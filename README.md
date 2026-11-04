@@ -52,7 +52,7 @@ build/xftrace <folder>                               # each trace, then all of t
 
 # a shader's microcode disassembled (Xenia's --dump_shaders writes them host-order)
 build/xfshader shader_<hash>.ucode.bin.frag
-tools/compare_disasm.ps1 <folder>                    # against Xenia's own disassembly
+tools/compare_disasm.ps1 -Shaders <folder>           # against Xenia's own disassembly
 ```
 
 ## Documents
