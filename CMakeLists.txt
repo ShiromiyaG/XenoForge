@@ -33,6 +33,8 @@ add_library(xenoforge STATIC
     src/ucode_disasm.cpp
     src/xenos.cpp
     src/spirv.cpp
+    src/shader_translator.cpp
+    src/shader_interpreter.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
@@ -59,17 +61,22 @@ add_executable(xfshader tools/xfshader.cpp)
 target_link_libraries(xfshader PRIVATE xenoforge)
 
 enable_testing()
-foreach(name aes disc xex snappy ucode ucode_parse trace)
+foreach(name aes disc xex snappy ucode ucode_parse trace shader_interpreter)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
-add_executable(spirv_test tests/spirv_test.cpp)
-target_link_libraries(spirv_test PRIVATE xenoforge)
-if(SPIRV_VAL)
-    target_compile_definitions(spirv_test PRIVATE XF_SPIRV_VAL="${SPIRV_VAL}")
-endif()
-add_test(NAME spirv COMMAND spirv_test)
+foreach(name spirv shader_translator)
+    add_executable(${name}_test tests/${name}_test.cpp)
+    target_link_libraries(${name}_test PRIVATE xenoforge)
+    if(SPIRV_VAL)
+        target_compile_definitions(${name}_test PRIVATE XF_SPIRV_VAL="${SPIRV_VAL}")
+    endif()
+    add_test(NAME ${name} COMMAND ${name}_test)
+endforeach()
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)
+add_executable(shader_compare_test tests/shader_compare_test.cpp)
+target_link_libraries(shader_compare_test PRIVATE xenoforge_vk)
+add_test(NAME shader_compare COMMAND shader_compare_test)

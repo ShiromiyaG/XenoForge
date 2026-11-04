@@ -1,0 +1,333 @@
+// The translator's SPIR-V run on the GPU against the CPU interpreter, case
+// by case (shader_harness.h): every vector and scalar ALU operation on
+// chosen and edge inputs (0, -0, 1, -1, infinities, NaN, the largest and
+// smallest floats), operand swizzles and modifiers, write masks with
+// constant components, saturation, predicates, a0 from maxa, the previous
+// scalar, a conditional exec, vertex fetches of each format with each
+// endianness, the texture fetch's stand-in. Then the shaders of the traces,
+// if XF_SHADERS names the folder Xenia dumped them to, on random inputs.
+//
+// Without a Vulkan 1.3 device it says so and passes.
+
+#include "check.h"
+#include "shader_builders.h"
+#include "xenoforge/shader_harness.h"
+#include "xenoforge/shader_interpreter.h"
+#include "xenoforge/shader_translator.h"
+#include "xenoforge/vk_compute.h"
+
+#include <cfloat>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace xf;
+using namespace xf::ucode;
+using namespace xf::ucode::build;
+using harness::CaseInput;
+using harness::CaseOutput;
+using harness::Constants;
+
+namespace {
+
+std::unique_ptr<vk::Compute> gpu;
+
+// --- running ----------------------------------------------------------------
+
+struct Run {
+    std::vector<CaseInput> inputs;
+    Constants constants{};
+    std::vector<uint8_t> memory = std::vector<uint8_t>(256, 0);
+};
+
+bool same_float(float gpu_value, float cpu_value, bool approximate) {
+    if (std::isnan(gpu_value) && std::isnan(cpu_value)) return true;
+    // zeros and denormals alike: the GPU may flush them
+    if (std::fabs(gpu_value) < FLT_MIN && std::fabs(cpu_value) < FLT_MIN) return true;
+    uint32_t a, b;
+    std::memcpy(&a, &gpu_value, 4);
+    std::memcpy(&b, &cpu_value, 4);
+    if (a == b) return true;
+    if (!approximate || std::isinf(gpu_value) || std::isinf(cpu_value) || (a ^ b) >> 31) return false;
+    // exp, log, rcp, rsq, sqrt, sin, cos: the GPU's own precision, then 21 bits
+    return std::fabs(gpu_value - cpu_value) <= std::fabs(cpu_value) * 1e-5f + 1e-6f;
+}
+
+// Runs the shader on both sides; reports the first few differences. False
+// when it could not run (unsupported, no GPU).
+bool compare(const char *what, const ParsedShader &shader, Run &run, bool approximate = false) {
+    auto translation = shader::translate(shader, shader::Stage::Harness);
+    if (!translation.ok()) {
+        std::printf("  %s: not translated:", what);
+        for (auto &u : translation.unsupported) std::printf(" %s;", u.c_str());
+        std::printf("\n");
+        failures++;
+        return false;
+    }
+    size_t cases = run.inputs.size();
+    size_t padded = (cases + harness::LOCAL_SIZE - 1) / harness::LOCAL_SIZE * harness::LOCAL_SIZE;
+    run.inputs.resize(padded);
+    std::vector<uint8_t> in(padded * sizeof(CaseInput)), consts(sizeof(Constants)), out(padded * sizeof(CaseOutput));
+    std::memcpy(in.data(), run.inputs.data(), in.size());
+    std::memcpy(consts.data(), &run.constants, sizeof(Constants));
+    std::vector<uint8_t> memory = run.memory;
+    std::vector<uint8_t> *buffers[] = {&in, &consts, &memory, &out};
+    std::string error;
+    if (!gpu->run(translation.spirv, buffers, uint32_t(padded / harness::LOCAL_SIZE), error)) {
+        std::printf("  %s: GPU run failed: %s\n", what, error.c_str());
+        failures++;
+        return false;
+    }
+    int reported = 0;
+    for (size_t c = 0; c < cases; c++) {
+        CaseOutput expected{}, got;
+        std::memcpy(&got, out.data() + c * sizeof(CaseOutput), sizeof(CaseOutput));
+        std::string unsupported;
+        if (!shader::interpret(shader, run.inputs[c], run.constants, run.memory, expected, unsupported)) {
+            std::printf("  %s: the interpreter refused: %s\n", what, unsupported.c_str());
+            failures++;
+            return false;
+        }
+        const float *g = &got.registers[0][0], *e = &expected.registers[0][0];
+        size_t floats = (offsetof(CaseOutput, killed)) / 4;
+        bool same = got.killed == expected.killed && got.predicate == expected.predicate &&
+                    got.address_register == expected.address_register;
+        size_t bad = SIZE_MAX;
+        for (size_t k = 0; k < floats && same; k++)
+            if (!same_float(g[k], e[k], approximate)) same = false, bad = k;
+        if (same) continue;
+        failures++;
+        if (reported++ < 4) {
+            std::printf("  %s, case %zu:", what, c);
+            if (bad != SIZE_MAX)
+                std::printf(" output float %zu (vec4 %zu.%zu) GPU %.9g CPU %.9g;", bad, bad / 4, bad % 4, g[bad], e[bad]);
+            std::printf(" killed %u/%u predicate %u/%u a0 %d/%d\n", got.killed, expected.killed, got.predicate,
+                        expected.predicate, got.address_register, expected.address_register);
+            const float *r = &run.inputs[c].registers[0][0];
+            std::printf("    inputs r0 (%g %g %g %g) r1 (%g %g %g %g) r2 (%g %g %g %g)\n", r[0], r[1], r[2], r[3], r[4],
+                        r[5], r[6], r[7], r[8], r[9], r[10], r[11]);
+        }
+    }
+    return true;
+}
+
+// inputs for r0-r3 from the edge values, every case different
+std::vector<CaseInput> edge_inputs(size_t count, uint32_t seed) {
+    static const float values[] = {0.0f, -0.0f, 1.0f, -1.0f, 0.5f, -2.5f, 3.0f, 7.25f, -0.75f, 100.0f, 1e-3f,
+                                   1e30f, -1e30f, FLT_MAX, -FLT_MAX, FLT_MIN, 2.0f, 0.25f,
+                                   std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(),
+                                   std::numeric_limits<float>::quiet_NaN(), 255.6f, -256.4f, 1.0e-20f};
+    constexpr size_t n = sizeof(values) / sizeof(values[0]);
+    std::vector<CaseInput> inputs(count);
+    uint32_t x = seed;
+    for (CaseInput &c : inputs) {
+        std::memset(&c, 0, sizeof(c));
+        for (int r = 0; r < 4; r++)
+            for (int k = 0; k < 4; k++) {
+                x = x * 1664525u + 1013904223u;
+                c.registers[r][k] = values[(x >> 16) % n];
+            }
+    }
+    return inputs;
+}
+
+// --- the checks ----------------------------------------------------------------
+
+void vector_operations() {
+    for (uint32_t op = 0; op <= uint32_t(AluVectorOpcode::MaxA); op++) {
+        auto opcode = AluVectorOpcode(op);
+        uint32_t n = vector_opcode_info(opcode).operand_count();
+        std::initializer_list<Operand> three = {reg(0), reg(1), reg(2)}, two = {reg(0), reg(1)}, one = {reg(0)};
+        AluInstruction a = vector(opcode, dst(StorageTarget::Register, 10, 0xF), n == 3 ? three : n == 2 ? two : one);
+        // the scalar half sets ps first, for the record
+        auto shader = make_shader(ShaderType::Pixel, {make_exec({a}, true)});
+        Run run;
+        run.inputs = edge_inputs(256, 17 + op);
+        compare(vector_opcode_info(opcode).name, shader, run);
+    }
+}
+
+void scalar_operations() {
+    for (uint32_t op = 0; op <= uint32_t(AluScalarOpcode::RetainPrev); op++) {
+        auto opcode = AluScalarOpcode(op);
+        if (opcode == AluScalarOpcode::Opcode41) continue;
+        const auto &info = scalar_opcode_info(opcode);
+        // ps from r3.x + r3.y first, so the *_prev operations see something
+        AluInstruction first = scalar(AluScalarOpcode::Adds, dst(StorageTarget::Register, 12, 1), {reg(3, "xyzw")});
+        AluInstruction a = info.operand_count == 2
+                               ? scalar(opcode, dst(StorageTarget::Register, 11, 0xF), {reg(0, "xxxx"), reg(1, "yyyy")})
+                               : scalar(opcode, dst(StorageTarget::Register, 11, 0xF), {reg(0, "xyzw")});
+        auto shader = make_shader(ShaderType::Pixel, {make_exec({first, a}, true)});
+        Run run;
+        run.inputs = edge_inputs(256, 101 + op);
+        bool approximate = opcode == AluScalarOpcode::Exp || opcode == AluScalarOpcode::Log ||
+                           opcode == AluScalarOpcode::Logc || (opcode >= AluScalarOpcode::Rcpc && opcode <= AluScalarOpcode::Rsq) ||
+                           opcode == AluScalarOpcode::Sqrt || opcode == AluScalarOpcode::Sin || opcode == AluScalarOpcode::Cos;
+        if (opcode == AluScalarOpcode::Sin || opcode == AluScalarOpcode::Cos) {
+            // the GPU's sin and cos are exact enough only near the circle
+            for (CaseInput &c : run.inputs)
+                for (int k = 0; k < 4; k++)
+                    if (!std::isfinite(c.registers[0][k]) || std::fabs(c.registers[0][k]) > 3.0f) c.registers[0][k] = 0.75f;
+        }
+        compare(info.name, shader, run, approximate);
+    }
+}
+
+void operands_and_results() {
+    // swizzles, negation, absolute values; a constant; a masked, swizzled,
+    // saturated destination with constant 0 and 1 components
+    AluInstruction a = vector(AluVectorOpcode::Mad, dst(StorageTarget::Register, 5, 0b1111, "zx01", true),
+                              {reg(0, "wzyx", true), reg(1, "xxyy", false, true), con(3, "zwzw")});
+    AluInstruction b = scalar(AluScalarOpcode::Mulsc0, dst(StorageTarget::Register, 6, 0b0110, "xx1x"),
+                              {reg(2, "wwww", true, true), con(4, "yyyy")});
+    auto shader = make_shader(ShaderType::Vertex, {make_exec({a, b}, true)});
+    Run run;
+    run.inputs = edge_inputs(256, 7);
+    for (int k = 0; k < 256; k++) run.constants.float_constants[k % 256][k % 4] = float(k) * 0.125f - 3.0f;
+    compare("operands and results", shader, run);
+}
+
+void control() {
+    // maxa sets a0, then c[a0 + 2] is read; setp sets the predicate, then
+    // instructions on either side of it; a conditional exec on b5
+    AluInstruction maxa = vector(AluVectorOpcode::MaxA, dst(StorageTarget::Register, 8, 0xF), {reg(0), reg(1)});
+    AluInstruction relative = vector(AluVectorOpcode::Add, dst(StorageTarget::Register, 9, 0xF),
+                                     {con(2, "xyzw", StorageAddressing::AddressRegisterRelative), reg(2)});
+    AluInstruction setp = scalar(AluScalarOpcode::SetpGt, dst(StorageTarget::Register, 10, 1), {reg(3)});
+    AluInstruction if_true = vector(AluVectorOpcode::Mul, dst(StorageTarget::Register, 11, 0xF), {reg(0), reg(1)});
+    if_true.is_predicated = true, if_true.predicate_condition = true;
+    AluInstruction if_false = vector(AluVectorOpcode::Add, dst(StorageTarget::Register, 12, 0xF), {reg(0), reg(1)});
+    if_false.is_predicated = true, if_false.predicate_condition = false;
+    AluInstruction on_bool = vector(AluVectorOpcode::Max, dst(StorageTarget::Color, 0, 0xF), {reg(1), reg(2)});
+    AluInstruction export_depth = scalar(AluScalarOpcode::Adds, dst(StorageTarget::Depth, 0, 1), {reg(0)});
+    auto shader = make_shader(ShaderType::Pixel,
+                              {make_exec({maxa, relative, setp, if_true, if_false}, false),
+                               make_exec({on_bool}, false, ExecInstruction::Type::Conditional, 5, true),
+                               make_exec({export_depth}, true)});
+    for (uint32_t b : {0u, 1u}) {
+        Run run;
+        run.inputs = edge_inputs(256, 23 + b);
+        for (int k = 0; k < 256; k++) run.constants.float_constants[k][0] = float(k);
+        run.constants.bool_constants[0] = b << 5;
+        compare(b ? "control, b5 set" : "control, b5 clear", shader, run);
+    }
+}
+
+void fetches() {
+    // the vertex formats, each with each endianness, from r0.x as the index
+    const uint32_t formats[] = {6, 7, 16, 17, 25, 26, 31, 32, 33, 34, 35, 36, 37, 57, 38};
+    for (uint32_t format : formats) {
+        for (uint32_t endian = 0; endian < 4; endian++) {
+            for (int is_signed = 0; is_signed < 2; is_signed++) {
+                VertexFetchInstruction v;
+                v.result = dst(StorageTarget::Register, 4, 0xF);
+                v.operand_count = 2;
+                v.operands[0] = reg(0, "xxxx");
+                v.operands[1].source = StorageSource::VertexFetchConstant;
+                v.operands[1].index = 3; // vertex fetch constant 3: slot 1, second
+                v.data_format = format;
+                v.stride = 5;
+                v.offset = 1;
+                v.is_signed = is_signed;
+                v.is_index_rounded = endian & 1;
+                v.exp_adjust = endian == 2 ? -3 : 0;
+                v.signed_rf_mode = endian == 3 ? SignedRepeatingFractionMode::NoZero : SignedRepeatingFractionMode::ZeroClampMinusOne;
+                auto shader = make_shader(ShaderType::Vertex, {make_exec({v}, true)});
+                Run run;
+                run.memory.resize(1024);
+                for (size_t k = 0; k < run.memory.size(); k++) run.memory[k] = uint8_t(k * 37 + 11);
+                // vertex constant 3: address 16 dwords, endianness, 64 dwords
+                run.constants.fetch_constants[6] = 3u | 16u << 2;
+                run.constants.fetch_constants[7] = endian | 64u << 2;
+                run.inputs.resize(64);
+                for (size_t c = 0; c < run.inputs.size(); c++) {
+                    std::memset(&run.inputs[c], 0, sizeof(CaseInput));
+                    run.inputs[c].registers[0][0] = float(c % 16) * 0.75f;
+                }
+                char name[64];
+                std::snprintf(name, sizeof(name), "vfetch format %u endian %u %s", format, endian, is_signed ? "signed" : "unsigned");
+                compare(name, shader, run);
+            }
+        }
+    }
+    // the texture fetch's stand-in, 2D and 3D, with a destination swizzle
+    for (auto dimension : {FetchOpDimension::D1, FetchOpDimension::D2, FetchOpDimension::D3OrStacked}) {
+        TextureFetchInstruction t;
+        t.opcode_name = "tfetch";
+        t.dimension = dimension;
+        t.result = dst(StorageTarget::Register, 6, 0b1011, "wzy1");
+        t.operand_count = 2;
+        t.operands[0] = reg(1, "yxzw");
+        t.operands[1].source = StorageSource::TextureFetchConstant;
+        t.operands[1].index = 9;
+        auto shader = make_shader(ShaderType::Pixel, {make_exec({t}, true)});
+        Run run;
+        run.inputs = edge_inputs(128, 5);
+        compare("tfetch stand-in", shader, run);
+    }
+}
+
+// the traces' shaders on random registers and constants
+void corpus() {
+    const char *folder = std::getenv("XF_SHADERS");
+    if (!folder) {
+        std::printf("  XF_SHADERS not set: the traces' shaders not run\n");
+        return;
+    }
+    int count = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(folder)) {
+        std::string name = entry.path().filename().string();
+        if (name.find(".ucode.bin.") == std::string::npos) continue;
+        std::ifstream in(entry.path(), std::ios::binary);
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        std::vector<uint32_t> dwords(bytes.size() / 4);
+        std::memcpy(dwords.data(), bytes.data(), dwords.size() * 4);
+        bool vertex = name.ends_with(".vert");
+        auto shader = parse_shader(vertex ? ShaderType::Vertex : ShaderType::Pixel, dwords);
+        Run run;
+        run.inputs.resize(256);
+        uint32_t x = uint32_t(count) * 977 + 1;
+        auto next = [&] {
+            x = x * 1664525u + 1013904223u;
+            return float(int32_t(x >> 8) % 20000) / 1000.0f;
+        };
+        for (CaseInput &c : run.inputs)
+            for (auto &r : c.registers)
+                for (float &v : r) v = next();
+        for (auto &c : run.constants.float_constants)
+            for (float &v : c) v = next();
+        run.memory.resize(4096);
+        for (size_t k = 0; k < run.memory.size(); k++) run.memory[k] = uint8_t(k * 13 + 7);
+        for (int slot = 0; slot < 96; slot++) {
+            run.constants.fetch_constants[slot * 2] = 3u | 8u << 2;
+            run.constants.fetch_constants[slot * 2 + 1] = 2u | 512u << 2;
+        }
+        compare(name.c_str(), shader, run, true);
+        count++;
+    }
+    std::printf("  %d shaders of the traces run\n", count);
+}
+
+} // namespace
+
+int main() {
+    std::string error;
+    gpu = vk::Compute::open(error);
+    if (!gpu) {
+        std::printf("  no Vulkan device (%s): not run\n", error.c_str());
+        return finish("shader_compare");
+    }
+    vector_operations();
+    scalar_operations();
+    operands_and_results();
+    control();
+    fetches();
+    corpus();
+    return finish("shader_compare");
+}

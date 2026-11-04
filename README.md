@@ -24,6 +24,8 @@ Early days: the first step of [the plan](docs/plan.md).
 | `xftrace`: what a corpus of traces uses (packets, draws, formats, shaders, textures) | `tools/xftrace.cpp` | done |
 | Xenos microcode parsed as Xenia parses it, and disassembled: byte for byte Xenia's text on every shader of the traces | `ucode_parse.h`, `tools/xfshader.cpp` | done; tests |
 | A SPIR-V module writer (checked by `spirv-val`) and a windowless Vulkan compute runner (checked on the GPU) | `spirv.h`, `vk_compute.h` | done; tests |
+| The microcode translated to SPIR-V (vertex, pixel, and a compute wrapper for checks), version 1: every ALU operation, the vertex formats, 2D and 3D texture fetches, straight control flow | `shader_translator.h` | done; tests |
+| A CPU interpreter of the microcode, the translator's reference: the GPU and it agree case by case, the traces' shaders included | `shader_interpreter.h`, `tests/shader_compare_test.cpp` | done; tests |
 
 ## Building
 
@@ -52,6 +54,7 @@ build/xftrace <folder>                               # each trace, then all of t
 
 # a shader's microcode disassembled (Xenia's --dump_shaders writes them host-order)
 build/xfshader shader_<hash>.ucode.bin.frag
+build/xfshader shader_<hash>.ucode.bin.frag --spirv out.spv [--stage harness]
 tools/compare_disasm.ps1 -Shaders <folder>           # against Xenia's own disassembly
 ```
 

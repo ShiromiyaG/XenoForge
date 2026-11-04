@@ -49,7 +49,7 @@ public:
     Id type_vector(Id component, uint32_t count);
     // stride 0: no ArrayStride (for Private and Function variables)
     Id type_array(Id element, uint32_t length, uint32_t stride = 0);
-    Id type_runtime_array(Id element, uint32_t stride);
+    Id type_runtime_array(Id element, uint32_t stride); // stride 0: none (arrays of images, samplers)
     Id type_struct(std::span<const Id> members);
     Id type_pointer(spv::StorageClass storage, Id pointee);
     Id type_function(Id result, std::span<const Id> parameters);

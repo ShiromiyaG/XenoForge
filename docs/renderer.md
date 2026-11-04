@@ -125,9 +125,19 @@ exports written to one, an invocation per case).
   the same instructions, on chosen and edge inputs (0, -0, infinities,
   NaN, denormals); and whole frames against Xenia's pictures in B3.
 
-The parts in place (2026-11-04): the SPIR-V writer (`spirv.h`, every module
-checked by `spirv-val` in the tests) and the windowless compute runner
-(`vk_compute.h`, checked on the GPU).
+In place (2026-11-04): the SPIR-V writer (`spirv.h`); the translator,
+version 1 (`shader_translator.h`): every vector and scalar operation, the 15
+vertex formats with their endianness and normalization, 2D and 3D texture
+fetches, execs plain, on a bool constant or on the predicate; the CPU
+interpreter (`shader_interpreter.h`), translated from Xenia's with the GPU
+translator's semantics where the two differ; the windowless compute runner
+(`vk_compute.h`). `shader_compare_test` runs both on the GPU and the CPU,
+case by case, and they agree, the traces' shaders included (`XF_SHADERS`).
+
+The hardware has no denormals, not even between a multiply and the add of a
+`mad`: the interpreter flushes them there, and the GPU's flush-to-zero does
+the same (B3 asks for it with the float controls where the device has
+them).
 
 ## What is asked and not done is counted
 

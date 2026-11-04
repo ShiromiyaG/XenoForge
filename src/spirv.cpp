@@ -140,7 +140,7 @@ Id Module::type_runtime_array(Id element, uint32_t stride) {
     Id result = id();
     const uint32_t w[] = {result, element};
     emit(globals_, Op::OpTypeRuntimeArray, w);
-    decorate(result, spv::Decoration::ArrayStride, {stride});
+    if (stride) decorate(result, spv::Decoration::ArrayStride, {stride});
     return result;
 }
 
