@@ -147,7 +147,11 @@ traces, without a recompiled game.
   what each frame uses (`xftrace`). First traces: both games' intros, with
   no input; the game itself needs a player pressing F4 in Xenia, or input
   sent to it.
-- **B2. The microcode translator** to SPIR-V, with its harness.
+- **B2. The microcode translator** to SPIR-V, with its harness (under way,
+  2026-11-04): the SPIR-V writer and the GPU compute runner are in, the
+  microcode parsed as Xenia parses it (its disassembly, byte for byte, is
+  the check), then the emitter and the CPU interpreter
+  ([renderer.md](renderer.md), "The translated shader").
 - **B3. The renderer**: front end, render targets, textures, draws; a trace
   replayed and compared with Xenia's picture.
 - **B4. Scale and speed**: resolution scale, the pipeline cache on disk,

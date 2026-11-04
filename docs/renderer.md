@@ -92,6 +92,43 @@ what it overlaps invalidated), rectangle and quad lists and point sprites
 (expanded without geometry shaders), occlusion queries, tessellation. Each
 is counted until the corpus or a game needs it.
 
+## The translated shader (B2)
+
+One body, three wrappers: the vertex shader, the pixel shader, and a compute
+shader that only the checks use (registers and constants read from buffers,
+exports written to one, an invocation per case).
+
+- **Interface** (Vulkan 1.3). Set 0: the stage's 256 float constants (a
+  uniform buffer), the bool and loop constants, the 32 fetch constants (6
+  dwords each), guest memory as a storage buffer (vertex fetch reads it
+  with the fetch constant's address and endianness, memexport writes it).
+  Set 1: the textures bindless (2D, 3D and cube arrays) and the samplers,
+  reached through a per-draw table from fetch slot to descriptor. A vertex
+  shader writes the position, 16 interpolators (locations 0-15) and the
+  point size; a pixel shader up to 4 colors, and depth when it exports it.
+- **State**: the registers as a Function array of vec4 sized by
+  `SQ_PROGRAM_CNTL` (128 at most), relative addressing through `a0` and
+  `aL`, the predicate.
+- **Control flow**: straight-line code when the program is only execs,
+  allocs and conditional execs (on a bool constant or the predicate), which
+  is most shaders; otherwise a loop over a switch on the next control flow
+  instruction, as Xenia does, for loops, calls and jumps.
+- **Semantics kept as the hardware's** (Xenia's
+  `spirv_shader_translator_alu.cc` is the reference): multiplies without
+  contraction and with 0 times anything giving 0 (`mul`, `mad`, `dp*`);
+  `rcp`, `rsq`, `log`, `exp` reduced to 21 bits of precision, like the
+  hardware's approximations; the clamps of `rcpc`, `rcpf`, `logc`; `maxa`
+  setting `a0 = clamp(floor(w + 0.5), -256, 255)`; kills as demotion to a
+  helper invocation.
+- **Checked three ways**: `spirv-val` on every shader of the corpus; the
+  compute wrapper on the GPU (`vk_compute.h`) against a CPU interpreter of
+  the same instructions, on chosen and edge inputs (0, -0, infinities,
+  NaN, denormals); and whole frames against Xenia's pictures in B3.
+
+The parts in place (2026-11-04): the SPIR-V writer (`spirv.h`, every module
+checked by `spirv-val` in the tests) and the windowless compute runner
+(`vk_compute.h`, checked on the GPU).
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that

@@ -22,6 +22,8 @@ Early days: the first step of [the plan](docs/plan.md).
 | Xenia's GPU traces read (snappy included) and walked through a PM4 front end that counts | `gpu_trace.h`, `trace_stats.h`, `snappy.h` | done; tests |
 | Xenos microcode walked: control flow, ALU and fetch operations, the constants it reads | `ucode.h`, `xenos.h` | done; tests |
 | `xftrace`: what a corpus of traces uses (packets, draws, formats, shaders, textures) | `tools/xftrace.cpp` | done |
+| Xenos microcode parsed as Xenia parses it, and disassembled: byte for byte Xenia's text on every shader of the traces | `ucode_parse.h`, `tools/xfshader.cpp` | done; tests |
+| A SPIR-V module writer (checked by `spirv-val`) and a windowless Vulkan compute runner (checked on the GPU) | `spirv.h`, `vk_compute.h` | done; tests |
 
 ## Building
 
@@ -47,6 +49,10 @@ build/xfinspect default.xex                          # an executable outside a d
 # (release downloads leave the trace writer out), then counted
 tools/capture_traces.ps1 -Xenia <xenia_canary.exe> -Game "<game>.iso" -Out <folder> -Frames 300,900,1800
 build/xftrace <folder>                               # each trace, then all of them
+
+# a shader's microcode disassembled (Xenia's --dump_shaders writes them host-order)
+build/xfshader shader_<hash>.ucode.bin.frag
+tools/compare_disasm.ps1 <folder>                    # against Xenia's own disassembly
 ```
 
 ## Documents
