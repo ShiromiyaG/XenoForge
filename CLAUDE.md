@@ -15,7 +15,8 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
   `xb` faria). O `xenia_canary.exe` baixado (release) **não grava traces**. Traces e PNGs de referência ficam em
   `../traces/` (fora dos repositórios): `xenia_canary.exe --trace_gpu_prefix=<pasta> --trace_gpu_frames=N,...`
   (ou F4 jogando), `xenia-gpu-vulkan-trace-dump.exe --target_trace_file=<xtr> --trace_dump_path=<pasta>`.
-  Lançar o Xenia pelo Bash funciona; pelo PowerShell da ferramenta ele fechou sozinho logo após iniciar. Código traduzido do
+  `tools/capture_traces.ps1` grava e fecha o Xenia sozinho (testado). A primeira execução do build novo fechou
+  sozinha logo após iniciar o jogo (não se repetiu). Código traduzido do
   Xenia leva o aviso BSD no topo do arquivo e é conferido contra o Xenia na mesma sessão. As tabelas de exports
   em `src/exports/` são cópias sem mudança (xenia-canary `838850fed`).
 - O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando Chaves e Ben 10 até o XenoForge rodá-los.
