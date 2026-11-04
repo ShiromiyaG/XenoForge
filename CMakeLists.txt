@@ -18,20 +18,28 @@ if(WIN32)
 endif()
 
 # The lean Xbox 360 system: so far the disc, the executable and the system's
-# export tables (docs/plan.md, step 1).
+# export tables (docs/plan.md, A1), and Xenia's GPU traces read and counted
+# (B1).
 add_library(xenoforge STATIC
     src/aes.cpp
     src/disc.cpp
     src/exports.cpp
     src/xex.cpp
+    src/snappy.cpp
+    src/gpu_trace.cpp
+    src/trace_stats.cpp
+    src/ucode.cpp
+    src/xenos.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
 add_executable(xfinspect tools/xfinspect.cpp)
 target_link_libraries(xfinspect PRIVATE xenoforge)
+add_executable(xftrace tools/xftrace.cpp)
+target_link_libraries(xftrace PRIVATE xenoforge)
 
 enable_testing()
-foreach(name aes disc xex)
+foreach(name aes disc xex snappy ucode trace)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)

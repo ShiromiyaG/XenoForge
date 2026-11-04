@@ -19,6 +19,9 @@ Early days: the first step of [the plan](docs/plan.md).
 | The executable: XEX2 headers, AES-128, basic compression, the import libraries | `xex.h`, `aes.h`, `src/xex.cpp`, `src/aes.cpp` | done but LZX; tests |
 | The system's exports by ordinal (xboxkrnl, xam, xbdm) | `exports.h`, `src/exports/` (Xenia's tables) | done |
 | `xfinspect`: a disc's executable, its XDK libraries and imports, the image dumped | `tools/xfinspect.cpp` | done |
+| Xenia's GPU traces read (snappy included) and walked through a PM4 front end that counts | `gpu_trace.h`, `trace_stats.h`, `snappy.h` | done; tests |
+| Xenos microcode walked: control flow, ALU and fetch operations, the constants it reads | `ucode.h`, `xenos.h` | done; tests |
+| `xftrace`: what a corpus of traces uses (packets, draws, formats, shaders, textures) | `tools/xftrace.cpp` | done |
 
 ## Building
 
@@ -39,6 +42,11 @@ build/xfinspect "<game>.iso" --imports              # every import, tab separate
 build/xfinspect "<game>.iso" --files                # the disc's files
 build/xfinspect "<game>.iso" --dump-image image.bin # the image, decrypted and unpacked
 build/xfinspect default.xex                          # an executable outside a disc
+
+# GPU traces: recorded by a xenia-canary built with -DXENIA_ENABLE_GPU_TRACE=ON
+# (release downloads leave the trace writer out), then counted
+tools/capture_traces.ps1 -Xenia <xenia_canary.exe> -Game "<game>.iso" -Out <folder> -Frames 300,900,1800
+build/xftrace <folder>                               # each trace, then all of them
 ```
 
 ## Documents
