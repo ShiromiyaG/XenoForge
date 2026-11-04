@@ -1,0 +1,8 @@
+build/
+
+# nothing of a game goes in: discs, executables, their images and dumps
+*.iso
+*.xex
+*.xexp
+*.bin
+re/

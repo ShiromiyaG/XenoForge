@@ -1,0 +1,310 @@
+library	ordinal	name	kind	chaves	ben10
+xam.xex	0x001	NetDll_WSAStartup	function	x	x
+xam.xex	0x002	NetDll_WSACleanup	function	x	x
+xam.xex	0x003	NetDll_socket	function	x	x
+xam.xex	0x004	NetDll_closesocket	function	x	x
+xam.xex	0x005	NetDll_shutdown	function	x	
+xam.xex	0x006	NetDll_ioctlsocket	function	x	x
+xam.xex	0x007	NetDll_setsockopt	function	x	x
+xam.xex	0x008	NetDll_getsockopt	function	x	
+xam.xex	0x009	NetDll_getsockname	function	x	
+xam.xex	0x00B	NetDll_bind	function	x	x
+xam.xex	0x00C	NetDll_connect	function	x	x
+xam.xex	0x00D	NetDll_listen	function	x	x
+xam.xex	0x00E	NetDll_accept	function	x	x
+xam.xex	0x00F	NetDll_select	function	x	x
+xam.xex	0x012	NetDll_recv	function	x	x
+xam.xex	0x014	NetDll_recvfrom	function	x	
+xam.xex	0x016	NetDll_send	function	x	x
+xam.xex	0x018	NetDll_sendto	function	x	
+xam.xex	0x01A	NetDll_inet_addr	function	x	x
+xam.xex	0x01B	NetDll_WSAGetLastError	function	x	x
+xam.xex	0x01C	NetDll_WSASetLastError	function	x	
+xam.xex	0x01D	NetDll_WSACreateEvent	function	x	
+xam.xex	0x022	NetDll___WSAFDIsSet	function	x	x
+xam.xex	0x033	NetDll_XNetStartup	function	x	x
+xam.xex	0x034	NetDll_XNetCleanup	function	x	x
+xam.xex	0x035	NetDll_XNetRandom	function	x	
+xam.xex	0x037	NetDll_XNetRegisterKey	function	x	
+xam.xex	0x038	NetDll_XNetUnregisterKey	function	x	
+xam.xex	0x039	NetDll_XNetXnAddrToInAddr	function	x	
+xam.xex	0x03A	NetDll_XNetServerToInAddr	function	x	
+xam.xex	0x03C	NetDll_XNetInAddrToXnAddr	function	x	
+xam.xex	0x03F	NetDll_XNetUnregisterInAddr	function	x	
+xam.xex	0x041	NetDll_XNetConnect	function	x	
+xam.xex	0x043	NetDll_XNetDnsLookup	function	x	
+xam.xex	0x044	NetDll_XNetDnsRelease	function	x	
+xam.xex	0x045	NetDll_XNetQosListen	function	x	
+xam.xex	0x046	NetDll_XNetQosLookup	function	x	
+xam.xex	0x048	NetDll_XNetQosRelease	function	x	
+xam.xex	0x049	NetDll_XNetGetTitleXnAddr	function	x	x
+xam.xex	0x04B	NetDll_XNetGetEthernetLinkStatus	function	x	
+xam.xex	0x04D	NetDll_XNetQosGetListenStats	function	x	
+xam.xex	0x054	NetDll_XNetSetSystemLinkPort	function	x	
+xam.xex	0x136	XNetLogonGetTitleID	function	x	
+xam.xex	0x190	XamInputGetCapabilities	function	x	x
+xam.xex	0x191	XamInputGetState	function	x	x
+xam.xex	0x192	XamInputSetState	function	x	x
+xam.xex	0x198	XamInputGetKeystrokeEx	function		x
+xam.xex	0x1A4	XamLoaderLaunchTitle	function	x	
+xam.xex	0x1A7	XamLoaderGetLaunchDataSize	function	x	
+xam.xex	0x1A8	XamLoaderGetLaunchData	function	x	
+xam.xex	0x1A9	XamLoaderTerminateTitle	function	x	x
+xam.xex	0x1AF	XamTaskSchedule	function	x	
+xam.xex	0x1B1	XamTaskCloseHandle	function	x	
+xam.xex	0x1B3	XamTaskShouldExit	function	x	
+xam.xex	0x1EA	XamAlloc	function	x	
+xam.xex	0x1EC	XamFree	function	x	
+xam.xex	0x1F4	XMsgInProcessCall	function	x	x
+xam.xex	0x1F5	XMsgCompleteIORequest	function	x	
+xam.xex	0x1F7	XMsgStartIORequest	function	x	x
+xam.xex	0x1F8	XMsgCancelIORequest	function	x	
+xam.xex	0x1FB	XamGetOverlappedResult	function	x	
+xam.xex	0x1FC	XMsgStartIORequestEx	function	x	x
+xam.xex	0x208	XamUserGetDeviceContext	function	x	x
+xam.xex	0x20A	XamUserGetXUID	function	x	
+xam.xex	0x20E	XamUserGetName	function	x	
+xam.xex	0x210	XamUserGetSigninState	function	x	
+xam.xex	0x212	XamUserCheckPrivilege	function	x	
+xam.xex	0x213	XamUserAreUsersFriends	function	x	
+xam.xex	0x219	XamUserReadProfileSettings	function	x	x
+xam.xex	0x21A	XamUserWriteProfileSettings	function	x	
+xam.xex	0x227	XamUserGetSigninInfo	function	x	x
+xam.xex	0x24E	XamCreateEnumeratorHandle	function	x	
+xam.xex	0x24F	XamGetPrivateEnumStructureFromHandle	function	x	
+xam.xex	0x250	XamEnumerate	function	x	x
+xam.xex	0x259	XamContentCreateEx	function	x	x
+xam.xex	0x25A	XamContentClose	function	x	x
+xam.xex	0x25B	XamContentDelete	function	x	
+xam.xex	0x25C	XamContentCreateEnumerator	function	x	x
+xam.xex	0x25E	XamContentGetDeviceData	function	x	x
+xam.xex	0x262	XamContentGetCreator	function	x	x
+xam.xex	0x265	XamContentGetDeviceState	function	x	x
+xam.xex	0x266	XamContentGetLicenseMask	function	x	
+xam.xex	0x280	XamGetExecutionId	function	x	x
+xam.xex	0x282	XamGetSystemVersion	function	x	x
+xam.xex	0x28A	XamNotifyCreateListener	function	x	x
+xam.xex	0x28B	XNotifyGetNext	function	x	x
+xam.xex	0x28C	XNotifyPositionUI	function	x	
+xam.xex	0x2BC	XamShowSigninUI	function	x	x
+xam.xex	0x2BF	XamShowFriendsUI	function	x	
+xam.xex	0x2C0	XamShowMessagesUI	function	x	
+xam.xex	0x2C1	XamShowKeyboardUI	function	x	x
+xam.xex	0x2C2	XamShowQuickChatUI	function	x	
+xam.xex	0x2C5	XamShowAchievementsUI	function	x	
+xam.xex	0x2C6	XamShowPlayerReviewUI	function	x	
+xam.xex	0x2C7	XamShowMarketplaceUI	function	x	
+xam.xex	0x2C8	XamShowPlayersUI	function	x	
+xam.xex	0x2CB	XamShowDeviceSelectorUI	function	x	x
+xam.xex	0x2CC	XamShowMessageComposeUI	function	x	
+xam.xex	0x2CD	XamShowGameInviteUI	function	x	
+xam.xex	0x2CE	XamShowFriendRequestUI	function	x	
+xam.xex	0x2D5	XamShowGamerCardUIForXUID	function	x	
+xam.xex	0x2D9	XamShowDirtyDiscErrorUI	function	x	
+xam.xex	0x2DC	XamShowMessageBoxUIEx	function	x	x
+xam.xex	0x2E5	XamShowCustomMessageComposeUI	function	x	
+xam.xex	0x2E6	XamShowCustomPlayerListUI	function	x	
+xam.xex	0x2EE	XamUserCreateAchievementEnumerator	function	x	
+xam.xex	0x2F0	XamWriteGamerTile	function	x	
+xam.xex	0x2F5	XamReadTileToTexture	function	x	
+xam.xex	0x2F7	XamUserCreateStatsEnumerator	function	x	
+xam.xex	0x30C	XamVoiceCreate	function	x	
+xam.xex	0x30D	XamVoiceHeadsetPresent	function	x	
+xam.xex	0x30E	XamVoiceSubmitPacket	function	x	
+xam.xex	0x30F	XamVoiceClose	function	x	
+xam.xex	0x316	XamSessionCreateHandle	function	x	
+xam.xex	0x317	XamSessionRefObjByHandle	function	x	
+xam.xex	0x3CB	XGetAVPack	function	x	x
+xam.xex	0x3CC	XGetGameRegion	function	x	x
+xam.xex	0x3CD	XGetLanguage	function		x
+xam.xex	0x3D1	XGetVideoMode	function	x	x
+xam.xex	0x497	XamVoiceIsActiveProcess	function	x	
+xboxkrnl.exe	0x001	DbgBreakPoint	function	x	x
+xboxkrnl.exe	0x003	DbgPrint	function	x	x
+xboxkrnl.exe	0x009	ExAllocatePool	function	x	
+xboxkrnl.exe	0x00A	ExAllocatePoolWithTag	function	x	x
+xboxkrnl.exe	0x00B	ExAllocatePoolTypeWithTag	function	x	
+xboxkrnl.exe	0x00D	ExCreateThread	function	x	x
+xboxkrnl.exe	0x00E	ExEventObjectType	variable	x	x
+xboxkrnl.exe	0x00F	ExFreePool	function	x	x
+xboxkrnl.exe	0x010	ExGetXConfigSetting	function	x	x
+xboxkrnl.exe	0x015	ExRegisterTitleTerminateNotification	function	x	x
+xboxkrnl.exe	0x019	ExTerminateThread	function	x	x
+xboxkrnl.exe	0x01B	ExThreadObjectType	variable	x	x
+xboxkrnl.exe	0x021	FscSetCacheElementCount	function	x	x
+xboxkrnl.exe	0x028	HalReturnToFirmware	function	x	x
+xboxkrnl.exe	0x02B	InterlockedFlushSList	function	x	
+xboxkrnl.exe	0x02C	InterlockedPopEntrySList	function	x	
+xboxkrnl.exe	0x034	IoCheckShareAccess	function	x	
+xboxkrnl.exe	0x035	IoCompleteRequest	function	x	
+xboxkrnl.exe	0x037	IoCreateDevice	function	x	
+xboxkrnl.exe	0x039	IoDeleteDevice	function	x	
+xboxkrnl.exe	0x03B	IoDismountVolume	function	x	
+xboxkrnl.exe	0x03C	IoDismountVolumeByFileHandle	function	x	
+xboxkrnl.exe	0x041	IoInvalidDeviceRequest	function	x	
+xboxkrnl.exe	0x045	IoRemoveShareAccess	function	x	
+xboxkrnl.exe	0x047	IoSetShareAccess	function	x	
+xboxkrnl.exe	0x04D	KeAcquireSpinLockAtRaisedIrql	function	x	x
+xboxkrnl.exe	0x052	KeBugCheck	function	x	x
+xboxkrnl.exe	0x053	KeBugCheckEx	function	x	x
+xboxkrnl.exe	0x059	KeDebugMonitorData	variable	x	x
+xboxkrnl.exe	0x05A	KeDelayExecutionThread	function	x	x
+xboxkrnl.exe	0x05D	KeEnableFpuExceptions	function	x	x
+xboxkrnl.exe	0x05F	KeEnterCriticalRegion	function	x	x
+xboxkrnl.exe	0x066	KeGetCurrentProcessType	function	x	x
+xboxkrnl.exe	0x06B	KeLockL2	function	x	x
+xboxkrnl.exe	0x06C	KeUnlockL2	function	x	x
+xboxkrnl.exe	0x06D	KeInitializeApc	function	x	x
+xboxkrnl.exe	0x06F	KeInitializeDpc	function	x	
+xboxkrnl.exe	0x07A	KeInsertQueueApc	function	x	x
+xboxkrnl.exe	0x07B	KeInsertQueueDpc	function	x	
+xboxkrnl.exe	0x07D	KeLeaveCriticalRegion	function	x	x
+xboxkrnl.exe	0x081	KeQueryBasePriorityThread	function	x	x
+xboxkrnl.exe	0x083	KeQueryPerformanceFrequency	function	x	x
+xboxkrnl.exe	0x084	KeQuerySystemTime	function	x	x
+xboxkrnl.exe	0x089	KeReleaseSpinLockFromRaisedIrql	function	x	x
+xboxkrnl.exe	0x08F	KeResetEvent	function	x	x
+xboxkrnl.exe	0x097	KeSetAffinityThread	function	x	x
+xboxkrnl.exe	0x099	KeSetBasePriorityThread	function	x	x
+xboxkrnl.exe	0x09A	KeSetCurrentProcessType	function	x	
+xboxkrnl.exe	0x09D	KeSetEvent	function	x	x
+xboxkrnl.exe	0x0AD	KeTimeStampBundle	variable	x	x
+xboxkrnl.exe	0x0AF	KeWaitForMultipleObjects	function	x	x
+xboxkrnl.exe	0x0B0	KeWaitForSingleObject	function	x	x
+xboxkrnl.exe	0x0B1	KfAcquireSpinLock	function	x	x
+xboxkrnl.exe	0x0B4	KfReleaseSpinLock	function	x	x
+xboxkrnl.exe	0x0BA	MmAllocatePhysicalMemoryEx	function	x	x
+xboxkrnl.exe	0x0BD	MmFreePhysicalMemory	function	x	x
+xboxkrnl.exe	0x0BE	MmGetPhysicalAddress	function	x	x
+xboxkrnl.exe	0x0C2	MmMapIoSpace	function	x	x
+xboxkrnl.exe	0x0C4	MmQueryAddressProtect	function	x	x
+xboxkrnl.exe	0x0C5	MmQueryAllocationSize	function	x	x
+xboxkrnl.exe	0x0C7	MmSetAddressProtect	function	x	x
+xboxkrnl.exe	0x0CC	NtAllocateVirtualMemory	function	x	x
+xboxkrnl.exe	0x0CD	NtCancelTimer	function	x	
+xboxkrnl.exe	0x0CE	NtClearEvent	function	x	
+xboxkrnl.exe	0x0CF	NtClose	function	x	x
+xboxkrnl.exe	0x0D1	NtCreateEvent	function	x	x
+xboxkrnl.exe	0x0D2	NtCreateFile	function	x	x
+xboxkrnl.exe	0x0D4	NtCreateMutant	function	x	
+xboxkrnl.exe	0x0D5	NtCreateSemaphore	function	x	x
+xboxkrnl.exe	0x0D7	NtCreateTimer	function	x	
+xboxkrnl.exe	0x0D9	NtDeviceIoControlFile	function	x	
+xboxkrnl.exe	0x0DA	NtDuplicateObject	function	x	x
+xboxkrnl.exe	0x0DB	NtFlushBuffersFile	function	x	x
+xboxkrnl.exe	0x0DC	NtFreeVirtualMemory	function	x	x
+xboxkrnl.exe	0x0DF	NtOpenFile	function	x	x
+xboxkrnl.exe	0x0E2	NtPulseEvent	function	x	
+xboxkrnl.exe	0x0E4	NtQueryDirectoryFile	function	x	x
+xboxkrnl.exe	0x0E7	NtQueryFullAttributesFile	function	x	x
+xboxkrnl.exe	0x0E8	NtQueryInformationFile	function	x	x
+xboxkrnl.exe	0x0EE	NtQueryVirtualMemory	function	x	x
+xboxkrnl.exe	0x0EF	NtQueryVolumeInformationFile	function	x	x
+xboxkrnl.exe	0x0F0	NtReadFile	function	x	x
+xboxkrnl.exe	0x0F1	NtReadFileScatter	function	x	x
+xboxkrnl.exe	0x0F2	NtReleaseMutant	function	x	
+xboxkrnl.exe	0x0F3	NtReleaseSemaphore	function	x	x
+xboxkrnl.exe	0x0F5	NtResumeThread	function	x	x
+xboxkrnl.exe	0x0F6	NtSetEvent	function	x	x
+xboxkrnl.exe	0x0F7	NtSetInformationFile	function	x	x
+xboxkrnl.exe	0x0FA	NtSetTimerEx	function	x	
+xboxkrnl.exe	0x0FC	NtSuspendThread	function	x	x
+xboxkrnl.exe	0x0FD	NtWaitForSingleObjectEx	function	x	x
+xboxkrnl.exe	0x0FE	NtWaitForMultipleObjectsEx	function	x	
+xboxkrnl.exe	0x0FF	NtWriteFile	function	x	x
+xboxkrnl.exe	0x100	NtWriteFileGather	function	x	
+xboxkrnl.exe	0x101	NtYieldExecution	function	x	x
+xboxkrnl.exe	0x103	ObCreateSymbolicLink	function	x	x
+xboxkrnl.exe	0x104	ObDeleteSymbolicLink	function	x	x
+xboxkrnl.exe	0x105	ObDereferenceObject	function	x	x
+xboxkrnl.exe	0x109	ObIsTitleObject	function	x	
+xboxkrnl.exe	0x10F	ObReferenceObject	function	x	x
+xboxkrnl.exe	0x110	ObReferenceObjectByHandle	function	x	x
+xboxkrnl.exe	0x119	RtlCaptureContext	function	x	x
+xboxkrnl.exe	0x11B	RtlCompareMemoryUlong	function	x	x
+xboxkrnl.exe	0x11D	RtlCompareStringN	function	x	
+xboxkrnl.exe	0x125	RtlEnterCriticalSection	function	x	x
+xboxkrnl.exe	0x126	RtlFillMemoryUlong	function	x	x
+xboxkrnl.exe	0x127	RtlFreeAnsiString	function	x	
+xboxkrnl.exe	0x12B	RtlImageXexHeaderField	function	x	x
+xboxkrnl.exe	0x12C	RtlInitAnsiString	function	x	x
+xboxkrnl.exe	0x12D	RtlInitUnicodeString	function	x	
+xboxkrnl.exe	0x12E	RtlInitializeCriticalSection	function	x	x
+xboxkrnl.exe	0x12F	RtlInitializeCriticalSectionAndSpinCount	function	x	x
+xboxkrnl.exe	0x130	RtlLeaveCriticalSection	function	x	x
+xboxkrnl.exe	0x133	RtlMultiByteToUnicodeN	function	x	x
+xboxkrnl.exe	0x135	RtlNtStatusToDosError	function	x	x
+xboxkrnl.exe	0x136	RtlRaiseException	function	x	x
+xboxkrnl.exe	0x13A	_snprintf	function	x	
+xboxkrnl.exe	0x13B	sprintf	function	x	x
+xboxkrnl.exe	0x13F	RtlTimeFieldsToTime	function	x	x
+xboxkrnl.exe	0x140	RtlTimeToTimeFields	function	x	x
+xboxkrnl.exe	0x141	RtlTryEnterCriticalSection	function	x	x
+xboxkrnl.exe	0x142	RtlUnicodeStringToAnsiString	function	x	
+xboxkrnl.exe	0x143	RtlUnicodeToMultiByteN	function	x	x
+xboxkrnl.exe	0x147	RtlUnwind	function	x	x
+xboxkrnl.exe	0x149	RtlUpcaseUnicodeChar	function	x	
+xboxkrnl.exe	0x14D	_vsnprintf	function	x	x
+xboxkrnl.exe	0x152	KeTlsAlloc	function	x	x
+xboxkrnl.exe	0x153	KeTlsFree	function	x	x
+xboxkrnl.exe	0x154	KeTlsGetValue	function	x	x
+xboxkrnl.exe	0x155	KeTlsSetValue	function	x	x
+xboxkrnl.exe	0x156	XboxHardwareInfo	variable	x	x
+xboxkrnl.exe	0x158	XboxKrnlVersion	variable	x	x
+xboxkrnl.exe	0x192	XeCryptSha	function	x	
+xboxkrnl.exe	0x193	XexExecutableModuleHandle	variable	x	x
+xboxkrnl.exe	0x194	XexCheckExecutablePrivilege	function	x	x
+xboxkrnl.exe	0x195	XexGetModuleHandle	function	x	x
+xboxkrnl.exe	0x196	XexGetModuleSection	function	x	
+xboxkrnl.exe	0x197	XexGetProcedureAddress	function	x	x
+xboxkrnl.exe	0x199	XexLoadImage	function	x	
+xboxkrnl.exe	0x19B	XexLoadImageHeaders	function	x	
+xboxkrnl.exe	0x1A1	XexUnloadImage	function	x	
+xboxkrnl.exe	0x1A5	__C_specific_handler	function	x	x
+xboxkrnl.exe	0x1AE	ExLoadedCommandLine	variable	x	x
+xboxkrnl.exe	0x1B1	VdCallGraphicsNotificationRoutines	function	x	x
+xboxkrnl.exe	0x1B4	VdEnableDisableClockGating	function	x	x
+xboxkrnl.exe	0x1B6	VdEnableRingBufferRPtrWriteBack	function	x	x
+xboxkrnl.exe	0x1B9	VdGetCurrentDisplayGamma	function	x	x
+xboxkrnl.exe	0x1BA	VdGetCurrentDisplayInformation	function	x	x
+xboxkrnl.exe	0x1BD	VdGetSystemCommandBuffer	function	x	x
+xboxkrnl.exe	0x1BE	VdGlobalDevice	variable	x	x
+xboxkrnl.exe	0x1BF	VdGlobalXamDevice	variable	x	x
+xboxkrnl.exe	0x1C0	VdGpuClockInMHz	variable	x	x
+xboxkrnl.exe	0x1C1	VdHSIOCalibrationLock	variable	x	x
+xboxkrnl.exe	0x1C2	VdInitializeEngines	function	x	x
+xboxkrnl.exe	0x1C3	VdInitializeRingBuffer	function	x	x
+xboxkrnl.exe	0x1C5	VdInitializeScalerCommandBuffer	function	x	x
+xboxkrnl.exe	0x1C6	VdIsHSIOTrainingSucceeded	function	x	x
+xboxkrnl.exe	0x1C7	VdPersistDisplay	function	x	x
+xboxkrnl.exe	0x1C9	VdQueryVideoFlags	function	x	x
+xboxkrnl.exe	0x1CA	VdQueryVideoMode	function	x	x
+xboxkrnl.exe	0x1D3	VdSetDisplayMode	function	x	x
+xboxkrnl.exe	0x1D4	VdSetDisplayModeOverride	function	x	
+xboxkrnl.exe	0x1D5	VdSetGraphicsInterruptCallback	function	x	x
+xboxkrnl.exe	0x1D9	VdSetSystemCommandBufferGpuIdentifierAddress	function	x	x
+xboxkrnl.exe	0x1DC	VdShutdownEngines	function	x	x
+xboxkrnl.exe	0x1DF	KiApcNormalRoutineNop	function	x	x
+xboxkrnl.exe	0x1F3	XAudioRegisterRenderDriverClient	function	x	x
+xboxkrnl.exe	0x1F4	XAudioUnregisterRenderDriverClient	function	x	x
+xboxkrnl.exe	0x1F5	XAudioSubmitRenderDriverFrame	function	x	x
+xboxkrnl.exe	0x1F8	XAudioGetVoiceCategoryVolume	function	x	x
+xboxkrnl.exe	0x1FF	XAudioGetSpeakerConfig	function	x	x
+xboxkrnl.exe	0x224	XMACreateContext	function	x	x
+xboxkrnl.exe	0x226	XMAReleaseContext	function	x	x
+xboxkrnl.exe	0x256	XeKeysConsolePrivateKeySign	function	x	
+xboxkrnl.exe	0x257	XeKeysConsoleSignatureVerification	function	x	
+xboxkrnl.exe	0x259	StfsCreateDevice	function	x	
+xboxkrnl.exe	0x25A	StfsControlDevice	function	x	
+xboxkrnl.exe	0x25B	VdSwap	function	x	x
+xboxkrnl.exe	0x266	KeCertMonitorData	variable	x	x
+xboxkrnl.exe	0x269	VdRetrainEDRAM	function	x	x
+xboxkrnl.exe	0x26A	VdRetrainEDRAMWorker	function	x	x
+xboxkrnl.exe	0x2B1	MicDeviceRequest	function	x	x
+xboxkrnl.exe	0x2E1	RmcDeviceRequest	function	x	x
+xboxkrnl.exe	0x34D	XAudioEnableDucker	function	x	
+xboxkrnl.exe	0x350	XAudioGetDuckerLevel	function	x	
+xboxkrnl.exe	0x351	XAudioGetDuckerThreshold	function	x	
+xboxkrnl.exe	0x353	XAudioGetDuckerAttackTime	function	x	
+xboxkrnl.exe	0x355	XAudioGetDuckerReleaseTime	function	x	
+xboxkrnl.exe	0x357	XAudioGetDuckerHoldTime	function	x	
