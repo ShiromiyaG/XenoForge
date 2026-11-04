@@ -10,7 +10,12 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
 - C++20, CMake + Ninja + clang; namespace `xf`; estilo do `.clang-format` (4 espaços, 120 colunas).
   Build: `cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`,
   `cmake --build build`, `ctest --test-dir build`. Testes em `tests/` com o `CHECK` de `tests/check.h`.
-- **Oráculo = `../xenia-canary`** (BSD; ainda não compilado, submódulos não baixados). Código traduzido do
+- **Oráculo = `../xenia-canary`** (BSD), compilado em `build/bin/Windows/Release` com
+  `-DXENIA_ENABLE_GPU_TRACE=ON -DXENIA_BUILD_MISC=ON` (preset `vs`; o `build/version.h` foi escrito à mão, como o
+  `xb` faria). O `xenia_canary.exe` baixado (release) **não grava traces**. Traces e PNGs de referência ficam em
+  `../traces/` (fora dos repositórios): `xenia_canary.exe --trace_gpu_prefix=<pasta> --trace_gpu_frames=N,...`
+  (ou F4 jogando), `xenia-gpu-vulkan-trace-dump.exe --target_trace_file=<xtr> --trace_dump_path=<pasta>`.
+  Lançar o Xenia pelo Bash funciona; pelo PowerShell da ferramenta ele fechou sozinho logo após iniciar. Código traduzido do
   Xenia leva o aviso BSD no topo do arquivo e é conferido contra o Xenia na mesma sessão. As tabelas de exports
   em `src/exports/` são cópias sem mudança (xenia-canary `838850fed`).
 - O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando Chaves e Ben 10 até o XenoForge rodá-los.

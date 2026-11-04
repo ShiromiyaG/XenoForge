@@ -54,6 +54,8 @@ bool walk_gpu_trace(const GpuTrace &trace, TraceVisitor &visitor, std::string &e
     const size_t size = trace.data.size();
     size_t at = HEADER_SIZE;
     std::vector<uint8_t> decoded;
+    constexpr size_t NONE = ~size_t(0);
+    size_t pending = NONE; // the packet started and not yet ended
     auto fail = [&](const char *what) {
         error = std::string(what) + " at offset " + std::to_string(at);
         return false;
@@ -83,11 +85,21 @@ bool walk_gpu_trace(const GpuTrace &trace, TraceVisitor &visitor, std::string &e
             if (!have(12)) return fail("a packet cut short");
             uint64_t words = le32(p + 8);
             if (!have(12 + words * 4)) return fail("a packet's words run past the file");
-            visitor.packet(le32(p + 4), {p + 12, size_t(words * 4)});
+            // held until its end: the memory it reads is recorded in between
+            pending = at;
             at += 12 + words * 4;
             break;
         }
-        case TraceCommand::PacketEnd: at += 4; break;
+        case TraceCommand::PacketEnd:
+            // as Xenia's player: one packet pending, so an indirect buffer's
+            // own packet gives way to the packets inside it
+            if (pending != NONE) {
+                const uint8_t *start = data + pending;
+                visitor.packet(le32(start + 4), {start + 12, size_t(le32(start + 8)) * 4});
+                pending = NONE;
+            }
+            at += 4;
+            break;
         case TraceCommand::MemoryRead:
         case TraceCommand::MemoryWrite: {
             if (!have(20)) return fail("a memory command cut short");

@@ -36,7 +36,9 @@ enum class TraceCommand : uint32_t {
 };
 
 // What a walk over a trace hands out, in the order recorded. Spans live only
-// for the call. Packets are the guest's words (big-endian), memory physical.
+// for the call. Packets are the guest's words (big-endian), handed out at
+// their end, after the memory they read (as Xenia's player executes them);
+// memory addresses are physical.
 class TraceVisitor {
 public:
     virtual ~TraceVisitor() = default;

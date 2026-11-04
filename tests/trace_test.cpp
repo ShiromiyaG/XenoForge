@@ -23,7 +23,8 @@ struct Writer {
         for (int i = 0; i < 4; i++) out.push_back(uint8_t(v >> (8 * i)));
     }
     void bytes(const std::vector<uint8_t> &b) { out.insert(out.end(), b.begin(), b.end()); }
-    void packet(std::vector<uint32_t> words) {
+    // what the packet read (memory commands) goes between its start and end
+    void packet(std::vector<uint32_t> words, const std::vector<uint8_t> &inside = {}) {
         u32(4); // PacketStart
         u32(0x1000);
         u32(uint32_t(words.size()));
@@ -32,6 +33,7 @@ struct Writer {
             put_be32(b, w);
             out.insert(out.end(), b, b + 4);
         }
+        bytes(inside);
         u32(5); // PacketEnd
     }
 };
@@ -81,21 +83,36 @@ std::vector<uint8_t> make_trace() {
     }
     std::vector<uint8_t> snappy = {uint8_t(raw.size()), uint8_t((raw.size() - 1) << 2)};
     snappy.insert(snappy.end(), raw.begin(), raw.end());
-    w.u32(6); // MemoryRead
-    w.u32(0x00100000);
-    w.u32(1); // snappy
-    w.u32(uint32_t(snappy.size()));
-    w.u32(uint32_t(raw.size()));
-    w.bytes(snappy);
+    Writer read; // a MemoryRead, recorded inside the IM_LOAD that made it
+    read.u32(6);
+    read.u32(0x00100000);
+    read.u32(1); // snappy
+    read.u32(uint32_t(snappy.size()));
+    read.u32(uint32_t(raw.size()));
+    read.bytes(snappy);
 
     w.u32(0); // PrimaryBufferStart
     w.u32(0x1000);
     w.u32(0);
     w.packet({type0(reg::RB_MODECONTROL), 4});                               // color and depth
-    w.packet({type3(pm4::IM_LOAD, 2), 0x00100000 | 1, uint32_t(ps.size())}); // the pixel shader
+    w.packet({type3(pm4::IM_LOAD, 2), 0x00100000 | 1, uint32_t(ps.size())}, read.out); // the pixel shader
     w.packet({type3(pm4::IM_LOAD_IMMEDIATE, 5), 0, 3, 1, 0x2000, 0});        // an empty vertex shader
     w.packet({type3(pm4::SET_CONSTANT, 2), 4u << 16 | 0x104, 0xF});          // RB_COLOR_MASK: target 0
-    w.packet({type3(pm4::DRAW_INDX_2, 1), 4 | 2u << 6 | 3u << 16});           // a triangle, auto index
+    // the draw inside an indirect buffer: the buffer's own packet ends after it
+    w.u32(4); // PacketStart of INDIRECT_BUFFER, two words
+    w.u32(0x1000);
+    w.u32(2);
+    for (uint32_t word : {type3(pm4::INDIRECT_BUFFER, 2), 0x2000u}) {
+        uint8_t b[4];
+        put_be32(b, word);
+        w.out.insert(w.out.end(), b, b + 4);
+    }
+    w.u32(2); // IndirectBufferStart
+    w.u32(0x2000);
+    w.u32(0);
+    w.packet({type3(pm4::DRAW_INDX_2, 1), 4 | 2u << 6 | 3u << 16}); // a triangle, auto index
+    w.u32(3); // IndirectBufferEnd
+    w.u32(5); // the indirect buffer packet's end
     w.packet({type0(reg::RB_MODECONTROL), 6});                               // copy
     w.packet({type0(reg::RB_COPY_CONTROL), 1u << 8});                        // color 0, cleared
     w.packet({type0(reg::RB_COPY_DEST_INFO), 6u << 7});                      // to 8_8_8_8
@@ -128,7 +145,11 @@ void counts_a_trace() {
 
     CHECK(s.packets[0] == 4 && s.packets[2] == 1 && s.packets[3] == 6 && s.bad_packets == 1);
     CHECK(s.type3.at(xenos::pm4::IM_LOAD) == 1 && s.type3.at(xenos::pm4::DRAW_INDX) == 1);
+    CHECK(!s.type3.count(xenos::pm4::INDIRECT_BUFFER)); // its packet gave way to the ones inside
     CHECK(s.memory_reads == 1 && s.swaps == 1);
+    CHECK(s.shaders.size() == 2);
+    for (const auto &[hash, shader] : s.shaders)
+        if (shader.type == 1) CHECK(shader.summary.memexport && shader.summary.texture_slots.count(7)); // read after the memory came
     CHECK(s.draws == 2 && s.resolves == 1);
     CHECK(s.primitives.at(4) == 1 && s.primitives.at(8) == 1 && s.sources.at(2) == 2);
     CHECK(s.edram_modes.at(4) == 1 && s.edram_modes.at(6) == 1);

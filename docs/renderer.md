@@ -104,9 +104,12 @@ the renderer decides what comes next.
 
 - **The trace corpus.** xenia-canary writes traces of chosen frames of any
   game with no input (`--trace_gpu_frames=300,1200`, beside its
-  `--trace_gpu_prefix`). XenoForge reads Xenia's trace format
+  `--trace_gpu_prefix`; F4 records the frame being played). It needs a
+  build with `XENIA_ENABLE_GPU_TRACE`: release downloads leave the writer
+  out. XenoForge reads Xenia's trace format
   (`trace_protocol.h`: packets, memory reads and writes, EDRAM snapshots,
-  registers), replays a frame into the renderer without a window, and
+  registers; a packet runs at its end, after the memory it read, as
+  Xenia's player runs it), replays a frame into the renderer without a window, and
   writes a PNG; Xenia's `trace_dump` writes the oracle's PNG of the same
   frame; the two are compared as the 3DS runtime compares with Zakuro (mean
   difference, share of pixels off by more than 16). Traces hold game data:

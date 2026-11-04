@@ -139,9 +139,14 @@ traces, without a recompiled game.
 
 **Track B: the GPU** ([renderer.md](renderer.md))
 
-- **B1. Traces.** xenia-canary built (its submodules first), traces of both
-  games and of any other the player owns; XenoForge reads them and counts
-  what each frame uses.
+- **B1. Traces** (under way, 2026-11-04). xenia-canary built from source with
+  `-DXENIA_ENABLE_GPU_TRACE=ON -DXENIA_BUILD_MISC=ON` (release downloads
+  leave the trace writer out; `build/version.h` is written by hand as
+  `xb` would), so it records traces and its `trace-dump` draws the
+  oracle's picture of each. XenoForge reads them (`gpu_trace.h`) and counts
+  what each frame uses (`xftrace`). First traces: both games' intros, with
+  no input; the game itself needs a player pressing F4 in Xenia, or input
+  sent to it.
 - **B2. The microcode translator** to SPIR-V, with its harness.
 - **B3. The renderer**: front end, render targets, textures, draws; a trace
   replayed and compared with Xenia's picture.

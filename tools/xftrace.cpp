@@ -87,10 +87,10 @@ void report(const TraceStats &s) {
         for (auto [k, v] : u.vertex_formats) vformats[k] += v;
         for (auto [k, v] : u.texture_dims) tdims[k] += v;
     }
-    std::printf("  %-18s%llu vertex, %llu pixel (%llu KB of microcode); %llu with memexport, %llu that kill, %llu cut "
+    std::printf("  %-18s%llu vertex, %llu pixel (%llu bytes of microcode); %llu with memexport, %llu that kill, %llu cut "
                 "short; draws without a shader %llu, with memexport %llu\n",
                 "shaders", static_cast<unsigned long long>(vertex), static_cast<unsigned long long>(pixel),
-                static_cast<unsigned long long>(dwords * 4 / 1024), static_cast<unsigned long long>(memexport),
+                static_cast<unsigned long long>(dwords * 4), static_cast<unsigned long long>(memexport),
                 static_cast<unsigned long long>(kills), static_cast<unsigned long long>(truncated),
                 static_cast<unsigned long long>(s.draws_without_shader),
                 static_cast<unsigned long long>(s.draws_with_memexport));
