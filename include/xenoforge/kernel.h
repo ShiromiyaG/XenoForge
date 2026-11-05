@@ -13,6 +13,7 @@
 
 #include "xenoforge/memory.h"
 #include "xenoforge/ppc_context.h"
+#include "xenoforge/ppc_module.h"
 #include "xenoforge/xex.h"
 
 #include <atomic>
@@ -76,12 +77,11 @@ struct Import {
     uint16_t ordinal = 0;
     uint32_t thunk = 0;
     ExportFn fn = nullptr;     // nullptr: not implemented yet
+    // a game library's function (a DLL's export): where the thunk jumps
+    uint32_t forward = 0;
 };
 
-struct Generated {
-    uint32_t address;
-    void (*fn)(ppc::Context &);
-};
+using Generated = ppc::GeneratedFunction;
 
 // The modules family's parts (modules.cpp). setup_kernel, as the kernel
 // starts: the guest globals (object types, processes), the kernel's memory
@@ -107,8 +107,12 @@ uint32_t module_export(Kernel &k, uint32_t hmodule, uint16_t ordinal);
 void modules_thread_start(Kernel &k, ppc::Context &c);
 void modules_thread_end(Kernel &k, ppc::Context &c);
 // the modules, for boot: the kernel's the game loaded, the executable and
-// the DLLs (path, range, entry, load count), and those unloaded
+// the DLLs (path, range, entry, load count, generated code), and those
+// unloaded
 std::string modules_report(Kernel &k);
+// the file name of the game's module loaded at address ("" if none), for
+// boot's report of where the interpreter was entered
+std::string module_at(Kernel &k, uint32_t address);
 // The file system (files.cpp, xam.cpp; Xenia's VirtualFileSystem and its
 // mounts): the game's disc at \Device\Cdrom0, or a bare executable's
 // directory at \Device\Harddisk0\Partition1 (read-only), with game: and d:
@@ -184,7 +188,18 @@ public:
     const Xex *xex() const { return xex_; }
     const std::vector<Import> &imports() const { return imports_; }
 
-    // the generated code, if linked (sorted by address)
+    // The generated code (docs/runtime.md, "Code"). A game library carries a
+    // table per module (ppc_module.h), set before load(): when an image is
+    // placed at its base (the executable in load(), a DLL as XexLoadImage
+    // loads it), the table made from the same image (its base, size and
+    // digest) runs the code in its range, until the image is unloaded; an
+    // image no table matches (another version, a title update) runs in the
+    // interpreter. add_module_code says which, for the modules' report.
+    void set_generated_modules(const ppc::GeneratedModule *const *modules, size_t count);
+    std::string add_module_code(const Xex &xex);
+    void remove_module_code(uint32_t base);
+    // Functions at any address, looked up before the modules' (sorted by
+    // address; the tests' host functions).
     void set_generated(const Generated *table, size_t count);
 
     // The title's main thread (Xenia's KernelState::LaunchModule): the
@@ -272,6 +287,10 @@ public:
 private:
     void bind(const Xex &xex, bool executable);
     void run_import(ppc::Context &c, const Import &import);
+    void publish_code();
+    // the interpreter from pc until the call returns to until with r1 back
+    // at stack_top; a longjmp past stack_top is thrown on (kernel.cpp)
+    void interpret_from(ppc::Context &c, uint32_t pc, uint32_t until, uint32_t stack_top);
     // a thunk add_thunk wrote (nullptr if none is at the address)
     const Import *find_thunk(uint32_t address) const;
     const Mmio *find_mmio(uint32_t address) const;
@@ -289,6 +308,12 @@ private:
     std::unordered_map<uint32_t, size_t> by_thunk_;
     const Generated *generated_ = nullptr;
     size_t generated_count_ = 0;
+    // the modules' generated code (kernel.cpp): the ranges try_call reads, a
+    // map replaced whole as modules load and unload, and the rest
+    struct CodeMap;
+    struct Code;
+    std::atomic<const CodeMap *> code_map_{nullptr};
+    std::unique_ptr<Code> code_;
     // (a module's imports add to it while threads read it)
     mutable std::shared_mutex variables_mutex_;
     std::map<std::string, uint32_t> variables_;

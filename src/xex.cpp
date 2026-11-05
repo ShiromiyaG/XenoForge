@@ -375,4 +375,40 @@ std::vector<XexImport> list_imports(const Xex &xex) {
     return imports;
 }
 
+// Not translated: four lanes of eight-byte words, each lane folding a word in
+// with a multiply and a shift (a bijection of the lane for a given word, so a
+// single word changed always changes the lane), then the lanes and the length
+// mixed with splitmix64's finalizer. About as fast as memory reads it.
+uint64_t image_digest(std::span<const uint8_t> image) {
+    auto fold = [](uint64_t h, uint64_t w) {
+        h = (h ^ w) * 0xBF58476D1CE4E5B9ull;
+        return h ^ (h >> 31);
+    };
+    auto mix = [](uint64_t h) {
+        h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ull;
+        h = (h ^ (h >> 27)) * 0x94D049BB133111EBull;
+        return h ^ (h >> 31);
+    };
+    auto word = [&](size_t at) {
+        uint64_t w;
+        std::memcpy(&w, image.data() + at, 8);
+        return w;
+    };
+    uint64_t lane[4] = {0x9E3779B97F4A7C15ull, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull};
+    size_t n = image.size(), at = 0;
+    for (; at + 32 <= n; at += 32)
+        for (int k = 0; k < 4; k++) lane[k] = fold(lane[k], word(at + 8 * k));
+    for (; at + 8 <= n; at += 8) lane[0] = fold(lane[0], word(at));
+    if (at < n) {
+        uint8_t tail[8] = {};
+        std::memcpy(tail, image.data() + at, n - at);
+        uint64_t w;
+        std::memcpy(&w, tail, 8);
+        lane[1] = fold(lane[1], w);
+    }
+    uint64_t h = mix(uint64_t(n));
+    for (uint64_t l : lane) h = mix(h ^ l);
+    return h;
+}
+
 } // namespace xf

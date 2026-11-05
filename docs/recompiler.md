@@ -135,15 +135,18 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   by their first words, one entry per register as rexglue does); `.pdata`
   (8-byte entries: begin, then prolog length, length in instructions,
   32-bit and exception flags; with the exception flag, the handler and its
-  scope or FuncInfo table give the funclets); the entry point; the data
-  pointer scan's (below); `bl` targets; last, gaps no function covers.
-  On El Chavo Kart `.pdata` alone gives 52,360 of the 73,587 functions.
+  scope or FuncInfo table give the funclets); the entry point; a DLL's
+  exports (the XEX export table the security info points at, and the PE
+  export directory, as GetProcAddress reads them); the data pointer scan's
+  (below); `bl` targets; last, gaps no function covers. On El Chavo Kart
+  `.pdata` alone gives 52,360 of the 73,587 functions.
 - **The data pointer scan** (`scan_pointers`, `DiscoverOptions`; translated
   from the fork's `codegen/pointer_scan.cpp`, its `[analysis]
   scan_data_pointers`): every word of the sections that are not code
   (vtables, callback tables, fields), and every `lis rX`/`addi rY, rX` pair
   in code, whose value looks like a function's first instruction (`mflr
-  r12`, `stwu r1`, or after `blr`/`bctr`/`b`/0) is a candidate; engines
+  r12`, `stwu r1`, or after `blr`/`bctr`/`b`/0 or a `.pdata` function's
+  end) is a candidate; engines
   without RTTI (UE3) reach most of their methods only so. A baseline run
   says which the image explains already (a start, or a branch target inside
   a function); the rest become starts and discovery runs again. A candidate
@@ -153,7 +156,12 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   the culprit is dropped (the first candidate after the branch going
   forward, the last before it going backward, else every one in the span),
   and the passes go on until nothing changes; branch targets no function
-  holds are added the same way. Branches unresolved without the scan say
+  holds are added the same way, and so are those inside a function whose
+  end was only walked to (no `.pdata` size) when the branch reaches no start
+  without the scan either: the XDK's context-save routine after a call that
+  never returns (the walk runs on past the `bl`; Forza Horizon and Reach),
+  a tail two functions share (Reach); the holder then runs on into it as a
+  tail call. Branches unresolved without the scan say
   nothing about the candidates. Not in rexglue: an address inside a jump
   table discovery read is no start (the `lis`/`addi` that loads a table's
   address after its `bctr` looks like one), nor one inside the prologue
@@ -163,7 +171,8 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   funclets an exception scope table names. `xfrecomp --no-pointers` leaves
   the scan out.
 - **Gaps**: code no function covers gets a function after each end (`blr`,
-  `bctr`, `b`) and after padding, as rexglue splits its gaps; each is
+  `bctr`, `b`, or where `.pdata` says a function ends, which may be a call
+  that never returns) and after padding, as rexglue splits its gaps; each is
   walked as soon as it is found, so a run of leaf methods is cut in one
   pass (rounds of one gap per run left all but the first 8 of El Chavo
   Kart's longer runs to the interpreter). A `blr` alone right after an end
@@ -187,6 +196,16 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   `cmplwi 12` is 13 entries, not 32). A compare guessed from elsewhere in the
   function that the table does not hold code for is dropped for an
   unbounded read.
+- **Stack switches**: a function that loads r1 from memory r1 does not
+  address (`ld r1, 0x90(r7)`: the CRT's longjmp; `ld r1, 0x20(r4); blr`:
+  the C++ exception machinery's jump to a catch's continuation) or branches
+  to KeSetCurrentStackPointers' thunk (the XDK's SwitchToFiber, in Reach)
+  returns to another frame than its caller's, which a C++ `return` cannot
+  do. It gets no generated code (`Function::switches_stack`): calls to it
+  dispatch, the interpreter runs it, and the runtime takes its return to
+  that frame (docs/runtime.md, "Code"). The eight games have 0 to 3 each,
+  all of those kinds; BC2's splash screen longjmps (its generated code
+  faulted when longjmp "returned" into padding), Reach switches fibers.
 - **Everything else** that is indirect (`bctr`, `bctrl`, `blrl`, a branch
   to an address no function holds) goes through the dispatch table, and an
   address with no generated code runs in the interpreter: a wrong guess
@@ -235,6 +254,84 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   far as registering its XAudio client; Ben 10 1,154 instead of 1,043 (60
   a second).
 
+## Modules and the game library
+
+A game is every executable on its disc, not one: Forza Horizon loads
+`XMediaFacade_default.xex`, Reach four Waves DLLs, BC2 boots a launcher
+that loads `Splash.xex` and then `Game.xex`, both at 0x82A00000. So the
+generated code is per module:
+
+- **`xfrecomp emit <iso> <dir>`** discovers and emits each XEX2 file on
+  the disc (but the system update's and title updates; `--xex` picks), each
+  into a directory of its own named after its path (`default_xex`,
+  `waves_L360_dll`), its functions in a namespace of their own
+  (`xfm_waves_L360_dll::xf_894206E0`), so modules at the same addresses
+  link into one library. Each DLL's 16-byte import records are thunks, as
+  the executable's are; a call through one stays a dispatch call, the
+  kernel taking it to the export (docs/runtime.md, "Code").
+- **The table** (`ppc_module.h`, `table.cpp`): the module's path, base,
+  image size and the digest of its image as the loader unpacks it
+  (`image_digest`: 64 bits, four lanes of multiply-folds, as fast as memory
+  reads; SHA-1 would have cost 80 ms of El Chavo Kart's start), and its
+  functions by address. `modules.cpp` lists every module's table
+  (`xf_modules`); the kernel gives a table its module's range when an image
+  with that digest loads, so another version of a module or a title update
+  runs interpreted, never another image's code.
+- **Files**: one per 64 KB of the image (about 16,000 instructions), each
+  declaring only what it calls, written only when its text changes. A
+  discovery fix then rebuilds the files it touched (Forza Horizon's and
+  Reach's below: 2 and 4 files of 224 and 149), where one header declaring
+  every function made any change rebuild the whole game, and every file
+  parsed 1.5 MB of declarations (about 4 minutes per million instructions
+  were measured with that layout under other builds' load).
+- **Optimization**: `XF_GAME_OPT` (default `-O2`) and `XF_GAME_OPT_<game>`.
+  Measured here at -O2 (12 threads): El Chavo Kart's 4.7M instructions in
+  269 s; the other six games' 21.7M in 1,465 s, part of it beside another
+  build; Ben 10's 1.7M in 143 s, and 100 s at -O1. Linking a `boot_<game>`
+  takes about a minute, which dominates a rebuild after a discovery fix (60
+  files of the eight games and eight links: 534 s). -O2 stays the default:
+  every game builds in under half an hour.
+
+The eight games (2026-11-05; functions with generated code, so neither
+imports nor stack switches; instructions are their sizes / 4; switches:
+functions left to the interpreter for switching the stack; unresolved:
+direct branches and table cases to no start, with the scan):
+
+| game | module | functions | instructions | switches | unresolved |
+|---|---|---|---|---|---|
+| El Chavo Kart | default.xex | 73,292 | 4,720,319 | 1 | 0 |
+| Ben 10 | default.xex | 21,718 | 1,711,798 | 2 | 0 |
+| BC2 | Default.xex | 292 | 12,518 | 0 | 0 |
+| | Splash.xex | 6,833 | 679,160 | 1 | 0 |
+| | Game.xex | 54,016 | 2,773,485 | 2 | 0 |
+| Forza Horizon | default.xex | 76,044 | 3,654,955 | 3 | 8 |
+| | XMediaFacade_default.xex | 3,163 | 525,032 | 0 | 0 |
+| | SpeechFacade_default.xex | 6,648 | 374,001 | 1 | 0 |
+| Gears of War 3 | default.xex | 56,300 | 3,465,659 | 2 | 0 |
+| Reach | default.xex | 37,901 | 2,424,184 | 3 | 0 |
+| | waveShell-Xbox.dll | 2,652 | 103,993 | 1 | 0 |
+| | wavesLibDLL.dll | 3,372 | 141,968 | 1 | 0 |
+| | waves\L360.dll | 1,351 | 47,300 | 1 | 0 |
+| | waves\Q10.dll | 1,146 | 38,075 | 1 | 0 |
+| Red Dead Redemption | default.xex | 69,231 | 3,418,826 | 0 | 0 |
+| Sonic Unleashed | default.xex | 65,840 | 4,046,340 | 2 | 0 |
+
+Two discovery fixes came from running them: the branch targets inside a
+walked function (above, "The data pointer scan"), and a .pdata function's
+end as an end for the gap filler and the pointer scan whatever its last
+instruction: a function that ends calling one that never returns (`bl
+_CxxThrowException`) is followed by another, Sonic's adjustor thunks
+(`addi r3, r3, 0xC; b ...`) reached only through vtables, which the gap
+filler skipped for want of a `blr` or `b` before them (Sonic entered the
+interpreter 135,471 times at 4 of them in 30 s; 12 such starts on Sonic, 1
+each on Forza Horizon, Reach and two of its DLLs).
+
+Forza Horizon's 8 are one byte-offset table's cases (0x829EB474: `rlwinm
+r10, r9, 0, 26, 31`, so 64 entries by the mask, no compare) past the end of
+its function, into the middle of the next: the table is shorter than the
+mask allows and the bytes after it are other data. They are emitted as
+dispatches (what the hardware would do if the index ever got there).
+
 ## Steps
 
 1. Decoder and disassembler, checked against Xenia's (above).
@@ -245,4 +342,5 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
    jump tables, the data pointers rexglue's fork scans; compared with
    rexglue's lists.
 4. Emission: C++ per function, the dispatch table, the listing; the
-   instruction tests recompiled; both games compiled.
+   instruction tests recompiled; both games compiled, then every module
+   of the eight games, a table each.

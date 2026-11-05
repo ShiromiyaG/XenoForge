@@ -7,7 +7,8 @@
 // the scripted presses (--press) both take.
 //
 // Compiled into each executable (with XF_GENERATED in the ones linked with a
-// game's generated code), so the table it installs is that game's.
+// game's generated code), so the tables it installs (one per module) are
+// that game's.
 
 #pragma once
 

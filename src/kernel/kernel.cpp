@@ -14,7 +14,9 @@
 // 0xDEADC0DE; a variable's gets the address of the kernel's object for it.
 // A game's library's (a DLL's) function thunk gets lis r11 / ori r11 with
 // the export's address in place of its first two instructions, so its own
-// mtctr r11; bctr jumps there; a variable's record gets the address; what
+// mtctr r11; bctr jumps there (dispatch to the thunk goes to the export
+// itself, so generated code reaches the export's generated code: not in
+// Xenia, whose JIT runs the thunk); a variable's record gets the address; what
 // the library does not export gets 0xF00DF00D, or an unimplemented thunk.
 // An import no table names is called "<library>_<ordinal, 3 hex digits>", as
 // Xenia names it. Unlike Xenia, the imports from xbdm.xex are bound as the
@@ -76,7 +78,33 @@ uint32_t arg(Kernel &k, ppc::Context &c, int n) {
     return k.load32(uint32_t(c.r[1]) + 0x54 + uint32_t(n - 8) * 8);
 }
 
-Kernel::Kernel(Memory &memory) : memory_(memory) {
+// What try_call reads: the generated code of each module loaded, as a range
+// and a table with a slot per instruction ((address - begin) / 4), so a
+// lookup is one range compare per module and one load. Never changed once
+// published: a load or unload publishes a new one.
+struct Kernel::CodeMap {
+    using Fn = void (*)(ppc::Context &);
+    struct Range {
+        uint32_t begin = 0, size = 0; // the first function to the end of the last one's first word
+        const Fn *table = nullptr;
+        const ppc::GeneratedModule *module = nullptr;
+    };
+    std::vector<Range> ranges;
+};
+
+struct Kernel::Code {
+    std::mutex mutex; // the writers'
+    std::vector<const ppc::GeneratedModule *> available;
+    // each module's range and table, made the first time its image loads and
+    // kept (a module unloaded and loaded again finds it)
+    std::map<const ppc::GeneratedModule *, CodeMap::Range> ranges;
+    std::vector<std::unique_ptr<CodeMap::Fn[]>> tables;
+    std::map<uint32_t, const ppc::GeneratedModule *> loaded; // by base
+    // every map published: a thread may still read one replaced
+    std::vector<std::unique_ptr<CodeMap>> maps;
+};
+
+Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()) {
     system_.owner = this;
     system_.syscall = [](ppc::Context &c) {
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
@@ -258,9 +286,16 @@ void Kernel::bind(const Xex &xex, bool executable) {
             } else if (type == 1) {
                 if (user) {
                     // lis r11, hi; ori r11, r11, lo: the thunk's mtctr r11;
-                    // bctr goes to the export
+                    // bctr goes to the export. Dispatch to the thunk goes
+                    // there itself (try_call), so generated code reaches the
+                    // export's generated code with no interpreted thunk.
                     store32(record + 0, 0x3D600000 | (user >> 16));
                     store32(record + 4, 0x616B0000 | (user & 0xFFFF));
+                    Import im;
+                    im.library = lib, im.name = name, im.ordinal = ordinal, im.thunk = record, im.forward = user;
+                    std::unique_lock lock(thunks_mutex_);
+                    thunks_[record] = std::move(im);
+                    has_thunks_ = true;
                     continue;
                 }
                 // sc 2; blr; nop; nop
@@ -294,6 +329,65 @@ void Kernel::remove_thunks(uint32_t begin, uint32_t end) {
 
 void Kernel::set_generated(const Generated *table, size_t count) { generated_ = table, generated_count_ = count; }
 
+void Kernel::set_generated_modules(const ppc::GeneratedModule *const *modules, size_t count) {
+    std::lock_guard lock(code_->mutex);
+    code_->available.assign(modules, modules + count);
+}
+
+std::string Kernel::add_module_code(const Xex &xex) {
+    std::lock_guard lock(code_->mutex);
+    if (code_->available.empty()) return {};
+    // the base and size first: the digest is computed only for a candidate
+    uint32_t base = xex.base_address, size = uint32_t(xex.image.size());
+    const ppc::GeneratedModule *match = nullptr, *other = nullptr;
+    uint64_t digest = 0;
+    bool digested = false;
+    for (const ppc::GeneratedModule *m : code_->available) {
+        if (m->base != base || m->size != size) continue;
+        if (!digested) digest = image_digest(xex.image), digested = true;
+        if (m->digest == digest) {
+            match = m;
+            break;
+        }
+        other = m;
+    }
+    if (!match)
+        return other ? std::string("interpreted: its image is not the one ") + other->name +
+                           "'s generated code was made from"
+                     : "interpreted: no generated code for it";
+    auto [it, made] = code_->ranges.try_emplace(match);
+    CodeMap::Range &r = it->second;
+    if (made && match->count) {
+        uint32_t begin = UINT32_MAX, end = 0;
+        for (size_t i = 0; i < match->count; i++)
+            begin = std::min(begin, match->functions[i].address), end = std::max(end, match->functions[i].address + 4);
+        auto table = std::make_unique<CodeMap::Fn[]>((end - begin) / 4);
+        for (size_t i = 0; i < match->count; i++)
+            table[(match->functions[i].address - begin) / 4] = match->functions[i].fn;
+        r = {begin, end - begin, table.get(), match};
+        code_->tables.push_back(std::move(table));
+    }
+    code_->loaded[base] = match;
+    publish_code();
+    return "generated code, " + std::to_string(match->count) + " functions";
+}
+
+void Kernel::remove_module_code(uint32_t base) {
+    std::lock_guard lock(code_->mutex);
+    if (code_->loaded.erase(base)) publish_code();
+}
+
+// (code_->mutex held)
+void Kernel::publish_code() {
+    auto map = std::make_unique<CodeMap>();
+    for (const auto &[base, m] : code_->loaded) {
+        const CodeMap::Range &r = code_->ranges[m];
+        if (r.size) map->ranges.push_back(r);
+    }
+    code_map_.store(map.get(), std::memory_order_release);
+    code_->maps.push_back(std::move(map));
+}
+
 void Kernel::attach(ppc::Context &c) {
     c.base = memory_.base();
     c.system = &system_;
@@ -324,27 +418,73 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
             return true;
         }
     }
+    // the module whose generated code holds the address, then its slot
+    if (const CodeMap *map = code_map_.load(std::memory_order_acquire)) {
+        for (const CodeMap::Range &r : map->ranges) {
+            uint32_t offset = target - r.begin;
+            if (offset >= r.size) continue;
+            if (CodeMap::Fn fn = r.table[offset / 4]; fn && !(offset & 3)) {
+                fn(c);
+                return true;
+            }
+            break;
+        }
+    }
     auto thunk = by_thunk_.find(target);
     if (thunk != by_thunk_.end()) {
         run_import(c, imports_[thunk->second]);
         return true;
     }
     if (const Import *added = find_thunk(target)) {
-        run_import(c, *added);
+        if (added->forward) {
+            // a game library's thunk: what its lis/ori r11, mtctr r11, bctr
+            // do, then the export, generated or interpreted
+            c.r[11] = c.ctr = added->forward;
+            dispatch(c, added->forward);
+        } else {
+            run_import(c, *added);
+        }
         return true;
     }
     return false;
 }
 
+// A longjmp (docs/runtime.md, "Code"): an interpreted blr out of the frames
+// its dispatch began in, to a frame further up. Thrown through the generated
+// code's frames (C++ cannot return into the middle of one) to the dispatch
+// whose frames hold the stack it restored, which interprets on from where it
+// went: the rest of the functions between, interpreted, until the guest
+// returns to that dispatch's own return address and stack.
+struct GuestUnwind {
+    uint32_t target;
+};
+
 void Kernel::dispatch(ppc::Context &c, uint32_t target) {
     if (stopped) return;
-    if (try_call(c, target)) return;
-    interpreted_++;
-    {
-        std::lock_guard<std::mutex> lock(counts_mutex_);
-        interpreted_targets_[target]++;
+    // what a return from this call comes back to
+    const uint32_t until = uint32_t(c.lr), stack_top = uint32_t(c.r[1]);
+    uint32_t pc = target;
+    for (bool unwound = false;;) {
+        try {
+            if (!unwound && try_call(c, target)) return;
+            interpreted_++;
+            {
+                std::lock_guard<std::mutex> lock(counts_mutex_);
+                interpreted_targets_[pc]++;
+            }
+            interpret_from(c, pc, until, stack_top);
+            return;
+        } catch (const GuestUnwind &u) {
+            // a frame of this call's, or one further up
+            if (uint32_t(c.r[1]) > stack_top) throw;
+            pc = u.target, unwound = true;
+        }
     }
-    ppc::Stopped s = ppc::interpret(c, target, uint32_t(c.lr), step_limit);
+}
+
+void Kernel::interpret_from(ppc::Context &c, uint32_t pc, uint32_t until, uint32_t stack_top) {
+    ppc::Stopped s = ppc::interpret(c, pc, until, step_limit, stack_top);
+    if (s.reason == ppc::Stopped::Unwound) throw GuestUnwind{s.pc};
     if (s.reason != ppc::Stopped::Returned && !stopped.exchange(true)) {
         char reason[128];
         std::snprintf(reason, sizeof(reason), "the interpreter stopped at 0x%08X: %s", s.pc,
@@ -357,7 +497,35 @@ void Kernel::dispatch(ppc::Context &c, uint32_t target) {
 
 void Kernel::call(ppc::Context &c, uint32_t address) {
     c.lr = SENTINEL;
-    dispatch(c, address);
+    uint32_t target;
+    try {
+        dispatch(c, address);
+        return;
+    } catch (const GuestUnwind &u) {
+        target = u.target;
+    }
+    // r1 above every frame of this call: a fiber whose stack lies above the
+    // thread's (or a longjmp out of a callback the kernel made). The guest
+    // goes on from there, interpreted, until it returns from this call, its
+    // own unwinds no longer checked; one from a dispatch below (generated
+    // code it calls switching fibers again) comes here too.
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "kernel: a blr to 0x%08X with r1 0x%08X left the frames of a call to 0x%08X\n", target,
+                     uint32_t(c.r[1]), address);
+    for (;;) {
+        interpreted_++;
+        {
+            std::lock_guard<std::mutex> lock(counts_mutex_);
+            interpreted_targets_[target]++;
+        }
+        try {
+            interpret_from(c, target, SENTINEL, 0);
+            return;
+        } catch (const GuestUnwind &u) {
+            target = u.target;
+        }
+    }
 }
 
 std::map<std::string, uint64_t> Kernel::calls() const {

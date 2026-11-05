@@ -11,7 +11,8 @@
 // content/ for saves, cache*/), a temporary directory's xenoforge by default.
 //
 // Built as boot_<game> (CMake's XF_GAMES), it links that game's generated
-// code (xfrecomp emit) and dispatch runs it; --interpret leaves it out.
+// code (xfrecomp emit: a table per executable and DLL) and dispatch runs a
+// module's once the module is loaded; --interpret leaves it out.
 // --render draws what the GPU is sent (the renderer as the command
 // processor's Sink, on a Vulkan device without a window); off by default,
 // so the GPU stays headless. --shots <dir> writes the front buffer of chosen

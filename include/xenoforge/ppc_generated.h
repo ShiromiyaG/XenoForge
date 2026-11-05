@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "xenoforge/ppc_module.h"
 #include "xenoforge/ppc_ops.h"
 
 namespace xf::ppc {

@@ -140,6 +140,13 @@ struct XexImport {
 
 std::vector<XexImport> list_imports(const Xex &xex);
 
+// A digest of an image as load_xex_image unpacks it (64 bits, not
+// cryptographic; the host's byte order): what ties a module's generated code
+// to the image it was made from (ppc_module.h). Another version of the module
+// or a title update gives another digest. Fast enough for every load (a few
+// milliseconds for 30 MB).
+uint64_t image_digest(std::span<const uint8_t> image);
+
 const char *compression_name(XexCompression c);
 
 } // namespace xf

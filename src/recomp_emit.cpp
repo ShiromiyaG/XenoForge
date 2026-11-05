@@ -29,8 +29,10 @@ std::string hex8(uint32_t v) {
 
 class Emitter {
 public:
-    Emitter(const Image &image, const Discovery &d, const Function &f, const std::string &prefix)
-        : image_(image), d_(d), f_(f), prefix_(prefix), end_(f.address + std::max<uint32_t>(f.size, 4)) {}
+    Emitter(const Image &image, const Discovery &d, const Function &f, const std::string &prefix,
+            std::set<uint32_t> *calls)
+        : image_(image), d_(d), f_(f), prefix_(prefix), end_(f.address + std::max<uint32_t>(f.size, 4)),
+          calls_(calls) {}
 
     std::string run() {
         walk();
@@ -50,10 +52,11 @@ public:
     std::string name(uint32_t address) const { return prefix_ + hex8(address); }
 
 private:
-    // a function the code can call directly (imports go through dispatch)
+    // a function the code can call directly (imports, and functions that
+    // load r1 and so are left to the interpreter, go through dispatch)
     bool callable(uint32_t address) const {
         auto it = d_.functions.find(address);
-        return it != d_.functions.end() && it->second.source != Source::Import;
+        return it != d_.functions.end() && it->second.source != Source::Import && !it->second.switches_stack;
     }
     bool internal(uint32_t target) const {
         return target >= f_.address && target < end_ && code_.count(target) &&
@@ -109,11 +112,17 @@ private:
             if (first) referenced_.insert(target);
             return "goto L_" + hex8(target) + ";";
         }
-        if (callable(target)) return "XF_TAIL(" + name(target) + ");";
+        if (callable(target)) {
+            if (calls_) calls_->insert(target);
+            return "XF_TAIL(" + name(target) + ");";
+        }
         return "{ ::xf::ppc::dispatch(c, 0x" + hex8(target) + "); return; }";
     }
     std::string call(uint32_t target) {
-        if (callable(target)) return name(target) + "(c);";
+        if (callable(target)) {
+            if (calls_) calls_->insert(target);
+            return name(target) + "(c);";
+        }
         return "::xf::ppc::dispatch(c, 0x" + hex8(target) + ");";
     }
 
@@ -224,14 +233,16 @@ private:
     uint32_t end_;
     std::set<uint32_t> code_, referenced_;
     std::string *out_ = nullptr;
+    std::set<uint32_t> *calls_; // the functions it calls by name, when asked
 };
 
 } // namespace
 
 std::string function_name(const std::string &prefix, uint32_t address) { return prefix + hex8(address); }
 
-std::string emit_function(const Image &image, const Discovery &d, const Function &f, const std::string &prefix) {
-    return Emitter(image, d, f, prefix).run();
+std::string emit_function(const Image &image, const Discovery &d, const Function &f, const std::string &prefix,
+                          std::set<uint32_t> *calls) {
+    return Emitter(image, d, f, prefix, calls).run();
 }
 
 } // namespace xf::recomp

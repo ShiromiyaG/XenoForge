@@ -138,8 +138,14 @@ traces, without a recompiled game.
   [recompiler.md](recompiler.md)); emission (labels, calls, tail calls, jump
   table switches, dispatch); both games emitted and compiled, and in 20 s of
   `boot` neither enters the interpreter (El Chavo Kart did 262,094 times
-  before the scan and the gap fix). Next: exception funclets from the scope
-  tables, the listing and `#line`, yield points.
+  before the scan and the gap fix). Then (2026-11-05, later): generated code
+  per module (a table per executable and DLL, matched to the image loaded by
+  its digest, dispatch through a slot per instruction), files that declare
+  what they call and are rewritten only when they change, and all eight
+  games emitted (28M instructions, 16 modules) and built
+  ([recompiler.md](recompiler.md), "Modules and the game library"). Next:
+  exception funclets from the scope tables, the listing and `#line`, yield
+  points.
 - **A3. The interpreter** (in, 2026-11-04): the same ops, the branches its
   own; runs the instruction tests and whatever dispatch finds without
   generated code.
@@ -156,8 +162,26 @@ traces, without a recompiled game.
   (CMake's `XF_GAMES`). With their code generated, both games run their
   frame loop at their caps (El Chavo Kart 30 swaps a second, Ben 10 60)
   with no interpreter entry and no unimplemented call; interpreted, all
-  eight games run 30 s without stopping (Forza Horizon, Reach and BC2 with
-  their DLLs, interpreted until a module gets its own generated table).
+  eight games run 30 s without stopping. Then (2026-11-05, later): a
+  generated table per module, matched to each image as it loads, and the
+  runtime's unwinding for longjmp and fiber switches; all eight games run
+  30 s with their code generated, every module's (30 s of `boot_<game>`,
+  generated / interpreted, swaps a second over the run):
+
+  | game | first swap | swaps a second | interpreter entries (generated) |
+  |---|---|---|---|
+  | El Chavo Kart | 1.0 s / 1.1 s | 30.0 / 14.4 | 0 |
+  | Ben 10 | 1.0 s / 13.0 s | 60.0 / 58.5 | 0 |
+  | BC2 (launcher, Splash.xex) | 1.2 s / 11.3 s | 30.0 / 14.4 | 16 (8 longjmps) |
+  | Forza Horizon (+ XMediaFacade) | 1.1 s / 6.4 s | 52.7 / 13.8 | 0 |
+  | Gears of War 3 | 1.0 s / 1.1 s | 14.9 / 2.2 | 0 |
+  | Reach (+ four Waves DLLs) | 1.4 s / 3.2 s | 58.4 / 25.2 | 1,803 (fiber switches) |
+  | Red Dead Redemption | 5.0 s / 8.5 s | 27.0 / 21.5 | 0 |
+  | Sonic Unleashed | 2.0 s / 21.1 s | 29.9 / 24.1 | 0 |
+
+  Gears of War 3, generated, gets as far as its sockets: the xam NetDll_*
+  it calls are not implemented (NetDll_socket answers 0), and it polls
+  NetDll_recvfrom 4.26M times in 30 s.
 - **A5. The deterministic mode**, input recording and replay.
 - **A6. Sound** (XMA: Xenia decodes it with FFmpeg's XMA decoder from its own
   fork; LGPL, linked dynamically), input, saves.
@@ -253,7 +277,10 @@ runs live as the command processor's
 Sink, headless (`boot --render`); next the player (C1: the window and the
 presentation, input) for M1, and the renderer's speed (B4: draws batched
 into fewer submissions, resolves on the GPU). Generated tables per module
-(the DLLs' code), and the other six games' code generated.
+and the other six games' code generated are in (A2, A4); left there: fiber
+switches and longjmps leave the rest of the frames they skip interpreted (a
+fiber scheduler of our own, as Xenia re-enters the thread, would keep them
+generated), and what each game asks of the kernel past 30 seconds.
 
 ## Decisions
 

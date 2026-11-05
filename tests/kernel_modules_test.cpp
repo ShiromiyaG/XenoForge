@@ -625,6 +625,39 @@ std::vector<uint8_t> make_app(uint32_t log) {
                      {"xboxkrnl.exe", {APP + IMPORTS + 0x40, APP + IMPORTS + 0x50, APP + IMPORTS + 0x60}}});
 }
 
+// The generated code per module: lib.dll's table, made from its image, has
+// its export 1 as host code that does what the guest code does (the kernel's
+// import through the thunk, plus 7) and counts its calls; app.dll's table
+// names the same base and size and another digest (another version of the
+// module), so app.dll's code stays interpreted and its "generated" export
+// never runs.
+std::atomic<int> lib_generated_calls{0};
+std::atomic<bool> app_generated_ran{false};
+kernel::Kernel *modules_kernel = nullptr;
+void lib_function(ppc::Context &c) {
+    lib_generated_calls++;
+    modules_kernel->dispatch(c, LIB + IMPORTS + 0x10);
+    c.r[3] = uint32_t(c.r[3]) + 7;
+}
+void app_function(ppc::Context &c) {
+    app_generated_ran = true;
+    c.r[3] = 0;
+}
+const ppc::GeneratedFunction lib_functions[] = {{LIB + FUNCTION, lib_function}};
+const ppc::GeneratedFunction app_functions[] = {{APP + FUNCTION, app_function}};
+ppc::GeneratedModule lib_module{"lib.dll", LIB, 0, 0, lib_functions, 1};
+ppc::GeneratedModule app_module{"app.dll", APP, 0, 0, app_functions, 1};
+const ppc::GeneratedModule *const generated_modules[] = {&lib_module, &app_module};
+
+// a module's table for a DLL file, its digest as the kernel computes it
+void made_from(ppc::GeneratedModule &m, const std::vector<uint8_t> &file) {
+    Xex x;
+    std::string error;
+    CHECK(parse_xex(file, x, error) && load_xex_image(file, x, error));
+    m.size = uint32_t(x.image.size());
+    m.digest = image_digest(x.image);
+}
+
 struct EntryCall {
     uint32_t hinstance, reason, reserved, id;
     bool operator==(const EntryCall &) const = default;
@@ -693,11 +726,22 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     CHECK(k.load32(APP + IMPORTS + 0x60) == k.variable("XboxHardwareInfo"));
     CHECK(k.load32(LIB + IMPORTS + 0x10) == 0x44000042);
 
-    // the code runs (interpreted): app.dll's export through its thunk into
-    // lib.dll's, which calls the kernel through its own
+    // the code runs: app.dll's export (interpreted: its table was made from
+    // another image) through its thunk into lib.dll's (its generated code:
+    // dispatch takes the thunk to the export), which calls the kernel through
+    // its own
     CHECK(h.krnl("XexGetProcedureAddress", {app, 1, out}) == 0 && k.load32(out) == APP + FUNCTION);
     k.call(*h.c, APP + FUNCTION);
     CHECK(uint32_t(h.c->r[3]) == 50'000'000 + 7 + 0x100);
+    CHECK(lib_generated_calls == 1 && !app_generated_ran);
+    CHECK(uint32_t(h.c->r[11]) == LIB + FUNCTION && uint32_t(h.c->ctr) == LIB + FUNCTION); // as the thunk leaves them
+    std::string code_report = kernel::modules_report(k);
+    CHECK(code_report.find("\\lib.dll: 0x88000000-0x88010000, entry 0x88001800, a DLL, attached, loaded 0 time(s); "
+                           "generated code, 1 functions") != std::string::npos);
+    CHECK(code_report.find("\\app.dll: 0x89000000-0x89010000, entry 0x89001800, a DLL, attached, loaded 1 time(s); "
+                           "interpreted: its image is not the one app.dll's generated code was made from") !=
+          std::string::npos);
+    CHECK(kernel::module_at(k, LIB + FUNCTION) == "lib.dll" && kernel::module_at(k, 0x8F000000).empty());
     k.call(*h.c, APP + IMPORTS + 0x30); // lib.dll's ordinal 9: no such export
     CHECK(uint32_t(h.c->r[3]) == 0 && k.unimplemented().count("lib!lib_009") == 1);
 
@@ -751,8 +795,10 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     CHECK((entry_calls(k, log, 7) == std::vector<EntryCall>{{lib, DETACH, 0, LIB_ID}}));
     CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0x490);
     CHECK(k.memory().heap_for(LIB)->query(LIB, region) && region.state == 0);
+    // its generated code gone with it
+    CHECK(!k.try_call(*h.c, LIB + FUNCTION));
 
-    // and loaded again where they were
+    // and loaded again where they were, lib.dll's generated code with it
     CHECK(h.krnl("XexLoadImage", {h.string("app.dll"), 9, 0, out}) == 0);
     app = k.load32(out);
     CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0);
@@ -760,6 +806,7 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     CHECK((entry_calls(k, log, 8) == std::vector<EntryCall>{{lib, ATTACH, 0, LIB_ID}, {app, ATTACH, 0, APP_ID}}));
     k.call(*h.c, APP + FUNCTION);
     CHECK(uint32_t(h.c->r[3]) == 50'000'000 + 7 + 0x100);
+    CHECK(lib_generated_calls == 2 && !app_generated_ran);
     std::string report = kernel::modules_report(k);
     CHECK(report.find("\\app.dll: 0x89000000-0x89010000, entry 0x89001800, a DLL, attached, loaded 1 time(s)") !=
           std::string::npos);
@@ -868,8 +915,85 @@ void loader_thread(ppc::Context &c) {
     c.r[3] = 0;
 }
 
+// ---- a longjmp across generated code ----
+//
+// Guest code at J, interpreted: SETJMP keeps r1 and LR in a buffer and
+// returns 0; LONGJMP takes them back (r1 loaded from the buffer: discovery
+// leaves such a function to the interpreter) and returns r4 to where SETJMP
+// was called. S sets a jump with SETJMP, then calls X, a host function in the
+// generated-code table that pushes a frame and calls LONGJMP as generated
+// code does (LR set, dispatch); the longjmp must come back into S, never
+// into X. S2 longjmps to a buffer whose r1 lies above the whole call (a
+// fiber's stack above the thread's): the kernel goes on interpreting there.
+
+void put_code_at(kernel::Kernel &k, uint32_t at, std::initializer_list<uint32_t> code) {
+    for (uint32_t word : code) k.store32(at, word), at += 4;
+}
+
+constexpr uint32_t J = BASE + 0x8000;
+constexpr uint32_t SETJMP = J, LONGJMP = J + 0x20, S = J + 0x40, X = J + 0x100, S2 = J + 0x140, G = J + 0x180;
+constexpr uint32_t X2 = J + 0x1C0, G2 = J + 0x200;
+std::atomic<bool> x_continued{false};
+uint32_t jump3 = 0; // G's buffer
+uint32_t mr(uint32_t a, uint32_t s) { return 31u << 26 | s << 21 | a << 16 | s << 11 | 444u << 1; }
+uint32_t cmpwi0(uint32_t a, int16_t v) { return 11u << 26 | a << 16 | uint16_t(v); }
+uint32_t bne(uint32_t from, uint32_t to) { return 16u << 26 | 4u << 21 | 2u << 16 | ((to - from) & 0xFFFC); }
+
+void x_function(ppc::Context &c) {
+    c.r[1] -= 0x20; // its frame
+    c.lr = X + 4;
+    K->dispatch(c, LONGJMP);
+    x_continued = true; // never: the longjmp went to S's frame
+    c.r[1] += 0x20;
+}
+// X2, called by G while the kernel already goes on interpreting above the
+// call: a second switch above its frame, thrown up to the kernel again
+void x2_function(ppc::Context &c) {
+    c.r[1] -= 0x20;
+    c.r[3] = jump3, c.r[4] = 0;
+    c.lr = X2 + 4;
+    K->dispatch(c, LONGJMP);
+    x_continued = true;
+    c.r[1] += 0x20;
+}
+
+void longjmp_across_generated(KernelHarness &h) {
+    kernel::Kernel &k = *h.k;
+    uint32_t buf = h.alloc(0x10), buf2 = h.alloc(0x10);
+    put_code_at(k, SETJMP, {stw(1, 0, 3), MFLR_R0, stw(0, 4, 3), li(3, 0), BLR});
+    put_code_at(k, LONGJMP, {lwz(1, 0, 3), lwz(0, 4, 3), MTLR_R0, mr(3, 4), BLR});
+    put_code_at(k, S,
+                {MFLR_R0, stw(0, -8, 1), stwu(1, -0x40, 1), lis(3, uint16_t(buf >> 16)), ori(3, 3, uint16_t(buf)),
+                 bl(S + 0x14, SETJMP), cmpwi0(3, 0), bne(S + 0x1C, S + 0x38), lis(3, uint16_t(buf >> 16)),
+                 ori(3, 3, uint16_t(buf)), li(4, 7), bl(S + 0x2C, X), li(3, 1), 0x48000008 /* b S + 0x3C */,
+                 addi(3, 3, 0x100), addi(1, 1, 0x40), lwz(0, -8, 1), MTLR_R0, BLR});
+    uint64_t sp = h.c->r[1];
+    k.call(*h.c, S);
+    CHECK(uint32_t(h.c->r[3]) == 0x107 && !x_continued && h.c->r[1] == sp);
+    CHECK(k.interpreted_targets().count(S + 0x18) == 1); // where the interpreter went on
+
+    // S2: r31 = buf2, its return address in buf2 + 8, longjmp to G with r1
+    // above every frame of the call; G calls X2, whose longjmp goes above
+    // again, to G2, which returns from the call
+    jump3 = h.alloc(0x10);
+    put_code_at(k, S2,
+                {lis(31, uint16_t(buf2 >> 16)), ori(31, 31, uint16_t(buf2)), MFLR_R0, stw(0, 8, 31), mr(3, 31), li(4, 0),
+                 bl(S2 + 0x18, LONGJMP), li(3, 1), BLR});
+    put_code_at(k, G, {bl(G, X2), li(3, 1), BLR});
+    put_code_at(k, G2, {lwz(0, 8, 31), MTLR_R0, li(3, 9), BLR});
+    k.store32(buf2, uint32_t(sp) + 0x1000);
+    k.store32(buf2 + 4, G);
+    k.store32(jump3, uint32_t(sp) + 0x2000);
+    k.store32(jump3 + 4, G2);
+    k.call(*h.c, S2);
+    CHECK(uint32_t(h.c->r[3]) == 9 && uint32_t(h.c->r[1]) == uint32_t(sp) + 0x2000 && !k.stopped && !x_continued);
+    h.c->r[1] = sp;
+}
+
 const kernel::Generated generated[] = {
     {F_LOADER, loader_thread},
+    {X, x_function},
+    {X2, x2_function},
     {GATE + ENTRY, gate_main},
 };
 
@@ -997,22 +1121,28 @@ int main() {
                                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directories(dir);
     uint32_t log = h.alloc(0x400);
-    std::vector<uint8_t> lib_file = make_lib(log);
+    std::vector<uint8_t> lib_file = make_lib(log), app_file = make_app(log);
     auto write = [&](const char *name, const std::vector<uint8_t> &data) {
         std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char *>(data.data()), data.size());
     };
     write("lib.dll", lib_file);
-    write("app.dll", make_app(log));
+    write("app.dll", app_file);
+    made_from(lib_module, lib_file);
+    made_from(app_module, app_file);
+    app_module.digest ^= 1; // another image
     write("junk.dll", std::vector<uint8_t>(0x1000, 'j'));
     write("gate.dll", make_gate(log));
     std::string error;
     if (!kernel::mount_directory(*h.k, dir, error)) return std::printf("kernel_modules: %s\n", error.c_str()), 1;
 
     K = h.k.get();
+    modules_kernel = h.k.get();
     h.k->set_generated(generated, std::size(generated));
+    h.k->set_generated_modules(generated_modules, std::size(generated_modules));
     Xex xex = make_xex();
     if (!h.k->load(xex, error)) return std::printf("kernel_modules: %s\n", error.c_str()), 1;
     modules(h);
+    longjmp_across_generated(h);
     uint32_t gate_module = load_gate(h);
     user_modules(h, log, lib_file);
     exit_in_dll_main(h, log, gate_module);

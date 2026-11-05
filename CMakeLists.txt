@@ -119,21 +119,32 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/memory.cpp) # the guest memory, being 
     target_link_libraries(boot PRIVATE xenoforge_kernel xenoforge)
 endif()
 # boot linked with a game's generated code: `xfrecomp emit <iso> <XF_GEN_DIR>/<name>`
-# writes it (game code: outside the repository), -DXF_GAMES="chaves;ben10" builds
-# boot_<name> for each. The code is built here, against these headers, so it
-# follows every change to the instructions' semantics.
+# writes it, a directory per executable and DLL on the disc and modules.cpp
+# listing their tables (game code: outside the repository); -DXF_GAMES="chaves;ben10"
+# builds boot_<name> for each, with one game library carrying every module. The
+# code is built here, against these headers, so it follows every change to the
+# instructions' semantics. XF_GAME_OPT is the game libraries' optimization
+# (-O1 builds in about 70% of -O2's time and runs slower; docs/recompiler.md,
+# "Modules and the game library"), XF_GAME_OPT_<name> one game's.
 set(XF_GAMES "" CACHE STRING "games whose generated code a boot_<name> links (directories under XF_GEN_DIR)")
 set(XF_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/gen" CACHE PATH "where xfrecomp emit wrote each game")
+set(XF_GAME_OPT "-O2" CACHE STRING "the game libraries' optimization level")
 foreach(game ${XF_GAMES})
-    file(GLOB game_sources CONFIGURE_DEPENDS ${XF_GEN_DIR}/${game}/functions_*.cpp ${XF_GEN_DIR}/${game}/table.cpp)
-    if(NOT game_sources)
-        message(FATAL_ERROR "XF_GAMES: no generated code in ${XF_GEN_DIR}/${game}")
+    if(NOT EXISTS ${XF_GEN_DIR}/${game}/modules.cpp)
+        message(FATAL_ERROR "XF_GAMES: no modules.cpp in ${XF_GEN_DIR}/${game}: run xfrecomp emit <iso> "
+                            "${XF_GEN_DIR}/${game} (an emission before the per-module tables has none)")
+    endif()
+    file(GLOB game_sources CONFIGURE_DEPENDS ${XF_GEN_DIR}/${game}/modules.cpp
+         ${XF_GEN_DIR}/${game}/*/functions_*.cpp ${XF_GEN_DIR}/${game}/*/table.cpp)
+    set(game_opt ${XF_GAME_OPT})
+    if(DEFINED XF_GAME_OPT_${game})
+        set(game_opt ${XF_GAME_OPT_${game}})
     endif()
     add_library(game_${game} STATIC ${game_sources})
-    target_include_directories(game_${game} PRIVATE include ${XF_GEN_DIR}/${game})
+    target_include_directories(game_${game} PRIVATE include)
     # optimized, without debug information (it is large) or warnings; never
     # -ffast-math (docs/recompiler.md)
-    target_compile_options(game_${game} PRIVATE -O2 -g0 -w -mfma -mavx2)
+    target_compile_options(game_${game} PRIVATE ${game_opt} -g0 -w -mfma -mavx2)
     add_executable(boot_${game} tools/boot.cpp tools/game.cpp)
     target_compile_definitions(boot_${game} PRIVATE XF_GENERATED)
     target_link_libraries(boot_${game} PRIVATE xenoforge_kernel xenoforge game_${game})

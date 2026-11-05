@@ -41,7 +41,8 @@ struct Image {
     std::vector<uint8_t> bytes; // offset 0 is base
     std::vector<Section> sections;
     std::vector<PdataEntry> pdata;
-    std::vector<Import> imports; // functions only
+    std::vector<Import> imports;   // functions only
+    std::vector<uint32_t> exports; // a DLL's: what its export table and PE export directory name
 
     bool contains(uint32_t address, uint32_t size = 4) const {
         return address >= base && uint64_t(address) + size <= uint64_t(base) + bytes.size();
@@ -63,6 +64,7 @@ enum class Source : uint8_t {
     Helper,  // a register save or restore helper
     Pdata,   // .pdata
     Entry,   // the entry point
+    Export,  // a DLL's export
     Pointer, // a code address held as data (a word in a data section, a lis/addi pair)
     Branch,  // a branch target no function held
     Call,    // a bl target
@@ -87,6 +89,12 @@ struct Function {
     std::set<uint32_t> blocks;      // where its blocks start
     std::set<uint32_t> calls;       // bl targets
     std::set<uint32_t> tail_calls;  // b and bc to other functions
+    // It moves r1 to another stack: loads it from memory r1 does not
+    // address (longjmp), or has the kernel set it (a branch to
+    // KeSetCurrentStackPointers' thunk: a fiber switch). Its return goes to
+    // another frame than its caller's, which generated code cannot follow,
+    // so it is left to the interpreter (the runtime unwinds to that frame).
+    bool switches_stack = false;
 };
 
 // A direct branch or a jump table's case that leaves its function for an
@@ -118,8 +126,10 @@ Discovery discover(const Image &image, const DiscoverOptions &options = {});
 std::vector<uint32_t> scan_pointers(const Image &image);
 
 // A function's C++ (ppc_generated.h's form), named prefix + its address in
-// hex; what it calls is named the same way.
-std::string emit_function(const Image &image, const Discovery &d, const Function &f, const std::string &prefix);
+// hex; what it calls is named the same way, and added to `calls` when given
+// (what the file holding it declares).
+std::string emit_function(const Image &image, const Discovery &d, const Function &f, const std::string &prefix,
+                          std::set<uint32_t> *calls = nullptr);
 std::string function_name(const std::string &prefix, uint32_t address);
 
 } // namespace xf::recomp

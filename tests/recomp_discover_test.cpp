@@ -3,8 +3,10 @@
 // function ran on into is kept, a lis/addi pair is found, a jump table's
 // address is not a start, an empty method only a vtable reaches comes back),
 // the gap filler (a run of leaf methods longer than its old rounds, a dead
-// blr after a tail call, an exception handler's record before a function)
-// and a jump table bounded by a cmplwi after a clrlwi.
+// blr after a tail call, an exception handler's record before a function),
+// a jump table bounded by a cmplwi after a clrlwi, a branch into a function
+// the walk ran on into past a call that never returns, and the functions that
+// switch the stack (a longjmp, a fiber switch).
 
 #include "check.h"
 #include "xenoforge/recomp.h"
@@ -71,6 +73,14 @@ constexpr uint32_t LEAF = T + 0x600; // 12 leaf methods of 8 bytes
 constexpr uint32_t G = T + 0x700;    // b Z, then a dead blr
 constexpr uint32_t EMPTY = T + 0x710; // blr alone, held by .rdata
 constexpr uint32_t E = T + 0x808;    // .pdata with exception data: its handler record is at E - 8
+constexpr uint32_t NR = T + 0x900;   // a call that never returns (a blr here: discovery cannot tell)
+constexpr uint32_t H = T + 0x910;    // a gap: li r3, 14; bl NR; then R, a routine of its own
+constexpr uint32_t R = H + 8;        // only S's b reaches it
+constexpr uint32_t S = T + 0x930;    // b R, a stub H2 calls
+constexpr uint32_t H2 = T + 0x940;
+constexpr uint32_t LJ = T + 0xA00;    // lwz r1, 0(r3): a longjmp
+constexpr uint32_t FS = T + 0xA20;    // b to KeSetCurrentStackPointers' thunk: a fiber switch
+constexpr uint32_t THUNK = T + 0xA40; // that import's thunk
 
 Image build() {
     Builder m;
@@ -86,6 +96,14 @@ Image build() {
     for (uint32_t k = 0; k < 12; k++) m.code(LEAF + 8 * k, {lwz(3, int32_t(4 * k), 3), BLR});
     m.code(G, {b(G, Z), BLR, li(3, 3), BLR, BLR});
     m.code(E - 8, {A, RDATA + 0x40, li(3, 0), BLR});
+    m.code(NR, {BLR});
+    m.code(H, {li(3, 14), bl(H + 4, NR), lwz(4, 0x100, 13), li(3, 0), BLR});
+    m.code(S, {b(S, R)});
+    m.code(H2, {MFLR_R12, bl(H2 + 4, S), BLR});
+    m.code(LJ, {lwz(1, 0, 3), lwz(0, 4, 3), 0x7C0803A6 /* mtlr r0 */, BLR});
+    m.code(FS, {lwz(3, 0x30, 3), b(FS + 4, THUNK)});
+    m.code(THUNK, {li(3, 0), BLR, NOP, NOP});
+    m.image.imports.push_back({"xboxkrnl.exe", 0x9B, THUNK}); // KeSetCurrentStackPointers
     m.code(RDATA, {P, V, EMPTY});
     m.image.pdata.push_back({A, 0x1C, 1, false});
     m.image.pdata.push_back({TB, 0x60, 0, false});
@@ -147,5 +165,19 @@ int main() {
     // the handler's record before E is data
     CHECK(!d.functions.count(E - 8) && !d.functions.count(E - 4));
     CHECK(d.functions.count(E) && d.functions.at(E).source == Source::Pdata);
+    // R, inside the gap H ran on into past a call: S's branch to it reaches no
+    // start without the scan's passes; with them R is one, H ending in a tail
+    // call to it
+    CHECK(!plain.functions.count(R) && plain.functions.count(H) && plain.functions.at(H).size == 0x14);
+    CHECK(plain.unresolved.size() == 1 && plain.unresolved[0].site == S && plain.unresolved[0].target == R);
+    CHECK(d.functions.count(R) && d.functions.at(R).source == Source::Branch && d.functions.at(R).size == 0xC);
+    CHECK(d.functions.count(H) && d.functions.at(H).size == 8 && d.functions.at(H).tail_calls.count(R));
+    CHECK(d.counts["pointer scan: branch targets added"] == 1);
+    // what switches the stack is left to the interpreter: r1 loaded from a
+    // buffer (LJ), a branch to KeSetCurrentStackPointers (FS); not an epilogue
+    CHECK(d.functions.count(LJ) && d.functions.at(LJ).switches_stack);
+    CHECK(d.functions.count(FS) && d.functions.at(FS).switches_stack && d.functions.at(FS).tail_calls.count(THUNK));
+    CHECK(d.functions.count(U) && !d.functions.at(U).switches_stack && !d.functions.at(A).switches_stack);
+    CHECK(d.counts["functions that switch the stack (left to the interpreter)"] == 2);
     return finish("recomp_discover");
 }

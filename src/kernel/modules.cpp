@@ -178,6 +178,7 @@ struct Module {
     uint32_t xex_header = 0, base_address = 0, image_size = 0, entry_point = 0;
     bool dll = false;         // XEX_MODULE_DLL_MODULE: its entry point is a DllMain
     bool attached = false;    // its DllMain had DLL_PROCESS_ATTACH
+    std::string code;         // its generated code, or why it has none (Kernel::add_module_code)
     std::unique_ptr<Xex> xex; // one the kernel loaded (the executable's is the caller's)
     // a kernel module's GetProcAddress trampolines
     uint32_t trampoline = 0, trampoline_next = 0;
@@ -558,6 +559,9 @@ Module *load_user_module(Kernel &k, Modules &s, std::string_view raw_name) {
     std::unique_ptr<Module> made = make_user_module(k, s, absolute, *xex);
     Module &m = *made;
     m.xex = std::move(xex);
+    // its generated code, if the game library has the table made from this
+    // image, before any of its code runs
+    m.code = k.add_module_code(*m.xex);
     // listed before its imports are bound, as Xenia's: a library importing
     // back from it finds it
     s.user_modules.push_back(std::move(made));
@@ -571,6 +575,7 @@ Module *load_user_module(Kernel &k, Modules &s, std::string_view raw_name) {
 // (XexModule::Unload), its loader entry and header freed
 void unload_user_module(Kernel &k, Modules &s, Module &m) {
     if (m.xex) {
+        k.remove_module_code(m.base_address);
         k.remove_thunks(m.base_address, m.base_address + m.image_size);
         if (Heap *heap = k.memory().heap_for(m.base_address)) heap->release(m.base_address);
     }
@@ -726,6 +731,7 @@ void setup_modules(Kernel &k, const Xex &xex) {
     s.executable = exe.get();
     s.user_modules.push_back(std::move(exe));
     Module &m = *s.executable;
+    m.code = k.add_module_code(xex);
 
     // KernelState::SetExecutableModule: the title process (its TLS from the
     // header, its kernel stacks' size), the handle, the image's name and
@@ -1045,13 +1051,14 @@ std::string modules_report(Kernel &k) {
         if (count) out += "  " + m->path + ": the kernel's, loaded " + std::to_string(count) + " time(s)\n";
     }
     for (auto &m : s.user_modules) {
-        char line[384];
-        std::snprintf(line, sizeof(line), "  %s: 0x%08X-0x%08X, entry 0x%08X, %s, loaded %u time(s)\n", m->path.c_str(),
-                      m->base_address, m->base_address + m->image_size, m->entry_point,
+        char line[512];
+        std::snprintf(line, sizeof(line), "  %s: 0x%08X-0x%08X, entry 0x%08X, %s, loaded %u time(s)%s%s\n",
+                      m->path.c_str(), m->base_address, m->base_address + m->image_size, m->entry_point,
                       m.get() == s.executable ? "the executable"
                       : m->dll                ? (m->attached ? "a DLL, attached" : "a DLL, not attached")
                                               : "loaded",
-                      m->hmodule ? k.load16(m->hmodule + LDR_LOAD_COUNT) : 0);
+                      m->hmodule ? k.load16(m->hmodule + LDR_LOAD_COUNT) : 0, m->code.empty() ? "" : "; ",
+                      m->code.c_str());
         out += line;
     }
     for (const std::string &path : s.unloaded) out += "  " + path + ": unloaded\n";
@@ -1065,6 +1072,14 @@ std::string modules_report(Kernel &k) {
         out += line;
     }
     return out;
+}
+
+std::string module_at(Kernel &k, uint32_t address) {
+    Modules &s = k.state<Modules>();
+    std::lock_guard lock(s.mutex);
+    for (auto &m : s.user_modules)
+        if (address - m->base_address < m->image_size) return std::string(name_from_path(m->path));
+    return {};
 }
 
 } // namespace xf::kernel

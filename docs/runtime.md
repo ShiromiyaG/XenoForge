@@ -21,12 +21,64 @@ and "Sound").
 ## Code: generated, interpreted, imported
 
 One rule for every call the code cannot make directly (`dispatch`): the
-address is looked up in the generated functions' table; an import thunk
-runs its export; anything else runs in the interpreter until it returns.
-The interpreter's own `bl` to an address with a generated function calls
-it. So a game runs with all its code generated, with none (bring-up, before
-the 3-minute build), or with a title update's changed functions
-interpreted.
+address is looked up in the generated code of the module that holds it; an
+import thunk runs its export; anything else runs in the interpreter until
+it returns. The interpreter's own `bl` to an address with a generated
+function calls it. So a game runs with all its code generated, with none
+(bring-up, before the build), or with a module whose image is not the one
+its code was made from (a title update, another version) interpreted.
+
+The generated code is per module (`ppc_module.h`; docs/recompiler.md,
+"Modules"): the game library carries a table for each executable and DLL on
+the disc (its path, base, size, the digest of its image and its functions),
+handed to the kernel before the load (`Kernel::set_generated_modules`).
+When an image is placed at its base (the executable in `load`, a DLL or a
+second executable as XexLoadImage loads it), the kernel looks for the table
+with the same base and size and, only then, digests the image as unpacked
+(`image_digest`, before the imports are bound; a few milliseconds for
+30 MB) and compares (`add_module_code`); the module's report line says
+which: "generated code, N functions", or why it runs interpreted. A table
+that matches gets the module's range and a slot per instruction from its
+first function to its last ((address - first) / 4: 36 MB for El Chavo
+Kart's 4.7M-instruction range, made the first time the image loads and
+kept). Dispatch reads one immutable map of those ranges (an atomic
+pointer, a new map published at each load and unload, the old ones kept
+for threads still reading them): one compare per module loaded and one
+load, about 2 ns, where the binary search over one table it replaced took
+29 to 79 ns on El Chavo Kart's 73,293 functions. XexUnloadImage drops the range with the pages,
+so BC2's Splash.xex and Game.xex, one after the other at 0x82A00000, each
+run their own code. Functions given with `set_generated` (any address, the
+tests' host functions) are looked up first.
+
+Returns to another frame (longjmp, a C++ catch's continuation, a fiber
+switch: the functions discovery leaves to the interpreter for it) are the
+runtime's: each dispatch knows the stack its call was made on (r1, its
+"stack top") and the return address; the interpreter it runs treats a
+`blr` elsewhere with r1 above that stack top as an unwind
+(`Stopped::Unwound`), and the dispatch throws it (a C++ exception, through
+the generated code's frames, as ExitThread's is). The first dispatch whose
+stack top is at or above the restored r1 catches it and interprets on from
+the target: the rest of the functions between, interpreted (their generated
+frames are gone, and the generated code keeps nothing outside the context,
+so the interpreter takes over exactly), until the guest returns to that
+dispatch's return address with r1 back at its stack top, and the generated
+code after it goes on. A return to that address with r1 below it is a
+recursive call's, not this one's. A switch back to a fiber lands on the
+dispatch that left it (its saved LR and r1 are that call's), which then
+returns normally. With r1 above every frame of a call the kernel made (a
+fiber stack above the thread's), the call interprets on until the guest
+returns from it, and so does any switch thrown up to it meanwhile (Reach's
+fibers, after their first switch, run so: correct, and slower than their
+generated code). Mid-function jumps the generated code dispatches with a
+stale LR (an unresolved table case) end the same way, where before they
+could interpret past their function forever.
+
+A game library's import thunk (a DLL's function another module imports:
+`lis r11; ori r11` before the thunk's own `mtctr r11; bctr`, written at
+load) is known as such to the kernel: dispatch to it sets r11 and CTR as
+the thunk would and dispatches to the export, so generated code calling
+across modules reaches the other module's generated code without
+interpreting the thunk.
 
 The loader rewrites each import thunk (16 bytes) to `sc` and `blr`: the
 interpreter reaches the export through `sc` (the kernel looks the thunk up
@@ -80,9 +132,9 @@ lists: what the game calls is what gets written next.
   (NT's), recursive, also held across XexLoadImage's lookup and load,
   XexUnloadImage's detach and removal and XexGetModuleHandle: a load waits
   for an unload in progress, and no DllMain gets a module that is gone.
-  boot's module report names the lock's owner when it is held. The DLLs'
-  code runs in the interpreter: the generated code covers the executable
-  only, so far.
+  boot's module report names the lock's owner when it is held. Each
+  module's code is generated or interpreted as its image matches a table
+  of the game library ("Code" above).
 - **Memory exports** (`memory_exports.cpp`): NtAllocateVirtualMemory and
   the Mm*/Ex* pools on the heaps of memory.h, with Xenia's addresses.
 - **Rtl and misc** (`rtl.cpp`, `misc.cpp`): strings, time fields, status
@@ -292,12 +344,14 @@ once here, before the export returns ERROR_IO_PENDING.
 ## `boot`
 
 `boot <game.iso> [--seconds N] [--steps N] [--content <dir>] [--interpret]
-[--no-controller] [--press <buttons@seconds>]...`: loads the game, runs its entry point, and prints the modules loaded, the
-interpreter's entries (the most entered addresses first), the kernel calls
+[--no-controller] [--press <buttons@seconds>]...`: loads the game, runs its entry point, and prints the modules loaded
+(each one's generated code, or why it runs interpreted), the
+interpreter's entries (the most entered addresses first, with the module
+holding each), the kernel calls
 (counts, unimplemented ones), the GPU's packets, draws, resolves, swaps (and
 swaps per second) and interrupts, the sound's frames and XMA contexts, and
 where it stopped. Built as `boot_<game>` (CMake's `XF_GAMES`), it runs the
-game's generated code; `--interpret` leaves it out. `--steps` bounds the
+game's generated code, every module's ("Code" above); `--interpret` leaves it out. `--steps` bounds the
 interpreter's instructions per entry (2 billion by default: about 20 s of
 El Chavo Kart's main thread). XAM's input answers from an idle pad for
 user 0, a controller plugged in with nothing pressed, so a game waiting

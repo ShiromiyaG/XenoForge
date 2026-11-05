@@ -32,9 +32,9 @@ bool implemented(Opcode op) {
     }
 }
 
-Stopped interpret(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps) {
+Stopped interpret(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_t stack_top) {
     for (uint64_t step = 0; step < max_steps; step++) {
-        if (pc == until) return {Stopped::Returned, pc};
+        if (pc == until && uint32_t(c.r[1]) >= stack_top) return {Stopped::Returned, pc};
         Instr i{ops::load32(c, pc)};
         Opcode op = decode(i.code);
         c.pc = pc;
@@ -65,6 +65,9 @@ Stopped interpret(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps) {
             if (i.XL.LK) {
                 c.lr = next;
                 if (taken && c.system && c.system->call && c.system->call(c, target)) break;
+            } else if (taken && stack_top && target != until && uint32_t(c.r[1]) > stack_top) {
+                c.pc = pc;
+                return {Stopped::Unwound, target};
             }
             if (taken) next = target;
             break;

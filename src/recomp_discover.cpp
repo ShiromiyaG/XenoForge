@@ -15,6 +15,7 @@
 
 #include "xenoforge/recomp.h"
 
+#include "xenoforge/exports.h"
 #include "xenoforge/ppc.h"
 
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 namespace xf::recomp {
 namespace {
@@ -234,6 +236,8 @@ public:
             }
         }
         if (image_.is_code(image_.entry)) add(image_.entry, Source::Entry);
+        for (uint32_t a : image_.exports)
+            if (add(a, Source::Export)) d_.counts["exports"]++;
         for (const auto &[a, source] : extra_) add(a, source);
         settle();
         // gaps: code nothing covers, cut after each end of a function; a
@@ -244,7 +248,10 @@ public:
             settle();
             if (d_.functions.size() == before) break;
         }
-        for (auto &[a, f] : d_.functions) d_.counts[std::string("functions from ") + source_name(f.source)]++;
+        for (auto &[a, f] : d_.functions) {
+            d_.counts[std::string("functions from ") + source_name(f.source)]++;
+            if (f.switches_stack) d_.counts["functions that switch the stack (left to the interpreter)"]++;
+        }
         d_.counts["functions"] = d_.functions.size();
         d_.counts["jump tables"] = d_.tables.size();
         d_.counts["indirect branches"] = d_.indirect.size();
@@ -277,9 +284,13 @@ private:
     }
 
     void add_imports() {
-        for (const Import &i : image_.imports)
+        for (const Import &i : image_.imports) {
             if (add(i.thunk, Source::Import, 16, "__imp__" + i.library + "_" + std::to_string(i.ordinal)))
                 d_.counts["imports"]++;
+            // the export that moves the caller to another stack (a fiber's)
+            const Export *e = find_export(i.library, i.ordinal);
+            if (e && std::string_view(e->name) == "KeSetCurrentStackPointers") stack_thunks_.insert(i.thunk);
+        }
     }
 
     // rexglue's detectSaveRestoreHelpers and registerHelpers
@@ -339,6 +350,7 @@ private:
         bool sized = sized_[f.address];
         uint32_t end = sized ? f.address + f.size : limit(f.address);
         f.blocks.clear(), f.calls.clear(), f.tail_calls.clear();
+        f.switches_stack = false;
         std::vector<std::pair<uint32_t, uint32_t>> &exits = exits_[f.address];
         exits.clear();
         std::deque<uint32_t> work{f.address};
@@ -366,8 +378,15 @@ private:
                     d_.counts["blocks ending in an invalid word"]++;
                     break;
                 }
+                // r1 loaded from a buffer, not popped from the back chain
+                // (lwz r1, 0(r1)): another frame's stack (longjmp)
+                if (std::optional<uint32_t> w = written_gpr(op, i);
+                    w && *w == 1 && ppc::info(op).group == 'm' && i.D.RA != 1)
+                    f.switches_stack = true;
                 if (op == Opcode::bx) {
                     uint32_t target = uint32_t(exts26(i.I.LI << 2)) + (i.I.AA ? 0 : pc);
+                    // the kernel moves r1 to another stack (a fiber switch)
+                    if (stack_thunks_.count(target)) f.switches_stack = true;
                     if (i.I.LK) {
                         f.calls.insert(target);
                         add(target, Source::Call);
@@ -596,6 +615,14 @@ private:
             Instr i{w};
             return w == BLR || w == BCTR || (ppc::decode(w) == Opcode::bx && !i.I.LK);
         };
+        // where a function .pdata (or a helper's or a thunk's size) bounds
+        // ends: an end whatever its last instruction, which may be a call
+        // that never returns (bl _CxxThrowException), so the code after it
+        // is another function's (Sonic's adjustor thunks there are reached
+        // only through vtables)
+        std::set<uint32_t> sized_ends;
+        for (const auto &[a, f] : d_.functions)
+            if (sized_[a]) sized_ends.insert(a + f.size);
         for (const Section &s : image_.sections) {
             if (!s.code) continue;
             bool after_end = true; // a gap starts after an end, or at the section's start
@@ -603,7 +630,7 @@ private:
             for (uint32_t a = s.address; a + 4 <= s.address + s.size; a += 4) {
                 uint32_t w = image_.word(a);
                 if (is_covered(a)) {
-                    after_end = ends(w);
+                    after_end = ends(w) || sized_ends.count(a + 4);
                     continue;
                 }
                 if (w == 0) {
@@ -640,6 +667,7 @@ private:
     std::deque<uint32_t> pending_;
     std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> exits_; // by function: (site, target) leaving it
     std::set<uint32_t> handler_data_; // the words before functions with exception data
+    std::set<uint32_t> stack_thunks_; // KeSetCurrentStackPointers' import thunks
 };
 
 // ---- the data pointer scan ----
@@ -670,8 +698,9 @@ constexpr int SCAN_PASSES = 16;
 bool is_code_address(const Image &image, uint32_t a) { return !(a & 3) && image.is_code(a) && image.contains(a); }
 
 // A function's first instruction opens a frame (mflr r12, stwu r1), or
-// follows a return, an unconditional branch or padding.
-bool looks_like_start(const Image &image, uint32_t a) {
+// follows a return, an unconditional branch, padding or the end .pdata gives
+// the function before (which may end in a call that never returns).
+bool looks_like_start(const Image &image, const std::set<uint32_t> &pdata_ends, uint32_t a) {
     if (!is_code_address(image, a)) return false;
     const Section *s = image.section_of(a);
     uint32_t w = image.word(a);
@@ -680,7 +709,7 @@ bool looks_like_start(const Image &image, uint32_t a) {
     if (a < s->address + 4) return false; // the word before is in another section
     uint32_t prev = image.word(a - 4);
     bool b = (prev >> 26) == 18 && !(prev & 1);
-    return prev == BLR || prev == BCTR || b || prev == 0;
+    return prev == BLR || prev == BCTR || b || prev == 0 || pdata_ends.count(a);
 }
 
 // the function whose range holds `a`
@@ -694,9 +723,10 @@ const Function *holder(const Discovery &d, uint32_t a) {
 } // namespace
 
 std::vector<uint32_t> scan_pointers(const Image &image) {
-    std::set<uint32_t> found;
+    std::set<uint32_t> found, pdata_ends;
+    for (const PdataEntry &p : image.pdata) pdata_ends.insert(p.begin + p.length);
     auto consider = [&](uint32_t v) {
-        if (looks_like_start(image, v)) found.insert(v);
+        if (looks_like_start(image, pdata_ends, v)) found.insert(v);
     };
     for (const Section &s : image.sections) {
         uint32_t end = s.address + s.size;
@@ -817,12 +847,22 @@ Discovery discover(const Image &image, const DiscoverOptions &options) {
             changed = true;
         }
 
-        // branch targets no function holds: code the discovery left
-        // orphaned, made starts too, under the same pruning
+        // Branch targets no function holds (code the discovery left
+        // orphaned), made starts too, under the same pruning; and those held
+        // by a function whose end was only walked to, when the branch reaches
+        // no start without the scan either (a candidate's split is the
+        // candidate's fault): a routine after a call that never returns (the
+        // walk went on past the bl), or a tail two functions share. The
+        // function holding it ends there now, running on into it as a tail
+        // call. A function .pdata sizes stays whole.
         for (const Unresolved &u : d.unresolved) {
             uint32_t t = u.target;
             if (rejected.count(t) || candidates.count(t) || d.functions.count(t)) continue;
-            if (!is_code_address(image, t) || holder(d, t)) continue;
+            if (!is_code_address(image, t)) continue;
+            if (const Function *h = holder(d, t);
+                h && (h->source == Source::Pdata || h->source == Source::Helper || h->source == Source::Import ||
+                      !baseline.count({u.site, u.target})))
+                continue;
             candidates[t] = Source::Branch;
             branches++;
             changed = true;

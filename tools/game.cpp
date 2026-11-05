@@ -21,10 +21,9 @@
 #endif
 
 #ifdef XF_GENERATED
-// the game's generated functions by address (xfrecomp emit's table.cpp, C
-// linkage; the same layout as Generated)
-extern "C" const xf::kernel::Generated xf_functions[];
-extern "C" const size_t xf_function_count;
+// the game library's tables, one per module (xfrecomp emit's modules.cpp)
+extern "C" const xf::ppc::GeneratedModule *const xf_modules[];
+extern "C" const size_t xf_module_count;
 #endif
 
 namespace xf::game {
@@ -104,17 +103,17 @@ bool open(const Options &options, Game &g, std::string &error) {
     // its module's path, which the DLLs it loads by a bare name are next to
     kernel::set_executable_path(k, "game:\\" +
                                        (bare ? std::filesystem::path(input).filename().string() : options.xex_path));
-    if (!k.load(g.xex, error)) return error = "load: " + error, false;
-    k.step_limit = options.steps;
 #ifdef XF_GENERATED
-    // dispatch looks addresses up by binary search
-    if (!std::is_sorted(xf_functions, xf_functions + xf_function_count,
-                        [](const kernel::Generated &a, const kernel::Generated &b) { return a.address < b.address; }))
-        return error = "the generated functions are not in address order", false;
-    if (!options.interpret) k.set_generated(xf_functions, xf_function_count);
-    std::printf("generated code: %zu functions%s\n", size_t(xf_function_count),
+    // each module's code runs once an image it was made from is loaded
+    // (the executable's in load(), a DLL's as XexLoadImage loads it)
+    size_t functions = 0;
+    for (size_t i = 0; i < xf_module_count; i++) functions += xf_modules[i]->count;
+    if (!options.interpret) k.set_generated_modules(xf_modules, xf_module_count);
+    std::printf("generated code: %zu modules, %zu functions%s\n", size_t(xf_module_count), functions,
                 options.interpret ? " (left out: --interpret)" : "");
 #endif
+    if (!k.load(g.xex, error)) return error = "load: " + error, false;
+    k.step_limit = options.steps;
     std::printf("loaded %s: base 0x%08X, entry 0x%08X, %zu imported functions\n", options.xex_path.c_str(),
                 g.xex.base_address, k.entry_point(), k.imports().size());
     std::printf("stack 0x%X; TLS: ", g.xex.stack_size);
@@ -156,7 +155,8 @@ void print_report(Game &g, bool waiting) {
     std::printf("interpreted entries: %llu, at %zu addresses\n", (unsigned long long)k.interpreted_entries(),
                 entered.size());
     for (size_t i = 0; i < entered.size() && i < 20; i++)
-        std::printf("  %10llu  0x%08X\n", (unsigned long long)entered[i].first, entered[i].second);
+        std::printf("  %10llu  0x%08X  %s\n", (unsigned long long)entered[i].first, entered[i].second,
+                    kernel::module_at(k, entered[i].second).c_str());
     std::vector<std::pair<uint64_t, std::string>> calls;
     for (const auto &[name, n] : k.calls()) calls.push_back({n, name});
     std::sort(calls.rbegin(), calls.rend());

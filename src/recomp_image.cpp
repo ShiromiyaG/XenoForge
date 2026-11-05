@@ -32,6 +32,7 @@ const char *source_name(Source s) {
     case Source::Helper: return "helper";
     case Source::Pdata: return "pdata";
     case Source::Entry: return "entry";
+    case Source::Export: return "export";
     case Source::Pointer: return "pointer";
     case Source::Branch: return "branch";
     case Source::Call: return "call";
@@ -88,6 +89,30 @@ bool read_image(const Xex &xex, Image &out, std::string &error) {
 
     for (const XexImport &i : list_imports(xex))
         if (i.thunk) out.imports.push_back({xex.import_libraries[i.library].name, i.ordinal, i.record});
+
+    // A DLL's exports, as the kernel's GetProcAddress finds them (Xenia's
+    // XexModule::GetProcAddress): the export table the security info points
+    // at (xex2_export_table: the image base >> 16 at 0x20, the count at
+    // 0x24, the offsets from 0x2C), and the PE export directory
+    // XEX_HEADER_EXPORTS_BY_NAME gives (its RVA first; AddressOfFunctions'
+    // RVAs, little-endian). Data exports are no code and are not starts.
+    const std::vector<uint8_t> &h = xex.header;
+    if (uint64_t(xex.security_offset) + 0x164 <= h.size()) {
+        uint32_t table = be32(&h[xex.security_offset + 0x160]);
+        if (table && out.contains(table, 0x2C)) {
+            uint32_t image_base = out.word(table + 0x20) << 16, count = out.word(table + 0x24);
+            for (uint32_t k = 0; k < count && out.contains(table + 0x2C + 4 * k); k++)
+                if (uint32_t offset = out.word(table + 0x2C + 4 * k)) out.exports.push_back(image_base + offset);
+        }
+    }
+    for (const auto &[key, offset] : xex.opt_headers) {
+        if (key != 0x00E10402 || uint64_t(offset) + 4 > h.size()) continue;
+        uint32_t directory = be32(&h[offset]);
+        if (uint64_t(directory) + 0x28 > b.size()) continue;
+        uint32_t count = le32(&b[directory + 0x14]), functions = le32(&b[directory + 0x1C]);
+        for (uint32_t k = 0; k < count && uint64_t(functions) + 4 * (k + 1) <= b.size(); k++)
+            if (uint32_t rva = le32(&b[functions + 4 * k])) out.exports.push_back(out.base + rva);
+    }
     return true;
 }
 
