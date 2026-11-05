@@ -148,12 +148,16 @@ traces, without a recompiled game.
   counted; the counts set against the imports. Under way (2026-11-05,
   [runtime.md](runtime.md)): the memory, modules, Rtl, threads and sync,
   video (the GPU's live front end, headless), files and xam, and crypto
-  families are in; MMIO reaches the devices. Both games run their frame loop
-  interpreted (El Chavo Kart about 17 swaps a second, Ben 10 about 40) and
-  stop next at sound (XAudio*, the XMA registers at 0x7FEA0000). Of the
-  other six games, Forza Horizon, Reach and BC2 need XexLoadImage of a
-  second executable; Red Dead Redemption needs XMA; the rest stop on an
-  invalid instruction or a fault still to be looked at.
+  families are in; MMIO reaches the devices. Then (2026-11-05, later):
+  sound enough to boot (XAudio's render driver clients paced on the
+  scheduler's clock, the XMA decoder walking contexts to silence; real
+  output and decoding are A6), XexLoadImage of a second executable with
+  NT's loader lock, and `boot_<game>` linked with the generated code
+  (CMake's `XF_GAMES`). With their code generated, both games run their
+  frame loop at their caps (El Chavo Kart 30 swaps a second, Ben 10 60)
+  with no interpreter entry and no unimplemented call; interpreted, all
+  eight games run 30 s without stopping (Forza Horizon, Reach and BC2 with
+  their DLLs, interpreted until a module gets its own generated table).
 - **A5. The deterministic mode**, input recording and replay.
 - **A6. Sound** (XMA: Xenia decodes it with FFmpeg's XMA decoder from its own
   fork; LGPL, linked dynamically), input, saves.
@@ -209,10 +213,9 @@ traces, without a recompiled game.
 - **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work
   (`../Chaves/docs/native-renderer-re.md`) moved over as El Chavo Kart's port.
 
-Next (2026-11-05): sound enough to boot (XAudio's render driver, XMA
-contexts), XexLoadImage of a second executable, boot with the generated code
-linked, then the renderer as the command processor's Sink in the player (C1)
-for M1.
+Next (2026-11-05, later): the renderer as the command processor's Sink
+(under way), then the player (C1: window, input) for M1; generated tables
+per module (the DLLs' code), and the other six games' code generated.
 
 ## Decisions
 
