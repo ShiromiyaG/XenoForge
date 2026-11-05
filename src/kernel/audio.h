@@ -202,12 +202,26 @@ public:
     uint32_t context_array = 0; // the first context's guest address (0xE0000000 and up)
     std::unique_ptr<audio::FrameDecoder> decoder;
 
-    // counts
+    // counts: frames the decoder gave samples for, frames it gave none
+    // (FFmpeg's errors, or more input wanted), frames with a sample not zero;
+    // errors are bad input (a frame of the invalid length, a read offset past
+    // its buffer, a split frame whose rest is not there), stalls a run cut at
+    // its pass limit, starved a run with room to write and no input (an
+    // underrun: the game reads what it wrote before); the contexts ever kicked
     std::atomic<uint64_t> created{0}, released{0}, kicks{0}, works{0}, frames{0}, packets_skipped{0}, swaps{0};
-    std::atomic<uint64_t> loops{0}, errors{0};
+    std::atomic<uint64_t> loops{0}, errors{0}, frames_failed{0}, frames_with_sound{0}, stalls{0}, starved{0};
+    std::atomic<uint32_t> contexts_kicked{0}, peak{0}; // peak: the largest |sample| decoded
+
+    // XF_XMA_RECORD=<file>, or this, before the first kick: every run of a
+    // context written to the file (its data before and after, its input and
+    // output buffers), and the clears and releases, for replaying the walk
+    // against Xenia's (tests/xma_replay_test.cpp, tools/xenia_oracle)
+    bool record_to(const std::string &path);
 
 private:
     struct Context;
+    struct Recorder;
+    std::unique_ptr<Recorder> recorder_;
     void worker(Thread &self);
     bool work(Context &x);
     void kick(uint32_t first, uint32_t mask);

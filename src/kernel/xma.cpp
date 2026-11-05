@@ -22,10 +22,10 @@
 // Where it differs:
 //
 // - A frame's decode is audio::FrameDecoder's one call (Xenia: FFmpeg's
-//   xmaframes decoder inside the context), silence by default; the walk
-//   around it, which finds the frame, builds its packet and moves the
-//   offsets, is Xenia's. A silent frame always gives samples (FFmpeg may
-//   want more input before its first).
+//   xmaframes decoder inside the context): FFmpeg's, as Xenia drives it
+//   (src/xma_decoder.cpp), unless something else is set; the walk around it,
+//   which finds the frame, builds its packet and moves the offsets, is
+//   Xenia's.
 // - The decoder's thread waits on a kernel event, and a kicking guest thread
 //   waits through the kernel's objects until the decoder has walked its
 //   contexts (Xenia: host events). A kick from a host thread with no guest
@@ -42,31 +42,21 @@
 //   one run of a context stops after 65536 passes (Xenia's could loop for
 //   ever on a loop region with no frame in it).
 // - Unhandled registers are logged once each (Xenia logs every access).
+// - The runs can be recorded (XF_XMA_RECORD, Xma::record_to) and the walk
+//   counts what it decodes, what has sound and what goes wrong (the report).
 
 #include "audio.h"
+#include "xenoforge/xma_recording.h"
 
 #include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
-
-namespace xf::audio {
-namespace {
-
-class SilentDecoder final : public FrameDecoder {
-public:
-    bool decode(uint32_t, const uint8_t *, uint32_t, uint32_t, uint32_t channels, uint8_t *pcm) override {
-        std::memset(pcm, 0, 512 * 2 * channels); // 512 16-bit samples a channel
-        return true;
-    }
-};
-
-} // namespace
-
-std::unique_ptr<FrameDecoder> make_silent_decoder() { return std::make_unique<SilentDecoder>(); }
-
-} // namespace xf::audio
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace xf::kernel {
 namespace {
@@ -236,7 +226,7 @@ void set_xma_decoder(Kernel &k, std::unique_ptr<audio::FrameDecoder> decoder) {
 struct Xma::Context {
     Xma *owner = nullptr;
     uint32_t id = 0, guest = 0;
-    std::atomic<bool> allocated{false};
+    std::atomic<bool> allocated{false}, kicked{false};
 
     // kicks, under the dispatcher lock: enabled until the decoder takes it;
     // each kick a generation; done set while every kick so far is complete
@@ -311,7 +301,7 @@ void Xma::Context::walk() {
 
     for (uint32_t passes = 0; remaining_subframe_blocks >= minimum_subframe_decode_count; passes++) {
         if (passes == 65536) {
-            owner->errors++;
+            owner->stalls++;
             break;
         }
         const uint32_t pre_decode_offset = data.input_buffer_read_offset;
@@ -329,11 +319,14 @@ void Xma::Context::walk() {
 
     if (initial.any_input_buffer_valid()) {
         data.output_buffer_write_offset = output.write_offset() / OUTPUT_BYTES_PER_BLOCK;
-    } else if (data.output_buffer_write_offset != data.output_buffer_read_offset) {
-        // starved of input: the write offset meets the read offset (games
-        // take a difference there for a stall)
-        data.output_buffer_write_offset = data.output_buffer_read_offset;
-        data.output_buffer_valid = 0;
+    } else {
+        owner->starved++;
+        if (data.output_buffer_write_offset != data.output_buffer_read_offset) {
+            // starved of input: the write offset meets the read offset (games
+            // take a difference there for a stall)
+            data.output_buffer_write_offset = data.output_buffer_read_offset;
+            data.output_buffer_valid = 0;
+        }
     }
     // the output buffer full
     if (remaining_subframe_blocks == 0 && output.empty()) data.output_buffer_valid = 0;
@@ -511,9 +504,22 @@ void Xma::Context::decode(XmaContextData &data) {
 
     raw_frame.fill(0);
     const uint32_t channels = data.is_stereo ? 2 : 1;
-    if (owner->decoder->decode(id, xma_frame.data(), size, SAMPLE_RATES[std::min(uint32_t(data.sample_rate), 3u)],
-                               channels, raw_frame.data())) {
+    if (!owner->decoder->decode(id, xma_frame.data(), size, SAMPLE_RATES[std::min(uint32_t(data.sample_rate), 3u)],
+                                channels, raw_frame.data())) {
+        owner->frames_failed++;
+    } else {
         owner->frames++;
+        // the loudest sample (16-bit big-endian)
+        uint32_t peak = 0;
+        for (uint32_t i = 0; i < BYTES_PER_FRAME_CHANNEL * channels; i += 2) {
+            const int32_t sample = int16_t(uint16_t(raw_frame[i] << 8 | raw_frame[i + 1]));
+            peak = std::max(peak, uint32_t(sample < 0 ? -sample : sample));
+        }
+        if (peak) {
+            owner->frames_with_sound++;
+            for (uint32_t seen = owner->peak.load(); peak > seen && !owner->peak.compare_exchange_weak(seen, peak);) {
+            }
+        }
         current_frame_remaining_subframes = uint8_t(4 << data.is_stereo);
         // the loop's end frame: subframes up to loop_subframe_end only
         loop_frame_output_limit = is_loop_end_frame ? uint8_t((data.loop_subframe_end + 1) << data.is_stereo) : 0;
@@ -665,6 +671,78 @@ void Xma::Context::store_merged(const XmaContextData &data, const XmaContextData
     fresh.store(context);
 }
 
+// ---- the recording (xenoforge/xma_recording.h) ----
+
+namespace {
+
+// whether a host range is committed and readable (a buffer address the game
+// left in a context may point at pages that are not)
+bool readable(const uint8_t *p, size_t size) {
+#ifdef _WIN32
+    for (const uint8_t *end = p + size; p < end;) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery(p, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return false;
+        p = static_cast<const uint8_t *>(info.BaseAddress) + info.RegionSize;
+    }
+#else
+    (void)p, (void)size;
+#endif
+    return true;
+}
+
+} // namespace
+
+struct Xma::Recorder {
+    std::mutex mutex;
+    xma_recording::Writer writer;
+
+    // a buffer at a physical address, recorded if it is all there
+    uint64_t buffer(Kernel &k, uint32_t physical, uint32_t size) {
+        if (!physical || !size || (physical & 0x1FFFFFFF) + uint64_t(size) > 0x20000000) return 0;
+        const uint8_t *p = k.memory().translate_physical(physical);
+        if (!readable(p, size)) return 0;
+        return writer.buffer(p, size);
+    }
+    // the context's data and its buffers as the run starts (its lock held)
+    void before(Kernel &k, Context &x, xma_recording::Run &run) {
+        const uint8_t *context = k.host(x.guest);
+        std::memcpy(run.before, context, 64);
+        XmaContextData data(context);
+        std::lock_guard<std::mutex> l(mutex);
+        run.context = x.id;
+        for (uint32_t b = 0; b < 2; b++)
+            run.input[b] =
+                buffer(k, data.input_buffer_address(b), data.input_buffer_packet_count(b) * BYTES_PER_PACKET);
+        run.output_before = buffer(k, data.output_buffer_ptr, data.output_buffer_block_count * OUTPUT_BYTES_PER_BLOCK);
+    }
+    // and as it ends: the run written
+    void after(Kernel &k, Context &x, xma_recording::Run &run) {
+        const uint8_t *context = k.host(x.guest);
+        std::memcpy(run.after, context, 64);
+        XmaContextData data(context);
+        std::lock_guard<std::mutex> l(mutex);
+        run.output_after = buffer(k, data.output_buffer_ptr, data.output_buffer_block_count * OUTPUT_BYTES_PER_BLOCK);
+        writer.run(run);
+    }
+    void event(uint8_t type, uint32_t id) {
+        std::lock_guard<std::mutex> l(mutex);
+        writer.event(type, id);
+    }
+};
+
+bool Xma::record_to(const std::string &path) {
+    auto r = std::make_unique<Recorder>();
+    if (!r->writer.open(path)) {
+        std::fprintf(stderr, "xma: cannot write the recording %s\n", path.c_str());
+        return false;
+    }
+    std::fprintf(stderr, "xma: recording the contexts' runs to %s\n", path.c_str());
+    recorder_ = std::move(r);
+    return true;
+}
+
 // ---- the decoder (XmaDecoder) ----
 
 Xma::Xma() = default;
@@ -672,7 +750,10 @@ Xma::~Xma() = default;
 
 void Xma::setup(Kernel &kernel) {
     k = &kernel;
-    if (!decoder) decoder = audio::make_silent_decoder();
+    // XF_XMA_SILENT=1: every frame silence, to measure what decoding costs
+    const char *silent = std::getenv("XF_XMA_SILENT");
+    if (!decoder) decoder = silent && *silent == '1' ? audio::make_silent_decoder() : audio::make_xma_decoder();
+    if (const char *path = std::getenv("XF_XMA_RECORD"); path && *path) record_to(path);
     // the contexts in physical memory, uncached, the array's physical address
     // in a register (the console's kernel allocates them so)
     context_array = kernel.memory().system_alloc(CONTEXT_SIZE * CONTEXT_COUNT, 256, true);
@@ -752,6 +833,10 @@ void Xma::stop() {
     }
     events.clear();
     thread_ = {}, work_ = {};
+    if (recorder_) {
+        std::lock_guard<std::mutex> l(recorder_->mutex);
+        recorder_->writer.flush();
+    }
 }
 
 // a context's kicks complete up to generation (dispatcher lock held)
@@ -790,6 +875,7 @@ void Xma::release_context(uint32_t guest) {
     Context &x = contexts_[id];
     // the decoder may be walking it
     std::lock_guard<std::mutex> l(x.lock);
+    if (recorder_) recorder_->event(xma_recording::RELEASE, x.id);
     std::memset(k->host(x.guest), 0, CONTEXT_SIZE);
     x.forget();
     x.allocated = false;
@@ -869,6 +955,7 @@ void Xma::write_register(uint32_t address, uint32_t value) {
         for (uint32_t v = value; v; v &= v - 1) {
             Context &x = contexts_[(r - CLEAR) * 32 + std::countr_zero(v)];
             std::lock_guard<std::mutex> l(x.lock);
+            if (recorder_) recorder_->event(xma_recording::CLEAR, x.id);
             XmaContextData data(k->host(x.guest));
             x.clear_locked(data);
             data.store(k->host(x.guest));
@@ -910,6 +997,7 @@ void Xma::kick(uint32_t first, uint32_t mask) {
             Context &x = contexts_[first + bit];
             x.enabled = true;
             targets[bit] = ++x.generation;
+            if (!x.kicked.exchange(true)) contexts_kicked++;
             if (x.done) x.done->set_signal_state(0);
         }
     }
@@ -950,7 +1038,10 @@ bool Xma::work(Context &x) {
     }
     if (x.allocated.load()) {
         std::lock_guard<std::mutex> l(x.lock);
+        xma_recording::Run run;
+        if (recorder_) recorder_->before(*k, x, run);
         x.walk();
+        if (recorder_) recorder_->after(*k, x, run);
     }
     works++;
     std::lock_guard<std::mutex> l(o.lock);

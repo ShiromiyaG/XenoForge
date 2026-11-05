@@ -1,14 +1,16 @@
-// Sound's two seams (plan step A6 plugs into them; docs/runtime.md, "Sound"):
-// where a render driver client's frames go, and the decode of one XMA frame.
-// The kernel's APU (src/kernel/audio.cpp, xma.cpp) runs both headless until
-// something else is set: each client's frames discarded at the playback rate
-// (Xenia's PacingAudioDriver), every XMA frame decoded as silence.
+// Sound's two seams (docs/runtime.md, "Sound"): where a render driver
+// client's frames go, and the decode of one XMA frame. The kernel's APU
+// (src/kernel/audio.cpp, xma.cpp) runs both headless until something else is
+// set: each client's frames discarded at the playback rate (Xenia's
+// PacingAudioDriver), every XMA frame decoded by FFmpeg's xmaframes decoder
+// (silence when built without it).
 
 #pragma once
 
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace xf::kernel {
 class Kernel;
@@ -40,6 +42,11 @@ public:
 // discarded, and each frame is played 256/48000 s after the one before it,
 // or after its own submission when the output had run dry.
 std::unique_ptr<Output> make_pacing_output();
+// another output whose frames are also written to a WAV file at path (32-bit
+// floats, six channels, 48 kHz); the inner output alone if it cannot be made.
+// The kernel puts one around each client's output when XF_AUDIO_WAV names a
+// prefix (<prefix>.client<N>.wav): what the player would play, to listen to.
+std::unique_ptr<Output> make_wav_output(std::unique_ptr<Output> inner, const std::string &path);
 
 // The decode of one XMA frame (in Xenia's XmaContextNew, PrepareDecoder,
 // DecodePacket and ConvertFrame over FFmpeg's xmaframes decoder); the
@@ -60,6 +67,13 @@ public:
 
 // every frame silence
 std::unique_ptr<FrameDecoder> make_silent_decoder();
+// FFmpeg's xmaframes decoder, as Xenia's (src/xma_decoder.cpp); nullptr when
+// built without it (CMake's XF_XMA off)
+std::unique_ptr<FrameDecoder> make_ffmpeg_decoder();
+// the kernel's default: FFmpeg's when built with it, else silence
+std::unique_ptr<FrameDecoder> make_xma_decoder();
+// FFmpeg's error messages so far (the first are printed, all counted)
+uint32_t ffmpeg_errors();
 
 } // namespace xf::audio
 

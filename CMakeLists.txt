@@ -53,8 +53,20 @@ add_library(xenoforge STATIC
     src/memory.cpp
     src/guest_memory.cpp
     src/gpu/command_processor.cpp
+    src/xma_decoder.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
+
+# XMA decoded by FFmpeg's xmaframes decoder, as Xenia does (plan A6;
+# third_party/ffmpeg/ffmpeg.cmake): a shared library of its own (LGPL), fetched
+# unless XF_FFMPEG_DIR or xenia-canary's checkout has it. Off, the core builds
+# without FFmpeg and decodes XMA as silence.
+option(XF_XMA "decode XMA with FFmpeg (a shared library, LGPL)" ON)
+if(XF_XMA)
+    include(third_party/ffmpeg/ffmpeg.cmake)
+    target_compile_definitions(xenoforge PRIVATE XF_XMA=1)
+    target_link_libraries(xenoforge PRIVATE ffmpeg_xma)
+endif()
 
 # Khronos's SPIR-V headers (MIT), from the Vulkan SDK; spirv-val checks what
 # the translator writes in the tests
@@ -284,6 +296,12 @@ target_include_directories(kernel_audio_test PRIVATE src/kernel)
 target_link_libraries(kernel_audio_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_audio COMMAND kernel_audio_test)
 set_tests_properties(kernel_audio PROPERTIES TIMEOUT 120) # threads: fail, never hang
+# the XMA decoder against Xenia's on recorded game input, where XF_XMA_TRACES says
+add_executable(xma_replay_test tests/xma_replay_test.cpp)
+target_include_directories(xma_replay_test PRIVATE src/kernel)
+target_link_libraries(xma_replay_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME xma_replay COMMAND xma_replay_test)
+set_tests_properties(xma_replay PROPERTIES TIMEOUT 300)
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)

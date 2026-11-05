@@ -70,5 +70,8 @@ tools/compare_disasm.ps1 -Shaders <folder>           # against Xenia's own disas
 Written by ShiromiyaG with Claude (Anthropic). MIT (`LICENSE`). Parts are
 translated from Xenia (BSD 3-clause, Copyright (c) 2015 Ben Vanik and the
 Xenia contributors, `LICENSE-xenia`), and its export tables are included
-unchanged; each such file says so at its top. Nothing derived from any game
-is in this repository.
+unchanged; each such file says so at its top. XMA is decoded by FFmpeg
+(LGPL 2.1 or later, `LICENSE-ffmpeg`), fetched at build time and built as a
+shared library of its own (`ffmpeg-xma`); `-DXF_XMA=OFF` builds without it
+([`docs/runtime.md`](docs/runtime.md), "Sound"). Nothing derived from any
+game is in this repository.

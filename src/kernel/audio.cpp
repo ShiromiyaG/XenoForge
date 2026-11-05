@@ -41,6 +41,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 
 namespace xf::audio {
@@ -70,9 +71,65 @@ private:
     uint64_t next_end_ = 0;
 };
 
+// Another output's frames also written to a WAV file (32-bit floats, the six
+// channels interleaved, 48 kHz), its sizes brought up to date once a second
+// of sound so a run cut short leaves a file that plays: XF_AUDIO_WAV
+class WavOutput final : public Output {
+public:
+    WavOutput(std::unique_ptr<Output> inner, std::FILE *file) : inner_(std::move(inner)), file_(file) {
+        write_header();
+        interleaved_.resize(FRAME_SAMPLES);
+    }
+    ~WavOutput() override {
+        write_header();
+        std::fclose(file_);
+    }
+    void submit(const float *frame, uint64_t now) override {
+        for (uint32_t ch = 0; ch < CHANNELS; ch++)
+            for (uint32_t i = 0; i < CHANNEL_SAMPLES; i++)
+                interleaved_[i * CHANNELS + ch] = frame[ch * CHANNEL_SAMPLES + i];
+        std::fwrite(interleaved_.data(), sizeof(float), interleaved_.size(), file_);
+        bytes_ += uint32_t(interleaved_.size() * sizeof(float));
+        if (++frames_ % (FREQUENCY / CHANNEL_SAMPLES) == 0) write_header();
+        inner_->submit(frame, now);
+    }
+    uint32_t played(uint64_t now) override { return inner_->played(now); }
+
+private:
+    void write_header() {
+        auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, file_); };
+        auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, file_); };
+        std::fseek(file_, 0, SEEK_SET);
+        std::fwrite("RIFF", 1, 4, file_);
+        u32(36 + bytes_);
+        std::fwrite("WAVEfmt ", 1, 8, file_);
+        u32(16), u16(3 /* IEEE float */), u16(CHANNELS), u32(FREQUENCY), u32(FREQUENCY * CHANNELS * 4);
+        u16(CHANNELS * 4), u16(32);
+        std::fwrite("data", 1, 4, file_);
+        u32(bytes_);
+        std::fseek(file_, 0, SEEK_END);
+        std::fflush(file_);
+    }
+
+    std::unique_ptr<Output> inner_;
+    std::FILE *file_;
+    std::vector<float> interleaved_;
+    uint32_t bytes_ = 0, frames_ = 0;
+};
+
 } // namespace
 
 std::unique_ptr<Output> make_pacing_output() { return std::make_unique<PacingOutput>(); }
+
+std::unique_ptr<Output> make_wav_output(std::unique_ptr<Output> inner, const std::string &path) {
+    std::FILE *file = std::fopen(path.c_str(), "wb");
+    if (!file) {
+        std::fprintf(stderr, "audio: cannot write %s\n", path.c_str());
+        return inner;
+    }
+    std::fprintf(stderr, "audio: writing a client's frames to %s\n", path.c_str());
+    return std::make_unique<WavOutput>(std::move(inner), file);
+}
 
 } // namespace xf::audio
 
@@ -162,6 +219,11 @@ uint32_t Audio::register_client(uint32_t callback, uint32_t callback_arg, uint32
     k->store32(wrapped, callback_arg);
     Client &c = *free;
     c.output = make_output();
+    // XF_AUDIO_WAV=<prefix>: the client's frames also to <prefix>.client<N>.wav
+    if (const char *wav = std::getenv("XF_AUDIO_WAV"); wav && *wav && c.output) {
+        const std::string path = std::string(wav) + ".client" + std::to_string(free - clients_.begin()) + ".wav";
+        c.output = audio::make_wav_output(std::move(c.output), path);
+    }
     c.slots = QUEUED_FRAMES;
     c.next_pump = 0;
     c.callback = callback, c.callback_arg = callback_arg, c.wrapped_arg = wrapped;
@@ -327,14 +389,19 @@ std::string audio_report(Kernel &k) {
     }
     if (x.created.load() || x.kicks.load()) {
         std::snprintf(line, sizeof(line),
-                      "xma: %llu contexts created (%llu released), %llu kicks, %llu context runs; %llu frames walked "
-                      "(decoded as silence), %llu input buffer swaps, %llu loops, %llu packets skipped, %llu stops on "
-                      "an error\n",
+                      "xma: %llu contexts created (%llu released), %u kicked, %llu kicks, %llu context runs (%llu "
+                      "starved of input); %llu input buffer swaps, %llu loops, %llu packets skipped\n",
                       (unsigned long long)x.created.load(), (unsigned long long)x.released.load(),
-                      (unsigned long long)x.kicks.load(), (unsigned long long)x.works.load(),
-                      (unsigned long long)x.frames.load(), (unsigned long long)x.swaps.load(),
-                      (unsigned long long)x.loops.load(), (unsigned long long)x.packets_skipped.load(),
-                      (unsigned long long)x.errors.load());
+                      x.contexts_kicked.load(), (unsigned long long)x.kicks.load(), (unsigned long long)x.works.load(),
+                      (unsigned long long)x.starved.load(), (unsigned long long)x.swaps.load(),
+                      (unsigned long long)x.loops.load(), (unsigned long long)x.packets_skipped.load());
+        out += line;
+        std::snprintf(line, sizeof(line),
+                      "xma: %llu frames decoded, %llu with sound (the loudest sample %u of 32768), %llu that decoded "
+                      "to nothing; %llu bad input, %llu runs cut short, %u FFmpeg errors\n",
+                      (unsigned long long)x.frames.load(), (unsigned long long)x.frames_with_sound.load(),
+                      x.peak.load(), (unsigned long long)x.frames_failed.load(), (unsigned long long)x.errors.load(),
+                      (unsigned long long)x.stalls.load(), audio::ffmpeg_errors());
         out += line;
     }
     return out;

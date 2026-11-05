@@ -257,12 +257,13 @@ game.
 
 ## Sound
 
-The APU as the games' code sees it, headless: enough for their sound to
-start and run with silence (plan, "Next"); the XMA decode is step A6, and
-the player sends the frames to the sound card (see "The player"). Translated from Xenia (`audio_system.cc`,
+The APU as the games' code sees it: the render driver's clients and the
+XMA decoder, with XMA decoded by FFmpeg's xmaframes decoder as Xenia
+decodes it (plan step A6); the player sends the clients' frames to the
+sound card (see "The player"). Translated from Xenia (`audio_system.cc`,
 `pacing_audio_driver.cc`, `xma_decoder.cc`, `xma_context_new.cc`,
-`xboxkrnl_audio.cc`, `xboxkrnl_audio_xma.cc`); where it differs is noted
-at the top of each file.
+`xma_context.cc`, `xboxkrnl_audio.cc`, `xboxkrnl_audio_xma.cc`); where it
+differs is noted at the top of each file.
 
 As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
 `xenoforge/audio.h`):
@@ -276,9 +277,12 @@ As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
   hands the frame (6 channels of 256 big-endian floats, one channel after
   another) to the client's `audio::Output` as host floats; the default
   one is Xenia's PacingAudioDriver: the samples are dropped and each frame
-  is played a period after the one before it, freeing its slot. A6 sets a
-  real output (`set_audio_output`). An unregistration waits for a
-  callback in progress.
+  is played a period after the one before it, freeing its slot. The player
+  sets a real output (`set_audio_output`). An unregistration waits for a
+  callback in progress. `XF_AUDIO_WAV=<prefix>` also writes each client's
+  frames to `<prefix>.client<N>.wav` (six channels of 32-bit floats at
+  48 kHz, the game's own mix of its voices: what the player plays), to
+  listen to a headless run.
 - **The XMA decoder**: its registers at 0x7FEA0000 through MMIO (the games
   reach them with lwbrx and stwbrx: the context array's physical address,
   a rotating current context, ten kick, lock and clear registers of 32
@@ -291,15 +295,63 @@ As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
   loops with their subframe end and skip, the two input buffers swapped,
   the output full or starved, the context data written back merged with
   what the game changed meanwhile. Each frame's decode is one call to an
-  `audio::FrameDecoder` (`set_xma_decoder`), silence until A6 puts
-  FFmpeg's there.
+  `audio::FrameDecoder` (`set_xma_decoder`).
+- **FFmpeg's decoder** (`src/xma_decoder.cpp`, the default): Xenia's
+  XmaContextNew around FFmpeg's `xmaframes` decoder, from has207's fork
+  (Xenia's submodule, commit d980192): a codec context per XMA context,
+  opened again when its rate or channels change, each frame one packet
+  (the byte with the frame's bit padding, then its bits), the planar
+  floats made 16-bit big-endian samples as Xenia's ConvertFrame does
+  (times 32767, rounded to nearest even, saturated). FFmpeg's first errors
+  are printed and all counted. `XF_XMA_SILENT=1` puts the silent decoder
+  in its place, to measure what decoding costs.
+- **FFmpeg, built** (`third_party/ffmpeg/ffmpeg.cmake`): CMake's `XF_XMA`
+  (on by default) fetches the fork's archive at that commit, or builds from
+  `XF_FFMPEG_DIR` (a checkout of it; xenia-canary's
+  `third_party/FFmpeg` is taken by itself from the sibling checkout when it
+  is at the commit), and compiles only the part of libavutil and libavcodec
+  the decoder needs, over a configuration overlay after Xenia's
+  `third_party/ffmpeg-xenia` (one codec, no assembly): one shared library,
+  `ffmpeg-xma` (0.8 MB), beside the executables. With `XF_XMA` off the core
+  builds without FFmpeg and every XMA frame decodes to silence.
+- **FFmpeg is LGPL 2.1 or later** (`LICENSE-ffmpeg`), and stays a separate,
+  dynamically linked library so XenoForge's own code keeps its license.
+  Shipping the player (or anything built with `XF_XMA`) means shipping
+  `ffmpeg-xma.dll` (`.so`) with: the LGPL's text and a notice that the
+  program uses FFmpeg under it; the library's source, or a written offer of
+  it, which is the fork's commit plus `third_party/ffmpeg` (the overlay and
+  the build script); and nothing that keeps a user from putting their own
+  build of it in its place (the player loads whatever `ffmpeg-xma` it finds
+  beside it). Linking FFmpeg statically would add the duty to ship the
+  player's objects for relinking, so it is not done.
+- **Recordings and Xenia's oracle**: with `XF_XMA_RECORD=<file.xmar>`
+  (boot or the player) the decoder writes every run of a context (its
+  data before and after, its input buffers and its output buffer before
+  and after, each distinct buffer once) and the clears and releases
+  between them (`xenoforge/xma_recording.h`); it hashes every buffer of
+  every run, which slows a game that kicks often (Reach's client fell to
+  a few frames a second while recording). `xma_oracle`
+  (`tools/xenia_oracle/build.bat xma`, against the xenia-canary build and
+  its FFmpeg) walks a recording through Xenia's own XmaContextNew and
+  writes its runs beside it (`<name>.xenia.xmar`); `xma_replay_test` walks
+  each recording under `XF_XMA_TRACES` through the kernel again and
+  compares every run with the live one (the decoder's fields, the output)
+  and with Xenia's (all 64 bytes of the context, every byte of the
+  output); `XF_XMA_WAV=<dir>` writes each context's output, ours and
+  Xenia's, as WAV files. Recordings are game data: `../traces/xma`,
+  never the repository. Without `XF_XMA_TRACES` the test has nothing to
+  run.
 - **The exports**: Xenia's XAudio* (the speaker configuration from the
   console's settings, full voice category volumes, no volume changes, the
   ducker off) and all its XMA*; the ducker's getters, which Xenia lacks,
   return their float in f1, as the games' calls read it.
 - `boot` reports the clients, callbacks and frames (and frames per
-  second), and the XMA contexts created, kicks, frames walked and buffer
-  swaps.
+  second), and the XMA contexts created and kicked, kicks, runs (and runs
+  starved of input: the game reads what it wrote before), buffer swaps,
+  loops, frames decoded, frames with sound and the loudest sample, frames
+  that decoded to nothing, bad input (a frame of the invalid length, a read
+  offset past its buffer, a split frame whose rest is missing), runs cut
+  at their pass limit and FFmpeg's errors.
 
 ## Files
 
@@ -458,7 +510,7 @@ logs in `../traces/player/`):
   `--press start@100` took it to the main menu, where the game's
   first-time dialog ("Would you like to? A Yes, B No") waits. Two XAudio
   clients play 187.5 frames a second each; 10,685 of 99,085 frames carried
-  sound (the movie's PCM; XMA is silence until A6), none dropped. The
+  sound (the movie's PCM; XMA was silence then, before A6), none dropped. The
   game asks for users 0-3 each frame and calls XamInputSetState (441 to
   599 times in a run). A capture of the window with `--overlay` shows the
   front buffer letterboxed under the overlay's rates, controllers and

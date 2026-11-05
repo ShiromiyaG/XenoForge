@@ -183,8 +183,34 @@ traces, without a recompiled game.
   it calls are not implemented (NetDll_socket answers 0), and it polls
   NetDll_recvfrom 4.26M times in 30 s.
 - **A5. The deterministic mode**, input recording and replay.
-- **A6. Sound** (XMA: Xenia decodes it with FFmpeg's XMA decoder from its own
-  fork; LGPL, linked dynamically), input, saves.
+- **A6. Sound** (XMA in, 2026-11-05; input, saves to come). XMA is decoded
+  by FFmpeg's `xmaframes` decoder from has207's fork, Xenia's own (commit
+  d980192), driven as Xenia's XmaContextNew drives it; FFmpeg (LGPL) is a
+  shared library of its own, `ffmpeg-xma`, fetched and built from the part
+  the decoder needs (CMake's `XF_XMA`, on by default; off, XMA decodes to
+  silence) ([runtime.md](runtime.md), "Sound"). Checked against Xenia on the
+  games' own input without putting it in the repository: the kernel records
+  what each context consumed (`XF_XMA_RECORD`), Xenia's XmaContextNew walks
+  the same recording (`tools/xenia_oracle`'s `xma_oracle`, linked with
+  xenia-canary's libraries and its FFmpeg), and `xma_replay_test` compares
+  the two run by run. Every run of the recordings made so far, 28,329 runs
+  in five games, leaves the same context data and the same PCM, byte for
+  byte, as Xenia's (`boot_<game>` with scripted presses):
+
+  | game | seconds | runs | contexts kicked | frames | loops, starved runs, releases |
+  |---|---|---|---|---|---|
+  | Ben 10 | 60 | 3,352 | 2 | 1,370 | 0, 0, 0 |
+  | El Chavo Kart | 220 (its menus) | 4,819 | 30 | 2,960 | 0, 0, 37 |
+  | Forza Horizon | 120 | 4,515 | 4 | 1,962 | 0, 0, 0 |
+  | Halo: Reach | 120 | 5,332 | 30 | 2,286 | 3, 0, 0 |
+  | Red Dead Redemption | 120 | 10,311 | 83 | 2,690 | 23, 14, 208 |
+
+  Gears of War 3 and Sonic Unleashed kicked none in 40 s (interpreted), BC2
+  was not run. Decoding costs little: RDR, which decodes about 1,100 frames
+  a second, keeps its client at 172 frames a second against 184 with
+  silence (`XF_XMA_SILENT=1`). The WAVs written from the recordings
+  (`XF_XMA_WAV`) and of the clients' mix (`XF_AUDIO_WAV`) are music and
+  effects, not yet heard by a person.
 
 **Track B: the GPU** ([renderer.md](renderer.md))
 
@@ -276,7 +302,7 @@ traces, without a recompiled game.
   report, `--press start@100` taking El Chavo Kart from its title screen to
   the main menu (its first-time dialog); a person at the screen still has
   to confirm that a pad moves things and that sound is heard (PCM frames
-  reach the device, XMA is silence until A6).
+  reach the device; XMA is decoded since A6).
 - **C2. The launcher** (ISO, recompile, settings, controls, port options).
 
 **Where they meet**
@@ -326,5 +352,7 @@ generated), and what each game asks of the kernel past 30 seconds.
 
 - The recompiler's discovery: translated from rexglue's (BSD), or written
   anew on Xenia's scanner; decided at A2 after reading both.
-- XMA: Xenia's FFmpeg fork (its `xmaframes` decoder) or upstream FFmpeg's
-  `xma2`; decided at A6.
+- XMA: decided at A6, Xenia's FFmpeg fork (its `xmaframes` decoder, one
+  frame a packet, as Xenia's walk hands them), so the PCM is Xenia's byte
+  for byte. Upstream FFmpeg's `xma2` decodes whole packets and would need
+  a walk of its own.
