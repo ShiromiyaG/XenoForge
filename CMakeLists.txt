@@ -39,6 +39,8 @@ add_library(xenoforge STATIC
     src/texture.cpp
     src/resolve.cpp
     src/ppc.cpp
+    src/ppc_interp.cpp
+    src/guest_space.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
@@ -105,7 +107,7 @@ add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
-foreach(name aes disc xex snappy ucode ucode_parse trace shader_interpreter texture)
+foreach(name aes disc xex snappy ucode ucode_parse trace shader_interpreter texture ppc)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
