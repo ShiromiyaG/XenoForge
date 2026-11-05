@@ -141,7 +141,7 @@ endif()
 # (-O1 builds in about 70% of -O2's time and runs slower; docs/recompiler.md,
 # "Modules and the game library"), XF_GAME_OPT_<name> one game's.
 set(XF_GAMES "" CACHE STRING "games whose generated code a boot_<name> links (directories under XF_GEN_DIR)")
-set(XF_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/gen" CACHE PATH "where xfrecomp emit wrote each game")
+set(XF_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/gen-modules" CACHE PATH "where xfrecomp emit wrote each game")
 set(XF_GAME_OPT "-O2" CACHE STRING "the game libraries' optimization level")
 foreach(game ${XF_GAMES})
     if(NOT EXISTS ${XF_GEN_DIR}/${game}/modules.cpp)

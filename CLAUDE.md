@@ -32,8 +32,8 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
 - **Som (A6)**: XMA pelo `xmaframes` do FFmpeg do Xenia (`ffmpeg-xma.dll`, LGPL). Regressão contra o Xenia:
   `XF_XMA_TRACES=../traces/xma build/xma_replay_test` (gravações com `XF_XMA_RECORD=<arquivo.xmar>`; o oráculo
   `xma_oracle` sai de `tools/xenia_oracle/build.bat xma`). `XF_AUDIO_WAV=<prefixo>` grava a mixagem para ouvir.
-- **Jogos com código gerado**: `-DXF_GAMES="chaves;ben10" -DXF_GEN_DIR=F:/RECOMPs/external/gen-modules` gera
-  `boot_<jogo>` e `player_<jogo>` (janela SDL3, controle, som). O `../external/gen` é do layout antigo.
+- **Jogos com código gerado**: `-DXF_GAMES="chaves;ben10"` gera `boot_<jogo>` e `player_<jogo>` (janela SDL3,
+  controle, som), com o código de `../external/gen-modules` (padrão do `XF_GEN_DIR`; `xfrecomp emit` grava lá).
 - **Recompilador (A2)**: desenho em `docs/recompiler.md`. Tabelas de `src/ppc/ppc-instructions.xml` (do Xenia,
   sem mudança) via `python tools/ppc_gen.py` (gera `include/xenoforge/ppc_opcodes.inc`, `src/ppc/decode.inc`,
   `src/ppc/disasm.inc`; commitados). Oráculo: `tools/xenia_oracle/build.bat` compila
