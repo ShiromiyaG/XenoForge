@@ -79,6 +79,9 @@ struct Xex {
     uint32_t header_size = 0; // where the image's data starts in the file
     uint32_t security_offset = 0;
     std::vector<std::pair<uint32_t, uint32_t>> opt_headers; // key, value or offset
+    // the file's first header_size bytes, as Xenia's XexModule keeps them (the
+    // kernel copies them into guest memory for RtlImageXexHeaderField)
+    std::vector<uint8_t> header;
 
     // from the security info
     uint32_t image_size = 0;

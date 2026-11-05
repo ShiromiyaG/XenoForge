@@ -225,6 +225,7 @@ bool parse_xex(std::span<const uint8_t> file, Xex &out, std::string &error) {
     }
     for (uint32_t i = 0; i < count; i++)
         out.opt_headers.emplace_back(be32(f + 0x18 + 8 * i), be32(f + 0x1C + 8 * i));
+    out.header.assign(f, f + out.header_size);
 
     // the security info: the image's size, address, key and pages
     uint32_t so = out.security_offset;

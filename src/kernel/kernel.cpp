@@ -30,13 +30,19 @@ std::string short_library(std::string_view library) {
 
 constexpr uint32_t SENTINEL = 0xBCBCBCBC; // a return address no code is at
 
+// the FILETIME's unit
+using Ticks100ns = std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>;
+
 uint16_t be16(const uint8_t *p) { return uint16_t(p[0] << 8 | p[1]); }
 uint32_t be32(const uint8_t *p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
 
 } // namespace
 
 bool register_export(const char *library, const char *name, ExportFn fn) {
-    registry()[std::string(library) + "!" + name] = fn;
+    ExportFn &slot = registry()[std::string(library) + "!" + name];
+    // two families writing the same export: the last one linked would win
+    if (slot) std::fprintf(stderr, "kernel: %s!%s is implemented twice\n", library, name);
+    slot = fn;
     return true;
 }
 
@@ -46,11 +52,18 @@ uint64_t arg64(Kernel &k, ppc::Context &c, int n) {
 }
 
 Kernel::Kernel(Memory &memory) : memory_(memory) {
+    // the clock's start (Xenia's Clock: the guest's system time base is the
+    // host's at start)
+    start_ = std::chrono::steady_clock::now();
+    start_system_time_ =
+        uint64_t(std::chrono::duration_cast<Ticks100ns>(std::chrono::system_clock::now().time_since_epoch()).count()) +
+        116'444'736'000'000'000ull; // 1601 to 1970
     system_.owner = this;
     system_.syscall = [](ppc::Context &c) {
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
         auto it = k.by_thunk_.find(c.pc);
         if (it != k.by_thunk_.end()) k.run_import(c, k.imports_[it->second]);
+        else if (const Import *thunk = k.find_thunk(c.pc)) k.run_import(c, *thunk);
     };
     system_.call = [](ppc::Context &c, uint32_t target) {
         return static_cast<Kernel *>(c.system->owner)->try_call(c, target);
@@ -94,6 +107,46 @@ uint32_t Kernel::variable(const std::string &name) {
     return variables_[name] = address;
 }
 
+void Kernel::set_variable(const std::string &name, uint32_t address) { variables_[name] = address; }
+
+void Kernel::add_thunk(uint32_t address, const std::string &library, const std::string &name) {
+    // sc 2; blr, as the import thunks (Xenia's trampolines are the same 8 bytes)
+    store32(address + 0, 0x44000042);
+    store32(address + 4, 0x4E800020);
+    Import im;
+    im.library = library, im.name = name, im.thunk = address;
+    auto fn = registry().find(library + "!" + name);
+    if (fn != registry().end()) im.fn = fn->second;
+    std::unique_lock lock(thunks_mutex_);
+    thunks_[address] = std::move(im);
+    has_thunks_ = true;
+}
+
+bool Kernel::implemented(const std::string &library, const std::string &name) {
+    return registry().count(library + "!" + name) != 0;
+}
+
+const Import *Kernel::find_thunk(uint32_t address) const {
+    if (!has_thunks_) return nullptr;
+    std::shared_lock lock(thunks_mutex_);
+    auto it = thunks_.find(address);
+    return it == thunks_.end() ? nullptr : &it->second;
+}
+
+uint64_t Kernel::interrupt_time() const {
+    // the host's interrupt time (Xenia's QueryHostInterruptTime): 100 ns
+    // since the host started, which steady_clock counts from
+    return uint64_t(std::chrono::duration_cast<Ticks100ns>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+uint64_t Kernel::system_time() const {
+    auto since = std::chrono::steady_clock::now() - start_;
+    return start_system_time_ + uint64_t(std::chrono::duration_cast<Ticks100ns>(since).count());
+}
+uint32_t Kernel::uptime_ms() const {
+    auto since = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_);
+    return uint32_t(std::min<int64_t>(since.count(), UINT32_MAX));
+}
+
 bool Kernel::load(const Xex &xex, std::string &error) {
     xex_ = &xex;
     uint32_t base = xex.base_address, size = uint32_t(xex.image.size());
@@ -104,6 +157,9 @@ bool Kernel::load(const Xex &xex, std::string &error) {
         return error = "could not map the image at its base", false;
     std::memcpy(host(base), xex.image.data(), size);
     entry_ = xex.entry_point;
+    // the kernel's memory, variables and modules, before the imports take
+    // the variables' addresses
+    setup_modules(*this, xex);
 
     for (const XexImportLibrary &library : xex.import_libraries) {
         std::string lib = short_library(library.name);
@@ -167,6 +223,10 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
     auto thunk = by_thunk_.find(target);
     if (thunk != by_thunk_.end()) {
         run_import(c, imports_[thunk->second]);
+        return true;
+    }
+    if (const Import *added = find_thunk(target)) {
+        run_import(c, *added);
         return true;
     }
     return false;

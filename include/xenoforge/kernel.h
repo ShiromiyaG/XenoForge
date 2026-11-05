@@ -16,10 +16,13 @@
 #include "xenoforge/xex.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -66,6 +69,11 @@ struct Generated {
     void (*fn)(ppc::Context &);
 };
 
+// The modules family's part of the load (modules.cpp), before the imports
+// are bound: the kernel's memory and variables at Xenia's addresses, the
+// kernel modules and the executable's module with its loader entry.
+void setup_modules(Kernel &k, const Xex &xex);
+
 class Kernel {
 public:
     explicit Kernel(Memory &memory);
@@ -110,6 +118,34 @@ public:
 
     // a variable export's value (the kernel's object for it), by name
     uint32_t variable(const std::string &name);
+    // where a variable export lives, set before load() binds the imports
+    // (the modules family puts them at Xenia's addresses)
+    void set_variable(const std::string &name, uint32_t address);
+
+    // Writes a thunk (sc 2; blr) at address that runs library!name as an
+    // import runs: counted, its absence logged once (Xenia's trampolines:
+    // XexGetProcedureAddress, the object types' procedures). The registry
+    // takes any library name, so the kernel's own guest-callable helpers are
+    // XF_EXPORT(kernel, Name).
+    void add_thunk(uint32_t address, const std::string &library, const std::string &name);
+    // whether library!name has an implementation
+    static bool implemented(const std::string &library, const std::string &name);
+
+    // The guest's clock, as Xenia's Clock unscaled: the system time (a
+    // FILETIME, 100 ns since 1601) from the host's at start, the interrupt
+    // time (100 ns, monotonic), and the milliseconds since the start.
+    uint64_t system_time() const;
+    uint64_t interrupt_time() const;
+    uint32_t uptime_ms() const;
+
+    // A family's own state, made on first use and destroyed with the kernel
+    // (before anything else in it).
+    template <class T> T &state() {
+        std::lock_guard<std::mutex> lock(states_mutex_);
+        std::shared_ptr<void> &p = states_[state_key<T>()];
+        if (!p) p = std::make_shared<T>();
+        return *static_cast<T *>(p.get());
+    }
 
     // the interpreter's limit per entry (boot stops a run with it)
     uint64_t step_limit = UINT64_MAX;
@@ -121,6 +157,12 @@ public:
 
 private:
     void run_import(ppc::Context &c, const Import &import);
+    // a thunk add_thunk wrote (nullptr if none is at the address)
+    const Import *find_thunk(uint32_t address) const;
+    template <class T> static const void *state_key() {
+        static const char key = 0;
+        return &key;
+    }
 
     Memory &memory_;
     const Xex *xex_ = nullptr;
@@ -134,6 +176,15 @@ private:
     mutable std::mutex counts_mutex_;
     std::map<std::string, uint64_t> calls_, unimplemented_;
     std::atomic<uint64_t> interpreted_{0};
+    // add_thunk's (a map: its entries stay where they are)
+    mutable std::shared_mutex thunks_mutex_;
+    std::map<uint32_t, Import> thunks_;
+    std::atomic<bool> has_thunks_{false};
+    std::chrono::steady_clock::time_point start_;
+    uint64_t start_system_time_ = 0;
+    // last: destroyed first, while the rest is still there
+    std::mutex states_mutex_;
+    std::map<const void *, std::shared_ptr<void>> states_;
 };
 
 } // namespace xf::kernel

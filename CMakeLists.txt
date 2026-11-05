@@ -130,6 +130,13 @@ foreach(name aes disc xex lzx snappy ucode ucode_parse trace shader_interpreter 
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+# the kernel's exports, called through a Kernel (the object library brings
+# their registrations)
+foreach(name kernel_memory kernel_modules)
+    add_executable(${name}_test tests/${name}_test.cpp)
+    target_link_libraries(${name}_test PRIVATE xenoforge_kernel xenoforge)
+    add_test(NAME ${name} COMMAND ${name}_test)
+endforeach()
 foreach(name spirv shader_translator)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
