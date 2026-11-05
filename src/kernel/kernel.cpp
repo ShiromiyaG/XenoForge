@@ -6,11 +6,11 @@
 
 #include "xenoforge/kernel.h"
 
+#include "objects.h"
 #include "xenoforge/exports.h"
 #include "xenoforge/ppc_interp.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 
 namespace xf::kernel {
@@ -39,11 +39,14 @@ uint32_t be32(const uint8_t *p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) <
 } // namespace
 
 bool register_export(const char *library, const char *name, ExportFn fn) {
-    ExportFn &slot = registry()[std::string(library) + "!" + name];
-    // two families writing the same export: the last one linked would win
-    if (slot) std::fprintf(stderr, "kernel: %s!%s is implemented twice\n", library, name);
-    slot = fn;
+    auto [it, added] = registry().insert({std::string(library) + "!" + name, fn});
+    if (!added) std::fprintf(stderr, "kernel: %s!%s is implemented twice\n", library, name);
     return true;
+}
+
+ExportFn find_export_fn(const char *library, const char *name) {
+    auto it = registry().find(std::string(library) + "!" + name);
+    return it == registry().end() ? nullptr : it->second;
 }
 
 uint64_t arg64(Kernel &k, ppc::Context &c, int n) {
@@ -52,12 +55,6 @@ uint64_t arg64(Kernel &k, ppc::Context &c, int n) {
 }
 
 Kernel::Kernel(Memory &memory) : memory_(memory) {
-    // the clock's start (Xenia's Clock: the guest's system time base is the
-    // host's at start)
-    start_ = std::chrono::steady_clock::now();
-    start_system_time_ =
-        uint64_t(std::chrono::duration_cast<Ticks100ns>(std::chrono::system_clock::now().time_since_epoch()).count()) +
-        116'444'736'000'000'000ull; // 1601 to 1970
     system_.owner = this;
     system_.syscall = [](ppc::Context &c) {
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
@@ -74,13 +71,15 @@ Kernel::Kernel(Memory &memory) : memory_(memory) {
         std::snprintf(reason, sizeof(reason), "%s (0x%08X) at 0x%08X has no semantics", ppc::info(op).name, code, c.pc);
         if (!k.stopped.exchange(true)) k.stop_reason = reason;
     };
-    system_.time_base = [](ppc::Context &) {
-        // the Xenon's time base runs at 50 MHz
-        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch())
-                      .count();
-        return uint64_t(ns / 20);
+    system_.time_base = [](ppc::Context &c) {
+        // the Xenon's time base runs at 50 MHz: 5 ticks in the scheduler's
+        // clock's 100 ns
+        return static_cast<Kernel *>(c.system->owner)->objects_->now() * 5;
     };
+    // the globals first: the objects and threads use their processes,
+    // object types and KeTimeStampBundle
+    setup_kernel(*this);
+    objects_ = std::make_unique<Objects>(*this);
 }
 
 Kernel::~Kernel() = default;
@@ -133,19 +132,11 @@ const Import *Kernel::find_thunk(uint32_t address) const {
     return it == thunks_.end() ? nullptr : &it->second;
 }
 
-uint64_t Kernel::interrupt_time() const {
-    // the host's interrupt time (Xenia's QueryHostInterruptTime): 100 ns
-    // since the host started, which steady_clock counts from
-    return uint64_t(std::chrono::duration_cast<Ticks100ns>(std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-uint64_t Kernel::system_time() const {
-    auto since = std::chrono::steady_clock::now() - start_;
-    return start_system_time_ + uint64_t(std::chrono::duration_cast<Ticks100ns>(since).count());
-}
-uint32_t Kernel::uptime_ms() const {
-    auto since = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_);
-    return uint32_t(std::min<int64_t>(since.count(), UINT32_MAX));
-}
+// one clock, the scheduler's (100 ns since the kernel started): the
+// interrupt time; the system time is it plus the host's time at the start
+uint64_t Kernel::interrupt_time() const { return objects_->now(); }
+uint64_t Kernel::system_time() const { return objects_->system_time(); }
+uint32_t Kernel::uptime_ms() const { return uint32_t(std::min<uint64_t>(objects_->now() / 10'000, UINT32_MAX)); }
 
 bool Kernel::load(const Xex &xex, std::string &error) {
     xex_ = &xex;
@@ -206,6 +197,8 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
             std::fprintf(stderr, "kernel: %s is not implemented (r3 0x%08X, r4 0x%08X, from 0x%08X)\n", key.c_str(),
                          uint32_t(c.r[3]), uint32_t(c.r[4]), uint32_t(c.lr));
     }
+    // a suspension or kernel APCs waiting for this thread happen here
+    if (Thread *t = current_thread(); t && t->pending.load(std::memory_order_relaxed)) objects_->safe_point(*t);
     if (import.fn) import.fn(*this, c);
     else result(c, 0);
 }

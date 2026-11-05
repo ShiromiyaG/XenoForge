@@ -131,53 +131,7 @@ XF_EXPORT(xboxkrnl, HalReturnToFirmware) {
 
 // ---- the clock (xboxkrnl_threading.cc, xboxkrnl_misc.cc) ----
 
-XF_EXPORT(xboxkrnl, KeQuerySystemTime) {
-    // also the timestamp bundle's system time, kept consistent with it
-    uint32_t time_ptr = arg(k, c, 0);
-    if (!time_ptr) return;
-    uint64_t time = k.system_time();
-    k.store64(k.variable("KeTimeStampBundle") + 8, time);
-    k.store64(time_ptr, time);
-}
-
-XF_EXPORT(xboxkrnl, KeQueryPerformanceFrequency) {
-    // the time base's: 50 MHz
-    result(c, 50'000'000);
-}
-
 XF_EXPORT(xboxkrnl, KeQueryInterruptTime) { c.r[3] = k.load64(k.variable("KeTimeStampBundle")); }
-
-// ---- the current process (xboxkrnl_threading.cc, xboxkrnl_misc.cc) ----
-// The PCR (r13): the PRCB at 0x100 with the current thread at 0x100 and DPC
-// activity at 0x150, the process type in a DPC at 0xC; the thread (KTHREAD):
-// the FPU exceptions at 0x71, the process type at 0x73.
-
-constexpr uint32_t PCR_PROCESS_TYPE_IN_DPC = 0x0C;
-constexpr uint32_t PCR_CURRENT_THREAD = 0x100;
-constexpr uint32_t PCR_DPC_ACTIVE = 0x150;
-constexpr uint32_t KTHREAD_FPU_EXCEPTIONS = 0x71;
-constexpr uint32_t KTHREAD_PROCESS_TYPE = 0x73;
-
-XF_EXPORT(xboxkrnl, KeGetCurrentProcessType) {
-    uint32_t pcr = uint32_t(c.r[13]);
-    if (k.load32(pcr + PCR_DPC_ACTIVE)) return result(c, k.host(pcr + PCR_PROCESS_TYPE_IN_DPC)[0]);
-    uint32_t thread = k.load32(pcr + PCR_CURRENT_THREAD);
-    // a thread with no KTHREAD yet (until the threads family gives it one)
-    // runs in the title
-    if (!thread) return result(c, 1);
-    result(c, k.host(thread + KTHREAD_PROCESS_TYPE)[0]);
-}
-
-XF_EXPORT(xboxkrnl, KeSetCurrentProcessType) {
-    uint32_t pcr = uint32_t(c.r[13]);
-    if (k.load32(pcr + PCR_DPC_ACTIVE)) k.host(pcr + PCR_PROCESS_TYPE_IN_DPC)[0] = uint8_t(arg(k, c, 0));
-}
-
-XF_EXPORT(xboxkrnl, KeEnableFpuExceptions) {
-    // (enabled): kept in the thread, nothing more (Xenia's stub)
-    uint32_t thread = k.load32(uint32_t(c.r[13]) + PCR_CURRENT_THREAD);
-    if (thread) k.host(thread + KTHREAD_FPU_EXCEPTIONS)[0] = arg(k, c, 0) != 0;
-}
 
 // ---- the console's settings (xboxkrnl_xconfig.cc, xconfig.h) ----
 // Each setting by category and id, at its size, with the value Xenia's

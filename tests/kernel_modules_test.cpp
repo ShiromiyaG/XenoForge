@@ -7,8 +7,6 @@
 #include "xenoforge/xex.h"
 
 #include <array>
-#include <chrono>
-#include <thread>
 
 using namespace xf;
 
@@ -210,12 +208,10 @@ void variables(KernelHarness &h) {
     CHECK(k.load32(title + 0x38) == 0);
     CHECK(k.load32(title + 0x1C) == 0x42000); // the stack size, to pages
 
-    // KeTimeStampBundle, kept by the timer
+    // KeTimeStampBundle at Xenia's address, filled as the kernel starts (the
+    // scheduler's clock moves it on once threads run: kernel_threads_test)
     uint32_t bundle = k.variable("KeTimeStampBundle");
     CHECK(bundle == 0x80240EE0);
-    uint32_t tick = k.load32(bundle + 0x10);
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    CHECK(k.load32(bundle + 0x10) >= tick + 20);
     uint64_t system_time = k.load64(bundle + 8);
     CHECK(system_time <= k.system_time() && k.system_time() - system_time < 10'000'000);
 }
@@ -438,8 +434,7 @@ void crypto(KernelHarness &h) {
 
 void process_type(KernelHarness &h) {
     kernel::Kernel &k = *h.k;
-    // no KTHREAD in the PCR yet: the title
-    CHECK(h.krnl("KeGetCurrentProcessType") == 1);
+    // the thread's (every guest thread has its KTHREAD in the PCR)
     uint32_t thread = h.alloc(0x100);
     k.store32(h.pcr + 0x100, thread);
     k.host(thread + 0x73)[0] = 2;

@@ -35,18 +35,12 @@
 #include "xenoforge/kernel.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <vector>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 namespace xf::kernel {
 namespace {
@@ -133,13 +127,6 @@ struct Modules {
     Module *executable = nullptr;
     uint32_t globals = 0;
     std::vector<std::pair<uint32_t, uint32_t>> terminate_notifications; // routine, priority
-    std::thread timer;
-    std::atomic<bool> running{false};
-
-    ~Modules() {
-        running = false;
-        if (timer.joinable()) timer.join();
-    }
 };
 
 bool equal_case(std::string_view a, std::string_view b) {
@@ -315,23 +302,12 @@ void initialize_process(Kernel &k, uint32_t process, uint8_t type, uint8_t prior
     k.store32(process + 0x58, process + 0x54);
 }
 
-// KernelState::SetProcessTLSVars: the slots in the bitmap (1 free)
-void set_process_tls(Kernel &k, uint32_t process, uint32_t slots, uint32_t data_size, uint32_t static_data) {
-    uint32_t padded = (slots + 3) & 0xFFFFFFFC;
-    k.store32(process + 0x24, data_size);
-    k.store32(process + 0x28, data_size);
-    k.store32(process + 0x20, static_data);
-    k.store16(process + 0x2C, uint16_t(4 * padded));
-    uint32_t words = padded / 32;
-    for (uint32_t i = 0; i < words; i++) k.store32(process + 0x30 + 4 * i, 0xFFFFFFFF);
-    if (((slots + 3) & 0x1C) != 0) k.store32(process + 0x30 + 4 * words, 0xFFFFFFFFu << (32 - ((slots + 3) & 0x1C)));
-}
-
 // KernelState::InitializeKernelGuestGlobals
 uint32_t initialize_globals(Kernel &k) {
     uint32_t g = k.memory().system_alloc(GLOBALS_SIZE);
     initialize_process(k, g + IDLE_PROCESS, 0, 0, 0, 0);
     k.store32(g + IDLE_PROCESS + 0x0C, 0x7F); // quantum
+    initialize_process(k, g + TITLE_PROCESS, 1, 10, 13, 17);
     initialize_process(k, g + SYSTEM_PROCESS, 2, 2, 5, 9);
     set_process_tls(k, g + SYSTEM_PROCESS, 32, 0, 0);
 
@@ -376,40 +352,6 @@ uint32_t initialize_globals(Kernel &k) {
     return g;
 }
 
-// KernelState::UpdateKeTimestampBundle (Xenia's timer runs every millisecond)
-void update_timestamp_bundle(Kernel &k) {
-    k.store64(KeTimeStampBundle + 0x00, k.interrupt_time());
-    k.store64(KeTimeStampBundle + 0x08, k.system_time());
-    k.store32(KeTimeStampBundle + 0x10, k.uptime_ms());
-}
-
-void start_timer(Modules &s) {
-    s.running = true;
-    s.timer = std::thread([&s] {
-#ifdef _WIN32
-        // a millisecond, which Sleep does not give
-        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
-#endif
-        while (s.running) {
-            update_timestamp_bundle(*s.k);
-#ifdef _WIN32
-            if (timer) {
-                LARGE_INTEGER due;
-                due.QuadPart = -10000; // 1 ms, relative
-                if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-                    WaitForSingleObject(timer, INFINITE);
-                    continue;
-                }
-            }
-#endif
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-#ifdef _WIN32
-        if (timer) CloseHandle(timer);
-#endif
-    });
-}
-
 void copy_string(Kernel &k, uint32_t address, const std::string &s, uint32_t capacity) {
     size_t n = std::min<size_t>(s.size(), capacity - 1);
     std::memcpy(k.host(address), s.data(), n);
@@ -418,7 +360,7 @@ void copy_string(Kernel &k, uint32_t address, const std::string &s, uint32_t cap
 
 } // namespace
 
-void setup_modules(Kernel &k, const Xex &xex) {
+void setup_kernel(Kernel &k) {
     Memory &memory = k.memory();
     Modules &s = k.state<Modules>();
     s.k = &k;
@@ -486,15 +428,33 @@ void setup_modules(Kernel &k, const Xex &xex) {
     k.store16(XboxKrnlVersion + 6, 0);
     k.set_variable("XboxKrnlVersion", XboxKrnlVersion);
 
-    // KeTimeStampBundle: interrupt time, system time, tick count, kept
-    // current by a timer
-    update_timestamp_bundle(k);
+    // KeTimeStampBundle: interrupt time, system time, tick count; the
+    // scheduler's clock keeps it current (objects.cpp, every millisecond)
     k.store32(KeTimeStampBundle + 0x14, 0);
     k.set_variable("KeTimeStampBundle", KeTimeStampBundle);
-    start_timer(s);
 
     // xam.xex
     add_kernel_module(k, s, "xe:\\xam.xex", "xam");
+}
+
+// KernelState::SetProcessTLSVars: the slots in the bitmap (1 free)
+void set_process_tls(Kernel &k, uint32_t process, uint32_t slots, uint32_t data_size, uint32_t static_data) {
+    uint32_t padded = (slots + 3) & 0xFFFFFFFC;
+    k.store32(process + 0x24, data_size);
+    k.store32(process + 0x28, data_size);
+    k.store32(process + 0x20, static_data);
+    k.store16(process + 0x2C, uint16_t(4 * padded));
+    uint32_t words = padded / 32;
+    for (uint32_t i = 0; i < words; i++) k.store32(process + 0x30 + 4 * i, 0xFFFFFFFF);
+    if (((slots + 3) & 0x1C) != 0) k.store32(process + 0x30 + 4 * words, 0xFFFFFFFFu << (32 - ((slots + 3) & 0x1C)));
+}
+
+uint32_t title_process(Kernel &k) { return k.state<Modules>().globals + TITLE_PROCESS; }
+uint32_t system_process(Kernel &k) { return k.state<Modules>().globals + SYSTEM_PROCESS; }
+
+void setup_modules(Kernel &k, const Xex &xex) {
+    Memory &memory = k.memory();
+    Modules &s = k.state<Modules>();
 
     // The executable (UserModule::LoadContinue): its header copied into
     // guest memory, its loader entry

@@ -30,11 +30,15 @@
 namespace xf::kernel {
 
 class Kernel;
+class Objects; // the objects and threads (src/kernel/objects.h)
 using ExportFn = void (*)(Kernel &k, ppc::Context &c);
 
 // Registers an export's implementation by library ("xboxkrnl", "xam") and
 // name (Xenia's export tables give the ordinal). XF_EXPORT does it.
 bool register_export(const char *library, const char *name, ExportFn fn);
+// an export's implementation (nullptr: none), for the kernel's own calls
+// and the tests
+ExportFn find_export_fn(const char *library, const char *name);
 
 #define XF_EXPORT(library, name)                                                                                       \
     static void xf_export_##library##_##name(::xf::kernel::Kernel &k, ::xf::ppc::Context &c);                         \
@@ -69,10 +73,18 @@ struct Generated {
     void (*fn)(ppc::Context &);
 };
 
-// The modules family's part of the load (modules.cpp), before the imports
-// are bound: the kernel's memory and variables at Xenia's addresses, the
-// kernel modules and the executable's module with its loader entry.
+// The modules family's parts (modules.cpp). setup_kernel, as the kernel
+// starts: the guest globals (object types, processes), the kernel's memory
+// and variables at Xenia's addresses, the kernel modules. setup_modules, at
+// the load before the imports are bound: the executable's module with its
+// loader entry, the title process's TLS and stack size.
+void setup_kernel(Kernel &k);
 void setup_modules(Kernel &k, const Xex &xex);
+// the title and system processes (X_KPROCESS) in the guest globals
+uint32_t title_process(Kernel &k);
+uint32_t system_process(Kernel &k);
+// a process's TLS (Xenia's SetProcessTLSVars): the slots free in its bitmap
+void set_process_tls(Kernel &k, uint32_t process, uint32_t slots, uint32_t data_size, uint32_t static_data);
 
 class Kernel {
 public:
@@ -100,6 +112,19 @@ public:
 
     // the generated code, if linked (sorted by address)
     void set_generated(const Generated *table, size_t count);
+
+    // The title's main thread (Xenia's KernelState::LaunchModule): the
+    // entry point on a guest thread with the executable's default stack and
+    // TLS, started on its own host thread.
+    bool launch(std::string &error);
+    // Waits up to timeout_ms for the main thread to end: true, and its exit
+    // code, if it did.
+    bool wait_main(uint32_t timeout_ms, uint32_t *exit_code = nullptr);
+    // the guest threads alive: each one's state and where it was
+    std::string thread_report();
+    // the context of the guest thread on this host thread (nullptr off one)
+    static ppc::Context *current_context();
+    Objects &objects() { return *objects_; }
 
     // A thread's context set up to run here (its System points back).
     void attach(ppc::Context &c);
@@ -180,11 +205,10 @@ private:
     mutable std::shared_mutex thunks_mutex_;
     std::map<uint32_t, Import> thunks_;
     std::atomic<bool> has_thunks_{false};
-    std::chrono::steady_clock::time_point start_;
-    uint64_t start_system_time_ = 0;
-    // last: destroyed first, while the rest is still there
+    // destroyed after the objects and threads, before the rest
     std::mutex states_mutex_;
     std::map<const void *, std::shared_ptr<void>> states_;
+    std::unique_ptr<Objects> objects_; // last: it reaches the rest
 };
 
 } // namespace xf::kernel

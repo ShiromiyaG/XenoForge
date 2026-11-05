@@ -73,6 +73,16 @@ struct XexExecutionInfo {
     uint32_t savegame_id = 0;
 };
 
+// The thread local storage the executable asks for (TLS_INFO; Xenia's
+// xex2_opt_tls_info): slots per thread, and __declspec(thread) data copied
+// into each thread's block from the image.
+struct XexTls {
+    uint32_t slot_count = 0;
+    uint32_t raw_data_address = 0;
+    uint32_t data_size = 0;
+    uint32_t raw_data_size = 0;
+};
+
 struct Xex {
     // the main header
     uint32_t module_flags = 0;
@@ -99,6 +109,8 @@ struct Xex {
     uint32_t lzx_window = 0;
     bool has_execution_info = false;
     XexExecutionInfo execution;
+    bool has_tls = false;
+    XexTls tls;
     std::string original_pe_name;
     std::vector<XexStaticLibrary> static_libraries;
     std::vector<XexImportLibrary> import_libraries;

@@ -111,6 +111,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/memory.cpp) # the guest memory, being 
     add_executable(boot tools/boot.cpp)
     target_link_libraries(boot PRIVATE xenoforge_kernel xenoforge)
 endif()
+# the kernel's threads and objects, tested through their exports and
+# src/kernel/objects.h
+add_executable(kernel_threads_test tests/kernel_threads_test.cpp)
+target_include_directories(kernel_threads_test PRIVATE src/kernel)
+target_link_libraries(kernel_threads_test PRIVATE xenoforge_kernel xenoforge)
 
 # stb_image and stb_image_write (public domain / MIT), for PNGs in the tools;
 # Xenia's copy unless STB_DIR says otherwise
@@ -145,6 +150,7 @@ foreach(name spirv shader_translator)
     endif()
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+add_test(NAME kernel_threads COMMAND kernel_threads_test)
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)

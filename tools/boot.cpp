@@ -1,11 +1,11 @@
 // boot: a game run without a window (plan step A4; docs/runtime.md). Loads
-// the disc's executable, maps it, binds its imports, sets up the main
-// thread as Xenia's XThread does (a stack, the PCR in r13, TLS), runs the
-// entry point (generated code where linked, else the interpreter) and
-// prints what the kernel saw: every export called and how often, the ones
-// with no implementation, where it stopped.
+// the disc's executable, maps it, binds its imports, starts the main thread
+// the kernel makes (Kernel::launch: stack, PCR, KTHREAD, TLS, as Xenia's
+// XThread), runs the entry point (generated code where linked, else the
+// interpreter) and prints what the kernel saw: every export called and how
+// often, the ones with no implementation, the threads and where it stopped.
 //
-//   boot <game.iso | default.xex> [--xex <path>] [--steps N]
+//   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N]
 
 #include "xenoforge/disc.h"
 #include "xenoforge/kernel.h"
@@ -28,8 +28,7 @@ using namespace xf;
 
 namespace {
 
-// for the fault report: the main thread's context and the guest memory
-ppc::Context *main_context = nullptr;
+// for the fault report: the guest memory
 uint8_t *guest_base = nullptr;
 kernel::Kernel *the_kernel = nullptr;
 
@@ -44,8 +43,9 @@ LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
     std::printf("fault: %s host 0x%llX", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
                 (unsigned long long)at);
     if (offset < (1ull << 33)) std::printf(" (guest 0x%08llX)", (unsigned long long)offset);
-    if (main_context)
-        std::printf(", the main thread last at guest 0x%08X, lr 0x%08X", main_context->pc, uint32_t(main_context->lr));
+    // the faulting thread's own context (the handler runs on it)
+    if (ppc::Context *c = kernel::Kernel::current_context())
+        std::printf(", its guest thread last at 0x%08X, lr 0x%08X", c->pc, uint32_t(c->lr));
     std::printf("\n");
     if (the_kernel) print_report(*the_kernel);
     std::fflush(stdout);
@@ -73,15 +73,17 @@ bool load(const std::string &input, const std::string &xex_path, Xex &xex, std::
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N]\n");
+        std::fprintf(stderr, "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N]\n");
         return 2;
     }
     std::string input = argv[1], xex_path = "default.xex";
     uint64_t steps = 2'000'000'000ull;
+    uint32_t seconds = 30;
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc) xex_path = argv[++k];
         else if (a == "--steps" && k + 1 < argc) steps = std::strtoull(argv[++k], nullptr, 10);
+        else if (a == "--seconds" && k + 1 < argc) seconds = uint32_t(std::strtoul(argv[++k], nullptr, 10));
     }
 
     std::string error;
@@ -94,35 +96,31 @@ int main(int argc, char **argv) {
     k.step_limit = steps;
     std::printf("loaded %s: base 0x%08X, entry 0x%08X, %zu imported functions\n", xex_path.c_str(), xex.base_address,
                 k.entry_point(), k.imports().size());
+    std::printf("stack 0x%X; TLS: ", xex.stack_size);
+    if (xex.has_tls)
+        std::printf("%u slots, %u bytes of data (0x%X from 0x%08X)\n", xex.tls.slot_count, xex.tls.data_size,
+                    xex.tls.raw_data_size, xex.tls.raw_data_address);
+    else std::printf("none\n");
 
-    // the main thread, as Xenia's XThread::Create sets one up (lean): a
-    // stack in the 64 KB virtual heap, the PCR in r13, a TLS block
-    static ppc::Context c;
-    std::memset(&c, 0, sizeof(c));
-    k.attach(c);
-    Heap *stacks = memory->heap_by_type(false, 64 * 1024);
-    uint32_t stack_size = 1u << 20, stack = 0;
-    if (!stacks || !stacks->alloc(stack_size, 64 * 1024, ALLOCATE_RESERVE | ALLOCATE_COMMIT, PROTECT_READ_WRITE, true, &stack))
-        return std::fprintf(stderr, "no stack\n"), 1;
-    uint32_t pcr = memory->system_alloc(0x2D8), tls = memory->system_alloc(0x1000);
-    uint32_t stack_top = stack + stack_size;
-    k.store32(pcr + 0x00, tls);       // tls_ptr
-    k.store64(pcr + 0x30, pcr);       // pcr_ptr
-    k.store32(pcr + 0x70, stack_top); // stack_base_ptr (high)
-    k.store32(pcr + 0x74, stack);     // stack_end_ptr (low)
-    c.r[1] = stack_top - 0x100;
-    c.r[13] = pcr;
-    c.msr = 0x9030;
-
-    main_context = &c, guest_base = memory->base(), the_kernel = &k;
+    guest_base = memory->base(), the_kernel = &k;
 #ifdef _WIN32
     AddVectoredExceptionHandler(1, on_fault);
 #endif
-    k.call(c, k.entry_point());
+    if (!k.launch(error)) return std::fprintf(stderr, "launch: %s\n", error.c_str()), 1;
+    // until the main thread ends, the code hits what cannot run, or time is up
+    uint32_t exit_code = 0;
+    bool ended = false;
+    for (uint32_t ms = 0; ms < seconds * 1000 && !k.stopped; ms += 100)
+        if ((ended = k.wait_main(100, &exit_code))) break;
 
-    std::printf("%s\n", k.stopped ? ("stopped: " + k.stop_reason).c_str() : "the entry point returned");
+    if (k.stopped) std::printf("stopped: %s\n", k.stop_reason.c_str());
+    else if (ended) std::printf("the main thread ended (exit code 0x%08X)\n", exit_code);
+    else std::printf("still running after %u s\n", seconds);
+    std::printf("threads:\n%s", k.thread_report().c_str());
     print_report(k);
-    return 0;
+    // other threads may still run: no destructors under them
+    std::fflush(stdout);
+    std::_Exit(0);
 }
 
 namespace {

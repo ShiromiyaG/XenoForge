@@ -275,6 +275,11 @@ bool parse_xex(std::span<const uint8_t> file, Xex &out, std::string &error) {
         out.execution.savegame_id = be32(p + 0x14);
     }
 
+    if (const uint8_t *p = header_data(file, out, xex_key::TLS_INFO, 0x10)) {
+        out.has_tls = true;
+        out.tls = {be32(p), be32(p + 4), be32(p + 8), be32(p + 0xC)};
+    }
+
     if (const uint8_t *p = header_data(file, out, xex_key::ORIGINAL_PE_NAME, 4)) {
         uint32_t size = be32(p);
         const auto *h = find_header(out, xex_key::ORIGINAL_PE_NAME);
