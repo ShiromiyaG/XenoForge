@@ -187,8 +187,9 @@ traces, without a recompiled game.
   `xfeffect`), the 10 compiled from `tests/hlsl/` and the 13 of the
   traces, every pixel shader translates and validates, and the GPU and
   the interpreter agree on all 141 (whole shaders within 1e-4: rcp's 21
-  bits differ by a step and subtractions grow it). Left: memexport, fetch
-  offsets, unnormalized coordinates, getCompTexLOD and getWeights, the
+  bits differ by a step and subtractions grow it). Fetch offsets,
+  unnormalized coordinates (not yet on cube maps) and stacked textures
+  came with B3. Left: memexport, getCompTexLOD and getWeights, the
   parameter generator.
 - **B3. The renderer**: front end, render targets, textures, draws; a trace
   replayed and compared with Xenia's picture. First form in (2026-11-04,
@@ -198,8 +199,17 @@ traces, without a recompiled game.
   [renderer.md](renderer.md), "Driven live"): the renderer is the command
   processor's Sink, traces replay through the same processor, and `boot
   --render --shots` draws both games headless and writes chosen swaps.
-  Next: traces of more games, and of the games themselves past their
-  titles.
+  El Chavo Kart's title screen (2026-11-05, later): it came out red
+  because D24FS8 depth was kept as 0-2 in a 0-1 host depth, so the color
+  bits the game moves through a float depth target lost their green and
+  blue; kept halved, as Xenia's host targets keep it, the title matches
+  Xenia's trace (mean 0.000) and live (identical but for its pulsing
+  "Press START"). Also in: point lists (sprites through a geometry
+  shader), texture fetch offsets with Xenia's rounding epsilon,
+  unnormalized coordinates, stacked textures as 2D arrays, depth and
+  EXPAND textures as Xenia loads them, 2_10_10_10_FLOAT as 32 bits in
+  EDRAM, draws that can write nothing dropped. Next: traces of more games,
+  and of the games themselves past their titles.
 - **B4. Scale and speed**: resolution scale, the pipeline cache on disk,
   shaders translated in the build.
 - **B5. The generic pipeline** (the microcode interpreter on the GPU), if

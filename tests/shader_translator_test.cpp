@@ -1,9 +1,10 @@
 // The translator's vertex and pixel shaders, checked by spirv-val (Vulkan
 // 1.3): every vector and scalar operation, a predicated instruction, a
 // conditional exec, an exec that ends inside a condition, each vertex
-// format, 1D, 2D and 3D texture fetches with a LOD bias, the color and depth
-// exports and a kill. And what version 1 refuses is refused: loops, calls,
-// jumps, memexport, cube fetches.
+// format, 1D, 2D, 3D-or-stacked and cube texture fetches with a LOD bias,
+// offsets, unnormalized coordinates, the LOD or gradients from registers and
+// the stacked layers' filters, the color and depth exports and a kill. And
+// what is refused is refused: getWeights, memexport, the wrong stage.
 
 #include "check.h"
 #include "shader_builders.h"
@@ -119,6 +120,37 @@ void fetches() {
     }
     translates(make_shader(ShaderType::Pixel, {make_exec(textures, true)}), "tfetch_ps");
     translates(make_shader(ShaderType::Vertex, {make_exec(textures, true)}), "tfetch_vs");
+
+    // offsets, unnormalized coordinates, the LOD and gradients from
+    // registers, a 1D fetch of two coordinates, and the stacked layers'
+    // filters: the instruction's linear, the fetch constant's, and the two
+    // differing (chosen by the layer's gradient)
+    std::vector<Slot> variants;
+    uint32_t variant = 0;
+    for (auto dimension :
+         {FetchOpDimension::D1, FetchOpDimension::D2, FetchOpDimension::D3OrStacked, FetchOpDimension::Cube})
+        for (uint32_t v = 0; v < 4; v++, variant++) {
+            TextureFetchInstruction t;
+            t.opcode_name = "tfetch";
+            t.dimension = dimension;
+            t.result = dst(StorageTarget::Register, 7, 0xF);
+            t.operand_count = 2;
+            t.operands[0] = reg(2);
+            if (dimension == FetchOpDimension::D1) t.operands[0].component_count = v & 1 ? 2 : 1;
+            t.operands[1].source = StorageSource::TextureFetchConstant;
+            t.operands[1].index = variant % 32;
+            t.offset_x = v & 1 ? -0.5f : 1.0f, t.offset_y = 0.5f, t.offset_z = v & 2 ? 1.0f : 0.0f;
+            t.unnormalized_coordinates = v == 1 && dimension != FetchOpDimension::Cube;
+            t.use_register_lod = v == 2;
+            t.use_register_gradients = v == 3;
+            t.vol_mag_filter = v == 0   ? TextureFilter::Linear
+                               : v == 1 ? TextureFilter::Point
+                                        : TextureFilter::UseFetchConst;
+            t.vol_min_filter = v == 1 ? TextureFilter::Linear : TextureFilter::UseFetchConst;
+            variants.push_back(t);
+        }
+    translates(make_shader(ShaderType::Pixel, {make_exec(variants, true)}), "tfetch_variants_ps");
+    translates(make_shader(ShaderType::Vertex, {make_exec(variants, true)}), "tfetch_variants_vs");
 }
 
 // loops, calls and jumps go through the dispatcher

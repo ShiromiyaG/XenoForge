@@ -6,8 +6,9 @@
 // GetGuestTextureLayout), the loads' addressing, levels and byte swaps
 // (vulkan/vulkan_texture_cache.cc's LoadTextureData, shaders/texture_load.xesli
 // and texture_load_*bpb.xesli, endian.xesli), the host formats
-// (vulkan_texture_cache.cc's table) and the decompressions (texture_load_dxt3a,
-// texture_load_ctx1 and the DXT helpers of pixel_formats.xesli). BSD; see
+// (vulkan_texture_cache.cc's table), the decompressions (texture_load_dxt3a,
+// texture_load_ctx1 and the DXT helpers of pixel_formats.xesli) and the depth
+// loads (texture_load_depth_unorm, texture_load_depth_float). BSD; see
 // LICENSE-xenia.
 
 #include "xenoforge/texture.h"
@@ -24,8 +25,10 @@ namespace xf::texture {
 namespace {
 
 // Formats Xenia's Vulkan texture cache turns into others on the CPU side of
-// the load; the rest keep the guest's bits.
-enum class Convert : uint8_t { None, Dxt3aToR8, Ctx1ToRg8 };
+// the load; the rest keep the guest's bits. Depth (24_8, 24_8_FLOAT) becomes
+// 32-bit floats as texture_load_depth_unorm and texture_load_depth_float make
+// it.
+enum class Convert : uint8_t { None, Dxt3aToR8, Ctx1ToRg8, DepthUnormToFloat, DepthFloatToFloat };
 
 struct FormatEntry {
     uint8_t block_width, block_height;
@@ -58,14 +61,14 @@ constexpr FormatEntry FORMATS[64] = {
     {4, 4, 8, H::BC2},               // k_DXT2_3
     {4, 4, 8, H::BC3},               // k_DXT4_5
     {1, 1, 64, H::Unsupported},      // k_16_16_16_16_EDRAM
-    {1, 1, 32, H::R32},              // k_24_8
-    {1, 1, 32, H::R32},              // k_24_8_FLOAT
+    {1, 1, 32, H::R32F, Convert::DepthUnormToFloat}, // k_24_8
+    {1, 1, 32, H::R32F, Convert::DepthFloatToFloat}, // k_24_8_FLOAT
     {1, 1, 16, H::R16},              // k_16
     {1, 1, 32, H::RG16},             // k_16_16
     {1, 1, 64, H::RGBA16},           // k_16_16_16_16
-    {1, 1, 16, H::R16},              // k_16_EXPAND
-    {1, 1, 32, H::RG16},             // k_16_16_EXPAND
-    {1, 1, 64, H::RGBA16},           // k_16_16_16_16_EXPAND
+    {1, 1, 16, H::R16F},             // k_16_EXPAND: 16-bit floats, as Xenia reads them
+    {1, 1, 32, H::RG16F},            // k_16_16_EXPAND
+    {1, 1, 64, H::RGBA16F},          // k_16_16_16_16_EXPAND
     {1, 1, 16, H::R16F},             // k_16_FLOAT
     {1, 1, 32, H::RG16F},            // k_16_16_FLOAT
     {1, 1, 64, H::RGBA16F},          // k_16_16_16_16_FLOAT
@@ -302,6 +305,19 @@ void read_blocks(const LevelLoad &load, const GuestMemory &memory, uint32_t endi
     dst = out.data() + start;
     for (size_t i = 0; i < size_t(blocks_x) * blocks_y; i++, dst += load.bytes_per_block)
         swap_block(dst, load.bytes_per_block, endian);
+}
+
+// pixel_formats.xesli's XeFloat20e4To32: 20e4 depth (0-2) to a float
+float float20e4_to_float(uint32_t f24) {
+    f24 &= 0xFFFFFF;
+    if (!f24) return 0.0f;
+    uint32_t mantissa = f24 & 0xFFFFF, exponent = f24 >> 20;
+    if (!exponent) {
+        uint32_t lzcnt = 20 - log2_floor(mantissa);
+        exponent = 1 - lzcnt;
+        mantissa = (mantissa << lzcnt) & 0xFFFFF;
+    }
+    return std::bit_cast<float>(((exponent + 112) << 23) | (mantissa << 3));
 }
 
 // half precision to single
@@ -586,6 +602,19 @@ bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string
 
         std::vector<uint8_t> &dst = out.levels[level];
         if (f.convert == Convert::None) {
+            dst = std::move(blocks);
+            blocks = {};
+            continue;
+        }
+        if (f.convert == Convert::DepthUnormToFloat || f.convert == Convert::DepthFloatToFloat) {
+            // the depth in the high 24 bits, to a float: unorm24 as
+            // XeUNorm24To32 (exact), float24 as XeFloat20e4To32
+            for (size_t i = 0; i + 4 <= blocks.size(); i += 4) {
+                uint32_t d24 = load_le32(blocks.data() + i) >> 8;
+                float value = f.convert == Convert::DepthUnormToFloat ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f)
+                                                                      : float20e4_to_float(d24);
+                store_le32(blocks.data() + i, std::bit_cast<uint32_t>(value));
+            }
             dst = std::move(blocks);
             blocks = {};
             continue;

@@ -3,7 +3,8 @@
 // (GetHostViewportInfo, GetScissor), the register fields registers.h, the
 // clear values vulkan/vulkan_render_target_cache.cc, the vertex data a draw
 // needs vulkan/vulkan_command_processor.cc (IssueDraw's shared memory
-// requests), and the swap vulkan/vulkan_texture_cache.cc
+// requests), the point sizes its UpdateSystemConstantValues, and the swap
+// vulkan/vulkan_texture_cache.cc
 // (RequestSwapTexture); all BSD, see LICENSE-xenia. Written anew, plainly:
 // one submission per draw, waited for.
 //
@@ -51,6 +52,9 @@ using namespace xenos;
 const uint32_t RECTANGLE_LIST_GS[] = {
 #include "rectangle_list.geom.inc"
 };
+const uint32_t POINT_LIST_GS[] = {
+#include "point_list.geom.inc"
+};
 const uint32_t FULLSCREEN_VS[] = {
 #include "fullscreen.vert.inc"
 };
@@ -82,6 +86,7 @@ constexpr uint32_t PA_CL_VPORT_XSCALE = 0x210F; // then XOFFSET, YSCALE, YOFFSET
 constexpr uint32_t RB_BLENDCONTROL[4] = {0x2201, 0x2209, 0x220A, 0x220B};
 constexpr uint32_t RB_COLORCONTROL = 0x2202;
 constexpr uint32_t PA_CL_CLIP_CNTL = 0x2204, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206;
+constexpr uint32_t PA_SU_POINT_SIZE = 0x2280, PA_SU_POINT_MINMAX = 0x2281;
 constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
 constexpr uint32_t RB_COPY_CONTROL = 0x2318;
 constexpr uint32_t RB_DEPTH_CLEAR = 0x231D, RB_COLOR_CLEAR = 0x231E, RB_COLOR_CLEAR_LO = 0x231F;
@@ -159,6 +164,29 @@ float float24_to_float(uint32_t f24) {
         mantissa = (mantissa << lzcnt) & 0xFFFFF;
     }
     return as_float(((exponent + 112) << 23) | (mantissa << 3));
+}
+
+// xenos::Float32To20e4, rounded towards zero (Xenia's default)
+uint32_t float_to_float24(float f) {
+    if (!(f > 0.0f)) return 0;
+    uint32_t u = std::bit_cast<uint32_t>(f);
+    if (u >= 0x3FFFFFF8) return 0xFFFFFF;
+    if (u < 0x38800000) u = (0x800000 | (u & 0x7FFFFF)) >> std::min(113 - (u >> 23), 24u);
+    else u += 0xC8000000u;
+    return (u >> 3) & 0xFFFFFF;
+}
+
+// xenos::Float7e3To32
+float float7e3_to_float(uint32_t f10) {
+    f10 &= 0x3FF;
+    if (!f10) return 0.0f;
+    uint32_t mantissa = f10 & 0x7F, exponent = f10 >> 7;
+    if (!exponent) {
+        uint32_t lzcnt = uint32_t(std::countl_zero(mantissa)) - 24;
+        exponent = uint32_t(1 - int32_t(lzcnt));
+        mantissa = (mantissa << lzcnt) & 0x7F;
+    }
+    return as_float(((exponent + 124) << 23) | (mantissa << 16));
 }
 
 VkFormat vk_format_of(texture::HostFormat f) {
@@ -298,15 +326,17 @@ struct Texture {
     bool stale = false;                                   // the processor wrote memory under it
 };
 
+// the translated shaders' and the geometry shaders' system constants
 struct System {
     float ndc_scale[4];
     float ndc_offset[4];
-    uint32_t slots[32];
-    uint32_t flags[4];
-    float values[4];
+    uint32_t slots[32]; // image index (bits 0-13), its kind (14-15: 2D array, 3D, cube), sampler (16-31)
+    uint32_t flags[4];  // alpha test, the position's formats, gamma targets, D24FS8 depth
+    float values[4];    // alpha reference, the point diameter's bounds (PA_SU_POINT_MINMAX)
     float color_scales[4];
+    float point[4]; // the constant diameter (PA_SU_POINT_SIZE), guest pixel diameter to NDC radius
 };
-static_assert(sizeof(System) == 208);
+static_assert(sizeof(System) == 224);
 
 class Impl final : public Renderer {
 public:
@@ -470,7 +500,7 @@ private:
     VkDescriptorSetLayout set_layouts_[2] = {};
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
-    VkShaderModule rectangle_gs_ = VK_NULL_HANDLE;
+    VkShaderModule rectangle_gs_ = VK_NULL_HANDLE, point_gs_ = VK_NULL_HANDLE;
     vk::Image dummy_[3]; // 2D, 3D, cube
     VkImageView dummy_views_[3] = {};
     VkSampler dummy_sampler_ = VK_NULL_HANDLE;
@@ -508,7 +538,8 @@ Impl::~Impl() {
     for (auto &[k, t] : textures_) destroy(*t);
     for (auto &im : dummy_) d_.destroy(im);
     if (dummy_sampler_) vkDestroySampler(dev_, dummy_sampler_, nullptr);
-    if (rectangle_gs_) vkDestroyShaderModule(dev_, rectangle_gs_, nullptr);
+    for (VkShaderModule m : {rectangle_gs_, point_gs_})
+        if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (auto &[k, p] : load_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
     for (VkPipeline p : store_pipelines_)
         if (p) vkDestroyPipeline(dev_, p, nullptr);
@@ -606,6 +637,10 @@ bool Impl::init(std::string &error) {
     gs.pCode = RECTANGLE_LIST_GS;
     if (vkCreateShaderModule(dev_, &gs, nullptr, &rectangle_gs_) != VK_SUCCESS)
         return error = "could not make the rectangle list geometry shader", false;
+    gs.codeSize = sizeof(POINT_LIST_GS);
+    gs.pCode = POINT_LIST_GS;
+    if (vkCreateShaderModule(dev_, &gs, nullptr, &point_gs_) != VK_SUCCESS)
+        return error = "could not make the point list geometry shader", false;
 
     // EDRAM: the buffer, the tile mask, store (compute) and load (draw) pipelines
     edram_ = d_.create_buffer(EDRAM_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
@@ -677,9 +712,10 @@ bool Impl::init(std::string &error) {
         if (d_.stencil_export()) load_fs_[2] = module(EDRAM_LOAD_STENCIL, sizeof(EDRAM_LOAD_STENCIL));
     }
 
-    // the stand-ins for slots without a texture: 1x1 transparent black
+    // the stand-ins for slots without a texture: 1x1 transparent black (2D
+    // textures are sampled as 2D arrays)
     const VkImageType types[] = {VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_2D};
-    const VkImageViewType view_types[] = {VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_CUBE};
+    const VkImageViewType view_types[] = {VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_CUBE};
     for (int k = 0; k < 3; k++) {
         dummy_[k] = d_.create_image(types[k], VK_FORMAT_R8G8B8A8_UNORM, {1, 1, 1}, 1, k == 2 ? 6 : 1,
                                     VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -791,7 +827,10 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
                     : t->host == texture::HostFormat::RGBA16 ? VK_FORMAT_R16G16B16A16_SNORM
                                                              : vk_format_of(t->host);
         if (vk_format == VK_FORMAT_UNDEFINED) return nullptr;
-        bytes = texture::bytes_per_block(t->host) > 4 ? 8 : 4;
+        // the guest's bits per sample (xenos.h's IsColorRenderTargetFormat64bpp),
+        // not the host's: 2_10_10_10_FLOAT is 32 bits in EDRAM, kept as
+        // 16-bit floats here
+        bytes = format == 5 || format == 7 || format == 15 ? 8 : 4;
     }
     // as many rows as fit in EDRAM from the base: a tile is 80x16 samples of
     // 32 bits (40 wide at 64 bits), 2x MSAA doubles the samples down, 4x
@@ -1196,18 +1235,24 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         for (uint32_t l = 0; l < levels.size(); l++) levels[l] = texture::to_rgba8(image, l);
         approximate("a texture format sampled as 8 bits per component");
     }
-    if (info.signs[0] || info.signs[1] || info.signs[2] || info.signs[3]) approximate("signed texture components");
+    // signed components: float formats are signed either way (Xenia's signed
+    // and unsigned views of them are the same format)
+    bool float_format = format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_R16G16_SFLOAT ||
+                        format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32_SFLOAT ||
+                        format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT;
+    if (!float_format && (info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1))
+        approximate("signed texture components");
+    if (info.signs[0] == 2 || info.signs[1] == 2 || info.signs[2] == 2 || info.signs[3] == 2)
+        approximate("biased texture components");
     if (info.gamma) approximate("gamma textures read as linear");
     if (info.exp_adjust) approximate("texture exponent adjust");
 
     auto t = std::make_unique<Texture>();
     t->dimension = info.dimension;
+    // 1D, 2D and stacked as 2D arrays (stacked: a layer a slice), as Xenia
+    // binds them
     bool cube = info.dimension == 3, three = info.dimension == 2;
     uint32_t layers = three ? 1 : std::max(1u, image.depth);
-    if (info.dimension <= 1 && layers > 1) {
-        why = "stacked textures";
-        return nullptr;
-    }
     VkExtent3D extent{image.width, image.height, three ? image.depth : 1};
     uint32_t level_count = uint32_t(levels.size());
     t->image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, format, extent, level_count, layers,
@@ -1223,8 +1268,11 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
                               : host_components(image.format);
     VkComponentMapping mapping{swizzle_of(info.swizzle & 7, components), swizzle_of((info.swizzle >> 3) & 7, components),
                                swizzle_of((info.swizzle >> 6) & 7, components), swizzle_of((info.swizzle >> 9) & 7, components)};
-    t->view = make_view(t->image.image, cube ? VK_IMAGE_VIEW_TYPE_CUBE : three ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D,
-                        format, VK_IMAGE_ASPECT_COLOR_BIT, mapping, level_count, layers, false);
+    VkImageViewType view_type = cube    ? VK_IMAGE_VIEW_TYPE_CUBE
+                                : three ? VK_IMAGE_VIEW_TYPE_3D
+                                        : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+    t->view = make_view(t->image.image, view_type, format, VK_IMAGE_ASPECT_COLOR_BIT, mapping, level_count, layers,
+                        false);
     if (!t->view) {
         destroy(*t);
         why = "could not make the image's view";
@@ -1311,8 +1359,9 @@ struct Viewport {
 };
 
 // draw_util.cc's GetHostViewportInfo, at resolution scale 1, for Vulkan
-// (origin at the top left, reverse Z allowed)
-Viewport host_viewport(const uint32_t *regs, float max_x, float max_y, bool pixel_writes_depth) {
+// (origin at the top left, reverse Z allowed, float24 depth halved);
+// depth_float24: a D24FS8 target with the depth test on
+Viewport host_viewport(const uint32_t *regs, float max_x, float max_y, bool pixel_writes_depth, bool depth_float24) {
     Viewport v;
     uint32_t clip = regs[r::PA_CL_CLIP_CNTL], vte = regs[r::PA_CL_VTE_CNTL], mode = regs[r::PA_SU_SC_MODE_CNTL];
     uint32_t vtx = regs[r::PA_SU_VTX_CNTL];
@@ -1373,6 +1422,11 @@ Viewport host_viewport(const uint32_t *regs, float max_x, float max_y, bool pixe
             z_max = std::clamp(host_offset_z + host_scale_z, 0.0f, 1.0f);
         }
     }
+    if (depth_float24) {
+        // D24FS8's 0-2 kept as 0-1 (Xenia's full_float24_in_0_to_1)
+        z_min *= 0.5f;
+        z_max *= 0.5f;
+    }
     v.viewport = {xy_offset[0], xy_offset[1], xy_extent[0], xy_extent[1], z_min, z_max};
     return v;
 }
@@ -1408,9 +1462,29 @@ void Impl::draw(const gpu::Draw &d) {
     uint32_t primitive = d.primitive, count = d.count;
     bool index32 = d.index32;
     if (count == 0) return;
-    bool rectangles = primitive == 8;
+    bool color = EdramMode(mode) == EdramMode::ColorDepth;
+    {
+        // A draw that can write nothing (no color channel enabled, depth and
+        // stencil off, no memory export) leaves EDRAM and memory as they
+        // were, and the occlusion queries' counts are the processor's fake
+        // ones (EVENT_WRITE_ZPD, as Xenia's): nothing to draw, whatever its
+        // primitive. El Chavo Kart issues hundreds of such point lists a
+        // frame.
+        const Shader *v = have_vertex_ ? shader(vertex_hash_) : nullptr;
+        const Shader *p = have_pixel_ ? shader(pixel_hash_) : nullptr;
+        bool colors = color && (regs_[reg::RB_COLOR_MASK] & 0xFFFF) != 0;
+        bool depth_stencil = (regs_[reg::RB_DEPTHCONTROL] & 3) != 0;
+        bool exports = (v && v->summary.memexport) || (color && p && p->summary.memexport);
+        if (!colors && !depth_stencil && !exports) {
+            if (options_.verbose)
+                std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
+            return;
+        }
+    }
+    bool rectangles = primitive == 8, points = primitive == 1;
     VkPrimitiveTopology topology;
     switch (primitive) {
+    case 1: topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break; // sprites made by point_list.geom
     case 2: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
     case 3: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
     case 4: case 8: case 13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
@@ -1423,7 +1497,6 @@ void Impl::draw(const gpu::Draw &d) {
     // shaders
     Shader *vs = have_vertex_ ? shader(vertex_hash_) : nullptr;
     if (!vs) return skip("no vertex shader");
-    bool color = EdramMode(mode) == EdramMode::ColorDepth;
     Shader *ps = color && have_pixel_ ? shader(pixel_hash_) : nullptr;
     std::string why;
     if (!translate(*vs, why)) return skip("vertex shader: " + why);
@@ -1468,10 +1541,17 @@ void Impl::draw(const gpu::Draw &d) {
     for (RenderTarget *t : colors)
         if (t) width = std::min(width, t->width), height = std::min(height, t->height);
     if (depth) width = std::min(width, depth->width), height = std::min(height, depth->height);
-    if (width == 8192 && height == 8192) return skip("nothing to draw to");
+    if (width == 8192 && height == 8192) {
+        // no target the pixel shader writes and no depth: nothing it could change
+        if (options_.verbose)
+            std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
+        return;
+    }
 
     // viewport and scissor
-    Viewport viewport = host_viewport(regs_, max_viewport_[0], max_viewport_[1], ps && ps->writes_depth);
+    bool depth_float24 = depth && depth->format == 1;
+    Viewport viewport = host_viewport(regs_, max_viewport_[0], max_viewport_[1], ps && ps->writes_depth,
+                                      depth_float24 && (depth_control & 2));
     if (viewport.empty) return;
     VkRect2D scissor = host_scissor(regs_, pitch);
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
@@ -1542,7 +1622,20 @@ void Impl::draw(const gpu::Draw &d) {
     sys.flags[1] = ((vte >> 10) & 1) | ((vte >> 8) & 1) << 1 | ((vte >> 9) & 1) << 2;
     if (color_control & 16) approximate("alpha to coverage");
     sys.flags[2] = gamma_targets;
+    sys.flags[3] = depth_float24 ? 1u : 0u; // oDepth halved, as the target keeps D24FS8's 0-2
     std::copy(color_scales, color_scales + 4, sys.color_scales);
+    if (points) {
+        // as Xenia's UpdateSystemConstantValues: the registers' 12.4 radii
+        // as diameters, and the viewport's pixels to NDC (2 / extent, halved
+        // for the radius)
+        uint32_t minmax = regs_[r::PA_SU_POINT_MINMAX], point_size = regs_[r::PA_SU_POINT_SIZE];
+        sys.values[1] = float(minmax & 0xFFFF) * (2.0f / 16.0f);
+        sys.values[2] = float(minmax >> 16) * (2.0f / 16.0f);
+        sys.point[0] = float(point_size >> 16) * (2.0f / 16.0f);
+        sys.point[1] = float(point_size & 0xFFFF) * (2.0f / 16.0f);
+        sys.point[2] = 1.0f / float(std::max(uint32_t(viewport.viewport.width), 1u));
+        sys.point[3] = 1.0f / float(std::max(uint32_t(viewport.viewport.height), 1u));
+    }
 
     // textures: per slot the shaders read, an image in the array of its
     // dimension and a sampler
@@ -1576,7 +1669,7 @@ void Impl::draw(const gpu::Draw &d) {
         uint32_t image_index = uint32_t(images[kind].size()), sampler_index = uint32_t(samplers.size());
         images[kind].push_back({VK_NULL_HANDLE, t->view, VK_IMAGE_LAYOUT_GENERAL});
         samplers.push_back({sampler(fetch, overrides), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
-        sys.slots[slot] = image_index | sampler_index << 16;
+        sys.slots[slot] = image_index | kind << 14 | sampler_index << 16;
     }
     std::memcpy(system_.mapped, &sys, sizeof(sys));
 
@@ -1606,9 +1699,9 @@ void Impl::draw(const gpu::Draw &d) {
     uint32_t stage_count = 0;
     stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
                              vs->module, "main", nullptr};
-    if (rectangles)
+    if (rectangles || points)
         stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-                                 VK_SHADER_STAGE_GEOMETRY_BIT, rectangle_gs_, "main", nullptr};
+                                 VK_SHADER_STAGE_GEOMETRY_BIT, points ? point_gs_ : rectangle_gs_, "main", nullptr};
     if (ps)
         stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
                                  VK_SHADER_STAGE_FRAGMENT_BIT, ps->module, "main", nullptr};
@@ -1855,13 +1948,18 @@ void Impl::resolve() {
                 const uint8_t *data = static_cast<const uint8_t *>(readback.mapped);
                 std::vector<uint8_t> pixels(data, data + bytes);
                 if (info.depth) {
-                    // as D24S8 words: depth in the high 24 bits
+                    // as the guest's words: depth in the high 24 bits, D24S8's
+                    // unorm or D24FS8's 20e4 (kept halved), as the EDRAM
+                    // store writes them
                     bool float_depth = source->image.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
                     for (uint32_t i = 0; i < w * h; i++) {
                         uint32_t d;
                         std::memcpy(&d, data + 4 * i, 4);
-                        uint32_t d24 = float_depth ? uint32_t(std::lround(std::clamp(as_float(d), 0.0f, 1.0f) * 16777215.0))
-                                                   : d & 0xFFFFFF;
+                        float depth = as_float(d);
+                        uint32_t d24 = !float_depth          ? d & 0xFFFFFF
+                                       : source->format == 1 ? float_to_float24(depth * 2.0f)
+                                                             : uint32_t(std::nearbyint(std::clamp(depth, 0.0f, 1.0f) *
+                                                                                       16777215.0f));
                         uint32_t word = d24 << 8 | data[bytes + i];
                         std::memcpy(&pixels[4 * i], &word, 4);
                     }
@@ -1895,16 +1993,22 @@ void Impl::resolve() {
             if (t->depth) {
                 uint32_t value = regs_[r::RB_DEPTH_CLEAR];
                 clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-                clear.clearValue.depthStencil.depth =
-                    t->format == 0 ? float(value >> 8) / 16777215.0f : std::min(1.0f, float24_to_float(value >> 8));
+                // xenos::UNorm24To32, or D24FS8 halved (as the target keeps it)
+                uint32_t d24 = value >> 8;
+                clear.clearValue.depthStencil.depth = t->format == 0 ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f)
+                                                                     : float24_to_float(d24) * 0.5f;
                 clear.clearValue.depthStencil.stencil = value & 0xFF;
             } else {
                 clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 uint64_t value = regs_[r::RB_COLOR_CLEAR];
-                if (texture::bytes_per_block(t->host) == 8) value = value << 32 | regs_[r::RB_COLOR_CLEAR_LO];
+                if (t->wide) value = value << 32 | regs_[r::RB_COLOR_CLEAR_LO];
                 auto &c = clear.clearValue.color;
                 using H = texture::HostFormat;
-                switch (t->host) {
+                if (t->format == 3 || t->format == 12) {
+                    // 2_10_10_10_FLOAT: 7e3 floats kept as 16-bit floats
+                    for (int j = 0; j < 3; j++) c.float32[j] = float7e3_to_float(uint32_t(value >> (10 * j)));
+                    c.float32[3] = float((value >> 30) & 3) / 3.0f;
+                } else switch (t->host) {
                 case H::RGBA8:
                     for (int j = 0; j < 4; j++) c.float32[j] = float((value >> (8 * j)) & 0xFF) / 255.0f;
                     break;

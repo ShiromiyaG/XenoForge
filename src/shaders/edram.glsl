@@ -68,12 +68,12 @@ uint float32_to_7e3(float f) {
     return ((biased + 0x7FFFu + ((biased >> 16u) & 1u)) >> 16u) & 0x3FFu;
 }
 
+// rounded towards zero, as Xenia does by default (its depth_float24_round off)
 uint float32_to_20e4(float f) {
     uint u = floatBitsToUint(f);
     u = min(u <= 0x7FFFFFFFu ? u : 0u, 0x3FFFFFF8u);
     uint denormalized = ((u & 0x7FFFFFu) | 0x800000u) >> min(113u - (u >> 23u), 24u);
     uint f24 = u < 0x38800000u ? denormalized : u + 0xC8000000u;
-    f24 += 3u + ((f24 >> 3u) & 1u); // to the nearest even
     return (f24 >> 3u) & 0xFFFFFFu;
 }
 
@@ -90,15 +90,19 @@ float float20e4_to_32(uint f24) {
     return uintBitsToFloat((uint(exponent + 112) << 23u) | (mantissa << 3u));
 }
 
-// depth (0-1 as the host keeps it) and stencil to the guest's D24S8 or D24FS8 word
+// Depth as the host keeps it and stencil to the guest's D24S8 or D24FS8 word.
+// D24FS8's 0-2 is kept as 0-1 (halved, as Xenia's host render targets keep
+// it), so all of it survives the host's 0-1 depth: color bits moved through
+// a depth target come back whole.
 uint pack_depth(float depth, uint stencil) {
-    uint d24 = target.format == 0u ? uint(round(clamp(depth, 0.0, 1.0) * 16777215.0)) : float32_to_20e4(depth);
+    uint d24 = target.format == 0u ? uint(roundEven(clamp(depth, 0.0, 1.0) * 16777215.0))
+                                   : float32_to_20e4(depth * 2.0);
     return (d24 << 8u) | (stencil & 0xFFu);
 }
 float unpack_depth(uint word) {
     uint d24 = word >> 8u;
     // xenos::UNorm24To32: exact, 0xFFFFFF to 1
-    return target.format == 0u ? float(d24 + (d24 >> 23u)) * (1.0 / 16777216.0) : float20e4_to_32(d24);
+    return target.format == 0u ? float(d24 + (d24 >> 23u)) * (1.0 / 16777216.0) : float20e4_to_32(d24) * 0.5;
 }
 
 uint pack_snorm16(float v) { return uint(int(round(clamp(v, -1.0, 1.0) * 32767.0))) & 0xFFFFu; }

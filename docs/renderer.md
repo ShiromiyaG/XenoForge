@@ -164,10 +164,14 @@ submission, waited for: plain, not fast.
   -32..32, gamma targets written through the piecewise linear curve); guest memory a 512 MB
   storage buffer the vertex fetches read, what changed copied over before
   each draw; indices swapped and offset on the CPU (quad lists split,
-  strips restarted at the reset index); rectangle lists through a geometry
-  shader; viewport, scissor and the position's formats as Xenia's
-  `GetHostViewportInfo` and `GetScissor`; blend, depth, stencil, culling
-  and the alpha test from the registers.
+  strips restarted at the reset index); rectangle lists and point lists
+  through geometry shaders (points as sprites of the vertex shader's
+  clamped oPts.x or PA_SU_POINT_SIZE, as Xenia's); viewport, scissor and
+  the position's formats as Xenia's `GetHostViewportInfo` and
+  `GetScissor`; blend, depth, stencil, culling and the alpha test from the
+  registers. A draw that can write nothing (no color channel enabled,
+  depth and stencil off, no memexport) is dropped: occlusion queries are
+  the processor's fake counts, so nothing could see it.
 - **Render targets** stand for EDRAM as host images, one per base, pitch,
   MSAA and format, as many rows as EDRAM holds from the base. EDRAM itself
   is a 10 MB buffer in Xenia's layout (`edram.glsl`, from `edram.xesli`):
@@ -176,13 +180,26 @@ submission, waited for: plain, not fast.
   loads them, in any format and MSAA, as Xenia's ownership transfers do;
   depth tiles have their halves swapped; the stencil is exported, or
   written a bit per pass where the device cannot export it (NVIDIA). The
-  trace's EDRAM snapshot is where EDRAM starts (zeros, live).
+  bits per sample are the guest format's (2_10_10_10_FLOAT is 32 in EDRAM
+  though kept as 16-bit floats). D24FS8's range, 0 to 2, is kept halved
+  (viewport depth range, oDepth, clears, loads and stores), as Xenia's
+  host render targets keep it: whatever moves through a depth target
+  (color bits too) survives the host's 0-1 depth whole. The trace's EDRAM
+  snapshot is where EDRAM starts (zeros, live).
 - **Textures** decoded from guest memory (`texture.h`: 1D, 2D, stacked, 3D,
-  cube, tiled or linear, packed mips, the block formats kept compressed),
-  with the fetch constant's swizzle and sampler; each is kept with a hash
-  of the memory it was decoded from (the spans the decoder read) and
-  decoded again when that memory differs at a use, or at once when the
-  processor writes over it (`memory_written`).
+  cube, tiled or linear, packed mips, the block formats kept compressed;
+  depth formats as 32-bit floats, the EXPAND formats as 16-bit floats, as
+  Xenia's texture cache loads them), with the fetch constant's swizzle and
+  sampler; each is kept with a hash of the memory it was decoded from (the
+  spans the decoder read) and decoded again when that memory differs at a
+  use, or at once when the processor writes over it (`memory_written`).
+  1D, 2D and stacked textures are 2D arrays, as Xenia binds them; a
+  3D-or-stacked fetch chooses at run time by the fetch constant's
+  dimension, a stacked one its layer (two blended when the volume filter
+  is linear). Every fetch's coordinates carry its offsets plus Xenia's
+  rounding epsilon (1.5/1024 of a texel), and unnormalized coordinates are
+  divided by the size from the fetch constant, as Xenia's
+  `ProcessTextureFetchInstruction` does.
 - **Vertex data**: before each draw, the ranges of the vertex fetch
   constants the shaders use (address and size, as Xenia's IssueDraw
   requests them) are copied from guest memory to the GPU's copy of it.
@@ -198,17 +215,19 @@ again at each use: textures by their hash, vertex data and indices copied
 at each draw.
 
 Against Xenia's trace dumps (`replay_test` with `XF_TRACES` and
-`XF_DUMPS`): all ten frames of the two games within 0.013 of 255 on
-average, no pixel off by more than 16: El Chavo Kart's video (three planes),
+`XF_DUMPS`): all eleven frames of the two games within 0.005 of 255 on
+average (Ben 10's within 0.001 since the rounding epsilon), no pixel off by
+more than 16: El Chavo Kart's video (three planes) and its title screen,
 Ben 10's intro, and Ben 10's title, drawn in two predicated tiles of a 2x
 MSAA target that the game clears by drawing into the same samples seen as a
 640 4x target.
 
 Not done yet, counted where it shows: MSAA resolves of one sample; depth
 resolves of MSAA targets; the display's piecewise linear gamma; signed,
-gamma and exponent-adjusted textures; memexport; point lists; float16 and
-float32 targets moved through EDRAM by value rather than by bits (NaN
-payloads).
+biased, gamma and exponent-adjusted textures; memexport; unnormalized cube
+map coordinates; point sprite coordinates (pixel parameter generation);
+float16 and float32 targets moved through EDRAM by value rather than by
+bits (NaN payloads).
 
 ## Driven live (2026-11-05)
 
@@ -243,13 +262,38 @@ no input):
   kernel yet (sound, most likely). Ben 10's six traces replay through the
   same Sink and match.
 
-What the live runs ask for and the renderer does not do yet, counted:
-point lists (168,840 of El Chavo Kart's 202,089 draws in its first 1,887
-swaps, past the movie), texture fetch offsets in pixel shaders and stacked
-(array) textures (about one each a frame on its title screen, which comes
-out in red alone, its green and blue lost: no trace of that screen yet to
-tell which gap it is), D24FS8 depth kept as 32-bit float, Ben 10's texture
-slots without a texture constant.
+El Chavo Kart's title screen ("Press START" over clouds, from about swap
+1800 live, Xenia's frame 2400 and later) came out in red alone. Its trace
+(`475807D7_2400`, in the regression) showed why: the menu's frame moves
+its 8_8_8_8 target's tiles through a D24FS8 depth target and back (its
+depth-only draws take EDRAM whole), and the depth, kept as 0-2 in the
+host's 0-1 depth, was clamped to 1: the 24 bits above the stencil byte
+(green, blue, alpha, an opaque alpha making them 1 or more) came back as
+1.0's 0xF00000, green and blue zero; red, the stencil byte, survived.
+Kept halved,
+as Xenia's host render targets keep it (`full_float24_in_0_to_1`), the
+title matches Xenia's trace dump with a mean difference of 0.000 and live
+is identical to it but for the pulsing "Press START" (whose phase differs;
+0.852 over the whole picture, 0 elsewhere). Not the mechanism of
+rexglue's Vulkan red tint on the character select (a stencil of 255 in
+the red byte), though the same family: color moved through depth.
+
+The title's frame also issues 240 point lists that write nothing (color
+mask 0, depth and stencil off), now dropped; its UE3 post-process reads a
+16x16x16 color grading table as a stacked texture, a depth texture
+(24_8_FLOAT), EXPAND textures and a 2_10_10_10_FLOAT target, all now as
+Xenia does them, though the menu covers what they draw (the table, shown
+in place of the front buffer in a probe of the trace, matches Xenia's
+exactly). A 600 s live run (6,398 swaps, the title from swap 2100 on)
+issued 1,258,016 draws, 198,176 of them drawn and the rest writing
+nothing, and skipped none. What the live runs still ask for and the
+renderer does not do: D24FS8 depth kept as 32-bit float (Xenia's default
+too), Ben 10's texture slots without a texture constant. On the title the
+renderer is the bottleneck: 590 s of the 600 busy, 442 s of them in its
+fifteen resolves a frame, read back and tiled by the CPU (B4). Its "Press
+START" pulse shows one phase at every hundredth swap from 2100 to 6300,
+not the phase of Xenia's frame 2400 nor that of its 3000 and 3600: the
+pulse is the game's (its clock or its frame count), not the renderer's.
 
 The cost (runs of the same length back to back, other work sharing the
 machine): El Chavo Kart is bound by the interpreter, and rendering on the

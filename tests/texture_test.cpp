@@ -477,7 +477,8 @@ void test_resolve_round_trips() {
         for (size_t i = 0; i < rgba.size() && close; i++) close &= std::abs(int(rgba[i]) - int(pixels[i])) <= 1;
         CHECK(close);
     }
-    // depth: the D24S8 words as they are
+    // depth: the D24S8 words as they are, read as a 24_8 texture's floats
+    // (XeUNorm24To32 of the high 24 bits)
     {
         ResolveSetup s(0, 0, 32, 8, 0, 6, 0x2500000, 32, 2);
         s.regs[xenos::reg::RB_COPY_CONTROL] = 4;
@@ -489,7 +490,15 @@ void test_resolve_round_trips() {
         std::vector<uint8_t> words = random_bytes(32 * 8 * 4, 7);
         Fetch f;
         f.format = 22, f.width = 32, f.height = 8, f.pitch = 32, f.endian = 2, f.base = 0x2500000;
-        CHECK(resolve_and_read(s, words, f, img) && img.format == HostFormat::R32 && img.levels[0] == words);
+        std::vector<uint8_t> floats(words.size());
+        for (size_t i = 0; i < words.size(); i += 4) {
+            uint32_t w, d24;
+            std::memcpy(&w, &words[i], 4);
+            d24 = w >> 8;
+            float v = float(d24 + (d24 >> 23)) / 16777216.0f;
+            std::memcpy(&floats[i], &v, 4);
+        }
+        CHECK(resolve_and_read(s, words, f, img) && img.format == HostFormat::R32F && img.levels[0] == floats);
     }
     // 8_8_8_8_GAMMA: decoded to linear by the piecewise curve, in 8 bits
     {

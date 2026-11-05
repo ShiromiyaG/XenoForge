@@ -15,8 +15,8 @@
 // constant, on the predicate), allocs and nops; with loops, calls or jumps,
 // as a loop over a switch on the next control flow instruction, with the
 // interpreter's stacks (four loops deep, four calls deep) and step limit.
-// Memexport, fetch offsets, unnormalized coordinates and the texture
-// queries other than getGradients are reported as unsupported.
+// Memexport, unnormalized cube map coordinates and the texture queries
+// other than getGradients are reported as unsupported.
 
 #include "xenoforge/shader_translator.h"
 
@@ -53,6 +53,7 @@ private:
     Id u(uint32_t v) { return m_.const_uint(v); }
     Id vec4_of(Id x, Id y, Id z, Id w) { return m_.op(Op::OpCompositeConstruct, vec4_, {x, y, z, w}); }
     Id splat(Id x) { return vec4_of(x, x, x, x); }
+    Id splat_bool(Id b) { return m_.op(Op::OpCompositeConstruct, bvec4_, {b, b, b, b}); }
     Id vec4_const(float x, float y, float z, float w) {
         const Id parts[] = {f(x), f(y), f(z), f(w)};
         return m_.const_composite(vec4_, parts);
@@ -206,6 +207,7 @@ private:
     }
     void vertex_fetch(const VertexFetchInstruction &v);
     void texture_fetch(const TextureFetchInstruction &t);
+    Id sample_texture(const TextureFetchInstruction &t, Id coordinates);
     Id swap_endian(Id word, Id endian);
 
     void unsupported(std::string what) {
@@ -289,8 +291,11 @@ void Translator::declare() {
     if (stage_ != Stage::Harness) {
         // ndc_scale, ndc_offset, the image and sampler index of each fetch
         // slot, then flags (x: the alpha test, bit 3 on, bits 0-2 its
-        // function) and values (x: the alpha test's reference)
-        const Id system_members[] = {vec4_, vec4_, m_.type_array(uvec4_, 8, 16), uvec4_, vec4_, vec4_};
+        // function; y: the position's formats; z: gamma targets; w: D24FS8
+        // depth), values (x: the alpha test's reference, y and z: the point
+        // diameter's bounds), the color targets' scales and the point
+        // constants (renderer.cpp's System, point_list.geom)
+        const Id system_members[] = {vec4_, vec4_, m_.type_array(uvec4_, 8, 16), uvec4_, vec4_, vec4_, vec4_};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
@@ -299,6 +304,7 @@ void Translator::declare() {
         m_.member_decorate(system_block, 3, spv::Decoration::Offset, {160});
         m_.member_decorate(system_block, 4, spv::Decoration::Offset, {176});
         m_.member_decorate(system_block, 5, spv::Decoration::Offset, {192});
+        m_.member_decorate(system_block, 6, spv::Decoration::Offset, {208});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -785,10 +791,8 @@ void Translator::texture_fetch(const TextureFetchInstruction &t) {
     }
     if (!t.has_result()) return;
     bool gradients = t.opcode == FetchOpcode::GetTextureGradients;
-    if (stage_ != Stage::Harness && !gradients) {
-        if (t.unnormalized_coordinates) unsupported("unnormalized texture coordinates");
-        if (t.offset_x != 0 || t.offset_y != 0 || t.offset_z != 0) unsupported("texture fetch offsets");
-    }
+    if (stage_ != Stage::Harness && !gradients && t.unnormalized_coordinates && t.dimension == FetchOpDimension::Cube)
+        unsupported("unnormalized cube map coordinates");
     auto body = [&] {
         Id coordinates = operand(t.operands[0]);
         uint32_t dims = dimension_component_count(t.dimension);
@@ -818,75 +822,218 @@ void Translator::texture_fetch(const TextureFetchInstruction &t) {
             if (t.use_register_lod) w = exact(Op::OpFAdd, float_, {s, load(float_, tfetch_lod_)});
             result = vec4_of(exact(Op::OpFAdd, float_, {cx, s}), exact(Op::OpFSub, float_, {cy, s}), z, w);
         } else {
-            // the image and sampler of this slot, from the system constants
-            Id entry = m_.op(Op::OpCompositeExtract, uint_,
-                             {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
-                                                 {system_, u(2), u(slot >> 2)})),
-                              slot & 3});
-            Id image_index = m_.op(Op::OpBitwiseAnd, uint_, {entry, u(0xFFFF)});
-            Id sampler_index = m_.op(Op::OpShiftRightLogical, uint_, {entry, u(16)});
-            bool cube = t.dimension == FetchOpDimension::Cube;
-            bool three = t.dimension == FetchOpDimension::D3OrStacked || cube; // three coordinates
-            Id image_type = cube ? imagecube_type_ : t.dimension == FetchOpDimension::D3OrStacked ? image3d_type_ : image2d_type_;
-            Id images = cube ? imagescube_ : t.dimension == FetchOpDimension::D3OrStacked ? images3d_ : images2d_;
-            Id image = load(image_type, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::UniformConstant, image_type),
-                                              {images, image_index}));
-            Id sampler = load(sampler_type_, m_.op(Op::OpAccessChain,
-                                                   m_.type_pointer(spv::StorageClass::UniformConstant, sampler_type_),
-                                                   {samplers_, sampler_index}));
-            Id sampled = m_.op(Op::OpSampledImage, m_.type_sampled_image(image_type), {image, sampler});
-            Id coord_type = three ? m_.type_vector(float_, 3) : vec2_;
-            Id coords;
-            if (cube) {
-                // the cube instruction's face coordinates (sc and tc in 1-2,
-                // the face 0-5) back to a direction, as Xenia does
-                Id sc = exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {comp(coordinates, 0), f(2)}), f(-3)});
-                Id tc = exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {comp(coordinates, 1), f(2)}), f(-3)});
-                Id face_value = comp(coordinates, 2);
-                if (t.offset_z != 0) face_value = exact(Op::OpFAdd, float_, {face_value, f(t.offset_z)});
-                Id face = m_.op(Op::OpConvertFToU, uint_, {glsl(GLSLstd450NClamp, float_, {face_value, f(0), f(5)})});
-                Id axis = m_.op(Op::OpShiftRightLogical, uint_, {face, u(1)});
-                Id negative = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {face, u(1)}), u(0)});
-                Id sign = select(float_, negative, f(-1), f(1));
-                Id nsc = m_.op(Op::OpFNegate, float_, {sc}), ntc = m_.op(Op::OpFNegate, float_, {tc});
-                Id on_x = m_.op(Op::OpCompositeConstruct, coord_type, {sign, ntc, select(float_, negative, sc, nsc)});
-                Id on_y = m_.op(Op::OpCompositeConstruct, coord_type, {sc, sign, select(float_, negative, ntc, tc)});
-                Id on_z = m_.op(Op::OpCompositeConstruct, coord_type, {select(float_, negative, nsc, sc), ntc, sign});
-                coords = select(coord_type, m_.op(Op::OpIEqual, bool_, {axis, u(0)}), on_x,
-                                select(coord_type, m_.op(Op::OpIEqual, bool_, {axis, u(1)}), on_y, on_z));
-            } else if (three) {
-                coords = m_.op(Op::OpVectorShuffle, coord_type, {coordinates, coordinates, 0, 1, 2});
-            } else {
-                // a 1D texture is a row of a 2D one
-                Id cy = dims >= 2 ? comp(coordinates, 1) : f(0.5f);
-                coords = m_.op(Op::OpCompositeConstruct, vec2_, {comp(coordinates, 0), cy});
-            }
-            auto narrow = [&](Id v) {
-                return three ? m_.op(Op::OpVectorShuffle, coord_type, {v, v, 0, 1, 2})
-                             : m_.op(Op::OpVectorShuffle, coord_type, {v, v, 0, 1});
-            };
-            // Xenia: the computed LOD in pixel shaders, or with gradients from registers
-            bool computed = t.use_computed_lod && (stage_ == Stage::Pixel || t.use_register_gradients);
-            if (t.use_register_gradients) {
-                result = m_.op(Op::OpImageSampleExplicitLod, vec4_,
-                               {sampled, coords, uint32_t(spv::ImageOperandsMask::Grad), narrow(load(vec4_, gradient_h_)),
-                                narrow(load(vec4_, gradient_v_))});
-            } else if (t.use_register_lod || !computed) {
-                Id lod = f(t.lod_bias);
-                if (t.use_register_lod) lod = exact(Op::OpFAdd, float_, {load(float_, tfetch_lod_), lod});
-                result = m_.op(Op::OpImageSampleExplicitLod, vec4_, {sampled, coords, uint32_t(spv::ImageOperandsMask::Lod), lod});
-            } else if (t.lod_bias != 0) {
-                result = m_.op(Op::OpImageSampleImplicitLod, vec4_,
-                               {sampled, coords, uint32_t(spv::ImageOperandsMask::Bias), f(t.lod_bias)});
-            } else {
-                result = m_.op(Op::OpImageSampleImplicitLod, vec4_, {sampled, coords});
-            }
+            result = sample_texture(t, coordinates);
         }
         store_result(t.result, result);
         return false;
     };
     if (t.is_predicated) when(predicate_is(t.predicate_condition), body);
     else body();
+}
+
+// A texture fetch on the host's images, as Xenia's
+// ProcessTextureFetchInstruction (spirv_shader_translator_fetch.cc) makes
+// it: the sizes from the fetch constant; the coordinates offset by the
+// instruction's offsets plus Xenia's rounding epsilon (kTextureCoordEpsilon,
+// 1.5/1024 of a texel), normalized when they are not; 1D and 2D textures
+// sampled as 2D arrays at layer 0; a 3D-or-stacked fetch choosing at run
+// time by the fetch constant's dimension between the 3D image and the
+// layers of a stacked one (two of them blended when the volume filter is
+// linear); cube maps from the face coordinates.
+Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates) {
+    const uint32_t slot = t.operands[1].index;
+    const float epsilon = 1.5f / 1024.0f;
+    const Id vec3 = m_.type_vector(float_, 3);
+    auto add = [&](Id a, Id b) { return exact(Op::OpFAdd, float_, {a, b}); };
+    auto mul = [&](Id a, Id b) { return exact(Op::OpFMul, float_, {a, b}); };
+    auto div = [&](Id a, Id b) { return exact(Op::OpFDiv, float_, {a, b}); };
+
+    // the slot's image (bits 0-13), the kind of image it is (bits 14-15: a
+    // 2D array, 3D, cube) and its sampler (bits 16-31), from the system
+    // constants
+    Id entry = m_.op(Op::OpCompositeExtract, uint_,
+                     {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                         {system_, u(2), u(slot >> 2)})),
+                      slot & 3});
+    Id image_index = m_.op(Op::OpBitwiseAnd, uint_, {entry, u(0x3FFF)});
+    Id kind = m_.op(Op::OpBitwiseAnd, uint_, {m_.op(Op::OpShiftRightLogical, uint_, {entry, u(14)}), u(3)});
+    Id sampler_index = m_.op(Op::OpShiftRightLogical, uint_, {entry, u(16)});
+    auto constant_pointer = [&](Id type) { return m_.type_pointer(spv::StorageClass::UniformConstant, type); };
+    Id sampler =
+        load(sampler_type_, m_.op(Op::OpAccessChain, constant_pointer(sampler_type_), {samplers_, sampler_index}));
+    // the slot's image as kind k (0 2D array, 1 3D, 2 cube); another kind's
+    // index would name the wrong image, so the stand-in (0) instead
+    auto sampled_image = [&](uint32_t k) {
+        Id type = k == 0 ? image2d_type_ : k == 1 ? image3d_type_ : imagecube_type_;
+        Id images = k == 0 ? images2d_ : k == 1 ? images3d_ : imagescube_;
+        Id index = select(uint_, m_.op(Op::OpIEqual, bool_, {kind, u(k)}), image_index, u(0));
+        Id image = load(type, m_.op(Op::OpAccessChain, constant_pointer(type), {images, index}));
+        return m_.op(Op::OpSampledImage, m_.type_sampled_image(type), {image, sampler});
+    };
+    auto bits = [&](Id word, uint32_t offset, uint32_t count) {
+        return m_.op(Op::OpBitFieldUExtract, uint_, {word, u(offset), u(count)});
+    };
+    auto signed_bits = [&](Id word, uint32_t offset, uint32_t count) {
+        return m_.op(Op::OpConvertSToF, float_,
+                     {m_.op(Op::OpBitFieldSExtract, int_, {m_.op(Op::OpBitcast, int_, {word}), u(offset), u(count)})});
+    };
+    auto size_of = [&](Id minus_one) {
+        return m_.op(Op::OpConvertUToF, float_, {m_.op(Op::OpIAdd, uint_, {minus_one, u(1)})});
+    };
+
+    const bool cube = t.dimension == FetchOpDimension::Cube, volume = t.dimension == FetchOpDimension::D3OrStacked;
+    // a 1D fetch with more than one coordinate is a 2D one (Xenia's coordinate_dimension)
+    const bool one = t.dimension == FetchOpDimension::D1 && t.operands[0].component_count <= 1;
+
+    // the size, from fetch constant word 2 by the dimension in word 5
+    Id word2 = constant_dword(3, slot * 6 + 2), word5 = constant_dword(3, slot * 6 + 5);
+    Id data_is_3d = 0;
+    Id size[3] = {};
+    if (one) {
+        size[0] = size_of(bits(word2, 0, 24));
+    } else if (volume) {
+        data_is_3d = m_.op(Op::OpIEqual, bool_, {bits(word5, 9, 2), u(2)});
+        size[0] = size_of(select(uint_, data_is_3d, bits(word2, 0, 11), bits(word2, 0, 13)));
+        size[1] = size_of(select(uint_, data_is_3d, bits(word2, 11, 11), bits(word2, 13, 13)));
+        size[2] = size_of(select(uint_, data_is_3d, bits(word2, 22, 10), bits(word2, 26, 6)));
+    } else {
+        size[0] = size_of(bits(word2, 0, 13));
+        size[1] = size_of(bits(word2, 13, 13));
+        if (t.dimension == FetchOpDimension::D1) {
+            // its texture may still be 1D: one row as wide as it is
+            Id data_is_1d = m_.op(Op::OpIEqual, bool_, {bits(word5, 9, 2), u(0)});
+            size[0] = select(float_, data_is_1d, size_of(bits(word2, 0, 24)), size[0]);
+            size[1] = select(float_, data_is_1d, f(1), size[1]);
+        }
+    }
+
+    // the coordinates, offset and normalized
+    Id c[3] = {comp(coordinates, 0), one ? f(0) : comp(coordinates, 1), cube || volume ? comp(coordinates, 2) : f(0)};
+    const float offsets[3] = {t.offset_x + epsilon, one ? 0.0f : t.offset_y + epsilon,
+                              cube ? t.offset_z : volume ? t.offset_z + epsilon : 0.0f};
+    for (uint32_t k = 0; k < (one ? 1u : 2u); k++)
+        c[k] = t.unnormalized_coordinates ? div(add(c[k], f(offsets[k])), size[k])
+                                          : add(c[k], div(f(offsets[k]), size[k]));
+    Id z_3d = 0, layer = 0; // volume: the 3D texture's z, the stacked texture's layer
+    if (volume) {
+        if (t.unnormalized_coordinates) {
+            layer = add(c[2], f(offsets[2]));
+            z_3d = div(layer, size[2]);
+        } else {
+            z_3d = add(c[2], div(f(offsets[2]), size[2]));
+            // within the layers, so an infinity or NaN picks one of them
+            layer = glsl(GLSLstd450NClamp, float_,
+                         {add(mul(c[2], size[2]), f(offsets[2])), f(0), exact(Op::OpFSub, float_, {size[2], f(1)})});
+        }
+    }
+
+    // the sample: the computed LOD in pixel shaders, or with gradients from
+    // registers (normalized if the coordinates are not); n gradient components
+    bool computed = t.use_computed_lod && (stage_ == Stage::Pixel || t.use_register_gradients);
+    auto sample = [&](Id sampled, Id coords, uint32_t n) {
+        if (t.use_register_gradients) {
+            Id gradients[2];
+            for (uint32_t g = 0; g < 2; g++) {
+                Id v = load(vec4_, g ? gradient_v_ : gradient_h_);
+                Id parts[3];
+                for (uint32_t k = 0; k < n; k++)
+                    parts[k] = t.unnormalized_coordinates && size[k] ? div(comp(v, k), size[k]) : comp(v, k);
+                gradients[g] = n == 3 ? m_.op(Op::OpCompositeConstruct, vec3, {parts[0], parts[1], parts[2]})
+                                      : m_.op(Op::OpCompositeConstruct, vec2_, {parts[0], parts[1]});
+            }
+            return m_.op(Op::OpImageSampleExplicitLod, vec4_,
+                         {sampled, coords, uint32_t(spv::ImageOperandsMask::Grad), gradients[0], gradients[1]});
+        }
+        if (t.use_register_lod || !computed) {
+            Id lod = f(t.lod_bias);
+            if (t.use_register_lod) lod = add(load(float_, tfetch_lod_), lod);
+            return m_.op(Op::OpImageSampleExplicitLod, vec4_,
+                         {sampled, coords, uint32_t(spv::ImageOperandsMask::Lod), lod});
+        }
+        if (t.lod_bias != 0)
+            return m_.op(Op::OpImageSampleImplicitLod, vec4_,
+                         {sampled, coords, uint32_t(spv::ImageOperandsMask::Bias), f(t.lod_bias)});
+        return m_.op(Op::OpImageSampleImplicitLod, vec4_, {sampled, coords});
+    };
+    auto vec3_of = [&](Id x, Id y, Id z) { return m_.op(Op::OpCompositeConstruct, vec3, {x, y, z}); };
+
+    if (cube) {
+        // the cube instruction's face coordinates (sc and tc in 1-2, the
+        // face 0-5) back to a direction, as Xenia does
+        Id sc = add(mul(c[0], f(2)), f(-3)), tc = add(mul(c[1], f(2)), f(-3));
+        Id face_value = offsets[2] != 0 ? add(c[2], f(offsets[2])) : c[2];
+        Id face = m_.op(Op::OpConvertFToU, uint_, {glsl(GLSLstd450NClamp, float_, {face_value, f(0), f(5)})});
+        Id axis = m_.op(Op::OpShiftRightLogical, uint_, {face, u(1)});
+        Id negative = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {face, u(1)}), u(0)});
+        Id sign = select(float_, negative, f(-1), f(1));
+        Id nsc = m_.op(Op::OpFNegate, float_, {sc}), ntc = m_.op(Op::OpFNegate, float_, {tc});
+        Id on_x = vec3_of(sign, ntc, select(float_, negative, sc, nsc));
+        Id on_y = vec3_of(sc, sign, select(float_, negative, ntc, tc));
+        Id on_z = vec3_of(select(float_, negative, nsc, sc), ntc, sign);
+        Id coords = select(vec3, m_.op(Op::OpIEqual, bool_, {axis, u(0)}), on_x,
+                           select(vec3, m_.op(Op::OpIEqual, bool_, {axis, u(1)}), on_y, on_z));
+        return sample(sampled_image(2), coords, 3);
+    }
+    if (!volume) return sample(sampled_image(0), vec3_of(c[0], c[1], f(0)), 2);
+
+    // 3D, or stacked; both sampled (the right one chosen after, so the
+    // implicit LOD's derivatives stay in uniform control flow)
+    Id sampled_3d = sample(sampled_image(1), vec3_of(c[0], c[1], z_3d), 3);
+    // the filter between layers: the instruction's, or the fetch
+    // constant's (word 4 bits 0 and 1, magnifying and minifying); with a
+    // computed LOD and the two differing, chosen by the layer coordinate's
+    // gradient as Xenia does
+    bool mag_constant = t.vol_mag_filter == TextureFilter::UseFetchConst;
+    bool min_constant = t.vol_min_filter == TextureFilter::UseFetchConst;
+    bool mag_linear = t.vol_mag_filter == TextureFilter::Linear, min_linear = t.vol_min_filter == TextureFilter::Linear;
+    Id word4 = constant_dword(3, slot * 6 + 4);
+    auto word4_bit = [&](uint32_t bit) {
+        return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {word4, u(1u << bit)}), u(0)});
+    };
+    Id linear = 0; // chosen at run time
+    if (computed && (mag_constant || min_constant || mag_linear != min_linear)) {
+        Id lod = mul(signed_bits(word4, 12, 10), f(1.0f / 32.0f));
+        if (t.use_register_lod) lod = add(load(float_, tfetch_lod_), lod);
+        if (t.lod_bias != 0) lod = add(lod, f(t.lod_bias));
+        Id scale_h = glsl(GLSLstd450Exp2, float_, {add(lod, signed_bits(word4, 22, 5))});
+        Id scale_v = glsl(GLSLstd450Exp2, float_, {add(lod, signed_bits(word4, 27, 5))});
+        Id gradient_h, gradient_v;
+        if (t.use_register_gradients) {
+            gradient_h = comp(load(vec4_, gradient_h_), 2), gradient_v = comp(load(vec4_, gradient_v_), 2);
+            if (t.unnormalized_coordinates) {
+                gradient_h = div(gradient_h, size[2]);
+                gradient_v = div(gradient_v, size[2]);
+            }
+        } else {
+            m_.capability(spv::Capability::DerivativeControl);
+            gradient_h = m_.op(Op::OpDPdxCoarse, float_, {layer});
+            gradient_v = m_.op(Op::OpDPdyCoarse, float_, {layer});
+        }
+        Id layer_gradient = glsl(GLSLstd450NMax, float_, {mul(gradient_h, scale_h), mul(gradient_v, scale_v)});
+        if (!t.unnormalized_coordinates) layer_gradient = mul(layer_gradient, size[2]);
+        // NaN: magnifying
+        Id minifying = m_.op(Op::OpFOrdLessThan, bool_, {layer_gradient, f(1)});
+        Id mag = mag_constant ? word4_bit(0) : m_.const_bool(mag_linear);
+        Id min = min_constant ? word4_bit(1) : m_.const_bool(min_linear);
+        linear = select(bool_, minifying, min, mag);
+    } else if (mag_constant) {
+        linear = word4_bit(0);
+    }
+    bool always_linear = !linear && mag_linear;
+    // linear: the first layer's middle at 0.5; the layer floored, as the
+    // hardware addresses layers like a 3D texture's slices
+    Id half_back = exact(Op::OpFSub, float_, {layer, f(0.5f)});
+    Id layer_coordinate = linear ? select(float_, linear, half_back, layer) : always_linear ? half_back : layer;
+    Id layer_0 = glsl(GLSLstd450Floor, float_, {layer_coordinate});
+    Id stacked = sample(sampled_image(0), vec3_of(c[0], c[1], layer_0), 2);
+    if (linear || always_linear) {
+        Id next = sample(sampled_image(0), vec3_of(c[0], c[1], m_.op(Op::OpFAdd, float_, {layer_0, f(1)})), 2);
+        Id factor = glsl(GLSLstd450Fract, float_, {layer_coordinate});
+        Id step = exact(Op::OpVectorTimesScalar, vec4_, {exact(Op::OpFSub, vec4_, {next, stacked}), factor});
+        Id filtered = exact(Op::OpFAdd, vec4_, {stacked, step});
+        stacked = linear ? select(vec4_, splat_bool(linear), filtered, stacked) : filtered;
+    }
+    return select(vec4_, splat_bool(data_is_3d), sampled_3d, stacked);
 }
 
 bool Translator::exec(const Exec &e) {
@@ -1101,6 +1248,18 @@ void Translator::main_vertex() {
     m_.decorate(position, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::Position)});
     Id outputs = global(m_.type_array(vec4_, 16), spv::StorageClass::Output, "interpolators");
     m_.decorate(outputs, spv::Decoration::Location, {0});
+    // the point diameter for point lists' geometry shader (point_list.geom),
+    // after the interpolators
+    Id point_size = global(float_, spv::StorageClass::Output, "point_size");
+    m_.decorate(point_size, spv::Decoration::Location, {16});
+    bool writes_point_size = false;
+    for (const ControlFlow &cf : s_.control_flow)
+        if (const auto *e = std::get_if<Exec>(&cf.instruction))
+            for (const ExecSlot &slot : e->slots)
+                if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
+                    for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
+                        writes_point_size |=
+                            r->target == StorageTarget::PointSizeEdgeFlagKillVertex && (r->used_write_mask() & 1);
 
     Id main = m_.begin_function(void_, m_.type_function(void_, {}));
     m_.label();
@@ -1134,6 +1293,20 @@ void Translator::main_vertex() {
     for (uint32_t k = 0; k < 16; k++)
         store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))}),
               load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {interpolators_, i(int32_t(k))})));
+    // oPts.x clamped to PA_SU_POINT_MINMAX (system values' y and z) as Xenia
+    // does, like signed integers (-NaN and negatives to the minimum, NaN to
+    // the maximum); -1 when the shader does not write it, for the constant
+    // size
+    if (writes_point_size) {
+        Id values = load(vec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, vec4_),
+                                      {system_, u(4)}));
+        auto as_int = [&](Id x) { return m_.op(Op::OpBitcast, int_, {x}); };
+        Id bits = glsl(GLSLstd450SMax, int_, {as_int(comp(values, 1)), as_int(comp(load(vec4_, point_size_), 0))});
+        bits = glsl(GLSLstd450SMin, int_, {as_int(comp(values, 2)), bits});
+        store(point_size, m_.op(Op::OpBitcast, float_, {bits}));
+    } else {
+        store(point_size, f(-1.0f));
+    }
     m_.op_void(Op::OpReturn);
     m_.end_function();
     m_.entry_point(spv::ExecutionModel::Vertex, main, "main", interface_);
@@ -1167,7 +1340,16 @@ void Translator::main_pixel() {
     }
     reset_state();
     m_.op(Op::OpFunctionCall, void_, {body_});
-    if (frag_depth) store(frag_depth, comp(load(vec4_, depth_), 0));
+    if (frag_depth) {
+        // oDepth clamped to 0-1, as Xenia does, then halved for a D24FS8
+        // target (system flags' w, bit 0), which keeps its 0-2 as 0-1
+        Id depth = glsl(GLSLstd450NClamp, float_, {comp(load(vec4_, depth_), 0), f(0), f(1)});
+        Id flags_pointer =
+            m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)});
+        Id flags = m_.op(Op::OpCompositeExtract, uint_, {load(uvec4_, flags_pointer), 3});
+        Id float24 = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(1)}), u(0)});
+        store(frag_depth, select(float_, float24, exact(Op::OpFMul, float_, {depth, f(0.5f)}), depth));
+    }
     // the alpha test (state, not microcode): oC0's alpha against the
     // reference, by the function in the system constants
     {
@@ -1232,7 +1414,8 @@ Translation Translator::run() {
     declare();
     if (stage_ != Stage::Harness) {
         m_.capability(spv::Capability::RuntimeDescriptorArray);
-        image2d_type_ = m_.type_image(float_, spv::Dim::Dim2D, 0, false, false, 1, spv::ImageFormat::Unknown);
+        // 1D, 2D and stacked textures alike as 2D arrays, as Xenia binds them
+        image2d_type_ = m_.type_image(float_, spv::Dim::Dim2D, 0, true, false, 1, spv::ImageFormat::Unknown);
         image3d_type_ = m_.type_image(float_, spv::Dim::Dim3D, 0, false, false, 1, spv::ImageFormat::Unknown);
         imagecube_type_ = m_.type_image(float_, spv::Dim::Cube, 0, false, false, 1, spv::ImageFormat::Unknown);
         sampler_type_ = m_.type_sampler();
