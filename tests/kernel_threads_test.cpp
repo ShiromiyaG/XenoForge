@@ -188,6 +188,14 @@ void tls_other(ppc::Context &c) {
     CHECK(ex(c, "KeTlsGetValue", {tls_slot}) == 77);
 }
 
+// how many threads wait on the object a handle names now
+size_t waiters_on(uint32_t handle) {
+    Ref<Dispatcher> d = objects(*K).lookup<Dispatcher>(handle);
+    if (!d) return 0;
+    std::lock_guard<std::mutex> l(objects(*K).lock);
+    return d->waiters.size();
+}
+
 void wait_manual(ppc::Context &c) {
     if (wait_handle(c, event) == X_STATUS_SUCCESS) woken++;
 }
@@ -284,7 +292,11 @@ void events(ppc::Context &c) {
     CHECK(wait_handle(c, event, 0) == X_STATUS_TIMEOUT);
     woken = 0;
     uint32_t w1 = create_thread(c, F_WAIT_MANUAL, 0), w2 = create_thread(c, F_WAIT_MANUAL, 0);
-    sleep_ms(c, 30);
+    // A pulse frees only the threads already waiting, so wait until both
+    // are: a fixed sleep lost one to a slow start under load (it waited
+    // after the pulse, forever).
+    for (int tries = 0; waiters_on(event) < 2 && tries < 5000; tries++) sleep_ms(c, 1);
+    CHECK(waiters_on(event) == 2);
     CHECK(woken == 0);
     CHECK(ex(c, "NtPulseEvent", {event, previous}) == X_STATUS_SUCCESS && K->load32(previous) == 0);
     join_and_close(c, w1);
