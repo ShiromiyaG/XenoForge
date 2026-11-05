@@ -196,7 +196,11 @@ private:
 
 class Object {
 public:
-    enum class Type : uint8_t { Event, Semaphore, Mutant, Timer, Thread, Other };
+    // the files and XAM families' kinds: File (an auto-reset event, signaled
+    // after each I/O), IoCompletion (a queue), NotifyListener (a manual-reset
+    // event, signaled while notifications wait); Other has no dispatcher
+    // header
+    enum class Type : uint8_t { Event, Semaphore, Mutant, Timer, Thread, File, IoCompletion, NotifyListener, Other };
 
     Object(Objects &owner, Type type) : owner(owner), type_(type) {}
     virtual ~Object();
@@ -482,7 +486,7 @@ public:
     // guest memory the objects use
     uint32_t title_process = 0, system_process = 0;
     uint32_t time_stamp_bundle = 0;
-    uint32_t type_thread = 0, type_event = 0, type_semaphore = 0, type_mutant = 0, type_timer = 0;
+    uint32_t type_thread = 0, type_event = 0, type_semaphore = 0, type_mutant = 0, type_timer = 0, type_file = 0;
     uint64_t system_time_base = 0; // the system time when the clock was 0
 
     // The title process's TLS slots and data (Xenia's SetProcessTLSVars),

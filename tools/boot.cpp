@@ -5,8 +5,11 @@
 // interpreter) and prints what the kernel saw: every export called and how
 // often, the ones with no implementation, the threads and where it stopped,
 // and what the GPU did (packets, draws, resolves, swaps, interrupts).
+// The disc is the game's file system (game:, d:), or a bare executable's
+// directory is; --content names the writable storage root (Xenia's layout:
+// content/ for saves, cache*/), a temporary directory's xenoforge by default.
 //
-//   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N]
+//   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>]
 
 #include "xenoforge/disc.h"
 #include "xenoforge/kernel.h"
@@ -16,6 +19,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -74,10 +78,13 @@ bool load(const std::string &input, const std::string &xex_path, Xex &xex, std::
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N]\n");
+        std::fprintf(stderr, "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
+                             "[--content <dir>]\n");
         return 2;
     }
     std::string input = argv[1], xex_path = "default.xex";
+    std::error_code ec;
+    std::filesystem::path storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
     uint64_t steps = 2'000'000'000ull;
     uint32_t seconds = 30;
     for (int k = 2; k < argc; k++) {
@@ -85,6 +92,7 @@ int main(int argc, char **argv) {
         if (a == "--xex" && k + 1 < argc) xex_path = argv[++k];
         else if (a == "--steps" && k + 1 < argc) steps = std::strtoull(argv[++k], nullptr, 10);
         else if (a == "--seconds" && k + 1 < argc) seconds = uint32_t(std::strtoul(argv[++k], nullptr, 10));
+        else if (a == "--content" && k + 1 < argc) storage = argv[++k];
     }
 
     std::string error;
@@ -93,6 +101,12 @@ int main(int argc, char **argv) {
     auto memory = Memory::create(error);
     if (!memory) return std::fprintf(stderr, "memory: %s\n", error.c_str()), 1;
     kernel::Kernel k(*memory);
+    bool bare = input.ends_with(".xex") || input.ends_with(".XEX");
+    bool mounted = bare ? kernel::mount_directory(k, std::filesystem::path(input).parent_path(), error)
+                        : kernel::mount_disc(k, input, error);
+    if (!mounted || !kernel::mount_storage(k, storage, error))
+        return std::fprintf(stderr, "mount: %s\n", error.c_str()), 1;
+    std::printf("storage: %s\n", storage.string().c_str());
     if (!k.load(xex, error)) return std::fprintf(stderr, "load: %s\n", error.c_str()), 1;
     k.step_limit = steps;
     std::printf("loaded %s: base 0x%08X, entry 0x%08X, %zu imported functions\n", xex_path.c_str(), xex.base_address,

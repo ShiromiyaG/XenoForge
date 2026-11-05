@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -18,7 +19,8 @@ namespace xf {
 struct DiscEntry {
     std::string name;
     bool directory = false;
-    uint64_t offset = 0; // in the image, for files
+    uint8_t attributes = 0; // the disc's attribute byte (0x10: a directory)
+    uint64_t offset = 0;    // in the image, for files
     uint64_t size = 0;
     std::vector<DiscEntry> children; // directories, in the disc's (sorted) order
 };
@@ -30,10 +32,12 @@ public:
 
     const DiscEntry &root() const { return root_; }
     uint64_t game_offset() const { return game_offset_; }
+    uint64_t size() const { return file_size_; } // the image's
 
     // A path such as "default.xex" or "media/sound.xwb", either slash, any case.
     const DiscEntry *find(std::string_view path) const;
 
+    // Reads may come from several threads at once.
     bool read(const DiscEntry &file, uint64_t offset, void *out, size_t size) const;
     std::vector<uint8_t> read_all(const DiscEntry &file) const;
 
@@ -43,6 +47,7 @@ private:
     bool read_directory(uint32_t sector, uint32_t size, DiscEntry &into, int depth, std::string &error);
 
     std::FILE *file_ = nullptr;
+    mutable std::mutex mutex_; // the file's position
     uint64_t file_size_ = 0;
     uint64_t game_offset_ = 0;
     DiscEntry root_;

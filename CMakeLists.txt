@@ -165,6 +165,12 @@ target_include_directories(kernel_video_test PRIVATE src/kernel)
 target_link_libraries(kernel_video_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_video COMMAND kernel_video_test)
 set_tests_properties(kernel_video PROPERTIES TIMEOUT 120) # threads: fail, never hang
+# the files family and XAM, through their exports on a guest thread
+add_executable(kernel_files_test tests/kernel_files_test.cpp)
+target_include_directories(kernel_files_test PRIVATE src/kernel)
+target_link_libraries(kernel_files_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME kernel_files COMMAND kernel_files_test)
+set_tests_properties(kernel_files PROPERTIES TIMEOUT 120) # threads: fail, never hang
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)

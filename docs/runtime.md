@@ -181,6 +181,45 @@ memory read where it lies (physical memory instead of the trace's copy,
 `swap` and the gamma ramps from the processor. The same Sink with a trace
 writer behind it records Xenia's .xtr from a live game.
 
+## Files
+
+As built (`src/kernel/files.h`; vfs.cpp, files.cpp), from Xenia's vfs and
+xboxkrnl_io: a guest path is made canonical, its symbolic links resolved
+(the object manager's list: ObCreateSymbolicLink's and the system's), and
+given to the device whose mount path starts it; each device keeps a tree of
+entries, names any case.
+
+- **Devices**: the disc (`\Device\Cdrom0`, read in place through
+  `disc.h`), or a bare executable's directory
+  (`\Device\Harddisk0\Partition1`, read-only), with `game:` and `d:` on it;
+  Xenia's null device at `\Device\Harddisk0` (the raw partitions answer
+  with nothing); host directories for the cache partitions and content.
+- **File objects** are dispatchers (an auto-reset event in guest memory,
+  set after each request, as Xenia's XFile is waitable). Requests complete
+  at once, as Xenia completes them: the I/O status block, the event, the
+  APC routine queued to the calling thread, the completion ports
+  (`IoCompletion`, a queue whose signal state counts its packets). A file
+  opened neither synchronous nor buffered answers STATUS_PENDING for a
+  request that succeeded, its result already in the status block.
+- **The storage root** (`boot --content <dir>`, a temporary directory's
+  `xenoforge` by default; never in the repository) has Xenia's layout, so
+  saves are shared with it: `cache0`, `cache1` and `cache` (`cache0:`...),
+  and `content/<XUID>/<TITLE>/<TYPE>/<name>/` for a package with its header
+  at `content/<XUID>/<TITLE>/Headers/<TYPE>/<name>.header` (Xenia's
+  XContentContainerHeader). The user is Xenia's default profile (XUID
+  B13EBABEBABEBABE), or the first profile Xenia made there.
+- `XF_LOG_FILES=1` logs each open and attribute query with its answer.
+
+## XAM
+
+As built (`src/kernel/xam.h`; xam.cpp, xam_content.cpp, xam_user.cpp,
+xam_msg.cpp, xam_net.cpp), from Xenia's xam: one user signed in offline in
+slot 0 with Xenia's default profile settings; content as above; the
+notifications Xenia queues at start; no controller; the guide's UI answered
+headless; XMsg's apps offline; the network's start-up answers offline.
+Overlapped requests Xenia defers (25 ms, on a dispatch thread) complete at
+once here, before the export returns ERROR_IO_PENDING.
+
 ## `boot`
 
 `boot <game.iso> [--frames N] [--interpret]`: loads the game, runs its

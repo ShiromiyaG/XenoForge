@@ -114,6 +114,7 @@ Objects::Objects(Kernel &kernel) : k(kernel) {
     type_mutant = k.variable("ExMutantObjectType");
     type_semaphore = k.variable("ExSemaphoreObjectType");
     type_timer = k.variable("ExTimerObjectType");
+    type_file = k.variable("IoFileObjectType");
     title_process = ::xf::kernel::title_process(k);
     system_process = ::xf::kernel::system_process(k);
 
@@ -136,6 +137,7 @@ uint32_t Objects::object_type_for(const Object &o) const {
     case Object::Type::Mutant: return type_mutant;
     case Object::Type::Timer: return type_timer;
     case Object::Type::Thread: return type_thread;
+    case Object::Type::File: return type_file; // as Xenia's: the other files family types have none
     default: return 0;
     }
 }
@@ -582,12 +584,11 @@ XF_EXPORT(xboxkrnl, ObCreateSymbolicLink) {
     std::string target = link_path(ansi_string(k, arg(k, c, 1)));
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);
-    for (auto &[p, t] : o.symbolic_links) {
-        if (lowercase(p) == lowercase(path)) {
-            t = target;
-            return result(c, X_STATUS_SUCCESS);
-        }
-    }
+    // a link that already starts the path stays, and the call succeeds (as
+    // Xenia's FindSymbolicLink check: the system's cache0: stays the host's
+    // cache partition when the title links it to its own device)
+    for (const auto &link : o.symbolic_links)
+        if (lowercase(path).starts_with(lowercase(link.first))) return result(c, X_STATUS_SUCCESS);
     o.symbolic_links.push_back({path, target});
     result(c, X_STATUS_SUCCESS);
 }

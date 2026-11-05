@@ -57,12 +57,19 @@ struct KernelHarness {
             k->add_thunk(address, library, name);
             it = thunks.emplace(key, address).first;
         }
+        // past the eighth, a 64-bit value at r1 + 0x54 + 8 * (n - 8) (what
+        // arg64 and the printf family's 64-bit reads take); a 32-bit one
+        // there for arg and in the next word too, where the printf family's
+        // 32-bit reads (Xenia's, the low half of those 8 bytes) look
         int n = 0;
         for (uint64_t a : args) {
+            uint32_t slot = uint32_t(c->r[1]) + 0x54 + 8 * (n - 8);
             if (n < 8)
                 c->r[3 + n] = a;
+            else if (a > 0xFFFFFFFFull)
+                k->store64(slot, a);
             else
-                k->store64(uint32_t(c->r[1]) + 0x54 + 8 * (n - 8), a);
+                k->store32(slot, uint32_t(a)), k->store32(slot + 4, uint32_t(a));
             n++;
         }
         k->call(*c, it->second);

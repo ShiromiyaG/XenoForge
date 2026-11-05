@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -85,6 +86,16 @@ struct Generated {
 // loader entry, the title process's TLS and stack size.
 void setup_kernel(Kernel &k);
 void setup_modules(Kernel &k, const Xex &xex);
+// The file system (files.cpp, xam.cpp; Xenia's VirtualFileSystem and its
+// mounts): the game's disc at \Device\Cdrom0, or a bare executable's
+// directory at \Device\Harddisk0\Partition1 (read-only), with game: and d:
+// linked to it; the writable storage root in Xenia's layout, its cache
+// partitions (cache:, cache0:, cache1:) and content root (content/, where
+// saves go, interchangeable with Xenia's).
+bool mount_disc(Kernel &k, const std::filesystem::path &iso, std::string &error);
+bool mount_directory(Kernel &k, const std::filesystem::path &dir, std::string &error);
+bool mount_storage(Kernel &k, const std::filesystem::path &root, std::string &error);
+
 // the title and system processes (X_KPROCESS) in the guest globals
 uint32_t title_process(Kernel &k);
 uint32_t system_process(Kernel &k);

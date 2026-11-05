@@ -90,6 +90,7 @@ std::unique_ptr<Disc> Disc::open(const std::filesystem::path &path, std::string 
 
 bool Disc::read_at(uint64_t offset, void *out, size_t size) const {
     if (offset > file_size_ || size > file_size_ - offset) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
     if (seek(file_, offset) != 0) return false;
     return std::fread(out, 1, size, file_) == size;
 }
@@ -151,6 +152,7 @@ bool Disc::read_directory(uint32_t sector, uint32_t size, DiscEntry &into, int d
         }
         DiscEntry entry;
         entry.name.assign(reinterpret_cast<const char *>(p + 14), name_length);
+        entry.attributes = attributes;
         if (attributes & ATTRIBUTE_DIRECTORY) {
             entry.directory = true;
             if (length && !read_directory(entry_sector, length, entry, depth + 1, error)) return false;
