@@ -36,14 +36,14 @@
 
 namespace xf::ppc::ops {
 
-template <Opcode> constexpr bool implemented = false;
+template <Opcode> inline constexpr bool implemented = false;
 
 template <Opcode op> XF_INLINE void run(Context &c, Instr i) {
     if (c.system && c.system->unimplemented) c.system->unimplemented(c, op, i.code);
 }
 
 #define XF_OP(name)                                                                                                    \
-    template <> constexpr bool implemented<Opcode::name> = true;                                                       \
+    template <> inline constexpr bool implemented<Opcode::name> = true;                                                \
     template <> XF_INLINE void run<Opcode::name>([[maybe_unused]] Context & c, [[maybe_unused]] Instr i)
 
 // ---- the instruction word (ppc_decode_data.h's helpers) ----
