@@ -2,12 +2,15 @@
 // (src/xenia/cpu/xex_module.cc: GetOptHeader, ReadImage*, the import
 // libraries in LoadContinue) and its structures (src/xenia/kernel/util/
 // xex2_info.h), BSD; see LICENSE-xenia. Every offset read from the file is
-// checked against it.
+// checked against it. The LZX decoder normal compression ends in is ours
+// (lzx.cpp), not Xenia's (libmspack).
 
 #include "xenoforge/xex.h"
 
 #include "xenoforge/aes.h"
 #include "xenoforge/bytes.h"
+#include "xenoforge/lzx.h"
+#include "xenoforge/sha1.h"
 
 #include <algorithm>
 #include <cstring>
@@ -91,6 +94,23 @@ bool parse_imports(std::span<const uint8_t> file, Xex &xex, std::string &error) 
     return true;
 }
 
+uint64_t pages_size(const Xex &xex) {
+    uint64_t size = 0;
+    for (const XexPages &pages : xex.pages) size += uint64_t(pages.count) * xex.page_size();
+    return size;
+}
+
+// The image zeroed: the security info's size, or its pages' if more.
+bool allocate_image(const Xex &xex, std::vector<uint8_t> &image, std::string &error) {
+    uint64_t size = std::max<uint64_t>(xex.image_size, pages_size(xex));
+    if (size > (512u << 20)) {
+        error = "the image is implausibly large";
+        return false;
+    }
+    image.assign(size, 0);
+    return true;
+}
+
 bool unpack_basic(std::span<const uint8_t> file, const Xex &xex, const std::vector<uint8_t> &data,
                   std::vector<uint8_t> &image, std::string &error) {
     const uint8_t *info = header_data(file, xex, xex_key::FILE_FORMAT_INFO, 8);
@@ -99,14 +119,8 @@ bool unpack_basic(std::span<const uint8_t> file, const Xex &xex, const std::vect
         error = "the basic compression's blocks run past the file";
         return false;
     }
-    uint64_t pages_size = 0;
-    for (const XexPages &pages : xex.pages) pages_size += uint64_t(pages.count) * xex.page_size();
-    uint64_t size = std::max<uint64_t>(xex.image_size, pages_size);
-    if (size > (512u << 20)) {
-        error = "the image is implausibly large";
-        return false;
-    }
-    image.assign(size, 0);
+    if (!allocate_image(xex, image, error)) return false;
+    const uint64_t size = image.size();
 
     // each block: data_size bytes from the file, then zero_size zeros
     uint64_t from = 0, to = 0;
@@ -121,6 +135,65 @@ bool unpack_basic(std::span<const uint8_t> file, const Xex &xex, const std::vect
         to += uint64_t(data_size) + zero_size;
     }
     return true;
+}
+
+enum class Unpacked { Ok, WrongKey, Failed };
+
+// Normal compression (ReadImageCompressed): a chain of blocks, the first
+// one's size and SHA-1 in the file format info, each next one's in the 24
+// bytes that start the block before it. After those, a block holds chunks of
+// LZX data, each after its big-endian 16-bit size, until a size of 0. The
+// chunks joined are one LZX stream, decompressed into the image with the
+// window size of the file format info. A block whose SHA-1 differs was
+// decrypted with the wrong key: the caller tries the next one.
+Unpacked unpack_normal(std::span<const uint8_t> file, const Xex &xex, const std::vector<uint8_t> &data,
+                       std::vector<uint8_t> &image, std::string &error) {
+    const uint8_t *info = header_data(file, xex, xex_key::FILE_FORMAT_INFO, 36);
+    if (!info || be32(info) < 36) {
+        error = "the normal compression's header runs past the file";
+        return Unpacked::Failed;
+    }
+    std::vector<uint8_t> stream;
+    stream.reserve(data.size());
+    uint32_t block_size = be32(info + 12);
+    const uint8_t *block_hash = info + 16;
+    for (size_t at = 0; block_size;) {
+        if (block_size < 24 || block_size > data.size() - at) {
+            error = "a compressed block runs past the file";
+            return Unpacked::Failed;
+        }
+        const uint8_t *block = data.data() + at;
+        uint8_t digest[20];
+        sha1({block, block_size}, digest);
+        if (std::memcmp(digest, block_hash, 20) != 0) {
+            error = "a compressed block's SHA-1 differs";
+            return Unpacked::WrongKey;
+        }
+        for (uint32_t p = 24;;) {
+            if (p + 2 > block_size) {
+                error = "a compressed block's chunks run past it";
+                return Unpacked::Failed;
+            }
+            uint32_t chunk = be16(block + p);
+            p += 2;
+            if (chunk == 0) break;
+            if (chunk > block_size - p) {
+                error = "a compressed block's chunks run past it";
+                return Unpacked::Failed;
+            }
+            stream.insert(stream.end(), block + p, block + p + chunk);
+            p += chunk;
+        }
+        at += block_size;
+        block_size = be32(block);
+        block_hash = block + 4;
+    }
+
+    if (!allocate_image(xex, image, error)) return Unpacked::Failed;
+    // Xenia decompresses the pages' size (its image_size())
+    uint64_t length = pages_size(xex) ? pages_size(xex) : xex.image_size;
+    if (!lzx_decompress(stream, std::span(image).first(size_t(length)), xex.lzx_window, error)) return Unpacked::Failed;
+    return Unpacked::Ok;
 }
 
 } // namespace
@@ -236,16 +309,14 @@ bool load_xex_image(std::span<const uint8_t> file, Xex &xex, std::string &error)
         error = "a patch (.xexp) has no image of its own: it applies to its base executable";
         return false;
     }
-    if (xex.compression == XexCompression::Normal) {
-        error = "normal (LZX) compression is not supported yet";
-        return false;
-    }
-    if (xex.compression != XexCompression::None && xex.compression != XexCompression::Basic) {
+    if (xex.compression != XexCompression::None && xex.compression != XexCompression::Basic &&
+        xex.compression != XexCompression::Normal) {
         error = std::string("unsupported compression: ") + compression_name(xex.compression);
         return false;
     }
     std::span<const uint8_t> payload = file.subspan(xex.header_size);
 
+    std::string why;
     for (const uint8_t *key : {RETAIL_KEY, DEVKIT_KEY}) {
         std::vector<uint8_t> data(payload.begin(), payload.end());
         if (xex.encryption == XexEncryption::Normal) {
@@ -261,8 +332,16 @@ bool load_xex_image(std::span<const uint8_t> file, Xex &xex, std::string &error)
         if (xex.compression == XexCompression::None) {
             image = std::move(data);
             if (xex.image_size) image.resize(xex.image_size);
-        } else if (!unpack_basic(file, xex, data, image, error)) {
-            return false;
+        } else if (xex.compression == XexCompression::Basic) {
+            if (!unpack_basic(file, xex, data, image, error)) return false;
+        } else {
+            Unpacked unpacked = unpack_normal(file, xex, data, image, error);
+            if (unpacked == Unpacked::Failed) return false;
+            if (unpacked == Unpacked::WrongKey) {
+                why = error;
+                if (xex.encryption == XexEncryption::None) break;
+                continue;
+            }
         }
 
         if (image.size() >= 2 && image[0] == 'M' && image[1] == 'Z') {
@@ -270,9 +349,11 @@ bool load_xex_image(std::span<const uint8_t> file, Xex &xex, std::string &error)
             xex.devkit = key == DEVKIT_KEY;
             return true;
         }
+        why = "the image is not a PE image after decryption";
         if (xex.encryption == XexEncryption::None) break;
     }
-    error = "the image is not a PE image after decryption (neither the retail nor the devkit key)";
+    error = why;
+    if (xex.encryption == XexEncryption::Normal) error += " (neither the retail nor the devkit key)";
     return false;
 }
 

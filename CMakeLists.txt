@@ -25,6 +25,8 @@ add_library(xenoforge STATIC
     src/disc.cpp
     src/exports.cpp
     src/xex.cpp
+    src/lzx.cpp
+    src/sha1.cpp
     src/snappy.cpp
     src/gpu_trace.cpp
     src/trace_stats.cpp
@@ -123,7 +125,7 @@ add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
-foreach(name aes disc xex snappy ucode ucode_parse trace shader_interpreter texture ppc memory)
+foreach(name aes disc xex lzx snappy ucode ucode_parse trace shader_interpreter texture ppc memory)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)

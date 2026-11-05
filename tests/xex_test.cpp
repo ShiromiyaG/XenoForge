@@ -1,15 +1,20 @@
 // XEX2 on an executable made here: encrypted with a session key (the file key
 // sealed with the retail key, then with the devkit's), packed with basic
 // compression, with two import libraries; its headers, image and imports
-// read back. Cut short, it is refused without reading past the end.
+// read back. Cut short, it is refused without reading past the end. The same
+// image packed with normal compression (two chained blocks with their SHA-1,
+// LZX chunks of an uncompressed block) reads back the same; a block changed
+// is refused. SHA-1 on FIPS 180's examples.
 
 #include "check.h"
 #include "xenoforge/aes.h"
 #include "xenoforge/bytes.h"
 #include "xenoforge/exports.h"
+#include "xenoforge/sha1.h"
 #include "xenoforge/xex.h"
 
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace xf;
@@ -41,7 +46,45 @@ std::vector<uint8_t> plain_image() {
     return image;
 }
 
-std::vector<uint8_t> make_xex(const uint8_t *console_key) {
+// The image as one LZX uncompressed block: the E8 bit (0), the type (3) and
+// the 24-bit size, 4 bits of padding, the repeated offsets (1, 1, 1), the
+// bytes.
+std::vector<uint8_t> lzx_stored(const std::vector<uint8_t> &data) {
+    uint32_t size = uint32_t(data.size());
+    uint16_t w0 = uint16_t(3 << 12 | (size >> 12 & 0xFFF)), w1 = uint16_t((size & 0xFFF) << 4);
+    std::vector<uint8_t> s = {uint8_t(w0), uint8_t(w0 >> 8), uint8_t(w1), uint8_t(w1 >> 8)};
+    for (int i = 0; i < 3; i++) s.insert(s.end(), {1, 0, 0, 0});
+    s.insert(s.end(), data.begin(), data.end());
+    if (size & 1) s.push_back(0);
+    return s;
+}
+
+// Normal compression's blocks: each starts with the next one's size and
+// SHA-1, then chunks after their big-endian 16-bit sizes, then a size of 0.
+// The first block's size and SHA-1 go in the file format info.
+std::vector<uint8_t> chain_blocks(const std::vector<uint8_t> &stream, uint8_t *first_info) {
+    const size_t half = stream.size() / 2;
+    std::vector<uint8_t> next_info(24, 0); // the last block: no next one
+    std::vector<uint8_t> blocks;
+    for (size_t from : {half, size_t(0)}) { // the second block first: the first holds its SHA-1
+        size_t to = from ? stream.size() : half;
+        std::vector<uint8_t> block = next_info;
+        for (size_t at = from; at < to; at += 0x3000) {
+            size_t n = std::min<size_t>(0x3000, to - at);
+            block.insert(block.end(), {uint8_t(n >> 8), uint8_t(n)});
+            block.insert(block.end(), stream.data() + at, stream.data() + at + n);
+        }
+        block.insert(block.end(), {0, 0});
+        put_be32(next_info.data(), uint32_t(block.size()));
+        sha1(block, next_info.data() + 4);
+        blocks.insert(blocks.begin(), block.begin(), block.end());
+    }
+    std::memcpy(first_info, next_info.data(), 24);
+    blocks.resize((blocks.size() + 15) & ~size_t(15));
+    return blocks;
+}
+
+std::vector<uint8_t> make_xex(const uint8_t *console_key, bool lzx = false) {
     std::vector<uint8_t> f(HEADER_SIZE, 0);
     uint8_t *p = f.data();
     std::memcpy(p, "XEX2", 4);
@@ -120,6 +163,13 @@ std::vector<uint8_t> make_xex(const uint8_t *console_key) {
     auto image = plain_image();
     std::vector<uint8_t> payload(image.begin(), image.begin() + 0x200);
     payload.insert(payload.end(), image.begin() + 0x300, image.begin() + 0x400);
+    if (lzx) {
+        // normal compression instead: a 32 KB window, the blocks chained
+        put_be32(ffi, 36);
+        put_be16(ffi + 6, 2);
+        put_be32(ffi + 8, 0x8000);
+        payload = chain_blocks(lzx_stored(image), ffi + 12);
+    }
     const uint8_t iv[16] = {};
     aes::encrypt_cbc(aes::expand(session), iv, payload.data(), payload.size());
     f.insert(f.end(), payload.begin(), payload.end());
@@ -190,13 +240,62 @@ void refuses_a_wrong_key() {
     CHECK(!load_xex_image(file, xex, error));
 }
 
+void reads_an_lzx_executable(const uint8_t *console_key, bool devkit) {
+    auto file = make_xex(console_key, true);
+    Xex xex;
+    std::string error;
+    CHECK(parse_xex(file, xex, error));
+    CHECK(xex.compression == XexCompression::Normal && xex.lzx_window == 0x8000);
+    CHECK(load_xex_image(file, xex, error));
+    CHECK(xex.devkit == devkit);
+    CHECK(xex.image == plain_image());
+    CHECK(list_imports(xex).size() == 4);
+
+    // a byte changed in the second block: its SHA-1 differs with both keys
+    file[file.size() - 0x40] ^= 1;
+    CHECK(!load_xex_image(file, xex, error));
+    CHECK(error.find("SHA-1") != std::string::npos);
+
+    // cut short: the chain runs past the end
+    auto cut = make_xex(console_key, true);
+    cut.resize(HEADER_SIZE + 0x1000);
+    CHECK(parse_xex(cut, xex, error));
+    CHECK(!load_xex_image(cut, xex, error));
+}
+
+std::string hex(const uint8_t *p, size_t n) {
+    std::string s;
+    for (size_t i = 0; i < n; i++) {
+        s += "0123456789abcdef"[p[i] >> 4];
+        s += "0123456789abcdef"[p[i] & 15];
+    }
+    return s;
+}
+
+std::string sha1_hex(const std::string &text) {
+    uint8_t digest[20];
+    sha1({reinterpret_cast<const uint8_t *>(text.data()), text.size()}, digest);
+    return hex(digest, 20);
+}
+
+void sha1_examples() {
+    CHECK(sha1_hex("") == "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+    CHECK(sha1_hex("abc") == "a9993e364706816aba3e25717850c26c9cd0d89d");
+    CHECK(sha1_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
+          "84983e441c3bd26ebaae4aa1f95129e5e54670f1");
+    CHECK(sha1_hex(std::string(1000000, 'a')) == "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+}
+
 } // namespace
 
 int main() {
+    sha1_examples();
     reads_an_executable(RETAIL_KEY, false);
     const uint8_t devkit[16] = {};
     reads_an_executable(devkit, true);
     refuses_a_short_file();
     refuses_a_wrong_key();
+    reads_an_lzx_executable(RETAIL_KEY, false);
+    reads_an_lzx_executable(devkit, true);
     return finish("xex");
 }

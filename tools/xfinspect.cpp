@@ -25,7 +25,14 @@ void usage() {
                 "  --xex <path>         the executable on the disc (default.xex)\n"
                 "  --files              list the disc's files\n"
                 "  --imports            each import: library, ordinal, name, kind (tab separated)\n"
-                "  --dump-image <file>  write the image decrypted and unpacked (offset 0 = base address)\n");
+                "  --dump-image <file>  write the image decrypted and unpacked (offset 0 = base address)\n"
+                "  --dump-xex <file>    write the executable as the disc holds it\n");
+}
+
+bool write_file(const std::string &path, const std::vector<uint8_t> &data) {
+    std::ofstream out(std::filesystem::path(path), std::ios::binary);
+    out.write(reinterpret_cast<const char *>(data.data()), std::streamsize(data.size()));
+    return bool(out);
 }
 
 std::string version(uint32_t v) {
@@ -97,7 +104,7 @@ bool looks_like_xex(const std::filesystem::path &path) {
 
 int main(int argc, char **argv) {
     std::filesystem::path input;
-    std::string xex_path = "default.xex", dump_path;
+    std::string xex_path = "default.xex", dump_path, dump_xex_path;
     bool files = false, imports = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -105,6 +112,7 @@ int main(int argc, char **argv) {
         else if (a == "--files") files = true;
         else if (a == "--imports") imports = true;
         else if (a == "--dump-image" && i + 1 < argc) dump_path = argv[++i];
+        else if (a == "--dump-xex" && i + 1 < argc) dump_xex_path = argv[++i];
         else if (a == "-h" || a == "--help") {
             usage();
             return 0;
@@ -155,6 +163,13 @@ int main(int argc, char **argv) {
         }
         std::printf("executable    %s (%zu bytes)\n", xex_path.c_str(), file.size());
     }
+    if (!dump_xex_path.empty()) {
+        if (!write_file(dump_xex_path, file)) {
+            std::fprintf(stderr, "cannot write %s\n", dump_xex_path.c_str());
+            return 1;
+        }
+        std::printf("wrote         %s\n", dump_xex_path.c_str());
+    }
 
     Xex xex;
     if (!parse_xex(file, xex, error)) {
@@ -172,8 +187,10 @@ int main(int argc, char **argv) {
     std::printf("base          0x%08X  entry 0x%08X  image 0x%X bytes  pages of 0x%X\n", xex.base_address,
                 xex.entry_point, xex.image_size, xex.page_size());
     std::printf("stack, heap   0x%X, 0x%X\n", xex.stack_size, xex.heap_size);
-    std::printf("encryption    %s  compression %s\n", xex.encryption == XexEncryption::Normal ? "normal" : "none",
+    std::printf("encryption    %s  compression %s", xex.encryption == XexEncryption::Normal ? "normal" : "none",
                 compression_name(xex.compression));
+    if (xex.compression == XexCompression::Normal) std::printf(", window 0x%X", xex.lzx_window);
+    std::printf("\n");
     if (!xex.original_pe_name.empty()) std::printf("original name %s\n", xex.original_pe_name.c_str());
 
     // consecutive pages of a kind as one section

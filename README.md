@@ -16,7 +16,7 @@ Early days: the first step of [the plan](docs/plan.md).
 | Part | Where | State |
 | --- | --- | --- |
 | The disc: XDVDFS read from the ISO in place (XGD2/XGD3 dumps, rebuilt images) | `disc.h`, `src/disc.cpp` | done; tests |
-| The executable: XEX2 headers, AES-128, basic compression, the import libraries | `xex.h`, `aes.h`, `src/xex.cpp`, `src/aes.cpp` | done but LZX; tests |
+| The executable: XEX2 headers, AES-128, basic and normal (LZX) compression, the import libraries | `xex.h`, `aes.h`, `lzx.h`, `sha1.h`, `src/xex.cpp`, `src/aes.cpp`, `src/lzx.cpp`, `src/sha1.cpp` | done; tests |
 | The system's exports by ordinal (xboxkrnl, xam, xbdm) | `exports.h`, `src/exports/` (Xenia's tables) | done |
 | `xfinspect`: a disc's executable, its XDK libraries and imports, the image dumped | `tools/xfinspect.cpp` | done |
 | Xenia's GPU traces read (snappy included) and walked through a PM4 front end that counts | `gpu_trace.h`, `trace_stats.h`, `snappy.h` | done; tests |

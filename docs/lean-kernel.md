@@ -30,8 +30,8 @@ An import nothing calls stays a stub that logs once.
 | xam imports | 118 functions | 49 functions |
 
 The LatAm and USA discs of El Chavo Kart import the same (and their
-executables are the same file). Both games use basic compression, so the
-LZX decoder (normal compression) waits for a game that needs it.
+executables are the same file). Both games use basic compression; normal
+(LZX) compression came with Battlefield: Bad Company 2.
 
 XDK libraries linked into each (the static libraries header):
 

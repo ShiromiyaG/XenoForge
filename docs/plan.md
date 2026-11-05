@@ -43,7 +43,7 @@ access, the calls into the system), so its thousands of files compile fast.
 | Part | What it is | State |
 | --- | --- | --- |
 | Disc | XDVDFS read from the ISO in place (`disc.h`) | done |
-| Executable | XEX2 headers, AES, basic compression, imports (`xex.h`); LZX when a game needs it | done but LZX |
+| Executable | XEX2 headers, AES, basic and normal (LZX) compression, imports (`xex.h`, `lzx.h`) | done |
 | Exports | xboxkrnl, xam, xbdm by ordinal (`exports.h`) | done |
 | `xfinspect` | a disc's executable, its XDK libraries and imports, the image for reverse engineering | done |
 | Recompiler | PPC and VMX128 to C++: discovery, emission, `#line` listing, yield points, dispatch table | step A2 |
@@ -217,12 +217,13 @@ Next: A2 and B1, side by side.
   binutils' disassembler (GPL v2+, `thirdparty/disasm`), which never enters
   XenoForge, and both are built around one game (Sonic Unleashed). XenoForge
   stays MIT, with Xenia's BSD notice on what is translated from it.
+- 2026-11-04: LZX (normal compression, Battlefield: Bad Company 2) written
+  from [MS-PATCH] (`lzx.cpp`, MIT); the block chain translated from Xenia.
+  The images of 40 executables (BC2's three, 37 system updates on other
+  discs) are identical to Xenia's (libmspack), by `tools/xenia_oracle`.
 
 ## Open
 
-- LZX (normal compression): written here from Microsoft's open
-  specification ([MS-PATCH]), checked against Xenia's (libmspack) output,
-  when a game needs it. Neither game does.
 - The recompiler's discovery: translated from rexglue's (BSD), or written
   anew on Xenia's scanner; decided at A2 after reading both.
 - XMA: Xenia's FFmpeg fork (its `xmaframes` decoder) or upstream FFmpeg's
