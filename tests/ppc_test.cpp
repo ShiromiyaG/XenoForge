@@ -172,6 +172,11 @@ int main(int argc, char **argv) {
     for (auto [a, b] : regions)
         if (!space.commit(a, b - a)) return std::printf("could not commit guest memory\n"), 1;
 
+    // the time base counts up, one per read
+    static uint64_t ticks = 0;
+    System system;
+    system.time_base = [](Context &) { return ++ticks; };
+
     Totals totals;
     for (const fs::path &source : sources) {
         std::string suite = source.stem().string();
@@ -198,6 +203,8 @@ int main(int argc, char **argv) {
             std::memset(&c, 0, sizeof(c));
             c.base = space.base();
             c.lr = SENTINEL;
+            c.msr = 0x9030; // Xenia's ThreadState, "dumped from a real 360"
+            c.system = &system;
             for (auto &[key, value] : t.annotations) {
                 size_t space_at = value.find(' ');
                 std::string reg = value.substr(0, space_at), v = space_at == std::string::npos ? "" : value.substr(space_at + 1);

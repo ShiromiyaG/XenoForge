@@ -62,6 +62,28 @@ SAT, the reservation of `lwarx`/`stwcx.`, and the guest memory's base.
 Memory is 4 GB of reserved host address space, the guest's addresses
 added to its base; loads and stores swap bytes.
 
+## Semantics, where it departs from Xenia or the brief
+
+- 32-bit mode (MSR 0x9030, SF clear): results are 64-bit, but CA, CR0 and
+  OV come from the low word. OE (XER[OV]) follows the architecture, which
+  Xenia leaves out; CR0 copies XER[SO]; CA is set even with OE, unlike
+  Xenia's addc, subfc, subfe and addme. `sraw`/`srad` give the sign to CA
+  past 31/63 bits. XER is SO, OV and CA.
+- Division by zero (and the most negative number by -1) gives 0, as Xenia's
+  backend does.
+- `dcbz` clears 128 bytes, as Xenia canary ("no short cache line" on the
+  Xbox 360); El Chavo Kart's own `dcbz` loops step by 128.
+- Reservations: `lwarx`/`ldarx` record address and value after a fence;
+  `stwcx.`/`stdcx.` store with one compare-exchange against the reserved
+  value and drop the reservation; CR0's SO is left alone, as Xenia.
+- `lswi`/`stswi` follow the manual (Xenia has none of the string
+  instructions); `lswx`/`stswx` are not done (their count is XER bits
+  57-63, which the context does not keep; neither game uses them).
+- Traps call `system->trap` when they fire (Xenia ignores them by default);
+  `sc` calls `system->syscall`. VSCR is SAT alone, NJ always set.
+- For step A4: Xenia adds 0x1000 to addresses at 0xE0000000 and above (the
+  4 KB offset of that physical view); `ops::host` is the one place to do it.
+
 ## Threads and the system
 
 As the 3DS runtime's interface 6: each guest thread runs on its own stack
