@@ -11,6 +11,7 @@
 #include "objects.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -634,18 +635,27 @@ XF_EXPORT(xboxkrnl, ExCreateThread) {
 
 XF_EXPORT(xboxkrnl, ExTerminateThread) { throw ThreadExit{arg(k, c, 0)}; }
 
+namespace {
+// one suspension less, the thread going on at none (lock held): the
+// previous count
+uint32_t resume(Objects &o, Thread &t) {
+    uint32_t previous = t.suspend_count;
+    if (t.suspend_count && --t.suspend_count == 0) {
+        t.pending.fetch_and(~uint32_t(Thread::PENDING_SUSPEND));
+        if (t.blocked == Thread::Blocked::Suspended) o.scheduler->wake(t);
+    }
+    o.k.host(t.kthread())[kthread::SUSPEND_COUNT] = uint8_t(t.suspend_count);
+    return previous;
+}
+} // namespace
+
 XF_EXPORT(xboxkrnl, NtResumeThread) {
     uint32_t handle = arg(k, c, 0), count_ptr = arg(k, c, 1);
     Objects &o = objects(k);
     Ref<Thread> t = o.lookup<Thread>(handle);
     if (!t) return result(c, o.lookup<Object>(handle) ? X_STATUS_OBJECT_TYPE_MISMATCH : X_STATUS_INVALID_HANDLE);
     std::lock_guard<std::mutex> l(o.lock);
-    uint32_t previous = t->suspend_count;
-    if (t->suspend_count && --t->suspend_count == 0) {
-        t->pending.fetch_and(~uint32_t(Thread::PENDING_SUSPEND));
-        if (t->blocked == Thread::Blocked::Suspended) o.scheduler->wake(*t);
-    }
-    k.host(t->kthread())[kthread::SUSPEND_COUNT] = uint8_t(t->suspend_count);
+    uint32_t previous = resume(o, *t);
     if (count_ptr) k.store32(count_ptr, previous);
     result(c, X_STATUS_SUCCESS);
 }
@@ -716,6 +726,63 @@ XF_EXPORT(xboxkrnl, KeSetBasePriorityThread) {
     k.host(t->kthread())[kthread::BASE_PRIORITY] = uint8_t(priority);
     k.host(t->kthread())[kthread::PRIORITY] = uint8_t(priority);
     result(c, uint32_t(previous));
+}
+
+// By the KTHREAD: NT's answer, the previous suspend count (Xenia returns
+// its status, success).
+XF_EXPORT(xboxkrnl, KeResumeThread) {
+    Ref<Thread> t = thread_at(k, arg(k, c, 0));
+    if (!t) return result(c, X_STATUS_INVALID_HANDLE);
+    std::lock_guard<std::mutex> l(objects(k).lock);
+    result(c, resume(objects(k), *t));
+}
+
+// (thread, disabled): the previous flag (Xenia's: an exchange of the byte)
+XF_EXPORT(xboxkrnl, KeSetDisableBoostThread) {
+    std::atomic_ref<uint8_t> flag(k.host(arg(k, c, 0))[kthread::BOOST_DISABLED]);
+    result(c, flag.exchange(uint8_t(arg(k, c, 1))));
+}
+
+// (stack pointer, thread, allocation base, base, limit): a thread moving to
+// another stack, a fiber's (Xenia's KeSetCurrentStackPointers). r1 changes
+// under the caller; Xenia also re-enters the thread when a fiber switches
+// to avoid growing the host stack, which a switch here still does (each
+// switch a host call that does not return until the fiber is left).
+XF_EXPORT(xboxkrnl, KeSetCurrentStackPointers) {
+    uint32_t stack_ptr = arg(k, c, 0), thread = arg(k, c, 1);
+    uint32_t base = arg(k, c, 3), limit = arg(k, c, 4), pcr = uint32_t(c.r[13]);
+    k.store32(thread + kthread::STACK_ALLOC_BASE, arg(k, c, 2));
+    k.store32(thread + kthread::STACK_BASE, base);
+    k.store32(thread + kthread::STACK_LIMIT, limit);
+    k.store32(pcr + kpcr::STACK_BASE, base);
+    k.store32(pcr + kpcr::STACK_END, limit);
+    c.r[1] = stack_ptr;
+}
+
+// The FPU registers kept in the current KTHREAD (Xenia's, sketchy as its).
+XF_EXPORT(xboxkrnl, KeSaveFloatingPointState) {
+    uint32_t thread = k.load32(uint32_t(c.r[13]) + kpcr::CURRENT_THREAD);
+    for (uint32_t n = 0; n < 32; n++) k.store64(thread + kthread::FPU_CONTEXT + 8 * n, std::bit_cast<uint64_t>(c.f[n]));
+}
+XF_EXPORT(xboxkrnl, KeRestoreFloatingPointState) {
+    uint32_t thread = k.load32(uint32_t(c.r[13]) + kpcr::CURRENT_THREAD);
+    for (uint32_t n = 0; n < 32; n++) c.f[n] = std::bit_cast<double>(k.load64(thread + kthread::FPU_CONTEXT + 8 * n));
+}
+
+// (thread id, out): the thread's KTHREAD, referenced until
+// ObDereferenceObject (Xenia's ObLookupThreadByThreadId)
+XF_EXPORT(xboxkrnl, ObLookupAnyThreadByThreadId) {
+    uint32_t id = arg(k, c, 0), out_ptr = arg(k, c, 1);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    for (Thread *t : o.threads) {
+        if (t->id != id) continue;
+        o.retain_handle(t->handle());
+        if (out_ptr) k.store32(out_ptr, t->kthread());
+        return result(c, X_STATUS_SUCCESS);
+    }
+    if (out_ptr) k.store32(out_ptr, 0);
+    result(c, X_STATUS_INVALID_PARAMETER);
 }
 
 XF_EXPORT(xboxkrnl, KeGetCurrentProcessType) {
@@ -835,6 +902,18 @@ XF_EXPORT(xboxkrnl, KfReleaseSpinLock) {
     uint32_t old_irql = arg(k, c, 1);
     release_spin_lock(objects(k), arg(k, c, 0));
     if (old_irql < 2) k.host(uint32_t(c.r[13]))[kpcr::CURRENT_IRQL] = uint8_t(old_irql);
+}
+
+// IRQL in the PCR (Xenia's): to dispatch level, the old one back; down
+XF_EXPORT(xboxkrnl, KeRaiseIrqlToDpcLevel) { result(c, raise_irql(k, uint32_t(c.r[13]), 2)); }
+XF_EXPORT(xboxkrnl, KfLowerIrql) { k.host(uint32_t(c.r[13]))[kpcr::CURRENT_IRQL] = uint8_t(arg(k, c, 0)); }
+
+// one try: 1 if the lock was free and is now the caller's
+XF_EXPORT(xboxkrnl, KeTryToAcquireSpinLockAtRaisedIrql) {
+    uint32_t expected = 0;
+    bool taken = guest_word(k, arg(k, c, 0))
+                     .compare_exchange_strong(expected, bswap32(uint32_t(c.r[13])), std::memory_order_acquire);
+    result(c, taken ? 1 : 0);
 }
 
 XF_EXPORT(xboxkrnl, KeAcquireSpinLockAtRaisedIrql) { acquire_spin_lock(objects(k), c, arg(k, c, 0)); }

@@ -151,6 +151,9 @@ foreach(name spirv shader_translator)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
 add_test(NAME kernel_threads COMMAND kernel_threads_test)
+# a rare deadlock seen once under load (2026-11-05, not reproduced in 36
+# runs since): fail instead of hanging the suite
+set_tests_properties(kernel_threads PROPERTIES TIMEOUT 120)
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)

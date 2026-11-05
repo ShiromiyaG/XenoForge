@@ -473,6 +473,30 @@ XF_EXPORT(xboxkrnl, ObReferenceObjectByHandle) {
     result(c, X_STATUS_SUCCESS);
 }
 
+// (object, out handle): a handle to an object by its body (Xenia's: the
+// object's own handle, one more reference)
+XF_EXPORT(xboxkrnl, ObOpenObjectByPointer) {
+    uint32_t address = arg(k, c, 0), out_ptr = arg(k, c, 1);
+    Objects &o = objects(k);
+    if (out_ptr) k.store32(out_ptr, 0);
+    Ref<Dispatcher> made;
+    {
+        std::lock_guard<std::mutex> l(o.lock);
+        if (Object *object = o.by_guest(address)) {
+            o.retain_handle(object->handle());
+            if (out_ptr) k.store32(out_ptr, object->handle());
+            return result(c, X_STATUS_SUCCESS);
+        }
+    }
+    // a header the game initialized itself: its host object made now
+    made = o.native(address);
+    if (!made) return result(c, X_STATUS_UNSUCCESSFUL);
+    std::lock_guard<std::mutex> l(o.lock);
+    o.retain_handle(made->handle());
+    if (out_ptr) k.store32(out_ptr, made->handle());
+    result(c, X_STATUS_SUCCESS);
+}
+
 XF_EXPORT(xboxkrnl, ObReferenceObject) {
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);

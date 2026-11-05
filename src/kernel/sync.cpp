@@ -237,6 +237,75 @@ XF_EXPORT(xboxkrnl, NtReleaseMutant) {
     result(c, X_STATUS_SUCCESS);
 }
 
+// ---- the Ke forms of semaphores and mutants (a header in the game's memory) ----
+
+// (semaphore, count, limit): the header and limit written, the host object
+// made or found (Xenia's KeInitializeSemaphore; its wait list keeps a host
+// object's stash, as Xenia leaves it)
+XF_EXPORT(xboxkrnl, KeInitializeSemaphore) {
+    uint32_t s = arg(k, c, 0);
+    k.host(s)[header::TYPE] = uint8_t(GuestType::Semaphore);
+    k.store32(s + header::SIGNAL_STATE, arg(k, c, 1));
+    k.store32(s + ksemaphore::LIMIT, arg(k, c, 2));
+    objects(k).native(s);
+}
+
+// (semaphore, increment, adjustment, wait): the previous count; past the
+// limit nothing changes (NT raises an exception there, Xenia ignores it)
+XF_EXPORT(xboxkrnl, KeReleaseSemaphore) {
+    int32_t adjustment = int32_t(arg(k, c, 2));
+    Objects &o = objects(k);
+    Ref<Semaphore> s = as<Semaphore>(o.native(arg(k, c, 0)));
+    if (!s) return result(c, 0);
+    std::lock_guard<std::mutex> l(o.lock);
+    int32_t previous = s->signal_state();
+    if (adjustment > 0 && int64_t(previous) + adjustment <= s->limit()) {
+        s->set_signal_state(previous + adjustment);
+        o.signaled(*s);
+    }
+    result(c, uint32_t(previous));
+}
+
+// (mutant, initial owner): NT's KeInitializeMutant (Xenia has none): owned
+// by the caller, or signaled
+XF_EXPORT(xboxkrnl, KeInitializeMutant) {
+    uint32_t address = arg(k, c, 0);
+    bool owned = arg(k, c, 1) != 0;
+    k.host(address)[header::TYPE] = uint8_t(GuestType::Mutant);
+    k.store32(address + header::SIGNAL_STATE, owned ? 0 : 1);
+    k.host(address)[kmutant::ABANDONED] = 0;
+    Objects &o = objects(k);
+    Ref<Mutant> m = as<Mutant>(o.native(address));
+    if (!m) return;
+    std::lock_guard<std::mutex> l(o.lock);
+    m->abandoned = false;
+    m->set_owner(owned ? current_thread() : nullptr);
+}
+
+// (mutant, increment, abandoned, wait): NT's KeReleaseMutant, the previous
+// signal state. Abandoning releases it whoever owns it, as NT does.
+XF_EXPORT(xboxkrnl, KeReleaseMutant) {
+    bool abandon = arg(k, c, 2) != 0;
+    Objects &o = objects(k);
+    Ref<Mutant> m = as<Mutant>(o.native(arg(k, c, 0)));
+    if (!m) return result(c, 0);
+    std::lock_guard<std::mutex> l(o.lock);
+    int32_t previous = m->signal_state();
+    if (abandon) {
+        m->set_signal_state(1);
+        m->abandoned = true;
+        k.host(m->guest)[kmutant::ABANDONED] = 1;
+    } else {
+        if (m->owner_thread != current_thread()) return result(c, uint32_t(previous)); // NT raises here
+        m->set_signal_state(previous + 1);
+    }
+    if (m->signal_state() > 0) {
+        m->set_owner(nullptr);
+        o.signaled(*m);
+    }
+    result(c, uint32_t(previous));
+}
+
 // ---- timers ----
 
 // timer_type 0: notification, 1: synchronization
@@ -325,6 +394,42 @@ XF_EXPORT(xboxkrnl, NtWaitForSingleObjectEx) {
     if (!object) return result(c, X_STATUS_INVALID_HANDLE);
     if (!object->dispatcher() || !t) return result(c, X_STATUS_SUCCESS);
     Dispatcher *objects[] = {static_cast<Dispatcher *>(object.get())};
+    result(c, finish_wait(o, *t, o.wait(*t, objects, false, alertable != 0, o.deadline(timeout_ptr))));
+}
+
+// (signal handle, wait handle, mode, alertable, timeout): an event set, a
+// semaphore released by one or a mutant released, then the wait (Xenia's
+// XObject::SignalAndWait). The two are not one atomic step here: another
+// thread may run between them, which a waiter cannot tell from being
+// scheduled late.
+XF_EXPORT(xboxkrnl, NtSignalAndWaitForSingleObjectEx) {
+    uint32_t alertable = arg(k, c, 3), timeout_ptr = arg(k, c, 4);
+    Objects &o = objects(k);
+    Thread *t = current_thread();
+    Ref<Object> signal = o.lookup<Object>(arg(k, c, 0));
+    Ref<Object> wait = o.lookup<Object>(arg(k, c, 1));
+    if (!signal || !wait || !t) return result(c, X_STATUS_INVALID_HANDLE);
+    {
+        std::lock_guard<std::mutex> l(o.lock);
+        if (auto *e = dynamic_cast<Event *>(signal.get())) {
+            set_event(o, *e);
+        } else if (auto *s = dynamic_cast<Semaphore *>(signal.get())) {
+            if (int64_t(s->signal_state()) + 1 > s->limit()) return result(c, X_STATUS_SEMAPHORE_LIMIT_EXCEEDED);
+            s->set_signal_state(s->signal_state() + 1);
+            o.signaled(*s);
+        } else if (auto *m = dynamic_cast<Mutant *>(signal.get())) {
+            if (m->owner_thread != t) return result(c, X_STATUS_MUTANT_NOT_OWNED);
+            m->set_signal_state(m->signal_state() + 1);
+            if (m->signal_state() > 0) {
+                m->set_owner(nullptr);
+                o.signaled(*m);
+            }
+        } else {
+            return result(c, X_STATUS_OBJECT_TYPE_MISMATCH);
+        }
+    }
+    if (!wait->dispatcher()) return result(c, X_STATUS_SUCCESS);
+    Dispatcher *objects[] = {static_cast<Dispatcher *>(wait.get())};
     result(c, finish_wait(o, *t, o.wait(*t, objects, false, alertable != 0, o.deadline(timeout_ptr))));
 }
 
