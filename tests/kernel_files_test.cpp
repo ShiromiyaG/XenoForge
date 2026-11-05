@@ -495,6 +495,18 @@ void content(ppc::Context &c) {
     CHECK(K->load32(K->load32(private_ptr)) == 0xFE && K->load32(K->load32(private_ptr) + 0x10) == 4);
     krnl(c, "ObDereferenceObject", {K->load32(private_ptr)});
     close(c, K->load32(handle));
+    // across titles (the running one here): XCONTENT_DATA_AGGREGATE, one a call
+    uint64_t xuid = user_at(*K, 0)->xuid;
+    CHECK(xam(c, "XamContentAggregateCreateEnumerator", {xuid, 7, 1, 0, handle}) == X_E_INVALIDARG);
+    CHECK(xam(c, "XamContentAggregateCreateEnumerator", {xuid, 1, 1, 0, handle}) == X_ERROR_SUCCESS);
+    uint32_t aggregate = alloc(0x148);
+    CHECK(xam(c, "XamEnumerate", {K->load32(handle), 0, aggregate, 0x148, returned, 0}) == X_ERROR_SUCCESS);
+    CHECK(K->load32(returned) == 1 && K->load32(aggregate) == 1 && K->load32(aggregate + 4) == 1 &&
+          guest_u16(*K, aggregate + 8) == u"Slot 1" &&
+          std::string(reinterpret_cast<const char *>(K->host(aggregate + 0x108))) == "slot1" &&
+          K->load32(aggregate + 0x140) == xam(c, "XamGetCurrentTitleId", {}));
+    CHECK(xam(c, "XamEnumerate", {K->load32(handle), 0, aggregate, 0x148, returned, 0}) == X_ERROR_NO_MORE_FILES);
+    close(c, K->load32(handle));
 
     // the creator: the user
     uint32_t is_creator = alloc(4), creator = alloc(8);

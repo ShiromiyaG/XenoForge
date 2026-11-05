@@ -34,6 +34,7 @@ constexpr uint32_t X_ERROR_FILE_NOT_FOUND = 0x2;
 constexpr uint32_t X_ERROR_PATH_NOT_FOUND = 0x3;
 constexpr uint32_t X_ERROR_ACCESS_DENIED = 0x5;
 constexpr uint32_t X_ERROR_INVALID_HANDLE = 0x6;
+constexpr uint32_t X_ERROR_NOT_ENOUGH_MEMORY = 0x8;
 constexpr uint32_t X_ERROR_NO_MORE_FILES = 0x12;
 constexpr uint32_t X_ERROR_NOT_SUPPORTED = 0x32;
 constexpr uint32_t X_ERROR_INVALID_PARAMETER = 0x57;

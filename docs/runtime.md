@@ -389,9 +389,23 @@ xam_input.cpp, xam_msg.cpp, xam_net.cpp), from Xenia's xam: one user signed
 in offline in slot 0 with Xenia's default profile settings; content as
 above; the notifications Xenia queues at start; the controllers from the
 drivers boot or the player installs ([input.md](input.md); none, every
-user disconnected, without one); the guide's UI answered headless; XMsg's apps offline; the network's start-up answers offline.
+user disconnected, without one); the guide's UI answered headless; XMsg's apps offline; the disc's media
+verification never failing; the network offline (below).
 Overlapped requests Xenia defers (25 ms, on a dispatch thread) complete at
 once here, before the export returns ERROR_IO_PENDING.
+
+The network is offline, as Xenia's answers make it: no Ethernet link, the
+title's address the loopback, DNS and QoS lookups failed at once. The
+sockets (xam_net.cpp) are the kernel's own objects with no host socket
+behind them (Xenia opens a host socket for each): a datagram socket binds,
+keeps its options, and has nothing to read (WSAEWOULDBLOCK, or a blocking
+read waits up to SO_RCVTIMEO); datagrams to the loopback or broadcast
+reach this title's sockets bound to that port, from 127.0.0.1, and those
+to anywhere else are sent and lost; a stream socket listens and never gets
+a connection, and connect fails at once. select, the WSA events and
+closesocket wake what waits, through the dispatcher. Gears of War 3 polled
+recvfrom on an unimplemented socket (an answer of 0, an empty datagram)
+and stalled its frame loop there; with these it goes on.
 
 ## `boot`
 

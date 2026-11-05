@@ -21,9 +21,10 @@
 // \Device\Content\<N> under the title's root name ("save:").
 //
 // Translated from Xenia (BSD; see LICENSE-xenia): xam_content.cc,
-// xam_content_device.cc, content_manager.cc, xcontent/xcontent.h,
-// xcontent_package.cc and xcontent_package_directory.cc, xenumerator.cc's
-// ContentEnumerator; checked against them. Where it differs, and why:
+// xam_content_aggregate.cc, xam_content_device.cc, content_manager.cc,
+// xcontent/xcontent.h, xcontent_package.cc and xcontent_package_directory.cc,
+// xenumerator.cc's ContentEnumerator; checked against them. Where it
+// differs, and why:
 //   - no SPA is read from the executable, so a new package's header has its
 //     display name in the English slot and no title name or thumbnails
 //     (Xenia puts the name in the SPA's default language and takes the
@@ -129,12 +130,12 @@ bool read_content_data(Kernel &k, uint32_t p, uint32_t size, ContentData &d) {
     d.display_name = guest_u16(k, p + 8, 128);
     const char *name = reinterpret_cast<const char *>(k.host(p + 0x108));
     d.file_name.assign(name, strnlen(name, FILE_NAME_SIZE));
-    if (size == AGGREGATE_SIZE) {
-        d.xuid = k.load64(p + 0x134);
-        d.title_id = k.load32(p + 0x13C);
-    } else if (size == INTERNAL_SIZE) {
+    // both: the XUID 8-aligned after XCONTENT_DATA's 0x134 bytes, then the title
+    if (size != CONTENT_DATA_SIZE) {
         d.xuid = k.load64(p + 0x138);
         d.title_id = k.load32(p + 0x140);
+    }
+    if (size == INTERNAL_SIZE) {
         d.license_mask = k.load32(p + 0x144);
         d.content_size = k.load64(p + 0x148);
     }
@@ -230,7 +231,7 @@ bool read_header(const std::filesystem::path &path, std::vector<uint8_t> &h, uin
         wr32(m + M_CONTENT_TYPE, rd32(a.data() + 4));
         wr32(m + M_DATA_FILE_COUNT, 1);
         wr32(m + M_VERSION, 2);
-        wr32(m + M_TITLE_ID, rd32(a.data() + 0x13C));
+        wr32(m + M_TITLE_ID, rd32(a.data() + 0x140));
         std::memcpy(m + M_DISPLAY_NAME, a.data() + 8, 0x100);
         std::memcpy(h.data() + FILE_NAME_AT, a.data() + 0x108, FILE_NAME_SIZE);
         license = rd32(a.data() + AGGREGATE_SIZE);
@@ -636,6 +637,52 @@ XF_EXPORT(xam, XamContentCreateEnumerator) {
         found.insert(found.end(), list.begin(), list.end());
     }
     for (const ContentData &d : found) write_content_data(e->append(), d);
+    k.store32(handle_out, e->handle());
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (xuid, device_id, content_type, title_id, handle_out), Xenia's
+// xam_content_aggregate.cc: the hard drive's content of the title (0: the
+// running one) and of the alternate titles its executable names, one item
+// a call, XCONTENT_DATA_AGGREGATE (0x148; XCONTENT_DATA, the XUID at 0x138,
+// the title at 0x140) or, for content type 0 (all), XCONTENT_DATA_INTERNAL
+XF_EXPORT(xam, XamContentAggregateCreateEnumerator) {
+    uint64_t xuid = arg64(k, c, 0);
+    uint32_t device_id = arg(k, c, 1), type = arg(k, c, 2), title = arg(k, c, 3), handle_out = arg(k, c, 4);
+    DeviceInfo info{};
+    bool known = device_id && device_info(k, device_id, info);
+    if ((device_id && !known) || !handle_out) return result(c, X_E_INVALIDARG);
+    uint32_t item_size = type == 0 ? INTERNAL_SIZE : AGGREGATE_SIZE;
+    // X_KENUMERATOR_CONTENT_AGGREGATE after it: Xenia's object signature and
+    // the handle
+    Ref<Enumerator> e = make_enumerator(k, USER_INDEX_ANY, 0xFE, 0x2000E, 0x20010, 0, 1, item_size, 8);
+    if (!e) return result(c, X_STATUS_NO_MEMORY);
+    k.store32(e->guest + 0x18, header::SIGNATURE);
+    k.store32(e->guest + 0x1C, e->handle());
+    if (!known || info.id == DEVICE_HDD) {
+        std::vector<uint32_t> titles{title ? title : title_id(k)};
+        if (const Xex *xex = k.xex()) {
+            for (const auto &[key, offset] : xex->opt_headers) {
+                if (key != xex_key::ALTERNATE_TITLE_IDS || offset + 4 > xex->header.size()) continue;
+                const uint8_t *p = xex->header.data() + offset;
+                uint32_t size = std::min<uint32_t>(rd32(p), uint32_t(xex->header.size() - offset));
+                for (uint32_t at = 4; at + 4 <= size; at += 4) titles.push_back(rd32(p + at));
+            }
+        }
+        for (uint32_t t : titles) {
+            for (const ContentData &d : list_content(k, xuid == ~0ull ? 0 : xuid, t, type)) {
+                uint8_t *p = e->append();
+                std::memset(p, 0, item_size);
+                write_content_data(p, d);
+                wr64(p + 0x138, d.xuid);
+                wr32(p + 0x140, d.title_id);
+                if (item_size == INTERNAL_SIZE) {
+                    wr32(p + 0x144, d.license_mask);
+                    wr64(p + 0x148, d.content_size);
+                }
+            }
+        }
+    }
     k.store32(handle_out, e->handle());
     result(c, X_ERROR_SUCCESS);
 }

@@ -324,8 +324,11 @@ Then, in order:
 2. The player presents the front buffer on the GPU (renderer.md,
    "Decisions"), instead of the picture read back at each swap.
 3. The other six games under the renderer, against Xenia's traces.
-4. The kernel families they reach first: Gears of War 3 polls NetDll_*
-   (the network offline), Reach asks for XCustomRegisterDynamicActions.
+4. The kernel families they reach first. Done for the first two: the
+   network offline (NetDll_*, XNet; Gears of War 3 polls its socket once a
+   frame and runs at 30 swaps a second) and XCustomRegisterDynamicActions
+   (Reach); runtime.md, "XAM". Next for those two: the XamShow*UI calls,
+   XamVoiceSetMicArrayIdleUsers (looked up, absent in Xenia too).
 5. A fiber scheduler of our own: fiber switches and longjmps now leave the
    frames they skip interpreted.
 6. The launcher (C2), the deterministic mode (A5), and the A2 leftovers

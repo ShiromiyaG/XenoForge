@@ -7,31 +7,319 @@
  ******************************************************************************
  */
 
-// XAM's network as the games see it at start, offline: Winsock started,
-// XNet started with no Ethernet link, the title's address the loopback.
-// Translated from Xenia (BSD; see LICENSE-xenia): xam_net.cc's answers for
-// these exports; checked against it. The sockets themselves (Xenia's host
-// sockets) are not here: no game has reached them yet, and they stay
-// counted as unimplemented until one does.
+// XAM's network, offline: Winsock and XNet started with no Ethernet link,
+// the title's address the loopback, and sockets that only reach each other.
+// Translated from Xenia (BSD; see LICENSE-xenia): xam_net.cc's exports and
+// xsocket.cc/xsocket.h's socket object and option codes; checked against
+// them.
+//
+// Where it differs from Xenia, and why:
+//   - the sockets are the kernel's own objects, with no host socket behind
+//     them (Xenia opens a host socket for each and passes every call to the
+//     host's Winsock). What Xenia's answers come to on a console with no
+//     network partner is kept: a datagram socket binds, takes its options,
+//     and finds nothing to read (WSAEWOULDBLOCK when non-blocking; a
+//     blocking read waits, up to SO_RCVTIMEO). Datagrams sent to the
+//     loopback (127.x.x.x) or broadcast are delivered to this title's
+//     sockets bound to that port, from 127.0.0.1 and the sender's port, as
+//     a host stack delivers them to itself; datagrams to anywhere else are
+//     counted as sent and dropped. A stream socket binds and listens, and
+//     never gets a connection; connect fails at once (WSAECONNREFUSED to
+//     the loopback, WSAENETUNREACH elsewhere) where a host socket would
+//     have tried the host's network;
+//   - what the guest reads back is big-endian as the guest lays it out
+//     (Xenia copies the host's sockaddr and option values as the host
+//     wrote them: getsockname's family and getsockopt's value come out
+//     little-endian, and getsockopt never updates the length);
+//   - select's timeout is the guest's (Xenia scales it to the host clock);
+//   - WSAWaitForMultipleEvents returns WSA_WAIT_EVENT_0 + n, WSA_WAIT_TIMEOUT
+//     or WSA_WAIT_IO_COMPLETION with its timeout in milliseconds, as
+//     Winsock (Xenia passes the milliseconds to the NT wait as an absolute
+//     time, so every timed wait ends at once, and returns 0 for any wake);
+//   - the errors a call meets are Winsock's own for the case (a second
+//     bind WSAEINVAL, a taken port WSAEADDRINUSE, a datagram longer than
+//     the buffer WSAEMSGSIZE...), where Xenia gets them from the host;
+//   - XNetLogonGetTitleID is not in Xenia (see it below).
+//
+// A socket ends with closesocket (its handle released then); a thread
+// blocked on it is woken with WSAEINTR, as Winsock does.
 
 #include "xam.h"
 
 #include <cstring>
+#include <deque>
+#include <map>
 #include <random>
+#include <vector>
 
 namespace xf::kernel {
 namespace {
 
-constexpr uint32_t X_WSAEINVAL = 0x2726, X_WSAEMSGSIZE = 0x2738;
+// Winsock's errors, as the console's Winsock numbers them (Xenia's X_WSAError
+// has the first five)
+constexpr uint32_t X_WSA_INVALID_PARAMETER = 0x57;
+constexpr uint32_t X_WSAEINTR = 10004, X_WSAEACCES = 10013, X_WSAEFAULT = 10014, X_WSAEINVAL = 10022;
+constexpr uint32_t X_WSAEWOULDBLOCK = 10035, X_WSAENOTSOCK = 10038, X_WSAEMSGSIZE = 10040;
+constexpr uint32_t X_WSAEPROTONOSUPPORT = 10043, X_WSAESOCKTNOSUPPORT = 10044, X_WSAEOPNOTSUPP = 10045;
+constexpr uint32_t X_WSAEAFNOSUPPORT = 10047, X_WSAEADDRINUSE = 10048, X_WSAENETUNREACH = 10051;
+constexpr uint32_t X_WSAENOBUFS = 10055;
+constexpr uint32_t X_WSAEISCONN = 10056, X_WSAENOTCONN = 10057, X_WSAETIMEDOUT = 10060;
+constexpr uint32_t X_WSAECONNREFUSED = 10061;
+constexpr uint32_t SOCKET_ERROR = 0xFFFFFFFF;
+
+// XSocket's enums and the option codes xsocket.cc translates
+constexpr uint32_t AF_INET = 2, SOCK_STREAM = 1, SOCK_DGRAM = 2;
+constexpr uint32_t IPPROTO_TCP = 6, IPPROTO_UDP = 17, IPPROTO_VDP = 254;
+constexpr uint32_t SOL_SOCKET = 0xFFFF;
+constexpr uint32_t SO_ACCEPTCONN = 0x0002, SO_REUSEADDR = 0x0004, SO_BROADCAST = 0x0020, SO_SNDBUF = 0x1001;
+constexpr uint32_t SO_RCVBUF = 0x1002, SO_RCVTIMEO = 0x1006, SO_ERROR = 0x1007, SO_TYPE = 0x1008;
+// the console's own: the socket's traffic unencrypted (Xenia's SetOption)
+constexpr uint32_t SO_INSECURE = 0x5801, SO_INSECURE_2 = 0x5802;
+constexpr uint32_t FIONBIO = 0x8004667E, FIONREAD = 0x4004667F;
+constexpr uint32_t MSG_PEEK = 0x2;
+constexpr uint32_t SOCKADDR_IN_SIZE = 0x10;
+constexpr uint32_t LOOPBACK = 0x7F000001, BROADCAST = 0xFFFFFFFF;
+constexpr uint16_t EPHEMERAL_FIRST = 49152;
+constexpr uint32_t MAX_DATAGRAM = 65507; // UDP over IPv4's largest payload
+
 constexpr uint32_t XNET_GET_XNADDR_STATIC = 0x4;
 constexpr uint32_t XNET_STARTUP_PARAMS_SIZE = 0xD;
+// XNetStartupParams' cfgSockDefaultRecvBufsizeInK and ...SendBufsizeInK
+constexpr uint32_t PARAM_RECV_BUF_K = 4, PARAM_SEND_BUF_K = 5;
+constexpr uint32_t DEFAULT_BUFFER_K = 16; // XNet's default for both
 
-struct NetState {
-    std::mutex mutex;
-    uint8_t startup_params[XNET_STARTUP_PARAMS_SIZE] = {};
+constexpr uint32_t WSA_WAIT_FAILED = 0xFFFFFFFF;
+
+// A socket (Xenia's XSocket), its state under the objects' lock.
+class Socket : public Object {
+  public:
+    explicit Socket(Objects &owner) : Object(owner, Type::Other) {}
+    struct Datagram {
+        uint32_t address;
+        uint16_t port;
+        std::vector<uint8_t> data;
+    };
+    uint32_t type = 0, protocol = 0;
+    bool nonblocking = false, listening = false, connected = false, closed = false;
+    bool bound = false;
+    uint32_t bound_address = 0, peer_address = 0;
+    uint16_t bound_port = 0, peer_port = 0;
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> options; // (level, name): the value setsockopt gave
+    std::deque<Datagram> queue;
+    size_t queued_bytes = 0;
+    // signaled while a read would not block (data queued, or closed)
+    Ref<Event> readable;
+
+    uint32_t option(uint32_t level, uint32_t name, uint32_t otherwise = 0) const {
+        auto it = options.find({level, name});
+        return it == options.end() ? otherwise : it->second;
+    }
+    bool datagram() const { return type == SOCK_DGRAM; }
 };
 
+struct NetState {
+    std::mutex mutex; // the startup parameters
+    uint8_t startup_params[XNET_STARTUP_PARAMS_SIZE] = {};
+    // the title's open sockets, each retained until closesocket, under the
+    // objects' lock (never released at the kernel's end: the objects outlive
+    // nothing here, as the handle table's own)
+    std::vector<Socket *> sockets;
+    uint16_t next_ephemeral = EPHEMERAL_FIRST;
+};
+
+uint32_t default_buffer(Kernel &k, uint32_t param) {
+    NetState &s = k.state<NetState>();
+    std::lock_guard<std::mutex> l(s.mutex);
+    uint32_t kb = s.startup_params[param];
+    return (kb ? kb : DEFAULT_BUFFER_K) * 1024;
+}
+
+// a socket call's failure: the error as the thread's last, SOCKET_ERROR
+void fail(Kernel &k, ppc::Context &c, uint32_t error) {
+    set_last_error(k, error);
+    result(c, SOCKET_ERROR);
+}
+
+// a socket by handle, not closed (another handle to it may outlive closesocket)
+Ref<Socket> socket_by_handle(Kernel &k, uint32_t handle) {
+    Objects &o = objects(k);
+    Ref<Socket> s = o.lookup<Socket>(handle);
+    if (!s) return s;
+    std::lock_guard<std::mutex> l(o.lock);
+    return s->closed ? Ref<Socket>() : s;
+}
+
+// the readable event follows the socket's state (lock held)
+void update_readable(Objects &o, Socket &s) {
+    bool now = !s.queue.empty() || s.closed;
+    if (now == (s.readable->signal_state() > 0)) return;
+    s.readable->set_signal_state(now ? 1 : 0);
+    if (now) o.signaled(*s.readable);
+}
+
+bool port_taken(NetState &n, const Socket &self, uint16_t port) {
+    for (const Socket *s : n.sockets)
+        if (s != &self && !s->closed && s->bound && s->bound_port == port && s->type == self.type) return true;
+    return false;
+}
+
+// binds to the next free ephemeral port, as a host stack does for a socket
+// that sends or connects unbound (lock held)
+void bind_implicitly(NetState &n, Socket &s) {
+    if (s.bound) return;
+    for (int tries = 0; tries < 16384; tries++) {
+        uint16_t port = n.next_ephemeral;
+        n.next_ephemeral = n.next_ephemeral == 0xFFFF ? EPHEMERAL_FIRST : uint16_t(n.next_ephemeral + 1);
+        if (!port_taken(n, s, port)) {
+            s.bound = true, s.bound_address = 0, s.bound_port = port;
+            return;
+        }
+    }
+}
+
+// whether a datagram sent to address stays on this console
+bool local_destination(uint32_t address) { return (address >> 24) == 127 || address == BROADCAST; }
+
+// a datagram from s to address:port: delivered to this title's sockets bound
+// there when the address is the loopback or broadcast, dropped otherwise
+// (lock held); the bytes sent, else the error
+uint32_t send_datagram(Kernel &k, Socket &s, uint32_t address, uint16_t port, const uint8_t *data, uint32_t length,
+                       uint32_t &error) {
+    if (address == BROADCAST && !s.option(SOL_SOCKET, SO_BROADCAST)) {
+        error = X_WSAEACCES;
+        return SOCKET_ERROR;
+    }
+    if (length > MAX_DATAGRAM) {
+        error = X_WSAEMSGSIZE;
+        return SOCKET_ERROR;
+    }
+    Objects &o = objects(k);
+    NetState &n = k.state<NetState>();
+    bind_implicitly(n, s);
+    if (!local_destination(address)) return length;
+    for (Socket *r : n.sockets) {
+        Socket &to = *r;
+        if (to.closed || !to.datagram() || !to.bound || to.bound_port != port) continue;
+        if (to.bound_address && to.bound_address != address && address != BROADCAST) continue;
+        if (to.connected && (to.peer_address != LOOPBACK || to.peer_port != s.bound_port)) continue;
+        uint32_t limit = to.option(SOL_SOCKET, SO_RCVBUF, default_buffer(k, PARAM_RECV_BUF_K));
+        if (to.queued_bytes + length > limit) continue; // the receiver's buffer is full: lost, as UDP loses it
+        to.queue.push_back({LOOPBACK, s.bound_port, std::vector<uint8_t>(data, data + length)});
+        to.queued_bytes += length;
+        update_readable(o, to);
+    }
+    return length;
+}
+
+// XSOCKADDR_IN (0x10): family, port, address big-endian, zeros
+void store_sockaddr(Kernel &k, uint32_t address, uint32_t ip, uint16_t port) {
+    k.store16(address + 0, uint16_t(AF_INET));
+    k.store16(address + 2, port);
+    k.store32(address + 4, ip);
+    std::memset(k.host(address + 8), 0, 8);
+}
+
+// waits, the lock released meanwhile, for the socket to become readable or
+// the deadline; false at the deadline
+bool wait_readable(Objects &o, Socket &s, uint64_t deadline) {
+    Thread *t = current_thread();
+    if (!t) return false;
+    Dispatcher *list[] = {s.readable.get()};
+    return o.wait(*t, list, false, false, deadline) != X_STATUS_TIMEOUT;
+}
+
+uint64_t deadline_ms(Objects &o, uint32_t ms) { return ms ? o.now() + uint64_t(ms) * 10000 : Scheduler::NEVER; }
+
+// recv and recvfrom: the first datagram queued (MSG_PEEK leaves it), waiting
+// for one when the socket blocks; its length, else the error
+uint32_t receive(Kernel &k, Socket &s, uint32_t buffer, uint32_t length, uint32_t flags, uint32_t from,
+                 uint32_t from_length_ptr, uint32_t &error) {
+    if (!s.datagram()) {
+        error = s.listening ? X_WSAEINVAL : X_WSAENOTCONN;
+        return SOCKET_ERROR;
+    }
+    if (from && from_length_ptr && k.load32(from_length_ptr) < SOCKADDR_IN_SIZE) {
+        error = X_WSAEFAULT;
+        return SOCKET_ERROR;
+    }
+    Objects &o = objects(k);
+    uint64_t deadline = Scheduler::NEVER;
+    bool deadline_set = false;
+    std::unique_lock<std::mutex> l(o.lock);
+    if (!s.bound) {
+        error = X_WSAEINVAL; // Winsock: a datagram socket reads only once bound
+        return SOCKET_ERROR;
+    }
+    for (;;) {
+        if (s.closed) {
+            error = X_WSAEINTR;
+            return SOCKET_ERROR;
+        }
+        if (!s.queue.empty()) break;
+        if (s.nonblocking) {
+            error = X_WSAEWOULDBLOCK;
+            return SOCKET_ERROR;
+        }
+        if (!deadline_set) deadline = deadline_ms(o, s.option(SOL_SOCKET, SO_RCVTIMEO)), deadline_set = true;
+        l.unlock();
+        bool woken = wait_readable(o, s, deadline);
+        l.lock();
+        if (!woken && s.queue.empty()) {
+            error = X_WSAETIMEDOUT;
+            return SOCKET_ERROR;
+        }
+    }
+    Socket::Datagram &d = s.queue.front();
+    uint32_t size = uint32_t(d.data.size()), copied = std::min(size, length);
+    if (copied) std::memcpy(k.host(buffer), d.data.data(), copied);
+    if (from) store_sockaddr(k, from, d.address, d.port);
+    if (from_length_ptr) k.store32(from_length_ptr, SOCKADDR_IN_SIZE);
+    if (!(flags & MSG_PEEK)) {
+        s.queued_bytes -= size;
+        s.queue.pop_front();
+        update_readable(o, s);
+    }
+    if (copied < size) { // the rest of the datagram is lost, as Winsock loses it
+        error = X_WSAEMSGSIZE;
+        return SOCKET_ERROR;
+    }
+    return size;
+}
+
+// ---- fd_set (x_fd_set: a count, 64 handles) ----
+
+constexpr uint32_t FD_SETSIZE = 64;
+
+struct SocketSet {
+    uint32_t address = 0;
+    std::vector<Ref<Socket>> sockets;
+};
+
+// the sockets a guest set names; false if one is not a socket
+bool load_set(Kernel &k, uint32_t address, SocketSet &set) {
+    set.address = address;
+    if (!address) return true;
+    uint32_t count = std::min(k.load32(address), FD_SETSIZE);
+    for (uint32_t i = 0; i < count; i++) {
+        Ref<Socket> s = socket_by_handle(k, k.load32(address + 4 + 4 * i));
+        if (!s) return false;
+        set.sockets.push_back(std::move(s));
+    }
+    return true;
+}
+
+// the sockets left in a set rewritten (Xenia's host_set::Store)
+void store_set(Kernel &k, const SocketSet &set, const std::vector<bool> &ready) {
+    if (!set.address) return;
+    uint32_t count = 0;
+    for (size_t i = 0; i < set.sockets.size(); i++)
+        if (ready[i]) k.store32(set.address + 4 + 4 * count++, set.sockets[i]->handle());
+    k.store32(set.address, count);
+}
+
 } // namespace
+
+// ---- Winsock ----
 
 // (caller, version, X_WSADATA *): Winsock 2.2
 XF_EXPORT(xam, NetDll_WSAStartup) {
@@ -48,6 +336,8 @@ XF_EXPORT(xam, NetDll_WSACleanup) { result(c, 0); }
 XF_EXPORT(xam, NetDll_WSAGetLastError) { result(c, last_error(k)); }
 XF_EXPORT(xam, NetDll_WSASetLastError) { set_last_error(k, arg(k, c, 0)); }
 
+// ---- XNet ----
+
 // (caller, XNetStartupParams *): kept for XNetGetOpt
 XF_EXPORT(xam, NetDll_XNetStartup) {
     if (uint32_t params = arg(k, c, 1)) {
@@ -59,6 +349,18 @@ XF_EXPORT(xam, NetDll_XNetStartup) {
 }
 
 XF_EXPORT(xam, NetDll_XNetCleanup) { result(c, 0); }
+
+// (machine_id_ptr): not logged on (X_ERROR_LOGON_NOT_LOGGED_ON)
+XF_EXPORT(xam, XNetLogonGetMachineID) {
+    if (uint32_t p = arg(k, c, 0)) k.store64(p, 0);
+    result(c, 0x80151802);
+}
+
+// (index): the running title's ID. Xenia has no implementation (its
+// undefined import leaves r3, the argument, as it is); the title's own ID
+// is what the name asks for, and Gears of War 3, the one caller seen, only
+// puts it in a Live request that fails earlier (no user signed in to Live).
+XF_EXPORT(xam, XNetLogonGetTitleID) { result(c, title_id(k)); }
 
 // (one, option, buffer, size_ptr): option 1, the startup parameters
 XF_EXPORT(xam, NetDll_XNetGetOpt) {
@@ -97,8 +399,72 @@ XF_EXPORT(xam, NetDll_XNetGetTitleXnAddr) {
     result(c, XNET_GET_XNADDR_STATIC);
 }
 
+// (caller, XNADDR *, machine_id_ptr): not signed in to Live
+XF_EXPORT(xam, NetDll_XNetXnAddrToMachineId) { result(c, 1); }
+// (caller, XNADDR *, XNKID *, IN_ADDR *) and its reverse: no secure
+// association to make offline
+XF_EXPORT(xam, NetDll_XNetXnAddrToInAddr) { result(c, 1); }
+XF_EXPORT(xam, NetDll_XNetInAddrToXnAddr) { result(c, 1); }
+
 // no cable
 XF_EXPORT(xam, NetDll_XNetGetEthernetLinkStatus) { result(c, 0); }
+
+// (caller, host, event, XNDNS **): an XNDNS (0x28) from the system heap
+// with a failed status, the event set at once
+XF_EXPORT(xam, NetDll_XNetDnsLookup) {
+    uint32_t event = arg(k, c, 2), dns_ptr = arg(k, c, 3);
+    if (dns_ptr) {
+        uint32_t dns = k.memory().system_alloc(0x28);
+        std::memset(k.host(dns), 0, 0x28);
+        k.store32(dns + 0, 1); // status: non-zero, an error
+        k.store32(dns_ptr, dns);
+    }
+    if (event) {
+        Objects &o = objects(k);
+        if (Ref<Event> e = o.lookup<Event>(event)) {
+            std::lock_guard<std::mutex> l(o.lock);
+            e->set_signal_state(1);
+            o.signaled(*e);
+        }
+    }
+    result(c, 0);
+}
+
+// (caller, XNDNS *)
+XF_EXPORT(xam, NetDll_XNetDnsRelease) {
+    uint32_t dns = arg(k, c, 1);
+    if (!dns) return result(c, X_STATUS_INVALID_PARAMETER);
+    k.memory().system_free(dns);
+    result(c, 0);
+}
+
+// (caller, flags, event, XNQOS **): an XNQOS (0x20) with nothing in it
+// (some games read it whatever the result), the event set at once
+XF_EXPORT(xam, NetDll_XNetQosServiceLookup) {
+    uint32_t event = arg(k, c, 2), qos_ptr = arg(k, c, 3);
+    if (qos_ptr) {
+        uint32_t qos = k.memory().system_alloc(0x20);
+        std::memset(k.host(qos), 0, 0x20);
+        k.store32(qos_ptr, qos);
+    }
+    if (event) {
+        Objects &o = objects(k);
+        if (Ref<Event> e = o.lookup<Event>(event)) {
+            std::lock_guard<std::mutex> l(o.lock);
+            e->set_signal_state(1);
+            o.signaled(*e);
+        }
+    }
+    result(c, 0);
+}
+
+// (caller, XNQOS *)
+XF_EXPORT(xam, NetDll_XNetQosRelease) {
+    uint32_t qos = arg(k, c, 1);
+    if (!qos) return result(c, X_STATUS_INVALID_PARAMETER);
+    k.memory().system_free(qos);
+    result(c, 0);
+}
 
 XF_EXPORT(xam, NetDll_XNetQosListen) { result(c, X_ERROR_FUNCTION_FAILED); }
 XF_EXPORT(xam, NetDll_XNetSetSystemLinkPort) { result(c, 1); }
@@ -133,6 +499,382 @@ XF_EXPORT(xam, NetDll_inet_addr) {
     if (n != 4) return result(c, 0xFFFFFFFF);
     // network order in guest memory, so big-endian as the guest reads it
     result(c, parts[0] << 24 | parts[1] << 16 | parts[2] << 8 | parts[3]);
+}
+
+// ---- WSA events: the kernel's manual-reset events ----
+
+XF_EXPORT(xam, NetDll_WSACreateEvent) {
+    Ref<Event> e = objects(k).create<Event>(GuestType::EventNotification, header::SIZE);
+    result(c, e ? e->handle() : 0);
+}
+
+// (event): TRUE, else FALSE with the error as the last
+XF_EXPORT(xam, NetDll_WSACloseEvent) {
+    Objects &o = objects(k);
+    uint32_t handle = arg(k, c, 0);
+    if (Ref<Event> e = o.lookup<Event>(handle)) {
+        std::lock_guard<std::mutex> l(o.lock);
+        if (o.release_handle(handle)) return result(c, 1);
+    }
+    set_last_error(k, X_ERROR_INVALID_HANDLE);
+    result(c, 0);
+}
+
+XF_EXPORT(xam, NetDll_WSASetEvent) {
+    Objects &o = objects(k);
+    Ref<Event> e = o.lookup<Event>(arg(k, c, 0));
+    if (!e) return set_last_error(k, X_ERROR_INVALID_HANDLE), result(c, 0);
+    std::lock_guard<std::mutex> l(o.lock);
+    e->set_signal_state(1);
+    o.signaled(*e);
+    result(c, 1);
+}
+
+XF_EXPORT(xam, NetDll_WSAResetEvent) {
+    Objects &o = objects(k);
+    Ref<Event> e = o.lookup<Event>(arg(k, c, 0));
+    if (!e) return set_last_error(k, X_ERROR_INVALID_HANDLE), result(c, 0);
+    std::lock_guard<std::mutex> l(o.lock);
+    e->set_signal_state(0);
+    result(c, 1);
+}
+
+// (count, events, wait_all, timeout_ms, alertable)
+XF_EXPORT(xam, NetDll_WSAWaitForMultipleEvents) {
+    uint32_t count = arg(k, c, 0), events = arg(k, c, 1), wait_all = arg(k, c, 2), timeout = arg(k, c, 3);
+    uint32_t alertable = arg(k, c, 4);
+    Objects &o = objects(k);
+    Thread *t = current_thread();
+    if (!t || !count || count > 64) return set_last_error(k, X_WSA_INVALID_PARAMETER), result(c, WSA_WAIT_FAILED);
+    std::vector<Ref<Event>> refs;
+    std::vector<Dispatcher *> list;
+    for (uint32_t i = 0; i < count; i++) {
+        refs.push_back(o.lookup<Event>(k.load32(events + 4 * i)));
+        if (!refs.back()) return set_last_error(k, X_ERROR_INVALID_HANDLE), result(c, WSA_WAIT_FAILED);
+        list.push_back(refs.back().get());
+    }
+    uint64_t deadline = timeout == 0xFFFFFFFF ? Scheduler::NEVER : o.now() + uint64_t(timeout) * 10000;
+    uint32_t status = o.wait(*t, list, wait_all != 0, alertable != 0, deadline);
+    if (status == X_STATUS_USER_APC) o.deliver_apcs(*t, 1);
+    result(c, status); // WSA_WAIT_EVENT_0 + n, WSA_WAIT_TIMEOUT, WSA_WAIT_IO_COMPLETION as NT's
+}
+
+// ---- sockets ----
+
+// (caller, af, type, protocol): a handle, else INVALID_SOCKET
+XF_EXPORT(xam, NetDll_socket) {
+    uint32_t af = arg(k, c, 1), type = arg(k, c, 2), protocol = arg(k, c, 3);
+    if (af != AF_INET) return fail(k, c, X_WSAEAFNOSUPPORT);
+    if (type != SOCK_STREAM && type != SOCK_DGRAM) return fail(k, c, X_WSAESOCKTNOSUPPORT);
+    bool fits = protocol == 0 ||
+                (type == SOCK_STREAM ? protocol == IPPROTO_TCP : protocol == IPPROTO_UDP || protocol == IPPROTO_VDP);
+    if (!fits) return fail(k, c, X_WSAEPROTONOSUPPORT);
+    Objects &o = objects(k);
+    Ref<Event> readable = o.create<Event>(GuestType::EventNotification, header::SIZE);
+    if (!readable) return fail(k, c, X_WSAENOBUFS);
+    Ref<Socket> s(new Socket(o));
+    s->type = type, s->protocol = protocol, s->readable = readable;
+    std::lock_guard<std::mutex> l(o.lock);
+    o.release_handle(readable->handle()); // the socket's own, waited on through it
+    uint32_t handle = o.add_handle(s.get());
+    s->retain();
+    k.state<NetState>().sockets.push_back(s.get());
+    result(c, handle);
+}
+
+// (caller, socket): its handle released; a thread blocked on it woken
+XF_EXPORT(xam, NetDll_closesocket) {
+    uint32_t handle = arg(k, c, 1);
+    Ref<Socket> s = socket_by_handle(k, handle);
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    s->closed = true;
+    s->queue.clear(), s->queued_bytes = 0;
+    update_readable(o, *s);
+    std::erase(k.state<NetState>().sockets, s.get());
+    s->release(); // the registry's (the Ref here keeps it until the export returns)
+    o.release_handle(handle);
+    result(c, 0);
+}
+
+// (caller, socket, how)
+XF_EXPORT(xam, NetDll_shutdown) {
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    if (!s->connected) return fail(k, c, X_WSAENOTCONN);
+    result(c, 0);
+}
+
+// (caller, socket, level, name, value, length): kept, read back by getsockopt
+XF_EXPORT(xam, NetDll_setsockopt) {
+    uint32_t level = arg(k, c, 2), name = arg(k, c, 3), value = arg(k, c, 4), length = arg(k, c, 5);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    if (level == SOL_SOCKET && (name == SO_INSECURE || name == SO_INSECURE_2)) return result(c, 0);
+    if (!value || length == 0) return fail(k, c, X_WSAEFAULT);
+    // an int, or a BOOL the console's Winsock takes as a byte as well
+    uint32_t v = length >= 4 ? k.load32(value) : k.host(value)[0];
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    s->options[{level, name}] = v;
+    result(c, 0);
+}
+
+// (caller, socket, level, name, value, length_ptr): an int, big-endian
+XF_EXPORT(xam, NetDll_getsockopt) {
+    uint32_t level = arg(k, c, 2), name = arg(k, c, 3), value = arg(k, c, 4), length_ptr = arg(k, c, 5);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    if (!value || !length_ptr || k.load32(length_ptr) < 4) return fail(k, c, X_WSAEFAULT);
+    Objects &o = objects(k);
+    uint32_t v;
+    {
+        std::lock_guard<std::mutex> l(o.lock);
+        if (level == SOL_SOCKET && name == SO_TYPE)
+            v = s->type;
+        else if (level == SOL_SOCKET && name == SO_ACCEPTCONN)
+            v = s->listening;
+        else if (level == SOL_SOCKET && name == SO_ERROR)
+            v = 0;
+        else if (level == SOL_SOCKET && name == SO_RCVBUF)
+            v = s->option(level, name, default_buffer(k, PARAM_RECV_BUF_K));
+        else if (level == SOL_SOCKET && name == SO_SNDBUF)
+            v = s->option(level, name, default_buffer(k, PARAM_SEND_BUF_K));
+        else
+            v = s->option(level, name);
+    }
+    k.store32(value, v);
+    k.store32(length_ptr, 4);
+    result(c, 0);
+}
+
+// (caller, socket, command, arg): FIONBIO and FIONREAD
+XF_EXPORT(xam, NetDll_ioctlsocket) {
+    uint32_t command = arg(k, c, 2), argp = arg(k, c, 3);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    if (!argp) return fail(k, c, X_WSAEFAULT);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    if (command == FIONBIO)
+        s->nonblocking = k.load32(argp) != 0;
+    else if (command == FIONREAD)
+        k.store32(argp, uint32_t(s->queued_bytes));
+    else
+        return fail(k, c, X_WSAEINVAL);
+    result(c, 0);
+}
+
+// (caller, socket, XSOCKADDR_IN *, length): port 0 an ephemeral one
+XF_EXPORT(xam, NetDll_bind) {
+    uint32_t name = arg(k, c, 2), length = arg(k, c, 3);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    if (!name || length < SOCKADDR_IN_SIZE) return fail(k, c, X_WSAEFAULT);
+    if (k.load16(name) != AF_INET) return fail(k, c, X_WSAEAFNOSUPPORT);
+    uint16_t port = k.load16(name + 2);
+    uint32_t address = k.load32(name + 4);
+    Objects &o = objects(k);
+    NetState &n = k.state<NetState>();
+    std::lock_guard<std::mutex> l(o.lock);
+    if (s->bound) return fail(k, c, X_WSAEINVAL);
+    if (port) {
+        if (port_taken(n, *s, port) && !s->option(SOL_SOCKET, SO_REUSEADDR)) return fail(k, c, X_WSAEADDRINUSE);
+        s->bound = true, s->bound_port = port;
+    } else {
+        bind_implicitly(n, *s);
+    }
+    s->bound_address = address;
+    result(c, 0);
+}
+
+// (caller, socket, XSOCKADDR *, length): a datagram socket's default peer;
+// a stream socket finds nobody (see the top)
+XF_EXPORT(xam, NetDll_connect) {
+    uint32_t name = arg(k, c, 2), length = arg(k, c, 3);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    if (!name || length < SOCKADDR_IN_SIZE) return fail(k, c, X_WSAEFAULT);
+    if (k.load16(name) != AF_INET) return fail(k, c, X_WSAEAFNOSUPPORT);
+    uint16_t port = k.load16(name + 2);
+    uint32_t address = k.load32(name + 4);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    if (s->listening) return fail(k, c, X_WSAEINVAL);
+    if (!s->datagram()) {
+        if (s->connected) return fail(k, c, X_WSAEISCONN);
+        return fail(k, c, local_destination(address) ? X_WSAECONNREFUSED : X_WSAENETUNREACH);
+    }
+    bind_implicitly(k.state<NetState>(), *s);
+    s->connected = address != 0;
+    s->peer_address = address, s->peer_port = port;
+    result(c, 0);
+}
+
+// (caller, socket, backlog)
+XF_EXPORT(xam, NetDll_listen) {
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    if (s->datagram()) return fail(k, c, X_WSAEOPNOTSUPP);
+    if (!s->bound) return fail(k, c, X_WSAEINVAL);
+    s->listening = true;
+    result(c, 0);
+}
+
+// (caller, socket, XSOCKADDR *, length_ptr): no connection ever comes; a
+// blocking accept waits until the socket is closed
+XF_EXPORT(xam, NetDll_accept) {
+    uint32_t addr = arg(k, c, 2);
+    if (!addr) return fail(k, c, X_WSAEFAULT); // as Xenia's
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    Objects &o = objects(k);
+    {
+        std::lock_guard<std::mutex> l(o.lock);
+        if (!s->listening) return fail(k, c, X_WSAEINVAL);
+        if (s->nonblocking) return fail(k, c, X_WSAEWOULDBLOCK);
+    }
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> l(o.lock);
+            if (s->closed) break;
+        }
+        if (!current_thread()) return fail(k, c, X_WSAEWOULDBLOCK);
+        wait_readable(o, *s, Scheduler::NEVER);
+    }
+    fail(k, c, X_WSAEINTR);
+}
+
+// (caller, nfds, readfds, writefds, exceptfds, timeval *): the sockets
+// ready in each set (a datagram socket is always writable; nothing is ever
+// exceptional), waiting up to the timeout for one to become readable
+XF_EXPORT(xam, NetDll_select) {
+    uint32_t timeout = arg(k, c, 5);
+    SocketSet sets[3];
+    for (int i = 0; i < 3; i++)
+        if (!load_set(k, arg(k, c, 2 + i), sets[i])) return fail(k, c, X_WSAENOTSOCK);
+    if (sets[0].sockets.empty() && sets[1].sockets.empty() && sets[2].sockets.empty())
+        return fail(k, c, X_WSAEINVAL); // nothing to wait for: Winsock's answer
+    Objects &o = objects(k);
+    uint64_t deadline = Scheduler::NEVER;
+    if (timeout) {
+        // timeval: tv_sec, tv_usec
+        uint64_t us = uint64_t(int32_t(k.load32(timeout))) * 1000000 + uint64_t(int32_t(k.load32(timeout + 4)));
+        deadline = o.now() + us * 10;
+    }
+    std::vector<bool> ready[3];
+    for (;;) {
+        uint32_t total = 0;
+        std::vector<Dispatcher *> waits;
+        {
+            std::lock_guard<std::mutex> l(o.lock);
+            for (int i = 0; i < 3; i++) {
+                ready[i].assign(sets[i].sockets.size(), false);
+                for (size_t n = 0; n < sets[i].sockets.size(); n++) {
+                    Socket &s = *sets[i].sockets[n];
+                    bool r = i == 0 ? !s.queue.empty() || s.closed : i == 1 ? s.datagram() || s.connected : false;
+                    ready[i][n] = r;
+                    total += r;
+                    waits.push_back(s.readable.get());
+                }
+            }
+        }
+        Thread *t = current_thread();
+        if (total || (timeout && o.now() >= deadline) || !t) {
+            for (int i = 0; i < 3; i++) store_set(k, sets[i], ready[i]);
+            return result(c, total);
+        }
+        o.wait(*t, waits, false, false, deadline);
+    }
+}
+
+// (socket, x_fd_set *): whether the set names the socket
+XF_EXPORT(xam, NetDll___WSAFDIsSet) {
+    uint32_t handle = arg(k, c, 0), set = arg(k, c, 1);
+    uint32_t count = std::min(k.load32(set), FD_SETSIZE);
+    for (uint32_t i = 0; i < count; i++)
+        if (k.load32(set + 4 + 4 * i) == handle) return result(c, 1);
+    result(c, 0);
+}
+
+// (caller, socket, buffer, length, flags)
+XF_EXPORT(xam, NetDll_recv) {
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    bool connected;
+    {
+        std::lock_guard<std::mutex> l(objects(k).lock);
+        connected = s->connected;
+    }
+    if (s->datagram() && !connected) return fail(k, c, X_WSAENOTCONN);
+    uint32_t error = 0;
+    uint32_t n = receive(k, *s, arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), 0, 0, error);
+    if (n == SOCKET_ERROR) return fail(k, c, error);
+    result(c, n);
+}
+
+// (caller, socket, buffer, length, flags, XSOCKADDR_IN *from, from_length_ptr)
+XF_EXPORT(xam, NetDll_recvfrom) {
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    uint32_t error = 0;
+    uint32_t n = receive(k, *s, arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), arg(k, c, 5), arg(k, c, 6), error);
+    if (n == SOCKET_ERROR) return fail(k, c, error);
+    result(c, n);
+}
+
+// (caller, socket, buffer, length, flags): to a datagram socket's peer
+XF_EXPORT(xam, NetDll_send) {
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    if (!s->connected) return fail(k, c, X_WSAENOTCONN);
+    uint32_t error = 0, buffer = arg(k, c, 2), length = arg(k, c, 3);
+    uint32_t n = send_datagram(k, *s, s->peer_address, s->peer_port, k.host(buffer), length, error);
+    if (n == SOCKET_ERROR) return fail(k, c, error);
+    result(c, n);
+}
+
+// (caller, socket, buffer, length, flags, XSOCKADDR_IN *to, to_length)
+XF_EXPORT(xam, NetDll_sendto) {
+    uint32_t buffer = arg(k, c, 2), length = arg(k, c, 3), to = arg(k, c, 5), to_length = arg(k, c, 6);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    if (!s->datagram()) return fail(k, c, X_WSAENOTCONN);
+    uint32_t address = s->peer_address;
+    uint16_t port = s->peer_port;
+    if (to) {
+        if (to_length < SOCKADDR_IN_SIZE) return fail(k, c, X_WSAEFAULT);
+        address = k.load32(to + 4), port = k.load16(to + 2);
+    } else if (!s->connected) {
+        return fail(k, c, X_WSAENOTCONN);
+    }
+    uint32_t error = 0;
+    uint32_t n = send_datagram(k, *s, address, port, k.host(buffer), length, error);
+    if (n == SOCKET_ERROR) return fail(k, c, error);
+    result(c, n);
+}
+
+// (caller, socket, XSOCKADDR_IN *, length_ptr): where it is bound
+XF_EXPORT(xam, NetDll_getsockname) {
+    uint32_t name = arg(k, c, 2), length_ptr = arg(k, c, 3);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    if (!name || !length_ptr || k.load32(length_ptr) < SOCKADDR_IN_SIZE) return fail(k, c, X_WSAEFAULT);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    if (!s->bound) return fail(k, c, X_WSAEINVAL);
+    store_sockaddr(k, name, s->bound_address, s->bound_port);
+    k.store32(length_ptr, SOCKADDR_IN_SIZE);
+    result(c, 0);
 }
 
 } // namespace xf::kernel

@@ -10,11 +10,11 @@
 
 // XAM's shared parts (xam.h) and its small exports: the notifications, the
 // loader, the title's information, XamAlloc, the enumerators, the tasks,
-// voice and sessions. Translated from Xenia (BSD; see LICENSE-xenia):
-// kernel_state.cc, xnotifylistener.cc, xenumerator.cc, xam_state.cc,
-// profile_manager.cc (FindProfiles), xam_notify.cc, xam_info.cc,
-// xam_module.cc, xam_enum.cc, xam_task.cc, xam_voice.cc and xam_user.cc
-// (sessions); checked against them.
+// voice, sessions and the media verification. Translated from Xenia (BSD;
+// see LICENSE-xenia): kernel_state.cc, xnotifylistener.cc, xenumerator.cc,
+// xam_state.cc, profile_manager.cc (FindProfiles), xam_notify.cc,
+// xam_info.cc, xam_module.cc, xam_enum.cc, xam_task.cc, xam_voice.cc,
+// xam_user.cc (sessions) and xam_media.cc; checked against them.
 //
 // Where it differs from Xenia, and why:
 //   - deferred overlapped requests run at once, on the calling thread
@@ -341,6 +341,40 @@ XF_EXPORT(xam, XamGetExecutionId) {
 // Xenia's: 0, so games take the oldest system's paths
 XF_EXPORT(xam, XamGetSystemVersion) { result(c, 0); }
 XF_EXPORT(xam, XamGetCurrentTitleId) { result(c, title_id(k)); }
+
+// the guide's custom actions: nothing to register with no guide (Xenia's
+// stub, which returns nothing)
+XF_EXPORT(xam, XCustomRegisterDynamicActions) {}
+
+// ---- the disc's media verification (xam_media.cc): nothing ever fails ----
+
+// (creation_flags)
+XF_EXPORT(xam, XamMediaVerificationCreate) { result(c, X_ERROR_SUCCESS); }
+
+// (r3, overlapped, callback): the callback queued to the calling thread as
+// a user APC with no arguments (the overlapped untouched, as Xenia's)
+XF_EXPORT(xam, XamMediaVerificationVerify) {
+    uint32_t callback = arg(k, c, 2) & ~1u;
+    if (callback) {
+        if (Thread *t = current_thread()) {
+            Objects &o = objects(k);
+            std::lock_guard<std::mutex> l(o.lock);
+            o.queue_user_apc(*t, callback, 0, 0, 0);
+        }
+    }
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (X_SECURITY_FAILURE_INFORMATION *: size, failed reads, failed hashes,
+// blocks checked, total blocks, complete): none failed, complete
+XF_EXPORT(xam, XamMediaVerificationFailedBlocks) {
+    if (uint32_t info = arg(k, c, 0)) {
+        if (k.load32(info) != 0x18) return result(c, X_ERROR_NOT_ENOUGH_MEMORY);
+        for (uint32_t offset = 4; offset < 0x14; offset += 4) k.store32(info + offset, 0);
+        k.store32(info + 0x14, 1);
+    }
+    result(c, X_ERROR_SUCCESS);
+}
 
 // (flags, size, out_ptr): from the system heap, as Xenia's
 XF_EXPORT(xam, XamAlloc) {
