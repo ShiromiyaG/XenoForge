@@ -6,4 +6,6 @@ build/
 *.xexp
 *.bin
 re/
-.claude/
+# Claude Code's local state (worktrees, settings); its agent definitions are versioned
+.claude/*
+!.claude/agents/
