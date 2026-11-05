@@ -190,16 +190,16 @@ XF_OP(lwaux) {
 }
 XF_OP(lwax) { c.r[i.X.RT] = load_s32(c, uint32_t(ea_x(c, i))); }
 
-XF_OP(lwz) { c.r[i.D.RT] = load32(c, uint32_t(ea_d(c, i))); }
+XF_OP(lwz) { c.r[i.D.RT] = load32_io(c, i.D.RA, uint32_t(ea_d(c, i))); }
 XF_OP(lwzu) {
     uint64_t ea = ea_du(c, i);
-    c.r[i.D.RT] = load32(c, uint32_t(ea)), c.r[i.D.RA] = ea;
+    c.r[i.D.RT] = load32_io(c, i.D.RA, uint32_t(ea)), c.r[i.D.RA] = ea;
 }
 XF_OP(lwzux) {
     uint64_t ea = ea_xu(c, i);
-    c.r[i.X.RT] = load32(c, uint32_t(ea)), c.r[i.X.RA] = ea;
+    c.r[i.X.RT] = load32_io(c, i.X.RA, uint32_t(ea)), c.r[i.X.RA] = ea;
 }
-XF_OP(lwzx) { c.r[i.X.RT] = load32(c, uint32_t(ea_x(c, i))); }
+XF_OP(lwzx) { c.r[i.X.RT] = load32_io(c, i.X.RA, uint32_t(ea_x(c, i))); }
 
 XF_OP(ld) { c.r[i.DS.RT] = load64(c, uint32_t(ea_ds(c, i))); }
 XF_OP(ldu) {
@@ -236,16 +236,16 @@ XF_OP(sthux) {
 }
 XF_OP(sthx) { store16(c, uint32_t(ea_x(c, i)), uint16_t(c.r[i.X.RT])); }
 
-XF_OP(stw) { store32(c, uint32_t(ea_d(c, i)), uint32_t(c.r[i.D.RT])); }
+XF_OP(stw) { store32_io(c, i.D.RA, uint32_t(ea_d(c, i)), uint32_t(c.r[i.D.RT])); }
 XF_OP(stwu) {
     uint64_t ea = ea_du(c, i);
-    store32(c, uint32_t(ea), uint32_t(c.r[i.D.RT])), c.r[i.D.RA] = ea;
+    store32_io(c, i.D.RA, uint32_t(ea), uint32_t(c.r[i.D.RT])), c.r[i.D.RA] = ea;
 }
 XF_OP(stwux) {
     uint64_t ea = ea_xu(c, i);
-    store32(c, uint32_t(ea), uint32_t(c.r[i.X.RT])), c.r[i.X.RA] = ea;
+    store32_io(c, i.X.RA, uint32_t(ea), uint32_t(c.r[i.X.RT])), c.r[i.X.RA] = ea;
 }
-XF_OP(stwx) { store32(c, uint32_t(ea_x(c, i)), uint32_t(c.r[i.X.RT])); }
+XF_OP(stwx) { store32_io(c, i.X.RA, uint32_t(ea_x(c, i)), uint32_t(c.r[i.X.RT])); }
 
 XF_OP(std) { store64(c, uint32_t(ea_ds(c, i)), c.r[i.DS.RT]); }
 XF_OP(stdu) {
@@ -261,10 +261,10 @@ XF_OP(stdx) { store64(c, uint32_t(ea_x(c, i)), c.r[i.X.RT]); }
 // ---- byte-reversed: memory's little-endian value, so no swap ----
 
 XF_OP(lhbrx) { c.r[i.X.RT] = __builtin_bswap16(load16(c, uint32_t(ea_x(c, i)))); }
-XF_OP(lwbrx) { c.r[i.X.RT] = __builtin_bswap32(load32(c, uint32_t(ea_x(c, i)))); }
+XF_OP(lwbrx) { c.r[i.X.RT] = __builtin_bswap32(load32_io(c, i.X.RA, uint32_t(ea_x(c, i)))); }
 XF_OP(ldbrx) { c.r[i.X.RT] = __builtin_bswap64(load64(c, uint32_t(ea_x(c, i)))); }
 XF_OP(sthbrx) { store16(c, uint32_t(ea_x(c, i)), __builtin_bswap16(uint16_t(c.r[i.X.RT]))); }
-XF_OP(stwbrx) { store32(c, uint32_t(ea_x(c, i)), __builtin_bswap32(uint32_t(c.r[i.X.RT]))); }
+XF_OP(stwbrx) { store32_io(c, i.X.RA, uint32_t(ea_x(c, i)), __builtin_bswap32(uint32_t(c.r[i.X.RT]))); }
 XF_OP(stdbrx) { store64(c, uint32_t(ea_x(c, i)), __builtin_bswap64(c.r[i.X.RT])); }
 
 // ---- multiple and string ----

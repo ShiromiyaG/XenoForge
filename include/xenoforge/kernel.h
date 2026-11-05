@@ -156,6 +156,18 @@ public:
     // whether library!name has an implementation
     static bool implemented(const std::string &library, const std::string &name);
 
+    // A device's registers (Xenia's AddVirtualMappedRange): the 32-bit
+    // loads and stores at an address where (address & mask) == base reach
+    // read and write (ppc_ops.h's MMIO). Added as the devices start, before
+    // guest threads run; one nobody answers for reads 0 and is logged once.
+    struct Mmio {
+        uint32_t base = 0, mask = 0;
+        uint32_t (*read)(void *device, uint32_t address) = nullptr;
+        void (*write)(void *device, uint32_t address, uint32_t value) = nullptr;
+        void *device = nullptr;
+    };
+    void add_mmio(const Mmio &range);
+
     // The guest's clock, as Xenia's Clock unscaled: the system time (a
     // FILETIME, 100 ns since 1601) from the host's at start, the interrupt
     // time (100 ns, monotonic), and the milliseconds since the start.
@@ -184,6 +196,8 @@ private:
     void run_import(ppc::Context &c, const Import &import);
     // a thunk add_thunk wrote (nullptr if none is at the address)
     const Import *find_thunk(uint32_t address) const;
+    const Mmio *find_mmio(uint32_t address) const;
+    void unanswered_mmio(const char *what, uint32_t address, uint32_t pc);
     template <class T> static const void *state_key() {
         static const char key = 0;
         return &key;
@@ -205,6 +219,7 @@ private:
     mutable std::shared_mutex thunks_mutex_;
     std::map<uint32_t, Import> thunks_;
     std::atomic<bool> has_thunks_{false};
+    std::vector<Mmio> mmio_;
     // destroyed after the objects and threads, before the rest
     std::mutex states_mutex_;
     std::map<const void *, std::shared_ptr<void>> states_;

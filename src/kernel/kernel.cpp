@@ -65,6 +65,20 @@ Kernel::Kernel(Memory &memory) : memory_(memory) {
     system_.call = [](ppc::Context &c, uint32_t target) {
         return static_cast<Kernel *>(c.system->owner)->try_call(c, target);
     };
+    system_.mmio_read = [](ppc::Context &c, uint32_t address) -> uint32_t {
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        if (const Mmio *m = k.find_mmio(address)) return m->read ? m->read(m->device, address) : 0;
+        k.unanswered_mmio("read", address, c.pc);
+        return 0;
+    };
+    system_.mmio_write = [](ppc::Context &c, uint32_t address, uint32_t value) {
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        if (const Mmio *m = k.find_mmio(address)) {
+            if (m->write) m->write(m->device, address, value);
+            return;
+        }
+        k.unanswered_mmio("write", address, c.pc);
+    };
     system_.unimplemented = [](ppc::Context &c, ppc::Opcode op, uint32_t code) {
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
         char reason[96];
@@ -134,6 +148,22 @@ const Import *Kernel::find_thunk(uint32_t address) const {
 
 // one clock, the scheduler's (100 ns since the kernel started): the
 // interrupt time; the system time is it plus the host's time at the start
+void Kernel::add_mmio(const Mmio &range) { mmio_.push_back(range); }
+
+const Kernel::Mmio *Kernel::find_mmio(uint32_t address) const {
+    for (const Mmio &m : mmio_)
+        if ((address & m.mask) == m.base) return &m;
+    return nullptr;
+}
+
+void Kernel::unanswered_mmio(const char *what, uint32_t address, uint32_t pc) {
+    std::lock_guard<std::mutex> l(counts_mutex_);
+    char key[48];
+    std::snprintf(key, sizeof(key), "mmio %s 0x%08X", what, address);
+    if (unimplemented_[key]++ == 0)
+        std::fprintf(stderr, "kernel: no device answers a %s at 0x%08X (from 0x%08X)\n", what, address, pc);
+}
+
 uint64_t Kernel::interrupt_time() const { return objects_->now(); }
 uint64_t Kernel::system_time() const { return objects_->system_time(); }
 uint32_t Kernel::uptime_ms() const { return uint32_t(std::min<uint64_t>(objects_->now() / 10'000, UINT32_MAX)); }

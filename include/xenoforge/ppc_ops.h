@@ -113,6 +113,34 @@ XF_INLINE void store64(Context &c, uint32_t ea, uint64_t v) {
     std::memcpy(host(c, ea), &v, 8);
 }
 
+// ---- MMIO: the devices' registers (the GPU's at 0x7FC80000) ----
+// Xenia catches an access there with a page fault and decodes its JIT's
+// 32-bit mov or movbe (cpu/mmio_handler.cc), the only form it handles: the
+// games reach the registers with lwz and stw. Here those check the address
+// and call the system's handlers; a base of r1 (the stack) or r13 (the
+// PCR) never points there, and with the word a constant the check is gone
+// for them.
+
+constexpr uint32_t MMIO_BEGIN = 0x7FC80000, MMIO_END = 0x80000000;
+XF_INLINE bool mmio(uint32_t ra, uint32_t ea) { return ra != 1 && ra != 13 && ea - MMIO_BEGIN < MMIO_END - MMIO_BEGIN; }
+[[gnu::cold, gnu::noinline]] inline uint32_t mmio_read(Context &c, uint32_t ea) {
+    return c.system && c.system->mmio_read ? c.system->mmio_read(c, ea) : 0;
+}
+[[gnu::cold, gnu::noinline]] inline void mmio_write(Context &c, uint32_t ea, uint32_t v) {
+    if (c.system && c.system->mmio_write) c.system->mmio_write(c, ea, v);
+}
+// a 32-bit load or store through base register ra
+XF_INLINE uint32_t load32_io(Context &c, uint32_t ra, uint32_t ea) {
+    if (mmio(ra, ea)) [[unlikely]]
+        return mmio_read(c, ea);
+    return load32(c, ea);
+}
+XF_INLINE void store32_io(Context &c, uint32_t ra, uint32_t ea, uint32_t v) {
+    if (mmio(ra, ea)) [[unlikely]]
+        return mmio_write(c, ea, v);
+    store32(c, ea, v);
+}
+
 // ---- the flags (ppc_hir_builder.cc) ----
 
 // UpdateCR: the result's low 32 bits against 0 (or two values), signed or

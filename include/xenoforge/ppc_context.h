@@ -42,6 +42,10 @@ struct System {
     // set): true if the system ran it (generated code, an import), so the
     // interpreter goes on after the call; false to interpret the callee.
     bool (*call)(Context &c, uint32_t target) = nullptr;
+    // A 32-bit load or store at the devices' registers (MMIO, 0x7FC80000
+    // and up; ppc_ops.h): what the device answers, what it is told.
+    uint32_t (*mmio_read)(Context &c, uint32_t address) = nullptr;
+    void (*mmio_write)(Context &c, uint32_t address, uint32_t value) = nullptr;
     void *owner = nullptr; // whoever set these up (the kernel)
 };
 
