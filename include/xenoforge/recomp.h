@@ -96,4 +96,9 @@ struct Discovery {
 
 Discovery discover(const Image &image);
 
+// A function's C++ (ppc_generated.h's form), named prefix + its address in
+// hex; what it calls is named the same way.
+std::string emit_function(const Image &image, const Discovery &d, const Function &f, const std::string &prefix);
+std::string function_name(const std::string &prefix, uint32_t address);
+
 } // namespace xf::recomp

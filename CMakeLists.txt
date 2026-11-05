@@ -43,6 +43,7 @@ add_library(xenoforge STATIC
     src/guest_space.cpp
     src/recomp_image.cpp
     src/recomp_discover.cpp
+    src/recomp_emit.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
@@ -127,6 +128,29 @@ endforeach()
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)
+# Xenia's PPC instruction tests recompiled by xfrecomp (when XF_PPC_TESTS_DIR
+# names them, assembled by tools/assemble_ppc_tests.sh) and run as ppc_test
+# runs them through the interpreter
+set(XF_PPC_TESTS_DIR "" CACHE PATH "Xenia's PPC instruction tests, assembled")
+if(XF_PPC_TESTS_DIR)
+    set(XF_PPC_TESTS_OUT ${CMAKE_CURRENT_BINARY_DIR}/ppc_tests)
+    set(XF_PPC_TESTS_SOURCES ${XF_PPC_TESTS_OUT}/ppc_tests_table.cpp)
+    foreach(n RANGE 15)
+        list(APPEND XF_PPC_TESTS_SOURCES ${XF_PPC_TESTS_OUT}/ppc_tests_${n}.cpp)
+    endforeach()
+    add_custom_command(
+        OUTPUT ${XF_PPC_TESTS_SOURCES}
+        COMMAND xfrecomp tests ${XF_PPC_TESTS_DIR} ${XF_PPC_TESTS_OUT} --files 16
+        DEPENDS xfrecomp
+        COMMENT "xfrecomp tests")
+    # generated code: optimized, without debug information (it is large)
+    set_source_files_properties(${XF_PPC_TESTS_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-g0")
+    add_executable(ppc_recompiled_test tests/ppc_test.cpp ${XF_PPC_TESTS_SOURCES})
+    target_compile_definitions(ppc_recompiled_test PRIVATE XF_PPC_RECOMPILED)
+    target_link_libraries(ppc_recompiled_test PRIVATE xenoforge)
+    add_test(NAME ppc_recompiled COMMAND ppc_recompiled_test)
+    set_tests_properties(ppc_recompiled PROPERTIES ENVIRONMENT "XF_PPC_TESTS=${XF_PPC_TESTS_DIR}")
+endif()
 add_executable(shader_compare_test tests/shader_compare_test.cpp)
 target_link_libraries(shader_compare_test PRIVATE xenoforge_vk)
 add_test(NAME shader_compare COMMAND shader_compare_test)

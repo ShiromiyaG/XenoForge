@@ -36,6 +36,9 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
   mesmo formato (comparar com `cmp`). Testes de instrução do Xenia montados por
   `bash tools/assemble_ppc_tests.sh ../rexglue-sdk/tools/binutils ../xenia-canary/src/xenia/cpu/ppc/testing
   ../external/ppc_tests` (566 montam; dcbz128, vpermwi128, vpkd3d128, vspltisw128 não montam com este binutils).
+  Rodar: `XF_PPC_TESTS=../external/ppc_tests build/ppc_test [filtros] [-v]` (interpretador) e, configurando com
+  `-DXF_PPC_TESTS_DIR=F:/RECOMPs/external/ppc_tests`, `build/ppc_recompiled_test` (os testes recompilados pelo
+  `xfrecomp tests`; ~1 min de build). Descoberta: `build/xfrecomp analyze <iso> --compare <*_init.cpp do rexglue>`.
 - O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando Chaves e Ben 10 até o XenoForge rodá-los.
   Não mexer nele por causa do XenoForge.
 - Nada derivado dos jogos entra aqui (ISOs, XEX, imagens, traces de GPU, dumps). Listas de nomes de funções do

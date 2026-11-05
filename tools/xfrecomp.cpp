@@ -1,4 +1,4 @@
-// xfrecomp: the recompiler's command (plan step A2). So far, discovery:
+// xfrecomp: the recompiler's command (plan step A2).
 //
 //   xfrecomp analyze <game.iso | default.xex> [--xex <path on the disc>]
 //            [--compare <rexglue's *_init.cpp>] [--functions <out.tsv>]
@@ -6,13 +6,21 @@
 // prints what discovery found by kind; --compare sets the function starts
 // against rexglue's PPCFuncMappings for the same executable; --functions
 // writes every function (address, size, source, name).
+//
+//   xfrecomp tests <assembled tests dir> <out dir> [--files N]
+//
+// recompiles Xenia's instruction tests (tools/assemble_ppc_tests.sh) into
+// out/ppc_tests_0..N-1.cpp and ppc_tests_table.cpp for ppc_recompiled_test:
+// every test label a function as long as the code up to the next label.
 
 #include "xenoforge/disc.h"
 #include "xenoforge/recomp.h"
 #include "xenoforge/xex.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <regex>
@@ -26,7 +34,8 @@ namespace {
 
 int usage() {
     std::fprintf(stderr, "usage: xfrecomp analyze <game.iso | default.xex> [--xex <path>] [--compare <init.cpp>] "
-                         "[--functions <out.tsv>]\n");
+                         "[--functions <out.tsv>]\n"
+                         "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n");
     return 2;
 }
 
@@ -48,9 +57,80 @@ bool load(const std::string &input, const std::string &xex_path, Xex &xex, std::
     return parse_xex(file, xex, error) && load_xex_image(file, xex, error);
 }
 
+std::vector<uint8_t> read_all(const std::filesystem::path &p) {
+    std::ifstream f(p, std::ios::binary);
+    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+int tests(const std::filesystem::path &dir, const std::filesystem::path &out, int files) {
+    namespace fs = std::filesystem;
+    constexpr uint32_t START = 0x80000000;
+    std::vector<fs::path> sources;
+    for (const auto &e : fs::directory_iterator(dir))
+        if (e.path().extension() == ".s" && fs::exists(fs::path(e.path()).replace_extension(".bin")))
+            sources.push_back(e.path());
+    std::sort(sources.begin(), sources.end());
+    fs::create_directories(out);
+    std::vector<std::string> bodies(files), declarations(files);
+    std::string table;
+    uint64_t functions = 0;
+    for (size_t k = 0; k < sources.size(); k++) {
+        std::string suite = sources[k].stem().string(), prefix = "t" + std::to_string(k) + "_";
+        recomp::Image image;
+        image.base = START;
+        image.bytes = read_all(fs::path(sources[k]).replace_extension(".bin"));
+        image.sections.push_back({".text", START, uint32_t(image.bytes.size()), true, false});
+        std::vector<uint32_t> labels;
+        std::ifstream m(fs::path(sources[k]).replace_extension(".map"));
+        std::string line;
+        while (std::getline(m, line)) {
+            size_t at = line.find(" t test_");
+            if (at != std::string::npos) labels.push_back(START + uint32_t(std::stoul(line.substr(0, at), nullptr, 16)));
+        }
+        std::sort(labels.begin(), labels.end());
+        labels.erase(std::unique(labels.begin(), labels.end()), labels.end());
+        for (size_t l = 0; l < labels.size(); l++) {
+            uint32_t end = l + 1 < labels.size() ? labels[l + 1] : START + uint32_t(image.bytes.size());
+            image.pdata.push_back({labels[l], end - labels[l], 0, false});
+        }
+        recomp::Discovery d = recomp::discover(image);
+        std::string &body = bodies[k % files], &decl = declarations[k % files];
+        body += "\n// " + suite + "\n";
+        for (const auto &[a, f] : d.functions) {
+            decl += "XF_FN(" + recomp::function_name(prefix, a) + ");\n";
+            body += recomp::emit_function(image, d, f, prefix);
+            table += "    {\"" + suite + "\", 0x" + recomp::function_name("", a) + "u, " + recomp::function_name(prefix, a) + "},\n";
+            functions++;
+        }
+    }
+    for (int n = 0; n < files; n++) {
+        std::ofstream f(out / ("ppc_tests_" + std::to_string(n) + ".cpp"));
+        f << "// Written by xfrecomp tests. Xenia's PPC instruction tests, recompiled.\n"
+             "#include \"xenoforge/ppc_generated.h\"\n\n"
+          << declarations[n] << bodies[n];
+    }
+    std::string all_declarations;
+    for (const std::string &d : declarations) all_declarations += d;
+    std::ofstream f(out / "ppc_tests_table.cpp");
+    f << "// Written by xfrecomp tests: every recompiled function of the tests, by suite and address.\n"
+         "#include \"xenoforge/ppc_generated.h\"\n#include <cstddef>\n\n"
+      << all_declarations
+      << "\nstruct XfTestFunction { const char *suite; uint32_t address; void (*fn)(xf::ppc::Context &); };\n"
+         "extern const XfTestFunction xf_test_functions[] = {\n"
+      << table << "};\nextern const size_t xf_test_function_count = " << functions << ";\n";
+    std::printf("%zu suites, %llu functions\n", sources.size(), (unsigned long long)functions);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
+    if (argc >= 4 && std::string(argv[1]) == "tests") {
+        int files = 16;
+        for (int k = 4; k + 1 < argc; k++)
+            if (std::string(argv[k]) == "--files") files = std::max(1, std::atoi(argv[k + 1]));
+        return tests(argv[2], argv[3], files);
+    }
     if (argc < 3 || std::string(argv[1]) != "analyze") return usage();
     std::string input = argv[2], xex_path = "default.xex", compare, functions_out;
     for (int k = 3; k < argc; k++) {

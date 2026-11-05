@@ -8,7 +8,10 @@
 //
 //   XF_PPC_TESTS=../external/ppc_tests build/ppc_test [name filters...] [-v]
 //
-// Without XF_PPC_TESTS there is nothing to run.
+// Without XF_PPC_TESTS there is nothing to run. Built with
+// XF_PPC_RECOMPILED (ppc_recompiled_test), each case calls the function
+// xfrecomp wrote for it instead of interpreting it, and dispatch() runs a
+// function of the same suite or the interpreter.
 
 #include "xenoforge/guest_space.h"
 #include "xenoforge/ppc_interp.h"
@@ -27,6 +30,32 @@
 
 namespace fs = std::filesystem;
 using namespace xf::ppc;
+
+#ifdef XF_PPC_RECOMPILED
+#include "xenoforge/ppc_generated.h"
+struct XfTestFunction {
+    const char *suite;
+    uint32_t address;
+    void (*fn)(Context &);
+};
+extern const XfTestFunction xf_test_functions[];
+extern const size_t xf_test_function_count;
+namespace {
+std::map<std::pair<std::string, uint32_t>, void (*)(Context &)> functions;
+std::string current_suite;
+bool missing = false;
+Opcode missing_op = Opcode::Invalid;
+} // namespace
+namespace xf::ppc {
+void dispatch(Context &c, uint32_t target) {
+    auto it = functions.find({current_suite, target});
+    if (it != functions.end()) return it->second(c);
+    Stopped s = interpret(c, target, uint32_t(c.lr), 1'000'000);
+    if (s.reason != Stopped::Returned) missing = true, missing_op = s.op;
+}
+void invalid(Context &, uint32_t) { missing = true, missing_op = Opcode::Invalid; }
+} // namespace xf::ppc
+#endif
 
 namespace {
 
@@ -176,6 +205,13 @@ int main(int argc, char **argv) {
     static uint64_t ticks = 0;
     System system;
     system.time_base = [](Context &) { return ++ticks; };
+#ifdef XF_PPC_RECOMPILED
+    for (size_t k = 0; k < xf_test_function_count; k++)
+        functions[{xf_test_functions[k].suite, xf_test_functions[k].address}] = xf_test_functions[k].fn;
+    system.unimplemented = [](Context &, Opcode op, uint32_t) {
+        if (!missing) missing = true, missing_op = op;
+    };
+#endif
 
     Totals totals;
     for (const fs::path &source : sources) {
@@ -220,7 +256,19 @@ int main(int argc, char **argv) {
                     std::memcpy(space.base() + address, bytes.data(), bytes.size());
                 }
             }
+#ifdef XF_PPC_RECOMPILED
+            current_suite = suite, missing = false;
+            Stopped stop;
+            auto fn = functions.find({suite, t.address});
+            if (fn != functions.end()) {
+                fn->second(c);
+                if (missing) stop = {Stopped::Unimplemented, t.address, missing_op};
+            } else {
+                stop = interpret(c, t.address, SENTINEL, 1'000'000);
+            }
+#else
             Stopped stop = interpret(c, t.address, SENTINEL, 1'000'000);
+#endif
             if (stop.reason == Stopped::Unimplemented || stop.reason == Stopped::Invalid) {
                 totals.unimplemented++, suite_missing++;
                 totals.missing[stop.reason == Stopped::Invalid ? "(invalid)" : info(stop.op).name]++;
