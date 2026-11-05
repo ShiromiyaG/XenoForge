@@ -47,6 +47,7 @@ add_library(xenoforge STATIC
     src/recomp_discover.cpp
     src/recomp_emit.cpp
     src/memory.cpp
+    src/gpu/command_processor.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
@@ -130,7 +131,7 @@ add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
-foreach(name aes disc xex lzx snappy ucode ucode_parse trace shader_interpreter texture ppc memory)
+foreach(name aes disc xex lzx snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
@@ -154,6 +155,12 @@ add_test(NAME kernel_threads COMMAND kernel_threads_test)
 # a rare deadlock seen once under load (2026-11-05, not reproduced in 36
 # runs since): fail instead of hanging the suite
 set_tests_properties(kernel_threads PROPERTIES TIMEOUT 120)
+# the video family: the GPU live through its exports, MMIO and threads
+add_executable(kernel_video_test tests/kernel_video_test.cpp)
+target_include_directories(kernel_video_test PRIVATE src/kernel)
+target_link_libraries(kernel_video_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME kernel_video COMMAND kernel_video_test)
+set_tests_properties(kernel_video PROPERTIES TIMEOUT 120) # threads: fail, never hang
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)

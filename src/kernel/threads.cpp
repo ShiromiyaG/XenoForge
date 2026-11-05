@@ -323,7 +323,9 @@ void Thread::body() {
         o.deliver_apcs(*this, 1); // the ones queued before it ran (Xenia's DeliverAPCs)
         // Xenia's Processor::Execute pads the stack by 64 + 112
         c.r[1] = stack_base - (64 + 112);
-        if (params.xapi_startup) {
+        if (params.host) {
+            params.host(*this, params.host_arg);
+        } else if (params.xapi_startup) {
             c.r[3] = params.start_address, c.r[4] = params.start_context;
             k.call(c, params.xapi_startup);
         } else {
@@ -462,10 +464,11 @@ std::string Kernel::thread_report() {
         const char *state = t->blocked == Thread::Blocked::Wait        ? "waiting"
                             : t->blocked == Thread::Blocked::Suspended ? "suspended"
                                                                        : "running";
-        char line[192];
-        std::snprintf(line, sizeof(line), "  thread %u%s (handle 0x%08X, start 0x%08X): %s, pc 0x%08X, lr 0x%08X\n",
-                      t->id, t->main ? " (main)" : "", t->self_handle, t->params.start_address, state, t->context->pc,
-                      uint32_t(t->context->lr));
+        char line[224];
+        std::snprintf(line, sizeof(line), "  thread %u%s%s%s (handle 0x%08X, start 0x%08X): %s, pc 0x%08X, lr 0x%08X\n",
+                      t->id, t->main ? " (main)" : "", t->params.name ? ", " : "",
+                      t->params.name ? t->params.name : "", t->self_handle, t->params.start_address, state,
+                      t->context->pc, uint32_t(t->context->lr));
         out += line;
     }
     return out;

@@ -12,8 +12,10 @@ anew, as lean as the games allow ([lean-kernel.md](lean-kernel.md)).
 in a 4 GB host range, so a guest address is an offset from the base (plus
 0x1000 at 0xE0000000 and above); heaps hand out pages as the kernel's
 allocators ask. The generated code and the interpreter reach memory through
-`ops::host`, which applies that offset. The GPU's registers (MMIO at
-0x7FC80000) come with the GPU's live front end.
+`ops::host`, which applies that offset. A 32-bit load or store at the
+devices' registers (0x7FC80000 and up) reaches the device that registered
+the range (`Kernel::add_mmio`): the GPU's, 0x7FC80000-0x7FC8FFFF, as Xenia
+maps them (see "The GPU").
 
 ## Code: generated, interpreted, imported
 
@@ -44,7 +46,10 @@ XF_EXPORT(xboxkrnl, NtAllocateVirtualMemory) {
 ```
 
 Arguments as Xenia's shims read them: r3-r10, then the stack at
-`r1 + 0x54 + 8 * (n - 8)`. Every call is counted by export; an import with
+`r1 + 0x54 + 8 * (n - 8)`: a 32-bit argument (`arg`) is the word there,
+where the caller's `stw` puts it (the games store VdSwap's ninth and tenth
+at 0x54 and 0x5C), a 64-bit one or a vararg (`arg64`) the doubleword.
+Every call is counted by export; an import with
 no implementation logs once, counts, and returns 0, and `boot` prints both
 lists: what the game calls is what gets written next.
 
@@ -106,11 +111,77 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
 - `Kernel::launch` makes the main thread (the executable's stack size and
   TLS header) and starts it; `boot` waits for it and reports the threads.
 
+## The GPU
+
+The video driver's side of the GPU, live and headless (plan step A4, "GPU
+live"): what the games' Direct3D needs to get through its initialization
+and run its frame loop, nothing drawn. Translated from Xenia
+(`graphics_system.cc`, `command_processor.cc`,
+`pm4_command_processor_implement.h`, `kernel_state.cc`'s
+EmulateCPInterruptDPC, `xboxkrnl_video.cc`, `xam_video.cc`); where it
+differs is noted at the top of each file.
+
+As built (`command_processor.h`, `src/gpu/command_processor.cpp`;
+`src/kernel/video.h`, `video.cpp`):
+
+- **The command processor** executes the ring buffer from its read pointer
+  to the CPU's CP_RB_WPTR, wrapping, and the indirect buffers it points at:
+  packet types 0-3 and every type-3 opcode Xenia's handles, with their
+  effects on the register file (0x5003 registers) and on physical memory:
+  fences (MEM_WRITE, EVENT_WRITE_SHD with a value or the vblank counter,
+  REG_TO_MEM, COND_WRITE), the scratch registers' write-back, the read
+  pointer's write-back after each run, COHER_STATUS_HOST, the gamma ramps,
+  occlusion query reports (Xenia's fake ones: no host queries here). No
+  kernel in it: memory, and a `Host` for the CPU interrupt and the wait
+  between two polls of a WAIT_REG_MEM.
+- **A `Sink`** takes what it does not do itself, in order, with the
+  register file as it stands: buffers' starts and ends, packets as they
+  run, memory read and written, shader loads, draws, resolves (a draw in
+  copy mode) and swaps. That is Xenia's backend (IssueDraw, IssueCopy,
+  IssueSwap, LoadShader) and its trace writer behind one interface; the
+  headless GPU is Xenia's null backend (every draw succeeds, no picture).
+- **The registers** answer the CPU's MMIO as Xenia's GraphicsSystem: reads
+  from the register file but for the five it answers itself (the EDRAM's
+  timing and controls, the vblank status, the 1280x720 viewport); writes
+  store, and CP_RB_WPTR wakes the command processor.
+- **Two kernel threads** run it, guest threads with a stack, a PCR and a
+  KTHREAD in the idle process whose body is host code
+  (`Thread::Params::host`, Xenia's XHostThread). "GPU commands" waits on an
+  auto-reset kernel event the CP_RB_WPTR writes set, then runs the ring
+  buffer. "GPU vblank" ticks 60 times a second on the scheduler's clock,
+  paced to a deadline (missed beats made up to a second behind), moving
+  D1MODE_V_COUNTER and the counter EVENT_WRITE_SHD can write. Both wait
+  through `Objects::wait`, so the deterministic mode will run them as it
+  runs the guest's. They start with the first call into the video driver
+  and stop with the kernel.
+- **The interrupt**: the callback VdSetGraphicsInterruptCallback names runs
+  on the thread that raised it (vblank: source 0 on CPU 2; INTERRUPT:
+  source 1 on each CPU of its mask), as EmulateCPInterruptDPC: the thread's
+  PCR moved to that CPU, at DISPATCH_LEVEL with DPC_ACTIVE set and the
+  title's process type in the DPC; the callback with r3 = source, r4 = its
+  data on the thread's own stack (`Objects::call` keeps the context); then
+  the PCR as it was. Interrupts on one CPU run one at a time.
+- **The exports**: the 21 Vd* the games import and xam's XGetVideoMode,
+  as Xenia's. The video mode comes from the console's settings, read
+  through ExGetXConfigSetting; VdSwap writes the front buffer's fetch
+  constant (its address made physical) to fetch constant 0 and Xenia's
+  XE_SWAP packet into the 64 words the caller set aside in the ring.
+
+The renderer (B3) replays traces through its own PM4 front end. Driven
+live, it becomes the command processor's Sink: shaders from `shader`,
+draws and resolves from `draw` and `resolve` with the register file the
+processor keeps (its own register tracking and packet parsing go), guest
+memory read where it lies (physical memory instead of the trace's copy,
+`memory_written` invalidating what it caches), the front buffer from
+`swap` and the gamma ramps from the processor. The same Sink with a trace
+writer behind it records Xenia's .xtr from a live game.
+
 ## `boot`
 
 `boot <game.iso> [--frames N] [--interpret]`: loads the game, runs its
 entry point, and prints the kernel calls (counts, unimplemented ones), the
-GPU's packets and swaps (the trace front end counting), and where it
+GPU's packets, draws, resolves, swaps (and swaps per second) and
+interrupts, and where it
 stopped.
 
 ## Order

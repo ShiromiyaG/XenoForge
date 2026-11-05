@@ -54,6 +54,11 @@ uint64_t arg64(Kernel &k, ppc::Context &c, int n) {
     return k.load64(uint32_t(c.r[1]) + 0x54 + uint32_t(n - 8) * 8);
 }
 
+uint32_t arg(Kernel &k, ppc::Context &c, int n) {
+    if (n < 8) return uint32_t(c.r[3 + n]);
+    return k.load32(uint32_t(c.r[1]) + 0x54 + uint32_t(n - 8) * 8);
+}
+
 Kernel::Kernel(Memory &memory) : memory_(memory) {
     system_.owner = this;
     system_.syscall = [](ppc::Context &c) {
@@ -94,9 +99,12 @@ Kernel::Kernel(Memory &memory) : memory_(memory) {
     // object types and KeTimeStampBundle
     setup_kernel(*this);
     objects_ = std::make_unique<Objects>(*this);
+    // the devices, before any guest thread runs
+    setup_video(*this);
 }
 
-Kernel::~Kernel() = default;
+// the devices' threads end while the objects they run on are still here
+Kernel::~Kernel() { shutdown_video(*this); }
 
 uint32_t Kernel::load32(uint32_t a) { return be32(host(a)); }
 uint16_t Kernel::load16(uint32_t a) { return be16(host(a)); }

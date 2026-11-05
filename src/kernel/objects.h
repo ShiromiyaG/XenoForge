@@ -316,6 +316,12 @@ public:
         uint32_t start_context = 0;
         uint32_t flags = 0;   // ExCreateThread's: bit 0 suspended, top byte the processor mask
         uint32_t process = 0; // the KPROCESS (0: the title's)
+        // A kernel thread whose body is host code (Xenia's XHostThread: the
+        // GPU's command processor and vblank), in place of a start address;
+        // it calls guest code on its own context (Objects::call).
+        void (*host)(Thread &self, void *arg) = nullptr;
+        void *host_arg = nullptr;
+        const char *name = nullptr; // for the thread report
     };
     // the guest side (stack, TLS, PCR, KTHREAD); X_STATUS
     uint32_t create(const Params &params);

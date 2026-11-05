@@ -3,7 +3,8 @@
 // the kernel makes (Kernel::launch: stack, PCR, KTHREAD, TLS, as Xenia's
 // XThread), runs the entry point (generated code where linked, else the
 // interpreter) and prints what the kernel saw: every export called and how
-// often, the ones with no implementation, the threads and where it stopped.
+// often, the ones with no implementation, the threads and where it stopped,
+// and what the GPU did (packets, draws, resolves, swaps, interrupts).
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N]
 
@@ -133,6 +134,8 @@ void print_report(kernel::Kernel &k) {
     auto missing = k.unimplemented();
     for (const auto &[n, name] : calls)
         std::printf("  %8llu  %s%s\n", (unsigned long long)n, name.c_str(), missing.count(name) ? "  (not implemented)" : "");
+    // what the GPU did: packets, draws, resolves, swaps, interrupts
+    std::printf("%s", kernel::video_report(k).c_str());
     std::fflush(stdout);
 }
 } // namespace

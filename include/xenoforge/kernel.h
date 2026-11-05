@@ -49,9 +49,14 @@ ExportFn find_export_fn(const char *library, const char *name);
 
 // ---- arguments and results, as Xenia's shim_utils ----
 
-// the n-th integer argument: r3-r10, then the stack at r1 + 0x54 + 8 * (n - 8)
+// the n-th integer argument: r3-r10, then the stack at r1 + 0x54 + 8 * (n - 8),
+// a doubleword there as varargs and 64-bit values are passed (Xenia's
+// get_arg_64)
 uint64_t arg64(Kernel &k, ppc::Context &c, int n);
-inline uint32_t arg(Kernel &k, ppc::Context &c, int n) { return uint32_t(arg64(k, c, n)); }
+// a 32-bit argument: on the stack, the word at that address, where the
+// caller's stw puts it (Xenia's get_arg_32; VdSwap's callers store its ninth
+// and tenth at 0x54 and 0x5C)
+uint32_t arg(Kernel &k, ppc::Context &c, int n);
 // a 32-bit result, sign-extended (SHIM_SET_RETURN_32)
 inline void result(ppc::Context &c, uint32_t v) { c.r[3] = uint64_t(int64_t(int32_t(v))); }
 
@@ -85,6 +90,15 @@ uint32_t title_process(Kernel &k);
 uint32_t system_process(Kernel &k);
 // a process's TLS (Xenia's SetProcessTLSVars): the slots free in its bitmap
 void set_process_tls(Kernel &k, uint32_t process, uint32_t slots, uint32_t data_size, uint32_t static_data);
+
+// The video family's parts (video.cpp). setup_video, as the kernel starts:
+// the GPU's registers as MMIO and its command processor (its threads start
+// with the first call into the video driver). shutdown_video, as the kernel
+// ends: those threads stopped and joined. video_report: what the GPU did
+// (packets, draws, resolves, swaps, interrupts), for boot.
+void setup_video(Kernel &k);
+void shutdown_video(Kernel &k);
+std::string video_report(Kernel &k);
 
 class Kernel {
 public:

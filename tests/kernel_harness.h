@@ -46,7 +46,9 @@ struct KernelHarness {
         return true;
     }
 
-    // the export's result (r3), the arguments past the eighth on the stack
+    // the export's result (r3), the arguments past the eighth on the stack as
+    // doublewords (varargs, 64-bit values); a fixed 32-bit argument there is
+    // a word at the slot's address (arg()), so a test of one stores it itself
     uint64_t call(const char *library, const char *name, std::initializer_list<uint64_t> args = {}) {
         std::string key = std::string(library) + "!" + name;
         auto it = thunks.find(key);
