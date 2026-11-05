@@ -201,6 +201,13 @@ Next: A2 and B1, side by side.
   vectors. The export tables are Xenia's files, unchanged.
 - 2026-11-04: the static libraries' approval sits in bits 5-6 of their flags
   byte (0x40 approved), not in the whole byte as Xenia's struct has it.
+- 2026-11-04: hedge-dev's XenonRecomp and XenosRecomp (MIT, cloned beside
+  in `../XenonRecomp` and `../XenosRecomp`) are references too, and their
+  MIT code may be taken where it helps, with their notice (`LICENSE-hedge-dev`
+  once something is taken). Not as the base: XenonRecomp decodes with GNU
+  binutils' disassembler (GPL v2+, `thirdparty/disasm`), which never enters
+  XenoForge, and both are built around one game (Sonic Unleashed). XenoForge
+  stays MIT, with Xenia's BSD notice on what is translated from it.
 
 ## Open
 

@@ -10,6 +10,9 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
 - C++20, CMake + Ninja + clang; namespace `xf`; estilo do `.clang-format` (4 espaços, 120 colunas).
   Build: `cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`,
   `cmake --build build`, `ctest --test-dir build`. Testes em `tests/` com o `CHECK` de `tests/check.h`.
+- **Referências MIT da hedge-dev**: `../XenonRecomp` e `../XenosRecomp` (clonados). Pode usar código deles quando
+  ajudar, com o aviso MIT no topo do arquivo e um `LICENSE-hedge-dev` na raiz quando algo for copiado. **Nunca** o
+  `thirdparty/disasm` do XenonRecomp (binutils, GPL). Eles referenciam o Xenia; o oráculo continua sendo o Xenia.
 - **Oráculo = `../xenia-canary`** (BSD), compilado em `build/bin/Windows/Release` com
   `-DXENIA_ENABLE_GPU_TRACE=ON -DXENIA_BUILD_MISC=ON` (preset `vs`; o `build/version.h` foi escrito à mão, como o
   `xb` faria). O `xenia_canary.exe` baixado (release) **não grava traces**. Traces e PNGs de referência ficam em
