@@ -312,18 +312,24 @@ traces, without a recompiled game.
 - **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work
   (`../Chaves/docs/native-renderer-re.md`) moved over as El Chavo Kart's port.
 
-Next (2026-11-05, later still): the player (C1) is in, so M1 is there as a
-person would see it; the renderer keeps up with both games (B4, above),
-so the player can switch to the front buffer on the GPU (renderer.md,
-"Decisions") instead of the picture read back at each swap. Earlier: the renderer
-runs live as the command processor's
-Sink, headless (`boot --render`); next the player (C1: the window and the
-presentation, input) for M1, and the renderer's speed (B4: draws batched
-into fewer submissions, resolves on the GPU). Generated tables per module
-and the other six games' code generated are in (A2, A4); left there: fiber
-switches and longjmps leave the rest of the frames they skip interpreted (a
-fiber scheduler of our own, as Xenia re-enters the thread, would keep them
-generated), and what each game asks of the kernel past 30 seconds.
+Next (2026-11-05, end of the day): M1 is there as a person would see it,
+unconfirmed by one. El Chavo Kart and Ben 10 run generated in the player,
+rendered at their caps (30 and 60 swaps a second, B4), with input and with
+XMA decoded as Xenia decodes it (A6). Waiting on a person at the screen:
+that a pad and the keyboard move things, and that the sound is right.
+
+Then, in order:
+1. Play both games through: what they ask of the kernel and the renderer
+   past the menus (races, levels, saves).
+2. The player presents the front buffer on the GPU (renderer.md,
+   "Decisions"), instead of the picture read back at each swap.
+3. The other six games under the renderer, against Xenia's traces.
+4. The kernel families they reach first: Gears of War 3 polls NetDll_*
+   (the network offline), Reach asks for XCustomRegisterDynamicActions.
+5. A fiber scheduler of our own: fiber switches and longjmps now leave the
+   frames they skip interpreted.
+6. The launcher (C2), the deterministic mode (A5), and the A2 leftovers
+   (exception funclets, `#line`, yield points).
 
 ## Decisions
 
