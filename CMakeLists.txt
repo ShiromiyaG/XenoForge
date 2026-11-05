@@ -38,6 +38,7 @@ add_library(xenoforge STATIC
     src/shader_container.cpp
     src/texture.cpp
     src/resolve.cpp
+    src/ppc.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
@@ -88,6 +89,8 @@ add_executable(xfshader tools/xfshader.cpp)
 target_link_libraries(xfshader PRIVATE xenoforge)
 add_executable(xfeffect tools/xfeffect.cpp)
 target_link_libraries(xfeffect PRIVATE xenoforge)
+add_executable(xfppc tools/xfppc.cpp)
+target_link_libraries(xfppc PRIVATE xenoforge)
 
 # stb_image and stb_image_write (public domain / MIT), for PNGs in the tools;
 # Xenia's copy unless STB_DIR says otherwise

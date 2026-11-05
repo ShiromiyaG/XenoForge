@@ -26,6 +26,13 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
 - **Renderizador (B3)**: `build/xfreplay <xtr> -o frame.png --compare <png do trace-dump> [--diff d.png] [-v]`;
   regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 10 frames batem com o Xenia).
   Saídas do replay em `../traces/replay/`. `XF_VK_VALIDATION=1` liga a validação do Vulkan.
+- **Recompilador (A2)**: desenho em `docs/recompiler.md`. Tabelas de `src/ppc/ppc-instructions.xml` (do Xenia,
+  sem mudança) via `python tools/ppc_gen.py` (gera `include/xenoforge/ppc_opcodes.inc`, `src/ppc/decode.inc`,
+  `src/ppc/disasm.inc`; commitados). Oráculo: `tools/xenia_oracle/build.bat` compila
+  `../external/oracle/ppc_oracle.exe` contra as libs do xenia-canary; `build/xfppc <arquivo> <base>` imprime no
+  mesmo formato (comparar com `cmp`). Testes de instrução do Xenia montados por
+  `bash tools/assemble_ppc_tests.sh ../rexglue-sdk/tools/binutils ../xenia-canary/src/xenia/cpu/ppc/testing
+  ../external/ppc_tests` (566 montam; dcbz128, vpermwi128, vpkd3d128, vspltisw128 não montam com este binutils).
 - O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando Chaves e Ben 10 até o XenoForge rodá-los.
   Não mexer nele por causa do XenoForge.
 - Nada derivado dos jogos entra aqui (ISOs, XEX, imagens, traces de GPU, dumps). Listas de nomes de funções do
