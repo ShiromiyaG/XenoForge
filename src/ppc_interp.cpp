@@ -42,28 +42,40 @@ Stopped interpret(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps) {
         switch (op) {
         case Opcode::bx: {
             uint32_t target = uint32_t(ops::exts26(i.I.LI << 2)) + (i.I.AA ? 0 : pc);
-            if (i.I.LK) c.lr = next;
+            if (i.I.LK) {
+                c.lr = next;
+                if (c.system && c.system->call && c.system->call(c, target)) break; // ran it: on after the call
+            }
             next = target;
             break;
         }
         case Opcode::bcx: {
             bool taken = ops::branch_condition(c, i.B.BO, i.B.BI);
             uint32_t target = uint32_t(ops::exts16(i.B.BD << 2)) + (i.B.AA ? 0 : pc);
-            if (i.B.LK) c.lr = next;
+            if (i.B.LK) {
+                c.lr = next;
+                if (taken && c.system && c.system->call && c.system->call(c, target)) break;
+            }
             if (taken) next = target;
             break;
         }
         case Opcode::bclrx: {
             bool taken = ops::branch_condition(c, i.XL.BO, i.XL.BI);
             uint32_t target = uint32_t(c.lr) & ~3u;
-            if (i.XL.LK) c.lr = next;
+            if (i.XL.LK) {
+                c.lr = next;
+                if (taken && c.system && c.system->call && c.system->call(c, target)) break;
+            }
             if (taken) next = target;
             break;
         }
         case Opcode::bcctrx: {
             bool taken = ops::branch_condition_ctr(c, i.XL.BO, i.XL.BI);
             uint32_t target = uint32_t(c.ctr) & ~3u;
-            if (i.XL.LK) c.lr = next;
+            if (i.XL.LK) {
+                c.lr = next;
+                if (taken && c.system && c.system->call && c.system->call(c, target)) break;
+            }
             if (taken) next = target;
             break;
         }

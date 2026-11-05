@@ -99,6 +99,16 @@ target_link_libraries(xfppc PRIVATE xenoforge)
 add_executable(xfrecomp tools/xfrecomp.cpp)
 target_link_libraries(xfrecomp PRIVATE xenoforge)
 
+# The kernel (step A4; docs/runtime.md): an object library, so every
+# export's registration (XF_EXPORT, a static initializer) is linked in.
+file(GLOB XF_KERNEL_SOURCES CONFIGURE_DEPENDS src/kernel/*.cpp)
+add_library(xenoforge_kernel OBJECT ${XF_KERNEL_SOURCES})
+target_link_libraries(xenoforge_kernel PUBLIC xenoforge)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/memory.cpp) # the guest memory, being written
+    add_executable(boot tools/boot.cpp)
+    target_link_libraries(boot PRIVATE xenoforge_kernel xenoforge)
+endif()
+
 # stb_image and stb_image_write (public domain / MIT), for PNGs in the tools;
 # Xenia's copy unless STB_DIR says otherwise
 if(NOT TARGET stb)

@@ -38,6 +38,11 @@ struct System {
     void (*trap)(Context &c, uint32_t address) = nullptr;     // a trap instruction that fired
     void (*unimplemented)(Context &c, Opcode op, uint32_t code) = nullptr;
     uint64_t (*time_base)(Context &c) = nullptr;              // mftb
+    // A call the interpreter is about to make (bl, bctrl, blrl; LR already
+    // set): true if the system ran it (generated code, an import), so the
+    // interpreter goes on after the call; false to interpret the callee.
+    bool (*call)(Context &c, uint32_t target) = nullptr;
+    void *owner = nullptr; // whoever set these up (the kernel)
 };
 
 struct alignas(64) Context {
