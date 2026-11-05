@@ -8,12 +8,13 @@
 //   0x00000000-0x3FFFFFFF  virtual, 4 KB pages
 //   0x40000000-0x7EFFFFFF  virtual, 64 KB pages
 //   0x7F000000-0x7FC7FFFF  GPU writeback and XPS (physical, 4 KB)
-//   0x7FC80000-0x7FFFFFFF  MMIO (the GPU's registers): not mapped here
+//   0x7FC80000-0x7FFFFFFF  MMIO (the GPU's registers): no access here
 //   0x80000000-0x8FFFFFFF  XEX images, 64 KB pages
-//   0x90000000-0x9FFFFFFF  XEX images, 4 KB pages
+//   0x90000000-0x9FFFFFFF  XEX images, 4 KB pages (the same host memory as
+//                          0x80000000, as Xenia maps it)
 //   0xA0000000-0xBFFFFFFF  physical, 64 KB pages
 //   0xC0000000-0xDFFFFFFF  physical, 16 MB pages
-//   0xE0000000-0xFFFFFFFF  physical, 4 KB pages
+//   0xE0000000-0xFFCFFFFF  physical, 4 KB pages (physical 0x1000 and up)
 //
 // Each range is a heap that hands out pages (reserve, commit, release,
 // protect, query) as the kernel's NtAllocateVirtualMemory,
@@ -78,7 +79,10 @@ public:
     // a physical address (0-0x1FFFFFFF) as the GPU and DMA see it
     virtual uint8_t *translate_physical(uint32_t physical) const = 0;
     // the physical address behind a guest address in a physical window
-    // (0xA0000000 and up, 0x7F000000); the address itself below
+    // (0xA0000000 and up, 0x7F000000); elsewhere what Xenia's
+    // GetPhysicalAddress gives, the address's offset in its heap (the address
+    // itself below 0x40000000: no physical page is behind virtual memory
+    // here); UINT32_MAX outside every heap
     virtual uint32_t physical_address(uint32_t address) const = 0;
 
     // the heap holding an address (nullptr outside every heap)
@@ -86,9 +90,12 @@ public:
     // by kind, as Xenia's LookupHeapByType: virtual or physical, by page size
     virtual Heap *heap_by_type(bool physical, uint32_t page_size) = 0;
 
-    // the kernel's own small allocations (objects the guest sees), in the
-    // 64 KB virtual range, committed, read-write, zeroed
-    virtual uint32_t system_alloc(uint32_t size, uint32_t alignment = 0x20) = 0;
+    // the kernel's own small allocations (objects the guest sees),
+    // committed, read-write, zeroed, a page each (Xenia's SystemHeapAlloc):
+    // virtual from the top 256 MB of the 4 KB range (0x30000000 up),
+    // physical (what the GPU or the audio read) from the 4 KB window
+    // (0xE0000000, top-down); 0 when full
+    virtual uint32_t system_alloc(uint32_t size, uint32_t alignment = 0x20, bool physical = false) = 0;
     virtual void system_free(uint32_t address) = 0;
 };
 
