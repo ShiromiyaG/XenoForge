@@ -12,6 +12,12 @@
 // recompiles Xenia's instruction tests (tools/assemble_ppc_tests.sh) into
 // out/ppc_tests_0..N-1.cpp and ppc_tests_table.cpp for ppc_recompiled_test:
 // every test label a function as long as the code up to the next label.
+//
+//   xfrecomp emit <game.iso | default.xex> <out dir> [--xex <path>] [--files N]
+//
+// writes the game's functions as C++ (functions_0..N-1.cpp, by address),
+// functions.h declaring them all, and table.cpp listing them by address
+// for dispatch. Game code: the out dir stays outside the repository.
 
 #include "xenoforge/disc.h"
 #include "xenoforge/recomp.h"
@@ -35,7 +41,8 @@ namespace {
 int usage() {
     std::fprintf(stderr, "usage: xfrecomp analyze <game.iso | default.xex> [--xex <path>] [--compare <init.cpp>] "
                          "[--functions <out.tsv>]\n"
-                         "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n");
+                         "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n"
+                         "       xfrecomp emit <game.iso | default.xex> <out dir> [--xex <path>] [--files N]\n");
     return 2;
 }
 
@@ -124,7 +131,65 @@ int tests(const std::filesystem::path &dir, const std::filesystem::path &out, in
 
 } // namespace
 
+int emit(const std::string &input, const std::string &xex_path, const std::filesystem::path &out, int files) {
+    std::string error;
+    Xex xex;
+    recomp::Image image;
+    if (!load(input, xex_path, xex, error) || !recomp::read_image(xex, image, error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
+    recomp::Discovery d = recomp::discover(image);
+    std::filesystem::create_directories(out);
+    const std::string prefix = "xf_";
+    // the functions with code, split by instruction count
+    std::vector<const recomp::Function *> list;
+    uint64_t total = 0;
+    for (const auto &[a, f] : d.functions)
+        if (f.source != recomp::Source::Import) list.push_back(&f), total += f.size / 4;
+    {
+        std::ofstream h(out / "functions.h");
+        h << "// Written by xfrecomp emit. Game code: not for the repository.\n#pragma once\n"
+             "#include \"xenoforge/ppc_generated.h\"\n\n";
+        for (const recomp::Function *f : list) h << "XF_FN(" << recomp::function_name(prefix, f->address) << ");\n";
+    }
+    uint64_t per_file = total / files + 1, in_file = 0;
+    int n = 0;
+    std::ofstream f(out / ("functions_0.cpp"));
+    f << "#include \"functions.h\"\n\n";
+    for (const recomp::Function *fn : list) {
+        if (in_file >= per_file && n + 1 < files) {
+            f.close();
+            f.open(out / ("functions_" + std::to_string(++n) + ".cpp"));
+            f << "#include \"functions.h\"\n\n";
+            in_file = 0;
+        }
+        f << recomp::emit_function(image, d, *fn, prefix) << "\n";
+        in_file += fn->size / 4;
+    }
+    f.close();
+    for (int k = n + 1; k < files; k++) std::ofstream(out / ("functions_" + std::to_string(k) + ".cpp")) << "\n";
+    std::ofstream t(out / "table.cpp");
+    t << "// Written by xfrecomp emit: the functions by address, for dispatch.\n#include \"functions.h\"\n"
+         "#include <cstddef>\n\nstruct XfFunction { uint32_t address; void (*fn)(xf::ppc::Context &); };\n"
+         "extern const XfFunction xf_functions[] = {\n";
+    for (const recomp::Function *fn : list)
+        t << "    {0x" << recomp::function_name("", fn->address) << "u, " << recomp::function_name(prefix, fn->address) << "},\n";
+    t << "};\nextern const size_t xf_function_count = " << list.size() << ";\n";
+    std::printf("%zu functions, %llu instructions, %d files\n", list.size(), (unsigned long long)total, files);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc >= 4 && std::string(argv[1]) == "emit") {
+        std::string xex_path = "default.xex";
+        int files = 64;
+        for (int k = 4; k + 1 < argc; k++) {
+            if (std::string(argv[k]) == "--files") files = std::max(1, std::atoi(argv[k + 1]));
+            if (std::string(argv[k]) == "--xex") xex_path = argv[k + 1];
+        }
+        return emit(argv[2], xex_path, argv[3], files);
+    }
     if (argc >= 4 && std::string(argv[1]) == "tests") {
         int files = 16;
         for (int k = 4; k + 1 < argc; k++)
