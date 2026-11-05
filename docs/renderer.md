@@ -260,7 +260,9 @@ no input):
   then stops swapping before Xenia's frame 600, headless as well as
   rendered (at 506 and 345 swaps): what it waits for next is not in the
   kernel yet (sound, most likely). Ben 10's six traces replay through the
-  same Sink and match.
+  same Sink and match. (Later the same day boot answered from an idle pad
+  for user 0, [input.md](input.md), and with the generated code the game
+  plays on past the Cartoon Network logo to Papaya's, past swap 700.)
 
 El Chavo Kart's title screen ("Press START" over clouds, from about swap
 1800 live, Xenia's frame 2400 and later) came out in red alone. Its trace

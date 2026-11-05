@@ -63,7 +63,10 @@ struct Options {
     // (the number Xenia's --trace_gpu_frames gives the frame a trace holds:
     // frame N is what the swap after the first N shows); none when empty.
     std::function<bool(uint64_t swap)> frame_wanted;
-    // Each front buffer read back, on the processor's thread.
+    // Each front buffer read back, on the processor's thread. This is the
+    // presentation hook too: the player's window takes the frame and
+    // returns at once (frame_wanted says no while the window has not shown
+    // the last one), so the guest never waits for a display.
     std::function<void(uint64_t swap, const Image &frame)> on_frame;
 };
 

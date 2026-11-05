@@ -115,7 +115,7 @@ file(GLOB XF_KERNEL_SOURCES CONFIGURE_DEPENDS src/kernel/*.cpp)
 add_library(xenoforge_kernel OBJECT ${XF_KERNEL_SOURCES})
 target_link_libraries(xenoforge_kernel PUBLIC xenoforge)
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/memory.cpp) # the guest memory, being written
-    add_executable(boot tools/boot.cpp)
+    add_executable(boot tools/boot.cpp tools/game.cpp)
     target_link_libraries(boot PRIVATE xenoforge_kernel xenoforge)
 endif()
 # boot linked with a game's generated code: `xfrecomp emit <iso> <XF_GEN_DIR>/<name>`
@@ -134,7 +134,7 @@ foreach(game ${XF_GAMES})
     # optimized, without debug information (it is large) or warnings; never
     # -ffast-math (docs/recompiler.md)
     target_compile_options(game_${game} PRIVATE -O2 -g0 -w -mfma -mavx2)
-    add_executable(boot_${game} tools/boot.cpp)
+    add_executable(boot_${game} tools/boot.cpp tools/game.cpp)
     target_compile_definitions(boot_${game} PRIVATE XF_GENERATED)
     target_link_libraries(boot_${game} PRIVATE xenoforge_kernel xenoforge game_${game})
 endforeach()
@@ -162,6 +162,65 @@ endif()
 foreach(game ${XF_GAMES})
     target_link_libraries(boot_${game} PRIVATE xenoforge_vk stb)
 endforeach()
+# The player (track C1; docs/runtime.md, "The player"): a game in an SDL3
+# window with its input and sound, the overlay in Dear ImGui, the settings in
+# config.toml. SDL3, Dear ImGui and toml++ are fetched as the 3DS runtime pins
+# them, only when the player is built (by default with XF_GAMES), so the core
+# and its tests build without them. `player` runs a game interpreted;
+# player_<game> links its generated code as boot_<game> does.
+if(XF_GAMES)
+    set(XF_PLAYER_DEFAULT ON)
+else()
+    set(XF_PLAYER_DEFAULT OFF)
+endif()
+option(XF_PLAYER "build the player (fetches SDL3, Dear ImGui, toml++)" ${XF_PLAYER_DEFAULT})
+if(XF_PLAYER AND TARGET boot)
+    include(FetchContent)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG release-3.4.16 GIT_SHALLOW TRUE)
+    FetchContent_Declare(tomlplusplus GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git GIT_TAG v3.4.0
+                         GIT_SHALLOW TRUE)
+    FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.9 GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(SDL3 tomlplusplus imgui)
+    target_compile_options(SDL3-static PRIVATE -w) # the project's -Wall is not for SDL's sources
+    add_library(xf_imgui STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+    target_include_directories(xf_imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+    target_link_libraries(xf_imgui PUBLIC SDL3::SDL3-static Vulkan::Vulkan)
+    target_compile_options(xf_imgui PRIVATE -w)
+    # the window, input, sound and settings, apart from the kernel they feed
+    add_library(xf_frontend STATIC frontend/settings.cpp frontend/presenter.cpp frontend/sdl_input.cpp
+                                   frontend/sdl_audio.cpp)
+    target_link_libraries(xf_frontend PUBLIC xenoforge SDL3::SDL3-static Vulkan::Vulkan tomlplusplus::tomlplusplus)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(xf_frontend PRIVATE -Wno-missing-field-initializers)
+    endif()
+    set(XF_PLAYERS player)
+    add_executable(player frontend/player.cpp tools/game.cpp)
+    foreach(game ${XF_GAMES})
+        add_executable(player_${game} frontend/player.cpp tools/game.cpp)
+        target_compile_definitions(player_${game} PRIVATE XF_GENERATED)
+        target_link_libraries(player_${game} PRIVATE game_${game})
+        list(APPEND XF_PLAYERS player_${game})
+    endforeach()
+    foreach(target ${XF_PLAYERS})
+        target_link_libraries(${target} PRIVATE xf_frontend xf_imgui xenoforge_kernel xenoforge_vk stb)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(${target} PRIVATE -Wno-missing-field-initializers)
+        endif()
+    endforeach()
+    # the settings file, the sound's fold to stereo, the scripted presses
+    add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
+    target_link_libraries(frontend_test PRIVATE xf_frontend xenoforge_kernel xenoforge_vk)
+    add_test(NAME frontend COMMAND frontend_test)
+endif()
 add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)
 

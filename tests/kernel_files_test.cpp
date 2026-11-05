@@ -12,6 +12,7 @@
 
 #include "files.h"
 #include "xam.h"
+#include "xenoforge/input.h"
 #include "xenoforge/kernel.h"
 #include "xenoforge/memory.h"
 
@@ -537,6 +538,64 @@ void content(ppc::Context &c) {
     CHECK(xam(c, "XamContentGetLicenseMask", {mask, 0}) == X_ERROR_SUCCESS && K->load32(mask) == 0);
 }
 
+// The input exports with boot's idle pad, START pressed by its overlay when
+// asked: states and their packet numbers, the capabilities, keystrokes
+// (Xenia's SDL driver's, sticks included), vibration.
+std::atomic<bool> start_pressed{false};
+void input_exports(ppc::Context &c, uint32_t state) {
+    using namespace xf::input;
+    add_input_driver(*K, make_idle_pad([](uint32_t, uint64_t) {
+        Gamepad g;
+        if (start_pressed) g.buttons = START;
+        return g;
+    }));
+    CHECK(xam(c, "XamInputGetState", {0, 0, state}) == X_ERROR_SUCCESS && K->load32(state) == 1 &&
+          K->load16(state + 4) == 0);
+    CHECK(xam(c, "XamInputGetState", {0, 0, state}) == X_ERROR_SUCCESS && K->load32(state) == 1);
+    CHECK(xam(c, "XamInputGetState", {1, 0, state}) == X_ERROR_DEVICE_NOT_CONNECTED && K->load32(state) == 0);
+    CHECK(xam(c, "XamInputGetState", {0, 2, state}) == X_ERROR_DEVICE_NOT_CONNECTED); // the keyboard asked for
+    start_pressed = true;
+    CHECK(xam(c, "XamInputGetState", {0, 1, state}) == X_ERROR_SUCCESS && K->load32(state) == 2 &&
+          K->load16(state + 4) == START);
+    uint32_t caps = alloc(32);
+    CHECK(xam(c, "XamInputGetCapabilities", {0, 1, caps}) == X_ERROR_SUCCESS && K->host(caps)[0] == 1 &&
+          K->host(caps)[1] == 1 && K->load16(caps + 4) == 0xF7FF && K->load16(caps + 18) == 0xFFFF);
+    CHECK(xam(c, "XamInputGetCapabilitiesEx", {1, 0xFF, 0, caps}) == X_ERROR_SUCCESS && K->host(caps)[0] == 1);
+    CHECK(xam(c, "XamInputGetCapabilities", {2, 1, caps}) == X_ERROR_DEVICE_NOT_CONNECTED);
+    uint32_t user = alloc(4), key = alloc(8);
+    K->store32(user, 0xFF);
+    CHECK(xam(c, "XamInputGetKeystrokeEx", {user, 1, key}) == X_ERROR_SUCCESS && K->load16(key) == vk::START &&
+          K->load16(key + 4) == KEYSTROKE_KEYDOWN && K->load32(user) == 0);
+    CHECK(xam(c, "XamInputGetKeystrokeEx", {user, 1, key}) == X_ERROR_EMPTY);
+    start_pressed = false;
+    CHECK(xam(c, "XamInputGetKeystroke", {0, 1, key}) == X_ERROR_SUCCESS && K->load16(key) == vk::START &&
+          K->load16(key + 4) == KEYSTROKE_KEYUP);
+    CHECK(xam(c, "XamInputGetKeystroke", {1, 1, key}) == X_ERROR_DEVICE_NOT_CONNECTED);
+    uint32_t vibration = alloc(4);
+    CHECK(xam(c, "XamInputSetState", {0, 0, vibration}) == X_ERROR_SUCCESS);
+    CHECK(xam(c, "XamInputSetState", {3, 0, vibration}) == X_ERROR_DEVICE_NOT_CONNECTED);
+    CHECK(input_states_delivered(*K) == 3);
+
+    // a stick: up-left, then left alone (up-left lets go before left goes down)
+    PadKeystrokes keys;
+    Keystroke s;
+    Gamepad g;
+    g.thumb_lx = -32768, g.thumb_ly = 32767;
+    CHECK(keys.next(g, 0, 0, s) == SUCCESS && s.virtual_key == vk::LTHUMB_UPLEFT && s.flags == KEYSTROKE_KEYDOWN);
+    g.thumb_ly = 0;
+    CHECK(keys.next(g, 0, 10, s) == SUCCESS && s.virtual_key == vk::LTHUMB_UPLEFT && s.flags == KEYSTROKE_KEYUP);
+    CHECK(keys.next(g, 0, 20, s) == SUCCESS && s.virtual_key == vk::LTHUMB_LEFT && s.flags == KEYSTROKE_KEYDOWN);
+    CHECK(keys.next(g, 0, 30, s) == EMPTY);
+    // held: repeated after 400 ms, then every 100 ms
+    CHECK(keys.next(g, 0, 420, s) == EMPTY);
+    CHECK(keys.next(g, 0, 421, s) == SUCCESS && s.virtual_key == vk::LTHUMB_LEFT &&
+          s.flags == (KEYSTROKE_KEYDOWN | KEYSTROKE_REPEAT));
+    CHECK(keys.next(g, 0, 500, s) == EMPTY);
+    CHECK(keys.next(g, 0, 523, s) == SUCCESS && (s.flags & KEYSTROKE_REPEAT));
+    g.left_trigger = 0x20;
+    CHECK(keys.next(g, 0, 524, s) == SUCCESS && s.virtual_key == vk::LTRIGGER && s.flags == KEYSTROKE_KEYDOWN);
+}
+
 void notifications_and_users(ppc::Context &c) {
     scratch_next = 0;
     // the first system listener hears the UI and the sign-in at start
@@ -605,6 +664,7 @@ void notifications_and_users(ppc::Context &c) {
     uint32_t state = alloc(16);
     CHECK(xam(c, "XamInputGetState", {0, 0, state}) == X_ERROR_DEVICE_NOT_CONNECTED);
     CHECK(xam(c, "XamInputGetCapabilities", {0, 1, state}) == X_ERROR_DEVICE_NOT_CONNECTED);
+    input_exports(c, state);
 
     // the loader's launch data
     uint32_t launch = alloc(16);

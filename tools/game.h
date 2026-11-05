@@ -1,0 +1,85 @@
+// What boot and the player share (docs/runtime.md, "boot" and "The
+// player"): a game opened (the disc or a bare executable read, the memory,
+// the kernel, the file system and the storage root, the executable loaded,
+// its generated code linked in), the renderer installed as the command
+// processor's Sink, the main thread launched with the fault report in place,
+// the report of what the kernel, the GPU, the sound and the input did, and
+// the scripted presses (--press) both take.
+//
+// Compiled into each executable (with XF_GENERATED in the ones linked with a
+// game's generated code), so the table it installs is that game's.
+
+#pragma once
+
+#include "xenoforge/input.h"
+#include "xenoforge/kernel.h"
+#include "xenoforge/memory.h"
+#include "xenoforge/renderer.h"
+#include "xenoforge/vk_device.h"
+#include "xenoforge/xex.h"
+
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace xf::game {
+
+struct Options {
+    std::string input;                    // a disc image, or a bare default.xex
+    std::string xex_path = "default.xex"; // the executable on the disc
+    std::filesystem::path storage;        // the storage root (content/, cache*/)
+    uint64_t steps = 2'000'000'000ull;    // the interpreter's instructions per entry
+    bool interpret = false;               // the generated code left out, where it is linked
+};
+
+struct Game {
+    Xex xex;
+    std::unique_ptr<Memory> memory;
+    std::unique_ptr<kernel::Kernel> kernel;
+    std::unique_ptr<vk::Device> device;
+    std::unique_ptr<render::Renderer> renderer;
+};
+
+// The game read, its memory and kernel made, the disc (or the executable's
+// directory) and the storage root mounted, the executable loaded and its
+// generated code installed; prints what boot always printed of it (the
+// storage, the generated functions, the executable's base, entry, stack and
+// TLS). False, and why, when any of it fails.
+bool open(const Options &options, Game &game, std::string &error);
+
+// The renderer on a Vulkan device without a window, installed as the
+// command processor's Sink, before the game runs.
+bool start_renderer(Game &game, const render::Options &options, std::string &error);
+
+// The main thread started, with the fault report (an access fault in the
+// guest's code: where, in guest terms, then the report) in place.
+bool launch(Game &game, std::string &error);
+
+// The modules, the interpreter's entries, the kernel calls, what the GPU,
+// the sound and the input did, and the renderer's counts (waiting: for a
+// call of its under way; else skipped if one is).
+void print_report(Game &game, bool waiting);
+
+// "300,301,890-910": numbers and ranges of them
+bool parse_numbers(const std::string &list, std::set<uint64_t> &out);
+
+// Scripted presses: "start@40" or "start@40s" (START held 0.3 s from 40 s
+// on the scheduler's clock, user 0), "a+b@12.5:1" (A and B held 1 s),
+// "start@#1100" (from the GPU's 1100th swap: what the game shows, whatever
+// the run's speed); buttons a b x y start back guide lb rb ls rs up down
+// left right lt rt.
+struct Press {
+    input::Gamepad pad;
+    uint64_t from_ms = 0, hold_ms = 300;
+    uint64_t from_swap = UINT64_MAX; // set: from that swap on, not from_ms
+};
+bool parse_press(const std::string &text, Press &out, std::string &error);
+// what the presses hold at a time, as a driver's overlay takes it (user 0);
+// swaps counts the GPU's swaps, for the presses at a swap
+input::Overlay presses_overlay(std::vector<Press> presses, std::function<uint64_t()> swaps = nullptr);
+
+} // namespace xf::game

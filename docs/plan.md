@@ -53,7 +53,7 @@ access, the calls into the system), so its thousands of files compile fast.
 | XAM | content, users, input, settings; the network offline, the guide's UI cancelled | step A4 |
 | Sound | the APU's XMA contexts (XAudio2 itself is the game's code) | step A6 |
 | GPU | PM4 front end and the Xenos renderer ([renderer.md](renderer.md)) | track B |
-| Player | SDL3 window, input, sound, ImGui overlay (F1), `config.toml` | track C, from the 3DS runtime |
+| Player | SDL3 window, input, sound, ImGui overlay (F1), `config.toml` | C1 in ([runtime.md](runtime.md), [input.md](input.md)) |
 | Launcher | the player's ISO set up and recompiled on their machine; settings, controls, port options | track C, from the 3DS runtime |
 | `boot` | a game run without a window: counts, shots, recordings, the deterministic mode | step A4 |
 
@@ -217,7 +217,26 @@ traces, without a recompiled game.
 
 **Track C: the frontend**, from the 3DS runtime's
 
-- **C1. The player** (window, input, sound, overlay, settings).
+- **C1. The player** (window, input, sound, overlay, settings; in,
+  2026-11-05: [runtime.md](runtime.md), "The player"; [input.md](input.md)).
+  `player_<game>` links the game's generated code as `boot_<game>` does
+  and shares boot's opening, launch and report (`tools/game.cpp`); SDL3,
+  Dear ImGui and toml++ are fetched only when it is built. The window shows
+  the front buffer the renderer reads back at each swap, through a Vulkan
+  swapchain on a device of its own, letterboxed; the guest never waits for
+  it (a front buffer is read back only when the window took the last one).
+  XAM's input exports answer from drivers in Xenia's order: SDL3's
+  gamepads as Xenia's SDL driver, then the keyboard as a controller with
+  Xenia's bindings (config.toml); boot answers from an idle pad for user 0
+  (`--no-controller` for none), so Ben 10 no longer pauses on "Controller
+  Lost Connection" and plays on past the Cartoon Network logo to
+  Papaya's. Sound: each XAudio client's frames to an SDL3 stream, folded to
+  stereo as Xenia folds 5.1, paced on the scheduler's clock as before.
+  Checked without a person: `--quit-after`, `--screenshots`, the exit
+  report, `--press start@100` taking El Chavo Kart from its title screen to
+  the main menu (its first-time dialog); a person at the screen still has
+  to confirm that a pad moves things and that sound is heard (PCM frames
+  reach the device, XMA is silence until A6).
 - **C2. The launcher** (ISO, recompile, settings, controls, port options).
 
 **Where they meet**
@@ -227,7 +246,10 @@ traces, without a recompiled game.
 - **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work
   (`../Chaves/docs/native-renderer-re.md`) moved over as El Chavo Kart's port.
 
-Next (2026-11-05, later): the renderer runs live as the command processor's
+Next (2026-11-05, later still): the player (C1) is in, so M1 is there as a
+person would see it, at the renderer's speed (B4: a few swaps a second on
+El Chavo Kart's menus, the renderer the bottleneck). Earlier: the renderer
+runs live as the command processor's
 Sink, headless (`boot --render`); next the player (C1: the window and the
 presentation, input) for M1, and the renderer's speed (B4: draws batched
 into fewer submissions, resolves on the GPU). Generated tables per module

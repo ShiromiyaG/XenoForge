@@ -206,8 +206,8 @@ game.
 ## Sound
 
 The APU as the games' code sees it, headless: enough for their sound to
-start and run with silence (plan, "Next"); the real output and the XMA
-decode are step A6. Translated from Xenia (`audio_system.cc`,
+start and run with silence (plan, "Next"); the XMA decode is step A6, and
+the player sends the frames to the sound card (see "The player"). Translated from Xenia (`audio_system.cc`,
 `pacing_audio_driver.cc`, `xma_decoder.cc`, `xma_context_new.cc`,
 `xboxkrnl_audio.cc`, `xboxkrnl_audio_xma.cc`); where it differs is noted
 at the top of each file.
@@ -281,24 +281,31 @@ entries, names any case.
 ## XAM
 
 As built (`src/kernel/xam.h`; xam.cpp, xam_content.cpp, xam_user.cpp,
-xam_msg.cpp, xam_net.cpp), from Xenia's xam: one user signed in offline in
-slot 0 with Xenia's default profile settings; content as above; the
-notifications Xenia queues at start; no controller; the guide's UI answered
-headless; XMsg's apps offline; the network's start-up answers offline.
+xam_input.cpp, xam_msg.cpp, xam_net.cpp), from Xenia's xam: one user signed
+in offline in slot 0 with Xenia's default profile settings; content as
+above; the notifications Xenia queues at start; the controllers from the
+drivers boot or the player installs ([input.md](input.md); none, every
+user disconnected, without one); the guide's UI answered headless; XMsg's apps offline; the network's start-up answers offline.
 Overlapped requests Xenia defers (25 ms, on a dispatch thread) complete at
 once here, before the export returns ERROR_IO_PENDING.
 
 ## `boot`
 
-`boot <game.iso> [--seconds N] [--steps N] [--content <dir>] [--interpret]`:
-loads the game, runs its entry point, and prints the modules loaded, the
+`boot <game.iso> [--seconds N] [--steps N] [--content <dir>] [--interpret]
+[--no-controller] [--press <buttons@seconds>]...`: loads the game, runs its entry point, and prints the modules loaded, the
 interpreter's entries (the most entered addresses first), the kernel calls
 (counts, unimplemented ones), the GPU's packets, draws, resolves, swaps (and
 swaps per second) and interrupts, the sound's frames and XMA contexts, and
 where it stopped. Built as `boot_<game>` (CMake's `XF_GAMES`), it runs the
 game's generated code; `--interpret` leaves it out. `--steps` bounds the
 interpreter's instructions per entry (2 billion by default: about 20 s of
-El Chavo Kart's main thread).
+El Chavo Kart's main thread). XAM's input answers from an idle pad for
+user 0, a controller plugged in with nothing pressed, so a game waiting
+for one goes on (Ben 10 paused on "Controller Lost Connection" without
+it); `--no-controller` leaves every user disconnected, and `--press
+start@40` holds buttons at a time on the scheduler's clock
+([input.md](input.md)). What boot shares with the player (opening the
+game, the renderer, the launch, the report) is `tools/game.cpp`.
 
 `--render` draws what the GPU is sent (the renderer as the processor's
 Sink, on a Vulkan device without a window; off by default, so runs stay
@@ -309,6 +316,108 @@ the swaps numbered as Xenia's `--trace_gpu_frames` numbers a trace's frame;
 report adds the renderer's counts: draws drawn and skipped by reason, what
 is approximate, resolves, swaps, and the time spent (in submissions,
 resolves, checking and decoding textures, copying vertex data).
+
+## The player
+
+Plan track C1 (2026-11-05), after the 3DS runtime's `frontend/player.cpp`:
+a game in an SDL3 window, with its controllers, its sound and an overlay.
+Built as `player_<game>` beside `boot_<game>` (the same generated code
+linked) and as `player` (interpreted), when CMake's `XF_PLAYER` is on (by
+default with `XF_GAMES`); only then are SDL3 (release-3.4.16), Dear ImGui
+(v1.91.9) and toml++ (v3.4.0) fetched, the 3DS runtime's pins, so the core
+and its tests never need them.
+
+```
+player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] [--steps N]
+    [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] [--press <b@s>]... [--no-sound]
+    [--overlay]
+```
+
+The game is opened, launched and reported by `tools/game.cpp`, boot's own
+code. As built (`frontend/`):
+
+- **The window** (`presenter.cpp`): the front buffer each swap shows (the
+  renderer's read-back, through the display's gamma ramp, the same picture
+  `boot --shots` writes) uploaded and blitted into a Vulkan swapchain's
+  image, scaled to fit with its shape kept (`video.aspect = "auto"`,
+  letterboxed or pillarboxed) or stretched, filtered (`video.smooth`) or
+  not, with the overlay drawn over it. The presenter has a Vulkan device of
+  its own: the renderer's is windowless and its thread never waits for it.
+- **One clock.** The renderer hands a front buffer over on its thread
+  (`render::Options::on_frame`, the hook boot's shots already used) and
+  goes on; the window's thread shows the latest whenever the display lets
+  it (`video.vsync`: FIFO, else mailbox), and that wait is the window's
+  thread's alone. A front buffer is read back only when the window has
+  taken the one before, or a screenshot wants it (`frame_wanted`), so a
+  minimized or slow window costs the guest nothing.
+- **Input** ([input.md](input.md)): SDL3's gamepads (Xenia's SDL driver),
+  then the keyboard as a controller (Xenia's keyboard driver, its
+  bindings), the deadzones; the scripted presses on user 0.
+- **Sound** (`sdl_audio.cpp`): each render driver client's frames to an
+  SDL3 audio stream on the default playback device, in 5.1 where the
+  device takes six channels, else folded to stereo as Xenia folds it
+  (center halved on both sides, the back channels on theirs, the LFE
+  dropped, over 2.5). The guest's timing stays the scheduler's: each output
+  is the pacing output (a frame played every 256/48000 s on that clock)
+  with the samples sent on beside it; the stream is kept about 60 ms ahead
+  by playing a little faster or slower (half a percent at most), primed
+  with silence when it ran dry, and a frame is let go when a quarter second
+  is queued. `audio.volume` and `audio.mute` are the device's gain.
+- **The overlay** (F1, Dear ImGui): the guest's swaps per second, the
+  frames presented and the window's refreshes per second, the sound frames
+  played (and how many had sound), the input states delivered, each user's
+  controller (what drives it, its buttons, triggers and sticks), the
+  volume, mute, vsync, scaling, fullscreen, and a screenshot button. F11
+  switches fullscreen; F12 saves the frame shown as
+  `<title>_<swap>_key<n>.png` in `player.screenshots` (default: a
+  `screenshots` folder beside config.toml, never the repository).
+- **config.toml** (`settings.cpp`; `--config`, else SDL's preference folder,
+  `%APPDATA%\xenoforge\config.toml` on Windows), written with the defaults
+  the first time and saved when the overlay closes:
+
+  ```toml
+  [video]    # fullscreen, vsync (true), smooth (true), aspect ("auto" or "stretch")
+  [audio]    # volume (0-100), mute
+  [input]    # keyboard (true), keyboard_user (0), left_deadzone, right_deadzone (0-1), vibration (true)
+  [keyboard] # each pad control's keys (input.md)
+  [player]   # screenshots: the folder F12 writes to
+  ```
+
+For checks without a person at the screen: `--quit-after <seconds>`
+ends the run with a report (the swaps, the front buffers handed over and
+presented, the window's refreshes, the input states delivered, the sound
+frames submitted, sent to the device, with sound, dropped and starved,
+then boot's report); `--screenshots <dir>` writes every
+`--screenshot-every N` swaps' front buffer (300 by default) as
+`<title>_<swap>.png`, printing the time on the scheduler's clock each came
+at, which is the clock `--press` takes (or `--press start@#1100`, at a
+swap); `--overlay` opens the overlay from the start; `--no-sound` keeps the pacing
+output alone.
+
+Checked (2026-11-05, both games with their generated code, on a machine
+other builds were loading, so the rates vary from run to run; the shots and
+logs in `../traces/player/`):
+
+- **El Chavo Kart**: the intro movie at 10 to 20 swaps a second, each front
+  buffer handed over shown (1204 of 1221 swaps in 60 s, 1600 of 1615 in
+  270 s); its title screen came at 96.5 s on the scheduler's clock, and
+  `--press start@100` took it to the main menu, where the game's
+  first-time dialog ("Would you like to? A Yes, B No") waits. Two XAudio
+  clients play 187.5 frames a second each; 10,685 of 99,085 frames carried
+  sound (the movie's PCM; XMA is silence until A6), none dropped. The
+  game asks for users 0-3 each frame and calls XamInputSetState (441 to
+  599 times in a run). A capture of the window with `--overlay` shows the
+  front buffer letterboxed under the overlay's rates, controllers and
+  settings.
+- **Ben 10**: no "Controller Lost Connection": in 90 s, 738 swaps, the
+  Cartoon Network logo by swap 300 and Papaya's by 600 (where boot used to
+  stop swapping before 600); one XAudio client at 187.5 frames a second,
+  3,867 of 16,160 with sound. It polls XamInputGetKeystrokeEx with
+  `ANY_USER | KEYBOARD`, which no driver here answers (as in Xenia).
+- Left for a person at the screen: that a real pad and the keyboard move
+  things in the game (only their drivers' states and the scripted presses
+  are checked here), that the sound is heard and sounds right, how the
+  window feels resized, fullscreen and with vsync off.
 
 ## Order
 

@@ -1,0 +1,463 @@
+// player: a game in a window (plan track C1; docs/runtime.md, "The player"),
+// after the 3DS runtime's frontend/player.cpp. The game is opened, run and
+// reported as boot does it (tools/game.cpp); the window shows the front
+// buffer of the guest's latest swap, scaled to fit; XAM's input answers from
+// SDL3's gamepads and the keyboard (sdl_input.h, docs/input.md); the sound
+// goes to the sound card (sdl_audio.h). F1 opens the overlay (Dear ImGui):
+// the rates, the controllers, the volume, a screenshot; F11 switches
+// fullscreen, F12 saves a screenshot. The settings are config.toml
+// (settings.h).
+//
+// One clock, the scheduler's: the guest runs on its own threads and never
+// waits for the window. The renderer hands each front buffer over at its
+// swap (on the "GPU commands" thread) and goes on; this thread shows the
+// latest it was given whenever the display lets it. A front buffer is only
+// read back while the window has shown the one before (or a screenshot
+// wants it), so a window that is slow or minimized costs the guest nothing.
+//
+// For checks without a person at the screen: --quit-after <seconds> ends the
+// run and prints the report (frames presented, swaps, input states
+// delivered, sound frames played, then boot's); --screenshots <dir> writes
+// every --screenshot-every N swaps' front buffer there (300 by default);
+// --press start@40 (repeatable; tools/game.h) holds buttons on user 0's
+// controller at times on the scheduler's clock; --overlay opens the overlay
+// from the start.
+//
+//   player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] [--steps N]
+//        [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] [--press <b@s>]...
+//        [--no-sound] [--overlay]
+
+#include "presenter.h"
+#include "sdl_audio.h"
+#include "sdl_input.h"
+#include "settings.h"
+
+#include "../tools/game.h"
+
+#include <SDL3/SDL.h>
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_vulkan.h>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <vector>
+
+using namespace xf;
+using Clock = std::chrono::steady_clock;
+
+namespace {
+
+// a screenshot's front buffer, its swap and when it came on the scheduler's
+// clock (the time --press takes)
+struct Shot {
+    uint64_t swap = 0, ms = 0;
+    render::Image frame;
+};
+
+// The front buffers the renderer hands over, on its thread: the latest for
+// the window, and the ones a screenshot wants
+struct Mailbox {
+    std::mutex mutex;
+    render::Image latest;
+    uint64_t latest_swap = 0;
+    bool fresh = false; // not shown yet
+    std::deque<Shot> shots;
+    std::atomic<uint64_t> swaps{0}, handed{0};
+};
+
+bool write_png(const std::filesystem::path &path, const render::Image &frame) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    return stbi_write_png(path.string().c_str(), int(frame.width), int(frame.height), 4, frame.rgba.data(),
+                          int(frame.width) * 4) != 0;
+}
+
+const char *button_names(uint16_t b, std::string &out) {
+    static const std::pair<uint16_t, const char *> names[] = {
+        {input::A, "A"},
+        {input::B, "B"},
+        {input::X, "X"},
+        {input::Y, "Y"},
+        {input::START, "Start"},
+        {input::BACK, "Back"},
+        {input::GUIDE, "Guide"},
+        {input::LEFT_SHOULDER, "LB"},
+        {input::RIGHT_SHOULDER, "RB"},
+        {input::LEFT_THUMB, "LS"},
+        {input::RIGHT_THUMB, "RS"},
+        {input::DPAD_UP, "Up"},
+        {input::DPAD_DOWN, "Down"},
+        {input::DPAD_LEFT, "Left"},
+        {input::DPAD_RIGHT, "Right"},
+    };
+    out.clear();
+    for (const auto &[bit, name] : names)
+        if (b & bit) out += out.empty() ? name : std::string(" ") + name;
+    return out.empty() ? "-" : out.c_str();
+}
+
+// what the overlay shows of the last second
+struct Rates {
+    double swaps = 0, presented = 0, refreshes = 0, sound = 0, states = 0;
+};
+
+int fail(const std::string &message) {
+    std::fprintf(stderr, "%s\n", message.c_str());
+    return 1;
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+    const char *usage = "usage: player <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] "
+                        "[--steps N] [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] "
+                        "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay]\n";
+    if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
+    game::Options o;
+    o.input = argv[1];
+    std::error_code ec;
+    o.storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
+    std::filesystem::path config_file, screenshots;
+    double quit_after = 0;
+    uint64_t screenshot_every = 300;
+    bool sound_wanted = true, overlay = false;
+    std::vector<game::Press> presses;
+    for (int i = 2; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--xex" && i + 1 < argc)
+            o.xex_path = argv[++i];
+        else if (a == "--content" && i + 1 < argc)
+            o.storage = argv[++i];
+        else if (a == "--steps" && i + 1 < argc)
+            o.steps = std::strtoull(argv[++i], nullptr, 10);
+        else if (a == "--interpret")
+            o.interpret = true;
+        else if (a == "--config" && i + 1 < argc)
+            config_file = argv[++i];
+        else if (a == "--quit-after" && i + 1 < argc)
+            quit_after = std::strtod(argv[++i], nullptr);
+        else if (a == "--screenshots" && i + 1 < argc)
+            screenshots = argv[++i];
+        else if (a == "--screenshot-every" && i + 1 < argc)
+            screenshot_every = std::strtoull(argv[++i], nullptr, 10);
+        else if (a == "--overlay")
+            overlay = true;
+        else if (a == "--no-sound")
+            sound_wanted = false;
+        else if (a == "--press" && i + 1 < argc) {
+            std::string why;
+            if (!game::parse_press(argv[++i], presses.emplace_back(), why)) return fail(why);
+        } else
+            std::fprintf(stderr, "player: %s ignored\n", a.c_str());
+    }
+    if (!screenshot_every) screenshot_every = 1;
+
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | (sound_wanted ? SDL_INIT_AUDIO : 0)))
+        return fail(std::string("SDL: ") + SDL_GetError());
+    // the settings, written with the defaults the first time so there is a
+    // file to edit
+    frontend::Settings settings;
+    if (config_file.empty()) config_file = frontend::default_path();
+    std::string error;
+    if (!frontend::load(config_file, settings, error))
+        std::fprintf(stderr, "%s: %s (the defaults instead)\n", config_file.string().c_str(), error.c_str());
+    else if (!std::filesystem::exists(config_file, ec) && !frontend::save(config_file, settings, error))
+        std::fprintf(stderr, "%s\n", error.c_str());
+    std::printf("settings: %s\n", config_file.string().c_str());
+    std::filesystem::path key_shots =
+        settings.screenshots.empty() ? config_file.parent_path() / "screenshots" : settings.screenshots;
+
+    // the game, opened as boot opens it
+    game::Game g;
+    if (!game::open(o, g, error)) return fail(error);
+    kernel::Kernel &k = *g.kernel;
+    char title_id[16];
+    std::snprintf(title_id, sizeof(title_id), "%08X", g.xex.execution.title_id);
+
+    SDL_Window *window = SDL_CreateWindow((std::string("XenoForge - ") + title_id).c_str(), 1280, 720,
+                                          SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+    if (!window) return fail(std::string("SDL: ") + SDL_GetError());
+    frontend::Presenter presenter;
+    if (!presenter.open(window, error)) return fail("the window cannot show Vulkan's pictures: " + error);
+
+    // the overlay (Dear ImGui) on the presenter's device
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui_ImplSDL3_InitForVulkan(window);
+    VkFormat format = presenter.format();
+    ImGui_ImplVulkan_InitInfo info{};
+    info.ApiVersion = VK_API_VERSION_1_3;
+    info.Instance = presenter.instance();
+    info.PhysicalDevice = presenter.physical();
+    info.Device = presenter.device();
+    info.QueueFamily = presenter.family();
+    info.Queue = presenter.queue();
+    info.DescriptorPool = presenter.overlay_pool();
+    info.MinImageCount = 2;
+    info.ImageCount = 3;
+    info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    info.UseDynamicRendering = true;
+    info.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    info.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+    info.PipelineRenderingCreateInfo.pColorAttachmentFormats = &format;
+    ImGui_ImplVulkan_Init(&info);
+    ImGui_ImplVulkan_CreateFontsTexture();
+
+    // the sound: SDL's device for each client, else the pacing output alone
+    frontend::Sound sound;
+    bool sounding = false;
+    if (sound_wanted) {
+        if (sound.open(error)) {
+            sounding = true;
+            kernel::set_audio_output(k, sound.outputs());
+            std::printf("sound: %u channels to the device\n", sound.channels());
+        } else {
+            std::fprintf(stderr, "sound: %s (paced, not heard)\n", error.c_str());
+        }
+    }
+    auto apply = [&] {
+        sound.set_gain(settings.audio.mute ? 0.0f : settings.audio.volume / 100.0f);
+        SDL_SetWindowFullscreen(window, settings.video.fullscreen);
+    };
+
+    // the input: the gamepads, then the keyboard, as Xenia asks its drivers;
+    // the scripted presses at a swap count the GPU's swaps
+    auto swaps = [&k] { return kernel::gpu_command_processor(k).counts().swaps.load(); };
+    frontend::Controllers controllers(settings, game::presses_overlay(presses, swaps));
+    kernel::add_input_driver(k, controllers.gamepads());
+    kernel::add_input_driver(k, controllers.keyboard());
+    if (!presses.empty() && !settings.input.keyboard)
+        kernel::add_input_driver(k, input::make_idle_pad(game::presses_overlay(presses, swaps)));
+    kernel::set_input_deadzones(k, settings.input.left_deadzone, settings.input.right_deadzone);
+    apply();
+
+    // the renderer hands each front buffer over at its swap; read back only
+    // while the window took the last one, or for a screenshot
+    Mailbox mailbox;
+    render::Options options;
+    options.frame_wanted = [&](uint64_t swap) {
+        mailbox.swaps = swap + 1;
+        if (!screenshots.empty() && swap % screenshot_every == 0) return true;
+        std::lock_guard<std::mutex> lock(mailbox.mutex);
+        return !mailbox.fresh;
+    };
+    options.on_frame = [&](uint64_t swap, const render::Image &frame) {
+        std::lock_guard<std::mutex> lock(mailbox.mutex);
+        mailbox.latest = frame;
+        mailbox.latest_swap = swap;
+        mailbox.fresh = true;
+        mailbox.handed++;
+        if (!screenshots.empty() && swap % screenshot_every == 0) mailbox.shots.push_back({swap, k.uptime_ms(), frame});
+    };
+    if (!game::start_renderer(g, options, error)) return fail(error);
+    std::printf("rendering on %s; window on its own device\n", g.device->name().c_str());
+    stbi_write_png_compression_level = 1;
+    if (!game::launch(g, error)) return fail("launch: " + error);
+    const Clock::time_point started = Clock::now();
+
+    bool quit = false, changed = false;
+    render::Image showing; // the front buffer last shown
+    uint64_t showing_swap = 0, presented = 0, refreshes = 0, key_screenshots = 0, shots_written = 0;
+    std::string ended;
+    Rates rates;
+    Clock::time_point second = started, last_present = started;
+    uint64_t swaps_before = 0, presented_before = 0, refreshes_before = 0, sound_before = 0, states_before = 0;
+    std::string names;
+    auto key_screenshot = [&] {
+        if (showing.rgba.empty()) return;
+        std::filesystem::path path = key_shots / (std::string(title_id) + "_" + std::to_string(showing_swap) + "_key" +
+                                                  std::to_string(++key_screenshots) + ".png");
+        if (write_png(path, showing))
+            std::printf("screenshot: %s\n", path.string().c_str());
+        else
+            std::fprintf(stderr, "could not write %s\n", path.string().c_str());
+    };
+
+    while (!quit) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit = true, ended = "closed";
+            controllers.event(e);
+            if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
+                if (e.key.scancode == SDL_SCANCODE_F1) {
+                    overlay = !overlay;
+                    if (!overlay && changed) {
+                        if (!frontend::save(config_file, settings, error)) std::fprintf(stderr, "%s\n", error.c_str());
+                        changed = false;
+                    }
+                    continue;
+                }
+                if (e.key.scancode == SDL_SCANCODE_F11) {
+                    settings.video.fullscreen = !settings.video.fullscreen;
+                    SDL_SetWindowFullscreen(window, settings.video.fullscreen);
+                    changed = true;
+                }
+                if (e.key.scancode == SDL_SCANCODE_F12) key_screenshot();
+            }
+            ImGui_ImplSDL3_ProcessEvent(&e);
+        }
+        const bool focused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+        controllers.read_keyboard(focused, overlay);
+
+        // the run's end: time asked for, the code stopped, the main thread done
+        const Clock::time_point now = Clock::now();
+        const double seconds = std::chrono::duration<double>(now - started).count();
+        if (quit_after > 0 && seconds >= quit_after)
+            quit = true, ended = "quit after " + std::to_string(seconds) + " s";
+        if (k.stopped) quit = true, ended = "stopped: " + k.stop_reason;
+        uint32_t exit_code = 0;
+        if (k.wait_main(0, &exit_code)) quit = true, ended = "the main thread ended";
+
+        // the latest front buffer, and the screenshots asked for
+        bool fresh = false;
+        std::deque<Shot> shots;
+        {
+            std::lock_guard<std::mutex> lock(mailbox.mutex);
+            if (mailbox.fresh) {
+                std::swap(showing, mailbox.latest);
+                showing_swap = mailbox.latest_swap;
+                mailbox.fresh = false;
+                fresh = true;
+            }
+            shots.swap(mailbox.shots);
+        }
+        for (const Shot &shot : shots) {
+            std::filesystem::path path =
+                screenshots / (std::string(title_id) + "_" + std::to_string(shot.swap) + ".png");
+            if (write_png(path, shot.frame)) {
+                shots_written++;
+                std::printf("screenshot: swap %llu at %.1f s, %s\n", (unsigned long long)shot.swap, shot.ms / 1000.0,
+                            path.string().c_str());
+            } else {
+                std::fprintf(stderr, "could not write %s\n", path.string().c_str());
+            }
+        }
+
+        // the rates over the last second
+        if (now - second >= std::chrono::seconds(1)) {
+            const double dt = std::chrono::duration<double>(now - second).count();
+            const uint64_t states = kernel::input_states_delivered(k);
+            rates.swaps = (mailbox.swaps - swaps_before) / dt;
+            rates.presented = (presented - presented_before) / dt;
+            rates.refreshes = (refreshes - refreshes_before) / dt;
+            rates.sound = (sound.sent - sound_before) / dt;
+            rates.states = (states - states_before) / dt;
+            swaps_before = mailbox.swaps, presented_before = presented, refreshes_before = refreshes;
+            sound_before = sound.sent, states_before = states;
+            second = now;
+        }
+
+        // nothing new and nothing moving: no present (with vsync each
+        // present waits for the display; this thread alone)
+        int pw = 0, ph = 0;
+        SDL_GetWindowSizeInPixels(window, &pw, &ph);
+        const bool minimized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) || !pw || !ph;
+        if (minimized || (!fresh && !overlay && now - last_present < std::chrono::milliseconds(100))) {
+            SDL_Delay(minimized ? 10 : 1);
+            continue;
+        }
+
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+        if (overlay) {
+            ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(600, 0), ImGuiCond_FirstUseEver);
+            bool keep = true;
+            ImGui::Begin("XenoForge (F1)", &keep, ImGuiWindowFlags_NoSavedSettings);
+            ImGui::Text("guest swaps %.1f/s (%llu), frames presented %.1f/s (%llu)", rates.swaps,
+                        (unsigned long long)mailbox.swaps.load(), rates.presented, (unsigned long long)presented);
+            ImGui::Text("window refreshes %.1f/s, run %.0f s", rates.refreshes, seconds);
+            ImGui::Text("sound: %llu frames played (%.1f/s, %u channels), %llu with sound, %llu starved",
+                        (unsigned long long)sound.sent.load(), rates.sound, sound.channels(),
+                        (unsigned long long)sound.audible.load(), (unsigned long long)sound.starved.load());
+            ImGui::Text("input: %llu states delivered (%.1f/s)", (unsigned long long)kernel::input_states_delivered(k),
+                        rates.states);
+            ImGui::SeparatorText("Controllers");
+            if (ImGui::BeginTable("pads", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+                auto view = controllers.view(k.uptime_ms());
+                for (uint32_t u = 0; u < input::USERS; u++) {
+                    const auto &v = view[u];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", u);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(v.source.empty() ? "(none)" : v.source.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(v.source.empty() ? "" : button_names(v.pad.buttons, names));
+                    ImGui::TableNextColumn();
+                    if (!v.source.empty())
+                        ImGui::Text("LT %3u RT %3u  L %6d %6d  R %6d %6d", v.pad.left_trigger, v.pad.right_trigger,
+                                    v.pad.thumb_lx, v.pad.thumb_ly, v.pad.thumb_rx, v.pad.thumb_ry);
+                }
+                ImGui::EndTable();
+            }
+            ImGui::SeparatorText("Settings");
+            bool moved = false;
+            moved |= ImGui::SliderInt("Volume", &settings.audio.volume, 0, 100, "%d%%");
+            moved |= ImGui::Checkbox("Mute", &settings.audio.mute);
+            moved |= ImGui::Checkbox("Vertical sync (the window's only)", &settings.video.vsync);
+            ImGui::SameLine();
+            moved |= ImGui::Checkbox("Smooth scaling", &settings.video.smooth);
+            bool stretch = settings.video.aspect == "stretch";
+            if (ImGui::Checkbox("Stretch", &stretch))
+                settings.video.aspect = stretch ? "stretch" : "auto", moved = true;
+            ImGui::SameLine();
+            moved |= ImGui::Checkbox("Fullscreen (F11)", &settings.video.fullscreen);
+            if (moved) apply(), changed = true;
+            ImGui::SeparatorText("Screenshot");
+            if (ImGui::Button("Save (F12)")) key_screenshot();
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", key_shots.string().c_str());
+            ImGui::End();
+            if (!keep) overlay = false;
+        }
+        ImGui::Render();
+        frontend::Presenter::View view;
+        view.width = uint32_t(pw), view.height = uint32_t(ph);
+        view.vsync = settings.video.vsync;
+        view.smooth = settings.video.smooth;
+        view.stretch = settings.video.aspect == "stretch";
+        presenter.present(fresh ? showing.rgba.data() : nullptr, showing.width, showing.height, view,
+                          [](VkCommandBuffer cmd) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd); });
+        last_present = Clock::now();
+        refreshes++;
+        if (fresh) presented++;
+    }
+
+    // the report: the player's counts, then boot's
+    const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+    if (changed && !frontend::save(config_file, settings, error)) std::fprintf(stderr, "%s\n", error.c_str());
+    std::printf("player: %s\n", ended.c_str());
+    std::printf("player: %.1f s; %llu swaps (%.1f/s), %llu front buffers handed over, %llu frames presented "
+                "(%.1f/s), %llu window refreshes; %llu screenshots written to %s\n",
+                seconds, (unsigned long long)mailbox.swaps.load(), mailbox.swaps / seconds,
+                (unsigned long long)mailbox.handed.load(), (unsigned long long)presented, presented / seconds,
+                (unsigned long long)refreshes, (unsigned long long)shots_written,
+                screenshots.empty() ? "(none asked)" : screenshots.string().c_str());
+    std::printf("player: input states delivered %llu\n", (unsigned long long)kernel::input_states_delivered(k));
+    if (sounding)
+        std::printf("player: sound frames: %llu submitted, %llu played to the device (%u channels), %llu with sound, "
+                    "%llu dropped, %llu times starved\n",
+                    (unsigned long long)sound.submitted.load(), (unsigned long long)sound.sent.load(), sound.channels(),
+                    (unsigned long long)sound.audible.load(), (unsigned long long)sound.dropped.load(),
+                    (unsigned long long)sound.starved.load());
+    else
+        std::printf("player: no sound device\n");
+    std::printf("threads:\n%s", k.thread_report().c_str());
+    game::print_report(g, true);
+    // the guest's threads still run: no destructors under them (boot's way)
+    presenter.idle();
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::_Exit(0);
+}

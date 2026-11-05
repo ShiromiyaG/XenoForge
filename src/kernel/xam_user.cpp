@@ -8,13 +8,12 @@
  ******************************************************************************
  */
 
-// XAM's users, input and UI (xam.h): one user signed in offline in slot 0,
-// its profile settings, no controller connected, and the guide's UI
-// answered as Xenia answers it headless. Translated from Xenia (BSD; see
-// LICENSE-xenia): xam_user.cc, user_settings.h and .cc, user_data.cc,
-// user_tracker.cc (GetUserSetting), xam_input.cc with hid/input_system.cc
-// (no driver: no device), xam_ui.cc (the headless paths); checked against
-// them.
+// XAM's users and UI (xam.h): one user signed in offline in slot 0, its
+// profile settings, and the guide's UI answered as Xenia answers it
+// headless (the input exports are in xam_input.cpp). Translated from Xenia
+// (BSD; see LICENSE-xenia): xam_user.cc, user_settings.h and .cc, user_data.cc,
+// user_tracker.cc (GetUserSetting), xam_ui.cc (the headless paths);
+// checked against them.
 //
 // Where it differs from Xenia, and why:
 //   - the user is Xenia's default profile (XUID 0xB13EBABEBABEBABE, or the
@@ -366,46 +365,7 @@ XF_EXPORT(xam, XamUserGetDeviceContext) {
     result(c, X_E_DEVICE_NOT_CONNECTED);
 }
 
-// ---- input (xam_input.cc): no controller is connected yet ----
-
-// (user_index, flags, X_INPUT_CAPABILITIES *)
-XF_EXPORT(xam, XamInputGetCapabilities) {
-    if (uint32_t caps = arg(k, c, 2)) std::memset(k.host(caps), 0, 20);
-    result(c, X_ERROR_DEVICE_NOT_CONNECTED);
-}
-
-// (unknown, user_index, flags, X_INPUT_CAPABILITIES_EX *)
-XF_EXPORT(xam, XamInputGetCapabilitiesEx) {
-    if (arg(k, c, 0) > 1) return result(c, X_ERROR_NOT_SUPPORTED);
-    uint32_t caps = arg(k, c, 3);
-    if (!caps) return result(c, X_ERROR_BAD_ARGUMENTS);
-    std::memset(k.host(caps), 0, 20 + 12);
-    result(c, X_ERROR_DEVICE_NOT_CONNECTED);
-}
-
-// (user_index, flags, X_INPUT_STATE *)
-XF_EXPORT(xam, XamInputGetState) {
-    if (uint32_t state = arg(k, c, 2)) std::memset(k.host(state), 0, 16);
-    result(c, X_ERROR_DEVICE_NOT_CONNECTED);
-}
-
-// (user_index, flags, X_INPUT_VIBRATION *)
-XF_EXPORT(xam, XamInputSetState) {
-    if (arg(k, c, 0) >= 4) return result(c, X_E_DEVICE_NOT_CONNECTED);
-    if (!arg(k, c, 2)) return result(c, X_ERROR_BAD_ARGUMENTS);
-    result(c, X_ERROR_DEVICE_NOT_CONNECTED);
-}
-
-// (user_index_ptr, flags, X_INPUT_KEYSTROKE *)
-XF_EXPORT(xam, XamInputGetKeystrokeEx) {
-    uint32_t keystroke = arg(k, c, 2);
-    if (!keystroke) return result(c, X_ERROR_BAD_ARGUMENTS);
-    std::memset(k.host(keystroke), 0, 8);
-    result(c, X_ERROR_DEVICE_NOT_CONNECTED);
-}
-
-XF_EXPORT(xam, XamEnableInactivityProcessing) { result(c, X_ERROR_SUCCESS); }
-XF_EXPORT(xam, XamResetInactivity) {}
+// (input: xam_input.cpp)
 
 // ---- the guide's UI (xam_ui.cc, headless) ----
 
