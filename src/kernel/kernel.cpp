@@ -267,6 +267,10 @@ void Kernel::dispatch(ppc::Context &c, uint32_t target) {
     if (stopped) return;
     if (try_call(c, target)) return;
     interpreted_++;
+    {
+        std::lock_guard<std::mutex> lock(counts_mutex_);
+        interpreted_targets_[target]++;
+    }
     ppc::Stopped s = ppc::interpret(c, target, uint32_t(c.lr), step_limit);
     if (s.reason != ppc::Stopped::Returned && !stopped.exchange(true)) {
         char reason[128];
@@ -290,6 +294,10 @@ std::map<std::string, uint64_t> Kernel::calls() const {
 std::map<std::string, uint64_t> Kernel::unimplemented() const {
     std::lock_guard<std::mutex> lock(counts_mutex_);
     return unimplemented_;
+}
+std::unordered_map<uint32_t, uint64_t> Kernel::interpreted_targets() const {
+    std::lock_guard<std::mutex> lock(counts_mutex_);
+    return interpreted_targets_;
 }
 
 } // namespace xf::kernel

@@ -170,12 +170,15 @@ int emit(const std::string &input, const std::string &xex_path, const std::files
     f.close();
     for (int k = n + 1; k < files; k++) std::ofstream(out / ("functions_" + std::to_string(k) + ".cpp")) << "\n";
     std::ofstream t(out / "table.cpp");
+    // C linkage, so boot declares the table with the kernel's own type
+    // (xf::kernel::Generated, the same layout) without the C++ name
+    // carrying either type
     t << "// Written by xfrecomp emit: the functions by address, for dispatch.\n#include \"functions.h\"\n"
          "#include <cstddef>\n\nstruct XfFunction { uint32_t address; void (*fn)(xf::ppc::Context &); };\n"
-         "extern const XfFunction xf_functions[] = {\n";
+         "extern \"C\" const XfFunction xf_functions[] = {\n";
     for (const recomp::Function *fn : list)
         t << "    {0x" << recomp::function_name("", fn->address) << "u, " << recomp::function_name(prefix, fn->address) << "},\n";
-    t << "};\nextern const size_t xf_function_count = " << list.size() << ";\n";
+    t << "};\nextern \"C\" const size_t xf_function_count = " << list.size() << ";\n";
     std::printf("%zu functions, %llu instructions, %d files\n", list.size(), (unsigned long long)total, files);
     return 0;
 }

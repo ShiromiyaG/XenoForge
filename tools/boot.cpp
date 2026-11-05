@@ -9,7 +9,10 @@
 // directory is; --content names the writable storage root (Xenia's layout:
 // content/ for saves, cache*/), a temporary directory's xenoforge by default.
 //
-//   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>]
+// Built as boot_<game> (CMake's XF_GAMES), it links that game's generated
+// code (xfrecomp emit) and dispatch runs it; --interpret leaves it out.
+//
+//   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 
 #include "xenoforge/disc.h"
 #include "xenoforge/kernel.h"
@@ -30,6 +33,13 @@
 #endif
 
 using namespace xf;
+
+#ifdef XF_GENERATED
+// the game's generated functions by address (xfrecomp emit's table.cpp, C
+// linkage; the same layout as Generated)
+extern "C" const kernel::Generated xf_functions[];
+extern "C" const size_t xf_function_count;
+#endif
 
 namespace {
 
@@ -79,7 +89,7 @@ bool load(const std::string &input, const std::string &xex_path, Xex &xex, std::
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
-                             "[--content <dir>]\n");
+                             "[--content <dir>] [--interpret]\n");
         return 2;
     }
     std::string input = argv[1], xex_path = "default.xex";
@@ -87,12 +97,14 @@ int main(int argc, char **argv) {
     std::filesystem::path storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
     uint64_t steps = 2'000'000'000ull;
     uint32_t seconds = 30;
+    bool interpret = false; // the generated code left out, where it is linked
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc) xex_path = argv[++k];
         else if (a == "--steps" && k + 1 < argc) steps = std::strtoull(argv[++k], nullptr, 10);
         else if (a == "--seconds" && k + 1 < argc) seconds = uint32_t(std::strtoul(argv[++k], nullptr, 10));
         else if (a == "--content" && k + 1 < argc) storage = argv[++k];
+        else if (a == "--interpret") interpret = true;
     }
 
     std::string error;
@@ -109,6 +121,16 @@ int main(int argc, char **argv) {
     std::printf("storage: %s\n", storage.string().c_str());
     if (!k.load(xex, error)) return std::fprintf(stderr, "load: %s\n", error.c_str()), 1;
     k.step_limit = steps;
+#ifdef XF_GENERATED
+    // dispatch looks addresses up by binary search
+    if (!std::is_sorted(xf_functions, xf_functions + xf_function_count,
+                        [](const kernel::Generated &a, const kernel::Generated &b) { return a.address < b.address; }))
+        return std::fprintf(stderr, "the generated functions are not in address order\n"), 1;
+    if (!interpret) k.set_generated(xf_functions, xf_function_count);
+    std::printf("generated code: %zu functions%s\n", size_t(xf_function_count), interpret ? " (left out: --interpret)" : "");
+#else
+    (void)interpret;
+#endif
     std::printf("loaded %s: base 0x%08X, entry 0x%08X, %zu imported functions\n", xex_path.c_str(), xex.base_address,
                 k.entry_point(), k.imports().size());
     std::printf("stack 0x%X; TLS: ", xex.stack_size);
@@ -140,7 +162,16 @@ int main(int argc, char **argv) {
 
 namespace {
 void print_report(kernel::Kernel &k) {
-    std::printf("interpreted entries: %llu\n", (unsigned long long)k.interpreted_entries());
+    // where the interpreter was entered: with generated code, what
+    // discovery missed (the most entered first)
+    auto targets = k.interpreted_targets();
+    std::vector<std::pair<uint64_t, uint32_t>> entered;
+    for (const auto &[address, n] : targets) entered.push_back({n, address});
+    std::sort(entered.rbegin(), entered.rend());
+    std::printf("interpreted entries: %llu, at %zu addresses\n", (unsigned long long)k.interpreted_entries(),
+                entered.size());
+    for (size_t i = 0; i < entered.size() && i < 20; i++)
+        std::printf("  %10llu  0x%08X\n", (unsigned long long)entered[i].first, entered[i].second);
     std::vector<std::pair<uint64_t, std::string>> calls;
     for (const auto &[name, n] : k.calls()) calls.push_back({n, name});
     std::sort(calls.rbegin(), calls.rend());

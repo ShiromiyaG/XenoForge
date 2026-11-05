@@ -116,6 +116,26 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/memory.cpp) # the guest memory, being 
     add_executable(boot tools/boot.cpp)
     target_link_libraries(boot PRIVATE xenoforge_kernel xenoforge)
 endif()
+# boot linked with a game's generated code: `xfrecomp emit <iso> <XF_GEN_DIR>/<name>`
+# writes it (game code: outside the repository), -DXF_GAMES="chaves;ben10" builds
+# boot_<name> for each. The code is built here, against these headers, so it
+# follows every change to the instructions' semantics.
+set(XF_GAMES "" CACHE STRING "games whose generated code a boot_<name> links (directories under XF_GEN_DIR)")
+set(XF_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/gen" CACHE PATH "where xfrecomp emit wrote each game")
+foreach(game ${XF_GAMES})
+    file(GLOB game_sources CONFIGURE_DEPENDS ${XF_GEN_DIR}/${game}/functions_*.cpp ${XF_GEN_DIR}/${game}/table.cpp)
+    if(NOT game_sources)
+        message(FATAL_ERROR "XF_GAMES: no generated code in ${XF_GEN_DIR}/${game}")
+    endif()
+    add_library(game_${game} STATIC ${game_sources})
+    target_include_directories(game_${game} PRIVATE include ${XF_GEN_DIR}/${game})
+    # optimized, without debug information (it is large) or warnings; never
+    # -ffast-math (docs/recompiler.md)
+    target_compile_options(game_${game} PRIVATE -O2 -g0 -w -mfma -mavx2)
+    add_executable(boot_${game} tools/boot.cpp)
+    target_compile_definitions(boot_${game} PRIVATE XF_GENERATED)
+    target_link_libraries(boot_${game} PRIVATE xenoforge_kernel xenoforge game_${game})
+endforeach()
 # the kernel's threads and objects, tested through their exports and
 # src/kernel/objects.h
 add_executable(kernel_threads_test tests/kernel_threads_test.cpp)

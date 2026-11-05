@@ -165,6 +165,9 @@ public:
     std::map<std::string, uint64_t> calls() const;
     std::map<std::string, uint64_t> unimplemented() const;
     uint64_t interpreted_entries() const { return interpreted_; }
+    // the addresses the interpreter was entered at, and how often: with
+    // generated code linked, what discovery missed
+    std::unordered_map<uint32_t, uint64_t> interpreted_targets() const;
 
     // a variable export's value (the kernel's object for it), by name
     uint32_t variable(const std::string &name);
@@ -240,6 +243,7 @@ private:
     mutable std::mutex counts_mutex_;
     std::map<std::string, uint64_t> calls_, unimplemented_;
     std::atomic<uint64_t> interpreted_{0};
+    std::unordered_map<uint32_t, uint64_t> interpreted_targets_; // under counts_mutex_
     // add_thunk's (a map: its entries stay where they are)
     mutable std::shared_mutex thunks_mutex_;
     std::map<uint32_t, Import> thunks_;
