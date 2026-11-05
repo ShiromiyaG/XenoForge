@@ -81,6 +81,24 @@ added to its base; loads and stores swap bytes.
   57-63, which the context does not keep; neither game uses them).
 - Traps call `system->trap` when they fire (Xenia ignores them by default);
   `sc` calls `system->syscall`. VSCR is SAT alone, NJ always set.
+- VMX: VSCR[SAT] is sticky (Xenia's backends always clear it). `vsl`/`vsr`
+  shift each byte by its own count with the neighbour's bits, as the
+  console does where the counts differ (Xenia uses byte 15's for all and
+  skips those 876 tests; they pass here). The 22 instructions Xenia lacks
+  (`vmsum*`, `vmul[eo]*`, `vsum*`, `vmhaddshs`, `vmhraddshs`, `vmladduhm`,
+  `vupk[hl]px`) follow the AltiVec PEM.
+- VMX floating point runs in non-Java mode: denormals in and out flush to
+  a zero of their sign. `vmaddfp`/`vnmsubfp` round once (`std::fma`; one
+  instruction with FMA in the build). Where the console's tests contradict
+  Xenia, the console wins: a NaN comes out quieted, the first in operand
+  order vA, vB, vC; `vnmsubfp` does not negate a NaN; invalid operations
+  give 0x7FC00000; `vmaxfp`/`vminfp` quiet signalling NaNs; `vcmpbfp`'s NaN
+  sets both bits. `vrefp`, `vexptefp`, `vlogefp` stay exact as Xenia's (the
+  console's estimates are skipped tests); `vrsqrtefp` uses the console's
+  table. The dot products and D3D packs follow Xenia's sequences bit for bit
+  (checked on 2M random vectors per type), but for FLOAT16 -0 and denormals,
+  where Xenia's fast path looks wrong. All of it assumes the host rounds to
+  nearest.
 - For step A4: Xenia adds 0x1000 to addresses at 0xE0000000 and above (the
   4 KB offset of that physical view); `ops::host` is the one place to do it.
 
