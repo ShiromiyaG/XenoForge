@@ -70,6 +70,42 @@ call is a C++ call that comes back. The generated code never leaves partway;
 yield points where loops turn back and functions start hand over in the
 deterministic mode (plan, "Threads").
 
+## Discovery
+
+Where functions start, where they end, and what each indirect branch can
+reach. Learned from rexglue's fork (`../rexglue-sdk/src/codegen`, BSD), which
+runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
+
+- **Starts**, the more certain winning: the port's own entries; the import
+  thunks; the register save and restore helpers (`__savegprlr_14`... found
+  by their first words, one entry per register as rexglue does); `.pdata`
+  (8-byte entries: begin, then prolog length, length in instructions,
+  32-bit and exception flags; with the exception flag, the handler and its
+  scope or FuncInfo table give the funclets); `bl` targets; then pointers:
+  words in data sections and `lis`/`addi` pairs that look like a function's
+  first instruction (`mflr r12`, `stwu r1`, or after `blr`/`bctr`/`b`/0),
+  for engines without RTTI (UE3); last, gaps no function covers.
+  On El Chavo Kart `.pdata` alone gives about 52,400 of the 73,800
+  functions rexglue emits.
+- **Ends**: `.pdata`'s length where there is one; else the blocks reached,
+  never past the next known start. A function that runs on into the next one
+  ends in a tail call to it (rexglue copies the code instead, and functions
+  without a size there swallow their neighbours).
+- **Jump tables**: the four forms the XDK's compiler writes (XenonAnalyse's
+  patterns, rexglue's detectJumpTable): `lwzx` of absolute words; `lbzx` of
+  byte offsets added to a base, or shifted by an `rlwinm` first; `lhzx` of
+  halfword offsets; bounded by the `cmplwi` or `clrlwi` on the index before.
+- **Everything else** that is indirect (`bctr`, `bctrl`, `blrl`, a branch
+  to an address no function holds) goes through the dispatch table, and an
+  address with no generated code runs in the interpreter: a wrong guess
+  costs speed, never correctness. `boot` counts those entries, which is how
+  discovery is improved, game by game, without traps (rexglue leaves 26
+  unresolved branches and 26 unresolved table entries on El Chavo Kart, and
+  needed 633 starts added by hand).
+- **Checked** against rexglue's list for El Chavo Kart (74,112 entries: 294
+  imports, 73,818 bodies) and `.pdata`; the differences are counted and
+  explained.
+
 ## Steps
 
 1. Decoder and disassembler, checked against Xenia's (above).
