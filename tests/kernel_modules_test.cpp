@@ -1,12 +1,22 @@
 // The modules family (src/kernel/modules.cpp), the Rtl functions (rtl.cpp)
 // and the small exports (misc.cpp), called as a game calls them on a kernel
-// that loaded a made-up executable, against what Xenia's code gives.
+// that loaded a made-up executable, against what Xenia's code gives. The
+// second executables are DLLs the test builds itself (XEX2 files, neither
+// encrypted nor compressed, as parse_xex and load_xex_image take any), in a
+// temporary directory mounted as the game's: loaded, their imports bound
+// (the kernel's, and one DLL's from the other), their entry points called,
+// their exports found, unloaded and loaded again.
 
 #include "kernel_harness.h"
 
+#include "objects.h"
 #include "xenoforge/xex.h"
 
 #include <array>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <random>
 
 using namespace xf;
 
@@ -16,6 +26,10 @@ constexpr uint32_t BASE = 0x82000000;
 
 void put32(std::vector<uint8_t> &v, size_t at, uint32_t x) {
     v[at] = uint8_t(x >> 24), v[at + 1] = uint8_t(x >> 16), v[at + 2] = uint8_t(x >> 8), v[at + 3] = uint8_t(x);
+}
+void put16(std::vector<uint8_t> &v, size_t at, uint16_t x) { v[at] = uint8_t(x >> 8), v[at + 1] = uint8_t(x); }
+void put_le32(std::vector<uint8_t> &v, size_t at, uint32_t x) {
+    v[at] = uint8_t(x), v[at + 1] = uint8_t(x >> 8), v[at + 2] = uint8_t(x >> 16), v[at + 3] = uint8_t(x >> 24);
 }
 
 // An executable with what the modules read: system flags, the entry point,
@@ -167,7 +181,9 @@ void variables(KernelHarness &h) {
     CHECK(k.variable("KeDebugMonitorData") == 0x80207A64 && k.load32(0x80207A64) == 0);
     CHECK(k.variable("KeCertMonitorData") == 0x80207A60 && k.load32(0x80207A60) == 0);
     CHECK(k.variable("ExLoadedCommandLine") == 0x80207C60 && h.read(0x80207C60) == "\"default.xex\"");
-    CHECK(k.variable("ExLoadedImageName") == 0x80207E60 && h.read(0x80207E60) == "\\Device\\Cdrom0\\default.xex");
+    // the executable's path: game:\default.xex resolved (the test's directory)
+    CHECK(k.variable("ExLoadedImageName") == 0x80207E60 &&
+          h.read(0x80207E60) == "\\Device\\Harddisk0\\Partition1\\default.xex");
     CHECK(k.variable("ExConsoleGameRegion") == 0x80205150 && k.load16(0x80205150) == 0xFFFF);
     CHECK(k.variable("VdGpuClockInMHz") == 0x801D0E94 && k.load32(0x801D0E94) == 500);
     uint32_t device = k.load32(k.variable("VdGlobalDevice"));
@@ -434,15 +450,353 @@ void debugging(KernelHarness &h) {
     CHECK(h.krnl("MicDeviceRequest", {device}) == kernel::X_STATUS_INVALID_PARAMETER);
 }
 
+// ---- second executables: two DLLs ----
+//
+// lib.dll at LIB imports KeQueryPerformanceFrequency; its export 1 returns
+// that plus 7, its export 2 is a word of data. app.dll at APP imports from
+// lib.dll (export 1's thunk and descriptor, export 2, and ordinals 7 and 9
+// lib.dll has not) and from the kernel (KeQueryPerformanceFrequency,
+// XboxHardwareInfo); its export 1 calls lib.dll's through the import thunk
+// and adds 0x100. Each DllMain appends (hinstance, reason, reserved, its
+// id) to a log in guest memory.
+
+constexpr uint32_t LIB = 0x88000000, APP = 0x89000000;
+constexpr uint32_t FUNCTION = 0x1000, ENTRY = 0x1800, IMPORTS = 0x3000, DATA = 0x4000, IMAGE_SIZE = 0x10000;
+constexpr uint32_t LIB_ID = 0x11, APP_ID = 0x22;
+constexpr uint16_t KE_QUERY_PERFORMANCE_FREQUENCY = 0x83, XBOX_HARDWARE_INFO = 0x156;
+
+// the instructions the DLLs' code uses
+constexpr uint32_t MFLR_R0 = 0x7C0802A6, MTLR_R0 = 0x7C0803A6, MTCTR_R11 = 0x7D6903A6, BCTR = 0x4E800420;
+constexpr uint32_t BLR = 0x4E800020;
+uint32_t li(uint32_t d, int16_t v) { return 14u << 26 | d << 21 | uint16_t(v); }
+uint32_t addi(uint32_t d, uint32_t a, int16_t v) { return 14u << 26 | d << 21 | a << 16 | uint16_t(v); }
+uint32_t lis(uint32_t d, uint16_t v) { return 15u << 26 | d << 21 | v; }
+uint32_t ori(uint32_t a, uint32_t s, uint16_t v) { return 24u << 26 | s << 21 | a << 16 | v; }
+uint32_t lwz(uint32_t d, int16_t offset, uint32_t a) { return 32u << 26 | d << 21 | a << 16 | uint16_t(offset); }
+uint32_t stw(uint32_t s, int16_t offset, uint32_t a) { return 36u << 26 | s << 21 | a << 16 | uint16_t(offset); }
+uint32_t stwu(uint32_t s, int16_t offset, uint32_t a) { return 37u << 26 | s << 21 | a << 16 | uint16_t(offset); }
+uint32_t slwi(uint32_t a, uint32_t s, uint32_t n) { return 21u << 26 | s << 21 | a << 16 | n << 11 | (31 - n) << 1; }
+uint32_t add(uint32_t d, uint32_t a, uint32_t b) { return 31u << 26 | d << 21 | a << 16 | b << 11 | 266u << 1; }
+uint32_t bl(uint32_t from, uint32_t to) { return 18u << 26 | ((to - from) & 0x03FFFFFC) | 1; }
+
+void put_code(std::vector<uint8_t> &image, uint32_t at, std::initializer_list<uint32_t> code) {
+    for (uint32_t word : code) put32(image, at, word), at += 4;
+}
+
+// An import thunk as the linker leaves it: the record (type 1, the ordinal),
+// a word the loader overwrites, mtctr r11, bctr
+void put_thunk(std::vector<uint8_t> &image, uint32_t at, uint16_t ordinal) {
+    put_code(image, at, {0x01000000u | ordinal, 0, MTCTR_R11, BCTR});
+}
+
+struct ImportLibrary {
+    std::string name;
+    std::vector<uint32_t> records;
+};
+
+// The image: MZ; the XEX export table at 0x100 (two exports from ordinal 1:
+// the function, the data); a PE export directory at 0x200 (little-endian,
+// its tables relative to it) naming them LibFunction and LibData; the
+// DllMain; the data word.
+std::vector<uint8_t> make_image(uint32_t base, uint32_t id, uint32_t log) {
+    std::vector<uint8_t> image(IMAGE_SIZE, 0);
+    image[0] = 'M', image[1] = 'Z';
+    put32(image, 0x120, base >> 16);
+    put32(image, 0x124, 2);
+    put32(image, 0x128, 1);
+    put32(image, 0x12C, FUNCTION);
+    put32(image, 0x130, DATA);
+    put_le32(image, 0x214, 2);    // functions
+    put_le32(image, 0x218, 2);    // names
+    put_le32(image, 0x21C, 0x40); // the functions' addresses
+    put_le32(image, 0x220, 0x48); // the names
+    put_le32(image, 0x224, 0x50); // the names' ordinals
+    put_le32(image, 0x240, FUNCTION);
+    put_le32(image, 0x244, DATA);
+    put_le32(image, 0x248, 0x60);
+    put_le32(image, 0x24C, 0x70);
+    image[0x250] = 0, image[0x252] = 1;
+    std::memcpy(&image[0x260], "LibFunction", 12);
+    std::memcpy(&image[0x270], "LibData", 8);
+    // DllMain(hinstance, reason, reserved): the log's count at log, its
+    // entries of 16 bytes from log + 4
+    put_code(image, ENTRY,
+             {lis(11, uint16_t(log >> 16)), ori(11, 11, uint16_t(log)), lwz(12, 0, 11), slwi(10, 12, 4),
+              add(10, 10, 11), stw(3, 4, 10), stw(4, 8, 10), stw(5, 12, 10), li(9, int16_t(id)), stw(9, 16, 10),
+              addi(12, 12, 1), stw(12, 0, 11), li(3, 1), BLR});
+    put32(image, DATA, 0xCAFEF00D);
+    return image;
+}
+
+// A DLL as the XDK links one, neither encrypted nor compressed: a header of
+// 0x1000 bytes (module flags title and DLL; entry point, base, file format,
+// import libraries, exports by name), its security info at 0x400 (image
+// size, load address, export table; no page descriptors), then the image.
+std::vector<uint8_t> make_dll(uint32_t base, const std::vector<uint8_t> &image,
+                              const std::vector<ImportLibrary> &imports) {
+    std::vector<uint8_t> f(0x1000, 0);
+    std::memcpy(f.data(), "XEX2", 4);
+    put32(f, 0x04, 0x9);
+    put32(f, 0x08, 0x1000);
+    put32(f, 0x10, 0x400);
+    const std::pair<uint32_t, uint32_t> headers[] = {
+        {xex_key::ENTRY_POINT, base + ENTRY},      {xex_key::IMAGE_BASE_ADDRESS, base},
+        {xex_key::FILE_FORMAT_INFO, 0x600},        {xex_key::IMPORT_LIBRARIES, 0x700},
+        {0x00E10402 /* exports by name */, 0x610},
+    };
+    put32(f, 0x14, uint32_t(std::size(headers)));
+    for (size_t i = 0; i < std::size(headers); i++) {
+        put32(f, 0x18 + 8 * i, headers[i].first);
+        put32(f, 0x1C + 8 * i, headers[i].second);
+    }
+    put32(f, 0x400 + 0x004, uint32_t(image.size()));
+    put32(f, 0x400 + 0x110, base);
+    put32(f, 0x400 + 0x160, base + 0x100);
+    put32(f, 0x600, 8); // no encryption, no compression
+    put32(f, 0x610, 0x200);
+    put32(f, 0x614, 0x80);
+    // the import libraries: the names (each padded to 4), then each one's
+    // records
+    std::vector<uint8_t> names;
+    for (const ImportLibrary &library : imports) {
+        names.insert(names.end(), library.name.begin(), library.name.end());
+        names.push_back(0);
+        while (names.size() % 4) names.push_back(0);
+    }
+    std::memcpy(&f[0x70C], names.data(), names.size());
+    size_t at = 0x70C + names.size();
+    for (size_t i = 0; i < imports.size(); i++) {
+        uint32_t size = 0x28 + 4 * uint32_t(imports[i].records.size());
+        put32(f, at, size);
+        put16(f, at + 0x24, uint16_t(i));
+        put16(f, at + 0x26, uint16_t(imports[i].records.size()));
+        for (size_t r = 0; r < imports[i].records.size(); r++) put32(f, at + 0x28 + 4 * r, imports[i].records[r]);
+        at += size;
+    }
+    put32(f, 0x700, uint32_t(at - 0x700));
+    put32(f, 0x704, uint32_t(names.size()));
+    put32(f, 0x708, uint32_t(imports.size()));
+    f.insert(f.end(), image.begin(), image.end());
+    return f;
+}
+
+std::vector<uint8_t> make_lib(uint32_t log) {
+    std::vector<uint8_t> image = make_image(LIB, LIB_ID, log);
+    // export 1: KeQueryPerformanceFrequency() + 7
+    put_code(image, FUNCTION,
+             {MFLR_R0, stw(0, -8, 1), stwu(1, -0x60, 1), bl(LIB + FUNCTION + 12, LIB + IMPORTS + 0x10), addi(3, 3, 7),
+              addi(1, 1, 0x60), lwz(0, -8, 1), MTLR_R0, BLR});
+    put32(image, IMPORTS, KE_QUERY_PERFORMANCE_FREQUENCY);
+    put_thunk(image, IMPORTS + 0x10, KE_QUERY_PERFORMANCE_FREQUENCY);
+    return make_dll(LIB, image, {{"xboxkrnl.exe", {LIB + IMPORTS, LIB + IMPORTS + 0x10}}});
+}
+
+std::vector<uint8_t> make_app(uint32_t log) {
+    std::vector<uint8_t> image = make_image(APP, APP_ID, log);
+    // export 1: lib.dll's export 1 + 0x100, through the import thunk
+    put_code(image, FUNCTION,
+             {MFLR_R0, stw(0, -8, 1), stwu(1, -0x60, 1), bl(APP + FUNCTION + 12, APP + IMPORTS + 0x10),
+              addi(3, 3, 0x100), addi(1, 1, 0x60), lwz(0, -8, 1), MTLR_R0, BLR});
+    put32(image, IMPORTS + 0x00, 1);
+    put_thunk(image, IMPORTS + 0x10, 1);
+    put32(image, IMPORTS + 0x20, 2);
+    put32(image, IMPORTS + 0x24, 7);
+    put32(image, IMPORTS + 0x28, 9);
+    put_thunk(image, IMPORTS + 0x30, 9);
+    put32(image, IMPORTS + 0x40, KE_QUERY_PERFORMANCE_FREQUENCY);
+    put_thunk(image, IMPORTS + 0x50, KE_QUERY_PERFORMANCE_FREQUENCY);
+    put32(image, IMPORTS + 0x60, XBOX_HARDWARE_INFO);
+    return make_dll(APP, image,
+                    {{"lib.dll",
+                      {APP + IMPORTS, APP + IMPORTS + 0x10, APP + IMPORTS + 0x20, APP + IMPORTS + 0x24,
+                       APP + IMPORTS + 0x28, APP + IMPORTS + 0x30}},
+                     {"xboxkrnl.exe", {APP + IMPORTS + 0x40, APP + IMPORTS + 0x50, APP + IMPORTS + 0x60}}});
+}
+
+struct EntryCall {
+    uint32_t hinstance, reason, reserved, id;
+    bool operator==(const EntryCall &) const = default;
+};
+
+// the DllMain calls logged since `from`
+std::vector<EntryCall> entry_calls(kernel::Kernel &k, uint32_t log, uint32_t from = 0) {
+    std::vector<EntryCall> calls;
+    for (uint32_t i = from; i < k.load32(log); i++) {
+        uint32_t e = log + 16 * i;
+        calls.push_back({k.load32(e + 4), k.load32(e + 8), k.load32(e + 12), k.load32(e + 16)});
+    }
+    return calls;
+}
+
+uint32_t ansi(KernelHarness &h, const char *s) {
+    uint32_t a = h.alloc(8), n = uint32_t(std::strlen(s));
+    h.k->store16(a, uint16_t(n));
+    h.k->store16(a + 2, uint16_t(n + 1));
+    h.k->store32(a + 4, h.string(s));
+    return a;
+}
+
+void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &lib_file) {
+    kernel::Kernel &k = *h.k;
+    uint32_t out = h.alloc(4);
+    constexpr uint32_t ATTACH = 1, DETACH = 0, THREAD_ATTACH = 2, THREAD_DETACH = 3;
+
+    // XexLoadImage of app.dll: lib.dll, which it imports from, loaded with
+    // it; both DllMains on this thread, lib.dll's first, each with its
+    // HMODULE; app.dll's load counted
+    CHECK(h.krnl("XexLoadImage", {h.string("game:\\app.dll"), 9, 0, out}) == 0);
+    uint32_t app = k.load32(out);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0);
+    uint32_t lib = k.load32(out);
+    CHECK(app && lib && app != lib);
+    CHECK((entry_calls(k, log) == std::vector<EntryCall>{{lib, ATTACH, 0, LIB_ID}, {app, ATTACH, 0, APP_ID}}));
+    CHECK(k.load16(app + 0x40) == 1 && k.load16(lib + 0x40) == 0);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("game:\\LIB.DLL"), out}) == 0 && k.load32(out) == lib);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("app"), out}) == 0 && k.load32(out) == app);
+
+    // the loader entry and the header in guest memory
+    uint32_t header = k.load32(app + 0x58);
+    CHECK(header && std::memcmp(k.host(header), "XEX2", 4) == 0 && k.load32(header + 8) == 0x1000);
+    CHECK(k.load32(app + 0x1C) == APP && k.load32(app + 0x38) == IMAGE_SIZE && k.load32(app + 0x3C) == APP + ENTRY);
+    CHECK(k.load32(app + 0x18) == 0);
+    CHECK(h.krnl("RtlImageXexHeaderField", {header, xex_key::ENTRY_POINT}) == APP + ENTRY);
+    // the image at its base, its pages taken
+    CHECK(k.host(APP)[0] == 'M' && k.load32(APP + DATA) == 0xCAFEF00D);
+    RegionInfo region;
+    CHECK(k.memory().heap_for(APP)->query(APP, region) && region.state != 0 && region.allocation_base == APP);
+
+    // the imports: lib.dll's function descriptor and data get their
+    // addresses, its function's thunk jumps there (lis r11 / ori r11 before
+    // the thunk's own mtctr r11; bctr), what lib.dll lacks gets 0xF00DF00D or
+    // a thunk to nothing; the kernel's as the executable's
+    CHECK(k.load32(APP + IMPORTS) == LIB + FUNCTION);
+    CHECK(k.load32(APP + IMPORTS + 0x10) == lis(11, LIB >> 16) &&
+          k.load32(APP + IMPORTS + 0x14) == ori(11, 11, FUNCTION));
+    CHECK(k.load32(APP + IMPORTS + 0x18) == MTCTR_R11 && k.load32(APP + IMPORTS + 0x1C) == BCTR);
+    CHECK(k.load32(APP + IMPORTS + 0x20) == LIB + DATA);
+    CHECK(k.load32(APP + IMPORTS + 0x24) == 0xF00DF00D && k.load32(APP + IMPORTS + 0x28) == 0xF00DF00D);
+    CHECK(k.load32(APP + IMPORTS + 0x30) == 0x44000042 && k.load32(APP + IMPORTS + 0x34) == BLR);
+    CHECK(k.load32(APP + IMPORTS + 0x40) == 0xDEADC0DE);
+    CHECK(k.load32(APP + IMPORTS + 0x50) == 0x44000042 && k.load32(APP + IMPORTS + 0x58) == 0x60000000);
+    CHECK(k.load32(APP + IMPORTS + 0x60) == k.variable("XboxHardwareInfo"));
+    CHECK(k.load32(LIB + IMPORTS + 0x10) == 0x44000042);
+
+    // the code runs (interpreted): app.dll's export through its thunk into
+    // lib.dll's, which calls the kernel through its own
+    CHECK(h.krnl("XexGetProcedureAddress", {app, 1, out}) == 0 && k.load32(out) == APP + FUNCTION);
+    k.call(*h.c, APP + FUNCTION);
+    CHECK(uint32_t(h.c->r[3]) == 50'000'000 + 7 + 0x100);
+    k.call(*h.c, APP + IMPORTS + 0x30); // lib.dll's ordinal 9: no such export
+    CHECK(uint32_t(h.c->r[3]) == 0 && k.unimplemented().count("lib!lib_9") == 1);
+
+    // XexGetProcedureAddress: the export table by ordinal, the PE export
+    // directory by name
+    CHECK(h.krnl("XexGetProcedureAddress", {lib, 1, out}) == 0 && k.load32(out) == LIB + FUNCTION);
+    CHECK(h.krnl("XexGetProcedureAddress", {lib, 2, out}) == 0 && k.load32(out) == LIB + DATA);
+    CHECK(h.krnl("XexGetProcedureAddress", {lib, 3, out}) == 0xC0000263 && k.load32(out) == 0);
+    CHECK(h.krnl("XexGetProcedureAddress", {lib, h.string("LibData"), out}) == 0 && k.load32(out) == LIB + DATA);
+    CHECK(h.krnl("XexGetProcedureAddress", {lib, h.string("LibFunction"), out}) == 0);
+    CHECK(k.load32(out) == LIB + FUNCTION);
+    CHECK(h.krnl("XexGetProcedureAddress", {lib, h.string("LibNothing"), out}) == 0xC0000263);
+
+    // loaded already: found by a bare name or another case, counted, no
+    // DllMain again
+    CHECK(h.krnl("XexLoadImage", {h.string("lib.dll"), 9, 0, out}) == 0 && k.load32(out) == lib);
+    CHECK(h.krnl("XexLoadImage", {h.string("GAME:\\App.dll"), 9, 0, out}) == 0 && k.load32(out) == app);
+    CHECK(k.load16(lib + 0x40) == 1 && k.load16(app + 0x40) == 2 && k.load32(log) == 2);
+
+    // a guest thread: each DLL's DllMain on it as it starts and as it ends
+    // (in the modules' order: app.dll was listed before lib.dll loaded)
+    k.store32(BASE + 0x6000, li(3, 0x55));
+    k.store32(BASE + 0x6004, BLR);
+    uint32_t handle_ptr = h.alloc(4), id_ptr = h.alloc(4);
+    CHECK(h.krnl("ExCreateThread", {handle_ptr, 0, id_ptr, 0, BASE + 0x6000, 0, 0}) == 0);
+    uint32_t thread = k.load32(handle_ptr);
+    {
+        kernel::Objects &o = k.objects();
+        kernel::Ref<kernel::Thread> t = o.lookup<kernel::Thread>(thread);
+        CHECK(t);
+        std::unique_lock<std::mutex> l(o.lock);
+        CHECK(t && o.thread_exited.wait_for(l, std::chrono::seconds(30), [&] { return t->finished; }));
+        CHECK(t && t->exit_code == 0x55);
+    }
+    CHECK(h.krnl("NtClose", {thread}) == 0);
+    CHECK((entry_calls(k, log, 2) == std::vector<EntryCall>{{app, THREAD_ATTACH, 0, APP_ID},
+                                                            {lib, THREAD_ATTACH, 0, LIB_ID},
+                                                            {app, THREAD_DETACH, 0, APP_ID},
+                                                            {lib, THREAD_DETACH, 0, LIB_ID}}));
+
+    // XexUnloadImage: counted down; at none, DllMain(DLL_PROCESS_DETACH) on
+    // this thread, then gone: its pages released
+    CHECK(h.krnl("XexUnloadImage", {app}) == 0 && k.load16(app + 0x40) == 1 && k.load32(log) == 6);
+    CHECK(h.krnl("XexUnloadImage", {app}) == 0);
+    CHECK((entry_calls(k, log, 6) == std::vector<EntryCall>{{app, DETACH, 0, APP_ID}}));
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("app.dll"), out}) == 0x490);
+    CHECK(h.krnl("XexUnloadImage", {app}) == 0xC0000008);
+    CHECK(k.memory().heap_for(APP)->query(APP, region) && region.state == 0);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0 && k.load32(out) == lib);
+    CHECK(h.krnl("XexUnloadImage", {lib}) == 0);
+    CHECK((entry_calls(k, log, 7) == std::vector<EntryCall>{{lib, DETACH, 0, LIB_ID}}));
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0x490);
+    CHECK(k.memory().heap_for(LIB)->query(LIB, region) && region.state == 0);
+
+    // and loaded again where they were
+    CHECK(h.krnl("XexLoadImage", {h.string("app.dll"), 9, 0, out}) == 0);
+    app = k.load32(out);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0);
+    lib = k.load32(out);
+    CHECK((entry_calls(k, log, 8) == std::vector<EntryCall>{{lib, ATTACH, 0, LIB_ID}, {app, ATTACH, 0, APP_ID}}));
+    k.call(*h.c, APP + FUNCTION);
+    CHECK(uint32_t(h.c->r[3]) == 50'000'000 + 7 + 0x100);
+    std::string report = kernel::modules_report(k);
+    CHECK(report.find("\\app.dll: 0x89000000-0x89010000, entry 0x89001800, a DLL, attached, loaded 1 time(s)") !=
+          std::string::npos);
+    CHECK(report.find("\\lib.dll: unloaded") != std::string::npos);
+
+    // what cannot be loaded: no file, no executable
+    k.store32(out, 0x1234);
+    CHECK(h.krnl("XexLoadImage", {h.string("game:\\missing.dll"), 9, 0, out}) == 0xC000000F && k.load32(out) == 0);
+    CHECK(h.krnl("XexLoadImage", {h.string("junk.dll"), 9, 0, out}) == 0xC000000F && k.load32(out) == 0);
+
+    // XexLoadImageHeaders: the headers as the file has them, into a buffer
+    // they fit in
+    uint32_t buffer = h.alloc(0x2000);
+    CHECK(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\lib.dll"), buffer, 0x2000}) == 0);
+    CHECK(std::memcmp(k.host(buffer), lib_file.data(), 0x1000) == 0);
+    CHECK(h.krnl("XexLoadImageHeaders", {ansi(h, " game:\\lib.dll "), buffer, 0x1000}) == 0);
+    CHECK(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\lib.dll"), buffer, 0x800}) == 0xC0000023);
+    CHECK(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\lib.dll"), buffer, 0x7FF}) == 0xC0000023);
+    CHECK(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\junk.dll"), buffer, 0x2000}) == 0xC000007B);
+    CHECK(int32_t(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\missing.dll"), buffer, 0x2000})) < 0);
+}
+
 } // namespace
 
 int main() {
     KernelHarness h;
     if (!h.init()) return std::printf("kernel_modules: no kernel\n"), 1;
-    Xex xex = make_xex();
+    // the game's directory: the DLLs, and a file that is no executable (its
+    // own name, so copies of the test run side by side)
+    std::random_device random;
+    std::filesystem::path dir = std::filesystem::temp_directory_path() /
+                                ("xf_modules_test_" + std::to_string(random()) + "_" +
+                                 std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(dir);
+    uint32_t log = h.alloc(0x400);
+    std::vector<uint8_t> lib_file = make_lib(log);
+    auto write = [&](const char *name, const std::vector<uint8_t> &data) {
+        std::ofstream(dir / name, std::ios::binary).write(reinterpret_cast<const char *>(data.data()), data.size());
+    };
+    write("lib.dll", lib_file);
+    write("app.dll", make_app(log));
+    write("junk.dll", std::vector<uint8_t>(0x1000, 'j'));
     std::string error;
+    if (!kernel::mount_directory(*h.k, dir, error)) return std::printf("kernel_modules: %s\n", error.c_str()), 1;
+
+    Xex xex = make_xex();
     if (!h.k->load(xex, error)) return std::printf("kernel_modules: %s\n", error.c_str()), 1;
     modules(h);
+    user_modules(h, log, lib_file);
     variables(h);
     strings(h);
     time(h);
@@ -451,5 +805,8 @@ int main() {
     settings(h);
     process_type(h);
     debugging(h);
+    h.k.reset(); // its files closed first
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
     return finish("kernel_modules");
 }

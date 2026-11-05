@@ -64,6 +64,19 @@ lists: what the game calls is what gets written next.
   The load (`setup_modules`) adds the executable's module, its loader
   entry and header, and the title process's TLS and stack size. The
   objects and threads take the processes and object types from there.
+- **Second executables** (`modules.cpp`, Xenia's LoadUserModule and
+  XexModule): XexLoadImage reads a DLL through the file system (a bare
+  name next to the executable), places its image at its base, makes its
+  module (loader entry, header) and binds its imports as the executable's
+  (`Kernel::bind_imports`), loading first the game's libraries it imports
+  from; their thunks jump to the exports (lis/ori r11 before the thunk's
+  own bctr). DllMain runs on the calling thread with the HMODULE:
+  DLL_PROCESS_ATTACH at the load (the libraries it brought first),
+  DLL_THREAD_ATTACH and DETACH as guest threads start and end,
+  DLL_PROCESS_DETACH when XexUnloadImage takes the last load, which
+  releases the pages (BC2 loads Splash.xex and Game.xex at the same base,
+  one after the other). The DLLs' code runs in the interpreter: the
+  generated code covers the executable only, so far.
 - **Memory exports** (`memory_exports.cpp`): NtAllocateVirtualMemory and
   the Mm*/Ex* pools on the heaps of memory.h, with Xenia's addresses.
 - **Rtl and misc** (`rtl.cpp`, `misc.cpp`): strings, time fields, status

@@ -320,6 +320,9 @@ void Thread::body() {
     ppc::Context &c = *context;
     uint32_t code = 0;
     try {
+        // the DLLs' entry points (Xenia's OnThreadExecute; the kernel's own
+        // threads, host code, get none)
+        if (!params.host) modules_thread_start(k, c);
         o.deliver_apcs(*this, 1); // the ones queued before it ran (Xenia's DeliverAPCs)
         // Xenia's Processor::Execute pads the stack by 64 + 112
         c.r[1] = stack_base - (64 + 112);
@@ -335,6 +338,11 @@ void Thread::body() {
         }
     } catch (const ThreadExit &e) {
         code = e.code;
+    }
+    // and as it exits (OnThreadExit)
+    try {
+        if (!params.host) modules_thread_end(k, c);
+    } catch (const ThreadExit &) {
     }
 
     // the exit (Xenia's XThread::Exit): signaled, its mutants abandoned

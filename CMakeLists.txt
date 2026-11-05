@@ -167,6 +167,9 @@ foreach(name kernel_memory kernel_modules kernel_crypt)
     target_link_libraries(${name}_test PRIVATE xenoforge_kernel xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+# the modules family loads DLLs and runs a guest thread through them
+target_include_directories(kernel_modules_test PRIVATE src/kernel)
+set_tests_properties(kernel_modules PROPERTIES TIMEOUT 120) # threads: fail, never hang
 foreach(name spirv shader_translator)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)

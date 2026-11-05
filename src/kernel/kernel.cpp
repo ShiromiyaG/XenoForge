@@ -1,8 +1,12 @@
 // The kernel's core (kernel.h; docs/runtime.md). The import binding
 // follows Xenia's XexModule::SetupLibraryImports (src/xenia/cpu/
-// xex_module.cc, BSD; see LICENSE-xenia): function thunks become sc 2,
-// blr, nop, nop; a function's descriptor record gets 0xDEADC0DE; a
-// variable's gets the address of the kernel's object for it.
+// xex_module.cc, BSD; see LICENSE-xenia): a system library's function
+// thunks become sc 2, blr, nop, nop; a function's descriptor record gets
+// 0xDEADC0DE; a variable's gets the address of the kernel's object for it.
+// A game's library's (a DLL's) function thunk gets lis r11 / ori r11 with
+// the export's address in place of its first two instructions, so its own
+// mtctr r11; bctr jumps there; a variable's record gets the address; what
+// the library does not export gets 0xF00DF00D, or an unimplemented thunk.
 
 #include "xenoforge/kernel.h"
 
@@ -120,6 +124,12 @@ void Kernel::store16(uint32_t a, uint16_t v) {
 void Kernel::store64(uint32_t a, uint64_t v) { store32(a, uint32_t(v >> 32)), store32(a + 4, uint32_t(v)); }
 
 uint32_t Kernel::variable(const std::string &name) {
+    {
+        std::shared_lock lock(variables_mutex_);
+        auto it = variables_.find(name);
+        if (it != variables_.end()) return it->second;
+    }
+    std::unique_lock lock(variables_mutex_);
     auto it = variables_.find(name);
     if (it != variables_.end()) return it->second;
     // zeroed until the family that owns it fills it in (exports with a
@@ -128,7 +138,10 @@ uint32_t Kernel::variable(const std::string &name) {
     return variables_[name] = address;
 }
 
-void Kernel::set_variable(const std::string &name, uint32_t address) { variables_[name] = address; }
+void Kernel::set_variable(const std::string &name, uint32_t address) {
+    std::unique_lock lock(variables_mutex_);
+    variables_[name] = address;
+}
 
 void Kernel::add_thunk(uint32_t address, const std::string &library, const std::string &name) {
     // sc 2; blr, as the import thunks (Xenia's trampolines are the same 8 bytes)
@@ -178,30 +191,58 @@ uint32_t Kernel::uptime_ms() const { return uint32_t(std::min<uint64_t>(objects_
 
 bool Kernel::load(const Xex &xex, std::string &error) {
     xex_ = &xex;
-    uint32_t base = xex.base_address, size = uint32_t(xex.image.size());
-    Heap *heap = memory_.heap_for(base);
-    if (!heap) return error = "no heap holds the image's base", false;
-    uint32_t pages = (size + heap->page_size() - 1) & ~(heap->page_size() - 1);
-    if (!heap->alloc_fixed(base, pages, heap->page_size(), ALLOCATE_RESERVE | ALLOCATE_COMMIT, PROTECT_READ_WRITE))
-        return error = "could not map the image at its base", false;
-    std::memcpy(host(base), xex.image.data(), size);
+    if (!map_image(xex, error)) return false;
     entry_ = xex.entry_point;
     // the kernel's memory, variables and modules, before the imports take
     // the variables' addresses
     setup_modules(*this, xex);
+    bind(xex, true);
+    return true;
+}
 
+bool Kernel::map_image(const Xex &xex, std::string &error) {
+    uint32_t base = xex.base_address, size = uint32_t(xex.image.size());
+    Heap *heap = memory_.heap_for(base);
+    if (!heap) return error = "no heap holds the image's base", false;
+    uint32_t pages = (size + heap->page_size() - 1) & ~(heap->page_size() - 1);
+    if (!size ||
+        !heap->alloc_fixed(base, pages, heap->page_size(), ALLOCATE_RESERVE | ALLOCATE_COMMIT, PROTECT_READ_WRITE)) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "could not map the image at its base (0x%08X-0x%08X)", base, base + pages);
+        return error = text, false;
+    }
+    std::memcpy(host(base), xex.image.data(), size);
+    // pages another image had before are not zeroed by their release
+    std::memset(host(base) + size, 0, pages - size);
+    return true;
+}
+
+void Kernel::bind_imports(const Xex &xex) { bind(xex, false); }
+
+void Kernel::bind(const Xex &xex, bool executable) {
     for (const XexImportLibrary &library : xex.import_libraries) {
         std::string lib = short_library(library.name);
+        // a game's own library: its module, loaded first if need be
+        bool system = is_system_library(library.name);
+        uint32_t module = system ? 0 : import_module(*this, library.name);
         for (uint32_t record : library.records) {
             uint32_t value = load32(record);
             uint32_t type = value >> 24;
             uint16_t ordinal = uint16_t(value & 0xFFFF);
-            const Export *e = find_export(library.name, ordinal);
+            const Export *e = system ? find_export(library.name, ordinal) : nullptr;
+            uint32_t user = module ? module_export(*this, module, ordinal) : 0;
             std::string name = e ? e->name : lib + "_" + std::to_string(ordinal);
             if (type == 0) {
-                if (e && e->kind == ExportKind::Variable) store32(record, variable(name));
-                else store32(record, 0xDEADC0DE);
+                if (e) store32(record, e->kind == ExportKind::Variable ? variable(name) : 0xDEADC0DE);
+                else store32(record, user ? user : 0xF00DF00D);
             } else if (type == 1) {
+                if (user) {
+                    // lis r11, hi; ori r11, r11, lo: the thunk's mtctr r11;
+                    // bctr goes to the export
+                    store32(record + 0, 0x3D600000 | (user >> 16));
+                    store32(record + 4, 0x616B0000 | (user & 0xFFFF));
+                    continue;
+                }
                 // sc 2; blr; nop; nop
                 store32(record + 0, 0x44000042);
                 store32(record + 4, 0x4E800020);
@@ -211,12 +252,24 @@ bool Kernel::load(const Xex &xex, std::string &error) {
                 im.library = lib, im.name = name, im.ordinal = ordinal, im.thunk = record;
                 auto fn = registry().find(lib + "!" + name);
                 if (fn != registry().end()) im.fn = fn->second;
-                by_thunk_[record] = imports_.size();
-                imports_.push_back(std::move(im));
+                if (executable) {
+                    by_thunk_[record] = imports_.size();
+                    imports_.push_back(std::move(im));
+                } else {
+                    // a module loaded while threads run: with add_thunk's
+                    std::unique_lock lock(thunks_mutex_);
+                    thunks_[record] = std::move(im);
+                    has_thunks_ = true;
+                }
             }
         }
     }
-    return true;
+}
+
+void Kernel::remove_thunks(uint32_t begin, uint32_t end) {
+    std::unique_lock lock(thunks_mutex_);
+    for (auto it = thunks_.lower_bound(begin); it != thunks_.end() && it->first < end;)
+        retired_thunks_.push_back(thunks_.extract(it++));
 }
 
 void Kernel::set_generated(const Generated *table, size_t count) { generated_ = table, generated_count_ = count; }

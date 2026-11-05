@@ -2,7 +2,8 @@
 // the disc's executable, maps it, binds its imports, starts the main thread
 // the kernel makes (Kernel::launch: stack, PCR, KTHREAD, TLS, as Xenia's
 // XThread), runs the entry point (generated code where linked, else the
-// interpreter) and prints what the kernel saw: every export called and how
+// interpreter) and prints what the kernel saw: the modules loaded (the
+// executable, the DLLs it loaded or unloaded), every export called and how
 // often, the ones with no implementation, the threads and where it stopped,
 // and what the GPU did (packets, draws, resolves, swaps, interrupts).
 // The disc is the game's file system (game:, d:), or a bare executable's
@@ -119,6 +120,8 @@ int main(int argc, char **argv) {
     if (!mounted || !kernel::mount_storage(k, storage, error))
         return std::fprintf(stderr, "mount: %s\n", error.c_str()), 1;
     std::printf("storage: %s\n", storage.string().c_str());
+    // its module's path, which the DLLs it loads by a bare name are next to
+    kernel::set_executable_path(k, "game:\\" + (bare ? std::filesystem::path(input).filename().string() : xex_path));
     if (!k.load(xex, error)) return std::fprintf(stderr, "load: %s\n", error.c_str()), 1;
     k.step_limit = steps;
 #ifdef XF_GENERATED
@@ -162,6 +165,7 @@ int main(int argc, char **argv) {
 
 namespace {
 void print_report(kernel::Kernel &k) {
+    std::printf("%s", kernel::modules_report(k).c_str());
     // where the interpreter was entered: with generated code, what
     // discovery missed (the most entered first)
     auto targets = k.interpreted_targets();

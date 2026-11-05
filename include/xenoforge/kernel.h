@@ -86,6 +86,25 @@ struct Generated {
 // loader entry, the title process's TLS and stack size.
 void setup_kernel(Kernel &k);
 void setup_modules(Kernel &k, const Xex &xex);
+// The executable's guest path, set before load() ("game:\default.xex" if
+// never): its module's path, and the directory a module named bare is
+// loaded from.
+void set_executable_path(Kernel &k, const std::string &path);
+// A game's own library an image imports from (no system library: a DLL),
+// for the binding, as Xenia's XexModule::LoadContinue finds it: its loader
+// entry (its HMODULE), loaded first if it is not, 0 if it cannot be; and the
+// address of a module's export by ordinal (0: none).
+uint32_t import_module(Kernel &k, const std::string &library);
+uint32_t module_export(Kernel &k, uint32_t hmodule, uint16_t ordinal);
+// A guest thread starts or ends (Xenia's KernelState::OnThreadExecute and
+// OnThreadExit): each DLL loaded has its entry point called on it, with
+// DLL_THREAD_ATTACH (DLL_PROCESS_ATTACH if not attached yet) or
+// DLL_THREAD_DETACH.
+void modules_thread_start(Kernel &k, ppc::Context &c);
+void modules_thread_end(Kernel &k, ppc::Context &c);
+// the modules, for boot: the kernel's the game loaded, the executable and
+// the DLLs (path, range, entry, load count), and those unloaded
+std::string modules_report(Kernel &k);
 // The file system (files.cpp, xam.cpp; Xenia's VirtualFileSystem and its
 // mounts): the game's disc at \Device\Cdrom0, or a bare executable's
 // directory at \Device\Harddisk0\Partition1 (read-only), with game: and d:
@@ -131,6 +150,18 @@ public:
     // imports: function thunks rewritten to sc 2 / blr, variables pointed
     // at the kernel's objects for them.
     bool load(const Xex &xex, std::string &error);
+    // Places an image at its base: its pages reserved and committed,
+    // read-write, the rest of the last page zeroed (Xenia's
+    // XexModule::ReadImage*); false, and why, when they are taken.
+    bool map_image(const Xex &xex, std::string &error);
+    // Binds an image's imports (the executable's in load(), a module's as
+    // XexLoadImage loads it; Xenia's SetupLibraryImports): a system
+    // library's as load() says; a game's library's (import_module) to its
+    // exports, a function's thunk made to jump there, a variable given its
+    // address.
+    void bind_imports(const Xex &xex);
+    // Drops the thunks written in [begin, end) (an image unloaded).
+    void remove_thunks(uint32_t begin, uint32_t end);
     uint32_t entry_point() const { return entry_; }
     const Xex *xex() const { return xex_; }
     const std::vector<Import> &imports() const { return imports_; }
@@ -221,6 +252,7 @@ public:
     std::string stop_reason;
 
 private:
+    void bind(const Xex &xex, bool executable);
     void run_import(ppc::Context &c, const Import &import);
     // a thunk add_thunk wrote (nullptr if none is at the address)
     const Import *find_thunk(uint32_t address) const;
@@ -239,6 +271,8 @@ private:
     std::unordered_map<uint32_t, size_t> by_thunk_;
     const Generated *generated_ = nullptr;
     size_t generated_count_ = 0;
+    // (a module's imports add to it while threads read it)
+    mutable std::shared_mutex variables_mutex_;
     std::map<std::string, uint32_t> variables_;
     mutable std::mutex counts_mutex_;
     std::map<std::string, uint64_t> calls_, unimplemented_;
@@ -247,6 +281,8 @@ private:
     // add_thunk's (a map: its entries stay where they are)
     mutable std::shared_mutex thunks_mutex_;
     std::map<uint32_t, Import> thunks_;
+    // removed ones, kept: a thread may still be running one
+    std::vector<std::map<uint32_t, Import>::node_type> retired_thunks_;
     std::atomic<bool> has_thunks_{false};
     std::vector<Mmio> mmio_;
     // destroyed after the objects and threads, before the rest
