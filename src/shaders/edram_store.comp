@@ -1,0 +1,46 @@
+// A render target's samples into EDRAM, in the tiles the mask marks
+// (renderer.cpp). MS: the target is multisampled. BSD; see LICENSE-xenia.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) buffer Edram { uint words[]; } edram;
+layout(set = 0, binding = 1) readonly buffer Mask { uint tiles[]; } mask;
+#ifdef MS
+layout(set = 0, binding = 2) uniform texture2DMS source;   // color, or depth
+layout(set = 0, binding = 3) uniform utexture2DMS stencil; // depth targets'
+#else
+layout(set = 0, binding = 2) uniform texture2D source;
+layout(set = 0, binding = 3) uniform utexture2D stencil;
+#endif
+
+#include "edram.glsl"
+
+void main() {
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= target.width || pixel.y >= target.height) return;
+    uint samples = target.msaa == 0u ? 1u : target.msaa == 1u ? 2u : 4u;
+    for (uint host = 0u; host < samples; host++) {
+        uint at = edram_offset(pixel, guest_sample(host));
+        if (mask.tiles[at / TILE_DWORDS] == 0u) continue;
+#ifdef MS
+        vec4 value = texelFetch(source, ivec2(pixel), int(host));
+#else
+        vec4 value = texelFetch(source, ivec2(pixel), 0);
+#endif
+        if (target.is_depth != 0u) {
+#ifdef MS
+            uint s = texelFetch(stencil, ivec2(pixel), int(host)).r;
+#else
+            uint s = texelFetch(stencil, ivec2(pixel), 0).r;
+#endif
+            edram.words[at] = pack_depth(value.r, s);
+        } else {
+            uvec2 bits = pack_color(value);
+            edram.words[at] = bits.x;
+            if (target.ints_log2 != 0u) edram.words[at + 1u] = bits.y;
+        }
+    }
+}

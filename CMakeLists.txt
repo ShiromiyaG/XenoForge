@@ -53,15 +53,26 @@ find_program(SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin")
 find_package(Vulkan REQUIRED)
 find_program(GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" REQUIRED)
 set(XF_SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
-add_custom_command(
-    OUTPUT ${XF_SHADER_OUT}/rectangle_list.geom.inc
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
-    COMMAND ${GLSLC} --target-env=vulkan1.3 -mfmt=num -o ${XF_SHADER_OUT}/rectangle_list.geom.inc
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/rectangle_list.geom
-    DEPENDS src/shaders/rectangle_list.geom
-    COMMENT "glslc rectangle_list.geom")
-add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp
-    ${XF_SHADER_OUT}/rectangle_list.geom.inc)
+set(XF_SHADER_WORDS)
+# xf_shader(<name> <source> [defines...]): src/shaders/<source> to <name>.inc
+function(xf_shader name source)
+    add_custom_command(
+        OUTPUT ${XF_SHADER_OUT}/${name}.inc
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
+        COMMAND ${GLSLC} --target-env=vulkan1.3 -mfmt=num ${ARGN} -o ${XF_SHADER_OUT}/${name}.inc
+                ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/${source}
+        DEPENDS src/shaders/${source} src/shaders/edram.glsl
+        COMMENT "glslc ${name}")
+    set(XF_SHADER_WORDS ${XF_SHADER_WORDS} ${XF_SHADER_OUT}/${name}.inc PARENT_SCOPE)
+endfunction()
+xf_shader(rectangle_list.geom rectangle_list.geom)
+xf_shader(fullscreen.vert fullscreen.vert)
+xf_shader(edram_store.comp edram_store.comp)
+xf_shader(edram_store_ms.comp edram_store.comp -DMS)
+xf_shader(edram_load.frag edram_load.frag)
+xf_shader(edram_load_depth.frag edram_load.frag -DDEPTH)
+xf_shader(edram_load_stencil.frag edram_load.frag -DDEPTH -DSTENCIL)
+add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SHADER_OUT})
 target_link_libraries(xenoforge_vk PUBLIC xenoforge Vulkan::Vulkan)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -110,3 +121,7 @@ add_test(NAME vk_compute COMMAND vk_compute_test)
 add_executable(shader_compare_test tests/shader_compare_test.cpp)
 target_link_libraries(shader_compare_test PRIVATE xenoforge_vk)
 add_test(NAME shader_compare COMMAND shader_compare_test)
+# the renderer against Xenia's pictures, where XF_TRACES and XF_DUMPS say
+add_executable(replay_test tests/replay_test.cpp)
+target_link_libraries(replay_test PRIVATE xenoforge_vk stb)
+add_test(NAME replay COMMAND replay_test)

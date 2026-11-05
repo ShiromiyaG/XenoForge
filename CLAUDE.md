@@ -23,6 +23,9 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
   `../traces/ue3_global` (118, do `GlobalShaderCache-Xbox360.bin` do Chaves via `xfeffect`),
   `../external/xna/work/shaders` (10, de `tests/hlsl/`). Rodar: `XF_SHADERS=<pasta> build/shader_compare_test`.
   O `.defs` ao lado de cada shader traz as constantes literais do contêiner (o D3D as carrega com o shader).
+- **Renderizador (B3)**: `build/xfreplay <xtr> -o frame.png --compare <png do trace-dump> [--diff d.png] [-v]`;
+  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 10 frames batem com o Xenia).
+  Saídas do replay em `../traces/replay/`. `XF_VK_VALIDATION=1` liga a validação do Vulkan.
 - O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando Chaves e Ben 10 até o XenoForge rodá-los.
   Não mexer nele por causa do XenoForge.
 - Nada derivado dos jogos entra aqui (ISOs, XEX, imagens, traces de GPU, dumps). Listas de nomes de funções do

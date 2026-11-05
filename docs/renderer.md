@@ -153,7 +153,9 @@ player does (packets at their end, recorded memory writes skipped, PM4
 predication by bin mask and select). Every draw is one Vulkan submission,
 waited for: plain, not fast.
 
-- **Draws**: the translated vertex and pixel shaders; guest memory a 512 MB
+- **Draws**: the translated vertex and pixel shaders (colors scaled by the
+  target's exponent bias, 16-bit fixed targets kept as snorm with their
+  -32..32, gamma targets written through the piecewise linear curve); guest memory a 512 MB
   storage buffer the vertex fetches read, what changed copied over before
   each draw; indices swapped and offset on the CPU (quad lists split,
   strips restarted at the reset index); rectangle lists through a geometry
@@ -161,7 +163,14 @@ waited for: plain, not fast.
   `GetHostViewportInfo` and `GetScissor`; blend, depth, stencil, culling
   and the alpha test from the registers.
 - **Render targets** stand for EDRAM as host images, one per base, pitch,
-  MSAA and format, as many rows as EDRAM holds from the base.
+  MSAA and format, as many rows as EDRAM holds from the base. EDRAM itself
+  is a 10 MB buffer in Xenia's layout (`edram.glsl`, from `edram.xesli`):
+  when a target needs tiles another holds (down to the scissor's bottom),
+  the holder stores them into EDRAM in the guest's bits and the new one
+  loads them, in any format and MSAA, as Xenia's ownership transfers do;
+  depth tiles have their halves swapped; the stencil is exported, or
+  written a bit per pass where the device cannot export it (NVIDIA). The
+  trace's EDRAM snapshot is where EDRAM starts.
 - **Textures** decoded from guest memory (`texture.h`: 1D, 2D, stacked, 3D,
   cube, tiled or linear, packed mips, the block formats kept compressed),
   re-decoded when the memory under them changes, with the fetch constant's
@@ -171,17 +180,18 @@ waited for: plain, not fast.
 - **The swap** shows texture fetch constant 0 through the display's gamma
   table, as Xenia's presenter does.
 
-Against Xenia's trace dumps: El Chavo Kart's four frames (a video through
-three planes) within 0.005 of 255 on average, Ben 10's title intro (600,
-601) identical; Ben 10's title (1800, 3600) has its first tile dark, below.
+Against Xenia's trace dumps (`replay_test` with `XF_TRACES` and
+`XF_DUMPS`): all ten frames of the two games within 0.013 of 255 on
+average, no pixel off by more than 16: El Chavo Kart's video (three planes),
+Ben 10's intro, and Ben 10's title, drawn in two predicated tiles of a 2x
+MSAA target that the game clears by drawing into the same samples seen as a
+640 4x target.
 
-Not done yet, counted where it shows: **EDRAM shared between render
-targets** (a game clears a 1280 2x MSAA target by drawing into the same
-samples as a 640 4x one; Xenia moves the contents between the two, here the
-second starts empty) and the trace's EDRAM snapshot; 16-bit fixed targets'
--32..32 range; gamma targets; the colour exponent bias; MSAA resolves of one
-sample; depth resolves of MSAA targets; the display's piecewise linear gamma;
-signed, gamma and exponent-adjusted textures; memexport; point lists.
+Not done yet, counted where it shows: MSAA resolves of one sample; depth
+resolves of MSAA targets; the display's piecewise linear gamma; signed,
+gamma and exponent-adjusted textures; memexport; point lists; float16 and
+float32 targets moved through EDRAM by value rather than by bits (NaN
+payloads).
 
 ## What is asked and not done is counted
 

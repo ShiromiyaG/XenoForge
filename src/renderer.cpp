@@ -35,6 +35,24 @@ using namespace xenos;
 const uint32_t RECTANGLE_LIST_GS[] = {
 #include "rectangle_list.geom.inc"
 };
+const uint32_t FULLSCREEN_VS[] = {
+#include "fullscreen.vert.inc"
+};
+const uint32_t EDRAM_STORE[] = {
+#include "edram_store.comp.inc"
+};
+const uint32_t EDRAM_STORE_MS[] = {
+#include "edram_store_ms.comp.inc"
+};
+const uint32_t EDRAM_LOAD[] = {
+#include "edram_load.frag.inc"
+};
+const uint32_t EDRAM_LOAD_DEPTH[] = {
+#include "edram_load_depth.frag.inc"
+};
+const uint32_t EDRAM_LOAD_STENCIL[] = {
+#include "edram_load_stencil.frag.inc"
+};
 
 // registers xenos.h does not name
 namespace r {
@@ -57,6 +75,7 @@ constexpr uint32_t COLOR_INFO[4] = {reg::RB_COLOR_INFO, reg::RB_COLOR1_INFO, reg
 constexpr uint32_t DESCRIPTORS = 64;     // per image kind and for samplers, per draw
 constexpr uint32_t EDRAM_TILES = 2048;   // 80x16 samples of 32 bits each
 constexpr VkDeviceSize GUEST_MEMORY = 512u << 20;
+constexpr VkDeviceSize EDRAM_BYTES = VkDeviceSize(EDRAM_TILES) * 80 * 16 * 4;
 constexpr VkDeviceSize STAGING = 64u << 20;
 
 float as_float(uint32_t bits) {
@@ -220,7 +239,16 @@ struct RenderTarget {
     texture::HostFormat host = texture::HostFormat::Unsupported; // color
     vk::Image image;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView sampled = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE; // color or depth alone, stencil alone
     uint32_t width = 0, height = 0;
+    // in EDRAM: tiles per row (at its bits per sample), a tile's size in pixels
+    uint32_t pitch_tiles = 1, tile_width = 80, tile_height = 16;
+    bool wide = false; // 64 bits per sample
+};
+
+// edram.glsl's push constants
+struct EdramTarget {
+    uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit;
 };
 
 struct Texture {
@@ -238,8 +266,9 @@ struct System {
     uint32_t slots[32];
     uint32_t flags[4];
     float values[4];
+    float color_scales[4];
 };
-static_assert(sizeof(System) == 192);
+static_assert(sizeof(System) == 208);
 
 class Renderer final : public TraceVisitor {
 public:
@@ -259,6 +288,17 @@ public:
         for (size_t i = 0; i < values.size() && first + i < regs_.size(); i++) regs_[first + i] = values[i];
     }
     void memory_read(uint32_t address, std::span<const uint8_t> bytes) override { memory_.write(address, bytes); }
+    // EDRAM as the trace began, in Xenia's layout (edram.glsl's)
+    void edram_snapshot(std::span<const uint8_t> bytes) override {
+        if (bytes.size() != EDRAM_BYTES || !fatal_.empty()) return;
+        std::fill(owners_.begin(), owners_.end(), nullptr);
+        std::memcpy(staging_.mapped, bytes.data(), bytes.size());
+        run([&](VkCommandBuffer cmd) {
+            full_barrier(cmd);
+            VkBufferCopy copy{0, 0, EDRAM_BYTES};
+            vkCmdCopyBuffer(cmd, staging_.buffer, edram_.buffer, 1, &copy);
+        });
+    }
     // what the GPU wrote, recorded: Xenia's player skips it, the replay makes its own
     void memory_write(uint32_t, std::span<const uint8_t>) override {}
     void gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t>) override {
@@ -353,6 +393,25 @@ private:
     VkImageView dummy_views_[3] = {};
     VkSampler dummy_sampler_ = VK_NULL_HANDLE;
     std::vector<VkImageView> views_; // all made, destroyed at the end
+
+    // EDRAM: the render targets' contents move through it when another
+    // target takes over its tiles (Xenia's ownership transfers); it starts
+    // as the trace's snapshot
+    void acquire(RenderTarget *t, uint32_t rows);
+    bool edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles);
+    bool edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows);
+    EdramTarget edram_target(const RenderTarget &t, uint32_t height) const {
+        return {t.base, t.pitch_tiles, t.msaa, t.format, t.width, height, t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u};
+    }
+    VkPipeline load_pipeline(const RenderTarget &t);
+    std::vector<RenderTarget *> owners_ = std::vector<RenderTarget *>(EDRAM_TILES, nullptr); // null: EDRAM holds it
+    vk::Buffer edram_, mask_;
+    VkDescriptorSetLayout edram_set_layouts_[2] = {}; // store, load
+    VkPipelineLayout edram_layouts_[2] = {};
+    VkDescriptorPool edram_pool_ = VK_NULL_HANDLE;
+    VkPipeline store_pipelines_[2] = {}; // 1x, multisampled
+    VkShaderModule fullscreen_vs_ = VK_NULL_HANDLE, load_fs_[3] = {}; // color, depth, depth and stencil
+    std::map<std::pair<VkFormat, uint32_t>, VkPipeline> load_pipelines_;
     VkFormat d24s8_ = VK_FORMAT_D24_UNORM_S8_UINT;
 };
 
@@ -368,6 +427,18 @@ Renderer::~Renderer() {
     for (auto &im : dummy_) d_.destroy(im);
     if (dummy_sampler_) vkDestroySampler(dev_, dummy_sampler_, nullptr);
     if (rectangle_gs_) vkDestroyShaderModule(dev_, rectangle_gs_, nullptr);
+    for (auto &[k, p] : load_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
+    for (VkPipeline p : store_pipelines_)
+        if (p) vkDestroyPipeline(dev_, p, nullptr);
+    for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2]})
+        if (m) vkDestroyShaderModule(dev_, m, nullptr);
+    if (edram_pool_) vkDestroyDescriptorPool(dev_, edram_pool_, nullptr);
+    for (int k = 0; k < 2; k++) {
+        if (edram_layouts_[k]) vkDestroyPipelineLayout(dev_, edram_layouts_[k], nullptr);
+        if (edram_set_layouts_[k]) vkDestroyDescriptorSetLayout(dev_, edram_set_layouts_[k], nullptr);
+    }
+    d_.destroy(edram_);
+    d_.destroy(mask_);
     if (pool_) vkDestroyDescriptorPool(dev_, pool_, nullptr);
     if (layout_) vkDestroyPipelineLayout(dev_, layout_, nullptr);
     for (VkDescriptorSetLayout l : set_layouts_)
@@ -448,6 +519,76 @@ bool Renderer::init(std::string &error) {
     if (vkCreateShaderModule(dev_, &gs, nullptr, &rectangle_gs_) != VK_SUCCESS)
         return error = "could not make the rectangle list geometry shader", false;
 
+    // EDRAM: the buffer, the tile mask, store (compute) and load (draw) pipelines
+    edram_ = d_.create_buffer(EDRAM_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+    mask_ = d_.create_buffer(EDRAM_TILES * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    if (!edram_.buffer || !mask_.buffer) return error = "could not make the EDRAM buffers", false;
+    {
+        VkDescriptorSetLayoutBinding store[4] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        };
+        VkDescriptorBindingFlags store_flags[4] = {0, 0, 0, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT};
+        VkDescriptorSetLayoutBindingFlagsCreateInfo store_binding_flags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+        store_binding_flags.bindingCount = 4;
+        store_binding_flags.pBindingFlags = store_flags;
+        VkDescriptorSetLayoutBinding load[2] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        };
+        VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        info.pNext = &store_binding_flags;
+        info.bindingCount = 4;
+        info.pBindings = store;
+        vkCreateDescriptorSetLayout(dev_, &info, nullptr, &edram_set_layouts_[0]);
+        info.pNext = nullptr;
+        info.bindingCount = 2;
+        info.pBindings = load;
+        vkCreateDescriptorSetLayout(dev_, &info, nullptr, &edram_set_layouts_[1]);
+        for (int k = 0; k < 2; k++) {
+            VkPushConstantRange range{VkShaderStageFlags(k == 0 ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_FRAGMENT_BIT), 0,
+                                      sizeof(EdramTarget)};
+            VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layout.setLayoutCount = 1;
+            layout.pSetLayouts = &edram_set_layouts_[k];
+            layout.pushConstantRangeCount = 1;
+            layout.pPushConstantRanges = &range;
+            if (vkCreatePipelineLayout(dev_, &layout, nullptr, &edram_layouts_[k]) != VK_SUCCESS)
+                return error = "could not make the EDRAM pipeline layouts", false;
+        }
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2}};
+        VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pool.maxSets = 1;
+        pool.poolSizeCount = 2;
+        pool.pPoolSizes = sizes;
+        vkCreateDescriptorPool(dev_, &pool, nullptr, &edram_pool_);
+        auto module = [&](const uint32_t *words, size_t bytes) {
+            VkShaderModuleCreateInfo m{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            m.codeSize = bytes;
+            m.pCode = words;
+            VkShaderModule out = VK_NULL_HANDLE;
+            vkCreateShaderModule(dev_, &m, nullptr, &out);
+            return out;
+        };
+        const uint32_t *stores[2] = {EDRAM_STORE, EDRAM_STORE_MS};
+        const size_t store_sizes[2] = {sizeof(EDRAM_STORE), sizeof(EDRAM_STORE_MS)};
+        for (int k = 0; k < 2; k++) {
+            VkShaderModule m = module(stores[k], store_sizes[k]);
+            VkComputePipelineCreateInfo c{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            c.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+            c.layout = edram_layouts_[0];
+            VkResult r = vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &c, nullptr, &store_pipelines_[k]);
+            vkDestroyShaderModule(dev_, m, nullptr);
+            if (r != VK_SUCCESS) return error = "could not make the EDRAM store pipelines", false;
+        }
+        fullscreen_vs_ = module(FULLSCREEN_VS, sizeof(FULLSCREEN_VS));
+        load_fs_[0] = module(EDRAM_LOAD, sizeof(EDRAM_LOAD));
+        load_fs_[1] = module(EDRAM_LOAD_DEPTH, sizeof(EDRAM_LOAD_DEPTH));
+        if (d_.stencil_export()) load_fs_[2] = module(EDRAM_LOAD_STENCIL, sizeof(EDRAM_LOAD_STENCIL));
+    }
+
     // the stand-ins for slots without a texture: 1x1 transparent black
     const VkImageType types[] = {VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_2D};
     const VkImageViewType view_types[] = {VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_CUBE};
@@ -462,6 +603,7 @@ bool Renderer::init(std::string &error) {
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     vkCreateSampler(dev_, &si, nullptr, &dummy_sampler_);
     return run([&](VkCommandBuffer cmd) {
+        vkCmdFillBuffer(cmd, edram_.buffer, 0, VK_WHOLE_SIZE, 0);
         for (auto &im : dummy_) {
             VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
             b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -631,7 +773,11 @@ RenderTarget *Renderer::render_target(bool depth, uint32_t base, uint32_t pitch,
         vk_format = depth_vk_format(format);
     } else {
         t->host = resolve::host_format_of_color_target(format);
-        vk_format = vk_format_of(t->host);
+        // 16-bit fixed targets as snorm: the shader scales -32..32 into it,
+        // so the bits are the guest's (resolve.h reads them so)
+        vk_format = t->host == texture::HostFormat::RG16     ? VK_FORMAT_R16G16_SNORM
+                    : t->host == texture::HostFormat::RGBA16 ? VK_FORMAT_R16G16B16A16_SNORM
+                                                             : vk_format_of(t->host);
         if (vk_format == VK_FORMAT_UNDEFINED) return nullptr;
         bytes = texture::bytes_per_block(t->host) > 4 ? 8 : 4;
     }
@@ -644,8 +790,11 @@ RenderTarget *Renderer::render_target(bool depth, uint32_t base, uint32_t pitch,
     uint32_t rows = std::max(1u, (EDRAM_TILES - std::min(base, EDRAM_TILES - 1)) / pitch_tiles);
     t->width = std::clamp(pitch, 1u, 8192u);
     t->height = std::clamp(rows * tile_height, 1u, 8192u);
+    t->wide = bytes == 8;
+    t->tile_width = tile_width, t->tile_height = tile_height;
+    t->pitch_tiles = pitch_tiles;
     VkSampleCountFlagBits samples = msaa == 0 ? VK_SAMPLE_COUNT_1_BIT : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
-    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                               (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->width, t->height, 1}, 1, 1, samples, usage);
     if (!t->image.image) {
@@ -655,6 +804,8 @@ RenderTarget *Renderer::render_target(bool depth, uint32_t base, uint32_t pitch,
     VkImageAspectFlags aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     t->view = make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format,
                         depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
+    t->sampled = depth ? make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, VK_IMAGE_ASPECT_DEPTH_BIT) : t->view;
+    if (depth) t->stencil = make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, VK_IMAGE_ASPECT_STENCIL_BIT);
     // EDRAM's contents are not carried from the trace's snapshot yet: zeros
     VkImage image = t->image.image;
     if (!run([&](VkCommandBuffer cmd) {
@@ -684,6 +835,212 @@ RenderTarget *Renderer::render_target(bool depth, uint32_t base, uint32_t pitch,
         std::fprintf(stderr, "  render target: %s base %u pitch %u msaa %u format %u -> %ux%u\n", depth ? "depth" : "color",
                      base, pitch, msaa, format, t->width, t->height);
     return (targets_[key] = std::move(t)).get();
+}
+
+// ---- EDRAM: tiles change hands between render targets ----
+
+// The target takes over the tiles of its first `rows` pixel rows: those
+// another target holds are stored into EDRAM by their holder, then all it
+// did not hold are loaded from EDRAM, as Xenia's ownership transfers do.
+void Renderer::acquire(RenderTarget *t, uint32_t rows) {
+    uint32_t tile_rows = std::min((rows + t->tile_height - 1) / t->tile_height, t->height / t->tile_height);
+    uint32_t count = std::min(tile_rows * t->pitch_tiles, EDRAM_TILES);
+    std::vector<uint32_t> needed;
+    std::map<RenderTarget *, std::vector<uint32_t>> held;
+    for (uint32_t k = 0; k < count; k++) {
+        uint32_t tile = (t->base + k) % EDRAM_TILES;
+        if (owners_[tile] == t) continue;
+        needed.push_back(tile);
+        if (owners_[tile]) held[owners_[tile]].push_back(tile);
+    }
+    if (needed.empty()) return;
+    for (auto &[holder, tiles] : held)
+        if (!edram_store(holder, tiles)) return;
+    if (!edram_load(t, needed, tile_rows * t->tile_height)) return;
+    for (uint32_t tile : needed) owners_[tile] = t;
+    if (options_.verbose)
+        std::fprintf(stderr, "  EDRAM: %zu tiles to %s base %u (from %zu targets)\n", needed.size(), t->depth ? "depth" : "color",
+                     t->base, held.size());
+}
+
+bool Renderer::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
+    uint32_t *mask = static_cast<uint32_t *>(mask_.mapped);
+    std::fill(mask, mask + EDRAM_TILES, 0u);
+    uint32_t last_row = 0;
+    for (uint32_t tile : tiles) {
+        mask[tile] = 1;
+        last_row = std::max(last_row, ((tile + EDRAM_TILES - t->base) % EDRAM_TILES) / t->pitch_tiles);
+    }
+    uint32_t height = std::min((last_row + 1) * t->tile_height, t->height);
+    vkResetDescriptorPool(dev_, edram_pool_, 0);
+    VkDescriptorSet set;
+    VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    alloc.descriptorPool = edram_pool_;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &edram_set_layouts_[0];
+    if (vkAllocateDescriptorSets(dev_, &alloc, &set) != VK_SUCCESS) return fatal_ = "vkAllocateDescriptorSets failed", false;
+    VkDescriptorBufferInfo buffers[2] = {{edram_.buffer, 0, VK_WHOLE_SIZE}, {mask_.buffer, 0, VK_WHOLE_SIZE}};
+    VkDescriptorImageInfo images[2] = {{VK_NULL_HANDLE, t->sampled, VK_IMAGE_LAYOUT_GENERAL},
+                                       {VK_NULL_HANDLE, t->stencil, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet writes[4] = {};
+    for (uint32_t b = 0; b < 4; b++) {
+        writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[b].dstSet = set;
+        writes[b].dstBinding = b;
+        writes[b].descriptorCount = 1;
+        writes[b].descriptorType = b < 2 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        if (b < 2) writes[b].pBufferInfo = &buffers[b];
+        else writes[b].pImageInfo = &images[b - 2];
+    }
+    vkUpdateDescriptorSets(dev_, t->stencil ? 4 : 3, writes, 0, nullptr);
+    EdramTarget push = edram_target(*t, height);
+    VkPipeline pipeline = store_pipelines_[t->msaa ? 1 : 0];
+    return run([&](VkCommandBuffer cmd) {
+        full_barrier(cmd);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, edram_layouts_[0], 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd, edram_layouts_[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (t->width + 7) / 8, (height + 7) / 8, 1);
+    });
+}
+
+VkPipeline Renderer::load_pipeline(const RenderTarget &t) {
+    auto key = std::make_pair(t.image.format, t.msaa);
+    auto it = load_pipelines_.find(key);
+    if (it != load_pipelines_.end()) return it->second;
+    VkShaderModule fs = !t.depth ? load_fs_[0] : load_fs_[2] ? load_fs_[2] : load_fs_[1];
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, fullscreen_vs_, "main", nullptr},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr}};
+    VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport.viewportCount = viewport.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = t.image.samples;
+    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    if (t.depth) {
+        depth.depthTestEnable = depth.depthWriteEnable = VK_TRUE;
+        depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        depth.stencilTestEnable = VK_TRUE;
+        depth.front = depth.back = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE,
+                                    VK_COMPARE_OP_ALWAYS, 0xFF, 0xFF, 0};
+    }
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.colorWriteMask = 0xF;
+    VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend_state.attachmentCount = t.depth ? 0 : 1;
+    blend_state.pAttachments = &blend;
+    // depth: the stencil a bit per pass without stencil export
+    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                             VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                             VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = t.depth ? 5 : 2;
+    dynamic.pDynamicStates = dynamic_states;
+    VkFormat color_format = t.image.format;
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    if (t.depth) {
+        rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = t.image.format;
+    } else {
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachmentFormats = &color_format;
+    }
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &rendering;
+    info.stageCount = 2;
+    info.pStages = stages;
+    info.pVertexInputState = &vertex_input;
+    info.pInputAssemblyState = &assembly;
+    info.pViewportState = &viewport;
+    info.pRasterizationState = &raster;
+    info.pMultisampleState = &multisample;
+    info.pDepthStencilState = &depth;
+    info.pColorBlendState = &blend_state;
+    info.pDynamicState = &dynamic;
+    info.layout = edram_layouts_[1];
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    return load_pipelines_[key] = p;
+}
+
+bool Renderer::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows) {
+    VkPipeline pipeline = load_pipeline(*t);
+    if (!pipeline) return fatal_ = "could not make an EDRAM load pipeline", false;
+    uint32_t *mask = static_cast<uint32_t *>(mask_.mapped);
+    std::fill(mask, mask + EDRAM_TILES, 0u);
+    for (uint32_t tile : tiles) mask[tile] = 1;
+    vkResetDescriptorPool(dev_, edram_pool_, 0);
+    VkDescriptorSet set;
+    VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    alloc.descriptorPool = edram_pool_;
+    alloc.descriptorSetCount = 1;
+    alloc.pSetLayouts = &edram_set_layouts_[1];
+    if (vkAllocateDescriptorSets(dev_, &alloc, &set) != VK_SUCCESS) return fatal_ = "vkAllocateDescriptorSets failed", false;
+    VkDescriptorBufferInfo buffers[2] = {{edram_.buffer, 0, VK_WHOLE_SIZE}, {mask_.buffer, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet writes[2] = {};
+    for (uint32_t b = 0; b < 2; b++) {
+        writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[b].dstSet = set;
+        writes[b].dstBinding = b;
+        writes[b].descriptorCount = 1;
+        writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[b].pBufferInfo = &buffers[b];
+    }
+    vkUpdateDescriptorSets(dev_, 2, writes, 0, nullptr);
+    uint32_t height = std::min(rows, t->height);
+    EdramTarget push = edram_target(*t, height);
+    return run([&](VkCommandBuffer cmd) {
+        full_barrier(cmd);
+        VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        attachment.imageView = t->view;
+        attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        rendering.renderArea = {{0, 0}, {t->width, height}};
+        rendering.layerCount = 1;
+        if (t->depth) {
+            rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
+        } else {
+            rendering.colorAttachmentCount = 1;
+            rendering.pColorAttachments = &attachment;
+        }
+        vkCmdBeginRendering(cmd, &rendering);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, edram_layouts_[1], 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd, edram_layouts_[1], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+        VkViewport viewport{0, 0, float(t->width), float(height), 0, 1};
+        VkRect2D scissor{{0, 0}, {t->width, height}};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        if (!t->depth) {
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+        } else {
+            // the depth and the stencil (exported, or cleared to 0 for the
+            // bit passes that follow)
+            vkCmdSetDepthWriteEnable(cmd, VK_TRUE);
+            vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+            vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            if (!load_fs_[2]) {
+                vkCmdSetDepthWriteEnable(cmd, VK_FALSE);
+                vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+                for (uint32_t bit = 0; bit < 8; bit++) {
+                    EdramTarget pass = push;
+                    pass.stencil_bit = bit;
+                    vkCmdPushConstants(cmd, edram_layouts_[1], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pass), &pass);
+                    vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 1u << bit);
+                    vkCmdDraw(cmd, 3, 1, 0, 0);
+                }
+            }
+        }
+        vkCmdEndRendering(cmd);
+    });
 }
 
 // ---- guest memory on the GPU: what changed, copied over before a draw ----
@@ -1016,6 +1373,8 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
     if (msaa == 3) return skip("MSAA mode 3");
     RenderTarget *colors[4] = {};
     uint32_t color_masks[4] = {};
+    float color_scales[4] = {1, 1, 1, 1};
+    uint32_t gamma_targets = 0;
     uint32_t mask = regs_[reg::RB_COLOR_MASK];
     for (uint32_t i = 0; i < 4 && ps; i++) {
         color_masks[i] = (mask >> (4 * i)) & 0xF;
@@ -1024,9 +1383,10 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
             continue;
         }
         uint32_t info = regs_[r::COLOR_INFO[i]], format = (info >> 16) & 0xF;
-        if (sign_extend((info >> 20) & 0x3F, 6)) approximate("color exponent bias");
-        if (format == 1) approximate("gamma render targets written linear");
-        if (format == 4 || format == 5) approximate("16-bit fixed render targets in -1..1, not -32..32");
+        // the exponent bias, and 16-bit fixed (-32..32, 10 fraction bits) kept as snorm
+        color_scales[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
+        if (format == 4 || format == 5) color_scales[i] *= 1024.0f / 32767.0f;
+        if (format == 1) gamma_targets |= 1u << i;
         colors[i] = render_target(false, info & 0xFFF, pitch, msaa, format);
         if (!colors[i]) return fatal_.empty() ? skip(std::string("color target format ") + color_target_format_name(format)) : void();
     }
@@ -1056,6 +1416,11 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
     scissor.extent.height = std::min<uint32_t>(scissor.extent.height, height - std::min<uint32_t>(scissor.offset.y, height));
     if (!scissor.extent.width || !scissor.extent.height) return;
+    // the targets take over the EDRAM tiles down to the scissor's bottom
+    for (RenderTarget *t : colors)
+        if (t) acquire(t, scissor.offset.y + scissor.extent.height);
+    if (depth) acquire(depth, scissor.offset.y + scissor.extent.height);
+    if (!fatal_.empty()) return;
 
     // indices: the guest's, swapped, plus the index offset (as Xenia's
     // vertex shader adds it), reset indices kept as the host's restart index
@@ -1113,6 +1478,8 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
     uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
     sys.flags[1] = ((vte >> 10) & 1) | ((vte >> 8) & 1) << 1 | ((vte >> 9) & 1) << 2;
     if (color_control & 16) approximate("alpha to coverage");
+    sys.flags[2] = gamma_targets;
+    std::copy(color_scales, color_scales + 4, sys.color_scales);
 
     // textures: per slot the shaders read, an image in the array of its
     // dimension and a sampler
@@ -1348,6 +1715,8 @@ void Renderer::resolve() {
     if (!source) return fatal_.empty() ? skip("resolve: source format") : void();
     uint32_t x = std::min(info.x, source->width), y = std::min(info.y, source->height);
     uint32_t w = std::min(info.width, source->width - x), h = std::min(info.height, source->height - y);
+    acquire(source, y + h);
+    if (!fatal_.empty()) return;
     if (options_.verbose)
         std::fprintf(stderr, "  resolve: %s base %u (%u,%u %ux%u) -> %08X format %u%s%s\n", info.depth ? "depth" : "color",
                      info.edram_base, x, y, w, h, info.dest_base, info.dest_format, info.clear_color ? ", clear color" : "",
@@ -1442,6 +1811,8 @@ void Renderer::resolve() {
         }
         for (RenderTarget *t : {depth_target, color_target}) {
             if (!t) continue;
+            acquire(t, y + h);
+            if (!fatal_.empty()) return;
             VkClearAttachment clear{};
             if (t->depth) {
                 uint32_t value = regs_[r::RB_DEPTH_CLEAR];
@@ -1470,9 +1841,12 @@ void Renderer::resolve() {
                     c.float32[0] = as_float(uint32_t(value >> (t->host == H::RG32F ? 32 : 0)));
                     c.float32[1] = as_float(uint32_t(value));
                     break;
+                case H::RG16: case H::RGBA16: // snorm: the guest's bits
+                    for (int j = 0; j < 4; j++)
+                        c.float32[j] = std::max(-1.0f, float(int16_t(value >> (16 * j))) / 32767.0f);
+                    break;
                 default:
-                    for (int j = 0; j < 4; j++) c.float32[j] = float((value >> (16 * j)) & 0xFFFF) / 65535.0f;
-                    approximate("clears of 16-bit fixed render targets");
+                    approximate("clears of this target format");
                     break;
                 }
             }

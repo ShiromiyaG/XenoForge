@@ -40,6 +40,8 @@ public:
     VkPhysicalDevice physical() const { return physical_; }
     VkQueue queue() const { return queue_; }
     const std::string &name() const { return name_; }
+    // VK_EXT_shader_stencil_export, enabled when the device has it
+    bool stencil_export() const { return stencil_export_; }
 
     // host-visible and coherent (mapped), or device-local
     Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible);
@@ -65,6 +67,7 @@ private:
     VkFence fence_ = VK_NULL_HANDLE;
     VkPhysicalDeviceMemoryProperties memory_{};
     std::string name_;
+    bool stencil_export_ = false;
 };
 
 } // namespace xf::vk

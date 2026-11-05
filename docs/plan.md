@@ -167,9 +167,10 @@ traces, without a recompiled game.
   parameter generator.
 - **B3. The renderer**: front end, render targets, textures, draws; a trace
   replayed and compared with Xenia's picture. First form in (2026-11-04,
-  [renderer.md](renderer.md), "The renderer, first form"): El Chavo Kart's
-  frames and Ben 10's intro match Xenia's; next, EDRAM shared between
-  render targets (Ben 10's title) and the trace's EDRAM snapshot.
+  [renderer.md](renderer.md), "The renderer, first form"): EDRAM moved
+  between render targets as Xenia moves it; all ten frames of both games
+  match Xenia's (within 0.013 of 255). Next: traces of more games, and of
+  the games themselves past their titles.
 - **B4. Scale and speed**: resolution scale, the pipeline cache on disk,
   shaders translated in the build.
 - **B5. The generic pipeline** (the microcode interpreter on the GPU), if

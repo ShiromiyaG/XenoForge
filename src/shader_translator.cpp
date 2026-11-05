@@ -290,7 +290,7 @@ void Translator::declare() {
         // ndc_scale, ndc_offset, the image and sampler index of each fetch
         // slot, then flags (x: the alpha test, bit 3 on, bits 0-2 its
         // function) and values (x: the alpha test's reference)
-        const Id system_members[] = {vec4_, vec4_, m_.type_array(uvec4_, 8, 16), uvec4_, vec4_};
+        const Id system_members[] = {vec4_, vec4_, m_.type_array(uvec4_, 8, 16), uvec4_, vec4_, vec4_};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
@@ -298,6 +298,7 @@ void Translator::declare() {
         m_.member_decorate(system_block, 2, spv::Decoration::Offset, {32});
         m_.member_decorate(system_block, 3, spv::Decoration::Offset, {160});
         m_.member_decorate(system_block, 4, spv::Decoration::Offset, {176});
+        m_.member_decorate(system_block, 5, spv::Decoration::Offset, {192});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -1166,10 +1167,6 @@ void Translator::main_pixel() {
     }
     reset_state();
     m_.op(Op::OpFunctionCall, void_, {body_});
-    Id ptr_out_vec4 = m_.type_pointer(spv::StorageClass::Output, vec4_);
-    for (uint32_t k = 0; k < 4; k++)
-        store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))}),
-              load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))})));
     if (frag_depth) store(frag_depth, comp(load(vec4_, depth_), 0));
     // the alpha test (state, not microcode): oC0's alpha against the
     // reference, by the function in the system constants
@@ -1190,6 +1187,39 @@ void Translator::main_pixel() {
             m_.op_void(Op::OpDemoteToHelperInvocation);
             return false;
         });
+    }
+    // The colors out, as Xenia's host render target path writes them: times
+    // the target's scale (its exponent bias, and the range of a 16-bit fixed
+    // target kept as snorm; system member 5), after the alpha test, which
+    // takes the alpha unscaled; then to the piecewise linear gamma for gamma
+    // targets (system flags' z, a bit per target; xenos.cc's
+    // LinearToPWLGamma).
+    {
+        Id ptr_out_vec4 = m_.type_pointer(spv::StorageClass::Output, vec4_);
+        Id ptr_u_vec4 = m_.type_pointer(spv::StorageClass::Uniform, vec4_);
+        Id scales = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(5)}));
+        Id gamma_flags = m_.op(Op::OpCompositeExtract, uint_,
+                               {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)})), 2});
+        auto pwl = [&](Id linear) {
+            Id l = glsl(GLSLstd450FClamp, float_, {linear, f(0), f(1)});
+            auto at_least = [&](float edge) { return m_.op(Op::OpFOrdGreaterThanEqual, bool_, {l, f(edge)}); };
+            Id high = at_least(512.0f / 1023.0f), mid = at_least(128.0f / 1023.0f), low = at_least(64.0f / 1023.0f);
+            Id scale = select(float_, mid, select(float_, high, f(1023.0f / 8.0f), f(1023.0f / 4.0f)),
+                              select(float_, low, f(1023.0f / 2.0f), f(1023.0f)));
+            Id offset = select(float_, mid, select(float_, high, f(128.0f / 255.0f), f(64.0f / 255.0f)),
+                               select(float_, low, f(32.0f / 255.0f), f(0.0f)));
+            Id truncated = glsl(GLSLstd450Trunc, float_, {exact(Op::OpFMul, float_, {l, scale})});
+            return exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {truncated, f(1.0f / 255.0f)}), offset});
+        };
+        for (uint32_t k = 0; k < 4; k++) {
+            Id color = load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))}));
+            color = exact(Op::OpVectorTimesScalar, vec4_, {color, comp(scales, k)});
+            Id gamma = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {gamma_flags, u(1u << k)}), u(0)});
+            Id r = comp(color, 0), g = comp(color, 1), b = comp(color, 2);
+            color = vec4_of(select(float_, gamma, pwl(r), r), select(float_, gamma, pwl(g), g),
+                            select(float_, gamma, pwl(b), b), comp(color, 3));
+            store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))}), color);
+        }
     }
     m_.op_void(Op::OpReturn);
     m_.end_function();

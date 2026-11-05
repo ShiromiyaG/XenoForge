@@ -36,8 +36,9 @@ struct Translation {
 //          index, 16 bits each, as uvec4[8], then flags (uvec4; x: the alpha
 //          test, bit 3 on and bits 0-2 its function; y: the position's
 //          formats, bit 0 W not 1/W, bit 1 XY divided by W, bit 2 Z divided
-//          by W) and values (vec4; x: the alpha test's reference): 192
-//          bytes);
+//          by W; z: a bit per color target written as gamma) and values
+//          (vec4; x: the alpha test's reference), then the color targets'
+//          scales (vec4, one per target): 208 bytes);
 //   set 1: 0 2D images, 1 3D images, 2 cube images, 3 samplers (unsized
 //          arrays).
 // A vertex shader writes the position and o0-o15 (locations 0-15); a pixel

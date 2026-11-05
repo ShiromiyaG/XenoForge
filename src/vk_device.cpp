@@ -72,6 +72,7 @@ std::unique_ptr<Device> Device::open(std::string &error) {
     features.pNext = &v12;
     features.features.geometryShader = VK_TRUE;
     features.features.depthClamp = VK_TRUE;
+    features.features.sampleRateShading = VK_TRUE;
     features.features.independentBlend = VK_TRUE;
     features.features.textureCompressionBC = VK_TRUE;
     features.features.fragmentStoresAndAtomics = VK_TRUE;
@@ -82,8 +83,18 @@ std::unique_ptr<Device> Device::open(std::string &error) {
     queue_info.queueFamilyIndex = d->family_;
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
+    uint32_t extension_count = 0;
+    vkEnumerateDeviceExtensionProperties(d->physical_, nullptr, &extension_count, nullptr);
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    vkEnumerateDeviceExtensionProperties(d->physical_, nullptr, &extension_count, extensions.data());
+    std::vector<const char *> enabled;
+    for (const VkExtensionProperties &e : extensions)
+        if (std::strcmp(e.extensionName, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME) == 0) d->stencil_export_ = true;
+    if (d->stencil_export_) enabled.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     device_info.pNext = &features;
+    device_info.enabledExtensionCount = uint32_t(enabled.size());
+    device_info.ppEnabledExtensionNames = enabled.data();
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
     if (VkResult r = vkCreateDevice(d->physical_, &device_info, nullptr, &d->device_); r != VK_SUCCESS) {
