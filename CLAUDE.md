@@ -19,6 +19,10 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
   sozinha logo após iniciar o jogo (não se repetiu). Código traduzido do
   Xenia leva o aviso BSD no topo do arquivo e é conferido contra o Xenia na mesma sessão. As tabelas de exports
   em `src/exports/` são cópias sem mudança (xenia-canary `838850fed`).
+- **Corpus de shaders** (fora do repo, dados de jogo): `../traces/shaders` (13, dos traces via `--dump_shaders`),
+  `../traces/ue3_global` (118, do `GlobalShaderCache-Xbox360.bin` do Chaves via `xfeffect`),
+  `../external/xna/work/shaders` (10, de `tests/hlsl/`). Rodar: `XF_SHADERS=<pasta> build/shader_compare_test`.
+  O `.defs` ao lado de cada shader traz as constantes literais do contêiner (o D3D as carrega com o shader).
 - O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando Chaves e Ben 10 até o XenoForge rodá-los.
   Não mexer nele por causa do XenoForge.
 - Nada derivado dos jogos entra aqui (ISOs, XEX, imagens, traces de GPU, dumps). Listas de nomes de funções do
