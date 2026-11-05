@@ -80,7 +80,9 @@ constexpr uint64_t mask(uint32_t mstart, uint32_t mstop) {
 
 // ---- memory: big-endian, guest address added to the base ----
 
-XF_INLINE uint8_t *host(Context &c, uint32_t ea) { return c.base + ea; }
+// the 4 KB offset of the 0xE0000000 physical view (memory.h; Xenia's
+// host_address_offset)
+XF_INLINE uint8_t *host(Context &c, uint32_t ea) { return c.base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u); }
 XF_INLINE uint8_t load8(Context &c, uint32_t ea) { return *host(c, ea); }
 XF_INLINE uint16_t load16(Context &c, uint32_t ea) {
     uint16_t v;
