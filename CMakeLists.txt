@@ -41,6 +41,8 @@ add_library(xenoforge STATIC
     src/ppc.cpp
     src/ppc_interp.cpp
     src/guest_space.cpp
+    src/recomp_image.cpp
+    src/recomp_discover.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
@@ -93,6 +95,8 @@ add_executable(xfeffect tools/xfeffect.cpp)
 target_link_libraries(xfeffect PRIVATE xenoforge)
 add_executable(xfppc tools/xfppc.cpp)
 target_link_libraries(xfppc PRIVATE xenoforge)
+add_executable(xfrecomp tools/xfrecomp.cpp)
+target_link_libraries(xfrecomp PRIVATE xenoforge)
 
 # stb_image and stb_image_write (public domain / MIT), for PNGs in the tools;
 # Xenia's copy unless STB_DIR says otherwise
