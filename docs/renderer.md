@@ -134,6 +134,12 @@ translator's semantics where the two differ; the windowless compute runner
 (`vk_compute.h`). `shader_compare_test` runs both on the GPU and the CPU,
 case by case, and they agree, the traces' shaders included (`XF_SHADERS`).
 
+Version 2 adds the dispatcher (loops, calls, jumps), cube maps,
+getGradients and the LOD and gradient setters; the corpus is the traces'
+shaders, the UE3 global shader cache of El Chavo Kart's data and HLSL
+compiled by Microsoft's Xbox 360 compiler (`tests/hlsl/`, `tools/xna/`),
+each with the literal constants its container defines.
+
 The hardware has no denormals, not even between a multiply and the add of a
 `mad`: the interpreter flushes them there, and the GPU's flush-to-zero does
 the same (B3 asks for it with the float controls where the device has

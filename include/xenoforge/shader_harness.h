@@ -14,7 +14,14 @@
 // - a texture fetch does not sample: with s its fetch constant (0-31) as a
 //   float and c its coordinates (the components the dimension has, the
 //   others 0), it returns (c.x + s, c.y - s, c.x * c.y, s), the multiply
-//   without contraction; the instruction's destination swizzle applies;
+//   without contraction; with a LOD from the register, w is s + lod; with
+//   gradients from the registers, z is (c.x * c.y + h.x) + v.y; the
+//   instruction's destination swizzle applies;
+// - setTexLOD sets the LOD register to its operand's x; setGradientH and
+//   setGradientV set h and v to its operand's xyz; all start at 0;
+// - getGradients, which needs a pixel quad the harness does not have,
+//   returns (c.x * 0.5, c.x * -0.5, c.y * 0.5, c.y * -0.5) of its operand's
+//   x and y; getCompTexLOD, getWeights and getBCF are not run;
 // - a vertex fetch reads `memory` (guest physical address 0 is its first
 //   byte) as the fetch constant describes;
 // - exports go to the case's output: oPos, oPts, o0-o15 for a vertex shader,

@@ -762,17 +762,34 @@ private:
     }
 
     // The harness's stand-in for sampling: (c.x + s, c.y - s, c.x * c.y, s).
+    // shader_harness.h's stand-ins: sampling and derivatives are the GPU's
     void texture_fetch(const TextureFetchInstruction &f) {
         if (f.is_predicated && p != f.predicate_condition) return;
-        if (f.opcode != FetchOpcode::TextureFetch) {
-            fail("a texture operation other than tfetch");
+        switch (f.opcode) {
+        case FetchOpcode::SetTextureLod: tfetch_lod_ = component(f.operands[0], 0, false); return;
+        case FetchOpcode::SetTextureGradientsHorz:
+        case FetchOpcode::SetTextureGradientsVert: {
+            float *g = f.opcode == FetchOpcode::SetTextureGradientsHorz ? gradient_h_ : gradient_v_;
+            for (uint32_t i = 0; i < 3; i++) g[i] = component(f.operands[0], i, false);
             return;
+        }
+        case FetchOpcode::GetTextureGradients: {
+            float x = component(f.operands[0], 0, false), y = component(f.operands[0], 1, false);
+            float value[4] = {x * 0.5f, x * -0.5f, y * 0.5f, y * -0.5f};
+            if (f.has_result()) store_fetch(f.result, value);
+            return;
+        }
+        case FetchOpcode::TextureFetch: break;
+        default: fail("a texture operation other than tfetch, getGradients and the LOD and gradient setters"); return;
         }
         float c[3] = {};
         uint32_t n = dimension_component_count(f.dimension);
         for (uint32_t i = 0; i < n; i++) c[i] = component(f.operands[0], i, false);
         float s = float(f.operands[1].index);
-        float value[4] = {c[0] + s, c[1] - s, c[0] * c[1], s};
+        float z = c[0] * c[1], w = s;
+        if (f.use_register_gradients) z = (z + gradient_h_[0]) + gradient_v_[1];
+        if (f.use_register_lod) w = s + tfetch_lod_;
+        float value[4] = {c[0] + s, c[1] - s, z, w};
         if (f.has_result()) store_fetch(f.result, value);
     }
 
@@ -785,6 +802,7 @@ private:
     uint32_t call_stack_[4] = {};
     uint32_t call_depth_ = 0;
     uint32_t vfetch_address_ = 0, vfetch_end_ = 0; // the last full fetch's, for mini fetches
+    float tfetch_lod_ = 0.0f, gradient_h_[3] = {}, gradient_v_[3] = {};
 };
 
 } // namespace

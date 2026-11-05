@@ -11,10 +11,12 @@
 // function, so an exec that ends the shader returns from it; each stage's
 // main fills the registers, calls it, and passes the exports on.
 //
-// Version 1 runs the control flow straight: execs (unconditional, on a bool
-// constant, on the predicate), allocs, nops. Loops, calls, jumps, memexport,
-// and texture fetches other than plain 2D and 3D sampling are reported as
-// unsupported.
+// The control flow runs straight when it is only execs (plain, on a bool
+// constant, on the predicate), allocs and nops; with loops, calls or jumps,
+// as a loop over a switch on the next control flow instruction, with the
+// interpreter's stacks (four loops deep, four calls deep) and step limit.
+// Memexport, fetch offsets, unnormalized coordinates and the texture
+// queries other than getGradients are reported as unsupported.
 
 #include "xenoforge/shader_translator.h"
 
@@ -178,7 +180,17 @@ private:
     void store_result(const Result &r, Id value, bool clamp_depth = true);
 
     // --- instructions -------------------------------------------------------
-    void exec(const Exec &e);
+    // true when the code it wrote ends the block (the shader returned)
+    bool exec(const Exec &e);
+    bool control_flow(const ControlFlow &cf, uint32_t index);
+    void dispatch();
+    Id taken(bool unconditional, bool predicated, uint32_t bool_index, bool condition) {
+        if (unconditional) return m_.const_bool(true);
+        if (predicated) return predicate_is(condition);
+        Id b = bool_constant(bool_index);
+        return condition ? b : m_.op(Op::OpLogicalNot, bool_, {b});
+    }
+    Id element(Id array, Id pointer_type, Id index) { return m_.op(Op::OpAccessChain, pointer_type, {array, index}); }
     void alu(const AluInstruction &a);
     Id vector_op(const AluInstruction &a);
     Id scalar_op(const AluInstruction &a);
@@ -217,9 +229,16 @@ private:
     Id ptr_private_vec4_ = 0, zero4_ = 0;
     spv::StorageClass constants_storage_ = spv::StorageClass::Uniform;
     Id constants_ = 0, memory_ = 0, memory_ptr_uint_ = 0, system_ = 0;
-    Id images2d_ = 0, images3d_ = 0, samplers_ = 0, image2d_type_ = 0, image3d_type_ = 0, sampler_type_ = 0;
+    Id images2d_ = 0, images3d_ = 0, imagescube_ = 0, samplers_ = 0, image2d_type_ = 0, image3d_type_ = 0,
+       imagecube_type_ = 0, sampler_type_ = 0;
     Id registers_ = 0, predicate_ = 0, a0_ = 0, aL_ = 0, previous_scalar_ = 0, vfetch_address_ = 0, vfetch_bound_ = 0;
     Id killed_ = 0, interpolators_ = 0, position_ = 0, point_size_ = 0, colors_ = 0, depth_ = 0;
+    // loops and calls: four-deep stacks of counts, of aL (aL_ is the top's
+    // copy), of return addresses; the next control flow instruction
+    Id loop_count_ = 0, loop_address_ = 0, call_stack_ = 0, call_depth_ = 0, pc_ = 0, steps_ = 0;
+    Id ptr_private_uint_ = 0, ptr_private_int_ = 0;
+    // the texture LOD and gradients the setters leave for later fetches
+    Id tfetch_lod_ = 0, gradient_h_ = 0, gradient_v_ = 0;
     Id body_ = 0;
     bool ended_ = false; // the straight control flow has returned
 };
@@ -293,6 +312,17 @@ void Translator::declare() {
     point_size_ = global(vec4_, spv::StorageClass::Private, "oPts");
     colors_ = global(m_.type_array(vec4_, 4), spv::StorageClass::Private, "oC");
     depth_ = global(vec4_, spv::StorageClass::Private, "oDepth");
+    ptr_private_uint_ = m_.type_pointer(spv::StorageClass::Private, uint_);
+    ptr_private_int_ = m_.type_pointer(spv::StorageClass::Private, int_);
+    loop_count_ = global(m_.type_array(uint_, 4), spv::StorageClass::Private, "loop_count");
+    loop_address_ = global(m_.type_array(int_, 4), spv::StorageClass::Private, "loop_address");
+    call_stack_ = global(m_.type_array(uint_, 4), spv::StorageClass::Private, "call_stack");
+    call_depth_ = global(uint_, spv::StorageClass::Private, "call_depth");
+    pc_ = global(uint_, spv::StorageClass::Private, "pc");
+    steps_ = global(uint_, spv::StorageClass::Private, "steps");
+    tfetch_lod_ = global(float_, spv::StorageClass::Private, "tfetch_lod");
+    gradient_h_ = global(vec4_, spv::StorageClass::Private, "gradient_h");
+    gradient_v_ = global(vec4_, spv::StorageClass::Private, "gradient_v");
 }
 
 void Translator::reset_state() {
@@ -309,6 +339,13 @@ void Translator::reset_state() {
     store(point_size_, zero4_);
     for (uint32_t k = 0; k < 4; k++) store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))}), zero4_);
     store(depth_, zero4_);
+    store(loop_count_, m_.const_null(m_.type_array(uint_, 4)));
+    store(loop_address_, m_.const_null(m_.type_array(int_, 4)));
+    store(call_stack_, m_.const_null(m_.type_array(uint_, 4)));
+    store(call_depth_, u(0));
+    store(tfetch_lod_, f(0));
+    store(gradient_h_, zero4_);
+    store(gradient_v_, zero4_);
 }
 
 void Translator::store_result(const Result &r, Id value, bool clamp_depth) {
@@ -723,58 +760,120 @@ void Translator::vertex_fetch(const VertexFetchInstruction &v) {
 }
 
 void Translator::texture_fetch(const TextureFetchInstruction &t) {
-    if (t.opcode != FetchOpcode::TextureFetch) {
+    // the setters keep state for later fetches
+    if (t.opcode == FetchOpcode::SetTextureLod || t.opcode == FetchOpcode::SetTextureGradientsHorz ||
+        t.opcode == FetchOpcode::SetTextureGradientsVert) {
+        auto body = [&] {
+            Id value = operand(t.operands[0]);
+            if (t.opcode == FetchOpcode::SetTextureLod) store(tfetch_lod_, comp(value, 0));
+            else store(t.opcode == FetchOpcode::SetTextureGradientsHorz ? gradient_h_ : gradient_v_, value);
+            return false;
+        };
+        if (t.is_predicated) when(predicate_is(t.predicate_condition), body);
+        else body();
+        return;
+    }
+    if (t.opcode != FetchOpcode::TextureFetch && t.opcode != FetchOpcode::GetTextureGradients) {
         unsupported(std::string("texture fetch operation ") + t.opcode_name);
         return;
     }
     if (!t.has_result()) return;
-    if (stage_ != Stage::Harness) {
-        if (t.dimension == FetchOpDimension::Cube) unsupported("cube texture fetches");
+    bool gradients = t.opcode == FetchOpcode::GetTextureGradients;
+    if (stage_ != Stage::Harness && !gradients) {
         if (t.unnormalized_coordinates) unsupported("unnormalized texture coordinates");
         if (t.offset_x != 0 || t.offset_y != 0 || t.offset_z != 0) unsupported("texture fetch offsets");
-        if (!t.use_computed_lod || t.use_register_lod || t.use_register_gradients)
-            unsupported("texture fetches with a LOD or gradients from registers");
     }
     auto body = [&] {
         Id coordinates = operand(t.operands[0]);
         uint32_t dims = dimension_component_count(t.dimension);
         uint32_t slot = t.operands[1].index;
         Id result;
-        if (stage_ == Stage::Harness) {
-            // shader_harness.h's stand-in: (c.x + s, c.y - s, c.x * c.y, s)
+        if (gradients) {
+            // (d/dx c.x, d/dy c.x, d/dx c.y, d/dy c.y); the harness has no quads
+            Id x = comp(coordinates, 0), y = comp(coordinates, 1);
+            if (stage_ == Stage::Harness) {
+                result = vec4_of(exact(Op::OpFMul, float_, {x, f(0.5f)}), exact(Op::OpFMul, float_, {x, f(-0.5f)}),
+                                 exact(Op::OpFMul, float_, {y, f(0.5f)}), exact(Op::OpFMul, float_, {y, f(-0.5f)}));
+            } else if (stage_ == Stage::Pixel) {
+                m_.capability(spv::Capability::DerivativeControl);
+                result = vec4_of(m_.op(Op::OpDPdxCoarse, float_, {x}), m_.op(Op::OpDPdyCoarse, float_, {x}),
+                                 m_.op(Op::OpDPdxCoarse, float_, {y}), m_.op(Op::OpDPdyCoarse, float_, {y}));
+            } else {
+                result = zero4_; // no derivatives in a vertex shader
+            }
+        } else if (stage_ == Stage::Harness) {
+            // shader_harness.h's stand-in, with the LOD and gradient registers
             Id s = f(float(slot));
             Id cx = comp(coordinates, 0), cy = dims >= 2 ? comp(coordinates, 1) : f(0);
-            result = vec4_of(exact(Op::OpFAdd, float_, {cx, s}), exact(Op::OpFSub, float_, {cy, s}),
-                             exact(Op::OpFMul, float_, {cx, cy}), s);
+            Id z = exact(Op::OpFMul, float_, {cx, cy}), w = s;
+            if (t.use_register_gradients)
+                z = exact(Op::OpFAdd, float_, {exact(Op::OpFAdd, float_, {z, comp(load(vec4_, gradient_h_), 0)}),
+                                               comp(load(vec4_, gradient_v_), 1)});
+            if (t.use_register_lod) w = exact(Op::OpFAdd, float_, {s, load(float_, tfetch_lod_)});
+            result = vec4_of(exact(Op::OpFAdd, float_, {cx, s}), exact(Op::OpFSub, float_, {cy, s}), z, w);
         } else {
             // the image and sampler of this slot, from the system constants
             Id entry = m_.op(Op::OpCompositeExtract, uint_,
-                             {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(2), u(slot >> 2)})), slot & 3});
+                             {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                                 {system_, u(2), u(slot >> 2)})),
+                              slot & 3});
             Id image_index = m_.op(Op::OpBitwiseAnd, uint_, {entry, u(0xFFFF)});
             Id sampler_index = m_.op(Op::OpShiftRightLogical, uint_, {entry, u(16)});
-            bool three = t.dimension == FetchOpDimension::D3OrStacked;
-            Id image_type = three ? image3d_type_ : image2d_type_;
+            bool cube = t.dimension == FetchOpDimension::Cube;
+            bool three = t.dimension == FetchOpDimension::D3OrStacked || cube; // three coordinates
+            Id image_type = cube ? imagecube_type_ : t.dimension == FetchOpDimension::D3OrStacked ? image3d_type_ : image2d_type_;
+            Id images = cube ? imagescube_ : t.dimension == FetchOpDimension::D3OrStacked ? images3d_ : images2d_;
             Id image = load(image_type, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::UniformConstant, image_type),
-                                              {three ? images3d_ : images2d_, image_index}));
-            Id sampler = load(sampler_type_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::UniformConstant, sampler_type_),
+                                              {images, image_index}));
+            Id sampler = load(sampler_type_, m_.op(Op::OpAccessChain,
+                                                   m_.type_pointer(spv::StorageClass::UniformConstant, sampler_type_),
                                                    {samplers_, sampler_index}));
             Id sampled = m_.op(Op::OpSampledImage, m_.type_sampled_image(image_type), {image, sampler});
+            Id coord_type = three ? m_.type_vector(float_, 3) : vec2_;
             Id coords;
-            if (three) {
-                coords = m_.op(Op::OpVectorShuffle, m_.type_vector(float_, 3), {coordinates, coordinates, 0, 1, 2});
+            if (cube) {
+                // the cube instruction's face coordinates (sc and tc in 1-2,
+                // the face 0-5) back to a direction, as Xenia does
+                Id sc = exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {comp(coordinates, 0), f(2)}), f(-3)});
+                Id tc = exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {comp(coordinates, 1), f(2)}), f(-3)});
+                Id face_value = comp(coordinates, 2);
+                if (t.offset_z != 0) face_value = exact(Op::OpFAdd, float_, {face_value, f(t.offset_z)});
+                Id face = m_.op(Op::OpConvertFToU, uint_, {glsl(GLSLstd450NClamp, float_, {face_value, f(0), f(5)})});
+                Id axis = m_.op(Op::OpShiftRightLogical, uint_, {face, u(1)});
+                Id negative = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {face, u(1)}), u(0)});
+                Id sign = select(float_, negative, f(-1), f(1));
+                Id nsc = m_.op(Op::OpFNegate, float_, {sc}), ntc = m_.op(Op::OpFNegate, float_, {tc});
+                Id on_x = m_.op(Op::OpCompositeConstruct, coord_type, {sign, ntc, select(float_, negative, sc, nsc)});
+                Id on_y = m_.op(Op::OpCompositeConstruct, coord_type, {sc, sign, select(float_, negative, ntc, tc)});
+                Id on_z = m_.op(Op::OpCompositeConstruct, coord_type, {select(float_, negative, nsc, sc), ntc, sign});
+                coords = select(coord_type, m_.op(Op::OpIEqual, bool_, {axis, u(0)}), on_x,
+                                select(coord_type, m_.op(Op::OpIEqual, bool_, {axis, u(1)}), on_y, on_z));
+            } else if (three) {
+                coords = m_.op(Op::OpVectorShuffle, coord_type, {coordinates, coordinates, 0, 1, 2});
             } else {
                 // a 1D texture is a row of a 2D one
                 Id cy = dims >= 2 ? comp(coordinates, 1) : f(0.5f);
                 coords = m_.op(Op::OpCompositeConstruct, vec2_, {comp(coordinates, 0), cy});
             }
-            if (stage_ == Stage::Pixel) {
-                if (t.lod_bias != 0) {
-                    result = m_.op(Op::OpImageSampleImplicitLod, vec4_, {sampled, coords, uint32_t(spv::ImageOperandsMask::Bias), f(t.lod_bias)});
-                } else {
-                    result = m_.op(Op::OpImageSampleImplicitLod, vec4_, {sampled, coords});
-                }
+            auto narrow = [&](Id v) {
+                return three ? m_.op(Op::OpVectorShuffle, coord_type, {v, v, 0, 1, 2})
+                             : m_.op(Op::OpVectorShuffle, coord_type, {v, v, 0, 1});
+            };
+            // Xenia: the computed LOD in pixel shaders, or with gradients from registers
+            bool computed = t.use_computed_lod && (stage_ == Stage::Pixel || t.use_register_gradients);
+            if (t.use_register_gradients) {
+                result = m_.op(Op::OpImageSampleExplicitLod, vec4_,
+                               {sampled, coords, uint32_t(spv::ImageOperandsMask::Grad), narrow(load(vec4_, gradient_h_)),
+                                narrow(load(vec4_, gradient_v_))});
+            } else if (t.use_register_lod || !computed) {
+                Id lod = f(t.lod_bias);
+                if (t.use_register_lod) lod = exact(Op::OpFAdd, float_, {load(float_, tfetch_lod_), lod});
+                result = m_.op(Op::OpImageSampleExplicitLod, vec4_, {sampled, coords, uint32_t(spv::ImageOperandsMask::Lod), lod});
+            } else if (t.lod_bias != 0) {
+                result = m_.op(Op::OpImageSampleImplicitLod, vec4_,
+                               {sampled, coords, uint32_t(spv::ImageOperandsMask::Bias), f(t.lod_bias)});
             } else {
-                result = m_.op(Op::OpImageSampleExplicitLod, vec4_, {sampled, coords, uint32_t(spv::ImageOperandsMask::Lod), f(t.lod_bias)});
+                result = m_.op(Op::OpImageSampleImplicitLod, vec4_, {sampled, coords});
             }
         }
         store_result(t.result, result);
@@ -784,7 +883,7 @@ void Translator::texture_fetch(const TextureFetchInstruction &t) {
     else body();
 }
 
-void Translator::exec(const Exec &e) {
+bool Translator::exec(const Exec &e) {
     auto instructions = [&] {
         for (const ExecSlot &slot : e.slots) {
             if (const auto *a = std::get_if<AluInstruction>(&slot.instruction)) alu(*a);
@@ -798,17 +897,145 @@ void Translator::exec(const Exec &e) {
         return false;
     };
     switch (e.cf.type) {
-    case ExecInstruction::Type::Unconditional:
-        if (instructions()) ended_ = true;
-        break;
+    case ExecInstruction::Type::Unconditional: return instructions();
     case ExecInstruction::Type::Conditional: {
         Id condition = bool_constant(e.cf.bool_constant);
         if (!e.cf.condition) condition = m_.op(Op::OpLogicalNot, bool_, {condition});
         when(condition, instructions);
-        break;
+        return false;
     }
-    case ExecInstruction::Type::Predicated: when(predicate_is(e.cf.condition), instructions); break;
+    case ExecInstruction::Type::Predicated: when(predicate_is(e.cf.condition), instructions); return false;
     }
+    return false;
+}
+
+// One control flow instruction inside the dispatcher; pc_ already holds the
+// next index, which a loop, call, return or jump may change.
+bool Translator::control_flow(const ControlFlow &cf, uint32_t index) {
+    auto set_pc = [&](Id value) { store(pc_, value); };
+    auto count_at = [&](uint32_t k) { return element(loop_count_, ptr_private_uint_, i(int32_t(k))); };
+    auto address_at = [&](uint32_t k) { return element(loop_address_, ptr_private_int_, i(int32_t(k))); };
+    return std::visit(
+        [&](const auto &instruction) -> bool {
+            using T = std::decay_t<decltype(instruction)>;
+            if constexpr (std::is_same_v<T, Exec>) {
+                return exec(instruction);
+            } else if constexpr (std::is_same_v<T, LoopStartInstruction>) {
+                // push the loop: its count, and aL (the start, or aL kept)
+                Id constant = constant_dword(2, instruction.loop_constant & 31);
+                Id count = m_.op(Op::OpBitwiseAnd, uint_, {constant, u(0xFF)});
+                Id start = m_.op(Op::OpBitcast, int_, {m_.op(Op::OpBitFieldUExtract, uint_, {constant, i(8), i(8)})});
+                Id old_al = load(int_, address_at(0));
+                for (uint32_t k = 3; k > 0; k--) {
+                    store(count_at(k), load(uint_, count_at(k - 1)));
+                    store(address_at(k), load(int_, address_at(k - 1)));
+                }
+                store(count_at(0), count);
+                Id al = instruction.is_repeat ? old_al : start;
+                store(address_at(0), al);
+                store(aL_, al);
+                set_pc(select(uint_, m_.op(Op::OpIEqual, bool_, {count, u(0)}), u(instruction.skip_address), u(index + 1)));
+                return false;
+            } else if constexpr (std::is_same_v<T, LoopEndInstruction>) {
+                Id count = m_.op(Op::OpISub, uint_, {load(uint_, count_at(0)), u(1)});
+                Id done = m_.op(Op::OpIEqual, bool_, {count, u(0)});
+                if (instruction.is_predicated_break)
+                    done = m_.op(Op::OpLogicalOr, bool_, {done, predicate_is(instruction.predicate_condition)});
+                Id constant = constant_dword(2, instruction.loop_constant & 31);
+                Id step = m_.op(Op::OpBitFieldSExtract, int_, {m_.op(Op::OpBitcast, int_, {constant}), i(16), i(8)});
+                // again: the count down, aL a step on; done: the stack pops
+                Id counts[4], addresses[4];
+                for (uint32_t k = 0; k < 4; k++) {
+                    counts[k] = load(uint_, count_at(k));
+                    addresses[k] = load(int_, address_at(k));
+                }
+                Id again_al = m_.op(Op::OpIAdd, int_, {addresses[0], step});
+                for (uint32_t k = 0; k < 4; k++) {
+                    Id popped_count = k < 3 ? counts[k + 1] : u(0), popped_address = k < 3 ? addresses[k + 1] : i(0);
+                    Id again_count = k == 0 ? count : counts[k], again_address = k == 0 ? again_al : addresses[k];
+                    store(count_at(k), select(uint_, done, popped_count, again_count));
+                    store(address_at(k), select(int_, done, popped_address, again_address));
+                }
+                store(aL_, load(int_, address_at(0)));
+                set_pc(select(uint_, done, u(index + 1), u(instruction.body_address)));
+                return false;
+            } else if constexpr (std::is_same_v<T, CallInstruction>) {
+                // a fifth call deep is skipped, as Xenia's interpreter does
+                Id depth = load(uint_, call_depth_);
+                Id go = m_.op(Op::OpLogicalAnd, bool_,
+                              {m_.op(Op::OpULessThan, bool_, {depth, u(4)}),
+                               taken(instruction.type == CallInstruction::Type::Unconditional,
+                                     instruction.type == CallInstruction::Type::Predicated, instruction.bool_constant,
+                                     instruction.condition)});
+                when(go, [&] {
+                    Id d = load(uint_, call_depth_);
+                    store(element(call_stack_, ptr_private_uint_, d), u(index + 1));
+                    store(call_depth_, m_.op(Op::OpIAdd, uint_, {d, u(1)}));
+                    set_pc(u(instruction.target));
+                    return false;
+                });
+                return false;
+            } else if constexpr (std::is_same_v<T, ReturnInstruction>) {
+                when(m_.op(Op::OpUGreaterThan, bool_, {load(uint_, call_depth_), u(0)}), [&] {
+                    Id d = m_.op(Op::OpISub, uint_, {load(uint_, call_depth_), u(1)});
+                    store(call_depth_, d);
+                    set_pc(load(uint_, element(call_stack_, ptr_private_uint_, d)));
+                    return false;
+                });
+                return false;
+            } else if constexpr (std::is_same_v<T, JumpInstruction>) {
+                Id go = taken(instruction.type == JumpInstruction::Type::Unconditional,
+                              instruction.type == JumpInstruction::Type::Predicated, instruction.bool_constant,
+                              instruction.condition);
+                set_pc(select(uint_, go, u(instruction.target), u(index + 1)));
+                return false;
+            } else {
+                return false; // nop, alloc, mark_vs_fetch_done
+            }
+        },
+        cf.instruction);
+}
+
+// The control flow as a loop over a switch on the next instruction, for
+// shaders with loops, calls or jumps. The interpreter's step limit keeps a
+// shader that never ends from hanging the GPU.
+void Translator::dispatch() {
+    uint32_t n = uint32_t(s_.control_flow.size());
+    Id header = m_.id(), body = m_.id(), continue_block = m_.id(), merge = m_.id(), switch_merge = m_.id(),
+       fallback = m_.id();
+    store(pc_, u(0));
+    store(steps_, u(0));
+    m_.op_void(Op::OpBranch, {header});
+    m_.label(header);
+    m_.op_void(Op::OpLoopMerge, {merge, continue_block, uint32_t(spv::LoopControlMask::MaskNone)});
+    m_.op_void(Op::OpBranch, {body});
+    m_.label(body);
+    std::vector<Id> cases(n);
+    std::vector<uint32_t> operands{load(uint_, pc_), fallback};
+    for (uint32_t k = 0; k < n; k++) {
+        cases[k] = m_.id();
+        operands.push_back(k);
+        operands.push_back(cases[k]);
+    }
+    m_.op_void(Op::OpSelectionMerge, {switch_merge, uint32_t(spv::SelectionControlMask::MaskNone)});
+    m_.op_void(Op::OpSwitch, operands);
+    for (uint32_t k = 0; k < n; k++) {
+        m_.label(cases[k]);
+        store(pc_, u(k + 1));
+        if (!control_flow(s_.control_flow[k], k)) m_.op_void(Op::OpBranch, {switch_merge});
+    }
+    m_.label(fallback);
+    store(pc_, u(n));
+    m_.op_void(Op::OpBranch, {switch_merge});
+    m_.label(switch_merge);
+    m_.op_void(Op::OpBranch, {continue_block});
+    m_.label(continue_block);
+    Id steps = m_.op(Op::OpIAdd, uint_, {load(uint_, steps_), u(1)});
+    store(steps_, steps);
+    Id again = m_.op(Op::OpLogicalAnd, bool_, {m_.op(Op::OpULessThan, bool_, {load(uint_, pc_), u(n)}),
+                                               m_.op(Op::OpULessThanEqual, bool_, {steps, u(1u << 20)})});
+    m_.op_void(Op::OpBranchConditional, {again, header, merge});
+    m_.label(merge);
 }
 
 void Translator::main_harness() {
@@ -941,12 +1168,14 @@ Translation Translator::run() {
         m_.capability(spv::Capability::RuntimeDescriptorArray);
         image2d_type_ = m_.type_image(float_, spv::Dim::Dim2D, 0, false, false, 1, spv::ImageFormat::Unknown);
         image3d_type_ = m_.type_image(float_, spv::Dim::Dim3D, 0, false, false, 1, spv::ImageFormat::Unknown);
+        imagecube_type_ = m_.type_image(float_, spv::Dim::Cube, 0, false, false, 1, spv::ImageFormat::Unknown);
         sampler_type_ = m_.type_sampler();
         images2d_ = global(m_.type_runtime_array(image2d_type_, 0), spv::StorageClass::UniformConstant, "images2d");
         images3d_ = global(m_.type_runtime_array(image3d_type_, 0), spv::StorageClass::UniformConstant, "images3d");
+        imagescube_ = global(m_.type_runtime_array(imagecube_type_, 0), spv::StorageClass::UniformConstant, "imagescube");
         samplers_ = global(m_.type_runtime_array(sampler_type_, 0), spv::StorageClass::UniformConstant, "samplers");
         uint32_t binding = 0;
-        for (Id v : {images2d_, images3d_, samplers_}) {
+        for (Id v : {images2d_, images3d_, imagescube_, samplers_}) {
             m_.decorate(v, spv::Decoration::DescriptorSet, {1});
             m_.decorate(v, spv::Decoration::Binding, {binding++});
         }
@@ -956,18 +1185,18 @@ Translation Translator::run() {
     body_ = m_.begin_function(void_, m_.type_function(void_, {}));
     m_.name(body_, "xenos_main");
     m_.label();
-    for (const ControlFlow &cf : s_.control_flow) {
-        if (ended_) break;
-        switch (cf.opcode) {
-        case ControlFlowOpcode::Nop:
-        case ControlFlowOpcode::MarkVsFetchDone:
-        case ControlFlowOpcode::Alloc: break;
-        case ControlFlowOpcode::LoopStart:
-        case ControlFlowOpcode::LoopEnd: unsupported("loops"); break;
-        case ControlFlowOpcode::CondCall:
-        case ControlFlowOpcode::Return: unsupported("calls"); break;
-        case ControlFlowOpcode::CondJmp: unsupported("jumps"); break;
-        default: exec(std::get<Exec>(cf.instruction)); break;
+    bool branches = false;
+    for (const ControlFlow &cf : s_.control_flow)
+        branches |= cf.opcode == ControlFlowOpcode::LoopStart || cf.opcode == ControlFlowOpcode::LoopEnd ||
+                    cf.opcode == ControlFlowOpcode::CondCall || cf.opcode == ControlFlowOpcode::Return ||
+                    cf.opcode == ControlFlowOpcode::CondJmp;
+    if (branches) {
+        dispatch();
+    } else {
+        // straight: each exec in order, the first that ends returning
+        for (const ControlFlow &cf : s_.control_flow) {
+            if (ended_) break;
+            if (const auto *e = std::get_if<Exec>(&cf.instruction)) ended_ = exec(*e);
         }
     }
     if (s_.reads_past_end) unsupported("an exec past the end of the microcode");

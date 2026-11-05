@@ -105,7 +105,7 @@ void fetches() {
     translates(make_shader(ShaderType::Vertex, {make_exec(slots, true)}), "vfetch_vs");
 
     std::vector<Slot> textures;
-    for (auto dimension : {FetchOpDimension::D1, FetchOpDimension::D2, FetchOpDimension::D3OrStacked}) {
+    for (auto dimension : {FetchOpDimension::D1, FetchOpDimension::D2, FetchOpDimension::D3OrStacked, FetchOpDimension::Cube}) {
         TextureFetchInstruction t;
         t.opcode_name = "tfetch";
         t.dimension = dimension;
@@ -121,6 +121,39 @@ void fetches() {
     translates(make_shader(ShaderType::Vertex, {make_exec(textures, true)}), "tfetch_vs");
 }
 
+// loops, calls and jumps go through the dispatcher
+void branches() {
+    AluInstruction body = vector(AluVectorOpcode::Add, dst(StorageTarget::Register, 2, 0xF),
+                                 {reg(2), con(0, "xyzw", StorageAddressing::LoopRelative)});
+    AluInstruction setp = scalar(AluScalarOpcode::SetpGt, dst(StorageTarget::Register, 3, 1), {reg(2)});
+    // 0: exec; 1: loop i3 (skip to 5); 2: exec body; 3: (p0) jmp 5; 4: endloop i3 (back to 2);
+    // 5: call 7 on b2; 6: exec end; 7: exec; 8: return
+    ParsedShader s = make_shader(ShaderType::Pixel, {make_exec({setp}, false)});
+    LoopStartInstruction start;
+    start.cf_index = 1, start.loop_constant = 3, start.skip_address = 5;
+    s.control_flow.push_back({1, ControlFlowOpcode::LoopStart, start});
+    Exec e = make_exec({body, setp}, false);
+    e.cf.cf_index = 2;
+    s.control_flow.push_back({2, e.cf.opcode, e});
+    JumpInstruction jump;
+    jump.cf_index = 3, jump.target = 5, jump.type = JumpInstruction::Type::Predicated, jump.condition = true;
+    s.control_flow.push_back({3, ControlFlowOpcode::CondJmp, jump});
+    LoopEndInstruction end;
+    end.cf_index = 4, end.loop_constant = 3, end.body_address = 2, end.is_predicated_break = true;
+    s.control_flow.push_back({4, ControlFlowOpcode::LoopEnd, end});
+    CallInstruction call;
+    call.cf_index = 5, call.target = 7, call.type = CallInstruction::Type::Conditional, call.bool_constant = 2;
+    s.control_flow.push_back({5, ControlFlowOpcode::CondCall, call});
+    Exec last = make_exec({body}, true);
+    last.cf.cf_index = 6;
+    s.control_flow.push_back({6, last.cf.opcode, last});
+    Exec sub = make_exec({setp}, false);
+    sub.cf.cf_index = 7;
+    s.control_flow.push_back({7, sub.cf.opcode, sub});
+    s.control_flow.push_back({8, ControlFlowOpcode::Return, ReturnInstruction{8}});
+    translates(s, "branches_ps");
+}
+
 void refuses() {
     auto refused = [](ParsedShader s, const char *what) {
         auto t = shader::translate(s, shader::Stage::Harness);
@@ -130,20 +163,14 @@ void refuses() {
         CHECK(named);
         if (!named) std::printf("  expected \"%s\" among what is refused\n", what);
     };
-    auto loop = make_shader(ShaderType::Vertex, {make_exec({}, false)});
-    loop.control_flow.push_back({1, ControlFlowOpcode::LoopStart, LoopStartInstruction{}});
-    refused(loop, "loops");
-    auto jump = make_shader(ShaderType::Vertex, {make_exec({}, false)});
-    jump.control_flow.push_back({1, ControlFlowOpcode::CondJmp, JumpInstruction{}});
-    refused(jump, "jumps");
+    TextureFetchInstruction weights;
+    weights.opcode = FetchOpcode::GetTextureWeights;
+    weights.opcode_name = "getWeights";
+    weights.result = dst(StorageTarget::Register, 1, 0xF);
+    weights.operands[0] = reg(0);
+    refused(make_shader(ShaderType::Pixel, {make_exec({weights}, true)}), "getWeights");
     AluInstruction export_data = vector(AluVectorOpcode::Add, dst(StorageTarget::ExportData, 0, 0xF), {reg(0), reg(1)});
     refused(make_shader(ShaderType::Vertex, {make_exec({export_data}, true)}), "memexport");
-    TextureFetchInstruction cube;
-    cube.dimension = FetchOpDimension::Cube;
-    cube.result = dst(StorageTarget::Register, 1, 0xF);
-    cube.operands[0] = reg(0);
-    auto t = shader::translate(make_shader(ShaderType::Pixel, {make_exec({cube}, true)}), shader::Stage::Pixel);
-    CHECK(!t.ok());
     // a stage that is not the shader's
     CHECK(!shader::translate(make_shader(ShaderType::Vertex, {make_exec({}, true)}), shader::Stage::Pixel).ok());
 }
@@ -154,6 +181,7 @@ int main() {
     every_operation();
     control_and_exports();
     fetches();
+    branches();
     refuses();
     return finish("shader_translator");
 }

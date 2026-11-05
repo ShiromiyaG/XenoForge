@@ -33,7 +33,8 @@ struct Translation {
 //          memory (storage, words), 2 the system constants (uniform:
 //          ndc_scale, ndc_offset, then per fetch slot the image and sampler
 //          index, 16 bits each, as uvec4[8]);
-//   set 1: 0 2D images, 1 3D images, 2 samplers (unsized arrays).
+//   set 1: 0 2D images, 1 3D images, 2 cube images, 3 samplers (unsized
+//          arrays).
 // A vertex shader writes the position and o0-o15 (locations 0-15); a pixel
 // shader reads o0-o15 into r0-r15 and writes oC0-oC3 (locations 0-3).
 Translation translate(const ucode::ParsedShader &shader, Stage stage);

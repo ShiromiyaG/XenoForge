@@ -155,9 +155,16 @@ traces, without a recompiled game.
   pixel stages and a compute wrapper; a CPU interpreter written apart from
   it, from Xenia's; the two agree on the GPU on every operation's edge
   cases and on the 13 shaders of the traces, and breaking the legacy
-  multiply makes 163 cases differ. Left: loops, calls and jumps in the
-  translator (the interpreter has them), memexport, cube maps, fetch
-  offsets, LOD and gradients from registers, the parameter generator.
+  multiply makes 163 cases differ. Version 2 (2026-11-04): loops, calls
+  and jumps through a dispatcher with the interpreter's stacks, cube maps,
+  getGradients and the LOD and gradient setters. On the 118 shaders of El
+  Chavo Kart's UE3 global shader cache (pulled from its data by
+  `xfeffect`), the 10 compiled from `tests/hlsl/` and the 13 of the
+  traces, every pixel shader translates and validates, and the GPU and
+  the interpreter agree on all 141 (whole shaders within 1e-4: rcp's 21
+  bits differ by a step and subtractions grow it). Left: memexport, fetch
+  offsets, unnormalized coordinates, getCompTexLOD and getWeights, the
+  parameter generator.
 - **B3. The renderer**: front end, render targets, textures, draws; a trace
   replayed and compared with Xenia's picture.
 - **B4. Scale and speed**: resolution scale, the pipeline cache on disk,

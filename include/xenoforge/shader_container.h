@@ -18,6 +18,15 @@ struct ShaderContainer {
     bool vertex = false;
     uint32_t flags = 0;
     std::vector<uint32_t> microcode; // host order
+    // The literals the compiler defines, which the console's D3D loads with
+    // the shader: float constants (c0-c255 of the shader's stage, the words
+    // as stored) and loop constants (i0-i31).
+    struct FloatConstant {
+        uint32_t index;
+        uint32_t words[4];
+    };
+    std::vector<FloatConstant> float_constants;
+    std::vector<std::pair<uint32_t, uint32_t>> loop_constants; // index, value
 };
 
 // Every container in the data (searched a word at a time), with sizes that

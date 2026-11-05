@@ -46,7 +46,9 @@ struct Run {
     std::vector<uint8_t> memory = std::vector<uint8_t>(256, 0);
 };
 
-bool same_float(float gpu_value, float cpu_value, bool approximate) {
+// tolerance: 0 for bit for bit; otherwise relative, for the operations
+// whose GPU results are approximate (exp, log, rcp, rsq, sqrt, sin, cos)
+bool same_float(float gpu_value, float cpu_value, float tolerance) {
     if (std::isnan(gpu_value) && std::isnan(cpu_value)) return true;
     // zeros and denormals alike: the GPU may flush them
     if (std::fabs(gpu_value) < FLT_MIN && std::fabs(cpu_value) < FLT_MIN) return true;
@@ -54,14 +56,14 @@ bool same_float(float gpu_value, float cpu_value, bool approximate) {
     std::memcpy(&a, &gpu_value, 4);
     std::memcpy(&b, &cpu_value, 4);
     if (a == b) return true;
-    if (!approximate || std::isinf(gpu_value) || std::isinf(cpu_value) || (a ^ b) >> 31) return false;
+    if (tolerance == 0 || std::isinf(gpu_value) || std::isinf(cpu_value) || (a ^ b) >> 31) return false;
     // exp, log, rcp, rsq, sqrt, sin, cos: the GPU's own precision, then 21 bits
-    return std::fabs(gpu_value - cpu_value) <= std::fabs(cpu_value) * 1e-5f + 1e-6f;
+    return std::fabs(gpu_value - cpu_value) <= std::fabs(cpu_value) * tolerance + tolerance * 0.1f;
 }
 
 // Runs the shader on both sides; reports the first few differences. False
 // when it could not run (unsupported, no GPU).
-bool compare(const char *what, const ParsedShader &shader, Run &run, bool approximate = false) {
+bool compare(const char *what, const ParsedShader &shader, Run &run, float tolerance = 0) {
     auto translation = shader::translate(shader, shader::Stage::Harness);
     if (!translation.ok()) {
         std::printf("  %s: not translated:", what);
@@ -100,7 +102,7 @@ bool compare(const char *what, const ParsedShader &shader, Run &run, bool approx
                     got.address_register == expected.address_register;
         size_t bad = SIZE_MAX;
         for (size_t k = 0; k < floats && same; k++)
-            if (!same_float(g[k], e[k], approximate)) same = false, bad = k;
+            if (!same_float(g[k], e[k], tolerance)) same = false, bad = k;
         if (same) continue;
         failures++;
         if (reported++ < 4) {
@@ -175,7 +177,7 @@ void scalar_operations() {
                 for (int k = 0; k < 4; k++)
                     if (!std::isfinite(c.registers[0][k]) || std::fabs(c.registers[0][k]) > 3.0f) c.registers[0][k] = 0.75f;
         }
-        compare(info.name, shader, run, approximate);
+        compare(info.name, shader, run, approximate ? 1e-5f : 0.0f);
     }
 }
 
@@ -283,13 +285,20 @@ void corpus() {
     int count = 0;
     for (const auto &entry : std::filesystem::directory_iterator(folder)) {
         std::string name = entry.path().filename().string();
-        if (name.find(".ucode.bin.") == std::string::npos) continue;
+        if (name.find(".ucode.bin.") == std::string::npos || !(name.ends_with(".vert") || name.ends_with(".frag"))) continue;
         std::ifstream in(entry.path(), std::ios::binary);
         std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         std::vector<uint32_t> dwords(bytes.size() / 4);
         std::memcpy(dwords.data(), bytes.data(), dwords.size() * 4);
         bool vertex = name.ends_with(".vert");
         auto shader = parse_shader(vertex ? ShaderType::Vertex : ShaderType::Pixel, dwords);
+        // A compiler leaves a vertex fetch's format empty for the console's
+        // D3D to fill from the vertex declaration: filled here as a float4's.
+        for (ControlFlow &cf : shader.control_flow)
+            if (auto *e = std::get_if<Exec>(&cf.instruction))
+                for (ExecSlot &slot : e->slots)
+                    if (auto *v = std::get_if<VertexFetchInstruction>(&slot.instruction); v && v->data_format == 0)
+                        v->data_format = 38;
         Run run;
         run.inputs.resize(256);
         uint32_t x = uint32_t(count) * 977 + 1;
@@ -308,10 +317,35 @@ void corpus() {
             run.constants.fetch_constants[slot * 2] = 3u | 8u << 2;
             run.constants.fetch_constants[slot * 2 + 1] = 2u | 512u << 2;
         }
-        compare(name.c_str(), shader, run, true);
+        // three settings of the bool and loop constants, so branches go
+        // both ways and loops run: none set and no iterations; some set and
+        // a few iterations stepping up; all set and longer loops stepping down
+        for (int setting = 0; setting < 3; setting++) {
+            for (int b = 0; b < 8; b++)
+                run.constants.bool_constants[b] = setting == 0 ? 0u : setting == 1 ? 0x5A5A5A5Au * uint32_t(b + 1) : ~0u;
+            for (uint32_t l = 0; l < 32; l++) {
+                uint32_t iterations = setting == 0 ? 0 : setting == 1 ? 1 + l % 3 : 4 + l % 3;
+                uint32_t start = setting == 2 ? 8 : l % 2, step = setting == 2 ? uint32_t(uint8_t(-1)) : 1;
+                run.constants.loop_constants[l] = iterations | start << 8 | step << 16;
+            }
+            // the compiler's literals over them, as D3D loads them with the
+            // shader (xfeffect writes them beside the microcode)
+            std::ifstream defs(entry.path().string() + ".defs");
+            for (std::string line; std::getline(defs, line);) {
+                unsigned index = 0, w[4] = {};
+                if (std::sscanf(line.c_str(), "c%u %x %x %x %x", &index, &w[0], &w[1], &w[2], &w[3]) == 5 && index < 256)
+                    std::memcpy(run.constants.float_constants[index], w, 16);
+                else if (std::sscanf(line.c_str(), "i%u %x", &index, &w[0]) == 2 && index < 32)
+                    run.constants.loop_constants[index] = w[0];
+            }
+            std::string label = name + " (constants " + std::to_string(setting) + ")";
+            // whole shaders chain the approximate operations through
+            // subtractions: a step of difference in a 21-bit rcp grows
+            compare(label.c_str(), shader, run, 1e-4f);
+        }
         count++;
     }
-    std::printf("  %d shaders of the traces run\n", count);
+    std::printf("  %d shaders from XF_SHADERS run\n", count);
 }
 
 } // namespace
