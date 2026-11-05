@@ -1,0 +1,95 @@
+// One level of a guest texture, every slice or layer of it, read out of the
+// GPU's copy of guest memory into a buffer the image is then copied from
+// (renderer.cpp, textures over memory a resolve wrote): the same blocks, in
+// the same order and with the same byte swaps and depth conversions, as
+// texture.cpp's decode makes on the CPU (texture::Plan's SliceLoads). An
+// invocation writes a 32-bit word of the output: a part of a block, or two
+// or four blocks of 16 and 8 bits, which may lie in two slices. BSD; see
+// LICENSE-xenia.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer Memory { uint words[]; } memory;
+layout(set = 0, binding = 1) writeonly buffer Out { uint words[]; } dst;
+
+layout(push_constant) uniform Level {
+    uint base;          // the first slice's first byte in guest memory
+    uint slice_stride;  // layers: the bytes from one to the next
+    uint slices;        // layers, or a 3D level's slices
+    uint layered;       // 1: slices are layers (each at its own base); 0: 3D slices (z)
+    uint pitch_blocks, z_rows;
+    uint ox, oy, oz;    // in the packed tail
+    uint tiled, is_3d;
+    uint log2_bytes;    // per block
+    uint endian;
+    uint blocks_x, blocks_y;
+    uint out_word;      // where in dst its first word goes
+    uint words;         // how many it writes
+    uint load;          // texture::Load: 0 copy, 1 unorm24 depth to float, 2 float24 depth to float
+    uint row_words;     // the dispatch's words per row of workgroups
+} p;
+
+#include "tiling.glsl"
+
+// a block's byte address in guest memory, by its index in the level's slices
+uint block_address(uint block) {
+    uint per_slice = p.blocks_x * p.blocks_y;
+    uint slice = block / per_slice, rest = block - slice * per_slice;
+    uint x = rest % p.blocks_x + p.ox, y = rest / p.blocks_x + p.oy;
+    uint base = p.base + (p.layered != 0u ? slice * p.slice_stride : 0u);
+    uint z = (p.layered != 0u ? 0u : slice) + p.oz;
+    uint offset;
+    if (p.tiled == 0u) offset = (x + p.pitch_blocks * (y + p.z_rows * z)) << p.log2_bytes;
+    else if (p.is_3d != 0u) offset = tiled_offset_3d(x, y, z, p.pitch_blocks, p.z_rows, p.log2_bytes);
+    else offset = tiled_offset_2d(x, y, p.pitch_blocks, p.log2_bytes);
+    return (base + offset) & PHYSICAL_MASK;
+}
+
+uint load_word(uint address) { return memory.words[(address & PHYSICAL_MASK) >> 2u]; }
+
+// pixel_formats.xesli's XeFloat20e4To32
+float float20e4_to_32(uint f24) {
+    f24 &= 0xFFFFFFu;
+    if (f24 == 0u) return 0.0;
+    uint mantissa = f24 & 0xFFFFFu;
+    uint exponent = f24 >> 20u;
+    if (exponent == 0u) {
+        uint lzcnt = 20u - uint(findMSB(mantissa));
+        exponent = 1u - lzcnt;
+        mantissa = (mantissa << lzcnt) & 0xFFFFFu;
+    }
+    return uintBitsToFloat(((exponent + 112u) << 23u) | (mantissa << 3u));
+}
+
+void main() {
+    uint w = gl_GlobalInvocationID.y * p.row_words + gl_GlobalInvocationID.x;
+    if (w >= p.words) return;
+    uint blocks = p.blocks_x * p.blocks_y * p.slices;
+    uint value;
+    if (p.log2_bytes >= 2u) {
+        uint words_per_block_log2 = p.log2_bytes - 2u;
+        uint block = w >> words_per_block_log2, part = w & ((1u << words_per_block_log2) - 1u);
+        value = swap32(load_word(block_address(block) + 4u * part), p.endian);
+        if (p.load != 0u) {
+            // the depth in the high 24 bits: XeUNorm24To32 (exact), or XeFloat20e4To32
+            uint d24 = value >> 8u;
+            value = floatBitsToUint(p.load == 1u ? float(d24 + (d24 >> 23u)) * (1.0 / 16777216.0)
+                                                 : float20e4_to_32(d24));
+        }
+    } else {
+        // 16-bit blocks two to a word, 8-bit ones four, each swapped alone
+        uint per_word = 4u >> p.log2_bytes, bits = 8u << p.log2_bytes;
+        value = 0u;
+        for (uint k = 0u; k < per_word; k++) {
+            uint block = w * per_word + k;
+            if (block >= blocks) break;
+            uint address = block_address(block);
+            uint part = (load_word(address & ~3u) >> ((address & 3u) * 8u)) & ((1u << bits) - 1u);
+            if (bits == 16u) part = swap16(part, p.endian) & 0xFFFFu;
+            value |= part << (k * bits);
+        }
+    }
+    dst.words[p.out_word + w] = value;
+}

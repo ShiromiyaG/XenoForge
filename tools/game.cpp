@@ -74,10 +74,14 @@ void print_renderer_report(const render::Report &r) {
     std::printf("renderer: %llu draws (%llu drawn), %llu resolves, %llu swaps (%llu front buffers written)\n",
                 (unsigned long long)r.draws, (unsigned long long)r.drawn, (unsigned long long)r.resolves,
                 (unsigned long long)r.swaps, (unsigned long long)r.frames);
-    std::printf("renderer: %.1f s spent: %.1f s in submissions, %.1f s in resolves, %.1f s checking textures, "
-                "%.1f s decoding them, %.1f s copying %.1f MB of vertex data\n",
-                r.seconds, r.submit_seconds, r.resolve_seconds, r.check_seconds, r.decode_seconds, r.vertex_seconds,
-                double(r.vertex_bytes) / (1 << 20));
+    std::printf("renderer: %.1f s spent: %.1f s in submissions (%.1f s waiting for the GPU), %.1f s in resolves, "
+                "%.1f s checking textures, %.1f s decoding them, %.1f s copying %.1f MB of vertex data, %.1f s "
+                "copying %.1f MB that resolves wrote into memory\n",
+                r.seconds, r.submit_seconds, r.wait_seconds, r.resolve_seconds, r.check_seconds, r.decode_seconds,
+                r.vertex_seconds, double(r.vertex_bytes) / (1 << 20), r.writeback_seconds,
+                double(r.writeback_bytes) / (1 << 20));
+    std::printf("renderer: %llu submissions, %llu waits for the GPU\n", (unsigned long long)r.submissions,
+                (unsigned long long)r.waits);
     std::printf("renderer: made %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
                 (unsigned long long)r.render_targets, (unsigned long long)r.textures, (unsigned long long)r.pipelines,
                 (unsigned long long)r.shaders);
@@ -173,7 +177,10 @@ void print_report(Game &g, bool waiting) {
     std::printf("%s", kernel::input_report(k).c_str());
     if (g.renderer) {
         render::Report r;
-        if (waiting) r = g.renderer->report();
+        if (waiting) {
+            g.renderer->drain(); // the last front buffers asked for, to on_frame
+            r = g.renderer->report();
+        }
         if (waiting || g.renderer->try_report(r)) {
             print_renderer_report(r);
             std::string failure;

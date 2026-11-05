@@ -98,11 +98,55 @@ struct Image {
     // guest's bit order: the first component in the low bits.
     std::vector<std::vector<uint8_t>> levels;
     // the guest memory read for them, (physical address, bytes) per slice or
-    // layer of each level: what a cache of the image watches for changes
+    // layer of each level: what a cache of the image watches for changes.
+    // Tiled slices give the 4 KB pages their tiles lie in (a little more than
+    // the texels when the texture is narrower than its pitch).
     std::vector<std::pair<uint32_t, uint32_t>> footprint;
 };
 
+// What a decode does to a slice's blocks after reading and byte-swapping
+// them: nothing (the guest's bits, compressed blocks included), depth to
+// 32-bit floats, or a decompression to texels.
+enum class Load : uint8_t { Copy, DepthUnormToFloat, DepthFloatToFloat, Dxt3aToR8, Ctx1ToRg8 };
+
+// One slice (or layer) of one level, as the loads read it: Xenia's guest
+// addressing of its blocks (texture_load.xesli's XeTextureLoadSourceAddress)
+// at the packed tail's offset.
+struct SliceLoad {
+    uint32_t level = 0;
+    uint32_t base = 0;               // its first byte in guest memory (a 3D level's, for 3D)
+    uint32_t z = 0;                  // 3D: its slice; else 0
+    uint32_t pitch_blocks = 0, z_rows = 0;
+    uint32_t ox = 0, oy = 0, oz = 0; // in the packed tail, in blocks
+    bool tiled = false, is_3d = false;
+    uint32_t blocks_x = 0, blocks_y = 0;
+    uint32_t log2_bytes_per_block = 0;
+    // where its blocks lie, in bytes from base: [low, high), the 4 KB pages
+    // of its tiles when tiled, else exact
+    uint64_t low = 0, high = 0;
+
+    // the byte offset from base of block (x, y)
+    uint64_t offset(uint32_t x, uint32_t y) const;
+};
+
+// How a texture is read out of guest memory, without reading it: its host
+// format and size, and every slice of every level in the order decode
+// writes them (level by level, each level's slices in turn, tightly packed).
+// Both the CPU's decode and the renderer's loads on the GPU follow it.
+struct Plan {
+    HostFormat format = HostFormat::Unsupported;
+    Load load = Load::Copy;
+    uint32_t width = 0, height = 0, depth = 1; // as Image's
+    uint32_t bytes_per_block = 0;              // the guest's block (a texel, or a compressed 4x4 block)
+    uint32_t block_width = 1, block_height = 1;
+    uint32_t endian = 0;
+    uint32_t level_count = 0; // levels 0 to level_count - 1; level 0 has no slices without a base
+    std::vector<SliceLoad> slices;
+    std::vector<std::pair<uint32_t, uint32_t>> footprint; // as Image's: (physical address, bytes) per slice
+};
+
 // False with the reason when the format or layout is not done.
+bool plan(const Info &info, Plan &out, std::string &unsupported);
 bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string &unsupported);
 
 // A level's first slice or layer as row-major RGBA8, for looking at or

@@ -1,8 +1,9 @@
 // A windowless Vulkan 1.3 device for the renderer: one graphics queue, the
 // features the translated shaders and the renderer ask for (descriptor
-// indexing, dynamic rendering, demote to helper, geometry shaders for
-// rectangle lists, BC textures), and small helpers for buffers, images and
-// one-off command buffers. XF_VK_VALIDATION=1 turns the validation layer on.
+// indexing with sampled images updated after binding, dynamic rendering,
+// demote to helper, geometry shaders for rectangle lists, BC textures), and
+// small helpers for buffers, images and one-off command buffers.
+// XF_VK_VALIDATION=1 turns the validation layer on.
 
 #pragma once
 
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace xf::vk {
@@ -39,6 +41,7 @@ public:
     VkDevice device() const { return device_; }
     VkPhysicalDevice physical() const { return physical_; }
     VkQueue queue() const { return queue_; }
+    uint32_t queue_family() const { return family_; }
     const std::string &name() const { return name_; }
     // VK_EXT_shader_stencil_export, enabled when the device has it
     bool stencil_export() const { return stencil_export_; }
@@ -54,6 +57,11 @@ public:
 
     // Records with record(), submits, waits.
     bool run(const std::function<void(VkCommandBuffer)> &record, std::string &error);
+    // vkQueueSubmit on the queue, which threads share through this (the
+    // renderer's thread and a presenter's): Vulkan wants a queue's
+    // submissions made one at a time.
+    VkResult submit(uint32_t count, const VkSubmitInfo *submits, VkFence fence);
+    std::mutex &queue_mutex() { return queue_mutex_; }
 
 private:
     Device() = default;
@@ -69,6 +77,7 @@ private:
     VkPhysicalDeviceMemoryProperties memory_{};
     std::string name_;
     bool stencil_export_ = false;
+    std::mutex queue_mutex_;
 };
 
 } // namespace xf::vk

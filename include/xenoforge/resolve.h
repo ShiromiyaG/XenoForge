@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace xf::resolve {
 
@@ -61,5 +63,20 @@ texture::HostFormat host_format_of_color_target(uint32_t format);
 // (or D24S8 as 32-bit words, depth in the high 24 bits, for depth); each
 // sample of an MSAA target already resolved to one.
 bool write(const Info &info, std::span<const uint8_t> pixels, GuestMemory &memory, std::string &error);
+
+// The copy keeps the source's bits (Xenia's fast resolve shaders): depth,
+// or a color format bitwise equal to the destination's, unscaled.
+bool raw_copy(const Info &info);
+
+// Where a copy writes guest memory, as [start, end) ranges of physical
+// memory in address order: written, the ranges its texels lie in; partial,
+// those of them that also hold texels it does not write. With texels of 4
+// bytes or more in 2D, a 32x32 tile is a run of memory of its own, so
+// written is the runs of the rectangle's tiles, row by row, and partial the
+// tiles the rectangle's edges cut. Smaller texels and 3D destinations: the
+// span from the lowest texel to the highest, both. False when the
+// destination format is not one write() writes.
+bool destination_ranges(const Info &info, std::vector<std::pair<uint32_t, uint32_t>> &written,
+                        std::vector<std::pair<uint32_t, uint32_t>> &partial);
 
 } // namespace xf::resolve

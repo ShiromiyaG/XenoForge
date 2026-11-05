@@ -170,12 +170,54 @@ void test_decode_tiled_8() {
     for (uint32_t y = 0; y < 64 && same; y++)
         for (uint32_t x = 0; x < 64; x++) same &= img.levels[0][y * 64 + x] == uint8_t(hash(x * 64 + y));
     CHECK(same);
-    // the memory it read covers every texel's tiled offset
+    // the memory it read: the 4 KB pages of its tiles, every texel's tiled
+    // offset inside
     CHECK(img.footprint.size() == 1 && img.footprint[0].first == 0x200000);
     uint32_t last = 0;
     for (uint32_t y = 0; y < 64; y++)
         for (uint32_t x = 0; x < 64; x++) last = std::max(last, texture::tiled_offset_2d(x, y, 64, 0));
-    CHECK(img.footprint[0].second == last + 1);
+    CHECK(img.footprint[0].second == 4096 && last < 4096);
+}
+
+// The spans a plan gives each slice hold every block of it, and are the pages
+// of its tiles: for 2D and 3D tiling at every block size, with and without a
+// packed tail's offset, on sizes that are not multiples of a tile.
+void test_plan_spans() {
+    bool held = true, pages = true;
+    uint32_t checked = 0;
+    for (uint32_t format : {2u, 10u, 6u, 26u, 38u, 18u, 20u}) // 1, 2, 4, 8, 16 bytes; DXT1 8, DXT4_5 16 per block
+        for (uint32_t dimension : {1u, 2u})
+            for (uint32_t size : {7u, 32u, 70u, 200u}) {
+                Fetch f;
+                f.format = format, f.dimension = dimension, f.width = size, f.height = size / 2 + 1;
+                f.depth = dimension == 2 ? 5 : 1, f.pitch = (size + 31) & ~31u, f.base = 0x800000;
+                f.mip_max = 4, f.mip_base = 0x900000, f.packed = true;
+                texture::Plan p;
+                std::string why;
+                if (!texture::plan(f.info(), p, why)) {
+                    held = false;
+                    continue;
+                }
+                for (const texture::SliceLoad &s : p.slices) {
+                    uint64_t low = UINT64_MAX, high = 0;
+                    for (uint32_t y = 0; y < s.blocks_y; y++)
+                        for (uint32_t x = 0; x < s.blocks_x; x++) {
+                            uint64_t o = s.offset(x, y);
+                            low = std::min(low, o), high = std::max(high, o + (1u << s.log2_bytes_per_block));
+                        }
+                    held &= s.low <= low && high <= s.high;
+                    // no more than the pages of the blocks' tiles: at most a
+                    // tile and a page beyond the blocks at either end
+                    uint64_t tile = uint64_t(s.is_3d ? 32 * 16 * 4 : 32 * 32) << s.log2_bytes_per_block;
+                    uint64_t slack = s.tiled ? tile + 4096 : 0;
+                    pages &= (!s.tiled || (s.low % 4096 == 0 && s.high % 4096 == 0)) && low - s.low <= slack &&
+                             s.high - high <= slack;
+                    checked++;
+                }
+            }
+    CHECK(held);
+    CHECK(pages);
+    CHECK(checked > 100);
 }
 
 void test_decode_tiled_dxt1() {
@@ -409,6 +451,63 @@ void test_resolve_info() {
     CHECK(info.x == 0 && info.y == 0 && info.width == 64 && info.height == 32);
 }
 
+// The ranges a copy writes (resolve::destination_ranges) hold every byte of
+// every texel it writes, and the bytes they hold besides lie in the partial
+// ranges: for texels of 1 to 16 bytes, 2D and 3D, rectangles inside a tile,
+// across tiles and at offsets within the first.
+void test_resolve_destination_ranges() {
+    struct Rect {
+        uint32_t x, y, width, height, pitch;
+    };
+    const Rect rects[] = {{0, 0, 64, 32, 64}, {8, 16, 40, 24, 64}, {0, 0, 1280, 720, 1280}, {24, 8, 8, 8, 32},
+                          {0, 0, 48, 40, 160}, {16, 0, 96, 64, 128}};
+    bool held = true, rest_partial = true, some_full = false;
+    for (uint32_t format : {6u, 26u, 38u, 2u, 4u}) // 4, 8, 16, 1 and 2 bytes per texel
+        for (bool array : {false, true})
+            for (const Rect &r : rects) {
+                resolve::Info info;
+                info.copy = true, info.width = r.width, info.height = r.height, info.dest_x = r.x, info.dest_y = r.y;
+                info.dest_pitch = r.pitch, info.dest_height = (r.y + r.height + 31) & ~31u;
+                info.dest_format = format, info.dest_array = array, info.dest_slice = array ? 2 : 0;
+                info.dest_base = 0x1000000;
+                std::vector<std::pair<uint32_t, uint32_t>> written, partial;
+                CHECK(resolve::destination_ranges(info, written, partial));
+                if (written.empty()) {
+                    held = false;
+                    continue;
+                }
+                uint32_t bytes = texture::format_block(format).bytes, log2 = uint32_t(std::countr_zero(bytes));
+                uint32_t low = written.front().first, span = written.back().second - low;
+                std::vector<uint8_t> in_written(span), in_partial(span), texel(span);
+                for (auto [s, e] : written) std::fill(in_written.begin() + (s - low), in_written.begin() + (e - low), 1);
+                for (auto [s, e] : partial)
+                    if (s >= low && e <= low + span)
+                        std::fill(in_partial.begin() + (s - low), in_partial.begin() + (e - low), 1);
+                for (uint32_t j = 0; j < r.height; j++)
+                    for (uint32_t i = 0; i < r.width; i++) {
+                        uint32_t x = r.x + i, y = r.y + j;
+                        uint64_t o = array ? texture::tiled_offset_3d(x, y, 2, r.pitch, info.dest_height, log2)
+                                           : texture::tiled_offset_2d(x, y, r.pitch, log2);
+                        uint64_t at = info.dest_base + o;
+                        if (at < low || at + bytes > uint64_t(low) + span) {
+                            held = false;
+                            continue;
+                        }
+                        for (uint32_t b = 0; b < bytes; b++) {
+                            held &= in_written[at - low + b] != 0;
+                            texel[at - low + b] = 1;
+                        }
+                    }
+                for (uint32_t k = 0; k < span; k++) {
+                    if (in_written[k] && !texel[k]) rest_partial &= in_partial[k] != 0;
+                    some_full |= in_written[k] && !in_partial[k];
+                }
+            }
+    CHECK(held);
+    CHECK(rest_partial);
+    CHECK(some_full); // whole tiles are not partial
+}
+
 void test_resolve_round_trips() {
     texture::Image img;
     // 8_8_8_8 to 8_8_8_8 8in32: the bits as they were
@@ -525,11 +624,13 @@ int main() {
     test_parse();
     test_decode_linear_rgba8();
     test_decode_tiled_8();
+    test_plan_spans();
     test_decode_tiled_dxt1();
     test_decode_3d_and_cube();
     test_decode_mips();
     test_endian();
     test_resolve_info();
     test_resolve_round_trips();
+    test_resolve_destination_ranges();
     return finish("texture");
 }

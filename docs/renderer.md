@@ -27,8 +27,9 @@ ring buffer (PM4)  ──>  front end                    src/gpu/
                                v
                          Vulkan back end              src/vk/
                            render targets: images keyed by EDRAM range
-                           textures: decoded by compute, keyed by fetch constant
-                           guest memory: one buffer, pages watched
+                           textures: keyed by fetch constant, bindless
+                           guest memory: a mirror resolves write, an upload
+                             arena per submission
 ```
 
 The front end runs on its own thread, the game's threads only write the ring
@@ -75,9 +76,9 @@ state, so pipelines key on less.
   copy shader: the one general reinterpretation, where aliasing bugs live,
   so it gets tests of its own.
 - A resolve writes the image into guest memory as a texture (tiling,
-  endianness, format, the optional clear) and marks those pages as written
-  by the GPU; the texture cache then uses the image directly, and memory gets
-  the bytes only when the CPU reads them (page guards).
+  endianness, format, the optional clear) on the GPU, into the mirror
+  ("Guest memory on the GPU" below); the textures over it are loaded from
+  there on the GPU.
 - A resolution scale applies from the start: images at N times their size,
   resolves keep a scaled copy for sampling, the CPU sees them scaled back.
 
@@ -85,7 +86,65 @@ state, so pipelines key on less.
 format, size, tiling, endianness, mip address); untiled and decoded by
 compute shaders, one per format family, from a table of formats; dropped
 when the CPU writes their pages (page guards over guest memory). HD texture
-packs hook in here, as in the 3DS runtime.
+packs hook in here, as in the 3DS runtime. So far (B4) the GPU loads the
+textures over what resolves wrote (`texture_load.comp`, the CPU decode's
+addressing and byte swaps from the same `texture::Plan`); the rest are
+decoded on the CPU and checked by a hash of their memory.
+
+**Submissions batched (B4, 2026-11-05).** What the processor sends is
+recorded into command buffers a frame at a time: a submission at each
+swap, or sooner when its share of the upload arena fills, three in flight.
+Render passes stay open from draw to draw while the targets stay the same;
+transfers and computes (EDRAM moves, resolves, texture uploads, clears) end
+them, with a full barrier on each side (a few a frame). A draw's constants,
+indices and vertex data are copied into its submission's share of a
+host-visible arena, the vertex fetch constants pointed at the copies (the
+shader reads its vertices where they were copied, bounded by the
+constant's size as before); textures are bindless, one descriptor set
+written after binding, each image at its own index for its life. The
+renderer waits for the GPU only to reuse a submission's slot, or when the
+CPU must see what the GPU wrote.
+
+**Guest memory on the GPU: the mirror (B4, 2026-11-05).** Xenia keeps all
+of guest memory on the GPU (its shared memory) and learns of the CPU's
+writes from page watches. XenoForge has no page watches yet, and guest
+memory is host memory the renderer reads where it lies; so its copy on
+the GPU (512 MB, device-local) holds what the GPU writes and what reads of
+that need around it.
+- A resolve runs on the GPU: the rectangle copied from its render target
+  into a scratch buffer (to one sample first when multisampled, as before),
+  then `resolve.comp` (resolve.cpp's write, ported with its arithmetic kept
+  exact) writes it into the mirror, tiled. The 32x32 tiles the rectangle
+  cuts at its edges get guest memory's bytes first, so the rest of them
+  is the CPU's (`resolve::destination_ranges`).
+- Until guest memory has it, what a resolve wrote is pending: textures over
+  it are loaded from the mirror; a draw whose vertex data lies there reads
+  the mirror instead of the arena; a front buffer read back and textures
+  in formats only the CPU decodes (DXT3A, CTX1) wait for it.
+- Guest memory gets it once the GPU is done, without waiting: the resolve's
+  ranges are copied into a read-back buffer on the GPU, and into guest
+  memory at the first call of the processor's that finds the submission
+  done (its textures are then checked by hash again). A later resolve of the
+  same range takes over (only the newest bytes are copied); the processor's
+  own writes there (`memory_written`, a trace's memory) cancel it.
+- Why copy it back at all rather than when the CPU reads it (the page
+  guards of "EDRAM as render targets" above): nothing tells the renderer
+  when the CPU reads, and a game reading a resolved surface (a screenshot,
+  a save's thumbnail, data rendered on the GPU) must find it there. Xenia's
+  default (`readback_resolve=fast`) copies every resolve back too, a frame
+  late; here it lands when the GPU is done. With page guards it can become
+  lazy. Until then, the CPU writing a range between a resolve and its copy
+  back loses that write (Xenia's fast readback has the same window, a frame
+  long).
+
+**Front buffers read back without waiting (B4).** A swap asked for
+(`frame_wanted`) records a copy of its front buffer (fetch constant 0, as a
+texture) into a read-back buffer; the picture goes to `on_frame` when the
+GPU is done, at a later call of the processor's or at `drain()`. A
+presenter on the renderer's device could take the image itself: the
+texture of fetch constant 0 is a GPU image (general layout, the guest's
+swizzle in its view), and a copy submitted after the renderer's submission
+on the same queue comes after it.
 
 **The rest, as games ask:** memexport (shaders writing guest memory, then
 what it overlaps invalidated), rectangle and quad lists and point sprites
@@ -156,14 +215,15 @@ where it lies (the processor's physical memory). A trace is replayed
 through a processor of its own as Xenia's trace player feeds its command
 processor (`replay.cpp`: each packet written at its address and executed
 there, the memory it read written first, recorded memory writes skipped,
-the registers and gamma ramps restored). Every draw is one Vulkan
-submission, waited for: plain, not fast.
+the registers and gamma ramps restored). At first every draw was one
+Vulkan submission, waited for; since B4 a frame's work is one submission,
+waited for only when the CPU needs what the GPU wrote (Decisions).
 
 - **Draws**: the translated vertex and pixel shaders (colors scaled by the
   target's exponent bias, 16-bit fixed targets kept as snorm with their
-  -32..32, gamma targets written through the piecewise linear curve); guest memory a 512 MB
-  storage buffer the vertex fetches read, what changed copied over before
-  each draw; indices swapped and offset on the CPU (quad lists split,
+  -32..32, gamma targets written through the piecewise linear curve);
+  the vertex fetches reading the copies of their ranges in the upload
+  arena; indices swapped and offset on the CPU (quad lists split,
   strips restarted at the reset index); rectangle lists and point lists
   through geometry shaders (points as sprites of the vertex shader's
   clamped oPts.x or PA_SU_POINT_SIZE, as Xenia's); viewport, scissor and
@@ -190,9 +250,11 @@ submission, waited for: plain, not fast.
   cube, tiled or linear, packed mips, the block formats kept compressed;
   depth formats as 32-bit floats, the EXPAND formats as 16-bit floats, as
   Xenia's texture cache loads them), with the fetch constant's swizzle and
-  sampler; each is kept with a hash of the memory it was decoded from (the
-  spans the decoder read) and decoded again when that memory differs at a
-  use, or at once when the processor writes over it (`memory_written`).
+  sampler; each is kept with a hash of the memory it was decoded from (its
+  slices' spans: a tiled slice's the 4 KB pages its tiles lie in, found
+  without visiting the texels) and decoded again when that memory differs
+  at a use, or at once when the processor or a resolve writes over it
+  (`memory_written`).
   1D, 2D and stacked textures are 2D arrays, as Xenia binds them; a
   3D-or-stacked fetch chooses at run time by the fetch constant's
   dimension, a stacked one its layer (two blended when the volume filter
@@ -200,14 +262,15 @@ submission, waited for: plain, not fast.
   rounding epsilon (1.5/1024 of a texel), and unnormalized coordinates are
   divided by the size from the fetch constant, as Xenia's
   `ProcessTextureFetchInstruction` does.
-- **Vertex data**: before each draw, the ranges of the vertex fetch
-  constants the shaders use (address and size, as Xenia's IssueDraw
-  requests them) are copied from guest memory to the GPU's copy of it.
-- **Resolves** read the rectangle back (MSAA averaged), write it into guest
-  memory as the destination says (`resolve.h`), then clear.
+- **Vertex data**: at each draw, the ranges of the vertex fetch constants
+  the shaders use (address and size, as Xenia's IssueDraw requests them)
+  are copied from guest memory into the upload arena.
+- **Resolves** write the rectangle (MSAA averaged) as the destination says
+  (`resolve.h`), on the GPU since B4 (into the mirror, then guest memory),
+  then clear.
 - **The swap** shows texture fetch constant 0 through the processor's gamma
   table, as Xenia's presenter does, for the swaps asked for (numbered from 0
-  as Xenia numbers a trace's frame).
+  as Xenia numbers a trace's frame), read back without waiting.
 
 Nothing tells the renderer when the CPU writes guest memory (Xenia watches
 pages with memory protection), so what it copies is checked or copied
@@ -297,8 +360,8 @@ START" pulse shows one phase at every hundredth swap from 2100 to 6300,
 not the phase of Xenia's frame 2400 nor that of its 3000 and 3600: the
 pulse is the game's (its clock or its frame count), not the renderer's.
 
-The cost (runs of the same length back to back, other work sharing the
-machine): El Chavo Kart is bound by the interpreter, and rendering on the
+The cost, before B4 (runs of the same length back to back, other work
+sharing the machine): El Chavo Kart is bound by the interpreter, and rendering on the
 processor's thread costs it nothing measurable (747 swaps in 90 s headless,
 742 rendered; the renderer busy 24 s of the 90). Ben 10 is bound by the
 renderer: 59.4 swaps a second headless (vblank's pace), 18.4 rendered, the
@@ -308,6 +371,55 @@ frame. Every draw is a submission waited for and every resolve is read
 back and tiled by the CPU, as planned for traces; batching a frame's draws
 into one submission and resolving on the GPU (B4) are what would take this
 away.
+
+## Speed (B4, 2026-11-05)
+
+Batched submissions, resolves and the textures over them on the GPU, and
+front buffers read back without waiting ("Decisions"). Measured with boot's
+report on runs of the same length, headless and rendered back to back, the
+generated code linked, an RTX 5060, other agents' builds sharing the
+machine (60 to 100% load); swaps a second over the whole run and over its
+last 5 s:
+
+| | before (648464d) | after |
+| --- | --- | --- |
+| Ben 10, 45 s headless | 60.0, 60.0 | 40.9, 60.0 |
+| Ben 10, 45 s rendered | 14.7, 19.4 | 43.2, 60.0 |
+| renderer busy | 41.3 s (25.9 resolves, 19.6 submissions) | 2.3 s |
+| El Chavo Kart, 150 s headless | 22.3, 30.0 (3,353 swaps) | 29.9, 29.9 (4,590) |
+| El Chavo Kart, 150 s rendered | 17.0, 8.0 on the title (2,566) | 30.0, 30.0 on the title (4,504) |
+| renderer busy | 146.6 s (90.1 resolves, 37.1 submissions, 25.3 decoding textures) | 11.5 s |
+
+(Ben 10's whole-run rate fell headless as well: since the player's merge
+boot answers an idle pad, and the game plays past its logo into scenes
+that pace themselves; both runs end at 60.) After, El Chavo Kart's 11.5 s
+are 3.9 s copying vertex data (103 GB: the fetch constants' whole ranges,
+about 1 MB a draw), 1.8 s recording resolves, 1.3 s checking textures, 1.1
+s decoding them (the intro movie's three planes a frame, written by the
+CPU), 1.1 s copying what resolves wrote into guest memory (16 GB), 0.4 s
+submitting (0.1 s of it waiting for the GPU); 4,508 submissions and 4 waits
+in the run. Ben 10's 2.3 s: 0.7 s in resolves, 0.5 s checking textures,
+0.4 s decoding, 0.4 s copying 6.9 GB back; 2 waits. On the title every
+texture reloaded in a frame (about 17) is a resolve's, loaded on the GPU.
+
+Live against Xenia's dumps (shots of every swap around each frame): El
+Chavo Kart's 300 at swap 290 (0.005 of 255, no pixel off by 16), its 900
+at swap 818 (0.003), 1800 at 1615 (0.004), its title (2400) at swap 2910
+(0.000, the "Press START" pulse in the same phase); its 301 lies between
+two of our swaps (the logo's fade runs on the clock, and Xenia swaps twice
+as often there: our 290 differs from Xenia's 301 by what Xenia's 300 does,
+5.08). Ben 10, now past its logo: 600 and 601 at swaps 574 and 575 (0.000),
+1800 and 1801 at 1481 and 1482 (0.154 and 0.006); its 3600 (the title's
+glow in another phase) was not reached within 1.55. The eleven trace
+frames match as before. Vulkan's validation layer, on the trace
+regression and on a live run of each game, reports nothing.
+
+Left: the vertex data (copied whole at each draw, with nothing to tell the
+renderer which pages changed: page watches, or ranges trimmed to the
+indices a draw uses), the CPU's texture decodes and checks (all textures
+loaded on the GPU from the mirror, as Xenia's, once the mirror can be kept
+current), the copy back of every resolve (lazy with page guards), and
+resolution scale and the pipeline cache (B4's other half).
 
 ## What is asked and not done is counted
 

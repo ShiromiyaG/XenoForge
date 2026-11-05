@@ -105,6 +105,7 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     Player player(*memory, processor, *renderer);
     bool walked = walk_gpu_trace(trace, player, error);
     processor.set_sink(nullptr);
+    renderer->drain(); // the front buffers asked for, read back
     report = renderer->report();
     report.packets = processor.counts().packets.load();
     if (!walked) return false;

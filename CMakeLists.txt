@@ -76,7 +76,7 @@ function(xf_shader name source)
         COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
         COMMAND ${GLSLC} --target-env=vulkan1.3 -mfmt=num ${ARGN} -o ${XF_SHADER_OUT}/${name}.inc
                 ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/${source}
-        DEPENDS src/shaders/${source} src/shaders/edram.glsl
+        DEPENDS src/shaders/${source} src/shaders/edram.glsl src/shaders/tiling.glsl
         COMMENT "glslc ${name}")
     set(XF_SHADER_WORDS ${XF_SHADER_WORDS} ${XF_SHADER_OUT}/${name}.inc PARENT_SCOPE)
 endfunction()
@@ -88,6 +88,8 @@ xf_shader(edram_store_ms.comp edram_store.comp -DMS)
 xf_shader(edram_load.frag edram_load.frag)
 xf_shader(edram_load_depth.frag edram_load.frag -DDEPTH)
 xf_shader(edram_load_stencil.frag edram_load.frag -DDEPTH -DSTENCIL)
+xf_shader(resolve.comp resolve.comp)
+xf_shader(texture_load.comp texture_load.comp)
 add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/replay.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SHADER_OUT})
 target_link_libraries(xenoforge_vk PUBLIC xenoforge Vulkan::Vulkan)

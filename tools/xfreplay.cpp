@@ -67,10 +67,14 @@ int main(int argc, char **argv) {
     std::printf("  made: %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
                 (unsigned long long)report.render_targets, (unsigned long long)report.textures,
                 (unsigned long long)report.pipelines, (unsigned long long)report.shaders);
-    std::printf("  %.3f s in the renderer: %.3f s in submissions, %.3f s in resolves, %.3f s checking textures, "
-                "%.3f s decoding them, %.3f s copying %.1f KB of vertex data\n",
-                report.seconds, report.submit_seconds, report.resolve_seconds, report.check_seconds,
-                report.decode_seconds, report.vertex_seconds, double(report.vertex_bytes) / 1024);
+    std::printf("  %.3f s in the renderer: %.3f s in submissions (%.3f s waiting for the GPU), %.3f s in resolves, "
+                "%.3f s checking textures, %.3f s decoding them, %.3f s copying %.1f KB of vertex data, %.3f s copying "
+                "%.1f KB that resolves wrote into memory\n",
+                report.seconds, report.submit_seconds, report.wait_seconds, report.resolve_seconds,
+                report.check_seconds, report.decode_seconds, report.vertex_seconds, double(report.vertex_bytes) / 1024,
+                report.writeback_seconds, double(report.writeback_bytes) / 1024);
+    std::printf("  %llu submissions, %llu waits for the GPU\n", (unsigned long long)report.submissions,
+                (unsigned long long)report.waits);
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)
         std::printf("  approx  %6llu  %s\n", (unsigned long long)n, what.c_str());

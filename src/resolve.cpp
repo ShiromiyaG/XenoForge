@@ -538,10 +538,7 @@ bool write(const Info &info, std::span<const uint8_t> pixels, GuestMemory &memor
     }
     uint32_t bpp_log2 = std::countr_zero(dest_bytes);
     // The raw copy (the fast shaders) when nothing changes the bits.
-    bool raw = info.depth ||
-               (info.source_format != rt_8_8_8_8_GAMMA && !info.dest_exp_bias &&
-                bitwise_equivalent(info.source_format, info.dest_format) &&
-                info.dest_number == (is_float_format(info.dest_format) ? 7u : 0u));
+    bool raw = raw_copy(info);
 
     auto offset = [&](uint32_t i, uint32_t j) -> uint64_t {
         uint32_t x = info.dest_x + i, y = info.dest_y + j;
@@ -581,6 +578,70 @@ bool write(const Info &info, std::span<const uint8_t> pixels, GuestMemory &memor
             }
         }
     memory.write(uint32_t(info.dest_base + low), dest);
+    return true;
+}
+
+bool raw_copy(const Info &info) {
+    return info.depth || (info.source_format != rt_8_8_8_8_GAMMA && !info.dest_exp_bias &&
+                          bitwise_equivalent(info.source_format, info.dest_format) &&
+                          info.dest_number == (is_float_format(info.dest_format) ? 7u : 0u));
+}
+
+bool destination_ranges(const Info &info, std::vector<std::pair<uint32_t, uint32_t>> &written,
+                        std::vector<std::pair<uint32_t, uint32_t>> &partial) {
+    written.clear(), partial.clear();
+    if (!info.copy || !info.width || !info.height) return true;
+    uint32_t dest_bytes = texture::format_block(info.dest_format).bytes;
+    if (!dest_bytes || !std::has_single_bit(dest_bytes) || dest_bytes > 16) return false;
+    uint32_t log2 = std::countr_zero(dest_bytes);
+    constexpr uint64_t SIZE = 0x20000000;
+    // [start, end) from the destination's base, wrapping at the end of
+    // physical memory as the address mask does, joined to the last range
+    // when it follows or overlaps it
+    auto add = [&](std::vector<std::pair<uint32_t, uint32_t>> &out, uint64_t start, uint64_t end) {
+        uint64_t at = (uint64_t(info.dest_base) + start) % SIZE, bytes = std::min(end - start, SIZE);
+        while (bytes) {
+            uint64_t n = std::min(bytes, SIZE - at);
+            if (!out.empty() && at >= out.back().first && at <= out.back().second)
+                out.back().second = uint32_t(std::max<uint64_t>(out.back().second, at + n));
+            else
+                out.push_back({uint32_t(at), uint32_t(at + n)});
+            bytes -= n, at = 0;
+        }
+    };
+    if (!info.dest_array && log2 >= 2) {
+        // tiled_combine moves the tiled byte offset's bits from 8 up to 12
+        // up and keeps the rest below 12; with texels of 4 bytes or more,
+        // those bits are tile t's index times its size (1024 << log2 bytes,
+        // 4 KB or more) plus a part of the texel's place under that size, so
+        // tile t takes [t, t + 1) * tile bytes from the base (a tile's corner)
+        uint64_t tile_bytes = uint64_t(32 * 32) << log2, pitch_tiles = info.dest_pitch >> 5;
+        uint32_t x0 = info.dest_x, y0 = info.dest_y, x1 = x0 + info.width, y1 = y0 + info.height;
+        uint32_t tx0 = x0 >> 5, tx1 = (x1 - 1) >> 5, ty0 = y0 >> 5, ty1 = (y1 - 1) >> 5;
+        for (uint32_t ty = ty0; ty <= ty1; ty++) {
+            uint64_t row = ty * pitch_tiles;
+            add(written, (row + tx0) * tile_bytes, (row + tx1 + 1) * tile_bytes);
+            if ((ty == ty0 && (y0 & 31)) || (ty == ty1 && (y1 & 31))) {
+                add(partial, (row + tx0) * tile_bytes, (row + tx1 + 1) * tile_bytes);
+                continue;
+            }
+            if (x0 & 31) add(partial, (row + tx0) * tile_bytes, (row + tx0 + 1) * tile_bytes);
+            if (x1 & 31) add(partial, (row + tx1) * tile_bytes, (row + tx1 + 1) * tile_bytes);
+        }
+        return true;
+    }
+    uint64_t low = UINT64_MAX, high = 0;
+    for (uint32_t j = 0; j < info.height; j++)
+        for (uint32_t i = 0; i < info.width; i++) {
+            uint32_t x = info.dest_x + i, y = info.dest_y + j;
+            uint64_t o = info.dest_array
+                             ? texture::tiled_offset_3d(x, y, info.dest_slice, info.dest_pitch, info.dest_height, log2)
+                             : texture::tiled_offset_2d(x, y, info.dest_pitch, log2);
+            low = std::min(low, o), high = std::max(high, o);
+        }
+    if (high - low > (256u << 20)) return false;
+    add(written, low, high + dest_bytes);
+    partial = written;
     return true;
 }
 

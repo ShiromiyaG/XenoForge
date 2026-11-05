@@ -235,7 +235,23 @@ traces, without a recompiled game.
   EDRAM, draws that can write nothing dropped. Next: traces of more games,
   and of the games themselves past their titles.
 - **B4. Scale and speed**: resolution scale, the pipeline cache on disk,
-  shaders translated in the build.
+  shaders translated in the build. The renderer's speed first (2026-11-05,
+  [renderer.md](renderer.md), "Decisions" and "Speed"): a frame's work is
+  recorded into one submission, three in flight, render passes kept open
+  across draws, constants, indices and vertex data in an upload arena,
+  textures bindless; resolves run on the GPU into a mirror of guest memory
+  (the CPU's resolve ported to a compute shader), the textures over them
+  are loaded there on the GPU (the CPU decode's plan, ported), guest memory
+  gets the bytes when the GPU is done, and front buffers are read back
+  without waiting. Rendering now costs the games little: Ben 10 renders at
+  its 60 swaps a second (14.7 before, the renderer busy 2.3 s of 45
+  instead of 41.3), El Chavo Kart's title at its 30 (8 before), within a
+  percent or two of the same runs headless; the eleven trace frames match
+  Xenia as before, and live both games draw Xenia's dumps of their intros
+  and titles exactly (Ben 10's too, now that boot answers an idle pad).
+  Left: the vertex data and the CPU's texture decodes
+  (most of what the renderer still spends), resolution scale, the pipeline
+  cache.
 - **B5. The generic pipeline** (the microcode interpreter on the GPU), if
   hitches still show.
 
@@ -271,8 +287,9 @@ traces, without a recompiled game.
   (`../Chaves/docs/native-renderer-re.md`) moved over as El Chavo Kart's port.
 
 Next (2026-11-05, later still): the player (C1) is in, so M1 is there as a
-person would see it, at the renderer's speed (B4: a few swaps a second on
-El Chavo Kart's menus, the renderer the bottleneck). Earlier: the renderer
+person would see it; the renderer keeps up with both games (B4, above),
+so the player can switch to the front buffer on the GPU (renderer.md,
+"Decisions") instead of the picture read back at each swap. Earlier: the renderer
 runs live as the command processor's
 Sink, headless (`boot --render`); next the player (C1: the window and the
 presentation, input) for M1, and the renderer's speed (B4: draws batched

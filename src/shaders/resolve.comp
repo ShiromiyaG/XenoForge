@@ -1,0 +1,345 @@
+// A resolve's rectangle, from a render target's pixels copied into a buffer,
+// written into the GPU's copy of guest memory as the destination says
+// (renderer.cpp): resolve.cpp's write, pixel by pixel, on the GPU. Translated
+// from Xenia through resolve.cpp: the copy as ResolveInfo::GetCopyShader
+// chooses it (raw when the formats are bitwise equal, else converted) and
+// the resolve shaders do it (resolve.xesli, resolve_fast_*.xesli,
+// resolve_full_*.xesli: unpacking, piecewise-linear gamma, exponent bias,
+// red/blue swap, packing per number format as pixel_formats.xesli's XePack*,
+// endian.xesli's byte swaps, the tiled destination). The arithmetic is
+// resolve.cpp's, kept exact (precise: no fused multiply-adds). BSD; see
+// LICENSE-xenia.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) readonly buffer Source { uint words[]; } src;
+layout(set = 0, binding = 1) coherent buffer Memory { uint words[]; } memory;
+
+layout(push_constant) uniform Resolve {
+    uint width, height;     // the rectangle
+    uint src_words;         // per pixel in src: 1 or 2
+    uint source_format;     // the color target format, or the depth format
+    uint depth;             // 1: depth words (and stencil bytes after them)
+    uint depth_mode;        // depth: 0 24-bit unorm bits, 1 float as 20e4 of twice it, 2 float as unorm24
+    uint stencil_word;      // depth: where the stencil bytes start in src, in words
+    uint raw;               // the bits as they are (the fast shaders)
+    uint dest_base, dest_pitch, dest_height, dest_x, dest_y, dest_slice, dest_array;
+    uint dest_format, dest_log2_bytes, dest_endian, dest_number, dest_swap;
+    float exp_factor;       // 2 to the exponent bias
+} p;
+
+#include "tiling.glsl"
+
+// color render target formats (xenos.h's ColorRenderTargetFormat)
+const uint RT_8_8_8_8 = 0u, RT_8_8_8_8_GAMMA = 1u, RT_2_10_10_10 = 2u, RT_2_10_10_10_FLOAT = 3u, RT_16_16 = 4u,
+           RT_16_16_16_16 = 5u, RT_16_16_FLOAT = 6u, RT_16_16_16_16_FLOAT = 7u, RT_2_10_10_10_AS_10_10_10_10 = 10u,
+           RT_2_10_10_10_FLOAT_AS_16_16_16_16 = 12u, RT_32_FLOAT = 14u, RT_32_32_FLOAT = 15u;
+// texture formats (xenos.h's TextureFormat)
+const uint K_1_5_5_5 = 3u, K_5_6_5 = 4u, K_6_5_5 = 5u, K_8_8_8_8 = 6u, K_2_10_10_10 = 7u, K_8_8 = 10u,
+           K_16_16_EDRAM = 13u, K_8_8_8_8_A = 14u, K_4_4_4_4 = 15u, K_10_11_11 = 16u, K_11_11_10 = 17u,
+           K_16_16_16_16_EDRAM = 21u, K_16 = 24u, K_16_16 = 25u, K_16_16_16_16 = 26u, K_16_16_FLOAT = 31u,
+           K_16_16_16_16_FLOAT = 32u, K_8_8_8_8_AS_16_16_16_16 = 50u, K_2_10_10_10_AS_16_16_16_16 = 54u,
+           K_10_11_11_AS_16_16_16_16 = 55u, K_11_11_10_AS_16_16_16_16 = 56u;
+
+float half_to_float(uint h) {
+    uint sign = (h >> 15u) << 31u, exponent = (h >> 10u) & 0x1Fu, mantissa = h & 0x3FFu;
+    uint bits;
+    if (exponent == 0x1Fu) bits = sign | 0x7F800000u | (mantissa << 13u);
+    else if (exponent != 0u) bits = sign | ((exponent + 112u) << 23u) | (mantissa << 13u);
+    else if (mantissa == 0u) bits = sign;
+    else {
+        uint e = 0u;
+        mantissa <<= 1u;
+        while ((mantissa & 0x400u) == 0u) e++, mantissa <<= 1u;
+        bits = sign | ((112u - e) << 23u) | ((mantissa & 0x3FFu) << 13u);
+    }
+    return uintBitsToFloat(bits);
+}
+
+// single to half, rounding to nearest even, overflowing to infinity
+uint float_to_half(float f) {
+    uint bits = floatBitsToUint(f);
+    uint sign = (bits >> 16u) & 0x8000u, exponent = (bits >> 23u) & 0xFFu, mantissa = bits & 0x7FFFFFu;
+    if (exponent == 0xFFu) return sign | 0x7C00u | (mantissa != 0u ? 0x200u : 0u);
+    int e = int(exponent) - 127 + 15;
+    if (e >= 31) return sign | 0x7C00u;
+    if (e <= 0) {
+        if (e < -10) return sign;
+        mantissa |= 0x800000u;
+        uint shift = uint(14 - e);
+        uint half_bits = mantissa >> shift, rest = mantissa & ((1u << shift) - 1u), midpoint = 1u << (shift - 1u);
+        if (rest > midpoint || (rest == midpoint && (half_bits & 1u) != 0u)) half_bits++;
+        return sign | half_bits;
+    }
+    uint half_bits = (uint(e) << 10u) | (mantissa >> 13u), rest = mantissa & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (half_bits & 1u) != 0u)) half_bits++;
+    return sign | half_bits;
+}
+uint pack_half2(float a, float b) { return float_to_half(a) | (float_to_half(b) << 16u); }
+
+// pixel_formats.xesli's XePackFixed
+uint pack_fixed(float value, uint bits, uint number) {
+    uint unsigned_max = (1u << bits) - 1u;
+    if (isnan(value)) value = 0.0;
+    uint packed;
+    if (number == 1u) { // signed repeating fraction
+        float positive_max = float((1u << (bits - 1u)) - 1u);
+        precise float t = clamp(value, -1.0, 1.0) * positive_max + (value >= 0.0 ? 0.5 : -0.5);
+        packed = uint(int(t));
+    } else if (number == 2u) { // unsigned integer
+        precise float t = clamp(value, 0.0, float(unsigned_max)) + 0.5;
+        packed = uint(t);
+    } else if (number == 3u) { // signed integer
+        float lo = -float(1u << (bits - 1u)), hi = float((1u << (bits - 1u)) - 1u);
+        precise float t = clamp(value, lo, hi) + (value >= 0.0 ? 0.5 : -0.5);
+        packed = uint(int(t));
+    } else {
+        precise float t = clamp(value, 0.0, 1.0) * float(unsigned_max) + 0.5;
+        packed = uint(t);
+    }
+    return packed & unsigned_max;
+}
+
+// resolve.xesli's piecewise-linear gamma, for 8_8_8_8_GAMMA sources
+uint pwl_gamma_to_linear_code(uint c) {
+    uint scale = c < 64u ? 1u : c < 96u ? 2u : c < 192u ? 4u : 8u;
+    uint offset = c < 64u ? 0u : c < 96u ? 64u : c < 192u ? 256u : 1024u;
+    uint linear_code = c * scale - offset;
+    return linear_code + ((linear_code * scale) >> 10u);
+}
+float average_pwl_gamma(uint m) {
+    uint c = m < 64u ? m : m < 128u ? (m + 64u) >> 1u : m < 512u ? (m + 256u) >> 2u : (m + 1024u) >> 3u;
+    c = min(c, 255u);
+    uint n = pwl_gamma_to_linear_code(c);
+    return n == 1023u ? 1.0 : float((n << 14u) | (n << 4u) | (n >> 6u)) * (1.0 / 16777216.0);
+}
+float gamma_to_linear(float v) {
+    precise float code = v * 255.0 + 0.5;
+    return average_pwl_gamma(pwl_gamma_to_linear_code(uint(code)));
+}
+
+// A source pixel as the resolve shaders unpack it (XeResolveUnpack*): two
+// components with blue and alpha 0, one with the rest 0.
+vec4 unpack(uint w0, uint w1) {
+    vec4 c = vec4(0.0);
+    switch (p.source_format) {
+    case RT_8_8_8_8:
+    case RT_8_8_8_8_GAMMA:
+        for (uint i = 0u; i < 4u; i++) c[i] = float((w0 >> (8u * i)) & 0xFFu) * (1.0 / 255.0);
+        break;
+    case RT_2_10_10_10:
+    case RT_2_10_10_10_AS_10_10_10_10:
+        for (uint i = 0u; i < 3u; i++) c[i] = float((w0 >> (10u * i)) & 1023u) * (1.0 / 1023.0);
+        c[3] = float(w0 >> 30u) * (1.0 / 3.0);
+        break;
+    case RT_16_16:
+        c[0] = float(int(w0 << 16u) >> 16) * (1.0 / 1024.0);
+        c[1] = float(int(w0) >> 16) * (1.0 / 1024.0);
+        break;
+    case RT_16_16_16_16:
+        c[0] = float(int(w0 << 16u) >> 16) * (1.0 / 1024.0);
+        c[1] = float(int(w0) >> 16) * (1.0 / 1024.0);
+        c[2] = float(int(w1 << 16u) >> 16) * (1.0 / 1024.0);
+        c[3] = float(int(w1) >> 16) * (1.0 / 1024.0);
+        break;
+    case RT_16_16_FLOAT:
+        c[0] = half_to_float(w0 & 0xFFFFu), c[1] = half_to_float(w0 >> 16u);
+        break;
+    case RT_16_16_16_16_FLOAT:
+    case RT_2_10_10_10_FLOAT:
+    case RT_2_10_10_10_FLOAT_AS_16_16_16_16:
+        c[0] = half_to_float(w0 & 0xFFFFu), c[1] = half_to_float(w0 >> 16u);
+        c[2] = half_to_float(w1 & 0xFFFFu), c[3] = half_to_float(w1 >> 16u);
+        break;
+    case RT_32_FLOAT: c[0] = uintBitsToFloat(w0); break;
+    case RT_32_32_FLOAT: c[0] = uintBitsToFloat(w0), c[1] = uintBitsToFloat(w1); break;
+    }
+    return c;
+}
+
+vec4 c_; // the pixel being converted
+uint fixed4(uint b0, uint b1, uint b2, uint b3) {
+    uint n = p.dest_number;
+    return pack_fixed(c_[0], b0, n) | (pack_fixed(c_[1], b1, n) << b0) |
+           (b2 != 0u ? pack_fixed(c_[2], b2, n) << (b0 + b1) : 0u) |
+           (b3 != 0u ? pack_fixed(c_[3], b3, n) << (b0 + b1 + b2) : 0u);
+}
+
+// The destination's words for a pixel, converted (the full resolve shaders);
+// returns the word count, 0 for a 1-byte or 2-byte destination, which goes
+// in small.
+uint convert(uint w0, uint w1, out uint w[4], out uint small) {
+    w = uint[4](0u, 0u, 0u, 0u);
+    small = 0u;
+    vec4 c = unpack(w0, w1);
+    float factor = p.exp_factor;
+    bool gamma = p.source_format == RT_8_8_8_8_GAMMA;
+    uint dest_bytes = 1u << p.dest_log2_bytes;
+    if (dest_bytes == 1u) {
+        // XeResolveLoad8ScalarColors: D3D maps A8 to k_8 with the swap
+        bool alpha = p.dest_swap != 0u;
+        float v = alpha ? c[3] : c[0];
+        if (gamma && !alpha) v = gamma_to_linear(v);
+        precise float scaled = v * factor;
+        small = pack_fixed(scaled, 8u, p.dest_number);
+        return 0u;
+    }
+    if (gamma) {
+        for (uint i = 0u; i < 3u; i++) {
+            precise float linear = gamma_to_linear(c[i]) * factor;
+            c[i] = linear;
+        }
+        precise float a = c[3] * factor;
+        c[3] = a;
+    } else {
+        for (uint i = 0u; i < 4u; i++) {
+            precise float v = c[i] * factor;
+            c[i] = v;
+        }
+    }
+    if (p.dest_swap != 0u) c = c.bgra;
+    c_ = c;
+    uint n = p.dest_number;
+    switch (dest_bytes) {
+    case 2u:
+        switch (p.dest_format) {
+        case K_1_5_5_5: small = fixed4(5u, 5u, 5u, 1u); break;
+        case K_5_6_5: small = fixed4(5u, 6u, 5u, 0u); break;
+        case K_6_5_5: small = fixed4(5u, 5u, 6u, 0u); break;
+        case K_8_8: small = fixed4(8u, 8u, 0u, 0u); break;
+        case K_4_4_4_4: small = fixed4(4u, 4u, 4u, 4u); break;
+        case K_16: small = pack_fixed(c[0], 16u, n); break;
+        default: small = float_to_half(c[0]); break; // as 16_FLOAT
+        }
+        return 0u;
+    case 4u:
+        switch (p.dest_format) {
+        case K_8_8_8_8: case K_8_8_8_8_A: case K_8_8_8_8_AS_16_16_16_16: w[0] = fixed4(8u, 8u, 8u, 8u); break;
+        case K_2_10_10_10: case K_2_10_10_10_AS_16_16_16_16: w[0] = fixed4(10u, 10u, 10u, 2u); break;
+        case K_10_11_11: case K_10_11_11_AS_16_16_16_16: w[0] = fixed4(11u, 11u, 10u, 0u); break;
+        case K_11_11_10: case K_11_11_10_AS_16_16_16_16: w[0] = fixed4(10u, 11u, 11u, 0u); break;
+        case K_16_16_EDRAM: case K_16_16: w[0] = fixed4(16u, 16u, 0u, 0u); break;
+        case K_16_16_FLOAT: w[0] = pack_half2(c[0], c[1]); break;
+        default: w[0] = floatBitsToUint(c[0]); break; // as 32_FLOAT
+        }
+        return 1u;
+    case 8u:
+        switch (p.dest_format) {
+        case K_16_16_16_16_EDRAM:
+        case K_16_16_16_16:
+            w[0] = pack_fixed(c[0], 16u, n) | (pack_fixed(c[1], 16u, n) << 16u);
+            w[1] = pack_fixed(c[2], 16u, n) | (pack_fixed(c[3], 16u, n) << 16u);
+            break;
+        case K_16_16_16_16_FLOAT: w[0] = pack_half2(c[0], c[1]), w[1] = pack_half2(c[2], c[3]); break;
+        default: w[0] = floatBitsToUint(c[0]), w[1] = floatBitsToUint(c[1]); break; // 32_32_FLOAT
+        }
+        return 2u;
+    default:
+        for (uint i = 0u; i < 4u; i++) w[i] = floatBitsToUint(c[i]);
+        return 4u;
+    }
+}
+
+// The fast resolve shaders: the source bits as they are, red and blue swapped
+// in place (XeResolveSwap*PixelsRedBlue*).
+uint copy_raw(uint w0, uint w1, out uint w[4]) {
+    w = uint[4](w0, w1, 0u, 0u);
+    if (p.depth != 0u) return 1u;
+    uint rt = p.source_format;
+    uint count = rt == RT_16_16_16_16 || rt == RT_16_16_16_16_FLOAT || rt == RT_2_10_10_10_FLOAT_AS_16_16_16_16 ||
+                         rt == RT_32_32_FLOAT
+                     ? 2u
+                     : 1u;
+    if (p.dest_swap != 0u) {
+        switch (rt) {
+        case RT_8_8_8_8:
+        case RT_8_8_8_8_GAMMA: w[0] = (w[0] & ~0xFF00FFu) | ((w[0] & 0xFFu) << 16u) | ((w[0] >> 16u) & 0xFFu); break;
+        case RT_2_10_10_10:
+        case RT_2_10_10_10_FLOAT:
+        case RT_2_10_10_10_AS_10_10_10_10:
+        case RT_2_10_10_10_FLOAT_AS_16_16_16_16:
+            w[0] = (w[0] & ~0x3FF003FFu) | ((w[0] & 0x3FFu) << 20u) | ((w[0] >> 20u) & 0x3FFu);
+            break;
+        case RT_16_16_16_16:
+        case RT_16_16_16_16_FLOAT: {
+            uint r = w[0] & 0xFFFFu, b = w[1] & 0xFFFFu;
+            w[0] = (w[0] & ~0xFFFFu) | b, w[1] = (w[1] & ~0xFFFFu) | r;
+            break;
+        }
+        }
+    }
+    return count;
+}
+
+// xenos::Float32To20e4, rounded towards zero (Xenia's default)
+uint float_to_float24(float f) {
+    if (!(f > 0.0)) return 0u;
+    uint u = floatBitsToUint(f);
+    if (u >= 0x3FFFFFF8u) return 0xFFFFFFu;
+    if (u < 0x38800000u) u = (0x800000u | (u & 0x7FFFFFu)) >> min(113u - (u >> 23u), 24u);
+    else u += 0xC8000000u;
+    return (u >> 3u) & 0xFFFFFFu;
+}
+
+// endian.xesli's, with 8in64 and 8in128 over the words
+void swap_words(inout uint w[4], uint count, uint e) {
+    if (count == 4u && e == 5u) {
+        uint t = w[0];
+        w[0] = w[3], w[3] = t, t = w[1], w[1] = w[2], w[2] = t;
+        e = 2u;
+    }
+    if (count >= 2u && e == 4u) {
+        for (uint i = 0u; i + 1u < count; i += 2u) {
+            uint t = w[i];
+            w[i] = w[i + 1u], w[i + 1u] = t;
+        }
+        e = 2u;
+    }
+    for (uint i = 0u; i < count; i++) w[i] = swap32(w[i], e);
+}
+
+void main() {
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (at.x >= p.width || at.y >= p.height) return;
+    uint index = at.y * p.width + at.x;
+    uint w0, w1 = 0u;
+    if (p.depth != 0u) {
+        // as the guest's words: depth in the high 24 bits, as the EDRAM store
+        // writes them (D24FS8 kept halved)
+        uint d = src.words[index];
+        uint s = (src.words[p.stencil_word + (index >> 2u)] >> ((index & 3u) * 8u)) & 0xFFu;
+        uint d24;
+        if (p.depth_mode == 0u) {
+            d24 = d & 0xFFFFFFu;
+        } else if (p.depth_mode == 1u) {
+            d24 = float_to_float24(uintBitsToFloat(d) * 2.0);
+        } else {
+            precise float scaled = clamp(uintBitsToFloat(d), 0.0, 1.0) * 16777215.0;
+            d24 = uint(roundEven(scaled));
+        }
+        w0 = (d24 << 8u) | s;
+    } else {
+        w0 = src.words[index * p.src_words];
+        if (p.src_words > 1u) w1 = src.words[index * p.src_words + 1u];
+    }
+
+    uint w[4], small = 0u;
+    uint words = p.raw != 0u ? copy_raw(w0, w1, w) : convert(w0, w1, w, small);
+    uint x = p.dest_x + at.x, y = p.dest_y + at.y;
+    uint offset = p.dest_array != 0u ? tiled_offset_3d(x, y, p.dest_slice, p.dest_pitch, p.dest_height, p.dest_log2_bytes)
+                                     : tiled_offset_2d(x, y, p.dest_pitch, p.dest_log2_bytes);
+    uint address = (p.dest_base + offset) & PHYSICAL_MASK;
+    uint dest_bytes = 1u << p.dest_log2_bytes;
+    if (dest_bytes <= 2u) {
+        // a part of a word other invocations write the rest of
+        uint value = dest_bytes == 1u ? small & 0xFFu : swap16(small & 0xFFFFu, p.dest_endian) & 0xFFFFu;
+        uint shift = (address & 3u) * 8u, mask = (dest_bytes == 1u ? 0xFFu : 0xFFFFu) << shift;
+        atomicAnd(memory.words[address >> 2u], ~mask);
+        atomicOr(memory.words[address >> 2u], value << shift);
+        return;
+    }
+    swap_words(w, words, p.dest_endian);
+    for (uint i = 0u; i < dest_bytes / 4u; i++) memory.words[(address >> 2u) + i] = w[i];
+}

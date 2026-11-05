@@ -28,13 +28,13 @@ namespace {
 // the load; the rest keep the guest's bits. Depth (24_8, 24_8_FLOAT) becomes
 // 32-bit floats as texture_load_depth_unorm and texture_load_depth_float make
 // it.
-enum class Convert : uint8_t { None, Dxt3aToR8, Ctx1ToRg8, DepthUnormToFloat, DepthFloatToFloat };
+using Convert = Load;
 
 struct FormatEntry {
     uint8_t block_width, block_height;
     uint8_t bits; // per texel (texture_info_formats.inl's bits_per_pixel)
     HostFormat host;
-    Convert convert = Convert::None;
+    Convert convert = Convert::Copy;
 };
 
 using H = HostFormat;
@@ -255,56 +255,67 @@ void ctx1_to_rg8(const uint8_t *block, uint8_t out[32]) {
     }
 }
 
-// One level of one slice or layer, block by block: Xenia's guest addressing
-// (texture_load.xesli's XeTextureLoadSourceAddress) at the packed-tail offset
-// the copy into the image applies (LoadTextureData).
-struct LevelLoad {
-    uint32_t base = 0;               // the slice's first byte in guest memory
-    uint32_t pitch_blocks = 0, z_rows = 0;
-    uint32_t ox = 0, oy = 0, oz = 0; // in the packed tail
-    bool tiled = false, is_3d = false;
-    uint32_t bytes_per_block = 0, log2_bpb = 0;
-
-    uint64_t offset(uint32_t x, uint32_t y, uint32_t z) const {
-        x += ox, y += oy, z += oz;
-        if (!tiled) return uint64_t(x + pitch_blocks * (y + z_rows * z)) << log2_bpb;
-        if (is_3d) return tiled_offset_3d(x, y, z, pitch_blocks, z_rows, log2_bpb);
-        return tiled_offset_2d(x, y, pitch_blocks, log2_bpb);
+// Where a slice's blocks lie, from its base, without visiting them. Linear:
+// from the first block to the end of the last. Tiled: the 4 KB pages of the
+// tiles they are in. A tile (32x32 blocks, 32x16x4 in 3D) holds its blocks'
+// bytes in the address bits from 12 up only through its index
+// (tiled_combine moves the bits of the tiled byte offset from 8 up to 12
+// up), so its bytes lie in the pages of [index * tile bytes, (index + 1) *
+// tile bytes), and the indices of the blocks' tiles run from the first
+// block's to the last's.
+void slice_span(SliceLoad &s) {
+    uint32_t x0 = s.ox, y0 = s.oy, x1 = s.ox + s.blocks_x - 1, y1 = s.oy + s.blocks_y - 1, z = s.z + s.oz;
+    uint32_t log2 = s.log2_bytes_per_block;
+    if (!s.tiled) {
+        s.low = uint64_t(x0 + uint64_t(s.pitch_blocks) * (y0 + uint64_t(s.z_rows) * z)) << log2;
+        s.high = (uint64_t(x1 + uint64_t(s.pitch_blocks) * (y1 + uint64_t(s.z_rows) * z)) << log2) + (1u << log2);
+        return;
     }
-};
+    uint64_t first, last, tile_bytes;
+    if (s.is_3d) {
+        auto index = [&](uint32_t x, uint32_t y) {
+            return ((uint64_t(z >> 2) * (s.z_rows >> 4) + (y >> 4)) * (s.pitch_blocks >> 5)) + (x >> 5);
+        };
+        first = index(x0, y0), last = index(x1, y1), tile_bytes = uint64_t(32 * 16 * 4) << log2;
+    } else {
+        first = uint64_t(y0 >> 5) * (s.pitch_blocks >> 5) + (x0 >> 5);
+        last = uint64_t(y1 >> 5) * (s.pitch_blocks >> 5) + (x1 >> 5);
+        tile_bytes = uint64_t(32 * 32) << log2;
+    }
+    s.low = first * tile_bytes & ~uint64_t(4095);
+    s.high = ((last + 1) * tile_bytes + 4095) & ~uint64_t(4095);
+}
 
 // Reads the blocks of one slice: the span of guest memory they lie in read at
-// once (and noted in the footprint), then each block copied out and
+// once, then each block copied out (a linear slice's rows whole) and
 // byte-swapped.
-void read_blocks(const LevelLoad &load, const GuestMemory &memory, uint32_t endian, uint32_t blocks_x,
-                 uint32_t blocks_y, uint32_t z, std::vector<uint8_t> &out,
-                 std::vector<std::pair<uint32_t, uint32_t>> &footprint) {
-    uint64_t low = UINT64_MAX, high = 0;
-    for (uint32_t y = 0; y < blocks_y; y++)
-        for (uint32_t x = 0; x < blocks_x; x++) {
-            uint64_t o = load.offset(x, y, z);
-            low = std::min(low, o), high = std::max(high, o);
-        }
+void read_blocks(const SliceLoad &load, const GuestMemory &memory, uint32_t endian, std::vector<uint8_t> &out) {
+    uint32_t bytes_per_block = 1u << load.log2_bytes_per_block;
     size_t start = out.size();
-    out.resize(start + size_t(blocks_x) * blocks_y * load.bytes_per_block);
+    out.resize(start + size_t(load.blocks_x) * load.blocks_y * bytes_per_block);
     uint8_t *dst = out.data() + start;
-    uint64_t span = high - low + load.bytes_per_block;
-    footprint.push_back({uint32_t(load.base + low) & GuestMemory::PHYSICAL_MASK,
-                         uint32_t(std::min<uint64_t>(span, GuestMemory::SIZE))});
+    uint64_t span = load.high - load.low;
     if (span <= (64u << 20)) {
         std::vector<uint8_t> src(span);
-        memory.read(uint32_t(load.base + low), src);
-        for (uint32_t y = 0; y < blocks_y; y++)
-            for (uint32_t x = 0; x < blocks_x; x++, dst += load.bytes_per_block)
-                std::memcpy(dst, src.data() + (load.offset(x, y, z) - low), load.bytes_per_block);
+        memory.read(uint32_t(load.base + load.low), src);
+        if (!load.tiled) {
+            size_t row = size_t(load.blocks_x) * bytes_per_block;
+            for (uint32_t y = 0; y < load.blocks_y; y++, dst += row)
+                std::memcpy(dst, src.data() + (load.offset(0, y) - load.low), row);
+        } else {
+            for (uint32_t y = 0; y < load.blocks_y; y++)
+                for (uint32_t x = 0; x < load.blocks_x; x++, dst += bytes_per_block)
+                    std::memcpy(dst, src.data() + (load.offset(x, y) - load.low), bytes_per_block);
+        }
     } else {
-        for (uint32_t y = 0; y < blocks_y; y++)
-            for (uint32_t x = 0; x < blocks_x; x++, dst += load.bytes_per_block)
-                memory.read(uint32_t(load.base + load.offset(x, y, z)), {dst, load.bytes_per_block});
+        for (uint32_t y = 0; y < load.blocks_y; y++)
+            for (uint32_t x = 0; x < load.blocks_x; x++, dst += bytes_per_block)
+                memory.read(uint32_t(load.base + load.offset(x, y)), {dst, bytes_per_block});
     }
+    if (!endian || bytes_per_block == 1) return; // nothing to swap
     dst = out.data() + start;
-    for (size_t i = 0; i < size_t(blocks_x) * blocks_y; i++, dst += load.bytes_per_block)
-        swap_block(dst, load.bytes_per_block, endian);
+    for (size_t i = 0; i < size_t(load.blocks_x) * load.blocks_y; i++, dst += bytes_per_block)
+        swap_block(dst, bytes_per_block, endian);
 }
 
 // pixel_formats.xesli's XeFloat20e4To32: 20e4 depth (0-2) to a float
@@ -542,8 +553,16 @@ Levels levels(const Info &info) {
     return l;
 }
 
-bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string &unsupported) {
-    out = Image{};
+uint64_t SliceLoad::offset(uint32_t x, uint32_t y) const {
+    x += ox, y += oy;
+    uint32_t zz = z + oz;
+    if (!tiled) return uint64_t(x + uint64_t(pitch_blocks) * (y + uint64_t(z_rows) * zz)) << log2_bytes_per_block;
+    if (is_3d) return tiled_offset_3d(x, y, zz, pitch_blocks, z_rows, log2_bytes_per_block);
+    return tiled_offset_2d(x, y, pitch_blocks, log2_bytes_per_block);
+}
+
+bool plan(const Info &info, Plan &out, std::string &unsupported) {
+    out = Plan{};
     const FormatEntry &f = FORMATS[info.format & 63];
     if (f.host == H::Unsupported) {
         unsupported = std::string("format ") + xenos::format_name(info.format);
@@ -569,17 +588,20 @@ bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string
     uint32_t bpb = uint32_t(f.bits) * f.block_width * f.block_height / 8;
 
     out.format = f.host;
+    out.load = f.convert;
     out.width = width, out.height = height, out.depth = info.depth;
+    out.bytes_per_block = bpb, out.block_width = f.block_width, out.block_height = f.block_height;
+    out.endian = info.endian;
     uint32_t level_last = lv.mips ? layout.max_level : 0;
-    out.levels.resize(level_last + 1);
-    std::vector<uint8_t> blocks;
+    out.level_count = level_last + 1;
     for (uint32_t level = lv.base ? 0 : 1; level <= level_last; level++) {
         bool is_base = level == 0;
         uint32_t stored = std::min(level, layout.packed_level);
         const LevelLayout &l = is_base ? layout.base : layout.mips[stored];
-        LevelLoad load;
+        SliceLoad load;
+        load.level = level;
         load.tiled = info.tiled, load.is_3d = info.dimension == 2;
-        load.bytes_per_block = bpb, load.log2_bpb = log2_floor(bpb);
+        load.log2_bytes_per_block = log2_floor(bpb);
         load.pitch_blocks = l.row_pitch_bytes / bpb;
         load.z_rows = l.z_slice_stride_block_rows;
         if (level >= layout.packed_level)
@@ -589,30 +611,56 @@ bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string
 
         uint32_t lw = std::max(width >> level, 1u), lh = std::max(height >> level, 1u);
         uint32_t ld = std::max(depth >> level, 1u);
-        uint32_t blocks_x = (lw + f.block_width - 1) / f.block_width;
-        uint32_t blocks_y = (lh + f.block_height - 1) / f.block_height;
+        load.blocks_x = (lw + f.block_width - 1) / f.block_width;
+        load.blocks_y = (lh + f.block_height - 1) / f.block_height;
         uint32_t slices = info.dimension == 2 ? ld : layout.array_size;
-
-        blocks.clear();
         for (uint32_t s = 0; s < slices; s++) {
             bool layer = info.dimension != 2;
             load.base = level_base + (layer ? s * l.array_slice_stride_bytes : 0);
-            read_blocks(load, memory, info.endian, blocks_x, blocks_y, layer ? 0 : s, blocks, out.footprint);
+            load.z = layer ? 0 : s;
+            slice_span(load);
+            out.slices.push_back(load);
+            out.footprint.push_back({uint32_t(load.base + load.low) & GuestMemory::PHYSICAL_MASK,
+                                     uint32_t(std::min<uint64_t>(load.high - load.low, GuestMemory::SIZE))});
         }
+    }
+    return true;
+}
+
+bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string &unsupported) {
+    out = Image{};
+    Plan p;
+    if (!plan(info, p, unsupported)) return false;
+    uint32_t bpb = p.bytes_per_block;
+    out.format = p.format;
+    out.width = p.width, out.height = p.height, out.depth = p.depth;
+    out.levels.resize(p.level_count);
+    out.footprint = std::move(p.footprint);
+    std::vector<uint8_t> blocks;
+    for (size_t first = 0; first < p.slices.size();) {
+        // a level's slices, read in turn
+        uint32_t level = p.slices[first].level;
+        size_t end = first;
+        blocks.clear();
+        for (; end < p.slices.size() && p.slices[end].level == level; end++)
+            read_blocks(p.slices[end], memory, p.endian, blocks);
+        uint32_t slices = uint32_t(end - first);
+        uint32_t blocks_x = p.slices[first].blocks_x, blocks_y = p.slices[first].blocks_y;
+        first = end;
 
         std::vector<uint8_t> &dst = out.levels[level];
-        if (f.convert == Convert::None) {
+        if (p.load == Convert::Copy) {
             dst = std::move(blocks);
             blocks = {};
             continue;
         }
-        if (f.convert == Convert::DepthUnormToFloat || f.convert == Convert::DepthFloatToFloat) {
+        if (p.load == Convert::DepthUnormToFloat || p.load == Convert::DepthFloatToFloat) {
             // the depth in the high 24 bits, to a float: unorm24 as
             // XeUNorm24To32 (exact), float24 as XeFloat20e4To32
             for (size_t i = 0; i + 4 <= blocks.size(); i += 4) {
                 uint32_t d24 = load_le32(blocks.data() + i) >> 8;
-                float value = f.convert == Convert::DepthUnormToFloat ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f)
-                                                                      : float20e4_to_float(d24);
+                float value = p.load == Convert::DepthUnormToFloat ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f)
+                                                                   : float20e4_to_float(d24);
                 store_le32(blocks.data() + i, std::bit_cast<uint32_t>(value));
             }
             dst = std::move(blocks);
@@ -620,14 +668,15 @@ bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string
             continue;
         }
         // decompressed to texels, as Xenia's load shaders for these do
-        uint32_t texel_bytes = f.convert == Convert::Ctx1ToRg8 ? 2 : 1;
+        uint32_t lw = std::max(p.width >> level, 1u), lh = std::max(p.height >> level, 1u);
+        uint32_t texel_bytes = p.load == Convert::Ctx1ToRg8 ? 2 : 1;
         dst.assign(size_t(lw) * lh * slices * texel_bytes, 0);
         for (uint32_t s = 0; s < slices; s++)
             for (uint32_t by = 0; by < blocks_y; by++)
                 for (uint32_t bx = 0; bx < blocks_x; bx++) {
                     const uint8_t *block = blocks.data() + ((size_t(s) * blocks_y + by) * blocks_x + bx) * bpb;
                     uint8_t texels[32];
-                    if (f.convert == Convert::Dxt3aToR8) dxt3a_to_r8(block, texels);
+                    if (p.load == Convert::Dxt3aToR8) dxt3a_to_r8(block, texels);
                     else ctx1_to_rg8(block, texels);
                     for (uint32_t ty = 0; ty < 4 && by * 4 + ty < lh; ty++)
                         for (uint32_t tx = 0; tx < 4 && bx * 4 + tx < lw; tx++)

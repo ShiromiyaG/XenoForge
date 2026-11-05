@@ -58,6 +58,18 @@ std::unique_ptr<Device> Device::open(std::string &error) {
     }
     vkGetPhysicalDeviceMemoryProperties(d->physical_, &d->memory_);
 
+    // the renderer's bindless textures: sampled images and samplers written
+    // into a bound set while submissions that do not use them run
+    VkPhysicalDeviceVulkan12Features has12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 has{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    has.pNext = &has12;
+    vkGetPhysicalDeviceFeatures2(d->physical_, &has);
+    if (!has12.descriptorBindingSampledImageUpdateAfterBind || !has12.descriptorBindingUpdateUnusedWhilePending ||
+        !has12.descriptorBindingPartiallyBound) {
+        error = std::string(d->name_) + " cannot update sampled image descriptors after binding (descriptor indexing)";
+        return nullptr;
+    }
+
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.dynamicRendering = VK_TRUE;
     v13.synchronization2 = VK_TRUE;
@@ -68,6 +80,8 @@ std::unique_ptr<Device> Device::open(std::string &error) {
     v12.runtimeDescriptorArray = VK_TRUE;
     v12.descriptorBindingPartiallyBound = VK_TRUE;
     v12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    v12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    v12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &v12;
     features.features.geometryShader = VK_TRUE;
@@ -219,11 +233,16 @@ bool Device::run(const std::function<void(VkCommandBuffer)> &record, std::string
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     vkResetFences(device_, 1, &fence_);
-    VkResult r = vkQueueSubmit(queue_, 1, &submit, fence_);
+    VkResult r = this->submit(1, &submit, fence_);
     if (r == VK_SUCCESS) r = vkWaitForFences(device_, 1, &fence_, VK_TRUE, 20'000'000'000ull);
     vkFreeCommandBuffers(device_, pool_, 1, &cmd);
     if (r != VK_SUCCESS) return error = failed("a submission", r), false;
     return true;
+}
+
+VkResult Device::submit(uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    return vkQueueSubmit(queue_, count, submits, fence);
 }
 
 } // namespace xf::vk
