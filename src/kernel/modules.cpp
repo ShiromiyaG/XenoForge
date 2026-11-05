@@ -35,8 +35,32 @@
 //   - a thread's DLL_THREAD_ATTACH and DETACH go to guest threads only (Xenia
 //     also calls them on its host threads, the GPU's; on the console the
 //     kernel's own threads get no DLL notifications);
-//   - a DLL's entry point runs with no lock held (Xenia holds its global lock
-//     in UnloadUserModule and OnThreadExecute);
+//   - every DllMain call runs under the loader lock (NT's LdrpLoaderLock;
+//     Modules::loader), recursive and owned by the calling thread: held
+//     across XexLoadImage's lookup, load and DLL_PROCESS_ATTACH,
+//     XexUnloadImage's DLL_PROCESS_DETACH and the removal from the list, a
+//     thread's DLL_THREAD_ATTACH and DETACH, and XexGetModuleHandle's lookup.
+//     A load waits for an unload in progress and then loads a fresh copy; no
+//     DllMain gets the HMODULE of a module unloaded meanwhile. Xenia holds its
+//     global critical region (also recursive) in OnThreadExecute,
+//     OnThreadExit, UnloadUserModule and GetModule, but calls
+//     FinishLoadingUserModule's DLL_PROCESS_ATTACH with it released. As on the
+//     console, a DllMain that waits for another thread to start or end, or to
+//     load or unload a module, waits forever: that thread waits for the lock;
+//   - a thread's DLL_THREAD_DETACH runs before the thread is marked
+//     terminated and taken off its process's list, as NT's LdrShutdownThread
+//     runs before the thread's end (Xenia's XThread::Exit calls OnThreadExit
+//     last). A DllMain that calls ExitThread in its DLL_THREAD_DETACH ends
+//     its own call: the other DLLs still get theirs, and the thread's exit
+//     code stays the one it ended with; one that does so in its
+//     DLL_THREAD_ATTACH ends the thread there (the DLLs after it get no
+//     THREAD_ATTACH, every DLL gets its THREAD_DETACH);
+//   - XexUnloadImage never unloads the executable (Xenia unloads any user
+//     module whose count reaches 0, the executable included, after which
+//     XexGetModuleHandle("default.xex") fails); the imports from xbdm.xex are
+//     bound as the other system libraries' (kernel.cpp; Xenia loads no xbdm
+//     module unless its console_type is set, -1 by default, and leaves them
+//     unresolved);
 //   - the image's pages are read-write throughout (as the executable's), the
 //     heap is not reset before a load (Xenia's ReadImage resets the page
 //     table of the heap the image goes in, the executable's too), and an
@@ -56,15 +80,18 @@
 //   0x254  UsbdBootEnumerationDoneEvent (X_KEVENT)
 
 #include "files.h"
+#include "objects.h"
 #include "xenoforge/exports.h"
 #include "xenoforge/kernel.h"
 
 #include <algorithm>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace xf::kernel {
@@ -88,7 +115,11 @@ constexpr uint32_t LDR_IMAGE_BASE = 0x1C;
 constexpr uint32_t LDR_FULL_IMAGE_SIZE = 0x38;
 constexpr uint32_t LDR_ENTRY_POINT = 0x3C;
 constexpr uint32_t LDR_LOAD_COUNT = 0x40; // 16 bits
+constexpr uint32_t LDR_TIME_DATE_STAMP = 0x50;
 constexpr uint32_t LDR_XEX_HEADER_BASE = 0x58;
+
+// XEX_HEADER_CHECKSUM_TIMESTAMP: the checksum, then the time stamp
+constexpr uint32_t XEX_HEADER_CHECKSUM_TIMESTAMP = 0x00018002;
 
 // the kernel's variables, where Xenia puts them (most at the real kernel's
 // addresses)
@@ -140,6 +171,9 @@ struct Module {
     std::string name;    // "xboxkrnl", "default"
     std::string library; // a kernel module's export table ("xboxkrnl"); empty for a user module
     uint32_t hmodule = 0;
+    // which load this is: a module unloaded and another loaded in its place
+    // (the same HMODULE, base or entry point) has another
+    uint64_t serial = 0;
     // a user module's
     uint32_t xex_header = 0, base_address = 0, image_size = 0, entry_point = 0;
     bool dll = false;         // XEX_MODULE_DLL_MODULE: its entry point is a DllMain
@@ -152,11 +186,58 @@ struct Module {
     bool is_kernel() const { return !library.empty(); }
 };
 
+// The loader lock (NT's LdrpLoaderLock, a critical section): recursive,
+// owned by a host thread (a guest thread's, or a host caller's). Held across
+// guest code (the DllMains), so a guest thread waiting for it waits on the
+// host, outside the guest's waits; the report names its owner.
+class LoaderLock {
+public:
+    void lock() {
+        std::unique_lock l(mutex_);
+        std::thread::id self = std::this_thread::get_id();
+        if (depth_ && owner_ == self) {
+            depth_++;
+            return;
+        }
+        waiting_++;
+        released_.wait(l, [&] { return depth_ == 0; });
+        waiting_--;
+        owner_ = self, depth_ = 1;
+        Thread *t = current_thread();
+        owner_thread_ = t ? int64_t(t->id) : -1;
+    }
+    void unlock() {
+        std::lock_guard l(mutex_);
+        if (--depth_ == 0) {
+            owner_ = {};
+            released_.notify_one();
+        }
+    }
+    // who holds it (a guest thread's id, -1 a host thread) and how many
+    // wait; false when it is free
+    bool held(int64_t &owner, uint32_t &waiting) {
+        std::lock_guard l(mutex_);
+        owner = owner_thread_, waiting = waiting_;
+        return depth_ != 0;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable released_;
+    std::thread::id owner_;
+    uint32_t depth_ = 0, waiting_ = 0;
+    int64_t owner_thread_ = -1;
+};
+
 struct Modules {
     Kernel *k = nullptr;
-    // recursive: a module's imports load the libraries it imports from while
-    // it loads; never held while guest code runs
+    // the loader lock: every DllMain call, the loads and unloads (see the
+    // top); taken before `mutex`, never while it is held
+    LoaderLock loader;
+    // the lists' (short, never held while guest code runs); recursive: a
+    // module's imports load the libraries it imports from while it loads
     std::recursive_mutex mutex;
+    uint64_t next_serial = 1;
     std::vector<std::unique_ptr<Module>> kernel_modules, user_modules;
     Module *executable = nullptr;
     std::string executable_path = "game:\\default.xex";
@@ -407,10 +488,12 @@ void copy_string(Kernel &k, uint32_t address, const std::string &s, uint32_t cap
 }
 
 // UserModule::LoadContinue: the header copied into guest memory, the loader
-// entry (XModule's constructor allocates it)
-std::unique_ptr<Module> make_user_module(Kernel &k, const std::string &path, const Xex &xex) {
+// entry (XModule's constructor allocates it; UserModule::Dump writes its time
+// stamp)
+std::unique_ptr<Module> make_user_module(Kernel &k, Modules &s, const std::string &path, const Xex &xex) {
     Memory &memory = k.memory();
     auto m = std::make_unique<Module>();
+    m->serial = s.next_serial++;
     m->path = path;
     m->name = base_name(path);
     m->hmodule = memory.system_alloc(LDR_SIZE);
@@ -425,6 +508,10 @@ std::unique_ptr<Module> make_user_module(Kernel &k, const std::string &path, con
     k.store32(m->hmodule + LDR_FULL_IMAGE_SIZE, xex.image_size);
     k.store32(m->hmodule + LDR_IMAGE_BASE, xex.base_address);
     k.store32(m->hmodule + LDR_ENTRY_POINT, xex.entry_point);
+    // the time stamp only: the checksum's field is Xenia's handle (0 here)
+    uint32_t stamp;
+    if (opt_header(k, m->xex_header, XEX_HEADER_CHECKSUM_TIMESTAMP, stamp))
+        k.store32(m->hmodule + LDR_TIME_DATE_STAMP, k.load32(stamp + 4));
     return m;
 }
 
@@ -468,7 +555,7 @@ Module *load_user_module(Kernel &k, Modules &s, std::string_view raw_name) {
         std::fprintf(stderr, "kernel: XexLoadImage: %s: %s\n", absolute.c_str(), error.c_str());
         return nullptr;
     }
-    std::unique_ptr<Module> made = make_user_module(k, absolute, *xex);
+    std::unique_ptr<Module> made = make_user_module(k, s, absolute, *xex);
     Module &m = *made;
     m.xex = std::move(xex);
     // listed before its imports are bound, as Xenia's: a library importing
@@ -495,12 +582,28 @@ void unload_user_module(Kernel &k, Modules &s, Module &m) {
 }
 
 // DllMain(hinstance, reason, reserved) on the calling thread (Xenia's
-// Processor::Execute), the lock released
+// Processor::Execute), the loader lock held and `mutex` released: each one
+// whose module is still listed (a DllMain before it, on this thread, may have
+// unloaded it). A ThreadExit (ExitThread in a DllMain) leaves through here.
 struct EntryCall {
+    uint64_t serial;
     uint32_t entry, hmodule, reason;
 };
-void run_entries(Kernel &k, ppc::Context &c, const std::vector<EntryCall> &calls) {
-    for (const EntryCall &e : calls) objects(k).call(c, e.entry, {e.hmodule, e.reason, 0});
+EntryCall entry_call(const Module &m, uint32_t reason) { return {m.serial, m.entry_point, m.hmodule, reason}; }
+Module *listed(Modules &s, uint64_t serial) {
+    for (auto &m : s.user_modules)
+        if (m->serial == serial) return m.get();
+    return nullptr;
+}
+void run_entry(Kernel &k, Modules &s, ppc::Context &c, const EntryCall &e) {
+    {
+        std::lock_guard lock(s.mutex);
+        if (!listed(s, e.serial)) return;
+    }
+    objects(k).call(c, e.entry, {e.hmodule, e.reason, 0});
+}
+void run_entries(Kernel &k, Modules &s, ppc::Context &c, const std::vector<EntryCall> &calls) {
+    for (const EntryCall &e : calls) run_entry(k, s, c, e);
 }
 
 } // namespace
@@ -619,7 +722,7 @@ void setup_modules(Kernel &k, const Xex &xex) {
     } else {
         path = fs.resolve_links(s.executable_path);
     }
-    std::unique_ptr<Module> exe = make_user_module(k, path, xex);
+    std::unique_ptr<Module> exe = make_user_module(k, s, path, xex);
     s.executable = exe.get();
     s.user_modules.push_back(std::move(exe));
     Module &m = *s.executable;
@@ -664,6 +767,9 @@ XF_EXPORT(xboxkrnl, XexGetModuleHandle) {
     std::string name = read_string(k, arg(k, c, 0));
     uint32_t hmodule_ptr = arg(k, c, 1);
     Modules &s = k.state<Modules>();
+    // (Xenia's GetModule takes its global lock: a module being unloaded is
+    // waited for)
+    std::lock_guard loader(s.loader);
     std::lock_guard lock(s.mutex);
     Module *m = find_module(k, s, name);
     if (hmodule_ptr) k.store32(hmodule_ptr, m ? m->hmodule : 0);
@@ -703,6 +809,10 @@ XF_EXPORT(xboxkrnl, XexLoadImage) {
     uint32_t flags = arg(k, c, 1), hmodule_ptr = arg(k, c, 3);
     if (!hmodule_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
     Modules &s = k.state<Modules>();
+    // the lookup, the load, the DllMains and the count under the loader lock:
+    // a module being unloaded is gone when it is looked up (a fresh copy is
+    // loaded), and no thread starts or ends meanwhile
+    std::lock_guard loader(s.loader);
     std::unique_lock lock(s.mutex);
     uint32_t status = X_STATUS_NO_SUCH_FILE, hmodule = 0;
     std::vector<EntryCall> attach;
@@ -723,12 +833,12 @@ XF_EXPORT(xboxkrnl, XexLoadImage) {
         for (Module *m : std::vector<Module *>(s.loaded.begin() + first, s.loaded.end()))
             if (m->dll && m->entry_point && !m->attached) {
                 m->attached = true;
-                attach.push_back({m->entry_point, m->hmodule, DLL_PROCESS_ATTACH});
+                attach.push_back(entry_call(*m, DLL_PROCESS_ATTACH));
             }
         s.loaded.resize(first);
     }
     lock.unlock();
-    run_entries(k, c, attach);
+    run_entries(k, s, c, attach);
     lock.lock();
     if (hmodule) k.store16(hmodule + LDR_LOAD_COUNT, uint16_t(k.load16(hmodule + LDR_LOAD_COUNT) + 1));
     k.store32(hmodule_ptr, hmodule);
@@ -738,6 +848,10 @@ XF_EXPORT(xboxkrnl, XexLoadImage) {
 XF_EXPORT(xboxkrnl, XexUnloadImage) {
     uint32_t hmodule = arg(k, c, 0);
     Modules &s = k.state<Modules>();
+    // the count, the DllMain and the removal under the loader lock: no other
+    // thread finds the module, loads it again or notifies it meanwhile
+    // (Xenia's UnloadUserModule holds its global lock)
+    std::lock_guard loader(s.loader);
     std::unique_lock lock(s.mutex);
     Module *m = module_from_hmodule(s, hmodule);
     if (!m) return result(c, X_STATUS_INVALID_HANDLE);
@@ -746,15 +860,17 @@ XF_EXPORT(xboxkrnl, XexUnloadImage) {
         uint16_t count = uint16_t(k.load16(hmodule + LDR_LOAD_COUNT) - 1);
         k.store16(hmodule + LDR_LOAD_COUNT, count);
         // the last reference: DllMain(DLL_PROCESS_DETACH) on this thread,
-        // then unloaded (the kernel keeps the executable)
+        // then unloaded (the kernel keeps the executable; see the top)
         if (count == 0 && m != s.executable) {
+            uint64_t serial = m->serial;
             std::vector<EntryCall> detach;
-            if (m->dll && m->entry_point) detach.push_back({m->entry_point, hmodule, DLL_PROCESS_DETACH});
+            if (m->dll && m->entry_point) detach.push_back(entry_call(*m, DLL_PROCESS_DETACH));
             lock.unlock();
-            run_entries(k, c, detach);
+            run_entries(k, s, c, detach);
             lock.lock();
-            // (unless its DllMain loaded it again)
-            if ((m = module_from_hmodule(s, hmodule)) && k.load16(hmodule + LDR_LOAD_COUNT) == 0) {
+            // (unless its DllMain, on this thread, loaded it again or
+            // unloaded it itself)
+            if ((m = listed(s, serial)) && k.load16(hmodule + LDR_LOAD_COUNT) == 0) {
                 std::fprintf(stderr, "kernel: XexUnloadImage: %s unloaded\n", m->path.c_str());
                 unload_user_module(k, s, *m);
             }
@@ -854,7 +970,9 @@ XF_EXPORT(xboxkrnl, RtlImageXexHeaderField) {
 } // namespace
 
 // XexModule::LoadContinue: a library not loaded yet is loaded (its entry
-// point not run: XexLoadImage runs it, or the next thread to start)
+// point not run: XexLoadImage runs it, or the next thread to start). Its
+// callers hold the loader lock (XexLoadImage) or run before any thread
+// (Kernel::load).
 uint32_t import_module(Kernel &k, const std::string &library) {
     Modules &s = k.state<Modules>();
     std::lock_guard lock(s.mutex);
@@ -877,33 +995,45 @@ uint32_t module_export(Kernel &k, uint32_t hmodule, uint16_t ordinal) {
 
 // OnThreadExecute: each DLL with an entry point, DLL_PROCESS_ATTACH the
 // first time (the libraries the executable imports from, as the main thread
-// starts), DLL_THREAD_ATTACH after
+// starts), DLL_THREAD_ATTACH after; under the loader lock, as Xenia's under
+// its global lock. A DllMain's ExitThread ends the thread here (body()).
 void modules_thread_start(Kernel &k, ppc::Context &c) {
     Modules &s = k.state<Modules>();
+    std::lock_guard loader(s.loader);
     std::vector<EntryCall> calls;
     {
         std::lock_guard lock(s.mutex);
         for (auto &m : s.user_modules) {
             if (!m->dll || !m->entry_point || m.get() == s.executable) continue;
-            calls.push_back({m->entry_point, m->hmodule, m->attached ? DLL_THREAD_ATTACH : DLL_PROCESS_ATTACH});
+            calls.push_back(entry_call(*m, m->attached ? DLL_THREAD_ATTACH : DLL_PROCESS_ATTACH));
             m->attached = true;
         }
         s.loaded.clear();
     }
-    run_entries(k, c, calls);
+    run_entries(k, s, c, calls);
 }
 
-// OnThreadExit: each DLL with an entry point, DLL_THREAD_DETACH
+// OnThreadExit: each DLL with an entry point, DLL_THREAD_DETACH, under the
+// loader lock. A DllMain that calls ExitThread ends its own call; the rest
+// still run, on the thread's context as it was (see the top).
 void modules_thread_end(Kernel &k, ppc::Context &c) {
     Modules &s = k.state<Modules>();
+    std::lock_guard loader(s.loader);
     std::vector<EntryCall> calls;
     {
         std::lock_guard lock(s.mutex);
         for (auto &m : s.user_modules)
-            if (m->dll && m->entry_point && m.get() != s.executable)
-                calls.push_back({m->entry_point, m->hmodule, DLL_THREAD_DETACH});
+            if (m->dll && m->entry_point && m.get() != s.executable) calls.push_back(entry_call(*m, DLL_THREAD_DETACH));
     }
-    run_entries(k, c, calls);
+    if (calls.empty()) return;
+    auto saved = std::make_unique<ppc::Context>(c);
+    for (const EntryCall &e : calls) {
+        try {
+            run_entry(k, s, c, e);
+        } catch (const ThreadExit &) {
+            c = *saved; // Objects::call restores it only when the call returns
+        }
+    }
 }
 
 std::string modules_report(Kernel &k) {
@@ -925,6 +1055,15 @@ std::string modules_report(Kernel &k) {
         out += line;
     }
     for (const std::string &path : s.unloaded) out += "  " + path + ": unloaded\n";
+    // a DllMain still running, or one that waits forever (see the top)
+    int64_t owner;
+    uint32_t waiting;
+    if (s.loader.held(owner, waiting)) {
+        char line[128];
+        std::string holder = owner >= 0 ? "thread " + std::to_string(owner) : "a host thread";
+        std::snprintf(line, sizeof(line), "  the loader lock: held by %s, %u waiting for it\n", holder.c_str(), waiting);
+        out += line;
+    }
     return out;
 }
 

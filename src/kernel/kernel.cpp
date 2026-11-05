@@ -1,3 +1,12 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
 // The kernel's core (kernel.h; docs/runtime.md). The import binding
 // follows Xenia's XexModule::SetupLibraryImports (src/xenia/cpu/
 // xex_module.cc, BSD; see LICENSE-xenia): a system library's function
@@ -7,6 +16,10 @@
 // the export's address in place of its first two instructions, so its own
 // mtctr r11; bctr jumps there; a variable's record gets the address; what
 // the library does not export gets 0xF00DF00D, or an unimplemented thunk.
+// An import no table names is called "<library>_<ordinal, 3 hex digits>", as
+// Xenia names it. Unlike Xenia, the imports from xbdm.xex are bound as the
+// other system libraries' (Xenia loads no xbdm module unless its console_type
+// is set, -1 by default, and leaves them unresolved).
 
 #include "xenoforge/kernel.h"
 
@@ -235,7 +248,10 @@ void Kernel::bind(const Xex &xex, bool executable) {
             uint16_t ordinal = uint16_t(value & 0xFFFF);
             const Export *e = system ? find_export(library.name, ordinal) : nullptr;
             uint32_t user = module ? module_export(*this, module, ordinal) : 0;
-            std::string name = e ? e->name : lib + "_" + std::to_string(ordinal);
+            // what no table names: Xenia's "{}_{:03X}" (the ordinal in hex)
+            char unnamed[16];
+            std::snprintf(unnamed, sizeof(unnamed), "_%03X", ordinal);
+            std::string name = e ? e->name : lib + unnamed;
             if (type == 0) {
                 if (e) store32(record, e->kind == ExportKind::Variable ? variable(name) : 0xDEADC0DE);
                 else store32(record, user ? user : 0xF00DF00D);

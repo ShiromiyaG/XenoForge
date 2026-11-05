@@ -76,8 +76,13 @@ lists: what the game calls is what gets written next.
   DLL_THREAD_ATTACH and DETACH as guest threads start and end,
   DLL_PROCESS_DETACH when XexUnloadImage takes the last load, which
   releases the pages (BC2 loads Splash.xex and Game.xex at the same base,
-  one after the other). The DLLs' code runs in the interpreter: the
-  generated code covers the executable only, so far.
+  one after the other). Every DllMain call runs under the loader lock
+  (NT's), recursive, also held across XexLoadImage's lookup and load,
+  XexUnloadImage's detach and removal and XexGetModuleHandle: a load waits
+  for an unload in progress, and no DllMain gets a module that is gone.
+  boot's module report names the lock's owner when it is held. The DLLs'
+  code runs in the interpreter: the generated code covers the executable
+  only, so far.
 - **Memory exports** (`memory_exports.cpp`): NtAllocateVirtualMemory and
   the Mm*/Ex* pools on the heaps of memory.h, with Xenia's addresses.
 - **Rtl and misc** (`rtl.cpp`, `misc.cpp`): strings, time fields, status

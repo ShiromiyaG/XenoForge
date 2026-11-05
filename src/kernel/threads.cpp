@@ -1,3 +1,12 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2022 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
 // Guest threads (objects.h): their creation as Xenia's XThread::Create
 // makes them (stack, TLS, PCR, KTHREAD), the host scheduler, APCs and DPCs,
 // TLS slots, IRQL and spin locks, critical regions, SLists, time, and the
@@ -339,11 +348,11 @@ void Thread::body() {
     } catch (const ThreadExit &e) {
         code = e.code;
     }
-    // and as it exits (OnThreadExit)
-    try {
-        if (!params.host) modules_thread_end(k, c);
-    } catch (const ThreadExit &) {
-    }
+    // and as it exits (OnThreadExit), before it is marked terminated and
+    // taken off its process (NT's order; Xenia's XThread::Exit calls it
+    // last). An ExitThread in a DllMain there ends that DllMain only
+    // (modules_thread_end); the exit code stays.
+    if (!params.host) modules_thread_end(k, c);
 
     // the exit (Xenia's XThread::Exit): signaled, its mutants abandoned
     std::unique_lock<std::mutex> l(o.lock);

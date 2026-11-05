@@ -13,16 +13,22 @@
 #include "xenoforge/xex.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <mutex>
 #include <random>
+#include <thread>
 
 using namespace xf;
 
 namespace {
 
 constexpr uint32_t BASE = 0x82000000;
+// XEX_HEADER_CHECKSUM_TIMESTAMP, and the time stamps the test's images have
+constexpr uint32_t CHECKSUM_TIMESTAMP = 0x00018002, EXE_STAMP = 0x4A5B6C7D, DLL_STAMP = 0x4B000001;
 
 void put32(std::vector<uint8_t> &v, size_t at, uint32_t x) {
     v[at] = uint8_t(x >> 24), v[at + 1] = uint8_t(x >> 16), v[at + 2] = uint8_t(x >> 8), v[at + 3] = uint8_t(x);
@@ -47,6 +53,7 @@ Xex make_xex() {
         {xex_key::SYSTEM_FLAGS, 0x00000440}, {xex_key::ENTRY_POINT, BASE + 0x1000},
         {xex_key::IMAGE_BASE_ADDRESS, BASE}, {xex_key::DEFAULT_STACK_SIZE, 0x00041234},
         {xex_key::TLS_INFO, 0x200},          {xex_key::RESOURCE_INFO, 0x300},
+        {CHECKSUM_TIMESTAMP, 0x500},
     };
     put32(h, 0x14, uint32_t(std::size(headers)));
     for (size_t i = 0; i < std::size(headers); i++) {
@@ -65,6 +72,8 @@ Xex make_xex() {
     std::memcpy(&h[0x314], "XSTR", 4);
     put32(h, 0x31C, BASE + 0x2100);
     put32(h, 0x320, 0x20);
+    put32(h, 0x500, 0x0BADF00D); // checksum, time stamp
+    put32(h, 0x504, EXE_STAMP);
     put32(h, 0x400 + 4, 0x10000);           // image size
     put32(h, 0x400 + 0x160, BASE + 0x4000); // the export table
     xex.header_size = 0x800;
@@ -95,6 +104,7 @@ void modules(KernelHarness &h) {
     CHECK(header != 0 && std::memcmp(k.host(header), "XEX2", 4) == 0 && k.load32(header + 0x400 + 4) == 0x10000);
     CHECK(k.load32(exe + 0x1C) == BASE && k.load32(exe + 0x38) == 0x10000 && k.load32(exe + 0x3C) == BASE + 0x1000);
     CHECK(k.load32(exe + 0x18) == 0 && k.load16(exe + 0x40) == 0);
+    CHECK(k.load32(exe + 0x50) == EXE_STAMP && k.load32(exe + 0x48) == 0); // the time stamp, no checksum
 
     // RtlImageXexHeaderField: a value, the address of one, the address of data
     CHECK(h.krnl("RtlImageXexHeaderField", {header, xex_key::SYSTEM_FLAGS}) == 0x440);
@@ -542,7 +552,7 @@ std::vector<uint8_t> make_dll(uint32_t base, const std::vector<uint8_t> &image,
     const std::pair<uint32_t, uint32_t> headers[] = {
         {xex_key::ENTRY_POINT, base + ENTRY},      {xex_key::IMAGE_BASE_ADDRESS, base},
         {xex_key::FILE_FORMAT_INFO, 0x600},        {xex_key::IMPORT_LIBRARIES, 0x700},
-        {0x00E10402 /* exports by name */, 0x610},
+        {0x00E10402 /* exports by name */, 0x610}, {CHECKSUM_TIMESTAMP, 0x680},
     };
     put32(f, 0x14, uint32_t(std::size(headers)));
     for (size_t i = 0; i < std::size(headers); i++) {
@@ -555,6 +565,8 @@ std::vector<uint8_t> make_dll(uint32_t base, const std::vector<uint8_t> &image,
     put32(f, 0x600, 8); // no encryption, no compression
     put32(f, 0x610, 0x200);
     put32(f, 0x614, 0x80);
+    put32(f, 0x680, 0x12345678);
+    put32(f, 0x684, DLL_STAMP);
     // the import libraries: the names (each padded to 4), then each one's
     // records
     std::vector<uint8_t> names;
@@ -658,7 +670,7 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     uint32_t header = k.load32(app + 0x58);
     CHECK(header && std::memcmp(k.host(header), "XEX2", 4) == 0 && k.load32(header + 8) == 0x1000);
     CHECK(k.load32(app + 0x1C) == APP && k.load32(app + 0x38) == IMAGE_SIZE && k.load32(app + 0x3C) == APP + ENTRY);
-    CHECK(k.load32(app + 0x18) == 0);
+    CHECK(k.load32(app + 0x18) == 0 && k.load32(app + 0x50) == DLL_STAMP && k.load32(lib + 0x50) == DLL_STAMP);
     CHECK(h.krnl("RtlImageXexHeaderField", {header, xex_key::ENTRY_POINT}) == APP + ENTRY);
     // the image at its base, its pages taken
     CHECK(k.host(APP)[0] == 'M' && k.load32(APP + DATA) == 0xCAFEF00D);
@@ -687,7 +699,7 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     k.call(*h.c, APP + FUNCTION);
     CHECK(uint32_t(h.c->r[3]) == 50'000'000 + 7 + 0x100);
     k.call(*h.c, APP + IMPORTS + 0x30); // lib.dll's ordinal 9: no such export
-    CHECK(uint32_t(h.c->r[3]) == 0 && k.unimplemented().count("lib!lib_9") == 1);
+    CHECK(uint32_t(h.c->r[3]) == 0 && k.unimplemented().count("lib!lib_009") == 1);
 
     // XexGetProcedureAddress: the export table by ordinal, the PE export
     // directory by name
@@ -770,6 +782,208 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     CHECK(int32_t(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\missing.dll"), buffer, 0x2000})) < 0);
 }
 
+// ---- the loader lock: gate.dll, its DllMain host code ----
+//
+// gate.dll at GATE has its DllMain in the generated-code table: it logs each
+// call (HMODULE, reason, the thread) on the host side, and in some phases
+// stays in the call (until a flag or a timeout) or calls ExitThread. Its
+// guest code is the other DLLs' and never runs.
+
+constexpr uint32_t GATE = 0x8A000000;
+constexpr uint32_t F_LOADER = BASE + 0x7000; // a thread that loads gate.dll (generated)
+constexpr uint32_t PROCESS_DETACH = 0, PROCESS_ATTACH = 1, THREAD_ATTACH = 2, THREAD_DETACH = 3;
+
+kernel::Kernel *K = nullptr;
+
+struct GateCall {
+    uint32_t hmodule, reason;
+    int64_t thread;   // the guest thread's id, -1 the test's own (host) thread
+    bool saw = false; // the other thread's load or unload ended during this call
+    bool operator==(const GateCall &) const = default;
+};
+
+struct Gate {
+    std::mutex mutex;
+    std::vector<GateCall> calls;
+    // 1: a thread's DLL_THREAD_DETACH stays until the unload returns (or
+    // 300 ms); 2: DLL_PROCESS_DETACH stays until the loader thread's load
+    // returns (or 300 ms); 3: DLL_THREAD_ATTACH and DETACH call ExitThread
+    std::atomic<int> phase{0};
+    std::atomic<bool> in_thread_detach{false}, unload_returned{false};
+    std::atomic<bool> loader_running{false}, in_process_detach{false}, load_returned{false};
+    uint32_t name = 0, out = 0; // the loader thread's XexLoadImage arguments
+    std::atomic<uint32_t> load_status{0}, loaded{0};
+
+    std::vector<GateCall> since(size_t from) {
+        std::lock_guard l(mutex);
+        return std::vector<GateCall>(calls.begin() + std::min(from, calls.size()), calls.end());
+    }
+    size_t count() {
+        std::lock_guard l(mutex);
+        return calls.size();
+    }
+} gate;
+
+// polls a flag until it is set or the time is up; whether it was set
+bool wait_flag(const std::atomic<bool> &flag, std::chrono::milliseconds limit) {
+    auto end = std::chrono::steady_clock::now() + limit;
+    while (!flag && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return flag;
+}
+
+int64_t thread_id() {
+    kernel::Thread *t = kernel::current_thread();
+    return t ? int64_t(t->id) : -1;
+}
+
+void gate_main(ppc::Context &c) {
+    GateCall call{uint32_t(c.r[3]), uint32_t(c.r[4]), thread_id()};
+    int phase = gate.phase;
+    if (phase == 1 && call.reason == THREAD_DETACH) {
+        gate.in_thread_detach = true;
+        call.saw = wait_flag(gate.unload_returned, std::chrono::milliseconds(300));
+    } else if (phase == 2 && call.reason == PROCESS_DETACH) {
+        gate.in_process_detach = true;
+        call.saw = wait_flag(gate.load_returned, std::chrono::milliseconds(300));
+    }
+    {
+        std::lock_guard l(gate.mutex);
+        gate.calls.push_back(call);
+    }
+    if (phase == 3 && (call.reason == THREAD_ATTACH || call.reason == THREAD_DETACH))
+        throw kernel::ThreadExit{call.reason == THREAD_ATTACH ? 0x77u : 0x78u}; // what ExTerminateThread does
+    c.r[3] = 1;
+}
+
+// a guest thread that loads gate.dll once its DLL_PROCESS_DETACH runs on
+// another thread
+void loader_thread(ppc::Context &c) {
+    gate.loader_running = true;
+    wait_flag(gate.in_process_detach, std::chrono::seconds(30));
+    c.r[3] = gate.name, c.r[4] = 9, c.r[5] = 0, c.r[6] = gate.out;
+    kernel::find_export_fn("xboxkrnl", "XexLoadImage")(*K, c);
+    gate.load_status = uint32_t(c.r[3]);
+    gate.loaded = K->load32(gate.out);
+    gate.load_returned = true;
+    c.r[3] = 0;
+}
+
+const kernel::Generated generated[] = {
+    {F_LOADER, loader_thread},
+    {GATE + ENTRY, gate_main},
+};
+
+std::vector<uint8_t> make_gate(uint32_t log) {
+    std::vector<uint8_t> image = make_image(GATE, 0x33, log);
+    put32(image, IMPORTS, KE_QUERY_PERFORMANCE_FREQUENCY);
+    put_thunk(image, IMPORTS + 0x10, KE_QUERY_PERFORMANCE_FREQUENCY);
+    return make_dll(GATE, image, {{"xboxkrnl.exe", {GATE + IMPORTS, GATE + IMPORTS + 0x10}}});
+}
+
+// a guest thread from start to end; its id
+uint32_t run_thread(KernelHarness &h, uint32_t start, uint32_t expected_exit, std::function<void()> meanwhile = {}) {
+    kernel::Kernel &k = *h.k;
+    uint32_t handle_ptr = h.alloc(4), id_ptr = h.alloc(4);
+    CHECK(h.krnl("ExCreateThread", {handle_ptr, 0, id_ptr, 0, start, 0, 0}) == 0);
+    uint32_t thread = k.load32(handle_ptr);
+    if (meanwhile) meanwhile();
+    kernel::Objects &o = k.objects();
+    kernel::Ref<kernel::Thread> t = o.lookup<kernel::Thread>(thread);
+    CHECK(t);
+    {
+        std::unique_lock<std::mutex> l(o.lock);
+        CHECK(t && o.thread_exited.wait_for(l, std::chrono::seconds(30), [&] { return t->finished; }));
+        CHECK(t && t->exit_code == expected_exit);
+    }
+    CHECK(h.krnl("NtClose", {thread}) == 0);
+    return k.load32(id_ptr);
+}
+
+// gate.dll loaded before the others: first in the list after the executable
+uint32_t load_gate(KernelHarness &h) {
+    uint32_t out = h.alloc(4);
+    size_t from = gate.count();
+    CHECK(h.krnl("XexLoadImage", {h.string("gate.dll"), 9, 0, out}) == 0);
+    uint32_t hmodule = h.k->load32(out);
+    CHECK((gate.since(from) == std::vector<GateCall>{{hmodule, PROCESS_ATTACH, -1}}));
+    return hmodule;
+}
+
+// ExitThread in DllMain: in DLL_THREAD_ATTACH, the thread ends there (the
+// DLLs after gate.dll get no THREAD_ATTACH, its start routine does not run);
+// in DLL_THREAD_DETACH, gate.dll's own call ends and the others still get
+// theirs. The loader lock is free after.
+void exit_in_dll_main(KernelHarness &h, uint32_t log, uint32_t gate_module) {
+    kernel::Kernel &k = *h.k;
+    uint32_t out = h.alloc(4);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("app.dll"), out}) == 0);
+    uint32_t app = k.load32(out);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0);
+    uint32_t lib = k.load32(out);
+    uint32_t logged = k.load32(log);
+    size_t from = gate.count();
+    gate.phase = 3;
+    uint32_t id = run_thread(h, BASE + 0x6000, 0x77);
+    gate.phase = 0;
+    CHECK((gate.since(from) ==
+           std::vector<GateCall>{{gate_module, THREAD_ATTACH, id}, {gate_module, THREAD_DETACH, id}}));
+    CHECK((entry_calls(k, log, logged) ==
+           std::vector<EntryCall>{{app, THREAD_DETACH, 0, APP_ID}, {lib, THREAD_DETACH, 0, LIB_ID}}));
+    std::string report = kernel::modules_report(k);
+    CHECK(report.find("the loader lock") == std::string::npos);
+    if (report.find("the loader lock") != std::string::npos) return; // the rest would wait for it forever
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("gate.dll"), out}) == 0 && k.load32(out) == gate_module);
+}
+
+void loader_lock(KernelHarness &h, uint32_t gate_module) {
+    kernel::Kernel &k = *h.k;
+    uint32_t out = h.alloc(4);
+
+    // A thread ends while gate.dll is unloaded: its DLL_THREAD_DETACH (still
+    // running when XexUnloadImage is called) ends before the unload's
+    // DLL_PROCESS_DETACH starts, and nothing reaches the module after.
+    size_t from = gate.count();
+    gate.phase = 1;
+    uint32_t id = run_thread(h, BASE + 0x6000, 0x55, [&] {
+        CHECK(wait_flag(gate.in_thread_detach, std::chrono::seconds(30)));
+        CHECK(h.krnl("XexUnloadImage", {gate_module}) == 0);
+        gate.unload_returned = true;
+    });
+    gate.phase = 0;
+    CHECK((gate.since(from) == std::vector<GateCall>{{gate_module, THREAD_ATTACH, id},
+                                                     {gate_module, THREAD_DETACH, id, false},
+                                                     {gate_module, PROCESS_DETACH, -1}}));
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("gate.dll"), out}) == 0x490);
+    RegionInfo region;
+    CHECK(k.memory().heap_for(GATE)->query(GATE, region) && region.state == 0);
+
+    // A thread loads gate.dll while it is being unloaded: the load waits for
+    // the unload, then loads a fresh copy and attaches it on its thread.
+    uint32_t again = load_gate(h);
+    from = gate.count();
+    gate.name = h.string("gate.dll"), gate.out = h.alloc(4);
+    id = run_thread(h, F_LOADER, 0, [&] {
+        CHECK(wait_flag(gate.loader_running, std::chrono::seconds(30)));
+        gate.phase = 2;
+        CHECK(h.krnl("XexUnloadImage", {again}) == 0);
+    });
+    gate.phase = 0;
+    uint32_t fresh = gate.loaded;
+    CHECK(gate.load_status == 0 && fresh != 0);
+    CHECK((gate.since(from) == std::vector<GateCall>{{again, THREAD_ATTACH, id},
+                                                     {again, PROCESS_DETACH, -1, false},
+                                                     {fresh, PROCESS_ATTACH, id},
+                                                     {fresh, THREAD_DETACH, id}}));
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("gate.dll"), out}) == 0 && k.load32(out) == fresh);
+    CHECK(k.load16(fresh + 0x40) == 1 && k.load32(GATE + DATA) == 0xCAFEF00D);
+
+    // and gone
+    from = gate.count();
+    CHECK(h.krnl("XexUnloadImage", {fresh}) == 0);
+    CHECK((gate.since(from) == std::vector<GateCall>{{fresh, PROCESS_DETACH, -1}}));
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("gate.dll"), out}) == 0x490);
+}
+
 } // namespace
 
 int main() {
@@ -790,13 +1004,19 @@ int main() {
     write("lib.dll", lib_file);
     write("app.dll", make_app(log));
     write("junk.dll", std::vector<uint8_t>(0x1000, 'j'));
+    write("gate.dll", make_gate(log));
     std::string error;
     if (!kernel::mount_directory(*h.k, dir, error)) return std::printf("kernel_modules: %s\n", error.c_str()), 1;
 
+    K = h.k.get();
+    h.k->set_generated(generated, std::size(generated));
     Xex xex = make_xex();
     if (!h.k->load(xex, error)) return std::printf("kernel_modules: %s\n", error.c_str()), 1;
     modules(h);
+    uint32_t gate_module = load_gate(h);
     user_modules(h, log, lib_file);
+    exit_in_dll_main(h, log, gate_module);
+    loader_lock(h, gate_module);
     variables(h);
     strings(h);
     time(h);
