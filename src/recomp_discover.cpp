@@ -8,6 +8,10 @@
 // through the instructions that made it, into constants, loads from a table
 // and shifts; the four forms the XDK's compiler writes are recognized in the
 // result, whatever order the instructions came in.
+//
+// The data pointer scan at the end of the file (scan_pointers and discover's
+// passes) is translated from rexglue's fork, codegen/pointer_scan.cpp (BSD;
+// see LICENSE-rexglue and the notice there).
 
 #include "xenoforge/recomp.h"
 
@@ -72,7 +76,8 @@ struct Expr {
     enum Kind { Const, Reg, Load, Add, Shl, Mask } kind = Reg;
     int64_t value = 0;     // Const's value; Reg's register; Load's size; Shl's amount; Mask's mask
     const Expr *a = nullptr, *b = nullptr;
-    uint32_t at = 0;       // Reg: where the scan stopped looking for it
+    uint32_t at = 0;       // Reg: where the scan stopped looking for it; an index's Shl, Mask: where it was used
+    uint32_t reg = 32;     // an index's Shl, Mask: the register holding the result there
 };
 
 class Tracer {
@@ -101,9 +106,9 @@ public:
         return reg_expr(reg, pc);
     }
 
-    // an index register, through slwi and clrlwi; anything else (a move
-    // too: the bound is on the register the table is read with) ends it
-    // (as a register used at `pc`)
+    // an index register, through slwi, clrlwi and mr, each step keeping the
+    // register it was in (the bound is a compare on one of them); anything
+    // else ends it (as a register used at `pc`)
     const Expr *index(uint32_t reg, uint32_t pc, uint32_t depth = 0) {
         uint32_t steps = 0;
         for (uint32_t at = pc - 4; depth < 4 && at >= floor_ && at < pc && steps < BACKWARD_MAX; at -= 4, steps++) {
@@ -114,10 +119,18 @@ public:
             std::optional<uint32_t> w = written_gpr(op, i, &second);
             if ((!w || *w != reg) && second != reg) continue;
             if (op == Opcode::rlwinmx && w && *w == reg) {
+                // clrlwi first: rlwinm rA, rS, 0, 0, 31 is a 32-bit move, not a shift by 0
                 uint32_t sh = i.M.SH, mb = i.M.MB, me = i.M.ME;
-                if (mb == 0 && me == 31 - sh) return make({Expr::Shl, int64_t(sh), index(i.M.RT, at, depth + 1)});
-                if (sh == 0 && me == 31) return make({Expr::Mask, int64_t(0xFFFFFFFFull >> mb), index(i.M.RT, at, depth + 1)});
+                if (sh == 0 && me == 31) {
+                    int64_t mask = int64_t(0xFFFFFFFFull >> mb);
+                    return make({Expr::Mask, mask, index(i.M.RT, at, depth + 1), nullptr, pc, reg});
+                }
+                if (mb == 0 && me == 31 - sh)
+                    return make({Expr::Shl, int64_t(sh), index(i.M.RT, at, depth + 1), nullptr, pc, reg});
             }
+            // mr: the compare may be on the register moved from (a mask that bounds nothing)
+            if (op == Opcode::orx && w && *w == reg && i.X.RT == i.X.RB)
+                return make({Expr::Mask, int64_t(0xFFFFFFFF), index(i.X.RT, at, depth + 1), nullptr, pc, reg});
             break;
         }
         return reg_expr(reg, pc);
@@ -152,6 +165,7 @@ private:
         case Opcode::rlwinmx: {
             uint32_t sh = i.M.SH, mb = i.M.MB, me = i.M.ME;
             const Expr *s = value(i.M.RT, at, depth + 1);
+            if (sh == 0 && mb == 0 && me == 31) return s; // a 32-bit move
             if (mb == 0 && me == 31 - sh) return make({Expr::Shl, int64_t(sh), s}); // slwi
             if (sh == 0 && me == 31) return make({Expr::Mask, int64_t(0xFFFFFFFFull >> mb), s}); // clrlwi
             break;
@@ -193,16 +207,20 @@ const Expr *index_of(const Expr *e, uint32_t shift, uint32_t &count) {
         if (e->kind != Expr::Shl || e->value != shift) return nullptr;
         e = e->a;
     }
-    if (e->kind == Expr::Mask) {
-        count = uint32_t(std::min<int64_t>(e->value + 1, TABLE_MAX));
-        e = e->a;
+    for (; e->kind == Expr::Mask; e = e->a) {
+        if (e->value == 0xFFFFFFFF) continue; // a move
+        uint32_t n = uint32_t(std::min<int64_t>(e->value + 1, TABLE_MAX));
+        count = count ? std::min(count, n) : n;
     }
     return e->kind == Expr::Reg && e->value < 32 ? e : nullptr;
 }
 
 class Discoverer {
 public:
-    explicit Discoverer(const Image &image) : image_(image) {}
+    // `extra`: starts from the data pointer scan (Pointer, Branch), registered
+    // after .pdata and before anything is walked, so the functions around
+    // them stop there
+    Discoverer(const Image &image, const std::map<uint32_t, Source> &extra) : image_(image), extra_(extra) {}
 
     Discovery run() {
         add_imports();
@@ -210,11 +228,16 @@ public:
         for (const PdataEntry &p : image_.pdata) {
             if (!image_.is_code(p.begin)) continue;
             if (add(p.begin, Source::Pdata, p.length)) d_.counts["pdata"]++;
-            if (p.exception) d_.counts["pdata with exception data"]++;
+            if (p.exception) {
+                d_.counts["pdata with exception data"]++;
+                handler_data_.insert(p.begin - 8), handler_data_.insert(p.begin - 4);
+            }
         }
         if (image_.is_code(image_.entry)) add(image_.entry, Source::Entry);
+        for (const auto &[a, source] : extra_) add(a, source);
         settle();
-        // gaps: code nothing covers, cut after each end of a function
+        // gaps: code nothing covers, cut after each end of a function; a
+        // round again when a function shrank and left code uncovered
         for (int round = 0; round < 8; round++) {
             size_t before = d_.functions.size();
             fill_gaps();
@@ -225,6 +248,11 @@ public:
         d_.counts["functions"] = d_.functions.size();
         d_.counts["jump tables"] = d_.tables.size();
         d_.counts["indirect branches"] = d_.indirect.size();
+        // the branches out of each function that reach no start
+        for (const auto &[a, list] : exits_)
+            for (const auto &[site, target] : list)
+                if (!d_.functions.count(target)) d_.unresolved.push_back({a, site, target});
+        d_.counts["unresolved branches"] = d_.unresolved.size();
         return std::move(d_);
     }
 
@@ -311,10 +339,17 @@ private:
         bool sized = sized_[f.address];
         uint32_t end = sized ? f.address + f.size : limit(f.address);
         f.blocks.clear(), f.calls.clear(), f.tail_calls.clear();
+        std::vector<std::pair<uint32_t, uint32_t>> &exits = exits_[f.address];
+        exits.clear();
         std::deque<uint32_t> work{f.address};
         std::set<uint32_t> seen;
         uint32_t reached = f.address;
         auto internal = [&](uint32_t t) { return t >= f.address && t < end && (t == f.address || !d_.functions.count(t)); };
+        // a branch out of the function: a tail call if a function starts there
+        auto leave = [&](uint32_t site, uint32_t target) {
+            f.tail_calls.insert(target);
+            exits.push_back({site, target});
+        };
         while (!work.empty()) {
             uint32_t pc = work.front();
             work.pop_front();
@@ -339,7 +374,7 @@ private:
                         continue;
                     }
                     if (internal(target)) work.push_back(target);
-                    else f.tail_calls.insert(target);
+                    else leave(pc, target);
                     break;
                 }
                 if (op == Opcode::bcx) {
@@ -351,7 +386,7 @@ private:
                         continue;
                     }
                     if (internal(target)) work.push_back(target);
-                    else f.tail_calls.insert(target);
+                    else leave(pc, target);
                     if (always) break;
                     work.push_back(pc + 4);
                     break;
@@ -375,6 +410,7 @@ private:
                     if (read_table(f.address, pc, end, table)) {
                         for (uint32_t t : table.targets)
                             if (internal(t)) work.push_back(t);
+                            else exits.push_back({pc, t});
                         d_.tables[pc] = std::move(table);
                         d_.indirect.erase(pc);
                     } else {
@@ -420,28 +456,59 @@ private:
         if (!load || !split_const(load->a, c, rest)) return false;
         t.table = uint32_t(c);
         uint32_t scale = t.kind == JumpTable::Absolute ? 2 : t.kind == JumpTable::HalfwordOffset ? 1 : 0;
-        index = index_of(rest, scale, count);
+        uint32_t masked = 0; // what a mask on the index allows
+        index = index_of(rest, scale, masked);
         if (!index) return false;
         t.index = uint32_t(index->value);
-        if (!count) count = bound(function, index->at, t.index);
-        if (!count) count = bound_anywhere(function, bctr, end, t.index);
-        uint32_t entry = 1u << scale;
-        for (uint32_t k = 0; k < (count ? count : TABLE_MAX); k++) {
-            uint32_t at = t.table + k * entry;
-            if (!image_.contains(at, entry)) break;
-            uint32_t v = image_.word(at & ~3u);
-            uint32_t raw = entry == 4 ? v : entry == 2 ? (v >> (16 - 8 * (at & 2))) & 0xFFFF : (v >> (24 - 8 * (at & 3))) & 0xFF;
-            uint32_t targetaddr = t.kind == JumpTable::Absolute ? raw : t.base + (raw << t.shift);
-            const Section *s = image_.section_of(targetaddr);
-            bool ok = !(targetaddr & 3) && s && s->code && targetaddr >= function && image_.word(targetaddr) != 0;
-            if (!ok) {
-                if (count) return false; // a bounded table must hold code everywhere
+        // The compare on the index is the bound; a mask only caps it (clrlwi
+        // to 5 bits, then cmplwi 12: 13 entries, not 32). The compare may be
+        // on any register the index passed through on its way to the load
+        // (clrlwi r9, r11, 27; cmplwi r9, 17; or mr r31, r4; cmplwi r4, 18),
+        // looked for back from the load, nearest the load first.
+        std::vector<uint32_t> path; // registers
+        uint32_t load_at = 0;
+        for (const Expr *e = rest; e; e = e->a) {
+            if (!load_at) load_at = e->at; // the first step was used by the load
+            if (e->kind == Expr::Reg) {
+                path.push_back(uint32_t(e->value));
                 break;
             }
-            if (!count && targetaddr >= end && !sized_[function]) break;
-            t.targets.push_back(targetaddr);
+            if ((e->kind == Expr::Shl || e->kind == Expr::Mask) && e->reg < 32) path.push_back(e->reg);
         }
-        if (t.targets.empty()) return false;
+        for (uint32_t reg : path)
+            if ((count = bound(function, load_at, reg))) break;
+        // a compare found elsewhere in the function is a guess: when the
+        // table does not hold code that far, it is read as if unbounded
+        bool guessed = false;
+        for (uint32_t reg : path)
+            if (!count) count = bound_anywhere(function, bctr, end, reg), guessed = count != 0;
+        if (masked && (!count || count > masked)) count = masked, guessed = false;
+        uint32_t entry = 1u << scale;
+        auto read = [&](uint32_t count) {
+            t.targets.clear();
+            for (uint32_t k = 0; k < (count ? count : TABLE_MAX); k++) {
+                uint32_t at = t.table + k * entry;
+                if (!image_.contains(at, entry)) break;
+                uint32_t v = image_.word(at & ~3u);
+                uint32_t raw = entry == 4   ? v
+                               : entry == 2 ? (v >> (16 - 8 * (at & 2))) & 0xFFFF
+                                            : (v >> (24 - 8 * (at & 3))) & 0xFF;
+                uint32_t targetaddr = t.kind == JumpTable::Absolute ? raw : t.base + (raw << t.shift);
+                const Section *s = image_.section_of(targetaddr);
+                bool ok = !(targetaddr & 3) && s && s->code && targetaddr >= function && image_.word(targetaddr) != 0;
+                if (!ok) {
+                    if (count) return false; // a bounded table must hold code everywhere
+                    break;
+                }
+                if (!count && targetaddr >= end && !sized_[function]) break;
+                t.targets.push_back(targetaddr);
+            }
+            return !t.targets.empty();
+        };
+        if (!read(count)) {
+            if (!guessed || !read(0)) return false;
+            count = 0;
+        }
         if (!count) d_.counts["jump tables without a bound"]++;
         out = std::move(t);
         return true;
@@ -466,60 +533,313 @@ private:
         return best;
     }
 
-    // cmplwi crN, rI, n (n + 1 entries) between where the index is used and
-    // where it was made
+    // cmplwi crN, rI, n (n + 1 entries) back from where the table is read,
+    // until rI is written
     uint32_t bound(uint32_t function, uint32_t from, uint32_t reg) {
         for (uint32_t at = from - 4, steps = 0; at >= function && at < from && steps < BACKWARD_MAX; at -= 4, steps++) {
             Instr i{image_.word(at)};
             Opcode op = ppc::decode(i.code);
             if ((op == Opcode::cmpli || op == Opcode::cmpi) && i.D.RA == reg) return std::min<uint32_t>(i.D.DS + 1, TABLE_MAX);
             std::optional<uint32_t> w = written_gpr(op, i);
-            if (w && *w == reg) break;
+            if (w && *w == reg) {
+                if (op == Opcode::lwz && i.D.RA == 1) return bound_in_slot(function, at, i.D.DS);
+                break;
+            }
         }
         return 0;
     }
 
+    // Unoptimized code reloads the index from its stack slot for each use:
+    // the compare is on another register loaded from the same slot before
+    // (lwz r8, 0x70(r1); cmplwi r8, 9; bgt; lwz r7, 0x70(r1); slwi r0, r7, 2).
+    uint32_t bound_in_slot(uint32_t function, uint32_t from, uint32_t slot) {
+        for (uint32_t at = from - 4, steps = 0; at >= function && at < from && steps < 16; at -= 4, steps++) {
+            Instr i{image_.word(at)};
+            Opcode op = ppc::decode(i.code);
+            std::string_view name = ppc::info(op).name;
+            if (name.starts_with("st") && ppc::info(op).form == ppc::Form::D && i.D.RA == 1 && i.D.DS == slot) return 0;
+            if (op != Opcode::cmpli && op != Opcode::cmpi) continue;
+            // the register compared, loaded from the slot just before
+            for (uint32_t b = at - 4, back = 0; b >= function && back < 3; b -= 4, back++) {
+                Instr l{image_.word(b)};
+                Opcode lop = ppc::decode(l.code);
+                if (lop == Opcode::lwz && l.D.RT == i.D.RA && l.D.RA == 1 && l.D.DS == slot)
+                    return std::min<uint32_t>(i.D.DS + 1, TABLE_MAX);
+                std::optional<uint32_t> w = written_gpr(lop, l);
+                if (w && *w == i.D.RA) break;
+            }
+        }
+        return 0;
+    }
+
+    // Code no function covers gets a function after each end (blr, bctr, b)
+    // and after padding, as rexglue splits its gaps on returns and tail
+    // calls. Each one is walked as soon as it is added, so the scan goes on
+    // past what it covers: a run of small functions reached only through
+    // pointers (a vtable's leaf methods) is cut in one pass.
     void fill_gaps() {
-        // what functions cover
-        std::vector<std::pair<uint32_t, uint32_t>> covered;
-        for (auto &[a, f] : d_.functions) covered.push_back({a, a + std::max<uint32_t>(f.size, 4)});
-        std::sort(covered.begin(), covered.end());
+        // Covered: inside the nearest function before, or inside a sized one
+        // that started earlier and holds it (a function nested in a .pdata
+        // range does not uncover the rest of the range: the sized function's
+        // code runs across it).
+        uint32_t sized_until = 0;
         auto is_covered = [&](uint32_t a) {
-            auto it = std::upper_bound(covered.begin(), covered.end(), std::make_pair(a, UINT32_MAX));
-            return it != covered.begin() && a < std::prev(it)->second;
+            auto here = d_.functions.find(a);
+            if (here != d_.functions.end() && sized_[a]) sized_until = std::max(sized_until, a + here->second.size);
+            if (a < sized_until) return true;
+            auto it = d_.functions.upper_bound(a);
+            if (it == d_.functions.begin()) return false;
+            --it;
+            return a < it->first + std::max<uint32_t>(it->second.size, 4);
+        };
+        auto ends = [](uint32_t w) {
+            Instr i{w};
+            return w == BLR || w == BCTR || (ppc::decode(w) == Opcode::bx && !i.I.LK);
         };
         for (const Section &s : image_.sections) {
             if (!s.code) continue;
             bool after_end = true; // a gap starts after an end, or at the section's start
+            sized_until = 0;
             for (uint32_t a = s.address; a + 4 <= s.address + s.size; a += 4) {
                 uint32_t w = image_.word(a);
                 if (is_covered(a)) {
-                    after_end = false;
-                    Instr i{w};
-                    Opcode op = ppc::decode(w);
-                    after_end = w == BLR || w == BCTR || (op == Opcode::bx && !i.I.LK);
+                    after_end = ends(w);
                     continue;
                 }
                 if (w == 0) {
                     after_end = true;
                     continue;
                 }
-                if (after_end && ppc::decode(w) != Opcode::Invalid) {
-                    if (add(a, Source::Gap)) d_.counts["gaps"]++;
-                    after_end = false;
+                // A blr alone after an end is the compiler's dead return
+                // after a tail call; a function only if something reaches it
+                // (a bl, a pointer, a branch). The 8 bytes before a function
+                // with exception data are its handler and the handler's data.
+                if ((w == BLR && after_end) || handler_data_.count(a)) {
+                    after_end = true;
+                    continue;
                 }
+                if (after_end && ppc::decode(w) != Opcode::Invalid) {
+                    if (add(a, Source::Gap)) {
+                        d_.counts["gaps"]++;
+                        settle();
+                        if (is_covered(a)) {
+                            after_end = ends(w);
+                            continue;
+                        }
+                    }
+                }
+                after_end = ends(w);
             }
         }
     }
 
     const Image &image_;
+    const std::map<uint32_t, Source> &extra_;
     Discovery d_;
     std::map<uint32_t, bool> sized_;
     std::deque<uint32_t> pending_;
+    std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> exits_; // by function: (site, target) leaving it
+    std::set<uint32_t> handler_data_; // the words before functions with exception data
 };
+
+// ---- the data pointer scan ----
+//
+// After rexglue's codegen/pointer_scan.cpp (rexglue-sdk, the fork's
+// [analysis] scan_data_pointers). Copyright (c) 2026, Tom Clay; portions
+// Copyright (c) 2022, Ben Vanik and Xenia project contributors. BSD 3-Clause:
+// redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the conditions in LICENSE-rexglue
+// are met; it is provided "as is", without any warranty (LICENSE-rexglue).
+//
+// Translated: what counts as a pointer (the words of every section that is not
+// code, lis/addi pairs in code), what looks like a function's start, and the
+// passes that drop a candidate when it splits a function. Written anew for
+// XenoForge's structures: a split shows as a branch out of a function to an
+// address no function starts at (Discovery::unresolved, what the generated
+// code would dispatch to the interpreter), where rexglue's builders would
+// trap; the passes rerun the whole discovery, which takes a fraction of a
+// second, so there is no cache of dropped candidates; a bl never shows a
+// split here, because every bl target is a start.
+
+constexpr uint32_t MFLR_R12 = 0x7D8802A6;
+constexpr uint32_t LIS_ADDI_WINDOW = 8; // how far past a lis the addi that completes it may sit
+// Passes after the baseline. Each only drops candidates or adds branch
+// targets, so the set settles quickly; this is a backstop.
+constexpr int SCAN_PASSES = 16;
+
+bool is_code_address(const Image &image, uint32_t a) { return !(a & 3) && image.is_code(a) && image.contains(a); }
+
+// A function's first instruction opens a frame (mflr r12, stwu r1), or
+// follows a return, an unconditional branch or padding.
+bool looks_like_start(const Image &image, uint32_t a) {
+    if (!is_code_address(image, a)) return false;
+    const Section *s = image.section_of(a);
+    uint32_t w = image.word(a);
+    if (w == 0) return false;
+    if (w == MFLR_R12 || (w & 0xFFFF0000) == 0x94210000) return true;
+    if (a < s->address + 4) return false; // the word before is in another section
+    uint32_t prev = image.word(a - 4);
+    bool b = (prev >> 26) == 18 && !(prev & 1);
+    return prev == BLR || prev == BCTR || b || prev == 0;
+}
+
+// the function whose range holds `a`
+const Function *holder(const Discovery &d, uint32_t a) {
+    auto it = d.functions.upper_bound(a);
+    if (it == d.functions.begin()) return nullptr;
+    --it;
+    return a < it->first + std::max<uint32_t>(it->second.size, 4) ? &it->second : nullptr;
+}
 
 } // namespace
 
-Discovery discover(const Image &image) { return Discoverer(image).run(); }
+std::vector<uint32_t> scan_pointers(const Image &image) {
+    std::set<uint32_t> found;
+    auto consider = [&](uint32_t v) {
+        if (looks_like_start(image, v)) found.insert(v);
+    };
+    for (const Section &s : image.sections) {
+        uint32_t end = s.address + s.size;
+        if (!s.code) {
+            // vtables, callback tables, fields holding function pointers
+            for (uint32_t a = s.address; a + 4 <= end; a += 4) consider(image.word(a));
+            continue;
+        }
+        // Addresses made in code: lis rX, hi followed by addi rY, rX, lo. A word
+        // in a code section is not read as a pointer: there it is an inline
+        // jump table.
+        for (uint32_t a = s.address; a + 4 <= end; a += 4) {
+            uint32_t lis = image.word(a);
+            if ((lis >> 26) != 15 || ((lis >> 16) & 31) != 0) continue; // addis rX, 0, hi
+            uint32_t reg = (lis >> 21) & 31, hi = lis << 16;
+            for (uint32_t k = 1; k <= LIS_ADDI_WINDOW && a + (k + 1) * 4 <= end; k++) {
+                uint32_t w = image.word(a + k * 4);
+                if ((w >> 26) == 14 && ((w >> 16) & 31) == reg) { // addi rY, rX, lo
+                    consider(hi + uint32_t(int32_t(int16_t(w & 0xFFFF))));
+                    break;
+                }
+                if (((w >> 21) & 31) == reg) break; // the register written before an addi used it
+            }
+        }
+    }
+    return {found.begin(), found.end()};
+}
+
+// Discovery with the data pointer scan: a baseline run says which pointers the
+// image explains already; the rest become starts, rerun after rerun, each one
+// dropped when it splits a function (it leaves the function's own branches
+// across the split pointing at no start), until the set holds still.
+Discovery discover(const Image &image, const DiscoverOptions &options) {
+    const std::map<uint32_t, Source> none;
+    Discovery d = Discoverer(image, none).run();
+    if (!options.scan_pointers) return d;
+
+    // branches unresolved without the scan say nothing about the candidates:
+    // pruning around them would only drop good starts
+    std::set<std::pair<uint32_t, uint32_t>> baseline;
+    for (const Unresolved &u : d.unresolved) baseline.insert({u.site, u.target});
+    const uint64_t baseline_count = d.unresolved.size();
+
+    // A jump table sits in the code after its bctr, so the lis/addi pair that
+    // loads its address looks like a pointer to a start: what discovery read
+    // as a table is not one (rexglue's scan has no such check).
+    std::map<uint32_t, uint32_t> tables; // start, end
+    for (const auto &[bctr, t] : d.tables) {
+        uint32_t entry = t.kind == JumpTable::Absolute ? 4 : t.kind == JumpTable::HalfwordOffset ? 2 : 1;
+        uint32_t &end = tables[t.table];
+        end = std::max<uint32_t>(end, t.table + std::max<uint32_t>(entry * uint32_t(t.targets.size()), 4));
+    }
+    auto in_table = [&](uint32_t a) {
+        auto it = tables.upper_bound(a);
+        return it != tables.begin() && a < std::prev(it)->second;
+    };
+    // Nor is an address inside the prologue .pdata gives a function, whatever
+    // word happens to hold it: the stwu r1 there looks like a start (rexglue
+    // has no such check). Past the prologue, inside the function, pointers
+    // do find entries: the funclets an exception scope table names.
+    std::map<uint32_t, uint32_t> prologs; // begin, end
+    for (const PdataEntry &p : image.pdata)
+        prologs[p.begin] = std::max(prologs[p.begin], p.begin + std::min(p.prolog * 4, p.length));
+    auto in_prolog = [&](uint32_t a) {
+        auto it = prologs.upper_bound(a);
+        return it != prologs.begin() && a > std::prev(it)->first && a < std::prev(it)->second;
+    };
+
+    std::map<uint32_t, Source> candidates;
+    std::set<uint32_t> rejected;
+    const std::vector<uint32_t> found = scan_pointers(image);
+    for (uint32_t a : found) {
+        if (d.functions.count(a) || in_table(a) || in_prolog(a)) continue;
+        // a branch target inside a function (a jump table's case) is not an entry
+        const Function *owner = holder(d, a);
+        if (owner && owner->blocks.count(a)) continue;
+        candidates[a] = Source::Pointer;
+    }
+    const uint64_t from_scan = candidates.size();
+
+    uint64_t branches = 0;
+    int pass = 0;
+    while (true) {
+        pass++;
+        d = Discoverer(image, candidates).run();
+        if (pass == SCAN_PASSES) break;
+        bool changed = false;
+
+        // A candidate that splits a function leaves the function's own
+        // branches across the split unresolved. The culprit is the candidate
+        // that cut the path: the first after the site going forward, the last
+        // at or before it going backward; when there is none, every candidate
+        // in the span. Collected first, so one pass judges every branch
+        // against the same discovery.
+        std::set<uint32_t> drop;
+        auto drop_span = [&](uint32_t lo, uint32_t hi) {
+            for (auto it = candidates.upper_bound(lo); it != candidates.end() && it->first <= hi; ++it)
+                drop.insert(it->first);
+        };
+        for (const Unresolved &u : d.unresolved) {
+            if (baseline.count({u.site, u.target})) continue;
+            uint32_t lo = std::min({u.site, u.target, u.function}), hi = std::max(u.site, u.target);
+            auto it = candidates.upper_bound(u.site);
+            if (u.target > u.site) {
+                if (it != candidates.end() && it->first <= u.target) {
+                    drop.insert(it->first);
+                    continue;
+                }
+            } else if (it != candidates.begin() && std::prev(it)->first > u.target) {
+                drop.insert(std::prev(it)->first);
+                continue;
+            }
+            drop_span(lo, hi);
+        }
+        for (uint32_t a : drop) {
+            candidates.erase(a);
+            rejected.insert(a);
+            changed = true;
+        }
+
+        // branch targets no function holds: code the discovery left
+        // orphaned, made starts too, under the same pruning
+        for (const Unresolved &u : d.unresolved) {
+            uint32_t t = u.target;
+            if (rejected.count(t) || candidates.count(t) || d.functions.count(t)) continue;
+            if (!is_code_address(image, t) || holder(d, t)) continue;
+            candidates[t] = Source::Branch;
+            branches++;
+            changed = true;
+        }
+        if (!changed) break;
+    }
+
+    uint64_t kept = 0;
+    for (const auto &[a, source] : candidates) kept += source == Source::Pointer;
+    d.counts["pointer scan: code pointers"] = found.size();
+    d.counts["pointer scan: not explained without it"] = from_scan;
+    d.counts["pointer scan: kept"] = kept;
+    d.counts["pointer scan: dropped as splits"] = rejected.size();
+    d.counts["pointer scan: branch targets added"] = branches;
+    d.counts["pointer scan: passes"] = uint64_t(pass);
+    d.counts["unresolved branches without the scan"] = baseline_count;
+    return d;
+}
 
 } // namespace xf::recomp

@@ -155,7 +155,8 @@ add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
-foreach(name aes disc xex lzx snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor)
+foreach(name aes disc xex lzx snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor
+             recomp_discover)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)

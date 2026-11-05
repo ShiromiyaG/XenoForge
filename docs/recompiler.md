@@ -135,12 +135,43 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   by their first words, one entry per register as rexglue does); `.pdata`
   (8-byte entries: begin, then prolog length, length in instructions,
   32-bit and exception flags; with the exception flag, the handler and its
-  scope or FuncInfo table give the funclets); `bl` targets; then pointers:
-  words in data sections and `lis`/`addi` pairs that look like a function's
-  first instruction (`mflr r12`, `stwu r1`, or after `blr`/`bctr`/`b`/0),
-  for engines without RTTI (UE3); last, gaps no function covers.
-  On El Chavo Kart `.pdata` alone gives about 52,400 of the 73,800
-  functions rexglue emits.
+  scope or FuncInfo table give the funclets); the entry point; the data
+  pointer scan's (below); `bl` targets; last, gaps no function covers.
+  On El Chavo Kart `.pdata` alone gives 52,360 of the 73,587 functions.
+- **The data pointer scan** (`scan_pointers`, `DiscoverOptions`; translated
+  from the fork's `codegen/pointer_scan.cpp`, its `[analysis]
+  scan_data_pointers`): every word of the sections that are not code
+  (vtables, callback tables, fields), and every `lis rX`/`addi rY, rX` pair
+  in code, whose value looks like a function's first instruction (`mflr
+  r12`, `stwu r1`, or after `blr`/`bctr`/`b`/0) is a candidate; engines
+  without RTTI (UE3) reach most of their methods only so. A baseline run
+  says which the image explains already (a start, or a branch target inside
+  a function); the rest become starts and discovery runs again. A candidate
+  that splits a function leaves the function's own branches across the
+  split pointing at no start (`Discovery::unresolved`: what the generated
+  code would hand to the interpreter, where rexglue's builders would trap);
+  the culprit is dropped (the first candidate after the branch going
+  forward, the last before it going backward, else every one in the span),
+  and the passes go on until nothing changes; branch targets no function
+  holds are added the same way. Branches unresolved without the scan say
+  nothing about the candidates. Not in rexglue: an address inside a jump
+  table discovery read is no start (the `lis`/`addi` that loads a table's
+  address after its `bctr` looks like one), nor one inside the prologue
+  `.pdata` gives (a `stwu r1` there); the passes rerun the whole discovery
+  (under a second each), so there is no cache of dropped candidates. Inside
+  a `.pdata` function past its prologue pointers do find entries: the
+  funclets an exception scope table names. `xfrecomp --no-pointers` leaves
+  the scan out.
+- **Gaps**: code no function covers gets a function after each end (`blr`,
+  `bctr`, `b`) and after padding, as rexglue splits its gaps; each is
+  walked as soon as it is found, so a run of leaf methods is cut in one
+  pass (rounds of one gap per run left all but the first 8 of El Chavo
+  Kart's longer runs to the interpreter). A `blr` alone right after an end
+  is the compiler's dead return after a tail call, a function only when a
+  `bl`, a pointer or a branch reaches it (an empty virtual method comes back
+  through its vtable); the 8 bytes before a function with exception data
+  are its handler and the handler's data. Coverage counts a sized function
+  that holds a nested start, so the rest of its range is no gap.
 - **Ends**: `.pdata`'s length where there is one; else the blocks reached,
   never past the next known start. A function that runs on into the next one
   ends in a tail call to it (rexglue copies the code instead, and functions
@@ -148,17 +179,61 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
 - **Jump tables**: the four forms the XDK's compiler writes (XenonAnalyse's
   patterns, rexglue's detectJumpTable): `lwzx` of absolute words; `lbzx` of
   byte offsets added to a base, or shifted by an `rlwinm` first; `lhzx` of
-  halfword offsets; bounded by the `cmplwi` or `clrlwi` on the index before.
+  halfword offsets. The bound is the `cmplwi` on any register the index
+  passed through (`clrlwi r9, r11, 27; cmplwi r9, 17`, `mr r31, r4;
+  cmplwi r4, 18`), looked for back from the load, or on a register loaded
+  from the same stack slot in unoptimized code (`lwz r8, 0x70(r1); cmplwi
+  r8, 9; ...; lwz r7, 0x70(r1)`); a `clrlwi` only caps it (a 5-bit mask and
+  `cmplwi 12` is 13 entries, not 32). A compare guessed from elsewhere in the
+  function that the table does not hold code for is dropped for an
+  unbounded read.
 - **Everything else** that is indirect (`bctr`, `bctrl`, `blrl`, a branch
   to an address no function holds) goes through the dispatch table, and an
   address with no generated code runs in the interpreter: a wrong guess
   costs speed, never correctness. `boot` counts those entries, which is how
   discovery is improved, game by game, without traps (rexglue leaves 26
   unresolved branches and 26 unresolved table entries on El Chavo Kart, and
-  needed 633 starts added by hand).
-- **Checked** against rexglue's list for El Chavo Kart (74,112 entries: 294
-  imports, 73,818 bodies) and `.pdata`; the differences are counted and
-  explained.
+  needed 633 starts added by hand; here no direct branch or table case of
+  either game reaches an address without a start).
+- **Checked** against rexglue's lists (`xfrecomp analyze --compare`): El
+  Chavo Kart's project (74,112 entries: 294 imports, 73,818 bodies, 633 of
+  them added by hand) and lists the fork wrote with its own scan for both
+  games (`rexglue init` and `codegen` with `[entrypoint.analysis]
+  scan_data_pointers = true`, outside the repository; Ben 10's fails
+  validation without it). Counts on 2026-11-05:
+
+  | | El Chavo Kart | Ben 10 |
+  |---|---|---|
+  | functions (before the scan and the gap fix) | 73,182 | 22,493 |
+  | functions now | 73,587 | 21,896 |
+  | from the pointer scan (kept / dropped as splits) | 89 / 4 | 183 / 5 |
+  | branch targets added | 6 | 0 |
+  | unresolved branches (without the scan, with it) | 6, 0 | 1, 0 |
+  | jump tables (before, now; none lost) | 566, 595 | 454, 473 |
+  | rexglue's own scan: functions | 74,131 | 22,239 |
+  | in both (before, now) | 72,743, 73,469 | 22,022, 21,888 |
+  | only here (before, now) | 439, 118 | 471, 8 |
+  | only there (before, now) | 1,388, 662 | 217, 351 |
+
+  What is only in rexglue's list now: dead `blr`s nothing reaches (365
+  and 214); the data of jump tables inline after their `bctr` (189 and
+  135), which rexglue's scan takes as starts; code after a `blr` that the
+  function's own branch reaches (105 on El Chavo Kart, `bne` over `li r3;
+  blr`), labels here; a `stwu r1` inside a prologue (1); 2 on each game
+  after a `b` inside a function the scan found, labels here. Only here:
+  leaf methods and adjustor thunks right after another function's `bctr`
+  or `b` that rexglue merges into it (115 and 8), and 3 functions without
+  `.pdata` after a `blr` (El Chavo Kart). Before, El Chavo Kart's project
+  list had 1,369 starts only there: the leaf method runs the gap filler's
+  rounds left uncovered, besides its hand-added labels and table data.
+  In 20 s of `boot` linked with the generated code, El Chavo Kart entered
+  the interpreter 262,094 times at 802 addresses before (those leaf runs:
+  `lwz r11, 0xA8(r3); lwz r10, 0x624(r11); rlwinm r3, ...; blr`, reached
+  through vtables) and Ben 10 10 times at 9 (small functions the same
+  rounds left uncovered); now neither does. El Chavo Kart's first swap comes at 1.0 s instead of 1.5 s, 593
+  swaps in the 20 s instead of 509 (30 a second, its cap), and it gets as
+  far as registering its XAudio client; Ben 10 1,154 instead of 1,043 (60
+  a second).
 
 ## Steps
 

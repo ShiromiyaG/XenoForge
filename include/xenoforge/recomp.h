@@ -63,6 +63,8 @@ enum class Source : uint8_t {
     Helper,  // a register save or restore helper
     Pdata,   // .pdata
     Entry,   // the entry point
+    Pointer, // a code address held as data (a word in a data section, a lis/addi pair)
+    Branch,  // a branch target no function held
     Call,    // a bl target
     Gap,     // code nothing else covered
 };
@@ -87,14 +89,33 @@ struct Function {
     std::set<uint32_t> tail_calls;  // b and bc to other functions
 };
 
+// A direct branch or a jump table's case that leaves its function for an
+// address no function starts at: the generated code dispatches it, and the
+// interpreter runs it.
+struct Unresolved {
+    uint32_t function = 0, site = 0, target = 0;
+};
+
 struct Discovery {
     std::map<uint32_t, Function> functions;
     std::map<uint32_t, JumpTable> tables;  // by bctr address
     std::set<uint32_t> indirect;           // bctr without a table, blrl, branches nowhere known
+    std::vector<Unresolved> unresolved;    // by function, then site
     std::map<std::string, uint64_t> counts; // what was found, by kind
 };
 
-Discovery discover(const Image &image);
+struct DiscoverOptions {
+    // look for starts among the code addresses the image holds as data,
+    // keeping those that do not split a function (recomp_discover.cpp)
+    bool scan_pointers = true;
+};
+
+Discovery discover(const Image &image, const DiscoverOptions &options = {});
+
+// The code addresses the image holds as data: words in sections that are not
+// code, and lis/addi pairs in code, where they look like a function's first
+// instruction. Sorted, without repeats.
+std::vector<uint32_t> scan_pointers(const Image &image);
 
 // A function's C++ (ppc_generated.h's form), named prefix + its address in
 // hex; what it calls is named the same way.

@@ -32,6 +32,8 @@ const char *source_name(Source s) {
     case Source::Helper: return "helper";
     case Source::Pdata: return "pdata";
     case Source::Entry: return "entry";
+    case Source::Pointer: return "pointer";
+    case Source::Branch: return "branch";
     case Source::Call: return "call";
     case Source::Gap: return "gap";
     }

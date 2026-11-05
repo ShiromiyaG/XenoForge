@@ -2,10 +2,13 @@
 //
 //   xfrecomp analyze <game.iso | default.xex> [--xex <path on the disc>]
 //            [--compare <rexglue's *_init.cpp>] [--functions <out.tsv>]
+//            [--tables <out.tsv>] [--unresolved <out.tsv>] [--no-pointers]
 //
 // prints what discovery found by kind; --compare sets the function starts
 // against rexglue's PPCFuncMappings for the same executable; --functions
-// writes every function (address, size, source, name).
+// writes every function (address, size, source, name), --tables the jump
+// tables, --unresolved the branches out of a function to no start (function,
+// branch, target); --no-pointers leaves the data pointer scan out.
 //
 //   xfrecomp tests <assembled tests dir> <out dir> [--files N]
 //
@@ -13,7 +16,7 @@
 // out/ppc_tests_0..N-1.cpp and ppc_tests_table.cpp for ppc_recompiled_test:
 // every test label a function as long as the code up to the next label.
 //
-//   xfrecomp emit <game.iso | default.xex> <out dir> [--xex <path>] [--files N]
+//   xfrecomp emit <game.iso | default.xex> <out dir> [--xex <path>] [--files N] [--no-pointers]
 //
 // writes the game's functions as C++ (functions_0..N-1.cpp, by address),
 // functions.h declaring them all, and table.cpp listing them by address
@@ -40,9 +43,10 @@ namespace {
 
 int usage() {
     std::fprintf(stderr, "usage: xfrecomp analyze <game.iso | default.xex> [--xex <path>] [--compare <init.cpp>] "
-                         "[--functions <out.tsv>]\n"
+                         "[--functions <out.tsv>] [--tables <out.tsv>] [--unresolved <out.tsv>] [--no-pointers]\n"
                          "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n"
-                         "       xfrecomp emit <game.iso | default.xex> <out dir> [--xex <path>] [--files N]\n");
+                         "       xfrecomp emit <game.iso | default.xex> <out dir> [--xex <path>] [--files N] "
+                         "[--no-pointers]\n");
     return 2;
 }
 
@@ -100,7 +104,8 @@ int tests(const std::filesystem::path &dir, const std::filesystem::path &out, in
             uint32_t end = l + 1 < labels.size() ? labels[l + 1] : START + uint32_t(image.bytes.size());
             image.pdata.push_back({labels[l], end - labels[l], 0, false});
         }
-        recomp::Discovery d = recomp::discover(image);
+        // every label is a function already; the tests hold no pointers to scan
+        recomp::Discovery d = recomp::discover(image, {.scan_pointers = false});
         std::string &body = bodies[k % files], &decl = declarations[k % files];
         body += "\n// " + suite + "\n";
         for (const auto &[a, f] : d.functions) {
@@ -131,7 +136,8 @@ int tests(const std::filesystem::path &dir, const std::filesystem::path &out, in
 
 } // namespace
 
-int emit(const std::string &input, const std::string &xex_path, const std::filesystem::path &out, int files) {
+int emit(const std::string &input, const std::string &xex_path, const std::filesystem::path &out, int files,
+         const recomp::DiscoverOptions &options) {
     std::string error;
     Xex xex;
     recomp::Image image;
@@ -139,7 +145,7 @@ int emit(const std::string &input, const std::string &xex_path, const std::files
         std::fprintf(stderr, "%s\n", error.c_str());
         return 1;
     }
-    recomp::Discovery d = recomp::discover(image);
+    recomp::Discovery d = recomp::discover(image, options);
     std::filesystem::create_directories(out);
     const std::string prefix = "xf_";
     // the functions with code, split by instruction count
@@ -187,11 +193,15 @@ int main(int argc, char **argv) {
     if (argc >= 4 && std::string(argv[1]) == "emit") {
         std::string xex_path = "default.xex";
         int files = 64;
-        for (int k = 4; k + 1 < argc; k++) {
-            if (std::string(argv[k]) == "--files") files = std::max(1, std::atoi(argv[k + 1]));
-            if (std::string(argv[k]) == "--xex") xex_path = argv[k + 1];
+        recomp::DiscoverOptions options;
+        for (int k = 4; k < argc; k++) {
+            std::string a = argv[k];
+            if (a == "--files" && k + 1 < argc) files = std::max(1, std::atoi(argv[++k]));
+            else if (a == "--xex" && k + 1 < argc) xex_path = argv[++k];
+            else if (a == "--no-pointers") options.scan_pointers = false;
+            else return usage();
         }
-        return emit(argv[2], xex_path, argv[3], files);
+        return emit(argv[2], xex_path, argv[3], files, options);
     }
     if (argc >= 4 && std::string(argv[1]) == "tests") {
         int files = 16;
@@ -200,13 +210,16 @@ int main(int argc, char **argv) {
         return tests(argv[2], argv[3], files);
     }
     if (argc < 3 || std::string(argv[1]) != "analyze") return usage();
-    std::string input = argv[2], xex_path = "default.xex", compare, functions_out, tables_out;
+    std::string input = argv[2], xex_path = "default.xex", compare, functions_out, tables_out, unresolved_out;
+    recomp::DiscoverOptions options;
     for (int k = 3; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc) xex_path = argv[++k];
         else if (a == "--compare" && k + 1 < argc) compare = argv[++k];
         else if (a == "--functions" && k + 1 < argc) functions_out = argv[++k];
         else if (a == "--tables" && k + 1 < argc) tables_out = argv[++k];
+        else if (a == "--unresolved" && k + 1 < argc) unresolved_out = argv[++k];
+        else if (a == "--no-pointers") options.scan_pointers = false;
         else return usage();
     }
     std::string error;
@@ -221,7 +234,7 @@ int main(int argc, char **argv) {
         if (s.code) std::printf("code          %-10s 0x%08X-0x%08X\n", s.name.c_str(), s.address, s.address + s.size);
     std::printf(".pdata        %zu entries; %zu imported functions\n", image.pdata.size(), image.imports.size());
 
-    recomp::Discovery d = recomp::discover(image);
+    recomp::Discovery d = recomp::discover(image, options);
     for (const auto &[what, n] : d.counts) std::printf("  %-36s %llu\n", what.c_str(), (unsigned long long)n);
     std::map<int, uint64_t> kinds;
     for (const auto &[at, t] : d.tables) kinds[t.kind]++;
@@ -233,6 +246,13 @@ int main(int argc, char **argv) {
         for (const auto &[a, fn] : d.functions)
             f << std::hex << a << '\t' << std::dec << fn.size << '\t' << recomp::source_name(fn.source) << '\t' << fn.name
               << '\n';
+    }
+
+    if (!unresolved_out.empty()) {
+        // function, branch, target
+        std::ofstream f(unresolved_out);
+        for (const recomp::Unresolved &u : d.unresolved)
+            f << std::hex << u.function << '\t' << u.site << '\t' << u.target << '\n';
     }
 
     if (!tables_out.empty()) {

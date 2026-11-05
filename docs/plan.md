@@ -131,11 +131,15 @@ traces, without a recompiled game.
   interpreted and recompiled, and 26,086 of the 28,687 it skips (the rest:
   the console's low-precision estimates and double-denormal operands of
   single-precision forms); discovery (`.pdata`, helpers, calls, gaps, jump
-  tables by following CTR's value backwards: 73,182 functions and 566
-  tables on El Chavo Kart, against rexglue's 74,112 and 638); emission
-  (labels, calls, tail calls, jump table switches, dispatch). Next: the
-  pointer scan and exception funclets in discovery, both games emitted and
-  compiled, the listing and `#line`, yield points.
+  tables by following CTR's value backwards, the data pointer scan after
+  rexglue's fork: 73,587 functions and 595 tables on El Chavo Kart, 21,896
+  and 473 on Ben 10, no direct branch to an address without a start, the
+  differences with rexglue's lists explained in
+  [recompiler.md](recompiler.md)); emission (labels, calls, tail calls, jump
+  table switches, dispatch); both games emitted and compiled, and in 20 s of
+  `boot` neither enters the interpreter (El Chavo Kart did 262,094 times
+  before the scan and the gap fix). Next: exception funclets from the scope
+  tables, the listing and `#line`, yield points.
 - **A3. The interpreter** (in, 2026-11-04): the same ops, the branches its
   own; runs the instruction tests and whatever dispatch finds without
   generated code.
