@@ -14,8 +14,9 @@ in a 4 GB host range, so a guest address is an offset from the base (plus
 allocators ask. The generated code and the interpreter reach memory through
 `ops::host`, which applies that offset. A 32-bit load or store at the
 devices' registers (0x7FC80000 and up) reaches the device that registered
-the range (`Kernel::add_mmio`): the GPU's, 0x7FC80000-0x7FC8FFFF, as Xenia
-maps them (see "The GPU").
+the range (`Kernel::add_mmio`): the GPU's, 0x7FC80000-0x7FC8FFFF, and the
+XMA decoder's, 0x7FEA0000-0x7FEAFFFF, as Xenia maps them (see "The GPU"
+and "Sound").
 
 ## Code: generated, interpreted, imported
 
@@ -194,6 +195,52 @@ memory read where it lies (physical memory instead of the trace's copy,
 `swap` and the gamma ramps from the processor. The same Sink with a trace
 writer behind it records Xenia's .xtr from a live game.
 
+## Sound
+
+The APU as the games' code sees it, headless: enough for their sound to
+start and run with silence (plan, "Next"); the real output and the XMA
+decode are step A6. Translated from Xenia (`audio_system.cc`,
+`pacing_audio_driver.cc`, `xma_decoder.cc`, `xma_context_new.cc`,
+`xboxkrnl_audio.cc`, `xboxkrnl_audio_xma.cc`); where it differs is noted
+at the top of each file.
+
+As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
+`xenoforge/audio.h`):
+
+- **Render driver clients** (XAudioRegisterRenderDriverClient, eight at
+  most): a kernel thread with a host body, "Audio Worker" in the system
+  process, calls each client's guest callback (r3 a word holding its
+  argument, as Xenia passes it) once a frame period, 256 samples at
+  48 kHz, paced on the scheduler's clock, while the client has a free slot
+  of the 64 frames it may have in flight. XAudioSubmitRenderDriverFrame
+  hands the frame (6 channels of 256 big-endian floats, one channel after
+  another) to the client's `audio::Output` as host floats; the default
+  one is Xenia's PacingAudioDriver: the samples are dropped and each frame
+  is played a period after the one before it, freeing its slot. A6 sets a
+  real output (`set_audio_output`). An unregistration waits for a
+  callback in progress.
+- **The XMA decoder**: its registers at 0x7FEA0000 through MMIO (the games
+  reach them with lwbrx and stwbrx: the context array's physical address,
+  a rotating current context, ten kick, lock and clear registers of 32
+  contexts each), and 320 contexts of 64 bytes (XMA_CONTEXT_DATA) in
+  physical memory, where Xenia puts them. A kick wakes a second kernel
+  thread, "XMA Decoder" in the idle process, and the kicking thread waits
+  until it has walked the context as Xenia's default context does:
+  packets, frames (a frame split across packets read whole), subframes
+  handed to the output ring buffer `subframe_decode_count` at a time,
+  loops with their subframe end and skip, the two input buffers swapped,
+  the output full or starved, the context data written back merged with
+  what the game changed meanwhile. Each frame's decode is one call to an
+  `audio::FrameDecoder` (`set_xma_decoder`), silence until A6 puts
+  FFmpeg's there.
+- **The exports**: Xenia's XAudio* (the speaker configuration from the
+  console's settings, full voice category volumes, no volume changes, the
+  ducker off) and all its XMA*; the ducker's getters, which Xenia lacks,
+  return their float in f1, as the games' calls read it.
+- `boot` reports the clients, callbacks and frames (and frames per
+  second), and the XMA contexts created, kicks, frames walked and buffer
+  swaps.
+
 ## Files
 
 As built (`src/kernel/files.h`; vfs.cpp, files.cpp), from Xenia's vfs and
@@ -238,7 +285,7 @@ once here, before the export returns ERROR_IO_PENDING.
 `boot <game.iso> [--frames N] [--interpret]`: loads the game, runs its
 entry point, and prints the kernel calls (counts, unimplemented ones), the
 GPU's packets, draws, resolves, swaps (and swaps per second) and
-interrupts, and where it
+interrupts, the sound's frames and XMA contexts, and where it
 stopped.
 
 ## Order

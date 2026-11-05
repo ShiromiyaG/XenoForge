@@ -130,6 +130,16 @@ void setup_video(Kernel &k);
 void shutdown_video(Kernel &k);
 std::string video_report(Kernel &k);
 
+// The sound family's parts (audio.cpp, xma.cpp; its seams in
+// xenoforge/audio.h). setup_audio, as the kernel starts: the XMA decoder's
+// registers as MMIO and its contexts in physical memory (the threads start
+// with the first call into the audio driver). shutdown_audio, as the kernel
+// ends: those threads stopped and joined. audio_report: what it did (render
+// driver frames, XMA contexts and kicks), for boot.
+void setup_audio(Kernel &k);
+void shutdown_audio(Kernel &k);
+std::string audio_report(Kernel &k);
+
 class Kernel {
 public:
     explicit Kernel(Memory &memory);

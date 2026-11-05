@@ -185,6 +185,8 @@ void print_report(kernel::Kernel &k) {
         std::printf("  %8llu  %s%s\n", (unsigned long long)n, name.c_str(), missing.count(name) ? "  (not implemented)" : "");
     // what the GPU did: packets, draws, resolves, swaps, interrupts
     std::printf("%s", kernel::video_report(k).c_str());
+    // and the APU: render driver frames, XMA contexts
+    std::printf("%s", kernel::audio_report(k).c_str());
     std::fflush(stdout);
 }
 } // namespace

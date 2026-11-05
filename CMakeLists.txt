@@ -194,6 +194,12 @@ target_include_directories(kernel_files_test PRIVATE src/kernel)
 target_link_libraries(kernel_files_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_files COMMAND kernel_files_test)
 set_tests_properties(kernel_files PROPERTIES TIMEOUT 120) # threads: fail, never hang
+# the sound family: render driver clients and XMA contexts on guest threads
+add_executable(kernel_audio_test tests/kernel_audio_test.cpp)
+target_include_directories(kernel_audio_test PRIVATE src/kernel)
+target_link_libraries(kernel_audio_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME kernel_audio COMMAND kernel_audio_test)
+set_tests_properties(kernel_audio PROPERTIES TIMEOUT 120) # threads: fail, never hang
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)

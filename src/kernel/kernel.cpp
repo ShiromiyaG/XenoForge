@@ -105,10 +105,14 @@ Kernel::Kernel(Memory &memory) : memory_(memory) {
     objects_ = std::make_unique<Objects>(*this);
     // the devices, before any guest thread runs
     setup_video(*this);
+    setup_audio(*this);
 }
 
 // the devices' threads end while the objects they run on are still here
-Kernel::~Kernel() { shutdown_video(*this); }
+Kernel::~Kernel() {
+    shutdown_audio(*this);
+    shutdown_video(*this);
+}
 
 uint32_t Kernel::load32(uint32_t a) { return be32(host(a)); }
 uint16_t Kernel::load16(uint32_t a) { return be16(host(a)); }
