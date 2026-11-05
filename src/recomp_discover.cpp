@@ -101,7 +101,8 @@ public:
         return reg_expr(reg, pc);
     }
 
-    // an index register, through slwi, clrlwi and mr; anything else ends it
+    // an index register, through slwi and clrlwi; anything else (a move
+    // too: the bound is on the register the table is read with) ends it
     // (as a register used at `pc`)
     const Expr *index(uint32_t reg, uint32_t pc, uint32_t depth = 0) {
         uint32_t steps = 0;
@@ -117,7 +118,6 @@ public:
                 if (mb == 0 && me == 31 - sh) return make({Expr::Shl, int64_t(sh), index(i.M.RT, at, depth + 1)});
                 if (sh == 0 && me == 31) return make({Expr::Mask, int64_t(0xFFFFFFFFull >> mb), index(i.M.RT, at, depth + 1)});
             }
-            if (op == Opcode::orx && w && *w == reg && i.X.RT == i.X.RB) return index(i.X.RT, at, depth + 1);
             break;
         }
         return reg_expr(reg, pc);
@@ -424,6 +424,7 @@ private:
         if (!index) return false;
         t.index = uint32_t(index->value);
         if (!count) count = bound(function, index->at, t.index);
+        if (!count) count = bound_anywhere(function, bctr, end, t.index);
         uint32_t entry = 1u << scale;
         for (uint32_t k = 0; k < (count ? count : TABLE_MAX); k++) {
             uint32_t at = t.table + k * entry;
@@ -446,7 +447,25 @@ private:
         return true;
     }
 
-    // cmplwi crN, rI, n (n + 1 entries) before where the index was defined
+    // Where the table is reached by a branch from elsewhere in the function,
+    // the bound is on that path: a cmplwi crN, rI, n followed by bgt or
+    // ble crN anywhere in the function, the nearest to the bctr.
+    uint32_t bound_anywhere(uint32_t function, uint32_t bctr, uint32_t end, uint32_t reg) {
+        uint32_t best = 0, best_distance = UINT32_MAX;
+        for (uint32_t at = function; at + 8 <= end && at < bctr + 0x1000; at += 4) {
+            Instr i{image_.word(at)};
+            if (ppc::decode(i.code) != Opcode::cmpli || i.D.RA != reg) continue;
+            uint32_t cr = i.D.RT >> 2;
+            Instr b{image_.word(at + 4)};
+            // bgt crN (BO 12: branch if true) out of the table, or ble crN
+            // (BO 4: if false) into it; BI = 4 * crN + 1
+            if (ppc::decode(b.code) != Opcode::bcx || (b.B.BO != 12 && b.B.BO != 4) || b.B.BI != 4 * cr + 1) continue;
+            uint32_t distance = at < bctr ? bctr - at : at - bctr;
+            if (distance < best_distance) best = std::min<uint32_t>(i.D.DS + 1, TABLE_MAX), best_distance = distance;
+        }
+        return best;
+    }
+
     // cmplwi crN, rI, n (n + 1 entries) between where the index is used and
     // where it was made
     uint32_t bound(uint32_t function, uint32_t from, uint32_t reg) {

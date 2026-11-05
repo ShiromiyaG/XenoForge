@@ -132,12 +132,13 @@ int main(int argc, char **argv) {
         return tests(argv[2], argv[3], files);
     }
     if (argc < 3 || std::string(argv[1]) != "analyze") return usage();
-    std::string input = argv[2], xex_path = "default.xex", compare, functions_out;
+    std::string input = argv[2], xex_path = "default.xex", compare, functions_out, tables_out;
     for (int k = 3; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc) xex_path = argv[++k];
         else if (a == "--compare" && k + 1 < argc) compare = argv[++k];
         else if (a == "--functions" && k + 1 < argc) functions_out = argv[++k];
+        else if (a == "--tables" && k + 1 < argc) tables_out = argv[++k];
         else return usage();
     }
     std::string error;
@@ -164,6 +165,16 @@ int main(int argc, char **argv) {
         for (const auto &[a, fn] : d.functions)
             f << std::hex << a << '\t' << std::dec << fn.size << '\t' << recomp::source_name(fn.source) << '\t' << fn.name
               << '\n';
+    }
+
+    if (!tables_out.empty()) {
+        // bctr, kind, table, index register, targets
+        std::ofstream f(tables_out);
+        for (const auto &[at, t] : d.tables) {
+            f << std::hex << at << '\t' << int(t.kind) << '\t' << t.table << '\t' << std::dec << t.index;
+            for (uint32_t target : t.targets) f << '\t' << std::hex << target;
+            f << '\n';
+        }
     }
 
     if (!compare.empty()) {
