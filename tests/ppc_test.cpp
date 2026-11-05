@@ -177,9 +177,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     std::vector<std::string> filters;
-    bool verbose = false;
+    bool verbose = false, all = false;
     for (int k = 1; k < argc; k++) {
         if (std::string(argv[k]) == "-v") verbose = true;
+        else if (std::string(argv[k]) == "--all") all = true; // Xenia's skipped cases too
         else filters.push_back(argv[k]);
     }
     std::set<std::string> skip;
@@ -225,7 +226,7 @@ int main(int argc, char **argv) {
         std::vector<uint8_t> code((std::istreambuf_iterator<char>(b)), std::istreambuf_iterator<char>());
         uint64_t suite_failed = 0, suite_missing = 0;
         for (TestCase &t : cases) {
-            if (skip.count(t.name)) {
+            if (!all && skip.count(t.name)) {
                 totals.skipped++;
                 continue;
             }

@@ -99,6 +99,20 @@ added to its base; loads and stores swap bytes.
   (checked on 2M random vectors per type), but for FLOAT16 -0 and denormals,
   where Xenia's fast path looks wrong. All of it assumes the host rounds to
   nearest.
+- Floating point: FPSCR[RN] and NI are honored; the common case (round to
+  nearest, no Rc, an ordinary result) costs one compare, the rest goes to a
+  cold path that sets the host's rounding (`<cfenv>`) and puts it back. The
+  host must stay at its default environment (round to nearest, no FTZ or
+  DAZ), and the generated code must not be built with `-ffast-math` or
+  `-ffp-contract=fast`; with `-mfma` (x86-64-v3) `std::fma` is one
+  instruction instead of a call. Rc forms keep FPSCR's exception and status
+  bits and copy them to CR1; compares set FPCC. The console wins over Xenia:
+  the default NaN 0x7FF8000000000000, NaNs in A, B, C order, quieted, not
+  negated by `fnm*`; fused single forms round once; `fctiw` of a NaN gives
+  0xFFFFFFFF80000000; `frsqrte` uses the console's table. Xenia's `mtfsf`
+  mask order, `mtfsfi`'s U field and `mcrfs` are fixed; `mtfsb0`/`mtfsb1`
+  are done. Left: double-denormal operands of single forms (the console
+  gives a NaN), `fres`'s 8-bit estimate.
 - For step A4: Xenia adds 0x1000 to addresses at 0xE0000000 and above (the
   4 KB offset of that physical view); `ops::host` is the one place to do it.
 

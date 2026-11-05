@@ -122,14 +122,23 @@ traces, without a recompiled game.
 - **A1. Disc and executable** (done 2026-11-04). `xfinspect` reads both
   games' ISOs in place; El Chavo Kart's image is byte for byte the one its
   Python script made; the imports measured ([lean-kernel.md](lean-kernel.md)).
-- **A2. The recompiler.** Instruction decoding translated from Xenia
-  (`cpu/ppc/ppc_opcode_*`, `ppc_decode_data.h`); discovery (functions,
-  jump tables, the data pointers rexglue's fork learned to scan); emission
-  with the listing, yield points and dispatch table. Checked by Xenia's 571
-  instruction tests (`cpu/ppc/testing`, assembled with the VMX128 binutils
-  in `../rexglue-sdk/tools/binutils`), and by recompiling both games.
-- **A3. The interpreter**, from the same instruction descriptions; the same
-  tests pass recompiled and interpreted.
+- **A2. The recompiler** (under way, 2026-11-04; [recompiler.md](recompiler.md)).
+  Done: the decoder and disassembler, from Xenia's instruction table,
+  identical to Xenia's on every word of both games' code and 2M random
+  words; every instruction's semantics once (`ppc_ops.h`), for the
+  generated code and the interpreter alike; of Xenia's 170,383 instruction
+  test cases (many generated on the console), all 141,696 Xenia runs pass,
+  interpreted and recompiled, and 26,086 of the 28,687 it skips (the rest:
+  the console's low-precision estimates and double-denormal operands of
+  single-precision forms); discovery (`.pdata`, helpers, calls, gaps, jump
+  tables by following CTR's value backwards: 73,182 functions and 566
+  tables on El Chavo Kart, against rexglue's 74,112 and 638); emission
+  (labels, calls, tail calls, jump table switches, dispatch). Next: the
+  pointer scan and exception funclets in discovery, both games emitted and
+  compiled, the listing and `#line`, yield points.
+- **A3. The interpreter** (in, 2026-11-04): the same ops, the branches its
+  own; runs the instruction tests and whatever dispatch finds without
+  generated code.
 - **A4. Memory, loader, kernel, `boot`.** Both games run without a picture
   (the GPU counts packets and draws) to their title loop; every kernel call
   counted; the counts set against the imports.
