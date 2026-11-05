@@ -35,6 +35,7 @@ add_library(xenoforge STATIC
     src/spirv.cpp
     src/shader_translator.cpp
     src/shader_interpreter.cpp
+    src/shader_container.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
@@ -59,6 +60,8 @@ add_executable(xftrace tools/xftrace.cpp)
 target_link_libraries(xftrace PRIVATE xenoforge)
 add_executable(xfshader tools/xfshader.cpp)
 target_link_libraries(xfshader PRIVATE xenoforge)
+add_executable(xfeffect tools/xfeffect.cpp)
+target_link_libraries(xfeffect PRIVATE xenoforge)
 
 enable_testing()
 foreach(name aes disc xex snappy ucode ucode_parse trace shader_interpreter)
