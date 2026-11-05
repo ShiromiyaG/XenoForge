@@ -141,7 +141,15 @@ traces, without a recompiled game.
   generated code.
 - **A4. Memory, loader, kernel, `boot`.** Both games run without a picture
   (the GPU counts packets and draws) to their title loop; every kernel call
-  counted; the counts set against the imports.
+  counted; the counts set against the imports. Under way (2026-11-05,
+  [runtime.md](runtime.md)): the memory, modules, Rtl, threads and sync,
+  video (the GPU's live front end, headless), files and xam, and crypto
+  families are in; MMIO reaches the devices. Both games run their frame loop
+  interpreted (El Chavo Kart about 17 swaps a second, Ben 10 about 40) and
+  stop next at sound (XAudio*, the XMA registers at 0x7FEA0000). Of the
+  other six games, Forza Horizon, Reach and BC2 need XexLoadImage of a
+  second executable; Red Dead Redemption needs XMA; the rest stop on an
+  invalid instruction or a fault still to be looked at.
 - **A5. The deterministic mode**, input recording and replay.
 - **A6. Sound** (XMA: Xenia decodes it with FFmpeg's XMA decoder from its own
   fork; LGPL, linked dynamically), input, saves.
@@ -197,7 +205,10 @@ traces, without a recompiled game.
 - **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work
   (`../Chaves/docs/native-renderer-re.md`) moved over as El Chavo Kart's port.
 
-Next: A2 and B1, side by side.
+Next (2026-11-05): sound enough to boot (XAudio's render driver, XMA
+contexts), XexLoadImage of a second executable, boot with the generated code
+linked, then the renderer as the command processor's Sink in the player (C1)
+for M1.
 
 ## Decisions
 
