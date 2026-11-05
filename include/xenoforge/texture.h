@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace xf::texture {
@@ -96,6 +97,9 @@ struct Image {
     // gives no base level (only mips). The packed 16-bit formats keep the
     // guest's bit order: the first component in the low bits.
     std::vector<std::vector<uint8_t>> levels;
+    // the guest memory read for them, (physical address, bytes) per slice or
+    // layer of each level: what a cache of the image watches for changes
+    std::vector<std::pair<uint32_t, uint32_t>> footprint;
 };
 
 // False with the reason when the format or layout is not done.

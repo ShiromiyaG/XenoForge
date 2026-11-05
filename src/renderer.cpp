@@ -1,13 +1,26 @@
-// The Xenos renderer, first form (renderer.h). The packets follow Xenia's
-// src/xenia/gpu/pm4_command_processor_implement.h, the viewport and scissor
-// draw_util.cc (GetHostViewportInfo, GetScissor), the register fields
-// registers.h, the clear values vulkan/vulkan_render_target_cache.cc, and the
-// swap vulkan/vulkan_texture_cache.cc (RequestSwapTexture); all BSD, see
-// LICENSE-xenia. Written anew, plainly: one submission per draw, waited for.
+// The Xenos renderer, first form (renderer.h), the command processor's Sink.
+// The viewport and scissor follow Xenia's src/xenia/gpu/draw_util.cc
+// (GetHostViewportInfo, GetScissor), the register fields registers.h, the
+// clear values vulkan/vulkan_render_target_cache.cc, the vertex data a draw
+// needs vulkan/vulkan_command_processor.cc (IssueDraw's shared memory
+// requests), and the swap vulkan/vulkan_texture_cache.cc
+// (RequestSwapTexture); all BSD, see LICENSE-xenia. Written anew, plainly:
+// one submission per draw, waited for.
+//
+// Guest memory is read where it lies, with nothing told when the CPU writes
+// it, so what is copied from it is checked or copied again at each use:
+// - the vertex data: the ranges the shaders' vertex fetch constants give,
+//   copied to the GPU's copy of guest memory before each draw (Xenia
+//   requests the same ranges and uploads the pages its write watches saw
+//   change);
+// - textures: kept with a hash of the memory they were decoded from, and
+//   decoded again when it differs at a use (Xenia drops them when a write
+//   watch on their pages fires); the processor's own writes
+//   (memory_written) mark the textures under them at once;
+// - indices: read at each draw.
 
 #include "xenoforge/renderer.h"
 
-#include "xenoforge/bytes.h"
 #include "xenoforge/guest_memory.h"
 #include "xenoforge/resolve.h"
 #include "xenoforge/shader_harness.h"
@@ -19,11 +32,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 
@@ -92,14 +108,35 @@ uint64_t hash_words(uint32_t seed, std::span<const uint32_t> words) {
     return h;
 }
 
-// the guest's swap modes on a 32-bit value (xenos::GpuSwap)
-uint32_t gpu_swap(uint32_t v, uint32_t endian) {
-    switch (endian & 3) {
-    case 1: return ((v & 0x00FF00FF) << 8) | ((v >> 8) & 0x00FF00FF); // 8 in 16
-    case 2: return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24); // 8 in 32
-    case 3: return (v >> 16) | (v << 16); // 16 in 32
-    default: return v;
+// A hash of bytes, fast enough to run over a texture's memory at each use:
+// four lanes, each word xored in, rotated and multiplied (a bijection of the
+// lane for a given word, so one changed word always changes its lane), then
+// the lanes and the tail mixed.
+uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t seed) {
+    constexpr uint64_t K1 = 0x9E3779B97F4A7C15ull, K2 = 0xC2B2AE3D27D4EB4Full;
+    uint64_t lanes[4] = {seed ^ K1, seed + K2, seed * K1 + 1, ~seed};
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+        for (int l = 0; l < 4; l++) {
+            uint64_t w;
+            std::memcpy(&w, p + i + 8 * l, 8);
+            lanes[l] = std::rotl(lanes[l] ^ w, 31) * K1;
+        }
+    uint64_t out = n;
+    for (; i < n; i++) out = (out ^ p[i]) * K2;
+    for (uint64_t l : lanes) out = std::rotl(out ^ (l * K2), 27) * K1;
+    return out ^ (out >> 29);
+}
+
+// the hash of guest memory spans, each wrapping at the end of physical memory
+uint64_t hash_spans(const GuestMemory &memory, std::span<const std::pair<uint32_t, uint32_t>> spans) {
+    uint64_t h = 0;
+    for (auto [address, bytes] : spans) {
+        uint32_t at = address & GuestMemory::PHYSICAL_MASK, first = std::min(bytes, GuestMemory::SIZE - at);
+        h = hash_bytes(memory.data() + at, first, h);
+        if (bytes > first) h = hash_bytes(memory.data(), bytes - first, h);
     }
+    return h;
 }
 
 float half_to_float(uint16_t h) {
@@ -253,11 +290,12 @@ struct EdramTarget {
 
 struct Texture {
     vk::Image image;
-    VkImageView view = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE; // its own: made and destroyed with it
     uint32_t dimension = 1;
-    uint64_t decoded_at = 0;          // the memory's version
-    uint32_t first_chunk = 0, last_chunk = 0; // the chunks it may read
-    uint32_t first_mip_chunk = 0, last_mip_chunk = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> footprint; // the guest memory it was decoded from
+    uint64_t hash = 0;                                    // of that memory then
+    uint32_t low = 0, high = 0;                           // the footprint's bounds
+    bool stale = false;                                   // the processor wrote memory under it
 };
 
 struct System {
@@ -270,27 +308,46 @@ struct System {
 };
 static_assert(sizeof(System) == 208);
 
-class Renderer final : public TraceVisitor {
+class Impl final : public Renderer {
 public:
-    Renderer(vk::Device &device, const Options &options, Report &report)
-        : d_(device), dev_(device.device()), options_(options), report_(report), regs_(REGISTER_COUNT) {}
-    ~Renderer() override;
+    Impl(vk::Device &device, gpu::CommandProcessor &processor, const Options &options)
+        : d_(device), dev_(device.device()), processor_(processor), options_(options),
+          memory_(processor.memory().translate_physical(0)) {}
+    ~Impl() override;
 
     bool init(std::string &error);
-    bool failed(std::string &error) const {
-        if (fatal_.empty()) return false;
-        error = fatal_;
-        return true;
-    }
-    Image &frame() { return frame_; }
 
-    void registers(uint32_t first, std::span<const uint32_t> values) override {
-        for (size_t i = 0; i < values.size() && first + i < regs_.size(); i++) regs_[first + i] = values[i];
+    // ---- the Sink: the processor's calls, on its thread ----
+    void shader(uint32_t type, uint32_t, std::span<const uint32_t> code) override {
+        Call call(*this, nullptr);
+        if (call) load_shader(type, code);
     }
-    void memory_read(uint32_t address, std::span<const uint8_t> bytes) override { memory_.write(address, bytes); }
-    // EDRAM as the trace began, in Xenia's layout (edram.glsl's)
-    void edram_snapshot(std::span<const uint8_t> bytes) override {
-        if (bytes.size() != EDRAM_BYTES || !fatal_.empty()) return;
+    void draw(const gpu::RegisterFile &registers, const gpu::Draw &d) override {
+        Call call(*this, &registers);
+        if (call) draw(d);
+    }
+    void resolve(const gpu::RegisterFile &registers, const gpu::Draw &) override {
+        Call call(*this, &registers);
+        Timer timer(report_.resolve_seconds);
+        if (call) resolve();
+    }
+    void swap(const gpu::RegisterFile &registers, const gpu::Swap &) override {
+        Call call(*this, &registers);
+        if (call) swap();
+    }
+    // the processor's own writes (fences, reports), and a trace's memory:
+    // the textures over them are decoded again at their next use
+    void memory_written(uint32_t address, uint32_t bytes) override {
+        Call call(*this, nullptr);
+        uint64_t end = uint64_t(address) + bytes;
+        for (auto &[key, t] : textures_)
+            if (address < t->high && end > t->low) t->stale = true;
+    }
+
+    // EDRAM as a trace began, in Xenia's layout (edram.glsl's)
+    void restore_edram(std::span<const uint8_t> bytes) override {
+        Call call(*this, nullptr);
+        if (bytes.size() != EDRAM_BYTES || !call) return;
         std::fill(owners_.begin(), owners_.end(), nullptr);
         std::memcpy(staging_.mapped, bytes.data(), bytes.size());
         run([&](VkCommandBuffer cmd) {
@@ -299,34 +356,58 @@ public:
             vkCmdCopyBuffer(cmd, staging_.buffer, edram_.buffer, 1, &copy);
         });
     }
-    // what the GPU wrote, recorded: Xenia's player skips it, the replay makes its own
-    void memory_write(uint32_t, std::span<const uint8_t>) override {}
-    void gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t>) override {
-        std::copy(table.begin(), table.end(), gamma_table_.begin());
-        have_gamma_ = true;
+    Report report() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return report_;
     }
-    void packet(uint32_t, std::span<const uint8_t> words) override {
-        if (words.size() < 4 || !fatal_.empty()) return;
-        p_.resize(words.size() / 4);
-        for (size_t i = 0; i < p_.size(); i++) p_[i] = be32(words.data() + 4 * i);
-        report_.packets++;
-        execute();
+    bool try_report(Report &out) const override {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (!lock) return false;
+        out = report_;
+        return true;
+    }
+    bool failed(std::string &error) const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (fatal_.empty()) return false;
+        error = fatal_;
+        return true;
     }
 
 private:
-    // the PM4 front end
-    void write(uint32_t index, uint32_t value) {
-        if (index < regs_.size()) regs_[index] = value;
-    }
-    uint32_t arg(size_t i) const { return i < p_.size() ? p_[i] : 0; }
-    void execute();
-    void type3(uint32_t header);
+    // adds the time from its making to its end to a count of seconds
+    class Timer {
+    public:
+        explicit Timer(double &into) : into_(into), start_(std::chrono::steady_clock::now()) {}
+        ~Timer() { into_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count(); }
+
+    private:
+        double &into_;
+        std::chrono::steady_clock::time_point start_;
+    };
+
+    // One of the processor's calls: the renderer's state is its alone while
+    // it runs (report() waits), the registers are the processor's as they
+    // stand, and its time is counted. False once the device has failed.
+    class Call {
+    public:
+        Call(Impl &r, const gpu::RegisterFile *registers) : r_(r), lock_(r.mutex_), timer_(r.report_.seconds) {
+            if (registers) r.regs_ = registers->data();
+        }
+        explicit operator bool() const { return r_.fatal_.empty(); }
+
+    private:
+        Impl &r_;
+        std::lock_guard<std::mutex> lock_;
+        Timer timer_;
+    };
+
     void load_shader(uint32_t type, std::span<const uint32_t> code);
 
     // draws
-    void draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size);
+    void draw(const gpu::Draw &d);
     void resolve();
     void swap();
+    bool front_buffer(Image &frame);
     void skip(const std::string &reason) {
         report_.skipped[reason]++;
         if (options_.verbose) std::fprintf(stderr, "  draw %llu skipped: %s\n", (unsigned long long)report_.draws, reason.c_str());
@@ -339,14 +420,18 @@ private:
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
     VkFormat depth_vk_format(uint32_t format) const;
     Texture *texture(const uint32_t fetch[6], std::string &why);
+    void destroy(Texture &t);
     VkSampler sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides);
     VkPipeline pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info);
-    bool upload_memory(VkCommandBuffer cmd);
-    bool flush_memory();
+    std::vector<std::pair<uint32_t, uint32_t>> vertex_ranges(const Shader *vs, const Shader *ps);
+    VkDeviceSize stage(const std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::vector<VkBufferCopy> &copies);
+    bool upload_vertices(const std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::vector<VkBufferCopy> &copies);
     VkImageView make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
-                          VkComponentMapping components = {}, uint32_t levels = 1, uint32_t layers = 1);
+                          VkComponentMapping components = {}, uint32_t levels = 1, uint32_t layers = 1,
+                          bool keep = true);
     bool run(const std::function<void(VkCommandBuffer)> &record) {
         std::string error;
+        Timer timer(report_.submit_seconds);
         if (d_.run(record, error)) return true;
         fatal_ = error;
         return false;
@@ -364,18 +449,16 @@ private:
 
     vk::Device &d_;
     VkDevice dev_;
-    const Options &options_;
-    Report &report_;
+    gpu::CommandProcessor &processor_;
+    Options options_;
+    mutable std::mutex mutex_; // held through each of the processor's calls
+    Report report_;
     std::string fatal_;
-    std::vector<uint32_t> regs_;
-    GuestMemory memory_;
-    std::vector<uint32_t> p_;
-    uint64_t bin_mask_ = ~0ull, bin_select_ = ~0ull;
+    const uint32_t *regs_ = nullptr; // the processor's register file, during a call
+    GuestMemory memory_;             // the processor's physical memory
     uint64_t vertex_hash_ = 0, pixel_hash_ = 0;
     bool have_vertex_ = false, have_pixel_ = false;
-    Image frame_;
-    std::array<uint32_t, 256> gamma_table_{};
-    bool have_gamma_ = false;
+    float max_viewport_[2] = {};
 
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
     std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<RenderTarget>> targets_;
@@ -383,8 +466,7 @@ private:
     std::map<std::array<uint32_t, 8>, VkSampler> samplers_;
     std::map<std::vector<uint32_t>, VkPipeline> pipelines_;
 
-    vk::Buffer guest_, staging_, constants_[2], system_, indices_;
-    uint64_t uploaded_version_ = 0;
+    vk::Buffer guest_, staging_, constants_[2], system_, indices_, readback_;
     VkDescriptorSetLayout set_layouts_[2] = {};
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
@@ -392,11 +474,11 @@ private:
     vk::Image dummy_[3]; // 2D, 3D, cube
     VkImageView dummy_views_[3] = {};
     VkSampler dummy_sampler_ = VK_NULL_HANDLE;
-    std::vector<VkImageView> views_; // all made, destroyed at the end
+    std::vector<VkImageView> views_; // all made but the textures', destroyed at the end
 
     // EDRAM: the render targets' contents move through it when another
     // target takes over its tiles (Xenia's ownership transfers); it starts
-    // as the trace's snapshot
+    // as zeros, or as a trace's snapshot
     void acquire(RenderTarget *t, uint32_t rows);
     bool edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles);
     bool edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows);
@@ -415,7 +497,7 @@ private:
     VkFormat d24s8_ = VK_FORMAT_D24_UNORM_S8_UINT;
 };
 
-Renderer::~Renderer() {
+Impl::~Impl() {
     vkDeviceWaitIdle(dev_);
     for (auto &[k, s] : shaders_)
         if (s->module) vkDestroyShaderModule(dev_, s->module, nullptr);
@@ -423,7 +505,7 @@ Renderer::~Renderer() {
     for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s, nullptr);
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
     for (auto &[k, t] : targets_) d_.destroy(t->image);
-    for (auto &[k, t] : textures_) d_.destroy(t->image);
+    for (auto &[k, t] : textures_) destroy(*t);
     for (auto &im : dummy_) d_.destroy(im);
     if (dummy_sampler_) vkDestroySampler(dev_, dummy_sampler_, nullptr);
     if (rectangle_gs_) vkDestroyShaderModule(dev_, rectangle_gs_, nullptr);
@@ -443,11 +525,13 @@ Renderer::~Renderer() {
     if (layout_) vkDestroyPipelineLayout(dev_, layout_, nullptr);
     for (VkDescriptorSetLayout l : set_layouts_)
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
-    for (vk::Buffer *b : {&guest_, &staging_, &constants_[0], &constants_[1], &system_, &indices_}) d_.destroy(*b);
+    for (vk::Buffer *b : {&guest_, &staging_, &constants_[0], &constants_[1], &system_, &indices_, &readback_})
+        d_.destroy(*b);
 }
 
-VkImageView Renderer::make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
-                                VkComponentMapping components, uint32_t levels, uint32_t layers) {
+// keep: destroyed with the renderer, else by the caller
+VkImageView Impl::make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
+                            VkComponentMapping components, uint32_t levels, uint32_t layers, bool keep) {
     VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     info.image = image;
     info.viewType = type;
@@ -456,11 +540,15 @@ VkImageView Renderer::make_view(VkImage image, VkImageViewType type, VkFormat fo
     info.subresourceRange = {aspect, 0, levels, 0, layers};
     VkImageView view = VK_NULL_HANDLE;
     if (vkCreateImageView(dev_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
-    views_.push_back(view);
+    if (keep) views_.push_back(view);
     return view;
 }
 
-bool Renderer::init(std::string &error) {
+bool Impl::init(std::string &error) {
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(d_.physical(), &props);
+    max_viewport_[0] = float(props.limits.maxViewportDimensions[0]);
+    max_viewport_[1] = float(props.limits.maxViewportDimensions[1]);
     guest_ = d_.create_buffer(GUEST_MEMORY, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
     staging_ = d_.create_buffer(STAGING, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
     for (auto &c : constants_) c = d_.create_buffer(sizeof(harness::Constants), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
@@ -623,85 +711,9 @@ bool Renderer::init(std::string &error) {
     }) || (error = fatal_, false);
 }
 
-// ---- the PM4 front end ----
+// ---- shaders: what IM_LOAD and IM_LOAD_IMMEDIATE load, kept by hash ----
 
-void Renderer::execute() {
-    uint32_t h = p_[0];
-    if (h == 0 || h == 0x0BADF00D) return;
-    uint32_t type = h >> 30;
-    if (type == 0) {
-        uint32_t count = ((h >> 16) & 0x3FFF) + 1, base = h & 0x7FFF;
-        bool one = (h >> 15) & 1;
-        for (uint32_t i = 0; i < count && 1 + i < p_.size(); i++) write(one ? base : base + i, p_[1 + i]);
-    } else if (type == 1) {
-        write(h & 0x7FF, arg(1));
-        write((h >> 11) & 0x7FF, arg(2));
-    } else if (type == 3) {
-        type3(h);
-    }
-}
-
-void Renderer::type3(uint32_t h) {
-    uint32_t opcode = (h >> 8) & 0x7F, count = ((h >> 16) & 0x3FFF) + 1;
-    // predicated (bit 0): run only for the selected bins (predicated tiling);
-    // a predicated swap never runs
-    if ((h & 1) && (!(bin_select_ & bin_mask_) || opcode == pm4::XE_SWAP)) return;
-    static const uint32_t bases[] = {reg::ALU_CONSTANTS, reg::FETCH_CONSTANTS, reg::BOOL_CONSTANTS, reg::LOOP_CONSTANTS,
-                                     0x2000};
-    switch (opcode) {
-    case pm4::SET_CONSTANT: {
-        uint32_t kind = (arg(1) >> 16) & 0xFF, index = arg(1) & 0x7FF;
-        if (kind > 4) break;
-        for (uint32_t i = 0; i + 1 < count && 2 + i < p_.size(); i++) write(bases[kind] + index + i, p_[2 + i]);
-        break;
-    }
-    case pm4::SET_CONSTANT2:
-    case pm4::SET_SHADER_CONSTANTS: {
-        uint32_t index = arg(1) & 0xFFFF;
-        for (uint32_t i = 0; i + 1 < count && 2 + i < p_.size(); i++) write(index + i, p_[2 + i]);
-        break;
-    }
-    case pm4::LOAD_ALU_CONSTANT: {
-        uint32_t address = arg(1) & 0x3FFFFFFF, kind = (arg(2) >> 16) & 0xFF, index = arg(2) & 0x7FF;
-        uint32_t size = arg(3) & 0xFFF;
-        if (kind > 4) break;
-        for (uint32_t i = 0; i < size; i++) write(bases[kind] + index + i, memory_.be32(address + 4 * i));
-        break;
-    }
-    case pm4::REG_RMW: {
-        uint32_t info = arg(1), and_mask = arg(2), or_mask = arg(3), index = info & 0x1FFF;
-        uint32_t value = regs_[index];
-        value &= (info >> 31) & 1 ? regs_[and_mask & 0x1FFF] : and_mask;
-        value |= (info >> 30) & 1 ? regs_[or_mask & 0x1FFF] : or_mask;
-        write(index, value);
-        break;
-    }
-    case pm4::IM_LOAD: {
-        uint32_t shader_type = arg(1) & 3, address = arg(1) & ~3u, size = arg(2) & 0xFFFF;
-        std::vector<uint32_t> code(size);
-        for (uint32_t i = 0; i < size; i++) code[i] = memory_.be32(address + 4 * i);
-        load_shader(shader_type, code);
-        break;
-    }
-    case pm4::IM_LOAD_IMMEDIATE: {
-        uint32_t shader_type = arg(1), size = arg(2) & 0xFFFF;
-        if (3 + size > p_.size()) break;
-        load_shader(shader_type, {p_.data() + 3, size});
-        break;
-    }
-    case pm4::DRAW_INDX: draw(arg(2), arg(3), arg(4)); break; // after the viz query token
-    case pm4::DRAW_INDX_2: draw(arg(1), 0, 0); break;
-    case pm4::XE_SWAP: swap(); break;
-    case 0x50: bin_mask_ = uint64_t(arg(1)) << 32 | arg(2); break;   // SET_BIN_MASK
-    case 0x51: bin_select_ = uint64_t(arg(1)) << 32 | arg(2); break; // SET_BIN_SELECT
-    case 0x60: bin_mask_ = (bin_mask_ & ~0xFFFFFFFFull) | arg(1); break;
-    case 0x61: bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) | uint64_t(arg(1)) << 32; break;
-    case 0x62: bin_select_ = (bin_select_ & ~0xFFFFFFFFull) | arg(1); break;
-    case 0x63: bin_select_ = (bin_select_ & 0xFFFFFFFFull) | uint64_t(arg(1)) << 32; break;
-    }
-}
-
-void Renderer::load_shader(uint32_t type, std::span<const uint32_t> code) {
+void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
     if (type > 1) return;
     uint64_t hash = hash_words(type, code);
     auto &s = shaders_[hash];
@@ -715,12 +727,12 @@ void Renderer::load_shader(uint32_t type, std::span<const uint32_t> code) {
     (type == 0 ? have_vertex_ : have_pixel_) = true;
 }
 
-Shader *Renderer::shader(uint64_t hash) {
+Shader *Impl::shader(uint64_t hash) {
     auto it = shaders_.find(hash);
     return it == shaders_.end() ? nullptr : it->second.get();
 }
 
-bool Renderer::translate(Shader &s, std::string &why) {
+bool Impl::translate(Shader &s, std::string &why) {
     if (!s.translated) {
         s.translated = true;
         bool pixel = s.parsed.type == xf::ucode::ShaderType::Pixel;
@@ -756,11 +768,11 @@ bool Renderer::translate(Shader &s, std::string &why) {
 
 // ---- render targets: EDRAM as host images, one per base, pitch, samples and format ----
 
-VkFormat Renderer::depth_vk_format(uint32_t format) const {
+VkFormat Impl::depth_vk_format(uint32_t format) const {
     return format == 0 ? d24s8_ : VK_FORMAT_D32_SFLOAT_S8_UINT; // D24S8, D24FS8
 }
 
-RenderTarget *Renderer::render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format) {
+RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format) {
     auto key = std::make_tuple(depth, base, pitch, msaa, format);
     auto it = targets_.find(key);
     if (it != targets_.end()) return it->second.get();
@@ -806,7 +818,7 @@ RenderTarget *Renderer::render_target(bool depth, uint32_t base, uint32_t pitch,
                         depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
     t->sampled = depth ? make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, VK_IMAGE_ASPECT_DEPTH_BIT) : t->view;
     if (depth) t->stencil = make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, VK_IMAGE_ASPECT_STENCIL_BIT);
-    // EDRAM's contents are not carried from the trace's snapshot yet: zeros
+    // cleared: its tiles come from EDRAM when it takes them over (acquire)
     VkImage image = t->image.image;
     if (!run([&](VkCommandBuffer cmd) {
             VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -842,7 +854,7 @@ RenderTarget *Renderer::render_target(bool depth, uint32_t base, uint32_t pitch,
 // The target takes over the tiles of its first `rows` pixel rows: those
 // another target holds are stored into EDRAM by their holder, then all it
 // did not hold are loaded from EDRAM, as Xenia's ownership transfers do.
-void Renderer::acquire(RenderTarget *t, uint32_t rows) {
+void Impl::acquire(RenderTarget *t, uint32_t rows) {
     uint32_t tile_rows = std::min((rows + t->tile_height - 1) / t->tile_height, t->height / t->tile_height);
     uint32_t count = std::min(tile_rows * t->pitch_tiles, EDRAM_TILES);
     std::vector<uint32_t> needed;
@@ -863,7 +875,7 @@ void Renderer::acquire(RenderTarget *t, uint32_t rows) {
                      t->base, held.size());
 }
 
-bool Renderer::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
+bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
     uint32_t *mask = static_cast<uint32_t *>(mask_.mapped);
     std::fill(mask, mask + EDRAM_TILES, 0u);
     uint32_t last_row = 0;
@@ -904,7 +916,7 @@ bool Renderer::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) 
     });
 }
 
-VkPipeline Renderer::load_pipeline(const RenderTarget &t) {
+VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     auto key = std::make_pair(t.image.format, t.msaa);
     auto it = load_pipelines_.find(key);
     if (it != load_pipelines_.end()) return it->second;
@@ -968,7 +980,7 @@ VkPipeline Renderer::load_pipeline(const RenderTarget &t) {
     return load_pipelines_[key] = p;
 }
 
-bool Renderer::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows) {
+bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows) {
     VkPipeline pipeline = load_pipeline(*t);
     if (!pipeline) return fatal_ = "could not make an EDRAM load pipeline", false;
     uint32_t *mask = static_cast<uint32_t *>(mask_.mapped);
@@ -1043,47 +1055,89 @@ bool Renderer::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, u
     });
 }
 
-// ---- guest memory on the GPU: what changed, copied over before a draw ----
+// ---- guest memory on the GPU: the vertex data a draw reads, copied over before it ----
 
-bool Renderer::upload_memory(VkCommandBuffer cmd) {
-    // the caller has made sure what changed fits in the staging buffer
-    std::vector<VkBufferCopy> copies;
-    VkDeviceSize at = 0;
-    memory_.each_chunk_since(uploaded_version_, [&](uint32_t index, const uint8_t *data) {
-        std::memcpy(static_cast<uint8_t *>(staging_.mapped) + at, data, GuestMemory::CHUNK);
-        copies.push_back({at, VkDeviceSize(index) * GuestMemory::CHUNK, GuestMemory::CHUNK});
-        at += GuestMemory::CHUNK;
-    });
-    uploaded_version_ = memory_.version();
-    if (!copies.empty()) vkCmdCopyBuffer(cmd, staging_.buffer, guest_.buffer, uint32_t(copies.size()), copies.data());
-    full_barrier(cmd);
-    return true;
+// The ranges the shaders' vertex fetches can read: each vertex fetch
+// constant they use, its address and size in words (a fetch reads nothing
+// past them), as Xenia's IssueDraw requests them from its shared memory;
+// sorted and merged.
+std::vector<std::pair<uint32_t, uint32_t>> Impl::vertex_ranges(const Shader *vs, const Shader *ps) {
+    std::set<uint32_t> slots;
+    for (const Shader *s : {vs, ps})
+        if (s) slots.insert(s->summary.vertex_slots.begin(), s->summary.vertex_slots.end());
+    std::vector<std::pair<uint32_t, uint32_t>> ranges; // [start, end)
+    for (uint32_t slot : slots) {
+        const uint32_t *f = &regs_[reg::FETCH_CONSTANTS + slot * 2];
+        // Xenia draws with any type here (its gpu_allow_invalid_fetch_constants
+        // is on by default), warning about texture constants
+        FetchConstantType type = FetchConstantType(f[0] & 3);
+        if (type == FetchConstantType::Texture || type == FetchConstantType::InvalidTexture)
+            approximate("a vertex fetch from a texture fetch constant");
+        uint32_t start = f[0] & 0x1FFFFFFC, words = (f[1] >> 2) & 0xFFFFFF;
+        uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(start) + uint64_t(words) * 4, GuestMemory::SIZE));
+        if (end > start) ranges.push_back({start, end});
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<uint32_t, uint32_t>> merged;
+    for (auto r : ranges) {
+        if (!merged.empty() && r.first <= merged.back().second)
+            merged.back().second = std::max(merged.back().second, r.second);
+        else
+            merged.push_back(r);
+    }
+    return merged;
 }
 
-bool Renderer::flush_memory() {
-    // more than the staging buffer holds: in turns, before the draw
-    std::vector<uint32_t> changed;
-    memory_.each_chunk_since(uploaded_version_, [&](uint32_t index, const uint8_t *) { changed.push_back(index); });
-    if (changed.size() * GuestMemory::CHUNK <= STAGING) return true;
-    std::vector<uint8_t> chunk(GuestMemory::CHUNK);
-    for (size_t first = 0; first < changed.size();) {
-        size_t n = std::min<size_t>(changed.size() - first, STAGING / GuestMemory::CHUNK);
-        std::vector<VkBufferCopy> copies;
-        for (size_t k = 0; k < n; k++) {
-            memory_.read(changed[first + k] * GuestMemory::CHUNK, {static_cast<uint8_t *>(staging_.mapped) + k * GuestMemory::CHUNK, GuestMemory::CHUNK});
-            copies.push_back({k * GuestMemory::CHUNK, VkDeviceSize(changed[first + k]) * GuestMemory::CHUNK, GuestMemory::CHUNK});
-        }
-        if (!run([&](VkCommandBuffer cmd) { vkCmdCopyBuffer(cmd, staging_.buffer, guest_.buffer, uint32_t(copies.size()), copies.data()); }))
-            return false;
-        first += n;
+// Copies what of the ranges fits into the staging buffer and adds the
+// copies into guest memory's buffer; returns the bytes staged.
+VkDeviceSize Impl::stage(const std::vector<std::pair<uint32_t, uint32_t>> &ranges, std::vector<VkBufferCopy> &copies) {
+    Timer timer(report_.vertex_seconds);
+    VkDeviceSize at = 0;
+    for (auto [start, end] : ranges) {
+        VkDeviceSize n = end - start;
+        std::memcpy(static_cast<uint8_t *>(staging_.mapped) + at, memory_.data() + start, n);
+        copies.push_back({at, start, n});
+        at += n;
     }
-    uploaded_version_ = memory_.version();
-    return true;
+    report_.vertex_bytes += at;
+    return at;
+}
+
+// The ranges into guest memory's buffer: copies for the draw's own
+// submission when they fit the staging buffer, else in turns of it before
+// the draw (no copies left).
+bool Impl::upload_vertices(const std::vector<std::pair<uint32_t, uint32_t>> &ranges,
+                           std::vector<VkBufferCopy> &copies) {
+    copies.clear();
+    VkDeviceSize total = 0;
+    for (auto [start, end] : ranges) total += end - start;
+    if (total <= STAGING) {
+        stage(ranges, copies);
+        return true;
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> turn;
+    VkDeviceSize in_turn = 0;
+    auto flush = [&] {
+        std::vector<VkBufferCopy> c;
+        stage(turn, c);
+        turn.clear(), in_turn = 0;
+        return c.empty() || run([&](VkCommandBuffer cmd) {
+                   vkCmdCopyBuffer(cmd, staging_.buffer, guest_.buffer, uint32_t(c.size()), c.data());
+               });
+    };
+    for (auto [start, end] : ranges)
+        for (uint32_t at = start; at < end;) {
+            uint32_t n = uint32_t(std::min<VkDeviceSize>(end - at, STAGING - in_turn));
+            turn.push_back({at, at + n});
+            in_turn += n, at += n;
+            if (in_turn == STAGING && !flush()) return false;
+        }
+    return flush();
 }
 
 // ---- textures ----
 
-VkSampler Renderer::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides) {
+VkSampler Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides) {
     uint32_t mag = (fetch[3] >> 19) & 3, min = (fetch[3] >> 21) & 3, mip = (fetch[3] >> 23) & 3, aniso = (fetch[3] >> 25) & 7;
     if (overrides[0] != 3) mag = overrides[0];
     if (overrides[1] != 3) min = overrides[1];
@@ -1106,24 +1160,32 @@ VkSampler Renderer::sampler(const uint32_t fetch[6], const std::array<uint32_t, 
     return samplers_[key] = s;
 }
 
-Texture *Renderer::texture(const uint32_t fetch[6], std::string &why) {
+void Impl::destroy(Texture &t) {
+    if (t.view) vkDestroyImageView(dev_, t.view, nullptr);
+    d_.destroy(t.image);
+    t.view = VK_NULL_HANDLE;
+}
+
+// A texture by its fetch constant, decoded again when the memory it came
+// from is not what it was.
+Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     std::array<uint32_t, 6> key;
     std::copy(fetch, fetch + 6, key.begin());
     texture::Info info = texture::parse_fetch_constant(fetch);
-    auto changed_since = [&](const Texture &t) {
-        for (uint32_t c = t.first_chunk; c <= t.last_chunk; c++)
-            if (memory_.chunk_version(c) > t.decoded_at) return true;
-        for (uint32_t c = t.first_mip_chunk; c <= t.last_mip_chunk && t.last_mip_chunk; c++)
-            if (memory_.chunk_version(c) > t.decoded_at) return true;
-        return false;
-    };
     auto it = textures_.find(key);
     if (it != textures_.end()) {
-        if (!changed_since(*it->second)) return it->second.get();
-        d_.destroy(it->second->image);
+        Texture &old = *it->second;
+        bool same;
+        {
+            Timer timer(report_.check_seconds);
+            same = !old.stale && hash_spans(memory_, old.footprint) == old.hash;
+        }
+        if (same) return &old;
+        destroy(old);
         textures_.erase(it);
     }
 
+    Timer decoding(report_.decode_seconds);
     texture::Image image;
     if (!texture::decode(info, memory_, image, why)) return nullptr;
     std::vector<std::vector<uint8_t>> levels = image.levels;
@@ -1162,7 +1224,12 @@ Texture *Renderer::texture(const uint32_t fetch[6], std::string &why) {
     VkComponentMapping mapping{swizzle_of(info.swizzle & 7, components), swizzle_of((info.swizzle >> 3) & 7, components),
                                swizzle_of((info.swizzle >> 6) & 7, components), swizzle_of((info.swizzle >> 9) & 7, components)};
     t->view = make_view(t->image.image, cube ? VK_IMAGE_VIEW_TYPE_CUBE : three ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D,
-                        format, VK_IMAGE_ASPECT_COLOR_BIT, mapping, level_count, layers);
+                        format, VK_IMAGE_ASPECT_COLOR_BIT, mapping, level_count, layers, false);
+    if (!t->view) {
+        destroy(*t);
+        why = "could not make the image's view";
+        return nullptr;
+    }
 
     // upload, level by level
     VkDeviceSize total = 0;
@@ -1206,21 +1273,19 @@ Texture *Renderer::texture(const uint32_t fetch[6], std::string &why) {
             vkCmdCopyBufferToImage(cmd, staging.buffer, vk_image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(copies.size()), copies.data());
     });
     d_.destroy(staging);
-    if (!ok) return nullptr;
+    if (!ok) {
+        destroy(*t);
+        return nullptr;
+    }
 
-    // the chunks it may have read, for seeing when it changes: a bound from
-    // the size, 32x32-aligned as tiled textures are
-    t->decoded_at = memory_.version();
-    uint32_t block_bytes = texture::bytes_per_block(image.format);
-    uint64_t texel_bytes = texture::is_compressed(image.format) ? (block_bytes + 15) / 16 : block_bytes;
-    uint64_t row = (std::max(info.pitch, info.width) + 31) & ~31u, rows = (info.height + 31) & ~31u;
-    uint64_t bytes = std::max<uint64_t>(1, row * rows * std::max(1u, info.depth) * std::max<uint64_t>(texel_bytes, 1));
-    bytes = std::min<uint64_t>(bytes, 64u << 20);
-    t->first_chunk = (info.base_address & GuestMemory::PHYSICAL_MASK) / GuestMemory::CHUNK;
-    t->last_chunk = uint32_t(((info.base_address & GuestMemory::PHYSICAL_MASK) + bytes - 1) / GuestMemory::CHUNK);
-    if (info.mip_address && level_count > 1) {
-        t->first_mip_chunk = (info.mip_address & GuestMemory::PHYSICAL_MASK) / GuestMemory::CHUNK;
-        t->last_mip_chunk = uint32_t(((info.mip_address & GuestMemory::PHYSICAL_MASK) + bytes - 1) / GuestMemory::CHUNK);
+    // what it was decoded from, for seeing when that changes
+    t->footprint = std::move(image.footprint);
+    t->hash = hash_spans(memory_, t->footprint);
+    t->low = UINT32_MAX;
+    for (auto [address, bytes] : t->footprint) {
+        t->low = std::min(t->low, address);
+        uint64_t end = std::min<uint64_t>(uint64_t(address) + bytes, GuestMemory::SIZE);
+        t->high = uint32_t(std::max<uint64_t>(t->high, end));
     }
     report_.textures++;
     return (textures_[key] = std::move(t)).get();
@@ -1228,7 +1293,7 @@ Texture *Renderer::texture(const uint32_t fetch[6], std::string &why) {
 
 // ---- pipelines ----
 
-VkPipeline Renderer::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info) {
+VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info) {
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second;
     VkPipeline p = VK_NULL_HANDLE;
@@ -1247,7 +1312,7 @@ struct Viewport {
 
 // draw_util.cc's GetHostViewportInfo, at resolution scale 1, for Vulkan
 // (origin at the top left, reverse Z allowed)
-Viewport host_viewport(const std::vector<uint32_t> &regs, float max_x, float max_y, bool pixel_writes_depth) {
+Viewport host_viewport(const uint32_t *regs, float max_x, float max_y, bool pixel_writes_depth) {
     Viewport v;
     uint32_t clip = regs[r::PA_CL_CLIP_CNTL], vte = regs[r::PA_CL_VTE_CNTL], mode = regs[r::PA_SU_SC_MODE_CNTL];
     uint32_t vtx = regs[r::PA_SU_VTX_CNTL];
@@ -1313,7 +1378,7 @@ Viewport host_viewport(const std::vector<uint32_t> &regs, float max_x, float max
 }
 
 // draw_util.cc's GetScissor, clamped to the surface pitch, the window offset not in EDRAM
-VkRect2D host_scissor(const std::vector<uint32_t> &regs, uint32_t pitch) {
+VkRect2D host_scissor(const uint32_t *regs, uint32_t pitch) {
     uint32_t tl = regs[r::PA_SC_WINDOW_SCISSOR_TL], br = regs[r::PA_SC_WINDOW_SCISSOR_BR];
     int32_t tl_x = tl & 0x3FFF, tl_y = (tl >> 16) & 0x3FFF, br_x = br & 0x3FFF, br_y = (br >> 16) & 0x3FFF;
     if (!(tl >> 31)) {
@@ -1333,17 +1398,16 @@ VkRect2D host_scissor(const std::vector<uint32_t> &regs, uint32_t pitch) {
     return {{tl_x, tl_y}, {uint32_t(br_x - tl_x), uint32_t(br_y - tl_y)}};
 }
 
-void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
-    write(reg::VGT_DRAW_INITIATOR, initiator);
+// A draw outside copy mode, as the processor gives it (immediate indices,
+// which Xenia does not draw either, never come: the processor counts them).
+void Impl::draw(const gpu::Draw &d) {
     report_.draws++;
     uint32_t mode = regs_[reg::RB_MODECONTROL] & 7;
-    if (EdramMode(mode) == EdramMode::Copy) return resolve();
     if (EdramMode(mode) != EdramMode::ColorDepth && EdramMode(mode) != EdramMode::DepthOnly) return skip("EDRAM mode " + std::to_string(mode));
 
-    uint32_t primitive = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
-    bool index32 = (initiator >> 11) & 1;
+    uint32_t primitive = d.primitive, count = d.count;
+    bool index32 = d.index32;
     if (count == 0) return;
-    if (SourceSelect(source) == SourceSelect::Immediate) return skip("immediate indices");
     bool rectangles = primitive == 8;
     VkPrimitiveTopology topology;
     switch (primitive) {
@@ -1407,10 +1471,7 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
     if (width == 8192 && height == 8192) return skip("nothing to draw to");
 
     // viewport and scissor
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(d_.physical(), &props);
-    Viewport viewport = host_viewport(regs_, float(props.limits.maxViewportDimensions[0]),
-                                      float(props.limits.maxViewportDimensions[1]), ps && ps->writes_depth);
+    Viewport viewport = host_viewport(regs_, max_viewport_[0], max_viewport_[1], ps && ps->writes_depth);
     if (viewport.empty) return;
     VkRect2D scissor = host_scissor(regs_, pitch);
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
@@ -1430,15 +1491,17 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
     bool restart = strip && (regs_[r::PA_SU_SC_MODE_CNTL] >> 21) & 1;
     uint32_t reset_index = regs_[r::VGT_MULTI_PRIM_IB_RESET_INDX];
     auto vertex = [&](uint32_t index) { return index + offset; };
-    if (SourceSelect(source) == SourceSelect::DMA) {
-        uint32_t endian = dma_size >> 30, size = index32 ? 4 : 2;
-        uint32_t base = dma_base & ~(size - 1);
+    if (d.indexed) {
+        uint32_t size = index32 ? 4 : 2;
+        gpu::Endian endian = d.index_endian;
+        std::vector<uint8_t> raw_indices(size_t(count) * size);
+        memory_.read(d.index_base, raw_indices);
         for (uint32_t i = 0; i < count; i++) {
-            uint8_t b[4] = {};
-            memory_.read(base + i * size, {b, size});
+            const uint8_t *b = raw_indices.data() + size_t(i) * size;
             uint32_t raw = index32 ? uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24
                                    : uint32_t(b[0]) | uint32_t(b[1]) << 8;
-            uint32_t index = index32 ? gpu_swap(raw, endian) : (endian == 1 ? ((raw >> 8) | (raw << 8)) & 0xFFFF : raw);
+            uint32_t index = index32 ? gpu::gpu_swap(raw, endian)
+                                     : (endian == gpu::Endian::In16 ? ((raw >> 8) | (raw << 8)) & 0xFFFF : raw);
             if (!index32) index &= 0xFFFF;
             if (restart && index == (index32 ? reset_index : reset_index & 0xFFFF)) indices.push_back(UINT32_MAX);
             else indices.push_back(vertex(index));
@@ -1615,8 +1678,12 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
     VkPipeline pipe = pipeline(key, info);
     if (!pipe) return skip("vkCreateGraphicsPipelines failed");
 
+    // the vertex data, from guest memory as it is now (staged last: nothing
+    // else uses the staging buffer before the draw's submission)
+    std::vector<VkBufferCopy> vertex_copies;
+    if (!upload_vertices(vertex_ranges(vs, ps), vertex_copies)) return;
+
     // descriptors
-    if (!flush_memory()) return;
     vkResetDescriptorPool(dev_, pool_, 0);
     VkDescriptorSet sets[2];
     VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -1659,7 +1726,9 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
     const float *blend_constants = reinterpret_cast<const float *>(&regs_[r::RB_BLEND_RED]);
     uint32_t index_count = uint32_t(indices.size());
     run([&](VkCommandBuffer cmd) {
-        upload_memory(cmd);
+        if (!vertex_copies.empty())
+            vkCmdCopyBuffer(cmd, staging_.buffer, guest_.buffer, uint32_t(vertex_copies.size()), vertex_copies.data());
+        full_barrier(cmd);
         VkRenderingAttachmentInfo attachments[4] = {};
         for (uint32_t i = 0; i < 4; i++) {
             attachments[i] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -1703,11 +1772,11 @@ void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
 
 // ---- resolves ----
 
-void Renderer::resolve() {
+void Impl::resolve() {
     report_.resolves++;
     resolve::Info info;
     std::string why;
-    if (!resolve::get_info(regs_, memory_, info, why)) return skip("resolve: " + why);
+    if (!resolve::get_info({regs_, REGISTER_COUNT}, memory_, info, why)) return skip("resolve: " + why);
     if (!info.copy && !why.empty()) approximate("resolve not copied: " + why);
     uint32_t pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
     RenderTarget *source = render_target(info.depth, info.edram_base, info.surface_pitch ? info.surface_pitch : pitch,
@@ -1728,7 +1797,17 @@ void Renderer::resolve() {
         } else {
             uint32_t texel = info.depth ? 4 : texture::bytes_per_block(source->host);
             VkDeviceSize bytes = VkDeviceSize(w) * h * texel;
-            vk::Buffer readback = d_.create_buffer(bytes + VkDeviceSize(w) * h, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+            // the read-back buffer, kept and grown: cached memory, read by the CPU
+            if (readback_.size < bytes + VkDeviceSize(w) * h) {
+                d_.destroy(readback_);
+                readback_ = d_.create_buffer(std::max<VkDeviceSize>(bytes + VkDeviceSize(w) * h, 16u << 20),
+                                             VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
+                if (!readback_.buffer) {
+                    fatal_ = "could not make the resolves' read-back buffer";
+                    return;
+                }
+            }
+            const vk::Buffer &readback = readback_;
             vk::Image resolved;
             if (!info.depth && info.msaa) {
                 resolved = d_.create_image(VK_IMAGE_TYPE_2D, source->image.format, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
@@ -1791,7 +1870,6 @@ void Renderer::resolve() {
                 clipped.x = x, clipped.y = y, clipped.width = w, clipped.height = h;
                 if (!resolve::write(clipped, pixels, memory_, why)) approximate("resolve not written: " + why);
             }
-            d_.destroy(readback);
             if (resolved.image) d_.destroy(resolved);
             if (!ok) return;
         }
@@ -1878,56 +1956,69 @@ void Renderer::resolve() {
 
 // ---- the swap: texture fetch constant 0, as Xenia's RequestSwapTexture ----
 
-void Renderer::swap() {
-    report_.swaps++;
+// Swaps are numbered from 0; the front buffer is read back for the ones the
+// options ask for.
+void Impl::swap() {
+    uint64_t number = report_.swaps++;
+    if (!options_.frame_wanted || !options_.frame_wanted(number)) return;
+    Image frame;
+    if (!front_buffer(frame)) return;
+    report_.frames++;
+    if (options_.on_frame) options_.on_frame(number, frame);
+}
+
+bool Impl::front_buffer(Image &frame) {
     const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS];
     texture::Info info = texture::parse_fetch_constant(fetch);
     if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture || info.dimension != 1 || !info.base_address) {
         approximate("a swap without a 2D texture in fetch constant 0");
-        return;
+        return false;
     }
     texture::Image image;
     std::string why;
     if (!texture::decode(info, memory_, image, why)) {
         approximate("swap texture not decoded: " + why);
-        return;
+        return false;
     }
     std::vector<uint8_t> rgba = texture::to_rgba8(image, 0);
+    if (rgba.size() < size_t(image.width) * image.height * 4) {
+        approximate("swap texture not decoded: no base level");
+        return false;
+    }
     uint32_t components = image.format == texture::HostFormat::RGBA8 ? 4 : host_components(image.format);
-    frame_.width = image.width, frame_.height = image.height;
-    frame_.rgba.resize(size_t(image.width) * image.height * 4);
+    frame.width = image.width, frame.height = image.height;
+    frame.rgba.resize(size_t(image.width) * image.height * 4);
     for (size_t i = 0; i < size_t(image.width) * image.height; i++)
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t guest = (info.swizzle >> (3 * c)) & 7;
             uint8_t value = guest == 5 ? 255 : guest >= 4 ? 0 : rgba[i * 4 + std::min(guest, components - 1)];
-            frame_.rgba[i * 4 + c] = c == 3 ? 255 : value; // shown opaque, as the presenter does
+            frame.rgba[i * 4 + c] = c == 3 ? 255 : value; // shown opaque, as the presenter does
         }
-    // the display's gamma: as Xenia's presenter, the piecewise linear ramp
-    // for 2_10_10_10 front buffers (not yet), the 256-entry table for the
-    // rest (apply_gamma_table.xesli), the 10 bits it gives back to 8
-    if (!have_gamma_) return;
+    // the display's gamma, the processor's ramps: as Xenia's presenter, the
+    // piecewise linear ramp for 2_10_10_10 front buffers (not yet), the
+    // 256-entry table for the rest (apply_gamma_table.xesli), the 10 bits it
+    // gives back to 8
     if (info.format == 7 || info.format == 54) {
         approximate("the display's piecewise linear gamma ramp");
-        return;
+        return true;
     }
+    const std::array<uint32_t, 256> &table = processor_.gamma_ramp_table();
     for (size_t i = 0; i < size_t(image.width) * image.height; i++)
         for (uint32_t c = 0; c < 3; c++) {
-            uint32_t entry = gamma_table_[frame_.rgba[i * 4 + c]];
+            uint32_t entry = table[frame.rgba[i * 4 + c]];
             uint32_t ten = (entry >> (c == 0 ? 20 : c == 1 ? 10 : 0)) & 0x3FF;
-            frame_.rgba[i * 4 + c] = uint8_t((ten * 255 + 511) / 1023);
+            frame.rgba[i * 4 + c] = uint8_t((ten * 255 + 511) / 1023);
         }
+    return true;
 }
 
 } // namespace
 
-bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, Image &frame, Report &report,
-            std::string &error) {
-    Renderer renderer(device, options, report);
-    if (!renderer.init(error)) return false;
-    if (!walk_gpu_trace(trace, renderer, error)) return false;
-    if (renderer.failed(error)) return false;
-    frame = std::move(renderer.frame());
-    return true;
+std::unique_ptr<Renderer> Renderer::create(vk::Device &device, gpu::CommandProcessor &processor,
+                                           const Options &options, std::string &error) {
+    auto renderer = std::make_unique<Impl>(device, processor, options);
+    if (!renderer->init(error)) return nullptr;
+    return renderer;
 }
 
 } // namespace xf::render

@@ -149,6 +149,9 @@ void test_decode_linear_rgba8() {
             same &= v == hash(x + 100 * y);
         }
     CHECK(same);
+    // the memory it read: the rows from the first texel to the last
+    CHECK(img.footprint.size() == 1);
+    CHECK(img.footprint[0].first == 0x100000 && img.footprint[0].second == (64 * 15 + 40) * 4);
 }
 
 void test_decode_tiled_8() {
@@ -167,6 +170,12 @@ void test_decode_tiled_8() {
     for (uint32_t y = 0; y < 64 && same; y++)
         for (uint32_t x = 0; x < 64; x++) same &= img.levels[0][y * 64 + x] == uint8_t(hash(x * 64 + y));
     CHECK(same);
+    // the memory it read covers every texel's tiled offset
+    CHECK(img.footprint.size() == 1 && img.footprint[0].first == 0x200000);
+    uint32_t last = 0;
+    for (uint32_t y = 0; y < 64; y++)
+        for (uint32_t x = 0; x < 64; x++) last = std::max(last, texture::tiled_offset_2d(x, y, 64, 0));
+    CHECK(img.footprint[0].second == last + 1);
 }
 
 void test_decode_tiled_dxt1() {

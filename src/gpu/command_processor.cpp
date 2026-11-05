@@ -26,6 +26,8 @@
 // - A WAIT_REG_MEM that does not match asks the Host to wait (a yield below
 //   0x100, else wait / 0x100 ms): Xenia spins below 0x100 and sleeps above.
 // - Indirect buffers nest at most 8 deep (Xenia: unbounded recursion).
+// - Restoring a trace's gamma ramps starts the next sequential write at red
+//   (Xenia restores the component the trace recorded).
 
 #include "xenoforge/command_processor.h"
 
@@ -176,6 +178,20 @@ void CommandProcessor::execute_indirect_buffer(uint32_t physical_address, uint32
         return;
     }
     bump(counts_.indirect_buffers);
+    if (sink_) sink_->buffer_start(true, start, count);
+    depth_++;
+    execute_straight(start, count);
+    depth_--;
+    if (sink_) sink_->buffer_end(true);
+}
+
+void CommandProcessor::execute_packets(uint32_t physical_address, uint32_t count) {
+    uint32_t start = physical_address & PHYSICAL_MASK;
+    count = std::min(count, (PHYSICAL_SIZE - start) / 4);
+    if (count) execute_straight(start, count);
+}
+
+void CommandProcessor::execute_straight(uint32_t start, uint32_t count) {
     Reader saved = reader_;
     // a straight run: the write offset is the capacity, which wraps to 0
     // (Xenia's RingBuffer), so the reads stop when they come back to it
@@ -183,17 +199,25 @@ void CommandProcessor::execute_indirect_buffer(uint32_t physical_address, uint32
     reader_.base = physical(start);
     reader_.address = start;
     reader_.capacity = count * 4;
-    if (sink_) sink_->buffer_start(true, start, count);
-    depth_++;
     do {
         if (!execute_packet()) {
             bump(counts_.bad_packets);
             break;
         }
     } while (reader_.count());
-    depth_--;
-    if (sink_) sink_->buffer_end(true);
     reader_ = saved;
+}
+
+void CommandProcessor::restore_registers(uint32_t first, std::span<const uint32_t> values) {
+    for (size_t i = 0; i < values.size() && first + i < RegisterFile::COUNT; i++)
+        regs_.set(uint32_t(first + i), values[i]);
+}
+
+void CommandProcessor::restore_gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t> pwl) {
+    std::copy_n(table.begin(), std::min(table.size(), gamma_table_.size()), gamma_table_.begin());
+    std::copy_n(pwl.begin(), std::min(pwl.size(), gamma_pwl_.size()), gamma_pwl_.begin());
+    gamma_component_ = 0;
+    gamma_version_++;
 }
 
 // ---- packets ----

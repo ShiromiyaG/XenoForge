@@ -9,10 +9,11 @@
 // the display's gamma ramp, occlusion query reports.
 //
 // It draws nothing. Draws, resolves, swaps and shader loads go to a Sink
-// with the register file standing as they happen, so boot counts them and
-// the renderer can take them later in place of a trace's packets (the
-// headless backend is Xenia's null command processor: every draw and copy
-// succeeds and leaves no picture).
+// with the register file standing as they happen: the renderer
+// (renderer.h), or nothing (the headless backend is Xenia's null command
+// processor: every draw and copy succeeds and leaves no picture). A trace
+// is replayed through it too, packet by packet, as Xenia's trace player
+// feeds its command processor (render::replay).
 //
 // No kernel here: guest memory is Memory's physical view, and what the
 // processor needs from the system (an interrupt on a CPU, a wait between
@@ -145,7 +146,9 @@ public:
 
     CommandProcessor(Memory &memory, Host &host);
 
+    // Set before the processor's thread runs, or on it.
     void set_sink(Sink *sink) { sink_ = sink; }
+    Memory &memory() const { return memory_; }
     RegisterFile &registers() { return regs_; }
     const Counts &counts() const { return counts_; }
 
@@ -173,6 +176,16 @@ public:
     // Executes count dwords of packets at a physical address (an indirect
     // buffer, a test's packets).
     void execute_indirect_buffer(uint32_t physical, uint32_t count);
+
+    // What a trace player does (Xenia's TracePlayer): a recorded packet run
+    // at its address on its own, outside any buffer (Xenia's
+    // ExecutePacket(ptr, count)); the register file restored as recorded,
+    // without the side effects of writing the registers (RestoreRegisters
+    // without callbacks, as Xenia records them); the gamma ramps restored
+    // (RestoreGammaRamp).
+    void execute_packets(uint32_t physical, uint32_t count);
+    void restore_registers(uint32_t first, std::span<const uint32_t> values);
+    void restore_gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t> pwl);
 
     // A register written by a packet: stored, with the side effects some
     // have (the scratch registers' write-back, COHER_STATUS_HOST, the gamma
@@ -206,6 +219,9 @@ private:
     };
 
     bool execute_packet();
+    // the packets of a straight run of count dwords (an indirect buffer, a
+    // trace's packet)
+    void execute_straight(uint32_t start, uint32_t count);
     bool type0(uint32_t packet);
     bool type1(uint32_t packet);
     bool type3(uint32_t packet);

@@ -271,9 +271,11 @@ struct LevelLoad {
 };
 
 // Reads the blocks of one slice: the span of guest memory they lie in read at
-// once, then each block copied out and byte-swapped.
+// once (and noted in the footprint), then each block copied out and
+// byte-swapped.
 void read_blocks(const LevelLoad &load, const GuestMemory &memory, uint32_t endian, uint32_t blocks_x,
-                 uint32_t blocks_y, uint32_t z, std::vector<uint8_t> &out) {
+                 uint32_t blocks_y, uint32_t z, std::vector<uint8_t> &out,
+                 std::vector<std::pair<uint32_t, uint32_t>> &footprint) {
     uint64_t low = UINT64_MAX, high = 0;
     for (uint32_t y = 0; y < blocks_y; y++)
         for (uint32_t x = 0; x < blocks_x; x++) {
@@ -284,6 +286,8 @@ void read_blocks(const LevelLoad &load, const GuestMemory &memory, uint32_t endi
     out.resize(start + size_t(blocks_x) * blocks_y * load.bytes_per_block);
     uint8_t *dst = out.data() + start;
     uint64_t span = high - low + load.bytes_per_block;
+    footprint.push_back({uint32_t(load.base + low) & GuestMemory::PHYSICAL_MASK,
+                         uint32_t(std::min<uint64_t>(span, GuestMemory::SIZE))});
     if (span <= (64u << 20)) {
         std::vector<uint8_t> src(span);
         memory.read(uint32_t(load.base + low), src);
@@ -577,7 +581,7 @@ bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string
         for (uint32_t s = 0; s < slices; s++) {
             bool layer = info.dimension != 2;
             load.base = level_base + (layer ? s * l.array_slice_stride_bytes : 0);
-            read_blocks(load, memory, info.endian, blocks_x, blocks_y, layer ? 0 : s, blocks);
+            read_blocks(load, memory, info.endian, blocks_x, blocks_y, layer ? 0 : s, blocks, out.footprint);
         }
 
         std::vector<uint8_t> &dst = out.levels[level];

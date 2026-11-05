@@ -127,7 +127,7 @@ uint32_t Device::memory_type(uint32_t bits, VkMemoryPropertyFlags want) const {
     return UINT32_MAX;
 }
 
-Buffer Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible) {
+Buffer Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, bool host_reads) {
     Buffer b;
     b.size = size;
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -138,9 +138,15 @@ Buffer Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool h
     vkGetBufferMemoryRequirements(device_, b.buffer, &need);
     VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     alloc.allocationSize = need.size;
-    alloc.memoryTypeIndex = memory_type(need.memoryTypeBits, host_visible ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-                                                                          : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    alloc.memoryTypeIndex =
+        memory_type(need.memoryTypeBits, host_visible ? visible : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // what the host reads back: cached memory where there is some (the first
+    // coherent type is often write-combined, slow to read)
+    if (host_visible && host_reads) {
+        uint32_t cached = memory_type(need.memoryTypeBits, visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (cached != UINT32_MAX) alloc.memoryTypeIndex = cached;
+    }
     if (alloc.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &alloc, nullptr, &b.memory) != VK_SUCCESS) {
         vkDestroyBuffer(device_, b.buffer, nullptr);
         return {};

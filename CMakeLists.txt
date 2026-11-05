@@ -51,6 +51,7 @@ add_library(xenoforge STATIC
     src/recomp_discover.cpp
     src/recomp_emit.cpp
     src/memory.cpp
+    src/guest_memory.cpp
     src/gpu/command_processor.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
@@ -86,7 +87,7 @@ xf_shader(edram_store_ms.comp edram_store.comp -DMS)
 xf_shader(edram_load.frag edram_load.frag)
 xf_shader(edram_load_depth.frag edram_load.frag -DDEPTH)
 xf_shader(edram_load_stencil.frag edram_load.frag -DDEPTH -DSTENCIL)
-add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp ${XF_SHADER_WORDS})
+add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/replay.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SHADER_OUT})
 target_link_libraries(xenoforge_vk PUBLIC xenoforge Vulkan::Vulkan)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -151,6 +152,15 @@ if(NOT TARGET stb)
 endif()
 add_executable(xfreplay tools/xfreplay.cpp)
 target_link_libraries(xfreplay PRIVATE xenoforge_vk stb)
+add_executable(xfcompare tools/xfcompare.cpp)
+target_link_libraries(xfcompare PRIVATE stb)
+if(TARGET boot)
+    # boot --render: the renderer as the command processor's Sink, and its shots
+    target_link_libraries(boot PRIVATE xenoforge_vk stb)
+endif()
+foreach(game ${XF_GAMES})
+    target_link_libraries(boot_${game} PRIVATE xenoforge_vk stb)
+endforeach()
 add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)
 

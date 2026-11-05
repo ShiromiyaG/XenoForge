@@ -147,11 +147,17 @@ them).
 
 ## The renderer, first form (B3)
 
-`renderer.h`, `xfreplay` (2026-11-04). A trace is replayed packet by packet
-through a PM4 front end that keeps the registers and guest memory as Xenia's
-player does (packets at their end, recorded memory writes skipped, PM4
-predication by bin mask and select). Every draw is one Vulkan submission,
-waited for: plain, not fast.
+`renderer.h`, `xfreplay` (2026-11-04). The renderer is the command
+processor's Sink (`command_processor.h`, 2026-11-05): one PM4 front end, the
+processor's, runs the packets and keeps the registers, constants and PM4
+predication; the renderer takes the shaders it loads, its draws, resolves
+and swaps with the register file as it stands, and reads guest memory
+where it lies (the processor's physical memory). A trace is replayed
+through a processor of its own as Xenia's trace player feeds its command
+processor (`replay.cpp`: each packet written at its address and executed
+there, the memory it read written first, recorded memory writes skipped,
+the registers and gamma ramps restored). Every draw is one Vulkan
+submission, waited for: plain, not fast.
 
 - **Draws**: the translated vertex and pixel shaders (colors scaled by the
   target's exponent bias, 16-bit fixed targets kept as snorm with their
@@ -170,15 +176,26 @@ waited for: plain, not fast.
   loads them, in any format and MSAA, as Xenia's ownership transfers do;
   depth tiles have their halves swapped; the stencil is exported, or
   written a bit per pass where the device cannot export it (NVIDIA). The
-  trace's EDRAM snapshot is where EDRAM starts.
+  trace's EDRAM snapshot is where EDRAM starts (zeros, live).
 - **Textures** decoded from guest memory (`texture.h`: 1D, 2D, stacked, 3D,
   cube, tiled or linear, packed mips, the block formats kept compressed),
-  re-decoded when the memory under them changes, with the fetch constant's
-  swizzle and sampler.
+  with the fetch constant's swizzle and sampler; each is kept with a hash
+  of the memory it was decoded from (the spans the decoder read) and
+  decoded again when that memory differs at a use, or at once when the
+  processor writes over it (`memory_written`).
+- **Vertex data**: before each draw, the ranges of the vertex fetch
+  constants the shaders use (address and size, as Xenia's IssueDraw
+  requests them) are copied from guest memory to the GPU's copy of it.
 - **Resolves** read the rectangle back (MSAA averaged), write it into guest
   memory as the destination says (`resolve.h`), then clear.
-- **The swap** shows texture fetch constant 0 through the display's gamma
-  table, as Xenia's presenter does.
+- **The swap** shows texture fetch constant 0 through the processor's gamma
+  table, as Xenia's presenter does, for the swaps asked for (numbered from 0
+  as Xenia numbers a trace's frame).
+
+Nothing tells the renderer when the CPU writes guest memory (Xenia watches
+pages with memory protection), so what it copies is checked or copied
+again at each use: textures by their hash, vertex data and indices copied
+at each draw.
 
 Against Xenia's trace dumps (`replay_test` with `XF_TRACES` and
 `XF_DUMPS`): all ten frames of the two games within 0.013 of 255 on
@@ -192,6 +209,59 @@ resolves of MSAA targets; the display's piecewise linear gamma; signed,
 gamma and exponent-adjusted textures; memexport; point lists; float16 and
 float32 targets moved through EDRAM by value rather than by bits (NaN
 payloads).
+
+## Driven live (2026-11-05)
+
+`boot --render` installs the renderer as the live command processor's Sink
+(`gpu_command_processor`), on a Vulkan device without a window; its calls
+come on the "GPU commands" kernel thread. `--shots <dir>` writes chosen
+swaps' front buffers as PNGs, numbered as Xenia numbers a trace's frame,
+and `xfcompare` finds the shot closest to a Xenia dump.
+
+The traces replay through the same path (a processor fed as Xenia's trace
+player feeds its own): the ten frames are byte for byte what the renderer
+drew with its own front end, and match Xenia's as before.
+
+Live, against Xenia's dumps of the traces' frames (the games' intros with
+no input):
+
+- **El Chavo Kart**: all four frames are drawn exactly (mean 0.003 to
+  0.005 of 255, no pixel off by more than 16), at other swaps: Xenia's 300
+  and 301 (the Unreal Engine logo) by swaps 289 and 290 of one run (286 for
+  301 in another), its 900 (the intro movie's beach) by swap 604, its 1800
+  (the movie's karts) by swap 1082. The videos run on the clock, and the
+  interpreted game swaps about 7 to 10 times a second where Xenia swaps up
+  to 60, so a movie frame comes at a lower swap, and not at the same one
+  from run to run; boot's run reaches the title screen by swap 1800.
+- **Ben 10**: XAM reports no controller, where Xenia's default input (its
+  keyboard driver) answers for user 0; the game pauses on "Controller Lost
+  Connection" from about swap 100, which the renderer draws, so its frames
+  are not Xenia's. With user 0 answered as Xenia's keyboard driver answers
+  (an experiment, not kept), the intro plays (the Cartoon Network logo) and
+  then stops swapping before Xenia's frame 600, headless as well as
+  rendered (at 506 and 345 swaps): what it waits for next is not in the
+  kernel yet (sound, most likely). Ben 10's six traces replay through the
+  same Sink and match.
+
+What the live runs ask for and the renderer does not do yet, counted:
+point lists (168,840 of El Chavo Kart's 202,089 draws in its first 1,887
+swaps, past the movie), texture fetch offsets in pixel shaders and stacked
+(array) textures (about one each a frame on its title screen, which comes
+out in red alone, its green and blue lost: no trace of that screen yet to
+tell which gap it is), D24FS8 depth kept as 32-bit float, Ben 10's texture
+slots without a texture constant.
+
+The cost (runs of the same length back to back, other work sharing the
+machine): El Chavo Kart is bound by the interpreter, and rendering on the
+processor's thread costs it nothing measurable (747 swaps in 90 s headless,
+742 rendered; the renderer busy 24 s of the 90). Ben 10 is bound by the
+renderer: 59.4 swaps a second headless (vblank's pace), 18.4 rendered, the
+renderer busy 39 s of the 45 after the first swap, 30 s of them in its
+three resolves a frame (12 ms each) and most of the rest in its 72 draws a
+frame. Every draw is a submission waited for and every resolve is read
+back and tiled by the CPU, as planned for traces; batching a frame's draws
+into one submission and resolving on the GPU (B4) are what would take this
+away.
 
 ## What is asked and not done is counted
 

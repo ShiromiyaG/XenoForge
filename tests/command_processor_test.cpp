@@ -410,6 +410,34 @@ void ring_wrap_and_bad_packets() {
     CHECK(r[0x2191] == 0 && cp.counts().bad_packets == 2);
 }
 
+// What a trace player does: packets run where they lie, on their own, not
+// as a buffer; the registers restored without their side effects; the
+// gamma ramps restored.
+void trace_player() {
+    Fixture f;
+    RegisterFile &r = f.cp.registers();
+    uint32_t at = physical_alloc(0x1000);
+    Words w(at);
+    w({type0(0x2100, 2), 5, 6});
+    w({type3(pm4::DRAW_INDX_2, 1), 4u | 2u << 6 | 3u << 16}); // auto-indexed, 3 vertices
+    f.cp.execute_packets(at, 3);                              // the first packet alone
+    CHECK(r[0x2100] == 5 && r[0x2101] == 6 && f.sink.draws.empty());
+    f.cp.execute_packets(at + 12, 2);
+    CHECK(f.sink.draws.size() == 1 && f.sink.draws[0].count == 3);
+    CHECK(f.sink.buffers.empty() && f.cp.counts().indirect_buffers == 0);
+    // a scratch register restored is not written back
+    r.set(reg::SCRATCH_UMSK, 1);
+    r.set(reg::SCRATCH_ADDR, at + 0x800);
+    const uint32_t values[] = {0x12345678};
+    f.cp.restore_registers(reg::SCRATCH_REG0, values);
+    CHECK(r[reg::SCRATCH_REG0] == 0x12345678 && be32(at + 0x800) == 0);
+    std::vector<uint32_t> table(256, 0x3FFFFFFF), pwl(3 * 128, 0x00400040);
+    uint64_t version = f.cp.gamma_ramp_version();
+    f.cp.restore_gamma_ramp(table, pwl);
+    CHECK(f.cp.gamma_ramp_table()[7] == 0x3FFFFFFF && f.cp.gamma_ramp_pwl()[100] == 0x00400040);
+    CHECK(f.cp.gamma_ramp_version() > version);
+}
+
 } // namespace
 
 int main() {
@@ -425,5 +453,6 @@ int main() {
     draws_shaders_swaps();
     interrupts_and_waits();
     ring_wrap_and_bad_packets();
+    trace_player();
     return finish("command_processor");
 }

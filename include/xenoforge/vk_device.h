@@ -43,8 +43,9 @@ public:
     // VK_EXT_shader_stencil_export, enabled when the device has it
     bool stencil_export() const { return stencil_export_; }
 
-    // host-visible and coherent (mapped), or device-local
-    Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible);
+    // host-visible and coherent (mapped), or device-local; host_reads: the
+    // host reads it back, so cached memory where the device has it
+    Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, bool host_reads = false);
     void destroy(Buffer &buffer);
     Image create_image(VkImageType type, VkFormat format, VkExtent3D extent, uint32_t levels, uint32_t layers,
                        VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags = 0);

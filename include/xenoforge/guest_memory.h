@@ -1,41 +1,50 @@
-// The console's physical memory as the GPU sees it (512 MB, addresses masked
-// to 29 bits), kept in 64 KB chunks made as they are first written; what was
-// never written reads as zeros. Big-endian words are read and written as
-// the guest stores them.
+// The console's physical memory as the GPU sees it: 512 MB, addresses masked
+// to 29 bits, one contiguous host range. Either the system's own (a view of
+// Memory::translate_physical(0), so the renderer reads guest memory where it
+// lies) or one of its own, zeroed, for the tools and tests that fill it
+// themselves (the operating system hands out its pages as they are first
+// touched). Big-endian words are read and written as the guest stores them.
 
 #pragma once
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <span>
-#include <unordered_map>
-#include <vector>
 
 namespace xf {
 
 class GuestMemory {
 public:
     static constexpr uint32_t PHYSICAL_MASK = 0x1FFFFFFF;
-    static constexpr uint32_t CHUNK = 1u << 16;
+    static constexpr uint32_t SIZE = 0x20000000;
 
+    // its own 512 MB, zeroed (std::bad_alloc when the host has no room)
+    GuestMemory();
+    // a view of physical memory that lies elsewhere: SIZE bytes from physical
+    explicit GuestMemory(uint8_t *physical) : data_(physical) {}
+    ~GuestMemory();
+    GuestMemory(const GuestMemory &) = delete;
+    GuestMemory &operator=(const GuestMemory &) = delete;
+
+    uint8_t *data() { return data_; }
+    const uint8_t *data() const { return data_; }
+
+    // Bytes at an address; a range past the end of physical memory wraps to
+    // its start, as the address mask does.
     void write(uint32_t address, std::span<const uint8_t> bytes) {
         for (size_t i = 0; i < bytes.size();) {
             uint32_t a = (address + uint32_t(i)) & PHYSICAL_MASK;
-            uint8_t *chunk = writable_chunk(a);
-            size_t n = std::min<size_t>(CHUNK - a % CHUNK, bytes.size() - i);
-            std::memcpy(chunk + a % CHUNK, bytes.data() + i, n);
+            size_t n = std::min<size_t>(SIZE - a, bytes.size() - i);
+            std::memcpy(data_ + a, bytes.data() + i, n);
             i += n;
         }
     }
     void read(uint32_t address, std::span<uint8_t> out) const {
         for (size_t i = 0; i < out.size();) {
             uint32_t a = (address + uint32_t(i)) & PHYSICAL_MASK;
-            const uint8_t *chunk = chunk_for(a);
-            size_t n = std::min<size_t>(CHUNK - a % CHUNK, out.size() - i);
-            if (chunk) std::memcpy(out.data() + i, chunk + a % CHUNK, n);
-            else std::memset(out.data() + i, 0, n);
+            size_t n = std::min<size_t>(SIZE - a, out.size() - i);
+            std::memcpy(out.data() + i, data_ + a, n);
             i += n;
         }
     }
@@ -49,37 +58,9 @@ public:
         write(address, b);
     }
 
-    // The chunks written so far, by index (address / CHUNK), for uploading.
-    template <typename F> void each_chunk(F f) const {
-        for (const auto &[index, data] : chunks_) f(index, data.get());
-    }
-    // Bumped by every write: a cheap way to see that something changed.
-    uint64_t version() const { return version_; }
-    // version() as of the last write to chunk `index` (0: never written).
-    uint64_t chunk_version(uint32_t index) const {
-        auto it = chunk_versions_.find(index);
-        return it == chunk_versions_.end() ? 0 : it->second;
-    }
-    // The chunks written after version `since`, by index, for uploading what changed.
-    template <typename F> void each_chunk_since(uint64_t since, F f) const {
-        for (const auto &[index, version] : chunk_versions_)
-            if (version > since) f(index, chunks_.at(index).get());
-    }
-
 private:
-    uint8_t *writable_chunk(uint32_t a) {
-        auto &chunk = chunks_[a / CHUNK];
-        if (!chunk) chunk = std::make_unique<uint8_t[]>(CHUNK), std::memset(chunk.get(), 0, CHUNK);
-        chunk_versions_[a / CHUNK] = ++version_;
-        return chunk.get();
-    }
-    const uint8_t *chunk_for(uint32_t a) const {
-        auto it = chunks_.find(a / CHUNK);
-        return it == chunks_.end() ? nullptr : it->second.get();
-    }
-    std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> chunks_;
-    std::unordered_map<uint32_t, uint64_t> chunk_versions_;
-    uint64_t version_ = 0;
+    uint8_t *data_ = nullptr;
+    uint8_t *owned_ = nullptr; // what the first constructor allocated
 };
 
 } // namespace xf

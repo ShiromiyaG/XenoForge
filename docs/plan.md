@@ -194,8 +194,12 @@ traces, without a recompiled game.
   replayed and compared with Xenia's picture. First form in (2026-11-04,
   [renderer.md](renderer.md), "The renderer, first form"): EDRAM moved
   between render targets as Xenia moves it; all ten frames of both games
-  match Xenia's (within 0.013 of 255). Next: traces of more games, and of
-  the games themselves past their titles.
+  match Xenia's (within 0.013 of 255). Driven live (2026-11-05,
+  [renderer.md](renderer.md), "Driven live"): the renderer is the command
+  processor's Sink, traces replay through the same processor, and `boot
+  --render --shots` draws both games headless and writes chosen swaps.
+  Next: traces of more games, and of the games themselves past their
+  titles.
 - **B4. Scale and speed**: resolution scale, the pipeline cache on disk,
   shaders translated in the build.
 - **B5. The generic pipeline** (the microcode interpreter on the GPU), if
@@ -213,9 +217,11 @@ traces, without a recompiled game.
 - **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work
   (`../Chaves/docs/native-renderer-re.md`) moved over as El Chavo Kart's port.
 
-Next (2026-11-05, later): the renderer as the command processor's Sink
-(under way), then the player (C1: window, input) for M1; generated tables
-per module (the DLLs' code), and the other six games' code generated.
+Next (2026-11-05, later): the renderer runs live as the command processor's
+Sink, headless (`boot --render`); next the player (C1: the window and the
+presentation, input) for M1, and the renderer's speed (B4: draws batched
+into fewer submissions, resolves on the GPU). Generated tables per module
+(the DLLs' code), and the other six games' code generated.
 
 ## Decisions
 

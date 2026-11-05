@@ -197,6 +197,7 @@ Video &video(Kernel &k) {
 
 void setup_video(Kernel &k) { k.state<Video>().setup(k); }
 void shutdown_video(Kernel &k) { k.state<Video>().stop(); }
+gpu::CommandProcessor &gpu_command_processor(Kernel &k) { return *k.state<Video>().cp; }
 
 // ---- the registers (GraphicsSystem::ReadRegister, WriteRegister) ----
 

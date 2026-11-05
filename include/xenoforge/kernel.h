@@ -28,6 +28,10 @@
 #include <unordered_map>
 #include <vector>
 
+namespace xf::gpu {
+class CommandProcessor;
+}
+
 namespace xf::kernel {
 
 class Kernel;
@@ -129,6 +133,10 @@ void set_process_tls(Kernel &k, uint32_t process, uint32_t slots, uint32_t data_
 void setup_video(Kernel &k);
 void shutdown_video(Kernel &k);
 std::string video_report(Kernel &k);
+// The GPU's command processor, for installing its Sink (the renderer)
+// before the game starts; the Sink's calls then come on the "GPU commands"
+// thread.
+gpu::CommandProcessor &gpu_command_processor(Kernel &k);
 
 // The sound family's parts (audio.cpp, xma.cpp; its seams in
 // xenoforge/audio.h). setup_audio, as the kernel starts: the XMA decoder's

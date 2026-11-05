@@ -191,14 +191,17 @@ As built (`command_processor.h`, `src/gpu/command_processor.cpp`;
   constant (its address made physical) to fetch constant 0 and Xenia's
   XE_SWAP packet into the 64 words the caller set aside in the ring.
 
-The renderer (B3) replays traces through its own PM4 front end. Driven
-live, it becomes the command processor's Sink: shaders from `shader`,
-draws and resolves from `draw` and `resolve` with the register file the
-processor keeps (its own register tracking and packet parsing go), guest
-memory read where it lies (physical memory instead of the trace's copy,
-`memory_written` invalidating what it caches), the front buffer from
-`swap` and the gamma ramps from the processor. The same Sink with a trace
-writer behind it records Xenia's .xtr from a live game.
+The renderer (B3) is the command processor's Sink (2026-11-05): shaders
+from `shader`, draws and resolves from `draw` and `resolve` with the
+register file the processor keeps, guest memory read where it lies (the
+processor's physical memory; `memory_written` marks the textures under
+the processor's writes), the front buffer at `swap` through the
+processor's gamma ramps. Its calls come on the "GPU commands" thread; the
+Vulkan device lives with it. Traces replay through a processor of their
+own, so there is one PM4 front end ([renderer.md](renderer.md)).
+`gpu_command_processor(k)` (`kernel.h`) is where boot installs it. The same
+Sink with a trace writer behind it would record Xenia's .xtr from a live
+game.
 
 ## Sound
 
@@ -287,11 +290,25 @@ once here, before the export returns ERROR_IO_PENDING.
 
 ## `boot`
 
-`boot <game.iso> [--frames N] [--interpret]`: loads the game, runs its
-entry point, and prints the kernel calls (counts, unimplemented ones), the
-GPU's packets, draws, resolves, swaps (and swaps per second) and
-interrupts, the sound's frames and XMA contexts, and where it
-stopped.
+`boot <game.iso> [--seconds N] [--steps N] [--content <dir>] [--interpret]`:
+loads the game, runs its entry point, and prints the modules loaded, the
+interpreter's entries (the most entered addresses first), the kernel calls
+(counts, unimplemented ones), the GPU's packets, draws, resolves, swaps (and
+swaps per second) and interrupts, the sound's frames and XMA contexts, and
+where it stopped. Built as `boot_<game>` (CMake's `XF_GAMES`), it runs the
+game's generated code; `--interpret` leaves it out. `--steps` bounds the
+interpreter's instructions per entry (2 billion by default: about 20 s of
+El Chavo Kart's main thread).
+
+`--render` draws what the GPU is sent (the renderer as the processor's
+Sink, on a Vulkan device without a window; off by default, so runs stay
+headless). `--shots <dir>` writes the front buffer of chosen swaps there as
+`<title>_<swap>.png` (`--shot-swaps 300,301,890-910`, `--shot-every N`),
+the swaps numbered as Xenia's `--trace_gpu_frames` numbers a trace's frame;
+`xfcompare <xenia.png> <dir>` finds the shot closest to a Xenia dump. The
+report adds the renderer's counts: draws drawn and skipped by reason, what
+is approximate, resolves, swaps, and the time spent (in submissions,
+resolves, checking and decoding textures, copying vertex data).
 
 ## Order
 
