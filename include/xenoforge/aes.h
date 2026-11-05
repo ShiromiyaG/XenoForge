@@ -15,6 +15,11 @@ struct Key {
 
 Key expand(const uint8_t key[16]);
 
+// The round keys of FIPS-197's equivalent inverse cipher (section 5.3.5),
+// in the encryption keys' order: the first and last as they are, the nine
+// between through InvMixColumns (the console's XeCryptAesKey keeps them).
+void equivalent_inverse_keys(const Key &key, uint8_t out[176]);
+
 void encrypt_block(const Key &key, const uint8_t in[16], uint8_t out[16]);
 void decrypt_block(const Key &key, const uint8_t in[16], uint8_t out[16]);
 

@@ -10,13 +10,11 @@
 
 // The rest of the kernel's small exports (plan step A4; docs/runtime.md):
 // debugging, the HAL, the clock, the current process type, the console's
-// settings (XConfig), the crypto the games import, the microphone's
-// requests. Translated from Xenia (BSD; see LICENSE-xenia):
-// xboxkrnl_debug.cc, xboxkrnl_hal.cc, xboxkrnl_threading.cc (the clock and
-// the process type), xboxkrnl_misc.cc, xboxkrnl_xconfig.cc with xconfig.h
-// and xconfig.cc (the settings' defaults, without the settings file),
-// xboxkrnl_crypt.cc; checked against them. SHA-1 is written here from FIPS
-// 180-1 (Xenia uses TinySHA1).
+// settings (XConfig), the microphone's requests (the crypto is crypt.cpp).
+// Translated from Xenia (BSD; see LICENSE-xenia): xboxkrnl_debug.cc,
+// xboxkrnl_hal.cc, xboxkrnl_threading.cc (the clock and the process type),
+// xboxkrnl_misc.cc, xboxkrnl_xconfig.cc with xconfig.h and xconfig.cc (the
+// settings' defaults, without the settings file); checked against them.
 //
 // Where Xenia stops the emulator (HalReturnToFirmware exits; KeBugCheckEx
 // suspends the thread; DbgBreakPoint breaks into the debugger), these log;
@@ -272,93 +270,6 @@ XF_EXPORT(xam, XGetLanguage) {
     if (language < 10) return result(c, language);       // kMaxBaseLanguages
     if ((region & 0xFF00) != 0x100) return result(c, 1); // English
     result(c, region == 0x101 ? 2 /* Japanese */ : region == 0x102 ? 1 /* English */ : 7 /* Korean */);
-}
-
-// ---- crypto (xboxkrnl_crypt.cc) ----
-
-// SHA-1 (FIPS 180-1)
-class Sha1 {
-  public:
-    void update(const uint8_t *data, size_t size) {
-        length_ += uint64_t(size) * 8;
-        while (size--) {
-            block_[used_++] = *data++;
-            if (used_ == 64) compress(), used_ = 0;
-        }
-    }
-    void finish(uint8_t digest[20]) {
-        uint64_t length = length_;
-        uint8_t pad = 0x80;
-        update(&pad, 1);
-        pad = 0;
-        while (used_ != 56) update(&pad, 1);
-        for (int i = 7; i >= 0; i--) {
-            uint8_t b = uint8_t(length >> (8 * i));
-            update(&b, 1);
-        }
-        for (int i = 0; i < 5; i++)
-            for (int j = 0; j < 4; j++) digest[4 * i + j] = uint8_t(h_[i] >> (24 - 8 * j));
-    }
-
-  private:
-    static uint32_t rol(uint32_t x, int n) { return x << n | x >> (32 - n); }
-    void compress() {
-        uint32_t w[80];
-        for (int i = 0; i < 16; i++)
-            w[i] = uint32_t(block_[4 * i]) << 24 | uint32_t(block_[4 * i + 1]) << 16 |
-                   uint32_t(block_[4 * i + 2]) << 8 | block_[4 * i + 3];
-        for (int i = 16; i < 80; i++) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-        uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4];
-        for (int i = 0; i < 80; i++) {
-            uint32_t f, k;
-            if (i < 20)
-                f = (b & c) | (~b & d), k = 0x5A827999;
-            else if (i < 40)
-                f = b ^ c ^ d, k = 0x6ED9EBA1;
-            else if (i < 60)
-                f = (b & c) | (b & d) | (c & d), k = 0x8F1BBCDC;
-            else
-                f = b ^ c ^ d, k = 0xCA62C1D6;
-            uint32_t t = rol(a, 5) + f + e + k + w[i];
-            e = d, d = c, c = rol(b, 30), b = a, a = t;
-        }
-        h_[0] += a, h_[1] += b, h_[2] += c, h_[3] += d, h_[4] += e;
-    }
-    uint32_t h_[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
-    uint8_t block_[64] = {};
-    size_t used_ = 0;
-    uint64_t length_ = 0;
-};
-
-XF_EXPORT(xboxkrnl, XeCryptSha) {
-    // (input1, size1, input2, size2, input3, size3, output, output_size):
-    // the SHA-1 of the three, as much of it as fits
-    Sha1 sha;
-    for (int i = 0; i < 3; i++) {
-        uint32_t input = arg(k, c, 2 * i), size = arg(k, c, 2 * i + 1);
-        if (input && size) sha.update(k.host(input), size);
-    }
-    uint8_t digest[20];
-    sha.finish(digest);
-    uint32_t output = arg(k, c, 6), output_size = arg(k, c, 7);
-    std::memcpy(k.host(output), digest, std::min<size_t>(sizeof(digest), output_size));
-}
-
-XF_EXPORT(xboxkrnl, XeKeysConsolePrivateKeySign) {
-    // (hash, XE_CONSOLE_CERTIFICATE *output): no signature, Xenia's made-up
-    // retail certificate
-    uint32_t hash = arg(k, c, 0), output = arg(k, c, 1);
-    if (!hash || !output) return result(c, 0);
-    std::memset(k.host(output), 0, 0x1A8);
-    // the console id (XE_CONSOLE_ID's bit fields as MSVC lays them out:
-    // refurb 3 and month 9 in the first byte, then year 1, MAC index bytes
-    // 0x40, 0x66, 0x7E and CRC 0 in a little-endian word)
-    static constexpr uint8_t console_id[5] = {0x93, 0x01, 0x64, 0xE6, 0x07};
-    std::memcpy(k.host(output + 0x02), console_id, sizeof(console_id));
-    k.store32(output + 0x18, 2); // console type: retail
-    static constexpr uint8_t manufacture_date[8] = {2, 0, 0, 5, 1, 1, 2, 2};
-    std::memcpy(k.host(output + 0x1C), manufacture_date, sizeof(manufacture_date));
-    result(c, 1);
 }
 
 // ---- the microphone (xboxkrnl_misc.cc) ----

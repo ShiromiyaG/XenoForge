@@ -68,7 +68,12 @@ lists: what the game calls is what gets written next.
   the Mm*/Ex* pools on the heaps of memory.h, with Xenia's addresses.
 - **Rtl and misc** (`rtl.cpp`, `misc.cpp`): strings, time fields, status
   codes (Xenia's table), the printf family, XConfig settings (Xenia's
-  defaults), SHA-1.
+  defaults).
+- **Crypto** (`crypt.cpp`): every XeCrypt*/XeKeys* export Xenia has, plus
+  SHA-384 and XeKeysConsoleSignatureVerification (it trusts the console's
+  own signatures, so the XDK's partition block check takes the normal
+  path), with Xenia's guest context layouts, over algorithms written from
+  their standards (sha1, sha2, md5, aes, des, bignum; no third-party code).
 - **One clock**: the scheduler's (100 ns since the kernel started). The
   interrupt time is it, the system time is it plus the host's time at the
   start, the time base (mftb) is it times 5 (50 MHz); KeTimeStampBundle

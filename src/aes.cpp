@@ -125,6 +125,11 @@ Key expand(const uint8_t key[16]) {
     return k;
 }
 
+void equivalent_inverse_keys(const Key &key, uint8_t out[176]) {
+    std::memcpy(out, key.round, 176);
+    for (int round = 1; round < 10; round++) inv_mix_columns(out + 16 * round);
+}
+
 void encrypt_block(const Key &key, const uint8_t in[16], uint8_t out[16]) {
     uint8_t s[16];
     std::memcpy(s, in, 16);

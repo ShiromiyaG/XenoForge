@@ -381,57 +381,6 @@ void settings(KernelHarness &h) {
     CHECK(h.call32("xam", "XGetLanguage") == 1);
 }
 
-void crypto(KernelHarness &h) {
-    kernel::Kernel &k = *h.k;
-    uint32_t out = h.alloc(32);
-    // SHA-1("abc"), in three parts
-    h.krnl("XeCryptSha", {h.string("a"), 1, h.string("bc"), 2, 0, 0, out, 20});
-    static const uint8_t abc[20] = {0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e,
-                                    0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d};
-    CHECK(std::memcmp(k.host(out), abc, 20) == 0);
-    // of nothing, cut to 8 bytes
-    std::memset(k.host(out), 0, 32);
-    h.krnl("XeCryptSha", {0, 0, 0, 0, 0, 0, out, 8});
-    static const uint8_t empty[8] = {0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d};
-    CHECK(std::memcmp(k.host(out), empty, 8) == 0 && k.load32(out + 8) == 0);
-    // a long message: SHA-1 of a million 'a's
-    uint32_t million = h.alloc(1000000);
-    std::memset(k.host(million), 'a', 1000000);
-    h.krnl("XeCryptSha", {million, 1000000, 0, 0, 0, 0, out, 20});
-    static const uint8_t a_million[20] = {0x34, 0xaa, 0x97, 0x3c, 0xd4, 0xc4, 0xda, 0xa4, 0xf6, 0x1e,
-                                          0xeb, 0x2b, 0xdb, 0xad, 0x27, 0x31, 0x65, 0x34, 0x01, 0x6f};
-    CHECK(std::memcmp(k.host(out), a_million, 20) == 0);
-
-    // the console certificate Xenia makes up
-    uint32_t certificate = h.alloc(0x1A8);
-    CHECK(h.krnl("XeKeysConsolePrivateKeySign", {out, certificate}) == 1);
-    CHECK(k.load32(certificate + 0x18) == 2 && k.host(certificate + 0x1C)[3] == 5);
-#if defined(_MSC_VER)
-    // XE_CONSOLE_ID's bit fields as Xenia's compiler lays them out
-#pragma pack(push, 1)
-    struct ConsoleId {
-        union {
-            struct {
-                uint8_t RefurbBits : 4;
-                uint8_t ManufactureMonth : 4;
-                uint32_t ManufactureYear : 4;
-                uint32_t MacIndex3 : 8;
-                uint32_t MacIndex4 : 8;
-                uint32_t MacIndex5 : 8;
-                uint32_t Crc : 4;
-            };
-            uint8_t Data[5];
-        };
-    };
-#pragma pack(pop)
-    ConsoleId id{};
-    id.RefurbBits = 3, id.ManufactureMonth = 9, id.ManufactureYear = 1;
-    id.MacIndex3 = 0x40, id.MacIndex4 = 0x66, id.MacIndex5 = 0x7E, id.Crc = 0;
-    CHECK(sizeof(ConsoleId) == 5 && std::memcmp(k.host(certificate + 2), id.Data, 5) == 0);
-#endif
-    CHECK(h.krnl("XeKeysConsolePrivateKeySign", {0, certificate}) == 0);
-}
-
 void process_type(KernelHarness &h) {
     kernel::Kernel &k = *h.k;
     // the thread's (every guest thread has its KTHREAD in the PCR)
@@ -500,7 +449,6 @@ int main() {
     status_codes(h);
     printf_family(h);
     settings(h);
-    crypto(h);
     process_type(h);
     debugging(h);
     return finish("kernel_modules");

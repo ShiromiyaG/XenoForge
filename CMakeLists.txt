@@ -22,11 +22,15 @@ endif()
 # (B1).
 add_library(xenoforge STATIC
     src/aes.cpp
+    src/bignum.cpp
+    src/des.cpp
     src/disc.cpp
     src/exports.cpp
     src/xex.cpp
     src/lzx.cpp
     src/sha1.cpp
+    src/sha2.cpp
+    src/md5.cpp
     src/snappy.cpp
     src/gpu_trace.cpp
     src/trace_stats.cpp
@@ -138,7 +142,7 @@ foreach(name aes disc xex lzx snappy ucode ucode_parse trace shader_interpreter 
 endforeach()
 # the kernel's exports, called through a Kernel (the object library brings
 # their registrations)
-foreach(name kernel_memory kernel_modules)
+foreach(name kernel_memory kernel_modules kernel_crypt)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge_kernel xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)

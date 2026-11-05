@@ -12,7 +12,9 @@ namespace {
 
 uint32_t rotl(uint32_t x, int n) { return x << n | x >> (32 - n); }
 
-void compress(uint32_t h[5], const uint8_t *block) {
+} // namespace
+
+void sha1_block(uint32_t h[5], const uint8_t block[64]) {
     uint32_t w[80];
     for (int t = 0; t < 16; t++) w[t] = be32(block + 4 * t);
     for (int t = 16; t < 80; t++) w[t] = rotl(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
@@ -41,12 +43,10 @@ void compress(uint32_t h[5], const uint8_t *block) {
     h[4] += e;
 }
 
-} // namespace
-
 void sha1(std::span<const uint8_t> data, uint8_t digest[20]) {
     uint32_t h[5] = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
     size_t full = data.size() & ~size_t(63);
-    for (size_t i = 0; i < full; i += 64) compress(h, data.data() + i);
+    for (size_t i = 0; i < full; i += 64) sha1_block(h, data.data() + i);
 
     // the tail, the 1 bit, zeros and the length: one block or two
     uint8_t tail[128] = {};
@@ -57,7 +57,7 @@ void sha1(std::span<const uint8_t> data, uint8_t digest[20]) {
     uint64_t bits = uint64_t(data.size()) * 8;
     put_be32(tail + 64 * blocks - 8, uint32_t(bits >> 32));
     put_be32(tail + 64 * blocks - 4, uint32_t(bits));
-    for (size_t i = 0; i < blocks; i++) compress(h, tail + 64 * i);
+    for (size_t i = 0; i < blocks; i++) sha1_block(h, tail + 64 * i);
     for (int i = 0; i < 5; i++) put_be32(digest + 4 * i, h[i]);
 }
 
