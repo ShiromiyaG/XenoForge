@@ -3,6 +3,7 @@ name: xf-kernel-family
 description: Implements one XenoForge kernel export family (xboxkrnl/xam exports, the objects and state behind them) translated from Xenia, with tests and measurements from boot. Use for kernel work in F:\RECOMPs\XenoForge, one family per agent; the brief names the family, the Xenia sources, and what other agents are touching.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
 model: inherit
+effort: high
 isolation: worktree
 ---
 

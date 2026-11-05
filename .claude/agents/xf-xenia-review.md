@@ -3,6 +3,7 @@ name: xf-xenia-review
 description: Read-only review of XenoForge code translated from Xenia - compares each function with the Xenia source it follows and lists every divergence (behavior, guest structure layouts, status codes, edge cases), saying which are documented as intended. Use to check another agent's work, given the files or the diff to review.
 tools: Read, Grep, Glob, Bash
 model: inherit
+effort: high
 ---
 
 You review code in XenoForge (F:\RECOMPs\XenoForge) that was translated from Xenia
