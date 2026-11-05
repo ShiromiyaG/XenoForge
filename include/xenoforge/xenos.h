@@ -27,7 +27,20 @@ constexpr uint32_t RB_DEPTHCONTROL = 0x2200;
 constexpr uint32_t RB_MODECONTROL = 0x2208;
 constexpr uint32_t RB_COPY_CONTROL = 0x2318;
 constexpr uint32_t RB_COPY_DEST_BASE = 0x2319;
+constexpr uint32_t RB_COPY_DEST_PITCH = 0x231A;
 constexpr uint32_t RB_COPY_DEST_INFO = 0x231B;
+constexpr uint32_t RB_DEPTH_CLEAR = 0x231D;
+constexpr uint32_t RB_COLOR_CLEAR = 0x231E;
+constexpr uint32_t RB_COLOR_CLEAR_LO = 0x231F;
+constexpr uint32_t RB_COPY_SURFACE_SLICE = 0x2323;
+// the resolve rectangle's: scissors, window offset, pixel center
+constexpr uint32_t PA_SC_SCREEN_SCISSOR_TL = 0x200E;
+constexpr uint32_t PA_SC_SCREEN_SCISSOR_BR = 0x200F;
+constexpr uint32_t PA_SC_WINDOW_OFFSET = 0x2080;
+constexpr uint32_t PA_SC_WINDOW_SCISSOR_TL = 0x2081;
+constexpr uint32_t PA_SC_WINDOW_SCISSOR_BR = 0x2082;
+constexpr uint32_t PA_SU_SC_MODE_CNTL = 0x2205;
+constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
 // SET_CONSTANT's kinds, each a block of registers
 constexpr uint32_t ALU_CONSTANTS = 0x4000;   // 512 float4, vertex then pixel
 constexpr uint32_t FETCH_CONSTANTS = 0x4800; // 32 textures of 6 dwords (96 vertex fetches of 2)

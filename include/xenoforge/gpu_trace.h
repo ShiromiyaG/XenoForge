@@ -48,6 +48,10 @@ public:
     virtual void registers(uint32_t /*first*/, std::span<const uint32_t> /*values*/) {}
     virtual void edram_snapshot(std::span<const uint8_t> /*bytes*/) {}
     virtual void event(uint32_t /*type*/) {} // 0: swap
+    // the display's gamma ramps: the 256-entry table (DC_LUT_30_COLOR:
+    // blue, green, red in 10 bits each from bit 0) and the piecewise linear
+    // one (DC_LUT_PWL_DATA, 128 per red, green, blue)
+    virtual void gamma_ramp(std::span<const uint32_t> /*table*/, std::span<const uint32_t> /*pwl*/) {}
     // primary and indirect buffers' starts and ends
     virtual void buffer(TraceCommand /*command*/, uint32_t /*address*/) {}
 };

@@ -145,6 +145,44 @@ The hardware has no denormals, not even between a multiply and the add of a
 the same (B3 asks for it with the float controls where the device has
 them).
 
+## The renderer, first form (B3)
+
+`renderer.h`, `xfreplay` (2026-11-04). A trace is replayed packet by packet
+through a PM4 front end that keeps the registers and guest memory as Xenia's
+player does (packets at their end, recorded memory writes skipped, PM4
+predication by bin mask and select). Every draw is one Vulkan submission,
+waited for: plain, not fast.
+
+- **Draws**: the translated vertex and pixel shaders; guest memory a 512 MB
+  storage buffer the vertex fetches read, what changed copied over before
+  each draw; indices swapped and offset on the CPU (quad lists split,
+  strips restarted at the reset index); rectangle lists through a geometry
+  shader; viewport, scissor and the position's formats as Xenia's
+  `GetHostViewportInfo` and `GetScissor`; blend, depth, stencil, culling
+  and the alpha test from the registers.
+- **Render targets** stand for EDRAM as host images, one per base, pitch,
+  MSAA and format, as many rows as EDRAM holds from the base.
+- **Textures** decoded from guest memory (`texture.h`: 1D, 2D, stacked, 3D,
+  cube, tiled or linear, packed mips, the block formats kept compressed),
+  re-decoded when the memory under them changes, with the fetch constant's
+  swizzle and sampler.
+- **Resolves** read the rectangle back (MSAA averaged), write it into guest
+  memory as the destination says (`resolve.h`), then clear.
+- **The swap** shows texture fetch constant 0 through the display's gamma
+  table, as Xenia's presenter does.
+
+Against Xenia's trace dumps: El Chavo Kart's four frames (a video through
+three planes) within 0.005 of 255 on average, Ben 10's title intro (600,
+601) identical; Ben 10's title (1800, 3600) has its first tile dark, below.
+
+Not done yet, counted where it shows: **EDRAM shared between render
+targets** (a game clears a 1280 2x MSAA target by drawing into the same
+samples as a 640 4x one; Xenia moves the contents between the two, here the
+second starts empty) and the trace's EDRAM snapshot; 16-bit fixed targets'
+-32..32 range; gamma targets; the colour exponent bias; MSAA resolves of one
+sample; depth resolves of MSAA targets; the display's piecewise linear gamma;
+signed, gamma and exponent-adjusted textures; memexport; point lists.
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that

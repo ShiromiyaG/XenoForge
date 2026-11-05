@@ -142,8 +142,13 @@ bool walk_gpu_trace(const GpuTrace &trace, TraceVisitor &visitor, std::string &e
         case TraceCommand::GammaRamp: {
             // type, the read/write component (a byte, padded), encoding, length
             if (!have(16)) return fail("a gamma ramp cut short");
-            uint32_t encoded = le32(p + 12);
+            uint32_t encoding = le32(p + 8), encoded = le32(p + 12);
             if (!have(16 + uint64_t(encoded))) return fail("a gamma ramp runs past the file");
+            if (!decode({p + 16, encoded}, encoding, decoded) || decoded.size() != (256 + 3 * 128) * 4)
+                return fail("a gamma ramp does not decode");
+            std::vector<uint32_t> ramps(256 + 3 * 128);
+            for (size_t i = 0; i < ramps.size(); i++) ramps[i] = le32(decoded.data() + 4 * i);
+            visitor.gamma_ramp({ramps.data(), 256}, {ramps.data() + 256, 3 * 128});
             at += 16 + uint64_t(encoded);
             break;
         }

@@ -270,7 +270,8 @@ void Translator::declare() {
     }
     constants_ = global(block, constants_storage_, "constants");
     m_.decorate(constants_, spv::Decoration::DescriptorSet, {0});
-    m_.decorate(constants_, spv::Decoration::Binding, {stage_ == Stage::Harness ? 1u : 0u});
+    // the vertex and the pixel shader read their own c0-c255
+    m_.decorate(constants_, spv::Decoration::Binding, {stage_ == Stage::Harness ? 1u : stage_ == Stage::Pixel ? 3u : 0u});
     if (stage_ == Stage::Harness) m_.decorate(constants_, spv::Decoration::NonWritable);
 
     // guest memory, as words
@@ -286,13 +287,17 @@ void Translator::declare() {
     memory_ptr_uint_ = m_.type_pointer(spv::StorageClass::StorageBuffer, uint_);
 
     if (stage_ != Stage::Harness) {
-        // ndc_scale, ndc_offset, then the image and sampler index of each fetch slot
-        const Id system_members[] = {vec4_, vec4_, m_.type_array(uvec4_, 8, 16)};
+        // ndc_scale, ndc_offset, the image and sampler index of each fetch
+        // slot, then flags (x: the alpha test, bit 3 on, bits 0-2 its
+        // function) and values (x: the alpha test's reference)
+        const Id system_members[] = {vec4_, vec4_, m_.type_array(uvec4_, 8, 16), uvec4_, vec4_};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
         m_.member_decorate(system_block, 1, spv::Decoration::Offset, {16});
         m_.member_decorate(system_block, 2, spv::Decoration::Offset, {32});
+        m_.member_decorate(system_block, 3, spv::Decoration::Offset, {160});
+        m_.member_decorate(system_block, 4, spv::Decoration::Offset, {176});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -1105,13 +1110,24 @@ void Translator::main_vertex() {
           vec4_of(m_.op(Op::OpConvertSToF, float_, {load(int_, vertex_index)}), f(0), f(0), f(0)));
     reset_state();
     m_.op(Op::OpFunctionCall, void_, {body_});
-    // to Vulkan's clip space: xyz * ndc_scale + ndc_offset * w
+    // The position's formats (PA_CL_VTE_CNTL, in the system flags' y), as
+    // Xenia's CompleteVertexOrTessEvalShaderInMain: W given as 1/W unless bit
+    // 0, XY divided by W with bit 1, Z with bit 2. Then to Vulkan's clip
+    // space: xyz * ndc_scale + ndc_offset * w.
     Id ptr_u_vec4 = m_.type_pointer(spv::StorageClass::Uniform, vec4_);
     Id scale = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(0)}));
     Id offset = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(1)}));
+    Id flags = m_.op(Op::OpCompositeExtract, uint_,
+                     {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)})), 1});
+    auto flag = [&](uint32_t bit) { return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(bit)}), u(0)}); };
     Id p = load(vec4_, position_);
     Id w = comp(p, 3);
-    Id moved = exact(Op::OpFAdd, vec4_, {exact(Op::OpFMul, vec4_, {p, scale}), exact(Op::OpVectorTimesScalar, vec4_, {offset, w})});
+    w = select(float_, flag(1), w, exact(Op::OpFDiv, float_, {f(1), w}));
+    Id x = select(float_, flag(2), exact(Op::OpFMul, float_, {comp(p, 0), w}), comp(p, 0));
+    Id y = select(float_, flag(2), exact(Op::OpFMul, float_, {comp(p, 1), w}), comp(p, 1));
+    Id z = select(float_, flag(4), exact(Op::OpFMul, float_, {comp(p, 2), w}), comp(p, 2));
+    Id xyzw = vec4_of(x, y, z, w);
+    Id moved = exact(Op::OpFAdd, vec4_, {exact(Op::OpFMul, vec4_, {xyzw, scale}), exact(Op::OpVectorTimesScalar, vec4_, {offset, w})});
     store(position, vec4_of(comp(moved, 0), comp(moved, 1), comp(moved, 2), w));
     Id ptr_out_vec4 = m_.type_pointer(spv::StorageClass::Output, vec4_);
     for (uint32_t k = 0; k < 16; k++)
@@ -1155,6 +1171,26 @@ void Translator::main_pixel() {
         store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))}),
               load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))})));
     if (frag_depth) store(frag_depth, comp(load(vec4_, depth_), 0));
+    // the alpha test (state, not microcode): oC0's alpha against the
+    // reference, by the function in the system constants
+    {
+        Id flags = m_.op(Op::OpCompositeExtract, uint_, {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)})), 0});
+        Id reference = comp(load(vec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, vec4_), {system_, u(4)})), 0);
+        Id alpha = comp(load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(0)})), 3);
+        Id function = m_.op(Op::OpBitwiseAnd, uint_, {flags, u(7)});
+        auto is = [&](uint32_t value) { return m_.op(Op::OpIEqual, bool_, {function, u(value)}); };
+        // never, less, equal, less or equal, greater, not equal, greater or equal, always
+        Id pass = m_.const_bool(true);
+        const Op tests[] = {Op::OpFOrdLessThan, Op::OpFOrdEqual, Op::OpFOrdLessThanEqual, Op::OpFOrdGreaterThan,
+                            Op::OpFUnordNotEqual, Op::OpFOrdGreaterThanEqual};
+        for (uint32_t k = 0; k < 6; k++) pass = select(bool_, is(k + 1), m_.op(tests[k], bool_, {alpha, reference}), pass);
+        pass = select(bool_, is(0), m_.const_bool(false), pass);
+        Id enabled = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(8)}), u(0)});
+        when(m_.op(Op::OpLogicalAnd, bool_, {enabled, m_.op(Op::OpLogicalNot, bool_, {pass})}), [&] {
+            m_.op_void(Op::OpDemoteToHelperInvocation);
+            return false;
+        });
+    }
     m_.op_void(Op::OpReturn);
     m_.end_function();
     m_.entry_point(spv::ExecutionModel::Fragment, main, "main", interface_);

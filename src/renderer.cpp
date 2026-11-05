@@ -1,0 +1,1559 @@
+// The Xenos renderer, first form (renderer.h). The packets follow Xenia's
+// src/xenia/gpu/pm4_command_processor_implement.h, the viewport and scissor
+// draw_util.cc (GetHostViewportInfo, GetScissor), the register fields
+// registers.h, the clear values vulkan/vulkan_render_target_cache.cc, and the
+// swap vulkan/vulkan_texture_cache.cc (RequestSwapTexture); all BSD, see
+// LICENSE-xenia. Written anew, plainly: one submission per draw, waited for.
+
+#include "xenoforge/renderer.h"
+
+#include "xenoforge/bytes.h"
+#include "xenoforge/guest_memory.h"
+#include "xenoforge/resolve.h"
+#include "xenoforge/shader_harness.h"
+#include "xenoforge/shader_translator.h"
+#include "xenoforge/texture.h"
+#include "xenoforge/ucode.h"
+#include "xenoforge/ucode_parse.h"
+#include "xenoforge/xenos.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <set>
+#include <unordered_map>
+
+namespace xf::render {
+namespace {
+
+using namespace xenos;
+
+const uint32_t RECTANGLE_LIST_GS[] = {
+#include "rectangle_list.geom.inc"
+};
+
+// registers xenos.h does not name
+namespace r {
+constexpr uint32_t PA_SC_SCREEN_SCISSOR_TL = 0x200E, PA_SC_SCREEN_SCISSOR_BR = 0x200F;
+constexpr uint32_t PA_SC_WINDOW_OFFSET = 0x2080, PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082;
+constexpr uint32_t VGT_INDX_OFFSET = 0x2102;
+constexpr uint32_t VGT_MULTI_PRIM_IB_RESET_INDX = 0x2103;
+constexpr uint32_t RB_BLEND_RED = 0x2105; // then green, blue, alpha
+constexpr uint32_t RB_STENCILREFMASK_BF = 0x210C, RB_STENCILREFMASK = 0x210D, RB_ALPHA_REF = 0x210E;
+constexpr uint32_t PA_CL_VPORT_XSCALE = 0x210F; // then XOFFSET, YSCALE, YOFFSET, ZSCALE, ZOFFSET
+constexpr uint32_t RB_BLENDCONTROL[4] = {0x2201, 0x2209, 0x220A, 0x220B};
+constexpr uint32_t RB_COLORCONTROL = 0x2202;
+constexpr uint32_t PA_CL_CLIP_CNTL = 0x2204, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206;
+constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
+constexpr uint32_t RB_COPY_CONTROL = 0x2318;
+constexpr uint32_t RB_DEPTH_CLEAR = 0x231D, RB_COLOR_CLEAR = 0x231E, RB_COLOR_CLEAR_LO = 0x231F;
+constexpr uint32_t COLOR_INFO[4] = {reg::RB_COLOR_INFO, reg::RB_COLOR1_INFO, reg::RB_COLOR2_INFO, reg::RB_COLOR3_INFO};
+} // namespace r
+
+constexpr uint32_t DESCRIPTORS = 64;     // per image kind and for samplers, per draw
+constexpr uint32_t EDRAM_TILES = 2048;   // 80x16 samples of 32 bits each
+constexpr VkDeviceSize GUEST_MEMORY = 512u << 20;
+constexpr VkDeviceSize STAGING = 64u << 20;
+
+float as_float(uint32_t bits) {
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+int32_t sign_extend(uint32_t value, uint32_t bits) { return int32_t(value << (32 - bits)) >> (32 - bits); }
+
+uint64_t hash_words(uint32_t seed, std::span<const uint32_t> words) {
+    uint64_t h = 0xcbf29ce484222325ull ^ seed; // FNV-1a
+    for (uint32_t d : words)
+        for (int i = 0; i < 4; i++) h = (h ^ ((d >> (8 * i)) & 0xFF)) * 0x100000001b3ull;
+    return h;
+}
+
+// the guest's swap modes on a 32-bit value (xenos::GpuSwap)
+uint32_t gpu_swap(uint32_t v, uint32_t endian) {
+    switch (endian & 3) {
+    case 1: return ((v & 0x00FF00FF) << 8) | ((v >> 8) & 0x00FF00FF); // 8 in 16
+    case 2: return (v >> 24) | ((v >> 8) & 0xFF00) | ((v << 8) & 0xFF0000) | (v << 24); // 8 in 32
+    case 3: return (v >> 16) | (v << 16); // 16 in 32
+    default: return v;
+    }
+}
+
+float half_to_float(uint16_t h) {
+    uint32_t sign = uint32_t(h >> 15) << 31, exponent = (h >> 10) & 0x1F, mantissa = h & 0x3FF;
+    if (exponent == 0) return (sign ? -1.0f : 1.0f) * std::ldexp(float(mantissa), -24);
+    if (exponent == 31) return as_float(sign | 0x7F800000 | (mantissa << 13));
+    return as_float(sign | ((exponent + 112) << 23) | (mantissa << 13));
+}
+
+// xenos::Float20e4To32
+float float24_to_float(uint32_t f24) {
+    f24 &= 0xFFFFFF;
+    if (!f24) return 0.0f;
+    uint32_t mantissa = f24 & 0xFFFFF, exponent = f24 >> 20;
+    if (!exponent) {
+        // normalized in the result
+        uint32_t lzcnt = 0;
+        while (!(mantissa & (0x100000u >> lzcnt))) lzcnt++;
+        exponent = uint32_t(1 - int32_t(lzcnt));
+        mantissa = (mantissa << lzcnt) & 0xFFFFF;
+    }
+    return as_float(((exponent + 112) << 23) | (mantissa << 3));
+}
+
+VkFormat vk_format_of(texture::HostFormat f) {
+    using H = texture::HostFormat;
+    switch (f) {
+    case H::R8: return VK_FORMAT_R8_UNORM;
+    case H::RG8: return VK_FORMAT_R8G8_UNORM;
+    case H::RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
+    case H::B5G6R5: return VK_FORMAT_B5G6R5_UNORM_PACK16;     // R in the low bits, as texture.h keeps it
+    case H::A4R4G4B4: return VK_FORMAT_A4B4G4R4_UNORM_PACK16; // likewise; 1_5_5_5 goes through to_rgba8
+    case H::RGB10A2: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case H::R16: return VK_FORMAT_R16_UNORM;
+    case H::RG16: return VK_FORMAT_R16G16_UNORM;
+    case H::RGBA16: return VK_FORMAT_R16G16B16A16_UNORM;
+    case H::R16F: return VK_FORMAT_R16_SFLOAT;
+    case H::RG16F: return VK_FORMAT_R16G16_SFLOAT;
+    case H::RGBA16F: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case H::R32: return VK_FORMAT_R32_UINT;
+    case H::RG32: return VK_FORMAT_R32G32_UINT;
+    case H::RGBA32: return VK_FORMAT_R32G32B32A32_UINT;
+    case H::R32F: return VK_FORMAT_R32_SFLOAT;
+    case H::RG32F: return VK_FORMAT_R32G32_SFLOAT;
+    case H::RGBA32F: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case H::BC1: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    case H::BC2: return VK_FORMAT_BC2_UNORM_BLOCK;
+    case H::BC3: return VK_FORMAT_BC3_UNORM_BLOCK;
+    case H::BC4: return VK_FORMAT_BC4_UNORM_BLOCK;
+    case H::BC5: return VK_FORMAT_BC5_UNORM_BLOCK;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+// Xenia's host swizzles: one-component formats read as RRRR, two as RGGG
+uint32_t host_components(texture::HostFormat f) {
+    using H = texture::HostFormat;
+    switch (f) {
+    case H::R8: case H::R16: case H::R16F: case H::R32: case H::R32F: case H::BC4: return 1;
+    case H::RG8: case H::RG16: case H::RG16F: case H::RG32: case H::RG32F: case H::BC5: return 2;
+    default: return 4;
+    }
+}
+
+VkComponentSwizzle swizzle_of(uint32_t guest, uint32_t components) {
+    switch (guest) {
+    case 4: return VK_COMPONENT_SWIZZLE_ZERO;
+    case 5: return VK_COMPONENT_SWIZZLE_ONE;
+    case 6: case 7: return VK_COMPONENT_SWIZZLE_ZERO;
+    }
+    uint32_t c = std::min(guest, components - 1);
+    return VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + c);
+}
+
+VkCompareOp compare_op(uint32_t f) {
+    static const VkCompareOp ops[] = {VK_COMPARE_OP_NEVER,   VK_COMPARE_OP_LESS,          VK_COMPARE_OP_EQUAL,
+                                      VK_COMPARE_OP_LESS_OR_EQUAL, VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL,
+                                      VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_ALWAYS};
+    return ops[f & 7];
+}
+VkStencilOp stencil_op(uint32_t o) {
+    static const VkStencilOp ops[] = {VK_STENCIL_OP_KEEP,      VK_STENCIL_OP_ZERO,
+                                      VK_STENCIL_OP_REPLACE,   VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+                                      VK_STENCIL_OP_DECREMENT_AND_CLAMP, VK_STENCIL_OP_INVERT,
+                                      VK_STENCIL_OP_INCREMENT_AND_WRAP,  VK_STENCIL_OP_DECREMENT_AND_WRAP};
+    return ops[o & 7];
+}
+VkBlendFactor blend_factor(uint32_t f) {
+    switch (f) {
+    case 0: return VK_BLEND_FACTOR_ZERO;
+    case 1: return VK_BLEND_FACTOR_ONE;
+    case 4: return VK_BLEND_FACTOR_SRC_COLOR;
+    case 5: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+    case 6: return VK_BLEND_FACTOR_SRC_ALPHA;
+    case 7: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    case 8: return VK_BLEND_FACTOR_DST_COLOR;
+    case 9: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+    case 10: return VK_BLEND_FACTOR_DST_ALPHA;
+    case 11: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+    case 12: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+    case 13: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+    case 14: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+    case 15: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+    case 16: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+    default: return VK_BLEND_FACTOR_ZERO;
+    }
+}
+VkBlendOp blend_op(uint32_t o) {
+    static const VkBlendOp ops[] = {VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX,
+                                    VK_BLEND_OP_REVERSE_SUBTRACT};
+    return o < 5 ? ops[o] : VK_BLEND_OP_ADD;
+}
+VkSamplerAddressMode address_mode(uint32_t clamp) {
+    switch (clamp) {
+    case 0: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case 1: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+    case 6: case 7: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; // the halfway and mirrored-once clamps approximated
+    }
+}
+
+struct Shader {
+    xf::ucode::ParsedShader parsed;
+    xf::ucode::ShaderSummary summary;
+    bool translated = false;
+    VkShaderModule module = VK_NULL_HANDLE;
+    std::string unsupported; // why it cannot be drawn with
+    uint32_t colors_written = 0; // oC0-oC3, a bit each
+    bool writes_depth = false;
+    // per texture slot, the first fetch's filter overrides: mag, min, mip, aniso (3: the constant's)
+    std::map<uint32_t, std::array<uint32_t, 4>> filters;
+};
+
+struct RenderTarget {
+    bool depth = false;
+    uint32_t base = 0, pitch = 0, msaa = 0, format = 0;
+    texture::HostFormat host = texture::HostFormat::Unsupported; // color
+    vk::Image image;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t width = 0, height = 0;
+};
+
+struct Texture {
+    vk::Image image;
+    VkImageView view = VK_NULL_HANDLE;
+    uint32_t dimension = 1;
+    uint64_t decoded_at = 0;          // the memory's version
+    uint32_t first_chunk = 0, last_chunk = 0; // the chunks it may read
+    uint32_t first_mip_chunk = 0, last_mip_chunk = 0;
+};
+
+struct System {
+    float ndc_scale[4];
+    float ndc_offset[4];
+    uint32_t slots[32];
+    uint32_t flags[4];
+    float values[4];
+};
+static_assert(sizeof(System) == 192);
+
+class Renderer final : public TraceVisitor {
+public:
+    Renderer(vk::Device &device, const Options &options, Report &report)
+        : d_(device), dev_(device.device()), options_(options), report_(report), regs_(REGISTER_COUNT) {}
+    ~Renderer() override;
+
+    bool init(std::string &error);
+    bool failed(std::string &error) const {
+        if (fatal_.empty()) return false;
+        error = fatal_;
+        return true;
+    }
+    Image &frame() { return frame_; }
+
+    void registers(uint32_t first, std::span<const uint32_t> values) override {
+        for (size_t i = 0; i < values.size() && first + i < regs_.size(); i++) regs_[first + i] = values[i];
+    }
+    void memory_read(uint32_t address, std::span<const uint8_t> bytes) override { memory_.write(address, bytes); }
+    // what the GPU wrote, recorded: Xenia's player skips it, the replay makes its own
+    void memory_write(uint32_t, std::span<const uint8_t>) override {}
+    void gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t>) override {
+        std::copy(table.begin(), table.end(), gamma_table_.begin());
+        have_gamma_ = true;
+    }
+    void packet(uint32_t, std::span<const uint8_t> words) override {
+        if (words.size() < 4 || !fatal_.empty()) return;
+        p_.resize(words.size() / 4);
+        for (size_t i = 0; i < p_.size(); i++) p_[i] = be32(words.data() + 4 * i);
+        report_.packets++;
+        execute();
+    }
+
+private:
+    // the PM4 front end
+    void write(uint32_t index, uint32_t value) {
+        if (index < regs_.size()) regs_[index] = value;
+    }
+    uint32_t arg(size_t i) const { return i < p_.size() ? p_[i] : 0; }
+    void execute();
+    void type3(uint32_t header);
+    void load_shader(uint32_t type, std::span<const uint32_t> code);
+
+    // draws
+    void draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size);
+    void resolve();
+    void swap();
+    void skip(const std::string &reason) {
+        report_.skipped[reason]++;
+        if (options_.verbose) std::fprintf(stderr, "  draw %llu skipped: %s\n", (unsigned long long)report_.draws, reason.c_str());
+    }
+    void approximate(const std::string &what) { report_.approximate[what]++; }
+
+    // resources
+    Shader *shader(uint64_t hash);
+    bool translate(Shader &s, std::string &why);
+    RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
+    VkFormat depth_vk_format(uint32_t format) const;
+    Texture *texture(const uint32_t fetch[6], std::string &why);
+    VkSampler sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides);
+    VkPipeline pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info);
+    bool upload_memory(VkCommandBuffer cmd);
+    bool flush_memory();
+    VkImageView make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
+                          VkComponentMapping components = {}, uint32_t levels = 1, uint32_t layers = 1);
+    bool run(const std::function<void(VkCommandBuffer)> &record) {
+        std::string error;
+        if (d_.run(record, error)) return true;
+        fatal_ = error;
+        return false;
+    }
+    static void full_barrier(VkCommandBuffer cmd) {
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &dep);
+    }
+
+    vk::Device &d_;
+    VkDevice dev_;
+    const Options &options_;
+    Report &report_;
+    std::string fatal_;
+    std::vector<uint32_t> regs_;
+    GuestMemory memory_;
+    std::vector<uint32_t> p_;
+    uint64_t bin_mask_ = ~0ull, bin_select_ = ~0ull;
+    uint64_t vertex_hash_ = 0, pixel_hash_ = 0;
+    bool have_vertex_ = false, have_pixel_ = false;
+    Image frame_;
+    std::array<uint32_t, 256> gamma_table_{};
+    bool have_gamma_ = false;
+
+    std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
+    std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<RenderTarget>> targets_;
+    std::map<std::array<uint32_t, 6>, std::unique_ptr<Texture>> textures_;
+    std::map<std::array<uint32_t, 8>, VkSampler> samplers_;
+    std::map<std::vector<uint32_t>, VkPipeline> pipelines_;
+
+    vk::Buffer guest_, staging_, constants_[2], system_, indices_;
+    uint64_t uploaded_version_ = 0;
+    VkDescriptorSetLayout set_layouts_[2] = {};
+    VkPipelineLayout layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool pool_ = VK_NULL_HANDLE;
+    VkShaderModule rectangle_gs_ = VK_NULL_HANDLE;
+    vk::Image dummy_[3]; // 2D, 3D, cube
+    VkImageView dummy_views_[3] = {};
+    VkSampler dummy_sampler_ = VK_NULL_HANDLE;
+    std::vector<VkImageView> views_; // all made, destroyed at the end
+    VkFormat d24s8_ = VK_FORMAT_D24_UNORM_S8_UINT;
+};
+
+Renderer::~Renderer() {
+    vkDeviceWaitIdle(dev_);
+    for (auto &[k, s] : shaders_)
+        if (s->module) vkDestroyShaderModule(dev_, s->module, nullptr);
+    for (auto &[k, p] : pipelines_) vkDestroyPipeline(dev_, p, nullptr);
+    for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s, nullptr);
+    for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
+    for (auto &[k, t] : targets_) d_.destroy(t->image);
+    for (auto &[k, t] : textures_) d_.destroy(t->image);
+    for (auto &im : dummy_) d_.destroy(im);
+    if (dummy_sampler_) vkDestroySampler(dev_, dummy_sampler_, nullptr);
+    if (rectangle_gs_) vkDestroyShaderModule(dev_, rectangle_gs_, nullptr);
+    if (pool_) vkDestroyDescriptorPool(dev_, pool_, nullptr);
+    if (layout_) vkDestroyPipelineLayout(dev_, layout_, nullptr);
+    for (VkDescriptorSetLayout l : set_layouts_)
+        if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
+    for (vk::Buffer *b : {&guest_, &staging_, &constants_[0], &constants_[1], &system_, &indices_}) d_.destroy(*b);
+}
+
+VkImageView Renderer::make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
+                                VkComponentMapping components, uint32_t levels, uint32_t layers) {
+    VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    info.image = image;
+    info.viewType = type;
+    info.format = format;
+    info.components = components;
+    info.subresourceRange = {aspect, 0, levels, 0, layers};
+    VkImageView view = VK_NULL_HANDLE;
+    if (vkCreateImageView(dev_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+    views_.push_back(view);
+    return view;
+}
+
+bool Renderer::init(std::string &error) {
+    guest_ = d_.create_buffer(GUEST_MEMORY, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+    staging_ = d_.create_buffer(STAGING, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    for (auto &c : constants_) c = d_.create_buffer(sizeof(harness::Constants), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+    system_ = d_.create_buffer(sizeof(System), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+    if (!guest_.buffer || !staging_.buffer || !constants_[0].buffer || !constants_[1].buffer || !system_.buffer)
+        return error = "could not make the renderer's buffers (512 MB of device memory for guest memory)", false;
+
+    if (!d_.format_supported(d24s8_, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) d24s8_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
+
+    const VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutBinding b0[4] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, stages, nullptr},
+    };
+    VkDescriptorSetLayoutBinding b1[4] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, DESCRIPTORS, stages, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, DESCRIPTORS, stages, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, DESCRIPTORS, stages, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_SAMPLER, DESCRIPTORS, stages, nullptr},
+    };
+    VkDescriptorBindingFlags partly[4] = {VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT,
+                                          VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT};
+    VkDescriptorSetLayoutBindingFlagsCreateInfo flags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    flags.bindingCount = 4;
+    flags.pBindingFlags = partly;
+    VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    set_info.bindingCount = 4;
+    set_info.pBindings = b0;
+    if (vkCreateDescriptorSetLayout(dev_, &set_info, nullptr, &set_layouts_[0]) != VK_SUCCESS)
+        return error = "vkCreateDescriptorSetLayout failed", false;
+    set_info.pNext = &flags;
+    set_info.pBindings = b1;
+    if (vkCreateDescriptorSetLayout(dev_, &set_info, nullptr, &set_layouts_[1]) != VK_SUCCESS)
+        return error = "vkCreateDescriptorSetLayout failed", false;
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout_info.setLayoutCount = 2;
+    layout_info.pSetLayouts = set_layouts_;
+    if (vkCreatePipelineLayout(dev_, &layout_info, nullptr, &layout_) != VK_SUCCESS)
+        return error = "vkCreatePipelineLayout failed", false;
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3},
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+                                    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * DESCRIPTORS},
+                                    {VK_DESCRIPTOR_TYPE_SAMPLER, DESCRIPTORS}};
+    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.maxSets = 2;
+    pool_info.poolSizeCount = 4;
+    pool_info.pPoolSizes = sizes;
+    if (vkCreateDescriptorPool(dev_, &pool_info, nullptr, &pool_) != VK_SUCCESS)
+        return error = "vkCreateDescriptorPool failed", false;
+
+    VkShaderModuleCreateInfo gs{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    gs.codeSize = sizeof(RECTANGLE_LIST_GS);
+    gs.pCode = RECTANGLE_LIST_GS;
+    if (vkCreateShaderModule(dev_, &gs, nullptr, &rectangle_gs_) != VK_SUCCESS)
+        return error = "could not make the rectangle list geometry shader", false;
+
+    // the stand-ins for slots without a texture: 1x1 transparent black
+    const VkImageType types[] = {VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_2D};
+    const VkImageViewType view_types[] = {VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_CUBE};
+    for (int k = 0; k < 3; k++) {
+        dummy_[k] = d_.create_image(types[k], VK_FORMAT_R8G8B8A8_UNORM, {1, 1, 1}, 1, k == 2 ? 6 : 1,
+                                    VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                    k == 2 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0);
+        dummy_views_[k] = make_view(dummy_[k].image, view_types[k], VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, {},
+                                    1, k == 2 ? 6 : 1);
+        if (!dummy_views_[k]) return error = "could not make the stand-in images", false;
+    }
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    vkCreateSampler(dev_, &si, nullptr, &dummy_sampler_);
+    return run([&](VkCommandBuffer cmd) {
+        for (auto &im : dummy_) {
+            VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.image = im.image;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, im.layers};
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.imageMemoryBarrierCount = 1;
+            dep.pImageMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(cmd, &dep);
+            VkClearColorValue zero{};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, im.layers};
+            vkCmdClearColorImage(cmd, im.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+        }
+    }) || (error = fatal_, false);
+}
+
+// ---- the PM4 front end ----
+
+void Renderer::execute() {
+    uint32_t h = p_[0];
+    if (h == 0 || h == 0x0BADF00D) return;
+    uint32_t type = h >> 30;
+    if (type == 0) {
+        uint32_t count = ((h >> 16) & 0x3FFF) + 1, base = h & 0x7FFF;
+        bool one = (h >> 15) & 1;
+        for (uint32_t i = 0; i < count && 1 + i < p_.size(); i++) write(one ? base : base + i, p_[1 + i]);
+    } else if (type == 1) {
+        write(h & 0x7FF, arg(1));
+        write((h >> 11) & 0x7FF, arg(2));
+    } else if (type == 3) {
+        type3(h);
+    }
+}
+
+void Renderer::type3(uint32_t h) {
+    uint32_t opcode = (h >> 8) & 0x7F, count = ((h >> 16) & 0x3FFF) + 1;
+    // predicated (bit 0): run only for the selected bins (predicated tiling);
+    // a predicated swap never runs
+    if ((h & 1) && (!(bin_select_ & bin_mask_) || opcode == pm4::XE_SWAP)) return;
+    static const uint32_t bases[] = {reg::ALU_CONSTANTS, reg::FETCH_CONSTANTS, reg::BOOL_CONSTANTS, reg::LOOP_CONSTANTS,
+                                     0x2000};
+    switch (opcode) {
+    case pm4::SET_CONSTANT: {
+        uint32_t kind = (arg(1) >> 16) & 0xFF, index = arg(1) & 0x7FF;
+        if (kind > 4) break;
+        for (uint32_t i = 0; i + 1 < count && 2 + i < p_.size(); i++) write(bases[kind] + index + i, p_[2 + i]);
+        break;
+    }
+    case pm4::SET_CONSTANT2:
+    case pm4::SET_SHADER_CONSTANTS: {
+        uint32_t index = arg(1) & 0xFFFF;
+        for (uint32_t i = 0; i + 1 < count && 2 + i < p_.size(); i++) write(index + i, p_[2 + i]);
+        break;
+    }
+    case pm4::LOAD_ALU_CONSTANT: {
+        uint32_t address = arg(1) & 0x3FFFFFFF, kind = (arg(2) >> 16) & 0xFF, index = arg(2) & 0x7FF;
+        uint32_t size = arg(3) & 0xFFF;
+        if (kind > 4) break;
+        for (uint32_t i = 0; i < size; i++) write(bases[kind] + index + i, memory_.be32(address + 4 * i));
+        break;
+    }
+    case pm4::REG_RMW: {
+        uint32_t info = arg(1), and_mask = arg(2), or_mask = arg(3), index = info & 0x1FFF;
+        uint32_t value = regs_[index];
+        value &= (info >> 31) & 1 ? regs_[and_mask & 0x1FFF] : and_mask;
+        value |= (info >> 30) & 1 ? regs_[or_mask & 0x1FFF] : or_mask;
+        write(index, value);
+        break;
+    }
+    case pm4::IM_LOAD: {
+        uint32_t shader_type = arg(1) & 3, address = arg(1) & ~3u, size = arg(2) & 0xFFFF;
+        std::vector<uint32_t> code(size);
+        for (uint32_t i = 0; i < size; i++) code[i] = memory_.be32(address + 4 * i);
+        load_shader(shader_type, code);
+        break;
+    }
+    case pm4::IM_LOAD_IMMEDIATE: {
+        uint32_t shader_type = arg(1), size = arg(2) & 0xFFFF;
+        if (3 + size > p_.size()) break;
+        load_shader(shader_type, {p_.data() + 3, size});
+        break;
+    }
+    case pm4::DRAW_INDX: draw(arg(2), arg(3), arg(4)); break; // after the viz query token
+    case pm4::DRAW_INDX_2: draw(arg(1), 0, 0); break;
+    case pm4::XE_SWAP: swap(); break;
+    case 0x50: bin_mask_ = uint64_t(arg(1)) << 32 | arg(2); break;   // SET_BIN_MASK
+    case 0x51: bin_select_ = uint64_t(arg(1)) << 32 | arg(2); break; // SET_BIN_SELECT
+    case 0x60: bin_mask_ = (bin_mask_ & ~0xFFFFFFFFull) | arg(1); break;
+    case 0x61: bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) | uint64_t(arg(1)) << 32; break;
+    case 0x62: bin_select_ = (bin_select_ & ~0xFFFFFFFFull) | arg(1); break;
+    case 0x63: bin_select_ = (bin_select_ & 0xFFFFFFFFull) | uint64_t(arg(1)) << 32; break;
+    }
+}
+
+void Renderer::load_shader(uint32_t type, std::span<const uint32_t> code) {
+    if (type > 1) return;
+    uint64_t hash = hash_words(type, code);
+    auto &s = shaders_[hash];
+    if (!s) {
+        s = std::make_unique<Shader>();
+        s->parsed = xf::ucode::parse_shader(type == 0 ? xf::ucode::ShaderType::Vertex : xf::ucode::ShaderType::Pixel, code);
+        s->summary = xf::ucode::analyze(code);
+        report_.shaders++;
+    }
+    (type == 0 ? vertex_hash_ : pixel_hash_) = hash;
+    (type == 0 ? have_vertex_ : have_pixel_) = true;
+}
+
+Shader *Renderer::shader(uint64_t hash) {
+    auto it = shaders_.find(hash);
+    return it == shaders_.end() ? nullptr : it->second.get();
+}
+
+bool Renderer::translate(Shader &s, std::string &why) {
+    if (!s.translated) {
+        s.translated = true;
+        bool pixel = s.parsed.type == xf::ucode::ShaderType::Pixel;
+        for (const xf::ucode::ControlFlow &cf : s.parsed.control_flow) {
+            const auto *e = std::get_if<xf::ucode::Exec>(&cf.instruction);
+            if (!e) continue;
+            for (const xf::ucode::ExecSlot &slot : e->slots) {
+                if (const auto *a = std::get_if<xf::ucode::AluInstruction>(&slot.instruction)) {
+                    for (const xf::ucode::Result *r : {&a->vector_and_constant_result, &a->scalar_result}) {
+                        if (r->target == xf::ucode::StorageTarget::Color && r->used_write_mask()) s.colors_written |= 1u << (r->index & 3);
+                        if (r->target == xf::ucode::StorageTarget::Depth && r->used_write_mask()) s.writes_depth = true;
+                    }
+                } else if (const auto *t = std::get_if<xf::ucode::TextureFetchInstruction>(&slot.instruction)) {
+                    if (t->opcode == xf::ucode::FetchOpcode::TextureFetch && !s.filters.count(t->operands[1].index))
+                        s.filters[t->operands[1].index] = {uint32_t(t->mag_filter), uint32_t(t->min_filter),
+                                                           uint32_t(t->mip_filter), uint32_t(t->aniso_filter)};
+                }
+            }
+        }
+        shader::Translation t = shader::translate(s.parsed, pixel ? shader::Stage::Pixel : shader::Stage::Vertex);
+        if (!t.ok()) {
+            s.unsupported = t.unsupported.empty() ? "the translator wrote nothing" : t.unsupported.front();
+        } else {
+            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            info.codeSize = t.spirv.size() * 4;
+            info.pCode = t.spirv.data();
+            if (vkCreateShaderModule(dev_, &info, nullptr, &s.module) != VK_SUCCESS) s.unsupported = "vkCreateShaderModule failed";
+        }
+    }
+    if (!s.unsupported.empty()) why = s.unsupported;
+    return s.unsupported.empty();
+}
+
+// ---- render targets: EDRAM as host images, one per base, pitch, samples and format ----
+
+VkFormat Renderer::depth_vk_format(uint32_t format) const {
+    return format == 0 ? d24s8_ : VK_FORMAT_D32_SFLOAT_S8_UINT; // D24S8, D24FS8
+}
+
+RenderTarget *Renderer::render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format) {
+    auto key = std::make_tuple(depth, base, pitch, msaa, format);
+    auto it = targets_.find(key);
+    if (it != targets_.end()) return it->second.get();
+
+    auto t = std::make_unique<RenderTarget>();
+    t->depth = depth, t->base = base, t->pitch = pitch, t->msaa = msaa, t->format = format;
+    VkFormat vk_format;
+    uint32_t bytes = 4;
+    if (depth) {
+        vk_format = depth_vk_format(format);
+    } else {
+        t->host = resolve::host_format_of_color_target(format);
+        vk_format = vk_format_of(t->host);
+        if (vk_format == VK_FORMAT_UNDEFINED) return nullptr;
+        bytes = texture::bytes_per_block(t->host) > 4 ? 8 : 4;
+    }
+    // as many rows as fit in EDRAM from the base: a tile is 80x16 samples of
+    // 32 bits (40 wide at 64 bits), 2x MSAA doubles the samples down, 4x
+    // across too
+    uint32_t samples_x = msaa >= 2 ? 2 : 1, samples_y = msaa >= 1 ? 2 : 1;
+    uint32_t tile_width = (bytes == 8 ? 40 : 80) / samples_x, tile_height = 16 / samples_y;
+    uint32_t pitch_tiles = std::max(1u, (pitch + tile_width - 1) / tile_width);
+    uint32_t rows = std::max(1u, (EDRAM_TILES - std::min(base, EDRAM_TILES - 1)) / pitch_tiles);
+    t->width = std::clamp(pitch, 1u, 8192u);
+    t->height = std::clamp(rows * tile_height, 1u, 8192u);
+    VkSampleCountFlagBits samples = msaa == 0 ? VK_SAMPLE_COUNT_1_BIT : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                              (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->width, t->height, 1}, 1, 1, samples, usage);
+    if (!t->image.image) {
+        fatal_ = "could not make a render target";
+        return nullptr;
+    }
+    VkImageAspectFlags aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    t->view = make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format,
+                        depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
+    // EDRAM's contents are not carried from the trace's snapshot yet: zeros
+    VkImage image = t->image.image;
+    if (!run([&](VkCommandBuffer cmd) {
+            VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.image = image;
+            b.subresourceRange = {aspect, 0, 1, 0, 1};
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.imageMemoryBarrierCount = 1;
+            dep.pImageMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(cmd, &dep);
+            VkImageSubresourceRange range{aspect, 0, 1, 0, 1};
+            if (depth) {
+                VkClearDepthStencilValue zero{};
+                vkCmdClearDepthStencilImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            } else {
+                VkClearColorValue zero{};
+                vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            }
+        }))
+        return nullptr;
+    report_.render_targets++;
+    if (options_.verbose)
+        std::fprintf(stderr, "  render target: %s base %u pitch %u msaa %u format %u -> %ux%u\n", depth ? "depth" : "color",
+                     base, pitch, msaa, format, t->width, t->height);
+    return (targets_[key] = std::move(t)).get();
+}
+
+// ---- guest memory on the GPU: what changed, copied over before a draw ----
+
+bool Renderer::upload_memory(VkCommandBuffer cmd) {
+    // the caller has made sure what changed fits in the staging buffer
+    std::vector<VkBufferCopy> copies;
+    VkDeviceSize at = 0;
+    memory_.each_chunk_since(uploaded_version_, [&](uint32_t index, const uint8_t *data) {
+        std::memcpy(static_cast<uint8_t *>(staging_.mapped) + at, data, GuestMemory::CHUNK);
+        copies.push_back({at, VkDeviceSize(index) * GuestMemory::CHUNK, GuestMemory::CHUNK});
+        at += GuestMemory::CHUNK;
+    });
+    uploaded_version_ = memory_.version();
+    if (!copies.empty()) vkCmdCopyBuffer(cmd, staging_.buffer, guest_.buffer, uint32_t(copies.size()), copies.data());
+    full_barrier(cmd);
+    return true;
+}
+
+bool Renderer::flush_memory() {
+    // more than the staging buffer holds: in turns, before the draw
+    std::vector<uint32_t> changed;
+    memory_.each_chunk_since(uploaded_version_, [&](uint32_t index, const uint8_t *) { changed.push_back(index); });
+    if (changed.size() * GuestMemory::CHUNK <= STAGING) return true;
+    std::vector<uint8_t> chunk(GuestMemory::CHUNK);
+    for (size_t first = 0; first < changed.size();) {
+        size_t n = std::min<size_t>(changed.size() - first, STAGING / GuestMemory::CHUNK);
+        std::vector<VkBufferCopy> copies;
+        for (size_t k = 0; k < n; k++) {
+            memory_.read(changed[first + k] * GuestMemory::CHUNK, {static_cast<uint8_t *>(staging_.mapped) + k * GuestMemory::CHUNK, GuestMemory::CHUNK});
+            copies.push_back({k * GuestMemory::CHUNK, VkDeviceSize(changed[first + k]) * GuestMemory::CHUNK, GuestMemory::CHUNK});
+        }
+        if (!run([&](VkCommandBuffer cmd) { vkCmdCopyBuffer(cmd, staging_.buffer, guest_.buffer, uint32_t(copies.size()), copies.data()); }))
+            return false;
+        first += n;
+    }
+    uploaded_version_ = memory_.version();
+    return true;
+}
+
+// ---- textures ----
+
+VkSampler Renderer::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides) {
+    uint32_t mag = (fetch[3] >> 19) & 3, min = (fetch[3] >> 21) & 3, mip = (fetch[3] >> 23) & 3, aniso = (fetch[3] >> 25) & 7;
+    if (overrides[0] != 3) mag = overrides[0];
+    if (overrides[1] != 3) min = overrides[1];
+    if (overrides[2] != 3) mip = overrides[2];
+    if (overrides[3] != 7) aniso = overrides[3];
+    std::array<uint32_t, 8> key = {(fetch[0] >> 10) & 7, (fetch[0] >> 13) & 7, (fetch[0] >> 16) & 7, mag, min, mip, aniso, 0};
+    auto it = samplers_.find(key);
+    if (it != samplers_.end()) return it->second;
+    VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    info.addressModeU = address_mode(key[0]);
+    info.addressModeV = address_mode(key[1]);
+    info.addressModeW = address_mode(key[2]);
+    info.magFilter = mag == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.minFilter = min == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    info.mipmapMode = mip == 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    info.maxLod = mip == 2 ? 0.0f : VK_LOD_CLAMP_NONE; // 2: the base map alone
+    info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    VkSampler s = VK_NULL_HANDLE;
+    vkCreateSampler(dev_, &info, nullptr, &s);
+    return samplers_[key] = s;
+}
+
+Texture *Renderer::texture(const uint32_t fetch[6], std::string &why) {
+    std::array<uint32_t, 6> key;
+    std::copy(fetch, fetch + 6, key.begin());
+    texture::Info info = texture::parse_fetch_constant(fetch);
+    auto changed_since = [&](const Texture &t) {
+        for (uint32_t c = t.first_chunk; c <= t.last_chunk; c++)
+            if (memory_.chunk_version(c) > t.decoded_at) return true;
+        for (uint32_t c = t.first_mip_chunk; c <= t.last_mip_chunk && t.last_mip_chunk; c++)
+            if (memory_.chunk_version(c) > t.decoded_at) return true;
+        return false;
+    };
+    auto it = textures_.find(key);
+    if (it != textures_.end()) {
+        if (!changed_since(*it->second)) return it->second.get();
+        d_.destroy(it->second->image);
+        textures_.erase(it);
+    }
+
+    texture::Image image;
+    if (!texture::decode(info, memory_, image, why)) return nullptr;
+    std::vector<std::vector<uint8_t>> levels = image.levels;
+    VkFormat format = vk_format_of(image.format);
+    if (format == VK_FORMAT_UNDEFINED || !d_.format_supported(format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+        // through 8 bits per component
+        format = VK_FORMAT_R8G8B8A8_UNORM;
+        for (uint32_t l = 0; l < levels.size(); l++) levels[l] = texture::to_rgba8(image, l);
+        approximate("a texture format sampled as 8 bits per component");
+    }
+    if (info.signs[0] || info.signs[1] || info.signs[2] || info.signs[3]) approximate("signed texture components");
+    if (info.gamma) approximate("gamma textures read as linear");
+    if (info.exp_adjust) approximate("texture exponent adjust");
+
+    auto t = std::make_unique<Texture>();
+    t->dimension = info.dimension;
+    bool cube = info.dimension == 3, three = info.dimension == 2;
+    uint32_t layers = three ? 1 : std::max(1u, image.depth);
+    if (info.dimension <= 1 && layers > 1) {
+        why = "stacked textures";
+        return nullptr;
+    }
+    VkExtent3D extent{image.width, image.height, three ? image.depth : 1};
+    uint32_t level_count = uint32_t(levels.size());
+    t->image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, format, extent, level_count, layers,
+                               VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                               cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0);
+    if (!t->image.image) {
+        why = "could not make the image";
+        return nullptr;
+    }
+    // the guest's swizzle over the host format's
+    uint32_t components = format == VK_FORMAT_R8G8B8A8_UNORM && image.format != texture::HostFormat::RGBA8
+                              ? 4
+                              : host_components(image.format);
+    VkComponentMapping mapping{swizzle_of(info.swizzle & 7, components), swizzle_of((info.swizzle >> 3) & 7, components),
+                               swizzle_of((info.swizzle >> 6) & 7, components), swizzle_of((info.swizzle >> 9) & 7, components)};
+    t->view = make_view(t->image.image, cube ? VK_IMAGE_VIEW_TYPE_CUBE : three ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D,
+                        format, VK_IMAGE_ASPECT_COLOR_BIT, mapping, level_count, layers);
+
+    // upload, level by level
+    VkDeviceSize total = 0;
+    for (const auto &l : levels) total += (l.size() + 15) & ~VkDeviceSize(15);
+    vk::Buffer staging = d_.create_buffer(std::max<VkDeviceSize>(total, 16), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    std::vector<VkBufferImageCopy> copies;
+    VkDeviceSize at = 0;
+    bool compressed = format != VK_FORMAT_R8G8B8A8_UNORM && texture::is_compressed(image.format);
+    uint32_t block_size = format == VK_FORMAT_R8G8B8A8_UNORM ? 4 : texture::bytes_per_block(image.format);
+    for (uint32_t l = 0; l < level_count; l++) {
+        VkExtent3D e{std::max(1u, extent.width >> l), std::max(1u, extent.height >> l), std::max(1u, extent.depth >> l)};
+        uint64_t need = compressed ? uint64_t((e.width + 3) / 4) * ((e.height + 3) / 4) : uint64_t(e.width) * e.height;
+        need *= uint64_t(block_size) * e.depth * layers;
+        if (levels[l].size() < need) {
+            // no base level (mips alone), or less than the level holds: left black
+            if (!levels[l].empty()) approximate("texture levels shorter than their size");
+            continue;
+        }
+        std::memcpy(static_cast<uint8_t *>(staging.mapped) + at, levels[l].data(), need);
+        VkBufferImageCopy c{};
+        c.bufferOffset = at;
+        c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, layers};
+        c.imageExtent = e;
+        copies.push_back(c);
+        at += (need + 15) & ~uint64_t(15);
+    }
+    VkImage vk_image = t->image.image;
+    bool ok = run([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.image = vk_image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, level_count, 0, layers};
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &dep);
+        if (!copies.empty())
+            vkCmdCopyBufferToImage(cmd, staging.buffer, vk_image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(copies.size()), copies.data());
+    });
+    d_.destroy(staging);
+    if (!ok) return nullptr;
+
+    // the chunks it may have read, for seeing when it changes: a bound from
+    // the size, 32x32-aligned as tiled textures are
+    t->decoded_at = memory_.version();
+    uint32_t block_bytes = texture::bytes_per_block(image.format);
+    uint64_t texel_bytes = texture::is_compressed(image.format) ? (block_bytes + 15) / 16 : block_bytes;
+    uint64_t row = (std::max(info.pitch, info.width) + 31) & ~31u, rows = (info.height + 31) & ~31u;
+    uint64_t bytes = std::max<uint64_t>(1, row * rows * std::max(1u, info.depth) * std::max<uint64_t>(texel_bytes, 1));
+    bytes = std::min<uint64_t>(bytes, 64u << 20);
+    t->first_chunk = (info.base_address & GuestMemory::PHYSICAL_MASK) / GuestMemory::CHUNK;
+    t->last_chunk = uint32_t(((info.base_address & GuestMemory::PHYSICAL_MASK) + bytes - 1) / GuestMemory::CHUNK);
+    if (info.mip_address && level_count > 1) {
+        t->first_mip_chunk = (info.mip_address & GuestMemory::PHYSICAL_MASK) / GuestMemory::CHUNK;
+        t->last_mip_chunk = uint32_t(((info.mip_address & GuestMemory::PHYSICAL_MASK) + bytes - 1) / GuestMemory::CHUNK);
+    }
+    report_.textures++;
+    return (textures_[key] = std::move(t)).get();
+}
+
+// ---- pipelines ----
+
+VkPipeline Renderer::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info) {
+    auto it = pipelines_.find(key);
+    if (it != pipelines_.end()) return it->second;
+    VkPipeline p = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    report_.pipelines++;
+    return pipelines_[key] = p;
+}
+
+// ---- a draw ----
+
+struct Viewport {
+    VkViewport viewport{};
+    float ndc_scale[3] = {1, 1, 1}, ndc_offset[3] = {};
+    bool empty = false;
+};
+
+// draw_util.cc's GetHostViewportInfo, at resolution scale 1, for Vulkan
+// (origin at the top left, reverse Z allowed)
+Viewport host_viewport(const std::vector<uint32_t> &regs, float max_x, float max_y, bool pixel_writes_depth) {
+    Viewport v;
+    uint32_t clip = regs[r::PA_CL_CLIP_CNTL], vte = regs[r::PA_CL_VTE_CNTL], mode = regs[r::PA_SU_SC_MODE_CNTL];
+    uint32_t vtx = regs[r::PA_SU_VTX_CNTL];
+    const float *vport = reinterpret_cast<const float *>(&regs[r::PA_CL_VPORT_XSCALE]);
+    float scale_xy[2] = {vte & 1 ? vport[0] : 1.0f, vte & 4 ? vport[2] : 1.0f};
+    float scale_z = vte & 16 ? vport[4] : 1.0f;
+    float offset_base_xy[2] = {vte & 2 ? vport[1] : 0.0f, vte & 8 ? vport[3] : 0.0f};
+    float offset_z = vte & 32 ? vport[5] : 0.0f;
+    float offset_add_xy[2] = {};
+    if (mode & (1u << 16)) {
+        uint32_t window = regs[r::PA_SC_WINDOW_OFFSET];
+        offset_add_xy[0] += float(sign_extend(window & 0x7FFF, 15));
+        offset_add_xy[1] += float(sign_extend((window >> 16) & 0x7FFF, 15));
+    }
+    if (!(vtx & 1)) offset_add_xy[0] += 0.5f, offset_add_xy[1] += 0.5f; // Direct3D 9's pixel centers
+    float xy_max[2] = {max_x, max_y};
+    float xy_offset[2], xy_extent[2], z_min, z_max;
+    if (clip & (1u << 16)) {
+        // clipping off: a huge viewport, the offsets in the vertex shader
+        for (int i = 0; i < 2; i++) {
+            float extent = std::min(8192.0f, xy_max[i]);
+            xy_offset[i] = 0;
+            xy_extent[i] = extent;
+            float to_ndc = 2.0f / extent;
+            v.ndc_scale[i] = scale_xy[i] * to_ndc;
+            v.ndc_offset[i] = (offset_base_xy[i] - extent * 0.5f + offset_add_xy[i]) * to_ndc;
+        }
+        z_min = 0.0f, z_max = 1.0f;
+        v.ndc_scale[2] = scale_z, v.ndc_offset[2] = offset_z;
+    } else {
+        for (int i = 0; i < 2; i++) {
+            float offset = offset_base_xy[i] + offset_add_xy[i], scale_abs = std::abs(scale_xy[i]);
+            int32_t axis_1 = int32_t(std::floor(std::clamp(offset + scale_abs, 0.0f, xy_max[i])));
+            int32_t axis_0 = int32_t(std::floor(std::clamp(offset - scale_abs, float(axis_1) - xy_max[i], xy_max[i])));
+            uint32_t extent = axis_1 > 0 ? uint32_t(axis_1 - axis_0) : 0;
+            xy_offset[i] = float(axis_0);
+            xy_extent[i] = float(extent);
+            if (extent) {
+                float inv = 1.0f / float(extent);
+                v.ndc_scale[i] = scale_xy[i] * 2.0f * inv;
+                v.ndc_offset[i] = (offset - (float(axis_0) + float(extent) * 0.5f)) * 2.0f * inv;
+            } else {
+                v.empty = true;
+            }
+        }
+        float host_offset_z, host_scale_z;
+        if (clip & (1u << 19)) {
+            host_offset_z = offset_z, host_scale_z = scale_z;
+            v.ndc_scale[2] = 1.0f, v.ndc_offset[2] = 0.0f;
+        } else {
+            host_offset_z = offset_z - scale_z, host_scale_z = scale_z * 2.0f;
+            v.ndc_scale[2] = 0.5f, v.ndc_offset[2] = 0.5f;
+        }
+        if (pixel_writes_depth) {
+            z_min = 0.0f, z_max = 1.0f;
+        } else {
+            z_min = std::clamp(host_offset_z, 0.0f, 1.0f);
+            z_max = std::clamp(host_offset_z + host_scale_z, 0.0f, 1.0f);
+        }
+    }
+    v.viewport = {xy_offset[0], xy_offset[1], xy_extent[0], xy_extent[1], z_min, z_max};
+    return v;
+}
+
+// draw_util.cc's GetScissor, clamped to the surface pitch, the window offset not in EDRAM
+VkRect2D host_scissor(const std::vector<uint32_t> &regs, uint32_t pitch) {
+    uint32_t tl = regs[r::PA_SC_WINDOW_SCISSOR_TL], br = regs[r::PA_SC_WINDOW_SCISSOR_BR];
+    int32_t tl_x = tl & 0x3FFF, tl_y = (tl >> 16) & 0x3FFF, br_x = br & 0x3FFF, br_y = (br >> 16) & 0x3FFF;
+    if (!(tl >> 31)) {
+        uint32_t window = regs[r::PA_SC_WINDOW_OFFSET];
+        int32_t wx = sign_extend(window & 0x7FFF, 15), wy = sign_extend((window >> 16) & 0x7FFF, 15);
+        tl_x += wx, tl_y += wy, br_x += wx, br_y += wy;
+    }
+    uint32_t stl = regs[r::PA_SC_SCREEN_SCISSOR_TL], sbr = regs[r::PA_SC_SCREEN_SCISSOR_BR];
+    tl_x = std::max(tl_x, sign_extend(stl & 0x7FFF, 15));
+    tl_y = std::max(tl_y, sign_extend((stl >> 16) & 0x7FFF, 15));
+    br_x = std::min(br_x, sign_extend(sbr & 0x7FFF, 15));
+    br_y = std::min(br_y, sign_extend((sbr >> 16) & 0x7FFF, 15));
+    tl_x = std::min(tl_x, int32_t(pitch));
+    br_x = std::min(br_x, int32_t(pitch));
+    tl_x = std::max(tl_x, 0), tl_y = std::max(tl_y, 0);
+    br_x = std::max(br_x, tl_x), br_y = std::max(br_y, tl_y);
+    return {{tl_x, tl_y}, {uint32_t(br_x - tl_x), uint32_t(br_y - tl_y)}};
+}
+
+void Renderer::draw(uint32_t initiator, uint32_t dma_base, uint32_t dma_size) {
+    write(reg::VGT_DRAW_INITIATOR, initiator);
+    report_.draws++;
+    uint32_t mode = regs_[reg::RB_MODECONTROL] & 7;
+    if (EdramMode(mode) == EdramMode::Copy) return resolve();
+    if (EdramMode(mode) != EdramMode::ColorDepth && EdramMode(mode) != EdramMode::DepthOnly) return skip("EDRAM mode " + std::to_string(mode));
+
+    uint32_t primitive = initiator & 0x3F, source = (initiator >> 6) & 3, count = initiator >> 16;
+    bool index32 = (initiator >> 11) & 1;
+    if (count == 0) return;
+    if (SourceSelect(source) == SourceSelect::Immediate) return skip("immediate indices");
+    bool rectangles = primitive == 8;
+    VkPrimitiveTopology topology;
+    switch (primitive) {
+    case 2: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+    case 3: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+    case 4: case 8: case 13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+    case 5: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+    case 6: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+    default: return skip(std::string("primitive ") + primitive_name(primitive));
+    }
+    bool strip = primitive == 3 || primitive == 5 || primitive == 6;
+
+    // shaders
+    Shader *vs = have_vertex_ ? shader(vertex_hash_) : nullptr;
+    if (!vs) return skip("no vertex shader");
+    bool color = EdramMode(mode) == EdramMode::ColorDepth;
+    Shader *ps = color && have_pixel_ ? shader(pixel_hash_) : nullptr;
+    std::string why;
+    if (!translate(*vs, why)) return skip("vertex shader: " + why);
+    if (ps && !translate(*ps, why)) return skip("pixel shader: " + why);
+    if (vs->summary.memexport || (ps && ps->summary.memexport)) return skip("memory export");
+    if (ps && (regs_[reg::SQ_PROGRAM_CNTL] >> 18) & 1) approximate("pixel parameter generation");
+
+    // render targets
+    uint32_t surface = regs_[reg::RB_SURFACE_INFO], pitch = surface & 0x3FFF, msaa = (surface >> 16) & 3;
+    if (!pitch) return skip("surface pitch 0");
+    if (msaa == 3) return skip("MSAA mode 3");
+    RenderTarget *colors[4] = {};
+    uint32_t color_masks[4] = {};
+    uint32_t mask = regs_[reg::RB_COLOR_MASK];
+    for (uint32_t i = 0; i < 4 && ps; i++) {
+        color_masks[i] = (mask >> (4 * i)) & 0xF;
+        if (!color_masks[i] || !(ps->colors_written & (1u << i))) {
+            color_masks[i] = 0;
+            continue;
+        }
+        uint32_t info = regs_[r::COLOR_INFO[i]], format = (info >> 16) & 0xF;
+        if (sign_extend((info >> 20) & 0x3F, 6)) approximate("color exponent bias");
+        if (format == 1) approximate("gamma render targets written linear");
+        if (format == 4 || format == 5) approximate("16-bit fixed render targets in -1..1, not -32..32");
+        colors[i] = render_target(false, info & 0xFFF, pitch, msaa, format);
+        if (!colors[i]) return fatal_.empty() ? skip(std::string("color target format ") + color_target_format_name(format)) : void();
+    }
+    uint32_t depth_control = regs_[reg::RB_DEPTHCONTROL];
+    RenderTarget *depth = nullptr;
+    if (depth_control & 3) {
+        uint32_t info = regs_[reg::RB_DEPTH_INFO], format = (info >> 16) & 1;
+        if (format == 1) approximate("D24FS8 depth as 32-bit float");
+        depth = render_target(true, info & 0xFFF, pitch, msaa, format);
+        if (!depth) return;
+    } else {
+        depth_control = 0;
+    }
+    uint32_t width = 8192, height = 8192;
+    for (RenderTarget *t : colors)
+        if (t) width = std::min(width, t->width), height = std::min(height, t->height);
+    if (depth) width = std::min(width, depth->width), height = std::min(height, depth->height);
+    if (width == 8192 && height == 8192) return skip("nothing to draw to");
+
+    // viewport and scissor
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(d_.physical(), &props);
+    Viewport viewport = host_viewport(regs_, float(props.limits.maxViewportDimensions[0]),
+                                      float(props.limits.maxViewportDimensions[1]), ps && ps->writes_depth);
+    if (viewport.empty) return;
+    VkRect2D scissor = host_scissor(regs_, pitch);
+    scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
+    scissor.extent.height = std::min<uint32_t>(scissor.extent.height, height - std::min<uint32_t>(scissor.offset.y, height));
+    if (!scissor.extent.width || !scissor.extent.height) return;
+
+    // indices: the guest's, swapped, plus the index offset (as Xenia's
+    // vertex shader adds it), reset indices kept as the host's restart index
+    std::vector<uint32_t> indices;
+    indices.reserve(count);
+    uint32_t offset = regs_[r::VGT_INDX_OFFSET];
+    bool restart = strip && (regs_[r::PA_SU_SC_MODE_CNTL] >> 21) & 1;
+    uint32_t reset_index = regs_[r::VGT_MULTI_PRIM_IB_RESET_INDX];
+    auto vertex = [&](uint32_t index) { return index + offset; };
+    if (SourceSelect(source) == SourceSelect::DMA) {
+        uint32_t endian = dma_size >> 30, size = index32 ? 4 : 2;
+        uint32_t base = dma_base & ~(size - 1);
+        for (uint32_t i = 0; i < count; i++) {
+            uint8_t b[4] = {};
+            memory_.read(base + i * size, {b, size});
+            uint32_t raw = index32 ? uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24
+                                   : uint32_t(b[0]) | uint32_t(b[1]) << 8;
+            uint32_t index = index32 ? gpu_swap(raw, endian) : (endian == 1 ? ((raw >> 8) | (raw << 8)) & 0xFFFF : raw);
+            if (!index32) index &= 0xFFFF;
+            if (restart && index == (index32 ? reset_index : reset_index & 0xFFFF)) indices.push_back(UINT32_MAX);
+            else indices.push_back(vertex(index));
+        }
+    } else {
+        for (uint32_t i = 0; i < count; i++) indices.push_back(vertex(i));
+    }
+    if (primitive == 13) {
+        // quads to triangle pairs
+        std::vector<uint32_t> triangles;
+        for (uint32_t q = 0; q + 3 < indices.size(); q += 4)
+            for (uint32_t k : {0, 1, 2, 0, 2, 3}) triangles.push_back(indices[q + k]);
+        indices = std::move(triangles);
+        if (indices.empty()) return;
+    }
+    VkDeviceSize index_bytes = indices.size() * 4;
+    if (indices_.size < index_bytes) {
+        d_.destroy(indices_);
+        indices_ = d_.create_buffer(std::max<VkDeviceSize>(index_bytes, 1 << 20), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true);
+    }
+    std::memcpy(indices_.mapped, indices.data(), index_bytes);
+
+    // constants
+    for (int stage = 0; stage < 2; stage++) {
+        auto *c = static_cast<harness::Constants *>(constants_[stage].mapped);
+        std::memcpy(c->float_constants, &regs_[reg::ALU_CONSTANTS + stage * 1024], 4096);
+        std::memcpy(c->bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(c->bool_constants));
+        std::memcpy(c->loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(c->loop_constants));
+        std::memcpy(c->fetch_constants, &regs_[reg::FETCH_CONSTANTS], sizeof(c->fetch_constants));
+    }
+    System sys{};
+    for (int i = 0; i < 3; i++) sys.ndc_scale[i] = viewport.ndc_scale[i], sys.ndc_offset[i] = viewport.ndc_offset[i];
+    sys.ndc_scale[3] = 1.0f;
+    uint32_t color_control = regs_[r::RB_COLORCONTROL];
+    if (color_control & 8) sys.flags[0] = 8 | (color_control & 7);
+    sys.values[0] = as_float(regs_[r::RB_ALPHA_REF]);
+    uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
+    sys.flags[1] = ((vte >> 10) & 1) | ((vte >> 8) & 1) << 1 | ((vte >> 9) & 1) << 2;
+    if (color_control & 16) approximate("alpha to coverage");
+
+    // textures: per slot the shaders read, an image in the array of its
+    // dimension and a sampler
+    std::vector<VkDescriptorImageInfo> images[3], samplers;
+    std::set<uint32_t> slots(vs->summary.texture_slots.begin(), vs->summary.texture_slots.end());
+    if (ps) slots.insert(ps->summary.texture_slots.begin(), ps->summary.texture_slots.end());
+    for (int k = 0; k < 3; k++) images[k].push_back({VK_NULL_HANDLE, dummy_views_[k], VK_IMAGE_LAYOUT_GENERAL});
+    samplers.push_back({dummy_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+    for (uint32_t slot = 0; slot < 32; slot++) sys.slots[slot] = 0; // the stand-ins
+    for (uint32_t slot : slots) {
+        const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS + slot * 6];
+        if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture) {
+            approximate("a texture slot without a texture constant");
+            continue;
+        }
+        std::string reason;
+        Texture *t = texture(fetch, reason);
+        if (!fatal_.empty()) return;
+        if (!t) {
+            approximate("texture not decoded: " + reason);
+            continue;
+        }
+        uint32_t kind = t->dimension == 2 ? 1 : t->dimension == 3 ? 2 : 0;
+        std::array<uint32_t, 4> overrides = {3, 3, 3, 7};
+        for (Shader *s : {vs, ps})
+            if (s && s->filters.count(slot)) {
+                overrides = s->filters[slot];
+                break;
+            }
+        if (images[kind].size() >= DESCRIPTORS || samplers.size() >= DESCRIPTORS) continue;
+        uint32_t image_index = uint32_t(images[kind].size()), sampler_index = uint32_t(samplers.size());
+        images[kind].push_back({VK_NULL_HANDLE, t->view, VK_IMAGE_LAYOUT_GENERAL});
+        samplers.push_back({sampler(fetch, overrides), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+        sys.slots[slot] = image_index | sampler_index << 16;
+    }
+    std::memcpy(system_.mapped, &sys, sizeof(sys));
+
+    // the pipeline
+    VkFormat color_formats[4] = {};
+    VkPipelineColorBlendAttachmentState blends[4] = {};
+    std::vector<uint32_t> key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32),
+                                 ps ? uint32_t(pixel_hash_) : 0, ps ? uint32_t(pixel_hash_ >> 32) : 0,
+                                 uint32_t(topology), rectangles, restart, msaa, depth ? depth->image.format : 0u,
+                                 depth_control, regs_[r::PA_SU_SC_MODE_CNTL] & 7, regs_[r::PA_CL_CLIP_CNTL] & (1u << 16)};
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!colors[i]) continue;
+        color_formats[i] = colors[i]->image.format;
+        uint32_t blend = regs_[r::RB_BLENDCONTROL[i]];
+        VkPipelineColorBlendAttachmentState &b = blends[i];
+        b.colorWriteMask = color_masks[i];
+        b.srcColorBlendFactor = blend_factor(blend & 0x1F);
+        b.colorBlendOp = blend_op((blend >> 5) & 7);
+        b.dstColorBlendFactor = blend_factor((blend >> 8) & 0x1F);
+        b.srcAlphaBlendFactor = blend_factor((blend >> 16) & 0x1F);
+        b.alphaBlendOp = blend_op((blend >> 21) & 7);
+        b.dstAlphaBlendFactor = blend_factor((blend >> 24) & 0x1F);
+        b.blendEnable = (blend & 0x1FFF1FFF) != 0x00010001; // not ONE, ADD, ZERO for both
+        key.insert(key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
+    }
+    VkPipelineShaderStageCreateInfo stages[3] = {};
+    uint32_t stage_count = 0;
+    stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
+                             vs->module, "main", nullptr};
+    if (rectangles)
+        stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                 VK_SHADER_STAGE_GEOMETRY_BIT, rectangle_gs_, "main", nullptr};
+    if (ps)
+        stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
+                                 VK_SHADER_STAGE_FRAGMENT_BIT, ps->module, "main", nullptr};
+    VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = topology;
+    assembly.primitiveRestartEnable = restart;
+    VkPipelineViewportStateCreateInfo viewport_state{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport_state.viewportCount = viewport_state.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.lineWidth = 1.0f;
+    uint32_t sc_mode = regs_[r::PA_SU_SC_MODE_CNTL];
+    bool triangles = primitive >= 4 && !rectangles;
+    if (triangles) {
+        raster.cullMode = (sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0);
+        raster.frontFace = sc_mode & 4 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        if ((sc_mode >> 3) & 3) approximate("polygon modes other than fill");
+        if ((sc_mode >> 11) & 3) approximate("polygon offset");
+    }
+    raster.depthClampEnable = (regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = msaa == 0 ? VK_SAMPLE_COUNT_1_BIT : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
+    VkPipelineDepthStencilStateCreateInfo depth_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    if (depth) {
+        depth_state.depthTestEnable = (depth_control >> 1) & 1;
+        depth_state.depthWriteEnable = (depth_control >> 2) & 1;
+        depth_state.depthCompareOp = compare_op(depth_control >> 4);
+        depth_state.stencilTestEnable = depth_control & 1;
+        auto face = [&](uint32_t shift) {
+            VkStencilOpState s{};
+            s.compareOp = compare_op(depth_control >> shift);
+            s.failOp = stencil_op(depth_control >> (shift + 3));
+            s.passOp = stencil_op(depth_control >> (shift + 6));
+            s.depthFailOp = stencil_op(depth_control >> (shift + 9));
+            return s;
+        };
+        depth_state.front = face(8);
+        depth_state.back = (depth_control >> 7) & 1 ? face(20) : depth_state.front;
+    }
+    VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blend_state.attachmentCount = 4;
+    blend_state.pAttachments = blends;
+    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                             VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                                             VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 6;
+    dynamic.pDynamicStates = dynamic_states;
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rendering.colorAttachmentCount = 4;
+    rendering.pColorAttachmentFormats = color_formats;
+    rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = depth ? depth->image.format : VK_FORMAT_UNDEFINED;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &rendering;
+    info.stageCount = stage_count;
+    info.pStages = stages;
+    info.pVertexInputState = &vertex_input;
+    info.pInputAssemblyState = &assembly;
+    info.pViewportState = &viewport_state;
+    info.pRasterizationState = &raster;
+    info.pMultisampleState = &multisample;
+    info.pDepthStencilState = &depth_state;
+    info.pColorBlendState = &blend_state;
+    info.pDynamicState = &dynamic;
+    info.layout = layout_;
+    VkPipeline pipe = pipeline(key, info);
+    if (!pipe) return skip("vkCreateGraphicsPipelines failed");
+
+    // descriptors
+    if (!flush_memory()) return;
+    vkResetDescriptorPool(dev_, pool_, 0);
+    VkDescriptorSet sets[2];
+    VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    alloc.descriptorPool = pool_;
+    alloc.descriptorSetCount = 2;
+    alloc.pSetLayouts = set_layouts_;
+    if (vkAllocateDescriptorSets(dev_, &alloc, sets) != VK_SUCCESS) {
+        fatal_ = "vkAllocateDescriptorSets failed";
+        return;
+    }
+    VkDescriptorBufferInfo buffers[4] = {{constants_[0].buffer, 0, VK_WHOLE_SIZE},
+                                         {guest_.buffer, 0, VK_WHOLE_SIZE},
+                                         {system_.buffer, 0, VK_WHOLE_SIZE},
+                                         {constants_[1].buffer, 0, VK_WHOLE_SIZE}};
+    std::vector<VkWriteDescriptorSet> writes;
+    for (uint32_t b = 0; b < 4; b++) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = sets[0];
+        w.dstBinding = b;
+        w.descriptorCount = 1;
+        w.descriptorType = b == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w.pBufferInfo = &buffers[b];
+        writes.push_back(w);
+    }
+    for (uint32_t b = 0; b < 4; b++) {
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = sets[1];
+        w.dstBinding = b;
+        w.descriptorType = b == 3 ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        const auto &list = b == 3 ? samplers : images[b];
+        w.descriptorCount = uint32_t(list.size());
+        w.pImageInfo = list.data();
+        writes.push_back(w);
+    }
+    vkUpdateDescriptorSets(dev_, uint32_t(writes.size()), writes.data(), 0, nullptr);
+
+    // record, submit, wait
+    uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
+    if (!((depth_control >> 7) & 1)) stencil_bf = stencil;
+    const float *blend_constants = reinterpret_cast<const float *>(&regs_[r::RB_BLEND_RED]);
+    uint32_t index_count = uint32_t(indices.size());
+    run([&](VkCommandBuffer cmd) {
+        upload_memory(cmd);
+        VkRenderingAttachmentInfo attachments[4] = {};
+        for (uint32_t i = 0; i < 4; i++) {
+            attachments[i] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            attachments[i].imageView = colors[i] ? colors[i]->view : VK_NULL_HANDLE;
+            attachments[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        VkRenderingAttachmentInfo depth_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        depth_attachment.imageView = depth ? depth->view : VK_NULL_HANDLE;
+        depth_attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo rendering_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        rendering_info.renderArea = {{0, 0}, {width, height}};
+        rendering_info.layerCount = 1;
+        rendering_info.colorAttachmentCount = 4;
+        rendering_info.pColorAttachments = attachments;
+        if (depth) rendering_info.pDepthAttachment = rendering_info.pStencilAttachment = &depth_attachment;
+        vkCmdBeginRendering(cmd, &rendering_info);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 0, nullptr);
+        vkCmdBindIndexBuffer(cmd, indices_.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdSetViewport(cmd, 0, 1, &viewport.viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vkCmdSetBlendConstants(cmd, blend_constants);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, stencil & 0xFF);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, stencil_bf & 0xFF);
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, (stencil >> 8) & 0xFF);
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 8) & 0xFF);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, (stencil >> 16) & 0xFF);
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 16) & 0xFF);
+        vkCmdDrawIndexed(cmd, index_count, 1, 0, 0, 0);
+        vkCmdEndRendering(cmd);
+    });
+    report_.drawn++;
+    if (options_.verbose)
+        std::fprintf(stderr, "  draw %llu: %s, %u indices, %s%s\n", (unsigned long long)report_.draws, primitive_name(primitive),
+                     count, ps ? "color and depth" : "depth only", depth ? ", depth on" : "");
+}
+
+// ---- resolves ----
+
+void Renderer::resolve() {
+    report_.resolves++;
+    resolve::Info info;
+    std::string why;
+    if (!resolve::get_info(regs_, memory_, info, why)) return skip("resolve: " + why);
+    if (!info.copy && !why.empty()) approximate("resolve not copied: " + why);
+    uint32_t pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
+    RenderTarget *source = render_target(info.depth, info.edram_base, info.surface_pitch ? info.surface_pitch : pitch,
+                                         info.msaa, info.source_format);
+    if (!source) return fatal_.empty() ? skip("resolve: source format") : void();
+    uint32_t x = std::min(info.x, source->width), y = std::min(info.y, source->height);
+    uint32_t w = std::min(info.width, source->width - x), h = std::min(info.height, source->height - y);
+    if (options_.verbose)
+        std::fprintf(stderr, "  resolve: %s base %u (%u,%u %ux%u) -> %08X format %u%s%s\n", info.depth ? "depth" : "color",
+                     info.edram_base, x, y, w, h, info.dest_base, info.dest_format, info.clear_color ? ", clear color" : "",
+                     info.clear_depth ? ", clear depth" : "");
+
+    if (info.copy && w && h) {
+        if (info.depth && info.msaa) {
+            approximate("MSAA depth resolves (not done)");
+        } else {
+            uint32_t texel = info.depth ? 4 : texture::bytes_per_block(source->host);
+            VkDeviceSize bytes = VkDeviceSize(w) * h * texel;
+            vk::Buffer readback = d_.create_buffer(bytes + VkDeviceSize(w) * h, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+            vk::Image resolved;
+            if (!info.depth && info.msaa) {
+                resolved = d_.create_image(VK_IMAGE_TYPE_2D, source->image.format, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                uint32_t select = (regs_[r::RB_COPY_CONTROL] >> 4) & 7;
+                if (select != 6 && !(select == 4 && info.msaa == 1)) approximate("resolves of one MSAA sample, averaged");
+            }
+            bool ok = run([&](VkCommandBuffer cmd) {
+                full_barrier(cmd);
+                VkImage from = source->image.image;
+                VkOffset3D at{int32_t(x), int32_t(y), 0};
+                if (resolved.image) {
+                    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+                    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                    b.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+                    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    b.image = resolved.image;
+                    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                    dep.imageMemoryBarrierCount = 1;
+                    dep.pImageMemoryBarriers = &b;
+                    vkCmdPipelineBarrier2(cmd, &dep);
+                    VkImageResolve region{};
+                    region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    region.srcOffset = at;
+                    region.extent = {w, h, 1};
+                    vkCmdResolveImage(cmd, from, VK_IMAGE_LAYOUT_GENERAL, resolved.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+                    full_barrier(cmd);
+                    from = resolved.image;
+                    at = {0, 0, 0};
+                }
+                VkBufferImageCopy copy{};
+                copy.imageSubresource = {VkImageAspectFlags(info.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
+                copy.imageOffset = at;
+                copy.imageExtent = {w, h, 1};
+                vkCmdCopyImageToBuffer(cmd, from, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1, &copy);
+                if (info.depth) {
+                    copy.bufferOffset = bytes;
+                    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+                    vkCmdCopyImageToBuffer(cmd, from, VK_IMAGE_LAYOUT_GENERAL, readback.buffer, 1, &copy);
+                }
+            });
+            if (ok) {
+                const uint8_t *data = static_cast<const uint8_t *>(readback.mapped);
+                std::vector<uint8_t> pixels(data, data + bytes);
+                if (info.depth) {
+                    // as D24S8 words: depth in the high 24 bits
+                    bool float_depth = source->image.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+                    for (uint32_t i = 0; i < w * h; i++) {
+                        uint32_t d;
+                        std::memcpy(&d, data + 4 * i, 4);
+                        uint32_t d24 = float_depth ? uint32_t(std::lround(std::clamp(as_float(d), 0.0f, 1.0f) * 16777215.0))
+                                                   : d & 0xFFFFFF;
+                        uint32_t word = d24 << 8 | data[bytes + i];
+                        std::memcpy(&pixels[4 * i], &word, 4);
+                    }
+                }
+                resolve::Info clipped = info;
+                clipped.x = x, clipped.y = y, clipped.width = w, clipped.height = h;
+                if (!resolve::write(clipped, pixels, memory_, why)) approximate("resolve not written: " + why);
+            }
+            d_.destroy(readback);
+            if (resolved.image) d_.destroy(resolved);
+            if (!ok) return;
+        }
+    }
+
+    // the clears, after the copy, over the same rectangle
+    if ((info.clear_color || info.clear_depth) && w && h) {
+        uint32_t msaa = (regs_[reg::RB_SURFACE_INFO] >> 16) & 3;
+        RenderTarget *depth_target = nullptr, *color_target = nullptr;
+        if (info.clear_depth) {
+            uint32_t depth_info = regs_[reg::RB_DEPTH_INFO];
+            depth_target = render_target(true, depth_info & 0xFFF, source->pitch, msaa, (depth_info >> 16) & 1);
+        }
+        if (info.clear_color) {
+            uint32_t color_info = regs_[r::COLOR_INFO[info.color_target & 3]];
+            color_target = render_target(false, color_info & 0xFFF, source->pitch, msaa, (color_info >> 16) & 0xF);
+        }
+        for (RenderTarget *t : {depth_target, color_target}) {
+            if (!t) continue;
+            VkClearAttachment clear{};
+            if (t->depth) {
+                uint32_t value = regs_[r::RB_DEPTH_CLEAR];
+                clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                clear.clearValue.depthStencil.depth =
+                    t->format == 0 ? float(value >> 8) / 16777215.0f : std::min(1.0f, float24_to_float(value >> 8));
+                clear.clearValue.depthStencil.stencil = value & 0xFF;
+            } else {
+                clear.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                uint64_t value = regs_[r::RB_COLOR_CLEAR];
+                if (texture::bytes_per_block(t->host) == 8) value = value << 32 | regs_[r::RB_COLOR_CLEAR_LO];
+                auto &c = clear.clearValue.color;
+                using H = texture::HostFormat;
+                switch (t->host) {
+                case H::RGBA8:
+                    for (int j = 0; j < 4; j++) c.float32[j] = float((value >> (8 * j)) & 0xFF) / 255.0f;
+                    break;
+                case H::RGB10A2:
+                    for (int j = 0; j < 3; j++) c.float32[j] = float((value >> (10 * j)) & 0x3FF) / 1023.0f;
+                    c.float32[3] = float((value >> 30) & 3) / 3.0f;
+                    break;
+                case H::RG16F: case H::RGBA16F:
+                    for (int j = 0; j < 4; j++) c.float32[j] = half_to_float(uint16_t(value >> (16 * j)));
+                    break;
+                case H::R32F: case H::RG32F:
+                    c.float32[0] = as_float(uint32_t(value >> (t->host == H::RG32F ? 32 : 0)));
+                    c.float32[1] = as_float(uint32_t(value));
+                    break;
+                default:
+                    for (int j = 0; j < 4; j++) c.float32[j] = float((value >> (16 * j)) & 0xFFFF) / 65535.0f;
+                    approximate("clears of 16-bit fixed render targets");
+                    break;
+                }
+            }
+            VkClearRect rect{{{int32_t(x), int32_t(y)}, {std::min(w, t->width - std::min(x, t->width)), std::min(h, t->height - std::min(y, t->height))}}, 0, 1};
+            if (!rect.rect.extent.width || !rect.rect.extent.height) continue;
+            run([&](VkCommandBuffer cmd) {
+                full_barrier(cmd);
+                VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                attachment.imageView = t->view;
+                attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                rendering.renderArea = {{0, 0}, {t->width, t->height}};
+                rendering.layerCount = 1;
+                if (t->depth) {
+                    rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
+                } else {
+                    rendering.colorAttachmentCount = 1;
+                    rendering.pColorAttachments = &attachment;
+                }
+                vkCmdBeginRendering(cmd, &rendering);
+                vkCmdClearAttachments(cmd, 1, &clear, 1, &rect);
+                vkCmdEndRendering(cmd);
+            });
+        }
+    }
+}
+
+// ---- the swap: texture fetch constant 0, as Xenia's RequestSwapTexture ----
+
+void Renderer::swap() {
+    report_.swaps++;
+    const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS];
+    texture::Info info = texture::parse_fetch_constant(fetch);
+    if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture || info.dimension != 1 || !info.base_address) {
+        approximate("a swap without a 2D texture in fetch constant 0");
+        return;
+    }
+    texture::Image image;
+    std::string why;
+    if (!texture::decode(info, memory_, image, why)) {
+        approximate("swap texture not decoded: " + why);
+        return;
+    }
+    std::vector<uint8_t> rgba = texture::to_rgba8(image, 0);
+    uint32_t components = image.format == texture::HostFormat::RGBA8 ? 4 : host_components(image.format);
+    frame_.width = image.width, frame_.height = image.height;
+    frame_.rgba.resize(size_t(image.width) * image.height * 4);
+    for (size_t i = 0; i < size_t(image.width) * image.height; i++)
+        for (uint32_t c = 0; c < 4; c++) {
+            uint32_t guest = (info.swizzle >> (3 * c)) & 7;
+            uint8_t value = guest == 5 ? 255 : guest >= 4 ? 0 : rgba[i * 4 + std::min(guest, components - 1)];
+            frame_.rgba[i * 4 + c] = c == 3 ? 255 : value; // shown opaque, as the presenter does
+        }
+    // the display's gamma: as Xenia's presenter, the piecewise linear ramp
+    // for 2_10_10_10 front buffers (not yet), the 256-entry table for the
+    // rest (apply_gamma_table.xesli), the 10 bits it gives back to 8
+    if (!have_gamma_) return;
+    if (info.format == 7 || info.format == 54) {
+        approximate("the display's piecewise linear gamma ramp");
+        return;
+    }
+    for (size_t i = 0; i < size_t(image.width) * image.height; i++)
+        for (uint32_t c = 0; c < 3; c++) {
+            uint32_t entry = gamma_table_[frame_.rgba[i * 4 + c]];
+            uint32_t ten = (entry >> (c == 0 ? 20 : c == 1 ? 10 : 0)) & 0x3FF;
+            frame_.rgba[i * 4 + c] = uint8_t((ten * 255 + 511) / 1023);
+        }
+}
+
+} // namespace
+
+bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, Image &frame, Report &report,
+            std::string &error) {
+    Renderer renderer(device, options, report);
+    if (!renderer.init(error)) return false;
+    if (!walk_gpu_trace(trace, renderer, error)) return false;
+    if (renderer.failed(error)) return false;
+    frame = std::move(renderer.frame());
+    return true;
+}
+
+} // namespace xf::render
