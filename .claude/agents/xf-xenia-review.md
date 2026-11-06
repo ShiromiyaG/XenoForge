@@ -2,7 +2,7 @@
 name: xf-xenia-review
 description: Read-only review of XenoForge code translated from Xenia - compares each function with the Xenia source it follows and lists every divergence (behavior, guest structure layouts, status codes, edge cases), saying which are documented as intended. Use to check another agent's work, given the files or the diff to review.
 tools: Read, Grep, Glob, Bash
-model: inherit
+model: sonnet
 effort: high
 ---
 
@@ -43,6 +43,22 @@ Xenia is its reference and oracle. You do not change anything: you read, compare
   running. Other agents may be building on the same machine.
 - Be concrete: every finding cites the XenoForge file:line and the Xenia file:line, and says what each
   side does. No style comments unless they hide a bug.
+
+## Token economy (the owner's rule, 2026-11-06)
+
+Tokens are the session's budget: every line read stays in the context. Spend them on the work, not on
+output.
+- **Builds and tests write to a file; read only what matters.** For example:
+  `cmake --build build -j 4 > build.log 2>&1; echo $?; grep -E "error|FAILED" build.log | head`. Do
+  the same for ctest, boots and replays: the summary lines, the first errors, the counts you need.
+- **Big files are read by range, after a search.** Use Grep to find the function, then Read with an
+  offset and a limit. Never read a whole large file such as renderer.cpp, shader_translator.cpp, or a
+  Xenia source, and never read the same range twice.
+- **Repeat a test only as much as the question needs.** Five runs show a test is not flaky. Go further
+  only when chasing a hang or a race.
+- **Measure once per question.** A run's numbers go in the report; don't rerun to see them again.
+- **The report is short:** about 30 lines, the essentials of the list below. Details belong in the docs
+  you changed, not in the report.
 
 ## Report
 

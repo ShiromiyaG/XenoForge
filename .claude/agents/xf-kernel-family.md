@@ -2,7 +2,7 @@
 name: xf-kernel-family
 description: Implements one XenoForge kernel export family (xboxkrnl/xam exports, the objects and state behind them) translated from Xenia, with tests and measurements from boot. Use for kernel work in F:\RECOMPs\XenoForge, one family per agent; the brief names the family, the Xenia sources, and what other agents are touching.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
-model: inherit
+model: sonnet
 effort: high
 isolation: worktree
 ---
@@ -73,6 +73,22 @@ threads.cpp, sync.cpp. Follow their style.
   `build/xfinspect.exe <iso> --imports` lists a game's imports.
 - Shell: Bash is Git Bash on Windows. Heredocs mangle backslashes (`\n` turns into a real newline),
   so make code changes with Edit/Write, not with scripts in heredocs.
+
+## Token economy (the owner's rule, 2026-11-06)
+
+Tokens are the session's budget: every line read stays in the context. Spend them on the work, not on
+output.
+- **Builds and tests write to a file; read only what matters.** For example:
+  `cmake --build build -j 4 > build.log 2>&1; echo $?; grep -E "error|FAILED" build.log | head`. Do
+  the same for ctest, boots and replays: the summary lines, the first errors, the counts you need.
+- **Big files are read by range, after a search.** Use Grep to find the function, then Read with an
+  offset and a limit. Never read a whole large file such as renderer.cpp, shader_translator.cpp, or a
+  Xenia source, and never read the same range twice.
+- **Repeat a test only as much as the question needs.** Five runs show a test is not flaky. Go further
+  only when chasing a hang or a race.
+- **Measure once per question.** A run's numbers go in the report; don't rerun to see them again.
+- **The report is short:** about 30 lines, the essentials of the list below. Details belong in the docs
+  you changed, not in the report.
 
 ## Report
 
