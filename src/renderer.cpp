@@ -1594,9 +1594,10 @@ bool Impl::init(std::string &error) {
         // the resolves' from the scratch buffer and from EDRAM (multisampled
         // sources), and the texture loads'
         resolve_set_ = sets[0], load_set_ = sets[1], resolve_edram_set_ = sets[2];
-        VkDescriptorBufferInfo buffers[6] = {{scratch_.buffer, 0, VK_WHOLE_SIZE},      {mirror_.buffer, 0, VK_WHOLE_SIZE},
-                                             {mirror_.buffer, 0, VK_WHOLE_SIZE},       {load_scratch_.buffer, 0, VK_WHOLE_SIZE},
-                                             {edram_.buffer, 0, VK_WHOLE_SIZE}, {mirror_.buffer, 0, VK_WHOLE_SIZE}};
+        VkDescriptorBufferInfo buffers[6] = {
+            {scratch_.buffer, 0, VK_WHOLE_SIZE}, {mirror_.buffer, 0, VK_WHOLE_SIZE},
+            {mirror_.buffer, 0, VK_WHOLE_SIZE},  {load_scratch_.buffer, 0, VK_WHOLE_SIZE},
+            {edram_.buffer, 0, VK_WHOLE_SIZE},   {mirror_.buffer, 0, VK_WHOLE_SIZE}};
         VkWriteDescriptorSet writes[6] = {};
         for (uint32_t k = 0; k < 6; k++) {
             writes[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};

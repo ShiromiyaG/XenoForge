@@ -113,37 +113,24 @@ written after binding, each image at its own index for its life. The
 renderer waits for the GPU only to reuse a submission's slot, or when the
 CPU must see what the GPU wrote.
 
-**Guest memory on the GPU: the mirror (B4, 2026-11-05).** Xenia keeps all
-of guest memory on the GPU (its shared memory) and learns of the CPU's
-writes from page watches. XenoForge has no page watches yet, and guest
-memory is host memory the renderer reads where it lies; so its copy on
-the GPU (512 MB, device-local) holds what the GPU writes and what reads of
-that need around it.
+**Guest memory on the GPU: the mirror (B4, 2026-11-05; watched since
+2026-11-06).** Xenia keeps all of guest memory on the GPU (its shared
+memory) and learns of the CPU's writes from page watches; so does the
+renderer now ("Write watches and read-backs" below). Its copy on the GPU
+(512 MB, device-local) holds what the GPU writes and what reads of that
+need around it.
 - A resolve runs on the GPU: the rectangle copied from its render target
-  into a scratch buffer (to one sample first when multisampled, as before),
-  then `resolve.comp` (resolve.cpp's write, ported with its arithmetic kept
-  exact) writes it into the mirror, tiled. The 32x32 tiles the rectangle
-  cuts at its edges get guest memory's bytes first, so the rest of them
-  is the CPU's (`resolve::destination_ranges`).
-- Until guest memory has it, what a resolve wrote is pending: textures over
-  it are loaded from the mirror; a draw whose vertex data lies there reads
-  the mirror instead of the arena; a front buffer read back and textures
-  in formats only the CPU decodes (DXT3A, CTX1) wait for it.
-- Guest memory gets it once the GPU is done, without waiting: the resolve's
-  ranges are copied into a read-back buffer on the GPU, and into guest
-  memory at the first call of the processor's that finds the submission
-  done (its textures are then checked by hash again). A later resolve of the
-  same range takes over (only the newest bytes are copied); the processor's
-  own writes there (`memory_written`, a trace's memory) cancel it.
-- Why copy it back at all rather than when the CPU reads it (the page
-  guards of "EDRAM as render targets" above): nothing tells the renderer
-  when the CPU reads, and a game reading a resolved surface (a screenshot,
-  a save's thumbnail, data rendered on the GPU) must find it there. Xenia's
-  default (`readback_resolve=fast`) copies every resolve back too, a frame
-  late; here it lands when the GPU is done. With page guards it can become
-  lazy. Until then, the CPU writing a range between a resolve and its copy
-  back loses that write (Xenia's fast readback has the same window, a frame
-  long).
+  into a scratch buffer (from EDRAM when multisampled, below), then
+  `resolve.comp` (resolve.cpp's write, ported with its arithmetic kept
+  exact) writes it into the mirror, tiled. The pages it does not write
+  whole get guest memory's bytes first, so the rest of them is the CPU's
+  (`resolve::destination_ranges`).
+- Its pages are then the GPU's until the CPU writes them: textures over
+  them are loaded from the mirror, vertex data there is read from the
+  mirror.
+- Guest memory gets the bytes as Xenia's `readback_resolve` says: never by
+  default, as Xenia's default since December 2025 ("Write watches and
+  read-backs").
 
 **Front buffers read back without waiting (B4).** A swap asked for
 (`frame_wanted`) records a copy of its front buffer (fetch constant 0, as a
@@ -185,10 +172,8 @@ agree on the shared memory):
   over them are loaded again, from the mirror, and vertex data there is
   read from the mirror. Guest memory never gets the exported bytes, as with
   Xenia's default (`readback_memexport` off). A page stays the GPU's until
-  the CPU writes it: Xenia's page watches tell it; here each page keeps the
-  hash of guest memory's bytes at the export, checked when a draw or a
-  texture uses the page (the processor's own writes and a trace's memory
-  give it back at once). A trace begins with the GPU's pages as memory
+  the CPU writes it, which the page watches tell (the processor's own writes
+  and a trace's memory are told to them). A trace begins with the GPU's pages as memory
   read, read back from the mirror, as Xenia's trace downloads what its GPU
   wrote.
 - Why not copy them back as resolves are: the processor writes a fence
@@ -204,15 +189,10 @@ agree on the shared memory):
   a point list with rasterization discarded, in a render pass without
   attachments, each index once (Xenia draws it with its pipeline as it
   is). A pixel shader's exports in such a draw are counted, not done.
-- Where it differs from Xenia: the CPU's writes to exported pages are
-  found by their hash when the page is used, not by page watches (a write
-  of the same bytes keeps the GPU's page, where Xenia's watch would drop
-  it). Xenia draws point lists as triangle strips and lets one host vertex
-  in four export; here a vertex shader runs once per vertex (points
-  through a geometry shader, or a point list alone). No resolution scale
-  yet, so no centre-pixel rule for pixel shaders' exports. A texture in a
-  format only the CPU decodes (DXT3A, CTX1) over exported pages is decoded
-  from guest memory, counted.
+- Where it differs from Xenia: Xenia draws point lists as triangle strips
+  and lets one host vertex in four export; here a vertex shader runs once
+  per vertex (points through a geometry shader, or a point list alone). No
+  resolution scale yet, so no centre-pixel rule for pixel shaders' exports.
 - Checked: spirv-val on exporting vertex and pixel shaders (straight, at a
   kill, through the dispatcher); on the GPU, the harness's exports in each
   of the 15 kinds of format against the packing written out in the test
@@ -599,7 +579,135 @@ would overlap the next frame's work, and read back only when the CPU touches
 the memory (page guards) they would mostly go; the indices, still converted
 on the CPU into host memory; the stencil's bit-by-bit EDRAM loads without
 stencil export (as Xenia's, nine passes), which could be skipped where the
-tiles' stencil is known to be zero.
+tiles' stencil is known to be zero. (The read-backs and the checks went on
+the same day: "Write watches and read-backs" below.)
+
+## Write watches and read-backs (2026-11-06)
+
+**Write watches** (memory.h, memory.cpp; Xenia's memory.cc physical memory
+access callbacks, `EnableAccessCallbacks`, `TriggerCallbacks`, the
+invalidations in `PhysicalHeap`'s Release, Decommit and Protect, and
+`exception_handler_win.cc` / `exception_handler_posix.cc`). Physical memory
+is cut into watch pages of the host's page size (4 KB here; 16 KB on some
+ARM64 hosts, never assumed). Each page has the number of the last write
+seen to it, out of a count that only grows. Watching a page protects it
+read-only in every window the guest may write it through (0x7F000000,
+0xA0000000, 0xC0000000, 0xE0000000; never the physical view
+`translate_physical` gives). The first write to it, by the game's
+generated code, the interpreter or the kernel's host code, faults once
+into a vectored handler on Windows or a SIGSEGV/SIGBUS handler on POSIX
+(only writes fault on a read-only page, so no decoding of the access, which
+Xenia does from x86's page fault code or ARM64's ESR), which numbers the
+page, takes the protection off and lets the write go on. As Xenia's shared
+memory does, the fault widens to the 64 pages around (256 KB) short of
+pages the GPU holds (the renderer's watcher bounds), at most 4 MB. Writes
+the watches cannot see are told to them (`physical_written`): the command
+processor's own (the renderer's `memory_written`), a trace's memory, the
+XMA decoder's output, and file reads, which now go through the physical
+view as Xenia's `XFile::Read` does (the host's `ReadFile` fails on a
+protected page instead of faulting). The heaps' protect to writable,
+alloc, decommit and release number their pages first, so a change of
+protection never loses a watch. A consumer watches a page, then takes the
+count, then copies the bytes: a page numbered above its count was written
+since.
+
+Windows' `GetWriteWatch` was measured as the other way: it fails on our
+guest memory (error 87: it only works on private `MEM_WRITE_WATCH`
+memory, and the guest's windows are views of one section). On private
+memory, 64 MB written a byte a page took 14-34 ms and the query and reset
+2.1 ms, where protection and the handler cost 7-10 us a page (113-166 ms
+for the same 16,384 pages, before widening): faster per write, but not
+usable with aliased views.
+
+**The renderer on the watches.** The mirror keeps, by watch page, the
+count its copy is as of; a page is current while nothing numbered above it
+came (Xenia's valid bits). `request` (Xenia's `RequestRange`) uploads the
+pages of a draw's vertex data or a texture load that are not current,
+watched first; a resolve or a memory export (`gpu_written`, Xenia's
+`RangeWrittenByGpu`) makes its pages current and the GPU's, watched, until
+the CPU writes them. Textures keep the count they were loaded at, and are
+loaded again when a page of theirs is numbered above it (one read of the
+count when nothing was written anywhere since). This replaces the hashes
+of textures at each use, the page-by-page comparison of vertex data with a
+512 MB shadow of what the mirror was given (gone), and the exported pages'
+hashes.
+
+**Resolve read-backs as Xenia's `readback_resolve`** (command_processor.cc;
+`IssueCopy_ReadbackResolvePath` in d3d12_command_processor.cc and the
+Vulkan one; `Options::readback_resolve`, `XF_READBACK_RESOLVE`,
+`xfreplay --readback-resolve`). Xenia's default is `none` since December
+2025 (`UPDATE_from_string(readback_resolve, 2025, 12, 4, 21, "fast")`: the
+old default was fast): guest memory never gets a resolve's bytes, the GPU's
+copy has them and every read of them on the GPU finds them there. `fast`:
+each resolve copies its bytes into one of a pair of read-back buffers kept
+by its address and length, and guest memory gets the other, which the same
+resolve filled the frame before (the first time, this one's, waited for);
+the pairs trade places at each swap, and above 64 pairs those unused for
+60 frames go. `full`: each resolve waits for the GPU and copies its bytes
+into guest memory at once. Where it differs from Xenia: only the ranges a
+resolve writes are copied, not its extent from first byte to last (the
+tiles between); fast waits for the other buffer's submission where Xenia
+reads it without waiting (a frame old, it is done).
+
+**MSAA resolves from EDRAM**, as Xenia's resolve shaders do them
+(resolve.xesli's `XeResolveLoad*Colors`, draw_util.cc's
+`SanitizeCopySampleSelect`): a multisampled source's rectangle is stored
+into the EDRAM buffer by its target (which keeps its tiles), and
+`resolve.comp` reads the samples RB_COPY_CONTROL selects there, as the
+guest keeps them: one sample (copied raw where the formats allow, as
+Xenia's fast shaders), or two or four summed in Xenia's order and averaged,
+8_8_8_8_GAMMA's colors as linear codes taken through the curve again, the
+exponent bias with the sample weight; depth one sample. This replaces the
+host's average (`vkCmdResolveImage`, approximate for a single sample) and
+the skipped MSAA depth resolves.
+
+Measured, the race trace (`xf_race`, `xfreplay --gpu-time --repeat 10`):
+
+| | before | after |
+| --- | --- | --- |
+| GPU time a frame | 9.05 ms (read-backs 2.81 ms) | 5.95 ms (none) |
+| renderer, 10 plays: checking textures, vertex data | 0.332 s, 0.084 s | 0.001 s, 0.009 s |
+| `fast`, `full` | | 10.0 ms, 9.9 ms a frame |
+
+The picture is byte for byte the same; the 17 frames of `replay_test` match
+as before, Ben 10's 3600 and 3601 and Sonic's title closer (0.001 to
+0.000, 0.007 to 0.000: their MSAA resolves).
+
+Live, El Chavo Kart (`boot_chaves --render --rates`, 600 s, the press
+script of "El Chavo Kart past the title" with the race's presses at
+10000-10750, `XF_GPU_TIME=1`, other agents' builds sharing the machine):
+
+| | before | after |
+| --- | --- | --- |
+| the race (swap 11000 on) | 15.1 swaps/s | 24.8 swaps/s (27.6 from swap 12000; the cap is 30) |
+| title (2100-3350), menus and park (4000-6800) | 30.0, 25.4 | 28.1, 26.9 |
+| renderer busy, of 600 s | 430.9 s (113.9 checking textures, 42.9 vertex data, 29.1 copying 166 GB back) | 87.3 s (0.9, 3.4, none) |
+| GPU time | 104.5 s (38.6 s read-backs) | 57.3 s |
+
+On top of the same day's pipelines on worker threads and texture formats
+(the same run): the race at 29.8 swaps a second from swap 11000 (reached at
+372 s instead of 444), the title at 30.0, the menus and park at 29.5;
+renderer busy 173.5 s for 10.1 million draws (6.4 million before), GPU
+time 90.3 s. The watches there: 1.43 million pages watched, 55,572 write
+faults (about 90 a second, 7-10 us each), 7.3 million pages numbered as
+written (most of them the XMA decoder's output and faults' widening). The
+title's shot matches Xenia's 2400 exactly (0.000), and the logo's 300 is
+in its fade's next phase (the clock's). Ben 10 plays at 49-60 swaps a
+second, its watches taking 12,593 faults in 120 s.
+
+Red Dead Redemption's title (`5454082B_850` and `_950`): 10.7-10.9 of 255
+off Xenia (15% of pixels) before, 9.21 and 9.29 (13.4% and 13.5%) with its
+MSAA resolves (4x MSAA depth resolved to 24_8 textures among them) done. The colored noise over its
+ground and buildings is left: they sample 4_4_4_4 textures with gamma
+signs that the game makes by resolving 4x MSAA targets drawn as
+8_8_8_8_GAMMA and resolved through their 8_8_8_8 view; not found yet.
+
+Left: the POSIX fault handler is not built here (Windows only so far),
+untried on Linux and Android; the write count is 32 bits (the race run
+numbers about 2,000 writes a second, the XMA decoder's most of them: weeks
+before it wraps); and the bindless table's places are never
+given back, so a texture constant made again takes a new one: the 600 s
+race run filled the 2D table (33,165 loads refused near its end).
 
 ## Traces of live runs (2026-11-05)
 
@@ -743,7 +851,8 @@ others in `../traces/xf_dumps`):
   top 7, base plus delta times the low 3 over 8), which was left out:
   frames 600, 1500 and 3000 were 40.2-53.4 of 255 off Xenia (84-99.7% of
   pixels), and are 0.001-0.014 (none off by 16) with it. Counted: depth
-  resolves of MSAA targets (7,857 in 150 s), not in those frames.
+  resolves of MSAA targets (7,857 in 150 s), not in those frames (done
+  since, from EDRAM).
 - **Sonic Unleashed** reaches its title; its title's draws use
   getCompTexLOD (27,146 skipped in 180 s) and then getWeights (46,844),
   now translated as Xenia's (OpImageQueryLod's unclamped level in x, in
@@ -764,7 +873,9 @@ others in `../traces/xf_dumps`):
   losing its host precision through EDRAM before a depth EQUAL pass ("Xenia's
   Direct3D 12 picture and more games" below; the 4_4_4_4 impostor textures
   the game makes on the GPU, suspected first, come out right). Counted
-  there too: resolves of one MSAA sample (averaged), MSAA depth resolves.
+  there too: resolves of one MSAA sample (averaged), MSAA depth resolves
+  (both done since, from EDRAM: "Write watches and read-backs"; the
+  texture checks by hash gone with them).
 
 ## Pipelines, primitive types and occlusion queries (2026-11-06)
 

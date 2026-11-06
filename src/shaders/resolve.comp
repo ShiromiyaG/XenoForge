@@ -216,7 +216,8 @@ vec4 unpack(uint w0, uint w1) {
 // words but for 2_10_10_10_FLOAT, 7e3 components in one dword there.
 vec4 unpack_guest(uint w0, uint w1) {
     if (p.source_format == RT_2_10_10_10_FLOAT || p.source_format == RT_2_10_10_10_FLOAT_AS_16_16_16_16)
-        return vec4(float7e3_to_32(w0), float7e3_to_32(w0 >> 10u), float7e3_to_32(w0 >> 20u), float(w0 >> 30u) * (1.0 / 3.0));
+        return vec4(float7e3_to_32(w0), float7e3_to_32(w0 >> 10u), float7e3_to_32(w0 >> 20u),
+                    float(w0 >> 30u) * (1.0 / 3.0));
     return unpack(w0, w1);
 }
 

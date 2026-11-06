@@ -692,7 +692,8 @@ public:
         uint32_t to = (end - 1 - physical_first()) >> page_size_shift_;
         for (uint32_t page = from; page <= to; ++page) {
             const PageEntry &entry = page_table_[page];
-            if (!(entry.state & ALLOCATE_COMMIT) || to_access(entry.current_protect) != Access::read_write) return false;
+            if (!(entry.state & ALLOCATE_COMMIT) || to_access(entry.current_protect) != Access::read_write)
+                return false;
         }
         return true;
     }
