@@ -47,6 +47,9 @@ Then:
   its view.
 - English in code, comments, logs and docs. C++20, clang, the repo's .clang-format (4 spaces,
   120 columns). Comments say what the code does and why, in plain prose.
+- Keep Linux and Android open (docs/plan.md, "Hosts"): no Win32 call outside a `_WIN32` branch, prefer
+  SDL3's portable calls (SDL_CreateProcess, its file dialogs, its paths), and keep what decides which game
+  to start apart from how it is started (on Android the game runs in the launcher's process).
 - Never put game data in the repo (ISOs, XEX, generated code, saves, screenshots). Never modify
   F:\RECOMPs\rexglue-sdk or F:\RECOMPs\runtime.
 - Do not commit. Leave the work uncommitted in your worktree; it is merged by whoever launched you.

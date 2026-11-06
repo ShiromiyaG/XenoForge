@@ -69,5 +69,9 @@ onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segund
   sistema e versões do XDK são fatos e podem ir para os docs.
 - O renderizador é geral (implementa o hardware, nunca casos de jogo); o que um jogo pede e não existe é
   contado. Particularidades de jogo vão no port do jogo, não aqui.
+- **Linux e Android (ARM64) ficam encaminhados** (dono, 2026-11-06; `docs/plan.md`, "Hosts"): nada de Win32 fora
+  de `_WIN32` com o par POSIX, tamanhos vindos do host, processos via SDL3. Vulkan 1.3 é o piso; acima disso, tudo
+  opcional com fallback no caminho do Xenia. A GPU vai além do Xenia onde o AoT ou o Vulkan moderno permitem,
+  com o trace do Xenia como imagem a bater ("Beyond Xenia on the GPU").
 - Verificação real feita: imagem do `default.xex` do Chaves via `xfinspect --dump-image` idêntica byte a byte a
   `../Chaves/re/image.bin` (script Python com PyCryptodome).

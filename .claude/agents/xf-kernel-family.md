@@ -46,6 +46,8 @@ threads.cpp, sync.cpp. Follow their style.
   XenosRecomp) may be used with its notice; never XenonRecomp's thirdparty/disasm (GPL).
 - English in code, comments, logs and docs. C++20, clang, the repo's .clang-format (4 spaces,
   120 columns). Comments say what the code does and why, in plain prose; no banners.
+- Keep Linux and Android (ARM64) open (docs/plan.md, "Hosts"): no Win32 call outside a `_WIN32` branch with a
+  POSIX counterpart, or a stub marked TODO; sizes from the host (page size), never a constant.
 - Never put game data in the repo (ISOs, XEX, images, dumps, traces, saves). Never modify
   F:\RECOMPs\rexglue-sdk.
 - Stay in your family's files. Other agents work in parallel on other families; the brief lists what

@@ -43,6 +43,10 @@ docs/plan.md (A2, A3). The code:
   (e.g. F:\RECOMPs\external\gen-<task>\<game>) unless the brief says otherwise.
 - English in code, comments, logs and docs. C++20, clang, the repo's .clang-format (4 spaces,
   120 columns). Comments say what the code does and why, in plain prose; no banners.
+- Keep Linux and Android (ARM64) open (docs/plan.md, "Hosts"):
+  - no Win32 call outside a `_WIN32` branch with a POSIX counterpart, or a stub marked TODO;
+  - no x86 intrinsics in what the generated code includes;
+  - sizes from the host (page size), never a constant.
 - Do not commit. Leave the work uncommitted in your worktree; it is merged by whoever launched you.
 
 ## Checks

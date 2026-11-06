@@ -53,6 +53,9 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
   features from Xenia at once rather than waiting for a game to ask.
 - English in code, comments, logs and docs. C++20, clang, the repo's .clang-format (4 spaces,
   120 columns). Comments say what the code does and why, in plain prose.
+- Keep Linux and Android open and go beyond Xenia where it pays (docs/plan.md, "Hosts" and "Beyond Xenia
+  on the GPU"). Vulkan 1.3 is the floor. Anything above it is found by a feature query, with the Xenia-like
+  path as its fallback and an option that forces it off. Test both ways and measure the gain.
 - Never put game data in the repo: traces, frames, dumps and shader corpora stay in F:\RECOMPs\traces
   and F:\RECOMPs\external. Never modify F:\RECOMPs\rexglue-sdk.
 - Avoid running games or Xenia unless the task needs a new trace; the existing traces cover most work.
