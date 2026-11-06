@@ -76,7 +76,10 @@ the generic player or linked by a port.
 ## References
 
 Xenia stays the first reference and the oracle for every part. These are
-the others, all public.
+the others, all public. Local, read-only copies (shallow clones, never
+built into XenoForge) are in `../refs/`: `free60-wiki`, `libxenon`,
+`xenon-examples`, `crosstool-ng-xenon`, `linux-kernel-xbox360`,
+`x360-research`, `xenon-emu`.
 
 **The license rule for each:**
 - **Documentation** (IBM, Microsoft, AMD, Free60, papers) states facts, and
@@ -104,20 +107,33 @@ the others, all public.
     the GPU at once, with no flush, and the renderer must see those writes.
   - VMX128 has D3D's compressed formats (the `vpkd3d128` and `vupkd3d128`
     family), the same ones the GPU reads.
-- Free60 (https://free60.org), the homebrew community's wiki: the hardware,
-  the XEX format, STFS and SVOD packages (DLC, title updates, XBLA and Games
-  on Demand), the boot chain and the hypervisor.
+- Free60 (https://free60.org), the homebrew community's wiki, archived as
+  Markdown by the Free60Project (`../refs/free60-wiki/docs/`). The pages
+  for what is still to do:
+  - packages: `System-Software/Formats/STFS.md` (DLC, title updates,
+    XBLA);
+  - profiles and achievements: `Formats/GPD.md`, `Profile_Account.md`;
+  - executables: `Formats/XDBF.md`, `Formats/XEX.md`;
+  - the kernel: `System-Software/Kernel.md`, `Kernel_Exports.md`;
+  - the hard drive: `Systems/FATX.md`;
+  - the SMC behind `HalSendSMCMessage` (tray, sensors, LEDs):
+    `Hardware/Console/SMC.md` and its command pages;
+  - the GPU: `Hardware/Console/Xenos_(GPU).md`,
+    `Development/Xenos_Framebuffer.md`;
+  - the boot chain and the hypervisor.
+  The wiki carries no license file; it is used as documentation (facts).
 - x360-research (Emma, InvoxiPlayGames,
-  https://github.com/InvoxiPlayGames/x360-research): notes and utilities
-  on the console's official offline software and on how production and
-  devkit hardware behave. It is for the kernel's and XAM's behavior where
-  Xenia has no answer. Notes are facts; check the license before taking
-  any code.
-- xenon-emu/xenon (https://github.com/xenon-emu/xenon): a low-level emulator
-  of the console's hardware (it runs XeLL and Linux), for what XenoForge's
-  high-level kernel answers on the hardware's behalf (the SMC's messages,
-  the hypervisor's calls). Its license is still to be checked; until then,
-  read only.
+  https://github.com/InvoxiPlayGames/x360-research, `../refs/x360-research`):
+  notes and utilities on the console's official offline software and on
+  how production and devkit hardware behave (`official-software/`,
+  `hardware/`). It is for the kernel's and XAM's behavior where Xenia has
+  no answer. It has no license file: notes as facts, no code taken.
+- xenon-emu/xenon (https://github.com/xenon-emu/xenon, `../refs/xenon-emu`,
+  GPL-2.0, read only): a low-level emulator of the console's hardware (it
+  runs XeLL and Linux), for what XenoForge's high-level kernel answers on
+  the hardware's behalf (the SMC's messages, the hypervisor's calls).
+- The Linux kernel's Xbox 360 drivers (`../refs/linux-kernel-xbox360`, GPL,
+  read only): the SMC, sound and video hardware as Linux drives them.
 - Xenia Canary's game compatibility list: which games run in Xenia and how
   far. It is used to choose the games for track D5 and to know what to
   expect of each.
@@ -205,9 +221,16 @@ In this order, each where the ones before it have no answer:
 - **XenosRecomp** (hedge-dev, MIT, `../XenosRecomp`): a second translation of
   Xenos microcode, made for Unleashed Recompiled, to set our translator's
   meaning of each instruction against.
-- **libxenon** (Free60's homebrew library; read only): its Xenos code
-  programmed the real GPU, so its register sequences, formats and setup
-  are ones known to work on the console.
+- **libxenon** (Free60's homebrew library, `../refs/libxenon`; no license
+  file, read only): its drivers programmed the real hardware, so their
+  register sequences, formats and setup are known to work on the console:
+  - `libxenon/drivers/xenos/` (`xe.c`, `edram.c`, `ucode.c`): the GPU,
+    EDRAM and microcode;
+  - `xenon_smc/`: the SMC;
+  - `xenon_sound/`: the sound hardware (raw PCM, not XMA).
+  `../refs/xenon-examples` and `../refs/crosstool-ng-xenon` (its
+  toolchain) are what a hardware test program for the community would be
+  built with ("Questions only hardware answers").
 - **XNA Game Studio 4.0**, for Microsoft's own encodings and layouts. Its `XnaNative.dll`
   (Microsoft's, unpacked without installing; `tools/xna/README.md`; nothing
   of it in the repository) exports:
