@@ -148,7 +148,25 @@ endif()
 set(XF_GAMES "" CACHE STRING "games whose generated code a boot_<name> links (directories under XF_GEN_DIR)")
 set(XF_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../external/gen-modules" CACHE PATH "where xfrecomp emit wrote each game")
 set(XF_GAME_OPT "-O2" CACHE STRING "the game libraries' optimization level")
+# XF_GAME_LIBS: a directory of game_<name>.lib built elsewhere (another build
+# of the same headers), linked instead of compiling the game's code again. For
+# work that leaves the instructions' semantics and the generated code's
+# headers alone (ppc_context.h, ppc_ops*, ppc_generated.h, ppc_module.h): a
+# build that changes them must compile the game libraries itself.
+set(XF_GAME_LIBS "" CACHE PATH "prebuilt game_<name>.lib to link instead of compiling the games")
 foreach(game ${XF_GAMES})
+    if(XF_GAME_LIBS)
+        set(prebuilt ${XF_GAME_LIBS}/game_${game}${CMAKE_STATIC_LIBRARY_SUFFIX})
+        if(NOT EXISTS ${prebuilt})
+            message(FATAL_ERROR "XF_GAME_LIBS: no ${prebuilt}")
+        endif()
+        add_library(game_${game} STATIC IMPORTED)
+        set_target_properties(game_${game} PROPERTIES IMPORTED_LOCATION ${prebuilt})
+        add_executable(boot_${game} tools/boot.cpp tools/game.cpp)
+        target_compile_definitions(boot_${game} PRIVATE XF_GENERATED)
+        target_link_libraries(boot_${game} PRIVATE xenoforge_kernel xenoforge game_${game})
+        continue()
+    endif()
     if(NOT EXISTS ${XF_GEN_DIR}/${game}/modules.cpp)
         message(FATAL_ERROR "XF_GAMES: no modules.cpp in ${XF_GEN_DIR}/${game}: run xfrecomp emit <iso> "
                             "${XF_GEN_DIR}/${game} (an emission before the per-module tables has none)")
