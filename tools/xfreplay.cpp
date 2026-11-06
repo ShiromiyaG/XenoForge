@@ -128,11 +128,15 @@ int main(int argc, char **argv) {
                 report.writeback_seconds, double(report.writeback_bytes) / 1024);
     std::printf("  %llu submissions, %llu waits for the GPU\n", (unsigned long long)report.submissions,
                 (unsigned long long)report.waits);
-    std::printf("  texture cache: %llu textures held in %.1f MB (at most %.1f MB), %llu destroyed by the memory "
-                "limits, %llu to make room, %llu loads refused\n",
-                (unsigned long long)report.textures_held, double(report.texture_bytes) / (1 << 20),
+    std::printf("  texture cache: %llu textures (%llu views) held in %.1f MB (at most %.1f MB), %llu destroyed by the "
+                "memory limits, %llu to make room, %llu loads refused\n",
+                (unsigned long long)report.textures_held, (unsigned long long)report.texture_views,
+                double(report.texture_bytes) / (1 << 20),
                 double(report.texture_bytes_peak) / (1 << 20), (unsigned long long)report.textures_evicted,
                 (unsigned long long)report.textures_evicted_for_room, (unsigned long long)report.textures_refused);
+    std::printf("  texture loads: %llu new, %llu after the CPU wrote their memory, %llu after a resolve or an export\n",
+                (unsigned long long)report.texture_loads_new, (unsigned long long)report.texture_loads_cpu_written,
+                (unsigned long long)report.texture_loads_gpu_written);
     if (report.zpd_reports)
         std::printf("  occlusion: %llu queries for %llu reports\n", (unsigned long long)report.occlusion_queries,
                     (unsigned long long)report.zpd_reports);

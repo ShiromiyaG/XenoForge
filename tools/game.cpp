@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -91,10 +92,14 @@ void print_renderer_report(const render::Report &r) {
     std::printf("renderer: made %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
                 (unsigned long long)r.render_targets, (unsigned long long)r.textures, (unsigned long long)r.pipelines,
                 (unsigned long long)r.shaders);
+    std::printf("renderer: texture loads: %llu new, %llu again after the CPU wrote their memory, %llu after a resolve "
+                "or a memory export did\n",
+                (unsigned long long)r.texture_loads_new, (unsigned long long)r.texture_loads_cpu_written,
+                (unsigned long long)r.texture_loads_gpu_written);
     std::printf(
-        "renderer: texture cache: %llu textures held in %.1f MB (at most %.1f MB), %llu destroyed by the memory "
-        "limits, %llu to make room in a bindless table, %llu loads refused for want of it\n",
-        (unsigned long long)r.textures_held, double(r.texture_bytes) / (1 << 20),
+        "renderer: texture cache: %llu textures (%llu views) held in %.1f MB (at most %.1f MB), %llu destroyed by the "
+        "memory limits, %llu to make room in a bindless table, %llu loads refused for want of it\n",
+        (unsigned long long)r.textures_held, (unsigned long long)r.texture_views, double(r.texture_bytes) / (1 << 20),
         double(r.texture_bytes_peak) / (1 << 20), (unsigned long long)r.textures_evicted,
         (unsigned long long)r.textures_evicted_for_room, (unsigned long long)r.textures_refused);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
@@ -322,6 +327,16 @@ void print_report(Game &g, bool waiting) {
         }
         if (waiting || g.renderer->try_report(r)) {
             print_renderer_report(r);
+            if (g.device) {
+                vk::MemoryCounts m = g.device->memory_counts();
+                std::printf("device memory: %llu allocations (at most %llu, %llu made); images pooled: %llu in %llu "
+                            "blocks (%.1f of %.1f MB), %llu of their own (%.1f MB)\n",
+                            (unsigned long long)m.allocations, (unsigned long long)m.allocations_peak,
+                            (unsigned long long)m.allocations_made, (unsigned long long)m.pooled_images,
+                            (unsigned long long)m.blocks, double(m.pooled_bytes) / (1 << 20),
+                            double(m.block_bytes) / (1 << 20), (unsigned long long)m.own_images,
+                            double(m.own_bytes) / (1 << 20));
+            }
             Memory::WatchCounts w = g.memory->watch_counts();
             std::printf("memory's write watches: %llu pages watched, %llu write faults (%llu let go already), %llu "
                         "pages written\n",
@@ -366,21 +381,31 @@ void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
     // since the last report it gave (a call under way when this one asks
     // shows as "-")
     render::Report report;
-    double busy = -1;
+    double busy = -1, loads = 0;
     if (g.renderer && g.renderer->try_report(report)) {
-        busy = (report.seconds - r.last_busy) / (wall - r.last_busy_wall);
-        r.last_busy = report.seconds, r.last_busy_wall = wall;
+        const double since = wall - r.last_busy_wall;
+        busy = (report.seconds - r.last_busy) / since;
+        loads = double(report.textures - r.last_texture_loads) / since;
+        r.last_busy = report.seconds, r.last_busy_wall = wall, r.last_texture_loads = report.textures;
     }
-    char renderer[160] = "";
+    char renderer[192] = "";
     if (g.renderer && busy < 0)
         std::snprintf(renderer, sizeof(renderer), ", renderer busy -");
     else if (g.renderer)
-        // with the texture cache's size, for seeing that memory stays flat
-        std::snprintf(renderer, sizeof(renderer), ", renderer busy %.0f%%, textures %llu (%.0f MB)", busy * 100,
-                      (unsigned long long)report.textures_held, double(report.texture_bytes) / (1 << 20));
-    char resident[48] = "";
+        // with the texture cache's size, for seeing that memory stays flat,
+        // and its loads a second
+        std::snprintf(renderer, sizeof(renderer), ", renderer busy %.0f%%, textures %llu (%.0f MB, %.0f loads/s)",
+                      busy * 100, (unsigned long long)report.textures_held, double(report.texture_bytes) / (1 << 20),
+                      loads);
+    char resident[96] = "";
     if (uint64_t bytes = resident_bytes())
         std::snprintf(resident, sizeof(resident), ", resident %.0f MB", double(bytes) / (1 << 20));
+    if (g.device) {
+        // the device memory allocations (the image pool's blocks among them)
+        const size_t used = std::strlen(resident);
+        std::snprintf(resident + used, sizeof(resident) - used, ", %llu allocations",
+                      (unsigned long long)g.device->memory_counts().allocations);
+    }
     std::printf("rates: %6.1f s (guest %6.1f s): %6llu swaps, %5.1f/s, %6.0f draws/s, %4.0f resolves/s%s%s%s\n", wall,
                 g.kernel->uptime_ms() / 1000.0, (unsigned long long)swaps, (swaps - r.last_swaps) / dt,
                 (draws - r.last_draws) / dt, (resolves - r.last_resolves) / dt, renderer, resident, extra.c_str());

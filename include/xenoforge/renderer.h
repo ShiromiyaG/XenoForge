@@ -54,6 +54,11 @@ struct Report {
     // (Options::texture_memory_*) and to make room in a full bindless table,
     // and the loads refused for want of room there.
     uint64_t textures_held = 0, texture_bytes = 0, texture_bytes_peak = 0;
+    uint64_t texture_views = 0; // the views of them held (one a swizzle and sign constants read them by)
+    // the loads (textures) by why: a texture not held, one whose memory the
+    // CPU wrote (its watches), one whose memory a resolve or a memory export
+    // wrote (render to texture, loaded again from the mirror on the GPU)
+    uint64_t texture_loads_new = 0, texture_loads_cpu_written = 0, texture_loads_gpu_written = 0;
     uint64_t textures_evicted = 0, textures_evicted_for_room = 0, textures_refused = 0;
     uint64_t occlusion_queries = 0, zpd_reports = 0; // host queries begun, reports answered with their counts
     double seconds = 0;                          // spent in the renderer's calls, of which:

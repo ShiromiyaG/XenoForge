@@ -88,6 +88,7 @@ void print_report(Game &game, bool waiting);
 struct Rates {
     double last_wall = 0, last_busy = 0, last_busy_wall = 0;
     uint64_t last_swaps = 0, last_draws = 0, last_resolves = 0;
+    uint64_t last_texture_loads = 0; // the renderer's, at its last report
 };
 void print_rates(Game &game, Rates &rates, double wall_seconds, const std::string &extra = {});
 

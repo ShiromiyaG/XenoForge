@@ -956,6 +956,13 @@ bool filterable(const Info &info, const Support &support) {
     return true;
 }
 
+Signed signed_read(uint32_t format, const Support &support) {
+    const FormatEntry &f = FORMATS[format & 63];
+    if (f.host == H::Unsupported) return S::None;
+    Version u = unsigned_version(f, support), s;
+    return signed_of(f, support, u, s);
+}
+
 uint64_t level_bytes(const Plan &plan, uint32_t level) {
     uint64_t slices = 0;
     for (const SliceLoad &s : plan.slices) slices += s.level == level;

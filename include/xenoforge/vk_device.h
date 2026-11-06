@@ -29,11 +29,22 @@ struct Buffer {
 
 struct Image {
     VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE; // its own, or the pool block's it lies in
+    VkDeviceSize offset = 0, bytes = 0;     // its range of that memory
+    uint32_t block = 0;                     // its pool block's number (1 and up); 0: memory of its own
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkExtent3D extent{};
     uint32_t levels = 1, layers = 1;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+};
+
+// What the device's memory holds (Device::memory_counts).
+struct MemoryCounts {
+    uint64_t allocations = 0, allocations_peak = 0; // vkAllocateMemory's live now, and the most at once
+    uint64_t allocations_made = 0;                  // vkAllocateMemory calls so far
+    uint64_t blocks = 0, block_bytes = 0;           // the image pool's blocks, and the memory they hold
+    uint64_t pooled_images = 0, pooled_bytes = 0;   // images in them, and the bytes those take
+    uint64_t own_images = 0, own_bytes = 0;         // images with memory of their own
 };
 
 class Device {
@@ -88,9 +99,20 @@ public:
     // host reads it back, so cached memory where the device has it
     Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, bool host_reads = false);
     void destroy(Buffer &buffer);
+    // view_format: a second format views of it read it as (a mutable format
+    // with the two listed, as Xenia's textures with a signed view)
     Image create_image(VkImageType type, VkFormat format, VkExtent3D extent, uint32_t levels, uint32_t layers,
-                       VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags = 0);
+                       VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags = 0,
+                       VkFormat view_format = VK_FORMAT_UNDEFINED);
     void destroy(Image &image);
+    // The image pool (Xenia's Vulkan backend has VMA place its images in
+    // larger blocks of memory): images lie in blocks of device memory shared
+    // by many, of BLOCK_BYTES (or an eighth of a smaller heap); one larger
+    // than half a block, or whose driver asks for memory of its own, gets its
+    // own. XF_VK_DEDICATED_IMAGES=1 gives every image its own, as before.
+    static constexpr VkDeviceSize BLOCK_BYTES = VkDeviceSize(64) << 20;
+    bool pooled_images() const { return pooled_images_; }
+    MemoryCounts memory_counts();
     bool format_supported(VkFormat format, VkFormatFeatureFlags features) const;
 
     // Records with record(), submits, waits.
@@ -104,6 +126,19 @@ public:
 private:
     Device() = default;
     uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) const;
+    // vkAllocateMemory and vkFreeMemory, counted
+    VkResult allocate(const VkMemoryAllocateInfo &info, VkDeviceMemory &out);
+    void free_memory(VkDeviceMemory memory);
+    // a range of a pool block for an image's requirements (false: none, the
+    // image gets memory of its own)
+    struct Block;
+    bool pool_take(const VkMemoryRequirements &need, uint32_t type, Image &im);
+    void pool_give(Image &im);
+
+    bool pooled_images_ = true;
+    std::vector<std::unique_ptr<Block>> blocks_; // by number less 1; null once freed
+    std::mutex memory_mutex_;                    // the pool and the counts (images come from more than one thread)
+    MemoryCounts counts_;
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;

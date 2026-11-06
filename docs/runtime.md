@@ -1158,7 +1158,9 @@ resolves, checking and decoding textures, copying vertex data, making
 pipelines). `--rates` prints a line a second on the host's clock: the
 swaps, draws and resolves a second, the scheduler's clock, the share of
 the second the renderer was busy (`-` when a call of its was under way),
-to set boot and the player side by side over a run.
+the texture cache's textures, memory and loads a second, the process's
+resident memory and the device's memory allocations, to set boot and the
+player side by side over a run.
 
 The thread report (at the end, and with `--stall-report S` whenever no
 swap has come for S seconds, 5 S before the first, once a stall) gives

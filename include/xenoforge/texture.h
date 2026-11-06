@@ -240,6 +240,11 @@ bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string
 // unsigned version, and the signed one where a component is signed).
 bool filterable(const Info &info, const Support &support);
 
+// How the format's signed components are read on this host (Plan's
+// signed_read), without making a plan: what a texture cache keys its images
+// by (Xenia's TextureKey::signed_separate).
+Signed signed_read(uint32_t format, const Support &support);
+
 // The bytes a level of the plan's image holds (all its slices), as decode
 // writes it: texels or compressed blocks of the host format, tightly packed.
 uint64_t level_bytes(const Plan &plan, uint32_t level);

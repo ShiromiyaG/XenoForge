@@ -27,7 +27,9 @@ ring buffer (PM4)  ──>  front end                    src/gpu/
                                v
                          Vulkan back end              src/vk/
                            render targets: images keyed by EDRAM range
-                           textures: keyed by fetch constant, bindless
+                           textures: keyed by memory, format and size
+                             (Xenia's TextureKey), a view per swizzle and
+                             sign, bindless; images in pooled memory blocks
                            guest memory: a mirror resolves write, an upload
                              arena per submission
 ```
@@ -751,10 +753,9 @@ Xenia's one table holds 262,144 descriptors; ours hold 16,384 2D and 4,096
 the least recently used textures of its kind the GPU is done with, waiting
 for submissions in flight if it must (never the one being recorded): a load
 is refused only when the submission being recorded holds the whole table.
-The cache is keyed by the whole fetch constant (Xenia's `TextureKey` leaves
-out the swizzle, the signs but whether they need their own image, the
-filters and clamps), so two constants over the same memory that differ in
-those hold an image each.
+(The cache was keyed by the whole fetch constant then; it is keyed as
+Xenia's since: "The texture cache's key, its loads and the image pool"
+below.)
 
 Measured live, El Chavo Kart's 600 s race run (`boot_chaves --render
 --rates`, the press script above, `XF_GPU_TIME=1`, two other agents
@@ -777,6 +778,121 @@ differ from Xenia's dumps only where they animate (the title's blinking
 traces with every texture destroyed and loaded again between plays (a
 build counting a use for the submission being recorded, under validation)
 gave the same pictures as one play.
+
+## The texture cache's key, its loads and the image pool (2026-11-06)
+
+**Why El Chavo Kart loads about 500 textures a second.** The suspicion
+was the write watches: a fault widens to the 64 pages around (as Xenia's
+shared memory does) and would invalidate textures beside what the CPU
+wrote. Measured with a build that kept, by watch page, the last exact write
+and what numbered it (a fault's own page, its widening, a host write), and
+a hash of each texture's guest bytes at each load, over the 600 s race run
+of "The texture cache's lifetime" (283,139 loads):
+
+| why the load | loads | |
+| --- | --- | --- |
+| a resolve or a memory export wrote the texture's memory | 241,723 | 85% |
+| the texture was not held (new, or evicted at the soft limit) | 16,632 | 6% |
+| the CPU wrote its memory (its watches) | 7,123 | 2.5% |
+| of those, a page of it written exactly / only by a fault's widening | 6,604 / 519 | |
+| of those, its bytes unchanged | 415 | |
+
+So the watches and their widening are not the cause: what the CPU writes
+loads about 12 textures a second (six textures the game rewrites in place,
+1,407 and 521 loads each), their bytes changed in 94% of those loads, and
+the widening alone accounts for under 1 a second. The loads come from render to
+texture: the race resolves 540 times a second into the memory of a few
+render targets (in a second such run, with the key below, seven bases
+between 0x141D0000 and 0x15580000 took 207,000 of 209,000 such loads, up to
+four a frame for one of them: a chain of passes each resolving into the same
+memory and sampling it) and draws read each result
+as a texture, which is loaded again from the mirror on the GPU. Xenia does
+the same: a resolve's `RangeWrittenByGpu` fires the watches of the textures
+over its pages (`FireWatches` with `invalidated_by_gpu`), and their next use
+loads them again from shared memory with its load shaders. Avoiding those
+loads (a resolve writing straight into the texture that reads it) would go
+beyond Xenia and is left open.
+
+What the measurement did find: the cache held an image per fetch constant,
+so the same memory under constants that differed only in their sampler
+(filters, clamps, the smallest level) was loaded once for each of them,
+after every resolve, and filled the cache with copies (4,243 textures in
+384 MB at its soft limit, 605 MB at most, 12,389 destroyed by the limits and
+loaded again).
+
+**The cache keyed by Xenia's `TextureKey`** (texture_cache.h,
+`BindingInfoFromFetchConstant`; `D3D12Texture::SRVDescriptorKey` and
+`FindOrCreateTextureDescriptor`): a texture is keyed by the pitch and
+tiling, the format, endianness and stacking, the size, the levels the
+constant gives (`texture::levels`: the base and mip pages within physical
+memory, so the windows' aliases of a page are one, and the last level), the
+dimension and packed mips, and whether it is the separate signed version.
+Constants that differ in their swizzle and signs read it through views of
+their own, made the first time one asks, each at a place of its own in the
+texture's bindless table: a view by the swizzle through the host format's
+and the sign, as Xenia's descriptors by `SRVDescriptorKey`. The filters,
+clamps, border, LOD bias and smallest level were the samplers' already.
+An image a signed view may read is made mutable with both formats listed
+(`VkImageFormatListCreateInfo`, as Xenia's Vulkan textures), whether or not
+the constant that made it reads signed components.
+
+**Textures by bucket of memory** (Xenia's shared memory watch buckets,
+`kWatchBucketSizeLog2`: 4 MB): a resolve or a memory export looked at every
+texture held for the ones over what it wrote; now each texture is listed in
+the 4 MB buckets its ranges span, and they look only at the buckets they
+wrote. (It also no longer takes the first and last of the written ranges as
+their bounds, which a destination wrapping past the end of physical memory
+would have broken.)
+
+**The image pool** (vk_device.cpp; Xenia's Vulkan backend has VMA place its
+images, its D3D12 one makes committed resources): images lie in blocks of
+64 MB of device memory (an eighth of a smaller heap) shared by many, each
+image in the smallest free range of a block of its memory type that holds
+it at its alignment, the free ranges merged with their neighbors as they
+come back; an image larger than half a block, or whose driver prefers or
+requires memory of its own (`VkMemoryDedicatedRequirements`), gets its own.
+Only images are pooled, all of optimal tiling, so the buffer-image
+granularity never applies; buffers keep memory of their own (a few dozen).
+A block left empty is freed while another empty one of its type is kept.
+`XF_VK_DEDICATED_IMAGES=1` gives every image its own memory, as before. No
+third-party allocator: VMA would be a new dependency for what the cache
+needs of it.
+
+**Counted**: the loads by why (`Report::texture_loads_new`,
+`texture_loads_cpu_written`, `texture_loads_gpu_written`), the views held,
+the device's memory allocations (`vk::Device::memory_counts`: live, most at
+once, made; the pool's blocks and images), and the loads a second and the
+allocations on the `--rates` line.
+
+Measured live, El Chavo Kart's 600 s race run (the press script of
+"The texture cache's lifetime", the pipeline cache warm in both, other
+agents building on the machine; "before" is master with the loads a second
+counted):
+
+| | before | after |
+| --- | --- | --- |
+| swaps | 17,961; the race (from 420 s) at 30.0 a second | 17,956; the race at 30.0 |
+| texture loads | 299,405; 641 a second in the race | 233,530 (1,483 new, 7,168 after the CPU's writes, 224,879 after resolves and exports); 499 a second in the race |
+| textures held at the end | 3,979 in 384 MB (664 MB at most), 15,411 destroyed by the limits | 1,483 (1,483 views) in 137 MB (137 MB at most), none destroyed |
+| renderer busy | 128.8 s (20.4 s in resolves); 23.1% in the race | 118.3 s (4.8 s in resolves); 20.6% in the race |
+| device memory allocations | one an image (about 4,000 live, 19,400 made) | 27 (27 made): 1,488 images in 3 blocks (140 of 192 MB), 18 of their own (114 MB) |
+| resident memory | 998 MB at 180 s, 1,103 at 360 s, 1,177 at 600 s | 886, 1,016, 1,140 MB |
+
+A run with the key and the pool but before the buckets spent 9.4 s in
+resolves (20.4 before, 4.8 with the buckets). Ben 10 (120 s, no input):
+6,399 swaps before and 6,387 after (60 a second), 60 loads a second in both
+(one render to texture a frame), 47 textures in 17.7 MB before and 44 in
+13.5 MB after, 423 MB resident in both, 12 device memory allocations with
+the pool and 58 with `XF_VK_DEDICATED_IMAGES=1`. The race's trace
+(`xfreplay --gpu-time --repeat 10`): 6.11 ms of GPU time a play, 0.64 ms
+(10.4%) of it the 13 texture loads after the frame's resolves; the picture
+0.010 off Xenia's as before. `replay_test` gives the same numbers for its 29
+frames as master, under validation and with `XF_VK_DEDICATED_IMAGES=1`.
+
+Left: the loads after resolves (render to texture, nearly all of the 499 a
+second in the race), as Xenia's; a resolve could write the texture it feeds instead
+(beyond Xenia). Xenia also keeps a texture's base and mips outdated apart
+and loads again only the part written; here a texture is loaded whole.
 
 ## Traces of live runs (2026-11-05)
 

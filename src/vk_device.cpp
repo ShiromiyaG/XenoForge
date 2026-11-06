@@ -2,8 +2,10 @@
 
 #include "xenoforge/vk_device.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <vector>
 
 namespace xf::vk {
@@ -11,6 +13,60 @@ namespace xf::vk {
 namespace {
 std::string failed(const char *what, VkResult r) { return std::string(what) + " failed (" + std::to_string(r) + ")"; }
 } // namespace
+
+// A block of the image pool: device memory of one type, its free ranges by
+// offset (merged with their neighbors as they come back) and by size (for
+// the best fit).
+struct Device::Block {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint32_t type = 0;
+    VkDeviceSize size = 0, used = 0;
+    uint64_t images = 0;
+    std::map<VkDeviceSize, VkDeviceSize> free;         // offset: size
+    std::multimap<VkDeviceSize, VkDeviceSize> by_size; // size: offset
+
+    void add_free(VkDeviceSize offset, VkDeviceSize bytes) {
+        if (!bytes) return;
+        // merged with the free ranges just before and just after it
+        auto next = free.lower_bound(offset);
+        if (next != free.begin()) {
+            auto previous = std::prev(next);
+            if (previous->first + previous->second == offset) {
+                offset = previous->first, bytes += previous->second;
+                drop_size(previous->second, previous->first);
+                free.erase(previous);
+            }
+        }
+        if (next != free.end() && offset + bytes == next->first) {
+            bytes += next->second;
+            drop_size(next->second, next->first);
+            free.erase(next);
+        }
+        free[offset] = bytes;
+        by_size.insert({bytes, offset});
+    }
+    void drop_size(VkDeviceSize bytes, VkDeviceSize offset) {
+        auto [from, to] = by_size.equal_range(bytes);
+        for (auto it = from; it != to; ++it)
+            if (it->second == offset) {
+                by_size.erase(it);
+                return;
+            }
+    }
+    // the smallest free range that holds `bytes` at `alignment`: its
+    // offset and size, and where the image would start; false if none
+    bool fit(VkDeviceSize bytes, VkDeviceSize alignment, VkDeviceSize &range, VkDeviceSize &range_bytes,
+             VkDeviceSize &at) const {
+        for (auto it = by_size.lower_bound(bytes); it != by_size.end(); ++it) {
+            VkDeviceSize aligned = (it->second + alignment - 1) / alignment * alignment;
+            if (aligned + bytes <= it->second + it->first) {
+                range = it->second, range_bytes = it->first, at = aligned;
+                return true;
+            }
+        }
+        return false;
+    }
+};
 
 std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     std::unique_ptr<Device> d(new Device());
@@ -156,6 +212,8 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     if (has12.samplerMirrorClampToEdge) v12.samplerMirrorClampToEdge = d->mirror_clamp_to_edge_ = true;
     // optional: occlusion queries counting samples (the guest's are counts)
     if (has.features.occlusionQueryPrecise) features.features.occlusionQueryPrecise = d->precise_occlusion_ = true;
+    // images in the pool's blocks, or each with memory of its own
+    d->pooled_images_ = !turned_off("XF_VK_DEDICATED_IMAGES");
     // the renderer's queue, and with a window a second one to present on
     // where the family has it
     const float priorities[2] = {1.0f, 1.0f};
@@ -197,6 +255,9 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
 Device::~Device() {
     if (device_) {
         vkDeviceWaitIdle(device_);
+        for (auto &block : blocks_)
+            if (block) vkFreeMemory(device_, block->memory, nullptr);
+        blocks_.clear();
         vkDestroyFence(device_, fence_, nullptr);
         vkDestroyCommandPool(device_, pool_, nullptr);
         vkDestroyDevice(device_, nullptr);
@@ -231,7 +292,7 @@ Buffer Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool h
         uint32_t cached = memory_type(need.memoryTypeBits, visible | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
         if (cached != UINT32_MAX) alloc.memoryTypeIndex = cached;
     }
-    if (alloc.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &alloc, nullptr, &b.memory) != VK_SUCCESS) {
+    if (alloc.memoryTypeIndex == UINT32_MAX || allocate(alloc, b.memory) != VK_SUCCESS) {
         vkDestroyBuffer(device_, b.buffer, nullptr);
         return {};
     }
@@ -242,12 +303,13 @@ Buffer Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool h
 
 void Device::destroy(Buffer &b) {
     if (b.buffer) vkDestroyBuffer(device_, b.buffer, nullptr);
-    if (b.memory) vkFreeMemory(device_, b.memory, nullptr);
+    if (b.memory) free_memory(b.memory);
     b = {};
 }
 
 Image Device::create_image(VkImageType type, VkFormat format, VkExtent3D extent, uint32_t levels, uint32_t layers,
-                           VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags) {
+                           VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags,
+                           VkFormat view_format) {
     Image im;
     im.format = format, im.extent = extent, im.levels = levels, im.layers = layers, im.samples = samples;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -261,15 +323,54 @@ Image Device::create_image(VkImageType type, VkFormat format, VkExtent3D extent,
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // read through views of a second format too: mutable, the two formats
+    // listed (Vulkan 1.2's image format list, which lets a driver keep the
+    // image's compression where it can), as Xenia's Vulkan textures
+    const VkFormat formats[2] = {format, view_format};
+    VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    if (view_format != VK_FORMAT_UNDEFINED && view_format != format) {
+        info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        list.viewFormatCount = 2;
+        list.pViewFormats = formats;
+        info.pNext = &list;
+    }
     if (vkCreateImage(device_, &info, nullptr, &im.image) != VK_SUCCESS) return {};
-    VkMemoryRequirements need;
-    vkGetImageMemoryRequirements(device_, im.image, &need);
-    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    alloc.allocationSize = need.size;
-    alloc.memoryTypeIndex = memory_type(need.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    if (alloc.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(device_, &alloc, nullptr, &im.memory) != VK_SUCCESS) {
+    // its needs, and whether the driver wants it in memory of its own
+    VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+    VkMemoryRequirements2 need2{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2};
+    need2.pNext = &dedicated;
+    VkImageMemoryRequirementsInfo2 which{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
+    which.image = im.image;
+    vkGetImageMemoryRequirements2(device_, &which, &need2);
+    const VkMemoryRequirements &need = need2.memoryRequirements;
+    const uint32_t type_index = memory_type(need.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type_index == UINT32_MAX) {
         vkDestroyImage(device_, im.image, nullptr);
         return {};
+    }
+    const bool wants_own = dedicated.requiresDedicatedAllocation || dedicated.prefersDedicatedAllocation;
+    if (pooled_images_ && !wants_own && pool_take(need, type_index, im)) {
+        if (vkBindImageMemory(device_, im.image, im.memory, im.offset) == VK_SUCCESS) return im;
+        pool_give(im);
+        vkDestroyImage(device_, im.image, nullptr);
+        return {};
+    }
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = need.size;
+    alloc.memoryTypeIndex = type_index;
+    VkMemoryDedicatedAllocateInfo dedicate{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+    if (wants_own) {
+        dedicate.image = im.image;
+        alloc.pNext = &dedicate;
+    }
+    if (allocate(alloc, im.memory) != VK_SUCCESS) {
+        vkDestroyImage(device_, im.image, nullptr);
+        return {};
+    }
+    im.offset = 0, im.bytes = need.size, im.block = 0;
+    {
+        std::lock_guard lock(memory_mutex_);
+        counts_.own_images++, counts_.own_bytes += need.size;
     }
     vkBindImageMemory(device_, im.image, im.memory, 0);
     return im;
@@ -277,8 +378,116 @@ Image Device::create_image(VkImageType type, VkFormat format, VkExtent3D extent,
 
 void Device::destroy(Image &im) {
     if (im.image) vkDestroyImage(device_, im.image, nullptr);
-    if (im.memory) vkFreeMemory(device_, im.memory, nullptr);
+    if (im.block) {
+        pool_give(im);
+    } else if (im.memory) {
+        free_memory(im.memory);
+        std::lock_guard lock(memory_mutex_);
+        counts_.own_images--, counts_.own_bytes -= im.bytes;
+    }
     im = {};
+}
+
+VkResult Device::allocate(const VkMemoryAllocateInfo &info, VkDeviceMemory &out) {
+    VkResult r = vkAllocateMemory(device_, &info, nullptr, &out);
+    if (r != VK_SUCCESS) return r;
+    std::lock_guard lock(memory_mutex_);
+    counts_.allocations++, counts_.allocations_made++;
+    counts_.allocations_peak = std::max(counts_.allocations_peak, counts_.allocations);
+    return r;
+}
+
+void Device::free_memory(VkDeviceMemory memory) {
+    vkFreeMemory(device_, memory, nullptr);
+    std::lock_guard lock(memory_mutex_);
+    counts_.allocations--;
+}
+
+// The best fit among the blocks of the type, or a new block when none has
+// room. Too large for a block (more than half of one): none, the image gets
+// memory of its own, as VMA gives such allocations theirs.
+bool Device::pool_take(const VkMemoryRequirements &need, uint32_t type, Image &im) {
+    const VkDeviceSize heap = memory_.memoryHeaps[memory_.memoryTypes[type].heapIndex].size;
+    const VkDeviceSize block_bytes = std::min(BLOCK_BYTES, std::max<VkDeviceSize>(heap / 8, VkDeviceSize(1) << 20));
+    if (need.size > block_bytes / 2) return false;
+    const VkDeviceSize alignment = std::max<VkDeviceSize>(need.alignment, 1);
+    std::unique_lock lock(memory_mutex_);
+    Block *best = nullptr;
+    size_t best_number = 0;
+    VkDeviceSize best_range = 0, best_range_bytes = 0, best_at = 0;
+    for (size_t i = 0; i < blocks_.size(); i++) {
+        Block *b = blocks_[i].get();
+        if (!b || b->type != type || b->size - b->used < need.size) continue;
+        VkDeviceSize range, range_bytes, at;
+        if (b->fit(need.size, alignment, range, range_bytes, at) && (!best || range_bytes < best_range_bytes))
+            best = b, best_number = i + 1, best_range = range, best_range_bytes = range_bytes, best_at = at;
+    }
+    if (!best) {
+        // a new block (allocated outside the lock: it may take a while)
+        lock.unlock();
+        VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        alloc.allocationSize = block_bytes;
+        alloc.memoryTypeIndex = type;
+        VkDeviceMemory memory;
+        if (allocate(alloc, memory) != VK_SUCCESS) return false;
+        lock.lock();
+        auto block = std::make_unique<Block>();
+        block->memory = memory, block->type = type, block->size = block_bytes;
+        block->add_free(0, block_bytes);
+        best = block.get();
+        auto empty = std::find(blocks_.begin(), blocks_.end(), nullptr);
+        if (empty != blocks_.end()) {
+            *empty = std::move(block);
+            best_number = size_t(empty - blocks_.begin()) + 1;
+        } else {
+            blocks_.push_back(std::move(block));
+            best_number = blocks_.size();
+        }
+        counts_.blocks++, counts_.block_bytes += block_bytes;
+        best->fit(need.size, alignment, best_range, best_range_bytes, best_at);
+    }
+    // the range taken out, what is left before and after it given back
+    best->drop_size(best_range_bytes, best_range);
+    best->free.erase(best_range);
+    best->add_free(best_range, best_at - best_range);
+    best->add_free(best_at + need.size, best_range + best_range_bytes - (best_at + need.size));
+    best->used += need.size;
+    best->images++;
+    counts_.pooled_images++, counts_.pooled_bytes += need.size;
+    im.memory = best->memory, im.offset = best_at, im.bytes = need.size, im.block = uint32_t(best_number);
+    return true;
+}
+
+// An image's range back to its block. A block left empty is freed while
+// another empty one of its type is kept (so a frame that frees and makes the
+// same images does not allocate again).
+void Device::pool_give(Image &im) {
+    VkDeviceMemory freed = VK_NULL_HANDLE;
+    {
+        std::lock_guard lock(memory_mutex_);
+        Block *b = im.block <= blocks_.size() ? blocks_[im.block - 1].get() : nullptr;
+        if (!b) return;
+        b->add_free(im.offset, im.bytes);
+        b->used -= im.bytes;
+        b->images--;
+        counts_.pooled_images--, counts_.pooled_bytes -= im.bytes;
+        if (!b->images) {
+            bool other_empty = false;
+            for (auto &o : blocks_)
+                if (o && o.get() != b && o->type == b->type && !o->images) other_empty = true;
+            if (other_empty) {
+                freed = b->memory;
+                counts_.blocks--, counts_.block_bytes -= b->size;
+                blocks_[im.block - 1].reset();
+            }
+        }
+    }
+    if (freed) free_memory(freed);
+}
+
+MemoryCounts Device::memory_counts() {
+    std::lock_guard lock(memory_mutex_);
+    return counts_;
 }
 
 bool Device::format_supported(VkFormat format, VkFormatFeatureFlags features) const {
