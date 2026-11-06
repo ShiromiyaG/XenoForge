@@ -1,5 +1,7 @@
 // What the generated code includes (docs/recompiler.md): the ops, the
-// branch conditions, and the things whoever links the code provides.
+// branch conditions, and the runtime's calls (ppc_runtime.h: dispatch,
+// invalid, unwind, switch_stack, resumable; direct calls when the code is
+// linked statically, through the runtime's table in a game library).
 // A generated function is `void name(xf::ppc::Context &c)`; each
 // instruction is one line:
 //
@@ -11,26 +13,7 @@
 
 #include "xenoforge/ppc_module.h"
 #include "xenoforge/ppc_ops.h"
-
-namespace xf::ppc {
-
-// An indirect call or jump, or a call to code with no generated function:
-// the function at `target`, else the interpreter from there until it
-// returns. LR is already set as the code set it.
-void dispatch(Context &c, uint32_t target);
-// An invalid instruction reached.
-void invalid(Context &c, uint32_t pc);
-
-// Throws an Unwind (ppc_module.h) to where LR points (a function that
-// switches the stack returning elsewhere than to its caller).
-[[noreturn]] void unwind(Context &c);
-// A branch to KeSetCurrentStackPointers' thunk (a fiber switch), with where
-// this frame's code goes on when its stack is switched back to: the return
-// address after a bl, the function's own return address for a tail branch.
-// The kernel runs each guest stack on a host stack of its own.
-void switch_stack(Context &c, uint32_t thunk, uint32_t resume);
-
-} // namespace xf::ppc
+#include "xenoforge/ppc_runtime.h"
 
 #define XF_FN(name) void name([[maybe_unused]] ::xf::ppc::Context &c)
 #define I(op, code) ::xf::ppc::ops::run<::xf::ppc::Opcode::op>(c, ::xf::ppc::Instr{code})
@@ -48,3 +31,17 @@ void switch_stack(Context &c, uint32_t thunk, uint32_t resume);
         if (uint32_t(c.r[1]) != xf_sp || (uint32_t(c.lr) & ~3u) != xf_lr) ::xf::ppc::unwind(c);                        \
         return;                                                                                                        \
     } while (0)
+// A function with resume sites (docs/recompiler.md, "Stack switches"): its
+// body is a function of its own the runtime runs, from the entry and again
+// from a resume site an Unwind came back to (ppc_runtime.h's resumable):
+//
+//   XF_FN(xf_82000B20) {
+//       static constexpr uint32_t xf_sites[] = {0x82000B4Cu, 0x82000B54u};
+//       ::xf::ppc::resumable(c, XF_RESUMABLE_BODY {
+//           switch (xf_at) { case 0x82000B4C: goto L_82000B4C; ... }
+//           ...
+//       }, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, 2);
+//   }
+#define XF_RESUMABLE_BODY                                                                                              \
+    [](::xf::ppc::Context &c, [[maybe_unused]] uint32_t xf_at, [[maybe_unused]] uint32_t xf_lr,                        \
+       [[maybe_unused]] uint32_t xf_sp)

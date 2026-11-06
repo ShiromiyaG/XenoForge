@@ -24,11 +24,13 @@
 // from the start; --rates prints a line a second (boot's, with the frames
 // handed over and presented and the sound frames sent). --identify alone
 // prints the modules whose generated code the player carries (the launcher
-// asks it, frontend/library.h).
+// asks it, frontend/library.h). The generic player runs the game library the
+// recompile step cached for the disc (game_build.h; --cache names the cache,
+// --game-library a library), else interprets.
 //
 //   player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] [--steps N]
-//        [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] [--press <b@s>]...
-//        [--no-sound] [--overlay] [--rates]
+//        [--interpret] [--cache <dir>] [--game-library <file>] [--quit-after S] [--screenshots <dir>]
+//        [--screenshot-every N] [--press <b@s>]... [--no-sound] [--overlay] [--rates]
 //   player[_<game>] --identify
 
 #include "presenter.h"
@@ -127,7 +129,8 @@ int fail(const std::string &message) {
 
 int main(int argc, char **argv) {
     const char *usage = "usage: player <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] "
-                        "[--steps N] [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] "
+                        "[--steps N] [--interpret] [--cache <dir>] [--game-library <file>] [--quit-after S] "
+                        "[--screenshots <dir>] [--screenshot-every N] "
                         "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay] [--rates]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     if (std::string(argv[1]) == "--identify") {
@@ -160,6 +163,10 @@ int main(int argc, char **argv) {
             o.steps = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--interpret")
             o.interpret = true;
+        else if (a == "--cache" && i + 1 < argc)
+            o.cache = argv[++i];
+        else if (a == "--game-library" && i + 1 < argc)
+            o.game_library = argv[++i];
         else if (a == "--config" && i + 1 < argc)
             config_file = argv[++i];
         else if (a == "--quit-after" && i + 1 < argc)

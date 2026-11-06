@@ -38,31 +38,31 @@ XF_INLINE uint64_t load_s32(Context &c, uint32_t ea) { return uint64_t(int64_t(i
 // signaling)
 XF_INLINE double single_to_double(uint32_t bits) {
     if ((bits & 0x7FFFFFFFu) > 0x7F800000u)
-        return std::bit_cast<double>(uint64_t(bits & 0x80000000u) << 32 | 0x7FF0000000000000ull |
+        return lib::bit_cast<double>(uint64_t(bits & 0x80000000u) << 32 | 0x7FF0000000000000ull |
                                      uint64_t(bits & 0x007FFFFFu) << 29);
-    return double(std::bit_cast<float>(bits));
+    return double(lib::bit_cast<float>(bits));
 }
 // stfs: rounded as the host rounds (Xenia's CONVERT_F32_F64: cvtsd2ss); a
 // NaN keeps its sign, the top of its payload and its own quiet bit
 XF_INLINE uint32_t double_to_single(double value) {
-    uint64_t bits = std::bit_cast<uint64_t>(value);
+    uint64_t bits = lib::bit_cast<uint64_t>(value);
     if ((bits & 0x7FFFFFFFFFFFFFFFull) > 0x7FF0000000000000ull)
         return (uint32_t(bits >> 32) & 0x80000000u) | 0x7F800000u | (uint32_t(bits >> 29) & 0x007FFFFFu);
-    return std::bit_cast<uint32_t>(float(value));
+    return lib::bit_cast<uint32_t>(float(value));
 }
 
 // a vector at an aligned address: the 16 bytes with each word swapped
 // (Xenia's Load of a VEC128 then ByteSwap), so words land in guest order
 XF_INLINE Vec128 load_vec(Context &c, uint32_t ea) {
     Vec128 v;
-    std::memcpy(&v, host(c, ea), 16);
+    lib::memcpy(&v, host(c, ea), 16);
     for (int k = 0; k < 4; k++) v.u32[k] = __builtin_bswap32(v.u32[k]);
     return v;
 }
 XF_INLINE void store_vec(Context &c, uint32_t ea, const Vec128 &v) {
     Vec128 m;
     for (int k = 0; k < 4; k++) m.u32[k] = __builtin_bswap32(v.u32[k]);
-    std::memcpy(host(c, ea), &m, 16);
+    lib::memcpy(host(c, ea), &m, 16);
 }
 
 // lvlx (Xenia's LVL): the bytes from EA to the end of its 16-byte block,
@@ -70,9 +70,9 @@ XF_INLINE void store_vec(Context &c, uint32_t ea, const Vec128 &v) {
 inline Vec128 load_vector_left(Context &c, uint32_t ea) {
     uint32_t eb = ea & 15;
     uint8_t bytes[32] = {};
-    std::memcpy(bytes, host(c, ea & ~15u), 16);
+    lib::memcpy(bytes, host(c, ea & ~15u), 16);
     Vec128 v;
-    std::memcpy(&v, bytes + eb, 16);
+    lib::memcpy(&v, bytes + eb, 16);
     for (int k = 0; k < 4; k++) v.u32[k] = __builtin_bswap32(v.u32[k]);
     return v;
 }
@@ -83,9 +83,9 @@ inline Vec128 load_vector_right(Context &c, uint32_t ea) {
     uint32_t eb = ea & 15;
     if (!eb) return Vec128{};
     uint8_t bytes[32] = {};
-    std::memcpy(bytes + 16, host(c, ea & ~15u), 16);
+    lib::memcpy(bytes + 16, host(c, ea & ~15u), 16);
     Vec128 v;
-    std::memcpy(&v, bytes + eb, 16);
+    lib::memcpy(&v, bytes + eb, 16);
     for (int k = 0; k < 4; k++) v.u32[k] = __builtin_bswap32(v.u32[k]);
     return v;
 }
@@ -94,7 +94,7 @@ inline Vec128 load_vector_right(Context &c, uint32_t ea) {
 inline void store_vector_left(Context &c, uint32_t ea, const Vec128 &v) {
     Vec128 m;
     for (int k = 0; k < 4; k++) m.u32[k] = __builtin_bswap32(v.u32[k]);
-    std::memcpy(host(c, ea), &m, 16 - (ea & 15));
+    lib::memcpy(host(c, ea), &m, 16 - (ea & 15));
 }
 // stvrx (Xenia's STVR): the register's last EA & 15 bytes, from the start of
 // EA's block up to EA; nothing is written when EA is aligned
@@ -103,7 +103,7 @@ inline void store_vector_right(Context &c, uint32_t ea, const Vec128 &v) {
     if (!eb) return;
     Vec128 m;
     for (int k = 0; k < 4; k++) m.u32[k] = __builtin_bswap32(v.u32[k]);
-    std::memcpy(host(c, ea & ~15u), m.u8 + 16 - eb, eb);
+    lib::memcpy(host(c, ea & ~15u), m.u8 + 16 - eb, eb);
 }
 
 // The string instructions (Book I; Xenia leaves them out): n bytes from RT
@@ -314,16 +314,16 @@ XF_OP(stdcx) {
 
 // ---- floating point ----
 
-XF_OP(lfd) { c.f[i.D.RT] = std::bit_cast<double>(load64(c, uint32_t(ea_d(c, i)))); }
+XF_OP(lfd) { c.f[i.D.RT] = lib::bit_cast<double>(load64(c, uint32_t(ea_d(c, i)))); }
 XF_OP(lfdu) {
     uint64_t ea = ea_du(c, i);
-    c.f[i.D.RT] = std::bit_cast<double>(load64(c, uint32_t(ea))), c.r[i.D.RA] = ea;
+    c.f[i.D.RT] = lib::bit_cast<double>(load64(c, uint32_t(ea))), c.r[i.D.RA] = ea;
 }
 XF_OP(lfdux) {
     uint64_t ea = ea_xu(c, i);
-    c.f[i.X.RT] = std::bit_cast<double>(load64(c, uint32_t(ea))), c.r[i.X.RA] = ea;
+    c.f[i.X.RT] = lib::bit_cast<double>(load64(c, uint32_t(ea))), c.r[i.X.RA] = ea;
 }
-XF_OP(lfdx) { c.f[i.X.RT] = std::bit_cast<double>(load64(c, uint32_t(ea_x(c, i)))); }
+XF_OP(lfdx) { c.f[i.X.RT] = lib::bit_cast<double>(load64(c, uint32_t(ea_x(c, i)))); }
 
 XF_OP(lfs) { c.f[i.D.RT] = single_to_double(load32(c, uint32_t(ea_d(c, i)))); }
 XF_OP(lfsu) {
@@ -336,16 +336,16 @@ XF_OP(lfsux) {
 }
 XF_OP(lfsx) { c.f[i.X.RT] = single_to_double(load32(c, uint32_t(ea_x(c, i)))); }
 
-XF_OP(stfd) { store64(c, uint32_t(ea_d(c, i)), std::bit_cast<uint64_t>(c.f[i.D.RT])); }
+XF_OP(stfd) { store64(c, uint32_t(ea_d(c, i)), lib::bit_cast<uint64_t>(c.f[i.D.RT])); }
 XF_OP(stfdu) {
     uint64_t ea = ea_du(c, i);
-    store64(c, uint32_t(ea), std::bit_cast<uint64_t>(c.f[i.D.RT])), c.r[i.D.RA] = ea;
+    store64(c, uint32_t(ea), lib::bit_cast<uint64_t>(c.f[i.D.RT])), c.r[i.D.RA] = ea;
 }
 XF_OP(stfdux) {
     uint64_t ea = ea_xu(c, i);
-    store64(c, uint32_t(ea), std::bit_cast<uint64_t>(c.f[i.X.RT])), c.r[i.X.RA] = ea;
+    store64(c, uint32_t(ea), lib::bit_cast<uint64_t>(c.f[i.X.RT])), c.r[i.X.RA] = ea;
 }
-XF_OP(stfdx) { store64(c, uint32_t(ea_x(c, i)), std::bit_cast<uint64_t>(c.f[i.X.RT])); }
+XF_OP(stfdx) { store64(c, uint32_t(ea_x(c, i)), lib::bit_cast<uint64_t>(c.f[i.X.RT])); }
 
 XF_OP(stfs) { store32(c, uint32_t(ea_d(c, i)), double_to_single(c.f[i.D.RT])); }
 XF_OP(stfsu) {
@@ -359,7 +359,7 @@ XF_OP(stfsux) {
 XF_OP(stfsx) { store32(c, uint32_t(ea_x(c, i)), double_to_single(c.f[i.X.RT])); }
 
 // the low word of the register's bits
-XF_OP(stfiwx) { store32(c, uint32_t(ea_x(c, i)), uint32_t(std::bit_cast<uint64_t>(c.f[i.X.RT]))); }
+XF_OP(stfiwx) { store32(c, uint32_t(ea_x(c, i)), uint32_t(lib::bit_cast<uint64_t>(c.f[i.X.RT]))); }
 
 // ---- vectors ----
 
@@ -419,8 +419,8 @@ XF_OP(stvrxl128) { store_vector_right(c, ea_v(c, i.VX128_1.RA, i.VX128_1.RB), c.
 
 // dcbz and dcbz128 both zero the 128-byte line, as Xenia does ("On Xbox360
 // there is no short cache line"); compiled clearing loops step dcbz by 128
-XF_OP(dcbz) { std::memset(host(c, uint32_t(ea_x(c, i)) & ~127u), 0, 128); }
-XF_OP(dcbz128) { std::memset(host(c, uint32_t(ea_x(c, i)) & ~127u), 0, 128); }
+XF_OP(dcbz) { lib::memset(host(c, uint32_t(ea_x(c, i)) & ~127u), 0, 128); }
+XF_OP(dcbz128) { lib::memset(host(c, uint32_t(ea_x(c, i)) & ~127u), 0, 128); }
 // hints: nothing to do (Xenia's disable_prefetch_and_cachecontrol default)
 XF_OP(dcbf) {}
 XF_OP(dcbi) {}

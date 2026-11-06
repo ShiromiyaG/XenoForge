@@ -21,18 +21,8 @@
 
 #include "xenoforge/ppc.h"
 #include "xenoforge/ppc_context.h"
-
-#include <bit>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <limits>
-
-#if defined(__clang__) || defined(__GNUC__)
-#define XF_INLINE inline __attribute__((always_inline))
-#else
-#define XF_INLINE __forceinline
-#endif
+// the standard library's pieces (lib::), freestanding in a game library
+#include "xenoforge/ppc_runtime.h"
 
 namespace xf::ppc::ops {
 
@@ -86,31 +76,31 @@ XF_INLINE uint8_t *host(Context &c, uint32_t ea) { return c.base + ea + (ea >= 0
 XF_INLINE uint8_t load8(Context &c, uint32_t ea) { return *host(c, ea); }
 XF_INLINE uint16_t load16(Context &c, uint32_t ea) {
     uint16_t v;
-    std::memcpy(&v, host(c, ea), 2);
+    lib::memcpy(&v, host(c, ea), 2);
     return __builtin_bswap16(v);
 }
 XF_INLINE uint32_t load32(Context &c, uint32_t ea) {
     uint32_t v;
-    std::memcpy(&v, host(c, ea), 4);
+    lib::memcpy(&v, host(c, ea), 4);
     return __builtin_bswap32(v);
 }
 XF_INLINE uint64_t load64(Context &c, uint32_t ea) {
     uint64_t v;
-    std::memcpy(&v, host(c, ea), 8);
+    lib::memcpy(&v, host(c, ea), 8);
     return __builtin_bswap64(v);
 }
 XF_INLINE void store8(Context &c, uint32_t ea, uint8_t v) { *host(c, ea) = v; }
 XF_INLINE void store16(Context &c, uint32_t ea, uint16_t v) {
     v = __builtin_bswap16(v);
-    std::memcpy(host(c, ea), &v, 2);
+    lib::memcpy(host(c, ea), &v, 2);
 }
 XF_INLINE void store32(Context &c, uint32_t ea, uint32_t v) {
     v = __builtin_bswap32(v);
-    std::memcpy(host(c, ea), &v, 4);
+    lib::memcpy(host(c, ea), &v, 4);
 }
 XF_INLINE void store64(Context &c, uint32_t ea, uint64_t v) {
     v = __builtin_bswap64(v);
-    std::memcpy(host(c, ea), &v, 8);
+    lib::memcpy(host(c, ea), &v, 8);
 }
 
 // ---- MMIO: the devices' registers (the GPU's at 0x7FC80000) ----

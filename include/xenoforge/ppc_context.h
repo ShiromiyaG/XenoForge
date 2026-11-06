@@ -8,9 +8,6 @@
 
 #include "xenoforge/ppc.h"
 
-#include <cstdint>
-#include <cstring>
-
 namespace xf::ppc {
 
 // A VMX register. Words are in guest order (u32[0] is the first word in

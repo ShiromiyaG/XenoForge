@@ -32,8 +32,8 @@ namespace vfp {
 
 constexpr uint32_t QNAN = 0x7FC00000u; // the NaN an invalid operation makes
 
-inline float flt(uint32_t v) { return std::bit_cast<float>(v); }
-inline uint32_t bits(float v) { return std::bit_cast<uint32_t>(v); }
+inline float flt(uint32_t v) { return lib::bit_cast<float>(v); }
+inline uint32_t bits(float v) { return lib::bit_cast<uint32_t>(v); }
 inline bool is_nan(uint32_t v) { return (v & 0x7FFFFFFFu) > 0x7F800000u; }
 inline uint32_t quiet(uint32_t v) { return v | 0x00400000u; }
 // non-Java mode, both ways: a denormal is a zero of its sign
@@ -77,17 +77,17 @@ inline uint32_t mul(uint32_t a, uint32_t b) {
 }
 // vmaddfp: a * c + b rounded once, as Xenia's MUL_ADD (vfmadd213ps); the
 // console fuses too (rounding the product first fails 588 of the 15600 tests).
-// std::fma is one instruction where the build has FMA, a libm call otherwise.
+// lib::fma is one instruction where the build has FMA, a libm call otherwise.
 inline uint32_t madd(uint32_t a, uint32_t b, uint32_t c) {
     a = flush(a), b = flush(b), c = flush(c);
     if (is_nan(a) || is_nan(b) || is_nan(c)) return quiet(is_nan(a) ? a : is_nan(b) ? b : c);
-    return result(std::fma(flt(a), flt(c), flt(b)));
+    return result(lib::fma(flt(a), flt(c), flt(b)));
 }
 // vnmsubfp: -(a * c - b) rounded once (Xenia: Neg(MulSub)); a NaN is not negated
 inline uint32_t nmsub(uint32_t a, uint32_t b, uint32_t c) {
     a = flush(a), b = flush(b), c = flush(c);
     if (is_nan(a) || is_nan(b) || is_nan(c)) return quiet(is_nan(a) ? a : is_nan(b) ? b : c);
-    return result(-std::fma(flt(a), flt(c), -flt(b)));
+    return result(-lib::fma(flt(a), flt(c), -flt(b)));
 }
 // vmaxfp/vminfp: +0 above -0; a NaN operand comes out quieted, vA's first
 // (Xenia passes a signaling NaN through unchanged; the console tests quiet it)
@@ -130,7 +130,7 @@ inline uint32_t recip(uint32_t v) {
     int32_t estimate = int32_t((entry & 0xFFFF) << 10) - int32_t(low * (entry >> 16));
     int32_t result_exponent = 253 - int32_t(exponent);
     if (!(estimate & (1 << 25))) {
-        int zeros = std::countl_zero(uint32_t(estimate) & 0x1FFFFFFu);
+        int zeros = lib::countl_zero(uint32_t(estimate) & 0x1FFFFFFu);
         result_exponent += 6 - zeros;
         estimate = int32_t(uint32_t(estimate) << (zeros - 6));
     }
@@ -157,7 +157,7 @@ inline uint32_t rsqrte(uint32_t v) {
     int32_t result_exponent = (127 - int32_t(exponent)) >> 1;
     int32_t estimate = int32_t((entry << 10) & 0x3FFFC00u) - int32_t(((mantissa >> 9) & 1023) * (entry >> 16));
     if (!(estimate & (1 << 25))) {
-        int zeros = std::countl_zero(uint32_t(estimate) & 0x1FFFFFFu);
+        int zeros = lib::countl_zero(uint32_t(estimate) & 0x1FFFFFFu);
         result_exponent += 6 - zeros;
         estimate = int32_t(uint32_t(estimate) << (zeros - 6));
     }
@@ -168,13 +168,13 @@ inline uint32_t rsqrte(uint32_t v) {
 inline uint32_t exp2e(uint32_t v) {
     v = flush(v);
     if (is_nan(v)) return quiet(v);
-    return result(std::exp2(flt(v)));
+    return result(lib::exp2(flt(v)));
 }
 inline uint32_t log2e(uint32_t v) {
     v = flush(v);
     if (is_nan(v)) return quiet(v);
     if (v & 0x80000000u) return v == 0x80000000u ? 0xFF800000u : QNAN;
-    return result(std::log2(flt(v)));
+    return result(lib::log2(flt(v)));
 }
 
 // ---- rounding to an integer value (vrfi*), on the bits ----
@@ -283,11 +283,11 @@ inline void bounded(Context &c, uint32_t vd, const Vec128 &v, bool rc) {
 // operand's NaN, else the second's; an invalid operation makes the default
 // NaN (the console's, not x86's negative one)
 inline double widen_nan(uint32_t v) { // cvtps2pd: payload kept, quieted
-    return std::bit_cast<double>(uint64_t(v & 0x80000000u) << 32 | 0x7FF8000000000000ull |
+    return lib::bit_cast<double>(uint64_t(v & 0x80000000u) << 32 | 0x7FF8000000000000ull |
                                  uint64_t(v & 0x3FFFFF) << 29);
 }
 inline double x86_op(double x, double y, double r) {
-    return x != x ? x : y != y ? y : r != r ? std::bit_cast<double>(0x7FF8000000000000ull) : r;
+    return x != x ? x : y != y ? y : r != r ? lib::bit_cast<double>(0x7FF8000000000000ull) : r;
 }
 inline uint32_t dot_nan(const Vec128 &a, const Vec128 &b, int n) {
     double p[4];
@@ -303,7 +303,7 @@ inline uint32_t dot_nan(const Vec128 &a, const Vec128 &b, int n) {
     } else {
         s = x86_op(s, p[1], s + p[1]);
     }
-    uint64_t v = std::bit_cast<uint64_t>(s); // cvtsd2ss of a NaN: the top of the payload
+    uint64_t v = lib::bit_cast<uint64_t>(s); // cvtsd2ss of a NaN: the top of the payload
     return uint32_t(v >> 32 & 0x80000000u) | 0x7FC00000u | uint32_t(v >> 29 & 0x3FFFFF);
 }
 inline uint32_t dot(const Vec128 &a, const Vec128 &b, int n) {
@@ -312,7 +312,7 @@ inline uint32_t dot(const Vec128 &a, const Vec128 &b, int n) {
     double sum = n == 4 ? (p[0] + p[2]) + (p[1] + p[3]) : (p[0] + p[2]) + p[1];
     if (sum != sum) return dot_nan(a, b, n);
     float r = float(sum);
-    if (std::isinf(r) && !std::isinf(sum)) return QNAN;
+    if (lib::isinf(r) && !lib::isinf(sum)) return QNAN;
     return flush(bits(r));
 }
 inline Vec128 splat(uint32_t v) {

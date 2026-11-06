@@ -23,7 +23,7 @@
 #include <thread>
 
 namespace xf::ppc {
-[[noreturn]] void unwind(Context &c); // ppc_generated.h
+[[noreturn]] void unwind(Context &c); // ppc_runtime.h
 }
 
 using namespace xf;
@@ -1057,10 +1057,10 @@ std::atomic<bool> xr_fell{false};
 uint64_t xr_value = 0;
 
 void xr_function(ppc::Context &c) {
-    const uint32_t xf_sp = uint32_t(c.r[1]);
-    uint32_t xf_at = 0;
-    for (;;) {
-        try {
+    static constexpr uint32_t xf_sites[] = {XR_RET};
+    ppc::resumable(
+        c,
+        [](ppc::Context &c, uint32_t xf_at, uint32_t, uint32_t) {
             if (xf_at == XR_RET) goto resume;
             c.r[1] -= 0x40; // its frame
             c.r[3] = xr_buffer;
@@ -1075,13 +1075,8 @@ void xr_function(ppc::Context &c) {
             }
             xr_value = c.r[3];
             c.r[1] += 0x40;
-            return;
-        } catch (const ppc::Unwind &u) {
-            if (uint32_t(c.r[1]) >= xf_sp) throw;
-            if (u.target != XR_RET) throw;
-            xf_at = u.target;
-        }
-    }
+        },
+        uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, 1);
 }
 
 void xlj_function(ppc::Context &c) {

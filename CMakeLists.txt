@@ -34,6 +34,7 @@ add_library(xenoforge STATIC
     src/snappy.cpp
     src/gpu_trace.cpp
     src/game_build.cpp
+    src/game_library.cpp
     src/trace_stats.cpp
     src/ucode.cpp
     src/ucode_parse.cpp
@@ -47,17 +48,36 @@ add_library(xenoforge STATIC
     src/resolve.cpp
     src/ppc.cpp
     src/ppc_interp.cpp
+    src/ppc_runtime.cpp
     src/guest_space.cpp
     src/recomp_image.cpp
     src/recomp_discover.cpp
     src/recomp_emit.cpp
+    src/recomp_module.cpp
     src/memory.cpp
     src/guest_memory.cpp
     src/gpu/command_processor.cpp
     src/gpu_trace_writer.cpp
     src/xma_decoder.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/game_interface.stamp
 )
-target_include_directories(xenoforge PUBLIC include PRIVATE src)
+target_include_directories(xenoforge PUBLIC include PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/generated)
+# The game library's interface (game_library.h; docs/runtime.md, "The game
+# library"): its version, a digest of what makes a library (the generated
+# code's headers, the recompiler's sources, the recompile step's flags in
+# game_build.cpp), and those headers as text, which the recompile step writes
+# beside the code it compiles (cmake/game_interface.cmake)
+file(GLOB XF_GAME_INTERFACE_INPUTS CONFIGURE_DEPENDS include/xenoforge/ppc*.h include/xenoforge/ppc_ops/*.h
+     include/xenoforge/ppc_opcodes.inc include/xenoforge/game_library.h include/xenoforge/recomp.h src/recomp_*.cpp
+     src/game_build.cpp)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/game_interface.stamp
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/xenoforge/game_interface.h
+               ${CMAKE_CURRENT_BINARY_DIR}/generated/game_headers.inc
+    COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/generated
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/game_interface.cmake
+    DEPENDS cmake/game_interface.cmake ${XF_GAME_INTERFACE_INPUTS}
+    COMMENT "the game library's interface version")
 
 # XMA decoded by FFmpeg's xmaframes decoder, as Xenia does (plan A6;
 # third_party/ffmpeg/ffmpeg.cmake): a shared library of its own (LGPL), fetched
@@ -128,6 +148,9 @@ add_executable(xfppc tools/xfppc.cpp)
 target_link_libraries(xfppc PRIVATE xenoforge)
 add_executable(xfrecomp tools/xfrecomp.cpp)
 target_link_libraries(xfrecomp PRIVATE xenoforge)
+# the recompile step from the command line (game_build.h): a disc into the cache, timed
+add_executable(xfbuild tools/xfbuild.cpp)
+target_link_libraries(xfbuild PRIVATE xenoforge)
 
 # The kernel (step A4; docs/runtime.md): an object library, so every
 # export's registration (XF_EXPORT, a static initializer) is linked in.
@@ -359,6 +382,15 @@ foreach(name kernel_memory kernel_modules kernel_crypt)
     target_link_libraries(${name}_test PRIVATE xenoforge_kernel xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+# a game library built by the recompile step from a piece of generated code,
+# loaded and run beside the same code linked in (needs clang and lld)
+add_executable(game_library_test tests/game_library_test.cpp tests/game_library/code.cpp)
+target_link_libraries(game_library_test PRIVATE xenoforge)
+target_compile_definitions(game_library_test PRIVATE
+                           XF_GAME_LIBRARY_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/game_library")
+set_source_files_properties(tests/game_library/code.cpp PROPERTIES COMPILE_OPTIONS "-O2;-g0;-w;-mfma;-mavx2")
+add_test(NAME game_library COMMAND game_library_test)
+set_tests_properties(game_library PROPERTIES TIMEOUT 300)
 # the modules family loads DLLs and runs a guest thread through them
 target_include_directories(kernel_modules_test PRIVATE src/kernel)
 set_tests_properties(kernel_modules PROPERTIES TIMEOUT 120) # threads: fail, never hang

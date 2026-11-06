@@ -8,6 +8,8 @@
 #include "xenoforge/xex.h"
 
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <map>
 #include <set>
 #include <span>
@@ -144,5 +146,51 @@ std::vector<uint32_t> scan_pointers(const Image &image);
 std::string emit_function(const Image &image, const Discovery &d, const Function &f, const std::string &prefix,
                           std::set<uint32_t> *calls = nullptr);
 std::string function_name(const std::string &prefix, uint32_t address);
+
+// ---- Modules: a disc's executables emitted (recomp_module.cpp) ----
+
+// An executable to emit: its path on the disc (or the host file's name) and
+// the file.
+struct ModuleFile {
+    std::string path;
+    std::vector<uint8_t> file;
+};
+
+// Every XEX2 executable on a disc but title updates and the system update's,
+// or the ones `only` names; a bare executable (a host file starting with
+// XEX2) alone. False, and why, when there is none.
+bool find_modules(const std::filesystem::path &input, const std::vector<std::string> &only,
+                  std::vector<ModuleFile> &out, std::string &error);
+
+enum class EmitStage { Discovering, Emitting };
+struct EmitOptions {
+    int files = 0; // about this many files per module; 0: 64 KB of the image each
+    DiscoverOptions discover;
+    // as each module is discovered (done of the modules) and each of its
+    // files written (done of its files); false stops the emission
+    std::function<bool(EmitStage stage, size_t done, size_t total, const std::string &detail)> progress;
+};
+struct EmittedModule {
+    std::string path;      // on the disc: "default.xex", "waves\\L360.dll"
+    std::string directory; // under the output: "default_xex", "waves_L360_dll"
+    std::string ns;        // its C++ namespace
+    uint64_t digest = 0;   // its image's (xf::image_digest)
+    size_t functions = 0;
+    uint64_t instructions = 0;
+    int files = 0, written = 0;
+    std::vector<std::string> sources; // what to compile, under the output: its functions_K.cpp, then table.cpp
+};
+
+// Each module's directory under `out`, holding its functions as C++ in a
+// namespace of its own (functions_K.cpp, each declaring what it calls) and
+// table.cpp with its table (ppc_module.h: the path, base, size and digest of
+// the image it was made from, the functions by address, the resume sites);
+// and out/modules.cpp listing every module's table (xf_modules). A file is
+// written only when its text changes, so a build after a discovery fix
+// compiles the files that fix touched; files of an earlier emission that hold
+// nothing now are left empty. False, and why, when an executable cannot be
+// read or the progress stops it.
+bool emit_modules(const std::vector<ModuleFile> &modules, const std::filesystem::path &out,
+                  const EmitOptions &options, std::vector<EmittedModule> &emitted, std::string &error);
 
 } // namespace xf::recomp

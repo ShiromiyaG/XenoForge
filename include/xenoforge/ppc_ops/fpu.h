@@ -37,8 +37,6 @@
 
 #include "xenoforge/ppc_ops.h"
 
-#include <cfenv>
-
 #if defined(__clang__) || defined(__GNUC__)
 #define XF_FP_SLOW __attribute__((noinline, cold))
 #else
@@ -62,13 +60,13 @@ constexpr uint32_t FPSCR_EXCEPTIONS = FPSCR_OX | FPSCR_UX | FPSCR_ZX | FPSCR_XX 
 // the PPC's default QNaN
 constexpr uint64_t FP_DEFAULT_NAN = 0x7FF8000000000000;
 
-XF_INLINE uint64_t fp_bits(double v) { return std::bit_cast<uint64_t>(v); }
-XF_INLINE double fp_double(uint64_t v) { return std::bit_cast<double>(v); }
+XF_INLINE uint64_t fp_bits(double v) { return lib::bit_cast<uint64_t>(v); }
+XF_INLINE double fp_double(uint64_t v) { return lib::bit_cast<double>(v); }
 XF_INLINE bool fp_is_snan(uint64_t v) {
     return (v & 0x7FF8000000000000) == 0x7FF0000000000000 && (v & 0x0007FFFFFFFFFFFF);
 }
 // a denormal double (no single is one: lfs and the single forms never make one)
-XF_INLINE bool fp_denormal(double v) { return std::fabs(v) < 0x1p-1022 && v != 0; }
+XF_INLINE bool fp_denormal(double v) { return lib::fabs(v) < 0x1p-1022 && v != 0; }
 
 // FEX and VX are summaries: VX the OR of the invalid-operation bits, FEX of
 // the exceptions whose enable is set (VX..XX against VE..XE)
@@ -90,11 +88,11 @@ inline void fp_record(Context &c, uint32_t exceptions, uint32_t status, uint32_t
 
 // FPRF (C, <, >, =, ?) for a result, denormal by its format
 inline uint32_t fp_class(double r, bool single) {
-    bool negative = std::signbit(r);
+    bool negative = lib::signbit(r);
     if (r != r) return 0x11u << 12;
-    if (std::isinf(r)) return (negative ? 0x09u : 0x05u) << 12;
+    if (lib::isinf(r)) return (negative ? 0x09u : 0x05u) << 12;
     if (r == 0) return (negative ? 0x12u : 0x02u) << 12;
-    if (std::fabs(r) < (single ? 0x1p-126 : 0x1p-1022)) return (negative ? 0x18u : 0x14u) << 12;
+    if (lib::fabs(r) < (single ? 0x1p-126 : 0x1p-1022)) return (negative ? 0x18u : 0x14u) << 12;
     return (negative ? 0x08u : 0x04u) << 12;
 }
 
@@ -127,14 +125,14 @@ inline double fp_compute(uint32_t kind, double a, double b, double c) {
     case FP_SUB: return a - b;
     case FP_MUL: return a * c;
     case FP_DIV: return a / b;
-    case FP_SQRT: return std::sqrt(b);
+    case FP_SQRT: return lib::sqrt(b);
     case FP_MADD:
-    case FP_NMADD: return std::fma(a, c, b);
+    case FP_NMADD: return lib::fma(a, c, b);
     case FP_MSUB:
-    case FP_NMSUB: return std::fma(a, c, -b);
+    case FP_NMSUB: return lib::fma(a, c, -b);
     case FP_RSP: return b;
     case FP_RES: return 1.0 / b;
-    default: return double(std::bit_cast<int64_t>(b)); // FP_CFID
+    default: return double(lib::bit_cast<int64_t>(b)); // FP_CFID
     }
 }
 
@@ -160,7 +158,7 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
     else if (kind != FP_CFID)
         operands[0] = b, count = 1;
     // infinity x 0 is invalid even when FRB is a NaN (the console flags it)
-    const bool imz = (kind == FP_MUL || fused) && ((std::isinf(a) && cc == 0) || (a == 0 && std::isinf(cc)));
+    const bool imz = (kind == FP_MUL || fused) && ((lib::isinf(a) && cc == 0) || (a == 0 && lib::isinf(cc)));
     uint32_t exceptions = imz ? FPSCR_VXIMZ : 0;
     int nan = -1;
     for (int k = 0; k < count; k++) {
@@ -180,7 +178,7 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
     // give the double result, not rounded to single (and its exceptions)
     if (single && kind <= FP_NMSUB) {
         bool denormal = false, infinite = false;
-        for (int k = 0; k < count; k++) denormal |= fp_denormal(operands[k]), infinite |= std::isinf(operands[k]);
+        for (int k = 0; k < count; k++) denormal |= fp_denormal(operands[k]), infinite |= lib::isinf(operands[k]);
         if (denormal && (kind == FP_DIV || kind == FP_SQRT)) {
             single = false;
         } else if (denormal && !infinite) {
@@ -193,14 +191,14 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
         // exceptions holds it
     } else if (kind == FP_ADD || kind == FP_SUB || fused) {
         // infinities of opposite effective signs: the product's (or FRA's) against FRB's
-        bool infinite = fused ? std::isinf(a) || std::isinf(cc) : std::isinf(a);
-        bool negative = fused ? std::signbit(a) != std::signbit(cc) : std::signbit(a);
-        if (infinite && std::isinf(b) && negative != (std::signbit(b) != (kind == FP_SUB || subtract)))
+        bool infinite = fused ? lib::isinf(a) || lib::isinf(cc) : lib::isinf(a);
+        bool negative = fused ? lib::signbit(a) != lib::signbit(cc) : lib::signbit(a);
+        if (infinite && lib::isinf(b) && negative != (lib::signbit(b) != (kind == FP_SUB || subtract)))
             exceptions = FPSCR_VXISI;
     } else if (kind == FP_DIV) {
         if (a == 0 && b == 0)
             exceptions = FPSCR_VXZDZ;
-        else if (std::isinf(a) && std::isinf(b))
+        else if (lib::isinf(a) && lib::isinf(b))
             exceptions = FPSCR_VXIDI;
     } else if (kind == FP_SQRT && b < 0) {
         exceptions = FPSCR_VXSQRT;
@@ -209,44 +207,44 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
         if (rc) fp_record(c, exceptions, 0x11u << 12, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
         return fp_double(FP_DEFAULT_NAN);
     }
-    static constexpr int MODES[4] = {FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD};
+    static constexpr int MODES[4] = {lib::ROUND_NEAREST, lib::ROUND_ZERO, lib::ROUND_UP, lib::ROUND_DOWN};
     const int mode = MODES[c.fpscr & FPSCR_RN];
     double r, rz = 0; // rz: toward zero, for FR
     int flags;
     if (!single) {
-        std::fesetround(mode);
-        std::feclearexcept(FE_ALL_EXCEPT);
+        lib::fesetround(mode);
+        lib::feclearexcept(lib::EXCEPT_ALL);
         r = fp_compute(kind, a, b, cc);
-        flags = std::fetestexcept(FE_ALL_EXCEPT);
-        if (rc) std::fesetround(FE_TOWARDZERO), rz = fp_compute(kind, a, b, cc);
+        flags = lib::fetestexcept(lib::EXCEPT_ALL);
+        if (rc) lib::fesetround(lib::ROUND_ZERO), rz = fp_compute(kind, a, b, cc);
     } else {
         // toward zero and odd if inexact: one rounding to single below
-        std::fesetround(FE_TOWARDZERO);
-        std::feclearexcept(FE_ALL_EXCEPT);
+        lib::fesetround(lib::ROUND_ZERO);
+        lib::feclearexcept(lib::EXCEPT_ALL);
         double d = fp_compute(kind, a, b, cc);
-        flags = std::fetestexcept(FE_ALL_EXCEPT);
-        std::fesetround(mode);
-        if (flags & FE_INEXACT)
+        flags = lib::fetestexcept(lib::EXCEPT_ALL);
+        lib::fesetround(mode);
+        if (flags & lib::EXCEPT_INEXACT)
             d = fp_double(fp_bits(d) | 1);
         else if (d == 0)
             d = fp_compute(kind, a, b, cc); // an exact zero's sign is the mode's
-        std::feclearexcept(FE_ALL_EXCEPT);
+        lib::feclearexcept(lib::EXCEPT_ALL);
         r = double(float(d));
-        flags |= std::fetestexcept(FE_ALL_EXCEPT);
-        if (rc) std::fesetround(FE_TOWARDZERO), rz = double(float(d));
+        flags |= lib::fetestexcept(lib::EXCEPT_ALL);
+        if (rc) lib::fesetround(lib::ROUND_ZERO), rz = double(float(d));
     }
-    std::fesetround(FE_TONEAREST);
+    lib::fesetround(lib::ROUND_NEAREST);
     if (kind == FP_NMADD || kind == FP_NMSUB) r = -r, rz = -rz;
-    if ((c.fpscr & FPSCR_NI) && r != 0 && std::fabs(r) < (single ? 0x1p-126 : 0x1p-1022)) {
-        r = rz = std::copysign(0.0, r);
-        flags |= FE_UNDERFLOW | FE_INEXACT;
+    if ((c.fpscr & FPSCR_NI) && r != 0 && lib::fabs(r) < (single ? 0x1p-126 : 0x1p-1022)) {
+        r = rz = lib::copysign(0.0, r);
+        flags |= lib::EXCEPT_UNDERFLOW | lib::EXCEPT_INEXACT;
     }
     if (rc) {
-        exceptions = (flags & FE_OVERFLOW ? FPSCR_OX : 0) | (flags & FE_UNDERFLOW ? FPSCR_UX : 0) |
-                     (flags & FE_DIVBYZERO ? FPSCR_ZX : 0);
+        exceptions = (flags & lib::EXCEPT_OVERFLOW ? FPSCR_OX : 0) | (flags & lib::EXCEPT_UNDERFLOW ? FPSCR_UX : 0) |
+                     (flags & lib::EXCEPT_DIVBYZERO ? FPSCR_ZX : 0);
         uint32_t status = fp_class(r, single);
         // fres: XX untouched, FR and FI undefined (left 0)
-        if (kind != FP_RES && (flags & FE_INEXACT))
+        if (kind != FP_RES && (flags & lib::EXCEPT_INEXACT))
             exceptions |= FPSCR_XX, status |= FPSCR_FI | (r != rz ? FPSCR_FR : 0);
         fp_record(c, exceptions, status, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
     }
@@ -258,7 +256,7 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
 // compare when normal; a NaN fails it too)
 XF_INLINE bool fp_plain(Context &c, bool rc, uint32_t kind, double r) {
     return !rc && !(c.fpscr & FPSCR_RN) &&
-           (__builtin_expect(std::fabs(r) >= (kind & FP_SINGLE ? 0x1p-126 : 0x1p-1022), 1) || r == 0);
+           (__builtin_expect(lib::fabs(r) >= (kind & FP_SINGLE ? 0x1p-126 : 0x1p-1022), 1) || r == 0);
 }
 // a double exactly halfway between two singles (normal ones): rounding the
 // fused result again could round the wrong way
@@ -269,7 +267,7 @@ XF_INLINE bool fp_single_tie(double d) { return (uint32_t(fp_bits(d)) & 0x1FFFFF
 // operand, mostly) is each looked at.
 XF_INLINE bool fp_ordinary_operands(uint32_t kind, double a, double b = 1, double c = 1) {
     if (!(kind & FP_SINGLE)) return true;
-    double x = std::fabs(a), y = std::fabs(b), z = std::fabs(c), m = x < y ? x : y;
+    double x = lib::fabs(a), y = lib::fabs(b), z = lib::fabs(c), m = x < y ? x : y;
     m = m < z ? m : z;
     return __builtin_expect(m >= 0x1p-1022, 1) || !(fp_denormal(a) || fp_denormal(b) || fp_denormal(c));
 }
@@ -298,7 +296,7 @@ XF_FP_BINARY(fdivsx, FP_DIV | FP_SINGLE, double(float(a / b)), FRB)
 // frD <- +-((frA x frC) +- frB), one rounding
 #define XF_FP_FUSED(name, kind, sign, addend)                                                                          \
     XF_OP(name) {                                                                                                      \
-        double a = c.f[i.A.FRA], b = c.f[i.A.FRB], cc = c.f[i.A.FRC], d = std::fma(a, cc, addend);                     \
+        double a = c.f[i.A.FRA], b = c.f[i.A.FRB], cc = c.f[i.A.FRC], d = lib::fma(a, cc, addend);                     \
         double r = sign((kind) & FP_SINGLE ? double(float(d)) : d);                                                    \
         if (fp_plain(c, i.A.Rc, kind, r) && !((kind) & FP_SINGLE && fp_single_tie(d)) &&                               \
             fp_ordinary_operands(kind, a, b, cc)) [[likely]]                                                           \
@@ -326,14 +324,14 @@ XF_FP_FUSED(fnmsubsx, FP_NMSUB | FP_SINGLE, -, -b)
             c.f[i.form.rt] = fp_arith(c, kind, i.form.rc, b, b, b);                                                    \
     }
 // frD <- sqrt(frB)
-XF_FP_UNARY(fsqrtx, FP_SQRT, std::sqrt(b), A, FRT, FRB, Rc)
-XF_FP_UNARY(fsqrtsx, FP_SQRT | FP_SINGLE, double(float(std::sqrt(b))), A, FRT, FRB, Rc)
+XF_FP_UNARY(fsqrtx, FP_SQRT, lib::sqrt(b), A, FRT, FRB, Rc)
+XF_FP_UNARY(fsqrtsx, FP_SQRT | FP_SINGLE, double(float(lib::sqrt(b))), A, FRT, FRB, Rc)
 // frD <- Round_single(frB)
 XF_FP_UNARY(frspx, FP_RSP | FP_SINGLE, double(float(b)), X, RT, RB, Rc)
 // frD <- 1 / frB, single (the console's is an estimate; see the top)
 XF_FP_UNARY(fresx, FP_RES | FP_SINGLE, double(float(1.0 / b)), A, FRT, FRB, Rc)
 // frD <- signed_int64_to_double(frB)
-XF_FP_UNARY(fcfidx, FP_CFID, double(std::bit_cast<int64_t>(b)), X, RT, RB, Rc)
+XF_FP_UNARY(fcfidx, FP_CFID, double(lib::bit_cast<int64_t>(b)), X, RT, RB, Rc)
 #undef XF_FP_UNARY
 
 // frsqrte: the console's estimate, a 16-entry table by the exponent's parity
@@ -359,7 +357,7 @@ inline void fp_frsqrte(Context &c, uint32_t rt, double in, bool rc) {
         result = FP_DEFAULT_NAN, exceptions = FPSCR_VXSQRT;
     } else {
         if (exponent == 0) {
-            int zeros = std::countl_zero(mantissa);
+            int zeros = lib::countl_zero(mantissa);
             mantissa <<= zeros - 11;
             exponent = 12 - zeros;
         }
@@ -383,13 +381,13 @@ inline XF_FP_SLOW double fp_to_int(Context &c, double b, bool word, bool toward_
     uint32_t exceptions = 0, status = 0;
     if (b != b) {
         v = lo, exceptions = FPSCR_VXCVI | (fp_is_snan(fp_bits(b)) ? FPSCR_VXSNAN : 0);
-    } else if (std::isinf(b)) {
+    } else if (lib::isinf(b)) {
         v = b < 0 ? lo : hi, exceptions = FPSCR_VXCVI;
     } else {
-        double t = std::trunc(b), fraction = b - t; // both exact
+        double t = lib::trunc(b), fraction = b - t; // both exact
         bool away = false;                          // rounded away from zero
         switch (toward_zero ? 1 : c.fpscr & FPSCR_RN) {
-        case 0: away = std::fabs(fraction) > 0.5 || (std::fabs(fraction) == 0.5 && std::fmod(t, 2.0) != 0); break;
+        case 0: away = lib::fabs(fraction) > 0.5 || (lib::fabs(fraction) == 0.5 && lib::fmod(t, 2.0) != 0); break;
         case 2: away = fraction > 0; break;
         case 3: away = fraction < 0; break;
         }
@@ -402,14 +400,14 @@ inline XF_FP_SLOW double fp_to_int(Context &c, double b, bool word, bool toward_
         }
     }
     if (rc) fp_record(c, exceptions, status, FPSCR_FR | FPSCR_FI);
-    return std::bit_cast<double>(word ? int64_t(int32_t(v)) : v);
+    return lib::bit_cast<double>(word ? int64_t(int32_t(v)) : v);
 }
 
 XF_OP(fctidx) {
     // frD <- double_to_signed_int64(frB), by FPSCR[RN]
     double b = c.f[i.X.RB];
-    if (!i.X.Rc && !(c.fpscr & FPSCR_RN) && std::fabs(b) < 0x1p63) [[likely]]
-        c.f[i.X.RT] = std::bit_cast<double>(int64_t(std::llrint(b)));
+    if (!i.X.Rc && !(c.fpscr & FPSCR_RN) && lib::fabs(b) < 0x1p63) [[likely]]
+        c.f[i.X.RT] = lib::bit_cast<double>(int64_t(lib::llrint(b)));
     else
         c.f[i.X.RT] = fp_to_int(c, b, false, false, i.X.Rc);
 }
@@ -417,8 +415,8 @@ XF_OP(fctidx) {
 XF_OP(fctidzx) {
     // frD <- double_to_signed_int64(frB), toward zero
     double b = c.f[i.X.RB];
-    if (!i.X.Rc && std::fabs(b) < 0x1p63) [[likely]]
-        c.f[i.X.RT] = std::bit_cast<double>(int64_t(b));
+    if (!i.X.Rc && lib::fabs(b) < 0x1p63) [[likely]]
+        c.f[i.X.RT] = lib::bit_cast<double>(int64_t(b));
     else
         c.f[i.X.RT] = fp_to_int(c, b, false, true, i.X.Rc);
 }
@@ -426,8 +424,8 @@ XF_OP(fctidzx) {
 XF_OP(fctiwx) {
     // frD <- double_to_signed_int32(frB), by FPSCR[RN]
     double b = c.f[i.X.RB];
-    if (!i.X.Rc && !(c.fpscr & FPSCR_RN) && std::fabs(b) < 2147483647.0) [[likely]]
-        c.f[i.X.RT] = std::bit_cast<double>(int64_t(std::llrint(b)));
+    if (!i.X.Rc && !(c.fpscr & FPSCR_RN) && lib::fabs(b) < 2147483647.0) [[likely]]
+        c.f[i.X.RT] = lib::bit_cast<double>(int64_t(lib::llrint(b)));
     else
         c.f[i.X.RT] = fp_to_int(c, b, true, false, i.X.Rc);
 }
@@ -435,8 +433,8 @@ XF_OP(fctiwx) {
 XF_OP(fctiwzx) {
     // frD <- double_to_signed_int32(frB), toward zero
     double b = c.f[i.X.RB];
-    if (!i.X.Rc && std::fabs(b) < 2147483648.0) [[likely]]
-        c.f[i.X.RT] = std::bit_cast<double>(int64_t(int32_t(b)));
+    if (!i.X.Rc && lib::fabs(b) < 2147483648.0) [[likely]]
+        c.f[i.X.RT] = lib::bit_cast<double>(int64_t(int32_t(b)));
     else
         c.f[i.X.RT] = fp_to_int(c, b, true, true, i.X.Rc);
 }
@@ -488,9 +486,9 @@ XF_INLINE void fp_compare(Context &c, uint32_t bf, double a, double b, bool orde
         // exactly one of lt, gt, eq: the field's four bytes in one store
         const bool lt = a < b;
         const bool gt = a > b;
-        if constexpr (std::endian::native == std::endian::little) {
+        if constexpr (lib::little_endian) {
             uint32_t field = lt ? 0x1 : gt ? 0x100 : 0x10000;
-            std::memcpy(&c.cr[4 * bf], &field, 4);
+            lib::memcpy(&c.cr[4 * bf], &field, 4);
         } else {
             c.cr[4 * bf + 0] = lt, c.cr[4 * bf + 1] = gt, c.cr[4 * bf + 2] = !lt && !gt, c.cr[4 * bf + 3] = 0;
         }

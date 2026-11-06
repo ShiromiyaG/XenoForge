@@ -623,10 +623,11 @@ traces, without a recompiled game.
   game's settings and controls in config.toml (shared, or a game's own
   table the player reads for it), and each started in the player beside it
   that carries its code (`--identify`), else the generic one. The
-  recompile step is not built; its candidates are weighed there ("The
-  generated code without the source"). Its view is RmlUi over LauncherCore (2026-11-06; docs/runtime.md, "The
-  launcher's interface"): the library with each game's own icon, the
-  preparing screen (`prepare_job`), settings, controls and about.
+  recompile step is `game_build.h` (D2; docs/runtime.md, "The game
+  library"). Its view is RmlUi over LauncherCore (2026-11-06;
+  docs/runtime.md, "The launcher's interface"): the library with each
+  game's own icon, the preparing screen (`prepare_job`, which calls
+  `prepare_game`), settings, controls and about.
   It becomes the emulator's front door (D2).
 
 **Track D: the AoT emulator** (goal of 2026-11-05)
@@ -636,7 +637,15 @@ traces, without a recompiled game.
   and an interface version. It reaches the runtime only through a narrow
   table: the guest context, memory, dispatch, the kernel's entry points.
   The generic `player` loads the game library that matches the disc; ports
-  link the same code statically.
+  link the same code statically. Done (2026-11-06; docs/runtime.md, "The
+  game library"): `game_library.h` and `ppc_runtime.h`, a C table each way
+  (the library's `xf_game_library` gives its modules; the runtime's table
+  holds dispatch, invalid, unwind, switch_stack, resumable and the C
+  library's few pieces), the version a digest of the headers and the
+  recompiler; the library freestanding, importing nothing; an Unwind thrown
+  and caught by the runtime alone (the emitter's try blocks became
+  `resumable`), passing through the library's frames at the static code's
+  cost.
 - **D2. Recompiling on the player's machine.**
   - The launcher bundles the compiler (clang and lld, Apache 2.0 with the
     LLVM exception; about 150-200 MB).
@@ -645,6 +654,11 @@ traces, without a recompiled game.
     instructions on 12 threads), with progress shown.
   - It keeps the result in a cache, keyed by the executable's digest, any
     title update, and XenoForge's interface version.
+  - Done (2026-11-06) but for the launcher's view: `game_build.h`'s
+    `prepare_game` (discovery and emission in process, clang 4 at once,
+    lld, progress per file, cancel, the cache) and `xfbuild`; the toolchain
+    shipped is `clang.exe` and `lld.exe` alone (docs/runtime.md, "The game
+    library"). Title updates are not applied yet (D3).
 - **D3. What discovery missed.** It runs in the interpreter and is logged
   by address. The next build takes those functions in, as rexglue's
   iterated discovery does by hand. Title updates (`.xexp`) are applied
@@ -687,7 +701,10 @@ traces, without a recompiled game.
   sound confirmed.
 - **M2. The emulator runs a disc it was never built for.** D1 and D2: the
   launcher recompiles El Chavo Kart from the ISO into the cache, and the
-  generic player runs it.
+  generic player runs it. The step is in (2026-11-06): `xfbuild` makes El
+  Chavo Kart's library from the ISO in 575 s and Ben 10's in 279 s, and
+  the generic boot and player run them as fast as the statically linked
+  games; left, the launcher's view calling it.
 - **M3. A port on the SDK** (E1-E3, E6): El Chavo Kart's port built on
   XenoForge instead of the rexglue fork.
 - **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work moved

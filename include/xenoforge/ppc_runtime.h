@@ -1,0 +1,256 @@
+// What the generated code needs from outside itself (docs/runtime.md, "The
+// game library"): the runtime's calls (dispatch, invalid, unwind,
+// switch_stack, resumable) and the few pieces of the C library the
+// instructions' semantics use. One description, reached two ways:
+//
+// - linked statically (boot_<game>, player_<game>, a port, the tests):
+//   direct calls to the runtime's functions and to the C library;
+// - in a game library (XF_GAME_LIBRARY: a DLL or .so the recompile step
+//   builds on the player's machine, game_build.h): freestanding, with no
+//   standard header and no C library, the same calls going through the table
+//   the runtime passes in when it loads the library (Runtime below,
+//   game_library.h). So the toolchain that builds it is clang and lld alone.
+//
+// The rest of the standard library the instructions use is compiler builtins
+// either way (lib:: below), so both compile to the same code. The guest's
+// registers, its memory's base and the system's callbacks (sc, traps, mftb,
+// MMIO) come in the Context each call is given (ppc_context.h).
+
+#pragma once
+
+#if defined(__clang__) || defined(__GNUC__)
+#define XF_INLINE inline __attribute__((always_inline))
+#else
+#define XF_INLINE __forceinline
+#endif
+
+#ifdef XF_GAME_LIBRARY
+// the fixed-width types from the compiler's own definitions, no header
+typedef __INT8_TYPE__ int8_t;
+typedef __INT16_TYPE__ int16_t;
+typedef __INT32_TYPE__ int32_t;
+typedef __INT64_TYPE__ int64_t;
+typedef __UINT8_TYPE__ uint8_t;
+typedef __UINT16_TYPE__ uint16_t;
+typedef __UINT32_TYPE__ uint32_t;
+typedef __UINT64_TYPE__ uint64_t;
+typedef __SIZE_TYPE__ size_t;
+typedef __UINTPTR_TYPE__ uintptr_t;
+#define INT32_MAX __INT32_MAX__
+#define INT32_MIN (-__INT32_MAX__ - 1)
+#define INT64_MAX __INT64_MAX__
+#define INT64_MIN (-__INT64_MAX__ - 1)
+#define UINT32_MAX __UINT32_MAX__
+#define UINT64_MAX __UINT64_MAX__
+#else
+#include <cfenv>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#endif
+
+namespace xf::ppc {
+
+struct Context;
+
+// The body of a function with resume sites (docs/recompiler.md, "Stack
+// switches"), entered at `at` (0: its entry), with its entry's LR and r1.
+using ResumableBody = void (*)(Context &c, uint32_t at, uint32_t lr, uint32_t sp);
+
+// The runtime's table, as a game library gets it when it is loaded
+// (game_library.h): the calls below, and the C library's pieces lib:: needs.
+// The fenv calls take lib::ROUND_* and lib::EXCEPT_* as a game library numbers
+// them (its own, below), not the host's.
+struct Runtime {
+    uint32_t version; // the interface version (game_library.h)
+    uint32_t size;    // sizeof(Runtime)
+    void (*dispatch)(Context &c, uint32_t target);
+    void (*invalid)(Context &c, uint32_t pc);
+    void (*unwind)(Context &c); // never returns
+    void (*switch_stack)(Context &c, uint32_t thunk, uint32_t resume);
+    void (*resumable)(Context &c, ResumableBody body, uint32_t lr, uint32_t sp, const uint32_t *sites, size_t count);
+    void *(*memcpy)(void *to, const void *from, size_t n);
+    void *(*memmove)(void *to, const void *from, size_t n);
+    void *(*memset)(void *to, int value, size_t n);
+    long long (*llrint)(double v);
+    float (*exp2f)(float v);
+    float (*log2f)(float v);
+    double (*fmod)(double a, double b);
+    int (*fesetround)(int mode);
+    int (*feclearexcept)(int flags);
+    int (*fetestexcept)(int flags);
+};
+
+#ifdef XF_GAME_LIBRARY
+// the library's copy of the table, filled by its entry (game_library.h)
+extern Runtime runtime;
+#endif
+
+// ---- the runtime's calls ----
+
+#ifdef XF_GAME_LIBRARY
+XF_INLINE void dispatch(Context &c, uint32_t target) { runtime.dispatch(c, target); }
+XF_INLINE void invalid(Context &c, uint32_t pc) { runtime.invalid(c, pc); }
+[[noreturn]] XF_INLINE void unwind(Context &c) {
+    runtime.unwind(c);
+    __builtin_unreachable();
+}
+XF_INLINE void switch_stack(Context &c, uint32_t thunk, uint32_t resume) { runtime.switch_stack(c, thunk, resume); }
+XF_INLINE void resumable(Context &c, ResumableBody body, uint32_t lr, uint32_t sp, const uint32_t *sites,
+                         size_t count) {
+    runtime.resumable(c, body, lr, sp, sites, count);
+}
+#else
+// An indirect call or jump, or a call to code with no generated function:
+// the function at `target`, else the interpreter from there until it
+// returns. LR is already set as the code set it. Defined by whoever links
+// the generated code (the kernel, a test), as the next three.
+void dispatch(Context &c, uint32_t target);
+// An invalid instruction reached.
+void invalid(Context &c, uint32_t pc);
+// Throws an Unwind (ppc_module.h) to where LR points (a function that
+// switches the stack returning elsewhere than to its caller).
+[[noreturn]] void unwind(Context &c);
+// A branch to KeSetCurrentStackPointers' thunk (a fiber switch), with where
+// this frame's code goes on when its stack is switched back to: the return
+// address after a bl, the function's own return address for a tail branch.
+// The kernel runs each guest stack on a host stack of its own.
+void switch_stack(Context &c, uint32_t thunk, uint32_t resume);
+// A function with resume sites: runs its body from its entry, and again from
+// a resume site (sites: sorted) when an Unwind to one of them comes back with
+// r1 inside its frame (below sp); an Unwind for a frame further up goes on.
+// The generated code catches nothing itself: Unwinds are thrown and caught
+// by the runtime alone, so a game library carries no C++ runtime. Defined in
+// the core (ppc_runtime.cpp).
+void resumable(Context &c, ResumableBody body, uint32_t lr, uint32_t sp, const uint32_t *sites, size_t count);
+#endif
+
+// ---- the standard library's pieces, freestanding ----
+
+namespace lib {
+
+template <class To, class From> XF_INLINE constexpr To bit_cast(const From &from) {
+    return __builtin_bit_cast(To, from);
+}
+template <class T> XF_INLINE constexpr T rotl(T x, int s) {
+    if constexpr (sizeof(T) == 8)
+        return __builtin_rotateleft64(x, uint64_t(s));
+    else if constexpr (sizeof(T) == 4)
+        return __builtin_rotateleft32(x, uint32_t(s));
+    else if constexpr (sizeof(T) == 2)
+        return __builtin_rotateleft16(x, uint16_t(s));
+    else
+        return __builtin_rotateleft8(x, uint8_t(s));
+}
+template <class T> XF_INLINE constexpr int countl_zero(T x) { return __builtin_clzg(x, int(sizeof(T) * 8)); }
+template <class T> XF_INLINE constexpr int countr_zero(T x) { return __builtin_ctzg(x, int(sizeof(T) * 8)); }
+template <class T> XF_INLINE constexpr int popcount(T x) { return __builtin_popcountg(x); }
+
+XF_INLINE void *memcpy(void *to, const void *from, size_t n) { return __builtin_memcpy(to, from, n); }
+XF_INLINE void *memset(void *to, int value, size_t n) { return __builtin_memset(to, value, n); }
+XF_INLINE void atomic_thread_fence_seq_cst() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+constexpr bool little_endian = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__;
+
+// integer types' limits (the instructions use no other)
+template <class T> struct numeric_limits {
+    static constexpr bool is_signed = T(-1) < T(0);
+    static constexpr T max() { return is_signed ? T(~(T(1) << (sizeof(T) * 8 - 1))) : T(~T(0)); }
+    static constexpr T min() { return is_signed ? T(T(1) << (sizeof(T) * 8 - 1)) : T(0); }
+};
+template <bool B, class T, class F> struct conditional {
+    using type = T;
+};
+template <class T, class F> struct conditional<false, T, F> {
+    using type = F;
+};
+template <bool B, class T, class F> using conditional_t = typename conditional<B, T, F>::type;
+template <class T> struct make_unsigned;
+template <> struct make_unsigned<signed char> {
+    using type = unsigned char;
+};
+template <> struct make_unsigned<unsigned char> {
+    using type = unsigned char;
+};
+template <> struct make_unsigned<char> {
+    using type = unsigned char;
+};
+template <> struct make_unsigned<short> {
+    using type = unsigned short;
+};
+template <> struct make_unsigned<unsigned short> {
+    using type = unsigned short;
+};
+template <> struct make_unsigned<int> {
+    using type = unsigned int;
+};
+template <> struct make_unsigned<unsigned int> {
+    using type = unsigned int;
+};
+template <> struct make_unsigned<long> {
+    using type = unsigned long;
+};
+template <> struct make_unsigned<unsigned long> {
+    using type = unsigned long;
+};
+template <> struct make_unsigned<long long> {
+    using type = unsigned long long;
+};
+template <> struct make_unsigned<unsigned long long> {
+    using type = unsigned long long;
+};
+template <class T> using make_unsigned_t = typename make_unsigned<T>::type;
+
+// what compiles to an instruction (-mfma, SSE4.1 for trunc)
+XF_INLINE double fabs(double v) { return __builtin_fabs(v); }
+XF_INLINE float fabs(float v) { return __builtin_fabsf(v); }
+template <class T> XF_INLINE bool isinf(T v) { return __builtin_isinf(v); }
+template <class T> XF_INLINE bool signbit(T v) { return __builtin_signbit(v); }
+XF_INLINE double copysign(double a, double b) { return __builtin_copysign(a, b); }
+XF_INLINE double sqrt(double v) { return __builtin_sqrt(v); }
+XF_INLINE float sqrt(float v) { return __builtin_sqrtf(v); }
+XF_INLINE double fma(double a, double b, double c) { return __builtin_fma(a, b, c); }
+XF_INLINE float fma(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
+XF_INLINE double trunc(double v) { return __builtin_trunc(v); }
+
+// what the C library does: the host's own, through the runtime's table in a
+// game library
+#ifdef XF_GAME_LIBRARY
+enum : int { ROUND_NEAREST, ROUND_ZERO, ROUND_UP, ROUND_DOWN };
+enum : int {
+    EXCEPT_INEXACT = 1,
+    EXCEPT_UNDERFLOW = 2,
+    EXCEPT_OVERFLOW = 4,
+    EXCEPT_DIVBYZERO = 8,
+    EXCEPT_INVALID = 16,
+    EXCEPT_ALL = 31,
+};
+XF_INLINE long long llrint(double v) { return runtime.llrint(v); }
+XF_INLINE float exp2(float v) { return runtime.exp2f(v); }
+XF_INLINE float log2(float v) { return runtime.log2f(v); }
+XF_INLINE double fmod(double a, double b) { return runtime.fmod(a, b); }
+XF_INLINE int fesetround(int mode) { return runtime.fesetround(mode); }
+XF_INLINE int feclearexcept(int flags) { return runtime.feclearexcept(flags); }
+XF_INLINE int fetestexcept(int flags) { return runtime.fetestexcept(flags); }
+#else
+enum : int { ROUND_NEAREST = FE_TONEAREST, ROUND_ZERO = FE_TOWARDZERO, ROUND_UP = FE_UPWARD, ROUND_DOWN = FE_DOWNWARD };
+enum : int {
+    EXCEPT_INEXACT = FE_INEXACT,
+    EXCEPT_UNDERFLOW = FE_UNDERFLOW,
+    EXCEPT_OVERFLOW = FE_OVERFLOW,
+    EXCEPT_DIVBYZERO = FE_DIVBYZERO,
+    EXCEPT_INVALID = FE_INVALID,
+    EXCEPT_ALL = FE_ALL_EXCEPT,
+};
+XF_INLINE long long llrint(double v) { return std::llrint(v); }
+XF_INLINE float exp2(float v) { return std::exp2(v); }
+XF_INLINE float log2(float v) { return std::log2(v); }
+XF_INLINE double fmod(double a, double b) { return std::fmod(a, b); }
+XF_INLINE int fesetround(int mode) { return std::fesetround(mode); }
+XF_INLINE int feclearexcept(int flags) { return std::feclearexcept(flags); }
+XF_INLINE int fetestexcept(int flags) { return std::fetestexcept(flags); }
+#endif
+
+} // namespace lib
+
+} // namespace xf::ppc

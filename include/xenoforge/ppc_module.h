@@ -9,9 +9,6 @@
 
 #include "xenoforge/ppc_context.h"
 
-#include <cstddef>
-#include <cstdint>
-
 namespace xf::ppc {
 
 // A return to another frame than the caller's (a longjmp, a catch's

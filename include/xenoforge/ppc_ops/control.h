@@ -77,7 +77,7 @@ XF_INLINE uint64_t load_cr_field(const Context &c, uint32_t n) {
 
 // mfocrf/mtocrf name one field in FXM; Xenia takes any other count as
 // invalid. Returns the field, or -1.
-XF_INLINE int single_cr_field(uint32_t fxm) { return std::popcount(fxm) == 1 ? 7 - std::countr_zero(fxm) : -1; }
+XF_INLINE int single_cr_field(uint32_t fxm) { return lib::popcount(fxm) == 1 ? 7 - lib::countr_zero(fxm) : -1; }
 
 // mfcr / mfocrf
 inline uint64_t read_cr(const Context &c, Instr i) {
@@ -92,7 +92,7 @@ inline void write_cr(Context &c, Instr i, uint64_t v) {
     if (i.XFX.spr & (1 << 9)) {
         int n = single_cr_field(fxm);
         if (n >= 0) store_cr_field(c, uint32_t(n), v);
-        else std::memset(c.cr, 0, sizeof(c.cr)); // invalid: Xenia stores zero to CR
+        else lib::memset(c.cr, 0, sizeof(c.cr)); // invalid: Xenia stores zero to CR
         return;
     }
     for (uint32_t b = 0; b < 8; b++)
@@ -124,8 +124,8 @@ XF_OP(crxor) { c.cr[i.XL.BO] = (c.cr[i.XL.BI] ^ c.cr[i.XL.BB]) & 1; }
 XF_OP(mcrf) {
     // CR field BO >> 2 <- CR field BI >> 2
     uint32_t field;
-    std::memcpy(&field, &c.cr[4 * (i.XL.BI >> 2)], 4);
-    std::memcpy(&c.cr[4 * (i.XL.BO >> 2)], &field, 4);
+    lib::memcpy(&field, &c.cr[4 * (i.XL.BI >> 2)], 4);
+    lib::memcpy(&c.cr[4 * (i.XL.BO >> 2)], &field, 4);
 }
 
 XF_OP(mcrxr) {

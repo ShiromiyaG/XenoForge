@@ -12,7 +12,10 @@
 //
 // Built as boot_<game> (CMake's XF_GAMES), it links that game's generated
 // code (xfrecomp emit: a table per executable and DLL) and dispatch runs a
-// module's once the module is loaded; --interpret leaves it out.
+// module's once the module is loaded; --interpret leaves it out. Plain boot
+// loads the game library the recompile step cached for the executable
+// (xfbuild, game_build.h): from --cache <dir> (the launcher's cache by
+// default), or the one --game-library names; with none it interprets.
 // --render draws what the GPU is sent (the renderer as the command
 // processor's Sink, on a Vulkan device without a window); off by default,
 // so the GPU stays headless. --shots <dir> writes the front buffer of chosen
@@ -32,6 +35,7 @@
 // clock, the renderer's time), as the player's --rates does.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
+//        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates]
 
@@ -52,7 +56,8 @@ using namespace xf;
 
 int main(int argc, char **argv) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
-                        "[--content <dir>] [--interpret] [--render [--shots <dir> [--shot-swaps <list>] "
+                        "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
+                        "[--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
                         "[--press <buttons@seconds[:hold]>]... [--rates]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
@@ -79,6 +84,10 @@ int main(int argc, char **argv) {
             o.storage = argv[++k];
         else if (a == "--interpret")
             o.interpret = true;
+        else if (a == "--cache" && k + 1 < argc)
+            o.cache = argv[++k];
+        else if (a == "--game-library" && k + 1 < argc)
+            o.game_library = argv[++k];
         else if (a == "--render")
             rendering = true;
         else if (a == "--shots" && k + 1 < argc)

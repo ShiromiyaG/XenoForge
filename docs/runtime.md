@@ -880,79 +880,169 @@ RmlUi makes of it (box shadows). Left for a person: the folder dialog, typing
 in the games folder's field, the mouse (hover, drag on a slider), a real pad
 (only the scripted presses were run), how the transitions feel.
 
-Left out of this first launcher: the recompile step (below), port options,
-title updates and content packages.
+Left out of this first launcher: port options, title updates and content
+packages, cover art. The recompile step itself is below ("The game
+library"); the preparing screen calls it.
 
-### The generated code without the source (design, not decided)
+### The game library (plan D1 and D2, 2026-11-06)
 
-Today a game's generated code reaches a player only through a build of
-XenoForge: `xfrecomp emit` writes C++ (El Chavo Kart: 291 files, 323 MB),
-CMake compiles it into `game_<name>.lib` (224 MB) and links it into
-`player_<game>`. Principle 5 rules out handing out that code or anything
-built from it: it is made on the user's machine from their disc. So
-whatever the shape, the user's machine runs `xfrecomp` and a C++ compiler
-on it, once per game and XenoForge version (minutes: the build's own time
-for El Chavo Kart is several minutes on 4 cores), and keeps the result in a
-cache beside config.toml. What the generated code needs is small:
-`ppc_generated.h` and the ops it includes (headers, inlined), the C++
-standard headers they use (`<atomic>`, `<cmath>`, `<cfenv>`, `<cstring>`,
-`<bit>`), and four functions of the runtime's (`dispatch`, `invalid`,
-`unwind`, which throws, and `switch_stack`) plus the module table
-(`xf_modules`).
+The generated code reaches a player two ways, from one emission and one set
+of headers:
 
-1. **A game library loaded by the generic player.** The launcher emits and
-   compiles the code into `games/<title ID>-<digest>.dll`; the player
-   (the one shipped) loads the library whose digest matches each module as
-   it loads (the executable, and DLLs through `XexLoadImage`), and runs
-   interpreted where none does. Needs: a stable boundary between player
-   and library: a C table each way (the library's `xf_modules`; the
-   player's four functions and anything the ops call out of line), with a
-   version number the player checks, since a library is only good for the
-   XenoForge version whose headers built it (a new player rebuilds the
-   cache). The `unwind` throw crosses the boundary: on Windows x64 an
-   exception unwinds through any frame with unwind tables (clang always
-   emits them), but which C++ runtime the library may use has to match the
-   player's, or the library must use none (below). Fits the plan's split
-   of a game library and a port library (hooks bind by guest address,
-   so a port can rebuild and reload alone), and the owner's goal as
-   revised on 2026-11-05: one generic player, the game's library cached.
-   One player to ship and update; each game is just its code.
-2. **A per-game executable built by the launcher.** The launcher compiles
-   the code and links it with the player's own static libraries (shipped
-   for this: XenoForge's core, kernel, renderer and frontend, SDL3, Dear
-   ImGui, toml++), giving today's `player_<game>`. No boundary to keep
-   stable inside a build, but every player update relinks every game, the
-   libraries ship with the launcher (tens of MB), and the link needs the
-   whole C and C++ runtime the libraries were built against: with the
-   MSVC ABI that is the Visual Studio build tools and the Windows SDK,
-   which cannot be redistributed, so the user installs them (several GB),
-   or everything is built with a redistributable toolchain (llvm-mingw)
-   instead.
-3. **Something else.**
-   - *A freestanding library* (a variant of 1 that decides the toolchain):
-     the generated code compiled against XenoForge's headers alone, with
-     the few standard pieces it uses provided as compiler builtins
-     (`__builtin_memcpy`, `__builtin_sqrt`, the atomics) and the rounding
-     mode through the player's table, linked `-nostdlib` with no imports
-     but that table. Then the bundled toolchain is `clang` and `lld` alone
-     (redistributable, Apache 2.0 with LLVM's exception; about 150 MB),
-     no SDK, no CRT, and any player build loads it. The ops' headers have
-     to stay free of the standard library for this; to be measured (the
-     exception crossing frames with no runtime of their own included).
-   - *Ask the user for a toolchain* (rexglue's way: Visual Studio or the
-     build tools, CMake): no bundle, but a heavy first step for a player.
-   - *An embedded compiler* (LLVM's ORC JIT or clang as a library inside
-     the launcher): no external tools, but LLVM linked in (a larger
-     launcher than a bundled clang) and its own build to maintain.
-   - *An object-code back end in `xfrecomp`* (emitting x86-64 directly):
-     no compiler at all and fast installs, but it gives up clang's
-     optimizer and is a project of its own.
+- **linked statically**, as before: CMake compiles `xfrecomp emit`'s files
+  into `game_<name>.lib` and links it into `boot_<game>` and
+  `player_<game>`. Ports (the SDK, track E) build this way.
+- **as a game library**: the recompile step (`game_build.h`; `xfbuild` on
+  the command line, the launcher on a worker thread) emits the disc's
+  modules in process, compiles them with clang and links them with lld into
+  a DLL (a `.so` on Linux) in the cache, and the generic `boot` and `player`
+  load the one built for the disc's executable.
 
-What each needs from the launcher is the same: a step that runs
-`xfrecomp emit` (in process: it is XenoForge's own code), runs the
-compiler with progress and a cancel button, and caches the result by title
-ID and digest; and from the player, today's `--identify` turned into
-"which digests have a library in the cache".
+**The interface** (`game_library.h`, `ppc_runtime.h`): a C table each way.
+The library exports one function, `xf_game_library(const Runtime *)`, which
+checks the runtime's interface version and the table's size, copies the
+table, and gives back its modules' tables (`xf_modules`, `ppc_module.h`) and
+the version it was built for; another version gets nullptr. The runtime's
+table holds the five calls the generated code makes (`dispatch`, `invalid`,
+`unwind`, `switch_stack`, and `resumable`, which runs the body of a function
+with resume sites: docs/recompiler.md, "Stack switches") and the C library's
+pieces the instructions' semantics use: `memcpy`, `memmove` and `memset`
+(the compiler calls them on its own), `llrint` (fctiw and fctid's fast
+path), `exp2f` and `log2f` (vexptefp, vlogefp), `fmod`, and `fesetround`,
+`feclearexcept` and `fetestexcept` (the slow path of the FPU's arithmetic),
+with the rounding modes and flags in XenoForge's own numbering, translated
+by the runtime. Everything else the generated code needs comes in the
+`Context` each call is given: the registers, the guest memory's base, and
+the system's callbacks (`sc`, traps, `mftb`, MMIO). The rest of the
+standard library the ops used (`bit_cast`, `rotl`, `countl_zero`, `fma`,
+`sqrt`, the atomics' fence, `numeric_limits`...) is compiler builtins in
+`ppc_runtime.h`'s `lib::`, for both ways, so the statically linked code and
+the library compile to the same instructions; the five calls are direct
+calls in one and calls through the table in the other (an indirect call,
+as a call to a DLL's import is).
+
+**The version** (`XF_GAME_INTERFACE_VERSION`, `cmake/game_interface.cmake`):
+the first 32 bits of a SHA-256 of what makes a library: the generated
+code's headers, the recompiler's sources (discovery and emission) and
+`game_build.cpp` (the compiler's flags). Any change to them makes every
+cached library stale, and the launcher builds it again; a library from
+another XenoForge never runs against these headers. The same script embeds
+those headers in the core, and the recompile step writes them beside the
+code it compiles, so the code is always built against the headers of the
+XenoForge that loads it and nothing but the toolchain ships for the build.
+
+**The Unwind across the boundary.** An `Unwind` (a longjmp, a catch's
+continuation, a stack switched back elsewhere) is a C++ exception. It is
+thrown only by the runtime (`unwind()`, the kernel's dispatch) and caught
+only by the runtime (the kernel's dispatch, `resumable()`): the emitter
+used to write a try block into each function with resume sites (9 in El
+Chavo Kart, 274 in the eight games), and now writes its body as a lambda
+the runtime's `resumable` runs and runs again at a resume site. So the
+exception only passes through the library's frames, which carry their
+unwind tables (`.pdata` and `.xdata` on Windows, which RtlUnwindEx finds in
+any loaded module; `.eh_frame` with `--eh-frame-hdr` on Linux) and no
+handlers: no personality routine, no type information, no C++ runtime in
+the library. Measured (game_library_test, the same code linked and in a
+library, 5,000 each): through 2 frames 3,695 ns linked and 3,666 ns in the
+library, through 17 frames 6,244 and 6,265 ns, with other builds running;
+on a quieter machine 1,885 and 1,877 ns, 3,229 and 2,959 ns. The same.
+
+**The toolchain shipped** (decided): `clang.exe` and `lld.exe` from the
+LLVM release (23.1.2 here), 184.9 MB (109.5 and 75.4 MB; 71.6 MB as
+gzip, 51.2 MB as xz), against 3.0 GB for the installed LLVM. `lld.exe` is
+run as `lld -flavor link` when there is no `lld-link.exe`, so one copy of
+it does. Nothing else: the generated code's headers
+are freestanding when built as a library (`XF_GAME_LIBRARY`: the integer
+types from the compiler's predefined macros, no `#include` of a standard
+header), the files are compiled with `-nostdinc -nostdinc++` (so clang
+looks for no Visual Studio, Windows SDK or resource headers) and linked
+with `/nodefaultlib /noentry` (so no C runtime and no import library). The
+library's import directory is empty (checked by game_library_test, and on
+El Chavo Kart's and Ben 10's libraries). Both binaries import only
+Windows' own DLLs (KERNEL32, ADVAPI32, ntdll, ole32, OLEAUT32, SHELL32,
+VERSION): the LLVM release links its C runtime statically. Apache 2.0 with
+LLVM's exception, redistributable. The search (`find_toolchain`):
+`--toolchain`, `XF_TOOLCHAIN`, `toolchain/bin` beside the executable (the
+bundle), an installed LLVM (`%ProgramFiles%\LLVM\bin`), the PATH.
+
+**The build** (`prepare_game`): the disc's executables read (all XEX2 files
+but title updates and the system update's), `default.xex`'s image digest
+taken; discovery and emission in process (`recomp::emit_modules`, what
+`xfrecomp emit` writes) into `<cache>/work/<digest>-<version>/src`, the
+headers and the library's entry (`xf_library_entry.cpp`) beside them; each
+file compiled by its own clang process (`-std=c++20 -O2 -g0 -w -mfma
+-mavx2 -fno-math-errno -nostdinc -nostdinc++ -DXF_GAME_LIBRARY`, the
+statically linked games' flags; never `-ffast-math`; on Linux also
+`-fPIC -fvisibility=hidden -fno-stack-protector`), 4 at once by default
+(`BuildOptions::jobs`: more ran out of memory on 16 GB), the largest files
+first, at below-normal priority with only its log inherited; then
+`lld-link /dll /noentry /nodefaultlib /opt:ref /Brepro` through a response
+file (`ld.lld -shared --eh-frame-hdr --gc-sections` on Linux).
+The library goes to `<cache>/<digest>-<version>.dll`, replacing any other
+version's for that digest, and the work directory is removed (`keep_work`
+keeps it). Progress is reported per module (discovery), per file (emission
+and compiling) and for the link, always from the caller's thread; the
+cancel flag ends the compilers under way. A stopped build goes on from the
+objects it left (an object newer than its source is not compiled again).
+The CPU must have AVX2 and FMA (checked first, `cpu_supported`).
+`find_cached(cache, digest)` finds `<digest>-<this version>.dll`.
+
+```
+xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
+        [--cancel-after S] [--quiet]
+boot <iso> [--cache <dir>] [--game-library <dll>] ...
+player <iso> [--cache <dir>] [--game-library <dll>] ...
+```
+
+The generic `boot` and `player` look in the cache (the launcher's by
+default) for the executable's digest; with a library they print
+"generated code: N modules, M functions (the game library <path>)", with
+none they interpret as before. `boot_<game>` and `player_<game>` link their
+code as before; `--interpret` leaves either out.
+
+Measured (2026-11-06, a Ryzen 5 5600G, 6 cores and 12 threads, 16 GB; the
+discs and the cache on a hard disk; another agent's build running beside
+the two builds):
+
+| | reading | discovery | emission | compiling | linking | total | library |
+|---|---|---|---|---|---|---|---|
+| El Chavo Kart (291 files + 2) | 3.2 s | 4.4 s | 7.9 s | 543.6 s | 15.8 s | 575 s | 180 MB |
+| Ben 10 (106 files + 2) | 2.7 s | 1.4 s | 2.2 s | 266.2 s | 6.6 s | 279 s | 62 MB |
+
+Neither library imports anything (an empty import directory, one export,
+`.pdata` for the unwinds, no initializers). A build cancelled after 40 s
+stopped at 40.2 s with no compiler left running; run again, it compiled
+the 100 files left (249 s), and its library is the clean build's but for
+the link's time stamp (two bytes; `/Brepro`, added after these builds,
+leaves it out).
+
+The libraries run as fast as the statically linked games (boot with
+`--render`, back to back, swaps counted by the GPU; interpreted entries 0
+in every run):
+
+| | 30 s | 45 s |
+|---|---|---|
+| El Chavo Kart, linked | 878 | 1,337 (59.0 s of CPU) |
+| El Chavo Kart, library | 898 | 1,347 (59.8 s of CPU) |
+| Ben 10, linked | 1,119; 1,123 | 1,652; 1,669 |
+| Ben 10, library | 1,132 | 1,803; 1,872 |
+
+El Chavo Kart's menus run at the game's 30 frames a second either way.
+Ben 10 over 15 s: 585 and 650 swaps linked, 627 and 640 in the library;
+with ten compilers running beside (a library build), 604 and 622 linked,
+599 and 607 in the library. The start varies between runs of either
+(a first swap at 4.7 s instead of 1.2 s: one library run at 30 s, 881
+swaps, and the static warm-up). Three runs of the library while the
+resumed build above was writing its sources to the same hard disk crawled
+(0 to 33 swaps in 15 s, the player's window stalled with them), and a
+static run between them did not; not seen again in eight runs under a
+build's load since. The cache belongs on the system drive, as its default
+(`%LOCALAPPDATA%`) has it.
+
+Left: the launcher's view calling `prepare_game` (the RmlUi view, under
+way) and choosing the generic player for a disc with a cached library;
+the Linux side (`.so`, `posix_spawn`, `ld.lld`) is written but not built
+or run; title updates (D3).
 
 ## Order
 

@@ -47,6 +47,11 @@ onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segund
   `xma_oracle` sai de `tools/xenia_oracle/build.bat xma`). `XF_AUDIO_WAV=<prefixo>` grava a mixagem para ouvir.
 - **Jogos com código gerado**: `-DXF_GAMES="chaves;ben10"` gera `boot_<jogo>` e `player_<jogo>` (janela SDL3,
   controle, som), com o código de `../external/gen-modules` (padrão do `XF_GEN_DIR`; `xfrecomp emit` grava lá).
+- **Biblioteca do jogo (D1/D2)**: `build/xfbuild <iso> [cache]` recompila o disco numa DLL em cache
+  (`<cache>/<digest>-<versão da interface>.dll`; padrão `%LOCALAPPDATA%\xenoforge\cache`; clang e lld, 4 jobs); o
+  `boot` e o `player` genéricos a carregam (`--cache <pasta>`, `--game-library <dll>`), os `boot_<jogo>` seguem
+  estáticos. Interface: `game_library.h` e `ppc_runtime.h` (código gerado freestanding, sem CRT; docs/runtime.md,
+  "The game library"). Mudar os headers do código gerado ou o recompilador muda a versão e invalida o cache.
 - **Recompilador (A2)**: desenho em `docs/recompiler.md`. Tabelas de `src/ppc/ppc-instructions.xml` (do Xenia,
   sem mudança) via `python tools/ppc_gen.py` (gera `include/xenoforge/ppc_opcodes.inc`, `src/ppc/decode.inc`,
   `src/ppc/disasm.inc`; commitados). Oráculo: `tools/xenia_oracle/build.bat` compila

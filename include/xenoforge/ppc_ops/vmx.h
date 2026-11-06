@@ -13,8 +13,6 @@
 
 #include "xenoforge/ppc_ops.h"
 
-#include <type_traits>
-
 namespace xf::ppc::ops {
 
 // Lane helpers. Element-wise ops work on the host lanes as they are: element n
@@ -24,10 +22,10 @@ namespace xf::ppc::ops {
 namespace vmxi {
 
 // the type a lane's arithmetic is done in before it saturates
-template <typename T> using Wide = std::conditional_t<(sizeof(T) < 4), int32_t, int64_t>;
+template <typename T> using Wide = lib::conditional_t<(sizeof(T) < 4), int32_t, int64_t>;
 
 template <typename T, typename W> XF_INLINE T clamp(W w, uint32_t &sat) {
-    constexpr W lo = W(std::numeric_limits<T>::min()), hi = W(std::numeric_limits<T>::max());
+    constexpr W lo = W(lib::numeric_limits<T>::min()), hi = W(lib::numeric_limits<T>::max());
     W v = w < lo ? lo : w > hi ? hi : w;
     sat |= v != w;
     return T(v);
@@ -37,11 +35,11 @@ template <typename T, typename W> XF_INLINE T clamp(W w, uint32_t &sat) {
 template <typename T, typename F> XF_INLINE Vec128 map(const Vec128 &a, const Vec128 &b, F f) {
     constexpr int N = 16 / sizeof(T);
     T x[N], y[N], r[N];
-    std::memcpy(x, &a, 16);
-    std::memcpy(y, &b, 16);
+    lib::memcpy(x, &a, 16);
+    lib::memcpy(y, &b, 16);
     for (int k = 0; k < N; k++) r[k] = T(f(x[k], y[k]));
     Vec128 v;
-    std::memcpy(&v, r, 16);
+    lib::memcpy(&v, r, 16);
     return v;
 }
 
@@ -50,12 +48,12 @@ template <typename T, typename F> XF_INLINE Vec128 map(const Vec128 &a, const Ve
 // separate loops: the compiler makes the first a saturating add (paddsb...)
 // and the others narrow lanes, where one loop would widen every lane.
 template <typename T, bool Sub> XF_INLINE Vec128 add_sat(Context &c, const Vec128 &a, const Vec128 &b) {
-    using U = std::make_unsigned_t<T>;
+    using U = lib::make_unsigned_t<T>;
     constexpr int N = 16 / sizeof(T);
-    constexpr Wide<T> lo = std::numeric_limits<T>::min(), hi = std::numeric_limits<T>::max();
+    constexpr Wide<T> lo = lib::numeric_limits<T>::min(), hi = lib::numeric_limits<T>::max();
     T x[N], y[N], r[N], w[N];
-    std::memcpy(x, &a, 16);
-    std::memcpy(y, &b, 16);
+    lib::memcpy(x, &a, 16);
+    lib::memcpy(y, &b, 16);
     for (int k = 0; k < N; k++) {
         Wide<T> s = Sub ? Wide<T>(x[k]) - y[k] : Wide<T>(x[k]) + y[k];
         r[k] = T(s < lo ? lo : s > hi ? hi : s);
@@ -65,7 +63,7 @@ template <typename T, bool Sub> XF_INLINE Vec128 add_sat(Context &c, const Vec12
     for (int k = 0; k < N; k++) any |= U(r[k] ^ w[k]);
     c.vscr_sat |= any != 0;
     Vec128 v;
-    std::memcpy(&v, r, 16);
+    lib::memcpy(&v, r, 16);
     return v;
 }
 
@@ -160,8 +158,8 @@ inline Vec128 shr_bits(const Vec128 &a, const Vec128 &b) {
 // a || b is at tab[k ^ 3] (bit 4 picks b, and ^ 3 keeps it).
 inline Vec128 perm(const Vec128 &a, const Vec128 &b, const Vec128 &control) {
     uint8_t tab[32];
-    std::memcpy(tab, &a, 16);
-    std::memcpy(tab + 16, &b, 16);
+    lib::memcpy(tab, &a, 16);
+    lib::memcpy(tab + 16, &b, 16);
     Vec128 r;
     for (uint32_t j = 0; j < 16; j++) r.u8[j] = tab[(control.u8[j] & 0x1F) ^ 3];
     return r;
@@ -169,8 +167,8 @@ inline Vec128 perm(const Vec128 &a, const Vec128 &b, const Vec128 &control) {
 // (a || b) << (sh * 8), the high 16 bytes
 inline Vec128 sldoi(const Vec128 &a, const Vec128 &b, uint32_t sh) {
     uint8_t tab[32];
-    std::memcpy(tab, &a, 16);
-    std::memcpy(tab + 16, &b, 16);
+    lib::memcpy(tab, &a, 16);
+    lib::memcpy(tab + 16, &b, 16);
     Vec128 r;
     for (uint32_t n = 0; n < 16; n++) r.u8[n ^ 3] = tab[(n + sh) ^ 3];
     return r;
@@ -210,11 +208,11 @@ XF_INLINE int32_t simm5(uint32_t v) { return int32_t(v << 27) >> 27; }
 // done in In), then a fixed shuffle.
 template <typename In, typename Out, bool Sat, int N, typename F>
 XF_INLINE void narrow(Context &c, const Vec128 &a, const Vec128 &b, F store) {
-    constexpr In lo = In(std::numeric_limits<Out>::min()), hi = In(std::numeric_limits<Out>::max());
+    constexpr In lo = In(lib::numeric_limits<Out>::min()), hi = In(lib::numeric_limits<Out>::max());
     In x[N];
     Out y[N];
-    std::memcpy(x, &a, 16);
-    std::memcpy(x + N / 2, &b, 16);
+    lib::memcpy(x, &a, 16);
+    lib::memcpy(x + N / 2, &b, 16);
     for (int k = 0; k < N; k++) y[k] = Out(Sat ? (x[k] < lo ? lo : x[k] > hi ? hi : x[k]) : x[k]);
     if constexpr (Sat) {
         In any = 0;
@@ -241,8 +239,8 @@ template <typename In, typename Out, bool Sat> XF_INLINE Vec128 pack32(Context &
 XF_INLINE Vec128 pack_pixel(const Vec128 &a, const Vec128 &b) {
     uint32_t x[8];
     uint16_t y[8];
-    std::memcpy(x, &a, 16);
-    std::memcpy(x + 4, &b, 16);
+    lib::memcpy(x, &a, 16);
+    lib::memcpy(x + 4, &b, 16);
     for (int k = 0; k < 8; k++) y[k] = uint16_t(((x[k] >> 9) & 0xFC00) | ((x[k] >> 6) & 0x3E0) | ((x[k] >> 3) & 0x1F));
     Vec128 r;
     for (uint32_t n = 0; n < 8; n++) r.u16[n ^ 1] = y[n];
@@ -292,8 +290,8 @@ template <typename TA, typename TB> XF_INLINE void products(const Vec128 &a, con
     constexpr int N = 4 / sizeof(TA);
     TA x[16 / sizeof(TA)];
     TB y[16 / sizeof(TB)];
-    std::memcpy(x, &a, 16);
-    std::memcpy(y, &b, 16);
+    lib::memcpy(x, &a, 16);
+    lib::memcpy(y, &b, 16);
     for (int w = 0; w < 4; w++) {
         int64_t s = 0;
         for (int k = 0; k < N; k++) s += int64_t(x[w * N + k]) * int64_t(y[w * N + k]);
@@ -318,7 +316,7 @@ inline Vec128 msum(Context &ctx, const Vec128 &a, const Vec128 &b, const Vec128 
 template <typename TA, typename T> inline Vec128 sum4(Context &c, const Vec128 &a, const Vec128 &b) {
     constexpr int N = 4 / sizeof(TA);
     TA x[16 / sizeof(TA)];
-    std::memcpy(x, &a, 16);
+    lib::memcpy(x, &a, 16);
     Vec128 r;
     uint32_t sat = 0;
     for (int w = 0; w < 4; w++) {

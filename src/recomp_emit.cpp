@@ -9,8 +9,10 @@
 // switches the stack checks each return against its entry's LR and r1
 // (XF_CHECKED_RETURN), and a branch to KeSetCurrentStackPointers' thunk is
 // switch_stack(), which says where this frame goes on when its stack is
-// switched back to. A function with resume sites runs its body in a try
-// block: an Unwind to one of them with r1 inside its frame goes on there.
+// switched back to. A function with resume sites has the runtime run its
+// body (resumable()): an Unwind to one of them with r1 inside its frame goes
+// on there. The generated code never catches: the runtime throws and catches
+// every Unwind, so the code needs no C++ runtime (a game library, D1).
 
 #include "xenoforge/recomp.h"
 
@@ -49,7 +51,7 @@ public:
         // the resume sites the walk reached (an invalid word stops it)
         std::erase_if(resumes_, [&](uint32_t a) { return !code_.count(a); });
         for (uint32_t a : resumes_) referenced_.insert(a);
-        if (!resumes_.empty()) base_ = 3;
+        if (!resumes_.empty()) base_ = 2;
         // first pass: which labels are jumped to
         for (uint32_t pc : code_) instruction(pc, true);
         std::string body;
@@ -61,23 +63,26 @@ public:
         std::string head = "XF_FN(" + name(f_.address) + ") {";
         if (!f_.name.empty()) head += " // " + f_.name;
         head += "\n";
-        // where its returns are checked against (XF_CHECKED_RETURN), and
-        // whether an Unwind's r1 is inside its frame
-        if (checked_) head += "    const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);\n";
-        else if (!resumes_.empty()) head += "    const uint32_t xf_sp = uint32_t(c.r[1]);\n";
-        if (resumes_.empty()) return head + body + "}\n";
-        std::string cases, labels;
-        for (uint32_t a : resumes_) {
-            cases += "            case 0x" + hex8(a) + ": goto L_" + hex8(a) + ";\n";
-            labels += "            case 0x" + hex8(a) + ":\n";
+        if (resumes_.empty()) {
+            // where its returns are checked against (XF_CHECKED_RETURN)
+            if (checked_) head += "    const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);\n";
+            return head + body + "}\n";
         }
-        return head + "    uint32_t xf_at = 0; // where an Unwind came back to\n" + "    for (;;) {\n" +
-               "        try {\n" + "            switch (xf_at) {\n" + cases + "            }\n" + body +
-               "            return;\n" + "        } catch (const ::xf::ppc::Unwind &xf_unwind) {\n" +
-               "            if (uint32_t(c.r[1]) >= xf_sp) throw; // a frame further up\n" +
-               "            switch (xf_unwind.target) {\n" + labels +
-               "                xf_at = xf_unwind.target;\n                continue;\n" + "            }\n" +
-               "            throw;\n" + "        }\n" + "    }\n" + "}\n";
+        // Its body a function the runtime runs (ppc_generated.h's
+        // XF_RESUMABLE_BODY), from the entry and again from the resume site an
+        // Unwind came back to with r1 inside its frame: the runtime catches,
+        // so the generated code carries no C++ exception handling of its own.
+        // The body gets the entry's LR and r1 (xf_lr, xf_sp) for its checked
+        // returns.
+        std::string sites, cases;
+        for (uint32_t a : resumes_) {
+            sites += (sites.empty() ? "0x" : ", 0x") + hex8(a) + "u";
+            cases += "        case 0x" + hex8(a) + ": goto L_" + hex8(a) + ";\n";
+        }
+        return head + "    static constexpr uint32_t xf_sites[] = {" + sites + "};\n" +
+               "    ::xf::ppc::resumable(c, XF_RESUMABLE_BODY {\n" + "        switch (xf_at) {\n" + cases +
+               "        }\n" + body + "    }, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, " +
+               std::to_string(resumes_.size()) + ");\n" + "}\n";
     }
 
     std::string name(uint32_t address) const { return prefix_ + hex8(address); }
@@ -155,7 +160,7 @@ private:
                    (checked_ ? "xf_lr" : "uint32_t(c.lr) & ~3u") + "); " + ret() + " }";
         if (callable(target)) {
             if (calls_) calls_->insert(target);
-            // no tail call where the return is checked or in a try block
+            // no tail call where the return is checked or in a resumable body
             if (checked_ || !resumes_.empty()) return "{ " + name(target) + "(c); " + ret() + " }";
             return "XF_TAIL(" + name(target) + ");";
         }

@@ -4,6 +4,8 @@
 
 #include "xenoforge/command_processor.h"
 #include "xenoforge/disc.h"
+#include "xenoforge/game_build.h"
+#include "xenoforge/game_library.h"
 
 #include <algorithm>
 #include <cctype>
@@ -112,6 +114,38 @@ void print_renderer_report(const render::Report &r) {
         std::printf("  approx  %8llu  %s\n", (unsigned long long)n, what.c_str());
 }
 
+#ifndef XF_GENERATED
+// The game library the recompile step cached for this executable (or the one
+// named), its modules given to the kernel as a linked game's are; with none,
+// or one that does not load, the game is interpreted.
+void load_game_library(const Options &options, Game &g) {
+    std::filesystem::path library = options.game_library;
+    char digest[24];
+    std::snprintf(digest, sizeof(digest), "%016llx", (unsigned long long)image_digest(g.xex.image));
+    if (library.empty()) {
+        const std::filesystem::path cache = options.cache.empty() ? build::default_cache_dir() : options.cache;
+        if (auto cached = build::find_cached(cache, digest)) library = cached->library;
+        if (library.empty()) {
+            std::printf("generated code: none (no game library for %s in %s)\n", digest, cache.string().c_str());
+            return;
+        }
+    }
+    // the runtime's table, kept for the process's life with the library
+    static const ppc::Runtime runtime = ppc::host_runtime();
+    std::string error;
+    const ppc::GameLibrary *loaded = ppc::load_game_library(library, runtime, error);
+    if (!loaded) {
+        std::printf("generated code: none (%s)\n", error.c_str());
+        return;
+    }
+    size_t functions = 0;
+    for (size_t i = 0; i < loaded->count; i++) functions += loaded->modules[i]->count;
+    g.kernel->set_generated_modules(loaded->modules, loaded->count);
+    std::printf("generated code: %zu modules, %zu functions (the game library %s)\n", loaded->count, functions,
+                library.string().c_str());
+}
+#endif
+
 } // namespace
 
 bool open(const Options &options, Game &g, std::string &error) {
@@ -137,6 +171,8 @@ bool open(const Options &options, Game &g, std::string &error) {
     if (!options.interpret) k.set_generated_modules(xf_modules, xf_module_count);
     std::printf("generated code: %zu modules, %zu functions%s\n", size_t(xf_module_count), functions,
                 options.interpret ? " (left out: --interpret)" : "");
+#else
+    if (!options.interpret) load_game_library(options, g);
 #endif
     if (!k.load(g.xex, error)) return error = "load: " + error, false;
     k.step_limit = options.steps;

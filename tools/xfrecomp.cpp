@@ -154,199 +154,22 @@ int tests(const std::filesystem::path &dir, const std::filesystem::path &out, in
     std::printf("%zu suites, %llu functions\n", sources.size(), (unsigned long long)functions);
     return 0;
 }
-
-// An executable to emit: its path on the disc (or the host file's name) and
-// the file.
-struct Executable {
-    std::string path;
-    std::vector<uint8_t> file;
-};
-
-bool is_xex_file(const std::vector<uint8_t> &file) {
-    return file.size() >= 4 && std::memcmp(file.data(), "XEX2", 4) == 0;
-}
-
-// every XEX2 executable under dir, but the system update's
-void find_executables(const Disc &disc, const DiscEntry &dir, const std::string &prefix, std::vector<Executable> &out) {
-    for (const DiscEntry &e : dir.children) {
-        std::string path = prefix.empty() ? e.name : prefix + "\\" + e.name;
-        if (e.directory) {
-            std::string lower = e.name;
-            for (char &ch : lower) ch = char(std::tolower(uint8_t(ch)));
-            if (prefix.empty() && lower == "$systemupdate") continue;
-            find_executables(disc, e, path, out);
-            continue;
-        }
-        char magic[4] = {};
-        if (e.size < 0x18 || !disc.read(e, 0, magic, 4) || std::memcmp(magic, "XEX2", 4) != 0) continue;
-        out.push_back({path, disc.read_all(e)});
-    }
-}
-
-// what a path becomes as a directory and a C++ name: letters, digits and _
-std::string identifier(const std::string &path) {
-    std::string s;
-    for (char ch : path) s += std::isalnum(uint8_t(ch)) ? ch : '_';
-    return s;
-}
-
-std::string hex(uint64_t v, int digits) {
-    char b[24];
-    std::snprintf(b, sizeof(b), "%0*llX", digits, (unsigned long long)v);
-    return b;
-}
-
-// Writes a file unless it holds that already, so a build after an emission
-// compiles only what changed; whether it wrote.
-bool write_if_changed(const std::filesystem::path &path, const std::string &text) {
-    {
-        std::ifstream f(path, std::ios::binary);
-        if (f) {
-            std::string old((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-            if (old == text) return false;
-        }
-    }
-    std::ofstream(path, std::ios::binary) << text;
-    return true;
-}
-
-// One module's directory (see the top): false, the reason printed, when the
-// executable cannot be read.
-struct Emitted {
-    std::string ns;
-    size_t functions = 0;
-    uint64_t instructions = 0;
-    int files = 0, written = 0;
-};
-bool emit_module(const Executable &e, const std::filesystem::path &dir, const std::string &ns, int files,
-                 const recomp::DiscoverOptions &options, Emitted &out) {
-    std::string error;
-    Xex xex;
-    recomp::Image image;
-    if (!parse_xex(e.file, xex, error) || !load_xex_image(e.file, xex, error) ||
-        !recomp::read_image(xex, image, error)) {
-        std::fprintf(stderr, "%s: %s\n", e.path.c_str(), error.c_str());
-        return false;
-    }
-    recomp::Discovery d = recomp::discover(image, options);
-    std::filesystem::create_directories(dir);
-    const std::string prefix = "xf_";
-    // the functions with code: all but the imports
-    std::vector<const recomp::Function *> list;
-    uint64_t total = 0;
-    for (const auto &[a, f] : d.functions)
-        if (f.source != recomp::Source::Import) list.push_back(&f), total += f.size / 4;
-    // Files by address: 64 KB of the image each (about 16,000 instructions,
-    // a file the build compiles in seconds), or what --files asks; empty
-    // ones not written. A function found or lost changes its own file and its
-    // callers' (each file declares what it calls), not every file after it.
-    uint32_t bucket = 0x10000;
-    if (files > 0 && !list.empty()) {
-        uint32_t span = list.back()->address + list.back()->size - list.front()->address;
-        bucket = std::max<uint32_t>(0x1000, (span / uint32_t(files) + 0xFFF) & ~0xFFFu);
-    }
-    std::map<uint32_t, std::vector<const recomp::Function *>> by_file;
-    for (const recomp::Function *fn : list) by_file[(fn->address - image.base) / bucket].push_back(fn);
-    const std::string open = "namespace " + ns + " {\n\n", close = "\n} // namespace " + ns + "\n";
-    const std::string head = "// Written by xfrecomp emit from " + e.path +
-                             ". Game code: not for the repository.\n#include \"xenoforge/ppc_generated.h\"\n\n";
-    std::set<std::string> current;
-    for (const auto &[k, functions] : by_file) {
-        std::string bodies;
-        std::set<uint32_t> calls;
-        for (const recomp::Function *fn : functions) {
-            bodies += recomp::emit_function(image, d, *fn, prefix, &calls) + "\n";
-            calls.insert(fn->address);
-        }
-        std::string text = head + open;
-        for (uint32_t a : calls) text += "XF_FN(" + recomp::function_name(prefix, a) + ");\n";
-        text += "\n" + bodies + close;
-        std::string name = "functions_" + std::to_string(k) + ".cpp";
-        current.insert(name);
-        out.written += write_if_changed(dir / name, text);
-    }
-    // files of an earlier emission that hold nothing now: left empty
-    for (const auto &entry : std::filesystem::directory_iterator(dir)) {
-        std::string name = entry.path().filename().string();
-        if (name.starts_with("functions_") && name.ends_with(".cpp") && !current.count(name))
-            out.written += write_if_changed(entry.path(), "\n");
-    }
-    // an earlier layout's header of every function
-    std::error_code ec;
-    std::filesystem::remove(dir / "functions.h", ec);
-    // the path as a C++ string
-    std::string literal;
-    for (char ch : e.path) literal += ch == '\\' ? std::string("\\\\") : std::string(1, ch);
-    std::string t = "// Written by xfrecomp emit: " + e.path + "'s functions by address, for dispatch.\n" +
-                    "#include \"xenoforge/ppc_generated.h\"\n\n" + open;
-    for (const recomp::Function *fn : list) t += "XF_FN(" + recomp::function_name(prefix, fn->address) + ");\n";
-    t += "\nconst ::xf::ppc::GeneratedFunction functions[] = {\n";
-    for (const recomp::Function *fn : list)
-        t += "    {0x" + recomp::function_name("", fn->address) + "u, " + recomp::function_name(prefix, fn->address) +
-             "},\n";
-    if (list.empty()) t += "    {0, nullptr}, // (none: the count says 0)\n";
-    // where the functions take a return from a stack switch elsewhere, in
-    // order (the kernel's dispatch lets those through to them)
-    std::set<uint32_t> resumes;
-    for (const recomp::Function *fn : list) resumes.insert(fn->resumes.begin(), fn->resumes.end());
-    t += "};\n\nconst uint32_t resumes[] = {";
-    for (uint32_t a : resumes) t += "0x" + recomp::function_name("", a) + "u, ";
-    if (resumes.empty()) t += "0 /* (none: the count says 0) */";
-    t += "};\n\n// the image it was made from: path, base, size, digest (xf::image_digest)\n"
-         "extern const ::xf::ppc::GeneratedModule module = {\"" +
-         literal + "\", 0x" + hex(xex.base_address, 8) + "u, 0x" + hex(xex.image.size(), 8) + "u, 0x" +
-         hex(image_digest(xex.image), 16) + "ull, functions, " + std::to_string(list.size()) + ", resumes, " +
-         std::to_string(resumes.size()) + "};\n" + close;
-    out.written += write_if_changed(dir / "table.cpp", t);
-    out.ns = ns, out.functions = list.size(), out.instructions = total, out.files = int(by_file.size());
-    return true;
-}
-
 } // namespace
 
+// the disc's modules through recomp::emit_modules (recomp_module.cpp), a line each
 int emit(const std::string &input, const std::vector<std::string> &only, const std::filesystem::path &out, int files,
          const recomp::DiscoverOptions &options) {
     std::string error;
-    std::vector<Executable> executables;
-    if (is_executable(input)) {
-        executables.push_back({std::filesystem::path(input).filename().string(), read_all(input)});
-    } else {
-        auto disc = Disc::open(input, error);
-        if (!disc) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
-        if (only.empty()) find_executables(*disc, disc->root(), "", executables);
-        for (const std::string &path : only) {
-            const DiscEntry *entry = disc->find(path);
-            if (!entry || entry->directory) return std::fprintf(stderr, "no %s on the disc\n", path.c_str()), 1;
-            executables.push_back({path, disc->read_all(*entry)});
-        }
-    }
-    // title updates are patches to apply, not modules
-    std::erase_if(executables, [](const Executable &e) {
-        Xex x;
-        std::string ignored;
-        return !is_xex_file(e.file) || (parse_xex(e.file, x, ignored) && x.is_patch());
-    });
-    if (executables.empty()) return std::fprintf(stderr, "no executable to emit\n"), 1;
-    std::filesystem::create_directories(out);
-    std::vector<Emitted> emitted;
-    std::set<std::string> names;
-    for (const Executable &e : executables) {
-        std::string name = identifier(e.path);
-        for (int k = 2; !names.insert(name).second; k++) name = identifier(e.path) + "_" + std::to_string(k);
-        Emitted m;
-        if (!emit_module(e, out / name, "xfm_" + name, files, options, m)) return 1;
-        std::printf("%-28s %7zu functions, %9llu instructions, %4d files, %4d written (%s)\n", e.path.c_str(),
-                    m.functions, (unsigned long long)m.instructions, m.files, m.written, name.c_str());
-        emitted.push_back(m);
-    }
-    std::string t = "// Written by xfrecomp emit: every module's table, for the game library (ppc_module.h).\n"
-                    "#include \"xenoforge/ppc_module.h\"\n\n";
-    for (const Emitted &m : emitted)
-        t += "namespace " + m.ns + " {\nextern const ::xf::ppc::GeneratedModule module;\n}\n";
-    t += "\nextern \"C\" const ::xf::ppc::GeneratedModule *const xf_modules[] = {\n";
-    for (const Emitted &m : emitted) t += "    &" + m.ns + "::module,\n";
-    t += "};\nextern \"C\" const size_t xf_module_count = " + std::to_string(emitted.size()) + ";\n";
-    write_if_changed(out / "modules.cpp", t);
+    std::vector<recomp::ModuleFile> modules;
+    if (!recomp::find_modules(input, only, modules, error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    recomp::EmitOptions o;
+    o.files = files;
+    o.discover = options;
+    std::vector<recomp::EmittedModule> emitted;
+    if (!recomp::emit_modules(modules, out, o, emitted, error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+    for (const recomp::EmittedModule &m : emitted)
+        std::printf("%-28s %7zu functions, %9llu instructions, %4d files, %4d written (%s)\n", m.path.c_str(),
+                    m.functions, (unsigned long long)m.instructions, m.files, m.written, m.directory.c_str());
     return 0;
 }
 

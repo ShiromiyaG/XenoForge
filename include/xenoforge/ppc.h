@@ -6,8 +6,12 @@
 
 #pragma once
 
-#include <cstdint>
+// the integer types (freestanding in a game library)
+#include "xenoforge/ppc_runtime.h"
+
+#ifndef XF_GAME_LIBRARY
 #include <string>
+#endif
 
 namespace xf::ppc {
 
@@ -34,8 +38,10 @@ struct OpcodeInfo {
 
 const OpcodeInfo &info(Opcode op);
 Opcode decode(uint32_t code);
+#ifndef XF_GAME_LIBRARY
 // Xenia's DisasmPPC: "DISASM ERROR" for what does not decode.
 std::string disassemble(uint32_t address, uint32_t code);
+#endif
 
 // The instruction word's fields by form, as Xenia's InstrData (ppc_instr.h):
 // bitfields from the low bit, so i.XO.RT is bits 21-25 of the word as the

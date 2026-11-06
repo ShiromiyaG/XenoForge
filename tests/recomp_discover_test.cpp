@@ -250,8 +250,8 @@ int main() {
     CHECK(d.functions.at(SC).call_sites.size() == 3);
 
     // Emitted: a switch's returns checked, its branch to the thunk a
-    // switch_stack with its own return address; the setjmp's caller in a
-    // try block that takes an Unwind at its resume sites, without tail
+    // switch_stack with its own return address; the setjmp's caller a body
+    // the runtime runs again at its resume sites (resumable), without tail
     // calls; the continuation a label of EP's
     auto emitted = [&](uint32_t a) { return emit_function(image, d, d.functions.at(a), "xf_"); };
     auto contains = [](const std::string &text, const std::string &part) {
@@ -262,12 +262,15 @@ int main() {
     CHECK(contains(lj, "XF_CHECKED_RETURN();") && !contains(lj, "    return;"));
     CHECK(contains(fs, "{ ::xf::ppc::switch_stack(c, 0x82000A40, xf_lr); XF_CHECKED_RETURN(); }"));
     CHECK(contains(fs3, "if (BC(12, 2)) { ::xf::ppc::switch_stack(c, 0x82000A40, xf_lr); XF_CHECKED_RETURN(); }"));
-    CHECK(contains(sc, "try {") && contains(sc, "case 0x82000B4C: goto L_82000B4C;") &&
-          contains(sc, "case 0x82000B54: goto L_82000B54;") && contains(sc, "L_82000B4C:") &&
-          contains(sc, "catch (const ::xf::ppc::Unwind &xf_unwind)") && contains(sc, "xf_82000B20(c);") &&
-          contains(sc, "c.lr = 0x82000B58; xf_82000B80(c);"));
+    CHECK(contains(sc, "static constexpr uint32_t xf_sites[] = {0x82000B4Cu, 0x82000B54u};") &&
+          contains(sc, "::xf::ppc::resumable(c, XF_RESUMABLE_BODY {") &&
+          contains(sc, "case 0x82000B4C: goto L_82000B4C;") && contains(sc, "case 0x82000B54: goto L_82000B54;") &&
+          contains(sc, "L_82000B4C:") && contains(sc, "}, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, 2);") &&
+          contains(sc, "xf_82000B20(c);") && contains(sc, "c.lr = 0x82000B58; xf_82000B80(c);"));
     CHECK(contains(ep, "case 0x82000C18: goto L_82000C18;") && contains(ep, "L_82000C18:"));
-    CHECK(!contains(sc, "XF_TAIL") && !contains(emitted(A), "try {"));
+    // the generated code never catches (the runtime does)
+    CHECK(!contains(sc, "XF_TAIL") && !contains(sc, "try {") && !contains(ep, "catch") &&
+          !contains(emitted(A), "resumable"));
     std::string mb = emitted(MB);
     CHECK(contains(mb, "case 0x82000D3C:") && !contains(mb, "case 0x82000D48:") &&
           contains(mb, "default: ::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u);"));

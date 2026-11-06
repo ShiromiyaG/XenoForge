@@ -8,7 +8,8 @@
 //
 // Compiled into each executable (with XF_GENERATED in the ones linked with a
 // game's generated code), so the tables it installs (one per module) are
-// that game's.
+// that game's; the generic ones load the game library cached for the disc
+// (game_library.h) instead.
 
 #pragma once
 
@@ -34,7 +35,13 @@ struct Options {
     std::string xex_path = "default.xex"; // the executable on the disc
     std::filesystem::path storage;        // the storage root (content/, cache*/)
     uint64_t steps = 2'000'000'000ull;    // the interpreter's instructions per entry
-    bool interpret = false;               // the generated code left out, where it is linked
+    bool interpret = false;               // the generated code left out (linked, or a game library)
+    // Built without generated code (the generic boot and player): the game
+    // library the recompile step cached for the executable (game_build.h),
+    // from this cache (game_build.h's default_cache_dir() when empty), or the
+    // one named; with none, the game is interpreted.
+    std::filesystem::path cache;
+    std::filesystem::path game_library;
 };
 
 struct Game {

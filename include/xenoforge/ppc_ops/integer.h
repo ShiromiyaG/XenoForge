@@ -16,8 +16,6 @@
 
 #include "xenoforge/ppc_ops.h"
 
-#include <atomic>
-
 namespace xf::ppc::ops {
 
 // ---- helpers ----
@@ -48,7 +46,7 @@ template <typename T> XF_INLINE void compare(Context &c, uint32_t n, T a, T b) {
 
 // ROTL32 as the rotates see it: the rotated low word in both halves
 XF_INLINE uint64_t rotl32_both(uint64_t rs, uint32_t n) {
-    uint64_t r = std::rotl(uint32_t(rs), int(n & 31));
+    uint64_t r = lib::rotl(uint32_t(rs), int(n & 31));
     return r | (r << 32);
 }
 
@@ -252,7 +250,7 @@ XF_OP(mulhdux) {
 XF_OP(divwx) {
     // RT[32:63] <- (RA)[32:63] ÷ (RB)[32:63], RT[0:31] <- 0 (as Xenia)
     int32_t a = int32_t(c.r[i.XO.RA]), b = int32_t(c.r[i.XO.RB]);
-    bool overflow = b == 0 || (a == std::numeric_limits<int32_t>::min() && b == -1);
+    bool overflow = b == 0 || (a == lib::numeric_limits<int32_t>::min() && b == -1);
     store_xo(c, i, overflow ? 0 : uint64_t(uint32_t(a / b)), overflow);
 }
 
@@ -265,7 +263,7 @@ XF_OP(divwux) {
 XF_OP(divdx) {
     // RT <- (RA) ÷ (RB)
     int64_t a = int64_t(c.r[i.XO.RA]), b = int64_t(c.r[i.XO.RB]);
-    bool overflow = b == 0 || (a == std::numeric_limits<int64_t>::min() && b == -1);
+    bool overflow = b == 0 || (a == lib::numeric_limits<int64_t>::min() && b == -1);
     store_xo(c, i, overflow ? 0 : uint64_t(a / b), overflow);
 }
 
@@ -333,8 +331,8 @@ XF_OP(oris) { c.r[i.D.RA] = c.r[i.D.RT] | (extz16(i.D.DS) << 16); }
 XF_OP(xori) { c.r[i.D.RA] = c.r[i.D.RT] ^ extz16(i.D.DS); }
 XF_OP(xoris) { c.r[i.D.RA] = c.r[i.D.RT] ^ (extz16(i.D.DS) << 16); }
 
-XF_OP(cntlzwx) { store_x(c, i, uint64_t(std::countl_zero(uint32_t(c.r[i.X.RT])))); }
-XF_OP(cntlzdx) { store_x(c, i, uint64_t(std::countl_zero(c.r[i.X.RT]))); }
+XF_OP(cntlzwx) { store_x(c, i, uint64_t(lib::countl_zero(uint32_t(c.r[i.X.RT])))); }
+XF_OP(cntlzdx) { store_x(c, i, uint64_t(lib::countl_zero(c.r[i.X.RT]))); }
 XF_OP(extsbx) { store_x(c, i, uint64_t(int64_t(int8_t(c.r[i.X.RT])))); }
 XF_OP(extshx) { store_x(c, i, uint64_t(int64_t(int16_t(c.r[i.X.RT])))); }
 XF_OP(extswx) { store_x(c, i, uint64_t(int64_t(int32_t(c.r[i.X.RT])))); }
@@ -343,39 +341,39 @@ XF_OP(extswx) { store_x(c, i, uint64_t(int64_t(int32_t(c.r[i.X.RT])))); }
 
 XF_OP(rldclx) {
     // RA <- ROTL64((RS), (RB)[58:63]) & MASK(mb, 63)
-    uint64_t v = std::rotl(c.r[i.MDS.RT], int(c.r[i.MDS.RB] & 0x3F));
+    uint64_t v = lib::rotl(c.r[i.MDS.RT], int(c.r[i.MDS.RB] & 0x3F));
     store_md(c, i, v & mask((i.MDS.MB5 << 5) | i.MDS.MB, 63));
 }
 
 XF_OP(rldcrx) {
     // RA <- ROTL64((RS), (RB)[58:63]) & MASK(0, me)
-    uint64_t v = std::rotl(c.r[i.MDS.RT], int(c.r[i.MDS.RB] & 0x3F));
+    uint64_t v = lib::rotl(c.r[i.MDS.RT], int(c.r[i.MDS.RB] & 0x3F));
     store_md(c, i, v & mask(0, (i.MDS.MB5 << 5) | i.MDS.MB));
 }
 
 XF_OP(rldicx) {
     // RA <- ROTL64((RS), sh) & MASK(mb, ¬sh)
     uint32_t sh = (i.MD.SH5 << 5) | i.MD.SH;
-    store_md(c, i, std::rotl(c.r[i.MD.RT], int(sh)) & mask((i.MD.MB5 << 5) | i.MD.MB, ~sh));
+    store_md(c, i, lib::rotl(c.r[i.MD.RT], int(sh)) & mask((i.MD.MB5 << 5) | i.MD.MB, ~sh));
 }
 
 XF_OP(rldiclx) {
     // RA <- ROTL64((RS), sh) & MASK(mb, 63)
     uint32_t sh = (i.MD.SH5 << 5) | i.MD.SH;
-    store_md(c, i, std::rotl(c.r[i.MD.RT], int(sh)) & mask((i.MD.MB5 << 5) | i.MD.MB, 63));
+    store_md(c, i, lib::rotl(c.r[i.MD.RT], int(sh)) & mask((i.MD.MB5 << 5) | i.MD.MB, 63));
 }
 
 XF_OP(rldicrx) {
     // RA <- ROTL64((RS), sh) & MASK(0, me)
     uint32_t sh = (i.MD.SH5 << 5) | i.MD.SH;
-    store_md(c, i, std::rotl(c.r[i.MD.RT], int(sh)) & mask(0, (i.MD.MB5 << 5) | i.MD.MB));
+    store_md(c, i, lib::rotl(c.r[i.MD.RT], int(sh)) & mask(0, (i.MD.MB5 << 5) | i.MD.MB));
 }
 
 XF_OP(rldimix) {
     // RA <- ROTL64((RS), sh) & m | (RA) & ¬m, m = MASK(mb, ¬sh)
     uint32_t sh = (i.MD.SH5 << 5) | i.MD.SH;
     uint64_t m = mask((i.MD.MB5 << 5) | i.MD.MB, ~sh);
-    store_md(c, i, (std::rotl(c.r[i.MD.RT], int(sh)) & m) | (c.r[i.MD.RA] & ~m));
+    store_md(c, i, (lib::rotl(c.r[i.MD.RT], int(sh)) & m) | (c.r[i.MD.RA] & ~m));
 }
 
 XF_OP(rlwinmx) {
@@ -428,8 +426,8 @@ XF_OP(sradix) { shift_right_algebraic_double(c, i, (i.XS.SH5 << 5) | i.XS.SH); }
 // ---- memory barriers (ppc_emit_memory.cc): sync and eieio are a full
 // fence (Xenia's mfence), isync nothing ----
 
-XF_OP(sync) { std::atomic_thread_fence(std::memory_order_seq_cst); }
-XF_OP(eieio) { std::atomic_thread_fence(std::memory_order_seq_cst); }
+XF_OP(sync) { lib::atomic_thread_fence_seq_cst(); }
+XF_OP(eieio) { lib::atomic_thread_fence_seq_cst(); }
 XF_OP(isync) {}
 
 } // namespace xf::ppc::ops

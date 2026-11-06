@@ -311,6 +311,14 @@ generated code is per module:
   takes about a minute, which dominates a rebuild after a discovery fix (60
   files of the eight games and eight links: 534 s). -O2 stays the default:
   every game builds in under half an hour.
+- **Two ways to link it** (2026-11-06): CMake's `game_<name>.lib` linked
+  into `boot_<game>` and `player_<game>` (ports), or a game library: the
+  recompile step (`xfbuild`, the launcher; `recomp::emit_modules` in
+  process, then clang and lld) builds the same emission into a DLL the
+  generic `boot` and `player` load (docs/runtime.md, "The game library").
+  The same headers compile both; in the library they are freestanding
+  (`XF_GAME_LIBRARY`) and the runtime's calls go through its table
+  (`ppc_runtime.h`).
 
 The eight games (2026-11-05, with the stack switches generated, "Stack
 switches" below; functions with generated code, all but the imports;
@@ -418,39 +426,37 @@ code follows them, and nothing between is interpreted:
   (checked on Reach: 0x821D6038's two catch funclets return 0x821D60AC and
   0x821D60B0; the pointer scan took the first for a start, which it stays,
   and the label is emitted in the parent too). A function with resume sites
-  runs its body in a try block that takes an Unwind with r1 inside its frame
-  to one of them (Reach's setjmp caller, a decompressor entry):
+  has its body run by the runtime (`resumable`, ppc_runtime.h), which runs
+  it again from a resume site when an Unwind to one of them comes back with
+  r1 inside its frame (Reach's setjmp caller, a decompressor entry):
 
   ```cpp
   XF_FN(xf_827D2B80) {
-      const uint32_t xf_sp = uint32_t(c.r[1]);
-      uint32_t xf_at = 0; // where an Unwind came back to
-      for (;;) {
-          try {
-              switch (xf_at) {
-              case 0x827D2BA4: goto L_827D2BA4;
-              }
-              ...
-              c.lr = 0x827D2BA4; xf_829B20A0(c); // setjmp
-          L_827D2BA4:
-              ...
-              return;
-          } catch (const ::xf::ppc::Unwind &xf_unwind) {
-              if (uint32_t(c.r[1]) >= xf_sp) throw; // a frame further up
-              switch (xf_unwind.target) {
-              case 0x827D2BA4:
-                  xf_at = xf_unwind.target;
-                  continue;
-              }
-              throw;
+      static constexpr uint32_t xf_sites[] = {0x827D2BA4u};
+      ::xf::ppc::resumable(c, XF_RESUMABLE_BODY {
+          switch (xf_at) {
+          case 0x827D2BA4: goto L_827D2BA4;
           }
-      }
+          ...
+          c.lr = 0x827D2BA4; xf_829B20A0(c); // setjmp
+      L_827D2BA4:
+          ...
+          return;
+      }, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, 1);
   }
   ```
 
-  The generated code keeps nothing outside the context but `xf_sp`, `xf_lr`
+  `resumable` (src/ppc_runtime.cpp) holds the try block the emitter wrote
+  into the function until 2026-11-06: it runs the body (a lambda taking the
+  entry's LR and r1 as `xf_lr` and `xf_sp`, and `xf_at`), and on an Unwind
+  with r1 below the entry's and its target among the sites runs it again
+  from there; any other goes on up. So the generated code never catches:
+  every Unwind is thrown and caught by the runtime, and a game library
+  carries no C++ runtime (docs/runtime.md, "The game library"). The
+  generated code keeps nothing outside the context but `xf_sp`, `xf_lr`
   and `xf_at`, so a frame goes on at a label exactly as the guest's does.
-  There are no tail calls in the try block (`musttail` cannot leave one).
+  There are no tail calls in the body (`musttail` cannot leave a lambda for
+  a function of another type).
 - **Who takes an Unwind**: the innermost host frame entered with r1 above
   the restored one, whose function holds the guest's frame at that r1 (the
   frames inside it were entered at or below it). A generated function with
@@ -463,11 +469,12 @@ code follows them, and nothing between is interpreted:
   generated code (`GeneratedModule::resumes`, `Kernel::resumable`), and
   interprets otherwise, as before.
 - **Cost**: nothing where nothing switches. The checked returns are in the
-  switching functions alone (20 in the 16 modules), the try blocks in the
-  functions with resume sites (zero-cost tables on x64; 274 functions, 354
-  sites, most of them catch continuations in Sonic and Reach's Waves DLLs:
-  the table above), and an Unwind is a C++ exception (tens of
-  microseconds), only for longjmps and catches.
+  switching functions alone (20 in the 16 modules), a call through
+  `resumable` for each call of a function with resume sites (274
+  functions, 354 sites, most of them catch continuations in Sonic and
+  Reach's Waves DLLs: the table above), and an Unwind is a C++ exception
+  (3.7 microseconds through 2 frames, 6.2 through 17, the same in a game
+  library: game_library_test), only for longjmps and catches.
 
 Measured (2026-11-05, 30 s of `boot_<game>`, whose report now says what
 took each switch): Reach enters the interpreter 0 times (1,803 before: 1,202
