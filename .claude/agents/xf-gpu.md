@@ -32,6 +32,13 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
   draw_util, render_target_cache, texture_cache, shaders/*.xesli, command_processor) and match it.
   Code translated from Xenia starts with Xenia's BSD notice and is checked against its source in the
   same session. hedge-dev's MIT XenosRecomp (F:\RECOMPs\XenosRecomp) may be used with its notice.
+- Where Xenia has no answer (a feature it lacks or approximates), XNA Game Studio 4.0 is the second
+  reference (docs/plan.md, "References for the GPU"; tools/xna/README.md). Its XnaNative.dll in
+  F:\RECOMPs\external\xna\bin has Microsoft's Xbox 360 HLSL compiler, a Xenos microcode assembler
+  (CreateAssembleShaderFromSourceForXbox) and FillXboxBuffer. HLSL for a feature is compiled by XNA
+  into microcode for our translator, and by a host HLSL compiler into SPIR-V as the expected meaning.
+- The kernel and the GPU are completed by inventory now (docs/plan.md, "Everything left"): port whole
+  features from Xenia at once rather than waiting for a game to ask.
 - English in code, comments, logs and docs. C++20, clang, the repo's .clang-format (4 spaces,
   120 columns). Comments say what the code does and why, in plain prose.
 - Never put game data in the repo: traces, frames, dumps and shader corpora stay in F:\RECOMPs\traces
