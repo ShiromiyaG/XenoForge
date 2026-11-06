@@ -100,10 +100,24 @@ uint32_t Mutant::acquire(Thread &t) {
     return X_STATUS_SUCCESS;
 }
 
+Mutant::~Mutant() {
+    if (!owner_thread) return;
+    std::erase(owner_thread->mutants, this);
+    if (guest) list_remove(owner.k, guest + kmutant::LIST);
+}
+
+// The owner's list of mutants, in the guest too, as the console keeps it (KiInsertMutant puts the mutant at the head
+// of the thread's list; releasing unlinks it and leaves its own links as they were). Xenia keeps no such list.
 void Mutant::set_owner(Thread *t) {
-    if (owner_thread) std::erase(owner_thread->mutants, this);
+    if (owner_thread) {
+        std::erase(owner_thread->mutants, this);
+        list_remove(owner.k, guest + kmutant::LIST);
+    }
     owner_thread = t;
-    if (t) t->mutants.push_back(this);
+    if (t) {
+        t->mutants.push_back(this);
+        list_insert_head(owner.k, t->kthread() + kthread::MUTANTS_LIST, guest + kmutant::LIST);
+    }
     owner.k.store32(guest + kmutant::OWNER, t ? t->kthread() : 0);
 }
 

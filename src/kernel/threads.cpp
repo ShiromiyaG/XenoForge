@@ -307,6 +307,9 @@ uint32_t Thread::create(const Params &p) {
     k.store32(pcr + kpcr::STACK_BASE, stack_base);
     k.store32(pcr + kpcr::STACK_END, stack_limit);
     k.store32(pcr + kpcr::DPC_ACTIVE, 0);
+    k.store32(pcr + kpcr::FPU_OWNER, 0xFFFFFFFF);
+    k.store32(pcr + kpcr::VMX_OWNER, 0xFFFFFFFF);
+    list_init(k, pcr + kpcr::DPC_QUEUE);
     set_cpu(k, *this, cpu);
     if (suspend_count) pending.fetch_or(PENDING_SUSPEND);
     return X_STATUS_SUCCESS;
@@ -678,29 +681,54 @@ XF_EXPORT(xboxkrnl, KeInitializeDpc) {
     k.store32(dpc + kdpc::CONTEXT, arg(k, c, 2));
 }
 
-XF_EXPORT(xboxkrnl, KeInsertQueueDpc) {
-    uint32_t dpc = arg(k, c, 0), arg1 = arg(k, c, 1), arg2 = arg(k, c, 2);
-    k.store32(dpc + kdpc::ARG1, arg1);
-    k.store32(dpc + kdpc::ARG2, arg2);
-    uint32_t routine = k.load32(dpc + kdpc::ROUTINE);
-    if (routine && current_thread()) {
-        // at DISPATCH_LEVEL, the PCR saying a DPC runs (Xenia's
-        // BeginDPCImpersonation), unless one already does
-        uint32_t pcr = uint32_t(c.r[13]);
-        bool nested = k.load32(pcr + kpcr::DPC_ACTIVE) != 0;
-        uint8_t irql = k.host(pcr)[kpcr::CURRENT_IRQL];
-        if (!nested) k.host(pcr)[kpcr::CURRENT_IRQL] = 2, k.store32(pcr + kpcr::DPC_ACTIVE, 1);
-        objects(k).call(c, routine, {dpc, k.load32(dpc + kdpc::CONTEXT), arg1, arg2});
-        if (!nested) k.host(pcr)[kpcr::CURRENT_IRQL] = irql, k.store32(pcr + kpcr::DPC_ACTIVE, 0);
+// The DPCs queued on this processor run when the IRQL falls below DISPATCH_LEVEL (the console's KfLowerIrql sees the
+// software interrupt the insert requested, and its dispatch takes them off the PRCB's queue, head first, each at
+// DISPATCH_LEVEL with the PCR saying a DPC runs; Xenia runs a DPC as it is inserted, at any IRQL). A DPC taken off is
+// not inserted any more and its list entry keeps the links it had (the console unlinks the neighbours only).
+void run_queued_dpcs(Kernel &k, ppc::Context &c) {
+    uint32_t pcr = uint32_t(c.r[13]), queue = pcr + kpcr::DPC_QUEUE;
+    if (k.load32(pcr + kpcr::DPC_ACTIVE) != 0 || !current_thread()) return;
+    if (list_empty(k, queue)) {
+        k.host(pcr)[kpcr::SOFTWARE_INTERRUPT] = 0;
+        return;
     }
+    uint8_t irql = k.host(pcr)[kpcr::CURRENT_IRQL];
+    k.host(pcr)[kpcr::CURRENT_IRQL] = 2, k.store32(pcr + kpcr::DPC_ACTIVE, 1);
+    while (!list_empty(k, queue)) {
+        uint32_t entry = k.load32(queue), dpc = entry - kdpc::LIST;
+        list_remove(k, entry);
+        k.host(dpc)[kdpc::SELECTED_CPU] = 0;
+        if (uint32_t routine = k.load32(dpc + kdpc::ROUTINE))
+            objects(k).call(
+                c, routine, {dpc, k.load32(dpc + kdpc::CONTEXT), k.load32(dpc + kdpc::ARG1), k.load32(dpc + kdpc::ARG2)});
+    }
+    k.host(pcr)[kpcr::SOFTWARE_INTERRUPT] = 0;
+    k.host(pcr)[kpcr::CURRENT_IRQL] = irql, k.store32(pcr + kpcr::DPC_ACTIVE, 0);
+}
+
+// (dpc, argument 1, argument 2): 1 if it was queued by this call, 0 if it was queued already (the console's answer:
+// the byte at +2 says where it is queued, the processor + 1)
+XF_EXPORT(xboxkrnl, KeInsertQueueDpc) {
+    uint32_t dpc = arg(k, c, 0), pcr = uint32_t(c.r[13]);
+    if (!current_thread()) return result(c, 1); // not on a guest thread: no processor to queue on
+    if (k.host(dpc)[kdpc::SELECTED_CPU]) return result(c, 0);
+    k.host(dpc)[kdpc::SELECTED_CPU] = uint8_t(k.host(pcr)[kpcr::CURRENT_CPU] + 1);
+    k.store32(dpc + kdpc::ARG1, arg(k, c, 1));
+    k.store32(dpc + kdpc::ARG2, arg(k, c, 2));
+    list_insert_tail(k, pcr + kpcr::DPC_QUEUE, dpc + kdpc::LIST);
+    k.host(pcr)[kpcr::SOFTWARE_INTERRUPT] = 2;
+    if (k.host(pcr)[kpcr::CURRENT_IRQL] < 2) run_queued_dpcs(k, c);
     result(c, 1);
 }
 
-// (dpc): whether it was queued and is no longer. A DPC runs as it is
-// inserted here, so none is ever left queued: NT's answer for a DPC that ran.
-// (Xenia also runs it at once but leaves it on its list of queued DPCs, so
-// its KeRemoveQueueDpc says 1 for any DPC inserted and not removed since.)
-XF_EXPORT(xboxkrnl, KeRemoveQueueDpc) { result(c, 0); }
+// (dpc): whether it was queued and is no longer (NT's)
+XF_EXPORT(xboxkrnl, KeRemoveQueueDpc) {
+    uint32_t dpc = arg(k, c, 0);
+    if (!k.host(dpc)[kdpc::SELECTED_CPU]) return result(c, 0);
+    list_remove(k, dpc + kdpc::LIST);
+    k.host(dpc)[kdpc::SELECTED_CPU] = 0;
+    result(c, 1);
+}
 
 // ---- thread exports ----
 
@@ -797,8 +825,9 @@ Ref<Thread> thread_at(Kernel &k, uint32_t kthread) {
 
 XF_EXPORT(xboxkrnl, KeSetAffinityThread) {
     uint32_t affinity = arg(k, c, 1), previous_ptr = arg(k, c, 2);
-    // no thread is a bad parameter on the console's kernel, as is an empty affinity
-    if (!affinity || !arg(k, c, 0)) return result(c, X_STATUS_INVALID_PARAMETER);
+    // no thread is a bad parameter on the console's kernel, as is an empty affinity or one with a processor that is
+    // not there (it wants the mask to lie within KeActiveProcessors: the six hardware threads)
+    if (!affinity || (affinity & ~0x3Fu) || !arg(k, c, 0)) return result(c, X_STATUS_INVALID_PARAMETER);
     Ref<Thread> t = thread_at(k, arg(k, c, 0));
     if (!t) return result(c, X_STATUS_INVALID_HANDLE);
     std::lock_guard<std::mutex> l(objects(k).lock);
@@ -894,14 +923,20 @@ XF_EXPORT(xboxkrnl, KeSetCurrentStackPointers) {
         switch_guest_stack(k, *t, c, from_sp, base, limit);
 }
 
-// The FPU registers kept in the current KTHREAD (Xenia's, sketchy as its).
+// The FPU registers kept in the current KTHREAD (Xenia's, sketchy as its). The console's save answers the previous
+// owner of the FPU state (-1 when there is none; its save area is the control block's own, at +0x300, from then on)
+// and its restore gives the state back (-1); the answer is the console's, the registers' keeping is ours.
 XF_EXPORT(xboxkrnl, KeSaveFloatingPointState) {
-    uint32_t thread = k.load32(uint32_t(c.r[13]) + kpcr::CURRENT_THREAD);
+    uint32_t pcr = uint32_t(c.r[13]), thread = k.load32(pcr + kpcr::CURRENT_THREAD);
     for (uint32_t n = 0; n < 32; n++) k.store64(thread + kthread::FPU_CONTEXT + 8 * n, std::bit_cast<uint64_t>(c.f[n]));
+    uint32_t owner = k.load32(pcr + kpcr::FPU_OWNER);
+    k.store32(pcr + kpcr::FPU_OWNER, pcr + 0x300);
+    result(c, owner);
 }
 XF_EXPORT(xboxkrnl, KeRestoreFloatingPointState) {
-    uint32_t thread = k.load32(uint32_t(c.r[13]) + kpcr::CURRENT_THREAD);
+    uint32_t pcr = uint32_t(c.r[13]), thread = k.load32(pcr + kpcr::CURRENT_THREAD);
     for (uint32_t n = 0; n < 32; n++) c.f[n] = std::bit_cast<double>(k.load64(thread + kthread::FPU_CONTEXT + 8 * n));
+    k.store32(pcr + kpcr::FPU_OWNER, 0xFFFFFFFF);
 }
 
 // (thread id, out): the thread's KTHREAD, referenced until
@@ -942,6 +977,18 @@ XF_EXPORT(xboxkrnl, KeEnableFpuExceptions) {
     k.host(k.load32(uint32_t(c.r[13]) + kpcr::CURRENT_THREAD))[kthread::FPU_EXCEPTIONS] = arg(k, c, 0) != 0;
 }
 
+// What giving up the time slice answers. The console's NtYieldExecution (and the zero-interval delay, which is one)
+// is STATUS_NO_YIELD_PERFORMED (0x40000024) when no other thread is ready on the processor, success when one ran
+// (the oracle: with only the caller running it answers 0x40000024; Xenia answers 0 always). Ready here: another
+// guest thread that has started, has not finished, and is not blocked.
+static uint32_t yield_status(Objects &o, Thread *self) {
+    std::lock_guard<std::mutex> l(o.lock);
+    for (Thread *t : o.threads)
+        if (t != self && t->started && !t->finished && !t->terminated && t->blocked == Thread::Blocked::No)
+            return X_STATUS_SUCCESS;
+    return X_STATUS_NO_YIELD_PERFORMED;
+}
+
 // (mode, alertable, interval *): a null interval is not a zero wait. The
 // console's kernel reads it through the pointer (the oracle: a fault reading
 // guest address 0), which a title sees as an access violation; there is no
@@ -964,7 +1011,7 @@ XF_EXPORT(xboxkrnl, KeDelayExecutionThread) {
     if (!t) return result(c, X_STATUS_SUCCESS);
     if (!interval && !(alertable && o.user_apc_pending(*t))) {
         o.scheduler->yield();
-        return result(c, X_STATUS_SUCCESS);
+        return result(c, yield_status(o, t));
     }
     uint32_t status = o.wait(*t, {}, false, alertable != 0, o.deadline(interval_ptr));
     if (status == X_STATUS_USER_APC) {
@@ -975,8 +1022,9 @@ XF_EXPORT(xboxkrnl, KeDelayExecutionThread) {
 }
 
 XF_EXPORT(xboxkrnl, NtYieldExecution) {
-    objects(k).scheduler->yield();
-    result(c, 0);
+    Objects &o = objects(k);
+    o.scheduler->yield();
+    result(c, yield_status(o, current_thread()));
 }
 
 // ---- TLS slots (Xenia's AllocateTLS, FreeTLS, XThread's TLS values) ----
@@ -1056,12 +1104,18 @@ XF_EXPORT(xboxkrnl, KfAcquireSpinLock) {
 XF_EXPORT(xboxkrnl, KfReleaseSpinLock) {
     uint32_t old_irql = arg(k, c, 1);
     release_spin_lock(objects(k), arg(k, c, 0));
-    if (old_irql < 2) k.host(uint32_t(c.r[13]))[kpcr::CURRENT_IRQL] = uint8_t(old_irql);
+    if (old_irql < 2) {
+        k.host(uint32_t(c.r[13]))[kpcr::CURRENT_IRQL] = uint8_t(old_irql);
+        run_queued_dpcs(k, c);
+    }
 }
 
 // IRQL in the PCR (Xenia's): to dispatch level, the old one back; down
 XF_EXPORT(xboxkrnl, KeRaiseIrqlToDpcLevel) { result(c, raise_irql(k, uint32_t(c.r[13]), 2)); }
-XF_EXPORT(xboxkrnl, KfLowerIrql) { k.host(uint32_t(c.r[13]))[kpcr::CURRENT_IRQL] = uint8_t(arg(k, c, 0)); }
+XF_EXPORT(xboxkrnl, KfLowerIrql) {
+    k.host(uint32_t(c.r[13]))[kpcr::CURRENT_IRQL] = uint8_t(arg(k, c, 0));
+    if (arg(k, c, 0) < 2) run_queued_dpcs(k, c);
+}
 // (new IRQL): the old one
 XF_EXPORT(xboxkrnl, KfRaiseIrql) { result(c, raise_irql(k, uint32_t(c.r[13]), uint8_t(arg(k, c, 0)))); }
 

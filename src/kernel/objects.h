@@ -39,6 +39,7 @@ namespace xf::kernel {
 constexpr uint32_t X_STATUS_ABANDONED_WAIT_0 = 0x00000080;
 constexpr uint32_t X_STATUS_USER_APC = 0x000000C0;
 constexpr uint32_t X_STATUS_TIMEOUT = 0x00000102;
+constexpr uint32_t X_STATUS_NO_YIELD_PERFORMED = 0x40000024;
 constexpr uint32_t X_STATUS_PENDING = 0x00000103;
 constexpr uint32_t X_STATUS_OBJECT_NAME_EXISTS = 0x40000000;
 constexpr uint32_t X_STATUS_TIMER_RESUME_IGNORED = 0x40000025;
@@ -118,6 +119,11 @@ namespace ktimer {
 constexpr uint32_t DUE_TIME = 0x10, DPC = 0x20, PERIOD = 0x24, SIZE = 0x28;
 }
 
+// X_KWAIT_BLOCK (0x18): the list entry, then the thread, the object, the next block, the key and the wait type
+namespace kwait_block {
+constexpr uint32_t THREAD = 0x8, OBJECT = 0xC, NEXT = 0x10, KEY = 0x14, TYPE = 0x16, SIZE = 0x18;
+}
+
 // X_KTHREAD (0xAB0)
 namespace kthread {
 constexpr uint32_t MUTANTS_LIST = 0x10, WAIT_TIMEOUT_TIMER = 0x18, WAIT_TIMEOUT_BLOCK = 0x40;
@@ -131,6 +137,7 @@ constexpr uint32_t BASE_PRIORITY_COPY = 0xC9, MAX_DYNAMIC_PRIORITY = 0xCA, STACK
 constexpr uint32_t PROCESS_THREADS = 0x110, CREATE_TIME = 0x130, EXIT_TIME = 0x138, EXIT_STATUS = 0x140;
 constexpr uint32_t TIMER_LIST = 0x144, THREAD_ID = 0x14C, START_ADDRESS = 0x150, UNK_154 = 0x154;
 constexpr uint32_t LAST_ERROR = 0x160, CREATION_FLAGS = 0x16C, FPU_CONTEXT = 0x988, SIZE = 0xAB0;
+constexpr uint32_t WAIT_BLOCKS = 0xA8, ON_SUSPEND_APC = 0xD4, SUSPEND_SEMAPHORE = 0xFC;
 // X_KTHREAD_STATE_FLAGS
 constexpr uint8_t INITIALIZED = 0, READY = 1, RUNNING = 2, TERMINATED_STATE = 4, WAITING = 5;
 } // namespace kthread
@@ -142,6 +149,11 @@ constexpr uint32_t USE_ALTERNATIVE_STACK = 0x6C, STACK_BASE = 0x70, STACK_END = 
 constexpr uint32_t ALT_STACK_BASE = 0x78, ALT_STACK_END = 0x7C, PRCB_DATA = 0x100;
 constexpr uint32_t CURRENT_THREAD = 0x100, CURRENT_CPU = 0x10C, PROCESSOR_MASK = 0x110, DPC_ACTIVE = 0x150;
 constexpr uint32_t PRCB = 0x2A8, SIZE = 0x2D8;
+// the FPU and vector state owners (-1: none; a save area's address while the kernel's own use holds them), and the
+// KPRCB's queue of DPCs (a list head; the console's KeInsertQueueDpc links a DPC there)
+constexpr uint32_t FPU_OWNER = 0x10, VMX_OWNER = 0x14, DPC_QUEUE = PRCB_DATA + 0x48;
+// the byte of software interrupts requested (2: the DPC interrupt, which KfLowerIrql honors below DISPATCH_LEVEL)
+constexpr uint32_t SOFTWARE_INTERRUPT = 0x8;
 } // namespace kpcr
 
 // X_KPROCESS (0x60)
@@ -301,6 +313,7 @@ public:
 class Mutant : public Dispatcher {
 public:
     explicit Mutant(Objects &owner) : Dispatcher(owner, Type::Mutant) {}
+    ~Mutant() override; // off its owner's list (the guest's too) before the object goes
     bool signaled_for(const Thread &t) const override { return signal_state() > 0 || owner_thread == &t; }
     uint32_t acquire(Thread &t) override;
     void set_owner(Thread *t); // the guest's owner field too

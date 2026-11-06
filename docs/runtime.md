@@ -321,7 +321,20 @@ lists: what the game calls is what gets written next.
   refused and NtDuplicateObject leaves its output alone on failure;
   ObReferenceObjectByName answers OBJECT_NAME_INVALID to a name that is not
   rooted; ObIsTitleObject(0) is 0; KeSetAffinityThread of no thread is
-  INVALID_PARAMETER.
+  INVALID_PARAMETER. From the console's kernel with its init state built
+  (the oracle, third round): an affinity outside the six processors is
+  INVALID_PARAMETER; NtYieldExecution and a delay of zero answer 0x40000024
+  (STATUS_NO_YIELD_PERFORMED) when no other guest thread is ready, 0 when one
+  is (Xenia: 0), and RtlSleep counts it as a sleep done; a mutant is on its
+  owner's guest list of mutants (the KTHREAD's head, the mutant's +0x10 entry
+  put at the head, unlinked on release with its links left as they were);
+  KeWaitForMultipleObjects fills the wait blocks the caller gives (thread,
+  object, next block, key, type, as the console's loop does: a wait for any
+  stops before the first signaled object, the last block points to the first
+  when the wait is satisfied for all or goes on to block); a DPC that has run
+  is not inserted and its list entry points at the processor's DPC queue; the
+  FPU owner word (PCR +0x10) is -1 and KeSaveFloatingPointState answers the
+  previous owner, KeRestoreFloatingPointState puts -1 back; a timer whose due time has passed is signaled in the call that sets it.
 - **The debug monitor** (`xbdm.cpp`): Xenia's 36 xbdm exports, a retail
   console's answers (console type -1, no debugger, the end of the module
   list). The imports bind as the other system libraries', but no xbdm.xex
@@ -372,9 +385,12 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
   time base (mftb) is the same clock. The fiber scheduler replaces it.
 - **Safe points**: a thread suspended by another, or with kernel APCs
   queued, stops at its next kernel call (Xenia suspends the host thread
-  wherever it is). User APCs run in alertable waits; DPCs run at once on
-  the calling thread, as in Xenia, except those of timers (KeSetTimerEx),
-  which run on a kernel thread of their own. ExTerminateThread unwinds the host
+  wherever it is). User APCs run in alertable waits; DPCs run on the
+  calling thread as the IRQL falls below DISPATCH_LEVEL (at once from an
+  insert at IRQL 0, as in Xenia; one inserted at a raised IRQL waits on the
+  PRCB's queue in guest memory until KfLowerIrql or KfReleaseSpinLock lowers
+  it, as the console's), except those of timers (KeSetTimerEx), which run on
+  a kernel thread of their own. ExTerminateThread unwinds the host
   stack to the thread's start (a C++ exception).
 - `Kernel::launch` makes the main thread (the executable's stack size and
   TLS header) and starts it; `boot` waits for it and reports the threads.

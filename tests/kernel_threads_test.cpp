@@ -655,6 +655,74 @@ void apcs_and_dpcs(ppc::Context &c) {
     CHECK(ex(c, "KeInsertQueueDpc", {d, 1, 2}) == 1);
     CHECK(flag == 7);
     CHECK(K->load32(uint32_t(c.r[13]) + kpcr::DPC_ACTIVE) == 0);
+    // what the console's dispatch leaves in a DPC it has run (the kernel oracle): not inserted, its list entry still
+    // pointing at the processor's queue
+    uint32_t queue = uint32_t(c.r[13]) + kpcr::DPC_QUEUE;
+    CHECK(K->host(d)[kdpc::SELECTED_CPU] == 0 && K->load32(d + kdpc::LIST) == queue &&
+          K->load32(d + kdpc::LIST + 4) == queue);
+
+    // at DISPATCH_LEVEL a DPC waits for the IRQL to fall, and queued twice it is queued once, with the first
+    // arguments (the console's: KeInsertQueueDpc answers 0 for a DPC that is queued)
+    flag = 0;
+    ex(c, "KfRaiseIrql", {2});
+    CHECK(ex(c, "KeInsertQueueDpc", {d, 1, 2}) == 1);
+    CHECK(ex(c, "KeInsertQueueDpc", {d, 3, 4}) == 0);
+    CHECK(flag == 0 && K->host(d)[kdpc::SELECTED_CPU] != 0);
+    ex(c, "KfLowerIrql", {0});
+    CHECK(flag == 7 && K->host(d)[kdpc::SELECTED_CPU] == 0);
+    // queued and removed before the IRQL falls, it never runs
+    flag = 0;
+    ex(c, "KfRaiseIrql", {2});
+    CHECK(ex(c, "KeInsertQueueDpc", {d, 1, 2}) == 1 && ex(c, "KeRemoveQueueDpc", {d}) == 1);
+    ex(c, "KfLowerIrql", {0});
+    CHECK(flag == 0 && ex(c, "KeRemoveQueueDpc", {d}) == 0);
+
+    // a timer set for a time that has passed is signaled in the call (the console's insert finds it expired)
+    uint32_t timer = scratch + 0x6C0;
+    ex(c, "KeInitializeTimerEx", {timer, 0, 0});
+    CHECK(K->load32(timer + 4) == 0);
+    ex(c, "KeSetTimerEx", {timer, 0, 0, 0});
+    CHECK(K->load32(timer + 4) == 1);
+
+    // an owned mutant is on its owner's list in the guest, as the console keeps it, and off it once released (its
+    // own links stay)
+    uint32_t me_thread = K->load32(uint32_t(c.r[13]) + kpcr::CURRENT_THREAD), mu = scratch + 0x680;
+    ex(c, "KeInitializeMutant", {mu, 1});
+    CHECK(K->load32(me_thread + kthread::MUTANTS_LIST) == mu + kmutant::LIST &&
+          K->load32(mu + kmutant::OWNER) == me_thread);
+    CHECK(ex(c, "KeReleaseMutant", {mu, 1, 0, 0}) == 0);
+    CHECK(K->load32(me_thread + kthread::MUTANTS_LIST) == me_thread + kthread::MUTANTS_LIST);
+
+    // the wait blocks of a wait for several objects, filled as the console fills them: a wait for any stops at the
+    // first object that is signaled (its block and the ones after are left alone)
+    uint32_t ev1 = scratch + 0x700, ev2 = scratch + 0x720, objs = scratch + 0x740, blocks = scratch + 0x750,
+             zero = scratch + 0x790;
+    std::memset(K->host(scratch + 0x700), 0, 0xA0);
+    ex(c, "KeInitializeEvent", {ev1, 0, 0});
+    ex(c, "KeInitializeEvent", {ev2, 0, 1});
+    K->store32(objs, ev1), K->store32(objs + 4, ev2);
+    CHECK(ex(c, "KeWaitForMultipleObjects", {2, objs, 1, 0, 0, 0, zero, blocks}) == 1);
+    CHECK(K->load32(blocks + kwait_block::THREAD) == me_thread && K->load32(blocks + kwait_block::OBJECT) == ev1 &&
+          K->load32(blocks + kwait_block::NEXT) == blocks + kwait_block::SIZE &&
+          K->load16(blocks + kwait_block::KEY) == 0 && K->load16(blocks + kwait_block::TYPE) == 1);
+    CHECK(K->load32(blocks + kwait_block::SIZE + kwait_block::OBJECT) == 0);
+    // a wait for all that is satisfied closes the ring: the last block points to the first
+    ex(c, "KeSetEvent", {ev1, 0, 0});
+    CHECK(ex(c, "KeWaitForMultipleObjects", {2, objs, 0, 0, 0, 0, zero, blocks}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(blocks + kwait_block::SIZE + kwait_block::OBJECT) == ev2 &&
+          K->load32(blocks + kwait_block::SIZE + kwait_block::NEXT) == blocks);
+    CHECK(K->load32(me_thread + kthread::WAIT_BLOCKS) == blocks);
+
+    // an affinity with a processor that is not there is refused (the console wants the mask within the six)
+    CHECK(ex(c, "KeSetAffinityThread", {me_thread, 0x40, local(c, 0x38)}) == X_STATUS_INVALID_PARAMETER);
+
+    // the owner of the FPU state, as the console keeps it: none (-1) before a save, which answers the previous owner,
+    // and none again after the restore
+    CHECK(K->load32(uint32_t(c.r[13]) + kpcr::FPU_OWNER) == 0xFFFFFFFF);
+    CHECK(ex(c, "KeSaveFloatingPointState", {}) == 0xFFFFFFFF);
+    CHECK(K->load32(uint32_t(c.r[13]) + kpcr::FPU_OWNER) == uint32_t(c.r[13]) + 0x300);
+    ex(c, "KeRestoreFloatingPointState", {});
+    CHECK(K->load32(uint32_t(c.r[13]) + kpcr::FPU_OWNER) == 0xFFFFFFFF);
 }
 
 // ---- guest stacks on host fibers ----

@@ -56,7 +56,8 @@ uint32_t rtl_sleep(Kernel &k, ppc::Context &c, uint32_t ms, uint32_t alertable) 
     do {
         status = call_export(k, c, "xboxkrnl", "KeDelayExecutionThread", {USER_MODE, alertable, interval});
     } while (alertable && status == X_STATUS_ALERTED);
-    return status == X_STATUS_SUCCESS ? X_STATUS_SUCCESS : X_STATUS_USER_APC;
+    // (a delay of zero that had no other thread to give the slice to is the console's 0x40000024: still a sleep done)
+    return status == X_STATUS_SUCCESS || status == X_STATUS_NO_YIELD_PERFORMED ? X_STATUS_SUCCESS : X_STATUS_USER_APC;
 }
 
 // XapiFormatTimeOut: an NT relative timeout for ms milliseconds in the

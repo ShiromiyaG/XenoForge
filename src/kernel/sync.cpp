@@ -602,6 +602,9 @@ static uint32_t set_timer(Kernel &k, uint32_t timer, int64_t due, uint32_t perio
     k.store64(t->guest + ktimer::DUE_TIME, o.system_time_base + t->due);
     k.store32(t->guest + ktimer::PERIOD, period_ms);
     o.arm(*t);
+    // a due time that has passed is signaled in the call, as the console's insert finds it expired (the clock's thread
+    // would do it a moment later)
+    if (t->due <= o.scheduler->now()) o.on_clock();
     return was_set;
 }
 
@@ -651,6 +654,33 @@ XF_EXPORT(xboxkrnl, KeWaitForMultipleObjects) {
         refs.push_back(o.native(k.load32(objects_ptr + 4 * n)));
         if (!refs.back()) return result(c, X_STATUS_INVALID_PARAMETER);
         list.push_back(refs.back().get());
+    }
+    // The wait blocks the caller supplies, as the console fills them (KeWaitForMultipleObjects walks the objects and
+    // fills each one's block: the thread, the object, the next block, the key and the type); a wait for any stops at
+    // the first object that is signaled, before its block. Xenia leaves them alone.
+    // The last block points back to the first when the wait is satisfied for all or goes on to block; a wait that
+    // finds nothing and has a timeout of zero leaves it pointing past the array.
+    if (uint32_t blocks = arg(k, c, 7)) {
+        k.store32(t->kthread() + kthread::WAIT_BLOCKS, blocks);
+        bool any_signaled = false, all_signaled = true;
+        for (Dispatcher *d : list) {
+            bool signaled = d->signaled_for(*t);
+            any_signaled = any_signaled || signaled, all_signaled = all_signaled && signaled;
+        }
+        bool zero_timeout = timeout_ptr && k.load64(timeout_ptr) == 0;
+        bool circular = type == 0 ? (all_signaled || !zero_timeout) : (!any_signaled && !zero_timeout);
+        uint32_t filled = 0;
+        for (uint32_t n = 0; n < count; n++) {
+            if (type == 1 && list[n]->signaled_for(*t)) break;
+            uint32_t block = blocks + kwait_block::SIZE * n;
+            k.store32(block + kwait_block::THREAD, t->kthread());
+            k.store32(block + kwait_block::OBJECT, list[n]->guest);
+            k.store32(block + kwait_block::NEXT, block + kwait_block::SIZE);
+            k.store16(block + kwait_block::KEY, uint16_t(n));
+            k.store16(block + kwait_block::TYPE, uint16_t(type));
+            filled++;
+        }
+        if (circular && filled) k.store32(blocks + kwait_block::SIZE * (filled - 1) + kwait_block::NEXT, blocks);
     }
     result(c, finish_wait(o, *t, o.wait(*t, list, type == 0, alertable != 0, o.deadline(timeout_ptr))));
 }
