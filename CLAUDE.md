@@ -27,8 +27,11 @@ como referência: recompilador, kernel, GPU, som e input só do que os jogos ped
   `../external/xna/work/shaders` (10, de `tests/hlsl/`). Rodar: `XF_SHADERS=<pasta> build/shader_compare_test`.
   O `.defs` ao lado de cada shader traz as constantes literais do contêiner (o D3D as carrega com o shader).
 - **Renderizador (B3)**: `build/xfreplay <xtr> -o frame.png --compare <png do trace-dump> [--diff d.png] [-v]`;
-  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 11 frames batem com o Xenia).
+  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 17 frames batem com o Xenia).
   Saídas do replay em `../traces/replay/`. `XF_VK_VALIDATION=1` liga a validação do Vulkan.
+- **Traces das nossas execuções** (o oráculo sem jogar no Xenia): `boot_<jogo> <iso> --trace-frames N,M
+  --trace-dir <pasta>` (no player, `XF_TRACE_FRAMES`/`XF_TRACE_DIR`) grava `.xtr` no formato do Xenia; o
+  `xenia-gpu-vulkan-trace-dump.exe` desenha a referência. `--press botão@#swap` leva a qualquer cena.
 - **Som (A6)**: XMA pelo `xmaframes` do FFmpeg do Xenia (`ffmpeg-xma.dll`, LGPL). Regressão contra o Xenia:
   `XF_XMA_TRACES=../traces/xma build/xma_replay_test` (gravações com `XF_XMA_RECORD=<arquivo.xmar>`; o oráculo
   `xma_oracle` sai de `tools/xenia_oracle/build.bat xma`). `XF_AUDIO_WAV=<prefixo>` grava a mixagem para ouvir.

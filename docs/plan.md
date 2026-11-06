@@ -568,36 +568,45 @@ Retail games rarely call it.
 
 ### The GPU (B)
 
-**Under way:**
-- a GPU trace writer in Xenia's format, so any scene a run reaches can be
-  checked against Xenia's trace dump;
-- El Chavo Kart's colors past the menus.
+**In since 2026-11-05:**
+- the player presents on the GPU and keeps up with the guest;
+- the pipeline cache is on disk;
+- traces of live runs in Xenia's format, which Xenia's trace dump draws as
+  the reference for any scene a run reaches (renderer.md, "Traces of live
+  runs");
+- with those traces: gamma textures, signed and biased components, the
+  exponent adjust, the display's piecewise linear gamma, polygon offset,
+  alpha to coverage, pixel parameters, the LOD bias and gradient
+  exponents, the samplers' anisotropy, minimum mip, border colors and
+  mirror clamps, getCompTexLOD and getWeights. El Chavo Kart's menus,
+  park and race, Forza Horizon's and Sonic's frames match Xenia.
 
-The player presents on the GPU and keeps up with the guest, and the
-pipeline cache is on disk (both came in on 2026-11-05).
+**Next, from those traces:**
+- memexport: El Chavo Kart's kart is black in a race;
+- Red Dead Redemption's ground and buildings, textures it makes by
+  resolving 4x MSAA gamma targets to 4_4_4_4; and its renderer time, most
+  of it spent checking textures by hash;
+- BC2, Gears of War 3 and Reach, not traced yet.
 
 **Approximated** (drawn, but counted as not what the console does):
 - **Textures:**
-  - signed components;
-  - biased components;
-  - gamma textures read as linear;
-  - exponent adjust;
+  - signed components of formats with no signed view (5_6_5, 4_4_4_4,
+    DXT colors);
+  - YCbCr border colors;
+  - getWeights ignoring the LOD (as Xenia does);
   - formats sampled at 8 bits per component;
   - mip levels shorter than their size;
   - vertex fetches from a texture fetch constant;
   - an ALU operand from a fetch constant;
   - samplers past the bindless table.
 - **Output:**
-  - the display's piecewise linear gamma ramp;
-  - D24FS8 depth kept as 32-bit float;
+  - D24FS8 depth kept as 32-bit float (as Xenia does);
   - clears of some target formats;
   - float16 and float32 targets moved through EDRAM by value rather than
     by bits (NaN payloads).
 - **Rasterizer:**
-  - polygon offset;
   - polygon modes other than fill (wireframe, points);
-  - alpha to coverage;
-  - pixel parameter generation (point sprite coordinates).
+  - point sprite coordinates in the pixel parameters (zero).
 - **Resolves:**
   - resolves of one MSAA sample, which are averaged instead;
   - depth resolves of MSAA targets.
@@ -641,8 +650,8 @@ pipeline cache is on disk (both came in on 2026-11-05).
     Xenia does, instead of hashing at each use.
 - **Options:** resolution scale (B4), anisotropic filtering, frame pacing
   and vsync.
-- **The other six games:** none of them has been checked against Xenia
-  yet.
+- **The other six games:** Forza Horizon and Sonic match Xenia on the frames
+  traced; Red Dead Redemption does not yet; BC2, GoW3 and Reach are untraced.
 
 **Complete:**
 - the vertex formats: all 15 that Xenia knows;
