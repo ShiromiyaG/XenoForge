@@ -628,6 +628,8 @@ code. As built (`frontend/`):
   [input]    # keyboard (true), keyboard_user (0), left_deadzone, right_deadzone (0-1), vibration (true)
   [keyboard] # each pad control's keys (input.md)
   [player]   # screenshots: the folder F12 writes to
+  [launcher] # games: the folder the launcher lists
+  [games.4D5307E6.video] # a game's own settings (the launcher's), any of the four sections above
   ```
 
 For checks without a person at the screen: `--quit-after <seconds>`
@@ -702,6 +704,160 @@ logs in `../traces/player/`):
   things in the game (only their drivers' states and the scripted presses
   are checked here), that the sound is heard and sounds right, how the
   window feels resized, fullscreen and with vsync off.
+
+## The launcher
+
+Plan track C2 (2026-11-05, a first one), after the 3DS runtime's
+`frontend/launcher.cpp`, built as `launcher` beside the players (a window
+program on Windows: no console) and installed with them by `cmake
+--install`. What it does is `LauncherCore` (`launcher_core.h`), with no UI
+code: the games folder and its scan, a game's settings loaded, saved, made
+its own or shared again, the gamepads connected, a game started and polled
+until it ends. The view (`launcher.cpp`) is a form in Dear ImGui on SDL3's
+renderer for now; the emulator's UI is to be RmlUi drawn through
+XenoForge's Vulkan (the owner's decision, 2026-11-05), with Dear ImGui kept
+for the debugging tools, so the view is the part to be replaced.
+
+```
+launcher [--config <file>] [--games <folder>] [--list] [--select N] [--start N] [--player-arg <arg>]...
+    [--quit-after S] [--screenshot <png>]
+```
+
+- **The games** (`library.cpp`): the ISOs (and bare `default.xex` files) in
+  a folder the user picks (`launcher.games` in config.toml; the system's
+  folder dialog) and its subfolders one level down, read in place on a
+  thread of their own: the disc's `default.xex` parsed and unpacked for its
+  title ID, version and the digest of its image (`xf::image_digest`, what
+  generated code is tied to), and the title's name from the executable's
+  XDBF resource (the one named by its title ID: the string 0x8000 of the
+  English table, else of the XSTC's default language, as Xenia's
+  `GameInfoDatabase::GetTitleName` gives it on an English console). About a
+  second per disc (the executable decrypted and unpacked).
+- **Which player**: each `player` and `player_<game>` beside the launcher
+  is run once with `--identify` (no window, no console), which prints the
+  digest of every module whose generated code it carries; a game starts in
+  the player that carries its `default.xex`, else in the generic `player`,
+  which interprets (the list says which: "Runs in").
+- **Settings and controls**: the selected game's settings, edited in the
+  player's own config.toml and saved as they change: the video (fullscreen,
+  vsync, scaling, shape) and sound (volume, mute) of the player's overlay,
+  and the controls: the gamepads connected, vibration, the sticks'
+  deadzones, the keyboard as a controller (on or off, for which user) and
+  each of the 25 bindings (typed, or "Set" and the next key pressed;
+  "Xenia's keys" puts the defaults back). These are the shared settings
+  unless "Settings of its own for this game" is ticked: then a
+  `[games.<title ID>]` table holds the game's own copy of the video, audio,
+  input and keyboard sections, the player reads it over the shared ones for
+  that game (its title ID, once the disc is open) and its overlay saves
+  back into it. Unticked, the table is dropped.
+- **Start** (or a double click): the player as a process of its own on the
+  ISO, with no console, its working directory its own, its output and
+  errors in `logs/<title ID>.log` beside config.toml. The launcher stays
+  open; when the player ends, it shows the player's closing lines (how the
+  run ended, the frames, the sound) or, when there are none, the log's
+  last lines, and reads the settings again (the overlay may have changed
+  them). "Stop" ends the process.
+
+For checks without a person at the screen: `--list` prints the players
+(with how many modules each carries) and the folder's games (title ID,
+title, version, digest, the player each starts in), without a window;
+`--select N` selects a game, `--controls` opens its controls' tab,
+`--start N` starts it as
+the button does, `--player-arg` adds to the player's command line (e.g.
+`--quit-after 20`), `--quit-after S` closes the launcher after S seconds
+once a game it started has ended, printing how it ended, and `--screenshot`
+saves its window's last picture.
+
+Checked (2026-11-05): `--list` over `F:\RECOMPs` found the 9 discs in
+its subfolders (over `F:\RECOMPs\Chaves`, the extracted `assets\default.xex`
+too) with their names from the XDBF (BEN 10: VILGAX ATTACKS, El Chavo Kart, Battlefield Bad Co. 2, Forza
+Horizon, Gears of War 3, Halo: Reach, Red Dead Redemption, SONIC
+UNLEASHED), 0.1 to 1.7 s each; both El Chavo Kart discs matched
+`player_chaves` by digest, Ben 10 `player_ben10`, the rest the generic
+player. `--start` ran El Chavo Kart's USA disc in `player_chaves` with a
+`[games.475807D7]` table in the settings ("settings: ... (the game's own,
+475807D7)" in its log): 1153 swaps in 120 s, 1130 frames presented, 20,713
+sound frames played, 5,380 input states delivered, its screenshots and
+its closing lines shown in the launcher. The launcher's own pictures (the
+list, the controls' tab, a run's end) are saved by `--screenshot`. Once,
+after a two-minute run, that picture came out blank (the window's
+background alone); a three-second run's was whole. Left for a person:
+the folder dialog, typing and "Set" for the bindings, and how the form
+feels.
+
+Left out of this first launcher: the recompile step (below), port options,
+title updates and content packages, cover art.
+
+### The generated code without the source (design, not decided)
+
+Today a game's generated code reaches a player only through a build of
+XenoForge: `xfrecomp emit` writes C++ (El Chavo Kart: 291 files, 323 MB),
+CMake compiles it into `game_<name>.lib` (224 MB) and links it into
+`player_<game>`. Principle 5 rules out handing out that code or anything
+built from it: it is made on the user's machine from their disc. So
+whatever the shape, the user's machine runs `xfrecomp` and a C++ compiler
+on it, once per game and XenoForge version (minutes: the build's own time
+for El Chavo Kart is several minutes on 4 cores), and keeps the result in a
+cache beside config.toml. What the generated code needs is small:
+`ppc_generated.h` and the ops it includes (headers, inlined), the C++
+standard headers they use (`<atomic>`, `<cmath>`, `<cfenv>`, `<cstring>`,
+`<bit>`), and four functions of the runtime's (`dispatch`, `invalid`,
+`unwind`, which throws, and `switch_stack`) plus the module table
+(`xf_modules`).
+
+1. **A game library loaded by the generic player.** The launcher emits and
+   compiles the code into `games/<title ID>-<digest>.dll`; the player
+   (the one shipped) loads the library whose digest matches each module as
+   it loads (the executable, and DLLs through `XexLoadImage`), and runs
+   interpreted where none does. Needs: a stable boundary between player
+   and library: a C table each way (the library's `xf_modules`; the
+   player's four functions and anything the ops call out of line), with a
+   version number the player checks, since a library is only good for the
+   XenoForge version whose headers built it (a new player rebuilds the
+   cache). The `unwind` throw crosses the boundary: on Windows x64 an
+   exception unwinds through any frame with unwind tables (clang always
+   emits them), but which C++ runtime the library may use has to match the
+   player's, or the library must use none (below). Fits the plan's split
+   of a game library and a port library (hooks bind by guest address,
+   so a port can rebuild and reload alone), and the owner's goal as
+   revised on 2026-11-05: one generic player, the game's library cached.
+   One player to ship and update; each game is just its code.
+2. **A per-game executable built by the launcher.** The launcher compiles
+   the code and links it with the player's own static libraries (shipped
+   for this: XenoForge's core, kernel, renderer and frontend, SDL3, Dear
+   ImGui, toml++), giving today's `player_<game>`. No boundary to keep
+   stable inside a build, but every player update relinks every game, the
+   libraries ship with the launcher (tens of MB), and the link needs the
+   whole C and C++ runtime the libraries were built against: with the
+   MSVC ABI that is the Visual Studio build tools and the Windows SDK,
+   which cannot be redistributed, so the user installs them (several GB),
+   or everything is built with a redistributable toolchain (llvm-mingw)
+   instead.
+3. **Something else.**
+   - *A freestanding library* (a variant of 1 that decides the toolchain):
+     the generated code compiled against XenoForge's headers alone, with
+     the few standard pieces it uses provided as compiler builtins
+     (`__builtin_memcpy`, `__builtin_sqrt`, the atomics) and the rounding
+     mode through the player's table, linked `-nostdlib` with no imports
+     but that table. Then the bundled toolchain is `clang` and `lld` alone
+     (redistributable, Apache 2.0 with LLVM's exception; about 150 MB),
+     no SDK, no CRT, and any player build loads it. The ops' headers have
+     to stay free of the standard library for this; to be measured (the
+     exception crossing frames with no runtime of their own included).
+   - *Ask the user for a toolchain* (rexglue's way: Visual Studio or the
+     build tools, CMake): no bundle, but a heavy first step for a player.
+   - *An embedded compiler* (LLVM's ORC JIT or clang as a library inside
+     the launcher): no external tools, but LLVM linked in (a larger
+     launcher than a bundled clang) and its own build to maintain.
+   - *An object-code back end in `xfrecomp`* (emitting x86-64 directly):
+     no compiler at all and fast installs, but it gives up clang's
+     optimizer and is a project of its own.
+
+What each needs from the launcher is the same: a step that runs
+`xfrecomp emit` (in process: it is XenoForge's own code), runs the
+compiler with progress and a cancel button, and caches the result by title
+ID and digest; and from the player, today's `--identify` turned into
+"which digests have a library in the cache".
 
 ## Order
 

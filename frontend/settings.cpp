@@ -57,21 +57,14 @@ std::filesystem::path default_path() {
 }
 
 namespace {
+
 template <typename T> void get(const toml::table &t, const char *section, const char *key, T &into) {
     if (auto v = t[section][key].value<T>()) into = *v;
 }
-} // namespace
 
-bool load(const std::filesystem::path &path, Settings &s, std::string &error) {
-    std::error_code ec;
-    if (!std::filesystem::exists(path, ec)) return true;
-    toml::table t;
-    try {
-        t = toml::parse_file(path.u8string());
-    } catch (const toml::parse_error &e) {
-        error = std::string(e.description());
-        return false;
-    }
+// the sections a game may have of its own, read from the file's root or from
+// a game's table
+void read_sections(const toml::table &t, Settings &s) {
     get(t, "video", "fullscreen", s.video.fullscreen);
     get(t, "video", "vsync", s.video.vsync);
     get(t, "video", "smooth", s.video.smooth);
@@ -93,33 +86,99 @@ bool load(const std::filesystem::path &path, Settings &s, std::string &error) {
         for (auto &[key, value] : *table)
             if (auto v = value.value<std::string>(); v && s.keys.count(std::string(key.str())))
                 s.keys[std::string(key.str())] = *v;
-    get(t, "player", "screenshots", s.screenshots);
-    return true;
 }
 
-bool save(const std::filesystem::path &path, const Settings &s, std::string &error) {
+void write_sections(toml::table &t, const Settings &s) {
     toml::table keys;
     for (const Binding &b : BINDINGS) keys.insert(b.name, s.keys.at(b.name));
-    toml::table t{
-        {"video", toml::table{{"fullscreen", s.video.fullscreen},
-                              {"vsync", s.video.vsync},
-                              {"smooth", s.video.smooth},
-                              {"aspect", s.video.aspect}}},
-        {"audio", toml::table{{"volume", s.audio.volume}, {"mute", s.audio.mute}}},
-        {"input", toml::table{{"keyboard", s.input.keyboard},
-                              {"keyboard_user", s.input.keyboard_user},
-                              {"left_deadzone", s.input.left_deadzone},
-                              {"right_deadzone", s.input.right_deadzone},
-                              {"vibration", s.input.vibration}}},
-        {"keyboard", keys},
-        {"player", toml::table{{"screenshots", s.screenshots}}},
-    };
+    t.insert_or_assign("video", toml::table{{"fullscreen", s.video.fullscreen},
+                                            {"vsync", s.video.vsync},
+                                            {"smooth", s.video.smooth},
+                                            {"aspect", s.video.aspect}});
+    t.insert_or_assign("audio", toml::table{{"volume", s.audio.volume}, {"mute", s.audio.mute}});
+    t.insert_or_assign("input", toml::table{{"keyboard", s.input.keyboard},
+                                            {"keyboard_user", s.input.keyboard_user},
+                                            {"left_deadzone", s.input.left_deadzone},
+                                            {"right_deadzone", s.input.right_deadzone},
+                                            {"vibration", s.input.vibration}});
+    t.insert_or_assign("keyboard", std::move(keys));
+}
+
+// the file as it is, or an empty table when it is missing or does not parse
+// (then it is written anew)
+toml::table read_file(const std::filesystem::path &path) {
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return {};
+    try {
+        return toml::parse_file(path.u8string());
+    } catch (const toml::parse_error &) {
+        return {};
+    }
+}
+
+bool write_file(const std::filesystem::path &path, const toml::table &t, std::string &error) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     std::ofstream out(path);
     if (!out) return error = "cannot write " + path.string(), false;
     out << "# XenoForge's player (docs/runtime.md, \"The player\"; docs/input.md for the keyboard)\n" << t << "\n";
+    return out.good() || (error = "cannot write " + path.string(), false);
+}
+
+} // namespace
+
+bool load(const std::filesystem::path &path, Settings &s, std::string &error, const std::string &title) {
+    s.game.clear();
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return true;
+    toml::table t;
+    try {
+        t = toml::parse_file(path.u8string());
+    } catch (const toml::parse_error &e) {
+        error = std::string(e.description());
+        return false;
+    }
+    read_sections(t, s);
+    get(t, "player", "screenshots", s.screenshots);
+    get(t, "launcher", "games", s.launcher.games);
+    if (!title.empty())
+        if (const toml::table *own = t["games"][title].as_table()) {
+            read_sections(*own, s);
+            s.game = title;
+        }
     return true;
+}
+
+bool save(const std::filesystem::path &path, const Settings &s, std::string &error) {
+    toml::table t = read_file(path);
+    if (s.game.empty()) {
+        write_sections(t, s);
+        t.insert_or_assign("player", toml::table{{"screenshots", s.screenshots}});
+        t.insert_or_assign("launcher", toml::table{{"games", s.launcher.games}});
+    } else {
+        // a new file gets the shared defaults beside the game's, so it has
+        // the whole set to edit
+        if (!t.contains("video")) {
+            Settings shared;
+            write_sections(t, shared);
+            t.insert_or_assign("player", toml::table{{"screenshots", s.screenshots}});
+            t.insert_or_assign("launcher", toml::table{{"games", s.launcher.games}});
+        }
+        if (!t["games"].as_table()) t.insert_or_assign("games", toml::table{});
+        toml::table own;
+        write_sections(own, s);
+        t["games"].as_table()->insert_or_assign(s.game, std::move(own));
+    }
+    return write_file(path, t, error);
+}
+
+bool forget_game(const std::filesystem::path &path, const std::string &title, std::string &error) {
+    toml::table t = read_file(path);
+    toml::table *games = t["games"].as_table();
+    if (!games || !games->contains(title)) return true;
+    games->erase(title);
+    if (games->empty()) t.erase("games");
+    return write_file(path, t, error);
 }
 
 } // namespace xf::frontend

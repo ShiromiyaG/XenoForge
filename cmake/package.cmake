@@ -7,6 +7,7 @@
 #
 # What goes in:
 #   player.exe                   XenoForge (MIT); player_<game>.exe only with XF_PACKAGE_GAME_PLAYERS
+#   launcher.exe                 XenoForge (MIT): the games, their settings, each started in its player
 #   ffmpeg-xma.dll               FFmpeg (LGPL 2.1 or later), loaded at run time, replaceable
 #   LICENSE                      XenoForge's (MIT)
 #   LICENSE-ffmpeg               which FFmpeg, and the LGPL 2.1's text
@@ -27,9 +28,9 @@ set(XF_PACKAGE_DIR "${CMAKE_BINARY_DIR}/xenoforge-player")
 # which runs any game interpreted, unless XF_PACKAGE_GAME_PLAYERS asks for the
 # game players too, for a folder that stays on the machine that built them.
 option(XF_PACKAGE_GAME_PLAYERS "install player_<game> too (game code: never to distribute)" OFF)
-set(_installed player)
+set(_installed player launcher)
 if(XF_PACKAGE_GAME_PLAYERS)
-    set(_installed ${XF_PLAYERS})
+    set(_installed ${XF_PLAYERS} launcher)
 endif()
 install(TARGETS ${_installed} RUNTIME DESTINATION .)
 install(FILES ${CMAKE_SOURCE_DIR}/LICENSE ${CMAKE_SOURCE_DIR}/LICENSE-xenia ${CMAKE_SOURCE_DIR}/LICENSE-rexglue

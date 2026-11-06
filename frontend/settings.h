@@ -3,6 +3,13 @@
 // the keyboard's bindings. The overlay changes what can change live and the
 // file is saved when it closes; a missing file is written with the defaults,
 // so there is one to edit.
+//
+// A game may have settings of its own: a [games."<title ID>"] table in the
+// same file holding the video, audio, input and keyboard sections, read over
+// the shared ones for that game. The launcher makes and edits them; the
+// player reads them for the game it runs and saves its overlay's changes
+// back where they came from. The launcher's own section (the games folder)
+// is shared only.
 
 #pragma once
 
@@ -51,14 +58,27 @@ struct Settings {
     // where F12 and the overlay's button put screenshots ("" for the
     // screenshots folder beside the config file)
     std::string screenshots;
+    struct {
+        std::string games; // the folder the launcher lists the games of
+    } launcher;
+    // the title ID ("4D5307E6") whose own settings these are, or "" for the
+    // shared ones: where save() writes them
+    std::string game;
 
     Settings(); // Xenia's default bindings
 };
 
 // SDL's preference folder's xenoforge\config.toml
 std::filesystem::path default_path();
-// a missing file gives the defaults; false and why for one that does not parse
-bool load(const std::filesystem::path &path, Settings &settings, std::string &error);
+// A missing file gives the defaults; false and why for one that does not
+// parse. With a title ID, that game's own settings over the shared ones
+// (settings.game is the title ID when the game has a table, else "").
+bool load(const std::filesystem::path &path, Settings &settings, std::string &error, const std::string &title = {});
+// Written as the shared settings, or as settings.game's own when it is set;
+// the rest of the file (the other games' tables, the shared settings when a
+// game's are written) is kept.
 bool save(const std::filesystem::path &path, const Settings &settings, std::string &error);
+// A game's own settings dropped: it goes back to the shared ones.
+bool forget_game(const std::filesystem::path &path, const std::string &title, std::string &error);
 
 } // namespace xf::frontend

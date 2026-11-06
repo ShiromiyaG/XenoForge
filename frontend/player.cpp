@@ -22,11 +22,14 @@
 // --press start@40 (repeatable; tools/game.h) holds buttons on user 0's
 // controller at times on the scheduler's clock; --overlay opens the overlay
 // from the start; --rates prints a line a second (boot's, with the frames
-// handed over and presented and the sound frames sent).
+// handed over and presented and the sound frames sent). --identify alone
+// prints the modules whose generated code the player carries (the launcher
+// asks it, frontend/library.h).
 //
 //   player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] [--steps N]
 //        [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] [--press <b@s>]...
 //        [--no-sound] [--overlay] [--rates]
+//   player[_<game>] --identify
 
 #include "presenter.h"
 #include "sdl_audio.h"
@@ -52,6 +55,13 @@
 #include <mutex>
 #include <string>
 #include <vector>
+
+#ifdef XF_GENERATED
+#include "xenoforge/ppc_module.h"
+// the game library's tables, one per module (xfrecomp emit's modules.cpp)
+extern "C" const xf::ppc::GeneratedModule *const xf_modules[];
+extern "C" const size_t xf_module_count;
+#endif
 
 using namespace xf;
 using Clock = std::chrono::steady_clock;
@@ -120,6 +130,17 @@ int main(int argc, char **argv) {
                         "[--steps N] [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] "
                         "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay] [--rates]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
+    if (std::string(argv[1]) == "--identify") {
+        // for the launcher (library.h): the modules whose generated code
+        // this player carries, by the digest of the image each was made
+        // from; the generic player carries none
+        std::printf("player\n");
+#ifdef XF_GENERATED
+        for (size_t i = 0; i < xf_module_count; i++)
+            std::printf("module %016llx %s\n", (unsigned long long)xf_modules[i]->digest, xf_modules[i]->name);
+#endif
+        return 0;
+    }
     game::Options o;
     o.input = argv[1];
     std::error_code ec;
@@ -163,25 +184,26 @@ int main(int argc, char **argv) {
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | (sound_wanted ? SDL_INIT_AUDIO : 0)))
         return fail(std::string("SDL: ") + SDL_GetError());
-    // the settings, written with the defaults the first time so there is a
-    // file to edit
-    frontend::Settings settings;
-    if (config_file.empty()) config_file = frontend::default_path();
-    std::string error;
-    if (!frontend::load(config_file, settings, error))
-        std::fprintf(stderr, "%s: %s (the defaults instead)\n", config_file.string().c_str(), error.c_str());
-    else if (!std::filesystem::exists(config_file, ec) && !frontend::save(config_file, settings, error))
-        std::fprintf(stderr, "%s\n", error.c_str());
-    std::printf("settings: %s\n", config_file.string().c_str());
-    std::filesystem::path key_shots =
-        settings.screenshots.empty() ? config_file.parent_path() / "screenshots" : settings.screenshots;
-
     // the game, opened as boot opens it
+    std::string error;
     game::Game g;
     if (!game::open(o, g, error)) return fail(error);
     kernel::Kernel &k = *g.kernel;
     char title_id[16];
     std::snprintf(title_id, sizeof(title_id), "%08X", g.xex.execution.title_id);
+
+    // the settings (the game's own when it has them), written with the
+    // defaults the first time so there is a file to edit
+    frontend::Settings settings;
+    if (config_file.empty()) config_file = frontend::default_path();
+    if (!frontend::load(config_file, settings, error, title_id))
+        std::fprintf(stderr, "%s: %s (the defaults instead)\n", config_file.string().c_str(), error.c_str());
+    else if (!std::filesystem::exists(config_file, ec) && !frontend::save(config_file, settings, error))
+        std::fprintf(stderr, "%s\n", error.c_str());
+    std::printf("settings: %s%s\n", config_file.string().c_str(),
+                settings.game.empty() ? "" : (std::string(" (the game's own, ") + title_id + ")").c_str());
+    std::filesystem::path key_shots =
+        settings.screenshots.empty() ? config_file.parent_path() / "screenshots" : settings.screenshots;
 
     SDL_Window *window = SDL_CreateWindow((std::string("XenoForge - ") + title_id).c_str(), 1280, 720,
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);

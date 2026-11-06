@@ -517,6 +517,13 @@ traces, without a recompiled game.
   to confirm that a pad moves things and that sound is heard (PCM frames
   reach the device; XMA is decoded since A6).
 - **C2. The launcher** (ISO, recompile, settings, controls, port options).
+  A first one in, 2026-11-05 ([runtime.md](runtime.md), "The launcher"):
+  the ISOs in a folder read in place (title, title ID, digest), each
+  game's settings and controls in config.toml (shared, or a game's own
+  table the player reads for it), and each started in the player beside it
+  that carries its code (`--identify`), else the generic one. The
+  recompile step is not built; its candidates are weighed there ("The
+  generated code without the source"). Its view is Dear ImGui for now, over LauncherCore; the RmlUi view is next.
   It becomes the emulator's front door (D2).
 
 **Track D: the AoT emulator** (goal of 2026-11-05)

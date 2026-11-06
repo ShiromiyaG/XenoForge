@@ -239,6 +239,7 @@ if(XF_PLAYER AND TARGET boot)
         ${imgui_SOURCE_DIR}/imgui_tables.cpp
         ${imgui_SOURCE_DIR}/imgui_widgets.cpp
         ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
         ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
     target_include_directories(xf_imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
     target_link_libraries(xf_imgui PUBLIC SDL3::SDL3-static Vulkan::Vulkan)
@@ -253,7 +254,8 @@ if(XF_PLAYER AND TARGET boot)
         DEPENDS frontend/front_buffer.comp
         COMMENT "glslc front_buffer.comp")
     add_library(xf_frontend STATIC frontend/settings.cpp frontend/presenter.cpp frontend/sdl_input.cpp
-                                   frontend/sdl_audio.cpp ${XF_SHADER_OUT}/front_buffer.comp.inc)
+                                   frontend/sdl_audio.cpp frontend/library.cpp frontend/launcher_core.cpp
+                                   ${XF_SHADER_OUT}/front_buffer.comp.inc)
     target_include_directories(xf_frontend PRIVATE ${XF_SHADER_OUT})
     target_link_libraries(xf_frontend PUBLIC xenoforge xenoforge_vk SDL3::SDL3-static Vulkan::Vulkan
                                              tomlplusplus::tomlplusplus)
@@ -274,6 +276,12 @@ if(XF_PLAYER AND TARGET boot)
             target_compile_options(${target} PRIVATE -Wno-missing-field-initializers)
         endif()
     endforeach()
+    # the launcher (track C2; docs/runtime.md, "The launcher"): the games in a
+    # folder, their settings and controls, and each started in the player
+    # beside it that carries its code; a window program, its form drawn by
+    # SDL's renderer
+    add_executable(launcher WIN32 frontend/launcher.cpp)
+    target_link_libraries(launcher PRIVATE xf_frontend xf_imgui stb)
     # the settings file, the sound's fold to stereo, the scripted presses
     add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
     target_link_libraries(frontend_test PRIVATE xf_frontend xenoforge_kernel xenoforge_vk)
