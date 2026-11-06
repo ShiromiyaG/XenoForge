@@ -76,6 +76,13 @@ public:
     bool geometry_shader() const { return geometry_shader_; }
     // tessellation control and evaluation shaders (the guest's tessellator)
     bool tessellation_shader() const { return tessellation_shader_; }
+    // clip and cull distances in the shaders (the guest's user clip planes)
+    bool clip_distance() const { return clip_distance_; }
+    bool cull_distance() const { return cull_distance_; }
+    // lines wider than a pixel, and the widths the device draws
+    bool wide_lines() const { return wide_lines_; }
+    float min_line_width() const { return wide_lines_ ? line_width_range_[0] : 1.0f; }
+    float max_line_width() const { return wide_lines_ ? line_width_range_[1] : 1.0f; }
 
     // host-visible and coherent (mapped), or device-local; host_reads: the
     // host reads it back, so cached memory where the device has it
@@ -115,6 +122,8 @@ private:
     bool precise_occlusion_ = false;
     bool geometry_shader_ = false;
     bool tessellation_shader_ = false;
+    bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false;
+    float line_width_range_[2] = {1.0f, 1.0f};
     std::mutex queue_mutex_;
 };
 

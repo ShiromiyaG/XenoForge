@@ -96,7 +96,7 @@ class Presenter {
         VkImageView front = VK_NULL_HANDLE;   // the renderer's image, until the conversion is done
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkDescriptorSet set = VK_NULL_HANDLE;
-        vk::Buffer ramp;      // the gamma ramp (256 words)
+        vk::Buffer ramp;      // the gamma ramps: the table (256 words), then the piecewise linear one (384)
         vk::Buffer copy;      // the picture copied back, when captured
         bool copying = false; // a capture not handed over yet (the picture is kept until it is)
         uint64_t swap = 0;

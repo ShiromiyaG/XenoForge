@@ -37,6 +37,7 @@
 
 #include <GLSL.std.450.h>
 
+#include <algorithm>
 #include <array>
 #include <cfloat>
 #include <cmath>
@@ -57,9 +58,9 @@ static_assert(OUT_MISC + 1 == OUTPUT_VEC4S);
 
 class Translator {
 public:
-    Translator(const ParsedShader &shader, Stage stage, const VertexOptions &vertex)
-        : s_(shader), stage_(stage), vertex_(vertex) {}
-    Translation run();
+  Translator(const ParsedShader &shader, Stage stage, const VertexOptions &vertex, const PixelOptions &pixel)
+      : s_(shader), stage_(stage), vertex_(vertex), pixel_(pixel) {}
+  Translation run();
 
 private:
     // --- values -----------------------------------------------------------
@@ -258,8 +259,10 @@ private:
     const ParsedShader &s_;
     Stage stage_;
     VertexOptions vertex_;
+    PixelOptions pixel_;
     spirv::Module m_;
     std::vector<std::string> unsupported_;
+    std::vector<std::string> approximate_; // Translation::approximate
     std::vector<Id> interface_;
 
     Id void_ = 0, bool_ = 0, int_ = 0, uint_ = 0, float_ = 0, vec2_ = 0, vec4_ = 0, uvec4_ = 0, bvec4_ = 0;
@@ -358,9 +361,11 @@ void Translator::declare() {
         // alpha test's reference, y and z: the point
         // diameter's bounds), the color targets' scales and the point
         // constants (renderer.cpp's System, point_list.geom), then per fetch
-        // slot its texture's signs and the signed view's image and sampler
+        // slot its texture's signs and the signed view's image and sampler,
+        // then the user clip planes enabled, packed (VertexOptions)
         Id slot_table = m_.type_array(uvec4_, 8, 16);
-        const Id system_members[] = {vec4_, vec4_, slot_table, uvec4_, vec4_, vec4_, vec4_, slot_table, slot_table};
+        const Id system_members[] = {vec4_, vec4_, slot_table, uvec4_,     vec4_,
+                                     vec4_, vec4_, slot_table, slot_table, m_.type_array(vec4_, 6, 16)};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
@@ -372,6 +377,7 @@ void Translator::declare() {
         m_.member_decorate(system_block, 6, spv::Decoration::Offset, {208});
         m_.member_decorate(system_block, 7, spv::Decoration::Offset, {224});
         m_.member_decorate(system_block, 8, spv::Decoration::Offset, {352});
+        m_.member_decorate(system_block, 9, spv::Decoration::Offset, {480});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -1226,6 +1232,23 @@ void Translator::texture_fetch(const TextureFetchInstruction &t) {
         else body();
         return;
     }
+    // getBCF, the fraction of the border color the fetch would blend in
+    // (Microsoft's docs: ucode.h's link): Xenia's translators make it a
+    // translation error that is not fatal and store 0 (its TODO: sample a
+    // black texture with a white border), so 0 here, as Xenia draws it
+    if (t.opcode == FetchOpcode::GetTextureBorderColorFrac) {
+        if (!t.has_result()) return;
+        approximate_.push_back("getBCF answered 0 (as Xenia)");
+        auto zero = [&] {
+            store_result(t.result, zero4_);
+            return false;
+        };
+        if (t.is_predicated)
+            when(predicate_is(t.predicate_condition), zero);
+        else
+            zero();
+        return;
+    }
     // getCompTexLOD and getWeights on the host's images only (the harness
     // has none)
     bool lod_query = t.opcode == FetchOpcode::GetTextureComputedLod && stage_ != Stage::Harness;
@@ -1880,13 +1903,46 @@ void Translator::main_vertex() {
                     for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
                         writes_point_size |=
                             r->target == StorageTarget::PointSizeEdgeFlagKillVertex && (r->used_write_mask() & 1);
+    // User clip planes (VertexOptions): which distances go to the clip and
+    // cull distances. A vertex's own (a point's corners'), or a point's
+    // center's; with ps_ucp_mode 2 the center's cull and the corners' clip,
+    // the corners' alone where both would pass the 8 clip and cull distances
+    // every Vulkan device has.
+    const uint32_t planes = std::min<uint32_t>(vertex_.clip_planes, 6);
+    const bool cull_only = vertex_.clip_planes_cull;
+    const uint32_t ucp_mode = vertex_.point_ucp_mode & 3;
+    bool center_to_clip = false, center_to_cull = false, own_to_clip = false, own_to_cull = false;
+    if (planes) {
+        if (!points || ucp_mode == 3) {
+            (cull_only ? own_to_cull : own_to_clip) = true;
+        } else if (ucp_mode <= 1) {
+            (cull_only ? center_to_cull : center_to_clip) = true;
+        } else {
+            center_to_cull = cull_only || planes <= 4;
+            own_to_clip = !cull_only;
+        }
+    }
+    Id clip_distances = 0, cull_distances = 0;
+    if (center_to_clip || own_to_clip) {
+        m_.capability(spv::Capability::ClipDistance);
+        clip_distances = global(m_.type_array(float_, planes), spv::StorageClass::Output, "clip_distances");
+        m_.decorate(clip_distances, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::ClipDistance)});
+    }
+    if (center_to_cull || own_to_cull) {
+        m_.capability(spv::Capability::CullDistance);
+        cull_distances = global(m_.type_array(float_, planes), spv::StorageClass::Output, "cull_distances");
+        m_.decorate(cull_distances, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::CullDistance)});
+    }
     // a rectangle's three guest vertices, run one after another: their host
-    // positions and interpolators
-    Id rectangle_positions = 0, rectangle_interpolators = 0;
+    // positions and interpolators, and their guest positions for the planes
+    Id rectangle_positions = 0, rectangle_interpolators = 0, rectangle_guest_positions = 0;
     if (rectangles) {
         rectangle_positions = global(m_.type_array(vec4_, 3), spv::StorageClass::Private, "rectangle_positions");
         rectangle_interpolators =
             global(m_.type_array(vec4_, 48), spv::StorageClass::Private, "rectangle_interpolators");
+        if (planes)
+            rectangle_guest_positions =
+                global(m_.type_array(vec4_, 3), spv::StorageClass::Private, "rectangle_guest_positions");
     }
 
     Id main = m_.begin_function(void_, m_.type_function(void_, {}));
@@ -1917,9 +1973,7 @@ void Translator::main_vertex() {
     // Xenia's CompleteVertexOrTessEvalShaderInMain: W given as 1/W unless bit
     // 0, XY divided by W with bit 1, Z with bit 2. Then to Vulkan's clip
     // space: xyz * ndc_scale + ndc_offset * w.
-    auto host_position = [&]() {
-        Id scale = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(0)}));
-        Id offset = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(1)}));
+    auto guest_position = [&]() {
         Id flags = m_.op(Op::OpCompositeExtract, uint_,
                          {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
                                              {system_, u(3)})),
@@ -1933,10 +1987,26 @@ void Translator::main_vertex() {
         Id x = select(float_, flag(2), exact(Op::OpFMul, float_, {comp(p, 0), w}), comp(p, 0));
         Id y = select(float_, flag(2), exact(Op::OpFMul, float_, {comp(p, 1), w}), comp(p, 1));
         Id z = select(float_, flag(4), exact(Op::OpFMul, float_, {comp(p, 2), w}), comp(p, 2));
-        Id xyzw = vec4_of(x, y, z, w);
+        return vec4_of(x, y, z, w);
+    };
+    auto to_host = [&](Id xyzw) {
+        Id scale = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(0)}));
+        Id offset = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(1)}));
+        Id w = comp(xyzw, 3);
         Id moved = exact(Op::OpFAdd, vec4_,
                          {exact(Op::OpFMul, vec4_, {xyzw, scale}), exact(Op::OpVectorTimesScalar, vec4_, {offset, w})});
         return vec4_of(comp(moved, 0), comp(moved, 1), comp(moved, 2), w);
+    };
+    // The guest position's distance to each enabled user clip plane (system
+    // member 9), as Xenia's dp4, into a clip or cull distance array.
+    auto put_distances = [&](Id array, Id xyzw) {
+        if (!array) return;
+        Id ptr_out_float = m_.type_pointer(spv::StorageClass::Output, float_);
+        for (uint32_t k = 0; k < planes; k++) {
+            Id plane = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(9), u(k)}));
+            store(m_.op(Op::OpAccessChain, ptr_out_float, {array, i(int32_t(k))}),
+                  m_.op(Op::OpDot, float_, {xyzw, plane}));
+        }
     };
     // oPts.x clamped to PA_SU_POINT_MINMAX (system values' y and z) as Xenia
     // does, like signed integers (-NaN and negatives to the minimum, NaN to
@@ -1967,7 +2037,10 @@ void Translator::main_vertex() {
             if (export_allowed_) store(export_allowed_, m_.op(Op::OpIEqual, bool_, {corner, u(k)}));
             Id index = m_.op(Op::OpCompositeExtract, uint_, {indices, k});
             run_guest(vec4_of(m_.op(Op::OpConvertUToF, float_, {index}), f(0), f(0), f(0)), 0);
-            store(m_.op(Op::OpAccessChain, ptr_private_vec4, {rectangle_positions, i(int32_t(k))}), host_position());
+            Id guest = guest_position();
+            store(m_.op(Op::OpAccessChain, ptr_private_vec4, {rectangle_positions, i(int32_t(k))}), to_host(guest));
+            if (rectangle_guest_positions)
+                store(m_.op(Op::OpAccessChain, ptr_private_vec4, {rectangle_guest_positions, i(int32_t(k))}), guest);
             for (uint32_t j = 0; j < 16; j++)
                 store(m_.op(Op::OpAccessChain, ptr_private_vec4, {rectangle_interpolators, i(int32_t(k * 16 + j))}),
                       load(vec4_, interpolator(j)));
@@ -2001,6 +2074,13 @@ void Translator::main_vertex() {
             return select(vec4_, fourth, mirrored, at(chosen));
         };
         store(position, pick(rectangle_positions, 0));
+        if (rectangle_guest_positions) {
+            // the corner's guest position, made as its host one: distances
+            // mirrored as the position is
+            Id guest = pick(rectangle_guest_positions, 0);
+            put_distances(clip_distances, guest);
+            put_distances(cull_distances, guest);
+        }
         for (uint32_t j = 0; j < 16; j++)
             store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(j))}),
                   pick(rectangle_interpolators, j + 1));
@@ -2049,7 +2129,8 @@ void Translator::main_vertex() {
             r0 = vec4_of(value, f(0), f(0), f(0));
         }
         run_guest(r0, r1);
-        Id p = host_position();
+        Id guest = guest_position();
+        Id p = to_host(guest);
         Id size = guest_point_size();
         if (points) {
             // The sprite, as Xenia's vertex shader expansion makes it
@@ -2074,6 +2155,31 @@ void Translator::main_vertex() {
             Id y = exact(Op::OpFAdd, float_,
                          {comp(p, 1), select(float_, side(1), ry, exact(Op::OpFNegate, float_, {ry}))});
             p = vec4_of(x, y, comp(p, 2), w);
+            if (planes) {
+                // the center's distances, and the corner's: its offset from
+                // the center taken back to the guest's clip space through the
+                // NDC scale (0 where the scale is)
+                put_distances(center_to_clip ? clip_distances : 0, guest);
+                put_distances(center_to_cull ? cull_distances : 0, guest);
+                if (own_to_clip || own_to_cull) {
+                    Id scale = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(0)}));
+                    auto guest_offset = [&](Id host_offset, uint32_t c) {
+                        Id s = comp(scale, c);
+                        return select(float_, m_.op(Op::OpFOrdEqual, bool_, {s, f(0)}), f(0),
+                                      exact(Op::OpFDiv, float_, {host_offset, s}));
+                    };
+                    Id dx = guest_offset(select(float_, side(2), rx, exact(Op::OpFNegate, float_, {rx})), 0);
+                    Id dy = guest_offset(select(float_, side(1), ry, exact(Op::OpFNegate, float_, {ry})), 1);
+                    Id corner_guest =
+                        vec4_of(exact(Op::OpFAdd, float_, {comp(guest, 0), dx}),
+                                exact(Op::OpFAdd, float_, {comp(guest, 1), dy}), comp(guest, 2), comp(guest, 3));
+                    put_distances(own_to_clip ? clip_distances : 0, corner_guest);
+                    put_distances(own_to_cull ? cull_distances : 0, corner_guest);
+                }
+            }
+        } else {
+            put_distances(clip_distances, guest);
+            put_distances(cull_distances, guest);
         }
         store(position, p);
         put_interpolators();
@@ -2110,8 +2216,10 @@ void Translator::main_pixel() {
                 if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
                     writes_depth |= a->vector_and_constant_result.target == StorageTarget::Depth ||
                                     a->scalar_result.target == StorageTarget::Depth;
+    // the depth converted to 20e4 (PixelOptions), oDepth's or the rasterized one
+    const uint32_t float24 = pixel_.depth_float24;
     Id frag_depth = 0;
-    if (writes_depth) {
+    if (writes_depth || float24) {
         frag_depth = global(float_, spv::StorageClass::Output, "depth");
         m_.decorate(frag_depth, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FragDepth)});
     }
@@ -2119,6 +2227,13 @@ void Translator::main_pixel() {
     // for the pixel parameters
     Id frag_coord = global(vec4_, spv::StorageClass::Input, "frag_coord");
     m_.decorate(frag_coord, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FragCoord)});
+    if (float24 && !writes_depth) {
+        // the rasterized depth converted per sample, for the antialiasing of
+        // intersections: a Sample-decorated input runs the shader per sample
+        // (Xenia's IsSampleRate), the other inputs still at the pixel's center
+        m_.capability(spv::Capability::SampleRateShading);
+        m_.decorate(frag_coord, spv::Decoration::Sample);
+    }
     Id front_facing = global(bool_, spv::StorageClass::Input, "front_facing");
     m_.decorate(front_facing, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FrontFacing)});
     // for alpha to coverage, when the shader writes oC0
@@ -2188,7 +2303,66 @@ void Translator::main_pixel() {
     reset_state();
     m_.op(Op::OpFunctionCall, void_, {body_});
     export_to_memory(em_before_end_); // the export under way at the end
-    if (frag_depth) {
+    if (frag_depth && float24) {
+        // As Xenia's CompletePixelShader_DSV_DepthTo24Bit: oDepth clamped to
+        // 0-1, or the rasterized depth from the host's 0-0.5 back to 0-1,
+        // saturated; then to 20e4 and back, halved.
+        Id depth = writes_depth ? comp(load(vec4_, depth_), 0)
+                                : exact(Op::OpFMul, float_, {comp(load(vec4_, frag_coord), 2), f(2.0f)});
+        depth = glsl(GLSLstd450NClamp, float_, {depth, f(0), f(1)});
+        Id bits = m_.op(Op::OpBitcast, uint_, {depth});
+        Id result;
+        if (float24 == 1) {
+            // towards zero: the mantissa's low bits dropped, 3 for a normal
+            // 20e4 (exponent -14 and up), up to 23 at -34; below that 0
+            Id exponent = m_.op(Op::OpBitFieldUExtract, uint_, {bits, u(23), u(8)});
+            Id drop = glsl(GLSLstd450SMax, int_,
+                           {m_.op(Op::OpISub, int_, {i(116), m_.op(Op::OpBitcast, int_, {exponent})}), i(3)});
+            drop = glsl(GLSLstd450SMin, int_, {drop, i(31)});
+            Id truncated = m_.op(Op::OpBitFieldInsert, uint_, {bits, u(0), u(0), m_.op(Op::OpBitcast, uint_, {drop})});
+            Id halved = exact(Op::OpFMul, float_, {m_.op(Op::OpBitcast, float_, {truncated}), f(0.5f)});
+            result = select(float_, m_.op(Op::OpUGreaterThanEqual, bool_, {bits, u(0x2E800000)}), halved, f(0));
+        } else {
+            // to the nearest even (xenos::Float32To20e4 and Float20e4To32)
+            Id is_small = m_.op(Op::OpULessThan, bool_, {bits, u(0x38800000)});
+            Id shift = m_.op(Op::OpISub, uint_, {u(113), m_.op(Op::OpShiftRightLogical, uint_, {bits, u(23)})});
+            shift = glsl(GLSLstd450UMin, uint_, {shift, u(24)});
+            Id denormal = m_.op(
+                Op::OpShiftRightLogical, uint_,
+                {m_.op(Op::OpBitwiseOr, uint_, {m_.op(Op::OpBitwiseAnd, uint_, {bits, u(0x7FFFFF)}), u(0x800000)}),
+                 shift});
+            Id f24 = select(uint_, is_small, denormal, m_.op(Op::OpIAdd, uint_, {bits, u(0xC8000000u)}));
+            f24 = m_.op(Op::OpIAdd, uint_,
+                        {f24, m_.op(Op::OpIAdd, uint_,
+                                    {u(3), m_.op(Op::OpBitwiseAnd, uint_,
+                                                 {m_.op(Op::OpShiftRightLogical, uint_, {f24, u(3)}), u(1)})})});
+            f24 = m_.op(Op::OpBitwiseAnd, uint_, {m_.op(Op::OpShiftRightLogical, uint_, {f24, u(3)}), u(0xFFFFFF)});
+            f24 = select(uint_, m_.op(Op::OpFOrdGreaterThan, bool_, {depth, f(0)}), f24, u(0));
+            Id mantissa = m_.op(Op::OpBitwiseAnd, uint_, {f24, u(0xFFFFF)});
+            Id exponent24 = m_.op(Op::OpShiftRightLogical, uint_, {f24, u(20)});
+            // a denormal 20e4 normalized: the mantissa's leading one moved to bit 20
+            Id msb = glsl(GLSLstd450FindUMsb, int_, {mantissa});
+            Id lz = m_.op(Op::OpISub, int_, {i(20), msb});
+            Id denormal24 = m_.op(Op::OpIEqual, bool_, {exponent24, u(0)});
+            Id exponent32 =
+                select(int_, denormal24, m_.op(Op::OpISub, int_, {i(1), lz}), m_.op(Op::OpBitcast, int_, {exponent24}));
+            Id mantissa32 =
+                select(uint_, denormal24,
+                       m_.op(Op::OpBitwiseAnd, uint_,
+                             {m_.op(Op::OpShiftLeftLogical, uint_,
+                                    {mantissa, m_.op(Op::OpBitcast, uint_, {glsl(GLSLstd450SMax, int_, {lz, i(0)})})}),
+                              u(0xFFFFF)}),
+                       mantissa);
+            Id out_bits =
+                m_.op(Op::OpBitwiseOr, uint_,
+                      {m_.op(Op::OpShiftLeftLogical, uint_,
+                             {m_.op(Op::OpBitcast, uint_, {m_.op(Op::OpIAdd, int_, {exponent32, i(112)})}), u(23)}),
+                       m_.op(Op::OpShiftLeftLogical, uint_, {mantissa32, u(3)})});
+            Id value = exact(Op::OpFMul, float_, {m_.op(Op::OpBitcast, float_, {out_bits}), f(0.5f)});
+            result = select(float_, m_.op(Op::OpIEqual, bool_, {f24, u(0)}), f(0), value);
+        }
+        store(frag_depth, result);
+    } else if (frag_depth) {
         // oDepth clamped to 0-1, as Xenia does, then halved for a D24FS8
         // target (system flags' w, bit 0), which keeps its 0-2 as 0-1
         Id depth = glsl(GLSLstd450NClamp, float_, {comp(load(vec4_, depth_), 0), f(0), f(1)});
@@ -2307,7 +2481,10 @@ void Translator::main_pixel() {
     m_.end_function();
     m_.entry_point(spv::ExecutionModel::Fragment, main, "main", interface_);
     m_.execution_mode(main, spv::ExecutionMode::OriginUpperLeft);
-    if (writes_depth) m_.execution_mode(main, spv::ExecutionMode::DepthReplacing);
+    if (frag_depth) m_.execution_mode(main, spv::ExecutionMode::DepthReplacing);
+    // truncation never raises the rasterized depth: early depth tests may
+    // still reject (Xenia's SV_DepthLessEqual)
+    if (float24 == 1 && !writes_depth) m_.execution_mode(main, spv::ExecutionMode::DepthLess);
 }
 
 Translation Translator::run() {
@@ -2362,16 +2539,21 @@ Translation Translator::run() {
 
     Translation t;
     t.unsupported = std::move(unsupported_);
+    std::sort(approximate_.begin(), approximate_.end());
+    approximate_.erase(std::unique(approximate_.begin(), approximate_.end()), approximate_.end());
+    t.approximate = std::move(approximate_);
     if (t.unsupported.empty()) t.spirv = m_.finish();
     return t;
 }
 
 } // namespace
 
-Translation translate(const ParsedShader &shader, Stage stage, const VertexOptions &vertex) {
+Translation translate(const ParsedShader &shader, Stage stage, const VertexOptions &vertex, const PixelOptions &pixel) {
     if (stage == Stage::Vertex && shader.type != ShaderType::Vertex) return {{}, {"a pixel shader as a vertex shader"}};
     if (stage == Stage::Pixel && shader.type != ShaderType::Pixel) return {{}, {"a vertex shader as a pixel shader"}};
-    return Translator(shader, stage, stage == Stage::Vertex ? vertex : VertexOptions{}).run();
+    return Translator(shader, stage, stage == Stage::Vertex ? vertex : VertexOptions{},
+                      stage == Stage::Pixel ? pixel : PixelOptions{})
+        .run();
 }
 
 } // namespace xf::shader

@@ -117,11 +117,20 @@ const uint32_t EDRAM_STORE_MS[] = {
 const uint32_t EDRAM_LOAD[] = {
 #include "edram_load.frag.inc"
 };
+const uint32_t EDRAM_LOAD_UINT[] = {
+#include "edram_load_uint.frag.inc"
+};
 const uint32_t EDRAM_LOAD_DEPTH[] = {
 #include "edram_load_depth.frag.inc"
 };
 const uint32_t EDRAM_LOAD_STENCIL[] = {
 #include "edram_load_stencil.frag.inc"
+};
+const uint32_t DEPTH_FLOAT24[] = {
+#include "depth_float24.frag.inc"
+};
+const uint32_t DEPTH_FLOAT24_ROUND[] = {
+#include "depth_float24_round.frag.inc"
 };
 const uint32_t RESOLVE[] = {
 #include "resolve.comp.inc"
@@ -142,7 +151,9 @@ constexpr uint32_t PA_CL_VPORT_XSCALE = 0x210F; // then XOFFSET, YSCALE, YOFFSET
 constexpr uint32_t RB_BLENDCONTROL[4] = {0x2201, 0x2209, 0x220A, 0x220B};
 constexpr uint32_t RB_COLORCONTROL = 0x2202;
 constexpr uint32_t PA_CL_CLIP_CNTL = 0x2204, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206;
-constexpr uint32_t PA_SU_POINT_SIZE = 0x2280, PA_SU_POINT_MINMAX = 0x2281;
+constexpr uint32_t PA_SU_POINT_SIZE = 0x2280, PA_SU_POINT_MINMAX = 0x2281, PA_SU_LINE_CNTL = 0x2282;
+constexpr uint32_t PA_CL_UCP_0_X = 0x2388; // six planes of X, Y, Z, W
+constexpr uint32_t DC_LUTA_CONTROL = 0x1930;
 constexpr uint32_t VGT_OUTPUT_PATH_CNTL = 0x2284, VGT_HOS_CNTL = 0x2285;
 constexpr uint32_t VGT_HOS_MAX_TESS_LEVEL = 0x2286, VGT_HOS_MIN_TESS_LEVEL = 0x2287;
 constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
@@ -231,6 +242,39 @@ float float24_to_float(uint32_t f24) {
 }
 
 // xenos::Float7e3To32
+// xenos.cc's PWLGammaToLinear: a gamma value (0-1, saturated) to linear
+float pwl_gamma_to_linear(float gamma) {
+    gamma = std::isnan(gamma) ? 0.0f : std::clamp(gamma, 0.0f, 1.0f);
+    float scale, offset;
+    if (gamma >= 96.0f / 255.0f) {
+        if (gamma >= 192.0f / 255.0f)
+            scale = 8.0f / 1024.0f, offset = -1024.0f;
+        else
+            scale = 4.0f / 1024.0f, offset = -256.0f;
+    } else {
+        if (gamma >= 64.0f / 255.0f)
+            scale = 2.0f / 1024.0f, offset = -64.0f;
+        else
+            scale = 1.0f / 1024.0f, offset = 0.0f;
+    }
+    float linear = gamma * ((255.0f * 1024.0f) * scale) + offset;
+    linear += std::trunc(linear * scale);
+    return linear * (1.0f / 1023.0f);
+}
+
+// xenos::Float32To20e4: towards zero, or to the nearest even
+uint32_t float_to_float24(float f, bool round_to_nearest_even) {
+    if (!(f > 0.0f)) return 0;
+    uint32_t u = std::bit_cast<uint32_t>(f);
+    if (u >= 0x3FFFFFF8) return 0xFFFFFF;
+    if (u < 0x38800000)
+        u = (0x800000 | (u & 0x7FFFFF)) >> std::min(113u - (u >> 23), 24u);
+    else
+        u += 0xC8000000u;
+    if (round_to_nearest_even) u += 3 + ((u >> 3) & 1);
+    return (u >> 3) & 0xFFFFFF;
+}
+
 float float7e3_to_float(uint32_t f10) {
     f10 &= 0x3FF;
     if (!f10) return 0.0f;
@@ -371,6 +415,7 @@ struct Shader {
     // spacing in bit 8 for the domain ones), made as draws ask for them
     std::map<uint32_t, VkShaderModule> variants;
     std::string unsupported; // why it cannot be drawn with
+    std::vector<std::string> approximate; // shader::Translation's, counted at each draw
     uint32_t colors_written = 0; // oC0-oC3, a bit each
     bool writes_depth = false;
     // for running it on the CPU (draw extents): whether it uses what a
@@ -398,11 +443,19 @@ struct RenderTarget {
     // in EDRAM: tiles per row (at its bits per sample), a tile's size in pixels
     uint32_t pitch_tiles = 1, tile_width = 80, tile_height = 16;
     bool wide = false; // 64 bits per sample
+    // an 8_8_8_8_GAMMA target kept linear, as RGBA16 unorm, so that blending
+    // is done in linear as the console's (Xenia's
+    // gamma_render_target_as_unorm16); its gamma is made in EDRAM's bits
+    bool gamma_linear = false;
+    // a float target moved through EDRAM by its bits (NaN payloads,
+    // denormals), through a UINT view of its image: the view, its format
+    VkImageView raw = VK_NULL_HANDLE;
+    VkFormat raw_format = VK_FORMAT_UNDEFINED;
 };
 
 // edram.glsl's push constants
 struct EdramTarget {
-    uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, depth_flags;
+    uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, flags;
 };
 
 // resolve.comp's push constants
@@ -413,6 +466,7 @@ struct ResolveConstants {
     float exp_factor;
     // a multisampled source read from EDRAM
     uint32_t edram, edram_base, edram_pitch, msaa, ints_log2, src_x, src_y, first_sample, samples;
+    uint32_t depth_round; // D24FS8 from the host's float: 20e4 rounded to the nearest even
 };
 static_assert(sizeof(ResolveConstants) <= 128, "the push constants every device has room for");
 
@@ -463,8 +517,9 @@ struct System {
     // unknown), for biased components
     uint32_t signs[32];
     uint32_t signed_slots[32]; // per slot, its texture's signed view as slots has it; 0 none
+    float clip_planes[6][4];   // the user clip planes enabled, packed (shader::VertexOptions)
 };
-static_assert(sizeof(System) == 480);
+static_assert(sizeof(System) == 576);
 
 // The bits of each component of a fixed-point guest texture format, in the
 // texel's order (Xenia's texture_info_formats.inl, its fixed formats); zeros
@@ -579,6 +634,7 @@ struct FrontRead {
     uint32_t width = 0, height = 0, swizzle = 0, format = 0;
     std::array<uint32_t, 256> gamma{};
     std::array<uint32_t, 128 * 3> pwl{};
+    uint32_t luta_control = 0; // DC_LUTA_CONTROL at the swap
 };
 
 // The attachments of the render pass under way.
@@ -831,12 +887,12 @@ public:
     }
     Report report() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return report_;
+        return with_processor_counts(report_);
     }
     bool try_report(Report &out) const override {
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
         if (!lock) return false;
-        out = report_;
+        out = with_processor_counts(report_);
         return true;
     }
     bool failed(std::string &error) const override {
@@ -913,6 +969,19 @@ private:
                          reason.c_str(), (unsigned long long)vertex_hash_, (unsigned long long)pixel_hash_);
     }
     void approximate(const std::string &what) { report_.approximate[what]++; }
+    void use(const std::string &what) { report_.used[what]++; }
+    // the report with what the processor counted of the packets the renderer
+    // does not see (Report::used)
+    Report with_processor_counts(Report r) const {
+        const gpu::Counts &n = processor_.counts();
+        auto put = [&](const char *what, uint64_t count) {
+            if (count) r.used[what] = count;
+        };
+        put("EVENT_WRITE_EXT packets (screen extent reports)", n.opcodes[pm4::EVENT_WRITE_EXT].load());
+        put("VIZ_QUERY packets", n.opcodes[pm4::VIZ_QUERY].load());
+        put("draws with no valid index source (not drawn)", n.failed_draws.load());
+        return r;
+    }
 
     // GPU timing (Options::gpu_timing): a timestamp where the kind of work
     // being recorded changes; finish() sums the intervals by kind
@@ -936,6 +1005,10 @@ private:
     // a translated vertex shader's module in a host form; null when the
     // translator cannot make it
     VkShaderModule vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why);
+    VkShaderModule pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why);
+    // the depth-only draws' pixel shaders that convert D24FS8 depth
+    // (Options::depth_float24_convert_in_pixel_shader): towards zero, nearest even
+    VkShaderModule depth_float24_fs_[2] = {};
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
     VkFormat depth_vk_format(uint32_t format) const;
     Texture *texture(const uint32_t fetch[6], std::string &why);
@@ -1258,16 +1331,23 @@ private:
     bool edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows);
     VkDeviceSize edram_mask(const std::vector<uint32_t> &tiles);
     EdramTarget edram_target(const RenderTarget &t, uint32_t height) const {
-        uint32_t depth_flags =
-            t.depth ? (host_depth_kept(t.format) ? 1u : 0u) | (options_.depth_float24_round ? 2u : 0u) : 0u;
-        return {t.base, t.pitch_tiles, t.msaa, t.format, t.width, height, t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u,
-                depth_flags};
+        // (20e4 rounded only where the host's depth is not already 20e4, as
+        // Xenia's dump of float24 depth)
+        bool round = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader;
+        uint32_t flags = t.depth ? (host_depth_kept(t.format) ? 1u : 0u) | (round ? 2u : 0u)
+                                 : (t.gamma_linear ? 4u : 0u) | (t.raw ? 8u : 0u);
+        return {t.base, t.pitch_tiles,     t.msaa,           t.format, t.width,
+                height, t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u,       flags};
     }
     // Whether a depth format is encoded differently on the host, so that its
     // 32-bit depth is kept beside EDRAM across transfers (Xenia's
     // IsHostDepthEncodingDifferent): D24FS8 always (its 20e4 is kept as a
     // 32-bit float), D24S8 where the device has no 24-bit unorm depth.
-    bool host_depth_kept(uint32_t format) const { return format == 1 || d24s8_ != VK_FORMAT_D24_UNORM_S8_UINT; }
+    // (D24FS8 converted to 20e4 in the pixel shaders keeps nothing the 24
+    // bits do not: Xenia's IsHostDepthEncodingDifferent)
+    bool host_depth_kept(uint32_t format) const {
+        return format == 1 ? !options_.depth_float24_convert_in_pixel_shader : d24s8_ != VK_FORMAT_D24_UNORM_S8_UINT;
+    }
     VkPipeline load_pipeline(const RenderTarget &t);
     VkDescriptorSet edram_set(uint32_t which);
     std::vector<RenderTarget *> owners_ = std::vector<RenderTarget *>(EDRAM_TILES, nullptr); // null: EDRAM holds it
@@ -1281,8 +1361,16 @@ private:
     VkDescriptorSet edram_load_set_ = VK_NULL_HANDLE;
     VkPipeline store_pipelines_[2] = {}; // 1x, multisampled
     VkShaderModule fullscreen_vs_ = VK_NULL_HANDLE, load_fs_[3] = {}; // color, depth, depth and stencil
+    VkShaderModule load_uint_fs_ = VK_NULL_HANDLE;                    // a float target's bits (RenderTarget::raw)
+    // float targets moved through EDRAM by their bits where the device
+    // samples and renders their UINT views at the sample counts below
+    // (XF_VK_NO_RAW_FLOAT_TARGETS=1 turns it off: moved by value then)
+    bool raw_float_targets_ = false;
+    VkSampleCountFlags integer_samples_ = 0;
     std::map<std::pair<VkFormat, uint32_t>, VkPipeline> load_pipelines_;
     VkFormat d24s8_ = VK_FORMAT_D24_UNORM_S8_UINT;
+    // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm (RenderTarget::gamma_linear)
+    bool gamma_unorm16_ = false;
 };
 
 Impl::~Impl() {
@@ -1326,7 +1414,8 @@ Impl::~Impl() {
     for (auto &[k, p] : load_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
     for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
-    for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2]})
+    for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
+                             depth_float24_fs_[1]})
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (VkDescriptorPool p : edram_pools_) vkDestroyDescriptorPool(dev_, p, nullptr);
     for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_})
@@ -1469,6 +1558,19 @@ bool Impl::init(std::string &error) {
     if (!d_.format_supported(d24s8_, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
         (depth_fallback && depth_fallback[0] == '1'))
         d24s8_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm, blended in linear
+    // (Xenia's gamma_render_target_as_unorm16, on by default), where the
+    // device samples, renders to and blends that format; without it, or with
+    // the option off (XF_VK_NO_GAMMA_UNORM16=1 too), the pixel shader writes
+    // the gamma curve into an RGBA8 target, as Xenia does then
+    {
+        const char *off = std::getenv("XF_VK_NO_GAMMA_UNORM16");
+        gamma_unorm16_ =
+            options_.gamma_render_target_as_unorm16 && !(off && off[0] && off[0] != '0') &&
+            d_.format_supported(VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                                  VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                                  VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT);
+    }
 
     // submissions
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1666,6 +1768,24 @@ bool Impl::init(std::string &error) {
         load_fs_[0] = module(EDRAM_LOAD, sizeof(EDRAM_LOAD));
         load_fs_[1] = module(EDRAM_LOAD_DEPTH, sizeof(EDRAM_LOAD_DEPTH));
         if (d_.stencil_export()) load_fs_[2] = module(EDRAM_LOAD_STENCIL, sizeof(EDRAM_LOAD_STENCIL));
+        load_uint_fs_ = module(EDRAM_LOAD_UINT, sizeof(EDRAM_LOAD_UINT));
+        if (!load_uint_fs_) return error = "could not make the EDRAM load shaders", false;
+        {
+            // integer images at the guest's sample counts: sampled, and
+            // rendered to (Vulkan 1.2's framebufferIntegerColorSampleCounts)
+            VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+            VkPhysicalDeviceProperties2 p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            p.pNext = &p12;
+            vkGetPhysicalDeviceProperties2(d_.physical(), &p);
+            integer_samples_ =
+                p.properties.limits.sampledImageIntegerSampleCounts & p12.framebufferIntegerColorSampleCounts;
+            const char *off = std::getenv("XF_VK_NO_RAW_FLOAT_TARGETS");
+            raw_float_targets_ = !(off && off[0] && off[0] != '0');
+        }
+        depth_float24_fs_[0] = module(DEPTH_FLOAT24, sizeof(DEPTH_FLOAT24));
+        depth_float24_fs_[1] = module(DEPTH_FLOAT24_ROUND, sizeof(DEPTH_FLOAT24_ROUND));
+        if (!depth_float24_fs_[0] || !depth_float24_fs_[1])
+            return error = "could not make the float24 depth shaders", false;
         edram_load_set_ = edram_set(1);
         if (!edram_load_set_) return error = "could not make the EDRAM load's descriptors", false;
         VkDescriptorBufferInfo buffers[3] = {
@@ -2318,6 +2438,7 @@ bool Impl::translate(Shader &s, std::string &why) {
             }
         }
         shader::Translation t = shader::translate(s.parsed, pixel ? shader::Stage::Pixel : shader::Stage::Vertex);
+        s.approximate = t.approximate;
         if (!t.ok()) {
             s.unsupported = t.unsupported.empty() ? "the translator wrote nothing" : t.unsupported.front();
         } else {
@@ -2331,9 +2452,31 @@ bool Impl::translate(Shader &s, std::string &why) {
     return s.unsupported.empty();
 }
 
+// a pixel shader's other forms (shader::PixelOptions), made as draws ask for
+// them, kept among its variants above the vertex forms' keys
+VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why) {
+    uint32_t key = options.key();
+    if (!key) return s.module;
+    key |= 1u << 31;
+    auto it = s.variants.find(key);
+    if (it == s.variants.end()) {
+        VkShaderModule m = VK_NULL_HANDLE;
+        shader::Translation t = shader::translate(s.parsed, shader::Stage::Pixel, {}, options);
+        if (t.ok()) {
+            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            info.codeSize = t.spirv.size() * 4;
+            info.pCode = t.spirv.data();
+            if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
+        }
+        it = s.variants.emplace(key, m).first;
+    }
+    if (!it->second) why = "its float24 depth form could not be made";
+    return it->second;
+}
+
 VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why) {
-    if (options.host == shader::HostVertex::Vertex) return s.module;
-    uint32_t key = uint32_t(options.host) | (options.equal_spacing ? 1u << 8 : 0u);
+    uint32_t key = options.key();
+    if (!key) return s.module; // HostVertex::Vertex without clip planes
     auto it = s.variants.find(key);
     if (it == s.variants.end()) {
         VkShaderModule m = VK_NULL_HANDLE;
@@ -2406,6 +2549,7 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
         vk_format = t->host == texture::HostFormat::RG16     ? VK_FORMAT_R16G16_SNORM
                     : t->host == texture::HostFormat::RGBA16 ? VK_FORMAT_R16G16B16A16_SNORM
                                                              : vk_format_of(t->host);
+        if (format == 1 && gamma_unorm16_) vk_format = VK_FORMAT_R16G16B16A16_UNORM, t->gamma_linear = true;
         if (vk_format == VK_FORMAT_UNDEFINED) return nullptr;
         // the guest's bits per sample (xenos.h's IsColorRenderTargetFormat64bpp),
         // not the host's: 2_10_10_10_FLOAT is 32 bits in EDRAM, kept as
@@ -2427,7 +2571,27 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     VkSampleCountFlagBits samples = msaa == 0 ? VK_SAMPLE_COUNT_1_BIT : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
     VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                               (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-    t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->width, t->height, 1}, 1, 1, samples, usage);
+    // A float target (16_16_FLOAT, 16_16_16_16_FLOAT, 32_FLOAT, 32_32_FLOAT)
+    // keeps the guest's bits as its host components: its image is made
+    // mutable and moved through EDRAM through a UINT view (EDRAM stores
+    // sampled as floats lose NaN payloads and denormals; Xenia's D3D12 TODO
+    // on D3D11.3's NaN rules for these). 2_10_10_10_FLOAT is 7e3 in EDRAM, not
+    // the host's bits.
+    VkFormat raw_format = VK_FORMAT_UNDEFINED;
+    if (!depth && (format == 6 || format == 7 || format == 14 || format == 15) && raw_float_targets_) {
+        raw_format = vk_format == VK_FORMAT_R16G16_SFLOAT         ? VK_FORMAT_R16G16_UINT
+                     : vk_format == VK_FORMAT_R16G16B16A16_SFLOAT ? VK_FORMAT_R16G16B16A16_UINT
+                     : vk_format == VK_FORMAT_R32_SFLOAT          ? VK_FORMAT_R32_UINT
+                     : vk_format == VK_FORMAT_R32G32_SFLOAT       ? VK_FORMAT_R32G32_UINT
+                                                                  : VK_FORMAT_UNDEFINED;
+        if (raw_format != VK_FORMAT_UNDEFINED &&
+            (!d_.format_supported(raw_format,
+                                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) ||
+             (msaa && !(integer_samples_ & samples))))
+            raw_format = VK_FORMAT_UNDEFINED;
+    }
+    t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->width, t->height, 1}, 1, 1, samples, usage,
+                               raw_format != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
     if (!t->image.image) {
         fatal_ = "could not make a render target";
         return nullptr;
@@ -2436,6 +2600,10 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     t->view = make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, aspect);
     t->sampled = depth ? make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, VK_IMAGE_ASPECT_DEPTH_BIT) : t->view;
     if (depth) t->stencil = make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, VK_IMAGE_ASPECT_STENCIL_BIT);
+    if (raw_format != VK_FORMAT_UNDEFINED) {
+        t->raw = make_view(t->image.image, VK_IMAGE_VIEW_TYPE_2D, raw_format, VK_IMAGE_ASPECT_COLOR_BIT);
+        t->raw_format = raw_format;
+    }
     // its EDRAM store's descriptors: EDRAM, the tile mask (in the arena), its views
     t->store_set = edram_set(0);
     if (!t->store_set) {
@@ -2447,12 +2615,14 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
         {edram_.buffer, 0, VK_WHOLE_SIZE},
         {arena_.buffer, 0, EDRAM_TILES * 4},
         {host_depth_.buffer, 0, VK_WHOLE_SIZE}};
+    // (binding 3: the stencil of a depth target, or a float target's UINT view)
+    VkImageView unsigned_view = depth ? t->stencil : t->raw;
     VkDescriptorImageInfo images[2] = {{VK_NULL_HANDLE, t->sampled, VK_IMAGE_LAYOUT_GENERAL},
-                                       {VK_NULL_HANDLE, t->stencil, VK_IMAGE_LAYOUT_GENERAL}};
+                                       {VK_NULL_HANDLE, unsigned_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet writes[5] = {};
     uint32_t write_count = 0;
     for (uint32_t b = 0; b < 5; b++) {
-        if (b == 3 && !t->stencil) continue;
+        if (b == 3 && !unsigned_view) continue;
         VkWriteDescriptorSet &w = writes[write_count++];
         w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w.dstSet = t->store_set;
@@ -2608,10 +2778,12 @@ void Impl::gpu_memory(std::vector<std::pair<uint32_t, std::vector<uint8_t>>> &ou
 }
 
 VkPipeline Impl::load_pipeline(const RenderTarget &t) {
-    auto key = std::make_pair(t.image.format, t.msaa);
+    // (a float target moved by its bits renders into its UINT view)
+    VkFormat color_format = t.raw ? t.raw_format : t.image.format;
+    auto key = std::make_pair(color_format, t.msaa);
     auto it = load_pipelines_.find(key);
     if (it != load_pipelines_.end()) return it->second;
-    VkShaderModule fs = !t.depth ? load_fs_[0] : load_fs_[2] ? load_fs_[2] : load_fs_[1];
+    VkShaderModule fs = !t.depth ? (t.raw ? load_uint_fs_ : load_fs_[0]) : load_fs_[2] ? load_fs_[2] : load_fs_[1];
     VkPipelineShaderStageCreateInfo stages[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, fullscreen_vs_, "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr}};
@@ -2645,7 +2817,6 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = t.depth ? 5 : 2;
     dynamic.pDynamicStates = dynamic_states;
-    VkFormat color_format = t.image.format;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     if (t.depth) {
         rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = t.image.format;
@@ -2681,7 +2852,7 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
     VkCommandBuffer c = outside();
     if (options_.gpu_timing) gpu_mark("EDRAM load: " + target_name(*t));
     VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    attachment.imageView = t->view;
+    attachment.imageView = t->raw ? t->raw : t->view;
     attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -3303,7 +3474,8 @@ struct Viewport {
 // draw_util.cc's GetHostViewportInfo, at resolution scale 1, for Vulkan
 // (origin at the top left, reverse Z allowed, float24 depth halved);
 // depth_float24: a D24FS8 target with the depth test on
-Viewport host_viewport(const uint32_t *regs, float max_x, float max_y, bool pixel_writes_depth, bool depth_float24) {
+Viewport host_viewport(const uint32_t *regs, float max_x, float max_y, bool pixel_writes_depth, bool depth_float24,
+                       bool float24_convert) {
     Viewport v;
     uint32_t clip = regs[r::PA_CL_CLIP_CNTL], vte = regs[r::PA_CL_VTE_CNTL], mode = regs[r::PA_SU_SC_MODE_CNTL];
     uint32_t vtx = regs[r::PA_SU_VTX_CNTL];
@@ -3365,6 +3537,13 @@ Viewport host_viewport(const uint32_t *regs, float max_x, float max_y, bool pixe
         }
     }
     if (depth_float24) {
+        // the bounds the depth is clamped to after the pixel shader, as 20e4
+        // values when the pixel shader converts it (rounded to the nearest
+        // even whatever the depth's rounding, as Xenia's)
+        if (float24_convert) {
+            z_min = float24_to_float(float_to_float24(z_min, true));
+            z_max = float24_to_float(float_to_float24(z_max, true));
+        }
         // D24FS8's 0-2 kept as 0-1 (Xenia's full_float24_in_0_to_1)
         z_min *= 0.5f;
         z_max *= 0.5f;
@@ -3518,10 +3697,16 @@ uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constant
     return (uint32_t(std::max(0, max_y_24p8)) + (msaa == 0 ? 127u : 255u)) >> 8;
 }
 
-// A draw outside copy mode, as the processor gives it (immediate indices,
-// which Xenia does not draw either, never come: the processor counts them).
+// A draw outside copy mode, as the processor gives it (immediate indices in
+// the draw, which Xenia does not draw).
 void Impl::draw(const gpu::Draw &d) {
     report_.draws++;
+    // VIZ queries, as Xenia's default (occlusion_query_viz off), counted:
+    // draws predicated on one (DRAW_INDX's VIZ token, bit 8) are drawn, and
+    // survey draws (PA_SC_VIZ_QUERY's viz_query_ena with kill_pix_post_hi_z)
+    // are drawn as they are
+    if (d.viz_query & 0x100) use("draws predicated on a VIZ query (drawn, as Xenia's default)");
+    if ((regs_[reg::PA_SC_VIZ_QUERY] & 0x81) == 0x81) use("VIZ survey draws (drawn, as Xenia's default)");
     uint32_t mode = regs_[reg::RB_MODECONTROL] & 7;
     if (EdramMode(mode) != EdramMode::ColorDepth && EdramMode(mode) != EdramMode::DepthOnly) return skip("EDRAM mode " + std::to_string(mode));
 
@@ -3545,6 +3730,27 @@ void Impl::draw(const gpu::Draw &d) {
             if (options_.verbose)
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
             return;
+        }
+    }
+    // What the draw asks for, counted whether it is drawn or not
+    // (Report::used): user clip planes (PA_CL_CLIP_CNTL's ucp_ena_0-5 while
+    // clipping is on; on points with ps_ucp_mode), and lines of another width
+    // than one pixel (PA_SU_LINE_CNTL's WIDTH, half the width in 12.4 fixed
+    // point: 8 is Xenia's reset value, one pixel)
+    {
+        uint32_t clip = regs_[r::PA_CL_CLIP_CNTL];
+        if ((clip & 0x3F) && !((clip >> 16) & 1)) {
+            use((clip >> 17) & 1 ? "draws with user clip planes, cull only" : "draws with user clip planes");
+            if (primitive == 1)
+                use("point lists with user clip planes, ps_ucp_mode " + std::to_string((clip >> 14) & 3));
+        }
+        if (primitive == 2 || primitive == 3 || primitive == 12) {
+            uint32_t width = regs_[r::PA_SU_LINE_CNTL] & 0xFFFF;
+            if (width != 8) {
+                char what[96];
+                std::snprintf(what, sizeof(what), "line draws %g pixels wide (PA_SU_LINE_CNTL)", double(width) / 8.0);
+                use(what);
+            }
         }
     }
     // Tessellation, as Xenia's PrimitiveProcessor::Process takes it:
@@ -3607,7 +3813,26 @@ void Impl::draw(const gpu::Draw &d) {
     // (its rectangles are a TODO there, done here as its
     // HostVertexShaderType describes them: the three guest vertices in each
     // host invocation).
-    if (expand_in_vs_ && (rectangles || points))
+    // User clip planes (PA_CL_CLIP_CNTL's ucp_ena_0-5, while clipping is on),
+    // as Xenia's: their distances in the vertex shader (shader::VertexOptions),
+    // the planes packed in the system constants. Points and rectangles are
+    // expanded in the vertex shader then, where the corners' distances are
+    // made (ps_ucp_mode); without clip or cull distances on the device the
+    // draw is skipped.
+    const uint32_t clip_cntl = regs_[r::PA_CL_CLIP_CNTL];
+    const uint32_t ucp = (clip_cntl >> 16) & 1 ? 0u : clip_cntl & 0x3F;
+    if (ucp) {
+        host_vertex.clip_planes = uint8_t(std::popcount(ucp));
+        host_vertex.clip_planes_cull = (clip_cntl >> 17) & 1;
+        if (points) host_vertex.point_ucp_mode = uint8_t((clip_cntl >> 14) & 3);
+        bool cull = host_vertex.clip_planes_cull || (points && host_vertex.point_ucp_mode == 2);
+        bool clip = !host_vertex.clip_planes_cull;
+        if ((cull && !d_.cull_distance()) || (clip && !d_.clip_distance()))
+            return skip("user clip planes without clip or cull distances on the device");
+        if (points && host_vertex.point_ucp_mode == 2 && !host_vertex.clip_planes_cull && host_vertex.clip_planes > 4)
+            approximate("points with ps_ucp_mode 2 and more than 4 user clip planes (clipped by the corners only)");
+    }
+    if ((expand_in_vs_ || ucp) && (rectangles || points))
         host_vertex.host =
             points ? shader::HostVertex::PointListAsTriangleStrip : shader::HostVertex::RectangleListAsTriangleStrip;
     bool expanded = host_vertex.host == shader::HostVertex::PointListAsTriangleStrip ||
@@ -3654,6 +3879,9 @@ void Impl::draw(const gpu::Draw &d) {
     std::string why;
     if (!translate(*vs, why)) return skip("vertex shader: " + why);
     if (ps && !translate(*ps, why)) return skip("pixel shader: " + why);
+    for (const Shader *s : {vs, ps})
+        if (s)
+            for (const std::string &a : s->approximate) approximate(a);
 
     // render targets
     uint32_t surface = regs_[reg::RB_SURFACE_INFO], pitch = surface & 0x3FFF, msaa = (surface >> 16) & 3;
@@ -3689,6 +3917,7 @@ void Impl::draw(const gpu::Draw &d) {
     uint32_t color_masks[4] = {};
     float color_scales[4] = {1, 1, 1, 1};
     uint32_t gamma_targets = 0;
+    bool any_gamma = false;
     uint32_t mask = regs_[reg::RB_COLOR_MASK];
     for (uint32_t i = 0; i < 4 && ps; i++) {
         color_masks[i] = (mask >> (4 * i)) & 0xF;
@@ -3700,15 +3929,22 @@ void Impl::draw(const gpu::Draw &d) {
         // the exponent bias, and 16-bit fixed (-32..32, 10 fraction bits) kept as snorm
         color_scales[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
         if (format == 4 || format == 5) color_scales[i] *= 1024.0f / 32767.0f;
-        if (format == 1) gamma_targets |= 1u << i;
         colors[i] = render_target(false, info & 0xFFF, pitch, msaa, format);
         if (!colors[i]) return fatal_.empty() ? skip(std::string("color target format ") + color_target_format_name(format)) : void();
+        // 8_8_8_8_GAMMA: the shader writes linear into a target kept linear,
+        // else the gamma curve (blended in gamma then, unlike the console)
+        if (format == 1) {
+            any_gamma = true;
+            if (!colors[i]->gamma_linear) gamma_targets |= 1u << i;
+        }
     }
+    if (any_gamma) use("draws into 8_8_8_8_GAMMA color targets");
+    if (gamma_targets) approximate("8_8_8_8_GAMMA color targets blended in gamma (no RGBA16 unorm attachments)");
     uint32_t depth_control = export_only ? 0 : regs_[reg::RB_DEPTHCONTROL];
     RenderTarget *depth = nullptr;
     if (depth_control & 3) {
         uint32_t info = regs_[reg::RB_DEPTH_INFO], format = (info >> 16) & 1;
-        if (format == 1) approximate("D24FS8 depth as 32-bit float");
+        if (format == 1 && !options_.depth_float24_convert_in_pixel_shader) approximate("D24FS8 depth as 32-bit float");
         depth = render_target(true, info & 0xFFF, pitch, msaa, format);
         if (!depth) return;
     } else {
@@ -3727,15 +3963,18 @@ void Impl::draw(const gpu::Draw &d) {
 
     // viewport and scissor
     bool depth_float24 = depth && depth->format == 1;
+    // D24FS8 depth converted to 20e4 in the pixel shader (Options), for draws
+    // with the depth test on, as Xenia's depth_float24_convert_in_pixel_shader
+    bool float24_convert = options_.depth_float24_convert_in_pixel_shader && depth_float24 && (depth_control & 2);
     Viewport viewport = host_viewport(regs_, max_viewport_[0], max_viewport_[1], ps && ps->writes_depth,
-                                      depth_float24 && (depth_control & 2));
+                                      depth_float24 && (depth_control & 2), float24_convert);
     VkRect2D scissor = host_scissor(regs_, pitch);
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
     scissor.extent.height = std::min<uint32_t>(scissor.extent.height, height - std::min<uint32_t>(scissor.offset.y, height));
     if (!export_only && (viewport.empty || !scissor.extent.width || !scissor.extent.height) && !rasterizes_nothing()) return;
     if (export_only) {
         std::fill(std::begin(colors), std::end(colors), nullptr);
-        depth = nullptr, depth_control = 0;
+        depth = nullptr, depth_control = 0, float24_convert = false;
     }
     // (the targets take over their EDRAM tiles below, once the draw's lowest
     // row is known: draw_max_y)
@@ -3760,7 +3999,21 @@ void Impl::draw(const gpu::Draw &d) {
     auto remap = [&](uint32_t index) { return std::min(max_index, std::max(min_index, (index + offset) & 0xFFFFFF)); };
     const bool factors = tessellated && tess_mode == 2;
     auto vertex = [&](uint32_t index) { return factors ? index : remap(index); };
-    if (d.indexed) {
+    if (d.indexed && !d.immediate.empty()) {
+        // immediate indices, from the packet (gpu::Draw::immediate): no
+        // swap, 16-bit ones two a word, the first in the low half (AMD's
+        // DRAW_INDEX_IMMD); then as an index buffer's
+        use("draws with immediate indices");
+        if (!index32) approximate("immediate 16-bit indices (their order in a word unverified)");
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t word = d.immediate[index32 ? i : i / 2];
+            uint32_t index = index32 ? word : (i & 1 ? word >> 16 : word & 0xFFFF);
+            if (restart && index == (index32 ? reset_index : reset_index & 0xFFFF))
+                indices.push_back(UINT32_MAX);
+            else
+                indices.push_back(vertex(index));
+        }
+    } else if (d.indexed) {
         uint32_t size = index32 ? 4 : 2;
         gpu::Endian endian = d.index_endian;
         std::vector<uint8_t> raw_indices(size_t(count) * size);
@@ -3920,6 +4173,14 @@ void Impl::draw(const gpu::Draw &d) {
     // (bits 1-2: 1x, 2x, 4x), for alpha to coverage
     sys.flags[3] = (depth_float24 ? 1u : 0u) | msaa << 1;
     std::copy(color_scales, color_scales + 4, sys.color_scales);
+    for (uint32_t plane = 0, k = 0; plane < 6; plane++)
+        if (ucp & (1u << plane)) std::memcpy(sys.clip_planes[k++], &regs_[r::PA_CL_UCP_0_X + plane * 4], 16);
+    if (ucp && options_.verbose)
+        for (uint32_t k = 0; k < host_vertex.clip_planes; k++)
+            std::fprintf(stderr, "  draw %llu: user clip plane %u (%g, %g, %g, %g)%s\n",
+                         (unsigned long long)report_.draws, k, sys.clip_planes[k][0], sys.clip_planes[k][1],
+                         sys.clip_planes[k][2], sys.clip_planes[k][3],
+                         host_vertex.clip_planes_cull ? ", cull only" : "");
     if (points) {
         // as Xenia's UpdateSystemConstantValues: the registers' 12.4 radii
         // as diameters, and the viewport's pixels to NDC (2 / extent, halved
@@ -4003,8 +4264,7 @@ void Impl::draw(const gpu::Draw &d) {
                                                                              : 2;
     // the vertex shader's host form, with a tessellated draw's hull shader
     // and patch size
-    uint32_t host_key =
-        uint32_t(host_vertex.host) | (host_vertex.equal_spacing ? 1u << 8 : 0u) | hull << 12 | patch_points << 16;
+    uint32_t host_key = host_vertex.key() | hull << 16 | patch_points << 20;
     std::vector<uint32_t> key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32),
                                  ps ? uint32_t(pixel_hash_) : 0, ps ? uint32_t(pixel_hash_ >> 32) : 0,
                                  topology_class, rectangles, msaa, depth ? depth->image.format : 0u,
@@ -4026,6 +4286,26 @@ void Impl::draw(const gpu::Draw &d) {
     }
     VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why);
     if (!guest_vs) return skip("vertex shader: " + why);
+    // The pixel shader: the guest's, its float24 depth conversion form with
+    // float24_convert; a depth-only draw that tests or writes depth then gets
+    // one that converts the rasterized depth (Xenia's float24_truncate and
+    // _round fragment shaders). The conversion runs per sample under MSAA, as
+    // Xenia's (unless the shader writes oDepth, which is per pixel).
+    VkShaderModule fragment = ps ? ps->module : VK_NULL_HANDLE;
+    uint32_t float24_mode = float24_convert ? (options_.depth_float24_round ? 2u : 1u) : 0u;
+    bool sample_shading = false;
+    if (float24_convert) {
+        if (ps) {
+            fragment = pixel_module(*ps, {uint8_t(float24_mode)}, why);
+            if (!fragment) return skip("pixel shader: " + why);
+        } else if ((depth_control & 4) || ((depth_control >> 4) & 7) != 7) {
+            fragment = depth_float24_fs_[float24_mode == 2 ? 1 : 0];
+        }
+        // (the guest's shader runs per sample by its sample-decorated
+        // position; the depth-only one by the pipeline's sample shading)
+        sample_shading = msaa && fragment && !ps;
+    }
+    key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u));
     VkPipelineShaderStageCreateInfo stages[4] = {};
     uint32_t stage_count = 0;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
@@ -4041,7 +4321,7 @@ void Impl::draw(const gpu::Draw &d) {
         if ((rectangles || points) && !expanded)
             stage(VK_SHADER_STAGE_GEOMETRY_BIT, points ? point_gs_ : rectangle_gs_);
     }
-    if (ps) stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps->module);
+    if (fragment) stage(VK_SHADER_STAGE_FRAGMENT_BIT, fragment);
     // the vertex attributes: a tessellated draw's control points (two
     // floats), an expanded rectangle's guest indices (three)
     VkVertexInputBindingDescription vertex_binding{0, tessellated ? 8u : 12u, VK_VERTEX_INPUT_RATE_VERTEX};
@@ -4074,6 +4354,7 @@ void Impl::draw(const gpu::Draw &d) {
     raster.depthBiasEnable = depth ? VK_TRUE : VK_FALSE; // the polygon offset, set at the draw
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = msaa == 0 ? VK_SAMPLE_COUNT_1_BIT : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
+    if (sample_shading) multisample.sampleShadingEnable = VK_TRUE, multisample.minSampleShading = 1.0f;
     VkPipelineDepthStencilStateCreateInfo depth_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     if (depth) {
         depth_state.depthTestEnable = (depth_control >> 1) & 1;
@@ -4102,7 +4383,9 @@ void Impl::draw(const gpu::Draw &d) {
         VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_CULL_MODE,
         VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
-        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE};
+        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+        // (core) the lines' width, PA_SU_LINE_CNTL's
+        VK_DYNAMIC_STATE_LINE_WIDTH};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states));
     dynamic.pDynamicStates = dynamic_states;
@@ -4312,6 +4595,21 @@ void Impl::draw(const gpu::Draw &d) {
     vkCmdSetStencilOp(c, VK_STENCIL_FACE_BACK_BIT, back.failOp, back.passOp, back.depthFailOp, back.compareOp);
     vkCmdSetDepthBiasEnable(c, raster.depthBiasEnable);
     {
+        // Lines as wide as PA_SU_LINE_CNTL's WIDTH says (half the width in
+        // 12.4 fixed point, AMD's R6xx guide and freedreno's a2xx.xml; 8, one
+        // pixel, is Xenia's reset value), within what the device draws; one
+        // pixel without wide lines, as Xenia draws all of them (a TODO there)
+        float width = 1.0f;
+        if (topology_class == 1) {
+            float guest = float(regs_[r::PA_SU_LINE_CNTL] & 0xFFFF) * (1.0f / 8.0f);
+            width = d_.wide_lines() ? std::clamp(guest, d_.min_line_width(), d_.max_line_width()) : 1.0f;
+            if (width != guest)
+                approximate(d_.wide_lines() ? "line widths outside the device's range (clamped)"
+                                            : "wide lines drawn one pixel wide (no wide lines on the device)");
+        }
+        vkCmdSetLineWidth(c, width);
+    }
+    {
         // the polygon offset as Xenia's Vulkan backend sets it
         // (draw_util.cc's GetPreferredFacePolygonOffset, then the guest's
         // units in host ones: kD3D10PolygonOffsetFactorFloat24 or Unorm24,
@@ -4430,17 +4728,28 @@ void Impl::resolve() {
                 } else switch (t->host) {
                 case H::RGBA8:
                     for (int j = 0; j < 4; j++) cv.float32[j] = float((value >> (8 * j)) & 0xFF) / 255.0f;
+                    // a gamma target kept linear holds the clear linear, as Xenia's
+                    if (t->gamma_linear)
+                        for (int j = 0; j < 3; j++) cv.float32[j] = pwl_gamma_to_linear(cv.float32[j]);
                     break;
                 case H::RGB10A2:
                     for (int j = 0; j < 3; j++) cv.float32[j] = float((value >> (10 * j)) & 0x3FF) / 1023.0f;
                     cv.float32[3] = float((value >> 30) & 3) / 3.0f;
                     break;
                 case H::RG16F: case H::RGBA16F:
-                    for (int j = 0; j < 4; j++) cv.float32[j] = half_to_float(uint16_t(value >> (16 * j)));
+                    // through the UINT view, the bits as they are, where the
+                    // target is moved by its bits
+                    for (int j = 0; j < 4; j++) {
+                        if (t->raw)
+                            cv.uint32[j] = uint32_t(value >> (16 * j)) & 0xFFFF;
+                        else
+                            cv.float32[j] = half_to_float(uint16_t(value >> (16 * j)));
+                    }
                     break;
                 case H::R32F: case H::RG32F:
-                    cv.float32[0] = as_float(uint32_t(value >> (t->host == H::RG32F ? 32 : 0)));
-                    cv.float32[1] = as_float(uint32_t(value));
+                    // (the same bits as floats or through the UINT view)
+                    cv.uint32[0] = uint32_t(value >> (t->host == H::RG32F ? 32 : 0));
+                    cv.uint32[1] = uint32_t(value);
                     break;
                 case H::RG16: case H::RGBA16: // snorm: the guest's bits
                     for (int j = 0; j < 4; j++)
@@ -4456,7 +4765,7 @@ void Impl::resolve() {
             VkCommandBuffer c = outside();
             gpu_mark("resolves: clears");
             VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            attachment.imageView = t->view;
+            attachment.imageView = t->raw ? t->raw : t->view;
             attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -4521,7 +4830,9 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // keeps them, as Xenia's resolve shaders read them (the sample or the
     // average RB_COPY_CONTROL selects; depth one sample): the rectangle's
     // tiles stored there first by the target, which keeps them
-    const bool from_edram = info.msaa != 0;
+    // (and an 8_8_8_8_GAMMA target kept linear, its gamma made in EDRAM's
+    // bits, which Xenia's resolves always read)
+    const bool from_edram = info.msaa != 0 || (!info.depth && source.gamma_linear);
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!from_edram && !grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
@@ -4564,6 +4875,10 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // has no D24S8)
     p.depth_mode = !info.depth || source.image.format != VK_FORMAT_D32_SFLOAT_S8_UINT ? 0 : source.format == 1 ? 1 : 2;
     p.stencil_word = uint32_t(pixel_bytes / 4);
+    // as EDRAM's bits would be (Xenia resolves from its EDRAM dump, which
+    // follows depth_float24_round; a depth converted in the pixel shader is
+    // exact either way)
+    p.depth_round = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader;
     p.raw = resolve::raw_copy(info);
     p.dest_base = info.dest_base, p.dest_pitch = info.dest_pitch, p.dest_height = info.dest_height;
     p.dest_x = info.dest_x, p.dest_y = info.dest_y, p.dest_slice = info.dest_slice, p.dest_array = info.dest_array;
@@ -4702,6 +5017,12 @@ void Impl::swap() {
     end_query();
     zpd_current_ = 0;
     uint64_t number = report_.swaps++;
+    {
+        // the display's look-up table mode (display_gamma), counted
+        char what[96];
+        std::snprintf(what, sizeof(what), "swaps with DC_LUTA_CONTROL 0x%06X", regs_[r::DC_LUTA_CONTROL]);
+        use(what);
+    }
     const bool read = options_.frame_wanted && options_.frame_wanted(number);
     texture::Info info;
     Texture *t = read || options_.on_swap ? front_texture(info) : nullptr;
@@ -4715,8 +5036,10 @@ void Impl::swap() {
         // image's four components
         front.swizzle = texture::compose_swizzle(info.swizzle, t->host_swizzle);
         front.components = 4;
-        front.gamma_table = info.format != 7 && info.format != 54; // as deliver
+        front.bits = info.format == 7 || info.format == 54 ? 10 : 8; // as deliver
+        front.luta_control = regs_[r::DC_LUTA_CONTROL];
         front.gamma = processor_.gamma_ramp_table();
+        front.pwl = processor_.gamma_ramp_pwl();
     }
     flush();
     if (front.image && fatal_.empty()) options_.on_swap(front);
@@ -4760,6 +5083,7 @@ void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &i
     read.swizzle = texture::compose_swizzle(info.swizzle, t.host_swizzle), read.format = info.format;
     read.gamma = processor_.gamma_ramp_table();
     read.pwl = processor_.gamma_ramp_pwl();
+    read.luta_control = regs_[r::DC_LUTA_CONTROL];
     bool compressed = texture::is_compressed(read.host);
     read.bytes = compressed ? VkDeviceSize((read.width + 3) / 4) * ((read.height + 3) / 4)
                             : VkDeviceSize(read.width) * read.height;
@@ -4803,45 +5127,58 @@ void Impl::deliver(const FrontRead &read) {
             uint8_t value = guest == 5 ? 255 : guest >= 4 ? 0 : rgba[i * 4 + guest];
             frame.rgba[i * 4 + c] = c == 3 ? 255 : value; // shown opaque, as the presenter does
         }
-    // the display's gamma, the processor's ramps: as Xenia's presenter, the
-    // piecewise linear ramp for 2_10_10_10 front buffers
-    // (apply_gamma_pwl.xesli: a component's 10 bits pick an entry by their
-    // top 7, base plus delta times the low 3 over 8, in 1/64 of 1023), the
-    // 256-entry table for the rest (apply_gamma_table.xesli), the 10 bits
-    // they give back to 8 (presenter.h's Packed10bpcRGBTo8bpcBytes)
-    if (read.format == 7 || read.format == 54) {
-        if (read.host != texture::HostFormat::RGB10A2) {
-            approximate("the display's piecewise linear gamma ramp (front buffer not 10 bits a component)");
-        } else {
-            for (size_t i = 0; i < pixels; i++) {
+    // The display's gamma (display_gamma: DC_LUTA_CONTROL's 256-entry table
+    // or piecewise linear ramp per component, Xenia's apply_gamma_table and
+    // apply_gamma_pwl where they agree), on the front buffer's 8 bits a
+    // component, or 10 for 2_10_10_10; the 10 bits it gives back to 8
+    // (presenter.h's Packed10bpcRGBTo8bpcBytes).
+    const bool ten_bits = read.format == 7 || read.format == 54;
+    if (read.luta_control & 0x303030) approximate("DC_LUTA_CONTROL's signed or floating-point data (read as unsigned)");
+    if (read.luta_control & 0xF0F00) approximate("DC_LUTA_CONTROL's green and red increments (the blue one's applies)");
+    if (ten_bits && !(read.luta_control & 0xF))
+        approximate("the display's 256-entry gamma table on a 10-bit front buffer (its top 8 bits)");
+    if (ten_bits && read.host != texture::HostFormat::RGB10A2) {
+        approximate("the display's gamma ramp (front buffer not 10 bits a component)");
+    } else {
+        for (size_t i = 0; i < pixels; i++) {
+            uint32_t values[4] = {};
+            if (ten_bits) {
                 uint32_t word;
                 std::memcpy(&word, read.data + 4 * i, 4);
-                const uint32_t values[4] = {word & 0x3FF, (word >> 10) & 0x3FF, (word >> 20) & 0x3FF,
-                                            (word >> 30) * 341};
+                const uint32_t texel[4] = {word & 0x3FF, (word >> 10) & 0x3FF, (word >> 20) & 0x3FF,
+                                           (word >> 30) * 341};
                 for (uint32_t c = 0; c < 3; c++) {
                     uint32_t guest = (read.swizzle >> (3 * c)) & 7;
-                    uint32_t value = guest == 5 ? 1023 : guest >= 4 ? 0 : values[guest];
-                    uint32_t entry = read.pwl[(value >> 3) * 3 + c];
-                    float out = (float(entry & 0xFFFF) + float((value & 7) * (entry >> 16)) * (1.0f / 8.0f)) *
-                                (1.0f / (64.0f * 1023.0f));
-                    uint32_t ten = uint32_t(std::clamp(out, 0.0f, 1.0f) * 1023.0f + 0.5f);
-                    frame.rgba[i * 4 + c] = uint8_t(float(ten) * (255.0f / 1023.0f) + 0.5f);
+                    values[c] = guest == 5 ? 1023 : guest >= 4 ? 0 : texel[guest];
                 }
+            } else {
+                for (uint32_t c = 0; c < 3; c++) values[c] = frame.rgba[i * 4 + c];
+            }
+            for (uint32_t c = 0; c < 3; c++) {
+                uint32_t ten = display_gamma(values[c], ten_bits ? 10 : 8, c, read.luta_control, read.gamma, read.pwl);
+                frame.rgba[i * 4 + c] =
+                    ten_bits ? uint8_t(float(ten) * (255.0f / 1023.0f) + 0.5f) : uint8_t((ten * 255 + 511) / 1023);
             }
         }
-    } else {
-        for (size_t i = 0; i < pixels; i++)
-            for (uint32_t c = 0; c < 3; c++) {
-                uint32_t entry = read.gamma[frame.rgba[i * 4 + c]];
-                uint32_t ten = (entry >> (c == 0 ? 20 : c == 1 ? 10 : 0)) & 0x3FF;
-                frame.rgba[i * 4 + c] = uint8_t((ten * 255 + 511) / 1023);
-            }
     }
     report_.frames++;
     if (options_.on_frame) options_.on_frame(read.number, frame);
 }
 
 } // namespace
+
+uint32_t display_gamma(uint32_t value, uint32_t bits, uint32_t channel, uint32_t luta_control,
+                       const std::array<uint32_t, 256> &table, const std::array<uint32_t, 128 * 3> &pwl) {
+    uint32_t increment = luta_control & 0xF;
+    if (!increment) return (table[(value >> (bits - 8)) & 0xFF] >> (channel == 0 ? 20 : channel == 1 ? 10 : 0)) & 0x3FF;
+    increment = std::min(increment, 9u);
+    uint32_t entry = pwl[((value >> increment) & 0x7F) * 3 + channel];
+    // base and delta in 1/64 of the 10 bits (their low 6 bits are zero)
+    float out =
+        (float(entry & 0xFFFF) + float((value & ((1u << increment) - 1)) * (entry >> 16)) / float(1u << increment)) *
+        (1.0f / (64.0f * 1023.0f));
+    return uint32_t(std::clamp(out, 0.0f, 1.0f) * 1023.0f + 0.5f);
+}
 
 std::unique_ptr<Renderer> Renderer::create(vk::Device &device, gpu::CommandProcessor &processor,
                                            const Options &options, std::string &error) {

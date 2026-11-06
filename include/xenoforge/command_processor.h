@@ -85,6 +85,11 @@ struct Draw {
     bool index32 = false;
     uint32_t index_base = 0, index_bytes = 0;
     Endian index_endian = Endian::None;
+    // immediate indices (VGT_DRAW_INITIATOR's source_select 1): the packet's
+    // words after the initiator, as AMD's DRAW_INDEX_IMMD has them (R6xx 3D
+    // Register Reference Guide): one 32-bit index a word, or two 16-bit ones,
+    // the first in the low half; indexed is set, with no index buffer
+    std::vector<uint32_t> immediate;
 };
 
 // XE_SWAP, the packet VdSwap writes: the front buffer, physical
@@ -149,7 +154,8 @@ struct Counts {
     std::atomic<uint64_t> primary_buffers{0}; // primary buffer runs
     std::atomic<uint64_t> indirect_buffers{0};
     std::atomic<uint64_t> draws{0}, resolves{0}, swaps{0};
-    std::atomic<uint64_t> failed_draws{0};                    // immediate indices or no valid source, as Xenia reports
+    std::atomic<uint64_t> failed_draws{0};                    // no valid index source (or a packet too short)
+    std::atomic<uint64_t> immediate_draws{0};                 // with immediate indices (Xenia fails them)
     std::atomic<uint64_t> interrupts{0};                      // INTERRUPT's, one per CPU in its mask
     std::atomic<uint64_t> waits{0};                           // WAIT_REG_MEM polls that did not match
     std::atomic<uint64_t> bad_packets{0};                     // ones that stopped their buffer

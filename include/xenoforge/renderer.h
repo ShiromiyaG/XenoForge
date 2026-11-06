@@ -73,6 +73,11 @@ struct Report {
     std::map<std::string, uint64_t> skipped;     // draws not done, by reason
     std::map<std::string, std::vector<uint64_t>> skipped_at; // the first swaps (by number) each reason came in
     std::map<std::string, uint64_t> approximate; // done, with something not exact yet, by what
+    // What the draws and packets asked for, done or not, by what: the
+    // features the corpus and the games use, to order the work by (user clip
+    // planes, line widths, gamma targets, screen-extent and VIZ queries,
+    // immediate indices)
+    std::map<std::string, uint64_t> used;
     // The GPU's time by kind of work (Options::gpu_timing): timestamps
     // written where the kind changes, each interval counted to the kind that
     // began it; the submissions' first to last timestamps in all
@@ -95,9 +100,33 @@ struct FrontBuffer {
     uint32_t width = 0, height = 0;
     uint32_t swizzle = 0;    // the fetch constant's: 3 bits a component (red first), 0-3 a texel's, 4 zero, 5 one
     uint32_t components = 4; // in the image's format (a swizzle past them takes the last)
-    bool gamma_table = true; // the display's 256-entry ramp applies (not the piecewise one of 2_10_10_10)
-    std::array<uint32_t, 256> gamma{}; // that ramp at the swap: 10 bits a component, red highest
+    // The display's gamma (display_gamma below): the front buffer's bits a
+    // component the display reads (8, or 10 for 2_10_10_10), DC_LUTA_CONTROL
+    // at the swap, the 256-entry ramp (10 bits a component, red highest) and
+    // the piecewise linear one (128 entries a component, red, green, blue;
+    // base in bits 0-15, delta in 16-31)
+    uint32_t bits = 8;
+    uint32_t luta_control = 0;
+    std::array<uint32_t, 256> gamma{};
+    std::array<uint32_t, 128 * 3> pwl{};
 };
+
+// A component through the display's look-up table A by DC_LUTA_CONTROL (the
+// register libxenon and Direct3D program, 0x1930), as AMD's RV630 Register
+// Reference Guide gives its increment exponent: 0 the 256-entry table,
+// indexed by the component's 8 bits (a 10-bit component's top 8, which no
+// reference states), else the piecewise linear ramp of 128 entries, indexed
+// by bits INC+6 to INC, the bits below it times the entry's delta over 2^INC
+// added to its base. The RV630 has an increment per component (blue bits
+// 0-3, green 8-11, red 16-19), but Direct3D writes 3 for a 10-bit front
+// buffer, which Xenia (and the console's picture as Xenia draws it) takes as
+// the ramp for all three: the blue field's increment applies to every
+// component here. Xenia picks the table or the ramp by the front buffer's
+// format and always steps by 8 (DC_LUTA_CONTROL 0 and 3, what Direct3D
+// writes for 8- and 10-bit fronts); both agree there. value: the component in `bits` bits; channel: 0 red, 1
+// green, 2 blue. The result: 10 bits.
+uint32_t display_gamma(uint32_t value, uint32_t bits, uint32_t channel, uint32_t luta_control,
+                       const std::array<uint32_t, 256> &table, const std::array<uint32_t, 128 * 3> &pwl);
 
 // When the CPU sees what a resolve wrote (Xenia's readback_resolve option):
 // the GPU's copy of guest memory always has it, and textures read it there.
@@ -168,6 +197,20 @@ struct Options {
     // "greater or equal" test passing on a second pass over depth that lost
     // the host's precision)
     bool depth_float24_round = false;
+    // 8_8_8_8_GAMMA color targets kept linear as RGBA16 unorm, so that they
+    // blend in linear as the console's do, their gamma made and undone where
+    // they move through EDRAM (Xenia's gamma_render_target_as_unorm16, on by
+    // default as there); off, or on a device that cannot blend that format,
+    // the pixel shader writes the gamma curve and the blend works on it
+    bool gamma_render_target_as_unorm16 = true;
+    // The depth of draws into a D24FS8 target with the depth test on written
+    // by the pixel shader rounded to 20e4 (towards zero, or to the nearest
+    // even with depth_float24_round), so the host's depth holds only what
+    // EDRAM's 24 bits can, and a pass over depth that went through EDRAM
+    // compares equal; the shader runs per sample under MSAA. Xenia's
+    // depth_float24_convert_in_pixel_shader, off by default as there (the
+    // host's depth is kept beside EDRAM instead, renderer.md).
+    bool depth_float24_convert_in_pixel_shader = false;
     // The texture cache's memory limits, in MB of the GPU memory its images
     // hold, as Xenia's texture_cache_memory_limit_* (its defaults): above the
     // soft limit, textures unused for soft_lifetime seconds are destroyed,

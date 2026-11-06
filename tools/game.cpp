@@ -122,6 +122,7 @@ void print_renderer_report(const render::Report &r) {
     }
     for (const auto &[what, n] : r.approximate)
         std::printf("  approx  %8llu  %s\n", (unsigned long long)n, what.c_str());
+    for (const auto &[what, n] : r.used) std::printf("  uses    %8llu  %s\n", (unsigned long long)n, what.c_str());
 }
 
 #ifndef XF_GENERATED

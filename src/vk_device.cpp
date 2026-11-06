@@ -120,6 +120,25 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     const char *no_tess = std::getenv("XF_VK_NO_TESSELLATION");
     if (has.features.tessellationShader && !(no_tess && no_tess[0] && no_tess[0] != '0'))
         features.features.tessellationShader = d->tessellation_shader_ = true;
+    // optional: clip and cull distances (the guest's user clip planes;
+    // without them those draws are skipped and counted), and wide lines
+    // (PA_SU_LINE_CNTL; without them lines are drawn one pixel wide, counted);
+    // XF_VK_NO_CLIP_DISTANCE=1 and XF_VK_NO_WIDE_LINES=1 turn them off
+    auto turned_off = [](const char *name) {
+        const char *v = std::getenv(name);
+        return v && v[0] && v[0] != '0';
+    };
+    if (!turned_off("XF_VK_NO_CLIP_DISTANCE")) {
+        if (has.features.shaderClipDistance) features.features.shaderClipDistance = d->clip_distance_ = true;
+        if (has.features.shaderCullDistance) features.features.shaderCullDistance = d->cull_distance_ = true;
+    }
+    if (has.features.wideLines && !turned_off("XF_VK_NO_WIDE_LINES")) {
+        features.features.wideLines = d->wide_lines_ = true;
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(d->physical_, &props);
+        d->line_width_range_[0] = props.limits.lineWidthRange[0];
+        d->line_width_range_[1] = props.limits.lineWidthRange[1];
+    }
     features.features.depthClamp = VK_TRUE;
     features.features.sampleRateShading = VK_TRUE;
     features.features.independentBlend = VK_TRUE;

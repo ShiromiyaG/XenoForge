@@ -68,6 +68,20 @@ line width (A9, not counted), the screen-extent query (A10, not counted).
 | A9 | `vulkan/vulkan_pipeline_cache.cc:2989` | wide lines: the line width is fixed at 1 | `PA_SU_LINE_CNTL` (0x2282, `WIDTH` in 12.4 fixed point per Mesa's `a2xx.xml`; R6xx guide: "1/2 width of line, in subpixels"; Xenia's reset value is 8, a one-pixel line) is in the register file. Ours: `renderer.cpp:2625`, `:4065`, `:4134` set `lineWidth = 1.0`. Set it dynamically from the register; where the host has no wide lines, expand lines to quads in the geometry or vertex shader as points are. | S (wide lines), M (expansion) | `wideLines` (optional, not enabled yet) + `VK_DYNAMIC_STATE_LINE_WIDTH` (core); fallback expansion | not counted; no trace known to draw a wide line |
 | A10 | `command_processor.h:305`; `draw_util.cc:74` | EVENT_WRITE_EXT (screen extent) reports are not tracked; once they are, draws killed after hi-Z that feed only the VIZ survey must rasterize so the extents can come back empty | Xenia answers every screen-extent report with the full screen (x and y 0 to 8192/8 in the report's units, z 0 to 1; `pm4_command_processor_implement.h:957-966`), citing patent US20060055701 for the real meaning; its `occlusion_query_viz` option (off) does VIZ_QUERY predicates with coarse occlusion queries (`command_processor.cc:81-92`). Ours writes the same fake extents (`src/gpu/command_processor.cpp:575-583`) and `VIZ_QUERY` only marks the event (`:390`). Real extents: the min/max of the pixel positions and depths each draw between the events covers, by a pass in the renderer's occlusion-query bookkeeping (`renderer.cpp:1040-1100`, the same draw ranges); units and the hi-Z interplay want one measurement (C27). | M | `fragmentStoresAndAtomics` (required already) | not counted; nothing traced reads them |
 
+**Since (2026-11-06; `docs/renderer.md`, "Xenia's GPU TODOs, category A"):** A2 to A9 done, A10 counted and
+left at Xenia's defaults. Counted first over the 115 traces and live runs of El Chavo Kart and Ben 10:
+EVENT_WRITE_EXT (Ben 10, live 48,676 in 300 s; RDR 4,878 in two traces), D24FS8 depth (El Chavo Kart, 2.75
+million draws in 420 s; Reach, RDR), user clip planes (RDR, 288 draws), gamma targets (RDR 91, FH 4, Reach 1),
+VIZ_QUERY (RDR, 232); no wide lines, immediate indices or getBCF anywhere.
+- A2: 8_8_8_8_GAMMA targets as RGBA16 unorm holding linear, gamma made and undone in EDRAM's bits (Xenia's
+  default); A3: user clip planes as clip or cull distances, points by `ps_ucp_mode` as Xenia's TODO describes;
+  A4: Xenia's `depth_float24_convert_in_pixel_shader` (off by default as there), per sample through a
+  sample-decorated position; A5: immediate indices from the packet (AMD's `DRAW_INDEX_IMMD` layout; the 16-bit
+  order in a word is open, counted); A6: the display's table or ramp by `DC_LUTA_CONTROL`'s increment (the blue
+  field's for all components: Direct3D's 3 for 10-bit fronts sets only it); A7: float16 and float32 targets moved by their bits through UINT views; A8: getBCF translated as
+  Xenia's 0 (counted; the real fraction stays C-like); A9: dynamic line width from `PA_SU_LINE_CNTL` with
+  `wideLines`; A10: screen extents faked and VIZ predicates ignored, as Xenia's defaults, counted.
+
 ## C. Unknown: only hardware answers (by impact)
 
 The test programs, for the owner's Trinity (lent out now): libxenon programs, results on USB.

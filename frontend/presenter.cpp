@@ -20,7 +20,7 @@ const uint32_t FRONT_BUFFER[] = {
 
 // front_buffer.comp's push constants
 struct Push {
-    uint32_t width, height, swizzle, components, gamma;
+    uint32_t width, height, swizzle, components, bits, luta;
 };
 
 // one barrier, everything before to everything after (a few per frame)
@@ -180,7 +180,7 @@ bool Presenter::make_pipeline(std::string &error) {
         dai.descriptorPool = convert_pool_sets_;
         dai.descriptorSetCount = 1;
         dai.pSetLayouts = &set_layout_;
-        p.ramp = device_->create_buffer(256 * sizeof(uint32_t), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
+        p.ramp = device_->create_buffer((256 + 128 * 3) * sizeof(uint32_t), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, true);
         if (vkAllocateCommandBuffers(dev_, &cai, &p.cmd) != VK_SUCCESS ||
             vkAllocateDescriptorSets(dev_, &dai, &p.set) != VK_SUCCESS || !p.ramp.mapped)
             return error = "the window's pictures could not be made", false;
@@ -272,6 +272,7 @@ bool Presenter::take(const render::FrontBuffer &front) {
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     if (vkCreateImageView(dev_, &vi, nullptr, &p.front) != VK_SUCCESS) return skipped++, false;
     std::memcpy(p.ramp.mapped, front.gamma.data(), sizeof(front.gamma));
+    std::memcpy(static_cast<uint8_t *>(p.ramp.mapped) + sizeof(front.gamma), front.pwl.data(), sizeof(front.pwl));
 
     VkDescriptorImageInfo source{sampler_, p.front, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo target{VK_NULL_HANDLE, p.storage, VK_IMAGE_LAYOUT_GENERAL};
@@ -300,7 +301,7 @@ bool Presenter::take(const render::FrontBuffer &front) {
     barrier(cmd, p.image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &p.set, 0, nullptr);
-    Push push{front.width, front.height, front.swizzle, std::max(front.components, 1u), front.gamma_table ? 1u : 0u};
+    Push push{front.width, front.height, front.swizzle, std::max(front.components, 1u), front.bits, front.luta_control};
     vkCmdPushConstants(cmd, pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, (front.width + 7) / 8, (front.height + 7) / 8, 1);
     // a screenshot of the picture: copied back too

@@ -8,12 +8,14 @@
 // plays the trace N times through the same renderer, as a game draws a frame
 // again, the GPU time then being the fastest of the plays after the first.
 // --readback-resolve none|fast|full is Xenia's readback_resolve, --depth-float24-round its
-// depth_float24_round (renderer.h). --texture-memory soft,hard[,lifetime] sets the texture
-// cache's memory limits (Xenia's texture_cache_memory_limit_*; renderer.h).
+// depth_float24_round, --depth-float24-convert its depth_float24_convert_in_pixel_shader,
+// --no-gamma-unorm16 its gamma_render_target_as_unorm16 off (renderer.h). --texture-memory soft,hard[,lifetime] sets
+// the texture cache's memory limits (Xenia's texture_cache_memory_limit_*; renderer.h).
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
 //            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
 //            [--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round]
+//            [--depth-float24-convert] [--no-gamma-unorm16]
 //            [--texture-memory soft,hard[,lifetime]] [-v]
 
 #include "xenoforge/renderer.h"
@@ -37,6 +39,7 @@ int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
                          "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
                          "[--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] "
+                         "[--depth-float24-convert] [--no-gamma-unorm16] "
                          "[--texture-memory soft,hard[,lifetime]] [-v]\n");
     return 2;
 }
@@ -66,6 +69,12 @@ int main(int argc, char **argv) {
         else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
         // Xenia's depth_float24_round
         else if (a == "--depth-float24-round") options.depth_float24_round = true;
+        // Xenia's depth_float24_convert_in_pixel_shader
+        else if (a == "--depth-float24-convert")
+            options.depth_float24_convert_in_pixel_shader = true;
+        // Xenia's gamma_render_target_as_unorm16 off
+        else if (a == "--no-gamma-unorm16")
+            options.gamma_render_target_as_unorm16 = false;
         // the texture cache's memory limits, soft,hard[,soft lifetime] in MB
         // and seconds (0,0 destroys what the GPU is done with each time it
         // finishes work: with --repeat, every texture between the plays)
@@ -130,6 +139,7 @@ int main(int argc, char **argv) {
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)
         std::printf("  approx  %6llu  %s\n", (unsigned long long)n, what.c_str());
+    for (const auto &[what, n] : report.used) std::printf("  uses    %6llu  %s\n", (unsigned long long)n, what.c_str());
     if (options.gpu_timing) {
         // a play's GPU time: the fastest of the plays after the first, when repeated
         std::vector<std::pair<std::string, xf::render::Report::GpuTime>> kinds(report.gpu_time.begin(),

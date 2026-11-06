@@ -13,10 +13,10 @@ layout(set = 0, binding = 0) buffer Edram { uint words[]; } edram;
 layout(set = 0, binding = 1) readonly buffer Mask { uint tiles[]; } mask;
 #ifdef MS
 layout(set = 0, binding = 2) uniform texture2DMS source;   // color, or depth
-layout(set = 0, binding = 3) uniform utexture2DMS stencil; // depth targets'
+layout(set = 0, binding = 3) uniform utexture2DMS stencil; // depth targets', or a float target's UINT view
 #else
 layout(set = 0, binding = 2) uniform texture2D source;
-layout(set = 0, binding = 3) uniform utexture2D stencil;
+layout(set = 0, binding = 3) uniform utexture2D stencil; // or a float target's UINT view
 #endif
 layout(set = 0, binding = 4) writeonly buffer HostDepth { uint words[]; } host_depth;
 
@@ -41,9 +41,18 @@ void main() {
             uint s = texelFetch(stencil, ivec2(pixel), 0).r;
 #endif
             edram.words[at] = pack_depth(value.r, s);
-            if ((target.depth_flags & 1u) != 0u) host_depth.words[host_depth_offset(at)] = floatBitsToUint(value.r);
+            if ((target.flags & 1u) != 0u) host_depth.words[host_depth_offset(at)] = floatBitsToUint(value.r);
         } else {
-            uvec2 bits = pack_color(value);
+            uvec2 bits;
+            if ((target.flags & 8u) != 0u) {
+#ifdef MS
+                bits = pack_raw(texelFetch(stencil, ivec2(pixel), int(host)));
+#else
+                bits = pack_raw(texelFetch(stencil, ivec2(pixel), 0));
+#endif
+            } else {
+                bits = pack_color(value);
+            }
             edram.words[at] = bits.x;
             if (target.ints_log2 != 0u) edram.words[at + 1u] = bits.y;
         }

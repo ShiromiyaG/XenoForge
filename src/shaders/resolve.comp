@@ -33,6 +33,10 @@ layout(push_constant) uniform Resolve {
     // Xenia's resolve shaders read it: the surface's base and pitch in tiles,
     // its samples, 64-bit samples, the rectangle's corner, the samples taken
     uint edram, edram_base, edram_pitch, msaa, ints_log2, src_x, src_y, first_sample, samples;
+    // depth_mode 1: 20e4 rounded to the nearest even rather than towards zero
+    // (Xenia's depth_float24_round, which its resolves follow, made from its
+    // EDRAM dump)
+    uint depth_round;
 } p;
 
 #include "tiling.glsl"
@@ -357,13 +361,15 @@ uint copy_raw(uint w0, uint w1, out uint w[4]) {
     return count;
 }
 
-// xenos::Float32To20e4, rounded towards zero (Xenia's default)
-uint float_to_float24(float f) {
+// xenos::Float32To20e4, rounded towards zero (Xenia's default) or to the
+// nearest even
+uint float_to_float24(float f, bool round_to_nearest_even) {
     if (!(f > 0.0)) return 0u;
     uint u = floatBitsToUint(f);
     if (u >= 0x3FFFFFF8u) return 0xFFFFFFu;
     if (u < 0x38800000u) u = (0x800000u | (u & 0x7FFFFFu)) >> min(113u - (u >> 23u), 24u);
     else u += 0xC8000000u;
+    if (round_to_nearest_even) u += 3u + ((u >> 3u) & 1u);
     return (u >> 3u) & 0xFFFFFFu;
 }
 
@@ -403,7 +409,7 @@ void main() {
         if (p.depth_mode == 0u) {
             d24 = d & 0xFFFFFFu;
         } else if (p.depth_mode == 1u) {
-            d24 = float_to_float24(uintBitsToFloat(d) * 2.0);
+            d24 = float_to_float24(uintBitsToFloat(d) * 2.0, p.depth_round != 0u);
         } else {
             precise float scaled = clamp(uintBitsToFloat(d), 0.0, 1.0) * 16777215.0;
             d24 = uint(roundEven(scaled));

@@ -712,9 +712,27 @@ bool CommandProcessor::draw(uint32_t viz_query, uint32_t remaining) {
         break;
     }
     case SourceSelect::AutoIndex: break;
+    case SourceSelect::Immediate: {
+        // The indices in the packet (Xenia fails these draws, a TODO there):
+        // AMD's DRAW_INDEX_IMMD gives them after the initiator, 32-bit ones a
+        // word each, 16-bit ones two a word with the first in the low half.
+        // The words are the ring's, already as the CPU wrote them; which half
+        // a big-endian CPU's first index lands in only hardware can say.
+        uint32_t words = d.index32 ? d.count : (d.count + 1) / 2;
+        if (words > remaining) {
+            ok = false;
+            break;
+        }
+        d.immediate.resize(words);
+        for (uint32_t i = 0; i < words; i++) d.immediate[i] = reader_.next();
+        remaining -= words;
+        d.indexed = true;
+        d.index_bytes = d.count * (d.index32 ? 4 : 2);
+        bump(counts_.immediate_draws);
+        break;
+    }
     default:
-        // immediate indices (VGT_IMMED_DATA), which Xenia does not support
-        // either, or no valid source
+        // no valid source
         ok = false;
         break;
     }

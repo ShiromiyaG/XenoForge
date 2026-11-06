@@ -18,7 +18,9 @@ layout(set = 0, binding = 2) readonly buffer HostDepth { uint words[]; } host_de
 
 #include "edram.glsl"
 
-#ifndef DEPTH
+#if defined(UINT)
+layout(location = 0) out uvec4 color; // a float target's bits, through its UINT view (edram.glsl's flags bit 3)
+#elif !defined(DEPTH)
 layout(location = 0) out vec4 color;
 #endif
 
@@ -33,7 +35,7 @@ void main() {
     // beside EDRAM (zeros before any did, which round to 0, the same as
     // EDRAM's 0): if it still rounds to the guest's bits, nothing has written
     // the sample since but a transfer, and the host's precision comes back.
-    if ((target.depth_flags & 1u) != 0u && target.stencil_bit >= 8u) {
+    if ((target.flags & 1u) != 0u && target.stencil_bit >= 8u) {
         float host = uintBitsToFloat(host_depth.words[host_depth_offset(at)]);
         if (depth_to_guest(host) == (low >> 8u)) depth = host;
     }
@@ -45,6 +47,10 @@ void main() {
 #endif
 #else
     uint high = target.ints_log2 != 0u ? edram.words[(at + 1u) % EDRAM_DWORDS] : 0u;
+#ifdef UINT
+    color = unpack_raw(uvec2(low, high));
+#else
     color = unpack_color(uvec2(low, high));
+#endif
 #endif
 }

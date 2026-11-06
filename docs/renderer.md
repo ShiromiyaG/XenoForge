@@ -348,7 +348,8 @@ resolves of MSAA targets;
 point sprite coordinates in the pixel parameters; signed components of
 formats with no signed version (as in Xenia: "Texture formats" below);
 float16 and float32 targets moved through EDRAM by value rather than by
-bits (NaN payloads). Signed, biased, gamma and exponent-adjusted textures,
+bits (NaN payloads; by their bits since, "Xenia's GPU TODOs, category A").
+Signed, biased, gamma and exponent-adjusted textures,
 the pixel parameters, the polygon offset, the samplers' LOD bias, mip
 range, anisotropy and border, render targets keyed by storage format,
 getCompTexLOD and getWeights, alpha to coverage, and the display's
@@ -1273,14 +1274,11 @@ D24S8 a 32-bit float depth, as on devices without 24-bit unorm depth
 an option (`Options::depth_float24_round`, `xfreplay
 --depth-float24-round`, `XF_DEPTH_FLOAT24_ROUND=1`), off as there: the
 EDRAM stores and the loads' comparison round 20e4 to the nearest even
-rather than towards zero. Not done: single-sample depth resolves round as
-`resolve.comp` does (towards zero; Xenia's resolves come from its EDRAM
-dump and follow the option), and `depth_float24_convert_in_pixel_shader`,
-which needs the translator to write every D24FS8 fragment's depth rounded
-to 20e4 (sample-rate shading under MSAA, the viewport's depth bounds
-rounded too) and then turns the host depth off for D24FS8; the 25 draws of
-Reach's menu and the rest keep counting "D24FS8 depth as 32-bit float",
-Xenia's default too.
+rather than towards zero. Single-sample depth resolves follow the option
+too since, and `depth_float24_convert_in_pixel_shader` is an option of its
+own ("Xenia's GPU TODOs, category A" below); off, as Xenia's default, the
+25 draws of Reach's menu and the rest keep counting "D24FS8 depth as
+32-bit float".
 
 **El Chavo Kart's park and race, D3D12 against Vulkan** (2026-11-06): the
 host's anisotropic filtering. Found by patching the trace (a script
@@ -1306,6 +1304,146 @@ is the console's: Xenos's anisotropic filter is not documented, only that
 its fetch constant has the mip filter and the anisotropy apart (as D3D9's
 MIPFILTER and MINFILTER), which Vulkan's set-up, and ours, follow. So
 `replay_test` keeps matching Vulkan's picture for these two frames.
+
+## Xenia's GPU TODOs, category A (2026-11-06)
+
+The items of `docs/xenia-todos-gpu.md`'s category A but the first (exact
+EDRAM through fragment shader interlock, its own task), each as Xenia's code
+does it; where Xenia has nothing, AMD's guides (R5xx, R6xx, RV630) and Mesa
+say what the registers mean.
+
+**What the corpus and the games use** (`Report::used`, printed as `uses`
+by `xfreplay` and the runs: what the draws and packets ask for, done or
+not). Over the 115 traces in `../traces`: Red Dead Redemption's title (two
+traces) has 288 draws with user clip planes, 4,878 EVENT_WRITE_EXT packets,
+232 VIZ_QUERY packets, 844 draws predicated on a VIZ query, 116 VIZ survey
+draws and 91 draws into 8_8_8_8_GAMMA targets; Ben 10's four traces 128
+EVENT_WRITE_EXT; Forza Horizon 4 draws and Reach 1 into gamma targets.
+None draws wide lines, with immediate indices or getBCF, or a point list
+with user clip planes. `DC_LUTA_CONTROL` is 0 at every swap but Forza
+Horizon's (3, its 10-bit front buffer). Live, El Chavo Kart (420 s to the
+race, 11,139 swaps) asks for none of them but D24FS8 depth (2,751,412
+draws); Ben 10 (300 s, 7,067 swaps) for 48,676 EVENT_WRITE_EXT packets and
+nothing else.
+
+- **8_8_8_8_GAMMA targets blended in linear** (Xenia's
+  `gamma_render_target_as_unorm16`, on by default as there,
+  `Options::gamma_render_target_as_unorm16`, `--no-gamma-unorm16`,
+  `XF_VK_NO_GAMMA_UNORM16=1`): such a target is an RGBA16 unorm image
+  holding linear color where the device samples, renders to and blends that
+  format, so the blend is in linear as the console's; the pixel shader
+  writes linear. Its gamma is made where it moves through EDRAM: the store
+  encodes with xenos.cc's LinearToPWLGamma, the load decodes each byte to
+  the middle of its linear range (Xenia's GammaByteToLinearMidpoint, which
+  comes back to the same byte through the 16-bit unorm); clears hold the
+  clear color linear (PWLGammaToLinear); resolves of such a target read
+  EDRAM's bits, as Xenia's always do. Without it the shader writes the
+  curve and the blend works on it (counted). Red Dead Redemption's frame
+  950 went from 0.457 to 0.453 of 255 off Xenia's Direct3D 12 picture
+  (0.469% to 0.458% of pixels), frame 850 and Forza Horizon's and Reach's
+  frames did not move.
+- **User clip planes** (`PA_CL_CLIP_CNTL`'s `ucp_ena_0-5` while clipping is
+  on, `PA_CL_UCP_0_X` on), as Xenia's shader modifications
+  `user_clip_plane_count` and `_cull`: the enabled planes packed in the
+  system constants, each one's distance the dot product of the guest's
+  clip-space position (after `PA_CL_VTE_CNTL`'s formats, before the host's
+  viewport transform) with it, a clip distance, or a cull distance with
+  `ucp_cull_only_ena` (`shader::VertexOptions`). Rectangles and points are
+  expanded in the vertex shader then (the corners' distances are made
+  there; a rectangle's fourth corner's mirrored as its position). Points
+  follow `ps_ucp_mode` as Xenia's TODO describes it from AMD's guides
+  (Xenia's geometry shader copies the center's distances to the corners,
+  which is modes 0 and 1): the center's distances for 0 and 1 (the sprite
+  kept or dropped whole), the center's as cull and the corners' as clip
+  distances for 2, the corners' for 3; mode 2 with more than four planes
+  clips by the corners only (8 distances is what every device has; counted).
+  Mode 1's "radius-based distance" is the center's, as Xenia's TODO says;
+  the radius it means is not documented. Without clip or cull distances on
+  the device (`XF_VK_NO_CLIP_DISTANCE=1`) the draw is skipped and counted.
+  Red Dead Redemption's 144 draws a frame (a water plane's
+  `(-0.0001, -0.386, 586.3, -586.5)`) cut nothing visible: frames 850 and
+  950 did not move; with the planes negated the frame changes (0.018), so
+  the distances are in effect.
+- **D24FS8 depth converted in the pixel shader** (Xenia's
+  `depth_float24_convert_in_pixel_shader`, off by default as there,
+  `Options::depth_float24_convert_in_pixel_shader`,
+  `--depth-float24-convert`): for draws into D24FS8 with the depth test on,
+  the pixel shader writes every fragment's depth (oDepth's, or the
+  rasterized one from the host's 0-0.5 back to 0-1, saturated) rounded to
+  20e4, towards zero (with the conservative DepthLess, as Xenia's
+  `SV_DepthLessEqual`) or to the nearest even with `depth_float24_round`,
+  then halved (`shader::PixelOptions`, Xenia's
+  `CompletePixelShader_DSV_DepthTo24Bit`). It runs per sample under MSAA
+  through a sample-decorated position, as Xenia's `IsSampleRate` (the other
+  inputs stay at the pixel's center: with the pipeline's sample shading
+  instead they moved to the samples, and Red Dead Redemption's foliage
+  edges came out 1.09 of 255 off). Depth-only draws that test or write
+  depth get `depth_float24.frag` (Xenia's float24 truncate and round
+  fragment shaders), per sample by the pipeline. The viewport's depth
+  bounds go through 20e4 (nearest even), the host's depth is no longer kept
+  beside EDRAM for D24FS8, and EDRAM stores do not round again (Xenia's
+  `IsHostDepthEncodingDifferent` and dump). Not done: Xenia's newer polygon
+  offset in the shader (`depth_bias_shader_offset`, off by default there).
+  Red Dead Redemption's frame 950 with it is 0.660 of 255 (1.04% of pixels)
+  off Xenia's Vulkan picture with the same option; Xenia's Direct3D 12
+  picture with it is broken (colored noise over the scene, 20.6 off either),
+  so the Vulkan one is the reference there.
+- **Single-sample depth resolves** honor `depth_float24_round` in
+  `resolve.comp` (20e4 rounded to the nearest even from the host's float),
+  as Xenia's resolves follow it through its EDRAM dump.
+- **Immediate indices** (`DRAW_INDX`/`DRAW_INDX_2` with source select 1,
+  which Xenia fails: "report the game"): the processor takes the indices
+  from the packet as AMD's `DRAW_INDEX_IMMD` lays them out (one 32-bit
+  index a word, or two 16-bit ones, the first in the low half) into
+  `gpu::Draw::immediate`, and the renderer draws them as an index buffer's
+  (the reset index, offset, 24 bits, clamps). Which half a big-endian CPU's
+  first 16-bit index lands in only hardware can say (counted as
+  approximate). No trace or game sends one.
+- **The display's look-up table by `DC_LUTA_CONTROL`** (register 0x1930;
+  AMD's RV630 guide, the register Direct3D and libxenon program): the
+  increment exponent picks the 256-entry table (0, indexed by the
+  component's 8 bits; a 10-bit front buffer's top 8, which no reference
+  states, counted) or the piecewise linear ramp (index bits INC+6 to INC,
+  the bits below times the entry's delta over 2^INC added to its base),
+  `render::display_gamma`, in the read-back and in the player's presenter
+  (which had applied no ramp to 10-bit fronts). The RV630 has an increment
+  per component (blue bits 0-3, green 8-11, red 16-19); Direct3D writes 3
+  for Forza Horizon's 10-bit front buffer, which read per component turned
+  red and green to the table and its intro 3.955 of 255 off Xenia's
+  picture, so on the Xenos the blue field's increment applies to all three
+  (the others counted when set). Xenia picks by the front buffer's format
+  with the increment 8; both agree on what Direct3D writes (0 for 8-bit
+  fronts, 3 for 10-bit). Signed and float data enables are read as
+  unsigned (counted).
+- **Float targets' bits through EDRAM** (16_16_FLOAT, 16_16_16_16_FLOAT,
+  32_FLOAT, 32_32_FLOAT): their images are made mutable and moved through a
+  UINT view of the same image (stores read it, loads render into it,
+  clears write the clear color's bits through it), so NaN payloads and
+  denormals survive as the console's EDRAM keeps them (Xenia's D3D12 TODO on
+  D3D11.3's NaN rules); where the device cannot sample and render the UINT
+  format at the target's samples (`framebufferIntegerColorSampleCounts`),
+  or with `XF_VK_NO_RAW_FLOAT_TARGETS=1`, by value as before. 2_10_10_10_FLOAT
+  is 7e3 in EDRAM, not the host's bits, and is not among them.
+- **getBCF** (the border color fraction): Xenia's translators make it a
+  translation error that is not fatal and store 0 (its TODO: sample a black
+  texture with a white border); translated so here, counted ("getBCF
+  answered 0"), where the shader was refused and its draws skipped before.
+  What the hardware blends at a border with each filter and clamp mode is
+  only the console's to say.
+- **Wide lines** (`PA_SU_LINE_CNTL`'s WIDTH, half the width in 12.4 fixed
+  point per AMD's R6xx guide and freedreno's a2xx.xml; 8, one pixel, is
+  Xenia's reset value): the line width is dynamic state set at each draw
+  from the register where the device has wide lines
+  (`XF_VK_NO_WIDE_LINES=1` turns them off), clamped to its range; without
+  them one pixel, as Xenia draws every line (a TODO there), counted.
+- **Screen extents and VIZ queries** stay as Xenia's defaults: every
+  EVENT_WRITE_EXT is answered with the whole screen, draws predicated on a
+  VIZ query and VIZ survey draws are drawn (counted: "draws predicated on a
+  VIZ query", "VIZ survey draws"). Xenia's `occlusion_query_viz` (off by
+  default: coarse occlusion queries feeding VIZ predicates, survey draws
+  skipped in copy mode) is not done; real extents (the pixels and depths
+  the draws between two events cover) would be a pass over the occlusion
+  queries' draw ranges, and how hi-Z interplays with them wants a console.
 
 ## What is asked and not done is counted
 

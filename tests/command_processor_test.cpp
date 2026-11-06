@@ -311,7 +311,8 @@ void draws_shaders_swaps() {
     // indexed: 32-bit indices, 8-in-32, 3 of them; a CPU address made physical
     w({type3(pm4::DRAW_INDX, 4), 0x123, 3u << 16 | 1u << 11 | 0u << 6 | 4, (indices + 2) | 0xA0000000, 2u << 30 | 3});
     w({type3(pm4::DRAW_INDX_2, 1), 6u << 16 | 2u << 6 | 8});  // auto-indexed rectangles
-    w({type3(pm4::DRAW_INDX_2, 1), 3u << 16 | 1u << 6 | 4});  // immediate indices: not issued
+    w({type3(pm4::DRAW_INDX_2, 3), 3u << 16 | 1u << 6 | 4, 0x00050004, 0x0006}); // immediate 16-bit indices 4, 5, 6
+    w({type3(pm4::DRAW_INDX_2, 1), 3u << 16 | 3u << 6 | 4});                     // no valid source: not issued
     w({type0(reg::RB_MODECONTROL, 1), 6});                    // copy
     w({type3(pm4::DRAW_INDX, 2), 0, 3u << 16 | 2u << 6 | 8}); // the resolve
     w({type3(pm4::XE_SWAP, 4), pm4::SWAP_SIGNATURE, 0x1E000000, 1280, 720});
@@ -322,16 +323,20 @@ void draws_shaders_swaps() {
               f.sink.shaders[0].second == (std::vector<uint32_t>{0xC0DE0001, 0xC0DE0002, 0xC0DE0003}));
         CHECK(f.sink.shaders[1].first == 0 && f.sink.shaders[1].second == (std::vector<uint32_t>{0xAAAA, 0xBBBB}));
     }
-    CHECK(f.sink.draws.size() == 2 && f.sink.resolves.size() == 1);
-    if (f.sink.draws.size() == 2) {
+    CHECK(f.sink.draws.size() == 3 && f.sink.resolves.size() == 1);
+    if (f.sink.draws.size() == 3) {
         const Draw &d = f.sink.draws[0];
         CHECK(d.viz_query == 0x123 && d.primitive == 4 && d.count == 3 && d.indexed && d.index32);
         CHECK(d.index_base == indices && d.index_bytes == 12 && d.index_endian == Endian::In32);
         CHECK(f.sink.draw_modes[0] == 4);
         CHECK(!f.sink.draws[1].indexed && f.sink.draws[1].count == 6 && f.sink.draws[1].primitive == 8);
+        const Draw &immediate = f.sink.draws[2];
+        CHECK(immediate.indexed && !immediate.index32 && immediate.count == 3 && immediate.index_bytes == 6 &&
+              immediate.immediate == (std::vector<uint32_t>{0x00050004, 0x0006}));
     }
     CHECK(r[reg::VGT_DMA_BASE] == (indices + 2) && r[reg::VGT_DMA_SIZE] == (2u << 30 | 3));
-    CHECK(f.cp.counts().draws == 2 && f.cp.counts().resolves == 1 && f.cp.counts().failed_draws == 1);
+    CHECK(f.cp.counts().draws == 3 && f.cp.counts().resolves == 1 && f.cp.counts().failed_draws == 1 &&
+          f.cp.counts().immediate_draws == 1);
     CHECK(f.sink.swaps.size() == 1 && f.cp.counts().swaps == 1 && f.cp.counter() == 1);
     if (!f.sink.swaps.empty())
         CHECK(f.sink.swaps[0].frontbuffer == 0x1E000000 && f.sink.swaps[0].width == 1280 &&

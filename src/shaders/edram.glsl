@@ -20,8 +20,13 @@ layout(push_constant) uniform Target {
     // depth targets: bit 0, the host's depth is kept beside EDRAM (its format
     // is encoded differently on the host: D24FS8, and D24S8 on a device
     // without 24-bit unorm depth); bit 1, 20e4 rounded to the nearest even
-    // (Xenia's depth_float24_round)
-    uint depth_flags;
+    // (Xenia's depth_float24_round). Color targets: bit 2, an 8_8_8_8_GAMMA
+    // target the host keeps linear (as RGBA16 unorm, Xenia's
+    // gamma_render_target_as_unorm16), its gamma made at stores and undone
+    // at loads. Bit 3, a float target (16_16_FLOAT, 16_16_16_16_FLOAT,
+    // 32_FLOAT, 32_32_FLOAT) moved by its bits, through a UINT view of its
+    // image (pack_raw), so NaN payloads and denormals survive.
+    uint flags;
 } target;
 
 const uint TILE_DWORDS = 80u * 16u;
@@ -106,12 +111,12 @@ float float20e4_to_32(uint f24) {
 // whole.
 uint depth_to_guest(float depth) {
     return target.format == 0u ? uint(roundEven(clamp(depth, 0.0, 1.0) * 16777215.0))
-                               : float32_to_20e4(depth * 2.0, (target.depth_flags & 2u) != 0u);
+                               : float32_to_20e4(depth * 2.0, (target.flags & 2u) != 0u);
 }
 // and with the stencil to the guest's D24S8 or D24FS8 word
 uint pack_depth(float depth, uint stencil) { return (depth_to_guest(depth) << 8u) | (stencil & 0xFFu); }
 
-// The host's depth kept beside EDRAM (depth_flags bit 0), in EDRAM's layout:
+// The host's depth kept beside EDRAM (flags bit 0), in EDRAM's layout:
 // D24FS8's in the first half, D24S8's in the second (Xenia's
 // OwnershipRange::host_depth_render_target_float24 and _unorm24, tracked
 // apart so that clearing through the other format does not drop it).
@@ -122,13 +127,45 @@ float unpack_depth(uint word) {
     return target.format == 0u ? float(d24 + (d24 >> 23u)) * (1.0 / 16777216.0) : float20e4_to_32(d24) * 0.5;
 }
 
+// xenos.cc's LinearToPWLGamma (saturated, NaN to 0): the 8-bit gamma code
+// over 255, for an 8_8_8_8_GAMMA target kept linear
+float linear_to_pwl_gamma(float linear) {
+    float l = clamp(linear, 0.0, 1.0);
+    if (isnan(linear)) l = 0.0;
+    float scale, offset;
+    if (l >= 128.0 / 1023.0) {
+        scale = l >= 512.0 / 1023.0 ? 1023.0 / 8.0 : 1023.0 / 4.0;
+        offset = l >= 512.0 / 1023.0 ? 128.0 / 255.0 : 64.0 / 255.0;
+    } else {
+        scale = l >= 64.0 / 1023.0 ? 1023.0 / 2.0 : 1023.0;
+        offset = l >= 64.0 / 1023.0 ? 32.0 / 255.0 : 0.0;
+    }
+    precise float scaled = l * scale;
+    precise float gamma = trunc(scaled) * (1.0 / 255.0) + offset;
+    return gamma;
+}
+// An 8-bit gamma code to the middle of the linear range that encodes to it
+// (Xenia's GammaByteToLinearMidpoint, vulkan_render_target_cache.cc, and the
+// D3D12 render target cache's transfers): a value on a range's edge could
+// fall below it in the 16-bit unorm and come back one code lower.
+float pwl_gamma_byte_to_linear_midpoint(uint b) {
+    float recip = 1.0 / 1023.0, offset = 0.5 / 1023.0;
+    if (b >= 64u) recip = 1.0 / 511.5, offset = -31.5 / 511.5;
+    if (b >= 96u) recip = 1.0 / 255.75, offset = -63.5 / 255.75;
+    if (b >= 192u) recip = 1.0 / 127.875, offset = -127.5 / 127.875;
+    precise float linear = float(b) * recip + offset;
+    return linear;
+}
+
 uint pack_snorm16(float v) { return uint(int(round(clamp(v, -1.0, 1.0) * 32767.0))) & 0xFFFFu; }
 float unpack_snorm16(uint bits) { return max(-1.0, float(int(bits << 16u) >> 16) / 32767.0); }
 
 // A color the host keeps to the guest's bits (two dwords for 64-bit formats).
 uvec2 pack_color(vec4 v) {
     switch (target.format) {
-    case 0u: case 1u: // 8_8_8_8, gamma (the host keeps it encoded)
+    case 0u: case 1u: // 8_8_8_8, gamma (encoded by the host, or kept linear: flags bit 2)
+        if (target.format == 1u && (target.flags & 4u) != 0u)
+            v.rgb = vec3(linear_to_pwl_gamma(v.r), linear_to_pwl_gamma(v.g), linear_to_pwl_gamma(v.b));
         return uvec2(packUnorm4x8(v), 0u);
     case 2u: case 10u: { // 2_10_10_10
         uvec4 u = uvec4(round(clamp(v, 0.0, 1.0) * vec4(1023.0, 1023.0, 1023.0, 3.0)));
@@ -148,9 +185,35 @@ uvec2 pack_color(vec4 v) {
     return uvec2(0u);
 }
 
+// A float target's host components as they are, which are the guest's bits
+// (flags bit 3)
+uvec2 pack_raw(uvec4 u) {
+    switch (target.format) {
+    case 6u: return uvec2((u.r & 0xFFFFu) | (u.g << 16u), 0u);
+    case 7u: return uvec2((u.r & 0xFFFFu) | (u.g << 16u), (u.b & 0xFFFFu) | (u.a << 16u));
+    case 14u: return uvec2(u.r, 0u);
+    case 15u: return uvec2(u.r, u.g);
+    }
+    return uvec2(0u);
+}
+
+uvec4 unpack_raw(uvec2 b) {
+    switch (target.format) {
+    case 6u: return uvec4(b.x & 0xFFFFu, b.x >> 16u, 0u, 0u);
+    case 7u: return uvec4(b.x & 0xFFFFu, b.x >> 16u, b.y & 0xFFFFu, b.y >> 16u);
+    case 14u: return uvec4(b.x, 0u, 0u, 0u);
+    case 15u: return uvec4(b.x, b.y, 0u, 0u);
+    }
+    return uvec4(0u);
+}
+
 vec4 unpack_color(uvec2 b) {
     switch (target.format) {
-    case 0u: case 1u: return unpackUnorm4x8(b.x);
+    case 0u: case 1u:
+        if (target.format == 1u && (target.flags & 4u) != 0u)
+            return vec4(pwl_gamma_byte_to_linear_midpoint(b.x & 0xFFu), pwl_gamma_byte_to_linear_midpoint((b.x >> 8u) & 0xFFu),
+                        pwl_gamma_byte_to_linear_midpoint((b.x >> 16u) & 0xFFu), float(b.x >> 24u) * (1.0 / 255.0));
+        return unpackUnorm4x8(b.x);
     case 2u: case 10u:
         return vec4(b.x & 0x3FFu, (b.x >> 10u) & 0x3FFu, (b.x >> 20u) & 0x3FFu, b.x >> 30u) / vec4(1023.0, 1023.0, 1023.0, 3.0);
     case 3u: case 12u:

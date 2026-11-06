@@ -23,6 +23,9 @@ struct Translation {
     // What the shader uses that the translator does not do yet; a shader
     // with any is not translated (spirv stays empty).
     std::vector<std::string> unsupported;
+    // What it does as Xenia does, which is not the console's (counted by the
+    // renderer at each draw): getBCF's 0
+    std::vector<std::string> approximate;
     bool ok() const { return unsupported.empty() && !spirv.empty(); }
 };
 
@@ -71,10 +74,44 @@ enum class HostVertex : uint8_t {
     QuadDomainCPIndexed,
     QuadDomainPatchIndexed,
 };
+// User clip planes (PA_CL_CLIP_CNTL's ucp_ena_0-5 while clipping is on), as
+// Xenia's shader modifications user_clip_plane_count and _cull: the enabled
+// planes packed in the system constants' clip_planes (renderer.cpp's System),
+// each one's distance the dot product of the guest's clip-space position
+// (after PA_CL_VTE_CNTL's formats, before the host's viewport transform) with
+// the plane, written as a clip distance, or a cull distance with
+// ucp_cull_only_ena. Points (PointListAsTriangleStrip) by PA_CL_CLIP_CNTL's
+// ps_ucp_mode, as Xenia's TODO describes it from AMD's register guides: the
+// center's distances for modes 0 and 1 (the sprite kept or dropped whole), the
+// center's as cull distances and each corner's as clip distances for mode 2
+// (dropped by the center, then clipped where it crosses a plane), each
+// corner's for mode 3 (clipped as a polygon). A rectangle's fourth corner has
+// the mirrored distances, as its position.
 struct VertexOptions {
     HostVertex host = HostVertex::Vertex;
-    bool equal_spacing = false; // domain types: discrete tessellation
+    bool equal_spacing = false;    // domain types: discrete tessellation
+    uint8_t clip_planes = 0;       // 0-6
+    bool clip_planes_cull = false; // ucp_cull_only_ena
+    uint8_t point_ucp_mode = 0;    // ps_ucp_mode, for points
+    // a word naming the variant (the renderer's key for the module)
+    uint32_t key() const {
+        return uint32_t(host) | (equal_spacing ? 1u << 8 : 0u) | uint32_t(clip_planes) << 9 |
+               (clip_planes_cull ? 1u << 12 : 0u) | uint32_t(point_ucp_mode & 3) << 13;
+    }
 };
-Translation translate(const ucode::ParsedShader &shader, Stage stage, const VertexOptions &vertex = {});
+// How a pixel shader writes depth (Xenia's DepthStencilMode on the host
+// render target path). By default oDepth clamped to 0-1, halved for a D24FS8
+// target (system flags' w bit 0), which keeps its 0-2 as 0-1. With
+// depth_float24 (Xenia's depth_float24_convert_in_pixel_shader, for draws
+// into D24FS8 with the depth test on): every fragment's depth, oDepth or the
+// rasterized one taken back to 0-1, rounded to 20e4 (1 towards zero, as
+// kFloat24Truncating, with the conservative DepthLess when the shader writes
+// no depth; 2 to the nearest even, as kFloat24Rounding), then halved.
+struct PixelOptions {
+    uint8_t depth_float24 = 0;
+    uint32_t key() const { return depth_float24; }
+};
+Translation translate(const ucode::ParsedShader &shader, Stage stage, const VertexOptions &vertex = {},
+                      const PixelOptions &pixel = {});
 
 } // namespace xf::shader
