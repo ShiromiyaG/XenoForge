@@ -222,6 +222,14 @@ void CommandProcessor::restore_gamma_ramp(std::span<const uint32_t> table, std::
 
 // ---- packets ----
 
+void CommandProcessor::report_packet(uint32_t address, uint32_t packet, uint32_t count) {
+    if (!sink_) return;
+    words_.resize(1 + count);
+    words_[0] = packet;
+    for (uint32_t i = 0; i < count; i++) words_[1 + i] = reader_.peek(i);
+    sink_->packet(address, words_);
+}
+
 bool CommandProcessor::execute_packet() {
     uint32_t address = reader_.address + reader_.read;
     uint32_t packet = reader_.next();
@@ -229,64 +237,61 @@ bool CommandProcessor::execute_packet() {
     uint32_t type = packet >> 30;
     // 0 and 0x0BADF00D are padding, type 2 a one-word no-op
     if (packet == 0 || packet == 0x0BADF00D || type == 2) {
-        if (sink_) {
-            words_.assign(1, packet);
-            sink_->packet(address, words_);
-        }
+        report_packet(address, packet, 0);
+        end_packet();
         return true;
     }
-    if (sink_) {
-        uint32_t n = type == 1 ? 2 : ((packet >> 16) & 0x3FFF) + 1;
-        n = std::min(n, reader_.count() / 4);
-        words_.resize(1 + n);
-        words_[0] = packet;
-        for (uint32_t i = 0; i < n; i++) words_[1 + i] = reader_.peek(i);
-        sink_->packet(address, words_);
-    }
-    if (type == 0) return type0(packet);
-    if (type == 1) return type1(packet);
-    return type3(packet);
+    if (type == 0) return type0(address, packet);
+    if (type == 1) return type1(address, packet);
+    return type3(address, packet);
 }
 
 // count registers from base_index, or one register count times (bit 15)
-bool CommandProcessor::type0(uint32_t packet) {
+bool CommandProcessor::type0(uint32_t address, uint32_t packet) {
     uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
     if (reader_.count() < count * 4) {
         std::fprintf(stderr, "gpu: a type-0 packet of %u words with %u left\n", count, reader_.count() / 4);
         return false;
     }
+    report_packet(address, packet, count);
     uint32_t base = packet & 0x7FFF;
     bool one_register = (packet >> 15) & 1;
     for (uint32_t i = 0; i < count; i++) write_register(one_register ? base : base + i, reader_.next());
+    end_packet();
     return true;
 }
 
 // two registers, each with its index in the header
-bool CommandProcessor::type1(uint32_t packet) {
+bool CommandProcessor::type1(uint32_t address, uint32_t packet) {
     if (reader_.count() < 8) return false;
+    report_packet(address, packet, 2);
     uint32_t value_1 = reader_.next(), value_2 = reader_.next();
     write_register(packet & 0x7FF, value_1);
     write_register((packet >> 11) & 0x7FF, value_2);
+    end_packet();
     return true;
 }
 
-bool CommandProcessor::type3(uint32_t packet) {
+bool CommandProcessor::type3(uint32_t address, uint32_t packet) {
     uint32_t opcode = (packet >> 8) & 0x7F, count = ((packet >> 16) & 0x3FFF) + 1;
     if (reader_.count() < count * 4) {
         std::fprintf(stderr, "gpu: a %s packet of %u words with %u left\n", pm4_opcode_name(opcode), count,
                      reader_.count() / 4);
         return false;
     }
+    report_packet(address, packet, count);
     bump(counts_.opcodes[opcode]);
     uint32_t data = reader_.read;
     // predicated (bit 0): only for the selected bins of predicated tiling; a
     // predicated swap never runs
     if ((packet & 1) && (!(bin_select_ & bin_mask_) || opcode == pm4::XE_SWAP)) {
         reader_.skip(count * 4);
+        end_packet();
         return true;
     }
     bool ok = type3_opcode(opcode, count);
     reader_.read = uint32_t((uint64_t(data) + count * 4) % reader_.capacity);
+    end_packet();
     return ok;
 }
 

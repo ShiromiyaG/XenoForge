@@ -53,6 +53,7 @@ add_library(xenoforge STATIC
     src/memory.cpp
     src/guest_memory.cpp
     src/gpu/command_processor.cpp
+    src/gpu_trace_writer.cpp
     src/xma_decoder.cpp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src)
@@ -267,7 +268,7 @@ target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
 foreach(name aes disc xex lzx snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor
-             recomp_discover)
+             recomp_discover gpu_trace_writer)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)

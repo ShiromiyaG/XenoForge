@@ -110,6 +110,8 @@ constexpr uint32_t RB_COLORCONTROL = 0x2202;
 constexpr uint32_t PA_CL_CLIP_CNTL = 0x2204, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206;
 constexpr uint32_t PA_SU_POINT_SIZE = 0x2280, PA_SU_POINT_MINMAX = 0x2281;
 constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
+constexpr uint32_t SQ_CONTEXT_MISC = 0x2181;
+constexpr uint32_t PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2380; // then FRONT_OFFSET, BACK_SCALE, BACK_OFFSET
 constexpr uint32_t RB_COPY_CONTROL = 0x2318;
 constexpr uint32_t RB_DEPTH_CLEAR = 0x231D, RB_COLOR_CLEAR = 0x231E, RB_COLOR_CLEAR_LO = 0x231F;
 constexpr uint32_t COLOR_INFO[4] = {reg::RB_COLOR_INFO, reg::RB_COLOR1_INFO, reg::RB_COLOR2_INFO, reg::RB_COLOR3_INFO};
@@ -311,14 +313,6 @@ VkBlendOp blend_op(uint32_t o) {
                                     VK_BLEND_OP_REVERSE_SUBTRACT};
     return o < 5 ? ops[o] : VK_BLEND_OP_ADD;
 }
-VkSamplerAddressMode address_mode(uint32_t clamp) {
-    switch (clamp) {
-    case 0: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    case 1: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-    case 6: case 7: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; // the halfway and mirrored-once clamps approximated
-    }
-}
 
 struct Shader {
     xf::ucode::ParsedShader parsed;
@@ -371,6 +365,10 @@ struct Texture {
     uint32_t dimension = 1;
     texture::HostFormat host = texture::HostFormat::Unsupported; // what its image holds (RGBA8 when converted)
     uint32_t kind = 0, index = 0;      // its bindless table (2D arrays, 3D, cube) and place in it
+    // for a constant with signed components: a view of the image as snorm,
+    // at its own place in the same table (0: none)
+    VkImageView signed_view = VK_NULL_HANDLE;
+    uint32_t signed_index = 0;
     std::vector<Range> ranges;         // the guest memory it was loaded from
     uint64_t hash = 0;                 // of that memory then
     uint32_t low = 0, high = 0;        // the ranges' bounds
@@ -388,8 +386,83 @@ struct System {
     float values[4];    // alpha reference, the point diameter's bounds (PA_SU_POINT_MINMAX)
     float color_scales[4];
     float point[4]; // the constant diameter (PA_SU_POINT_SIZE), guest pixel diameter to NDC radius
+    // per slot, its texture's signs on the result components (bits 0-7, two
+    // each: unsigned, signed, biased, gamma; Xenia's SwizzleSigns) and the
+    // width less one of each one's component (bits 8-23, four each; 0
+    // unknown), for biased components
+    uint32_t signs[32];
+    uint32_t signed_slots[32]; // per slot, its texture's signed view as slots has it; 0 none
 };
-static_assert(sizeof(System) == 224);
+static_assert(sizeof(System) == 480);
+
+// The bits of each component of a fixed-point guest texture format, in the
+// texel's order (Xenia's texture_info_formats.inl, its fixed formats); zeros
+// for the others.
+std::array<uint32_t, 4> component_bits(uint32_t format) {
+    switch (format) {
+    case 2: case 8: case 9: case 58: case 59: return {8, 0, 0, 0};       // 8, 8_A, 8_B, DXT3A, DXT5A
+    case 3: return {5, 5, 5, 1};                                         // 1_5_5_5
+    case 4: return {5, 6, 5, 0};                                         // 5_6_5
+    case 5: return {5, 5, 6, 0};                                         // 6_5_5
+    case 6: case 14: case 50: case 62: return {8, 8, 8, 8};              // 8_8_8_8 and its kin
+    case 7: case 54: return {10, 10, 10, 2};                             // 2_10_10_10
+    case 10: case 49: case 60: return {8, 8, 0, 0};                      // 8_8, DXN, CTX1
+    case 13: case 25: return {16, 16, 0, 0};                             // 16_16
+    case 15: return {4, 4, 4, 4};                                        // 4_4_4_4
+    case 16: case 55: return {11, 11, 10, 0};                            // 10_11_11
+    case 17: case 56: return {10, 11, 11, 0};                            // 11_11_10
+    case 21: case 26: return {16, 16, 16, 16};                           // 16_16_16_16
+    case 24: return {16, 0, 0, 0};                                       // 16
+    default: return {0, 0, 0, 0};
+    }
+}
+
+// A slot's signs word (System::signs): the fetch constant's signs through its
+// swizzle onto the result components, as Xenia's SwizzleSigns (constant
+// components unsigned, or signed when everything else is), and the biased
+// ones' component widths as its GetIntegerScaleBits gives them.
+uint32_t swizzled_signs(const texture::Info &info) {
+    uint32_t signs = 0, constants = 0;
+    bool any_signed = false, any_not_signed = false;
+    std::array<uint32_t, 4> bits = component_bits(info.format);
+    uint32_t last_stored = 0;
+    for (uint32_t c = 1; c < 4; c++)
+        if (bits[c]) last_stored = c;
+    for (uint32_t k = 0; k < 4; k++) {
+        uint32_t source = (info.swizzle >> (3 * k)) & 7;
+        if (source & 4) {
+            constants |= 1u << (2 * k);
+            continue;
+        }
+        uint32_t sign = info.signs[source];
+        signs |= sign << (2 * k);
+        (sign == 1 ? any_signed : any_not_signed) = true;
+        uint32_t width = bits[std::min(source, last_stored)];
+        if (sign == 2 && width && width <= 16) signs |= (width - 1) << (8 + 4 * k);
+    }
+    bool constants_signed = constants == 0x55 ? info.signs[0] == 1 && info.signs[1] == 1 && info.signs[2] == 1 &&
+                                                    info.signs[3] == 1
+                                              : any_signed && !any_not_signed;
+    if (constants_signed) signs |= constants; // 1 for each constant component
+    return signs;
+}
+
+// The snorm format of a unorm one's bits, where the host has one (a signed
+// view of the same image); undefined for the rest.
+VkFormat snorm_of(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: return VK_FORMAT_R8_SNORM;
+    case VK_FORMAT_R8G8_UNORM: return VK_FORMAT_R8G8_SNORM;
+    case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SNORM;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+    case VK_FORMAT_R16_UNORM: return VK_FORMAT_R16_SNORM;
+    case VK_FORMAT_R16G16_UNORM: return VK_FORMAT_R16G16_SNORM;
+    case VK_FORMAT_R16G16B16A16_UNORM: return VK_FORMAT_R16G16B16A16_SNORM;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return VK_FORMAT_BC4_SNORM_BLOCK;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return VK_FORMAT_BC5_SNORM_BLOCK;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
 
 // A part of what a resolve wrote that guest memory does not have yet, and
 // where its bytes wait for the GPU to be done (a read-back buffer).
@@ -443,6 +516,7 @@ struct FrontRead {
     texture::HostFormat host = texture::HostFormat::Unsupported;
     uint32_t width = 0, height = 0, swizzle = 0, format = 0;
     std::array<uint32_t, 256> gamma{};
+    std::array<uint32_t, 128 * 3> pwl{};
 };
 
 // The attachments of the render pass under way.
@@ -535,6 +609,14 @@ public:
         save_pipeline_cache();
     }
 
+    // ---- TraceSource: what a trace writer asks ----
+    void set_memory_trace(gpu::MemoryTrace *trace) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        trace_ = trace;
+    }
+    void settle() override { drain(); }
+    bool snapshot_edram(std::vector<uint8_t> &out) override;
+
 private:
     // adds the time from its making to its end to a count of seconds
     class Timer {
@@ -575,7 +657,12 @@ private:
     void deliver(const FrontRead &read);
     void skip(const std::string &reason) {
         report_.skipped[reason]++;
-        if (options_.verbose) std::fprintf(stderr, "  draw %llu skipped: %s\n", (unsigned long long)report_.draws, reason.c_str());
+        // the frames to trace for it: the swap this draw's frame ends with
+        std::vector<uint64_t> &at = report_.skipped_at[reason];
+        if (at.size() < 8 && (at.empty() || at.back() != report_.swaps)) at.push_back(report_.swaps);
+        if (options_.verbose)
+            std::fprintf(stderr, "  draw %llu skipped: %s (shaders %016llX %016llX)\n", (unsigned long long)report_.draws,
+                         reason.c_str(), (unsigned long long)vertex_hash_, (unsigned long long)pixel_hash_);
     }
     void approximate(const std::string &what) { report_.approximate[what]++; }
 
@@ -606,6 +693,14 @@ private:
         uint64_t h = 0;
         for (auto [start, end] : ranges) h = hash_bytes(memory_.data() + start, end - start, h);
         return h;
+    }
+    // guest memory read where it lies, for a trace being written
+    void traced(uint32_t address, uint32_t bytes) {
+        if (trace_) trace_->read(address, bytes);
+    }
+    void traced(const std::vector<Range> &ranges) {
+        if (trace_)
+            for (auto [start, end] : ranges) trace_->read(start, end - start);
     }
     static void full_barrier(VkCommandBuffer cmd) {
         VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
@@ -701,6 +796,7 @@ private:
     std::string fatal_;
     const uint32_t *regs_ = nullptr; // the processor's register file, during a call
     GuestMemory memory_;             // the processor's physical memory
+    gpu::MemoryTrace *trace_ = nullptr; // a trace writer's, told what is read
     uint64_t vertex_hash_ = 0, pixel_hash_ = 0;
     bool have_vertex_ = false, have_pixel_ = false;
     float max_viewport_[2] = {};
@@ -794,6 +890,7 @@ Impl::~Impl() {
     for (auto &[k, t] : targets_) d_.destroy(t->image);
     for (auto &[k, t] : textures_) {
         if (t->view) vkDestroyImageView(dev_, t->view, nullptr);
+        if (t->signed_view) vkDestroyImageView(dev_, t->signed_view, nullptr);
         d_.destroy(t->image);
     }
     for (auto &[k, im] : msaa_temps_) d_.destroy(im);
@@ -1038,7 +1135,10 @@ bool Impl::init(std::string &error) {
 
     // EDRAM: the buffer, store (compute) and load (draw) pipelines; the tile
     // masks come from the arena
-    edram_ = d_.create_buffer(EDRAM_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+    edram_ = d_.create_buffer(EDRAM_BYTES,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                              false);
     if (!edram_.buffer) return error = "could not make the EDRAM buffer", false;
     {
         VkDescriptorSetLayoutBinding store[4] = {
@@ -1427,6 +1527,7 @@ void Impl::upload_to_mirror(const std::vector<Range> &ranges) {
     VkDeviceSize total = 0;
     for (auto [start, end] : ranges) total += end - start;
     if (!total) return;
+    traced(ranges);
     VkBuffer from;
     VkDeviceSize at;
     uint8_t *data;
@@ -1453,6 +1554,7 @@ void Impl::finish_writebacks(uint64_t serial) {
         for (const Piece &p : w.pieces) {
             std::memcpy(memory_.data() + p.start, p.from, p.end - p.start);
             report_.writeback_bytes += p.end - p.start;
+            if (trace_) trace_->gpu_wrote(p.start, p.end - p.start);
         }
     }
     for (auto it = pending_textures_.begin(); it != pending_textures_.end();) {
@@ -1477,6 +1579,15 @@ void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
         s->parsed = xf::ucode::parse_shader(type == 0 ? xf::ucode::ShaderType::Vertex : xf::ucode::ShaderType::Pixel, code);
         s->summary = xf::ucode::analyze(code);
         report_.shaders++;
+        if (!options_.dump_shaders.empty()) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "/shader_%016llX.ucode.bin.%s", (unsigned long long)hash,
+                          type == 0 ? "vert" : "frag");
+            if (std::FILE *f = std::fopen((options_.dump_shaders + name).c_str(), "wb")) {
+                std::fwrite(code.data(), 4, code.size(), f);
+                std::fclose(f);
+            }
+        }
     }
     (type == 0 ? vertex_hash_ : pixel_hash_) = hash;
     (type == 0 ? have_vertex_ : have_pixel_) = true;
@@ -1554,6 +1665,12 @@ VkDescriptorSet Impl::edram_set(uint32_t which) {
 }
 
 RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format) {
+    // by the format EDRAM stores (xenos.h's GetStorageColorFormat, as
+    // Xenia keys its render targets): 2_10_10_10_AS_10_10_10_10 is
+    // 2_10_10_10 and 2_10_10_10_FLOAT_AS_16_16_16_16 is 2_10_10_10_FLOAT,
+    // the same target, so nothing moves through EDRAM's bits between them
+    if (!depth && format == 10) format = 2;
+    if (!depth && format == 12) format = 3;
     auto key = std::make_tuple(depth, base, pitch, msaa, format);
     auto it = targets_.find(key);
     if (it != targets_.end()) return it->second.get();
@@ -1696,6 +1813,29 @@ bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
     return true;
 }
 
+// EDRAM as it stands, for a trace's start: every tile a render target holds
+// stored into EDRAM by its holder (which keeps holding it), then the whole
+// buffer read back, waited for.
+bool Impl::snapshot_edram(std::vector<uint8_t> &out) {
+    Call call(*this, nullptr);
+    if (!call) return false;
+    std::map<RenderTarget *, std::vector<uint32_t>> held;
+    for (uint32_t tile = 0; tile < EDRAM_TILES; tile++)
+        if (owners_[tile]) held[owners_[tile]].push_back(tile);
+    for (auto &[holder, tiles] : held)
+        if (!edram_store(holder, tiles)) return false;
+    VkBuffer back;
+    VkDeviceSize at;
+    uint8_t *data = readback(EDRAM_BYTES, back, at);
+    if (!data) return false;
+    VkBufferCopy copy{0, at, EDRAM_BYTES};
+    vkCmdCopyBuffer(outside(), edram_.buffer, back, 1, &copy);
+    sync();
+    if (!fatal_.empty()) return false;
+    out.assign(data, data + EDRAM_BYTES);
+    return true;
+}
+
 VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     auto key = std::make_pair(t.image.format, t.msaa);
     auto it = load_pipelines_.find(key);
@@ -1818,30 +1958,62 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
 
 // ---- textures ----
 
-// A sampler's place in the bindless table, made once per address modes and
-// filters.
+// A sampler's place in the bindless table, made once per what it is made
+// of, as Xenia's Vulkan texture cache makes them (GetSamplerParameters,
+// UseSampler, NormalizeClampMode): the clamps (the halfway one as to the
+// edge, the mirrored clamps all as mirror clamp to edge, or mirrored repeat
+// without it); the border color when a clamp uses it (white, else
+// transparent black); the filters, the instruction's over the constant's;
+// anisotropy up to the device's; the constant's lowest mip as the lowest
+// LOD (level 0 for a base map with a base), a base map clamped there. LOD
+// biases are the shader's.
 uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides) {
     uint32_t mag = (fetch[3] >> 19) & 3, min = (fetch[3] >> 21) & 3, mip = (fetch[3] >> 23) & 3, aniso = (fetch[3] >> 25) & 7;
     if (overrides[0] != 3) mag = overrides[0];
     if (overrides[1] != 3) min = overrides[1];
     if (overrides[2] != 3) mip = overrides[2];
     if (overrides[3] != 7) aniso = overrides[3];
-    std::array<uint32_t, 8> key = {(fetch[0] >> 10) & 7, (fetch[0] >> 13) & 7, (fetch[0] >> 16) & 7, mag, min, mip, aniso, 0};
+    texture::Info parsed = texture::parse_fetch_constant(fetch);
+    texture::Levels levels = texture::levels(parsed);
+    uint32_t mip_min = mip == 2 && levels.base ? 0 : levels.mip_min;
+    uint32_t clamp[3];
+    bool border = false;
+    for (uint32_t k = 0; k < 3; k++) {
+        clamp[k] = (fetch[0] >> (10 + 3 * k)) & 7;
+        if (clamp[k] == 4) clamp[k] = 2;
+        if (clamp[k] == 3 || clamp[k] == 5 || clamp[k] == 7) clamp[k] = d_.mirror_clamp_to_edge() ? 3 : 1;
+        border |= clamp[k] == 6;
+    }
+    uint32_t border_color = border ? fetch[5] & 3 : 0;
+    if (border_color >= 2) approximate("YCbCr border colors (transparent black)");
+    if (d_.max_anisotropy() < 1.0f) aniso = 0;
+    std::array<uint32_t, 8> key = {clamp[0] | clamp[1] << 3 | clamp[2] << 6 | border_color << 9,
+                                   mag, min, mip, aniso, mip_min, 0, 0};
     auto it = samplers_.find(key);
     if (it != samplers_.end()) return it->second.second;
     if (next_sampler_ >= sampler_capacity_) {
         approximate("samplers past the bindless table's size (the stand-in's used)");
         return 0;
     }
+    static const VkSamplerAddressMode modes[8] = {
+        VK_SAMPLER_ADDRESS_MODE_REPEAT,          VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,   VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,   VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE};
     VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    info.addressModeU = address_mode(key[0]);
-    info.addressModeV = address_mode(key[1]);
-    info.addressModeW = address_mode(key[2]);
+    info.addressModeU = modes[clamp[0]];
+    info.addressModeV = modes[clamp[1]];
+    info.addressModeW = modes[clamp[2]];
     info.magFilter = mag == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     info.minFilter = min == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     info.mipmapMode = mip == 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    info.maxLod = mip == 2 ? 0.0f : VK_LOD_CLAMP_NONE; // 2: the base map alone
-    info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    if (aniso && aniso < 6) {
+        info.anisotropyEnable = VK_TRUE;
+        info.maxAnisotropy = std::min(float(1u << (aniso - 1)), d_.max_anisotropy());
+    }
+    info.minLod = float(mip_min);
+    info.maxLod = mip == 2 ? info.minLod + 0.25f : VK_LOD_CLAMP_NONE; // 2: the base map alone
+    info.borderColor = border_color == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     VkSampler s = VK_NULL_HANDLE;
     vkCreateSampler(dev_, &info, nullptr, &s);
     uint32_t index = next_sampler_++;
@@ -1874,6 +2046,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             uint64_t hash = hash_ranges(t->ranges);
             if (t->rehash) t->hash = hash, t->rehash = false;
             same = hash == t->hash;
+            if (same) traced(t->ranges);
         }
         if (same) return t;
     }
@@ -1897,6 +2070,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     std::vector<std::vector<uint8_t>> levels;
     if (!gpu) {
         Timer decoding(report_.decode_seconds);
+        traced(ranges);
         if (!texture::decode(info, memory_, image, why)) return nullptr;
         if (direct) {
             levels = std::move(image.levels);
@@ -1913,12 +2087,15 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     bool float_format = format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_R16G16_SFLOAT ||
                         format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32_SFLOAT ||
                         format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT;
-    if (!float_format && (info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1))
-        approximate("signed texture components");
-    if (info.signs[0] == 2 || info.signs[1] == 2 || info.signs[2] == 2 || info.signs[3] == 2)
-        approximate("biased texture components");
-    if (info.gamma) approximate("gamma textures read as linear");
-    if (info.exp_adjust) approximate("texture exponent adjust");
+    // otherwise read through a snorm view of the same bits (Xenia's signed
+    // host format), where the host has one; biased and gamma components,
+    // and the exponent adjust, are the shader's (texture_signs)
+    bool any_signed = info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1;
+    VkFormat signed_format = any_signed && !float_format && direct ? snorm_of(format) : VK_FORMAT_UNDEFINED;
+    if (signed_format != VK_FORMAT_UNDEFINED && !d_.format_supported(signed_format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
+        signed_format = VK_FORMAT_UNDEFINED;
+    if (any_signed && !float_format && signed_format == VK_FORMAT_UNDEFINED)
+        approximate("signed texture components read as unsigned (no signed view of the format)");
 
     // 1D, 2D and stacked as 2D arrays (stacked: a layer a slice), as Xenia
     // binds them
@@ -1931,23 +2108,26 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
                  t->image.levels != level_count || t->image.layers != layers;
     if (fresh) {
         uint32_t kind = three ? 1 : cube ? 2 : 0;
-        if (next_index_[kind] >= capacity_[kind]) {
+        uint32_t needed = signed_format != VK_FORMAT_UNDEFINED ? 2 : 1;
+        if (next_index_[kind] + needed > capacity_[kind]) {
             why = "the bindless table is full";
             return nullptr;
         }
         uint32_t index = next_index_[kind]++;
+        uint32_t signed_index = needed == 2 ? next_index_[kind]++ : 0;
         if (t) {
             // the same constant made another image (not with the same format
             // decisions; kept safe): the old one goes once unused, its place
             // in the table with it (work under way may still read it there)
             vk::Image old = t->image;
-            VkImageView old_view = t->view;
+            VkImageView old_view = t->view, old_signed = t->signed_view;
             cmd();
-            slots_[current_].after.push_back([this, old, old_view]() mutable {
+            slots_[current_].after.push_back([this, old, old_view, old_signed]() mutable {
                 vkDestroyImageView(dev_, old_view, nullptr);
+                if (old_signed) vkDestroyImageView(dev_, old_signed, nullptr);
                 d_.destroy(old);
             });
-            t->image = {}, t->view = VK_NULL_HANDLE;
+            t->image = {}, t->view = VK_NULL_HANDLE, t->signed_view = VK_NULL_HANDLE, t->signed_index = 0;
         } else {
             auto owned = std::make_unique<Texture>();
             t = owned.get();
@@ -1961,7 +2141,8 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
                                    VK_SAMPLE_COUNT_1_BIT,
                                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                   cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0);
+                                   (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
+                                       (signed_index ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0));
         if (!t->image.image) {
             why = "could not make the image";
             return nullptr;
@@ -1982,15 +2163,28 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             why = "could not make the image's view";
             return nullptr;
         }
-        VkDescriptorImageInfo descriptor{VK_NULL_HANDLE, t->view, VK_IMAGE_LAYOUT_GENERAL};
-        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        write.dstSet = bindless_;
-        write.dstBinding = kind;
-        write.dstArrayElement = index;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        write.pImageInfo = &descriptor;
-        vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+        if (signed_index) {
+            t->signed_view = make_view(t->image.image, view_type, signed_format, VK_IMAGE_ASPECT_COLOR_BIT, mapping,
+                                       level_count, layers, false);
+            if (!t->signed_view) {
+                why = "could not make the image's signed view";
+                return nullptr;
+            }
+            t->signed_index = signed_index;
+        }
+        VkDescriptorImageInfo descriptors[2] = {{VK_NULL_HANDLE, t->view, VK_IMAGE_LAYOUT_GENERAL},
+                                                {VK_NULL_HANDLE, t->signed_view, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet writes[2] = {};
+        for (uint32_t w = 0; w < 2; w++) {
+            writes[w] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[w].dstSet = bindless_;
+            writes[w].dstBinding = kind;
+            writes[w].dstArrayElement = w ? signed_index : index;
+            writes[w].descriptorCount = 1;
+            writes[w].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            writes[w].pImageInfo = &descriptors[w];
+        }
+        vkUpdateDescriptorSets(dev_, signed_index ? 2 : 1, writes, 0, nullptr);
     }
 
     // what it was loaded from, for seeing when that changes
@@ -2010,6 +2204,10 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     }
     t->stale = false;
     report_.textures++;
+    if (options_.verbose)
+        std::fprintf(stderr, "  texture %08X: format %s %ux%u, signs %u%u%u%u, exponent %d, from %s\n", info.base_address,
+                     format_name(info.format), plan.width, plan.height, info.signs[0], info.signs[1], info.signs[2],
+                     info.signs[3], info.exp_adjust, gpu ? "the mirror" : "guest memory");
     return t;
 }
 
@@ -2269,6 +2467,9 @@ void Impl::draw(const gpu::Draw &d) {
         }
     }
     bool rectangles = primitive == 8, points = primitive == 1;
+    // triangles, quads and polygons (draw_util.h's IsPrimitivePolygonal): faces,
+    // culling, the front and back polygon offsets
+    bool polygonal = (primitive >= 4 && primitive <= 7) || (primitive >= 13 && primitive <= 15);
     VkPrimitiveTopology topology;
     switch (primitive) {
     case 1: topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break; // sprites made by point_list.geom
@@ -2289,7 +2490,6 @@ void Impl::draw(const gpu::Draw &d) {
     if (!translate(*vs, why)) return skip("vertex shader: " + why);
     if (ps && !translate(*ps, why)) return skip("pixel shader: " + why);
     if (vs->summary.memexport || (ps && ps->summary.memexport)) return skip("memory export");
-    if (ps && (regs_[reg::SQ_PROGRAM_CNTL] >> 18) & 1) approximate("pixel parameter generation");
 
     // render targets
     uint32_t surface = regs_[reg::RB_SURFACE_INFO], pitch = surface & 0x3FFF, msaa = (surface >> 16) & 3;
@@ -2362,6 +2562,7 @@ void Impl::draw(const gpu::Draw &d) {
         uint32_t size = index32 ? 4 : 2;
         gpu::Endian endian = d.index_endian;
         std::vector<uint8_t> raw_indices(size_t(count) * size);
+        traced(d.index_base, uint32_t(raw_indices.size()));
         memory_.read(d.index_base, raw_indices);
         for (uint32_t i = 0; i < count; i++) {
             const uint8_t *b = raw_indices.data() + size_t(i) * size;
@@ -2402,9 +2603,31 @@ void Impl::draw(const gpu::Draw &d) {
     sys.values[0] = as_float(regs_[r::RB_ALPHA_REF]);
     uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
     sys.flags[1] = ((vte >> 10) & 1) | ((vte >> 8) & 1) << 1 | ((vte >> 9) & 1) << 2;
-    if (color_control & 16) approximate("alpha to coverage");
+    // the pixel parameters (SQ_PROGRAM_CNTL's param_gen) into the
+    // interpolator SQ_CONTEXT_MISC's param_gen_pos names, as Xenia's
+    // GetInterpolatorInputMask allows them (within the 16 interpolators),
+    // with the kind of primitive
+    if (ps && (regs_[reg::SQ_PROGRAM_CNTL] >> 18) & 1) {
+        uint32_t position = (regs_[r::SQ_CONTEXT_MISC] >> 8) & 0xFF;
+        if (position < 16) {
+            sys.flags[1] |= 1u << 8 | position << 9;
+            if (points) {
+                sys.flags[1] |= 1u << 13;
+                approximate("point sprite coordinates in the pixel parameters (0)");
+            } else if (polygonal) {
+                sys.flags[1] |= 1u << 15;
+            } else if (primitive == 2 || primitive == 3 || primitive == 12) {
+                sys.flags[1] |= 1u << 14;
+            }
+        }
+    }
+    // alpha to coverage (RB_COLORCONTROL bit 4) with its dither offsets
+    // (bits 24-31), as Xenia's system constant alpha_to_mask
+    if (color_control & 16) sys.flags[0] |= (color_control >> 24) << 8 | 1u << 16;
     sys.flags[2] = gamma_targets;
-    sys.flags[3] = depth_float24 ? 1u : 0u; // oDepth halved, as the target keeps D24FS8's 0-2
+    // oDepth halved, as the target keeps D24FS8's 0-2 (bit 0); the samples
+    // (bits 1-2: 1x, 2x, 4x), for alpha to coverage
+    sys.flags[3] = (depth_float24 ? 1u : 0u) | msaa << 1;
     std::copy(color_scales, color_scales + 4, sys.color_scales);
     if (points) {
         // as Xenia's UpdateSystemConstantValues: the registers' 12.4 radii
@@ -2442,7 +2665,10 @@ void Impl::draw(const gpu::Draw &d) {
                 overrides = s->filters[slot];
                 break;
             }
-        sys.slots[slot] = t->index | t->kind << 14 | sampler(fetch, overrides) << 16;
+        uint32_t sampler_bits = sampler(fetch, overrides) << 16;
+        sys.slots[slot] = t->index | t->kind << 14 | sampler_bits;
+        sys.signs[slot] = swizzled_signs(texture::parse_fetch_constant(fetch));
+        if (t->signed_index) sys.signed_slots[slot] = t->signed_index | t->kind << 14 | sampler_bits;
     }
 
     // the pipeline
@@ -2492,9 +2718,9 @@ void Impl::draw(const gpu::Draw &d) {
         raster.cullMode = (sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0);
         raster.frontFace = sc_mode & 4 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
         if ((sc_mode >> 3) & 3) approximate("polygon modes other than fill");
-        if ((sc_mode >> 11) & 3) approximate("polygon offset");
     }
     raster.depthClampEnable = (regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1;
+    raster.depthBiasEnable = depth ? VK_TRUE : VK_FALSE; // the polygon offset, set at the draw
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = msaa == 0 ? VK_SAMPLE_COUNT_1_BIT : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
     VkPipelineDepthStencilStateCreateInfo depth_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
@@ -2519,9 +2745,10 @@ void Impl::draw(const gpu::Draw &d) {
     blend_state.pAttachments = blends;
     const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                              VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                             VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK};
+                                             VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                             VK_DYNAMIC_STATE_DEPTH_BIAS};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 6;
+    dynamic.dynamicStateCount = 7;
     dynamic.pDynamicStates = dynamic_states;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 4;
@@ -2601,6 +2828,7 @@ void Impl::draw(const gpu::Draw &d) {
 
     if (!from_mirror) {
         Timer timer(report_.vertex_seconds);
+        traced(vertex_ranges);
         std::vector<VkDeviceSize> at(vertex_ranges.size());
         for (size_t k = 0; k < vertex_ranges.size(); k++) {
             auto [start, end] = vertex_ranges[k];
@@ -2674,12 +2902,39 @@ void Impl::draw(const gpu::Draw &d) {
     vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 8) & 0xFF);
     vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, (stencil >> 16) & 0xFF);
     vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 16) & 0xFF);
+    {
+        // the polygon offset as Xenia's Vulkan backend sets it
+        // (draw_util.cc's GetPreferredFacePolygonOffset, then the guest's
+        // units in host ones: kD3D10PolygonOffsetFactorFloat24 or Unorm24,
+        // the slope in 1/16 subpixels)
+        const float *offsets = reinterpret_cast<const float *>(&regs_[r::PA_SU_POLY_OFFSET_FRONT_SCALE]);
+        float scale = 0.0f, offset = 0.0f;
+        if (polygonal) {
+            if ((sc_mode >> 11) & 1 && !(sc_mode & 1)) {
+                scale = offsets[0], offset = offsets[1];
+                // base/math.h's roundToNearestOrderOfMagnitude
+                if (scale != 0.0f) {
+                    double order = std::pow(10.0, std::floor(std::log10(std::fabs(double(scale)))));
+                    scale = float(std::round(double(scale) / order) * order);
+                }
+            }
+            if ((sc_mode >> 12) & 1 && !(sc_mode & 2) && scale == 0.0f && offset == 0.0f)
+                scale = offsets[2], offset = offsets[3];
+        } else if ((sc_mode >> 13) & 1) {
+            scale = offsets[0], offset = offsets[1];
+        }
+        float constant = offset * (depth && depth->format == 1 ? float(1u << 24) : float((1u << 24) - 1));
+        vkCmdSetDepthBias(c, constant, 0.0f, scale * (1.0f / 16.0f));
+    }
     vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
     report_.drawn++;
     if (options_.verbose)
-        std::fprintf(stderr, "  draw %llu: %s, %u indices, %s%s%s\n", (unsigned long long)report_.draws, primitive_name(primitive),
-                     count, ps ? "color and depth" : "depth only", depth ? ", depth on" : "",
-                     from_mirror ? ", vertices from the mirror" : "");
+        std::fprintf(stderr, "  draw %llu: %s, %u indices, %s%s%s, shaders %016llX %016llX, blend %08X, mask %04X\n",
+                     (unsigned long long)report_.draws, primitive_name(primitive), count,
+                     ps ? "color and depth" : "depth only", depth ? ", depth on" : "",
+                     from_mirror ? ", vertices from the mirror" : "", (unsigned long long)vertex_hash_,
+                     ps ? (unsigned long long)pixel_hash_ : 0ull, regs_[r::RB_BLENDCONTROL[0]],
+                     regs_[reg::RB_COLOR_MASK] & 0xFFFF);
 }
 
 // ---- resolves ----
@@ -2689,6 +2944,8 @@ void Impl::resolve() {
     poll();
     resolve::Info info;
     std::string why;
+    // the rectangle's three vertices, in vertex fetch constant 0
+    traced(regs_[reg::FETCH_CONSTANTS] & 0x1FFFFFFC, 24);
     if (!resolve::get_info({regs_, REGISTER_COUNT}, memory_, info, why)) return skip("resolve: " + why);
     if (!info.copy && !why.empty()) approximate("resolve not copied: " + why);
     uint32_t pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
@@ -2985,6 +3242,7 @@ void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &i
     read.width = t.image.extent.width, read.height = t.image.extent.height;
     read.swizzle = info.swizzle, read.format = info.format;
     read.gamma = processor_.gamma_ramp_table();
+    read.pwl = processor_.gamma_ramp_pwl();
     bool compressed = texture::is_compressed(read.host);
     read.bytes = compressed ? VkDeviceSize((read.width + 3) / 4) * ((read.height + 3) / 4)
                             : VkDeviceSize(read.width) * read.height;
@@ -3027,11 +3285,31 @@ void Impl::deliver(const FrontRead &read) {
             frame.rgba[i * 4 + c] = c == 3 ? 255 : value; // shown opaque, as the presenter does
         }
     // the display's gamma, the processor's ramps: as Xenia's presenter, the
-    // piecewise linear ramp for 2_10_10_10 front buffers (not yet), the
-    // 256-entry table for the rest (apply_gamma_table.xesli), the 10 bits it
-    // gives back to 8
+    // piecewise linear ramp for 2_10_10_10 front buffers
+    // (apply_gamma_pwl.xesli: a component's 10 bits pick an entry by their
+    // top 7, base plus delta times the low 3 over 8, in 1/64 of 1023), the
+    // 256-entry table for the rest (apply_gamma_table.xesli), the 10 bits
+    // they give back to 8 (presenter.h's Packed10bpcRGBTo8bpcBytes)
     if (read.format == 7 || read.format == 54) {
-        approximate("the display's piecewise linear gamma ramp");
+        if (read.host != texture::HostFormat::RGB10A2) {
+            approximate("the display's piecewise linear gamma ramp (front buffer not 10 bits a component)");
+        } else {
+            for (size_t i = 0; i < pixels; i++) {
+                uint32_t word;
+                std::memcpy(&word, read.data + 4 * i, 4);
+                const uint32_t values[4] = {word & 0x3FF, (word >> 10) & 0x3FF, (word >> 20) & 0x3FF,
+                                            (word >> 30) * 341};
+                for (uint32_t c = 0; c < 3; c++) {
+                    uint32_t guest = (read.swizzle >> (3 * c)) & 7;
+                    uint32_t value = guest == 5 ? 1023 : guest >= 4 ? 0 : values[guest];
+                    uint32_t entry = read.pwl[(value >> 3) * 3 + c];
+                    float out = (float(entry & 0xFFFF) + float((value & 7) * (entry >> 16)) * (1.0f / 8.0f)) *
+                                (1.0f / (64.0f * 1023.0f));
+                    uint32_t ten = uint32_t(std::clamp(out, 0.0f, 1.0f) * 1023.0f + 0.5f);
+                    frame.rgba[i * 4 + c] = uint8_t(float(ten) * (255.0f / 1023.0f) + 0.5f);
+                }
+            }
+        }
     } else {
         for (size_t i = 0; i < pixels; i++)
             for (uint32_t c = 0; c < 3; c++) {

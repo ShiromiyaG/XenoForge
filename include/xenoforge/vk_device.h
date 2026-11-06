@@ -66,6 +66,10 @@ public:
     const std::string &name() const { return name_; }
     // VK_EXT_shader_stencil_export, enabled when the device has it
     bool stencil_export() const { return stencil_export_; }
+    // anisotropic filtering (its largest ratio, 0 without it) and the mirror
+    // clamp to edge address mode, enabled when the device has them
+    float max_anisotropy() const { return max_anisotropy_; }
+    bool mirror_clamp_to_edge() const { return mirror_clamp_to_edge_; }
 
     // host-visible and coherent (mapped), or device-local; host_reads: the
     // host reads it back, so cached memory where the device has it
@@ -100,6 +104,8 @@ private:
     VkPhysicalDeviceMemoryProperties memory_{};
     std::string name_;
     bool stencil_export_ = false;
+    float max_anisotropy_ = 0.0f;
+    bool mirror_clamp_to_edge_ = false;
     std::mutex queue_mutex_;
 };
 

@@ -4,7 +4,9 @@
 // multiply (0 times anything is 0), multiplies and adds without contraction,
 // the ordered and unordered comparisons, the 21-bit results of exp, log,
 // rcp, rsq and sqrt, the clamps of rcpc, rcpf, rsqc, rsqf and logc, maxa's
-// address register, the vertex formats and their normalization.
+// address register, the vertex formats and their normalization, the texture
+// fetch's LOD and gradients, its signs, gamma and exponent adjust, and the
+// pixel parameters (spirv_shader_translator.cc's StartFragmentShaderInMain).
 //
 // The state is Private: r0-r127 (a vec4 each), a0, aL, the predicate, the
 // previous scalar, the vertex fetch address, the exports. The body is a
@@ -16,7 +18,8 @@
 // as a loop over a switch on the next control flow instruction, with the
 // interpreter's stacks (four loops deep, four calls deep) and step limit.
 // Memexport, unnormalized cube map coordinates and the texture queries
-// other than getGradients are reported as unsupported.
+// other than getGradients, getCompTexLOD and getWeights (those two on the
+// host's images only, not in the harness) are reported as unsupported.
 
 #include "xenoforge/shader_translator.h"
 
@@ -207,7 +210,15 @@ private:
     }
     void vertex_fetch(const VertexFetchInstruction &v);
     void texture_fetch(const TextureFetchInstruction &t);
-    Id sample_texture(const TextureFetchInstruction &t, Id coordinates);
+    // member: the system constants' slot table the image comes from (2: the
+    // textures, 8: their signed views)
+    // what sample_texture gives: the sample, getCompTexLOD's LOD, or
+    // getWeights's filtering weights
+    enum class Query { Sample, Lod, Weights };
+    Id sample_texture(const TextureFetchInstruction &t, Id coordinates, uint32_t member = 2, Query query = Query::Sample);
+    Id texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample);
+    Id pwl_gamma_to_linear(Id gamma);
+    Id slot_word(uint32_t member, uint32_t slot);
     Id swap_endian(Id word, Id endian);
 
     void unsupported(std::string what) {
@@ -241,6 +252,7 @@ private:
     Id ptr_private_uint_ = 0, ptr_private_int_ = 0;
     // the texture LOD and gradients the setters leave for later fetches
     Id tfetch_lod_ = 0, gradient_h_ = 0, gradient_v_ = 0;
+    Id signed_sample_ = 0; // a fetch's sample from the texture's signed view
     Id body_ = 0;
     bool ended_ = false; // the straight control flow has returned
 };
@@ -291,11 +303,14 @@ void Translator::declare() {
     if (stage_ != Stage::Harness) {
         // ndc_scale, ndc_offset, the image and sampler index of each fetch
         // slot, then flags (x: the alpha test, bit 3 on, bits 0-2 its
-        // function; y: the position's formats; z: gamma targets; w: D24FS8
-        // depth), values (x: the alpha test's reference, y and z: the point
+        // function; y: the position's formats, bits 8-15 the pixel
+        // parameters; z: gamma targets; w: D24FS8 depth), values (x: the
+        // alpha test's reference, y and z: the point
         // diameter's bounds), the color targets' scales and the point
-        // constants (renderer.cpp's System, point_list.geom)
-        const Id system_members[] = {vec4_, vec4_, m_.type_array(uvec4_, 8, 16), uvec4_, vec4_, vec4_, vec4_};
+        // constants (renderer.cpp's System, point_list.geom), then per fetch
+        // slot its texture's signs and the signed view's image and sampler
+        Id slot_table = m_.type_array(uvec4_, 8, 16);
+        const Id system_members[] = {vec4_, vec4_, slot_table, uvec4_, vec4_, vec4_, vec4_, slot_table, slot_table};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
@@ -305,6 +320,8 @@ void Translator::declare() {
         m_.member_decorate(system_block, 4, spv::Decoration::Offset, {176});
         m_.member_decorate(system_block, 5, spv::Decoration::Offset, {192});
         m_.member_decorate(system_block, 6, spv::Decoration::Offset, {208});
+        m_.member_decorate(system_block, 7, spv::Decoration::Offset, {224});
+        m_.member_decorate(system_block, 8, spv::Decoration::Offset, {352});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -335,6 +352,7 @@ void Translator::declare() {
     tfetch_lod_ = global(float_, spv::StorageClass::Private, "tfetch_lod");
     gradient_h_ = global(vec4_, spv::StorageClass::Private, "gradient_h");
     gradient_v_ = global(vec4_, spv::StorageClass::Private, "gradient_v");
+    signed_sample_ = global(vec4_, spv::StorageClass::Private, "signed_sample");
 }
 
 void Translator::reset_state() {
@@ -785,7 +803,12 @@ void Translator::texture_fetch(const TextureFetchInstruction &t) {
         else body();
         return;
     }
-    if (t.opcode != FetchOpcode::TextureFetch && t.opcode != FetchOpcode::GetTextureGradients) {
+    // getCompTexLOD and getWeights on the host's images only (the harness
+    // has none)
+    bool lod_query = t.opcode == FetchOpcode::GetTextureComputedLod && stage_ != Stage::Harness;
+    bool weights = t.opcode == FetchOpcode::GetTextureWeights && stage_ != Stage::Harness;
+    if (t.opcode != FetchOpcode::TextureFetch && t.opcode != FetchOpcode::GetTextureGradients && !lod_query &&
+        !weights) {
         unsupported(std::string("texture fetch operation ") + t.opcode_name);
         return;
     }
@@ -821,8 +844,22 @@ void Translator::texture_fetch(const TextureFetchInstruction &t) {
                                                comp(load(vec4_, gradient_v_), 1)});
             if (t.use_register_lod) w = exact(Op::OpFAdd, float_, {s, load(float_, tfetch_lod_)});
             result = vec4_of(exact(Op::OpFAdd, float_, {cx, s}), exact(Op::OpFSub, float_, {cy, s}), z, w);
+        } else if (lod_query) {
+            // the LOD the hardware would compute, as Xenia's (OpImageQueryLod's
+            // unclamped level in x): only in pixel shaders with the computed
+            // LOD, else zeros (with an explicit LOD or register gradients it
+            // contradicts MSDN, as Xenia reports)
+            bool computed = stage_ == Stage::Pixel && t.use_computed_lod && !t.use_register_gradients;
+            result = computed ? sample_texture(t, coordinates, 2, Query::Lod) : zero4_;
+        } else if (weights) {
+            result = sample_texture(t, coordinates, 2, Query::Weights);
         } else {
-            result = sample_texture(t, coordinates);
+            result = texture_signs(t, coordinates, sample_texture(t, coordinates));
+            // the fetch constant's exponent adjust (word 3 bits 13-18,
+            // signed): the result times its power of two, as Xenia's
+            Id word3 = m_.op(Op::OpBitcast, int_, {constant_dword(3, slot * 6 + 3)});
+            Id adjust = m_.op(Op::OpBitFieldSExtract, int_, {word3, u(13), u(6)});
+            result = exact(Op::OpVectorTimesScalar, vec4_, {result, glsl(GLSLstd450Ldexp, float_, {f(1), adjust})});
         }
         store_result(t.result, result);
         return false;
@@ -840,7 +877,87 @@ void Translator::texture_fetch(const TextureFetchInstruction &t) {
 // time by the fetch constant's dimension between the 3D image and the
 // layers of a stacked one (two of them blended when the volume filter is
 // linear); cube maps from the face coordinates.
-Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates) {
+// A slot's word in one of the system constants' per-slot tables (member 2
+// the images, 7 the signs, 8 the signed views).
+Id Translator::slot_word(uint32_t member, uint32_t slot) {
+    return m_.op(Op::OpCompositeExtract, uint_,
+                 {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                     {system_, u(member), u(slot >> 2)})),
+                  slot & 3});
+}
+
+// The fetch constant's signs on the sampled components, as Xenia's
+// ProcessTextureFetchInstruction applies them (spirv_shader_translator_
+// fetch.cc), by the renderer's per-slot word (system member 7): two bits per
+// result component, already through the constant's swizzle (Xenia's
+// SwizzleSigns), and four bits more for a biased component's width less
+// one. Unsigned as sampled; signed from the texture's signed view (member 8,
+// sampled only when a component asks for it and there is one; else the
+// sample as it is, which float formats already give signed); biased as
+// signed offset binary, (n - 2^(w-1)) / (2^(w-1) - 1) for a width known,
+// else 2u - 1, no lower than -1; gamma back to linear through the piecewise
+// linear curve.
+Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample) {
+    const uint32_t slot = t.operands[1].index;
+    Id info = slot_word(7, slot), signed_entry = slot_word(8, slot);
+    auto field = [&](uint32_t offset, uint32_t count) {
+        return m_.op(Op::OpBitFieldUExtract, uint_, {info, u(offset), u(count)});
+    };
+    Id signs[4], any_signed = m_.const_bool(false);
+    for (uint32_t k = 0; k < 4; k++) {
+        signs[k] = field(2 * k, 2);
+        any_signed = m_.op(Op::OpLogicalOr, bool_, {any_signed, m_.op(Op::OpIEqual, bool_, {signs[k], u(1)})});
+    }
+    store(signed_sample_, sample);
+    when(m_.op(Op::OpLogicalAnd, bool_, {any_signed, m_.op(Op::OpINotEqual, bool_, {signed_entry, u(0)})}), [&] {
+        store(signed_sample_, sample_texture(t, coordinates, 8));
+        return false;
+    });
+    Id signed_sample = load(vec4_, signed_sample_);
+    Id out[4];
+    for (uint32_t k = 0; k < 4; k++) {
+        Id value = comp(sample, k);
+        Id width_less_one = field(8 + 4 * k, 4);
+        Id half = m_.op(Op::OpConvertUToF, float_, {m_.op(Op::OpShiftLeftLogical, uint_, {u(1), width_less_one})});
+        Id offset_binary = exact(
+            Op::OpFDiv, float_,
+            {exact(Op::OpFSub, float_,
+                   {exact(Op::OpFMul, float_,
+                          {value, exact(Op::OpFSub, float_, {exact(Op::OpFMul, float_, {half, f(2)}), f(1)})}),
+                    half}),
+             exact(Op::OpFSub, float_, {half, f(1)})});
+        Id twice_less_one = exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {value, f(2)}), f(-1)});
+        Id biased = select(float_, m_.op(Op::OpINotEqual, bool_, {width_less_one, u(0)}), offset_binary, twice_less_one);
+        biased = glsl(GLSLstd450NMax, float_, {biased, f(-1)});
+        auto is = [&](uint32_t sign) { return m_.op(Op::OpIEqual, bool_, {signs[k], u(sign)}); };
+        Id r = select(float_, is(3), pwl_gamma_to_linear(value), value);
+        r = select(float_, is(2), biased, r);
+        out[k] = select(float_, is(1), comp(signed_sample, k), r);
+    }
+    return vec4_of(out[0], out[1], out[2], out[3]);
+}
+
+// xenos.cc's PWLGammaToLinear as Xenia's translators write it
+// (SpirvShaderTranslator::PWLGammaToLinear): saturated (NaN to 0), then the
+// curve's four pieces inverted.
+Id Translator::pwl_gamma_to_linear(Id gamma) {
+    gamma = glsl(GLSLstd450NClamp, float_, {gamma, f(0), f(1)});
+    auto at_least = [&](float edge) { return m_.op(Op::OpFOrdGreaterThanEqual, bool_, {gamma, f(edge)}); };
+    Id piece_3 = at_least(192.0f / 255.0f), piece_2 = at_least(96.0f / 255.0f), piece_1 = at_least(64.0f / 255.0f);
+    Id scale = select(float_, piece_2, select(float_, piece_3, f(8.0f / 1024.0f), f(4.0f / 1024.0f)),
+                      select(float_, piece_1, f(2.0f / 1024.0f), f(1.0f / 1024.0f)));
+    Id offset = select(float_, piece_2, select(float_, piece_3, f(-1024.0f), f(-256.0f)),
+                       select(float_, piece_1, f(-64.0f), f(0.0f)));
+    // linear = gamma * 255 * 1024 * scale + offset, plus trunc(linear * scale), over 1023
+    Id linear = exact(Op::OpFAdd, float_,
+                      {exact(Op::OpFMul, float_, {exact(Op::OpFMul, float_, {gamma, f(255.0f * 1024.0f)}), scale}), offset});
+    linear = exact(Op::OpFAdd, float_,
+                   {linear, glsl(GLSLstd450Trunc, float_, {exact(Op::OpFMul, float_, {linear, scale})})});
+    return exact(Op::OpFMul, float_, {linear, f(1.0f / 1023.0f)});
+}
+
+Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates, uint32_t member, Query query) {
+    const bool lod_query = query == Query::Lod;
     const uint32_t slot = t.operands[1].index;
     const float epsilon = 1.5f / 1024.0f;
     const Id vec3 = m_.type_vector(float_, 3);
@@ -851,10 +968,7 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates) 
     // the slot's image (bits 0-13), the kind of image it is (bits 14-15: a
     // 2D array, 3D, cube) and its sampler (bits 16-31), from the system
     // constants
-    Id entry = m_.op(Op::OpCompositeExtract, uint_,
-                     {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
-                                         {system_, u(2), u(slot >> 2)})),
-                      slot & 3});
+    Id entry = slot_word(member, slot);
     Id image_index = m_.op(Op::OpBitwiseAnd, uint_, {entry, u(0x3FFF)});
     Id kind = m_.op(Op::OpBitwiseAnd, uint_, {m_.op(Op::OpShiftRightLogical, uint_, {entry, u(14)}), u(3)});
     Id sampler_index = m_.op(Op::OpShiftRightLogical, uint_, {entry, u(16)});
@@ -911,6 +1025,18 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates) 
     Id c[3] = {comp(coordinates, 0), one ? f(0) : comp(coordinates, 1), cube || volume ? comp(coordinates, 2) : f(0)};
     const float offsets[3] = {t.offset_x + epsilon, one ? 0.0f : t.offset_y + epsilon,
                               cube ? t.offset_z : volume ? t.offset_z + epsilon : 0.0f};
+    if (query == Query::Weights) {
+        // getWeights as Xenia's (the LOD disregarded, as it does): per axis
+        // the bilinear lerp factor, fract of the coordinate in texels plus
+        // the offsets less half a texel; the LOD's factor in w, 0
+        uint32_t axes = one ? 1u : volume ? 3u : 2u;
+        Id w[4] = {f(0), f(0), f(0), f(0)};
+        for (uint32_t k = 0; k < axes; k++) {
+            Id v = t.unnormalized_coordinates ? c[k] : mul(c[k], size[k]);
+            w[k] = glsl(GLSLstd450Fract, float_, {add(v, f(offsets[k] - 0.5f))});
+        }
+        return vec4_of(w[0], w[1], w[2], w[3]);
+    }
     for (uint32_t k = 0; k < (one ? 1u : 2u); k++)
         c[k] = t.unnormalized_coordinates ? div(add(c[k], f(offsets[k])), size[k])
                                           : add(c[k], div(f(offsets[k]), size[k]));
@@ -927,35 +1053,62 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates) 
         }
     }
 
-    // the sample: the computed LOD in pixel shaders, or with gradients from
-    // registers (normalized if the coordinates are not); n gradient components
+    // The sample, as Xenia's ProcessTextureFetchInstruction makes it. The
+    // LOD: the fetch constant's bias (word 4 bits 12-21, in 1/32), the
+    // register's, the instruction's. With a computed LOD (pixel shaders, or
+    // register gradients), explicit gradients: the registers' (normalized
+    // if the coordinates are not) or the coordinates' coarse derivatives,
+    // times 2 to the LOD plus the constant's per-axis exponents (word 4 bits
+    // 22-26 across, 27-31 down); a cube map without register gradients
+    // takes the implicit LOD with the LOD and the larger exponent as a bias.
+    // Otherwise the LOD itself. n: the gradients' components; derivatives
+    // of `differentiated` (normalized coordinates).
     bool computed = t.use_computed_lod && (stage_ == Stage::Pixel || t.use_register_gradients);
-    auto sample = [&](Id sampled, Id coords, uint32_t n) {
+    Id word4 = constant_dword(3, slot * 6 + 4);
+    Id lod = mul(signed_bits(word4, 12, 10), f(1.0f / 32.0f));
+    if (t.use_register_lod) lod = add(load(float_, tfetch_lod_), lod);
+    if (t.lod_bias != 0) lod = add(lod, f(t.lod_bias));
+    Id exponent_h = signed_bits(word4, 22, 5), exponent_v = signed_bits(word4, 27, 5);
+    auto sample = [&](Id sampled, Id coords, uint32_t n, Id differentiated) {
+        if (lod_query) {
+            // the coordinates without an array layer
+            m_.capability(spv::Capability::ImageQuery);
+            Id lod = m_.op(Op::OpImageQueryLod, vec2_, {sampled, differentiated});
+            return vec4_of(comp(lod, 1), f(0), f(0), f(0));
+        }
+        if (computed && cube && !t.use_register_gradients) {
+            Id bias = add(lod, glsl(GLSLstd450FMax, float_, {exponent_h, exponent_v}));
+            return m_.op(Op::OpImageSampleImplicitLod, vec4_,
+                         {sampled, coords, uint32_t(spv::ImageOperandsMask::Bias), bias});
+        }
+        if (!computed)
+            return m_.op(Op::OpImageSampleExplicitLod, vec4_,
+                         {sampled, coords, uint32_t(spv::ImageOperandsMask::Lod), lod});
+        Id type = n == 3 ? vec3 : vec2_;
+        Id gradients[2];
         if (t.use_register_gradients) {
-            Id gradients[2];
             for (uint32_t g = 0; g < 2; g++) {
                 Id v = load(vec4_, g ? gradient_v_ : gradient_h_);
                 Id parts[3];
                 for (uint32_t k = 0; k < n; k++)
-                    parts[k] = t.unnormalized_coordinates && size[k] ? div(comp(v, k), size[k]) : comp(v, k);
+                    parts[k] = t.unnormalized_coordinates && !cube && size[k] ? div(comp(v, k), size[k]) : comp(v, k);
                 gradients[g] = n == 3 ? m_.op(Op::OpCompositeConstruct, vec3, {parts[0], parts[1], parts[2]})
                                       : m_.op(Op::OpCompositeConstruct, vec2_, {parts[0], parts[1]});
             }
-            return m_.op(Op::OpImageSampleExplicitLod, vec4_,
-                         {sampled, coords, uint32_t(spv::ImageOperandsMask::Grad), gradients[0], gradients[1]});
+        } else {
+            m_.capability(spv::Capability::DerivativeControl);
+            gradients[0] = m_.op(Op::OpDPdxCoarse, type, {differentiated});
+            gradients[1] = m_.op(Op::OpDPdyCoarse, type, {differentiated});
         }
-        if (t.use_register_lod || !computed) {
-            Id lod = f(t.lod_bias);
-            if (t.use_register_lod) lod = add(load(float_, tfetch_lod_), lod);
-            return m_.op(Op::OpImageSampleExplicitLod, vec4_,
-                         {sampled, coords, uint32_t(spv::ImageOperandsMask::Lod), lod});
-        }
-        if (t.lod_bias != 0)
-            return m_.op(Op::OpImageSampleImplicitLod, vec4_,
-                         {sampled, coords, uint32_t(spv::ImageOperandsMask::Bias), f(t.lod_bias)});
-        return m_.op(Op::OpImageSampleImplicitLod, vec4_, {sampled, coords});
+        gradients[0] = exact(Op::OpVectorTimesScalar, type,
+                             {gradients[0], glsl(GLSLstd450Exp2, float_, {add(lod, exponent_h)})});
+        gradients[1] = exact(Op::OpVectorTimesScalar, type,
+                             {gradients[1], glsl(GLSLstd450Exp2, float_, {add(lod, exponent_v)})});
+        return m_.op(Op::OpImageSampleExplicitLod, vec4_,
+                     {sampled, coords, uint32_t(spv::ImageOperandsMask::Grad), gradients[0], gradients[1]});
     };
     auto vec3_of = [&](Id x, Id y, Id z) { return m_.op(Op::OpCompositeConstruct, vec3, {x, y, z}); };
+    auto vec2_of = [&](Id x, Id y) { return m_.op(Op::OpCompositeConstruct, vec2_, {x, y}); };
 
     if (cube) {
         // the cube instruction's face coordinates (sc and tc in 1-2, the
@@ -972,13 +1125,14 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates) 
         Id on_z = vec3_of(select(float_, negative, nsc, sc), ntc, sign);
         Id coords = select(vec3, m_.op(Op::OpIEqual, bool_, {axis, u(0)}), on_x,
                            select(vec3, m_.op(Op::OpIEqual, bool_, {axis, u(1)}), on_y, on_z));
-        return sample(sampled_image(2), coords, 3);
+        return sample(sampled_image(2), coords, 3, coords);
     }
-    if (!volume) return sample(sampled_image(0), vec3_of(c[0], c[1], f(0)), 2);
+    if (!volume) return sample(sampled_image(0), vec3_of(c[0], c[1], f(0)), 2, vec2_of(c[0], c[1]));
 
     // 3D, or stacked; both sampled (the right one chosen after, so the
     // implicit LOD's derivatives stay in uniform control flow)
-    Id sampled_3d = sample(sampled_image(1), vec3_of(c[0], c[1], z_3d), 3);
+    Id coords_3d = vec3_of(c[0], c[1], z_3d);
+    Id sampled_3d = sample(sampled_image(1), coords_3d, 3, coords_3d);
     // the filter between layers: the instruction's, or the fetch
     // constant's (word 4 bits 0 and 1, magnifying and minifying); with a
     // computed LOD and the two differing, chosen by the layer coordinate's
@@ -986,17 +1140,13 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates) 
     bool mag_constant = t.vol_mag_filter == TextureFilter::UseFetchConst;
     bool min_constant = t.vol_min_filter == TextureFilter::UseFetchConst;
     bool mag_linear = t.vol_mag_filter == TextureFilter::Linear, min_linear = t.vol_min_filter == TextureFilter::Linear;
-    Id word4 = constant_dword(3, slot * 6 + 4);
     auto word4_bit = [&](uint32_t bit) {
         return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {word4, u(1u << bit)}), u(0)});
     };
     Id linear = 0; // chosen at run time
     if (computed && (mag_constant || min_constant || mag_linear != min_linear)) {
-        Id lod = mul(signed_bits(word4, 12, 10), f(1.0f / 32.0f));
-        if (t.use_register_lod) lod = add(load(float_, tfetch_lod_), lod);
-        if (t.lod_bias != 0) lod = add(lod, f(t.lod_bias));
-        Id scale_h = glsl(GLSLstd450Exp2, float_, {add(lod, signed_bits(word4, 22, 5))});
-        Id scale_v = glsl(GLSLstd450Exp2, float_, {add(lod, signed_bits(word4, 27, 5))});
+        Id scale_h = glsl(GLSLstd450Exp2, float_, {add(lod, exponent_h)});
+        Id scale_v = glsl(GLSLstd450Exp2, float_, {add(lod, exponent_v)});
         Id gradient_h, gradient_v;
         if (t.use_register_gradients) {
             gradient_h = comp(load(vec4_, gradient_h_), 2), gradient_v = comp(load(vec4_, gradient_v_), 2);
@@ -1025,9 +1175,10 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates) 
     Id half_back = exact(Op::OpFSub, float_, {layer, f(0.5f)});
     Id layer_coordinate = linear ? select(float_, linear, half_back, layer) : always_linear ? half_back : layer;
     Id layer_0 = glsl(GLSLstd450Floor, float_, {layer_coordinate});
-    Id stacked = sample(sampled_image(0), vec3_of(c[0], c[1], layer_0), 2);
+    Id stacked = sample(sampled_image(0), vec3_of(c[0], c[1], layer_0), 2, vec2_of(c[0], c[1]));
     if (linear || always_linear) {
-        Id next = sample(sampled_image(0), vec3_of(c[0], c[1], m_.op(Op::OpFAdd, float_, {layer_0, f(1)})), 2);
+        Id next = sample(sampled_image(0), vec3_of(c[0], c[1], m_.op(Op::OpFAdd, float_, {layer_0, f(1)})), 2,
+                         vec2_of(c[0], c[1]));
         Id factor = glsl(GLSLstd450Fract, float_, {layer_coordinate});
         Id step = exact(Op::OpVectorTimesScalar, vec4_, {exact(Op::OpFSub, vec4_, {next, stacked}), factor});
         Id filtered = exact(Op::OpFAdd, vec4_, {stacked, step});
@@ -1331,12 +1482,64 @@ void Translator::main_pixel() {
         m_.decorate(frag_depth, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FragDepth)});
     }
 
+    // for the pixel parameters
+    Id frag_coord = global(vec4_, spv::StorageClass::Input, "frag_coord");
+    m_.decorate(frag_coord, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FragCoord)});
+    Id front_facing = global(bool_, spv::StorageClass::Input, "front_facing");
+    m_.decorate(front_facing, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FrontFacing)});
+    // for alpha to coverage, when the shader writes oC0
+    bool writes_color_0 = false;
+    for (const ControlFlow &cf : s_.control_flow)
+        if (const auto *e = std::get_if<Exec>(&cf.instruction))
+            for (const ExecSlot &slot : e->slots)
+                if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
+                    for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
+                        writes_color_0 |= r->target == StorageTarget::Color && (r->index & 3) == 0 && r->used_write_mask();
+    Id sample_mask = 0;
+    if (writes_color_0) {
+        sample_mask = global(m_.type_array(int_, 1), spv::StorageClass::Output, "sample_mask");
+        m_.decorate(sample_mask, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::SampleMask)});
+    }
+
     Id main = m_.begin_function(void_, m_.type_function(void_, {}));
     m_.label();
     Id ptr_in_vec4 = m_.type_pointer(spv::StorageClass::Input, vec4_);
     for (uint32_t k = 0; k < harness::REGISTERS; k++) {
         Id value = k < 16 ? load(vec4_, m_.op(Op::OpAccessChain, ptr_in_vec4, {inputs, i(int32_t(k))})) : zero4_;
         store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))}), value);
+    }
+    // The pixel parameters (SQ_PROGRAM_CNTL's param_gen), as Xenia's
+    // StartFragmentShaderInMain writes them into the interpolator
+    // SQ_CONTEXT_MISC names, by the system flags' y (bit 8 on, bits 9-12
+    // the interpolator, bit 13 a point, 14 a line, 15 a polygon): x the
+    // pixel's column (floored), negative for a polygon's back face; y its
+    // row, negative for a point; z -0 for a line, else 0 (a point's sprite
+    // coordinates are not made: 0), w 0.
+    {
+        Id flags = m_.op(Op::OpCompositeExtract, uint_,
+                         {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                             {system_, u(3)})),
+                          1});
+        auto flag = [&](uint32_t bit) {
+            return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(1u << bit)}), u(0)});
+        };
+        when(flag(8), [&] {
+            Id position = load(vec4_, frag_coord);
+            Id sign_bit = u(1u << 31);
+            auto negated = [&](Id x) {
+                return m_.op(Op::OpBitcast, float_,
+                             {m_.op(Op::OpBitwiseXor, uint_, {m_.op(Op::OpBitcast, uint_, {x}), sign_bit})});
+            };
+            Id x = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {comp(position, 0)})});
+            Id y = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {comp(position, 1)})});
+            Id back = m_.op(Op::OpLogicalAnd, bool_, {flag(15), m_.op(Op::OpLogicalNot, bool_, {load(bool_, front_facing)})});
+            x = select(float_, back, negated(x), x);
+            y = select(float_, flag(13), negated(y), y);
+            Id z = select(float_, flag(14), negated(f(0)), f(0));
+            Id index = m_.op(Op::OpBitFieldUExtract, uint_, {flags, u(9), u(4)});
+            store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, index}), vec4_of(x, y, z, f(0)));
+            return false;
+        });
     }
     reset_state();
     m_.op(Op::OpFunctionCall, void_, {body_});
@@ -1367,6 +1570,58 @@ void Translator::main_pixel() {
         Id enabled = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(8)}), u(0)});
         when(m_.op(Op::OpLogicalAnd, bool_, {enabled, m_.op(Op::OpLogicalNot, bool_, {pass})}), [&] {
             m_.op_void(Op::OpDemoteToHelperInvocation);
+            return false;
+        });
+    }
+    // Alpha to coverage, as Xenia's host render target path makes it
+    // (spirv_shader_translator_rb.cc's FBO alpha to mask): with the system
+    // flags' x bit 16 on, oC0's unscaled alpha against each sample's
+    // threshold, less the pixel's dither offset (bits 8-15, two bits each,
+    // picked by the pixel's column and row parity) times the step, sets the
+    // sample's bit of the coverage: 1x 1.0 by quarters; 2x (host samples 1
+    // and 0, the host's order) 0.5 and 1.0 by eighths; 4x 0.75, 0.25, 0.5,
+    // 1.0 by sixteenths (the sample count in the flags' w bits 1-2). No
+    // sample covered: the pixel is dropped.
+    if (sample_mask) {
+        Id ptr_out_int = m_.type_pointer(spv::StorageClass::Output, int_);
+        Id mask_element = m_.op(Op::OpAccessChain, ptr_out_int, {sample_mask, i(0)});
+        store(mask_element, i(-1));
+        Id flags_vector =
+            load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)}));
+        Id flags = m_.op(Op::OpCompositeExtract, uint_, {flags_vector, 0});
+        Id enabled = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(1u << 16)}), u(0)});
+        when(enabled, [&] {
+            Id position = load(vec4_, frag_coord);
+            Id px = m_.op(Op::OpConvertFToU, uint_, {comp(position, 0)});
+            Id py = m_.op(Op::OpConvertFToU, uint_, {comp(position, 1)});
+            Id index = m_.op(Op::OpBitwiseOr, uint_,
+                             {m_.op(Op::OpBitwiseAnd, uint_, {py, u(1)}),
+                              m_.op(Op::OpShiftLeftLogical, uint_, {m_.op(Op::OpBitwiseAnd, uint_, {px, u(1)}), u(1)})});
+            Id offset_bits = m_.op(Op::OpBitFieldUExtract, uint_,
+                                   {flags, m_.op(Op::OpIAdd, uint_, {u(8), m_.op(Op::OpShiftLeftLogical, uint_, {index, u(1)})}),
+                                    u(2)});
+            Id offset = m_.op(Op::OpConvertUToF, float_, {offset_bits});
+            Id alpha = comp(load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(0)})), 3);
+            auto coverage = [&](std::initializer_list<std::pair<uint32_t, float>> samples, float step) {
+                Id mask = u(0);
+                for (auto [sample, base] : samples) {
+                    Id threshold = exact(Op::OpFAdd, float_, {f(base), exact(Op::OpFMul, float_, {offset, f(-step)})});
+                    Id passes = m_.op(Op::OpFOrdGreaterThanEqual, bool_, {alpha, threshold});
+                    mask = select(uint_, passes, m_.op(Op::OpBitwiseOr, uint_, {mask, u(1u << sample)}), mask);
+                }
+                return mask;
+            };
+            Id msaa = m_.op(Op::OpBitFieldUExtract, uint_, {m_.op(Op::OpCompositeExtract, uint_, {flags_vector, 3}), u(1), u(2)});
+            Id one = coverage({{0, 1.0f}}, 1.0f / 4.0f);
+            Id two = coverage({{1, 0.5f}, {0, 1.0f}}, 1.0f / 8.0f);
+            Id four = coverage({{0, 0.75f}, {1, 0.25f}, {2, 0.5f}, {3, 1.0f}}, 1.0f / 16.0f);
+            Id mask = select(uint_, m_.op(Op::OpIEqual, bool_, {msaa, u(2)}), four,
+                             select(uint_, m_.op(Op::OpIEqual, bool_, {msaa, u(1)}), two, one));
+            store(mask_element, m_.op(Op::OpBitcast, int_, {mask}));
+            when(m_.op(Op::OpIEqual, bool_, {mask, u(0)}), [&] {
+                m_.op_void(Op::OpDemoteToHelperInvocation);
+                return false;
+            });
             return false;
         });
     }

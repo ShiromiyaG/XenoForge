@@ -99,8 +99,12 @@ public:
     // a primary (indirect false) or indirect buffer begins or ends
     virtual void buffer_start(bool /*indirect*/, uint32_t /*address*/, uint32_t /*dwords*/) {}
     virtual void buffer_end(bool /*indirect*/) {}
-    // a packet, before it runs: its address (physical) and its words, host order
+    // a packet, before it runs: its address (physical) and its words, host
+    // order; then its end, once it has run (an indirect buffer's packet ends
+    // after the buffer's own packets). Only packets that run are reported:
+    // one longer than what is left of its buffer is not.
     virtual void packet(uint32_t /*address*/, std::span<const uint32_t> /*words*/) {}
+    virtual void packet_end() {}
     // memory the processor read (constants, shaders, polled words) or wrote
     // (fences, write-backs, reports), physical
     virtual void memory_read(uint32_t /*address*/, uint32_t /*bytes*/) {}
@@ -204,6 +208,8 @@ public:
     const std::array<uint32_t, 256> &gamma_ramp_table() const { return gamma_table_; }
     const std::array<uint32_t, 128 * 3> &gamma_ramp_pwl() const { return gamma_pwl_; }
     uint64_t gamma_ramp_version() const { return gamma_version_; }
+    // the component (0 red, 1 green, 2 blue) the next sequential write goes to
+    uint32_t gamma_ramp_rw_component() const { return gamma_component_; }
 
 private:
     // a buffer being read: a ring (the primary buffer) or a straight run (an
@@ -222,11 +228,15 @@ private:
     // the packets of a straight run of count dwords (an indirect buffer, a
     // trace's packet)
     void execute_straight(uint32_t start, uint32_t count);
-    bool type0(uint32_t packet);
-    bool type1(uint32_t packet);
-    bool type3(uint32_t packet);
+    bool type0(uint32_t address, uint32_t packet);
+    bool type1(uint32_t address, uint32_t packet);
+    bool type3(uint32_t address, uint32_t packet);
     bool type3_opcode(uint32_t opcode, uint32_t count);
-    void report_packet(uint32_t address, uint32_t words);
+    // a packet that runs, to the sink: its header and the count words after it
+    void report_packet(uint32_t address, uint32_t packet, uint32_t count);
+    void end_packet() {
+        if (sink_) sink_->packet_end();
+    }
     void special_register_write(uint32_t index, uint32_t value);
     void write_registers_from_ring(uint32_t base, uint32_t count);
     void write_registers_from_memory(uint32_t base, uint32_t physical, uint32_t count);

@@ -19,7 +19,9 @@
 // swaps there as <title>_<swap>.png, the swaps numbered from 0 as Xenia's
 // --trace_gpu_frames numbers a trace's frame (frame N: what the swap after
 // the first N shows): --shot-swaps 300,301,890-910, or --shot-every N. The
-// report adds the renderer's counts.
+// report adds the renderer's counts. --trace-frames 300,301 records those
+// frames as Xenia's GPU traces (gpu_trace_writer.h), numbered as the shots,
+// into --trace-dir (./traces by default); it renders.
 //
 // XAM's input answers from an idle pad for user 0 (a controller plugged in,
 // nothing pressed), so a game that waits for one goes on; --no-controller
@@ -30,8 +32,8 @@
 // clock, the renderer's time), as the player's --rates does.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
-//        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--no-controller] [--press <b@s>]...
-//        [--rates]
+//        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
+//        [--no-controller] [--press <b@s>]... [--rates]
 
 #include "game.h"
 
@@ -51,7 +53,8 @@ using namespace xf;
 int main(int argc, char **argv) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--render [--shots <dir> [--shot-swaps <list>] "
-                        "[--shot-every N]]] [--no-controller] [--press <buttons@seconds[:hold]>]... [--rates]\n";
+                        "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
+                        "[--press <buttons@seconds[:hold]>]... [--rates]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -61,8 +64,9 @@ int main(int argc, char **argv) {
     bool rendering = false, controller = true, rates = false;
     std::vector<game::Press> presses;
     std::filesystem::path shots;
-    std::set<uint64_t> shot_swaps;
+    std::set<uint64_t> shot_swaps, trace_frames;
     uint64_t shot_every = 0;
+    std::filesystem::path trace_dir = "traces";
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc)
@@ -84,6 +88,12 @@ int main(int argc, char **argv) {
                 return std::fprintf(stderr, "bad --shot-swaps\n%s", usage), 2;
         } else if (a == "--shot-every" && k + 1 < argc)
             shot_every = std::strtoull(argv[++k], nullptr, 10);
+        else if (a == "--trace-frames" && k + 1 < argc) {
+            if (!game::parse_numbers(argv[++k], trace_frames))
+                return std::fprintf(stderr, "bad --trace-frames\n%s", usage), 2;
+            rendering = true;
+        } else if (a == "--trace-dir" && k + 1 < argc)
+            trace_dir = argv[++k];
         else if (a == "--no-controller")
             controller = false;
         else if (a == "--rates")
@@ -126,6 +136,8 @@ int main(int argc, char **argv) {
             };
         }
         if (!game::start_renderer(g, options, error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
+        if (!trace_frames.empty() && !game::start_trace(g, trace_frames, trace_dir, error))
+            return std::fprintf(stderr, "%s\n", error.c_str()), 1;
         std::printf("rendering on %s%s%s\n", g.device->name().c_str(), shots.empty() ? "" : ", shots in ",
                     shots.string().c_str());
     }

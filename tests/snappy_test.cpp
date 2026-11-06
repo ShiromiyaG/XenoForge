@@ -55,10 +55,46 @@ void refuses() {
     CHECK(!ok);
 }
 
+// What the compressor writes reads back the same: empty, short, runs,
+// repeats across and past a 64 KB block, incompressible bytes; runs of
+// zeros shrink to a small part of their size.
+void compresses() {
+    auto round_trip = [](const std::vector<uint8_t> &data) {
+        std::vector<uint8_t> packed = snappy_compress(data), back;
+        return snappy_decompress(packed, back) && back == data;
+    };
+    CHECK(round_trip({}));
+    CHECK(round_trip({1, 2, 3}));
+    std::vector<uint8_t> zeros(10 << 20, 0);
+    CHECK(round_trip(zeros));
+    CHECK(snappy_compress(zeros).size() < zeros.size() / 20);
+    std::vector<uint8_t> mixed;
+    uint32_t seed = 12345;
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    for (int i = 0; i < 300000; i++) {
+        uint32_t kind = next() >> 30;
+        if (kind == 0 && mixed.size() > 70000) {
+            // a repeat from far back (another block) and from near
+            size_t from = mixed.size() - 1 - (next() >> 8) % 70000, n = 4 + (next() >> 24) % 200;
+            for (size_t k = 0; k < n; k++) mixed.push_back(mixed[from + k]);
+        } else if (kind == 1) {
+            uint8_t b = uint8_t(next() >> 24);
+            for (int k = 0; k < 70; k++) mixed.push_back(b);
+        } else {
+            mixed.push_back(uint8_t(next() >> 24));
+        }
+    }
+    CHECK(round_trip(mixed));
+    std::vector<uint8_t> noise(100000);
+    for (uint8_t &b : noise) b = uint8_t(next() >> 24);
+    CHECK(round_trip(noise));
+}
+
 } // namespace
 
 int main() {
     decodes();
     refuses();
+    compresses();
     return finish("snappy");
 }

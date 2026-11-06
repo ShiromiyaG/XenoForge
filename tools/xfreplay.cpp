@@ -1,8 +1,11 @@
 // xfreplay: a GPU trace replayed through the command processor into the
 // renderer (plan B3), the frame it shows written as a PNG and compared with
-// Xenia's (its trace dump's PNG of the same trace).
+// Xenia's (its trace dump's PNG of the same trace). --no-edram leaves the
+// trace's EDRAM snapshot out, as Xenia's Vulkan trace player does: a frame
+// that reads what an earlier frame left in EDRAM differs from Xenia's there.
 //
-//   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [-v]
+//   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
+//            [--dump-shaders <dir>] [-v]
 
 #include "xenoforge/renderer.h"
 
@@ -22,7 +25,8 @@
 namespace {
 
 int usage() {
-    std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [-v]\n");
+    std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
+                         "[--no-edram] [-v]\n");
     return 2;
 }
 
@@ -31,11 +35,14 @@ int usage() {
 int main(int argc, char **argv) {
     std::string trace_path, out_path, compare_path, diff_path;
     xf::render::Options options;
+    bool restore_edram = true;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) out_path = argv[++i];
         else if (a == "--compare" && i + 1 < argc) compare_path = argv[++i];
         else if (a == "--diff" && i + 1 < argc) diff_path = argv[++i];
+        else if (a == "--no-edram") restore_edram = false;
+        else if (a == "--dump-shaders" && i + 1 < argc) options.dump_shaders = argv[++i];
         else if (a == "-v") options.verbose = true;
         else if (!a.empty() && a[0] != '-' && trace_path.empty()) trace_path = a;
         else return usage();
@@ -55,7 +62,7 @@ int main(int argc, char **argv) {
     }
     xf::render::Image frame;
     xf::render::Report report;
-    if (!xf::render::replay(trace, *device, options, frame, report, error)) {
+    if (!xf::render::replay(trace, *device, options, frame, report, error, restore_edram)) {
         std::fprintf(stderr, "replay: %s\n", error.c_str());
         return 1;
     }

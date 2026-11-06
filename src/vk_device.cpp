@@ -116,6 +116,14 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     features.features.fragmentStoresAndAtomics = VK_TRUE;
     features.features.vertexPipelineStoresAndAtomics = VK_TRUE;
     features.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    // optional: the samplers' anisotropy and mirror clamp to edge
+    if (has.features.samplerAnisotropy) {
+        features.features.samplerAnisotropy = VK_TRUE;
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(d->physical_, &props);
+        d->max_anisotropy_ = props.limits.maxSamplerAnisotropy;
+    }
+    if (has12.samplerMirrorClampToEdge) v12.samplerMirrorClampToEdge = d->mirror_clamp_to_edge_ = true;
     // the renderer's queue, and with a window a second one to present on
     // where the family has it
     const float priorities[2] = {1.0f, 1.0f};

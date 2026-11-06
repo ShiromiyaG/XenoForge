@@ -87,7 +87,16 @@ void print_renderer_report(const render::Report &r) {
                 (unsigned long long)r.shaders);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
                 r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
-    for (const auto &[why, n] : r.skipped) std::printf("  skipped %8llu  %s\n", (unsigned long long)n, why.c_str());
+    for (const auto &[why, n] : r.skipped) {
+        std::printf("  skipped %8llu  %s", (unsigned long long)n, why.c_str());
+        auto at = r.skipped_at.find(why);
+        if (at != r.skipped_at.end() && !at->second.empty()) {
+            std::printf(" (frames");
+            for (uint64_t swap : at->second) std::printf(" %llu", (unsigned long long)swap);
+            std::printf("%s)", n > at->second.size() ? " ..." : "");
+        }
+        std::printf("\n");
+    }
     for (const auto &[what, n] : r.approximate)
         std::printf("  approx  %8llu  %s\n", (unsigned long long)n, what.c_str());
 }
@@ -147,6 +156,28 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     g.renderer = render::Renderer::create(*g.device, processor, o, error);
     if (!g.renderer) return error = "renderer: " + error, false;
     processor.set_sink(g.renderer.get());
+    // frames traced as XF_TRACE_FRAMES and XF_TRACE_DIR say (the player's
+    // way to them; boot has --trace-frames)
+    if (const char *frames = std::getenv("XF_TRACE_FRAMES")) {
+        std::set<uint64_t> numbers;
+        if (!parse_numbers(frames, numbers)) return error = "XF_TRACE_FRAMES: not a list of frames", false;
+        const char *dir = std::getenv("XF_TRACE_DIR");
+        if (!start_trace(g, numbers, dir ? dir : "traces", error)) return false;
+    }
+    return true;
+}
+
+bool start_trace(Game &g, const std::set<uint64_t> &frames, const std::filesystem::path &directory,
+                 std::string &error) {
+    if (!g.renderer) return error = "tracing frames needs the renderer", false;
+    gpu::CommandProcessor &processor = kernel::gpu_command_processor(*g.kernel);
+    gpu::TraceOptions options;
+    options.directory = directory;
+    options.frames = frames;
+    options.title_id = g.xex.execution.title_id;
+    g.trace = std::make_unique<gpu::TraceWriter>(processor, g.renderer.get(), g.renderer.get(), options);
+    processor.set_sink(g.trace.get());
+    std::printf("tracing %zu frames into %s\n", frames.size(), directory.string().c_str());
     return true;
 }
 
@@ -201,6 +232,10 @@ void print_report(Game &g, bool waiting) {
         } else {
             std::printf("renderer: busy (the fault came during one of its calls)\n");
         }
+    }
+    if (g.trace) {
+        for (const auto &path : g.trace->finished()) std::printf("trace: %s\n", path.string().c_str());
+        for (const auto &e : g.trace->errors()) std::printf("trace: %s\n", e.c_str());
     }
     std::fflush(stdout);
 }

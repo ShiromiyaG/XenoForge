@@ -23,6 +23,7 @@
 
 #include "xenoforge/command_processor.h"
 #include "xenoforge/gpu_trace.h"
+#include "xenoforge/gpu_trace_writer.h"
 #include "xenoforge/vk_device.h"
 
 #include <array>
@@ -63,6 +64,7 @@ struct Report {
     uint64_t writeback_bytes = 0;                // what resolves wrote, copied into guest memory
     uint64_t submissions = 0, waits = 0;         // command buffers submitted; waits for the GPU
     std::map<std::string, uint64_t> skipped;     // draws not done, by reason
+    std::map<std::string, std::vector<uint64_t>> skipped_at; // the first swaps (by number) each reason came in
     std::map<std::string, uint64_t> approximate; // done, with something not exact yet, by what
 };
 
@@ -83,6 +85,10 @@ struct FrontBuffer {
 
 struct Options {
     bool verbose = false; // a line per draw and resolve on stderr
+    // where to write each shader loaded, as Xenia's --dump_shaders writes
+    // them (shader_<hash>.ucode.bin.vert or .frag, words in host order; the
+    // hash is the renderer's, the one verbose draws print); none when empty
+    std::string dump_shaders;
     // Which swaps' front buffers to read back, by the swap's number from 0
     // (the number Xenia's --trace_gpu_frames gives the frame a trace holds:
     // frame N is what the swap after the first N shows); none when empty.
@@ -108,7 +114,13 @@ struct Options {
     std::filesystem::path pipeline_cache;
 };
 
-class Renderer : public gpu::Sink {
+// A trace writer (gpu_trace_writer.h) stands in front of it as the
+// processor's Sink and takes what it reads of guest memory (TraceSource):
+// vertex data, indices, textures, a resolve's rectangle and the tiles it
+// cuts, each where the renderer reads it on the CPU's side (not what it
+// loads from the mirror, which a replay's resolves make), and what resolves
+// wrote as it reaches guest memory.
+class Renderer : public gpu::Sink, public gpu::TraceSource {
 public:
     // A renderer for the processor's draws on the device, reading the
     // processor's physical memory. Install it with processor.set_sink.
@@ -134,8 +146,10 @@ public:
 // Replays the trace through a command processor of its own, as Xenia's trace
 // player does, into a renderer; the image is what the last swap showed
 // (empty without a swap). False only when the trace or the device fails,
-// not for draws that were skipped.
+// not for draws that were skipped. Without restore_edram the trace's EDRAM
+// snapshot is left out, EDRAM starting as zeros, as Xenia's Vulkan trace
+// player leaves it.
 bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, Image &frame, Report &report,
-            std::string &error);
+            std::string &error, bool restore_edram = true);
 
 } // namespace xf::render

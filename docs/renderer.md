@@ -300,11 +300,16 @@ MSAA target that the game clears by drawing into the same samples seen as a
 640 4x target.
 
 Not done yet, counted where it shows: MSAA resolves of one sample; depth
-resolves of MSAA targets; the display's piecewise linear gamma; signed,
-biased, gamma and exponent-adjusted textures; memexport; unnormalized cube
-map coordinates; point sprite coordinates (pixel parameter generation);
+resolves of MSAA targets; memexport; unnormalized cube map coordinates;
+point sprite coordinates in the pixel parameters; signed components of
+formats with no snorm view on the host (5_6_5, 4_4_4_4, the DXT colors);
 float16 and float32 targets moved through EDRAM by value rather than by
-bits (NaN payloads).
+bits (NaN payloads). Signed, biased, gamma and exponent-adjusted textures,
+the pixel parameters, the polygon offset, the samplers' LOD bias, mip
+range, anisotropy and border, render targets keyed by storage format,
+getCompTexLOD and getWeights, alpha to coverage, and the display's
+piecewise linear gamma came with the traces of live runs ("Traces of live
+runs" below).
 
 ## Driven live (2026-11-05)
 
@@ -434,6 +439,156 @@ indices a draw uses), the CPU's texture decodes and checks (all textures
 loaded on the GPU from the mirror, as Xenia's, once the mirror can be kept
 current), the copy back of every resolve (lazy with page guards), and
 resolution scale and the pipeline cache (B4's other half).
+
+## Traces of live runs (2026-11-05)
+
+Xenia's traces stop where a person stops playing it; XenoForge's runs go
+further (boot's scripted presses, the player). So the runs write Xenia's
+trace format themselves (`gpu_trace_writer.h`, Xenia's TraceWriter
+translated), and Xenia's trace dump draws the oracle's picture of the very
+commands our run sent: any scene a run reaches has a reference without
+playing it in Xenia.
+
+- **What a trace holds**, as Xenia's: from the swap before the frame to its
+  own swap, the register file and the gamma ramps, EDRAM as the renderer
+  holds it (its targets stored into the EDRAM buffer and read back, the
+  layout of Xenia's snapshots), then each packet with its words, the memory
+  the processor read for it (constants, shaders, polled words) and what it
+  wrote (fences, write-backs), and the memory the renderer read for it
+  (vertex data, indices, textures, a resolve's rectangle and the tiles it
+  cuts). Snappy-compressed above 1 KB as Xenia's writer does (`snappy.h`
+  compresses too now). An indirect buffer's packet is recorded with its
+  header and address alone, as Xenia's, so a player runs its packets once.
+- **Memory recorded once**: a shadow of what the trace has given, by 4 KB
+  page, so a range is recorded again only where it changed (Xenia uploads
+  again only what its page watches saw the CPU write). What a resolve wrote
+  during the frame is never recorded: the shadow learns it as it reaches
+  guest memory, and a replay's resolves make it (a recorded copy would hand
+  our resolve's output to Xenia's picture). At a trace's start the renderer
+  finishes its work, so what earlier frames' resolves wrote is in guest
+  memory and is recorded when read (Xenia downloads its GPU-written ranges).
+- **Frames** are numbered as boot's shots and as Xenia's
+  `--trace_gpu_frames`: frame N is what the swap after the first N shows,
+  `<title id>_<N>.xtr`. `boot --trace-frames 4500,4800 --trace-dir <dir>`
+  (it renders), or `XF_TRACE_FRAMES` and `XF_TRACE_DIR` for anything that
+  starts the renderer through `game::start_renderer` (the player).
+- **Checked**: `gpu_trace_writer_test` (a processor's packets written and
+  read back: the commands in order, the indirect buffer's packet giving way,
+  memory recorded once and again where it changed, not where the GPU wrote,
+  compressed and not); every trace recorded so far replays in `xfreplay` to
+  the live shot of the same swap exactly (mean 0.000), and Xenia's
+  `xenia-gpu-vulkan-trace-dump` draws each of them (its Vulkan backend leaves
+  EDRAM's snapshot out; `xfreplay --no-edram` does the same, for frames
+  that read an earlier frame's EDRAM).
+
+**El Chavo Kart past the title** (traces in `../traces/xf_chaves`, Xenia's
+dumps in `../traces/xf_dumps`). Presses by swap reach everything the same
+way whatever the run's speed: `--press start@#3400` brings the main menu
+and its first-time dialog; A takes it to Challenges, whose loading screen
+leads to a 3D scene of the park behind "Press START"; B on the dialog,
+then A through Cups (`a@#3800` to `a@#5400` every 200 swaps) reaches a
+race's "Normal Race" tip over the same park, and `a@#6900 a@#7050
+start@#7200 a@#7350 start@#7500 a+rt@#7650:90` starts the race and drives
+it. Against Xenia's dumps of the same traces (mean difference of 255,
+share of pixels off by more than 16):
+
+| frame | before | after |
+| --- | --- | --- |
+| menu (dialog; 3 frames) | 0.000, 0% | 0.000, 0% |
+| menu, Cups (4000) | 2.367, 8.04% | 0.000, 0% |
+| loading screens (5 frames) | 0.019-0.037, 0.07-0.09% | 0.000, 0% |
+| park behind "Press START" (4 frames) | 56.4-131.2, 75-95% | 0.005-0.067, 0.01-0.03% |
+| race tip over the track (3 frames) | 64.0-88.5, 85-88% | 0.009-0.136, 0.02-0.13% |
+| race (5 frames) | 55.0-68.8, 72-86% | 0.010-0.140, 0.01-0.14% |
+
+Four of them are in the regression now (`../traces/chaves_xf`, Xenia's
+dumps as `../traces/dumps/475807D7_xf_*.png`): the Cups menu, a loading
+screen, the park and the race, all within 0.017 and 0.03%; with a frame
+each of Forza Horizon and Sonic Unleashed (below, `../traces/fh_xf` and
+`../traces/sonic_xf`) `replay_test` compares 17 frames. The loading
+screens' top half is garbage in Xenia's picture as in ours (the game draws
+it so, or both read the same uninitialized memory).
+
+What the scenes asked for and the renderer approximated, counted by the
+runs (three minutes of the park: 6,363 gamma texture fetches, 14,590 draws
+with pixel parameters, 39,211 with a polygon offset, 1,225 with an exponent
+adjust), and what else differed from Xenia without being counted:
+
+- **Gamma textures** (the fetch constant's sign 3): read back to linear
+  through the piecewise linear curve (Xenia's PWLGammaToLinear) after the
+  sample. The scene's color textures (DXT1 and DXT4_5, gamma on red, green
+  and blue; 59 fetches in frame 4500) are lit in linear HDR (a
+  2_10_10_10_FLOAT target): read as linear, they came out washed white and
+  magenta.
+- **Signed and biased components**: the swizzled signs per slot (Xenia's
+  SwizzleSigns) in the system constants; signed components from a snorm
+  view of the same image (made mutable for it), biased ones as signed
+  offset binary by the component's width (Xenia's GetIntegerScaleBits),
+  else 2u - 1.
+- **The exponent adjust** (fetch constant word 3): the result times its
+  power of two.
+- **Pixel parameters** (SQ_PROGRAM_CNTL's param_gen): the pixel's
+  position, its facing and the kind of primitive in the interpolator
+  SQ_CONTEXT_MISC names, as Xenia writes them (VPOS for screen-space
+  passes); point sprite coordinates are still 0 there.
+- **The LOD**: the fetch constant's bias (word 4) and per-axis gradient
+  exponents on every fetch, computed LOD as explicit gradients from coarse
+  derivatives (cube maps: the implicit LOD with a bias), as Xenia samples.
+- **Samplers** as Xenia's: anisotropy, the constant's lowest mip as the
+  lowest LOD, the base map clamped there, white borders, the mirrored
+  clamps as mirror clamp to edge.
+- **The polygon offset** as Xenia's Vulkan backend sets the depth bias
+  (GetPreferredFacePolygonOffset, the float24 and unorm24 factors).
+- **Render targets by their storage format** (xenos.h's
+  GetStorageColorFormat, as Xenia keys them): 2_10_10_10_FLOAT_AS_16_16_16_16
+  is 2_10_10_10_FLOAT, 2_10_10_10_AS_10_10_10_10 is 2_10_10_10. The scene's
+  HDR target is used as both at the same base; as two images it moved
+  through EDRAM's 7e3 bits between them, clamped to 31.875 and to 7 bits of
+  mantissa, and the trees' leaves came out darker (0.4 of 255, 0.8% of the
+  pixels, before this; 0.02 and 0.03% after).
+
+What is left: the race's kart is drawn black, in Xenia's picture of our
+traces as in ours. The runs skip the draws whose vertex shaders export
+memory (memexport: 2,891 in five minutes of menus and park, every fifth
+frame in the race, from frame 7281 in one run; `boot` prints the first
+frames each skip reason came in); if the kart's colors or vertices come
+from such exports, our run never wrote them and the traces carry what was
+there instead. A frame with 29 such draws (4943 of one run) matches Xenia's
+picture of it (0.006): what they export is not read in their own frame.
+Memexport is next.
+
+**The other games** (`boot_<game> --render --trace-frames`, no input
+unless said; traces in `../traces/xf_<game>`, Xenia's dumps beside the
+others in `../traces/xf_dumps`):
+
+- **Forza Horizon** draws everything it sends; its front buffer is
+  2_10_10_10, shown through the display's piecewise linear gamma ramp
+  (Xenia's apply_gamma_pwl: a component's 10 bits choose an entry by their
+  top 7, base plus delta times the low 3 over 8), which was left out:
+  frames 600, 1500 and 3000 were 40.2-53.4 of 255 off Xenia (84-99.7% of
+  pixels), and are 0.001-0.014 (none off by 16) with it. Counted: depth
+  resolves of MSAA targets (7,857 in 150 s), not in those frames.
+- **Sonic Unleashed** reaches its title; its title's draws use
+  getCompTexLOD (27,146 skipped in 180 s) and then getWeights (46,844),
+  now translated as Xenia's (OpImageQueryLod's unclamped level in x, in
+  pixel shaders with the computed LOD; the bilinear lerp factors, the LOD
+  disregarded as Xenia does). Its frames 300, 450, 600 and 800 match
+  Xenia's (0.000 skipping those draws, 0.007-0.008 drawing them). Also
+  counted: MSAA depth resolves, texture slots without a texture constant.
+- **Red Dead Redemption** reaches its title (a 3D scene behind "Press
+  START") at about 7 swaps a second rendered: the renderer is its
+  bottleneck, 136 s of 160 busy, 101 s of them checking textures by hash
+  (over 500 textures a frame). It asked for alpha to coverage on 665,197
+  draws in 150 s (its vegetation drawn as solid quads), now made as Xenia's
+  host render target path makes it (oC0's alpha against each sample's
+  threshold, dithered by RB_COLORCONTROL's offsets, into gl_SampleMask):
+  the title's frames 850 and 950 went from 12.6 of 255 off Xenia (19% of
+  pixels) to 10.7-10.9 (15%), the cacti and trees now as Xenia's. What
+  remains is colored noise over the buildings, ground and hills, whose
+  4_4_4_4 textures the game makes on the GPU (4x MSAA 8_8_8_8_GAMMA targets
+  resolved at 192, 96, 48 and 24 texels, then read with gamma signs); not
+  from loading them on the GPU (decoded on the CPU, the same). Counted
+  there too: resolves of one MSAA sample (averaged), MSAA depth resolves.
 
 ## What is asked and not done is counted
 

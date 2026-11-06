@@ -46,8 +46,8 @@ public:
 
 class Player final : public TraceVisitor {
 public:
-    Player(Memory &memory, gpu::CommandProcessor &processor, Renderer &renderer)
-        : memory_(memory), processor_(processor), renderer_(renderer) {}
+    Player(Memory &memory, gpu::CommandProcessor &processor, Renderer &renderer, bool restore_edram)
+        : memory_(memory), processor_(processor), renderer_(renderer), restore_edram_(restore_edram) {}
 
     void packet(uint32_t address, std::span<const uint8_t> words) override {
         uint32_t count = uint32_t(words.size() / 4);
@@ -62,7 +62,9 @@ public:
     void registers(uint32_t first, std::span<const uint32_t> values) override {
         processor_.restore_registers(first, values);
     }
-    void edram_snapshot(std::span<const uint8_t> bytes) override { renderer_.restore_edram(bytes); }
+    void edram_snapshot(std::span<const uint8_t> bytes) override {
+        if (restore_edram_) renderer_.restore_edram(bytes);
+    }
     void gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t> pwl) override {
         processor_.restore_gamma_ramp(table, pwl);
     }
@@ -81,12 +83,13 @@ private:
     Memory &memory_;
     gpu::CommandProcessor &processor_;
     Renderer &renderer_;
+    bool restore_edram_;
 };
 
 } // namespace
 
 bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, Image &frame, Report &report,
-            std::string &error) {
+            std::string &error, bool restore_edram) {
     // the console's memory, all of its physical memory committed, as Xenia's
     // player allocates it
     std::unique_ptr<Memory> memory = Memory::create(error);
@@ -102,7 +105,7 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     std::unique_ptr<Renderer> renderer = Renderer::create(device, processor, o, error);
     if (!renderer) return false;
     processor.set_sink(renderer.get());
-    Player player(*memory, processor, *renderer);
+    Player player(*memory, processor, *renderer, restore_edram);
     bool walked = walk_gpu_trace(trace, player, error);
     processor.set_sink(nullptr);
     renderer->drain(); // the front buffers asked for, read back

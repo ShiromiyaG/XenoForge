@@ -235,7 +235,12 @@ traces, without a recompiled game.
   oracle's picture of each. XenoForge reads them (`gpu_trace.h`) and counts
   what each frame uses (`xftrace`). First traces: both games' intros, with
   no input; the game itself needs a player pressing F4 in Xenia, or input
-  sent to it.
+  sent to it. Then (2026-11-05, later) XenoForge writes them itself
+  (`gpu_trace_writer.h`, Xenia's TraceWriter translated): `boot
+  --trace-frames` (or `XF_TRACE_FRAMES` in the player) records chosen frames
+  of a live run, which Xenia's trace dump draws, so any scene our runs reach
+  has Xenia's own picture of the same commands ([renderer.md](renderer.md),
+  "Traces of live runs").
 - **B2. The microcode translator** to SPIR-V, with its harness (version 1
   in, 2026-11-04; [renderer.md](renderer.md), "The translated shader"):
   the microcode parsed as Xenia parses it (its disassembly, byte for byte,
@@ -253,8 +258,8 @@ traces, without a recompiled game.
   the interpreter agree on all 141 (whole shaders within 1e-4: rcp's 21
   bits differ by a step and subtractions grow it). Fetch offsets,
   unnormalized coordinates (not yet on cube maps) and stacked textures
-  came with B3. Left: memexport, getCompTexLOD and getWeights, the
-  parameter generator.
+  came with B3. Left: memexport (getCompTexLOD, getWeights and the
+  parameter generator came with the traces of live runs, 2026-11-05).
 - **B3. The renderer**: front end, render targets, textures, draws; a trace
   replayed and compared with Xenia's picture. First form in (2026-11-04,
   [renderer.md](renderer.md), "The renderer, first form"): EDRAM moved
@@ -338,11 +343,25 @@ keyboard is not confirmed yet.
 
 Then, in order:
 1. Play both games through: what they ask of the kernel and the renderer
-   past the menus (races, levels, saves).
+   past the menus (races, levels, saves). Begun for the renderer
+   (2026-11-05, later): traces written by our own runs and drawn by Xenia
+   as the reference; El Chavo Kart's menus, its park scene and a race went
+   from 55-131 of 255 off Xenia (3D frames) to 0.005-0.14 (gamma, signed
+   and biased textures, pixel parameters, the LOD bias, samplers, polygon
+   offset and render targets keyed by storage format as Xenia's;
+   [renderer.md](renderer.md), "Traces of live runs"). Next there:
+   memexport (the race's kart is black, in Xenia's picture of our traces
+   too).
 2. ~~The player presents the front buffer on the GPU~~ (done 2026-11-05:
    renderer.md, "Decisions"; runtime.md, "The player"). FFmpeg is loaded
    at run time and the player has a package to ship (runtime.md, "Sound").
-3. The other six games under the renderer, against Xenia's traces.
+3. The other six games under the renderer, against Xenia's traces. Begun
+   with our own traces (2026-11-05, later; [renderer.md](renderer.md),
+   "Traces of live runs"): Forza Horizon matches Xenia with the display's
+   PWL gamma ramp in; Sonic Unleashed's title matches with getCompTexLOD
+   and getWeights in; Red Dead Redemption's title is 10.9 of 255 off
+   (textures it makes from MSAA gamma targets), and its renderer cost is
+   the texture checks. BC2, Gears of War 3 and Reach not run yet.
 4. The kernel families they reach first. Done for the first two: the
    network offline (NetDll_*, XNet; Gears of War 3 polls its socket once a
    frame and runs at 30 swaps a second) and XCustomRegisterDynamicActions

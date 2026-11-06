@@ -43,6 +43,7 @@ struct Game {
     std::unique_ptr<kernel::Kernel> kernel;
     std::unique_ptr<vk::Device> device;
     std::unique_ptr<render::Renderer> renderer;
+    std::unique_ptr<gpu::TraceWriter> trace; // in front of the renderer, when frames are traced
 };
 
 // The game read, its memory and kernel made, the disc (or the executable's
@@ -54,8 +55,16 @@ bool open(const Options &options, Game &game, std::string &error);
 
 // The renderer on a Vulkan device without a window (or on game.device when
 // it is opened already: the player's, with its window), installed as the
-// command processor's Sink, before the game runs.
+// command processor's Sink, before the game runs. With XF_TRACE_FRAMES set
+// (a list as parse_numbers reads it), those frames are traced as well, into
+// XF_TRACE_DIR (./traces by default).
 bool start_renderer(Game &game, const render::Options &options, std::string &error);
+
+// Frames traced (gpu_trace_writer.h): a trace writer put in front of the
+// renderer, writing <title id>_<frame>.xtr into the directory; frames
+// numbered as the shots are (frame N: what the swap after the first N shows).
+bool start_trace(Game &game, const std::set<uint64_t> &frames, const std::filesystem::path &directory,
+                 std::string &error);
 
 // The main thread started, with the fault report (an access fault in the
 // guest's code: where, in guest terms, then the report) in place.
