@@ -539,6 +539,8 @@ void debugging(KernelHarness &h) {
 constexpr uint32_t LIB = 0x88000000, APP = 0x89000000;
 constexpr uint32_t FUNCTION = 0x1000, ENTRY = 0x1800, IMPORTS = 0x3000, DATA = 0x4000, IMAGE_SIZE = 0x10000;
 constexpr uint32_t LIB_ID = 0x11, APP_ID = 0x22;
+// splash.xex and game.xex, one after the other at one base (launcher_chain)
+constexpr uint32_t CHAIN = 0x8D000000, SPLASH_ID = 0x55, GAME_ID = 0x66;
 constexpr uint16_t KE_QUERY_PERFORMANCE_FREQUENCY = 0x83, XBOX_HARDWARE_INFO = 0x156;
 
 // the instructions the DLLs' code uses
@@ -691,6 +693,16 @@ std::vector<uint8_t> make_app(uint32_t log) {
                      {"xboxkrnl.exe", {APP + IMPORTS + 0x40, APP + IMPORTS + 0x50, APP + IMPORTS + 0x60}}});
 }
 
+// splash.xex and game.xex, both at CHAIN: export 1 returns the DLL's id in
+// guest code
+std::vector<uint8_t> make_chain_dll(uint32_t id, uint32_t log) {
+    std::vector<uint8_t> image = make_image(CHAIN, id, log);
+    put_code(image, FUNCTION, {li(3, int16_t(id)), BLR});
+    put32(image, IMPORTS, KE_QUERY_PERFORMANCE_FREQUENCY);
+    put_thunk(image, IMPORTS + 0x10, KE_QUERY_PERFORMANCE_FREQUENCY);
+    return make_dll(CHAIN, image, {{"xboxkrnl.exe", {CHAIN + IMPORTS, CHAIN + IMPORTS + 0x10}}});
+}
+
 // The generated code per module: lib.dll's table, made from its image, has
 // its export 1 as host code that does what the guest code does (the kernel's
 // import through the thunk, plus 7) and counts its calls; app.dll's table
@@ -713,7 +725,27 @@ const ppc::GeneratedFunction lib_functions[] = {{LIB + FUNCTION, lib_function}};
 const ppc::GeneratedFunction app_functions[] = {{APP + FUNCTION, app_function}};
 ppc::GeneratedModule lib_module{"lib.dll", LIB, 0, 0, lib_functions, 1};
 ppc::GeneratedModule app_module{"app.dll", APP, 0, 0, app_functions, 1};
-const ppc::GeneratedModule *const generated_modules[] = {&lib_module, &app_module};
+
+// BC2's launcher chain (docs/runtime.md, "Modules, memory, Rtl"): its
+// default.xex loads splash.xex, calls its export 1, unloads it and loads
+// game.xex at the same base. Each DLL's export 1 returns its own constant
+// in guest code (interpreted) and another in its generated code, which
+// counts its calls.
+std::atomic<int> splash_generated_calls{0}, game_generated_calls{0};
+void splash_function(ppc::Context &c) {
+    splash_generated_calls++;
+    c.r[3] = 0x5B1A54;
+}
+void game_function(ppc::Context &c) {
+    game_generated_calls++;
+    c.r[3] = 0x6A4E;
+}
+const ppc::GeneratedFunction splash_functions[] = {{CHAIN + FUNCTION, splash_function}};
+const ppc::GeneratedFunction game_functions[] = {{CHAIN + FUNCTION, game_function}};
+ppc::GeneratedModule splash_module{"splash.xex", CHAIN, 0, 0, splash_functions, 1};
+ppc::GeneratedModule game_module{"game.xex", CHAIN, 0, 0, game_functions, 1};
+
+const ppc::GeneratedModule *const generated_modules[] = {&lib_module, &app_module, &splash_module, &game_module};
 
 // a module's table for a DLL file, its digest as the kernel computes it
 void made_from(ppc::GeneratedModule &m, const std::vector<uint8_t> &file) {
@@ -893,6 +925,40 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     CHECK(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\lib.dll"), buffer, 0x7FF}) == 0xC0000023);
     CHECK(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\junk.dll"), buffer, 0x2000}) == 0xC000007B);
     CHECK(int32_t(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\missing.dll"), buffer, 0x2000})) < 0);
+}
+
+// BC2's chain, as its launcher (default.xex) runs it: splash.xex loaded, its
+// export 1 found (and no export 2) and called, unloaded; game.xex loaded at
+// the same base, its export 1 called. Each call runs the generated code of
+// the DLL loaded then, never the other's; each DllMain sees its own module.
+void launcher_chain(KernelHarness &h, uint32_t log) {
+    kernel::Kernel &k = *h.k;
+    constexpr uint32_t ATTACH = 1, DETACH = 0;
+    uint32_t out = h.alloc(4);
+    CHECK(h.krnl("XexLoadImage", {h.string("GAME:\\splash.xex"), 9, 0, out}) == 0);
+    uint32_t splash = k.load32(out);
+    CHECK(splash && k.load32(splash + 0x1C) == CHAIN);
+    CHECK(h.krnl("XexGetProcedureAddress", {splash, 1, out}) == 0 && k.load32(out) == CHAIN + FUNCTION);
+    CHECK(h.krnl("XexGetProcedureAddress", {splash, 3, out}) == 0xC0000263 && k.load32(out) == 0);
+    k.call(*h.c, CHAIN + FUNCTION);
+    CHECK(uint32_t(h.c->r[3]) == 0x5B1A54 && splash_generated_calls == 1 && game_generated_calls == 0);
+    CHECK(kernel::modules_report(k).find("\\splash.xex: 0x8D000000-0x8D010000, entry 0x8D001800, a DLL, attached, "
+                                         "loaded 1 time(s); generated code, 1 functions") != std::string::npos);
+    CHECK(h.krnl("XexUnloadImage", {splash}) == 0);
+    CHECK(!k.try_call(*h.c, CHAIN + FUNCTION)); // its code gone with its pages
+
+    CHECK(h.krnl("XexLoadImage", {h.string("GAME:\\game.xex"), 9, 0, out}) == 0);
+    uint32_t game = k.load32(out);
+    CHECK(game && k.load32(game + 0x1C) == CHAIN);
+    CHECK(h.krnl("XexGetProcedureAddress", {game, 1, out}) == 0 && k.load32(out) == CHAIN + FUNCTION);
+    k.call(*h.c, CHAIN + FUNCTION);
+    CHECK(uint32_t(h.c->r[3]) == 0x6A4E && splash_generated_calls == 1 && game_generated_calls == 1);
+    CHECK(k.load32(CHAIN + FUNCTION) == li(3, int16_t(GAME_ID))); // game.xex's image, not splash.xex's
+    CHECK(h.krnl("XexUnloadImage", {game}) == 0);
+    CHECK((entry_calls(k, log) == std::vector<EntryCall>{{splash, ATTACH, 0, SPLASH_ID},
+                                                         {splash, DETACH, 0, SPLASH_ID},
+                                                         {game, ATTACH, 0, GAME_ID},
+                                                         {game, DETACH, 0, GAME_ID}}));
 }
 
 // XexLoadImageFromMemory: a DLL's file in guest memory, its module named by
@@ -1305,6 +1371,13 @@ int main() {
     made_from(lib_module, lib_file);
     made_from(app_module, app_file);
     app_module.digest ^= 1; // another image
+    uint32_t chain_log = h.alloc(0x100);
+    std::vector<uint8_t> splash_file = make_chain_dll(SPLASH_ID, chain_log);
+    std::vector<uint8_t> game_file = make_chain_dll(GAME_ID, chain_log);
+    write("splash.xex", splash_file);
+    write("game.xex", game_file);
+    made_from(splash_module, splash_file);
+    made_from(game_module, game_file);
     write("junk.dll", std::vector<uint8_t>(0x1000, 'j'));
     write("gate.dll", make_gate(log));
     std::string error;
@@ -1321,6 +1394,7 @@ int main() {
     longjmp_into_generated(h);
     uint32_t gate_module = load_gate(h);
     user_modules(h, log, lib_file);
+    launcher_chain(h, chain_log);
     from_memory(h, log);
     exit_in_dll_main(h, log, gate_module);
     loader_lock(h, gate_module);

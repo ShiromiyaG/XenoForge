@@ -32,12 +32,14 @@
 // holds buttons at times on the scheduler's clock. What boot shares with the
 // player (opening the game, the renderer, the launch, the report) is in
 // game.cpp. --rates prints a line a second (the swaps, the scheduler's
-// clock, the renderer's time), as the player's --rates does.
+// clock, the renderer's time), as the player's --rates does. --stall-report S
+// prints the threads (what each waits for, its guest stack by the back chain)
+// when no swap has come for S seconds (5 S before the first), once a stall.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
-//        [--no-controller] [--press <b@s>]... [--rates]
+//        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S]
 
 #include "game.h"
 
@@ -59,13 +61,14 @@ int main(int argc, char **argv) {
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
                         "[--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
-                        "[--press <buttons@seconds[:hold]>]... [--rates]\n";
+                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
     std::error_code ec;
     o.storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
     uint32_t seconds = 30;
+    double stall_report = 0;
     bool rendering = false, controller = true, rates = false;
     std::vector<game::Press> presses;
     std::filesystem::path shots;
@@ -107,6 +110,8 @@ int main(int argc, char **argv) {
             controller = false;
         else if (a == "--rates")
             rates = true;
+        else if (a == "--stall-report" && k + 1 < argc)
+            stall_report = std::strtod(argv[++k], nullptr);
         else if (a == "--press" && k + 1 < argc) {
             std::string why;
             if (!game::parse_press(argv[++k], presses.emplace_back(), why))
@@ -159,10 +164,27 @@ int main(int argc, char **argv) {
     game::Rates rate_log;
     const auto started = std::chrono::steady_clock::now();
     double next_rates = 1;
+    // a stall: no swap for --stall-report seconds (five times that before the
+    // first); the threads (what each waits for, its guest stack) are printed
+    // once a stall
+    uint64_t last_swaps = 0;
+    double last_swap_at = 0;
+    bool stall_reported = false;
     for (double elapsed = 0; elapsed < seconds && !k.stopped;) {
         if ((ended = k.wait_main(100, &exit_code))) break;
         elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (rates && elapsed >= next_rates) game::print_rates(g, rate_log, elapsed), next_rates += 1;
+        if (stall_report > 0) {
+            uint64_t now_swaps = swaps();
+            if (now_swaps != last_swaps) {
+                last_swaps = now_swaps, last_swap_at = elapsed, stall_reported = false;
+            } else if (!stall_reported && elapsed - last_swap_at >= (now_swaps ? stall_report : 5 * stall_report)) {
+                stall_reported = true;
+                std::printf("stall: no swap for %.1f s after swap %llu (%.1f s); threads:\n%s", elapsed - last_swap_at,
+                            (unsigned long long)now_swaps, elapsed, k.thread_report().c_str());
+                std::fflush(stdout);
+            }
+        }
     }
 
     if (k.stopped)

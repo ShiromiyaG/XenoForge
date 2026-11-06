@@ -349,6 +349,7 @@ public:
     uint32_t exit_code = 0;
     uint32_t self_handle = 0; // the handle its hold on itself is on
     bool main = false;
+    std::string guest_name; // what the guest named it (SetThreadName), for the thread report
 
     // what makes the thread stop at its next kernel call (a safe point)
     enum : uint32_t { PENDING_SUSPEND = 1, PENDING_KERNEL_APC = 2 };

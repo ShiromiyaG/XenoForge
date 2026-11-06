@@ -10,7 +10,8 @@ The plan's "Accuracy beyond Xenia" item, the first, cheap and read-only step: ev
 - Games: Chavo (El Chavo Kart), Ben10, BC2 (Battlefield: Bad Company 2), FH (Forza Horizon), GoW3, Halo (Reach),
   RDR (Red Dead Redemption), Sonic (Unleashed). "Imports" is `xfinspect --imports`; "calls" is the export's
   count in a 15 second boot of the master build (interpreted, no game library, so the games are at different
-  points; a call count is a floor, not a rate). BC2's boot (`--xex Game.xex`) ends at once, so it has imports only.
+  points; a call count is a floor, not a rate). BC2's boot (`--xex Game.xex`) ends at once, so it has imports only:
+  Game.xex is a DLL its default.xex loads after Splash.xex's "press START" (runtime.md, "BC2's launcher chain").
 - Nothing of the console's XAM (code, data, strings) is in this page; the oracle's answers are behavior only.
 
 ## Counts

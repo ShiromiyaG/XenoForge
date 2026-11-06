@@ -485,12 +485,46 @@ std::string Kernel::thread_report() {
         const char *state = t->blocked == Thread::Blocked::Wait        ? "waiting"
                             : t->blocked == Thread::Blocked::Suspended ? "suspended"
                                                                        : "running";
-        char line[224];
+        char line[320];
+        const char *name = t->params.name ? t->params.name : t->guest_name.c_str();
         std::snprintf(line, sizeof(line), "  thread %u%s%s%s (handle 0x%08X, start 0x%08X): %s, pc 0x%08X, lr 0x%08X\n",
-                      t->id, t->main ? " (main)" : "", t->params.name ? ", " : "",
-                      t->params.name ? t->params.name : "", t->self_handle, t->params.start_address, state,
-                      t->context->pc, uint32_t(t->context->lr));
+                      t->id, t->main ? " (main)" : "", name[0] ? ", " : "", name, t->self_handle,
+                      t->params.start_address, state, t->context->pc, uint32_t(t->context->lr));
         out += line;
+        // what a waiting thread waits on: each object's kind, handle, body
+        // and signal state
+        if (t->blocked == Thread::Blocked::Wait && !t->waiting_on.empty()) {
+            static const char *const kinds[] = {"event", "semaphore",      "mutant",          "timer", "thread",
+                                                "file",  "I/O completion", "notify listener", "other"};
+            out += t->waiting_on.size() > 1 ? (t->wait_all ? "    waits for all of:" : "    waits for any of:")
+                                            : "    waits for";
+            for (Dispatcher *d : t->waiting_on) {
+                std::snprintf(line, sizeof(line), " %s 0x%08X (body 0x%08X, type %u, state %d%s%s)",
+                              kinds[size_t(d->type())], d->handle(), d->guest, unsigned(d->guest_type()),
+                              d->signal_state(), d->name.empty() ? "" : ", ", d->name.c_str());
+                out += line;
+            }
+            out += t->alertable ? ", alertable\n" : "\n";
+        }
+        // the guest's stack, by its back chain: each frame's saved LR (the
+        // XDK's prologues store it 8 bytes below the caller's frame), read
+        // only where the pages are readable (a stack's guard pages are not)
+        auto readable = [this](uint32_t address) {
+            Heap *heap = memory().heap_for(address);
+            RegionInfo info;
+            return heap && heap->query(address & ~3u, info) && (info.state & ALLOCATE_COMMIT) &&
+                   (info.protect & PROTECT_READ);
+        };
+        uint32_t sp = uint32_t(t->context->r[1]);
+        std::string frames;
+        for (int n = 0; n < 16 && sp && readable(sp); n++) {
+            uint32_t next = load32(sp);
+            if (next <= sp || next - sp > 0x100000 || !readable(next - 8)) break;
+            std::snprintf(line, sizeof(line), " 0x%08X", load32(next - 8));
+            frames += line;
+            sp = next;
+        }
+        if (!frames.empty()) out += "    stack:" + frames + "\n";
     }
     return out;
 }

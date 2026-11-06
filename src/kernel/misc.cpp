@@ -81,6 +81,12 @@ XF_EXPORT(xboxkrnl, RtlRaiseException) {
                 text += (ch < 32 || ch > 126) ? '?' : ch;
             }
         std::fprintf(stderr, "kernel: SetThreadName(%d, %s)\n", int32_t(thread_id), text.c_str());
+        // kept for the thread report: the calling thread (-1) or the one
+        // with that id
+        Objects &o = objects(k);
+        std::lock_guard<std::mutex> l(o.lock);
+        for (Thread *t : o.threads)
+            if (thread_id == 0xFFFFFFFF ? t == current_thread() : t->id == thread_id) t->guest_name = text;
         return;
     }
     if (code == 0xE06D7363) {

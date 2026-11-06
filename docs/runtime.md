@@ -138,6 +138,28 @@ lists: what the game calls is what gets written next.
   boot's module report names the lock's owner when it is held. Each
   module's code is generated or interpreted as its image matches a table
   of the game library ("Code" above).
+- **BC2's launcher chain** (`kernel_modules_test`'s `launcher_chain` runs
+  the same sequence). Its `default.xex` (Frost.Game.Launcher) is a small
+  executable; `Splash.xex` (splash.dll) and `Game.xex` (game.dll) are DLLs
+  (module flags 0x9) at 0x82A00000, each exporting one function, ordinal 1,
+  its `dllMain`. The launcher loads `GAME:\splash.xex` (XexLoadImage, its
+  DllMain attached), looks up ordinal 1 (and ordinal 2, which must be
+  absent, else it warns) and calls it with a launcher object of its own (a
+  C++ interface on its stack whose methods the DLL calls: a "go on" flag,
+  which executable comes next, the index of the pad that pressed START,
+  as Splash.xex's code reads); when it returns with the flag set,
+  the launcher unloads it and loads `GAME:\game.xex` the same way, and with
+  the flag clear it ends with XLaunchNewImage(NULL) (the dashboard). The
+  state passed on is that object in memory, not XAM's: Game.xex calls
+  XamLoaderGetLaunchData once and goes on with none (X_ERROR_NOT_FOUND, a
+  cold boot's answer). Splash.xex plays its movies and waits on its "press
+  START" screen (START or A on any pad moves on, as on the console), so an
+  idle pad keeps it there for good; `--press start@20 --press start@30
+  ...` takes the chain to Game.xex, which loads (about 15 s on its main
+  thread, no swaps) and runs its menus (2026-11-06: 30 swaps a second,
+  5,700 draws a second, its single-player menu reached with presses).
+  Booted alone (`--xex Game.xex`), its entry point is the CRT's DllMain,
+  which returns: the main thread ends at once.
 - **Memory exports** (`memory_exports.cpp`): NtAllocateVirtualMemory and
   the Mm*/Ex* pools on the heaps of memory.h, with Xenia's addresses.
 - **Rtl and misc** (`rtl.cpp`, `misc.cpp`): strings, time fields, status
@@ -823,6 +845,26 @@ pipelines). `--rates` prints a line a second on the host's clock: the
 swaps, draws and resolves a second, the scheduler's clock, the share of
 the second the renderer was busy (`-` when a call of its was under way),
 to set boot and the player side by side over a run.
+
+The thread report (at the end, and with `--stall-report S` whenever no
+swap has come for S seconds, 5 S before the first, once a stall) gives
+each thread's name (the host's, or what the guest named it with
+SetThreadName), its state, what a waiting thread waits for (each object's
+kind, handle, body, type and signal state) and its guest stack: the saved
+LR of each frame on the back chain, read where the pages are readable. A
+title's main thread often waits for good on its game thread (Reach's
+`main` waits at lr 0x820CCFA8, in WaitForSingleObjectEx, for its
+MAIN_THREAD), so the thread to look at is the one that stopped, not the
+main one. Booting a DLL as the executable (`--xex Game.xex` on BC2) says
+so: its entry point is a DllMain that returns at once.
+
+Reach with its game library (2026-11-06): the intro at 60 swaps a second;
+2,300 to 2,750 swaps in, MAIN_THREAD loads the main menu itself (running,
+16 frames deep; 0 to 6 s with no swap, longer as the machine is busier),
+then the menu at 30 swaps a second, 6,349 swaps in 180 s. Its start was
+run 30 times beside other load (16 beside 12 busy processes, 8 beside two
+writers flushing to the hard disk the disc image is on, 6 under a game
+library's build): the first swap came at 2 to 11 s every time.
 
 ## The player
 
