@@ -7,7 +7,9 @@ relatórios com a pilha do guest, interpretador conferindo o código gerado, rep
 parte). Escrito do zero com o Xenia como referência; kernel e GPU completados por inventário (famílias
 inteiras portadas do Xenia de uma vez, `docs/plan.md` "Everything left"), não só o que os jogos pedem. Na GPU,
 onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segunda referência. Plano:
-`docs/plan.md`; renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-kernel.md`.
+`docs/plan.md` (**fora do git, só local**, pedido do dono em 2026-11-06: está no `.gitignore`; worktrees não o têm,
+então agentes o leem em `F:\RECOMPs\XenoForge\docs\plan.md`, não o editam e trazem as mudanças no relatório, que eu
+aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-kernel.md`.
 
 - Remoto: `origin` = https://github.com/ShiromiyaG/XenoForge (**privado**, criado em 2026-11-06, branch
   `master`). Commits locais de rotina permitidos; **push só quando o dono pedir**. Só o `master` vai para o

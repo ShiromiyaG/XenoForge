@@ -38,6 +38,8 @@ Xenia is its reference and oracle. You do not change anything: you read, compare
 
 - Read-only. No edits, no commits, no builds that write outside build/, no git commands that change
   state.
+- docs/plan.md is kept out of git, so a worktree has none: read it at F:\RECOMPs\XenoForge\docs\plan.md.
+  References are in F:\RECOMPs\refs (index: refs/README.md).
 - You may run the existing tests or tools to confirm a suspected bug (`ctest --test-dir build`,
   `build/boot.exe ...`), always under a timeout (`timeout 120 ...`) and without leaving processes
   running. Other agents may be building on the same machine.

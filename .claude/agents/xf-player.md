@@ -53,6 +53,10 @@ Then:
 - Never put game data in the repo (ISOs, XEX, generated code, saves, screenshots). Never modify
   F:\RECOMPs\rexglue-sdk or F:\RECOMPs\runtime.
 - Do not commit. Leave the work uncommitted in your worktree; it is merged by whoever launched you.
+- docs/plan.md is kept out of git, so a worktree has none. Read it at F:\RECOMPs\XenoForge\docs\plan.md
+  and never edit it. Put the changes your work makes to the plan in your report, as a short list.
+- References are downloaded into F:\RECOMPs\refs (index: refs/README.md). Read them there before going
+  online.
 
 ## Checks
 

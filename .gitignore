@@ -9,3 +9,6 @@ re/
 # Claude Code's local state (worktrees, settings); its agent definitions are versioned
 .claude/*
 !.claude/agents/
+
+# the plan is the owner's working document, kept on this machine only
+docs/plan.md

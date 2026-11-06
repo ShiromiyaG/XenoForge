@@ -48,6 +48,10 @@ docs/plan.md (A2, A3). The code:
   - no x86 intrinsics in what the generated code includes;
   - sizes from the host (page size), never a constant.
 - Do not commit. Leave the work uncommitted in your worktree; it is merged by whoever launched you.
+- docs/plan.md is kept out of git, so a worktree has none. Read it at F:\RECOMPs\XenoForge\docs\plan.md
+  and never edit it. Put the changes your work makes to the plan in your report, as a short list.
+- References are downloaded into F:\RECOMPs\refs (index: refs/README.md). Read them there before going
+  online.
 
 ## Checks
 

@@ -60,6 +60,10 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
   and F:\RECOMPs\external. Never modify F:\RECOMPs\rexglue-sdk.
 - Avoid running games or Xenia unless the task needs a new trace; the existing traces cover most work.
 - Do not commit. Leave the work uncommitted in your worktree; it is merged by whoever launched you.
+- docs/plan.md is kept out of git, so a worktree has none. Read it at F:\RECOMPs\XenoForge\docs\plan.md
+  and never edit it. Put the changes your work makes to the plan in your report, as a short list.
+- References are downloaded into F:\RECOMPs\refs (index: refs/README.md). Read them there before going
+  online.
 
 ## Checking against Xenia
 

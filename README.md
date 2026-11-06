@@ -12,7 +12,7 @@ Written from scratch in C++20 (Vulkan, SDL3), with
 reference for how the console behaves. No game is included or needed to
 build it; to run anything you need your own copy of a game.
 
-**Status: early, in development.** See [docs/plan.md](docs/plan.md).
+**Status: early, in development.**
 
 ## What works today
 
@@ -45,8 +45,6 @@ A game's generated code is built with `-DXF_GAMES="<name>;..."` from what
 
 ## Documents
 
-- [docs/plan.md](docs/plan.md): the goal, the principles, the steps, the
-  references, and everything left to do.
 - [docs/recompiler.md](docs/recompiler.md): the recompiler.
 - [docs/runtime.md](docs/runtime.md): the kernel, sound, player and launcher.
 - [docs/renderer.md](docs/renderer.md): the GPU.
@@ -54,8 +52,7 @@ A game's generated code is built with `-DXF_GAMES="<name>;..."` from what
 
 ## References
 
-XenoForge stands on the work of others. The full list, with what each is
-used for, is in [docs/plan.md](docs/plan.md), "References".
+XenoForge stands on the work of others. The main ones:
 
 - **Emulators and recompilers:**
   - [Xenia / Xenia Canary](https://github.com/xenia-canary/xenia-canary)

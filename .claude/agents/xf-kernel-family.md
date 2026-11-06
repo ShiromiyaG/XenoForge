@@ -54,6 +54,10 @@ threads.cpp, sync.cpp. Follow their style.
   is theirs. Shared files (CMakeLists.txt, tools/boot.cpp, include/xenoforge/kernel.h, objects.h): small,
   self-contained edits only.
 - Do not commit. Leave the work uncommitted in your worktree; it is merged by whoever launched you.
+- docs/plan.md is kept out of git, so a worktree has none. Read it at F:\RECOMPs\XenoForge\docs\plan.md
+  and never edit it. Put the changes your work makes to the plan in your report, as a short list.
+- References are downloaded into F:\RECOMPs\refs (index: refs/README.md). Read them there before going
+  online.
 
 ## Tests and measurements
 
