@@ -51,7 +51,8 @@ onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segund
   `../external/oracle/ppc_oracle.exe` contra as libs do xenia-canary; `build/xfppc <arquivo> <base>` imprime no
   mesmo formato (comparar com `cmp`). Testes de instrução do Xenia montados por
   `bash tools/assemble_ppc_tests.sh ../rexglue-sdk/tools/binutils ../xenia-canary/src/xenia/cpu/ppc/testing
-  ../external/ppc_tests` (566 montam; dcbz128, vpermwi128, vpkd3d128, vspltisw128 não montam com este binutils).
+  ../external/ppc_tests tests/ppc` (566 montam; dcbz128, vpermwi128, vpkd3d128, vspltisw128 não montam com este
+  binutils; `tests/ppc` traz os nossos, como lswx/stswx, e o `skip.txt` dos casos do Xenia que o console contradiz).
   Rodar: `XF_PPC_TESTS=../external/ppc_tests build/ppc_test [filtros] [-v]` (interpretador) e, configurando com
   `-DXF_PPC_TESTS_DIR=F:/RECOMPs/external/ppc_tests`, `build/ppc_recompiled_test` (os testes recompilados pelo
   `xfrecomp tests`; ~1 min de build). Descoberta: `build/xfrecomp analyze <iso> --compare <*_init.cpp do rexglue>`.
