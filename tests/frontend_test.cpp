@@ -7,6 +7,9 @@
 #include "check.h"
 
 #include "../frontend/launcher_core.h"
+#include "../frontend/launcher_html.h"
+#include "../frontend/launcher_model.h"
+#include "../frontend/prepare_job.h"
 #include "../frontend/library.h"
 #include "../frontend/sdl_audio.h"
 #include "../frontend/sdl_input.h"
@@ -14,7 +17,9 @@
 #include "../tools/game.h"
 
 #include <cmath>
+#include <chrono>
 #include <filesystem>
+#include <thread>
 #include <vector>
 
 using namespace xf;
@@ -180,5 +185,117 @@ int main() {
     CHECK(keyboard->state(2, 0, state) == input::SUCCESS && state.packet_number == 2);
     auto pads = controllers.gamepads();
     CHECK(pads->state(0, 0, state) == input::DEVICE_NOT_CONNECTED);
+
+    // the launcher's screens: what they say, apart from how they are drawn
+    CHECK(frontend::game_status(true, false, false) == frontend::GameStatus::Ready);
+    CHECK(frontend::game_status(false, true, true) == frontend::GameStatus::Ready);
+    CHECK(frontend::game_status(false, false, false) == frontend::GameStatus::NeedsPreparing);
+    CHECK(frontend::game_status(false, false, true) == frontend::GameStatus::Interpreted);
+    CHECK(frontend::format_duration(42) == "0:42" && frontend::format_duration(725) == "12:05");
+    CHECK(frontend::format_duration(3729) == "1:02:09" && frontend::format_duration(-3) == "0:00");
+    CHECK(frontend::version_text(0x10000100) == "1.0.1.0");
+    CHECK(frontend::html_escape("a<b>&\"c") == "a&lt;b&gt;&amp;&quot;c");
+    {
+        const frontend::Accent a = frontend::accent_from_hex("#4c9bff"), bad = frontend::accent_from_hex("nonsense");
+        CHECK(a.base == "#4c9bff" && a.a40 == "#4c9bff66" && a.on == "#1a0f08" && frontend::accent_from_hex("#2a3fa0").on == "#ffffff");
+        CHECK(bad.base == frontend::accent_choices()[0]);
+        const std::string css = frontend::apply_tokens("x {accent} {accent-hi} {accent-lo} {accent25} {on-accent} {accent}", a);
+        CHECK(css.find('{') == std::string::npos && css.starts_with("x #4c9bff #"));
+        CHECK(frontend::accent_from_hex("#ffc247").on == "#1a0f08"); // a dark label on a light accent
+    }
+    {
+        const auto caps = frontend::parse_keys("^A Return");
+        CHECK(caps.size() == 2 && caps[0].shift && caps[0].label == "A" && caps[1].label == "Enter" && !caps[1].shift);
+        CHECK(frontend::parse_keys("_W")[0].no_shift && frontend::parse_keys("").empty());
+        for (const frontend::Binding &b : frontend::BINDINGS) CHECK(std::string(frontend::binding_info(b.name).label) != "?");
+    }
+    {
+        // a grid of two rows of three, a wide row below, and one off to the right
+        std::vector<frontend::NavRect> r = {{0, 0, 100, 100},     {120, 0, 100, 100},   {240, 0, 100, 100}, {0, 120, 100, 100},
+                                            {120, 120, 100, 100}, {240, 120, 100, 100}, {0, 260, 340, 50},  {400, 0, 100, 100}};
+        using frontend::NavDir;
+        CHECK(frontend::nav_pick(r, 0, NavDir::Right) == 1 && frontend::nav_pick(r, 1, NavDir::Down) == 4);
+        CHECK(frontend::nav_pick(r, 4, NavDir::Up) == 1 && frontend::nav_pick(r, 5, NavDir::Left) == 4);
+        CHECK(frontend::nav_pick(r, 4, NavDir::Down) == 6 && frontend::nav_pick(r, 6, NavDir::Up) == 4);
+        CHECK(frontend::nav_pick(r, 2, NavDir::Right) == 7 && frontend::nav_pick(r, 0, NavDir::Up) == -1);
+        CHECK(frontend::nav_pick(r, 0, NavDir::Left) == -1 && frontend::nav_pick(r, 99, NavDir::Left) == -1);
+    }
+    {
+        // the screens' structure: escaped titles, every binding a row, the settings' keys
+        frontend::TileInfo tile;
+        tile.title = "A <b> & C", tile.id_text = "4D5307E6";
+        const std::string tiles = frontend::tiles_html({tile});
+        CHECK(tiles.find("A &lt;b&gt; &amp; C") != std::string::npos && tiles.find("<b>") == std::string::npos);
+        frontend::Settings own;
+        frontend::SettingsPage page;
+        page.settings = &own, page.accent = "#ff7a45";
+        const std::string settings = frontend::settings_html(page);
+        for (const char *key : {"video.fullscreen", "video.aspect", "audio.volume", "audio.mute"})
+            CHECK(settings.find(std::string("data-key=\"") + key + "\"") != std::string::npos);
+        frontend::ControlsPage controls;
+        controls.settings = &own;
+        const std::string html = frontend::controls_html(controls);
+        size_t rows = 0;
+        for (size_t at = html.find("data-action=\"capture\""); at != std::string::npos; at = html.find("data-action=\"capture\"", at + 1)) rows++;
+        CHECK(rows == 25);
+        CHECK(frontend::about_html().find("FFmpeg") != std::string::npos);
+    }
+    {
+        // the accent colour saved in config.toml, with the games folder beside it
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / "xf_frontend_test_accent.toml";
+        std::filesystem::remove(file);
+        frontend::Settings a, b;
+        a.launcher.games = "D:/games", a.launcher.accent = "#9b7bff";
+        std::string err;
+        CHECK(frontend::save(file, a, err) && frontend::load(file, b, err));
+        CHECK(b.launcher.games == "D:/games" && b.launcher.accent == "#9b7bff");
+        std::filesystem::remove(file);
+    }
+    {
+        // a game being prepared: through its stages, failing, and cancelled
+        using build::Stage;
+        auto wait = [](frontend::PrepareJob &job) {
+            for (int i = 0; i < 500 && job.active(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        };
+        frontend::PrepareJob job;
+        CHECK(!job.state().started);
+        job.start("Game", [](build::Progress &p, std::string &) {
+            p.report(Stage::Reading, 0, 1, "default.xex");
+            p.report(Stage::Compiling, 3, 6, "file_003.cpp");
+            p.report(Stage::Done, 0, 0, "");
+            return true;
+        });
+        wait(job);
+        frontend::PrepareJob::State st = job.state();
+        CHECK(st.started && st.finished && st.ok && !st.running && st.stage == Stage::Done && st.fraction == 1);
+        CHECK(job.log_from(0).size() >= 4 && job.log_from(0).front() == "Preparing Game" && job.log_from(0).back() == "Done.");
+        CHECK(st.log_lines == job.log_from(0).size() && job.log_from(st.log_lines).empty());
+        job.start("Game", [](build::Progress &p, std::string &error) {
+            p.report(Stage::Compiling, 3, 6, "file_003.cpp");
+            error = "compiler said no";
+            p.report(Stage::Failed, 0, 0, error);
+            return false;
+        });
+        wait(job);
+        st = job.state();
+        CHECK(st.finished && !st.ok && !st.cancelled && st.error == "compiler said no" && st.stage == Stage::Failed);
+        CHECK(job.log_from(0).back() == "Failed: compiler said no");
+        // half of compiling is the stages before it and half its weight
+        job.start("Game", [](build::Progress &p, std::string &) {
+            p.report(Stage::Compiling, 1, 2, "x");
+            while (!p.cancel->load()) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            return false;
+        });
+        for (int i = 0; i < 500 && job.state().stage != Stage::Compiling; i++) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        st = job.state();
+        CHECK(st.running && std::fabs(st.fraction - (0.03 + 0.07 + 0.15 + 0.68 / 2)) < 1e-9);
+        job.cancel();
+        wait(job);
+        CHECK(job.state().cancelled && !job.state().ok);
+        // the placeholder build of today ends in a failure at once
+        job.start("Game", frontend::PrepareJob::build_runner("no.iso", std::filesystem::temp_directory_path()));
+        wait(job);
+        CHECK(job.state().finished && (job.state().ok || !job.state().error.empty()));
+    }
     return finish("frontend");
 }

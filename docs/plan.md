@@ -624,7 +624,9 @@ traces, without a recompiled game.
   table the player reads for it), and each started in the player beside it
   that carries its code (`--identify`), else the generic one. The
   recompile step is not built; its candidates are weighed there ("The
-  generated code without the source"). Its view is Dear ImGui for now, over LauncherCore; the RmlUi view is next.
+  generated code without the source"). Its view is RmlUi over LauncherCore (2026-11-06; docs/runtime.md, "The
+  launcher's interface"): the library with each game's own icon, the
+  preparing screen (`prepare_job`), settings, controls and about.
   It becomes the emulator's front door (D2).
 
 **Track D: the AoT emulator** (goal of 2026-11-05)
@@ -712,8 +714,8 @@ The keyboard is not confirmed yet.
 **Done on 2026-11-06:**
 - the kernel completed by inventory: every export Xenia has is in
   ("Everything left", the kernel);
-- a first launcher (C2): its logic in LauncherCore, the view Dear ImGui
-  until the RmlUi one;
+- a first launcher (C2): its logic in LauncherCore, the view in RmlUi on our
+  Vulkan (a render interface with layers and filters);
 - the GPU's cost cut 5 to 14 times on the traces (renderer.md, "GPU
   time"):
   - Ben 10's 3D at its 60 swaps a second (14 before);

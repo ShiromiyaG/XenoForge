@@ -23,7 +23,7 @@ namespace xf::frontend {
 namespace {
 
 constexpr uint32_t XDBF = 0x58444246, XSTC = 0x58535443, XSTR = 0x58535452;
-constexpr uint16_t SECTION_METADATA = 1, SECTION_STRING_TABLE = 3;
+constexpr uint16_t SECTION_METADATA = 1, SECTION_IMAGE = 2, SECTION_STRING_TABLE = 3;
 constexpr uint64_t ID_TITLE = 0x8000; // kXdbfIdTitle: the title's name in each string table
 constexpr uint64_t LANGUAGE_ENGLISH = 1;
 
@@ -75,6 +75,12 @@ struct Xdbf {
     uint64_t default_language() const {
         auto [p, n] = find(SECTION_METADATA, XSTC);
         return p && n >= 16 && be32(p) == XSTC ? be32(p + 12) : LANGUAGE_ENGLISH;
+    }
+    // the title's image (GameInfoDatabase::GetIcon): a PNG, in the image section under the title's ID
+    std::vector<uint8_t> icon() const {
+        auto [p, n] = find(SECTION_IMAGE, ID_TITLE);
+        if (!p || n < 8 || be32(p) != 0x89504E47) return {};
+        return std::vector<uint8_t>(p, p + n);
     }
 };
 
@@ -164,6 +170,15 @@ std::string title_name(const Xex &xex) {
     return title.empty() ? xdbf.string(xdbf.default_language(), ID_TITLE) : title;
 }
 
+std::vector<uint8_t> title_icon(const Xex &xex) {
+    char name[16];
+    std::snprintf(name, sizeof(name), "%08X", xex.execution.title_id);
+    auto [p, n] = resource(xex, name);
+    Xdbf xdbf;
+    if (!p || !xdbf.open(p, n)) return {};
+    return xdbf.icon();
+}
+
 GameEntry read_game(const std::filesystem::path &path) {
     GameEntry game;
     game.path = path;
@@ -190,6 +205,7 @@ GameEntry read_game(const std::filesystem::path &path) {
     game.media_id = xex.execution.media_id;
     game.digest = image_digest(xex.image);
     game.title = title_name(xex);
+    game.icon = title_icon(xex);
     if (game.title.empty()) game.title = path.stem().string();
     return game;
 }

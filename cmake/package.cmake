@@ -15,7 +15,8 @@
 #   FFMPEG-SOURCE.txt            where ffmpeg-xma's source is: the fork's commit and the overlay
 #   ffmpeg-source/               the overlay itself (third_party/ffmpeg: configuration and build script)
 #   LICENSE-xenia, LICENSE-rexglue
-#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, stb, linked into the player
+#   ui/                          the launcher's screens (RML, RCSS) and its font, Inter (SIL OFL)
+#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, stb
 #
 # Included by CMakeLists.txt once the player's targets (XF_PLAYERS) and its
 # fetched dependencies exist.
@@ -43,6 +44,9 @@ file(READ "${sdl3_SOURCE_DIR}/LICENSE.txt" _sdl)
 file(READ "${sdl3_SOURCE_DIR}/src/hidapi/LICENSE-bsd.txt" _hidapi)
 file(READ "${imgui_SOURCE_DIR}/LICENSE.txt" _imgui)
 file(READ "${tomlplusplus_SOURCE_DIR}/LICENSE" _toml)
+file(READ "${rmlui_SOURCE_DIR}/LICENSE.txt" _rmlui)
+file(READ "${freetype_SOURCE_DIR}/docs/FTL.TXT" _freetype)
+file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Inter.txt" _inter)
 file(READ "${STB_DIR}/stb_image_write.h" _stb)
 string(FIND "${_stb}" "This software is available under 2 licenses" _stb_at)
 if(_stb_at LESS 0)
@@ -72,7 +76,22 @@ toml++ (v3.4.0), https://github.com/marzer/tomlplusplus - MIT license
 ${_rule}
 ${_toml}
 ${_rule}
-stb_image_write, https://github.com/nothings/stb - MIT license or public domain
+RmlUi (6.3), https://github.com/mikke89/RmlUi - MIT license (the launcher's interface)
+${_rule}
+${_rmlui}
+${_rule}
+FreeType (VER-2-14-3), https://freetype.org - used under the FreeType License
+(FTL). Portions of this software are copyright The FreeType Project
+(www.freetype.org). All rights reserved.
+${_rule}
+${_freetype}
+${_rule}
+Inter (4.1), https://rsms.me/inter - the launcher's typeface, SIL Open Font
+License 1.1, shipped as ui/fonts/Inter-*.ttf
+${_rule}
+${_inter}
+${_rule}
+stb_image and stb_image_write, https://github.com/nothings/stb - MIT license or public domain
 ${_rule}
 ${_stb}
 ")

@@ -55,7 +55,17 @@ bool LauncherCore::set_games_folder(const std::string &folder, bool save, std::s
     Settings s;
     std::string ignored;
     load(config_file_, s, ignored);
-    s.launcher.games = shared_.launcher.games, s.screenshots = shared_.screenshots;
+    s.launcher.games = shared_.launcher.games, s.launcher.accent = shared_.launcher.accent;
+    s.screenshots = shared_.screenshots;
+    return frontend::save(config_file_, s, error);
+}
+
+bool LauncherCore::set_accent(const std::string &accent, std::string &error) {
+    shared_.launcher.accent = accent;
+    Settings s;
+    std::string ignored;
+    load(config_file_, s, ignored);
+    s.launcher.games = shared_.launcher.games, s.launcher.accent = accent, s.screenshots = shared_.screenshots;
     return frontend::save(config_file_, s, error);
 }
 
@@ -116,7 +126,8 @@ bool LauncherCore::load_settings(const GameEntry &game, Settings &settings, std:
 
 bool LauncherCore::save_settings(Settings &settings, std::string &error) const {
     // the shared parts as the launcher has them, not as they were read
-    settings.launcher.games = shared_.launcher.games, settings.screenshots = shared_.screenshots;
+    settings.launcher.games = shared_.launcher.games, settings.launcher.accent = shared_.launcher.accent;
+    settings.screenshots = shared_.screenshots;
     return save(config_file_, settings, error);
 }
 

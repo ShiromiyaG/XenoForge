@@ -141,6 +141,7 @@ bool load(const std::filesystem::path &path, Settings &s, std::string &error, co
     read_sections(t, s);
     get(t, "player", "screenshots", s.screenshots);
     get(t, "launcher", "games", s.launcher.games);
+    get(t, "launcher", "accent", s.launcher.accent);
     if (!title.empty())
         if (const toml::table *own = t["games"][title].as_table()) {
             read_sections(*own, s);
@@ -154,7 +155,7 @@ bool save(const std::filesystem::path &path, const Settings &s, std::string &err
     if (s.game.empty()) {
         write_sections(t, s);
         t.insert_or_assign("player", toml::table{{"screenshots", s.screenshots}});
-        t.insert_or_assign("launcher", toml::table{{"games", s.launcher.games}});
+        t.insert_or_assign("launcher", toml::table{{"games", s.launcher.games}, {"accent", s.launcher.accent}});
     } else {
         // a new file gets the shared defaults beside the game's, so it has
         // the whole set to edit
@@ -162,7 +163,7 @@ bool save(const std::filesystem::path &path, const Settings &s, std::string &err
             Settings shared;
             write_sections(t, shared);
             t.insert_or_assign("player", toml::table{{"screenshots", s.screenshots}});
-            t.insert_or_assign("launcher", toml::table{{"games", s.launcher.games}});
+            t.insert_or_assign("launcher", toml::table{{"games", s.launcher.games}, {"accent", s.launcher.accent}});
         }
         if (!t["games"].as_table()) t.insert_or_assign("games", toml::table{});
         toml::table own;

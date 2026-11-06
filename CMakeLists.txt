@@ -232,7 +232,30 @@ if(XF_PLAYER AND TARGET boot)
     FetchContent_Declare(tomlplusplus GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git GIT_TAG v3.4.0
                          GIT_SHALLOW TRUE)
     FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.91.9 GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(SDL3 tomlplusplus imgui)
+    # RmlUi (MIT) with FreeType (its FTL; no zlib, PNG, HarfBuzz or Brotli),
+    # for what the player's user sees: the launcher (docs/runtime.md, "The
+    # launcher"). RmlUi finds FreeType by the Freetype::Freetype target.
+    set(FT_DISABLE_ZLIB ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+    set(RMLUI_SAMPLES OFF CACHE BOOL "" FORCE)
+    set(RMLUI_PRECOMPILED_HEADERS OFF CACHE BOOL "" FORCE)
+    set(RMLUI_BACKEND "auto" CACHE STRING "" FORCE)
+    FetchContent_Declare(freetype GIT_REPOSITORY https://github.com/freetype/freetype.git GIT_TAG VER-2-14-3
+                         GIT_SHALLOW TRUE)
+    FetchContent_Declare(RmlUi GIT_REPOSITORY https://github.com/mikke89/RmlUi.git GIT_TAG 6.3 GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(SDL3 tomlplusplus imgui freetype)
+    if(NOT TARGET Freetype::Freetype)
+        add_library(Freetype::Freetype ALIAS freetype)
+    endif()
+    set(_shared ${BUILD_SHARED_LIBS})
+    set(BUILD_SHARED_LIBS OFF)
+    FetchContent_MakeAvailable(RmlUi)
+    set(BUILD_SHARED_LIBS ${_shared})
+    target_compile_options(freetype PRIVATE -w)
+    target_compile_options(rmlui_core PRIVATE -w)
     target_compile_options(SDL3-static PRIVATE -w) # the project's -Wall is not for SDL's sources
     add_library(xf_imgui STATIC
         ${imgui_SOURCE_DIR}/imgui.cpp
@@ -281,11 +304,40 @@ if(XF_PLAYER AND TARGET boot)
     # folder, their settings and controls, and each started in the player
     # beside it that carries its code; a window program, its form drawn by
     # SDL's renderer
+    # The view is RmlUi (frontend/ui): its Vulkan render interface on the
+    # frontend's own vk::Device, the screens written as RML and RCSS beside
+    # the executable (ui/), and the font (Inter, SIL OFL) with them.
+    foreach(shader vert frag)
+        add_custom_command(
+            OUTPUT ${XF_SHADER_OUT}/ui.${shader}.inc
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
+            COMMAND ${GLSLC} --target-env=vulkan1.3 -mfmt=num -o ${XF_SHADER_OUT}/ui.${shader}.inc
+                    ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/ui.${shader}
+            DEPENDS frontend/ui/ui.${shader} frontend/ui/ui_draw.glsl
+            COMMENT "glslc ui.${shader}")
+    endforeach()
+    add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
+                             frontend/prepare_job.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
+                             frontend/launcher_view.cpp frontend/launcher_screens.cpp frontend/launcher_input.cpp
+                             ${XF_SHADER_OUT}/ui.vert.inc ${XF_SHADER_OUT}/ui.frag.inc)
+    target_include_directories(xf_ui PRIVATE ${XF_SHADER_OUT})
+    target_include_directories(xf_ui PUBLIC frontend)
+    target_link_libraries(xf_ui PUBLIC xf_frontend RmlUi::Core stb)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(xf_ui PRIVATE -Wno-missing-field-initializers)
+    endif()
     add_executable(launcher WIN32 frontend/launcher.cpp)
-    target_link_libraries(launcher PRIVATE xf_frontend xf_imgui stb)
+    target_link_libraries(launcher PRIVATE xf_ui xf_frontend stb)
+    set(XF_UI_ASSETS ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui)
+    add_custom_command(TARGET launcher POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${XF_UI_ASSETS}/assets $<TARGET_FILE_DIR:launcher>/ui
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${XF_UI_ASSETS}/fonts $<TARGET_FILE_DIR:launcher>/ui/fonts
+        COMMENT "the launcher's screens and font")
+    install(DIRECTORY ${XF_UI_ASSETS}/assets/ DESTINATION ui)
+    install(DIRECTORY ${XF_UI_ASSETS}/fonts/ DESTINATION ui/fonts)
     # the settings file, the sound's fold to stereo, the scripted presses
     add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
-    target_link_libraries(frontend_test PRIVATE xf_frontend xenoforge_kernel xenoforge_vk)
+    target_link_libraries(frontend_test PRIVATE xf_ui xf_frontend xenoforge_kernel xenoforge_vk)
     add_test(NAME frontend COMMAND frontend_test)
     # the player as it is shipped: cmake --install, or the player_package target
     include(cmake/package.cmake)

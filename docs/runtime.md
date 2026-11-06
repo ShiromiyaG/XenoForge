@@ -738,15 +738,60 @@ program on Windows: no console) and installed with them by `cmake
 --install`. What it does is `LauncherCore` (`launcher_core.h`), with no UI
 code: the games folder and its scan, a game's settings loaded, saved, made
 its own or shared again, the gamepads connected, a game started and polled
-until it ends. The view (`launcher.cpp`) is a form in Dear ImGui on SDL3's
-renderer for now; the emulator's UI is to be RmlUi drawn through
-XenoForge's Vulkan (the owner's decision, 2026-11-05), with Dear ImGui kept
-for the debugging tools, so the view is the part to be replaced.
+until it ends. The view is RmlUi drawn through XenoForge's own Vulkan inside
+the SDL3 window (the owner's decision, 2026-11-05; built 2026-11-06), with
+Dear ImGui kept for the debugging tools only (the player's F1 overlay).
 
 ```
-launcher [--config <file>] [--games <folder>] [--list] [--select N] [--start N] [--player-arg <arg>]...
-    [--quit-after S] [--screenshot <png>]
+launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <page>] [--start N]
+    [--player-arg <arg>]... [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
+    [--demo-speed X] [--show-log] [--capture-binding <name>] [--render-size WxH] [--scale F] [--assets <dir>]
 ```
+
+### The launcher's interface (`frontend/ui`, `launcher_view.*`)
+
+Pieces, each apart from the others:
+
+- **`ui/ui_renderer.*`**: `Rml::RenderInterface` on `vk::Device`, written
+  again for Vulkan 1.3's dynamic rendering after the structure of RmlUi's own
+  GL3 backend (MIT). Geometry in an arena of mapped buffers (so thousands of
+  geometries are a few allocations), textures and layers all in
+  `VK_IMAGE_LAYOUT_GENERAL` with one global barrier between passes, a
+  per-frame uniform ring with dynamic offsets, one shader pair (`ui.vert`,
+  `ui.frag`: texture, linear/radial/conic gradients, color matrix, mask,
+  drop shadow, blur) and eight pipelines (blend over or replace, times
+  stencil: off, test, write, increment). Scissor, a stencil clip mask
+  (rounded `overflow: hidden`), transforms, layers with filters (blur by
+  halving and a 7-tap Gaussian, drop shadow, opacity, brightness, contrast,
+  invert, grayscale, sepia, hue-rotate, saturate, mask images),
+  `SaveLayerAsTexture` (box shadows are made of it). What RmlUi releases
+  mid-frame is destroyed once the frame is done.
+- **`ui/ui_window.*`**: the device opened with the SDL window, its swapchain
+  (two frames in flight, FIFO), and `frame()`: the UI drawn into the base
+  layer and blitted to the swapchain image. A frame can be drawn at a size of
+  its own without the window (`--render-size`) and read back.
+- **`ui/ui_system.*`**: RmlUi's system interface on SDL3 and SDL events as
+  RmlUi's input.
+- **`launcher_model.*`, `launcher_html.*`**: what the screens say (a game's
+  status, durations, the accent colour's shades, the bindings' names, the
+  spatial navigation) and their structure as RML strings, as plain functions
+  with no RmlUi in them (`frontend_test` checks them). **`prepare_job.*`**: a
+  build on its worker thread, as state to read (no UI, no SDL).
+- **`launcher_view.*`, `launcher_screens.cpp`, `launcher_input.cpp`**: the
+  connection to the document: parts rebuilt when what they show changes,
+  clicks, keys and the pad into actions, focus moved by direction.
+- **`ui/assets/launcher.rml`, `launcher.rcss`**: the look. The stylesheet has
+  `{accent...}` tokens the launcher fills when it loads it, so the accent
+  colour (six swatches in Settings, `[launcher] accent` in config.toml) is the
+  user's; changing it loads the document again. `ui/fonts/`: Inter (SIL OFL
+  1.1; its license beside it), four weights.
+
+The layout is made for 1280 x 720 dp and scales with the window
+(`min(width / 1280, height / 720)`, 0.5 to 4), so 1080p is 1.5, 4K is 3.
+Navigation: the mouse as usual; the keyboard with the arrows, Enter, Escape
+and Tab (pages); the pad with the d-pad or left stick (repeating), A, B, X
+(game settings), Y (rescan), the shoulders (pages) and Start (play). The
+hints at the bottom follow the last device used.
 
 - **The games** (`library.cpp`): the ISOs (and bare `default.xex` files) in
   a folder the user picks (`launcher.games` in config.toml; the system's
@@ -810,8 +855,33 @@ background alone); a three-second run's was whole. Left for a person:
 the folder dialog, typing and "Set" for the bindings, and how the form
 feels.
 
+Checked (2026-11-06, the RmlUi view): every screen and state saved by
+`--screenshot` at 1920 x 1080 and the library at 3840 x 2160 (`--render-size`,
+outside the window; the pictures hold the games' icons, so they are kept in
+`traces/launcher_ui/`, never in the repo): the library (9 discs, a focused
+tile, ready and needs-preparing, scanning, no folder chosen, no games found),
+the preparing screen (`--demo-progress`, `--demo-fail`, `--show-log`),
+settings (with a dropdown open), controls (a binding lit on the drawn pad, one
+waiting for a key) and about. `--keys` sent pad presses through the whole
+navigation (d-pad focus, the dropdown, the scrolled list); Vulkan validation
+reported nothing. A window run drew 168 frames a second (the display's rate);
+`--start 0` ran El Chavo Kart in `player_chaves` as before and `--list` is
+unchanged. RmlUi quirks learned, kept in launcher.rcss: `div` is not block
+until the stylesheet says so; text directly inside a flex container is not
+drawn (wrap it in a block); `box-shadow` cannot be transitioned; an element
+with its own `opacity` inside one with `opacity: 0` is still drawn (the
+pages are `visibility: hidden` once faded); `overflow: hidden` clips only
+when the content overflows, `clip: always` makes it; a shadow bigger than the
+window (layers are window-sized) draws wrongly, so the big cards carry none.
+The backdrop and the detail's hero are the icon shrunk and blurred on the
+CPU (`add_soft_image`): a full-window GPU blur costs several passes a frame
+and fades at the window's edges, while the blur filter is kept for what
+RmlUi makes of it (box shadows). Left for a person: the folder dialog, typing
+in the games folder's field, the mouse (hover, drag on a slider), a real pad
+(only the scripted presses were run), how the transitions feel.
+
 Left out of this first launcher: the recompile step (below), port options,
-title updates and content packages, cover art.
+title updates and content packages.
 
 ### The generated code without the source (design, not decided)
 

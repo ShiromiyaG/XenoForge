@@ -1,0 +1,45 @@
+<rml>
+<head>
+    <title>XenoForge</title>
+    <!--STYLE-->
+</head>
+<body>
+    <div id="backdrop">
+        <div id="art-a" class="art-layer"></div>
+        <div id="art-b" class="art-layer"></div>
+        <div id="backdrop-glow"></div>
+        <div id="backdrop-shade"></div>
+    </div>
+    <div id="app">
+        <div id="topbar">
+            <div id="brand">
+                <div id="mark"><div id="mark-core"></div></div>
+                <div id="wordmark">XENO<span>FORGE</span></div>
+            </div>
+            <div id="tabs">
+                <div id="tab-pill"></div>
+                <div class="tab f" id="tab-library" data-action="tab" data-arg="library">Library</div>
+                <div class="tab f" id="tab-settings" data-action="tab" data-arg="settings">Settings</div>
+                <div class="tab f" id="tab-controls" data-action="tab" data-arg="controls">Controls</div>
+                <div class="tab f" id="tab-about" data-action="tab" data-arg="about">About</div>
+            </div>
+            <div id="top-spacer"></div>
+            <div id="folder-chip">
+                <div class="path nowrap" id="folder-path"></div>
+                <div class="mini-btn f" data-action="browse">Browse</div>
+                <div class="mini-btn f" data-action="rescan">Rescan</div>
+            </div>
+        </div>
+        <div id="screens">
+            <div class="screen" id="screen-library"></div>
+            <div class="screen" id="screen-settings"></div>
+            <div class="screen" id="screen-controls"></div>
+            <div class="screen" id="screen-about"></div>
+        </div>
+        <div id="hints"></div>
+    </div>
+    <div id="running"></div>
+    <div id="prepare"><div id="prepare-card"></div></div>
+    <div id="popup-layer"></div>
+</body>
+</rml>

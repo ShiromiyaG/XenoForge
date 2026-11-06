@@ -2,8 +2,8 @@
 // launcher"): the games folder and its list, read on a thread of its own;
 // each game's settings and controls as the player reads them (config.toml,
 // the shared ones or the game's own); and a game started in its player, as a
-// process of its own, until it ends. No UI code here: a view (the Dear ImGui
-// form in launcher.cpp today) calls this each frame and draws what it says.
+// process of its own, until it ends. No UI code here: a view (the RmlUi
+// screens, launcher_view.cpp) calls this each frame and draws what it says.
 
 #pragma once
 
@@ -39,6 +39,9 @@ class LauncherCore {
     // A folder to list: rescanned, and saved in config.toml when `save`.
     bool set_games_folder(const std::string &folder, bool save, std::string &error);
     void rescan(); // the players asked again, the games read again
+    // The launcher's accent colour ("#RRGGBB", "" for the default), saved in config.toml.
+    const std::string &accent() const { return shared_.launcher.accent; }
+    bool set_accent(const std::string &accent, std::string &error);
 
     // The list as the scan has it so far.
     struct Listing {

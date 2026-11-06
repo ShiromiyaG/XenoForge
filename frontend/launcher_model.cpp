@@ -1,0 +1,255 @@
+// What the launcher's screens say (launcher_model.h).
+
+#include "launcher_model.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+
+namespace xf::frontend {
+
+GameStatus game_status(bool cached_library, bool generated_player, bool prepare_failed) {
+    if (cached_library || generated_player) return GameStatus::Ready;
+    return prepare_failed ? GameStatus::Interpreted : GameStatus::NeedsPreparing;
+}
+
+const char *status_class(GameStatus status) {
+    switch (status) {
+    case GameStatus::Ready: return "ready";
+    case GameStatus::NeedsPreparing: return "prep";
+    case GameStatus::Interpreted: return "interp";
+    }
+    return "";
+}
+
+const char *status_text(GameStatus status) {
+    switch (status) {
+    case GameStatus::Ready: return "Ready";
+    case GameStatus::NeedsPreparing: return "Needs preparing";
+    case GameStatus::Interpreted: return "Interpreted";
+    }
+    return "";
+}
+
+const char *status_detail(GameStatus status) {
+    switch (status) {
+    case GameStatus::Ready: return "Its game library is built.";
+    case GameStatus::NeedsPreparing: return "Built once here from your disc, in a few minutes.";
+    case GameStatus::Interpreted: return "No library could be built: it runs interpreted.";
+    }
+    return "";
+}
+
+std::string format_duration(double seconds) {
+    if (!(seconds > 0)) seconds = 0;
+    const long total = long(seconds + 0.5);
+    char text[32];
+    if (total >= 3600)
+        std::snprintf(text, sizeof(text), "%ld:%02ld:%02ld", total / 3600, total / 60 % 60, total % 60);
+    else
+        std::snprintf(text, sizeof(text), "%ld:%02ld", total / 60, total % 60);
+    return text;
+}
+
+std::string version_text(uint32_t version) {
+    char text[40];
+    std::snprintf(text, sizeof(text), "%u.%u.%u.%u", version >> 28, (version >> 24) & 15, (version >> 8) & 0xFFFF,
+                  version & 0xFF);
+    return text;
+}
+
+std::string html_escape(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (char c : text) {
+        switch (c) {
+        case '&': out += "&amp;"; break;
+        case '<': out += "&lt;"; break;
+        case '>': out += "&gt;"; break;
+        case '"': out += "&quot;"; break;
+        default: out += c;
+        }
+    }
+    return out;
+}
+
+uint32_t hue_of(uint32_t title_id) {
+    uint32_t h = title_id * 2654435761u;
+    h ^= h >> 15;
+    return (h % 360);
+}
+
+std::string tile_background(uint32_t title_id) {
+    const uint32_t hue = hue_of(title_id);
+    // two hsl stops as a gradient
+    char text[160];
+    std::snprintf(text, sizeof(text), "decorator: linear-gradient(145deg, hsl(%u, 62%%, 44%%), hsl(%u, 70%%, 20%%));", hue,
+                  (hue + 40) % 360);
+    return text;
+}
+
+namespace {
+
+bool parse_hex(const std::string &hex, int &r, int &g, int &b) {
+    if (hex.size() != 7 || hex[0] != '#') return false;
+    unsigned v = 0;
+    for (size_t i = 1; i < 7; i++) {
+        const char c = hex[i];
+        const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (d < 0) return false;
+        v = v << 4 | unsigned(d);
+    }
+    r = int(v >> 16), g = int(v >> 8 & 255), b = int(v & 255);
+    return true;
+}
+
+std::string hex_of(int r, int g, int b, int a = -1) {
+    char text[16];
+    if (a < 0)
+        std::snprintf(text, sizeof(text), "#%02x%02x%02x", r, g, b);
+    else
+        std::snprintf(text, sizeof(text), "#%02x%02x%02x%02x", r, g, b, a);
+    return text;
+}
+
+int mix(int from, int to, double t) { return std::clamp(int(std::lround(from + (to - from) * t)), 0, 255); }
+
+} // namespace
+
+const std::vector<std::string> &accent_choices() {
+    static const std::vector<std::string> choices = {"#ff7a45", "#4c9bff", "#9b7bff", "#2fd6a1", "#ff5c8a", "#ffc247"};
+    return choices;
+}
+
+Accent accent_from_hex(const std::string &hex) {
+    int r = 0, g = 0, b = 0;
+    if (!parse_hex(hex, r, g, b)) parse_hex(accent_choices()[0], r, g, b);
+    Accent a;
+    a.base = hex_of(r, g, b);
+    a.hi = hex_of(mix(r, 255, 0.28), mix(g, 255, 0.28), mix(b, 255, 0.28));
+    a.lo = hex_of(mix(r, 0, 0.32), mix(g, 0, 0.32), mix(b, 0, 0.32));
+    a.a08 = hex_of(r, g, b, 0x14);
+    a.a12 = hex_of(r, g, b, 0x1f);
+    a.a15 = hex_of(r, g, b, 0x26);
+    a.a25 = hex_of(r, g, b, 0x40);
+    a.a40 = hex_of(r, g, b, 0x66);
+    a.a60 = hex_of(r, g, b, 0x99);
+    // a dark label on a light accent, a white one on a dark accent
+    const double luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+    a.on = luminance > 0.55 ? "#1a0f08" : "#ffffff";
+    return a;
+}
+
+std::string apply_tokens(std::string text, const Accent &a) {
+    const std::pair<const char *, const std::string *> tokens[] = {
+        {"{accent-hi}", &a.hi},   {"{accent-lo}", &a.lo}, {"{accent08}", &a.a08}, {"{accent12}", &a.a12},
+        {"{accent15}", &a.a15},   {"{accent25}", &a.a25}, {"{accent40}", &a.a40}, {"{accent60}", &a.a60},
+        {"{on-accent}", &a.on},   {"{accent}", &a.base}};
+    for (const auto &[token, value] : tokens) {
+        const size_t length = std::strlen(token);
+        for (size_t at = text.find(token); at != std::string::npos; at = text.find(token, at + value->size()))
+            text.replace(at, length, *value);
+    }
+    return text;
+}
+
+std::string key_label(const std::string &name) {
+    static const std::pair<const char *, const char *> names[] = {
+        {"Return", "Enter"}, {"Left", "\xE2\x86\x90"}, {"Right", "\xE2\x86\x92"}, {"Up", "\xE2\x86\x91"},
+        {"Down", "\xE2\x86\x93"}, {"Escape", "Esc"}, {"Backspace", "Backspace"}, {"Space", "Space"}};
+    for (const auto &[from, to] : names)
+        if (name == from) return to;
+    if (name.size() == 1 && name[0] >= 'a' && name[0] <= 'z') return std::string(1, char(name[0] - 32));
+    return name;
+}
+
+std::vector<KeyCap> parse_keys(const std::string &keys) {
+    std::vector<KeyCap> caps;
+    size_t at = 0;
+    while (at < keys.size()) {
+        const size_t end = keys.find(' ', at);
+        std::string token = keys.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        at = end == std::string::npos ? keys.size() : end + 1;
+        if (token.empty()) continue;
+        KeyCap cap;
+        if (token[0] == '^') cap.shift = true, token.erase(0, 1);
+        else if (token[0] == '_') cap.no_shift = true, token.erase(0, 1);
+        cap.label = key_label(token);
+        caps.push_back(std::move(cap));
+    }
+    return caps;
+}
+
+BindingInfo binding_info(const std::string &name) {
+    static const struct {
+        const char *name, *label, *group, *part;
+    } table[] = {
+        {"a", "A button", "Face buttons", "a"},
+        {"b", "B button", "Face buttons", "b"},
+        {"x", "X button", "Face buttons", "x"},
+        {"y", "Y button", "Face buttons", "y"},
+        {"left_shoulder", "Left bumper", "Bumpers and triggers", "lb"},
+        {"right_shoulder", "Right bumper", "Bumpers and triggers", "rb"},
+        {"left_trigger", "Left trigger", "Bumpers and triggers", "lt"},
+        {"right_trigger", "Right trigger", "Bumpers and triggers", "rt"},
+        {"dpad_up", "D-pad up", "D-pad", "dpad-up"},
+        {"dpad_down", "D-pad down", "D-pad", "dpad-down"},
+        {"dpad_left", "D-pad left", "D-pad", "dpad-left"},
+        {"dpad_right", "D-pad right", "D-pad", "dpad-right"},
+        {"left_thumb_up", "Up", "Left stick", "ls"},
+        {"left_thumb_down", "Down", "Left stick", "ls"},
+        {"left_thumb_left", "Left", "Left stick", "ls"},
+        {"left_thumb_right", "Right", "Left stick", "ls"},
+        {"left_thumb", "Press", "Left stick", "ls"},
+        {"right_thumb_up", "Up", "Right stick", "rs"},
+        {"right_thumb_down", "Down", "Right stick", "rs"},
+        {"right_thumb_left", "Left", "Right stick", "rs"},
+        {"right_thumb_right", "Right", "Right stick", "rs"},
+        {"right_thumb", "Press", "Right stick", "rs"},
+        {"back", "Back", "System", "back"},
+        {"start", "Start", "System", "start"},
+        {"guide", "Guide", "System", "guide"},
+    };
+    for (const auto &e : table)
+        if (name == e.name) return {e.label, e.group, e.part};
+    return {"?", "System", ""};
+}
+
+int nav_pick(const std::vector<NavRect> &rects, int from, NavDir dir) {
+    if (from < 0 || from >= int(rects.size())) return -1;
+    const NavRect &f = rects[size_t(from)];
+    const float fcx = f.x + f.w / 2, fcy = f.y + f.h / 2;
+    const bool vertical = dir == NavDir::Up || dir == NavDir::Down;
+    int best = -1;
+    float best_score = 0;
+    for (int i = 0; i < int(rects.size()); i++) {
+        if (i == from) continue;
+        const NavRect &c = rects[size_t(i)];
+        const float ccx = c.x + c.w / 2, ccy = c.y + c.h / 2;
+        // the candidate's centre must lie on the direction's side of ours
+        const float along = vertical ? (dir == NavDir::Down ? ccy - fcy : fcy - ccy) : (dir == NavDir::Right ? ccx - fcx : fcx - ccx);
+        if (along <= 1) continue;
+        // the gap between the edges along the direction (0 when they overlap there)
+        float gap;
+        if (dir == NavDir::Down) gap = c.y - (f.y + f.h);
+        else if (dir == NavDir::Up) gap = f.y - (c.y + c.h);
+        else if (dir == NavDir::Right) gap = c.x - (f.x + f.w);
+        else gap = f.x - (c.x + c.w);
+        gap = std::max(gap, 0.f);
+        // how far the two are from overlapping across the direction
+        float off, centre_off;
+        if (vertical) {
+            off = std::max({c.x - (f.x + f.w), f.x - (c.x + c.w), 0.f});
+            centre_off = std::fabs(ccx - fcx);
+        } else {
+            off = std::max({c.y - (f.y + f.h), f.y - (c.y + c.h), 0.f});
+            centre_off = std::fabs(ccy - fcy);
+        }
+        const float score = gap + along * 0.35f + off * 3.f + centre_off * 0.6f;
+        if (best < 0 || score < best_score) best = i, best_score = score;
+    }
+    return best;
+}
+
+} // namespace xf::frontend

@@ -23,6 +23,7 @@ struct GameEntry {
     uint32_t version = 0, media_id = 0; // the execution info's
     uint64_t digest = 0;                // default.xex's image (xf::image_digest), what generated code is tied to
     uint64_t size = 0;                  // the file's
+    std::vector<uint8_t> icon;          // the title's image from its XDBF (a PNG; empty when it has none), read at run time
     std::string error;                  // why it could not be read (then only path is set)
     std::string title_id_text() const;  // "4D5307E6"
 };
@@ -40,6 +41,8 @@ struct PlayerBinary {
 // GameInfoDatabase::GetTitleName gives it for an English console; "" when
 // there is none.
 std::string title_name(const Xex &xex);
+// The title's image in the same XDBF (a PNG), or empty.
+std::vector<uint8_t> title_icon(const Xex &xex);
 
 // One game read: the disc's default.xex (or the bare executable) parsed and
 // unpacked for its title, ID and digest.
