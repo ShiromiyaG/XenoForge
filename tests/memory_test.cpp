@@ -6,8 +6,11 @@
 
 #include "xenoforge/memory.h"
 
+#include <atomic>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace xf;
 
@@ -303,6 +306,84 @@ static void system(Memory &mem) {
     CHECK(query(mem.heap_for(0x30000000), 0x30000000).state == 0);
 }
 
+// a watcher letting the watches go three pages either side of a write
+static std::pair<uint32_t, uint32_t> three_around(void *, uint32_t first, uint32_t last) {
+    return {first >= 3 ? first - 3 : 0, last + 3};
+}
+
+// The write watches: a watched page's first write faults once and numbers
+// it, from any thread; host writes through the physical view are told;
+// protecting a range writable numbers it; a watcher widens a fault.
+static void watches(Memory &mem) {
+    const uint32_t page = mem.watch_page_size(), shift = mem.watch_page_shift();
+    CHECK(page >= 0x1000 && (1u << shift) == page);
+    Heap *heap = mem.heap_by_type(true, 0x10000);
+    uint32_t guest = 0;
+    CHECK(heap->alloc(0x100000, 0x10000, ALLOCATE_RESERVE | ALLOCATE_COMMIT, PROTECT_READ_WRITE, false, &guest));
+    uint32_t physical = mem.physical_address(guest);
+    const std::atomic<uint32_t> *stamps = mem.write_stamps();
+    auto stamp = [&](uint32_t offset) { return stamps[(physical + offset) >> shift].load(); };
+
+    // watched, then written by the guest's view: numbered, once
+    uint32_t before = mem.write_count();
+    mem.watch(physical, 4 * page);
+    CHECK(mem.write_count() == before);
+    mem.translate(guest + page)[5] = 1;
+    uint32_t after = mem.write_count();
+    CHECK(after > before && stamp(page) == after);
+    CHECK(stamp(0) <= before && stamp(2 * page) <= before);
+    mem.translate(guest + page)[6] = 2; // the watch is gone: no fault
+    CHECK(mem.write_count() == after);
+    CHECK(mem.translate(guest + page)[5] == 1 && mem.translate(guest + page)[6] == 2);
+
+    // through the physical view: unseen until told
+    mem.translate_for_host_write(guest + 2 * page)[0] = 3;
+    CHECK(mem.write_count() == after && mem.translate(guest + 2 * page)[0] == 3);
+    mem.written(guest + 2 * page, 1);
+    CHECK(stamp(2 * page) > after);
+    after = mem.write_count();
+    // the other watched pages still fault
+    mem.translate(guest + 3 * page)[0] = 4;
+    CHECK(stamp(3 * page) > after);
+
+    // threads writing their own watched pages at once
+    mem.watch(physical, 0x100000);
+    before = mem.write_count();
+    std::vector<std::thread> threads;
+    for (uint32_t t = 0; t < 4; t++)
+        threads.emplace_back([&, t] {
+            for (uint32_t p = t; p < 0x100000 / page; p += 4) mem.translate(guest + p * page)[t] = uint8_t(p);
+        });
+    for (std::thread &t : threads) t.join();
+    bool all = true;
+    for (uint32_t p = 0; p < 0x100000 / page; p++) all &= stamp(p * page) > before;
+    CHECK(all);
+
+    // made writable again: numbered, watched or not
+    after = mem.write_count();
+    CHECK(heap->protect(guest, 0x10000, PROTECT_READ));
+    CHECK(mem.write_count() == after);
+    CHECK(heap->protect(guest, 0x10000, PROTECT_READ_WRITE));
+    CHECK(stamp(0) > after && mem.write_count() > after);
+    mem.translate(guest)[0] = 5;
+
+    // a watcher's bounds widen a fault
+    void *handle = mem.add_watcher(three_around, nullptr);
+    mem.watch(physical, 0x100000);
+    after = mem.write_count();
+    mem.translate(guest + 8 * page)[0] = 6;
+    CHECK(stamp(5 * page) > after && stamp(11 * page) > after);
+    CHECK(stamp(4 * page) <= after && stamp(12 * page) <= after);
+    mem.translate(guest + 11 * page)[0] = 7; // taken off with the rest: no fault
+    CHECK(mem.write_count() == stamp(8 * page));
+    mem.remove_watcher(handle);
+
+    // released: the watches go with the pages
+    after = mem.write_count();
+    CHECK(heap->release(guest));
+    CHECK(stamp(0) > after && stamp(0x100000 - page) > after);
+}
+
 int main() {
     std::string error;
     auto mem = Memory::create(error);
@@ -319,6 +400,7 @@ int main() {
     virtual_64k(*mem);
     physical(*mem);
     system(*mem);
+    watches(*mem);
     mem.reset();
     // a second one after the first is gone
     mem = Memory::create(error);

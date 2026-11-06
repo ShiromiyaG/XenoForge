@@ -279,6 +279,14 @@ void Xma::Context::walk() {
     if (!data.output_buffer_valid) return;
     if (!data.output_buffer_block_count) return; // no room at all
     RingBuffer output = output_ring(data);
+    // the output is written through the physical view, which no write watch
+    // protects: the watches are told of the whole buffer as the walk ends
+    struct Written {
+        Memory &memory;
+        uint32_t physical, bytes;
+        ~Written() { memory.physical_written(physical, bytes); }
+    } written{k().memory(), uint32_t(data.output_buffer_ptr) & 0x1FFFFFFF,
+              uint32_t(data.output_buffer_block_count) * OUTPUT_BYTES_PER_BLOCK};
 
     if (data.consume_only()) {
         // nothing to drain: the offsets stay as the game left them

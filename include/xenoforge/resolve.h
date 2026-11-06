@@ -25,6 +25,7 @@ struct Info {
     uint32_t edram_base = 0;     // in tiles, of the source surface
     uint32_t surface_pitch = 0;  // in pixels
     uint32_t msaa = 0;           // 0 1x, 1 2x, 2 4x
+    uint32_t sample_select = 0;  // RB_COPY_CONTROL's, as the samples allow (sanitize_sample_select)
     uint32_t source_format = 0;  // a color target format, or the depth format
     uint32_t x = 0, y = 0, width = 0, height = 0; // the rectangle, in surface pixels
     // the destination, in guest memory
@@ -42,6 +43,16 @@ struct Info {
     uint32_t clear_color_value[2] = {}; // RB_COLOR_CLEAR, RB_COLOR_CLEAR_LO
     uint32_t clear_depth_value = 0;     // RB_DEPTH_CLEAR
 };
+
+// The samples a resolve takes (xenos.h's CopySampleSelect): one of 0-3, or
+// the average of 0 and 1, of 2 and 3, of all four.
+constexpr uint32_t SAMPLES_01 = 4, SAMPLES_23 = 5, SAMPLES_0123 = 6;
+// draw_util.cc's SanitizeCopySampleSelect: a selection the surface's samples
+// (msaa: 0 1x, 1 2x, 2 4x) allow; depth is never averaged
+uint32_t sanitize_sample_select(uint32_t select, uint32_t msaa, bool depth);
+// the first sample a selection takes, and how many (1, 2 or 4)
+constexpr uint32_t first_sample(uint32_t select) { return select <= 3 ? select : select == SAMPLES_23 ? 2 : 0; }
+constexpr uint32_t sample_count(uint32_t select) { return select <= 3 ? 1 : select == SAMPLES_0123 ? 4 : 2; }
 
 // From the registers at a draw in copy mode (RB_MODECONTROL = 6); the
 // rectangle may come from the draw's vertices in guest memory. The

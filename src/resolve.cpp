@@ -349,6 +349,26 @@ uint32_t copy_raw(const Info &info, const uint8_t *src, uint32_t w[4]) {
 
 } // namespace
 
+// draw_util.cc's SanitizeCopySampleSelect: what the surface's samples allow
+// (depth is never averaged)
+uint32_t sanitize_sample_select(uint32_t select, uint32_t msaa, bool depth) {
+    if (msaa >= 2) {
+        select = std::min(select, SAMPLES_0123);
+        if (depth) {
+            if (select == SAMPLES_01 || select == SAMPLES_0123) select = 0;
+            else if (select == SAMPLES_23) select = 2;
+        }
+    } else if (msaa == 1) {
+        if (select == 2) select = 0;
+        else if (select == 3) select = 1;
+        else if (select > SAMPLES_01) select = SAMPLES_01;
+        if (depth && select == SAMPLES_01) select = 0;
+    } else {
+        select = 0;
+    }
+    return select;
+}
+
 HostFormat host_format_of_color_target(uint32_t format) {
     switch (format) {
     case rt_8_8_8_8: case rt_8_8_8_8_GAMMA: return HostFormat::RGBA8;
@@ -445,6 +465,7 @@ bool get_info(std::span<const uint32_t> regs, const GuestMemory &memory, Info &o
     // the source
     uint32_t source = control & 7;
     out.depth = source >= 4;
+    out.sample_select = sanitize_sample_select((control >> 4) & 7, out.msaa, out.depth);
     uint32_t depth_info = r(reg::RB_DEPTH_INFO);
     if (out.depth) {
         out.edram_base = (depth_info & 0x1FFF) & (EDRAM_TILE_COUNT - 1);
@@ -582,7 +603,9 @@ bool write(const Info &info, std::span<const uint8_t> pixels, GuestMemory &memor
 }
 
 bool raw_copy(const Info &info) {
-    return info.depth || (info.source_format != rt_8_8_8_8_GAMMA && !info.dest_exp_bias &&
+    // (Xenia's fast shaders copy one sample; an average is converted)
+    return info.depth || (sample_count(info.sample_select) == 1 && info.source_format != rt_8_8_8_8_GAMMA &&
+                          !info.dest_exp_bias &&
                           bitwise_equivalent(info.source_format, info.dest_format) &&
                           info.dest_number == (is_float_format(info.dest_format) ? 7u : 0u));
 }

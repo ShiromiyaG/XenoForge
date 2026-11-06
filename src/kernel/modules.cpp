@@ -952,7 +952,9 @@ XF_EXPORT(xboxkrnl, XexLoadImageHeaders) {
                                           true, file, action);
     if (!file.stream) return result(c, status);
     size_t done = 0;
-    status = file.stream->read(0, k.host(header), 0x800, done);
+    // through the view no write watch protects (files.cpp's read_locked)
+    status = file.stream->read(0, k.memory().translate_for_host_write(header), 0x800, done);
+    k.memory().written(header, uint32_t(done));
     if (int32_t(status) < 0) return result(c, status);
     if (k.load32(header) != 0x58455832) return result(c, X_STATUS_INVALID_IMAGE_FORMAT); // 'XEX2'
     uint32_t header_size = k.load32(header + 8);
@@ -961,7 +963,9 @@ XF_EXPORT(xboxkrnl, XexLoadImageHeaders) {
     } else if (header_size > buffer_size) {
         status = X_STATUS_BUFFER_TOO_SMALL;
     } else if (header_size > 0x800) {
-        status = file.stream->read(0x800, k.host(header + 0x800), header_size - 0x800, done);
+        status = file.stream->read(0x800, k.memory().translate_for_host_write(header + 0x800), header_size - 0x800,
+                                   done);
+        k.memory().written(header + 0x800, uint32_t(done));
         if (int32_t(status) >= 0) status = X_STATUS_SUCCESS;
     } else {
         status = X_STATUS_SUCCESS;

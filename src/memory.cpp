@@ -3,17 +3,22 @@
 // LookupHeapByType, GetPhysicalAddress and SystemHeapAlloc; BaseHeap with
 // its page table and free block tracker; PhysicalHeap) and the host
 // primitives they use from src/xenia/base/memory_win.cc and memory_posix.cc.
-// Left out: the MMIO handler (0x7FC80000-0x7FFFFFFF is committed no-access
-// instead, so an access faults), the GPU's physical memory watches
-// (EnableAccessCallbacks, TriggerCallbacks and the invalidations in
-// PhysicalHeap's Release, Decommit and Protect), Reset, Save and Restore,
-// DumpMap, the scribble_heap and protect_on_release options (off in Xenia by
-// default), and the merged protection of hosts whose pages are larger than
-// 4 KB (left as the views map them). BSD; see LICENSE-xenia.
+// The write watches on physical memory follow PhysicalHeap's
+// EnableAccessCallbacks and TriggerCallbacks, the invalidations in its
+// Release, Decommit and Protect, Memory::AccessViolationCallback, and the
+// fault handlers of src/xenia/base/exception_handler_win.cc and
+// exception_handler_posix.cc (watches below). Left out: the MMIO handler
+// (0x7FC80000-0x7FFFFFFF is committed no-access instead, so an access
+// faults), the read watches (data providers, which nothing in Xenia uses
+// yet), Reset, Save and Restore, DumpMap, the scribble_heap and
+// protect_on_release options (off in Xenia by default), and the merged
+// protection of hosts whose pages are larger than 4 KB (left as the views
+// map them). BSD; see LICENSE-xenia.
 
 #include "xenoforge/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -25,6 +30,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -102,6 +108,25 @@ bool host_protect(void *address, size_t length, Access access) {
     return VirtualProtect(address, length, win32_protect(access), &old) != 0;
 }
 
+// The handler of write faults (exception_handler_win.cc): a vectored handler,
+// first in the process's list when it is added, so it sees a fault before a
+// handler added earlier that reports crashes; a write it does not take goes
+// on to them.
+bool (*write_fault)(void *host_address) = nullptr;
+
+LONG CALLBACK vectored_handler(EXCEPTION_POINTERS *e) {
+    const EXCEPTION_RECORD *r = e->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    return write_fault(reinterpret_cast<void *>(r->ExceptionInformation[1])) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                             : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void install_write_fault_handler(bool (*handler)(void *host_address)) {
+    write_fault = handler;
+    AddVectoredExceptionHandler(1, vectored_handler);
+}
+
 #else
 
 using MappingHandle = int;
@@ -161,6 +186,43 @@ bool host_commit(void *address, size_t length, Access access) {
 
 bool host_protect(void *address, size_t length, Access access) {
     return mprotect(address, length, posix_protect(access)) == 0;
+}
+
+// The handler of write faults (exception_handler_posix.cc): SIGSEGV (and
+// SIGBUS, which some hosts raise for a protected page). Only a write faults
+// on a page the watches made read-only, so the handler needs no decoding of
+// the access (Xenia reads the x86 page fault code or ARM64's ESR for it). A
+// fault it does not take goes to the handler that was there before, or, with
+// none, to the default action: restored, it acts when the access comes again.
+bool (*write_fault)(void *host_address) = nullptr;
+struct sigaction previous_segv, previous_bus;
+
+void signal_handler(int signal, siginfo_t *info, void *context) {
+    if (write_fault(info->si_addr)) return;
+    struct sigaction &previous = signal == SIGBUS ? previous_bus : previous_segv;
+    if (previous.sa_flags & SA_SIGINFO) {
+        if (previous.sa_sigaction) {
+            previous.sa_sigaction(signal, info, context);
+            return;
+        }
+    } else if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN) {
+        previous.sa_handler(signal);
+        return;
+    }
+    struct sigaction fallback = {};
+    fallback.sa_handler = SIG_DFL;
+    sigemptyset(&fallback.sa_mask);
+    sigaction(signal, &fallback, nullptr);
+}
+
+void install_write_fault_handler(bool (*handler)(void *host_address)) {
+    write_fault = handler;
+    struct sigaction action = {};
+    action.sa_sigaction = signal_handler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGSEGV, &action, &previous_segv);
+    sigaction(SIGBUS, &action, &previous_bus);
 }
 
 #endif
@@ -598,18 +660,41 @@ void BaseHeap::insert_free_block(uint32_t start_page, uint32_t page_count) {
     free_blocks_[new_start] = new_count;
 }
 
+class Watches;
+
 // A window on the physical memory (Xenia's PhysicalHeap): its pages are
 // taken from the physical heap (its parent, 0-512 MB, 4 KB pages) and pinned
 // at the same offset here, so every window sees the same physical page.
 class PhysicalHeap final : public BaseHeap {
 public:
     void init(std::recursive_mutex *lock, uint8_t *membase, uint32_t heap_base, uint32_t heap_size, uint32_t page_size,
-              BaseHeap *parent) {
+              BaseHeap *parent, Watches *watches) {
         // the 0xE0000000 window's view starts on the 64 KB granularity, at
         // physical 0, and the window at physical 0x1000: 4 KB on on the host
         BaseHeap::init(lock, membase, HeapType::physical, heap_base, heap_size, page_size,
                        heap_base >= 0xE0000000 ? 0x1000 : 0);
         parent_ = parent;
+        watches_ = watches;
+    }
+
+    // the physical memory the window shows, [physical_first, physical_end)
+    uint32_t physical_first() const { return heap_base_ >= 0xE0000000 ? 0x1000 : 0; }
+    uint32_t physical_end() const { return physical_first() + heap_size_; }
+    // a physical address's host address in this window's view (the same
+    // offset from the view's start in every window: the 0xE0000000 one starts
+    // at physical 0)
+    uint8_t *host_of(uint32_t physical) const { return membase_ + heap_base_ + physical; }
+    // whether the guest may write all of [first, end) here (physical, within
+    // the window): its pages committed and writable (Xenia's
+    // SystemPageGuestAccess being read-write); lock held
+    bool guest_writable(uint32_t first, uint32_t end) const {
+        uint32_t from = (first - physical_first()) >> page_size_shift_;
+        uint32_t to = (end - 1 - physical_first()) >> page_size_shift_;
+        for (uint32_t page = from; page <= to; ++page) {
+            const PageEntry &entry = page_table_[page];
+            if (!(entry.state & ALLOCATE_COMMIT) || to_access(entry.current_protect) != Access::read_write) return false;
+        }
+        return true;
     }
 
     // the physical address of an address in this window
@@ -639,20 +724,239 @@ private:
     // it, so an alignment above the size reserved more here than in the
     // parent, over the next allocations' pages)
     bool pin(uint32_t parent_address, uint32_t parent_base, uint32_t size, uint32_t alignment, uint32_t type,
-             uint32_t protect, uint32_t *out) {
-        uint32_t address = heap_base_ + parent_address - parent_base;
-        // the alignment is the host address's (the physical address's)
-        if ((address + host_address_offset_) % alignment != 0 ||
-            !BaseHeap::alloc_fixed(address, size, page_size_, type, protect)) {
-            parent_->release(parent_address);
-            return false;
-        }
-        if (out) *out = address;
-        return true;
-    }
+             uint32_t protect, uint32_t *out);
+    // the watched pages of a guest range here written: their protection
+    // comes off before the heap changes it (lock held)
+    void invalidate(uint32_t address, uint32_t size);
 
     BaseHeap *parent_ = nullptr;
+    Watches *watches_ = nullptr;
 };
+
+// ---------------------------------------------------------------------------
+// Write watches on physical memory (memory.h; Xenia's PhysicalHeap
+// EnableAccessCallbacks and TriggerCallbacks, with SharedMemory's
+// MemoryInvalidationCallback asking how far to go as the watchers' bounds).
+// Xenia keeps the watch bits in each window's heap; here they are by
+// physical page, each window's protection apart: a physical page is watched
+// in every window where the guest may write it, and a change to a window's
+// page table (the heaps' protect, alloc, decommit, release) takes the watch
+// off first, so the windows' bits stay true.
+
+class Watches {
+public:
+    void init(std::recursive_mutex *lock, std::array<PhysicalHeap *, 4> windows) {
+        lock_ = lock;
+        windows_ = windows;
+        shift_ = 12;
+        while ((size_t(1) << shift_) < host_page_size()) shift_++;
+        pages_ = 0x20000000u >> shift_;
+        stamps_ = std::make_unique<std::atomic<uint32_t>[]>(pages_);
+        for (uint32_t p = 0; p < pages_; p++) stamps_[p].store(0, std::memory_order_relaxed);
+        uint32_t words = (pages_ + 63) / 64;
+        watched_.assign(words, 0);
+        for (auto &bits : protected_) bits.assign(words, 0);
+    }
+
+    uint32_t shift() const { return shift_; }
+    uint32_t count() const { return count_.load(std::memory_order_acquire); }
+    const std::atomic<uint32_t> *stamps() const { return stamps_.get(); }
+
+    // EnableAccessCallbacks for invalidation notifications: each page not
+    // watched yet made read-only in the windows where the guest may write it
+    void watch(uint32_t physical, uint32_t length) {
+        if (!length || physical >= 0x20000000u) return;
+        length = std::min(length, 0x20000000u - physical);
+        uint32_t first = physical >> shift_, last = (physical + length - 1) >> shift_;
+        std::lock_guard guard(*lock_);
+        // runs of pages to protect, by window
+        std::array<uint32_t, 4> run;
+        run.fill(UINT32_MAX);
+        auto flush = [&](size_t w, uint32_t end) {
+            if (run[w] == UINT32_MAX) return;
+            host_protect(windows_[w]->host_of(run[w] << shift_), size_t(end - run[w]) << shift_, Access::read_only);
+            run[w] = UINT32_MAX;
+        };
+        for (uint32_t p = first; p <= last; p++) {
+            // a whole word watched: its 64 pages at once
+            if ((p & 63) == 0 && p + 63 <= last && watched_[p >> 6] == ~0ull) {
+                for (size_t w = 0; w < windows_.size(); w++) flush(w, p);
+                p += 63;
+                continue;
+            }
+            bool already = bit(watched_, p), any = false;
+            for (size_t w = 0; w < windows_.size(); w++) {
+                uint32_t start, end;
+                bool take = !already && window_part(w, p, start, end) && windows_[w]->guest_writable(start, end);
+                if (!take) {
+                    flush(w, p);
+                    continue;
+                }
+                if (run[w] == UINT32_MAX) run[w] = p;
+                set(protected_[w], p, true);
+                any = true;
+            }
+            if (any) {
+                set(watched_, p, true);
+                counts_.watched++;
+            }
+        }
+        for (size_t w = 0; w < windows_.size(); w++) flush(w, last + 1);
+    }
+
+    // TriggerCallbacks for a write: the pages numbered as written, and, where
+    // watched, their protection back to what the guest has; widened as the
+    // watchers allow for a fault (Xenia's unwatch range, at most 4 MB around)
+    void written(uint32_t physical, uint32_t length, bool widen) {
+        if (!length || physical >= 0x20000000u) return;
+        length = std::min(length, 0x20000000u - physical);
+        uint32_t first = physical >> shift_, last = (physical + length - 1) >> shift_;
+        std::lock_guard guard(*lock_);
+        if (widen) {
+            uint32_t from = 0, to = pages_ - 1;
+            bool asked = false;
+            for (const Watcher &w : watchers_) {
+                if (!w.bounds) continue;
+                auto [a, b] = w.bounds(w.context, first, last);
+                from = std::max(from, a), to = std::min(to, b);
+                asked = true;
+            }
+            if (asked) {
+                uint32_t block = (4u << 20) >> shift_;
+                from = std::max(from, first & ~(block - 1));
+                to = std::min(to, last | (block - 1));
+                first = std::min(first, from), last = std::max(last, to);
+            }
+        }
+        uint32_t stamp = count_.load(std::memory_order_relaxed) + 1;
+        for (uint32_t p = first; p <= last; p++) stamps_[p].store(stamp, std::memory_order_release);
+        count_.store(stamp, std::memory_order_release);
+        counts_.written += last - first + 1;
+        for (size_t w = 0; w < windows_.size(); w++) {
+            uint32_t run = UINT32_MAX;
+            for (uint32_t p = first; p <= last + 1; p++) {
+                bool take = false;
+                if (p <= last && bit(protected_[w], p)) {
+                    set(protected_[w], p, false);
+                    // a page the guest made read-only since keeps its protection
+                    uint32_t start, end;
+                    take = window_part(w, p, start, end) && windows_[w]->guest_writable(start, end);
+                }
+                if (take && run == UINT32_MAX) run = p;
+                if (!take && run != UINT32_MAX) {
+                    host_protect(windows_[w]->host_of(run << shift_), size_t(p - run) << shift_, Access::read_write);
+                    run = UINT32_MAX;
+                }
+            }
+        }
+        for (uint32_t p = first; p <= last; p++) set(watched_, p, false);
+    }
+
+    // AccessViolationCallback: a write fault at a host address; true when it
+    // was a watch's (the write goes on)
+    bool fault(uintptr_t host, uint8_t *membase) {
+        uintptr_t base = uintptr_t(membase);
+        if (host < base || host - base >= (uint64_t(1) << 32)) return false;
+        uint64_t offset = host - base;
+        for (size_t w = 0; w < windows_.size(); w++) {
+            const PhysicalHeap &heap = *windows_[w];
+            uint64_t start = heap.heap_base() + heap.physical_first(), end = heap.heap_base() + heap.physical_end();
+            if (offset < start || offset >= end) continue;
+            uint32_t physical = uint32_t(offset - heap.heap_base());
+            uint32_t p = physical >> shift_;
+            std::lock_guard guard(*lock_);
+            counts_.faults++;
+            if (bit(protected_[w], p)) {
+                written(physical, 1, true);
+                return true;
+            }
+            // not watched here (any more): another thread's fault took the
+            // watch off; the write goes on if the guest may write the page
+            uint32_t part_start, part_end;
+            if (!window_part(w, p, part_start, part_end) || !heap.guest_writable(part_start, part_end)) {
+                counts_.faults--;
+                return false;
+            }
+            host_protect(heap.host_of(p << shift_), size_t(1) << shift_, Access::read_write);
+            counts_.retried++;
+            return true;
+        }
+        return false;
+    }
+
+    void *add(Memory::WatchBounds bounds, void *context) {
+        std::lock_guard guard(*lock_);
+        watchers_.push_back({bounds, context, ++next_handle_});
+        return reinterpret_cast<void *>(uintptr_t(next_handle_));
+    }
+    void remove(void *handle) {
+        std::lock_guard guard(*lock_);
+        std::erase_if(watchers_, [&](const Watcher &w) { return w.handle == uintptr_t(handle); });
+    }
+    // (none while another thread holds the lock: a fault's report may ask)
+    Memory::WatchCounts counts() const {
+        std::unique_lock guard(*lock_, std::try_to_lock);
+        return guard ? counts_ : Memory::WatchCounts{};
+    }
+
+private:
+    struct Watcher {
+        Memory::WatchBounds bounds;
+        void *context;
+        uintptr_t handle;
+    };
+    static bool bit(const std::vector<uint64_t> &bits, uint32_t p) { return (bits[p >> 6] >> (p & 63)) & 1; }
+    static void set(std::vector<uint64_t> &bits, uint32_t p, bool on) {
+        if (on)
+            bits[p >> 6] |= 1ull << (p & 63);
+        else
+            bits[p >> 6] &= ~(1ull << (p & 63));
+    }
+    // the part of watch page p window w shows, physical [start, end); false
+    // when it shows none
+    bool window_part(size_t w, uint32_t p, uint32_t &start, uint32_t &end) const {
+        const PhysicalHeap &heap = *windows_[w];
+        start = std::max(p << shift_, heap.physical_first());
+        end = uint32_t(std::min<uint64_t>(uint64_t(p + 1) << shift_, heap.physical_end()));
+        return start < end;
+    }
+
+    std::recursive_mutex *lock_ = nullptr; // the heaps' (Xenia's global critical region)
+    std::array<PhysicalHeap *, 4> windows_{};
+    uint32_t shift_ = 12, pages_ = 0;
+    std::unique_ptr<std::atomic<uint32_t>[]> stamps_;
+    std::atomic<uint32_t> count_{1};
+    std::vector<uint64_t> watched_;                 // by physical page: protected in some window
+    std::array<std::vector<uint64_t>, 4> protected_; // by window and physical page: made read-only here
+    std::vector<Watcher> watchers_;
+    uintptr_t next_handle_ = 0;
+    Memory::WatchCounts counts_;
+};
+
+bool PhysicalHeap::pin(uint32_t parent_address, uint32_t parent_base, uint32_t size, uint32_t alignment, uint32_t type,
+                       uint32_t protect, uint32_t *out) {
+    uint32_t address = heap_base_ + parent_address - parent_base;
+    // the alignment is the host address's (the physical address's)
+    if ((address + host_address_offset_) % alignment != 0) {
+        parent_->release(parent_address);
+        return false;
+    }
+    // pages committed here already may be taken again: their watches go
+    // before the commit sets their protection
+    invalidate(address, size);
+    if (!BaseHeap::alloc_fixed(address, size, page_size_, type, protect)) {
+        parent_->release(parent_address);
+        return false;
+    }
+    if (out) *out = address;
+    return true;
+}
+
+void PhysicalHeap::invalidate(uint32_t address, uint32_t size) {
+    if (!watches_ || !size || address < heap_base_ || address - heap_base_ >= heap_size_) return;
+    size = std::min(size, heap_size_ - (address - heap_base_));
+    watches_->written(physical_address(address), size, false);
+}
 
 bool PhysicalHeap::alloc(uint32_t size, uint32_t alignment, uint32_t type, uint32_t protect, bool, uint32_t *out) {
     *out = 0;
@@ -705,17 +1009,26 @@ bool PhysicalHeap::alloc_range(uint32_t low_address, uint32_t high_address, uint
 bool PhysicalHeap::release(uint32_t base_address, uint32_t *out_size) {
     std::lock_guard guard(*lock_);
     if (!parent_->release(physical_address(base_address), out_size)) return false;
+    // the range may be used again by another window's mapping, so what
+    // watches it here goes (Xenia: issue 1559)
+    uint32_t region_size;
+    if (query_size(base_address, &region_size)) invalidate(base_address, region_size);
     return BaseHeap::release(base_address, out_size);
 }
 
 bool PhysicalHeap::decommit(uint32_t address, uint32_t size) {
     std::lock_guard guard(*lock_);
     if (!parent_->decommit(physical_address(address), size)) return false;
+    invalidate(address, size); // not caring about the contents any more
     return BaseHeap::decommit(address, size);
 }
 
 bool PhysicalHeap::protect(uint32_t address, uint32_t size, uint32_t protect, uint32_t *old_protect) {
     std::lock_guard guard(*lock_);
+    // made writable: the guest announces a write, so the pages are written
+    // even unwatched (a page read-only when it was last copied never got a
+    // watch), as Xenia invalidates them
+    if (to_access(protect) == Access::read_write) invalidate(address, size);
     if (!parent_->protect(physical_address(address), size, protect, old_protect)) return false;
     return BaseHeap::protect(address, size, protect);
 }
@@ -753,15 +1066,43 @@ void store_be32(uint8_t *p, uint32_t value) {
     p[3] = uint8_t(value);
 }
 
+// Every Memory whose watches the process's fault handler asks, in a table
+// the handler reads without a lock (a fault may come on a thread holding
+// any lock).
+class MemoryImpl;
+constexpr size_t MAX_MEMORIES = 16;
+std::atomic<MemoryImpl *> memories[MAX_MEMORIES];
+bool on_write_fault(void *host_address);
+
 class MemoryImpl final : public Memory {
 public:
     MemoryImpl() = default;
     MemoryImpl(const MemoryImpl &) = delete;
     MemoryImpl &operator=(const MemoryImpl &) = delete;
     ~MemoryImpl() override {
+        for (auto &slot : memories) {
+            MemoryImpl *self = this;
+            slot.compare_exchange_strong(self, nullptr);
+        }
         unmap_views();
         if (has_mapping_) close_mapping(mapping_);
     }
+
+    uint32_t watch_page_shift() const override { return watches_.shift(); }
+    uint32_t write_count() const override { return watches_.count(); }
+    const std::atomic<uint32_t> *write_stamps() const override { return watches_.stamps(); }
+    void watch(uint32_t physical, uint32_t length) override {
+        // the fault handler, the first time anything is watched: added then,
+        // it comes before the handlers added at the game's launch
+        static std::once_flag installed;
+        std::call_once(installed, [] { install_write_fault_handler(on_write_fault); });
+        watches_.watch(physical, length);
+    }
+    void physical_written(uint32_t physical, uint32_t length) override { watches_.written(physical, length, false); }
+    void *add_watcher(WatchBounds bounds, void *context) override { return watches_.add(bounds, context); }
+    void remove_watcher(void *handle) override { watches_.remove(handle); }
+    WatchCounts watch_counts() const override { return watches_.counts(); }
+    bool fault(void *host_address) { return watches_.fault(uintptr_t(host_address), virtual_membase_); }
 
     bool init(std::string &error);
 
@@ -787,6 +1128,7 @@ private:
     uint8_t *virtual_membase_ = nullptr;
     uint8_t *physical_membase_ = nullptr;
     std::recursive_mutex lock_;
+    Watches watches_;
     struct {
         BaseHeap v00000000;
         BaseHeap v40000000;
@@ -847,10 +1189,11 @@ bool MemoryImpl::init(std::string &error) {
 
     // the physical memory and its windows
     heaps_.physical.init(&lock_, physical_membase_, HeapType::physical, 0x00000000, 0x20000000, 0x1000);
-    heaps_.vA0000000.init(&lock_, virtual_membase_, 0xA0000000, 0x20000000, 0x10000, &heaps_.physical);
-    heaps_.vC0000000.init(&lock_, virtual_membase_, 0xC0000000, 0x20000000, 0x1000000, &heaps_.physical);
-    heaps_.vE0000000.init(&lock_, virtual_membase_, 0xE0000000, 0x1FD00000, 0x1000, &heaps_.physical);
-    heaps_.v7F000000.init(&lock_, virtual_membase_, 0x7F000000, 0x00C80000, 0x1000, &heaps_.physical);
+    heaps_.vA0000000.init(&lock_, virtual_membase_, 0xA0000000, 0x20000000, 0x10000, &heaps_.physical, &watches_);
+    heaps_.vC0000000.init(&lock_, virtual_membase_, 0xC0000000, 0x20000000, 0x1000000, &heaps_.physical, &watches_);
+    heaps_.vE0000000.init(&lock_, virtual_membase_, 0xE0000000, 0x1FD00000, 0x1000, &heaps_.physical, &watches_);
+    heaps_.v7F000000.init(&lock_, virtual_membase_, 0x7F000000, 0x00C80000, 0x1000, &heaps_.physical, &watches_);
+    watches_.init(&lock_, {&heaps_.v7F000000, &heaps_.vA0000000, &heaps_.vC0000000, &heaps_.vE0000000});
 
     bool ok = true;
     // the first 64 KB, no access (Xenia's protect_zero), and the physical
@@ -932,11 +1275,29 @@ void MemoryImpl::system_free(uint32_t address) {
     if (Heap *heap = heap_for(address)) heap->release(address);
 }
 
+bool on_write_fault(void *host_address) {
+    for (auto &slot : memories)
+        if (MemoryImpl *m = slot.load(std::memory_order_acquire); m && m->fault(host_address)) return true;
+    return false;
+}
+
 } // namespace
 
 std::unique_ptr<Memory> Memory::create(std::string &error) {
     auto memory = std::make_unique<MemoryImpl>();
     if (!memory->init(error)) return nullptr;
+    bool listed = false;
+    for (auto &slot : memories) {
+        MemoryImpl *none = nullptr;
+        if (slot.compare_exchange_strong(none, memory.get())) {
+            listed = true;
+            break;
+        }
+    }
+    if (!listed) {
+        error = "too many guest memories at once for the write watches' fault handler";
+        return nullptr;
+    }
     return memory;
 }
 

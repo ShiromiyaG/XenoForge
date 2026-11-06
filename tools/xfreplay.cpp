@@ -7,10 +7,11 @@
 // --gpu-time-draws each draw's too, by its shaders; --repeat N
 // plays the trace N times through the same renderer, as a game draws a frame
 // again, the GPU time then being the fastest of the plays after the first.
+// --readback-resolve none|fast|full is Xenia's readback_resolve (renderer.h).
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
 //            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
-//            [--occlusion-queries] [-v]
+//            [--occlusion-queries] [--readback-resolve none|fast|full] [-v]
 
 #include "xenoforge/renderer.h"
 
@@ -32,7 +33,7 @@ namespace {
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
                          "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
-                         "[--occlusion-queries] [-v]\n");
+                         "[--occlusion-queries] [--readback-resolve none|fast|full] [-v]\n");
     return 2;
 }
 
@@ -59,6 +60,13 @@ int main(int argc, char **argv) {
         else if (a == "--async-pipelines") options.async_pipelines = true;
         // occlusion query reports with the GPU's counts (else the fake ones)
         else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
+        else if (a == "--readback-resolve" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if (m == "none") options.readback_resolve = xf::render::ReadbackResolve::none;
+            else if (m == "fast") options.readback_resolve = xf::render::ReadbackResolve::fast;
+            else if (m == "full") options.readback_resolve = xf::render::ReadbackResolve::full;
+            else return usage();
+        }
         else if (!a.empty() && a[0] != '-' && trace_path.empty()) trace_path = a;
         else return usage();
     }

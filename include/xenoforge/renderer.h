@@ -93,8 +93,17 @@ struct FrontBuffer {
     std::array<uint32_t, 256> gamma{}; // that ramp at the swap: 10 bits a component, red highest
 };
 
+// When the CPU sees what a resolve wrote (Xenia's readback_resolve option):
+// the GPU's copy of guest memory always has it, and textures read it there.
+enum class ReadbackResolve {
+    none, // never: guest memory keeps its bytes (Xenia's default since December 2025)
+    fast, // a frame late: each resolve gives guest memory the bytes the same resolve wrote the frame before
+    full, // at once: each resolve waits for the GPU and gives guest memory its bytes
+};
+
 struct Options {
     bool verbose = false; // a line per draw and resolve on stderr
+    ReadbackResolve readback_resolve = ReadbackResolve::none;
     // where to write each shader loaded, as Xenia's --dump_shaders writes
     // them (shader_<hash>.ucode.bin.vert or .frag, words in host order; the
     // hash is the renderer's, the one verbose draws print); none when empty

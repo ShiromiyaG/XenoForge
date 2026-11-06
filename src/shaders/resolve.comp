@@ -28,9 +28,56 @@ layout(push_constant) uniform Resolve {
     uint dest_base, dest_pitch, dest_height, dest_x, dest_y, dest_slice, dest_array;
     uint dest_format, dest_log2_bytes, dest_endian, dest_number, dest_swap;
     float exp_factor;       // 2 to the exponent bias
+    // a multisampled source, read from EDRAM (src is the EDRAM buffer, the
+    // surface's samples as the guest keeps them, stored there first), as
+    // Xenia's resolve shaders read it: the surface's base and pitch in tiles,
+    // its samples, 64-bit samples, the rectangle's corner, the samples taken
+    uint edram, edram_base, edram_pitch, msaa, ints_log2, src_x, src_y, first_sample, samples;
 } p;
 
 #include "tiling.glsl"
+
+// edram.glsl's edram_offset, with the surface from the push constants (its
+// own push constant block is the EDRAM transfers'): the dword of a pixel's
+// guest sample. 4x: bit 0 of the sample horizontal, bit 1 vertical; 2x:
+// sample 0 the top one.
+const uint TILE_DWORDS = 80u * 16u, EDRAM_DWORDS = TILE_DWORDS * 2048u;
+uint edram_dword(uvec2 pixel, uint sample_index) {
+    uvec2 s;
+    if (p.msaa >= 2u) {
+        uvec2 offset = (uvec2(sample_index) >> uvec2(0u, 1u)) & 1u;
+        s = ((pixel & ~1u) << 1u) | (pixel & 1u) | (offset << 1u);
+    } else if (p.msaa == 1u) {
+        s.x = (pixel.x & ~2u) | ((sample_index & 1u) << 1u);
+        s.y = ((pixel.y & ~1u) << 1u) | (pixel.y & 1u) | (pixel.x & 2u);
+    } else {
+        s = pixel;
+    }
+    uvec2 tile_size = uvec2(80u >> p.ints_log2, 16u);
+    uvec2 tile_xy = s / tile_size;
+    uint tile = p.edram_base + tile_xy.y * p.edram_pitch + tile_xy.x;
+    s -= tile_xy * tile_size;
+    if (p.depth != 0u) {
+        // depth tiles have their halves swapped
+        uint half_width = tile_size.x >> 1u;
+        s.x = s.x >= half_width ? s.x - half_width : s.x + half_width;
+    }
+    return (tile * TILE_DWORDS + ((s.y * tile_size.x + s.x) << p.ints_log2)) % EDRAM_DWORDS;
+}
+
+// edram.glsl's: a 7e3 float (2_10_10_10_FLOAT's components in EDRAM)
+float float7e3_to_32(uint f10) {
+    f10 &= 0x3FFu;
+    if (f10 == 0u) return 0.0;
+    uint mantissa = f10 & 0x7Fu;
+    int exponent = int(f10 >> 7u);
+    if (exponent == 0) {
+        uint lzcnt = 7u - uint(findMSB(mantissa));
+        exponent = 1 - int(lzcnt);
+        mantissa = (mantissa << lzcnt) & 0x7Fu;
+    }
+    return uintBitsToFloat((uint(exponent + 124) << 23u) | (mantissa << 16u));
+}
 
 // color render target formats (xenos.h's ColorRenderTargetFormat)
 const uint RT_8_8_8_8 = 0u, RT_8_8_8_8_GAMMA = 1u, RT_2_10_10_10 = 2u, RT_2_10_10_10_FLOAT = 3u, RT_16_16 = 4u,
@@ -109,15 +156,21 @@ uint pwl_gamma_to_linear_code(uint c) {
     uint linear_code = c * scale - offset;
     return linear_code + ((linear_code * scale) >> 10u);
 }
-float average_pwl_gamma(uint m) {
+// XeResolveAveragePWLGamma: the samples' linear codes averaged, through the
+// curve again
+float average_pwl_gamma(float sum, float weight) {
+    precise float averaged = sum * weight;
+    uint m = uint(averaged);
     uint c = m < 64u ? m : m < 128u ? (m + 64u) >> 1u : m < 512u ? (m + 256u) >> 2u : (m + 1024u) >> 3u;
     c = min(c, 255u);
     uint n = pwl_gamma_to_linear_code(c);
     return n == 1023u ? 1.0 : float((n << 14u) | (n << 4u) | (n >> 6u)) * (1.0 / 16777216.0);
 }
-float gamma_to_linear(float v) {
+// XePWLGammaToLinearCode of a component's 8 bits, the code kept as a float
+// until the samples are averaged
+float gamma_code(float v) {
     precise float code = v * 255.0 + 0.5;
-    return average_pwl_gamma(pwl_gamma_to_linear_code(uint(code)));
+    return float(pwl_gamma_to_linear_code(uint(code)));
 }
 
 // A source pixel as the resolve shaders unpack it (XeResolveUnpack*): two
@@ -159,6 +212,56 @@ vec4 unpack(uint w0, uint w1) {
     return c;
 }
 
+// A sample as EDRAM keeps it (XeResolveUnpack* of the raw bits): the host's
+// words but for 2_10_10_10_FLOAT, 7e3 components in one dword there.
+vec4 unpack_guest(uint w0, uint w1) {
+    if (p.source_format == RT_2_10_10_10_FLOAT || p.source_format == RT_2_10_10_10_FLOAT_AS_16_16_16_16)
+        return vec4(float7e3_to_32(w0), float7e3_to_32(w0 >> 10u), float7e3_to_32(w0 >> 20u), float(w0 >> 30u) * (1.0 / 3.0));
+    return unpack(w0, w1);
+}
+
+// The pixel's components as the resolve shaders load them
+// (XeResolveLoad*Colors): one sample, or the samples selected summed in their
+// order and averaged; 8_8_8_8_GAMMA's red, green and blue as linear codes,
+// averaged and taken through the curve again, alpha as it is; all scaled by
+// the exponent bias.
+vec4 load_colors(uvec2 at, uint index) {
+    bool gamma = p.source_format == RT_8_8_8_8_GAMMA;
+    uint count = p.edram != 0u ? p.samples : 1u;
+    vec4 sum = vec4(0.0);
+    for (uint k = 0u; k < count; k++) {
+        vec4 c;
+        if (p.edram != 0u) {
+            uint d = edram_dword(uvec2(p.src_x, p.src_y) + at, p.first_sample + k);
+            c = unpack_guest(src.words[d], p.ints_log2 != 0u ? src.words[(d + 1u) % EDRAM_DWORDS] : 0u);
+        } else {
+            c = unpack(src.words[index * p.src_words], p.src_words > 1u ? src.words[index * p.src_words + 1u] : 0u);
+        }
+        if (gamma) c.rgb = vec3(gamma_code(c.r), gamma_code(c.g), gamma_code(c.b));
+        if (k == 0u) {
+            sum = c;
+        } else {
+            precise vec4 added = sum + c;
+            sum = added;
+        }
+    }
+    float weight = count == 4u ? 0.25 : count == 2u ? 0.5 : 1.0;
+    precise float bias = p.exp_factor * weight;
+    vec4 out_c;
+    if (gamma) {
+        for (uint i = 0u; i < 3u; i++) {
+            precise float linear = average_pwl_gamma(sum[i], weight) * p.exp_factor;
+            out_c[i] = linear;
+        }
+        precise float a = sum.a * bias;
+        out_c.a = a;
+    } else {
+        precise vec4 scaled = sum * bias;
+        out_c = scaled;
+    }
+    return out_c;
+}
+
 vec4 c_; // the pixel being converted
 uint fixed4(uint b0, uint b1, uint b2, uint b3) {
     uint n = p.dest_number;
@@ -167,37 +270,17 @@ uint fixed4(uint b0, uint b1, uint b2, uint b3) {
            (b3 != 0u ? pack_fixed(c_[3], b3, n) << (b0 + b1 + b2) : 0u);
 }
 
-// The destination's words for a pixel, converted (the full resolve shaders);
-// returns the word count, 0 for a 1-byte or 2-byte destination, which goes
-// in small.
-uint convert(uint w0, uint w1, out uint w[4], out uint small) {
+// The destination's words for a pixel's loaded components, converted (the
+// full resolve shaders); returns the word count, 0 for a 1-byte or 2-byte
+// destination, which goes in small.
+uint convert(vec4 c, out uint w[4], out uint small) {
     w = uint[4](0u, 0u, 0u, 0u);
     small = 0u;
-    vec4 c = unpack(w0, w1);
-    float factor = p.exp_factor;
-    bool gamma = p.source_format == RT_8_8_8_8_GAMMA;
     uint dest_bytes = 1u << p.dest_log2_bytes;
     if (dest_bytes == 1u) {
         // XeResolveLoad8ScalarColors: D3D maps A8 to k_8 with the swap
-        bool alpha = p.dest_swap != 0u;
-        float v = alpha ? c[3] : c[0];
-        if (gamma && !alpha) v = gamma_to_linear(v);
-        precise float scaled = v * factor;
-        small = pack_fixed(scaled, 8u, p.dest_number);
+        small = pack_fixed(p.dest_swap != 0u ? c[3] : c[0], 8u, p.dest_number);
         return 0u;
-    }
-    if (gamma) {
-        for (uint i = 0u; i < 3u; i++) {
-            precise float linear = gamma_to_linear(c[i]) * factor;
-            c[i] = linear;
-        }
-        precise float a = c[3] * factor;
-        c[3] = a;
-    } else {
-        for (uint i = 0u; i < 4u; i++) {
-            precise float v = c[i] * factor;
-            c[i] = v;
-        }
     }
     if (p.dest_swap != 0u) c = c.bgra;
     c_ = c;
@@ -305,7 +388,12 @@ void main() {
     if (at.x >= p.width || at.y >= p.height) return;
     uint index = at.y * p.width + at.x;
     uint w0, w1 = 0u;
-    if (p.depth != 0u) {
+    if (p.edram != 0u && (p.depth != 0u || p.raw != 0u)) {
+        // the guest's words of the one sample taken, as they are
+        uint d = edram_dword(uvec2(p.src_x, p.src_y) + at, p.first_sample);
+        w0 = src.words[d];
+        if (p.ints_log2 != 0u) w1 = src.words[(d + 1u) % EDRAM_DWORDS];
+    } else if (p.depth != 0u) {
         // as the guest's words: depth in the high 24 bits, as the EDRAM store
         // writes them (D24FS8 kept halved)
         uint d = src.words[index];
@@ -320,13 +408,13 @@ void main() {
             d24 = uint(roundEven(scaled));
         }
         w0 = (d24 << 8u) | s;
-    } else {
+    } else if (p.raw != 0u) {
         w0 = src.words[index * p.src_words];
         if (p.src_words > 1u) w1 = src.words[index * p.src_words + 1u];
     }
 
     uint w[4], small = 0u;
-    uint words = p.raw != 0u ? copy_raw(w0, w1, w) : convert(w0, w1, w, small);
+    uint words = p.raw != 0u ? copy_raw(w0, w1, w) : convert(load_colors(at, index), w, small);
     uint x = p.dest_x + at.x, y = p.dest_y + at.y;
     uint offset = p.dest_array != 0u ? tiled_offset_3d(x, y, p.dest_slice, p.dest_pitch, p.dest_height, p.dest_log2_bytes)
                                      : tiled_offset_2d(x, y, p.dest_pitch, p.dest_log2_bytes);

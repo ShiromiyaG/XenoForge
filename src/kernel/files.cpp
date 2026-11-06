@@ -151,7 +151,12 @@ uint32_t read_locked(Kernel &k, File &f, uint32_t buffer, uint32_t length, uint6
         if (!buffer || UINT32_MAX - buffer < length) {
             status = X_STATUS_ACCESS_VIOLATION;
         } else {
-            status = f.stream ? f.stream->read(offset, k.host(buffer), length, done) : X_STATUS_INVALID_DEVICE_REQUEST;
+            // into physical memory through its own view, which no write watch
+            // protects (the host's read would fail on a watched page instead
+            // of faulting), and the watches told after, as Xenia's XFile::Read
+            uint8_t *into = k.memory().translate_for_host_write(buffer);
+            status = f.stream ? f.stream->read(offset, into, length, done) : X_STATUS_INVALID_DEVICE_REQUEST;
+            k.memory().written(buffer, uint32_t(done));
             if (pending && !f.synchronous) *pending = !f.buffering && status == X_STATUS_SUCCESS;
             if (status == X_STATUS_SUCCESS) f.position = offset + done;
         }

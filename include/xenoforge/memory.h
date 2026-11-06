@@ -23,9 +23,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace xf {
 
@@ -97,6 +99,76 @@ public:
     // (0xE0000000, top-down); 0 when full
     virtual uint32_t system_alloc(uint32_t size, uint32_t alignment = 0x20, bool physical = false) = 0;
     virtual void system_free(uint32_t address) = 0;
+
+    // ---- write watches on physical memory ----
+    // (Xenia's physical memory access callbacks: EnablePhysicalMemoryAccessCallbacks,
+    // TriggerPhysicalMemoryCallbacks and the access violation handler.) What
+    // keeps a copy of physical memory, as the renderer's mirror and textures
+    // do, learns of the writes to it this way. Physical memory is cut into
+    // watch pages of the host's page size (4 KB on Windows and most hosts, 16
+    // KB on some ARM64 ones). Every watch page has the number of the last
+    // write seen to it, out of a count of writes that only grows.
+    //
+    // A watched page is protected read-only in the windows where the guest may
+    // write it (0x7F000000, 0xA0000000, 0xC0000000, 0xE0000000; never in
+    // translate_physical's view). The first write to it after that, by the
+    // game's code (generated or interpreted) or by the kernel's host code,
+    // faults once: the fault numbers the page (and, as Xenia widens it, the
+    // pages around it its watchers allow), takes the protection off and lets
+    // the write go on. Writes through translate_physical's view (the GPU's
+    // command processor, DMA, a file read made there) are not seen: whoever
+    // makes them calls physical_written.
+    //
+    // A watcher's use: watch the pages first, then take write_count(), then
+    // copy the bytes. A page whose stamp is at or below that count has not
+    // been written since the copy; a later write numbers it higher.
+    uint32_t watch_page_size() const { return 1u << watch_page_shift(); }
+    virtual uint32_t watch_page_shift() const = 0;
+    // the number of the last write seen (they start at 1)
+    virtual uint32_t write_count() const = 0;
+    // each watch page's: the number of the last write seen to it (0: none
+    // since the start); 0x20000000 >> watch_page_shift() of them
+    virtual const std::atomic<uint32_t> *write_stamps() const = 0;
+    // Watches the pages of [physical, physical + length). Pages the guest
+    // cannot write anywhere stay unwatched: making them writable (the heaps'
+    // protect, alloc, decommit and release) numbers them as written.
+    virtual void watch(uint32_t physical, uint32_t length) = 0;
+    // Host code wrote [physical, physical + length) where no watch sees it:
+    // the pages are numbered as written, and their watches go.
+    virtual void physical_written(uint32_t physical, uint32_t length) = 0;
+    // Where host code writes the guest's memory at a guest address so that a
+    // watch does not stop it (an operating system's call filling it, as a file
+    // read, fails on a protected page instead of faulting): the physical view
+    // for an address in a physical window, as Xenia's file reads write there,
+    // else translate(). Tell written() after.
+    uint8_t *translate_for_host_write(uint32_t address) const {
+        uint32_t physical = physical_window(address) ? physical_address(address) : UINT32_MAX;
+        return physical != UINT32_MAX ? translate_physical(physical) : translate(address);
+    }
+    // what host code wrote at a guest address through translate_for_host_write
+    void written(uint32_t address, uint32_t length) {
+        if (length && physical_window(address)) physical_written(physical_address(address), length);
+    }
+    static bool physical_window(uint32_t address) {
+        return (address >= 0x7F000000u && address < 0x7FC80000u) || address >= 0xA0000000u;
+    }
+    // A watcher's say in how far around a written page the watches may go
+    // (Xenia's invalidation callbacks' unwatch range): given the first and
+    // last pages written, the widest [first, last] it accepts seeing as
+    // written. Memory takes what every watcher accepts, at most the 4 MB
+    // around the write, at least the pages written. Called in the fault
+    // handler, under the heaps' lock, on the writing thread: it must not
+    // block nor take a lock held around calls of watch().
+    using WatchBounds = std::pair<uint32_t, uint32_t> (*)(void *context, uint32_t first_page, uint32_t last_page);
+    virtual void *add_watcher(WatchBounds bounds, void *context) = 0;
+    virtual void remove_watcher(void *handle) = 0;
+    // what the watches did so far: write faults taken (and of them, ones
+    // another thread's fault had already let go), pages watched, and pages
+    // numbered as written (by faults, widened, and by host writes told)
+    struct WatchCounts {
+        uint64_t faults = 0, retried = 0, watched = 0, written = 0;
+    };
+    virtual WatchCounts watch_counts() const = 0;
 };
 
 } // namespace xf

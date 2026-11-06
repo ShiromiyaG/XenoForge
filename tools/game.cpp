@@ -211,6 +211,14 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     const char *queries = std::getenv("XF_OCCLUSION_QUERIES");
     processor.set_occlusion_queries(queries && std::string(queries) == "fake" ? gpu::OcclusionQueries::Fake
                                                                               : gpu::OcclusionQueries::Fast);
+    // when the CPU sees what resolves wrote (Xenia's readback_resolve):
+    // XF_READBACK_RESOLVE=none (the default, as Xenia's), fast or full
+    if (const char *mode = std::getenv("XF_READBACK_RESOLVE")) {
+        std::string m = mode;
+        o.readback_resolve = m == "full"   ? render::ReadbackResolve::full
+                             : m == "fast" ? render::ReadbackResolve::fast
+                                           : render::ReadbackResolve::none;
+    }
     g.renderer = render::Renderer::create(*g.device, processor, o, error);
     if (!g.renderer) return error = "renderer: " + error, false;
     processor.set_sink(g.renderer.get());
@@ -285,6 +293,11 @@ void print_report(Game &g, bool waiting) {
         }
         if (waiting || g.renderer->try_report(r)) {
             print_renderer_report(r);
+            Memory::WatchCounts w = g.memory->watch_counts();
+            std::printf("memory's write watches: %llu pages watched, %llu write faults (%llu let go already), %llu "
+                        "pages written\n",
+                        (unsigned long long)w.watched, (unsigned long long)w.faults, (unsigned long long)w.retried,
+                        (unsigned long long)w.written);
             std::string failure;
             if (g.renderer->failed(failure)) std::printf("renderer: failed: %s\n", failure.c_str());
         } else {

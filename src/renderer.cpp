@@ -19,24 +19,24 @@
 // is read from the mirror (below); textures are bindless, each image at an
 // index of one descriptor set written as they are made.
 //
-// Guest memory is read where it lies, with nothing told when the CPU writes
-// it, so what is copied from it is checked or copied again at each use:
-// indices are copied at each draw; vertex data is compared at each draw, page
-// by page, with what the mirror was last given, and the pages that differ
-// are uploaded (Xenia requests the same ranges from its shared memory and
-// uploads the pages its write watches saw change); textures are kept with a
-// hash of the memory they were decoded from and decoded again when it
-// differs at a use (Xenia drops them when a write watch on their pages
-// fires); the processor's own writes (memory_written) mark the textures under
-// them at once.
+// Guest memory is read where it lies, and the CPU's writes to it are seen by
+// the memory's write watches (memory.h; Xenia's physical memory access
+// callbacks): a page is watched before its bytes are copied, and the number
+// of its last write, above the count taken then, says the copy is old.
+// Indices are copied at each draw. The mirror, a copy of guest memory on the
+// GPU as Xenia's shared memory, is given the pages a draw's vertex data or a
+// texture load needs that are not current there (Xenia's RequestRange), and
+// textures are kept until a write to their pages (Xenia's texture cache
+// watches); the processor's own writes (memory_written) are told to the
+// watches.
 //
-// Resolves run on the GPU, into the mirror: a copy of guest memory on the
-// GPU, as Xenia's shared memory, holding what resolves wrote and what loads
-// from it need around that. Textures over what a resolve wrote are loaded
-// from the mirror on the GPU (as Xenia's texture cache loads all of its
-// textures), and guest memory gets the resolve's bytes once the GPU has
-// written them, without waiting for it (docs/renderer.md, "Decisions"): read
-// back at the submission's end, what no later resolve wrote over.
+// Resolves and memory exports run on the GPU, into the mirror, whose pages
+// then hold what the GPU wrote and guest memory does not (Xenia's
+// RangeWrittenByGpu) until the CPU writes them. Textures over them are
+// loaded from the mirror on the GPU (as Xenia's texture cache loads all of
+// its textures). Guest memory gets a resolve's bytes as Xenia's
+// readback_resolve option says (Options::readback_resolve): never, as its
+// default; a frame late, without waiting; or at once, waiting for the GPU.
 
 #include "xenoforge/renderer.h"
 
@@ -123,7 +123,6 @@ constexpr uint32_t VGT_OUTPUT_PATH_CNTL = 0x2284, VGT_HOS_CNTL = 0x2285;
 constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
 constexpr uint32_t SQ_CONTEXT_MISC = 0x2181;
 constexpr uint32_t PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2380; // then FRONT_OFFSET, BACK_SCALE, BACK_OFFSET
-constexpr uint32_t RB_COPY_CONTROL = 0x2318;
 constexpr uint32_t RB_DEPTH_CLEAR = 0x231D, RB_COLOR_CLEAR = 0x231E, RB_COLOR_CLEAR_LO = 0x231F;
 constexpr uint32_t COLOR_INFO[4] = {reg::RB_COLOR_INFO, reg::RB_COLOR1_INFO, reg::RB_COLOR2_INFO, reg::RB_COLOR3_INFO};
 } // namespace r
@@ -135,8 +134,6 @@ constexpr VkDeviceSize EDRAM_BYTES = VkDeviceSize(EDRAM_TILES) * 80 * 16 * 4;
 constexpr uint32_t SLOTS = 3;
 constexpr VkDeviceSize ARENA_SLOT = 64u << 20;
 constexpr VkDeviceSize READBACK_CHUNK = 32u << 20;
-// the mirror's uploads are of whole pages of this size where they can be
-constexpr uint32_t MIRROR_PAGE = 4096;
 // GPU timestamps a submission holds at most (Options::gpu_timing)
 constexpr uint32_t TIMESTAMPS = 8192;
 constexpr uint32_t GPU_END = UINT32_MAX; // the kind of a submission's last timestamp
@@ -158,26 +155,6 @@ uint64_t hash_words(uint32_t seed, std::span<const uint32_t> words) {
     for (uint32_t d : words)
         for (int i = 0; i < 4; i++) h = (h ^ ((d >> (8 * i)) & 0xFF)) * 0x100000001b3ull;
     return h;
-}
-
-// A hash of bytes, fast enough to run over a texture's memory at each use:
-// four lanes, each word xored in, rotated and multiplied (a bijection of the
-// lane for a given word, so one changed word always changes its lane), then
-// the lanes and the tail mixed.
-uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t seed) {
-    constexpr uint64_t K1 = 0x9E3779B97F4A7C15ull, K2 = 0xC2B2AE3D27D4EB4Full;
-    uint64_t lanes[4] = {seed ^ K1, seed + K2, seed * K1 + 1, ~seed};
-    size_t i = 0;
-    for (; i + 32 <= n; i += 32)
-        for (int l = 0; l < 4; l++) {
-            uint64_t w;
-            std::memcpy(&w, p + i + 8 * l, 8);
-            lanes[l] = std::rotl(lanes[l] ^ w, 31) * K1;
-        }
-    uint64_t out = n;
-    for (; i < n; i++) out = (out ^ p[i]) * K2;
-    for (uint64_t l : lanes) out = std::rotl(out ^ (l * K2), 27) * K1;
-    return out ^ (out >> 29);
 }
 
 // Physical memory as [first, second) ranges that do not wrap.
@@ -406,7 +383,10 @@ struct ResolveConstants {
     uint32_t dest_base, dest_pitch, dest_height, dest_x, dest_y, dest_slice, dest_array;
     uint32_t dest_format, dest_log2_bytes, dest_endian, dest_number, dest_swap;
     float exp_factor;
+    // a multisampled source read from EDRAM
+    uint32_t edram, edram_base, edram_pitch, msaa, ints_log2, src_x, src_y, first_sample, samples;
 };
+static_assert(sizeof(ResolveConstants) <= 128, "the push constants every device has room for");
 
 // texture_load.comp's push constants
 using LoadConstants = texture::GpuLevel;
@@ -425,11 +405,10 @@ struct Texture {
     VkImageView signed_view = VK_NULL_HANDLE;
     uint32_t signed_index = 0;
     std::vector<Range> ranges;         // the guest memory it was loaded from
-    uint64_t hash = 0;                 // of that memory then
+    uint32_t checked = 0;              // the write count its memory was last known unwritten at (Memory's)
     uint32_t low = 0, high = 0;        // the ranges' bounds
-    bool stale = false;                // the processor or a resolve wrote memory under it
-    bool pending = false;              // loaded from the mirror where guest memory does not have the bytes yet
-    bool rehash = false;               // they are there now: hash them at the next use
+    bool stale = false;                // a resolve or a memory export wrote memory under it
+    bool gpu = false;                  // loaded from what the GPU wrote (the mirror's, or read back from it)
 };
 
 // the translated shaders' and the geometry shaders' system constants
@@ -519,36 +498,15 @@ VkFormat snorm_of(VkFormat f) {
     }
 }
 
-// A part of what a resolve wrote that guest memory does not have yet, and
-// where its bytes wait for the GPU to be done (a read-back buffer: mapped at
-// from, offset bytes into buffer).
-struct Piece {
-    uint32_t start, end;
-    const uint8_t *from;
-    VkBuffer buffer;
-    VkDeviceSize offset;
+// A resolve's pair of read-back buffers for readback_resolve=fast (Xenia's
+// ReadbackBuffer, keyed by the resolve's address and length): one written
+// this frame, the other the frame before's, which guest memory gets.
+struct ResolveReadback {
+    vk::Buffer buffers[2];
+    uint64_t serials[2] = {}; // the submission that last wrote each
+    uint32_t current = 0;     // the one this frame writes
+    uint64_t last_used = 0;   // the swap it was last used at
 };
-struct WriteBack {
-    uint64_t serial = 0; // the submission that writes it
-    std::vector<Piece> pieces;
-};
-
-// takes [start, end) out of the pieces
-void cut(std::vector<Piece> &pieces, uint32_t start, uint32_t end) {
-    bool any = false;
-    for (const Piece &p : pieces) any |= start < p.end && p.start < end;
-    if (!any) return;
-    std::vector<Piece> out;
-    for (const Piece &p : pieces) {
-        if (end <= p.start || start >= p.end) {
-            out.push_back(p);
-            continue;
-        }
-        if (p.start < start) out.push_back({p.start, start, p.from, p.buffer, p.offset});
-        if (end < p.end) out.push_back({end, p.end, p.from + (end - p.start), p.buffer, p.offset + (end - p.start)});
-    }
-    pieces = std::move(out);
-}
 
 // A submission slot: its command buffer and fence, its share of the arena,
 // its read-back buffers, and what waits for the GPU to be done with it.
@@ -747,7 +705,13 @@ class Impl final : public Renderer {
 public:
     Impl(vk::Device &device, gpu::CommandProcessor &processor, const Options &options)
         : d_(device), dev_(device.device()), processor_(processor), options_(options),
-          memory_(processor.memory().translate_physical(0)) {}
+          memory_(processor.memory().translate_physical(0)), mem_(processor.memory()),
+          stamps_(mem_.write_stamps()), page_shift_(mem_.watch_page_shift()),
+          mirror_at_(GuestMemory::SIZE >> page_shift_, 0),
+          gpu_pages_(std::make_unique<std::atomic<uint64_t>[]>(((GuestMemory::SIZE >> page_shift_) + 63) / 64)) {
+        for (size_t i = 0; i < ((GuestMemory::SIZE >> page_shift_) + 63) / 64; i++) gpu_pages_[i].store(0);
+        watcher_ = mem_.add_watcher(watch_bounds, this);
+    }
     ~Impl() override;
 
     bool init(std::string &error);
@@ -787,22 +751,15 @@ public:
         resolved.insert(resolved.end(), zpd_resolved_.begin(), zpd_resolved_.end());
         zpd_resolved_.clear();
     }
-    // the processor's own writes (fences, reports), and a trace's memory:
-    // the textures over them are loaded again at their next use, and what a
-    // resolve wrote there and guest memory does not have yet stays the GPU's;
-    // memory exports' pages there are guest memory's again
+    // the processor's own writes (fences, reports), and a trace's memory
+    // (Xenia's TracePlaybackWroteMemory): written through the physical view,
+    // which no watch sees, so the watches are told; the mirror's pages and
+    // the textures there are loaded again at their next use
     void memory_written(uint32_t address, uint32_t bytes) override {
         Call call(*this, nullptr);
-        uint64_t end = uint64_t(address) + bytes;
-        for (auto &[key, t] : textures_)
-            if (address < t->high && end > t->low) t->stale = true;
         std::vector<Range> written;
         add_span(written, address, bytes);
-        for (WriteBack &w : writebacks_)
-            for (auto [start, stop] : written) cut(w.pieces, start, stop);
-        if (!exported_pages_.empty())
-            for (auto [start, stop] : written)
-                if (stop > start) drop_exported(start >> PAGE_SHIFT, (stop - 1) >> PAGE_SHIFT);
+        for (auto [start, stop] : written) mem_.physical_written(start, stop - start);
     }
 
     // EDRAM as a trace began, in Xenia's layout (edram.glsl's)
@@ -919,7 +876,6 @@ private:
     }
     void gpu_mark(uint32_t kind);
     void gpu_collect(Slot &s);
-    void read_back_resolves(Slot &s);
     std::string target_name(const RenderTarget &t) const;
 
     // resources
@@ -950,11 +906,6 @@ private:
         return out;
     }
     VkPipeline compute_pipeline(const uint32_t *words, size_t bytes, VkPipelineLayout layout);
-    uint64_t hash_ranges(const std::vector<Range> &ranges) const {
-        uint64_t h = 0;
-        for (auto [start, end] : ranges) h = hash_bytes(memory_.data() + start, end - start, h);
-        return h;
-    }
     // guest memory read where it lies, for a trace being written
     void traced(uint32_t address, uint32_t bytes) {
         if (trace_) trace_->read(address, bytes);
@@ -1111,29 +1062,44 @@ private:
     // its descriptor rewritten
     bool grow(vk::Buffer &buffer, VkDeviceSize bytes, VkBufferUsageFlags usage, VkDescriptorSet set, uint32_t binding);
 
-    // ---- the mirror: what resolves wrote, on the GPU ----
-    bool pending(const std::vector<Range> &ranges) const;
-    std::vector<Range> not_pending(const std::vector<Range> &ranges) const;
-    void wait_for(const std::vector<Range> &ranges);
-    VkDeviceSize upload_to_mirror(const std::vector<Range> &ranges);
-    void mirror_written(const std::vector<Range> &ranges);
-    void finish_writebacks(uint64_t serial);
+    // ---- the mirror: guest memory on the GPU (Xenia's shared memory) ----
+    // By the memory's watch pages: the write count the mirror's copy of each
+    // is as of (0: never given), and whether it holds what the GPU wrote
+    // there (a resolve, a memory export) and guest memory does not. A page is
+    // current while no write numbered above its count came; a page the GPU
+    // holds is current until the CPU writes it.
+    bool current(uint32_t page) const {
+        uint32_t at = mirror_at_[page];
+        return at && stamps_[page].load(std::memory_order_acquire) <= at;
+    }
+    bool gpu_page(uint32_t page) const {
+        return (gpu_pages_[page >> 6].load(std::memory_order_relaxed) >> (page & 63)) & 1;
+    }
+    void set_gpu_page(uint32_t page, bool on) {
+        if (on)
+            gpu_pages_[page >> 6].fetch_or(1ull << (page & 63), std::memory_order_relaxed);
+        else if (gpu_page(page))
+            gpu_pages_[page >> 6].fetch_and(~(1ull << (page & 63)), std::memory_order_relaxed);
+    }
+    bool gpu_held(uint32_t page) const { return gpu_page(page) && current(page); }
+    uint32_t first_page(const Range &r) const { return r.first >> page_shift_; }
+    uint32_t last_page(const Range &r) const { return (r.second - 1) >> page_shift_; }
+    bool gpu_held(const std::vector<Range> &ranges) const;
+    std::vector<Range> cpu_parts(const std::vector<Range> &ranges) const;
+    VkDeviceSize request(const std::vector<Range> &ranges);
+    void gpu_written(const std::vector<Range> &ranges);
+    bool unwritten(Texture &t);
+    static std::pair<uint32_t, uint32_t> watch_bounds(void *self, uint32_t first, uint32_t last);
+    // guest memory given a resolve's bytes, as readback_resolve says
+    void read_back_resolve(const std::vector<Range> &written);
+    std::unordered_map<uint64_t, ResolveReadback> resolve_readbacks_;
+    void next_readback_frame();
 
     // ---- memexport: shaders writing guest memory, into the mirror ----
-    // The 4 KB pages memory exports wrote, which the mirror holds and guest
-    // memory does not (Xenia keeps them on the GPU too), each with the hash
-    // of guest memory's page as it was then: when those bytes change, the
-    // CPU has written the page since and guest memory's bytes are the newer
-    // (Xenia's page watches, checked here when the page is used).
+    // The streams' pages are the GPU's after the draw (gpu_written), as
+    // Xenia keeps them on the GPU, until the CPU writes them.
     static constexpr uint32_t PAGE_SHIFT = 12;
-    std::map<uint32_t, uint64_t> exported_pages_;
-    uint64_t page_hash(uint32_t page) const {
-        return hash_bytes(memory_.data() + (size_t(page) << PAGE_SHIFT), size_t(1) << PAGE_SHIFT, page);
-    }
     void export_ranges(const Shader &s, uint32_t stage, std::vector<Range> &ranges);
-    bool exported(const Range &r) const;
-    void check_exported(const std::vector<Range> &ranges);
-    void drop_exported(uint32_t first_page, uint32_t last_page);
     void end_export(const std::vector<Range> &pages);
 
     vk::Device &d_;
@@ -1145,6 +1111,12 @@ private:
     std::string fatal_;
     const uint32_t *regs_ = nullptr; // the processor's register file, during a call
     GuestMemory memory_;             // the processor's physical memory
+    Memory &mem_;                    // the same memory, with its write watches
+    const std::atomic<uint32_t> *stamps_ = nullptr;
+    uint32_t page_shift_ = 12; // the watch pages'
+    std::vector<uint32_t> mirror_at_;
+    std::unique_ptr<std::atomic<uint64_t>[]> gpu_pages_;
+    void *watcher_ = nullptr;
     gpu::MemoryTrace *trace_ = nullptr; // a trace writer's, told what is read
     uint64_t vertex_hash_ = 0, pixel_hash_ = 0;
     bool have_vertex_ = false, have_pixel_ = false;
@@ -1154,10 +1126,8 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
     std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<RenderTarget>> targets_;
     std::map<std::array<uint32_t, 6>, std::unique_ptr<Texture>> textures_;
-    std::unordered_set<Texture *> pending_textures_;
     std::map<std::array<uint32_t, 8>, std::pair<VkSampler, uint32_t>> samplers_;
     std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> pipelines_;
-    std::map<std::tuple<VkFormat, uint32_t, uint32_t>, vk::Image> msaa_temps_; // resolves' single-sample copies
 
     // submissions
     VkCommandPool pool_ = VK_NULL_HANDLE;
@@ -1173,11 +1143,6 @@ private:
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
 
     vk::Buffer mirror_, arena_, scratch_, load_scratch_;
-    // what the mirror was last given of guest memory, by page, and whether it
-    // still holds it (upload_to_mirror)
-    std::unique_ptr<uint8_t[]> mirror_shadow_ = std::make_unique_for_overwrite<uint8_t[]>(GUEST_MEMORY);
-    std::vector<uint8_t> mirror_known_ = std::vector<uint8_t>(GUEST_MEMORY / MIRROR_PAGE, 0);
-    std::deque<WriteBack> writebacks_; // oldest first
     std::deque<FrontRead> front_reads_; // oldest first
 
     // draws: set 0 (constants, system constants, vertex memory: the mirror),
@@ -1201,7 +1166,7 @@ private:
     VkPipelineLayout resolve_layout_ = VK_NULL_HANDLE, load_layout_ = VK_NULL_HANDLE;
     VkPipeline resolve_pipeline_ = VK_NULL_HANDLE, load_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool compute_pool_ = VK_NULL_HANDLE;
-    VkDescriptorSet resolve_set_ = VK_NULL_HANDLE, load_set_ = VK_NULL_HANDLE;
+    VkDescriptorSet resolve_set_ = VK_NULL_HANDLE, load_set_ = VK_NULL_HANDLE, resolve_edram_set_ = VK_NULL_HANDLE;
 
     // EDRAM: the render targets' contents move through it when another
     // target takes over its tiles (Xenia's ownership transfers); it starts
@@ -1228,9 +1193,12 @@ private:
 };
 
 Impl::~Impl() {
+    mem_.remove_watcher(watcher_);
     vkDeviceWaitIdle(dev_);
     pipeline_workers_.reset(); // before the shader modules and the cache they use
     save_pipeline_cache();
+    for (auto &[key, rb] : resolve_readbacks_)
+        for (vk::Buffer &b : rb.buffers) d_.destroy(b);
     if (pipeline_cache_) vkDestroyPipelineCache(dev_, pipeline_cache_, nullptr);
     for (Slot &s : slots_) {
         for (auto &f : s.after) f();
@@ -1253,7 +1221,6 @@ Impl::~Impl() {
         d_.destroy(t->image);
         if (t->signed_image.image) d_.destroy(t->signed_image);
     }
-    for (auto &[k, im] : msaa_temps_) d_.destroy(im);
     for (auto &im : dummy_) d_.destroy(im);
     if (dummy_sampler_) vkDestroySampler(dev_, dummy_sampler_, nullptr);
     for (VkShaderModule m : {rectangle_gs_, point_gs_})
@@ -1610,35 +1577,36 @@ bool Impl::init(std::string &error) {
         resolve_pipeline_ = compute_pipeline(RESOLVE, sizeof(RESOLVE), resolve_layout_);
         load_pipeline_ = compute_pipeline(TEXTURE_LOAD, sizeof(TEXTURE_LOAD), load_layout_);
         if (!resolve_pipeline_ || !load_pipeline_) return error = "could not make the resolve and load pipelines", false;
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pool.maxSets = 2;
+        pool.maxSets = 3;
         pool.poolSizeCount = 1;
         pool.pPoolSizes = sizes;
         if (vkCreateDescriptorPool(dev_, &pool, nullptr, &compute_pool_) != VK_SUCCESS)
             return error = "vkCreateDescriptorPool failed", false;
-        VkDescriptorSetLayout twice[2] = {compute_set_layout_, compute_set_layout_};
-        VkDescriptorSet sets[2];
+        VkDescriptorSetLayout thrice[3] = {compute_set_layout_, compute_set_layout_, compute_set_layout_};
+        VkDescriptorSet sets[3];
         VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         alloc.descriptorPool = compute_pool_;
-        alloc.descriptorSetCount = 2;
-        alloc.pSetLayouts = twice;
+        alloc.descriptorSetCount = 3;
+        alloc.pSetLayouts = thrice;
         if (vkAllocateDescriptorSets(dev_, &alloc, sets) != VK_SUCCESS) return error = "vkAllocateDescriptorSets failed", false;
-        resolve_set_ = sets[0], load_set_ = sets[1];
-        VkDescriptorBufferInfo buffers[4] = {{scratch_.buffer, 0, VK_WHOLE_SIZE},
-                                             {mirror_.buffer, 0, VK_WHOLE_SIZE},
-                                             {mirror_.buffer, 0, VK_WHOLE_SIZE},
-                                             {load_scratch_.buffer, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet writes[4] = {};
-        for (uint32_t k = 0; k < 4; k++) {
+        // the resolves' from the scratch buffer and from EDRAM (multisampled
+        // sources), and the texture loads'
+        resolve_set_ = sets[0], load_set_ = sets[1], resolve_edram_set_ = sets[2];
+        VkDescriptorBufferInfo buffers[6] = {{scratch_.buffer, 0, VK_WHOLE_SIZE},      {mirror_.buffer, 0, VK_WHOLE_SIZE},
+                                             {mirror_.buffer, 0, VK_WHOLE_SIZE},       {load_scratch_.buffer, 0, VK_WHOLE_SIZE},
+                                             {edram_.buffer, 0, VK_WHOLE_SIZE}, {mirror_.buffer, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[6] = {};
+        for (uint32_t k = 0; k < 6; k++) {
             writes[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            writes[k].dstSet = k < 2 ? resolve_set_ : load_set_;
+            writes[k].dstSet = k < 2 ? resolve_set_ : k < 4 ? load_set_ : resolve_edram_set_;
             writes[k].dstBinding = k & 1;
             writes[k].descriptorCount = 1;
             writes[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[k].pBufferInfo = &buffers[k];
         }
-        vkUpdateDescriptorSets(dev_, 4, writes, 0, nullptr);
+        vkUpdateDescriptorSets(dev_, 6, writes, 0, nullptr);
     }
 
     // the stand-ins for slots without a texture, index 0 of each table: 1x1
@@ -1719,24 +1687,6 @@ VkCommandBuffer Impl::cmd() {
     return s.cmd;
 }
 
-// What the submission's resolves wrote and no later resolve of it wrote over
-// (the pieces left of each), copied from the mirror into its read-back
-// buffers for guest memory, at the submission's end: a game resolves to the
-// same memory many times a frame (El Chavo Kart's post-processing, 15
-// resolves and 26 MB a frame, through one texture's memory), and only the
-// last bytes are guest memory's.
-void Impl::read_back_resolves(Slot &s) {
-    std::map<VkBuffer, std::vector<VkBufferCopy>> copies;
-    for (const WriteBack &w : writebacks_)
-        if (w.serial == s.serial)
-            for (const Piece &p : w.pieces) copies[p.buffer].push_back({p.start, p.offset, p.end - p.start});
-    if (copies.empty()) return;
-    full_barrier(s.cmd);
-    gpu_mark("resolves: read-backs for guest memory");
-    for (const auto &[buffer, regions] : copies)
-        vkCmdCopyBuffer(s.cmd, mirror_.buffer, buffer, uint32_t(regions.size()), regions.data());
-}
-
 void Impl::gpu_mark(uint32_t kind) {
     VkCommandBuffer c = cmd();
     Slot &s = slots_[current_];
@@ -1778,7 +1728,6 @@ void Impl::flush() {
     Slot &s = slots_[current_];
     if (!s.recording) return;
     end_pass();
-    read_back_resolves(s);
     if (s.queries && !s.marks.empty()) {
         vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.queries, uint32_t(s.marks.size()));
         s.marks.push_back(GPU_END);
@@ -1822,14 +1771,12 @@ bool Impl::finish_oldest(bool wait) {
 }
 
 // The GPU is done with the slot's submission: what waited for that goes
-// (images and buffers no longer used), and what its resolves wrote is
-// copied into guest memory.
+// (images and buffers no longer used).
 void Impl::finish(Slot &s) {
     gpu_collect(s);
     zpd_collect(s);
     for (auto &f : s.after) f();
     s.after.clear();
-    finish_writebacks(s.serial);
     done_serial_ = s.serial;
     // the front buffers it read back, to on_frame
     while (!front_reads_.empty() && front_reads_.front().serial <= s.serial) {
@@ -1959,148 +1906,79 @@ bool Impl::grow(vk::Buffer &buffer, VkDeviceSize bytes, VkBufferUsageFlags usage
 
 // ---- the mirror ----
 
-// whether a resolve wrote any of the ranges and guest memory does not have
-// it yet, or a memory export did (which guest memory never gets)
-bool Impl::pending(const std::vector<Range> &ranges) const {
-    for (const WriteBack &w : writebacks_)
-        for (const Piece &p : w.pieces)
-            for (const Range &r : ranges)
-                if (overlaps({p.start, p.end}, r)) return true;
+// whether the GPU holds any page of the ranges
+bool Impl::gpu_held(const std::vector<Range> &ranges) const {
     for (const Range &r : ranges)
-        if (exported(r)) return true;
+        if (r.second > r.first)
+            for (uint32_t p = first_page(r); p <= last_page(r); p++)
+                if (gpu_held(p)) return true;
     return false;
 }
 
-std::vector<Range> Impl::not_pending(const std::vector<Range> &ranges) const {
-    std::vector<Range> out = ranges;
-    auto take_out = [&](uint32_t start, uint32_t end) {
-        std::vector<Range> rest;
-        for (const Range &r : out) {
-            if (!overlaps({start, end}, r)) {
-                rest.push_back(r);
-                continue;
-            }
-            if (r.first < start) rest.push_back({r.first, start});
-            if (end < r.second) rest.push_back({end, r.second});
+// the ranges less the pages the GPU holds: what of them guest memory has
+std::vector<Range> Impl::cpu_parts(const std::vector<Range> &ranges) const {
+    std::vector<Range> out;
+    for (const Range &r : ranges) {
+        if (r.second <= r.first) continue;
+        uint32_t start = r.first;
+        for (uint32_t p = first_page(r); p <= last_page(r); p++) {
+            if (!gpu_held(p)) continue;
+            uint32_t page_start = p << page_shift_, page_end = page_start + (1u << page_shift_);
+            if (start < page_start) out.push_back({start, page_start});
+            start = std::min(page_end, r.second);
         }
-        out = std::move(rest);
-    };
-    for (const WriteBack &w : writebacks_)
-        for (const Piece &p : w.pieces) take_out(p.start, p.end);
-    if (!exported_pages_.empty())
-        for (const Range &r : ranges) {
-            if (r.second <= r.first) continue;
-            auto it = exported_pages_.lower_bound(r.first >> PAGE_SHIFT);
-            for (; it != exported_pages_.end() && it->first <= (r.second - 1) >> PAGE_SHIFT; ++it)
-                take_out(it->first << PAGE_SHIFT, (it->first + 1) << PAGE_SHIFT);
-        }
+        if (start < r.second) out.push_back({start, r.second});
+    }
     return out;
 }
 
-// ---- memory exports' pages ----
-
-// whether a memory export wrote any page of the range
-bool Impl::exported(const Range &r) const {
-    if (exported_pages_.empty() || r.second <= r.first) return false;
-    auto it = exported_pages_.lower_bound(r.first >> PAGE_SHIFT);
-    return it != exported_pages_.end() && it->first <= (r.second - 1) >> PAGE_SHIFT;
-}
-
-// The exported pages of the ranges whose bytes in guest memory changed since
-// the export: the CPU wrote them, and they are guest memory's again.
-void Impl::check_exported(const std::vector<Range> &ranges) {
-    for (const Range &r : ranges) {
-        if (exported_pages_.empty()) return;
-        if (r.second <= r.first) continue;
-        auto it = exported_pages_.lower_bound(r.first >> PAGE_SHIFT);
-        while (it != exported_pages_.end() && it->first <= (r.second - 1) >> PAGE_SHIFT) {
-            uint32_t page = it->first;
-            ++it;
-            if (page_hash(page) != exported_pages_[page]) drop_exported(page, page);
-        }
-    }
-}
-
-// Pages that are guest memory's again: the textures loaded from the mirror
-// over them are loaded again.
-void Impl::drop_exported(uint32_t first_page, uint32_t last_page) {
-    auto from = exported_pages_.lower_bound(first_page), to = exported_pages_.upper_bound(last_page);
-    if (from == to) return;
-    exported_pages_.erase(from, to);
-    Range dropped{first_page << PAGE_SHIFT, (last_page + 1) << PAGE_SHIFT};
-    for (auto &[key, t] : textures_) {
-        if (t->high <= dropped.first || t->low >= dropped.second) continue;
-        for (const Range &tr : t->ranges)
-            if (overlaps(dropped, tr)) t->stale = true;
-    }
-}
-
-// until guest memory has what resolves wrote over the ranges
-void Impl::wait_for(const std::vector<Range> &ranges) {
-    uint64_t serial = 0;
-    for (const WriteBack &w : writebacks_)
-        for (const Piece &p : w.pieces)
-            for (const Range &r : ranges)
-                if (overlaps({p.start, p.end}, r)) serial = std::max(serial, w.serial);
-    if (serial) wait_serial(serial);
-}
-
-// Guest memory's bytes into the mirror, before what reads them there: only
-// the pages that differ from what the mirror was last given (its shadow), as
-// Xenia's shared memory uploads only the pages its watches saw the CPU write
-// (nothing here watches the CPU's writes: the bytes are compared instead,
-// at each use). A page is given whole unless a resolve's bytes in it have
-// not reached guest memory yet (the ranges leave those out); then only the
-// ranges' bytes in it, and it stays unknown. The bytes uploaded.
-VkDeviceSize Impl::upload_to_mirror(const std::vector<Range> &ranges) {
+// Guest memory's bytes into the mirror, before what reads them there
+// (Xenia's RequestRange): the pages of the ranges that are not current,
+// watched first, then copied whole, the write count taken between the two (a
+// write after the watch numbers its page above it, so the copy is seen to be
+// old). Pages the GPU holds are current and keep its bytes. The bytes
+// uploaded.
+VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
     if (ranges.empty()) return 0;
-    traced(ranges);
-    // what resolves wrote that guest memory does not have yet
-    std::vector<Range> held;
-    for (const WriteBack &w : writebacks_)
-        for (const Piece &p : w.pieces) held.push_back({p.start, p.end});
-    auto holds = [&](uint32_t start, uint32_t end) {
-        for (const Range &h : held)
-            if (h.first < end && start < h.second) return true;
-        return false;
-    };
-    std::vector<Range> uploads;
-    auto add = [&](uint32_t start, uint32_t end) {
-        if (!uploads.empty() && uploads.back().second >= start)
-            uploads.back().second = std::max(uploads.back().second, end);
-        else
-            uploads.push_back({start, end});
-    };
-    const uint8_t *memory = memory_.data();
-    for (auto [start, end] : ranges) {
-        for (uint32_t page = start & ~(MIRROR_PAGE - 1); page < end; page += MIRROR_PAGE) {
-            uint32_t page_end = page + MIRROR_PAGE;
-            uint8_t &known = mirror_known_[page / MIRROR_PAGE];
-            if (!held.empty() && holds(page, page_end)) {
-                add(std::max(start, page), std::min(end, page_end));
-                known = 0;
-                continue;
-            }
-            if (!uploads.empty() && uploads.back().second >= page_end) continue; // given already
-            if (known && std::memcmp(memory + page, mirror_shadow_.get() + page, MIRROR_PAGE) == 0) continue;
-            add(page, page_end);
-            known = 1;
+    traced(cpu_parts(ranges));
+    // runs of pages to give, [first, end); a page taken is marked current
+    // (UINT32_MAX) until the count is known, so ranges sharing it give it once
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    for (const Range &r : ranges) {
+        if (r.second <= r.first) continue;
+        for (uint32_t p = first_page(r); p <= last_page(r); p++) {
+            if (current(p)) continue;
+            mirror_at_[p] = UINT32_MAX;
+            if (!runs.empty() && runs.back().second == p)
+                runs.back().second++;
+            else
+                runs.push_back({p, p + 1});
         }
     }
+    if (runs.empty()) return 0;
+    for (auto [first, end] : runs) mem_.watch(first << page_shift_, (end - first) << page_shift_);
+    uint32_t count = mem_.write_count();
     VkDeviceSize total = 0;
-    for (auto [start, end] : uploads) total += end - start;
-    if (!total) return 0;
+    for (auto [first, end] : runs) total += VkDeviceSize(end - first) << page_shift_;
     VkBuffer from;
     VkDeviceSize at;
     uint8_t *data = staging(total, from, at);
-    if (!data) return 0;
+    if (!data) {
+        for (auto [first, end] : runs) std::fill(mirror_at_.begin() + first, mirror_at_.begin() + end, 0u);
+        return 0;
+    }
     std::vector<VkBufferCopy> copies;
     VkDeviceSize offset = 0;
-    for (auto [start, end] : uploads) {
-        std::memcpy(data + offset, memory + start, end - start);
-        std::memcpy(mirror_shadow_.get() + start, memory + start, end - start);
-        copies.push_back({at + offset, start, end - start});
-        offset += end - start;
+    for (auto [first, end] : runs) {
+        uint32_t start = first << page_shift_;
+        VkDeviceSize bytes = VkDeviceSize(end - first) << page_shift_;
+        std::memcpy(data + offset, memory_.data() + start, bytes);
+        copies.push_back({at + offset, start, bytes});
+        offset += bytes;
+        for (uint32_t p = first; p < end; p++) {
+            mirror_at_[p] = count;
+            set_gpu_page(p, false);
+        }
     }
     VkCommandBuffer c = outside();
     gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
@@ -2108,37 +1986,60 @@ VkDeviceSize Impl::upload_to_mirror(const std::vector<Range> &ranges) {
     return total;
 }
 
-// The GPU wrote the ranges in the mirror (a resolve): their pages no longer
-// hold what the shadow says.
-void Impl::mirror_written(const std::vector<Range> &ranges) {
-    for (auto [start, end] : ranges)
-        for (uint32_t page = start / MIRROR_PAGE; page < (end + MIRROR_PAGE - 1) / MIRROR_PAGE; page++)
-            mirror_known_[page] = 0;
+// The GPU wrote the ranges in the mirror (a resolve, a memory export; Xenia's
+// RangeWrittenByGpu): their pages hold what guest memory does not, current
+// until the CPU writes them, so they are watched. What else those pages hold
+// was made current before (request).
+void Impl::gpu_written(const std::vector<Range> &ranges) {
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    for (const Range &r : ranges) {
+        if (r.second <= r.first) continue;
+        uint32_t first = first_page(r), end = last_page(r) + 1;
+        if (!runs.empty() && runs.back().second >= first)
+            runs.back().second = std::max(runs.back().second, end);
+        else
+            runs.push_back({first, end});
+    }
+    for (auto [first, end] : runs) mem_.watch(first << page_shift_, (end - first) << page_shift_);
+    uint32_t count = mem_.write_count();
+    for (auto [first, end] : runs)
+        for (uint32_t p = first; p < end; p++) {
+            mirror_at_[p] = count;
+            set_gpu_page(p, true);
+        }
 }
 
-// The submissions up to serial are done: what their resolves wrote goes into
-// guest memory, and the textures loaded from it are checked by hash again.
-void Impl::finish_writebacks(uint64_t serial) {
-    if (writebacks_.empty() || writebacks_.front().serial > serial) return;
-    Timer timer(report_.writeback_seconds);
-    while (!writebacks_.empty() && writebacks_.front().serial <= serial) {
-        WriteBack w = std::move(writebacks_.front());
-        writebacks_.pop_front();
-        for (const Piece &p : w.pieces) {
-            std::memcpy(memory_.data() + p.start, p.from, p.end - p.start);
-            report_.writeback_bytes += p.end - p.start;
-            if (trace_) trace_->gpu_wrote(p.start, p.end - p.start);
-        }
+// Whether a texture's memory is unwritten since it was last known to be: no
+// page of it numbered above its count (one read of the count when nothing
+// was written anywhere since).
+bool Impl::unwritten(Texture &t) {
+    uint32_t count = mem_.write_count();
+    if (count == t.checked) return true;
+    for (const Range &r : t.ranges) {
+        if (r.second <= r.first) continue;
+        for (uint32_t p = first_page(r); p <= last_page(r); p++)
+            if (stamps_[p].load(std::memory_order_acquire) > t.checked) return false;
     }
-    for (auto it = pending_textures_.begin(); it != pending_textures_.end();) {
-        Texture *t = *it;
-        if (pending(t->ranges)) {
-            ++it;
-            continue;
-        }
-        t->pending = false, t->rehash = true;
-        it = pending_textures_.erase(it);
+    t.checked = count;
+    return true;
+}
+
+// How far around a written page the watches may go (Xenia's
+// SharedMemory::MemoryInvalidationCallback, not exact): within the 64 pages
+// around it, short of the nearest page the GPU holds, which a write would
+// otherwise take back from the mirror. Called in the fault handler, on the
+// writing thread: it reads the GPU's pages without the renderer's lock.
+std::pair<uint32_t, uint32_t> Impl::watch_bounds(void *self, uint32_t first, uint32_t last) {
+    const Impl &r = *static_cast<const Impl *>(self);
+    if (first & 63) {
+        uint64_t below = r.gpu_pages_[first >> 6].load(std::memory_order_relaxed) & ((1ull << (first & 63)) - 1);
+        first = (first & ~63u) + uint32_t(64 - std::countl_zero(below));
     }
+    if ((last & 63) != 63) {
+        uint64_t above = r.gpu_pages_[last >> 6].load(std::memory_order_relaxed) & ~((2ull << (last & 63)) - 1);
+        last = (last & ~63u) + uint32_t(std::max(std::countr_zero(above), 1) - 1);
+    }
+    return {first, last};
 }
 
 // ---- memexport ----
@@ -2202,17 +2103,13 @@ void Impl::export_ranges(const Shader &s, uint32_t stage, std::vector<Range> &ra
     ranges = std::move(merged);
 }
 
-// After the draw: the streams' pages are the GPU's, each with its hash in
-// guest memory; the textures over them loaded again at their next use. The
-// pass ends, so what reads the mirror next comes after a barrier.
+// After the draw: the streams' pages are the GPU's until the CPU writes
+// them; the textures over them loaded again at their next use. The pass
+// ends, so what reads the mirror next comes after a barrier.
 void Impl::end_export(const std::vector<Range> &pages) {
     if (pages.empty()) return;
     end_pass();
-    // the shaders wrote the mirror there: its shadow no longer knows those
-    // pages (draws reading vertex data from the mirror upload by the shadow)
-    mirror_written(pages);
-    for (auto [start, end] : pages)
-        for (uint32_t page = start >> PAGE_SHIFT; page < end >> PAGE_SHIFT; page++) exported_pages_[page] = page_hash(page);
+    gpu_written(pages);
     for (auto &[key, t] : textures_) {
         if (t->high <= pages.front().first || t->low >= pages.back().second) continue;
         for (const Range &r : pages)
@@ -2504,21 +2401,26 @@ bool Impl::snapshot_edram(std::vector<uint8_t> &out) {
     return true;
 }
 
-// The pages memory exports wrote and the CPU has not since, read back from
-// the mirror, runs of pages together: what a trace records as it begins
-// (Xenia's trace downloads the ranges its GPU wrote)
+// The pages the GPU holds (what resolves and memory exports wrote and the
+// CPU has not written since), read back from the mirror, runs of pages
+// together: what a trace records as it begins (Xenia's trace downloads the
+// ranges its GPU wrote, PrepareForTraceDownload)
 void Impl::gpu_memory(std::vector<std::pair<uint32_t, std::vector<uint8_t>>> &out) {
     out.clear();
     Call call(*this, nullptr);
-    if (!call || exported_pages_.empty()) return;
-    std::vector<Range> pages;
-    for (auto [page, hash] : exported_pages_) pages.push_back({page << PAGE_SHIFT, (page + 1) << PAGE_SHIFT});
-    check_exported(pages);
+    if (!call) return;
     std::vector<Range> runs;
-    for (auto [page, hash] : exported_pages_) {
-        uint32_t start = page << PAGE_SHIFT, end = (page + 1) << PAGE_SHIFT;
-        if (!runs.empty() && runs.back().second == start) runs.back().second = end;
-        else runs.push_back({start, end});
+    for (uint32_t page = 0; page < uint32_t(mirror_at_.size()); page++) {
+        if ((page & 63) == 0 && !gpu_pages_[page >> 6].load(std::memory_order_relaxed)) {
+            page += 63;
+            continue;
+        }
+        if (!gpu_held(page)) continue;
+        uint32_t start = page << page_shift_, end = (page + 1) << page_shift_;
+        if (!runs.empty() && runs.back().second == start)
+            runs.back().second = end;
+        else
+            runs.push_back({start, end});
     }
     VkDeviceSize total = 0;
     for (auto [start, end] : runs) total += end - start;
@@ -2743,33 +2645,28 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
 }
 
 // A texture by its fetch constant, loaded again when the memory it came from
-// is not what it was: from guest memory on the CPU, or from the mirror on
-// the GPU when a resolve wrote some of it and guest memory does not have the
-// bytes yet. Loaded again, it keeps its image and its place in the table.
+// was written since (its pages' watches, as Xenia's texture cache drops a
+// texture when a watch on its pages fires; resolves and memory exports over
+// it mark it at once): from guest memory on the CPU, or from the mirror on
+// the GPU when the GPU holds some of it. Loaded again, it keeps its image and
+// its place in the table.
 Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     std::array<uint32_t, 6> key;
     std::copy(fetch, fetch + 6, key.begin());
     auto it = textures_.find(key);
     Texture *t = it == textures_.end() ? nullptr : it->second.get();
-    // loaded from exported pages the CPU has written since: loaded again
-    if (t && t->pending && !exported_pages_.empty()) check_exported(t->ranges);
     if (t && !t->stale) {
         bool same;
-        Timer timer(report_.check_seconds);
-        if (t->pending) {
-            // loaded from the mirror: the parts guest memory gave it are
-            // checked by hash all the same (a memory export's pages keep a
-            // texture pending for good), and a trace gets them
-            std::vector<Range> guest = not_pending(t->ranges);
-            same = hash_ranges(guest) == t->hash;
-            if (same) traced(guest);
-        } else {
-            uint64_t hash = hash_ranges(t->ranges);
-            if (t->rehash) t->hash = hash, t->rehash = false;
-            same = hash == t->hash;
-            if (same) traced(t->ranges);
+        {
+            Timer timer(report_.check_seconds);
+            same = unwritten(*t);
         }
-        if (same) return t;
+        if (same) {
+            // a trace gets what guest memory gave it (a replay makes the
+            // GPU's parts with its own resolves and exports)
+            traced(t->gpu ? cpu_parts(t->ranges) : t->ranges);
+            return t;
+        }
     }
     if (t) t->stale = true; // until it is loaded again
 
@@ -2801,16 +2698,21 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     else if (separate)
         signed_format =
             signed_plan.snorm ? snorm_of(vk_format_of(signed_plan.format)) : vk_format_of(signed_plan.format);
-    check_exported(ranges);
-    // over memory a resolve wrote (or a memory export): loaded on the GPU from
-    // the mirror; the DXT formats a host without BC holds decompressed are
-    // decompressed on the GPU too, from guest memory put into the mirror
-    bool mirror = pending(ranges);
+    // over pages the GPU holds (a resolve's, a memory export's): loaded on the
+    // GPU from the mirror; the DXT formats a host without BC holds
+    // decompressed are decompressed on the GPU too, from guest memory put into
+    // the mirror
+    bool mirror = gpu_held(ranges);
     bool gpu = mirror || (texture::is_compressed(info.host) && !texture::is_compressed(plan.format));
+    // the write count before anything is watched or read: a write after it
+    // that the load may have missed numbers a page above it
+    uint32_t checked = mem_.write_count();
 
     texture::Image image, signed_image;
     if (!gpu) {
         Timer decoding(report_.decode_seconds);
+        // decoded from guest memory, watched first
+        for (auto [start, end] : ranges) mem_.watch(start, end - start);
         traced(ranges);
         if (!texture::decode(info, memory_, image, why, support_)) return nullptr;
         if (separate && !texture::decode(info, memory_, signed_image, why, support_, true)) return nullptr;
@@ -2916,7 +2818,6 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     t->ranges = std::move(ranges);
     t->low = UINT32_MAX, t->high = 0;
     for (auto [start, end] : t->ranges) t->low = std::min(t->low, start), t->high = std::max(t->high, end);
-    t->rehash = false;
     if (gpu) {
         if (!gpu_load(*t, t->image, plan, fresh, true)) return nullptr;
         if (separate && !gpu_load(*t, t->signed_image, signed_plan, fresh, false)) return nullptr;
@@ -2924,16 +2825,8 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         if (!cpu_upload(t->image, image, fresh)) return nullptr;
         if (separate && !cpu_upload(t->signed_image, signed_image, fresh)) return nullptr;
     }
-    if (mirror) {
-        // the hash of what guest memory gave it (the parts the mirror holds
-        // nothing newer of)
-        t->pending = true, t->hash = hash_ranges(not_pending(t->ranges));
-        pending_textures_.insert(t);
-    } else {
-        if (t->pending) pending_textures_.erase(t);
-        t->pending = false;
-        t->hash = hash_ranges(t->ranges);
-    }
+    t->checked = checked;
+    t->gpu = mirror;
     t->stale = false;
     report_.textures++;
     if (options_.verbose)
@@ -3004,7 +2897,7 @@ bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &pla
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!grow(load_scratch_, std::max<VkDeviceSize>(total, 16), usage, load_set_, 1)) return false;
-    if (upload) upload_to_mirror(not_pending(t.ranges));
+    if (upload) request(t.ranges);
     VkCommandBuffer c = outside();
     gpu_mark("textures: loads on the GPU (texture_load)");
     if (fresh) begin_image(c, image.image, VK_IMAGE_ASPECT_COLOR_BIT, image.levels, image.layers);
@@ -3759,9 +3652,9 @@ void Impl::draw(const gpu::Draw &d) {
     // the vertex data: the ranges of the vertex fetch constants the shaders
     // use (address and size, as Xenia's IssueDraw requests them), merged,
     // read from the mirror in device memory as Xenia's shaders read its
-    // shared memory, guest memory's bytes put there where they changed
-    // (upload_to_mirror) and where a resolve or an export has not written
-    // newer ones. (Read from host memory, the arena's copies, they made the
+    // shared memory, guest memory's bytes put there where the CPU wrote them
+    // since (request) and where a resolve or an export has not written newer
+    // ones. (Read from host memory, the arena's copies, they made the
     // scene's vertex shaders wait on the bus: 6.7 ms of El Chavo Kart's race
     // frame.)
     struct VertexSlot {
@@ -3794,15 +3687,12 @@ void Impl::draw(const gpu::Draw &d) {
                 vertex_ranges.push_back(r);
         }
     }
-    // exported pages the CPU has written since are guest memory's again
-    check_exported(vertex_ranges);
-    check_exported(exported);
     {
         Timer timer(report_.vertex_seconds);
-        report_.vertex_bytes += upload_to_mirror(not_pending(vertex_ranges));
+        report_.vertex_bytes += request(vertex_ranges);
         // guest memory's bytes under the streams' pages, where the mirror has
         // nothing newer (Xenia's RequestRange of each stream)
-        report_.vertex_bytes += upload_to_mirror(not_pending(exported));
+        report_.vertex_bytes += request(exported);
     }
     if (!fatal_.empty()) return;
 
@@ -3976,14 +3866,10 @@ void Impl::resolve() {
                      info.clear_depth ? ", clear depth" : "");
 
     if (info.copy && w && h) {
-        if (info.depth && info.msaa) {
-            approximate("MSAA depth resolves (not done)");
-        } else {
-            resolve::Info clipped = info;
-            clipped.x = x, clipped.y = y, clipped.width = w, clipped.height = h;
-            gpu_resolve(clipped, *source);
-            if (!fatal_.empty()) return;
-        }
+        resolve::Info clipped = info;
+        clipped.x = x, clipped.y = y, clipped.width = w, clipped.height = h;
+        gpu_resolve(clipped, *source);
+        if (!fatal_.empty()) return;
     }
 
     // the clears, after the copy, over the same rectangle
@@ -4073,10 +3959,10 @@ void Impl::resolve() {
 // The copy on the GPU: the rectangle (resolved to one sample per pixel when
 // multisampled) copied into a scratch buffer as the host keeps it, then
 // written into the mirror as the destination says (resolve.comp, resolve.cpp's
-// write); the partly written tiles at its edges keep guest memory's bytes
-// (put into the mirror first, unless the mirror holds newer ones). What it
-// wrote is copied into a read-back buffer for guest memory, which gets it
-// once the GPU is done (finish_writebacks); textures over it are loaded again.
+// write); what of its pages it does not write keeps guest memory's bytes
+// (made current in the mirror first, Xenia's RequestRange of the extent).
+// Its pages are then the GPU's (gpu_written); textures over it are loaded
+// again; guest memory gets the bytes as readback_resolve says.
 void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     std::vector<Range> written, partial;
     if (!resolve::destination_ranges(info, written, partial)) {
@@ -4084,6 +3970,25 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         return;
     }
     if (written.empty()) return;
+    // the pages the copy does not write whole: those with a partial tile, and
+    // those a written run starts or ends inside
+    std::vector<Range> keep = partial;
+    {
+        std::vector<Range> runs = written;
+        std::sort(runs.begin(), runs.end());
+        std::vector<Range> merged;
+        for (const Range &r : runs) {
+            if (!merged.empty() && r.first <= merged.back().second)
+                merged.back().second = std::max(merged.back().second, r.second);
+            else
+                merged.push_back(r);
+        }
+        uint32_t mask = (1u << page_shift_) - 1;
+        for (const Range &r : merged) {
+            if (r.first & mask) keep.push_back({r.first, r.first + 1});
+            if (r.second & mask) keep.push_back({r.second - 1, r.second});
+        }
+    }
     uint32_t w = info.width, h = info.height;
     uint32_t texel = info.depth ? 4 : texture::bytes_per_block(source.host);
     if (!texel) {
@@ -4092,57 +3997,41 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     }
     VkDeviceSize pixel_bytes = VkDeviceSize(w) * h * texel;
     VkDeviceSize stencil_bytes = info.depth ? (VkDeviceSize(w) * h + 3) & ~VkDeviceSize(3) : 0;
+    // a multisampled source is read from EDRAM, its samples as the guest
+    // keeps them, as Xenia's resolve shaders read them (the sample or the
+    // average RB_COPY_CONTROL selects; depth one sample): the rectangle's
+    // tiles stored there first by the target, which keeps them
+    const bool from_edram = info.msaa != 0;
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (!grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
-    upload_to_mirror(not_pending(partial));
-    VkDeviceSize back_bytes = 0;
-    for (auto [start, end] : written) back_bytes += end - start;
-    VkBuffer back;
-    VkDeviceSize back_at;
-    uint8_t *back_data = readback(back_bytes, back, back_at);
-    if (!back_data) return;
+    if (!from_edram && !grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
+    request(keep);
 
-    VkCommandBuffer c = outside();
-    gpu_mark("resolves: copies");
-    VkImage from = source.image.image;
-    VkOffset3D at{int32_t(info.x), int32_t(info.y), 0};
-    if (!info.depth && info.msaa) {
-        // a single-sample copy of the rectangle, kept for the next resolves
-        // of its size and format
-        auto key = std::make_tuple(source.image.format, w, h);
-        vk::Image &temp = msaa_temps_[key];
-        if (!temp.image) {
-            temp = d_.create_image(VK_IMAGE_TYPE_2D, source.image.format, {w, h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
-                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-            if (!temp.image) {
-                fatal_ = "could not make a resolve's single-sample image";
-                return;
-            }
-            begin_image(c, temp.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    VkCommandBuffer c;
+    if (from_edram) {
+        std::vector<uint32_t> tiles;
+        for (uint32_t row = info.y / source.tile_height; row <= (info.y + h - 1) / source.tile_height; row++)
+            for (uint32_t column = info.x / source.tile_width; column <= (info.x + w - 1) / source.tile_width; column++)
+                tiles.push_back((source.base + row * source.pitch_tiles + column) % EDRAM_TILES);
+        if (!edram_store(&source, tiles)) return;
+        c = outside();
+        gpu_mark("resolves: copies");
+    } else {
+        c = outside();
+        gpu_mark("resolves: copies");
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VkImageAspectFlags(info.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
+                                 0, 0, 1};
+        copy.imageOffset = {int32_t(info.x), int32_t(info.y), 0};
+        copy.imageExtent = {w, h, 1};
+        vkCmdCopyImageToBuffer(c, source.image.image, VK_IMAGE_LAYOUT_GENERAL, scratch_.buffer, 1, &copy);
+        if (info.depth) {
+            copy.bufferOffset = pixel_bytes;
+            copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+            vkCmdCopyImageToBuffer(c, source.image.image, VK_IMAGE_LAYOUT_GENERAL, scratch_.buffer, 1, &copy);
         }
-        uint32_t select = (regs_[r::RB_COPY_CONTROL] >> 4) & 7;
-        if (select != 6 && !(select == 4 && info.msaa == 1)) approximate("resolves of one MSAA sample, averaged");
-        VkImageResolve region{};
-        region.srcSubresource = region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.srcOffset = at;
-        region.extent = {w, h, 1};
-        vkCmdResolveImage(c, from, VK_IMAGE_LAYOUT_GENERAL, temp.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
         full_barrier(c);
-        from = temp.image;
-        at = {0, 0, 0};
     }
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VkImageAspectFlags(info.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
-    copy.imageOffset = at;
-    copy.imageExtent = {w, h, 1};
-    vkCmdCopyImageToBuffer(c, from, VK_IMAGE_LAYOUT_GENERAL, scratch_.buffer, 1, &copy);
-    if (info.depth) {
-        copy.bufferOffset = pixel_bytes;
-        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-        vkCmdCopyImageToBuffer(c, from, VK_IMAGE_LAYOUT_GENERAL, scratch_.buffer, 1, &copy);
-    }
-    full_barrier(c);
 
     // the destination's words, as resolve.cpp's write makes them
     ResolveConstants p{};
@@ -4162,32 +4051,119 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     p.dest_log2_bytes = uint32_t(std::countr_zero(texture::format_block(info.dest_format).bytes));
     p.dest_endian = info.dest_endian, p.dest_number = info.dest_number, p.dest_swap = info.dest_swap;
     p.exp_factor = std::ldexp(1.0f, info.dest_exp_bias);
+    if (from_edram) {
+        p.edram = 1;
+        p.edram_base = source.base, p.edram_pitch = source.pitch_tiles, p.msaa = source.msaa;
+        p.ints_log2 = source.wide ? 1 : 0;
+        p.src_x = info.x, p.src_y = info.y;
+        p.first_sample = resolve::first_sample(info.sample_select);
+        p.samples = resolve::sample_count(info.sample_select);
+    }
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_pipeline_);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 1, &resolve_set_, 0, nullptr);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 1,
+                            from_edram ? &resolve_edram_set_ : &resolve_set_, 0, nullptr);
     vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
     full_barrier(c);
 
-    // for guest memory, once the GPU is done: read back at the submission's
-    // end (read_back_resolves), what no later resolve wrote over
-    WriteBack wb;
-    wb.serial = slots_[current_].serial;
-    VkDeviceSize offset = 0;
-    for (auto [start, end] : written) {
-        wb.pieces.push_back({start, end, back_data + offset, back, back_at + offset});
-        offset += end - start;
-    }
-    // what earlier resolves wrote there will not reach guest memory: this
-    // one's bytes will
-    for (WriteBack &older : writebacks_)
-        for (auto [start, end] : written) cut(older.pieces, start, end);
-    writebacks_.push_back(std::move(wb));
-    mirror_written(written);
+    gpu_written(written);
     for (auto &[key, t] : textures_) {
         if (t->high <= written.front().first || t->low >= written.back().second) continue;
         for (const Range &r : written)
             for (const Range &tr : t->ranges)
                 if (overlaps(r, tr)) t->stale = true;
+    }
+    if (options_.readback_resolve != ReadbackResolve::none) read_back_resolve(written);
+}
+
+// Guest memory given what a resolve wrote (Xenia's
+// IssueCopy_ReadbackResolvePath, readback_resolve fast or full), through the
+// physical view, which no watch sees: the mirror keeps the pages as the GPU's.
+// full: copied from the mirror and waited for, at once. fast: copied into
+// one of the resolve's two read-back buffers (by address and length, as
+// Xenia keys them), and guest memory given the other, which the same
+// resolve filled the frame before (the first time, this one's, waited for).
+// Where Xenia differs: it copies the extent from the resolve's first byte to
+// its last, the tiles between included, where only the written ranges are
+// copied here; and fast reads the other buffer without waiting, which may
+// still be in flight on the GPU, where it is waited for here (a frame old,
+// it is done).
+void Impl::read_back_resolve(const std::vector<Range> &written) {
+    uint32_t first = written.front().first, last = written.front().second;
+    for (const Range &r : written) first = std::min(first, r.first), last = std::max(last, r.second);
+    VkDeviceSize extent = last - first;
+    VkBuffer into = VK_NULL_HANDLE;
+    VkDeviceSize into_at = 0;
+    const uint8_t *data = nullptr;
+    ResolveReadback *rb = nullptr;
+    if (options_.readback_resolve == ReadbackResolve::full) {
+        uint8_t *mapped = readback(extent, into, into_at);
+        if (!mapped) return;
+        data = mapped;
+    } else {
+        rb = &resolve_readbacks_[uint64_t(first) << 32 | uint32_t(extent)];
+        rb->last_used = report_.swaps;
+        vk::Buffer &b = rb->buffers[rb->current];
+        if (b.size < extent) {
+            if (b.buffer) {
+                vk::Buffer old = b;
+                cmd();
+                slots_[current_].after.push_back([this, old]() mutable { d_.destroy(old); });
+            }
+            b = d_.create_buffer(std::max<VkDeviceSize>(extent, 4096), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
+            if (!b.buffer) {
+                fatal_ = "could not make a resolve's read-back buffer";
+                return;
+            }
+        }
+        into = b.buffer;
+    }
+    std::vector<VkBufferCopy> copies;
+    for (auto [start, end] : written) copies.push_back({start, into_at + (start - first), end - start});
+    VkCommandBuffer c = outside();
+    gpu_mark("resolves: read-backs for guest memory");
+    vkCmdCopyBuffer(c, mirror_.buffer, into, uint32_t(copies.size()), copies.data());
+    if (rb) {
+        rb->serials[rb->current] = slots_[current_].serial;
+        uint32_t other = rb->current ^ 1;
+        if (rb->buffers[other].size < extent) {
+            // nothing from the frame before: this one's, waited for
+            other = rb->current;
+            sync();
+        } else if (rb->serials[other] > done_serial_) {
+            wait_serial(rb->serials[other]);
+        }
+        data = static_cast<const uint8_t *>(rb->buffers[other].mapped);
+    } else {
+        sync();
+    }
+    if (!fatal_.empty() || !data) return;
+    Timer timer(report_.writeback_seconds);
+    for (auto [start, end] : written) {
+        std::memcpy(memory_.data() + start, data + (start - first), end - start);
+        report_.writeback_bytes += end - start;
+        if (trace_) trace_->gpu_wrote(start, end - start);
+    }
+}
+
+// A frame begins (a swap): the fast read-backs' buffers trade places, and
+// those of resolves not seen for a while go (Xenia's BeginSubmission on
+// opening a frame, with its eviction above 64 pairs)
+void Impl::next_readback_frame() {
+    if (resolve_readbacks_.empty()) return;
+    for (auto &[key, rb] : resolve_readbacks_) rb.current ^= 1;
+    if (resolve_readbacks_.size() <= 64) return;
+    for (auto it = resolve_readbacks_.begin(); it != resolve_readbacks_.end();) {
+        if (report_.swaps > 60 && it->second.last_used < report_.swaps - 60) {
+            ResolveReadback old = it->second;
+            cmd();
+            slots_[current_].after.push_back([this, old]() mutable {
+                for (vk::Buffer &b : old.buffers) d_.destroy(b);
+            });
+            it = resolve_readbacks_.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -4225,6 +4201,7 @@ void Impl::swap() {
     flush();
     if (front.image && fatal_.empty()) options_.on_swap(front);
     poll();
+    next_readback_frame();
     // the pipeline cache written once new pipelines have settled
     if (pipelines_saved_ != report_.pipelines && report_.swaps - last_pipeline_swap_ >= 300) save_pipeline_cache();
 }
