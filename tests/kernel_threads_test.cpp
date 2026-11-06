@@ -557,6 +557,44 @@ void locks(ppc::Context &c) {
     CHECK(int32_t(K->load32(me + kthread::APC_DISABLE_COUNT)) == -1);
     ex(c, "KeLeaveCriticalRegion", {});
     CHECK(K->load32(me + kthread::APC_DISABLE_COUNT) == 0);
+
+    // the initializers leave an empty wait list, as the console's do (the oracle):
+    // both links to the list head's own address, +8 and +0xC; the spin-count
+    // form of the critical section returns its pointer
+    uint32_t block = scratch + 0x900;
+    auto empty_list = [&](uint32_t header_address) {
+        return K->load32(header_address + 8) == header_address + 8 &&
+               K->load32(header_address + 0xC) == header_address + 8;
+    };
+    std::memset(K->host(block), 0xFF, 0x100);
+    ex(c, "KeInitializeEvent", {block, 0, 1});
+    ex(c, "KeInitializeEvent", {block + 0x10, 1, 0});
+    ex(c, "KeInitializeSemaphore", {block + 0x20, 2, 5});
+    ex(c, "KeInitializeMutant", {block + 0x40, 0});
+    ex(c, "KeInitializeTimerEx", {block + 0x60, 0, 0});
+    CHECK(empty_list(block) && empty_list(block + 0x10) && empty_list(block + 0x20) && empty_list(block + 0x40) &&
+          empty_list(block + 0x60));
+    std::memset(K->host(block + 0x80), 0xFF, 0x80);
+    ex(c, "ExInitializeReadWriteLock", {block + 0x80});
+    CHECK(empty_list(block + 0x80 + 0x10) && empty_list(block + 0x80 + 0x20));
+    ex(c, "RtlInitializeCriticalSection", {block + 0xE0});
+    CHECK(empty_list(block + 0xE0));
+    std::memset(K->host(block + 0xE0), 0xFF, 0x20);
+    CHECK(ex(c, "RtlInitializeCriticalSectionAndSpinCount", {block + 0xE0, 0}) == block + 0xE0);
+    CHECK(empty_list(block + 0xE0));
+    // the host objects behind them still work, found without a marker: a wait
+    // satisfied by the header's state, the signal and the count seen
+    CHECK(ex(c, "KeWaitForSingleObject", {block, 0, 0, 0, 0}) == X_STATUS_SUCCESS); // signaled notification event
+    CHECK(ex(c, "KeResetEvent", {block}) == 1);
+    CHECK(K->load32(block + 4) == 0 && empty_list(block));
+    ex(c, "KeSetEvent", {block, 0, 0});
+    CHECK(K->load32(block + 4) == 1 && empty_list(block));
+    CHECK(ex(c, "KeReleaseSemaphore", {block + 0x20, 0, 1, 0}) == 2 && K->load32(block + 0x24) == 3);
+    // an event re-initialized as another kind keeps no host object of the old
+    std::memset(K->host(block + 0x20), 0xFF, 0x10);
+    ex(c, "KeInitializeEvent", {block + 0x20, 1, 1});
+    CHECK(ex(c, "KeWaitForSingleObject", {block + 0x20, 0, 0, 0, 0}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(block + 0x24) == 0 && empty_list(block + 0x20)); // auto-reset: taken
 }
 
 void slists(ppc::Context &c) {

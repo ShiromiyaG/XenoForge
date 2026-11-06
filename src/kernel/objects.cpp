@@ -23,9 +23,18 @@ std::string lowercase(std::string s) {
     return s;
 }
 
-void stash(Kernel &k, uint32_t address, uint32_t handle) {
-    k.store32(address + header::WAIT_LIST, header::SIGNATURE);
-    k.store32(address + header::WAIT_LIST + 4, handle);
+// The header type bytes a host object of a kind can stand behind.
+bool header_matches(const Object &o, uint8_t type) {
+    switch (o.type()) {
+    case Object::Type::Event:
+        return type == uint8_t(GuestType::EventNotification) || type == uint8_t(GuestType::EventSynchronization);
+    case Object::Type::Semaphore: return type == uint8_t(GuestType::Semaphore);
+    case Object::Type::Mutant: return type == uint8_t(GuestType::Mutant);
+    case Object::Type::Timer:
+        return type == uint8_t(GuestType::TimerNotification) || type == uint8_t(GuestType::TimerSynchronization);
+    case Object::Type::Thread: return type == uint8_t(GuestType::Thread);
+    default: return false;
+    }
 }
 
 } // namespace
@@ -198,15 +207,16 @@ bool Objects::release_handle(uint32_t handle) {
     if (--slot.refs > 0) return true;
     slot = {};
     std::erase(object->handles, handle);
-    // the guest header named this handle: the next, or none (an empty wait
-    // list again, so the next use makes a new object; Xenia's
-    // UpdateNativeHandle)
-    if (object->guest && object->dispatcher() && k.load32(object->guest + header::WAIT_LIST) == header::SIGNATURE &&
-        k.load32(object->guest + header::WAIT_LIST + 4) == handle) {
-        if (!object->handles.empty())
-            stash(k, object->guest, object->handles.front());
-        else
-            list_init(k, object->guest + header::WAIT_LIST);
+    // the header's address named this handle: the next, or none (so the next
+    // use makes a new object; Xenia's UpdateNativeHandle)
+    if (object->guest && object->dispatcher()) {
+        auto it = native_handles_.find(object->guest);
+        if (it != native_handles_.end() && it->second == handle) {
+            if (!object->handles.empty())
+                it->second = object->handles.front();
+            else
+                native_handles_.erase(it);
+        }
     }
     if (!object->name.empty()) {
         std::string key = lowercase(object->name);
@@ -235,13 +245,23 @@ void Objects::set_name(Object &object, const std::string &name) {
     names_.push_back({key, object.handle()});
 }
 
-// the object whose body is at a guest address: its stash, else a search
+// The host object made for the header at a guest address, if it is still the
+// header's: of a kind the header's type byte allows. The header itself holds
+// nothing of it (an empty wait list, as the console leaves it); Xenia's marker
+// in the list's links is replaced by this table.
+Object *Objects::find_native(uint32_t address) {
+    auto it = native_handles_.find(address);
+    if (it == native_handles_.end()) return nullptr;
+    Object *o = object_in(it->second);
+    if (!o || o->guest != address || !o->dispatcher() || !header_matches(*o, k.host(address)[header::TYPE]))
+        return nullptr;
+    return o;
+}
+
+// the object whose body is at a guest address: the table's, else a search
 Object *Objects::by_guest(uint32_t address) {
     if (!address) return nullptr;
-    if (k.load32(address + header::WAIT_LIST) == header::SIGNATURE) {
-        Object *o = object_in(k.load32(address + header::WAIT_LIST + 4));
-        if (o && o->guest == address) return o;
-    }
+    if (Object *o = find_native(address)) return o;
     for (const Slot &s : slots_)
         if (s.object && s.object->guest == address) return s.object;
     return nullptr;
@@ -260,7 +280,8 @@ bool Objects::make_native(Dispatcher &d, GuestType type, uint32_t body_size) {
     k.store32(memory + object_header::OBJECT_TYPE, object_type_for(d));
     k.store16(memory + object_header::FLAGS, object_header::IS_TITLE_OBJECT);
     k.host(d.guest)[header::TYPE] = uint8_t(type);
-    stash(k, d.guest, handle);
+    list_init(k, d.guest + header::WAIT_LIST);
+    native_handles_[d.guest] = handle;
     return true;
 }
 
@@ -271,10 +292,7 @@ Ref<Dispatcher> Objects::native(uint32_t address) {
 
 Ref<Dispatcher> Objects::native_locked(uint32_t address) {
     if (!address) return {};
-    if (k.load32(address + header::WAIT_LIST) == header::SIGNATURE) {
-        Object *o = object_in(k.load32(address + header::WAIT_LIST + 4));
-        if (o && o->guest == address && o->dispatcher()) return Ref<Dispatcher>::retain(static_cast<Dispatcher *>(o));
-    }
+    if (Object *o = find_native(address)) return Ref<Dispatcher>::retain(static_cast<Dispatcher *>(o));
     // first use: what the header says it is (Xenia makes events, mutants and
     // semaphores; timers here too)
     Dispatcher *d = nullptr;
@@ -291,7 +309,7 @@ Ref<Dispatcher> Objects::native_locked(uint32_t address) {
     }
     Ref<Dispatcher> ref(d);
     d->guest = address;
-    stash(k, address, add_handle(d));
+    native_handles_[address] = add_handle(d);
     return ref;
 }
 

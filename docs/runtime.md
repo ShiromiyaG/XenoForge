@@ -145,6 +145,14 @@ lists: what the game calls is what gets written next.
   image headers, XConfig settings (Xenia's defaults, then what the title
   writes, for the kernel's life), the HAL's system management controller
   (Xenia's SMC: the DVD tray, open at start, the AV pack, temperatures).
+  Where the console's own kernel answered differently (the oracle, `xfkrnl`
+  of XenoForge-private, on system software 2.0.16202), the console wins: the
+  Unicode case mapping is the console's table (all 65536 values checked;
+  Unicode 2.1.2's simple mappings less the titlecase letters and the variant
+  forms, `tools/gen_unicode_case.py`), RtlCopyUnicodeString copies the bytes
+  it says and ends the text, RtlUnicodeStringToAnsiString makes a byte per
+  unit with the converted Length, `%lld` reads 32 bits (`%I64d` 64), and
+  KeDelayExecutionThread with a null interval is an access violation.
 - **The debug monitor** (`xbdm.cpp`): Xenia's 36 xbdm exports, a retail
   console's answers (console type -1, no debugger, the end of the module
   list). The imports bind as the other system libraries', but no xbdm.xex
@@ -174,10 +182,13 @@ one host thread, plan "Threads") comes on the same interface later.
 As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
 
 - **Handles** as Xenia's (0xF8000000 + slot * 4, -2 the current thread),
-  names case-insensitive. A dispatcher header the kernel has seen holds
-  Xenia's stash (`'XEN\0'` and the handle in its wait list), so the host
-  object is found from the guest pointer, and one the code initialized
-  itself (the XDK inlines KeInitializeEvent) gets one on first use.
+  names case-insensitive. A dispatcher header's wait list is an empty list
+  pointing at itself, as the console's own initializers leave it (Xenia
+  writes a marker, `'XEN\0'` and the handle, there; the oracle showed the
+  console does not). The host object is found from the guest pointer through
+  a table (guest address to handle, checked against the header's type byte),
+  and one the code initialized itself (the XDK inlines KeInitializeEvent)
+  gets one on first use.
 - **The dispatcher is NT's, not the host's waits**: one lock over every
   object; the signal state is the guest header's own (the game reads it,
   and what it writes there counts); a signal satisfies the waits it can,

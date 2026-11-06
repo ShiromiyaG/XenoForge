@@ -907,11 +907,25 @@ XF_EXPORT(xboxkrnl, KeEnableFpuExceptions) {
     k.host(k.load32(uint32_t(c.r[13]) + kpcr::CURRENT_THREAD))[kthread::FPU_EXCEPTIONS] = arg(k, c, 0) != 0;
 }
 
+// (mode, alertable, interval *): a null interval is not a zero wait. The
+// console's kernel reads it through the pointer (the oracle: a fault reading
+// guest address 0), which a title sees as an access violation; there is no
+// exception delivery here yet, so the call fails with that status and does
+// not wait. Xenia treats it as zero, with a TODO asking whether it should.
 XF_EXPORT(xboxkrnl, KeDelayExecutionThread) {
     uint32_t alertable = arg(k, c, 1), interval_ptr = arg(k, c, 2);
     Objects &o = objects(k);
     Thread *t = current_thread();
-    int64_t interval = interval_ptr ? int64_t(k.load64(interval_ptr)) : 0;
+    if (!interval_ptr) {
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            std::fprintf(stderr,
+                         "kernel: KeDelayExecutionThread with a null interval from 0x%08X: an access violation\n",
+                         uint32_t(c.lr));
+        });
+        return result(c, 0xC0000005 /* STATUS_ACCESS_VIOLATION */);
+    }
+    int64_t interval = int64_t(k.load64(interval_ptr));
     if (!t) return result(c, X_STATUS_SUCCESS);
     if (!interval && !(alertable && o.user_apc_pending(*t))) {
         o.scheduler->yield();

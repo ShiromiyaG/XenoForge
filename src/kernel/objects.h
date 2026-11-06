@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -71,8 +72,9 @@ enum class GuestType : uint8_t {
 // / 256), size, inserted, signal_state, wait_list
 namespace header {
 constexpr uint32_t TYPE = 0x0, ABSOLUTE = 0x1, SIGNAL_STATE = 0x4, WAIT_LIST = 0x8, SIZE = 0x10;
-// Xenia's kXObjSignature: in wait_list.flink, a host object stands behind
-// the header, its handle in wait_list.blink
+// Xenia's kXObjSignature. A dispatcher header's wait list no longer holds it
+// (the console leaves an empty list; Objects keeps the table); XAM's
+// enumerators still mark their bodies with it.
 constexpr uint32_t SIGNATURE = 0x58454E00; // 'XEN\0'
 } // namespace header
 
@@ -445,6 +447,10 @@ public:
     // GetNativeObject). nullptr for what it cannot be.
     Ref<Dispatcher> native(uint32_t address);
     Ref<Dispatcher> native_locked(uint32_t address);
+    // the host object made for the header at a guest address, if any (lock
+    // held; not retained). The header holds no pointer to it: its wait list
+    // is empty, as on the console.
+    Object *find_native(uint32_t address);
     // any object by its body's guest address (lock held; not retained)
     Object *by_guest(uint32_t address);
 
@@ -519,7 +525,8 @@ private:
     };
     std::vector<Slot> slots_;
     uint32_t free_cursor_ = 0;
-    std::vector<std::pair<std::string, uint32_t>> names_; // lowercase name, handle
+    std::vector<std::pair<std::string, uint32_t>> names_;   // lowercase name, handle
+    std::unordered_map<uint32_t, uint32_t> native_handles_; // a header's guest address, the handle of its object
     std::vector<Timer *> armed_;
     uint32_t initialize_native(Dispatcher &d, uint32_t address);
     void remove_waits(Thread &t);

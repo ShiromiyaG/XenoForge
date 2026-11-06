@@ -258,17 +258,72 @@ void strings(KernelHarness &h) {
     CHECK(h.krnl("RtlInitUnicodeString", {s, wide}) == s);
     CHECK(k.load16(s) == 6 && k.load16(s + 2) == 8 && k.load32(s + 4) == wide);
 
-    // RtlUnicodeStringToAnsiString: UTF-8; allocated, or into a buffer
+    // RtlUnicodeStringToAnsiString, as the console's (the oracle): a byte for
+    // each unit, Length the converted length; allocated, or into a buffer
     uint32_t ansi = h.alloc(8);
     CHECK(h.krnl("RtlUnicodeStringToAnsiString", {ansi, s, 1}) == 0);
-    CHECK(k.load16(ansi) == 4 && k.load16(ansi + 2) == 5 && h.read(k.load32(ansi + 4)) == "W\xC3\xA9!");
+    CHECK(k.load16(ansi) == 3 && k.load16(ansi + 2) == 4 && h.read(k.load32(ansi + 4)) == "W\xE9!");
     h.krnl("RtlFreeAnsiString", {ansi});
     CHECK(k.load32(ansi + 4) == 0);
     uint32_t buffer = h.alloc(16);
     std::memset(k.host(buffer), 'x', 16);
-    k.store16(ansi + 2, 3), k.store32(ansi + 4, buffer);
+    // too short: the length is the maximum less one, the text cut, a terminator
+    k.store16(ansi, 9), k.store16(ansi + 2, 3), k.store32(ansi + 4, buffer);
     CHECK(h.krnl("RtlUnicodeStringToAnsiString", {ansi, s, 0}) == 0x80000005);
-    CHECK(h.read(buffer) == "W\xC3");
+    CHECK(k.load16(ansi) == 2 && h.read(buffer) == "W\xE9" && k.host(buffer)[3] == 'x');
+    // fits: the length set whatever it was, a terminator after the text
+    k.store16(ansi, 9), k.store16(ansi + 2, 8);
+    CHECK(h.krnl("RtlUnicodeStringToAnsiString", {ansi, s, 0}) == 0);
+    CHECK(k.load16(ansi) == 3 && h.read(buffer) == "W\xE9!" && k.host(buffer)[4] == 'x');
+    // a maximum of 0: nothing written, the length still says what it needs
+    k.store16(ansi, 9), k.store16(ansi + 2, 0), k.store32(ansi + 4, 0);
+    CHECK(h.krnl("RtlUnicodeStringToAnsiString", {ansi, s, 0}) == 0x80000005 && k.load16(ansi) == 3);
+    // past Latin-1 a '?'
+    k.store16(ansi + 2, 8), k.store32(ansi + 4, buffer);
+    h.krnl("RtlInitUnicodeString", {s, h.wide(u"aα€ÿ")});
+    CHECK(h.krnl("RtlUnicodeStringToAnsiString", {ansi, s, 0}) == 0);
+    CHECK(h.read(buffer) == "a??\xFF");
+
+    // RtlCopyUnicodeString: the bytes it copies (at most the destination's
+    // maximum), the length, a terminator when there is room, nothing past
+    uint32_t source = h.alloc(8), destination = h.alloc(8), text16 = h.alloc(32);
+    h.krnl("RtlInitUnicodeString", {source, h.wide(u"Hello")});
+    std::memset(k.host(text16), 0xAA, 32);
+    k.store16(destination, 0), k.store16(destination + 2, 16), k.store32(destination + 4, text16);
+    h.krnl("RtlCopyUnicodeString", {destination, source});
+    CHECK(k.load16(destination) == 10 && k.load16(text16 + 8) == 'o' && k.load16(text16 + 10) == 0 &&
+          k.load16(text16 + 12) == 0xAAAA && k.host(text16)[31] == 0xAA);
+    k.store16(destination + 2, 6);
+    h.krnl("RtlCopyUnicodeString", {destination, source});
+    CHECK(k.load16(destination) == 6 && k.load16(text16 + 4) == 'l' && k.load16(text16 + 6) == 'l');
+    h.krnl("RtlCopyUnicodeString", {destination, 0});
+    CHECK(k.load16(destination) == 0);
+
+    // the case mapping of the console's table: the whole Unicode range
+    CHECK(h.krnl("RtlUpcaseUnicodeChar", {0xE9}) == 0xC9 && h.krnl("RtlUpcaseUnicodeChar", {0x3B1}) == 0x391);
+    CHECK(h.krnl("RtlUpcaseUnicodeChar", {0xFF}) == 0x178 && h.krnl("RtlUpcaseUnicodeChar", {0x430}) == 0x410);
+    CHECK(h.krnl("RtlUpcaseUnicodeChar", {0x1E9}) == 0x1E8 && h.krnl("RtlUpcaseUnicodeChar", {0xFF41}) == 0xFF21);
+    CHECK(h.krnl("RtlUpcaseUnicodeChar", {0x1C6}) == 0x1C4 && h.krnl("RtlUpcaseUnicodeChar", {0x2170}) == 0x2160);
+    CHECK(h.krnl("RtlDowncaseUnicodeChar", {0xC9}) == 0xE9 && h.krnl("RtlDowncaseUnicodeChar", {0x178}) == 0xFF);
+    CHECK(h.krnl("RtlDowncaseUnicodeChar", {0x410}) == 0x430 && h.krnl("RtlDowncaseUnicodeChar", {0xFF21}) == 0xFF41);
+    // what the console leaves alone: the titlecase digraphs, the variants, and the high bits
+    CHECK(h.krnl("RtlUpcaseUnicodeChar", {0x1C5}) == 0x1C5 && h.krnl("RtlDowncaseUnicodeChar", {0x1C5}) == 0x1C5);
+    CHECK(h.krnl("RtlUpcaseUnicodeChar", {0x131}) == 0x131 && h.krnl("RtlDowncaseUnicodeChar", {0x130}) == 0x130);
+    CHECK(h.krnl("RtlUpcaseUnicodeChar", {0x1F80}) == 0x1F80 && h.krnl("RtlDowncaseUnicodeChar", {0x1F88}) == 0x1F88);
+    CHECK(h.krnl("RtlUpcaseUnicodeChar", {0x10061}) == 0x41 && h.krnl("RtlDowncaseUnicodeChar", {0x10041}) == 0x61);
+    // the whole table as the console's kernel gave it for every value 0..0xFFFF (the oracle's sweep; 2.0.16202)
+    {
+        uint64_t up = 0xCBF29CE484222325ULL, down = up;
+        auto mix = [](uint64_t &hash, uint32_t value) {
+            for (uint32_t b : {value & 0xFF, value >> 8}) hash = (hash ^ b) * 0x100000001B3ULL;
+        };
+        for (uint32_t ch = 0; ch < 0x10000; ch++) {
+            mix(up, uint32_t(h.krnl("RtlUpcaseUnicodeChar", {ch})));
+            mix(down, uint32_t(h.krnl("RtlDowncaseUnicodeChar", {ch})));
+        }
+        CHECK(up == 0xFEFF151516F84DEAULL);
+        CHECK(down == 0x41B6B4384BE615D3ULL);
+    }
 
     // the conversions, byte for byte
     uint32_t written = h.alloc(4), out = h.alloc(32);
@@ -366,8 +421,12 @@ void printf_family(KernelHarness &h) {
     uint32_t format = h.string("%d|%5s|%-4x|%04X|%c|%%|%p|%lld|%.2f!");
     int32_t n = int32_t(h.krnl("sprintf", {buffer, format, uint64_t(int64_t(-42)), h.string("ab"), 0xAB, 0x1F, 'z',
                                            0x1234, 0x123456789ull, pi_bits}));
-    std::string expected = "-42|   ab|ab  |001F|z|%|00001234|4886718345|3.14!";
+    // (%lld reads 32 bits, as the console's: 0x23456789; %I64d reads 64)
+    std::string expected = "-42|   ab|ab  |001F|z|%|00001234|591751049|3.14!";
     CHECK(h.read(buffer) == expected && n == int32_t(expected.size()));
+    h.krnl("sprintf", {buffer, h.string("%lld|%lld|%llu|%llx|%I64d|%d"), 0x100000000ull, 0xFFFFFFFFull, 0xFFFFFFFFull,
+                       0x1FFFFFFFFull, 0x100000005ull, 7});
+    CHECK(h.read(buffer) == "0|-1|4294967295|ffffffff|4294967301|7");
     // strings: (null), precision, wide
     n = int32_t(h.krnl("sprintf", {buffer, h.string("[%s][%.3s][%S][%ls][%#x][%#o][%+d][% d]"), 0, h.string("abcdef"),
                                    h.wide(u"wide"), h.wide(u"ls"), 0x1F, 8, 5, 7}));

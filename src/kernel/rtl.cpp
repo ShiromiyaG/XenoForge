@@ -17,6 +17,12 @@
 // and the stack limits belong to the threads family. The CRC-32 table is
 // made from the polynomial's definition (Xenia writes it out); where
 // RtlImageDirectoryEntryToData differs from Xenia, it says.
+//
+// Where the console's own kernel answered differently from Xenia (the
+// oracle, XenoForge-private's xfkrnl, on system software 2.0.16202), the
+// console wins, as noted at each: the Unicode case mapping,
+// RtlCopyUnicodeString, RtlUnicodeStringToAnsiString and the formatter's
+// "%ll" (read as 32 bits; "%I64" stays 64).
 
 #include "xenoforge/kernel.h"
 
@@ -25,7 +31,6 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
-#include <cwctype>
 #include <iomanip>
 #include <iterator>
 #include <sstream>
@@ -35,7 +40,6 @@ namespace xf::kernel {
 namespace {
 
 constexpr uint32_t X_STATUS_BUFFER_OVERFLOW = 0x80000005;
-constexpr uint32_t X_STATUS_INVALID_PARAMETER_2 = 0xC00000F0;
 
 // ---- memory and strings (xboxkrnl_rtl.cc) ----
 
@@ -177,64 +181,50 @@ XF_EXPORT(xboxkrnl, RtlCopyString) {
 }
 
 XF_EXPORT(xboxkrnl, RtlCopyUnicodeString) {
-    // (the lengths are in bytes; Xenia copies twice that, as here)
+    // (destination, source): as NT's and the console's: at most the destination's
+    // maximum length in bytes (Xenia copies twice the byte count, past the
+    // buffer), the length set, and a terminator after the text when there is
+    // room for one
     uint32_t destination = arg(k, c, 0), source = arg(k, c, 1);
     if (!source) return k.store16(destination, 0);
-    uint16_t length = std::min(k.load16(destination + 2), k.load16(source));
-    if (length) std::memcpy(k.host(k.load32(destination + 4)), k.host(k.load32(source + 4)), length * 2u);
+    uint32_t maximum = k.load16(destination + 2), buffer = k.load32(destination + 4);
+    uint16_t length = uint16_t(std::min<uint32_t>(maximum, k.load16(source)));
+    if (length) std::memcpy(k.host(buffer), k.host(k.load32(source + 4)), length);
     k.store16(destination, length);
-}
-
-// xe::to_utf8 of a UTF-16 string
-std::string to_utf8(const std::u16string &s) {
-    std::string out;
-    for (size_t i = 0; i < s.size(); i++) {
-        uint32_t cp = s[i];
-        if (cp >= 0xD800 && cp < 0xDC00 && i + 1 < s.size() && s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000) {
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (s[i + 1] - 0xDC00);
-            i++;
-        } else if (cp >= 0xD800 && cp < 0xE000) {
-            cp = 0xFFFD;
-        }
-        if (cp < 0x80) {
-            out += char(cp);
-        } else if (cp < 0x800) {
-            out += char(0xC0 | cp >> 6), out += char(0x80 | (cp & 0x3F));
-        } else if (cp < 0x10000) {
-            out += char(0xE0 | cp >> 12), out += char(0x80 | ((cp >> 6) & 0x3F)), out += char(0x80 | (cp & 0x3F));
-        } else {
-            out += char(0xF0 | cp >> 18), out += char(0x80 | ((cp >> 12) & 0x3F));
-            out += char(0x80 | ((cp >> 6) & 0x3F)), out += char(0x80 | (cp & 0x3F));
-        }
-    }
-    return out;
+    if (length < maximum) k.store16(buffer + length, 0);
 }
 
 XF_EXPORT(xboxkrnl, RtlUnicodeStringToAnsiString) {
-    // (ANSI_STRING *destination, UNICODE_STRING *source, allocate): UTF-8
+    // (ANSI_STRING *destination, UNICODE_STRING *source, allocate): as the
+    // console's, which is NT's. Each UTF-16 unit becomes one byte, the units
+    // past Latin-1 a '?' (RtlUnicodeToMultiByteN's; Xenia writes UTF-8). The
+    // destination's Length is the converted length, cut to its maximum less
+    // one when the buffer is too short (BUFFER_OVERFLOW; a maximum of 0
+    // writes nothing), a terminator after the text.
     uint32_t destination = arg(k, c, 0), source = arg(k, c, 1), allocate = arg(k, c, 2);
-    std::u16string unicode;
     uint32_t chars = k.load16(source) / 2, pointer = k.load32(source + 4);
-    for (uint32_t i = 0; i < chars; i++) unicode += char16_t(k.load16(pointer + 2 * i));
-    std::string ansi = to_utf8(unicode);
-    if (ansi.size() > 0xFFFF - 1) return result(c, X_STATUS_INVALID_PARAMETER_2);
-    uint32_t status = X_STATUS_SUCCESS;
+    uint32_t length = chars, status = X_STATUS_SUCCESS, buffer;
     if (allocate) {
-        uint32_t buffer = k.memory().system_alloc(uint32_t(ansi.size() + 1));
-        std::memcpy(k.host(buffer), ansi.c_str(), ansi.size() + 1);
-        set_string(k, destination, uint16_t(ansi.size()), uint16_t(ansi.size() + 1), buffer);
+        buffer = k.memory().system_alloc(length + 1);
+        if (!buffer) return result(c, X_STATUS_NO_MEMORY);
+        set_string(k, destination, uint16_t(length), uint16_t(length + 1), buffer);
     } else {
-        uint32_t capacity = k.load16(destination + 2);
-        uint8_t *buffer = k.host(k.load32(destination + 4));
-        if (capacity < ansi.size() + 1) {
-            // what fits
+        uint32_t maximum = k.load16(destination + 2);
+        buffer = k.load32(destination + 4);
+        if (length >= maximum) {
+            k.store16(destination, uint16_t(length));
+            if (!maximum) return result(c, X_STATUS_BUFFER_OVERFLOW);
+            length = maximum - 1;
             status = X_STATUS_BUFFER_OVERFLOW;
-            if (capacity) std::memcpy(buffer, ansi.data(), capacity - 1);
-        } else {
-            std::memcpy(buffer, ansi.c_str(), ansi.size() + 1);
         }
-        if (capacity) buffer[capacity - 1] = 0;
+        k.store16(destination, uint16_t(length));
     }
+    uint8_t *text = k.host(buffer);
+    for (uint32_t i = 0; i < length; i++) {
+        uint16_t ch = k.load16(pointer + 2 * i);
+        text[i] = ch < 256 ? uint8_t(ch) : '?';
+    }
+    text[length] = 0;
     result(c, status);
 }
 
@@ -263,8 +253,33 @@ XF_EXPORT(xboxkrnl, RtlUnicodeToMultiByteN) {
     result(c, 0);
 }
 
-XF_EXPORT(xboxkrnl, RtlUpcaseUnicodeChar) { result(c, uint32_t(std::towupper(wint_t(arg(k, c, 0))))); }
-XF_EXPORT(xboxkrnl, RtlDowncaseUnicodeChar) { result(c, uint32_t(std::towlower(wint_t(arg(k, c, 0) & 0xFFFF)))); }
+// The console's case table (Unicode 2.1.2's simple mappings of the Basic
+// Multilingual Plane, as the console's kernel has them: tools/gen_unicode_case.py
+// says what changed and why). Xenia maps with the host's towupper/towlower.
+struct CaseRun {
+    uint16_t first, last;
+    uint8_t stride;
+    int32_t delta;
+};
+
+#include "unicode_case.inc"
+
+uint16_t map_case(const CaseRun *begin, const CaseRun *end, uint16_t ch) {
+    // the last run that starts at or before ch (the runs are sorted and apart)
+    const CaseRun *run =
+        std::upper_bound(begin, end, ch, [](uint16_t value, const CaseRun &r) { return value < r.first; });
+    if (run == begin) return ch;
+    --run;
+    if (ch > run->last || (ch - run->first) % run->stride) return ch;
+    return uint16_t(ch + run->delta);
+}
+
+XF_EXPORT(xboxkrnl, RtlUpcaseUnicodeChar) {
+    result(c, map_case(std::begin(upcase_runs), std::end(upcase_runs), uint16_t(arg(k, c, 0))));
+}
+XF_EXPORT(xboxkrnl, RtlDowncaseUnicodeChar) {
+    result(c, map_case(std::begin(downcase_runs), std::end(downcase_runs), uint16_t(arg(k, c, 0))));
+}
 
 // ---- time (FILETIME: 100 ns since 1601-01-01) ----
 
@@ -768,8 +783,11 @@ int32_t format_core(Kernel &k, FormatData &data, ArgList &args, const bool wide)
         case FS_Size: {
             if (c == 'l') {
                 if (data.peek(0) == 'l') {
+                    // "ll": the console reads 32 bits (the oracle: "%lld" of
+                    // 0x100000000 prints 0, of 0xFFFFFFFF prints -1); only
+                    // "%I64" reads 64. Xenia reads 64 for both.
                     data.skip(1);
-                    flags |= FF_IsLongLong;
+                    flags |= FF_IsLong;
                 } else {
                     flags |= FF_IsLong;
                 }

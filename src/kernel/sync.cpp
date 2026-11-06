@@ -12,8 +12,14 @@
 // Also where it differs:
 //   - KeInitializeEvent and KeInitializeTimerEx on a header a host object of
 //     the same kind already stands behind keep that object (Xenia clears the
-//     header's stash, so a new one is made and the old one stays behind);
+//     header's marker, so a new one is made and the old one stays behind);
 //     the timer is disarmed;
+//   - the wait list of every initialized header (events, semaphores, mutants,
+//     timers, critical sections, the read-write lock's members) is an empty
+//     list, as the console's initializers leave it, where Xenia writes a
+//     host-object marker there; the host object is found through a table
+//     (objects.cpp). RtlInitializeCriticalSectionAndSpinCount returns the
+//     critical section's pointer, as the console does (Xenia: 0);
 //   - NtQueryEvent on a handle of another kind answers OBJECT_TYPE_MISMATCH,
 //     as the other Nt event calls here (Xenia: INVALID_HANDLE);
 //   - ExReleaseReadWriteLock wakes a waiting writer when the last reader or
@@ -108,36 +114,36 @@ uint32_t finish_wait(Objects &o, Thread &t, uint32_t status) {
     return status;
 }
 
-// the host object a header's stash names, if it is the header's and of that
-// kind (lock held)
-Object *stashed(Kernel &k, Objects &o, uint32_t address, Object::Type type) {
-    if (k.load32(address + header::WAIT_LIST) != header::SIGNATURE) return nullptr;
-    Object *object = o.object_in(k.load32(address + header::WAIT_LIST + 4));
-    return object && object->guest == address && object->type() == type ? object : nullptr;
+// the host object made for a header, if it is of that kind (lock held)
+Object *existing(Objects &o, uint32_t address, Object::Type type) {
+    Object *object = o.find_native(address);
+    return object && object->type() == type ? object : nullptr;
 }
 
 // Xenia's KeInitializeEvent: the header written (type 0 notification, 1
-// synchronization), the host object made, or the one behind it kept
+// synchronization) with an empty wait list (the console's; Xenia leaves its
+// host-object marker there), the host object made, or the one behind it kept
 void initialize_event(Kernel &k, uint32_t address, uint32_t type, uint32_t state) {
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);
-    auto *e = static_cast<Event *>(stashed(k, o, address, Object::Type::Event));
+    auto *e = static_cast<Event *>(existing(o, address, Object::Type::Event));
     uint8_t *h = k.host(address);
     h[header::TYPE] = uint8_t(type), h[1] = 0, h[2] = 0, h[3] = 0;
     k.store32(address + header::SIGNAL_STATE, state);
+    list_init(k, address + header::WAIT_LIST);
     if (e) {
         if (int32_t(state) > 0) o.signaled(*e);
         return;
     }
-    list_init(k, address + header::WAIT_LIST);
     o.native_locked(address);
 }
 
 // Xenia's KeInitializeSemaphore, as the read-write lock's initialization
-// calls it
+// calls it; the wait list empty, as the console's
 void initialize_semaphore(Kernel &k, uint32_t address, uint32_t count, uint32_t limit) {
     k.host(address)[header::TYPE] = uint8_t(GuestType::Semaphore);
     k.store32(address + header::SIGNAL_STATE, count);
+    list_init(k, address + header::WAIT_LIST);
     k.store32(address + ksemaphore::LIMIT, limit);
     objects(k).native(address);
 }
@@ -314,15 +320,9 @@ XF_EXPORT(xboxkrnl, NtReleaseMutant) {
 // ---- the Ke forms of semaphores and mutants (a header in the game's memory) ----
 
 // (semaphore, count, limit): the header and limit written, the host object
-// made or found (Xenia's KeInitializeSemaphore; its wait list keeps a host
-// object's stash, as Xenia leaves it)
-XF_EXPORT(xboxkrnl, KeInitializeSemaphore) {
-    uint32_t s = arg(k, c, 0);
-    k.host(s)[header::TYPE] = uint8_t(GuestType::Semaphore);
-    k.store32(s + header::SIGNAL_STATE, arg(k, c, 1));
-    k.store32(s + ksemaphore::LIMIT, arg(k, c, 2));
-    objects(k).native(s);
-}
+// made or found (Xenia's KeInitializeSemaphore; the wait list an empty list,
+// as the console's, where Xenia leaves a host-object marker)
+XF_EXPORT(xboxkrnl, KeInitializeSemaphore) { initialize_semaphore(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2)); }
 
 // (semaphore, increment, adjustment, wait): the previous count; past the
 // limit nothing changes (NT raises an exception there, Xenia ignores it)
@@ -347,6 +347,7 @@ XF_EXPORT(xboxkrnl, KeInitializeMutant) {
     bool owned = arg(k, c, 1) != 0;
     k.host(address)[header::TYPE] = uint8_t(GuestType::Mutant);
     k.store32(address + header::SIGNAL_STATE, owned ? 0 : 1);
+    list_init(k, address + header::WAIT_LIST);
     k.host(address)[kmutant::ABANDONED] = 0;
     Objects &o = objects(k);
     Ref<Mutant> m = as<Mutant>(o.native(address));
@@ -438,7 +439,7 @@ XF_EXPORT(xboxkrnl, KeInitializeTimerEx) {
     uint32_t timer = arg(k, c, 0), type = arg(k, c, 1), process_type = arg(k, c, 2) & 0xFF;
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);
-    auto *t = static_cast<Timer *>(stashed(k, o, timer, Object::Type::Timer));
+    auto *t = static_cast<Timer *>(existing(o, timer, Object::Type::Timer));
     if (t) {
         o.disarm(*t);
         t->apc_thread = {};
@@ -450,7 +451,7 @@ XF_EXPORT(xboxkrnl, KeInitializeTimerEx) {
     h[2] = uint8_t(process_type);
     h[3] = 0; // inserted
     k.store32(timer + header::SIGNAL_STATE, 0);
-    if (!t) list_init(k, timer + header::WAIT_LIST);
+    list_init(k, timer + header::WAIT_LIST);
     k.store64(timer + ktimer::DUE_TIME, 0);
     k.store32(timer + ktimer::PERIOD, 0);
 }
@@ -744,6 +745,7 @@ void initialize_critical_section(Kernel &k, uint32_t cs, uint8_t spin_count_256)
     k.host(cs)[header::TYPE] = uint8_t(GuestType::EventSynchronization);
     k.host(cs)[header::ABSOLUTE] = spin_count_256;
     k.store32(cs + header::SIGNAL_STATE, 0);
+    list_init(k, cs + header::WAIT_LIST); // an empty wait list, as the console's (Xenia leaves it alone)
     k.store32(cs + CS_LOCK_COUNT, 0xFFFFFFFF);
     k.store32(cs + CS_RECURSION, 0);
     k.store32(cs + CS_OWNER, 0);
@@ -758,11 +760,12 @@ uint32_t current_kthread() {
 
 XF_EXPORT(xboxkrnl, RtlInitializeCriticalSection) { initialize_critical_section(k, arg(k, c, 0), 0); }
 
-// the spin count in 256s, rounded up, at most 255
+// the spin count in 256s, rounded up, at most 255; the console returns the
+// pointer it was given (Xenia returns 0, a status)
 XF_EXPORT(xboxkrnl, RtlInitializeCriticalSectionAndSpinCount) {
     uint32_t spin = (arg(k, c, 1) + 255) >> 8;
     initialize_critical_section(k, arg(k, c, 0), uint8_t(std::min(spin, 255u)));
-    result(c, X_STATUS_SUCCESS);
+    result(c, arg(k, c, 0));
 }
 
 XF_EXPORT(xboxkrnl, RtlEnterCriticalSection) {
