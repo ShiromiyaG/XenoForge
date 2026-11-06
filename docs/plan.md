@@ -523,9 +523,10 @@ Retail games rarely call it.
 **Under way:**
 - a GPU trace writer in Xenia's format, so any scene a run reaches can be
   checked against Xenia's trace dump;
-- El Chavo Kart's colors past the menus;
-- the player presenting on the GPU, and the slow start (no pipeline cache
-  on disk, and every shader compiled the first time it is drawn).
+- El Chavo Kart's colors past the menus.
+
+The player presents on the GPU and keeps up with the guest, and the
+pipeline cache is on disk (both came in on 2026-11-05).
 
 **Approximated** (drawn, but counted as not what the console does):
 - **Textures:**
@@ -582,8 +583,7 @@ Retail games rarely call it.
   host queries are left.
 
 **Infrastructure and speed:**
-- **Shader compiles:**
-  - the pipeline cache on disk;
+- **Shader compiles** (the pipeline cache on disk is in):
   - compiling on a worker thread with the generic pipeline drawing
     meanwhile (B5);
   - the shaders translated in the launcher's build step.
