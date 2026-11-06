@@ -107,9 +107,17 @@ struct VertexOptions {
 // rasterized one taken back to 0-1, rounded to 20e4 (1 towards zero, as
 // kFloat24Truncating, with the conservative DepthLess when the shader writes
 // no depth; 2 to the nearest even, as kFloat24Rounding), then halved.
+//
+// centroid: the interpolators (a bit each) read at the centroid of the
+// pixel's covered samples rather than at its center, as Xenia's
+// interpolators_centroid modification (xenos.h's
+// GetInterpolatorSamplingPattern: SQ_CONTEXT_MISC's sc_sample_cntl and
+// SQ_INTERPOLATOR_CNTL's sampling_pattern under MSAA). Without it, values a
+// triangle's edge pixels take are extrapolated past the triangle.
 struct PixelOptions {
     uint8_t depth_float24 = 0;
-    uint32_t key() const { return depth_float24; }
+    uint16_t centroid = 0;
+    uint32_t key() const { return depth_float24 | uint32_t(centroid) << 8; }
 };
 Translation translate(const ucode::ParsedShader &shader, Stage stage, const VertexOptions &vertex = {},
                       const PixelOptions &pixel = {});

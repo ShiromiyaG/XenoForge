@@ -10,6 +10,8 @@
 // 0.1% of pixels off by more than 16. Where Xenia's two backends disagree
 // with each other by more than that, matching the Vulkan picture passes too,
 // and the line says so: what differs between them is open (renderer.md).
+// With XF_LINKED_PIPELINES=1 every draw is drawn by a pipeline linked from
+// libraries (VK_EXT_graphics_pipeline_library), which must draw the same.
 
 #include "check.h"
 #include "xenoforge/renderer.h"
@@ -85,6 +87,15 @@ int main() {
         std::printf("no Vulkan device (%s): nothing to replay\n", error.c_str());
         return 0;
     }
+    // XF_LINKED_PIPELINES=1: every pipeline linked from libraries, never made
+    // whole (Options::linked_pipelines_only), where the device has them
+    xf::render::Options options;
+    if (const char *linked = std::getenv("XF_LINKED_PIPELINES"); linked && linked[0] == '1') {
+        if (device->pipeline_library())
+            options.linked_pipelines_only = true;
+        else
+            std::printf("XF_LINKED_PIPELINES: the device has no graphics pipeline libraries; whole pipelines\n");
+    }
     int compared = 0, vulkan_only = 0;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(traces)) {
         if (entry.path().extension() != ".xtr") continue;
@@ -96,7 +107,7 @@ int main() {
         CHECK(xf::open_gpu_trace(entry.path(), trace, error));
         xf::render::Image frame;
         xf::render::Report report;
-        CHECK(xf::render::replay(trace, *device, {}, frame, report, error));
+        CHECK(xf::render::replay(trace, *device, options, frame, report, error));
         CHECK(frame.rgba.size() == size_t(frame.width) * frame.height * 4);
         if (frame.rgba.size() != size_t(frame.width) * frame.height * 4) continue;
         std::optional<Difference> to_d3d12, to_vulkan;

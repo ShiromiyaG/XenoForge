@@ -75,6 +75,24 @@ struct Report {
     uint64_t vertex_bytes = 0;                   // the vertex data uploaded (the pages that differed)
     uint64_t writeback_bytes = 0;                // what resolves wrote, copied into guest memory
     uint64_t submissions = 0, waits = 0;         // command buffers submitted; waits for the GPU
+    // Pipelines (Options::pipeline_stand_in): besides the whole ones counted
+    // in `pipelines` above, the libraries of their parts made, the pipelines
+    // linked from them and the placeholders made; the draws drawn by a
+    // stand-in (a placeholder or a linked pipeline) while their own pipeline
+    // was made
+    uint64_t pipeline_libraries = 0, pipelines_linked = 0, pipeline_placeholders = 0, stand_in_draws = 0;
+    // The pipelines made on the workers, and how long their draws went
+    // without one (from the first draw asking to the first drawn, by the
+    // pipeline or its stand-in): in all and at most
+    uint64_t pipeline_waits = 0;
+    double pipeline_wait_seconds = 0, pipeline_wait_max = 0;
+    // Hitches: the frames in which the renderer's thread spent more than 4 ms
+    // making pipelines (and the most it spent in one), and the intervals
+    // between swaps longer than 50 and 100 ms, whatever their cause
+    uint64_t pipeline_hitches = 0;
+    double pipeline_frame_max = 0;
+    uint64_t swap_gaps_50ms = 0, swap_gaps_100ms = 0;
+    double swap_gap_max = 0;
     std::map<std::string, uint64_t> skipped;     // draws not done, by reason
     std::map<std::string, std::vector<uint64_t>> skipped_at; // the first swaps (by number) each reason came in
     std::map<std::string, uint64_t> approximate; // done, with something not exact yet, by what
@@ -182,6 +200,29 @@ struct Options {
     // logical cores (Xenia's d3d12_pipeline_creation_threads default).
     bool async_pipelines = false;
     int pipeline_threads = -1;
+    // What a draw is drawn with while its pipeline is made on the workers
+    // (async_pipelines; docs/renderer.md, "Pipelines while they are made"):
+    enum class PipelineStandIn {
+        // nothing: the draw is skipped, as Xenia's D3D12 backend skips it
+        skip,
+        // a placeholder pipeline made at once on the renderer's thread, the
+        // guest's vertex shader with a pixel shader writing transparent
+        // black, as Xenia's Vulkan backend draws (its pipeline hot-swap)
+        placeholder,
+        // a pipeline linked at once from libraries of its four parts
+        // (VK_EXT_graphics_pipeline_library's fast linking), the libraries of
+        // shaders made on the workers too and the draw skipped until they
+        // are; the whole pipeline made after them, when nothing else waits.
+        // Where the device has no such libraries, skip. The default: it
+        // measured best (docs/renderer.md)
+        library,
+    };
+    PipelineStandIn pipeline_stand_in = PipelineStandIn::library;
+    // Every draw drawn by a pipeline linked from libraries, made at once,
+    // never by the whole pipeline: to check that linked pipelines draw what
+    // whole ones do (xfreplay --linked-pipelines); needs the device's
+    // libraries
+    bool linked_pipelines_only = false;
     // what replay() has its processor write in occlusion query reports
     // (live, the caller sets its processor's: tools/game.cpp)
     gpu::OcclusionQueries occlusion_queries = gpu::OcclusionQueries::Fake;

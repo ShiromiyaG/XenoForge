@@ -1881,6 +1881,10 @@ void Translator::main_vertex() {
     }
     Id position = global(vec4_, spv::StorageClass::Output, "position");
     m_.decorate(position, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::Position)});
+    // the same position from the same computation in any shader (a depth
+    // pre-pass and a pass testing EQUAL against it), as Xenia's translators
+    // declare their outputs invariant
+    m_.decorate(position, spv::Decoration::Invariant);
     Id outputs = global(m_.type_array(vec4_, 16), spv::StorageClass::Output, "interpolators");
     m_.decorate(outputs, spv::Decoration::Location, {0});
     // the point diameter for point lists' geometry shader (point_list.geom),
@@ -2205,8 +2209,22 @@ void Translator::main_vertex() {
 
 void Translator::main_pixel() {
     m_.capability(spv::Capability::DemoteToHelperInvocation);
-    Id inputs = global(m_.type_array(vec4_, 16), spv::StorageClass::Input, "interpolators");
-    m_.decorate(inputs, spv::Decoration::Location, {0});
+    // The interpolators: one array, or with some read at the centroid
+    // (PixelOptions::centroid) one variable each, those Centroid-decorated, as
+    // Xenia's translators declare them (an array's elements cannot be
+    // decorated apart). The vertex shader's array covers the same locations.
+    Id inputs = 0;
+    Id interpolators[16] = {};
+    if (pixel_.centroid) {
+        for (uint32_t k = 0; k < 16; k++) {
+            interpolators[k] = global(vec4_, spv::StorageClass::Input, "interpolator");
+            m_.decorate(interpolators[k], spv::Decoration::Location, {k});
+            if ((pixel_.centroid >> k) & 1) m_.decorate(interpolators[k], spv::Decoration::Centroid);
+        }
+    } else {
+        inputs = global(m_.type_array(vec4_, 16), spv::StorageClass::Input, "interpolators");
+        m_.decorate(inputs, spv::Decoration::Location, {0});
+    }
     Id outputs = global(m_.type_array(vec4_, 4), spv::StorageClass::Output, "colors");
     m_.decorate(outputs, spv::Decoration::Location, {0});
     bool writes_depth = false;
@@ -2254,7 +2272,10 @@ void Translator::main_pixel() {
     m_.label();
     Id ptr_in_vec4 = m_.type_pointer(spv::StorageClass::Input, vec4_);
     for (uint32_t k = 0; k < harness::REGISTERS; k++) {
-        Id value = k < 16 ? load(vec4_, m_.op(Op::OpAccessChain, ptr_in_vec4, {inputs, i(int32_t(k))})) : zero4_;
+        Id value = zero4_;
+        if (k < 16)
+            value =
+                load(vec4_, inputs ? m_.op(Op::OpAccessChain, ptr_in_vec4, {inputs, i(int32_t(k))}) : interpolators[k]);
         store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))}), value);
     }
     // The pixel parameters (SQ_PROGRAM_CNTL's param_gen), as Xenia's

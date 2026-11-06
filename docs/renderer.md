@@ -1084,8 +1084,8 @@ no fallback) take the topology within its class, primitive restart,
 culling, the front face, the depth and stencil tests and ops and the depth
 bias's enable at the draw, out of the pipeline key (Xenia's Vulkan backend
 keys them: a TODO in its command processor). The race: 102 pipelines, 96
-now; the rest differ mostly in blend state and color formats, which only
-VK_EXT_extended_dynamic_state3 could take (not used yet).
+now. Extended dynamic state 3 takes the blend state too where the device
+has it (below, "Pipelines while they are made").
 
 **Geometry shaders are optional** (many mobile GPUs lack them;
 `vk::Device::geometry_shader()`, off with `XF_VK_NO_GEOMETRY_SHADER=1`).
@@ -1223,6 +1223,153 @@ undefined scalar opcode 41 and an exec past the end of the microcode stay
 unsupported: Xenia fails the first (a fatal translation error) and reads
 past its copy of the microcode for the second, so only hardware could
 answer.
+
+## Pipelines while they are made, and the interpolators' centroids (2026-11-06)
+
+**Something drawn while a pipeline is made** (B5; `Options::pipeline_stand_in`;
+`XF_PIPELINES=wait|skip|placeholder|library` for `boot` and the player,
+`xfreplay --async-pipelines --stand-in ...`). With pipelines made on the
+workers, a draw whose pipeline was not made yet was skipped, as Xenia's
+D3D12 backend skips it (`skip`). Two ways to draw it instead are built:
+- `placeholder`, Xenia's Vulkan backend's pipeline hot-swap
+  (`vulkan_pipeline_cache.cc`): a pipeline of the draw's own state and
+  vertex shader with a pixel shader writing transparent black
+  (`placeholder.frag`, Xenia's `placeholder.ps.glsl`, but writing the four
+  colors where Xenia's writes oC0 alone, so no bound target gets undefined
+  values), made at once on the renderer's thread and drawn until the whole
+  pipeline replaces it.
+- `library`, VK_EXT_graphics_pipeline_library's fast linking: a pipeline
+  in its four parts, each a library kept by its own key (the vertex input's
+  attribute and topology class; the vertex, tessellation and geometry
+  shaders' modules with the patch size, depth clamp and bias, and
+  rasterization discarded; the pixel shader's module with the samples; the
+  targets' formats and samples, with the blend state where it is not
+  dynamic). The two with the guest's shaders are made on the workers, ahead
+  of everything queued; the vertex input and fragment output, which have no
+  shader, on the renderer's thread. Once an entry's four are made, a
+  pipeline is linked from them (no link-time optimization) and draws until
+  the whole pipeline replaces it. The whole one is queued only then, and
+  made only when nothing else waits, on half the workers at most: it draws
+  what the linked one draws (the race frame's GPU time 6.18 ms with whole
+  pipelines, 6.24 with linked ones), so it must never delay a library a
+  draw waits for. A new shader's draws are still skipped until its library
+  is made; a new combination of known shaders and states draws at once. The
+  libraries go in the pipeline cache on disk, the linked pipelines do not.
+  A stand-in replaced is destroyed once the submission recording it is
+  done.
+
+The device's libraries come from a feature query
+(`vk::Device::pipeline_library`: the extension with
+`graphicsPipelineLibraryFastLinking`); `XF_VK_NO_GPL=1`
+turns them off, and then `library` skips the draws, as `skip` does.
+`Options::linked_pipelines_only` (`xfreplay --linked-pipelines`,
+`XF_LINKED_PIPELINES=1` for `replay_test`) draws every draw with a linked
+pipeline and none whole, made at once: the 29 frames match exactly as with
+whole pipelines, validation clean (the race frame: 153 libraries for its 96
+pipelines).
+
+Measured cold, which needs both caches empty: the pipeline cache on disk
+(`XF_PIPELINE_CACHE=<file>`) and the NVIDIA driver's own
+(`__GL_SHADER_DISK_CACHE_PATH=<empty folder>`; with it warm, the race
+frame's 96 pipelines take 0.3 s, cold 9.2 s). The report counts hitches:
+frames in which the renderer's thread spent more than 4 ms making
+pipelines, the most it spent in one, and swaps more than 50 and 100 ms
+apart. El Chavo Kart live (`boot_chaves --render --rates`, 680 s, the press
+script of "El Chavo Kart past the title" with the race's presses at
+10000-10750; title, menus and park up to swap 10000, the race after it, to
+swap 19,900-20,100; RTX 5060, 12 logical cores, so 9 workers, other agents
+building; the `--rates` lines now give the pipelines and skipped draws so
+far, so runs compare at the same swap):
+
+| | skip | placeholder | library | library, no EDS3 |
+| --- | --- | --- | --- | --- |
+| pipelines (whole) | 181 | 180 | 177 | 179 |
+| and | | 171 placeholders | 244 libraries, 168 linked | 258 libraries, 170 linked |
+| draws skipped, to swap 10000 | 1,877 | 0 | 1,275 | 1,838 |
+| draws skipped, in the race | 422 | 0 | 373 | 311 |
+| draws by a stand-in | 0 | 590, transparent black | 5,343, exact | 5,367, exact |
+| the renderer's thread making pipelines | 1.01 s | 10.49 s | 0.91 s | 1.11 s |
+| frames with more than 4 ms of it (the most) | 6 (747 ms) | 54 (1,076 ms) | 6 (691 ms) | 6 (839 ms) |
+| swaps more than 50 / 100 ms apart | 701 / 54 | 1,226 / 41 | 113 / 24 | 1,103 / 11 |
+
+`skip`'s six long frames can only be pipelines of draws without a pixel
+shader, made at once as before (Xenia's too); `library` has as many, as
+long, so its links and shaderless libraries add none. `library` is the
+default: fewer draws skipped than `skip` in both runs (2,149 and 1,648
+against 2,299; the runs vary with the machine's load, other agents'
+builds), every stand-in drawing exactly, no more time on the renderer's
+thread. Its gain is bounded by El Chavo Kart's pipelines being new pairs of
+shaders (89 of the race frame's 96): a new shader's draws wait for its
+library as they waited for the whole pipeline, and only new combinations
+of known shaders and states draw at once. `placeholder` skips nothing but
+makes every new pipeline twice, once on the renderer's thread (54 long
+frames, 10.5 s), and draws its stand-ins black; it stays an option. The
+swaps' gaps vary too much from run to run to rank them. A first form of
+`library`, which queued each whole pipeline at once beside its libraries,
+skipped more draws than `skip` (2,184 against 1,449 in 500 s): the
+workers made every new shader twice at the same time.
+
+**Not done yet: the libraries at the launcher's build step.** What costs
+is the driver compiling the shaders (the race frame's 96 pipelines: 9.2 s
+from an empty driver cache, 0.3 s from a full one). The libraries make that
+cost per shader rather than per pipeline (153 libraries for the race's 96
+pipelines, the fragment shader's keyed by the
+module and the samples alone, the pre-rasterization one by the module's
+host form, patch size, depth clamp and bias), which makes compiling ahead
+practical: a run could keep, beside the pipeline cache on disk, the
+microcode of every shader it met and the keys of its pipelines and
+libraries (Xenia keeps such a shader and pipeline storage per title and
+compiles all of it on its creation threads when the title starts), and the
+launcher's build step, which has the device, would translate those and the
+shaders found on the disc (`xfeffect`'s containers) and make their
+libraries into the game's pipeline cache. The player would then link every
+draw's pipeline at once, the libraries found in the cache. The cache is
+the device's and driver's (Vulkan checks its header), so a new driver
+means doing it again.
+
+**Extended dynamic state 3** (`vk::Device::dynamic_blend`; `XF_VK_NO_EDS3=1`
+turns it off): the blend enables, blend equations and color write masks
+set at the draw, so pipelines key the targets' formats alone (and the
+fragment output libraries the formats and samples alone). Counted on the
+traces, without and with it: El Chavo Kart's race 96 and 96 (its 96
+pipelines are 89 pairs of shaders; the other 7 differ by MSAA, depth format
+or a color format, none by blend), park 54/54, menu 36/36; Ben 10 8/5;
+Gears of War 3 44/39 (45/39 at 3600); Sonic's title 32/30; Red Dead
+Redemption 148/148 and 147/147. Live (the table above), El Chavo Kart's
+680 s made 177 whole pipelines with it and 179 without, and 244 libraries
+against 258 (the fragment output's). The earlier guess that the race's
+pipelines differed mostly in blend state was wrong: what makes pipelines
+there is shaders, so B5's stand-in is what removes the skips, not fewer
+keys.
+
+**Red Dead Redemption's edges: the interpolators' centroids.** Frames 850
+and 950 were 0.45 off Xenia's D3D12 picture (0.46% of pixels off by more
+than 16) after the host depth kept across transfers, on the edges of
+geometry, brighter than Xenia's: 3,818 of the 4,226 pixels off D3D12's were
+off Vulkan's too, where Xenia's two agree. Under MSAA the console reads
+interpolators at the centroid of the pixel's covered samples, not its
+center, by SQ_CONTEXT_MISC's `sc_sample_cntl` (bits 2-3: centroids only,
+centers only, or both by SQ_INTERPOLATOR_CNTL's `sampling_pattern`, a bit
+an interpolator, 1 the center); at the center a triangle's edge pixels
+extrapolate its values past it. Xenia's xenos.h names this game for it
+(`GetInterpolatorSamplingPattern`) and its translators decorate those
+interpolators Centroid (`interpolators_centroid`). Now the pixel shader
+takes the mask as a variant (`shader::PixelOptions::centroid`, in the
+pipeline key): its interpolators one variable each, Centroid-decorated
+where the mask says, the array as before otherwise. The frame uses
+centroids only in 1,046 draws and patterns in 1,171. Frames 850 and 950:
+0.452 and 0.453 to 0.347 and 0.347 off D3D12's picture, 0.459% and 0.458%
+to 0.238% of pixels; still above `replay_test`'s 0.1%, so not in its
+corpus. What is left is small vegetation on the ground (alpha to coverage
+draws, 2,106 of the frame's) and thin texture features such as the cactus
+ribs, where Xenia's two pictures again agree with each other (1,887 of the
+2,189 pixels off D3D12's are off Vulkan's too). Ruled out by trying: the 2x
+sample order (swapping it makes 2.98% off), alpha to coverage's 2x
+thresholds swapped (1.57%) and its dither's axes swapped (unchanged), the
+interpolators through InterpolateAtCentroid instead of the decoration
+(identical), an invariant position (identical; kept, as Xenia's outputs
+are invariant), and the samplers, made as Xenia's Vulkan backend makes
+them. The 29 frames of `replay_test` are unchanged.
 
 ## Texture formats (2026-11-06)
 
@@ -1383,8 +1530,9 @@ starts as zeros, which round to EDRAM's 0, so a sample no such target held
 loads EDRAM's value as before. Red Dead Redemption's frames 850 and 950
 went from 9.20 and 9.28 off D3D12's picture to 0.45 and 0.46 (0.46-0.47%
 of pixels off by more than 16; 0.36 and 0.38 off Vulkan's, whose two
-pictures are 0.21 apart): the noise is gone, what is left are edges. The
-29 frames of `replay_test` are unchanged. `XF_DEPTH_FALLBACK=1` makes
+pictures are 0.21 apart): the noise is gone, what is left are edges (the
+interpolators' centroids, "Pipelines while they are made" above). The 29
+frames of `replay_test` are unchanged. `XF_DEPTH_FALLBACK=1` makes
 D24S8 a 32-bit float depth, as on devices without 24-bit unorm depth
 (AMD), to test that path and its unorm24 half. Xenia's `depth_float24_round` is
 an option (`Options::depth_float24_round`, `xfreplay

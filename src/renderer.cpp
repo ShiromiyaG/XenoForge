@@ -132,6 +132,9 @@ const uint32_t DEPTH_FLOAT24[] = {
 const uint32_t DEPTH_FLOAT24_ROUND[] = {
 #include "depth_float24_round.frag.inc"
 };
+const uint32_t PLACEHOLDER[] = {
+#include "placeholder.frag.inc"
+};
 const uint32_t RESOLVE[] = {
 #include "resolve.comp.inc"
 };
@@ -157,7 +160,7 @@ constexpr uint32_t DC_LUTA_CONTROL = 0x1930;
 constexpr uint32_t VGT_OUTPUT_PATH_CNTL = 0x2284, VGT_HOS_CNTL = 0x2285;
 constexpr uint32_t VGT_HOS_MAX_TESS_LEVEL = 0x2286, VGT_HOS_MIN_TESS_LEVEL = 0x2287;
 constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
-constexpr uint32_t SQ_CONTEXT_MISC = 0x2181;
+constexpr uint32_t SQ_CONTEXT_MISC = 0x2181, SQ_INTERPOLATOR_CNTL = 0x2182;
 constexpr uint32_t PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2380; // then FRONT_OFFSET, BACK_SCALE, BACK_OFFSET
 constexpr uint32_t RB_DEPTH_CLEAR = 0x231D, RB_COLOR_CLEAR = 0x231E, RB_COLOR_CLEAR_LO = 0x231F;
 constexpr uint32_t COLOR_INFO[4] = {reg::RB_COLOR_INFO, reg::RB_COLOR1_INFO, reg::RB_COLOR2_INFO, reg::RB_COLOR3_INFO};
@@ -702,7 +705,8 @@ struct Pass {
 
 // A graphics pipeline's description, owning what its pointers reach (the
 // renderer's draws give stages, the fixed states, blend attachments, dynamic
-// states and the dynamic rendering formats; nothing else is chained).
+// states, and chained the dynamic rendering formats and a pipeline library's
+// part and libraries).
 struct PipelineDesc {
     VkPipelineShaderStageCreateInfo stages[5]{};
     VkPipelineVertexInputStateCreateInfo vertex_input{};
@@ -720,19 +724,41 @@ struct PipelineDesc {
     VkPipelineDynamicStateCreateInfo dynamic{};
     VkFormat color_formats[4]{};
     VkPipelineRenderingCreateInfo rendering{};
+    VkGraphicsPipelineLibraryCreateInfoEXT library_part{};
+    VkPipeline libraries[4]{};
+    VkPipelineLibraryCreateInfoKHR library_list{};
     VkGraphicsPipelineCreateInfo info{};
 
     explicit PipelineDesc(const VkGraphicsPipelineCreateInfo &from) : info(from) {
         info.stageCount = std::min<uint32_t>(from.stageCount, uint32_t(std::size(stages)));
         std::copy_n(from.pStages, info.stageCount, stages);
         info.pStages = stages;
-        if (from.pNext) {
-            rendering = *static_cast<const VkPipelineRenderingCreateInfo *>(from.pNext);
-            rendering.colorAttachmentCount = std::min<uint32_t>(rendering.colorAttachmentCount, 4);
-            std::copy_n(rendering.pColorAttachmentFormats, rendering.colorAttachmentCount, color_formats);
-            rendering.pColorAttachmentFormats = color_formats;
-            info.pNext = &rendering;
+        // the chain, each structure copied and linked again in the same order
+        const void **tail = &info.pNext;
+        for (auto *in = static_cast<const VkBaseInStructure *>(from.pNext); in; in = in->pNext) {
+            switch (in->sType) {
+            case VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO:
+                rendering = *reinterpret_cast<const VkPipelineRenderingCreateInfo *>(in);
+                rendering.colorAttachmentCount = std::min<uint32_t>(rendering.colorAttachmentCount, 4);
+                std::copy_n(rendering.pColorAttachmentFormats, rendering.colorAttachmentCount, color_formats);
+                rendering.pColorAttachmentFormats = color_formats;
+                *tail = &rendering, tail = &rendering.pNext;
+                break;
+            case VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT:
+                library_part = *reinterpret_cast<const VkGraphicsPipelineLibraryCreateInfoEXT *>(in);
+                *tail = &library_part, tail = &library_part.pNext;
+                break;
+            case VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR:
+                library_list = *reinterpret_cast<const VkPipelineLibraryCreateInfoKHR *>(in);
+                library_list.libraryCount = std::min<uint32_t>(library_list.libraryCount, 4);
+                std::copy_n(library_list.pLibraries, library_list.libraryCount, libraries);
+                library_list.pLibraries = libraries;
+                *tail = &library_list, tail = &library_list.pNext;
+                break;
+            default: break; // nothing else is chained
+            }
         }
+        *tail = nullptr;
         if (own(info.pVertexInputState, vertex_input)) {
             // one binding and one attribute at most (tessellation's control
             // points, the rectangles' guest indices)
@@ -776,18 +802,41 @@ private:
     }
 };
 
-// A pipeline the renderer asked for: made (state 1, the pipeline null when
-// the driver failed) or being made (0).
+// A pipeline (or a pipeline library) the renderer asked for: made (state 1,
+// the pipeline null when the driver failed) or being made (0). While a
+// pipeline is made on the workers, its draws may be drawn by a stand-in
+// (Options::pipeline_stand_in): a placeholder or a pipeline linked from the
+// libraries of its parts, which the renderer's thread owns.
 struct PipelineEntry {
     std::atomic<int> state{0};
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipeline stand_in = VK_NULL_HANDLE;
+    bool stand_in_failed = false; // the driver failed it: not tried again
+    bool queued = false;          // the whole pipeline given to the workers
+    // when a draw first asked for it, until one is first drawn with it or
+    // its stand-in (Report::pipeline_wait_*); zero once counted
+    std::chrono::steady_clock::time_point asked{};
+    // the libraries it is linked from (vertex input, pre-rasterization,
+    // fragment shader, fragment output; the last two null when rasterization
+    // is discarded), once asked for
+    PipelineEntry *libraries[4] = {};
+};
+
+// What a pipeline made on the workers is to the draws waiting for it.
+enum class PipelinePriority {
+    first,  // a library a stand-in waits for: ahead of everything queued
+    normal, // a whole pipeline its draws wait for
+    later,  // a whole pipeline that will replace a linked stand-in drawing as
+            // it does: only when nothing else waits, on half the workers at
+            // most, so the libraries are never kept waiting by it
 };
 
 class PipelineWorkers {
 public:
-    PipelineWorkers(VkDevice device, VkPipelineCache cache, uint32_t threads) : dev_(device), cache_(cache) {
-        for (uint32_t i = 0; i < threads; i++) threads_.emplace_back([this] { run(); });
-    }
+  PipelineWorkers(VkDevice device, VkPipelineCache cache, uint32_t threads)
+      : dev_(device), cache_(cache), max_later_(std::max(threads / 2, 1u)) {
+      for (uint32_t i = 0; i < threads; i++) threads_.emplace_back([this] { run(); });
+  }
     // stops: what is queued is left unmade, what is being made is waited for
     ~PipelineWorkers() {
         {
@@ -798,10 +847,15 @@ public:
         for (std::thread &t : threads_) t.join();
     }
     size_t threads() const { return threads_.size(); }
-    void queue(PipelineEntry *entry, std::unique_ptr<PipelineDesc> desc) {
+    void queue(PipelineEntry *entry, std::unique_ptr<PipelineDesc> desc, PipelinePriority priority) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            queue_.emplace_back(entry, std::move(desc));
+            if (priority == PipelinePriority::first)
+                queue_.emplace_front(entry, std::move(desc));
+            else if (priority == PipelinePriority::normal)
+                queue_.emplace_back(entry, std::move(desc));
+            else
+                later_.emplace_back(entry, std::move(desc));
         }
         work_.notify_one();
     }
@@ -813,7 +867,7 @@ public:
     // until everything queued is made
     void wait_all() {
         std::unique_lock<std::mutex> lock(mutex_);
-        done_.wait(lock, [&] { return queue_.empty() && busy_ == 0; });
+        done_.wait(lock, [&] { return queue_.empty() && later_.empty() && busy_ == 0; });
     }
     // the time the workers spent making pipelines, and how many they made
     double seconds() const { return double(nanoseconds_.load()) * 1e-9; }
@@ -823,11 +877,14 @@ private:
     void run() {
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {
-            work_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            work_.wait(lock, [&] { return stop_ || !queue_.empty() || (!later_.empty() && busy_later_ < max_later_); });
             if (stop_) return;
-            auto [entry, desc] = std::move(queue_.front());
-            queue_.pop_front();
+            const bool late = queue_.empty();
+            auto &from = late ? later_ : queue_;
+            auto [entry, desc] = std::move(from.front());
+            from.pop_front();
             busy_++;
+            if (late) busy_later_++;
             lock.unlock();
             auto start = std::chrono::steady_clock::now();
             VkPipeline p = VK_NULL_HANDLE;
@@ -840,6 +897,10 @@ private:
             entry->pipeline = p;
             entry->state.store(1, std::memory_order_release);
             busy_--;
+            if (late) {
+                busy_later_--;
+                work_.notify_one(); // another one may be taken now
+            }
             done_.notify_all();
         }
     }
@@ -848,8 +909,9 @@ private:
     VkPipelineCache cache_;
     std::mutex mutex_;
     std::condition_variable work_, done_;
-    std::deque<std::pair<PipelineEntry *, std::unique_ptr<PipelineDesc>>> queue_;
-    uint32_t busy_ = 0;
+    std::deque<std::pair<PipelineEntry *, std::unique_ptr<PipelineDesc>>> queue_, later_;
+    uint32_t busy_ = 0, busy_later_ = 0;
+    const uint32_t max_later_;
     bool stop_ = false;
     std::atomic<uint64_t> nanoseconds_{0}, made_{0};
     std::vector<std::thread> threads_;
@@ -1055,6 +1117,8 @@ private:
     // the depth-only draws' pixel shaders that convert D24FS8 depth
     // (Options::depth_float24_convert_in_pixel_shader): towards zero, nearest even
     VkShaderModule depth_float24_fs_[2] = {};
+    // the pixel shader of the placeholder pipelines (Options::pipeline_stand_in)
+    VkShaderModule placeholder_fs_ = VK_NULL_HANDLE;
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
     VkFormat depth_vk_format(uint32_t format) const;
     Texture *texture(const uint32_t fetch[6], std::string &why);
@@ -1098,12 +1162,44 @@ private:
     bool cpu_upload(const vk::Image &target, const texture::Image &image, bool fresh);
     texture::Support support_; // what the device samples (texture_support)
     uint32_t sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides);
+    // The keys of a pipeline's four parts, for its libraries (vertex input,
+    // pre-rasterization, fragment shader, fragment output); a part the
+    // pipeline has not (rasterization discarded) has none.
+    struct PipelineParts {
+        std::vector<uint32_t> keys[4];
+    };
     // the pipeline of a key, made now or found made; null when the driver
     // failed, or (pending) when worker threads are making it and the draw may
-    // not wait (async)
-    VkPipeline pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info, bool async,
-                        bool &pending);
+    // not wait (async); or its stand-in (Options::pipeline_stand_in) while
+    // they make it
+    VkPipeline pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info,
+                        const PipelineParts &parts, bool async, bool &pending, bool &stand_in);
+    // a part's library, made now (async: those with shaders queued for the
+    // workers, ahead of the whole pipelines); null for a part without a key
+    PipelineEntry *library(uint32_t part, const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &whole,
+                           bool async);
+    // the entry's pipeline linked from its libraries (fast linking), null
+    // while one of them is not made yet or when one failed (stand_in_failed)
+    VkPipeline link(PipelineEntry &e);
+    // the placeholder of a whole pipeline: its pixel shader the placeholder's
+    VkPipeline placeholder(const VkGraphicsPipelineCreateInfo &info);
+    // a stand-in replaced by its whole pipeline, destroyed once the GPU is
+    // done with what drew with it
+    void retire_stand_in(PipelineEntry &e);
     std::unique_ptr<PipelineWorkers> pipeline_workers_; // with Options::async_pipelines
+    // the device's pipeline libraries, used (Options::pipeline_stand_in library
+    // with async_pipelines, or linked_pipelines_only)
+    bool use_libraries_ = false;
+    Options::PipelineStandIn stand_in_ = Options::PipelineStandIn::skip; // the option, as the device allows it
+    std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> libraries_;
+    // extended dynamic state 3's blend state at the draw (vk::Device::dynamic_blend)
+    PFN_vkCmdSetColorBlendEnableEXT set_blend_enable_ = nullptr;
+    PFN_vkCmdSetColorBlendEquationEXT set_blend_equation_ = nullptr;
+    PFN_vkCmdSetColorWriteMaskEXT set_write_mask_ = nullptr;
+    // hitches (Report::pipeline_hitches, swap_gaps_*): the pipeline time at
+    // the last swap, and when it came
+    double pipeline_seconds_at_swap_ = 0;
+    std::chrono::steady_clock::time_point last_swap_time_{};
     VkImageView make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
                           VkComponentMapping components = {}, uint32_t levels = 1, uint32_t layers = 1,
                           bool keep = true);
@@ -1455,8 +1551,10 @@ Impl::~Impl() {
         for (auto &[v, m] : s->variants)
             if (m) vkDestroyShaderModule(dev_, m, nullptr);
     }
-    for (auto &[k, p] : pipelines_)
-        if (p->pipeline) vkDestroyPipeline(dev_, p->pipeline, nullptr);
+    for (auto *table : {&pipelines_, &libraries_})
+        for (auto &[k, p] : *table)
+            for (VkPipeline pipe : {p->pipeline, p->stand_in})
+                if (pipe) vkDestroyPipeline(dev_, pipe, nullptr);
     for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.first, nullptr);
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
     for (auto &[k, t] : targets_) d_.destroy(t->image);
@@ -1475,7 +1573,7 @@ Impl::~Impl() {
     for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
     for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
-                             depth_float24_fs_[1]})
+                             depth_float24_fs_[1], placeholder_fs_})
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (VkDescriptorPool p : edram_pools_) vkDestroyDescriptorPool(dev_, p, nullptr);
     for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_})
@@ -1576,6 +1674,27 @@ bool Impl::init(std::string &error) {
         uint32_t threads = options_.pipeline_threads < 0 ? std::max(cores * 3 / 4, 1u)
                                                         : std::min(uint32_t(options_.pipeline_threads), cores);
         if (threads) pipeline_workers_ = std::make_unique<PipelineWorkers>(dev_, pipeline_cache_, threads);
+    }
+    use_libraries_ = d_.pipeline_library() &&
+                     (options_.linked_pipelines_only ||
+                      (pipeline_workers_ && options_.pipeline_stand_in == Options::PipelineStandIn::library));
+    if (options_.linked_pipelines_only && !d_.pipeline_library())
+        return error = "linked pipelines asked for, and the device has no graphics pipeline libraries", false;
+    // without the device's libraries the draws are skipped, as Xenia's D3D12
+    // backend skips them (the placeholder, an option, measured worse: every
+    // new pipeline compiled twice, once on the renderer's thread)
+    stand_in_ = options_.pipeline_stand_in;
+    if (stand_in_ == Options::PipelineStandIn::library && !d_.pipeline_library())
+        stand_in_ = Options::PipelineStandIn::skip;
+    if (d_.dynamic_blend()) {
+        set_blend_enable_ =
+            reinterpret_cast<PFN_vkCmdSetColorBlendEnableEXT>(vkGetDeviceProcAddr(dev_, "vkCmdSetColorBlendEnableEXT"));
+        set_blend_equation_ = reinterpret_cast<PFN_vkCmdSetColorBlendEquationEXT>(
+            vkGetDeviceProcAddr(dev_, "vkCmdSetColorBlendEquationEXT"));
+        set_write_mask_ =
+            reinterpret_cast<PFN_vkCmdSetColorWriteMaskEXT>(vkGetDeviceProcAddr(dev_, "vkCmdSetColorWriteMaskEXT"));
+        if (!set_blend_enable_ || !set_blend_equation_ || !set_write_mask_)
+            return error = "extended dynamic state 3 enabled without its commands", false;
     }
     VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -1846,6 +1965,8 @@ bool Impl::init(std::string &error) {
         depth_float24_fs_[1] = module(DEPTH_FLOAT24_ROUND, sizeof(DEPTH_FLOAT24_ROUND));
         if (!depth_float24_fs_[0] || !depth_float24_fs_[1])
             return error = "could not make the float24 depth shaders", false;
+        placeholder_fs_ = module(PLACEHOLDER, sizeof(PLACEHOLDER));
+        if (!placeholder_fs_) return error = "could not make the placeholder pixel shader", false;
         edram_load_set_ = edram_set(1);
         if (!edram_load_set_) return error = "could not make the EDRAM load's descriptors", false;
         VkDescriptorBufferInfo buffers[3] = {
@@ -2571,7 +2692,7 @@ VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options
         }
         it = s.variants.emplace(key, m).first;
     }
-    if (!it->second) why = "its float24 depth form could not be made";
+    if (!it->second) why = "its float24 depth or centroid form could not be made";
     return it->second;
 }
 
@@ -3544,35 +3665,243 @@ bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &pla
 
 // ---- pipelines ----
 
-VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info, bool async,
-                          bool &pending) {
-    pending = false;
-    async = async && pipeline_workers_;
+VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info,
+                          const PipelineParts &parts, bool async, bool &pending, bool &stand_in) {
+    pending = stand_in = false;
+    async = async && pipeline_workers_ && !options_.linked_pipelines_only;
+    // how long a pipeline made on the workers left its draws without one
+    auto drawn = [this](PipelineEntry &entry) {
+        if (entry.asked == std::chrono::steady_clock::time_point{}) return;
+        double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - entry.asked).count();
+        entry.asked = {};
+        report_.pipeline_waits++;
+        report_.pipeline_wait_seconds += waited;
+        report_.pipeline_wait_max = std::max(report_.pipeline_wait_max, waited);
+    };
+    PipelineEntry *e = nullptr;
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) {
-        PipelineEntry &e = *it->second;
-        if (e.state.load(std::memory_order_acquire)) return e.pipeline;
-        // being made on a worker: waited for, unless the draw may go without it
-        if (async) return pending = true, VK_NULL_HANDLE;
-        Timer timer(report_.pipeline_seconds);
-        pipeline_workers_->wait(&e);
-        return e.pipeline;
+        e = it->second.get();
+        if (e->state.load(std::memory_order_acquire)) {
+            if (e->stand_in) retire_stand_in(*e);
+            if (e->pipeline) drawn(*e);
+            return e->pipeline;
+        }
+        if (!async) {
+            // being made on a worker, and the draw waits for it
+            Timer timer(report_.pipeline_seconds);
+            if (!e->queued) {
+                pipeline_workers_->queue(e, std::make_unique<PipelineDesc>(info), PipelinePriority::normal);
+                e->queued = true;
+            }
+            pipeline_workers_->wait(e);
+            if (e->stand_in) retire_stand_in(*e);
+            return e->pipeline;
+        }
+    } else {
+        e = (pipelines_[key] = std::make_unique<PipelineEntry>()).get();
+        report_.pipelines++;
+        last_pipeline_swap_ = report_.swaps;
+        if (options_.verbose) {
+            std::fprintf(stderr, "  pipeline %llu:", (unsigned long long)report_.pipelines);
+            for (uint32_t word : key) std::fprintf(stderr, " %X", word);
+            std::fprintf(stderr, "\n");
+        }
+        if (options_.linked_pipelines_only) {
+            // linked from libraries made now, never made whole
+            for (uint32_t part = 0; part < 4; part++) e->libraries[part] = library(part, parts.keys[part], info, false);
+            e->pipeline = link(*e);
+            e->state.store(1, std::memory_order_release);
+            return e->pipeline;
+        }
+        if (!async) {
+            VkPipeline p = VK_NULL_HANDLE;
+            {
+                Timer timer(report_.pipeline_seconds);
+                if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &info, nullptr, &p) != VK_SUCCESS)
+                    p = VK_NULL_HANDLE;
+            }
+            e->pipeline = p;
+            e->state.store(1, std::memory_order_release);
+            return p;
+        }
+        // made on the workers: the whole pipeline, or first its libraries
+        e->asked = std::chrono::steady_clock::now();
+        if (stand_in_ == Options::PipelineStandIn::library && use_libraries_) {
+            for (uint32_t part = 0; part < 4; part++) e->libraries[part] = library(part, parts.keys[part], info, true);
+        } else {
+            pipeline_workers_->queue(e, std::make_unique<PipelineDesc>(info), PipelinePriority::normal);
+            e->queued = true;
+            if (stand_in_ == Options::PipelineStandIn::placeholder) {
+                e->stand_in = placeholder(info);
+                if (e->stand_in) report_.pipeline_placeholders++;
+                e->stand_in_failed = !e->stand_in;
+            }
+        }
     }
-    PipelineEntry &e = *(pipelines_[key] = std::make_unique<PipelineEntry>());
-    report_.pipelines++;
-    last_pipeline_swap_ = report_.swaps;
-    if (async) {
-        pipeline_workers_->queue(&e, std::make_unique<PipelineDesc>(info));
-        return pending = true, VK_NULL_HANDLE;
+    // being made on the workers: its stand-in meanwhile, linked as soon as
+    // the libraries it is linked from are made; then the whole pipeline,
+    // which replaces the linked one, after everything the draws wait for (or
+    // at once when its libraries failed)
+    if (!e->stand_in && !e->stand_in_failed && e->libraries[0]) e->stand_in = link(*e);
+    if (!e->queued && (e->stand_in || e->stand_in_failed)) {
+        pipeline_workers_->queue(e, std::make_unique<PipelineDesc>(info),
+                                 e->stand_in ? PipelinePriority::later : PipelinePriority::normal);
+        e->queued = true;
+    }
+    if (e->stand_in) {
+        drawn(*e);
+        return stand_in = true, e->stand_in;
+    }
+    return pending = true, VK_NULL_HANDLE;
+}
+
+// The part of a whole pipeline's description a library holds, by
+// VK_EXT_graphics_pipeline_library's four state subsets: the vertex input and
+// input assembly; the vertex, tessellation and geometry shaders with the
+// viewport, rasterization and tessellation states; the pixel shader with the
+// depth and multisample states; the blend and multisample states and the
+// targets' formats. The depth state is all dynamic (extended dynamic state 1
+// and 2) but for the depth bounds test, never on, so the fragment shader's
+// library takes none of the draw's.
+struct LibraryDesc {
+    VkGraphicsPipelineLibraryCreateInfoEXT part{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkPipelineShaderStageCreateInfo stages[5]{};
+    VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+
+    LibraryDesc(const VkGraphicsPipelineCreateInfo &whole, uint32_t which) {
+        static constexpr VkGraphicsPipelineLibraryFlagsEXT FLAGS[4] = {
+            VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
+            VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
+            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT,
+            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
+        part.flags = FLAGS[which];
+        info.pNext = &part;
+        info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+        info.pDynamicState = whole.pDynamicState;
+        // the targets' formats for the fragment output; the others' view
+        // mask (0) alone
+        for (auto *in = static_cast<const VkBaseInStructure *>(whole.pNext); in; in = in->pNext)
+            if (in->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO && which == 3)
+                rendering = *reinterpret_cast<const VkPipelineRenderingCreateInfo *>(in);
+        rendering.pNext = nullptr;
+        if (which) part.pNext = &rendering;
+        switch (which) {
+        case 0:
+            info.pVertexInputState = whole.pVertexInputState;
+            info.pInputAssemblyState = whole.pInputAssemblyState;
+            break;
+        case 1:
+            for (uint32_t i = 0; i < whole.stageCount; i++)
+                if (whole.pStages[i].stage != VK_SHADER_STAGE_FRAGMENT_BIT)
+                    stages[info.stageCount++] = whole.pStages[i];
+            info.pStages = stages;
+            info.pViewportState = whole.pViewportState;
+            info.pRasterizationState = whole.pRasterizationState;
+            info.pTessellationState = whole.pTessellationState;
+            info.layout = whole.layout;
+            break;
+        case 2:
+            for (uint32_t i = 0; i < whole.stageCount; i++)
+                if (whole.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    stages[info.stageCount++] = whole.pStages[i];
+            info.pStages = stages;
+            info.pDepthStencilState = &depth;
+            info.pMultisampleState = whole.pMultisampleState;
+            info.layout = whole.layout;
+            break;
+        default:
+            info.pColorBlendState = whole.pColorBlendState;
+            info.pMultisampleState = whole.pMultisampleState;
+            break;
+        }
+    }
+};
+
+PipelineEntry *Impl::library(uint32_t part, const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &whole,
+                             bool async) {
+    if (key.empty()) return nullptr;
+    std::unique_ptr<PipelineEntry> &slot = libraries_[key];
+    if (slot) return slot.get();
+    slot = std::make_unique<PipelineEntry>();
+    report_.pipeline_libraries++;
+    LibraryDesc desc(whole, part);
+    // the parts with the guest's shaders are the slow ones: on the workers,
+    // ahead of the whole pipelines; the others are made here
+    if (async && (part == 1 || part == 2)) {
+        pipeline_workers_->queue(slot.get(), std::make_unique<PipelineDesc>(desc.info), PipelinePriority::first);
+        return slot.get();
     }
     VkPipeline p = VK_NULL_HANDLE;
     {
         Timer timer(report_.pipeline_seconds);
-        if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+        if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &desc.info, nullptr, &p) != VK_SUCCESS)
+            p = VK_NULL_HANDLE;
     }
-    e.pipeline = p;
-    e.state.store(1, std::memory_order_release);
+    slot->pipeline = p;
+    slot->state.store(1, std::memory_order_release);
+    return slot.get();
+}
+
+VkPipeline Impl::link(PipelineEntry &e) {
+    VkPipeline libraries[4];
+    uint32_t count = 0;
+    for (PipelineEntry *l : e.libraries) {
+        if (!l) continue;
+        if (!l->state.load(std::memory_order_acquire)) return VK_NULL_HANDLE;
+        if (!l->pipeline) {
+            approximate("pipelines without a stand-in: a library the driver failed");
+            return e.stand_in_failed = true, VK_NULL_HANDLE;
+        }
+        libraries[count++] = l->pipeline;
+    }
+    // fast linking: no link-time optimization (the whole pipeline the
+    // workers make replaces it), nor the cache on disk
+    VkPipelineLibraryCreateInfoKHR list{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
+    list.libraryCount = count;
+    list.pLibraries = libraries;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &list;
+    info.layout = layout_;
+    VkPipeline p = VK_NULL_HANDLE;
+    {
+        Timer timer(report_.pipeline_seconds);
+        if (vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    }
+    if (p) {
+        report_.pipelines_linked++;
+    } else {
+        approximate("pipelines without a stand-in: linking failed");
+        e.stand_in_failed = true;
+    }
     return p;
+}
+
+VkPipeline Impl::placeholder(const VkGraphicsPipelineCreateInfo &info) {
+    VkPipelineShaderStageCreateInfo stages[5];
+    VkGraphicsPipelineCreateInfo p = info;
+    p.stageCount = std::min<uint32_t>(info.stageCount, 5);
+    for (uint32_t i = 0; i < p.stageCount; i++) {
+        stages[i] = info.pStages[i];
+        if (stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) stages[i].module = placeholder_fs_;
+    }
+    p.pStages = stages;
+    VkPipeline made = VK_NULL_HANDLE;
+    {
+        Timer timer(report_.pipeline_seconds);
+        if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &p, nullptr, &made) != VK_SUCCESS)
+            made = VK_NULL_HANDLE;
+    }
+    return made;
+}
+
+void Impl::retire_stand_in(PipelineEntry &e) {
+    VkPipeline old = e.stand_in;
+    e.stand_in = VK_NULL_HANDLE;
+    cmd();
+    slots_[current_].after.push_back([this, old] { vkDestroyPipeline(dev_, old, nullptr); });
 }
 
 // ---- a draw ----
@@ -4392,10 +4721,17 @@ void Impl::draw(const gpu::Draw &d) {
     // the vertex shader's host form, with a tessellated draw's hull shader
     // and patch size
     uint32_t host_key = host_vertex.key() | hull << 16 | patch_points << 20;
-    std::vector<uint32_t> key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32),
-                                 ps ? uint32_t(pixel_hash_) : 0, ps ? uint32_t(pixel_hash_ >> 32) : 0,
-                                 topology_class, rectangles, msaa, depth ? depth->image.format : 0u,
-                                 regs_[r::PA_CL_CLIP_CNTL] & (1u << 16), host_key};
+    std::vector<uint32_t> key = {uint32_t(vertex_hash_),
+                                 uint32_t(vertex_hash_ >> 32),
+                                 ps ? uint32_t(pixel_hash_) : 0,
+                                 ps ? uint32_t(pixel_hash_ >> 32) : 0,
+                                 topology_class,
+                                 rectangles,
+                                 msaa,
+                                 depth ? depth->image.format : 0u,
+                                 regs_[r::PA_CL_CLIP_CNTL] & (1u << 16),
+                                 host_key};
+    std::vector<uint32_t> color_key; // the targets' part of the key
     for (uint32_t i = 0; i < 4; i++) {
         if (!colors[i]) continue;
         color_formats[i] = colors[i]->image.format;
@@ -4409,8 +4745,14 @@ void Impl::draw(const gpu::Draw &d) {
         b.alphaBlendOp = blend_op((blend >> 21) & 7);
         b.dstAlphaBlendFactor = blend_factor((blend >> 24) & 0x1F);
         b.blendEnable = (blend & 0x1FFF1FFF) != 0x00010001; // not ONE, ADD, ZERO for both
-        key.insert(key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
+        // with extended dynamic state 3 the blend and the write mask are set
+        // at the draw too, so the targets' formats alone make pipelines
+        if (d_.dynamic_blend())
+            color_key.insert(color_key.end(), {i, uint32_t(color_formats[i])});
+        else
+            color_key.insert(color_key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
     }
+    key.insert(key.end(), color_key.begin(), color_key.end());
     VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why);
     if (!guest_vs) return skip("vertex shader: " + why);
     // The pixel shader: the guest's, its float24 depth conversion form with
@@ -4420,19 +4762,33 @@ void Impl::draw(const gpu::Draw &d) {
     // Xenia's (unless the shader writes oDepth, which is per pixel).
     VkShaderModule fragment = ps ? ps->module : VK_NULL_HANDLE;
     uint32_t float24_mode = float24_convert ? (options_.depth_float24_round ? 2u : 1u) : 0u;
+    // The interpolators read at the centroid under MSAA, as xenos.h's
+    // GetInterpolatorSamplingPattern takes SQ_CONTEXT_MISC's sc_sample_cntl (bits 2-3:
+    // 0 centroids only, 1 centers only, 2 both, by SQ_INTERPOLATOR_CNTL's
+    // sampling_pattern: a bit each, 1 the center). Xenia keeps only the
+    // interpolators the pixel shader reads; here all 16, as the shader
+    // loads them all.
+    uint32_t centroid = 0;
+    if (ps && msaa) {
+        uint32_t sample_control = (regs_[r::SQ_CONTEXT_MISC] >> 2) & 3;
+        if (sample_control == 0)
+            centroid = 0xFFFF;
+        else if (sample_control == 2)
+            centroid = ~(regs_[r::SQ_INTERPOLATOR_CNTL] >> 16) & 0xFFFF;
+    }
     bool sample_shading = false;
+    if (ps && (float24_convert || centroid)) {
+        fragment = pixel_module(*ps, {uint8_t(float24_mode), uint16_t(centroid)}, why);
+        if (!fragment) return skip("pixel shader: " + why);
+    }
     if (float24_convert) {
-        if (ps) {
-            fragment = pixel_module(*ps, {uint8_t(float24_mode)}, why);
-            if (!fragment) return skip("pixel shader: " + why);
-        } else if ((depth_control & 4) || ((depth_control >> 4) & 7) != 7) {
+        if (!ps && ((depth_control & 4) || ((depth_control >> 4) & 7) != 7))
             fragment = depth_float24_fs_[float24_mode == 2 ? 1 : 0];
-        }
         // (the guest's shader runs per sample by its sample-decorated
         // position; the depth-only one by the pipeline's sample shading)
         sample_shading = msaa && fragment && !ps;
     }
-    key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u));
+    key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) | centroid << 16);
     VkPipelineShaderStageCreateInfo stages[4] = {};
     uint32_t stage_count = 0;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
@@ -4480,7 +4836,9 @@ void Impl::draw(const gpu::Draw &d) {
     raster.depthClampEnable = (regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1;
     raster.depthBiasEnable = depth ? VK_TRUE : VK_FALSE; // the polygon offset, set at the draw
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    multisample.rasterizationSamples = msaa == 0 ? VK_SAMPLE_COUNT_1_BIT : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
+    multisample.rasterizationSamples = msaa == 0   ? VK_SAMPLE_COUNT_1_BIT
+                                       : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT
+                                                   : VK_SAMPLE_COUNT_4_BIT;
     if (sample_shading) multisample.sampleShadingEnable = VK_TRUE, multisample.minSampleShading = 1.0f;
     VkPipelineDepthStencilStateCreateInfo depth_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     if (depth) {
@@ -4512,14 +4870,18 @@ void Impl::draw(const gpu::Draw &d) {
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
         VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
         // (core) the lines' width, PA_SU_LINE_CNTL's
-        VK_DYNAMIC_STATE_LINE_WIDTH};
+        VK_DYNAMIC_STATE_LINE_WIDTH,
+        // extended dynamic state 3 where the device has it (the last three)
+        VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+        VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states));
+    dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states)) - (d_.dynamic_blend() ? 0u : 3u);
     dynamic.pDynamicStates = dynamic_states;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 4;
     rendering.pColorAttachmentFormats = color_formats;
-    rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = depth ? depth->image.format : VK_FORMAT_UNDEFINED;
+    rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat =
+        depth ? depth->image.format : VK_FORMAT_UNDEFINED;
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     info.pNext = &rendering;
     info.stageCount = stage_count;
@@ -4538,7 +4900,7 @@ void Impl::draw(const gpu::Draw &d) {
         // the vertex shader alone, rasterization discarded: no viewport,
         // multisample, depth, blend or dynamic state; a render pass without
         // attachments
-        key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), 0xE0u};
+        key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), 0xE0u, topology_class, host_key};
         raster = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
         raster.rasterizerDiscardEnable = VK_TRUE;
         raster.lineWidth = 1.0f;
@@ -4550,12 +4912,41 @@ void Impl::draw(const gpu::Draw &d) {
         info.pDynamicState = nullptr;
         rendering.colorAttachmentCount = 0;
     }
-    // made on a worker while the draw goes without it when there is a pixel
-    // shader (Xenia's D3D12 pipeline cache: draws without one get theirs at once)
-    bool pending = false;
-    VkPipeline pipe = pipeline(key, info, options_.async_pipelines && ps, pending);
+    // The libraries' keys (use_libraries_): the vertex input's attribute and
+    // topology class; the pre-rasterization stages' modules (each module is
+    // one shader in one host form for the renderer's life), the patch size,
+    // depth clamp and bias, and rasterization discarded; the pixel shader's
+    // module with the samples; the targets' formats and samples (with their
+    // blend state where it is not dynamic).
+    PipelineParts parts;
+    if (use_libraries_) {
+        auto words = [](std::vector<uint32_t> &out, uint64_t v) {
+            out.insert(out.end(), {uint32_t(v), uint32_t(v >> 32)});
+        };
+        parts.keys[0] = {0, uint32_t(vertex_input.vertexAttributeDescriptionCount ? vertex_attribute.format : 0),
+                         topology_class};
+        parts.keys[1] = {1, patch_points, uint32_t(raster.depthClampEnable), uint32_t(raster.depthBiasEnable),
+                         uint32_t(raster.rasterizerDiscardEnable)};
+        for (uint32_t i = 0; i < info.stageCount; i++)
+            if (stages[i].stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
+                parts.keys[1].push_back(stages[i].stage);
+                words(parts.keys[1], uint64_t(stages[i].module));
+            }
+        if (!export_only) {
+            parts.keys[2] = {2, msaa, uint32_t(sample_shading)};
+            words(parts.keys[2], uint64_t(fragment));
+            parts.keys[3] = {3, msaa, uint32_t(sample_shading), uint32_t(rendering.depthAttachmentFormat)};
+            parts.keys[3].insert(parts.keys[3].end(), color_key.begin(), color_key.end());
+        }
+    }
+    // made on a worker while the draw goes without it, or with a stand-in,
+    // when there is a pixel shader (Xenia's D3D12 pipeline cache: draws
+    // without one get theirs at once)
+    bool pending = false, stand_in = false;
+    VkPipeline pipe = pipeline(key, info, parts, options_.async_pipelines && ps, pending, stand_in);
     if (pending) return skip("pipeline not ready (being made)");
     if (!pipe) return skip("vkCreateGraphicsPipelines failed");
+    if (stand_in) report_.stand_in_draws++;
 
     // the vertex data: the ranges of the vertex fetch constants the shaders
     // use (address and size, as Xenia's IssueDraw requests them), merged,
@@ -4721,6 +5112,23 @@ void Impl::draw(const gpu::Draw &d) {
     vkCmdSetStencilOp(c, VK_STENCIL_FACE_FRONT_BIT, front.failOp, front.passOp, front.depthFailOp, front.compareOp);
     vkCmdSetStencilOp(c, VK_STENCIL_FACE_BACK_BIT, back.failOp, back.passOp, back.depthFailOp, back.compareOp);
     vkCmdSetDepthBiasEnable(c, raster.depthBiasEnable);
+    if (d_.dynamic_blend()) {
+        // extended dynamic state 3: the blend and write masks of the four
+        // attachments the pipelines have (those without a target unused)
+        VkBool32 enables[4];
+        VkColorBlendEquationEXT equations[4];
+        VkColorComponentFlags masks[4];
+        for (uint32_t i = 0; i < 4; i++) {
+            const VkPipelineColorBlendAttachmentState &b = blends[i];
+            enables[i] = b.blendEnable;
+            equations[i] = {b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp,
+                            b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp};
+            masks[i] = b.colorWriteMask;
+        }
+        set_blend_enable_(c, 0, 4, enables);
+        set_blend_equation_(c, 0, 4, equations);
+        set_write_mask_(c, 0, 4, masks);
+    }
     {
         // Lines as wide as PA_SU_LINE_CNTL's WIDTH says (half the width in
         // 12.4 fixed point, AMD's R6xx guide and freedreno's a2xx.xml; 8, one
@@ -4782,6 +5190,12 @@ void Impl::draw(const gpu::Draw &d) {
                      (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull,
                      regs_[r::RB_BLENDCONTROL[0]], regs_[reg::RB_COLOR_MASK] & 0xFFFF);
         for (auto [start, end] : vertex_ranges) std::fprintf(stderr, " %08X-%08X", start, end);
+        if (msaa)
+            std::fprintf(stderr, ", %ux MSAA (sample control %u, pattern %04X)", 1u << msaa,
+                         (regs_[r::SQ_CONTEXT_MISC] >> 2) & 3, regs_[r::SQ_INTERPOLATOR_CNTL] >> 16);
+        if (centroid) std::fprintf(stderr, ", centroid %04X", centroid);
+        if (color_control & 8) std::fprintf(stderr, ", alpha test %u", color_control & 7);
+        if (color_control & 16) std::fprintf(stderr, ", alpha to coverage %02X", color_control >> 24);
         std::fprintf(stderr, "\n");
     }
 }
@@ -4806,8 +5220,10 @@ void Impl::resolve() {
     acquire(source, y + h);
     if (!fatal_.empty()) return;
     if (options_.verbose)
-        std::fprintf(stderr, "  resolve: %s base %u (%u,%u %ux%u) -> %08X format %u%s%s\n", info.depth ? "depth" : "color",
-                     info.edram_base, x, y, w, h, info.dest_base, info.dest_format, info.clear_color ? ", clear color" : "",
+        std::fprintf(stderr,
+                     "  resolve: %s base %u (%u,%u %ux%u) -> %08X format %u from %u (msaa %u, samples %u)%s%s\n",
+                     info.depth ? "depth" : "color", info.edram_base, x, y, w, h, info.dest_base, info.dest_format,
+                     info.source_format, info.msaa, info.sample_select, info.clear_color ? ", clear color" : "",
                      info.clear_depth ? ", clear depth" : "");
 
     if (info.copy && w && h) {
@@ -5139,6 +5555,22 @@ void Impl::swap() {
     end_query();
     zpd_current_ = 0;
     uint64_t number = report_.swaps++;
+    {
+        // hitches: the frame's time making pipelines on this thread, and the
+        // time since the last swap
+        double spent = report_.pipeline_seconds - pipeline_seconds_at_swap_;
+        pipeline_seconds_at_swap_ = report_.pipeline_seconds;
+        if (spent > 0.004) report_.pipeline_hitches++;
+        report_.pipeline_frame_max = std::max(report_.pipeline_frame_max, spent);
+        auto now = std::chrono::steady_clock::now();
+        if (number) {
+            double gap = std::chrono::duration<double>(now - last_swap_time_).count();
+            if (gap > 0.05) report_.swap_gaps_50ms++;
+            if (gap > 0.1) report_.swap_gaps_100ms++;
+            report_.swap_gap_max = std::max(report_.swap_gap_max, gap);
+        }
+        last_swap_time_ = now;
+    }
     {
         // the display's look-up table mode (display_gamma), counted
         char what[96];

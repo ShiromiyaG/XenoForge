@@ -226,9 +226,60 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     std::vector<VkExtensionProperties> extensions(extension_count);
     vkEnumerateDeviceExtensionProperties(d->physical_, nullptr, &extension_count, extensions.data());
     std::vector<const char *> enabled;
-    for (const VkExtensionProperties &e : extensions)
-        if (std::strcmp(e.extensionName, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME) == 0) d->stencil_export_ = true;
+    auto has_extension = [&](const char *name) {
+        for (const VkExtensionProperties &e : extensions)
+            if (std::strcmp(e.extensionName, name) == 0) return true;
+        return false;
+    };
+    d->stencil_export_ = has_extension(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     if (d->stencil_export_) enabled.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+    // optional, beyond Vulkan 1.3 (docs/renderer.md, "Pipelines while they
+    // are made"): extended dynamic state 3's
+    // blend enables, equations and write masks (XF_VK_NO_EDS3=1 turns them
+    // off), and graphics pipeline libraries with fast linking (XF_VK_NO_GPL=1)
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+    {
+        const bool has_eds3 =
+            has_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && !turned_off("XF_VK_NO_EDS3");
+        const bool has_gpl = has_extension(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+                             has_extension(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) && !turned_off("XF_VK_NO_GPL");
+        VkPhysicalDeviceExtendedDynamicState3FeaturesEXT has_eds3_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+        VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT has_gpl_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+        has_eds3_features.pNext = &has_gpl_features;
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &has_eds3_features;
+        vkGetPhysicalDeviceFeatures2(d->physical_, &query);
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gpl_props{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        props.pNext = &gpl_props;
+        vkGetPhysicalDeviceProperties2(d->physical_, &props);
+        void **tail = &v13.pNext;
+        if (has_eds3 && has_eds3_features.extendedDynamicState3ColorBlendEnable &&
+            has_eds3_features.extendedDynamicState3ColorBlendEquation &&
+            has_eds3_features.extendedDynamicState3ColorWriteMask) {
+            eds3.extendedDynamicState3ColorBlendEnable = VK_TRUE;
+            eds3.extendedDynamicState3ColorBlendEquation = VK_TRUE;
+            eds3.extendedDynamicState3ColorWriteMask = VK_TRUE;
+            *tail = &eds3, tail = &eds3.pNext;
+            enabled.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+            d->dynamic_blend_ = true;
+        }
+        // (without fast linking a linked pipeline may cost as much as a whole
+        // one, so the libraries would gain nothing)
+        if (has_gpl && has_gpl_features.graphicsPipelineLibrary && gpl_props.graphicsPipelineLibraryFastLinking) {
+            gpl.graphicsPipelineLibrary = VK_TRUE;
+            *tail = &gpl, tail = &gpl.pNext;
+            enabled.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+            enabled.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+            d->pipeline_library_ = true;
+        }
+    }
     if (d->surface_) enabled.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     device_info.pNext = &features;

@@ -104,6 +104,20 @@ void print_renderer_report(const render::Report &r) {
         (unsigned long long)r.textures_evicted_for_room, (unsigned long long)r.textures_refused);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
                 r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
+    std::printf(
+        "renderer: %llu pipeline libraries, %llu pipelines linked, %llu placeholders, %llu draws by a stand-in; "
+        "hitches: %llu frames with more than 4 ms making pipelines (at most %.1f ms), %llu swaps more than 50 ms "
+        "apart, %llu more than 100 ms (at most %.0f ms)\n",
+        (unsigned long long)r.pipeline_libraries, (unsigned long long)r.pipelines_linked,
+        (unsigned long long)r.pipeline_placeholders, (unsigned long long)r.stand_in_draws,
+        (unsigned long long)r.pipeline_hitches, r.pipeline_frame_max * 1000.0, (unsigned long long)r.swap_gaps_50ms,
+        (unsigned long long)r.swap_gaps_100ms, r.swap_gap_max * 1000.0);
+    if (r.pipeline_waits)
+        std::printf(
+            "renderer: %llu pipelines made on the workers, their draws without one for %.0f ms on average, %.0f "
+            "ms at most\n",
+            (unsigned long long)r.pipeline_waits, r.pipeline_wait_seconds * 1000.0 / double(r.pipeline_waits),
+            r.pipeline_wait_max * 1000.0);
     if (!r.gpu_time.empty()) {
         // XF_GPU_TIME: the GPU's time by kind of work, the largest first
         std::vector<std::pair<std::string, render::Report::GpuTime>> kinds(r.gpu_time.begin(), r.gpu_time.end());
@@ -222,6 +236,20 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
         char name[32];
         std::snprintf(name, sizeof(name), "%08X.vkpipelines", g.xex.execution.title_id);
         o.pipeline_cache = std::filesystem::temp_directory_path(ec) / "xenoforge-cache" / name;
+    }
+    // XF_PIPELINE_CACHE=<file>: the pipeline cache elsewhere (an empty one
+    // for a cold start)
+    if (const char *cache = std::getenv("XF_PIPELINE_CACHE")) o.pipeline_cache = cache;
+    // XF_PIPELINES=wait|skip|placeholder|library: each pipeline waited for
+    // (boot's default), or made on worker threads with the draws meanwhile
+    // skipped, drawn by a placeholder or by a linked pipeline (renderer.h,
+    // Options::pipeline_stand_in; the player's default is the option's)
+    if (const char *mode = std::getenv("XF_PIPELINES")) {
+        std::string m = mode;
+        o.async_pipelines = m != "wait";
+        if (m == "skip") o.pipeline_stand_in = render::Options::PipelineStandIn::skip;
+        if (m == "placeholder") o.pipeline_stand_in = render::Options::PipelineStandIn::placeholder;
+        if (m == "library") o.pipeline_stand_in = render::Options::PipelineStandIn::library;
     }
     // the GPU's time by kind of work, in the report (XF_GPU_TIME=1; =draws
     // each draw's too)
@@ -388,15 +416,22 @@ void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
         loads = double(report.textures - r.last_texture_loads) / since;
         r.last_busy = report.seconds, r.last_busy_wall = wall, r.last_texture_loads = report.textures;
     }
-    char renderer[192] = "";
-    if (g.renderer && busy < 0)
+    char renderer[288] = "";
+    if (g.renderer && busy < 0) {
         std::snprintf(renderer, sizeof(renderer), ", renderer busy -");
-    else if (g.renderer)
+    } else if (g.renderer) {
         // with the texture cache's size, for seeing that memory stays flat,
-        // and its loads a second
-        std::snprintf(renderer, sizeof(renderer), ", renderer busy %.0f%%, textures %llu (%.0f MB, %.0f loads/s)",
+        // and its loads a second; and the pipelines so far: made, the draws
+        // skipped waiting for one and those drawn by a stand-in
+        auto waiting = report.skipped.find("pipeline not ready (being made)");
+        std::snprintf(renderer, sizeof(renderer),
+                      ", renderer busy %.0f%%, textures %llu (%.0f MB, %.0f loads/s), pipelines %llu (%llu draws "
+                      "skipped, %llu by a stand-in)",
                       busy * 100, (unsigned long long)report.textures_held, double(report.texture_bytes) / (1 << 20),
-                      loads);
+                      loads, (unsigned long long)report.pipelines,
+                      (unsigned long long)(waiting == report.skipped.end() ? 0 : waiting->second),
+                      (unsigned long long)report.stand_in_draws);
+    }
     char resident[96] = "";
     if (uint64_t bytes = resident_bytes())
         std::snprintf(resident, sizeof(resident), ", resident %.0f MB", double(bytes) / (1 << 20));

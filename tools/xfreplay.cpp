@@ -11,9 +11,13 @@
 // depth_float24_round, --depth-float24-convert its depth_float24_convert_in_pixel_shader,
 // --no-gamma-unorm16 its gamma_render_target_as_unorm16 off (renderer.h). --texture-memory soft,hard[,lifetime] sets
 // the texture cache's memory limits (Xenia's texture_cache_memory_limit_*; renderer.h).
+// --async-pipelines makes pipelines on worker threads as the player does, --stand-in says what
+// draws meanwhile (renderer.h's PipelineStandIn), --linked-pipelines links every pipeline from
+// libraries and never makes one whole.
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
 //            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
+//            [--stand-in skip|placeholder|library] [--linked-pipelines]
 //            [--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round]
 //            [--depth-float24-convert] [--no-gamma-unorm16]
 //            [--texture-memory soft,hard[,lifetime]] [-v]
@@ -38,6 +42,7 @@ namespace {
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
                          "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
+                         "[--stand-in skip|placeholder|library] [--linked-pipelines] "
                          "[--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] "
                          "[--depth-float24-convert] [--no-gamma-unorm16] "
                          "[--texture-memory soft,hard[,lifetime]] [-v]\n");
@@ -65,6 +70,22 @@ int main(int argc, char **argv) {
         // pipelines made on worker threads, their draws skipped meanwhile (as
         // the player plays; a replay otherwise waits for each)
         else if (a == "--async-pipelines") options.async_pipelines = true;
+        // what draws while they are made: skip, placeholder or library
+        else if (a == "--stand-in" && i + 1 < argc) {
+            std::string m = argv[++i];
+            using S = xf::render::Options::PipelineStandIn;
+            if (m == "skip")
+                options.pipeline_stand_in = S::skip;
+            else if (m == "placeholder")
+                options.pipeline_stand_in = S::placeholder;
+            else if (m == "library")
+                options.pipeline_stand_in = S::library;
+            else
+                return usage();
+        }
+        // every pipeline linked from libraries, never made whole
+        else if (a == "--linked-pipelines")
+            options.linked_pipelines_only = true;
         // occlusion query reports with the GPU's counts (else the fake ones)
         else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
         // Xenia's depth_float24_round
@@ -120,6 +141,17 @@ int main(int argc, char **argv) {
     std::printf("  made: %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
                 (unsigned long long)report.render_targets, (unsigned long long)report.textures,
                 (unsigned long long)report.pipelines, (unsigned long long)report.shaders);
+    std::printf("  pipelines: %.3f s making them, %llu libraries, %llu linked, %llu placeholders, %llu draws by a "
+                "stand-in\n",
+                report.pipeline_seconds, (unsigned long long)report.pipeline_libraries,
+                (unsigned long long)report.pipelines_linked, (unsigned long long)report.pipeline_placeholders,
+                (unsigned long long)report.stand_in_draws);
+    if (report.pipeline_waits)
+        std::printf("  %llu pipelines made on the workers, their draws without one for %.1f ms on average, %.1f ms "
+                    "at most\n",
+                    (unsigned long long)report.pipeline_waits,
+                    report.pipeline_wait_seconds * 1000.0 / double(report.pipeline_waits),
+                    report.pipeline_wait_max * 1000.0);
     std::printf("  %.3f s in the renderer: %.3f s in submissions (%.3f s waiting for the GPU), %.3f s in resolves, "
                 "%.3f s checking textures, %.3f s decoding them, %.3f s on vertex data (%.1f KB uploaded), "
                 "%.3f s copying %.1f KB that resolves wrote into memory\n",

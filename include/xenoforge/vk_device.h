@@ -94,6 +94,12 @@ public:
     bool wide_lines() const { return wide_lines_; }
     float min_line_width() const { return wide_lines_ ? line_width_range_[0] : 1.0f; }
     float max_line_width() const { return wide_lines_ ? line_width_range_[1] : 1.0f; }
+    // VK_EXT_extended_dynamic_state3's blend enables, blend equations and
+    // color write masks set at the draw (all three, or none of them)
+    bool dynamic_blend() const { return dynamic_blend_; }
+    // VK_EXT_graphics_pipeline_library with fast linking: pipelines linked
+    // from libraries of their four parts in a fraction of a millisecond
+    bool pipeline_library() const { return pipeline_library_; }
 
     // host-visible and coherent (mapped), or device-local; host_reads: the
     // host reads it back, so cached memory where the device has it
@@ -159,6 +165,7 @@ private:
     bool tessellation_shader_ = false;
     bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false;
     float line_width_range_[2] = {1.0f, 1.0f};
+    bool dynamic_blend_ = false, pipeline_library_ = false;
     std::mutex queue_mutex_;
 };
 

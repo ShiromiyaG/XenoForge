@@ -136,6 +136,7 @@ xf_shader(edram_load_depth.frag edram_load.frag -DDEPTH)
 xf_shader(edram_load_stencil.frag edram_load.frag -DDEPTH -DSTENCIL)
 xf_shader(depth_float24.frag depth_float24.frag)
 xf_shader(depth_float24_round.frag depth_float24.frag -DROUND)
+xf_shader(placeholder.frag placeholder.frag)
 xf_shader(resolve.comp resolve.comp)
 xf_shader(texture_load.comp texture_load.comp)
 xf_shader(texture_load_test.comp texture_load.comp -DPARAMS_BUFFER) # texture_gpu_test's
