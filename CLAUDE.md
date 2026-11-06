@@ -1,9 +1,13 @@
 # XenoForge — instruções para o Claude
 
-Sistema enxuto de Xbox 360 para jogos recompilados estaticamente, escrito do zero com a pesquisa do Xenia
-como referência: recompilador, kernel, GPU, som e input só do que os jogos pedem (medido). Mesmo método do
-`../runtime` (o do 3DS). Plano: `docs/plan.md`; renderizador: `docs/renderer.md`; o que os jogos importam:
-`docs/lean-kernel.md`.
+**Emulador AoT de Xbox 360 com SDK para ports** (objetivo revisto com o dono em 2026-11-05): o launcher
+recompila o disco do jogador na máquina dele numa biblioteca do jogo em cache, e o player genérico a roda; o
+SDK serve ports de jogos específicos como o rexglue, mas mais fácil de depurar (achar o erro é um recurso:
+relatórios com a pilha do guest, interpretador conferindo o código gerado, replays exatos, oráculo para cada
+parte). Escrito do zero com o Xenia como referência; kernel e GPU completados por inventário (famílias
+inteiras portadas do Xenia de uma vez, `docs/plan.md` "Everything left"), não só o que os jogos pedem. Na GPU,
+onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segunda referência. Plano:
+`docs/plan.md`; renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-kernel.md`.
 
 - Repositório local (ainda sem remoto). Commits locais de rotina permitidos; criar repo no GitHub ou dar push
   só quando o dono pedir. Docs, comentários, logs e commits em inglês; só este arquivo em português.

@@ -1,10 +1,15 @@
 # XenoForge
 
-A lean Xbox 360 system for statically recompiled games: the recompiler, the
-kernel calls, the GPU, the sound and the input the games ask for, measured,
-in place of a whole emulator. Written from scratch in C++20, with
+An ahead-of-time Xbox 360 emulator, and an SDK for ports of specific games.
+
+- **The emulator** recompiles your own disc on your machine into native code,
+  once, and runs it on its own kernel, GPU, sound and input.
+- **The SDK** lets a port of one game replace and hook its functions and draw
+  natively, built to make errors easy to find.
+
+Written from scratch in C++20, with
 [Xenia](https://github.com/xenia-canary/xenia-canary)'s research as the
-reference for how the console behaves.
+reference for how the console behaves ([docs/plan.md](docs/plan.md)).
 
 No game is included or needed to build it. To run anything you need your own
 copy of a game.

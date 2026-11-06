@@ -1,35 +1,108 @@
-# XenoForge: the plan (2026-11-04)
+# XenoForge: the plan (2026-11-04; goal revised 2026-11-05)
 
-A lean Xbox 360 system for statically recompiled games, written from scratch
-with Xenia's research as the reference: the recompiler, the kernel calls, the
-GPU, the sound and the input the games ask for, measured, not a whole
-emulator. The method is the 3DS runtime's (`../runtime`): its own
-recompiler, its own renderer, a player and a launcher, tools that run a game
-without a window and compare it with a reference emulator.
+**An ahead-of-time Xbox 360 emulator, and an SDK for ports of specific
+games.** Decided with the owner on 2026-11-05.
+
+- **The emulator.** The player points the launcher at their own disc. The
+  game's code is recompiled on their machine, once, into native code (a game
+  library kept in a cache by the executable's digest) and runs on
+  XenoForge's kernel, GPU, sound and input. Code that discovery missed runs
+  in the interpreter and is taken into the next build.
+- **The SDK.** For a port of one game, as rexglue serves its ports: the
+  same recompiler and runtime as a CMake package, a project file per game,
+  guest functions replaced by native C++, hooks, a native renderer in the
+  console's place, options. El Chavo Kart's and Ben 10's ports move to it
+  from the rexglue fork.
+- **Easier to debug than rexglue: finding the error is a feature.** Every
+  failure names a guest address and what it was compared with. The
+  generated code steps as PPC in the host debugger, the interpreter and the
+  generated code check each other, a run replays exactly, and every part
+  has an oracle to compare against ("Debugging" below).
+
+Both are one core, written from scratch with Xenia's research as the
+reference: the recompiler, the kernel, the GPU, the sound, the input. The
+method is still the 3DS runtime's (`../runtime`): its own recompiler and
+renderer, a player and a launcher, and tools that run a game without a
+window and compare it with a reference emulator.
 
 ## Principles
 
-1. **Measured, not guessed.** The kernel implements what the games import
-   and call ([lean-kernel.md](lean-kernel.md)); the renderer what the games
-   and the traces use. What is asked for and missing is counted and
-   reported, never silently skipped.
+1. **Complete, ported by inventory; measured for order.** An emulator runs
+   games nobody has measured, so the kernel and the GPU cover the console as
+   Xenia does. They are ported in bulk, a whole family at a time, from the
+   inventory in "Everything left", with Xenia's stubs where Xenia stubs.
+   What the games ask for and lack is counted and reported, never silently
+   skipped, and that decides what comes first
+   ([lean-kernel.md](lean-kernel.md)).
 2. **The hardware, not the games.** The kernel and the renderer implement
-   the console. What is particular to a game lives in its port (hooks,
-   native rendering, options), never in XenoForge.
-3. **An oracle, not a dependency.** xenia-canary (`../xenia-canary`, BSD) is
-   the reference for how the console behaves; the tools compare against it.
-   The rexglue fork keeps running El Chavo Kart and Ben 10 until XenoForge
-   runs them.
+   the console. What is particular to a game lives in its port (SDK) or in
+   the emulator's per-game settings, never in the core.
+3. **Oracles, not dependencies:**
+   - xenia-canary (`../xenia-canary`, BSD) is the reference for how the
+     console behaves, and the tools compare against it.
+   - For the GPU, where Xenia has no answer (features it lacks or
+     approximates), XNA Game Studio 4.0 is the second reference: it carries
+     Microsoft's own Xbox 360 shader tools ("References for the GPU" below).
+   - The rexglue fork keeps running El Chavo Kart and Ben 10 until their
+     ports move to the SDK.
 4. **Translate what is specified and dull, write anew what is design.**
-   Translated from Xenia, with its notice at the top of each file and checked
-   against it in the same session: the disc, the executable, the export
-   tables, formats and tiling, the microcode's layout, VMX128's semantics.
-   Written anew: the recompiler's output, the scheduler and the kernel's
-   objects, the renderer, the tools, the player and the launcher.
-5. **Nothing of any game in the repository.** XenoForge reads the player's
-   own disc; ports and their libraries are built on the player's machine.
+   - Translated from Xenia, with its notice at the top of each file and
+     checked against it in the same session: the disc, the executable, the
+     export tables and the kernel's exports, formats and tiling, the
+     microcode's layout, VMX128's semantics.
+   - Written anew: the recompiler's output, the scheduler and the kernel's
+     objects, the renderer, the tools, the player, the launcher and the SDK.
+5. **Nothing of any game in the repository, nor in what is distributed.**
+   The emulator ships no game code: it recompiles the player's own disc on
+   their machine. A port's game library is likewise built on the player's
+   machine.
 6. **Every step checks itself**: tests in the repository, and a check against
-   real data or the oracle written down with the step.
+   real data or an oracle, written down with the step.
+
+## Two products, one core
+
+| | the emulator (track D) | the SDK (track E) |
+| --- | --- | --- |
+| who uses it | a player with a disc | someone porting one game |
+| the game's code | recompiled by the launcher on the player's machine, at first run, into a game library in a cache | recompiled in the port's build, with the port's project file (names, extra functions, overrides) |
+| the runtime | the generic `player`, loading the game library | linked into the port's executable |
+| what is particular to a game | per-game settings and patches (data, as Xenia's game config) | the port's C++: replaced functions, hooks, a native renderer, options |
+| debugging | crash reports with the guest stack, the overlay's debugger, traces | everything the emulator has, plus the host debugger stepping PPC in the generated code |
+
+What both need first: the generated code as a library behind a stable
+interface (the guest context, memory, the calls into the system), loaded by
+the generic player or linked by a port.
+
+## References for the GPU
+
+- **Xenia** first: its translator, render targets, texture formats and
+  tiling, and its trace dump as the picture to match. The trace writer
+  (2026-11-05) gives that picture for any scene a run reaches.
+- **XNA Game Studio 4.0** where Xenia has no answer. Its `XnaNative.dll`
+  (Microsoft's, unpacked without installing; `tools/xna/README.md`; nothing
+  of it in the repository) exports:
+  - the Xbox 360 HLSL compiler (`CreateCompileShaderFromSourceForXbox`,
+    `CompileEffectForXbox`);
+  - an assembler of Xenos microcode (`CreateAssembleShaderFromSourceForXbox`);
+  - `FillXboxBuffer`, the packing of resources the way the console reads
+    them;
+  - XMemCompress (`Compress`, `Decompress`).
+
+  How they are used:
+  - **Encodings.** Microcode written in assembly for each feature the
+    translator lacks (memexport's `alloc export` and `eA`/`eM`, the fetch
+    and ALU forms not yet seen) gives the instruction words as Microsoft
+    encodes them.
+  - **Meaning.** HLSL written for a feature is compiled twice: by XNA's
+    compiler into microcode, which our translator runs, and by a host HLSL
+    compiler into SPIR-V, which runs directly. The two results must agree,
+    so the HLSL source is the oracle where Xenia has none.
+  - **Layouts.** Textures and vertex data packed by `FillXboxBuffer` show the
+    tiling and endianness of the formats XNA writes.
+
+  Its limits: there is no console and no D3D runtime in it. It gives
+  Microsoft's tools, not the GPU's behavior, so what only hardware shows
+  (precision, undefined cases) stays Xenia's or is counted as open.
 
 ## Stack
 
@@ -54,7 +127,9 @@ access, the calls into the system), so its thousands of files compile fast.
 | Sound | the APU's XMA contexts (XAudio2 itself is the game's code) | step A6 |
 | GPU | PM4 front end and the Xenos renderer ([renderer.md](renderer.md)) | track B |
 | Player | SDL3 window, input, sound, ImGui overlay (F1), `config.toml` | C1 in ([runtime.md](runtime.md), [input.md](input.md)) |
-| Launcher | the player's ISO set up and recompiled on their machine; settings, controls, port options | track C, from the 3DS runtime |
+| Launcher | the emulator's front door: the player's ISO recompiled on their machine into a cached game library; settings, controls | C2, D2 |
+| Game library | the generated code behind a stable interface, loaded by the generic player or linked by a port | D1 |
+| SDK | CMake package, project file, function replacement and hooks, native renderer | track E |
 | `boot` | a game run without a window: counts, shots, recordings, the deterministic mode | step A4 |
 
 ## Threads
@@ -73,6 +148,29 @@ one kernel written against a scheduler interface:
 
 ## Debugging
 
+Finding the error is a feature of XenoForge, not an afterthought; this is
+where it must beat rexglue. Each item names where an error is and what it
+differs from.
+
+- **Crash and stop reports.** On a fault, or on an export that is missing or
+  fails, the report gives:
+  - the guest address and its function;
+  - the guest stack (from the r1 chain and the saved LRs);
+  - the thread and the last kernel calls.
+  The emulator writes it to a file; boot and the SDK print it.
+- **The interpreter checks the generated code** (lockstep): chosen
+  functions, or a sampled share of all calls, run both ways from the same
+  state. The first instruction whose registers or memory differ is
+  reported. This finds recompiler errors without a reference emulator.
+- **Exact replays.** The deterministic mode (A5) and input recordings make a
+  run repeat, so an error seen once is seen every time, then bisected.
+- **Every part has an oracle and a tool to compare with it:**
+  - instructions: `ppc_oracle` and Xenia's test vectors;
+  - sound: `xma_oracle`;
+  - pictures: the GPU trace writer and Xenia's trace dump, or XNA's tools
+    where Xenia has no answer.
+  Each export's calls are counted, and `XF_LOG_*` logs one family's calls
+  with their arguments and answers.
 - **PPC in the host debugger.** The recompiler writes a listing of each
   function's PPC and `#line` directives into the C++ pointing at it, so
   Visual Studio or WinDbg step through PPC instructions; a natvis shows the
@@ -325,58 +423,132 @@ traces, without a recompiled game.
   to confirm that a pad moves things and that sound is heard (PCM frames
   reach the device; XMA is decoded since A6).
 - **C2. The launcher** (ISO, recompile, settings, controls, port options).
+  It becomes the emulator's front door (D2).
+
+**Track D: the AoT emulator** (goal of 2026-11-05)
+
+- **D1. The game as a library behind a stable interface.** The generated
+  code is built into a game library: a DLL or `.so`, with its module tables
+  and an interface version. It reaches the runtime only through a narrow
+  table: the guest context, memory, dispatch, the kernel's entry points.
+  The generic `player` loads the game library that matches the disc; ports
+  link the same code statically.
+- **D2. Recompiling on the player's machine.**
+  - The launcher bundles the compiler (clang and lld, Apache 2.0 with the
+    LLVM exception; about 150-200 MB).
+  - At a disc's first run it runs discovery and emission, then compiles the
+    game library at `-O2` (about 5 minutes for El Chavo Kart's 4.7M
+    instructions on 12 threads), with progress shown.
+  - It keeps the result in a cache, keyed by the executable's digest, any
+    title update, and XenoForge's interface version.
+- **D3. What discovery missed.** It runs in the interpreter and is logged
+  by address. The next build takes those functions in, as rexglue's
+  iterated discovery does by hand. Title updates (`.xexp`) are applied
+  before recompiling.
+- **D4. Per-game settings and patches**, as data (Xenia's game config and
+  patch files as the model): resolution, frame limits, workarounds. None of
+  them lives in the core's code.
+- **D5. Compatibility breadth.** The kernel completed by inventory, then
+  the GPU across many games. Each game is checked with traces of our own
+  runs against Xenia's dump, and against XNA's tools where Xenia has no
+  answer. A compatibility list is kept per game.
+
+**Track E: the SDK** (ports of specific games, as rexglue)
+
+- **E1. The package.** `find_package(XenoForge)`: the runtime libraries,
+  the headers, `xfrecomp`, and CMake functions that turn a disc and a
+  project file into a game library.
+- **E2. The project file** (TOML): the game's names for functions (from a
+  map or a Ghidra export), functions to add or skip, jump tables, and the
+  functions the port replaces.
+- **E3. Replacing and hooking:**
+  - a guest function replaced by native C++ (registered against its
+    address, at link time or at run time);
+  - hooks before and after a call, and at an address inside a function;
+  - the guest's memory and context through typed big-endian helpers.
+- **E4. A native renderer in the console's place**, the skate3recomp model:
+  draws captured from the game's engine, the Xenos path skipped for what
+  the port draws itself, and a toggle back to the emulated picture.
+- **E5. Debugging for porters:** everything in "Debugging"; the port's
+  hooks in the reports' stacks; and the hooks reloaded without restarting
+  the game where they can be.
+- **E6. El Chavo Kart's and Ben 10's ports moved from the rexglue fork**,
+  with the UE3 native renderer work (`../Chaves/docs/native-renderer-re.md`).
+  This is the proof that the SDK serves a real port.
 
 **Where they meet**
 
 - **M1. El Chavo Kart on XenoForge with a picture** (A4, B3, C1), then
-  Ben 10.
-- **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work
-  (`../Chaves/docs/native-renderer-re.md`) moved over as El Chavo Kart's port.
+  Ben 10. Reached on 2026-11-05: a person played it, with the pad and the
+  sound confirmed.
+- **M2. The emulator runs a disc it was never built for.** D1 and D2: the
+  launcher recompiles El Chavo Kart from the ISO into the cache, and the
+  generic player runs it.
+- **M3. A port on the SDK** (E1-E3, E6): El Chavo Kart's port built on
+  XenoForge instead of the rexglue fork.
+- **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work moved
+  over as El Chavo Kart's port (E4).
 
-Next (2026-11-05, end of the day): M1 is there as a person sees it. El
-Chavo Kart and Ben 10 run generated in the player, rendered at their caps
-(30 and 60 swaps a second, B4), with input and with XMA decoded as Xenia
-decodes it (A6). The owner played El Chavo Kart in the player: a pad moves
-it past the title into the menus, and the sound is right (music and
-effects). They saw small color errors past the menus (under way). The
-keyboard is not confirmed yet.
+Next (2026-11-05, night; goal revised to the AoT emulator and the SDK):
+
+**M1 is reached.** El Chavo Kart and Ben 10 run generated in the player,
+with these confirmed by a person:
+- the picture, at their caps (30 and 60 swaps a second);
+- the pad;
+- the sound, with XMA decoded as Xenia decodes it.
+
+**Done that day:**
+- the player presents on the GPU;
+- the trace writer, and El Chavo Kart's colors past the menus;
+- Forza Horizon's and Sonic's frames;
+- the network offline;
+- stack switches generated, so all eight games enter the interpreter 0
+  times in 30 s.
+
+The keyboard is not confirmed yet.
+
+**Under way, in parallel:**
+- the kernel completed by inventory, in four families:
+  - xboxkrnl and xbdm;
+  - XAM users, profiles, locale and the Win32 re-exports;
+  - XAM content, loader, dash, avatars, Kinect and tiles;
+  - XAM UI and the network;
+- the GPU's cost in 3D scenes (the owner's RTX 5060 runs at 100% there);
+- memexport (El Chavo Kart's kart is black in races);
+- the launcher (C2);
+- the recompiler's leftovers (`lswx`/`stswx`, Forza Horizon's table,
+  precision).
 
 Then, in order:
-1. Play both games through: what they ask of the kernel and the renderer
-   past the menus (races, levels, saves). Begun for the renderer
-   (2026-11-05, later): traces written by our own runs and drawn by Xenia
-   as the reference; El Chavo Kart's menus, its park scene and a race went
-   from 55-131 of 255 off Xenia (3D frames) to 0.005-0.14 (gamma, signed
-   and biased textures, pixel parameters, the LOD bias, samplers, polygon
-   offset and render targets keyed by storage format as Xenia's;
-   [renderer.md](renderer.md), "Traces of live runs"). Next there:
-   memexport (the race's kart is black, in Xenia's picture of our traces
-   too).
-2. ~~The player presents the front buffer on the GPU~~ (done 2026-11-05:
-   renderer.md, "Decisions"; runtime.md, "The player"). FFmpeg is loaded
-   at run time and the player has a package to ship (runtime.md, "Sound").
-3. The other six games under the renderer, against Xenia's traces. Begun
-   with our own traces (2026-11-05, later; [renderer.md](renderer.md),
-   "Traces of live runs"): Forza Horizon matches Xenia with the display's
-   PWL gamma ramp in; Sonic Unleashed's title matches with getCompTexLOD
-   and getWeights in; Red Dead Redemption's title is 10.9 of 255 off
-   (textures it makes from MSAA gamma targets), and its renderer cost is
-   the texture checks. BC2, Gears of War 3 and Reach not run yet.
-4. The kernel families they reach first. Done for the first two: the
-   network offline (NetDll_*, XNet; Gears of War 3 polls its socket once a
-   frame and runs at 30 swaps a second) and XCustomRegisterDynamicActions
-   (Reach); runtime.md, "XAM". Next for those two: the XamShow*UI calls,
-   XamVoiceSetMicArrayIdleUsers (looked up, absent in Xenia too).
-5. A fiber scheduler of our own (done, 2026-11-05: each guest stack on a
-   host fiber of its own, the switching functions generated, longjmps and
-   catches taken by the frame that set them up; recompiler.md, "Stack
-   switches"; runtime.md, "Stacks"). All eight games enter the interpreter
-   0 times in 30 s (Reach 1,803 before, BC2 16).
-6. The launcher (C2), the deterministic mode (A5), and the A2 leftovers
-   (exception funclets, `#line`, yield points).
+1. D1: the game as a library behind a stable interface, which the generic
+   player loads.
+2. D2 with C2: the launcher recompiles a disc on the player's machine into
+   the cache (M2).
+3. The GPU completed by inventory, Xenia first and XNA's tools where Xenia
+   has no answer:
+   - the texture formats, the primitive types and tessellation;
+   - MSAA resolves and occlusion queries;
+   - shader compiles off the GPU thread;
+   - the other games' traces (Red Dead Redemption's noise; BC2, Gears of
+     War 3 and Reach).
+4. Debugging:
+   - crash reports with the guest stack;
+   - the lockstep check of generated code against the interpreter;
+   - the `#line` listing (A2);
+   - the deterministic mode and replays (A5).
+5. The SDK (E1-E3, E6): the package, the project file, replacing and
+   hooking; El Chavo Kart's port moved from the rexglue fork (M3).
+6. Play both games through (the owner), and D3-D5, E4-E5.
 
 ## Decisions
 
+- 2026-11-05: **the goal is revised** with the owner: an ahead-of-time
+  Xbox 360 emulator (a disc recompiled on the player's machine into a
+  cached game library), with an SDK for ports of specific games as rexglue
+  serves them, and easier to debug than rexglue. The kernel and the GPU are
+  completed by inventory, ported in bulk, instead of only what measured
+  games ask. XNA Game Studio 4.0's Xbox 360 tools become the GPU's second
+  reference where Xenia has no answer.
 - 2026-11-04: written from scratch, Xenia as the reference; named
   XenoForge. Vulkan 1.3 only. xenia-canary is the oracle; the rexglue fork
   is left as it is and keeps running the two games meanwhile.
