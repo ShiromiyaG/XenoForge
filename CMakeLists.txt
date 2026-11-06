@@ -33,6 +33,7 @@ add_library(xenoforge STATIC
     src/md5.cpp
     src/snappy.cpp
     src/gpu_trace.cpp
+    src/game_build.cpp
     src/trace_stats.cpp
     src/ucode.cpp
     src/ucode_parse.cpp
