@@ -206,6 +206,16 @@ void startup(ppc::Context &c) {
     CHECK(xam(c, "NetDll_WSACleanup", {2}) == 0xFFFFFFFF);
     CHECK(xam(c, "NetDll_WSAStartup", {1, 0x0202, data}) == 0);
     CHECK(K->load16(data) == 0x0202 && K->load16(data + 2) == 0x0202);
+    // before the title's XNetStartup: pending, the structure zeroed but the
+    // console's 1 at +0x20 (the system application's startup does not count)
+    uint32_t early = local(c, 0x6C0);
+    std::memset(K->host(early), 0xEE, 0x30);
+    CHECK(xam(c, "NetDll_XNetStartup", {2, 0}) == 0);
+    CHECK(xam(c, "NetDll_XNetGetTitleXnAddr", {1, early}) == 0);
+    CHECK(K->load32(early) == 0 && K->load32(early + 4) == 0 && K->load32(early + 0x1C) == 0 &&
+          K->host(early)[0x20] == 1 && K->host(early)[0x21] == 0 && K->host(early)[0x23] == 0 &&
+          K->host(early)[0x24] == 0xEE);
+    CHECK(xam(c, "NetDll_XNetCleanup", {2}) == 0);
     // XNetStartupParams: 32 KB receive buffers by default
     uint32_t params = local(c, 0x600);
     std::memset(K->host(params), 0, 13);

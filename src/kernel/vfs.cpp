@@ -360,15 +360,33 @@ class HostStream : public Stream {
     uint32_t access_;
 };
 
+// A host path that may pass Windows' MAX_PATH: a FATX path of 240 characters under a storage
+// root already deep takes more than 260. The extended-length prefix lifts that; elsewhere the
+// path is as it is.
+std::filesystem::path extended_path(const std::filesystem::path &p) {
+#ifdef _WIN32
+    std::wstring w = std::filesystem::absolute(p).lexically_normal().native();
+    while (w.size() > 3 && (w.back() == L'\\' || w.back() == L'/')) w.pop_back();
+    if (w.rfind(L"\\\\?\\", 0) == 0) return w;
+    if (w.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + w.substr(2);
+    return L"\\\\?\\" + w;
+#else
+    return p;
+#endif
+}
+
 class HostDevice : public Device {
   public:
     HostDevice(const std::string &mount_path, const std::filesystem::path &host_path, bool read_only, bool package)
         : Device(mount_path, package ? "STFS" : "FATX", read_only) {
+        // FATX's limits (Free60's FATX page, "Limitations"): names of 42 characters, paths of 240;
+        // Xenia's host device says 255 for the names and has no path limit
+        if (!package) component_name_max_length = 42, max_path_length = 240;
         total_units = available_units = 128 * 1024;
         root = std::make_shared<Entry>();
         root->device = this;
         root->attributes = ATTRIBUTE_DIRECTORY;
-        root->host_path = host_path;
+        root->host_path = extended_path(host_path);
         std::vector<std::filesystem::path> ancestors;
         populate(*root, ancestors);
     }
@@ -851,6 +869,18 @@ uint32_t FileSystem::open(std::shared_ptr<Device> root_device, Entry *root, std:
         }
         break;
     default: break;
+    }
+
+    // a new name must fit the device (FATX: 42 characters, 240 in a path); a file that exists
+    // was made elsewhere (a host directory's), and is let be
+    if (!entry && parent && !parent->device->read_only) {
+        std::string_view name = base.empty() ? std::string_view(path) : name_of(path);
+        const Device &d = *parent->device;
+        size_t in_device = (parent->path.empty() ? 0 : parent->path.size() + 1) + name.size();
+        if (name.size() > d.component_name_max_length || (d.max_path_length && in_device > d.max_path_length)) {
+            action = Action::DoesNotExist;
+            return X_STATUS_OBJECT_NAME_INVALID;
+        }
     }
 
     bool wants_write = access & (WRITE_DATA | APPEND_DATA);

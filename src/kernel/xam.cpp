@@ -25,17 +25,23 @@
 //   - XamLoaderLaunchTitle and XamLoaderTerminateTitle stop the run with
 //     the reason (Xenia asks to be restarted with the launch data), ending
 //     the calling thread;
-//   - XamTaskSchedule hands out the task thread's handle (Xenia: 12345,
-//     which XamTaskCloseHandle then fails to close).
+//   - XamTaskSchedule queues to a pool of worker threads and hands out the
+//     task object's address with the low bit set, as the console's XAM does
+//     (Xenia: a thread a task and the handle 12345, which XamTaskCloseHandle
+//     then fails to close); see "tasks" below.
 
 #include "xam.h"
 
 #include "xenoforge/xex.h"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <regex>
+#include <set>
 
 namespace xf::kernel {
 namespace {
@@ -521,42 +527,232 @@ XF_EXPORT(xam, XamGetPrivateEnumStructureFromHandle) {
 }
 
 // ---- tasks (xam_task.cc) ----
+//
+// The console's XAM does not make a thread for a task (xfxam): the call
+// enters a critical region, makes a task object in XAM's heap, puts it on a
+// work queue under a lock, resets the task's event and releases a semaphore
+// that wakes one of the worker threads XAM's start made (eight threads, six of
+// them the workers that take tasks, each with a 64 KB stack), and answers 0;
+// the handle it writes is the task object's address with the low bit set. The
+// worker takes the task, runs callback(message) with its thread's base
+// priority lowered, sets the task's event, and the task's reference count (a
+// word at +4 of the object) is what XamTaskCloseHandle decrements: the call
+// answers the count it leaves, and the object goes with the last reference.
+// XamTaskShouldExit takes no argument (the worker finds its task through
+// its thread's TLS) and faults when the caller is no worker.
+//
+// Here: the same pool, six workers with the console's stack size, started
+// with the first task, kernel threads in the system process whose body is host
+// code calling the guest callback; a queue of tasks, a semaphore a task each,
+// no separate dispatcher thread (the console's thread that hands tasks to
+// idle workers) and no affinities or priorities. The task object is a
+// 0x50-byte block in the system heap, the count at +4 as the console's;
+// the other fields (state, callback, message) are ours. A caller that is
+// no worker gets 0 from XamTaskShouldExit, not a fault. Xenia runs each
+// task on a thread of its own and writes a fixed handle (12345).
 
-// (callback, message, task_args, handle_ptr): callback(message) on a new
-// thread of the system process
-XF_EXPORT(xam, XamTaskSchedule) {
-    uint32_t callback = arg(k, c, 0), message = arg(k, c, 1), handle_ptr = arg(k, c, 3);
-    Objects &o = objects(k);
-    Thread::Params p;
-    p.start_address = callback;
-    p.start_context = message;
-    p.process = o.system_process;
-    uint32_t stack = k.xex() ? k.xex()->stack_size : 0;
-    p.stack_size = std::max(0x4000u, (stack + 0xFFF) & 0xFFFFF000);
-    uint32_t status;
-    Ref<Thread> t = o.create_thread(p, status);
-    if (!t) {
-        std::fprintf(stderr, "xam: XamTaskSchedule: no thread (0x%08X)\n", status);
-        return result(c, status);
+namespace {
+
+class XamTasks {
+  public:
+    static constexpr unsigned WORKERS = 6;
+    static constexpr uint32_t STACK = 0x10000, TASK_SIZE = 0x50;
+    // the task object's words: +4 is the console's reference count
+    static constexpr uint32_t STATE = 0x00, REFS = 0x04, CALLBACK = 0x08, MESSAGE = 0x0C, ARGS = 0x10;
+    enum : uint32_t { QUEUED, RUNNING, DONE };
+
+    // the task, queued: its handle (address | 1) for the caller; 0 when it could not be
+    uint32_t schedule(Kernel &kernel, uint32_t callback, uint32_t message, uint32_t args) {
+        start(kernel);
+        if (!running.load()) return 0;
+        uint32_t task = k->memory().system_alloc(TASK_SIZE);
+        if (!task) return 0;
+        std::memset(k->host(task), 0, TASK_SIZE);
+        k->store32(task + REFS, 2); // the caller's handle and the queue's
+        k->store32(task + CALLBACK, callback);
+        k->store32(task + MESSAGE, message);
+        k->store32(task + ARGS, args);
+        {
+            std::lock_guard<std::mutex> l(mutex);
+            tasks.insert(task);
+            queue.push_back(task);
+        }
+        release_work(1);
+        return task | 1;
     }
-    if (handle_ptr) k.store32(handle_ptr, t->handle());
-    if (!o.scheduler->start(*t)) std::fprintf(stderr, "xam: no host thread for task thread %u\n", t->id);
+
+    // XamTaskCloseHandle: the count the task is left with, or -1 for a handle that is not one's
+    // (the console reads whatever the address holds)
+    uint32_t close(uint32_t handle) {
+        uint32_t task = handle & ~1u;
+        std::lock_guard<std::mutex> l(mutex);
+        if (!(handle & 1) || !tasks.count(task)) return 0xFFFFFFFF;
+        return unref(task);
+    }
+
+    // XamTaskShouldExit: the calling worker's task is asked to end (the kernel is ending)
+    bool should_exit() { return !running.load(); }
+
+    // the kernel ends: the workers stop after the task they run, and are joined if they do
+    void stop() {
+        if (!k) return;
+        Objects &o = objects(*k);
+        if (!running.exchange(false)) return;
+        release_work(WORKERS);
+        // a worker in a callback that never returns cannot be joined (the host scheduler's
+        // threads are detached): give them a moment, and leave those
+        {
+            std::unique_lock<std::mutex> l(mutex);
+            exited.wait_for(l, std::chrono::seconds(2), [&] { return finished == started_count; });
+        }
+        bool all_back = finished == started_count;
+        if (all_back) {
+            for (size_t i = 0; i < threads.size(); i++)
+                if (started_flags[i]) o.scheduler->join(*threads[i]);
+        } else {
+            std::fprintf(stderr, "xam: %u task workers still run a task as the kernel ends\n",
+                         started_count - finished);
+        }
+        {
+            std::lock_guard<std::mutex> l(o.lock);
+            for (auto &t : threads)
+                if (t && t->handle()) o.release_handle(t->handle());
+            if (work && work->handle()) o.release_handle(work->handle());
+        }
+        // after the lock (the last reference deletes); a worker that never came back keeps its
+        // object, which is leaked as the thread is
+        if (all_back) {
+            threads.clear();
+            work = {};
+        } else {
+            new std::vector<Ref<Thread>>(std::move(threads));
+            new Ref<Semaphore>(std::move(work));
+        }
+    }
+
+  private:
+    Kernel *k = nullptr;
+    std::once_flag once;
+    std::mutex mutex; // the queue and the task set; never held around the objects' lock
+    std::condition_variable exited;
+    std::set<uint32_t> tasks;
+    std::deque<uint32_t> queue;
+    Ref<Semaphore> work;
+    std::vector<Ref<Thread>> threads;
+    std::vector<bool> started_flags;
+    unsigned started_count = 0, finished = 0;
+    std::atomic<bool> running{false};
+
+    // the count after one reference less; the object goes with the last (mutex held)
+    uint32_t unref(uint32_t task) {
+        uint32_t refs = k->load32(task + REFS) - 1;
+        k->store32(task + REFS, refs);
+        if (!refs) {
+            tasks.erase(task);
+            k->memory().system_free(task);
+        }
+        return refs;
+    }
+
+    void release_work(int32_t count) {
+        Objects &o = objects(*k);
+        std::lock_guard<std::mutex> l(o.lock);
+        work->set_signal_state(work->signal_state() + count);
+        o.signaled(*work);
+    }
+
+    void start(Kernel &kernel) {
+        std::call_once(once, [&] {
+            k = &kernel;
+            Objects &o = objects(kernel);
+            work = o.create<Semaphore>(GuestType::Semaphore, ksemaphore::SIZE);
+            if (!work) return;
+            work->set_signal_state(0);
+            k->store32(work->guest + ksemaphore::LIMIT, 0x7FFFFFFF);
+            uint32_t status = X_STATUS_NO_MEMORY;
+            for (unsigned i = 0; i < WORKERS; i++) {
+                Thread::Params p;
+                p.stack_size = STACK;
+                p.process = o.system_process;
+                p.host_arg = this;
+                p.host = [](Thread &self, void *v) { static_cast<XamTasks *>(v)->loop(self); };
+                p.name = "XAM task worker";
+                Ref<Thread> t = o.create_thread(p, status);
+                if (!t) {
+                    std::fprintf(stderr, "xam: a task worker was not made (0x%08X)\n", status);
+                    break;
+                }
+                threads.push_back(t);
+                started_flags.push_back(false);
+            }
+            if (threads.empty()) return;
+            running = true;
+            for (size_t i = 0; i < threads.size(); i++) {
+                {
+                    std::lock_guard<std::mutex> l(mutex);
+                    started_count++; // counted before it runs, so a stop waits for it
+                }
+                started_flags[i] = o.scheduler->start(*threads[i]);
+                if (!started_flags[i]) {
+                    std::lock_guard<std::mutex> l(mutex);
+                    started_count--;
+                    std::fprintf(stderr, "xam: no host thread for a task worker\n");
+                }
+            }
+        });
+    }
+
+    void loop(Thread &self) {
+        Objects &o = objects(*k);
+        Dispatcher *const works[] = {work.get()};
+        while (running.load()) {
+            o.wait(self, works, false, false, Scheduler::NEVER);
+            uint32_t task = 0;
+            {
+                std::lock_guard<std::mutex> l(mutex);
+                if (!queue.empty()) task = queue.front(), queue.pop_front();
+            }
+            if (!task) continue;
+            k->store32(task + STATE, RUNNING);
+            try {
+                o.call(*self.context, k->load32(task + CALLBACK), {k->load32(task + MESSAGE)});
+            } catch (const ThreadExit &) {
+                // an ExitThread in a task ends the task, not the worker
+                self.context->r[1] = self.stack_base - (64 + 112);
+            }
+            k->store32(task + STATE, DONE);
+            std::lock_guard<std::mutex> l(mutex);
+            unref(task); // the queue's reference
+        }
+        std::lock_guard<std::mutex> l(mutex);
+        finished++;
+        exited.notify_all();
+    }
+};
+
+} // namespace
+
+void shutdown_xam_tasks(Kernel &k) { k.state<XamTasks>().stop(); }
+
+// (callback, message, task_args, handle_ptr): callback(message) on a worker
+// thread, the task's handle through the pointer; 0 when it is queued
+XF_EXPORT(xam, XamTaskSchedule) {
+    uint32_t handle = k.state<XamTasks>().schedule(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2));
+    if (!handle) return result(c, X_STATUS_NO_MEMORY);
+    if (uint32_t handle_ptr = arg(k, c, 3)) k.store32(handle_ptr, handle);
     result(c, X_STATUS_SUCCESS);
 }
 
-// (handle): NtClose, the error as the thread's last
+// (handle): one reference of the task less: the count it leaves; a handle
+// that is no task's is ERROR_INVALID_HANDLE as the thread's last error
 XF_EXPORT(xam, XamTaskCloseHandle) {
-    Objects &o = objects(k);
-    bool closed;
-    {
-        std::lock_guard<std::mutex> l(o.lock);
-        closed = o.release_handle(arg(k, c, 0));
-    }
-    if (!closed) set_last_error(k, X_ERROR_INVALID_HANDLE);
-    result(c, closed ? 1 : 0);
+    uint32_t refs = k.state<XamTasks>().close(arg(k, c, 0));
+    if (refs == 0xFFFFFFFF) set_last_error(k, X_ERROR_INVALID_HANDLE);
+    result(c, refs);
 }
 
-XF_EXPORT(xam, XamTaskShouldExit) { result(c, 0); }
+// (): whether the task this worker runs should end
+XF_EXPORT(xam, XamTaskShouldExit) { result(c, k.state<XamTasks>().should_exit() ? 1 : 0); }
 
 // ---- voice (xam_voice.cc): no headset ----
 

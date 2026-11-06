@@ -118,7 +118,7 @@ constexpr uint32_t LOOPBACK = 0x7F000001, BROADCAST = 0xFFFFFFFF;
 constexpr uint16_t EPHEMERAL_FIRST = 49152;
 constexpr uint32_t MAX_DATAGRAM = 65507; // UDP over IPv4's largest payload
 
-constexpr uint32_t XNET_GET_XNADDR_NONE = 0x1, XNET_GET_XNADDR_STATIC = 0x4;
+constexpr uint32_t XNET_GET_XNADDR_PENDING = 0x0, XNET_GET_XNADDR_NONE = 0x1, XNET_GET_XNADDR_STATIC = 0x4;
 constexpr uint32_t XNADDR_SIZE = 0x24;
 constexpr uint32_t XNET_STARTUP_PARAMS_SIZE = 0xD;
 // XNetStartupParams' cfgSockDefaultRecvBufsizeInK and ...SendBufsizeInK
@@ -576,11 +576,24 @@ XF_EXPORT(xam, NetDll_XNetRandom) {
     result(c, X_ERROR_SUCCESS);
 }
 
-// (caller, XNADDR *): the loopback; an Ethernet address of 0xCC (RakNet
-// makes its random numbers from it, and zero ones fail)
+// (caller, XNADDR *): before the title's XNetStartup, the console's XAM
+// (no adapter, no startup: xfxam) answers 0, XNET_GET_XNADDR_PENDING, with
+// the structure zeroed but for a 1 in the byte at +0x20, taking only the
+// network lock. After it, here: the loopback; an Ethernet address of 0xCC
+// (RakNet makes its random numbers from it, and zero ones fail), where Xenia
+// answers it at once (and the console's real adapter would have its own).
 XF_EXPORT(xam, NetDll_XNetGetTitleXnAddr) {
     uint32_t addr = arg(k, c, 1);
     uint8_t *p = k.host(addr);
+    {
+        NetState &s = k.state<NetState>();
+        std::lock_guard<std::mutex> l(s.mutex);
+        if (!s.xnet_started[XNCALLER_TITLE]) {
+            std::memset(p, 0, XNADDR_SIZE);
+            p[0x20] = 1;
+            return result(c, XNET_GET_XNADDR_PENDING);
+        }
+    }
     p[0] = 127, p[1] = 0, p[2] = 0, p[3] = 1; // ina
     std::memset(p + 4, 0, 6);                 // inaOnline, wPortOnline
     std::memset(p + 10, 0xCC, 6);             // abEnet

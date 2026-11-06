@@ -521,11 +521,13 @@ void avatars_kinect_tiles(ppc::Context &c) {
     CHECK(guest_string(package + 0x108) == "01020304050607080A0B0C0D4D5308BC");
     CHECK(xam(c, "XamAvatarReinstallAwardedAsset", {0, 0, 0}) == 0 && xam(c, "XamAvatarSetCustomAsset", {}) == 0);
 
-    // Kinect: none set up
+    // Kinect: no sensor. The console's XAM answers success with the three
+    // statuses zero and the status bits 3 (xfxam)
     uint32_t status = alloc(0x10);
     std::memset(K->host(status), 0xEE, 0x10);
-    CHECK(xam(c, "XamNuiGetDeviceStatus", {status}) == 0xC0050006 && K->load32(status) == 0 &&
-          K->load32(status + 0xC) == 0);
+    CHECK(xam(c, "XamNuiGetDeviceStatus", {status}) == 0 && K->load32(status) == 0 && K->load32(status + 4) == 0 &&
+          K->load32(status + 8) == 0 && K->load32(status + 0xC) == 3);
+    CHECK(xam(c, "XamNuiGetDeviceStatus", {0}) == 0);
     CHECK(xam(c, "XamNuiIsDeviceReady", {}) == 0 && xam(c, "XamNuiHudIsEnabled", {}) == 0 &&
           xam(c, "XamNuiIsChatMicEnabled", {}) == 1 && xam(c, "XamIsNuiUIActive", {}) == 0);
     CHECK(xam(c, "XamIsNuiAutomationEnabled", {0, 0}) == 0 && xam(c, "XamIsNatalPlaybackEnabled", {0, 0}) == 0);
@@ -552,9 +554,10 @@ void avatars_kinect_tiles(ppc::Context &c) {
     uint32_t tilt = alloc(0x50);
     K->store32(tilt, 0x50);
     K->store32(tilt + 4, 0x58745373);
-    CHECK(xam(c, "XamNuiCameraTiltGetStatus", {tilt}) == X_E_FAIL &&
-          xam(c, "XamNuiCameraTiltGetStatus", {0}) == X_E_FAIL);
-    CHECK(xam(c, "XamNuiCameraElevationGetAngle", {a, b}) == X_E_FAIL);
+    // the tilt calls ask the sensor first and answer not connected, a bad request too
+    CHECK(xam(c, "XamNuiCameraTiltGetStatus", {tilt}) == X_E_DEVICE_NOT_CONNECTED &&
+          xam(c, "XamNuiCameraTiltGetStatus", {0}) == X_E_DEVICE_NOT_CONNECTED);
+    CHECK(xam(c, "XamNuiCameraElevationGetAngle", {a, b}) == X_E_DEVICE_NOT_CONNECTED);
     CHECK(xam(c, "XamNuiCameraGetTiltControllerType", {}) == 0);
     CHECK(xam(c, "XamNuiCameraSetFlags", {0, 0}) == X_E_DEVICE_NOT_CONNECTED);
     CHECK(xam(c, "XamNuiCameraTiltSetCallback", {0x82001000}) == 0);

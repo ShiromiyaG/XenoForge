@@ -158,6 +158,8 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
 
 // the devices' threads end while the objects they run on are still here
 Kernel::~Kernel() {
+    shutdown_xam_tasks(*this);
+    shutdown_file_completion(*this);
     shutdown_audio(*this);
     shutdown_video(*this);
     shutdown_timer_dpcs(*this);

@@ -517,12 +517,31 @@ entries, names any case.
   package), the hash and signature checks (Xenia does none), and deleting
   an SVOD's `.data` with it.
 - **File objects** are dispatchers (an auto-reset event in guest memory,
-  set after each request, as Xenia's XFile is waitable). Requests complete
-  at once, as Xenia completes them: the I/O status block, the event, the
-  APC routine queued to the calling thread, the completion ports
-  (`IoCompletion`, a queue whose signal state counts its packets). A file
-  opened neither synchronous nor buffered answers STATUS_PENDING for a
-  request that succeeded, its result already in the status block.
+  set when a request completes, as Xenia's XFile is waitable). A request
+  that fails, or is made on a handle opened with FILE_SYNCHRONOUS_IO_*,
+  completes in the call: the I/O status block, the event, the APC routine
+  queued to the calling thread, the completion ports (`IoCompletion`, a
+  queue whose signal state counts its packets). A request that succeeds on
+  a handle opened neither synchronous nor buffered (the requests Xenia
+  answers STATUS_PENDING for) pends as NT's does (2026-11-06): the call
+  answers STATUS_PENDING, the status block says STATUS_PENDING, the
+  request's event is reset, and the request completes later on a kernel
+  thread ("File completion", made with the first one): the status block
+  (information, then status), the ports and the file's own event (only when
+  the request had no event: NT's rule), the APC and the event. The data is
+  moved in the call (so the position, the size and the end-of-file answer
+  are known, and a failure is never pending); only the completion is late,
+  ordered by a per-device queue with a small cost (20 microseconds and a
+  nanosecond a byte; a request due within a millisecond completes as soon
+  as the thread runs, so loading is not slowed; `XF_FILE_LATENCY_US` adds a
+  delay to each completion, which the tests use). NtCancelIoFile completes
+  the calling thread's pending requests on the file as STATUS_CANCELLED
+  (their data has moved) and writes its own status block. FATX devices (the
+  cache partitions, the hard drive) take no new name past 42 characters or
+  path past 240 (STATUS_OBJECT_NAME_INVALID; Free60's FATX page), and say
+  42 for the component limit of NtQueryVolumeInformationFile. Host paths
+  take Windows' extended-length prefix, so 240 characters fit under a deep
+  storage root.
 - **The storage root** (`boot --content <dir>`, a temporary directory's
   `xenoforge` by default; never in the repository) has Xenia's layout, so
   saves are shared with it: `cache0`, `cache1` and `cache` (`cache0:`...),
@@ -543,6 +562,21 @@ user disconnected, without one); the guide's UI answered headless (below); XMsg'
 verification never failing; the network offline (below).
 Overlapped requests Xenia defers (25 ms, on a dispatch thread) complete at
 once here, before the export returns ERROR_IO_PENDING.
+
+XAM's tasks (XamTaskSchedule, xam.cpp) are the console's, as its XAM was
+seen to do (xfxam, 2026-11-06): no thread a task but a pool of six workers
+(kernel threads of the system process with 64 KB stacks, made with the first
+task) taking tasks from a queue, a semaphore a task; the handle written is
+the task object's address with the low bit set (a block in the system heap,
+its reference count at +4, two when made: the handle's and the queue's);
+XamTaskCloseHandle takes one reference and answers the count left (the
+object goes with the last); XamTaskShouldExit asks whether the kernel is
+ending. Left from the console's: its separate dispatcher thread, the
+workers' affinities and priorities, and the fault of ShouldExit outside a
+task. The Kinect answers are the console's with no sensor: the device status
+success with the bits 3, the tilt status and angle E_DEVICE_NOT_CONNECTED,
+the tilt controller type none. XNetGetTitleXnAddr before the title's
+XNetStartup answers 0 (pending) with a zeroed structure but a 1 at +0x20.
 
 The rest of Xenia's system families, ported whole (xam_content.cpp,
 xam_info.cpp, xam_avatar.cpp): every XamContent* (the internal forms,
@@ -782,6 +816,15 @@ beside its code with the console's answer and Xenia's:
   a kernel thread, "Timer DPCs", made with the first such timer, which
   runs it at DISPATCH_LEVEL with the PCR saying a DPC runs. XAM's start
   sets four timers, and they fire now.
+
+Then (2026-11-06) the Kinect answers (XamNuiGetDeviceStatus, the tilt status
+and angle, the tilt controller type and SetFlags: the console's, with no
+sensor), NetDll_XNetGetTitleXnAddr before the title's XNetStartup (pending,
+zeroed but a 1 at +0x20) and XamTaskSchedule as a worker pool (the handle
+the task object's address with the low bit set; XamTaskCloseHandle takes a
+reference of the count at +4): 218 match, 113 differ, 39 need state, 13 fault.
+The task calls stay in "differ": the handle is a pointer into another heap,
+and the console's XamTaskShouldExit and CloseHandle fault outside a task.
 
 What is left in "differ", and why (the survey's generic arguments, and the
 oracle's start, cannot say more):

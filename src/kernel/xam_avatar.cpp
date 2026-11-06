@@ -26,7 +26,12 @@
 //   - XamWriteGamerTile succeeds without writing the pictures: they are the
 //     SPA's images, which are not read here (Xenia writes them under the
 //     dashboard's gamer pictures);
-//   - XamReadTileToTexture never decodes a picture, as none is found.
+//   - XamReadTileToTexture never decodes a picture, as none is found;
+//   - the device status and the tilt calls answer as the console's XAM does
+//     with no sensor (xfxam): XamNuiGetDeviceStatus success with the status
+//     bits 3, the tilt status and angle E_DEVICE_NOT_CONNECTED, the tilt
+//     controller type none, whatever the retail flags say (Xenia: E_FAIL, and
+//     the type 1 with the flags' Kinect bit).
 
 #include "xam.h"
 
@@ -224,16 +229,17 @@ XF_EXPORT(xam, XamAvatarReinstallAwardedAsset) { result(c, X_ERROR_SUCCESS); }
 
 // ---- Kinect ----
 
-// (X_NUI_DEVICE_STATUS *: camera, tilt, microphone, status bits): zeroed,
-// the status bits whether it is initialized
+// (X_NUI_DEVICE_STATUS *: camera, tilt, microphone, status bits): the console's
+// XAM, with no sensor (the kernel's UsbdGetNatalHardwareVersion answering 0),
+// answers success whatever the retail flags say, the three statuses zero and
+// the status bits 3 (xfxam; Xenia answers 0xC0050006 with the bits 0 when
+// Kinect is not initialized, and success with the bits 1 when it is)
 XF_EXPORT(xam, XamNuiGetDeviceStatus) {
-    uint32_t status = arg(k, c, 0);
-    bool initialized = nui_initialized(k);
-    if (status) {
+    if (uint32_t status = arg(k, c, 0)) {
         std::memset(k.host(status), 0, 0x10);
-        k.store32(status + 0xC, initialized ? 1 : 0);
+        k.store32(status + 0xC, 3);
     }
-    result(c, initialized ? X_ERROR_SUCCESS : 0xC0050006);
+    result(c, X_ERROR_SUCCESS);
 }
 
 XF_EXPORT(xam, XamNuiIsDeviceReady) { result(c, nui_initialized(k) ? 1 : 0); }
@@ -283,19 +289,23 @@ XF_EXPORT(xam, XamNuiCameraTiltSetCallback) {
     result(c, X_ERROR_SUCCESS);
 }
 
-// (X_NUI_TILT_STATUS *: its size, 0x50 or more, and 'XtSs', ...): a bad
-// request fails, and so does a good one, the motor's status never reported
-XF_EXPORT(xam, XamNuiCameraTiltGetStatus) { result(c, X_E_FAIL); }
+// The tilt exports follow the console's XAM, which asks the kernel for the
+// sensor's hardware version (UsbdGetNatalHardwareVersion) first and, with no
+// sensor, answers E_DEVICE_NOT_CONNECTED (HRESULT of ERROR_DEVICE_NOT_CONNECTED)
+// whatever the request, a zeroed one too (xfxam). Xenia answers E_FAIL, and
+// takes Kinect's controller type from the retail flags.
 
-// (angle_ptr, moving_ptr): the status is never had, so neither is the angle
-XF_EXPORT(xam, XamNuiCameraElevationGetAngle) { result(c, X_E_FAIL); }
+// (X_NUI_TILT_STATUS *: its size, 0x50 or more, and 'XtSs', ...): no sensor
+XF_EXPORT(xam, XamNuiCameraTiltGetStatus) { result(c, X_E_DEVICE_NOT_CONNECTED); }
 
-// the controller type: 1 with a Kinect set up, else none
-XF_EXPORT(xam, XamNuiCameraGetTiltControllerType) { result(c, nui_initialized(k) ? 1 : 0); }
+// (angle_ptr, moving_ptr): the status is asked first, and fails the same
+XF_EXPORT(xam, XamNuiCameraElevationGetAngle) { result(c, X_E_DEVICE_NOT_CONNECTED); }
 
-// (unknown (64 bits), unknown): type 1 needs the tilt status (never had);
-// none: not connected
-XF_EXPORT(xam, XamNuiCameraSetFlags) { result(c, nui_initialized(k) ? X_E_FAIL : X_E_DEVICE_NOT_CONNECTED); }
+// the controller type, from the sensor's hardware version: none
+XF_EXPORT(xam, XamNuiCameraGetTiltControllerType) { result(c, 0); }
+
+// (unknown (64 bits), unknown): type none: not connected
+XF_EXPORT(xam, XamNuiCameraSetFlags) { result(c, X_E_DEVICE_NOT_CONNECTED); }
 
 // (tracking_id): kept (the NUI data is always there)
 XF_EXPORT(xam, XamNuiHudSetEngagedTrackingID) {

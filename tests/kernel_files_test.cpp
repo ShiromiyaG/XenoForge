@@ -17,6 +17,8 @@
 #include "xenoforge/memory.h"
 
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -367,6 +369,33 @@ void cache_files(ppc::Context &c) {
     CHECK(o.status == X_STATUS_SUCCESS && o.action == 3 && size_of(c, o.handle) == 0);
     close(c, o.handle);
     CHECK(std::filesystem::exists(storage / "cache0" / "z.bin"));
+    // FATX's limits: a name of 42 characters, a path of 240 (Free60's FATX page)
+    std::string name42(42, 'n'), name43(43, 'n');
+    o = create(c, "cache:\\" + name42, GENERIC_WRITE, CREATE, 0);
+    CHECK(o.status == X_STATUS_SUCCESS && std::filesystem::exists(storage / "cache" / name42));
+    close(c, o.handle);
+    CHECK(create(c, "cache:\\" + name43, GENERIC_WRITE, CREATE, 0).status == X_STATUS_OBJECT_NAME_INVALID);
+    CHECK(create(c, "cache:\\" + name43, GENERIC_WRITE, OPEN_IF, 0).status == X_STATUS_OBJECT_NAME_INVALID);
+    CHECK(!std::filesystem::exists(storage / "cache" / name43));
+    // a path: directories of 39 characters (and a last of 38) down to 238, a file of 1 makes 240, of 2 241
+    std::string path = "cache:\\";
+    for (int depth = 0; depth < 6; depth++) {
+        std::string dir(depth == 5 ? 38 : 39, char('a' + depth));
+        path += (depth ? "\\" : "") + dir;
+        Opened made = create(c, path, GENERIC_READ, OPEN_IF, DIRECTORY_FILE);
+        CHECK(made.status == X_STATUS_SUCCESS);
+        close(c, made.handle);
+    }
+    o = create(c, path + "\\x", GENERIC_WRITE, CREATE, 0);
+    CHECK(o.status == X_STATUS_SUCCESS);
+    close(c, o.handle);
+    CHECK(create(c, path + "\\xy", GENERIC_WRITE, CREATE, 0).status == X_STATUS_OBJECT_NAME_INVALID);
+    // the volume says its names are 42 characters at most
+    uint32_t volume = alloc(64), volume_iosb = alloc(8);
+    Opened v = create(c, "cache:\\dir", GENERIC_READ, OPEN, DIRECTORY_FILE);
+    CHECK(krnl(c, "NtQueryVolumeInformationFile", {v.handle, volume_iosb, volume, 64, 5}) == 0 &&
+          K->load32(volume + 4) == 42);
+    close(c, v.handle);
     // a title linking cache0: to its own device keeps the system's (Xenia's)
     CHECK(krnl(c, "ObCreateSymbolicLink", {ansi("\\??\\cache0:"), ansi("\\Device\\cache0")}) == 0);
     o = create(c, "cache0:\\z.bin", GENERIC_READ, OPEN, 0);
@@ -374,31 +403,79 @@ void cache_files(ppc::Context &c) {
     close(c, o.handle);
 }
 
+// a wait of up to `ms` on a handle: the status
+uint32_t wait_for(ppc::Context &c, uint32_t handle, int64_t ms) {
+    uint32_t timeout = alloc(8);
+    K->store64(timeout, uint64_t(-ms * 10'000));
+    return krnl(c, "NtWaitForSingleObjectEx", {handle, 0, 0, timeout});
+}
+
+// a sleep of `ms` (not alertable)
+void sleep_for(ppc::Context &c, int64_t ms) {
+    uint32_t timeout = alloc(8);
+    K->store64(timeout, uint64_t(-ms * 10'000));
+    krnl(c, "KeDelayExecutionThread", {1, 0, timeout});
+}
+
+// an alertable sleep of `ms`: the status (STATUS_USER_APC when an APC ran)
+uint32_t alert_for(ppc::Context &c, int64_t ms) {
+    uint32_t timeout = alloc(8);
+    K->store64(timeout, uint64_t(-ms * 10'000));
+    return krnl(c, "KeDelayExecutionThread", {1, 1, timeout});
+}
+
+// The test sets XF_FILE_LATENCY_US (main) so a pending request is seen
+// pending: it completes that long after it was made, on the completion thread.
+constexpr int64_t LATENCY_MS = 250;
+constexpr uint32_t STATUS_PENDING = 0x103, STATUS_CANCELLED = 0xC0000120;
+
 void async_files(ppc::Context &c) {
     scratch_next = 0;
     // without FILE_SYNCHRONOUS_IO_* and with no buffering, a request that
-    // succeeds answers STATUS_PENDING, done; the event, the file itself
+    // succeeds answers STATUS_PENDING and completes later: the data is
+    // moved, the status block pends and the event is reset until then
     Opened f = create(c, "game:\\media\\a.bin", GENERIC_READ, OPEN, NO_BUFFERING);
     CHECK(f.status == X_STATUS_SUCCESS);
     uint32_t event_ptr = alloc(4), iosb = alloc(8), buffer = alloc(64), off = alloc(8), zero = alloc(8);
-    CHECK(krnl(c, "NtCreateEvent", {event_ptr, 0, 0, 0}) == 0);
+    CHECK(krnl(c, "NtCreateEvent", {event_ptr, 0, 1, 1}) == 0); // synchronization, signaled
     uint32_t event = K->load32(event_ptr);
     K->store64(off, 100);
     K->store64(zero, 0);
+    auto started = std::chrono::steady_clock::now();
     CHECK(krnl(c, "NtReadFile", {f.handle, event, 0, 0, iosb, buffer, 8, off}) == X_STATUS_PENDING);
-    CHECK(K->load32(iosb) == X_STATUS_SUCCESS && K->load32(iosb + 4) == 8 && K->host(buffer)[0] == 100);
-    CHECK(krnl(c, "NtWaitForSingleObjectEx", {event, 0, 0, zero}) == X_STATUS_SUCCESS);
-    CHECK(krnl(c, "NtWaitForSingleObjectEx", {f.handle, 0, 0, zero}) == X_STATUS_SUCCESS);
-    CHECK(krnl(c, "NtWaitForSingleObjectEx", {f.handle, 0, 0, zero}) == X_STATUS_TIMEOUT); // auto-reset
+    CHECK(K->load32(iosb) == STATUS_PENDING && K->load32(iosb + 4) == 0);
+    CHECK(K->host(buffer)[0] == 100 && K->host(buffer)[7] == 107);
+    CHECK(wait_for(c, event, 0) == X_STATUS_TIMEOUT); // reset by the request
+    CHECK(wait_for(c, event, 5000) == X_STATUS_SUCCESS);
+    CHECK(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(LATENCY_MS - 20));
+    CHECK(K->load32(iosb) == X_STATUS_SUCCESS && K->load32(iosb + 4) == 8);
+    // the request had an event: the file's own is left alone
+    CHECK(wait_for(c, f.handle, 0) == X_STATUS_TIMEOUT);
 
-    // the APC routine: queued to this thread, run in an alertable wait
+    // with no event, the file's is set when the request completes, once
+    CHECK(krnl(c, "NtReadFile", {f.handle, 0, 0, 0, iosb, buffer, 8, off}) == X_STATUS_PENDING);
+    CHECK(K->load32(iosb) == STATUS_PENDING);
+    CHECK(wait_for(c, f.handle, 0) == X_STATUS_TIMEOUT);
+    CHECK(wait_for(c, f.handle, 5000) == X_STATUS_SUCCESS);
+    CHECK(K->load32(iosb) == X_STATUS_SUCCESS && K->load32(iosb + 4) == 8);
+    CHECK(wait_for(c, f.handle, 0) == X_STATUS_TIMEOUT); // auto-reset
+
+    // a request that fails does not pend: end of file, in the call
+    K->store64(off, 100000);
+    CHECK(krnl(c, "NtReadFile", {f.handle, 0, 0, 0, iosb, buffer, 8, off}) == X_STATUS_END_OF_FILE);
+    CHECK(K->load32(iosb) == X_STATUS_END_OF_FILE && K->load32(iosb + 4) == 0);
+    K->store64(off, 100);
+
+    // the APC routine: queued to this thread when the request completes,
+    // run in an alertable wait
     apc_calls = 0;
     CHECK(krnl(c, "NtReadFile", {f.handle, 0, F_IO_APC, 0x1234, iosb, buffer, 8, off}) == X_STATUS_PENDING);
     CHECK(apc_calls == 0);
-    uint32_t timeout = alloc(8);
-    K->store64(timeout, uint64_t(-int64_t(2'000'000)));
-    CHECK(krnl(c, "KeDelayExecutionThread", {1, 1, timeout}) == X_STATUS_USER_APC);
+    CHECK(alert_for(c, 1) == X_STATUS_SUCCESS); // 1 ms: not yet
+    CHECK(apc_calls == 0 && K->load32(iosb) == STATUS_PENDING);
+    CHECK(alert_for(c, 5000) == X_STATUS_USER_APC);
     CHECK(apc_calls == 1 && apc_args[0] == 0x1234 && apc_args[1] == iosb && apc_args[2] == 0);
+    CHECK(K->load32(iosb) == X_STATUS_SUCCESS && K->load32(iosb + 4) == 8);
 
     // an I/O completion port: the file's key and the request's context
     uint32_t port_ptr = alloc(4);
@@ -409,7 +486,10 @@ void async_files(ppc::Context &c) {
     K->store32(completion_info + 4, 77);
     CHECK(krnl(c, "NtSetInformationFile", {f.handle, iosb, completion_info, 8, 30}) == 0);
     CHECK(krnl(c, "NtReadFile", {f.handle, 0, 0, 0x55, iosb, buffer, 16, off}) == X_STATUS_PENDING);
-    uint32_t key = alloc(4), context = alloc(4), packet = alloc(8);
+    uint32_t key = alloc(4), context = alloc(4), packet = alloc(8), timeout = alloc(8);
+    K->store64(timeout, uint64_t(-int64_t(10'000)));
+    CHECK(krnl(c, "NtRemoveIoCompletion", {port, key, context, packet, timeout}) == X_STATUS_TIMEOUT); // not yet
+    K->store64(timeout, uint64_t(-int64_t(50'000'000)));
     CHECK(krnl(c, "NtRemoveIoCompletion", {port, key, context, packet, timeout}) == X_STATUS_SUCCESS);
     CHECK(K->load32(key) == 77 && K->load32(context) == 0x55 && K->load32(packet) == 0 && K->load32(packet + 4) == 16);
     CHECK(krnl(c, "NtSetIoCompletion", {port, 1, 2, 3, 4}) == 0);
@@ -417,19 +497,88 @@ void async_files(ppc::Context &c) {
     CHECK(K->load32(key) == 1 && K->load32(context) == 2 && K->load32(packet) == 3 && K->load32(packet + 4) == 4);
     K->store64(timeout, uint64_t(-int64_t(100'000)));
     CHECK(krnl(c, "NtRemoveIoCompletion", {port, key, context, packet, timeout}) == X_STATUS_TIMEOUT);
-    CHECK(krnl(c, "NtCancelIoFile", {f.handle}) == 0);
+
+    // NtCancelIoFile: the pending request completes as cancelled, its event
+    // set, its APC and port packet queued, and nothing comes later
+    apc_calls = 0;
+    CHECK(krnl(c, "NtReadFile", {f.handle, event, F_IO_APC, 0x4321, iosb, buffer, 8, off}) == X_STATUS_PENDING);
+    uint32_t cancel_iosb = alloc(8);
+    K->store32(cancel_iosb, 0xEEEEEEEE);
+    CHECK(krnl(c, "NtCancelIoFile", {f.handle, cancel_iosb}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(cancel_iosb) == X_STATUS_SUCCESS && K->load32(cancel_iosb + 4) == 0);
+    CHECK(K->load32(iosb) == STATUS_CANCELLED && K->load32(iosb + 4) == 0);
+    CHECK(wait_for(c, event, 0) == X_STATUS_SUCCESS);
+    CHECK(alert_for(c, 100) == X_STATUS_USER_APC && apc_calls == 1);
+    K->store64(timeout, uint64_t(-int64_t(50'000'000)));
+    CHECK(krnl(c, "NtRemoveIoCompletion", {port, key, context, packet, timeout}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(context) == 0x4321 && K->load32(packet) == STATUS_CANCELLED);
+    // nothing completes it again
+    sleep_for(c, LATENCY_MS + 100);
+    CHECK(wait_for(c, event, 0) == X_STATUS_TIMEOUT && K->load32(iosb) == STATUS_CANCELLED);
+    K->store64(timeout, uint64_t(-int64_t(100'000)));
+    CHECK(krnl(c, "NtRemoveIoCompletion", {port, key, context, packet, timeout}) == X_STATUS_TIMEOUT);
+    CHECK(alert_for(c, 1) == X_STATUS_SUCCESS && apc_calls == 1);
+    // with nothing pending it is a success; a bad handle is not
+    CHECK(krnl(c, "NtCancelIoFile", {f.handle, cancel_iosb}) == X_STATUS_SUCCESS);
+    CHECK(krnl(c, "NtCancelIoFile", {0x12345678, cancel_iosb}) == X_STATUS_INVALID_HANDLE);
+
+    // requests complete in the order of the device's queue, each with its own
+    // event and status block
+    uint32_t e2_ptr = alloc(4), iosb2 = alloc(8), buffer2 = alloc(64);
+    CHECK(krnl(c, "NtCreateEvent", {e2_ptr, 0, 0, 0}) == 0);
+    uint32_t event2 = K->load32(e2_ptr);
+    CHECK(krnl(c, "NtReadFile", {f.handle, event, 0, 0, iosb, buffer, 8, off}) == X_STATUS_PENDING);
+    CHECK(krnl(c, "NtReadFile", {f.handle, event2, 0, 0, iosb2, buffer2, 16, off}) == X_STATUS_PENDING);
+    CHECK(wait_for(c, event, 5000) == X_STATUS_SUCCESS && wait_for(c, event2, 5000) == X_STATUS_SUCCESS);
+    CHECK(K->load32(iosb + 4) == 8 && K->load32(iosb2 + 4) == 16);
     close(c, f.handle);
     close(c, port);
     close(c, event);
+    close(c, event2);
 
-    // a scatter read: a page a segment, from an explicit offset 0
-    Opened g = create(c, "game:\\media\\a.bin", GENERIC_READ, OPEN, SYNCHRONOUS);
+    // a buffered handle without synchronous I/O completes in the call
+    Opened b = create(c, "game:\\media\\a.bin", GENERIC_READ, OPEN, 0);
+    CHECK(krnl(c, "NtReadFile", {b.handle, 0, 0, 0, iosb, buffer, 8, off}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(iosb) == X_STATUS_SUCCESS && K->load32(iosb + 4) == 8);
+    close(c, b.handle);
+
+    // so does one with synchronous I/O, whatever it asks, and a scatter read: a
+    // page a segment, from an explicit offset 0
+    Opened g = create(c, "game:\\media\\a.bin", GENERIC_READ, OPEN, SYNCHRONOUS | NO_BUFFERING);
+    CHECK(krnl(c, "NtReadFile", {g.handle, 0, 0, 0, iosb, buffer, 8, off}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(iosb) == X_STATUS_SUCCESS && K->load32(iosb + 4) == 8);
     uint32_t pages = K->memory().system_alloc(0x2000, 0x1000), segments = alloc(8);
     K->store32(segments, pages);
     K->store32(segments + 4, pages + 0x1000);
     CHECK(krnl(c, "NtReadFileScatter", {g.handle, 0, 0, 0, iosb, segments, 0x1000, zero}) == 0);
     CHECK(K->load32(iosb + 4) == 512 && K->host(pages)[511] == 255);
     close(c, g.handle);
+
+    // a scatter read on an unbuffered handle without synchronous I/O pends too
+    Opened s = create(c, "game:\\media\\a.bin", GENERIC_READ, OPEN, NO_BUFFERING);
+    std::memset(K->host(pages), 0, 16);
+    CHECK(krnl(c, "NtReadFileScatter", {s.handle, 0, 0, 0, iosb, segments, 0x1000, zero}) == X_STATUS_PENDING);
+    CHECK(K->load32(iosb) == STATUS_PENDING && K->host(pages)[255] == 255);
+    CHECK(wait_for(c, s.handle, 5000) == X_STATUS_SUCCESS && K->load32(iosb) == 0 && K->load32(iosb + 4) == 512);
+    close(c, s.handle);
+
+    // a write that does not extend the file pends; one that does completes in the call
+    Opened w = create(c, "cache:\\async.bin", GENERIC_READ | GENERIC_WRITE, CREATE, SYNCHRONOUS);
+    CHECK(w.status == X_STATUS_SUCCESS && write_file(c, w.handle, "0123456789", 0) == 0);
+    close(c, w.handle);
+    w = create(c, "cache:\\async.bin", GENERIC_READ | GENERIC_WRITE, OPEN, NO_BUFFERING);
+    CHECK(w.status == X_STATUS_SUCCESS);
+    uint32_t data = alloc(16);
+    std::memcpy(K->host(data), "abcd", 4);
+    K->store64(off, 2);
+    CHECK(krnl(c, "NtWriteFile", {w.handle, 0, 0, 0, iosb, data, 4, off}) == X_STATUS_PENDING);
+    CHECK(K->load32(iosb) == STATUS_PENDING);
+    CHECK(wait_for(c, w.handle, 5000) == X_STATUS_SUCCESS && K->load32(iosb) == 0 && K->load32(iosb + 4) == 4);
+    K->store64(off, 8);
+    CHECK(krnl(c, "NtWriteFile", {w.handle, 0, 0, 0, iosb, data, 4, off}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(iosb) == X_STATUS_SUCCESS && K->load32(iosb + 4) == 4);
+    close(c, w.handle);
+    CHECK(host_read(storage / "cache" / "async.bin") == "01abcd67abcd");
 }
 
 // XCONTENT_DATA: the hard drive, a type, a display name, a file name
@@ -769,10 +918,27 @@ const Generated generated[] = {
 
 } // namespace
 
-int main() {
+// the directory removed, with Windows' extended-length prefix (the FATX test makes paths past MAX_PATH)
+void remove_tree(const std::filesystem::path &dir) {
     std::error_code ec;
-    auto dir = std::filesystem::temp_directory_path() / "xenoforge_files_test";
+#ifdef _WIN32
+    std::filesystem::remove_all(std::filesystem::path(L"\\\\?\\" + std::filesystem::absolute(dir).native()), ec);
+#else
     std::filesystem::remove_all(dir, ec);
+#endif
+}
+
+int main() {
+    // each pending request completes this long after it was made (files.cpp)
+#ifdef _WIN32
+    _putenv_s("XF_FILE_LATENCY_US", "250000");
+#else
+    setenv("XF_FILE_LATENCY_US", "250000", 1);
+#endif
+    // a directory of its own, so copies of the test run side by side
+    auto dir = std::filesystem::temp_directory_path() /
+               ("xenoforge_files_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    remove_tree(dir);
     std::filesystem::create_directories(dir);
     storage = dir / "storage";
     auto iso = make_disc(dir);
@@ -805,6 +971,6 @@ int main() {
         CHECK(!k.stopped);
         if (k.stopped) std::printf("stopped: %s\n", k.stop_reason.c_str());
     }
-    std::filesystem::remove_all(dir, ec);
+    remove_tree(dir);
     return finish("kernel_files");
 }

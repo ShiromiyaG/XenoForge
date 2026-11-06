@@ -156,6 +156,11 @@ void shutdown_video(Kernel &k);
 // The kernel thread that runs the DPCs of timers (KeSetTimerEx), made with the
 // first timer that has one (sync.cpp); ended and joined as the kernel ends.
 void shutdown_timer_dpcs(Kernel &k);
+// The kernel threads that complete asynchronous file requests (files.cpp) and
+// run XAM's tasks (xam.cpp), made with the first request or task; ended and
+// joined as the kernel ends.
+void shutdown_file_completion(Kernel &k);
+void shutdown_xam_tasks(Kernel &k);
 std::string video_report(Kernel &k);
 // The GPU's command processor, for installing its Sink (the renderer)
 // before the game starts; the Sink's calls then come on the "GPU commands"

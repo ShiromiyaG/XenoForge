@@ -124,6 +124,10 @@ class Device {
     std::string name;       // the file system's: "GDFX", "FATX", "STFS"
     bool read_only;
     uint32_t attributes = 0, component_name_max_length = 255;
+    // the longest path a new file or directory may have, in the device (without
+    // its mount path); 0: no limit. A name longer than component_name_max_length
+    // cannot be created either.
+    uint32_t max_path_length = 0;
     uint64_t total_units = 0, available_units = 0;
     uint32_t sectors_per_unit = 1, bytes_per_sector = 0x200;
     std::shared_ptr<Entry> root;

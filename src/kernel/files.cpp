@@ -14,12 +14,18 @@
 // xsymboliclink.cc, emulator.cc and xenia_main.cc (the mounts); checked
 // against them.
 //
-// Requests complete at once, as Xenia completes them: the I/O status block,
-// then the event, the APC routine (queued to the calling thread, delivered
-// in its next alertable wait) and the completion ports. A file opened
-// without FILE_SYNCHRONOUS_IO_* and with FILE_NO_INTERMEDIATE_BUFFERING
-// answers STATUS_PENDING for a request that succeeded (Xenia's out_pending),
-// its result already in the status block.
+// A request that fails, or that is made on a handle opened with
+// FILE_SYNCHRONOUS_IO_*, completes in the call: the I/O status block, then the
+// event, the APC routine (queued to the calling thread, delivered in its next
+// alertable wait) and the completion ports. A request that succeeds on a
+// handle opened without those flags and with FILE_NO_INTERMEDIATE_BUFFERING
+// (the requests Xenia answers STATUS_PENDING for, its out_pending, and which
+// NT does not complete in the call either) pends, as NT's does: the call
+// answers STATUS_PENDING with the status block still STATUS_PENDING, the event
+// reset, and the request completes later, on the scheduler's clock, on a
+// kernel thread of its own ("File completion"): the status block, then the
+// ports, the APC and the event are done there. See "asynchronous requests"
+// below.
 //
 // Where it differs from Xenia, and why:
 //   - a read or write at an explicit offset leaves the position after what
@@ -27,6 +33,17 @@
 //     the offset is 0, and never for a write), and a scatter or gather
 //     request at an explicit offset 0 starts there (Xenia: at the position);
 //   - after a write the entry's size is read again, so a query sees it;
+//   - a pending request completes later (Xenia completes it in the call,
+//     the result already in the status block): the data is moved in the call
+//     (the request's buffer is the I/O's until it completes, and the
+//     position, the size and the status are then known), only its
+//     completion is later, ordered per device with a cost (20 microseconds
+//     and a nanosecond a byte, not the disc's), so a cancelled request has
+//     moved its data but reports STATUS_CANCELLED; the file's own event is
+//     reset by a request with no event of its own and set when it
+//     completes, and left alone when the request has an event (NT's);
+//   - NtCancelIoFile cancels the calling thread's pending requests on the
+//     file (Xenia has no pending requests) and writes its status block;
 //   - NtRemoveIoCompletion waits as NT does (no timeout: forever; Xenia
 //     truncates the timeout to 32 bits) and on the scheduler's clock;
 //   - a rename moves the entry in the tree too (Xenia renames the host file
@@ -42,9 +59,11 @@
 #include "files.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 
 namespace xf::kernel {
 namespace {
@@ -121,8 +140,9 @@ struct FilesFamily {
 
 Ref<File> file_by_handle(Objects &o, uint32_t handle) { return o.lookup<File>(handle); }
 
-// the file's event and its ports, after a request (lock not held)
-void complete(File &f, uint32_t apc_context, uint32_t status, uint32_t bytes) {
+// the file's ports, and its own event unless the request had one of its own
+// (NT sets the file object's event only then), after a request (lock not held)
+void complete(File &f, uint32_t apc_context, uint32_t status, uint32_t bytes, bool signal_file = true) {
     Objects &o = f.owner;
     std::vector<std::pair<uint32_t, Ref<IoCompletion>>> ports;
     {
@@ -131,8 +151,10 @@ void complete(File &f, uint32_t apc_context, uint32_t status, uint32_t bytes) {
     }
     std::lock_guard<std::mutex> l(o.lock);
     for (auto &[key, port] : ports) port->post({key, apc_context, status, bytes});
-    f.set_signal_state(1);
-    o.signaled(f);
+    if (signal_file) {
+        f.set_signal_state(1);
+        o.signaled(f);
+    }
 }
 
 constexpr uint64_t CURRENT_POSITION = ~0ull;
@@ -203,7 +225,7 @@ bool failed(uint32_t status) { return (status & 0xC0000000) != 0; } // XFAILED
 // one's status block says 0 bytes (NtReadFile, NtWriteFile; the scatter
 // read keeps what it moved)
 uint32_t finish_request(Kernel &k, const Ref<Event> &event, const Request &r, uint32_t status, uint32_t bytes, bool ran,
-                        bool queue_apc, bool pending, bool clear = true) {
+                        bool queue_apc, bool clear = true) {
     Objects &o = objects(k);
     if (ran) {
         write_iosb(k, r.iosb, status, bytes);
@@ -220,7 +242,7 @@ uint32_t finish_request(Kernel &k, const Ref<Event> &event, const Request &r, ui
         event->set_signal_state(1);
         o.signaled(*event);
     }
-    return pending ? X_STATUS_PENDING : status;
+    return status;
 }
 
 // the event and the file a request names: X_STATUS_SUCCESS, or why not
@@ -252,7 +274,232 @@ uint32_t segmented(Kernel &k, uint32_t segments, uint32_t length, uint64_t offse
     return status;
 }
 
+// ---- asynchronous requests ----
+//
+// A request that pends has moved its data in the call (see the top). What is
+// left is its completion, which a kernel thread does in the order of the due
+// times: each request's is when its device has finished the ones before it
+// plus its own cost, on the scheduler's clock. The cost is small, a few
+// microseconds' worth of a disc's seek and a fast bus, so a title's loading
+// is not slowed: a request due within the host's timer resolution
+// completes as soon as the thread runs.
+
+constexpr uint32_t STATUS_CANCELLED = 0xC0000120;
+
+struct Pending {
+    uint64_t due = 0;
+    Ref<File> file;
+    Ref<Event> event;
+    Ref<Thread> thread; // the one that made the request: its APC, and who may cancel it
+    Request request;
+    uint32_t status = 0, bytes = 0;
+    bool apc = false;
+};
+
+// the request's end, on whatever thread: the status block (the information
+// before the status, for a loop polling the status), the ports and the file's
+// event, the APC, the request's event
+void finish_pending(Kernel &k, Pending &p, uint32_t status, uint32_t bytes, bool apc) {
+    Objects &o = objects(k);
+    const Request &r = p.request;
+    if (r.iosb) {
+        k.store32(r.iosb + 4, bytes);
+        std::atomic_thread_fence(std::memory_order_release);
+        k.store32(r.iosb, status);
+    }
+    complete(*p.file, r.apc_context, status, bytes, !p.event);
+    if (apc && (r.apc_routine & ~1u) && r.apc_context && p.thread) {
+        std::lock_guard<std::mutex> l(o.lock);
+        if (!p.thread->terminated) o.queue_user_apc(*p.thread, r.apc_routine & ~1u, r.apc_context, r.iosb, 0);
+    }
+    if (p.event) {
+        std::lock_guard<std::mutex> l(o.lock);
+        p.event->set_signal_state(1);
+        o.signaled(*p.event);
+    }
+}
+
+class FileCompletion {
+  public:
+    // 100 ns units of the scheduler's clock
+    static constexpr uint64_t BASE_COST = 200, BYTES_PER_UNIT = 100, SLACK = 10'000;
+
+    // the request queued; false when there is no thread to complete it (it then completes in the call)
+    bool submit(Kernel &kernel, Pending p, uint32_t length) {
+        start(kernel);
+        if (!running.load()) return false;
+        Objects &o = objects(*k);
+        uint64_t now = o.now();
+        {
+            std::lock_guard<std::mutex> l(mutex);
+            uint64_t &busy = busy_until[p.file->device.get()];
+            busy = std::max(now, busy) + BASE_COST + length / BYTES_PER_UNIT;
+            p.due = busy + extra;
+            auto at = std::upper_bound(queue.begin(), queue.end(), p,
+                                       [](const Pending &a, const Pending &b) { return a.due < b.due; });
+            queue.insert(at, std::move(p));
+        }
+        std::lock_guard<std::mutex> l(o.lock);
+        wake->set_signal_state(1);
+        o.signaled(*wake);
+        return true;
+    }
+
+    // the requests of a file made by a thread, taken off the queue
+    std::vector<Pending> take(const File &f, const Thread *thread) {
+        std::vector<Pending> taken;
+        std::lock_guard<std::mutex> l(mutex);
+        for (auto it = queue.begin(); it != queue.end();) {
+            if (it->file.get() == &f && it->thread.get() == thread) {
+                taken.push_back(std::move(*it));
+                it = queue.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return taken;
+    }
+
+    // the kernel ends: the thread stopped and joined, what is queued dropped
+    void stop() {
+        if (!k) return;
+        Objects &o = objects(*k);
+        if (running.exchange(false)) {
+            {
+                std::lock_guard<std::mutex> l(o.lock);
+                wake->set_signal_state(1);
+                o.signaled(*wake);
+            }
+            if (thread_started) o.scheduler->join(*thread);
+        }
+        {
+            std::lock_guard<std::mutex> l(o.lock);
+            for (Object *object : {static_cast<Object *>(thread.get()), static_cast<Object *>(wake.get())})
+                if (object && object->handle()) o.release_handle(object->handle());
+        }
+        thread = {}, wake = {};
+        std::lock_guard<std::mutex> l(mutex);
+        queue.clear();
+    }
+
+  private:
+    Kernel *k = nullptr;
+    std::once_flag started;
+    std::mutex mutex; // the queue; never held around the objects' lock
+    std::vector<Pending> queue; // by due time
+    std::map<const vfs::Device *, uint64_t> busy_until;
+    Ref<Event> wake; // auto-reset: the queue changed
+    Ref<Thread> thread;
+    std::atomic<bool> running{false};
+    bool thread_started = false;
+    // XF_FILE_LATENCY_US: a delay added to each pending request's completion
+    // (not to the device's queue), for a title or a test that wants the
+    // completions seen late; 0 by default
+    uint64_t extra = 0;
+
+    void start(Kernel &kernel) {
+        std::call_once(started, [&] {
+            k = &kernel;
+            if (const char *v = std::getenv("XF_FILE_LATENCY_US")) extra = std::strtoull(v, nullptr, 10) * 10;
+            Objects &o = objects(kernel);
+            wake = o.create<Event>(GuestType::EventSynchronization, header::SIZE);
+            Thread::Params p;
+            p.stack_size = 128 * 1024;
+            p.process = title_process(kernel) - kprocess::SIZE; // the idle process, as the GPU's threads
+            p.host_arg = this;
+            p.host = [](Thread &self, void *v) { static_cast<FileCompletion *>(v)->loop(self); };
+            p.name = "File completion";
+            uint32_t status = X_STATUS_NO_MEMORY;
+            if (wake) thread = o.create_thread(p, status);
+            if (!thread) {
+                std::fprintf(stderr, "files: the completion thread was not made (status 0x%08X)\n", status);
+                return;
+            }
+            running = true;
+            thread_started = o.scheduler->start(*thread);
+            if (!thread_started) {
+                running = false;
+                std::fprintf(stderr, "files: no host thread for the completion thread\n");
+            }
+        });
+    }
+
+    void loop(Thread &self) {
+        Objects &o = objects(*k);
+        Dispatcher *const wakes[] = {wake.get()};
+        while (running.load()) {
+            Pending p;
+            bool have = false;
+            uint64_t deadline = Scheduler::NEVER;
+            {
+                std::lock_guard<std::mutex> l(mutex);
+                if (!queue.empty()) {
+                    uint64_t now = o.now();
+                    if (queue.front().due <= now + SLACK) {
+                        p = std::move(queue.front());
+                        queue.erase(queue.begin());
+                        have = true;
+                    } else {
+                        deadline = queue.front().due - SLACK;
+                    }
+                }
+            }
+            if (have) {
+                finish_pending(*k, p, p.status, p.bytes, p.apc);
+                continue;
+            }
+            o.wait(self, wakes, false, false, deadline);
+        }
+    }
+};
+
+// A request that succeeded and pends (the call is NT's STATUS_PENDING): the
+// status block pends, the request's event is reset, the completion is queued.
+// False when it could not be (the caller completes it in the call).
+bool pend_request(Kernel &k, const Ref<File> &f, const Ref<Event> &event, const Request &r, uint32_t bytes,
+                  bool queue_apc, uint32_t length) {
+    Objects &o = objects(k);
+    Pending p;
+    p.file = f;
+    p.event = event;
+    p.request = r;
+    p.status = X_STATUS_SUCCESS;
+    p.bytes = bytes;
+    p.apc = queue_apc;
+    {
+        std::lock_guard<std::mutex> l(o.lock);
+        if (Thread *t = current_thread()) p.thread = Ref<Thread>::retain(t);
+        if (event) event->set_signal_state(0);
+    }
+    write_iosb(k, r.iosb, X_STATUS_PENDING, 0);
+    if (log_files())
+        std::fprintf(stderr, "files: request of %u bytes on %s pends (event 0x%08X, apc 0x%08X, status block 0x%08X)\n",
+                     length, f->entry ? f->entry->path.c_str() : "?", r.event, r.apc_routine, r.iosb);
+    return k.state<FileCompletion>().submit(k, std::move(p), length);
+}
+
+// The end of a request that was made: the call's answer. It pends, or
+// completes here (the ports and the file's event, the status block, the APC and
+// the request's event).
+uint32_t end_request(Kernel &k, const Ref<File> &f, const Ref<Event> &event, const Request &r, uint32_t status,
+                     uint32_t bytes, bool queue_apc, bool pending, uint32_t length, bool clear = true) {
+    if (pending && pend_request(k, f, event, r, bytes, queue_apc, length)) return X_STATUS_PENDING;
+    complete(*f, r.apc_context, status, bytes, !event || f->synchronous);
+    return finish_request(k, event, r, status, bytes, true, queue_apc, clear);
+}
+
+// before a request on a handle without synchronous I/O and with no event of its own: NT clears
+// the file's event, which the request's completion sets
+void begin_request(const Ref<File> &f, const Ref<Event> &event) {
+    if (event || f->synchronous) return;
+    Objects &o = f->owner;
+    std::lock_guard<std::mutex> l(o.lock);
+    f->set_signal_state(0);
+}
+
 } // namespace
+
+void shutdown_file_completion(Kernel &k) { k.state<FileCompletion>().stop(); }
 
 vfs::FileSystem &file_system(Kernel &k) {
     FilesFamily &s = k.state<FilesFamily>();
@@ -414,13 +661,14 @@ XF_EXPORT(xboxkrnl, NtReadFile) {
     bool pending = false, ran = status == X_STATUS_SUCCESS;
     if (ran) {
         uint64_t offset = offset_ptr ? k.load64(offset_ptr) : CURRENT_POSITION;
+        begin_request(f, event);
         {
             std::lock_guard<std::mutex> l(f->mutex);
             status = read_locked(k, *f, buffer, length, offset, bytes, &pending);
         }
-        complete(*f, r.apc_context, status, bytes);
+        return result(c, end_request(k, f, event, r, status, bytes, status == X_STATUS_SUCCESS, pending, length));
     }
-    result(c, finish_request(k, event, r, status, bytes, ran, status == X_STATUS_SUCCESS, pending));
+    result(c, finish_request(k, event, r, status, bytes, false, false));
 }
 
 // (file, event, apc_routine, apc_context, io_status_block, segments,
@@ -436,6 +684,7 @@ XF_EXPORT(xboxkrnl, NtReadFileScatter) {
     bool pending = false, ran = status == X_STATUS_SUCCESS;
     if (ran) {
         uint64_t offset = offset_ptr ? k.load64(offset_ptr) : CURRENT_POSITION;
+        begin_request(f, event);
         {
             std::lock_guard<std::mutex> l(f->mutex);
             status = segmented(k, segments, length, offset, bytes,
@@ -443,9 +692,9 @@ XF_EXPORT(xboxkrnl, NtReadFileScatter) {
                                    return read_locked(k, *f, buffer, n, at, done, &pending);
                                });
         }
-        complete(*f, r.apc_context, status, bytes);
+        return result(c, end_request(k, f, event, r, status, bytes, true, pending, length, false));
     }
-    result(c, finish_request(k, event, r, status, bytes, ran, true, pending, false));
+    result(c, finish_request(k, event, r, status, bytes, false, true, false));
 }
 
 // (file, event, apc_routine, apc_context, io_status_block, buffer, length,
@@ -461,13 +710,14 @@ XF_EXPORT(xboxkrnl, NtWriteFile) {
     bool pending = false, ran = status == X_STATUS_SUCCESS;
     if (ran) {
         uint64_t offset = offset_ptr ? k.load64(offset_ptr) : CURRENT_POSITION;
+        begin_request(f, event);
         {
             std::lock_guard<std::mutex> l(f->mutex);
             status = write_locked(k, *f, buffer, length, offset, bytes, &pending);
         }
-        complete(*f, r.apc_context, status, bytes);
+        return result(c, end_request(k, f, event, r, status, bytes, true, pending, length));
     }
-    result(c, finish_request(k, event, r, status, bytes, ran, true, pending));
+    result(c, finish_request(k, event, r, status, bytes, false, true));
 }
 
 // (file, event, apc_routine, apc_context, io_status_block, segments,
@@ -483,6 +733,7 @@ XF_EXPORT(xboxkrnl, NtWriteFileGather) {
     bool pending = false, ran = status == X_STATUS_SUCCESS;
     if (ran) {
         uint64_t offset = offset_ptr ? k.load64(offset_ptr) : CURRENT_POSITION;
+        begin_request(f, event);
         {
             std::lock_guard<std::mutex> l(f->mutex);
             status = segmented(k, segments, length, offset, bytes,
@@ -490,9 +741,9 @@ XF_EXPORT(xboxkrnl, NtWriteFileGather) {
                                    return write_locked(k, *f, buffer, n, at, done, &pending);
                                });
         }
-        complete(*f, r.apc_context, status, bytes);
+        return result(c, end_request(k, f, event, r, status, bytes, true, pending, length, false));
     }
-    result(c, finish_request(k, event, r, status, bytes, ran, true, pending, false));
+    result(c, finish_request(k, event, r, status, bytes, false, true, false));
 }
 
 // ---- information (xboxkrnl_io_info.cc) ----
@@ -864,9 +1115,16 @@ XF_EXPORT(xboxkrnl, NtFlushBuffersFile) {
     result(c, X_STATUS_SUCCESS);
 }
 
-// (file): requests complete at once, so none waits to be cancelled
+// (file, io_status_block): the pending requests the calling thread made on the
+// file complete as STATUS_CANCELLED (their status blocks, events, APCs and
+// ports as a completion does), and the call's own status block says success,
+// as NT's does with nothing to cancel too
 XF_EXPORT(xboxkrnl, NtCancelIoFile) {
-    result(c, file_by_handle(objects(k), arg(k, c, 0)) ? X_STATUS_SUCCESS : X_STATUS_INVALID_HANDLE);
+    Ref<File> f = file_by_handle(objects(k), arg(k, c, 0));
+    if (!f) return result(c, X_STATUS_INVALID_HANDLE);
+    for (Pending &p : k.state<FileCompletion>().take(*f, current_thread())) finish_pending(k, p, STATUS_CANCELLED, 0, true);
+    write_iosb(k, arg(k, c, 1), X_STATUS_SUCCESS, 0);
+    result(c, X_STATUS_SUCCESS);
 }
 
 // (file, event, apc_routine, apc_context, io_status_block, code, input,
