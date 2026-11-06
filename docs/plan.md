@@ -73,6 +73,65 @@ What both need first: the generated code as a library behind a stable
 interface (the guest context, memory, the calls into the system), loaded by
 the generic player or linked by a port.
 
+## References
+
+Xenia stays the first reference and the oracle for every part. These are
+the others, all public.
+
+**The license rule for each:**
+- **Documentation** (IBM, Microsoft, AMD, Free60, papers) states facts, and
+  may be used freely.
+- **MIT or BSD code** (Xenia, Mesa, hedge-dev, N64Recomp) may be translated,
+  with its notice at the top of the file, as Xenia's is.
+- **GPL or LGPL code** (RPCS3, Dolphin, Cxbx-Reloaded, ReactOS, Wine,
+  libxenon) is only read to understand. None of it is copied into
+  XenoForge, which stays MIT.
+
+**The whole system**
+- "Xbox 360 System Architecture", J. Andrews and N. Baker, IEEE Micro,
+  March-April 2006. The console's architects describe the CPU, the GPU and
+  its EDRAM, memory, and the XMA decoder.
+- Free60 (https://free60.org), the homebrew community's wiki: the hardware,
+  the XEX format, STFS and SVOD packages (DLC, title updates, XBLA and Games
+  on Demand), the boot chain and the hypervisor.
+
+**The CPU and the recompiler**
+- IBM's Cell Broadband Engine documentation. Xenon's cores derive from the
+  Cell's PPE, so it covers the pipeline and the VMX unit.
+- The PowerPC 64-bit programming environments manual and the AltiVec
+  manual: each instruction's specified meaning, and the precision bounds
+  of the estimates (`fres`, `frsqrte`, `vrefp`, `vrsqrtefp`). VMX128's own
+  additions are not in them; for those, Xenia remains the only source.
+- RPCS3 (GPL-2.0, https://github.com/RPCS3/rpcs3), the PS3 emulator, whose
+  PPU is the same CPU family. Its PPU LLVM recompiler compiles a game's
+  PPC code ahead of time at first boot and keeps it in a cache: the design
+  reference for track D (discovery at load, the cache's keys, progress,
+  fallback).
+- Dolphin (GPL-2.0+), a second, older PowerPC implementation (the
+  GameCube's), for floating point corner cases.
+- hedge-dev's XenonRecomp (MIT, `../XenonRecomp`) and UnleashedRecomp, and
+  rexglue (the fork, `../rexglue-sdk`): other Xbox 360 recompilers and their
+  runtimes.
+- N64Recomp (MIT, https://github.com/N64Recomp/N64Recomp) and
+  Zelda64Recomp: a recompilation SDK with a mod system, function
+  replacement and hooks, for track E's API.
+
+**The kernel and the system software**
+- Microsoft's documentation of the NT kernel's routines (the WDK reference
+  on learn.microsoft.com). The 360's kernel derives from NT, and `Ke*`,
+  `Ex*`, `Ob*`, `Io*`, `Rtl*` are documented there with their meaning and
+  status codes.
+- Wine (LGPL) and ReactOS (GPL): implementations of the same NT and Win32
+  routines, for behavior the documentation leaves out (XAM re-exports
+  `CreateThread`, `WaitForSingleObject` and the like).
+- Cxbx-Reloaded (GPL-2.0, https://github.com/Cxbx-Reloaded/Cxbx-Reloaded),
+  the original Xbox's emulator. That console's kernel shares many exports
+  with the 360's, and Cxbx-Reloaded implements them in high level as
+  XenoForge does. xemu (GPL) runs the real original Xbox kernel instead.
+- Free60, for XEX, STFS and SVOD.
+
+**The GPU:** below.
+
 ## References for the GPU
 
 In this order, each where the ones before it have no answer:
@@ -98,6 +157,9 @@ In this order, each where the ones before it have no answer:
 - **XenosRecomp** (hedge-dev, MIT, `../XenosRecomp`): a second translation of
   Xenos microcode, made for Unleashed Recompiled, to set our translator's
   meaning of each instruction against.
+- **libxenon** (Free60's homebrew library; read only): its Xenos code
+  programmed the real GPU, so its register sequences, formats and setup
+  are ones known to work on the console.
 - **XNA Game Studio 4.0**, for Microsoft's own encodings and layouts. Its `XnaNative.dll`
   (Microsoft's, unpacked without installing; `tools/xna/README.md`; nothing
   of it in the repository) exports:
