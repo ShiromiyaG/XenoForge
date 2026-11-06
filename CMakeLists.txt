@@ -234,6 +234,21 @@ endforeach()
 add_executable(kernel_threads_test tests/kernel_threads_test.cpp)
 target_include_directories(kernel_threads_test PRIVATE src/kernel)
 target_link_libraries(kernel_threads_test PRIVATE xenoforge_kernel xenoforge)
+# the exception dispatch on a guest program (tests/seh_program.h), interpreted
+# and recompiled: seh_gen emits the program's functions as xfrecomp would
+add_executable(seh_gen tests/seh_gen.cpp)
+target_link_libraries(seh_gen PRIVATE xenoforge)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/seh_generated.cpp
+    COMMAND seh_gen ${CMAKE_CURRENT_BINARY_DIR}/seh_generated.cpp
+    DEPENDS seh_gen
+    COMMENT "seh_gen")
+set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/seh_generated.cpp PROPERTIES COMPILE_OPTIONS "-O1;-g0")
+add_executable(kernel_exceptions_test tests/kernel_exceptions_test.cpp ${CMAKE_CURRENT_BINARY_DIR}/seh_generated.cpp)
+target_include_directories(kernel_exceptions_test PRIVATE src/kernel tests)
+target_link_libraries(kernel_exceptions_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME kernel_exceptions COMMAND kernel_exceptions_test)
+set_tests_properties(kernel_exceptions PROPERTIES TIMEOUT 120)
 
 # stb_image and stb_image_write (public domain / MIT), for PNGs in the tools;
 # Xenia's copy unless STB_DIR says otherwise

@@ -223,9 +223,13 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   SwitchToFiber, in Reach) may return to another frame than its caller's
   (`Function::switches_stack`); one that keeps r1 in memory r1 does not
   address and returns (setjmp, or a tail branch to one) saves the stack
-  (`saves_stack`); the return sites of the calls to those, and the catch
-  continuations of the functions with exception data, are resume sites
-  (`resumes`). How the generated code follows them: "Stack switches" below.
+  (`saves_stack`); the return sites of the calls to those, the catch
+  continuations of the functions with exception data, and the `__except`
+  blocks of those whose handler is `__C_specific_handler` (its import
+  thunk, xboxkrnl 0x1A5; each scope record's target in the scope table the
+  handler data points at) are resume sites (`resumes`). How the generated
+  code follows them: "Stack switches" below; how the exception dispatch
+  lands there: docs/runtime.md, "Structured exceptions".
 - **Everything else** that is indirect (`bctr`, `bctrl`, `blrl`, a branch
   to an address no function holds) goes through the dispatch table, and an
   address with no generated code runs in the interpreter: a wrong guess

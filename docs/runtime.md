@@ -88,6 +88,129 @@ interpreter reaches the export through `sc` (the kernel looks the thunk up
 by the address), generated code through `dispatch`. Variable imports
 receive the address of the kernel's object for them.
 
+## Structured exceptions
+
+(2026-11-06, `src/kernel/exceptions.cpp`; docs/xenia-todos-kernel.md A1
+and A2.) Xenia logs RtlRaiseException and returns, so a C++ throw or an
+`__except` never reaches its handler. The kernel here dispatches as NT's
+PowerPC ports do (the handlers' protocol of its RISC design, read in Wine's
+ARM64 dispatcher for behavior), with what the console's code fixes read
+from the games' own CRT.
+
+- **Raising.** RtlRaiseException (RaiseException, the C++ runtime's throw,
+  SetThreadName) and DbgBreakPoint (STATUS_BREAKPOINT, one parameter,
+  BREAKPOINT_BREAK, as NT's trap). The record's address becomes the call's
+  return address; the context is the caller's at the call.
+- **The layouts.** CONTEXT, 0xA40 bytes: flags, MSR (0x9030), IAR, LR, CTR
+  (8 bytes), r0-r31 as doublewords at 0x18, CR, XER, FPSCR (8 bytes), f0-f31
+  at 0x128, VSCR at 0x230, v0-v127 at 0x240 (the C++ runtime's jump to a
+  catch's continuation loads exactly these, and copies 0xA40 bytes).
+  EXCEPTION_RECORD: code, flags, chained record, address, count, 15
+  parameters. DISPATCHER_CONTEXT: ControlPc, FunctionEntry (the 8-byte
+  `.pdata` entry), EstablisherFrame, ContextRecord (the C++ handler reads
+  the handler data at FunctionEntry's begin - 4).
+- **Functions.** The image's exception directory (PE data directory 3,
+  `.pdata`), looked up by the loaded module holding the address; with the
+  exception flag the handler and its data are the two words before the
+  function. `add_function_table` (kernel.h, NT's RtlAddFunctionTable) for
+  code no image holds: the tests.
+- **The virtual unwind.** The prologue (up to the call, if the call is in
+  it) run forward over symbols: what each register holds relative to the
+  entry's r1, where each entry value was stored. The XDK's forms: `mflr r12`
+  then `stw r12, -8(r1)` or `bl __savegprlr_N`; LR kept in a nonvolatile
+  (`std r31, -0x48(r1); mflr r31`); `std`/`stw` of nonvolatiles; `addi r12,
+  r1, -X` then `__savefpr_N` and `__savevmx_N` (their stores simulated);
+  `mfcr` and its store; `stwu r1` or `stwux` by a size in a register (else the
+  back chain); a frame pointer in a nonvolatile (`addi r31, r1, -0xA0` before
+  the `stwu`, or `mr r31, r1` after), which gives the entry's r1 past an
+  alloca. The establisher frame is r1 at the function's entry (the games'
+  `_local_unwind(r31 + frame size, target)`). A frame's ControlPc is its
+  call (the return address - 4): a scope's range holds the call, not the
+  return (SetThreadName's `__try` ends right after its `bl`). A handler runs
+  only past its function's prologue (NT's InFunction).
+- **The search** (RtlDispatchException): the frames from the raise up, each
+  handler called with the record, its establisher frame, the raise's
+  CONTEXT and a DISPATCHER_CONTEXT. ContinueExecution goes on with the
+  CONTEXT as the handler left it (a noncontinuable exception raises
+  STATUS_NONCONTINUABLE_EXCEPTION over it instead, the original chained),
+  ContinueSearch goes on up, another answer raises
+  STATUS_INVALID_DISPOSITION.
+- **The unwind** (RtlUnwind(target frame, target IP, record, value)): the
+  frames from RtlUnwind's caller up to the target frame (all of them
+  without one: EXCEPTION_EXIT_UNWIND), each handler called with
+  EXCEPTION_UNWINDING and the frame's own context (EXCEPTION_TARGET_UNWIND
+  at the target); then on at the target IP in the target frame's context
+  as its handler left it, r3 the value. Without a record it makes one,
+  STATUS_UNWIND.
+- **`__C_specific_handler`** (the kernel's export; the scope table, a count
+  then begin, end, filter and target per scope, inner scopes first, is the
+  handler data): searching, an `__except` whose range holds ControlPc has
+  its filter run (EXCEPTION_POINTERS in r3, the frame in r4 and r12, as the
+  funclets read it); positive unwinds to its block with the code as the
+  value, negative continues. Unwinding, each `__finally` whose range holds
+  ControlPc runs (TRUE in r3), ControlPc moved past the scope first; in the
+  target frame the scope that holds the target ends it.
+- **C++** is the game's own CRT (`__CxxFrameHandler`, from FuncInfo). What it
+  asks of the kernel: searching, it captures its context (RtlCaptureContext,
+  which leaves r3 alone: the CRT passes it on after the call), points its
+  IAR at its own return point, and RtlUnwinds to the catching frame with
+  that target; its handler, called for the target frame, keeps the frame's
+  context and swaps the captured one in, so the unwind comes back into the
+  CRT's own frame; it runs the catch funclet (frame in r12) and jumps to the
+  continuation the funclet returns by loading the frame's context and a
+  `blr` (a function that switches the stack: docs/recompiler.md, "Stack
+  switches").
+- **Handlers are guest calls** on a frame below the raise's (its back chain
+  to it), returning to `HANDLER_RETURN` (0xBCBCBCB0), the registers around
+  them put back. A walk that reaches that return is in the frames of a
+  dispatch or unwind in progress on the thread, and goes on from the code
+  that started that one, as NT's walks go through the frames of its
+  dispatcher: an exception raised inside a handler or a catch funclet (a
+  rethrow) gets EXCEPTION_NESTED_CALL up to the frame whose handler was
+  running; an unwind passes a dispatch's frames on to the raise (the C++
+  runtime's unwind from inside its handler); an unwind that reaches another
+  unwind's handler takes that frame again from the ControlPc its
+  DISPATCHER_CONTEXT holds (EXCEPTION_COLLIDED_UNWIND).
+- **Going on.** Execution goes on with a context: back from the call when
+  that is where it points (a continued exception, the C++ runtime's unwind
+  into its own frame); anywhere else a `ppc::Unwind` to the target, as a
+  longjmp ("Code" above): a generated function with a resume site there
+  (discovery makes each `__except` block one, beside the catch
+  continuations and `_local_unwind` targets lis/addi pairs make), else a
+  dispatch that interprets from there.
+- **No handler.** A log of the exception and the frames walked, then
+  KeBugCheckEx(KMODE_EXCEPTION_NOT_HANDLED, code, address, the first two
+  parameters): NT's kernel-mode answer, as titles run in supervisor state
+  (MSR 0x9030 has no PR). The XAPI's own top-level filter (mainCRTStartup's
+  `__except`) answers continue-search when no debugger is attached, so this
+  is where an exception a title does not catch ends. SetThreadName's
+  (0x406D1388) alone goes on silently when nothing takes it: it is a
+  debugger's notification (the XDK's SetThreadName wraps it in its own
+  `__try` anyway). The thread is named first, as a debugger would.
+
+Where it differs from NT, and why: the CONTEXT's flags are NT PowerPC's
+CONTEXT_FULL (0x7; the console's value is not known and nothing seen reads
+it); a restored CR takes fields 2-4 only (the nonvolatile ones); a frame
+with no `.pdata` ends a walk (NT takes it for a leaf, right only for the
+innermost frame); the stack's bounds are the PCR's; no debugger's first or
+second chance (none is attached); RtlVirtualUnwind, RtlLookupFunctionEntry,
+RtlUnwind2 and the vectored handlers are not written, as none of the eight
+games imports them. Traps in guest code (`tw`, `twi`) still raise nothing.
+
+`kernel_exceptions_test` runs a guest program written as the XDK's
+compiler writes (`tests/seh_program.h`), interpreted and then recompiled
+by `seh_gen` at build time: `__except` and its filter (nonvolatiles,
+including f31, back in the frame), nested `__try` with `__finally` run on
+the unwind in its own frame and in the frame between, a continued
+exception, a noncontinuable one continued, DbgBreakPoint, SetThreadName's
+exception with no handler, RtlUnwind to its own frame and two frames up
+with a value, a C++ throw caught two frames up with a destructor run on the
+way, rethrown from the catch and caught one frame further (the C++ handler
+is the test's host code, at a guest address with a guest frame and
+`.pdata`), and, in a child process, an exception nothing takes stopping the
+title. Recompiled, every unwind lands at a resume site: nothing is
+interpreted.
+
 ## Exports
 
 `kernel.h`: an export is a function of the kernel and the calling thread's

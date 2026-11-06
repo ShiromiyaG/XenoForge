@@ -840,10 +840,34 @@ void find_resumes(const Image &image, Discovery &d) {
         if (ppc::decode(image.word(v)) == Opcode::Invalid || image.word(v) == 0) return;
         if (f.resumes.insert(v).second) continuations++;
     });
+    // The __except blocks: a function whose handler is __C_specific_handler
+    // (xboxkrnl's 0x1A5, through its import thunk) has a scope table for
+    // handler data (a count, then begin, end, filter and target), and the
+    // exception dispatch's unwind goes on at each target in the function's
+    // own frame (docs/runtime.md, "Structured exceptions").
+    std::set<uint32_t> c_handlers;
+    for (const Import &i : image.imports)
+        if (i.ordinal == 0x1A5 && (i.library == "xboxkrnl.exe" || i.library == "xboxkrnl")) c_handlers.insert(i.thunk);
+    uint64_t except_blocks = 0;
+    for (const PdataEntry &p : image.pdata) {
+        if (!p.exception || !c_handlers.count(image.word(p.begin - 8))) continue;
+        auto it = d.functions.find(p.begin);
+        if (it == d.functions.end()) continue;
+        Function &f = it->second;
+        uint32_t table = image.word(p.begin - 4), count = image.word(table);
+        if (!image.contains(table, 4) || count > 256 || !image.contains(table + 4, 16 * count)) continue;
+        for (uint32_t k = 0; k < count; k++) {
+            uint32_t target = image.word(table + 4 + 16 * k + 12);
+            if (!target || (target & 3) || target <= f.address || target >= f.address + f.size) continue;
+            if (ppc::decode(image.word(target)) == Opcode::Invalid) continue;
+            if (f.resumes.insert(target).second) except_blocks++;
+        }
+    }
     uint64_t holders = 0;
     for (const auto &[a, f] : d.functions) holders += !f.resumes.empty();
     d.counts["resume sites: after a call that saves the stack"] = after_saves;
     d.counts["resume sites: catch continuations"] = continuations;
+    d.counts["resume sites: __except blocks"] = except_blocks;
     d.counts["functions with resume sites"] = holders;
 }
 

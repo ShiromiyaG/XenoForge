@@ -1170,4 +1170,15 @@ std::string module_at(Kernel &k, uint32_t address) {
     return {};
 }
 
+bool module_range(Kernel &k, uint32_t address, uint32_t &base, uint32_t &size) {
+    Modules &s = k.state<Modules>();
+    std::lock_guard lock(s.mutex);
+    for (auto &m : s.user_modules)
+        if (address - m->base_address < m->image_size) {
+            base = m->base_address, size = m->image_size;
+            return true;
+        }
+    return false;
+}
+
 } // namespace xf::kernel

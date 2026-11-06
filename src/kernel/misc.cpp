@@ -59,53 +59,9 @@ uint64_t execute(Kernel &k, ppc::Context &c, uint32_t address, std::initializer_
 }
 
 // ---- debugging (xboxkrnl_debug.cc) ----
-
-XF_EXPORT(xboxkrnl, DbgBreakPoint) {
-    // Xenia breaks into the host's debugger
-    std::fprintf(stderr, "kernel: DbgBreakPoint from 0x%08X\n", uint32_t(c.lr));
-}
-
-XF_EXPORT(xboxkrnl, RtlRaiseException) {
-    // (X_EXCEPTION_RECORD *): code, flags, record, address, parameter
-    // count, parameters
-    uint32_t record = arg(k, c, 0);
-    uint32_t code = k.load32(record);
-    if (code == 0x406D1388) {
-        // SetThreadName: X_THREADNAME_INFO in the parameters (type 0x1000,
-        // name, thread id, flags)
-        uint32_t name = k.load32(record + 0x14 + 4), thread_id = k.load32(record + 0x14 + 8);
-        std::string text;
-        if (name)
-            for (uint32_t p = name; k.host(p)[0] && text.size() < 256; p++) {
-                char ch = char(k.host(p)[0]);
-                text += (ch < 32 || ch > 126) ? '?' : ch;
-            }
-        std::fprintf(stderr, "kernel: SetThreadName(%d, %s)\n", int32_t(thread_id), text.c_str());
-        // kept for the thread report: the calling thread (-1) or the one
-        // with that id
-        Objects &o = objects(k);
-        std::lock_guard<std::mutex> l(o.lock);
-        for (Thread *t : o.threads)
-            if (thread_id == 0xFFFFFFFF ? t == current_thread() : t->id == thread_id) t->guest_name = text;
-        return;
-    }
-    if (code == 0xE06D7363) {
-        std::fprintf(stderr, "kernel: the guest throws a C++ exception\n");
-        return;
-    }
-    // (no unwinding: RtlRaiseException returns)
-    std::fprintf(stderr, "kernel: RtlRaiseException(0x%08X) from 0x%08X\n", code, uint32_t(c.lr));
-}
-
-[[noreturn]] void bug_check(Kernel &k, uint32_t code, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t p4) {
-    char message[96];
-    std::snprintf(message, sizeof(message), "*** STOP: 0x%08X (0x%08X, 0x%08X, 0x%08X, 0x%08X)", code, p1, p2, p3, p4);
-    std::fprintf(stderr, "kernel: %s\n", message);
-    if (!k.stopped.exchange(true)) k.stop_reason = std::string("KeBugCheck: ") + message;
-    std::fflush(stdout);
-    std::fflush(stderr);
-    std::exit(4);
-}
+//
+// DbgBreakPoint and RtlRaiseException raise through the exception dispatch
+// (exceptions.cpp); KeBugCheck and KeBugCheckEx stop here.
 
 XF_EXPORT(xboxkrnl, KeBugCheckEx) {
     bug_check(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4));
@@ -474,6 +430,16 @@ XF_EXPORT(xboxkrnl, MicDeviceRequest) {
 }
 
 } // namespace
+
+[[noreturn]] void bug_check(Kernel &k, uint32_t code, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t p4) {
+    char message[96];
+    std::snprintf(message, sizeof(message), "*** STOP: 0x%08X (0x%08X, 0x%08X, 0x%08X, 0x%08X)", code, p1, p2, p3, p4);
+    std::fprintf(stderr, "kernel: %s\n", message);
+    if (!k.stopped.exchange(true)) k.stop_reason = std::string("KeBugCheck: ") + message;
+    std::fflush(stdout);
+    std::fflush(stderr);
+    std::exit(4);
+}
 
 uint32_t smc_tray_state(Kernel &k) {
     Smc &smc = k.state<Smc>();

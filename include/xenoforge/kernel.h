@@ -121,6 +121,15 @@ std::string modules_report(Kernel &k);
 // the file name of the game's module loaded at address ("" if none), for
 // boot's report of where the interpreter was entered
 std::string module_at(Kernel &k, uint32_t address);
+// the base and size of the game's image (the executable or a DLL) holding
+// address, for the exception dispatch's function tables (its .pdata)
+bool module_range(Kernel &k, uint32_t address, uint32_t &base, uint32_t &size);
+// A table of .pdata entries (8 bytes each, as the Xbox 360's PE writes them)
+// for code in [begin, end) no loaded image holds (NT's RtlAddFunctionTable;
+// the tests' programs). The exception dispatch (exceptions.cpp) looks
+// functions up in these first, then in the loaded images' exception
+// directories.
+void add_function_table(Kernel &k, uint32_t begin, uint32_t end, uint32_t table, uint32_t count);
 // the guest stacks, for boot (stacks.cpp): the switches between them, the
 // host fibers made and dropped, and the returns to another frame
 // (ppc::Unwind) and what took them

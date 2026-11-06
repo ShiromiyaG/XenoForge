@@ -492,16 +492,15 @@ void process_type(KernelHarness &h) {
 
 void debugging(KernelHarness &h) {
     kernel::Kernel &k = *h.k;
-    // SetThreadName and others: logged, returning
+    // SetThreadName's exception with no handler: logged, returning (the
+    // dispatch itself, and an exception nothing takes stopping the title, are
+    // kernel_exceptions_test's)
     uint32_t record = h.alloc(0x50);
     k.store32(record, 0x406D1388);
     k.store32(record + 0x14, 0x1000);
     k.store32(record + 0x18, h.string("Main"));
     k.store32(record + 0x1C, 0xFFFFFFFF);
     h.krnl("RtlRaiseException", {record});
-    k.store32(record, 0x80000003);
-    h.krnl("RtlRaiseException", {record});
-    h.krnl("DbgBreakPoint");
     // no microphone: not connected, the completion called at once
     uint32_t device = h.alloc(0x40);
     CHECK(h.krnl("MicDeviceRequest", {0}) == kernel::X_STATUS_INVALID_PARAMETER);

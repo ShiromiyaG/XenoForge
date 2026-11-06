@@ -312,6 +312,11 @@ struct ThreadExit {
     uint32_t code;
 };
 
+// KeBugCheckEx (misc.cpp): the stop code and its parameters logged, the
+// kernel stopped, the process ended; also what an exception no handler takes
+// ends in (exceptions.cpp).
+[[noreturn]] void bug_check(Kernel &k, uint32_t code, uint32_t p1, uint32_t p2, uint32_t p3, uint32_t p4);
+
 // A guest thread (Xenia's XThread): a KTHREAD in guest memory, a stack with
 // guard pages in 0x70000000-0x7F000000, a PCR (r13), a TLS block, and the
 // host's context it runs with.
