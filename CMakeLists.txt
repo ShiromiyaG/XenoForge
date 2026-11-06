@@ -169,6 +169,14 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/memory.cpp) # the guest memory, being 
     add_executable(boot tools/boot.cpp tools/game.cpp)
     target_link_libraries(boot PRIVATE xenoforge_kernel xenoforge)
 endif()
+# the console's own XAM (the player's system update) as the oracle for ours
+add_executable(xfxam tools/xfxam.cpp)
+target_include_directories(xfxam PRIVATE src/kernel)
+target_link_libraries(xfxam PRIVATE xenoforge_kernel xenoforge)
+# xfxam on the console's XAM where XF_XAM_XEX names it (skipped otherwise)
+add_executable(xam_oracle_test tests/xam_oracle_test.cpp)
+add_test(NAME xam_oracle COMMAND xam_oracle_test $<TARGET_FILE:xfxam>)
+set_tests_properties(xam_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 # boot linked with a game's generated code: `xfrecomp emit <iso> <XF_GEN_DIR>/<name>`
 # writes it, a directory per executable and DLL on the disc and modules.cpp
 # listing their tables (game code: outside the repository); -DXF_GAMES="chaves;ben10"

@@ -331,9 +331,11 @@ void devices(ppc::Context &c) {
 
 void system_queries(ppc::Context &c) {
     scratch_next = 0;
-    CHECK(xam(c, "XamFeatureEnabled", {0}) == 1 && xam(c, "XamFeatureEnabled", {31}) == 1);
-    CHECK(xam(c, "XamFeatureEnabled", {32}) == 0 && xam(c, "XamFeatureEnabled", {38}) == 0 &&
-          xam(c, "XamFeatureEnabled", {1000}) == 0);
+    // feature n is bit n - 1, as the console's XAM answers (xfxam)
+    CHECK(xam(c, "XamFeatureEnabled", {1}) == 1 && xam(c, "XamFeatureEnabled", {32}) == 1 &&
+          xam(c, "XamFeatureEnabled", {39}) == 1);
+    CHECK(xam(c, "XamFeatureEnabled", {0}) == 0 && xam(c, "XamFeatureEnabled", {33}) == 0 &&
+          xam(c, "XamFeatureEnabled", {38}) == 0 && xam(c, "XamFeatureEnabled", {1000}) == 0);
     CHECK(xam(c, "XamIsSystemTitleId", {0xFFFE07D1}) == 1 && xam(c, "XamIsSystemTitleId", {0}) == 1);
     CHECK(xam(c, "XamIsSystemTitleId", {0x4D5308BC}) == 0 && xam(c, "XamIsSystemTitleId", {0x5841089A}) == 0);
     CHECK(xam(c, "XamIsSystemTitleId", {0x58420001}) == 1); // an 'X' publisher, not Arcade

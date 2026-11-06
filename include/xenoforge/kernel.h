@@ -100,6 +100,14 @@ void set_executable_path(Kernel &k, const std::string &path);
 // address of a module's export by ordinal (0: none).
 uint32_t import_module(Kernel &k, const std::string &library);
 uint32_t module_export(Kernel &k, uint32_t hmodule, uint16_t ordinal);
+// A system module from its file (the console's own, read from the player's
+// disc: xfxam's XAM), loaded as XexLoadImage loads a game's DLL: its image at
+// its base, listed under path, its imports bound to the kernel's exports as
+// a game's are. Its HMODULE, or 0 and why. Its entry point is the caller's to
+// run, and threads starting and ending do not call it (the console's kernel
+// gives its own modules no DLL notifications). Its exports are module_export's;
+// the kernel's module of the same name (xam.xex) stays what games bind to.
+uint32_t load_module(Kernel &k, const std::string &path, const std::vector<uint8_t> &data, std::string &error);
 // A guest thread starts or ends (Xenia's KernelState::OnThreadExecute and
 // OnThreadExit): each DLL loaded has its entry point called on it, with
 // DLL_THREAD_ATTACH (DLL_PROCESS_ATTACH if not attached yet) or
@@ -296,6 +304,13 @@ public:
         return *static_cast<T *>(p.get());
     }
 
+    // Every import call as it is made (returned false) and as its export
+    // returns (true), on the calling thread: a tool's trace of the kernel
+    // calls code makes (xfxam sets the calls of the console's XAM beside
+    // ours). Set before guest threads run; none by default.
+    using ImportHook = void (*)(void *user, const Import &import, ppc::Context &c, bool returned);
+    void set_import_hook(ImportHook hook, void *user) { import_hook_ = hook, import_hook_user_ = user; }
+
     // the interpreter's limit per entry (boot stops a run with it)
     uint64_t step_limit = UINT64_MAX;
 
@@ -355,6 +370,8 @@ private:
     std::vector<std::map<uint32_t, Import>::node_type> retired_thunks_;
     std::atomic<bool> has_thunks_{false};
     std::vector<Mmio> mmio_;
+    ImportHook import_hook_ = nullptr;
+    void *import_hook_user_ = nullptr;
     // destroyed after the objects and threads, before the rest
     std::mutex states_mutex_;
     std::map<const void *, std::shared_ptr<void>> states_;

@@ -24,8 +24,10 @@
 //     the executable's SPA here (Xenia takes it from its game database);
 //   - XamIptvGetServiceName's buffer is from the system heap, made at the
 //     first call (Xenia allocates it at 0x80D20000 as XAM starts);
-//   - XamFeatureEnabled answers 0 for a bit past the 36 Xenia's table has
-//     (Xenia's std::bitset::test throws there);
+//   - XamFeatureEnabled reads feature n at bit n - 1 of the table, as the
+//     console's XAM does (xfxam, 2.0.16202: 1-32 and 39 on, 0 off); Xenia
+//     tests bit n of the table's low 36 bits (0-31 on, 39 off) and throws
+//     past them;
 //   - XamNetworkStorageHasUserEnabledStorage reads no user preference (the
 //     kernel keeps none), which leaves the privilege check, always denied
 //     offline: never enabled, as Xenia answers for a profile that never set it;
@@ -153,10 +155,12 @@ uint32_t get_live_hive_value(Kernel &k, uint32_t name, uint32_t value, uint32_t 
 
 // ---- features and versions ----
 
-// (feature_bit, 64 bits): Xenia's table, 0x40FFFFFFFF
+// (feature): Xenia's table, 0x40FFFFFFFF, with feature n at bit n - 1 as the
+// console's XAM reads it (xfxam: 1-32 and 39 on, 0 and 33-38 off; Xenia tests
+// bit n of the table's low 36 bits)
 XF_EXPORT(xam, XamFeatureEnabled) {
-    uint64_t bit = arg64(k, c, 0);
-    result(c, bit < 36 && ((0x40FFFFFFFFull >> bit) & 1) ? 1 : 0);
+    uint32_t bit = arg(k, c, 0) - 1;
+    result(c, bit < 64 && ((0x40FFFFFFFFull >> bit) & 1) ? 1 : 0);
 }
 
 XF_EXPORT(xam, XamGetStagingMode) { result(c, 0); } // Xenia's staging_mode, off

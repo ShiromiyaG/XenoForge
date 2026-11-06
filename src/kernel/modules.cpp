@@ -66,7 +66,13 @@
 //     table of the heap the image goes in, the executable's too), and an
 //     unloaded module's header is freed (Xenia keeps it);
 //   - no title update is applied to a module (none is to the executable
-//     either).
+//     either);
+//   - an ordinal whose slot in a module's export table is empty is not
+//     exported (Xenia's GetProcAddress answers the image's base, base << 16,
+//     for it): the console's XAM leaves 1,320 of its 2,890 slots empty;
+//   - a system module (load_module: the console's own XAM, which a tool
+//     reads from the player's disc) gets no DLL_THREAD_ATTACH or DETACH and
+//     its entry is its loader's to run (Xenia loads none).
 //
 // The guest globals (Xenia's KernelGuestGlobals) are at
 // k.variable("ExThreadObjectType"), the first field:
@@ -181,6 +187,9 @@ struct Module {
     bool attached = false;    // its DllMain had DLL_PROCESS_ATTACH
     std::string code;         // its generated code, or why it has none (Kernel::add_module_code)
     std::unique_ptr<Xex> xex; // one the kernel loaded (the executable's is the caller's)
+    // a system module load_module loaded (the console's own): its entry is
+    // its loader's to run, and threads starting and ending do not call it
+    bool system = false;
     // a kernel module's GetProcAddress trampolines
     uint32_t trampoline = 0, trampoline_next = 0;
     std::map<uint16_t, uint32_t> trampolines;
@@ -381,7 +390,9 @@ uint32_t user_proc_address(Kernel &k, Module &m, uint16_t ordinal) {
             std::fprintf(stderr, "kernel: GetProcAddress(%03X): ordinal out of bounds\n", ordinal);
             return 0;
         }
-        return k.load32(table + 0x2C + 4 * ordinal) + (k.load32(table + 0x20) << 16);
+        // an empty slot exports nothing (Xenia's answer is the image's base)
+        uint32_t offset = k.load32(table + 0x2C + 4 * ordinal);
+        return offset ? offset + (k.load32(table + 0x20) << 16) : 0;
     }
     uint32_t directory;
     if (!opt_header(k, m.xex_header, 0x00E10402, directory)) return 0; // XEX_HEADER_EXPORTS_BY_NAME
@@ -1055,6 +1066,24 @@ uint32_t module_export(Kernel &k, uint32_t hmodule, uint16_t ordinal) {
     return m->is_kernel() ? kernel_proc_address(k, *m, ordinal) : user_proc_address(k, *m, ordinal);
 }
 
+uint32_t load_module(Kernel &k, const std::string &path, const std::vector<uint8_t> &data, std::string &error) {
+    Modules &s = k.state<Modules>();
+    std::lock_guard loader(s.loader);
+    std::lock_guard lock(s.mutex);
+    for (auto &m : s.user_modules)
+        if (equal_case(m->path, path)) return error = path + " is loaded already", 0;
+    size_t first = s.loaded.size();
+    Module *m = load_user_module_data(k, s, path, base_name(path), data);
+    if (!m) return error = "it cannot be loaded (the kernel's log says why)", 0;
+    m->system = true;
+    // (the list XexLoadImage attaches what its own load brought from)
+    s.loaded.resize(first);
+    k.store16(m->hmodule + LDR_LOAD_COUNT, 1);
+    std::fprintf(stderr, "kernel: %s at 0x%08X-0x%08X, entry 0x%08X (a system module)\n", path.c_str(), m->base_address,
+                 m->base_address + m->image_size, m->entry_point);
+    return m->hmodule;
+}
+
 // OnThreadExecute: each DLL with an entry point, DLL_PROCESS_ATTACH the
 // first time (the libraries the executable imports from, as the main thread
 // starts), DLL_THREAD_ATTACH after; under the loader lock, as Xenia's under
@@ -1066,7 +1095,7 @@ void modules_thread_start(Kernel &k, ppc::Context &c) {
     {
         std::lock_guard lock(s.mutex);
         for (auto &m : s.user_modules) {
-            if (!m->dll || !m->entry_point || m.get() == s.executable) continue;
+            if (!m->dll || !m->entry_point || m.get() == s.executable || m->system) continue;
             calls.push_back(entry_call(*m, m->attached ? DLL_THREAD_ATTACH : DLL_PROCESS_ATTACH));
             m->attached = true;
         }
@@ -1085,7 +1114,8 @@ void modules_thread_end(Kernel &k, ppc::Context &c) {
     {
         std::lock_guard lock(s.mutex);
         for (auto &m : s.user_modules)
-            if (m->dll && m->entry_point && m.get() != s.executable) calls.push_back(entry_call(*m, DLL_THREAD_DETACH));
+            if (m->dll && m->entry_point && m.get() != s.executable && !m->system)
+                calls.push_back(entry_call(*m, DLL_THREAD_DETACH));
     }
     if (calls.empty()) return;
     auto saved = std::make_unique<ppc::Context>(c);

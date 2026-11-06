@@ -426,8 +426,10 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
     }
     // a suspension or kernel APCs waiting for this thread happen here
     if (Thread *t = current_thread(); t && t->pending.load(std::memory_order_relaxed)) objects_->safe_point(*t);
+    if (import_hook_) import_hook_(import_hook_user_, import, c, false);
     if (import.fn) import.fn(*this, c);
     else result(c, 0);
+    if (import_hook_) import_hook_(import_hook_user_, import, c, true);
 }
 
 bool Kernel::try_call(ppc::Context &c, uint32_t target) {

@@ -560,6 +560,143 @@ APC. Gears of War 3 polled
 recvfrom on an unimplemented socket (an answer of 0, an empty datagram)
 and stalled its frame loop there; with these it goes on.
 
+## XAM's oracle
+
+The console's own XAM is the system update's `$flash_xam.xex` (plan,
+"Accuracy beyond Xenia"): El Chavo Kart's disc carries 2.0.16202
+unencrypted (xamc.dll, base 0x815F0000, 6 MB, 1,570 exports in a table of
+2,890 slots). `xfinspect --package` extracts it; `xfxam` (tools/xfxam.cpp)
+runs it on our kernel and sets each of its answers beside ours. The file is
+read from the path given; nothing of it (code, data, strings, tables) enters
+the repository, its docs or its tests, only what it does.
+
+```
+xfxam <xam.xex> imports                what its imports bind to here
+xfxam <xam.xex> init [--trace]         its entry run on our kernel: the calls, the threads, where it ended
+xfxam <xam.xex> call <Export> [arg..]  one export, ours and the console's, compared
+xfxam <xam.xex> survey [--out <file>]  every export both have, sorted
+  --seconds N (a call's limit), --init-seconds N, --no-init (the export without XAM's start),
+  --system (the call on a system thread), --trace (every kernel call printed), --work <dir>
+```
+
+**Loading.** `load_module` (kernel.h) loads it as XexLoadImage loads a
+game's DLL: its image at its base, its 429 function and 20 variable imports
+from xboxkrnl bound to our exports as a game's are, listed as
+`\SystemRoot\xam.xex`. It is a system module: its entry is its loader's to
+run, and threads starting and ending do not call it (the console's kernel
+gives its own modules no DLL notifications). The kernel's own `xam.xex`
+stays what games bind to. Of the 429 functions, 241 are implemented here
+(32 of them Xenia's stubs, ported as they are: the Vd* display calls, the
+XConfig writes, IoCreateDevice, NtDeviceIoControlFile...) and 188 are not,
+none of which Xenia has: XeKeys* (27), XInputd* (22, the input driver),
+Hal* (13), Xex* (12), Etx* (9, event tracing), XVoiced* (8), Vd* (8), Drv*
+(8), XAudio* (7), the network adapter (Nic*, 10), Mtpd* (8), the boot
+animation (Ani*, 4), LZX decompression (LDI*, 4), the USB hubs (Usbd*, 5).
+
+**Starting.** The entry is DllMain(hmodule, DLL_PROCESS_ATTACH, 0) on a
+system-process thread, in the interpreter. It returns TRUE in 0.27 s of
+1,431 kernel calls: it allocates its heaps (NtAllocateVirtualMemory with a
+fifth argument set, MmAllocatePhysicalMemoryEx, NtAllocateEncryptedMemory),
+initializes some 150 critical sections and read-write locks, makes eight
+worker threads (one start address, a work queue each, priorities and
+affinities set) and a ninth, looks for the system update's trace and
+diagnostic switches on the flash, the hard disk and a memory unit and for
+`systemupdate.xex` on the disc, a USB drive and the flash, tries to load a
+security expansion from `\Device\Harddisk0\Partition1`, registers its
+title-termination notifications, sets its drivers' callbacks, and queues a
+first look at the content storage's notifications to a worker. Of the
+imports it calls, 17 are not implemented (each answers 0): EtxProducerRegister,
+the Drv*Callback setters (user binding, device configuration, mic array,
+audio latency, content storage), XInputdSetFailedConnectionOrBindCallback,
+HalRegisterHdDvdRomNotification, KeSetPriorityClassThread, XeKeysGetStatus,
+DumpRegisterDedicatedDataBlock, DumpGetRawDumpInfo, IoDismountVolumeByName,
+KeSetTimerEx (its five timers never fire), HalGetPowerUpCause, XexShimLock,
+HalGetNotedArgonErrors. DrvGetContentStorageNotification is answered
+(system.cpp): XAM takes the notifications until an error, and the 0 of an
+unimplemented import made it read an empty one and fault. What its start
+does not have, and so its exports do not either:
+- no title launched through it: the heap XAM makes for a title is absent,
+  so the calls that allocate on a title's thread fail (E_OUTOFMEMORY,
+  ERROR_NO_SYSTEM_RESOURCES; XamAlloc works on a system thread);
+- no profile and no user signed in (ERROR_NO_SUCH_USER);
+- no `\Device\Harddisk0\Partition1` (the storage root is Xenia's layout,
+  not a partition device), so no content device;
+- no input driver (the XInputd* family), no network adapter.
+
+**A call.** Each side runs in a process of its own (`xfxam ... side hle|real`,
+which `call` and `survey` start), on a fresh kernel, so a fault or a hang
+costs only that side's answer. The arguments are numbers or memory made for
+them at the same addresses on both sides (0x5F000000 up: `buf:<size>[:<hex>]`,
+`fill:<size>:<byte>`, `u32:`, `u64:`, `str:`, `wstr:`). The call runs on a
+new thread of the title's process, as a game's (`--system`: the system's);
+ours through a thunk, the console's at its export's address after its
+start. Each side's answer: how it ended (returned, timed out after
+`--seconds`, the interpreter stopped, the thread exited, or a fault, with
+the guest address, the pc and the callers' return addresses from the
+stack's back chain), r3, the arguments' memory after, and the kernel calls
+made on the calling thread in order (Kernel::set_import_hook; ours makes
+none but the export itself). Two handles are the same answer whatever
+their numbers (XAM's start made objects first). The verdicts:
+- **matches**: the same result and memory;
+- **differs**;
+- **needs state**: the console's timed out, or answered that its start did
+  not set up what the call needs (the codes above);
+- **faults**, on either side or both.
+
+`XF_XAM_XEX=<file> ctest -R xam_oracle` runs `tests/xam_oracle_test.cpp`
+(skipped without it): the imports, the start's TRUE, a call that matches,
+the console's own answer to XamGetSystemVersion, a memory difference found
+and placed, and a fault kept to its side's process. Its expectations are
+2.0.16202's.
+
+**The first survey** (2026-11-06; 105 seconds, sequential). Of our 387 xam
+exports, 383 are the console's too: XamFirstRunExperienceShouldRun,
+XamGetLocaleEx, XamSetCountry and XamShowMultiplayerUpgradeUI are later
+dashboards' and fall in empty slots of its table (1,320 of the 2,890 are
+empty, and our loader no longer answers the image's base for one, as
+Xenia's does). Each is called with arguments made from its parameters as
+Xenia declares them (`tools/xam_signatures.inc`, from
+`tools/xam_signatures.py`): user 0, sizes 0x100, counts 1, a zeroed 4 KB
+buffer for each pointer, no overlapped. On the title's threads: 185 match,
+144 differ, 39 need state, 15 fault (8 the console's, 2 ours, 5 both; most
+are a null pointer the generic arguments gave, which neither side checks,
+and the console's XamTask* calls outside a task). Much of what differs is
+the arguments: the
+console's XAM checks them (ERROR_INVALID_PARAMETER or E_INVALIDARG for a
+zeroed structure, in 51 answers) where ours takes them. The telling ones,
+candidates for our HLE (the console's answer first; where Xenia's answer is
+the one we ported, the console's is Microsoft's own and wins):
+- XamGetSystemVersion(): 0x20076000, ours 0 (Xenia returns 0 on purpose);
+  XamUpdateGetCurrentSystemVersion(): 0x20076000, ours 0x760;
+  XamUpdateGetBaseSystemVersion(): 0, ours 0x760;
+- XamInputGetCapabilities(0, 0, buf): it asks the kernel
+  (HidGetCapabilities, which answers success here) and returns 0 with the
+  type byte 2 written; ours answers ERROR_DEVICE_NOT_CONNECTED from XAM's
+  own state. Ours disagrees with our own kernel;
+- XamResetInactivity(): the interrupt time it read (KeQueryInterruptTime),
+  ours 0 (Xenia's stub);
+- XamVoiceGetMicArrayStatus(): 2, ours 0 (Xenia's stub);
+- XamGetLocaleDateFormat(0): 2, ours 3;
+- XamFeatureEnabled(n) reads bit n - 1 of Xenia's own mask (1-32 and 39
+  on, 0 and 33-38 off), where Xenia reads bit n of its low 36 bits: fixed
+  here (xam_info.cpp), and the five edges now match;
+- XamIsXbox1TitleId(0): 0, ours 1 (Xenia's test, title IDs below 0x10000);
+- XamNotifyCreateListener(0, 0): no listener (0) for an empty mask, ours a
+  handle;
+- NetDll_WSAStartup(0, 0, buf): WSAEINVAL (0x2726) for version 0, ours 0;
+  NetDll_XNetRandom calls XeCryptRandom, as ours could;
+- XamFormatDateString and XamFormatTimeString(0, 0, buf, 1): -1 with no
+  write, where ours writes through the second argument read as a pointer
+  (Xenia's reading for an invalid time; this XAM's arguments differ);
+- XamShowMessageBoxUI(0, "T", "X", 1, buttons, 0, 0, result, overlapped):
+  without an overlapped ERROR_INVALID_PARAMETER (the box is never
+  synchronous), ours the default answer at once; with one,
+  ERROR_FUNCTION_FAILED here (no UI to show it), ours ERROR_IO_PENDING.
+
+The noise to read past: thread IDs and tick counts (its start made threads
+and took time), pointers into XAM's own data (XamGetOnlineSchema), and
+calls that end the title (XamLoaderLaunchTitle, XamLoaderTerminateTitle).
+
 ## `boot`
 
 `boot <game.iso> [--seconds N] [--steps N] [--content <dir>] [--interpret]
