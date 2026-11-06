@@ -360,6 +360,13 @@ target_include_directories(kernel_inventory_test PRIVATE src/kernel)
 target_link_libraries(kernel_inventory_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_inventory COMMAND kernel_inventory_test)
 set_tests_properties(kernel_inventory PROPERTIES TIMEOUT 120) # threads: fail, never hang
+
+# XAM's system UI with no dialog drawn: defaults, overlapped, notifications
+add_executable(kernel_ui_test tests/kernel_ui_test.cpp)
+target_include_directories(kernel_ui_test PRIVATE src/kernel)
+target_link_libraries(kernel_ui_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME kernel_ui COMMAND kernel_ui_test)
+set_tests_properties(kernel_ui PROPERTIES TIMEOUT 120)
 # the sound family: render driver clients and XMA contexts on guest threads
 add_executable(kernel_audio_test tests/kernel_audio_test.cpp)
 target_include_directories(kernel_audio_test PRIVATE src/kernel)

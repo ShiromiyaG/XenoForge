@@ -39,13 +39,38 @@
 //   - the errors a call meets are Winsock's own for the case (a second
 //     bind WSAEINVAL, a taken port WSAEADDRINUSE, a datagram longer than
 //     the buffer WSAEMSGSIZE...), where Xenia gets them from the host;
-//   - XNetLogonGetTitleID is not in Xenia (see it below).
+//   - XNetLogonGetTitleID is not in Xenia (see it below);
+//   - the overlapped Winsock calls (WSARecv, WSARecvFrom, WSASend, WSASendTo,
+//     WSAGetOverlappedResult, WSACancelOverlappedIO, WSAEventSelect) follow
+//     Winsock 2's contract on these sockets. Xenia has only WSARecvFrom, a
+//     stub that returns -1 with no error set, and WSASendTo, which sends
+//     without completing the overlapped or writing the bytes sent; the rest
+//     are not in Xenia. Their signatures are Winsock's with the caller type
+//     first, as every NetDll export that takes a socket (Xenia's WSARecvFrom
+//     leaves out lpFromlen; Winsock's has it, before the overlapped). A send
+//     completes at once. A receive takes a datagram queued, else it pends
+//     (WSA_IO_PENDING, whether or not the socket blocks, as Winsock's
+//     overlapped receives do) until a datagram comes, the request is
+//     cancelled (WSACancelOverlappedIO) or the socket is closed (both
+//     WSA_OPERATION_ABORTED). A request ends as an NT I/O request does: the
+//     WSAOVERLAPPED's Internal the status (STATUS_PENDING meanwhile) and
+//     InternalHigh the bytes, then its event set or, with a completion
+//     routine, the routine queued as a user APC to the thread that asked:
+//     routine(error, bytes, overlapped). The routine's fourth argument
+//     (flags) is not passed: the kernel's user APCs carry three.
+//     WSAEventSelect makes the socket non-blocking and sets the event for
+//     FD_READ when a datagram is queued and for FD_WRITE at once on a
+//     datagram socket (always writable here);
+//   - XNetInAddrToString writes the address in dotted form (Xenia's stub
+//     writes "666.666.666.666").
 //
 // A socket ends with closesocket (its handle released then); a thread
 // blocked on it is woken with WSAEINTR, as Winsock does.
 
 #include "xam.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -65,7 +90,18 @@ constexpr uint32_t X_WSAEAFNOSUPPORT = 10047, X_WSAEADDRINUSE = 10048, X_WSAENET
 constexpr uint32_t X_WSAENOBUFS = 10055;
 constexpr uint32_t X_WSAEISCONN = 10056, X_WSAENOTCONN = 10057, X_WSAETIMEDOUT = 10060;
 constexpr uint32_t X_WSAECONNREFUSED = 10061;
+constexpr uint32_t X_WSA_OPERATION_ABORTED = 995, X_WSA_IO_INCOMPLETE = 996, X_WSA_IO_PENDING = 997;
 constexpr uint32_t SOCKET_ERROR = 0xFFFFFFFF;
+
+// WSAOVERLAPPED (0x14): Internal (the request's NT status), InternalHigh
+// (the bytes moved), Offset, OffsetHigh, hEvent
+namespace wsaov {
+constexpr uint32_t INTERNAL = 0x0, INTERNAL_HIGH = 0x4, EVENT = 0x10;
+}
+constexpr uint32_t STATUS_BUFFER_OVERFLOW = 0x80000005, STATUS_CANCELLED = 0xC0000120;
+
+// WSAEventSelect's network events
+constexpr uint32_t FD_READ = 0x01, FD_WRITE = 0x02, FD_ALL_EVENTS = 0x3FF;
 
 // XSocket's enums and the option codes xsocket.cc translates
 constexpr uint32_t AF_INET = 2, SOCK_STREAM = 1, SOCK_DGRAM = 2;
@@ -82,13 +118,29 @@ constexpr uint32_t LOOPBACK = 0x7F000001, BROADCAST = 0xFFFFFFFF;
 constexpr uint16_t EPHEMERAL_FIRST = 49152;
 constexpr uint32_t MAX_DATAGRAM = 65507; // UDP over IPv4's largest payload
 
-constexpr uint32_t XNET_GET_XNADDR_STATIC = 0x4;
+constexpr uint32_t XNET_GET_XNADDR_NONE = 0x1, XNET_GET_XNADDR_STATIC = 0x4;
+constexpr uint32_t XNADDR_SIZE = 0x24;
 constexpr uint32_t XNET_STARTUP_PARAMS_SIZE = 0xD;
 // XNetStartupParams' cfgSockDefaultRecvBufsizeInK and ...SendBufsizeInK
 constexpr uint32_t PARAM_RECV_BUF_K = 4, PARAM_SEND_BUF_K = 5;
 constexpr uint32_t DEFAULT_BUFFER_K = 16; // XNet's default for both
 
 constexpr uint32_t WSA_WAIT_FAILED = 0xFFFFFFFF;
+
+// a WSABUF: the length, the address
+struct Buffer {
+    uint32_t address, length;
+};
+
+// An overlapped receive pending on a socket: where its datagram goes, and
+// how its end is told.
+struct Request {
+    uint32_t overlapped = 0, routine = 0;
+    std::vector<Buffer> buffers;
+    uint32_t from = 0, from_length_ptr = 0;
+    Ref<Event> event; // hEvent's (none with a completion routine)
+    Ref<Thread> thread;
+};
 
 // A socket (Xenia's XSocket), its state under the objects' lock.
 class Socket : public Object {
@@ -99,6 +151,12 @@ class Socket : public Object {
         uint16_t port;
         std::vector<uint8_t> data;
     };
+    std::deque<Request> pending; // overlapped receives, in the order asked
+    Ref<Event> select_event;     // WSAEventSelect's
+    uint32_t select_mask = 0;
+    // set each time a request ends, for WSAGetOverlappedResult's waits
+    // (each resets it, under the lock, before it waits)
+    Ref<Event> progress;
     uint32_t type = 0, protocol = 0;
     bool nonblocking = false, listening = false, connected = false, closed = false;
     bool bound = false;
@@ -149,12 +207,77 @@ Ref<Socket> socket_by_handle(Kernel &k, uint32_t handle) {
     return s->closed ? Ref<Socket>() : s;
 }
 
+// XSOCKADDR_IN (0x10): family, port, address big-endian, zeros
+void store_sockaddr(Kernel &k, uint32_t address, uint32_t ip, uint16_t port) {
+    k.store16(address + 0, uint16_t(AF_INET));
+    k.store16(address + 2, port);
+    k.store32(address + 4, ip);
+    std::memset(k.host(address + 8), 0, 8);
+}
+
 // the readable event follows the socket's state (lock held)
 void update_readable(Objects &o, Socket &s) {
     bool now = !s.queue.empty() || s.closed;
     if (now == (s.readable->signal_state() > 0)) return;
     s.readable->set_signal_state(now ? 1 : 0);
     if (now) o.signaled(*s.readable);
+}
+
+void set_event(Objects &o, Event &e) { // (lock held)
+    e.set_signal_state(1);
+    o.signaled(e);
+}
+
+// a datagram scattered over the buffers, as much as fits: the bytes copied
+uint32_t scatter(Kernel &k, const std::vector<uint8_t> &data, const std::vector<Buffer> &buffers) {
+    uint32_t copied = 0;
+    for (const Buffer &b : buffers) {
+        uint32_t n = std::min<uint32_t>(b.length, uint32_t(data.size()) - copied);
+        if (n) std::memcpy(k.host(b.address), data.data() + copied, n);
+        copied += n;
+        if (copied == data.size()) break;
+    }
+    return copied;
+}
+
+uint32_t total_length(const std::vector<Buffer> &buffers) {
+    uint64_t n = 0;
+    for (const Buffer &b : buffers) n += b.length;
+    return uint32_t(std::min<uint64_t>(n, 0xFFFFFFFF));
+}
+
+// a request ended (lock held): the status and the bytes in its
+// WSAOVERLAPPED, then its event set or its routine queued to the thread
+// that asked, routine(error, bytes, overlapped)
+void end_request(Kernel &k, Objects &o, Socket &s, Request &r, uint32_t status, uint32_t error, uint32_t bytes) {
+    k.store32(r.overlapped + wsaov::INTERNAL_HIGH, bytes);
+    k.store32(r.overlapped + wsaov::INTERNAL, status);
+    if (r.routine) {
+        if (r.thread) o.queue_user_apc(*r.thread, r.routine, error, bytes, r.overlapped);
+    } else if (r.event) {
+        set_event(o, *r.event);
+    }
+    set_event(o, *s.progress);
+}
+
+// a datagram into a pending request (lock held)
+void fill_request(Kernel &k, Objects &o, Socket &s, Request &r, const Socket::Datagram &d) {
+    uint32_t copied = scatter(k, d.data, r.buffers);
+    if (r.from) store_sockaddr(k, r.from, d.address, d.port);
+    if (r.from_length_ptr) k.store32(r.from_length_ptr, SOCKADDR_IN_SIZE);
+    bool whole = copied == d.data.size();
+    end_request(k, o, s, r, whole ? X_STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW, whole ? 0 : X_WSAEMSGSIZE, copied);
+}
+
+// every request pending on the socket ends aborted (lock held), moved to
+// ended: what they hold is released after the lock (a last release under
+// it could take it again)
+void abort_requests(Kernel &k, Objects &o, Socket &s, std::vector<Request> &ended) {
+    for (Request &r : s.pending) {
+        end_request(k, o, s, r, STATUS_CANCELLED, X_WSA_OPERATION_ABORTED, 0);
+        ended.push_back(std::move(r));
+    }
+    s.pending.clear();
 }
 
 bool port_taken(NetState &n, const Socket &self, uint16_t port) {
@@ -182,9 +305,10 @@ bool local_destination(uint32_t address) { return (address >> 24) == 127 || addr
 
 // a datagram from s to address:port: delivered to this title's sockets bound
 // there when the address is the loopback or broadcast, dropped otherwise
-// (lock held); the bytes sent, else the error
+// (lock held); the bytes sent, else the error. The overlapped receives it
+// ends go to ended, released after the lock.
 uint32_t send_datagram(Kernel &k, Socket &s, uint32_t address, uint16_t port, const uint8_t *data, uint32_t length,
-                       uint32_t &error) {
+                       uint32_t &error, std::vector<Request> &ended) {
     if (address == BROADCAST && !s.option(SOL_SOCKET, SO_BROADCAST)) {
         error = X_WSAEACCES;
         return SOCKET_ERROR;
@@ -202,21 +326,21 @@ uint32_t send_datagram(Kernel &k, Socket &s, uint32_t address, uint16_t port, co
         if (to.closed || !to.datagram() || !to.bound || to.bound_port != port) continue;
         if (to.bound_address && to.bound_address != address && address != BROADCAST) continue;
         if (to.connected && (to.peer_address != LOOPBACK || to.peer_port != s.bound_port)) continue;
+        if (!to.pending.empty()) { // an overlapped receive waits for it
+            fill_request(k, o, to, to.pending.front(),
+                         {LOOPBACK, s.bound_port, std::vector<uint8_t>(data, data + length)});
+            ended.push_back(std::move(to.pending.front()));
+            to.pending.pop_front();
+            continue;
+        }
         uint32_t limit = to.option(SOL_SOCKET, SO_RCVBUF, default_buffer(k, PARAM_RECV_BUF_K));
         if (to.queued_bytes + length > limit) continue; // the receiver's buffer is full: lost, as UDP loses it
         to.queue.push_back({LOOPBACK, s.bound_port, std::vector<uint8_t>(data, data + length)});
         to.queued_bytes += length;
         update_readable(o, to);
+        if (to.select_event && (to.select_mask & FD_READ)) set_event(o, *to.select_event);
     }
     return length;
-}
-
-// XSOCKADDR_IN (0x10): family, port, address big-endian, zeros
-void store_sockaddr(Kernel &k, uint32_t address, uint32_t ip, uint16_t port) {
-    k.store16(address + 0, uint16_t(AF_INET));
-    k.store16(address + 2, port);
-    k.store32(address + 4, ip);
-    std::memset(k.host(address + 8), 0, 8);
 }
 
 // waits, the lock released meanwhile, for the socket to become readable or
@@ -230,10 +354,13 @@ bool wait_readable(Objects &o, Socket &s, uint64_t deadline) {
 
 uint64_t deadline_ms(Objects &o, uint32_t ms) { return ms ? o.now() + uint64_t(ms) * 10000 : Scheduler::NEVER; }
 
-// recv and recvfrom: the first datagram queued (MSG_PEEK leaves it), waiting
-// for one when the socket blocks; its length, else the error
-uint32_t receive(Kernel &k, Socket &s, uint32_t buffer, uint32_t length, uint32_t flags, uint32_t from,
-                 uint32_t from_length_ptr, uint32_t &error) {
+// recv, recvfrom, WSARecv and WSARecvFrom: the first datagram queued
+// (MSG_PEEK leaves it) scattered over the buffers, waiting for one when the
+// socket blocks; its length, else the error. An overlapped request (pend)
+// that finds a datagram ends at once; one that finds none is left pending
+// (WSA_IO_PENDING).
+uint32_t receive(Kernel &k, Socket &s, const std::vector<Buffer> &buffers, uint32_t flags, uint32_t from,
+                 uint32_t from_length_ptr, uint32_t &error, Request *pend = nullptr) {
     if (!s.datagram()) {
         error = s.listening ? X_WSAEINVAL : X_WSAENOTCONN;
         return SOCKET_ERROR;
@@ -256,6 +383,15 @@ uint32_t receive(Kernel &k, Socket &s, uint32_t buffer, uint32_t length, uint32_
             return SOCKET_ERROR;
         }
         if (!s.queue.empty()) break;
+        if (pend) {
+            k.store32(pend->overlapped + wsaov::INTERNAL, X_STATUS_PENDING);
+            k.store32(pend->overlapped + wsaov::INTERNAL_HIGH, 0);
+            if (pend->event) pend->event->set_signal_state(0);
+            pend->buffers = buffers, pend->from = from, pend->from_length_ptr = from_length_ptr;
+            s.pending.push_back(std::move(*pend));
+            error = X_WSA_IO_PENDING;
+            return SOCKET_ERROR;
+        }
         if (s.nonblocking) {
             error = X_WSAEWOULDBLOCK;
             return SOCKET_ERROR;
@@ -270,8 +406,7 @@ uint32_t receive(Kernel &k, Socket &s, uint32_t buffer, uint32_t length, uint32_
         }
     }
     Socket::Datagram &d = s.queue.front();
-    uint32_t size = uint32_t(d.data.size()), copied = std::min(size, length);
-    if (copied) std::memcpy(k.host(buffer), d.data.data(), copied);
+    uint32_t size = uint32_t(d.data.size()), copied = scatter(k, d.data, buffers);
     if (from) store_sockaddr(k, from, d.address, d.port);
     if (from_length_ptr) k.store32(from_length_ptr, SOCKADDR_IN_SIZE);
     if (!(flags & MSG_PEEK)) {
@@ -279,6 +414,9 @@ uint32_t receive(Kernel &k, Socket &s, uint32_t buffer, uint32_t length, uint32_
         s.queue.pop_front();
         update_readable(o, s);
     }
+    if (pend)
+        end_request(k, o, s, *pend, copied < size ? STATUS_BUFFER_OVERFLOW : X_STATUS_SUCCESS,
+                    copied < size ? X_WSAEMSGSIZE : 0, copied);
     if (copied < size) { // the rest of the datagram is lost, as Winsock loses it
         error = X_WSAEMSGSIZE;
         return SOCKET_ERROR;
@@ -332,6 +470,9 @@ XF_EXPORT(xam, NetDll_WSAStartup) {
     result(c, 0);
 }
 
+// (caller, version, X_WSADATA *, version_requested): as WSAStartup
+XF_EXPORT(xam, NetDll_WSAStartupEx) { find_export_fn("xam", "NetDll_WSAStartup")(k, c); }
+
 XF_EXPORT(xam, NetDll_WSACleanup) { result(c, 0); }
 XF_EXPORT(xam, NetDll_WSAGetLastError) { result(c, last_error(k)); }
 XF_EXPORT(xam, NetDll_WSASetLastError) { set_last_error(k, arg(k, c, 0)); }
@@ -347,6 +488,9 @@ XF_EXPORT(xam, NetDll_XNetStartup) {
     }
     result(c, 0);
 }
+
+// (caller, XNetStartupParams *, version_requested): as XNetStartup
+XF_EXPORT(xam, NetDll_XNetStartupEx) { find_export_fn("xam", "NetDll_XNetStartup")(k, c); }
 
 XF_EXPORT(xam, NetDll_XNetCleanup) { result(c, 0); }
 
@@ -397,6 +541,27 @@ XF_EXPORT(xam, NetDll_XNetGetTitleXnAddr) {
     std::memset(p + 10, 0xCC, 6);             // abEnet
     std::memset(p + 16, 0, 20);               // abOnline
     result(c, XNET_GET_XNADDR_STATIC);
+}
+
+// (caller, XNADDR *): no debugger, the address zero (XNET_GET_XNADDR_NONE;
+// the callers give up gracefully)
+XF_EXPORT(xam, NetDll_XNetGetDebugXnAddr) {
+    if (uint32_t addr = arg(k, c, 1)) std::memset(k.host(addr), 0, XNADDR_SIZE);
+    result(c, XNET_GET_XNADDR_NONE);
+}
+
+// (caller, in_addr, string, size): the address in dotted form, truncated
+// to the size with its terminator (see the top)
+XF_EXPORT(xam, NetDll_XNetInAddrToString) {
+    uint32_t ip = arg(k, c, 1), out = arg(k, c, 2), size = arg(k, c, 3);
+    char text[16];
+    std::snprintf(text, sizeof(text), "%u.%u.%u.%u", ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+    if (out && size) {
+        uint32_t n = std::min<uint32_t>(uint32_t(std::strlen(text)), size - 1);
+        std::memcpy(k.host(out), text, n);
+        k.host(out)[n] = 0;
+    }
+    result(c, 0);
 }
 
 // (caller, XNADDR *, machine_id_ptr): not signed in to Live
@@ -475,6 +640,21 @@ XF_EXPORT(xam, NetDll_XNetUnregisterKey) { result(c, 0); }
 XF_EXPORT(xam, NetDll_XNetCreateKey) {
     std::memset(k.host(arg(k, c, 1)), 0xBE, 8);
     std::memset(k.host(arg(k, c, 2)), 0xBE, 16);
+    result(c, 0);
+}
+
+// ---- XHttp: offline, as Xenia's stubs (XAuth's are in xam_info.cpp) ----
+
+// (caller, reserved, reserved_ptr): TRUE, the last error cleared
+XF_EXPORT(xam, NetDll_XHttpStartup) {
+    set_last_error(k, X_ERROR_SUCCESS);
+    result(c, 1);
+}
+
+// (caller, user_agent, access_type, proxy_name, proxy_bypass, flags): no
+// session, ERROR_NOT_SUPPORTED
+XF_EXPORT(xam, NetDll_XHttpOpen) {
+    set_last_error(k, X_ERROR_NOT_SUPPORTED);
     result(c, 0);
 }
 
@@ -571,11 +751,13 @@ XF_EXPORT(xam, NetDll_socket) {
     if (!fits) return fail(k, c, X_WSAEPROTONOSUPPORT);
     Objects &o = objects(k);
     Ref<Event> readable = o.create<Event>(GuestType::EventNotification, header::SIZE);
-    if (!readable) return fail(k, c, X_WSAENOBUFS);
+    Ref<Event> progress = o.create<Event>(GuestType::EventNotification, header::SIZE);
+    if (!readable || !progress) return fail(k, c, X_WSAENOBUFS);
     Ref<Socket> s(new Socket(o));
-    s->type = type, s->protocol = protocol, s->readable = readable;
+    s->type = type, s->protocol = protocol, s->readable = readable, s->progress = progress;
     std::lock_guard<std::mutex> l(o.lock);
     o.release_handle(readable->handle()); // the socket's own, waited on through it
+    o.release_handle(progress->handle());
     uint32_t handle = o.add_handle(s.get());
     s->retain();
     k.state<NetState>().sockets.push_back(s.get());
@@ -588,9 +770,13 @@ XF_EXPORT(xam, NetDll_closesocket) {
     Ref<Socket> s = socket_by_handle(k, handle);
     if (!s) return fail(k, c, X_WSAENOTSOCK);
     Objects &o = objects(k);
+    std::vector<Request> ended;
+    Ref<Event> ended_event;
     std::lock_guard<std::mutex> l(o.lock);
     s->closed = true;
     s->queue.clear(), s->queued_bytes = 0;
+    abort_requests(k, o, *s, ended);
+    ended_event = std::move(s->select_event);
     update_readable(o, *s);
     std::erase(k.state<NetState>().sockets, s.get());
     s->release(); // the registry's (the Ref here keeps it until the export returns)
@@ -813,7 +999,7 @@ XF_EXPORT(xam, NetDll_recv) {
     }
     if (s->datagram() && !connected) return fail(k, c, X_WSAENOTCONN);
     uint32_t error = 0;
-    uint32_t n = receive(k, *s, arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), 0, 0, error);
+    uint32_t n = receive(k, *s, {{arg(k, c, 2), arg(k, c, 3)}}, arg(k, c, 4), 0, 0, error);
     if (n == SOCKET_ERROR) return fail(k, c, error);
     result(c, n);
 }
@@ -823,7 +1009,7 @@ XF_EXPORT(xam, NetDll_recvfrom) {
     Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
     if (!s) return fail(k, c, X_WSAENOTSOCK);
     uint32_t error = 0;
-    uint32_t n = receive(k, *s, arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), arg(k, c, 5), arg(k, c, 6), error);
+    uint32_t n = receive(k, *s, {{arg(k, c, 2), arg(k, c, 3)}}, arg(k, c, 4), arg(k, c, 5), arg(k, c, 6), error);
     if (n == SOCKET_ERROR) return fail(k, c, error);
     result(c, n);
 }
@@ -833,10 +1019,11 @@ XF_EXPORT(xam, NetDll_send) {
     Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
     if (!s) return fail(k, c, X_WSAENOTSOCK);
     Objects &o = objects(k);
+    std::vector<Request> ended;
     std::lock_guard<std::mutex> l(o.lock);
     if (!s->connected) return fail(k, c, X_WSAENOTCONN);
     uint32_t error = 0, buffer = arg(k, c, 2), length = arg(k, c, 3);
-    uint32_t n = send_datagram(k, *s, s->peer_address, s->peer_port, k.host(buffer), length, error);
+    uint32_t n = send_datagram(k, *s, s->peer_address, s->peer_port, k.host(buffer), length, error, ended);
     if (n == SOCKET_ERROR) return fail(k, c, error);
     result(c, n);
 }
@@ -847,6 +1034,7 @@ XF_EXPORT(xam, NetDll_sendto) {
     Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
     if (!s) return fail(k, c, X_WSAENOTSOCK);
     Objects &o = objects(k);
+    std::vector<Request> ended;
     std::lock_guard<std::mutex> l(o.lock);
     if (!s->datagram()) return fail(k, c, X_WSAENOTCONN);
     uint32_t address = s->peer_address;
@@ -858,7 +1046,7 @@ XF_EXPORT(xam, NetDll_sendto) {
         return fail(k, c, X_WSAENOTCONN);
     }
     uint32_t error = 0;
-    uint32_t n = send_datagram(k, *s, address, port, k.host(buffer), length, error);
+    uint32_t n = send_datagram(k, *s, address, port, k.host(buffer), length, error, ended);
     if (n == SOCKET_ERROR) return fail(k, c, error);
     result(c, n);
 }
@@ -874,6 +1062,190 @@ XF_EXPORT(xam, NetDll_getsockname) {
     if (!s->bound) return fail(k, c, X_WSAEINVAL);
     store_sockaddr(k, name, s->bound_address, s->bound_port);
     k.store32(length_ptr, SOCKADDR_IN_SIZE);
+    result(c, 0);
+}
+
+// ---- overlapped Winsock (see the top) ----
+
+namespace {
+
+constexpr uint32_t MAX_WSABUFS = 1024;
+
+// a WSABUF array (length, address each); false if there is none
+bool load_buffers(Kernel &k, uint32_t address, uint32_t count, std::vector<Buffer> &out) {
+    if (!address || !count || count > MAX_WSABUFS) return false;
+    for (uint32_t i = 0; i < count; i++) out.push_back({k.load32(address + 8 * i + 4), k.load32(address + 8 * i)});
+    return true;
+}
+
+// an overlapped request's parts that are looked up before the lock is
+// taken: hEvent's event (ignored with a completion routine, as Winsock
+// ignores it) and the thread that asks; false if hEvent is no event
+bool prepare(Kernel &k, uint32_t ov, uint32_t routine, Request &r) {
+    r.overlapped = ov, r.routine = routine;
+    if (Thread *t = current_thread()) r.thread = Ref<Thread>::retain(t);
+    uint32_t handle = routine ? 0 : k.load32(ov + wsaov::EVENT);
+    if (!handle) return true;
+    r.event = objects(k).lookup<Event>(handle);
+    return bool(r.event);
+}
+
+// WSARecv and WSARecvFrom: 0 and the bytes when a datagram was there,
+// else SOCKET_ERROR (WSA_IO_PENDING for an overlapped request left pending)
+void wsa_receive(Kernel &k, ppc::Context &c, uint32_t handle, uint32_t buffers_at, uint32_t count, uint32_t bytes_ptr,
+                 uint32_t flags_ptr, uint32_t from, uint32_t from_length_ptr, uint32_t ov, uint32_t routine,
+                 bool connected_only) {
+    Ref<Socket> s = socket_by_handle(k, handle);
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    std::vector<Buffer> buffers;
+    if (!load_buffers(k, buffers_at, count, buffers)) return fail(k, c, X_WSAEFAULT);
+    if (connected_only && s->datagram()) {
+        std::lock_guard<std::mutex> l(objects(k).lock);
+        if (!s->connected) return fail(k, c, X_WSAENOTCONN);
+    }
+    uint32_t flags = flags_ptr ? k.load32(flags_ptr) : 0;
+    Request r;
+    if (ov && !prepare(k, ov, routine, r)) return fail(k, c, X_ERROR_INVALID_HANDLE);
+    uint32_t error = 0;
+    uint32_t n = receive(k, *s, buffers, flags, from, from_length_ptr, error, ov ? &r : nullptr);
+    if (n == SOCKET_ERROR) return fail(k, c, error);
+    if (bytes_ptr) k.store32(bytes_ptr, n);
+    if (flags_ptr) k.store32(flags_ptr, 0);
+    result(c, 0);
+}
+
+// WSASend and WSASendTo: the buffers gathered into one datagram, sent at
+// once (to, else the connected peer); an overlapped request ends with it
+void wsa_send(Kernel &k, ppc::Context &c, uint32_t handle, uint32_t buffers_at, uint32_t count, uint32_t bytes_ptr,
+              uint32_t to, uint32_t to_length, uint32_t ov, uint32_t routine) {
+    Ref<Socket> s = socket_by_handle(k, handle);
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    std::vector<Buffer> buffers;
+    if (!load_buffers(k, buffers_at, count, buffers)) return fail(k, c, X_WSAEFAULT);
+    std::vector<uint8_t> data;
+    data.reserve(total_length(buffers));
+    for (const Buffer &b : buffers) data.insert(data.end(), k.host(b.address), k.host(b.address) + b.length);
+    Request r;
+    if (ov && !prepare(k, ov, routine, r)) return fail(k, c, X_ERROR_INVALID_HANDLE);
+    Objects &o = objects(k);
+    std::vector<Request> ended;
+    std::lock_guard<std::mutex> l(o.lock);
+    if (!s->datagram()) return fail(k, c, X_WSAENOTCONN);
+    uint32_t address = s->peer_address;
+    uint16_t port = s->peer_port;
+    if (to) {
+        if (to_length < SOCKADDR_IN_SIZE) return fail(k, c, X_WSAEFAULT);
+        address = k.load32(to + 4), port = k.load16(to + 2);
+    } else if (!s->connected) {
+        return fail(k, c, X_WSAENOTCONN);
+    }
+    uint32_t error = 0;
+    uint32_t n = send_datagram(k, *s, address, port, data.data(), uint32_t(data.size()), error, ended);
+    if (n == SOCKET_ERROR) return fail(k, c, error);
+    if (ov) end_request(k, o, *s, r, X_STATUS_SUCCESS, 0, n);
+    if (bytes_ptr) k.store32(bytes_ptr, n);
+    result(c, 0);
+}
+
+} // namespace
+
+// (caller, socket, buffers, count, bytes_ptr, flags_ptr, overlapped, routine)
+XF_EXPORT(xam, NetDll_WSARecv) {
+    wsa_receive(k, c, arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), arg(k, c, 5), 0, 0, arg(k, c, 6),
+                arg(k, c, 7), true);
+}
+
+// (caller, socket, buffers, count, bytes_ptr, flags_ptr, from, from_length_ptr,
+// overlapped, routine)
+XF_EXPORT(xam, NetDll_WSARecvFrom) {
+    wsa_receive(k, c, arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), arg(k, c, 5), arg(k, c, 6), arg(k, c, 7),
+                arg(k, c, 8), arg(k, c, 9), false);
+}
+
+// (caller, socket, buffers, count, bytes_ptr, flags, overlapped, routine)
+XF_EXPORT(xam, NetDll_WSASend) {
+    wsa_send(k, c, arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), 0, 0, arg(k, c, 6), arg(k, c, 7));
+}
+
+// (caller, socket, buffers, count, bytes_ptr, flags, to, to_length,
+// overlapped, routine)
+XF_EXPORT(xam, NetDll_WSASendTo) {
+    wsa_send(k, c, arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), arg(k, c, 6), arg(k, c, 7), arg(k, c, 8),
+             arg(k, c, 9));
+}
+
+// (caller, socket, overlapped, bytes_ptr, wait, flags_ptr): TRUE and the
+// bytes when the request succeeded; FALSE with WSA_IO_INCOMPLETE while it
+// pends (waiting for its end first with wait), else with its error
+XF_EXPORT(xam, NetDll_WSAGetOverlappedResult) {
+    uint32_t ov = arg(k, c, 2), bytes_ptr = arg(k, c, 3), wait = arg(k, c, 4), flags_ptr = arg(k, c, 5);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return set_last_error(k, X_WSAENOTSOCK), result(c, 0);
+    if (!ov) return set_last_error(k, X_WSAEFAULT), result(c, 0);
+    Objects &o = objects(k);
+    std::unique_lock<std::mutex> l(o.lock);
+    for (;;) {
+        bool pending =
+            std::any_of(s->pending.begin(), s->pending.end(), [&](const Request &r) { return r.overlapped == ov; });
+        if (!pending && k.load32(ov + wsaov::INTERNAL) != X_STATUS_PENDING) break;
+        Thread *t = current_thread();
+        if (!wait || !pending || !t) {
+            l.unlock();
+            set_last_error(k, X_WSA_IO_INCOMPLETE);
+            return result(c, 0);
+        }
+        // until a request on the socket ends; the reset is seen by no one
+        // already woken, as the wake happens under the lock
+        Ref<Event> progress = s->progress;
+        progress->set_signal_state(0);
+        l.unlock();
+        Dispatcher *list[] = {progress.get()};
+        o.wait(*t, list, false, false, Scheduler::NEVER);
+        l.lock();
+    }
+    uint32_t status = k.load32(ov + wsaov::INTERNAL), bytes = k.load32(ov + wsaov::INTERNAL_HIGH);
+    l.unlock();
+    if (bytes_ptr) k.store32(bytes_ptr, bytes);
+    if (flags_ptr) k.store32(flags_ptr, 0);
+    if (status == X_STATUS_SUCCESS) return result(c, 1);
+    set_last_error(k, status == STATUS_CANCELLED         ? X_WSA_OPERATION_ABORTED
+                      : status == STATUS_BUFFER_OVERFLOW ? X_WSAEMSGSIZE
+                                                         : X_WSAEINVAL);
+    result(c, 0);
+}
+
+// (caller, socket): every overlapped request pending on it ends aborted
+XF_EXPORT(xam, NetDll_WSACancelOverlappedIO) {
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    Objects &o = objects(k);
+    std::vector<Request> ended;
+    std::lock_guard<std::mutex> l(o.lock);
+    abort_requests(k, o, *s, ended);
+    result(c, 0);
+}
+
+// (caller, socket, event, network_events): the socket non-blocking, the
+// event set for the events asked as they happen (FD_READ, FD_WRITE; see the
+// top); no events and no event undo it
+XF_EXPORT(xam, NetDll_WSAEventSelect) {
+    uint32_t handle = arg(k, c, 2), mask = arg(k, c, 3) & FD_ALL_EVENTS;
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    Objects &o = objects(k);
+    Ref<Event> e = handle ? o.lookup<Event>(handle) : Ref<Event>();
+    if (mask && !e) return fail(k, c, X_WSAEINVAL);
+    Ref<Event> previous;
+    std::lock_guard<std::mutex> l(o.lock);
+    previous = std::move(s->select_event);
+    s->nonblocking = true;
+    s->select_mask = mask;
+    if (mask) s->select_event = e;
+    if (mask) {
+        bool readable = (mask & FD_READ) && !s->queue.empty();
+        bool writable = (mask & FD_WRITE) && (s->datagram() || s->connected);
+        if (readable || writable) set_event(o, *e);
+    }
     result(c, 0);
 }
 

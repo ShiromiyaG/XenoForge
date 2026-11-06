@@ -6,7 +6,12 @@
 // thread blocked until another sends, woken by closesocket; stream sockets
 // that listen and never connect; the WSA events; DNS and QoS lookups that
 // fail at once; XNetLogonGetTitleID; XCustomRegisterDynamicActions; the
-// disc's media verification, its callback a user APC.
+// disc's media verification, its callback a user APC; the overlapped
+// Winsock calls (receives pending until a datagram, completed at once,
+// truncated, cancelled, aborted by closesocket, ended through an event, a
+// completion routine and WSAGetOverlappedResult waiting on another thread;
+// gathered sends; WSAEventSelect); the Ex startups, the debug address,
+// XNetInAddrToString, XAuth and XHttp offline.
 
 #include "check.h"
 
@@ -41,6 +46,8 @@ enum : uint32_t {
     F_CLOSED_WAITER = 0x82000020,
     F_SELECTER = 0x82000030,
     F_MEDIA_CALLBACK = 0x82000040,
+    F_WSA_ROUTINE = 0x82000050,
+    F_OVERLAPPED_WAITER = 0x82000060,
 };
 
 std::atomic<int> media_callbacks{0};
@@ -49,7 +56,8 @@ void media_callback(ppc::Context &c) {
     c.r[3] = 0;
 }
 
-// an export, as the code calls it: r3-r10
+// an export, as the code calls it: r3-r10, then the stack (a 32-bit value
+// in the word at r1 + 0x54 + 8 * (n - 8))
 uint32_t call(ppc::Context &c, const char *library, const char *name, std::initializer_list<uint64_t> args) {
     ExportFn fn = find_export_fn(library, name);
     if (!fn) {
@@ -57,8 +65,14 @@ uint32_t call(ppc::Context &c, const char *library, const char *name, std::initi
         failures++;
         return 0xFFFFFFFF;
     }
-    int n = 3;
-    for (uint64_t a : args) c.r[n++] = a;
+    int n = 0;
+    for (uint64_t a : args) {
+        if (n < 8)
+            c.r[3 + n] = a;
+        else
+            K->store32(uint32_t(c.r[1]) + 0x54 + 8 * (n - 8), uint32_t(a));
+        n++;
+    }
     fn(*K, c);
     return uint32_t(c.r[3]);
 }
@@ -69,6 +83,14 @@ uint32_t xam(ppc::Context &c, const char *name, std::initializer_list<uint64_t> 
     return call(c, "xam", name, args);
 }
 uint32_t last_error(ppc::Context &c) { return xam(c, "NetDll_WSAGetLastError", {}); }
+
+// a WSA completion routine: what it was called with
+std::atomic<int> routine_calls{0};
+std::atomic<uint32_t> routine_error{0}, routine_bytes{0}, routine_overlapped{0};
+void wsa_routine(ppc::Context &c) {
+    routine_error = uint32_t(c.r[3]), routine_bytes = uint32_t(c.r[4]), routine_overlapped = uint32_t(c.r[5]);
+    routine_calls++;
+}
 
 // per-thread guest scratch below the stack pointer
 uint32_t local(ppc::Context &c, uint32_t offset) { return uint32_t(c.r[1]) - 0x1000 + offset; }
@@ -425,6 +447,226 @@ void media_verification(ppc::Context &c) {
     CHECK(media_callbacks == 1);
 }
 
+constexpr uint32_t WSA_OPERATION_ABORTED = 995, WSA_IO_INCOMPLETE = 996, WSA_IO_PENDING = 997, WSAEFAULT = 10014;
+constexpr uint32_t STATUS_PENDING = 0x103, STATUS_BUFFER_OVERFLOW = 0x80000005, STATUS_CANCELLED = 0xC0000120;
+constexpr uint32_t FD_READ = 1, FD_WRITE = 2;
+
+// a WSABUF array: (address, length) each
+uint32_t wsabufs(ppc::Context &c, uint32_t offset, std::initializer_list<std::pair<uint32_t, uint32_t>> buffers) {
+    uint32_t p = local(c, offset), at = p;
+    for (auto [address, length] : buffers) {
+        K->store32(at, length);
+        K->store32(at + 4, address);
+        at += 8;
+    }
+    return p;
+}
+
+// a WSAOVERLAPPED with an event (0 for none)
+uint32_t wsa_overlapped(ppc::Context &c, uint32_t offset, uint32_t event) {
+    uint32_t p = local(c, offset);
+    std::memset(K->host(p), 0xEE, 0x14);
+    K->store32(p + 0x10, event);
+    return p;
+}
+
+bool event_set(ppc::Context &c, uint32_t event) {
+    uint32_t list = local(c, 0x300);
+    K->store32(list, event);
+    return xam(c, "NetDll_WSAWaitForMultipleEvents", {1, list, 0, 0, 0}) == 0;
+}
+
+// a text in a scratch buffer, as one WSABUF
+uint32_t text_buffer(ppc::Context &c, uint32_t offset, uint32_t bufs_offset, const char *text) {
+    uint32_t p = local(c, offset);
+    std::memcpy(K->host(p), text, std::strlen(text));
+    return wsabufs(c, bufs_offset, {{p, uint32_t(std::strlen(text))}});
+}
+
+// WSAGetOverlappedResult with wait on a socket and an overlapped the main
+// thread left pending (both in these), until a datagram ends it
+uint32_t waiter_socket = 0, waiter_overlapped = 0;
+void overlapped_waiter(ppc::Context &c) {
+    uint32_t bytes = local(c, 0x10), flags = local(c, 0x14);
+    CHECK(xam(c, "NetDll_WSAGetOverlappedResult", {1, waiter_socket, waiter_overlapped, bytes, 1, flags}) == 1);
+    CHECK(K->load32(bytes) == 4 && K->load32(flags) == 0);
+    c.r[3] = 0;
+}
+
+void overlapped_io(ppc::Context &c) {
+    uint32_t a = udp(c), b = udp(c);
+    CHECK(bind(c, a, 4000) == 0);
+    uint32_t e = xam(c, "NetDll_WSACreateEvent", {});
+    uint32_t first = local(c, 0x720), second = local(c, 0x740);
+    std::memset(K->host(first), 0, 16), std::memset(K->host(second), 0, 16);
+    uint32_t bufs = wsabufs(c, 0x700, {{first, 3}, {second, 8}});
+    uint32_t bytes = local(c, 0x760), flags = local(c, 0x764), from = local(c, 0x770), from_length = local(c, 0x780);
+    uint32_t ov = wsa_overlapped(c, 0x900, e);
+    K->store32(flags, 0), K->store32(from_length, 16), K->store32(bytes, 0xEEEEEEEE);
+
+    // nothing to read: pending, whether or not the socket blocks
+    CHECK(xam(c, "NetDll_WSARecvFrom", {1, a, bufs, 2, bytes, flags, from, from_length, ov, 0}) == SOCKET_ERROR &&
+          last_error(c) == WSA_IO_PENDING);
+    CHECK(K->load32(ov) == STATUS_PENDING && K->load32(bytes) == 0xEEEEEEEE && !event_set(c, e));
+    CHECK(xam(c, "NetDll_WSAGetOverlappedResult", {1, a, ov, bytes, 0, flags}) == 0 &&
+          last_error(c) == WSA_IO_INCOMPLETE);
+    // a send gathered from two buffers ends it: scattered over the two
+    uint32_t hello = local(c, 0x7C0), there = local(c, 0x7D0);
+    std::memcpy(K->host(hello), "hel", 3), std::memcpy(K->host(there), "lo there", 8);
+    uint32_t sbufs = wsabufs(c, 0x7A0, {{hello, 3}, {there, 8}}), sent = local(c, 0x7E0);
+    CHECK(xam(c, "NetDll_WSASendTo", {1, b, sbufs, 2, sent, 0, sockaddr(c, 0x130, LOOPBACK, 4000), 16, 0, 0}) == 0 &&
+          K->load32(sent) == 11);
+    CHECK(event_set(c, e) && K->load32(ov) == 0 && K->load32(ov + 4) == 11);
+    CHECK(std::string(reinterpret_cast<const char *>(K->host(first))) == "hel" &&
+          std::string(reinterpret_cast<const char *>(K->host(second))) == "lo there");
+    uint16_t b_port = port_of(c, b);
+    CHECK(K->load32(from + 4) == LOOPBACK && K->load16(from + 2) == b_port && K->load32(from_length) == 16);
+    CHECK(xam(c, "NetDll_WSAGetOverlappedResult", {1, a, ov, bytes, 0, flags}) == 1 && K->load32(bytes) == 11);
+    CHECK(xam(c, "NetDll_WSAResetEvent", {e}) == 1);
+
+    // WSARecv reads a connected socket only
+    CHECK(xam(c, "NetDll_WSARecv", {1, a, bufs, 2, bytes, flags, 0, 0}) == SOCKET_ERROR &&
+          last_error(c) == WSAENOTCONN);
+    CHECK(xam(c, "NetDll_connect", {1, a, sockaddr(c, 0x100, LOOPBACK, b_port), 16}) == 0);
+    // a datagram already there: completed at once, the event set too
+    CHECK(xam(c, "NetDll_WSASendTo",
+              {1, b, text_buffer(c, 0x7C0, 0x7A0, "now"), 1, sent, 0, sockaddr(c, 0x130, LOOPBACK, 4000), 16, 0, 0}) ==
+          0);
+    ov = wsa_overlapped(c, 0x900, e);
+    CHECK(xam(c, "NetDll_WSARecv", {1, a, bufs, 2, bytes, flags, ov, 0}) == 0 && K->load32(bytes) == 3);
+    CHECK(K->load32(ov) == 0 && K->load32(ov + 4) == 3 && event_set(c, e));
+    CHECK(xam(c, "NetDll_WSAResetEvent", {e}) == 1);
+    // and with no overlapped, as recv: non-blocking, nothing there
+    uint32_t on = local(c, 0x190);
+    K->store32(on, 1);
+    CHECK(xam(c, "NetDll_ioctlsocket", {1, a, FIONBIO, on}) == 0);
+    CHECK(xam(c, "NetDll_WSARecv", {1, a, bufs, 2, bytes, flags, 0, 0}) == SOCKET_ERROR &&
+          last_error(c) == WSAEWOULDBLOCK);
+    CHECK(xam(c, "NetDll_WSARecv", {1, a, bufs, 0, bytes, flags, 0, 0}) == SOCKET_ERROR && last_error(c) == WSAEFAULT);
+
+    // too long for the buffers: the start, STATUS_BUFFER_OVERFLOW, WSAEMSGSIZE
+    uint32_t small = wsabufs(c, 0x7F0, {{first, 2}});
+    ov = wsa_overlapped(c, 0x900, e);
+    CHECK(xam(c, "NetDll_WSARecv", {1, a, small, 1, bytes, flags, ov, 0}) == SOCKET_ERROR &&
+          last_error(c) == WSA_IO_PENDING);
+    CHECK(xam(c, "NetDll_WSASendTo",
+              {1, b, text_buffer(c, 0x7C0, 0x7A0, "long"), 1, sent, 0, sockaddr(c, 0x130, LOOPBACK, 4000), 16, 0, 0}) ==
+          0);
+    CHECK(K->load32(ov) == STATUS_BUFFER_OVERFLOW && event_set(c, e));
+    CHECK(xam(c, "NetDll_WSAGetOverlappedResult", {1, a, ov, bytes, 0, flags}) == 0 && last_error(c) == WSAEMSGSIZE &&
+          K->load32(bytes) == 2);
+    CHECK(xam(c, "NetDll_WSAResetEvent", {e}) == 1);
+
+    // cancelled
+    ov = wsa_overlapped(c, 0x900, e);
+    CHECK(xam(c, "NetDll_WSARecv", {1, a, bufs, 2, bytes, flags, ov, 0}) == SOCKET_ERROR);
+    CHECK(xam(c, "NetDll_WSACancelOverlappedIO", {1, a}) == 0);
+    CHECK(K->load32(ov) == STATUS_CANCELLED && event_set(c, e));
+    CHECK(xam(c, "NetDll_WSAGetOverlappedResult", {1, a, ov, bytes, 1, flags}) == 0 &&
+          last_error(c) == WSA_OPERATION_ABORTED);
+    CHECK(xam(c, "NetDll_WSAResetEvent", {e}) == 1);
+
+    // a completion routine instead of the event: queued to this thread, run
+    // at its next alertable wait, the event left alone
+    ov = wsa_overlapped(c, 0x900, e);
+    CHECK(xam(c, "NetDll_WSARecv", {1, a, bufs, 2, bytes, flags, ov, F_WSA_ROUTINE}) == SOCKET_ERROR &&
+          last_error(c) == WSA_IO_PENDING);
+    CHECK(xam(c, "NetDll_WSASendTo",
+              {1, b, text_buffer(c, 0x7C0, 0x7A0, "apc"), 1, sent, 0, sockaddr(c, 0x130, LOOPBACK, 4000), 16, 0, 0}) ==
+          0);
+    CHECK(K->load32(ov) == 0 && !event_set(c, e) && routine_calls == 0);
+    uint32_t p = local(c, 0xF00);
+    K->store64(p, uint64_t(-1000 * 10'000));
+    CHECK(krnl(c, "KeDelayExecutionThread", {1, 1, p}) == X_STATUS_USER_APC);
+    CHECK(routine_calls == 1 && routine_error == 0 && routine_bytes == 3 && routine_overlapped == ov);
+
+    // WSASend to the connected peer, overlapped: completed at once
+    CHECK(xam(c, "NetDll_connect", {1, b, sockaddr(c, 0x100, LOOPBACK, 4000), 16}) == 0);
+    ov = wsa_overlapped(c, 0x900, e);
+    CHECK(xam(c, "NetDll_WSASend", {1, b, text_buffer(c, 0x7C0, 0x7A0, "peer"), 1, sent, 0, ov, 0}) == 0 &&
+          K->load32(sent) == 4 && K->load32(ov) == 0 && K->load32(ov + 4) == 4 && event_set(c, e));
+    CHECK(xam(c, "NetDll_recv", {1, a, first, 16, 0}) == 4);
+    uint32_t unconnected = udp(c);
+    CHECK(xam(c, "NetDll_WSASend", {1, unconnected, text_buffer(c, 0x7C0, 0x7A0, "x"), 1, sent, 0, 0, 0}) ==
+              SOCKET_ERROR &&
+          last_error(c) == WSAENOTCONN);
+
+    // another thread waits in WSAGetOverlappedResult until a datagram comes
+    uint32_t w = udp(c);
+    CHECK(bind(c, w, 4001) == 0);
+    waiter_socket = w, waiter_overlapped = wsa_overlapped(c, 0x7F8, 0);
+    CHECK(xam(c, "NetDll_WSARecv", {1, 0x1234, bufs, 2, bytes, flags, 0, 0}) == SOCKET_ERROR &&
+          last_error(c) == WSAENOTSOCK);
+    CHECK(xam(c, "NetDll_WSARecvFrom", {1, w, bufs, 2, bytes, flags, 0, 0, waiter_overlapped, 0}) == SOCKET_ERROR &&
+          last_error(c) == WSA_IO_PENDING);
+    uint32_t t = create_thread(c, F_OVERLAPPED_WAITER, 0);
+    until_waiting(c, t);
+    CHECK(xam(c, "NetDll_WSASendTo",
+              {1, b, text_buffer(c, 0x7C0, 0x7A0, "wake"), 1, sent, 0, sockaddr(c, 0x130, LOOPBACK, 4001), 16, 0, 0}) ==
+          0);
+    join(c, t);
+
+    // closesocket aborts what pends on it
+    ov = wsa_overlapped(c, 0x900, e);
+    CHECK(xam(c, "NetDll_WSARecvFrom", {1, w, bufs, 2, bytes, flags, 0, 0, ov, 0}) == SOCKET_ERROR);
+    CHECK(xam(c, "NetDll_closesocket", {1, w}) == 0);
+    CHECK(K->load32(ov) == STATUS_CANCELLED && event_set(c, e));
+
+    for (uint32_t s : {a, b, unconnected}) CHECK(xam(c, "NetDll_closesocket", {1, s}) == 0);
+    CHECK(xam(c, "NetDll_WSACloseEvent", {e}) == 1);
+}
+
+void event_select(ppc::Context &c) {
+    uint32_t u = udp(c), sender = udp(c);
+    CHECK(bind(c, u, 4002) == 0);
+    uint32_t e = xam(c, "NetDll_WSACreateEvent", {});
+    // a datagram socket is writable at once
+    CHECK(xam(c, "NetDll_WSAEventSelect", {1, u, e, FD_READ | FD_WRITE}) == 0 && event_set(c, e));
+    CHECK(xam(c, "NetDll_WSAResetEvent", {e}) == 1);
+    CHECK(xam(c, "NetDll_WSAEventSelect", {1, u, e, FD_READ}) == 0 && !event_set(c, e));
+    CHECK(send_to(c, sender, LOOPBACK, 4002, "read") == 4 && event_set(c, e));
+    // and non-blocking now
+    CHECK(receive(c, u).text == "read");
+    CHECK(receive(c, u).n == SOCKET_ERROR && last_error(c) == WSAEWOULDBLOCK);
+    // undone with no events
+    CHECK(xam(c, "NetDll_WSAResetEvent", {e}) == 1);
+    CHECK(xam(c, "NetDll_WSAEventSelect", {1, u, 0, 0}) == 0);
+    CHECK(send_to(c, sender, LOOPBACK, 4002, "more") == 4 && !event_set(c, e));
+    CHECK(xam(c, "NetDll_WSAEventSelect", {1, u, 0x1234, FD_READ}) == SOCKET_ERROR && last_error(c) == WSAEINVAL);
+    CHECK(xam(c, "NetDll_WSAEventSelect", {1, 0x1234, e, FD_READ}) == SOCKET_ERROR && last_error(c) == WSAENOTSOCK);
+    for (uint32_t s : {u, sender}) CHECK(xam(c, "NetDll_closesocket", {1, s}) == 0);
+    CHECK(xam(c, "NetDll_WSACloseEvent", {e}) == 1);
+}
+
+void extras(ppc::Context &c) {
+    uint32_t data = local(c, 0x400);
+    CHECK(xam(c, "NetDll_WSAStartupEx", {1, 0x0202, data, 0x20501400}) == 0 && K->load16(data + 2) == 0x0202);
+    uint32_t params = local(c, 0x600);
+    std::memset(K->host(params), 0, 13);
+    K->host(params)[0] = 13;
+    CHECK(xam(c, "NetDll_XNetStartupEx", {1, params, 0x20501400}) == 0);
+    uint32_t xnaddr = local(c, 0x640);
+    std::memset(K->host(xnaddr), 0xEE, 0x24);
+    CHECK(xam(c, "NetDll_XNetGetDebugXnAddr", {1, xnaddr}) == 1 && K->load32(xnaddr) == 0 &&
+          K->load32(xnaddr + 0x20) == 0);
+    uint32_t text = local(c, 0x680);
+    CHECK(xam(c, "NetDll_XNetInAddrToString", {1, 0xC0A80102, text, 16}) == 0 &&
+          std::string(reinterpret_cast<const char *>(K->host(text))) == "192.168.1.2");
+    CHECK(xam(c, "NetDll_XNetInAddrToString", {1, 0xC0A80102, text, 4}) == 0 &&
+          std::string(reinterpret_cast<const char *>(K->host(text))) == "192");
+    uint32_t settings = local(c, 0x6A0);
+    K->store32(settings, 8);
+    CHECK(xam(c, "XampXAuthStartup", {settings}) == 0x80158406);
+    K->store32(settings, 12);
+    CHECK(xam(c, "XampXAuthStartup", {settings}) == 0x80158401);
+    uint32_t count = local(c, 0x6B0);
+    K->store32(count, 5);
+    xam(c, "XampXAuthShutdown", {count});
+    CHECK(K->load32(count) == 0 && xam(c, "XampXAuthGetTitleBuffer", {}) == 0);
+    CHECK(xam(c, "NetDll_XHttpStartup", {1, 0, 0}) == 1 && last_error(c) == 0);
+    CHECK(xam(c, "NetDll_XHttpOpen", {1, 0, 0, 0, 0, 0}) == 0 && last_error(c) == X_ERROR_NOT_SUPPORTED);
+}
+
 void main_thread(ppc::Context &c) {
     startup(c);
     datagrams(c);
@@ -432,6 +674,9 @@ void main_thread(ppc::Context &c) {
     streams(c);
     events_and_lookups(c);
     media_verification(c);
+    overlapped_io(c);
+    event_select(c);
+    extras(c);
     c.r[3] = 0x600D;
 }
 
@@ -441,6 +686,8 @@ const Generated generated[] = {
     {F_CLOSED_WAITER, closed_waiter},
     {F_SELECTER, selecter},
     {F_MEDIA_CALLBACK, media_callback},
+    {F_WSA_ROUTINE, wsa_routine},
+    {F_OVERLAPPED_WAITER, overlapped_waiter},
 };
 
 } // namespace

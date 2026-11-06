@@ -480,11 +480,11 @@ entries, names any case.
 ## XAM
 
 As built (`src/kernel/xam.h`; xam.cpp, xam_content.cpp, xam_user.cpp,
-xam_input.cpp, xam_msg.cpp, xam_net.cpp), from Xenia's xam: one user signed
+xam_input.cpp, xam_msg.cpp, xam_ui.cpp, xam_net.cpp), from Xenia's xam: one user signed
 in offline in slot 0 with Xenia's default profile settings; content as
 above; the notifications Xenia queues at start; the controllers from the
 drivers boot or the player installs ([input.md](input.md); none, every
-user disconnected, without one); the guide's UI answered headless; XMsg's apps offline; the disc's media
+user disconnected, without one); the guide's UI answered headless (below); XMsg's apps offline; the disc's media
 verification never failing; the network offline (below).
 Overlapped requests Xenia defers (25 ms, on a dispatch thread) complete at
 once here, before the export returns ERROR_IO_PENDING.
@@ -501,6 +501,24 @@ network storage offline; avatars with nothing to load, Kinect never set up
 toy portals never connected. Each file's header says where it differs from
 Xenia.
 
+The system UI (xam_ui.cpp, every export of Xenia's xam_ui.cc) draws no
+dialog: each XamShow*UI answers as Xenia does headless, with the dialog's
+default (a message box's focused button, the keyboard's default text, the
+hard drive from the device selector, sign-in with the user already there
+and XN_SYS_SIGNINCHANGED, the marketplace's downloads succeeded), completes
+its overlapped, and sends XN_SYS_UI on and off around the answer (Xenia
+sends "off" 200 ms later). Kinect's UI is refused (no sensor), the party,
+community and Gold upgrade pages fail, XamIsUIActive is always 0. A player
+overlay would plug in at `present` and `present_async` in xam_ui.cpp, the
+one place every dialog goes through: it would send XN_SYS_UI on, show the
+dialog (title, text, buttons, default) on the player's thread, and make the
+answer when the player closes it, completing the overlapped then (the
+export already returns ERROR_IO_PENDING) and sending XN_SYS_UI off;
+XamIsUIActive would answer whether one is up, and XNotifyQueueUI's toasts
+(printed now, by xam_info.cpp) would be drawn by it. The XamShow*UI calls Xenia does not
+implement either (the friends, players, messages, game invites, gamer card
+for a XUID...) stay unimplemented here: counted, answering 0.
+
 The network is offline, as Xenia's answers make it: no Ethernet link, the
 title's address the loopback, DNS and QoS lookups failed at once. The
 sockets (xam_net.cpp) are the kernel's own objects with no host socket
@@ -510,7 +528,14 @@ read waits up to SO_RCVTIMEO); datagrams to the loopback or broadcast
 reach this title's sockets bound to that port, from 127.0.0.1, and those
 to anywhere else are sent and lost; a stream socket listens and never gets
 a connection, and connect fails at once. select, the WSA events and
-closesocket wake what waits, through the dispatcher. Gears of War 3 polled
+closesocket wake what waits, through the dispatcher. The overlapped calls
+(WSARecv, WSARecvFrom, WSASend, WSASendTo, WSAGetOverlappedResult,
+WSACancelOverlappedIO, WSAEventSelect; Xenia has only stubs of two) follow
+Winsock: a send completes at once, a receive takes a queued datagram or
+pends (WSA_IO_PENDING) until one comes, it is cancelled or the socket is
+closed; the WSAOVERLAPPED's Internal and InternalHigh hold the status and
+the bytes, and its event is set or its completion routine queued as a user
+APC. Gears of War 3 polled
 recvfrom on an unimplemented socket (an answer of 0, an empty datagram)
 and stalled its frame loop there; with these it goes on.
 

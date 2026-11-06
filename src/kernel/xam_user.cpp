@@ -8,17 +8,16 @@
  ******************************************************************************
  */
 
-// XAM's users, profiles and UI (xam.h): one user signed in offline in slot
-// 0, its account's flags, its profile settings and preferences, signing in
-// and out, the accounts and profile packages, and the guide's UI answered
-// as Xenia answers it headless (the input exports are in xam_input.cpp,
-// the locale in xam_locale.cpp). Translated from Xenia (BSD; see
-// LICENSE-xenia): xam_user.cc, xam_profile.cc, xam_enum.cc (the profile
-// enumerator), xam_nui.cc (XamUserNui*), xam.h (X_XAMACCOUNTINFO and the
-// creation info), profile_manager.cc (Login, Logout, the accounts, the
-// profile's path), user_settings.h and .cc, user_data.cc, user_tracker.cc
-// (GetUserSetting, the preferences, the subscription), xam_ui.cc (the
-// headless paths); checked against them.
+// XAM's users and profiles (xam.h): one user signed in offline in slot 0,
+// its account's flags, its profile settings and preferences, signing in
+// and out, the accounts and profile packages (the input exports are in
+// xam_input.cpp, the locale in xam_locale.cpp, the guide's UI in
+// xam_ui.cpp). Translated from Xenia (BSD; see LICENSE-xenia):
+// xam_user.cc, xam_profile.cc, xam_enum.cc (the profile enumerator), xam.h
+// (X_XAMACCOUNTINFO and the creation info), profile_manager.cc (Login,
+// Logout, the accounts, the profile's path), user_settings.h and .cc,
+// user_data.cc, user_tracker.cc (GetUserSetting, the preferences, the
+// subscription); checked against them.
 //
 // Where it differs from Xenia, and why:
 //   - the user is Xenia's default profile (XUID 0xB13EBABEBABEBABE, or the
@@ -31,9 +30,7 @@
 //   - XamUserGetUserTenure completes an overlapped it is given (Xenia
 //     leaves it alone, and a title waiting on it would wait for good);
 //   - XamUserIsParentalControlled tests the account's parental control bit
-//     (Xenia tests the language's bits; an offline account has neither);
-//   - the UI's notifications (XN_SYS_UI on, then off) go out together
-//     around the answer (Xenia turns it off 200 ms later).
+//     (Xenia tests the language's bits; an offline account has neither).
 
 #include "xam.h"
 
@@ -932,128 +929,6 @@ XF_EXPORT(xam, XamProfileEnumerate) {
     result(c, run_or_defer(k, ov, run));
 }
 
-// (input: xam_input.cpp)
-
-// ---- the guide's UI (xam_ui.cc, headless) ----
-
-namespace {
-
-// xeXamDispatchHeadless: the UI shows, the answer is made, the UI goes
-uint32_t headless(Kernel &k, uint32_t ov, const std::function<uint32_t()> &answer) {
-    broadcast(k, XN_SYS_UI, 1);
-    uint32_t r;
-    if (ov) {
-        r = complete_overlapped_deferred(k, ov, [&](uint32_t &extended_error, uint32_t &length) {
-            uint32_t a = answer();
-            extended_error = a, length = 0;
-            return a;
-        });
-    } else {
-        r = answer();
-    }
-    broadcast(k, XN_SYS_UI, 0);
-    return r;
-}
-
-// xeXamDispatchHeadlessAsync: the answer is made after the export returns
-uint32_t headless_async(Kernel &k, const std::function<void()> &answer) {
-    broadcast(k, XN_SYS_UI, 1);
-    answer();
-    broadcast(k, XN_SYS_UI, 0);
-    return X_ERROR_SUCCESS;
-}
-
-// a message box: the focused button
-uint32_t message_box(Kernel &k, uint32_t active_button, uint32_t result_ptr, uint32_t ov) {
-    return headless(k, ov, [&] {
-        if (result_ptr) k.store32(result_ptr, active_button); // MESSAGEBOX_RESULT
-        return X_ERROR_SUCCESS;
-    });
-}
-
-} // namespace
-
-XF_EXPORT(xam, XamIsUIActive) { result(c, 0); }
-
-// (user_index, title, text, button_count, buttons, active_button, flags,
-// result, overlapped)
-XF_EXPORT(xam, XamShowMessageBoxUI) { result(c, message_box(k, arg(k, c, 5), arg(k, c, 7), arg(k, c, 8))); }
-
-// (user_index, title, text, button_count, buttons, active_button, flags,
-// unused, result, overlapped)
-XF_EXPORT(xam, XamShowMessageBoxUIEx) { result(c, message_box(k, arg(k, c, 5), arg(k, c, 8), arg(k, c, 9))); }
-
-// (user_index, flags, default_text, title, description, buffer, length,
-// overlapped): the default text is the answer
-XF_EXPORT(xam, XamShowKeyboardUI) {
-    uint32_t default_text = arg(k, c, 2), buffer = arg(k, c, 5), length = arg(k, c, 6), ov = arg(k, c, 7);
-    if (!buffer) return result(c, X_ERROR_INVALID_PARAMETER);
-    result(c, headless(k, ov, [&] {
-               if (!default_text)
-                   std::memset(k.host(buffer), 0, size_t(length) * 2);
-               else
-                   put_u16(k, buffer, guest_u16(k, default_text), length);
-               return X_ERROR_SUCCESS;
-           }));
-}
-
-// (user_index, content_type, content_flags, total_requested, device_id_ptr,
-// overlapped): the hard drive
-XF_EXPORT(xam, XamShowDeviceSelectorUI) {
-    uint32_t index = arg(k, c, 0), flags = arg(k, c, 2), device_ptr = arg(k, c, 4), ov = arg(k, c, 5);
-    if (!ov) return result(c, X_ERROR_INVALID_PARAMETER);
-    if ((index >= 4 && index != USER_INDEX_ANY) || (flags & 0x83F00008) || !device_ptr) {
-        k.store32(ov + xoverlapped::EXTENDED_ERROR, X_ERROR_INVALID_PARAMETER);
-        return result(c, X_ERROR_INVALID_PARAMETER);
-    }
-    result(c, headless(k, ov, [&] {
-               k.store32(device_ptr, 1); // the HDD (xam_content.cpp's devices)
-               return X_ERROR_SUCCESS;
-           }));
-}
-
-// (users_needed, flags): the user is signed in already; the games wait for
-// the notification
-XF_EXPORT(xam, XamShowSigninUI) {
-    uint32_t needed = arg(k, c, 0);
-    if (needed != 1 && needed != 2 && needed != 4) return result(c, X_ERROR_INVALID_PARAMETER);
-    result(c, headless_async(k, [&] { broadcast(k, XN_SYS_SIGNINCHANGED, 1); }));
-}
-
-// (user_index): the title could not read its disc; said here, as Xenia's
-// dialog says it
-XF_EXPORT(xam, XamShowDirtyDiscErrorUI) {
-    std::fprintf(stderr, "xam: the title reports a disc read error (XamShowDirtyDiscErrorUI, from 0x%08X)\n",
-                 uint32_t(c.lr));
-    result(c, X_ERROR_SUCCESS);
-}
-
-// (user_index, ui_type, offer_id, offer_type, category, ...): nothing to buy
-XF_EXPORT(xam, XamShowMarketplaceUI) {
-    if (arg(k, c, 0) >= 4) return result(c, X_ERROR_INVALID_PARAMETER);
-    if (!signed_in(k, arg(k, c, 0))) return result(c, X_ERROR_NO_SUCH_USER);
-    result(c, headless_async(k, [] {}));
-}
-
-// (user_index, entry_point, offers, offer_count, hresult_ptr, overlapped)
-XF_EXPORT(xam, XamShowMarketplaceDownloadItemsUI) {
-    uint32_t hresult_ptr = arg(k, c, 4), ov = arg(k, c, 5);
-    if (arg(k, c, 0) >= 4 || !arg(k, c, 2) || arg(k, c, 3) > 6) return result(c, X_ERROR_INVALID_PARAMETER);
-    if (!signed_in(k, arg(k, c, 0))) {
-        if (!ov) return result(c, X_ERROR_NO_SUCH_USER);
-        complete_overlapped_immediate(k, ov, X_ERROR_NO_SUCH_USER);
-        return result(c, X_ERROR_IO_PENDING);
-    }
-    result(c, headless(k, ov, [&] {
-               if (hresult_ptr) k.store32(hresult_ptr, X_E_SUCCESS);
-               return X_ERROR_SUCCESS;
-           }));
-}
-
-// (user_index, title_id)
-XF_EXPORT(xam, XamShowAchievementsUI) {
-    if (!user_at(k, arg(k, c, 0))) return result(c, X_ERROR_NO_SUCH_USER);
-    result(c, headless_async(k, [] {}));
-}
+// (input: xam_input.cpp; the guide's UI: xam_ui.cpp)
 
 } // namespace xf::kernel

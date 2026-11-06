@@ -250,8 +250,7 @@ XF_EXPORT(xam, XamPartyGetBandwidth) {
     result(c, X_ERROR_SUCCESS);
 }
 
-XF_EXPORT(xam, XamShowPartyUI) { result(c, X_ERROR_FUNCTION_FAILED); }
-XF_EXPORT(xam, XamShowCommunitySessionsUI) { result(c, X_ERROR_FUNCTION_FAILED); }
+// (XamShowPartyUI and XamShowCommunitySessionsUI: xam_ui.cpp)
 
 // (overlapped, length_ptr, wait): its result, waiting on its event when
 // asked and still pending
