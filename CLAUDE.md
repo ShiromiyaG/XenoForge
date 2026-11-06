@@ -9,8 +9,10 @@ inteiras portadas do Xenia de uma vez, `docs/plan.md` "Everything left"), não s
 onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segunda referência. Plano:
 `docs/plan.md`; renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-kernel.md`.
 
-- Repositório local (ainda sem remoto). Commits locais de rotina permitidos; criar repo no GitHub ou dar push
-  só quando o dono pedir. Docs, comentários, logs e commits em inglês; só este arquivo em português.
+- Remoto: `origin` = https://github.com/ShiromiyaG/XenoForge (**privado**, criado em 2026-11-06, branch
+  `master`). Commits locais de rotina permitidos; **push só quando o dono pedir**. Só o `master` vai para o
+  GitHub (nunca os branches `worktree-agent-*`). Docs, comentários, logs e commits em inglês; só este arquivo
+  em português.
 - **No máximo 4 agentes rodando ao mesmo tempo** (pedido do dono, 2026-11-06: oito em paralelo estouraram o
   limite de uso de 5 horas). Novos agentes só quando os anteriores terminarem. Agentes `xf-*`
   (`.claude/agents`), em worktrees; builds com `-j 4`; quem não mexe nos headers do código gerado usa
