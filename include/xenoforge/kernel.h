@@ -153,6 +153,9 @@ void set_process_tls(Kernel &k, uint32_t process, uint32_t slots, uint32_t data_
 // (packets, draws, resolves, swaps, interrupts), for boot.
 void setup_video(Kernel &k);
 void shutdown_video(Kernel &k);
+// The kernel thread that runs the DPCs of timers (KeSetTimerEx), made with the
+// first timer that has one (sync.cpp); ended and joined as the kernel ends.
+void shutdown_timer_dpcs(Kernel &k);
 std::string video_report(Kernel &k);
 // The GPU's command processor, for installing its Sink (the renderer)
 // before the game starts; the Sink's calls then come on the "GPU commands"

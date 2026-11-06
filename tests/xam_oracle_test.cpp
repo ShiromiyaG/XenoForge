@@ -93,6 +93,17 @@ int main(int argc, char **argv) {
     // reports
     std::string version = xfxam("call XamGetSystemVersion", code);
     CHECK(has(version, "real: returned, r3 0x20076000"));
+    CHECK(has(version, "verdict: matches")); // ours takes it since the second survey
+
+    // what the survey found and the HLE took from the console's XAM: these
+    // answer alike now (each was a difference)
+    for (const char *call : {"XamUpdateGetCurrentSystemVersion", "XamIsXbox1TitleId 0", "XamGetLocaleDateFormat 7",
+                             "XamNotifyCreateListener 0 0", "NetDll_WSAStartup 0 0x0202 buf:512",
+                             "XamShowMessageBoxUI 0 wstr:T wstr:X 1 buf:16 0 0 buf:16 0",
+                             "XamInputGetCapabilities 0 0 buf:32", "XamVoiceGetMicArrayStatus"}) {
+        std::string answer = xfxam(std::string("call ") + call, code);
+        CHECK(has(answer, "verdict: matches"));
+    }
 
     // memory written on both sides, compared: 0x100 random bytes in a buffer
     // differ (each side's own random numbers), and the answer says where

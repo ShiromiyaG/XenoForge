@@ -610,11 +610,17 @@ XF_EXPORT(xam, XamContentCreateInternal) {
 
 // (user_index, root_name, path, flags, disposition_ptr, license_mask_ptr,
 // overlapped): Xenia's stub, no such file
-XF_EXPORT(xam, XamContentOpenFile) { result(c, X_ERROR_FILE_NOT_FOUND); }
+// A null or empty root name is ERROR_INVALID_NAME on the console's XAM for
+// this, Close and Flush (xfxam; it checks the name before anything else);
+// Xenia has no check.
+XF_EXPORT(xam, XamContentOpenFile) {
+    result(c, guest_string(k, arg(k, c, 1)).empty() ? X_ERROR_INVALID_NAME : X_ERROR_FILE_NOT_FOUND);
+}
 
 // (root_name, overlapped)
 XF_EXPORT(xam, XamContentClose) {
     std::string root = guest_string(k, arg(k, c, 0));
+    if (root.empty()) return result(c, X_ERROR_INVALID_NAME);
     uint32_t ov = arg(k, c, 1);
     if (root.ends_with(':')) root.pop_back();
     ContentState &s = content(k);
@@ -639,6 +645,7 @@ XF_EXPORT(xam, XamContentClose) {
 // (root_name, overlapped): the header written now
 XF_EXPORT(xam, XamContentFlush) {
     std::string root = guest_string(k, arg(k, c, 0));
+    if (root.empty()) return result(c, X_ERROR_INVALID_NAME);
     uint32_t ov = arg(k, c, 1);
     if (root.ends_with(':')) root.pop_back();
     ContentState &s = content(k);
@@ -1281,12 +1288,14 @@ XF_EXPORT(xam, XamLoaderGetMediaInfoEx) {
     if (uint32_t p = arg(k, c, 0)) k.store32(p, 1); // XBOX_360_GAME_DISC
     if (uint32_t p = arg(k, c, 1)) k.store32(p, 0);
     if (uint32_t p = arg(k, c, 2)) k.store32(p, 0);
+    result(c, X_ERROR_SUCCESS); // the console's XAM answers 0 (xfxam); r3 was left as the argument
 }
 
 // (media_type_ptr, title_id_ptr)
 XF_EXPORT(xam, XamLoaderGetMediaInfo) {
     if (uint32_t p = arg(k, c, 0)) k.store32(p, 1);
     if (uint32_t p = arg(k, c, 1)) k.store32(p, 0);
+    result(c, X_ERROR_SUCCESS);
 }
 
 } // namespace xf::kernel

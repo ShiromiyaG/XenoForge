@@ -71,7 +71,6 @@ uint32_t config_setting32(Kernel &k, uint16_t category, uint16_t setting, uint32
 namespace {
 
 constexpr uint32_t DASHBOARD_ID = 0xFFFE07D1; // kDashboardID
-constexpr uint32_t BASE_KERNEL_BUILD = 1888;  // kBaseKernelBuildVersion
 constexpr uint32_t XN_SYS_DASHCONTEXTCHANGED = 0x8000000C;
 constexpr uint32_t HR_PENDING = 0x8000000A;             // X_E_PENDING
 constexpr uint32_t HR_NOT_IMPLEMENTED = 0x80004001;     // X_E_NOT_IMPLEMENTED
@@ -111,9 +110,13 @@ constexpr bool system_title(uint32_t title) {
     return true;
 }
 
+// The console's XAM answers 0 for title 0, and takes a title whose top byte is
+// 0xFF by its low bits like any other (0xFF000000 is an original Xbox
+// title, 0xFF0007D0 not; xfxam). Xenia's test treats title 0 as one and
+// every 0xFF title as not.
 constexpr bool original_xbox_title(uint32_t title) {
+    if (!title) return false;
     if (!valid_game_id(title)) return true;
-    if (title >> 24 == 0xFF) return false;
     return (title & 0x7FFF) < 0x7D0;
 }
 
@@ -164,8 +167,11 @@ XF_EXPORT(xam, XamFeatureEnabled) {
 }
 
 XF_EXPORT(xam, XamGetStagingMode) { result(c, 0); } // Xenia's staging_mode, off
-XF_EXPORT(xam, XamUpdateGetBaseSystemVersion) { result(c, BASE_KERNEL_BUILD); }
-XF_EXPORT(xam, XamUpdateGetCurrentSystemVersion) { result(c, BASE_KERNEL_BUILD); }
+// The console's XAM answers 0 for the base system's version and 0x20076000
+// for the current one (xfxam), the value XamGetSystemVersion gives; Xenia
+// answers its kernel's base build, 1888, for both.
+XF_EXPORT(xam, XamUpdateGetBaseSystemVersion) { result(c, 0); }
+XF_EXPORT(xam, XamUpdateGetCurrentSystemVersion) { result(c, 0x20076000); }
 XF_EXPORT(xam, XamDoesOmniNeedConfiguration) { result(c, 0); }
 XF_EXPORT(xam, XamFirstRunExperienceShouldRun) { result(c, 0); }
 // (live, local, adult, child profiles): nothing to count them for
@@ -375,8 +381,9 @@ XF_EXPORT(xam, XNotifyQueueUI) {
 
 // ---- devices that are never there ----
 
-// the microphone array: not connected
-XF_EXPORT(xam, XamVoiceGetMicArrayStatus) { result(c, 0); }
+// the microphone array: the console's XAM answers 2 with no array
+// attached (xfxam); Xenia's stub answers 0
+XF_EXPORT(xam, XamVoiceGetMicArrayStatus) { result(c, 2); }
 
 // the media player's objects (Xenia's stubs)
 XF_EXPORT(xam, EnumerateMediaObjects) { result(c, HR_NOT_IMPLEMENTED); }

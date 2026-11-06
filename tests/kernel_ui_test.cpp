@@ -58,14 +58,30 @@ void message_boxes() {
     // result, overlapped): the focused button
     uint32_t box = h.alloc(4);
     h.k->store32(box, 0xEEEEEEEE);
-    CHECK(xam("XamShowMessageBoxUI", {0, h.wide(u"Title"), h.wide(u"Text"), 0, 0, 2, 0, box, 0}) == X_ERROR_SUCCESS);
-    CHECK(h.k->load32(box) == 2 && shown_and_closed());
+    Overlapped first = overlapped();
+    CHECK(xam("XamShowMessageBoxUI", {0, h.wide(u"Title"), h.wide(u"Text"), 3, 0, 2, 0, box, first.address}) ==
+          X_ERROR_IO_PENDING);
+    CHECK(h.k->load32(box) == 2 && completed(first, X_ERROR_SUCCESS, X_ERROR_SUCCESS) && shown_and_closed());
     // the Ex form, its overlapped tenth (on the stack)
     Overlapped ov = overlapped();
-    CHECK(xam("XamShowMessageBoxUIEx", {0, 0, 0, 0, 0, 1, 0, 0, box, ov.address}) == X_ERROR_IO_PENDING);
-    CHECK(h.k->load32(box) == 1 && completed(ov, X_ERROR_SUCCESS, X_ERROR_SUCCESS) &&
+    CHECK(xam("XamShowMessageBoxUIEx", {0, 0, 0, 1, 0, 0, 0, 0, box, ov.address}) == X_ERROR_IO_PENDING);
+    CHECK(h.k->load32(box) == 0 && completed(ov, X_ERROR_SUCCESS, X_ERROR_SUCCESS) &&
           h.k->load32(ov.address + xoverlapped::LENGTH) == 0);
     CHECK(shown_and_closed());
+    // what the console's XAM refuses (xfxam), nothing shown: no overlapped (a
+    // box is never synchronous), a user past 3 that is not "any", a count of
+    // 0 or past 3, an active button past the count, no result, flags outside
+    // the icon, bit 8 and bits 12-21
+    constexpr uint32_t BAD = X_ERROR_INVALID_PARAMETER;
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 1, 0, 0, 0, box, 0}) == BAD);
+    CHECK(xam("XamShowMessageBoxUI", {4, 0, 0, 1, 0, 0, 0, box, ov.address}) == BAD);
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 0, 0, 0, 0, box, ov.address}) == BAD);
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 4, 0, 0, 0, box, ov.address}) == BAD);
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 3, 0, 3, 0, box, ov.address}) == BAD);
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 1, 0, 0, 0, 0, ov.address}) == BAD);
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 1, 0, 0, 0x8, box, ov.address}) == BAD);
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 1, 0, 0, 0x400000, box, ov.address}) == BAD);
+    CHECK(xam("XamShowMessageBoxUIEx", {0, 0, 0, 1, 0, 0, 0, 0, box, 0}) == BAD);
     // Kinect's: no sensor
     CHECK(xam("XamShowNuiMessageBoxUI", {1, 0, 0, 0, 0, 0, 0, 0, box, 0}) == X_ERROR_ACCESS_DENIED);
     CHECK(nothing_queued());

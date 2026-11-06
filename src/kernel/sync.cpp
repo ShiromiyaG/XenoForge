@@ -24,7 +24,10 @@
 #include "objects.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <deque>
+#include <mutex>
 
 namespace xf::kernel {
 namespace {
@@ -405,6 +408,7 @@ XF_EXPORT(xboxkrnl, NtSetTimerEx) {
     t->due = due_ptr ? o.deadline(due_ptr) : o.now();
     t->period = uint64_t(period_ms) * 10'000;
     t->routine = routine, t->routine_arg = routine_arg;
+    t->dpc = 0;
     t->apc_thread = Ref<Thread>::retain(routine ? current_thread() : nullptr);
     k.store64(t->guest + ktimer::DUE_TIME, o.system_time_base + t->due);
     k.store32(t->guest + ktimer::PERIOD, period_ms);
@@ -421,6 +425,7 @@ XF_EXPORT(xboxkrnl, NtCancelTimer) {
     std::lock_guard<std::mutex> l(o.lock);
     o.disarm(*t);
     t->apc_thread = {};
+    t->dpc = 0;
     if (state_ptr) k.store32(state_ptr, t->signal_state() > 0);
     result(c, X_STATUS_SUCCESS);
 }
@@ -438,6 +443,7 @@ XF_EXPORT(xboxkrnl, KeInitializeTimerEx) {
         o.disarm(*t);
         t->apc_thread = {};
         t->routine = t->routine_arg = 0;
+        t->dpc = 0;
     }
     uint8_t *h = k.host(timer);
     h[header::TYPE] = uint8_t(type ? GuestType::TimerSynchronization : GuestType::TimerNotification);
@@ -447,6 +453,172 @@ XF_EXPORT(xboxkrnl, KeInitializeTimerEx) {
     if (!t) list_init(k, timer + header::WAIT_LIST);
     k.store64(timer + ktimer::DUE_TIME, 0);
     k.store32(timer + ktimer::PERIOD, 0);
+}
+
+// ---- the Ke timers, with DPCs (KeSetTimerEx) ----
+//
+// Xenia has none of KeSetTimer, KeSetTimerEx and KeCancelTimer; these are
+// NT's, over the timers NtSetTimerEx arms. A timer that comes due is
+// signaled; with a DPC, the DPC is queued as NT's timer expiration does,
+// its two arguments the system time's low and high words, and runs on a
+// kernel thread of its own at DISPATCH_LEVEL (the PCR saying a DPC runs, as
+// the GPU's interrupt DPCs). XAM's own timers need it.
+
+namespace {
+
+struct DpcRun {
+    uint32_t dpc, arg1, arg2;
+    uint8_t process_type;
+};
+
+struct TimerDpcs {
+    Kernel *k = nullptr;
+    std::once_flag started;
+    std::mutex mutex; // the queue; taken under the objects' lock, never around it
+    std::deque<DpcRun> queue;
+    Ref<Event> wake; // auto-reset: the queue has something
+    Ref<Thread> thread;
+    std::atomic<bool> running{false};
+    bool thread_started = false;
+
+    // the thread, made with the first timer that has a DPC
+    void start(Kernel &kernel) {
+        std::call_once(started, [&] {
+            k = &kernel;
+            Objects &o = objects(kernel);
+            wake = o.create<Event>(GuestType::EventSynchronization, header::SIZE);
+            Thread::Params p;
+            p.stack_size = 128 * 1024;
+            p.process = title_process(kernel) - kprocess::SIZE; // the idle process, as the GPU's threads
+            p.host_arg = this;
+            p.host = [](Thread &self, void *v) { static_cast<TimerDpcs *>(v)->loop(self); };
+            p.name = "Timer DPCs";
+            uint32_t status = X_STATUS_NO_MEMORY;
+            if (wake) thread = o.create_thread(p, status);
+            if (!thread) {
+                std::fprintf(stderr, "timers: the DPC thread was not made (status 0x%08X)\n", status);
+                return;
+            }
+            running = true;
+            {
+                std::lock_guard<std::mutex> l(o.lock);
+                o.on_timer_dpc = [this](Timer &t, uint64_t time) { queue_dpc(t, time); };
+            }
+            thread_started = o.scheduler->start(*thread);
+            if (!thread_started) std::fprintf(stderr, "timers: no host thread for the DPCs\n");
+        });
+    }
+
+    // a timer came due (lock held)
+    void queue_dpc(Timer &t, uint64_t time) {
+        if (!running.load() || !wake) return;
+        uint8_t process_type = k->host(t.guest)[2]; // KeInitializeTimerEx's
+        {
+            std::lock_guard<std::mutex> l(mutex);
+            queue.push_back({t.dpc, uint32_t(time), uint32_t(time >> 32), process_type ? process_type : kprocess::TITLE});
+        }
+        set_event(objects(*k), *wake);
+    }
+
+    void loop(Thread &self) {
+        Objects &o = objects(*k);
+        Dispatcher *const wakes[] = {wake.get()};
+        while (running.load()) {
+            std::deque<DpcRun> batch;
+            {
+                std::lock_guard<std::mutex> l(mutex);
+                batch.swap(queue);
+            }
+            if (batch.empty()) {
+                o.wait(self, wakes, false, false, Scheduler::NEVER);
+                continue;
+            }
+            for (const DpcRun &r : batch) run(self, r);
+        }
+    }
+
+    // KeInsertQueueDpc's run, on this thread
+    void run(Thread &self, const DpcRun &r) {
+        uint32_t routine = k->load32(r.dpc + kdpc::ROUTINE);
+        if (!routine) return;
+        k->store32(r.dpc + kdpc::ARG1, r.arg1);
+        k->store32(r.dpc + kdpc::ARG2, r.arg2);
+        uint8_t *p = k->host(self.pcr);
+        uint8_t irql = p[kpcr::CURRENT_IRQL];
+        p[kpcr::CURRENT_IRQL] = 2;
+        k->store32(self.pcr + kpcr::DPC_ACTIVE, 1);
+        p[kpcr::PROCESS_TYPE_IN_DPC] = r.process_type;
+        objects(*k).call(*self.context, routine, {r.dpc, k->load32(r.dpc + kdpc::CONTEXT), r.arg1, r.arg2});
+        p[kpcr::PROCESS_TYPE_IN_DPC] = kprocess::IDLE;
+        p[kpcr::CURRENT_IRQL] = irql;
+        k->store32(self.pcr + kpcr::DPC_ACTIVE, 0);
+    }
+
+    // the kernel ends: the thread stopped and joined, its handles closed
+    void stop() {
+        if (!k) return;
+        Objects &o = objects(*k);
+        if (running.exchange(false)) {
+            {
+                std::lock_guard<std::mutex> l(o.lock);
+                o.on_timer_dpc = nullptr;
+                set_event(o, *wake);
+            }
+            if (thread_started) o.scheduler->join(*thread);
+        }
+        {
+            std::lock_guard<std::mutex> l(o.lock);
+            for (Object *object : {static_cast<Object *>(thread.get()), static_cast<Object *>(wake.get())})
+                if (object && object->handle()) o.release_handle(object->handle());
+        }
+        thread = {}, wake = {};
+    }
+};
+
+} // namespace
+
+void shutdown_timer_dpcs(Kernel &k) { k.state<TimerDpcs>().stop(); }
+
+// (timer, due time (64 bits: negative relative in 100 ns, positive an
+// absolute system time), period in ms, dpc): whether the timer was already
+// set, NT's answer. The timer is reset when set; a period of 0 fires once.
+static uint32_t set_timer(Kernel &k, uint32_t timer, int64_t due, uint32_t period_ms, uint32_t dpc) {
+    Objects &o = objects(k);
+    Ref<Timer> t = as<Timer>(o.native(timer));
+    if (!t) return 0;
+    if (dpc) k.state<TimerDpcs>().start(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    bool was_set = t->armed;
+    t->set_signal_state(0);
+    t->due = o.deadline_at(due);
+    t->period = int32_t(period_ms) > 0 ? uint64_t(period_ms) * 10'000 : 0;
+    t->routine = 0, t->routine_arg = 0;
+    t->apc_thread = {};
+    t->dpc = dpc;
+    k.store64(t->guest + ktimer::DUE_TIME, o.system_time_base + t->due);
+    k.store32(t->guest + ktimer::PERIOD, period_ms);
+    o.arm(*t);
+    return was_set;
+}
+
+XF_EXPORT(xboxkrnl, KeSetTimerEx) {
+    result(c, set_timer(k, arg(k, c, 0), int64_t(arg64(k, c, 1)), arg(k, c, 2), arg(k, c, 3)));
+}
+
+// (timer, due time (64 bits), dpc)
+XF_EXPORT(xboxkrnl, KeSetTimer) { result(c, set_timer(k, arg(k, c, 0), int64_t(arg64(k, c, 1)), 0, arg(k, c, 2))); }
+
+// (timer): whether it was set; its signal state is left as it is
+XF_EXPORT(xboxkrnl, KeCancelTimer) {
+    Objects &o = objects(k);
+    Ref<Timer> t = as<Timer>(o.native(arg(k, c, 0)));
+    if (!t) return result(c, 0);
+    std::lock_guard<std::mutex> l(o.lock);
+    bool was_set = t->armed;
+    o.disarm(*t);
+    t->apc_thread = {};
+    t->dpc = 0;
+    result(c, was_set);
 }
 
 // ---- waits ----

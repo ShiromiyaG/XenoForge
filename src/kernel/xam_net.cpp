@@ -183,7 +183,16 @@ struct NetState {
     // nothing here, as the handle table's own)
     std::vector<Socket *> sockets;
     uint16_t next_ephemeral = EPHEMERAL_FIRST;
+    // the starts not yet cleaned up, by caller (XNCALLER_TITLE, XNCALLER_SYSAPP)
+    uint32_t wsa_started[3] = {}, xnet_started[3] = {};
 };
+
+// The callers the console's XAM takes in the first argument of the startup
+// calls: the title (1) and the system application (2); any other is
+// WSAEINVAL (xfxam). Xenia reads no caller.
+constexpr uint32_t XNCALLER_TITLE = 1, XNCALLER_SYSAPP = 2;
+constexpr uint32_t WSAEINVAL = 0x2726, WSANOTINITIALISED = 0x276D;
+bool valid_caller(uint32_t caller) { return caller == XNCALLER_TITLE || caller == XNCALLER_SYSAPP; }
 
 uint32_t default_buffer(Kernel &k, uint32_t param) {
     NetState &s = k.state<NetState>();
@@ -461,7 +470,13 @@ void store_set(Kernel &k, const SocketSet &set, const std::vector<bool> &ready) 
 
 // (caller, version, X_WSADATA *): Winsock 2.2
 XF_EXPORT(xam, NetDll_WSAStartup) {
-    uint32_t version = arg(k, c, 1) & 0xFFFF, data = arg(k, c, 2);
+    uint32_t caller = arg(k, c, 0), version = arg(k, c, 1) & 0xFFFF, data = arg(k, c, 2);
+    if (!valid_caller(caller)) return result(c, WSAEINVAL);
+    {
+        NetState &s = k.state<NetState>();
+        std::lock_guard<std::mutex> l(s.mutex);
+        s.wsa_started[caller]++;
+    }
     if (data) {
         std::memset(k.host(data), 0, 0x190);
         k.store16(data + 0, uint16_t(version));
@@ -473,7 +488,20 @@ XF_EXPORT(xam, NetDll_WSAStartup) {
 // (caller, version, X_WSADATA *, version_requested): as WSAStartup
 XF_EXPORT(xam, NetDll_WSAStartupEx) { find_export_fn("xam", "NetDll_WSAStartup")(k, c); }
 
-XF_EXPORT(xam, NetDll_WSACleanup) { result(c, 0); }
+// (caller): the console's XAM answers SOCKET_ERROR (-1, last error
+// WSANOTINITIALISED) for a cleanup with no startup before it (xfxam); Xenia's
+// answers 0 always.
+XF_EXPORT(xam, NetDll_WSACleanup) {
+    uint32_t caller = arg(k, c, 0);
+    NetState &s = k.state<NetState>();
+    std::lock_guard<std::mutex> l(s.mutex);
+    if (!valid_caller(caller) || !s.wsa_started[caller]) {
+        set_last_error(k, WSANOTINITIALISED);
+        return result(c, 0xFFFFFFFF);
+    }
+    s.wsa_started[caller]--;
+    result(c, 0);
+}
 XF_EXPORT(xam, NetDll_WSAGetLastError) { result(c, last_error(k)); }
 XF_EXPORT(xam, NetDll_WSASetLastError) { set_last_error(k, arg(k, c, 0)); }
 
@@ -481,6 +509,13 @@ XF_EXPORT(xam, NetDll_WSASetLastError) { set_last_error(k, arg(k, c, 0)); }
 
 // (caller, XNetStartupParams *): kept for XNetGetOpt
 XF_EXPORT(xam, NetDll_XNetStartup) {
+    uint32_t caller = arg(k, c, 0);
+    if (!valid_caller(caller)) return result(c, WSAEINVAL);
+    {
+        NetState &s = k.state<NetState>();
+        std::lock_guard<std::mutex> l(s.mutex);
+        s.xnet_started[caller]++;
+    }
     if (uint32_t params = arg(k, c, 1)) {
         NetState &s = k.state<NetState>();
         std::lock_guard<std::mutex> l(s.mutex);
@@ -492,7 +527,17 @@ XF_EXPORT(xam, NetDll_XNetStartup) {
 // (caller, XNetStartupParams *, version_requested): as XNetStartup
 XF_EXPORT(xam, NetDll_XNetStartupEx) { find_export_fn("xam", "NetDll_XNetStartup")(k, c); }
 
-XF_EXPORT(xam, NetDll_XNetCleanup) { result(c, 0); }
+// (caller): the title's cleanup with no startup before it is
+// WSANOTINITIALISED on the console's XAM (xfxam; the system application's, and
+// any other caller's, 0); Xenia's answers 0 always.
+XF_EXPORT(xam, NetDll_XNetCleanup) {
+    uint32_t caller = arg(k, c, 0);
+    NetState &s = k.state<NetState>();
+    std::lock_guard<std::mutex> l(s.mutex);
+    if (caller == XNCALLER_TITLE && !s.xnet_started[caller]) return result(c, WSANOTINITIALISED);
+    if (valid_caller(caller) && s.xnet_started[caller]) s.xnet_started[caller]--;
+    result(c, 0);
+}
 
 // (machine_id_ptr): not logged on (X_ERROR_LOGON_NOT_LOGGED_ON)
 XF_EXPORT(xam, XNetLogonGetMachineID) {

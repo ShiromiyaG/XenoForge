@@ -237,7 +237,8 @@ XF_EXPORT(xam, XamNuiGetDeviceStatus) {
 }
 
 XF_EXPORT(xam, XamNuiIsDeviceReady) { result(c, nui_initialized(k) ? 1 : 0); }
-XF_EXPORT(xam, XamNuiIsChatMicEnabled) { result(c, 0); }
+// the console's XAM answers 1, with no sensor and no call made (xfxam); Xenia 0
+XF_EXPORT(xam, XamNuiIsChatMicEnabled) { result(c, 1); }
 // (unknown, unknown): no automation, no playback, yet success (as XAM answers)
 XF_EXPORT(xam, XamIsNuiAutomationEnabled) { result(c, X_ERROR_SUCCESS); }
 XF_EXPORT(xam, XamIsNatalPlaybackEnabled) { result(c, X_ERROR_SUCCESS); }

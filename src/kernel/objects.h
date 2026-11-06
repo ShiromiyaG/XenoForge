@@ -22,6 +22,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -301,6 +302,7 @@ public:
     uint64_t due = 0, period = 0;
     uint32_t routine = 0, routine_arg = 0; // queued as a user APC to apc_thread
     Ref<Thread> apc_thread;
+    uint32_t dpc = 0; // the KDPC (KeSetTimerEx's), queued as the timer comes due
 };
 
 // Thrown by ExTerminateThread and caught where the thread started.
@@ -458,6 +460,7 @@ public:
     // an NT timeout (negative: relative, in 100 ns; positive: an absolute
     // system time; none: forever) as a deadline on the scheduler's clock
     uint64_t deadline(uint32_t timeout_ptr);
+    uint64_t deadline_at(int64_t timeout); // the same, the time given as a value
     uint64_t now() { return scheduler->now(); }
     uint64_t system_time() { return system_time_base + now(); }
 
@@ -467,6 +470,9 @@ public:
     uint64_t next_due(); // Scheduler::NEVER: none armed
     // the clock ticked (lock held): due timers fire, KeTimeStampBundle moves
     void on_clock();
+    // where a timer with a DPC (KeSetTimerEx) sends it when it comes due
+    // (lock held; the system time then): the family that runs DPCs sets it
+    std::function<void(Timer &timer, uint64_t system_time)> on_timer_dpc;
 
     // threads: made, not started (scheduler->start)
     Ref<Thread> create_thread(const Thread::Params &params, uint32_t &status);

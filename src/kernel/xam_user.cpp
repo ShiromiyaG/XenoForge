@@ -838,6 +838,8 @@ XF_EXPORT(xam, XamProfileOpen) {
 XF_EXPORT(xam, XamProfileClose) {
     uint32_t name_ptr = arg(k, c, 0);
     std::string name = name_ptr ? reinterpret_cast<const char *>(k.host(name_ptr)) : "";
+    // no name is ERROR_INVALID_NAME on the console's XAM (xfxam); Xenia has none
+    if (name.empty()) return result(c, X_ERROR_INVALID_NAME);
     ProfileState &s = profiles(k);
     std::lock_guard<std::mutex> l(s.mutex);
     auto it =

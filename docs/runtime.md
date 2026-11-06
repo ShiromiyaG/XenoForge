@@ -192,7 +192,8 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
 - **Safe points**: a thread suspended by another, or with kernel APCs
   queued, stops at its next kernel call (Xenia suspends the host thread
   wherever it is). User APCs run in alertable waits; DPCs run at once on
-  the calling thread, as in Xenia. ExTerminateThread unwinds the host
+  the calling thread, as in Xenia, except those of timers (KeSetTimerEx),
+  which run on a kernel thread of their own. ExTerminateThread unwinds the host
   stack to the thread's start (a C++ exception).
 - `Kernel::launch` makes the main thread (the executable's stack size and
   TLS header) and starts it; `boot` waits for it and reports the threads.
@@ -605,12 +606,13 @@ diagnostic switches on the flash, the hard disk and a memory unit and for
 security expansion from `\Device\Harddisk0\Partition1`, registers its
 title-termination notifications, sets its drivers' callbacks, and queues a
 first look at the content storage's notifications to a worker. Of the
-imports it calls, 17 are not implemented (each answers 0): EtxProducerRegister,
+imports it calls, 16 are not implemented (each answers 0; it called 17
+before KeSetTimerEx, below): EtxProducerRegister,
 the Drv*Callback setters (user binding, device configuration, mic array,
 audio latency, content storage), XInputdSetFailedConnectionOrBindCallback,
 HalRegisterHdDvdRomNotification, KeSetPriorityClassThread, XeKeysGetStatus,
 DumpRegisterDedicatedDataBlock, DumpGetRawDumpInfo, IoDismountVolumeByName,
-KeSetTimerEx (its five timers never fire), HalGetPowerUpCause, XexShimLock,
+HalGetPowerUpCause, XexShimLock,
 HalGetNotedArgonErrors. DrvGetContentStorageNotification is answered
 (system.cpp): XAM takes the notifications until an error, and the 0 of an
 unimplemented import made it read an empty one and fault. What its start
@@ -665,7 +667,9 @@ the arguments: the
 console's XAM checks them (ERROR_INVALID_PARAMETER or E_INVALIDARG for a
 zeroed structure, in 51 answers) where ours takes them. The telling ones,
 candidates for our HLE (the console's answer first; where Xenia's answer is
-the one we ported, the console's is Microsoft's own and wins):
+the one we ported, the console's is Microsoft's own and wins). These are
+the first survey's findings as they were; "The second survey" below says
+what was done with each:
 - XamGetSystemVersion(): 0x20076000, ours 0 (Xenia returns 0 on purpose);
   XamUpdateGetCurrentSystemVersion(): 0x20076000, ours 0x760;
   XamUpdateGetBaseSystemVersion(): 0, ours 0x760;
@@ -696,6 +700,81 @@ the one we ported, the console's is Microsoft's own and wins):
 The noise to read past: thread IDs and tick counts (its start made threads
 and took time), pointers into XAM's own data (XamGetOnlineSchema), and
 calls that end the title (XamLoaderLaunchTitle, XamLoaderTerminateTitle).
+
+**The second survey** (2026-11-06, after the fixes below): 214 match, 117
+differ, 39 need state, 13 fault (8 the console's, 5 both; none ours), against
+185, 144, 39 and 15. The
+fixes, each confirmed with `xfxam call` before and after, each commented
+beside its code with the console's answer and Xenia's:
+- the versions: XamGetSystemVersion and XamUpdateGetCurrentSystemVersion
+  0x20076000, XamUpdateGetBaseSystemVersion 0. Xenia's 0 was on purpose
+  ("if we pretend to be old we have less to implement"); El Chavo Kart and
+  Ben 10 import XamGetSystemVersion and both boot as before (same swaps per
+  second as on the build without the fix, no interpreted entry);
+- XamInputGetCapabilities: the kernel's HidGetCapabilities is now ours
+  (xam_input.cpp), answering from the input drivers (success for a pad that
+  is there, 0xC000009D for another) so the two agree, and the console's XAM
+  run against it answers ERROR_DEVICE_NOT_CONNECTED as ours does. Ours does
+  not call the export: both read the same drivers;
+- XamResetInactivity keeps the interrupt time (nothing times a user out);
+  XamVoiceGetMicArrayStatus 2; XamNuiIsChatMicEnabled 1;
+  XamIsXbox1TitleId(0) 0, and a title with 0xFF in the top byte is taken by
+  its low bits; XamNotifyCreateListener(Internal) with an empty mask 0;
+  XamGetOnlineCountryFromLocale(0) 0;
+- XamGetLocaleDateFormat: every one of the 126 locales asked: Xenia's
+  table with its 3 (also its default) read as 2, but locale 13 (0) and 103
+  (3);
+- NetDll_WSAStartup(Ex) and NetDll_XNetStartup(Ex) take callers 1 and 2,
+  any other is WSAEINVAL; a WSACleanup with no startup before it is -1 with
+  WSANOTINITIALISED, and the title's XNetCleanup the same status;
+- XamFormatDateString and XamFormatTimeString: an invalid time (in the
+  second form too) or no room is -1 with nothing written (ours used to
+  fault on a null buffer); a done one answers the characters written;
+- XamShowMessageBoxUI(Ex): ERROR_INVALID_PARAMETER with no overlapped, a user
+  past 3 that is not 0xFF, a button count of 0 or past 3, an active button
+  past the count, no result pointer, or flags outside the icon (0-4), bit
+  8 and bits 12-21; the console's XAM has no UI here and answers
+  ERROR_FUNCTION_FAILED to a good call, where ours still answers the
+  default button, headless;
+- XamSessionRefObjByHandle and XamGetPrivateEnumStructureFromHandle: a handle
+  that is not theirs is ERROR_INVALID_HANDLE (it maps a status with
+  RtlNtStatusToDosError); XamContentClose, Flush and OpenFile and
+  XamProfileClose with no name: ERROR_INVALID_NAME; XamInputSetState a
+  user past the slots is the Win32 ERROR_DEVICE_NOT_CONNECTED, and the pad
+  is asked about before the vibration pointer; XamLoaderGetMediaInfo(Ex)
+  answer 0; XAutomationpUnbindController 0;
+- KeSetTimerEx, KeSetTimer and KeCancelTimer (xboxkrnl, sync.cpp; Xenia has
+  none): NT's, over the timers NtSetTimerEx arms; a timer with a DPC
+  queues it as it comes due (the arguments the system time's two words) to
+  a kernel thread, "Timer DPCs", made with the first such timer, which
+  runs it at DISPATCH_LEVEL with the PCR saying a DPC runs. XAM's start
+  sets four timers, and they fire now.
+
+What is left in "differ", and why (the survey's generic arguments, and the
+oracle's start, cannot say more):
+- **state, not arguments**: most of the 51 "rejects zeroed" answers do not
+  depend on the arguments. The avatar calls (XamAvatar*, 18), XamGetDvrStorage
+  and SetDvrStorage, the party calls, XamNuiCameraTiltSetCallback and the
+  content calls with a name (XamContentCreate*, Delete, GetCreator,
+  GetDeviceData...) answer E_INVALIDARG or ERROR_INVALID_PARAMETER whatever
+  is given (tried with a valid overlapped, a content structure of a saved
+  game, every flags value): XAM's start has no title launched through it,
+  no profile and no content device. They would answer as ours only with a
+  title running, which this oracle does not have; they are left as they
+  are. The same for the calls that need the network (XNet*, XamReadTile,
+  XamWriteGamerTile: ERROR_FUNCTION_FAILED), a user (XamUserGetSigninState 0:
+  ours has Xenia's one signed-in user on purpose, XamUserWriteProfileSettings)
+  and a UI (XamShowGoldUpgradeUI, XNotifyQueueUI, XamShowSigninUIEx);
+- **noise**: thread IDs, ticks, handles, pointers into XAM's own data
+  (XCustomRegisterDynamicActions, XamGetOnlineSchema, XampXAuthShutdown,
+  XamBuild*ResourceLocator and XamParseGamerTileKey only in the memory they
+  leave), and XamResetInactivity's r3, a leftover;
+- **past a table's end**: XamGetLanguageFromOnlineLanguage past its table
+  answers what lies after the table in XAM's memory: not an answer;
+- **left as Xenia's**: XamGetLocaleDateFormat's table entries other than 3
+  (they match, all of them); XamGetLanguageTypefacePatch (the console's
+  start has loaded no font path: 0); XGetGameRegion (a title's); XamSwapDisc
+  (ours asks for the disc as the title's would be asked).
 
 ## `boot`
 

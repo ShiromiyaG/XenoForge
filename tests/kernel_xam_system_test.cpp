@@ -166,6 +166,10 @@ void content(ppc::Context &c) {
     CHECK(xam(c, "XamContentGetThumbnail", {0, data, buffer, size, ov}) == X_ERROR_IO_PENDING && K->load32(ov) == 0);
     CHECK(xam(c, "XamContentGetThumbnail", {9, data, buffer, size, 0}) == X_ERROR_NO_SUCH_USER);
     CHECK(xam(c, "XamContentClose", {root, 0}) == X_ERROR_SUCCESS);
+    // no root name: ERROR_INVALID_NAME, as the console's XAM answers
+    CHECK(xam(c, "XamContentClose", {0, 0}) == X_ERROR_INVALID_NAME &&
+          xam(c, "XamContentFlush", {0, 0}) == X_ERROR_INVALID_NAME &&
+          xam(c, "XamContentOpenFile", {0, 0, 0, 3, 0, 0, 0}) == X_ERROR_INVALID_NAME);
     std::string header = header_of("slot1");
     CHECK(header.size() == 0xA000);
     if (header.size() == 0xA000) {
@@ -344,10 +348,17 @@ void system_queries(ppc::Context &c) {
     CHECK(xam(c, "XamIsSystemExperienceTitleId", {0x584E07D1}) == 1 &&
           xam(c, "XamIsSystemExperienceTitleId", {0x4D5308BC}) == 0);
     CHECK(xam(c, "XamIsXbox1TitleId", {0x41430006}) == 1 && xam(c, "XamIsXbox1TitleId", {0x4D5308BC}) == 0);
-    CHECK(xam(c, "XamIsXbox1TitleId", {0xFFFE07D1}) == 1 && xam(c, "XamIsXbox1TitleId", {0xFF000001}) == 0);
+    CHECK(xam(c, "XamIsXbox1TitleId", {0xFFFE07D1}) == 1 && xam(c, "XamIsXbox1TitleId", {0xFF000001}) == 1 &&
+          xam(c, "XamIsXbox1TitleId", {0xFF0007D0}) == 0 && xam(c, "XamIsXbox1TitleId", {0}) == 0);
     CHECK(xam(c, "XamIsCurrentTitleDash", {}) == 0);
-    CHECK(xam(c, "XamUpdateGetBaseSystemVersion", {}) == 1888 &&
-          xam(c, "XamUpdateGetCurrentSystemVersion", {}) == 1888);
+    // an empty notification mask makes no listener (the console's XAM)
+    CHECK(xam(c, "XamNotifyCreateListener", {0, 0}) == 0 && xam(c, "XamNotifyCreateListenerInternal", {0, 0, 0}) == 0);
+    CHECK(xam(c, "XamNotifyCreateListener", {1, 0}) != 0);
+    CHECK(xam(c, "XamGetOnlineCountryFromLocale", {0}) == 0 && xam(c, "XamGetOnlineCountryFromLocale", {1}) == 6);
+    // the console's own XAM's answers (xfxam), not Xenia's 0 and 1888
+    CHECK(xam(c, "XamUpdateGetBaseSystemVersion", {}) == 0 &&
+          xam(c, "XamUpdateGetCurrentSystemVersion", {}) == 0x20076000 &&
+          xam(c, "XamGetSystemVersion", {}) == 0x20076000);
     CHECK(xam(c, "XamGetStagingMode", {}) == 0 && xam(c, "XamDoesOmniNeedConfiguration", {}) == 0 &&
           xam(c, "XamFirstRunExperienceShouldRun", {}) == 0 && xam(c, "XamIsChildAccountSignedIn", {}) == 0);
     CHECK(xam(c, "XamXStudioRequest", {6, alloc(4)}) == X_E_FAIL);
@@ -435,12 +446,12 @@ void system_queries(ppc::Context &c) {
     CHECK(xam(c, "XamNetworkStorageHasUserEnabledStorage", {0}) == 0);
 
     // devices that are never there
-    CHECK(xam(c, "XamVoiceGetMicArrayStatus", {}) == 0);
+    CHECK(xam(c, "XamVoiceGetMicArrayStatus", {}) == 2);
     for (const char *e :
          {"EnumerateMediaObjects", "EnumerateMediaObjects_", "EnumerateMediaObjects_0", "EnumerateMediaObjects_1"})
         CHECK(xam(c, e, {}) == 0x80004001);
     CHECK(xam(c, "XamMediaVerificationClose", {}) == 0 && xam(c, "XamMediaVerificationInject", {0, 0}) == 0);
-    CHECK(xam(c, "XAutomationpUnbindController", {0}) == 1 && xam(c, "XAutomationpUnbindController", {4}) == 0);
+    CHECK(xam(c, "XAutomationpUnbindController", {0}) == 0 && xam(c, "XAutomationpUnbindController", {4}) == 0);
     uint32_t raw = alloc(0x40), raw_length = alloc(4), state = alloc(2);
     K->store32(raw_length, 0x20);
     CHECK(xam(c, "XamInputNonControllerGetRawEx", {4, raw, raw_length, state}) == X_ERROR_INVALID_PARAMETER);
@@ -516,7 +527,7 @@ void avatars_kinect_tiles(ppc::Context &c) {
     CHECK(xam(c, "XamNuiGetDeviceStatus", {status}) == 0xC0050006 && K->load32(status) == 0 &&
           K->load32(status + 0xC) == 0);
     CHECK(xam(c, "XamNuiIsDeviceReady", {}) == 0 && xam(c, "XamNuiHudIsEnabled", {}) == 0 &&
-          xam(c, "XamNuiIsChatMicEnabled", {}) == 0 && xam(c, "XamIsNuiUIActive", {}) == 0);
+          xam(c, "XamNuiIsChatMicEnabled", {}) == 1 && xam(c, "XamIsNuiUIActive", {}) == 0);
     CHECK(xam(c, "XamIsNuiAutomationEnabled", {0, 0}) == 0 && xam(c, "XamIsNatalPlaybackEnabled", {0, 0}) == 0);
     uint32_t index = alloc(4);
     K->store32(index, 9);

@@ -177,8 +177,12 @@ void locale_tables(ppc::Context &c) {
     CHECK(xam(c, "XamGetLocaleDateFormat", {5}) == 2);
     CHECK(xam(c, "XamGetLocaleDateFormat", {6}) == 1);
     CHECK(xam(c, "XamGetLocaleDateFormat", {0x6D}) == 5);
-    CHECK(xam(c, "XamGetLocaleDateFormat", {0x6E}) == 3);
-    CHECK(xam(c, "XamGetLocaleDateFormat", {4}) == 3);
+    // outside the table, and where it has Xenia's default 3, the console's
+    // XAM answers 2 (xfxam), but for locales 13 (0) and 103 (3)
+    CHECK(xam(c, "XamGetLocaleDateFormat", {0x6E}) == 2);
+    CHECK(xam(c, "XamGetLocaleDateFormat", {4}) == 2);
+    CHECK(xam(c, "XamGetLocaleDateFormat", {7}) == 2 && xam(c, "XamGetLocaleDateFormat", {13}) == 0 &&
+          xam(c, "XamGetLocaleDateFormat", {103}) == 3);
 
     // the country written, if the console's settings can be
     if (find_export_fn("xboxkrnl", "ExSetXConfigSetting")) {
@@ -207,6 +211,12 @@ void dates_and_fonts(ppc::Context &c) {
     // truncated to the bytes given
     xam(c, "XamFormatTimeString", {0, filetime, buffer, 6});
     CHECK(read_wide(buffer) == u"05");
+    // a time that is none, in either form, or no room: -1 and nothing written
+    // (the console's XAM; ours wrote through the arguments); a done one
+    // answers the characters written
+    CHECK(xam(c, "XamFormatDateString", {0, 0, buffer, 64}) == 0xFFFFFFFF && read_wide(buffer) == u"05");
+    CHECK(xam(c, "XamFormatTimeString", {0, 1, 0, 64}) == 0xFFFFFFFF);
+    CHECK(xam(c, "XamFormatTimeString", {0, filetime, buffer, 64}) == 5 && read_wide(buffer) == u"05:06");
 
     uint32_t de = xam(c, "XamGetLanguageLocaleFallbackString", {3});
     CHECK(de && read_wide(de) == u"de-DE");
@@ -546,6 +556,7 @@ void profiles(ppc::Context &c) {
     CHECK(xam(c, "XamProfileClose", {mount}) == X_ERROR_SUCCESS);
     CHECK(!file_system(*K).has_link("prof:"));
     CHECK(xam(c, "XamProfileClose", {mount}) == X_ERROR_FUNCTION_FAILED);
+    CHECK(xam(c, "XamProfileClose", {0}) == 0x7B); // no name
     // with no name: User_<XUID>
     CHECK(xam(c, "XamProfileOpen", {OTHER_XUID, 0, 0, 0}) == X_ERROR_SUCCESS);
     CHECK(file_system(*K).has_link("User_E030000000001234:"));

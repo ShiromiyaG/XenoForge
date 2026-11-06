@@ -135,7 +135,9 @@ uint8_t online_country_from_locale(uint8_t id) {
         2,  6,  5,  8,  13, 16, 19, 20, 21,  23, 25, 32, 34,  24, 37,  39, 42,  46, 44, 50, 53, 56,
         71, 74, 76, 75, 82, 84, 91, 93, 109, 31, 90, 18, 101, 35, 103, 88, 236, 99, 4,  89, 45, 1,
     };
-    return at_or(table, id, uint8_t(0));
+    // locale 0 (none) is online country 0 on the console's XAM (xfxam; every
+    // other entry is the same); Xenia's table answers 2 for it
+    return id ? at_or(table, id, uint8_t(0)) : uint8_t(0);
 }
 
 const char16_t *online_country_string(uint8_t id) {
@@ -349,7 +351,11 @@ std::u16string time_string(uint64_t filetime) {
 
 // (r3 the user index or format, r4 the filetime, r5 the buffer, r6 its size
 // in bytes); the newer dashboards' form has no first argument, which an
-// invalid time there says
+// invalid time there says. The console's XAM has only the newer form, and a
+// time it cannot format (or no room for it) is -1 with nothing written
+// (xfxam); Xenia, and this before, wrote through whatever the arguments
+// made of the buffer. A done one answers the characters written, as the
+// console's snwprintf does; Xenia's is void.
 template <class F> void format_time(Kernel &k, ppc::Context &c, F format) {
     uint64_t filetime = arg64(k, c, 1);
     uint32_t buffer = arg(k, c, 2), size = arg(k, c, 3);
@@ -357,7 +363,11 @@ template <class F> void format_time(Kernel &k, ppc::Context &c, F format) {
         filetime = c.r[3];
         buffer = uint32_t(c.r[4]), size = uint32_t(c.r[5]);
     }
-    put_u16(k, buffer, format(filetime), size / 2);
+    if (filetime < MIN_VALID_FILETIME || filetime > MAX_VALID_FILETIME || !buffer || size < 2)
+        return result(c, 0xFFFFFFFF);
+    std::u16string text = format(filetime);
+    put_u16(k, buffer, text, size / 2);
+    result(c, uint32_t(std::min<size_t>(text.size(), size / 2 - 1)));
 }
 
 // ---- the language's strings in guest memory (xam_state.cc) ----
@@ -579,7 +589,11 @@ XF_EXPORT(xam, XapipGetLocale) {
     result(c, r);
 }
 
-// (locale): the date's order (a table of the dashboard's switch)
+// (locale): the date's order (a table of the dashboard's switch). The
+// console's XAM answers differently where Xenia's table, or its range, gives
+// the default 3 (xfxam, every locale from 0 to 125 asked): 2 for it, except
+// locale 13, which it answers 0, and locale 103, which stays 3. Entries that
+// are not 3 are the same on both.
 XF_EXPORT(xam, XamGetLocaleDateFormat) {
     static constexpr uint8_t table[] = {
         2, 1, 3, 1, 3, 3, 3, 3, 3, 3, 3, 2, 3, 2, 1, 4, 2, 3, 1, 2, 2, 3, 3, 3, 3, 3, 2, 1, 3, 2, 2, 3, 0, 3, 0, 3, 3,
@@ -587,8 +601,10 @@ XF_EXPORT(xam, XamGetLocaleDateFormat) {
         3, 3, 3, 5, 3, 2, 3, 3, 3, 2, 3, 5, 0, 3, 1, 3, 3, 3, 3, 3, 3, 3, 4, 3, 3, 3, 3, 3, 3, 3, 5, 1, 1, 1, 1,
     };
     static_assert(std::size(table) > 0x68);
-    uint32_t biased = arg(k, c, 0) - 5;
-    result(c, biased > 0x68 ? 3 : table[biased]);
+    uint32_t locale = arg(k, c, 0), biased = locale - 5;
+    uint32_t format = biased > 0x68 ? 3 : table[biased];
+    if (format == 3) format = locale == 103 ? 3 : locale == 13 ? 0 : 2;
+    result(c, format);
 }
 
 // (user_index or format, filetime, buffer, size in bytes)

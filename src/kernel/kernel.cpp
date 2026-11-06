@@ -160,6 +160,7 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
 Kernel::~Kernel() {
     shutdown_audio(*this);
     shutdown_video(*this);
+    shutdown_timer_dpcs(*this);
 }
 
 uint32_t Kernel::load32(uint32_t a) { return be32(host(a)); }

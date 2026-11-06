@@ -195,6 +195,15 @@ uint32_t fd_set_of(ppc::Context &c, uint32_t offset, uint32_t s) {
 
 void startup(ppc::Context &c) {
     uint32_t data = local(c, 0x400);
+    // the console's XAM takes the title (1) and the system application (2) as
+    // callers, any other is WSAEINVAL; a cleanup with no startup is an error
+    CHECK(xam(c, "NetDll_WSAStartup", {0, 0x0202, data}) == 0x2726 &&
+          xam(c, "NetDll_WSAStartup", {3, 0x0202, data}) == 0x2726);
+    CHECK(xam(c, "NetDll_XNetStartup", {0, 0}) == 0x2726);
+    CHECK(xam(c, "NetDll_WSACleanup", {1}) == 0xFFFFFFFF && last_error(c) == 0x276D);
+    CHECK(xam(c, "NetDll_XNetCleanup", {1}) == 0x276D && xam(c, "NetDll_XNetCleanup", {2}) == 0);
+    CHECK(xam(c, "NetDll_WSAStartup", {2, 0x0202, data}) == 0 && xam(c, "NetDll_WSACleanup", {2}) == 0);
+    CHECK(xam(c, "NetDll_WSACleanup", {2}) == 0xFFFFFFFF);
     CHECK(xam(c, "NetDll_WSAStartup", {1, 0x0202, data}) == 0);
     CHECK(K->load16(data) == 0x0202 && K->load16(data + 2) == 0x0202);
     // XNetStartupParams: 32 KB receive buffers by default

@@ -195,6 +195,7 @@ struct InputSystem {
     std::vector<std::unique_ptr<Driver>> drivers;
     std::bitset<USERS> connected;
     double deadzone[2] = {0, 0}; // left, right
+    uint64_t last_activity = 0; // XamResetInactivity's: the interrupt time then
     uint64_t states[USERS] = {}, keystrokes[USERS] = {}, vibrations = 0, changes = 0, not_connected = 0;
 
     std::vector<Driver *> filter(uint32_t flags) {
@@ -375,7 +376,13 @@ std::string input_report(Kernel &k) {
 // ---- the exports (xam_input.cc) ----
 
 XF_EXPORT(xam, XamEnableInactivityProcessing) { result(c, X_ERROR_SUCCESS); }
-XF_EXPORT(xam, XamResetInactivity) {}
+
+// The console's XAM reads the kernel's interrupt time and keeps it as the
+// last activity (xfxam); Xenia's stub does nothing. Nothing here times a user
+// out, so the stamp only waits for whoever asks.
+XF_EXPORT(xam, XamResetInactivity) {
+    inputs(k).last_activity = k.load64(k.variable("KeTimeStampBundle"));
+}
 
 // (unknown, user_index, flags, X_INPUT_CAPABILITIES_EX *)
 XF_EXPORT(xam, XamInputGetCapabilitiesEx) {
@@ -387,6 +394,22 @@ XF_EXPORT(xam, XamInputGetCapabilitiesEx) {
     uint32_t r = get_capabilities(k, arg(k, c, 1), arg(k, c, 2), out);
     if (r == SUCCESS) write_capabilities(k, caps, out);
     result(c, r);
+}
+
+// (user_index, ...): the kernel's HID layer, which the console's XAM asks
+// before it answers XamInputGetCapabilities (xfxam: HidGetCapabilities(user,
+// ...) on the way, and it goes on when the answer is success). The kernel has
+// no device of its own: it answers from the drivers XAM's input uses, so the
+// two agree (ours answered "not connected" from XAM's state while the kernel
+// said success). A pad that is not there is 0xC000009D, the code games check
+// from the HID layer (HidReadKeys' note). Xenia has no HidGetCapabilities.
+XF_EXPORT(xboxkrnl, HidGetCapabilities) {
+    uint32_t user = arg(k, c, 0);
+    Capabilities out;
+    InputSystem &s = inputs(k);
+    std::lock_guard<std::mutex> lock(s.mutex);
+    bool there = user < USERS && s.capabilities(user, FLAG_GAMEPAD, out) == SUCCESS;
+    result(c, there ? 0 : 0xC000009D);
 }
 
 // (user_index, flags, X_INPUT_CAPABILITIES *)
@@ -426,12 +449,17 @@ XF_EXPORT(xam, XamInputGetState) {
 // (user_index, flags, X_INPUT_VIBRATION *)
 XF_EXPORT(xam, XamInputSetState) {
     uint32_t user = arg(k, c, 0), at = arg(k, c, 2);
-    if (user >= USERS) return result(c, X_E_DEVICE_NOT_CONNECTED);
-    if (!at) return result(c, X_ERROR_BAD_ARGUMENTS);
-    Vibration v{k.load16(at), k.load16(at + 2)};
+    // The console's XAM answers a user past the slots, and any pad that is not
+    // there, with the Win32 ERROR_DEVICE_NOT_CONNECTED whether or not a
+    // vibration is given (xfxam); the pointer is asked for after the pad. Xenia
+    // answers the HRESULT for a user past the slots and asks for the pointer
+    // first.
+    if (user >= USERS) return result(c, X_ERROR_DEVICE_NOT_CONNECTED);
+    Vibration v{at ? k.load16(at) : uint16_t(0), at ? k.load16(at + 2) : uint16_t(0)};
     InputSystem &s = inputs(k);
     std::lock_guard<std::mutex> lock(s.mutex);
-    result(c, s.vibrate(user, v));
+    uint32_t r = s.vibrate(user, v);
+    result(c, r == SUCCESS && !at ? X_ERROR_BAD_ARGUMENTS : r);
 }
 
 // (user_index_ptr, flags, X_INPUT_KEYSTROKE *)
@@ -461,8 +489,9 @@ XF_EXPORT(xam, XamInputGetKeystroke) {
     result(c, r);
 }
 
-// (user_index): 1 for a user slot, 0 past them; nothing is bound to undo
-XF_EXPORT(xam, XAutomationpUnbindController) { result(c, arg(k, c, 0) >= USERS ? 0 : 1); }
+// (user_index): nothing is bound to undo, so 0 for any user (the console's XAM
+// answers 0 for each of them, xfxam; this answered 1 for the four slots)
+XF_EXPORT(xam, XAutomationpUnbindController) { result(c, 0); }
 
 // ---- the non-controller devices (the toy portals, devices 5 and 6) ----
 // Xenia reads and writes a portal through its USB passthrough; there is

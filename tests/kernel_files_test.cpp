@@ -624,6 +624,9 @@ void input_exports(ppc::Context &c, uint32_t state) {
           K->host(caps)[1] == 1 && K->load16(caps + 4) == 0xF7FF && K->load16(caps + 18) == 0xFFFF);
     CHECK(xam(c, "XamInputGetCapabilitiesEx", {1, 0xFF, 0, caps}) == X_ERROR_SUCCESS && K->host(caps)[0] == 1);
     CHECK(xam(c, "XamInputGetCapabilities", {2, 1, caps}) == X_ERROR_DEVICE_NOT_CONNECTED);
+    // the kernel's HID layer answers from the same drivers (the console's XAM
+    // asks it): success for the pad that is there, the HID code for another
+    CHECK(krnl(c, "HidGetCapabilities", {0, 0, 0, 0}) == 0 && krnl(c, "HidGetCapabilities", {1, 0, 0, 0}) == 0xC000009D);
     uint32_t user = alloc(4), key = alloc(8);
     K->store32(user, 0xFF);
     CHECK(xam(c, "XamInputGetKeystrokeEx", {user, 1, key}) == X_ERROR_SUCCESS && K->load16(key) == vk::START &&
@@ -636,6 +639,10 @@ void input_exports(ppc::Context &c, uint32_t state) {
     uint32_t vibration = alloc(4);
     CHECK(xam(c, "XamInputSetState", {0, 0, vibration}) == X_ERROR_SUCCESS);
     CHECK(xam(c, "XamInputSetState", {3, 0, vibration}) == X_ERROR_DEVICE_NOT_CONNECTED);
+    // the Win32 code for a user past the slots, the pad asked about before the pointer
+    CHECK(xam(c, "XamInputSetState", {4, 0, vibration}) == X_ERROR_DEVICE_NOT_CONNECTED);
+    CHECK(xam(c, "XamInputSetState", {3, 0, 0}) == X_ERROR_DEVICE_NOT_CONNECTED);
+    CHECK(xam(c, "XamInputSetState", {0, 0, 0}) == X_ERROR_BAD_ARGUMENTS);
     CHECK(input_states_delivered(*K) == 3);
 
     // a stick: up-left, then left alone (up-left lets go before left goes down)
@@ -740,7 +747,7 @@ void notifications_and_users(ppc::Context &c) {
 
     // the guide's UI, headless: the focused button, the hard drive
     uint32_t box = alloc(4), ov = alloc(0x1C), device = alloc(4);
-    CHECK(xam(c, "XamShowMessageBoxUI", {0, 0, 0, 0, 0, 1, 0, box, 0}) == X_ERROR_SUCCESS && K->load32(box) == 1);
+    CHECK(xam(c, "XamShowMessageBoxUI", {0, 0, 0, 2, 0, 1, 0, box, ov}) == X_ERROR_IO_PENDING && K->load32(box) == 1);
     CHECK(xam(c, "XamShowDeviceSelectorUI", {0, 1, 0, 0, device, ov}) == X_ERROR_IO_PENDING && K->load32(device) == 1 &&
           K->load32(ov) == 0);
 }

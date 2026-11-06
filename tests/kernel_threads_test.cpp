@@ -107,6 +107,7 @@ enum : uint32_t {
     F_FIBER_AGAIN2 = 0x82000130,
     F_FIBER_THREAD = 0x82000140,
     F_FIBER_EXIT = 0x82000150,
+    F_TIMER_DPC = 0x82000160,
 };
 
 std::atomic<uint32_t> flag{0}, apcs{0}, woken{0};
@@ -457,6 +458,54 @@ void timers(ppc::Context &c) {
     CHECK(objects(*K).next_due() == Scheduler::NEVER);
 }
 
+// a timer's DPC, run on the DPC thread: (dpc, context, system time low, high)
+std::atomic<uint32_t> timer_dpc_runs{0};
+void timer_dpc(ppc::Context &c) {
+    CHECK(c.r[4] == 0x66 && c.r[6] != 0); // the time's high word is set from 2009 on
+    CHECK(K->load32(uint32_t(c.r[13]) + kpcr::DPC_ACTIVE) == 1);
+    CHECK(K->host(uint32_t(c.r[13]))[kpcr::CURRENT_IRQL] == 2);
+    timer_dpc_runs++;
+}
+
+// KeSetTimerEx, KeSetTimer and KeCancelTimer (NT's; Xenia has none): a due
+// timer is signaled and its DPC queued to a kernel thread
+void timer_dpcs(ppc::Context &c) {
+    uint32_t timer = scratch + 0x800, dpc = scratch + 0x840;
+    auto relative_ms = [](int64_t ms) { return uint64_t(-ms * 10'000); };
+    auto wait_runs = [&](uint32_t n) {
+        for (int i = 0; i < 400 && timer_dpc_runs < n; i++) sleep_ms(c, 5);
+        return timer_dpc_runs.load() >= n;
+    };
+    ex(c, "KeInitializeTimerEx", {timer, 0, 1});
+    ex(c, "KeInitializeDpc", {dpc, F_TIMER_DPC, 0x66});
+    timer_dpc_runs = 0;
+
+    // once: signaled, the DPC run on another thread
+    CHECK(ex(c, "KeSetTimerEx", {timer, relative_ms(5), 0, dpc}) == 0);
+    CHECK(wait_runs(1));
+    CHECK(ex(c, "KeWaitForSingleObject", {timer, 0, 0, 0, timeout_ms(c, 1000, 2)}) == X_STATUS_SUCCESS);
+    sleep_ms(c, 30);
+    CHECK(timer_dpc_runs == 1);
+    CHECK(ex(c, "KeCancelTimer", {timer}) == 0); // it had come due: no longer set
+
+    // periodic: once a period; cancelled, it stops; set again, it says so
+    CHECK(ex(c, "KeSetTimerEx", {timer, relative_ms(5), 10, dpc}) == 0);
+    CHECK(wait_runs(4));
+    CHECK(ex(c, "KeSetTimerEx", {timer, relative_ms(3'600'000), 0, dpc}) == 1);
+    uint32_t seen = timer_dpc_runs;
+    sleep_ms(c, 40);
+    CHECK(timer_dpc_runs <= seen + 1);
+    CHECK(ex(c, "KeCancelTimer", {timer}) == 1 && ex(c, "KeCancelTimer", {timer}) == 0);
+    seen = timer_dpc_runs;
+    sleep_ms(c, 30);
+    CHECK(timer_dpc_runs == seen);
+
+    // no DPC: only signaled (KeSetTimer: the same, a DPC the third argument)
+    CHECK(ex(c, "KeSetTimer", {timer, relative_ms(5), 0}) == 0);
+    CHECK(ex(c, "KeWaitForSingleObject", {timer, 0, 0, 0, timeout_ms(c, 1000, 2)}) == X_STATUS_SUCCESS);
+    CHECK(timer_dpc_runs == seen);
+}
+
 void tls(ppc::Context &c) {
     tls_slot = ex(c, "KeTlsAlloc", {});
     CHECK(tls_slot == 0);
@@ -674,6 +723,7 @@ void main_thread(ppc::Context &c) {
     mutants(c);
     multiple(c);
     timers(c);
+    timer_dpcs(c);
     tls(c);
     locks(c);
     slists(c);
@@ -706,6 +756,7 @@ const Generated generated[] = {
     {F_FIBER_AGAIN2, fiber_again2},
     {F_FIBER_THREAD, fiber_thread},
     {F_FIBER_EXIT, fiber_exit},
+    {F_TIMER_DPC, timer_dpc},
 };
 
 } // namespace
@@ -746,6 +797,7 @@ int main() {
         CHECK(k.load64(bundle + 8) <= k.system_time() && k.system_time() - k.load64(bundle + 8) < 10'000'000);
         CHECK(!k.stopped);
         if (k.stopped) std::printf("stopped: %s\n", k.stop_reason.c_str());
+        shutdown_timer_dpcs(k); // the timers' DPC thread, made by timer_dpcs, ended and joined
         std::lock_guard<std::mutex> l(o.lock);
         CHECK(o.threads.empty());
     }

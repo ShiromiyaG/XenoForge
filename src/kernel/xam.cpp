@@ -216,11 +216,19 @@ uint32_t create_listener(Kernel &k, uint64_t mask, uint32_t max_version) {
 } // namespace
 
 // (mask (64 bits), max_version)
-XF_EXPORT(xam, XamNotifyCreateListener) { result(c, create_listener(k, arg64(k, c, 0), arg(k, c, 1))); }
+// The console's XAM makes the listener, finds the mask empty, drops it and
+// answers 0 (xfxam); Xenia hands out a listener that no notification reaches.
+XF_EXPORT(xam, XamNotifyCreateListener) {
+    uint64_t mask = arg64(k, c, 0);
+    result(c, mask ? create_listener(k, mask, arg(k, c, 1)) : 0);
+}
 
 // (mask (64 bits), is_system, max_version): the same listener (Xenia keeps
 // is_system and never reads it)
-XF_EXPORT(xam, XamNotifyCreateListenerInternal) { result(c, create_listener(k, arg64(k, c, 0), arg(k, c, 2))); }
+XF_EXPORT(xam, XamNotifyCreateListenerInternal) {
+    uint64_t mask = arg64(k, c, 0);
+    result(c, mask ? create_listener(k, mask, arg(k, c, 2)) : 0); // an empty mask: 0, as above
+}
 
 // (listener, match_id, id_ptr, param_ptr): 1 and the next (or the matching)
 // notification, else 0
@@ -366,8 +374,11 @@ XF_EXPORT(xam, XamGetExecutionId) {
     result(c, 0xC0000225); // X_STATUS_NOT_FOUND
 }
 
-// Xenia's: 0, so games take the oldest system's paths
-XF_EXPORT(xam, XamGetSystemVersion) { result(c, 0); }
+// The console's XAM answers a constant, 0x20076000 (xfxam); Xenia answers 0
+// on purpose, so that games take the oldest system's paths (its comment: a
+// version too high may ask for what is not there, too low may break new
+// games). Here the console's answer: a game written for the console reads it.
+XF_EXPORT(xam, XamGetSystemVersion) { result(c, 0x20076000); }
 XF_EXPORT(xam, XamGetCurrentTitleId) { result(c, title_id(k)); }
 
 // the guide's custom actions: nothing to register with no guide (Xenia's
@@ -497,7 +508,10 @@ XF_EXPORT(xam, XamGetPrivateEnumStructureFromHandle) {
     uint32_t handle = arg(k, c, 0), out_ptr = arg(k, c, 1);
     Objects &o = objects(k);
     Ref<Enumerator> e = o.lookup<Enumerator>(handle);
-    if (!e) return result(c, X_STATUS_INVALID_HANDLE);
+    // a handle that is not an enumerator's: the console's XAM answers the Win32
+    // ERROR_INVALID_HANDLE (it makes ObReferenceObjectByHandle's status one
+    // with RtlNtStatusToDosError; xfxam); Xenia the NT status
+    if (!e) return result(c, X_ERROR_INVALID_HANDLE);
     {
         std::lock_guard<std::mutex> l(o.lock);
         o.retain_handle(handle);
@@ -557,13 +571,23 @@ XF_EXPORT(xam, XamVoiceSubmitPacket) { result(c, 0x800700AA); }
 
 // ---- sessions (xam_user.cc): one stand-in, as Xenia's ----
 
+constexpr uint32_t SESSION_HANDLE = 0xCAFEDEAD;
+
 XF_EXPORT(xam, XamSessionCreateHandle) {
-    if (uint32_t p = arg(k, c, 0)) k.store32(p, 0xCAFEDEAD);
+    if (uint32_t p = arg(k, c, 0)) k.store32(p, SESSION_HANDLE);
     result(c, X_ERROR_SUCCESS);
 }
 
+// A handle that is not the stand-in's is the console's ERROR_INVALID_HANDLE
+// with the output cleared (xfxam: it asks ObReferenceObjectByHandle and maps
+// its status); Xenia takes any handle.
 XF_EXPORT(xam, XamSessionRefObjByHandle) {
-    if (uint32_t p = arg(k, c, 1)) k.store32(p, 0xDEADF00D); // what ObDereferenceObject ignores
+    uint32_t handle = arg(k, c, 0), p = arg(k, c, 1);
+    if (handle != SESSION_HANDLE) {
+        if (p) k.store32(p, 0);
+        return result(c, X_ERROR_INVALID_HANDLE);
+    }
+    if (p) k.store32(p, 0xDEADF00D); // what ObDereferenceObject ignores
     result(c, X_ERROR_SUCCESS);
 }
 

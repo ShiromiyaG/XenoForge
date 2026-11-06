@@ -387,7 +387,10 @@ uint32_t Objects::wait(Thread &self, std::span<Dispatcher *const> objects, bool 
 
 uint64_t Objects::deadline(uint32_t timeout_ptr) {
     if (!timeout_ptr) return Scheduler::NEVER;
-    int64_t timeout = int64_t(k.load64(timeout_ptr));
+    return deadline_at(int64_t(k.load64(timeout_ptr)));
+}
+
+uint64_t Objects::deadline_at(int64_t timeout) {
     uint64_t t = now();
     if (timeout < 0) {
         uint64_t relative = timeout == INT64_MIN ? uint64_t(INT64_MAX) : uint64_t(-timeout);
@@ -444,6 +447,7 @@ void Objects::on_clock() {
             queue_user_apc(*timer->apc_thread, timer->routine, timer->routine_arg, uint32_t(time),
                            uint32_t(time >> 32));
         }
+        if (timer->dpc && on_timer_dpc) on_timer_dpc(*timer, system_time_base + t);
         if (timer->period) {
             timer->due += timer->period;
             if (timer->due <= t) timer->due = t + timer->period;

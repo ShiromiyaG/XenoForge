@@ -71,7 +71,19 @@ uint32_t present_async(Kernel &k, const std::function<void()> &answer) {
 uint32_t nui_hud_check() { return X_ERROR_ACCESS_DENIED; }
 
 // a message box (XamShowMessageBoxUi): the focused button
-uint32_t message_box(Kernel &k, uint32_t active_button, uint32_t result_ptr, uint32_t ov) {
+// The console's XAM refuses (ERROR_INVALID_PARAMETER, xfxam) a box with no
+// overlapped (a box is never synchronous there), a user that is neither 0-3
+// nor "any" (0xFF), a button count of 0 or past 3, an active button past the
+// count, no result, and flags outside the icon (0-4), bit 8 and bits 12-21.
+// Xenia takes them all and answers the default button at once. With a valid
+// request and no UI to show it the console's XAM answers
+// ERROR_FUNCTION_FAILED; here the box is answered headless, as Xenia does.
+uint32_t message_box(Kernel &k, uint32_t user, uint32_t button_count, uint32_t active_button, uint32_t flags,
+                     uint32_t result_ptr, uint32_t ov) {
+    constexpr uint32_t FLAGS_TAKEN = 0x003FF107;
+    if (!ov || (user >= 4 && user != USER_INDEX_ANY) || button_count < 1 || button_count > 3 ||
+        active_button >= button_count || !result_ptr || (flags & ~FLAGS_TAKEN))
+        return X_ERROR_INVALID_PARAMETER;
     return present(k, ov, [&] {
         if (result_ptr) k.store32(result_ptr, active_button); // MESSAGEBOX_RESULT::ButtonPressed
         return X_ERROR_SUCCESS;
@@ -108,11 +120,15 @@ XF_EXPORT(xam, XamIsUIActive) { result(c, 0); } // no dialog is ever up
 
 // (user_index, title, text, button_count, buttons, active_button, flags,
 // result, overlapped)
-XF_EXPORT(xam, XamShowMessageBoxUI) { result(c, message_box(k, arg(k, c, 5), arg(k, c, 7), arg(k, c, 8))); }
+XF_EXPORT(xam, XamShowMessageBoxUI) {
+    result(c, message_box(k, arg(k, c, 0), arg(k, c, 3), arg(k, c, 5), arg(k, c, 6), arg(k, c, 7), arg(k, c, 8)));
+}
 
 // (user_index, title, text, button_count, buttons, active_button, flags,
 // unused, result, overlapped)
-XF_EXPORT(xam, XamShowMessageBoxUIEx) { result(c, message_box(k, arg(k, c, 5), arg(k, c, 8), arg(k, c, 9))); }
+XF_EXPORT(xam, XamShowMessageBoxUIEx) {
+    result(c, message_box(k, arg(k, c, 0), arg(k, c, 3), arg(k, c, 5), arg(k, c, 6), arg(k, c, 8), arg(k, c, 9)));
+}
 
 // (tracking_id, user_index, title, text, ...): Kinect's
 XF_EXPORT(xam, XamShowNuiMessageBoxUI) { result(c, nui_hud_check()); }
