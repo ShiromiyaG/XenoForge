@@ -440,6 +440,107 @@ loaded on the GPU from the mirror, as Xenia's, once the mirror can be kept
 current), the copy back of every resolve (lazy with page guards), and
 resolution scale and the pipeline cache (B4's other half).
 
+## GPU time (2026-11-06)
+
+El Chavo Kart and Ben 10 kept an RTX 5060 at 100% in their 3D scenes and
+lost frames there. Measured, not assumed: `Options::gpu_timing` writes a
+timestamp wherever the kind of work being recorded changes (draws by render
+pass, EDRAM loads and stores by target, resolves, read-backs, texture loads,
+the swap's read-back) and sums the intervals by kind (`Report::gpu_time`;
+`xfreplay --gpu-time`, `--gpu-time-draws` for each draw by its shaders,
+`XF_GPU_TIME=1` or `=draws` for the games' runs). `xfreplay --repeat N` plays
+a trace N times through one renderer, as a game draws a frame again, and
+reports the fastest play after the first: the GPU is shared with other
+agents' runs and its clocks ramp up, so a single play's time is noise.
+The machine's GPU sits on a PCIe 3.0 x8 link (6.5 GB/s measured), which
+makes everything that crosses the bus expensive.
+
+Four causes, in the order found, each fixed as Xenia does it:
+
+- **Every pixel shader kept its registers in memory.** The pixel parameters
+  were stored into the register array at an index from the system
+  constants, a variable index, and the driver's compiler then keeps the
+  whole array (128 registers) in memory for every pixel shader, even those
+  that never take the branch. Stored by constant indices now (a select per
+  interpolator): El Chavo Kart's FXAA pass went from 5.5 ms to 0.12 ms at
+  1280x720. (Sizing the array to the registers the shader names, as
+  Xenia's register_static_address_bound, changed nothing measurable once
+  the indices were constant; not kept.)
+- **Vertex data was read from host memory.** Each draw's vertex fetch
+  ranges were copied into the upload arena (host memory) and the vertex
+  shaders read them there, across the bus: 6.7 ms of the race's 3D scene.
+  They are read from the mirror in device memory now, as Xenia's shaders
+  read its shared memory; nothing here watches the CPU's writes, so each
+  draw compares its ranges page by page with a shadow of what the mirror was
+  last given and uploads only the pages that differ (a resolve's write
+  makes its pages unknown). The race's 150 MB a frame of copies became
+  4 MB of uploads; the CPU compares instead of copying.
+- **A draw without a scissor took over all of EDRAM.** The rows a draw takes
+  from other targets were the scissor's bottom, and Direct3D 9 leaves the
+  scissor at 8192 for clears and screen-space rectangles: a 1280-wide depth
+  target took all 2048 tiles three times a frame, every target there
+  stored and loaded back. Now Xenia's draw_extent_estimator: the viewport's
+  bottom with clipping on, and with clipping off and no scissor the vertex
+  shader run on the CPU (shader_interpreter.h) over the draw's vertices
+  (up to 1024 of them; Xenia has no limit).
+- **Resolves read back what later resolves overwrote.** Every resolve's
+  bytes were copied to host memory for guest memory at once; the games
+  resolve to the same memory many times a frame (El Chavo Kart's
+  post-processing chain goes through one texture's memory). The read-backs
+  are recorded at the submission's end now, for what no later resolve wrote
+  over (26 MB a race frame became 18 MB).
+
+GPU time a frame, before (master's renderer with the timing added) and after,
+`xfreplay --gpu-time --repeat 10`, the GPU otherwise idle:
+
+| trace | before | after |
+| --- | --- | --- |
+| El Chavo Kart, race (`xf_race`) | 55.5 ms | 8.9 ms |
+| park behind "Press START" (`xf_park`) | 44.7 ms | 7.5 ms |
+| Cups menu (`xf_menu`) | 56.3 ms | 9.4 ms |
+| loading screen (`xf_loading`) | 6.5 ms | 1.3 ms |
+| title (2400) | 35.0 ms | 7.5 ms |
+| intro movie (1800) | 6.5 ms | 1.5 ms |
+| Ben 10, 600 / 1800 / 3600 | 21.2 / 43.1 / 43.1 ms | 2.7 / 3.0 / 3.0 ms |
+
+The race after: read-backs 2.8 ms (18 MB over the bus), the 3D scene's draws
+1.0 ms, texture loads from the mirror 0.7 ms, resolves' copies 0.7 ms, the
+front buffer's read-back 0.5 ms (xfreplay's; the player's presenter takes
+the image on the GPU), EDRAM loads 1.0 ms; before, the 3D scene alone was
+20.9 ms and the post-processing passes 6.3, 4.9 and 3.2 ms. The 17 frames
+of the regression match Xenia as before.
+
+Live (`boot_<game> --render --rates`, `XF_GPU_TIME=1`, the before runs on a
+build of master's renderer with the timing added, nothing else on the GPU;
+GPU busy is `nvidia-smi`'s utilization, averaged over the phase):
+
+| | before | after |
+| --- | --- | --- |
+| Ben 10, its 3D scene (70-150 s) | 14.2 swaps/s, GPU busy 98.9% | 59.5 swaps/s (vblank), 58.5% |
+| Ben 10, 150 s: GPU time, renderer waiting for it | 146.8 s, 110.6 s | 29.7 s, 0.0 s |
+| El Chavo Kart, title (swaps 2100-3350) | 28.3 swaps/s, 97.6% | 29.4 swaps/s, 90.6% |
+| menus and the park (4000-6800) | 15.6 swaps/s, 94.6% | 23.9 swaps/s, 88.9% |
+| the race (7700 on) | 5.9 swaps/s, 88.9% | 15.1 swaps/s, 80.9% |
+| 500 s: GPU time, renderer waiting for it | 392.3 s, 245.6 s | 166.8 s, 0.1 s |
+
+The renderer no longer waits for the GPU; El Chavo Kart's race is bound by
+the renderer's thread now (68.8 s checking textures by hash, 72.5 s
+comparing vertex data, of 342 s busy). `nvidia-smi` keeps reporting a busy
+GPU where the timestamps add up to far less: what it counts is mostly the
+read-backs, which live take 38% (El Chavo Kart) and 65% (Ben 10) of the
+GPU's time and cross the bus at about 1.2 GB/s, five times slower than in
+a trace's replay (6.5 GB/s, the link's speed), for reasons not found yet
+(the link stays at PCIe 3.0; the read-back memory being cached or not made
+no difference in a replay).
+
+Left: the read-backs, now the largest share (at PCIe 3.0 speed, slower still
+when the link drops to a lower speed at low load): on a transfer queue they
+would overlap the next frame's work, and read back only when the CPU touches
+the memory (page guards) they would mostly go; the indices, still converted
+on the CPU into host memory; the stencil's bit-by-bit EDRAM loads without
+stencil export (as Xenia's, nine passes), which could be skipped where the
+tiles' stencil is known to be zero.
+
 ## Traces of live runs (2026-11-05)
 
 Xenia's traces stop where a person stops playing it; XenoForge's runs go

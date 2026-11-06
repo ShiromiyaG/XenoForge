@@ -3,9 +3,13 @@
 // Xenia's (its trace dump's PNG of the same trace). --no-edram leaves the
 // trace's EDRAM snapshot out, as Xenia's Vulkan trace player does: a frame
 // that reads what an earlier frame left in EDRAM differs from Xenia's there.
+// --gpu-time prints the GPU's time by kind of work (timestamps), and
+// --gpu-time-draws each draw's too, by its shaders; --repeat N
+// plays the trace N times through the same renderer, as a game draws a frame
+// again, the GPU time then being the fastest of the plays after the first.
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
-//            [--dump-shaders <dir>] [-v]
+//            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [-v]
 
 #include "xenoforge/renderer.h"
 
@@ -26,7 +30,7 @@ namespace {
 
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
-                         "[--no-edram] [-v]\n");
+                         "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [-v]\n");
     return 2;
 }
 
@@ -36,6 +40,7 @@ int main(int argc, char **argv) {
     std::string trace_path, out_path, compare_path, diff_path;
     xf::render::Options options;
     bool restore_edram = true;
+    uint32_t repeat = 1;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) out_path = argv[++i];
@@ -44,6 +49,9 @@ int main(int argc, char **argv) {
         else if (a == "--no-edram") restore_edram = false;
         else if (a == "--dump-shaders" && i + 1 < argc) options.dump_shaders = argv[++i];
         else if (a == "-v") options.verbose = true;
+        else if (a == "--gpu-time") options.gpu_timing = true;
+        else if (a == "--gpu-time-draws") options.gpu_timing = options.gpu_timing_draws = true;
+        else if (a == "--repeat" && i + 1 < argc) repeat = uint32_t(std::max(1, std::atoi(argv[++i])));
         else if (!a.empty() && a[0] != '-' && trace_path.empty()) trace_path = a;
         else return usage();
     }
@@ -62,7 +70,7 @@ int main(int argc, char **argv) {
     }
     xf::render::Image frame;
     xf::render::Report report;
-    if (!xf::render::replay(trace, *device, options, frame, report, error, restore_edram)) {
+    if (!xf::render::replay(trace, *device, options, frame, report, error, restore_edram, repeat)) {
         std::fprintf(stderr, "replay: %s\n", error.c_str());
         return 1;
     }
@@ -75,8 +83,8 @@ int main(int argc, char **argv) {
                 (unsigned long long)report.render_targets, (unsigned long long)report.textures,
                 (unsigned long long)report.pipelines, (unsigned long long)report.shaders);
     std::printf("  %.3f s in the renderer: %.3f s in submissions (%.3f s waiting for the GPU), %.3f s in resolves, "
-                "%.3f s checking textures, %.3f s decoding them, %.3f s copying %.1f KB of vertex data, %.3f s copying "
-                "%.1f KB that resolves wrote into memory\n",
+                "%.3f s checking textures, %.3f s decoding them, %.3f s on vertex data (%.1f KB uploaded), "
+                "%.3f s copying %.1f KB that resolves wrote into memory\n",
                 report.seconds, report.submit_seconds, report.wait_seconds, report.resolve_seconds,
                 report.check_seconds, report.decode_seconds, report.vertex_seconds, double(report.vertex_bytes) / 1024,
                 report.writeback_seconds, double(report.writeback_bytes) / 1024);
@@ -85,6 +93,19 @@ int main(int argc, char **argv) {
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)
         std::printf("  approx  %6llu  %s\n", (unsigned long long)n, what.c_str());
+    if (options.gpu_timing) {
+        // a play's GPU time: the fastest of the plays after the first, when repeated
+        std::vector<std::pair<std::string, xf::render::Report::GpuTime>> kinds(report.gpu_time.begin(),
+                                                                               report.gpu_time.end());
+        std::sort(kinds.begin(), kinds.end(),
+                  [](const auto &a, const auto &b) { return a.second.seconds > b.second.seconds; });
+        std::printf("  GPU time a play: %.3f ms%s\n", report.gpu_seconds * 1000,
+                    repeat > 1 ? " (the fastest of the plays after the first)" : "");
+        for (const auto &[what, t] : kinds)
+            std::printf("    %8.3f ms %5.1f%% %6llu  %s\n", t.seconds * 1000,
+                        report.gpu_seconds > 0 ? 100.0 * t.seconds / report.gpu_seconds : 0.0,
+                        (unsigned long long)t.intervals, what.c_str());
+    }
     if (frame.rgba.empty()) {
         std::printf("  no frame (no swap showed one)\n");
         return compare_path.empty() ? 0 : 1;

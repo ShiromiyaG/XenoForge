@@ -56,6 +56,9 @@ public:
         processor_.execute_packets(address, count);
     }
     void memory_read(uint32_t address, std::span<const uint8_t> bytes) override {
+        // a repeated play: what memory holds already is not written again
+        // (a game's frame drawn again finds its memory as it left it)
+        if (repeating_ && unchanged(address, bytes)) return;
         write(address, bytes);
         renderer_.memory_written(address & 0x1FFFFFFF, uint32_t(bytes.size()));
     }
@@ -63,13 +66,26 @@ public:
         processor_.restore_registers(first, values);
     }
     void edram_snapshot(std::span<const uint8_t> bytes) override {
-        if (restore_edram_) renderer_.restore_edram(bytes);
+        // a repeated play keeps EDRAM as the last one left it, as a game's
+        // next frame finds it
+        if (restore_edram_ && !repeating_) renderer_.restore_edram(bytes);
     }
     void gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t> pwl) override {
         processor_.restore_gamma_ramp(table, pwl);
     }
 
+    bool repeating_ = false;
+
 private:
+    bool unchanged(uint32_t address, std::span<const uint8_t> bytes) const {
+        for (size_t i = 0; i < bytes.size();) {
+            uint32_t at = (address + uint32_t(i)) & 0x1FFFFFFF;
+            size_t n = std::min<size_t>(0x20000000 - at, bytes.size() - i);
+            if (std::memcmp(memory_.translate_physical(at), bytes.data() + i, n) != 0) return false;
+            i += n;
+        }
+        return true;
+    }
     // physical memory, wrapping at its end as the address mask does
     void write(uint32_t address, std::span<const uint8_t> bytes) {
         for (size_t i = 0; i < bytes.size();) {
@@ -89,7 +105,7 @@ private:
 } // namespace
 
 bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, Image &frame, Report &report,
-            std::string &error, bool restore_edram) {
+            std::string &error, bool restore_edram, uint32_t repeat) {
     // the console's memory, all of its physical memory committed, as Xenia's
     // player allocates it
     std::unique_ptr<Memory> memory = Memory::create(error);
@@ -107,9 +123,39 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     processor.set_sink(renderer.get());
     Player player(*memory, processor, *renderer, restore_edram);
     bool walked = walk_gpu_trace(trace, player, error);
+    // the plays after the first, each finished on the GPU: the GPU time that
+    // of the fastest one (other work on the GPU only ever adds to a play's)
+    std::map<std::string, Report::GpuTime> fastest_gpu_time;
+    double fastest_gpu_seconds = -1;
+    if (walked && repeat > 1) {
+        renderer->drain();
+        Report before = renderer->report();
+        player.repeating_ = true;
+        for (uint32_t k = 1; k < repeat && walked; k++) {
+            walked = walk_gpu_trace(trace, player, error);
+            renderer->drain();
+            Report after = renderer->report();
+            double seconds = after.gpu_seconds - before.gpu_seconds;
+            if (fastest_gpu_seconds < 0 || seconds < fastest_gpu_seconds) {
+                fastest_gpu_seconds = seconds;
+                fastest_gpu_time.clear();
+                for (const auto &[what, t] : after.gpu_time) {
+                    Report::GpuTime play = t;
+                    if (auto it = before.gpu_time.find(what); it != before.gpu_time.end())
+                        play.seconds -= it->second.seconds, play.intervals -= it->second.intervals;
+                    if (play.intervals) fastest_gpu_time[what] = play;
+                }
+            }
+            before = std::move(after);
+        }
+    }
     processor.set_sink(nullptr);
     renderer->drain(); // the front buffers asked for, read back
     report = renderer->report();
+    if (fastest_gpu_seconds >= 0) {
+        report.gpu_time = std::move(fastest_gpu_time);
+        report.gpu_seconds = fastest_gpu_seconds;
+    }
     report.packets = processor.counts().packets.load();
     if (!walked) return false;
     return !renderer->failed(error);

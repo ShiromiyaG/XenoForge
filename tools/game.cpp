@@ -75,7 +75,7 @@ void print_renderer_report(const render::Report &r) {
                 (unsigned long long)r.draws, (unsigned long long)r.drawn, (unsigned long long)r.resolves,
                 (unsigned long long)r.swaps, (unsigned long long)r.frames);
     std::printf("renderer: %.1f s spent: %.1f s in submissions (%.1f s waiting for the GPU), %.1f s in resolves, "
-                "%.1f s checking textures, %.1f s decoding them, %.1f s copying %.1f MB of vertex data, %.1f s "
+                "%.1f s checking textures, %.1f s decoding them, %.1f s on vertex data (%.1f MB uploaded), %.1f s "
                 "copying %.1f MB that resolves wrote into memory\n",
                 r.seconds, r.submit_seconds, r.wait_seconds, r.resolve_seconds, r.check_seconds, r.decode_seconds,
                 r.vertex_seconds, double(r.vertex_bytes) / (1 << 20), r.writeback_seconds,
@@ -87,6 +87,17 @@ void print_renderer_report(const render::Report &r) {
                 (unsigned long long)r.shaders);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
                 r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
+    if (!r.gpu_time.empty()) {
+        // XF_GPU_TIME: the GPU's time by kind of work, the largest first
+        std::vector<std::pair<std::string, render::Report::GpuTime>> kinds(r.gpu_time.begin(), r.gpu_time.end());
+        std::sort(kinds.begin(), kinds.end(),
+                  [](const auto &a, const auto &b) { return a.second.seconds > b.second.seconds; });
+        std::printf("renderer: %.2f s of GPU time\n", r.gpu_seconds);
+        for (size_t i = 0; i < kinds.size() && i < 24; i++)
+            std::printf("  GPU %8.3f s %5.1f%%  %s\n", kinds[i].second.seconds,
+                        r.gpu_seconds > 0 ? 100.0 * kinds[i].second.seconds / r.gpu_seconds : 0.0,
+                        kinds[i].first.c_str());
+    }
     for (const auto &[why, n] : r.skipped) {
         std::printf("  skipped %8llu  %s", (unsigned long long)n, why.c_str());
         auto at = r.skipped_at.find(why);
@@ -152,6 +163,12 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
         char name[32];
         std::snprintf(name, sizeof(name), "%08X.vkpipelines", g.xex.execution.title_id);
         o.pipeline_cache = std::filesystem::temp_directory_path(ec) / "xenoforge-cache" / name;
+    }
+    // the GPU's time by kind of work, in the report (XF_GPU_TIME=1; =draws
+    // each draw's too)
+    if (const char *timing = std::getenv("XF_GPU_TIME")) {
+        o.gpu_timing = timing[0] && timing[0] != '0';
+        o.gpu_timing_draws = std::string(timing) == "draws";
     }
     g.renderer = render::Renderer::create(*g.device, processor, o, error);
     if (!g.renderer) return error = "renderer: " + error, false;

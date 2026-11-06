@@ -1537,7 +1537,17 @@ void Translator::main_pixel() {
             y = select(float_, flag(13), negated(y), y);
             Id z = select(float_, flag(14), negated(f(0)), f(0));
             Id index = m_.op(Op::OpBitFieldUExtract, uint_, {flags, u(9), u(4)});
-            store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, index}), vec4_of(x, y, z, f(0)));
+            // into the register the index names, each by a constant index: a
+            // variable index into the registers made the host's compiler keep
+            // the whole array in memory, every access of every pixel shader a
+            // memory access (the post-processing passes of El Chavo Kart's race
+            // took 5 ms of the GPU each at 1280x720, 0.2 ms without)
+            Id value = vec4_of(x, y, z, f(0));
+            for (uint32_t k = 0; k < 16; k++) {
+                Id pointer = m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))});
+                Id here = m_.op(Op::OpIEqual, bool_, {index, u(k)});
+                store(pointer, select(vec4_, here, value, load(vec4_, pointer)));
+            }
             return false;
         });
     }

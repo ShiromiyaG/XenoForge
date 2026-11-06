@@ -54,18 +54,27 @@ struct Report {
     double wait_seconds = 0;                     //     waiting for the GPU to finish work
     double check_seconds = 0;                    //   checking textures against the memory under them
     double decode_seconds = 0;                   //   decoding textures on the CPU and recording their uploads
-    double vertex_seconds = 0;                   //   copying vertex data out of guest memory
+    double vertex_seconds = 0;                   //   comparing vertex data with the mirror's, uploading what differs
     double resolve_seconds = 0;                  //   recording resolves (their waits counted in submit_seconds too)
     double writeback_seconds = 0;                //   copying what resolves wrote into guest memory, once done
     double pipeline_seconds = 0;                 //   making pipelines (the driver compiling the shaders)
     uint64_t pipeline_cache_read = 0;            // bytes of pipeline cache read from disk at the start
     uint64_t pipeline_cache_written = 0;         // bytes of it written back, the last time
-    uint64_t vertex_bytes = 0;                   // the vertex data copied
+    uint64_t vertex_bytes = 0;                   // the vertex data uploaded (the pages that differed)
     uint64_t writeback_bytes = 0;                // what resolves wrote, copied into guest memory
     uint64_t submissions = 0, waits = 0;         // command buffers submitted; waits for the GPU
     std::map<std::string, uint64_t> skipped;     // draws not done, by reason
     std::map<std::string, std::vector<uint64_t>> skipped_at; // the first swaps (by number) each reason came in
     std::map<std::string, uint64_t> approximate; // done, with something not exact yet, by what
+    // The GPU's time by kind of work (Options::gpu_timing): timestamps
+    // written where the kind changes, each interval counted to the kind that
+    // began it; the submissions' first to last timestamps in all
+    struct GpuTime {
+        double seconds = 0;
+        uint64_t intervals = 0;
+    };
+    std::map<std::string, GpuTime> gpu_time;
+    double gpu_seconds = 0;
 };
 
 // A swap's front buffer on the GPU (Options::on_swap): level 0, layer 0 of a
@@ -112,6 +121,13 @@ struct Options {
     // written once new pipelines have settled (300 swaps without one) and at
     // drain(). Empty: a cache in memory only.
     std::filesystem::path pipeline_cache;
+    // GPU timestamps around each kind of work (draws by render pass, EDRAM
+    // loads and stores, resolves, texture loads, the swap's read-back), summed
+    // into Report::gpu_time as submissions finish
+    bool gpu_timing = false;
+    // with it, each draw timed on its own, counted to its primitive and
+    // shaders ("draw: ..."), the time between draws apart
+    bool gpu_timing_draws = false;
 };
 
 // A trace writer (gpu_trace_writer.h) stands in front of it as the
@@ -148,8 +164,12 @@ public:
 // (empty without a swap). False only when the trace or the device fails,
 // not for draws that were skipped. Without restore_edram the trace's EDRAM
 // snapshot is left out, EDRAM starting as zeros, as Xenia's Vulkan trace
-// player leaves it.
+// player leaves it. With repeat above 1 the trace plays that many times
+// through the same renderer, as a game draws the same frame again (memory
+// the trace gives again unchanged is not written again), and the report's
+// GPU time is that of the fastest play after the first (each finished on
+// the GPU before the next: other work sharing the GPU only adds to a play's).
 bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, Image &frame, Report &report,
-            std::string &error, bool restore_edram = true);
+            std::string &error, bool restore_edram = true, uint32_t repeat = 1);
 
 } // namespace xf::render

@@ -3,7 +3,8 @@
 // (GetHostViewportInfo, GetScissor), the register fields registers.h, the
 // clear values vulkan/vulkan_render_target_cache.cc, the vertex data a draw
 // needs vulkan/vulkan_command_processor.cc (IssueDraw's shared memory
-// requests), the point sizes its UpdateSystemConstantValues, and the swap
+// requests), the point sizes its UpdateSystemConstantValues, the rows a
+// draw takes over in EDRAM draw_extent_estimator.cc, and the swap
 // vulkan/vulkan_texture_cache.cc (RequestSwapTexture); all BSD, see
 // LICENSE-xenia.
 //
@@ -13,32 +14,36 @@
 // when its share of the upload arena fills. A few slots are in flight; the
 // renderer waits for the GPU only to reuse a slot, or when the CPU needs
 // what the GPU wrote (a front buffer read back for --shots, a texture over a
-// resolve's output in a format only the CPU decodes). A draw's constants,
-// indices and vertex data are copied into its slot's share of the arena, the
-// vertex fetch constants pointed at the copies; textures are bindless, each
-// image at an index of one descriptor set written as they are made.
+// resolve's output in a format only the CPU decodes). A draw's constants
+// and indices are copied into its slot's share of the arena; its vertex data
+// is read from the mirror (below); textures are bindless, each image at an
+// index of one descriptor set written as they are made.
 //
 // Guest memory is read where it lies, with nothing told when the CPU writes
 // it, so what is copied from it is checked or copied again at each use:
-// vertex data and indices are copied at each draw (Xenia requests the same
-// ranges from its shared memory and uploads the pages its write watches saw
-// change); textures are kept with a hash of the memory they were decoded
-// from and decoded again when it differs at a use (Xenia drops them when a
-// write watch on their pages fires); the processor's own writes
-// (memory_written) mark the textures under them at once.
+// indices are copied at each draw; vertex data is compared at each draw, page
+// by page, with what the mirror was last given, and the pages that differ
+// are uploaded (Xenia requests the same ranges from its shared memory and
+// uploads the pages its write watches saw change); textures are kept with a
+// hash of the memory they were decoded from and decoded again when it
+// differs at a use (Xenia drops them when a write watch on their pages
+// fires); the processor's own writes (memory_written) mark the textures under
+// them at once.
 //
 // Resolves run on the GPU, into the mirror: a copy of guest memory on the
 // GPU, as Xenia's shared memory, holding what resolves wrote and what loads
 // from it need around that. Textures over what a resolve wrote are loaded
 // from the mirror on the GPU (as Xenia's texture cache loads all of its
 // textures), and guest memory gets the resolve's bytes once the GPU has
-// written them, without waiting for it (docs/renderer.md, "Decisions").
+// written them, without waiting for it (docs/renderer.md, "Decisions"): read
+// back at the submission's end, what no later resolve wrote over.
 
 #include "xenoforge/renderer.h"
 
 #include "xenoforge/guest_memory.h"
 #include "xenoforge/resolve.h"
 #include "xenoforge/shader_harness.h"
+#include "xenoforge/shader_interpreter.h"
 #include "xenoforge/shader_translator.h"
 #include "xenoforge/texture.h"
 #include "xenoforge/ucode.h"
@@ -48,6 +53,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -100,7 +106,7 @@ const uint32_t TEXTURE_LOAD[] = {
 namespace r {
 constexpr uint32_t PA_SC_SCREEN_SCISSOR_TL = 0x200E, PA_SC_SCREEN_SCISSOR_BR = 0x200F;
 constexpr uint32_t PA_SC_WINDOW_OFFSET = 0x2080, PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082;
-constexpr uint32_t VGT_INDX_OFFSET = 0x2102;
+constexpr uint32_t VGT_MAX_VTX_INDX = 0x2100, VGT_MIN_VTX_INDX = 0x2101, VGT_INDX_OFFSET = 0x2102;
 constexpr uint32_t VGT_MULTI_PRIM_IB_RESET_INDX = 0x2103;
 constexpr uint32_t RB_BLEND_RED = 0x2105; // then green, blue, alpha
 constexpr uint32_t RB_STENCILREFMASK_BF = 0x210C, RB_STENCILREFMASK = 0x210D, RB_ALPHA_REF = 0x210E;
@@ -124,6 +130,11 @@ constexpr VkDeviceSize EDRAM_BYTES = VkDeviceSize(EDRAM_TILES) * 80 * 16 * 4;
 constexpr uint32_t SLOTS = 3;
 constexpr VkDeviceSize ARENA_SLOT = 64u << 20;
 constexpr VkDeviceSize READBACK_CHUNK = 32u << 20;
+// the mirror's uploads are of whole pages of this size where they can be
+constexpr uint32_t MIRROR_PAGE = 4096;
+// GPU timestamps a submission holds at most (Options::gpu_timing)
+constexpr uint32_t TIMESTAMPS = 8192;
+constexpr uint32_t GPU_END = UINT32_MAX; // the kind of a submission's last timestamp
 constexpr VkDeviceSize NONE = ~VkDeviceSize(0);
 // the bindless tables: images by kind (2D arrays, 3D, cube; the slot word
 // holds 14 bits of index) and samplers
@@ -322,6 +333,11 @@ struct Shader {
     std::string unsupported; // why it cannot be drawn with
     uint32_t colors_written = 0; // oC0-oC3, a bit each
     bool writes_depth = false;
+    // for running it on the CPU (draw extents): whether it uses what a
+    // texture fetch returns, and which of oPos's y and w, oPts's size and
+    // vertex kill it writes
+    bool fetches_textures = false;
+    bool writes_position_y = false, writes_position_w = false, writes_point_size = false, writes_vertex_kill = false;
     // per texture slot, the first fetch's filter overrides: mag, min, mip, aniso (3: the constant's)
     std::map<uint32_t, std::array<uint32_t, 4>> filters;
 };
@@ -465,10 +481,13 @@ VkFormat snorm_of(VkFormat f) {
 }
 
 // A part of what a resolve wrote that guest memory does not have yet, and
-// where its bytes wait for the GPU to be done (a read-back buffer).
+// where its bytes wait for the GPU to be done (a read-back buffer: mapped at
+// from, offset bytes into buffer).
 struct Piece {
     uint32_t start, end;
     const uint8_t *from;
+    VkBuffer buffer;
+    VkDeviceSize offset;
 };
 struct WriteBack {
     uint64_t serial = 0; // the submission that writes it
@@ -486,8 +505,8 @@ void cut(std::vector<Piece> &pieces, uint32_t start, uint32_t end) {
             out.push_back(p);
             continue;
         }
-        if (p.start < start) out.push_back({p.start, start, p.from});
-        if (end < p.end) out.push_back({end, p.end, p.from + (end - p.start)});
+        if (p.start < start) out.push_back({p.start, start, p.from, p.buffer, p.offset});
+        if (end < p.end) out.push_back({end, p.end, p.from + (end - p.start), p.buffer, p.offset + (end - p.start)});
     }
     pieces = std::move(out);
 }
@@ -504,6 +523,10 @@ struct Slot {
     std::vector<vk::Buffer> readbacks;
     size_t readback = 0;
     VkDeviceSize readback_used = 0;
+    // GPU timing (Options::gpu_timing): its timestamps, and the kind of work
+    // each one begins
+    VkQueryPool queries = VK_NULL_HANDLE;
+    std::vector<uint32_t> marks;
 };
 
 // A swap's front buffer being read back: where its texels wait for the GPU
@@ -585,7 +608,9 @@ public:
         if (!data) return;
         std::memcpy(data, bytes.data(), bytes.size());
         VkBufferCopy copy{at, 0, EDRAM_BYTES};
-        vkCmdCopyBuffer(outside(), from, edram_.buffer, 1, &copy);
+        VkCommandBuffer c = outside();
+        gpu_mark("EDRAM: a trace's snapshot restored");
+        vkCmdCopyBuffer(c, from, edram_.buffer, 1, &copy);
     }
     Report report() const override {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -649,6 +674,10 @@ private:
 
     // draws
     void draw(const gpu::Draw &d);
+    uint32_t draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                        uint32_t primitive) const;
+    uint32_t vertex_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                          uint32_t primitive) const;
     void resolve();
     void gpu_resolve(const resolve::Info &info, RenderTarget &source);
     void swap();
@@ -665,6 +694,23 @@ private:
                          reason.c_str(), (unsigned long long)vertex_hash_, (unsigned long long)pixel_hash_);
     }
     void approximate(const std::string &what) { report_.approximate[what]++; }
+
+    // GPU timing (Options::gpu_timing): a timestamp where the kind of work
+    // being recorded changes; finish() sums the intervals by kind
+    std::vector<std::string> gpu_kinds_;
+    std::map<std::string, uint32_t> gpu_kind_ids_;
+    double timestamp_period_ = 1.0; // nanoseconds a tick
+    uint64_t timestamp_mask_ = ~0ull;
+    void gpu_mark(const std::string &kind) {
+        if (!options_.gpu_timing) return;
+        auto [it, made] = gpu_kind_ids_.try_emplace(kind, uint32_t(gpu_kinds_.size()));
+        if (made) gpu_kinds_.push_back(kind);
+        gpu_mark(it->second);
+    }
+    void gpu_mark(uint32_t kind);
+    void gpu_collect(Slot &s);
+    void read_back_resolves(Slot &s);
+    std::string target_name(const RenderTarget &t) const;
 
     // resources
     Shader *shader(uint64_t hash);
@@ -784,7 +830,8 @@ private:
     bool pending(const std::vector<Range> &ranges) const;
     std::vector<Range> not_pending(const std::vector<Range> &ranges) const;
     void wait_for(const std::vector<Range> &ranges);
-    void upload_to_mirror(const std::vector<Range> &ranges);
+    VkDeviceSize upload_to_mirror(const std::vector<Range> &ranges);
+    void mirror_written(const std::vector<Range> &ranges);
     void finish_writebacks(uint64_t serial);
 
     vk::Device &d_;
@@ -824,15 +871,21 @@ private:
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
 
     vk::Buffer mirror_, arena_, scratch_, load_scratch_;
+    // what the mirror was last given of guest memory, by page, and whether it
+    // still holds it (upload_to_mirror)
+    std::unique_ptr<uint8_t[]> mirror_shadow_ = std::make_unique_for_overwrite<uint8_t[]>(GUEST_MEMORY);
+    std::vector<uint8_t> mirror_known_ = std::vector<uint8_t>(GUEST_MEMORY / MIRROR_PAGE, 0);
     std::deque<WriteBack> writebacks_; // oldest first
     std::deque<FrontRead> front_reads_; // oldest first
 
-    // draws: set 0 (constants, system constants, vertex memory: the arena or
-    // the mirror), set 1 bindless (images and samplers)
+    // draws: set 0 (constants, system constants, vertex memory: the mirror),
+    // set 1 bindless (images and samplers)
     VkDescriptorSetLayout set_layouts_[2] = {};
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool0_ = VK_NULL_HANDLE, bindless_pool_ = VK_NULL_HANDLE;
-    VkDescriptorSet draw_sets_[2] = {}; // vertex memory: the arena, the mirror
+    // vertex memory: the arena (no longer drawn with: its host memory made
+    // the vertex shaders wait on the bus), the mirror
+    VkDescriptorSet draw_sets_[2] = {};
     VkDescriptorSet bindless_ = VK_NULL_HANDLE;
     uint32_t capacity_[3] = {}, next_index_[3] = {1, 1, 1}, sampler_capacity_ = 0, next_sampler_ = 1;
     VkShaderModule rectangle_gs_ = VK_NULL_HANDLE, point_gs_ = VK_NULL_HANDLE;
@@ -880,6 +933,7 @@ Impl::~Impl() {
         for (auto &f : s.after) f();
         for (vk::Buffer &b : s.readbacks) d_.destroy(b);
         if (s.fence) vkDestroyFence(dev_, s.fence, nullptr);
+        if (s.queries) vkDestroyQueryPool(dev_, s.queries, nullptr);
     }
     if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
     for (auto &[k, s] : shaders_)
@@ -1044,6 +1098,22 @@ bool Impl::init(std::string &error) {
         if (vkAllocateCommandBuffers(dev_, &alloc, &s.cmd) != VK_SUCCESS ||
             vkCreateFence(dev_, &fence, nullptr, &s.fence) != VK_SUCCESS)
             return error = "could not make the submission slots", false;
+    }
+    if (options_.gpu_timing) {
+        // timestamps where the queue has them (none: no timing)
+        uint32_t families = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(d_.physical(), &families, nullptr);
+        std::vector<VkQueueFamilyProperties> family(families);
+        vkGetPhysicalDeviceQueueFamilyProperties(d_.physical(), &families, family.data());
+        uint32_t bits = d_.queue_family() < families ? family[d_.queue_family()].timestampValidBits : 0;
+        timestamp_period_ = limits.timestampPeriod;
+        timestamp_mask_ = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+        for (Slot &s : slots_) {
+            VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            q.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            q.queryCount = TIMESTAMPS;
+            if (bits && vkCreateQueryPool(dev_, &q, nullptr, &s.queries) != VK_SUCCESS) s.queries = VK_NULL_HANDLE;
+        }
     }
 
     // draws: set 0, three uniform buffers in the arena at offsets of their
@@ -1313,14 +1383,79 @@ VkCommandBuffer Impl::cmd() {
         in_pass_ = false;
         bound_pipeline_ = VK_NULL_HANDLE;
         last_constants_at_[0] = last_constants_at_[1] = last_system_at_ = NONE;
+        if (s.queries) {
+            vkCmdResetQueryPool(s.cmd, s.queries, 0, TIMESTAMPS);
+            s.marks.clear();
+            gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
+        }
     }
     return s.cmd;
+}
+
+// What the submission's resolves wrote and no later resolve of it wrote over
+// (the pieces left of each), copied from the mirror into its read-back
+// buffers for guest memory, at the submission's end: a game resolves to the
+// same memory many times a frame (El Chavo Kart's post-processing, 15
+// resolves and 26 MB a frame, through one texture's memory), and only the
+// last bytes are guest memory's.
+void Impl::read_back_resolves(Slot &s) {
+    std::map<VkBuffer, std::vector<VkBufferCopy>> copies;
+    for (const WriteBack &w : writebacks_)
+        if (w.serial == s.serial)
+            for (const Piece &p : w.pieces) copies[p.buffer].push_back({p.start, p.offset, p.end - p.start});
+    if (copies.empty()) return;
+    full_barrier(s.cmd);
+    gpu_mark("resolves: read-backs for guest memory");
+    for (const auto &[buffer, regions] : copies)
+        vkCmdCopyBuffer(s.cmd, mirror_.buffer, buffer, uint32_t(regions.size()), regions.data());
+}
+
+void Impl::gpu_mark(uint32_t kind) {
+    VkCommandBuffer c = cmd();
+    Slot &s = slots_[current_];
+    if (!s.queries || (!s.marks.empty() && s.marks.back() == kind)) return;
+    // one kept for the submission's end
+    if (s.marks.size() + 1 >= TIMESTAMPS) return;
+    vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.queries, uint32_t(s.marks.size()));
+    s.marks.push_back(kind);
+}
+
+// The finished submission's timestamps, each interval to the kind of work
+// that began it
+void Impl::gpu_collect(Slot &s) {
+    if (!s.queries || s.marks.size() < 2) return;
+    std::vector<uint64_t> ticks(s.marks.size());
+    if (vkGetQueryPoolResults(dev_, s.queries, 0, uint32_t(ticks.size()), ticks.size() * 8, ticks.data(), 8,
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return;
+    double scale = timestamp_period_ * 1e-9;
+    for (size_t i = 0; i + 1 < ticks.size(); i++) {
+        double seconds = double((ticks[i + 1] - ticks[i]) & timestamp_mask_) * scale;
+        Report::GpuTime &t = report_.gpu_time[gpu_kinds_[s.marks[i]]];
+        t.seconds += seconds, t.intervals++;
+        report_.gpu_seconds += seconds;
+    }
+    s.marks.clear();
+}
+
+// a render target as the GPU timing names it
+std::string Impl::target_name(const RenderTarget &t) const {
+    char name[96];
+    std::snprintf(name, sizeof(name), "%s %s, pitch %u, %ux MSAA, base %u", t.depth ? "depth" : "color",
+                  t.depth ? (t.format ? "D24FS8" : "D24S8") : color_target_format_name(t.format), t.pitch, 1u << t.msaa,
+                  t.base);
+    return name;
 }
 
 void Impl::flush() {
     Slot &s = slots_[current_];
     if (!s.recording) return;
     end_pass();
+    read_back_resolves(s);
+    if (s.queries && !s.marks.empty()) {
+        vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.queries, uint32_t(s.marks.size()));
+        s.marks.push_back(GPU_END);
+    }
     vkEndCommandBuffer(s.cmd);
     s.recording = false;
     {
@@ -1363,6 +1498,7 @@ bool Impl::finish_oldest(bool wait) {
 // (images and buffers no longer used), and what its resolves wrote is
 // copied into guest memory.
 void Impl::finish(Slot &s) {
+    gpu_collect(s);
     for (auto &f : s.after) f();
     s.after.clear();
     finish_writebacks(s.serial);
@@ -1405,6 +1541,13 @@ VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4]
     rendering_info.colorAttachmentCount = 4;
     rendering_info.pColorAttachments = attachments;
     if (depth) rendering_info.pDepthAttachment = rendering_info.pStencilAttachment = &depth_attachment;
+    if (options_.gpu_timing) {
+        std::string kind = "draws:";
+        for (uint32_t i = 0; i < 4; i++)
+            if (colors[i]) kind += " " + target_name(*colors[i]) + ";";
+        if (depth) kind += " " + target_name(*depth);
+        gpu_mark(kind);
+    }
     vkCmdBeginRendering(c, &rendering_info);
     in_pass_ = true;
     pass_ = pass;
@@ -1522,25 +1665,75 @@ void Impl::wait_for(const std::vector<Range> &ranges) {
     if (serial) wait_serial(serial);
 }
 
-// guest memory's bytes into the mirror, before what reads them there
-void Impl::upload_to_mirror(const std::vector<Range> &ranges) {
-    VkDeviceSize total = 0;
-    for (auto [start, end] : ranges) total += end - start;
-    if (!total) return;
+// Guest memory's bytes into the mirror, before what reads them there: only
+// the pages that differ from what the mirror was last given (its shadow), as
+// Xenia's shared memory uploads only the pages its watches saw the CPU write
+// (nothing here watches the CPU's writes: the bytes are compared instead,
+// at each use). A page is given whole unless a resolve's bytes in it have
+// not reached guest memory yet (the ranges leave those out); then only the
+// ranges' bytes in it, and it stays unknown. The bytes uploaded.
+VkDeviceSize Impl::upload_to_mirror(const std::vector<Range> &ranges) {
+    if (ranges.empty()) return 0;
     traced(ranges);
+    // what resolves wrote that guest memory does not have yet
+    std::vector<Range> held;
+    for (const WriteBack &w : writebacks_)
+        for (const Piece &p : w.pieces) held.push_back({p.start, p.end});
+    auto holds = [&](uint32_t start, uint32_t end) {
+        for (const Range &h : held)
+            if (h.first < end && start < h.second) return true;
+        return false;
+    };
+    std::vector<Range> uploads;
+    auto add = [&](uint32_t start, uint32_t end) {
+        if (!uploads.empty() && uploads.back().second >= start)
+            uploads.back().second = std::max(uploads.back().second, end);
+        else
+            uploads.push_back({start, end});
+    };
+    const uint8_t *memory = memory_.data();
+    for (auto [start, end] : ranges) {
+        for (uint32_t page = start & ~(MIRROR_PAGE - 1); page < end; page += MIRROR_PAGE) {
+            uint32_t page_end = page + MIRROR_PAGE;
+            uint8_t &known = mirror_known_[page / MIRROR_PAGE];
+            if (!held.empty() && holds(page, page_end)) {
+                add(std::max(start, page), std::min(end, page_end));
+                known = 0;
+                continue;
+            }
+            if (!uploads.empty() && uploads.back().second >= page_end) continue; // given already
+            if (known && std::memcmp(memory + page, mirror_shadow_.get() + page, MIRROR_PAGE) == 0) continue;
+            add(page, page_end);
+            known = 1;
+        }
+    }
+    VkDeviceSize total = 0;
+    for (auto [start, end] : uploads) total += end - start;
+    if (!total) return 0;
     VkBuffer from;
     VkDeviceSize at;
-    uint8_t *data;
-    data = staging(total, from, at);
-    if (!data) return;
+    uint8_t *data = staging(total, from, at);
+    if (!data) return 0;
     std::vector<VkBufferCopy> copies;
     VkDeviceSize offset = 0;
-    for (auto [start, end] : ranges) {
-        std::memcpy(data + offset, memory_.data() + start, end - start);
+    for (auto [start, end] : uploads) {
+        std::memcpy(data + offset, memory + start, end - start);
+        std::memcpy(mirror_shadow_.get() + start, memory + start, end - start);
         copies.push_back({at + offset, start, end - start});
         offset += end - start;
     }
-    vkCmdCopyBuffer(outside(), from, mirror_.buffer, uint32_t(copies.size()), copies.data());
+    VkCommandBuffer c = outside();
+    gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
+    vkCmdCopyBuffer(c, from, mirror_.buffer, uint32_t(copies.size()), copies.data());
+    return total;
+}
+
+// The GPU wrote the ranges in the mirror (a resolve): their pages no longer
+// hold what the shadow says.
+void Impl::mirror_written(const std::vector<Range> &ranges) {
+    for (auto [start, end] : ranges)
+        for (uint32_t page = start / MIRROR_PAGE; page < (end + MIRROR_PAGE - 1) / MIRROR_PAGE; page++)
+            mirror_known_[page] = 0;
 }
 
 // The submissions up to serial are done: what their resolves wrote goes into
@@ -1608,10 +1801,21 @@ bool Impl::translate(Shader &s, std::string &why) {
             for (const xf::ucode::ExecSlot &slot : e->slots) {
                 if (const auto *a = std::get_if<xf::ucode::AluInstruction>(&slot.instruction)) {
                     for (const xf::ucode::Result *r : {&a->vector_and_constant_result, &a->scalar_result}) {
-                        if (r->target == xf::ucode::StorageTarget::Color && r->used_write_mask()) s.colors_written |= 1u << (r->index & 3);
-                        if (r->target == xf::ucode::StorageTarget::Depth && r->used_write_mask()) s.writes_depth = true;
+                        uint32_t mask = r->used_write_mask();
+                        if (r->target == xf::ucode::StorageTarget::Color && mask)
+                            s.colors_written |= 1u << (r->index & 3);
+                        if (r->target == xf::ucode::StorageTarget::Depth && mask) s.writes_depth = true;
+                        if (r->target == xf::ucode::StorageTarget::Position) {
+                            s.writes_position_y |= (mask & 2) != 0;
+                            s.writes_position_w |= (mask & 8) != 0;
+                        }
+                        if (r->target == xf::ucode::StorageTarget::PointSizeEdgeFlagKillVertex) {
+                            s.writes_point_size |= (mask & 1) != 0;
+                            s.writes_vertex_kill |= (mask & 4) != 0;
+                        }
                     }
                 } else if (const auto *t = std::get_if<xf::ucode::TextureFetchInstruction>(&slot.instruction)) {
+                    if (t->has_result()) s.fetches_textures = true;
                     if (t->opcode == xf::ucode::FetchOpcode::TextureFetch && !s.filters.count(t->operands[1].index))
                         s.filters[t->operands[1].index] = {uint32_t(t->mag_filter), uint32_t(t->min_filter),
                                                            uint32_t(t->mip_filter), uint32_t(t->aniso_filter)};
@@ -1742,6 +1946,7 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     vkUpdateDescriptorSets(dev_, t->stencil ? 4 : 3, writes, 0, nullptr);
     // cleared: its tiles come from EDRAM when it takes them over (acquire)
     VkCommandBuffer c = outside();
+    gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
     begin_image(c, t->image.image, aspect, 1, 1);
     VkImageSubresourceRange range{aspect, 0, 1, 0, 1};
     if (depth) {
@@ -1806,6 +2011,7 @@ bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
     EdramTarget push = edram_target(*t, height);
     uint32_t offset = uint32_t(mask);
     VkCommandBuffer c = outside();
+    if (options_.gpu_timing) gpu_mark("EDRAM store: " + target_name(*t));
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, store_pipelines_[t->msaa ? 1 : 0]);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, edram_layouts_[0], 0, 1, &t->store_set, 1, &offset);
     vkCmdPushConstants(c, edram_layouts_[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
@@ -1908,6 +2114,7 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
     uint32_t height = std::min(rows, t->height), offset = uint32_t(mask);
     EdramTarget push = edram_target(*t, height);
     VkCommandBuffer c = outside();
+    if (options_.gpu_timing) gpu_mark("EDRAM load: " + target_name(*t));
     VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     attachment.imageView = t->view;
     attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2249,6 +2456,7 @@ bool Impl::cpu_upload(Texture &t, const texture::Image &image, const std::vector
         copies[i].bufferOffset += at;
     }
     VkCommandBuffer c = outside();
+    gpu_mark("textures: uploads of CPU decodes");
     if (fresh) begin_image(c, t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, level_count, layers);
     if (!copies.empty())
         vkCmdCopyBufferToImage(c, from, t.image.image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(copies.size()), copies.data());
@@ -2280,6 +2488,7 @@ bool Impl::gpu_load(Texture &t, const texture::Plan &plan, bool fresh) {
     if (!grow(load_scratch_, std::max<VkDeviceSize>(total, 16), usage, load_set_, 1)) return false;
     upload_to_mirror(not_pending(t.ranges));
     VkCommandBuffer c = outside();
+    gpu_mark("textures: loads on the GPU (texture_load)");
     if (fresh) begin_image(c, t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, t.image.levels, t.image.layers);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1, &load_set_, 0, nullptr);
@@ -2437,6 +2646,129 @@ VkRect2D host_scissor(const uint32_t *regs, uint32_t pitch) {
     return {{tl_x, tl_y}, {uint32_t(br_x - tl_x), uint32_t(br_y - tl_y)}};
 }
 
+// ui/graphics_util.cc's FloatToD3D11Fixed16p8: a float as 16.8 fixed point,
+// rounded to nearest even, as Direct3D 11 converts it
+int32_t float_to_fixed_16p8(float f32) {
+    if (!(std::abs(f32) >= 1.0f / 512.0f)) return 0;
+    if (f32 >= 32768.0f - 1.0f / 256.0f) return (1 << 23) - 1;
+    if (f32 <= -32768.0f) return -32768 * 256;
+    uint32_t bits = std::bit_cast<uint32_t>(f32);
+    int32_t result = int32_t((bits & ((1u << 23) - 1)) | (1u << 23));
+    if (bits >> 31) result = -result;
+    uint32_t extra_bits = uint32_t(15 - (int32_t((bits >> 23) & 255) - 127));
+    if (extra_bits) {
+        uint32_t u = uint32_t(result);
+        u += (1u << (extra_bits - 1)) - 1 + ((u >> extra_bits) & 1);
+        result = int32_t(u) >> extra_bits;
+    }
+    return result;
+}
+
+// draw_extent_estimator.cc's EstimateMaxY (the window offset not in EDRAM's
+// bases): the rows of the render targets a draw can reach, which it takes
+// over from the targets holding them. The scissor's bottom, then the
+// viewport's with clipping on; with clipping off and no scissor (8192 both
+// ways, as Direct3D 9 leaves it for clears and other screen-space
+// rectangles), the lowest row the vertices reach, the vertex shader run on
+// the CPU. Without it a 1280-wide target took over all of EDRAM at such a
+// draw, every target there stored and loaded again (El Chavo Kart's race:
+// its depth target took 2048 tiles three times a frame).
+uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                          uint32_t primitive) const {
+    uint32_t window = regs_[r::PA_SC_WINDOW_OFFSET];
+    int32_t window_x = sign_extend(window & 0x7FFF, 15), window_y = sign_extend((window >> 16) & 0x7FFF, 15);
+    uint32_t tl = regs_[r::PA_SC_WINDOW_SCISSOR_TL], br = regs_[r::PA_SC_WINDOW_SCISSOR_BR];
+    uint32_t screen_br = regs_[r::PA_SC_SCREEN_SCISSOR_BR];
+    int32_t scissor_bottom = int32_t((br >> 16) & 0x3FFF), scissor_right = int32_t(br & 0x3FFF);
+    int32_t screen_bottom = sign_extend((screen_br >> 16) & 0x7FFF, 15);
+    int32_t screen_right = sign_extend(screen_br & 0x7FFF, 15);
+    bool scissor_window_offset = !(tl >> 31);
+    if (scissor_window_offset) scissor_bottom += window_y, scissor_right += window_x;
+    scissor_bottom = std::min(scissor_bottom, screen_bottom);
+    scissor_right = std::min(scissor_right, screen_right);
+    uint32_t max_y = uint32_t(std::max(scissor_bottom, 0));
+    if ((regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1) {
+        // the vertices' extent, where there is no scissor (Xenia's
+        // execute_unclipped_draw_vs_on_cpu, without _with_scissor)
+        if (scissor_bottom >= 8192 && scissor_right >= 8192)
+            max_y = std::min(max_y, vertex_max_y(vs, constants, indices, primitive));
+    } else {
+        // the viewport's bottom, truncated
+        uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
+        const float *vport = reinterpret_cast<const float *>(&regs_[r::PA_CL_VPORT_XSCALE]);
+        float bottom = 0.0f;
+        if ((regs_[r::PA_SU_SC_MODE_CNTL] >> 16) & 1) bottom += float(window_y);
+        if (!(regs_[r::PA_SU_VTX_CNTL] & 1)) bottom += 0.5f;
+        if (vte & 8) bottom += vport[3];
+        bottom += vte & 4 ? std::abs(vport[2]) : 1.0f;
+        max_y = uint32_t(std::min(float(max_y), std::max(0.0f, bottom)));
+    }
+    return max_y;
+}
+
+// draw_extent_estimator.cc's EstimateVertexMaxY: the vertex shader run on the
+// CPU (shader_interpreter.h) for each of the draw's vertices, the lowest row
+// one reaches (a point's with its radius); 8192 when it cannot tell (a
+// shader using what a texture fetch returns, which the interpreter does not
+// sample, as Xenia's CanInterpretShader). Unlike Xenia, a draw of more than
+// 1024 vertices is not run (8192): the CPU's time, for what a scissor
+// usually bounds anyway.
+uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                            uint32_t primitive) const {
+    if (indices.empty()) return 0;
+    if (vs.fetches_textures || !vs.writes_position_y) return 8192;
+    uint32_t min_index = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, max_index = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
+    std::vector<uint32_t> vertices;
+    for (uint32_t index : indices)
+        if (index != UINT32_MAX) vertices.push_back(std::min(max_index, std::max(min_index, index & 0xFFFFFF)));
+    std::sort(vertices.begin(), vertices.end());
+    vertices.erase(std::unique(vertices.begin(), vertices.end()), vertices.end());
+    if (vertices.size() > 1024) return 8192;
+    uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
+    const float *vport = reinterpret_cast<const float *>(&regs_[r::PA_CL_VPORT_XSCALE]);
+    float y_scale = vte & 4 ? vport[2] : 1.0f, y_offset = vte & 8 ? vport[3] : 0.0f;
+    bool divide_by_w = !((vte >> 8) & 1);
+    if (divide_by_w && !vs.writes_position_w) return 8192;
+    int32_t point_min_diameter = 0, point_max_diameter = 0;
+    float point_constant_radius_y = 0.0f;
+    bool points = primitive == 1;
+    if (points) {
+        uint32_t minmax = regs_[r::PA_SU_POINT_MINMAX];
+        point_min_diameter = std::bit_cast<int32_t>(float(minmax & 0xFFFF) * (2.0f / 16.0f));
+        point_max_diameter = std::bit_cast<int32_t>(float(minmax >> 16) * (2.0f / 16.0f));
+        point_constant_radius_y = float(regs_[r::PA_SU_POINT_SIZE] & 0xFFFF) * (1.0f / 16.0f);
+    }
+    std::span<const uint8_t> memory(memory_.data(), GuestMemory::SIZE);
+    float max_y = -FLT_MAX;
+    harness::CaseInput input{};
+    harness::CaseOutput output;
+    std::string unsupported;
+    for (uint32_t vertex : vertices) {
+        input.registers[0][0] = float(vertex);
+        if (!shader::interpret(vs.parsed, input, constants, memory, output, unsupported)) return 8192;
+        if (vs.writes_vertex_kill && (std::bit_cast<uint32_t>(output.point_size[2]) & ~(1u << 31))) continue;
+        float y = output.position[1];
+        if (divide_by_w) y /= output.position[3];
+        y = y * y_scale + y_offset;
+        if (points) {
+            float radius = point_constant_radius_y;
+            if (vs.writes_point_size)
+                radius = 0.5f * std::bit_cast<float>(std::min(
+                                    point_max_diameter,
+                                    std::max(point_min_diameter, std::bit_cast<int32_t>(output.point_size[0]))));
+            y += radius;
+        }
+        max_y = std::max(max_y, y); // NaN keeps max_y, as Xenia's std::max
+    }
+    int32_t max_y_24p8 = float_to_fixed_16p8(max_y);
+    if (!(regs_[r::PA_SU_VTX_CNTL] & 1)) max_y_24p8 += 128; // Direct3D 9's pixel centers
+    if ((regs_[r::PA_SU_SC_MODE_CNTL] >> 16) & 1)
+        max_y_24p8 += sign_extend((regs_[r::PA_SC_WINDOW_OFFSET] >> 16) & 0x7FFF, 15) * 256;
+    // the top-left rule: .5 exclusive without MSAA, 1. with
+    uint32_t msaa = (regs_[reg::RB_SURFACE_INFO] >> 16) & 3;
+    return (uint32_t(std::max(0, max_y_24p8)) + (msaa == 0 ? 127u : 255u)) >> 8;
+}
+
 // A draw outside copy mode, as the processor gives it (immediate indices,
 // which Xenia does not draw either, never come: the processor counts them).
 void Impl::draw(const gpu::Draw &d) {
@@ -2544,11 +2876,6 @@ void Impl::draw(const gpu::Draw &d) {
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
     scissor.extent.height = std::min<uint32_t>(scissor.extent.height, height - std::min<uint32_t>(scissor.offset.y, height));
     if (!scissor.extent.width || !scissor.extent.height) return;
-    // the targets take over the EDRAM tiles down to the scissor's bottom
-    for (RenderTarget *t : colors)
-        if (t) acquire(t, scissor.offset.y + scissor.extent.height);
-    if (depth) acquire(depth, scissor.offset.y + scissor.extent.height);
-    if (!fatal_.empty()) return;
 
     // indices: the guest's, swapped, plus the index offset (as Xenia's
     // vertex shader adds it), reset indices kept as the host's restart index
@@ -2594,6 +2921,17 @@ void Impl::draw(const gpu::Draw &d) {
         std::memcpy(c.bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(c.bool_constants));
         std::memcpy(c.loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(c.loop_constants));
         std::memcpy(c.fetch_constants, &regs_[reg::FETCH_CONSTANTS], sizeof(c.fetch_constants));
+    }
+
+    // the targets take over the EDRAM tiles down to the lowest row the draw
+    // can reach (draw_max_y), within the scissor
+    {
+        uint32_t rows =
+            std::min(scissor.offset.y + scissor.extent.height, draw_max_y(*vs, constants[0], indices, primitive));
+        for (RenderTarget *t : colors)
+            if (t) acquire(t, rows);
+        if (depth) acquire(depth, rows);
+        if (!fatal_.empty()) return;
     }
     System sys{};
     for (int i = 0; i < 3; i++) sys.ndc_scale[i] = viewport.ndc_scale[i], sys.ndc_offset[i] = viewport.ndc_offset[i];
@@ -2771,11 +3109,12 @@ void Impl::draw(const gpu::Draw &d) {
     if (!pipe) return skip("vkCreateGraphicsPipelines failed");
 
     // the vertex data: the ranges of the vertex fetch constants the shaders
-    // use (address and size, as Xenia's IssueDraw requests them), merged.
-    // Copied into the arena, the constants pointed at the copies; read from
-    // the mirror instead, with guest memory's bytes put there, when a
-    // resolve wrote some of them and guest memory does not have them yet
-    // (or when they are too many for the arena).
+    // use (address and size, as Xenia's IssueDraw requests them), merged,
+    // read from the mirror in device memory as Xenia's shaders read its
+    // shared memory, guest memory's bytes put there where they changed
+    // (upload_to_mirror) and where a resolve has not written newer ones.
+    // (Read from host memory, the arena's copies, they made the scene's
+    // vertex shaders wait on the bus: 6.7 ms of El Chavo Kart's race frame.)
     struct VertexSlot {
         uint32_t slot, start, end;
     };
@@ -2806,43 +3145,22 @@ void Impl::draw(const gpu::Draw &d) {
                 vertex_ranges.push_back(r);
         }
     }
-    VkDeviceSize vertex_bytes = 0;
-    for (auto [start, end] : vertex_ranges) vertex_bytes += end - start;
-    bool from_mirror = vertex_bytes > ARENA_SLOT / 2 || pending(vertex_ranges);
-    if (from_mirror) {
+    {
         Timer timer(report_.vertex_seconds);
-        upload_to_mirror(not_pending(vertex_ranges));
+        report_.vertex_bytes += upload_to_mirror(not_pending(vertex_ranges));
     }
-    report_.vertex_bytes += vertex_bytes;
+    if (!fatal_.empty()) return;
 
     // everything else the draw takes from the arena, in one submission
     VkDeviceSize index_bytes = indices.size() * 4;
     VkDeviceSize constants_size = (sizeof(harness::Constants) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     VkDeviceSize system_size = (sizeof(System) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     bool own_indices = index_bytes > ARENA_SLOT / 4;
-    VkDeviceSize need = 2 * constants_size + system_size + 4 * ubo_align_ + (own_indices ? 0 : index_bytes + 4) +
-                        (from_mirror ? 0 : vertex_bytes + 16 * vertex_ranges.size());
+    VkDeviceSize need = 2 * constants_size + system_size + 4 * ubo_align_ + (own_indices ? 0 : index_bytes + 4);
     if (arena_take(need, 1) == NONE) flush();
     else slots_[current_].used -= need; // only a check that the draw fits
     if (!fatal_.empty()) return;
 
-    if (!from_mirror) {
-        Timer timer(report_.vertex_seconds);
-        traced(vertex_ranges);
-        std::vector<VkDeviceSize> at(vertex_ranges.size());
-        for (size_t k = 0; k < vertex_ranges.size(); k++) {
-            auto [start, end] = vertex_ranges[k];
-            at[k] = arena_take(end - start, 16);
-            std::memcpy(arena_data(at[k]), memory_.data() + start, end - start);
-        }
-        for (const VertexSlot &v : vertex_slots) {
-            size_t k = size_t(std::upper_bound(vertex_ranges.begin(), vertex_ranges.end(), Range{v.start, UINT32_MAX}) -
-                              vertex_ranges.begin()) - 1;
-            uint32_t address = uint32_t(at[k] + (v.start - vertex_ranges[k].first));
-            for (harness::Constants &c : constants)
-                c.fetch_constants[v.slot * 2] = (c.fetch_constants[v.slot * 2] & ~0x1FFFFFFCu) | address;
-        }
-    }
     uint32_t dynamic_offsets[3];
     for (int stage = 0; stage < 2; stage++) {
         if (last_constants_at_[stage] == NONE ||
@@ -2887,7 +3205,7 @@ void Impl::draw(const gpu::Draw &d) {
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         bound_pipeline_ = pipe;
     }
-    VkDescriptorSet sets[2] = {draw_sets_[from_mirror ? 1 : 0], bindless_};
+    VkDescriptorSet sets[2] = {draw_sets_[1], bindless_};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 3, dynamic_offsets);
     vkCmdBindIndexBuffer(c, index_buffer, index_at, VK_INDEX_TYPE_UINT32);
     uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
@@ -2926,13 +3244,20 @@ void Impl::draw(const gpu::Draw &d) {
         float constant = offset * (depth && depth->format == 1 ? float(1u << 24) : float((1u << 24) - 1));
         vkCmdSetDepthBias(c, constant, 0.0f, scale * (1.0f / 16.0f));
     }
+    if (options_.gpu_timing_draws) {
+        // each draw timed on its own, counted to its shaders
+        char kind[96];
+        std::snprintf(kind, sizeof(kind), "draw: %s, shaders %016llX %016llX", primitive_name(primitive),
+                      (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull);
+        gpu_mark(kind);
+    }
     vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
+    if (options_.gpu_timing_draws) gpu_mark("draws: between draws");
     report_.drawn++;
     if (options_.verbose)
-        std::fprintf(stderr, "  draw %llu: %s, %u indices, %s%s%s, shaders %016llX %016llX, blend %08X, mask %04X\n",
+        std::fprintf(stderr, "  draw %llu: %s, %u indices, %s%s, shaders %016llX %016llX, blend %08X, mask %04X\n",
                      (unsigned long long)report_.draws, primitive_name(primitive), count,
-                     ps ? "color and depth" : "depth only", depth ? ", depth on" : "",
-                     from_mirror ? ", vertices from the mirror" : "", (unsigned long long)vertex_hash_,
+                     ps ? "color and depth" : "depth only", depth ? ", depth on" : "", (unsigned long long)vertex_hash_,
                      ps ? (unsigned long long)pixel_hash_ : 0ull, regs_[r::RB_BLENDCONTROL[0]],
                      regs_[reg::RB_COLOR_MASK] & 0xFFFF);
 }
@@ -3034,6 +3359,7 @@ void Impl::resolve() {
             VkClearRect rect{{{int32_t(x), int32_t(y)}, {std::min(w, t->width - std::min(x, t->width)), std::min(h, t->height - std::min(y, t->height))}}, 0, 1};
             if (!rect.rect.extent.width || !rect.rect.extent.height) continue;
             VkCommandBuffer c = outside();
+            gpu_mark("resolves: clears");
             VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             attachment.imageView = t->view;
             attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -3089,6 +3415,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     if (!back_data) return;
 
     VkCommandBuffer c = outside();
+    gpu_mark("resolves: copies");
     VkImage from = source.image.image;
     VkOffset3D at{int32_t(info.x), int32_t(info.y), 0};
     if (!info.depth && info.msaa) {
@@ -3152,22 +3479,21 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
     full_barrier(c);
 
-    // for guest memory, once the GPU is done
-    std::vector<VkBufferCopy> copies;
+    // for guest memory, once the GPU is done: read back at the submission's
+    // end (read_back_resolves), what no later resolve wrote over
     WriteBack wb;
     wb.serial = slots_[current_].serial;
     VkDeviceSize offset = 0;
     for (auto [start, end] : written) {
-        copies.push_back({start, back_at + offset, end - start});
-        wb.pieces.push_back({start, end, back_data + offset});
+        wb.pieces.push_back({start, end, back_data + offset, back, back_at + offset});
         offset += end - start;
     }
-    vkCmdCopyBuffer(c, mirror_.buffer, back, uint32_t(copies.size()), copies.data());
     // what earlier resolves wrote there will not reach guest memory: this
     // one's bytes will
     for (WriteBack &older : writebacks_)
         for (auto [start, end] : written) cut(older.pieces, start, end);
     writebacks_.push_back(std::move(wb));
+    mirror_written(written);
     for (auto &[key, t] : textures_) {
         if (t->high <= written.front().first || t->low >= written.back().second) continue;
         for (const Range &r : written)
@@ -3256,7 +3582,9 @@ void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &i
     copy.bufferOffset = at;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {read.width, read.height, 1};
-    vkCmdCopyImageToBuffer(outside(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, back, 1, &copy);
+    VkCommandBuffer c = outside();
+    gpu_mark("swap: the front buffer read back");
+    vkCmdCopyImageToBuffer(c, t.image.image, VK_IMAGE_LAYOUT_GENERAL, back, 1, &copy);
     read.serial = slots_[current_].serial;
     front_reads_.push_back(std::move(read));
 }
