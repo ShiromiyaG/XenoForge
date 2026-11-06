@@ -75,10 +75,30 @@ the generic player or linked by a port.
 
 ## References for the GPU
 
+In this order, each where the ones before it have no answer:
+
 - **Xenia** first: its translator, render targets, texture formats and
   tiling, and its trace dump as the picture to match. The trace writer
   (2026-11-05) gives that picture for any scene a run reaches.
-- **XNA Game Studio 4.0** where Xenia has no answer. Its `XnaNative.dll`
+- **AMD's public documentation of the same hardware family.** Xenos is an
+  ATI design of the R400/R500 generation, close to the R600. The sources:
+  - the "R6xx/R7xx 3D Register Reference Guide", the R600 ISA, and the
+    R5xx acceleration documents, which AMD published (X.Org's AMD
+    documents);
+  - they give the registers under the same names (`PA_SC_*`, `RB_*`,
+    `SQ_*`, `VGT_*`), PM4, formats, tiling and the MSAA sample positions;
+  - Xenia cites the register guide itself (`command_processor.cc`,
+    `draw_util.h`).
+- **Mesa's drivers**, a second implementation of the same registers:
+  - r600, which Xenia cites too;
+  - freedreno's a2xx (MIT), for the Adreno 200, Xenos's sibling from ATI's
+    Imageon line, which Xenia's authors also tested on. How close a2xx's
+    shader ISA (ir2) is to Xenos's microcode is to be checked in Mesa's
+    source before relying on it.
+- **XenosRecomp** (hedge-dev, MIT, `../XenosRecomp`): a second translation of
+  Xenos microcode, made for Unleashed Recompiled, to set our translator's
+  meaning of each instruction against.
+- **XNA Game Studio 4.0**, for Microsoft's own encodings and layouts. Its `XnaNative.dll`
   (Microsoft's, unpacked without installing; `tools/xna/README.md`; nothing
   of it in the repository) exports:
   - the Xbox 360 HLSL compiler (`CreateCompileShaderFromSourceForXbox`,
@@ -101,8 +121,14 @@ the generic player or linked by a port.
     tiling and endianness of the formats XNA writes.
 
   Its limits: there is no console and no D3D runtime in it. It gives
-  Microsoft's tools, not the GPU's behavior, so what only hardware shows
-  (precision, undefined cases) stays Xenia's or is counted as open.
+  Microsoft's tools, not the GPU's behavior.
+
+**No hardware oracle.** The owner no longer has a console (2026-11-05).
+What only hardware shows (precision, undefined cases) is settled by Xenia,
+whose test vectors and several decisions came from consoles; where Xenia
+has no answer, the question is counted as open. The other hardware oracles
+would be a homebrew test program (libxenon) on an unlocked console, or an
+old phone with an Adreno 2xx under freedreno; neither is pursued now.
 
 ## Stack
 

@@ -32,8 +32,15 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
   draw_util, render_target_cache, texture_cache, shaders/*.xesli, command_processor) and match it.
   Code translated from Xenia starts with Xenia's BSD notice and is checked against its source in the
   same session. hedge-dev's MIT XenosRecomp (F:\RECOMPs\XenosRecomp) may be used with its notice.
-- Where Xenia has no answer (a feature it lacks or approximates), XNA Game Studio 4.0 is the second
-  reference (docs/plan.md, "References for the GPU"; tools/xna/README.md). Its XnaNative.dll in
+- Where Xenia has no answer (a feature it lacks or approximates), the next references, in order
+  (docs/plan.md, "References for the GPU"):
+  - AMD's public docs (R6xx/R7xx 3D Register Reference Guide, the R600 ISA, R5xx);
+  - Mesa's r600 driver and freedreno's a2xx (MIT; check how close a2xx's ISA is before relying on it);
+  - hedge-dev's XenosRecomp (MIT, F:\RECOMPs\XenosRecomp), as a second translation of the microcode;
+  - XNA Game Studio 4.0 (tools/xna/README.md).
+  There is no console to test on. What only hardware would show stays Xenia's answer, or is counted as
+  open.
+- XNA Game Studio 4.0's tools: its XnaNative.dll in
   F:\RECOMPs\external\xna\bin has Microsoft's Xbox 360 HLSL compiler, a Xenos microcode assembler
   (CreateAssembleShaderFromSourceForXbox) and FillXboxBuffer. HLSL for a feature is compiled by XNA
   into microcode for our translator, and by a host HLSL compiler into SPIR-V as the expected meaning.
