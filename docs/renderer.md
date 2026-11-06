@@ -760,10 +760,10 @@ others in `../traces/xf_dumps`):
   threshold, dithered by RB_COLORCONTROL's offsets, into gl_SampleMask):
   the title's frames 850 and 950 went from 12.6 of 255 off Xenia (19% of
   pixels) to 10.7-10.9 (15%), the cacti and trees now as Xenia's. What
-  remains is colored noise over the buildings, ground and hills, whose
-  4_4_4_4 textures the game makes on the GPU (4x MSAA 8_8_8_8_GAMMA targets
-  resolved at 192, 96, 48 and 24 texels, then read with gamma signs); not
-  from loading them on the GPU (decoded on the CPU, the same). Counted
+  remains is colored noise over the buildings, ground and hills: the depth
+  losing its host precision through EDRAM before a depth EQUAL pass ("Xenia's
+  Direct3D 12 picture and more games" below; the 4_4_4_4 impostor textures
+  the game makes on the GPU, suspected first, come out right). Counted
   there too: resolves of one MSAA sample (averaged), MSAA depth resolves.
 
 ## Pipelines, primitive types and occlusion queries (2026-11-06)
@@ -902,6 +902,81 @@ and the 4:2:2 formats read RGBB, 6_5_5 RBGG) and its signed version.
   texture with the shader converting the coordinates (the translator's).
   XNA's `FillXboxBuffer` gives no known texels for these formats: none of
   the ones added is an XNA surface format.
+
+## Xenia's Direct3D 12 picture and more games (2026-11-06)
+
+**The picture to match is now Xenia's Direct3D 12 trace dump**
+(`xenia-gpu-d3d12-trace-dump`, built beside the Vulkan one with its trace
+viewer; its default render target path on this NVIDIA GPU is host render
+targets, ROV only with `--render_target_path_d3d12=rov`). Its PNGs are in
+`../traces/dumps/d3d12` beside the Vulkan ones in `../traces/dumps`, and
+`../traces/xf_dumps/d3d12/<game>` beside `xf_dumps/<game>`. `replay_test`
+compares each frame with the D3D12 picture, and with the Vulkan one where
+there is no D3D12 one; it prints both. Where Xenia's two backends differ
+from each other by more than the test's bounds, matching the Vulkan picture
+passes too and the line says so (the frames below).
+
+Xenia's two pictures of the same traces (mean of 255, share of pixels off
+by more than 16):
+- the same (0.000) on Ben 10's six frames, seven of El Chavo Kart's (the
+  five of `chaves`, the loading and menu screens of `chaves_xf`), Forza
+  Horizon's four, Sonic Unleashed's five and Red Dead Redemption's frame
+  600;
+- El Chavo Kart's park and race (`chaves_xf`): D3D12 3.144 (6.9%) and 1.707
+  (4.4%) off Vulkan, darker in the brightest parts (the blossoming trees,
+  lamps and curbs of the HDR scene); ours is 0.017 and 0.010 off Vulkan's,
+  so 3.142 and 1.712 off D3D12's. The cause is open. It is not the render
+  target path (D3D12's ROV picture is 0.56 off its host render target one,
+  Vulkan's FSI picture 0.55 off its own) nor the EDRAM snapshot (D3D12
+  restores it, Vulkan drops it; ours is the same without it), so it lies in
+  what the two backends do differently outside their render target caches:
+  the shader translators (DXBC against SPIR-V), texture and sampler set-up;
+  the scene goes through a 2_10_10_10_FLOAT target read back as
+  2_10_10_10 bits and a bloom chain of 16_16_16_16 targets;
+- the memory export frames of the race (`xf_chaves/memexport4`): 0.13-0.15
+  (0.1-0.3%) between Xenia's two, ours 0.01-0.05 off Vulkan's;
+- Red Dead Redemption's frames 850 and 950: 0.21-0.22 (0.1%).
+
+**New traces from Xenia** (`tools/capture_traces.ps1`, no input, frames
+600, 1200, 2400 and 3600; `../traces/xenia_bc2`, `xenia_gow3`,
+`xenia_reach`), all twelve in `replay_test`'s corpus, Xenia's two pictures
+the same on each:
+- Battlefield: Bad Company 2 (454108A8): the title, two frames of the intro
+  video, the Frostbite logo; ours 0.000-0.002 off;
+- Gears of War 3 (4D5308AB): the start screen behind its "Connection Lost"
+  dialog, three frames, and a white one; ours 0.039-0.043 off;
+- Halo: Reach (4D53085B): the copyright screen, a dark frame, the intro's
+  planet and the main menu over its 3D scene; ours 0.000-0.082 off (the menu
+  counts 25 draws with D24FS8 depth as 32-bit float and 7 texture slots
+  without a texture constant).
+
+**Red Dead Redemption's noise** (frames 850 and 950 of `xf_rdr`, 10.8 of
+255 off Xenia's): it is the depth's precision, not its textures. The scene
+is lit in two passes over a 2x MSAA D24FS8 depth buffer: a depth and normal
+pre-pass, a light pass, then the material pass (draws 1688-2415 of frame
+850 for the top 1280x512 tile, again for the bottom one), which tests depth
+EQUAL and writes the 2_10_10_10_FLOAT target over the light buffer's EDRAM.
+Between the pre-pass and the material pass a depth-only draw (1687) uses
+another depth target over the same EDRAM, so the depth moves out and back
+through EDRAM's 20e4 bits; the host's 32-bit depth comes back rounded, the
+material pass's fragments no longer equal it, and most samples fail at
+random, keeping the light buffer's 8_8_8_8 bits seen as 2_10_10_10_FLOAT:
+the colored noise. Checked: with the depth test forced to always the noise
+goes (the overdraw comes instead); with draw 1687 skipped the top tile is
+clean and the frame goes from 10.80 to 4.10 off D3D12's picture (the bottom
+tile, aliased the same way, stays noisy). Xenia keeps the host depth across
+such transfers: each EDRAM range remembers the last float24 and unorm24
+host depth target that held it (`render_target_cache.h`,
+`OwnershipRange::host_depth_render_target_float24`), and a transfer back
+takes that target's 32-bit depth where it still rounds to the guest's 24
+bits (`kDepthAndHostDepthToDepth`, the "host depth" transfers of
+`d3d12_render_target_cache.cc`); Xenia's
+`depth_float24_convert_in_pixel_shader` is the other way out (the
+fragments' depth rounded to 20e4 in the pixel shader, at the cost of early
+depth). That is the render target cache's to port. Also in that frame,
+apart from the noise: its MSAA depth resolves are not done (8, among them
+the scene's depth read by the material pass as a texture; done as sample 0
+they take 1.2 of the 10.8 off, the rest is the depth precision above).
 
 ## What is asked and not done is counted
 
