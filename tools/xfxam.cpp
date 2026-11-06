@@ -633,8 +633,8 @@ std::string run_prepare(Side &s, const std::vector<std::string> &calls, double s
 // What the console's XAM makes for a running title that a launch cannot make
 // here, by the build it was found in (identified by its entry point). The
 // launch itself (XamLoaderLaunchTitleEx, --launch) goes as far as asking the
-// kernel to dismount the drives and to start a thread of its own, which this
-// kernel does not model (its device objects, a process per title), so the
+// kernel to end the previous title (ExTerminateTitleProcess), which this
+// kernel does not model (a process per title), so the
 // state is made by the functions of XAM's own that the launch calls, found by
 // reading its code (2.0.16202's, no names):
 //   0x816E5118  makes the title's heap (heap 0 of its table: the one XamAlloc
@@ -1309,8 +1309,8 @@ void usage() {
                 "  --no-title     no title running (default: the synthetic one, Partition1 a host directory)\n"
                 "  --user         ours keeps its signed-in user (default: signed out, as the console's XAM is)\n"
                 "  --prepare A[:x],B  XAM functions (hex addresses) called after its start, as a title's state\n"
-                "  --launch       XAM's own XamLoaderLaunchTitleEx instead of that state (it stops in the\n"
-                "                 kernel's device model; docs/runtime.md, \"A title running\")\n"
+                "  --launch       XAM's own XamLoaderLaunchTitleEx instead of that state (it stops at the\n"
+                "                 old title's end, ExTerminateTitleProcess; docs/runtime.md, \"A title running\")\n"
                 "  --only A,B     survey: these exports only (or @file, one per line); imports --all lists them\n");
 }
 

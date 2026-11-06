@@ -1007,6 +1007,41 @@ void from_memory(KernelHarness &h, uint32_t log) {
     CHECK(h.krnl("XexLoadExecutable", {h.string("game:\\missing.dll"), out, 9, 0}) == 0xC000000F);
 }
 
+// XexUnloadTitleModules: every module the title holds, whatever its load count, DLL_PROCESS_DETACH to the DLLs
+// that attached, the last loaded first, and the executable's with them; the kernel's modules stay
+void unload_title_modules(KernelHarness &h, uint32_t log) {
+    kernel::Kernel &k = *h.k;
+    constexpr uint32_t DETACH = 0;
+    uint32_t out = h.alloc(4);
+    CHECK(h.krnl("XexLoadImage", {h.string("game:\\app.dll"), 9, 0, out}) == 0);
+    uint32_t app = k.load32(out);
+    CHECK(h.krnl("XexLoadImage", {h.string("game:\\app.dll"), 9, 0, out}) == 0 && k.load16(app + 0x40) >= 2);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0);
+    uint32_t lib = k.load32(out);
+    CHECK(h.krnl("XexGetModuleHandle", {0, out}) == 0);
+    uint32_t exe = k.load32(out);
+    CHECK(exe && exe != app && k.load32(k.variable("XexExecutableModuleHandle")) == exe);
+    uint32_t from = k.load32(log);
+    CHECK(h.krnl("XexUnloadTitleModules", {0}) == 0);
+    std::vector<EntryCall> calls = entry_calls(k, log, from);
+    auto at = [&](const EntryCall &call) {
+        for (size_t i = 0; i < calls.size(); i++)
+            if (calls[i] == call) return int(i);
+        return -1;
+    };
+    int lib_at = at({lib, DETACH, 0, LIB_ID}), app_at = at({app, DETACH, 0, APP_ID});
+    CHECK(lib_at >= 0 && app_at > lib_at); // each once, lib.dll (an import of app.dll) first
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("app.dll"), out}) == 0x490);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("lib.dll"), out}) == 0x490);
+    CHECK(h.krnl("XexGetModuleHandle", {0, out}) == 0x490 && k.load32(out) == 0); // no executable now
+    CHECK(k.load32(k.variable("XexExecutableModuleHandle")) == 0);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("xam.xex"), out}) == 0 && k.load32(out) != 0); // the kernel's stay
+    RegionInfo region;
+    CHECK(k.memory().heap_for(APP)->query(APP, region) && region.state == 0);
+    CHECK(h.krnl("XexUnloadTitleModules", {0}) == 0); // nothing left to do
+    CHECK(entry_calls(k, log, from).size() == calls.size());
+}
+
 // ---- the loader lock: gate.dll, its DllMain host code ----
 //
 // gate.dll at GATE has its DllMain in the generated-code table: it logs each
@@ -1401,6 +1436,7 @@ int main() {
     settings(h);
     process_type(h);
     debugging(h);
+    unload_title_modules(h, log);
     h.k.reset(); // its files closed first
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

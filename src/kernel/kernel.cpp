@@ -151,6 +151,7 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
     // object types and KeTimeStampBundle
     setup_kernel(*this);
     objects_ = std::make_unique<Objects>(*this);
+    create_devices(*this);
     // the devices, before any guest thread runs
     setup_video(*this);
     setup_audio(*this);

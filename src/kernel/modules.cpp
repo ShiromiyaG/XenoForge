@@ -733,6 +733,8 @@ void set_executable_path(Kernel &k, const std::string &path) {
     s.executable_path = path;
 }
 
+void set_executable_module(Kernel &k, Modules &s, Module &m, bool reset);
+
 void setup_modules(Kernel &k, const Xex &xex) {
     Modules &s = k.state<Modules>();
     std::lock_guard lock(s.mutex);
@@ -754,12 +756,16 @@ void setup_modules(Kernel &k, const Xex &xex) {
     s.user_modules.push_back(std::move(exe));
     Module &m = *s.executable;
     m.code = k.add_module_code(xex);
+    set_executable_module(k, s, m, true);
+}
 
-    // KernelState::SetExecutableModule: the title process (its TLS from the
-    // header, its kernel stacks' size), the handle, the image's name and
-    // the command line
+// KernelState::SetExecutableModule: the title process (its TLS from the
+// header, its kernel stacks' size), the handle, the image's name and the
+// command line. reset: the process made anew (the first title; a title
+// started later, XexStartExecutable, leaves it as it is).
+void set_executable_module(Kernel &k, Modules &s, Module &m, bool reset) {
     uint32_t title = s.globals + TITLE_PROCESS;
-    initialize_process(k, title, 1, 10, 13, 17);
+    if (reset) initialize_process(k, title, 1, 10, 13, 17);
     uint32_t tls;
     if (opt_header(k, m.xex_header, xex_key::TLS_INFO, tls) && tls) {
         uint32_t slots = k.load32(tls), raw_data = k.load32(tls + 4), data_size = k.load32(tls + 8);
@@ -919,6 +925,11 @@ XF_EXPORT(xboxkrnl, XexStartExecutable) {
         if (!m || m->is_kernel() || !m->entry_point) return result(c, X_STATUS_INVALID_HANDLE);
         entry = m->entry_point;
         stack = m->xex ? m->xex->stack_size : 0;
+        // it is the executable from now on (XexUnloadTitleModules left none)
+        if (s.executable != m) {
+            s.executable = m;
+            set_executable_module(k, s, *m, false);
+        }
     }
     Objects &o = objects(k);
     Thread::Params p;
@@ -981,6 +992,44 @@ XF_EXPORT(xboxkrnl, XexUnloadImage) {
                 unload_user_module(k, s, *m);
             }
         }
+    }
+    result(c, X_STATUS_SUCCESS);
+}
+
+// (flags): every module the title holds unloaded, the last loaded first:
+// DLL_PROCESS_DETACH to those that attached, then their pages, thunks and
+// loader entries released whatever their load counts, and the executable's
+// too (none is the executable until XexStartExecutable names the next).
+// What stays is the system's: the kernel's modules and the ones a tool loaded
+// as the console's own (load_module). Xenia has none (it ends the title by
+// tearing the emulator down and starting again); the console's XAM calls it
+// before it loads the next title. What the flags select is not known (the
+// console's XAM passes them; they are not read here), and the title's threads
+// are not ended: the caller's job, as XAM's (its launch ends them first).
+XF_EXPORT(xboxkrnl, XexUnloadTitleModules) {
+    Modules &s = k.state<Modules>();
+    std::lock_guard loader(s.loader);
+    std::unique_lock lock(s.mutex);
+    std::vector<uint64_t> serials;
+    std::vector<EntryCall> detach;
+    for (auto it = s.user_modules.rbegin(); it != s.user_modules.rend(); ++it) {
+        Module &m = **it;
+        if (m.system) continue;
+        serials.push_back(m.serial);
+        if (m.dll && m.entry_point && m.attached) detach.push_back(entry_call(m, DLL_PROCESS_DETACH));
+    }
+    lock.unlock();
+    run_entries(k, s, c, detach);
+    lock.lock();
+    for (uint64_t serial : serials) {
+        Module *m = listed(s, serial);
+        if (!m) continue; // a DllMain unloaded it
+        std::fprintf(stderr, "kernel: XexUnloadTitleModules: %s unloaded\n", m->path.c_str());
+        if (m == s.executable) {
+            s.executable = nullptr;
+            k.store32(XexExecutableModuleHandle, 0);
+        }
+        unload_user_module(k, s, *m);
     }
     result(c, X_STATUS_SUCCESS);
 }

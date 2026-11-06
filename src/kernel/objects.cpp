@@ -261,6 +261,7 @@ Object *Objects::find_native(uint32_t address) {
 // the object whose body is at a guest address: the table's, else a search
 Object *Objects::by_guest(uint32_t address) {
     if (!address) return nullptr;
+    if (GuestObject *g = guest_object(address)) return g;
     if (Object *o = find_native(address)) return o;
     for (const Slot &s : slots_)
         if (s.object && s.object->guest == address) return s.object;
@@ -483,6 +484,14 @@ namespace {
 uint32_t reference_by_handle(Kernel &k, Objects &o, uint32_t handle, uint32_t type_ptr, uint32_t out_ptr) {
     Object *object = o.object_in(handle);
     if (!object) return X_STATUS_INVALID_HANDLE;
+    // an object the guest made: its type is its header's, the reference the header's count
+    if (auto *g = dynamic_cast<GuestObject *>(object)) {
+        if (type_ptr && k.load32(g->header() + object_header::OBJECT_TYPE) != type_ptr)
+            return X_STATUS_OBJECT_TYPE_MISMATCH;
+        o.reference_guest(*g);
+        if (out_ptr) k.store32(out_ptr, g->guest);
+        return X_STATUS_SUCCESS;
+    }
     uint32_t native = object->guest;
     if (type_ptr) {
         uint32_t actual = o.object_type_for(*object);
@@ -535,6 +544,19 @@ XF_EXPORT(xboxkrnl, ObOpenObjectByName) {
     std::lock_guard<std::mutex> l(o.lock);
     uint32_t handle = name.empty() ? 0 : o.find_name(name);
     if (!handle) return result(c, X_STATUS_OBJECT_NAME_NOT_FOUND);
+    // an object the guest made: a handle of its own (NT's: one more handle and
+    // pointer reference), of the type asked for if one is
+    if (auto *g = dynamic_cast<GuestObject *>(o.object_in(handle))) {
+        uint32_t type_ptr = arg(k, c, 1);
+        uint32_t status = X_STATUS_SUCCESS, opened = 0;
+        if (type_ptr && k.load32(g->header() + object_header::OBJECT_TYPE) != type_ptr)
+            status = X_STATUS_OBJECT_TYPE_MISMATCH;
+        else
+            opened = o.open_guest_handle(*g);
+        o.release_handle(handle);
+        if (handle_ptr) k.store32(handle_ptr, opened);
+        return result(c, status);
+    }
     if (handle_ptr) k.store32(handle_ptr, handle);
     result(c, X_STATUS_SUCCESS);
 }
@@ -548,7 +570,6 @@ XF_EXPORT(xboxkrnl, ObOpenObjectByName) {
 // object is named by its last element, and an empty element is invalid.
 XF_EXPORT(xboxkrnl, ObCreateObject) {
     constexpr uint32_t X_STATUS_INSUFFICIENT_RESOURCES = 0xC000009A, X_STATUS_OBJECT_NAME_INVALID = 0xC0000033;
-    constexpr uint16_t NAMED_OBJECT = 0x1;
     uint32_t type = arg(k, c, 0), attributes = arg(k, c, 1), size = arg(k, c, 2), out_ptr = arg(k, c, 3);
     k.store32(out_ptr, 0);
     // the pool and the title flag: by the attributes (0x1000 the title's,
@@ -572,14 +593,17 @@ XF_EXPORT(xboxkrnl, ObCreateObject) {
     uint32_t allocate = k.load32(type + 0x0), tag = k.load32(type + object_type::POOL_TAG);
     Objects &o = objects(k);
     uint32_t name_ptr = attributes ? k.load32(attributes + object_attributes::NAME) : 0;
+    bool permanent = (attribute_bits & obj::PERMANENT) != 0;
     if (!name_ptr) {
         uint32_t memory = uint32_t(o.call(c, allocate, {size + object_header::SIZE, tag, pool}));
         if (!memory) return result(c, X_STATUS_INSUFFICIENT_RESOURCES);
-        k.store32(memory + object_header::POINTER_COUNT, 1);
-        k.store32(memory + object_header::HANDLE_COUNT, 0);
-        k.store32(memory + object_header::OBJECT_TYPE, type);
-        k.store16(memory + object_header::FLAGS, flags);
-        k.store32(out_ptr, memory + object_header::SIZE);
+        uint32_t body = o.init_guest_object(memory, type, size, {}, flags);
+        {
+            // known to the object manager from now on (ObInsertObject, ObDereferenceObject)
+            std::lock_guard<std::mutex> l(o.lock);
+            o.add_guest_object(body, memory, false, {}, permanent);
+        }
+        k.store32(out_ptr, body);
         return result(c, X_STATUS_SUCCESS);
     }
     std::string path = ansi_string(k, name_ptr), element;
@@ -598,17 +622,12 @@ XF_EXPORT(xboxkrnl, ObCreateObject) {
     uint32_t aligned = (size + 3) & ~3u, length = uint32_t(element.size());
     uint32_t memory = uint32_t(o.call(c, allocate, {length + aligned + 0x10 + object_header::SIZE, tag, pool}));
     if (!memory) return result(c, X_STATUS_INSUFFICIENT_RESOURCES);
-    uint32_t header = memory + 0x10, body = header + object_header::SIZE, text = body + aligned;
-    k.store32(memory + 0x0, 0); // next in the directory
-    k.store32(memory + 0x4, 0); // the directory
-    k.store16(memory + 0x8, uint16_t(length));
-    k.store16(memory + 0xA, uint16_t(length));
-    k.store32(memory + 0xC, text);
-    std::memcpy(k.host(text), element.data(), length);
-    k.store32(header + object_header::POINTER_COUNT, 1);
-    k.store32(header + object_header::HANDLE_COUNT, 0);
-    k.store32(header + object_header::OBJECT_TYPE, type);
-    k.store16(header + object_header::FLAGS, uint16_t((flags & 0xFFFE) | NAMED_OBJECT));
+    uint32_t body = o.init_guest_object(memory, type, size, element, flags);
+    {
+        // its whole path is what ObInsertObject names it by (the header keeps the last element)
+        std::lock_guard<std::mutex> l(o.lock);
+        o.add_guest_object(body, memory, false, path, permanent);
+    }
     k.store32(out_ptr, body);
     result(c, X_STATUS_SUCCESS);
 }
@@ -623,6 +642,12 @@ XF_EXPORT(xboxkrnl, ObOpenObjectByPointer) {
     {
         std::lock_guard<std::mutex> l(o.lock);
         if (Object *object = o.by_guest(address)) {
+            // an object the guest made: a handle of its own (NT's)
+            if (auto *g = dynamic_cast<GuestObject *>(object)) {
+                uint32_t handle = o.open_guest_handle(*g);
+                if (out_ptr) k.store32(out_ptr, handle);
+                return result(c, X_STATUS_SUCCESS);
+            }
             o.retain_handle(object->handle());
             if (out_ptr) k.store32(out_ptr, object->handle());
             return result(c, X_STATUS_SUCCESS);
@@ -640,18 +665,33 @@ XF_EXPORT(xboxkrnl, ObOpenObjectByPointer) {
 XF_EXPORT(xboxkrnl, ObReferenceObject) {
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);
-    if (Object *object = o.by_guest(arg(k, c, 0))) o.retain_handle(object->handle());
+    if (Object *object = o.by_guest(arg(k, c, 0))) {
+        if (auto *g = dynamic_cast<GuestObject *>(object))
+            o.reference_guest(*g);
+        else
+            o.retain_handle(object->handle());
+    }
 }
 
 XF_EXPORT(xboxkrnl, ObDereferenceObject) {
     uint32_t native = arg(k, c, 0);
     if (!native || native == 0xDEADF00D) return;
     Objects &o = objects(k);
-    std::lock_guard<std::mutex> l(o.lock);
-    if (Object *object = o.by_guest(native))
-        o.release_handle(object->handle());
-    else
-        std::fprintf(stderr, "kernel: ObDereferenceObject of an unknown object 0x%08X\n", native);
+    Ref<GuestObject> dead;
+    {
+        std::lock_guard<std::mutex> l(o.lock);
+        if (Object *object = o.by_guest(native)) {
+            // an object the guest made: the header's count, the delete procedure at the last
+            if (auto *g = dynamic_cast<GuestObject *>(object)) {
+                if (o.dereference_guest(*g)) dead = Ref<GuestObject>::retain(g);
+            } else {
+                o.release_handle(object->handle());
+            }
+        } else {
+            std::fprintf(stderr, "kernel: ObDereferenceObject of an unknown object 0x%08X\n", native);
+        }
+    }
+    if (dead) o.delete_guest_object(c, std::move(dead));
 }
 
 // Whether an object belongs to the title (its header's flag): the objects
@@ -661,6 +701,8 @@ XF_EXPORT(xboxkrnl, ObIsTitleObject) {
     std::lock_guard<std::mutex> l(o.lock);
     if (!arg(k, c, 0)) return result(c, 0); // a null object is none of the title's (the console's answer)
     Object *object = o.by_guest(arg(k, c, 0));
+    if (auto *g = dynamic_cast<GuestObject *>(object))
+        return result(c, (k.load16(g->header() + object_header::FLAGS) & object_header::IS_TITLE_OBJECT) != 0);
     if (object && object->allocated)
         return result(c, (k.load16(object->guest - object_header::SIZE + object_header::FLAGS) &
                           object_header::IS_TITLE_OBJECT) != 0);
@@ -669,10 +711,11 @@ XF_EXPORT(xboxkrnl, ObIsTitleObject) {
 
 XF_EXPORT(xboxkrnl, NtClose) {
     Objects &o = objects(k);
-    std::lock_guard<std::mutex> l(o.lock);
     // -2, the current thread, is not a handle that closes (the console's kernel refuses it; Xenia accepts it)
     if (arg(k, c, 0) == 0xFFFFFFFE) return result(c, X_STATUS_INVALID_HANDLE);
-    result(c, o.release_handle(arg(k, c, 0)) ? X_STATUS_SUCCESS : X_STATUS_INVALID_HANDLE);
+    // (the lock is taken inside: an object the guest made runs its type's
+    // close and delete procedures)
+    result(c, o.close_handle(c, arg(k, c, 0)));
 }
 
 // Another handle to the same object; with DUPLICATE_CLOSE_SOURCE (1) the
@@ -689,6 +732,14 @@ XF_EXPORT(xboxkrnl, NtDuplicateObject) {
         return result(c, X_STATUS_INVALID_HANDLE);
     }
     uint32_t duplicate = (options & 1) ? source : o.add_handle(object);
+    // an object the guest made counts the handle and its pointer reference
+    if (!(options & 1)) {
+        if (auto *g = dynamic_cast<GuestObject *>(object)) {
+            uint32_t counts = g->header() + object_header::HANDLE_COUNT;
+            k.store32(counts, k.load32(counts) + 1);
+            o.reference_guest(*g);
+        }
+    }
     if (new_ptr) k.store32(new_ptr, duplicate);
     result(c, X_STATUS_SUCCESS);
 }

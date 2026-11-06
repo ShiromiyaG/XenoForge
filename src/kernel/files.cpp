@@ -1213,35 +1213,7 @@ XF_EXPORT(xboxkrnl, NtRemoveIoCompletion) {
     result(c, X_STATUS_SUCCESS);
 }
 
-// ---- devices and the rest of Io*, Fsc*, Stfs* ----
-
-// (driver_object, extension_size, device_name, device_type,
-// extra_attributes, device_object_ptr): an X_DEVICE_OBJECT (0x50) and its
-// extension, for XMountUtilityDrive's task (Xenia's IoCreateDevice)
-XF_EXPORT(xboxkrnl, IoCreateDevice) {
-    uint32_t driver = arg(k, c, 0), extension_size = arg(k, c, 1), name = arg(k, c, 2), type = arg(k, c, 3);
-    uint32_t out_ptr = arg(k, c, 5);
-    uint32_t size = 0x50 + ((extension_size + 7) & ~7u);
-    uint32_t d = k.memory().system_alloc(size);
-    if (!d) return result(c, X_STATUS_NO_MEMORY);
-    std::memset(k.host(d), 0, size);
-    k.store16(d + 0x00, 3);
-    k.store16(d + 0x02, uint16_t(extension_size + 0x50)); // the size, unaligned
-    static constexpr uint32_t unmounted[] = {7, 58, 62, 45, 2, 60, 61, 36, 64, 65, 66, 67, 68, 69, 70, 72, 73};
-    bool self = std::find(std::begin(unmounted), std::end(unmounted), type) == std::end(unmounted);
-    k.store32(d + 0x0C, self ? d : 0); // mounted or self device
-    k.host(d)[0x1C] = uint8_t(type);
-    k.host(d)[0x1E] = 1; // stack size
-    k.store32(d + 0x14, 16 | (name ? 8 : 0));
-    if (extension_size) k.store32(d + 0x18, d + 0x50);
-    k.store32(d + 0x08, driver);
-    if (out_ptr) k.store32(out_ptr, d);
-    result(c, X_STATUS_SUCCESS);
-}
-
-XF_EXPORT(xboxkrnl, IoDeleteDevice) {
-    if (uint32_t d = arg(k, c, 0)) k.memory().system_free(d);
-}
+// ---- the rest of Io*, Fsc*, Stfs* (the device objects are devices.cpp's) ----
 
 // ---- share access (NT's IoSetShareAccess, IoCheckShareAccess, IoRemoveShareAccess) ----
 //
@@ -1326,7 +1298,6 @@ XF_EXPORT(xboxkrnl, IoRemoveShareAccess) {
 // the I/O manager's other driver calls (see the top of the file)
 XF_EXPORT(xboxkrnl, IoCompleteRequest) {}
 XF_EXPORT(xboxkrnl, IoInvalidDeviceRequest) { result(c, X_STATUS_INVALID_DEVICE_REQUEST); }
-XF_EXPORT(xboxkrnl, IoDismountVolume) { result(c, X_STATUS_SUCCESS); }
 XF_EXPORT(xboxkrnl, IoDismountVolumeByFileHandle) {
     // a handle that is no file is refused, as the console's kernel does
     result(c, file_by_handle(objects(k), arg(k, c, 0)) ? X_STATUS_SUCCESS : not_a_file(objects(k), arg(k, c, 0)));

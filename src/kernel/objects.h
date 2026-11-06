@@ -84,10 +84,29 @@ constexpr uint32_t POINTER_COUNT = 0x0, HANDLE_COUNT = 0x4, OBJECT_TYPE = 0x8, F
 constexpr uint16_t IS_TITLE_OBJECT = 0x10;
 } // namespace object_header
 
-// X_OBJECT_TYPE (0x1C)
+// X_OBJECT_TYPE (0x1C): the procedures the object manager calls (allocate,
+// free, close, delete, parse), the default object, the pool tag
 namespace object_type {
+constexpr uint32_t ALLOCATE = 0x0, FREE = 0x4, CLOSE = 0x8, DELETE = 0xC, PARSE = 0x10, DEFAULT_OBJECT = 0x14;
 constexpr uint32_t POOL_TAG = 0x18, SIZE = 0x1C;
+} // namespace object_type
+
+// X_OBJECT_HEADER_NAME_INFO (0x10), before the header of a named object:
+// the next in its directory, the directory, the name (an X_ANSI_STRING)
+namespace object_name_info {
+constexpr uint32_t NEXT = 0x0, DIRECTORY = 0x4, NAME = 0x8, SIZE = 0x10;
+} // namespace object_name_info
+
+// X_OBJECT_HEADER's flags
+namespace object_flags {
+constexpr uint16_t NAMED = 0x1;
 }
+
+// OBJ_* in X_OBJECT_ATTRIBUTES' attributes
+namespace obj {
+constexpr uint32_t PERMANENT = 0x10, CASE_INSENSITIVE = 0x40, OPEN_IF = 0x80;
+constexpr uint32_t TITLE_POOL = 0x1000, SYSTEM_POOL = 0x2000; // the xbox's: which pool ObCreateObject uses
+} // namespace obj
 
 namespace ksemaphore {
 constexpr uint32_t LIMIT = 0x10, SIZE = 0x14;
@@ -307,6 +326,24 @@ public:
     uint32_t dpc = 0; // the KDPC (KeSetTimerEx's), queued as the timer comes due
 };
 
+// An object the guest made with ObCreateObject (or the kernel made the same
+// way, as IoCreateDevice does), of a type the kernel or a title defined: its
+// body is in guest memory after an X_OBJECT_HEADER, and the header holds the
+// counts (pointer and handle), as NT's. It has no dispatcher header of the
+// kernel's kinds; what it does is the type's procedures (close, delete).
+class GuestObject : public Object {
+public:
+    explicit GuestObject(Objects &owner) : Object(owner, Type::Other) {}
+    uint32_t header() const { return guest - object_header::SIZE; }
+
+    uint32_t allocation = 0;     // the allocation's start: the name info of a named object, else the header
+    bool host_allocated = false; // not from the type's allocate procedure: freed by the host
+    bool inserted = false;       // ObInsertObject (or the kernel's own insertion) done
+    bool permanent = false;      // OBJ_PERMANENT: the name stays with no handle open
+    uint32_t permanent_handle = 0;
+    std::string path; // the full name it is inserted under (its header holds only the last element)
+};
+
 // Thrown by ExTerminateThread and caught where the thread started.
 struct ThreadExit {
     uint32_t code;
@@ -460,6 +497,34 @@ public:
     // any object by its body's guest address (lock held; not retained)
     Object *by_guest(uint32_t address);
 
+    // ---- objects the guest made with ObCreateObject (guest_objects.cpp) ----
+    // Registered when made, whether or not they are inserted yet; the table
+    // holds a reference. The counts are the header's. Lock held, except where
+    // a guest procedure runs (close_handle, delete_guest_object).
+    GuestObject *guest_object(uint32_t body); // not retained
+    GuestObject &add_guest_object(uint32_t body, uint32_t allocation, bool host_allocated, std::string path,
+                                  bool permanent);
+    // the header and name info over an allocation; the body's address (element: the last name part, if named)
+    uint32_t init_guest_object(uint32_t memory, uint32_t type, uint32_t body_size, const std::string &element,
+                               uint16_t flags);
+    // an object the kernel makes itself, in memory of its own (devices): registered, not inserted; 0 on failure
+    uint32_t make_guest_object(uint32_t type, uint32_t body_size, const std::string &path, bool title_object);
+    // ObInsertObject: its status, the handle, and the new object when it has to be deleted
+    struct Insertion {
+        uint32_t status = 0, handle = 0;
+        Ref<GuestObject> discard;
+    };
+    Insertion insert_guest_object(GuestObject &g, const std::string &path, uint32_t attributes, uint32_t bias);
+    void reference_guest(GuestObject &g);
+    bool dereference_guest(GuestObject &g); // true: the last reference is gone, delete_guest_object is next
+    uint32_t open_guest_handle(GuestObject &g);
+    bool drop_guest_handle(GuestObject &g, uint32_t handle); // a handle closed, no close procedure; true: dead
+    bool make_temporary(GuestObject &g);                     // ObMakeTemporaryObject; true: dead
+    // the delete procedure, the object forgotten, then the free procedure
+    void delete_guest_object(ppc::Context &c, Ref<GuestObject> g);
+    // NtClose (lock not held): a guest object's close procedure and, at its last, its deletion
+    uint32_t close_handle(ppc::Context &c, uint32_t handle);
+
     // Waits (all or any) until the deadline on the scheduler's clock: the NT
     // wait's status (WAIT_0 + n, ABANDONED_WAIT_0 + n, TIMEOUT, USER_APC).
     // The caller delivers user APCs on USER_APC.
@@ -533,6 +598,7 @@ private:
     uint32_t free_cursor_ = 0;
     std::vector<std::pair<std::string, uint32_t>> names_;   // lowercase name, handle
     std::unordered_map<uint32_t, uint32_t> native_handles_; // a header's guest address, the handle of its object
+    std::unordered_map<uint32_t, Ref<GuestObject>> guest_objects_; // by body
     std::vector<Timer *> armed_;
     uint32_t initialize_native(Dispatcher &d, uint32_t address);
     void remove_waits(Thread &t);
@@ -569,5 +635,8 @@ std::atomic_ref<uint32_t> guest_word(Kernel &k, uint32_t address);
 inline uint32_t bswap32(uint32_t v) { return __builtin_bswap32(v); }
 
 Objects &objects(Kernel &k);
+
+// the device objects there are at start (devices.cpp), once Objects exists
+void create_devices(Kernel &k);
 
 } // namespace xf::kernel

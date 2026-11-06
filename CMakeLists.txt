@@ -493,6 +493,13 @@ target_link_libraries(kernel_inventory_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_inventory COMMAND kernel_inventory_test)
 set_tests_properties(kernel_inventory PROPERTIES TIMEOUT 120) # threads: fail, never hang
 
+# the object manager's guest-made objects (ObCreateObject + ObInsertObject) and the device objects
+add_executable(kernel_ob_test tests/kernel_ob_test.cpp)
+target_include_directories(kernel_ob_test PRIVATE src/kernel)
+target_link_libraries(kernel_ob_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME kernel_ob COMMAND kernel_ob_test)
+set_tests_properties(kernel_ob PROPERTIES TIMEOUT 120) # threads: fail, never hang
+
 # XAM's system UI with no dialog drawn: defaults, overlapped, notifications
 add_executable(kernel_ui_test tests/kernel_ui_test.cpp)
 target_include_directories(kernel_ui_test PRIVATE src/kernel)

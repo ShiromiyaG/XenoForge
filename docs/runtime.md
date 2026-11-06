@@ -379,6 +379,65 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
 - `Kernel::launch` makes the main thread (the executable's stack size and
   TLS header) and starts it; `boot` waits for it and reports the threads.
 
+### Objects the guest makes, and device objects
+
+Xenia has no ObInsertObject (its table entry is unimplemented) and its objects
+are host objects behind handles. The console's XAM makes its enumerators,
+sessions and voices with ObCreateObject (a type of its own: allocate, free,
+close and delete procedures in its data) and ObInsertObject, so this is NT's
+object manager as the console keeps it (`guest_objects.cpp`, `devices.cpp`;
+`tests/kernel_ob_test.cpp`):
+
+- **A made object** is a `GuestObject` in the object table: its body in guest
+  memory after an X_OBJECT_HEADER (and, named, an X_OBJECT_HEADER_NAME_INFO
+  holding the last name element), registered by ObCreateObject, which keeps the
+  whole path the object will be inserted under. The pointer and handle counts
+  are the header's own, and the type's procedures are called as NT calls them
+  (on a guest call from the exporting thread, the lock released).
+- **ObInsertObject(object, attributes, bias, handle)** (the console's XAM
+  passes the handle pointer fourth; the attributes' name, else the creation's
+  path, names it): one handle opened (written even when the pointer is null),
+  handle count 1, pointer count = creation's + bias (the handle's reference
+  replaces the creation's). A name that exists is
+  STATUS_OBJECT_NAME_COLLISION, or with OBJ_OPENIF (0x80) a handle to that
+  object (types must match: STATUS_OBJECT_TYPE_MISMATCH) and
+  STATUS_OBJECT_NAME_EXISTS; the new object is dereferenced and deleted in
+  every failure. A name not rooted is STATUS_OBJECT_NAME_INVALID. OBJ_PERMANENT
+  (0x10) keeps the name, and a reference, with no handle open until
+  ObMakeTemporaryObject. There are no directory objects: the directories of a
+  name are not looked for, and an object under a missing one is inserted.
+- **References**: ObReferenceObjectByHandle (the type checked against the
+  header's, STATUS_OBJECT_TYPE_MISMATCH), ObReferenceObject and
+  ObReferenceObjectByName count in the header; ObDereferenceObject at the last
+  runs the delete procedure then the free procedure (an object never inserted
+  goes the same way); ObOpenObjectByName and ObOpenObjectByPointer open
+  another handle (NT's: handle and pointer count one more, where Xenia hands
+  back the same handle); NtDuplicateObject counts both; NtClose closes, runs
+  the close procedure (object, handles left: the Xbox's two-argument form,
+  from NT's five), then dereferences. A type no host kind stands behind
+  (dispatcher headers of an Ex type made with ObCreateObject, then
+  KeInitializeEvent) is not made into a host event: its handle waits nowhere.
+- **Device objects** are such objects of IoDeviceObjectType, permanent and
+  named, as IoCreateDevice makes them (Xenia's layout: type 3, size, driver,
+  the mounted or self device, flags, extension, device type, stack size; a name
+  that exists is a collision, IoDeleteDevice makes it temporary and deletes it
+  when nothing refers to it). At start there are `\Device\Cdrom0`,
+  `\Device\HdDvdRom`, `\Device\Harddisk0\Partition0`, `\Partition1`, `\Cache0`
+  and `\Cache1` (a list of ours: the console's drivers make more, which nothing
+  asks for yet). The file systems stay the VFS's: a device object is what a
+  driver names and XAM looks for. IoDismountVolume answers
+  STATUS_VOLUME_DISMOUNTED (0xC000026E), as the console's, to what is not a
+  device object, and success to one (nothing is taken from the VFS);
+  IoDismountVolumeByName finds the device as ObReferenceObjectByName does with
+  IoDeviceObjectType (invalid name, not found, mismatch) and dismounts it.
+- **XexUnloadTitleModules(flags)** unloads every module that is not the
+  kernel's or a system module (`load_module`): DLL_PROCESS_DETACH to the DLLs
+  that attached, the last loaded first, then their pages and loader entries
+  whatever their counts, the executable's too (there is none until
+  XexStartExecutable names the next, which also sets the executable handle, the
+  image name, the TLS and the stack size from it). What the flags select is not
+  known (not read), and the title's threads are the caller's to end.
+
 ### Stacks
 
 A guest thread may move between guest stacks: the XDK's fibers
@@ -883,13 +942,29 @@ thread, which never returned), was `\SystemRoot\dash.xex`: why was not found
 (the request's type is made from the path and the caller's process type,
 and the launch state machine's later states were not read). It gets that far
 when that file is the synthetic title (its absence is a fatal error screen,
-VdDisplayFatalError 0x12247), and then stops in a loop
-of the worker's: IoDismountVolumeByName and ObReferenceObjectByName on
-`\Device\HdDvdRom`, which the kernel here has no device object for (it is
-answered 0xC0000034, and the loop wants 0xC000000E or an object). That is the
-kernel's device model (objects for devices, a process per title), not XAM's,
-and is left; XexStartExecutable (a thread of the title process at the
-module's entry) is in place for the day it gets there.
+VdDisplayFatalError 0x12247). Why it is always the dashboard was not found
+beyond this: XamLoaderLaunchTitleEx (0x8169F268 in 2.0.16202) keeps the path
+for flags 0 and stores a request type (0xA or 0xB), and the launcher's thread
+function (0x8169CD98) loads the request's path, and `\SystemRoot\dash.xex`
+(or `\Device\Flash\dash.xex`) goes through a function (0x8169A8D8) that may
+swap in another dashboard; which step replaces a given path was not traced.
+
+With the device objects (the second round, 2026-11-06) the launch no longer
+stops in the loop of the worker's: the kernel here has `\Device\HdDvdRom` now,
+IoDismountVolumeByName and ObReferenceObjectByName on it answer, and the
+worker goes on to ask the drive (IoSynchronousDeviceIoControlRequest 0x4D014,
+not implemented: answered 0) and to poll on a delay, as a worker of the
+console's does. The launch loads the executable (XexLoadExecutable,
+`\SystemRoot\dash.xex` being the synthetic title), checks its privilege,
+starts a thread that calls ExTerminateTitleProcess(0, ...) (not implemented)
+and, as it returns, ends in VdDisplayFatalError 0x12247 (0x8169F164: the
+state machine's status was not the one it waits for). XexUnloadTitleModules and
+XexStartExecutable are not reached. What is left is the kernel's process per
+title: ExTerminateTitleProcess (the title's threads ended, its modules
+unloaded) and the launch's status; XexStartExecutable (a thread of the title
+process at the module's entry, naming the executable) is in place for the day
+it gets there. ObTranslateSymbolicLink, which the launch calls on
+`\SystemRoot`-style names, is not implemented either.
 
 **A call.** Each side runs in a process of its own (`xfxam ... side hle|real`,
 which `call` and `survey` start), on a fresh kernel, so a fault or a hang
@@ -1095,14 +1170,27 @@ ID, and our stopping when the title ends (the run is over, the console's
 thread did not return either).
 
 Left, and why:
-- **ObInsertObject is not implemented here** (xboxkrnl; the kernel oracle's
-  list). XAM makes each of its enumerators, sessions and voice objects with
-  ObCreateObject and ObInsertObject, and gets no handle: its
-  ObReferenceObjectByHandle then answers STATUS_INVALID_HANDLE, which is
-  where some of the 0x65B answers (XamUserCreateAchievementEnumerator and
-  TitlesPlayed) and the 13 faults of the console's side come from (the
-  enumerator calls, XamProfileFindAccount: its error paths read through a
-  null). The differences on these are not the HLE's yet.
+- **ObInsertObject** (done after this survey: "Objects the guest makes",
+  above). XAM makes each of its enumerators, sessions and voice objects with
+  ObCreateObject and ObInsertObject; without a handle its
+  ObReferenceObjectByHandle answered STATUS_INVALID_HANDLE and the error paths
+  of the enumerator calls and XamProfileFindAccount read through a null. The
+  survey run again on the new build against the old one (233 match, 128
+  differ, 5 need state, 17 fault, 13 of them the console's side, before):
+  236 match, 130 differ, 5 need state, 12 fault (8 the console's side), and
+  the variants' faults 3 to 0. Five faults on enumerator calls
+  (XamContentAggregateCreateEnumerator, XamContentCreateDeviceEnumerator and
+  its variant, XamContentCreateEnumerator#1, XamContentCreateEnumeratorInternal)
+  and XamCreateEnumeratorHandle now match; XamProfileCreateEnumerator,
+  XamProfileFindAccount and XamUserLogon#1 went from a fault to a difference.
+  The 0x65B answers did not move (24 both times): they are the console's XAM
+  asking its worker for a user it has none of (XamUserCreateAchievementEnumerator
+  makes and inserts its object, references it, closes the handle, then
+  answers from the worker), the HLE's answer to compare with, not the
+  kernel's. The faults left on the console's side (XamFree, XamTask*,
+  XamAvatarInitialize, XamNuiSkeletonGetBestSkeletonIndex,
+  XamProfileGetCreationStatus, NetDll_XNetRegisterKey, XMsgCancelIORequest) do
+  not go through Ob.
 - **A profile and a signed-in user.** A profile is an STFS package on a
   content device (Content\<xuid>\FFFE07D1\00010000\<xuid>); XAM learns of
   the device from DrvGetContentStorageNotification, whose structure is not
@@ -1112,7 +1200,9 @@ Left, and why:
   State answer 0x57 for device 1 on the console, a device ours has; Create
   answers 0x57 before it looks for a user, ours 0x525) are the oracle's
   lack of a device, not ours.
-- **The console's own launch** (above): the kernel's device model.
+- **The console's own launch** (above): past the device objects now; it ends
+  at ExTerminateTitleProcess (a process per title) and the launch's fatal
+  error 0x12247.
 - The UI calls (0x65B against our headless answers), XamVoiceCreate (the
   console makes a voice object with no microphone, ours is Xenia's stub,
   ERROR_ACCESS_DENIED), XNetGetTitleXnAddr's MAC (XAM's own, different on
