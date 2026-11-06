@@ -10,7 +10,8 @@
 
 // XAM's shared parts (xam.h) and its small exports: the notifications, the
 // loader, the title's information, XamAlloc, the enumerators, the tasks,
-// voice, sessions and the media verification. Translated from Xenia (BSD;
+// voice, sessions and the media verification; the user signed in or out,
+// and the kernel exports XAM's own code calls. Translated from Xenia (BSD;
 // see LICENSE-xenia): kernel_state.cc, xnotifylistener.cc, xenumerator.cc,
 // xam_state.cc, profile_manager.cc (FindProfiles), xam_notify.cc,
 // xam_info.cc, xam_module.cc, xam_enum.cc, xam_task.cc, xam_voice.cc,
@@ -43,6 +44,7 @@ struct XamState {
     std::mutex mutex;
     std::filesystem::path content_root;
     User user;
+    std::atomic<bool> signed_out{false}; // XamUserLogon took the user out
     // under the objects' lock; each retained for good, as Xenia's (and so
     // never released after the objects are gone)
     std::vector<NotifyListener *> listeners;
@@ -129,6 +131,23 @@ void set_last_error(Kernel &k, uint32_t error) {
 uint32_t last_error(Kernel &k) {
     Thread *t = current_thread();
     return t ? k.load32(t->kthread() + kthread::LAST_ERROR) : 0;
+}
+
+uint32_t call_export(Kernel &k, ppc::Context &c, const char *library, const char *name,
+                     std::initializer_list<uint64_t> args) {
+    ExportFn fn = find_export_fn(library, name);
+    if (!fn) {
+        std::fprintf(stderr, "xam: %s!%s, which XAM calls, is not implemented\n", library, name);
+        return X_STATUS_NOT_IMPLEMENTED;
+    }
+    auto saved = std::make_unique<ppc::Context>(c);
+    c.r[1] -= SCRATCH_SIZE + 112; // past the scratch, a minimal frame
+    int n = 3;
+    for (uint64_t a : args) c.r[n++] = a;
+    fn(k, c);
+    uint32_t r = uint32_t(c.r[3]);
+    c = *saved;
+    return r;
 }
 
 // ---- notifications ----
@@ -234,13 +253,18 @@ const User *user_at(Kernel &k, uint32_t index) {
     uint8_t slot = uint8_t(index);
     if (slot == USER_INDEX_NONE) return nullptr;
     if (slot == USER_INDEX_LATEST || slot == USER_INDEX_ANY) slot = 0;
-    return slot == 0 ? &xam(k).user : nullptr;
+    XamState &s = xam(k);
+    return slot == 0 && !s.signed_out ? &s.user : nullptr;
 }
 
 const User *user_by_xuid(Kernel &k, uint64_t xuid) {
-    const User &u = xam(k).user;
-    return xuid == u.xuid ? &u : nullptr;
+    XamState &s = xam(k);
+    return xuid == s.user.xuid && !s.signed_out ? &s.user : nullptr;
 }
+
+const User &user_profile(Kernel &k) { return xam(k).user; }
+
+bool set_signed_in(Kernel &k, bool signed_in) { return xam(k).signed_out.exchange(!signed_in) == signed_in; }
 
 uint32_t title_id(Kernel &k) { return k.xex() ? k.xex()->execution.title_id : 0; }
 

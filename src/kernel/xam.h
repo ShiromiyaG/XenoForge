@@ -21,6 +21,8 @@
 
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -92,6 +94,17 @@ uint32_t run_or_defer(Kernel &k, uint32_t overlapped, const OverlappedRun &run);
 void set_last_error(Kernel &k, uint32_t error);
 uint32_t last_error(Kernel &k);
 
+// Another export run from a XAM export, as XAM's own code calls the kernel:
+// on the caller's context, its stack lowered past a scratch area (the
+// export's own frame, SCRATCH_SIZE bytes at export_scratch(c)) the
+// arguments may point into, so nothing the callee runs (a user APC)
+// reaches it; the registers restored after. Its r3
+// (X_STATUS_NOT_IMPLEMENTED, logged, when there is no such export).
+constexpr uint32_t SCRATCH_SIZE = 0x80;
+inline uint32_t export_scratch(ppc::Context &c) { return uint32_t(c.r[1]) - SCRATCH_SIZE; }
+uint32_t call_export(Kernel &k, ppc::Context &c, const char *library, const char *name,
+                     std::initializer_list<uint64_t> args);
+
 // ---- notifications (Xenia's XNotifyListener) ----
 
 constexpr uint32_t XN_SYS_UI = 0x00000009;
@@ -127,11 +140,30 @@ struct User {
     uint64_t xuid = DEFAULT_XUID;
     std::string name = "User";
     uint32_t signin_state = 1; // signed in locally (offline)
+    // its X_XAMACCOUNTINFO's flags, as Xenia's new account has them (none):
+    // reserved (live enabled 0x20000000), cached (country 0xFF00,
+    // subscription tier 0xF00000, language 0x3E000000)
+    uint32_t reserved_flags = 0, cached_flags = 0;
 };
 // XamState::GetUserProfile(user_index): slot 0 holds the one user; "any"
-// and "latest" are it; 4-0xFC and "none" are nobody
+// and "latest" are it; 4-0xFC and "none" are nobody; nobody while the user
+// is signed out
 const User *user_at(Kernel &k, uint32_t user_index);
 const User *user_by_xuid(Kernel &k, uint64_t xuid);
+// the user's profile, signed in or not (its account)
+const User &user_profile(Kernel &k);
+// ProfileManager::Login and Logout of the one user (slot 0): whether it
+// changed
+bool set_signed_in(Kernel &k, bool signed_in);
+
+// the console's user settings XAM reads (xam_locale.cpp), through
+// ExGetXConfigSetting: the country (XCONFIG_USER_COUNTRY) and language
+// (XCONFIG_USER_LANGUAGE)
+uint8_t config_country(Kernel &k);
+uint32_t config_language(Kernel &k);
+// An SPA (an XDBF file in guest memory) and from it the string table of its
+// default language (XSTC, else English), by string id (xam_locale.cpp)
+std::map<uint16_t, std::u16string> spa_strings(Kernel &k, uint32_t base, uint32_t size);
 
 // the running title's ID (its execution info)
 uint32_t title_id(Kernel &k);

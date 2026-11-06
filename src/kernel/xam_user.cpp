@@ -8,27 +8,42 @@
  ******************************************************************************
  */
 
-// XAM's users and UI (xam.h): one user signed in offline in slot 0, its
-// profile settings, and the guide's UI answered as Xenia answers it
-// headless (the input exports are in xam_input.cpp). Translated from Xenia
-// (BSD; see LICENSE-xenia): xam_user.cc, user_settings.h and .cc, user_data.cc,
-// user_tracker.cc (GetUserSetting), xam_ui.cc (the headless paths);
-// checked against them.
+// XAM's users, profiles and UI (xam.h): one user signed in offline in slot
+// 0, its account's flags, its profile settings and preferences, signing in
+// and out, the accounts and profile packages, and the guide's UI answered
+// as Xenia answers it headless (the input exports are in xam_input.cpp,
+// the locale in xam_locale.cpp). Translated from Xenia (BSD; see
+// LICENSE-xenia): xam_user.cc, xam_profile.cc, xam_enum.cc (the profile
+// enumerator), xam_nui.cc (XamUserNui*), xam.h (X_XAMACCOUNTINFO and the
+// creation info), profile_manager.cc (Login, Logout, the accounts, the
+// profile's path), user_settings.h and .cc, user_data.cc, user_tracker.cc
+// (GetUserSetting, the preferences, the subscription), xam_ui.cc (the
+// headless paths); checked against them.
 //
 // Where it differs from Xenia, and why:
 //   - the user is Xenia's default profile (XUID 0xB13EBABEBABEBABE, or the
 //     first profile in the content root) named "User", without its account
 //     file or GPDs: settings a title writes are kept for the run, not in
-//     the profile's GPD;
+//     the profile's GPD, and no titles played are recorded;
+//   - the accounts XamProfileCreate makes are kept for the run (no Account
+//     file is written) and cannot sign in: only the one user does, to slot
+//     0;
+//   - XamUserGetUserTenure completes an overlapped it is given (Xenia
+//     leaves it alone, and a title waiting on it would wait for good);
+//   - XamUserIsParentalControlled tests the account's parental control bit
+//     (Xenia tests the language's bits; an offline account has neither);
 //   - the UI's notifications (XN_SYS_UI on, then off) go out together
 //     around the answer (Xenia turns it off 200 ms later).
 
 #include "xam.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <optional>
+#include <random>
 
 namespace xf::kernel {
 namespace {
@@ -104,6 +119,46 @@ struct UserState {
 };
 
 UserState &users(Kernel &k) { return k.state<UserState>(); }
+
+// the dashboard's settings in the profile (Xenia's dashboard GPD)
+constexpr uint32_t DASHBOARD_ID = 0xFFFE07D1;
+constexpr uint32_t XPROFILE_TENURE_LEVEL = 0x10040047, XPROFILE_TENURE_MILESTONE = 0x10040048;
+constexpr uint32_t XPROFILE_TENURE_NEXT_MILESTONE_DATE = 0x70080049;
+constexpr uint32_t XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS = 0x1004004B;
+constexpr uint32_t XPROFILE_SUBSCRIPTION_PAYMENT_TYPE = 0x1004004C, XPROFILE_USER_PREFERENCES = 0x10040053;
+
+uint32_t be32_at(const uint8_t *p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+
+// UserTracker::GetSetting(user, kDashboardID, id) of a number: what was
+// written, else its default; 32 or 64 bits by its type
+uint64_t dashboard_value(Kernel &k, uint32_t id) {
+    UserState &s = users(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    auto it = s.written.find({DASHBOARD_ID, id});
+    Setting v = it != s.written.end() ? it->second : default_setting(id);
+    if (type_of(id) == DataType::Int64 || type_of(id) == DataType::DateTime || type_of(id) == DataType::Double)
+        return uint64_t(be32_at(v.value)) << 32 | be32_at(v.value + 4);
+    return be32_at(v.value);
+}
+
+// GetUserPreferenceWrittenBit: the bit a multi-bit preference marks itself
+// written with (0 for one bit), none for an unknown mask
+std::optional<uint32_t> preference_written_bit(uint32_t mask) {
+    switch (mask) {
+    case 0x001:
+    case 0x020:
+    case 0x040:
+    case 0x080:
+    case 0x100:
+    case 0x200: return 0;
+    case 0x006: return 0x004;
+    case 0x018: return 0x010;
+    default: return std::nullopt;
+    }
+}
+
+// IsUserSignedIn(user_index): the index's low byte
+const User *signed_in_user(Kernel &k, uint32_t index) { return user_at(k, uint8_t(index)); }
 
 // X_USER_PROFILE_SETTING (40): source, user_index or xuid (8), setting id,
 // X_USER_DATA (type at 0x18, value at 0x20); strings and binaries after the
@@ -227,16 +282,14 @@ XF_EXPORT(xam, XamUserAreUsersFriends) {
     result(c, r);
 }
 
-// (title_id, user_index, xuid_count, xuids, setting_count, setting_ids,
-// buffer_size_ptr, buffer, overlapped): X_USER_READ_PROFILE_SETTINGS (the
-// count, the settings' address), the settings, their strings and binaries
-XF_EXPORT(xam, XamUserReadProfileSettings) {
-    uint32_t title = arg(k, c, 0), index = arg(k, c, 1), xuid_count = arg(k, c, 2), xuids = arg(k, c, 3);
-    uint32_t count = arg(k, c, 4), ids = arg(k, c, 5), size_ptr = arg(k, c, 6), buffer = arg(k, c, 7);
-    uint32_t ov = arg(k, c, 8);
-    if (count < 1 || count > 32 || !size_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
+namespace {
+// XamUserReadProfileSettingsEx: X_USER_READ_PROFILE_SETTINGS (the count,
+// the settings' address), the settings, their strings and binaries
+uint32_t read_profile_settings(Kernel &k, uint32_t title, uint32_t index, uint32_t xuid_count, uint32_t xuids,
+                               uint32_t count, uint32_t ids, uint32_t size_ptr, uint32_t buffer, uint32_t ov) {
+    if (count < 1 || count > 32 || !size_ptr) return X_ERROR_INVALID_PARAMETER;
     uint32_t size = k.load32(size_ptr);
-    if (size && !buffer) return result(c, X_ERROR_INVALID_PARAMETER);
+    if (size && !buffer) return X_ERROR_INVALID_PARAMETER;
     uint32_t header = 0, data = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint32_t id = k.load32(ids + 4 * i);
@@ -247,7 +300,7 @@ XF_EXPORT(xam, XamUserReadProfileSettings) {
     uint32_t needed = header + 8 + data;
     if (!buffer || size < needed) {
         if (!size) k.store32(size_ptr, needed);
-        return result(c, X_ERROR_INSUFFICIENT_BUFFER);
+        return X_ERROR_INSUFFICIENT_BUFFER;
     }
     auto run = [&](uint32_t &extended_error, uint32_t &length) -> uint32_t {
         extended_error = 0, length = 0;
@@ -286,7 +339,24 @@ XF_EXPORT(xam, XamUserReadProfileSettings) {
         extended_error = 0;
         return X_ERROR_SUCCESS;
     };
-    result(c, run_or_defer(k, ov, run));
+    return run_or_defer(k, ov, run);
+}
+} // namespace
+
+// (title_id, user_index, xuid_count, xuids, setting_count, setting_ids,
+// buffer_size_ptr, buffer, overlapped)
+XF_EXPORT(xam, XamUserReadProfileSettings) {
+    result(c, read_profile_settings(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4),
+                                    arg(k, c, 5), arg(k, c, 6), arg(k, c, 7), arg(k, c, 8)));
+}
+
+// (title_id, user_index, xuid_count, xuids, setting_count, setting_ids,
+// buffer_size_ptr, other_buffer_size_ptr, buffer, overlapped): the size
+// through either pointer
+XF_EXPORT(xam, XamUserReadProfileSettingsEx) {
+    uint32_t size_ptr = arg(k, c, 6) ? arg(k, c, 6) : arg(k, c, 7);
+    result(c, read_profile_settings(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4),
+                                    arg(k, c, 5), size_ptr, arg(k, c, 8), arg(k, c, 9)));
 }
 
 // (title_id, user_index, setting_count, settings, overlapped): kept for the
@@ -363,6 +433,520 @@ XF_EXPORT(xam, XamUserGetDeviceContext) {
         return result(c, X_E_SUCCESS);
     }
     result(c, X_E_DEVICE_NOT_CONNECTED);
+}
+
+// (user_index, buffer, buffer_len): the gamertag, 16 wide characters at
+// most with the terminator
+XF_EXPORT(xam, XamUserGetGamerTag) {
+    uint32_t index = arg(k, c, 0), buffer = arg(k, c, 1), length = arg(k, c, 2);
+    if (!buffer || length < 16 || index >= 4) return result(c, X_E_INVALIDARG);
+    const User *u = signed_in_user(k, index);
+    if (!u) return result(c, X_E_NO_SUCH_USER);
+    put_u16(k, buffer, std::u16string(u->name.begin(), u->name.end()), std::min<uint32_t>(length, 16));
+    result(c, X_E_SUCCESS);
+}
+
+// ---- the account's flags (X_XAMACCOUNTINFO) ----
+
+namespace {
+constexpr uint32_t ACCOUNT_LIVE_ENABLED = 0x20000000, ACCOUNT_PARENTAL_CONTROL = 0x01000000;
+uint32_t tier_of(const User &u) { return (u.cached_flags & 0xF00000) >> 20; }
+uint32_t user_flags_of(const User &u) { return u.cached_flags | u.reserved_flags; }
+} // namespace
+
+XF_EXPORT(xam, XamUserIsOnlineEnabled) {
+    uint32_t index = arg(k, c, 0);
+    const User *u = index < 4 ? signed_in_user(k, index) : nullptr;
+    result(c, u && (u->reserved_flags & ACCOUNT_LIVE_ENABLED) ? 1 : 0);
+}
+
+// the subscription tier: none (0), silver (3), gold (6), family gold (9)
+XF_EXPORT(xam, XamUserGetMembershipTier) {
+    uint32_t index = arg(k, c, 0);
+    const User *u = index < 4 ? signed_in_user(k, index) : nullptr;
+    result(c, u ? tier_of(*u) : 0);
+}
+
+XF_EXPORT(xam, XamUserGetMembershipTierFromXUID) {
+    const User *u = user_by_xuid(k, arg64(k, c, 0));
+    result(c, u ? tier_of(*u) : 0);
+}
+
+XF_EXPORT(xam, XamUserGetCachedUserFlags) {
+    const User *u = signed_in_user(k, arg(k, c, 0));
+    result(c, u ? u->cached_flags : 0);
+}
+
+XF_EXPORT(xam, XamUserGetUserFlags) {
+    const User *u = signed_in_user(k, arg(k, c, 0));
+    result(c, u ? user_flags_of(*u) : 0);
+}
+
+XF_EXPORT(xam, XamUserGetUserFlagsFromXUID) {
+    const User *u = user_by_xuid(k, arg64(k, c, 0));
+    result(c, u ? user_flags_of(*u) : 0);
+}
+
+// a profile without a language or country of its own (an offline one) has
+// the console's
+XF_EXPORT(xam, XamUserGetOnlineLanguageFromXUID) {
+    const User *u = user_by_xuid(k, arg64(k, c, 0));
+    uint32_t language = u ? (u->cached_flags & 0x3E000000) >> 25 : 0;
+    result(c, language ? language : config_language(k));
+}
+
+XF_EXPORT(xam, XamUserGetOnlineCountryFromXUID) {
+    const User *u = user_by_xuid(k, arg64(k, c, 0));
+    uint32_t country = u ? (u->cached_flags & 0xFF00) >> 8 : 0;
+    result(c, country ? country : config_country(k));
+}
+
+// (user_index): the account's parental control flag (Xenia tests the
+// language's bits there; an offline account has neither)
+XF_EXPORT(xam, XamUserIsParentalControlled) {
+    const User *u = user_at(k, arg(k, c, 0));
+    result(c, u && (u->cached_flags & ACCOUNT_PARENTAL_CONTROL) ? 1 : 0);
+}
+
+// no guests sign in here
+XF_EXPORT(xam, XamUserIsGuest) { result(c, 0); }
+
+// (user_index, subscription_length_ptr, subscription_payment_ptr): the
+// dashboard's settings
+XF_EXPORT(xam, XamUserGetSubscriptionType) {
+    uint32_t index = arg(k, c, 0), length_ptr = arg(k, c, 1), payment_ptr = arg(k, c, 2);
+    if (index >= 4 || !length_ptr || !payment_ptr) return result(c, X_E_INVALIDARG);
+    if (!user_at(k, index)) return result(c, X_E_NO_SUCH_USER);
+    k.store32(length_ptr, uint32_t(dashboard_value(k, XPROFILE_SUBSCRIPTION_TYPE_LENGTH_IN_MONTHS)));
+    k.store32(payment_ptr, uint32_t(dashboard_value(k, XPROFILE_SUBSCRIPTION_PAYMENT_TYPE)));
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (user_index, tenure_level_ptr, milestone_ptr, milestone_date_ptr,
+// overlapped): the dashboard's settings
+XF_EXPORT(xam, XamUserGetUserTenure) {
+    uint32_t index = arg(k, c, 0), level_ptr = arg(k, c, 1), milestone_ptr = arg(k, c, 2);
+    uint32_t date_ptr = arg(k, c, 3), ov = arg(k, c, 4);
+    if (!signed_in_user(k, index)) return result(c, X_E_NO_SUCH_USER);
+    if (level_ptr) k.store32(level_ptr, uint32_t(dashboard_value(k, XPROFILE_TENURE_LEVEL)));
+    if (milestone_ptr) k.store32(milestone_ptr, uint32_t(dashboard_value(k, XPROFILE_TENURE_MILESTONE)));
+    if (date_ptr) k.store64(date_ptr, dashboard_value(k, XPROFILE_TENURE_NEXT_MILESTONE_DATE));
+    // Xenia leaves an overlapped alone; one completed here, as XAM's own
+    // asynchronous calls complete theirs
+    result(c, run_or_defer(k, ov, [](uint32_t &extended_error, uint32_t &length) {
+               extended_error = 0, length = 0;
+               return X_ERROR_SUCCESS;
+           }));
+}
+
+// ---- restrictions ----
+
+// (user_index, pc_check, result_ptr): allowed
+XF_EXPORT(xam, XamUserIsUnsafeProgrammingAllowed) {
+    uint32_t index = arg(k, c, 0), result_ptr = arg(k, c, 2);
+    if (!result_ptr || (index != USER_INDEX_ANY && index >= 4)) return result(c, X_ERROR_INVALID_PARAMETER);
+    k.store32(result_ptr, 1);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (user_index, out_flags): none
+XF_EXPORT(xam, XamUserContentRestrictionGetFlags) {
+    uint32_t index = arg(k, c, 0), flags_ptr = arg(k, c, 1);
+    if (index >= 4 && index != USER_INDEX_ANY) return result(c, X_ERROR_INVALID_PARAMETER);
+    if (!signed_in_user(k, index)) return result(c, X_ERROR_NO_SUCH_USER);
+    if (flags_ptr) k.store32(flags_ptr, 0);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (user_index, content_type, out_rating, out_unknown): 0x3F, which games
+// take for "any"; content type 0 has no rating
+XF_EXPORT(xam, XamUserContentRestrictionGetRating) {
+    uint32_t index = arg(k, c, 0), type = arg(k, c, 1), rating_ptr = arg(k, c, 2), other_ptr = arg(k, c, 3);
+    if (!type) return result(c, X_ERROR_NOT_FOUND);
+    if (!signed_in_user(k, index)) return result(c, X_ERROR_NO_SUCH_USER);
+    if (rating_ptr) k.store32(rating_ptr, 0x3F);
+    if (other_ptr) k.store32(other_ptr, 0);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (user_index, unknown, content_type, unknown, unknown, out_access,
+// overlapped): allowed; content type 0 at once even with an overlapped,
+// which stays untouched
+XF_EXPORT(xam, XamUserContentRestrictionCheckAccess) {
+    uint32_t type = arg(k, c, 2), access_ptr = arg(k, c, 5), ov = arg(k, c, 6);
+    if (access_ptr) k.store32(access_ptr, 1);
+    if (ov && type) {
+        complete_overlapped_immediate(k, ov, X_ERROR_SUCCESS);
+        return result(c, X_ERROR_IO_PENDING);
+    }
+    result(c, X_ERROR_SUCCESS);
+}
+
+// ---- preferences (UserTracker::ReadUserPreference, WriteUserPreference):
+// bit fields of the dashboard's XPROFILE_USER_PREFERENCES ----
+
+// (user_index, mask, value_ptr, overlapped)
+XF_EXPORT(xam, XamUserReadUserPreference) {
+    uint32_t index = arg(k, c, 0), mask = arg(k, c, 1), value_ptr = arg(k, c, 2), ov = arg(k, c, 3);
+    if (index >= 4 || !value_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
+    result(c, run_or_defer(k, ov, [&](uint32_t &extended_error, uint32_t &length) -> uint32_t {
+               length = 0;
+               if (!user_at(k, index)) {
+                   extended_error = X_E_NO_SUCH_USER;
+                   return X_ERROR_FUNCTION_FAILED;
+               }
+               std::optional<uint32_t> written = preference_written_bit(mask);
+               if (!written) {
+                   extended_error = X_E_INVALIDARG;
+                   return X_ERROR_FUNCTION_FAILED;
+               }
+               uint32_t value = uint32_t(dashboard_value(k, XPROFILE_USER_PREFERENCES)) & mask;
+               extended_error = X_E_SUCCESS;
+               if (*written) {
+                   if ((value & *written) != *written)
+                       extended_error = 1; // S_FALSE: never written, the bits as they are
+                   else
+                       value &= ~*written;
+               }
+               k.store32(value_ptr, value);
+               return X_ERROR_SUCCESS;
+           }));
+}
+
+// (user_index, mask, value, overlapped): the bits and the field's written
+// bit; ProfileSettingChanged for the user
+XF_EXPORT(xam, XamUserWriteUserPreference) {
+    uint32_t index = arg(k, c, 0), mask = arg(k, c, 1), value = arg(k, c, 2), ov = arg(k, c, 3);
+    if (index >= 4) return result(c, X_ERROR_INVALID_PARAMETER);
+    result(c, run_or_defer(k, ov, [&](uint32_t &extended_error, uint32_t &length) -> uint32_t {
+               length = 0;
+               if (!user_at(k, index)) {
+                   extended_error = X_E_NO_SUCH_USER;
+                   return X_ERROR_FUNCTION_FAILED;
+               }
+               std::optional<uint32_t> written = preference_written_bit(mask);
+               if (!written || (mask | value) != mask || (value & *written)) {
+                   extended_error = X_E_INVALIDARG;
+                   return X_ERROR_FUNCTION_FAILED;
+               }
+               uint32_t preferences = uint32_t(dashboard_value(k, XPROFILE_USER_PREFERENCES));
+               Setting v;
+               v.source = 2;
+               put_be32(v.value, (preferences & ~mask) | value | *written);
+               {
+                   UserState &s = users(k);
+                   std::lock_guard<std::mutex> l(s.mutex);
+                   s.written[{DASHBOARD_ID, XPROFILE_USER_PREFERENCES}] = v;
+               }
+               broadcast(k, XN_SYS_PROFILESETTINGCHANGED, 1u << index);
+               extended_error = X_E_SUCCESS;
+               return X_ERROR_SUCCESS;
+           }));
+}
+
+// ---- signing in and out (ProfileManager::Login, Logout) ----
+
+namespace {
+constexpr uint32_t LOGON_FORCE_LIVE_LOG_OFF = 0x2, LOGON_ADD_USER = 0x4, LOGON_REMOVE_USER = 0x8;
+
+void logout(Kernel &k) {
+    if (set_signed_in(k, false)) broadcast(k, XN_SYS_SIGNINCHANGED, 0);
+}
+
+// a known account to its slot (the one user to slot 0); signed in already,
+// it is signed out first
+void login(Kernel &k, uint64_t xuid) {
+    if (xuid != user_profile(k).xuid) return;
+    logout(k);
+    set_signed_in(k, true);
+    broadcast(k, XN_SYS_SIGNINCHANGED, 1);
+}
+} // namespace
+
+// (xuids (4), flags, overlapped)
+XF_EXPORT(xam, XamUserLogon) {
+    uint32_t xuids_ptr = arg(k, c, 0), flags = arg(k, c, 1), ov = arg(k, c, 2);
+    if (!xuids_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
+    uint64_t xuids[4];
+    for (uint32_t i = 0; i < 4; i++) xuids[i] = k.load64(xuids_ptr + 8 * i);
+    result(c, run_or_defer(k, ov, [&](uint32_t &extended_error, uint32_t &length) -> uint32_t {
+               if (flags & LOGON_ADD_USER)
+                   for (uint64_t xuid : xuids)
+                       if (xuid) login(k, xuid);
+               if (flags & LOGON_REMOVE_USER)
+                   for (uint64_t xuid : xuids)
+                       if (xuid && user_by_xuid(k, xuid)) logout(k);
+               if (flags & LOGON_FORCE_LIVE_LOG_OFF) logout(k);
+               extended_error = 0, length = 0;
+               return X_ERROR_SUCCESS;
+           }));
+}
+
+// (X_PROFILEENUMRESULT *, flags, overlapped): accepted (Xenia's stub)
+XF_EXPORT(xam, XamUserLogonEx) {
+    result(c, run_or_defer(k, arg(k, c, 2), [](uint32_t &extended_error, uint32_t &length) {
+               extended_error = 0, length = 0;
+               return X_ERROR_SUCCESS;
+           }));
+}
+
+// ---- the titles played (XTitleEnumerator) ----
+
+// (title_id, user_index, xuid, starting_index, game_count, buffer_size_ptr,
+// handle_ptr): XTITLE_PLAYED (0xA8) items; the titles the dashboard's
+// records list, none here (there are no records)
+XF_EXPORT(xam, XamUserCreateTitlesPlayedEnumerator) {
+    uint32_t index = arg(k, c, 1), count = arg(k, c, 4), size_ptr = arg(k, c, 5), handle_ptr = arg(k, c, 6);
+    if (index >= 4 || !count || !size_ptr || !handle_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
+    if (!user_at(k, index)) return result(c, X_ERROR_FUNCTION_FAILED);
+    k.store32(size_ptr, count * 0xA8);
+    Ref<Enumerator> e = make_enumerator(k, index, 0xFB, 0xB0050, 0xB000B, 0, count, 0xA8, 0x28);
+    if (!e) return result(c, X_STATUS_NO_MEMORY);
+    k.store32(handle_ptr, e->handle());
+    result(c, X_ERROR_SUCCESS);
+}
+
+// ---- Kinect (xam_nui.cc): none ----
+
+XF_EXPORT(xam, XamUserNuiGetUserIndex) { result(c, X_E_NO_SUCH_USER); }
+
+// (user_index_ptr): the first user signed in
+XF_EXPORT(xam, XamUserNuiGetUserIndexForSignin) {
+    uint32_t index_ptr = arg(k, c, 0);
+    if (!index_ptr) return result(c, X_E_INVALIDARG);
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!user_at(k, i)) continue;
+        k.store32(index_ptr, i);
+        return result(c, X_E_SUCCESS);
+    }
+    result(c, X_E_FAIL);
+}
+
+XF_EXPORT(xam, XamUserNuiGetUserIndexForBind) { result(c, arg(k, c, 0) ? X_E_FAIL : X_E_INVALIDARG); }
+XF_EXPORT(xam, XamUserNuiEnableBiometric) { result(c, X_E_INVALIDARG); }
+
+// ---- profiles (xam_profile.cc, xam_enum.cc; ProfileManager) ----
+
+namespace {
+
+constexpr uint32_t ACCOUNT_SIZE = 0x17C;           // X_XAMACCOUNTINFO
+constexpr uint32_t CREATION_INFO_SIZE = 0xAC0;     // X_PROFILE_CREATION_INFO
+constexpr uint32_t PROFILE_CONTENT_TYPE = 0x10000; // XContentType::kProfile
+
+struct ProfileMount {
+    std::string name, device_path;
+};
+
+// The accounts (ProfileManager's): the user's and those XamProfileCreate
+// made, kept for the run (no Account file is written); the profiles
+// mounted by XamProfileOpen.
+struct ProfileState {
+    std::mutex mutex;
+    std::map<uint64_t, std::vector<uint8_t>> created;
+    std::vector<ProfileMount> mounts;
+    uint32_t next_device = 0;
+};
+
+ProfileState &profiles(Kernel &k) { return k.state<ProfileState>(); }
+
+// the user's X_XAMACCOUNTINFO: flags, the gamertag (16 wide characters),
+// the online XUID (none offline), the cached flags
+std::vector<uint8_t> user_account(const User &u) {
+    std::vector<uint8_t> a(ACCOUNT_SIZE, 0);
+    put_be32(a.data(), u.reserved_flags);
+    for (size_t i = 0; i < u.name.size() && i < 15; i++) a[8 + 2 * i + 1] = uint8_t(u.name[i]);
+    put_be32(a.data() + 0x30, u.cached_flags);
+    return a;
+}
+
+std::map<uint64_t, std::vector<uint8_t>> accounts(Kernel &k) {
+    ProfileState &s = profiles(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    std::map<uint64_t, std::vector<uint8_t>> all = s.created;
+    all[user_profile(k).xuid] = user_account(user_profile(k));
+    return all;
+}
+
+std::string hex16(uint64_t xuid) {
+    char text[20];
+    std::snprintf(text, sizeof(text), "%016llX", static_cast<unsigned long long>(xuid));
+    return text;
+}
+
+// ProfileManager::GetProfilePath: content/<XUID>/FFFE07D1/00010000/<XUID>
+std::filesystem::path profile_path(Kernel &k, uint64_t xuid) {
+    return content_root(k) / hex16(xuid) / "FFFE07D1" / "00010000" / hex16(xuid);
+}
+
+bool same_name(std::string_view a, std::string_view b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
+               return std::tolower(uint8_t(x)) == std::tolower(uint8_t(y));
+           });
+}
+
+// GenerateXuid: an offline XUID, E03 and 31 random bits
+uint64_t generate_xuid() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    return (uint64_t(0xE03) << 52) + (gen() % (1u << 31));
+}
+
+} // namespace
+
+// (xuid, account_ptr, device_id_ptr): the account and its device (the
+// hard drive)
+XF_EXPORT(xam, XamProfileFindAccount) {
+    uint64_t xuid = arg64(k, c, 0);
+    uint32_t account_ptr = arg(k, c, 1), device_ptr = arg(k, c, 2);
+    if (!account_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
+    std::memset(k.host(account_ptr), 0, ACCOUNT_SIZE);
+    auto all = accounts(k);
+    auto it = all.find(xuid);
+    if (it == all.end()) return result(c, X_ERROR_NO_SUCH_USER);
+    std::memcpy(k.host(account_ptr), it->second.data(), ACCOUNT_SIZE);
+    if (device_ptr) k.store32(device_ptr, 1);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (device_id, xuid, account_ptr)
+XF_EXPORT(xam, XamProfileLoadAccountInfo) {
+    uint64_t xuid = arg64(k, c, 1);
+    uint32_t account_ptr = arg(k, c, 2);
+    if (!account_ptr || !xuid) return result(c, X_ERROR_INVALID_PARAMETER);
+    auto all = accounts(k);
+    auto it = all.find(xuid);
+    if (it == all.end()) return result(c, X_ERROR_INVALID_PARAMETER);
+    std::memcpy(k.host(account_ptr), it->second.data(), ACCOUNT_SIZE);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (xuid, mount_path, flags, XCONTENT_DATA_AGGREGATE *): the profile's
+// package mounted (as User_<XUID> with no path) and described
+XF_EXPORT(xam, XamProfileOpen) {
+    uint64_t xuid = arg64(k, c, 0);
+    uint32_t mount_ptr = arg(k, c, 1), data_ptr = arg(k, c, 3);
+    std::string name = mount_ptr ? std::string(reinterpret_cast<const char *>(k.host(mount_ptr))) : "";
+    if (name.empty()) name = "User_" + hex16(xuid);
+    std::filesystem::path path = profile_path(k, xuid);
+    std::error_code ec;
+    if (content_root(k).empty() || !std::filesystem::is_directory(path, ec))
+        return result(c, X_ERROR_INVALID_PARAMETER);
+    {
+        ProfileState &s = profiles(k);
+        std::lock_guard<std::mutex> l(s.mutex);
+        ProfileMount m{name, "\\Device\\Profile\\" + std::to_string(++s.next_device)};
+        auto device = vfs::make_host_device(m.device_path, path, false, true);
+        vfs::FileSystem &fs = file_system(k);
+        if (!device || !fs.add_link(name + ":", m.device_path)) return result(c, X_ERROR_INVALID_PARAMETER);
+        fs.add_device(device);
+        s.mounts.push_back(m);
+    }
+    if (data_ptr) {
+        // XCONTENT_DATA: device, type, display name, file name (42); then
+        // the XUID and the title (the dashboard's)
+        k.store32(data_ptr + 0x0, 1);
+        k.store32(data_ptr + 0x4, PROFILE_CONTENT_TYPE);
+        std::string file = hex16(xuid);
+        std::memset(k.host(data_ptr + 0x108), 0, 42);
+        std::memcpy(k.host(data_ptr + 0x108), file.data(), file.size());
+        k.store32(data_ptr + 0x140, DASHBOARD_ID);
+    }
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (mount_name): what XamProfileOpen mounted
+XF_EXPORT(xam, XamProfileClose) {
+    uint32_t name_ptr = arg(k, c, 0);
+    std::string name = name_ptr ? reinterpret_cast<const char *>(k.host(name_ptr)) : "";
+    ProfileState &s = profiles(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    auto it =
+        std::find_if(s.mounts.begin(), s.mounts.end(), [&](const ProfileMount &m) { return same_name(m.name, name); });
+    if (it == s.mounts.end()) return result(c, X_ERROR_FUNCTION_FAILED);
+    vfs::FileSystem &fs = file_system(k);
+    fs.remove_link(it->name + ":");
+    fs.remove_device(it->device_path);
+    s.mounts.erase(it);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (flags, device_id_ptr, xuid, account, payment_info, user_token,
+// owner_token, profile_info_ptr): X_PROFILE_CREATION_INFO in the system
+// heap, and the profile's directory and account (Xenia does it at once
+// too; the console schedules a task)
+XF_EXPORT(xam, XamProfileCreate) {
+    uint32_t flags = arg(k, c, 0), device_ptr = arg(k, c, 1);
+    uint64_t xuid = arg64(k, c, 2);
+    uint32_t account = arg(k, c, 3), payment = arg(k, c, 4), user_token = arg(k, c, 5);
+    uint32_t owner_token = arg(k, c, 6), info_ptr = arg(k, c, 7);
+    uint32_t info = k.memory().system_alloc(CREATION_INFO_SIZE);
+    if (!info) return result(c, X_ERROR_NOT_ENOUGH_MEMORY);
+    std::memset(k.host(info), 0, CREATION_INFO_SIZE);
+    if (info_ptr) k.store32(info_ptr, info);
+    // flags, device, account (0x8), payment (0x184), offline XUID (0xA78),
+    // the tokens (0xA80, 0xA9C)
+    k.store32(info, flags & 0x7FFFFFFF);
+    if (device_ptr) {
+        k.store32(device_ptr, 1);
+        k.store32(info + 4, 1);
+    }
+    if (!xuid) xuid = generate_xuid();
+    k.store64(info + 0xA78, xuid);
+    if (account) std::memcpy(k.host(info + 0x8), k.host(account), ACCOUNT_SIZE);
+    if (payment) std::memcpy(k.host(info + 0x184), k.host(payment), 0x8F0);
+    if (user_token) std::memcpy(k.host(info + 0xA80), k.host(user_token), 0x1C);
+    if (owner_token) std::memcpy(k.host(info + 0xA9C), k.host(owner_token), 0x1C);
+    // ProfileManager::CreateProfile: a new directory, else it fails
+    std::error_code ec;
+    if (content_root(k).empty() || !std::filesystem::create_directories(profile_path(k, xuid), ec))
+        return result(c, X_ERROR_INVALID_PARAMETER);
+    ProfileState &s = profiles(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    s.created[xuid].assign(k.host(info + 0x8), k.host(info + 0x8) + ACCOUNT_SIZE);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (profile_info, offline_xuid_ptr): the XUID, and the creation info freed
+XF_EXPORT(xam, XamProfileGetCreationStatus) {
+    uint32_t info = arg(k, c, 0), xuid_ptr = arg(k, c, 1);
+    if (!info) return result(c, X_ERROR_SUCCESS);
+    if (xuid_ptr) k.store64(xuid_ptr, k.load64(info + 0xA78));
+    k.memory().system_free(info);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (device_id, handle_ptr): the accounts, X_PROFILEENUMRESULT (0x188: the
+// XUID, the account, the device) one a call
+XF_EXPORT(xam, XamProfileCreateEnumerator) {
+    uint32_t handle_ptr = arg(k, c, 1);
+    if (!handle_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
+    Ref<Enumerator> e = make_enumerator(k, USER_INDEX_ANY, 0xFE, 0x23001, 0x23003, 0, 1, 0x188, 0x28);
+    if (!e) return result(c, X_STATUS_NO_MEMORY);
+    for (const auto &[xuid, account] : accounts(k)) {
+        uint8_t *item = e->append();
+        for (int i = 0; i < 8; i++) item[i] = uint8_t(xuid >> (56 - 8 * i));
+        std::memcpy(item + 8, account.data(), ACCOUNT_SIZE);
+        put_be32(item + 8 + ACCOUNT_SIZE, 1);
+    }
+    k.store32(handle_ptr, e->handle());
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (handle, flags, buffer, overlapped): xeXamEnumerate with no buffer size
+// (the profile enumerator writes regardless)
+XF_EXPORT(xam, XamProfileEnumerate) {
+    uint32_t handle = arg(k, c, 0), buffer = arg(k, c, 2), ov = arg(k, c, 3);
+    Ref<Enumerator> e = objects(k).lookup<Enumerator>(handle);
+    if (!e) return result(c, X_ERROR_INVALID_HANDLE);
+    auto run = [&](uint32_t &extended_error, uint32_t &length) {
+        uint32_t count = 0;
+        uint32_t r = buffer ? e->write_items(k, buffer, UINT32_MAX, count) : X_ERROR_INVALID_PARAMETER;
+        extended_error = hresult_from_win32(r);
+        length = count;
+        if (r && ov) r = X_ERROR_FUNCTION_FAILED;
+        return r;
+    };
+    result(c, run_or_defer(k, ov, run));
 }
 
 // (input: xam_input.cpp)
