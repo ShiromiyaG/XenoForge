@@ -288,9 +288,11 @@ traces, without a recompiled game.
   `player_<game>` links the game's generated code as `boot_<game>` does
   and shares boot's opening, launch and report (`tools/game.cpp`); SDL3,
   Dear ImGui and toml++ are fetched only when it is built. The window shows
-  the front buffer the renderer reads back at each swap, through a Vulkan
-  swapchain on a device of its own, letterboxed; the guest never waits for
-  it (a front buffer is read back only when the window took the last one).
+  each swap's front buffer through a Vulkan swapchain on the renderer's
+  own device, letterboxed, the picture made on the GPU at the swap and
+  never read back (since 2026-11-05: before, it was read back and made a
+  picture on the CPU, on a device of its own, which slowed El Chavo Kart's
+  start to about 15 frames a second); the guest never waits for it.
   XAM's input exports answer from drivers in Xenia's order: SDL3's
   gamepads as Xenia's SDL driver, then the keyboard as a controller with
   Xenia's bindings (config.toml); boot answers from an idle pad for user 0
@@ -321,8 +323,9 @@ that a pad and the keyboard move things, and that the sound is right.
 Then, in order:
 1. Play both games through: what they ask of the kernel and the renderer
    past the menus (races, levels, saves).
-2. The player presents the front buffer on the GPU (renderer.md,
-   "Decisions"), instead of the picture read back at each swap.
+2. ~~The player presents the front buffer on the GPU~~ (done 2026-11-05:
+   renderer.md, "Decisions"; runtime.md, "The player"). FFmpeg is loaded
+   at run time and the player has a package to ship (runtime.md, "Sound").
 3. The other six games under the renderer, against Xenia's traces.
 4. The kernel families they reach first. Done for the first two: the
    network offline (NetDll_*, XNet; Gears of War 3 polls its socket once a

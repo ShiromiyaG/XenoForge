@@ -1,4 +1,4 @@
-// The renderer's windowless Vulkan 1.3 device.
+// The renderer's Vulkan 1.3 device, windowless or presenting to a window (vk_device.h).
 
 #include "xenoforge/vk_device.h"
 
@@ -12,13 +12,17 @@ namespace {
 std::string failed(const char *what, VkResult r) { return std::string(what) + " failed (" + std::to_string(r) + ")"; }
 } // namespace
 
-std::unique_ptr<Device> Device::open(std::string &error) {
+std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     std::unique_ptr<Device> d(new Device());
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "xenoforge";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
+    if (window) {
+        instance_info.enabledExtensionCount = uint32_t(window->instance_extensions.size());
+        instance_info.ppEnabledExtensionNames = window->instance_extensions.data();
+    }
     const char *validation = "VK_LAYER_KHRONOS_validation";
     const char *env = std::getenv("XF_VK_VALIDATION");
     if (env && env[0] == '1') {
@@ -29,12 +33,20 @@ std::unique_ptr<Device> Device::open(std::string &error) {
         error = failed("vkCreateInstance", r);
         return nullptr;
     }
+    if (window) {
+        d->surface_ = window->make_surface ? window->make_surface(d->instance_) : VK_NULL_HANDLE;
+        if (!d->surface_) {
+            error = "no surface for the window";
+            return nullptr;
+        }
+    }
 
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(d->instance_, &count, nullptr);
     std::vector<VkPhysicalDevice> devices(count);
     vkEnumeratePhysicalDevices(d->instance_, &count, devices.data());
     int best = -1;
+    uint32_t queues = 1; // in the family chosen
     for (VkPhysicalDevice p : devices) {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(p, &props);
@@ -45,15 +57,22 @@ std::unique_ptr<Device> Device::open(std::string &error) {
         vkGetPhysicalDeviceQueueFamilyProperties(p, &families, fp.data());
         for (uint32_t f = 0; f < families; f++) {
             if (!(fp[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+            if (d->surface_) {
+                VkBool32 presents = VK_FALSE;
+                vkGetPhysicalDeviceSurfaceSupportKHR(p, f, d->surface_, &presents);
+                if (!presents) continue;
+            }
             int score = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
             if (score > best) {
                 best = score, d->physical_ = p, d->family_ = f, d->name_ = props.deviceName;
+                queues = fp[f].queueCount;
             }
             break;
         }
     }
     if (!d->physical_) {
-        error = "no Vulkan 1.3 device with a graphics queue";
+        error = d->surface_ ? "no Vulkan 1.3 device with a graphics queue that presents to the window"
+                            : "no Vulkan 1.3 device with a graphics queue";
         return nullptr;
     }
     vkGetPhysicalDeviceMemoryProperties(d->physical_, &d->memory_);
@@ -69,6 +88,10 @@ std::unique_ptr<Device> Device::open(std::string &error) {
         error = std::string(d->name_) + " cannot update sampled image descriptors after binding (descriptor indexing)";
         return nullptr;
     }
+    if (!has12.timelineSemaphore) {
+        error = std::string(d->name_) + " has no timeline semaphores";
+        return nullptr;
+    }
 
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.dynamicRendering = VK_TRUE;
@@ -82,6 +105,7 @@ std::unique_ptr<Device> Device::open(std::string &error) {
     v12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     v12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
     v12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    v12.timelineSemaphore = VK_TRUE;
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &v12;
     features.features.geometryShader = VK_TRUE;
@@ -92,11 +116,13 @@ std::unique_ptr<Device> Device::open(std::string &error) {
     features.features.fragmentStoresAndAtomics = VK_TRUE;
     features.features.vertexPipelineStoresAndAtomics = VK_TRUE;
     features.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
-    float priority = 1.0f;
+    // the renderer's queue, and with a window a second one to present on
+    // where the family has it
+    const float priorities[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue_info.queueFamilyIndex = d->family_;
-    queue_info.queueCount = 1;
-    queue_info.pQueuePriorities = &priority;
+    queue_info.queueCount = d->surface_ && queues >= 2 ? 2 : 1;
+    queue_info.pQueuePriorities = priorities;
     uint32_t extension_count = 0;
     vkEnumerateDeviceExtensionProperties(d->physical_, nullptr, &extension_count, nullptr);
     std::vector<VkExtensionProperties> extensions(extension_count);
@@ -105,6 +131,7 @@ std::unique_ptr<Device> Device::open(std::string &error) {
     for (const VkExtensionProperties &e : extensions)
         if (std::strcmp(e.extensionName, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME) == 0) d->stencil_export_ = true;
     if (d->stencil_export_) enabled.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+    if (d->surface_) enabled.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     device_info.pNext = &features;
     device_info.enabledExtensionCount = uint32_t(enabled.size());
@@ -116,6 +143,8 @@ std::unique_ptr<Device> Device::open(std::string &error) {
         return nullptr;
     }
     vkGetDeviceQueue(d->device_, d->family_, 0, &d->queue_);
+    d->present_queue_ = d->queue_;
+    if (queue_info.queueCount == 2) vkGetDeviceQueue(d->device_, d->family_, 1, &d->present_queue_);
     VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool.queueFamilyIndex = d->family_;
@@ -132,6 +161,7 @@ Device::~Device() {
         vkDestroyCommandPool(device_, pool_, nullptr);
         vkDestroyDevice(device_, nullptr);
     }
+    if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);
 }
 

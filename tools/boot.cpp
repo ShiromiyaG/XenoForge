@@ -26,13 +26,16 @@
 // leaves every user disconnected. --press start@40 (repeatable; game.h)
 // holds buttons at times on the scheduler's clock. What boot shares with the
 // player (opening the game, the renderer, the launch, the report) is in
-// game.cpp.
+// game.cpp. --rates prints a line a second (the swaps, the scheduler's
+// clock, the renderer's time), as the player's --rates does.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--no-controller] [--press <b@s>]...
+//        [--rates]
 
 #include "game.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -48,14 +51,14 @@ using namespace xf;
 int main(int argc, char **argv) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--render [--shots <dir> [--shot-swaps <list>] "
-                        "[--shot-every N]]] [--no-controller] [--press <buttons@seconds[:hold]>]...\n";
+                        "[--shot-every N]]] [--no-controller] [--press <buttons@seconds[:hold]>]... [--rates]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
     std::error_code ec;
     o.storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
     uint32_t seconds = 30;
-    bool rendering = false, controller = true;
+    bool rendering = false, controller = true, rates = false;
     std::vector<game::Press> presses;
     std::filesystem::path shots;
     std::set<uint64_t> shot_swaps;
@@ -83,6 +86,8 @@ int main(int argc, char **argv) {
             shot_every = std::strtoull(argv[++k], nullptr, 10);
         else if (a == "--no-controller")
             controller = false;
+        else if (a == "--rates")
+            rates = true;
         else if (a == "--press" && k + 1 < argc) {
             std::string why;
             if (!game::parse_press(argv[++k], presses.emplace_back(), why))
@@ -129,8 +134,15 @@ int main(int argc, char **argv) {
     // until the main thread ends, the code hits what cannot run, or time is up
     uint32_t exit_code = 0;
     bool ended = false;
-    for (uint32_t ms = 0; ms < seconds * 1000 && !k.stopped; ms += 100)
+    // (on the host's clock: a wait may end early)
+    game::Rates rate_log;
+    const auto started = std::chrono::steady_clock::now();
+    double next_rates = 1;
+    for (double elapsed = 0; elapsed < seconds && !k.stopped;) {
         if ((ended = k.wait_main(100, &exit_code))) break;
+        elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (rates && elapsed >= next_rates) game::print_rates(g, rate_log, elapsed), next_rates += 1;
+    }
 
     if (k.stopped)
         std::printf("stopped: %s\n", k.stop_reason.c_str());

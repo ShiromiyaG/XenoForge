@@ -1,0 +1,41 @@
+#version 450
+// A front buffer made the window's picture on the GPU (presenter.cpp), at the
+// swap, as the renderer's read-back makes it on the CPU (renderer.cpp,
+// deliver; Xenia's presenter): the fetch constant's swizzle, opaque, each
+// component to 8 bits and through the display's 256-entry gamma ramp (10 bits
+// a component, red highest), the 10 bits given back to 8.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D front;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D picture;
+layout(set = 0, binding = 2, std140) uniform Ramp {
+    uvec4 ramp[64]; // entry i at ramp[i / 4][i % 4]
+};
+
+layout(push_constant) uniform Push {
+    uvec2 size;
+    uint swizzle;    // 3 bits a component: 0-3 the texel's, 4 zero, 5 one
+    uint components; // the front buffer's host format's
+    uint gamma;      // the 256-entry ramp applies (not to 2_10_10_10 front buffers)
+} pc;
+
+void main() {
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(at, pc.size))) return;
+    vec4 texel = texelFetch(front, ivec2(at), 0);
+    uvec3 v;
+    for (int c = 0; c < 3; c++) {
+        uint guest = (pc.swizzle >> (3 * c)) & 7u;
+        float value = guest == 5u ? 1.0 : guest >= 4u ? 0.0 : texel[min(guest, pc.components - 1u)];
+        v[c] = uint(clamp(value, 0.0, 1.0) * 255.0 + 0.5);
+    }
+    if (pc.gamma != 0u) {
+        for (int c = 0; c < 3; c++) {
+            uint entry = ramp[v[c] >> 2][v[c] & 3u];
+            uint ten = (entry >> (c == 0 ? 20 : c == 1 ? 10 : 0)) & 0x3FFu;
+            v[c] = (ten * 255u + 511u) / 1023u;
+        }
+    }
+    imageStore(picture, ivec2(at), vec4(vec3(v) / 255.0, 1.0));
+}

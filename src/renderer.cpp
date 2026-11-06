@@ -461,6 +461,12 @@ public:
     ~Impl() override;
 
     bool init(std::string &error);
+    // Vulkan's pipeline cache, on disk where the options say (see
+    // open_pipeline_cache)
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    uint64_t pipelines_saved_ = 0, last_pipeline_swap_ = 0;
+    void open_pipeline_cache();
+    void save_pipeline_cache();
 
     // ---- the Sink: the processor's calls, on its thread ----
     void shader(uint32_t type, uint32_t, std::span<const uint32_t> code) override {
@@ -526,6 +532,7 @@ public:
     void drain() override {
         Call call(*this, nullptr);
         if (call) sync();
+        save_pipeline_cache();
     }
 
 private:
@@ -563,7 +570,8 @@ private:
     void resolve();
     void gpu_resolve(const resolve::Info &info, RenderTarget &source);
     void swap();
-    void read_front_buffer(uint64_t number);
+    Texture *front_texture(texture::Info &info);
+    void read_front_buffer(uint64_t number, Texture &t, const texture::Info &info);
     void deliver(const FrontRead &read);
     void skip(const std::string &reason) {
         report_.skipped[reason]++;
@@ -770,6 +778,8 @@ private:
 
 Impl::~Impl() {
     vkDeviceWaitIdle(dev_);
+    save_pipeline_cache();
+    if (pipeline_cache_) vkDestroyPipelineCache(dev_, pipeline_cache_, nullptr);
     for (Slot &s : slots_) {
         for (auto &f : s.after) f();
         for (vk::Buffer &b : s.readbacks) d_.destroy(b);
@@ -829,12 +839,64 @@ VkPipeline Impl::compute_pipeline(const uint32_t *words, size_t bytes, VkPipelin
     c.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
     c.layout = layout;
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &c, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(dev_, pipeline_cache_, 1, &c, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
     vkDestroyShaderModule(dev_, m, nullptr);
     return p;
 }
 
+// ---- the pipeline cache ----
+
+// Vulkan's pipeline cache, made from the file the options name when it is
+// there (Vulkan checks the data's header against the device and the driver
+// and starts empty on a mismatch), and given to every pipeline made: a
+// game's pipelines are compiled by the driver once, not at each run (El Chavo
+// Kart's title screen made 24 in its first frame, 2.5 s on this thread).
+void Impl::open_pipeline_cache() {
+    std::vector<char> data;
+    if (!options_.pipeline_cache.empty()) {
+        if (FILE *f = std::fopen(options_.pipeline_cache.string().c_str(), "rb")) {
+            char chunk[65536];
+            for (size_t n; (n = std::fread(chunk, 1, sizeof(chunk), f)) > 0;) data.insert(data.end(), chunk, chunk + n);
+            std::fclose(f);
+        }
+    }
+    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(dev_, &info, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+        info.initialDataSize = 0, info.pInitialData = nullptr; // unreadable data: an empty cache
+        if (vkCreatePipelineCache(dev_, &info, nullptr, &pipeline_cache_) != VK_SUCCESS) pipeline_cache_ = VK_NULL_HANDLE;
+        data.clear();
+    }
+    report_.pipeline_cache_read = data.size();
+}
+
+// The cache written to its file (through a temporary file renamed over it,
+// so a run cut short leaves the last whole one) when pipelines were made
+// since the last time
+void Impl::save_pipeline_cache() {
+    if (!pipeline_cache_ || options_.pipeline_cache.empty() || pipelines_saved_ == report_.pipelines) return;
+    size_t size = 0;
+    if (vkGetPipelineCacheData(dev_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) return;
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(dev_, pipeline_cache_, &size, data.data()) != VK_SUCCESS) return;
+    std::error_code ec;
+    std::filesystem::create_directories(options_.pipeline_cache.parent_path(), ec);
+    std::filesystem::path temporary = options_.pipeline_cache;
+    temporary += ".new";
+    FILE *f = std::fopen(temporary.string().c_str(), "wb");
+    if (!f) return;
+    const bool written = std::fwrite(data.data(), 1, size, f) == size;
+    std::fclose(f);
+    if (!written) return;
+    std::filesystem::rename(temporary, options_.pipeline_cache, ec);
+    if (ec) return;
+    pipelines_saved_ = report_.pipelines;
+    report_.pipeline_cache_written = size;
+}
+
 bool Impl::init(std::string &error) {
+    open_pipeline_cache();
     VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props.pNext = &p12;
@@ -1694,7 +1756,7 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     info.pDynamicState = &dynamic;
     info.layout = edram_layouts_[1];
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
     return load_pipelines_[key] = p;
 }
 
@@ -2066,8 +2128,12 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second;
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    {
+        Timer timer(report_.pipeline_seconds);
+        if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+    }
     report_.pipelines++;
+    last_pipeline_swap_ = report_.swaps;
     return pipelines_[key] = p;
 }
 
@@ -2856,49 +2922,67 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
 // ---- the swap: texture fetch constant 0, as Xenia's RequestSwapTexture ----
 
 // Swaps are numbered from 0; the front buffer is read back for the ones the
-// options ask for. The frame's work goes to the GPU.
-//
-// A presenter on the renderer's device could take the front buffer without
-// the read-back: texture(fetch constant 0) gives its image (in the general
-// layout, its view with the guest's swizzle), loaded on the GPU from the
-// mirror when a resolve wrote it; recorded before the flush, a presenter's
-// copy submitted after it on the device's queue (vk::Device::submit) comes
-// after it, and the renderer's next writes to the image come after that.
+// options ask for. The frame's work goes to the GPU, and then the front
+// buffer's image to on_swap (a presenter on this device): texture(fetch
+// constant 0) gives it (in the general layout), loaded on the GPU from the
+// mirror when a resolve wrote it, its loads recorded before the flush; what
+// the hook submits on the device's queue after the flush comes after them,
+// and before the renderer's next work.
 void Impl::swap() {
     uint64_t number = report_.swaps++;
-    if (options_.frame_wanted && options_.frame_wanted(number)) read_front_buffer(number);
+    const bool read = options_.frame_wanted && options_.frame_wanted(number);
+    texture::Info info;
+    Texture *t = read || options_.on_swap ? front_texture(info) : nullptr;
+    if (read && t) read_front_buffer(number, *t, info);
+    FrontBuffer front;
+    if (t && options_.on_swap) {
+        front.swap = number;
+        front.image = t->image.image, front.format = t->image.format;
+        front.width = t->image.extent.width, front.height = t->image.extent.height;
+        front.swizzle = info.swizzle;
+        // (an image converted to RGBA8 holds four)
+        front.components = t->host == texture::HostFormat::RGBA8 ? 4 : host_components(t->host);
+        front.gamma_table = info.format != 7 && info.format != 54; // as deliver
+        front.gamma = processor_.gamma_ramp_table();
+    }
     flush();
+    if (front.image && fatal_.empty()) options_.on_swap(front);
     poll();
+    // the pipeline cache written once new pipelines have settled
+    if (pipelines_saved_ != report_.pipelines && report_.swaps - last_pipeline_swap_ >= 300) save_pipeline_cache();
 }
 
-// The front buffer's level 0 copied into a read-back buffer on the GPU,
-// handed to on_frame once the GPU is done (deliver), without waiting for it.
-void Impl::read_front_buffer(uint64_t number) {
+// The texture of fetch constant 0 that a swap shows, its loads recorded;
+// nullptr when it is none (counted as approximate)
+Texture *Impl::front_texture(texture::Info &info) {
     const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS];
-    texture::Info info = texture::parse_fetch_constant(fetch);
+    info = texture::parse_fetch_constant(fetch);
     if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture || info.dimension != 1 || !info.base_address) {
         approximate("a swap without a 2D texture in fetch constant 0");
-        return;
+        return nullptr;
     }
     texture::Plan plan;
     std::string why;
     if (!texture::plan(info, plan, why)) {
         approximate("swap texture not decoded: " + why);
-        return;
+        return nullptr;
     }
     if (plan.slices.empty() || plan.slices[0].level != 0) {
         approximate("swap texture not decoded: no base level");
-        return;
+        return nullptr;
     }
     Texture *t = texture(fetch, why);
-    if (!t) {
-        if (fatal_.empty()) approximate("swap texture not decoded: " + why);
-        return;
-    }
+    if (!t && fatal_.empty()) approximate("swap texture not decoded: " + why);
+    return t;
+}
+
+// The front buffer's level 0 copied into a read-back buffer on the GPU,
+// handed to on_frame once the GPU is done (deliver), without waiting for it.
+void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &info) {
     FrontRead read;
     read.number = number;
-    read.host = t->host;
-    read.width = t->image.extent.width, read.height = t->image.extent.height;
+    read.host = t.host;
+    read.width = t.image.extent.width, read.height = t.image.extent.height;
     read.swizzle = info.swizzle, read.format = info.format;
     read.gamma = processor_.gamma_ramp_table();
     bool compressed = texture::is_compressed(read.host);
@@ -2914,7 +2998,7 @@ void Impl::read_front_buffer(uint64_t number) {
     copy.bufferOffset = at;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {read.width, read.height, 1};
-    vkCmdCopyImageToBuffer(outside(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, back, 1, &copy);
+    vkCmdCopyImageToBuffer(outside(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, back, 1, &copy);
     read.serial = slots_[current_].serial;
     front_reads_.push_back(std::move(read));
 }

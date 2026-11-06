@@ -52,7 +52,8 @@ struct Game {
 // TLS). False, and why, when any of it fails.
 bool open(const Options &options, Game &game, std::string &error);
 
-// The renderer on a Vulkan device without a window, installed as the
+// The renderer on a Vulkan device without a window (or on game.device when
+// it is opened already: the player's, with its window), installed as the
 // command processor's Sink, before the game runs.
 bool start_renderer(Game &game, const render::Options &options, std::string &error);
 
@@ -64,6 +65,15 @@ bool launch(Game &game, std::string &error);
 // the sound and the input did, and the renderer's counts (waiting: for a
 // call of its under way; else skipped if one is).
 void print_report(Game &game, bool waiting);
+
+// --rates: one line a second of the run (the swaps, the scheduler's clock,
+// the renderer's time), so runs of boot and the player can be set side by
+// side over time. `extra` is appended to the line (the player's own counts).
+struct Rates {
+    double last_wall = 0, last_busy = 0, last_busy_wall = 0;
+    uint64_t last_swaps = 0, last_draws = 0, last_resolves = 0;
+};
+void print_rates(Game &game, Rates &rates, double wall_seconds, const std::string &extra = {});
 
 // "300,301,890-910": numbers and ranges of them
 bool parse_numbers(const std::string &list, std::set<uint64_t> &out);

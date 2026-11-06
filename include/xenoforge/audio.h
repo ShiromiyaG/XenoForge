@@ -67,8 +67,9 @@ public:
 
 // every frame silence
 std::unique_ptr<FrameDecoder> make_silent_decoder();
-// FFmpeg's xmaframes decoder, as Xenia's (src/xma_decoder.cpp); nullptr when
-// built without it (CMake's XF_XMA off)
+// FFmpeg's xmaframes decoder, as Xenia's (src/xma_decoder.cpp), from the
+// ffmpeg-xma library loaded at the first call; nullptr when built without it
+// (CMake's XF_XMA off) or when the library is not found (said once on stderr)
 std::unique_ptr<FrameDecoder> make_ffmpeg_decoder();
 // the kernel's default: FFmpeg's when built with it, else silence
 std::unique_ptr<FrameDecoder> make_xma_decoder();

@@ -59,13 +59,17 @@ target_include_directories(xenoforge PUBLIC include PRIVATE src)
 
 # XMA decoded by FFmpeg's xmaframes decoder, as Xenia does (plan A6;
 # third_party/ffmpeg/ffmpeg.cmake): a shared library of its own (LGPL), fetched
-# unless XF_FFMPEG_DIR or xenia-canary's checkout has it. Off, the core builds
-# without FFmpeg and decodes XMA as silence.
-option(XF_XMA "decode XMA with FFmpeg (a shared library, LGPL)" ON)
+# unless XF_FFMPEG_DIR or xenia-canary's checkout has it, and loaded at run time
+# (src/xma_decoder.cpp): the core is compiled against FFmpeg's headers, never
+# linked to it, so a program without the library still runs and decodes XMA as
+# silence. Off, the core builds without FFmpeg at all.
+option(XF_XMA "decode XMA with FFmpeg (a shared library, LGPL, loaded at run time)" ON)
 if(XF_XMA)
     include(third_party/ffmpeg/ffmpeg.cmake)
     target_compile_definitions(xenoforge PRIVATE XF_XMA=1)
-    target_link_libraries(xenoforge PRIVATE ffmpeg_xma)
+    target_include_directories(xenoforge SYSTEM PRIVATE $<TARGET_PROPERTY:ffmpeg_xma,INTERFACE_INCLUDE_DIRECTORIES>)
+    add_dependencies(xenoforge ffmpeg_xma) # built beside the executables
+    target_link_libraries(xenoforge PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # Khronos's SPIR-V headers (MIT), from the Vulkan SDK; spirv-val checks what
@@ -220,10 +224,20 @@ if(XF_PLAYER AND TARGET boot)
     target_include_directories(xf_imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
     target_link_libraries(xf_imgui PUBLIC SDL3::SDL3-static Vulkan::Vulkan)
     target_compile_options(xf_imgui PRIVATE -w)
-    # the window, input, sound and settings, apart from the kernel they feed
+    # the window, input, sound and settings, apart from the kernel they feed;
+    # the window's front buffer conversion, a compute shader glslc compiles
+    add_custom_command(
+        OUTPUT ${XF_SHADER_OUT}/front_buffer.comp.inc
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
+        COMMAND ${GLSLC} --target-env=vulkan1.3 -mfmt=num -o ${XF_SHADER_OUT}/front_buffer.comp.inc
+                ${CMAKE_CURRENT_SOURCE_DIR}/frontend/front_buffer.comp
+        DEPENDS frontend/front_buffer.comp
+        COMMENT "glslc front_buffer.comp")
     add_library(xf_frontend STATIC frontend/settings.cpp frontend/presenter.cpp frontend/sdl_input.cpp
-                                   frontend/sdl_audio.cpp)
-    target_link_libraries(xf_frontend PUBLIC xenoforge SDL3::SDL3-static Vulkan::Vulkan tomlplusplus::tomlplusplus)
+                                   frontend/sdl_audio.cpp ${XF_SHADER_OUT}/front_buffer.comp.inc)
+    target_include_directories(xf_frontend PRIVATE ${XF_SHADER_OUT})
+    target_link_libraries(xf_frontend PUBLIC xenoforge xenoforge_vk SDL3::SDL3-static Vulkan::Vulkan
+                                             tomlplusplus::tomlplusplus)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(xf_frontend PRIVATE -Wno-missing-field-initializers)
     endif()
@@ -245,6 +259,8 @@ if(XF_PLAYER AND TARGET boot)
     add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
     target_link_libraries(frontend_test PRIVATE xf_frontend xenoforge_kernel xenoforge_vk)
     add_test(NAME frontend COMMAND frontend_test)
+    # the player as it is shipped: cmake --install, or the player_package target
+    include(cmake/package.cmake)
 endif()
 add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)

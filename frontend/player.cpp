@@ -9,11 +9,11 @@
 // (settings.h).
 //
 // One clock, the scheduler's: the guest runs on its own threads and never
-// waits for the window. The renderer hands each front buffer over at its
-// swap (on the "GPU commands" thread) and goes on; this thread shows the
-// latest it was given whenever the display lets it. A front buffer is only
-// read back while the window has shown the one before (or a screenshot
-// wants it), so a window that is slow or minimized costs the guest nothing.
+// waits for the window. The window is on the renderer's Vulkan device: at
+// each swap the renderer hands its front buffer to the presenter on the "GPU
+// commands" thread, which makes it the window's next picture on the GPU and
+// goes on without waiting (presenter.h); this thread shows the newest picture
+// whenever the display lets it. Only screenshots are read back to the CPU.
 //
 // For checks without a person at the screen: --quit-after <seconds> ends the
 // run and prints the report (frames presented, swaps, input states
@@ -21,11 +21,12 @@
 // every --screenshot-every N swaps' front buffer there (300 by default);
 // --press start@40 (repeatable; tools/game.h) holds buttons on user 0's
 // controller at times on the scheduler's clock; --overlay opens the overlay
-// from the start.
+// from the start; --rates prints a line a second (boot's, with the frames
+// handed over and presented and the sound frames sent).
 //
 //   player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] [--steps N]
 //        [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] [--press <b@s>]...
-//        [--no-sound] [--overlay]
+//        [--no-sound] [--overlay] [--rates]
 
 #include "presenter.h"
 #include "sdl_audio.h"
@@ -35,6 +36,7 @@
 #include "../tools/game.h"
 
 #include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_vulkan.h>
@@ -63,15 +65,11 @@ struct Shot {
     render::Image frame;
 };
 
-// The front buffers the renderer hands over, on its thread: the latest for
-// the window, and the ones a screenshot wants
+// The screenshots the renderer reads back (--screenshots), handed over on
+// its thread
 struct Mailbox {
     std::mutex mutex;
-    render::Image latest;
-    uint64_t latest_swap = 0;
-    bool fresh = false; // not shown yet
     std::deque<Shot> shots;
-    std::atomic<uint64_t> swaps{0}, handed{0};
 };
 
 bool write_png(const std::filesystem::path &path, const render::Image &frame) {
@@ -120,7 +118,7 @@ int fail(const std::string &message) {
 int main(int argc, char **argv) {
     const char *usage = "usage: player <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] "
                         "[--steps N] [--interpret] [--quit-after S] [--screenshots <dir>] [--screenshot-every N] "
-                        "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay]\n";
+                        "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay] [--rates]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -129,7 +127,7 @@ int main(int argc, char **argv) {
     std::filesystem::path config_file, screenshots;
     double quit_after = 0;
     uint64_t screenshot_every = 300;
-    bool sound_wanted = true, overlay = false;
+    bool sound_wanted = true, overlay = false, print_rates = false;
     std::vector<game::Press> presses;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
@@ -153,6 +151,8 @@ int main(int argc, char **argv) {
             overlay = true;
         else if (a == "--no-sound")
             sound_wanted = false;
+        else if (a == "--rates")
+            print_rates = true;
         else if (a == "--press" && i + 1 < argc) {
             std::string why;
             if (!game::parse_press(argv[++i], presses.emplace_back(), why)) return fail(why);
@@ -186,8 +186,23 @@ int main(int argc, char **argv) {
     SDL_Window *window = SDL_CreateWindow((std::string("XenoForge - ") + title_id).c_str(), 1280, 720,
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!window) return fail(std::string("SDL: ") + SDL_GetError());
+    // one Vulkan device for the renderer and the window: the front buffers
+    // never leave the GPU
+    vk::Device::Window surface;
+    Uint32 extensions = 0;
+    const char *const *names = SDL_Vulkan_GetInstanceExtensions(&extensions);
+    if (!names) return fail(std::string("SDL: no Vulkan: ") + SDL_GetError());
+    surface.instance_extensions.assign(names, names + extensions);
+    surface.make_surface = [window](VkInstance instance) {
+        VkSurfaceKHR s = VK_NULL_HANDLE;
+        if (!SDL_Vulkan_CreateSurface(window, instance, nullptr, &s))
+            std::fprintf(stderr, "SDL: no surface: %s\n", SDL_GetError());
+        return s;
+    };
+    g.device = vk::Device::open(error, &surface);
+    if (!g.device) return fail("Vulkan: " + error);
     frontend::Presenter presenter;
-    if (!presenter.open(window, error)) return fail("the window cannot show Vulkan's pictures: " + error);
+    if (!presenter.open(*g.device, error)) return fail("the window cannot show Vulkan's pictures: " + error);
 
     // the overlay (Dear ImGui) on the presenter's device
     ImGui::CreateContext();
@@ -210,7 +225,10 @@ int main(int argc, char **argv) {
     info.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
     info.PipelineRenderingCreateInfo.pColorAttachmentFormats = &format;
     ImGui_ImplVulkan_Init(&info);
-    ImGui_ImplVulkan_CreateFontsTexture();
+    {
+        std::lock_guard<std::mutex> lock(presenter.queue_mutex()); // it submits on the window's queue
+        ImGui_ImplVulkan_CreateFontsTexture();
+    }
 
     // the sound: SDL's device for each client, else the pacing output alone
     frontend::Sound sound;
@@ -240,46 +258,46 @@ int main(int argc, char **argv) {
     kernel::set_input_deadzones(k, settings.input.left_deadzone, settings.input.right_deadzone);
     apply();
 
-    // the renderer hands each front buffer over at its swap; read back only
-    // while the window took the last one, or for a screenshot
+    // the renderer hands each front buffer to the presenter at its swap, on
+    // the GPU. Screenshots: --screenshots' swaps read back by the renderer
+    // (boot's --shots picture) and the window's picture of the same swap
+    // beside it (<swap>_window.png, which should be the same); F12's, the
+    // window's next picture
     Mailbox mailbox;
     render::Options options;
+    auto shot_wanted = [&](uint64_t swap) { return !screenshots.empty() && swap % screenshot_every == 0; };
+    std::atomic<int> keys_wanted{0};
+    options.on_swap = [&](const render::FrontBuffer &front) { presenter.take(front); };
+    // the driver's compiled pipelines kept between runs, beside the settings
+    options.pipeline_cache = config_file.parent_path() / "cache" / (std::string(title_id) + ".vkpipelines");
     options.frame_wanted = [&](uint64_t swap) {
-        mailbox.swaps = swap + 1;
-        if (!screenshots.empty() && swap % screenshot_every == 0) return true;
-        std::lock_guard<std::mutex> lock(mailbox.mutex);
-        return !mailbox.fresh;
+        if (!shot_wanted(swap)) return false;
+        presenter.capture_next(); // this swap's picture, taken after this
+        return true;
     };
     options.on_frame = [&](uint64_t swap, const render::Image &frame) {
         std::lock_guard<std::mutex> lock(mailbox.mutex);
-        mailbox.latest = frame;
-        mailbox.latest_swap = swap;
-        mailbox.fresh = true;
-        mailbox.handed++;
-        if (!screenshots.empty() && swap % screenshot_every == 0) mailbox.shots.push_back({swap, k.uptime_ms(), frame});
+        mailbox.shots.push_back({swap, k.uptime_ms(), frame});
     };
     if (!game::start_renderer(g, options, error)) return fail(error);
-    std::printf("rendering on %s; window on its own device\n", g.device->name().c_str());
+    std::printf("rendering on %s, the window on the same device (%s)\n", g.device->name().c_str(),
+                presenter.own_queue() ? "a queue of its own" : "the renderer's queue");
     stbi_write_png_compression_level = 1;
     if (!game::launch(g, error)) return fail("launch: " + error);
     const Clock::time_point started = Clock::now();
 
-    bool quit = false, changed = false;
-    render::Image showing; // the front buffer last shown
-    uint64_t showing_swap = 0, presented = 0, refreshes = 0, key_screenshots = 0, shots_written = 0;
+    bool quit = false, changed = false, shown_any = false;
+    uint64_t presented = 0, refreshes = 0, key_screenshots = 0, shots_written = 0;
     std::string ended;
     Rates rates;
     Clock::time_point second = started, last_present = started;
     uint64_t swaps_before = 0, presented_before = 0, refreshes_before = 0, sound_before = 0, states_before = 0;
-    std::string names;
+    uint64_t taken_before = 0;
+    game::Rates rate_log;
+    std::string button_text;
     auto key_screenshot = [&] {
-        if (showing.rgba.empty()) return;
-        std::filesystem::path path = key_shots / (std::string(title_id) + "_" + std::to_string(showing_swap) + "_key" +
-                                                  std::to_string(++key_screenshots) + ".png");
-        if (write_png(path, showing))
-            std::printf("screenshot: %s\n", path.string().c_str());
-        else
-            std::fprintf(stderr, "could not write %s\n", path.string().c_str());
+        keys_wanted++;
+        presenter.capture_next();
     };
 
     while (!quit) {
@@ -317,17 +335,10 @@ int main(int argc, char **argv) {
         uint32_t exit_code = 0;
         if (k.wait_main(0, &exit_code)) quit = true, ended = "the main thread ended";
 
-        // the latest front buffer, and the screenshots asked for
-        bool fresh = false;
+        // the screenshots asked for
         std::deque<Shot> shots;
         {
             std::lock_guard<std::mutex> lock(mailbox.mutex);
-            if (mailbox.fresh) {
-                std::swap(showing, mailbox.latest);
-                showing_swap = mailbox.latest_swap;
-                mailbox.fresh = false;
-                fresh = true;
-            }
             shots.swap(mailbox.shots);
         }
         for (const Shot &shot : shots) {
@@ -341,17 +352,50 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "could not write %s\n", path.string().c_str());
             }
         }
+        // the window's pictures copied back: a --screenshots swap's, or F12's
+        render::Image picture;
+        uint64_t picture_swap = 0;
+        while (presenter.captured(picture, picture_swap)) {
+            const bool key = !shot_wanted(picture_swap) && keys_wanted > 0;
+            if (!key && !shot_wanted(picture_swap)) continue;
+            std::filesystem::path path =
+                key ? key_shots / (std::string(title_id) + "_" + std::to_string(picture_swap) + "_key" +
+                                   std::to_string(++key_screenshots) + ".png")
+                    : screenshots / (std::string(title_id) + "_" + std::to_string(picture_swap) + "_window.png");
+            if (key) keys_wanted--;
+            if (write_png(path, picture))
+                std::printf("screenshot: %s\n", path.string().c_str());
+            else
+                std::fprintf(stderr, "could not write %s\n", path.string().c_str());
+        }
+        // F12's capture taken by a --screenshots swap: asked again
+        if (keys_wanted > 0 && !presenter.capturing()) presenter.capture_next();
 
         // the rates over the last second
+        const uint64_t swapped = swaps();
         if (now - second >= std::chrono::seconds(1)) {
             const double dt = std::chrono::duration<double>(now - second).count();
             const uint64_t states = kernel::input_states_delivered(k);
-            rates.swaps = (mailbox.swaps - swaps_before) / dt;
+            rates.swaps = (swapped - swaps_before) / dt;
             rates.presented = (presented - presented_before) / dt;
             rates.refreshes = (refreshes - refreshes_before) / dt;
             rates.sound = (sound.sent - sound_before) / dt;
             rates.states = (states - states_before) / dt;
-            swaps_before = mailbox.swaps, presented_before = presented, refreshes_before = refreshes;
+            if (print_rates) {
+                static double fence = 0, acquire = 0, present = 0;
+                char extra[256];
+                std::snprintf(extra, sizeof(extra),
+                              "; taken %.1f/s, presented %.1f/s, refreshes %.1f/s, sound sent %.1f/s; the window "
+                              "waited %.0f ms for its frame, %.0f ms for an image, %.0f ms presenting",
+                              (presenter.taken - taken_before) / dt, rates.presented, rates.refreshes, rates.sound,
+                              (presenter.fence_seconds - fence) * 1000, (presenter.acquire_seconds - acquire) * 1000,
+                              (presenter.present_seconds - present) * 1000);
+                fence = presenter.fence_seconds, acquire = presenter.acquire_seconds;
+                present = presenter.present_seconds;
+                game::print_rates(g, rate_log, seconds, extra);
+            }
+            taken_before = presenter.taken;
+            swaps_before = swapped, presented_before = presented, refreshes_before = refreshes;
             sound_before = sound.sent, states_before = states;
             second = now;
         }
@@ -361,7 +405,7 @@ int main(int argc, char **argv) {
         int pw = 0, ph = 0;
         SDL_GetWindowSizeInPixels(window, &pw, &ph);
         const bool minimized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) || !pw || !ph;
-        if (minimized || (!fresh && !overlay && now - last_present < std::chrono::milliseconds(100))) {
+        if (minimized || (!presenter.fresh() && !overlay && now - last_present < std::chrono::milliseconds(100))) {
             SDL_Delay(minimized ? 10 : 1);
             continue;
         }
@@ -375,8 +419,9 @@ int main(int argc, char **argv) {
             bool keep = true;
             ImGui::Begin("XenoForge (F1)", &keep, ImGuiWindowFlags_NoSavedSettings);
             ImGui::Text("guest swaps %.1f/s (%llu), frames presented %.1f/s (%llu)", rates.swaps,
-                        (unsigned long long)mailbox.swaps.load(), rates.presented, (unsigned long long)presented);
-            ImGui::Text("window refreshes %.1f/s, run %.0f s", rates.refreshes, seconds);
+                        (unsigned long long)swapped, rates.presented, (unsigned long long)presented);
+            ImGui::Text("window refreshes %.1f/s, run %.0f s; front buffers not shown (no picture free) %llu",
+                        rates.refreshes, seconds, (unsigned long long)presenter.skipped.load());
             ImGui::Text("sound: %llu frames played (%.1f/s, %u channels), %llu with sound, %llu starved",
                         (unsigned long long)sound.sent.load(), rates.sound, sound.channels(),
                         (unsigned long long)sound.audible.load(), (unsigned long long)sound.starved.load());
@@ -393,7 +438,7 @@ int main(int argc, char **argv) {
                     ImGui::TableNextColumn();
                     ImGui::TextUnformatted(v.source.empty() ? "(none)" : v.source.c_str());
                     ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(v.source.empty() ? "" : button_names(v.pad.buttons, names));
+                    ImGui::TextUnformatted(v.source.empty() ? "" : button_names(v.pad.buttons, button_text));
                     ImGui::TableNextColumn();
                     if (!v.source.empty())
                         ImGui::Text("LT %3u RT %3u  L %6d %6d  R %6d %6d", v.pad.left_trigger, v.pad.right_trigger,
@@ -427,23 +472,28 @@ int main(int argc, char **argv) {
         view.vsync = settings.video.vsync;
         view.smooth = settings.video.smooth;
         view.stretch = settings.video.aspect == "stretch";
-        presenter.present(fresh ? showing.rgba.data() : nullptr, showing.width, showing.height, view,
-                          [](VkCommandBuffer cmd) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd); });
+        const bool fresh = presenter.present(
+            view, [](VkCommandBuffer cmd) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd); });
         last_present = Clock::now();
         refreshes++;
-        if (fresh) presented++;
+        if (fresh) presented++, shown_any = true;
     }
 
     // the report: the player's counts, then boot's
     const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
     if (changed && !frontend::save(config_file, settings, error)) std::fprintf(stderr, "%s\n", error.c_str());
     std::printf("player: %s\n", ended.c_str());
-    std::printf("player: %.1f s; %llu swaps (%.1f/s), %llu front buffers handed over, %llu frames presented "
-                "(%.1f/s), %llu window refreshes; %llu screenshots written to %s\n",
-                seconds, (unsigned long long)mailbox.swaps.load(), mailbox.swaps / seconds,
-                (unsigned long long)mailbox.handed.load(), (unsigned long long)presented, presented / seconds,
+    const uint64_t swapped = swaps();
+    std::printf("player: %.1f s; %llu swaps (%.1f/s), %llu front buffers taken on the GPU (%llu not, no picture "
+                "free), %llu frames presented (%.1f/s), %llu window refreshes; %llu screenshots written to %s\n",
+                seconds, (unsigned long long)swapped, swapped / seconds, (unsigned long long)presenter.taken.load(),
+                (unsigned long long)presenter.skipped.load(), (unsigned long long)presented, presented / seconds,
                 (unsigned long long)refreshes, (unsigned long long)shots_written,
                 screenshots.empty() ? "(none asked)" : screenshots.string().c_str());
+    std::printf("player: the window waited %.1f s for its frames in flight, %.1f s for swapchain images, %.1f s "
+                "presenting%s\n",
+                presenter.fence_seconds, presenter.acquire_seconds, presenter.present_seconds,
+                shown_any ? "" : " (nothing was shown)");
     std::printf("player: input states delivered %llu\n", (unsigned long long)kernel::input_states_delivered(k));
     if (sounding)
         std::printf("player: sound frames: %llu submitted, %llu played to the device (%u channels), %llu with sound, "

@@ -54,7 +54,15 @@ those is a second implementation Xenia carries and XenoForge does not.
 - Every shader a game uses is kept in its cache (by hash), and its pipelines
   in Vulkan's pipeline cache on disk. The launcher's build step translates
   the shaders gathered from earlier runs and from traces, so a game played
-  again compiles nothing.
+  again compiles nothing. Built so far (2026-11-05): the pipeline cache, a
+  file per game (`render::Options::pipeline_cache`; boot's in a temporary
+  directory's `xenoforge-cache`, the player's in a `cache` folder beside
+  its config.toml), read when the renderer is made, given to every
+  pipeline, written once 300 swaps pass without a new pipeline and at
+  `drain()`. El Chavo Kart's title screen makes about 24 pipelines in its
+  first frame: 0.2 s on an idle CPU (2.5 s once with every core busy), 0.03
+  s from the cache. The report counts the time spent making pipelines.
+  The shader cache and the compile on a worker thread are not built.
 - A shader seen for the first time is drawn by a **generic pipeline while the
   translated one compiles on a worker thread**: an interpreter of Xenos
   microcode written as a SPIR-V vertex and pixel shader, reading the program
@@ -140,11 +148,17 @@ that need around it.
 **Front buffers read back without waiting (B4).** A swap asked for
 (`frame_wanted`) records a copy of its front buffer (fetch constant 0, as a
 texture) into a read-back buffer; the picture goes to `on_frame` when the
-GPU is done, at a later call of the processor's or at `drain()`. A
-presenter on the renderer's device could take the image itself: the
-texture of fetch constant 0 is a GPU image (general layout, the guest's
-swizzle in its view), and a copy submitted after the renderer's submission
-on the same queue comes after it.
+GPU is done, at a later call of the processor's or at `drain()`. That is
+for screenshots and checks now: the player's window takes the image itself
+(2026-11-05). `on_swap` hands a `FrontBuffer` (the texture of fetch
+constant 0: its image in the general layout, format, size, the fetch
+constant's swizzle, the display's gamma ramp) right after the swap's
+submission, on the renderer's thread; the queue's order is the
+synchronization (what the hook submits on the device's queue before it
+returns comes after the swap's work and before the renderer's next), and
+the image is the hook's only while it runs. The player's presenter
+converts it into a picture of its own on the GPU there and returns
+([runtime.md](runtime.md), "The player").
 
 **The rest, as games ask:** memexport (shaders writing guest memory, then
 what it overlaps invalidated), rectangle and quad lists and point sprites

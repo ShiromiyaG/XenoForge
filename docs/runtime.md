@@ -314,16 +314,43 @@ As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
   `third_party/ffmpeg-xenia` (one codec, no assembly): one shared library,
   `ffmpeg-xma` (0.8 MB), beside the executables. With `XF_XMA` off the core
   builds without FFmpeg and every XMA frame decodes to silence.
-- **FFmpeg is LGPL 2.1 or later** (`LICENSE-ffmpeg`), and stays a separate,
-  dynamically linked library so XenoForge's own code keeps its license.
-  Shipping the player (or anything built with `XF_XMA`) means shipping
-  `ffmpeg-xma.dll` (`.so`) with: the LGPL's text and a notice that the
-  program uses FFmpeg under it; the library's source, or a written offer of
-  it, which is the fork's commit plus `third_party/ffmpeg` (the overlay and
-  the build script); and nothing that keeps a user from putting their own
-  build of it in its place (the player loads whatever `ffmpeg-xma` it finds
-  beside it). Linking FFmpeg statically would add the duty to ship the
-  player's objects for relinking, so it is not done.
+- **Loaded at run time** (2026-11-05): the core is compiled against
+  FFmpeg's headers and never linked to the library. The first decoder made
+  loads `ffmpeg-xma` (LoadLibrary, dlopen) from the executable's folder,
+  else wherever the system finds libraries, and looks up the thirteen
+  functions it calls by name. Without it, or with one that lacks a
+  function, one line on stderr says so and every XMA frame decodes to
+  silence, as with `XF_XMA` off; the program starts and runs either way
+  (before, linked through the import library, it would not start). Xenia
+  links its FFmpeg statically.
+- **FFmpeg is LGPL 2.1 or later** (`LICENSE-ffmpeg`), and stays a separate
+  library loaded at run time, so XenoForge's own code keeps its license
+  (MIT): the LGPL covers `ffmpeg-xma` alone. Shipping the player (or
+  anything built with `XF_XMA`) means shipping `ffmpeg-xma.dll` (`.so`)
+  with: the LGPL's text and a notice that the program uses FFmpeg under it;
+  the library's source, or a written pointer to it, which is the fork's
+  commit plus `third_party/ffmpeg` (the overlay and the build script); and
+  nothing that keeps a user from putting their own build of it in its
+  place (the player loads whatever `ffmpeg-xma` it finds beside it).
+  Linking FFmpeg statically would add the duty to ship the player's
+  objects for relinking, so it is not done. The package below does all
+  of it.
+- **Shipping the player** (`cmake/package.cmake`): `cmake --install build
+  --prefix <folder>` (or the `player_package` target: `build/xenoforge-player/`
+  and `build/xenoforge-player.zip`) puts in one folder the player (which
+  runs any game interpreted; a `player_<game>` holds that game's
+  recompiled code, so it goes in only with `-DXF_PACKAGE_GAME_PLAYERS=ON`,
+  for a folder that stays on the machine that built it: plan.md's fifth
+  principle); `ffmpeg-xma.dll`; XenoForge's `LICENSE`; `LICENSE-ffmpeg`,
+  `COPYING.LGPLv2.1` from the FFmpeg checkout that was built,
+  `FFMPEG-SOURCE.txt` (the fork's commit, as built, and XenoForge's commit
+  for the overlay, written at install time) and `ffmpeg-source/` (the
+  overlay itself: XenoForge has no public repository yet); `LICENSE-xenia`
+  and `LICENSE-rexglue`; and `THIRD-PARTY-NOTICES.txt` with the licenses
+  of what is linked into the player (SDL3 and its HIDAPI, Dear ImGui,
+  toml++, stb_image_write), taken from the fetched sources. The Microsoft
+  C++ runtime the executables import (`MSVCP140.dll`, `VCRUNTIME140*.dll`)
+  is not in it: it comes with Windows' Visual C++ Redistributable.
 - **Recordings and Xenia's oracle**: with `XF_XMA_RECORD=<file.xmar>`
   (boot or the player) the decoder writes every run of a context (its
   data before and after, its input buffers and its output buffer before
@@ -435,7 +462,11 @@ the swaps numbered as Xenia's `--trace_gpu_frames` numbers a trace's frame;
 `xfcompare <xenia.png> <dir>` finds the shot closest to a Xenia dump. The
 report adds the renderer's counts: draws drawn and skipped by reason, what
 is approximate, resolves, swaps, and the time spent (in submissions,
-resolves, checking and decoding textures, copying vertex data).
+resolves, checking and decoding textures, copying vertex data, making
+pipelines). `--rates` prints a line a second on the host's clock: the
+swaps, draws and resolves a second, the scheduler's clock, the share of
+the second the renderer was busy (`-` when a call of its was under way),
+to set boot and the player side by side over a run.
 
 ## The player
 
@@ -456,20 +487,32 @@ player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--con
 The game is opened, launched and reported by `tools/game.cpp`, boot's own
 code. As built (`frontend/`):
 
-- **The window** (`presenter.cpp`): the front buffer each swap shows (the
-  renderer's read-back, through the display's gamma ramp, the same picture
-  `boot --shots` writes) uploaded and blitted into a Vulkan swapchain's
-  image, scaled to fit with its shape kept (`video.aspect = "auto"`,
-  letterboxed or pillarboxed) or stretched, filtered (`video.smooth`) or
-  not, with the overlay drawn over it. The presenter has a Vulkan device of
-  its own: the renderer's is windowless and its thread never waits for it.
-- **One clock.** The renderer hands a front buffer over on its thread
-  (`render::Options::on_frame`, the hook boot's shots already used) and
-  goes on; the window's thread shows the latest whenever the display lets
-  it (`video.vsync`: FIFO, else mailbox), and that wait is the window's
-  thread's alone. A front buffer is read back only when the window has
-  taken the one before, or a screenshot wants it (`frame_wanted`), so a
-  minimized or slow window costs the guest nothing.
+- **The window** (`presenter.cpp`, 2026-11-05: on the GPU): the window is
+  on the renderer's own Vulkan device (`vk::Device::open` with the
+  window's surface), and the front buffer never leaves the GPU. At each
+  swap the renderer hands the presenter its image (`render::Options::on_swap`,
+  a `render::FrontBuffer`: texture fetch constant 0's image, its swizzle,
+  the display's gamma ramp) right after submitting the swap's work; the
+  presenter makes it the window's picture with a compute shader
+  (`front_buffer.comp`: the swizzle, opaque, the 256-entry gamma ramp, as
+  the read-back's CPU code does; byte for byte the picture `boot --shots`
+  writes) into one of three 8-bit RGBA images of its own, submitted on the
+  renderer's queue, whose order is the synchronization. The window's
+  thread blits the newest picture into a swapchain image, scaled to fit
+  with its shape kept (`video.aspect = "auto"`, letterboxed or pillarboxed)
+  or stretched, filtered (`video.smooth`) or not, with the overlay drawn
+  over it, on a second queue of the device where it has one. Timeline
+  semaphores order the two queues: the window waits on the GPU for a
+  picture's conversion, and a picture is converted again only once the
+  window's last use of it is done.
+- **One clock.** The presenter's conversion records and submits a few
+  commands on the renderer's thread and returns; it never waits for the
+  GPU or the window (with no picture free, the swap is not shown and is
+  counted). The window's thread shows the newest picture whenever the
+  display lets it (`video.vsync`: FIFO, else mailbox), and that wait is
+  its alone: it presents on its own queue, so even a present that blocks
+  for the display holds nothing of the renderer's. (A device whose
+  graphics family has one queue shares it, under the queue's lock.)
 - **Input** ([input.md](input.md)): SDL3's gamepads (Xenia's SDL driver),
   then the keyboard as a controller (Xenia's keyboard driver, its
   bindings), the deadzones; the scripted presses on user 0.
@@ -488,9 +531,10 @@ code. As built (`frontend/`):
   played (and how many had sound), the input states delivered, each user's
   controller (what drives it, its buttons, triggers and sticks), the
   volume, mute, vsync, scaling, fullscreen, and a screenshot button. F11
-  switches fullscreen; F12 saves the frame shown as
-  `<title>_<swap>_key<n>.png` in `player.screenshots` (default: a
-  `screenshots` folder beside config.toml, never the repository).
+  switches fullscreen; F12 saves the window's next picture (copied back
+  from the GPU) as `<title>_<swap>_key<n>.png` in `player.screenshots`
+  (default: a `screenshots` folder beside config.toml, never the
+  repository).
 - **config.toml** (`settings.cpp`; `--config`, else SDL's preference folder,
   `%APPDATA%\xenoforge\config.toml` on Windows), written with the defaults
   the first time and saved when the overlay closes:
@@ -504,15 +548,52 @@ code. As built (`frontend/`):
   ```
 
 For checks without a person at the screen: `--quit-after <seconds>`
-ends the run with a report (the swaps, the front buffers handed over and
-presented, the window's refreshes, the input states delivered, the sound
-frames submitted, sent to the device, with sound, dropped and starved,
-then boot's report); `--screenshots <dir>` writes every
-`--screenshot-every N` swaps' front buffer (300 by default) as
-`<title>_<swap>.png`, printing the time on the scheduler's clock each came
-at, which is the clock `--press` takes (or `--press start@#1100`, at a
-swap); `--overlay` opens the overlay from the start; `--no-sound` keeps the pacing
-output alone.
+ends the run with a report (the swaps, the front buffers taken on the GPU
+and not, the frames presented, the window's refreshes and its waits, the
+input states delivered, the sound frames submitted, sent to the device,
+with sound, dropped and starved, then boot's report); `--screenshots <dir>`
+writes every `--screenshot-every N` swaps' front buffer (300 by default)
+as `<title>_<swap>.png` (the renderer's read-back, boot's `--shots`
+picture) and the window's picture of the same swap beside it as
+`<title>_<swap>_window.png`, printing the time on the scheduler's clock
+each came at, which is the clock `--press` takes (or `--press
+start@#1100`, at a swap); `--overlay` opens the overlay from the start;
+`--no-sound` keeps the pacing output alone; `--rates` prints a line a
+second (boot's `--rates`: the swaps, draws and resolves a second, the
+renderer's busy share; then the pictures taken and presented, the
+window's refreshes and waits, the sound frames sent).
+
+Slow at the start (2026-11-05, the user's report: the beginning at about
+15 frames a second, the rest at 30; boot `--render` at 30 swaps a second).
+Measured with `--rates`, boot and the player back to back: the guest swaps
+30 a second in both, and what fell to 14-20 was the frames the window got.
+The causes were the player's alone. Each front buffer the window took was
+read back and made a picture on the CPU on the renderer's thread
+(`deliver`: decoded, swizzled, through the gamma ramp, about 13 ms at
+720p): the renderer was busy 40-60% of the intro movie where boot's is 4-6%
+(boot reading back every swap the same way: 40%). The window's device was
+a second Vulkan device on the same GPU, and the renderer waited for the GPU
+for 3 s of 100 where boot waits 0.1 s. And a front buffer was read back
+only once the window had taken the one before, so as soon as a read-back
+took longer than a frame (a busy GPU: other work on the machine, a heavy
+scene) every other swap went unshown: 15 a second. The window's own waits
+(its frame, the swapchain's image, the present) were a few milliseconds a
+second: neither vsync nor the window's size. Presenting on the GPU took all
+three away. Back to back under the same load (other agents' builds), 100 s
+each: boot 6% busy in the movie and 0.1 s waiting for the GPU; the player
+5-7% and 0.2 s, 2823 of 2823 swaps taken and 2819 presented, 30 a second
+with the guest's swaps. With the validation layer, 1154 of 1154 taken and
+nothing reported; the window's pictures are byte for byte the renderer's
+read-back (12 of 12 swaps compared). Sound was not a cause: the game's
+movie and loading run on the scheduler's clock, and the SDL output is
+paced by the pacing output underneath it. Nor were pipelines, in the main:
+the title screen's first frame makes about 24, 0.2 s in all on an idle
+CPU with or without the driver's own disk cache, though 2.5 s once with
+every core busy compiling other builds; the renderer now keeps Vulkan's
+pipeline cache on disk (renderer.md, "Decisions"), 0.03 s on the next run.
+(A real pad plugged into the machine, with the deadzones at 0, took the
+player's runs past the title into the menus, which boot's idle pad does
+not: compare the two before the title.)
 
 Checked (2026-11-05, both games with their generated code, on a machine
 other builds were loading, so the rates vary from run to run; the shots and

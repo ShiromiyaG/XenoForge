@@ -20,7 +20,13 @@
 //   then reads the frame in place): the same bytes either way.
 // - FFmpeg's log goes through a callback that prints its first errors and
 //   counts the rest (Xenia lets FFmpeg print every one).
-// - Built without FFmpeg (CMake's XF_XMA off), every frame is silence.
+// - FFmpeg is loaded at run time (LoadLibrary, dlopen): the shared library
+//   ffmpeg-xma beside the executable, else wherever the system finds it, and
+//   the thirteen functions called here looked up in it. Without it one line
+//   says so and every frame is silence, as when built without FFmpeg (CMake's
+//   XF_XMA off); the program runs either way, and a user can put their own
+//   build of the library in its place (the LGPL's terms, docs/runtime.md).
+//   Xenia links its FFmpeg statically.
 
 #include "xenoforge/audio.h"
 
@@ -28,6 +34,7 @@
 #include <cstring>
 
 #if XF_XMA
+// FFmpeg's headers for its types and constants only: nothing is linked
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
@@ -40,8 +47,16 @@ extern "C" {
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
+#include <filesystem>
+#include <string>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#endif
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <unistd.h>
 #endif
 #endif
 
@@ -59,6 +74,88 @@ public:
 };
 
 #if XF_XMA
+
+// The FFmpeg functions the decoder calls, looked up in ffmpeg-xma once, at the
+// first decoder made
+struct Ffmpeg {
+#define XF_FFMPEG_FUNCTIONS(X)                                                                                         \
+    X(av_log_set_callback)                                                                                             \
+    X(avcodec_find_decoder)                                                                                            \
+    X(avcodec_alloc_context3)                                                                                          \
+    X(avcodec_free_context)                                                                                            \
+    X(avcodec_open2)                                                                                                   \
+    X(avcodec_send_packet)                                                                                             \
+    X(avcodec_receive_frame)                                                                                           \
+    X(av_channel_layout_default)                                                                                       \
+    X(av_frame_alloc)                                                                                                  \
+    X(av_frame_free)                                                                                                   \
+    X(av_frame_unref)                                                                                                  \
+    X(av_packet_alloc)                                                                                                 \
+    X(av_packet_free)
+#define XF_FFMPEG_POINTER(name) decltype(&::name) name = nullptr;
+    XF_FFMPEG_FUNCTIONS(XF_FFMPEG_POINTER)
+#undef XF_FFMPEG_POINTER
+};
+
+#ifdef _WIN32
+constexpr const char *FFMPEG_LIBRARY = "ffmpeg-xma.dll";
+#elif defined(__APPLE__)
+constexpr const char *FFMPEG_LIBRARY = "libffmpeg-xma.dylib";
+#else
+constexpr const char *FFMPEG_LIBRARY = "libffmpeg-xma.so";
+#endif
+
+// the directory of the running executable, where the library is shipped
+std::filesystem::path executable_directory() {
+#ifdef _WIN32
+    wchar_t path[32768];
+    DWORD n = GetModuleFileNameW(nullptr, path, DWORD(std::size(path)));
+    if (n == 0 || n >= std::size(path)) return {};
+    return std::filesystem::path(std::wstring(path, n)).parent_path();
+#else
+    char path[4096];
+    ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
+    if (n <= 0) return {};
+    return std::filesystem::path(std::string(path, size_t(n))).parent_path();
+#endif
+}
+
+// ffmpeg-xma beside the executable, else by its name where the system looks;
+// nullptr, after one line saying why, when it is not there or lacks a function
+const Ffmpeg *load_ffmpeg() {
+    static const Ffmpeg *loaded = []() -> const Ffmpeg * {
+        const std::filesystem::path beside = executable_directory() / FFMPEG_LIBRARY;
+        std::string where = beside.string();
+#ifdef _WIN32
+        HMODULE library = LoadLibraryW(beside.c_str());
+        if (!library) library = LoadLibraryA(FFMPEG_LIBRARY), where = FFMPEG_LIBRARY;
+        auto symbol = [&](const char *name) { return reinterpret_cast<void *>(GetProcAddress(library, name)); };
+#else
+        void *library = dlopen(beside.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!library) library = dlopen(FFMPEG_LIBRARY, RTLD_NOW | RTLD_LOCAL), where = FFMPEG_LIBRARY;
+        auto symbol = [&](const char *name) { return dlsym(library, name); };
+#endif
+        if (!library) {
+            std::fprintf(stderr, "xma: no %s beside the executable or where the system finds libraries: XMA decodes "
+                                 "to silence\n",
+                         FFMPEG_LIBRARY);
+            return nullptr;
+        }
+        static Ffmpeg f;
+        const char *missing = nullptr;
+#define XF_FFMPEG_LOOKUP(name)                                                                                         \
+    f.name = reinterpret_cast<decltype(f.name)>(symbol(#name));                                                        \
+    if (!f.name && !missing) missing = #name;
+        XF_FFMPEG_FUNCTIONS(XF_FFMPEG_LOOKUP)
+#undef XF_FFMPEG_LOOKUP
+        if (missing) {
+            std::fprintf(stderr, "xma: %s has no %s: XMA decodes to silence\n", where.c_str(), missing);
+            return nullptr;
+        }
+        return &f;
+    }();
+    return loaded;
+}
 
 // FFmpeg's messages: its first errors printed, every one counted
 std::atomic<uint32_t> ffmpeg_messages{0};
@@ -105,16 +202,16 @@ class FfmpegDecoder final : public FrameDecoder {
 public:
     static constexpr uint32_t CONTEXTS = 320;
 
-    FfmpegDecoder() {
-        av_log_set_callback(ffmpeg_log);
-        codec_ = avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
+    explicit FfmpegDecoder(const Ffmpeg &f) : f_(f) {
+        f_.av_log_set_callback(ffmpeg_log);
+        codec_ = f_.avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
         if (!codec_) std::fprintf(stderr, "xma: FFmpeg has no xmaframes decoder; frames decode to nothing\n");
     }
     ~FfmpegDecoder() override {
         for (State &s : states_) {
-            if (s.context) avcodec_free_context(&s.context);
-            if (s.frame) av_frame_free(&s.frame);
-            if (s.packet) av_packet_free(&s.packet);
+            if (s.context) f_.avcodec_free_context(&s.context);
+            if (s.frame) f_.av_frame_free(&s.frame);
+            if (s.packet) f_.av_packet_free(&s.packet);
         }
     }
 
@@ -126,17 +223,17 @@ public:
         if (prepare(s, int(sample_rate), int(channels)) < 0) return false;
         s.packet->data = const_cast<uint8_t *>(data);
         s.packet->size = int(size);
-        int ret = avcodec_send_packet(s.context, s.packet);
+        int ret = f_.avcodec_send_packet(s.context, s.packet);
         s.packet->data = nullptr, s.packet->size = 0;
         if (ret < 0) return false;
-        ret = avcodec_receive_frame(s.context, s.frame);
+        ret = f_.avcodec_receive_frame(s.context, s.frame);
         if (ret < 0) return false; // EAGAIN: more input wanted first; else an error FFmpeg logged
         if (s.frame->nb_samples < int(SAMPLES_PER_FRAME)) {
-            av_frame_unref(s.frame);
+            f_.av_frame_unref(s.frame);
             return false;
         }
         convert_frame(reinterpret_cast<const float *const *>(s.frame->data), channels == 2, pcm);
-        av_frame_unref(s.frame);
+        f_.av_frame_unref(s.frame);
         return true;
     }
 
@@ -149,9 +246,9 @@ private:
 
     // Setup: the codec context made, not opened (PrepareDecoder opens it)
     bool setup(State &s) {
-        s.packet = av_packet_alloc();
-        s.context = avcodec_alloc_context3(codec_);
-        s.frame = av_frame_alloc();
+        s.packet = f_.av_packet_alloc();
+        s.context = f_.avcodec_alloc_context3(codec_);
+        s.frame = f_.av_frame_alloc();
         if (!s.packet || !s.context || !s.frame) return false;
         s.context->ch_layout = AVChannelLayout{};
         s.context->sample_rate = 0;
@@ -161,13 +258,13 @@ private:
     // PrepareDecoder: a new codec context when the rate or the channels change
     int prepare(State &s, int sample_rate, int channels) {
         if (s.context->sample_rate == sample_rate && s.context->ch_layout.nb_channels == channels) return 0;
-        avcodec_free_context(&s.context);
-        s.context = avcodec_alloc_context3(codec_);
+        f_.avcodec_free_context(&s.context);
+        s.context = f_.avcodec_alloc_context3(codec_);
         if (!s.context) return -1;
         s.context->sample_rate = sample_rate;
-        av_channel_layout_default(&s.context->ch_layout, channels);
+        f_.av_channel_layout_default(&s.context->ch_layout, channels);
         s.context->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
-        if (avcodec_open2(s.context, codec_, nullptr) < 0) {
+        if (f_.avcodec_open2(s.context, codec_, nullptr) < 0) {
             std::fprintf(stderr, "xma: FFmpeg's xmaframes decoder did not open (%d Hz, %d channels)\n", sample_rate,
                          channels);
             // a closed context: the next frame tries again
@@ -177,6 +274,7 @@ private:
         return 1;
     }
 
+    const Ffmpeg &f_;
     const AVCodec *codec_ = nullptr;
     std::array<State, CONTEXTS> states_;
 };
@@ -189,7 +287,8 @@ std::unique_ptr<FrameDecoder> make_silent_decoder() { return std::make_unique<Si
 
 std::unique_ptr<FrameDecoder> make_ffmpeg_decoder() {
 #if XF_XMA
-    return std::make_unique<FfmpegDecoder>();
+    if (const Ffmpeg *f = load_ffmpeg()) return std::make_unique<FfmpegDecoder>(*f);
+    return nullptr;
 #else
     return nullptr;
 #endif

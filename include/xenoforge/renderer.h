@@ -25,7 +25,9 @@
 #include "xenoforge/gpu_trace.h"
 #include "xenoforge/vk_device.h"
 
+#include <array>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -54,11 +56,29 @@ struct Report {
     double vertex_seconds = 0;                   //   copying vertex data out of guest memory
     double resolve_seconds = 0;                  //   recording resolves (their waits counted in submit_seconds too)
     double writeback_seconds = 0;                //   copying what resolves wrote into guest memory, once done
+    double pipeline_seconds = 0;                 //   making pipelines (the driver compiling the shaders)
+    uint64_t pipeline_cache_read = 0;            // bytes of pipeline cache read from disk at the start
+    uint64_t pipeline_cache_written = 0;         // bytes of it written back, the last time
     uint64_t vertex_bytes = 0;                   // the vertex data copied
     uint64_t writeback_bytes = 0;                // what resolves wrote, copied into guest memory
     uint64_t submissions = 0, waits = 0;         // command buffers submitted; waits for the GPU
     std::map<std::string, uint64_t> skipped;     // draws not done, by reason
     std::map<std::string, uint64_t> approximate; // done, with something not exact yet, by what
+};
+
+// A swap's front buffer on the GPU (Options::on_swap): level 0, layer 0 of a
+// 2D image on the renderer's device, in VK_IMAGE_LAYOUT_GENERAL, usable as a
+// sampled image and a transfer source; and how the console's display shows
+// it (as the read-back's on_frame picture is made).
+struct FrontBuffer {
+    uint64_t swap = 0; // numbered as frame_wanted numbers them
+    VkImage image = VK_NULL_HANDLE;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0, height = 0;
+    uint32_t swizzle = 0;    // the fetch constant's: 3 bits a component (red first), 0-3 a texel's, 4 zero, 5 one
+    uint32_t components = 4; // in the image's format (a swizzle past them takes the last)
+    bool gamma_table = true; // the display's 256-entry ramp applies (not the piecewise one of 2_10_10_10)
+    std::array<uint32_t, 256> gamma{}; // that ramp at the swap: 10 bits a component, red highest
 };
 
 struct Options {
@@ -73,6 +93,19 @@ struct Options {
     // frame and returns at once (frame_wanted says no while the window has
     // not shown the last one), so the guest never waits for a display.
     std::function<void(uint64_t swap, const Image &frame)> on_frame;
+    // Each swap's front buffer on the GPU, with no read-back: called on the
+    // renderer's thread right after the swap's work is submitted on the
+    // device's queue. The synchronization is the queue's order: what the hook
+    // submits on that queue (vk::Device::submit) before it returns comes after
+    // the swap's work (a barrier at its start sees it) and before the
+    // renderer's next work (a barrier at its end makes that wait for it). The
+    // image is valid only until the hook returns; it must not wait for the GPU.
+    std::function<void(const FrontBuffer &front)> on_swap;
+    // Vulkan's pipeline cache on disk: read when the renderer is made (data
+    // from another device or driver is ignored, Vulkan checks its header),
+    // written once new pipelines have settled (300 swaps without one) and at
+    // drain(). Empty: a cache in memory only.
+    std::filesystem::path pipeline_cache;
 };
 
 class Renderer : public gpu::Sink {

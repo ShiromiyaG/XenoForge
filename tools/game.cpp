@@ -85,6 +85,8 @@ void print_renderer_report(const render::Report &r) {
     std::printf("renderer: made %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
                 (unsigned long long)r.render_targets, (unsigned long long)r.textures, (unsigned long long)r.pipelines,
                 (unsigned long long)r.shaders);
+    std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
+                r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
     for (const auto &[why, n] : r.skipped) std::printf("  skipped %8llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : r.approximate)
         std::printf("  approx  %8llu  %s\n", (unsigned long long)n, what.c_str());
@@ -130,10 +132,19 @@ bool open(const Options &options, Game &g, std::string &error) {
 }
 
 bool start_renderer(Game &g, const render::Options &options, std::string &error) {
-    g.device = vk::Device::open(error);
+    if (!g.device) g.device = vk::Device::open(error);
     if (!g.device) return error = "Vulkan: " + error, false;
     gpu::CommandProcessor &processor = kernel::gpu_command_processor(*g.kernel);
-    g.renderer = render::Renderer::create(*g.device, processor, options, error);
+    // the game's pipeline cache: a temporary directory's xenoforge-cache
+    // unless the caller names one (the player: beside its config.toml)
+    render::Options o = options;
+    if (o.pipeline_cache.empty()) {
+        std::error_code ec;
+        char name[32];
+        std::snprintf(name, sizeof(name), "%08X.vkpipelines", g.xex.execution.title_id);
+        o.pipeline_cache = std::filesystem::temp_directory_path(ec) / "xenoforge-cache" / name;
+    }
+    g.renderer = render::Renderer::create(*g.device, processor, o, error);
     if (!g.renderer) return error = "renderer: " + error, false;
     processor.set_sink(g.renderer.get());
     return true;
@@ -190,6 +201,31 @@ void print_report(Game &g, bool waiting) {
         }
     }
     std::fflush(stdout);
+}
+
+void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
+    const gpu::Counts &counts = kernel::gpu_command_processor(*g.kernel).counts();
+    const uint64_t swaps = counts.swaps.load(), draws = counts.draws.load(), resolves = counts.resolves.load();
+    const double dt = wall - r.last_wall;
+    if (dt <= 0) return;
+    // the renderer's time without waiting for a call of its: over the time
+    // since the last report it gave (a call under way when this one asks
+    // shows as "-")
+    render::Report report;
+    double busy = -1;
+    if (g.renderer && g.renderer->try_report(report)) {
+        busy = (report.seconds - r.last_busy) / (wall - r.last_busy_wall);
+        r.last_busy = report.seconds, r.last_busy_wall = wall;
+    }
+    char renderer[48] = "";
+    if (g.renderer)
+        std::snprintf(renderer, sizeof(renderer), busy < 0 ? ", renderer busy -" : ", renderer busy %.0f%%",
+                      busy * 100);
+    std::printf("rates: %6.1f s (guest %6.1f s): %6llu swaps, %5.1f/s, %6.0f draws/s, %4.0f resolves/s%s%s\n", wall,
+                g.kernel->uptime_ms() / 1000.0, (unsigned long long)swaps, (swaps - r.last_swaps) / dt,
+                (draws - r.last_draws) / dt, (resolves - r.last_resolves) / dt, renderer, extra.c_str());
+    std::fflush(stdout);
+    r.last_wall = wall, r.last_swaps = swaps, r.last_draws = draws, r.last_resolves = resolves;
 }
 
 bool parse_numbers(const std::string &list, std::set<uint64_t> &out) {
