@@ -37,7 +37,9 @@ onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segund
   `../external/xna/work/shaders` (10, de `tests/hlsl/`). Rodar: `XF_SHADERS=<pasta> build/shader_compare_test`.
   O `.defs` ao lado de cada shader traz as constantes literais do contêiner (o D3D as carrega com o shader).
 - **Renderizador (B3)**: `build/xfreplay <xtr> -o frame.png --compare <png do trace-dump> [--diff d.png] [-v]`;
-  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 17 frames batem com o Xenia).
+  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 29 frames batem com o Xenia; a referência é o
+  dump D3D12 do Xenia, `xenia-gpu-d3d12-trace-dump.exe`, em `../traces/dumps/d3d12`, com o Vulkan onde não há
+  D3D12 ou os dois discordam: parque e corrida do Chaves).
   Saídas do replay em `../traces/replay/`. `XF_VK_VALIDATION=1` liga a validação do Vulkan.
 - **Traces das nossas execuções** (o oráculo sem jogar no Xenia): `boot_<jogo> <iso> --trace-frames N,M
   --trace-dir <pasta>` (no player, `XF_TRACE_FRAMES`/`XF_TRACE_DIR`) grava `.xtr` no formato do Xenia; o
