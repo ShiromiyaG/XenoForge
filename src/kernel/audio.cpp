@@ -235,6 +235,12 @@ uint32_t Audio::register_client(uint32_t callback, uint32_t callback_arg, uint32
     return X_STATUS_SUCCESS;
 }
 
+bool Audio::valid_client(uint32_t driver) {
+    std::lock_guard<std::mutex> l(mutex_);
+    uint32_t index = driver & 0xFFFF;
+    return (driver & 0xFFFF0000) == DRIVER_TAG && index < MAX_CLIENTS && clients_[index].in_use;
+}
+
 void Audio::unregister_client(uint32_t index) {
     Objects &o = objects(*k);
     Thread *self = current_thread();
@@ -435,12 +441,15 @@ XF_EXPORT(xboxkrnl, XAudioGetSpeakerConfig) {
 // (driver, out): no voice category's volume changed
 XF_EXPORT(xboxkrnl, XAudioGetVoiceCategoryVolumeChangeMask) {
     objects(k).scheduler->yield(); // Xenia's MaybeYield: the games poll it
+    // (the console's: a driver that is not registered, or no output, is E_INVALIDARG)
+    if (!audio(k).valid_client(arg(k, c, 0)) || !arg(k, c, 1)) return result(c, X_E_INVALIDARG);
     k.store32(arg(k, c, 1), 0);
     result(c, X_STATUS_SUCCESS);
 }
 
-// (category, out): full volume
+// (category, out): full volume; the console's kernel refuses a category of 32 or more (its oracle took 0 to 31)
 XF_EXPORT(xboxkrnl, XAudioGetVoiceCategoryVolume) {
+    if (arg(k, c, 0) >= 32 || !arg(k, c, 1)) return result(c, X_E_INVALIDARG);
     k.store32(arg(k, c, 1), std::bit_cast<uint32_t>(1.0f));
     result(c, X_STATUS_SUCCESS);
 }
@@ -473,13 +482,17 @@ XF_EXPORT(xboxkrnl, XAudioRegisterRenderDriverClient) {
     result(c, X_STATUS_SUCCESS);
 }
 
+// A driver handle that is not a registered client is E_INVALIDARG in the three calls that take one, as on the console's
+// kernel (Xenia's drivers took any index and said success).
 XF_EXPORT(xboxkrnl, XAudioUnregisterRenderDriverClient) {
+    if (!audio(k).valid_client(arg(k, c, 0))) return result(c, X_E_INVALIDARG);
     audio(k).unregister_client(arg(k, c, 0) & 0xFFFF);
     result(c, X_STATUS_SUCCESS);
 }
 
 // (driver, samples): 6 channels of 256 big-endian floats, one after another
 XF_EXPORT(xboxkrnl, XAudioSubmitRenderDriverFrame) {
+    if (!audio(k).valid_client(arg(k, c, 0))) return result(c, X_E_INVALIDARG);
     audio(k).submit_frame(arg(k, c, 0) & 0xFFFF, arg(k, c, 1));
     result(c, X_STATUS_SUCCESS);
 }

@@ -17,11 +17,13 @@
 // MD5 and SHA-512, a DES library and aes_128.
 //
 // The games keep the contexts in their own memory, so they have Xenia's
-// layouts, big-endian:
+// layouts, big-endian, as the console's kernel has them (compared with it
+// by the private oracle; where Xenia differs, the console's way is here):
 //   XECRYPT_SHA_STATE (0x58)      count (bytes, 32 bits), 5 words, buffer[64]
 //   XECRYPT_HMACSHA_STATE (0xB0)  the inner SHA state, then the outer one
 //   XECRYPT_SHA256_STATE (0x64)   count (32 bits), 8 words, buffer[64]
-//   XECRYPT_SHA512_STATE (0xC8)   count (64 bits), 8 words, buffer[128]; SHA-384's too
+//   XECRYPT_SHA512_STATE (0xC8)   count (64 bits as two words, the low one
+//                                 first), 8 words, buffer[128]; SHA-384's too
 //   XECRYPT_MD5_STATE (0x54)      count (32 bits), A to D, buffer[64]
 //   XECRYPT_RC4_STATE (0x102)     S[256], i, j
 //   XECRYPT_AES_STATE (0x160)     11 encryption round keys, then the 11 of the
@@ -29,8 +31,11 @@
 //   XECRYPT_DES_STATE (0x80)      16 round keys as Xenia's DES library keeps
 //                                 them: 48 bits in little-endian 64-bit words
 //   XECRYPT_DES3_STATE (0x180)    three of them
-// The buffer keeps the partial block at its start; what the rest holds, and
-// what each Final leaves, is what Xenia leaves (each export says).
+// The buffer keeps the partial block at its start. A Final pads in the buffer
+// and leaves the digest in the state words (the console's way; Xenia leaves
+// the words and writes the digest into the buffer). The DES and DES3 key
+// schedules are Xenia's library's: the console's differ and are opaque (a
+// title only passes them back to the cipher).
 //
 // Leaner than, or beyond, Xenia: SHA-384 (Init, Update, Final) and the
 // one-shot SHA-384 and SHA-512, which Xenia lacks, follow its SHA-512;
@@ -167,7 +172,8 @@ template <class H> struct Context {
 
     H load() const {
         H s;
-        s.count = count_size == 8 ? k.load64(p) : k.load32(p);
+        // the 64-bit count of SHA-384 and SHA-512 is two big-endian words, the low one first (the console's)
+        s.count = count_size == 8 ? uint64_t(k.load32(p + 4)) << 32 | k.load32(p) : k.load32(p);
         for (size_t i = 0; i < H::words; i++) {
             uint32_t at = words_at() + uint32_t(i * sizeof(typename H::Word));
             if constexpr (sizeof(typename H::Word) == 8)
@@ -179,9 +185,10 @@ template <class H> struct Context {
         return s;
     }
     void store_count(const H &s) const {
-        if (count_size == 8)
-            k.store64(p, s.count);
-        else
+        if (count_size == 8) {
+            k.store32(p, uint32_t(s.count));
+            k.store32(p + 4, uint32_t(s.count >> 32));
+        } else
             k.store32(p, uint32_t(s.count));
     }
     void store_words(const H &s) const {
@@ -215,6 +222,22 @@ template <class H> void update3(Kernel &k, ppc::Context &c, int first, H &s, boo
 }
 
 // ---- SHA-1 ----
+
+// A final as the console does it, for every hash: the padding made in the context's own buffer (which keeps the last
+// block compressed), the digest left in the state words, as bytes (the words past a shorter digest, SHA-384's last
+// two, zeroed), and the count as it was.
+template <class H>
+void finish(Kernel &k, const Context<H> &ctx, size_t digest_size, bool little_endian, uint32_t out, uint32_t out_size) {
+    H s = ctx.load();
+    s.pad(H::block == 128 ? 16 : 8, little_endian);
+    uint8_t digest[H::words * sizeof(typename H::Word)];
+    s.digest(digest, digest_size, little_endian);
+    output(k, out, out_size, digest, digest_size);
+    uint8_t *words = k.host(ctx.words_at());
+    std::memset(words, 0, sizeof(digest));
+    std::memcpy(words, digest, digest_size);
+    ctx.store_buffer(s, H::block);
+}
 
 XF_EXPORT(xboxkrnl, XeCryptShaInit) { sha1_context(k, arg(k, c, 0)).init(sha1_initial); }
 
@@ -341,20 +364,19 @@ XF_EXPORT(xboxkrnl, XeCryptHmacSha) {
 }
 
 XF_EXPORT(xboxkrnl, XeCryptHmacShaVerify) {
-    // (..., expected, expected_size): as much of the HMAC as is given
+    // (..., expected, expected_size): as much of the HMAC as is given. The console's refuses a size past the
+    // digest's 20 bytes (Xenia compares the first 20).
     uint8_t digest[20];
     hmac_sha3(k, c, digest);
     uint32_t expected = arg(k, c, 8), expected_size = arg(k, c, 9);
-    size_t size = std::min<size_t>(sizeof(digest), expected_size);
-    result(c, !size || std::memcmp(digest, k.host(expected), size) == 0);
+    if (expected_size > sizeof(digest)) return result(c, 0);
+    result(c, !expected_size || std::memcmp(digest, k.host(expected), expected_size) == 0);
 }
 
 // ---- SHA-256, SHA-384, SHA-512 ----
 
-// The contexts as Xenia leaves them: an update writes back the whole buffer
-// (the rest of it as Brumme's SHA-256 and FFmpeg's SHA-512 leave it); a
-// final writes only the digest, to the buffer's start, leaving the words
-// and the count as they were.
+// The contexts as the console leaves them: an update writes back the whole
+// buffer; a final is `finish` above.
 
 XF_EXPORT(xboxkrnl, XeCryptSha256Init) { sha256_context(k, arg(k, c, 0)).init(sha256_initial); }
 
@@ -369,13 +391,7 @@ XF_EXPORT(xboxkrnl, XeCryptSha256Update) {
 }
 
 XF_EXPORT(xboxkrnl, XeCryptSha256Final) {
-    auto ctx = sha256_context(k, arg(k, c, 0));
-    Sha256 s = ctx.load();
-    s.pad(8);
-    uint8_t digest[32];
-    s.digest(digest, sizeof(digest));
-    output(k, arg(k, c, 1), arg(k, c, 2), digest, sizeof(digest));
-    std::memcpy(k.host(ctx.buffer_at()), digest, sizeof(digest));
+    finish(k, sha256_context(k, arg(k, c, 0)), 32, false, arg(k, c, 1), arg(k, c, 2));
 }
 
 XF_EXPORT(xboxkrnl, XeCryptSha256) {
@@ -399,13 +415,7 @@ void sha512_update(Kernel &k, ppc::Context &c) {
 
 // (state, output, output_size); SHA-384 is SHA-512's first 48 bytes
 void sha512_final(Kernel &k, ppc::Context &c, size_t digest_size) {
-    auto ctx = sha512_context(k, arg(k, c, 0));
-    Sha512 s = ctx.load();
-    s.pad(16);
-    uint8_t digest[64];
-    s.digest(digest, digest_size);
-    output(k, arg(k, c, 1), arg(k, c, 2), digest, digest_size);
-    std::memcpy(k.host(ctx.buffer_at()), digest, digest_size);
+    finish(k, sha512_context(k, arg(k, c, 0)), digest_size, false, arg(k, c, 1), arg(k, c, 2));
 }
 
 void sha512_oneshot(Kernel &k, ppc::Context &c, const uint64_t (&initial)[8], size_t digest_size) {
@@ -442,17 +452,7 @@ XF_EXPORT(xboxkrnl, XeCryptMd5Update) {
     ctx.store_buffer(s, 64);
 }
 
-XF_EXPORT(xboxkrnl, XeCryptMd5Final) {
-    // the digest is left in the state words, as bytes; the count and the
-    // buffer stay
-    auto ctx = md5_context(k, arg(k, c, 0));
-    Md5 s = ctx.load();
-    s.pad(8, true);
-    uint8_t digest[16];
-    s.digest(digest, sizeof(digest), true);
-    output(k, arg(k, c, 1), arg(k, c, 2), digest, sizeof(digest));
-    std::memcpy(k.host(ctx.words_at()), digest, sizeof(digest));
-}
+XF_EXPORT(xboxkrnl, XeCryptMd5Final) { finish(k, md5_context(k, arg(k, c, 0)), 16, true, arg(k, c, 1), arg(k, c, 2)); }
 
 XF_EXPORT(xboxkrnl, XeCryptMd5) {
     Md5 s = start<Md5>(md5_initial);
@@ -734,14 +734,10 @@ XF_EXPORT(xboxkrnl, XeCryptBnQwNeRsaPubCrypt) {
     result(c, 1);
 }
 
-XF_EXPORT(xboxkrnl, XeCryptBnQwBeSigFormat) {
-    // (XECRYPT_SIG *, hash[20], salt[10]): the block XeCryptBnQwBeSigVerify
-    // compares against, built as a big-endian number (zeros, 1, the salt, a
-    // hash of the inputs, 0xBC; everything before the hash encrypted with
-    // it by RC4, the top bit cleared), stored with its 64-bit words in
-    // reverse (after ExCrypt, as Xenia)
-    uint32_t sig = arg(k, c, 0);
-    const uint8_t *hash = k.host(arg(k, c, 1)), *salt = k.host(arg(k, c, 2));
+// The block XeCryptBnQwBeSigVerify compares against, built as a big-endian number (zeros, 1, the salt, a hash of the
+// inputs, 0xBC; everything before the hash encrypted with it by RC4, the top bit cleared), as the signature holds it:
+// its 64-bit words in reverse (after ExCrypt, as Xenia).
+void sig_format(const uint8_t *hash, const uint8_t *salt, uint8_t image[0x100]) {
     uint8_t block[0x100] = {};
     block[0xE0] = 1;
     std::memcpy(block + 0xE1, salt, 0xA);
@@ -755,52 +751,43 @@ XF_EXPORT(xboxkrnl, XeCryptBnQwBeSigFormat) {
     rc4_key(rc4, block + 0xEB, 0x14);
     rc4_crypt(rc4, block, 0xEB);
     block[0] &= 0x7F;
-    for (int i = 0; i < 32; i++) std::memcpy(k.host(sig + 8 * i), block + 0x100 - 8 * (i + 1), 8);
+    for (int i = 0; i < 32; i++) std::memcpy(image + 8 * i, block + 0x100 - 8 * (i + 1), 8);
 }
 
-XF_EXPORT(xboxkrnl, XeCryptBnQwBeSigVerify) {
-    // (XECRYPT_SIG *, hash, salt, XECRYPT_RSA *): Xenia's stub, valid (the
-    // hash comes from XeCryptRotSumSha; the known salts are "XBOX360SVC",
-    // "XBOX360XTT", "TDBXBOX36O")
-    result(c, 1);
+XF_EXPORT(xboxkrnl, XeCryptBnQwBeSigFormat) {
+    // (XECRYPT_SIG *, hash[20], salt[10])
+    uint8_t image[0x100];
+    sig_format(k.host(arg(k, c, 1)), k.host(arg(k, c, 2)), image);
+    std::memcpy(k.host(arg(k, c, 0)), image, sizeof(image));
 }
 
-XF_EXPORT(xboxkrnl, XeCryptBnQwNeModInv) {
-    // (n): n^-1 mod 2^64 for an odd n, from five correct bits by Newton's
-    // steps (Xenia's arithmetic); a 64-bit result
-    uint64_t input = arg64(k, c, 0);
+// n^-1 mod 2^64 for an odd n, from five correct bits by Newton's steps (Xenia's arithmetic; an even n gives what the
+// steps give, as on the console)
+uint64_t mod_inv64(uint64_t input) {
     uint64_t result = (input * 3) ^ 2;
     uint64_t intermediate = 1 - result * input;
     for (uint32_t i = 5; i < 32; i <<= 1) {
         result = result * (intermediate + 1);
         intermediate = intermediate * intermediate;
     }
-    c.r[3] = result * (intermediate + 1);
+    return result * (intermediate + 1);
 }
 
-XF_EXPORT(xboxkrnl, XeCryptBnQwNeModMul) {
-    // (a, b, out, inverse, modulus, size): Montgomery's multiplication,
-    // out = a * b / 2^(64 * size) mod modulus, inverse being
-    // XeCryptBnQwNeModInv(modulus[0]). As the kernel (and Xenia) do it: the
-    // sums of a * b and m * modulus kept apart and subtracted at the end,
-    // the modulus added back unless the first is larger. The inputs are only
-    // read before out is written, so out may be one of them.
-    uint32_t a = arg(k, c, 0), b = arg(k, c, 1), out = arg(k, c, 2), modulus = arg(k, c, 4);
-    uint64_t inverse = arg64(k, c, 3);
-    uint32_t n = arg(k, c, 5);
-    if (!n) return;
+// Montgomery's multiplication of n-word numbers (least significant word first), out = a * b / 2^(64 * n) mod
+// modulus, inverse being mod_inv64(modulus[0]). As the kernel (and Xenia) do it: the sums of a * b and m * modulus
+// kept apart and subtracted at the end, the modulus added back unless the first is larger. The inputs are only read
+// before out is written, so out may be one of them.
+void mont_mul(const uint64_t *a, const uint64_t *b, uint64_t *out, uint64_t inverse, const uint64_t *modulus,
+              uint32_t n) {
     using u128 = unsigned __int128;
-    std::vector<uint64_t> ab(n), mn(n), m_words(n);
-    uint64_t a0 = k.load64(a);
-    for (uint32_t j = 0; j < n; j++) m_words[j] = k.load64(modulus + 8 * j);
+    std::vector<uint64_t> ab(n), mn(n);
     for (uint32_t i = 0; i < n; i++) {
-        uint64_t bi = k.load64(b + 8 * i);
         // makes the low words of both sums equal, so they drop out of the shift
-        uint64_t m = (ab[0] - mn[0] + bi * a0) * inverse;
+        uint64_t m = (ab[0] - mn[0] + b[i] * a[0]) * inverse;
         uint64_t ab_carry = 0, mn_carry = 0;
         for (uint32_t j = 0; j < n; j++) {
-            u128 t = u128(bi) * k.load64(a + 8 * j) + ab[j] + ab_carry;
-            u128 u = u128(m) * m_words[j] + mn[j] + mn_carry;
+            u128 t = u128(b[i]) * a[j] + ab[j] + ab_carry;
+            u128 u = u128(m) * modulus[j] + mn[j] + mn_carry;
             if (j) {
                 ab[j - 1] = uint64_t(t);
                 mn[j - 1] = uint64_t(u);
@@ -819,13 +806,63 @@ XF_EXPORT(xboxkrnl, XeCryptBnQwNeModMul) {
         }
     uint64_t carry = 0, borrow = 0;
     for (uint32_t i = 0; i < n; i++) {
-        u128 sum = u128(ab[i]) + (greater ? 0 : m_words[i]) + carry;
+        u128 sum = u128(ab[i]) + (greater ? 0 : modulus[i]) + carry;
         carry = uint64_t(sum >> 64);
         uint64_t lo = uint64_t(sum), diff = lo - mn[i];
         uint64_t next_borrow = lo < mn[i] || diff < borrow;
-        k.store64(out + 8 * i, diff - borrow);
+        out[i] = diff - borrow;
         borrow = next_borrow;
     }
+}
+
+XF_EXPORT(xboxkrnl, XeCryptBnQwBeSigVerify) {
+    // (XECRYPT_SIG *, hash, salt, XECRYPT_RSA *): the console's, where Xenia's is a stub that says valid. The key
+    // must have 0x20 words and the exponent 3 or 65537, else it answers 0. The signature's words (least significant
+    // first, as XeCryptBnQwBeSigFormat stores a block) go through the exponent by Montgomery products, squaring
+    // and multiplying by the signature itself, with no conversion into or out of Montgomery's form: the result is
+    // signature^e / 2^(2048 * (e - 1)) mod modulus, which is compared with the block XeCryptBnQwBeSigFormat makes
+    // of the hash and the salt (a signature's maker allows for it; checked against the console's kernel). The hash
+    // comes from XeCryptRotSumSha; the known salts are "XBOX360SVC", "XBOX360XTT", "TDBXBOX36O".
+    uint32_t sig = arg(k, c, 0), rsa = arg(k, c, 3);
+    constexpr uint32_t words = 0x20;
+    uint32_t exponent = k.load32(rsa + 4);
+    if (k.load32(rsa) != words || (exponent != 3 && exponent != 0x10001)) return result(c, 0);
+    uint64_t x[words], y[words], modulus[words];
+    for (uint32_t i = 0; i < words; i++) {
+        x[i] = y[i] = k.load64(sig + 8 * i);
+        modulus[i] = k.load64(rsa + 0x10 + 8 * i);
+    }
+    uint64_t inverse = mod_inv64(modulus[0]);
+    for (int bit = std::bit_width(exponent) - 2; bit >= 0; bit--) {
+        mont_mul(y, y, y, inverse, modulus, words);
+        if (exponent >> bit & 1) mont_mul(y, x, y, inverse, modulus, words);
+    }
+    uint8_t image[0x100];
+    sig_format(k.host(arg(k, c, 1)), k.host(arg(k, c, 2)), image);
+    uint8_t power[0x100];
+    for (uint32_t i = 0; i < words; i++) put_be64(power + 8 * i, y[i]);
+    result(c, std::memcmp(power, image, sizeof(image)) == 0);
+}
+
+XF_EXPORT(xboxkrnl, XeCryptBnQwNeModInv) {
+    // (n): a 64-bit result
+    c.r[3] = mod_inv64(arg64(k, c, 0));
+}
+
+XF_EXPORT(xboxkrnl, XeCryptBnQwNeModMul) {
+    // (a, b, out, inverse, modulus, size): see mont_mul
+    uint32_t a = arg(k, c, 0), b = arg(k, c, 1), out = arg(k, c, 2), modulus = arg(k, c, 4);
+    uint64_t inverse = arg64(k, c, 3);
+    uint32_t n = arg(k, c, 5);
+    if (!n) return;
+    std::vector<uint64_t> aw(n), bw(n), mw(n), ow(n);
+    for (uint32_t i = 0; i < n; i++) {
+        aw[i] = k.load64(a + 8 * i);
+        bw[i] = k.load64(b + 8 * i);
+        mw[i] = k.load64(modulus + 8 * i);
+    }
+    mont_mul(aw.data(), bw.data(), ow.data(), inverse, mw.data(), n);
+    for (uint32_t i = 0; i < n; i++) k.store64(out + 8 * i, ow[i]);
 }
 
 // A PKCS #1 v1.5 signature block for a SHA-1 hash, as a little-endian
@@ -847,8 +884,8 @@ void pkcs1_format(const uint8_t *hash, uint32_t format, uint8_t *sig, uint32_t s
         std::memcpy(sig + 0x14, digest_info0, sizeof(digest_info0));
     else if (format == 1)
         std::memcpy(sig + 0x14, digest_info1, sizeof(digest_info1));
-    else if (format == 2)
-        sig[0x14] = 0;
+    else
+        sig[0x14] = 0; // format 2, and any other the console takes as it
 }
 
 XF_EXPORT(xboxkrnl, XeCryptBnDwLePkcs1Format) {

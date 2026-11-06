@@ -140,6 +140,12 @@ struct FilesFamily {
 
 Ref<File> file_by_handle(Objects &o, uint32_t handle) { return o.lookup<File>(handle); }
 
+// The status for a handle that is no file, as the console's kernel answers: no object at all is
+// STATUS_INVALID_HANDLE, an object of another type (-2 is the current thread) is NT's type mismatch.
+uint32_t not_a_file(Objects &o, uint32_t handle) {
+    return o.lookup<Object>(handle) ? X_STATUS_OBJECT_TYPE_MISMATCH : X_STATUS_INVALID_HANDLE;
+}
+
 // the file's ports, and its own event unless the request had one of its own
 // (NT sets the file object's event only then), after a request (lock not held)
 void complete(File &f, uint32_t apc_context, uint32_t status, uint32_t bytes, bool signal_file = true) {
@@ -1111,6 +1117,8 @@ XF_EXPORT(xboxkrnl, NtQueryDirectoryFile) {
 
 // (file, io_status_block): nothing is buffered
 XF_EXPORT(xboxkrnl, NtFlushBuffersFile) {
+    // a handle that is not a file is refused, as the console's does (checked against its kernel)
+    if (!file_by_handle(objects(k), arg(k, c, 0))) return result(c, not_a_file(objects(k), arg(k, c, 0)));
     write_iosb(k, arg(k, c, 1), X_STATUS_SUCCESS, 0);
     result(c, X_STATUS_SUCCESS);
 }
@@ -1121,7 +1129,8 @@ XF_EXPORT(xboxkrnl, NtFlushBuffersFile) {
 // as NT's does with nothing to cancel too
 XF_EXPORT(xboxkrnl, NtCancelIoFile) {
     Ref<File> f = file_by_handle(objects(k), arg(k, c, 0));
-    if (!f) return result(c, X_STATUS_INVALID_HANDLE);
+    // a handle that is not a file is refused as the console's kernel refuses it (checked against it)
+    if (!f) return result(c, not_a_file(objects(k), arg(k, c, 0)));
     for (Pending &p : k.state<FileCompletion>().take(*f, current_thread())) finish_pending(k, p, STATUS_CANCELLED, 0, true);
     write_iosb(k, arg(k, c, 1), X_STATUS_SUCCESS, 0);
     result(c, X_STATUS_SUCCESS);
@@ -1134,6 +1143,10 @@ XF_EXPORT(xboxkrnl, NtDeviceIoControlFile) {
     uint32_t code = arg(k, c, 5), output = arg(k, c, 8), output_length = arg(k, c, 9);
     constexpr uint32_t CACHE_SIZE = 0xFF000;
     constexpr uint32_t GET_DRIVE_GEOMETRY = 0x70000, GET_PARTITION_INFO = 0x74004;
+    // a handle that is no object is refused first (the console's kernel does; Xenia answers whichever file asks)
+    if (Ref<Object> object = objects(k).lookup<Object>(arg(k, c, 0));
+        !object || (object->type() != Object::Type::File && object->type() != Object::Type::Other))
+        return result(c, not_a_file(objects(k), arg(k, c, 0)));
     if (code == GET_DRIVE_GEOMETRY) {
         if (output_length < 8) return result(c, X_STATUS_BUFFER_TOO_SMALL);
         k.store32(output, CACHE_SIZE / 0x200); // sectors
@@ -1164,7 +1177,8 @@ XF_EXPORT(xboxkrnl, NtCreateIoCompletion) {
 XF_EXPORT(xboxkrnl, NtSetIoCompletion) {
     Objects &o = objects(k);
     Ref<IoCompletion> port = o.lookup<IoCompletion>(arg(k, c, 0));
-    if (!port) return result(c, X_STATUS_INVALID_HANDLE);
+    // (no object is invalid, one of another type a type mismatch, as the console's kernel answers)
+    if (!port) return result(c, not_a_file(o, arg(k, c, 0)));
     std::lock_guard<std::mutex> l(o.lock);
     port->post({arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4)});
     result(c, X_STATUS_SUCCESS);
@@ -1229,14 +1243,94 @@ XF_EXPORT(xboxkrnl, IoDeleteDevice) {
     if (uint32_t d = arg(k, c, 0)) k.memory().system_free(d);
 }
 
-// the I/O manager's driver calls (see the top of the file)
-XF_EXPORT(xboxkrnl, IoCheckShareAccess) { result(c, X_STATUS_SUCCESS); }
-XF_EXPORT(xboxkrnl, IoSetShareAccess) {}
-XF_EXPORT(xboxkrnl, IoRemoveShareAccess) {}
+// ---- share access (NT's IoSetShareAccess, IoCheckShareAccess, IoRemoveShareAccess) ----
+//
+// Xenia has none of these (they succeed, writing nothing). The console's kernel keeps a file object's access in the
+// bits of its first word, 0x40 read, 0x20 write, 0x10 delete, 0x08 shared read, 0x04 shared write, 0x02 shared
+// delete, and a SHARE_ACCESS as seven bytes: OpenCount, Readers, Writers, Deleters, SharedRead, SharedWrite,
+// SharedDelete (laid out and compared with its oracle). The rest is NT's documented algorithm.
+namespace {
+
+constexpr uint32_t X_STATUS_SHARING_VIOLATION = 0xC0000043;
+constexpr uint32_t FILE_OBJECT_ACCESS_BITS = 0x7E;
+
+struct Access {
+    uint8_t read, write, del, shared_read, shared_write, shared_delete;
+};
+
+// FILE_READ_DATA | FILE_EXECUTE, FILE_WRITE_DATA | FILE_APPEND_DATA, DELETE; FILE_SHARE_READ, _WRITE, _DELETE
+Access desired_access(uint32_t access, uint32_t share) {
+    return {uint8_t((access & 0x21) != 0), uint8_t((access & 0x06) != 0), uint8_t((access & 0x10000) != 0),
+            uint8_t((share & 1) != 0),     uint8_t((share & 2) != 0),     uint8_t((share & 4) != 0)};
+}
+
+void set_file_object_access(Kernel &k, uint32_t file_object, const Access &a) {
+    if (!file_object) return;
+    uint32_t flags = k.load32(file_object) & ~FILE_OBJECT_ACCESS_BITS;
+    flags |= a.read << 6 | a.write << 5 | a.del << 4 | a.shared_read << 3 | a.shared_write << 2 | a.shared_delete << 1;
+    k.store32(file_object, flags);
+}
+
+} // namespace
+
+// (desired access, desired share access, file object, SHARE_ACCESS)
+XF_EXPORT(xboxkrnl, IoSetShareAccess) {
+    uint32_t file_object = arg(k, c, 2), share_access = arg(k, c, 3);
+    Access a = desired_access(arg(k, c, 0), arg(k, c, 1));
+    set_file_object_access(k, file_object, a);
+    if (!share_access) return;
+    bool any = a.read || a.write || a.del;
+    const uint8_t bytes[7] = {uint8_t(any),
+                              a.read,
+                              a.write,
+                              a.del,
+                              uint8_t(any ? a.shared_read : 0),
+                              uint8_t(any ? a.shared_write : 0),
+                              uint8_t(any ? a.shared_delete : 0)};
+    std::memcpy(k.host(share_access), bytes, sizeof(bytes));
+}
+
+// (desired access, desired share access, file object, SHARE_ACCESS, update): STATUS_SHARING_VIOLATION when what is
+// wanted conflicts with what the users hold, else, if update, the new user counted
+XF_EXPORT(xboxkrnl, IoCheckShareAccess) {
+    uint32_t file_object = arg(k, c, 2), share_access = arg(k, c, 3);
+    bool update = uint8_t(arg(k, c, 4)) != 0;
+    Access a = desired_access(arg(k, c, 0), arg(k, c, 1));
+    set_file_object_access(k, file_object, a);
+    if (!share_access || !(a.read || a.write || a.del)) return result(c, X_STATUS_SUCCESS);
+    uint8_t *s = k.host(share_access);
+    uint8_t &open = s[0], &readers = s[1], &writers = s[2], &deleters = s[3];
+    uint8_t &shared_read = s[4], &shared_write = s[5], &shared_delete = s[6];
+    if ((a.read && shared_read < open) || (a.write && shared_write < open) || (a.del && shared_delete < open) ||
+        (readers && !a.shared_read) || (writers && !a.shared_write) || (deleters && !a.shared_delete))
+        return result(c, X_STATUS_SHARING_VIOLATION);
+    if (update) {
+        open++, readers += a.read, writers += a.write, deleters += a.del;
+        shared_read += a.shared_read, shared_write += a.shared_write, shared_delete += a.shared_delete;
+    }
+    result(c, X_STATUS_SUCCESS);
+}
+
+// (file object, SHARE_ACCESS): the file object's user taken back out of the counts
+XF_EXPORT(xboxkrnl, IoRemoveShareAccess) {
+    uint32_t file_object = arg(k, c, 0), share_access = arg(k, c, 1);
+    if (!file_object || !share_access) return;
+    uint32_t flags = k.load32(file_object);
+    uint8_t read = flags >> 6 & 1, write = flags >> 5 & 1, del = flags >> 4 & 1;
+    if (!(read || write || del)) return;
+    uint8_t *s = k.host(share_access);
+    s[0]--, s[1] -= read, s[2] -= write, s[3] -= del;
+    s[4] -= uint8_t(flags >> 3 & 1), s[5] -= uint8_t(flags >> 2 & 1), s[6] -= uint8_t(flags >> 1 & 1);
+}
+
+// the I/O manager's other driver calls (see the top of the file)
 XF_EXPORT(xboxkrnl, IoCompleteRequest) {}
 XF_EXPORT(xboxkrnl, IoInvalidDeviceRequest) { result(c, X_STATUS_INVALID_DEVICE_REQUEST); }
 XF_EXPORT(xboxkrnl, IoDismountVolume) { result(c, X_STATUS_SUCCESS); }
-XF_EXPORT(xboxkrnl, IoDismountVolumeByFileHandle) { result(c, X_STATUS_SUCCESS); }
+XF_EXPORT(xboxkrnl, IoDismountVolumeByFileHandle) {
+    // a handle that is no file is refused, as the console's kernel does
+    result(c, file_by_handle(objects(k), arg(k, c, 0)) ? X_STATUS_SUCCESS : not_a_file(objects(k), arg(k, c, 0)));
+}
 
 // the file system cache's size: nothing is cached here
 XF_EXPORT(xboxkrnl, FscSetCacheElementCount) { result(c, X_STATUS_SUCCESS); }
@@ -1281,8 +1375,11 @@ XF_EXPORT(xboxkrnl, NtQuerySymbolicLinkObject) {
     uint32_t target = arg(k, c, 1);
     Objects &o = objects(k);
     Ref<Object> object = o.lookup<Object>(arg(k, c, 0));
+    // a handle that is no object is STATUS_INVALID_HANDLE on the console's kernel (ours said no such file); one of
+    // another type is NT's type mismatch (the console's answer was not seen)
+    if (!object) return result(c, X_STATUS_INVALID_HANDLE);
     auto *link = dynamic_cast<SymbolicLink *>(object.get());
-    if (!link) return result(c, X_STATUS_NO_SUCH_FILE);
+    if (!link) return result(c, X_STATUS_OBJECT_TYPE_MISMATCH);
     uint32_t length = std::min<uint32_t>(k.load16(target + 2), uint32_t(link->target.size()));
     if (length) std::memcpy(k.host(k.load32(target + 4)), link->target.data(), length);
     k.store16(target, uint16_t(length));

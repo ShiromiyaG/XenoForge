@@ -42,19 +42,30 @@ constexpr uint32_t X_MEM_16MB_PAGES = 0x80000000;
 constexpr uint32_t X_PAGE_NOACCESS = 0x00000001;
 constexpr uint32_t X_PAGE_READONLY = 0x00000002;
 constexpr uint32_t X_PAGE_READWRITE = 0x00000004;
-constexpr uint32_t X_PAGE_EXECUTE = 0x00000010;
 constexpr uint32_t X_PAGE_EXECUTE_READ = 0x00000020;
 constexpr uint32_t X_PAGE_EXECUTE_READWRITE = 0x00000040;
-constexpr uint32_t X_PAGE_EXECUTE_WRITECOPY = 0x00000080;
 constexpr uint32_t X_PAGE_NOCACHE = 0x00000200;
 constexpr uint32_t X_PAGE_WRITECOMBINE = 0x00000400;
 
 constexpr uint32_t X_STATUS_ACCESS_DENIED = 0xC0000022;
 constexpr uint32_t X_STATUS_BUFFER_TOO_SMALL = 0xC0000023;
 constexpr uint32_t X_STATUS_INVALID_PAGE_PROTECTION = 0xC0000045;
-constexpr uint32_t X_STATUS_MEMORY_NOT_ALLOCATED = 0xC00000A0;
 
 constexpr uint32_t RC = ALLOCATE_RESERVE | ALLOCATE_COMMIT;
+
+// The protections the console's kernel takes in NtAllocateVirtualMemory and NtProtectVirtualMemory (found with its
+// oracle): one access mode, no access, read-only, read-write, execute-read or execute-read-write (not write-copy,
+// execute alone or execute-write-copy), with the guard bit (not on no access) and the cache bits, 0x200, 0x400 (the
+// console refuses these two in its oracle, but the XDK's wrappers may set them: let through) and 0x1000, 0x2000.
+// Xenia refuses the execute modes of NtProtectVirtualMemory, which the console takes.
+bool valid_protect(uint32_t bits) {
+    uint32_t mode = bits & 0xFF;
+    if (bits & ~(0xFFu | 0x100 | 0x200 | 0x400 | 0x1000 | 0x2000)) return false;
+    if (mode != X_PAGE_NOACCESS && mode != X_PAGE_READONLY && mode != X_PAGE_READWRITE && mode != X_PAGE_EXECUTE_READ &&
+        mode != X_PAGE_EXECUTE_READWRITE)
+        return false;
+    return !(mode == X_PAGE_NOACCESS && (bits & 0x100));
+}
 
 // Xenia's HeapType, from where the heap is (memory.h's map)
 enum class HeapType { Virtual, Xex, Physical };
@@ -178,8 +189,13 @@ XF_EXPORT(xboxkrnl, NtAllocateVirtualMemory) {
     if (!(alloc_type & (X_MEM_COMMIT | X_MEM_RESET | X_MEM_RESERVE))) return result(c, X_STATUS_INVALID_PARAMETER);
     // MEM_RESET alone or not at all
     if ((alloc_type & X_MEM_RESET) && (alloc_type & ~X_MEM_RESET)) return result(c, X_STATUS_INVALID_PARAMETER);
-    if (protect_bits & (X_PAGE_EXECUTE | X_PAGE_EXECUTE_READ | X_PAGE_EXECUTE_READWRITE | X_PAGE_EXECUTE_WRITECOPY))
-        log("NtAllocateVirtualMemory: the game sets an EXECUTE bit (%08X)", protect_bits);
+    // the console's kernel answers INVALID_PARAMETER to any other type bit (its oracle: 0x40000000 and the ones
+    // here are the ones it lets through; Xenia ignores the rest) and STATUS_INVALID_PAGE_PROTECTION to a
+    // protection that is not one
+    if (alloc_type &
+        ~(X_MEM_COMMIT | X_MEM_RESERVE | X_MEM_RESET | X_MEM_TOP_DOWN | X_MEM_NOZERO | X_MEM_LARGE_PAGES | 0x40000000))
+        return result(c, X_STATUS_INVALID_PARAMETER);
+    if (!valid_protect(protect_bits)) return result(c, X_STATUS_INVALID_PAGE_PROTECTION);
 
     uint32_t base_addr = k.load32(base_addr_ptr), region_size = k.load32(region_size_ptr);
     uint32_t page_size;
@@ -194,9 +210,11 @@ XF_EXPORT(xboxkrnl, NtAllocateVirtualMemory) {
     }
 
     uint32_t adjusted_base = base_addr - (base_addr % page_size);
-    // some games pass negative sizes
-    uint32_t adjusted_size = int32_t(region_size) < 0 ? uint32_t(-int32_t(region_size)) : region_size;
-    adjusted_size = round_up(adjusted_size, adjusted_base ? page_size : 64 * 1024);
+    // a size that rounds past 4 GB is refused, as the console's kernel does (Xenia took a size with the top bit set
+    // as negative, "some games pass negative sizes"; the console's answer to 0xFFFFF000 is INVALID_PARAMETER)
+    uint32_t granule = adjusted_base ? page_size : 64 * 1024;
+    if (uint64_t(region_size) + granule - 1 > 0xFFFFFFFFull) return result(c, X_STATUS_INVALID_PARAMETER);
+    uint32_t adjusted_size = round_up(region_size, granule);
 
     uint32_t allocation_type = 0;
     if (alloc_type & X_MEM_RESERVE) allocation_type |= ALLOCATE_RESERVE;
@@ -236,10 +254,7 @@ XF_EXPORT(xboxkrnl, NtProtectVirtualMemory) {
     uint32_t base_addr_ptr = arg(k, c, 0), region_size_ptr = arg(k, c, 1), protect_bits = arg(k, c, 2);
     uint32_t old_protect_ptr = arg(k, c, 3);
     if (!base_addr_ptr || !region_size_ptr || !k.load32(region_size_ptr)) return result(c, X_STATUS_INVALID_PARAMETER);
-    if (protect_bits & (X_PAGE_EXECUTE | X_PAGE_EXECUTE_READ | X_PAGE_EXECUTE_READWRITE | X_PAGE_EXECUTE_WRITECOPY)) {
-        log("NtProtectVirtualMemory: the game sets an EXECUTE bit (%08X)", protect_bits);
-        return result(c, X_STATUS_INVALID_PAGE_PROTECTION);
-    }
+    if (!valid_protect(protect_bits)) return result(c, X_STATUS_INVALID_PAGE_PROTECTION);
     uint32_t base_addr = k.load32(base_addr_ptr);
     Heap *heap = k.memory().heap_for(base_addr);
     if (!heap || heap_type(heap) != HeapType::Virtual) return result(c, X_STATUS_INVALID_PARAMETER);
@@ -260,7 +275,10 @@ XF_EXPORT(xboxkrnl, NtFreeVirtualMemory) {
     // (base_addr_ptr, region_size_ptr, free_type, debug_memory)
     uint32_t base_addr_ptr = arg(k, c, 0), region_size_ptr = arg(k, c, 1), free_type = arg(k, c, 2);
     uint32_t base_addr_value = k.load32(base_addr_ptr), region_size_value = k.load32(region_size_ptr);
-    if (!base_addr_value) return result(c, X_STATUS_MEMORY_NOT_ALLOCATED);
+    // a base of zero and a type other than exactly decommit or release are INVALID_PARAMETER on the console's kernel
+    // (Xenia: not allocated for the base, and anything else is a release)
+    if (!base_addr_value || (free_type != X_MEM_DECOMMIT && free_type != 0x8000))
+        return result(c, X_STATUS_INVALID_PARAMETER);
     Heap *heap = k.memory().heap_for(base_addr_value);
     if (!heap || heap_type(heap) != HeapType::Virtual) return result(c, X_STATUS_INVALID_PARAMETER);
     bool ok;
@@ -279,7 +297,8 @@ XF_EXPORT(xboxkrnl, NtFreeVirtualMemory) {
 XF_EXPORT(xboxkrnl, NtQueryVirtualMemory) {
     // (base_address, X_MEMORY_BASIC_INFORMATION *, region_type)
     uint32_t base_address = arg(k, c, 0), info = arg(k, c, 1), region_type = arg(k, c, 2);
-    if (region_type > 2) return result(c, X_STATUS_INVALID_PARAMETER);
+    // the console's kernel takes a region type of 0 or 1 (Xenia's check allows 2 too)
+    if (region_type > 1) return result(c, X_STATUS_INVALID_PARAMETER);
     Heap *heap = k.memory().heap_for(base_address);
     RegionInfo region;
     if (!heap || !heap->query(base_address, region)) return result(c, X_STATUS_INVALID_PARAMETER);

@@ -1188,8 +1188,9 @@ XF_EXPORT(xboxkrnl, _snwprintf) {
 }
 
 XF_EXPORT(xboxkrnl, _vsnwprintf) {
-    // (buffer, buffer_count, format, va_list): what fits; the whole text's
-    // count even when it does not (Xenia's, unlike _snwprintf)
+    // (buffer, buffer_count, format, va_list): what fits, -1 when it does not
+    // (as _snwprintf; Xenia returns the whole text's count; the console's
+    // kernel returns -1, which its oracle showed)
     uint32_t buffer = arg(k, c, 0), buffer_count = arg(k, c, 1), format = arg(k, c, 2), arg_ptr = arg(k, c, 3);
     if (!buffer || !buffer_count || !format) return result(c, uint32_t(-1));
     ArgList args(k, c, arg_ptr, true);
@@ -1202,6 +1203,7 @@ XF_EXPORT(xboxkrnl, _vsnwprintf) {
         if (uint32_t(count) < buffer_count) k.store16(buffer + 2 * uint32_t(count), 0);
     } else {
         put_wide(k, buffer, data.wstr(), buffer_count);
+        count = -1;
     }
     result(c, uint32_t(count));
 }

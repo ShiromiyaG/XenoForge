@@ -513,6 +513,8 @@ XF_EXPORT(xboxkrnl, ObReferenceObjectByHandle) {
 XF_EXPORT(xboxkrnl, ObReferenceObjectByName) {
     std::string name = ansi_string(k, arg(k, c, 0));
     uint32_t type_ptr = arg(k, c, 2), out_ptr = arg(k, c, 4);
+    // no name, an empty one or one that is not rooted is STATUS_OBJECT_NAME_INVALID on the console's kernel
+    if (!arg(k, c, 0) || name.empty() || name[0] != '\\') return result(c, 0xC0000033);
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);
     uint32_t handle = name.empty() ? 0 : o.find_name(name);
@@ -657,6 +659,7 @@ XF_EXPORT(xboxkrnl, ObDereferenceObject) {
 XF_EXPORT(xboxkrnl, ObIsTitleObject) {
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);
+    if (!arg(k, c, 0)) return result(c, 0); // a null object is none of the title's (the console's answer)
     Object *object = o.by_guest(arg(k, c, 0));
     if (object && object->allocated)
         return result(c, (k.load16(object->guest - object_header::SIZE + object_header::FLAGS) &
@@ -667,6 +670,8 @@ XF_EXPORT(xboxkrnl, ObIsTitleObject) {
 XF_EXPORT(xboxkrnl, NtClose) {
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);
+    // -2, the current thread, is not a handle that closes (the console's kernel refuses it; Xenia accepts it)
+    if (arg(k, c, 0) == 0xFFFFFFFE) return result(c, X_STATUS_INVALID_HANDLE);
     result(c, o.release_handle(arg(k, c, 0)) ? X_STATUS_SUCCESS : X_STATUS_INVALID_HANDLE);
 }
 
@@ -676,11 +681,16 @@ XF_EXPORT(xboxkrnl, NtDuplicateObject) {
     uint32_t handle = arg(k, c, 0), new_ptr = arg(k, c, 1), options = arg(k, c, 2);
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);
-    uint32_t source = o.translate(handle), duplicate = 0xFFFFFFFF;
+    uint32_t source = o.translate(handle);
     Object *object = o.object_in(source);
-    if (object) duplicate = (options & 1) ? source : o.add_handle(object);
+    // the output is zeroed when the handle is no object (the console's kernel does; Xenia writes -1)
+    if (!object) {
+        if (new_ptr) k.store32(new_ptr, 0);
+        return result(c, X_STATUS_INVALID_HANDLE);
+    }
+    uint32_t duplicate = (options & 1) ? source : o.add_handle(object);
     if (new_ptr) k.store32(new_ptr, duplicate);
-    result(c, object ? X_STATUS_SUCCESS : X_STATUS_INVALID_HANDLE);
+    result(c, X_STATUS_SUCCESS);
 }
 
 // ---- symbolic links (ObCreateSymbolicLink), kept for the file system ----

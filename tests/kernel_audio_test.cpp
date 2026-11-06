@@ -155,8 +155,9 @@ void queries(ppc::Context &c) {
     CHECK(ex(c, "XAudioGetVoiceCategoryVolume", {1, out}) == 0);
     CHECK(K->load32(out) == std::bit_cast<uint32_t>(1.0f));
     K->store32(out, 0xCCCCCCCC);
-    CHECK(ex(c, "XAudioGetVoiceCategoryVolumeChangeMask", {0x41550000, out}) == 0);
-    CHECK(K->load32(out) == 0);
+    // (no client is registered yet: E_INVALIDARG, as the console's kernel answers; one registered gets 0 below)
+    CHECK(ex(c, "XAudioGetVoiceCategoryVolumeChangeMask", {0x41550000, out}) == 0x80070057);
+    CHECK(K->load32(out) == 0xCCCCCCCC);
     CHECK(ex(c, "XAudioEnableDucker", {1}) == 0);
     for (const char *name : {"XAudioGetDuckerLevel", "XAudioGetDuckerThreshold", "XAudioGetDuckerAttackTime",
                              "XAudioGetDuckerReleaseTime", "XAudioGetDuckerHoldTime"}) {
@@ -210,6 +211,10 @@ void clients(ppc::Context &c) {
                     double(span) / 10'000.0, 99.0 * 10'000'000.0 / double(span));
     CHECK(a.frames.load() - frames_before >= 100);
 
+    K->store32(scratch + 0x100, 0xCCCCCCCC);
+    CHECK(ex(c, "XAudioGetVoiceCategoryVolumeChangeMask", {driver_a, scratch + 0x100}) == 0);
+    CHECK(K->load32(scratch + 0x100) == 0);
+
     // gone: no callback after the unregistration returns, even if one ran
     CHECK(ex(c, "XAudioUnregisterRenderDriverClient", {driver_b}) == 0);
     CHECK(!in_callback_b);
@@ -219,10 +224,15 @@ void clients(ppc::Context &c) {
     uint64_t callbacks = a.callbacks.load();
     sleep_ms(c, 30);
     CHECK(callbacks_b == after && callbacks_a == 68 && a.callbacks.load() == callbacks);
-    // a frame for a client gone goes nowhere
-    uint64_t none = a.submitted_to_none.load();
-    CHECK(ex(c, "XAudioSubmitRenderDriverFrame", {driver_b, frame_b}) == 0);
-    CHECK(a.submitted_to_none.load() == none + 1 && a.frames.load() == submitted);
+    // a frame for a client gone is refused (E_INVALIDARG, as the console's kernel answers) and goes nowhere, as does
+    // a second unregistration, a change mask and a handle that never was
+    CHECK(ex(c, "XAudioSubmitRenderDriverFrame", {driver_b, frame_b}) == 0x80070057);
+    CHECK(a.frames.load() == submitted);
+    CHECK(ex(c, "XAudioUnregisterRenderDriverClient", {driver_b}) == 0x80070057);
+    CHECK(ex(c, "XAudioGetVoiceCategoryVolumeChangeMask", {driver_b, scratch + 0x100}) == 0x80070057);
+    CHECK(ex(c, "XAudioSubmitRenderDriverFrame", {0, frame_b}) == 0x80070057);
+    CHECK(ex(c, "XAudioGetVoiceCategoryVolume", {32, scratch + 0x100}) == 0x80070057);
+    CHECK(ex(c, "XAudioGetVoiceCategoryVolume", {31, scratch + 0x100}) == 0);
     CHECK(seen.bad_frames == 0 && seen.frames.load() == a.frames.load());
 
     // eight clients at most (their callbacks are A's: no frames, 64 calls each)

@@ -68,6 +68,22 @@ const std::string_view MSG112 =
     "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqr"
     "smnopqrstnopqrstu";
 
+// a made-up 2048-bit key (exponent 3) and its signature of the test's hash and salt
+const char *const TEST_MODULUS =
+    "686da64b941e5ab1c48ab6f70d920d95b2a4a09a012f105ba9abfef39e7a4e8f6e0e1b5d663b4c6199b1ea96da7f4ece874a"
+    "491eec5e5c030af98288c6bcc88ffa39c4b6af306a9def4f99dc68a0b34d43d11460fabf6b43a537e7d40cf72702be9e12ff"
+    "4cd78d5647cb737774274f2118fa00c99cb00288a12ca2899ab8838f74a156322451b8c1029063f2d6cc919cad1b2de34410"
+    "e7df7c1d9a8eca0f5c92ba2bb3358c75d50fbdfe8cbafd5e20cb6ad571ad71364d88dce8449c937465a5f528849c9717a1ea"
+    "6689663a26fe068f21c37dbf1d1a3a9133f24073e6f8066bc406fd59cd393632e410c90b12f38f9e24f9fa935d672e54bfa4"
+    "658af4d4267d";
+const char *const TEST_SIGNATURE =
+    "48c7ec71392dce2ce8fddcb4ba67951809ac1e22ff5abcd63970f117378900734eab0c252049fe48f8d0b84f41788f5a0ebd"
+    "dcde3422743fbc87e29653803643a7233ef5cbaade2873c18e0ae85b1b99a72f8b48e8b76df91f14aa3fa8eea7ca6f65e8c6"
+    "724512c9658d5b08a0ff6ffe69f75bf8d5fafd63647e6535bd960c967819bf5b9b4da3cad46738fd659cdfcfdf65d64f7005"
+    "e945cf7298dfa497d160cbd8aacc2e59c6df5b59093f29c697149e23f05ed215181f4c1050aaede8ef7eea0656a2d8f514ba"
+    "ea4b284fe21c09eb30e6588dee8bebbbf8d3c62b92bcd899ce75d5907d842ca577fcbe7596f5532a593dbd3d568a2f275edf"
+    "c3ee689dd2ed";
+
 void sha1(KernelHarness &h) {
     kernel::Kernel &k = *h.k;
     uint32_t out = h.alloc(64);
@@ -234,24 +250,30 @@ void sha2(KernelHarness &h) {
             done += part;
         }
         CHECK(done == 1000000);
-        uint64_t count = t.count_size == 8 ? k.load64(ctx) : k.load32(ctx);
-        CHECK(count == 1000000);
-        std::vector<uint8_t> before = get(h, words, t.block / 2), tail = get(h, buffer, t.block);
+        // (a 64-bit count is two words, the low one first, as the console's kernel keeps it)
+        auto count_of = [&] {
+            return t.count_size == 8 ? uint64_t(k.load32(ctx + 4)) << 32 | k.load32(ctx) : uint64_t(k.load32(ctx));
+        };
+        CHECK(count_of() == 1000000);
         call("Final", {ctx, out, 128});
         std::vector<uint8_t> digest = hex(t.million);
         CHECK(get(h, out, t.digest) == digest);
-        // Final writes the digest to the buffer's start, nothing else
-        CHECK(get(h, words, t.block / 2) == before && get(h, buffer, t.digest) == digest);
-        CHECK(get(h, buffer + uint32_t(t.digest), t.block - t.digest) ==
-              std::vector<uint8_t>(tail.begin() + t.digest, tail.end()));
-        CHECK((t.count_size == 8 ? k.load64(ctx) : k.load32(ctx)) == 1000000);
-        // finalized again, the digest over the message's tail (1000000 % 128
-        // = 64 bytes for SHA-384 and SHA-512, none for SHA-256): as in Xenia,
-        // only SHA-256's is the same; and cut short
+        // Final pads in the context's buffer (the length in bits ends it) and leaves the digest in the words, the
+        // ones past a shorter digest zero, and the count as it was: the console's way (Xenia's leaves the words)
+        std::vector<uint8_t> words_after = digest;
+        words_after.resize(t.block / 2, 0);
+        CHECK(get(h, words, t.block / 2) == words_after);
+        CHECK(get(h, buffer + uint32_t(t.block - 8), 8) == hex("00000000007a1200"));
+        CHECK(count_of() == 1000000);
+        // cut short
         std::memset(k.host(out), 0, 128);
+        call("Init", {ctx});
         call("Final", {ctx, out, 5});
-        CHECK((get(h, out, 5) == std::vector<uint8_t>(digest.begin(), digest.begin() + 5)) == (t.block == 64));
-        CHECK(k.load32(out + 5) == 0);
+        // (the digest of nothing, 5 bytes)
+        CHECK(get(h, out, 5) == hex(t.digest == 32   ? "e3b0c44298"
+                                    : t.digest == 48 ? "38b060a751"
+                                                     : "cf83e1357e") &&
+              k.load32(out + 5) == 0);
     }
 
     // the buffer as each update leaves it: SHA-256 keeps the input's whole
@@ -270,7 +292,7 @@ void sha2(KernelHarness &h) {
     h.krnl("XeCryptSha512Update", {ctx, input, 130});
     std::vector<uint8_t> staged(bytes130.begin(), bytes130.begin() + 128);
     staged[0] = 128, staged[1] = 129;
-    CHECK(k.load64(ctx) == 130 && get(h, ctx + 0x48, 128) == staged);
+    CHECK(k.load32(ctx) == 130 && k.load32(ctx + 4) == 0 && get(h, ctx + 0x48, 128) == staged);
     h.krnl("XeCryptSha512Final", {ctx, out, 64});
     CHECK(get(h, out, 64) == hex("90272b89212c81b9700897f611f13ac1d291c33a437000c1423336b4d962dd39ce23413160f02396"
                                  "3e12f4ccf90d2762b31bfc6818ef865e8a7cbf918a94c1db"));
@@ -514,7 +536,7 @@ void bignum(KernelHarness &h) {
     CHECK(number_is(h, ma, "627191e8aa359dd8dcb76ec9bbcf67608f3652fd76e7ab3864ae3d52e5bccef1"));
 
     // the signature block XeCryptBnQwBeSigVerify compares (Xenia's
-    // construction); the verification itself is Xenia's stub
+    // construction, the console's the same)
     uint32_t sig = h.alloc(0x100), hash = h.alloc(20);
     for (int i = 0; i < 20; i++) k.host(hash + i)[0] = uint8_t(0x10 + i);
     h.krnl("XeCryptBnQwBeSigFormat", {sig, hash, put(h, "XBOX360SVC")});
@@ -525,7 +547,28 @@ void bignum(KernelHarness &h) {
               "d45ef87fe84cb01f85ad5fc5756cde7eb05c492afd50de0f5423d9c08ab774f364e4281f756bc52af6a2dfa25fd00b34c02d0b"
               "76966ca3a718dd652ca967bb1f384ff779602fedeed8552a51cacd4811226c300622fb5142b3d0a67c7e0b272dfccea5e6f40b"
               "d7"));
-    CHECK(h.krnl("XeCryptBnQwBeSigVerify", {sig, hash, put(h, "XBOX360SVC"), rsa}) == 1);
+    // the verification is the console's (found with its oracle): a key of 0x20 words and an exponent of 3 or 65537,
+    // the signature through Montgomery products with no conversion, compared with that block. This signature was
+    // made for the key by the exponent's inverse over the block times 2^(2048 * (e - 1)).
+    uint32_t key = h.alloc(0x110), signature = h.alloc(0x100);
+    std::vector<uint8_t> modulus = hex(TEST_MODULUS);
+    k.store32(key, 0x20), k.store32(key + 4, 3);
+    std::memcpy(k.host(key + 0x10), modulus.data(), modulus.size());
+    std::vector<uint8_t> signature_bytes = hex(TEST_SIGNATURE);
+    std::memcpy(k.host(signature), signature_bytes.data(), signature_bytes.size());
+    uint32_t salt = put(h, "XBOX360SVC");
+    CHECK(h.krnl("XeCryptBnQwBeSigVerify", {signature, hash, salt, key}) == 1);
+    k.host(signature)[5] ^= 1; // one bit
+    CHECK(h.krnl("XeCryptBnQwBeSigVerify", {signature, hash, salt, key}) == 0);
+    k.host(signature)[5] ^= 1;
+    k.host(hash)[3] ^= 1; // another hash
+    CHECK(h.krnl("XeCryptBnQwBeSigVerify", {signature, hash, salt, key}) == 0);
+    k.host(hash)[3] ^= 1;
+    CHECK(h.krnl("XeCryptBnQwBeSigVerify", {signature, hash, put(h, "XBOX360XTT"), key}) == 0); // another salt
+    k.store32(key + 4, 5); // an exponent the console refuses
+    CHECK(h.krnl("XeCryptBnQwBeSigVerify", {signature, hash, salt, key}) == 0);
+    k.store32(key + 4, 3), k.store32(key, 0x1F); // a key of another size
+    CHECK(h.krnl("XeCryptBnQwBeSigVerify", {signature, hash, salt, key}) == 0);
 
     // PKCS #1 v1.5 for SHA-1 (RFC 8017 section 9.2), little-endian: reversed,
     // 00 01 FF.. 00, the DigestInfo, the hash

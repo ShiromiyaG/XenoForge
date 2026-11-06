@@ -214,9 +214,9 @@ void wide_printf(KernelHarness &h) {
     CHECK(read_wide(buffer) == u"-1/zz/123456789");
     CHECK(h.krnl("_vscwprintf", {h.wide(u"%d/%s/%I64x"), args}) == 15);
     CHECK(h.krnl("_vscwprintf", {0, args}) == 0xFFFFFFFF);
-    // _vsnwprintf: the whole count even when it does not fit (Xenia's)
+    // _vsnwprintf: -1 when it does not fit (the console's; Xenia returns the whole count)
     std::memset(K->host(buffer), 0xEE, 0x40);
-    CHECK(h.krnl("_vsnwprintf", {buffer, 3, h.wide(u"%d/%s"), args}) == 5);
+    CHECK(h.krnl("_vsnwprintf", {buffer, 3, h.wide(u"%d/%s"), args}) == uint32_t(-1));
     CHECK(K->load16(buffer) == '-' && K->load16(buffer + 4) == '/' && K->load16(buffer + 6) == 0xEEEE);
     CHECK(h.krnl("_vsnwprintf", {buffer, 8, h.wide(u"%d/%s"), args}) == 5 && read_wide(buffer) == u"-1/zz");
 }
@@ -332,25 +332,25 @@ void links_and_names(KernelHarness &h) {
     CHECK(h.krnl("NtOpenSymbolicLinkObject", {out, attributes("bad|name:")}) == X_STATUS_OBJECT_NAME_INVALID);
     CHECK(h.krnl("NtOpenSymbolicLinkObject", {out, 0}) == X_STATUS_INVALID_PARAMETER);
     CHECK(h.krnl("NtClose", {link}) == 0);
-    CHECK(h.krnl("NtQuerySymbolicLinkObject", {link, target}) == X_STATUS_NO_SUCH_FILE);
+    CHECK(h.krnl("NtQuerySymbolicLinkObject", {link, target}) == X_STATUS_INVALID_HANDLE);
 
     // a named event: opened by name (another reference on its handle), and
     // referenced by name as by handle
     uint32_t handle_ptr = h.alloc(4);
-    CHECK(h.krnl("NtCreateEvent", {handle_ptr, attributes("InventoryEvent"), 0, 0}) == 0);
+    CHECK(h.krnl("NtCreateEvent", {handle_ptr, attributes("\\InventoryEvent"), 0, 0}) == 0);
     uint32_t event = K->load32(handle_ptr);
-    CHECK(h.krnl("ObOpenObjectByName", {attributes("inventoryevent"), 0, 0, out}) == 0 && K->load32(out) == event);
+    CHECK(h.krnl("ObOpenObjectByName", {attributes("\\inventoryevent"), 0, 0, out}) == 0 && K->load32(out) == event);
     CHECK(h.krnl("ObOpenObjectByName", {attributes("nothing"), 0, 0, out}) == X_STATUS_OBJECT_NAME_NOT_FOUND);
     CHECK(h.krnl("ObOpenObjectByName", {0, 0, 0, out}) == X_STATUS_INVALID_PARAMETER);
     uint32_t body = h.alloc(4);
-    CHECK(h.krnl("ObReferenceObjectByName", {ansi("InventoryEvent"), 0, K->variable("ExEventObjectType"), 0, body}) ==
+    CHECK(h.krnl("ObReferenceObjectByName", {ansi("\\InventoryEvent"), 0, K->variable("ExEventObjectType"), 0, body}) ==
           0);
     CHECK(K->load32(body) != 0 && K->host(K->load32(body))[0] == 0);
     h.krnl("ObDereferenceObject", {K->load32(body)});
-    CHECK(h.krnl("ObReferenceObjectByName", {ansi("InventoryEvent"), 0, K->variable("ExMutantObjectType"), 0, body}) ==
-          X_STATUS_OBJECT_TYPE_MISMATCH);
-    CHECK(h.krnl("ObReferenceObjectByName", {ansi("Missing"), 0, 0, 0, body}) == X_STATUS_OBJECT_NAME_NOT_FOUND);
-    h.krnl("ObReferenceObjectByName", {ansi("InventoryEvent"), 0, 0, 0, body});
+    CHECK(h.krnl("ObReferenceObjectByName", {ansi("\\InventoryEvent"), 0, K->variable("ExMutantObjectType"), 0,
+                                             body}) == X_STATUS_OBJECT_TYPE_MISMATCH);
+    CHECK(h.krnl("ObReferenceObjectByName", {ansi("\\Missing"), 0, 0, 0, body}) == X_STATUS_OBJECT_NAME_NOT_FOUND);
+    h.krnl("ObReferenceObjectByName", {ansi("\\InventoryEvent"), 0, 0, 0, body});
     h.krnl("ObDereferenceObject", {K->load32(body)});
     // the references balance: the creation's and the open's handles close,
     // then the handle is gone
@@ -402,6 +402,60 @@ void small_ones(KernelHarness &h) {
     h.krnl("KeInitializeDpc", {dpc, 0, 0});
     CHECK(h.krnl("KeInsertQueueDpc", {dpc, 1, 2}) == 1);
     CHECK(h.krnl("KeRemoveQueueDpc", {dpc}) == 0);
+}
+
+// ---- what the console's kernel answered in its oracle (xfkrnl, XenoForge-private) ----
+
+void console_answers(KernelHarness &h) {
+    // share access: a file object's bits 0x7E, a SHARE_ACCESS of seven bytes (NT's algorithm)
+    uint32_t fo1 = h.alloc(16), fo2 = h.alloc(16), sa = h.alloc(16);
+    K->store32(fo1, 0xFFFFFF81);
+    h.krnl("IoSetShareAccess", {0x1, 0x1, fo1, sa}); // a reader that shares reads
+    CHECK(K->load32(fo1) == 0xFFFFFFC9);             // read 0x40, shared read 0x08 over the bits left alone
+    CHECK(std::memcmp(K->host(sa), "\x01\x01\x00\x00\x01\x00\x00", 7) == 0);
+    CHECK(h.krnl("IoCheckShareAccess", {0x2, 0x1, fo2, sa, 1}) == 0xC0000043); // a writer: a sharing violation
+    CHECK(K->load32(fo2) == 0x20 + 0x08);                                      // the file object's bits are set anyway
+    CHECK(h.krnl("IoCheckShareAccess", {0x1, 0x1, fo2, sa, 1}) == 0);
+    CHECK(std::memcmp(K->host(sa), "\x02\x02\x00\x00\x02\x00\x00", 7) == 0);
+    h.krnl("IoRemoveShareAccess", {fo2, sa});
+    CHECK(std::memcmp(K->host(sa), "\x01\x01\x00\x00\x01\x00\x00", 7) == 0);
+    h.krnl("IoSetShareAccess", {0, 7, fo2, sa}); // no access: the bits but zero counts
+    CHECK(K->load32(fo2) == 0x0E && std::memcmp(K->host(sa), "\0\0\0\0\0\0\0", 7) == 0);
+
+    // handles that are no object: INVALID_HANDLE (the current thread's, -2, is a type mismatch where a file or a
+    // port is wanted: a thread's own test); -2 does not close; a failed duplicate zeroes its output; an event's
+    // type is 0 or 1
+    uint32_t out = h.alloc(8), iosb = h.alloc(8);
+    CHECK(h.krnl("NtFlushBuffersFile", {0xF8FFFF00, iosb}) == X_STATUS_INVALID_HANDLE);
+    CHECK(h.krnl("NtDeviceIoControlFile", {0xF8FFFF00, 0, 0, 0, iosb, 0, 0, 0, 0, 0}) == X_STATUS_INVALID_HANDLE);
+    CHECK(h.krnl("IoDismountVolumeByFileHandle", {0xF8FFFF00}) == X_STATUS_INVALID_HANDLE);
+    CHECK(h.krnl("NtClose", {0xFFFFFFFE}) == X_STATUS_INVALID_HANDLE);
+    K->store32(out, 0xAAAAAAAA);
+    CHECK(h.krnl("NtDuplicateObject", {0xF8FFFF00, out, 0}) == X_STATUS_INVALID_HANDLE && K->load32(out) == 0);
+    K->store32(out, 0xAAAAAAAA);
+    CHECK(h.krnl("NtCreateEvent", {out, 0, 2, 0}) == X_STATUS_INVALID_PARAMETER && K->load32(out) == 0xAAAAAAAA);
+    CHECK(h.krnl("NtCreateTimer", {out, 0, 2}) == X_STATUS_INVALID_PARAMETER && K->load32(out) == 0xAAAAAAAA);
+    CHECK(h.krnl("NtCreateSemaphore", {out, 0, 2, 1}) == X_STATUS_INVALID_PARAMETER && K->load32(out) == 0xAAAAAAAA);
+    K->store32(out, 0);
+    CHECK(h.krnl("ObReferenceObjectByName", {0, 0, 0, 0, out}) == 0xC0000033);
+    CHECK(h.krnl("ObReferenceObjectByName", {ansi("NotRooted"), 0, 0, 0, out}) == 0xC0000033);
+    CHECK(h.krnl("ObIsTitleObject", {0}) == 0);
+    CHECK(h.krnl("KeSetAffinityThread", {0, 0x3F, 0}) == X_STATUS_INVALID_PARAMETER);
+    // HMAC verification refuses an expected size past the digest; format 3 of the PKCS block is format 2
+    uint32_t block = h.alloc(64), hash = h.alloc(20);
+    std::memset(K->host(hash), 7, 20);
+    h.krnl("XeCryptBnDwLePkcs1Format", {hash, 3, block, 64});
+    CHECK(K->host(block)[0x14] == 0);
+    // virtual memory: the checks before the memory manager is asked
+    uint32_t base_ptr = h.alloc(4), size_ptr = h.alloc(4);
+    K->store32(base_ptr, 0), K->store32(size_ptr, 0x1000);
+    CHECK(h.krnl("NtAllocateVirtualMemory", {base_ptr, size_ptr, 0x3000, 0x100, 0}) == 0xC0000045);
+    CHECK(h.krnl("NtAllocateVirtualMemory", {base_ptr, size_ptr, 0x3000, 0x4004, 0}) == 0xC0000045);
+    CHECK(h.krnl("NtAllocateVirtualMemory", {base_ptr, size_ptr, 0x3000 | 0x80000000, 4, 0}) ==
+          X_STATUS_INVALID_PARAMETER);
+    K->store32(base_ptr, 0x70000000);
+    CHECK(h.krnl("NtFreeVirtualMemory", {base_ptr, size_ptr, 0xC000, 0}) == X_STATUS_INVALID_PARAMETER);
+    CHECK(h.krnl("NtQueryVirtualMemory", {0x70000000, out, 2}) == X_STATUS_INVALID_PARAMETER);
 }
 
 // ---- the debug monitor, on the test's own thread ----
@@ -828,6 +882,7 @@ int main() {
     hal(h);
     links_and_names(h);
     small_ones(h);
+    console_answers(h);
     xbdm(h);
 
     // the guest threads' part, the host waiting for it

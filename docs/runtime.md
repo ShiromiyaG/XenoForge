@@ -298,6 +298,30 @@ lists: what the game calls is what gets written next.
   it says and ends the text, RtlUnicodeStringToAnsiString makes a byte per
   unit with the converted Length, `%lld` reads 32 bits (`%I64d` 64), and
   KeDelayExecutionThread with a null interval is an access violation.
+  The second round (2026-11-06, vectors for 259 of the 338 shared exports)
+  added: `_vsnwprintf` returns -1 when the text does not fit; the SHA-256,
+  SHA-384, SHA-512 and MD5 contexts after Final hold the digest in the state
+  words and the padded last block in the buffer, a 64-bit count is two words
+  with the low one first; XeCryptHmacShaVerify refuses an expected size past
+  20; XeCryptBnQwBeSigVerify verifies (a 0x20-word key, exponent 3 or 65537,
+  Montgomery products with no conversion, compared with the
+  XeCryptBnQwBeSigFormat block; Xenia's stub says valid); format 3 of
+  XeCryptBnDwLePkcs1Format is format 2; IoSetShareAccess, IoCheckShareAccess
+  and IoRemoveShareAccess are NT's (the console's file object keeps its
+  access in the bits 0x7E of its first word, a SHARE_ACCESS is seven bytes);
+  NtAllocateVirtualMemory takes only the type bits the console's does and a
+  protection with one of no access, read, read-write, execute-read or
+  execute-read-write (INVALID_PAGE_PROTECTION otherwise; NtProtectVirtualMemory
+  takes the execute-read modes too), refuses a size that rounds past 4 GB;
+  NtFreeVirtualMemory takes exactly decommit or release and a nonzero base;
+  NtQueryVirtualMemory a region type of 0 or 1; NtCreateEvent and NtCreateTimer
+  a type of 0 or 1; a handle that is no object is STATUS_INVALID_HANDLE for
+  NtFlushBuffersFile, NtDeviceIoControlFile, NtQuerySymbolicLinkObject,
+  IoDismountVolumeByFileHandle and NtWaitForMultipleObjectsEx; NtClose(-2) is
+  refused and NtDuplicateObject leaves its output alone on failure;
+  ObReferenceObjectByName answers OBJECT_NAME_INVALID to a name that is not
+  rooted; ObIsTitleObject(0) is 0; KeSetAffinityThread of no thread is
+  INVALID_PARAMETER.
 - **The debug monitor** (`xbdm.cpp`): Xenia's 36 xbdm exports, a retail
   console's answers (console type -1, no debugger, the end of the module
   list). The imports bind as the other system libraries', but no xbdm.xex
@@ -306,7 +330,8 @@ lists: what the game calls is what gets written next.
 - **Crypto** (`crypt.cpp`): every XeCrypt*/XeKeys* export Xenia has, plus
   SHA-384 and XeKeysConsoleSignatureVerification (it trusts the console's
   own signatures, so the XDK's partition block check takes the normal
-  path), with Xenia's guest context layouts, over algorithms written from
+  path), with Xenia's guest context layouts (the console's where they
+  differ: see above), over algorithms written from
   their standards (sha1, sha2, md5, aes, des, bignum; no third-party code).
 - **One clock**: the scheduler's (100 ns since the kernel started). The
   interrupt time is it, the system time is it plus the host's time at the

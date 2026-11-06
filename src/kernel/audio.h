@@ -44,6 +44,8 @@ public:
     // X_STATUS or an HRESULT; *index the client's
     uint32_t register_client(uint32_t callback, uint32_t callback_arg, uint32_t &index);
     void unregister_client(uint32_t index);
+    // a driver handle a registration gave and no unregistration took back (the console's calls refuse any other)
+    bool valid_client(uint32_t driver);
     // a frame of 6 x 256 big-endian floats at guest address samples
     void submit_frame(uint32_t index, uint32_t samples);
 

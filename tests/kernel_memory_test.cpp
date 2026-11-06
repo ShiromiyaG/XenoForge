@@ -53,9 +53,12 @@ void virtual_memory(KernelHarness &h) {
     uint32_t large = k.load32(base_ptr);
     CHECK(large >= 0x40000000 && large < 0x70000000 && k.load32(size_ptr) == 0x20000);
 
-    // a negative size is its magnitude
+    // a negative size rounds past 4 GB: the console's kernel refuses it (Xenia took its magnitude)
     k.store32(base_ptr, 0);
     k.store32(size_ptr, uint32_t(-0x1000));
+    CHECK(h.krnl("NtAllocateVirtualMemory", {base_ptr, size_ptr, X_MEM_RESERVE, X_PAGE_READWRITE, 0}) ==
+          kernel::X_STATUS_INVALID_PARAMETER);
+    k.store32(size_ptr, 0x1000);
     CHECK(h.krnl("NtAllocateVirtualMemory", {base_ptr, size_ptr, X_MEM_RESERVE, X_PAGE_READWRITE, 0}) == 0);
     CHECK(k.load32(size_ptr) == 0x10000);
     uint32_t reserved = k.load32(base_ptr);
@@ -84,7 +87,15 @@ void virtual_memory(KernelHarness &h) {
     CHECK(h.krnl("NtProtectVirtualMemory", {base_ptr, size_ptr, X_PAGE_READWRITE, old, 0}) == 0);
     CHECK(k.load32(base_ptr) == 0x20001000 && k.load32(size_ptr) == 0x1000 && k.load32(old) == PROTECT_READ);
     CHECK(h.krnl("MmQueryAddressProtect", {0x20001000}) == X_PAGE_READWRITE);
-    CHECK(h.krnl("NtProtectVirtualMemory", {base_ptr, size_ptr, X_PAGE_EXECUTE_READWRITE, old, 0}) == 0xC0000045);
+    // the protections the console's kernel refuses: execute alone, write-copy, none, two modes, other bits
+    for (uint32_t bad : {0x10u, 0x08u, 0x80u, 0x00u, 0x06u, 0x4004u, 0x101u})
+        CHECK(h.krnl("NtProtectVirtualMemory", {base_ptr, size_ptr, bad, old, 0}) == 0xC0000045);
+    // and takes the execute-read modes (Xenia refused them)
+    CHECK(h.krnl("NtProtectVirtualMemory", {base_ptr, size_ptr, X_PAGE_EXECUTE_READWRITE, old, 0}) == 0);
+    k.store32(base_ptr, 0);
+    CHECK(h.krnl("NtAllocateVirtualMemory", {base_ptr, size_ptr, X_MEM_COMMIT, 0x08, 0}) == 0xC0000045);
+    CHECK(h.krnl("NtAllocateVirtualMemory", {base_ptr, size_ptr, X_MEM_COMMIT | 0x400000, X_PAGE_READWRITE, 0}) ==
+          kernel::X_STATUS_INVALID_PARAMETER);
 
     // the invalid ones
     k.store32(base_ptr, 0);
@@ -120,7 +131,11 @@ void virtual_memory(KernelHarness &h) {
     CHECK(h.krnl("NtQueryVirtualMemory", {0x20000000, info, 0}) == 0);
     CHECK(k.load32(info + 0x10) == X_MEM_FREE && k.load32(info + 0x14) == X_PAGE_NOACCESS);
     k.store32(base_ptr, 0);
-    CHECK(h.krnl("NtFreeVirtualMemory", {base_ptr, size_ptr, X_MEM_RELEASE, 0}) == 0xC00000A0);
+    CHECK(h.krnl("NtFreeVirtualMemory", {base_ptr, size_ptr, X_MEM_RELEASE, 0}) == kernel::X_STATUS_INVALID_PARAMETER);
+    k.store32(base_ptr, 0x20000000);
+    CHECK(h.krnl("NtFreeVirtualMemory", {base_ptr, size_ptr, X_MEM_RELEASE | X_MEM_DECOMMIT, 0}) ==
+          kernel::X_STATUS_INVALID_PARAMETER); // only one of them
+    CHECK(h.krnl("NtFreeVirtualMemory", {base_ptr, size_ptr, 0, 0}) == kernel::X_STATUS_INVALID_PARAMETER);
 
     // MmIsAddressValid: committed and readable
     CHECK(h.krnl("MmIsAddressValid", {a}) == 1);

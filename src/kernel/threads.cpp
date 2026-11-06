@@ -797,7 +797,8 @@ Ref<Thread> thread_at(Kernel &k, uint32_t kthread) {
 
 XF_EXPORT(xboxkrnl, KeSetAffinityThread) {
     uint32_t affinity = arg(k, c, 1), previous_ptr = arg(k, c, 2);
-    if (!affinity) return result(c, X_STATUS_INVALID_PARAMETER);
+    // no thread is a bad parameter on the console's kernel, as is an empty affinity
+    if (!affinity || !arg(k, c, 0)) return result(c, X_STATUS_INVALID_PARAMETER);
     Ref<Thread> t = thread_at(k, arg(k, c, 0));
     if (!t) return result(c, X_STATUS_INVALID_HANDLE);
     std::lock_guard<std::mutex> l(objects(k).lock);

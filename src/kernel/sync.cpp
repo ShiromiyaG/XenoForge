@@ -173,6 +173,9 @@ XF_EXPORT(xboxkrnl, NtCreateEvent) {
     uint32_t handle_ptr = arg(k, c, 0), attributes = arg(k, c, 1), type = arg(k, c, 2), initial = arg(k, c, 3);
     Objects &o = objects(k);
     uint32_t status;
+    // only types 0 (notification) and 1 (synchronization), as the console's kernel checks (Xenia takes any nonzero
+    // as synchronization)
+    if (type > 1) return result(c, X_STATUS_INVALID_PARAMETER);
     if (existing_named(k, o, Object::Type::Event, attributes, handle_ptr, status)) return result(c, status);
     Ref<Event> e = o.create<Event>(type ? GuestType::EventSynchronization : GuestType::EventNotification, header::SIZE);
     if (!e) return result(c, X_STATUS_NO_MEMORY);
@@ -248,10 +251,8 @@ XF_EXPORT(xboxkrnl, NtCreateSemaphore) {
     uint32_t status;
     if (existing_named(k, o, Object::Type::Semaphore, attributes, handle_ptr, status)) return result(c, status);
     // what a host semaphore refuses (Xenia's creation fails on it)
-    if (limit <= 0 || count < 0 || count > limit) {
-        if (handle_ptr) k.store32(handle_ptr, 0);
-        return result(c, X_STATUS_INVALID_PARAMETER);
-    }
+    // (the console's kernel leaves the output handle alone then; Xenia's wrote 0)
+    if (limit <= 0 || count < 0 || count > limit) return result(c, X_STATUS_INVALID_PARAMETER);
     Ref<Semaphore> s = o.create<Semaphore>(GuestType::Semaphore, ksemaphore::SIZE);
     if (!s) return result(c, X_STATUS_NO_MEMORY);
     s->set_signal_state(count);
@@ -388,6 +389,7 @@ XF_EXPORT(xboxkrnl, NtCreateTimer) {
     uint32_t handle_ptr = arg(k, c, 0), attributes = arg(k, c, 1), type = arg(k, c, 2);
     Objects &o = objects(k);
     uint32_t status;
+    if (type > 1) return result(c, X_STATUS_INVALID_PARAMETER); // as NtCreateEvent
     if (existing_named(k, o, Object::Type::Timer, attributes, handle_ptr, status)) return result(c, status);
     Ref<Timer> t = o.create<Timer>(type ? GuestType::TimerSynchronization : GuestType::TimerNotification, ktimer::SIZE);
     if (!t) return result(c, X_STATUS_NO_MEMORY);
@@ -516,7 +518,8 @@ struct TimerDpcs {
         uint8_t process_type = k->host(t.guest)[2]; // KeInitializeTimerEx's
         {
             std::lock_guard<std::mutex> l(mutex);
-            queue.push_back({t.dpc, uint32_t(time), uint32_t(time >> 32), process_type ? process_type : kprocess::TITLE});
+            queue.push_back(
+                {t.dpc, uint32_t(time), uint32_t(time >> 32), process_type ? process_type : kprocess::TITLE});
         }
         set_event(objects(*k), *wake);
     }
@@ -712,7 +715,9 @@ XF_EXPORT(xboxkrnl, NtWaitForMultipleObjectsEx) {
     std::vector<Dispatcher *> list;
     for (uint32_t n = 0; n < count; n++) {
         refs.push_back(o.lookup<Object>(k.load32(handles + 4 * n)));
-        if (!refs.back() || !refs.back()->dispatcher()) return result(c, X_STATUS_INVALID_PARAMETER);
+        // a handle that is no object is STATUS_INVALID_HANDLE on the console's kernel (checked against it)
+        if (!refs.back()) return result(c, X_STATUS_INVALID_HANDLE);
+        if (!refs.back()->dispatcher()) return result(c, X_STATUS_OBJECT_TYPE_MISMATCH);
         list.push_back(static_cast<Dispatcher *>(refs.back().get()));
     }
     result(c, finish_wait(o, *t, o.wait(*t, list, type == 0, alertable != 0, o.deadline(timeout_ptr))));
