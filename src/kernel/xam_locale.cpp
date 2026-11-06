@@ -14,7 +14,7 @@
 // resource locators, the language's font paths and the online schema.
 // Translated from Xenia (BSD; see LICENSE-xenia): xam_locale.cc,
 // xam_info.cc (the resource locators, XamReadString,
-// XamLookupCommonStringByIndex, XamGetOnlineSchema), xam_state.cc (the
+// XamLookupCommonStringByIndex), xam_state.cc (the
 // language fallbacks and typeface patches), xdbf_io.cc and spa_info.cc (the
 // SPA's string tables), game_info_database.cc (GetLocalizedString), xbox.h
 // (the online countries' features); checked against them.
@@ -57,7 +57,6 @@ struct LocaleState {
     // the language fallbacks and typeface patches (xam_state.cc), made once
     uint32_t fallbacks[18] = {}, typeface_patches[7] = {};
     bool strings_made = false;
-    uint32_t online_schema = 0;
     // the title's SPA strings, in its default language, read once
     std::optional<std::map<uint16_t, std::u16string>> spa_strings;
 };
@@ -666,27 +665,7 @@ XF_EXPORT(xam, XamReadString) {
 // (index): no common strings (Xenia's stub)
 XF_EXPORT(xam, XamLookupCommonStringByIndex) { result(c, 0); }
 
-// the online schema: its address and size, then Xenia's empty stub schema,
-// made once in the system heap
-XF_EXPORT(xam, XamGetOnlineSchema) {
-    static constexpr uint8_t schema[] = {
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x2C, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
-        0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,
-    };
-    LocaleState &s = locale(k);
-    std::lock_guard<std::mutex> l(s.mutex);
-    if (!s.online_schema) {
-        uint32_t p = k.memory().system_alloc(8 + sizeof(schema));
-        if (p) {
-            std::memcpy(k.host(p + 8), schema, sizeof(schema));
-            k.store32(p, p + 8);
-            k.store32(p + 4, sizeof(schema));
-            s.online_schema = p;
-        }
-    }
-    result(c, s.online_schema);
-}
+// XamGetOnlineSchema is in xam_info.cpp.
 
 // (module (64 bits), container, resource, buffer, buffer_count in bytes)
 XF_EXPORT(xam, XamBuildResourceLocator) {

@@ -706,24 +706,7 @@ XF_EXPORT(xam, XamUserCreateTitlesPlayedEnumerator) {
     result(c, X_ERROR_SUCCESS);
 }
 
-// ---- Kinect (xam_nui.cc): none ----
-
-XF_EXPORT(xam, XamUserNuiGetUserIndex) { result(c, X_E_NO_SUCH_USER); }
-
-// (user_index_ptr): the first user signed in
-XF_EXPORT(xam, XamUserNuiGetUserIndexForSignin) {
-    uint32_t index_ptr = arg(k, c, 0);
-    if (!index_ptr) return result(c, X_E_INVALIDARG);
-    for (uint32_t i = 0; i < 4; i++) {
-        if (!user_at(k, i)) continue;
-        k.store32(index_ptr, i);
-        return result(c, X_E_SUCCESS);
-    }
-    result(c, X_E_FAIL);
-}
-
-XF_EXPORT(xam, XamUserNuiGetUserIndexForBind) { result(c, arg(k, c, 0) ? X_E_FAIL : X_E_INVALIDARG); }
-XF_EXPORT(xam, XamUserNuiEnableBiometric) { result(c, X_E_INVALIDARG); }
+// Kinect's XamUserNui* (xam_nui.cc) are in xam_avatar.cpp, with the rest of Kinect.
 
 // ---- profiles (xam_profile.cc, xam_enum.cc; ProfileManager) ----
 
