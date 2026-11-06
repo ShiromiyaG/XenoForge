@@ -106,9 +106,9 @@ inline void store_vector_right(Context &c, uint32_t ea, const Vec128 &v) {
     std::memcpy(host(c, ea & ~15u), m.u8 + 16 - eb, eb);
 }
 
-// lswi and stswi (Book I; Xenia leaves the string instructions out): NB
-// bytes (32 when 0) from RT on, four to a register in its low word, wrapping
-// from r31 to r0, the high word and the last register's unused bytes zero
+// The string instructions (Book I; Xenia leaves them out): n bytes from RT
+// on, four to a register in its low word, wrapping from r31 to r0, the high
+// word and the last register's unused bytes zero
 inline void load_string(Context &c, uint32_t rt, uint32_t ea, uint32_t n) {
     for (uint32_t k = 0, r = rt; k < n; k++, ea++) {
         if (k % 4 == 0) {
@@ -280,11 +280,14 @@ XF_OP(stmw) {
     for (uint32_t r = i.D.RT; r < 32; r++)
         store32(c, uint32_t(b + uint64_t(exts16(i.D.DS)) + (r - i.D.RT) * 4), uint32_t(c.r[r]));
 }
-// the byte count is NB, 32 when NB = 0 (the RB field holds NB); lswx and
-// stswx take theirs from XER[57:63], which the context does not keep, so
-// they stay unimplemented, as in Xenia
+// lswi and stswi: the byte count is NB, 32 when NB = 0 (the RB field holds
+// NB), from (RA|0). lswx and stswx: XER[57:63] bytes, 0 to 127, from (RA|0)
+// + (RB); with a count of 0 nothing moves (the manual leaves RT undefined;
+// it is kept).
 XF_OP(lswi) { load_string(c, i.X.RT, uint32_t(i.X.RA ? c.r[i.X.RA] : 0), i.X.RB ? i.X.RB : 32); }
 XF_OP(stswi) { store_string(c, i.X.RT, uint32_t(i.X.RA ? c.r[i.X.RA] : 0), i.X.RB ? i.X.RB : 32); }
+XF_OP(lswx) { load_string(c, i.X.RT, uint32_t(ea_x(c, i)), c.xer_bc & 0x7F); }
+XF_OP(stswx) { store_string(c, i.X.RT, uint32_t(ea_x(c, i)), c.xer_bc & 0x7F); }
 
 // ---- reservations ----
 

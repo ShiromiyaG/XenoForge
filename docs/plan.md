@@ -319,12 +319,14 @@ traces, without a recompiled game.
   identical to Xenia's on every word of both games' code and 2M random
   words; every instruction's semantics once (`ppc_ops.h`), for the
   generated code and the interpreter alike; of Xenia's 170,383 instruction
-  test cases (many generated on the console), all 141,696 Xenia runs pass,
-  interpreted and recompiled, and 26,086 of the 28,687 it skips (the rest:
-  the console's low-precision estimates and double-denormal operands of
-  single-precision forms); discovery (`.pdata`, helpers, calls, gaps, jump
-  tables by following CTR's value backwards, the data pointer scan after
-  rexglue's fork: 73,587 functions and 595 tables on El Chavo Kart, 21,896
+  test cases (many generated on the console), the 141,696 Xenia runs pass,
+  interpreted and recompiled, but 8 hand-written `vrefp` ones that expect
+  exact reciprocals where the console's own give its estimate (skipped,
+  `tests/ppc/skip.txt`), and 28,663 of the 28,687 it skips (the rest: 23 of
+  the console's low-precision estimates and one contradictory case);
+  discovery (`.pdata`, helpers, calls, gaps, jump tables by following CTR's
+  value backwards, the data pointer scan after rexglue's fork: 73,587
+  functions and 595 tables on El Chavo Kart, 21,896
   and 473 on Ben 10, no direct branch to an address without a start, the
   differences with rexglue's lists explained in
   [recompiler.md](recompiler.md)); emission (labels, calls, tail calls, jump
@@ -710,17 +712,21 @@ times and BC2 16.
   Catch continuations are covered only by tests so far. One Reach stall at
   startup under heavy load (1 run in 16) is not explained.
 
-- **Instructions.** 454 of the 456 in Xenia's table have semantics. Left:
-  `lswx` and `stswx`, whose byte count is in XER.
-- **Precision.** 2,601 of Xenia's instruction test cases still fail:
-  - the console's low-precision estimates (`fres`, `frsqrte`, `vrefp`,
-    `vrsqrtefp` to the console's bits);
-  - double-denormal operands of the single-precision forms.
+- **Instructions.** All 456 in Xenia's table have semantics (`lswx` and
+  `stswx` last, 2026-11-05, with tests of XenoForge's own in `tests/ppc`).
+- **Precision.** 24 of Xenia's instruction test cases still fail (2,601
+  before 2026-11-05: the double-denormal operands of the single forms and
+  `vrefp`'s estimate now follow the console): the console's estimates for
+  `fres` (6), `vlogefp` (15) and `vexptefp` (2), whose tests hold too few of
+  its values to rebuild its tables, and one `fctiwz.` case that contradicts
+  its neighbours. `vrefp`'s table is known in 16 of its 32 segments and the
+  start of one; the rest divide, as Xenia.
 - **Exceptions.** SEH `__try`/`__except` and C++ `catch`: the funclets
   should come from the scope and FuncInfo tables, checked in a game that
   throws. Generated catch continuations came in with the stack switches.
-- **Discovery.** Forza Horizon's 8 table cases past the mask. Every
-  interpreter entry in every game should be counted down to 0.
+- **Discovery.** Every interpreter entry in every game should be counted
+  down to 0 (Forza Horizon's 8 table cases past the mask are gone: a table
+  the mask alone bounds ends where its entries leave its function).
 - **Code that is not on the disc at build time:**
   - title updates: apply the `.xexp` delta patch to the base executable,
     then recompile (`xex.cpp` refuses patches today);

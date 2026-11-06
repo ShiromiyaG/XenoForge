@@ -4,10 +4,10 @@
 # <name>.map (the test labels, from nm) and <name>.dis (objdump's listing,
 # for checking the disassembler), with the VMX128 binutils.
 #
-#   tools/assemble_ppc_tests.sh <binutils bin dir> <xenia testing dir> <out dir>
+#   tools/assemble_ppc_tests.sh <binutils bin dir> <xenia testing dir> <out dir> [more test dirs...]
 #
 # e.g. tools/assemble_ppc_tests.sh ../rexglue-sdk/tools/binutils \
-#        ../xenia-canary/src/xenia/cpu/ppc/testing ../external/ppc_tests
+#        ../xenia-canary/src/xenia/cpu/ppc/testing ../external/ppc_tests tests/ppc
 set -euo pipefail
 binutils=$(cd "$1" && pwd)
 src=$(cd "$2" && pwd)
@@ -35,4 +35,14 @@ export -f one
 export binutils out exe
 ls "$src"/instr_*.s "$src"/seq_*.s 2>/dev/null | xargs -P 8 -I{} bash -c 'one "$@"' _ {}
 cp "$src/skip.txt" "$out/skip.txt"
+# then XenoForge's own, in the same format (tests/ppc: what Xenia has no tests
+# for), or those of any other folders named after the first three, and their
+# skip.txt after Xenia's
+for extra in "${@:4}"; do
+    ls "$extra"/instr_*.s "$extra"/seq_*.s 2>/dev/null | xargs -P 8 -I{} bash -c 'one "$@"' _ {}
+    if [ -f "$extra/skip.txt" ]; then
+        echo >>"$out/skip.txt"
+        cat "$extra/skip.txt" >>"$out/skip.txt"
+    fi
+done
 echo "$(ls "$out"/*.bin | wc -l) tests in $out"

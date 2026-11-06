@@ -63,6 +63,9 @@ struct alignas(64) Context {
     uint32_t reserve_address;
     uint64_t reserve_value;
     bool reserved;
+    // XER's byte count (bits 57-63), what lswx and stswx move; kept in the
+    // padding here so the fields around it stay where they were
+    uint8_t xer_bc;
     // msr, as mfmsr/mtmsr see it (EE only)
     uint64_t msr;
     // where guest address 0 is

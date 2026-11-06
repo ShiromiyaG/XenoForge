@@ -1,0 +1,16 @@
+# XenoForge's additions to Xenia's skip.txt (tools/assemble_ppc_tests.sh
+# appends them to the one it copies).
+#
+# Xenia's hand-written vrefp and vrefp128 tests expect exact reciprocals; the
+# console's own tests (instr__gen_vrefp) give its estimate for the same inputs
+# (1.0 gives 0x3F7FF800, 1.5 0x3F2AA800), and the console wins. Their fifth
+# case (100, 200, 300, 600) falls in segments of the estimate's table no
+# console test reaches, which still divide, and passes.
+vrefp_1
+vrefp_2
+vrefp_3
+vrefp_4
+vrefp128_1
+vrefp128_2
+vrefp128_3
+vrefp128_4

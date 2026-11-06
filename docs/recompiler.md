@@ -49,7 +49,11 @@ the semantics, and then the emitter's control flow on its own.
   assembled by `tools/assemble_ppc_tests.sh` with the VMX128 binutils
   (`../rexglue-sdk/tools/binutils`) into `../external/ppc_tests`, run by
   `ppc_test` (`XF_PPC_TESTS`), skipping what Xenia's `skip.txt` skips.
-  First through the interpreter, then recompiled.
+  First through the interpreter, then recompiled. XenoForge's own tests in
+  the same format, `tests/ppc` (the string instructions, which Xenia has
+  none of), are assembled with them (the script's fourth argument), and
+  their `skip.txt` is added to Xenia's (Xenia's hand-written `vrefp` tests,
+  which expect exact reciprocals where the console's give its estimate).
 - **The games**: both recompiled and compiled; functions found compared
   with rexglue's lists for the same executables.
 
@@ -76,9 +80,10 @@ added to its base; loads and stores swap bytes.
 - Reservations: `lwarx`/`ldarx` record address and value after a fence;
   `stwcx.`/`stdcx.` store with one compare-exchange against the reserved
   value and drop the reservation; CR0's SO is left alone, as Xenia.
-- `lswi`/`stswi` follow the manual (Xenia has none of the string
-  instructions); `lswx`/`stswx` are not done (their count is XER bits
-  57-63, which the context does not keep; neither game uses them).
+- The string instructions follow the manual (Xenia has none of them, nor
+  tests: `tests/ppc` has some). `lswx`/`stswx` move the byte count XER
+  keeps in bits 57-63, which mtxer sets and mfxer reads back (the context's
+  `xer_bc`); with a count of 0 nothing moves.
 - Traps call `system->trap` when they fire (Xenia ignores them by default);
   `sc` calls `system->syscall`. VSCR is SAT alone, NJ always set.
 - VMX: VSCR[SAT] is sticky (Xenia's backends always clear it). `vsl`/`vsr`
@@ -93,11 +98,15 @@ added to its base; loads and stores swap bytes.
   Xenia, the console wins: a NaN comes out quieted, the first in operand
   order vA, vB, vC; `vnmsubfp` does not negate a NaN; invalid operations
   give 0x7FC00000; `vmaxfp`/`vminfp` quiet signalling NaNs; `vcmpbfp`'s NaN
-  sets both bits. `vrefp`, `vexptefp`, `vlogefp` stay exact as Xenia's (the
-  console's estimates are skipped tests); `vrsqrtefp` uses the console's
-  table. The dot products and D3D packs follow Xenia's sequences bit for bit
-  (checked on 2M random vectors per type), but for FLOAT16 -0 and denormals,
-  where Xenia's fast path looks wrong. All of it assumes the host rounds to
+  sets both bits. `vrsqrtefp` uses the console's table; `vrefp` the
+  console's estimate built the same way (32 segments by the top 5 fraction
+  bits, a line over the next 9), its table read back from the console's
+  tests: 16 segments whole, the start of one; the 15 no test reaches divide,
+  as Xenia does. `vexptefp`, `vlogefp` stay exact as Xenia's (the console's
+  estimates are 17 skipped tests that hold too little to rebuild them). The
+  dot products and D3D packs follow Xenia's sequences bit for bit (checked
+  on 2M random vectors per type), but for FLOAT16 -0 and denormals, where
+  Xenia's fast path looks wrong. All of it assumes the host rounds to
   nearest.
 - Floating point: FPSCR[RN] and NI are honored; the common case (round to
   nearest, no Rc, an ordinary result) costs one compare, the rest goes to a
@@ -111,8 +120,17 @@ added to its base; loads and stores swap bytes.
   negated by `fnm*`; fused single forms round once; `fctiw` of a NaN gives
   0xFFFFFFFF80000000; `frsqrte` uses the console's table. Xenia's `mtfsf`
   mask order, `mtfsfi`'s U field and `mcrfs` are fixed; `mtfsb0`/`mtfsb1`
-  are done. Left: double-denormal operands of single forms (the console
-  gives a NaN), `fres`'s 8-bit estimate.
+  are done. A single form with a double-denormal operand does what the
+  console does: `fadds`, `fsubs`, `fmuls` and the fused forms give the
+  default NaN and raise nothing unless an operand is infinite or a NaN;
+  `fdivs` and `fsqrts` give the double result, not rounded to single. The
+  fast path checks the single forms' operands for them: the smallest
+  magnitude against 2^-1022, then each only when it is that small (a zero).
+  It is not free: a loop of nothing but `fmadds`, `fmuls` and `fadds` takes
+  about 1.5 times as long. Left: `fres`'s estimate (its tests hold the
+  console's value for 1.0 alone), and one `fctiwz.` case whose vector
+  contradicts the same input's `fctiwz` and `fctiw.` (a NaN in, 0 and no
+  exception out).
 - For step A4: Xenia adds 0x1000 to addresses at 0xE0000000 and above (the
   4 KB offset of that physical view); `ops::host` is the one place to do it.
 
@@ -308,7 +326,7 @@ the scan):
 | BC2 | Default.xex | 292 | 12,518 | 0 | 0 | 0 |
 | | Splash.xex | 6,834 | 679,357 | 1 | 7 in 7 | 0 |
 | | Game.xex | 54,018 | 2,773,730 | 2 | 2 in 2 | 0 |
-| Forza Horizon | default.xex | 76,047 | 3,655,459 | 3 | 11 in 11 | 8 |
+| Forza Horizon | default.xex | 76,047 | 3,655,459 | 3 | 11 in 11 | 0 |
 | | XMediaFacade_default.xex | 3,163 | 525,032 | 0 | 0 | 0 |
 | | SpeechFacade_default.xex | 6,649 | 374,049 | 1 | 1 in 1 | 0 |
 | Gears of War 3 | default.xex | 56,302 | 3,465,904 | 2 | 2 in 2 | 0 |
@@ -330,11 +348,16 @@ filler skipped for want of a `blr` or `b` before them (Sonic entered the
 interpreter 135,471 times at 4 of them in 30 s; 12 such starts on Sonic, 1
 each on Forza Horizon, Reach and two of its DLLs).
 
-Forza Horizon's 8 are one byte-offset table's cases (0x829EB474: `rlwinm
+Forza Horizon had 8, one byte-offset table's cases (0x829EB474: `rlwinm
 r10, r9, 0, 26, 31`, so 64 entries by the mask, no compare) past the end of
 its function, into the middle of the next: the table is shorter than the
-mask allows and the bytes after it are other data. They are emitted as
-dispatches (what the hardware would do if the index ever got there).
+mask allows (9 cases, MSVC's `default: __assume(0)` leaving the bound out)
+and the bytes after it are other data. A table the mask alone bounds now
+ends at its first entry outside its function (here after 24, the 15 past
+the 9 cases being other data that lands inside the function); an index past
+it goes to the switch's `default`, a dispatch to CTR, which is what the
+hardware would do if the index ever got there. The function list is the
+same; no unresolved branch is left.
 
 ## Stack switches
 

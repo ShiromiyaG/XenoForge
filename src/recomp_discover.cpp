@@ -265,6 +265,8 @@ public:
         }
         d_.counts["functions"] = d_.functions.size();
         d_.counts["jump tables"] = d_.tables.size();
+        for (uint32_t bctr : cut_tables_)
+            if (d_.tables.count(bctr)) d_.counts["jump tables cut at their function's end"]++;
         d_.counts["indirect branches"] = d_.indirect.size();
         // the branches out of each function that reach no start
         for (const auto &[a, list] : exits_)
@@ -519,7 +521,14 @@ private:
         bool guessed = false;
         for (uint32_t reg : path)
             if (!count) count = bound_anywhere(function, bctr, end, reg), guessed = count != 0;
-        if (masked && (!count || count > masked)) count = masked, guessed = false;
+        // Bounded by the mask alone, the table may be shorter than the mask
+        // allows: with no compare (MSVC's `default: __assume(0)`) it ends at
+        // the highest case and other data follows it. Its entries go into
+        // its own function, so it ends at the first that leaves it; an index
+        // past that goes to the switch's dispatch, as the hardware would.
+        bool by_mask = masked && (!count || count > masked);
+        if (by_mask) count = masked, guessed = false;
+        bool cut = false;
         uint32_t entry = 1u << scale;
         auto read = [&](uint32_t count) {
             t.targets.clear();
@@ -533,6 +542,10 @@ private:
                 uint32_t targetaddr = t.kind == JumpTable::Absolute ? raw : t.base + (raw << t.shift);
                 const Section *s = image_.section_of(targetaddr);
                 bool ok = !(targetaddr & 3) && s && s->code && targetaddr >= function && image_.word(targetaddr) != 0;
+                if (ok && by_mask && count && targetaddr >= end) {
+                    cut = true;
+                    break;
+                }
                 if (!ok) {
                     if (count) return false; // a bounded table must hold code everywhere
                     break;
@@ -547,6 +560,8 @@ private:
             count = 0;
         }
         if (!count) d_.counts["jump tables without a bound"]++;
+        if (count && cut) cut_tables_.insert(bctr);
+        else cut_tables_.erase(bctr);
         out = std::move(t);
         return true;
     }
@@ -686,6 +701,7 @@ private:
     std::map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> exits_; // by function: (site, target) leaving it
     std::set<uint32_t> handler_data_; // the words before functions with exception data
     std::set<uint32_t> stack_thunks_; // KeSetCurrentStackPointers' import thunks
+    std::set<uint32_t> cut_tables_;   // the bctrs of tables cut at their function's end, as last read
 };
 
 // ---- the data pointer scan ----

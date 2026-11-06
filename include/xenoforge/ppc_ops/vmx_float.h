@@ -15,9 +15,12 @@
 // NaN operands come out quieted, the first in operand order vA, vB, vC (the
 // addend before the multiplier in vmaddfp; vnmsubfp does not negate them);
 // an invalid operation gives 0x7FC00000, not x86's 0xFFC00000; vmaxfp and
-// vminfp quiet a signaling NaN; vcmpbfp's NaN and CR6 rules. All the tests
-// pass but 34 estimate cases (vrefp, vexptefp, vlogefp: the console's own
-// estimates, which Xenia does not model either).
+// vminfp quiet a signaling NaN; vcmpbfp's NaN and CR6 rules; vrefp's
+// estimate (as much of its table as the tests hold). All the tests pass but
+// 17 estimate cases (vexptefp, vlogefp: the console's own estimates, which
+// Xenia does not model either and its tests hold too little of to rebuild).
+// Xenia's hand-written vrefp tests expect exact reciprocals where the
+// console's give its estimate; tests/ppc/skip.txt skips them.
 
 #pragma once
 
@@ -103,11 +106,37 @@ inline uint32_t min(uint32_t a, uint32_t b) {
 
 // ---- estimates ----
 
-// vrefp: Xenia divides (1 / x)
+// vrefp: the console's estimate, built as vrsqrtefp's: 32 segments by the
+// top 5 fraction bits, a line in each (base << 10 less slope times the next
+// 9 bits; the low 9 are not used), normalized, rounded to nearest even to 23
+// bits. Xenia divides. This table is read back from the console's tests
+// (instr__gen_vrefp, every case of which it passes): 16 segments whole, from
+// two to six distinct inputs in most, which fit one line each; of segment 16
+// only its start (1.5; slope 0: used there alone). The 15 segments no test
+// reaches (0) divide, as Xenia does.
 inline uint32_t recip(uint32_t v) {
+    static constexpr uint32_t TABLE[32] = {
+        0x0F84FFF8, 0x0E9CF838, 0x0DC4F0EA, 0x0D00EA08, 0x0C4CE388, 0,          0x0B10D790, 0,
+        0x09FCCCC8, 0,          0,          0,          0,          0x07ECB608, 0,          0,
+        0x0000AAA8, 0,          0,          0x062CA09E, 0,          0x05B89A90, 0,          0x056C94F8,
+        0,          0x050C8FBE, 0,          0,          0x04688884, 0,          0x0420841C, 0x0418820C,
+    };
     v = flush(v);
     if (is_nan(v)) return quiet(v);
-    return result(1.0f / flt(v));
+    uint32_t sign = v & 0x80000000u, exponent = (v >> 23) & 0xFF, mantissa = v & 0x7FFFFF;
+    uint32_t entry = TABLE[mantissa >> 18], low = (mantissa >> 9) & 511;
+    // zeros and infinities, and what the table does not hold
+    if (!exponent || exponent == 255 || !entry || (!(entry >> 16) && low)) return result(1.0f / flt(v));
+    int32_t estimate = int32_t((entry & 0xFFFF) << 10) - int32_t(low * (entry >> 16));
+    int32_t result_exponent = 253 - int32_t(exponent);
+    if (!(estimate & (1 << 25))) {
+        int zeros = std::countl_zero(uint32_t(estimate) & 0x1FFFFFFu);
+        result_exponent += 6 - zeros;
+        estimate = int32_t(uint32_t(estimate) << (zeros - 6));
+    }
+    if ((estimate & 5) && (estimate & 2)) estimate += 4;
+    if (result_exponent <= 0) return sign; // a denormal result: flushed
+    return sign | uint32_t(result_exponent) << 23 | ((uint32_t(estimate) >> 2) & 0x7FFFFF);
 }
 // vrsqrtefp: the console's table and interpolation, as Xenia's
 // EmitScalarVRsqrteHelper (and the PpcVrsqrtefpLane of its a64 backend)

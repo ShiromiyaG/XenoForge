@@ -4,8 +4,10 @@
 // address is not a start, an empty method only a vtable reaches comes back),
 // the gap filler (a run of leaf methods longer than its old rounds, a dead
 // blr after a tail call, an exception handler's record before a function),
-// a jump table bounded by a cmplwi after a clrlwi, a branch into a function
-// the walk ran on into past a call that never returns, the functions that
+// a jump table bounded by a cmplwi after a clrlwi, one bounded by its mask
+// alone that is shorter than the mask (cut where its entries leave the
+// function), a branch into a function the walk ran on into past a call that
+// never returns, the functions that
 // switch the stack (a longjmp, fiber switches) and the resume sites (after a
 // call to a setjmp, itself or behind a tail branch; a catch continuation a
 // funclet returns), and how those are emitted.
@@ -38,6 +40,8 @@ uint32_t rlwinm(uint32_t a, uint32_t s, uint32_t sh, uint32_t mb, uint32_t me) {
     return 21u << 26 | s << 21 | a << 16 | sh << 11 | mb << 6 | me << 1;
 }
 uint32_t lwzx(uint32_t d, uint32_t a, uint32_t b) { return 31u << 26 | d << 21 | a << 16 | b << 11 | 23u << 1; }
+uint32_t lbzx(uint32_t d, uint32_t a, uint32_t b) { return 31u << 26 | d << 21 | a << 16 | b << 11 | 87u << 1; }
+uint32_t add(uint32_t d, uint32_t a, uint32_t b) { return 31u << 26 | d << 21 | a << 16 | b << 11 | 266u << 1; }
 uint32_t mtctr(uint32_t s) { return 0x7C0903A6 | s << 21; }
 uint32_t b(uint32_t from, uint32_t to) { return 18u << 26 | ((to - from) & 0x03FFFFFC); }
 uint32_t bl(uint32_t from, uint32_t to) { return b(from, to) | 1; }
@@ -94,6 +98,10 @@ constexpr uint32_t FS3 = T + 0xBA0;   // a bc to the thunk
 constexpr uint32_t EP = T + 0xC08;    // .pdata with exception data, its handler record at EP - 8
 constexpr uint32_t CONT = EP + 0x10;  // inside EP, reached only by the funclet's return
 constexpr uint32_t FUNCLET = T + 0xC40; // a catch block: lis r3, addi r3 to CONT, blr
+constexpr uint32_t MB = T + 0xD00;          // a switch on r9 & 7, no compare: byte offsets from MB_CASES
+constexpr uint32_t MB_CASES = MB + 0x2C;    // its cases
+constexpr uint32_t MB_NEXT = MB + 0x44;     // the function after it
+constexpr uint32_t MB_TABLE = RDATA + 0x80; // 3 cases, then other data (into MB_NEXT)
 
 Image build() {
     Builder m;
@@ -126,12 +134,20 @@ Image build() {
     m.code(EP - 8, {A, RDATA + 0x40});
     m.code(EP, {MFLR_R12, stwu(1, -0x20, 1), bl(EP + 8, Z), b(EP + 0xC, EP + 0x14), li(3, 1), addi(1, 1, 0x20), BLR});
     m.code(FUNCLET, {lis(3, CONT >> 16), addi(3, 3, int32_t(CONT & 0xFFFF)), BLR});
+    m.code(MB,
+           {lwz(9, 0, 3), rlwinm(10, 9, 0, 29, 31), lis(12, MB_TABLE >> 16), addi(12, 12, int32_t(MB_TABLE & 0xFFFF)),
+            lbzx(0, 12, 10), rlwinm(0, 0, 2, 0, 29), lis(12, MB_CASES >> 16), addi(12, 12, int32_t(MB_CASES & 0xFFFF)),
+            add(12, 12, 0), mtctr(12), BCTR, li(3, 0), BLR, li(3, 1), BLR, li(3, 2), BLR});
+    m.code(MB_NEXT, {li(3, 9), BLR, BLR});
+    m.code(MB_TABLE, {0x00020407, 0x00000000});
     m.code(RDATA, {P, V, EMPTY});
     m.image.pdata.push_back({A, 0x1C, 1, false});
     m.image.pdata.push_back({TB, 0x60, 0, false});
     m.image.pdata.push_back({E, 8, 0, true});
     m.image.pdata.push_back({EP, 0x1C, 2, true});
     m.image.pdata.push_back({FUNCLET, 0xC, 0, false});
+    m.image.pdata.push_back({MB, 0x44, 0, false});
+    m.image.pdata.push_back({MB_NEXT, 0xC, 0, false});
     return m.image;
 }
 
@@ -178,6 +194,17 @@ int main() {
         CHECK(t.kind == JumpTable::Absolute && t.table == TABLE && t.index == 11);
         CHECK((t.targets == std::vector<uint32_t>{TB + 0x34, TB + 0x3C, TB + 0x44}));
     }
+
+    // the table the mask alone bounds (8 entries): its fourth entry goes
+    // into the next function, so it has 3; an index past them dispatches
+    CHECK(d.tables.count(MB + 0x28));
+    if (d.tables.count(MB + 0x28)) {
+        const JumpTable &t = d.tables.at(MB + 0x28);
+        CHECK(t.kind == JumpTable::ShiftedByteOffset && t.table == MB_TABLE && t.base == MB_CASES && t.shift == 2);
+        CHECK((t.targets == std::vector<uint32_t>{MB_CASES, MB_CASES + 8, MB_CASES + 0x10}));
+    }
+    CHECK(d.counts["jump tables cut at their function's end"] == 1);
+    CHECK(d.functions.count(MB) && d.functions.at(MB).tail_calls.empty());
 
     // every leaf method, in one pass of the gap filler
     for (uint32_t k = 0; k < 12; k++) {
@@ -241,5 +268,8 @@ int main() {
           contains(sc, "c.lr = 0x82000B58; xf_82000B80(c);"));
     CHECK(contains(ep, "case 0x82000C18: goto L_82000C18;") && contains(ep, "L_82000C18:"));
     CHECK(!contains(sc, "XF_TAIL") && !contains(emitted(A), "try {"));
+    std::string mb = emitted(MB);
+    CHECK(contains(mb, "case 0x82000D3C:") && !contains(mb, "case 0x82000D48:") &&
+          contains(mb, "default: ::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u);"));
     return finish("recomp_discover");
 }

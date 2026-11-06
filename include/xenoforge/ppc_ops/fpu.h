@@ -23,9 +23,12 @@
 //
 // Not modelled: enabled exceptions (VE..XE: traps, untouched targets), the
 // estimate of fres (the console's is a table, about 8 bits; this is the
-// single-rounded reciprocal, as Xenia), and the console's single forms with
-// double-denormal operands (fadds/fsubs/fmuls/fmadds... give its default NaN,
-// fdivs/fsqrts the unrounded double result); Xenia skips those tests too.
+// single-rounded reciprocal, as Xenia: its tests hold too few of the
+// console's values to rebuild it). The console's single forms with a
+// double-denormal operand are (Xenia skips those tests): fadds, fsubs, fmuls
+// and the fused forms give the default NaN and raise nothing unless an
+// operand is infinite or a NaN, fdivs and fsqrts give the double result; the
+// fast path checks the single forms' operands for them.
 // The fast path of fadds, fsubs, fmuls, fdivs, fsqrts and fres rounds twice
 // (to double, then to single), as Xenia: exact when the operands are singles,
 // as they are from lfs and the single forms; the fused forms check for ties.
@@ -64,6 +67,8 @@ XF_INLINE double fp_double(uint64_t v) { return std::bit_cast<double>(v); }
 XF_INLINE bool fp_is_snan(uint64_t v) {
     return (v & 0x7FF8000000000000) == 0x7FF0000000000000 && (v & 0x0007FFFFFFFFFFFF);
 }
+// a denormal double (no single is one: lfs and the single forms never make one)
+XF_INLINE bool fp_denormal(double v) { return std::fabs(v) < 0x1p-1022 && v != 0; }
 
 // FEX and VX are summaries: VX the OR of the invalid-operation bits, FEX of
 // the exceptions whose enable is set (VX..XX against VE..XE)
@@ -140,7 +145,8 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
 #pragma STDC FENV_ACCESS ON
 #endif
     const uint32_t kind = op & 0xFF;
-    const bool single = op & FP_SINGLE, fused = kind >= FP_MADD && kind <= FP_NMSUB;
+    const bool fused = kind >= FP_MADD && kind <= FP_NMSUB;
+    bool single = op & FP_SINGLE;
     const bool subtract = kind == FP_MSUB || kind == FP_NMSUB;
     // NaN operands, in the order the PPC takes them
     double operands[3];
@@ -167,6 +173,20 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
         if (single) v &= 0xFFFFFFFFE0000000;
         if (rc) fp_record(c, exceptions, fp_class(fp_double(v), single), FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
         return fp_double(v);
+    }
+    // A single form with a double-denormal operand, as the console's tests
+    // show: with no infinite operand, add, subtract, multiply and the fused
+    // forms give the default NaN and raise nothing; divide and square root
+    // give the double result, not rounded to single (and its exceptions)
+    if (single && kind <= FP_NMSUB) {
+        bool denormal = false, infinite = false;
+        for (int k = 0; k < count; k++) denormal |= fp_denormal(operands[k]), infinite |= std::isinf(operands[k]);
+        if (denormal && (kind == FP_DIV || kind == FP_SQRT)) {
+            single = false;
+        } else if (denormal && !infinite) {
+            if (rc) fp_record(c, 0, 0x11u << 12, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
+            return fp_double(FP_DEFAULT_NAN);
+        }
     }
     // invalid operations give the default NaN (infinity x 0 above)
     if (imz) {
@@ -243,11 +263,21 @@ XF_INLINE bool fp_plain(Context &c, bool rc, uint32_t kind, double r) {
 // a double exactly halfway between two singles (normal ones): rounding the
 // fused result again could round the wrong way
 XF_INLINE bool fp_single_tie(double d) { return (uint32_t(fp_bits(d)) & 0x1FFFFFFF) == 0x10000000; }
+// No double-denormal operand in a single form (fp_arith has the console's
+// rule for them); a double form asks nothing (kind without FP_SINGLE). The
+// smallest magnitude is compared once; only when it is that small (a zero
+// operand, mostly) is each looked at.
+XF_INLINE bool fp_ordinary_operands(uint32_t kind, double a, double b = 1, double c = 1) {
+    if (!(kind & FP_SINGLE)) return true;
+    double x = std::fabs(a), y = std::fabs(b), z = std::fabs(c), m = x < y ? x : y;
+    m = m < z ? m : z;
+    return __builtin_expect(m >= 0x1p-1022, 1) || !(fp_denormal(a) || fp_denormal(b) || fp_denormal(c));
+}
 
 #define XF_FP_BINARY(name, kind, expr, rhs)                                                                            \
     XF_OP(name) {                                                                                                      \
         double a = c.f[i.A.FRA], b = c.f[i.A.rhs], r = expr;                                                           \
-        if (fp_plain(c, i.A.Rc, kind, r)) [[likely]]                                                                   \
+        if (fp_plain(c, i.A.Rc, kind, r) && fp_ordinary_operands(kind, a, b)) [[likely]]                               \
             c.f[i.A.FRT] = r;                                                                                          \
         else                                                                                                           \
             c.f[i.A.FRT] = fp_arith(c, kind, i.A.Rc, a, b, b);                                                         \
@@ -270,7 +300,8 @@ XF_FP_BINARY(fdivsx, FP_DIV | FP_SINGLE, double(float(a / b)), FRB)
     XF_OP(name) {                                                                                                      \
         double a = c.f[i.A.FRA], b = c.f[i.A.FRB], cc = c.f[i.A.FRC], d = std::fma(a, cc, addend);                     \
         double r = sign((kind) & FP_SINGLE ? double(float(d)) : d);                                                    \
-        if (fp_plain(c, i.A.Rc, kind, r) && !((kind) & FP_SINGLE && fp_single_tie(d))) [[likely]]                      \
+        if (fp_plain(c, i.A.Rc, kind, r) && !((kind) & FP_SINGLE && fp_single_tie(d)) &&                               \
+            fp_ordinary_operands(kind, a, b, cc)) [[likely]]                                                           \
             c.f[i.A.FRT] = r;                                                                                          \
         else                                                                                                           \
             c.f[i.A.FRT] = fp_arith(c, kind, i.A.Rc, a, b, cc);                                                        \
@@ -288,7 +319,8 @@ XF_FP_FUSED(fnmsubsx, FP_NMSUB | FP_SINGLE, -, -b)
 #define XF_FP_UNARY(name, kind, expr, form, rt, rb, rc)                                                                \
     XF_OP(name) {                                                                                                      \
         double b = c.f[i.form.rb], r = expr;                                                                           \
-        if (fp_plain(c, i.form.rc, kind, r)) [[likely]]                                                                \
+        if (fp_plain(c, i.form.rc, kind, r) &&                                                                         \
+            fp_ordinary_operands(((kind) & 0xFF) == FP_SQRT ? (kind) : 0, b)) [[likely]]                               \
             c.f[i.form.rt] = r;                                                                                        \
         else                                                                                                           \
             c.f[i.form.rt] = fp_arith(c, kind, i.form.rc, b, b, b);                                                    \

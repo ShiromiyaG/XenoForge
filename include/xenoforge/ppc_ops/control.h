@@ -46,15 +46,17 @@ XF_INLINE uint32_t spr_number(Instr i) { return ((i.XFX.spr & 0x1F) << 5) | ((i.
 
 XF_INLINE uint64_t time_base(Context &c) { return c.system && c.system->time_base ? c.system->time_base(c) : 0; }
 
-// XER as the register: SO, OV, CA in bits 31, 30, 29 (the byte count of
-// lswx/stswx is not kept)
+// XER as the register: SO, OV, CA in bits 31, 30, 29 and the byte count of
+// lswx/stswx in bits 6-0 (57-63 of the architecture's 64); the rest reads 0
 XF_INLINE uint64_t xer_word(const Context &c) {
-    return (uint64_t(c.xer_so & 1) << 31) | (uint64_t(c.xer_ov & 1) << 30) | (uint64_t(c.xer_ca & 1) << 29);
+    return (uint64_t(c.xer_so & 1) << 31) | (uint64_t(c.xer_ov & 1) << 30) | (uint64_t(c.xer_ca & 1) << 29) |
+           (c.xer_bc & 0x7F);
 }
 XF_INLINE void set_xer_word(Context &c, uint64_t v) {
     c.xer_so = (v >> 31) & 1;
     c.xer_ov = (v >> 30) & 1;
     c.xer_ca = (v >> 29) & 1;
+    c.xer_bc = v & 0x7F;
 }
 
 // CR field n from bits 4*(7-n)+3 .. 4*(7-n) of v (StoreCR(n, v))
