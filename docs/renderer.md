@@ -299,7 +299,9 @@ waited for only when the CPU needs what the GPU wrote (Decisions).
   though kept as 16-bit floats). D24FS8's range, 0 to 2, is kept halved
   (viewport depth range, oDepth, clears, loads and stores), as Xenia's
   host render targets keep it: whatever moves through a depth target
-  (color bits too) survives the host's 0-1 depth whole. The trace's EDRAM
+  (color bits too) survives the host's 0-1 depth whole. The host's 32-bit
+  depth is kept beside EDRAM across transfers, as Xenia keeps it ("The
+  host's depth kept across transfers" below). The trace's EDRAM
   snapshot is where EDRAM starts (zeros, live).
 - **Textures** decoded from guest memory (`texture.h`: 1D, 2D, stacked, 3D,
   cube, tiled or linear, packed mips, the block formats kept compressed;
@@ -1131,17 +1133,13 @@ by more than 16):
 - El Chavo Kart's park and race (`chaves_xf`): D3D12 3.144 (6.9%) and 1.707
   (4.4%) off Vulkan, darker in the brightest parts (the blossoming trees,
   lamps and curbs of the HDR scene); ours is 0.017 and 0.010 off Vulkan's,
-  so 3.142 and 1.712 off D3D12's. The cause is open. It is not the render
-  target path (D3D12's ROV picture is 0.56 off its host render target one,
-  Vulkan's FSI picture 0.55 off its own) nor the EDRAM snapshot (D3D12
-  restores it, Vulkan drops it; ours is the same without it), so it lies in
-  what the two backends do differently outside their render target caches:
-  the shader translators (DXBC against SPIR-V), texture and sampler set-up;
-  the scene goes through a 2_10_10_10_FLOAT target read back as
-  2_10_10_10 bits and a bloom chain of 16_16_16_16 targets;
+  so 3.142 and 1.712 off D3D12's. The cause is the host's anisotropic
+  filtering (found 2026-11-06, below), not Xenia's logic, and ours stays as
+  it is;
 - the memory export frames of the race (`xf_chaves/memexport4`): 0.13-0.15
   (0.1-0.3%) between Xenia's two, ours 0.01-0.05 off Vulkan's;
-- Red Dead Redemption's frames 850 and 950: 0.21-0.22 (0.1%).
+- Red Dead Redemption's frames 850 and 950: 0.21-0.22 (0.1%); ours 0.45
+  off D3D12's since the host depth (below).
 
 **New traces from Xenia** (`tools/capture_traces.ps1`, no input, frames
 600, 1200, 2400 and 3600; `../traces/xenia_bc2`, `xenia_gow3`,
@@ -1179,10 +1177,71 @@ bits (`kDepthAndHostDepthToDepth`, the "host depth" transfers of
 `d3d12_render_target_cache.cc`); Xenia's
 `depth_float24_convert_in_pixel_shader` is the other way out (the
 fragments' depth rounded to 20e4 in the pixel shader, at the cost of early
-depth). That is the render target cache's to port. Also in that frame,
-apart from the noise: its MSAA depth resolves are not done (8, among them
-the scene's depth read by the material pass as a texture; done as sample 0
-they take 1.2 of the 10.8 off, the rest is the depth precision above).
+depth). Also in that frame, apart from the noise: its 8 MSAA depth
+resolves, among them the scene's depth read by the material pass as a
+texture, came later the same day from EDRAM (10.8 to 9.2 off).
+
+**The host's depth kept across transfers** (2026-11-06), Xenia's answer
+ported to EDRAM transfers that go through the EDRAM buffer rather than
+from target to target. Beside EDRAM a second buffer of its layout holds the
+host's 32-bit depth (`host_depth_`, 10 MB; twice that where D24S8 is kept
+as a float too, its half apart as Xenia tracks unorm24 and float24 apart):
+an EDRAM store of a depth target whose format the host encodes differently
+(Xenia's `IsHostDepthEncodingDifferent`: D24FS8, and D24S8 on a device
+without 24-bit unorm depth) writes its samples' depth there beside their
+guest bits, and an EDRAM load into such a target takes that depth where it
+still rounds to the 24 bits EDRAM holds (rounded as the store rounds), else
+EDRAM's (`edram_load.frag`). The last such target to store a sample is the
+last of that format to have held it, so this is Xenia's
+`host_depth_render_target_float24` and `_unorm24` without the bookkeeping:
+a depth-to-depth transfer of the same format comes back whole (Xenia
+copies the 32 bits), one through a color target or the other depth format
+takes the old host depth back where the guest's bits were not changed
+(`kColorAndHostDepthToDepth`, `kDepthAndHostDepthToDepth`), and the buffer
+starts as zeros, which round to EDRAM's 0, so a sample no such target held
+loads EDRAM's value as before. Red Dead Redemption's frames 850 and 950
+went from 9.20 and 9.28 off D3D12's picture to 0.45 and 0.46 (0.46-0.47%
+of pixels off by more than 16; 0.36 and 0.38 off Vulkan's, whose two
+pictures are 0.21 apart): the noise is gone, what is left are edges. The
+29 frames of `replay_test` are unchanged. `XF_DEPTH_FALLBACK=1` makes
+D24S8 a 32-bit float depth, as on devices without 24-bit unorm depth
+(AMD), to test that path and its unorm24 half. Xenia's `depth_float24_round` is
+an option (`Options::depth_float24_round`, `xfreplay
+--depth-float24-round`, `XF_DEPTH_FLOAT24_ROUND=1`), off as there: the
+EDRAM stores and the loads' comparison round 20e4 to the nearest even
+rather than towards zero. Not done: single-sample depth resolves round as
+`resolve.comp` does (towards zero; Xenia's resolves come from its EDRAM
+dump and follow the option), and `depth_float24_convert_in_pixel_shader`,
+which needs the translator to write every D24FS8 fragment's depth rounded
+to 20e4 (sample-rate shading under MSAA, the viewport's depth bounds
+rounded too) and then turns the host depth off for D24FS8; the 25 draws of
+Reach's menu and the rest keep counting "D24FS8 depth as 32-bit float",
+Xenia's default too.
+
+**El Chavo Kart's park and race, D3D12 against Vulkan** (2026-11-06): the
+host's anisotropic filtering. Found by patching the trace (a script
+rewriting the pixel shader's words in the trace's memory reads) and
+dumping it with both of Xenia's backends: the bright blossoming trees
+(draws 74-80 of the park, an alpha-tested leaf atlas, DXT5 with gamma RGB,
+hue-rotated per tree) differ even with the shader writing the texture's
+color alone, and stop differing when that fetch's anisotropy is turned off
+in the instruction (3.14 to 1.09); with `--anisotropic_override=0` on both
+dump tools Xenia's two pictures are the same, 0.006 (park) and 0.003
+(race). Both backends ask the host for the same thing, 4:1 anisotropy and
+the same coarse-derivative gradients (sample_d, Grad), except that
+Direct3D 12 cannot have anisotropy with point mips
+(`D3D12_FILTER_ANISOTROPIC` is trilinear; Xenia's `WriteSampler`), so it
+makes the mips linear where the fetch constant says point; Vulkan keeps
+the constant's mip filter, as ours does. That is not the gap: with linear
+mips in both (the instruction patched) they stay 3.01 apart, and ours with
+D3D12's sampler is 2.89 off D3D12's picture. The rest is the drivers'
+anisotropic filter itself, the same request filtered differently by
+NVIDIA's Direct3D 12 and Vulkan drivers, which alpha testing (a third of
+the leaves' alpha) and the hue rotation of the HDR scene magnify. Neither
+is the console's: Xenos's anisotropic filter is not documented, only that
+its fetch constant has the mip filter and the anisotropy apart (as D3D9's
+MIPFILTER and MINFILTER), which Vulkan's set-up, and ours, follow. So
+`replay_test` keeps matching Vulkan's picture for these two frames.
 
 ## What is asked and not done is counted
 

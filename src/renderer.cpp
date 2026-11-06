@@ -400,7 +400,7 @@ struct RenderTarget {
 
 // edram.glsl's push constants
 struct EdramTarget {
-    uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit;
+    uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, depth_flags;
 };
 
 // resolve.comp's push constants
@@ -1226,12 +1226,23 @@ private:
     bool edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows);
     VkDeviceSize edram_mask(const std::vector<uint32_t> &tiles);
     EdramTarget edram_target(const RenderTarget &t, uint32_t height) const {
-        return {t.base, t.pitch_tiles, t.msaa, t.format, t.width, height, t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u};
+        uint32_t depth_flags =
+            t.depth ? (host_depth_kept(t.format) ? 1u : 0u) | (options_.depth_float24_round ? 2u : 0u) : 0u;
+        return {t.base, t.pitch_tiles, t.msaa, t.format, t.width, height, t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u,
+                depth_flags};
     }
+    // Whether a depth format is encoded differently on the host, so that its
+    // 32-bit depth is kept beside EDRAM across transfers (Xenia's
+    // IsHostDepthEncodingDifferent): D24FS8 always (its 20e4 is kept as a
+    // 32-bit float), D24S8 where the device has no 24-bit unorm depth.
+    bool host_depth_kept(uint32_t format) const { return format == 1 || d24s8_ != VK_FORMAT_D24_UNORM_S8_UINT; }
     VkPipeline load_pipeline(const RenderTarget &t);
     VkDescriptorSet edram_set(uint32_t which);
     std::vector<RenderTarget *> owners_ = std::vector<RenderTarget *>(EDRAM_TILES, nullptr); // null: EDRAM holds it
-    vk::Buffer edram_;
+    // EDRAM, and beside it the host's 32-bit depth of the last D24FS8 target
+    // (and D24S8 where the host keeps it as a float) to store each sample,
+    // in the same layout (edram.glsl's host_depth_offset)
+    vk::Buffer edram_, host_depth_;
     VkDescriptorSetLayout edram_set_layouts_[2] = {}; // store, load
     VkPipelineLayout edram_layouts_[2] = {};
     std::vector<VkDescriptorPool> edram_pools_;
@@ -1293,7 +1304,7 @@ Impl::~Impl() {
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
                                     compute_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
-    for (vk::Buffer *b : {&edram_, &mirror_, &arena_, &scratch_, &load_scratch_}) d_.destroy(*b);
+    for (vk::Buffer *b : {&edram_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_}) d_.destroy(*b);
 }
 
 // keep: destroyed with the renderer, else by the caller
@@ -1420,7 +1431,12 @@ bool Impl::init(std::string &error) {
     if (!mirror_.buffer || !arena_.buffer || !scratch_.buffer || !load_scratch_.buffer)
         return error = "could not make the renderer's buffers (512 MB of device memory for guest memory's mirror)", false;
 
-    if (!d_.format_supported(d24s8_, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) d24s8_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    // D24S8 as a 32-bit float depth where the device has no 24-bit unorm
+    // depth (AMD), or where XF_DEPTH_FALLBACK=1 asks for it, to test that path
+    const char *depth_fallback = std::getenv("XF_DEPTH_FALLBACK");
+    if (!d_.format_supported(d24s8_, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
+        (depth_fallback && depth_fallback[0] == '1'))
+        d24s8_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
 
     // submissions
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -1569,28 +1585,35 @@ bool Impl::init(std::string &error) {
                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                               false);
     if (!edram_.buffer) return error = "could not make the EDRAM buffer", false;
+    // the host's depth beside it: D24FS8's, then D24S8's where the host keeps
+    // that as a float too
+    host_depth_ = d_.create_buffer(EDRAM_BYTES * (host_depth_kept(0) ? 2 : 1),
+                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+    if (!host_depth_.buffer) return error = "could not make the host depth buffer", false;
     {
-        VkDescriptorSetLayoutBinding store[4] = {
+        VkDescriptorSetLayoutBinding store[5] = {
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         };
-        VkDescriptorBindingFlags store_flags[4] = {0, 0, 0, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT};
+        VkDescriptorBindingFlags store_flags[5] = {0, 0, 0, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, 0};
         VkDescriptorSetLayoutBindingFlagsCreateInfo store_binding_flags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-        store_binding_flags.bindingCount = 4;
+        store_binding_flags.bindingCount = 5;
         store_binding_flags.pBindingFlags = store_flags;
-        VkDescriptorSetLayoutBinding load[2] = {
+        VkDescriptorSetLayoutBinding load[3] = {
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         };
         VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
         info.pNext = &store_binding_flags;
-        info.bindingCount = 4;
+        info.bindingCount = 5;
         info.pBindings = store;
         vkCreateDescriptorSetLayout(dev_, &info, nullptr, &edram_set_layouts_[0]);
         info.pNext = nullptr;
-        info.bindingCount = 2;
+        info.bindingCount = 3;
         info.pBindings = load;
         vkCreateDescriptorSetLayout(dev_, &info, nullptr, &edram_set_layouts_[1]);
         for (int k = 0; k < 2; k++) {
@@ -1613,17 +1636,21 @@ bool Impl::init(std::string &error) {
         if (d_.stencil_export()) load_fs_[2] = module(EDRAM_LOAD_STENCIL, sizeof(EDRAM_LOAD_STENCIL));
         edram_load_set_ = edram_set(1);
         if (!edram_load_set_) return error = "could not make the EDRAM load's descriptors", false;
-        VkDescriptorBufferInfo buffers[2] = {{edram_.buffer, 0, VK_WHOLE_SIZE}, {arena_.buffer, 0, EDRAM_TILES * 4}};
-        VkWriteDescriptorSet writes[2] = {};
-        for (uint32_t b = 0; b < 2; b++) {
+        VkDescriptorBufferInfo buffers[3] = {
+            {edram_.buffer, 0, VK_WHOLE_SIZE},
+            {arena_.buffer, 0, EDRAM_TILES * 4},
+            {host_depth_.buffer, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[3] = {};
+        for (uint32_t b = 0; b < 3; b++) {
             writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[b].dstSet = edram_load_set_;
             writes[b].dstBinding = b;
             writes[b].descriptorCount = 1;
-            writes[b].descriptorType = b ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[b].descriptorType =
+                b == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[b].pBufferInfo = &buffers[b];
         }
-        vkUpdateDescriptorSets(dev_, 2, writes, 0, nullptr);
+        vkUpdateDescriptorSets(dev_, 3, writes, 0, nullptr);
     }
 
     // resolves and texture loads: a source and a destination buffer
@@ -1717,6 +1744,7 @@ bool Impl::init(std::string &error) {
     }
     VkCommandBuffer c = cmd();
     vkCmdFillBuffer(c, edram_.buffer, 0, VK_WHOLE_SIZE, 0);
+    vkCmdFillBuffer(c, host_depth_.buffer, 0, VK_WHOLE_SIZE, 0);
     vkCmdFillBuffer(c, mirror_.buffer, 0, VK_WHOLE_SIZE, 0);
     for (auto &im : dummy_) {
         begin_image(c, im.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, im.layers);
@@ -2307,7 +2335,7 @@ VkDescriptorSet Impl::edram_set(uint32_t which) {
         alloc.descriptorPool = edram_pools_.back();
         if (vkAllocateDescriptorSets(dev_, &alloc, &set) == VK_SUCCESS) return set;
     }
-    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64},
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128},
                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 64},
                                     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 128}};
     VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -2382,22 +2410,29 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
         fatal_ = "could not make a render target's EDRAM descriptors";
         return nullptr;
     }
-    VkDescriptorBufferInfo buffers[2] = {{edram_.buffer, 0, VK_WHOLE_SIZE}, {arena_.buffer, 0, EDRAM_TILES * 4}};
+    // EDRAM, the tile mask, its views (the stencil's only for depth), the host depth beside EDRAM
+    VkDescriptorBufferInfo buffers[3] = {
+        {edram_.buffer, 0, VK_WHOLE_SIZE},
+        {arena_.buffer, 0, EDRAM_TILES * 4},
+        {host_depth_.buffer, 0, VK_WHOLE_SIZE}};
     VkDescriptorImageInfo images[2] = {{VK_NULL_HANDLE, t->sampled, VK_IMAGE_LAYOUT_GENERAL},
                                        {VK_NULL_HANDLE, t->stencil, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet writes[4] = {};
-    for (uint32_t b = 0; b < 4; b++) {
-        writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        writes[b].dstSet = t->store_set;
-        writes[b].dstBinding = b;
-        writes[b].descriptorCount = 1;
-        writes[b].descriptorType = b == 0   ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                                   : b == 1 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
-                                            : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        if (b < 2) writes[b].pBufferInfo = &buffers[b];
-        else writes[b].pImageInfo = &images[b - 2];
+    VkWriteDescriptorSet writes[5] = {};
+    uint32_t write_count = 0;
+    for (uint32_t b = 0; b < 5; b++) {
+        if (b == 3 && !t->stencil) continue;
+        VkWriteDescriptorSet &w = writes[write_count++];
+        w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = t->store_set;
+        w.dstBinding = b;
+        w.descriptorCount = 1;
+        w.descriptorType = b == 1             ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+                           : b == 0 || b == 4 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                              : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        if (b == 2 || b == 3) w.pImageInfo = &images[b - 2];
+        else w.pBufferInfo = &buffers[b == 4 ? 2 : b];
     }
-    vkUpdateDescriptorSets(dev_, t->stencil ? 4 : 3, writes, 0, nullptr);
+    vkUpdateDescriptorSets(dev_, write_count, writes, 0, nullptr);
     // cleared: its tiles come from EDRAM when it takes them over (acquire)
     VkCommandBuffer c = outside();
     gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");

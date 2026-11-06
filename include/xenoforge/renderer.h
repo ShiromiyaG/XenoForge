@@ -156,6 +156,12 @@ struct Options {
     // without geometry shaders, rather than by geometry shaders as Xenia's
     // D3D12 backend draws them (XF_VK_EXPAND_IN_VS=1 sets it too)
     bool expand_in_vertex_shader = false;
+    // D24FS8 depth to 20e4 rounded to the nearest even rather than towards
+    // zero, where the host's 32-bit depth goes into EDRAM's 24 bits (Xenia's
+    // depth_float24_round, off by default as there: truncation keeps a
+    // "greater or equal" test passing on a second pass over depth that lost
+    // the host's precision)
+    bool depth_float24_round = false;
 };
 
 // A trace writer (gpu_trace_writer.h) stands in front of it as the

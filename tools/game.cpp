@@ -219,6 +219,8 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
                              : m == "fast" ? render::ReadbackResolve::fast
                                            : render::ReadbackResolve::none;
     }
+    // Xenia's depth_float24_round: XF_DEPTH_FLOAT24_ROUND=1
+    if (const char *round = std::getenv("XF_DEPTH_FLOAT24_ROUND")) o.depth_float24_round = round[0] && round[0] != '0';
     g.renderer = render::Renderer::create(*g.device, processor, o, error);
     if (!g.renderer) return error = "renderer: " + error, false;
     processor.set_sink(g.renderer.get());

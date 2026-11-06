@@ -3,7 +3,10 @@
 // src/xenia/gpu/shaders/edram.xesli, XeEdramOffsetBytes, at resolution scale
 // 1), and the guest bits of each render target format, from and to the
 // values the host keeps (pixel_formats.xesli; the 7e3 packing of
-// dxbc_shader_translator_om.cc). BSD; see LICENSE-xenia.
+// dxbc_shader_translator_om.cc); the host's depth kept across transfers as
+// Xenia's host render targets keep it (render_target_cache.h's
+// OwnershipRange, the host depth transfers of d3d12_render_target_cache.cc).
+// BSD; see LICENSE-xenia.
 
 layout(push_constant) uniform Target {
     uint base_tiles;
@@ -14,6 +17,11 @@ layout(push_constant) uniform Target {
     uint is_depth;
     uint ints_log2;   // 1 for 64-bit samples
     uint stencil_bit; // loads without stencil export: the bit this pass writes, 8 or more for the depth pass
+    // depth targets: bit 0, the host's depth is kept beside EDRAM (its format
+    // is encoded differently on the host: D24FS8, and D24S8 on a device
+    // without 24-bit unorm depth); bit 1, 20e4 rounded to the nearest even
+    // (Xenia's depth_float24_round)
+    uint depth_flags;
 } target;
 
 const uint TILE_DWORDS = 80u * 16u;
@@ -68,12 +76,14 @@ uint float32_to_7e3(float f) {
     return ((biased + 0x7FFFu + ((biased >> 16u) & 1u)) >> 16u) & 0x3FFu;
 }
 
-// rounded towards zero, as Xenia does by default (its depth_float24_round off)
-uint float32_to_20e4(float f) {
+// XeFloat32To20e4: rounded towards zero, as Xenia does by default, or to the
+// nearest even with its depth_float24_round
+uint float32_to_20e4(float f, bool round_to_nearest_even) {
     uint u = floatBitsToUint(f);
     u = min(u <= 0x7FFFFFFFu ? u : 0u, 0x3FFFFFF8u);
     uint denormalized = ((u & 0x7FFFFFu) | 0x800000u) >> min(113u - (u >> 23u), 24u);
     uint f24 = u < 0x38800000u ? denormalized : u + 0xC8000000u;
+    if (round_to_nearest_even) f24 += 3u + ((f24 >> 3u) & 1u);
     return (f24 >> 3u) & 0xFFFFFFu;
 }
 
@@ -90,15 +100,22 @@ float float20e4_to_32(uint f24) {
     return uintBitsToFloat((uint(exponent + 112) << 23u) | (mantissa << 3u));
 }
 
-// Depth as the host keeps it and stencil to the guest's D24S8 or D24FS8 word.
-// D24FS8's 0-2 is kept as 0-1 (halved, as Xenia's host render targets keep
-// it), so all of it survives the host's 0-1 depth: color bits moved through
-// a depth target come back whole.
-uint pack_depth(float depth, uint stencil) {
-    uint d24 = target.format == 0u ? uint(roundEven(clamp(depth, 0.0, 1.0) * 16777215.0))
-                                   : float32_to_20e4(depth * 2.0);
-    return (d24 << 8u) | (stencil & 0xFFu);
+// Depth as the host keeps it to the guest's 24 bits. D24FS8's 0-2 is kept as
+// 0-1 (halved, as Xenia's host render targets keep it), so all of it survives
+// the host's 0-1 depth: color bits moved through a depth target come back
+// whole.
+uint depth_to_guest(float depth) {
+    return target.format == 0u ? uint(roundEven(clamp(depth, 0.0, 1.0) * 16777215.0))
+                               : float32_to_20e4(depth * 2.0, (target.depth_flags & 2u) != 0u);
 }
+// and with the stencil to the guest's D24S8 or D24FS8 word
+uint pack_depth(float depth, uint stencil) { return (depth_to_guest(depth) << 8u) | (stencil & 0xFFu); }
+
+// The host's depth kept beside EDRAM (depth_flags bit 0), in EDRAM's layout:
+// D24FS8's in the first half, D24S8's in the second (Xenia's
+// OwnershipRange::host_depth_render_target_float24 and _unorm24, tracked
+// apart so that clearing through the other format does not drop it).
+uint host_depth_offset(uint at) { return at + (target.format == 0u ? EDRAM_DWORDS : 0u); }
 float unpack_depth(uint word) {
     uint d24 = word >> 8u;
     // xenos::UNorm24To32: exact, 0xFFFFFF to 1

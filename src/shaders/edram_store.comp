@@ -1,5 +1,8 @@
 // A render target's samples into EDRAM, in the tiles the mask marks
-// (renderer.cpp). MS: the target is multisampled. BSD; see LICENSE-xenia.
+// (renderer.cpp). MS: the target is multisampled. A depth target whose
+// format the host encodes differently keeps its own depth beside EDRAM too
+// (edram.glsl's host_depth_offset), for the loads to take back where EDRAM's
+// 24 bits still are what it rounds to. BSD; see LICENSE-xenia.
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_samplerless_texture_functions : require
@@ -15,6 +18,7 @@ layout(set = 0, binding = 3) uniform utexture2DMS stencil; // depth targets'
 layout(set = 0, binding = 2) uniform texture2D source;
 layout(set = 0, binding = 3) uniform utexture2D stencil;
 #endif
+layout(set = 0, binding = 4) writeonly buffer HostDepth { uint words[]; } host_depth;
 
 #include "edram.glsl"
 
@@ -37,6 +41,7 @@ void main() {
             uint s = texelFetch(stencil, ivec2(pixel), 0).r;
 #endif
             edram.words[at] = pack_depth(value.r, s);
+            if ((target.depth_flags & 1u) != 0u) host_depth.words[host_depth_offset(at)] = floatBitsToUint(value.r);
         } else {
             uvec2 bits = pack_color(value);
             edram.words[at] = bits.x;

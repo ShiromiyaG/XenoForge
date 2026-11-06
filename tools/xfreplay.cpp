@@ -7,11 +7,12 @@
 // --gpu-time-draws each draw's too, by its shaders; --repeat N
 // plays the trace N times through the same renderer, as a game draws a frame
 // again, the GPU time then being the fastest of the plays after the first.
-// --readback-resolve none|fast|full is Xenia's readback_resolve (renderer.h).
+// --readback-resolve none|fast|full is Xenia's readback_resolve, --depth-float24-round its
+// depth_float24_round (renderer.h).
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
 //            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
-//            [--occlusion-queries] [--readback-resolve none|fast|full] [-v]
+//            [--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] [-v]
 
 #include "xenoforge/renderer.h"
 
@@ -33,7 +34,7 @@ namespace {
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
                          "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
-                         "[--occlusion-queries] [--readback-resolve none|fast|full] [-v]\n");
+                         "[--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] [-v]\n");
     return 2;
 }
 
@@ -60,6 +61,8 @@ int main(int argc, char **argv) {
         else if (a == "--async-pipelines") options.async_pipelines = true;
         // occlusion query reports with the GPU's counts (else the fake ones)
         else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
+        // Xenia's depth_float24_round
+        else if (a == "--depth-float24-round") options.depth_float24_round = true;
         else if (a == "--readback-resolve" && i + 1 < argc) {
             std::string m = argv[++i];
             if (m == "none") options.readback_resolve = xf::render::ReadbackResolve::none;
