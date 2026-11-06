@@ -19,13 +19,15 @@
 // mount path starts it; the device's tree of entries (case-insensitive, as
 // Xenia keeps it) names the file. The devices: the disc (\Device\Cdrom0), a
 // directory on the host (a bare executable's directory, the cache
-// partitions, mounted content), and the null device Xenia puts at
+// partitions, mounted content), a content package (STFS or SVOD, in
+// package.h), and the null device Xenia puts at
 // \Device\Harddisk0 for the raw partitions.
 
 #pragma once
 
 #include "objects.h"
 #include "xenoforge/disc.h"
+#include "xenoforge/package.h"
 
 #include <cstdint>
 #include <deque>
@@ -94,6 +96,7 @@ class Entry {
     // what its device keeps
     std::filesystem::path host_path; // a host directory's
     const DiscEntry *disc = nullptr; // the disc's
+    const PackageNode *package = nullptr; // a content package's
 
     bool directory() const { return attributes & ATTRIBUTE_DIRECTORY; }
     // a child by name, any case
@@ -145,6 +148,11 @@ class Device {
 
 // The game's disc (Xenia's DiscImageDevice), read in place.
 std::shared_ptr<Device> make_disc_device(const std::string &mount_path, std::unique_ptr<Disc> disc);
+// A content package (Xenia's StfsContainerDevice and SvodContainerDevice), STFS
+// or SVOD by its header, read only. Null, with the reason in `error`, when the
+// file is not one or is damaged.
+std::shared_ptr<Device> make_package_device(const std::string &mount_path, const std::filesystem::path &host_path,
+                                            std::string &error);
 // A directory on the host (Xenia's HostPathDevice): created when writable
 // and missing; package: named STFS (mounted content) instead of FATX.
 std::shared_ptr<Device> make_host_device(const std::string &mount_path, const std::filesystem::path &host_path,

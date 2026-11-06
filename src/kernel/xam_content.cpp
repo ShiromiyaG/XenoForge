@@ -29,9 +29,11 @@
 //     display name in the English slot and no title name or thumbnails
 //     (Xenia puts the name in the SPA's default language and takes the
 //     title's name and icon from it);
-//   - STFS package files (a console's own saves) are not mounted: only the
-//     directory packages Xenia writes, and publisher content is looked up
-//     under the title's own ID only;
+//   - package files (STFS and SVOD: DLC, updates, XBLA titles, a console's
+//     own saves) are mounted through xf::Package as read-only devices, as
+//     Xenia mounts them (its ContentPackageContainer, which also creates
+//     and writes STFS, is not ported: new content is a directory package),
+//     and publisher content is looked up under the title's own ID only;
 //   - closing a package leaves the files still open in it usable (Xenia
 //     releases a handle of each);
 //   - the hard drive's size is the content root's volume's, the disc's
@@ -179,6 +181,9 @@ struct Package {
     std::filesystem::path host_path, header_path;
     std::vector<uint8_t> header; // HEADER_SIZE
     ContentData data;
+    // a package file (STFS or SVOD: DLC, an update, an XBLA title), whose own
+    // first bytes are the header, not a directory with a header file beside it
+    bool file = false;
 };
 
 struct ContentState {
@@ -266,6 +271,7 @@ bool read_header(const std::filesystem::path &path, std::vector<uint8_t> &h, uin
 }
 
 bool write_header(const Package &p) {
+    if (p.file) return true; // a package file's own header is read-only
     std::error_code ec;
     std::filesystem::create_directories(p.header_path.parent_path(), ec);
     std::ofstream f(p.header_path, std::ios::binary | std::ios::trunc);
@@ -290,14 +296,18 @@ uint64_t directory_size(const std::filesystem::path &dir) {
 }
 
 // ContentPackage::GetContentMetadata
-ContentData metadata(const std::filesystem::path &host_path, const std::vector<uint8_t> &h, uint32_t license) {
+ContentData metadata(const std::filesystem::path &host_path, const std::vector<uint8_t> &h, uint32_t license,
+                     bool file = false) {
     const uint8_t *m = h.data() + META;
     ContentData d;
     d.device_id = DEVICE_HDD;
     d.title_id = rd32(m + M_TITLE_ID);
     d.content_type = rd32(m + M_CONTENT_TYPE);
     d.content_size = rd64(m + M_CONTENT_SIZE);
-    if (!d.content_size) d.content_size = directory_size(host_path);
+    if (!d.content_size) {
+        std::error_code ec;
+        d.content_size = file ? std::filesystem::file_size(host_path, ec) : directory_size(host_path);
+    }
     d.display_name = rd_u16(m + M_DISPLAY_NAME, 128);
     for (uint32_t i = 0; d.display_name.empty() && i < 12; i++) {
         if (i < 9)
@@ -306,7 +316,9 @@ ContentData metadata(const std::filesystem::path &host_path, const std::vector<u
             d.display_name = rd_u16(m + M_DISPLAY_NAME_EX + 0x100 * (i - 9), 128);
     }
     d.file_name = vfs::guest_name(host_path.filename());
-    if (d.content_type == TYPE_SAVED_GAME) {
+    // (Xenia's own file name field is past a package file's metadata, where a
+    // real package has other data)
+    if (d.content_type == TYPE_SAVED_GAME && !file) {
         const char *name = reinterpret_cast<const char *>(h.data() + FILE_NAME_AT);
         std::string saved(name, strnlen(name, FILE_NAME_SIZE));
         if (!saved.empty()) d.file_name = saved;
@@ -316,9 +328,26 @@ ContentData metadata(const std::filesystem::path &host_path, const std::vector<u
     return d;
 }
 
+// ContentPackageContainer::LoadPackage and ComputePackageLicenseMask: the
+// package file's first bytes are the header; the licenses' bits are or-ed
+bool open_package_file(const std::filesystem::path &path, Package &p) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    p.header.assign(HEADER_SIZE, 0);
+    f.read(reinterpret_cast<char *>(p.header.data()), std::streamsize(p.header.size()));
+    if (size_t(f.gcount()) < META + METADATA_SIZE || !valid_header(p.header)) return false;
+    uint32_t license = 0;
+    for (size_t i = 0; i < 16; i++) license |= rd32(p.header.data() + 4 + 0x228 + 0x10 * i + 8);
+    p.host_path = path;
+    p.file = true;
+    p.data = metadata(path, p.header, license, true);
+    return true;
+}
+
 bool open_package(const std::filesystem::path &path, Package &p) {
     std::error_code ec;
-    if (!std::filesystem::is_directory(path, ec)) return false; // STFS files are not read here
+    if (std::filesystem::is_regular_file(path, ec)) return open_package_file(path, p);
+    if (!std::filesystem::is_directory(path, ec)) return false;
     p.host_path = path;
     p.header_path = header_path_of(path);
     uint32_t license = 0;
@@ -335,7 +364,14 @@ bool is_open(ContentState &s, std::string_view root) {
 // ContentPackage::MountPackageAndRegister (the content lock held)
 bool mount(Kernel &k, ContentState &s, std::unique_ptr<Package> p, const std::string &root) {
     p->device_path = "\\Device\\Content\\" + std::to_string(++s.next_device);
-    auto device = vfs::make_host_device(p->device_path, p->host_path, false, true);
+    std::shared_ptr<vfs::Device> device;
+    if (p->file) {
+        std::string error;
+        device = vfs::make_package_device(p->device_path, p->host_path, error);
+        if (!device) std::fprintf(stderr, "xam: %s: %s\n", p->host_path.string().c_str(), error.c_str());
+    } else {
+        device = vfs::make_host_device(p->device_path, p->host_path, false, true);
+    }
     if (!device) return false;
     vfs::FileSystem &fs = file_system(k);
     if (!fs.add_link(root + ":", p->device_path)) {

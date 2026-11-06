@@ -24,7 +24,10 @@
 //     deleted (Xenia deletes it while its handle is open, which Windows
 //     refuses), and host files are shared for deletion too;
 //   - the disc is read through xf::Disc (an ISO read in place) instead of a
-//     mapping of the whole image.
+//     mapping of the whole image;
+//   - a package device (devices/xcontent_container_*, xcontent_devices/*) is
+//     read through xf::Package (package.h, where its own differences are),
+//     and its entries come from the package's tree.
 
 #include "files.h"
 
@@ -157,6 +160,81 @@ class DiscDevice : public Device {
         }
     }
     std::unique_ptr<Disc> disc_;
+};
+
+// ---- a content package (Xenia's StfsContainerDevice, SvodContainerDevice) ----
+
+class PackageStream : public Stream {
+  public:
+    PackageStream(const Package &package, const Entry &entry) : package_(package), entry_(entry) {}
+    // XContentContainerFile::ReadSync
+    uint32_t read(uint64_t offset, uint8_t *out, size_t length, size_t &done) override {
+        done = 0;
+        if (!entry_.package || offset >= entry_.size) return X_STATUS_END_OF_FILE;
+        done = package_.read(*entry_.package, offset, out, length);
+        return X_STATUS_SUCCESS;
+    }
+    // writes and resizing are denied, as Xenia's
+    uint32_t write(uint64_t, const uint8_t *, size_t, size_t &done) override {
+        done = 0;
+        return X_STATUS_ACCESS_DENIED;
+    }
+    uint32_t set_length(uint64_t) override { return X_STATUS_ACCESS_DENIED; }
+
+  private:
+    const Package &package_;
+    const Entry &entry_;
+};
+
+class PackageDevice : public Device {
+  public:
+    // the name Xenia gives each (an SVOD calls itself FATX); read_only is the
+    // STFS descriptor's flag, so a package not marked read-only is opened for
+    // writing and the writes are denied, as Xenia's
+    PackageDevice(const std::string &mount_path, std::unique_ptr<Package> package)
+        : Device(mount_path, package->is_stfs() ? "STFS" : "FATX", package->read_only()),
+          package_(std::move(package)) {
+        component_name_max_length = package_->is_stfs() ? 40 : 255;
+        total_units = package_->total_units();
+        available_units = package_->available_units();
+        sectors_per_unit = 8;
+        bytes_per_sector = 0x200;
+        root = std::make_shared<Entry>();
+        root->device = this;
+        root->attributes = ATTRIBUTE_DIRECTORY;
+        root->package = &package_->root();
+        root->create_time = root->access_time = root->write_time = package_->root().write_time;
+        add_children(*root, package_->root());
+    }
+    uint32_t open(Entry &entry, uint32_t, std::unique_ptr<Stream> &out) override {
+        out = std::make_unique<PackageStream>(*package_, entry);
+        return X_STATUS_SUCCESS;
+    }
+    const Package &package() const { return *package_; }
+
+  private:
+    void add_children(Entry &parent, const PackageNode &from) {
+        for (const auto &n : from.children) {
+            auto e = std::make_shared<Entry>();
+            e->device = this;
+            e->parent = &parent;
+            e->package = n.get();
+            e->name = n->name;
+            e->path = join(parent.path, n->name);
+            e->size = n->size;
+            e->allocation_size = round_up(n->size, 0x1000);
+            e->create_time = n->create_time;
+            e->write_time = e->access_time = n->write_time;
+            // a directory of an SVOD is read-only, of an STFS not (Xenia's)
+            if (n->directory)
+                e->attributes = package_->is_stfs() ? ATTRIBUTE_DIRECTORY : ATTRIBUTE_DIRECTORY | ATTRIBUTE_READ_ONLY;
+            else
+                e->attributes = ATTRIBUTE_NORMAL | ATTRIBUTE_READ_ONLY;
+            if (n->directory) add_children(*e, *n);
+            parent.children.push_back(std::move(e));
+        }
+    }
+    std::unique_ptr<Package> package_;
 };
 
 // ---- a host directory (Xenia's HostPathDevice) ----
@@ -497,6 +575,15 @@ bool Device::remove(Entry &) { return false; }
 
 std::shared_ptr<Device> make_disc_device(const std::string &mount_path, std::unique_ptr<Disc> disc) {
     return std::make_shared<DiscDevice>(mount_path, std::move(disc));
+}
+
+std::shared_ptr<Device> make_package_device(const std::string &mount_path, const std::filesystem::path &host_path,
+                                            std::string &error) {
+    std::unique_ptr<Package> package = Package::open(host_path, error);
+    if (!package) return nullptr;
+    for (const std::string &w : package->warnings())
+        std::fprintf(stderr, "files: %s: %s\n", host_path.string().c_str(), w.c_str());
+    return std::make_shared<PackageDevice>(mount_path, std::move(package));
 }
 
 std::shared_ptr<Device> make_host_device(const std::string &mount_path, const std::filesystem::path &host_path,

@@ -548,6 +548,56 @@ void content(ppc::Context &c) {
     CHECK(xam(c, "XamContentGetDeviceState", {1, 0}) == X_ERROR_SUCCESS);
     uint32_t mask = alloc(4);
     CHECK(xam(c, "XamContentGetLicenseMask", {mask, 0}) == X_ERROR_SUCCESS && K->load32(mask) == 0);
+
+    // a package file (an STFS: header, hash table, file table, one file's block)
+    // in the content root is opened and read as a device, read only
+    {
+        std::vector<uint8_t> pkg(0xA000 + 3 * 0x1000, 0);
+        auto be = [&](size_t at, uint32_t v) {
+            for (int i = 0; i < 4; i++) pkg[at + size_t(i)] = uint8_t(v >> (24 - 8 * i));
+        };
+        be(0, 0x4C495645); // "LIVE"
+        be(4 + 0x228 + 8, 0xF);  // the first license's bits
+        be(0x340, 0xA000);
+        be(0x344, 2);      // marketplace content
+        be(0x344 + 4, 2);  // metadata version
+        const std::u16string name = u"DLC Pack";
+        for (size_t i = 0; i < name.size(); i++) pkg[0x344 + 0xCD + 2 * i + 1] = uint8_t(name[i]);
+        uint8_t *v = &pkg[0x344 + 0x35]; // the volume descriptor
+        v[0] = 0x24, v[2] = 1, v[3] = 1;  // read-only format, one file table block (at block 0)
+        be(0x344 + 0x35 + 0x1C, 2);       // blocks
+        uint8_t *table = &pkg[0xA000];    // the level-0 hash table: both blocks end their chains
+        for (int i = 0; i < 2; i++) table[i * 0x18 + 0x14] = 0x80, table[i * 0x18 + 0x15] = 0xFF,
+                                    table[i * 0x18 + 0x16] = 0xFF, table[i * 0x18 + 0x17] = 0xFF;
+        uint8_t *entry = &pkg[0xA000 + 0x1000]; // block 0, the file table, after the one hash table
+        std::memcpy(entry, "pack.txt", 8);
+        entry[0x28] = 8 | 0x40, entry[0x2C] = 1, entry[0x2F] = 1, entry[0x32] = entry[0x33] = 0xFF, entry[0x37] = 11;
+        std::memcpy(&pkg[0xA000 + 2 * 0x1000], "hello world", 11); // block 1
+        auto dir = storage / "content" / "0000000000000000" / "00000000" / "00000002";
+        std::filesystem::create_directories(dir);
+        {
+            std::ofstream out(dir / "dlcpack", std::ios::binary);
+            out.write(reinterpret_cast<const char *>(pkg.data()), std::streamsize(pkg.size()));
+        }
+        uint32_t dlc = content_data(2, u"DLC Pack", "dlcpack"), proot = alloc(8);
+        std::memcpy(K->host(proot), "dlc", 4);
+        CHECK(xam(c, "XamContentCreateEx", {0, proot, dlc, 3, disposition, license, 0, 0, 0}) == X_ERROR_SUCCESS);
+        CHECK(K->load32(disposition) == 2 && K->load32(license) == 0xF);
+        Opened p = create(c, "dlc:\\PACK.TXT", GENERIC_READ, OPEN, 0);
+        CHECK(p.status == X_STATUS_SUCCESS && read_file(c, p.handle, 64, 0) == "hello world");
+        close(c, p.handle);
+        // writing is not allowed: a read-only open of what was asked for writing, or nothing
+        Opened w = create(c, "dlc:\\new.txt", GENERIC_WRITE, CREATE, 0);
+        CHECK(w.status != X_STATUS_SUCCESS);
+        // listed, as DLC of this title
+        CHECK(xam(c, "XamContentCreateEnumerator", {0, 1, 2, 0, 4, size, handle}) == X_ERROR_SUCCESS);
+        CHECK(xam(c, "XamEnumerate", {K->load32(handle), 0, items, 4 * 0x134, returned, 0}) == X_ERROR_SUCCESS);
+        CHECK(K->load32(returned) == 1 && K->load32(items + 4) == 2 && guest_u16(*K, items + 8) == u"DLC Pack" &&
+              std::string(reinterpret_cast<const char *>(K->host(items + 0x108))) == "dlcpack");
+        close(c, K->load32(handle));
+        CHECK(xam(c, "XamContentClose", {proot, 0}) == X_ERROR_SUCCESS);
+        CHECK(create(c, "dlc:\\pack.txt", GENERIC_READ, OPEN, 0).status == X_STATUS_OBJECT_PATH_NOT_FOUND);
+    }
 }
 
 // The input exports with boot's idle pad, START pressed by its overlay when

@@ -25,6 +25,7 @@ add_library(xenoforge STATIC
     src/bignum.cpp
     src/des.cpp
     src/disc.cpp
+    src/package.cpp
     src/exports.cpp
     src/xex.cpp
     src/lzx.cpp
@@ -419,6 +420,12 @@ target_include_directories(kernel_video_test PRIVATE src/kernel)
 target_link_libraries(kernel_video_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_video COMMAND kernel_video_test)
 set_tests_properties(kernel_video PROPERTIES TIMEOUT 120) # threads: fail, never hang
+# the content packages (STFS, SVOD) and their devices, on packages built in the test
+add_executable(package_test tests/package_test.cpp)
+target_include_directories(package_test PRIVATE src/kernel)
+target_link_libraries(package_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME package COMMAND package_test)
+set_tests_properties(package PROPERTIES TIMEOUT 120)
 # the files family and XAM, through their exports on a guest thread
 add_executable(kernel_files_test tests/kernel_files_test.cpp)
 target_include_directories(kernel_files_test PRIVATE src/kernel)

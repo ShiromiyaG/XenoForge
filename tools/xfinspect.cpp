@@ -3,10 +3,13 @@
 // what it imports from the system, the disc's files, and the image itself
 // decrypted and unpacked (for reverse engineering).
 
+#include "xenoforge/bytes.h"
 #include "xenoforge/disc.h"
 #include "xenoforge/exports.h"
+#include "xenoforge/package.h"
 #include "xenoforge/xex.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -22,8 +25,13 @@ namespace {
 
 void usage() {
     std::printf("usage: xfinspect <game.iso | file.xex> [options]\n"
+                "       xfinspect --package <file> [--list] [--extract <dir>]\n"
+                "  --package <file>     a content package (STFS or SVOD: DLC, update, XBLA, system update)\n"
+                "  --list               its files\n"
+                "  --extract <dir>      write its files under <dir>\n"
                 "  --xex <path>         the executable on the disc (default.xex)\n"
                 "  --files              list the disc's files\n"
+                "  --exports            each export of the module itself (ordinal, name when ours knows it, address)\n"
                 "  --imports            each import: library, ordinal, name, kind (tab separated)\n"
                 "  --dump-image <file>  write the image decrypted and unpacked (offset 0 = base address)\n"
                 "  --dump-xex <file>    write the executable as the disc holds it\n");
@@ -100,17 +108,128 @@ bool looks_like_xex(const std::filesystem::path &path) {
     return in && std::memcmp(magic, "XEX2", 4) == 0;
 }
 
+std::string utf8(const std::u16string &s) {
+    std::string out;
+    for (char16_t c : s) {
+        if (c < 0x80) out += char(c);
+        else if (c < 0x800) out += char(0xC0 | c >> 6), out += char(0x80 | (c & 0x3F));
+        else out += char(0xE0 | c >> 12), out += char(0x80 | ((c >> 6) & 0x3F)), out += char(0x80 | (c & 0x3F));
+    }
+    return out;
+}
+
+std::filesystem::path from_utf8(const std::string &s) {
+    return std::filesystem::path(std::u8string(s.begin(), s.end()));
+}
+
+void package_files(const PackageNode &dir, uint64_t &files, uint64_t &bytes, bool list) {
+    for (const auto &n : dir.children) {
+        if (n->directory) {
+            if (list) std::printf("%12s  %s/\n", "", n->path.c_str());
+            package_files(*n, files, bytes, list);
+        } else {
+            files++, bytes += n->size;
+            if (list) std::printf("%12llu  %s\n", static_cast<unsigned long long>(n->size), n->path.c_str());
+        }
+    }
+}
+
+// A name from a package is data from outside: nothing in it may leave the
+// directory it is written under.
+std::string safe_part(const std::string &name) {
+    std::string out;
+    for (char c : name) out += (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' ||
+                                c == '>' || c == '|' || uint8_t(c) < 0x20) ? '_' : c;
+    if (out.empty() || out == "." || out == "..") out = "_" + out;
+    return out;
+}
+
+bool extract(const Package &package, const PackageNode &dir, const std::filesystem::path &to, uint64_t &written) {
+    std::error_code ec;
+    std::filesystem::create_directories(to, ec);
+    for (const auto &n : dir.children) {
+        std::filesystem::path path = to / from_utf8(safe_part(n->name));
+        if (n->directory) {
+            if (!extract(package, *n, path, written)) return false;
+            continue;
+        }
+        std::ofstream out(path, std::ios::binary);
+        std::vector<uint8_t> chunk(1 << 20);
+        for (uint64_t at = 0; at < n->size;) {
+            size_t got = package.read(*n, at, chunk.data(), chunk.size());
+            if (!got) {
+                std::fprintf(stderr, "%s: only 0x%llX of 0x%llX bytes are in the package\n", n->path.c_str(),
+                             static_cast<unsigned long long>(at), static_cast<unsigned long long>(n->size));
+                break;
+            }
+            out.write(reinterpret_cast<const char *>(chunk.data()), std::streamsize(got));
+            at += got;
+            written += got;
+        }
+        if (!out) {
+            std::fprintf(stderr, "cannot write %s\n", path.string().c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+int inspect_package(const std::filesystem::path &path, bool list, const std::string &extract_to) {
+    std::string error;
+    auto package = Package::open(path, error);
+    if (!package) {
+        std::fprintf(stderr, "%s: %s\n", path.string().c_str(), error.c_str());
+        return 1;
+    }
+    const PackageInfo &i = package->info();
+    char magic[5] = {char(i.magic >> 24), char(i.magic >> 16), char(i.magic >> 8), char(i.magic), 0};
+    std::printf("package       %s (%s, %s, header 0x%X)\n", path.string().c_str(), magic,
+                package->is_stfs() ? "STFS" : "SVOD", i.header_size);
+    std::printf("content       type 0x%X  title id %08X  media id %08X  version %s (base %s)\n", i.content_type,
+                i.title_id, i.media_id, version(i.version).c_str(), version(i.base_version).c_str());
+    std::printf("name          \"%s\" by \"%s\", title \"%s\"\n", utf8(i.display_name[0]).c_str(),
+                utf8(i.publisher).c_str(), utf8(i.title_name).c_str());
+    std::printf("metadata      version %u, content size 0x%llX, profile %016llX, %zu + %zu bytes of thumbnails\n",
+                i.metadata_version, static_cast<unsigned long long>(i.content_size),
+                static_cast<unsigned long long>(i.profile_id), package->thumbnail().size(),
+                package->title_thumbnail().size());
+    if (package->is_stfs())
+        std::printf("volume        %u blocks (%u free), file table %u blocks at %u, %s\n", i.stfs.total_block_count,
+                    i.stfs.free_block_count, i.stfs.file_table_block_count, i.stfs.file_table_block_number,
+                    i.stfs.read_only_format() ? "read-only format" : "two tables per level");
+    else
+        std::printf("volume        %u data files, %u blocks from block %u, layout %s\n", i.data_file_count,
+                    i.svod.num_data_blocks, i.svod.start_data_block, package->layout().c_str());
+    uint64_t files = 0, bytes = 0;
+    if (list) std::printf("files\n");
+    package_files(package->root(), files, bytes, list);
+    std::printf("files         %llu, %llu bytes\n", static_cast<unsigned long long>(files),
+                static_cast<unsigned long long>(bytes));
+    for (const std::string &w : package->warnings()) std::printf("warning       %s\n", w.c_str());
+    if (!extract_to.empty()) {
+        uint64_t written = 0;
+        if (!extract(*package, package->root(), from_utf8(extract_to), written)) return 1;
+        std::printf("extracted     %llu bytes to %s\n", static_cast<unsigned long long>(written), extract_to.c_str());
+    }
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
-    std::filesystem::path input;
-    std::string xex_path = "default.xex", dump_path, dump_xex_path;
-    bool files = false, imports = false;
+    std::filesystem::path input, package_input;
+    std::string xex_path = "default.xex", dump_path, dump_xex_path, extract_path;
+    bool files = false, imports = false, list = false, exports = false;
+    std::string table_library; // the export table of ours that names this module's ordinals
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--xex" && i + 1 < argc) xex_path = argv[++i];
+        else if (a == "--package" && i + 1 < argc) package_input = std::filesystem::path(argv[++i]);
+        else if (a == "--list") list = true;
+        else if (a == "--extract" && i + 1 < argc) extract_path = argv[++i];
         else if (a == "--files") files = true;
         else if (a == "--imports") imports = true;
+        else if (a == "--exports") exports = true;
         else if (a == "--dump-image" && i + 1 < argc) dump_path = argv[++i];
         else if (a == "--dump-xex" && i + 1 < argc) dump_xex_path = argv[++i];
         else if (a == "-h" || a == "--help") {
@@ -121,6 +240,12 @@ int main(int argc, char **argv) {
             usage();
             return 2;
         }
+    }
+    if (!package_input.empty()) return inspect_package(package_input, list, extract_path);
+    {
+        std::string stem = input.filename().string();
+        for (char &c : stem) c = char(std::tolower(uint8_t(c)));
+        if (stem == "$flash_xam.xex" || stem == "xam.xex") table_library = "xam.xex";
     }
     if (input.empty()) {
         usage();
@@ -214,7 +339,42 @@ int main(int argc, char **argv) {
 
     bool have_image = load_xex_image(file, xex, error);
     if (!have_image) std::printf("image         not loaded: %s\n", error.c_str());
+    else if (xex.encryption == XexEncryption::None) std::printf("image         loaded (not encrypted)\n");
     else std::printf("image         decrypted with the %s key\n", xex.devkit ? "devkit" : "retail");
+
+    // the module's own exports: the table in the image, at the address the
+    // security info gives (xex2_export_table: count and base at 0x24 and 0x28,
+    // then an address for each ordinal, the image base's upper half added)
+    if (have_image && xex.header.size() >= size_t(xex.security_offset) + 0x164) {
+        uint32_t address = be32(xex.header.data() + xex.security_offset + 0x160);
+        uint64_t at = uint64_t(address) - xex.base_address;
+        if (address && address >= xex.base_address && at + 0x2C <= xex.image.size()) {
+            const uint8_t *t = xex.image.data() + at;
+            uint32_t count = be32(t + 0x24), base = be32(t + 0x28), image_base = be32(t + 0x20);
+            if (at + 0x2C + uint64_t(count) * 4 <= xex.image.size()) {
+                uint32_t used = 0, named = 0;
+                std::string listing;
+                for (uint32_t n = 0; n < count; n++) {
+                    uint32_t offset = be32(t + 0x2C + 4 * n);
+                    if (!offset) continue;
+                    used++;
+                    const Export *e = table_library.empty() ? nullptr : find_export(table_library, uint16_t(base + n));
+                    if (e) named++;
+                    char line[160];
+                    std::snprintf(line, sizeof(line), "%s\t0x%03X\t%s\t0x%08X\n", "export", base + n,
+                                  e ? e->name : "?", offset + (image_base << 16));
+                    listing += line;
+                }
+                std::printf("exports       %u slots from ordinal 0x%X, %u used, %u named in our table\n", count, base,
+                            used, named);
+                if (exports) std::fputs(listing.c_str(), stdout);
+            } else {
+                std::printf("exports       table at 0x%08X is not in the image\n", address);
+            }
+        } else {
+            std::printf("exports       none\n");
+        }
+    }
 
     // one line per (library, ordinal); the descriptor and the thunk count once
     struct Seen {

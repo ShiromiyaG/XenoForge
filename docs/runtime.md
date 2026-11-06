@@ -461,6 +461,27 @@ entries, names any case.
   (`\Device\Harddisk0\Partition1`, read-only), with `game:` and `d:` on it;
   Xenia's null device at `\Device\Harddisk0` (the raw partitions answer
   with nothing); host directories for the cache partitions and content.
+- **Content packages** (STFS and SVOD; `package.h`, `package.cpp`, and
+  `make_package_device` in vfs.cpp), from Xenia's xcontent container
+  devices: a CON, LIVE or PIRS header with its metadata, then a read-only
+  volume. `Package` reads the header and walks the whole tree at open: for
+  STFS the file table through the block hash tables (the active copy of
+  each pair chosen by the active-index bits, levels 0 to 2), for SVOD the
+  data fragments in `<package>.data` and the GDF directory trees of its
+  four layouts (EGDF, XSF, single file, multiple files). A file is a list of
+  runs in the host files; reads are positioned, under a lock, never a
+  mapping, and every read is bounds-checked (a damaged package fails to
+  open or reads short). The device is read only (its writes answer
+  ACCESS_DENIED, as Xenia's) and is named STFS or, for SVOD, FATX.
+  `xfinspect --package <file> [--list] [--extract <dir>]` lists and
+  extracts one. A package file in the content root
+  (`content/<XUID>/<TITLE>/<TYPE>/<name>`) is opened by XamContentCreate
+  with disposition open: its first bytes are its header (no header file),
+  its license mask the or of the licenses', and it is listed by the
+  enumerators. Left: creating or writing STFS (Xenia's
+  ContentPackageContainer writes it; new content here is a directory
+  package), the hash and signature checks (Xenia does none), and deleting
+  an SVOD's `.data` with it.
 - **File objects** are dispatchers (an auto-reset event in guest memory,
   set after each request, as Xenia's XFile is waitable). Requests complete
   at once, as Xenia completes them: the I/O status block, the event, the
