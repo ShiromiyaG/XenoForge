@@ -32,10 +32,11 @@ struct Fetch {
     bool tiled = true, stacked = false, packed = false;
     uint32_t pitch = 0; // texels
     uint32_t endian = 0, base = 0, mip_base = 0, mip_min = 0, mip_max = 0;
+    uint32_t signs = 0; // two bits a component
 
     texture::Info info() const {
         uint32_t d[6] = {};
-        d[0] = 2 | ((pitch >> 5) << 22) | (uint32_t(tiled) << 31);
+        d[0] = 2 | (signs << 2) | ((pitch >> 5) << 22) | (uint32_t(tiled) << 31);
         d[1] = format | (endian << 6) | (uint32_t(stacked) << 10) | (base & 0xFFFFF000);
         if (dimension == 0) d[2] = width - 1;
         else if (dimension == 2) d[2] = (width - 1) | ((height - 1) << 11) | ((depth - 1) << 22);
@@ -341,7 +342,7 @@ void test_decode_mips() {
 void test_endian() {
     GuestMemory m;
     Fetch f;
-    f.format = 4, f.width = 2, f.height = 1, f.pitch = 32, f.tiled = false, f.base = 0x800000; // 5_6_5
+    f.format = 10, f.width = 2, f.height = 1, f.pitch = 32, f.tiled = false, f.base = 0x800000; // 8_8
     const uint8_t guest[4] = {0x12, 0x34, 0x56, 0x78};
     m.write(0x800000, guest);
     texture::Image img;
@@ -540,11 +541,12 @@ void test_resolve_round_trips() {
         Fetch f;
         f.format = 4, f.width = 32, f.height = 32, f.pitch = 32, f.endian = 1, f.base = 0x2100000;
         CHECK(resolve_and_read(s, pixels, f, img));
-        bool same = img.format == HostFormat::B5G6R5 && img.levels[0].size() == 32 * 32 * 2;
+        // (read back as R5G6B5, red in the high bits)
+        bool same = img.format == HostFormat::R5G6B5 && img.levels[0].size() == 32 * 32 * 2;
         auto q = [](uint8_t v, uint32_t bits) { return uint32_t(float(v) / 255.0f * float((1u << bits) - 1) + 0.5f); };
         for (uint32_t i = 0; i < 32 * 32 && same; i++) {
             uint32_t v = img.levels[0][2 * i] | img.levels[0][2 * i + 1] << 8;
-            same &= v == (q(pixels[4 * i], 5) | q(pixels[4 * i + 1], 6) << 5 | q(pixels[4 * i + 2], 5) << 11);
+            same &= v == (q(pixels[4 * i], 5) << 11 | q(pixels[4 * i + 1], 6) << 5 | q(pixels[4 * i + 2], 5));
         }
         CHECK(same);
     }
@@ -616,9 +618,164 @@ void test_resolve_round_trips() {
     }
 }
 
+// A linear texture of the given bytes (endian 0) at 0x900000, decoded: its
+// level 0, with the plan it took.
+std::vector<uint8_t> decode_bytes(uint32_t format, uint32_t width, uint32_t height, const std::vector<uint8_t> &bytes,
+                                  texture::Plan &plan, const texture::Support &support = {}, uint32_t signs = 0,
+                                  bool signed_version = false) {
+    GuestMemory m;
+    m.write(0x900000, bytes);
+    Fetch f;
+    f.format = format, f.width = width, f.height = height, f.pitch = 32, f.tiled = false, f.base = 0x900000;
+    f.signs = signs;
+    texture::Image img;
+    std::string why;
+    if (!texture::plan(f.info(), plan, why, support, signed_version)) return {};
+    if (!texture::decode(f.info(), m, img, why, support, signed_version)) return {};
+    return img.levels[0];
+}
+std::vector<uint8_t> le16s(std::initializer_list<uint32_t> values) {
+    std::vector<uint8_t> out;
+    for (uint32_t v : values) out.push_back(uint8_t(v)), out.push_back(uint8_t(v >> 8));
+    return out;
+}
+std::vector<uint8_t> le32s(std::initializer_list<uint32_t> values) {
+    std::vector<uint8_t> out;
+    for (uint32_t v : values)
+        for (int k = 0; k < 4; k++) out.push_back(uint8_t(v >> (8 * k)));
+    return out;
+}
+
+// The formats Xenia's texture caches convert, texel by texel against
+// pixel_formats.xesli worked by hand; Xenia's host swizzles; the signed
+// versions; the fallbacks of a host without the optional formats; and what
+// stays unsupported, as in Xenia.
+void test_formats() {
+    using texture::Load, texture::Signed, texture::Half;
+    texture::Plan p;
+    // 16-bit packed (R 1, G 2, B 3, A 4 or 1): the host's packed formats
+    CHECK(decode_bytes(4, 1, 1, le16s({1 | 2 << 5 | 3 << 11}), p) == le16s({1 << 11 | 2 << 5 | 3})); // 5_6_5
+    CHECK(p.format == HostFormat::R5G6B5 && p.host_swizzle == texture::SWIZZLE_RGBB && p.signed_read == Signed::None);
+    // 6_5_5: its blue in R5G6B5's green, its green in blue, read through RBGG
+    CHECK(decode_bytes(5, 1, 1, le16s({1 | 2 << 5 | 3 << 10}), p) == le16s({1 << 11 | 3 << 5 | 2}));
+    CHECK(p.format == HostFormat::R5G6B5 && p.host_swizzle == texture::SWIZZLE_RBGG);
+    CHECK(decode_bytes(3, 1, 1, le16s({1 | 2 << 5 | 3 << 10 | 1 << 15}), p) == le16s({1 << 15 | 1 << 10 | 2 << 5 | 3}));
+    CHECK(p.format == HostFormat::A1R5G5B5); // 1_5_5_5
+    CHECK(decode_bytes(15, 1, 1, le16s({1 | 2 << 4 | 3 << 8 | 4 << 12}), p) == le16s({3 << 12 | 2 << 8 | 1 << 4 | 4}));
+    CHECK(p.format == HostFormat::B4G4R4A4); // 4_4_4_4
+    // 10_11_11 (red 11 bits low, blue 10 high) widened by replicating bits;
+    // its signed version of its own: 0x7FF is -1/1023, 0x400 -1, blue 1/511
+    uint32_t texel = 0x7FF | 0x400 << 11 | 1u << 22;
+    CHECK(decode_bytes(16, 1, 1, le32s({texel}), p) == le16s({0xFFFF, 0x8010, 0x0040, 0xFFFF}));
+    CHECK(p.format == HostFormat::RGBA16 && p.host_swizzle == texture::SWIZZLE_RGBB &&
+          p.signed_read == Signed::Separate && !p.snorm);
+    CHECK(decode_bytes(16, 1, 1, le32s({texel}), p, {}, 0x55, true) == le16s({0xFFE0, 0x8001, 0x0040, 0x7FFF}));
+    CHECK(p.format == HostFormat::RGBA16 && p.snorm && p.load == Load::R11G11B10ToRGBA16Snorm);
+    // 11_11_10 (red 10 bits low) and its _AS_16_16_16_16 twin
+    CHECK(decode_bytes(17, 1, 1, le32s({0x3FF | 0x7FFu << 21}), p) == le16s({0xFFFF, 0, 0xFFFF, 0xFFFF}));
+    CHECK(decode_bytes(56, 1, 1, le32s({0x3FF | 0x7FFu << 21}), p) == le16s({0xFFFF, 0, 0xFFFF, 0xFFFF}));
+    // the packed 4:2:2 formats, 3 texels of two blocks: Cr to red, Y to green, Cb to blue and alpha
+    std::vector<uint8_t> yuv = {0x10, 0x80, 0xEB, 0x40, 0x20, 0x81, 0x30, 0x41}; // Cr_Y1_Cb_Y0: Y0 Cb Y1 Cr
+    CHECK(decode_bytes(11, 3, 1, yuv, p) == std::vector<uint8_t>({0x40, 0x10, 0x80, 0x80, 0x40, 0xEB, 0x80, 0x80,
+                                                                   0x41, 0x20, 0x81, 0x81}));
+    CHECK(p.format == HostFormat::RGBA8 && p.host_swizzle == texture::SWIZZLE_RGBB && p.signed_read == Signed::View);
+    CHECK(decode_bytes(12, 3, 1, yuv, p) == // Y1_Cr_Y0_Cb: Cb Y0 Cr Y1
+          std::vector<uint8_t>({0xEB, 0x80, 0x10, 0x10, 0xEB, 0x40, 0x10, 0x10, 0x30, 0x81, 0x20, 0x20}));
+    // DXT3A_AS_1_1_1_1: a texel's 4 alpha bits are B4G4R4A4's red (bit 0),
+    // green, blue and alpha (bit 3), each a full 4 bits
+    std::vector<uint8_t> dxt3a = le32s({0xF681, 0});
+    std::vector<uint8_t> argb4 = decode_bytes(61, 4, 1, dxt3a, p);
+    CHECK(p.format == HostFormat::B4G4R4A4 && argb4.size() == 8);
+    CHECK(argb4 == le16s({0x00F0, 0x000F, 0xFF00, 0xFFFF}));
+    // 8_8_8_8_GAMMA_EDRAM is 8_8_8_8 (GetBaseFormat)
+    CHECK(decode_bytes(62, 1, 1, {1, 2, 3, 4}, p) == std::vector<uint8_t>({1, 2, 3, 4}));
+    CHECK(p.format == HostFormat::RGBA8 && p.signed_read == Signed::View);
+    // the signed versions
+    CHECK(!decode_bytes(2, 1, 1, {1}, p).empty() && p.signed_read == Signed::View);   // k_8: R8_SNORM
+    CHECK(!decode_bytes(30, 1, 1, {0, 0}, p).empty() && p.signed_read == Signed::View); // 16_FLOAT: the same
+    CHECK(!decode_bytes(18, 4, 4, le32s({0, 0}), p).empty() && p.signed_read == Signed::None); // DXT1: none
+    CHECK(!decode_bytes(58, 4, 4, le32s({0, 0}), p).empty() && p.signed_read == Signed::None); // DXT3A: none
+
+    // a host without the optional formats (XF_TEXTURE_FALLBACKS)
+    texture::Support bare;
+    for (HostFormat h : {HostFormat::BC1, HostFormat::BC2, HostFormat::BC3, HostFormat::BC4, HostFormat::BC5,
+                         HostFormat::R16, HostFormat::RG16, HostFormat::RGBA16, HostFormat::R5G6B5,
+                         HostFormat::A1R5G5B5, HostFormat::B4G4R4A4})
+        bare.sampled &= ~(uint64_t(1) << uint32_t(h));
+    bare.snorm = 0;
+    // DXT1 decompressed to RGBA8 as the host's BC1 would be read
+    std::vector<uint8_t> block = le32s({0xF800 | 0x001Fu << 16, 0xE4E4E4E4}); // red over blue, codes 0 1 2 3
+    std::vector<uint8_t> rgba = decode_bytes(18, 4, 4, block, p, bare);
+    CHECK(p.format == HostFormat::RGBA8 && p.load == Load::Dxt1ToRGBA8 && p.signed_read == Signed::None);
+    texture::Image bc;
+    bc.format = HostFormat::BC1, bc.width = 4, bc.height = 4, bc.levels = {block};
+    CHECK(rgba == texture::to_rgba8(bc));
+    CHECK(rgba.size() == 64 && rgba[0] == 255 && rgba[2] == 0 && rgba[4] == 0 && rgba[6] == 255); // red, blue
+    CHECK(rgba[8] == 170 && rgba[10] == 85 && rgba[12] == 85 && rgba[14] == 170);                 // 2:1, 1:2
+    // DXN to RG8, DXT5A to R8
+    CHECK(decode_bytes(49, 4, 4, le32s({0x00FF, 0, 0xFF00, 0}), p, bare).size() == 32 && p.format == HostFormat::RG8);
+    CHECK(decode_bytes(59, 4, 4, le32s({0x00FF, 0}), p, bare).size() == 16 && p.format == HostFormat::R8);
+    // 16-bit unorm as halves; its signed version of its own, from snorm
+    CHECK(decode_bytes(24, 3, 1, le16s({0xFFFF, 0x8000, 0}), p, bare) == le16s({0x3C00, 0x3800, 0}));
+    CHECK(p.format == HostFormat::R16F && p.half == Half::FromUnorm && p.signed_read == Signed::Separate &&
+          !p.approximate.empty());
+    CHECK(decode_bytes(24, 3, 1, le16s({0x7FFF, 0x8000, 0x8001}), p, bare, 0x55, true) ==
+          le16s({0x3C00, 0xBC00, 0xBC00}));
+    CHECK(p.format == HostFormat::R16F && p.half == Half::FromSnorm);
+    // and with 16-bit snorm left: the signed version is R16_SNORM of the same bits
+    texture::Support snorm16 = bare;
+    snorm16.snorm = uint64_t(1) << uint32_t(HostFormat::R16);
+    CHECK(decode_bytes(24, 1, 1, le16s({0x8001}), p, snorm16, 0x55, true) == le16s({0x8001}));
+    CHECK(p.format == HostFormat::R16 && p.snorm && p.half == Half::None);
+    // the packed 16-bit formats unpacked to RGBA8, bits replicated
+    CHECK(decode_bytes(4, 1, 1, le16s({1 | 2 << 5 | 3 << 11}), p, bare) == std::vector<uint8_t>({8, 8, 24, 255}));
+    CHECK(p.format == HostFormat::RGBA8 && p.host_swizzle == texture::SWIZZLE_RGBB);
+    CHECK(decode_bytes(5, 1, 1, le16s({1 | 2 << 5 | 3 << 10}), p, bare) == std::vector<uint8_t>({8, 16, 12, 255}));
+    CHECK(p.host_swizzle == texture::SWIZZLE_RGBB); // 6_5_5 unpacked in its own order
+    CHECK(decode_bytes(3, 1, 1, le16s({1 << 15}), p, bare) == std::vector<uint8_t>({0, 0, 0, 255}));
+    CHECK(decode_bytes(15, 1, 1, le16s({0x4321}), p, bare) == std::vector<uint8_t>({0x11, 0x22, 0x33, 0x44}));
+    CHECK(decode_bytes(61, 4, 1, dxt3a, p, bare) ==
+          std::vector<uint8_t>({255, 0, 0, 0, 0, 0, 0, 255, 0, 255, 255, 0, 255, 255, 255, 255}));
+    // the 32-bit floats need no filtering; a sampler of them points
+    texture::Support unfiltered;
+    unfiltered.linear &= ~(uint64_t(1) << uint32_t(HostFormat::R32F));
+    Fetch ff;
+    ff.format = 36, ff.width = 4, ff.height = 4, ff.pitch = 32, ff.base = 0x900000;
+    std::string reason;
+    CHECK(texture::plan(ff.info(), p, reason, unfiltered) && !texture::filterable(ff.info(), unfiltered));
+    CHECK(texture::filterable(ff.info(), {}));
+
+    // the halves' conversion constants are the floats nearest 1/65535 and 1/32767
+    CHECK(std::bit_cast<uint32_t>(1.0f / 65535.0f) == 0x37800080u);
+    CHECK(std::bit_cast<uint32_t>(1.0f / 32767.0f) == 0x38000100u);
+    // swizzles composed with the host format's
+    CHECK(texture::compose_swizzle(texture::SWIZZLE_RGBA, texture::SWIZZLE_RGBB) == texture::SWIZZLE_RGBB);
+    CHECK(texture::compose_swizzle(3 | 2 << 3 | 4 << 6 | 5 << 9, texture::SWIZZLE_RBGG) ==
+          (1 | 1 << 3 | 4 << 6 | 5 << 9));
+
+    // unsupported, as in Xenia: no host format for them
+    for (uint32_t format :
+         {0u, 1u, 13u, 21u, 33u, 34u, 35u, 39u, 40u, 41u, 42u, 43u, 44u, 45u, 46u, 47u, 48u, 57u, 63u}) {
+        Fetch f;
+        f.format = format, f.width = 8, f.height = 8, f.pitch = 32;
+        std::string why;
+        CHECK(!texture::plan(f.info(), p, why) && why.rfind("format ", 0) == 0);
+    }
+    // nor tiled 1D textures, nor 1D ones with packed mips
+    Fetch one;
+    one.format = 6, one.dimension = 0, one.width = 64, one.base = 0x900000;
+    std::string why;
+    CHECK(!texture::plan(one.info(), p, why) && why == "tiled 1D");
+    one.tiled = false, one.packed = true;
+    CHECK(!texture::plan(one.info(), p, why) && why == "1D with packed mips");
+    one.packed = false;
+    CHECK(texture::plan(one.info(), p, why));
+}
+
 } // namespace
 
 int main() {
+    test_formats();
     test_tiled_addresses();
     test_packed_mips();
     test_parse();

@@ -322,7 +322,8 @@ waited for only when the CPU needs what the GPU wrote (Decisions).
 - **Textures** decoded from guest memory (`texture.h`: 1D, 2D, stacked, 3D,
   cube, tiled or linear, packed mips, the block formats kept compressed;
   depth formats as 32-bit floats, the EXPAND formats as 16-bit floats, as
-  Xenia's texture cache loads them), with the fetch constant's swizzle and
+  Xenia's texture cache loads them; the host formats as "Texture formats"
+  below), with the fetch constant's swizzle and
   sampler; each is kept with a hash of the memory it was decoded from (its
   slices' spans: a tiled slice's the 4 KB pages its tiles lie in, found
   without visiting the texels) and decoded again when that memory differs
@@ -361,7 +362,7 @@ MSAA target that the game clears by drawing into the same samples seen as a
 Not done yet, counted where it shows: MSAA resolves of one sample; depth
 resolves of MSAA targets;
 point sprite coordinates in the pixel parameters; signed components of
-formats with no snorm view on the host (5_6_5, 4_4_4_4, the DXT colors);
+formats with no signed version (as in Xenia: "Texture formats" below);
 float16 and float32 targets moved through EDRAM by value rather than by
 bits (NaN payloads). Signed, biased, gamma and exponent-adjusted textures,
 the pixel parameters, the polygon offset, the samplers' LOD bias, mip
@@ -834,6 +835,74 @@ unsupported: Xenia fails the first (a fatal translation error) and reads
 past its copy of the microcode for the second, so only hardware could
 answer.
 
+## Texture formats (2026-11-06)
+
+Completed by inventory against Xenia's texture caches
+(`d3d12_texture_cache.h`'s table first, `vulkan_texture_cache.cc`'s where
+DXGI lacks a format; `texture_info.h`'s `GetBaseFormat`; the load shaders'
+conversions in `pixel_formats.xesli`). `texture.cpp`'s table gives each guest
+format its host format, the load that makes it, Xenia's host swizzle (the
+last component a format has stands for the missing ones: 5_6_5, 10_11_11
+and the 4:2:2 formats read RGBB, 6_5_5 RBGG) and its signed version.
+
+- **Drawn since**: `k_6_5_5` (R5G6B5, rearranged, through RBGG); the packed
+  4:2:2 pair `k_Cr_Y1_Cb_Y0_REP` and `k_Y1_Cr_Y0_Cb_REP` (decompressed to
+  RGBA8: Cr, Y, Cb, as Xenia's Vulkan path for any width); `k_10_11_11` and
+  `k_11_11_10`, plain and `_AS_16_16_16_16` (RGBA16 widened by replicating
+  bits; their signed version is an image of its own, 16-bit snorm, as
+  Xenia's `R11G11B10ToRGBA16SNorm`); `k_DXT3A_AS_1_1_1_1` (B4G4R4A4, a
+  texel's four alpha bits its four components); `k_8_8_8_8_GAMMA_EDRAM`
+  (as 8_8_8_8, which `GetBaseFormat` makes it).
+- **The packed 16-bit formats** are Vulkan's required R5G6B5, A1R5G5B5 and
+  B4G4R4A4, the loads moving the guest's red from the low bits, as Xenia's
+  Vulkan cache does; 1_5_5_5 no longer goes through 8 bits a component.
+- **Signed versions**: a snorm view of the same image where the bits are the
+  same; an image of its own where they are not (10_11_11, 11_11_10, and
+  16-bit snorm held as floats); none, as in Xenia, for the packed 16-bit
+  formats, the DXT colors, DXT3A, CTX1 and DXT3A_AS_1_1_1_1. Xenia binds no
+  view there (a null descriptor: zeros, logged as unsupported); XenoForge
+  reads them as unsigned, counted. No hardware reference says otherwise, so
+  that stays. DXT3A's and CTX1's earlier snorm views of the decompressed
+  unsigned bytes are gone; DXN's and DXT5A's BC5/BC4 snorm views stay
+  (beyond Xenia, which has none).
+- **Not drawn, as in Xenia** (no host format for them; each draw is skipped
+  and counted): `k_1`, `k_1_REVERSE`, `k_32_AS_8`, `k_32_AS_8_8`, the MPEG and
+  interlaced formats, `k_32_32_32_FLOAT`, the 32-bit integer `k_32`,
+  `k_32_32`, `k_32_32_32_32` (they were R32_UINT images sampled through the
+  float images the shaders declare, which Vulkan leaves undefined), and
+  `k_16_16_EDRAM`, `k_16_16_16_16_EDRAM`, `k_2_10_10_10_FLOAT_EDRAM` ("not
+  usable as a texture"). Nor tiled 1D textures, nor 1D ones with packed mips,
+  which Xenia's `BindingInfoFromFetchConstant` refuses as "completely wrong".
+- **Portable hosts.** The host formats are chosen from the device's format
+  properties (`texture::Support`: sampled, filtered, the snorm view), with
+  Xenia's Vulkan fallbacks: the DXT formats decompressed (DXT1-5 to RGBA8,
+  DXN to RG8, DXT5A to R8) on the GPU, 16-bit unorm and snorm as 16-bit floats
+  (`R16UNormToFloat` and kin, rounded the same on the CPU and the GPU), and a
+  sampler of a format the host does not filter (the 32-bit floats) points, as
+  `GetSamplerParameters` does. Beyond Xenia: the packed 16-bit formats
+  unpacked to RGBA8 where missing. The lossy fallbacks are counted
+  ("a texture format held with fewer bits"). `XF_TEXTURE_FALLBACKS=1` (or a
+  list of `bc`, `norm16`, `packed`, `snorm`, `linear32`) forces them on a
+  device that has everything. With all of them, the 17 frames of
+  `replay_test` stay within a mean of 0.34 of Xenia's; El Chavo Kart's park
+  has 0.108% of its pixels off by more than 16 (alpha-tested foliage: Xenia's
+  integer DXT decompression against the GPU's BC decoder, the same difference
+  Xenia's fallback has), the rest at most 0.068%. Validation stays clean.
+- **On the GPU**: `texture_load.comp` makes every load `decode` makes, for
+  textures over memory a resolve wrote (formerly the decompressions waited
+  for the resolve's bytes and decoded on the CPU) and for the DXT fallbacks.
+  `texture_gpu_test` loads every drawn format (45) in six layouts (tiled 2D
+  with mips and the packed tail, linear, 3D, cube, stacked, 1D; odd sizes;
+  every byte swap), as the host holds it and through the fallbacks, and the
+  separate signed versions: 1,313 levels, each byte for byte the CPU's.
+- Gone: "formats sampled at 8 bits per component" and "mip levels shorter
+  than their size" (the RGBA8 path that served formats without a host
+  format, which also kept only a texture's first layer).
+- Open: 1D textures wider than 8,192, which Xenia lays out as rows of a 2D
+  texture with the shader converting the coordinates (the translator's).
+  XNA's `FillXboxBuffer` gives no known texels for these formats: none of
+  the ones added is an XNA surface format.
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that
@@ -886,6 +955,9 @@ The generic renderer draws everything. Ports add, where it pays:
 `src/xenia/gpu/`: `xenos.h`, `registers.h`, `ucode.h` (the microcode),
 `pm4_command_processor_implement.h` (packets), `render_target_cache.h` (EDRAM,
 with long notes on its layout), `texture_info_formats.inl`,
-`texture_address.h`, `texture_util.h`, `draw_util.h`, `primitive_processor.h`,
+`texture_address.h`, `texture_util.h`, `texture_info.h` (`GetBaseFormat`),
+`d3d12/d3d12_texture_cache.h` and `vulkan/vulkan_texture_cache.cc` (the host
+formats, signed versions and fallbacks), `shaders/pixel_formats.xesli` and
+`shaders/texture_load_*` (the loads), `draw_util.h`, `primitive_processor.h`,
 `spirv_shader_translator*.cc`, `shader_interpreter.h`, `trace_protocol.h`,
 `trace_reader.h`, `trace_dump.h`; `vulkan/` for how Xenia drives Vulkan.

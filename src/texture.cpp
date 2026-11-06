@@ -5,10 +5,14 @@
 // GetSubresourcesFromFetchConstant, GetPackedMipLevel, GetPackedMipOffset,
 // GetGuestTextureLayout), the loads' addressing, levels and byte swaps
 // (vulkan/vulkan_texture_cache.cc's LoadTextureData, shaders/texture_load.xesli
-// and texture_load_*bpb.xesli, endian.xesli), the host formats
-// (vulkan_texture_cache.cc's table), the decompressions (texture_load_dxt3a,
-// texture_load_ctx1 and the DXT helpers of pixel_formats.xesli) and the depth
-// loads (texture_load_depth_unorm, texture_load_depth_float). BSD; see
+// and texture_load_*bpb.xesli, endian.xesli), the host formats, their
+// swizzles, signed versions and fallbacks (d3d12/d3d12_texture_cache.h's and
+// vulkan_texture_cache.cc's tables and Initialize, texture_info.h's
+// GetBaseFormat), the 1D textures it refuses (texture_cache.cc's
+// BindingInfoFromFetchConstant), the conversions (pixel_formats.xesli's
+// 16-bit rearrangements, R11G11B10 and R10G11B11 widenings, GBGR8 and BGRG8
+// decompressions, the DXT, DXT3A, DXT3A_AS_1_1_1_1 and CTX1 decoders) and the
+// depth loads (texture_load_depth_unorm, texture_load_depth_float). BSD; see
 // LICENSE-xenia.
 
 #include "xenoforge/texture.h"
@@ -24,86 +28,179 @@ namespace xf::texture {
 
 namespace {
 
-// Formats Xenia's Vulkan texture cache turns into others on the CPU side of
-// the load; the rest keep the guest's bits. Depth (24_8, 24_8_FLOAT) becomes
-// 32-bit floats as texture_load_depth_unorm and texture_load_depth_float make
-// it.
-using Convert = Load;
-
+// A guest format's block and how Xenia's texture caches hold it: the host
+// format and the load that makes it, the host swizzle (the last component a
+// format has stands for those it lacks, "on the Xenos, it appears that the
+// last existing component of a texture is replicated into the missing
+// components"), and its signed version. Where the two backends differ the
+// D3D12 one is followed (24_8's signed version is its R32_FLOAT view), except
+// where DXGI lacks a format Vulkan has (2_10_10_10's signed view). The
+// formats GetBaseFormat folds (the 8_A, _AS_16_16_16_16 and 8_8_8_8_GAMMA_EDRAM
+// ones) are their base format's rows. Unsupported, as in Xenia: the 1-bit,
+// 32_AS_8, MPEG, interlaced and 96-bit formats, the 32-bit integer ones (no
+// host format filters them), and the EDRAM ones other than 8_8_8_8_GAMMA
+// ("not usable as a texture").
 struct FormatEntry {
     uint8_t block_width, block_height;
     uint8_t bits; // per texel (texture_info_formats.inl's bits_per_pixel)
-    HostFormat host;
-    Convert convert = Convert::Copy;
+    HostFormat host = HostFormat::Unsupported;
+    Load load = Load::Copy;
+    uint32_t swizzle = SWIZZLE_RGBA;
+    Signed signs = Signed::None;
+    Load signed_load = Load::Copy; // a separate signed version's
 };
 
 using H = HostFormat;
+using L = Load;
+using S = Signed;
 constexpr FormatEntry FORMATS[64] = {
-    {1, 1, 1, H::Unsupported},       // k_1_REVERSE
-    {1, 1, 1, H::Unsupported},       // k_1
-    {1, 1, 8, H::R8},                // k_8
-    {1, 1, 16, H::A1R5G5B5},         // k_1_5_5_5
-    {1, 1, 16, H::B5G6R5},           // k_5_6_5
-    {1, 1, 16, H::Unsupported},      // k_6_5_5
-    {1, 1, 32, H::RGBA8},            // k_8_8_8_8
-    {1, 1, 32, H::RGB10A2},          // k_2_10_10_10
-    {1, 1, 8, H::R8},                // k_8_A
-    {1, 1, 8, H::R8},                // k_8_B
-    {1, 1, 16, H::RG8},              // k_8_8
-    {2, 1, 16, H::Unsupported},      // k_Cr_Y1_Cb_Y0_REP
-    {2, 1, 16, H::Unsupported},      // k_Y1_Cr_Y0_Cb_REP
-    {1, 1, 32, H::Unsupported},      // k_16_16_EDRAM
-    {1, 1, 32, H::RGBA8},            // k_8_8_8_8_A
-    {1, 1, 16, H::A4R4G4B4},         // k_4_4_4_4
-    {1, 1, 32, H::Unsupported},      // k_10_11_11
-    {1, 1, 32, H::Unsupported},      // k_11_11_10
-    {4, 4, 4, H::BC1},               // k_DXT1
-    {4, 4, 8, H::BC2},               // k_DXT2_3
-    {4, 4, 8, H::BC3},               // k_DXT4_5
-    {1, 1, 64, H::Unsupported},      // k_16_16_16_16_EDRAM
-    {1, 1, 32, H::R32F, Convert::DepthUnormToFloat}, // k_24_8
-    {1, 1, 32, H::R32F, Convert::DepthFloatToFloat}, // k_24_8_FLOAT
-    {1, 1, 16, H::R16},              // k_16
-    {1, 1, 32, H::RG16},             // k_16_16
-    {1, 1, 64, H::RGBA16},           // k_16_16_16_16
-    {1, 1, 16, H::R16F},             // k_16_EXPAND: 16-bit floats, as Xenia reads them
-    {1, 1, 32, H::RG16F},            // k_16_16_EXPAND
-    {1, 1, 64, H::RGBA16F},          // k_16_16_16_16_EXPAND
-    {1, 1, 16, H::R16F},             // k_16_FLOAT
-    {1, 1, 32, H::RG16F},            // k_16_16_FLOAT
-    {1, 1, 64, H::RGBA16F},          // k_16_16_16_16_FLOAT
-    {1, 1, 32, H::R32},              // k_32
-    {1, 1, 64, H::RG32},             // k_32_32
-    {1, 1, 128, H::RGBA32},          // k_32_32_32_32
-    {1, 1, 32, H::R32F},             // k_32_FLOAT
-    {1, 1, 64, H::RG32F},            // k_32_32_FLOAT
-    {1, 1, 128, H::RGBA32F},         // k_32_32_32_32_FLOAT
-    {4, 1, 8, H::Unsupported},       // k_32_AS_8
-    {2, 1, 16, H::Unsupported},      // k_32_AS_8_8
-    {1, 1, 16, H::Unsupported},      // k_16_MPEG
-    {1, 1, 32, H::Unsupported},      // k_16_16_MPEG
-    {1, 1, 8, H::Unsupported},       // k_8_INTERLACED
-    {4, 1, 8, H::Unsupported},       // k_32_AS_8_INTERLACED
-    {1, 1, 16, H::Unsupported},      // k_32_AS_8_8_INTERLACED
-    {1, 1, 16, H::Unsupported},      // k_16_INTERLACED
-    {1, 1, 16, H::Unsupported},      // k_16_MPEG_INTERLACED
-    {1, 1, 32, H::Unsupported},      // k_16_16_MPEG_INTERLACED
-    {4, 4, 8, H::BC5},               // k_DXN
-    {1, 1, 32, H::RGBA8},            // k_8_8_8_8_AS_16_16_16_16
-    {4, 4, 4, H::BC1},               // k_DXT1_AS_16_16_16_16
-    {4, 4, 8, H::BC2},               // k_DXT2_3_AS_16_16_16_16
-    {4, 4, 8, H::BC3},               // k_DXT4_5_AS_16_16_16_16
-    {1, 1, 32, H::RGB10A2},          // k_2_10_10_10_AS_16_16_16_16
-    {1, 1, 32, H::Unsupported},      // k_10_11_11_AS_16_16_16_16
-    {1, 1, 32, H::Unsupported},      // k_11_11_10_AS_16_16_16_16
-    {1, 1, 96, H::Unsupported},      // k_32_32_32_FLOAT
-    {4, 4, 4, H::R8, Convert::Dxt3aToR8},  // k_DXT3A
-    {4, 4, 4, H::BC4},               // k_DXT5A
-    {4, 4, 4, H::RG8, Convert::Ctx1ToRg8}, // k_CTX1
-    {4, 4, 4, H::Unsupported},       // k_DXT3A_AS_1_1_1_1
-    {1, 1, 32, H::Unsupported},      // k_8_8_8_8_GAMMA_EDRAM
-    {1, 1, 32, H::Unsupported},      // k_2_10_10_10_FLOAT_EDRAM
+    {1, 1, 1},                                                         // k_1_REVERSE
+    {1, 1, 1},                                                         // k_1
+    {1, 1, 8, H::R8, L::Copy, SWIZZLE_RRRR, S::View},                  // k_8
+    {1, 1, 16, H::A1R5G5B5, L::R5G5B5A1ToB5G5R5A1},                    // k_1_5_5_5
+    {1, 1, 16, H::R5G6B5, L::R5G6B5ToB5G6R5, SWIZZLE_RGBB},            // k_5_6_5
+    {1, 1, 16, H::R5G6B5, L::R5G5B6ToB5G6R5, SWIZZLE_RBGG},            // k_6_5_5: green in blue, blue in green
+    {1, 1, 32, H::RGBA8, L::Copy, SWIZZLE_RGBA, S::View},              // k_8_8_8_8
+    {1, 1, 32, H::RGB10A2, L::Copy, SWIZZLE_RGBA, S::View},            // k_2_10_10_10
+    {1, 1, 8, H::R8, L::Copy, SWIZZLE_RRRR, S::View},                  // k_8_A
+    {1, 1, 8, H::R8, L::Copy, SWIZZLE_RRRR, S::View},                  // k_8_B
+    {1, 1, 16, H::RG8, L::Copy, SWIZZLE_RGGG, S::View},                // k_8_8
+    {2, 1, 16, H::RGBA8, L::GBGR8ToRGBA8, SWIZZLE_RGBB, S::View},      // k_Cr_Y1_Cb_Y0_REP
+    {2, 1, 16, H::RGBA8, L::BGRG8ToRGBA8, SWIZZLE_RGBB, S::View},      // k_Y1_Cr_Y0_Cb_REP
+    {1, 1, 32},                                                        // k_16_16_EDRAM
+    {1, 1, 32, H::RGBA8, L::Copy, SWIZZLE_RGBA, S::View},              // k_8_8_8_8_A
+    {1, 1, 16, H::B4G4R4A4, L::R4G4B4A4ToA4R4G4B4},                    // k_4_4_4_4
+    {1, 1, 32, H::RGBA16, L::R11G11B10ToRGBA16, SWIZZLE_RGBB, S::Separate, L::R11G11B10ToRGBA16Snorm}, // k_10_11_11
+    {1, 1, 32, H::RGBA16, L::R10G11B11ToRGBA16, SWIZZLE_RGBB, S::Separate, L::R10G11B11ToRGBA16Snorm}, // k_11_11_10
+    {4, 4, 4, H::BC1},                                                 // k_DXT1
+    {4, 4, 8, H::BC2},                                                 // k_DXT2_3
+    {4, 4, 8, H::BC3},                                                 // k_DXT4_5
+    {1, 1, 64},                                                        // k_16_16_16_16_EDRAM
+    {1, 1, 32, H::R32F, L::DepthUnormToFloat, SWIZZLE_RRRR, S::View},  // k_24_8
+    {1, 1, 32, H::R32F, L::DepthFloatToFloat, SWIZZLE_RRRR, S::View},  // k_24_8_FLOAT
+    {1, 1, 16, H::R16, L::Copy, SWIZZLE_RRRR, S::View},                // k_16
+    {1, 1, 32, H::RG16, L::Copy, SWIZZLE_RGGG, S::View},               // k_16_16
+    {1, 1, 64, H::RGBA16, L::Copy, SWIZZLE_RGBA, S::View},             // k_16_16_16_16
+    {1, 1, 16, H::R16F, L::Copy, SWIZZLE_RRRR, S::View},               // k_16_EXPAND: floats, as Xenia reads it
+    {1, 1, 32, H::RG16F, L::Copy, SWIZZLE_RGGG, S::View},              // k_16_16_EXPAND
+    {1, 1, 64, H::RGBA16F, L::Copy, SWIZZLE_RGBA, S::View},            // k_16_16_16_16_EXPAND
+    {1, 1, 16, H::R16F, L::Copy, SWIZZLE_RRRR, S::View},               // k_16_FLOAT
+    {1, 1, 32, H::RG16F, L::Copy, SWIZZLE_RGGG, S::View},              // k_16_16_FLOAT
+    {1, 1, 64, H::RGBA16F, L::Copy, SWIZZLE_RGBA, S::View},            // k_16_16_16_16_FLOAT
+    {1, 1, 32},                                                        // k_32
+    {1, 1, 64},                                                        // k_32_32
+    {1, 1, 128},                                                       // k_32_32_32_32
+    {1, 1, 32, H::R32F, L::Copy, SWIZZLE_RRRR, S::View},               // k_32_FLOAT
+    {1, 1, 64, H::RG32F, L::Copy, SWIZZLE_RGGG, S::View},              // k_32_32_FLOAT
+    {1, 1, 128, H::RGBA32F, L::Copy, SWIZZLE_RGBA, S::View},           // k_32_32_32_32_FLOAT
+    {4, 1, 8},                                                         // k_32_AS_8
+    {2, 1, 16},                                                        // k_32_AS_8_8
+    {1, 1, 16},                                                        // k_16_MPEG
+    {1, 1, 32},                                                        // k_16_16_MPEG
+    {1, 1, 8},                                                         // k_8_INTERLACED
+    {4, 1, 8},                                                         // k_32_AS_8_INTERLACED
+    {1, 1, 16},                                                        // k_32_AS_8_8_INTERLACED
+    {1, 1, 16},                                                        // k_16_INTERLACED
+    {1, 1, 16},                                                        // k_16_MPEG_INTERLACED
+    {1, 1, 32},                                                        // k_16_16_MPEG_INTERLACED
+    {4, 4, 8, H::BC5, L::Copy, SWIZZLE_RGGG, S::View},                 // k_DXN (BC5_SNORM: beyond Xenia)
+    {1, 1, 32, H::RGBA8, L::Copy, SWIZZLE_RGBA, S::View},              // k_8_8_8_8_AS_16_16_16_16
+    {4, 4, 4, H::BC1},                                                 // k_DXT1_AS_16_16_16_16
+    {4, 4, 8, H::BC2},                                                 // k_DXT2_3_AS_16_16_16_16
+    {4, 4, 8, H::BC3},                                                 // k_DXT4_5_AS_16_16_16_16
+    {1, 1, 32, H::RGB10A2, L::Copy, SWIZZLE_RGBA, S::View},            // k_2_10_10_10_AS_16_16_16_16
+    // k_10_11_11_AS_16_16_16_16
+    {1, 1, 32, H::RGBA16, L::R11G11B10ToRGBA16, SWIZZLE_RGBB, S::Separate, L::R11G11B10ToRGBA16Snorm},
+    // k_11_11_10_AS_16_16_16_16
+    {1, 1, 32, H::RGBA16, L::R10G11B11ToRGBA16, SWIZZLE_RGBB, S::Separate, L::R10G11B11ToRGBA16Snorm},
+    {1, 1, 96},                                                        // k_32_32_32_FLOAT
+    {4, 4, 4, H::R8, L::Dxt3aToR8, SWIZZLE_RRRR},                      // k_DXT3A
+    {4, 4, 4, H::BC4, L::Copy, SWIZZLE_RRRR, S::View},                 // k_DXT5A (BC4_SNORM: beyond Xenia)
+    {4, 4, 4, H::RG8, L::Ctx1ToRg8, SWIZZLE_RGGG},                     // k_CTX1
+    {4, 4, 4, H::B4G4R4A4, L::Dxt3aAs1111ToARGB4},                     // k_DXT3A_AS_1_1_1_1
+    {1, 1, 32, H::RGBA8, L::Copy, SWIZZLE_RGBA, S::View},              // k_8_8_8_8_GAMMA_EDRAM: as 8_8_8_8
+    {1, 1, 32},                                                        // k_2_10_10_10_FLOAT_EDRAM
 };
+
+bool is_float(HostFormat f) {
+    return f == H::R16F || f == H::RG16F || f == H::RGBA16F || f == H::R32F || f == H::RG32F || f == H::RGBA32F;
+}
+bool is_norm16(HostFormat f) { return f == H::R16 || f == H::RG16 || f == H::RGBA16; }
+HostFormat half_of(HostFormat f) { return f == H::R16 ? H::R16F : f == H::RG16 ? H::RG16F : H::RGBA16F; }
+
+// A version of a texture as the host holds it.
+struct Version {
+    HostFormat host = H::Unsupported;
+    Load load = L::Copy;
+    Half half = Half::None;
+    uint32_t swizzle = SWIZZLE_RGBA;
+    bool snorm = false;
+    std::string approximate;
+};
+
+// The unsigned version: the format's host format where the host samples and
+// filters it, else the fallbacks of Xenia's Vulkan texture cache (Initialize:
+// the DXT formats decompressed, 16-bit fixed point as 16-bit floats); the
+// packed 16-bit formats, which Vulkan requires, unpacked to RGBA8 (beyond
+// Xenia, which has no fallback for them).
+Version unsigned_version(const FormatEntry &f, const Support &support) {
+    Version v;
+    v.host = f.host, v.load = f.load, v.swizzle = f.swizzle;
+    if (support.usable(v.host)) return v;
+    switch (v.host) {
+    case H::BC1: v.host = H::RGBA8, v.load = L::Dxt1ToRGBA8; break;
+    case H::BC2: v.host = H::RGBA8, v.load = L::Dxt3ToRGBA8; break;
+    case H::BC3: v.host = H::RGBA8, v.load = L::Dxt5ToRGBA8; break;
+    case H::BC4: v.host = H::R8, v.load = L::Dxt5aToR8; break;
+    case H::BC5: v.host = H::RG8, v.load = L::DxnToRG8; break;
+    case H::R16: case H::RG16: case H::RGBA16:
+        v.approximate = std::string(host_format_name(v.host)) + " as 16-bit floats";
+        v.host = half_of(v.host), v.half = Half::FromUnorm;
+        break;
+    case H::R5G6B5: case H::A1R5G5B5: case H::B4G4R4A4:
+        v.approximate = std::string(host_format_name(v.host)) + " as RGBA8";
+        v.load = v.load == L::R5G6B5ToB5G6R5       ? L::R5G6B5ToRGBA8
+                 : v.load == L::R5G5B6ToB5G6R5     ? L::R5G5B6ToRGBA8
+                 : v.load == L::R5G5B5A1ToB5G5R5A1 ? L::R5G5B5A1ToRGBA8
+                 : v.load == L::R4G4B4A4ToA4R4G4B4 ? L::R4G4B4A4ToRGBA8
+                                                   : L::Dxt3aAs1111ToRGBA8;
+        if (v.load == L::Dxt3aAs1111ToRGBA8) v.approximate.clear(); // its bits are 0 or 1: exact
+        if (v.swizzle == SWIZZLE_RBGG) v.swizzle = SWIZZLE_RGBB;     // 6_5_5 unpacked in its own order
+        v.host = H::RGBA8;
+        break;
+    default: break;
+    }
+    if (!support.usable(v.host)) v.host = H::Unsupported;
+    return v;
+}
+
+// The version signed components read (Signed::None when there is none):
+// the same image where the bits are the same (a snorm view; the floats are
+// signed either way), else one of its own: 10_11_11 and 11_11_10 widened as
+// signed (Xenia's R11G11B10ToRGBA16SNorm), 16-bit snorm as floats where the
+// host has no 16-bit snorm (R16SNormToFloat). DXN and DXT5A decompressed
+// have none, as in Xenia.
+Signed signed_of(const FormatEntry &f, const Support &support, const Version &u, Version &out) {
+    if (f.signs == S::None || u.host == H::Unsupported) return S::None;
+    Load load = f.signs == S::Separate ? f.signed_load : f.load;
+    if (is_float(f.host)) {
+        out = u;
+        return S::View;
+    }
+    if ((f.host == H::BC4 || f.host == H::BC5) && u.host != f.host) return S::None;
+    if (support.snorm_usable(f.host)) {
+        out = Version{};
+        out.host = f.host, out.load = load, out.swizzle = u.swizzle, out.snorm = true;
+    } else if (is_norm16(f.host)) {
+        out = Version{};
+        out.host = half_of(f.host), out.load = load, out.half = Half::FromSnorm, out.swizzle = u.swizzle;
+        out.approximate = std::string(host_format_name(f.host)) + " snorm as 16-bit floats";
+        if (!support.usable(out.host)) return S::None;
+    } else {
+        return S::None;
+    }
+    return out.host == u.host && out.load == u.load && out.half == u.half ? S::View : S::Separate;
+}
 
 constexpr uint32_t MAX_MIPS = 14;           // xenos::kTextureMaxMips
 constexpr uint32_t TILE = 32;               // kTextureTileWidthHeight
@@ -402,12 +499,208 @@ void dxt5_alpha(const uint8_t *block, uint8_t out[16]) {
     }
 }
 
+// pixel_formats.xesli's 16-bit rearrangements: the guest's packed formats
+// have red in the low bits, the host's in the high ones (R5G6B5, A1R5G5B5) or
+// the alpha there (B4G4R4A4); 6_5_5's components land as R5G6B5's red, blue
+// and green (read through RBGG).
+uint16_t transform16(Load load, uint32_t v) {
+    switch (load) {
+    case L::R5G6B5ToB5G6R5: v = (v & 0x07E0) | ((v & 0x001F) << 11) | ((v & 0xF800) >> 11); break;
+    case L::R5G5B6ToB5G6R5: v = ((v & 0x001F) << 11) | ((v & 0xFFE0) >> 5); break;
+    case L::R5G5B5A1ToB5G5R5A1: v = (v & 0x83E0) | ((v & 0x001F) << 10) | ((v & 0x7C00) >> 10); break;
+    case L::R4G4B4A4ToA4R4G4B4: v = ((v & 0x0FFF) << 4) | (v >> 12); break;
+    default: break;
+    }
+    return uint16_t(v);
+}
+bool is_transform16(Load load) {
+    return load == L::R5G6B5ToB5G6R5 || load == L::R5G5B6ToB5G6R5 || load == L::R5G5B5A1ToB5G5R5A1 ||
+           load == L::R4G4B4A4ToA4R4G4B4;
+}
+
+// pixel_formats.xesli's XeR11G11B10UNormToRGBA16 and kin: an n-bit unsigned
+// component to 16 bits by replicating its top bits below it; a signed one
+// (XeSNorm11To16, XeSNorm10To16) by its magnitude, the most negative value
+// taken as the one above it (both are -1), replicated to 15 bits, the sign
+// put back.
+uint32_t unorm_to_16(uint32_t v, uint32_t bits) { return (v << (16 - bits)) | (v >> (2 * bits - 16)); }
+uint32_t snorm_to_16(uint32_t s, uint32_t bits) {
+    uint32_t sign = s >> (bits - 1), mask = (1u << bits) - 1;
+    if (s == (1u << (bits - 1))) s++;
+    uint32_t magnitude = (s ^ (sign ? mask : 0)) + sign;
+    magnitude = (magnitude << (16 - bits)) | (magnitude >> (2 * bits - 17));
+    return ((magnitude ^ (sign ? 0xFFFFu : 0)) + sign) & 0xFFFF;
+}
+bool is_widening(Load load) {
+    return load == L::R11G11B10ToRGBA16 || load == L::R10G11B11ToRGBA16 || load == L::R11G11B10ToRGBA16Snorm ||
+           load == L::R10G11B11ToRGBA16Snorm;
+}
+// a 32-bit texel to RGBA16, alpha 1: 10_11_11 has red in its low 11 bits,
+// green in the next 11 and blue in the top 10; 11_11_10 red in its low 10,
+// green and blue in 11 each
+void widen(Load load, uint32_t texel, uint16_t out[4]) {
+    bool r11 = load == L::R11G11B10ToRGBA16 || load == L::R11G11B10ToRGBA16Snorm;
+    bool snorm = load == L::R11G11B10ToRGBA16Snorm || load == L::R10G11B11ToRGBA16Snorm;
+    uint32_t widths[3] = {r11 ? 11u : 10u, 11u, r11 ? 10u : 11u}, shift = 0;
+    for (uint32_t c = 0; c < 3; shift += widths[c], c++) {
+        uint32_t v = (texel >> shift) & ((1u << widths[c]) - 1);
+        out[c] = uint16_t(snorm ? snorm_to_16(v, widths[c]) : unorm_to_16(v, widths[c]));
+    }
+    out[3] = snorm ? 0x7FFF : 0xFFFF;
+}
+
+// The packed 16-bit formats unpacked to RGBA8 where the host lacks their own
+// (5_6_5, 6_5_5, 1_5_5_5, 4_4_4_4 from the low bits): each component's bits
+// replicated down to 8, alpha 1 where there is none.
+bool is_unpack16(Load load) {
+    return load == L::R5G6B5ToRGBA8 || load == L::R5G5B6ToRGBA8 || load == L::R5G5B5A1ToRGBA8 ||
+           load == L::R4G4B4A4ToRGBA8;
+}
+uint32_t unpack16(Load load, uint32_t v) {
+    static const uint8_t widths[4][4] = {{5, 6, 5, 0}, {5, 5, 6, 0}, {5, 5, 5, 1}, {4, 4, 4, 4}};
+    const uint8_t *w = widths[uint32_t(load) - uint32_t(L::R5G6B5ToRGBA8)];
+    uint32_t out = 0, shift = 0;
+    for (uint32_t c = 0; c < 4; shift += w[c], c++) {
+        uint32_t bits = w[c], x = (v >> shift) & ((1u << bits) - 1);
+        uint32_t byte = !bits ? 255 : bits == 1 ? x * 255 : (x << (8 - bits)) | (x >> (2 * bits - 8));
+        out |= byte << (8 * c);
+    }
+    return out;
+}
+
+// pixel_formats.xesli's pack_half_2x16 of XeRG16UNormToRG16Float and kin: a
+// 16-bit unorm (or snorm, clamped to -1) component as the float nearest it,
+// to half precision rounding to nearest even (texture_load.comp computes it
+// the same way, bit for bit)
+uint16_t float_to_half(float f) {
+    uint32_t x = std::bit_cast<uint32_t>(f), sign = (x >> 16) & 0x8000;
+    x &= 0x7FFFFFFF;
+    if (x < 0x38800000) { // below the smallest normal half: a denormal (or 0)
+        if (x < 0x33000000) return uint16_t(sign);
+        uint32_t mantissa = (x & 0x7FFFFF) | 0x800000, e = x >> 23; // f = mantissa * 2^(e - 150)
+        uint32_t shift = 126 - e;                                   // to units of 2^-24
+        uint32_t h = mantissa >> shift, rest = mantissa & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rest > half || (rest == half && (h & 1))) h++;
+        return uint16_t(sign | h);
+    }
+    uint32_t h = ((x - 0x38000000) >> 13), rest = x & 0x1FFF;
+    if (rest > 0x1000 || (rest == 0x1000 && (h & 1))) h++;
+    return uint16_t(sign | h);
+}
+uint16_t norm16_to_half(uint32_t v, Half half) {
+    // 1/32767 and 1/65535 by their bits, as texture_load.comp has them
+    float f = half == Half::FromSnorm ? std::max(float(int16_t(uint16_t(v))) * std::bit_cast<float>(0x38000100u), -1.0f)
+                                      : float(v & 0xFFFF) * std::bit_cast<float>(0x37800080u);
+    return float_to_half(f);
+}
+
+// A block decompressed to its texels (row-major, the host format's bytes
+// each), as Xenia's decompressing loads make them.
+uint32_t texel_bytes(Load load) {
+    switch (load) {
+    case L::Dxt3aToR8: case L::Dxt5aToR8: return 1;
+    case L::Dxt3aAs1111ToARGB4: case L::Ctx1ToRg8: case L::DxnToRG8: return 2;
+    default: return 4;
+    }
+}
+void decompress(Load load, const uint8_t *block, uint8_t *out) {
+    switch (load) {
+    case L::GBGR8ToRGBA8: case L::BGRG8ToRGBA8: {
+        // pixel_formats.xesli's XeGBGR8ToRGB8WithRGBBSwizzle and
+        // XeBGRG8ToRGB8WithRGBBSwizzle: Cr to red, each texel's Y to green,
+        // Cb to blue and to alpha (right for the signed reading too)
+        uint32_t v = load_le32(block);
+        bool gbgr = load == L::GBGR8ToRGBA8; // Cr_Y1_Cb_Y0: Y0, Cb, Y1, Cr from the low byte
+        uint8_t cr = uint8_t(gbgr ? v >> 24 : v >> 16), cb = uint8_t(gbgr ? v >> 8 : v);
+        uint8_t y[2] = {uint8_t(gbgr ? v : v >> 8), uint8_t(gbgr ? v >> 16 : v >> 24)};
+        for (uint32_t t = 0; t < 2; t++)
+            out[4 * t] = cr, out[4 * t + 1] = y[t], out[4 * t + 2] = cb, out[4 * t + 3] = cb;
+        break;
+    }
+    case L::Dxt3aToR8: dxt3a_to_r8(block, out); break;
+    case L::Dxt3aAs1111ToARGB4: {
+        // pixel_formats.xesli's XeDXT3AAs1111TwoBlocksRowToARGB4: a texel's
+        // 4 alpha bits are its red (bit 0), green, blue and alpha (bit 3), each
+        // widened to B4G4R4A4's 4 bits
+        uint32_t w[2] = {load_le32(block), load_le32(block + 4)};
+        for (uint32_t i = 0; i < 16; i++) {
+            uint32_t a = (w[i >> 3] >> (4 * (i & 7))) & 0xF;
+            uint32_t v = ((a & 1) << 4) | (((a >> 1) & 1) << 8) | (((a >> 2) & 1) << 12) | ((a >> 3) & 1);
+            v |= v << 1;
+            v |= v << 2;
+            out[2 * i] = uint8_t(v), out[2 * i + 1] = uint8_t(v >> 8);
+        }
+        break;
+    }
+    case L::Dxt3aAs1111ToRGBA8: {
+        // the same bits as RGBA8's components, each 0 or 255
+        uint32_t w[2] = {load_le32(block), load_le32(block + 4)};
+        for (uint32_t i = 0; i < 16; i++) {
+            uint32_t a = (w[i >> 3] >> (4 * (i & 7))) & 0xF;
+            for (uint32_t c = 0; c < 4; c++) out[4 * i + c] = (a >> c) & 1 ? 255 : 0;
+        }
+        break;
+    }
+    case L::Ctx1ToRg8: ctx1_to_rg8(block, out); break;
+    case L::Dxt1ToRGBA8: dxt_color(block, true, out); break;
+    case L::Dxt3ToRGBA8:
+        dxt_color(block + 8, false, out);
+        for (uint32_t i = 0; i < 16; i++) {
+            uint32_t a = (load_le32(block + 4 * (i >> 3)) >> (4 * (i & 7))) & 0xF;
+            out[4 * i + 3] = uint8_t(a | (a << 4));
+        }
+        break;
+    case L::Dxt5ToRGBA8: {
+        dxt_color(block + 8, false, out);
+        uint8_t a[16];
+        dxt5_alpha(block, a);
+        for (uint32_t i = 0; i < 16; i++) out[4 * i + 3] = a[i];
+        break;
+    }
+    case L::DxnToRG8: {
+        uint8_t r[16], g[16];
+        dxt5_alpha(block, r);
+        dxt5_alpha(block + 8, g);
+        for (uint32_t i = 0; i < 16; i++) out[2 * i] = r[i], out[2 * i + 1] = g[i];
+        break;
+    }
+    case L::Dxt5aToR8: dxt5_alpha(block, out); break;
+    default: break;
+    }
+}
 } // namespace
+
+const char *host_format_name(HostFormat f) {
+    static const char *names[] = {"Unsupported", "R8",      "RG8",     "RGBA8",   "R5G6B5", "A1R5G5B5", "B4G4R4A4",
+                                  "RGB10A2",     "R16",     "RG16",    "RGBA16",  "R16F",   "RG16F",    "RGBA16F",
+                                  "R32",         "RG32",    "RGBA32",  "R32F",    "RG32F",  "RGBA32F",  "BC1",
+                                  "BC2",         "BC3",     "BC4",     "BC5"};
+    static_assert(sizeof(names) / sizeof(names[0]) == HOST_FORMAT_COUNT);
+    return uint32_t(f) < HOST_FORMAT_COUNT ? names[uint32_t(f)] : "?";
+}
+
+bool decompresses(Load load) { return load >= L::GBGR8ToRGBA8; }
+
+bool Support::usable(HostFormat f) const {
+    // the 32-bit floats need no filtering: a sampler of them points where the host does not filter them
+    bool needs_linear = f != H::R32F && f != H::RG32F && f != H::RGBA32F;
+    return f != H::Unsupported && ((sampled >> uint32_t(f)) & 1) && (!needs_linear || ((linear >> uint32_t(f)) & 1));
+}
+
+uint32_t compose_swizzle(uint32_t guest, uint32_t host) {
+    uint32_t out = 0;
+    for (uint32_t c = 0; c < 4; c++) {
+        uint32_t g = (guest >> (3 * c)) & 7;
+        uint32_t v = g < 4 ? (host >> (3 * g)) & 7 : g == 5 ? 5 : 4;
+        out |= v << (3 * c);
+    }
+    return out;
+}
 
 uint32_t bytes_per_block(HostFormat format) {
     switch (format) {
     case H::R8: return 1;
-    case H::RG8: case H::B5G6R5: case H::A1R5G5B5: case H::A4R4G4B4: case H::R16: case H::R16F: return 2;
+    case H::RG8: case H::R5G6B5: case H::A1R5G5B5: case H::B4G4R4A4: case H::R16: case H::R16F: return 2;
     case H::RGBA8: case H::RGB10A2: case H::RG16: case H::RG16F: case H::R32: case H::R32F: return 4;
     case H::RGBA16: case H::RGBA16F: case H::RG32: case H::RG32F: case H::BC1: case H::BC4: return 8;
     case H::RGBA32: case H::RGBA32F: case H::BC2: case H::BC3: case H::BC5: return 16;
@@ -561,15 +854,35 @@ uint64_t SliceLoad::offset(uint32_t x, uint32_t y) const {
     return tiled_offset_2d(x, y, pitch_blocks, log2_bytes_per_block);
 }
 
-bool plan(const Info &info, Plan &out, std::string &unsupported) {
+bool plan(const Info &info, Plan &out, std::string &unsupported, const Support &support, bool signed_version) {
     out = Plan{};
     const FormatEntry &f = FORMATS[info.format & 63];
     if (f.host == H::Unsupported) {
         unsupported = std::string("format ") + xenos::format_name(info.format);
         return false;
     }
+    // the version the host holds, and the signed one
+    Version u = unsigned_version(f, support), s;
+    if (u.host == H::Unsupported) {
+        unsupported = std::string("format ") + xenos::format_name(info.format) + " (the host samples no " +
+                      host_format_name(f.host) + " nor its fallback)";
+        return false;
+    }
+    Signed signs = signed_of(f, support, u, s);
+    if (signed_version && signs != S::Separate) {
+        unsupported = "no separate signed version";
+        return false;
+    }
+    const Version &v = signed_version ? s : u;
+    // Xenia's BindingInfoFromFetchConstant: "1D texture has tiling enabled in
+    // the fetch constant, but this appears to be completely wrong - ignoring",
+    // and likewise packed mips
     if (info.dimension == 0 && info.tiled) {
         unsupported = "tiled 1D";
+        return false;
+    }
+    if (info.dimension == 0 && info.packed_mips) {
+        unsupported = "1D with packed mips";
         return false;
     }
     Levels lv = levels(info);
@@ -587,8 +900,13 @@ bool plan(const Info &info, Plan &out, std::string &unsupported) {
     }
     uint32_t bpb = uint32_t(f.bits) * f.block_width * f.block_height / 8;
 
-    out.format = f.host;
-    out.load = f.convert;
+    out.format = v.host;
+    out.load = v.load;
+    out.half = v.half;
+    out.host_swizzle = v.swizzle;
+    out.signed_read = signs;
+    out.snorm = signed_version && v.snorm;
+    out.approximate = v.approximate;
     out.width = width, out.height = height, out.depth = info.depth;
     out.bytes_per_block = bpb, out.block_width = f.block_width, out.block_height = f.block_height;
     out.endian = info.endian;
@@ -627,10 +945,62 @@ bool plan(const Info &info, Plan &out, std::string &unsupported) {
     return true;
 }
 
-bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string &unsupported) {
+bool filterable(const Info &info, const Support &support) {
+    const FormatEntry &f = FORMATS[info.format & 63];
+    Version u = unsigned_version(f, support), s;
+    if (u.host == H::Unsupported) return true; // not drawn with anyway
+    bool any_signed = false, any_unsigned = false;
+    for (uint32_t c = 0; c < 4; c++) (info.signs[c] == 1 ? any_signed : any_unsigned) = true;
+    if (any_unsigned && !support.filters(u.host)) return false;
+    if (any_signed && signed_of(f, support, u, s) != S::None && !support.filters(s.host)) return false;
+    return true;
+}
+
+uint64_t level_bytes(const Plan &plan, uint32_t level) {
+    uint64_t slices = 0;
+    for (const SliceLoad &s : plan.slices) slices += s.level == level;
+    uint64_t w = std::max(plan.width >> level, 1u), h = std::max(plan.height >> level, 1u);
+    uint64_t units = is_compressed(plan.format) ? ((w + 3) / 4) * ((h + 3) / 4) : w * h;
+    return units * bytes_per_block(plan.format) * slices;
+}
+
+void gpu_levels(const Plan &plan, std::vector<GpuLevel> &out, uint64_t &total_bytes) {
+    out.clear();
+    total_bytes = 0;
+    for (size_t i = 0; i < plan.slices.size();) {
+        size_t j = i;
+        while (j < plan.slices.size() && plan.slices[j].level == plan.slices[i].level) j++;
+        const SliceLoad &s = plan.slices[i];
+        uint64_t bytes = level_bytes(plan, s.level);
+        GpuLevel g{};
+        g.base = s.base;
+        g.slice_stride = j - i > 1 && !s.is_3d ? plan.slices[i + 1].base - s.base : 0;
+        g.slices = uint32_t(j - i);
+        g.layered = s.is_3d ? 0 : 1;
+        g.pitch_blocks = s.pitch_blocks, g.z_rows = s.z_rows;
+        g.ox = s.ox, g.oy = s.oy, g.oz = s.oz;
+        g.tiled = s.tiled, g.is_3d = s.is_3d;
+        g.log2_bytes = s.log2_bytes_per_block;
+        g.endian = plan.endian;
+        g.blocks_x = s.blocks_x, g.blocks_y = s.blocks_y;
+        g.out_word = uint32_t(total_bytes / 4);
+        g.words = uint32_t((bytes + 3) / 4);
+        g.load = uint32_t(plan.load);
+        g.half = uint32_t(plan.half);
+        uint32_t groups = (g.words + 63) / 64, across = std::max(std::min(groups, 32768u), 1u);
+        g.row_words = across * 64;
+        g.out_width = std::max(plan.width >> s.level, 1u), g.out_height = std::max(plan.height >> s.level, 1u);
+        out.push_back(g);
+        total_bytes += (bytes + 15) & ~uint64_t(15);
+        i = j;
+    }
+}
+
+bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string &unsupported,
+            const Support &support, bool signed_version) {
     out = Image{};
     Plan p;
-    if (!plan(info, p, unsupported)) return false;
+    if (!plan(info, p, unsupported, support, signed_version)) return false;
     uint32_t bpb = p.bytes_per_block;
     out.format = p.format;
     out.width = p.width, out.height = p.height, out.depth = p.depth;
@@ -649,39 +1019,60 @@ bool decode(const Info &info, const GuestMemory &memory, Image &out, std::string
         first = end;
 
         std::vector<uint8_t> &dst = out.levels[level];
-        if (p.load == Convert::Copy) {
-            dst = std::move(blocks);
-            blocks = {};
-            continue;
-        }
-        if (p.load == Convert::DepthUnormToFloat || p.load == Convert::DepthFloatToFloat) {
+        if (p.load == L::DepthUnormToFloat || p.load == L::DepthFloatToFloat) {
             // the depth in the high 24 bits, to a float: unorm24 as
             // XeUNorm24To32 (exact), float24 as XeFloat20e4To32
             for (size_t i = 0; i + 4 <= blocks.size(); i += 4) {
                 uint32_t d24 = load_le32(blocks.data() + i) >> 8;
-                float value = p.load == Convert::DepthUnormToFloat ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f)
-                                                                   : float20e4_to_float(d24);
+                float value = p.load == L::DepthUnormToFloat ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f)
+                                                             : float20e4_to_float(d24);
                 store_le32(blocks.data() + i, std::bit_cast<uint32_t>(value));
             }
+        } else if (is_transform16(p.load)) {
+            for (size_t i = 0; i + 2 <= blocks.size(); i += 2) {
+                uint16_t v = transform16(p.load, load_le16(blocks.data() + i));
+                std::memcpy(blocks.data() + i, &v, 2);
+            }
+        } else if (is_widening(p.load)) {
+            std::vector<uint8_t> wide(blocks.size() * 2);
+            for (size_t i = 0; i + 4 <= blocks.size(); i += 4) {
+                uint16_t rgba[4];
+                widen(p.load, load_le32(blocks.data() + i), rgba);
+                std::memcpy(wide.data() + 2 * i, rgba, 8);
+            }
+            blocks = std::move(wide);
+        } else if (is_unpack16(p.load)) {
+            std::vector<uint8_t> wide(blocks.size() * 2);
+            for (size_t i = 0; i + 2 <= blocks.size(); i += 2)
+                store_le32(wide.data() + 2 * i, unpack16(p.load, load_le16(blocks.data() + i)));
+            blocks = std::move(wide);
+        }
+        if (!decompresses(p.load)) {
+            // 16-bit fixed point as halves where the host has no format for it
+            if (p.half != Half::None)
+                for (size_t i = 0; i + 2 <= blocks.size(); i += 2) {
+                    uint16_t h = norm16_to_half(load_le16(blocks.data() + i), p.half);
+                    std::memcpy(blocks.data() + i, &h, 2);
+                }
             dst = std::move(blocks);
             blocks = {};
             continue;
         }
-        // decompressed to texels, as Xenia's load shaders for these do
+        // decompressed to texels, as Xenia's load shaders for these do: a
+        // block's that lie in the level
         uint32_t lw = std::max(p.width >> level, 1u), lh = std::max(p.height >> level, 1u);
-        uint32_t texel_bytes = p.load == Convert::Ctx1ToRg8 ? 2 : 1;
-        dst.assign(size_t(lw) * lh * slices * texel_bytes, 0);
+        uint32_t tb = texel_bytes(p.load), bw = p.block_width, bh = p.block_height;
+        dst.assign(size_t(lw) * lh * slices * tb, 0);
         for (uint32_t s = 0; s < slices; s++)
             for (uint32_t by = 0; by < blocks_y; by++)
                 for (uint32_t bx = 0; bx < blocks_x; bx++) {
                     const uint8_t *block = blocks.data() + ((size_t(s) * blocks_y + by) * blocks_x + bx) * bpb;
-                    uint8_t texels[32];
-                    if (p.load == Convert::Dxt3aToR8) dxt3a_to_r8(block, texels);
-                    else ctx1_to_rg8(block, texels);
-                    for (uint32_t ty = 0; ty < 4 && by * 4 + ty < lh; ty++)
-                        for (uint32_t tx = 0; tx < 4 && bx * 4 + tx < lw; tx++)
-                            std::memcpy(dst.data() + ((size_t(s) * lh + by * 4 + ty) * lw + bx * 4 + tx) * texel_bytes,
-                                        texels + (ty * 4 + tx) * texel_bytes, texel_bytes);
+                    uint8_t texels[64];
+                    decompress(p.load, block, texels);
+                    for (uint32_t ty = 0; ty < bh && by * bh + ty < lh; ty++)
+                        for (uint32_t tx = 0; tx < bw && bx * bw + tx < lw; tx++)
+                            std::memcpy(dst.data() + ((size_t(s) * lh + by * bh + ty) * lw + bx * bw + tx) * tb,
+                                        texels + (ty * bw + tx) * tb, tb);
                 }
     }
     return true;
@@ -744,21 +1135,21 @@ std::vector<uint8_t> to_rgba8(const Image &image, uint32_t level) {
         case H::R8: r = p[0]; break;
         case H::RG8: r = p[0], g = p[1]; break;
         case H::RGBA8: r = p[0], g = p[1], b = p[2], a = p[3]; break;
-        case H::B5G6R5: {
+        case H::R5G6B5: {
             uint32_t v = load_le16(p);
-            r = expand(v & 31, 5), g = expand((v >> 5) & 63, 6), b = expand(v >> 11, 5);
+            r = expand(v >> 11, 5), g = expand((v >> 5) & 63, 6), b = expand(v & 31, 5);
             break;
         }
         case H::A1R5G5B5: {
             uint32_t v = load_le16(p);
-            r = expand(v & 31, 5), g = expand((v >> 5) & 31, 5), b = expand((v >> 10) & 31, 5);
+            r = expand((v >> 10) & 31, 5), g = expand((v >> 5) & 31, 5), b = expand(v & 31, 5);
             a = (v >> 15) ? 255 : 0;
             break;
         }
-        case H::A4R4G4B4: {
+        case H::B4G4R4A4: {
             uint32_t v = load_le16(p);
-            r = expand(v & 15, 4), g = expand((v >> 4) & 15, 4), b = expand((v >> 8) & 15, 4);
-            a = expand(v >> 12, 4);
+            r = expand((v >> 4) & 15, 4), g = expand((v >> 8) & 15, 4), b = expand(v >> 12, 4);
+            a = expand(v & 15, 4);
             break;
         }
         case H::RGB10A2: {

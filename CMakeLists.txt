@@ -128,6 +128,7 @@ xf_shader(edram_load_depth.frag edram_load.frag -DDEPTH)
 xf_shader(edram_load_stencil.frag edram_load.frag -DDEPTH -DSTENCIL)
 xf_shader(resolve.comp resolve.comp)
 xf_shader(texture_load.comp texture_load.comp)
+xf_shader(texture_load_test.comp texture_load.comp -DPARAMS_BUFFER) # texture_gpu_test's
 add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/replay.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SHADER_OUT})
 target_link_libraries(xenoforge_vk PUBLIC xenoforge Vulkan::Vulkan)
@@ -467,6 +468,12 @@ set_tests_properties(xma_replay PROPERTIES TIMEOUT 300)
 add_executable(vk_compute_test tests/vk_compute_test.cpp)
 target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)
+# texture_load.comp against the CPU's decode, every format and fallback
+add_executable(texture_gpu_test tests/texture_gpu_test.cpp)
+target_include_directories(texture_gpu_test PRIVATE ${XF_SHADER_OUT})
+target_link_libraries(texture_gpu_test PRIVATE xenoforge_vk)
+add_test(NAME texture_gpu COMMAND texture_gpu_test)
+set_tests_properties(texture_gpu PROPERTIES TIMEOUT 300)
 # Xenia's PPC instruction tests recompiled by xfrecomp (when XF_PPC_TESTS_DIR
 # names them, assembled by tools/assemble_ppc_tests.sh) and run as ppc_test
 # runs them through the interpreter

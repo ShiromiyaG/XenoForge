@@ -31,12 +31,7 @@ using namespace xf::xenos;
 
 namespace {
 
-const char *host_name(texture::HostFormat f) {
-    static const char *names[] = {"Unsupported", "R8", "RG8", "RGBA8", "B5G6R5", "A1R5G5B5", "A4R4G4B4", "RGB10A2",
-                                  "R16", "RG16", "RGBA16", "R16F", "RG16F", "RGBA16F", "R32", "RG32", "RGBA32",
-                                  "R32F", "RG32F", "RGBA32F", "BC1", "BC2", "BC3", "BC4", "BC5"};
-    return names[size_t(f)];
-}
+const char *host_name(texture::HostFormat f) { return texture::host_format_name(f); }
 
 // The registers and memory a trace's packets set, Xenia's PM4 front end as
 // far as textures and resolves need it (trace_stats.cpp counts the same way).

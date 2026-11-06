@@ -59,6 +59,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -246,8 +247,12 @@ VkFormat vk_format_of(texture::HostFormat f) {
     case H::R8: return VK_FORMAT_R8_UNORM;
     case H::RG8: return VK_FORMAT_R8G8_UNORM;
     case H::RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
-    case H::B5G6R5: return VK_FORMAT_B5G6R5_UNORM_PACK16;     // R in the low bits, as texture.h keeps it
-    case H::A4R4G4B4: return VK_FORMAT_A4B4G4R4_UNORM_PACK16; // likewise; 1_5_5_5 goes through to_rgba8
+    // the packed formats Vulkan requires every device to sample, as Xenia's
+    // Vulkan texture cache takes them (texture.h: the loads rearrange the
+    // guest's bits for them)
+    case H::R5G6B5: return VK_FORMAT_R5G6B5_UNORM_PACK16;
+    case H::A1R5G5B5: return VK_FORMAT_A1R5G5B5_UNORM_PACK16;
+    case H::B4G4R4A4: return VK_FORMAT_B4G4R4A4_UNORM_PACK16;
     case H::RGB10A2: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case H::R16: return VK_FORMAT_R16_UNORM;
     case H::RG16: return VK_FORMAT_R16G16_UNORM;
@@ -270,24 +275,50 @@ VkFormat vk_format_of(texture::HostFormat f) {
     }
 }
 
-// Xenia's host swizzles: one-component formats read as RRRR, two as RGGG
-uint32_t host_components(texture::HostFormat f) {
-    using H = texture::HostFormat;
-    switch (f) {
-    case H::R8: case H::R16: case H::R16F: case H::R32: case H::R32F: case H::BC4: return 1;
-    case H::RG8: case H::RG16: case H::RG16F: case H::RG32: case H::RG32F: case H::BC5: return 2;
-    default: return 4;
-    }
+// A component of a swizzle composed with the host format's
+// (texture::compose_swizzle): 0-3 a host component, 5 one, the rest zero.
+VkComponentSwizzle swizzle_of(uint32_t composed) {
+    if (composed < 4) return VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + composed);
+    return composed == 5 ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_ZERO;
 }
 
-VkComponentSwizzle swizzle_of(uint32_t guest, uint32_t components) {
-    switch (guest) {
-    case 4: return VK_COMPONENT_SWIZZLE_ZERO;
-    case 5: return VK_COMPONENT_SWIZZLE_ONE;
-    case 6: case 7: return VK_COMPONENT_SWIZZLE_ZERO;
+// What the device samples, filters and has the snorm of, per host format
+// (texture::Support), from its format properties. XF_TEXTURE_FALLBACKS takes
+// away what a device may lack, so the fallbacks run on a device that has it
+// all: 1 (or "all") everything below, or a list of bc (the BC formats),
+// norm16 (16-bit unorm), packed (the packed 16-bit formats), snorm (the
+// snorm views Vulkan does not require: 16-bit, 2_10_10_10, BC4 and BC5) and
+// linear32 (linear filtering of 32-bit floats).
+VkFormat snorm_of(VkFormat f);
+texture::Support texture_support(const vk::Device &d) {
+    using H = texture::HostFormat;
+    std::string force = std::getenv("XF_TEXTURE_FALLBACKS") ? std::getenv("XF_TEXTURE_FALLBACKS") : "";
+    bool all = force == "1" || force == "all";
+    auto forced = [&](const char *name) {
+        return all || ("," + force + ",").find(std::string(",") + name + ",") != std::string::npos;
+    };
+    bool bc = forced("bc"), norm16 = forced("norm16"), packed = forced("packed"), snorms = forced("snorm");
+    bool linear32 = forced("linear32");
+    texture::Support s{0, 0, 0};
+    for (uint32_t i = 1; i < texture::HOST_FORMAT_COUNT; i++) {
+        H h = H(i);
+        VkFormat f = vk_format_of(h), snorm = snorm_of(f);
+        bool is_bc = h == H::BC1 || h == H::BC2 || h == H::BC3 || h == H::BC4 || h == H::BC5;
+        bool is_norm16 = h == H::R16 || h == H::RG16 || h == H::RGBA16;
+        if (f == VK_FORMAT_UNDEFINED || (bc && is_bc) || (norm16 && is_norm16) ||
+            (packed && (h == H::R5G6B5 || h == H::A1R5G5B5 || h == H::B4G4R4A4)))
+            continue;
+        if (d.format_supported(f, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) s.sampled |= uint64_t(1) << i;
+        bool float32 = h == H::R32F || h == H::RG32F || h == H::RGBA32F;
+        if (d.format_supported(f, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) && !(linear32 && float32))
+            s.linear |= uint64_t(1) << i;
+        bool required = h == H::R8 || h == H::RG8 || h == H::RGBA8; // their snorm Vulkan requires
+        if (snorm != VK_FORMAT_UNDEFINED && (required || !snorms) &&
+            d.format_supported(snorm,
+                               VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
+            s.snorm |= uint64_t(1) << i;
     }
-    uint32_t c = std::min(guest, components - 1);
-    return VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R + c);
+    return s;
 }
 
 VkCompareOp compare_op(uint32_t f) {
@@ -378,19 +409,19 @@ struct ResolveConstants {
 };
 
 // texture_load.comp's push constants
-struct LoadConstants {
-    uint32_t base, slice_stride, slices, layered, pitch_blocks, z_rows, ox, oy, oz, tiled, is_3d, log2_bytes, endian;
-    uint32_t blocks_x, blocks_y, out_word, words, load, row_words;
-};
+using LoadConstants = texture::GpuLevel;
 
 struct Texture {
     vk::Image image;
     VkImageView view = VK_NULL_HANDLE; // its own: made and destroyed with it
     uint32_t dimension = 1;
-    texture::HostFormat host = texture::HostFormat::Unsupported; // what its image holds (RGBA8 when converted)
+    texture::HostFormat host = texture::HostFormat::Unsupported; // what its image holds
+    uint32_t host_swizzle = texture::SWIZZLE_RGBA;               // what each guest component reads of it
     uint32_t kind = 0, index = 0;      // its bindless table (2D arrays, 3D, cube) and place in it
     // for a constant with signed components: a view of the image as snorm,
+    // or of an image of its own where the signed bits differ (signed_image),
     // at its own place in the same table (0: none)
+    vk::Image signed_image;
     VkImageView signed_view = VK_NULL_HANDLE;
     uint32_t signed_index = 0;
     std::vector<Range> ranges;         // the guest memory it was loaded from
@@ -897,9 +928,9 @@ private:
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
     VkFormat depth_vk_format(uint32_t format) const;
     Texture *texture(const uint32_t fetch[6], std::string &why);
-    bool gpu_load(Texture &t, const texture::Plan &plan, bool fresh);
-    bool cpu_upload(Texture &t, const texture::Image &image, const std::vector<std::vector<uint8_t>> &levels,
-                    VkFormat format, bool fresh);
+    bool gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload);
+    bool cpu_upload(const vk::Image &target, const texture::Image &image, bool fresh);
+    texture::Support support_; // what the device samples (texture_support)
     uint32_t sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides);
     // the pipeline of a key, made now or found made; null when the driver
     // failed, or (pending) when worker threads are making it and the draw may
@@ -1220,6 +1251,7 @@ Impl::~Impl() {
         if (t->view) vkDestroyImageView(dev_, t->view, nullptr);
         if (t->signed_view) vkDestroyImageView(dev_, t->signed_view, nullptr);
         d_.destroy(t->image);
+        if (t->signed_image.image) d_.destroy(t->signed_image);
     }
     for (auto &[k, im] : msaa_temps_) d_.destroy(im);
     for (auto &im : dummy_) d_.destroy(im);
@@ -1322,6 +1354,7 @@ void Impl::save_pipeline_cache() {
 
 bool Impl::init(std::string &error) {
     open_pipeline_cache();
+    support_ = texture_support(d_);
     if (options_.async_pipelines) {
         // Xenia's d3d12_pipeline_creation_threads: -1 three quarters of the
         // logical cores, else as many as asked up to their number
@@ -2649,6 +2682,10 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     if (overrides[2] != 3) mip = overrides[2];
     if (overrides[3] != 7) aniso = overrides[3];
     texture::Info parsed = texture::parse_fetch_constant(fetch);
+    // points where the host does not filter the formats it reads (Xenia's
+    // GetSamplerParameters; anisotropy filters linearly too)
+    if ((mag == 1 || min == 1 || mip == 1 || (aniso && aniso < 6)) && !texture::filterable(parsed, support_))
+        mag = min = 0, mip = mip == 2 ? 2 : 0, aniso = 0;
     texture::Levels levels = texture::levels(parsed);
     uint32_t mip_min = mip == 2 && levels.base ? 0 : levels.mip_min;
     uint32_t clamp[3];
@@ -2737,55 +2774,49 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     if (t) t->stale = true; // until it is loaded again
 
     texture::Info info = texture::parse_fetch_constant(fetch);
-    texture::Plan plan;
-    if (!texture::plan(info, plan, why)) return nullptr;
+    texture::Plan plan, signed_plan;
+    if (!texture::plan(info, plan, why, support_)) return nullptr;
+    // signed components: read through a snorm view of the same bits (Xenia's
+    // signed host format; float formats are signed either way), or an image
+    // of their own where the signed bits differ (10_11_11 and 11_11_10, 16-bit
+    // snorm as floats); biased and gamma components, and the exponent adjust,
+    // are the shader's (texture_signs)
+    bool any_signed = info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1;
+    bool separate = any_signed && plan.signed_read == texture::Signed::Separate;
+    if (separate && !texture::plan(info, signed_plan, why, support_, true)) return nullptr;
+    if (!plan.approximate.empty()) approximate("a texture format held with fewer bits: " + plan.approximate);
+    if (separate && !signed_plan.approximate.empty())
+        approximate("a texture format held with fewer bits: " + signed_plan.approximate);
     std::vector<Range> ranges = ranges_of(plan.footprint);
-    VkFormat format = vk_format_of(plan.format);
-    bool direct = format != VK_FORMAT_UNDEFINED && d_.format_supported(format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+    VkFormat format = vk_format_of(plan.format); // support_ has it sampled
+    auto is_float = [](VkFormat f) {
+        return f == VK_FORMAT_R16_SFLOAT || f == VK_FORMAT_R16G16_SFLOAT || f == VK_FORMAT_R16G16B16A16_SFLOAT ||
+               f == VK_FORMAT_R32_SFLOAT || f == VK_FORMAT_R32G32_SFLOAT || f == VK_FORMAT_R32G32B32A32_SFLOAT;
+    };
+    VkFormat signed_format = VK_FORMAT_UNDEFINED;
+    if (any_signed && plan.signed_read == texture::Signed::None)
+        approximate("signed texture components read as unsigned (no signed version of the format)");
+    else if (any_signed && plan.signed_read == texture::Signed::View && !is_float(format))
+        signed_format = snorm_of(format);
+    else if (separate)
+        signed_format =
+            signed_plan.snorm ? snorm_of(vk_format_of(signed_plan.format)) : vk_format_of(signed_plan.format);
     check_exported(ranges);
-    bool gpu = pending(ranges);
-    if (gpu && (!direct || plan.load == texture::Load::Dxt3aToR8 || plan.load == texture::Load::Ctx1ToRg8)) {
-        // a format the GPU's loads do not make: decoded from guest memory
-        // once the resolve's bytes are there (a memory export's never are)
-        wait_for(ranges);
-        for (const Range &r : ranges)
-            if (exported(r)) {
-                approximate("a texture over memory export pages decoded from guest memory");
-                break;
-            }
-        gpu = false;
-    }
+    // over memory a resolve wrote (or a memory export): loaded on the GPU from
+    // the mirror; the DXT formats a host without BC holds decompressed are
+    // decompressed on the GPU too, from guest memory put into the mirror
+    bool mirror = pending(ranges);
+    bool gpu = mirror || (texture::is_compressed(info.host) && !texture::is_compressed(plan.format));
 
-    texture::Image image;
-    std::vector<std::vector<uint8_t>> levels;
+    texture::Image image, signed_image;
     if (!gpu) {
         Timer decoding(report_.decode_seconds);
         traced(ranges);
-        if (!texture::decode(info, memory_, image, why)) return nullptr;
-        if (direct) {
-            levels = std::move(image.levels);
-        } else {
-            // through 8 bits per component
-            format = VK_FORMAT_R8G8B8A8_UNORM;
-            levels.resize(image.levels.size());
-            for (uint32_t l = 0; l < levels.size(); l++) levels[l] = texture::to_rgba8(image, l);
-            approximate("a texture format sampled as 8 bits per component");
-        }
+        if (!texture::decode(info, memory_, image, why, support_)) return nullptr;
+        if (separate && !texture::decode(info, memory_, signed_image, why, support_, true)) return nullptr;
+    } else if (!mirror) {
+        traced(ranges);
     }
-    // signed components: float formats are signed either way (Xenia's signed
-    // and unsigned views of them are the same format)
-    bool float_format = format == VK_FORMAT_R16_SFLOAT || format == VK_FORMAT_R16G16_SFLOAT ||
-                        format == VK_FORMAT_R16G16B16A16_SFLOAT || format == VK_FORMAT_R32_SFLOAT ||
-                        format == VK_FORMAT_R32G32_SFLOAT || format == VK_FORMAT_R32G32B32A32_SFLOAT;
-    // otherwise read through a snorm view of the same bits (Xenia's signed
-    // host format), where the host has one; biased and gamma components,
-    // and the exponent adjust, are the shader's (texture_signs)
-    bool any_signed = info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1;
-    VkFormat signed_format = any_signed && !float_format && direct ? snorm_of(format) : VK_FORMAT_UNDEFINED;
-    if (signed_format != VK_FORMAT_UNDEFINED && !d_.format_supported(signed_format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
-        signed_format = VK_FORMAT_UNDEFINED;
-    if (any_signed && !float_format && signed_format == VK_FORMAT_UNDEFINED)
-        approximate("signed texture components read as unsigned (no signed view of the format)");
 
     // 1D, 2D and stacked as 2D arrays (stacked: a layer a slice), as Xenia
     // binds them
@@ -2795,7 +2826,9 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     uint32_t level_count = plan.level_count;
     bool fresh = !t || t->image.format != format || t->image.extent.width != extent.width ||
                  t->image.extent.height != extent.height || t->image.extent.depth != extent.depth ||
-                 t->image.levels != level_count || t->image.layers != layers;
+                 t->image.levels != level_count || t->image.layers != layers ||
+                 separate != (t->signed_image.image != VK_NULL_HANDLE) ||
+                 (signed_format != VK_FORMAT_UNDEFINED) != (t->signed_index != 0);
     if (fresh) {
         uint32_t kind = three ? 1 : cube ? 2 : 0;
         uint32_t needed = signed_format != VK_FORMAT_UNDEFINED ? 2 : 1;
@@ -2809,15 +2842,17 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             // the same constant made another image (not with the same format
             // decisions; kept safe): the old one goes once unused, its place
             // in the table with it (work under way may still read it there)
-            vk::Image old = t->image;
+            vk::Image old = t->image, old_signed_image = t->signed_image;
             VkImageView old_view = t->view, old_signed = t->signed_view;
             cmd();
-            slots_[current_].after.push_back([this, old, old_view, old_signed]() mutable {
+            slots_[current_].after.push_back([this, old, old_signed_image, old_view, old_signed]() mutable {
                 vkDestroyImageView(dev_, old_view, nullptr);
                 if (old_signed) vkDestroyImageView(dev_, old_signed, nullptr);
                 d_.destroy(old);
+                if (old_signed_image.image) d_.destroy(old_signed_image);
             });
-            t->image = {}, t->view = VK_NULL_HANDLE, t->signed_view = VK_NULL_HANDLE, t->signed_index = 0;
+            t->image = {}, t->signed_image = {}, t->view = VK_NULL_HANDLE, t->signed_view = VK_NULL_HANDLE;
+            t->signed_index = 0;
         } else {
             auto owned = std::make_unique<Texture>();
             t = owned.get();
@@ -2825,25 +2860,25 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             textures_[key] = std::move(owned);
         }
         t->dimension = info.dimension, t->kind = kind, t->index = index;
-        t->host = format == VK_FORMAT_R8G8B8A8_UNORM && !direct ? texture::HostFormat::RGBA8 : plan.format;
+        t->host = plan.format, t->host_swizzle = plan.host_swizzle;
         // a source of copies too: a front buffer read back, or copied by a presenter
+        const VkImageUsageFlags usage =
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        const VkImageCreateFlags flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
         t->image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, format, extent, level_count, layers,
-                                   VK_SAMPLE_COUNT_1_BIT,
-                                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                   (cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
-                                       (signed_index ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0));
-        if (!t->image.image) {
+                                   VK_SAMPLE_COUNT_1_BIT, usage,
+                                   flags | (signed_index && !separate ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0));
+        if (separate)
+            t->signed_image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, signed_format, extent,
+                                              level_count, layers, VK_SAMPLE_COUNT_1_BIT, usage, flags);
+        if (!t->image.image || (separate && !t->signed_image.image)) {
             why = "could not make the image";
             return nullptr;
         }
         // the guest's swizzle over the host format's
-        uint32_t components = format == VK_FORMAT_R8G8B8A8_UNORM && plan.format != texture::HostFormat::RGBA8
-                                  ? 4
-                                  : host_components(plan.format);
-        VkComponentMapping mapping{swizzle_of(info.swizzle & 7, components), swizzle_of((info.swizzle >> 3) & 7, components),
-                                   swizzle_of((info.swizzle >> 6) & 7, components),
-                                   swizzle_of((info.swizzle >> 9) & 7, components)};
+        uint32_t swizzle = texture::compose_swizzle(info.swizzle, plan.host_swizzle);
+        VkComponentMapping mapping{swizzle_of(swizzle & 7), swizzle_of((swizzle >> 3) & 7),
+                                   swizzle_of((swizzle >> 6) & 7), swizzle_of((swizzle >> 9) & 7)};
         VkImageViewType view_type = cube    ? VK_IMAGE_VIEW_TYPE_CUBE
                                     : three ? VK_IMAGE_VIEW_TYPE_3D
                                             : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
@@ -2854,8 +2889,8 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             return nullptr;
         }
         if (signed_index) {
-            t->signed_view = make_view(t->image.image, view_type, signed_format, VK_IMAGE_ASPECT_COLOR_BIT, mapping,
-                                       level_count, layers, false);
+            t->signed_view = make_view(separate ? t->signed_image.image : t->image.image, view_type, signed_format,
+                                       VK_IMAGE_ASPECT_COLOR_BIT, mapping, level_count, layers, false);
             if (!t->signed_view) {
                 why = "could not make the image's signed view";
                 return nullptr;
@@ -2883,13 +2918,18 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     for (auto [start, end] : t->ranges) t->low = std::min(t->low, start), t->high = std::max(t->high, end);
     t->rehash = false;
     if (gpu) {
-        if (!gpu_load(*t, plan, fresh)) return nullptr;
+        if (!gpu_load(*t, t->image, plan, fresh, true)) return nullptr;
+        if (separate && !gpu_load(*t, t->signed_image, signed_plan, fresh, false)) return nullptr;
+    } else {
+        if (!cpu_upload(t->image, image, fresh)) return nullptr;
+        if (separate && !cpu_upload(t->signed_image, signed_image, fresh)) return nullptr;
+    }
+    if (mirror) {
         // the hash of what guest memory gave it (the parts the mirror holds
         // nothing newer of)
         t->pending = true, t->hash = hash_ranges(not_pending(t->ranges));
         pending_textures_.insert(t);
     } else {
-        if (!cpu_upload(*t, image, levels, format, fresh)) return nullptr;
         if (t->pending) pending_textures_.erase(t);
         t->pending = false;
         t->hash = hash_ranges(t->ranges);
@@ -2897,21 +2937,23 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     t->stale = false;
     report_.textures++;
     if (options_.verbose)
-        std::fprintf(stderr, "  texture %08X: format %s %ux%u, signs %u%u%u%u, exponent %d, from %s\n", info.base_address,
-                     format_name(info.format), plan.width, plan.height, info.signs[0], info.signs[1], info.signs[2],
-                     info.signs[3], info.exp_adjust, gpu ? "the mirror" : "guest memory");
+        std::fprintf(stderr, "  texture %08X: format %s %ux%u, signs %u%u%u%u, exponent %d, from %s as %s%s\n",
+                     info.base_address, format_name(info.format), plan.width, plan.height, info.signs[0],
+                     info.signs[1], info.signs[2], info.signs[3], info.exp_adjust,
+                     mirror ? "the mirror" : gpu ? "guest memory on the GPU" : "guest memory",
+                     texture::host_format_name(plan.format), separate ? " and a signed image" : "");
     return t;
 }
 
-// The decoded levels into the image, through the arena, as Xenia uploads
+// The decoded levels into an image, through the arena, as Xenia uploads
 // them: each level's slices tightly packed, at 16-byte aligned offsets.
-bool Impl::cpu_upload(Texture &t, const texture::Image &image, const std::vector<std::vector<uint8_t>> &levels,
-                      VkFormat format, bool fresh) {
+bool Impl::cpu_upload(const vk::Image &target, const texture::Image &image, bool fresh) {
     Timer decoding(report_.decode_seconds);
-    VkExtent3D extent = t.image.extent;
-    uint32_t layers = t.image.layers, level_count = t.image.levels;
-    bool compressed = format != VK_FORMAT_R8G8B8A8_UNORM && texture::is_compressed(image.format);
-    uint32_t block_size = format == VK_FORMAT_R8G8B8A8_UNORM ? 4 : texture::bytes_per_block(image.format);
+    VkExtent3D extent = target.extent;
+    uint32_t layers = target.layers, level_count = target.levels;
+    bool compressed = texture::is_compressed(image.format);
+    uint32_t block_size = texture::bytes_per_block(image.format);
+    const std::vector<std::vector<uint8_t>> &levels = image.levels;
     std::vector<VkBufferImageCopy> copies;
     std::vector<std::pair<uint32_t, VkDeviceSize>> sources; // level, bytes
     VkDeviceSize total = 0;
@@ -2942,75 +2984,54 @@ bool Impl::cpu_upload(Texture &t, const texture::Image &image, const std::vector
     }
     VkCommandBuffer c = outside();
     gpu_mark("textures: uploads of CPU decodes");
-    if (fresh) begin_image(c, t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, level_count, layers);
+    if (fresh) begin_image(c, target.image, VK_IMAGE_ASPECT_COLOR_BIT, level_count, layers);
     if (!copies.empty())
-        vkCmdCopyBufferToImage(c, from, t.image.image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(copies.size()), copies.data());
+        vkCmdCopyBufferToImage(c, from, target.image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(copies.size()), copies.data());
     return true;
 }
 
-// The texture loaded from the mirror on the GPU (texture_load.comp), level by
-// level as the plan lays it out, then copied into the image as cpu_upload
-// copies: what of its memory guest memory holds the newest of goes into the
-// mirror first.
-bool Impl::gpu_load(Texture &t, const texture::Plan &plan, bool fresh) {
-    struct Run {
-        size_t first, count;
-        VkDeviceSize offset, bytes;
-    };
-    std::vector<Run> runs;
-    VkDeviceSize total = 0;
-    for (size_t i = 0; i < plan.slices.size();) {
-        size_t j = i;
-        while (j < plan.slices.size() && plan.slices[j].level == plan.slices[i].level) j++;
-        const texture::SliceLoad &s = plan.slices[i];
-        VkDeviceSize bytes = VkDeviceSize(s.blocks_x) * s.blocks_y * plan.bytes_per_block * (j - i);
-        runs.push_back({i, j - i, total, bytes});
-        total += (bytes + 15) & ~VkDeviceSize(15);
-        i = j;
-    }
+// A texture's version loaded on the GPU (texture_load.comp) from the mirror,
+// level by level as the plan lays it out, then copied into the image as
+// cpu_upload copies: what of its memory guest memory holds the newest of goes
+// into the mirror first (upload: once for its versions).
+bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload) {
+    std::vector<texture::GpuLevel> loads;
+    uint64_t total = 0;
+    texture::gpu_levels(plan, loads, total);
+    std::vector<uint32_t> level_of; // each load's level
+    for (size_t i = 0; i < plan.slices.size(); i++)
+        if (!i || plan.slices[i].level != plan.slices[i - 1].level) level_of.push_back(plan.slices[i].level);
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!grow(load_scratch_, std::max<VkDeviceSize>(total, 16), usage, load_set_, 1)) return false;
-    upload_to_mirror(not_pending(t.ranges));
+    if (upload) upload_to_mirror(not_pending(t.ranges));
     VkCommandBuffer c = outside();
     gpu_mark("textures: loads on the GPU (texture_load)");
-    if (fresh) begin_image(c, t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, t.image.levels, t.image.layers);
+    if (fresh) begin_image(c, image.image, VK_IMAGE_ASPECT_COLOR_BIT, image.levels, image.layers);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1, &load_set_, 0, nullptr);
     std::vector<VkBufferImageCopy> copies;
-    for (const Run &run : runs) {
-        const texture::SliceLoad &s = plan.slices[run.first];
-        LoadConstants p{};
-        p.base = s.base;
-        p.slice_stride = run.count > 1 && !s.is_3d ? plan.slices[run.first + 1].base - s.base : 0;
-        p.slices = uint32_t(run.count);
-        p.layered = s.is_3d ? 0 : 1;
-        p.pitch_blocks = s.pitch_blocks, p.z_rows = s.z_rows;
-        p.ox = s.ox, p.oy = s.oy, p.oz = s.oz;
-        p.tiled = s.tiled, p.is_3d = s.is_3d;
-        p.log2_bytes = s.log2_bytes_per_block;
-        p.endian = plan.endian;
-        p.blocks_x = s.blocks_x, p.blocks_y = s.blocks_y;
-        p.out_word = uint32_t(run.offset / 4);
-        p.words = uint32_t((run.bytes + 3) / 4);
-        p.load = plan.load == texture::Load::DepthUnormToFloat ? 1 : plan.load == texture::Load::DepthFloatToFloat ? 2 : 0;
-        uint32_t groups = (p.words + 63) / 64, across = std::min(groups, 32768u);
-        p.row_words = across * 64;
+    for (size_t i = 0; i < loads.size(); i++) {
+        const LoadConstants &p = loads[i];
+        if (!p.words) continue;
+        uint32_t groups = (p.words + 63) / 64, across = p.row_words / 64;
         vkCmdPushConstants(c, load_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
         vkCmdDispatch(c, across, (groups + across - 1) / across, 1);
         VkBufferImageCopy copy{};
-        copy.bufferOffset = run.offset;
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, s.level, 0, t.image.layers};
-        copy.imageExtent = {std::max(1u, t.image.extent.width >> s.level), std::max(1u, t.image.extent.height >> s.level),
-                            std::max(1u, t.image.extent.depth >> s.level)};
+        copy.bufferOffset = VkDeviceSize(p.out_word) * 4;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level_of[i], 0, image.layers};
+        copy.imageExtent = {std::max(1u, image.extent.width >> level_of[i]),
+                            std::max(1u, image.extent.height >> level_of[i]),
+                            std::max(1u, image.extent.depth >> level_of[i])};
         copies.push_back(copy);
     }
     full_barrier(c);
-    vkCmdCopyBufferToImage(c, load_scratch_.buffer, t.image.image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(copies.size()),
-                           copies.data());
+    if (!copies.empty())
+        vkCmdCopyBufferToImage(c, load_scratch_.buffer, image.image, VK_IMAGE_LAYOUT_GENERAL, uint32_t(copies.size()),
+                               copies.data());
     if (options_.verbose)
-        std::fprintf(stderr, "  texture at %08X loaded from the mirror (%u levels)\n", plan.slices.empty() ? 0 : plan.slices[0].base,
-                     uint32_t(runs.size()));
+        std::fprintf(stderr, "  texture at %08X loaded on the GPU (%u levels)\n",
+                     plan.slices.empty() ? 0 : plan.slices[0].base, uint32_t(loads.size()));
     return true;
 }
 
@@ -4194,9 +4215,10 @@ void Impl::swap() {
         front.swap = number;
         front.image = t->image.image, front.format = t->image.format;
         front.width = t->image.extent.width, front.height = t->image.extent.height;
-        front.swizzle = info.swizzle;
-        // (an image converted to RGBA8 holds four)
-        front.components = t->host == texture::HostFormat::RGBA8 ? 4 : host_components(t->host);
+        // the fetch constant's swizzle through the host format's, over the
+        // image's four components
+        front.swizzle = texture::compose_swizzle(info.swizzle, t->host_swizzle);
+        front.components = 4;
         front.gamma_table = info.format != 7 && info.format != 54; // as deliver
         front.gamma = processor_.gamma_ramp_table();
     }
@@ -4218,7 +4240,7 @@ Texture *Impl::front_texture(texture::Info &info) {
     }
     texture::Plan plan;
     std::string why;
-    if (!texture::plan(info, plan, why)) {
+    if (!texture::plan(info, plan, why, support_)) {
         approximate("swap texture not decoded: " + why);
         return nullptr;
     }
@@ -4238,7 +4260,7 @@ void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &i
     read.number = number;
     read.host = t.host;
     read.width = t.image.extent.width, read.height = t.image.extent.height;
-    read.swizzle = info.swizzle, read.format = info.format;
+    read.swizzle = texture::compose_swizzle(info.swizzle, t.host_swizzle), read.format = info.format;
     read.gamma = processor_.gamma_ramp_table();
     read.pwl = processor_.gamma_ramp_pwl();
     bool compressed = texture::is_compressed(read.host);
@@ -4274,14 +4296,14 @@ void Impl::deliver(const FrontRead &read) {
         approximate("swap texture not decoded: no base level");
         return;
     }
-    uint32_t components = read.host == texture::HostFormat::RGBA8 ? 4 : host_components(read.host);
+    // (read.swizzle is composed with the host format's: it names the image's components)
     Image frame;
     frame.width = read.width, frame.height = read.height;
     frame.rgba.resize(pixels * 4);
     for (size_t i = 0; i < pixels; i++)
         for (uint32_t c = 0; c < 4; c++) {
             uint32_t guest = (read.swizzle >> (3 * c)) & 7;
-            uint8_t value = guest == 5 ? 255 : guest >= 4 ? 0 : rgba[i * 4 + std::min(guest, components - 1)];
+            uint8_t value = guest == 5 ? 255 : guest >= 4 ? 0 : rgba[i * 4 + guest];
             frame.rgba[i * 4 + c] = c == 3 ? 255 : value; // shown opaque, as the presenter does
         }
     // the display's gamma, the processor's ramps: as Xenia's presenter, the

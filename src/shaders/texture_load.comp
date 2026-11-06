@@ -1,11 +1,16 @@
 // One level of a guest texture, every slice or layer of it, read out of the
 // GPU's copy of guest memory into a buffer the image is then copied from
-// (renderer.cpp, textures over memory a resolve wrote): the same blocks, in
-// the same order and with the same byte swaps and depth conversions, as
-// texture.cpp's decode makes on the CPU (texture::Plan's SliceLoads). An
-// invocation writes a 32-bit word of the output: a part of a block, or two
-// or four blocks of 16 and 8 bits, which may lie in two slices. BSD; see
-// LICENSE-xenia.
+// (renderer.cpp: textures over memory a resolve wrote, and the DXT formats
+// decompressed where the host has no BC): the same bytes, with the same byte
+// swaps and conversions, as texture.cpp's decode makes on the CPU
+// (texture::Plan's SliceLoads, texture::GpuLevel's constants). An invocation
+// writes a 32-bit word of the output: a part of a block or texel, two or four
+// blocks of 16 and 8 bits (which may lie in two slices), or one to four
+// decompressed texels (which may lie in two rows). The conversions are
+// Xenia's (pixel_formats.xesli, texture_load_*.xesli). BSD; see LICENSE-xenia.
+//
+// With PARAMS_BUFFER the constants come from a buffer at binding 2 instead
+// of push constants (texture_gpu_test runs it so).
 #version 450
 #extension GL_GOOGLE_include_directive : require
 
@@ -14,24 +19,42 @@ layout(local_size_x = 64) in;
 layout(set = 0, binding = 0) readonly buffer Memory { uint words[]; } memory;
 layout(set = 0, binding = 1) writeonly buffer Out { uint words[]; } dst;
 
-layout(push_constant) uniform Level {
-    uint base;          // the first slice's first byte in guest memory
-    uint slice_stride;  // layers: the bytes from one to the next
-    uint slices;        // layers, or a 3D level's slices
-    uint layered;       // 1: slices are layers (each at its own base); 0: 3D slices (z)
-    uint pitch_blocks, z_rows;
-    uint ox, oy, oz;    // in the packed tail
-    uint tiled, is_3d;
-    uint log2_bytes;    // per block
-    uint endian;
-    uint blocks_x, blocks_y;
-    uint out_word;      // where in dst its first word goes
-    uint words;         // how many it writes
-    uint load;          // texture::Load: 0 copy, 1 unorm24 depth to float, 2 float24 depth to float
-    uint row_words;     // the dispatch's words per row of workgroups
-} p;
+#define LEVEL_FIELDS                                                                                   \
+    uint base;          /* the first slice's first byte in guest memory */                             \
+    uint slice_stride;  /* layers: the bytes from one to the next */                                   \
+    uint slices;        /* layers, or a 3D level's slices */                                           \
+    uint layered;       /* 1: slices are layers (each at its own base); 0: 3D slices (z) */            \
+    uint pitch_blocks, z_rows;                                                                         \
+    uint ox, oy, oz;    /* in the packed tail */                                                       \
+    uint tiled, is_3d;                                                                                 \
+    uint log2_bytes;    /* per block */                                                                \
+    uint endian;                                                                                       \
+    uint blocks_x, blocks_y;                                                                           \
+    uint out_word;      /* where in dst its first word goes */                                         \
+    uint words;         /* how many it writes */                                                       \
+    uint load;          /* texture::Load */                                                            \
+    uint half_from;     /* texture::Half: 1 16-bit unorm to halves, 2 snorm */                         \
+    uint row_words;     /* the dispatch's words per row of workgroups */                               \
+    uint out_width, out_height; /* the level's texels per row and rows */
+
+#ifdef PARAMS_BUFFER
+layout(set = 0, binding = 2) readonly buffer Level { LEVEL_FIELDS } p;
+#else
+layout(push_constant) uniform Level { LEVEL_FIELDS } p;
+#endif
 
 #include "tiling.glsl"
+
+// texture::Load, in its order
+const uint LOAD_COPY = 0u, LOAD_DEPTH_UNORM = 1u, LOAD_DEPTH_FLOAT = 2u;
+const uint LOAD_R5G6B5_TO_B5G6R5 = 3u, LOAD_R5G5B6_TO_B5G6R5 = 4u, LOAD_R5G5B5A1_TO_B5G5R5A1 = 5u,
+           LOAD_R4G4B4A4_TO_A4R4G4B4 = 6u;
+const uint LOAD_R11G11B10_TO_RGBA16 = 7u, LOAD_R10G11B11_TO_RGBA16 = 8u, LOAD_R11G11B10_TO_RGBA16_SNORM = 9u,
+           LOAD_R10G11B11_TO_RGBA16_SNORM = 10u;
+const uint LOAD_R5G6B5_TO_RGBA8 = 11u, LOAD_R4G4B4A4_TO_RGBA8 = 14u;
+const uint LOAD_GBGR8 = 15u, LOAD_BGRG8 = 16u, LOAD_DXT3A = 17u, LOAD_DXT3A_AS_1111_ARGB4 = 18u,
+           LOAD_DXT3A_AS_1111_RGBA8 = 19u, LOAD_CTX1 = 20u, LOAD_DXT1 = 21u, LOAD_DXT3 = 22u, LOAD_DXT5 = 23u,
+           LOAD_DXN = 24u, LOAD_DXT5A = 25u;
 
 // a block's byte address in guest memory, by its index in the level's slices
 uint block_address(uint block) {
@@ -49,6 +72,12 @@ uint block_address(uint block) {
 
 uint load_word(uint address) { return memory.words[(address & PHYSICAL_MASK) >> 2u]; }
 
+// a block of 16 bits, swapped
+uint load_half(uint block) {
+    uint address = block_address(block);
+    return swap16((load_word(address & ~3u) >> ((address & 3u) * 8u)) & 0xFFFFu, p.endian) & 0xFFFFu;
+}
+
 // pixel_formats.xesli's XeFloat20e4To32
 float float20e4_to_32(uint f24) {
     f24 &= 0xFFFFFFu;
@@ -63,33 +92,207 @@ float float20e4_to_32(uint f24) {
     return uintBitsToFloat(((exponent + 112u) << 23u) | (mantissa << 3u));
 }
 
+// pixel_formats.xesli's 16-bit rearrangements (Xenos red low, the host's high)
+uint transform16(uint v, uint load) {
+    if (load == LOAD_R5G6B5_TO_B5G6R5) return (v & 0x07E0u) | ((v & 0x001Fu) << 11u) | ((v & 0xF800u) >> 11u);
+    if (load == LOAD_R5G5B6_TO_B5G6R5) return ((v & 0x001Fu) << 11u) | ((v & 0xFFE0u) >> 5u);
+    if (load == LOAD_R5G5B5A1_TO_B5G5R5A1) return (v & 0x83E0u) | ((v & 0x001Fu) << 10u) | ((v & 0x7C00u) >> 10u);
+    if (load == LOAD_R4G4B4A4_TO_A4R4G4B4) return ((v & 0x0FFFu) << 4u) | (v >> 12u);
+    return v;
+}
+
+// a packed 16-bit texel unpacked to RGBA8, its components' bits replicated
+uint unpack16(uint v, uint load) {
+    const uvec4 widths[4] = uvec4[4](uvec4(5u, 6u, 5u, 0u), uvec4(5u, 5u, 6u, 0u), uvec4(5u, 5u, 5u, 1u),
+                                     uvec4(4u, 4u, 4u, 4u));
+    uvec4 w = widths[load - LOAD_R5G6B5_TO_RGBA8];
+    uint result = 0u, shift = 0u;
+    for (uint c = 0u; c < 4u; c++) {
+        uint bits = w[c], x = (v >> shift) & ((1u << bits) - 1u);
+        uint byte_ = bits == 0u ? 255u : bits == 1u ? x * 255u : (x << (8u - bits)) | (x >> (2u * bits - 8u));
+        result |= byte_ << (8u * c);
+        shift += bits;
+    }
+    return result;
+}
+
+// XeR11G11B10UNormToRGBA16 and kin, XeSNorm11To16 and XeSNorm10To16
+uint unorm_to_16(uint v, uint bits) { return (v << (16u - bits)) | (v >> (2u * bits - 16u)); }
+uint snorm_to_16(uint s, uint bits) {
+    uint sign = s >> (bits - 1u), mask = (1u << bits) - 1u;
+    if (s == (1u << (bits - 1u))) s++;
+    uint magnitude = (s ^ (sign != 0u ? mask : 0u)) + sign;
+    magnitude = (magnitude << (16u - bits)) | (magnitude >> (2u * bits - 17u));
+    return ((magnitude ^ (sign != 0u ? 0xFFFFu : 0u)) + sign) & 0xFFFFu;
+}
+uvec2 widen(uint texel, uint load) {
+    bool r11 = load == LOAD_R11G11B10_TO_RGBA16 || load == LOAD_R11G11B10_TO_RGBA16_SNORM;
+    bool snorm = load >= LOAD_R11G11B10_TO_RGBA16_SNORM;
+    uvec3 w = uvec3(r11 ? 11u : 10u, 11u, r11 ? 10u : 11u);
+    uvec3 c = uvec3(texel & ((1u << w.x) - 1u), (texel >> w.x) & ((1u << w.y) - 1u), texel >> (w.x + w.y));
+    uvec3 o = snorm ? uvec3(snorm_to_16(c.x, w.x), snorm_to_16(c.y, w.y), snorm_to_16(c.z, w.z))
+                    : uvec3(unorm_to_16(c.x, w.x), unorm_to_16(c.y, w.y), unorm_to_16(c.z, w.z));
+    return uvec2(o.x | (o.y << 16u), o.z | ((snorm ? 0x7FFFu : 0xFFFFu) << 16u));
+}
+
+// texture.cpp's float_to_half: to half precision, rounding to nearest even
+uint float_to_half(float f) {
+    uint x = floatBitsToUint(f), sign = (x >> 16u) & 0x8000u;
+    x &= 0x7FFFFFFFu;
+    if (x < 0x38800000u) {
+        if (x < 0x33000000u) return sign;
+        uint mantissa = (x & 0x7FFFFFu) | 0x800000u, shift = 126u - (x >> 23u);
+        uint h = mantissa >> shift, rest = mantissa & ((1u << shift) - 1u), half_way = 1u << (shift - 1u);
+        if (rest > half_way || (rest == half_way && (h & 1u) != 0u)) h++;
+        return sign | h;
+    }
+    uint h = (x - 0x38000000u) >> 13u, rest = x & 0x1FFFu;
+    if (rest > 0x1000u || (rest == 0x1000u && (h & 1u) != 0u)) h++;
+    return sign | h;
+}
+// XeRG16UNormToRG16Float and XeRG16SNormToRG16Float, a component (1/65535
+// and 1/32767 as their float bits, as texture.cpp has them)
+uint norm16_to_half(uint v) {
+    float f = p.half_from == 2u ? max(float(int(v << 16u) >> 16) * uintBitsToFloat(0x38000100u), -1.0)
+                                : float(v & 0xFFFFu) * uintBitsToFloat(0x37800080u);
+    return float_to_half(f);
+}
+
+// pixel_formats.xesli's DXT decoding, a texel at a time (texel i of 16,
+// row-major): 5:6:5 endpoints widened by bit replication, 2:1 and 1:2 steps
+// (integer division by 3), or DXT1's punchthrough mode (the first endpoint
+// not above the second) with the half way and transparent black
+uvec3 endpoint(uint c) {
+    uint r = (c >> 11u) & 31u, g = (c >> 5u) & 63u, b = c & 31u;
+    return uvec3((r << 3u) | (r >> 2u), (g << 2u) | (g >> 4u), (b << 3u) | (b >> 2u));
+}
+uint dxt_color(uint ends, uint codes, uint i, bool dxt1) {
+    uint code = (codes >> (2u * i)) & 3u;
+    uvec3 c0 = endpoint(ends & 0xFFFFu), c1 = endpoint(ends >> 16u);
+    uvec3 rgb;
+    uint a = 255u;
+    if (!dxt1 || (ends & 0xFFFFu) > (ends >> 16u)) {
+        uint w0 = code == 0u ? 3u : code == 1u ? 0u : code == 2u ? 2u : 1u;
+        rgb = (w0 * c0 + (3u - w0) * c1) / 3u;
+    } else {
+        rgb = code == 0u ? c0 : code == 1u ? c1 : code == 2u ? (c0 + c1) >> 1u : uvec3(0u);
+        if (code == 3u) a = 0u;
+    }
+    return rgb.r | (rgb.g << 8u) | (rgb.b << 16u) | (a << 24u);
+}
+// DXT5 alpha (and DXT5A, DXN): 8 steps (by 7) when the first endpoint is
+// above the second, else 6 (by 5) with 0 and 255; lo and hi the block's words
+uint dxt5_alpha(uint lo, uint hi, uint i) {
+    uint a0 = lo & 0xFFu, a1 = (lo >> 8u) & 0xFFu, bit = 16u + 3u * i;
+    uint k = (bit >= 32u ? hi >> (bit - 32u) : (lo >> bit) | (hi << (32u - bit))) & 7u;
+    if (k == 0u) return a0;
+    if (k == 1u) return a1;
+    if (a0 > a1) return (a0 * (8u - k) + a1 * (k - 1u)) / 7u;
+    if (k < 6u) return (a0 * (6u - k) + a1 * (k - 1u)) / 5u;
+    return k == 6u ? 0u : 255u;
+}
+// XeDXTHighColorWeights: a DXT color code as the second endpoint's weight
+uint high_weights(uint codes) {
+    codes = ((codes & 0x55555555u) << 1u) | ((codes & 0xAAAAAAAAu) >> 1u);
+    return codes ^ ((codes & 0xAAAAAAAAu) >> 1u);
+}
+
+// a decompressed texel (x, y) of a slice: its block's words read and
+// swapped, the texel decoded in the host format's bits
+uint decompressed_texel(uint slice, uint x, uint y) {
+    bool yuv = p.load == LOAD_GBGR8 || p.load == LOAD_BGRG8;
+    uint bw = yuv ? 2u : 4u, bh = yuv ? 1u : 4u;
+    uint bx = x / bw, by = y / bh, i = (y - by * bh) * bw + (x - bx * bw);
+    uint address = block_address((slice * p.blocks_y + by) * p.blocks_x + bx);
+    uint n = 1u << (p.log2_bytes - 2u);
+    uint b[4] = uint[4](0u, 0u, 0u, 0u);
+    for (uint k = 0u; k < n; k++) b[k] = swap32(load_word(address + 4u * k), p.endian);
+    uint load = p.load;
+    if (yuv) {
+        // Cr to red, the texel's Y to green, Cb to blue and alpha
+        bool gbgr = load == LOAD_GBGR8;
+        uint cr = gbgr ? b[0] >> 24u : (b[0] >> 16u) & 0xFFu, cb = gbgr ? (b[0] >> 8u) & 0xFFu : b[0] & 0xFFu;
+        uint luma = gbgr ? (i != 0u ? (b[0] >> 16u) & 0xFFu : b[0] & 0xFFu)
+                         : (i != 0u ? b[0] >> 24u : (b[0] >> 8u) & 0xFFu);
+        return cr | (luma << 8u) | (cb << 16u) | (cb << 24u);
+    }
+    uint nibble = (b[i >> 3u] >> (4u * (i & 7u))) & 0xFu;
+    if (load == LOAD_DXT3A) return nibble | (nibble << 4u);
+    if (load == LOAD_DXT3A_AS_1111_ARGB4) {
+        uint v = ((nibble & 1u) << 4u) | (((nibble >> 1u) & 1u) << 8u) | (((nibble >> 2u) & 1u) << 12u) |
+                 ((nibble >> 3u) & 1u);
+        v |= v << 1u;
+        return v | (v << 2u);
+    }
+    if (load == LOAD_DXT3A_AS_1111_RGBA8)
+        return ((nibble & 1u) * 0xFFu) | (((nibble >> 1u) & 1u) * 0xFF00u) | (((nibble >> 2u) & 1u) * 0xFF0000u) |
+               (((nibble >> 3u) & 1u) * 0xFF000000u);
+    if (load == LOAD_CTX1) {
+        uint high = (high_weights(b[1]) >> (2u * i)) & 3u, low = 3u - high;
+        uint r = (low * ((b[0] >> 8u) & 0xFFu) + high * (b[0] >> 24u)) / 3u;
+        uint g = (low * (b[0] & 0xFFu) + high * ((b[0] >> 16u) & 0xFFu)) / 3u;
+        return r | (g << 8u);
+    }
+    if (load == LOAD_DXT1) return dxt_color(b[0], b[1], i, true);
+    if (load == LOAD_DXT3) return (dxt_color(b[2], b[3], i, false) & 0xFFFFFFu) | ((nibble | (nibble << 4u)) << 24u);
+    if (load == LOAD_DXT5) return (dxt_color(b[2], b[3], i, false) & 0xFFFFFFu) | (dxt5_alpha(b[0], b[1], i) << 24u);
+    if (load == LOAD_DXN) return dxt5_alpha(b[0], b[1], i) | (dxt5_alpha(b[2], b[3], i) << 8u);
+    return dxt5_alpha(b[0], b[1], i); // DXT5A
+}
+
 void main() {
     uint w = gl_GlobalInvocationID.y * p.row_words + gl_GlobalInvocationID.x;
     if (w >= p.words) return;
     uint blocks = p.blocks_x * p.blocks_y * p.slices;
-    uint value;
-    if (p.log2_bytes >= 2u) {
+    uint value = 0u;
+    if (p.load >= LOAD_GBGR8) {
+        // decompressed texels, 1, 2 or 4 bytes each, rows of the level tightly packed
+        uint texel_bytes = p.load == LOAD_DXT3A || p.load == LOAD_DXT5A ? 1u
+                           : p.load == LOAD_DXT3A_AS_1111_ARGB4 || p.load == LOAD_CTX1 || p.load == LOAD_DXN ? 2u
+                                                                                                             : 4u;
+        uint per_word = 4u / texel_bytes, per_slice = p.out_width * p.out_height;
+        for (uint k = 0u; k < per_word; k++) {
+            uint t = w * per_word + k;
+            if (t >= per_slice * p.slices) break;
+            uint slice = t / per_slice, rest = t - slice * per_slice;
+            uint y = rest / p.out_width, x = rest - y * p.out_width;
+            uint texel = decompressed_texel(slice, x, y);
+            if (texel_bytes < 4u) texel &= (1u << (8u * texel_bytes)) - 1u;
+            value |= texel << (8u * texel_bytes * k);
+        }
+    } else if (p.load >= LOAD_R11G11B10_TO_RGBA16 && p.load <= LOAD_R10G11B11_TO_RGBA16_SNORM) {
+        // a 32-bit texel to two words of 16-bit components
+        uvec2 rgba = widen(swap32(load_word(block_address(w >> 1u)), p.endian), p.load);
+        value = (w & 1u) != 0u ? rgba.y : rgba.x;
+    } else if (p.load >= LOAD_R5G6B5_TO_RGBA8 && p.load <= LOAD_R4G4B4A4_TO_RGBA8) {
+        value = unpack16(load_half(w), p.load); // a 16-bit texel to a word
+    } else if (p.log2_bytes >= 2u) {
         uint words_per_block_log2 = p.log2_bytes - 2u;
         uint block = w >> words_per_block_log2, part = w & ((1u << words_per_block_log2) - 1u);
         value = swap32(load_word(block_address(block) + 4u * part), p.endian);
-        if (p.load != 0u) {
+        if (p.load == LOAD_DEPTH_UNORM || p.load == LOAD_DEPTH_FLOAT) {
             // the depth in the high 24 bits: XeUNorm24To32 (exact), or XeFloat20e4To32
             uint d24 = value >> 8u;
-            value = floatBitsToUint(p.load == 1u ? float(d24 + (d24 >> 23u)) * (1.0 / 16777216.0)
-                                                 : float20e4_to_32(d24));
+            value = floatBitsToUint(p.load == LOAD_DEPTH_UNORM ? float(d24 + (d24 >> 23u)) * (1.0 / 16777216.0)
+                                                               : float20e4_to_32(d24));
         }
     } else {
         // 16-bit blocks two to a word, 8-bit ones four, each swapped alone
+        // (and the 16-bit ones rearranged)
         uint per_word = 4u >> p.log2_bytes, bits = 8u << p.log2_bytes;
-        value = 0u;
         for (uint k = 0u; k < per_word; k++) {
             uint block = w * per_word + k;
             if (block >= blocks) break;
-            uint address = block_address(block);
-            uint part = (load_word(address & ~3u) >> ((address & 3u) * 8u)) & ((1u << bits) - 1u);
-            if (bits == 16u) part = swap16(part, p.endian) & 0xFFFFu;
+            uint part;
+            if (bits == 16u) {
+                part = transform16(load_half(block), p.load);
+            } else {
+                uint address = block_address(block);
+                part = (load_word(address & ~3u) >> ((address & 3u) * 8u)) & 0xFFu;
+            }
             value |= part << (k * bits);
         }
     }
+    if (p.half_from != 0u) value = norm16_to_half(value & 0xFFFFu) | (norm16_to_half(value >> 16u) << 16u);
     dst.words[p.out_word + w] = value;
 }
