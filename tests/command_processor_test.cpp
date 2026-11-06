@@ -440,6 +440,58 @@ void trace_player() {
 
 } // namespace
 
+// Occlusion queries with real counts (OcclusionQueries::Fast, Xenia's "fast"):
+// each report written at once with a guess, and again with the sink's counts
+struct Counter : Recorder {
+    std::vector<std::pair<uint64_t, uint64_t>> reports; // (ended, next) as told
+    std::vector<std::pair<uint64_t, uint64_t>> answers; // given at the next poll
+    bool counts_samples() override { return true; }
+    void zpd_report(uint64_t ended, uint64_t next) override { reports.push_back({ended, next}); }
+    void zpd_poll(std::vector<std::pair<uint64_t, uint64_t>> &resolved) override {
+        resolved.insert(resolved.end(), answers.begin(), answers.end());
+        answers.clear();
+    }
+};
+
+void occlusion_queries() {
+    Host host;
+    Counter sink;
+    CommandProcessor cp{*M, host};
+    uint32_t ring = physical_alloc(0x1000), m = physical_alloc(0x1000);
+    cp.set_sink(&sink);
+    cp.initialize_ring_buffer(ring, 9);
+    cp.set_occlusion_queries(OcclusionQueries::Fast);
+    auto zpd = [&](uint32_t address) {
+        Words w(ring + 4 * cp.read_pointer());
+        w({type0(reg::RB_SAMPLE_COUNT_ADDR, 1), address});
+        w({type3(pm4::EVENT_WRITE_ZPD, 1), 0x1B});
+        cp.run((w.at - ring) / 4 + w.n);
+    };
+    auto z_pass = [&](uint32_t address) { return le32(address + 0x10) + le32(address + 0x14); };
+    // the first report counts no draws (0), the next ones those since the last
+    zpd(m + 0x00);
+    CHECK(sink.reports.size() == 1 && sink.reports[0] == std::make_pair(uint64_t(0), uint64_t(1)));
+    CHECK(z_pass(m + 0x00) == 1); // the guess: one sample
+    sink.answers.push_back({0, 0});
+    zpd(m + 0x20); // report 1 ended; report 0 answered with nothing: rewritten as 0
+    CHECK(z_pass(m + 0x00) == 0);
+    CHECK(z_pass(m + 0x20) == 1); // the guess over the right counter
+    sink.answers.push_back({1, 500});
+    zpd(m + 0x40); // report 1 answered with 500 samples: corrected, report 2 guessed over it
+    CHECK(z_pass(m + 0x20) == 500);
+    CHECK(z_pass(m + 0x40) == 501);
+    CHECK(le32(m + 0x20) + le32(m + 0x24) == 500); // Total as ZPass
+    sink.answers.push_back({2, 7});
+    zpd(m + 0x20); // the address of report 1 again: its last count (500) is the guess
+    CHECK(z_pass(m + 0x40) == 507);
+    CHECK(z_pass(m + 0x20) == 1007);
+    // without a sink that counts, the fake reports, on the same counter (as Xenia's)
+    Recorder plain;
+    cp.set_sink(&plain);
+    zpd(m + 0x60);
+    CHECK(z_pass(m + 0x60) == 1007 + 100);
+}
+
 int main() {
     std::string error;
     auto memory = Memory::create(error);
@@ -454,5 +506,6 @@ int main() {
     interrupts_and_waits();
     ring_wrap_and_bad_packets();
     trace_player();
+    occlusion_queries();
     return finish("command_processor");
 }

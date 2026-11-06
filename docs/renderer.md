@@ -359,7 +359,7 @@ MSAA target that the game clears by drawing into the same samples seen as a
 640 4x target.
 
 Not done yet, counted where it shows: MSAA resolves of one sample; depth
-resolves of MSAA targets; unnormalized cube map coordinates;
+resolves of MSAA targets;
 point sprite coordinates in the pixel parameters; signed components of
 formats with no snorm view on the host (5_6_5, 4_4_4_4, the DXT colors);
 float16 and float32 targets moved through EDRAM by value rather than by
@@ -764,6 +764,75 @@ others in `../traces/xf_dumps`):
   resolved at 192, 96, 48 and 24 texels, then read with gamma signs); not
   from loading them on the GPU (decoded on the CPU, the same). Counted
   there too: resolves of one MSAA sample (averaged), MSAA depth resolves.
+
+## Pipelines, primitive types and occlusion queries (2026-11-06)
+
+**Pipelines made off the renderer's thread** (`Options::async_pipelines`,
+on in the player; `xfreplay --async-pipelines`), as Xenia's pipeline
+creation threads with its `async_shader_compilation`: a draw whose graphics
+pipeline is not made yet queues it, with a copy of its description
+(`PipelineDesc`), for worker threads (three quarters of the logical cores,
+Xenia's default; `pipeline_threads`), and is skipped meanwhile, counted as
+"pipeline not ready (being made)"; the draws after it have it once it is
+made. That is what Xenia's D3D12 backend does (its Vulkan one draws with a
+placeholder pixel shader instead). Draws without a pixel shader get theirs
+at once, as Xenia's do. Replays and `boot` wait for each pipeline, as
+Xenia's trace dump does. El Chavo Kart's race frame, cold (no cache on
+disk): 1.11 s of the renderer's thread waiting for pipelines, 0.58 s with
+them made aside (334 of its draws skipped that frame, 6 the next, none
+after). The Vulkan pipeline cache on disk is shared by the workers.
+
+**Fewer pipelines**: Vulkan 1.3's extended dynamic state 1 and 2 (core, so
+no fallback) take the topology within its class, primitive restart,
+culling, the front face, the depth and stencil tests and ops and the depth
+bias's enable at the draw, out of the pipeline key (Xenia's Vulkan backend
+keys them: a TODO in its command processor). The race: 102 pipelines, 96
+now; the rest differ mostly in blend state and color formats, which only
+VK_EXT_extended_dynamic_state3 could take (not used yet).
+
+**Geometry shaders are optional** (many mobile GPUs lack them;
+`vk::Device::geometry_shader()`, off with `XF_VK_NO_GEOMETRY_SHADER=1`):
+without them rectangle and point lists are skipped and counted ("rectangle
+list without geometry shaders"); Xenia's D3D12 expands both in the vertex
+shader, which is the next step. Checked both ways on the race frame, with
+validation.
+
+**Primitive types**: line loops as strips closed by their first index
+(Xenia's `LineLoopToStrip`, per primitive between reset indices); quad
+strips and polygons, which Xenia does not draw, as triangle strips (whole
+quads only) and fans: Mesa's r600 and freedreno's a2xx give these
+primitive types to OpenGL's `GL_QUAD_STRIP` and `GL_POLYGON`, so their
+meaning is OpenGL's. The reset index cuts them as Xenia's list says. Still
+skipped and counted: the triangle list with wireframe flags (7) and the 2D
+engine's primitives (16 to 22), which Xenia does not draw and no reference
+at hand defines, and tessellation: a draw on VGT_OUTPUT_PATH_CNTL's
+tessellator path, whatever its primitive (it used to be drawn as if the
+vertex shader were an ordinary one), counted by VGT_HOS_CNTL's mode and the
+primitive (line, triangle and quad patches are 16 to 18 there).
+
+**Occlusion queries** (`gpu::OcclusionQueries`; the player and `boot` use
+real counts, `XF_OCCLUSION_QUERIES=fake` the made-up ones;
+`xfreplay --occlusion-queries`). The command processor keeps Xenia's
+"fast" mode (command_processor.cc, 2026): at each EVENT_WRITE_ZPD the
+report of the draws since the last one is written at once with a guess (the
+last count at that address, or one sample), and again when the counts are
+in, the guesses after it rebased on the right counter. The renderer counts
+the draws between two events with host occlusion queries (precise where the
+device has them), one per render pass they fall in, read when their
+submission is done; draws after a swap count for no report until the next
+event, as Xenia's EndZPDFrame; a draw that finds no free query makes its
+report at least one sample. The race frame: 315 reports, 235 queries,
+validation clean, the picture unchanged. Not done: Xenia's "strict" mode
+(the guest waiting on the real count), VIZ queries, the hybrid ZFail and
+Total counts.
+
+**Shaders**: unnormalized cube map coordinates are translated as Xenia's
+`ProcessTextureFetchInstruction` takes them (the face's xy divided by its
+size, the face index as it is, register gradients left as given). The
+undefined scalar opcode 41 and an exec past the end of the microcode stay
+unsupported: Xenia fails the first (a fatal translation error) and reads
+past its copy of the microcode for the second, so only hardware could
+answer.
 
 ## What is asked and not done is counted
 

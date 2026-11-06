@@ -1225,8 +1225,11 @@ void Translator::texture_fetch(const TextureFetchInstruction &t) {
     }
     if (!t.has_result()) return;
     bool gradients = t.opcode == FetchOpcode::GetTextureGradients;
-    if (stage_ != Stage::Harness && !gradients && t.unnormalized_coordinates && t.dimension == FetchOpDimension::Cube)
-        unsupported("unnormalized cube map coordinates");
+    // Unnormalized cube map coordinates are the face's x and y in texels
+    // (divided by the face's size below, the offsets added first) and the
+    // face index as it is, as Xenia's ProcessTextureFetchInstruction
+    // normalizes a cube fetch's xy only; register gradients stay as given
+    // (Xenia leaves a cube map's unnormalized too).
     auto body = [&] {
         Id coordinates = operand(t.operands[0]);
         uint32_t dims = dimension_component_count(t.dimension);

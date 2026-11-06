@@ -206,6 +206,11 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
         o.gpu_timing = timing[0] && timing[0] != '0';
         o.gpu_timing_draws = std::string(timing) == "draws";
     }
+    // occlusion queries: the GPU's counts, as Xenia's default "fast" mode;
+    // XF_OCCLUSION_QUERIES=fake keeps the processor's made-up ones
+    const char *queries = std::getenv("XF_OCCLUSION_QUERIES");
+    processor.set_occlusion_queries(queries && std::string(queries) == "fake" ? gpu::OcclusionQueries::Fake
+                                                                              : gpu::OcclusionQueries::Fast);
     g.renderer = render::Renderer::create(*g.device, processor, o, error);
     if (!g.renderer) return error = "renderer: " + error, false;
     processor.set_sink(g.renderer.get());

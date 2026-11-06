@@ -16,9 +16,13 @@
 // their wrapping); checked against them. Where it differs:
 //
 // - Draws and copies go to the Sink, as Xenia's null backend takes them
-//   (every one succeeds); there are no host occlusion queries, so
-//   EVENT_WRITE_ZPD writes Xenia's fake reports (its occlusion_query=fake,
-//   and its fallback when host queries fail), and VIZ_QUERY only marks
+//   (every one succeeds). EVENT_WRITE_ZPD writes Xenia's fake reports (its
+//   occlusion_query=fake, and its fallback without host queries) unless
+//   OcclusionQueries::Fast and a sink that counts samples: then the reports
+//   follow command_processor.cc's "fast" mode (QueueZPDReport,
+//   PumpPendingRetire; 2026), with the ZPass counts of host occlusion
+//   queries and without its VIZ queries, hybrid totals or the deadline for
+//   reports that never resolve (the sink answers each). VIZ_QUERY only marks
 //   VGT_EVENT_INITIATOR (Xenia's default, occlusion_query_viz off).
 // - A type-3 packet ends where its header's count says, even when a handler
 //   read less (IM_LOAD_IMMEDIATE's padding) or more; Xenia asserts the two
@@ -585,17 +589,92 @@ bool CommandProcessor::event_write_zpd() {
     regs_.set(reg::VGT_EVENT_INITIATOR, reader_.next() & 0x3F);
     uint32_t report = regs_.get(reg::RB_SAMPLE_COUNT_ADDR);
     if (!report) return true;
+    if (occlusion_ == OcclusionQueries::Fast && sink_ && sink_->counts_samples()) {
+        queue_zpd(report);
+        return true;
+    }
     // Xenia's occlusion_query_fake_lower_threshold (80) and _upper (100)
     fake_zpd_samples_ = fake_zpd_samples_ <= 80 ? 100 : fake_zpd_samples_ - 1;
-    zpd_counter_ += fake_zpd_samples_;
-    uint32_t z_pass = uint32_t(zpd_counter_);
-    uint32_t lane_a = z_pass - (z_pass >> 1), lane_b = z_pass >> 1;
-    // Total, ZFail, ZPass, StencilFail: only samples that passed
-    const uint32_t values[8] = {lane_a, lane_b, 0, 0, lane_a, lane_b, 0, 0};
-    uint8_t *p = physical(report);
-    for (int i = 0; i < 8; i++) put_le32(p + 4 * i, values[i]);
-    if (sink_) sink_->memory_written(report & PHYSICAL_MASK, sizeof(values));
+    zpd_speculative_counter_ += fake_zpd_samples_;
+    zpd_counter_ = zpd_speculative_counter_;
+    write_zpd(report, zpd_counter_);
     return true;
+}
+
+// XenosZPDReport::WriteTo with only samples that passed: Total, ZFail, ZPass,
+// StencilFail, each split in two lanes
+void CommandProcessor::write_zpd(uint32_t address, uint64_t z_pass) {
+    uint32_t count = uint32_t(z_pass);
+    uint32_t lane_a = count - (count >> 1), lane_b = count >> 1;
+    const uint32_t values[8] = {lane_a, lane_b, 0, 0, lane_a, lane_b, 0, 0};
+    uint8_t *p = physical(address);
+    for (int i = 0; i < 8; i++) put_le32(p + 4 * i, values[i]);
+    if (sink_) sink_->memory_written(address & PHYSICAL_MASK, sizeof(values));
+}
+
+// QueueZPDReport: the report of the draws since the last event (the current
+// report) written at once with a guess, the last count at this address when
+// it was not zero, else one sample (unknown means visible); the draws from
+// here count for the next report
+void CommandProcessor::queue_zpd(uint32_t address) {
+    sink_->zpd_report(zpd_current_, zpd_next_);
+    ZpdReport r;
+    r.address = address;
+    r.handle = zpd_current_;
+    auto cached = zpd_cached_deltas_.find(address);
+    r.speculative_delta = cached != zpd_cached_deltas_.end() && cached->second ? cached->second : 1;
+    zpd_speculative_counter_ += r.speculative_delta;
+    r.speculative_value = zpd_speculative_counter_;
+    write_zpd(address, r.speculative_value);
+    zpd_reports_.push_back(r);
+    zpd_current_ = zpd_next_++;
+    poll_zpd();
+}
+
+// the sink's counts in, then the reports retired
+void CommandProcessor::poll_zpd() {
+    if (zpd_reports_.empty() || !sink_) return;
+    std::vector<std::pair<uint64_t, uint64_t>> resolved;
+    sink_->zpd_poll(resolved);
+    for (auto [handle, samples] : resolved) {
+        if (zpd_reports_.empty() || handle < zpd_reports_.front().handle) continue;
+        size_t index = size_t(handle - zpd_reports_.front().handle);
+        if (index >= zpd_reports_.size() || zpd_reports_[index].handle != handle) continue;
+        zpd_reports_[index].delta += samples;
+        zpd_reports_[index].pending = false;
+    }
+    retire_zpd();
+}
+
+// PumpPendingRetire: the reports whose counts are in, in order, added to the
+// counter; a report the guess got wrong written again, and the guesses
+// after it made again over the right counter
+void CommandProcessor::retire_zpd() {
+    bool rebase = false;
+    while (!zpd_reports_.empty() && !zpd_reports_.front().pending) {
+        ZpdReport &front = zpd_reports_.front();
+        zpd_counter_ += front.delta;
+        if (zpd_cached_deltas_.size() >= 1024 && !zpd_cached_deltas_.count(front.address)) zpd_cached_deltas_.clear();
+        zpd_cached_deltas_[front.address] = front.delta;
+        if (front.speculative_value != zpd_counter_) {
+            write_zpd(front.address, zpd_counter_);
+            rebase = true;
+        }
+        zpd_reports_.pop_front();
+    }
+    if (rebase) {
+        uint64_t running = zpd_counter_;
+        for (ZpdReport &r : zpd_reports_) {
+            running += r.speculative_delta;
+            if (r.speculative_value != running) {
+                write_zpd(r.address, running);
+                r.speculative_value = running;
+            }
+        }
+        zpd_speculative_counter_ = running;
+    } else if (zpd_reports_.empty()) {
+        zpd_speculative_counter_ = zpd_counter_;
+    }
 }
 
 // ---- draws, shaders, swaps ----
@@ -691,6 +770,8 @@ bool CommandProcessor::xe_swap(uint32_t count) {
     Swap s{words[1], words[2], words[3]};
     bump(counts_.swaps);
     if (sink_) sink_->swap(regs_, s);
+    // the counts of the frame's reports, as they come in
+    poll_zpd();
     counter_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

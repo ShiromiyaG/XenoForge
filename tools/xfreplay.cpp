@@ -9,7 +9,8 @@
 // again, the GPU time then being the fastest of the plays after the first.
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
-//            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [-v]
+//            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
+//            [--occlusion-queries] [-v]
 
 #include "xenoforge/renderer.h"
 
@@ -30,7 +31,8 @@ namespace {
 
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
-                         "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [-v]\n");
+                         "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
+                         "[--occlusion-queries] [-v]\n");
     return 2;
 }
 
@@ -52,6 +54,11 @@ int main(int argc, char **argv) {
         else if (a == "--gpu-time") options.gpu_timing = true;
         else if (a == "--gpu-time-draws") options.gpu_timing = options.gpu_timing_draws = true;
         else if (a == "--repeat" && i + 1 < argc) repeat = uint32_t(std::max(1, std::atoi(argv[++i])));
+        // pipelines made on worker threads, their draws skipped meanwhile (as
+        // the player plays; a replay otherwise waits for each)
+        else if (a == "--async-pipelines") options.async_pipelines = true;
+        // occlusion query reports with the GPU's counts (else the fake ones)
+        else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
         else if (!a.empty() && a[0] != '-' && trace_path.empty()) trace_path = a;
         else return usage();
     }
@@ -90,6 +97,9 @@ int main(int argc, char **argv) {
                 report.writeback_seconds, double(report.writeback_bytes) / 1024);
     std::printf("  %llu submissions, %llu waits for the GPU\n", (unsigned long long)report.submissions,
                 (unsigned long long)report.waits);
+    if (report.zpd_reports)
+        std::printf("  occlusion: %llu queries for %llu reports\n", (unsigned long long)report.occlusion_queries,
+                    (unsigned long long)report.zpd_reports);
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)
         std::printf("  approx  %6llu  %s\n", (unsigned long long)n, what.c_str());

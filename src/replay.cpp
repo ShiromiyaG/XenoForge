@@ -121,6 +121,7 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     std::unique_ptr<Renderer> renderer = Renderer::create(device, processor, o, error);
     if (!renderer) return false;
     processor.set_sink(renderer.get());
+    processor.set_occlusion_queries(options.occlusion_queries);
     Player player(*memory, processor, *renderer, restore_edram);
     bool walked = walk_gpu_trace(trace, player, error);
     // the plays after the first, each finished on the GPU: the GPU time that

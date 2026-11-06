@@ -52,10 +52,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -63,6 +65,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -115,6 +118,7 @@ constexpr uint32_t RB_BLENDCONTROL[4] = {0x2201, 0x2209, 0x220A, 0x220B};
 constexpr uint32_t RB_COLORCONTROL = 0x2202;
 constexpr uint32_t PA_CL_CLIP_CNTL = 0x2204, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206;
 constexpr uint32_t PA_SU_POINT_SIZE = 0x2280, PA_SU_POINT_MINMAX = 0x2281;
+constexpr uint32_t VGT_OUTPUT_PATH_CNTL = 0x2284, VGT_HOS_CNTL = 0x2285;
 constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
 constexpr uint32_t SQ_CONTEXT_MISC = 0x2181;
 constexpr uint32_t PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2380; // then FRONT_OFFSET, BACK_SCALE, BACK_OFFSET
@@ -531,6 +535,11 @@ struct Slot {
     // each one begins
     VkQueryPool queries = VK_NULL_HANDLE;
     std::vector<uint32_t> marks;
+    // occlusion queries (Impl's "occlusion queries"): the pool, reset as the
+    // slot begins recording, and the report each query counts for
+    VkQueryPool occlusion = VK_NULL_HANDLE;
+    uint32_t occlusion_used = 0; // the queries to reset before the next use
+    std::vector<uint64_t> occlusion_reports;
 };
 
 // A swap's front buffer being read back: where its texels wait for the GPU
@@ -552,6 +561,155 @@ struct Pass {
     VkImageView depth = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0;
     bool operator==(const Pass &) const = default;
+};
+
+// ---- pipelines made on worker threads ----
+//
+// As Xenia's pipeline cache's creation threads (d3d12/pipeline_cache.cc): a
+// draw's graphics pipeline that is not made yet is queued with a copy of its
+// description, and worker threads make it while the renderer goes on; the
+// draw is skipped meanwhile (D3D12CommandProcessor::IssueDraw's "pipeline not
+// ready"), and the draws after it have it once it is made. The pipeline
+// cache (Vulkan's, internally synchronized) is shared by all of them.
+
+// A graphics pipeline's description, owning what its pointers reach (the
+// renderer's draws give stages, the fixed states, blend attachments, dynamic
+// states and the dynamic rendering formats; nothing else is chained).
+struct PipelineDesc {
+    VkPipelineShaderStageCreateInfo stages[5]{};
+    VkPipelineVertexInputStateCreateInfo vertex_input{};
+    VkPipelineInputAssemblyStateCreateInfo assembly{};
+    VkPipelineTessellationStateCreateInfo tessellation{};
+    VkPipelineViewportStateCreateInfo viewport{};
+    VkPipelineRasterizationStateCreateInfo raster{};
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    VkPipelineDepthStencilStateCreateInfo depth{};
+    VkPipelineColorBlendAttachmentState blends[4]{};
+    VkPipelineColorBlendStateCreateInfo blend{};
+    VkDynamicState dynamic_states[32]{};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    VkFormat color_formats[4]{};
+    VkPipelineRenderingCreateInfo rendering{};
+    VkGraphicsPipelineCreateInfo info{};
+
+    explicit PipelineDesc(const VkGraphicsPipelineCreateInfo &from) : info(from) {
+        info.stageCount = std::min<uint32_t>(from.stageCount, uint32_t(std::size(stages)));
+        std::copy_n(from.pStages, info.stageCount, stages);
+        info.pStages = stages;
+        if (from.pNext) {
+            rendering = *static_cast<const VkPipelineRenderingCreateInfo *>(from.pNext);
+            rendering.colorAttachmentCount = std::min<uint32_t>(rendering.colorAttachmentCount, 4);
+            std::copy_n(rendering.pColorAttachmentFormats, rendering.colorAttachmentCount, color_formats);
+            rendering.pColorAttachmentFormats = color_formats;
+            info.pNext = &rendering;
+        }
+        own(info.pVertexInputState, vertex_input);
+        own(info.pInputAssemblyState, assembly);
+        own(info.pTessellationState, tessellation);
+        own(info.pViewportState, viewport);
+        own(info.pRasterizationState, raster);
+        own(info.pMultisampleState, multisample);
+        own(info.pDepthStencilState, depth);
+        if (own(info.pColorBlendState, blend) && blend.pAttachments) {
+            blend.attachmentCount = std::min<uint32_t>(blend.attachmentCount, 4);
+            std::copy_n(blend.pAttachments, blend.attachmentCount, blends);
+            blend.pAttachments = blends;
+        }
+        if (own(info.pDynamicState, dynamic) && dynamic.pDynamicStates) {
+            dynamic.dynamicStateCount = std::min<uint32_t>(dynamic.dynamicStateCount, uint32_t(std::size(dynamic_states)));
+            std::copy_n(dynamic.pDynamicStates, dynamic.dynamicStateCount, dynamic_states);
+            dynamic.pDynamicStates = dynamic_states;
+        }
+    }
+    PipelineDesc(const PipelineDesc &) = delete;
+    PipelineDesc &operator=(const PipelineDesc &) = delete;
+
+private:
+    template <typename T> static bool own(const T *&pointer, T &store) {
+        if (!pointer) return false;
+        store = *pointer;
+        pointer = &store;
+        return true;
+    }
+};
+
+// A pipeline the renderer asked for: made (state 1, the pipeline null when
+// the driver failed) or being made (0).
+struct PipelineEntry {
+    std::atomic<int> state{0};
+    VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+class PipelineWorkers {
+public:
+    PipelineWorkers(VkDevice device, VkPipelineCache cache, uint32_t threads) : dev_(device), cache_(cache) {
+        for (uint32_t i = 0; i < threads; i++) threads_.emplace_back([this] { run(); });
+    }
+    // stops: what is queued is left unmade, what is being made is waited for
+    ~PipelineWorkers() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        work_.notify_all();
+        for (std::thread &t : threads_) t.join();
+    }
+    size_t threads() const { return threads_.size(); }
+    void queue(PipelineEntry *entry, std::unique_ptr<PipelineDesc> desc) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.emplace_back(entry, std::move(desc));
+        }
+        work_.notify_one();
+    }
+    // until the entry is made
+    void wait(PipelineEntry *entry) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_.wait(lock, [&] { return entry->state.load(std::memory_order_acquire) != 0; });
+    }
+    // until everything queued is made
+    void wait_all() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_.wait(lock, [&] { return queue_.empty() && busy_ == 0; });
+    }
+    // the time the workers spent making pipelines, and how many they made
+    double seconds() const { return double(nanoseconds_.load()) * 1e-9; }
+    uint64_t made() const { return made_.load(); }
+
+private:
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            work_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            if (stop_) return;
+            auto [entry, desc] = std::move(queue_.front());
+            queue_.pop_front();
+            busy_++;
+            lock.unlock();
+            auto start = std::chrono::steady_clock::now();
+            VkPipeline p = VK_NULL_HANDLE;
+            if (vkCreateGraphicsPipelines(dev_, cache_, 1, &desc->info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
+            nanoseconds_ += uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            made_++;
+            desc.reset();
+            lock.lock();
+            entry->pipeline = p;
+            entry->state.store(1, std::memory_order_release);
+            busy_--;
+            done_.notify_all();
+        }
+    }
+
+    VkDevice dev_;
+    VkPipelineCache cache_;
+    std::mutex mutex_;
+    std::condition_variable work_, done_;
+    std::deque<std::pair<PipelineEntry *, std::unique_ptr<PipelineDesc>>> queue_;
+    uint32_t busy_ = 0;
+    bool stop_ = false;
+    std::atomic<uint64_t> nanoseconds_{0}, made_{0};
+    std::vector<std::thread> threads_;
 };
 
 class Impl final : public Renderer {
@@ -586,6 +744,17 @@ public:
     void swap(const gpu::RegisterFile &registers, const gpu::Swap &) override {
         Call call(*this, &registers);
         if (call) swap();
+    }
+    // occlusion queries (gpu::OcclusionQueries::Fast; "occlusion queries" below)
+    bool counts_samples() override { return true; }
+    void zpd_report(uint64_t ended, uint64_t next) override {
+        Call call(*this, nullptr);
+        if (call) zpd_report_ended(ended, next);
+    }
+    void zpd_poll(std::vector<std::pair<uint64_t, uint64_t>> &resolved) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        resolved.insert(resolved.end(), zpd_resolved_.begin(), zpd_resolved_.end());
+        zpd_resolved_.clear();
     }
     // the processor's own writes (fences, reports), and a trace's memory:
     // the textures over them are loaded again at their next use, and what a
@@ -639,6 +808,7 @@ public:
     void drain() override {
         Call call(*this, nullptr);
         if (call) sync();
+        if (pipeline_workers_) pipeline_workers_->wait_all();
         save_pipeline_cache();
     }
 
@@ -731,7 +901,12 @@ private:
     bool cpu_upload(Texture &t, const texture::Image &image, const std::vector<std::vector<uint8_t>> &levels,
                     VkFormat format, bool fresh);
     uint32_t sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides);
-    VkPipeline pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info);
+    // the pipeline of a key, made now or found made; null when the driver
+    // failed, or (pending) when worker threads are making it and the draw may
+    // not wait (async)
+    VkPipeline pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info, bool async,
+                        bool &pending);
+    std::unique_ptr<PipelineWorkers> pipeline_workers_; // with Options::async_pipelines
     VkImageView make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
                           VkComponentMapping components = {}, uint32_t levels = 1, uint32_t layers = 1,
                           bool keep = true);
@@ -802,8 +977,78 @@ private:
     }
     // the render pass ended, if one is under way
     void end_pass() {
+        end_query(); // a query does not outlive its render pass
         if (in_pass_) vkCmdEndRendering(slots_[current_].cmd);
         in_pass_ = false;
+    }
+    // ---- occlusion queries ----
+    //
+    // As Xenia's query segments (command_processor.cc's OpenQuerySegment and
+    // CloseQuerySegment, the backends' OpenQuery and CloseQuery): the draws
+    // between two EVENT_WRITE_ZPD count for one report through host occlusion
+    // queries, one per render pass they fall in (a query cannot cross one),
+    // opened at the first draw that counts; each query's samples are read
+    // when its submission is done, and a report is answered (zpd_poll) once
+    // all of its queries are in. Draws after a swap count for no report until
+    // the next event (Xenia's EndZPDFrame). A draw that finds no query free
+    // makes its report at least one sample, as Xenia's fast mode does.
+    struct ZpdCount {
+        uint64_t samples = 0;
+        uint32_t open = 0; // queries not read yet
+        bool ended = false, uncounted = false;
+    };
+    static constexpr uint32_t OCCLUSION_QUERIES = 4096; // a slot's
+    uint64_t zpd_current_ = 0;                          // the report draws count for (0: none)
+    uint32_t zpd_active_ = UINT32_MAX;                  // the query open in the render pass
+    std::map<uint64_t, ZpdCount> zpd_counts_;
+    std::vector<std::pair<uint64_t, uint64_t>> zpd_resolved_; // for zpd_poll
+    void zpd_answer(uint64_t handle, ZpdCount &count) {
+        report_.zpd_reports++;
+        zpd_resolved_.emplace_back(handle, count.uncounted ? std::max<uint64_t>(count.samples, 1) : count.samples);
+        zpd_counts_.erase(handle);
+    }
+    void end_query() {
+        if (zpd_active_ == UINT32_MAX) return;
+        vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
+        zpd_active_ = UINT32_MAX;
+    }
+    void zpd_report_ended(uint64_t ended, uint64_t next) {
+        end_query();
+        if (ended) {
+            ZpdCount &count = zpd_counts_[ended];
+            count.ended = true;
+            if (!count.open) zpd_answer(ended, count);
+        }
+        zpd_current_ = next;
+    }
+    // before a draw that rasterizes, in its render pass: the query its report counts it with
+    void zpd_draw(VkCommandBuffer c) {
+        if (!zpd_current_ || zpd_active_ != UINT32_MAX) return;
+        Slot &s = slots_[current_];
+        if (!s.occlusion || s.occlusion_reports.size() >= OCCLUSION_QUERIES) {
+            zpd_counts_[zpd_current_].uncounted = true;
+            return;
+        }
+        zpd_active_ = uint32_t(s.occlusion_reports.size());
+        s.occlusion_reports.push_back(zpd_current_);
+        s.occlusion_used = uint32_t(s.occlusion_reports.size());
+        zpd_counts_[zpd_current_].open++;
+        report_.occlusion_queries++;
+        vkCmdBeginQuery(c, s.occlusion, zpd_active_, d_.precise_occlusion() ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+    }
+    // the slot's submission is done: its queries' samples to their reports
+    void zpd_collect(Slot &s) {
+        if (s.occlusion_reports.empty()) return;
+        std::vector<uint64_t> samples(s.occlusion_reports.size());
+        vkGetQueryPoolResults(dev_, s.occlusion, 0, uint32_t(samples.size()), samples.size() * 8, samples.data(), 8,
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        for (size_t i = 0; i < samples.size(); i++) {
+            auto it = zpd_counts_.find(s.occlusion_reports[i]);
+            if (it == zpd_counts_.end()) continue;
+            it->second.samples += samples[i];
+            if (--it->second.open == 0 && it->second.ended) zpd_answer(it->first, it->second);
+        }
+        s.occlusion_reports.clear();
     }
     // for a transfer, compute or clear: no render pass, what came before done
     VkCommandBuffer outside() {
@@ -880,7 +1125,7 @@ private:
     std::map<std::array<uint32_t, 6>, std::unique_ptr<Texture>> textures_;
     std::unordered_set<Texture *> pending_textures_;
     std::map<std::array<uint32_t, 8>, std::pair<VkSampler, uint32_t>> samplers_;
-    std::map<std::vector<uint32_t>, VkPipeline> pipelines_;
+    std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> pipelines_;
     std::map<std::tuple<VkFormat, uint32_t, uint32_t>, vk::Image> msaa_temps_; // resolves' single-sample copies
 
     // submissions
@@ -953,6 +1198,7 @@ private:
 
 Impl::~Impl() {
     vkDeviceWaitIdle(dev_);
+    pipeline_workers_.reset(); // before the shader modules and the cache they use
     save_pipeline_cache();
     if (pipeline_cache_) vkDestroyPipelineCache(dev_, pipeline_cache_, nullptr);
     for (Slot &s : slots_) {
@@ -960,11 +1206,13 @@ Impl::~Impl() {
         for (vk::Buffer &b : s.readbacks) d_.destroy(b);
         if (s.fence) vkDestroyFence(dev_, s.fence, nullptr);
         if (s.queries) vkDestroyQueryPool(dev_, s.queries, nullptr);
+        if (s.occlusion) vkDestroyQueryPool(dev_, s.occlusion, nullptr);
     }
     if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
     for (auto &[k, s] : shaders_)
         if (s->module) vkDestroyShaderModule(dev_, s->module, nullptr);
-    for (auto &[k, p] : pipelines_) vkDestroyPipeline(dev_, p, nullptr);
+    for (auto &[k, p] : pipelines_)
+        if (p->pipeline) vkDestroyPipeline(dev_, p->pipeline, nullptr);
     for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.first, nullptr);
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
     for (auto &[k, t] : targets_) d_.destroy(t->image);
@@ -1074,6 +1322,14 @@ void Impl::save_pipeline_cache() {
 
 bool Impl::init(std::string &error) {
     open_pipeline_cache();
+    if (options_.async_pipelines) {
+        // Xenia's d3d12_pipeline_creation_threads: -1 three quarters of the
+        // logical cores, else as many as asked up to their number
+        uint32_t cores = std::max(std::thread::hardware_concurrency(), 1u);
+        uint32_t threads = options_.pipeline_threads < 0 ? std::max(cores * 3 / 4, 1u)
+                                                        : std::min(uint32_t(options_.pipeline_threads), cores);
+        if (threads) pipeline_workers_ = std::make_unique<PipelineWorkers>(dev_, pipeline_cache_, threads);
+    }
     VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
     VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props.pNext = &p12;
@@ -1225,9 +1481,11 @@ bool Impl::init(std::string &error) {
         }
     }
 
-    rectangle_gs_ = module(RECTANGLE_LIST_GS, sizeof(RECTANGLE_LIST_GS));
-    point_gs_ = module(POINT_LIST_GS, sizeof(POINT_LIST_GS));
-    if (!rectangle_gs_ || !point_gs_) return error = "could not make the geometry shaders", false;
+    if (d_.geometry_shader()) {
+        rectangle_gs_ = module(RECTANGLE_LIST_GS, sizeof(RECTANGLE_LIST_GS));
+        point_gs_ = module(POINT_LIST_GS, sizeof(POINT_LIST_GS));
+        if (!rectangle_gs_ || !point_gs_) return error = "could not make the geometry shaders", false;
+    }
 
     // EDRAM: the buffer, store (compute) and load (draw) pipelines; the tile
     // masks come from the arena
@@ -1414,6 +1672,16 @@ VkCommandBuffer Impl::cmd() {
             s.marks.clear();
             gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
         }
+        // the occlusion queries' pool, reset where its last submission used it
+        if (!s.occlusion) {
+            VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            info.queryType = VK_QUERY_TYPE_OCCLUSION;
+            info.queryCount = OCCLUSION_QUERIES;
+            if (vkCreateQueryPool(dev_, &info, nullptr, &s.occlusion) != VK_SUCCESS) s.occlusion = VK_NULL_HANDLE;
+            s.occlusion_used = OCCLUSION_QUERIES;
+        }
+        if (s.occlusion && s.occlusion_used) vkCmdResetQueryPool(s.cmd, s.occlusion, 0, s.occlusion_used);
+        s.occlusion_used = 0;
     }
     return s.cmd;
 }
@@ -1525,6 +1793,7 @@ bool Impl::finish_oldest(bool wait) {
 // copied into guest memory.
 void Impl::finish(Slot &s) {
     gpu_collect(s);
+    zpd_collect(s);
     for (auto &f : s.after) f();
     s.after.clear();
     finish_writebacks(s.serial);
@@ -2747,17 +3016,35 @@ bool Impl::gpu_load(Texture &t, const texture::Plan &plan, bool fresh) {
 
 // ---- pipelines ----
 
-VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info) {
+VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info, bool async,
+                          bool &pending) {
+    pending = false;
+    async = async && pipeline_workers_;
     auto it = pipelines_.find(key);
-    if (it != pipelines_.end()) return it->second;
+    if (it != pipelines_.end()) {
+        PipelineEntry &e = *it->second;
+        if (e.state.load(std::memory_order_acquire)) return e.pipeline;
+        // being made on a worker: waited for, unless the draw may go without it
+        if (async) return pending = true, VK_NULL_HANDLE;
+        Timer timer(report_.pipeline_seconds);
+        pipeline_workers_->wait(&e);
+        return e.pipeline;
+    }
+    PipelineEntry &e = *(pipelines_[key] = std::make_unique<PipelineEntry>());
+    report_.pipelines++;
+    last_pipeline_swap_ = report_.swaps;
+    if (async) {
+        pipeline_workers_->queue(&e, std::make_unique<PipelineDesc>(info));
+        return pending = true, VK_NULL_HANDLE;
+    }
     VkPipeline p = VK_NULL_HANDLE;
     {
         Timer timer(report_.pipeline_seconds);
         if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
     }
-    report_.pipelines++;
-    last_pipeline_swap_ = report_.swaps;
-    return pipelines_[key] = p;
+    e.pipeline = p;
+    e.state.store(1, std::memory_order_release);
+    return p;
 }
 
 // ---- a draw ----
@@ -3014,7 +3301,23 @@ void Impl::draw(const gpu::Draw &d) {
             return;
         }
     }
+    if ((regs_[r::VGT_OUTPUT_PATH_CNTL] & 3) == 1) {
+        // VGT_OUTPUT_PATH_CNTL's path_select: the tessellator, whose vertex
+        // shader runs as a domain shader on the patches' points (Xenia's
+        // HostVertexShaderType domain types); primitive types 16 to 18 are
+        // then line, triangle and quad patches. Not done: the hull and domain
+        // stages are not ported.
+        static const char *const modes[] = {"discrete", "continuous", "adaptive", "mode 3"};
+        static const char *const patches[] = {"line patch", "triangle patch", "quad patch"};
+        const char *kind = primitive >= 16 && primitive <= 18 ? patches[primitive - 16] : primitive_name(primitive);
+        return skip(std::string("tessellation: ") + modes[regs_[r::VGT_HOS_CNTL] & 3] + " " + kind);
+    }
     bool rectangles = primitive == 8, points = primitive == 1;
+    // rectangle and point lists are expanded by geometry shaders, which the
+    // device may lack (the vertex shader expansion Xenia's D3D12 backend does
+    // is not here yet)
+    if ((rectangles || points) && !d_.geometry_shader())
+        return skip(std::string(primitive_name(primitive)) + " without geometry shaders");
     // triangles, quads and polygons (draw_util.h's IsPrimitivePolygonal): faces,
     // culling, the front and back polygon offsets
     bool polygonal = (primitive >= 4 && primitive <= 7) || (primitive >= 13 && primitive <= 15);
@@ -3026,9 +3329,22 @@ void Impl::draw(const gpu::Draw &d) {
     case 4: case 8: case 13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
     case 5: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
     case 6: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+    // Line loops as strips closed by their first index (Xenia's
+    // LineLoopToStrip). Quad strips and polygons, which Xenia does not draw,
+    // are OpenGL's (Mesa's r600 and freedreno's a2xx give GL_QUAD_STRIP and
+    // GL_POLYGON to these primitive types): a quad strip covers what the
+    // triangle strip of its vertices covers, a whole number of quads, and a
+    // convex polygon what the fan of its vertices does.
+    case 12: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+    case 14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+    case 15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+    // Not drawn, as Xenia's primitive processor does not: the triangle list
+    // with wireframe flags (7), whose flags' place no reference gives, and
+    // the 2D engine's copy and fill rectangles and strips (16 to 22).
     default: return skip(std::string("primitive ") + primitive_name(primitive));
     }
-    bool strip = primitive == 3 || primitive == 5 || primitive == 6;
+    // the types the reset index cuts (Xenia's ProcessIndexBuffer list)
+    bool strip = primitive == 3 || primitive == 5 || primitive == 6 || (primitive >= 12 && primitive != 13);
 
     // shaders
     Shader *vs = have_vertex_ ? shader(vertex_hash_) : nullptr;
@@ -3164,6 +3480,29 @@ void Impl::draw(const gpu::Draw &d) {
             for (uint32_t k : {0, 1, 2, 0, 2, 3}) triangles.push_back(indices[q + k]);
         indices = std::move(triangles);
         if (indices.empty()) return;
+    } else if (primitive == 12 || primitive == 14 || primitive == 15) {
+        // each primitive between reset indices on its own: a line loop closed
+        // by its first index (2 vertices give two lines, 1 nothing: Xenia's
+        // GetLineLoopStripIndexCount); a quad strip's whole quads; a polygon
+        // of at least a triangle
+        std::vector<uint32_t> converted;
+        converted.reserve(indices.size() + indices.size() / 2 + 1);
+        for (size_t first = 0; first < indices.size();) {
+            size_t end = first;
+            while (end < indices.size() && indices[end] != UINT32_MAX) end++;
+            size_t n = end - first;
+            if (primitive == 14) n = n >= 4 ? n & ~size_t(1) : 0;
+            if (primitive == 15 && n < 3) n = 0;
+            if (primitive == 12 && n < 2) n = 0;
+            if (n) {
+                if (!converted.empty()) converted.push_back(UINT32_MAX);
+                converted.insert(converted.end(), indices.begin() + first, indices.begin() + first + n);
+                if (primitive == 12) converted.push_back(indices[first]);
+            }
+            first = end + 1;
+        }
+        indices = std::move(converted);
+        if (indices.empty()) return;
     }
 
     // constants
@@ -3265,10 +3604,20 @@ void Impl::draw(const gpu::Draw &d) {
     // the pipeline
     VkFormat color_formats[4] = {};
     VkPipelineColorBlendAttachmentState blends[4] = {};
+    // The key: what the pipeline cannot take at the draw. Vulkan 1.3's
+    // extended dynamic state (1 and 2, core) gives the draw the topology
+    // within its class (points, lines, triangles), primitive restart,
+    // culling, the front face, the depth and stencil tests and ops and the
+    // depth bias's enable, so those make no pipelines (Xenia's Vulkan backend
+    // keys them all: vulkan_pipeline_cache.cc, a TODO in its command
+    // processor).
+    uint32_t topology_class = topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0
+                              : topology <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 1
+                                                                              : 2;
     std::vector<uint32_t> key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32),
                                  ps ? uint32_t(pixel_hash_) : 0, ps ? uint32_t(pixel_hash_ >> 32) : 0,
-                                 uint32_t(topology), rectangles, restart, msaa, depth ? depth->image.format : 0u,
-                                 depth_control, regs_[r::PA_SU_SC_MODE_CNTL] & 7, regs_[r::PA_CL_CLIP_CNTL] & (1u << 16)};
+                                 topology_class, rectangles, msaa, depth ? depth->image.format : 0u,
+                                 regs_[r::PA_CL_CLIP_CNTL] & (1u << 16)};
     for (uint32_t i = 0; i < 4; i++) {
         if (!colors[i]) continue;
         color_formats[i] = colors[i]->image.format;
@@ -3334,12 +3683,17 @@ void Impl::draw(const gpu::Draw &d) {
     VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blend_state.attachmentCount = 4;
     blend_state.pAttachments = blends;
-    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                             VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                             VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-                                             VK_DYNAMIC_STATE_DEPTH_BIAS};
+    const VkDynamicState dynamic_states[] = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,
+        // extended dynamic state 1 and 2 (Vulkan 1.3), set at each draw
+        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 7;
+    dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states));
     dynamic.pDynamicStates = dynamic_states;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 4;
@@ -3374,7 +3728,11 @@ void Impl::draw(const gpu::Draw &d) {
         info.pDynamicState = nullptr;
         rendering.colorAttachmentCount = 0;
     }
-    VkPipeline pipe = pipeline(key, info);
+    // made on a worker while the draw goes without it when there is a pixel
+    // shader (Xenia's D3D12 pipeline cache: draws without one get theirs at once)
+    bool pending = false;
+    VkPipeline pipe = pipeline(key, info, options_.async_pipelines && ps, pending);
+    if (pending) return skip("pipeline not ready (being made)");
     if (!pipe) return skip("vkCreateGraphicsPipelines failed");
 
     // the vertex data: the ranges of the vertex fetch constants the shaders
@@ -3512,6 +3870,19 @@ void Impl::draw(const gpu::Draw &d) {
     vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 8) & 0xFF);
     vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, (stencil >> 16) & 0xFF);
     vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 16) & 0xFF);
+    // the extended dynamic state, as the pipeline's description has it
+    vkCmdSetPrimitiveTopology(c, topology);
+    vkCmdSetPrimitiveRestartEnable(c, restart);
+    vkCmdSetCullMode(c, raster.cullMode);
+    vkCmdSetFrontFace(c, raster.frontFace);
+    vkCmdSetDepthTestEnable(c, depth_state.depthTestEnable);
+    vkCmdSetDepthWriteEnable(c, depth_state.depthWriteEnable);
+    vkCmdSetDepthCompareOp(c, depth_state.depthCompareOp);
+    vkCmdSetStencilTestEnable(c, depth_state.stencilTestEnable);
+    const VkStencilOpState &front = depth_state.front, &back = depth_state.back;
+    vkCmdSetStencilOp(c, VK_STENCIL_FACE_FRONT_BIT, front.failOp, front.passOp, front.depthFailOp, front.compareOp);
+    vkCmdSetStencilOp(c, VK_STENCIL_FACE_BACK_BIT, back.failOp, back.passOp, back.depthFailOp, back.compareOp);
+    vkCmdSetDepthBiasEnable(c, raster.depthBiasEnable);
     {
         // the polygon offset as Xenia's Vulkan backend sets it
         // (draw_util.cc's GetPreferredFacePolygonOffset, then the guest's
@@ -3543,6 +3914,7 @@ void Impl::draw(const gpu::Draw &d) {
                       (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull);
         gpu_mark(kind);
     }
+    zpd_draw(c);
     vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
     if (options_.gpu_timing_draws) gpu_mark("draws: between draws");
     report_.drawn++;
@@ -3808,6 +4180,10 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
 // the hook submits on the device's queue after the flush comes after them,
 // and before the renderer's next work.
 void Impl::swap() {
+    // the draws after a swap count for no report until the next one
+    // (Xenia's EndZPDFrame)
+    end_query();
+    zpd_current_ = 0;
     uint64_t number = report_.swaps++;
     const bool read = options_.frame_wanted && options_.frame_wanted(number);
     texture::Info info;

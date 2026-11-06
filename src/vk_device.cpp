@@ -108,7 +108,12 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     v12.timelineSemaphore = VK_TRUE;
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &v12;
-    features.features.geometryShader = VK_TRUE;
+    // optional: geometry shaders (rectangle and point lists; without them
+    // those draws are skipped and counted). XF_VK_NO_GEOMETRY_SHADER=1 turns
+    // them off where the device has them, to check the path without.
+    const char *no_gs = std::getenv("XF_VK_NO_GEOMETRY_SHADER");
+    if (has.features.geometryShader && !(no_gs && no_gs[0] && no_gs[0] != '0'))
+        features.features.geometryShader = d->geometry_shader_ = true;
     features.features.depthClamp = VK_TRUE;
     features.features.sampleRateShading = VK_TRUE;
     features.features.independentBlend = VK_TRUE;
@@ -124,6 +129,8 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         d->max_anisotropy_ = props.limits.maxSamplerAnisotropy;
     }
     if (has12.samplerMirrorClampToEdge) v12.samplerMirrorClampToEdge = d->mirror_clamp_to_edge_ = true;
+    // optional: occlusion queries counting samples (the guest's are counts)
+    if (has.features.occlusionQueryPrecise) features.features.occlusionQueryPrecise = d->precise_occlusion_ = true;
     // the renderer's queue, and with a window a second one to present on
     // where the family has it
     const float priorities[2] = {1.0f, 1.0f};

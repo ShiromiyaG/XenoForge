@@ -49,6 +49,7 @@ struct Report {
     uint64_t resolves = 0, swaps = 0; // draws in copy mode; XE_SWAP packets
     uint64_t frames = 0;              // front buffers read back (the swaps asked for)
     uint64_t render_targets = 0, textures = 0, pipelines = 0, shaders = 0;
+    uint64_t occlusion_queries = 0, zpd_reports = 0; // host queries begun, reports answered with their counts
     double seconds = 0;                          // spent in the renderer's calls, of which:
     double submit_seconds = 0;                   //   submitting work and waiting for the GPU, of which:
     double wait_seconds = 0;                     //     waiting for the GPU to finish work
@@ -121,6 +122,20 @@ struct Options {
     // written once new pipelines have settled (300 swaps without one) and at
     // drain(). Empty: a cache in memory only.
     std::filesystem::path pipeline_cache;
+    // Graphics pipelines made off the renderer's thread, as Xenia's pipeline
+    // creation threads with its async_shader_compilation (on by default
+    // there; its trace dump turns it off): a draw whose pipeline is not made
+    // yet queues it for worker threads and is skipped meanwhile, counted as
+    // "pipeline not ready (being made)". Off: each pipeline is made when its
+    // first draw needs it, on the renderer's thread, as a replay must.
+    // Pipelines of draws without a pixel shader are made at once either way
+    // (Xenia's too: they are quick). The threads: -1 three quarters of the
+    // logical cores (Xenia's d3d12_pipeline_creation_threads default).
+    bool async_pipelines = false;
+    int pipeline_threads = -1;
+    // what replay() has its processor write in occlusion query reports
+    // (live, the caller sets its processor's: tools/game.cpp)
+    gpu::OcclusionQueries occlusion_queries = gpu::OcclusionQueries::Fake;
     // GPU timestamps around each kind of work (draws by render pass, EDRAM
     // loads and stores, resolves, texture loads, the swap's read-back), summed
     // into Report::gpu_time as submissions finish

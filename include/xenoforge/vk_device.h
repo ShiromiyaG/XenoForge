@@ -70,6 +70,10 @@ public:
     // clamp to edge address mode, enabled when the device has them
     float max_anisotropy() const { return max_anisotropy_; }
     bool mirror_clamp_to_edge() const { return mirror_clamp_to_edge_; }
+    // occlusion queries that count samples (otherwise only zero or not)
+    bool precise_occlusion() const { return precise_occlusion_; }
+    // geometry shaders (not on many mobile GPUs)
+    bool geometry_shader() const { return geometry_shader_; }
 
     // host-visible and coherent (mapped), or device-local; host_reads: the
     // host reads it back, so cached memory where the device has it
@@ -106,6 +110,8 @@ private:
     bool stencil_export_ = false;
     float max_anisotropy_ = 0.0f;
     bool mirror_clamp_to_edge_ = false;
+    bool precise_occlusion_ = false;
+    bool geometry_shader_ = false;
     std::mutex queue_mutex_;
 };
 

@@ -29,7 +29,10 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <span>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace xf::gpu {
@@ -116,6 +119,28 @@ public:
     virtual void draw(const RegisterFile &, const Draw &) {}
     virtual void resolve(const RegisterFile &, const Draw &) {}
     virtual void swap(const RegisterFile &, const Swap &) {}
+    // Occlusion queries with real counts (OcclusionQueries::Fast). Whether
+    // the sink counts the samples its draws pass; if not, the processor
+    // writes its fake reports.
+    virtual bool counts_samples() { return false; }
+    // An EVENT_WRITE_ZPD: the draws since the last one counted for report
+    // `ended` (0: none were counted), the draws from here count for `next`.
+    // Each report ended is answered once, through zpd_poll.
+    virtual void zpd_report(uint64_t /*ended*/, uint64_t /*next*/) {}
+    // The samples of the reports whose counts are in since the last poll.
+    virtual void zpd_poll(std::vector<std::pair<uint64_t, uint64_t>> & /*resolved*/) {}
+};
+
+// What EVENT_WRITE_ZPD's occlusion query reports hold (Xenia's
+// occlusion_query option).
+enum class OcclusionQueries {
+    // a made-up count, running down from 100 to 80 and around (Xenia's
+    // "fake"): what the processor writes with no sink counting samples
+    Fake,
+    // the sink's counts of the samples draws pass, the report written at
+    // once with a guess (the last count at that address, or one sample) and
+    // again when the counts are in (Xenia's "fast", its default)
+    Fast,
 };
 
 // What the command processor counts, read from any thread.
@@ -210,6 +235,9 @@ public:
     uint64_t gamma_ramp_version() const { return gamma_version_; }
     // the component (0 red, 1 green, 2 blue) the next sequential write goes to
     uint32_t gamma_ramp_rw_component() const { return gamma_component_; }
+    // What occlusion query reports hold; set before the processor runs.
+    void set_occlusion_queries(OcclusionQueries mode) { occlusion_ = mode; }
+    OcclusionQueries occlusion_queries() const { return occlusion_; }
 
 private:
     // a buffer being read: a ring (the primary buffer) or a straight run (an
@@ -279,6 +307,26 @@ private:
     // 100 to 80 and around, added to a free-running counter
     uint32_t fake_zpd_samples_ = 0;
     uint64_t zpd_counter_ = 0;
+    // With real counts (OcclusionQueries::Fast, Xenia's CommandProcessor
+    // ZPD state): the reports written with a guess and waiting for their
+    // counts, in order; the draws now counting for zpd_current_
+    struct ZpdReport {
+        uint32_t address = 0;
+        uint64_t handle = 0;
+        uint64_t delta = 0;             // the samples its draws passed, once in
+        bool pending = true;            // its counts not in yet
+        uint64_t speculative_value = 0; // the counter the guess wrote
+        uint64_t speculative_delta = 0;
+    };
+    OcclusionQueries occlusion_ = OcclusionQueries::Fake;
+    std::deque<ZpdReport> zpd_reports_;
+    uint64_t zpd_current_ = 0, zpd_next_ = 1;
+    uint64_t zpd_speculative_counter_ = 0;
+    std::unordered_map<uint32_t, uint64_t> zpd_cached_deltas_; // the last count of each report address
+    void write_zpd(uint32_t address, uint64_t z_pass);
+    void queue_zpd(uint32_t address);
+    void poll_zpd();
+    void retire_zpd();
 
     std::array<uint32_t, 256> gamma_table_{};
     std::array<uint32_t, 128 * 3> gamma_pwl_{};

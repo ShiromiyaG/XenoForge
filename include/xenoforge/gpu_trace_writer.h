@@ -98,6 +98,14 @@ public:
     void draw(const RegisterFile &registers, const Draw &draw) override;
     void resolve(const RegisterFile &registers, const Draw &draw) override;
     void swap(const RegisterFile &registers, const Swap &swap) override;
+    // occlusion queries: the backend's (counts_samples false without one)
+    bool counts_samples() override { return next_ && next_->counts_samples(); }
+    void zpd_report(uint64_t ended, uint64_t next) override {
+        if (next_) next_->zpd_report(ended, next);
+    }
+    void zpd_poll(std::vector<std::pair<uint64_t, uint64_t>> &resolved) override {
+        if (next_) next_->zpd_poll(resolved);
+    }
 
     // MemoryTrace: what the backend read and what the GPU wrote
     void read(uint32_t address, uint32_t bytes) override;

@@ -299,6 +299,9 @@ int main(int argc, char **argv) {
     options.on_swap = [&](const render::FrontBuffer &front) { presenter.take(front); };
     // the driver's compiled pipelines kept between runs, beside the settings
     options.pipeline_cache = config_file.parent_path() / "cache" / (std::string(title_id) + ".vkpipelines");
+    // new pipelines made on worker threads, their draws skipped meanwhile, as
+    // Xenia plays (boot and the replays wait for each, as its trace dump does)
+    options.async_pipelines = true;
     options.frame_wanted = [&](uint64_t swap) {
         if (!shot_wanted(swap)) return false;
         presenter.capture_next(); // this swap's picture, taken after this
