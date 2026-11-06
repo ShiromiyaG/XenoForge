@@ -608,15 +608,15 @@ with these confirmed by a person:
 
 The keyboard is not confirmed yet.
 
-**Under way, in parallel:**
-- the kernel completed by inventory, in four families:
-  - xboxkrnl and xbdm;
-  - XAM users, profiles, locale and the Win32 re-exports;
-  - XAM content, loader, dash, avatars, Kinect and tiles;
-  - XAM UI and the network;
+**Done on 2026-11-06:**
+- the kernel completed by inventory: every export Xenia has is in
+  ("Everything left", the kernel);
+- a first launcher (C2): its logic in LauncherCore, the view Dear ImGui
+  until the RmlUi one.
+
+**Under way:**
 - the GPU's cost in 3D scenes (the owner's RTX 5060 runs at 100% there);
 - memexport (El Chavo Kart's kart is black in races);
-- the launcher (C2);
 - the recompiler's leftovers (`lswx`/`stswx`, Forza Horizon's table,
   precision).
 
@@ -737,93 +737,44 @@ times and BC2 16.
 
 ### The kernel and the system (A4, A6)
 
-**Exports, against Xenia.** Xenia's counts include its stubs; the appendix
-below names every missing export.
+**Exports: every one Xenia has is in (2026-11-06).** The kernel was ported
+by inventory, a whole family at a time. As of that date, set against
+Xenia's exports:
 
 | | the export table | Xenia implements | XenoForge implements | Xenia's, missing here |
 | --- | --- | --- | --- | --- |
-| xboxkrnl | 922 | 310 | 287 | 46 |
-| xam | 1,741 | 382 | 135 | 247 |
-| xbdm | 255 | 38 | 0 | 36 |
+| xboxkrnl | 922 | 310 | 333 | 0 |
+| xam | 1,741 | 382 | 386 | 0 |
+| xbdm | 255 | 38 | 37 | 0 |
 
-Exports that neither implements wait until a game asks for them.
+Xenia's counts include its stubs, and XenoForge's include exports Xenia
+lacks.
 
-**The XAM families missing:**
-- **Win32 re-exports:** `CreateThread`, `Sleep`, `WaitForSingleObject`,
-  `GetTickCount`, `CloseHandle`, `GetLastError` and the like, which XAM
-  exports for titles.
-- **Profiles and accounts:**
-  - `XamProfile*`;
-  - `XamUserGet*`: gamertag, membership tier, flags, tenure, online
-    country and language;
-  - `XamUserLogon*`, content restrictions, user preferences, guests.
-  Today there is one profile. Several profiles signed in at once is
-  local multiplayer.
-- **Locale and strings:**
-  - `XamGetLocale*`, `XamGetLanguage*`, `XamGetCountry*`,
-    `XamGetOnline*`;
-  - `XamFormatDateString` and `XamFormatTimeString`;
-  - `XamReadString`, `XamLookupCommonStringByIndex`, `XTLGetLanguageV2`.
-- **The system's UI:**
-  - `XamShow*`: sign-in, profile creation and editing, gamercard,
-    marketplace, upgrades, and the Kinect ones;
-  - an overlay in the player for what these dialogs show. GoW3 and Reach
-    already call some of them.
-- **Content:**
-  - the device enumerator, device names and volume paths;
-  - thumbnails, opening and resolving files, change callbacks;
-  - launching images, and the `Internal` variants.
-- **Avatars:** `XamAvatar*` (24 exports).
-- **Kinect (NUI):** `XamNui*`, `XamUserNui*`, `XamShowNui*`, the camera,
-  `XamIsNatal*` (about 35 exports).
-- **Tiles:** `XamReadTile*`, `XamReadTileToTexture`, `XamWriteGamerTile`,
-  `XamParseGamerTileKey`.
-- **Loading and launching:**
-  - `XamLoaderGetMediaInfo*`, the tray state, launch request callbacks;
-  - `XamSwapDisc`, for games on several discs;
-  - `XamContentLaunchImage*`, plus xboxkrnl's `XexLoadExecutable` and
-    `XexLoadImageFromMemory`.
-- **The dashboard and system queries:**
-  - the dash context, system title IDs, system update versions;
-  - DVR storage, feature flags, the Live hive, IPTV, XAuth, network
-    storage;
-  - `XNotifyBroadcast` and `XNotifyQueueUI`.
-- **The network beyond what came in on 2026-11-05:**
-  - asynchronous Winsock (`WSARecv`, `WSASend`, `WSARecvFrom`,
-    `WSASendTo`, overlapped results, `WSAEventSelect`; Forza Horizon and
-    BC2 import them);
-  - `XHttp*`, `XNetStartupEx`, `XNetInAddrToString`.
-  Host sockets for system link (LAN play) would be an option, off by
-  default.
-- **Input beyond the pad:**
-  - `XamInputNonController*`, raw input;
-  - the other XInput device subtypes: guitar, drums, wheel, dance pad,
-    arcade stick, big button;
-  - the chatpad, and Kinect.
-
-**The xboxkrnl families missing:**
-- **Locks and settings:** `Ex*` read-write locks; writing `XConfig`
-  settings.
-- **Kernel primitives:**
-  - `KeInitializeEvent`, `KeInitializeTimerEx`, `KePulseEvent`;
-  - `KeRemoveQueueApc` and `KeRemoveQueueDpc`;
-  - `KeSetPriorityThread`, `KeSuspendThread`, `KfRaiseIrql`.
-- **Objects:**
-  - `NtQueueApcThread`, `NtQueryEvent`, the symbolic link calls;
-  - `ObCreateObject`, `ObLookupThreadByThreadId`, `ObOpenObjectByName`,
-    `ObReferenceObjectByName`.
-- **Hardware:**
-  - `Hal*`: the tray, SMC messages, the AV pack;
-  - `HidReadKeys`;
-  - `Vd*`: the GPU's ASIC ID and the real video mode;
-  - `XUsbcam*`: the camera.
-- **Runtime helpers:**
-  - `Rtl*`: CRC-32, stack limits, image headers;
-  - the wide `printf` family;
-  - `FscGetCacheElementCount`, `InterlockedPushEntrySList`.
-
-**XBDM, the dev kit's debug monitor:** `Dm*` and the CAP profiler hooks.
-Retail games rarely call it.
+**Still to do in the kernel:**
+- **What Xenia lacks too:**
+  - the XamShow*UI dialogs Xenia does not implement (friends, messages,
+    quick chat, player review, players, message compose, game invite,
+    friend request, gamer card for a XUID, custom message and player
+    lists): GoW3 and Reach import them;
+  - `XamVoiceSetMicArrayIdleUsers` (GoW3 looks it up);
+  - `WSAEnumNetworkEvents`;
+  - the fourth (flags) argument of WSA completion routines.
+- **The rest of the export tables,** which neither implements: counted, and
+  done when a game asks.
+- **The player's overlay for the system's dialogs.** `present` and
+  `present_async` in `xam_ui.cpp` are where it plugs in. It would draw the
+  message box, keyboard and sign-in that are now answered headless.
+- **State that is now kept for the run only:**
+  - profiles made by XamProfileCreate, avatars' manifests, titles played
+    and GPDs;
+  - settings a title writes with ExSetXConfigSetting;
+  - title names and gamer pictures (from SPA data) that are never read.
+- **Games, as they ask:**
+  - Reach stops presenting after about 2,600 swaps (its main thread waits
+    at lr 0x820CCFA8);
+  - BC2 from `Game.xex` ends its main thread at once;
+  - Forza Horizon's first unimplemented call is `xam!XamNuiGetDeviceStatus`
+    (now in; to check).
 
 **Beyond the exports:**
 - **Packages.** Read STFS and SVOD: DLC, title updates, XBLA and Games on
@@ -935,129 +886,12 @@ Retail games rarely call it.
 - the color target formats: all 12;
 - both depth formats.
 
-### Appendix: Xenia's exports missing here (2026-11-05)
+### Appendix: Xenia's exports missing here
 
-xboxkrnl (46): ExAcquireReadWriteLockExclusive,
-ExAcquireReadWriteLockShared, ExInitializeReadWriteLock,
-ExReadModifyWriteXConfigSettingUlong, ExReleaseReadWriteLock,
-ExSetXConfigSetting, ExTryToAcquireReadWriteLockExclusive,
-ExTryToAcquireReadWriteLockShared, FscGetCacheElementCount,
-HalGetCurrentAVPack, HalOpenCloseODDTray, HalSendSMCMessage, HidReadKeys,
-InterlockedPushEntrySList, KeInitializeEvent, KeInitializeTimerEx,
-KePulseEvent, KeRemoveQueueApc, KeRemoveQueueDpc, KeSetPriorityThread,
-KeSuspendThread, KfRaiseIrql, NtOpenSymbolicLinkObject, NtQueryEvent,
-NtQuerySymbolicLinkObject, NtQueueApcThread, ObCreateObject,
-ObLookupThreadByThreadId, ObOpenObjectByName, ObReferenceObjectByName,
-RtlComputeCrc32, RtlGetStackLimits, RtlImageDirectoryEntryToData,
-RtlImageNtHeader, RtlRip, VdGetGraphicsAsicID, VdQueryRealVideoMode,
-XUsbcamCreate, XUsbcamGetState, XexLoadExecutable, XexLoadImageFromMemory,
-_snwprintf, _vscwprintf, _vsnwprintf, swprintf, vswprintf.
-
-xam (247): CloseHandle, CreateThread, EnumerateMediaObjects,
-EnumerateMediaObjects_, EnumerateMediaObjects_0, EnumerateMediaObjects_1,
-ExitThread, GetCurrentThreadId, GetLastError, GetModuleHandleA,
-GetSystemTimeAsFileTime, GetTickCount, NetDll_WSARecvFrom,
-NetDll_WSASendTo, NetDll_WSAStartupEx, NetDll_XHttpOpen,
-NetDll_XHttpStartup, NetDll_XNetGetDebugXnAddr, NetDll_XNetInAddrToString,
-NetDll_XNetStartupEx, QueryPerformanceFrequency, Refresh, ResumeThread,
-RtlGetLastError, RtlRandom, RtlSetLastNTError, RtlSleep, Sleep, SleepEx,
-WaitForSingleObject, WaitForSingleObjectEx, XAutomationpUnbindController,
-XGetAudioFlags, XGetOverlappedExtendedError, XGetVideoCapabilities,
-XNotifyBroadcast, XNotifyQueueUI, XTLGetLanguageV2, XamAllocEx,
-XamAvatarBeginEnumAssets, XamAvatarEndEnumAssets, XamAvatarEnumAssets,
-XamAvatarGenerateMipMaps, XamAvatarGetAssetBinary, XamAvatarGetAssetIcon,
-XamAvatarGetAssets, XamAvatarGetAssetsResultSize,
-XamAvatarGetInstalledAssetPackageDescription, XamAvatarGetInstrumentation,
-XamAvatarGetManifestLocalUser, XamAvatarGetManifestsByXuid,
-XamAvatarGetMetadataRandom, XamAvatarGetMetadataSignedOutProfile,
-XamAvatarGetMetadataSignedOutProfileCount, XamAvatarInitialize,
-XamAvatarLoadAnimation, XamAvatarManifestGetBodyType,
-XamAvatarReinstallAwardedAsset, XamAvatarSetCustomAsset,
-XamAvatarSetManifest, XamAvatarSetMocks, XamAvatarShutdown,
-XamAvatarWearNow, XamBuildGamercardResourceLocator,
-XamBuildLegacySystemResourceLocator, XamBuildResourceLocator,
-XamBuildSharedSystemResourceLocator, XamBuildXamResourceLocator,
-XamContentCreate, XamContentCreateDeviceEnumerator,
-XamContentCreateEnumeratorInternal, XamContentCreateInternal,
-XamContentDeleteInternal, XamContentGetAttributesInternal,
-XamContentGetDeviceName, XamContentGetDeviceVolumePath,
-XamContentGetLocalizedDeviceData, XamContentGetLocalizedString,
-XamContentGetMetaDataInternal, XamContentGetThumbnail,
-XamContentLaunchImage, XamContentLaunchImageFromFileInternal,
-XamContentLaunchImageInternal, XamContentLaunchImageInternalEx,
-XamContentOpenFile, XamContentRegisterChangeCallback, XamContentResolve,
-XamContentResolveInternal, XamContentSetThumbnail,
-XamContentSetThumbnailInternal, XamDoesOmniNeedConfiguration,
-XamFeatureEnabled, XamFirstRunExperienceShouldRun, XamFormatDateString,
-XamFormatTimeString, XamGetActiveDashAppInfo, XamGetCachedTitleName,
-XamGetCountry, XamGetCountryFromOnlineCountry, XamGetCountryString,
-XamGetDashBackstackData, XamGetDashContext, XamGetDvrStorage,
-XamGetLanguage, XamGetLanguageFromOnlineLanguage,
-XamGetLanguageLocaleFallbackString, XamGetLanguageLocaleString,
-XamGetLanguageString, XamGetLanguageTypeface, XamGetLanguageTypefacePatch,
-XamGetLiveHiveValueA, XamGetLiveHiveValueW, XamGetLocale,
-XamGetLocaleDateFormat, XamGetLocaleEx, XamGetLocaleFromOnlineCountry,
-XamGetLocaleString, XamGetOnlineCountryFeatures,
-XamGetOnlineCountryFromLocale, XamGetOnlineCountryString,
-XamGetOnlineLanguageAndCountry, XamGetOnlineLanguageAndCountryString,
-XamGetOnlineLanguageString, XamGetOnlineSchema, XamGetStagingMode,
-XamInputNonControllerGetRaw, XamInputNonControllerGetRawEx,
-XamInputNonControllerSetRaw, XamInputNonControllerSetRawEx,
-XamIptvGetServiceName, XamIsChildAccountSignedIn, XamIsCurrentTitleDash,
-XamIsIptvEnabled, XamIsNatalPlaybackEnabled, XamIsNuiAutomationEnabled,
-XamIsNuiUIActive, XamIsSystemExperienceTitleId, XamIsSystemTitleId,
-XamIsXbox1TitleId, XamLoaderGetDvdTrayState, XamLoaderGetMediaInfo,
-XamLoaderGetMediaInfoEx, XamLoaderRegisterLaunchRequestCallback,
-XamLogLocalizationEtx, XamLookupCommonStringByIndex,
-XamMediaVerificationClose, XamMediaVerificationInject,
-XamNetworkStorageHasUserEnabledStorage, XamNetworkStorageUserHasPrivilege,
-XamNotifyCreateListenerInternal, XamNuiCameraElevationGetAngle,
-XamNuiCameraGetTiltControllerType, XamNuiCameraSetFlags,
-XamNuiCameraTiltGetStatus, XamNuiCameraTiltSetCallback,
-XamNuiGetDepthCalibration, XamNuiGetDeviceStatus,
-XamNuiHudGetEngagedTrackingID, XamNuiHudGetInitializeFlags,
-XamNuiHudGetVersions, XamNuiHudIsEnabled, XamNuiHudSetEngagedTrackingID,
-XamNuiIdentityAbort, XamNuiIdentityEnrollForSignIn,
-XamNuiIdentityGetSessionId, XamNuiIsChatMicEnabled, XamNuiIsDeviceReady,
-XamNuiPlayerEngagementUpdate, XamNuiSkeletonGetBestSkeletonIndex,
-XamParseGamerTileKey, XamProfileClose, XamProfileCreate,
-XamProfileCreateEnumerator, XamProfileEnumerate, XamProfileFindAccount,
-XamProfileGetCreationStatus, XamProfileGetLiveLegalLocale,
-XamProfileLoadAccountInfo, XamProfileOpen, XamQueryLiveHiveA,
-XamQueryLiveHiveW, XamReadString, XamReadTile, XamReadTileEx,
-XamReadTileToTexture, XamSetActiveDashAppInfo, XamSetCountry,
-XamSetDashContext, XamSetDvrStorage, XamShowCreateProfileUI,
-XamShowCreateProfileUIEx, XamShowEditProfileUI, XamShowForcedNameChangeUI,
-XamShowGamerCardUI, XamShowGoldUpgradeUI, XamShowMarketplaceUIEx,
-XamShowMultiplayerUpgradeUI, XamShowNuiDeviceSelectorUI,
-XamShowNuiDirtyDiscErrorUI, XamShowNuiGuideUI, XamShowNuiHardwareRequiredUI,
-XamShowNuiMessageBoxUI, XamShowNuiSigninUI, XamShowNuiTroubleshooterUI,
-XamShowSigninUIEx, XamShowSigninUIp, XamSwapDisc,
-XamUpdateGetBaseSystemVersion, XamUpdateGetCurrentSystemVersion,
-XamUserContentRestrictionCheckAccess, XamUserContentRestrictionGetFlags,
-XamUserContentRestrictionGetRating, XamUserCreateTitlesPlayedEnumerator,
-XamUserGetCachedUserFlags, XamUserGetGamerTag, XamUserGetMembershipTier,
-XamUserGetMembershipTierFromXUID, XamUserGetOnlineCountryFromXUID,
-XamUserGetOnlineLanguageFromXUID, XamUserGetSubscriptionType,
-XamUserGetUserFlags, XamUserGetUserFlagsFromXUID, XamUserGetUserTenure,
-XamUserIsGuest, XamUserIsOnlineEnabled, XamUserIsParentalControlled,
-XamUserIsUnsafeProgrammingAllowed, XamUserLogon, XamUserLogonEx,
-XamUserNuiEnableBiometric, XamUserNuiGetUserIndex,
-XamUserNuiGetUserIndexForBind, XamUserNuiGetUserIndexForSignin,
-XamUserReadProfileSettingsEx, XamUserReadUserPreference,
-XamUserWriteUserPreference, XamVoiceGetMicArrayStatus, XamWriteGamerTile,
-XamXStudioRequest, XampWebInstrumentationSetProfileCounts,
-XampXAuthGetTitleBuffer, XampXAuthShutdown, XampXAuthStartup,
-XapiFormatTimeOut, XapipCreateThread, XapipGetLocale, lstrlenW.
-
-xbdm (36): DmAllocatePool, DmCaptureStackBackTrace, DmCloseLoadedModules,
-DmFindPdbSignature, DmFreePool, DmGetConsoleDebugMemoryStatus,
-DmGetConsoleType, DmGetMemory, DmGetSystemInfo, DmGetThreadInfoEx,
-DmGetThreadList, DmGetXbeInfo, DmGetXboxName, DmIsDebuggerPresent,
-DmIsFastCAPEnabled, DmMapDevkitDrive, DmNotify, DmOpenNotificationSession,
-DmPMCGetCounterName, DmPMCInstallAndStart, DmQueryTitleMemoryStatistics,
-DmRegisterCommandProcessor, DmRegisterCommandProcessorEx, DmResumeThread,
-DmSendNotificationString, DmSetDumpMode, DmSetMemory, DmSetProfilingOptions,
-DmStartProfiling, DmStopProfiling, DmSuspendThread, DmWalkLoadedModules,
-__CAP_End_Profiling, __CAP_Enter_Function, __CAP_Exit_Function,
-__CAP_Start_Profiling.
+None since 2026-11-06. The 46 xboxkrnl, 247 xam and 36 xbdm exports listed
+here on 2026-11-05 were ported in bulk:
+- xboxkrnl and xbdm: bd6eef6;
+- XAM content, loader, dashboard, avatars, Kinect and tiles: 9aacd20;
+- XAM users, profiles, locale and the Win32 re-exports: bd3817b;
+- XAM UI and the network: b75c8fc;
+- XAM's `Refresh`: added with this note.

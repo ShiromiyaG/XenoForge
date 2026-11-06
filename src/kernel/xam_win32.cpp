@@ -250,6 +250,9 @@ XF_EXPORT(xam, RtlRandom) {
     result(c, uint32_t(r));
 }
 
+// (no arguments known): success, as Xenia's stub (xam_info.cc, Refresh)
+XF_EXPORT(xam, Refresh) { result(c, X_ERROR_SUCCESS); }
+
 // (string): its length in characters
 XF_EXPORT(xam, lstrlenW) {
     uint32_t s = arg(k, c, 0);
