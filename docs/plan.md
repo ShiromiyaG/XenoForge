@@ -314,11 +314,13 @@ traces, without a recompiled game.
 - **N1. Native**: the XDK's D3D by signature, widescreen, the UE3 work
   (`../Chaves/docs/native-renderer-re.md`) moved over as El Chavo Kart's port.
 
-Next (2026-11-05, end of the day): M1 is there as a person would see it,
-unconfirmed by one. El Chavo Kart and Ben 10 run generated in the player,
-rendered at their caps (30 and 60 swaps a second, B4), with input and with
-XMA decoded as Xenia decodes it (A6). Waiting on a person at the screen:
-that a pad and the keyboard move things, and that the sound is right.
+Next (2026-11-05, end of the day): M1 is there as a person sees it. El
+Chavo Kart and Ben 10 run generated in the player, rendered at their caps
+(30 and 60 swaps a second, B4), with input and with XMA decoded as Xenia
+decodes it (A6). The owner played El Chavo Kart in the player: a pad moves
+it past the title into the menus, and the sound is right (music and
+effects). They saw small color errors past the menus (under way). The
+keyboard is not confirmed yet.
 
 Then, in order:
 1. Play both games through: what they ask of the kernel and the renderer
