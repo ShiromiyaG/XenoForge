@@ -48,7 +48,13 @@ struct Report {
     uint64_t draws = 0, drawn = 0;    // outside copy mode; of them, done
     uint64_t resolves = 0, swaps = 0; // draws in copy mode; XE_SWAP packets
     uint64_t frames = 0;              // front buffers read back (the swaps asked for)
-    uint64_t render_targets = 0, textures = 0, pipelines = 0, shaders = 0;
+    uint64_t render_targets = 0, textures = 0, pipelines = 0, shaders = 0; // textures: loads
+    // The texture cache: the textures it holds now and the GPU memory their
+    // images take (the most it took), those destroyed by the memory limits
+    // (Options::texture_memory_*) and to make room in a full bindless table,
+    // and the loads refused for want of room there.
+    uint64_t textures_held = 0, texture_bytes = 0, texture_bytes_peak = 0;
+    uint64_t textures_evicted = 0, textures_evicted_for_room = 0, textures_refused = 0;
     uint64_t occlusion_queries = 0, zpd_reports = 0; // host queries begun, reports answered with their counts
     double seconds = 0;                          // spent in the renderer's calls, of which:
     double submit_seconds = 0;                   //   submitting work and waiting for the GPU, of which:
@@ -162,6 +168,16 @@ struct Options {
     // "greater or equal" test passing on a second pass over depth that lost
     // the host's precision)
     bool depth_float24_round = false;
+    // The texture cache's memory limits, in MB of the GPU memory its images
+    // hold, as Xenia's texture_cache_memory_limit_* (its defaults): above the
+    // soft limit, textures unused for soft_lifetime seconds are destroyed,
+    // the least recently used first; above the hard limit, any whose last
+    // use the GPU is done with. render_to_texture is the part of both that
+    // a draw resolution scale would multiply (none here: it adds nothing).
+    uint32_t texture_memory_soft_mb = 384;
+    uint32_t texture_memory_hard_mb = 768;
+    uint32_t texture_memory_soft_lifetime_s = 30;
+    uint32_t texture_memory_render_to_texture_mb = 24;
 };
 
 // A trace writer (gpu_trace_writer.h) stands in front of it as the

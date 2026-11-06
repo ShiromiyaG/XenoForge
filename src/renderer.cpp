@@ -6,9 +6,11 @@
 // requests), the point sizes its UpdateSystemConstantValues, the rows a
 // draw takes over in EDRAM draw_extent_estimator.cc, the tessellated draws
 // and the indices primitive_processor.cc and d3d12/pipeline_cache.cc (the
-// hull shaders by mode and domain), and the swap
-// vulkan/vulkan_texture_cache.cc (RequestSwapTexture); all BSD, see
-// LICENSE-xenia.
+// hull shaders by mode and domain), the swap
+// vulkan/vulkan_texture_cache.cc (RequestSwapTexture), and the textures'
+// lifetime texture_cache.cc (MarkAsUsed, CompletedSubmissionUpdated, the
+// texture_cache_memory_limit_* options) with d3d12/d3d12_texture_cache.cc's
+// descriptors given back with their texture; all BSD, see LICENSE-xenia.
 //
 // Batched (plan B4): what the processor sends is recorded into the command
 // buffer of a submission slot, render passes kept open from draw to draw
@@ -430,11 +432,20 @@ struct Texture {
     vk::Image signed_image;
     VkImageView signed_view = VK_NULL_HANDLE;
     uint32_t signed_index = 0;
-    std::vector<Range> ranges;         // the guest memory it was loaded from
-    uint32_t checked = 0;              // the write count its memory was last known unwritten at (Memory's)
-    uint32_t low = 0, high = 0;        // the ranges' bounds
-    bool stale = false;                // a resolve or a memory export wrote memory under it
-    bool gpu = false;                  // loaded from what the GPU wrote (the mirror's, or read back from it)
+    std::vector<Range> ranges;  // the guest memory it was loaded from
+    uint32_t checked = 0;       // the write count its memory was last known unwritten at (Memory's)
+    uint32_t low = 0, high = 0; // the ranges' bounds
+    bool stale = false;         // a resolve or a memory export wrote memory under it
+    bool gpu = false;           // loaded from what the GPU wrote (the mirror's, or read back from it)
+    // its lifetime (Xenia's TextureCache::Texture): its key in the cache, the
+    // GPU memory its images hold (host_memory_usage), the last submission
+    // that used it and the host's clock then (last_usage_submission_index,
+    // last_usage_time), and its place in the list by last use (used_previous,
+    // used_next)
+    std::array<uint32_t, 6> key{};
+    VkDeviceSize bytes = 0;
+    uint64_t used_serial = 0, used_ms = 0;
+    Texture *older = nullptr, *newer = nullptr;
 };
 
 // the translated shaders' and the geometry shaders' system constants
@@ -928,6 +939,27 @@ private:
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
     VkFormat depth_vk_format(uint32_t format) const;
     Texture *texture(const uint32_t fetch[6], std::string &why);
+    // The texture cache's lifetime (Xenia's texture_cache.cc): textures by
+    // last use, the least recent first; destroyed by the memory limits once
+    // the GPU is done with their last use, their places in the tables given
+    // back then and only then.
+    uint64_t submission_serial() const { return slots_[current_].recording ? slots_[current_].serial : next_serial_; }
+    void use(Texture &t, uint64_t serial);
+    void unlink(Texture &t);
+    void apply_texture_limits();
+    bool make_room(uint32_t kind, uint32_t needed);
+    void destroy_texture(Texture *t);
+    void release_index(uint32_t kind, uint32_t index);
+    uint32_t take_index(uint32_t kind);
+    uint32_t room(uint32_t kind) const {
+        return uint32_t(free_indices_[kind].size()) + (capacity_[kind] - next_index_[kind]);
+    }
+    void count_texture_bytes(VkDeviceSize add, VkDeviceSize remove);
+    VkDeviceSize image_bytes(const vk::Image &image) const;
+    Texture *lru_oldest_ = nullptr, *lru_newest_ = nullptr;
+    VkDeviceSize texture_bytes_ = 0;
+    std::vector<uint32_t> free_indices_[3]; // each table's places given back
+    uint64_t limits_applied_at_ = 0;        // done_serial_ when the limits were last applied
     bool gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload);
     bool cpu_upload(const vk::Image &target, const texture::Image &image, bool fresh);
     texture::Support support_; // what the device samples (texture_support)
@@ -2774,6 +2806,155 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     return index;
 }
 
+// ---- the textures' lifetime ----
+//
+// As Xenia's texture cache (texture_cache.cc): a texture is used by a
+// submission (MarkAsUsed, once a submission) and moves to the end of a list
+// by last use; when the GPU has finished submissions (CompletedSubmissionUpdated)
+// and the images take more memory than the soft limit, the least recently
+// used ones it is done with go, if unused for the soft lifetime, or at once
+// above the hard limit. A texture is destroyed only once the GPU is done with
+// its last use, so its places in the bindless tables are given back then (as
+// D3D12's ~D3D12Texture releases its descriptors), pointed at the stand-in
+// before anything takes them again; an image a constant replaces goes with
+// its places once the submission being recorded is done.
+//
+// Beyond Xenia, whose one table holds 262,144 descriptors: ours are smaller
+// (the slot word's 14 bits), so a table without room destroys the least
+// recently used textures of its kind the GPU is done with, waiting for
+// submissions in flight if it must (never the one being recorded); a load is
+// refused only when the submission being recorded holds the whole table.
+
+uint64_t now_ms() {
+    using namespace std::chrono;
+    return uint64_t(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+// A texture used by a submission: the newest in the list by last use.
+void Impl::use(Texture &t, uint64_t serial) {
+    if (t.used_serial >= serial) return;
+    t.used_serial = serial;
+    t.used_ms = now_ms();
+    if (lru_newest_ == &t) return;
+    unlink(t);
+    t.older = lru_newest_;
+    if (lru_newest_)
+        lru_newest_->newer = &t;
+    else
+        lru_oldest_ = &t;
+    lru_newest_ = &t;
+}
+
+void Impl::unlink(Texture &t) {
+    if (t.older)
+        t.older->newer = t.newer;
+    else if (lru_oldest_ == &t)
+        lru_oldest_ = t.newer;
+    if (t.newer)
+        t.newer->older = t.older;
+    else if (lru_newest_ == &t)
+        lru_newest_ = t.older;
+    t.older = t.newer = nullptr;
+}
+
+void Impl::count_texture_bytes(VkDeviceSize add, VkDeviceSize remove) {
+    texture_bytes_ = texture_bytes_ + add - remove;
+    report_.texture_bytes = texture_bytes_;
+    report_.texture_bytes_peak = std::max<uint64_t>(report_.texture_bytes_peak, texture_bytes_);
+}
+
+VkDeviceSize Impl::image_bytes(const vk::Image &image) const {
+    if (!image.image) return 0;
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(dev_, image.image, &req);
+    return req.size;
+}
+
+// Xenia's CompletedSubmissionUpdated, with its limits: run when the GPU has
+// finished submissions since the last time, before a texture is looked up
+// (no texture is held then).
+void Impl::apply_texture_limits() {
+    limits_applied_at_ = done_serial_;
+    // the limits' render-to-texture part times the draw resolution scale's
+    // area less one (Xenia's): the renderer draws at scale 1, so none
+    constexpr uint64_t resolution_scale_area = 1;
+    const uint64_t scaled_add = uint64_t(options_.texture_memory_render_to_texture_mb) * (resolution_scale_area - 1);
+    const uint64_t soft_mb = options_.texture_memory_soft_mb + scaled_add;
+    const uint64_t hard_mb = options_.texture_memory_hard_mb + scaled_add;
+    const uint64_t lifetime_ms = uint64_t(options_.texture_memory_soft_lifetime_s) * 1000;
+    const uint64_t now = now_ms();
+    while (lru_oldest_) {
+        const uint64_t mb = (texture_bytes_ + ((uint64_t(1) << 20) - 1)) >> 20;
+        const bool hard_exceeded = mb > hard_mb;
+        if (mb <= soft_mb && !hard_exceeded) break;
+        Texture *t = lru_oldest_;
+        if (t->used_serial > done_serial_) break;
+        if (!hard_exceeded && t->used_ms + lifetime_ms > now) break;
+        destroy_texture(t);
+        report_.textures_evicted++;
+    }
+}
+
+// Room for `needed` places in a table of `kind`: the least recently used
+// textures of that kind the GPU is done with destroyed, the oldest
+// submission in flight waited for while that is not enough. The list is in
+// the order of the submissions that last used them, so the first one still
+// in use ends the walk.
+bool Impl::make_room(uint32_t kind, uint32_t needed) {
+    for (;;) {
+        for (Texture *t = lru_oldest_; t && room(kind) < needed && t->used_serial <= done_serial_;) {
+            Texture *newer = t->newer;
+            if (t->kind == kind) {
+                destroy_texture(t);
+                report_.textures_evicted_for_room++;
+            }
+            t = newer;
+        }
+        if (room(kind) >= needed) return true;
+        if (!fatal_.empty() || !finish_oldest(true)) return false;
+    }
+}
+
+// A texture the GPU is done with: its places given back, its views and
+// images destroyed, and out of the cache.
+void Impl::destroy_texture(Texture *t) {
+    unlink(*t);
+    count_texture_bytes(0, t->bytes);
+    if (t->index) release_index(t->kind, t->index);
+    if (t->signed_index) release_index(t->kind, t->signed_index);
+    if (t->view) vkDestroyImageView(dev_, t->view, nullptr);
+    if (t->signed_view) vkDestroyImageView(dev_, t->signed_view, nullptr);
+    if (t->image.image) d_.destroy(t->image);
+    if (t->signed_image.image) d_.destroy(t->signed_image);
+    textures_.erase(t->key);
+    report_.textures_held = textures_.size();
+}
+
+// A place in a table the GPU no longer reads: pointed at the stand-in (no
+// descriptor ever names a destroyed view) and free to take again.
+void Impl::release_index(uint32_t kind, uint32_t index) {
+    VkDescriptorImageInfo image{VK_NULL_HANDLE, dummy_views_[kind], VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = bindless_;
+    write.dstBinding = kind;
+    write.dstArrayElement = index;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &image;
+    vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+    free_indices_[kind].push_back(index);
+}
+
+// A place in a table with room: one given back, else a new one.
+uint32_t Impl::take_index(uint32_t kind) {
+    if (!free_indices_[kind].empty()) {
+        uint32_t index = free_indices_[kind].back();
+        free_indices_[kind].pop_back();
+        return index;
+    }
+    return next_index_[kind]++;
+}
+
 // A texture by its fetch constant, loaded again when the memory it came from
 // was written since (its pages' watches, as Xenia's texture cache drops a
 // texture when a watch on its pages fires; resolves and memory exports over
@@ -2781,10 +2962,16 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
 // the GPU when the GPU holds some of it. Loaded again, it keeps its image and
 // its place in the table.
 Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
+    if (done_serial_ != limits_applied_at_) apply_texture_limits();
     std::array<uint32_t, 6> key;
     std::copy(fetch, fetch + 6, key.begin());
     auto it = textures_.find(key);
     Texture *t = it == textures_.end() ? nullptr : it->second.get();
+    // used by the submission being recorded, counted as the next one's: the
+    // draw that wants it records after its loads, which may submit this one,
+    // and a swap's presenter reads the front buffer after it is submitted
+    const uint64_t serial = submission_serial() + 1;
+    if (t) use(*t, serial);
     if (t && !t->stale) {
         bool same;
         {
@@ -2864,32 +3051,44 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     if (fresh) {
         uint32_t kind = three ? 1 : cube ? 2 : 0;
         uint32_t needed = signed_format != VK_FORMAT_UNDEFINED ? 2 : 1;
-        if (next_index_[kind] + needed > capacity_[kind]) {
+        if (room(kind) < needed && !make_room(kind, needed)) {
+            if (!fatal_.empty()) return nullptr;
+            report_.textures_refused++;
             why = "the bindless table is full";
             return nullptr;
         }
-        uint32_t index = next_index_[kind]++;
-        uint32_t signed_index = needed == 2 ? next_index_[kind]++ : 0;
+        uint32_t index = take_index(kind);
+        uint32_t signed_index = needed == 2 ? take_index(kind) : 0;
         if (t) {
             // the same constant made another image (not with the same format
-            // decisions; kept safe): the old one goes once unused, its place
-            // in the table with it (work under way may still read it there)
+            // decisions; kept safe): the old one goes once the submission
+            // being recorded is done, its places in the table with it (work
+            // under way may still read it there)
             vk::Image old = t->image, old_signed_image = t->signed_image;
             VkImageView old_view = t->view, old_signed = t->signed_view;
+            uint32_t old_kind = t->kind, old_index = t->index, old_signed_index = t->signed_index;
             cmd();
-            slots_[current_].after.push_back([this, old, old_signed_image, old_view, old_signed]() mutable {
-                vkDestroyImageView(dev_, old_view, nullptr);
-                if (old_signed) vkDestroyImageView(dev_, old_signed, nullptr);
-                d_.destroy(old);
-                if (old_signed_image.image) d_.destroy(old_signed_image);
-            });
+            slots_[current_].after.push_back(
+                [this, old, old_signed_image, old_view, old_signed, old_kind, old_index, old_signed_index]() mutable {
+                    if (old_index) release_index(old_kind, old_index);
+                    if (old_signed_index) release_index(old_kind, old_signed_index);
+                    if (old_view) vkDestroyImageView(dev_, old_view, nullptr);
+                    if (old_signed) vkDestroyImageView(dev_, old_signed, nullptr);
+                    if (old.image) d_.destroy(old);
+                    if (old_signed_image.image) d_.destroy(old_signed_image);
+                });
+            count_texture_bytes(0, t->bytes);
+            t->bytes = 0;
             t->image = {}, t->signed_image = {}, t->view = VK_NULL_HANDLE, t->signed_view = VK_NULL_HANDLE;
-            t->signed_index = 0;
+            t->index = 0, t->signed_index = 0;
         } else {
             auto owned = std::make_unique<Texture>();
             t = owned.get();
             t->stale = true;
+            t->key = key;
             textures_[key] = std::move(owned);
+            report_.textures_held = textures_.size();
+            use(*t, serial);
         }
         t->dimension = info.dimension, t->kind = kind, t->index = index;
         t->host = plan.format, t->host_swizzle = plan.host_swizzle;
@@ -2903,6 +3102,8 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         if (separate)
             t->signed_image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, signed_format, extent,
                                               level_count, layers, VK_SAMPLE_COUNT_1_BIT, usage, flags);
+        t->bytes = image_bytes(t->image) + image_bytes(t->signed_image);
+        count_texture_bytes(t->bytes, 0);
         if (!t->image.image || (separate && !t->signed_image.image)) {
             why = "could not make the image";
             return nullptr;

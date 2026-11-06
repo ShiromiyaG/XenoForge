@@ -8,11 +8,13 @@
 // plays the trace N times through the same renderer, as a game draws a frame
 // again, the GPU time then being the fastest of the plays after the first.
 // --readback-resolve none|fast|full is Xenia's readback_resolve, --depth-float24-round its
-// depth_float24_round (renderer.h).
+// depth_float24_round (renderer.h). --texture-memory soft,hard[,lifetime] sets the texture
+// cache's memory limits (Xenia's texture_cache_memory_limit_*; renderer.h).
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
 //            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
-//            [--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] [-v]
+//            [--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round]
+//            [--texture-memory soft,hard[,lifetime]] [-v]
 
 #include "xenoforge/renderer.h"
 
@@ -34,7 +36,8 @@ namespace {
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
                          "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
-                         "[--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] [-v]\n");
+                         "[--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] "
+                         "[--texture-memory soft,hard[,lifetime]] [-v]\n");
     return 2;
 }
 
@@ -63,7 +66,15 @@ int main(int argc, char **argv) {
         else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
         // Xenia's depth_float24_round
         else if (a == "--depth-float24-round") options.depth_float24_round = true;
-        else if (a == "--readback-resolve" && i + 1 < argc) {
+        // the texture cache's memory limits, soft,hard[,soft lifetime] in MB
+        // and seconds (0,0 destroys what the GPU is done with each time it
+        // finishes work: with --repeat, every texture between the plays)
+        else if (a == "--texture-memory" && i + 1 < argc) {
+            unsigned soft = 0, hard = 0, lifetime = options.texture_memory_soft_lifetime_s;
+            if (std::sscanf(argv[++i], "%u,%u,%u", &soft, &hard, &lifetime) < 2) return usage();
+            options.texture_memory_soft_mb = soft, options.texture_memory_hard_mb = hard;
+            options.texture_memory_soft_lifetime_s = lifetime;
+        } else if (a == "--readback-resolve" && i + 1 < argc) {
             std::string m = argv[++i];
             if (m == "none") options.readback_resolve = xf::render::ReadbackResolve::none;
             else if (m == "fast") options.readback_resolve = xf::render::ReadbackResolve::fast;
@@ -108,6 +119,11 @@ int main(int argc, char **argv) {
                 report.writeback_seconds, double(report.writeback_bytes) / 1024);
     std::printf("  %llu submissions, %llu waits for the GPU\n", (unsigned long long)report.submissions,
                 (unsigned long long)report.waits);
+    std::printf("  texture cache: %llu textures held in %.1f MB (at most %.1f MB), %llu destroyed by the memory "
+                "limits, %llu to make room, %llu loads refused\n",
+                (unsigned long long)report.textures_held, double(report.texture_bytes) / (1 << 20),
+                double(report.texture_bytes_peak) / (1 << 20), (unsigned long long)report.textures_evicted,
+                (unsigned long long)report.textures_evicted_for_room, (unsigned long long)report.textures_refused);
     if (report.zpd_reports)
         std::printf("  occlusion: %llu queries for %llu reports\n", (unsigned long long)report.occlusion_queries,
                     (unsigned long long)report.zpd_reports);

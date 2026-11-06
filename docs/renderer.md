@@ -709,9 +709,73 @@ signs that the game makes by resolving 4x MSAA targets drawn as
 Left: the POSIX fault handler is not built here (Windows only so far),
 untried on Linux and Android; the write count is 32 bits (the race run
 numbers about 2,000 writes a second, the XMA decoder's most of them: weeks
-before it wraps); and the bindless table's places are never
-given back, so a texture constant made again takes a new one: the 600 s
-race run filled the 2D table (33,165 loads refused near its end).
+before it wraps). The bindless table's places were never given back, so
+the 600 s race run filled the 2D table (33,165 loads refused near its
+end): "The texture cache's lifetime" below.
+
+## The texture cache's lifetime (2026-11-06)
+
+As Xenia's texture cache keeps its textures (texture_cache.cc: `Texture`'s
+`MarkAsUsed`, `CompletedSubmissionUpdated`, the
+`texture_cache_memory_limit_*` options; d3d12_texture_cache.cc's
+`~D3D12Texture`, which gives its descriptors back). Each texture knows the
+GPU memory its images hold (`vkGetImageMemoryRequirements`, as Xenia's
+`GetResourceAllocationInfo`), the last submission that used it and the
+host's clock then, and its place in a list by last use: a use moves it to
+the end, once a submission. When the GPU has finished submissions since
+the last look, before the next texture is looked up, the least recently
+used textures go while the cache holds more than the soft limit (384 MB)
+and their last use is done: if unused for the soft lifetime (30 s), or at
+once above the hard limit (768 MB); the render-to-texture part (24 MB) is
+what a draw resolution scale would add, none at scale 1.
+`Options::texture_memory_*`, `XF_TEXTURE_MEMORY=soft,hard[,lifetime]` for
+boot and the player, `xfreplay --texture-memory`.
+
+A texture is destroyed only once the GPU is done with its last use, so its
+places in the bindless tables go back to a free list then, pointed first
+at the stand-in (no descriptor ever names a destroyed view; the tables are
+update-after-bind and update-unused-while-pending, and nothing in flight
+reads those places). An image that a constant replaces (another shape for
+the same constant) goes with its places when the submission being
+recorded is done. Textures written by the CPU (their watches) are loaded
+again in place at their next use, as Xenia's outdated textures, and age
+out with the others when never used again.
+
+Where it differs from Xenia: a use counts for the submission after the one
+being recorded, because the draw that asked records after its loads,
+which may submit that one, and a swap's presenter reads the front buffer
+after it is submitted (one submission later than Xenia, never sooner).
+Xenia's one table holds 262,144 descriptors; ours hold 16,384 2D and 4,096
+3D and cube (the slot word's 14 bits), so a table without room destroys
+the least recently used textures of its kind the GPU is done with, waiting
+for submissions in flight if it must (never the one being recorded): a load
+is refused only when the submission being recorded holds the whole table.
+The cache is keyed by the whole fetch constant (Xenia's `TextureKey` leaves
+out the swizzle, the signs but whether they need their own image, the
+filters and clamps), so two constants over the same memory that differ in
+those hold an image each.
+
+Measured live, El Chavo Kart's 600 s race run (`boot_chaves --render
+--rates`, the press script above, `XF_GPU_TIME=1`, two other agents
+building): no load refused (33,165 before), 16,385 textures destroyed by
+the limits and none to make room, 304,950 loads. The cache reached the soft
+limit at 210 s and stayed there through the menus and the park (2,200-3,900
+textures in 382-384 MB), went above it as the race began (643 MB at 480 s,
+707 MB at most: the race's textures all used within 30 s) and came back to
+384 MB (4,530 textures) from 510 s on. The race at 29.6-30.2 swaps a second
+(the cap is 30), the menus and park at 28.9-31.0. The process's resident
+memory: 1,009 MB at 180 s, 1,083 MB at 300 s, 1,143 MB at 480 s, then
+1,156-1,160 MB from 510 s to the end. The same run for 420 s with
+`XF_TEXTURE_MEMORY=0,0` (every texture destroyed one submission after its
+last use, 22,510 of them; 189-473 held, 85 MB at most) had the same
+resident memory at the same times (995 MB at 180 s, 1,071 at 300 s, 1,129
+at 420 s): its growth is the game's (its pipelines, shaders and the race's
+data), not the cache's, whose images are the GPU's memory. Its shots
+differ from Xenia's dumps only where they animate (the title's blinking
+"Press START", the Cups menu's turning driver), and the replays of three
+traces with every texture destroyed and loaded again between plays (a
+build counting a use for the submission being recorded, under validation)
+gave the same pictures as one play.
 
 ## Traces of live runs (2026-11-05)
 

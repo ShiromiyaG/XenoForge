@@ -20,6 +20,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+// after windows.h
+#include <psapi.h>
+#else
+#include <unistd.h>
 #endif
 
 #ifdef XF_GENERATED
@@ -87,6 +91,12 @@ void print_renderer_report(const render::Report &r) {
     std::printf("renderer: made %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
                 (unsigned long long)r.render_targets, (unsigned long long)r.textures, (unsigned long long)r.pipelines,
                 (unsigned long long)r.shaders);
+    std::printf(
+        "renderer: texture cache: %llu textures held in %.1f MB (at most %.1f MB), %llu destroyed by the memory "
+        "limits, %llu to make room in a bindless table, %llu loads refused for want of it\n",
+        (unsigned long long)r.textures_held, double(r.texture_bytes) / (1 << 20),
+        double(r.texture_bytes_peak) / (1 << 20), (unsigned long long)r.textures_evicted,
+        (unsigned long long)r.textures_evicted_for_room, (unsigned long long)r.textures_refused);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
                 r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
     if (!r.gpu_time.empty()) {
@@ -221,6 +231,15 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     }
     // Xenia's depth_float24_round: XF_DEPTH_FLOAT24_ROUND=1
     if (const char *round = std::getenv("XF_DEPTH_FLOAT24_ROUND")) o.depth_float24_round = round[0] && round[0] != '0';
+    // the texture cache's memory limits (Xenia's texture_cache_memory_limit_*):
+    // XF_TEXTURE_MEMORY=soft,hard[,soft lifetime] in MB and seconds
+    if (const char *limits = std::getenv("XF_TEXTURE_MEMORY")) {
+        unsigned soft = o.texture_memory_soft_mb, hard = o.texture_memory_hard_mb;
+        unsigned lifetime = o.texture_memory_soft_lifetime_s;
+        if (std::sscanf(limits, "%u,%u,%u", &soft, &hard, &lifetime) < 2)
+            return error = "XF_TEXTURE_MEMORY: not soft,hard[,lifetime]", false;
+        o.texture_memory_soft_mb = soft, o.texture_memory_hard_mb = hard, o.texture_memory_soft_lifetime_s = lifetime;
+    }
     g.renderer = render::Renderer::create(*g.device, processor, o, error);
     if (!g.renderer) return error = "renderer: " + error, false;
     processor.set_sink(g.renderer.get());
@@ -313,6 +332,23 @@ void print_report(Game &g, bool waiting) {
     std::fflush(stdout);
 }
 
+// The process's resident memory in bytes (its working set on Windows); 0
+// where it is not known.
+uint64_t resident_bytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) return counters.WorkingSetSize;
+    return 0;
+#else
+    unsigned long long pages = 0, resident = 0;
+    FILE *statm = std::fopen("/proc/self/statm", "r");
+    if (!statm) return 0;
+    if (std::fscanf(statm, "%llu %llu", &pages, &resident) != 2) resident = 0;
+    std::fclose(statm);
+    return uint64_t(resident) * uint64_t(sysconf(_SC_PAGESIZE));
+#endif
+}
+
 void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
     const gpu::Counts &counts = kernel::gpu_command_processor(*g.kernel).counts();
     const uint64_t swaps = counts.swaps.load(), draws = counts.draws.load(), resolves = counts.resolves.load();
@@ -327,13 +363,19 @@ void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
         busy = (report.seconds - r.last_busy) / (wall - r.last_busy_wall);
         r.last_busy = report.seconds, r.last_busy_wall = wall;
     }
-    char renderer[48] = "";
-    if (g.renderer)
-        std::snprintf(renderer, sizeof(renderer), busy < 0 ? ", renderer busy -" : ", renderer busy %.0f%%",
-                      busy * 100);
-    std::printf("rates: %6.1f s (guest %6.1f s): %6llu swaps, %5.1f/s, %6.0f draws/s, %4.0f resolves/s%s%s\n", wall,
+    char renderer[160] = "";
+    if (g.renderer && busy < 0)
+        std::snprintf(renderer, sizeof(renderer), ", renderer busy -");
+    else if (g.renderer)
+        // with the texture cache's size, for seeing that memory stays flat
+        std::snprintf(renderer, sizeof(renderer), ", renderer busy %.0f%%, textures %llu (%.0f MB)", busy * 100,
+                      (unsigned long long)report.textures_held, double(report.texture_bytes) / (1 << 20));
+    char resident[48] = "";
+    if (uint64_t bytes = resident_bytes())
+        std::snprintf(resident, sizeof(resident), ", resident %.0f MB", double(bytes) / (1 << 20));
+    std::printf("rates: %6.1f s (guest %6.1f s): %6llu swaps, %5.1f/s, %6.0f draws/s, %4.0f resolves/s%s%s%s\n", wall,
                 g.kernel->uptime_ms() / 1000.0, (unsigned long long)swaps, (swaps - r.last_swaps) / dt,
-                (draws - r.last_draws) / dt, (resolves - r.last_resolves) / dt, renderer, extra.c_str());
+                (draws - r.last_draws) / dt, (resolves - r.last_resolves) / dt, renderer, resident, extra.c_str());
     std::fflush(stdout);
     r.last_wall = wall, r.last_swaps = swaps, r.last_draws = draws, r.last_resolves = resolves;
 }
