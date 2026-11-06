@@ -141,8 +141,15 @@ lists: what the game calls is what gets written next.
 - **Memory exports** (`memory_exports.cpp`): NtAllocateVirtualMemory and
   the Mm*/Ex* pools on the heaps of memory.h, with Xenia's addresses.
 - **Rtl and misc** (`rtl.cpp`, `misc.cpp`): strings, time fields, status
-  codes (Xenia's table), the printf family, XConfig settings (Xenia's
-  defaults).
+  codes (Xenia's table), the printf family (narrow and wide), CRC-32, PE
+  image headers, XConfig settings (Xenia's defaults, then what the title
+  writes, for the kernel's life), the HAL's system management controller
+  (Xenia's SMC: the DVD tray, open at start, the AV pack, temperatures).
+- **The debug monitor** (`xbdm.cpp`): Xenia's 36 xbdm exports, a retail
+  console's answers (console type -1, no debugger, the end of the module
+  list). The imports bind as the other system libraries', but no xbdm.xex
+  module is listed, so XexGetModuleHandle("xbdm.xex") fails as on a retail
+  console.
 - **Crypto** (`crypt.cpp`): every XeCrypt*/XeKeys* export Xenia has, plus
   SHA-384 and XeKeysConsoleSignatureVerification (it trusts the console's
   own signatures, so the XDK's partition block check takes the normal

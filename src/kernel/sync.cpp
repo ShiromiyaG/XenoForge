@@ -1,13 +1,25 @@
 // Synchronization exports (objects.h): events, semaphores, mutants and
-// timers in their Ke (guest pointer) and Nt (handle) forms, the waits, and
-// the RTL critical sections. Translated from Xenia (src/xenia/kernel:
-// xboxkrnl/xboxkrnl_threading.cc, xboxkrnl_rtl.cc's critical sections,
-// xevent.cc, xsemaphore.cc, xmutant.cc, xtimer.cc; BSD, see LICENSE-xenia)
-// and checked against them. What the objects do is the NT kernel's, over
-// the dispatcher in objects.cpp; where Xenia's host objects answer
-// differently (KeSetEvent's and KeResetEvent's previous state,
-// NtReleaseMutant's previous count, an absolute timeout), the NT answer,
-// as noted.
+// timers in their Ke (guest pointer) and Nt (handle) forms, the waits, the
+// RTL critical sections and the executive's read-write locks. Translated
+// from Xenia (src/xenia/kernel: xboxkrnl/xboxkrnl_threading.cc,
+// xboxkrnl_rtl.cc's critical sections, xevent.cc, xsemaphore.cc,
+// xmutant.cc, xtimer.cc; BSD, see LICENSE-xenia) and checked against them.
+// What the objects do is the NT kernel's, over the dispatcher in
+// objects.cpp; where Xenia's host objects answer differently (KeSetEvent's
+// and KeResetEvent's previous state, NtReleaseMutant's previous count, an
+// absolute timeout), the NT answer, as noted.
+//
+// Also where it differs:
+//   - KeInitializeEvent and KeInitializeTimerEx on a header a host object of
+//     the same kind already stands behind keep that object (Xenia clears the
+//     header's stash, so a new one is made and the old one stays behind);
+//     the timer is disarmed;
+//   - NtQueryEvent on a handle of another kind answers OBJECT_TYPE_MISMATCH,
+//     as the other Nt event calls here (Xenia: INVALID_HANDLE);
+//   - ExReleaseReadWriteLock wakes a waiting writer when the last reader or
+//     the writer leaves, as Cxbx-Reloaded's ExReleaseReadWriteLock (which
+//     Xenia's follows) does; Xenia decrements the readers' count also when
+//     it is 0, and so never wakes a writer queued behind another writer.
 
 #include "objects.h"
 
@@ -93,6 +105,40 @@ uint32_t finish_wait(Objects &o, Thread &t, uint32_t status) {
     return status;
 }
 
+// the host object a header's stash names, if it is the header's and of that
+// kind (lock held)
+Object *stashed(Kernel &k, Objects &o, uint32_t address, Object::Type type) {
+    if (k.load32(address + header::WAIT_LIST) != header::SIGNATURE) return nullptr;
+    Object *object = o.object_in(k.load32(address + header::WAIT_LIST + 4));
+    return object && object->guest == address && object->type() == type ? object : nullptr;
+}
+
+// Xenia's KeInitializeEvent: the header written (type 0 notification, 1
+// synchronization), the host object made, or the one behind it kept
+void initialize_event(Kernel &k, uint32_t address, uint32_t type, uint32_t state) {
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    auto *e = static_cast<Event *>(stashed(k, o, address, Object::Type::Event));
+    uint8_t *h = k.host(address);
+    h[header::TYPE] = uint8_t(type), h[1] = 0, h[2] = 0, h[3] = 0;
+    k.store32(address + header::SIGNAL_STATE, state);
+    if (e) {
+        if (int32_t(state) > 0) o.signaled(*e);
+        return;
+    }
+    list_init(k, address + header::WAIT_LIST);
+    o.native_locked(address);
+}
+
+// Xenia's KeInitializeSemaphore, as the read-write lock's initialization
+// calls it
+void initialize_semaphore(Kernel &k, uint32_t address, uint32_t count, uint32_t limit) {
+    k.host(address)[header::TYPE] = uint8_t(GuestType::Semaphore);
+    k.store32(address + header::SIGNAL_STATE, count);
+    k.store32(address + ksemaphore::LIMIT, limit);
+    objects(k).native(address);
+}
+
 } // namespace
 
 // ---- events ----
@@ -156,6 +202,31 @@ XF_EXPORT(xboxkrnl, NtPulseEvent) {
     std::lock_guard<std::mutex> l(o.lock);
     int32_t previous = pulse_event(o, *e);
     if (previous_ptr) k.store32(previous_ptr, uint32_t(previous));
+    result(c, X_STATUS_SUCCESS);
+}
+
+// (event, type, initial state)
+XF_EXPORT(xboxkrnl, KeInitializeEvent) { initialize_event(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2)); }
+
+// (event, increment, wait): the state before the pulse
+XF_EXPORT(xboxkrnl, KePulseEvent) {
+    Objects &o = objects(k);
+    Ref<Event> e = as<Event>(o.native(arg(k, c, 0)));
+    if (!e) return result(c, 0);
+    std::lock_guard<std::mutex> l(o.lock);
+    result(c, uint32_t(pulse_event(o, *e)));
+}
+
+// (handle, EVENT_BASIC_INFORMATION *): the type (0 notification, 1
+// synchronization) and the signal state
+XF_EXPORT(xboxkrnl, NtQueryEvent) {
+    uint32_t out = arg(k, c, 1), status;
+    Objects &o = objects(k);
+    Ref<Event> e = by_handle<Event>(o, arg(k, c, 0), status);
+    if (!e) return result(c, status);
+    std::lock_guard<std::mutex> l(o.lock);
+    k.store32(out, e->manual_reset() ? 0 : 1);
+    k.store32(out + 4, uint32_t(e->signal_state()));
     result(c, X_STATUS_SUCCESS);
 }
 
@@ -352,6 +423,30 @@ XF_EXPORT(xboxkrnl, NtCancelTimer) {
     t->apc_thread = {};
     if (state_ptr) k.store32(state_ptr, t->signal_state() > 0);
     result(c, X_STATUS_SUCCESS);
+}
+
+// (timer, type: 0 notification, 1 synchronization, process type): the
+// header, its due time and period (Xenia's xeKeInitializeTimerEx; the other
+// fields carry through repeated initializations); the host object is made on
+// first use
+XF_EXPORT(xboxkrnl, KeInitializeTimerEx) {
+    uint32_t timer = arg(k, c, 0), type = arg(k, c, 1), process_type = arg(k, c, 2) & 0xFF;
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    auto *t = static_cast<Timer *>(stashed(k, o, timer, Object::Type::Timer));
+    if (t) {
+        o.disarm(*t);
+        t->apc_thread = {};
+        t->routine = t->routine_arg = 0;
+    }
+    uint8_t *h = k.host(timer);
+    h[header::TYPE] = uint8_t(type ? GuestType::TimerSynchronization : GuestType::TimerNotification);
+    h[2] = uint8_t(process_type);
+    h[3] = 0; // inserted
+    k.store32(timer + header::SIGNAL_STATE, 0);
+    if (!t) list_init(k, timer + header::WAIT_LIST);
+    k.store64(timer + ktimer::DUE_TIME, 0);
+    k.store32(timer + ktimer::PERIOD, 0);
 }
 
 // ---- waits ----
@@ -561,6 +656,153 @@ XF_EXPORT(xboxkrnl, RtlLeaveCriticalSection) {
             std::lock_guard<std::mutex> l(o.lock);
             set_event(o, *e);
         }
+    }
+}
+
+// ---- read-write locks (Xenia's X_ERWLOCK, 0x38 bytes) ----
+//
+// The counts, then a synchronization event the writers wait on, a semaphore
+// the readers wait on and a spin lock over the counts; kept big-endian, in
+// the game's memory.
+
+namespace {
+
+constexpr uint32_t RW_LOCK_COUNT = 0x0, RW_WRITERS_WAITING = 0x4, RW_READERS_WAITING = 0x8, RW_READERS_ENTRY = 0xC;
+constexpr uint32_t RW_WRITER_EVENT = 0x10, RW_READER_SEMAPHORE = 0x20, RW_SPIN_LOCK = 0x34;
+
+// Xenia's xeKeKfAcquireSpinLock and xeKeKfReleaseSpinLock: the caller's PCR
+// in the lock word, the IRQL at dispatch level meanwhile
+uint8_t acquire_spin(Kernel &k, ppc::Context &c, uint32_t lock) {
+    uint32_t pcr = uint32_t(c.r[13]);
+    uint8_t old = k.host(pcr)[kpcr::CURRENT_IRQL];
+    k.host(pcr)[kpcr::CURRENT_IRQL] = 2;
+    auto word = guest_word(k, lock);
+    for (uint32_t spins = 0;; spins++) {
+        uint32_t expected = 0;
+        if (word.compare_exchange_weak(expected, bswap32(pcr), std::memory_order_acquire)) return old;
+        if (spins >= 64) objects(k).scheduler->yield();
+    }
+}
+
+void release_spin(Kernel &k, ppc::Context &c, uint32_t lock, uint8_t old_irql) {
+    guest_word(k, lock).store(0, std::memory_order_release);
+    if (old_irql < 2) k.host(uint32_t(c.r[13]))[kpcr::CURRENT_IRQL] = old_irql;
+}
+
+// xeKeWaitForSingleObject(object, WrExecutive, kernel mode, not alertable,
+// forever)
+void wait_forever(Kernel &k, uint32_t address) {
+    Objects &o = objects(k);
+    Thread *t = current_thread();
+    Ref<Dispatcher> d = o.native(address);
+    if (!d || !t) return;
+    Dispatcher *list[] = {d.get()};
+    o.wait(*t, list, false, false, Scheduler::NEVER);
+}
+
+uint32_t rw_load(Kernel &k, uint32_t lock, uint32_t field) { return k.load32(lock + field); }
+void rw_store(Kernel &k, uint32_t lock, uint32_t field, uint32_t value) { k.store32(lock + field, value); }
+
+} // namespace
+
+XF_EXPORT(xboxkrnl, ExInitializeReadWriteLock) {
+    uint32_t lock = arg(k, c, 0);
+    rw_store(k, lock, RW_LOCK_COUNT, 0xFFFFFFFF);
+    rw_store(k, lock, RW_WRITERS_WAITING, 0);
+    rw_store(k, lock, RW_READERS_WAITING, 0);
+    rw_store(k, lock, RW_READERS_ENTRY, 0);
+    initialize_event(k, lock + RW_WRITER_EVENT, uint32_t(GuestType::EventSynchronization), 0);
+    initialize_semaphore(k, lock + RW_READER_SEMAPHORE, 0, 0x7FFFFFFF);
+    rw_store(k, lock, RW_SPIN_LOCK, 0);
+}
+
+XF_EXPORT(xboxkrnl, ExAcquireReadWriteLockExclusive) {
+    uint32_t lock = arg(k, c, 0);
+    uint8_t irql = acquire_spin(k, c, lock + RW_SPIN_LOCK);
+    int32_t count = int32_t(rw_load(k, lock, RW_LOCK_COUNT)) + 1;
+    rw_store(k, lock, RW_LOCK_COUNT, uint32_t(count));
+    if (count == 0) return release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    rw_store(k, lock, RW_WRITERS_WAITING, rw_load(k, lock, RW_WRITERS_WAITING) + 1);
+    release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    wait_forever(k, lock + RW_WRITER_EVENT);
+}
+
+XF_EXPORT(xboxkrnl, ExTryToAcquireReadWriteLockExclusive) {
+    uint32_t lock = arg(k, c, 0);
+    uint8_t irql = acquire_spin(k, c, lock + RW_SPIN_LOCK);
+    bool taken = int32_t(rw_load(k, lock, RW_LOCK_COUNT)) < 0;
+    if (taken) rw_store(k, lock, RW_LOCK_COUNT, 0);
+    release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    result(c, taken ? 1 : 0);
+}
+
+// A reader enters while no writer holds the lock, or while readers hold it
+// and no writer waits.
+XF_EXPORT(xboxkrnl, ExAcquireReadWriteLockShared) {
+    uint32_t lock = arg(k, c, 0);
+    uint8_t irql = acquire_spin(k, c, lock + RW_SPIN_LOCK);
+    int32_t count = int32_t(rw_load(k, lock, RW_LOCK_COUNT)) + 1;
+    rw_store(k, lock, RW_LOCK_COUNT, uint32_t(count));
+    if (count == 0 || (rw_load(k, lock, RW_READERS_ENTRY) && !rw_load(k, lock, RW_WRITERS_WAITING))) {
+        rw_store(k, lock, RW_READERS_ENTRY, rw_load(k, lock, RW_READERS_ENTRY) + 1);
+        return release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    }
+    rw_store(k, lock, RW_READERS_WAITING, rw_load(k, lock, RW_READERS_WAITING) + 1);
+    release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    wait_forever(k, lock + RW_READER_SEMAPHORE);
+}
+
+XF_EXPORT(xboxkrnl, ExTryToAcquireReadWriteLockShared) {
+    uint32_t lock = arg(k, c, 0);
+    uint8_t irql = acquire_spin(k, c, lock + RW_SPIN_LOCK);
+    bool taken = int32_t(rw_load(k, lock, RW_LOCK_COUNT)) < 0 ||
+                 (rw_load(k, lock, RW_READERS_ENTRY) && !rw_load(k, lock, RW_WRITERS_WAITING));
+    if (taken) {
+        rw_store(k, lock, RW_LOCK_COUNT, rw_load(k, lock, RW_LOCK_COUNT) + 1);
+        rw_store(k, lock, RW_READERS_ENTRY, rw_load(k, lock, RW_READERS_ENTRY) + 1);
+    }
+    release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    result(c, taken ? 1 : 0);
+}
+
+// The last holder out lets the waiting readers in, all of them, else one
+// waiting writer (see the top for where Xenia differs).
+XF_EXPORT(xboxkrnl, ExReleaseReadWriteLock) {
+    uint32_t lock = arg(k, c, 0);
+    uint8_t irql = acquire_spin(k, c, lock + RW_SPIN_LOCK);
+    int32_t count = int32_t(rw_load(k, lock, RW_LOCK_COUNT)) - 1;
+    rw_store(k, lock, RW_LOCK_COUNT, uint32_t(count));
+    if (count < 0) {
+        rw_store(k, lock, RW_READERS_ENTRY, 0);
+        return release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    }
+    Objects &o = objects(k);
+    uint32_t entered = rw_load(k, lock, RW_READERS_ENTRY);
+    if (!entered) {
+        if (uint32_t waiting = rw_load(k, lock, RW_READERS_WAITING)) {
+            rw_store(k, lock, RW_READERS_WAITING, 0);
+            rw_store(k, lock, RW_READERS_ENTRY, waiting);
+            release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+            // KeReleaseSemaphore(semaphore, 1, waiting, FALSE)
+            if (Ref<Semaphore> s = as<Semaphore>(o.native(lock + RW_READER_SEMAPHORE))) {
+                std::lock_guard<std::mutex> l(o.lock);
+                int32_t previous = s->signal_state();
+                if (int64_t(previous) + waiting <= s->limit()) {
+                    s->set_signal_state(previous + int32_t(waiting));
+                    o.signaled(*s);
+                }
+            }
+            return;
+        }
+    } else {
+        rw_store(k, lock, RW_READERS_ENTRY, --entered);
+        if (entered) return release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    }
+    rw_store(k, lock, RW_WRITERS_WAITING, rw_load(k, lock, RW_WRITERS_WAITING) - 1);
+    release_spin(k, c, lock + RW_SPIN_LOCK, irql);
+    if (Ref<Event> e = as<Event>(o.native(lock + RW_WRITER_EVENT))) {
+        std::lock_guard<std::mutex> l(o.lock);
+        set_event(o, *e);
     }
 }
 

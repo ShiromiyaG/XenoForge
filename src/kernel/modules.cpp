@@ -89,6 +89,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -523,6 +524,8 @@ std::unique_ptr<Module> make_user_module(Kernel &k, Modules &s, const std::strin
 // them). Its entry point is its caller's to run. nullptr, the reason logged,
 // when it cannot be loaded (XexLoadImage answers X_STATUS_NO_SUCH_FILE for
 // any reason, as Xenia's).
+Module *load_user_module_data(Kernel &k, Modules &s, const std::string &path, const std::string &name,
+                              const std::vector<uint8_t> &data);
 Module *load_user_module(Kernel &k, Modules &s, std::string_view raw_name) {
     // a bare name is relative to the executable's directory
     std::string path(raw_name);
@@ -544,19 +547,27 @@ Module *load_user_module(Kernel &k, Modules &s, std::string_view raw_name) {
     status = file.stream->read(0, data.data(), data.size(), done);
     data.resize(done);
     std::string absolute = file.entry->device->mount_path + "\\" + file.entry->path; // Entry::absolute_path
-    auto xex = std::make_unique<Xex>();
-    std::string error;
     if (int32_t(status) < 0) {
-        char text[32];
-        std::snprintf(text, sizeof(text), "read status 0x%08X", status);
-        error = text;
-    }
-    if (!error.empty() || !parse_xex(data, *xex, error) || !load_xex_image(data, *xex, error) ||
-        !k.map_image(*xex, error)) {
-        std::fprintf(stderr, "kernel: XexLoadImage: %s: %s\n", absolute.c_str(), error.c_str());
+        std::fprintf(stderr, "kernel: XexLoadImage: %s: read status 0x%08X\n", absolute.c_str(), status);
         return nullptr;
     }
-    std::unique_ptr<Module> made = make_user_module(k, s, absolute, *xex);
+    return load_user_module_data(k, s, absolute, base_name(absolute), data);
+}
+
+// UserModule::LoadFromMemory and LoadContinue, XexModule::Load and
+// LoadContinue on an executable's file in data: its module made as
+// load_user_module's, with that path and name
+Module *load_user_module_data(Kernel &k, Modules &s, const std::string &path, const std::string &name,
+                              const std::vector<uint8_t> &data) {
+    auto xex = std::make_unique<Xex>();
+    std::string error;
+    if (!parse_xex(data, *xex, error) || !load_xex_image(data, *xex, error) || !k.map_image(*xex, error)) {
+        std::fprintf(stderr, "kernel: XexLoadImage: %s: %s\n", path.empty() ? name.c_str() : path.c_str(),
+                     error.c_str());
+        return nullptr;
+    }
+    std::unique_ptr<Module> made = make_user_module(k, s, path, *xex);
+    made->name = name;
     Module &m = *made;
     m.xex = std::move(xex);
     // its generated code, if the game library has the table made from this
@@ -581,7 +592,7 @@ void unload_user_module(Kernel &k, Modules &s, Module &m) {
     }
     k.memory().system_free(m.xex_header);
     k.memory().system_free(m.hmodule);
-    s.unloaded.push_back(m.path);
+    s.unloaded.push_back(m.path.empty() ? m.name : m.path); // (one loaded from memory has a name only)
     std::erase(s.loaded, &m);
     std::erase_if(s.user_modules, [&](const std::unique_ptr<Module> &u) { return u.get() == &m; });
 }
@@ -807,13 +818,15 @@ XF_EXPORT(xboxkrnl, XexGetModuleSection) {
     result(c, X_STATUS_NOT_FOUND);
 }
 
-XF_EXPORT(xboxkrnl, XexLoadImage) {
-    // (module_name, module_flags, min_version, hmodule_ptr): a module
-    // loaded already, or one loaded from its file (xeXexLoadImage); the
-    // load counted in its loader entry
-    std::string name = read_string(k, arg(k, c, 0));
-    uint32_t flags = arg(k, c, 1), hmodule_ptr = arg(k, c, 3);
-    if (!hmodule_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
+namespace {
+
+// xeXexLoadImage (module_name, module_flags, min_version, hmodule_ptr): a
+// module loaded already, or one load makes (from its file, or from memory);
+// the load counted in its loader entry. From memory, a module found by the
+// name already is a collision (no handle).
+uint32_t xex_load_image(Kernel &k, ppc::Context &c, const std::string &name, uint32_t flags, uint32_t hmodule_ptr,
+                        const std::function<Module *(Modules &)> &load, bool from_memory) {
+    if (!hmodule_ptr) return X_ERROR_INVALID_PARAMETER;
     Modules &s = k.state<Modules>();
     // the lookup, the load, the DllMains and the count under the loader lock:
     // a module being unloaded is gone when it is looked up (a fresh copy is
@@ -823,15 +836,20 @@ XF_EXPORT(xboxkrnl, XexLoadImage) {
     uint32_t status = X_STATUS_NO_SUCH_FILE, hmodule = 0;
     std::vector<EntryCall> attach;
     if (Module *m = find_module(k, s, name)) {
+        if (from_memory) {
+            k.store32(hmodule_ptr, 0);
+            return X_STATUS_OBJECT_NAME_COLLISION;
+        }
         hmodule = m->hmodule;
         status = X_STATUS_SUCCESS;
     } else {
         size_t first = s.loaded.size();
-        if (Module *loaded = load_user_module(k, s, name)) {
+        if (Module *loaded = load(s)) {
             hmodule = loaded->hmodule;
             status = X_STATUS_SUCCESS;
-            std::fprintf(stderr, "kernel: XexLoadImage(%s, flags 0x%X): %s at 0x%08X-0x%08X, entry 0x%08X%s\n",
-                         name.c_str(), flags, loaded->path.c_str(), loaded->base_address,
+            std::fprintf(stderr, "kernel: XexLoadImage%s(%s, flags 0x%X): %s at 0x%08X-0x%08X, entry 0x%08X%s\n",
+                         from_memory ? "FromMemory" : "", name.c_str(), flags,
+                         loaded->path.empty() ? loaded->name.c_str() : loaded->path.c_str(), loaded->base_address,
                          loaded->base_address + loaded->image_size, loaded->entry_point, loaded->dll ? " (a DLL)" : "");
         }
         // FinishLoadingUserModule's DllMain(DLL_PROCESS_ATTACH), on this
@@ -848,7 +866,41 @@ XF_EXPORT(xboxkrnl, XexLoadImage) {
     lock.lock();
     if (hmodule) k.store16(hmodule + LDR_LOAD_COUNT, uint16_t(k.load16(hmodule + LDR_LOAD_COUNT) + 1));
     k.store32(hmodule_ptr, hmodule);
-    result(c, status);
+    return status;
+}
+
+// (module_name, module_flags, min_version, hmodule_ptr)
+void xex_load_image_file(Kernel &k, ppc::Context &c) {
+    std::string name = read_string(k, arg(k, c, 0));
+    result(c, xex_load_image(
+                  k, c, name, arg(k, c, 1), arg(k, c, 3), [&](Modules &s) { return load_user_module(k, s, name); },
+                  false));
+}
+
+} // namespace
+
+XF_EXPORT(xboxkrnl, XexLoadImage) { xex_load_image_file(k, c); }
+
+// as XexLoadImage (Xenia's)
+XF_EXPORT(xboxkrnl, XexLoadExecutable) { xex_load_image_file(k, c); }
+
+// (buffer, size, module_name, module_flags, min_version, hmodule_ptr): the
+// executable's file in memory, its module named by the name's base (no
+// directory, no extension; Xenia's LoadUserModuleFromMemory). A module of
+// that base name loaded already is the one returned, counted once more (as
+// Xenia's lookup finds it; Xenia also runs its DllMain's DLL_PROCESS_ATTACH
+// again, which is not done here).
+XF_EXPORT(xboxkrnl, XexLoadImageFromMemory) {
+    uint32_t buffer = arg(k, c, 0), size = arg(k, c, 1);
+    std::string name = read_string(k, arg(k, c, 2));
+    std::string base = base_name(name);
+    auto load = [&](Modules &s) -> Module * {
+        for (auto &m : s.user_modules)
+            if (matches(*m, base)) return m.get();
+        std::vector<uint8_t> data(k.host(buffer), k.host(buffer) + size);
+        return load_user_module_data(k, s, "", base, data);
+    };
+    result(c, xex_load_image(k, c, name, arg(k, c, 3), arg(k, c, 5), load, true));
 }
 
 XF_EXPORT(xboxkrnl, XexUnloadImage) {
@@ -1053,7 +1105,8 @@ std::string modules_report(Kernel &k) {
     for (auto &m : s.user_modules) {
         char line[512];
         std::snprintf(line, sizeof(line), "  %s: 0x%08X-0x%08X, entry 0x%08X, %s, loaded %u time(s)%s%s\n",
-                      m->path.c_str(), m->base_address, m->base_address + m->image_size, m->entry_point,
+                      (m->path.empty() ? m->name : m->path).c_str(), m->base_address, m->base_address + m->image_size,
+                      m->entry_point,
                       m.get() == s.executable ? "the executable"
                       : m->dll                ? (m->attached ? "a DLL, attached" : "a DLL, not attached")
                                               : "loaded",
@@ -1078,7 +1131,8 @@ std::string module_at(Kernel &k, uint32_t address) {
     Modules &s = k.state<Modules>();
     std::lock_guard lock(s.mutex);
     for (auto &m : s.user_modules)
-        if (address - m->base_address < m->image_size) return std::string(name_from_path(m->path));
+        if (address - m->base_address < m->image_size)
+            return m->path.empty() ? m->name : std::string(name_from_path(m->path));
     return {};
 }
 

@@ -116,7 +116,8 @@ constexpr uint8_t INITIALIZED = 0, READY = 1, RUNNING = 2, TERMINATED_STATE = 4,
 // X_KPCR (0x2D8), r13; its X_KPRCB at 0x100
 namespace kpcr {
 constexpr uint32_t TLS_PTR = 0x0, PROCESS_TYPE_IN_DPC = 0xC, CURRENT_IRQL = 0x18, PCR_PTR = 0x30;
-constexpr uint32_t STACK_BASE = 0x70, STACK_END = 0x74, PRCB_DATA = 0x100;
+constexpr uint32_t USE_ALTERNATIVE_STACK = 0x6C, STACK_BASE = 0x70, STACK_END = 0x74;
+constexpr uint32_t ALT_STACK_BASE = 0x78, ALT_STACK_END = 0x7C, PRCB_DATA = 0x100;
 constexpr uint32_t CURRENT_THREAD = 0x100, CURRENT_CPU = 0x10C, PROCESSOR_MASK = 0x110, DPC_ACTIVE = 0x150;
 constexpr uint32_t PRCB = 0x2A8, SIZE = 0x2D8;
 } // namespace kpcr
@@ -153,9 +154,10 @@ namespace time_stamp_bundle {
 constexpr uint32_t INTERRUPT_TIME = 0x0, SYSTEM_TIME = 0x8, TICK_COUNT = 0x10;
 }
 
-// X_OBJECT_ATTRIBUTES: the name, a PANSI_STRING, at 4
+// X_OBJECT_ATTRIBUTES: the root directory, the name (a PANSI_STRING), the
+// attributes
 namespace object_attributes {
-constexpr uint32_t NAME = 0x4;
+constexpr uint32_t ROOT_DIRECTORY = 0x0, NAME = 0x4, ATTRIBUTES = 0x8;
 }
 
 class Objects;

@@ -833,6 +833,53 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     CHECK(int32_t(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\missing.dll"), buffer, 0x2000})) < 0);
 }
 
+// XexLoadImageFromMemory: a DLL's file in guest memory, its module named by
+// the name's base; loaded once (a second load by the same base name counts
+// the same module, a load by a name that finds the module already is a
+// collision); XexLoadExecutable: XexLoadImage
+void from_memory(KernelHarness &h, uint32_t log) {
+    kernel::Kernel &k = *h.k;
+    constexpr uint32_t MEM = 0x8C000000, MEM_ID = 0x33;
+    std::vector<uint8_t> file = make_dll(MEM, make_image(MEM, MEM_ID, log), {});
+    uint32_t buffer = h.alloc(uint32_t(file.size()));
+    std::memcpy(k.host(buffer), file.data(), file.size());
+    uint32_t out = h.alloc(4), from = k.load32(log);
+    CHECK(h.krnl("XexLoadImageFromMemory", {buffer, uint32_t(file.size()), h.string("game:\\mem.dll"), 9, 0, out}) ==
+          0);
+    uint32_t mem = k.load32(out);
+    CHECK(mem && k.load16(mem + 0x40) == 1 && k.load32(mem + 0x1C) == MEM);
+    CHECK((entry_calls(k, log, from) == std::vector<EntryCall>{{mem, 1, 0, MEM_ID}}));
+    // its name is its base: found by "mem", not by "mem.dll"
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("mem"), out}) == 0 && k.load32(out) == mem);
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("mem.dll"), out}) == 0x490);
+    CHECK(h.krnl("XexLoadImageFromMemory", {buffer, uint32_t(file.size()), h.string("mem.dll"), 9, 0, out}) == 0);
+    CHECK(k.load32(out) == mem && k.load16(mem + 0x40) == 2);
+    CHECK(h.krnl("XexLoadImageFromMemory", {buffer, uint32_t(file.size()), h.string("mem"), 9, 0, out}) == 0xC0000035 &&
+          k.load32(out) == 0);
+    CHECK(entry_calls(k, log, from).size() == 1); // attached once
+    CHECK(h.krnl("XexLoadImageFromMemory", {buffer, uint32_t(file.size()), h.string("x.dll"), 9, 0, 0}) == 0x57);
+    // not an executable
+    std::memset(k.host(buffer), 'j', 64);
+    CHECK(h.krnl("XexLoadImageFromMemory", {buffer, uint32_t(file.size()), h.string("junk.dll"), 9, 0, out}) ==
+              0xC000000F &&
+          k.load32(out) == 0);
+    CHECK(h.krnl("XexUnloadImage", {mem}) == 0 && h.krnl("XexUnloadImage", {mem}) == 0);
+    CHECK((entry_calls(k, log, from + 1) == std::vector<EntryCall>{{mem, 0, 0, MEM_ID}}));
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("mem"), out}) == 0x490);
+    RegionInfo region;
+    CHECK(k.memory().heap_for(MEM)->query(MEM, region) && region.state == 0);
+
+    // XexLoadExecutable: a module loaded already, counted (app.dll, loaded
+    // by name once; lib.dll, loaded as its import, has no count)
+    CHECK(h.krnl("XexGetModuleHandle", {h.string("app.dll"), out}) == 0);
+    uint32_t app = k.load32(out);
+    uint16_t count = k.load16(app + 0x40);
+    CHECK(h.krnl("XexLoadExecutable", {h.string("game:\\app.dll"), 9, 0, out}) == 0 && k.load32(out) == app);
+    CHECK(count == 1 && k.load16(app + 0x40) == 2);
+    CHECK(h.krnl("XexUnloadImage", {app}) == 0 && k.load16(app + 0x40) == 1);
+    CHECK(h.krnl("XexLoadExecutable", {h.string("game:\\missing.dll"), 9, 0, out}) == 0xC000000F);
+}
+
 // ---- the loader lock: gate.dll, its DllMain host code ----
 //
 // gate.dll at GATE has its DllMain in the generated-code table: it logs each
@@ -1217,6 +1264,7 @@ int main() {
     longjmp_into_generated(h);
     uint32_t gate_module = load_gate(h);
     user_modules(h, log, lib_file);
+    from_memory(h, log);
     exit_in_dll_main(h, log, gate_module);
     loader_lock(h, gate_module);
     variables(h);

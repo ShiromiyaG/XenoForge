@@ -9,18 +9,24 @@
  */
 
 // The rest of the kernel's small exports (plan step A4; docs/runtime.md):
-// debugging, the HAL, the clock, the current process type, the console's
-// settings (XConfig), the microphone's requests (the crypto is crypt.cpp).
-// Translated from Xenia (BSD; see LICENSE-xenia): xboxkrnl_debug.cc,
-// xboxkrnl_hal.cc, xboxkrnl_threading.cc (the clock and the process type),
-// xboxkrnl_misc.cc, xboxkrnl_xconfig.cc with xconfig.h and xconfig.cc (the
-// settings' defaults, without the settings file); checked against them.
+// debugging, the HAL and its system management controller (SMC), the clock,
+// the current process type, the console's settings (XConfig), the
+// microphone's requests, the keyboard's keys and the USB camera (the crypto
+// is crypt.cpp). Translated from Xenia (BSD; see LICENSE-xenia):
+// xboxkrnl_debug.cc, xboxkrnl_hal.cc with smc.h and smc.cc,
+// xboxkrnl_threading.cc (the clock and the process type), xboxkrnl_misc.cc,
+// xboxkrnl_hid.cc, xboxkrnl_usbcam.cc, xboxkrnl_xconfig.cc with xconfig.h and
+// xconfig.cc (the settings' defaults, without the settings file); checked
+// against them.
 //
 // Where Xenia stops the emulator (HalReturnToFirmware exits; KeBugCheckEx
 // suspends the thread; DbgBreakPoint breaks into the debugger), these log;
 // HalReturnToFirmware and KeBugCheckEx then end the process, as nothing
-// after them is meant to run.
+// after them is meant to run. The settings the title writes
+// (ExSetXConfigSetting) last as long as the kernel: Xenia also writes them
+// to its settings file.
 
+#include "xam.h"
 #include "xenoforge/kernel.h"
 
 #include <algorithm>
@@ -30,14 +36,12 @@
 #include <cstring>
 #include <initializer_list>
 #include <map>
+#include <mutex>
 #include <vector>
 
 namespace xf::kernel {
 namespace {
 
-constexpr uint32_t X_STATUS_PENDING = 0x00000103;
-constexpr uint32_t X_STATUS_INVALID_DEVICE_REQUEST = 0xC0000010;
-constexpr uint32_t X_STATUS_BUFFER_TOO_SMALL = 0xC0000023;
 constexpr uint32_t X_STATUS_INVALID_PARAMETER_3 = 0xC00000F1;
 
 // Runs guest code from an export, as Xenia's Processor::Execute: the
@@ -127,6 +131,127 @@ XF_EXPORT(xboxkrnl, HalReturnToFirmware) {
     std::exit(0);
 }
 
+// Xenia's default AV pack (its avpack setting): 8, HDMI
+constexpr uint32_t AV_PACK = 8;
+
+XF_EXPORT(xboxkrnl, HalGetCurrentAVPack) { result(c, AV_PACK); }
+
+// The system management controller (Xenia's SystemManagementController):
+// the DVD tray (open at start, as Xenia's), the remote's IR address, the
+// tilt, the fans and the LEDs, as the commands left them.
+constexpr uint8_t TRAY_OPEN = 0, TRAY_CLOSED = 2;
+constexpr uint32_t XN_SYS_TRAY_STATE_CHANGED = 0x8000000D; // kXNotificationSystemTrayStateChanged
+
+struct Smc {
+    std::mutex mutex;
+    uint8_t tray = TRAY_OPEN;
+    uint8_t ir_address = 0x0F; // MEDIA_REMOTE_360
+    uint8_t tilt = 0;          // vertical
+    uint32_t cpu_fan = 100, gpu_fan = 100;
+    uint8_t power_led[2] = {0x01, 0x00}; // on, not animated
+    uint8_t leds[2] = {0x80, 0x01};      // green, top left
+};
+
+// SetTrayState: the state, and every listener told
+void set_tray(Kernel &k, uint8_t state) {
+    {
+        Smc &smc = k.state<Smc>();
+        std::lock_guard<std::mutex> l(smc.mutex);
+        smc.tray = state;
+    }
+    broadcast(k, XN_SYS_TRAY_STATE_CHANGED, state);
+}
+
+// (message, response: X_SMC_DATA, a command byte and 15 of data): the
+// queries answer in the response with the command and their fields, the
+// rest of it left as it was; the settings answer nothing (but the IR
+// address's, which answers the address unchanged, as Xenia's)
+XF_EXPORT(xboxkrnl, HalSendSMCMessage) {
+    uint32_t message = arg(k, c, 0), response = arg(k, c, 1);
+    if (!message) return;
+    uint8_t command = k.host(message)[0];
+    const uint8_t *data = k.host(message) + 1;
+    Smc &smc = k.state<Smc>();
+    auto answer = [&](std::initializer_list<uint8_t> fields) {
+        if (!response) return;
+        k.host(response)[0] = command;
+        size_t n = 1;
+        for (uint8_t b : fields) k.host(response)[n++] = b;
+    };
+    // X_TEMPERATURE_DATA::SetTemp: the degrees in 8.8, low byte first
+    auto temperature = [](float celsius) { return uint16_t(celsius * 256.0f); };
+    uint16_t cpu = temperature(69.6f), gpu = temperature(69.9f);
+    switch (command) {
+    case 0x07: // QUERY_TEMP_SENSOR: CPU, GPU, EDRAM, motherboard
+        answer({uint8_t(cpu), uint8_t(cpu >> 8), uint8_t(gpu), uint8_t(gpu >> 8), uint8_t(cpu), uint8_t(cpu >> 8),
+                uint8_t(gpu), uint8_t(gpu >> 8)});
+        break;
+    case 0x0A: { // QUERY_TRAY
+        std::lock_guard<std::mutex> l(smc.mutex);
+        answer({smc.tray});
+        break;
+    }
+    case 0x0F: // QUERY_AV_PACK: the AV pack's SMC value (HDMI's 0x1F)
+        answer({AV_PACK == 8 ? uint8_t(0x1F) : uint8_t(0)});
+        break;
+    case 0x12: answer({65, 2, 1}); break; // QUERY_SMC_VERSION
+    case 0x16:                            // QUERY_IR_ADDRESS
+    case 0x95: {                          // SET_IR_ADDRESS
+        std::lock_guard<std::mutex> l(smc.mutex);
+        answer({smc.ir_address});
+        break;
+    }
+    case 0x17: { // QUERY_TILT_SENSOR
+        std::lock_guard<std::mutex> l(smc.mutex);
+        answer({smc.tilt});
+        break;
+    }
+    case 0x89:   // SET_FAN_SPEED_CPU
+    case 0x94: { // SET_FAN_SPEED_GPU
+        std::lock_guard<std::mutex> l(smc.mutex);
+        (command == 0x89 ? smc.cpu_fan : smc.gpu_fan) = uint32_t(data[0] - 0x80);
+        break;
+    }
+    case 0x8B: set_tray(k, uint8_t((data[0] & 0xF) % 5)); break; // SET_DVD_TRAY
+    case 0x8C: {                                                 // SET_POWER_LED
+        std::lock_guard<std::mutex> l(smc.mutex);
+        smc.power_led[0] = data[0], smc.power_led[1] = data[1];
+        break;
+    }
+    case 0x99: { // SET_LEDS
+        std::lock_guard<std::mutex> l(smc.mutex);
+        smc.leds[0] = data[0], smc.leds[1] = data[1];
+        break;
+    }
+    default: {
+        static std::mutex logged_mutex;
+        static bool logged[256] = {};
+        std::lock_guard<std::mutex> l(logged_mutex);
+        if (!logged[command]) {
+            logged[command] = true;
+            std::fprintf(stderr, "kernel: HalSendSMCMessage: no SMC command %02X\n", command);
+        }
+        break;
+    }
+    }
+}
+
+// (open): the tray opened or closed, the listeners told
+XF_EXPORT(xboxkrnl, HalOpenCloseODDTray) { set_tray(k, arg(k, c, 0) ? TRAY_OPEN : TRAY_CLOSED); }
+
+// ---- the keyboard and the USB camera (xboxkrnl_hid.cc, xboxkrnl_usbcam.cc) ----
+
+// (0, a 6-byte buffer, a 20-byte buffer): no keyboard,
+// STATUS_DEVICE_NOT_CONNECTED, which games turn into ERROR_DEVICE_NOT_CONNECTED
+XF_EXPORT(xboxkrnl, HidReadKeys) { result(c, 0xC000009D); }
+
+// (buffer, size, handle out): the camera's buffers taken, success (games
+// that see a failure skip their initialization and crash later, as Xenia
+// notes), no handle
+XF_EXPORT(xboxkrnl, XUsbcamCreate) { result(c, X_STATUS_SUCCESS); }
+// no camera connected
+XF_EXPORT(xboxkrnl, XUsbcamGetState) { result(c, 0); }
+
 // ---- the clock (xboxkrnl_threading.cc, xboxkrnl_misc.cc) ----
 
 XF_EXPORT(xboxkrnl, KeQueryInterruptTime) { c.r[3] = k.load64(k.variable("KeTimeStampBundle")); }
@@ -214,14 +339,22 @@ const std::map<uint32_t, std::vector<uint8_t>> &settings() {
     return table;
 }
 
+// The settings as the title sees them: the defaults, then what it wrote.
+struct XConfig {
+    std::mutex mutex;
+    std::map<uint32_t, std::vector<uint8_t>> values = settings();
+};
+
 XF_EXPORT(xboxkrnl, ExGetXConfigSetting) {
     // (category, setting, buffer, buffer_size, required_size_ptr): an
     // unknown setting has size 0
     uint16_t category = uint16_t(arg(k, c, 0)), setting = uint16_t(arg(k, c, 1));
     uint32_t buffer = arg(k, c, 2), required_size_ptr = arg(k, c, 4);
     uint16_t buffer_size = uint16_t(arg(k, c, 3));
-    auto it = settings().find(uint32_t(category) << 16 | setting);
-    uint16_t size = it == settings().end() ? 0 : uint16_t(it->second.size());
+    XConfig &x = k.state<XConfig>();
+    std::lock_guard<std::mutex> l(x.mutex);
+    auto it = x.values.find(uint32_t(category) << 16 | setting);
+    uint16_t size = it == x.values.end() ? 0 : uint16_t(it->second.size());
     if (!size) std::fprintf(stderr, "kernel: ExGetXConfigSetting: no setting %u in category %u\n", setting, category);
     uint32_t status = X_STATUS_SUCCESS;
     uint16_t required_size = 0;
@@ -235,6 +368,42 @@ XF_EXPORT(xboxkrnl, ExGetXConfigSetting) {
     }
     if (required_size_ptr) k.store16(required_size_ptr, required_size);
     result(c, status);
+}
+
+// (category, setting, buffer, buffer size): the setting's whole size taken
+// from the buffer, whatever size is given (Xenia's XConfig::WriteSetting);
+// an unknown setting is left alone; success either way
+XF_EXPORT(xboxkrnl, ExSetXConfigSetting) {
+    uint16_t category = uint16_t(arg(k, c, 0)), setting = uint16_t(arg(k, c, 1));
+    uint32_t buffer = arg(k, c, 2);
+    XConfig &x = k.state<XConfig>();
+    std::lock_guard<std::mutex> l(x.mutex);
+    auto it = x.values.find(uint32_t(category) << 16 | setting);
+    if (it != x.values.end() && buffer) std::memcpy(it->second.data(), k.host(buffer), it->second.size());
+    std::fprintf(stderr, "kernel: ExSetXConfigSetting: category 0x%04x, setting 0x%04x\n", category, setting);
+    result(c, X_STATUS_SUCCESS);
+}
+
+// (category, setting, bits kept, bits set): a 32-bit setting's value
+// masked, then or'ed (Xenia's: a setting of another size reads as 0 and gets
+// its first bytes of the result)
+XF_EXPORT(xboxkrnl, ExReadModifyWriteXConfigSettingUlong) {
+    uint16_t category = uint16_t(arg(k, c, 0)), setting = uint16_t(arg(k, c, 1));
+    uint32_t keep = arg(k, c, 2), set = arg(k, c, 3);
+    XConfig &x = k.state<XConfig>();
+    std::lock_guard<std::mutex> l(x.mutex);
+    auto it = x.values.find(uint32_t(category) << 16 | setting);
+    if (it != x.values.end()) {
+        std::vector<uint8_t> &v = it->second;
+        uint32_t value = v.size() == 4 ? uint32_t(v[0]) << 24 | v[1] << 16 | v[2] << 8 | v[3] : 0;
+        std::vector<uint8_t> bytes = be32((value & keep) | set);
+        std::copy_n(bytes.begin(), std::min<size_t>(v.size(), 4), v.begin());
+    }
+    std::fprintf(stderr,
+                 "kernel: ExReadModifyWriteXConfigSettingUlong: category 0x%04x, setting 0x%04x, bits kept "
+                 "0x%08X, bits set 0x%08X\n",
+                 category, setting, keep, set);
+    result(c, X_STATUS_SUCCESS);
 }
 
 // ---- xam's queries of the settings (xam_info.cc, xam_locale.cc) ----
@@ -299,4 +468,11 @@ XF_EXPORT(xboxkrnl, MicDeviceRequest) {
 }
 
 } // namespace
+
+uint32_t smc_tray_state(Kernel &k) {
+    Smc &smc = k.state<Smc>();
+    std::lock_guard<std::mutex> l(smc.mutex);
+    return smc.tray;
+}
+
 } // namespace xf::kernel

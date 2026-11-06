@@ -8,10 +8,11 @@
  */
 
 // The file exports (files.h): Nt*File, the I/O completion ports, the Io*
-// device calls, Fsc* and Stfs*, and the mounts boot asks for. Translated
-// from Xenia (BSD; see LICENSE-xenia): xboxkrnl_io.cc, xboxkrnl_io_info.cc,
-// xfile.cc, xiocompletion.cc, emulator.cc and xenia_main.cc (the mounts);
-// checked against them.
+// device calls, Fsc* and Stfs*, the symbolic link objects, and the mounts
+// boot asks for. Translated from Xenia (BSD; see LICENSE-xenia):
+// xboxkrnl_io.cc, xboxkrnl_io_info.cc, xfile.cc, xiocompletion.cc,
+// xsymboliclink.cc, emulator.cc and xenia_main.cc (the mounts); checked
+// against them.
 //
 // Requests complete at once, as Xenia completes them: the I/O status block,
 // then the event, the APC routine (queued to the calling thread, delivered
@@ -976,6 +977,54 @@ XF_EXPORT(xboxkrnl, IoDismountVolumeByFileHandle) { result(c, X_STATUS_SUCCESS);
 
 // the file system cache's size: nothing is cached here
 XF_EXPORT(xboxkrnl, FscSetCacheElementCount) { result(c, X_STATUS_SUCCESS); }
+XF_EXPORT(xboxkrnl, FscGetCacheElementCount) { result(c, 0); }
+
+// ---- symbolic link objects (Xenia's XSymbolicLink) ----
+
+namespace {
+// a link opened by name: its name and target, no dispatcher header
+class SymbolicLink : public Object {
+  public:
+    explicit SymbolicLink(Objects &owner) : Object(owner, Type::Other) {}
+    std::string path, target;
+};
+} // namespace
+
+// (handle out, attributes): a handle to the link that starts the name (the
+// object manager's \??\ prefix dropped), as VirtualFileSystem::FindSymbolicLink
+// finds it. The prefix is dropped before the name is checked: Xenia checks
+// it first, and its check refuses the '?', so a name with the prefix never
+// opens there.
+XF_EXPORT(xboxkrnl, NtOpenSymbolicLinkObject) {
+    uint32_t handle_out = arg(k, c, 0), attributes = arg(k, c, 1);
+    if (!attributes) return result(c, X_STATUS_INVALID_PARAMETER);
+    std::string path = guest_path(k, k.load32(attributes + object_attributes::NAME));
+    if (path.starts_with("\\??\\")) path = path.substr(4);
+    if (!valid_path(path, false)) return result(c, X_STATUS_OBJECT_NAME_INVALID);
+    std::string target;
+    if (!file_system(k).find_link(path, target)) return result(c, X_STATUS_NO_SUCH_FILE);
+    Objects &o = objects(k);
+    Ref<SymbolicLink> link(new SymbolicLink(o));
+    link->path = path, link->target = target;
+    std::lock_guard<std::mutex> l(o.lock);
+    uint32_t handle = o.add_handle(link.get());
+    if (handle_out) k.store32(handle_out, handle);
+    result(c, X_STATUS_SUCCESS);
+}
+
+// (handle, target: X_ANSI_STRING): the target, as much as its buffer holds,
+// unterminated
+XF_EXPORT(xboxkrnl, NtQuerySymbolicLinkObject) {
+    uint32_t target = arg(k, c, 1);
+    Objects &o = objects(k);
+    Ref<Object> object = o.lookup<Object>(arg(k, c, 0));
+    auto *link = dynamic_cast<SymbolicLink *>(object.get());
+    if (!link) return result(c, X_STATUS_NO_SUCH_FILE);
+    uint32_t length = std::min<uint32_t>(k.load16(target + 2), uint32_t(link->target.size()));
+    if (length) std::memcpy(k.host(k.load32(target + 4)), link->target.data(), length);
+    k.store16(target, uint16_t(length));
+    result(c, X_STATUS_SUCCESS);
+}
 
 // An STFS package mounted by the title's own code: no device is made (the
 // content family mounts packages as directories, as Xenia does)

@@ -408,6 +408,16 @@ XF_EXPORT(xboxkrnl, VdQueryVideoMode) {
     write_video_mode(k, arg(k, c, 0));
 }
 
+// the mode the display really has: the same (Xenia's)
+XF_EXPORT(xboxkrnl, VdQueryRealVideoMode) {
+    video(k);
+    write_video_mode(k, arg(k, c, 0));
+}
+
+// the GPU's revision: games initialize the EDRAM below 0x10 and retrain it
+// from there on; Xenia's 0x11
+XF_EXPORT(xboxkrnl, VdGetGraphicsAsicID) { result(c, 0x11); }
+
 // widescreen 1, 720p 2, 1080 4
 XF_EXPORT(xboxkrnl, VdQueryVideoFlags) {
     VideoMode m = video(k).mode();

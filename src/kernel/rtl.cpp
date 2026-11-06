@@ -14,11 +14,14 @@
 // see LICENSE-xenia): xboxkrnl_rtl.cc, xboxkrnl_error.cc (its tables written
 // out by value, the named codes resolved from xbox.h) and
 // xboxkrnl_strings.cc; checked against them. Critical sections, unwinding
-// and the stack limits belong to the threads family.
+// and the stack limits belong to the threads family. The CRC-32 table is
+// made from the polynomial's definition (Xenia writes it out); where
+// RtlImageDirectoryEntryToData differs from Xenia, it says.
 
 #include "xenoforge/kernel.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -1140,6 +1143,169 @@ XF_EXPORT(xboxkrnl, vsprintf) {
     FormatData data(k, format, false);
     int32_t count = format_core(k, data, args, false);
     result(c, uint32_t(write_unbounded(k, buffer, count, data.str())));
+}
+
+// the text at buffer as wide characters, big-endian
+void put_wide(Kernel &k, uint32_t buffer, const std::u16string &text, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) k.store16(buffer + 2 * i, uint16_t(text[i]));
+}
+
+XF_EXPORT(xboxkrnl, _snwprintf) {
+    // (buffer, buffer_count, format, ...): what fits, -1 when it does not
+    uint32_t buffer = arg(k, c, 0), buffer_count = arg(k, c, 1), format = arg(k, c, 2);
+    if (!buffer || !buffer_count || !format) return result(c, uint32_t(-1));
+    ArgList args(k, c, 3);
+    FormatData data(k, format, true);
+    int32_t count = format_core(k, data, args, true);
+    if (count < 0) {
+        k.store16(buffer, 0);
+    } else if (uint32_t(count) <= buffer_count) {
+        put_wide(k, buffer, data.wstr(), uint32_t(count));
+        if (uint32_t(count) < buffer_count) k.store16(buffer + 2 * uint32_t(count), 0);
+    } else {
+        put_wide(k, buffer, data.wstr(), buffer_count);
+        count = -1;
+    }
+    result(c, uint32_t(count));
+}
+
+XF_EXPORT(xboxkrnl, _vsnwprintf) {
+    // (buffer, buffer_count, format, va_list): what fits; the whole text's
+    // count even when it does not (Xenia's, unlike _snwprintf)
+    uint32_t buffer = arg(k, c, 0), buffer_count = arg(k, c, 1), format = arg(k, c, 2), arg_ptr = arg(k, c, 3);
+    if (!buffer || !buffer_count || !format) return result(c, uint32_t(-1));
+    ArgList args(k, c, arg_ptr, true);
+    FormatData data(k, format, true);
+    int32_t count = format_core(k, data, args, true);
+    if (count < 0) {
+        k.store16(buffer, 0);
+    } else if (uint32_t(count) <= buffer_count) {
+        put_wide(k, buffer, data.wstr(), uint32_t(count));
+        if (uint32_t(count) < buffer_count) k.store16(buffer + 2 * uint32_t(count), 0);
+    } else {
+        put_wide(k, buffer, data.wstr(), buffer_count);
+    }
+    result(c, uint32_t(count));
+}
+
+// the text at buffer, terminated (swprintf, vswprintf)
+int32_t write_wide_unbounded(Kernel &k, uint32_t buffer, int32_t count, const std::u16string &text) {
+    if (count <= 0) {
+        k.store16(buffer, 0);
+    } else {
+        put_wide(k, buffer, text, uint32_t(count));
+        k.store16(buffer + 2 * uint32_t(count), 0);
+    }
+    return count;
+}
+
+XF_EXPORT(xboxkrnl, swprintf) {
+    // (buffer, format, ...)
+    uint32_t buffer = arg(k, c, 0), format = arg(k, c, 1);
+    if (!buffer || !format) return result(c, uint32_t(-1));
+    ArgList args(k, c, 2);
+    FormatData data(k, format, true);
+    int32_t count = format_core(k, data, args, true);
+    result(c, uint32_t(write_wide_unbounded(k, buffer, count, data.wstr())));
+}
+
+XF_EXPORT(xboxkrnl, vswprintf) {
+    // (buffer, format, va_list)
+    uint32_t buffer = arg(k, c, 0), format = arg(k, c, 1), arg_ptr = arg(k, c, 2);
+    if (!buffer || !format) return result(c, uint32_t(-1));
+    ArgList args(k, c, arg_ptr, true);
+    FormatData data(k, format, true);
+    int32_t count = format_core(k, data, args, true);
+    result(c, uint32_t(write_wide_unbounded(k, buffer, count, data.wstr())));
+}
+
+XF_EXPORT(xboxkrnl, _vscwprintf) {
+    // (format, va_list): how many characters the text has
+    uint32_t format = arg(k, c, 0), arg_ptr = arg(k, c, 1);
+    if (!format) return result(c, uint32_t(-1));
+    ArgList args(k, c, arg_ptr, true);
+    FormatData data(k, format, true);
+    result(c, uint32_t(format_core(k, data, args, true)));
+}
+
+// ---- checksums, images, assertions (xboxkrnl_rtl.cc) ----
+
+// The CRC-32 of IEEE 802.3 (ISO-HDLC): the polynomial 0x04C11DB7 reflected,
+// one table entry per byte value, made from its definition
+constexpr std::array<uint32_t, 256> crc32_table = [] {
+    std::array<uint32_t, 256> table{};
+    for (uint32_t n = 0; n < 256; n++) {
+        uint32_t r = n;
+        for (int bit = 0; bit < 8; bit++) r = (r & 1) ? (r >> 1) ^ 0xEDB88320u : r >> 1;
+        table[n] = r;
+    }
+    return table;
+}();
+
+XF_EXPORT(xboxkrnl, RtlComputeCrc32) {
+    // (seed, buffer, length): the CRC continued from the seed (a previous
+    // result, 0 to start)
+    uint32_t seed = arg(k, c, 0), buffer = arg(k, c, 1), length = arg(k, c, 2);
+    if (!length) return result(c, seed);
+    uint32_t crc = ~seed;
+    const uint8_t *p = k.host(buffer);
+    for (uint32_t i = 0; i < length; i++) crc = crc32_table[(p[i] ^ crc) & 0xFF] ^ (crc >> 8);
+    result(c, ~crc);
+}
+
+// PE structures are little-endian
+uint16_t le16(Kernel &k, uint32_t a) { return uint16_t(k.host(a)[0] | k.host(a)[1] << 8); }
+uint32_t le32(Kernel &k, uint32_t a) { return uint32_t(le16(k, a)) | uint32_t(le16(k, a + 2)) << 16; }
+
+// the IMAGE_NT_HEADERS of a module at base: after "MZ", at e_lfanew, the
+// "PE" signature; 0 if none
+uint32_t image_nt_header(Kernel &k, uint32_t base) {
+    if (!base || le16(k, base) != 0x5A4D) return 0;
+    uint32_t nt = base + le32(k, base + 0x3C);
+    return le32(k, nt) == 0x4550 ? nt : 0;
+}
+
+XF_EXPORT(xboxkrnl, RtlImageNtHeader) { result(c, image_nt_header(k, arg(k, c, 0))); }
+
+XF_EXPORT(xboxkrnl, RtlImageDirectoryEntryToData) {
+    // (base, mapped as image, directory entry, size out): the entry's data
+    // and its size. Base's low bit says the image is a file as read, not
+    // mapped: then the data is found through the section that holds it, at
+    // its offset in the file (NT's RtlAddressInSectionTable; Xenia leaves out
+    // the section's PointerToRawData).
+    uint32_t base = arg(k, c, 0), size_ptr = arg(k, c, 3);
+    bool mapped = uint8_t(arg(k, c, 1)) != 0;
+    uint16_t entry = uint16_t(arg(k, c, 2));
+    if (base & 1) base &= ~1u, mapped = false;
+    uint32_t nt = image_nt_header(k, base);
+    if (!nt) return result(c, 0);
+    uint32_t optional = nt + 0x18;
+    if (le16(k, optional) != 0x10B) return result(c, 0);        // IMAGE_NT_OPTIONAL_HDR32_MAGIC
+    if (entry >= le32(k, optional + 0x5C)) return result(c, 0); // NumberOfRvaAndSizes
+    uint32_t directory = optional + 0x60 + 8 * entry;
+    uint32_t address = le32(k, directory);
+    if (!address) return result(c, 0);
+    k.store32(size_ptr, le32(k, directory + 4));
+    if (mapped || address < le32(k, optional + 0x3C)) return result(c, base + address); // SizeOfHeaders
+    uint32_t sections = le16(k, nt + 6), section = optional + le16(k, nt + 0x14);
+    for (uint32_t i = 0; i < sections; i++, section += 0x28) {
+        uint32_t virtual_address = le32(k, section + 0xC), raw_size = le32(k, section + 0x10);
+        if (address >= virtual_address && address < virtual_address + raw_size)
+            return result(c, base + address - virtual_address + le32(k, section + 0x14));
+    }
+    result(c, 0);
+}
+
+XF_EXPORT(xboxkrnl, RtlRip) {
+    // (message, message): an assertion's text; logged, and the code goes on
+    // (Xenia's)
+    auto text = [&](uint32_t address) {
+        if (!address) return std::string();
+        const char *s = reinterpret_cast<const char *>(k.host(address));
+        return std::string(s, strnlen(s, 1024));
+    };
+    std::fprintf(stderr, "kernel: RtlRip called, arg1 = %s, arg2 = %s\n", text(arg(k, c, 0)).c_str(),
+                 text(arg(k, c, 1)).c_str());
 }
 
 } // namespace

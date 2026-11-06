@@ -127,6 +127,11 @@ bool mount_disc(Kernel &k, const std::filesystem::path &iso, std::string &error)
 bool mount_directory(Kernel &k, const std::filesystem::path &dir, std::string &error);
 bool mount_storage(Kernel &k, const std::filesystem::path &root, std::string &error);
 
+// The DVD tray's state as the system management controller has it
+// (misc.cpp; Xenia's X_DVD_TRAY_STATE: 0 open, 2 closed), for
+// XamLoaderGetDvdTrayState.
+uint32_t smc_tray_state(Kernel &k);
+
 // the title and system processes (X_KPROCESS) in the guest globals
 uint32_t title_process(Kernel &k);
 uint32_t system_process(Kernel &k);

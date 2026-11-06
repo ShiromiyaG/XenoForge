@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 
 namespace xf::kernel {
 namespace {
@@ -454,24 +455,137 @@ void Objects::on_clock() {
 
 // ---- Ob exports (Xenia's xboxkrnl_ob.cc) ----
 
-XF_EXPORT(xboxkrnl, ObReferenceObjectByHandle) {
-    uint32_t handle = arg(k, c, 0), type_ptr = arg(k, c, 1), out_ptr = arg(k, c, 2);
-    Objects &o = objects(k);
-    if (out_ptr) k.store32(out_ptr, 0);
-    std::lock_guard<std::mutex> l(o.lock);
+namespace {
+// Xenia's ObReferenceObjectByHandle (lock held): the object's body, the
+// caller holding a reference until ObDereferenceObject
+uint32_t reference_by_handle(Kernel &k, Objects &o, uint32_t handle, uint32_t type_ptr, uint32_t out_ptr) {
     Object *object = o.object_in(handle);
-    if (!object) return result(c, X_STATUS_INVALID_HANDLE);
+    if (!object) return X_STATUS_INVALID_HANDLE;
     uint32_t native = object->guest;
     if (type_ptr) {
         uint32_t actual = o.object_type_for(*object);
         if (!actual)
             native = 0xDEADF00D; // as Xenia: a type it cannot name
         else if (actual != type_ptr)
-            return result(c, X_STATUS_OBJECT_TYPE_MISMATCH);
+            return X_STATUS_OBJECT_TYPE_MISMATCH;
     }
-    // the caller holds the reference until ObDereferenceObject
     o.retain_handle(handle);
     if (out_ptr) k.store32(out_ptr, native);
+    return X_STATUS_SUCCESS;
+}
+} // namespace
+
+XF_EXPORT(xboxkrnl, ObReferenceObjectByHandle) {
+    uint32_t handle = arg(k, c, 0), type_ptr = arg(k, c, 1), out_ptr = arg(k, c, 2);
+    Objects &o = objects(k);
+    if (out_ptr) k.store32(out_ptr, 0);
+    std::lock_guard<std::mutex> l(o.lock);
+    result(c, reference_by_handle(k, o, handle, type_ptr, out_ptr));
+}
+
+// (name: PANSI_STRING, attributes, object type, parse context, out): the
+// named object referenced, as ObReferenceObjectByHandle does. The name's
+// lookup holds no reference after (Xenia's GetObjectByName takes one more
+// on the handle that nothing gives back), and the name is the ANSI string's
+// length (Xenia reads it up to its terminator).
+XF_EXPORT(xboxkrnl, ObReferenceObjectByName) {
+    std::string name = ansi_string(k, arg(k, c, 0));
+    uint32_t type_ptr = arg(k, c, 2), out_ptr = arg(k, c, 4);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    uint32_t handle = name.empty() ? 0 : o.find_name(name);
+    if (!handle) return result(c, X_STATUS_OBJECT_NAME_NOT_FOUND);
+    uint32_t status = reference_by_handle(k, o, handle, type_ptr, out_ptr);
+    o.release_handle(handle);
+    result(c, status);
+}
+
+// (attributes, object type, unknown, out handle): a handle to the named
+// object, whatever its type (Xenia's: the name table's handle, one
+// reference more, which NtClose gives back)
+XF_EXPORT(xboxkrnl, ObOpenObjectByName) {
+    uint32_t attributes = arg(k, c, 0), handle_ptr = arg(k, c, 3);
+    if (!attributes) return result(c, X_STATUS_INVALID_PARAMETER);
+    std::string name = attributes_name(k, attributes);
+    Objects &o = objects(k);
+    std::lock_guard<std::mutex> l(o.lock);
+    uint32_t handle = name.empty() ? 0 : o.find_name(name);
+    if (!handle) return result(c, X_STATUS_OBJECT_NAME_NOT_FOUND);
+    if (handle_ptr) k.store32(handle_ptr, handle);
+    result(c, X_STATUS_SUCCESS);
+}
+
+// (object type, attributes, body size, out): a new object's body from the
+// type's allocate procedure (pool type 1 the title's, 2 the system's), after
+// an X_OBJECT_HEADER and, for a named one, an X_OBJECT_HEADER_NAME_INFO
+// before it and the name after it (Xenia's xeObCreateObject). Xenia's
+// xeObSplitName is a fatal error, so a named object is never made there;
+// here the name is split at its backslashes as NT's ObpSplitName does: the
+// object is named by its last element, and an empty element is invalid.
+XF_EXPORT(xboxkrnl, ObCreateObject) {
+    constexpr uint32_t X_STATUS_INSUFFICIENT_RESOURCES = 0xC000009A, X_STATUS_OBJECT_NAME_INVALID = 0xC0000033;
+    constexpr uint16_t NAMED_OBJECT = 0x1;
+    uint32_t type = arg(k, c, 0), attributes = arg(k, c, 1), size = arg(k, c, 2), out_ptr = arg(k, c, 3);
+    k.store32(out_ptr, 0);
+    // the pool and the title flag: by the attributes (0x1000 the title's,
+    // 0x2000 the system's), else by the calling thread's process type
+    uint32_t pool = 2;
+    uint16_t flags = 0;
+    auto by_process = [&] {
+        // (KeGetCurrentProcessType)
+        uint32_t pcr = uint32_t(c.r[13]), thread = k.load32(pcr + kpcr::CURRENT_THREAD);
+        uint8_t process_type = k.load32(pcr + kpcr::DPC_ACTIVE) ? k.host(pcr)[kpcr::PROCESS_TYPE_IN_DPC]
+                               : thread                         ? k.host(thread)[kthread::PROCESS_TYPE]
+                                                                : kprocess::SYSTEM;
+        if (process_type == kprocess::TITLE) pool = 1, flags = object_header::IS_TITLE_OBJECT;
+    };
+    uint32_t attribute_bits = attributes ? k.load32(attributes + object_attributes::ATTRIBUTES) : 0;
+    if (!attributes || !(attribute_bits & 0x1000)) {
+        if (!(attribute_bits & 0x2000)) by_process();
+    } else {
+        pool = 1, flags = object_header::IS_TITLE_OBJECT;
+    }
+    uint32_t allocate = k.load32(type + 0x0), tag = k.load32(type + object_type::POOL_TAG);
+    Objects &o = objects(k);
+    uint32_t name_ptr = attributes ? k.load32(attributes + object_attributes::NAME) : 0;
+    if (!name_ptr) {
+        uint32_t memory = uint32_t(o.call(c, allocate, {size + object_header::SIZE, tag, pool}));
+        if (!memory) return result(c, X_STATUS_INSUFFICIENT_RESOURCES);
+        k.store32(memory + object_header::POINTER_COUNT, 1);
+        k.store32(memory + object_header::HANDLE_COUNT, 0);
+        k.store32(memory + object_header::OBJECT_TYPE, type);
+        k.store16(memory + object_header::FLAGS, flags);
+        k.store32(out_ptr, memory + object_header::SIZE);
+        return result(c, X_STATUS_SUCCESS);
+    }
+    std::string path = ansi_string(k, name_ptr), element;
+    for (size_t at = 0; at <= path.size();) {
+        if (at < path.size() && path[at] == '\\') at++; // the separator before an element
+        size_t end = path.find('\\', at);
+        if (end == std::string::npos) end = path.size();
+        element = path.substr(at, end - at);
+        if (element.empty() && end < path.size()) return result(c, X_STATUS_OBJECT_NAME_INVALID); // "\\"
+        at = end;
+        if (at == path.size()) break;
+    }
+    if (element.empty()) return result(c, X_STATUS_OBJECT_NAME_INVALID);
+    // one allocation: the name info (0x10), the header, the body (aligned
+    // to 4), the name
+    uint32_t aligned = (size + 3) & ~3u, length = uint32_t(element.size());
+    uint32_t memory = uint32_t(o.call(c, allocate, {length + aligned + 0x10 + object_header::SIZE, tag, pool}));
+    if (!memory) return result(c, X_STATUS_INSUFFICIENT_RESOURCES);
+    uint32_t header = memory + 0x10, body = header + object_header::SIZE, text = body + aligned;
+    k.store32(memory + 0x0, 0); // next in the directory
+    k.store32(memory + 0x4, 0); // the directory
+    k.store16(memory + 0x8, uint16_t(length));
+    k.store16(memory + 0xA, uint16_t(length));
+    k.store32(memory + 0xC, text);
+    std::memcpy(k.host(text), element.data(), length);
+    k.store32(header + object_header::POINTER_COUNT, 1);
+    k.store32(header + object_header::HANDLE_COUNT, 0);
+    k.store32(header + object_header::OBJECT_TYPE, type);
+    k.store16(header + object_header::FLAGS, uint16_t((flags & 0xFFFE) | NAMED_OBJECT));
+    k.store32(out_ptr, body);
     result(c, X_STATUS_SUCCESS);
 }
 
