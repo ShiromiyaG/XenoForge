@@ -94,6 +94,23 @@ the others, all public.
 - Free60 (https://free60.org), the homebrew community's wiki: the hardware,
   the XEX format, STFS and SVOD packages (DLC, title updates, XBLA and Games
   on Demand), the boot chain and the hypervisor.
+- x360-research (Emma, InvoxiPlayGames,
+  https://github.com/InvoxiPlayGames/x360-research): notes and utilities
+  on the console's official offline software and on how production and
+  devkit hardware behave. It is for the kernel's and XAM's behavior where
+  Xenia has no answer. Notes are facts; check the license before taking
+  any code.
+- xenon-emu/xenon (https://github.com/xenon-emu/xenon): a low-level emulator
+  of the console's hardware (it runs XeLL and Linux), for what XenoForge's
+  high-level kernel answers on the hardware's behalf (the SMC's messages,
+  the hypervisor's calls). Its license is still to be checked; until then,
+  read only.
+- Xenia Canary's game compatibility list: which games run in Xenia and how
+  far. It is used to choose the games for track D5 and to know what to
+  expect of each.
+- The Xenia Canary Discord's `#dev` channel: people there have unlocked
+  consoles, so it is where a hardware test would be asked for ("Questions
+  only hardware answers").
 
 **The CPU and the recompiler**
 - IBM's Cell Broadband Engine documentation. Xenon's cores derive from the
@@ -111,7 +128,8 @@ the others, all public.
   GameCube's), for floating point corner cases.
 - hedge-dev's XenonRecomp (MIT, `../XenonRecomp`) and UnleashedRecomp, and
   rexglue (the fork, `../rexglue-sdk`): other Xbox 360 recompilers and their
-  runtimes.
+  runtimes. Also rexdex's recompiler (https://github.com/rexdex/recompiler,
+  the first of them) and LibertyRecomp, for comparison.
 - N64Recomp (MIT, https://github.com/N64Recomp/N64Recomp) and
   Zelda64Recomp: a recompilation SDK with a mod system, function
   replacement and hooks, for track E's API.
@@ -202,12 +220,39 @@ In this order, each where the ones before it have no answer:
   Its limits: there is no console and no D3D runtime in it. It gives
   Microsoft's tools, not the GPU's behavior.
 
-**No hardware oracle.** The owner no longer has a console (2026-11-05).
-What only hardware shows (precision, undefined cases) is settled by Xenia,
-whose test vectors and several decisions came from consoles; where Xenia
-has no answer, the question is counted as open. The other hardware oracles
-would be a homebrew test program (libxenon) on an unlocked console, or an
-old phone with an Adreno 2xx under freedreno; neither is pursued now.
+- **Xenia's trace viewer** (`xenia-gpu-d3d12-trace-viewer`, built with the
+  D3D12 trace dump): a frame draw by draw, with its state and textures, for
+  a person to see where a picture goes wrong.
+
+## Questions only hardware answers
+
+The owner no longer has a console (2026-11-05). What only hardware shows
+(precision, undefined cases) is settled in this order:
+1. **Count it first.** Every case without an answer is counted where a game
+   reaches it, as the renderer's `approximate` and `skip` already are. The
+   CPU's open estimates (`fres`, `vrefp`, `vlogefp`, `vexptefp` in the
+   ranges no vector covers) get counters too. A case no game reaches is
+   left alone.
+2. **The default: decide and keep it easy to fix.** Follow Xenia, whose test
+   vectors and several decisions came from consoles, or else AMD's and
+   IBM's documentation. Mark the case as open in the code, and keep each
+   doubtful value in one table, so that a measurement later changes a table
+   and nothing else.
+3. **A sibling that is easy to get, for the CPU: the PS3.** Xenon's cores
+   derive from the Cell's PPE, with the same IBM VMX unit, so the
+   estimates very likely agree. That is checked first on the cases already
+   known from the 360. If they agree, a PS3 running homebrew (HEN, any
+   model) measures the rest. RPCS3 may already hold values measured on
+   hardware: those are facts, though its code is GPL and is not copied.
+4. **The community.** A small test program (libxenon) that measures the open
+   instructions and formats and writes the results to a file, asked of
+   someone with an unlocked console (Xenia Canary's Discord, Free60). This
+   is how Xenia's CPU tests were made.
+5. **Last resort:** a used console unlocked with RGH, only if a game hits an
+   open case that steps 2-4 leave unanswered.
+
+An old phone with an Adreno 2xx under freedreno would be a GPU sibling, but
+it is further from Xenos than the PPE is from Xenon, and is not pursued.
 
 ## Stack
 
