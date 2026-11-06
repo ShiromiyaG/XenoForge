@@ -90,7 +90,20 @@ the others, all public.
 **The whole system**
 - "Xbox 360 System Architecture", J. Andrews and N. Baker, IEEE Micro,
   March-April 2006. The console's architects describe the CPU, the GPU and
-  its EDRAM, memory, and the XMA decoder.
+  its EDRAM, memory, and the XMA decoder. A copy is at `../xbox-system.pdf`
+  (IEEE's, never in the repository). It is an overview, not a
+  specification. The facts in it that bear on XenoForge:
+  - VMX128's dot product "simplifies the rounding of intermediate multiply
+    results". This is a lead for `vmsum3fp128` and `vmsum4fp128`
+    precision, not the exact rule.
+  - The GPU's ALUs flush denormals to zero on reads, and simplify rounding
+    modes, NaN handling and exceptions.
+  - XPS: the CPU writes procedural geometry into a locked set of the L2 and
+    the GPU reads it straight from there (128-byte reads over the FSB,
+    coherent). Data a game makes on the CPU each frame is therefore read by
+    the GPU at once, with no flush, and the renderer must see those writes.
+  - VMX128 has D3D's compressed formats (the `vpkd3d128` and `vupkd3d128`
+    family), the same ones the GPU reads.
 - Free60 (https://free60.org), the homebrew community's wiki: the hardware,
   the XEX format, STFS and SVOD packages (DLC, title updates, XBLA and Games
   on Demand), the boot chain and the hypervisor.
