@@ -11,6 +11,10 @@ onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segund
 
 - Repositório local (ainda sem remoto). Commits locais de rotina permitidos; criar repo no GitHub ou dar push
   só quando o dono pedir. Docs, comentários, logs e commits em inglês; só este arquivo em português.
+- **No máximo 4 agentes rodando ao mesmo tempo** (pedido do dono, 2026-11-06: oito em paralelo estouraram o
+  limite de uso de 5 horas). Novos agentes só quando os anteriores terminarem. Agentes `xf-*`
+  (`.claude/agents`), em worktrees; builds com `-j 4`; quem não mexe nos headers do código gerado usa
+  `-DXF_GAME_LIBS=F:/RECOMPs/external/game-libs/<commit>`.
 - C++20, CMake + Ninja + clang; namespace `xf`; estilo do `.clang-format` (4 espaços, 120 colunas).
   Build: `cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`,
   `cmake --build build`, `ctest --test-dir build`. Testes em `tests/` com o `CHECK` de `tests/check.h`.
