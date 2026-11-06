@@ -119,22 +119,24 @@ void TraceWriter::put_encoded(std::span<const uint8_t> head, size_t length_at, s
 
 // MemoryCommand: type, base_ptr, encoding_format, encoded_length,
 // decoded_length; the range lies within physical memory
-void TraceWriter::put_memory(uint32_t command, uint32_t address, uint32_t bytes) {
+void TraceWriter::put_memory(uint32_t command, uint32_t address, uint32_t bytes, const uint8_t *data) {
     uint8_t head[20] = {};
     set_u32(head, command);
     set_u32(head + 4, address);
     set_u32(head + 16, bytes);
-    put_encoded(head, 12, {memory_ + address, bytes});
+    put_encoded(head, 12, {data ? data : memory_ + address, bytes});
 }
 
 void TraceWriter::open(uint64_t frame) {
     // the backend's work finished (what it calls back with comes before the
     // trace) and EDRAM read, without the lock: the backend reports to it
     std::vector<uint8_t> edram;
+    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> gpu_memory;
     bool have_edram = false;
     if (source_) {
         source_->settle();
         have_edram = source_->snapshot_edram(edram);
+        source_->gpu_memory(gpu_memory);
     }
     std::lock_guard<std::mutex> lock(mutex_);
     char name[64];
@@ -192,6 +194,12 @@ void TraceWriter::open(uint64_t frame) {
         put(head, sizeof(head));
         put(data.data(), data.size());
     }
+    // what the GPU holds and guest memory does not (InitializeTraceCompleteDownloads)
+    for (const auto &[address, bytes] : gpu_memory) {
+        if (bytes.empty() || address >= PHYSICAL_SIZE || bytes.size() > PHYSICAL_SIZE - address) continue;
+        put_memory(MEMORY_READ, address, uint32_t(bytes.size()), bytes.data());
+        learn(address, uint32_t(bytes.size()), bytes.data());
+    }
 }
 
 void TraceWriter::close() {
@@ -204,7 +212,7 @@ void TraceWriter::close() {
 
 // ---- the shadow of what the trace gave ----
 
-void TraceWriter::learn(uint32_t address, uint32_t bytes) {
+void TraceWriter::learn(uint32_t address, uint32_t bytes, const uint8_t *data) {
     uint64_t end = uint64_t(address) + bytes;
     for (uint64_t at = address; at < end;) {
         uint32_t page = uint32_t(at / PAGE), lo = uint32_t(at % PAGE);
@@ -214,7 +222,7 @@ void TraceWriter::learn(uint32_t address, uint32_t bytes) {
             p = std::make_unique<Page>();
             std::memset(p->known, 0, sizeof(p->known));
         }
-        std::memcpy(p->bytes + lo, memory_ + at, hi - lo);
+        std::memcpy(p->bytes + lo, data ? data + (at - address) : memory_ + at, hi - lo);
         for (uint32_t b = lo; b < hi;) {
             uint32_t word = b / 64, first = b % 64, n = std::min(64 - first, hi - b);
             p->known[word] |= (n == 64 ? ~0ull : ((1ull << n) - 1)) << first;

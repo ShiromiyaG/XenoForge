@@ -338,6 +338,10 @@ struct Shader {
     // vertex kill it writes
     bool fetches_textures = false;
     bool writes_position_y = false, writes_position_w = false, writes_point_size = false, writes_vertex_kill = false;
+    // memexport: whether it writes any eM#, and the float constants its eA
+    // writes take the stream from (Shader::memexport_stream_constants)
+    bool exports = false;
+    std::set<uint32_t> stream_constants;
     // per texture slot, the first fetch's filter overrides: mag, min, mip, aniso (3: the constant's)
     std::map<uint32_t, std::array<uint32_t, 4>> filters;
 };
@@ -585,7 +589,8 @@ public:
     }
     // the processor's own writes (fences, reports), and a trace's memory:
     // the textures over them are loaded again at their next use, and what a
-    // resolve wrote there and guest memory does not have yet stays the GPU's
+    // resolve wrote there and guest memory does not have yet stays the GPU's;
+    // memory exports' pages there are guest memory's again
     void memory_written(uint32_t address, uint32_t bytes) override {
         Call call(*this, nullptr);
         uint64_t end = uint64_t(address) + bytes;
@@ -595,6 +600,9 @@ public:
         add_span(written, address, bytes);
         for (WriteBack &w : writebacks_)
             for (auto [start, stop] : written) cut(w.pieces, start, stop);
+        if (!exported_pages_.empty())
+            for (auto [start, stop] : written)
+                if (stop > start) drop_exported(start >> PAGE_SHIFT, (stop - 1) >> PAGE_SHIFT);
     }
 
     // EDRAM as a trace began, in Xenia's layout (edram.glsl's)
@@ -641,6 +649,7 @@ public:
     }
     void settle() override { drain(); }
     bool snapshot_edram(std::vector<uint8_t> &out) override;
+    void gpu_memory(std::vector<std::pair<uint32_t, std::vector<uint8_t>>> &out) override;
 
 private:
     // adds the time from its making to its end to a count of seconds
@@ -833,6 +842,23 @@ private:
     VkDeviceSize upload_to_mirror(const std::vector<Range> &ranges);
     void mirror_written(const std::vector<Range> &ranges);
     void finish_writebacks(uint64_t serial);
+
+    // ---- memexport: shaders writing guest memory, into the mirror ----
+    // The 4 KB pages memory exports wrote, which the mirror holds and guest
+    // memory does not (Xenia keeps them on the GPU too), each with the hash
+    // of guest memory's page as it was then: when those bytes change, the
+    // CPU has written the page since and guest memory's bytes are the newer
+    // (Xenia's page watches, checked here when the page is used).
+    static constexpr uint32_t PAGE_SHIFT = 12;
+    std::map<uint32_t, uint64_t> exported_pages_;
+    uint64_t page_hash(uint32_t page) const {
+        return hash_bytes(memory_.data() + (size_t(page) << PAGE_SHIFT), size_t(1) << PAGE_SHIFT, page);
+    }
+    void export_ranges(const Shader &s, uint32_t stage, std::vector<Range> &ranges);
+    bool exported(const Range &r) const;
+    void check_exported(const std::vector<Range> &ranges);
+    void drop_exported(uint32_t first_page, uint32_t last_page);
+    void end_export(const std::vector<Range> &pages);
 
     vk::Device &d_;
     VkDevice dev_;
@@ -1538,7 +1564,10 @@ VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4]
     VkRenderingInfo rendering_info{VK_STRUCTURE_TYPE_RENDERING_INFO};
     rendering_info.renderArea = {{0, 0}, {pass.width, pass.height}};
     rendering_info.layerCount = 1;
-    rendering_info.colorAttachmentCount = 4;
+    // none at all for memory exports alone (their pipelines discard rasterization)
+    bool attachments_used = depth != nullptr;
+    for (uint32_t i = 0; i < 4; i++) attachments_used |= colors[i] != nullptr;
+    rendering_info.colorAttachmentCount = attachments_used ? 4 : 0;
     rendering_info.pColorAttachments = attachments;
     if (depth) rendering_info.pDepthAttachment = rendering_info.pStencilAttachment = &depth_attachment;
     if (options_.gpu_timing) {
@@ -1628,31 +1657,80 @@ bool Impl::grow(vk::Buffer &buffer, VkDeviceSize bytes, VkBufferUsageFlags usage
 
 // ---- the mirror ----
 
-// whether a resolve wrote any of the ranges and guest memory does not have it yet
+// whether a resolve wrote any of the ranges and guest memory does not have
+// it yet, or a memory export did (which guest memory never gets)
 bool Impl::pending(const std::vector<Range> &ranges) const {
     for (const WriteBack &w : writebacks_)
         for (const Piece &p : w.pieces)
             for (const Range &r : ranges)
                 if (overlaps({p.start, p.end}, r)) return true;
+    for (const Range &r : ranges)
+        if (exported(r)) return true;
     return false;
 }
 
 std::vector<Range> Impl::not_pending(const std::vector<Range> &ranges) const {
     std::vector<Range> out = ranges;
-    for (const WriteBack &w : writebacks_)
-        for (const Piece &p : w.pieces) {
-            std::vector<Range> rest;
-            for (const Range &r : out) {
-                if (!overlaps({p.start, p.end}, r)) {
-                    rest.push_back(r);
-                    continue;
-                }
-                if (r.first < p.start) rest.push_back({r.first, p.start});
-                if (p.end < r.second) rest.push_back({p.end, r.second});
+    auto take_out = [&](uint32_t start, uint32_t end) {
+        std::vector<Range> rest;
+        for (const Range &r : out) {
+            if (!overlaps({start, end}, r)) {
+                rest.push_back(r);
+                continue;
             }
-            out = std::move(rest);
+            if (r.first < start) rest.push_back({r.first, start});
+            if (end < r.second) rest.push_back({end, r.second});
+        }
+        out = std::move(rest);
+    };
+    for (const WriteBack &w : writebacks_)
+        for (const Piece &p : w.pieces) take_out(p.start, p.end);
+    if (!exported_pages_.empty())
+        for (const Range &r : ranges) {
+            if (r.second <= r.first) continue;
+            auto it = exported_pages_.lower_bound(r.first >> PAGE_SHIFT);
+            for (; it != exported_pages_.end() && it->first <= (r.second - 1) >> PAGE_SHIFT; ++it)
+                take_out(it->first << PAGE_SHIFT, (it->first + 1) << PAGE_SHIFT);
         }
     return out;
+}
+
+// ---- memory exports' pages ----
+
+// whether a memory export wrote any page of the range
+bool Impl::exported(const Range &r) const {
+    if (exported_pages_.empty() || r.second <= r.first) return false;
+    auto it = exported_pages_.lower_bound(r.first >> PAGE_SHIFT);
+    return it != exported_pages_.end() && it->first <= (r.second - 1) >> PAGE_SHIFT;
+}
+
+// The exported pages of the ranges whose bytes in guest memory changed since
+// the export: the CPU wrote them, and they are guest memory's again.
+void Impl::check_exported(const std::vector<Range> &ranges) {
+    for (const Range &r : ranges) {
+        if (exported_pages_.empty()) return;
+        if (r.second <= r.first) continue;
+        auto it = exported_pages_.lower_bound(r.first >> PAGE_SHIFT);
+        while (it != exported_pages_.end() && it->first <= (r.second - 1) >> PAGE_SHIFT) {
+            uint32_t page = it->first;
+            ++it;
+            if (page_hash(page) != exported_pages_[page]) drop_exported(page, page);
+        }
+    }
+}
+
+// Pages that are guest memory's again: the textures loaded from the mirror
+// over them are loaded again.
+void Impl::drop_exported(uint32_t first_page, uint32_t last_page) {
+    auto from = exported_pages_.lower_bound(first_page), to = exported_pages_.upper_bound(last_page);
+    if (from == to) return;
+    exported_pages_.erase(from, to);
+    Range dropped{first_page << PAGE_SHIFT, (last_page + 1) << PAGE_SHIFT};
+    for (auto &[key, t] : textures_) {
+        if (t->high <= dropped.first || t->low >= dropped.second) continue;
+        for (const Range &tr : t->ranges)
+            if (overlaps(dropped, tr)) t->stale = true;
+    }
 }
 
 // until guest memory has what resolves wrote over the ranges
@@ -1761,6 +1839,86 @@ void Impl::finish_writebacks(uint64_t serial) {
     }
 }
 
+// ---- memexport ----
+//
+// As Xenia's IssueDraw does it: the streams a draw's shaders export to are
+// found from their float constants; guest memory's bytes under their pages
+// go into the mirror first (where it has nothing newer: Xenia's
+// RequestRange), the draw's shaders write the mirror, and the pages are then
+// the GPU's (Xenia's RangeWrittenByGpu): textures over them are loaded
+// again, from the mirror, and vertex data there is read from the mirror,
+// until the CPU writes them. Guest memory never gets the exported bytes, as
+// with Xenia's default (readback_memexport off): copied back late they
+// would overwrite what the CPU wrote there after its fence, which the
+// processor writes before the GPU has run the export.
+
+// a format's bits per element, for the formats exports take (Xenia's
+// kResolvable formats); 0 for the others
+static uint32_t export_format_bits(uint32_t format) {
+    switch (format) {
+    case 2: case 8: case 9: return 8;                                       // 8, 8_A, 8_B
+    case 3: case 4: case 5: case 10: case 15: case 24: case 30: return 16; // 1_5_5_5 ... 16, 16_FLOAT
+    case 6: case 7: case 14: case 16: case 17: case 25: case 31: case 36: // 8_8_8_8 ... 32_FLOAT
+    case 50: case 54: case 55: case 56: return 32;                         // the AS_16_16_16_16 ones
+    case 26: case 32: case 37: return 64;                                  // 16_16_16_16 (float), 32_32_FLOAT
+    case 38: return 128;                                                   // 32_32_32_32_FLOAT
+    default: return 0;
+    }
+}
+
+// The pages of the streams the shader exports to (draw_util.cc's
+// AddMemExportRanges): per float constant its eA takes a stream from, the
+// stream's base and count, when the bits the sequencer checks are there, in
+// a format exports take; whole pages, merged.
+void Impl::export_ranges(const Shader &s, uint32_t stage, std::vector<Range> &ranges) {
+    if (!s.exports) return;
+    for (uint32_t c : s.stream_constants) {
+        if (c > 255) continue;
+        const uint32_t *k = &regs_[reg::ALU_CONSTANTS + stage * 1024 + c * 4];
+        uint32_t count = k[3] & 0x7FFFFF;
+        if (k[0] >> 30 != 1 || k[2] >> 20 != 0x4B0 || k[3] >> 23 != 0x96 || !count) continue;
+        uint32_t format = (k[2] >> 8) & 0x3F, bits = export_format_bits(format);
+        if (!bits) {
+            approximate("memory export to format " + std::to_string(format) + " (not written)");
+            continue;
+        }
+        uint64_t start = uint64_t(k[0] & 0x3FFFFFFF) << 2, end = start + uint64_t(count) * (bits / 8);
+        if (start >= GUEST_MEMORY) continue;
+        const uint64_t page = uint64_t(1) << PAGE_SHIFT;
+        start &= ~(page - 1);
+        end = std::min<uint64_t>((end + page - 1) & ~(page - 1), GUEST_MEMORY);
+        ranges.push_back({uint32_t(start), uint32_t(end)});
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<Range> merged;
+    for (const Range &r : ranges) {
+        if (!merged.empty() && r.first <= merged.back().second)
+            merged.back().second = std::max(merged.back().second, r.second);
+        else
+            merged.push_back(r);
+    }
+    ranges = std::move(merged);
+}
+
+// After the draw: the streams' pages are the GPU's, each with its hash in
+// guest memory; the textures over them loaded again at their next use. The
+// pass ends, so what reads the mirror next comes after a barrier.
+void Impl::end_export(const std::vector<Range> &pages) {
+    if (pages.empty()) return;
+    end_pass();
+    // the shaders wrote the mirror there: its shadow no longer knows those
+    // pages (draws reading vertex data from the mirror upload by the shadow)
+    mirror_written(pages);
+    for (auto [start, end] : pages)
+        for (uint32_t page = start >> PAGE_SHIFT; page < end >> PAGE_SHIFT; page++) exported_pages_[page] = page_hash(page);
+    for (auto &[key, t] : textures_) {
+        if (t->high <= pages.front().first || t->low >= pages.back().second) continue;
+        for (const Range &r : pages)
+            for (const Range &tr : t->ranges)
+                if (overlaps(r, tr)) t->stale = true;
+    }
+}
+
 // ---- shaders: what IM_LOAD and IM_LOAD_IMMEDIATE load, kept by hash ----
 
 void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
@@ -1813,7 +1971,9 @@ bool Impl::translate(Shader &s, std::string &why) {
                             s.writes_point_size |= (mask & 1) != 0;
                             s.writes_vertex_kill |= (mask & 4) != 0;
                         }
+                        if (r->target == xf::ucode::StorageTarget::ExportData && r->index < 5 && mask) s.exports = true;
                     }
+                    if (uint32_t c = a->memexport_stream_constant(); c != UINT32_MAX) s.stream_constants.insert(c);
                 } else if (const auto *t = std::get_if<xf::ucode::TextureFetchInstruction>(&slot.instruction)) {
                     if (t->has_result()) s.fetches_textures = true;
                     if (t->opcode == xf::ucode::FetchOpcode::TextureFetch && !s.filters.count(t->operands[1].index))
@@ -2042,6 +2202,45 @@ bool Impl::snapshot_edram(std::vector<uint8_t> &out) {
     return true;
 }
 
+// The pages memory exports wrote and the CPU has not since, read back from
+// the mirror, runs of pages together: what a trace records as it begins
+// (Xenia's trace downloads the ranges its GPU wrote)
+void Impl::gpu_memory(std::vector<std::pair<uint32_t, std::vector<uint8_t>>> &out) {
+    out.clear();
+    Call call(*this, nullptr);
+    if (!call || exported_pages_.empty()) return;
+    std::vector<Range> pages;
+    for (auto [page, hash] : exported_pages_) pages.push_back({page << PAGE_SHIFT, (page + 1) << PAGE_SHIFT});
+    check_exported(pages);
+    std::vector<Range> runs;
+    for (auto [page, hash] : exported_pages_) {
+        uint32_t start = page << PAGE_SHIFT, end = (page + 1) << PAGE_SHIFT;
+        if (!runs.empty() && runs.back().second == start) runs.back().second = end;
+        else runs.push_back({start, end});
+    }
+    VkDeviceSize total = 0;
+    for (auto [start, end] : runs) total += end - start;
+    if (!total) return;
+    VkBuffer back;
+    VkDeviceSize at;
+    uint8_t *data = readback(total, back, at);
+    if (!data) return;
+    std::vector<VkBufferCopy> copies;
+    VkDeviceSize offset = 0;
+    for (auto [start, end] : runs) {
+        copies.push_back({start, at + offset, end - start});
+        offset += end - start;
+    }
+    vkCmdCopyBuffer(outside(), mirror_.buffer, back, uint32_t(copies.size()), copies.data());
+    sync();
+    if (!fatal_.empty()) return;
+    offset = 0;
+    for (auto [start, end] : runs) {
+        out.push_back({start, std::vector<uint8_t>(data + offset, data + offset + (end - start))});
+        offset += end - start;
+    }
+}
+
 VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     auto key = std::make_pair(t.image.format, t.msaa);
     auto it = load_pipelines_.find(key);
@@ -2246,10 +2445,19 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     std::copy(fetch, fetch + 6, key.begin());
     auto it = textures_.find(key);
     Texture *t = it == textures_.end() ? nullptr : it->second.get();
+    // loaded from exported pages the CPU has written since: loaded again
+    if (t && t->pending && !exported_pages_.empty()) check_exported(t->ranges);
     if (t && !t->stale) {
-        bool same = t->pending;
-        if (!same) {
-            Timer timer(report_.check_seconds);
+        bool same;
+        Timer timer(report_.check_seconds);
+        if (t->pending) {
+            // loaded from the mirror: the parts guest memory gave it are
+            // checked by hash all the same (a memory export's pages keep a
+            // texture pending for good), and a trace gets them
+            std::vector<Range> guest = not_pending(t->ranges);
+            same = hash_ranges(guest) == t->hash;
+            if (same) traced(guest);
+        } else {
             uint64_t hash = hash_ranges(t->ranges);
             if (t->rehash) t->hash = hash, t->rehash = false;
             same = hash == t->hash;
@@ -2265,11 +2473,17 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     std::vector<Range> ranges = ranges_of(plan.footprint);
     VkFormat format = vk_format_of(plan.format);
     bool direct = format != VK_FORMAT_UNDEFINED && d_.format_supported(format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+    check_exported(ranges);
     bool gpu = pending(ranges);
     if (gpu && (!direct || plan.load == texture::Load::Dxt3aToR8 || plan.load == texture::Load::Ctx1ToRg8)) {
         // a format the GPU's loads do not make: decoded from guest memory
-        // once the resolve's bytes are there
+        // once the resolve's bytes are there (a memory export's never are)
         wait_for(ranges);
+        for (const Range &r : ranges)
+            if (exported(r)) {
+                approximate("a texture over memory export pages decoded from guest memory");
+                break;
+            }
         gpu = false;
     }
 
@@ -2401,7 +2615,9 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     t->rehash = false;
     if (gpu) {
         if (!gpu_load(*t, plan, fresh)) return nullptr;
-        t->pending = true, t->hash = 0;
+        // the hash of what guest memory gave it (the parts the mirror holds
+        // nothing newer of)
+        t->pending = true, t->hash = hash_ranges(not_pending(t->ranges));
         pending_textures_.insert(t);
     } else {
         if (!cpu_upload(*t, image, levels, format, fresh)) return nullptr;
@@ -2780,6 +2996,8 @@ void Impl::draw(const gpu::Draw &d) {
     bool index32 = d.index32;
     if (count == 0) return;
     bool color = EdramMode(mode) == EdramMode::ColorDepth;
+    // whether the draw can write any target (a color channel enabled, or depth or stencil on)
+    bool writes_targets = (color && (regs_[reg::RB_COLOR_MASK] & 0xFFFF) != 0) || (regs_[reg::RB_DEPTHCONTROL] & 3) != 0;
     {
         // A draw that can write nothing (no color channel enabled, depth and
         // stencil off, no memory export) leaves EDRAM and memory as they
@@ -2789,10 +3007,8 @@ void Impl::draw(const gpu::Draw &d) {
         // frame.
         const Shader *v = have_vertex_ ? shader(vertex_hash_) : nullptr;
         const Shader *p = have_pixel_ ? shader(pixel_hash_) : nullptr;
-        bool colors = color && (regs_[reg::RB_COLOR_MASK] & 0xFFFF) != 0;
-        bool depth_stencil = (regs_[reg::RB_DEPTHCONTROL] & 3) != 0;
         bool exports = (v && v->summary.memexport) || (color && p && p->summary.memexport);
-        if (!colors && !depth_stencil && !exports) {
+        if (!writes_targets && !exports) {
             if (options_.verbose)
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
             return;
@@ -2821,12 +3037,31 @@ void Impl::draw(const gpu::Draw &d) {
     std::string why;
     if (!translate(*vs, why)) return skip("vertex shader: " + why);
     if (ps && !translate(*ps, why)) return skip("pixel shader: " + why);
-    if (vs->summary.memexport || (ps && ps->summary.memexport)) return skip("memory export");
 
     // render targets
     uint32_t surface = regs_[reg::RB_SURFACE_INFO], pitch = surface & 0x3FFF, msaa = (surface >> 16) & 3;
-    if (!pitch) return skip("surface pitch 0");
+    if (!pitch) return skip("surface pitch 0"); // Xenia draws nothing then, exports neither
     if (msaa == 3) return skip("MSAA mode 3");
+    // Memory exports. A draw that rasterizes nothing (it writes no target,
+    // or the vertex shader only exports: SQ_PROGRAM_CNTL's vs_export_mode
+    // multipass; or no target, viewport or scissor is left) still runs its
+    // vertex shader for them, as Xenia's does: alone, with rasterization
+    // discarded, each index once (a point list).
+    bool export_only = false;
+    auto rasterizes_nothing = [&]() {
+        if (ps && ps->exports) approximate("pixel shader memory export in a draw that rasterizes nothing (not done)");
+        if (!vs->exports) return false;
+        export_only = true;
+        ps = nullptr;
+        return true;
+    };
+    if (!writes_targets || ((regs_[reg::SQ_PROGRAM_CNTL] >> 24) & 7) == 7) {
+        if (!rasterizes_nothing()) {
+            if (options_.verbose)
+                std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
+            return;
+        }
+    }
     RenderTarget *colors[4] = {};
     uint32_t color_masks[4] = {};
     float color_scales[4] = {1, 1, 1, 1};
@@ -2846,7 +3081,7 @@ void Impl::draw(const gpu::Draw &d) {
         colors[i] = render_target(false, info & 0xFFF, pitch, msaa, format);
         if (!colors[i]) return fatal_.empty() ? skip(std::string("color target format ") + color_target_format_name(format)) : void();
     }
-    uint32_t depth_control = regs_[reg::RB_DEPTHCONTROL];
+    uint32_t depth_control = export_only ? 0 : regs_[reg::RB_DEPTHCONTROL];
     RenderTarget *depth = nullptr;
     if (depth_control & 3) {
         uint32_t info = regs_[reg::RB_DEPTH_INFO], format = (info >> 16) & 1;
@@ -2860,7 +3095,7 @@ void Impl::draw(const gpu::Draw &d) {
     for (RenderTarget *t : colors)
         if (t) width = std::min(width, t->width), height = std::min(height, t->height);
     if (depth) width = std::min(width, depth->width), height = std::min(height, depth->height);
-    if (width == 8192 && height == 8192) {
+    if (width == 8192 && height == 8192 && !export_only && !rasterizes_nothing()) {
         // no target the pixel shader writes and no depth: nothing it could change
         if (options_.verbose)
             std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
@@ -2871,11 +3106,23 @@ void Impl::draw(const gpu::Draw &d) {
     bool depth_float24 = depth && depth->format == 1;
     Viewport viewport = host_viewport(regs_, max_viewport_[0], max_viewport_[1], ps && ps->writes_depth,
                                       depth_float24 && (depth_control & 2));
-    if (viewport.empty) return;
     VkRect2D scissor = host_scissor(regs_, pitch);
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
     scissor.extent.height = std::min<uint32_t>(scissor.extent.height, height - std::min<uint32_t>(scissor.offset.y, height));
-    if (!scissor.extent.width || !scissor.extent.height) return;
+    if (!export_only && (viewport.empty || !scissor.extent.width || !scissor.extent.height) && !rasterizes_nothing()) return;
+    if (export_only) {
+        std::fill(std::begin(colors), std::end(colors), nullptr);
+        depth = nullptr, depth_control = 0;
+    }
+    // (the targets take over their EDRAM tiles below, once the draw's lowest
+    // row is known: draw_max_y)
+
+    // the pages of the streams the shaders export to (the pixel shader's only
+    // when it runs)
+    std::vector<Range> exported;
+    export_ranges(*vs, 0, exported);
+    if (ps) export_ranges(*ps, 1, exported);
+    bool exports = vs->exports || (ps && ps->exports);
 
     // indices: the guest's, swapped, plus the index offset (as Xenia's
     // vertex shader adds it), reset indices kept as the host's restart index
@@ -2904,7 +3151,13 @@ void Impl::draw(const gpu::Draw &d) {
     } else {
         for (uint32_t i = 0; i < count; i++) indices.push_back(vertex(i));
     }
-    if (primitive == 13) {
+    if (export_only) {
+        // each index a point, the reset indices left out
+        std::erase(indices, UINT32_MAX);
+        if (indices.empty()) return;
+        topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        restart = rectangles = points = false;
+    } else if (primitive == 13) {
         // quads to triangle pairs
         std::vector<uint32_t> triangles;
         for (uint32_t q = 0; q + 3 < indices.size(); q += 4)
@@ -3105,6 +3358,22 @@ void Impl::draw(const gpu::Draw &d) {
     info.pColorBlendState = &blend_state;
     info.pDynamicState = &dynamic;
     info.layout = layout_;
+    if (export_only) {
+        // the vertex shader alone, rasterization discarded: no viewport,
+        // multisample, depth, blend or dynamic state; a render pass without
+        // attachments
+        key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), 0xE0u};
+        raster = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        raster.rasterizerDiscardEnable = VK_TRUE;
+        raster.lineWidth = 1.0f;
+        info.stageCount = 1;
+        info.pViewportState = nullptr;
+        info.pMultisampleState = nullptr;
+        info.pDepthStencilState = nullptr;
+        info.pColorBlendState = nullptr;
+        info.pDynamicState = nullptr;
+        rendering.colorAttachmentCount = 0;
+    }
     VkPipeline pipe = pipeline(key, info);
     if (!pipe) return skip("vkCreateGraphicsPipelines failed");
 
@@ -3112,9 +3381,10 @@ void Impl::draw(const gpu::Draw &d) {
     // use (address and size, as Xenia's IssueDraw requests them), merged,
     // read from the mirror in device memory as Xenia's shaders read its
     // shared memory, guest memory's bytes put there where they changed
-    // (upload_to_mirror) and where a resolve has not written newer ones.
-    // (Read from host memory, the arena's copies, they made the scene's
-    // vertex shaders wait on the bus: 6.7 ms of El Chavo Kart's race frame.)
+    // (upload_to_mirror) and where a resolve or an export has not written
+    // newer ones. (Read from host memory, the arena's copies, they made the
+    // scene's vertex shaders wait on the bus: 6.7 ms of El Chavo Kart's race
+    // frame.)
     struct VertexSlot {
         uint32_t slot, start, end;
     };
@@ -3145,9 +3415,15 @@ void Impl::draw(const gpu::Draw &d) {
                 vertex_ranges.push_back(r);
         }
     }
+    // exported pages the CPU has written since are guest memory's again
+    check_exported(vertex_ranges);
+    check_exported(exported);
     {
         Timer timer(report_.vertex_seconds);
         report_.vertex_bytes += upload_to_mirror(not_pending(vertex_ranges));
+        // guest memory's bytes under the streams' pages, where the mirror has
+        // nothing newer (Xenia's RequestRange of each stream)
+        report_.vertex_bytes += upload_to_mirror(not_pending(exported));
     }
     if (!fatal_.empty()) return;
 
@@ -3195,11 +3471,14 @@ void Impl::draw(const gpu::Draw &d) {
         index_buffer = arena_.buffer;
     }
 
-    // record, in the render pass of these targets
+    // record, in the render pass of these targets (none for exports alone);
+    // a draw that exports begins its own, after a barrier, as what came
+    // before in the pass may read the mirror where it writes
+    if (exports) end_pass();
     Pass pass;
     for (uint32_t i = 0; i < 4; i++) pass.colors[i] = colors[i] ? colors[i]->view : VK_NULL_HANDLE;
     pass.depth = depth ? depth->view : VK_NULL_HANDLE;
-    pass.width = width, pass.height = height;
+    pass.width = export_only ? 1 : width, pass.height = export_only ? 1 : height;
     VkCommandBuffer c = begin_pass(pass, colors, depth);
     if (pipe != bound_pipeline_) {
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -3208,6 +3487,19 @@ void Impl::draw(const gpu::Draw &d) {
     VkDescriptorSet sets[2] = {draw_sets_[1], bindless_};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 3, dynamic_offsets);
     vkCmdBindIndexBuffer(c, index_buffer, index_at, VK_INDEX_TYPE_UINT32);
+    if (export_only) {
+        vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
+        report_.drawn++;
+        end_export(exported);
+        if (options_.verbose) {
+            std::fprintf(stderr, "  draw %llu: %s, %u indices, memory export only, shader %016llX, streams",
+                         (unsigned long long)report_.draws, primitive_name(primitive), count,
+                         (unsigned long long)vertex_hash_);
+            for (auto [start, end] : exported) std::fprintf(stderr, " %08X-%08X", start, end);
+            std::fprintf(stderr, "\n");
+        }
+        return;
+    }
     uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
     if (!((depth_control >> 7) & 1)) stencil_bf = stencil;
     const float *blend_constants = reinterpret_cast<const float *>(&regs_[r::RB_BLEND_RED]);
@@ -3254,12 +3546,16 @@ void Impl::draw(const gpu::Draw &d) {
     vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
     if (options_.gpu_timing_draws) gpu_mark("draws: between draws");
     report_.drawn++;
-    if (options_.verbose)
-        std::fprintf(stderr, "  draw %llu: %s, %u indices, %s%s, shaders %016llX %016llX, blend %08X, mask %04X\n",
+    end_export(exported);
+    if (options_.verbose) {
+        std::fprintf(stderr, "  draw %llu: %s, %u indices, %s%s%s, shaders %016llX %016llX, blend %08X, mask %04X, vertices",
                      (unsigned long long)report_.draws, primitive_name(primitive), count,
-                     ps ? "color and depth" : "depth only", depth ? ", depth on" : "", (unsigned long long)vertex_hash_,
-                     ps ? (unsigned long long)pixel_hash_ : 0ull, regs_[r::RB_BLENDCONTROL[0]],
-                     regs_[reg::RB_COLOR_MASK] & 0xFFFF);
+                     ps ? "color and depth" : "depth only", depth ? ", depth on" : "", exports ? ", memory export" : "",
+                     (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull,
+                     regs_[r::RB_BLENDCONTROL[0]], regs_[reg::RB_COLOR_MASK] & 0xFFFF);
+        for (auto [start, end] : vertex_ranges) std::fprintf(stderr, " %08X-%08X", start, end);
+        std::fprintf(stderr, "\n");
+    }
 }
 
 // ---- resolves ----

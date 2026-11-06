@@ -160,8 +160,66 @@ the image is the hook's only while it runs. The player's presenter
 converts it into a picture of its own on the GPU there and returns
 ([runtime.md](runtime.md), "The player").
 
-**The rest, as games ask:** memexport (shaders writing guest memory, then
-what it overlaps invalidated), rectangle and quad lists and point sprites
+**Memory exports (memexport, 2026-11-05)**, as Xenia does them
+(`spirv_shader_translator_memexport.cc` and, where it differs, the more
+mature D3D12 translator's `dxbc_shader_translator_memexport.cc`;
+`draw_util.cc`'s `AddMemExportRanges`; both backends' `IssueDraw`, which
+agree on the shared memory):
+- The translator keeps eA and eM0-eM4 in variables and ends an export at
+  an alloc, at a kill (before the pixel becomes a helper, whose stores are
+  dropped) and at the shader's end; which eM# may be pending where comes
+  from Xenia's walk of the control flow (`Shader::AnalyzeUcode`). An
+  export checks eA's upper bits as the sequencer does, packs each eM#
+  written since the last one into the stream's format (red and blue
+  swapped, signed or not, normalized or not, NaN as 0, integers clamped to
+  their range and signed components of 1 or 2 bits not scaled as the D3D12
+  translator does, Direct3D's rounding, the extended-range float16), swaps
+  it by the stream's 128-bit
+  endianness and stores the elements within the stream's count into guest
+  memory, the storage buffer the vertex fetches read (bytes and halves by
+  atomic AND and OR on their word, as Xenia's).
+- The renderer binds the mirror for a draw that exports, finds its
+  streams from the stream constants, and puts guest memory's bytes under
+  their 4 KB pages into the mirror first (Xenia's `RequestRange`). After
+  the draw the pages are the GPU's (Xenia's `RangeWrittenByGpu`): textures
+  over them are loaded again, from the mirror, and vertex data there is
+  read from the mirror. Guest memory never gets the exported bytes, as with
+  Xenia's default (`readback_memexport` off). A page stays the GPU's until
+  the CPU writes it: Xenia's page watches tell it; here each page keeps the
+  hash of guest memory's bytes at the export, checked when a draw or a
+  texture uses the page (the processor's own writes and a trace's memory
+  give it back at once). A trace begins with the GPU's pages as memory
+  read, read back from the mirror, as Xenia's trace downloads what its GPU
+  wrote.
+- Why not copy them back as resolves are: the processor writes a fence
+  when it reads the packet, before the GPU has run the export, so the CPU
+  goes on and may write the stream's memory again before a late copy lands
+  over it. A first form did copy the changed bytes back (as
+  `readback_memexport` would, without its wait); in its run El Chavo
+  Kart's race loading screen lasted about 3,000 swaps (two and a half
+  minutes), where the runs before and after it took 200 to 300.
+- A draw that rasterizes nothing (it writes no target, or the vertex
+  shader only exports: `vs_export_mode` multipass; or no target, viewport
+  or scissor is left) still runs its vertex shader for the exports, alone:
+  a point list with rasterization discarded, in a render pass without
+  attachments, each index once (Xenia draws it with its pipeline as it
+  is). A pixel shader's exports in such a draw are counted, not done.
+- Where it differs from Xenia: the CPU's writes to exported pages are
+  found by their hash when the page is used, not by page watches (a write
+  of the same bytes keeps the GPU's page, where Xenia's watch would drop
+  it). Xenia draws point lists as triangle strips and lets one host vertex
+  in four export; here a vertex shader runs once per vertex (points
+  through a geometry shader, or a point list alone). No resolution scale
+  yet, so no centre-pixel rule for pixel shaders' exports. A texture in a
+  format only the CPU decodes (DXT3A, CTX1) over exported pages is decoded
+  from guest memory, counted.
+- Checked: spirv-val on exporting vertex and pixel shaders (straight, at a
+  kill, through the dispatcher); on the GPU, the harness's exports in each
+  of the 15 kinds of format against the packing written out in the test
+  (360 combinations of format, number format, endianness and red-blue
+  swap, the stream's count stopping the last element).
+
+**The rest, as games ask:** rectangle and quad lists and point sprites
 (expanded without geometry shaders), occlusion queries, tessellation. Each
 is counted until the corpus or a game needs it.
 
@@ -245,7 +303,8 @@ waited for only when the CPU needs what the GPU wrote (Decisions).
   `GetScissor`; blend, depth, stencil, culling and the alpha test from the
   registers. A draw that can write nothing (no color channel enabled,
   depth and stencil off, no memexport) is dropped: occlusion queries are
-  the processor's fake counts, so nothing could see it.
+  the processor's fake counts, so nothing could see it. One that only
+  exports memory runs its vertex shader alone ("Memory exports" above).
 - **Render targets** stand for EDRAM as host images, one per base, pitch,
   MSAA and format, as many rows as EDRAM holds from the base. EDRAM itself
   is a 10 MB buffer in Xenia's layout (`edram.glsl`, from `edram.xesli`):
@@ -300,7 +359,7 @@ MSAA target that the game clears by drawing into the same samples seen as a
 640 4x target.
 
 Not done yet, counted where it shows: MSAA resolves of one sample; depth
-resolves of MSAA targets; memexport; unnormalized cube map coordinates;
+resolves of MSAA targets; unnormalized cube map coordinates;
 point sprite coordinates in the pixel parameters; signed components of
 formats with no snorm view on the host (5_6_5, 4_4_4_4, the DXT colors);
 float16 and float32 targets moved through EDRAM by value rather than by
@@ -568,6 +627,10 @@ playing it in Xenia.
   our resolve's output to Xenia's picture). At a trace's start the renderer
   finishes its work, so what earlier frames' resolves wrote is in guest
   memory and is recorded when read (Xenia downloads its GPU-written ranges).
+  What memory exports wrote stays on the GPU, so the trace begins with
+  those pages read back from the mirror (`TraceSource::gpu_memory`, Xenia's
+  `InitializeTraceCompleteDownloads`); a texture loaded from the mirror is
+  recorded, at each use, for the parts guest memory gave it.
 - **Frames** are numbered as boot's shots and as Xenia's
   `--trace_gpu_frames`: frame N is what the swap after the first N shows,
   `<title id>_<N>.xtr`. `boot --trace-frames 4500,4800 --trace-dir <dir>`
@@ -648,15 +711,26 @@ adjust), and what else differed from Xenia without being counted:
   mantissa, and the trees' leaves came out darker (0.4 of 255, 0.8% of the
   pixels, before this; 0.02 and 0.03% after).
 
-What is left: the race's kart is drawn black, in Xenia's picture of our
-traces as in ours. The runs skip the draws whose vertex shaders export
-memory (memexport: 2,891 in five minutes of menus and park, every fifth
-frame in the race, from frame 7281 in one run; `boot` prints the first
-frames each skip reason came in); if the kart's colors or vertices come
-from such exports, our run never wrote them and the traces carry what was
-there instead. A frame with 29 such draws (4943 of one run) matches Xenia's
-picture of it (0.006): what they export is not read in their own frame.
-Memexport is next.
+The race's kart was drawn black, in Xenia's picture of our traces as in
+ours: the runs skipped the draws whose vertex shaders export memory (2,891
+in five minutes of menus and park, then bursts in the race). The game
+copies data with them (one vertex shader: eight 16_16_16_16 vertex
+fetches into two exports of four elements, as point lists that write no
+target, 128 points and 8 KB a draw, 12 to 35 draws a burst), into pages
+that its textures and the kart then read. With memory exports ("Memory
+exports" above) the driver and the kart have their colors live (shots at
+swaps 11200 and 11600 of a race), and Xenia's pictures of the traces of
+those frames show them too: our replays are 0.009, 0.009 and 0.047 of 255
+off Xenia's for frames 11200, 11209 (12 export draws) and 11600, and
+0.000 off the live shots. The trace of a race frame first came out dark
+(the world unlit, 63-79 of 255 off the live shot): textures loaded from
+the mirror stayed pending for good over exported pages and were never
+recorded again; now their guest memory parts are checked and recorded at
+each use. Press script to the race for these runs: `start@#3400 b@#3600`,
+A every 200 swaps from 3800 to 5400, then `a@#10000 a@#10150
+start@#10300 a@#10450 start@#10600 a+rt@#10750:150` (the race's loading
+takes from a few hundred to thousands of swaps, so the race's presses
+come late).
 
 **The other games** (`boot_<game> --render --trace-frames`, no input
 unless said; traces in `../traces/xf_<game>`, Xenia's dumps beside the

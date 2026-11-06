@@ -514,8 +514,9 @@ traces, without a recompiled game.
   the interpreter agree on all 141 (whole shaders within 1e-4: rcp's 21
   bits differ by a step and subtractions grow it). Fetch offsets,
   unnormalized coordinates (not yet on cube maps) and stacked textures
-  came with B3. Left: memexport (getCompTexLOD, getWeights and the
-  parameter generator came with the traces of live runs, 2026-11-05).
+  came with B3; getCompTexLOD, getWeights and the parameter generator
+  with the traces of live runs, and memexport after them (2026-11-05,
+  [renderer.md](renderer.md), "Memory exports").
 - **B3. The renderer**: front end, render targets, textures, draws; a trace
   replayed and compared with Xenia's picture. First form in (2026-11-04,
   [renderer.md](renderer.md), "The renderer, first form"): EDRAM moved
@@ -676,13 +677,17 @@ The keyboard is not confirmed yet.
 - the kernel completed by inventory: every export Xenia has is in
   ("Everything left", the kernel);
 - a first launcher (C2): its logic in LauncherCore, the view Dear ImGui
-  until the RmlUi one.
-
-**Under way:**
-- the GPU's cost in 3D scenes (the owner's RTX 5060 runs at 100% there);
-- memexport (El Chavo Kart's kart is black in races);
-- the recompiler's leftovers (`lswx`/`stswx`, Forza Horizon's table,
-  precision).
+  until the RmlUi one;
+- the GPU's cost cut 5 to 14 times on the traces (renderer.md, "GPU
+  time"):
+  - Ben 10's 3D at its 60 swaps a second (14 before);
+  - El Chavo Kart's race at 15 (5.9 before);
+  - left: read-backs, the largest GPU cost now, and the renderer thread's
+    texture and vertex checks, which limit the race;
+- memexport: El Chavo Kart's kart is in color in races (renderer.md,
+  "Memory exports");
+- the recompiler's leftovers: `lswx`/`stswx`, Forza Horizon's table, and
+  the console's precision (24 of 2,601 cases left).
 
 Then, in order:
 1. D1: the game as a library behind a stable interface, which the generic
@@ -878,7 +883,8 @@ lacks.
   park and race, Forza Horizon's and Sonic's frames match Xenia.
 
 **Next, from those traces:**
-- memexport: El Chavo Kart's kart is black in a race;
+- ~~memexport: El Chavo Kart's kart is black in a race~~ (done; the other
+  games' traces ask for none);
 - Red Dead Redemption's ground and buildings, textures it makes by
   resolving 4x MSAA gamma targets to 4_4_4_4; and its renderer time, most
   of it spent checking textures by hash;
@@ -908,8 +914,8 @@ lacks.
   - depth resolves of MSAA targets.
 
 **Not drawn** (each draw is skipped and counted):
-- **Memexport:** shaders writing guest memory, then what they overlap
-  invalidated.
+- **Memexport:** a pixel shader's exports in a draw that rasterizes nothing
+  (the vertex shader's are done, alone).
 - **Primitive types:**
   - triangle with flags (7), line loop (12), quad strip (14), polygon (15);
   - the 2D copy rectangle lists (16 to 20);

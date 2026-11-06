@@ -4,7 +4,8 @@
 // format, 1D, 2D, 3D-or-stacked and cube texture fetches with a LOD bias,
 // offsets, unnormalized coordinates, the LOD or gradients from registers and
 // the stacked layers' filters, the color and depth exports and a kill. And
-// what is refused is refused: getWeights, memexport, the wrong stage.
+// memexport (straight, at a kill, through the dispatcher). And what is
+// refused is refused: getWeights, the wrong stage.
 
 #include "check.h"
 #include "shader_builders.h"
@@ -186,6 +187,65 @@ void branches() {
     translates(s, "branches_ps");
 }
 
+// memexport: allocs of exports, eA from a stream constant, eM0-eM4, the
+// export at an alloc, at a kill and at the end, straight and through the
+// dispatcher (a loop exporting each time round)
+void memexport() {
+    AluInstruction address = vector(AluVectorOpcode::Mad, dst(StorageTarget::ExportAddress, 0, 0xF),
+                                    {reg(0, "xxxx"), con(255, "xyxx"), con(6)});
+    std::vector<Slot> data = {address};
+    for (uint32_t k = 0; k < 5; k++)
+        data.push_back(vector(AluVectorOpcode::Max, dst(StorageTarget::ExportData, k, 0xF), {reg(1 + k), reg(1 + k)}));
+    AluInstruction kill = scalar(AluScalarOpcode::KillsGt, dst(StorageTarget::None, 0, 0), {reg(2)});
+    AluInstruction position = vector(AluVectorOpcode::Max, dst(StorageTarget::Position, 0, 0xF), {reg(0), reg(0)});
+    AluInstruction color = vector(AluVectorOpcode::Max, dst(StorageTarget::Color, 0, 0xF), {reg(0), reg(0)});
+    for (ShaderType type : {ShaderType::Vertex, ShaderType::Pixel}) {
+        bool vertex = type == ShaderType::Vertex;
+        // alloc export; exec (eA, eM0-eM4); alloc export; exec (eA, eM0-eM4, kill);
+        // alloc position or colors; exec end
+        ParsedShader s;
+        s.type = type;
+        uint32_t index = 0;
+        auto add_alloc = [&](AllocType t) {
+            s.control_flow.push_back({index, ControlFlowOpcode::Alloc, AllocInstruction{index, t, 1, vertex}});
+            index++;
+        };
+        auto add_exec = [&](Exec e) {
+            e.cf.cf_index = index;
+            s.control_flow.push_back({index++, e.cf.opcode, e});
+        };
+        add_alloc(AllocType::Memory);
+        add_exec(make_exec(data, false));
+        add_alloc(AllocType::Memory);
+        std::vector<Slot> killed = data;
+        killed.push_back(kill);
+        add_exec(make_exec(killed, false));
+        add_alloc(vertex ? AllocType::VsPosition : AllocType::PsColors);
+        add_exec(make_exec({vertex ? position : color}, true));
+        s.cf_pair_bound = (index + 1) / 2;
+        translates(s, vertex ? "memexport_vs" : "memexport_ps");
+    }
+    // 0: alloc export; 1: loop i0 (skip to 4); 2: exec (eA, eM0); 3: endloop
+    // (back to 2); 4: exec end, exporting what the last time round left
+    ParsedShader s;
+    s.type = ShaderType::Vertex;
+    s.control_flow.push_back({0, ControlFlowOpcode::Alloc, AllocInstruction{0, AllocType::Memory, 1, true}});
+    LoopStartInstruction start;
+    start.cf_index = 1, start.skip_address = 4;
+    s.control_flow.push_back({1, ControlFlowOpcode::LoopStart, start});
+    Exec e = make_exec({address, data[1]}, false);
+    e.cf.cf_index = 2;
+    s.control_flow.push_back({2, e.cf.opcode, e});
+    LoopEndInstruction end;
+    end.cf_index = 3, end.body_address = 2;
+    s.control_flow.push_back({3, ControlFlowOpcode::LoopEnd, end});
+    Exec last = make_exec({position}, true);
+    last.cf.cf_index = 4;
+    s.control_flow.push_back({4, last.cf.opcode, last});
+    s.cf_pair_bound = 3;
+    translates(s, "memexport_loop_vs");
+}
+
 void refuses() {
     auto refused = [](ParsedShader s, const char *what) {
         auto t = shader::translate(s, shader::Stage::Harness);
@@ -201,8 +261,6 @@ void refuses() {
     weights.result = dst(StorageTarget::Register, 1, 0xF);
     weights.operands[0] = reg(0);
     refused(make_shader(ShaderType::Pixel, {make_exec({weights}, true)}), "getWeights");
-    AluInstruction export_data = vector(AluVectorOpcode::Add, dst(StorageTarget::ExportData, 0, 0xF), {reg(0), reg(1)});
-    refused(make_shader(ShaderType::Vertex, {make_exec({export_data}, true)}), "memexport");
     // a stage that is not the shader's
     CHECK(!shader::translate(make_shader(ShaderType::Vertex, {make_exec({}, true)}), shader::Stage::Pixel).ok());
 }
@@ -214,6 +272,7 @@ int main() {
     control_and_exports();
     fetches();
     branches();
+    memexport();
     refuses();
     return finish("shader_translator");
 }

@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace xf::gpu {
@@ -62,6 +63,10 @@ public:
     // EDRAM as it stands, 10 MB in Xenia's layout (its snapshots'); false
     // when the backend keeps none
     virtual bool snapshot_edram(std::vector<uint8_t> &out) = 0;
+    // memory the GPU wrote that guest memory does not hold (memory exports,
+    // which stay on the GPU as Xenia's do): addresses and bytes, recorded
+    // as the trace begins, as Xenia's trace downloads what its GPU wrote
+    virtual void gpu_memory(std::vector<std::pair<uint32_t, std::vector<uint8_t>>> &out) { out.clear(); }
 };
 
 struct TraceOptions {
@@ -113,9 +118,11 @@ private:
     // (Xenia's MemoryCommand, EdramSnapshotCommand, RegistersCommand,
     // GammaRampCommand share the shape)
     void put_encoded(std::span<const uint8_t> head, size_t length_at, std::span<const uint8_t> data);
-    void put_memory(uint32_t command, uint32_t address, uint32_t bytes);
-    // the range as the trace gives it from now on
-    void learn(uint32_t address, uint32_t bytes);
+    // guest memory's bytes at the address, or the given ones
+    void put_memory(uint32_t command, uint32_t address, uint32_t bytes, const uint8_t *data = nullptr);
+    // the range as the trace gives it from now on (guest memory's bytes, or
+    // the given ones)
+    void learn(uint32_t address, uint32_t bytes, const uint8_t *data = nullptr);
     // the parts of the range that differ from what the trace gave, recorded
     void read_locked(uint32_t address, uint32_t bytes);
 

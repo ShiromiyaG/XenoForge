@@ -5,8 +5,14 @@
 // the ordered and unordered comparisons, the 21-bit results of exp, log,
 // rcp, rsq and sqrt, the clamps of rcpc, rcpf, rsqc, rsqf and logc, maxa's
 // address register, the vertex formats and their normalization, the texture
-// fetch's LOD and gradients, its signs, gamma and exponent adjust, and the
-// pixel parameters (spirv_shader_translator.cc's StartFragmentShaderInMain).
+// fetch's LOD and gradients, its signs, gamma and exponent adjust, the
+// pixel parameters (spirv_shader_translator.cc's StartFragmentShaderInMain),
+// and memexport (spirv_shader_translator_memexport.cc, and the D3D12
+// translator's dxbc_shader_translator_memexport.cc where the two differ:
+// integer components clamped to their range; with where an export ends from
+// shader_translator.cc's Shader::AnalyzeUcode): eA and eM0-eM4 packed into
+// the stream's format and stored into guest memory, the storage buffer the
+// vertex fetches read.
 //
 // The state is Private: r0-r127 (a vec4 each), a0, aL, the predicate, the
 // previous scalar, the vertex fetch address, the exports. The body is a
@@ -17,9 +23,9 @@
 // constant, on the predicate), allocs and nops; with loops, calls or jumps,
 // as a loop over a switch on the next control flow instruction, with the
 // interpreter's stacks (four loops deep, four calls deep) and step limit.
-// Memexport, unnormalized cube map coordinates and the texture queries
-// other than getGradients, getCompTexLOD and getWeights (those two on the
-// host's images only, not in the harness) are reported as unsupported.
+// Unnormalized cube map coordinates and the texture queries other than
+// getGradients, getCompTexLOD and getWeights (those two on the host's
+// images only, not in the harness) are reported as unsupported.
 
 #include "xenoforge/shader_translator.h"
 
@@ -28,8 +34,10 @@
 
 #include <GLSL.std.450.h>
 
+#include <array>
 #include <cfloat>
 #include <cmath>
+#include <functional>
 
 namespace xf::shader {
 namespace {
@@ -200,6 +208,9 @@ private:
     Id scalar_op(const AluInstruction &a);
     void kill(Id condition) {
         when(condition, [&] {
+            // the exports under way are done first: a helper invocation's
+            // stores are dropped (Xenia's KillPixel)
+            export_to_memory(em_before_);
             store(killed_, m_.const_bool(true));
             if (stage_ == Stage::Pixel) m_.op_void(Op::OpDemoteToHelperInvocation);
             return false;
@@ -220,6 +231,14 @@ private:
     Id pwl_gamma_to_linear(Id gamma);
     Id slot_word(uint32_t member, uint32_t slot);
     Id swap_endian(Id word, Id endian);
+
+    // --- memexport (Xenia's spirv_shader_translator_memexport.cc) ----------
+    void analyze_memexport();
+    void alloc(const AllocInstruction &a);
+    void export_to_memory(uint8_t em);
+    Id pack_half2(Id xy);
+    Id swap_endian_128(Id words, Id endian);
+    void store_memory_word(Id value, Id dword_index, Id replace_mask = 0);
 
     void unsupported(std::string what) {
         for (const std::string &u : unsupported_)
@@ -255,6 +274,15 @@ private:
     Id signed_sample_ = 0; // a fetch's sample from the texture's signed view
     Id body_ = 0;
     bool ended_ = false; // the straight control flow has returned
+    // memexport: which eM# the shader writes; per control flow instruction,
+    // which may have been written before it since the last export, and
+    // before the end (Shader::AnalyzeUcode's cf_memexport_info); the same
+    // within the exec being translated
+    uint8_t em_written_ = 0, em_before_end_ = 0, em_before_ = 0;
+    std::vector<uint8_t> em_before_cf_;
+    // eA, eM0-eM4, the eM# written since the last export (a bit each), and
+    // an export's packed words and element size (log2 bytes; 5 for none)
+    Id export_address_ = 0, export_data_[5] = {}, export_written_ = 0, export_packed_[5] = {}, export_size_ = 0;
 };
 
 void Translator::declare() {
@@ -297,8 +325,19 @@ void Translator::declare() {
     memory_ = global(memory_block, spv::StorageClass::StorageBuffer, "memory");
     m_.decorate(memory_, spv::Decoration::DescriptorSet, {0});
     m_.decorate(memory_, spv::Decoration::Binding, {stage_ == Stage::Harness ? 2u : 1u});
-    m_.decorate(memory_, spv::Decoration::NonWritable);
+    // written by memexport
+    if (!em_written_) m_.decorate(memory_, spv::Decoration::NonWritable);
     memory_ptr_uint_ = m_.type_pointer(spv::StorageClass::StorageBuffer, uint_);
+    if (em_written_) {
+        export_address_ = global(vec4_, spv::StorageClass::Private, "eA");
+        for (uint32_t k = 0; k < 5; k++) {
+            if (!(em_written_ & (1u << k))) continue;
+            export_data_[k] = global(vec4_, spv::StorageClass::Private, "eM");
+            export_packed_[k] = global(uvec4_, spv::StorageClass::Private, "eM_packed");
+        }
+        export_written_ = global(uint_, spv::StorageClass::Private, "eM_written");
+        export_size_ = global(uint_, spv::StorageClass::Private, "eM_size");
+    }
 
     if (stage_ != Stage::Harness) {
         // ndc_scale, ndc_offset, the image and sampler index of each fetch
@@ -376,6 +415,12 @@ void Translator::reset_state() {
     store(tfetch_lod_, f(0));
     store(gradient_h_, zero4_);
     store(gradient_v_, zero4_);
+    if (em_written_) {
+        store(export_address_, zero4_);
+        for (uint32_t k = 0; k < 5; k++)
+            if (export_data_[k]) store(export_data_[k], zero4_);
+        store(export_written_, u(0));
+    }
 }
 
 void Translator::store_result(const Result &r, Id value, bool clamp_depth) {
@@ -394,8 +439,16 @@ void Translator::store_result(const Result &r, Id value, bool clamp_depth) {
         pointer = m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(r.index & 3))});
         break;
     case StorageTarget::Depth: pointer = depth_; break;
+    // eA without any eM# written exports nothing (Xenia drops it)
     case StorageTarget::ExportAddress:
-    case StorageTarget::ExportData: unsupported("memexport"); return;
+        if (!em_written_) return;
+        pointer = export_address_;
+        break;
+    case StorageTarget::ExportData:
+        if (r.index >= 5 || !export_data_[r.index]) return;
+        pointer = export_data_[r.index];
+        store(export_written_, m_.op(Op::OpBitwiseOr, uint_, {load(uint_, export_written_), u(1u << r.index)}));
+        break;
     }
     uint32_t constant_values = 0;
     uint32_t constants = r.used_constant_components(constant_values);
@@ -662,6 +715,364 @@ Id Translator::swap_endian(Id v, Id endian) {
     Id r = select(uint_, is(1), in16, v);
     r = select(uint_, is(2), in32, r);
     return select(uint_, is(3), halves, r);
+}
+
+// ---- memexport ----------------------------------------------------------
+//
+// As Xenia's SPIR-V translator does it (spirv_shader_translator_memexport.cc,
+// and Shader::AnalyzeUcode for where exports end): eA and eM0-eM4 are
+// variables; an alloc ends the export under way (any alloc, as Xenia's), as
+// do the end of the shader and a kill; an export checks eA (its upper bits
+// as the sequencer validates them), packs each eM# written since the last
+// export into the stream's format (red and blue swapped, signed or not,
+// normalized or not, NaN as 0, Direct3D's rounding, the extended-range
+// float16), swaps its bytes by the stream's 128-bit endianness and stores
+// the elements within the stream's count into guest memory (the storage
+// buffer), bytes and halves by atomic AND and OR on their word.
+
+// Which eM# each control flow instruction may follow without an export in
+// between: Xenia's walk over the successors of each instruction that writes
+// them (a call taken as writing all of them, an alloc ending the walk). Where
+// a successor already has the bits the walk goes on with the others (Xenia's
+// stops there): more bits only add code the eM# written bits guard anyway.
+void Translator::analyze_memexport() {
+    uint32_t n = uint32_t(s_.control_flow.size());
+    std::vector<uint8_t> by(n, 0);
+    for (uint32_t k = 0; k < n; k++) {
+        const auto *e = std::get_if<Exec>(&s_.control_flow[k].instruction);
+        if (!e) continue;
+        for (const ExecSlot &slot : e->slots)
+            if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
+                for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
+                    if (r->target == StorageTarget::ExportData && r->index < 5 && r->used_write_mask())
+                        by[k] |= uint8_t(1u << r->index);
+        em_written_ |= by[k];
+    }
+    em_before_cf_.assign(n, 0);
+    if (!em_written_) return;
+    std::vector<uint32_t> stack;
+    for (uint32_t k = 0; k < n; k++) {
+        uint8_t written = s_.control_flow[k].opcode == ControlFlowOpcode::CondCall ? em_written_ : by[k];
+        if (!written) continue;
+        bool head = true;
+        stack.push_back(k);
+        while (!stack.empty()) {
+            uint32_t at = stack.back();
+            stack.pop_back();
+            if ((em_before_cf_[at] & written) == written) {
+                head = false;
+                continue;
+            }
+            if (!head) em_before_cf_[at] |= written;
+            head = false;
+            const ControlFlow &cf = s_.control_flow[at];
+            bool next = true;
+            switch (cf.opcode) {
+            case ControlFlowOpcode::ExecEnd:
+                em_before_end_ |= written;
+                next = false;
+                break;
+            case ControlFlowOpcode::CondExecEnd:
+            case ControlFlowOpcode::CondExecPredEnd:
+            case ControlFlowOpcode::CondExecPredCleanEnd: em_before_end_ |= written; break;
+            case ControlFlowOpcode::LoopStart:
+                stack.push_back(std::get<LoopStartInstruction>(cf.instruction).skip_address);
+                break;
+            case ControlFlowOpcode::LoopEnd:
+                stack.push_back(std::get<LoopEndInstruction>(cf.instruction).body_address);
+                break;
+            case ControlFlowOpcode::CondCall: stack.push_back(std::get<CallInstruction>(cf.instruction).target); break;
+            case ControlFlowOpcode::Return: next = false; break;
+            case ControlFlowOpcode::CondJmp: {
+                const auto &j = std::get<JumpInstruction>(cf.instruction);
+                stack.push_back(j.target);
+                next = j.type != JumpInstruction::Type::Unconditional;
+                break;
+            }
+            case ControlFlowOpcode::Alloc: next = false; break;
+            default: break;
+            }
+            if (next) {
+                if (at + 1 < n) stack.push_back(at + 1);
+                else em_before_end_ |= written;
+            }
+            // targets past the control flow end the shader
+            while (!stack.empty() && stack.back() >= n) {
+                stack.pop_back();
+                em_before_end_ |= written;
+            }
+        }
+    }
+}
+
+// An alloc ends the export under way; an alloc of exports starts with eA
+// invalid (Xenia's ProcessAllocInstruction).
+void Translator::alloc(const AllocInstruction &a) {
+    if (!em_written_) return;
+    uint8_t em = a.cf_index < em_before_cf_.size() ? em_before_cf_[a.cf_index] : 0;
+    if (em) {
+        export_to_memory(em);
+        store(export_written_, u(0));
+        for (uint32_t k = 0; k < 5; k++)
+            if (em & (1u << k)) store(export_data_[k], zero4_);
+    }
+    if (a.type == AllocType::Memory) store(export_address_, zero4_);
+}
+
+// The extended-range float16 pair Xenia's PackFloat16x2ExtendedRange makes:
+// NaN as 0, exponent 31 for magnitudes past 65504 (finite on the Xbox 360).
+Id Translator::pack_half2(Id xy) {
+    Id bvec2 = m_.type_vector(bool_, 2);
+    Id zero2 = m_.const_null(vec2_);
+    xy = select(vec2_, m_.op(Op::OpIsNan, bvec2, {xy}), zero2, xy);
+    Id standard = glsl(GLSLstd450PackHalf2x16, uint_, {xy});
+    auto band = [&](Id x, uint32_t mask) { return m_.op(Op::OpBitwiseAnd, uint_, {x, u(mask)}); };
+    Id lower_overflow = m_.op(Op::OpIEqual, bool_, {band(standard, 0x7C00), u(0x7C00)});
+    Id upper_overflow =
+        m_.op(Op::OpIEqual, bool_, {band(m_.op(Op::OpShiftRightLogical, uint_, {standard, u(16)}), 0x7C00), u(0x7C00)});
+    const Id limits[2][2] = {{f(-131008.0f), f(-131008.0f)}, {f(131008.0f), f(131008.0f)}};
+    Id clamped = glsl(GLSLstd450FClamp, vec2_,
+                      {xy, m_.const_composite(vec2_, limits[0]), m_.const_composite(vec2_, limits[1])});
+    const Id halves[] = {f(0.5f), f(0.5f)};
+    Id halved = m_.op(Op::OpFMul, vec2_, {clamped, m_.const_composite(vec2_, halves)});
+    Id extended = m_.op(Op::OpIAdd, uint_, {glsl(GLSLstd450PackHalf2x16, uint_, {halved}), u(0x04000400)});
+    Id lower = select(uint_, lower_overflow, band(extended, 0xFFFF), band(standard, 0xFFFF));
+    Id upper = select(uint_, upper_overflow, band(extended, 0xFFFF0000u), band(standard, 0xFFFF0000u));
+    return m_.op(Op::OpBitwiseOr, uint_, {lower, upper});
+}
+
+// Xenia's EndianSwap128Uint4: 8-in-64 and 8-in-128 as word moves, then 8-in-32
+Id Translator::swap_endian_128(Id words, Id endian) {
+    Id is_8in64 = m_.op(Op::OpIEqual, bool_, {endian, u(4)});
+    Id is_8in128 = m_.op(Op::OpIEqual, bool_, {endian, u(5)});
+    auto moved = [&](uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+        return m_.op(Op::OpVectorShuffle, uvec4_, {words, words, x, y, z, w});
+    };
+    words = select(uvec4_, splat_bool(is_8in64), moved(1, 0, 3, 2), words);
+    words = select(uvec4_, splat_bool(is_8in128), moved(3, 2, 1, 0), words);
+    endian = select(uint_, m_.op(Op::OpLogicalOr, bool_, {is_8in64, is_8in128}), u(2), endian);
+    Id c[4];
+    for (uint32_t k = 0; k < 4; k++) c[k] = swap_endian(m_.op(Op::OpCompositeExtract, uint_, {words, k}), endian);
+    return m_.op(Op::OpCompositeConstruct, uvec4_, {c[0], c[1], c[2], c[3]});
+}
+
+// A word of guest memory written, or only the bits of replace_mask (by atomic
+// AND and OR, as Xenia's StoreUint32ToSharedMemory); past the buffer, nothing
+// (Xenia's robust buffer access drops it).
+void Translator::store_memory_word(Id value, Id dword_index, Id replace_mask) {
+    Id inside = m_.op(Op::OpULessThan, bool_, {dword_index, m_.op(Op::OpArrayLength, uint_, {memory_, 0})});
+    when(inside, [&] {
+        Id pointer = m_.op(Op::OpAccessChain, memory_ptr_uint_, {memory_, u(0), dword_index});
+        if (!replace_mask) {
+            store(pointer, value);
+            return false;
+        }
+        Id device = u(uint32_t(spv::Scope::Device)), relaxed = u(0);
+        m_.op(Op::OpAtomicAnd, uint_, {pointer, device, relaxed, m_.op(Op::OpNot, uint_, {replace_mask})});
+        m_.op(Op::OpAtomicOr, uint_, {pointer, device, relaxed, m_.op(Op::OpBitwiseAnd, uint_, {value, replace_mask})});
+        return false;
+    });
+}
+
+// Xenia's ExportToMemory for the eM# in em.
+void Translator::export_to_memory(uint8_t em) {
+    em &= em_written_;
+    if (!em) return;
+    Id ea = m_.op(Op::OpBitcast, uvec4_, {load(vec4_, export_address_)});
+    const Id shift_parts[] = {u(30), u(23), u(23), u(23)}, expected_parts[] = {u(1), u(0x96), u(0x96), u(0x96)};
+    Id shifted = m_.op(Op::OpShiftRightLogical, uvec4_, {ea, m_.const_composite(uvec4_, shift_parts)});
+    Id valid = m_.op(Op::OpAll, bool_,
+                     {m_.op(Op::OpIEqual, bvec4_, {shifted, m_.const_composite(uvec4_, expected_parts)})});
+    auto each = [&](auto fn) {
+        for (uint32_t k = 0; k < 5; k++)
+            if (em & (1u << k)) fn(k);
+    };
+    when(valid, [&] {
+        Id info = m_.op(Op::OpCompositeExtract, uint_, {ea, 2});
+        auto bit = [&](uint32_t b) {
+            return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {info, u(1u << b)}), u(0)});
+        };
+        Id swap_red_blue = bit(19), is_signed = bit(16);
+        Id is_norm = m_.op(Op::OpLogicalNot, bool_, {bit(17)});
+        Id swapped[5] = {};
+        each([&](uint32_t k) {
+            Id v = load(vec4_, export_data_[k]);
+            Id zyxw = m_.op(Op::OpVectorShuffle, vec4_, {v, v, 2, 1, 0, 3});
+            swapped[k] = select(vec4_, splat_bool(swap_red_blue), zyxw, v);
+        });
+
+        // Fixed-point formats: the components converted as Direct3D does
+        // (NaN as 0, normalized ones clamped and scaled, integer ones clamped
+        // to the component's range, then rounded half away from zero), the
+        // first `widths` packed from bit 0 up. The clamps of integers and the
+        // scales (none for signed components of 1 or 2 bits) are Xenia's
+        // D3D12 translator's (dxbc_shader_translator_memexport.cc), which its
+        // Vulkan one lacks.
+        Id ivec4 = m_.type_vector(int_, 4);
+        Id half_up = vec4_const(0.5f, 0.5f, 0.5f, 0.5f), half_down = vec4_const(-0.5f, -0.5f, -0.5f, -0.5f);
+        Id ones = vec4_const(1, 1, 1, 1), minus_ones = vec4_const(-1, -1, -1, -1);
+        auto to_integers = [&](Id v, std::array<uint32_t, 4> widths) {
+            float sscale[4], smin[4], smax[4], umax[4];
+            for (uint32_t c = 0; c < 4; c++) {
+                uint32_t w = widths[c] ? widths[c] : 16;
+                smax[c] = float((1u << (w - 1)) - 1);
+                smin[c] = -1.0f - smax[c];
+                sscale[c] = w > 2 ? smax[c] : 1.0f;
+                umax[c] = float((1u << w) - 1);
+            }
+            Id flushed = select(vec4_, m_.op(Op::OpIsNan, bvec4_, {v}), zero4_, v);
+            Id snorm = exact(Op::OpFMul, vec4_, {glsl(GLSLstd450FClamp, vec4_, {flushed, minus_ones, ones}),
+                                                  vec4_const(sscale[0], sscale[1], sscale[2], sscale[3])});
+            Id sint = glsl(GLSLstd450FClamp, vec4_, {flushed, vec4_const(smin[0], smin[1], smin[2], smin[3]),
+                                                     vec4_const(smax[0], smax[1], smax[2], smax[3])});
+            Id sv = select(vec4_, splat_bool(is_norm), snorm, sint);
+            Id rounding = select(vec4_, m_.op(Op::OpFOrdLessThan, bvec4_, {sv, zero4_}), half_down, half_up);
+            Id si = m_.op(Op::OpConvertFToS, ivec4, {exact(Op::OpFAdd, vec4_, {sv, rounding})});
+            si = m_.op(Op::OpBitcast, uvec4_, {si});
+            Id umax_vector = vec4_const(umax[0], umax[1], umax[2], umax[3]);
+            Id unorm = exact(Op::OpFMul, vec4_, {glsl(GLSLstd450FClamp, vec4_, {flushed, zero4_, ones}), umax_vector});
+            Id uint = glsl(GLSLstd450FClamp, vec4_, {flushed, zero4_, umax_vector});
+            Id uv = select(vec4_, splat_bool(is_norm), unorm, uint);
+            Id ui = m_.op(Op::OpConvertFToU, uvec4_, {exact(Op::OpFAdd, vec4_, {uv, half_up})});
+            return select(uvec4_, splat_bool(is_signed), si, ui);
+        };
+        auto packed_store = [&](uint32_t k, Id x, Id y = 0) {
+            Id zero = u(0);
+            store(export_packed_[k], m_.op(Op::OpCompositeConstruct, uvec4_, {x, y ? y : zero, zero, zero}));
+        };
+        auto shuffle2 = [&](Id a, Id b, uint32_t x, uint32_t y) {
+            return m_.op(Op::OpVectorShuffle, vec2_, {a, b, x, y});
+        };
+        // float16: x alone, xy, or xy and zw; float32: the bits as they are
+        auto halves = [&](uint32_t pairs) {
+            each([&](uint32_t k) {
+                if (pairs == 0) packed_store(k, pack_half2(shuffle2(swapped[k], zero4_, 0, 4)));
+                else if (pairs == 1) packed_store(k, pack_half2(shuffle2(swapped[k], swapped[k], 0, 1)));
+                else
+                    packed_store(k, pack_half2(shuffle2(swapped[k], swapped[k], 0, 1)),
+                                 pack_half2(shuffle2(swapped[k], swapped[k], 2, 3)));
+            });
+        };
+        auto floats = [&] {
+            each([&](uint32_t k) { store(export_packed_[k], m_.op(Op::OpBitcast, uvec4_, {swapped[k]})); });
+        };
+        auto pack = [&](std::array<uint32_t, 4> widths) {
+            each([&](uint32_t k) {
+                Id ints = to_integers(swapped[k], widths);
+                Id word = m_.op(Op::OpCompositeExtract, uint_, {ints, 0});
+                for (uint32_t c = 1, offset = widths[0]; c < 4 && widths[c]; offset += widths[c], c++)
+                    word = m_.op(Op::OpBitFieldInsert, uint_,
+                                 {word, m_.op(Op::OpCompositeExtract, uint_, {ints, c}), u(offset), u(widths[c])});
+                packed_store(k, word);
+            });
+        };
+
+        // the packed words and the element's size, by the stream's format
+        struct Case {
+            std::vector<uint32_t> formats;
+            uint32_t size_log2;
+            std::function<void()> body;
+        };
+        const Case cases[] = {
+            {{2, 8, 9}, 0, [&] { pack({8, 0, 0, 0}); }},                // 8, 8_A, 8_B
+            {{3}, 1, [&] { pack({5, 5, 5, 1}); }},                      // 1_5_5_5
+            {{4}, 1, [&] { pack({5, 6, 5, 0}); }},                      // 5_6_5
+            {{5}, 1, [&] { pack({5, 5, 6, 0}); }},                      // 6_5_5
+            {{6, 14, 50}, 2, [&] { pack({8, 8, 8, 8}); }},              // 8_8_8_8, 8_8_8_8_A, 8_8_8_8_AS_16_16_16_16
+            {{7, 54}, 2, [&] { pack({10, 10, 10, 2}); }},               // 2_10_10_10 (and AS_16_16_16_16)
+            {{10}, 1, [&] { pack({8, 8, 0, 0}); }},                     // 8_8
+            {{15}, 1, [&] { pack({4, 4, 4, 4}); }},                     // 4_4_4_4
+            {{16, 55}, 2, [&] { pack({11, 11, 10, 0}); }},              // 10_11_11 (and AS_16_16_16_16)
+            {{17, 56}, 2, [&] { pack({10, 11, 11, 0}); }},              // 11_11_10 (and AS_16_16_16_16)
+            {{24}, 1, [&] { pack({16, 0, 0, 0}); }},                    // 16
+            {{25}, 2, [&] { pack({16, 16, 0, 0}); }},                   // 16_16
+            {{26}, 3,                                                   // 16_16_16_16
+             [&] {
+                 each([&](uint32_t k) {
+                     Id ints = to_integers(swapped[k], {16, 16, 16, 16});
+                     auto c = [&](uint32_t i) { return m_.op(Op::OpCompositeExtract, uint_, {ints, i}); };
+                     packed_store(k, m_.op(Op::OpBitFieldInsert, uint_, {c(0), c(1), u(16), u(16)}),
+                                  m_.op(Op::OpBitFieldInsert, uint_, {c(2), c(3), u(16), u(16)}));
+                 });
+             }},
+            {{30}, 1, [&] { halves(0); }}, // 16_FLOAT
+            {{31}, 2, [&] { halves(1); }}, // 16_16_FLOAT
+            {{32}, 3, [&] { halves(2); }}, // 16_16_16_16_FLOAT
+            {{36}, 2, floats},             // 32_FLOAT
+            {{37}, 3, floats},             // 32_32_FLOAT
+            {{38}, 4, floats},             // 32_32_32_32_FLOAT
+        };
+        Id format = m_.op(Op::OpBitFieldUExtract, uint_, {info, u(8), u(6)});
+        Id merge = m_.id(), fallback = m_.id();
+        std::vector<Id> labels;
+        std::vector<uint32_t> operands{format, fallback};
+        for (const Case &c : cases) {
+            labels.push_back(m_.id());
+            for (uint32_t literal : c.formats) operands.insert(operands.end(), {literal, labels.back()});
+        }
+        m_.op_void(Op::OpSelectionMerge, {merge, uint32_t(spv::SelectionControlMask::MaskNone)});
+        m_.op_void(Op::OpSwitch, std::span<const uint32_t>(operands));
+        for (size_t c = 0; c < std::size(cases); c++) {
+            m_.label(labels[c]);
+            cases[c].body();
+            store(export_size_, u(cases[c].size_log2));
+            m_.op_void(Op::OpBranch, {merge});
+        }
+        m_.label(fallback);
+        store(export_size_, u(5)); // not a format exports take: nothing is stored
+        m_.op_void(Op::OpBranch, {merge});
+        m_.label(merge);
+
+        Id size = load(uint_, export_size_);
+        Id endian = m_.op(Op::OpBitFieldUExtract, uint_, {info, u(0), u(3)});
+        Id packed[5] = {};
+        each([&](uint32_t k) { packed[k] = swap_endian_128(load(uvec4_, export_packed_[k]), endian); });
+
+        auto shl = [&](Id x, Id n) { return m_.op(Op::OpShiftLeftLogical, uint_, {x, n}); };
+        auto shr = [&](Id x, uint32_t n) { return m_.op(Op::OpShiftRightLogical, uint_, {x, u(n)}); };
+        auto band = [&](Id x, uint32_t mask) { return m_.op(Op::OpBitwiseAnd, uint_, {x, u(mask)}); };
+        auto add = [&](Id x, uint32_t n) { return m_.op(Op::OpIAdd, uint_, {x, u(n)}); };
+        auto low23 = [&](uint32_t c) {
+            return m_.op(Op::OpBitFieldUExtract, uint_, {m_.op(Op::OpCompositeExtract, uint_, {ea, c}), u(0), u(23)});
+        };
+        // the eM# written since the last export, from the stream's index of
+        // eM0 up to its count
+        Id index = low23(1), count = low23(3);
+        Id left = m_.op(Op::OpISub, int_, {m_.op(Op::OpBitcast, int_, {count}), m_.op(Op::OpBitcast, int_, {index})});
+        left = m_.op(Op::OpBitcast, uint_, {glsl(GLSLstd450SClamp, int_, {left, i(0), i(5)})});
+        Id to_store = m_.op(Op::OpBitFieldUExtract, uint_, {load(uint_, export_written_), u(0), left});
+        // eM0's address in bytes: the stream's base (in words; shifted out
+        // of its upper bits) plus the index's elements
+        Id address = m_.op(Op::OpIAdd, uint_, {shl(m_.op(Op::OpCompositeExtract, uint_, {ea, 0}), u(2)), shl(index, size)});
+        Id dwords = shr(address, 2);
+        auto word = [&](uint32_t k, uint32_t c) { return m_.op(Op::OpCompositeExtract, uint_, {packed[k], c}); };
+        for (uint32_t s = 0; s <= 4; s++) {
+            when(m_.op(Op::OpIEqual, bool_, {size, u(s)}), [&] {
+                each([&](uint32_t k) {
+                    when(m_.op(Op::OpINotEqual, bool_, {band(to_store, 1u << k), u(0)}), [&] {
+                        if (s == 0) {
+                            // a byte: 8 * (address & 3) into its word
+                            Id at = add(address, k);
+                            Id shift = shl(band(at, 3), u(3));
+                            store_memory_word(shl(word(k, 0), shift), shr(at, 2), shl(u(0xFF), shift));
+                        } else if (s == 1) {
+                            // a half: 16 * (half's index & 1) into its word
+                            Id at = add(shr(address, 1), k);
+                            Id shift = shl(band(at, 1), u(4));
+                            store_memory_word(shl(word(k, 0), shift), shr(at, 1), shl(u(0xFFFF), shift));
+                        } else {
+                            uint32_t words = 1u << (s - 2);
+                            Id at = add(dwords, words * k);
+                            for (uint32_t c = 0; c < words; c++) store_memory_word(word(k, c), c ? add(at, c) : at);
+                        }
+                        return false;
+                    });
+                });
+                return false;
+            });
+        }
+        return false;
+    });
 }
 
 void Translator::vertex_fetch(const VertexFetchInstruction &v) {
@@ -1189,9 +1600,15 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates, 
 
 bool Translator::exec(const Exec &e) {
     auto instructions = [&] {
+        // the eM# a kill here exports: those before the exec, and its own so far
+        em_before_ = e.cf.cf_index < em_before_cf_.size() ? em_before_cf_[e.cf.cf_index] : 0;
         for (const ExecSlot &slot : e.slots) {
-            if (const auto *a = std::get_if<AluInstruction>(&slot.instruction)) alu(*a);
-            else if (const auto *v = std::get_if<VertexFetchInstruction>(&slot.instruction)) vertex_fetch(*v);
+            if (const auto *a = std::get_if<AluInstruction>(&slot.instruction)) {
+                alu(*a);
+                for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
+                    if (r->target == StorageTarget::ExportData && r->index < 5 && r->used_write_mask())
+                        em_before_ |= uint8_t(1u << r->index);
+            } else if (const auto *v = std::get_if<VertexFetchInstruction>(&slot.instruction)) vertex_fetch(*v);
             else texture_fetch(std::get<TextureFetchInstruction>(slot.instruction));
         }
         if (e.cf.is_end) {
@@ -1293,8 +1710,11 @@ bool Translator::control_flow(const ControlFlow &cf, uint32_t index) {
                               instruction.condition);
                 set_pc(select(uint_, go, u(instruction.target), u(index + 1)));
                 return false;
+            } else if constexpr (std::is_same_v<T, AllocInstruction>) {
+                alloc(instruction);
+                return false;
             } else {
-                return false; // nop, alloc, mark_vs_fetch_done
+                return false; // nop, mark_vs_fetch_done
             }
         },
         cf.instruction);
@@ -1371,6 +1791,7 @@ void Translator::main_harness() {
     }
     reset_state();
     m_.op(Op::OpFunctionCall, void_, {body_});
+    export_to_memory(em_before_end_); // the export under way at the end
     Id out_base = m_.op(Op::OpIMul, uint_, {the_case, u(OUTPUT_VEC4S)});
     auto put = [&](uint32_t at, Id value) {
         store(m_.op(Op::OpAccessChain, ptr_sb_vec4, {out, u(0), m_.op(Op::OpIAdd, uint_, {out_base, u(at)})}), value);
@@ -1403,6 +1824,14 @@ void Translator::main_vertex() {
     // after the interpolators
     Id point_size = global(float_, spv::StorageClass::Output, "point_size");
     m_.decorate(point_size, spv::Decoration::Location, {16});
+    // A shader that exports memory is drawn alone as a point list when the
+    // draw rasterizes nothing (renderer.cpp), and Vulkan without
+    // maintenance5 wants a point size from it then: 1.
+    Id host_point_size = 0;
+    if (em_written_) {
+        host_point_size = global(float_, spv::StorageClass::Output, "host_point_size");
+        m_.decorate(host_point_size, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::PointSize)});
+    }
     bool writes_point_size = false;
     for (const ControlFlow &cf : s_.control_flow)
         if (const auto *e = std::get_if<Exec>(&cf.instruction))
@@ -1421,6 +1850,7 @@ void Translator::main_vertex() {
           vec4_of(m_.op(Op::OpConvertSToF, float_, {load(int_, vertex_index)}), f(0), f(0), f(0)));
     reset_state();
     m_.op(Op::OpFunctionCall, void_, {body_});
+    export_to_memory(em_before_end_); // the export under way at the end
     // The position's formats (PA_CL_VTE_CNTL, in the system flags' y), as
     // Xenia's CompleteVertexOrTessEvalShaderInMain: W given as 1/W unless bit
     // 0, XY divided by W with bit 1, Z with bit 2. Then to Vulkan's clip
@@ -1458,6 +1888,7 @@ void Translator::main_vertex() {
     } else {
         store(point_size, f(-1.0f));
     }
+    if (host_point_size) store(host_point_size, f(1.0f));
     m_.op_void(Op::OpReturn);
     m_.end_function();
     m_.entry_point(spv::ExecutionModel::Vertex, main, "main", interface_);
@@ -1553,6 +1984,7 @@ void Translator::main_pixel() {
     }
     reset_state();
     m_.op(Op::OpFunctionCall, void_, {body_});
+    export_to_memory(em_before_end_); // the export under way at the end
     if (frag_depth) {
         // oDepth clamped to 0-1, as Xenia does, then halved for a D24FS8
         // target (system flags' w, bit 0), which keeps its 0-2 as 0-1
@@ -1676,6 +2108,7 @@ void Translator::main_pixel() {
 }
 
 Translation Translator::run() {
+    analyze_memexport();
     declare();
     if (stage_ != Stage::Harness) {
         m_.capability(spv::Capability::RuntimeDescriptorArray);
@@ -1711,6 +2144,7 @@ Translation Translator::run() {
         for (const ControlFlow &cf : s_.control_flow) {
             if (ended_) break;
             if (const auto *e = std::get_if<Exec>(&cf.instruction)) ended_ = exec(*e);
+            else if (const auto *a = std::get_if<AllocInstruction>(&cf.instruction)) alloc(*a);
         }
     }
     if (s_.reads_past_end) unsupported("an exec past the end of the microcode");

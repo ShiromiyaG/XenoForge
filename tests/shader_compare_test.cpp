@@ -4,7 +4,9 @@
 // smallest floats), operand swizzles and modifiers, write masks with
 // constant components, saturation, predicates, a0 from maxa, the previous
 // scalar, a conditional exec, vertex fetches of each format with each
-// endianness, the texture fetch's stand-in. Then the shaders of the traces,
+// endianness, the texture fetch's stand-in; memory exports of each format,
+// number format and endianness against the packing written out here. Then
+// the shaders of the traces,
 // if XF_SHADERS names the folder Xenia dumped them to, on random inputs.
 //
 // Without a Vulkan 1.3 device it says so and passes.
@@ -16,6 +18,8 @@
 #include "xenoforge/shader_translator.h"
 #include "xenoforge/vk_compute.h"
 
+#include <algorithm>
+#include <array>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
@@ -275,6 +279,218 @@ void fetches() {
     }
 }
 
+// --- memexport ---------------------------------------------------------------
+//
+// The interpreter does not export (Xenia's does not either), so the GPU's
+// memory is checked against the packing written out here as Xenia's
+// translator does it (spirv_shader_translator_memexport.cc).
+
+float as_float(uint32_t bits) {
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+// a fixed-point component: NaN as 0, normalized ones clamped and scaled
+// (signed ones of 1 or 2 bits not scaled), integer ones clamped to the
+// component's range (Xenia's D3D12 translator), rounded half away from zero
+// (each step a statement: no contraction)
+uint32_t export_integer(float v, uint32_t width, bool is_signed, bool norm) {
+    if (std::isnan(v)) v = 0.0f;
+    if (is_signed) {
+        float max = float((1u << (width - 1)) - 1);
+        if (norm) {
+            v = std::clamp(v, -1.0f, 1.0f);
+            if (width > 2) v = v * max;
+        } else {
+            v = std::clamp(v, -1.0f - max, max);
+        }
+        float rounded = v + (v < 0.0f ? -0.5f : 0.5f);
+        return uint32_t(int32_t(rounded));
+    }
+    float max = float((1u << width) - 1);
+    if (norm) {
+        v = std::clamp(v, 0.0f, 1.0f);
+        v = v * max;
+    } else {
+        v = std::clamp(v, 0.0f, max);
+    }
+    float rounded = v + 0.5f;
+    return uint32_t(rounded);
+}
+
+// float to half for values a half holds exactly (the checks pick them), then
+// the extended range of PackFloat16x2ExtendedRange past 65504
+uint32_t export_half(float v) {
+    if (std::isnan(v)) v = 0.0f;
+    auto exact_half = [](float x) -> uint32_t {
+        uint32_t bits;
+        std::memcpy(&bits, &x, 4);
+        uint32_t sign = (bits >> 16) & 0x8000;
+        if ((bits & 0x7FFFFFFF) == 0) return sign;
+        int32_t exponent = int32_t((bits >> 23) & 0xFF) - 127 + 15;
+        if (exponent >= 31) return sign | 0x7C00;
+        return sign | uint32_t(exponent) << 10 | ((bits >> 13) & 0x3FF);
+    };
+    uint32_t standard = exact_half(v);
+    if ((standard & 0x7C00) != 0x7C00) return standard;
+    float halved = std::clamp(v, -131008.0f, 131008.0f) * 0.5f;
+    return exact_half(halved) + 0x400;
+}
+
+uint32_t swap32(uint32_t v, uint32_t endian) {
+    switch (endian) {
+    case 1: return ((v & 0x00FF00FF) << 8) | ((v >> 8) & 0x00FF00FF);
+    case 2: return __builtin_bswap32(v);
+    case 3: return (v << 16) | (v >> 16);
+    default: return v;
+    }
+}
+
+struct ExportFormat {
+    uint32_t format, size_log2;
+    std::array<uint32_t, 4> widths; // fixed-point; zeros for the float formats
+};
+
+// eM's packed words (before the byte swap), as the format says
+std::array<uint32_t, 4> export_words(const ExportFormat &f, std::array<float, 4> v, bool is_signed, bool norm,
+                                     bool swap_red_blue) {
+    if (swap_red_blue) std::swap(v[0], v[2]);
+    std::array<uint32_t, 4> w{};
+    if (f.widths[0]) {
+        uint32_t ints[4] = {};
+        for (int c = 0; c < 4; c++) ints[c] = export_integer(v[c], f.widths[c] ? f.widths[c] : 16, is_signed, norm);
+        if (f.format == 26) {
+            w[0] = (ints[0] & 0xFFFF) | ints[1] << 16;
+            w[1] = (ints[2] & 0xFFFF) | ints[3] << 16;
+            return w;
+        }
+        w[0] = ints[0];
+        for (uint32_t c = 1, offset = f.widths[0]; c < 4 && f.widths[c]; offset += f.widths[c], c++) {
+            uint32_t mask = ((1u << f.widths[c]) - 1) << offset;
+            w[0] = (w[0] & ~mask) | ((ints[c] << offset) & mask);
+        }
+        return w;
+    }
+    switch (f.format) {
+    case 31: w[0] = export_half(v[0]) | export_half(v[1]) << 16; break;
+    case 32:
+        w[0] = export_half(v[0]) | export_half(v[1]) << 16;
+        w[1] = export_half(v[2]) | export_half(v[3]) << 16;
+        break;
+    default:
+        for (int c = 0; c < 4; c++) std::memcpy(&w[c], &v[c], 4);
+        break;
+    }
+    return w;
+}
+
+// Each case exports eM0 and eM1 at elements 2c and 2c + 1 of a stream of 7
+// (so the last case's eM1 is past its count and not written), in each
+// format, number format and endianness.
+void memory_exports() {
+    const ExportFormat formats[] = {
+        {2, 0, {8, 0, 0, 0}},      {3, 1, {5, 5, 5, 1}},     {4, 1, {5, 6, 5, 0}},    {6, 2, {8, 8, 8, 8}},
+        {7, 2, {10, 10, 10, 2}},   {10, 1, {8, 8, 0, 0}},    {15, 1, {4, 4, 4, 4}},   {17, 2, {10, 11, 11, 0}},
+        {24, 1, {16, 0, 0, 0}},    {25, 2, {16, 16, 0, 0}},  {26, 3, {16, 16, 16, 16}}, {31, 2, {}},
+        {32, 3, {}},               {36, 2, {}},              {38, 4, {}},
+    };
+    AluInstruction address = vector(AluVectorOpcode::Mad, dst(StorageTarget::ExportAddress, 0, 0xF),
+                                    {reg(0, "xxxx"), con(1), con(0)});
+    AluInstruction em0 = vector(AluVectorOpcode::Max, dst(StorageTarget::ExportData, 0, 0xF), {reg(1), reg(1)});
+    AluInstruction em1 = vector(AluVectorOpcode::Max, dst(StorageTarget::ExportData, 1, 0xF), {reg(2), reg(2)});
+    ParsedShader shader;
+    shader.type = ShaderType::Vertex;
+    shader.control_flow.push_back({0, ControlFlowOpcode::Alloc, AllocInstruction{0, AllocType::Memory, 1, true}});
+    Exec e = make_exec({address, em0, em1}, true);
+    e.cf.cf_index = 1;
+    shader.control_flow.push_back({1, e.cf.opcode, e});
+    shader.cf_pair_bound = 1;
+    auto translation = shader::translate(shader, shader::Stage::Harness);
+    CHECK(translation.ok());
+    if (!translation.ok()) return;
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    // per case, eM0 and eM1 (halves exact in float16, or past it)
+    const std::array<float, 4> values[4][2] = {
+        {{1.0f, 0.5f, 0.0f, 0.25f}, {-1.0f, -0.5f, 2.0f, -3.0f}},
+        {{0.75f, -0.25f, nan, 1.5f}, {131008.0f, 98304.0f, -65504.0f, 1e9f}},
+        {{12.0f, -7.0f, 3.0f, 100.0f}, {0.125f, 1024.0f, -2.0f, 0.0f}},
+        {{-0.0f, 0.0625f, 0.875f, -0.875f}, {9.0f, 9.0f, 9.0f, 9.0f}},
+    };
+    const uint32_t base = 64; // bytes
+    int checked = 0;
+    for (const ExportFormat &f : formats) {
+        for (uint32_t endian = 0; endian <= 5; endian++) {
+            for (uint32_t number = 0; number < 4; number++) {
+                bool is_signed = number & 1, norm = !(number & 2);
+                bool swap = (endian + number) & 1;
+                Run run;
+                run.memory.assign(512, 0xCD);
+                // c0: the stream (base in words, eM0's index 0, the format, a count of 7); c1 moves y by 2 per case
+                uint32_t stream[4] = {0x40000000u | (base >> 2), 0x4B000000u,
+                                      endian | f.format << 8 | (is_signed ? 1u : 0u) << 16 |
+                                          (norm ? 0u : 1u) << 17 | (swap ? 1u : 0u) << 19 | 0x4B0u << 20,
+                                      0x4B000000u | 7u};
+                std::memcpy(run.constants.float_constants[0], stream, 16);
+                run.constants.float_constants[1][1] = 2.0f;
+                run.inputs.resize(4);
+                std::vector<uint8_t> expected = run.memory;
+                for (uint32_t c = 0; c < 4; c++) {
+                    std::memset(&run.inputs[c], 0, sizeof(CaseInput));
+                    run.inputs[c].registers[0][0] = float(c);
+                    for (uint32_t k = 0; k < 2; k++) {
+                        std::memcpy(run.inputs[c].registers[1 + k], values[c][k].data(), 16);
+                        uint32_t element = 2 * c + k;
+                        if (element >= 7) continue;
+                        auto words = export_words(f, values[c][k], is_signed, norm, swap);
+                        // the 128-bit endianness: word moves, then within words
+                        uint32_t word_endian = endian;
+                        if (endian == 4) std::swap(words[0], words[1]), std::swap(words[2], words[3]), word_endian = 2;
+                        if (endian == 5) std::swap(words[0], words[3]), std::swap(words[1], words[2]), word_endian = 2;
+                        for (uint32_t &w : words) w = swap32(w, word_endian);
+                        uint32_t at = base + (element << f.size_log2);
+                        uint8_t bytes[16];
+                        std::memcpy(bytes, words.data(), 16);
+                        std::memcpy(&expected[at], bytes, size_t(1) << f.size_log2);
+                    }
+                }
+                size_t padded = harness::LOCAL_SIZE;
+                run.inputs.resize(padded);
+                for (size_t c = 4; c < padded; c++) {
+                    // the padding's cases export nothing: eA invalid
+                    std::memset(&run.inputs[c], 0, sizeof(CaseInput));
+                    run.inputs[c].registers[0][0] = nan;
+                }
+                std::vector<uint8_t> in(padded * sizeof(CaseInput)), consts(sizeof(Constants)),
+                    out(padded * sizeof(CaseOutput));
+                std::memcpy(in.data(), run.inputs.data(), in.size());
+                std::memcpy(consts.data(), &run.constants, sizeof(Constants));
+                std::vector<uint8_t> memory = run.memory;
+                std::vector<uint8_t> *buffers[] = {&in, &consts, &memory, &out};
+                std::string error;
+                if (!gpu->run(translation.spirv, buffers, 1, error)) {
+                    std::printf("  memexport: GPU run failed: %s\n", error.c_str());
+                    failures++;
+                    return;
+                }
+                checked++;
+                if (memory == expected) continue;
+                failures++;
+                std::printf("  memexport format %u endian %u %s %s%s:", f.format, endian, is_signed ? "signed" : "unsigned",
+                            norm ? "normalized" : "integer", swap ? " red-blue swapped" : "");
+                for (size_t k = base; k < base + (size_t(8) << f.size_log2); k++)
+                    if (memory[k] != expected[k]) {
+                        std::printf(" byte %zu GPU %02X expected %02X;", k - base, memory[k], expected[k]);
+                        break;
+                    }
+                std::printf("\n");
+            }
+        }
+    }
+    std::printf("  memexport: %d formats, endiannesses and number formats checked\n", checked);
+}
+
 // the traces' shaders on random registers and constants
 void corpus() {
     const char *folder = std::getenv("XF_SHADERS");
@@ -362,6 +578,7 @@ int main() {
     operands_and_results();
     control();
     fetches();
+    memory_exports();
     corpus();
     return finish("shader_compare");
 }
