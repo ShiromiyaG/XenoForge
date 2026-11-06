@@ -365,3 +365,362 @@ Then, in order:
   frame a packet, as Xenia's walk hands them), so the PCM is Xenia's byte
   for byte. Upstream FFmpeg's `xma2` decodes whole packets and would need
   a walk of its own.
+
+## Everything left (2026-11-05)
+
+What is known to be missing for XenoForge to be a whole Xbox 360 for
+recompiled games, whether or not the eight games ask for it yet. It is taken
+from the code: the instruction table, the renderer's `approximate` and `skip`
+counters, the translator's `unsupported`, the texture table, and Xenia's
+exports set against ours. What a game asks for still comes first (the
+steps above); this is the inventory they draw from. Update it when
+something lands.
+
+### The recompiler and the CPU (A2, A3, A5)
+
+Under way: guest fibers on host fibers, and longjmp and catch
+continuations that unwind host frames. Reach enters the interpreter 1,803
+times in 30 s for its fiber switches, and BC2 16 times for longjmp.
+
+- **Instructions.** 454 of the 456 in Xenia's table have semantics. Left:
+  `lswx` and `stswx`, whose byte count is in XER.
+- **Precision.** 2,601 of Xenia's instruction test cases still fail:
+  - the console's low-precision estimates (`fres`, `frsqrte`, `vrefp`,
+    `vrsqrtefp` to the console's bits);
+  - double-denormal operands of the single-precision forms.
+- **Exceptions.** SEH `__try`/`__except` and C++ `catch` funclets should
+  be generated from the scope and FuncInfo tables. Today a continuation
+  runs interpreted.
+- **Discovery.** Forza Horizon's 8 table cases past the mask. Every
+  interpreter entry in every game should be counted down to 0.
+- **Code that is not on the disc at build time:**
+  - title updates: apply the `.xexp` delta patch to the base executable,
+    then recompile (`xex.cpp` refuses patches today);
+  - executables inside packages (DLC, XBLA, Games on Demand; see STFS
+    below);
+  - `XexLoadImageFromMemory`, and code written at run time.
+  Each is recompiled at install (the launcher) or interpreted.
+- **Debugging and determinism:**
+  - `#line` and the listing in the generated C++;
+  - yield points where loops turn back and functions start;
+  - the deterministic mode (A5), with input recording and replay.
+- **Build time.** Rebuild only the modules that changed. Today all eight
+  games at `-O2` take about half an hour.
+
+### The kernel and the system (A4, A6)
+
+**Exports, against Xenia.** Xenia's counts include its stubs; the appendix
+below names every missing export.
+
+| | the export table | Xenia implements | XenoForge implements | Xenia's, missing here |
+| --- | --- | --- | --- | --- |
+| xboxkrnl | 922 | 310 | 287 | 46 |
+| xam | 1,741 | 382 | 135 | 247 |
+| xbdm | 255 | 38 | 0 | 36 |
+
+Exports that neither implements wait until a game asks for them.
+
+**The XAM families missing:**
+- **Win32 re-exports:** `CreateThread`, `Sleep`, `WaitForSingleObject`,
+  `GetTickCount`, `CloseHandle`, `GetLastError` and the like, which XAM
+  exports for titles.
+- **Profiles and accounts:**
+  - `XamProfile*`;
+  - `XamUserGet*`: gamertag, membership tier, flags, tenure, online
+    country and language;
+  - `XamUserLogon*`, content restrictions, user preferences, guests.
+  Today there is one profile. Several profiles signed in at once is
+  local multiplayer.
+- **Locale and strings:**
+  - `XamGetLocale*`, `XamGetLanguage*`, `XamGetCountry*`,
+    `XamGetOnline*`;
+  - `XamFormatDateString` and `XamFormatTimeString`;
+  - `XamReadString`, `XamLookupCommonStringByIndex`, `XTLGetLanguageV2`.
+- **The system's UI:**
+  - `XamShow*`: sign-in, profile creation and editing, gamercard,
+    marketplace, upgrades, and the Kinect ones;
+  - an overlay in the player for what these dialogs show. GoW3 and Reach
+    already call some of them.
+- **Content:**
+  - the device enumerator, device names and volume paths;
+  - thumbnails, opening and resolving files, change callbacks;
+  - launching images, and the `Internal` variants.
+- **Avatars:** `XamAvatar*` (24 exports).
+- **Kinect (NUI):** `XamNui*`, `XamUserNui*`, `XamShowNui*`, the camera,
+  `XamIsNatal*` (about 35 exports).
+- **Tiles:** `XamReadTile*`, `XamReadTileToTexture`, `XamWriteGamerTile`,
+  `XamParseGamerTileKey`.
+- **Loading and launching:**
+  - `XamLoaderGetMediaInfo*`, the tray state, launch request callbacks;
+  - `XamSwapDisc`, for games on several discs;
+  - `XamContentLaunchImage*`, plus xboxkrnl's `XexLoadExecutable` and
+    `XexLoadImageFromMemory`.
+- **The dashboard and system queries:**
+  - the dash context, system title IDs, system update versions;
+  - DVR storage, feature flags, the Live hive, IPTV, XAuth, network
+    storage;
+  - `XNotifyBroadcast` and `XNotifyQueueUI`.
+- **The network beyond what came in on 2026-11-05:**
+  - asynchronous Winsock (`WSARecv`, `WSASend`, `WSARecvFrom`,
+    `WSASendTo`, overlapped results, `WSAEventSelect`; Forza Horizon and
+    BC2 import them);
+  - `XHttp*`, `XNetStartupEx`, `XNetInAddrToString`.
+  Host sockets for system link (LAN play) would be an option, off by
+  default.
+- **Input beyond the pad:**
+  - `XamInputNonController*`, raw input;
+  - the other XInput device subtypes: guitar, drums, wheel, dance pad,
+    arcade stick, big button;
+  - the chatpad, and Kinect.
+
+**The xboxkrnl families missing:**
+- **Locks and settings:** `Ex*` read-write locks; writing `XConfig`
+  settings.
+- **Kernel primitives:**
+  - `KeInitializeEvent`, `KeInitializeTimerEx`, `KePulseEvent`;
+  - `KeRemoveQueueApc` and `KeRemoveQueueDpc`;
+  - `KeSetPriorityThread`, `KeSuspendThread`, `KfRaiseIrql`.
+- **Objects:**
+  - `NtQueueApcThread`, `NtQueryEvent`, the symbolic link calls;
+  - `ObCreateObject`, `ObLookupThreadByThreadId`, `ObOpenObjectByName`,
+    `ObReferenceObjectByName`.
+- **Hardware:**
+  - `Hal*`: the tray, SMC messages, the AV pack;
+  - `HidReadKeys`;
+  - `Vd*`: the GPU's ASIC ID and the real video mode;
+  - `XUsbcam*`: the camera.
+- **Runtime helpers:**
+  - `Rtl*`: CRC-32, stack limits, image headers;
+  - the wide `printf` family;
+  - `FscGetCacheElementCount`, `InterlockedPushEntrySList`.
+
+**XBDM, the dev kit's debug monitor:** `Dm*` and the CAP profiler hooks.
+Retail games rarely call it.
+
+**Beyond the exports:**
+- **Packages.** Read STFS and SVOD: DLC, title updates, XBLA and Games on
+  Demand titles. Today an STFS package a title mounts itself gets no
+  device. Title updates are applied as above.
+- **Saves and profiles.** Saves are content packages in Xenia's layout
+  (runtime.md, "The storage root"). Still to come:
+  - saving and loading checked in play;
+  - saves kept per profile;
+  - achievements written and shown;
+  - gamer pictures;
+  - the profile settings games read, beyond the defaults.
+- **Voice.** XHV and `XamVoice*`: the headset, mic input, Kinect audio.
+- **Video and settings.** The video modes and widescreen setting games
+  read (480p, 720p, 1080i), and the dashboard's `XConfig` settings, from
+  config.toml.
+- **The deterministic mode (A5).** The kernel's side of it: a virtual
+  clock and thread order.
+
+### The GPU (B)
+
+**Under way:**
+- a GPU trace writer in Xenia's format, so any scene a run reaches can be
+  checked against Xenia's trace dump;
+- El Chavo Kart's colors past the menus;
+- the player presenting on the GPU, and the slow start (no pipeline cache
+  on disk, and every shader compiled the first time it is drawn).
+
+**Approximated** (drawn, but counted as not what the console does):
+- **Textures:**
+  - signed components;
+  - biased components;
+  - gamma textures read as linear;
+  - exponent adjust;
+  - formats sampled at 8 bits per component;
+  - mip levels shorter than their size;
+  - vertex fetches from a texture fetch constant;
+  - an ALU operand from a fetch constant;
+  - samplers past the bindless table.
+- **Output:**
+  - the display's piecewise linear gamma ramp;
+  - D24FS8 depth kept as 32-bit float;
+  - clears of some target formats;
+  - float16 and float32 targets moved through EDRAM by value rather than
+    by bits (NaN payloads).
+- **Rasterizer:**
+  - polygon offset;
+  - polygon modes other than fill (wireframe, points);
+  - alpha to coverage;
+  - pixel parameter generation (point sprite coordinates).
+- **Resolves:**
+  - resolves of one MSAA sample, which are averaged instead;
+  - depth resolves of MSAA targets.
+
+**Not drawn** (each draw is skipped and counted):
+- **Memexport:** shaders writing guest memory, then what they overlap
+  invalidated.
+- **Primitive types:**
+  - triangle with flags (7), line loop (12), quad strip (14), polygon (15);
+  - the 2D copy rectangle lists (16 to 20);
+  - tessellation: line, triangle and quad patches (21 to 23), with the
+    tessellator.
+- **Shaders:**
+  - unnormalized cube map coordinates;
+  - the undefined scalar opcode 41;
+  - an exec past the end of the microcode.
+- **Texture formats (25):**
+  - 1-bit: `k_1`, `k_1_REVERSE`;
+  - `k_6_5_5`;
+  - packed YUV: `k_Cr_Y1_Cb_Y0_REP`, `k_Y1_Cr_Y0_Cb_REP`;
+  - `k_10_11_11` and `k_11_11_10`, plain and `_AS_16_16_16_16`;
+  - `k_32_AS_8` and `k_32_AS_8_8`;
+  - the MPEG formats and the interlaced ones;
+  - `k_32_32_32_FLOAT`;
+  - `k_DXT3A_AS_1_1_1_1`;
+  - the EDRAM formats read as textures: `k_16_16_EDRAM`,
+    `k_16_16_16_16_EDRAM`, `k_8_8_8_8_GAMMA_EDRAM`,
+    `k_2_10_10_10_FLOAT_EDRAM`.
+  Also tiled 1D textures.
+- **Occlusion queries:** the answers are fake, as Xenia's default. Real
+  host queries are left.
+
+**Infrastructure and speed:**
+- **Shader compiles:**
+  - the pipeline cache on disk;
+  - compiling on a worker thread with the generic pipeline drawing
+    meanwhile (B5);
+  - the shaders translated in the launcher's build step.
+- **The renderer's remaining cost:**
+  - vertex data and the CPU's texture decodes;
+  - knowing when the CPU writes guest memory by watching its pages, as
+    Xenia does, instead of hashing at each use.
+- **Options:** resolution scale (B4), anisotropic filtering, frame pacing
+  and vsync.
+- **The other six games:** none of them has been checked against Xenia
+  yet.
+
+**Complete:**
+- the vertex formats: all 15 that Xenia knows;
+- the color target formats: all 12;
+- both depth formats.
+
+### Appendix: Xenia's exports missing here (2026-11-05)
+
+xboxkrnl (46): ExAcquireReadWriteLockExclusive,
+ExAcquireReadWriteLockShared, ExInitializeReadWriteLock,
+ExReadModifyWriteXConfigSettingUlong, ExReleaseReadWriteLock,
+ExSetXConfigSetting, ExTryToAcquireReadWriteLockExclusive,
+ExTryToAcquireReadWriteLockShared, FscGetCacheElementCount,
+HalGetCurrentAVPack, HalOpenCloseODDTray, HalSendSMCMessage, HidReadKeys,
+InterlockedPushEntrySList, KeInitializeEvent, KeInitializeTimerEx,
+KePulseEvent, KeRemoveQueueApc, KeRemoveQueueDpc, KeSetPriorityThread,
+KeSuspendThread, KfRaiseIrql, NtOpenSymbolicLinkObject, NtQueryEvent,
+NtQuerySymbolicLinkObject, NtQueueApcThread, ObCreateObject,
+ObLookupThreadByThreadId, ObOpenObjectByName, ObReferenceObjectByName,
+RtlComputeCrc32, RtlGetStackLimits, RtlImageDirectoryEntryToData,
+RtlImageNtHeader, RtlRip, VdGetGraphicsAsicID, VdQueryRealVideoMode,
+XUsbcamCreate, XUsbcamGetState, XexLoadExecutable, XexLoadImageFromMemory,
+_snwprintf, _vscwprintf, _vsnwprintf, swprintf, vswprintf.
+
+xam (247): CloseHandle, CreateThread, EnumerateMediaObjects,
+EnumerateMediaObjects_, EnumerateMediaObjects_0, EnumerateMediaObjects_1,
+ExitThread, GetCurrentThreadId, GetLastError, GetModuleHandleA,
+GetSystemTimeAsFileTime, GetTickCount, NetDll_WSARecvFrom,
+NetDll_WSASendTo, NetDll_WSAStartupEx, NetDll_XHttpOpen,
+NetDll_XHttpStartup, NetDll_XNetGetDebugXnAddr, NetDll_XNetInAddrToString,
+NetDll_XNetStartupEx, QueryPerformanceFrequency, Refresh, ResumeThread,
+RtlGetLastError, RtlRandom, RtlSetLastNTError, RtlSleep, Sleep, SleepEx,
+WaitForSingleObject, WaitForSingleObjectEx, XAutomationpUnbindController,
+XGetAudioFlags, XGetOverlappedExtendedError, XGetVideoCapabilities,
+XNotifyBroadcast, XNotifyQueueUI, XTLGetLanguageV2, XamAllocEx,
+XamAvatarBeginEnumAssets, XamAvatarEndEnumAssets, XamAvatarEnumAssets,
+XamAvatarGenerateMipMaps, XamAvatarGetAssetBinary, XamAvatarGetAssetIcon,
+XamAvatarGetAssets, XamAvatarGetAssetsResultSize,
+XamAvatarGetInstalledAssetPackageDescription, XamAvatarGetInstrumentation,
+XamAvatarGetManifestLocalUser, XamAvatarGetManifestsByXuid,
+XamAvatarGetMetadataRandom, XamAvatarGetMetadataSignedOutProfile,
+XamAvatarGetMetadataSignedOutProfileCount, XamAvatarInitialize,
+XamAvatarLoadAnimation, XamAvatarManifestGetBodyType,
+XamAvatarReinstallAwardedAsset, XamAvatarSetCustomAsset,
+XamAvatarSetManifest, XamAvatarSetMocks, XamAvatarShutdown,
+XamAvatarWearNow, XamBuildGamercardResourceLocator,
+XamBuildLegacySystemResourceLocator, XamBuildResourceLocator,
+XamBuildSharedSystemResourceLocator, XamBuildXamResourceLocator,
+XamContentCreate, XamContentCreateDeviceEnumerator,
+XamContentCreateEnumeratorInternal, XamContentCreateInternal,
+XamContentDeleteInternal, XamContentGetAttributesInternal,
+XamContentGetDeviceName, XamContentGetDeviceVolumePath,
+XamContentGetLocalizedDeviceData, XamContentGetLocalizedString,
+XamContentGetMetaDataInternal, XamContentGetThumbnail,
+XamContentLaunchImage, XamContentLaunchImageFromFileInternal,
+XamContentLaunchImageInternal, XamContentLaunchImageInternalEx,
+XamContentOpenFile, XamContentRegisterChangeCallback, XamContentResolve,
+XamContentResolveInternal, XamContentSetThumbnail,
+XamContentSetThumbnailInternal, XamDoesOmniNeedConfiguration,
+XamFeatureEnabled, XamFirstRunExperienceShouldRun, XamFormatDateString,
+XamFormatTimeString, XamGetActiveDashAppInfo, XamGetCachedTitleName,
+XamGetCountry, XamGetCountryFromOnlineCountry, XamGetCountryString,
+XamGetDashBackstackData, XamGetDashContext, XamGetDvrStorage,
+XamGetLanguage, XamGetLanguageFromOnlineLanguage,
+XamGetLanguageLocaleFallbackString, XamGetLanguageLocaleString,
+XamGetLanguageString, XamGetLanguageTypeface, XamGetLanguageTypefacePatch,
+XamGetLiveHiveValueA, XamGetLiveHiveValueW, XamGetLocale,
+XamGetLocaleDateFormat, XamGetLocaleEx, XamGetLocaleFromOnlineCountry,
+XamGetLocaleString, XamGetOnlineCountryFeatures,
+XamGetOnlineCountryFromLocale, XamGetOnlineCountryString,
+XamGetOnlineLanguageAndCountry, XamGetOnlineLanguageAndCountryString,
+XamGetOnlineLanguageString, XamGetOnlineSchema, XamGetStagingMode,
+XamInputNonControllerGetRaw, XamInputNonControllerGetRawEx,
+XamInputNonControllerSetRaw, XamInputNonControllerSetRawEx,
+XamIptvGetServiceName, XamIsChildAccountSignedIn, XamIsCurrentTitleDash,
+XamIsIptvEnabled, XamIsNatalPlaybackEnabled, XamIsNuiAutomationEnabled,
+XamIsNuiUIActive, XamIsSystemExperienceTitleId, XamIsSystemTitleId,
+XamIsXbox1TitleId, XamLoaderGetDvdTrayState, XamLoaderGetMediaInfo,
+XamLoaderGetMediaInfoEx, XamLoaderRegisterLaunchRequestCallback,
+XamLogLocalizationEtx, XamLookupCommonStringByIndex,
+XamMediaVerificationClose, XamMediaVerificationInject,
+XamNetworkStorageHasUserEnabledStorage, XamNetworkStorageUserHasPrivilege,
+XamNotifyCreateListenerInternal, XamNuiCameraElevationGetAngle,
+XamNuiCameraGetTiltControllerType, XamNuiCameraSetFlags,
+XamNuiCameraTiltGetStatus, XamNuiCameraTiltSetCallback,
+XamNuiGetDepthCalibration, XamNuiGetDeviceStatus,
+XamNuiHudGetEngagedTrackingID, XamNuiHudGetInitializeFlags,
+XamNuiHudGetVersions, XamNuiHudIsEnabled, XamNuiHudSetEngagedTrackingID,
+XamNuiIdentityAbort, XamNuiIdentityEnrollForSignIn,
+XamNuiIdentityGetSessionId, XamNuiIsChatMicEnabled, XamNuiIsDeviceReady,
+XamNuiPlayerEngagementUpdate, XamNuiSkeletonGetBestSkeletonIndex,
+XamParseGamerTileKey, XamProfileClose, XamProfileCreate,
+XamProfileCreateEnumerator, XamProfileEnumerate, XamProfileFindAccount,
+XamProfileGetCreationStatus, XamProfileGetLiveLegalLocale,
+XamProfileLoadAccountInfo, XamProfileOpen, XamQueryLiveHiveA,
+XamQueryLiveHiveW, XamReadString, XamReadTile, XamReadTileEx,
+XamReadTileToTexture, XamSetActiveDashAppInfo, XamSetCountry,
+XamSetDashContext, XamSetDvrStorage, XamShowCreateProfileUI,
+XamShowCreateProfileUIEx, XamShowEditProfileUI, XamShowForcedNameChangeUI,
+XamShowGamerCardUI, XamShowGoldUpgradeUI, XamShowMarketplaceUIEx,
+XamShowMultiplayerUpgradeUI, XamShowNuiDeviceSelectorUI,
+XamShowNuiDirtyDiscErrorUI, XamShowNuiGuideUI, XamShowNuiHardwareRequiredUI,
+XamShowNuiMessageBoxUI, XamShowNuiSigninUI, XamShowNuiTroubleshooterUI,
+XamShowSigninUIEx, XamShowSigninUIp, XamSwapDisc,
+XamUpdateGetBaseSystemVersion, XamUpdateGetCurrentSystemVersion,
+XamUserContentRestrictionCheckAccess, XamUserContentRestrictionGetFlags,
+XamUserContentRestrictionGetRating, XamUserCreateTitlesPlayedEnumerator,
+XamUserGetCachedUserFlags, XamUserGetGamerTag, XamUserGetMembershipTier,
+XamUserGetMembershipTierFromXUID, XamUserGetOnlineCountryFromXUID,
+XamUserGetOnlineLanguageFromXUID, XamUserGetSubscriptionType,
+XamUserGetUserFlags, XamUserGetUserFlagsFromXUID, XamUserGetUserTenure,
+XamUserIsGuest, XamUserIsOnlineEnabled, XamUserIsParentalControlled,
+XamUserIsUnsafeProgrammingAllowed, XamUserLogon, XamUserLogonEx,
+XamUserNuiEnableBiometric, XamUserNuiGetUserIndex,
+XamUserNuiGetUserIndexForBind, XamUserNuiGetUserIndexForSignin,
+XamUserReadProfileSettingsEx, XamUserReadUserPreference,
+XamUserWriteUserPreference, XamVoiceGetMicArrayStatus, XamWriteGamerTile,
+XamXStudioRequest, XampWebInstrumentationSetProfileCounts,
+XampXAuthGetTitleBuffer, XampXAuthShutdown, XampXAuthStartup,
+XapiFormatTimeOut, XapipCreateThread, XapipGetLocale, lstrlenW.
+
+xbdm (36): DmAllocatePool, DmCaptureStackBackTrace, DmCloseLoadedModules,
+DmFindPdbSignature, DmFreePool, DmGetConsoleDebugMemoryStatus,
+DmGetConsoleType, DmGetMemory, DmGetSystemInfo, DmGetThreadInfoEx,
+DmGetThreadList, DmGetXbeInfo, DmGetXboxName, DmIsDebuggerPresent,
+DmIsFastCAPEnabled, DmMapDevkitDrive, DmNotify, DmOpenNotificationSession,
+DmPMCGetCounterName, DmPMCInstallAndStart, DmQueryTitleMemoryStatistics,
+DmRegisterCommandProcessor, DmRegisterCommandProcessorEx, DmResumeThread,
+DmSendNotificationString, DmSetDumpMode, DmSetMemory, DmSetProfilingOptions,
+DmStartProfiling, DmStopProfiling, DmSuspendThread, DmWalkLoadedModules,
+__CAP_End_Profiling, __CAP_Enter_Function, __CAP_Exit_Function,
+__CAP_Start_Profiling.
