@@ -132,8 +132,14 @@ old phone with an Adreno 2xx under freedreno; neither is pursued now.
 
 ## Stack
 
-C++20, CMake, Ninja, clang (MSVC tolerated); SDL3, Vulkan 1.3, Dear ImGui,
-toml++, fetched by CMake when needed. Windows first, Linux kept building.
+C++20, CMake, Ninja, clang (MSVC tolerated); SDL3, Vulkan 1.3, toml++,
+fetched by CMake when needed. Windows first, Linux kept building. The UI:
+- **RmlUi** (MIT) for what a player sees: the launcher and the menus in the
+  game (pause, settings, controls). It is drawn through XenoForge's own
+  Vulkan inside the SDL3 window, written as RML and RCSS, and navigable
+  with a pad (Zelda64Recomp's front end is the precedent).
+- **Dear ImGui** only for the debugging tools: the F1 overlay, counters, the
+  debugger, memory views.
 The recompiled code includes one small header (the guest context, memory
 access, the calls into the system), so its thousands of files compile fast.
 
@@ -568,6 +574,10 @@ Then, in order:
 
 ## Decisions
 
+- 2026-11-05: the emulator's UI (the launcher, the menus in the game) is
+  RmlUi (MIT), drawn through our Vulkan. Dear ImGui stays for the debugging
+  tools. Qt 6 was the alternative: native widgets, but heavy, LGPL, and
+  unable to draw inside the game's window.
 - 2026-11-05: **the goal is revised** with the owner: an ahead-of-time
   Xbox 360 emulator (a disc recompiled on the player's machine into a
   cached game library), with an SDK for ports of specific games as rexglue

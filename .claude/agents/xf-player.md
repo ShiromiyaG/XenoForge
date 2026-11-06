@@ -41,6 +41,10 @@ Then:
   (a frame waiting on vsync must not block the guest's threads).
 - Dependencies are fetched by CMake (SDL3, Dear ImGui, toml++ as the 3DS runtime pins them), only when
   the player is built, so the core and its tests build without them.
+- The UI a player sees (the launcher, the menus in the game) is RmlUi (MIT; decided 2026-11-05), drawn
+  through our vk::Device inside the SDL3 window, in RML and RCSS, navigable with a pad. Dear ImGui is only
+  for the debugging tools (the F1 overlay, counters, the debugger). Keep each screen's logic apart from
+  its view.
 - English in code, comments, logs and docs. C++20, clang, the repo's .clang-format (4 spaces,
   120 columns). Comments say what the code does and why, in plain prose.
 - Never put game data in the repo (ISOs, XEX, generated code, saves, screenshots). Never modify
