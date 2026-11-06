@@ -172,16 +172,30 @@ traces, without a recompiled game.
   |---|---|---|---|
   | El Chavo Kart | 1.0 s / 1.1 s | 30.0 / 14.4 | 0 |
   | Ben 10 | 1.0 s / 13.0 s | 60.0 / 58.5 | 0 |
-  | BC2 (launcher, Splash.xex) | 1.2 s / 11.3 s | 30.0 / 14.4 | 16 (8 longjmps) |
+  | BC2 (launcher, Splash.xex) | 1.2 s / 11.3 s | 30.0 / 14.4 | 16 (8 longjmps; 0 now, below) |
   | Forza Horizon (+ XMediaFacade) | 1.1 s / 6.4 s | 52.7 / 13.8 | 0 |
   | Gears of War 3 | 1.0 s / 1.1 s | 14.9 / 2.2 | 0 |
-  | Reach (+ four Waves DLLs) | 1.4 s / 3.2 s | 58.4 / 25.2 | 1,803 (fiber switches) |
+  | Reach (+ four Waves DLLs) | 1.4 s / 3.2 s | 58.4 / 25.2 | 1,803 (fiber switches; 0 now, below) |
   | Red Dead Redemption | 5.0 s / 8.5 s | 27.0 / 21.5 | 0 |
   | Sonic Unleashed | 2.0 s / 21.1 s | 29.9 / 24.1 | 0 |
 
   Gears of War 3, generated, gets as far as its sockets: the xam NetDll_*
   it calls are not implemented (NetDll_socket answers 0), and it polls
   NetDll_recvfrom 4.26M times in 30 s.
+
+  Then (2026-11-05, later): stack switches in generated code
+  ([recompiler.md](recompiler.md), "Stack switches"; [runtime.md](runtime.md),
+  "Stacks"). Each guest stack runs on a host fiber of its own, so
+  KeSetCurrentStackPointers (the XDK's SwitchToFiber) is a host fiber switch
+  and each fiber's generated frames wait where they are; the functions that
+  switch the stack (longjmp, the jump to a catch's continuation,
+  SwitchToFiber) are generated, their returns checked; a longjmp or a catch
+  goes on in the generated frame that called setjmp or holds the try, at a
+  resume site discovery found. In 30 s, Reach enters the interpreter 0 times
+  (1,803 before), its 1,202 switches host switches, its 34 fibers on 34
+  host fibers dropped with their stacks; BC2 0 times (16 before), its 8
+  longjmps taken by the setjmp caller's frame; the other six 0, as before.
+  All eight run 30 s generated.
 - **A5. The deterministic mode**, input recording and replay.
 - **A6. Sound** (XMA in, 2026-11-05; input, saves to come). XMA is decoded
   by FFmpeg's `xmaframes` decoder from has207's fork, Xenia's own (commit
@@ -334,8 +348,11 @@ Then, in order:
    frame and runs at 30 swaps a second) and XCustomRegisterDynamicActions
    (Reach); runtime.md, "XAM". Next for those two: the XamShow*UI calls,
    XamVoiceSetMicArrayIdleUsers (looked up, absent in Xenia too).
-5. A fiber scheduler of our own: fiber switches and longjmps now leave the
-   frames they skip interpreted.
+5. A fiber scheduler of our own (done, 2026-11-05: each guest stack on a
+   host fiber of its own, the switching functions generated, longjmps and
+   catches taken by the frame that set them up; recompiler.md, "Stack
+   switches"; runtime.md, "Stacks"). All eight games enter the interpreter
+   0 times in 30 s (Reach 1,803 before, BC2 16).
 6. The launcher (C2), the deterministic mode (A5), and the A2 leftovers
    (exception funclets, `#line`, yield points).
 
@@ -383,9 +400,19 @@ something lands.
 
 ### The recompiler and the CPU (A2, A3, A5)
 
-Under way: guest fibers on host fibers, and longjmp and catch
-continuations that unwind host frames. Reach enters the interpreter 1,803
-times in 30 s for its fiber switches, and BC2 16 times for longjmp.
+Stack switches came in on 2026-11-05: guest fibers run on host fibers,
+and longjmp and catch continuations unwind host frames. All eight games
+now enter the interpreter 0 times in 30 s; before, Reach entered it 1,803
+times and BC2 16.
+
+- **Stack switches still left to the interpreter.** These are correct but
+  slower, and none of the eight games has hit one:
+  - returns to an address that discovery did not mark as a resume site;
+  - a stack first entered mid-function;
+  - a fiber that moves to another thread;
+  - an interpreted longjmp landing in its dispatch's caller.
+  Catch continuations are covered only by tests so far. One Reach stall at
+  startup under heavy load (1 run in 16) is not explained.
 
 - **Instructions.** 454 of the 456 in Xenia's table have semantics. Left:
   `lswx` and `stswx`, whose byte count is in XER.
@@ -393,9 +420,9 @@ times in 30 s for its fiber switches, and BC2 16 times for longjmp.
   - the console's low-precision estimates (`fres`, `frsqrte`, `vrefp`,
     `vrsqrtefp` to the console's bits);
   - double-denormal operands of the single-precision forms.
-- **Exceptions.** SEH `__try`/`__except` and C++ `catch` funclets should
-  be generated from the scope and FuncInfo tables. Today a continuation
-  runs interpreted.
+- **Exceptions.** SEH `__try`/`__except` and C++ `catch`: the funclets
+  should come from the scope and FuncInfo tables, checked in a game that
+  throws. Generated catch continuations came in with the stack switches.
 - **Discovery.** Forza Horizon's 8 table cases past the mask. Every
   interpreter entry in every game should be counted down to 0.
 - **Code that is not on the disc at build time:**

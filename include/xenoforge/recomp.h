@@ -89,12 +89,24 @@ struct Function {
     std::set<uint32_t> blocks;      // where its blocks start
     std::set<uint32_t> calls;       // bl targets
     std::set<uint32_t> tail_calls;  // b and bc to other functions
+    std::vector<std::pair<uint32_t, uint32_t>> call_sites; // (bl or bcl, its target)
     // It moves r1 to another stack: loads it from memory r1 does not
-    // address (longjmp), or has the kernel set it (a branch to
-    // KeSetCurrentStackPointers' thunk: a fiber switch). Its return goes to
-    // another frame than its caller's, which generated code cannot follow,
-    // so it is left to the interpreter (the runtime unwinds to that frame).
+    // address (longjmp, a catch's continuation), or has the kernel set it (a
+    // branch to KeSetCurrentStackPointers' thunk: a fiber switch). Its return
+    // may go to another frame than its caller's: its generated code checks
+    // each return against its entry's LR and r1 and throws the others to
+    // the frame they go to (docs/recompiler.md, "Stack switches").
     bool switches_stack = false;
+    // It keeps r1 in memory r1 does not address and returns normally (setjmp),
+    // itself or through a tail branch: a stack switch may come back to the
+    // return address of a call to it.
+    bool saves_stack = false;
+    // Where a stack switch elsewhere may return into this function's frame:
+    // after each call to a function that saves the stack (a longjmp comes
+    // back after its setjmp), and the catch continuations its exception
+    // handlers return (the addresses a lis/addi pair makes inside a function
+    // with exception data). Its generated code takes those returns there.
+    std::set<uint32_t> resumes;
 };
 
 // A direct branch or a jump table's case that leaves its function for an
@@ -109,6 +121,7 @@ struct Discovery {
     std::map<uint32_t, JumpTable> tables;  // by bctr address
     std::set<uint32_t> indirect;           // bctr without a table, blrl, branches nowhere known
     std::vector<Unresolved> unresolved;    // by function, then site
+    std::set<uint32_t> stack_thunks;       // KeSetCurrentStackPointers' import thunks
     std::map<std::string, uint64_t> counts; // what was found, by kind
 };
 

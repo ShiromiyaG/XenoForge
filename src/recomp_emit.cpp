@@ -4,6 +4,13 @@
 // gotos inside the function, C++ calls for bl, tail calls for branches to
 // other functions, return for blr, a switch on CTR for a jump table, and
 // dispatch() for whatever is indirect or has no generated code.
+//
+// Stack switches (docs/recompiler.md, "Stack switches"): a function that
+// switches the stack checks each return against its entry's LR and r1
+// (XF_CHECKED_RETURN), and a branch to KeSetCurrentStackPointers' thunk is
+// switch_stack(), which says where this frame goes on when its stack is
+// switched back to. A function with resume sites runs its body in a try
+// block: an Unwind to one of them with r1 inside its frame goes on there.
 
 #include "xenoforge/recomp.h"
 
@@ -31,45 +38,73 @@ class Emitter {
 public:
     Emitter(const Image &image, const Discovery &d, const Function &f, const std::string &prefix,
             std::set<uint32_t> *calls)
-        : image_(image), d_(d), f_(f), prefix_(prefix), end_(f.address + std::max<uint32_t>(f.size, 4)),
-          calls_(calls) {}
+        : image_(image), d_(d), f_(f), prefix_(prefix), end_(f.address + std::max<uint32_t>(f.size, 4)), calls_(calls),
+          checked_(f.switches_stack) {
+        for (uint32_t a : f.resumes)
+            if (a > f.address && a < end_) resumes_.insert(a);
+    }
 
     std::string run() {
         walk();
+        // the resume sites the walk reached (an invalid word stops it)
+        std::erase_if(resumes_, [&](uint32_t a) { return !code_.count(a); });
+        for (uint32_t a : resumes_) referenced_.insert(a);
+        if (!resumes_.empty()) base_ = 3;
         // first pass: which labels are jumped to
         for (uint32_t pc : code_) instruction(pc, true);
         std::string body;
         out_ = &body;
         for (uint32_t pc : code_) {
-            if (referenced_.count(pc)) line("L_" + hex8(pc) + ":", 0);
+            if (referenced_.count(pc)) line("L_" + hex8(pc) + ":", -1);
             instruction(pc, false);
         }
         std::string head = "XF_FN(" + name(f_.address) + ") {";
         if (!f_.name.empty()) head += " // " + f_.name;
-        return head + "\n" + body + "}\n";
+        head += "\n";
+        // where its returns are checked against (XF_CHECKED_RETURN), and
+        // whether an Unwind's r1 is inside its frame
+        if (checked_) head += "    const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);\n";
+        else if (!resumes_.empty()) head += "    const uint32_t xf_sp = uint32_t(c.r[1]);\n";
+        if (resumes_.empty()) return head + body + "}\n";
+        std::string cases, labels;
+        for (uint32_t a : resumes_) {
+            cases += "            case 0x" + hex8(a) + ": goto L_" + hex8(a) + ";\n";
+            labels += "            case 0x" + hex8(a) + ":\n";
+        }
+        return head + "    uint32_t xf_at = 0; // where an Unwind came back to\n" + "    for (;;) {\n" +
+               "        try {\n" + "            switch (xf_at) {\n" + cases + "            }\n" + body +
+               "            return;\n" + "        } catch (const ::xf::ppc::Unwind &xf_unwind) {\n" +
+               "            if (uint32_t(c.r[1]) >= xf_sp) throw; // a frame further up\n" +
+               "            switch (xf_unwind.target) {\n" + labels +
+               "                xf_at = xf_unwind.target;\n                continue;\n" + "            }\n" +
+               "            throw;\n" + "        }\n" + "    }\n" + "}\n";
     }
 
     std::string name(uint32_t address) const { return prefix_ + hex8(address); }
 
 private:
-    // a function the code can call directly (imports, and functions that
-    // load r1 and so are left to the interpreter, go through dispatch)
+    // a function the code can call directly (imports go through dispatch)
     bool callable(uint32_t address) const {
         auto it = d_.functions.find(address);
-        return it != d_.functions.end() && it->second.source != Source::Import && !it->second.switches_stack;
+        return it != d_.functions.end() && it->second.source != Source::Import;
     }
     bool internal(uint32_t target) const {
         return target >= f_.address && target < end_ && code_.count(target) &&
                (target == f_.address || !d_.functions.count(target));
     }
+    // a return: checked in a function that switches the stack
+    std::string ret() const { return checked_ ? "XF_CHECKED_RETURN();" : "return;"; }
 
-    // the instructions reached from the entry, the blocks discovery found
-    // and the jump tables' targets
+    // the instructions reached from the entry, the blocks discovery found,
+    // the jump tables' targets and the resume sites (which another function
+    // may start at: the pointer scan takes some catch continuations for
+    // starts)
     void walk() {
         std::vector<uint32_t> work(f_.blocks.begin(), f_.blocks.end());
         work.push_back(f_.address);
+        work.insert(work.end(), resumes_.begin(), resumes_.end());
         auto inside = [&](uint32_t t) {
-            return t >= f_.address && t < end_ && (t == f_.address || !d_.functions.count(t));
+            return t >= f_.address && t < end_ && (t == f_.address || !d_.functions.count(t) || resumes_.count(t));
         };
         while (!work.empty()) {
             uint32_t pc = work.back();
@@ -100,9 +135,10 @@ private:
         }
     }
 
-    void line(const std::string &text, int indent = 1) {
+    // a line of the body, indent levels past the body's own
+    void line(const std::string &text, int indent = 0) {
         if (!out_) return;
-        out_->append(indent * 4, ' ');
+        out_->append(size_t(base_ + indent) * 4, ' ');
         *out_ += text;
         *out_ += '\n';
     }
@@ -112,13 +148,22 @@ private:
             if (first) referenced_.insert(target);
             return "goto L_" + hex8(target) + ";";
         }
+        // the stack switch: this frame goes on, when switched back to, where
+        // its own return goes
+        if (d_.stack_thunks.count(target))
+            return "{ ::xf::ppc::switch_stack(c, 0x" + hex8(target) + ", " +
+                   (checked_ ? "xf_lr" : "uint32_t(c.lr) & ~3u") + "); " + ret() + " }";
         if (callable(target)) {
             if (calls_) calls_->insert(target);
+            // no tail call where the return is checked or in a try block
+            if (checked_ || !resumes_.empty()) return "{ " + name(target) + "(c); " + ret() + " }";
             return "XF_TAIL(" + name(target) + ");";
         }
-        return "{ ::xf::ppc::dispatch(c, 0x" + hex8(target) + "); return; }";
+        return "{ ::xf::ppc::dispatch(c, 0x" + hex8(target) + "); " + ret() + " }";
     }
-    std::string call(uint32_t target) {
+    // a call, LR already set to `next`
+    std::string call(uint32_t target, const std::string &next) {
+        if (d_.stack_thunks.count(target)) return "::xf::ppc::switch_stack(c, 0x" + hex8(target) + ", " + next + ");";
         if (callable(target)) {
             if (calls_) calls_->insert(target);
             return name(target) + "(c);";
@@ -150,7 +195,7 @@ private:
             uint32_t t = uint32_t(exts26(i.I.LI << 2)) + (i.I.AA ? 0 : pc);
             if (i.I.LK) {
                 if (first) return;
-                line("c.lr = " + next + "; " + call(t));
+                line("c.lr = " + next + "; " + call(t, next));
                 fall_through(pc);
             } else {
                 std::string s = go(t, first);
@@ -163,7 +208,8 @@ private:
             bool always = (i.B.BO & 0x14) == 0x14;
             if (i.B.LK) {
                 if (first) return;
-                line("{ bool taken = " + bc(i.B.BO, i.B.BI, false) + "; c.lr = " + next + "; if (taken) " + call(t) + " }");
+                line("{ bool taken = " + bc(i.B.BO, i.B.BI, false) + "; c.lr = " + next + "; if (taken) " +
+                     call(t, next) + " }");
                 fall_through(pc);
                 return;
             }
@@ -184,9 +230,9 @@ private:
                      "; c.lr = " + next + "; if (taken) ::xf::ppc::dispatch(c, target); }");
                 fall_through(pc);
             } else if (always) {
-                line("return;");
+                line(ret());
             } else {
-                line("if (" + bc(i.XL.BO, i.XL.BI, false) + ") return;");
+                line("if (" + bc(i.XL.BO, i.XL.BI, false) + ") " + ret());
                 fall_through(pc);
             }
             return;
@@ -201,7 +247,7 @@ private:
                 if (first) return;
                 line("switch (uint32_t(c.ctr) & ~3u) {");
                 for (const std::string &l : lines) line(l);
-                line("default: ::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u); return;");
+                line("default: ::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u); " + ret());
                 line("}");
                 return;
             }
@@ -211,9 +257,10 @@ private:
                      "; c.lr = " + next + "; if (taken) ::xf::ppc::dispatch(c, target); }");
                 fall_through(pc);
             } else if (always) {
-                line("::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u); return;");
+                line("::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u); " + ret());
             } else {
-                line("if (" + bc(i.XL.BO, i.XL.BI, true) + ") { ::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u); return; }");
+                line("if (" + bc(i.XL.BO, i.XL.BI, true) + ") { ::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u); " +
+                     ret() + " }");
                 fall_through(pc);
             }
             return;
@@ -233,7 +280,10 @@ private:
     uint32_t end_;
     std::set<uint32_t> code_, referenced_;
     std::string *out_ = nullptr;
-    std::set<uint32_t> *calls_; // the functions it calls by name, when asked
+    std::set<uint32_t> *calls_;  // the functions it calls by name, when asked
+    bool checked_;               // it switches the stack: its returns are checked
+    std::set<uint32_t> resumes_; // its resume sites inside its range
+    int base_ = 1;               // the body's indentation
 };
 
 } // namespace

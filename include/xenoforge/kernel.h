@@ -113,6 +113,10 @@ std::string modules_report(Kernel &k);
 // the file name of the game's module loaded at address ("" if none), for
 // boot's report of where the interpreter was entered
 std::string module_at(Kernel &k, uint32_t address);
+// the guest stacks, for boot (stacks.cpp): the switches between them, the
+// host fibers made and dropped, and the returns to another frame
+// (ppc::Unwind) and what took them
+std::string stacks_report(Kernel &k);
 // The file system (files.cpp, xam.cpp; Xenia's VirtualFileSystem and its
 // mounts): the game's disc at \Device\Cdrom0, or a bare executable's
 // directory at \Device\Harddisk0\Partition1 (read-only), with game: and d:
@@ -199,8 +203,10 @@ public:
     std::string add_module_code(const Xex &xex);
     void remove_module_code(uint32_t base);
     // Functions at any address, looked up before the modules' (sorted by
-    // address; the tests' host functions).
-    void set_generated(const Generated *table, size_t count);
+    // address; the tests' host functions), and their resume sites (sorted;
+    // GeneratedModule::resumes).
+    void set_generated(const Generated *table, size_t count, const uint32_t *resumes = nullptr,
+                       size_t resume_count = 0);
 
     // The title's main thread (Xenia's KernelState::LaunchModule): the
     // entry point on a guest thread with the executable's default stack and
@@ -223,6 +229,15 @@ public:
     // what generated code's dispatch() and the interpreter's calls reach
     void dispatch(ppc::Context &c, uint32_t target);
     bool try_call(ppc::Context &c, uint32_t target); // generated or import: ran it
+    // Runs the guest from pc with no frame to return to (a guest stack's
+    // host stack, from where the stack was entered): the function at pc,
+    // generated or imported, then on where it returns; the interpreter where
+    // there is none. Returns only when the kernel stops (or the guest
+    // returns to the sentinel). An Unwind is the caller's to catch.
+    void run_from(ppc::Context &c, uint32_t pc);
+    // whether generated code takes an Unwind to target in its own frame (a
+    // resume site of a loaded module's function, or of the tests' table)
+    bool resumable(uint32_t target) const;
 
     // Counts, by export ("library!name"): calls, and calls to imports with
     // no implementation (each logged once).
@@ -279,6 +294,11 @@ public:
     // the interpreter's limit per entry (boot stops a run with it)
     uint64_t step_limit = UINT64_MAX;
 
+    // Returns to another frame (ppc::Unwind) thrown, and those a dispatch (or
+    // a call the kernel made) took, interpreting on, and a guest stack's
+    // start took (stacks.cpp); generated code took the rest at a resume site.
+    std::atomic<uint64_t> unwinds_thrown{0}, unwinds_by_dispatch{0}, unwinds_by_stack_start{0};
+
     // set when the code hit what cannot run (an invalid instruction, an
     // instruction with no semantics): where, and why
     std::atomic<bool> stopped{false};
@@ -308,6 +328,8 @@ private:
     std::unordered_map<uint32_t, size_t> by_thunk_;
     const Generated *generated_ = nullptr;
     size_t generated_count_ = 0;
+    const uint32_t *generated_resumes_ = nullptr;
+    size_t generated_resume_count_ = 0;
     // the modules' generated code (kernel.cpp): the ranges try_call reads, a
     // map replaced whole as modules load and unload, and the rest
     struct CodeMap;

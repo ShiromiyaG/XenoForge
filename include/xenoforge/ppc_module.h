@@ -14,6 +14,16 @@
 
 namespace xf::ppc {
 
+// A return to another frame than the caller's (a longjmp, a catch's
+// continuation, a stack switched back to elsewhere than where it left): a C++
+// exception thrown through the host frames to the innermost one entered with
+// r1 above the restored one, which holds the guest's frame at r1 and goes on
+// at `target` (docs/recompiler.md, "Stack switches"): a generated function at
+// one of its resume sites, else a dispatch that interprets from there.
+struct Unwind {
+    uint32_t target;
+};
+
 // A generated function and the guest address it was made from.
 struct GeneratedFunction {
     uint32_t address;
@@ -22,14 +32,18 @@ struct GeneratedFunction {
 
 // One module's generated code: the image it was made from (its file name, for
 // the reports; where it is placed; the digest of its bytes as the loader
-// unpacks them, before any import is bound, xf::image_digest) and its
-// functions in address order.
+// unpacks them, before any import is bound, xf::image_digest), its functions
+// in address order, and its functions' resume sites in order (where their
+// generated code takes a return from a stack switch elsewhere; an emission
+// before them has none).
 struct GeneratedModule {
     const char *name; // "default.xex", "waves\\L360.dll": the path on the disc
     uint32_t base, size;
     uint64_t digest;
     const GeneratedFunction *functions;
     size_t count;
+    const uint32_t *resumes = nullptr;
+    size_t resume_count = 0;
 };
 
 } // namespace xf::ppc

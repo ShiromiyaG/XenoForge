@@ -172,6 +172,8 @@ void print_report(Game &g, bool waiting) {
     for (size_t i = 0; i < entered.size() && i < 20; i++)
         std::printf("  %10llu  0x%08X  %s\n", (unsigned long long)entered[i].first, entered[i].second,
                     kernel::module_at(k, entered[i].second).c_str());
+    // fiber switches, longjmps, catches: what took them
+    std::printf("%s", kernel::stacks_report(k).c_str());
     std::vector<std::pair<uint64_t, std::string>> calls;
     for (const auto &[name, n] : k.calls()) calls.push_back({n, name});
     std::sort(calls.rbegin(), calls.rend());

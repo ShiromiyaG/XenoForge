@@ -6,7 +6,8 @@
 //
 // prints what discovery found by kind; --compare sets the function starts
 // against rexglue's PPCFuncMappings for the same executable; --functions
-// writes every function (address, size, source, name), --tables the jump
+// writes every function (address, size, source, name, whether it switches or
+// saves the stack, its resume sites), --tables the jump
 // tables, --unresolved the branches out of a function to no start (function,
 // branch, target); --no-pointers leaves the data pointer scan out.
 //
@@ -230,12 +231,11 @@ bool emit_module(const Executable &e, const std::filesystem::path &dir, const st
     recomp::Discovery d = recomp::discover(image, options);
     std::filesystem::create_directories(dir);
     const std::string prefix = "xf_";
-    // the functions with code: not the imports, nor those that switch the
-    // stack (the interpreter runs them; recomp.h)
+    // the functions with code: all but the imports
     std::vector<const recomp::Function *> list;
     uint64_t total = 0;
     for (const auto &[a, f] : d.functions)
-        if (f.source != recomp::Source::Import && !f.switches_stack) list.push_back(&f), total += f.size / 4;
+        if (f.source != recomp::Source::Import) list.push_back(&f), total += f.size / 4;
     // Files by address: 64 KB of the image each (about 16,000 instructions,
     // a file the build compiles in seconds), or what --files asks; empty
     // ones not written. A function found or lost changes its own file and its
@@ -285,10 +285,18 @@ bool emit_module(const Executable &e, const std::filesystem::path &dir, const st
         t += "    {0x" + recomp::function_name("", fn->address) + "u, " + recomp::function_name(prefix, fn->address) +
              "},\n";
     if (list.empty()) t += "    {0, nullptr}, // (none: the count says 0)\n";
+    // where the functions take a return from a stack switch elsewhere, in
+    // order (the kernel's dispatch lets those through to them)
+    std::set<uint32_t> resumes;
+    for (const recomp::Function *fn : list) resumes.insert(fn->resumes.begin(), fn->resumes.end());
+    t += "};\n\nconst uint32_t resumes[] = {";
+    for (uint32_t a : resumes) t += "0x" + recomp::function_name("", a) + "u, ";
+    if (resumes.empty()) t += "0 /* (none: the count says 0) */";
     t += "};\n\n// the image it was made from: path, base, size, digest (xf::image_digest)\n"
          "extern const ::xf::ppc::GeneratedModule module = {\"" +
          literal + "\", 0x" + hex(xex.base_address, 8) + "u, 0x" + hex(xex.image.size(), 8) + "u, 0x" +
-         hex(image_digest(xex.image), 16) + "ull, functions, " + std::to_string(list.size()) + "};\n" + close;
+         hex(image_digest(xex.image), 16) + "ull, functions, " + std::to_string(list.size()) + ", resumes, " +
+         std::to_string(resumes.size()) + "};\n" + close;
     out.written += write_if_changed(dir / "table.cpp", t);
     out.ns = ns, out.functions = list.size(), out.instructions = total, out.files = int(by_file.size());
     return true;
@@ -396,9 +404,15 @@ int main(int argc, char **argv) {
 
     if (!functions_out.empty()) {
         std::ofstream f(functions_out);
-        for (const auto &[a, fn] : d.functions)
+        for (const auto &[a, fn] : d.functions) {
             f << std::hex << a << '\t' << std::dec << fn.size << '\t' << recomp::source_name(fn.source) << '\t' << fn.name
-              << (fn.switches_stack ? "\tswitches the stack" : "") << '\n';
+              << (fn.switches_stack ? "\tswitches the stack" : "") << (fn.saves_stack ? "\tsaves the stack" : "");
+            if (!fn.resumes.empty()) {
+                f << "\tresumes at";
+                for (uint32_t r : fn.resumes) f << ' ' << std::hex << r;
+            }
+            f << '\n';
+        }
     }
 
     if (!unresolved_out.empty()) {

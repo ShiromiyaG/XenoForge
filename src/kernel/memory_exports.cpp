@@ -16,6 +16,8 @@
 
 #include "xenoforge/kernel.h"
 
+#include "stacks.h"
+
 #include <algorithm>
 #include <bit>
 #include <cstdarg>
@@ -473,8 +475,10 @@ XF_EXPORT(xboxkrnl, MmCreateKernelStack) {
 }
 
 XF_EXPORT(xboxkrnl, MmDeleteKernelStack) {
-    // (stack_base, stack_end): released by its low end
-    uint32_t stack_end = arg(k, c, 1);
+    // (stack_base, stack_end): released by its low end; a fiber's stack, so
+    // the host fiber its code ran on goes too (stacks.h)
+    uint32_t stack_base = arg(k, c, 0), stack_end = arg(k, c, 1);
+    guest_stacks_freed(k, stack_base, stack_end);
     result(c, k.memory().heap_for(0x70000000)->release(stack_end) ? X_STATUS_SUCCESS : X_STATUS_UNSUCCESSFUL);
 }
 

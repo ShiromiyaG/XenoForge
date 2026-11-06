@@ -50,28 +50,31 @@ so BC2's Splash.xex and Game.xex, one after the other at 0x82A00000, each
 run their own code. Functions given with `set_generated` (any address, the
 tests' host functions) are looked up first.
 
-Returns to another frame (longjmp, a C++ catch's continuation, a fiber
-switch: the functions discovery leaves to the interpreter for it) are the
-runtime's: each dispatch knows the stack its call was made on (r1, its
-"stack top") and the return address; the interpreter it runs treats a
-`blr` elsewhere with r1 above that stack top as an unwind
-(`Stopped::Unwound`), and the dispatch throws it (a C++ exception, through
-the generated code's frames, as ExitThread's is). The first dispatch whose
-stack top is at or above the restored r1 catches it and interprets on from
-the target: the rest of the functions between, interpreted (their generated
-frames are gone, and the generated code keeps nothing outside the context,
-so the interpreter takes over exactly), until the guest returns to that
-dispatch's return address with r1 back at its stack top, and the generated
-code after it goes on. A return to that address with r1 below it is a
-recursive call's, not this one's. A switch back to a fiber lands on the
-dispatch that left it (its saved LR and r1 are that call's), which then
-returns normally. With r1 above every frame of a call the kernel made (a
-fiber stack above the thread's), the call interprets on until the guest
-returns from it, and so does any switch thrown up to it meanwhile (Reach's
-fibers, after their first switch, run so: correct, and slower than their
-generated code). Mid-function jumps the generated code dispatches with a
-stale LR (an unresolved table case) end the same way, where before they
-could interpret past their function forever.
+Returns to another frame (a longjmp, a C++ catch's continuation, a stack
+switched back to elsewhere than where it left) are thrown as `ppc::Unwind`
+(a C++ exception, through the host frames, as ExitThread's is): by the
+generated code of a function that switches the stack when a return is not
+to its caller (docs/recompiler.md, "Stack switches"), and by a dispatch
+whose interpreter takes a `blr` elsewhere with r1 above the stack its call
+was made on (r1, its "stack top"; `Stopped::Unwound`). Each frame on the
+way knows the r1 it was entered with, and the innermost one entered above
+the restored r1 holds the guest's frame there: a generated function with a
+resume site at the target goes on there, in its own frame; a dispatch
+interprets on from the target (a function's start there runs generated):
+the rest of the functions between, interpreted (their generated frames are
+gone, and the generated code keeps nothing outside the context, so the
+interpreter takes over exactly), until the guest returns to that dispatch's
+return address with r1 back at its stack top, and the generated code after
+it goes on. A return to that address with r1 below it is a recursive
+call's, not this one's. A dispatch whose stack top is the restored r1 lets
+the return through to its caller's frame when the target is a resume site
+of the generated code (`Kernel::resumable`, from each module's table). A
+fiber switch is no unwind: each guest stack runs on a host stack of its own
+("Stacks" below). With r1 above every frame of a call the kernel made (a
+longjmp out of a callback), the call interprets on until the guest returns
+from it. Mid-function jumps the generated code dispatches with a stale LR
+(an unresolved table case) end the same way, where before they could
+interpret past their function forever.
 
 A game library's import thunk (a DLL's function another module imports:
 `lis r11; ori r11` before the thunk's own `mtctr r11; bctr`, written at
@@ -186,6 +189,64 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
   stack to the thread's start (a C++ exception).
 - `Kernel::launch` makes the main thread (the executable's stack size and
   TLS header) and starts it; `boot` waits for it and reports the threads.
+
+### Stacks
+
+A guest thread may move between guest stacks: the XDK's fibers
+(SwitchToFiber saves the registers into the current fiber, loads the next
+one's and branches to KeSetCurrentStackPointers, which moves r1 to the next
+fiber's stack; Reach's streaming decompressor runs on one). Each guest stack
+runs on a host stack of its own (`src/kernel/stacks.h`, stacks.cpp; Windows
+fibers, ucontext elsewhere), so a guest switch is a host switch and each
+stack's generated frames wait where they are:
+
+- **KeSetCurrentStackPointers** on the calling thread's own context sets the
+  KTHREAD's and PCR's stack fields and r1, as Xenia's does, then moves the
+  thread to the new stack's host fiber: the thread's own host thread is made
+  a fiber at its first switch; a stack entered for the first time gets a
+  fiber (16 MB reserved, as a thread's stack) that runs the guest from LR
+  with no frame to return to (`Kernel::run_from`: the function there, then
+  on where it returns); a stack left before is resumed inside its own call
+  to KeSetCurrentStackPointers, which returns into the generated code that
+  made it. The calling stack's fiber waits in the call meanwhile. Stacks
+  are found by their base (KeSetCurrentStackPointers' fourth argument), or
+  the range that holds the new r1. A stack first entered at an address no
+  function starts at (the code after a `bl` to the thunk, going on on the
+  new stack) runs the frames it returns through interpreted, their calls
+  generated; the XDK's fibers start at a routine's start (Reach's at
+  0x8295DCD0, which calls the fiber's procedure).
+- **Resumed as it left, or unwound.** A stack is resumed as it left only
+  when the switch back comes with the r1 it left with and with LR where its
+  code waits: where generated code says with `ppc::switch_stack` (the
+  address after its `bl` to the thunk, or the switching function's own
+  return address for a tail branch); anywhere, for the interpreter running
+  the thunk's `sc`, whose `blr` goes where LR says; else the call's own
+  return address (the interpreter's `bl`, an indirect call).
+  Otherwise the guest went elsewhere on that stack (a fiber restarted from
+  its top, a longjmp across fibers): its host frames get an Unwind to LR as
+  they resume, which finds the frame that holds the new r1 or reaches the
+  stack's start, which runs on from LR.
+- **Ends.** MmDeleteKernelStack (a fiber's stack freed) drops the host
+  fibers of the stacks in its range, deleted from another of the thread's
+  fibers at its next switch. An exception that reaches a fiber's start
+  (ExitThread's ThreadExit, anything) is thrown again on the thread's own
+  stack, which takes it to `Thread::body`, where the thread's other fibers
+  go and the host thread stops being a fiber.
+- **Moved fibers.** A guest stack switched to by another thread than the one
+  whose host fiber holds its frames (a guest fiber that moved between
+  threads) starts over on a fiber of the new thread from LR, as those
+  frames use the other thread's context; its outer frames run interpreted.
+  None of the eight games does it.
+- **The deterministic mode** (fibers on one host thread) will have to resume
+  a guest thread on the host fiber of the stack it is on
+  (`GuestStacks::current`), not on its own; a thread that is a fiber
+  already is used as it is, and not made a thread again at its end.
+- Xenia runs a fiber switch on the thread's one host stack: its JIT can
+  enter any address, so KeSetCurrentStackPointers drops the host frames and
+  re-enters the thread at LR (`XThread::Reenter`). rexglue's fork replaces
+  the XAPI's CreateFiber, SwitchToFiber and ConvertThreadToFiber, hooked by
+  address, with host fibers of its own; here the game's own XAPI code runs,
+  and only the kernel export it ends in is the system's.
 
 ## The GPU
 
@@ -440,7 +501,10 @@ and stalled its frame loop there; with these it goes on.
 [--no-controller] [--press <buttons@seconds>]...`: loads the game, runs its entry point, and prints the modules loaded
 (each one's generated code, or why it runs interpreted), the
 interpreter's entries (the most entered addresses first, with the module
-holding each), the kernel calls
+holding each), the switches between guest stacks (host fibers made and
+dropped) and the returns to another frame (longjmps, catches: taken by
+generated code at a resume site, by a dispatch interpreting on, or at a
+stack's start; `stacks_report`), the kernel calls
 (counts, unimplemented ones), the GPU's packets, draws, resolves, swaps (and
 swaps per second) and interrupts, the sound's frames and XMA contexts, and
 where it stopped. Built as `boot_<game>` (CMake's `XF_GAMES`), it runs the

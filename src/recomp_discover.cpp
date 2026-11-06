@@ -72,6 +72,17 @@ std::optional<uint32_t> written_gpr(Opcode op, Instr i, uint32_t *second = nullp
     }
 }
 
+// A store of a whole register (a word or a doubleword: what can hold a stack
+// pointer), its source in i.D.RT and its base in i.D.RA.
+bool stores_gpr(Opcode op) {
+    switch (op) {
+    case Opcode::stw: case Opcode::stwu: case Opcode::stwx: case Opcode::stwux:
+    case Opcode::std: case Opcode::stdu: case Opcode::stdx: case Opcode::stdux:
+        return true;
+    default: return false;
+    }
+}
+
 // ---- following a value backwards ----
 
 struct Expr {
@@ -250,7 +261,7 @@ public:
         }
         for (auto &[a, f] : d_.functions) {
             d_.counts[std::string("functions from ") + source_name(f.source)]++;
-            if (f.switches_stack) d_.counts["functions that switch the stack (left to the interpreter)"]++;
+            if (f.switches_stack) d_.counts["functions that switch the stack"]++;
         }
         d_.counts["functions"] = d_.functions.size();
         d_.counts["jump tables"] = d_.tables.size();
@@ -260,6 +271,7 @@ public:
             for (const auto &[site, target] : list)
                 if (!d_.functions.count(target)) d_.unresolved.push_back({a, site, target});
         d_.counts["unresolved branches"] = d_.unresolved.size();
+        d_.stack_thunks = stack_thunks_;
         return std::move(d_);
     }
 
@@ -349,8 +361,8 @@ private:
     void walk(Function &f) {
         bool sized = sized_[f.address];
         uint32_t end = sized ? f.address + f.size : limit(f.address);
-        f.blocks.clear(), f.calls.clear(), f.tail_calls.clear();
-        f.switches_stack = false;
+        f.blocks.clear(), f.calls.clear(), f.tail_calls.clear(), f.call_sites.clear();
+        f.switches_stack = false, f.saves_stack = false;
         std::vector<std::pair<uint32_t, uint32_t>> &exits = exits_[f.address];
         exits.clear();
         std::deque<uint32_t> work{f.address};
@@ -383,12 +395,16 @@ private:
                 if (std::optional<uint32_t> w = written_gpr(op, i);
                     w && *w == 1 && ppc::info(op).group == 'm' && i.D.RA != 1)
                     f.switches_stack = true;
+                // r1 kept in memory it does not address (setjmp's buffer, a
+                // fiber's context); not the frame's back chain (stwu r1, -N(r1))
+                if (stores_gpr(op) && i.D.RT == 1 && i.D.RA != 1) f.saves_stack = true;
                 if (op == Opcode::bx) {
                     uint32_t target = uint32_t(exts26(i.I.LI << 2)) + (i.I.AA ? 0 : pc);
                     // the kernel moves r1 to another stack (a fiber switch)
                     if (stack_thunks_.count(target)) f.switches_stack = true;
                     if (i.I.LK) {
                         f.calls.insert(target);
+                        f.call_sites.push_back({pc, target});
                         add(target, Source::Call);
                         continue;
                     }
@@ -399,8 +415,10 @@ private:
                 if (op == Opcode::bcx) {
                     uint32_t target = uint32_t(exts16(i.B.BD << 2)) + (i.B.AA ? 0 : pc);
                     bool always = (i.B.BO & 0x14) == 0x14;
+                    if (stack_thunks_.count(target)) f.switches_stack = true;
                     if (i.B.LK) {
                         f.calls.insert(target);
+                        f.call_sites.push_back({pc, target});
                         add(target, Source::Call);
                         continue;
                     }
@@ -720,6 +738,99 @@ const Function *holder(const Discovery &d, uint32_t a) {
     return a < it->first + std::max<uint32_t>(it->second.size, 4) ? &it->second : nullptr;
 }
 
+// Every lis rX, hi followed by addi rY, rX, lo in code: the address it makes,
+// and where the addi is.
+template <class F> void lis_addi_pairs(const Image &image, F &&each) {
+    for (const Section &s : image.sections) {
+        if (!s.code) continue;
+        uint32_t end = s.address + s.size;
+        for (uint32_t a = s.address; a + 4 <= end; a += 4) {
+            uint32_t lis = image.word(a);
+            if ((lis >> 26) != 15 || ((lis >> 16) & 31) != 0) continue; // addis rX, 0, hi
+            uint32_t reg = (lis >> 21) & 31, hi = lis << 16;
+            for (uint32_t k = 1; k <= LIS_ADDI_WINDOW && a + (k + 1) * 4 <= end; k++) {
+                uint32_t w = image.word(a + k * 4);
+                if ((w >> 26) == 14 && ((w >> 16) & 31) == reg) { // addi rY, rX, lo
+                    each(hi + uint32_t(int32_t(int16_t(w & 0xFFFF))), a + k * 4);
+                    break;
+                }
+                if (((w >> 21) & 31) == reg) break; // the register written before an addi used it
+            }
+        }
+    }
+}
+
+// Where a stack switch may return into a function's frame from elsewhere
+// (Function::resumes): after a call to a function that saves the stack
+// pointer and returns (setjmp, itself or behind tail branches; not a
+// function that switches the stack itself, whose callers go on through the
+// switch back), and at the catch continuations of a function with exception
+// data. A catch block is a funclet that returns its continuation, an address
+// inside the function it belongs to, made with lis/addi (lis r3, cont@ha;
+// addi r3, r3, cont@l; blr): any such address past a function's start is
+// taken. A guess too many costs that function a try block; one missed sends
+// that return to the interpreter.
+void find_resumes(const Image &image, Discovery &d) {
+    // savers through tail branches, until nothing changes
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (auto &[a, f] : d.functions) {
+            if (f.saves_stack || f.switches_stack) continue;
+            for (uint32_t t : f.tail_calls) {
+                auto it = d.functions.find(t);
+                if (it != d.functions.end() && it->second.saves_stack && !it->second.switches_stack) {
+                    f.saves_stack = changed = true;
+                    break;
+                }
+            }
+        }
+    }
+    uint64_t after_saves = 0, continuations = 0;
+    for (auto &[a, f] : d.functions) {
+        f.resumes.clear();
+        if (f.source == Source::Import || f.source == Source::Helper) continue;
+        for (const auto &[site, target] : f.call_sites) {
+            auto it = d.functions.find(target);
+            if (it != d.functions.end() && it->second.saves_stack && !it->second.switches_stack &&
+                f.resumes.insert(site + 4).second)
+                after_saves++;
+        }
+    }
+    std::set<uint32_t> handlers; // functions with exception data
+    for (const PdataEntry &p : image.pdata)
+        if (p.exception) handlers.insert(p.begin);
+    std::map<uint32_t, uint32_t> tables; // inline jump tables: start, end
+    for (const auto &[bctr, t] : d.tables) {
+        uint32_t entry = t.kind == JumpTable::Absolute ? 4 : t.kind == JumpTable::HalfwordOffset ? 2 : 1;
+        uint32_t &end = tables[t.table];
+        end = std::max<uint32_t>(end, t.table + std::max<uint32_t>(entry * uint32_t(t.targets.size()), 4));
+    }
+    lis_addi_pairs(image, [&](uint32_t v, uint32_t) {
+        if (v & 3) return;
+        auto it = d.functions.upper_bound(v);
+        // the function with exception data whose range holds it, past its
+        // start (another function may start there: the pointer scan takes
+        // some continuations for starts)
+        while (it != d.functions.begin()) {
+            --it;
+            if (handlers.count(it->first)) break;
+            if (it->second.source == Source::Pdata) return;
+        }
+        if (it == d.functions.end() || !handlers.count(it->first)) return;
+        Function &f = it->second;
+        if (v <= f.address || v >= f.address + f.size) return;
+        auto table = tables.upper_bound(v);
+        if (table != tables.begin() && v < std::prev(table)->second) return;
+        if (ppc::decode(image.word(v)) == Opcode::Invalid || image.word(v) == 0) return;
+        if (f.resumes.insert(v).second) continuations++;
+    });
+    uint64_t holders = 0;
+    for (const auto &[a, f] : d.functions) holders += !f.resumes.empty();
+    d.counts["resume sites: after a call that saves the stack"] = after_saves;
+    d.counts["resume sites: catch continuations"] = continuations;
+    d.counts["functions with resume sites"] = holders;
+}
+
 } // namespace
 
 std::vector<uint32_t> scan_pointers(const Image &image) {
@@ -728,30 +839,14 @@ std::vector<uint32_t> scan_pointers(const Image &image) {
     auto consider = [&](uint32_t v) {
         if (looks_like_start(image, pdata_ends, v)) found.insert(v);
     };
-    for (const Section &s : image.sections) {
-        uint32_t end = s.address + s.size;
-        if (!s.code) {
-            // vtables, callback tables, fields holding function pointers
-            for (uint32_t a = s.address; a + 4 <= end; a += 4) consider(image.word(a));
-            continue;
-        }
-        // Addresses made in code: lis rX, hi followed by addi rY, rX, lo. A word
-        // in a code section is not read as a pointer: there it is an inline
-        // jump table.
-        for (uint32_t a = s.address; a + 4 <= end; a += 4) {
-            uint32_t lis = image.word(a);
-            if ((lis >> 26) != 15 || ((lis >> 16) & 31) != 0) continue; // addis rX, 0, hi
-            uint32_t reg = (lis >> 21) & 31, hi = lis << 16;
-            for (uint32_t k = 1; k <= LIS_ADDI_WINDOW && a + (k + 1) * 4 <= end; k++) {
-                uint32_t w = image.word(a + k * 4);
-                if ((w >> 26) == 14 && ((w >> 16) & 31) == reg) { // addi rY, rX, lo
-                    consider(hi + uint32_t(int32_t(int16_t(w & 0xFFFF))));
-                    break;
-                }
-                if (((w >> 21) & 31) == reg) break; // the register written before an addi used it
-            }
-        }
-    }
+    // vtables, callback tables, fields holding function pointers
+    for (const Section &s : image.sections)
+        if (!s.code)
+            for (uint32_t a = s.address; a + 4 <= s.address + s.size; a += 4) consider(image.word(a));
+    // Addresses made in code: lis rX, hi followed by addi rY, rX, lo. A word
+    // in a code section is not read as a pointer: there it is an inline jump
+    // table.
+    lis_addi_pairs(image, [&](uint32_t v, uint32_t) { consider(v); });
     return {found.begin(), found.end()};
 }
 
@@ -762,7 +857,10 @@ std::vector<uint32_t> scan_pointers(const Image &image) {
 Discovery discover(const Image &image, const DiscoverOptions &options) {
     const std::map<uint32_t, Source> none;
     Discovery d = Discoverer(image, none).run();
-    if (!options.scan_pointers) return d;
+    if (!options.scan_pointers) {
+        find_resumes(image, d);
+        return d;
+    }
 
     // branches unresolved without the scan say nothing about the candidates:
     // pruning around them would only drop good starts
@@ -879,6 +977,7 @@ Discovery discover(const Image &image, const DiscoverOptions &options) {
     d.counts["pointer scan: branch targets added"] = branches;
     d.counts["pointer scan: passes"] = uint64_t(pass);
     d.counts["unresolved branches without the scan"] = baseline_count;
+    find_resumes(image, d);
     return d;
 }
 

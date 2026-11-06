@@ -22,6 +22,10 @@
 #include <random>
 #include <thread>
 
+namespace xf::ppc {
+[[noreturn]] void unwind(Context &c); // ppc_generated.h
+}
+
 using namespace xf;
 
 namespace {
@@ -990,12 +994,79 @@ void longjmp_across_generated(KernelHarness &h) {
     h.c->r[1] = sp;
 }
 
+// ---- a longjmp back into generated code ----
+//
+// XR is generated code shaped as the emitter writes a function with a resume
+// site (docs/recompiler.md, "Stack switches"): it calls SETJMP (the guest's,
+// interpreted), then XLJ through dispatch (an indirect call: its stack top is
+// the r1 SETJMP kept). XLJ is a generated longjmp: r1 and LR back from the
+// buffer, its return checked, so it throws an Unwind to XR_RET. The dispatch
+// lets it through (XR_RET is a resume site), and XR goes on there in its own
+// frame, nothing interpreted.
+
+constexpr uint32_t XR = J + 0x240, XR_RET = XR + 0x10, XLJ = J + 0x280;
+uint32_t xr_buffer = 0;
+std::atomic<bool> xr_fell{false};
+uint64_t xr_value = 0;
+
+void xr_function(ppc::Context &c) {
+    const uint32_t xf_sp = uint32_t(c.r[1]);
+    uint32_t xf_at = 0;
+    for (;;) {
+        try {
+            if (xf_at == XR_RET) goto resume;
+            c.r[1] -= 0x40; // its frame
+            c.r[3] = xr_buffer;
+            c.lr = XR_RET;
+            K->dispatch(c, SETJMP);
+        resume:
+            if (uint32_t(c.r[3]) == 0) {
+                c.r[3] = xr_buffer, c.r[4] = 5;
+                c.lr = XR + 0x20;
+                K->dispatch(c, XLJ);
+                xr_fell = true; // never: the longjmp came back to XR_RET
+            }
+            xr_value = c.r[3];
+            c.r[1] += 0x40;
+            return;
+        } catch (const ppc::Unwind &u) {
+            if (uint32_t(c.r[1]) >= xf_sp) throw;
+            if (u.target != XR_RET) throw;
+            xf_at = u.target;
+        }
+    }
+}
+
+void xlj_function(ppc::Context &c) {
+    const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);
+    uint32_t buffer = uint32_t(c.r[3]);
+    c.r[1] = K->load32(buffer);
+    c.lr = K->load32(buffer + 4);
+    c.r[3] = c.r[4];
+    if (uint32_t(c.r[1]) != xf_sp || (uint32_t(c.lr) & ~3u) != xf_lr) ppc::unwind(c);
+}
+
+void longjmp_into_generated(KernelHarness &h) {
+    kernel::Kernel &k = *h.k;
+    xr_buffer = h.alloc(0x10);
+    uint64_t sp = h.c->r[1], entries = k.interpreted_entries(), thrown = k.unwinds_thrown;
+    uint64_t by_dispatch = k.unwinds_by_dispatch;
+    k.call(*h.c, XR);
+    CHECK(xr_value == 5 && !xr_fell && h.c->r[1] == sp && !k.stopped);
+    // SETJMP's entry alone was interpreted; the Unwind went to XR's frame
+    CHECK(k.interpreted_entries() == entries + 1 && k.interpreted_targets().count(SETJMP));
+    CHECK(k.unwinds_thrown == thrown + 1 && k.unwinds_by_dispatch == by_dispatch);
+}
+
 const kernel::Generated generated[] = {
     {F_LOADER, loader_thread},
     {X, x_function},
     {X2, x2_function},
+    {XR, xr_function},
+    {XLJ, xlj_function},
     {GATE + ENTRY, gate_main},
 };
+const uint32_t resumes[] = {XR_RET};
 
 std::vector<uint8_t> make_gate(uint32_t log) {
     std::vector<uint8_t> image = make_image(GATE, 0x33, log);
@@ -1137,12 +1208,13 @@ int main() {
 
     K = h.k.get();
     modules_kernel = h.k.get();
-    h.k->set_generated(generated, std::size(generated));
+    h.k->set_generated(generated, std::size(generated), resumes, std::size(resumes));
     h.k->set_generated_modules(generated_modules, std::size(generated_modules));
     Xex xex = make_xex();
     if (!h.k->load(xex, error)) return std::printf("kernel_modules: %s\n", error.c_str()), 1;
     modules(h);
     longjmp_across_generated(h);
+    longjmp_into_generated(h);
     uint32_t gate_module = load_gate(h);
     user_modules(h, log, lib_file);
     exit_in_dll_main(h, log, gate_module);

@@ -1,9 +1,10 @@
 // The kernel's threads, objects and synchronization (src/kernel/objects.h):
 // guest threads made and joined, events, semaphores, mutants and timers
 // signaled and waited on across host threads with timeouts, TLS slots,
-// critical sections, spin locks, SLists, APCs and DPCs, handles. The guest
-// code is host functions in the generated code's table, calling the
-// exports as the recompiled code reaches them.
+// critical sections, spin locks, SLists, APCs and DPCs, handles, and guest
+// stacks switched on host fibers of their own (stacks.h). The guest code is
+// host functions in the generated code's table, calling the exports as the
+// recompiled code reaches them.
 
 #include "check.h"
 
@@ -15,6 +16,11 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <vector>
+
+namespace xf::ppc {
+void switch_stack(Context &c, uint32_t thunk, uint32_t resume); // ppc_generated.h
+}
 
 using namespace xf;
 using namespace xf::kernel;
@@ -96,6 +102,11 @@ enum : uint32_t {
     F_TLS_OTHER = 0x820000E0,
     F_WAIT_MANUAL = 0x820000F0,
     F_APC_KERNEL = 0x82000100,
+    F_FIBER = 0x82000110,
+    F_FIBER_AGAIN = 0x82000120,
+    F_FIBER_AGAIN2 = 0x82000130,
+    F_FIBER_THREAD = 0x82000140,
+    F_FIBER_EXIT = 0x82000150,
 };
 
 std::atomic<uint32_t> flag{0}, apcs{0}, woken{0};
@@ -559,6 +570,103 @@ void apcs_and_dpcs(ppc::Context &c) {
     CHECK(K->load32(uint32_t(c.r[13]) + kpcr::DPC_ACTIVE) == 0);
 }
 
+// ---- guest stacks on host fibers ----
+//
+// The guest's SwitchToFiber as generated code reaches it: LR and r1 those
+// the other stack goes on with, then KeSetCurrentStackPointers' thunk
+// through ppc::switch_stack, with where this code goes on when its stack is
+// switched back to. The fibers' functions are host code in the generated
+// table; their locals live on the host stack each guest stack runs on.
+
+uint32_t ksp_thunk = 0;
+uint32_t own_base = 0, own_limit = 0, own_sp = 0, fiber_top = 0, fiber_sp = 0;
+std::vector<int> trace;
+std::atomic<uint32_t> fiber_thread_after{0};
+constexpr uint32_t RET_MAIN_1 = 0x82100000, RET_MAIN_2 = 0x82100004, RET_MAIN_3 = 0x82100008, RET_MAIN_4 = 0x8210000C,
+                   RET_FIBER_1 = 0x82100010, RET_FIBER_2 = 0x82100014, RET_FIBER_3 = 0x82100018,
+                   RET_FIBER_4 = 0x8210001C;
+
+void switch_to(ppc::Context &c, uint32_t sp, uint32_t base, uint32_t limit, uint32_t lr, uint32_t resume) {
+    c.r[3] = sp, c.r[4] = K->load32(uint32_t(c.r[13]) + kpcr::CURRENT_THREAD);
+    c.r[5] = base, c.r[6] = base, c.r[7] = limit;
+    c.lr = lr;
+    ppc::switch_stack(c, ksp_thunk, resume);
+}
+
+// F_FIBER: the fiber's first run, from its stack's top
+void fiber(ppc::Context &c) {
+    int mine = 7;
+    trace.push_back(uint32_t(c.r[1]) == fiber_top - 0x100 ? 1 : -1);
+    c.r[1] -= 0x40; // a frame of its own
+    fiber_sp = uint32_t(c.r[1]);
+    switch_to(c, own_sp, own_base, own_limit, RET_MAIN_1, RET_FIBER_1);
+    // switched back to where it left: its host frame as it was
+    trace.push_back(mine == 7 && uint32_t(c.r[1]) == fiber_sp ? 2 : -2);
+    switch_to(c, own_sp, own_base, own_limit, RET_MAIN_2, RET_FIBER_2);
+    trace.push_back(-4); // never: its stack starts over above this frame
+}
+
+// F_FIBER_AGAIN: the fiber started over from its top; the Unwind went past
+// fiber()'s frame to the stack's start, which runs this
+void fiber_again(ppc::Context &c) {
+    trace.push_back(uint32_t(c.r[1]) == fiber_top - 0x100 ? 3 : -3);
+    switch_to(c, own_sp, own_base, own_limit, RET_MAIN_3, RET_FIBER_3);
+    trace.push_back(-5); // never: switched back to with the same r1 elsewhere
+}
+
+// F_FIBER_AGAIN2: switched back to with fiber_again()'s r1, at a function's
+// start: the switch's own dispatch, whose r1 that is, runs it
+void fiber_again2(ppc::Context &c) {
+    trace.push_back(uint32_t(c.r[1]) == fiber_top - 0x100 ? 6 : -6);
+    switch_to(c, own_sp, own_base, own_limit, RET_MAIN_4, RET_FIBER_4);
+    trace.push_back(-7); // never: its stack is freed while it waits
+}
+
+// F_FIBER_THREAD: a thread that moves to a fiber which ends it
+void fiber_thread(ppc::Context &c) {
+    Thread *t = current_thread();
+    uint32_t top = ex(c, "MmCreateKernelStack", {0x10000, 0});
+    switch_to(c, top - 0x100, top, top - 0x10000, F_FIBER_EXIT, 0x82100020);
+    fiber_thread_after = t->id; // never: the thread ended on the fiber
+}
+void fiber_exit(ppc::Context &c) { ex(c, "ExTerminateThread", {0x77}); }
+
+void fibers(ppc::Context &c) {
+    Thread *t = current_thread();
+    own_base = t->stack_base, own_limit = t->stack_limit, own_sp = uint32_t(c.r[1]);
+    const uint64_t interpreted = K->interpreted_entries();
+    fiber_top = ex(c, "MmCreateKernelStack", {0x10000, 0});
+    CHECK(fiber_top >= 0x70000000 && fiber_top < 0x7F000000);
+    int mine = 42;
+    // to its own stack: nothing moves
+    switch_to(c, own_sp, own_base, own_limit, RET_MAIN_1, RET_MAIN_1);
+    CHECK(t->stacks && t->stacks->stacks.size() == 1 && uint32_t(c.r[1]) == own_sp && trace.empty());
+    // the fiber's stack: a host fiber of its own, from F_FIBER
+    switch_to(c, fiber_top - 0x100, fiber_top, fiber_top - 0x10000, F_FIBER, RET_MAIN_1);
+    CHECK(mine == 42 && uint32_t(c.r[1]) == own_sp && (trace == std::vector<int>{1}));
+    CHECK(t->stacks->stacks.size() == 2);
+    // back where the fiber left
+    switch_to(c, fiber_sp, fiber_top, fiber_top - 0x10000, RET_FIBER_1, RET_MAIN_2);
+    CHECK(mine == 42 && uint32_t(c.r[1]) == own_sp && (trace == std::vector<int>{1, 2}));
+    // the fiber starting over from its top elsewhere: its frames are unwound
+    switch_to(c, fiber_top - 0x100, fiber_top, fiber_top - 0x10000, F_FIBER_AGAIN, RET_MAIN_3);
+    CHECK(mine == 42 && (trace == std::vector<int>{1, 2, 3}));
+    // with the r1 it left with, elsewhere than where it waits
+    switch_to(c, fiber_top - 0x100, fiber_top, fiber_top - 0x10000, F_FIBER_AGAIN2, RET_MAIN_4);
+    CHECK(mine == 42 && uint32_t(c.r[1]) == own_sp && (trace == std::vector<int>{1, 2, 3, 6}));
+    CHECK(K->interpreted_entries() == interpreted); // all of it in the generated table's code
+    // its stack freed: its host fiber goes (deleted from this one)
+    CHECK(ex(c, "MmDeleteKernelStack", {fiber_top, fiber_top - 0x10000}) == X_STATUS_SUCCESS);
+    CHECK(t->stacks->stacks.size() == 1 && t->stacks->dead.size() == 1);
+
+    // ExitThread on a fiber ends its thread, thrown again on the thread's own stack
+    uint32_t kthread = create_thread(c, F_FIBER_THREAD, 0, 0x80);
+    uint32_t list = local(c, 0x20);
+    K->store32(list, kthread);
+    CHECK(ex(c, "KeWaitForMultipleObjects", {1, list, 1, 0, 0, 0, 0, 0}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(kthread + kthread::EXIT_STATUS) == 0x77 && fiber_thread_after == 0);
+}
+
 void main_thread(ppc::Context &c) {
     threads(c);
     events(c);
@@ -571,6 +679,7 @@ void main_thread(ppc::Context &c) {
     slists(c);
     links(c);
     apcs_and_dpcs(c);
+    fibers(c);
     c.r[3] = 0x600D;
 }
 
@@ -592,6 +701,11 @@ const Generated generated[] = {
     {F_TLS_OTHER, tls_other},
     {F_WAIT_MANUAL, wait_manual},
     {F_APC_KERNEL, apc_kernel},
+    {F_FIBER, fiber},
+    {F_FIBER_AGAIN, fiber_again},
+    {F_FIBER_AGAIN2, fiber_again2},
+    {F_FIBER_THREAD, fiber_thread},
+    {F_FIBER_EXIT, fiber_exit},
 };
 
 } // namespace
@@ -605,6 +719,8 @@ int main() {
         K = &k;
         k.set_generated(generated, std::size(generated));
         scratch = memory->system_alloc(0x1000);
+        ksp_thunk = memory->system_alloc(0x10);
+        k.add_thunk(ksp_thunk, "xboxkrnl", "KeSetCurrentStackPointers");
         Objects &o = objects(k);
         o.set_tls(64, 0, 0, 0); // as an executable's TLS header asks
 

@@ -5,13 +5,16 @@
 // the gap filler (a run of leaf methods longer than its old rounds, a dead
 // blr after a tail call, an exception handler's record before a function),
 // a jump table bounded by a cmplwi after a clrlwi, a branch into a function
-// the walk ran on into past a call that never returns, and the functions that
-// switch the stack (a longjmp, a fiber switch).
+// the walk ran on into past a call that never returns, the functions that
+// switch the stack (a longjmp, fiber switches) and the resume sites (after a
+// call to a setjmp, itself or behind a tail branch; a catch continuation a
+// funclet returns), and how those are emitted.
 
 #include "check.h"
 #include "xenoforge/recomp.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using namespace xf;
@@ -26,6 +29,8 @@ uint32_t addi(uint32_t d, uint32_t a, int32_t v) { return 14u << 26 | d << 21 | 
 uint32_t li(uint32_t d, int32_t v) { return addi(d, 0, v); }
 uint32_t lis(uint32_t d, uint32_t v) { return 15u << 26 | d << 21 | (v & 0xFFFF); }
 uint32_t lwz(uint32_t d, int32_t off, uint32_t a) { return 32u << 26 | d << 21 | a << 16 | (uint32_t(off) & 0xFFFF); }
+uint32_t stw(uint32_t s, int32_t off, uint32_t a) { return 36u << 26 | s << 21 | a << 16 | (uint32_t(off) & 0xFFFF); }
+uint32_t std_(uint32_t s, int32_t off, uint32_t a) { return 62u << 26 | s << 21 | a << 16 | (uint32_t(off) & 0xFFFC); }
 uint32_t stwu(uint32_t s, int32_t off, uint32_t a) { return 37u << 26 | s << 21 | a << 16 | (uint32_t(off) & 0xFFFF); }
 uint32_t cmpwi(uint32_t cr, uint32_t a, int32_t v) { return 11u << 26 | cr << 23 | a << 16 | (uint32_t(v) & 0xFFFF); }
 uint32_t cmplwi(uint32_t cr, uint32_t a, uint32_t v) { return 10u << 26 | cr << 23 | a << 16 | (v & 0xFFFF); }
@@ -39,7 +44,7 @@ uint32_t bl(uint32_t from, uint32_t to) { return b(from, to) | 1; }
 uint32_t bc(uint32_t bo, uint32_t bi, uint32_t from, uint32_t to) {
     return 16u << 26 | bo << 21 | bi << 16 | ((to - from) & 0xFFFC);
 }
-constexpr uint32_t BLR = 0x4E800020, BCTR = 0x4E800420, MFLR_R12 = 0x7D8802A6, NOP = 0x60000000;
+constexpr uint32_t BLR = 0x4E800020, BCTR = 0x4E800420, MFLR_R12 = 0x7D8802A6, MFLR_R0 = 0x7C0802A6, NOP = 0x60000000;
 
 struct Builder {
     Image image;
@@ -81,6 +86,14 @@ constexpr uint32_t H2 = T + 0x940;
 constexpr uint32_t LJ = T + 0xA00;    // lwz r1, 0(r3): a longjmp
 constexpr uint32_t FS = T + 0xA20;    // b to KeSetCurrentStackPointers' thunk: a fiber switch
 constexpr uint32_t THUNK = T + 0xA40; // that import's thunk
+constexpr uint32_t SJ = T + 0xB00;    // setjmp: r1 and LR kept in r3's buffer, returns 0
+constexpr uint32_t SJW = T + 0xB20;   // b SJ: it saves the stack through a tail branch
+constexpr uint32_t SC = T + 0xB40;    // calls SJW, SJ and FS2: resume sites after the first two
+constexpr uint32_t FS2 = T + 0xB80;   // keeps r1 and switches (a SwitchToFiber): not a setjmp
+constexpr uint32_t FS3 = T + 0xBA0;   // a bc to the thunk
+constexpr uint32_t EP = T + 0xC08;    // .pdata with exception data, its handler record at EP - 8
+constexpr uint32_t CONT = EP + 0x10;  // inside EP, reached only by the funclet's return
+constexpr uint32_t FUNCLET = T + 0xC40; // a catch block: lis r3, addi r3 to CONT, blr
 
 Image build() {
     Builder m;
@@ -104,10 +117,21 @@ Image build() {
     m.code(FS, {lwz(3, 0x30, 3), b(FS + 4, THUNK)});
     m.code(THUNK, {li(3, 0), BLR, NOP, NOP});
     m.image.imports.push_back({"xboxkrnl.exe", 0x9B, THUNK}); // KeSetCurrentStackPointers
+    m.code(SJ, {stw(1, 0, 3), MFLR_R0, stw(0, 4, 3), li(3, 0), BLR});
+    m.code(SJW, {b(SJW, SJ)});
+    m.code(SC, {MFLR_R12, stwu(1, -0x20, 1), bl(SC + 8, SJW), cmpwi(0, 3, 0), bl(SC + 0x10, SJ), bl(SC + 0x14, FS2),
+                addi(1, 1, 0x20), BLR});
+    m.code(FS2, {std_(1, 0x30, 5), b(FS2 + 4, THUNK)});
+    m.code(FS3, {cmpwi(0, 3, 0), bc(12, 2, FS3 + 4, THUNK), BLR});
+    m.code(EP - 8, {A, RDATA + 0x40});
+    m.code(EP, {MFLR_R12, stwu(1, -0x20, 1), bl(EP + 8, Z), b(EP + 0xC, EP + 0x14), li(3, 1), addi(1, 1, 0x20), BLR});
+    m.code(FUNCLET, {lis(3, CONT >> 16), addi(3, 3, int32_t(CONT & 0xFFFF)), BLR});
     m.code(RDATA, {P, V, EMPTY});
     m.image.pdata.push_back({A, 0x1C, 1, false});
     m.image.pdata.push_back({TB, 0x60, 0, false});
     m.image.pdata.push_back({E, 8, 0, true});
+    m.image.pdata.push_back({EP, 0x1C, 2, true});
+    m.image.pdata.push_back({FUNCLET, 0xC, 0, false});
     return m.image;
 }
 
@@ -173,11 +197,49 @@ int main() {
     CHECK(d.functions.count(R) && d.functions.at(R).source == Source::Branch && d.functions.at(R).size == 0xC);
     CHECK(d.functions.count(H) && d.functions.at(H).size == 8 && d.functions.at(H).tail_calls.count(R));
     CHECK(d.counts["pointer scan: branch targets added"] == 1);
-    // what switches the stack is left to the interpreter: r1 loaded from a
-    // buffer (LJ), a branch to KeSetCurrentStackPointers (FS); not an epilogue
+    // what switches the stack: r1 loaded from a buffer (LJ), a branch to
+    // KeSetCurrentStackPointers (FS, FS2, and FS3's bc); not an epilogue
     CHECK(d.functions.count(LJ) && d.functions.at(LJ).switches_stack);
     CHECK(d.functions.count(FS) && d.functions.at(FS).switches_stack && d.functions.at(FS).tail_calls.count(THUNK));
+    CHECK(d.functions.count(FS2) && d.functions.at(FS2).switches_stack);
+    CHECK(d.functions.count(FS3) && d.functions.at(FS3).switches_stack);
     CHECK(d.functions.count(U) && !d.functions.at(U).switches_stack && !d.functions.at(A).switches_stack);
-    CHECK(d.counts["functions that switch the stack (left to the interpreter)"] == 2);
+    CHECK(d.counts["functions that switch the stack"] == 4);
+    CHECK(d.stack_thunks == std::set<uint32_t>{THUNK});
+
+    // what saves the stack and returns (SJ, SJW through its tail branch); FS2
+    // keeps r1 too, but switches: its callers go on through the switch back
+    CHECK(d.functions.count(SJ) && d.functions.at(SJ).saves_stack && !d.functions.at(SJ).switches_stack);
+    CHECK(d.functions.count(SJW) && d.functions.at(SJW).saves_stack);
+    CHECK(!d.functions.at(A).saves_stack && !d.functions.at(SC).saves_stack);
+    // the resume sites: after the calls to SJW and SJ, not FS2; the catch
+    // continuation, which the pointer scan also took for a start
+    CHECK(d.functions.count(SC) && (d.functions.at(SC).resumes == std::set<uint32_t>{SC + 0xC, SC + 0x14}));
+    CHECK(d.functions.count(EP) && (d.functions.at(EP).resumes == std::set<uint32_t>{CONT}));
+    CHECK(d.functions.count(CONT) && d.functions.at(CONT).source == Source::Pointer);
+    CHECK(d.functions.at(FUNCLET).resumes.empty() && d.functions.at(A).resumes.empty());
+    CHECK(d.counts["resume sites: after a call that saves the stack"] == 2);
+    CHECK(d.counts["resume sites: catch continuations"] == 1);
+    CHECK(d.functions.at(SC).call_sites.size() == 3);
+
+    // Emitted: a switch's returns checked, its branch to the thunk a
+    // switch_stack with its own return address; the setjmp's caller in a
+    // try block that takes an Unwind at its resume sites, without tail
+    // calls; the continuation a label of EP's
+    auto emitted = [&](uint32_t a) { return emit_function(image, d, d.functions.at(a), "xf_"); };
+    auto contains = [](const std::string &text, const std::string &part) {
+        return text.find(part) != std::string::npos;
+    };
+    std::string lj = emitted(LJ), fs = emitted(FS), fs3 = emitted(FS3), sc = emitted(SC), ep = emitted(EP);
+    CHECK(contains(lj, "const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);"));
+    CHECK(contains(lj, "XF_CHECKED_RETURN();") && !contains(lj, "    return;"));
+    CHECK(contains(fs, "{ ::xf::ppc::switch_stack(c, 0x82000A40, xf_lr); XF_CHECKED_RETURN(); }"));
+    CHECK(contains(fs3, "if (BC(12, 2)) { ::xf::ppc::switch_stack(c, 0x82000A40, xf_lr); XF_CHECKED_RETURN(); }"));
+    CHECK(contains(sc, "try {") && contains(sc, "case 0x82000B4C: goto L_82000B4C;") &&
+          contains(sc, "case 0x82000B54: goto L_82000B54;") && contains(sc, "L_82000B4C:") &&
+          contains(sc, "catch (const ::xf::ppc::Unwind &xf_unwind)") && contains(sc, "xf_82000B20(c);") &&
+          contains(sc, "c.lr = 0x82000B58; xf_82000B80(c);"));
+    CHECK(contains(ep, "case 0x82000C18: goto L_82000C18;") && contains(ep, "L_82000C18:"));
+    CHECK(!contains(sc, "XF_TAIL") && !contains(emitted(A), "try {"));
     return finish("recomp_discover");
 }

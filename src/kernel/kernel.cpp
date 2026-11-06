@@ -108,9 +108,16 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
     system_.owner = this;
     system_.syscall = [](ppc::Context &c) {
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
-        auto it = k.by_thunk_.find(c.pc);
-        if (it != k.by_thunk_.end()) k.run_import(c, k.imports_[it->second]);
-        else if (const Import *thunk = k.find_thunk(c.pc)) k.run_import(c, *thunk);
+        const Import *import = nullptr;
+        if (auto it = k.by_thunk_.find(c.pc); it != k.by_thunk_.end()) import = &k.imports_[it->second];
+        else import = k.find_thunk(c.pc);
+        if (!import) return;
+        // the thunk's blr goes on where LR says after the export, and so does
+        // the code that waits in a stack switch made here (stacks.h)
+        static const ExportFn stack_switch = find_export_fn("xboxkrnl", "KeSetCurrentStackPointers");
+        if (import->fn && import->fn == stack_switch)
+            if (Thread *t = current_thread(); t && t->context.get() == &c) t->stack_resume = STACK_RESUME_ANYWHERE;
+        k.run_import(c, *import);
     };
     system_.call = [](ppc::Context &c, uint32_t target) {
         return static_cast<Kernel *>(c.system->owner)->try_call(c, target);
@@ -327,7 +334,20 @@ void Kernel::remove_thunks(uint32_t begin, uint32_t end) {
         retired_thunks_.push_back(thunks_.extract(it++));
 }
 
-void Kernel::set_generated(const Generated *table, size_t count) { generated_ = table, generated_count_ = count; }
+void Kernel::set_generated(const Generated *table, size_t count, const uint32_t *resumes, size_t resume_count) {
+    generated_ = table, generated_count_ = count;
+    generated_resumes_ = resumes, generated_resume_count_ = resume_count;
+}
+
+bool Kernel::resumable(uint32_t target) const {
+    if (std::binary_search(generated_resumes_, generated_resumes_ + generated_resume_count_, target)) return true;
+    if (const CodeMap *map = code_map_.load(std::memory_order_acquire))
+        for (const CodeMap::Range &r : map->ranges)
+            if (target - r.begin < r.size)
+                return r.module->resumes &&
+                       std::binary_search(r.module->resumes, r.module->resumes + r.module->resume_count, target);
+    return false;
+}
 
 void Kernel::set_generated_modules(const ppc::GeneratedModule *const *modules, size_t count) {
     std::lock_guard lock(code_->mutex);
@@ -394,8 +414,10 @@ void Kernel::attach(ppc::Context &c) {
 }
 
 void Kernel::run_import(ppc::Context &c, const Import &import) {
-    std::string key = import.library + "!" + import.name;
+    // (nothing of this frame outlives the count: a host stack may be dropped
+    // while it waits in the export, KeSetCurrentStackPointers's switch)
     {
+        std::string key = import.library + "!" + import.name;
         std::lock_guard<std::mutex> lock(counts_mutex_);
         calls_[key]++;
         if (!import.fn && unimplemented_[key]++ == 0)
@@ -449,16 +471,18 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
     return false;
 }
 
-// A longjmp (docs/runtime.md, "Code"): an interpreted blr out of the frames
-// its dispatch began in, to a frame further up. Thrown through the generated
-// code's frames (C++ cannot return into the middle of one) to the dispatch
-// whose frames hold the stack it restored, which interprets on from where it
-// went: the rest of the functions between, interpreted, until the guest
-// returns to that dispatch's own return address and stack.
-struct GuestUnwind {
-    uint32_t target;
-};
-
+// A return to another frame (docs/runtime.md, "Code"; ppc::Unwind): a
+// longjmp, a catch's continuation, a stack switched back to elsewhere than
+// where it left; an interpreted blr out of the frames its dispatch began in,
+// or a checked return of generated code that switches the stack. Thrown
+// through the host frames (C++ cannot return into the middle of one) to the
+// innermost frame entered with r1 above the restored one, which holds the
+// guest's frame at r1: a generated function with a resume site there goes on
+// at it; a dispatch interprets on from the target, the rest of the functions
+// between interpreted, until the guest returns to that dispatch's own return
+// address and stack (a function's start on the way runs its generated code).
+// A dispatch whose stack top is the restored r1 leaves the return to its
+// caller's frame when that frame's generated code takes it.
 void Kernel::dispatch(ppc::Context &c, uint32_t target) {
     if (stopped) return;
     // what a return from this call comes back to
@@ -466,7 +490,21 @@ void Kernel::dispatch(ppc::Context &c, uint32_t target) {
     uint32_t pc = target;
     for (bool unwound = false;;) {
         try {
-            if (!unwound && try_call(c, target)) return;
+            if (!unwound) {
+                if (try_call(c, target)) return;
+            } else {
+                // a function's start: its code, then on where it returns
+                while (!stopped && try_call(c, pc)) {
+                    pc = uint32_t(c.lr) & ~3u;
+                    uint32_t sp = uint32_t(c.r[1]);
+                    if (pc == until && sp >= stack_top) return;
+                    if (sp > stack_top) {
+                        unwinds_thrown++;
+                        throw ppc::Unwind{pc};
+                    }
+                }
+                if (stopped) return;
+            }
             interpreted_++;
             {
                 std::lock_guard<std::mutex> lock(counts_mutex_);
@@ -474,17 +512,38 @@ void Kernel::dispatch(ppc::Context &c, uint32_t target) {
             }
             interpret_from(c, pc, until, stack_top);
             return;
-        } catch (const GuestUnwind &u) {
+        } catch (const ppc::Unwind &u) {
             // a frame of this call's, or one further up
-            if (uint32_t(c.r[1]) > stack_top) throw;
+            uint32_t sp = uint32_t(c.r[1]);
+            if (sp > stack_top || (sp == stack_top && resumable(u.target))) throw;
+            unwinds_by_dispatch++;
             pc = u.target, unwound = true;
         }
     }
 }
 
+void Kernel::run_from(ppc::Context &c, uint32_t pc) {
+    while (!stopped) {
+        if (try_call(c, pc)) {
+            pc = uint32_t(c.lr) & ~3u; // where it returned
+            continue;
+        }
+        interpreted_++;
+        {
+            std::lock_guard<std::mutex> lock(counts_mutex_);
+            interpreted_targets_[pc]++;
+        }
+        interpret_from(c, pc, SENTINEL, 0);
+        return;
+    }
+}
+
 void Kernel::interpret_from(ppc::Context &c, uint32_t pc, uint32_t until, uint32_t stack_top) {
     ppc::Stopped s = ppc::interpret(c, pc, until, step_limit, stack_top);
-    if (s.reason == ppc::Stopped::Unwound) throw GuestUnwind{s.pc};
+    if (s.reason == ppc::Stopped::Unwound) {
+        unwinds_thrown++;
+        throw ppc::Unwind{s.pc};
+    }
     if (s.reason != ppc::Stopped::Returned && !stopped.exchange(true)) {
         char reason[128];
         std::snprintf(reason, sizeof(reason), "the interpreter stopped at 0x%08X: %s", s.pc,
@@ -501,29 +560,34 @@ void Kernel::call(ppc::Context &c, uint32_t address) {
     try {
         dispatch(c, address);
         return;
-    } catch (const GuestUnwind &u) {
+    } catch (const ppc::Unwind &u) {
         target = u.target;
+        unwinds_by_dispatch++;
     }
-    // r1 above every frame of this call: a fiber whose stack lies above the
-    // thread's (or a longjmp out of a callback the kernel made). The guest
-    // goes on from there, interpreted, until it returns from this call, its
-    // own unwinds no longer checked; one from a dispatch below (generated
-    // code it calls switching fibers again) comes here too.
+    // r1 above every frame of this call: a longjmp out of a callback the
+    // kernel made (a stack switch runs on a host stack of its own, so it
+    // ends up here no more). The guest goes on from there until it returns
+    // from this call (a function's start on the way generated, the rest
+    // interpreted), its own unwinds no longer checked; one from a dispatch
+    // below comes here too.
     static std::atomic<bool> logged{false};
     if (!logged.exchange(true))
         std::fprintf(stderr, "kernel: a blr to 0x%08X with r1 0x%08X left the frames of a call to 0x%08X\n", target,
                      uint32_t(c.r[1]), address);
     for (;;) {
-        interpreted_++;
-        {
-            std::lock_guard<std::mutex> lock(counts_mutex_);
-            interpreted_targets_[target]++;
-        }
         try {
+            while (target != SENTINEL && !stopped && try_call(c, target)) target = uint32_t(c.lr) & ~3u;
+            if (target == SENTINEL || stopped) return;
+            interpreted_++;
+            {
+                std::lock_guard<std::mutex> lock(counts_mutex_);
+                interpreted_targets_[target]++;
+            }
             interpret_from(c, target, SENTINEL, 0);
             return;
-        } catch (const GuestUnwind &u) {
+        } catch (const ppc::Unwind &u) {
             target = u.target;
+            unwinds_by_dispatch++;
         }
     }
 }
@@ -551,5 +615,18 @@ void invalid(Context &c, uint32_t pc) {
     char reason[64];
     std::snprintf(reason, sizeof(reason), "an invalid instruction at 0x%08X", pc);
     if (!k.stopped.exchange(true)) k.stop_reason = reason;
+}
+[[noreturn]] void unwind(Context &c) {
+    static_cast<kernel::Kernel *>(c.system->owner)->unwinds_thrown++;
+    throw Unwind{uint32_t(c.lr) & ~3u};
+}
+void switch_stack(Context &c, uint32_t thunk, uint32_t resume) {
+    // KeSetCurrentStackPointers reads it (stacks.cpp); cleared after, in case
+    // the thunk led elsewhere
+    kernel::Thread *t = kernel::current_thread();
+    if (t && t->context.get() != &c) t = nullptr;
+    if (t) t->stack_resume = resume;
+    static_cast<kernel::Kernel *>(c.system->owner)->dispatch(c, thunk);
+    if (t) t->stack_resume = 0;
 }
 } // namespace xf::ppc

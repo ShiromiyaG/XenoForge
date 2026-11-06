@@ -122,7 +122,9 @@ As the 3DS runtime's interface 6: each guest thread runs on its own stack
 (a host thread when playing, a fiber in the deterministic mode); a system
 call is a C++ call that comes back. The generated code never leaves partway;
 yield points where loops turn back and functions start hand over in the
-deterministic mode (plan, "Threads").
+deterministic mode (plan, "Threads"). Each guest stack a thread moves to (a
+fiber's) runs on a host stack of its own, so KeSetCurrentStackPointers is a
+call that comes back when its stack is switched back to ("Stack switches").
 
 ## Discovery
 
@@ -199,13 +201,13 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
 - **Stack switches**: a function that loads r1 from memory r1 does not
   address (`ld r1, 0x90(r7)`: the CRT's longjmp; `ld r1, 0x20(r4); blr`:
   the C++ exception machinery's jump to a catch's continuation) or branches
-  to KeSetCurrentStackPointers' thunk (the XDK's SwitchToFiber, in Reach)
-  returns to another frame than its caller's, which a C++ `return` cannot
-  do. It gets no generated code (`Function::switches_stack`): calls to it
-  dispatch, the interpreter runs it, and the runtime takes its return to
-  that frame (docs/runtime.md, "Code"). The eight games have 0 to 3 each,
-  all of those kinds; BC2's splash screen longjmps (its generated code
-  faulted when longjmp "returned" into padding), Reach switches fibers.
+  to KeSetCurrentStackPointers' thunk (`b`, `bc` or `bl`: the XDK's
+  SwitchToFiber, in Reach) may return to another frame than its caller's
+  (`Function::switches_stack`); one that keeps r1 in memory r1 does not
+  address and returns (setjmp, or a tail branch to one) saves the stack
+  (`saves_stack`); the return sites of the calls to those, and the catch
+  continuations of the functions with exception data, are resume sites
+  (`resumes`). How the generated code follows them: "Stack switches" below.
 - **Everything else** that is indirect (`bctr`, `bctrl`, `blrl`, a branch
   to an address no function holds) goes through the dispatch table, and an
   address with no generated code runs in the interpreter: a wrong guess
@@ -292,29 +294,31 @@ generated code is per module:
   files of the eight games and eight links: 534 s). -O2 stays the default:
   every game builds in under half an hour.
 
-The eight games (2026-11-05; functions with generated code, so neither
-imports nor stack switches; instructions are their sizes / 4; switches:
-functions left to the interpreter for switching the stack; unresolved:
-direct branches and table cases to no start, with the scan):
+The eight games (2026-11-05, with the stack switches generated, "Stack
+switches" below; functions with generated code, all but the imports;
+instructions are their sizes / 4; switches: functions that switch the
+stack, their returns checked; resumes: resume sites, in how many
+functions; unresolved: direct branches and table cases to no start, with
+the scan):
 
-| game | module | functions | instructions | switches | unresolved |
-|---|---|---|---|---|---|
-| El Chavo Kart | default.xex | 73,292 | 4,720,319 | 1 | 0 |
-| Ben 10 | default.xex | 21,718 | 1,711,798 | 2 | 0 |
-| BC2 | Default.xex | 292 | 12,518 | 0 | 0 |
-| | Splash.xex | 6,833 | 679,160 | 1 | 0 |
-| | Game.xex | 54,016 | 2,773,485 | 2 | 0 |
-| Forza Horizon | default.xex | 76,044 | 3,654,955 | 3 | 8 |
-| | XMediaFacade_default.xex | 3,163 | 525,032 | 0 | 0 |
-| | SpeechFacade_default.xex | 6,648 | 374,001 | 1 | 0 |
-| Gears of War 3 | default.xex | 56,300 | 3,465,659 | 2 | 0 |
-| Reach | default.xex | 37,901 | 2,424,184 | 3 | 0 |
-| | waveShell-Xbox.dll | 2,652 | 103,993 | 1 | 0 |
-| | wavesLibDLL.dll | 3,372 | 141,968 | 1 | 0 |
-| | waves\L360.dll | 1,351 | 47,300 | 1 | 0 |
-| | waves\Q10.dll | 1,146 | 38,075 | 1 | 0 |
-| Red Dead Redemption | default.xex | 69,231 | 3,418,826 | 0 | 0 |
-| Sonic Unleashed | default.xex | 65,840 | 4,046,340 | 2 | 0 |
+| game | module | functions | instructions | switches | resumes | unresolved |
+|---|---|---|---|---|---|---|
+| El Chavo Kart | default.xex | 73,293 | 4,720,516 | 1 | 9 in 9 | 0 |
+| Ben 10 | default.xex | 21,720 | 1,712,043 | 2 | 7 in 7 | 0 |
+| BC2 | Default.xex | 292 | 12,518 | 0 | 0 | 0 |
+| | Splash.xex | 6,834 | 679,357 | 1 | 7 in 7 | 0 |
+| | Game.xex | 54,018 | 2,773,730 | 2 | 2 in 2 | 0 |
+| Forza Horizon | default.xex | 76,047 | 3,655,459 | 3 | 11 in 11 | 8 |
+| | XMediaFacade_default.xex | 3,163 | 525,032 | 0 | 0 | 0 |
+| | SpeechFacade_default.xex | 6,649 | 374,049 | 1 | 1 in 1 | 0 |
+| Gears of War 3 | default.xex | 56,302 | 3,465,904 | 2 | 2 in 2 | 0 |
+| Reach | default.xex | 37,904 | 2,424,688 | 3 | 41 in 25 | 0 |
+| | waveShell-Xbox.dll | 2,653 | 104,041 | 1 | 49 in 43 | 0 |
+| | wavesLibDLL.dll | 3,373 | 142,016 | 1 | 64 in 56 | 0 |
+| | waves\L360.dll | 1,352 | 47,348 | 1 | 2 in 2 | 0 |
+| | waves\Q10.dll | 1,147 | 38,123 | 1 | 2 in 2 | 0 |
+| Red Dead Redemption | default.xex | 69,231 | 3,418,826 | 0 | 1 in 1 | 0 |
+| Sonic Unleashed | default.xex | 65,842 | 4,046,585 | 2 | 156 in 106 | 0 |
 
 Two discovery fixes came from running them: the branch targets inside a
 walked function (above, "The data pointer scan"), and a .pdata function's
@@ -331,6 +335,153 @@ r10, r9, 0, 26, 31`, so 64 entries by the mask, no compare) past the end of
 its function, into the middle of the next: the table is shorter than the
 mask allows and the bytes after it are other data. They are emitted as
 dispatches (what the hardware would do if the index ever got there).
+
+## Stack switches
+
+(2026-11-05, plan "Next", step 5.) Three things in the games move r1 to
+another stack and return into another frame than their caller's:
+
+- **longjmp**, the CRT's: the registers, r1 and LR back from the `jmp_buf`
+  setjmp filled, r3 the value (BC2's Splash.xex, 8 times in 30 s; Reach's
+  streaming decompressor, to bail out of bad input);
+- **the jump to a catch's continuation** in the C++ exception machinery: a
+  CONTEXT restored and a `blr` to the address the catch block returned;
+- **SwitchToFiber**, the XDK's: the registers saved into the current fiber,
+  the next one's loaded (LR and r1 among them), then a tail branch to
+  KeSetCurrentStackPointers, which moves r1 to the next fiber's stack
+  (Reach's decompressor runs on a fiber of its own and switches back to its
+  caller whenever its input runs out: 1,202 switches in 30 s of `boot`, 34
+  fibers made and deleted).
+
+A C++ return cannot go into the middle of another function's frame. Until
+now those functions were left to the interpreter, and their returns were
+thrown up to the dispatch whose frames held the restored r1, which
+interpreted the guest's frames from there up to its own return (Reach
+entered the interpreter 1,803 times in 30 s, BC2 16; after its first
+switch, a fiber of Reach's ran interpreted for good). Now the generated
+code follows them, and nothing between is interpreted:
+
+- **Each guest stack runs on a host stack of its own** (docs/runtime.md,
+  "Stacks"): KeSetCurrentStackPointers suspends the thread's host fiber in
+  the call and resumes the one the new guest stack's frames are on (made the
+  first time, running from LR). The game's own SwitchToFiber runs generated
+  on both sides: its call to the kernel returns on the other stack, into
+  the generated frames that were waiting there, which return as the guest's
+  do. A fiber switch is a host fiber switch; nothing is unwound or
+  interpreted.
+- **Functions that switch the stack have generated code**, called directly
+  like any other. Each keeps its entry's LR and r1 and checks every return
+  against them (`XF_CHECKED_RETURN`, in `ppc_generated.h`): a return with
+  both is an ordinary one; any other throws `ppc::Unwind{LR}`
+  (`ppc::unwind`, a C++ exception) to the frame it goes to. Tail calls in
+  them are calls and a checked return.
+- **A branch to KeSetCurrentStackPointers' thunk is `switch_stack(c, thunk,
+  resume)`**: the dispatch to the export, saying where this frame's code
+  goes on when its stack is switched back to: the address after a `bl`, the
+  function's own entry LR for a tail branch (SwitchToFiber's `b` to the
+  thunk is its return to its caller). The kernel resumes a suspended stack
+  as it left only when the switch back brings the r1 it left with and that
+  address in LR; otherwise its host frames get an Unwind as they resume.
+- **Resume sites.** A longjmp comes back after the call to its setjmp; a
+  catch continuation is an address inside the function the catch belongs
+  to. Discovery gives a function a resume site after each call to a
+  function that saves the stack (keeps r1 in memory r1 does not address and
+  returns normally: setjmp, or a function that tail-branches to one; not
+  SwitchToFiber, which saves it too but switches, so its callers go on
+  through the switch back), and, for a function with exception data
+  (`.pdata`'s flag), at each address inside it, past its start, that a
+  lis/addi pair makes anywhere in the code: a catch block is a funclet with
+  its own `.pdata` that ends `lis r3, cont@ha; addi r3, r3, cont@l; blr`
+  (checked on Reach: 0x821D6038's two catch funclets return 0x821D60AC and
+  0x821D60B0; the pointer scan took the first for a start, which it stays,
+  and the label is emitted in the parent too). A function with resume sites
+  runs its body in a try block that takes an Unwind with r1 inside its frame
+  to one of them (Reach's setjmp caller, a decompressor entry):
+
+  ```cpp
+  XF_FN(xf_827D2B80) {
+      const uint32_t xf_sp = uint32_t(c.r[1]);
+      uint32_t xf_at = 0; // where an Unwind came back to
+      for (;;) {
+          try {
+              switch (xf_at) {
+              case 0x827D2BA4: goto L_827D2BA4;
+              }
+              ...
+              c.lr = 0x827D2BA4; xf_829B20A0(c); // setjmp
+          L_827D2BA4:
+              ...
+              return;
+          } catch (const ::xf::ppc::Unwind &xf_unwind) {
+              if (uint32_t(c.r[1]) >= xf_sp) throw; // a frame further up
+              switch (xf_unwind.target) {
+              case 0x827D2BA4:
+                  xf_at = xf_unwind.target;
+                  continue;
+              }
+              throw;
+          }
+      }
+  }
+  ```
+
+  The generated code keeps nothing outside the context but `xf_sp`, `xf_lr`
+  and `xf_at`, so a frame goes on at a label exactly as the guest's does.
+  There are no tail calls in the try block (`musttail` cannot leave one).
+- **Who takes an Unwind**: the innermost host frame entered with r1 above
+  the restored one, whose function holds the guest's frame at that r1 (the
+  frames inside it were entered at or below it). A generated function with
+  the target among its resume sites goes on there, in its own frame, the
+  frames above it untouched; one without passes it on; a dispatch (entered
+  with its stack top above r1) interprets on from the target as before, a
+  function's start on the way running its generated code. A dispatch whose
+  stack top is exactly the restored r1 (an indirect call the target frame
+  made) passes it on to its caller when the target is a resume site of the
+  generated code (`GeneratedModule::resumes`, `Kernel::resumable`), and
+  interprets otherwise, as before.
+- **Cost**: nothing where nothing switches. The checked returns are in the
+  switching functions alone (20 in the 16 modules), the try blocks in the
+  functions with resume sites (zero-cost tables on x64; 274 functions, 354
+  sites, most of them catch continuations in Sonic and Reach's Waves DLLs:
+  the table above), and an Unwind is a C++ exception (tens of
+  microseconds), only for longjmps and catches.
+
+Measured (2026-11-05, 30 s of `boot_<game>`, whose report now says what
+took each switch): Reach enters the interpreter 0 times (1,803 before: 1,202
+at SwitchToFiber, 567 at the decompressor's return from it, 34 at the fiber
+start routine); its 1,202 switches are host fiber switches, its 34 fibers
+get 34 host fibers, dropped with their stacks (MmDeleteKernelStack), and
+nothing is unwound. BC2 enters it 0 times (16 before: 8 at longjmp, 8 at the
+setjmp caller's return site); its 8 longjmps are taken by the setjmp
+caller's generated frame at its resume site. The other six games enter it 0
+times, as before, and none of them switches stacks or unwinds in its first
+30 s. Swaps a second are as before, at the games' caps when the machine is
+not loaded (Reach 58 to 60, BC2 29.3); the switches and longjmps were too
+few for their interpretation to show in the rate.
+
+Left to the interpreter, correct and slower (none of it seen in the eight
+games): a return to an address discovery did not make a resume site (a
+setjmp called indirectly; a continuation not made by lis/addi), which the
+dispatch above the frame interprets from up to its own return, as before; a
+stack first entered at an address no function starts at, or a fiber that
+moved to another thread, whose outer frames run interpreted there
+(docs/runtime.md, "Stacks"); a longjmp that is itself interpreted (a module
+without generated code) and lands in the frame of the function that called
+the dispatch running it, which interprets that function on.
+
+How the others do it: Xenia's JIT can enter any address, so its
+KeSetCurrentStackPointers drops the thread's host frames and re-enters at
+LR (`XThread::Reenter`), and its x64 backend keeps a stack of (host rsp,
+guest r1, return address) entries so a return after a longjmp resets the
+host stack to the guest's (`enable_host_guest_stack_synchronization`); a
+fiber's code is entered anew at each switch. rexglue's fork (and
+XenonRecomp before it) replaces the XAPI's fiber functions, hooked by
+address (`REX_HOOK(rexcrt_SwitchToFiber)` and CreateFiber,
+ConvertThreadToFiber: host fibers), and setjmp and longjmp at addresses the
+port's configuration names (host setjmp and longjmp in the generated code).
+Here nothing is named by hand: the game's own XAPI code runs generated, the
+kernel export it ends in does the host side, and discovery finds setjmp's
+callers and the catch continuations.
 
 ## Steps
 

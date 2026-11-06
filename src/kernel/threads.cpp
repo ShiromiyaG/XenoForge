@@ -348,6 +348,9 @@ void Thread::body() {
     } catch (const ThreadExit &e) {
         code = e.code;
     }
+    // back on its own stack (a fiber's exit is thrown again there): the
+    // other guest stacks' host fibers go
+    end_guest_stacks(k, *this);
     // and as it exits (OnThreadExit), before it is marked terminated and
     // taken off its process (NT's order; Xenia's XThread::Exit calls it
     // last). An ExitThread in a DllMain there ends that DllMain only
@@ -765,9 +768,10 @@ XF_EXPORT(xboxkrnl, KeSetDisableBoostThread) {
 
 // (stack pointer, thread, allocation base, base, limit): a thread moving to
 // another stack, a fiber's (Xenia's KeSetCurrentStackPointers). r1 changes
-// under the caller; Xenia also re-enters the thread when a fiber switches
-// to avoid growing the host stack, which a switch here still does (each
-// switch a host call that does not return until the fiber is left).
+// under the caller. Where Xenia re-enters the thread at LR, dropping its host
+// frames, the calling thread here moves to the new stack's host fiber
+// (stacks.cpp): this call waits there until a switch comes back to this
+// stack.
 XF_EXPORT(xboxkrnl, KeSetCurrentStackPointers) {
     uint32_t stack_ptr = arg(k, c, 0), thread = arg(k, c, 1);
     uint32_t base = arg(k, c, 3), limit = arg(k, c, 4), pcr = uint32_t(c.r[13]);
@@ -776,7 +780,10 @@ XF_EXPORT(xboxkrnl, KeSetCurrentStackPointers) {
     k.store32(thread + kthread::STACK_LIMIT, limit);
     k.store32(pcr + kpcr::STACK_BASE, base);
     k.store32(pcr + kpcr::STACK_END, limit);
+    uint32_t from_sp = uint32_t(c.r[1]);
     c.r[1] = stack_ptr;
+    if (Thread *t = current_thread(); t && t->kthread() == thread && t->context.get() == &c)
+        switch_guest_stack(k, *t, c, from_sp, base, limit);
 }
 
 // The FPU registers kept in the current KTHREAD (Xenia's, sketchy as its).

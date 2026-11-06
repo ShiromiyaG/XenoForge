@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "stacks.h"
 #include "xenoforge/kernel.h"
 
 #include <atomic>
@@ -346,6 +347,13 @@ public:
     // what makes the thread stop at its next kernel call (a safe point)
     enum : uint32_t { PENDING_SUSPEND = 1, PENDING_KERNEL_APC = 2 };
     std::atomic<uint32_t> pending{0};
+
+    // the guest stacks it switched between and their host fibers (stacks.h),
+    // from its first switch; where the generated code that branched to
+    // KeSetCurrentStackPointers goes on when its stack is switched back to
+    // (ppc::switch_stack, read by the switch)
+    std::unique_ptr<GuestStacks> stacks;
+    uint32_t stack_resume = 0;
 
     // ---- under the lock ----
     enum class Blocked : uint8_t { No, Wait, Suspended };
