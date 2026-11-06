@@ -154,8 +154,8 @@ void LauncherView::rebuild_detail() {
     info.status = status_of(*g);
     info.has_player = player != nullptr;
     info.running = running;
-    info.runs_in = !player ? "no player beside the launcher" : player->generic ? "the generic player" : player->path.stem().string();
-    if (info.status == GameStatus::Ready && player && player->generic) info.runs_in = "the generic player, from its library";
+    info.runs_in = !player ? "no player beside the launcher" : player->generic ? "generic player" : player->path.stem().string();
+    if (info.status == GameStatus::Ready && player && player->generic && cached_of(*g)) info.runs_in = "generic player, library";
     if (!run.running && run.title == g->title) info.last_run = run.ended;
     detail->SetInnerRML(detail_html(info));
 }
@@ -262,8 +262,9 @@ void LauncherView::place_pill() {
 void LauncherView::begin_prepare(const GameEntry &game, bool demo) {
     const std::string title = game.title;
     PrepareJob::Runner runner = demo ? PrepareJob::demo_runner(opt_.demo_speed, opt_.demo_fail)
-                                     : PrepareJob::build_runner(game.path, build::default_cache_dir());
+                                     : PrepareJob::build_runner(game.path, build::default_cache_dir(), opt_.build_jobs);
     prepare_title_id_ = game.title_id;
+    prepare_listed_ = false;
     prepare_game_ = selected_;
     job_.start(title, std::move(runner));
     prepare_stage_ = 0;
@@ -312,6 +313,7 @@ void LauncherView::update_prepare() {
     const bool done = s.finished && s.ok;
     const bool cancelled = s.finished && s.cancelled;
     if (cancelled) return close_prepare(); // asked for: back to the library
+    if (s.finished && !prepare_listed_) prepare_listed_ = true, library_sig_.clear(), detail_sig_.clear(); // its card is ready now
 
     if (Rml::Element *p = by_id("prepare")) p->SetClass("failed", failed);
     // the stages
@@ -514,7 +516,7 @@ void LauncherView::update() {
             start_pending_ = -1;
         } else if (selected_ == start_pending_ && selected_game() && !core_.run().running && core_.run().ended.empty()) {
             start_pending_ = -1;
-            start_game(*selected_game(), player_of(*selected_game()));
+            play(*selected_game(), false); // the button's path: a disc not yet built is prepared first
         }
     }
     if (!capture_pending_.empty() && screen_ == Screen::Controls && by_id("controls-scroll")) {

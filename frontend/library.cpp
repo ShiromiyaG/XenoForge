@@ -240,14 +240,29 @@ std::vector<PlayerBinary> find_players(const std::filesystem::path &directory) {
     return players;
 }
 
-const PlayerBinary *player_for(const std::vector<PlayerBinary> &players, const GameEntry &game) {
-    const PlayerBinary *generic = nullptr;
+const PlayerBinary *player_for(const std::vector<PlayerBinary> &players, const GameEntry &game, bool cached_library) {
+    const PlayerBinary *generic = nullptr, *carrying = nullptr;
     for (const PlayerBinary &p : players) {
         if (p.generic) generic = &p;
         for (const auto &module : p.modules)
-            if (game.digest && module.first == game.digest) return &p;
+            if (game.digest && module.first == game.digest) carrying = &p;
     }
-    return generic;
+    // a cached library is what the emulator runs; a player with the game's
+    // code is the way out for a disc with none
+    if (cached_library && generic) return generic;
+    return carrying ? carrying : generic;
+}
+
+bool plan_launch(const std::vector<PlayerBinary> &players, const GameEntry &game, bool cached_library,
+                 const std::vector<std::string> &extra_args, LaunchPlan &plan) {
+    const PlayerBinary *player = player_for(players, game, cached_library);
+    if (!player) return false;
+    plan = LaunchPlan{};
+    plan.program = player->path;
+    plan.generic = player->generic;
+    plan.from_library = cached_library && player->generic;
+    plan.args = extra_args;
+    return true;
 }
 
 } // namespace xf::frontend

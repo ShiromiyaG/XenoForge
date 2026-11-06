@@ -44,9 +44,13 @@ void PrepareJob::join() {
     if (thread_.joinable()) thread_.join();
 }
 
-PrepareJob::Runner PrepareJob::build_runner(std::filesystem::path disc, std::filesystem::path cache_dir) {
-    return [disc = std::move(disc), cache_dir = std::move(cache_dir)](build::Progress &progress, std::string &error) {
-        return build::prepare_game(disc, cache_dir, progress, error);
+PrepareJob::Runner PrepareJob::build_runner(std::filesystem::path disc, std::filesystem::path cache_dir,
+                                            unsigned jobs) {
+    return [disc = std::move(disc), cache_dir = std::move(cache_dir), jobs](build::Progress &progress,
+                                                                            std::string &error) {
+        build::BuildOptions options;
+        if (jobs) options.jobs = jobs;
+        return build::prepare_game(disc, cache_dir, progress, error, options);
     };
 }
 

@@ -28,8 +28,9 @@ class PrepareJob {
 
     ~PrepareJob(); // cancelled, and waited for
 
-    // The real build of a disc into the cache.
-    static Runner build_runner(std::filesystem::path disc, std::filesystem::path cache_dir);
+    // The real build of a disc into the cache, with `jobs` compilers at once
+    // (0: the build's default).
+    static Runner build_runner(std::filesystem::path disc, std::filesystem::path cache_dir, unsigned jobs = 0);
     // A build that is not one, for --demo-progress: a few minutes of stages
     // at `speed` times real time, ending in a failure when `fail`.
     static Runner demo_runner(double speed, bool fail);

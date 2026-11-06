@@ -744,7 +744,7 @@ Dear ImGui kept for the debugging tools only (the player's F1 overlay).
 
 ```
 launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <page>] [--start N]
-    [--player-arg <arg>]... [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
+    [--player-arg <arg>]... [--build-jobs N] [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
     [--demo-speed X] [--show-log] [--capture-binding <name>] [--render-size WxH] [--scale F] [--assets <dir>]
 ```
 
@@ -805,9 +805,13 @@ hints at the bottom follow the last device used.
   second per disc (the executable decrypted and unpacked).
 - **Which player**: each `player` and `player_<game>` beside the launcher
   is run once with `--identify` (no window, no console), which prints the
-  digest of every module whose generated code it carries; a game starts in
-  the player that carries its `default.xex`, else in the generic `player`,
-  which interprets (the list says which: "Runs in").
+  digest of every module whose generated code it carries. A game whose
+  disc has a library in the cache (`find_cached` on its digest, in the
+  default cache) starts in the generic `player`, which loads it; without
+  one, in the `player_<game>` that carries its `default.xex`, else the card
+  offers Prepare (the recompile step) and, if that fails, the generic
+  player interprets (the list says which: "Runs in"). `player_for` in
+  `library.h` is that choice.
 - **Settings and controls**: the selected game's settings, edited in the
   player's own config.toml and saved as they change: the video (fullscreen,
   vsync, scaling, shape) and sound (volume, mute) of the player's overlay,
@@ -832,8 +836,10 @@ For checks without a person at the screen: `--list` prints the players
 (with how many modules each carries) and the folder's games (title ID,
 title, version, digest, the player each starts in), without a window;
 `--select N` selects a game, `--controls` opens its controls' tab,
-`--start N` starts it as
-the button does, `--player-arg` adds to the player's command line (e.g.
+`--start N` presses
+its Play (a disc not yet built is prepared first, then `--keys a` plays it),
+`--build-jobs N` the compilers a Prepare runs at once (4 by default; each
+takes a gigabyte or two), `--player-arg` adds to the player's command line (e.g.
 `--quit-after 20`), `--quit-after S` closes the launcher after S seconds
 once a game it started has ended, printing how it ended, and `--screenshot`
 saves its window's last picture.
@@ -871,14 +877,38 @@ until the stylesheet says so; text directly inside a flex container is not
 drawn (wrap it in a block); `box-shadow` cannot be transitioned; an element
 with its own `opacity` inside one with `opacity: 0` is still drawn (the
 pages are `visibility: hidden` once faded); `overflow: hidden` clips only
-when the content overflows, `clip: always` makes it; a shadow bigger than the
-window (layers are window-sized) draws wrongly, so the big cards carry none.
+when the content overflows, `clip: always` makes it. A blurred `box-shadow`
+needs a spread: RmlUi draws the shadow's shape with the box cut out of it
+before it blurs, so one that is not bigger than its box (offset 0, spread 0)
+has nothing to blur and shows nothing, which is why the big cards and the
+focus glows had none; launcher.rcss gives each about 0.4 of its blur as
+spread. A shadow's texture is made in a window-sized layer, so one taller
+than the window is cut (the detail card's is kept under that). The fades at
+the edges of the scrolling pages and of the grid are `mask-image` on the
+scroller (the content itself fades), not dark overlays, which showed as
+faint bands over the coloured backdrop.
 The backdrop and the detail's hero are the icon shrunk and blurred on the
 CPU (`add_soft_image`): a full-window GPU blur costs several passes a frame
 and fades at the window's edges, while the blur filter is kept for what
 RmlUi makes of it (box shadows). Left for a person: the folder dialog, typing
 in the games folder's field, the mouse (hover, drag on a slider), a real pad
 (only the scripted presses were run), how the transitions feel.
+
+The prepare flow, end to end (2026-11-06): Sonic Unleashed's disc, never
+built before (its interrupted build resumed from the nine objects in the
+cache's work folder, `--build-jobs 2`): Play opened the preparing screen
+(reading, analysing, writing code, "9 of 252 files" compiling with the time
+left), about 13 minutes later the library `<digest>-<version>.dll` was in
+the cache, the card said Ready, and Play (a pad's A on the finished screen)
+started the generic `player` on the disc, which loaded it from the default
+cache: 90 s, 2481 swaps (27.6 a second), 2481 frames presented, sound
+played without a drop, no stop; the title screen is drawn. Which player a
+game starts in is `player_for` (`library.h`): with a library cached, the
+generic player; without, the `player_<game>` that carries its code, else
+Prepare. `plan_launch` turns that into a `LaunchPlan` (program, whether it
+loads the library, arguments) and `LauncherCore::start` is the only place
+that carries one out, with SDL's process API, so a host that runs the game
+inside the launcher's own process reads the same plan.
 
 Left out of this first launcher: port options, title updates and content
 packages, cover art. The recompile step itself is below ("The game
@@ -1039,9 +1069,7 @@ static run between them did not; not seen again in eight runs under a
 build's load since. The cache belongs on the system drive, as its default
 (`%LOCALAPPDATA%`) has it.
 
-Left: the launcher's view calling `prepare_game` (the RmlUi view, under
-way) and choosing the generic player for a disc with a cached library;
-the Linux side (`.so`, `posix_spawn`, `ld.lld`) is written but not built
+Left: the Linux side (`.so`, `posix_spawn`, `ld.lld`) is written but not built
 or run; title updates (D3).
 
 ## Order

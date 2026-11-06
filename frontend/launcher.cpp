@@ -5,9 +5,11 @@
 // (launcher_view.cpp) and the loop. What the launcher does is LauncherCore's
 // (launcher_core.h), which has no UI code: the games are the folder's ISOs
 // (and bare default.xex files), read in place for their title, title ID,
-// picture and digest (library.h); each starts in the player beside the
-// launcher that carries its code (player_<game>, asked with --identify), else
-// in the generic player, which interprets; the settings are the player's
+// picture and digest (library.h); a game with a library cached for its disc
+// starts in the generic player, which loads it; without one, in the player
+// beside the launcher that carries its code (player_<game>, asked with
+// --identify), else the card offers Prepare (the recompile step) and, if
+// that fails, the generic player interprets; the settings are the player's
 // config.toml (settings.h), the shared ones or a game's own, which the player
 // then reads for it; the player runs as a process of its own with its output
 // in a log beside the settings (logs/<title ID>.log), and the launcher stays
@@ -20,7 +22,8 @@
 // --screen <library|settings|controls|about> opens a page (--controls is
 // --screen controls) and --start N starts the Nth game as the button does,
 // --player-arg <arg> (repeatable) adds an argument to the player's command
-// line (--quit-after 20, say). For the pictures of the screens: --demo-progress
+// line (--quit-after 20, say), --build-jobs N the compilers a Prepare runs at
+// once (4 unless told; each takes a gigabyte or two). For the pictures of the screens: --demo-progress
 // shows a fake build under way (--demo-fail: one that fails, --demo-speed X:
 // times real time, --show-log: its log open), --snap-at S ends at S seconds whatever the view is waiting for, --capture-binding <name> a
 // binding waiting for its key, --render-size WxH draws at that size without
@@ -31,11 +34,12 @@
 // the screen has settled, to check navigation without a person at the pad.
 //
 //   launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <page>] [--start N] [--keys <list>]
-//            [--player-arg <arg>]... [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
+//            [--player-arg <arg>]... [--build-jobs N] [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
 //            [--demo-speed X] [--show-log] [--capture-binding <name>] [--render-size WxH] [--scale F]
 //            [--assets <dir>]
 
 #include "launcher_core.h"
+#include "xenoforge/game_build.h"
 #include "launcher_view.h"
 #include "ui/ui_system.h"
 #include "ui/ui_window.h"
@@ -116,6 +120,8 @@ int main(int argc, char **argv) {
             options.select = std::strtol(argv[++i], nullptr, 10);
         else if (a == "--start" && i + 1 < argc)
             options.start_index = options.select = std::strtol(argv[++i], nullptr, 10);
+        else if (a == "--build-jobs" && i + 1 < argc)
+            options.build_jobs = unsigned(std::strtoul(argv[++i], nullptr, 10));
         else if (a == "--player-arg" && i + 1 < argc)
             options.player_args.push_back(argv[++i]);
         else if (a == "--quit-after" && i + 1 < argc)
@@ -178,7 +184,10 @@ int main(int argc, char **argv) {
                 std::printf("  %s: %s\n", utf8(g.path).c_str(), g.error.c_str());
                 continue;
             }
-            const frontend::PlayerBinary *p = frontend::player_for(l.players, g);
+            char digest[24];
+            std::snprintf(digest, sizeof(digest), "%016llx", (unsigned long long)g.digest);
+            const bool cached = build::find_cached(build::default_cache_dir(), digest).has_value();
+            const frontend::PlayerBinary *p = frontend::player_for(l.players, g, cached);
             std::printf("  %s  %s  v%08X  digest %016llx  %s -> %s\n", g.title_id_text().c_str(), g.title.c_str(), g.version,
                         (unsigned long long)g.digest, utf8(g.path).c_str(), p ? utf8(p->path.filename()).c_str() : "(no player)");
         }

@@ -56,8 +56,26 @@ std::vector<std::filesystem::path> find_games(const std::filesystem::path &folde
 // each run with --identify for the modules it carries.
 std::vector<PlayerBinary> find_players(const std::filesystem::path &directory);
 
-// The player for a game: the one carrying its default.xex's code, else the
-// generic one; null when there is neither.
-const PlayerBinary *player_for(const std::vector<PlayerBinary> &players, const GameEntry &game);
+// The player for a game. With a library cached for its disc (the recompile
+// step's, game_build.h) the generic player, which loads it; without one, the
+// player carrying the game's default.xex code, else the generic one (which
+// then interprets). Null when none fits.
+const PlayerBinary *player_for(const std::vector<PlayerBinary> &players, const GameEntry &game, bool cached_library);
+
+// What to start for a game, decided apart from how it is started: the
+// program that runs it (the player's executable; where the game runs inside
+// the launcher's own process, as on Android, there is none and the same plan
+// is what that start reads), whether it loads the cached library of the disc,
+// and the arguments after the disc's path. LauncherCore::start is the one
+// place that carries a plan out.
+struct LaunchPlan {
+    std::filesystem::path program; // the player's executable
+    bool generic = false;          // the generic player (loads the cached library, else interprets)
+    bool from_library = false;     // a library is cached for the disc
+    std::vector<std::string> args; // after the disc's path
+};
+// The plan for a game; false when no player fits (see player_for).
+bool plan_launch(const std::vector<PlayerBinary> &players, const GameEntry &game, bool cached_library,
+                 const std::vector<std::string> &extra_args, LaunchPlan &plan);
 
 } // namespace xf::frontend

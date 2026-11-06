@@ -23,7 +23,9 @@ build it; to run anything you need your own copy of a game.
   against Xenia's pictures.
 - **The sound:** XMA decoded byte for byte as Xenia decodes it.
 - **The player:** a window, gamepad and keyboard, sound, and a debug overlay
-  (F1). The launcher lists your discs and their settings.
+  (F1). The launcher lists your discs and their settings, recompiles a disc on
+  your machine into a cached game library (Prepare), and starts the generic
+  player on it.
 - **Games:** El Chavo Kart and Ben 10: Alien Force – Vilgax Attacks play with
   picture, sound and pad. Six more games boot.
 

@@ -162,19 +162,18 @@ std::vector<std::string> LauncherCore::gamepads() {
 
 // The player as a process of its own: no console window, its output and
 // errors into the log beside the settings, its working directory its own.
-bool LauncherCore::start(const GameEntry &game, const PlayerBinary &player, const std::vector<std::string> &extra,
-                         std::string &error) {
+bool LauncherCore::start(const GameEntry &game, const LaunchPlan &plan, std::string &error) {
     if (process_) return error = run_.title + " is running", false;
     const std::filesystem::path log = config_file_.parent_path() / "logs" / (game.title_id_text() + ".log");
     std::error_code ec;
     std::filesystem::create_directories(log.parent_path(), ec);
     SDL_IOStream *out = SDL_IOFromFile(utf8(log).c_str(), "w");
     if (!out) return error = std::string("cannot write the log: ") + SDL_GetError(), false;
-    const std::string program = utf8(player.path), input = utf8(game.path), settings = utf8(config_file_);
+    const std::string program = utf8(plan.program), input = utf8(game.path), settings = utf8(config_file_);
     std::vector<const char *> args{program.c_str(), input.c_str(), "--config", settings.c_str()};
-    for (const std::string &a : extra) args.push_back(a.c_str());
+    for (const std::string &a : plan.args) args.push_back(a.c_str());
     args.push_back(nullptr);
-    const std::string cwd = utf8(player.path.parent_path());
+    const std::string cwd = utf8(plan.program.parent_path());
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetPointerProperty(props, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, args.data());
     SDL_SetStringProperty(props, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, cwd.c_str());

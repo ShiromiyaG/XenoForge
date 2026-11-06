@@ -104,7 +104,7 @@ void LauncherView::reload_document() {
 }
 
 bool LauncherView::busy() const {
-    return listing_.busy || start_pending_ >= 0 || core_.run().running || now_ < settle_until_ || !deferred_.empty();
+    return listing_.busy || start_pending_ >= 0 || core_.run().running || job_.active() || now_ < settle_until_ || !deferred_.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -116,11 +116,17 @@ const GameEntry *LauncherView::selected_game() const {
     return g.error.empty() ? &g : nullptr;
 }
 
-const PlayerBinary *LauncherView::player_of(const GameEntry &game) const { return player_for(listing_.players, game); }
+bool LauncherView::cached_of(const GameEntry &game) const {
+    return build::find_cached(build::default_cache_dir(), digest_text(game.digest)).has_value();
+}
+
+const PlayerBinary *LauncherView::player_of(const GameEntry &game) const {
+    return player_for(listing_.players, game, cached_of(game));
+}
 
 GameStatus LauncherView::status_of(const GameEntry &game) const {
-    const PlayerBinary *player = player_of(game);
-    const bool cached = build::find_cached(build::default_cache_dir(), digest_text(game.digest)).has_value();
+    const bool cached = cached_of(game);
+    const PlayerBinary *player = player_for(listing_.players, game, cached);
     return game_status(cached, player && !player->generic, failed_.count(game.title_id) > 0);
 }
 

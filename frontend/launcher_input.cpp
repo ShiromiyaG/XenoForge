@@ -181,8 +181,7 @@ void LauncherView::do_action(const Action &a) {
         const long index = prepare_game_;
         close_prepare();
         if (index >= 0 && index < long(listing_.games.size())) {
-            const GameEntry &g = listing_.games[size_t(index)];
-            start_game(g, player_of(g));
+            start_game(listing_.games[size_t(index)], false);
         }
     } else if (a.name == "prep-interpreted") {
         const long index = prepare_game_;
@@ -193,25 +192,36 @@ void LauncherView::do_action(const Action &a) {
 
 void LauncherView::play(const GameEntry &game, bool force_interpreted) {
     if (core_.run().running) return;
-    const PlayerBinary *player = player_of(game);
-    if (!player) return toast("No player beside the launcher.", true, false, 6);
+    if (!player_of(game)) return toast("No player beside the launcher.", true, false, 6);
     if (force_interpreted) {
-        for (const PlayerBinary &p : listing_.players)
-            if (p.generic) player = &p;
         failed_.insert(game.title_id);
         library_sig_.clear();
-        return start_game(game, player);
+        return start_game(game, true);
     }
     if (status_of(game) == GameStatus::NeedsPreparing) return begin_prepare(game, false);
-    start_game(game, player);
+    start_game(game, false);
 }
 
-void LauncherView::start_game(const GameEntry &game, const PlayerBinary *player) {
-    if (!player) return toast("No player beside the launcher.", true, false, 6);
+// Start the game from its library: what to start is decided by plan_launch
+// (a cached library: the generic player; else the player carrying the game's
+// code), how by LauncherCore::start. Interpreted: the generic player told not
+// to load a library.
+void LauncherView::start_game(const GameEntry &game, bool interpreted) {
+    LaunchPlan plan;
+    if (!plan_launch(listing_.players, game, cached_of(game) && !interpreted, opt_.player_args, plan))
+        return toast("No player beside the launcher.", true, false, 6);
+    if (interpreted) {
+        const PlayerBinary *generic = nullptr;
+        for (const PlayerBinary &p : listing_.players)
+            if (p.generic) generic = &p;
+        if (!generic) return toast("No generic player beside the launcher.", true, false, 6);
+        plan.program = generic->path, plan.generic = true, plan.from_library = false;
+        plan.args.push_back("--interpret");
+    }
     std::string message;
-    if (!core_.start(game, *player, opt_.player_args, message)) return toast(message, true, false, 8);
-    std::printf("launcher: started %s on %s, its output in %s\n", utf8(player->path.filename()).c_str(), utf8(game.path).c_str(),
-                utf8(core_.run().log).c_str());
+    if (!core_.start(game, plan, message)) return toast(message, true, false, 8);
+    std::printf("launcher: started %s on %s%s, its output in %s\n", utf8(plan.program.filename()).c_str(), utf8(game.path).c_str(),
+                plan.from_library ? " from its cached library" : "", utf8(core_.run().log).c_str());
     detail_sig_.clear();
     toast("Playing " + game.title, false, true, 0);
 }

@@ -43,6 +43,7 @@ struct ViewOptions {
     bool show_log = false;      // the prepare screen's log open
     std::string capture;        // --capture-binding: a binding waiting for a key, for pictures
     std::vector<std::string> player_args;
+    unsigned build_jobs = 0;    // --build-jobs N: compilers at once while preparing (0: the build's default)
 };
 
 class LauncherView final : public Rml::EventListener {
@@ -88,6 +89,8 @@ class LauncherView final : public Rml::EventListener {
     // state
     void poll_listing();
     const GameEntry *selected_game() const;
+    bool prepare_listed_ = false; // the library was drawn again after the build ended
+    bool cached_of(const GameEntry &game) const; // a library is cached for the disc
     const PlayerBinary *player_of(const GameEntry &game) const;
     GameStatus status_of(const GameEntry &game) const;
     std::string icon_name(const GameEntry &game);
@@ -98,7 +101,7 @@ class LauncherView final : public Rml::EventListener {
     // actions
     void do_action(const Action &action);
     void play(const GameEntry &game, bool force_interpreted);
-    void start_game(const GameEntry &game, const PlayerBinary *player);
+    void start_game(const GameEntry &game, bool interpreted);
     void begin_prepare(const GameEntry &game, bool demo);
     void close_prepare();
     void update_prepare();

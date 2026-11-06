@@ -191,6 +191,34 @@ int main() {
     CHECK(frontend::game_status(false, true, true) == frontend::GameStatus::Ready);
     CHECK(frontend::game_status(false, false, false) == frontend::GameStatus::NeedsPreparing);
     CHECK(frontend::game_status(false, false, true) == frontend::GameStatus::Interpreted);
+    {
+        // which player: a cached library means the generic one, else the player carrying the code, else the generic
+        frontend::PlayerBinary generic, carrying, other;
+        generic.path = "player", generic.generic = true;
+        carrying.path = "player_game", carrying.modules = {{0x1234, "default.xex"}};
+        other.path = "player_other", other.modules = {{0x9999, "default.xex"}};
+        const std::vector<frontend::PlayerBinary> all{carrying, generic, other};
+        frontend::GameEntry game;
+        game.digest = 0x1234;
+        CHECK(frontend::player_for(all, game, true)->generic);
+        CHECK(frontend::player_for(all, game, false)->path == "player_game");
+        game.digest = 0x5555;
+        CHECK(frontend::player_for(all, game, false)->generic);
+        const std::vector<frontend::PlayerBinary> no_generic{carrying, other};
+        game.digest = 0x1234;
+        CHECK(frontend::player_for(no_generic, game, true)->path == "player_game");
+        game.digest = 0x5555;
+        CHECK(frontend::player_for(no_generic, game, false) == nullptr);
+        // the plan is that choice with the arguments, apart from how it is started
+        frontend::LaunchPlan plan;
+        game.digest = 0x1234;
+        CHECK(frontend::plan_launch(all, game, true, {"--quit-after", "5"}, plan));
+        CHECK(plan.program == "player" && plan.generic && plan.from_library && plan.args.size() == 2);
+        CHECK(frontend::plan_launch(all, game, false, {}, plan));
+        CHECK(plan.program == "player_game" && !plan.generic && !plan.from_library);
+        game.digest = 0x5555;
+        CHECK(!frontend::plan_launch(no_generic, game, false, {}, plan));
+    }
     CHECK(frontend::format_duration(42) == "0:42" && frontend::format_duration(725) == "12:05");
     CHECK(frontend::format_duration(3729) == "1:02:09" && frontend::format_duration(-3) == "0:00");
     CHECK(frontend::version_text(0x10000100) == "1.0.1.0");

@@ -147,8 +147,13 @@ std::string detail_html(const DetailInfo &g) {
     s += "<div class=\"fact\"><div class=\"k\">Disc</div><div class=\"v nowrap\">" + e(g.file) + "</div></div>";
     s += "</div>";
     if (!g.last_run.empty()) {
+        // the player's own lines, one row each (cut short, not wrapped: the panel's buttons stay in view)
         s += "<div class=\"small dim\" style=\"margin-top: 14dp; text-align: center;\">";
-        for (size_t i = 0; i < g.last_run.size() && i < 2; i++) s += e(g.last_run[i]) + "<br/>";
+        for (size_t i = 0; i < g.last_run.size() && i < 2; i++) {
+            std::string line = g.last_run[i];
+            if (line.starts_with("player: ")) line.erase(0, 8);
+            s += "<div class=\"nowrap\">" + e(line) + "</div>";
+        }
         s += "</div>";
     }
     s += "<div class=\"detail-spacer\"></div>";

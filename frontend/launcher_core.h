@@ -75,10 +75,12 @@ class LauncherCore {
         std::chrono::steady_clock::time_point started;
         std::vector<std::string> ended; // the log's "player:" lines, or its last lines
     };
-    // The player on the game, with this settings file and the extra
-    // arguments; false and why when it does not start (or one runs already).
-    bool start(const GameEntry &game, const PlayerBinary &player, const std::vector<std::string> &extra,
-               std::string &error);
+    // Starts the game from a launch plan (library.h: what to start is
+    // decided there): the player on the game's disc, with this settings file
+    // and the plan's arguments, as a process of SDL's. The one place a game
+    // is started from; false and why when it does not start (or one runs
+    // already).
+    bool start(const GameEntry &game, const LaunchPlan &plan, std::string &error);
     // Checks on the run: true once, when the one under way has ended (then
     // run().ended says how).
     bool poll();
