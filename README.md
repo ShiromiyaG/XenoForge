@@ -7,86 +7,105 @@ An ahead-of-time Xbox 360 emulator, and an SDK for ports of specific games.
 - **The SDK** lets a port of one game replace and hook its functions and draw
   natively, built to make errors easy to find.
 
-Written from scratch in C++20, with
+Written from scratch in C++20 (Vulkan, SDL3), with
 [Xenia](https://github.com/xenia-canary/xenia-canary)'s research as the
-reference for how the console behaves ([docs/plan.md](docs/plan.md)).
+reference for how the console behaves. No game is included or needed to
+build it; to run anything you need your own copy of a game.
 
-No game is included or needed to build it. To run anything you need your own
-copy of a game.
+**Status: early, in development.** See [docs/plan.md](docs/plan.md).
 
-## What works
+## What works today
 
-Early days: the first step of [the plan](docs/plan.md).
-
-| Part | Where | State |
-| --- | --- | --- |
-| The disc: XDVDFS read from the ISO in place (XGD2/XGD3 dumps, rebuilt images) | `disc.h`, `src/disc.cpp` | done; tests |
-| The executable: XEX2 headers, AES-128, basic and normal (LZX) compression, the import libraries | `xex.h`, `aes.h`, `lzx.h`, `sha1.h`, `src/xex.cpp`, `src/aes.cpp`, `src/lzx.cpp`, `src/sha1.cpp` | done; tests |
-| The system's exports by ordinal (xboxkrnl, xam, xbdm) | `exports.h`, `src/exports/` (Xenia's tables) | done |
-| `xfinspect`: a disc's executable, its XDK libraries and imports, the image dumped | `tools/xfinspect.cpp` | done |
-| Xenia's GPU traces read (snappy included) and walked through a PM4 front end that counts | `gpu_trace.h`, `trace_stats.h`, `snappy.h` | done; tests |
-| Xenos microcode walked: control flow, ALU and fetch operations, the constants it reads | `ucode.h`, `xenos.h` | done; tests |
-| `xftrace`: what a corpus of traces uses (packets, draws, formats, shaders, textures) | `tools/xftrace.cpp` | done |
-| Xenos microcode parsed as Xenia parses it, and disassembled: byte for byte Xenia's text on every shader of the traces | `ucode_parse.h`, `tools/xfshader.cpp` | done; tests |
-| A SPIR-V module writer (checked by `spirv-val`) and a windowless Vulkan compute runner (checked on the GPU) | `spirv.h`, `vk_compute.h` | done; tests |
-| The microcode translated to SPIR-V (vertex, pixel, and a compute wrapper for checks), version 1: every ALU operation, the vertex formats, 2D and 3D texture fetches, straight control flow | `shader_translator.h` | done; tests |
-| A CPU interpreter of the microcode, the translator's reference: the GPU and it agree case by case, the traces' shaders included | `shader_interpreter.h`, `tests/shader_compare_test.cpp` | done; tests |
+- **The CPU:** PowerPC and VMX128 recompiled ahead of time into C++, with an
+  interpreter for what is not. Xenia's instruction tests pass.
+- **The kernel:** every system export Xenia implements (xboxkrnl, XAM, xbdm).
+- **The GPU:** a Vulkan renderer of the Xenos GPU, checked frame by frame
+  against Xenia's pictures.
+- **The sound:** XMA decoded byte for byte as Xenia decodes it.
+- **The player:** a window, gamepad and keyboard, sound, and a debug overlay
+  (F1). The launcher lists your discs and their settings.
+- **Games:** El Chavo Kart and Ben 10: Alien Force – Vilgax Attacks play with
+  picture, sound and pad. Six more games boot.
 
 ## Building
 
-Needs CMake 3.25+, Ninja and clang (or MSVC).
+Needs CMake 3.25+, Ninja, clang and the Vulkan SDK.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-cmake --build build
+cmake --build build -j 4
 ctest --test-dir build
 ```
 
-## Tools
-
-```sh
-# what a game disc holds: title, executable, XDK libraries, imports
-build/xfinspect "<game>.iso"
-build/xfinspect "<game>.iso" --imports              # every import, tab separated
-build/xfinspect "<game>.iso" --files                # the disc's files
-build/xfinspect "<game>.iso" --dump-image image.bin # the image, decrypted and unpacked
-build/xfinspect default.xex                          # an executable outside a disc
-
-# GPU traces: recorded by a xenia-canary built with -DXENIA_ENABLE_GPU_TRACE=ON
-# (release downloads leave the trace writer out), then counted
-tools/capture_traces.ps1 -Xenia <xenia_canary.exe> -Game "<game>.iso" -Out <folder> -Frames 300,900,1800
-build/xftrace <folder>                               # each trace, then all of them
-
-# a shader's microcode disassembled (Xenia's --dump_shaders writes them host-order)
-build/xfshader shader_<hash>.ucode.bin.frag
-build/xfshader shader_<hash>.ucode.bin.frag --spirv out.spv [--stage harness]
-tools/compare_disasm.ps1 -Shaders <folder>           # against Xenia's own disassembly
-```
+A game's generated code is built with `-DXF_GAMES="<name>;..."` from what
+`xfrecomp emit <iso> <dir>/<name>` writes (`-DXF_GEN_DIR=<dir>`). That builds
+`boot_<name>` (no window) and `player_<name>`.
 
 ## Documents
 
-- [`docs/plan.md`](docs/plan.md): what XenoForge is, its principles, parts and steps.
-- [`docs/renderer.md`](docs/renderer.md): the Xenos renderer's design.
-- [`docs/lean-kernel.md`](docs/lean-kernel.md): what the games import from the
-  system ([`docs/imports.tsv`](docs/imports.tsv)).
+- [docs/plan.md](docs/plan.md): the goal, the principles, the steps, the
+  references, and everything left to do.
+- [docs/recompiler.md](docs/recompiler.md): the recompiler.
+- [docs/runtime.md](docs/runtime.md): the kernel, sound, player and launcher.
+- [docs/renderer.md](docs/renderer.md): the GPU.
+- [docs/input.md](docs/input.md): input.
+
+## References
+
+XenoForge stands on the work of others. The full list, with what each is
+used for, is in [docs/plan.md](docs/plan.md), "References".
+
+- **Emulators and recompilers:**
+  - [Xenia / Xenia Canary](https://github.com/xenia-canary/xenia-canary)
+    (BSD), the main reference and the oracle. Its D3D12 backend comes first
+    for the GPU.
+  - [XenonRecomp and XenosRecomp](https://github.com/hedge-dev) (MIT),
+    hedge-dev's Xbox 360 recompilers.
+  - [ReXGlue](https://github.com/rexglue/rexglue-sdk).
+  - [RPCS3](https://github.com/RPCS3/rpcs3): ahead-of-time PowerPC
+    recompilation.
+  - [N64Recomp](https://github.com/N64Recomp/N64Recomp): a recompilation SDK
+    with mods.
+  - [Cxbx-Reloaded](https://github.com/Cxbx-Reloaded/Cxbx-Reloaded): the
+    original Xbox's kernel in high level.
+  - [xenon-emu](https://github.com/xenon-emu/xenon): the Xbox 360's
+    hardware, low level.
+- **Documentation:**
+  - [Free60](https://free60.org) and its wiki archive
+    ([Free60Project/wiki](https://github.com/Free60Project/wiki)).
+  - [libxenon](https://github.com/Free60Project/libxenon).
+  - [x360-research](https://github.com/InvoxiPlayGames/x360-research).
+  - "Xbox 360 System Architecture" (Andrews and Baker, IEEE Micro, 2006).
+  - IBM's Cell Broadband Engine and PowerPC/AltiVec manuals.
+  - AMD's R5xx/R6xx register and ISA documents.
+  - Microsoft's documentation of the NT kernel routines.
+- **Second implementations:**
+  - [Mesa](https://gitlab.freedesktop.org/mesa/mesa)'s r600 and freedreno
+    a2xx drivers.
+  - [Wine](https://gitlab.winehq.org/wine/wine) and
+    [ReactOS](https://github.com/reactos/reactos).
+  - [Dolphin](https://github.com/dolphin-emu/dolphin).
+- **Tools:** XNA Game Studio 4.0's Xbox 360 shader compiler, used to make
+  test shaders ([tools/xna/README.md](tools/xna/README.md)).
+
+Code under the MIT or BSD licenses is translated with its notice at the top of
+the file. GPL and unlicensed sources are only read, never copied.
 
 ## License
 
 Written by ShiromiyaG with Claude (Anthropic). XenoForge is MIT (`LICENSE`).
-Parts are translated from Xenia (BSD 3-clause, Copyright (c) 2015 Ben Vanik
-and the Xenia contributors, `LICENSE-xenia`), and its export tables are
-included unchanged; each such file says so at its top. The data pointer scan
-is translated from rexglue (`LICENSE-rexglue`).
 
-XMA is decoded by FFmpeg (LGPL 2.1 or later, `LICENSE-ffmpeg`), fetched at
-build time and built as a shared library of its own, `ffmpeg-xma`, that the
-programs load at run time; the LGPL covers that library alone, and without
-it they run with XMA silent. `-DXF_XMA=OFF` builds without FFmpeg at all.
-`cmake --install build --prefix <folder>` (or the `player_package` target)
-makes the player's folder to ship: the player, `ffmpeg-xma` with the LGPL's
-text and where its source is, and the notices of everything linked in (SDL3,
-Dear ImGui, toml++, stb) ([`docs/runtime.md`](docs/runtime.md), "Sound").
-A game's own player (`player_<game>`) holds that game's recompiled code and
-is never part of it.
+The rest is under its own license:
+- **Xenia (BSD 3-clause, `LICENSE-xenia`):** parts are translated from it,
+  and its export tables are included unchanged. Each such file says so at
+  its top.
+- **rexglue (`LICENSE-rexglue`):** the data pointer scan is translated from
+  it.
+- **FFmpeg (LGPL 2.1 or later, `LICENSE-ffmpeg`):** XMA is decoded by FFmpeg,
+  built as a separate library (`ffmpeg-xma`) that the programs load at run
+  time. Without it, they run with XMA silent.
+- **The player's package:** `cmake --install build --prefix <folder>` makes
+  it, with the notices of everything linked in. A game's own player, which
+  holds that game's recompiled code, is never part of the package.
 
 Nothing derived from any game is in this repository.
