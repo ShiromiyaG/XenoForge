@@ -4,7 +4,9 @@
 // clear values vulkan/vulkan_render_target_cache.cc, the vertex data a draw
 // needs vulkan/vulkan_command_processor.cc (IssueDraw's shared memory
 // requests), the point sizes its UpdateSystemConstantValues, the rows a
-// draw takes over in EDRAM draw_extent_estimator.cc, and the swap
+// draw takes over in EDRAM draw_extent_estimator.cc, the tessellated draws
+// and the indices primitive_processor.cc and d3d12/pipeline_cache.cc (the
+// hull shaders by mode and domain), and the swap
 // vulkan/vulkan_texture_cache.cc (RequestSwapTexture); all BSD, see
 // LICENSE-xenia.
 //
@@ -84,6 +86,26 @@ const uint32_t POINT_LIST_GS[] = {
 const uint32_t FULLSCREEN_VS[] = {
 #include "fullscreen.vert.inc"
 };
+// tessellation: the host vertex shader, and the hull shaders by input patch
+// (1, 3 and 4 control points; adaptive triangles and quads)
+const uint32_t TESSELLATION_VS[] = {
+#include "tessellation.vert.inc"
+};
+const uint32_t TESSELLATION_1CP[] = {
+#include "tessellation_1cp.tesc.inc"
+};
+const uint32_t TESSELLATION_3CP[] = {
+#include "tessellation_3cp.tesc.inc"
+};
+const uint32_t TESSELLATION_4CP[] = {
+#include "tessellation_4cp.tesc.inc"
+};
+const uint32_t TESSELLATION_ADAPTIVE_TRIANGLE[] = {
+#include "tessellation_adaptive_triangle.tesc.inc"
+};
+const uint32_t TESSELLATION_ADAPTIVE_QUAD[] = {
+#include "tessellation_adaptive_quad.tesc.inc"
+};
 const uint32_t EDRAM_STORE[] = {
 #include "edram_store.comp.inc"
 };
@@ -120,6 +142,7 @@ constexpr uint32_t RB_COLORCONTROL = 0x2202;
 constexpr uint32_t PA_CL_CLIP_CNTL = 0x2204, PA_SU_SC_MODE_CNTL = 0x2205, PA_CL_VTE_CNTL = 0x2206;
 constexpr uint32_t PA_SU_POINT_SIZE = 0x2280, PA_SU_POINT_MINMAX = 0x2281;
 constexpr uint32_t VGT_OUTPUT_PATH_CNTL = 0x2284, VGT_HOS_CNTL = 0x2285;
+constexpr uint32_t VGT_HOS_MAX_TESS_LEVEL = 0x2286, VGT_HOS_MIN_TESS_LEVEL = 0x2287;
 constexpr uint32_t PA_SU_VTX_CNTL = 0x2302;
 constexpr uint32_t SQ_CONTEXT_MISC = 0x2181;
 constexpr uint32_t PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2380; // then FRONT_OFFSET, BACK_SCALE, BACK_OFFSET
@@ -342,6 +365,9 @@ struct Shader {
     xf::ucode::ShaderSummary summary;
     bool translated = false;
     VkShaderModule module = VK_NULL_HANDLE;
+    // a vertex shader's other host forms (shader::HostVertex, and the
+    // spacing in bit 8 for the domain ones), made as draws ask for them
+    std::map<uint32_t, VkShaderModule> variants;
     std::string unsupported; // why it cannot be drawn with
     uint32_t colors_written = 0; // oC0-oC3, a bit each
     bool writes_depth = false;
@@ -567,6 +593,8 @@ struct Pass {
 struct PipelineDesc {
     VkPipelineShaderStageCreateInfo stages[5]{};
     VkPipelineVertexInputStateCreateInfo vertex_input{};
+    VkVertexInputBindingDescription vertex_bindings[1]{};
+    VkVertexInputAttributeDescription vertex_attributes[1]{};
     VkPipelineInputAssemblyStateCreateInfo assembly{};
     VkPipelineTessellationStateCreateInfo tessellation{};
     VkPipelineViewportStateCreateInfo viewport{};
@@ -592,7 +620,20 @@ struct PipelineDesc {
             rendering.pColorAttachmentFormats = color_formats;
             info.pNext = &rendering;
         }
-        own(info.pVertexInputState, vertex_input);
+        if (own(info.pVertexInputState, vertex_input)) {
+            // one binding and one attribute at most (tessellation's control
+            // points, the rectangles' guest indices)
+            vertex_input.vertexBindingDescriptionCount =
+                std::min<uint32_t>(vertex_input.vertexBindingDescriptionCount, 1);
+            vertex_input.vertexAttributeDescriptionCount =
+                std::min<uint32_t>(vertex_input.vertexAttributeDescriptionCount, 1);
+            std::copy_n(vertex_input.pVertexBindingDescriptions, vertex_input.vertexBindingDescriptionCount,
+                        vertex_bindings);
+            std::copy_n(vertex_input.pVertexAttributeDescriptions, vertex_input.vertexAttributeDescriptionCount,
+                        vertex_attributes);
+            vertex_input.pVertexBindingDescriptions = vertex_bindings;
+            vertex_input.pVertexAttributeDescriptions = vertex_attributes;
+        }
         own(info.pInputAssemblyState, assembly);
         own(info.pTessellationState, tessellation);
         own(info.pViewportState, viewport);
@@ -842,7 +883,7 @@ private:
     // draws
     void draw(const gpu::Draw &d);
     uint32_t draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                        uint32_t primitive) const;
+                        uint32_t primitive, bool tessellated) const;
     uint32_t vertex_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
                           uint32_t primitive) const;
     void resolve();
@@ -881,6 +922,9 @@ private:
     // resources
     Shader *shader(uint64_t hash);
     bool translate(Shader &s, std::string &why);
+    // a translated vertex shader's module in a host form; null when the
+    // translator cannot make it
+    VkShaderModule vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why);
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
     VkFormat depth_vk_format(uint32_t format) const;
     Texture *texture(const uint32_t fetch[6], std::string &why);
@@ -1156,6 +1200,12 @@ private:
     VkDescriptorSet bindless_ = VK_NULL_HANDLE;
     uint32_t capacity_[3] = {}, next_index_[3] = {1, 1, 1}, sampler_capacity_ = 0, next_sampler_ = 1;
     VkShaderModule rectangle_gs_ = VK_NULL_HANDLE, point_gs_ = VK_NULL_HANDLE;
+    // rectangle and point lists expanded in the vertex shader rather than by
+    // the geometry shaders (without them, or with XF_VK_EXPAND_IN_VS=1)
+    bool expand_in_vs_ = false;
+    // tessellation, where the device has it: the host vertex shader, and the
+    // hull shaders in TESSELLATION_1CP to TESSELLATION_ADAPTIVE_QUAD's order
+    VkShaderModule tessellation_vs_ = VK_NULL_HANDLE, tessellation_hs_[5] = {};
     vk::Image dummy_[3]; // 2D, 3D, cube
     VkImageView dummy_views_[3] = {};
     VkSampler dummy_sampler_ = VK_NULL_HANDLE;
@@ -1208,8 +1258,11 @@ Impl::~Impl() {
         if (s.occlusion) vkDestroyQueryPool(dev_, s.occlusion, nullptr);
     }
     if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
-    for (auto &[k, s] : shaders_)
+    for (auto &[k, s] : shaders_) {
         if (s->module) vkDestroyShaderModule(dev_, s->module, nullptr);
+        for (auto &[v, m] : s->variants)
+            if (m) vkDestroyShaderModule(dev_, m, nullptr);
+    }
     for (auto &[k, p] : pipelines_)
         if (p->pipeline) vkDestroyPipeline(dev_, p->pipeline, nullptr);
     for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.first, nullptr);
@@ -1223,7 +1276,9 @@ Impl::~Impl() {
     }
     for (auto &im : dummy_) d_.destroy(im);
     if (dummy_sampler_) vkDestroySampler(dev_, dummy_sampler_, nullptr);
-    for (VkShaderModule m : {rectangle_gs_, point_gs_})
+    for (VkShaderModule m : {rectangle_gs_, point_gs_, tessellation_vs_})
+        if (m) vkDestroyShaderModule(dev_, m, nullptr);
+    for (VkShaderModule m : tessellation_hs_)
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (auto &[k, p] : load_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
     for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_})
@@ -1355,7 +1410,8 @@ bool Impl::init(std::string &error) {
                                false);
     arena_ = d_.create_buffer(VkDeviceSize(SLOTS) * ARENA_SLOT,
                               VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                               true);
     const VkBufferUsageFlags scratch_usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -1400,7 +1456,9 @@ bool Impl::init(std::string &error) {
 
     // draws: set 0, three uniform buffers in the arena at offsets of their
     // own per draw, and vertex memory; set 1, the bindless tables
-    const VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    // the guest's vertex shader run as a domain shader reads all of it too
+    if (d_.tessellation_shader()) stages |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     VkDescriptorSetLayoutBinding b0[4] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr},
@@ -1485,6 +1543,23 @@ bool Impl::init(std::string &error) {
         rectangle_gs_ = module(RECTANGLE_LIST_GS, sizeof(RECTANGLE_LIST_GS));
         point_gs_ = module(POINT_LIST_GS, sizeof(POINT_LIST_GS));
         if (!rectangle_gs_ || !point_gs_) return error = "could not make the geometry shaders", false;
+    }
+    {
+        const char *in_vs = std::getenv("XF_VK_EXPAND_IN_VS");
+        expand_in_vs_ =
+            !d_.geometry_shader() || options_.expand_in_vertex_shader || (in_vs && in_vs[0] && in_vs[0] != '0');
+    }
+    if (d_.tessellation_shader()) {
+        tessellation_vs_ = module(TESSELLATION_VS, sizeof(TESSELLATION_VS));
+        const std::pair<const uint32_t *, size_t> hull[5] = {
+            {TESSELLATION_1CP, sizeof(TESSELLATION_1CP)},
+            {TESSELLATION_3CP, sizeof(TESSELLATION_3CP)},
+            {TESSELLATION_4CP, sizeof(TESSELLATION_4CP)},
+            {TESSELLATION_ADAPTIVE_TRIANGLE, sizeof(TESSELLATION_ADAPTIVE_TRIANGLE)},
+            {TESSELLATION_ADAPTIVE_QUAD, sizeof(TESSELLATION_ADAPTIVE_QUAD)}};
+        for (uint32_t k = 0; k < 5; k++) tessellation_hs_[k] = module(hull[k].first, hull[k].second);
+        if (!tessellation_vs_ || std::count(std::begin(tessellation_hs_), std::end(tessellation_hs_), VkShaderModule()))
+            return error = "could not make the tessellation shaders", false;
     }
 
     // EDRAM: the buffer, store (compute) and load (draw) pipelines; the tile
@@ -2194,6 +2269,25 @@ bool Impl::translate(Shader &s, std::string &why) {
     }
     if (!s.unsupported.empty()) why = s.unsupported;
     return s.unsupported.empty();
+}
+
+VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why) {
+    if (options.host == shader::HostVertex::Vertex) return s.module;
+    uint32_t key = uint32_t(options.host) | (options.equal_spacing ? 1u << 8 : 0u);
+    auto it = s.variants.find(key);
+    if (it == s.variants.end()) {
+        VkShaderModule m = VK_NULL_HANDLE;
+        shader::Translation t = shader::translate(s.parsed, shader::Stage::Vertex, options);
+        if (t.ok()) {
+            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            info.codeSize = t.spirv.size() * 4;
+            info.pCode = t.spirv.data();
+            if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
+        }
+        it = s.variants.emplace(key, m).first;
+    }
+    if (!it->second) why = "its host form could not be made";
+    return it->second;
 }
 
 // ---- render targets: EDRAM as host images, one per base, pitch, samples and format ----
@@ -3090,9 +3184,10 @@ int32_t float_to_fixed_16p8(float f32) {
 // rectangles), the lowest row the vertices reach, the vertex shader run on
 // the CPU. Without it a 1280-wide target took over all of EDRAM at such a
 // draw, every target there stored and loaded again (El Chavo Kart's race:
-// its depth target took 2048 tiles three times a frame).
+// its depth target took 2048 tiles three times a frame). A tessellated draw's
+// vertices are not run (the estimator's "not reproducing tessellation").
 uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                          uint32_t primitive) const {
+                          uint32_t primitive, bool tessellated) const {
     uint32_t window = regs_[r::PA_SC_WINDOW_OFFSET];
     int32_t window_x = sign_extend(window & 0x7FFF, 15), window_y = sign_extend((window >> 16) & 0x7FFF, 15);
     uint32_t tl = regs_[r::PA_SC_WINDOW_SCISSOR_TL], br = regs_[r::PA_SC_WINDOW_SCISSOR_BR];
@@ -3108,7 +3203,7 @@ uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants,
     if ((regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1) {
         // the vertices' extent, where there is no scissor (Xenia's
         // execute_unclipped_draw_vs_on_cpu, without _with_scissor)
-        if (scissor_bottom >= 8192 && scissor_right >= 8192)
+        if (scissor_bottom >= 8192 && scissor_right >= 8192 && !tessellated)
             max_y = std::min(max_y, vertex_max_y(vs, constants, indices, primitive));
     } else {
         // the viewport's bottom, truncated
@@ -3216,28 +3311,79 @@ void Impl::draw(const gpu::Draw &d) {
             return;
         }
     }
-    if ((regs_[r::VGT_OUTPUT_PATH_CNTL] & 3) == 1) {
-        // VGT_OUTPUT_PATH_CNTL's path_select: the tessellator, whose vertex
-        // shader runs as a domain shader on the patches' points (Xenia's
-        // HostVertexShaderType domain types); primitive types 16 to 18 are
-        // then line, triangle and quad patches. Not done: the hull and domain
-        // stages are not ported.
+    // Tessellation, as Xenia's PrimitiveProcessor::Process takes it:
+    // VGT_OUTPUT_PATH_CNTL's path_select in the explicit major mode (games
+    // leave the register set after their tessellated draws, for draws in the
+    // implicit mode that do not tessellate). The guest's vertex shader runs as
+    // the domain shader at the points the tessellator makes, after the host's
+    // vertex and hull shaders (tessellation.vert and .tesc), as Xenia's D3D12
+    // backend draws it; primitive types 16 to 18 are line, triangle and quad
+    // patches then. Only what Xenia draws: triangle lists, fans and strips
+    // and quad lists in the discrete and continuous modes (indexed by control
+    // point), triangle and quad patches in any of the three (indexed by
+    // patch); not line patches (a TODO in Xenia), nor the rest.
+    const bool tessellated = d.major_mode_explicit && (regs_[r::VGT_OUTPUT_PATH_CNTL] & 3) == 1;
+    const uint32_t tess_mode = regs_[r::VGT_HOS_CNTL] & 3;
+    shader::VertexOptions host_vertex;
+    uint32_t patch_points = 0, hull = 0; // control points of a host patch; its hull shader (tessellation_hs_)
+    std::string draw_name = primitive_name(primitive); // for the verbose lines and the GPU timing
+    if (tessellated) {
         static const char *const modes[] = {"discrete", "continuous", "adaptive", "mode 3"};
         static const char *const patches[] = {"line patch", "triangle patch", "quad patch"};
         const char *kind = primitive >= 16 && primitive <= 18 ? patches[primitive - 16] : primitive_name(primitive);
-        return skip(std::string("tessellation: ") + modes[regs_[r::VGT_HOS_CNTL] & 3] + " " + kind);
+        std::string what = std::string(modes[tess_mode]) + " " + kind;
+        draw_name = "tessellated " + what;
+        using HV = shader::HostVertex;
+        switch (primitive) {
+        case 4:
+        case 5:
+        case 6:
+            if (tess_mode <= 1) host_vertex.host = HV::TriangleDomainCPIndexed, patch_points = 3, hull = 1;
+            break;
+        case 13:
+            if (tess_mode <= 1) host_vertex.host = HV::QuadDomainCPIndexed, patch_points = 4, hull = 2;
+            break;
+        case 17:
+            if (tess_mode <= 2)
+                host_vertex.host = HV::TriangleDomainPatchIndexed, patch_points = tess_mode == 2 ? 3 : 1,
+                hull = tess_mode == 2 ? 3 : 0;
+            break;
+        case 18:
+            if (tess_mode <= 2)
+                host_vertex.host = HV::QuadDomainPatchIndexed, patch_points = tess_mode == 2 ? 4 : 1,
+                hull = tess_mode == 2 ? 4 : 0;
+            break;
+        }
+        if (host_vertex.host == HV::Vertex) return skip("tessellation: " + what);
+        // the device's tessellation shaders are optional (most mobile GPUs
+        // lack them)
+        if (!d_.tessellation_shader()) return skip("tessellation without tessellation shaders: " + what);
+        // adaptive tessellation's edge factors are 32-bit floats in an index
+        // buffer (Xenia fails the draw otherwise)
+        if (tess_mode == 2 && !(d.indexed && d.index32))
+            return skip("adaptive tessellation without 32-bit edge factors");
+        host_vertex.equal_spacing = tess_mode == 0;
     }
-    bool rectangles = primitive == 8, points = primitive == 1;
-    // rectangle and point lists are expanded by geometry shaders, which the
-    // device may lack (the vertex shader expansion Xenia's D3D12 backend does
-    // is not here yet)
-    if ((rectangles || points) && !d_.geometry_shader())
-        return skip(std::string(primitive_name(primitive)) + " without geometry shaders");
-    // triangles, quads and polygons (draw_util.h's IsPrimitivePolygonal): faces,
-    // culling, the front and back polygon offsets
-    bool polygonal = (primitive >= 4 && primitive <= 7) || (primitive >= 13 && primitive <= 15);
-    VkPrimitiveTopology topology;
-    switch (primitive) {
+    bool rectangles = !tessellated && primitive == 8, points = !tessellated && primitive == 1;
+    // Rectangle and point lists: expanded by geometry shaders, as Xenia's
+    // D3D12 backend does; without them (or with XF_VK_EXPAND_IN_VS=1) in the
+    // vertex shader, as Xenia's Vulkan backend expands points without them
+    // (its rectangles are a TODO there, done here as its
+    // HostVertexShaderType describes them: the three guest vertices in each
+    // host invocation).
+    if (expand_in_vs_ && (rectangles || points))
+        host_vertex.host =
+            points ? shader::HostVertex::PointListAsTriangleStrip : shader::HostVertex::RectangleListAsTriangleStrip;
+    bool expanded = host_vertex.host == shader::HostVertex::PointListAsTriangleStrip ||
+                    host_vertex.host == shader::HostVertex::RectangleListAsTriangleStrip;
+    // triangles, quads and polygons (draw_util.h's IsPrimitivePolygonal, the
+    // triangle and quad patches with it): faces, culling, the front and back
+    // polygon offsets
+    bool polygonal = (primitive >= 4 && primitive <= 7) || (primitive >= 13 && primitive <= 15) || tessellated;
+    VkPrimitiveTopology topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    // (a tessellated draw's are patches)
+    switch (tessellated ? UINT32_MAX : primitive) {
+    case UINT32_MAX: break;
     case 1: topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break; // sprites made by point_list.geom
     case 2: topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
     case 3: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
@@ -3258,8 +3404,12 @@ void Impl::draw(const gpu::Draw &d) {
     // the 2D engine's copy and fill rectangles and strips (16 to 22).
     default: return skip(std::string("primitive ") + primitive_name(primitive));
     }
-    // the types the reset index cuts (Xenia's ProcessIndexBuffer list)
-    bool strip = primitive == 3 || primitive == 5 || primitive == 6 || (primitive >= 12 && primitive != 13);
+    // the types the reset index cuts (Xenia's ProcessIndexBuffer list, by the
+    // guest's type: tessellated strips and fans too, patches not, adaptive
+    // tessellation's edge factors not)
+    bool strip = (primitive == 3 || primitive == 5 || primitive == 6 || primitive == 12 || primitive == 14 ||
+                  primitive == 15 || primitive == 0x15 || primitive == 0x16) &&
+                 !(tessellated && tess_mode == 2);
 
     // shaders
     Shader *vs = have_vertex_ ? shader(vertex_hash_) : nullptr;
@@ -3282,6 +3432,12 @@ void Impl::draw(const gpu::Draw &d) {
     auto rasterizes_nothing = [&]() {
         if (ps && ps->exports) approximate("pixel shader memory export in a draw that rasterizes nothing (not done)");
         if (!vs->exports) return false;
+        // a domain shader's exports would need the tessellator without the
+        // rasterizer (not done)
+        if (tessellated) {
+            skip("memory export from a tessellated draw that rasterizes nothing");
+            return false;
+        }
         export_only = true;
         ps = nullptr;
         return true;
@@ -3355,14 +3511,19 @@ void Impl::draw(const gpu::Draw &d) {
     if (ps) export_ranges(*ps, 1, exported);
     bool exports = vs->exports || (ps && ps->exports);
 
-    // indices: the guest's, swapped, plus the index offset (as Xenia's
-    // vertex shader adds it), reset indices kept as the host's restart index
+    // indices: the guest's, swapped, plus the index offset, cut to 24 bits
+    // and clamped to VGT_MIN_VTX_INDX and VGT_MAX_VTX_INDX (as Xenia's vertex
+    // shaders do it: RemapAndConvertVertexIndices), reset indices kept as the
+    // host's restart index; adaptive tessellation's edge factors only swapped
     std::vector<uint32_t> indices;
     indices.reserve(count);
     uint32_t offset = regs_[r::VGT_INDX_OFFSET];
     bool restart = strip && (regs_[r::PA_SU_SC_MODE_CNTL] >> 21) & 1;
     uint32_t reset_index = regs_[r::VGT_MULTI_PRIM_IB_RESET_INDX];
-    auto vertex = [&](uint32_t index) { return index + offset; };
+    const uint32_t min_index = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, max_index = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
+    auto remap = [&](uint32_t index) { return std::min(max_index, std::max(min_index, (index + offset) & 0xFFFFFF)); };
+    const bool factors = tessellated && tess_mode == 2;
+    auto vertex = [&](uint32_t index) { return factors ? index : remap(index); };
     if (d.indexed) {
         uint32_t size = index32 ? 4 : 2;
         gpu::Endian endian = d.index_endian;
@@ -3387,7 +3548,12 @@ void Impl::draw(const gpu::Draw &d) {
         std::erase(indices, UINT32_MAX);
         if (indices.empty()) return;
         topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-        restart = rectangles = points = false;
+        restart = rectangles = points = expanded = false;
+        host_vertex = {};
+    } else if (tessellated) {
+        // the control points of the host's patches (tessellation.vert): the
+        // index for the domain shader and the edge factor
+        restart = false;
     } else if (primitive == 13) {
         // quads to triangle pairs
         std::vector<uint32_t> triangles;
@@ -3420,6 +3586,50 @@ void Impl::draw(const gpu::Draw &d) {
         if (indices.empty()) return;
     }
 
+    // A tessellated draw's control points: two floats each, the index for the
+    // domain shader and the edge factor (tessellation.vert). Control point
+    // indexed: the triangles' (strips and fans as lists, each primitive
+    // between reset indices on its own, as Xenia's TriangleStripToList and
+    // TriangleFanToList order them) or the quads' vertices, a patch each.
+    // Patch indexed: each index a patch's (discrete and continuous), or the
+    // guest's edge factors, 3 or 4 a patch, with the patch's number plus the
+    // offset as its index (adaptive, as Xenia's adaptive hull shaders).
+    // Factors are the guest's plus 1 clamped to its range plus 1 (Xenia's
+    // tessellation_adaptive.vs: NaN to the lowest, as its HLSL clamp), or that
+    // range's top (the discrete and continuous hull shaders).
+    std::vector<float> control_points;
+    if (tessellated) {
+        float max_factor = as_float(regs_[r::VGT_HOS_MAX_TESS_LEVEL]) + 1.0f;
+        float min_factor = as_float(regs_[r::VGT_HOS_MIN_TESS_LEVEL]) + 1.0f;
+        auto put = [&](float index, float factor) { control_points.insert(control_points.end(), {index, factor}); };
+        if (factors) {
+            for (size_t k = 0; k + patch_points <= indices.size(); k += patch_points) {
+                float patch = float(remap(uint32_t(k / patch_points)));
+                for (uint32_t j = 0; j < patch_points; j++)
+                    put(patch,
+                        std::fmin(std::fmax(std::bit_cast<float>(indices[k + j]) + 1.0f, min_factor), max_factor));
+            }
+        } else if (primitive == 5 || primitive == 6) {
+            for (size_t first = 0; first < indices.size();) {
+                size_t end = first;
+                while (end < indices.size() && indices[end] != UINT32_MAX) end++;
+                for (size_t k = first + 2; k < end; k++) {
+                    uint32_t a = indices[k - 2], b = indices[k - 1], c = indices[k];
+                    if (primitive == 5)
+                        a = indices[k - 1], b = indices[k], c = indices[first];
+                    else if ((k - first) & 1)
+                        std::swap(a, b);
+                    for (uint32_t v : {a, b, c}) put(float(v), max_factor);
+                }
+                first = end + 1;
+            }
+        } else {
+            for (size_t k = 0; k + patch_points <= indices.size(); k += patch_points)
+                for (uint32_t j = 0; j < patch_points; j++) put(float(indices[k + j]), max_factor);
+        }
+        if (control_points.empty()) return;
+    }
+
     // constants
     harness::Constants constants[2];
     for (int stage = 0; stage < 2; stage++) {
@@ -3433,8 +3643,8 @@ void Impl::draw(const gpu::Draw &d) {
     // the targets take over the EDRAM tiles down to the lowest row the draw
     // can reach (draw_max_y), within the scissor
     {
-        uint32_t rows =
-            std::min(scissor.offset.y + scissor.extent.height, draw_max_y(*vs, constants[0], indices, primitive));
+        uint32_t rows = std::min(scissor.offset.y + scissor.extent.height,
+                                 draw_max_y(*vs, constants[0], indices, primitive, tessellated));
         for (RenderTarget *t : colors)
             if (t) acquire(t, rows);
         if (depth) acquire(depth, rows);
@@ -3516,6 +3726,31 @@ void Impl::draw(const gpu::Draw &d) {
         if (t->signed_index) sys.signed_slots[slot] = t->signed_index | t->kind << 14 | sampler_bits;
     }
 
+    // Expanded in the vertex shader (shader::HostVertex): a strip of two
+    // triangles a point or rectangle, cut by the restart index, as Xenia's
+    // built-in index buffer of two-triangle strips. A point's four host
+    // vertices are its index shifted left by 2 plus the corner; a
+    // rectangle's are numbered from 4 times its number, each with the
+    // rectangle's three guest indices as its attribute (guest_indices).
+    std::vector<uint32_t> guest_indices;
+    if (expanded) {
+        std::vector<uint32_t> strips;
+        uint32_t primitives = uint32_t(points ? indices.size() : indices.size() / 3);
+        strips.reserve(size_t(primitives) * 5);
+        for (uint32_t k = 0; k < primitives; k++) {
+            if (k) strips.push_back(UINT32_MAX);
+            for (uint32_t corner = 0; corner < 4; corner++)
+                strips.push_back(points ? indices[k] << 2 | corner : k * 4 + corner);
+            if (rectangles)
+                for (uint32_t corner = 0; corner < 4; corner++)
+                    guest_indices.insert(guest_indices.end(), indices.begin() + k * 3, indices.begin() + k * 3 + 3);
+        }
+        if (strips.empty()) return;
+        indices = std::move(strips);
+        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+        restart = true;
+    }
+
     // the pipeline
     VkFormat color_formats[4] = {};
     VkPipelineColorBlendAttachmentState blends[4] = {};
@@ -3526,13 +3761,18 @@ void Impl::draw(const gpu::Draw &d) {
     // depth bias's enable, so those make no pipelines (Xenia's Vulkan backend
     // keys them all: vulkan_pipeline_cache.cc, a TODO in its command
     // processor).
-    uint32_t topology_class = topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 0
+    uint32_t topology_class = topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST   ? 0
                               : topology <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 1
-                                                                              : 2;
+                              : topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST ? 3
+                                                                             : 2;
+    // the vertex shader's host form, with a tessellated draw's hull shader
+    // and patch size
+    uint32_t host_key =
+        uint32_t(host_vertex.host) | (host_vertex.equal_spacing ? 1u << 8 : 0u) | hull << 12 | patch_points << 16;
     std::vector<uint32_t> key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32),
                                  ps ? uint32_t(pixel_hash_) : 0, ps ? uint32_t(pixel_hash_ >> 32) : 0,
                                  topology_class, rectangles, msaa, depth ? depth->image.format : 0u,
-                                 regs_[r::PA_CL_CLIP_CNTL] & (1u << 16)};
+                                 regs_[r::PA_CL_CLIP_CNTL] & (1u << 16), host_key};
     for (uint32_t i = 0; i < 4; i++) {
         if (!colors[i]) continue;
         color_formats[i] = colors[i]->image.format;
@@ -3548,20 +3788,40 @@ void Impl::draw(const gpu::Draw &d) {
         b.blendEnable = (blend & 0x1FFF1FFF) != 0x00010001; // not ONE, ADD, ZERO for both
         key.insert(key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
     }
-    VkPipelineShaderStageCreateInfo stages[3] = {};
+    VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why);
+    if (!guest_vs) return skip("vertex shader: " + why);
+    VkPipelineShaderStageCreateInfo stages[4] = {};
     uint32_t stage_count = 0;
-    stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
-                             vs->module, "main", nullptr};
-    if (rectangles || points)
-        stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-                                 VK_SHADER_STAGE_GEOMETRY_BIT, points ? point_gs_ : rectangle_gs_, "main", nullptr};
-    if (ps)
-        stages[stage_count++] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0,
-                                 VK_SHADER_STAGE_FRAGMENT_BIT, ps->module, "main", nullptr};
+    auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
+        stages[stage_count++] = {
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, bit, m, "main", nullptr};
+    };
+    if (tessellated) {
+        stage(VK_SHADER_STAGE_VERTEX_BIT, tessellation_vs_);
+        stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tessellation_hs_[hull]);
+        stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, guest_vs);
+    } else {
+        stage(VK_SHADER_STAGE_VERTEX_BIT, guest_vs);
+        if ((rectangles || points) && !expanded)
+            stage(VK_SHADER_STAGE_GEOMETRY_BIT, points ? point_gs_ : rectangle_gs_);
+    }
+    if (ps) stage(VK_SHADER_STAGE_FRAGMENT_BIT, ps->module);
+    // the vertex attributes: a tessellated draw's control points (two
+    // floats), an expanded rectangle's guest indices (three)
+    VkVertexInputBindingDescription vertex_binding{0, tessellated ? 8u : 12u, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription vertex_attribute{
+        0, 0, tessellated ? VK_FORMAT_R32G32_SFLOAT : VK_FORMAT_R32G32B32_UINT, 0};
     VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    if (tessellated || host_vertex.host == shader::HostVertex::RectangleListAsTriangleStrip) {
+        vertex_input.vertexBindingDescriptionCount = vertex_input.vertexAttributeDescriptionCount = 1;
+        vertex_input.pVertexBindingDescriptions = &vertex_binding;
+        vertex_input.pVertexAttributeDescriptions = &vertex_attribute;
+    }
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = topology;
     assembly.primitiveRestartEnable = restart;
+    VkPipelineTessellationStateCreateInfo tessellation{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+    tessellation.patchControlPoints = patch_points;
     VkPipelineViewportStateCreateInfo viewport_state{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     viewport_state.viewportCount = viewport_state.scissorCount = 1;
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
@@ -3620,6 +3880,7 @@ void Impl::draw(const gpu::Draw &d) {
     info.pStages = stages;
     info.pVertexInputState = &vertex_input;
     info.pInputAssemblyState = &assembly;
+    if (tessellated) info.pTessellationState = &tessellation;
     info.pViewportState = &viewport_state;
     info.pRasterizationState = &raster;
     info.pMultisampleState = &multisample;
@@ -3697,12 +3958,18 @@ void Impl::draw(const gpu::Draw &d) {
     }
     if (!fatal_.empty()) return;
 
-    // everything else the draw takes from the arena, in one submission
+    // everything else the draw takes from the arena, in one submission: the
+    // indices (none for a tessellated draw), the vertex attributes (its
+    // control points, or an expanded rectangle's guest indices)
+    if (tessellated) indices.clear();
     VkDeviceSize index_bytes = indices.size() * 4;
+    const void *attributes = tessellated ? static_cast<const void *>(control_points.data()) : guest_indices.data();
+    VkDeviceSize attribute_bytes = (tessellated ? control_points.size() : guest_indices.size()) * 4;
     VkDeviceSize constants_size = (sizeof(harness::Constants) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     VkDeviceSize system_size = (sizeof(System) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
-    bool own_indices = index_bytes > ARENA_SLOT / 4;
-    VkDeviceSize need = 2 * constants_size + system_size + 4 * ubo_align_ + (own_indices ? 0 : index_bytes + 4);
+    bool own_indices = index_bytes > ARENA_SLOT / 4, own_attributes = attribute_bytes > ARENA_SLOT / 4;
+    VkDeviceSize need = 2 * constants_size + system_size + 4 * ubo_align_ + (own_indices ? 0 : index_bytes + 4) +
+                        (own_attributes ? 0 : attribute_bytes + 4);
     if (arena_take(need, 1) == NONE) flush();
     else slots_[current_].used -= need; // only a check that the draw fits
     if (!fatal_.empty()) return;
@@ -3724,22 +3991,34 @@ void Impl::draw(const gpu::Draw &d) {
     dynamic_offsets[0] = uint32_t(last_constants_at_[0]);
     dynamic_offsets[1] = uint32_t(last_system_at_);
     dynamic_offsets[2] = uint32_t(last_constants_at_[1]);
-    VkBuffer index_buffer;
-    VkDeviceSize index_at;
-    if (own_indices) {
-        vk::Buffer own = d_.create_buffer(index_bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true);
-        if (!own.buffer) {
-            fatal_ = "could not make an index buffer";
-            return;
+    // words into the arena, or into a buffer of their own (freed with the
+    // slot) when they are too many for it
+    auto put_words = [&](const void *data, VkDeviceSize bytes, bool own_buffer, VkBufferUsageFlags usage,
+                         VkBuffer &buffer, VkDeviceSize &at) {
+        if (own_buffer) {
+            vk::Buffer own = d_.create_buffer(bytes, usage, true);
+            if (!own.buffer) {
+                fatal_ = "could not make an index or vertex buffer";
+                return false;
+            }
+            std::memcpy(own.mapped, data, bytes);
+            slots_[current_].after.push_back([this, own]() mutable { d_.destroy(own); });
+            buffer = own.buffer, at = 0;
+        } else {
+            at = arena_take(bytes, 4);
+            std::memcpy(arena_data(at), data, bytes);
+            buffer = arena_.buffer;
         }
-        std::memcpy(own.mapped, indices.data(), index_bytes);
-        slots_[current_].after.push_back([this, own]() mutable { d_.destroy(own); });
-        index_buffer = own.buffer, index_at = 0;
-    } else {
-        index_at = arena_take(index_bytes, 4);
-        std::memcpy(arena_data(index_at), indices.data(), index_bytes);
-        index_buffer = arena_.buffer;
-    }
+        return true;
+    };
+    VkBuffer index_buffer = VK_NULL_HANDLE, attribute_buffer = VK_NULL_HANDLE;
+    VkDeviceSize index_at = 0, attribute_at = 0;
+    if (index_bytes &&
+        !put_words(indices.data(), index_bytes, own_indices, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer, index_at))
+        return;
+    if (attribute_bytes && !put_words(attributes, attribute_bytes, own_attributes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                      attribute_buffer, attribute_at))
+        return;
 
     // record, in the render pass of these targets (none for exports alone);
     // a draw that exports begins its own, after a barrier, as what came
@@ -3756,7 +4035,8 @@ void Impl::draw(const gpu::Draw &d) {
     }
     VkDescriptorSet sets[2] = {draw_sets_[1], bindless_};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 3, dynamic_offsets);
-    vkCmdBindIndexBuffer(c, index_buffer, index_at, VK_INDEX_TYPE_UINT32);
+    if (index_buffer) vkCmdBindIndexBuffer(c, index_buffer, index_at, VK_INDEX_TYPE_UINT32);
+    if (attribute_buffer) vkCmdBindVertexBuffers(c, 0, 1, &attribute_buffer, &attribute_at);
     if (export_only) {
         vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
         report_.drawn++;
@@ -3822,18 +4102,21 @@ void Impl::draw(const gpu::Draw &d) {
     if (options_.gpu_timing_draws) {
         // each draw timed on its own, counted to its shaders
         char kind[96];
-        std::snprintf(kind, sizeof(kind), "draw: %s, shaders %016llX %016llX", primitive_name(primitive),
+        std::snprintf(kind, sizeof(kind), "draw: %s, shaders %016llX %016llX", draw_name.c_str(),
                       (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull);
         gpu_mark(kind);
     }
     zpd_draw(c);
-    vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
+    if (tessellated)
+        vkCmdDraw(c, uint32_t(control_points.size() / 2), 1, 0, 0);
+    else
+        vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
     if (options_.gpu_timing_draws) gpu_mark("draws: between draws");
     report_.drawn++;
     end_export(exported);
     if (options_.verbose) {
         std::fprintf(stderr, "  draw %llu: %s, %u indices, %s%s%s, shaders %016llX %016llX, blend %08X, mask %04X, vertices",
-                     (unsigned long long)report_.draws, primitive_name(primitive), count,
+                     (unsigned long long)report_.draws, draw_name.c_str(), count,
                      ps ? "color and depth" : "depth only", depth ? ", depth on" : "", exports ? ", memory export" : "",
                      (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull,
                      regs_[r::RB_BLENDCONTROL[0]], regs_[reg::RB_COLOR_MASK] & 0xFFFF);

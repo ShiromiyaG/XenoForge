@@ -275,10 +275,12 @@ waited for only when the CPU needs what the GPU wrote (Decisions).
   target's exponent bias, 16-bit fixed targets kept as snorm with their
   -32..32, gamma targets written through the piecewise linear curve);
   the vertex fetches reading the copies of their ranges in the upload
-  arena; indices swapped and offset on the CPU (quad lists split,
-  strips restarted at the reset index); rectangle lists and point lists
-  through geometry shaders (points as sprites of the vertex shader's
-  clamped oPts.x or PA_SU_POINT_SIZE, as Xenia's); viewport, scissor and
+  arena; indices swapped, offset, cut to 24 bits and clamped on the CPU
+  (quad lists split, strips restarted at the reset index); rectangle lists
+  and point lists through geometry shaders, or expanded in the vertex
+  shader without them (points as sprites of the vertex shader's clamped
+  oPts.x or PA_SU_POINT_SIZE, as Xenia's); tessellated draws through hull
+  and domain shaders ("Tessellation" below); viewport, scissor and
   the position's formats as Xenia's `GetHostViewportInfo` and
   `GetScissor`; blend, depth, stencil, culling and the alpha test from the
   registers. A draw that can write nothing (no color channel enabled,
@@ -903,11 +905,107 @@ now; the rest differ mostly in blend state and color formats, which only
 VK_EXT_extended_dynamic_state3 could take (not used yet).
 
 **Geometry shaders are optional** (many mobile GPUs lack them;
-`vk::Device::geometry_shader()`, off with `XF_VK_NO_GEOMETRY_SHADER=1`):
-without them rectangle and point lists are skipped and counted ("rectangle
-list without geometry shaders"); Xenia's D3D12 expands both in the vertex
-shader, which is the next step. Checked both ways on the race frame, with
+`vk::Device::geometry_shader()`, off with `XF_VK_NO_GEOMETRY_SHADER=1`).
+
+**Rectangle and point lists without geometry shaders** are expanded in the
+vertex shader (`shader::HostVertex`, Xenia's `Shader::HostVertexShaderType`
+kPointListAsTriangleStrip and kRectangleListAsTriangleStrip): a strip of two
+triangles per primitive, cut by the restart index, as Xenia's built-in
+index buffer of two-triangle strips. A point's four host vertices are its
+index shifted left by 2 plus the corner, and the sprite is made at the end
+of the vertex shader as point_list.geom makes it (Xenia's Vulkan
+translator, which expands points this way where the device has no geometry
+shaders); only corner 0 exports memory. Xenia has no rectangle expansion (a
+TODO in its Vulkan translator), so it is done as its HostVertexShaderType
+describes it: each host vertex runs the guest shader for the rectangle's
+three guest vertices (their indices a vertex attribute), then takes its
+corner of the strip rectangle_list.geom makes (the vertex opposite the
+longest edge first, the fourth mirrored across it); guest vertex k exports
+memory in corner k's invocation only. Xenia's D3D12 backend does not expand
+in the vertex shader: its primitive processor is told it draws points,
+rectangles and quads natively (`InitializeCommon(true, false, false, true,
+true, true)`) and its pipeline cache makes geometry shaders. So geometry
+shaders stay the path where the device has them; `XF_VK_EXPAND_IN_VS=1` (or
+`Options::expand_in_vertex_shader`) forces the expansion. Measured on the
+RTX 5060 with `xfreplay --gpu-time-draws --repeat`: Red Dead Redemption's
+frame 850, 82 rectangle draws, 0.884 ms with geometry shaders and 0.905 ms
+expanded; 600,000 points of 2 pixels (the synthetic frame below, made
+heavier), 0.625 ms and 1.797 ms. All 29 frames of `replay_test` match the
+same way with geometry shaders, expanded, and without geometry shaders, with
 validation.
+
+**Tessellation** (2026-11-06), as Xenia's D3D12 backend draws it, where the
+device has tessellation shaders (`vk::Device::tessellation_shader()`, off
+with `XF_VK_NO_TESSELLATION=1`; without them the draws are skipped and
+counted, "tessellation without tessellation shaders"). A draw is tessellated
+when VGT_OUTPUT_PATH_CNTL's path_select is the tessellator and the major
+mode is explicit (Xenia's PrimitiveProcessor::Process: games leave the
+register set for later draws in the implicit mode, which do not tessellate;
+it used to be checked alone here). Then, as Xenia's primitive processor
+takes them:
+- triangle lists, fans and strips (as lists, each primitive between reset
+  indices on its own, in Xenia's TriangleFanToList and TriangleStripToList
+  order) and quad lists, discrete or continuous, are patches of 3 and 4
+  control points indexed by control point;
+- triangle and quad patches (primitive types 17 and 18 there), in any of
+  the three modes, are indexed by patch: discrete and continuous, a patch
+  per index; adaptive, the "indices" are 32-bit float edge factors, 3 or 4
+  per patch, the patch's index its number plus VGT_INDX_OFFSET;
+- the rest is skipped and counted, as Xenia fails it: line patches (a TODO
+  in Xenia), adaptive lists, mode 3, other primitives.
+
+The host pipeline is tessellation.vert, a hull shader (tessellation.tesc:
+1, 3 or 4 control points, or adaptive triangles or quads) and the guest's
+vertex shader translated as the tessellation evaluation shader. What Xenia's
+tessellation_indexed.vs and tessellation_adaptive.vs compute is done on the
+CPU, where the renderer reads indices anyway: per control point, the index
+for the domain shader (swapped, offset, cut to 24 bits, clamped to
+VGT_MIN_VTX_INDX and VGT_MAX_VTX_INDX) and the edge factor (the guest's plus
+1, clamped to VGT_HOS_MIN_TESS_LEVEL and VGT_HOS_MAX_TESS_LEVEL plus 1, NaN
+to the lowest), two floats of a vertex attribute; so the factors never pass
+as indices, which would need fullDrawIndexUint32. The hull shaders are
+Xenia's: the discrete and continuous ones put every level at the largest
+factor; the adaptive ones take the Xbox 360's edge order to Direct3D's (and
+Vulkan's: the same edges) and the inner levels from the edges. Spacing is
+the evaluation shader's in SPIR-V: equal for discrete (Direct3D's integer),
+fractional even otherwise, clockwise (Xenia's Vulkan translator: what keeps
+Direct3D 12's faces). The domain shader gets r0 and r1 as Xenia's D3D12
+translator gives them (StartVertexOrDomainShader): triangles' barycentric
+coordinates as zyx in r0.xyz with the control points' indices in r1.xyz,
+or the patch's in r1.x and 0 in r1.y; control point indexed quads' UV in
+r0.xy, the indices in r0.z and r1.xyz; patch indexed quads' patch in r0.x,
+UV in r0.yz, 0 in r1.x; r0.w stays 0, where Xenia's Vulkan translator
+writes 1. Tessellated triangles and quads are polygons (draw_util's
+IsPrimitivePolygonal: faces, culling, the polygon offset), and their
+vertices are not run on the CPU for the rows a draw reaches (Xenia's draw
+extent estimator does not either). A tessellated draw whose memory exports
+would run without rasterization is skipped and counted.
+
+Every draw's indices are now cut to 24 bits and clamped to
+VGT_MIN_VTX_INDX and VGT_MAX_VTX_INDX after the offset, as Xenia's vertex
+shaders do (RemapAndConvertVertexIndices); the 29 frames are unchanged. The
+reset index cuts only Xenia's list (line and triangle strips and fans, line
+loops, quad strips, polygons, the 2D line and triangle strips).
+
+**Checked on a synthetic frame** (`primitives_test`): packets and microcode
+built by hand from Xenia's ucode.h, 4 by 4 cells of 80 pixels: points of
+PA_SU_POINT_SIZE's size, of the vertex shader's, and from 16-bit indices
+with the offset and the clamp; a rectangle with its three vertices in each
+order; triangle patches in the three modes (two adaptive ones), quad
+patches in the three modes, and, by control point, a triangle list, a
+triangle strip cut by the reset index, a fan and a quad list, each domain
+shader bowing its patch so the tessellation shows and coloring it by its
+coordinates and indices; three of them with back faces culled, which shows
+the tessellator's winding (culling changes the picture by a mean of 2.1,
+and Xenia's changes the same way). Drawn with geometry shaders and expanded, the
+frames are the same (worst difference 0). With `XF_SYNTH_TRACES=<folder>`
+the frame is written there as a trace (58460001_1.xtr); Xenia's D3D12 trace
+dump of it (`--trace_dump_path` the same folder) gives the picture the test
+then compares with: mean 0.000, 0.000% of pixels off by more than 16, worst
+1 (of 255). Xenia's Vulkan trace dump differs (mean 8.5): it draws the
+control point indexed cells with the wrong indices and adds a stray square;
+the D3D12 dump is the one matched. Validation is clean with tessellation,
+without it, and without geometry shaders.
 
 **Primitive types**: line loops as strips closed by their first index
 (Xenia's `LineLoopToStrip`, per primitive between reset indices); quad
@@ -917,10 +1015,7 @@ primitive types to OpenGL's `GL_QUAD_STRIP` and `GL_POLYGON`, so their
 meaning is OpenGL's. The reset index cuts them as Xenia's list says. Still
 skipped and counted: the triangle list with wireframe flags (7) and the 2D
 engine's primitives (16 to 22), which Xenia does not draw and no reference
-at hand defines, and tessellation: a draw on VGT_OUTPUT_PATH_CNTL's
-tessellator path, whatever its primitive (it used to be drawn as if the
-vertex shader were an ordinary one), counted by VGT_HOS_CNTL's mode and the
-primitive (line, triangle and quad patches are 16 to 18 there).
+at hand defines; tessellation is above.
 
 **Occlusion queries** (`gpu::OcclusionQueries`; the player and `boot` use
 real counts, `XF_OCCLUSION_QUERIES=fake` the made-up ones;

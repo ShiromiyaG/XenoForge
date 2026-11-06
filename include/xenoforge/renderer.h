@@ -152,6 +152,10 @@ struct Options {
     // with it, each draw timed on its own, counted to its primitive and
     // shaders ("draw: ..."), the time between draws apart
     bool gpu_timing_draws = false;
+    // Rectangle and point lists expanded in the vertex shader, as on a device
+    // without geometry shaders, rather than by geometry shaders as Xenia's
+    // D3D12 backend draws them (XF_VK_EXPAND_IN_VS=1 sets it too)
+    bool expand_in_vertex_shader = false;
 };
 
 // A trace writer (gpu_trace_writer.h) stands in front of it as the

@@ -114,6 +114,12 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     const char *no_gs = std::getenv("XF_VK_NO_GEOMETRY_SHADER");
     if (has.features.geometryShader && !(no_gs && no_gs[0] && no_gs[0] != '0'))
         features.features.geometryShader = d->geometry_shader_ = true;
+    // optional: tessellation shaders (the guest's tessellated draws; without
+    // them those are skipped and counted); XF_VK_NO_TESSELLATION=1 turns them
+    // off the same way
+    const char *no_tess = std::getenv("XF_VK_NO_TESSELLATION");
+    if (has.features.tessellationShader && !(no_tess && no_tess[0] && no_tess[0] != '0'))
+        features.features.tessellationShader = d->tessellation_shader_ = true;
     features.features.depthClamp = VK_TRUE;
     features.features.sampleRateShading = VK_TRUE;
     features.features.independentBlend = VK_TRUE;

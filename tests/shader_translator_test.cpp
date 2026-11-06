@@ -4,8 +4,9 @@
 // format, 1D, 2D, 3D-or-stacked and cube texture fetches with a LOD bias,
 // offsets, unnormalized coordinates, the LOD or gradients from registers and
 // the stacked layers' filters, the color and depth exports and a kill. And
-// memexport (straight, at a kill, through the dispatcher). And what is
-// refused is refused: getWeights, the wrong stage.
+// memexport (straight, at a kill, through the dispatcher). Vertex shaders in
+// every host form (shader::HostVertex). And what is refused is refused:
+// getWeights, the wrong stage.
 
 #include "check.h"
 #include "shader_builders.h"
@@ -39,11 +40,19 @@ bool validates(const std::vector<uint32_t> &words, const std::string &name) {
 #endif
 }
 
+// in its stage and the harness; a vertex shader in every host form too (the
+// expansions of points and rectangles, the domain shaders)
 void translates(const ParsedShader &shader, const std::string &name) {
-    for (auto stage : {shader.type == ShaderType::Vertex ? shader::Stage::Vertex : shader::Stage::Pixel,
-                       shader::Stage::Harness}) {
-        auto t = shader::translate(shader, stage);
+    std::vector<std::pair<shader::Stage, shader::VertexOptions>> forms = {
+        {shader.type == ShaderType::Vertex ? shader::Stage::Vertex : shader::Stage::Pixel, {}},
+        {shader::Stage::Harness, {}}};
+    if (shader.type == ShaderType::Vertex)
+        for (uint32_t h = 1; h <= uint32_t(shader::HostVertex::QuadDomainPatchIndexed); h++)
+            forms.push_back({shader::Stage::Vertex, {shader::HostVertex(h), h % 2 == 0}});
+    for (auto [stage, options] : forms) {
+        auto t = shader::translate(shader, stage, options);
         std::string label = name + (stage == shader::Stage::Harness ? "_harness" : "_stage");
+        if (options.host != shader::HostVertex::Vertex) label += "_host" + std::to_string(uint32_t(options.host));
         CHECK(t.ok());
         if (!t.ok()) {
             std::printf("  %s:", label.c_str());

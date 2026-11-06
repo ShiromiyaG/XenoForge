@@ -74,6 +74,8 @@ public:
     bool precise_occlusion() const { return precise_occlusion_; }
     // geometry shaders (not on many mobile GPUs)
     bool geometry_shader() const { return geometry_shader_; }
+    // tessellation control and evaluation shaders (the guest's tessellator)
+    bool tessellation_shader() const { return tessellation_shader_; }
 
     // host-visible and coherent (mapped), or device-local; host_reads: the
     // host reads it back, so cached memory where the device has it
@@ -112,6 +114,7 @@ private:
     bool mirror_clamp_to_edge_ = false;
     bool precise_occlusion_ = false;
     bool geometry_shader_ = false;
+    bool tessellation_shader_ = false;
     std::mutex queue_mutex_;
 };
 

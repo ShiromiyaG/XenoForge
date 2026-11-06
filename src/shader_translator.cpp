@@ -12,7 +12,10 @@
 // integer components clamped to their range; with where an export ends from
 // shader_translator.cc's Shader::AnalyzeUcode): eA and eM0-eM4 packed into
 // the stream's format and stored into guest memory, the storage buffer the
-// vertex fetches read.
+// vertex fetches read. The vertex shader's host forms (HostVertex) follow
+// Xenia's too: the domain shaders' inputs dxbc_shader_translator.cc's
+// StartVertexOrDomainShader, their execution modes and the point sprites
+// expanded in the vertex shader spirv_shader_translator.cc.
 //
 // The state is Private: r0-r127 (a vec4 each), a0, aL, the predicate, the
 // previous scalar, the vertex fetch address, the exports. The body is a
@@ -54,7 +57,8 @@ static_assert(OUT_MISC + 1 == OUTPUT_VEC4S);
 
 class Translator {
 public:
-    Translator(const ParsedShader &shader, Stage stage) : s_(shader), stage_(stage) {}
+    Translator(const ParsedShader &shader, Stage stage, const VertexOptions &vertex)
+        : s_(shader), stage_(stage), vertex_(vertex) {}
     Translation run();
 
 private:
@@ -253,6 +257,7 @@ private:
 
     const ParsedShader &s_;
     Stage stage_;
+    VertexOptions vertex_;
     spirv::Module m_;
     std::vector<std::string> unsupported_;
     std::vector<Id> interface_;
@@ -283,6 +288,9 @@ private:
     // eA, eM0-eM4, the eM# written since the last export (a bit each), and
     // an export's packed words and element size (log2 bytes; 5 for none)
     Id export_address_ = 0, export_data_[5] = {}, export_written_ = 0, export_packed_[5] = {}, export_size_ = 0;
+    // whether this invocation's exports are stored (a bool; 0: always), for
+    // the host vertex types that run a guest vertex in several invocations
+    Id export_allowed_ = 0;
 };
 
 void Translator::declare() {
@@ -337,6 +345,9 @@ void Translator::declare() {
         }
         export_written_ = global(uint_, spv::StorageClass::Private, "eM_written");
         export_size_ = global(uint_, spv::StorageClass::Private, "eM_size");
+        if (stage_ == Stage::Vertex && (vertex_.host == HostVertex::PointListAsTriangleStrip ||
+                                        vertex_.host == HostVertex::RectangleListAsTriangleStrip))
+            export_allowed_ = global(bool_, spv::StorageClass::Private, "export_allowed");
     }
 
     if (stage_ != Stage::Harness) {
@@ -883,6 +894,7 @@ void Translator::export_to_memory(uint8_t em) {
     Id shifted = m_.op(Op::OpShiftRightLogical, uvec4_, {ea, m_.const_composite(uvec4_, shift_parts)});
     Id valid = m_.op(Op::OpAll, bool_,
                      {m_.op(Op::OpIEqual, bvec4_, {shifted, m_.const_composite(uvec4_, expected_parts)})});
+    if (export_allowed_) valid = m_.op(Op::OpLogicalAnd, bool_, {valid, load(bool_, export_allowed_)});
     auto each = [&](auto fn) {
         for (uint32_t k = 0; k < 5; k++)
             if (em & (1u << k)) fn(k);
@@ -1817,8 +1829,33 @@ void Translator::main_harness() {
 }
 
 void Translator::main_vertex() {
-    Id vertex_index = global(int_, spv::StorageClass::Input, "vertex_index");
-    m_.decorate(vertex_index, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::VertexIndex)});
+    const HostVertex host = vertex_.host;
+    const bool domain = host >= HostVertex::TriangleDomainCPIndexed;
+    const bool points = host == HostVertex::PointListAsTriangleStrip;
+    const bool rectangles = host == HostVertex::RectangleListAsTriangleStrip;
+    const Id vec3 = m_.type_vector(float_, 3), uvec3 = m_.type_vector(uint_, 3);
+    Id vertex_index = 0, guest_indices = 0, control_points = 0, tess_coord = 0;
+    const uint32_t control_point_count = host == HostVertex::TriangleDomainCPIndexed ? 3
+                                         : host == HostVertex::QuadDomainCPIndexed   ? 4
+                                                                                     : 1;
+    if (domain) {
+        // the tessellator's coordinates, and per control point of the patch
+        // its index (the patch's for the patch-indexed types), as the hull
+        // shader (tessellation.tesc) passes it on
+        m_.capability(spv::Capability::Tessellation);
+        control_points =
+            global(m_.type_array(float_, control_point_count), spv::StorageClass::Input, "control_point_indices");
+        m_.decorate(control_points, spv::Decoration::Location, {0});
+        tess_coord = global(vec3, spv::StorageClass::Input, "tess_coord");
+        m_.decorate(tess_coord, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::TessCoord)});
+    } else {
+        vertex_index = global(int_, spv::StorageClass::Input, "vertex_index");
+        m_.decorate(vertex_index, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::VertexIndex)});
+        if (rectangles) {
+            guest_indices = global(uvec3, spv::StorageClass::Input, "guest_indices");
+            m_.decorate(guest_indices, spv::Decoration::Location, {0});
+        }
+    }
     Id position = global(vec4_, spv::StorageClass::Output, "position");
     m_.decorate(position, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::Position)});
     Id outputs = global(m_.type_array(vec4_, 16), spv::StorageClass::Output, "interpolators");
@@ -1831,7 +1868,7 @@ void Translator::main_vertex() {
     // draw rasterizes nothing (renderer.cpp), and Vulkan without
     // maintenance5 wants a point size from it then: 1.
     Id host_point_size = 0;
-    if (em_written_) {
+    if (em_written_ && host == HostVertex::Vertex) {
         host_point_size = global(float_, spv::StorageClass::Output, "host_point_size");
         m_.decorate(host_point_size, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::PointSize)});
     }
@@ -1843,58 +1880,221 @@ void Translator::main_vertex() {
                     for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
                         writes_point_size |=
                             r->target == StorageTarget::PointSizeEdgeFlagKillVertex && (r->used_write_mask() & 1);
+    // a rectangle's three guest vertices, run one after another: their host
+    // positions and interpolators
+    Id rectangle_positions = 0, rectangle_interpolators = 0;
+    if (rectangles) {
+        rectangle_positions = global(m_.type_array(vec4_, 3), spv::StorageClass::Private, "rectangle_positions");
+        rectangle_interpolators =
+            global(m_.type_array(vec4_, 48), spv::StorageClass::Private, "rectangle_interpolators");
+    }
 
     Id main = m_.begin_function(void_, m_.type_function(void_, {}));
     m_.label();
-    for (uint32_t k = 0; k < harness::REGISTERS; k++)
-        store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))}), zero4_);
-    // the vertex index in r0.x (B3 adds the index offset and endianness)
-    store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(0)}),
-          vec4_of(m_.op(Op::OpConvertSToF, float_, {load(int_, vertex_index)}), f(0), f(0), f(0)));
-    reset_state();
-    m_.op(Op::OpFunctionCall, void_, {body_});
-    export_to_memory(em_before_end_); // the export under way at the end
+    Id ptr_u_vec4 = m_.type_pointer(spv::StorageClass::Uniform, vec4_);
+    Id ptr_out_vec4 = m_.type_pointer(spv::StorageClass::Output, vec4_);
+    auto reg = [&](uint32_t k) { return m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))}); };
+    auto interpolator = [&](uint32_t k) {
+        return m_.op(Op::OpAccessChain, ptr_private_vec4_, {interpolators_, i(int32_t(k))});
+    };
+    auto as_uint = [&](Id x) { return m_.op(Op::OpBitcast, uint_, {x}); };
+    // the strip's corner this invocation makes (the expanded types)
+    Id corner = 0;
+    if (points || rectangles) corner = m_.op(Op::OpBitwiseAnd, uint_, {as_uint(load(int_, vertex_index)), u(3)});
+
+    // The guest shader once: the registers zeroed (as Xenia's, for shaders
+    // that read what they set only on some paths), the inputs in r0 and r1,
+    // the export under way at the end done.
+    auto run_guest = [&](Id r0, Id r1) {
+        for (uint32_t k = 0; k < harness::REGISTERS; k++) store(reg(k), zero4_);
+        store(reg(0), r0);
+        if (r1) store(reg(1), r1);
+        reset_state();
+        m_.op(Op::OpFunctionCall, void_, {body_});
+        export_to_memory(em_before_end_);
+    };
     // The position's formats (PA_CL_VTE_CNTL, in the system flags' y), as
     // Xenia's CompleteVertexOrTessEvalShaderInMain: W given as 1/W unless bit
     // 0, XY divided by W with bit 1, Z with bit 2. Then to Vulkan's clip
     // space: xyz * ndc_scale + ndc_offset * w.
-    Id ptr_u_vec4 = m_.type_pointer(spv::StorageClass::Uniform, vec4_);
-    Id scale = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(0)}));
-    Id offset = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(1)}));
-    Id flags = m_.op(Op::OpCompositeExtract, uint_,
-                     {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)})), 1});
-    auto flag = [&](uint32_t bit) { return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(bit)}), u(0)}); };
-    Id p = load(vec4_, position_);
-    Id w = comp(p, 3);
-    w = select(float_, flag(1), w, exact(Op::OpFDiv, float_, {f(1), w}));
-    Id x = select(float_, flag(2), exact(Op::OpFMul, float_, {comp(p, 0), w}), comp(p, 0));
-    Id y = select(float_, flag(2), exact(Op::OpFMul, float_, {comp(p, 1), w}), comp(p, 1));
-    Id z = select(float_, flag(4), exact(Op::OpFMul, float_, {comp(p, 2), w}), comp(p, 2));
-    Id xyzw = vec4_of(x, y, z, w);
-    Id moved = exact(Op::OpFAdd, vec4_, {exact(Op::OpFMul, vec4_, {xyzw, scale}), exact(Op::OpVectorTimesScalar, vec4_, {offset, w})});
-    store(position, vec4_of(comp(moved, 0), comp(moved, 1), comp(moved, 2), w));
-    Id ptr_out_vec4 = m_.type_pointer(spv::StorageClass::Output, vec4_);
-    for (uint32_t k = 0; k < 16; k++)
-        store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))}),
-              load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {interpolators_, i(int32_t(k))})));
+    auto host_position = [&]() {
+        Id scale = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(0)}));
+        Id offset = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(1)}));
+        Id flags = m_.op(Op::OpCompositeExtract, uint_,
+                         {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                             {system_, u(3)})),
+                          1});
+        auto flag = [&](uint32_t bit) {
+            return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(bit)}), u(0)});
+        };
+        Id p = load(vec4_, position_);
+        Id w = comp(p, 3);
+        w = select(float_, flag(1), w, exact(Op::OpFDiv, float_, {f(1), w}));
+        Id x = select(float_, flag(2), exact(Op::OpFMul, float_, {comp(p, 0), w}), comp(p, 0));
+        Id y = select(float_, flag(2), exact(Op::OpFMul, float_, {comp(p, 1), w}), comp(p, 1));
+        Id z = select(float_, flag(4), exact(Op::OpFMul, float_, {comp(p, 2), w}), comp(p, 2));
+        Id xyzw = vec4_of(x, y, z, w);
+        Id moved = exact(Op::OpFAdd, vec4_,
+                         {exact(Op::OpFMul, vec4_, {xyzw, scale}), exact(Op::OpVectorTimesScalar, vec4_, {offset, w})});
+        return vec4_of(comp(moved, 0), comp(moved, 1), comp(moved, 2), w);
+    };
     // oPts.x clamped to PA_SU_POINT_MINMAX (system values' y and z) as Xenia
     // does, like signed integers (-NaN and negatives to the minimum, NaN to
     // the maximum); -1 when the shader does not write it, for the constant
     // size
-    if (writes_point_size) {
-        Id values = load(vec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, vec4_),
-                                      {system_, u(4)}));
+    auto guest_point_size = [&]() {
+        if (!writes_point_size) return f(-1.0f);
+        Id values = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(4)}));
         auto as_int = [&](Id x) { return m_.op(Op::OpBitcast, int_, {x}); };
         Id bits = glsl(GLSLstd450SMax, int_, {as_int(comp(values, 1)), as_int(comp(load(vec4_, point_size_), 0))});
         bits = glsl(GLSLstd450SMin, int_, {as_int(comp(values, 2)), bits});
-        store(point_size, m_.op(Op::OpBitcast, float_, {bits}));
-    } else {
+        return m_.op(Op::OpBitcast, float_, {bits});
+    };
+    auto put_interpolators = [&]() {
+        for (uint32_t k = 0; k < 16; k++)
+            store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))}), load(vec4_, interpolator(k)));
+    };
+
+    if (rectangles) {
+        // The three guest vertices, then the strip rectangle_list.geom makes
+        // of them (Xenia's rectangle list geometry shader): the vertex
+        // opposite the longest edge first, the fourth mirrored across that
+        // edge (-a + b + c), position and interpolators alike. Guest vertex k
+        // exports memory in corner k's invocation only.
+        Id indices = load(uvec3, guest_indices);
+        Id ptr_private_vec4 = ptr_private_vec4_;
+        for (uint32_t k = 0; k < 3; k++) {
+            if (export_allowed_) store(export_allowed_, m_.op(Op::OpIEqual, bool_, {corner, u(k)}));
+            Id index = m_.op(Op::OpCompositeExtract, uint_, {indices, k});
+            run_guest(vec4_of(m_.op(Op::OpConvertUToF, float_, {index}), f(0), f(0), f(0)), 0);
+            store(m_.op(Op::OpAccessChain, ptr_private_vec4, {rectangle_positions, i(int32_t(k))}), host_position());
+            for (uint32_t j = 0; j < 16; j++)
+                store(m_.op(Op::OpAccessChain, ptr_private_vec4, {rectangle_interpolators, i(int32_t(k * 16 + j))}),
+                      load(vec4_, interpolator(j)));
+        }
+        Id p[3];
+        for (uint32_t k = 0; k < 3; k++)
+            p[k] = load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4, {rectangle_positions, i(int32_t(k))}));
+        auto edge = [&](uint32_t a, uint32_t b) {
+            Id d = m_.op(Op::OpFSub, vec2_,
+                         {m_.op(Op::OpVectorShuffle, vec2_, {p[b], p[b], 0, 1}),
+                          m_.op(Op::OpVectorShuffle, vec2_, {p[a], p[a], 0, 1})});
+            return m_.op(Op::OpDot, float_, {d, d});
+        };
+        Id e12 = edge(1, 2), e20 = edge(2, 0), e01 = edge(0, 1);
+        auto greater = [&](Id x, Id y) { return m_.op(Op::OpFOrdGreaterThan, bool_, {x, y}); };
+        Id first = select(uint_, m_.op(Op::OpLogicalAnd, bool_, {greater(e12, e20), greater(e12, e01)}), u(0),
+                          select(uint_, greater(e20, e01), u(1), u(2)));
+        auto mod3 = [&](Id x) { return m_.op(Op::OpUMod, uint_, {x, u(3)}); };
+        Id second = mod3(m_.op(Op::OpIAdd, uint_, {first, u(1)}));
+        Id third = mod3(m_.op(Op::OpIAdd, uint_, {first, u(2)}));
+        Id fourth = m_.op(Op::OpIEqual, bool_, {corner, u(3)});
+        Id chosen = mod3(m_.op(Op::OpIAdd, uint_, {first, corner}));
+        auto pick = [&](Id array, uint32_t base) {
+            auto at = [&](Id v) {
+                Id index = base ? m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpIMul, uint_, {v, u(16)}), u(base - 1)}) : v;
+                return load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4, {array, index}));
+            };
+            Id mirrored =
+                exact(Op::OpFAdd, vec4_,
+                      {exact(Op::OpFAdd, vec4_, {exact(Op::OpFNegate, vec4_, {at(first)}), at(second)}), at(third)});
+            return select(vec4_, fourth, mirrored, at(chosen));
+        };
+        store(position, pick(rectangle_positions, 0));
+        for (uint32_t j = 0; j < 16; j++)
+            store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(j))}),
+                  pick(rectangle_interpolators, j + 1));
         store(point_size, f(-1.0f));
+    } else {
+        Id r0 = 0, r1 = 0;
+        if (domain) {
+            // as Xenia's D3D12 translator's StartVertexOrDomainShader: the
+            // barycentric coordinates as zyx in r0.xyz (415607E1, 4D5307F2),
+            // the UV coordinates in r0.xy for control point indexed quads and
+            // r0.yz for patch indexed ones, the indices after them, and 0 as
+            // the coordinates' swizzle for the patch indexed types (r1.y for
+            // triangles, r1.x for quads); w stays 0 (Xenia's Vulkan
+            // translator writes 1 in some of them; its D3D12 one does not)
+            Id tc = load(vec3, tess_coord);
+            Id ptr_input_float = m_.type_pointer(spv::StorageClass::Input, float_);
+            auto cp = [&](uint32_t k) {
+                return load(float_, m_.op(Op::OpAccessChain, ptr_input_float, {control_points, i(int32_t(k))}));
+            };
+            auto t = [&](uint32_t k) { return m_.op(Op::OpCompositeExtract, float_, {tc, k}); };
+            switch (host) {
+            case HostVertex::TriangleDomainCPIndexed:
+                r0 = vec4_of(t(2), t(1), t(0), f(0));
+                r1 = vec4_of(cp(0), cp(1), cp(2), f(0));
+                break;
+            case HostVertex::TriangleDomainPatchIndexed:
+                r0 = vec4_of(t(2), t(1), t(0), f(0));
+                r1 = vec4_of(cp(0), f(0), f(0), f(0));
+                break;
+            case HostVertex::QuadDomainCPIndexed:
+                r0 = vec4_of(t(0), t(1), cp(0), f(0));
+                r1 = vec4_of(cp(1), cp(2), cp(3), f(0));
+                break;
+            default: // QuadDomainPatchIndexed
+                r0 = vec4_of(cp(0), t(0), t(1), f(0));
+                break;
+            }
+        } else {
+            // the vertex index in r0.x (the renderer adds the index offset and
+            // endianness); a point's is above its sprite's corner
+            Id index = load(int_, vertex_index);
+            Id value = points ? m_.op(Op::OpConvertUToF, float_,
+                                      {m_.op(Op::OpShiftRightLogical, uint_, {as_uint(index), u(2)})})
+                              : m_.op(Op::OpConvertSToF, float_, {index});
+            if (export_allowed_) store(export_allowed_, m_.op(Op::OpIEqual, bool_, {corner, u(0)}));
+            r0 = vec4_of(value, f(0), f(0), f(0));
+        }
+        run_guest(r0, r1);
+        Id p = host_position();
+        Id size = guest_point_size();
+        if (points) {
+            // The sprite, as Xenia's vertex shader expansion makes it
+            // (spirv_shader_translator.cc, kPointListAsTriangleStrip) and
+            // point_list.geom: the vertex shader's diameter where it writes
+            // one (not negative), else PA_SU_POINT_SIZE's, in guest pixels to
+            // the radius in clip space, without fused multiply-adds; corner
+            // bit 1 the right side, bit 0 the bottom.
+            Id point = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(6)}));
+            Id own = m_.op(Op::OpFOrdGreaterThanEqual, bool_, {size, f(0)});
+            Id w = comp(p, 3);
+            auto radius = [&](uint32_t c) {
+                Id diameter = select(float_, own, size, comp(point, c));
+                return exact(Op::OpFMul, float_, {exact(Op::OpFMul, float_, {diameter, comp(point, c + 2)}), w});
+            };
+            auto side = [&](uint32_t bit) {
+                return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {corner, u(bit)}), u(0)});
+            };
+            Id rx = radius(0), ry = radius(1);
+            Id x = exact(Op::OpFAdd, float_,
+                         {comp(p, 0), select(float_, side(2), rx, exact(Op::OpFNegate, float_, {rx}))});
+            Id y = exact(Op::OpFAdd, float_,
+                         {comp(p, 1), select(float_, side(1), ry, exact(Op::OpFNegate, float_, {ry}))});
+            p = vec4_of(x, y, comp(p, 2), w);
+        }
+        store(position, p);
+        put_interpolators();
+        store(point_size, size);
     }
     if (host_point_size) store(host_point_size, f(1.0f));
     m_.op_void(Op::OpReturn);
     m_.end_function();
-    m_.entry_point(spv::ExecutionModel::Vertex, main, "main", interface_);
+    if (domain) {
+        m_.entry_point(spv::ExecutionModel::TessellationEvaluation, main, "main", interface_);
+        bool quads = host == HostVertex::QuadDomainCPIndexed || host == HostVertex::QuadDomainPatchIndexed;
+        m_.execution_mode(main, quads ? spv::ExecutionMode::Quads : spv::ExecutionMode::Triangles);
+        // Xenia's hull shaders' partitioning: integer for discrete, fractional
+        // even otherwise; their triangle_cw winding (Xenia's Vulkan
+        // translator: VertexOrderCw keeps the faces Direct3D 12's have)
+        m_.execution_mode(main, vertex_.equal_spacing ? spv::ExecutionMode::SpacingEqual
+                                                      : spv::ExecutionMode::SpacingFractionalEven);
+        m_.execution_mode(main, spv::ExecutionMode::VertexOrderCw);
+    } else {
+        m_.entry_point(spv::ExecutionModel::Vertex, main, "main", interface_);
+    }
 }
 
 void Translator::main_pixel() {
@@ -2168,10 +2368,10 @@ Translation Translator::run() {
 
 } // namespace
 
-Translation translate(const ParsedShader &shader, Stage stage) {
+Translation translate(const ParsedShader &shader, Stage stage, const VertexOptions &vertex) {
     if (stage == Stage::Vertex && shader.type != ShaderType::Vertex) return {{}, {"a pixel shader as a vertex shader"}};
     if (stage == Stage::Pixel && shader.type != ShaderType::Pixel) return {{}, {"a vertex shader as a pixel shader"}};
-    return Translator(shader, stage).run();
+    return Translator(shader, stage, stage == Stage::Vertex ? vertex : VertexOptions{}).run();
 }
 
 } // namespace xf::shader
