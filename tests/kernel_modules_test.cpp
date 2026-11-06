@@ -292,6 +292,9 @@ void strings(KernelHarness &h) {
     CHECK(h.krnl("RtlCompareMemoryUlong", {m, 16, 0x11223344}) == 12);
     CHECK(h.krnl("RtlCompareMemoryUlong", {m, 7, 0x11223344}) == 4);
     CHECK(h.krnl("RtlCompareMemory", {m, m + 8, 8}) == 4);
+    // the common prefix, not the count of bytes that match
+    k.host(m)[2] = 0;
+    CHECK(h.krnl("RtlCompareMemory", {m, m + 4, 8}) == 2);
 }
 
 void time(KernelHarness &h) {

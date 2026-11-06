@@ -142,7 +142,7 @@ class Encoder {
   public:
     Encoder(uint32_t window, bool e8 = false, uint32_t e8_size = 0) {
         uint32_t b = 0;
-        for (int s = 0; s < 64; s++) {
+        for (int s = 0; s < 300; s++) {
             footer_[s] = s < 4 ? 0 : std::min((s - 2) / 2, 17);
             base_[s] = b;
             b += 1u << footer_[s];
@@ -320,8 +320,8 @@ class Encoder {
     }
 
     BitWriter w_;
-    uint32_t base_[64];
-    int footer_[64];
+    uint32_t base_[300];
+    int footer_[300];
     int slots_ = 0;
     std::vector<uint8_t> main_prev_, length_prev_;
 };
@@ -593,7 +593,43 @@ void refuses_bad_streams() {
     const std::vector<uint8_t> abc = {0x00, 0x30, 0x30, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
                                       0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x61, 0x62, 0x63, 0x00};
     out.resize(3);
-    for (uint32_t window : {0x18000u, 0x4000u, 1u << 22}) CHECK(!lzx_decompress(abc, out, window, error));
+    for (uint32_t window : {0x18000u, 0x4000u, 1u << 26}) CHECK(!lzx_decompress(abc, out, window, error));
+}
+
+// Reference data (LZX DELTA's): the target packed with the reference as the
+// history its matches may reach into. The reference is a multiple of a chunk
+// long, so that the chunks of the output line up with the match finder's.
+void decodes_with_reference(uint32_t window, uint64_t seed) {
+    auto base = make_data(3 * CHUNK, seed);
+    auto edited = make_data(40000, seed + 100);
+    std::vector<uint8_t> target(base.begin() + 1000, base.begin() + 1000 + 50000);
+    std::copy(edited.begin(), edited.begin() + 3000, target.begin() + 7000);
+    std::copy(edited.begin(), edited.begin() + 500, target.begin() + 33000);
+    std::vector<uint8_t> all = base;
+    all.insert(all.end(), target.begin(), target.end());
+
+    Encoder encoder(window, false, 0);
+    MatchFinder finder(all);
+    size_t at = base.size();
+    const int types[2] = {VERBATIM, ALIGNED};
+    for (int i = 0; at < all.size(); i++) {
+        size_t end = i == 1 ? all.size() : at + 21000;
+        uint32_t r[3] = {encoder.r[0], encoder.r[1], encoder.r[2]};
+        encoder.compressed(types[i], finder.find(at, end, r, window));
+        at = end;
+    }
+    auto stream = encoder.finish();
+
+    std::vector<uint8_t> out(target.size(), 0xCC);
+    std::string error;
+    CHECK(lzx_decompress_delta(stream, base, out, window, error));
+    CHECK(out == target);
+    // without its reference the stream reaches before its start
+    CHECK(!lzx_decompress(stream, out, window, error));
+    // a shorter reference (zeros before it) does not give the target back
+    std::vector<uint8_t> small(base.end() - 1000, base.end());
+    bool decoded = lzx_decompress_delta(stream, small, out, window, error);
+    CHECK(!decoded || out != target);
 }
 
 } // namespace
@@ -603,6 +639,9 @@ int main() {
     round_trips(1 << 19, 450000, 1, true); // 38 position slots: 17-bit footers
     round_trips(1 << 15, 200000, 2, false);
     round_trips(1 << 21, 300000, 3, false); // 50 slots, the largest main tree
+    round_trips(1u << 25, 300000, 4, false); // 290 slots: the largest window LZX DELTA has
+    decodes_with_reference(1 << 17, 5);
+    decodes_with_reference(1 << 16, 6);
     pads_a_whole_word();
     undoes_e8_translation();
     refuses_bad_streams();

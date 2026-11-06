@@ -6,6 +6,7 @@
 #include "xenoforge/bytes.h"
 
 #include <cstring>
+#include <vector>
 
 namespace xf {
 namespace {
@@ -59,6 +60,23 @@ void sha1(std::span<const uint8_t> data, uint8_t digest[20]) {
     put_be32(tail + 64 * blocks - 4, uint32_t(bits));
     for (size_t i = 0; i < blocks; i++) sha1_block(h, tail + 64 * i);
     for (int i = 0; i < 5; i++) put_be32(digest + 4 * i, h[i]);
+}
+
+void hmac_sha1(std::span<const uint8_t> key, std::span<const uint8_t> data, uint8_t digest[20]) {
+    uint8_t block[64] = {};
+    if (key.size() > 64)
+        sha1(key, block);
+    else if (!key.empty())
+        std::memcpy(block, key.data(), key.size());
+    std::vector<uint8_t> inner(64 + data.size());
+    for (int i = 0; i < 64; i++) inner[i] = block[i] ^ 0x36;
+    if (!data.empty()) std::memcpy(inner.data() + 64, data.data(), data.size());
+    uint8_t inner_digest[20];
+    sha1(inner, inner_digest);
+    uint8_t outer[64 + 20];
+    for (int i = 0; i < 64; i++) outer[i] = block[i] ^ 0x5C;
+    std::memcpy(outer + 64, inner_digest, 20);
+    sha1(outer, digest);
 }
 
 } // namespace xf

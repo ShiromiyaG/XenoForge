@@ -40,11 +40,11 @@ constexpr uint32_t X_STATUS_INVALID_PARAMETER_2 = 0xC00000F0;
 // ---- memory and strings (xboxkrnl_rtl.cc) ----
 
 XF_EXPORT(xboxkrnl, RtlCompareMemory) {
-    // (source1, source2, length): how many bytes match
+    // (source1, source2, length): the length of the common prefix (the NT
+    // kernel's answer; Xenia counts every byte that matches)
     uint32_t a = arg(k, c, 0), b = arg(k, c, 1), length = arg(k, c, 2);
     uint32_t count = 0;
-    for (uint32_t n = 0; n < length; n++)
-        if (k.host(a)[n] == k.host(b)[n]) count++;
+    while (count < length && k.host(a)[count] == k.host(b)[count]) count++;
     result(c, count);
 }
 

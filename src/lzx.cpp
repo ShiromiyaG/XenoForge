@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace xf {
 namespace {
@@ -30,7 +31,7 @@ constexpr int NUM_CHARS = 256;
 constexpr int PRETREE_SIZE = 20;
 constexpr int LENGTH_SIZE = 249; // length footers 0..248: matches of 9 to 257 bytes
 constexpr int ALIGNED_SIZE = 8;
-constexpr int MAX_SLOTS = 50; // a 2 MB window
+constexpr int MAX_SLOTS = 290; // a 32 MB window (LZX DELTA's largest; a cabinet's is 2 MB, 50)
 constexpr int MAIN_MAX = NUM_CHARS + 8 * MAX_SLOTS;
 // A run of path lengths (17, 18 or 19) may go up to 50 past the tree it
 // codes: what it writes there stays, as the decoder Xenia uses keeps it.
@@ -204,9 +205,15 @@ void undo_e8(uint8_t *chunk, uint32_t size, uint32_t chunk_offset, int32_t file_
 
 } // namespace
 
-bool lzx_decompress(std::span<const uint8_t> in, std::span<uint8_t> out, uint32_t window_size, std::string &error) {
-    if (window_size < (1u << 15) || window_size > (1u << 21) || (window_size & (window_size - 1))) {
-        error = "the LZX window is not a power of two from 32 KB to 2 MB";
+namespace {
+
+// The decoder over a flat buffer: out is the first output byte and `prefix`
+// bytes before it are readable (reference data, or zeros), so a match may
+// reach back into them.
+bool decode(std::span<const uint8_t> in, uint8_t *out, size_t size, size_t prefix, uint32_t window_size,
+            std::string &error) {
+    if (window_size < (1u << 15) || window_size > (1u << 25) || (window_size & (window_size - 1))) {
+        error = "the LZX window is not a power of two from 32 KB to 32 MB";
         return false;
     }
     int slots = 0;
@@ -230,7 +237,6 @@ bool lzx_decompress(std::span<const uint8_t> in, std::span<uint8_t> out, uint32_
     int block_type = 0;
     uint32_t block_size = 0, block_left = 0;
     size_t raw = 0; // in an uncompressed block: where its next byte is
-    const size_t size = out.size();
     for (size_t pos = 0; pos < size;) {
         const size_t chunk_end = std::min(size, pos + CHUNK);
         while (pos < chunk_end) {
@@ -282,7 +288,7 @@ bool lzx_decompress(std::span<const uint8_t> in, std::span<uint8_t> out, uint32_
                     error = "an LZX uncompressed block runs past the stream";
                     return false;
                 }
-                std::memcpy(out.data() + pos, in.data() + raw, n);
+                std::memcpy(out + pos, in.data() + raw, n);
                 raw += n;
                 pos += n;
                 block_left -= uint32_t(n);
@@ -340,11 +346,11 @@ bool lzx_decompress(std::span<const uint8_t> in, std::span<uint8_t> out, uint32_
                     error = "an LZX match runs past its block or chunk";
                     return false;
                 }
-                if (offset == 0 || offset > pos || offset > window_size) {
+                if (offset == 0 || offset > pos + prefix || offset > window_size) {
                     error = "an LZX match copies from before the stream or the window";
                     return false;
                 }
-                uint8_t *to = out.data() + pos;
+                uint8_t *to = out + pos;
                 const uint8_t *from = to - offset;
                 for (uint32_t i = 0; i < length; i++) to[i] = from[i]; // may overlap
                 pos += length;
@@ -361,7 +367,26 @@ bool lzx_decompress(std::span<const uint8_t> in, std::span<uint8_t> out, uint32_
 
     if (e8)
         for (size_t at = 0; at < size; at += CHUNK)
-            undo_e8(out.data() + at, uint32_t(std::min<size_t>(CHUNK, size - at)), uint32_t(at), e8_size);
+            undo_e8(out + at, uint32_t(std::min<size_t>(CHUNK, size - at)), uint32_t(at), e8_size);
+    return true;
+}
+
+} // namespace
+
+bool lzx_decompress(std::span<const uint8_t> in, std::span<uint8_t> out, uint32_t window_size, std::string &error) {
+    return decode(in, out.data(), out.size(), 0, window_size, error);
+}
+
+bool lzx_decompress_delta(std::span<const uint8_t> in, std::span<const uint8_t> reference, std::span<uint8_t> out,
+                          uint32_t window_size, std::string &error) {
+    // The window holds the reference at its end (zeros before it, if it is
+    // shorter than the window) and the output follows: what a decoder with
+    // reference data sees, as one flat buffer.
+    const size_t kept = std::min<size_t>(reference.size(), window_size);
+    std::vector<uint8_t> flat(size_t(window_size) + out.size());
+    if (kept) std::memcpy(flat.data() + window_size - kept, reference.data() + reference.size() - kept, kept);
+    if (!decode(in, flat.data() + window_size, out.size(), window_size, window_size, error)) return false;
+    std::memcpy(out.data(), flat.data() + window_size, out.size());
     return true;
 }
 

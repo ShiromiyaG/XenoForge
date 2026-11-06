@@ -14,4 +14,8 @@ void sha1(std::span<const uint8_t> data, uint8_t digest[20]);
 // words, the partial block and the count themselves).
 void sha1_block(uint32_t h[5], const uint8_t block[64]);
 
+// HMAC-SHA-1 (RFC 2104) of data under key; a key past the 64-byte block is
+// hashed first, as the RFC says (the kernel's XeCryptHmacSha cuts it instead).
+void hmac_sha1(std::span<const uint8_t> key, std::span<const uint8_t> data, uint8_t digest[20]);
+
 } // namespace xf
