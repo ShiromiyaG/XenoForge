@@ -28,8 +28,13 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
 - The renderer is general. It implements the hardware, never a game's special case. What a draw needs
   and the renderer does not do is counted by reason in the report and the draw is skipped, never
   guessed at. Game-specific behavior belongs in a game's port, not here.
-- Xenia is the oracle. When something graphical differs, find what Xenia does (src/xenia/gpu: vulkan/,
-  draw_util, render_target_cache, texture_cache, shaders/*.xesli, command_processor) and match it.
+- Xenia is the oracle. When something graphical differs, find what Xenia does and match it. Read its
+  **D3D12 backend first**: it is the more mature one, with the ROV path for exact EDRAM and real
+  occlusion queries. That means src/xenia/gpu/d3d12/ and dxbc_shader_translator*, plus the shared code
+  (draw_util, render_target_cache, texture_cache, primitive_processor, shared_memory, shaders/*.xesli,
+  command_processor). vulkan/ comes second; where they differ, D3D12 wins. The picture to match is the
+  D3D12 trace dump once it is built (docs/plan.md, "References for the GPU"), and the Vulkan dump until
+  then.
   Code translated from Xenia starts with Xenia's BSD notice and is checked against its source in the
   same session. hedge-dev's MIT XenosRecomp (F:\RECOMPs\XenosRecomp) may be used with its notice.
 - Where Xenia has no answer (a feature it lacks or approximates), the next references, in order

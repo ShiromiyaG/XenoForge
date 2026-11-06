@@ -139,6 +139,23 @@ In this order, each where the ones before it have no answer:
 - **Xenia** first: its translator, render targets, texture formats and
   tiling, and its trace dump as the picture to match. The trace writer
   (2026-11-05) gives that picture for any scene a run reaches.
+  - **Its D3D12 backend before its Vulkan one.** It is the more mature, the
+    owner found, and Xenia's code agrees:
+    - only D3D12 has the ROV path, which emulates EDRAM exactly in the pixel
+      shader (blending and the float formats bit for bit);
+    - only D3D12 has real occlusion query counters (the hybrid ZPD mode,
+      `d3d12_query_pool`).
+
+    So the reference is `d3d12/` (`d3d12_render_target_cache`,
+    `d3d12_texture_cache`, `d3d12_command_processor`) and
+    `dxbc_shader_translator*` for each instruction's meaning, along with
+    the code both backends share (`draw_util`, `render_target_cache`,
+    `texture_cache`, `primitive_processor`, `shared_memory`, the shaders in
+    `shaders/`). Translated to Vulkan and SPIR-V by us. Where D3D12 and
+    Vulkan differ, D3D12 wins.
+  - **The picture to match:** Xenia's D3D12 trace dump
+    (`xenia-gpu-d3d12-trace-dump`; its source is there, not built yet).
+    The Vulkan dump used so far stays as a second picture.
 - **AMD's public documentation of the same hardware family.** Xenos is an
   ATI design of the R400/R500 generation, close to the R600. The sources:
   - the "R6xx/R7xx 3D Register Reference Guide", the R600 ISA, and the
