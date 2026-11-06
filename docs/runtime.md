@@ -768,6 +768,9 @@ xfxam <xam.xex> call <Export> [arg..]  one export, ours and the console's, compa
 xfxam <xam.xex> survey [--out <file>]  every export both have, sorted
   --seconds N (a call's limit), --init-seconds N, --no-init (the export without XAM's start),
   --system (the call on a system thread), --trace (every kernel call printed), --work <dir>
+  --no-title (no title running, as before the third survey), --user (ours keeps its signed-in user),
+  --prepare <addr[:arg]>,... (functions of the console's XAM called after its start), --launch (XAM's own
+  launch of the title, below), --only <A,B | @file>, imports --all (every function it imports)
 ```
 
 **Loading.** `load_module` (kernel.h) loads it as XexLoadImage loads a
@@ -806,7 +809,9 @@ HalGetPowerUpCause, XexShimLock,
 HalGetNotedArgonErrors. DrvGetContentStorageNotification is answered
 (system.cpp): XAM takes the notifications until an error, and the 0 of an
 unimplemented import made it read an empty one and fault. What its start
-does not have, and so its exports do not either:
+does not have, and so its exports do not either (the first four were all
+that the oracle had until the third survey; "A title running" below says
+what is now made):
 - no title launched through it: the heap XAM makes for a title is absent,
   so the calls that allocate on a title's thread fail (E_OUTOFMEMORY,
   ERROR_NO_SYSTEM_RESOURCES; XamAlloc works on a system thread);
@@ -814,6 +819,52 @@ does not have, and so its exports do not either:
 - no `\Device\Harddisk0\Partition1` (the storage root is Xenia's layout,
   not a partition device), so no content device;
 - no input driver (the XInputd* family), no network adapter.
+
+**A title running** (third survey). `xfxam` now gives each side a title, the
+way the dashboard's launch leaves one, from a synthetic XEX of its own
+(`make_title_xex`: unencrypted, one page at 0x82000000, an entry that
+returns, a made-up title ID 0x58450001; no game's data):
+- `\Device\Harddisk0\Partition1` is a writable directory of the host (the
+  call's work directory, `<export>.real.hdd`) holding `default.xex`, mounted
+  before XAM's start, so its look for a security expansion there finds the
+  device and answers not found, as a console without one does;
+- our kernel holds the title as boot does (`Kernel::load` and `launch`; ours
+  mounts the same directory as the title's and keeps its storage root
+  apart), on the console's side too: XAM reads who is running from the
+  kernel's executable module (RtlImageXexHeaderField on it, which is what
+  XamGetExecutionId calls), so the two sides agree on the title;
+- the state XAM keeps of a running title is made by two of its own functions,
+  which `--prepare` calls after its start on a system thread, found by
+  reading 2.0.16202's code (`builds` in xfxam.cpp, selected by the entry
+  point; a build it does not know gets none): 0x816E5118 makes the title's
+  heap (heap 0 of XAM's table of nine; a call on a title's thread picks it
+  by its class, 0x19... from KeGetCurrentProcessType), and 0x816DF2F8 stores
+  the current title ID (XamGetCurrentTitleId, XNetLogonGetTitleID's source);
+- ours is signed out (`set_signed_in`): a profile is a package on a content
+  device the oracle has not been given, so the console's XAM has no user, and
+  the user calls are compared as they answer with none (`--user` keeps
+  Xenia's).
+
+**Why not the console's own launch.** `--launch` calls XamLoaderLaunchTitleEx
+from a system thread, which is the console's path (XamLoaderLaunchTitle adds
+flag 4, which turns a path that starts with a backslash into the dashboard).
+It posts a request to XAM's loader thread, which asks a worker to dismount the
+drives, loads the executable (the kernel's XexLoadExecutable, which here takes
+the console's argument order: name, handle pointer, flags, version; Xenia's
+alias of XexLoadImage wrote through the version), checks its privilege,
+creates a thread of its own and waits for it. What it loaded, whatever path
+was given (also through XamLoaderLaunchTitleEx with flags 0, and from a title's
+thread, which never returned), was `\SystemRoot\dash.xex`: why was not found
+(the request's type is made from the path and the caller's process type,
+and the launch state machine's later states were not read). It gets that far
+when that file is the synthetic title (its absence is a fatal error screen,
+VdDisplayFatalError 0x12247), and then stops in a loop
+of the worker's: IoDismountVolumeByName and ObReferenceObjectByName on
+`\Device\HdDvdRom`, which the kernel here has no device object for (it is
+answered 0xC0000034, and the loop wants 0xC000000E or an object). That is the
+kernel's device model (objects for devices, a process per title), not XAM's,
+and is left; XexStartExecutable (a thread of the title process at the
+module's entry) is in place for the day it gets there.
 
 **A call.** Each side runs in a process of its own (`xfxam ... side hle|real`,
 which `call` and `survey` start), on a fresh kernel, so a fault or a hang
@@ -974,6 +1025,78 @@ oracle's start, cannot say more):
   (they match, all of them); XamGetLanguageTypefacePatch (the console's
   start has loaded no font path: 0); XGetGameRegion (a title's); XamSwapDisc
   (ours asks for the disc as the title's would be asked).
+
+**The third survey** (2026-11-06; a title running, Partition1 a directory,
+no user: "A title running" above). Of the 383, against the second survey run
+again on the same build (218 match, 112 differ, 39 need state, 14 fault): 234
+match, 127 differ, 5 need state, 17 fault (13 the console's, 3 both, 1 ours).
+Of the 39 that needed state: 14 match, 17 differ, 3 still need it and 5
+fault (the console's side). Ten match with the user calls compared as they
+answer with none (XamContentCreateEnumerator, XamShowForcedNameChangeUI,
+XamShowMarketplaceUI(Ex), XamUserAreUsersFriends, XamUserCheckPrivilege,
+XamUserGetGamerTag, GetName, GetSubscriptionType and GetUserTenure all
+ERROR_NO_SUCH_USER on both sides) and four after the fixes below
+(XamUserContentRestrictionGetFlags, GetSigninInfo,
+IsUnsafeProgrammingAllowed, NuiEnableBiometric); XamAlloc(Ex) and the handle makers
+(XamSessionCreateHandle, XamCreateEnumeratorHandle) now answer, and differ
+only in addresses and handle values (the console allocates from the title heap
+at 0x106A0, ours from the kernel's pool); the UI calls answer
+ERROR_FUNCTION_FAILED (0x65B) where ours answers headless; five still wait
+(XamLoaderLaunchTitle and TerminateTitle, which load the dashboard, and the
+three XamShow*UI that wait for a dialog's thread). The survey also has
+`variants` now (14 cases, tallied apart: 2 match, 9 differ, 3 fault): the
+exports whose generic arguments are turned away before the state is looked at
+(a user count of 0, a zero XUID, a zero content structure) run again with the
+arguments a title passes (`variants` in xfxam.cpp). Each fix is commented
+beside its code with the console's answer and Xenia's:
+- XamUserIsUnsafeProgrammingAllowed with no user signed in: "allowed" is
+  written, then ERROR_NO_SUCH_USER (ours allowed it);
+- XamUserContentRestrictionGetFlags with no user: the console's parental
+  control setting (XConfig 3/0x0F, here 3) is written to the flags, then
+  ERROR_NO_SUCH_USER (ours wrote nothing); with a user the console's answer
+  is not known and Xenia's 0 stays;
+- XamUserGetSigninInfo: the sponsor's user index (+0x14) is written 0xFE
+  (none) before the user is looked for (ours left 0);
+- XamUserNuiEnableBiometric with no user: ERROR_NO_SUCH_USER as an HRESULT
+  (ours E_INVALIDARG; with a user Xenia's stays);
+- in the kernel (not XAM's, but the oracle's own launch needs them):
+  XexLoadExecutable takes the console's order (name, handle pointer, flags,
+  version: its XAM's launcher calls it so), and XexStartExecutable starts a
+  loaded module as a title. Xenia's alias of XexLoadImage made the console's
+  call write through the version.
+What the oracle's compare now sets aside as noise: a pointer into the heaps
+(0x30000000-0x4FFFFFFF) in the arguments' memory or the result, a thread's
+ID, and our stopping when the title ends (the run is over, the console's
+thread did not return either).
+
+Left, and why:
+- **ObInsertObject is not implemented here** (xboxkrnl; the kernel oracle's
+  list). XAM makes each of its enumerators, sessions and voice objects with
+  ObCreateObject and ObInsertObject, and gets no handle: its
+  ObReferenceObjectByHandle then answers STATUS_INVALID_HANDLE, which is
+  where some of the 0x65B answers (XamUserCreateAchievementEnumerator and
+  TitlesPlayed) and the 13 faults of the console's side come from (the
+  enumerator calls, XamProfileFindAccount: its error paths read through a
+  null). The differences on these are not the HLE's yet.
+- **A profile and a signed-in user.** A profile is an STFS package on a
+  content device (Content\<xuid>\FFFE07D1\00010000\<xuid>); XAM learns of
+  the device from DrvGetContentStorageNotification, whose structure is not
+  known, and XamProfileCreate needs it. XamUserLogon with a made-up XUID
+  faults on the console's side. Until that is built the user calls are
+  compared with none, and the content calls (XamContentGetDeviceData and
+  State answer 0x57 for device 1 on the console, a device ours has; Create
+  answers 0x57 before it looks for a user, ours 0x525) are the oracle's
+  lack of a device, not ours.
+- **The console's own launch** (above): the kernel's device model.
+- The UI calls (0x65B against our headless answers), XamVoiceCreate (the
+  console makes a voice object with no microphone, ours is Xenia's stub,
+  ERROR_ACCESS_DENIED), XNetGetTitleXnAddr's MAC (XAM's own, different on
+  each run), XNetLogonGetTitleID (the console's XAM answers 0 with the title
+  running; ours the title's: the reason was not read): left as Xenia's
+  design, noise or open.
+- XamTaskSchedule and CreateThread with the generic arguments run garbage as
+  a callback on our side; whether the interpreter stops before the call
+  returns varies (one "faults (ours)" in the last run was CreateThread).
 
 ## `boot`
 

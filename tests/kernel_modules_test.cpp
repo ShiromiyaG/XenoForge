@@ -963,7 +963,7 @@ void launcher_chain(KernelHarness &h, uint32_t log) {
 // XexLoadImageFromMemory: a DLL's file in guest memory, its module named by
 // the name's base; loaded once (a second load by the same base name counts
 // the same module, a load by a name that finds the module already is a
-// collision); XexLoadExecutable: XexLoadImage
+// collision); XexLoadExecutable: XexLoadImage in the console's argument order (name, handle pointer, flags, version)
 void from_memory(KernelHarness &h, uint32_t log) {
     kernel::Kernel &k = *h.k;
     constexpr uint32_t MEM = 0x8C000000, MEM_ID = 0x33;
@@ -1001,10 +1001,10 @@ void from_memory(KernelHarness &h, uint32_t log) {
     CHECK(h.krnl("XexGetModuleHandle", {h.string("app.dll"), out}) == 0);
     uint32_t app = k.load32(out);
     uint16_t count = k.load16(app + 0x40);
-    CHECK(h.krnl("XexLoadExecutable", {h.string("game:\\app.dll"), 9, 0, out}) == 0 && k.load32(out) == app);
+    CHECK(h.krnl("XexLoadExecutable", {h.string("game:\\app.dll"), out, 9, 0}) == 0 && k.load32(out) == app);
     CHECK(count == 1 && k.load16(app + 0x40) == 2);
     CHECK(h.krnl("XexUnloadImage", {app}) == 0 && k.load16(app + 0x40) == 1);
-    CHECK(h.krnl("XexLoadExecutable", {h.string("game:\\missing.dll"), 9, 0, out}) == 0xC000000F);
+    CHECK(h.krnl("XexLoadExecutable", {h.string("game:\\missing.dll"), out, 9, 0}) == 0xC000000F);
 }
 
 // ---- the loader lock: gate.dll, its DllMain host code ----
@@ -1155,8 +1155,8 @@ void longjmp_across_generated(KernelHarness &h) {
     // again, to G2, which returns from the call
     jump3 = h.alloc(0x10);
     put_code_at(k, S2,
-                {lis(31, uint16_t(buf2 >> 16)), ori(31, 31, uint16_t(buf2)), MFLR_R0, stw(0, 8, 31), mr(3, 31), li(4, 0),
-                 bl(S2 + 0x18, LONGJMP), li(3, 1), BLR});
+                {lis(31, uint16_t(buf2 >> 16)), ori(31, 31, uint16_t(buf2)), MFLR_R0, stw(0, 8, 31), mr(3, 31),
+                 li(4, 0), bl(S2 + 0x18, LONGJMP), li(3, 1), BLR});
     put_code_at(k, G, {bl(G, X2), li(3, 1), BLR});
     put_code_at(k, G2, {lwz(0, 8, 31), MTLR_R0, li(3, 9), BLR});
     k.store32(buf2, uint32_t(sp) + 0x1000);
@@ -1228,12 +1228,8 @@ void longjmp_into_generated(KernelHarness &h) {
 }
 
 const kernel::Generated generated[] = {
-    {F_LOADER, loader_thread},
-    {X, x_function},
-    {X2, x2_function},
-    {XR, xr_function},
-    {XLJ, xlj_function},
-    {GATE + ENTRY, gate_main},
+    {F_LOADER, loader_thread}, {X, x_function},     {X2, x2_function},
+    {XR, xr_function},         {XLJ, xlj_function}, {GATE + ENTRY, gate_main},
 };
 const uint32_t resumes[] = {XR_RET};
 

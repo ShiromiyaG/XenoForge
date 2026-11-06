@@ -269,8 +269,10 @@ XF_EXPORT(xam, XamUserNuiGetUserIndexForSignin) {
 
 // (user_index_ptr)
 XF_EXPORT(xam, XamUserNuiGetUserIndexForBind) { result(c, arg(k, c, 0) ? X_E_FAIL : X_E_INVALIDARG); }
-// (user_index, enable)
-XF_EXPORT(xam, XamUserNuiEnableBiometric) { result(c, X_E_INVALIDARG); }
+// (user_index, enable): no user signed in at the index is the console's
+// ERROR_NO_SUCH_USER as an HRESULT (its XAM, run with none); with one, Xenia's
+// stub, E_INVALIDARG (no sensor to enable it on)
+XF_EXPORT(xam, XamUserNuiEnableBiometric) { result(c, user_at(k, arg(k, c, 0)) ? X_E_INVALIDARG : X_E_NO_SUCH_USER); }
 
 // (X_NUI_DEPTH_CALIBRATION *): cleared; no calibration
 XF_EXPORT(xam, XamNuiGetDepthCalibration) {

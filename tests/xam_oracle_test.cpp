@@ -9,6 +9,7 @@
 
 #include "check.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -68,7 +69,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_xfxam = argv[1], g_xex = xex;
-    g_work = std::filesystem::temp_directory_path() / "xam_oracle_test";
+    // (a directory of its own: copies of the test may run at the same time)
+    g_work = std::filesystem::temp_directory_path() /
+             ("xam_oracle_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::error_code ec;
     std::filesystem::create_directories(g_work, ec);
     int code = 0;
@@ -89,6 +92,23 @@ int main(int argc, char **argv) {
     CHECK(code == 0);
     CHECK(has(language, "verdict: matches"));
 
+    // a title running (the oracle's synthetic one, built by xfxam: no game's
+    // data): the kernel holds it on both sides, the hard drive's Partition1 is
+    // a directory of the host, and the console's XAM has the heap it makes for
+    // a title, so a call that allocates on a title's thread works there; with
+    // no title (--no-title) it has none, and answers out of memory
+    std::string started = xfxam("init", code);
+    CHECK(has(started, "the kernel's title: started"));
+    CHECK(has(started, "prepared: 0x816E5118 -> 0x00000000"));
+    std::string heap = xfxam("call XamAlloc 0 0x100 buf:16", code);
+    CHECK(has(heap, "real: returned, r3 0x00000000"));
+    CHECK(has(heap, "ours: returned, r3 0x00000000"));
+    std::string no_heap = xfxam("call XamAlloc 0 0x100 buf:16 --no-title", code);
+    CHECK(has(no_heap, "real: returned, r3 0x8007000E"));
+    CHECK(has(no_heap, "verdict: needs state"));
+    std::string title_id = xfxam("call XamGetCurrentTitleId", code);
+    CHECK(has(title_id, "ours: returned, r3 0x58450001")); // the synthetic title's ID, in the kernel
+
     // the console's own answer, whatever ours says: the system version XAM
     // reports
     std::string version = xfxam("call XamGetSystemVersion", code);
@@ -97,10 +117,14 @@ int main(int argc, char **argv) {
 
     // what the survey found and the HLE took from the console's XAM: these
     // answer alike now (each was a difference)
-    for (const char *call : {"XamUpdateGetCurrentSystemVersion", "XamIsXbox1TitleId 0", "XamGetLocaleDateFormat 7",
-                             "XamNotifyCreateListener 0 0", "NetDll_WSAStartup 0 0x0202 buf:512",
-                             "XamShowMessageBoxUI 0 wstr:T wstr:X 1 buf:16 0 0 buf:16 0",
-                             "XamInputGetCapabilities 0 0 buf:32", "XamVoiceGetMicArrayStatus"}) {
+    for (const char *call :
+         {"XamUpdateGetCurrentSystemVersion", "XamIsXbox1TitleId 0", "XamGetLocaleDateFormat 7",
+          "XamNotifyCreateListener 0 0", "NetDll_WSAStartup 0 0x0202 buf:512",
+          "XamShowMessageBoxUI 0 wstr:T wstr:X 1 buf:16 0 0 buf:16 0", "XamInputGetCapabilities 0 0 buf:32",
+          "XamVoiceGetMicArrayStatus",
+          // with a title and no user (the third survey)
+          "XamGetCurrentTitleId", "XamUserGetSigninInfo 0 0 buf:48", "XamUserIsUnsafeProgrammingAllowed 0 0 buf:16",
+          "XamUserContentRestrictionGetFlags 0 buf:16", "XamUserNuiEnableBiometric 0 0"}) {
         std::string answer = xfxam(std::string("call ") + call, code);
         CHECK(has(answer, "verdict: matches"));
     }
@@ -109,7 +133,7 @@ int main(int argc, char **argv) {
     // differ (each side's own random numbers), and the answer says where
     std::string random = xfxam("call NetDll_XNetRandom 0 buf:0x100 0x100", code);
     CHECK(has(random, "real: returned, r3 0x00000000"));
-    CHECK(has(random, "arg 1 +0x0"));
+    CHECK(has(random, "arg 1 +0x")); // (where the difference starts is the numbers' chance)
 
     // a fault ends only its side's process: a buffer at a page nothing maps
     // (neither XAM checks the pointer), and the comparison still made

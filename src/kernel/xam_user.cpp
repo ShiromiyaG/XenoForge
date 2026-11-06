@@ -187,6 +187,9 @@ XF_EXPORT(xam, XamUserGetSigninInfo) {
     uint32_t index = arg(k, c, 0), flags = arg(k, c, 1), info = arg(k, c, 2);
     if (!info) return result(c, X_E_INVALIDARG);
     std::memset(k.host(info), 0, 40);
+    // the sponsor of a guest: none (the console's XAM sets it before it looks
+    // for the user; Xenia leaves it 0)
+    k.store32(info + 0x14, USER_INDEX_NONE);
     if (index >= 4) return result(c, X_E_INVALIDARG);
     const User *u = user_at(k, index);
     if (!u) return result(c, X_E_NO_SUCH_USER);
@@ -538,19 +541,32 @@ XF_EXPORT(xam, XamUserGetUserTenure) {
 
 // ---- restrictions ----
 
-// (user_index, pc_check, result_ptr): allowed
+// (user_index, pc_check, result_ptr): allowed. A user that is not signed in
+// is ERROR_NO_SUCH_USER, with "allowed" already written: the console's XAM
+// (run with no user, docs/runtime.md, "The third survey") answers so where
+// Xenia's stub allowed it; the console wins.
 XF_EXPORT(xam, XamUserIsUnsafeProgrammingAllowed) {
     uint32_t index = arg(k, c, 0), result_ptr = arg(k, c, 2);
     if (!result_ptr || (index != USER_INDEX_ANY && index >= 4)) return result(c, X_ERROR_INVALID_PARAMETER);
     k.store32(result_ptr, 1);
+    if (!signed_in_user(k, index)) return result(c, X_ERROR_NO_SUCH_USER);
     result(c, X_ERROR_SUCCESS);
 }
 
-// (user_index, out_flags): none
+// (user_index, out_flags): none. With no user signed in the console's XAM
+// (run with none) writes the console's parental control setting (XConfig's
+// user category, 0x0F: Live, membership creation) to the flags before it
+// answers ERROR_NO_SUCH_USER; Xenia's stub wrote nothing.
 XF_EXPORT(xam, XamUserContentRestrictionGetFlags) {
     uint32_t index = arg(k, c, 0), flags_ptr = arg(k, c, 1);
     if (index >= 4 && index != USER_INDEX_ANY) return result(c, X_ERROR_INVALID_PARAMETER);
-    if (!signed_in_user(k, index)) return result(c, X_ERROR_NO_SUCH_USER);
+    if (!signed_in_user(k, index)) {
+        std::vector<uint8_t> setting = config_setting(k, 3, 0x0F);
+        if (flags_ptr) k.store32(flags_ptr, setting.empty() ? 0 : setting[0]);
+        return result(c, X_ERROR_NO_SUCH_USER);
+    }
+    // (with a user the console's answer is not known, the oracle having
+    // none: no restriction, as Xenia's)
     if (flags_ptr) k.store32(flags_ptr, 0);
     result(c, X_ERROR_SUCCESS);
 }

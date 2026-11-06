@@ -202,7 +202,7 @@ struct Module {
 // guest code (the DllMains), so a guest thread waiting for it waits on the
 // host, outside the guest's waits; the report names its owner.
 class LoaderLock {
-public:
+  public:
     void lock() {
         std::unique_lock l(mutex_);
         std::thread::id self = std::this_thread::get_id();
@@ -232,7 +232,7 @@ public:
         return depth_ != 0;
     }
 
-private:
+  private:
     std::mutex mutex_;
     std::condition_variable released_;
     std::thread::id owner_;
@@ -892,8 +892,45 @@ void xex_load_image_file(Kernel &k, ppc::Context &c) {
 
 XF_EXPORT(xboxkrnl, XexLoadImage) { xex_load_image_file(k, c); }
 
-// as XexLoadImage (Xenia's)
-XF_EXPORT(xboxkrnl, XexLoadExecutable) { xex_load_image_file(k, c); }
+// (name, hmodule_ptr, flags, min_version): the console's order, from its XAM's
+// own launcher (XamLoaderLaunchTitle's thread calls it with the handle's
+// pointer second and the version last). Xenia declares it as XexLoadImage
+// (name, flags, min_version, hmodule_ptr), a sketchy alias that makes the
+// console's call write through the version; the console wins.
+XF_EXPORT(xboxkrnl, XexLoadExecutable) {
+    std::string name = read_string(k, arg(k, c, 0));
+    result(c, xex_load_image(
+                  k, c, name, arg(k, c, 2), arg(k, c, 1), [&](Modules &s) { return load_user_module(k, s, name); },
+                  false));
+}
+
+// (hmodule): the module XexLoadExecutable loaded, started as a title: its
+// entry point on a thread of the title process with the executable's default
+// stack, as Kernel::launch does the first one. Xenia has none (it starts the
+// title itself); the console's XAM calls it when it launches a title, and the
+// state it keeps for a running title is made after this.
+XF_EXPORT(xboxkrnl, XexStartExecutable) {
+    uint32_t hmodule = arg(k, c, 0);
+    uint32_t entry = 0, stack = 0;
+    {
+        Modules &s = k.state<Modules>();
+        std::lock_guard lock(s.mutex);
+        Module *m = module_from_hmodule(s, hmodule);
+        if (!m || m->is_kernel() || !m->entry_point) return result(c, X_STATUS_INVALID_HANDLE);
+        entry = m->entry_point;
+        stack = m->xex ? m->xex->stack_size : 0;
+    }
+    Objects &o = objects(k);
+    Thread::Params p;
+    p.stack_size = stack;
+    p.start_address = entry;
+    p.process = o.title_process;
+    uint32_t status = X_STATUS_SUCCESS;
+    Ref<Thread> t = o.create_thread(p, status);
+    if (!t) return result(c, status);
+    if (!o.scheduler->start(*t)) return result(c, X_STATUS_NO_MEMORY);
+    result(c, X_STATUS_SUCCESS);
+}
 
 // (buffer, size, module_name, module_flags, min_version, hmodule_ptr): the
 // executable's file in memory, its module named by the name's base (no
@@ -974,8 +1011,8 @@ XF_EXPORT(xboxkrnl, XexLoadImageHeaders) {
     } else if (header_size > buffer_size) {
         status = X_STATUS_BUFFER_TOO_SMALL;
     } else if (header_size > 0x800) {
-        status = file.stream->read(0x800, k.memory().translate_for_host_write(header + 0x800), header_size - 0x800,
-                                   done);
+        status =
+            file.stream->read(0x800, k.memory().translate_for_host_write(header + 0x800), header_size - 0x800, done);
         k.memory().written(header + 0x800, uint32_t(done));
         if (int32_t(status) >= 0) status = X_STATUS_SUCCESS;
     } else {
@@ -1155,7 +1192,8 @@ std::string modules_report(Kernel &k) {
     if (s.loader.held(owner, waiting)) {
         char line[128];
         std::string holder = owner >= 0 ? "thread " + std::to_string(owner) : "a host thread";
-        std::snprintf(line, sizeof(line), "  the loader lock: held by %s, %u waiting for it\n", holder.c_str(), waiting);
+        std::snprintf(line, sizeof(line), "  the loader lock: held by %s, %u waiting for it\n", holder.c_str(),
+                      waiting);
         out += line;
     }
     return out;
