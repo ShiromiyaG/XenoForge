@@ -175,4 +175,22 @@ Ref<Enumerator> make_enumerator(Kernel &k, uint32_t user_index, uint32_t app_id,
 std::u16string guest_u16(Kernel &k, uint32_t address, size_t max = 0x10000);
 void put_u16(Kernel &k, uint32_t address, std::u16string_view s, size_t count);
 
+// The run ends with the reason (the title exits, launches another, asks
+// for another disc), from the calling thread (xam.cpp).
+[[noreturn]] void end_title(Kernel &k, const std::string &why);
+
+// A console setting (ExGetXConfigSetting's, by category and id): its bytes,
+// empty when there is none; a 32-bit one, or the fallback (xam_info.cpp).
+std::vector<uint8_t> config_setting(Kernel &k, uint16_t category, uint16_t setting);
+uint32_t config_setting32(Kernel &k, uint16_t category, uint16_t setting, uint32_t fallback);
+
+// ---- Kinect (Xenia's NUIController, nui.h), with no device ----
+
+struct NuiState {
+    std::mutex mutex;
+    uint32_t engaged_tracking_id = 0, tilt_callback = 0, init_flags = 0;
+    uint64_t versions[2] = {}; // XAM's and the XTL's, as XNuiTitleInitialize gives them
+    uint64_t session_id = 0;
+};
+
 } // namespace xf::kernel

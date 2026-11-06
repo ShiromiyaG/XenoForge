@@ -35,14 +35,32 @@
 //   - closing a package leaves the files still open in it usable (Xenia
 //     releases a handle of each);
 //   - the hard drive's size is the content root's volume's, the disc's
-//     Xenia's dummy one.
+//     Xenia's dummy one;
+//   - a thumbnail or metadata asked for is the mounted package's (its header
+//     in memory) when it is mounted, and a thumbnail set on a package not
+//     mounted is written to its header (Xenia reads a mounted package's
+//     header from the host again, and loses a thumbnail set on one that is
+//     not, never writing its header);
+//   - XamContentGetAttributesInternal gives the package's last write time
+//     as all three of its times (std::filesystem has only that one);
+//   - XamContentLaunchImage* and XamSwapDisc to another disc end the run
+//     with the reason (Xenia extracts the image and asks to be restarted, or
+//     asks the user for the other disc); the disc's package for a title of
+//     -1 is the running title's;
+//   - XamLoaderGetDvdTrayState says closed when the title came on a disc
+//     (Xenia's tray starts open, whatever the title came on).
+//
+// Also from xam_content.cc: XamSwapDisc and the loader's media queries; from
+// xam_content_device.cc: the devices' names, data and enumerator.
 
 #include "xam.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 
 namespace xf::kernel {
 namespace {
@@ -63,7 +81,11 @@ constexpr size_t FILE_NAME_AT = 0x971A, FILE_NAME_SIZE = 42;
 // in the metadata
 constexpr size_t M_CONTENT_TYPE = 0x0, M_VERSION = 0x4, M_CONTENT_SIZE = 0x8, M_EXECUTION = 0x10, M_TITLE_ID = 0x1C;
 constexpr size_t M_PROFILE_ID = 0x2D, M_DATA_FILE_COUNT = 0x59, M_VOLUME_TYPE = 0x65, M_DISPLAY_NAME = 0xCD;
-constexpr size_t M_DISPLAY_NAME_EX = 0x50D6;
+constexpr size_t M_DISPLAY_NAME_EX = 0x50D6, M_DESCRIPTION = 0x9CD, M_DESCRIPTION_EX = 0x90D6;
+constexpr size_t M_THUMBNAIL_SIZE = 0x13CE, M_THUMBNAIL = 0x13D6, METADATA_SIZE = 0x93D6;
+// the thumbnail's room: version 1's, and version 2's (three more languages'
+// names take the rest)
+constexpr uint32_t THUMBNAIL_V1 = 0x4000, THUMBNAIL_V2 = 0x3D00;
 
 uint32_t rd32(const uint8_t *p) { return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]; }
 uint64_t rd64(const uint8_t *p) { return uint64_t(rd32(p)) << 32 | rd32(p + 4); }
@@ -163,6 +185,7 @@ struct ContentState {
     std::mutex mutex;
     std::vector<std::unique_ptr<Package>> mounted;
     uint32_t next_device = 0;
+    uint32_t change_callback = 0; // XamContentRegisterChangeCallback's, kept (Xenia never calls it)
 };
 
 ContentState &content(Kernel &k) { return k.state<ContentState>(); }
@@ -530,6 +553,29 @@ XF_EXPORT(xam, XamContentCreateEx) {
                              arg(k, c, 5), arg(k, c, 8)));
 }
 
+// (user_index, root_name, XCONTENT_DATA *, flags, disposition_ptr,
+// license_mask_ptr, overlapped): XamContentCreateEx with no cache
+XF_EXPORT(xam, XamContentCreate) {
+    uint32_t data = arg(k, c, 2);
+    if (!k.host(data + 0x108)[0]) return result(c, X_ERROR_INVALID_NAME);
+    result(c, content_create(k, arg(k, c, 0), arg(k, c, 1), data, CONTENT_DATA_SIZE, arg(k, c, 3), arg(k, c, 4),
+                             arg(k, c, 5), arg(k, c, 6)));
+}
+
+// (root_name, XCONTENT_DATA_INTERNAL *, flags, disposition_ptr,
+// license_mask_ptr, cache_size, content_size (64 bits), overlapped): for no
+// user, the XUID and title the structure names
+XF_EXPORT(xam, XamContentCreateInternal) {
+    uint32_t data = arg(k, c, 1);
+    if (!k.host(data + 0x108)[0]) return result(c, X_ERROR_INVALID_NAME);
+    result(c, content_create(k, USER_INDEX_NONE, arg(k, c, 0), data, INTERNAL_SIZE, arg(k, c, 2), arg(k, c, 3),
+                             arg(k, c, 4), arg(k, c, 7)));
+}
+
+// (user_index, root_name, path, flags, disposition_ptr, license_mask_ptr,
+// overlapped): Xenia's stub, no such file
+XF_EXPORT(xam, XamContentOpenFile) { result(c, X_ERROR_FILE_NOT_FOUND); }
+
 // (root_name, overlapped)
 XF_EXPORT(xam, XamContentClose) {
     std::string root = guest_string(k, arg(k, c, 0));
@@ -574,15 +620,15 @@ XF_EXPORT(xam, XamContentFlush) {
     result(c, X_ERROR_SUCCESS);
 }
 
-// (user_index, XCONTENT_DATA *, overlapped)
-XF_EXPORT(xam, XamContentDelete) {
-    uint32_t index = arg(k, c, 0), ov = arg(k, c, 2);
+namespace {
+// xeXamContentDelete: the content data read by its size, then the user
+uint32_t content_delete(Kernel &k, uint32_t index, uint32_t data, uint32_t data_size, uint32_t ov) {
     ContentData d;
-    read_content_data(k, arg(k, c, 1), CONTENT_DATA_SIZE, d);
+    if (!read_content_data(k, data, data_size, d)) return X_ERROR_INVALID_PARAMETER;
     uint64_t xuid = 0;
     if (index != USER_INDEX_NONE) {
         const User *u = user_at(k, index);
-        if (!u) return result(c, X_ERROR_NO_SUCH_USER);
+        if (!u) return X_ERROR_NO_SUCH_USER;
         xuid = u->xuid;
     }
     ContentState &s = content(k);
@@ -593,33 +639,37 @@ XF_EXPORT(xam, XamContentDelete) {
     }
     if (ov) {
         complete_overlapped_immediate(k, ov, r);
-        return result(c, X_ERROR_IO_PENDING);
+        return X_ERROR_IO_PENDING;
     }
-    result(c, r);
+    return r;
+}
+} // namespace
+
+// (user_index, XCONTENT_DATA *, overlapped)
+XF_EXPORT(xam, XamContentDelete) {
+    result(c, content_delete(k, arg(k, c, 0), arg(k, c, 1), CONTENT_DATA_SIZE, arg(k, c, 2)));
 }
 
-// (user_index, device_id, content_type, flags, items_per_enumerate,
-// buffer_size_ptr, handle_out): the user's and the common content on the
-// hard drive, and the disc's
-XF_EXPORT(xam, XamContentCreateEnumerator) {
-    uint32_t index = arg(k, c, 0), device_id = arg(k, c, 1), type = arg(k, c, 2), flags = arg(k, c, 3);
-    uint32_t items = arg(k, c, 4), size_ptr = arg(k, c, 5), handle_out = arg(k, c, 6);
-    uint64_t xuid = 0;
-    if (index < 4) {
-        const User *u = user_at(k, index);
-        if (!u) return result(c, X_ERROR_NO_SUCH_USER);
-        xuid = u->xuid;
-    }
+// (XCONTENT_DATA_INTERNAL *, overlapped): XAM's internal form, for no user
+XF_EXPORT(xam, XamContentDeleteInternal) {
+    result(c, content_delete(k, USER_INDEX_NONE, arg(k, c, 0), INTERNAL_SIZE, arg(k, c, 1)));
+}
+
+namespace {
+// XamContentCreateEnumeratorInternal: the XUID's and the common content on
+// the hard drive (of the title, 0 the running one), and the disc's
+uint32_t create_content_enumerator(Kernel &k, uint64_t xuid, uint32_t device_id, uint32_t type, uint32_t title,
+                                   uint32_t flags, uint32_t items, uint32_t size_ptr, uint32_t handle_out) {
     DeviceInfo info{};
     bool known = device_id && device_info(k, device_id, info);
     if ((device_id && !known) || !handle_out) {
         if (size_ptr) k.store32(size_ptr, 0);
-        return result(c, X_E_INVALIDARG);
+        return X_E_INVALIDARG;
     }
     if (size_ptr) k.store32(size_ptr, CONTENT_DATA_SIZE * items);
     Ref<Enumerator> e = make_enumerator(k, USER_INDEX_ANY, 0xFE, 0x20005, 0x20007, 0, items, CONTENT_DATA_SIZE, 0x98);
-    if (!e) return result(c, X_STATUS_NO_MEMORY);
-    uint32_t title = title_id(k);
+    if (!e) return X_STATUS_NO_MEMORY;
+    if (!title) title = title_id(k);
     std::vector<ContentData> found;
     if (!known || info.id == DEVICE_HDD) {
         std::vector<uint64_t> xuids;
@@ -638,7 +688,30 @@ XF_EXPORT(xam, XamContentCreateEnumerator) {
     }
     for (const ContentData &d : found) write_content_data(e->append(), d);
     k.store32(handle_out, e->handle());
-    result(c, X_ERROR_SUCCESS);
+    return X_ERROR_SUCCESS;
+}
+} // namespace
+
+// (xuid (64 bits), device_id, content_type, title_id, flags,
+// items_per_enumerate, buffer_size_ptr, handle_out)
+XF_EXPORT(xam, XamContentCreateEnumeratorInternal) {
+    result(c, create_content_enumerator(k, arg64(k, c, 0), arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4),
+                                        arg(k, c, 5), arg(k, c, 6), arg(k, c, 7)));
+}
+
+// (user_index, device_id, content_type, flags, items_per_enumerate,
+// buffer_size_ptr, handle_out): the user's (a user slot) and the common
+// content, of the running title
+XF_EXPORT(xam, XamContentCreateEnumerator) {
+    uint32_t index = arg(k, c, 0);
+    uint64_t xuid = 0;
+    if (index < 4) {
+        const User *u = user_at(k, index);
+        if (!u) return result(c, X_ERROR_NO_SUCH_USER);
+        xuid = u->xuid;
+    }
+    result(c, create_content_enumerator(k, xuid, arg(k, c, 1), arg(k, c, 2), 0, arg(k, c, 3), arg(k, c, 4),
+                                        arg(k, c, 5), arg(k, c, 6)));
 }
 
 // (xuid, device_id, content_type, title_id, handle_out), Xenia's
@@ -747,18 +820,437 @@ XF_EXPORT(xam, XamContentGetDeviceState) {
     result(c, X_ERROR_IO_PENDING);
 }
 
-// (device_id, X_CONTENT_DEVICE_DATA *): id, type, total and free bytes, name
+namespace {
+constexpr uint32_t DEVICE_DATA_SIZE = 0x50; // X_CONTENT_DEVICE_DATA
+
+// X_CONTENT_DEVICE_DATA: id, type, total and free bytes, the name (28
+// characters with its terminator)
+void fill_device_data(uint8_t *p, const DeviceInfo &info, std::u16string_view name) {
+    std::memset(p, 0, DEVICE_DATA_SIZE);
+    wr32(p + 0x00, info.id);
+    wr32(p + 0x04, info.type);
+    wr64(p + 0x08, info.total);
+    wr64(p + 0x10, info.free);
+    wr_u16(p + 0x18, name, 28);
+}
+
+// XDeviceTypeMap: the name a device type is shown with
+std::u16string_view localized_device_name(uint32_t type) {
+    switch (type) {
+    case 1: return u"Hard Drive";
+    case 2: return u"Memory Unit";
+    case 3: return u"System";
+    case 4: return u"Optical Drive";
+    case 8: return u"Transfer Cable";
+    case 15: return u"Sapphire";
+    case 16: return u"USB Storage";
+    default: return u"Storage Device";
+    }
+}
+
+// copy_truncating: as much as fits with its terminator
+void put_string(Kernel &k, uint32_t address, std::string_view s, uint32_t count) {
+    if (!count || !address) return;
+    size_t n = std::min<size_t>(s.size(), count - 1);
+    std::memcpy(k.host(address), s.data(), n);
+    k.host(address)[n] = 0;
+}
+} // namespace
+
+// (device_id, X_CONTENT_DEVICE_DATA *)
 XF_EXPORT(xam, XamContentGetDeviceData) {
     uint32_t device_id = arg(k, c, 0), out = arg(k, c, 1);
     DeviceInfo info;
     if (!device_info(k, device_id, info)) return result(c, X_ERROR_DEVICE_NOT_CONNECTED);
-    std::memset(k.host(out), 0, 0x50);
-    k.store32(out + 0x00, info.id);
-    k.store32(out + 0x04, info.type);
-    k.store64(out + 0x08, info.total);
-    k.store64(out + 0x10, info.free);
-    put_u16(k, out + 0x18, info.name, 28);
+    fill_device_data(k.host(out), info, info.name);
     result(c, X_ERROR_SUCCESS);
+}
+
+// (device_id, X_CONTENT_DEVICE_DATA *): the name by the device's type
+XF_EXPORT(xam, XamContentGetLocalizedDeviceData) {
+    uint32_t device_id = arg(k, c, 0), out = arg(k, c, 1);
+    DeviceInfo info;
+    if (!device_info(k, device_id, info)) return result(c, X_ERROR_DEVICE_NOT_CONNECTED);
+    fill_device_data(k.host(out), info, localized_device_name(info.type));
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (device_id, name_buffer, name_capacity): the device's name, if it fits
+XF_EXPORT(xam, XamContentGetDeviceName) {
+    uint32_t device_id = arg(k, c, 0), buffer = arg(k, c, 1), capacity = arg(k, c, 2);
+    DeviceInfo info;
+    if (!device_info(k, device_id, info)) return result(c, X_ERROR_DEVICE_NOT_CONNECTED);
+    std::u16string_view name = info.name;
+    if (capacity < name.size() + 1) return result(c, X_ERROR_INSUFFICIENT_BUFFER);
+    put_u16(k, buffer, name, capacity);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (device_id, path, path_size, append_backslash): the hard drive's volume,
+// "hdd0\" (the backslash always there, as Xenia's)
+XF_EXPORT(xam, XamContentGetDeviceVolumePath) {
+    if (arg(k, c, 0) != DEVICE_HDD) return result(c, X_ERROR_FUNCTION_FAILED);
+    put_string(k, arg(k, c, 1), "hdd0\\", arg(k, c, 2));
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (content_type, content_flags, max_count, buffer_size_ptr, handle_out): the
+// devices, the disc left out with kExcludeReadOnlyDevices
+XF_EXPORT(xam, XamContentCreateDeviceEnumerator) {
+    uint32_t flags = arg(k, c, 1), max_count = arg(k, c, 2), size_ptr = arg(k, c, 3), handle_out = arg(k, c, 4);
+    if (size_ptr) k.store32(size_ptr, DEVICE_DATA_SIZE * max_count);
+    Ref<Enumerator> e = make_enumerator(k, USER_INDEX_NONE, 0xFE, 0x2000A, 0x20009, 0, max_count, DEVICE_DATA_SIZE, 0);
+    if (!e) return result(c, X_STATUS_NO_MEMORY);
+    for (uint32_t id : {DEVICE_HDD, DEVICE_ODD}) {
+        DeviceInfo info;
+        device_info(k, id, info);
+        if (info.type == 4 && (flags & 0x80000000)) continue;
+        fill_device_data(e->append(), info, info.name);
+    }
+    if (handle_out) k.store32(handle_out, e->handle());
+    result(c, X_ERROR_SUCCESS);
+}
+
+// ---- resolving a package's path (xeXamContentResolve) ----
+
+namespace {
+// \Device\Harddisk0\Partition1\Content\ or D:\content\, then
+// <XUID>\<TITLE>\<TYPE>\<file name>: the user's XUID for a save, else 0; the
+// running title. A root name is not supported (as Xenia's).
+uint32_t content_resolve(Kernel &k, uint32_t index, uint32_t data, uint32_t data_size, uint32_t path,
+                         uint32_t path_size, uint32_t root_name, uint32_t ov) {
+    auto run = [&k, index, data, data_size, path, path_size, root_name](uint32_t &, uint32_t &) -> uint32_t {
+        ContentData d;
+        if (!read_content_data(k, data, data_size, d)) return X_ERROR_INVALID_PARAMETER;
+        uint64_t xuid = 0;
+        if (index < 4) {
+            const User *u = user_at(k, index);
+            if (u && d.content_type == TYPE_SAVED_GAME) xuid = u->xuid;
+        }
+        if (root_name) return X_ERROR_INVALID_PARAMETER;
+        std::string root;
+        if (d.device_id == DEVICE_HDD)
+            root = "\\Device\\Harddisk0\\Partition1\\Content\\";
+        else if (d.device_id == DEVICE_ODD)
+            root = "D:\\content\\";
+        else
+            return X_ERROR_INVALID_PARAMETER;
+        std::string full =
+            root + hex(xuid, 16) + "\\" + hex(title_id(k), 8) + "\\" + hex(d.content_type, 8) + "\\" + d.file_name;
+        put_string(k, path, full, path_size);
+        return X_ERROR_SUCCESS;
+    };
+    return run_or_defer(k, ov, run);
+}
+} // namespace
+
+// (user_index, XCONTENT_DATA *, path, path_size, create_directory,
+// root_name, overlapped)
+XF_EXPORT(xam, XamContentResolve) {
+    result(c, content_resolve(k, arg(k, c, 0), arg(k, c, 1), CONTENT_DATA_SIZE, arg(k, c, 2), arg(k, c, 3),
+                              arg(k, c, 5), arg(k, c, 6)));
+}
+
+// (XCONTENT_DATA_INTERNAL *, path, path_size, create_directory, root_name,
+// overlapped): for no user
+XF_EXPORT(xam, XamContentResolveInternal) {
+    result(c, content_resolve(k, USER_INDEX_NONE, arg(k, c, 0), INTERNAL_SIZE, arg(k, c, 1), arg(k, c, 2), arg(k, c, 4),
+                              arg(k, c, 5)));
+}
+
+// ---- thumbnails, metadata, attributes ----
+
+namespace {
+
+uint32_t max_thumbnail(const std::vector<uint8_t> &h) {
+    return rd32(h.data() + META + M_VERSION) == 1 ? THUMBNAIL_V1 : THUMBNAIL_V2;
+}
+
+// ContentPackageDirectory::GetThumbnail: a __thumbnail.png left in the
+// package is taken into its header (and removed), else the header's own;
+// changed when the header took one
+uint32_t package_thumbnail(Package &p, std::vector<uint8_t> &out, bool &changed) {
+    uint8_t *m = p.header.data() + META;
+    std::filesystem::path png = p.host_path / "__thumbnail.png";
+    std::ifstream f(png, std::ios::binary);
+    if (f) {
+        out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        f.close();
+        uint32_t size = std::min<uint32_t>(uint32_t(out.size()), max_thumbnail(p.header));
+        std::memcpy(m + M_THUMBNAIL, out.data(), size);
+        wr32(m + M_THUMBNAIL_SIZE, size);
+        std::error_code ec;
+        std::filesystem::remove(png, ec);
+        changed = true;
+        return X_ERROR_SUCCESS;
+    }
+    uint32_t size = std::min(rd32(m + M_THUMBNAIL_SIZE), max_thumbnail(p.header));
+    if (!size) return X_ERROR_FILE_NOT_FOUND;
+    out.assign(m + M_THUMBNAIL, m + M_THUMBNAIL + size);
+    return X_ERROR_SUCCESS;
+}
+
+// ContentPackageDirectory::SetThumbnail
+uint32_t set_package_thumbnail(Package &p, const uint8_t *data, uint32_t size) {
+    if (size > max_thumbnail(p.header)) return X_ERROR_INSUFFICIENT_BUFFER;
+    uint8_t *m = p.header.data() + META;
+    if (size) std::memcpy(m + M_THUMBNAIL, data, size);
+    wr32(m + M_THUMBNAIL_SIZE, size);
+    return X_ERROR_SUCCESS;
+}
+
+// The package content data names, the content lock held: the one mounted
+// (its header written at its close), else the one on the host opened into
+// `opened` (its header written by the caller). nullptr: none.
+Package *find_package(Kernel &k, ContentState &s, uint64_t xuid, const ContentData &d, Package &opened) {
+    ContentData wanted = d;
+    wanted.title_id = running(k, d.title_id);
+    for (const auto &p : s.mounted)
+        if (p->data.same(wanted)) return p.get();
+    if (!content_exists(k, xuid, d) || !open_package(package_path(k, xuid, d), opened)) return nullptr;
+    return &opened;
+}
+
+} // namespace
+
+// (user_index, XCONTENT_DATA *, buffer, buffer_size_ptr, overlapped): the
+// thumbnail's size, and the thumbnail when there is a buffer for it
+XF_EXPORT(xam, XamContentGetThumbnail) {
+    uint32_t index = arg(k, c, 0), data = arg(k, c, 1), buffer = arg(k, c, 2), size_ptr = arg(k, c, 3);
+    uint32_t ov = arg(k, c, 4);
+    const User *u = user_at(k, index);
+    if (!u) return result(c, X_ERROR_NO_SUCH_USER);
+    if (!size_ptr) return result(c, X_ERROR_INVALID_PARAMETER);
+    uint32_t buffer_size = k.load32(size_ptr);
+    ContentData d;
+    read_content_data(k, data, CONTENT_DATA_SIZE, d);
+    std::vector<uint8_t> thumbnail;
+    uint32_t r;
+    {
+        ContentState &s = content(k);
+        std::lock_guard<std::mutex> l(s.mutex);
+        Package opened;
+        Package *p = find_package(k, s, u->xuid, d, opened);
+        bool changed = false;
+        r = p ? package_thumbnail(*p, thumbnail, changed) : X_ERROR_FILE_NOT_FOUND;
+        if (changed && p == &opened) write_header(opened);
+    }
+    k.store32(size_ptr, uint32_t(thumbnail.size()));
+    if (r == X_ERROR_SUCCESS && buffer) {
+        if (buffer_size < thumbnail.size())
+            r = X_ERROR_INSUFFICIENT_BUFFER;
+        else
+            std::memcpy(k.host(buffer), thumbnail.data(), thumbnail.size());
+    }
+    if (ov) {
+        complete_overlapped_immediate(k, ov, r);
+        return result(c, X_ERROR_IO_PENDING);
+    }
+    result(c, r);
+}
+
+namespace {
+// xeXamContentSetThumbnail: the PNG kept in the package's header
+uint32_t content_set_thumbnail(Kernel &k, uint32_t index, uint32_t data, uint32_t data_size, uint32_t buffer,
+                               uint32_t buffer_size, uint32_t ov) {
+    const User *u = user_at(k, index);
+    if (!u) return X_ERROR_NO_SUCH_USER;
+    if (buffer_size > THUMBNAIL_V2) return X_E_INVALIDARG;
+    ContentData d;
+    if (!read_content_data(k, data, data_size, d)) return X_ERROR_INVALID_PARAMETER;
+    if (data_size != INTERNAL_SIZE) d.title_id = title_id(k);
+    uint32_t r;
+    {
+        ContentState &s = content(k);
+        std::lock_guard<std::mutex> l(s.mutex);
+        Package opened;
+        Package *p = find_package(k, s, u->xuid, d, opened);
+        r = p ? set_package_thumbnail(*p, buffer_size ? k.host(buffer) : nullptr, buffer_size) : X_ERROR_FILE_NOT_FOUND;
+        if (r == X_ERROR_SUCCESS && p == &opened) write_header(opened);
+    }
+    if (ov) {
+        complete_overlapped_immediate(k, ov, r);
+        return X_ERROR_IO_PENDING;
+    }
+    return r;
+}
+} // namespace
+
+// (user_index, XCONTENT_DATA *, buffer, buffer_size, overlapped)
+XF_EXPORT(xam, XamContentSetThumbnail) {
+    result(c, content_set_thumbnail(k, arg(k, c, 0), arg(k, c, 1), CONTENT_DATA_SIZE, arg(k, c, 2), arg(k, c, 3),
+                                    arg(k, c, 4)));
+}
+
+// (XCONTENT_DATA_INTERNAL *, buffer, buffer_size): for no user, which
+// Xenia's lookup finds no profile for: X_ERROR_NO_SUCH_USER
+XF_EXPORT(xam, XamContentSetThumbnailInternal) {
+    result(c, content_set_thumbnail(k, USER_INDEX_NONE, arg(k, c, 0), INTERNAL_SIZE, arg(k, c, 1), arg(k, c, 2), 0));
+}
+
+// (XCONTENT_DATA_INTERNAL *, XContentMetadata *, overlapped): the package's
+// metadata (0x93D6 bytes)
+XF_EXPORT(xam, XamContentGetMetaDataInternal) {
+    uint32_t data = arg(k, c, 0), out = arg(k, c, 1), ov = arg(k, c, 2);
+    ContentData d;
+    read_content_data(k, data, INTERNAL_SIZE, d);
+    {
+        ContentState &s = content(k);
+        std::lock_guard<std::mutex> l(s.mutex);
+        Package opened;
+        Package *p = find_package(k, s, 0, d, opened);
+        if (!p) return result(c, X_ERROR_FUNCTION_FAILED);
+        if (out) std::memcpy(k.host(out), p->header.data() + META, METADATA_SIZE);
+    }
+    if (ov) {
+        complete_overlapped_immediate(k, ov, 0);
+        return result(c, X_ERROR_IO_PENDING);
+    }
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (XCONTENT_DATA_INTERNAL *, X_FILE_ATTRIBUTE_DATA *, overlapped): the
+// package's directory's times (each its last write here), no attributes,
+// size 0
+XF_EXPORT(xam, XamContentGetAttributesInternal) {
+    uint32_t data = arg(k, c, 0), out = arg(k, c, 1), ov = arg(k, c, 2);
+    ContentData d;
+    read_content_data(k, data, INTERNAL_SIZE, d);
+    std::filesystem::path path = package_path(k, 0, d);
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) return result(c, X_ERROR_FUNCTION_FAILED);
+    auto written = std::filesystem::last_write_time(path, ec);
+    if (ec) return result(c, X_ERROR_FUNCTION_FAILED);
+    uint64_t size = std::filesystem::is_directory(path, ec) ? 0 : std::filesystem::file_size(path, ec);
+    auto since_epoch = std::chrono::clock_cast<std::chrono::system_clock>(written).time_since_epoch();
+    uint64_t time =
+        vfs::UNIX_EPOCH_FILETIME +
+        uint64_t(
+            std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(since_epoch).count());
+    if (out) {
+        uint8_t *p = k.host(out);
+        std::memset(p, 0, 0x24);
+        for (uint32_t at : {0x4u, 0xCu, 0x14u}) wr32(p + at, uint32_t(time >> 32)), wr32(p + at + 4, uint32_t(time));
+        wr32(p + 0x1C, uint32_t(size >> 32));
+        wr32(p + 0x20, uint32_t(size));
+    }
+    if (ov) {
+        complete_overlapped_immediate(k, ov, 0);
+        return result(c, X_ERROR_IO_PENDING);
+    }
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (XContentMetadata *, display_name, display_name_size, description,
+// description_size): in the console's language (XConfig's), from the
+// metadata's twelve languages (the last three from version 2)
+XF_EXPORT(xam, XamContentGetLocalizedString) {
+    uint32_t metadata = arg(k, c, 0), name = arg(k, c, 1), name_size = arg(k, c, 2);
+    uint32_t description = arg(k, c, 3), description_size = arg(k, c, 4);
+    if (!metadata) return result(c, X_ERROR_INVALID_PARAMETER);
+    uint32_t language = config_setting32(k, 3, 0x09, 1); // XCONFIG_USER_LANGUAGE
+    uint32_t version = k.load32(metadata + M_VERSION);
+    // the slot: language - 1 (an invalid language: Xenia's 1 for the name),
+    // English's past the twelfth
+    auto text = [&](size_t base, size_t base_ex, uint32_t slot) -> std::u16string {
+        if (slot >= 12) slot = 0;
+        if (slot < 9) return guest_u16(k, metadata + uint32_t(base + 0x100 * slot), 128);
+        if (version >= 2) return guest_u16(k, metadata + uint32_t(base_ex + 0x100 * (slot - 9)), 128);
+        return u"";
+    };
+    if (name) put_u16(k, name, text(M_DISPLAY_NAME, M_DISPLAY_NAME_EX, language ? language - 1 : 1), name_size);
+    if (description) put_u16(k, description, text(M_DESCRIPTION, M_DESCRIPTION_EX, language - 1), description_size);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (callback): kept, as Xenia keeps it (no content changes to report)
+XF_EXPORT(xam, XamContentRegisterChangeCallback) {
+    ContentState &s = content(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    s.change_callback = arg(k, c, 0);
+}
+
+// ---- launching an image (xeXamContentLaunchImage) ----
+
+namespace {
+// The image (a path, or the disc's package the content data names) must
+// exist; then the run ends with the launch, as XamLoaderLaunchTitle's does
+// (Xenia extracts the image and asks to be restarted).
+uint32_t launch_image(Kernel &k, uint32_t image_location, uint32_t data, uint32_t data_size, uint32_t xex_path) {
+    std::string image;
+    if (!image_location) {
+        ContentData d;
+        if (!data || !read_content_data(k, data, data_size, d)) return X_ERROR_INVALID_PARAMETER;
+        image = "GAME:\\Content\\0000000000000000\\" + hex(running(k, d.title_id), 8) + "\\" + hex(d.content_type, 8) +
+                "\\" + d.file_name;
+    } else {
+        image = guest_string(k, image_location);
+    }
+    if (!file_system(k).resolve(image)) return 0xC000000F; // X_STATUS_NO_SUCH_FILE
+    end_title(k, "the title launches " + guest_string(k, xex_path) + " from " + image + " (XamContentLaunchImage)");
+}
+} // namespace
+
+// (user_index, XCONTENT_DATA *, xex_path)
+XF_EXPORT(xam, XamContentLaunchImage) { result(c, launch_image(k, 0, arg(k, c, 1), CONTENT_DATA_SIZE, arg(k, c, 2))); }
+// (XCONTENT_DATA_INTERNAL *, xex_path)
+XF_EXPORT(xam, XamContentLaunchImageInternal) {
+    result(c, launch_image(k, 0, arg(k, c, 0), INTERNAL_SIZE, arg(k, c, 1)));
+}
+// (XCONTENT_DATA_INTERNAL *, xex_path, flags)
+XF_EXPORT(xam, XamContentLaunchImageInternalEx) {
+    result(c, launch_image(k, 0, arg(k, c, 0), INTERNAL_SIZE, arg(k, c, 1)));
+}
+// (image_location, xex_name)
+XF_EXPORT(xam, XamContentLaunchImageFromFileInternal) { result(c, launch_image(k, arg(k, c, 0), 0, 0, arg(k, c, 1))); }
+
+// ---- the disc ----
+
+// (disc_number, X_KEVENT *completion, X_SWAPDISC_ERROR_MESSAGE *): the disc
+// in the drive is set at once; another ends the run, as there is no other
+// disc to swap to (Xenia asks the user for one and mounts it at
+// \Device\LauncherData)
+XF_EXPORT(xam, XamSwapDisc) {
+    uint32_t disc = arg(k, c, 0), event = arg(k, c, 1), message = arg(k, c, 2);
+    XexExecutionInfo info = k.xex() ? k.xex()->execution : XexExecutionInfo{};
+    if (info.disc_number > info.disc_count) return result(c, X_ERROR_INVALID_PARAMETER);
+    if (info.disc_number == disc) {
+        Objects &o = objects(k);
+        if (Ref<Dispatcher> d = event ? o.native(event) : Ref<Dispatcher>()) {
+            if (Event *e = dynamic_cast<Event *>(d.get())) {
+                std::lock_guard<std::mutex> l(o.lock);
+                e->set_signal_state(1);
+                o.signaled(*e);
+            }
+        }
+        return result(c, X_ERROR_SUCCESS);
+    }
+    std::u16string text = message ? guest_u16(k, k.load32(message + 4), 0x400) : u"";
+    std::string why = "the title asks for disc " + std::to_string(disc) + " (XamSwapDisc";
+    if (!text.empty()) {
+        why += ": \"";
+        for (char16_t ch : text) why += ch < 0x80 ? char(ch) : '?';
+        why += "\"";
+    }
+    end_title(k, why + "); there is no other disc to swap to");
+}
+
+// X_DVD_TRAY_STATE: closed with the game's disc in, else open (Xenia's
+// state as it starts, whatever the title came on)
+XF_EXPORT(xam, XamLoaderGetDvdTrayState) { result(c, file_system(k).deployment == 0 ? 2 : 0); }
+
+// (media_type_ptr, title_id_ptr, unknown_ptr): an Xbox 360 game disc, no
+// title
+XF_EXPORT(xam, XamLoaderGetMediaInfoEx) {
+    if (uint32_t p = arg(k, c, 0)) k.store32(p, 1); // XBOX_360_GAME_DISC
+    if (uint32_t p = arg(k, c, 1)) k.store32(p, 0);
+    if (uint32_t p = arg(k, c, 2)) k.store32(p, 0);
+}
+
+// (media_type_ptr, title_id_ptr)
+XF_EXPORT(xam, XamLoaderGetMediaInfo) {
+    if (uint32_t p = arg(k, c, 0)) k.store32(p, 1);
+    if (uint32_t p = arg(k, c, 1)) k.store32(p, 0);
 }
 
 } // namespace xf::kernel

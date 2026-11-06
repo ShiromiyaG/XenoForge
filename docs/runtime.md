@@ -482,6 +482,18 @@ verification never failing; the network offline (below).
 Overlapped requests Xenia defers (25 ms, on a dispatch thread) complete at
 once here, before the export returns ERROR_IO_PENDING.
 
+The rest of Xenia's system families, ported whole (xam_content.cpp,
+xam_info.cpp, xam_avatar.cpp): every XamContent* (the internal forms,
+paths resolved, thumbnails kept in the package's header, metadata and
+attributes, the devices' names, volume paths and enumerator; launching an
+image ends the run, as does XamSwapDisc to a disc other than the one in);
+the dashboard's context and app information, title IDs, features, versions
+and the settings XAM reads (ExGetXConfigSetting's); the Live hive, XAuth and
+network storage offline; avatars with nothing to load, Kinect never set up
+(XNuiTitleInitialize's versions and flags kept), gamer tiles never found,
+toy portals never connected. Each file's header says where it differs from
+Xenia.
+
 The network is offline, as Xenia's answers make it: no Ethernet link, the
 title's address the loopback, DNS and QoS lookups failed at once. The
 sockets (xam_net.cpp) are the kernel's own objects with no host socket

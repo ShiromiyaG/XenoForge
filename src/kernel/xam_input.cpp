@@ -461,4 +461,47 @@ XF_EXPORT(xam, XamInputGetKeystroke) {
     result(c, r);
 }
 
+// (user_index): 1 for a user slot, 0 past them; nothing is bound to undo
+XF_EXPORT(xam, XAutomationpUnbindController) { result(c, arg(k, c, 0) >= USERS ? 0 : 1); }
+
+// ---- the non-controller devices (the toy portals, devices 5 and 6) ----
+// Xenia reads and writes a portal through its USB passthrough; there is
+// none here, so a request that passes Xenia's checks finds no device.
+
+namespace {
+constexpr uint32_t PORTAL_BUFFER_SIZE = 0x20; // hid::kPortalBufferSize
+
+// (device_id, buffer, buffer_length_ptr, state_ptr)
+uint32_t non_controller_get_raw(Kernel &k, uint32_t device, uint32_t buffer, uint32_t length_ptr, uint32_t state_ptr) {
+    if (device != 5 && device != 6) return X_ERROR_INVALID_PARAMETER;
+    if (!state_ptr || !length_ptr || !buffer) return X_ERROR_INVALID_PARAMETER;
+    uint32_t length = k.load32(length_ptr);
+    if (!length || length > PORTAL_BUFFER_SIZE) return X_ERROR_INVALID_PARAMETER;
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+// (device_id, buffer, buffer_length)
+uint32_t non_controller_set_raw(uint32_t device, uint32_t buffer, uint32_t length) {
+    if (device != 5 && device != 6) return X_ERROR_INVALID_PARAMETER;
+    if (!buffer || !length || length > PORTAL_BUFFER_SIZE) return X_ERROR_INVALID_PARAMETER;
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+}
+} // namespace
+
+XF_EXPORT(xam, XamInputNonControllerGetRawEx) {
+    result(c, non_controller_get_raw(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2), arg(k, c, 3)));
+}
+
+// (state_ptr, buffer_length_ptr, buffer): device 5
+XF_EXPORT(xam, XamInputNonControllerGetRaw) {
+    result(c, non_controller_get_raw(k, 5, arg(k, c, 2), arg(k, c, 1), arg(k, c, 0)));
+}
+
+XF_EXPORT(xam, XamInputNonControllerSetRawEx) {
+    result(c, non_controller_set_raw(arg(k, c, 0), arg(k, c, 1), arg(k, c, 2)));
+}
+
+// (buffer_length, buffer): device 5
+XF_EXPORT(xam, XamInputNonControllerSetRaw) { result(c, non_controller_set_raw(5, arg(k, c, 1), arg(k, c, 0))); }
+
 } // namespace xf::kernel

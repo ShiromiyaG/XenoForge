@@ -17,7 +17,8 @@
 // xlivebase_app.cc, xgi_app.cc, xmp_app.cc, messenger_app.cc, xam_party.cc;
 // checked against them. The messages Xenia answers from state this kernel
 // does not keep (the user tracker's contexts and properties, the media
-// player's playlists and songs, Kinect, the cross-title enumeration) answer
+// player's playlists and songs, Kinect's identities (its title
+// initialization is kept: NuiState, xam.h), the cross-title enumeration) answer
 // X_E_FAIL here and are logged once each.
 
 #include "xam.h"
@@ -62,6 +63,27 @@ uint32_t xam_app(Kernel &k, uint32_t message, uint32_t buffer, uint32_t length) 
         k.store32(k.load32(buffer), file_system(k).deployment);
         return X_E_SUCCESS;
     case 0x0002B001: return X_E_SUCCESS; // XNuiDelayUI
+    case 0x0002B003: {                   // XNuiTitleInitialize(xam_version (64), xtl_version (64), flags)
+        uint64_t xam_version = k.load64(buffer), xtl_version = k.load64(buffer + 8);
+        uint32_t flags = k.load32(buffer + 0x10);
+        uint32_t r = X_E_FAIL;
+        if (xam_version == 5) {
+            NuiState &n = k.state<NuiState>();
+            std::lock_guard<std::mutex> l(n.mutex);
+            n.versions[0] = xam_version, n.versions[1] = xtl_version;
+            n.init_flags = flags;
+            if (!(flags & 0x80000000)) r = X_E_SUCCESS;
+        }
+        return r;
+    }
+    case 0x0002B004: { // XNuiTitleShutdown
+        NuiState &n = k.state<NuiState>();
+        std::lock_guard<std::mutex> l(n.mutex);
+        n.versions[0] = n.versions[1] = 0;
+        n.init_flags = 0;
+        n.tilt_callback = 0;
+        return X_E_SUCCESS;
+    }
     case 0x0002C009: return buffer ? X_E_SUCCESS : X_E_INVALIDARG;
     case 0x8000000D: return X_E_SUCCESS; // the language or region changed; no parental control
     default: return unanswered(0xFE, message, buffer, length);

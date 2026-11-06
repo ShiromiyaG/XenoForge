@@ -199,6 +199,10 @@ uint32_t create_listener(Kernel &k, uint64_t mask, uint32_t max_version) {
 // (mask (64 bits), max_version)
 XF_EXPORT(xam, XamNotifyCreateListener) { result(c, create_listener(k, arg64(k, c, 0), arg(k, c, 1))); }
 
+// (mask (64 bits), is_system, max_version): the same listener (Xenia keeps
+// is_system and never reads it)
+XF_EXPORT(xam, XamNotifyCreateListenerInternal) { result(c, create_listener(k, arg64(k, c, 0), arg(k, c, 2))); }
+
 // (listener, match_id, id_ptr, param_ptr): 1 and the next (or the matching)
 // notification, else 0
 XF_EXPORT(xam, XNotifyGetNext) {
@@ -275,13 +279,13 @@ bool mount_storage(Kernel &k, const std::filesystem::path &root, std::string &er
 
 namespace {
 constexpr uint32_t MAX_LAUNCH_DATA_SIZE = 0x3FC;
+} // namespace
 
-[[noreturn]] void end_title(Kernel &k, const std::string &why) {
+void end_title(Kernel &k, const std::string &why) {
     std::fprintf(stderr, "xam: %s\n", why.c_str());
     if (!k.stopped.exchange(true)) k.stop_reason = why;
     throw ThreadExit{0};
 }
-} // namespace
 
 XF_EXPORT(xam, XamLoaderGetLaunchDataSize) {
     uint32_t size_ptr = arg(k, c, 0);
