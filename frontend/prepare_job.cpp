@@ -45,11 +45,12 @@ void PrepareJob::join() {
 }
 
 PrepareJob::Runner PrepareJob::build_runner(std::filesystem::path disc, std::filesystem::path cache_dir,
-                                            unsigned jobs) {
-    return [disc = std::move(disc), cache_dir = std::move(cache_dir), jobs](build::Progress &progress,
+                                            unsigned jobs, bool force) {
+    return [disc = std::move(disc), cache_dir = std::move(cache_dir), jobs, force](build::Progress &progress,
                                                                             std::string &error) {
         build::BuildOptions options;
         if (jobs) options.jobs = jobs;
+        options.force = force;
         return build::prepare_game(disc, cache_dir, progress, error, options);
     };
 }

@@ -3,6 +3,7 @@
 
 #include "launcher_view.h"
 
+#include "stale_library.h"
 #include "xenoforge/game_build.h"
 
 #include <algorithm>
@@ -147,10 +148,18 @@ bool LauncherView::cached_of(const GameEntry &game) const {
 
 const PlayerBinary *LauncherView::player_of(const GameEntry &game) const { return player_for(listing_.players, game, cached_of(game)); }
 
+bool LauncherView::stale_of(const GameEntry &game) const {
+    if (!cached_of(game)) return false;
+    auto it = stale_.find(game.digest);
+    if (it == stale_.end())
+        it = stale_.emplace(game.digest, library_has_new_entries(build::default_cache_dir(), digest_text(game.digest))).first;
+    return it->second;
+}
+
 GameStatus LauncherView::status_of(const GameEntry &game) const {
     const bool cached = cached_of(game);
     const PlayerBinary *player = player_for(listing_.players, game, cached);
-    return game_status(cached, player && !player->generic, failed_.count(game.title_id) > 0);
+    return game_status(cached, player && !player->generic, failed_.count(game.title_id) > 0, stale_of(game));
 }
 
 std::string LauncherView::runs_in(const GameEntry &game) const {
@@ -319,7 +328,7 @@ void LauncherView::update_toolbar() {
         play->SetClass("off", !running && (!g || !player_of(*g)));
     }
     if (Rml::Element *prepare = by_id("tb-prepare")) {
-        const char *label = !g || status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : "Rebuild";
+        const char *label = !g || status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild (new code)" : "Rebuild";
         if (Rml::Element *text = by_id("tb-prepare-label"))
             if (text->GetInnerRML() != label) text->SetInnerRML(label);
         prepare->SetClass("off", !g || running || job_.active());
@@ -440,7 +449,7 @@ void LauncherView::set_folder(const std::string &folder) {
     if (!core_.set_games_folder(folder, true, message)) message_box("The folder was not saved", message);
     selected_ = -1;
     rows_sig_.clear();
-    cached_.clear();
+    cached_.clear(), stale_.clear();
     last_listing_ = Clock::time_point();
     if (settings_) settings_->set_game(nullptr), settings_->folder_changed();
 }
@@ -449,7 +458,7 @@ void LauncherView::rescan() {
     core_.rescan();
     selected_ = -1;
     rows_sig_.clear();
-    cached_.clear();
+    cached_.clear(), stale_.clear();
     last_listing_ = Clock::time_point();
     if (settings_) settings_->set_game(nullptr);
 }

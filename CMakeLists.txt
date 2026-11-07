@@ -379,7 +379,7 @@ if(XF_PLAYER AND TARGET boot)
             COMMENT "glslc ui.${shader}")
     endforeach()
     add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
-                             frontend/prepare_job.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
+                             frontend/prepare_job.cpp frontend/stale_library.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
                              frontend/launcher_view.cpp frontend/launcher_screens.cpp frontend/launcher_input.cpp
                              frontend/settings_view.cpp
                              ${XF_SHADER_OUT}/ui.vert.inc ${XF_SHADER_OUT}/ui.frag.inc)
@@ -402,6 +402,13 @@ if(XF_PLAYER AND TARGET boot)
     add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
     target_link_libraries(frontend_test PRIVATE xf_ui xf_frontend xenoforge_kernel xenoforge_vk)
     add_test(NAME frontend COMMAND frontend_test)
+    # the batch compatibility run (tools/xfcompat.cpp): the discs of a folder prepared and booted, a row each.
+    # It reads the discs with the launcher's library and runs boot with SDL3's process calls, so it is built
+    # with the player (which brings SDL3); its rows and the parser of boot's output are compat_test's.
+    add_executable(xfcompat tools/xfcompat.cpp tools/compat.cpp)
+    target_include_directories(xfcompat PRIVATE tools frontend)
+    target_link_libraries(xfcompat PRIVATE xf_frontend xenoforge)
+    add_dependencies(xfcompat boot)
     # the player as it is shipped: cmake --install, or the player_package target
     include(cmake/package.cmake)
 endif()
@@ -415,6 +422,10 @@ foreach(name aes disc xex lzx sha1 snappy ucode ucode_parse trace shader_interpr
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+# xfcompat's rows, files and the parser of boot's output, on canned output
+add_executable(compat_test tests/compat_test.cpp tools/compat.cpp)
+target_include_directories(compat_test PRIVATE tools)
+add_test(NAME compat COMMAND compat_test)
 # the kernel's exports, called through a Kernel (the object library brings
 # their registrations)
 foreach(name kernel_memory kernel_modules kernel_crypt)

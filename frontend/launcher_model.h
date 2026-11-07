@@ -19,8 +19,9 @@ namespace xf::frontend {
 // carries its generated code), needs preparing (the recompile step makes the
 // library, once), or interpreted (preparing failed here: it runs in the
 // generic player, slowly).
-enum class GameStatus { Ready, NeedsPreparing, Interpreted };
-GameStatus game_status(bool cached_library, bool generated_player, bool prepare_failed);
+enum class GameStatus { Ready, NeedsPreparing, Interpreted, Stale = 4 }; // 3 is the table's unreadable file
+// stale: the cached library lacks code the runtime logged it needed (new interpreted entries since it was built)
+GameStatus game_status(bool cached_library, bool generated_player, bool prepare_failed, bool stale = false);
 const char *status_class(GameStatus status);  // the style class: ready, prep, interp
 const char *status_text(GameStatus status);   // "Ready", "Needs preparing", "Interpreted"
 const char *status_detail(GameStatus status); // a line saying what that means

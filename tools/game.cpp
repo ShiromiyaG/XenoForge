@@ -70,6 +70,21 @@ LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
     std::printf("\n");
     // the renderer's report only if no call of its is under way (this may be its thread)
     if (the_game) print_report(*the_game, false);
+    if (the_game) {
+        char detail[256];
+        std::snprintf(detail, sizeof(detail), "%s host 0x%llX", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+                      (unsigned long long)at);
+        std::string text = detail;
+        if (offset < (1ull << 33)) {
+            std::snprintf(detail, sizeof(detail), " (guest 0x%08llX)", (unsigned long long)offset);
+            text += detail;
+        }
+        if (ppc::Context *c = kernel::Kernel::current_context()) {
+            std::snprintf(detail, sizeof(detail), ", guest thread at 0x%08X, lr 0x%08X", c->pc, uint32_t(c->lr));
+            text += detail;
+        }
+        print_summary(*the_game, "crash", text);
+    }
     std::fflush(stdout);
     ExitProcess(3);
 }
@@ -171,6 +186,7 @@ void load_game_library(const Options &options, Game &g) {
     size_t functions = 0;
     for (size_t i = 0; i < loaded->count; i++) functions += loaded->modules[i]->count;
     g.kernel->set_generated_modules(loaded->modules, loaded->count);
+    g.generated_modules = loaded->count, g.generated_functions = functions;
     std::printf("generated code: %zu modules, %zu functions (the game library %s)\n", loaded->count, functions,
                 library.string().c_str());
 }
@@ -199,6 +215,7 @@ bool open(const Options &options, Game &g, std::string &error) {
     size_t functions = 0;
     for (size_t i = 0; i < xf_module_count; i++) functions += xf_modules[i]->count;
     if (!options.interpret) k.set_generated_modules(xf_modules, xf_module_count);
+    if (!options.interpret) g.generated_modules = xf_module_count, g.generated_functions = functions;
     std::printf("generated code: %zu modules, %zu functions%s\n", size_t(xf_module_count), functions,
                 options.interpret ? " (left out: --interpret)" : "");
 #else
@@ -398,6 +415,70 @@ uint64_t resident_bytes() {
     std::fclose(statm);
     return uint64_t(resident) * uint64_t(sysconf(_SC_PAGESIZE));
 #endif
+}
+
+namespace {
+// a JSON string's body
+std::string json_escape(const std::string &text) {
+    std::string out;
+    for (unsigned char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += char(c);
+        } else if (c < 0x20 || c == 0x7F) {
+            char hex[8];
+            std::snprintf(hex, sizeof(hex), "\\u%04x", c);
+            out += hex;
+        } else
+            out += char(c);
+    }
+    return out;
+}
+} // namespace
+
+void print_summary(Game &g, const std::string &state, const std::string &detail) {
+    kernel::Kernel &k = *g.kernel;
+    char text[256];
+    std::string out = "xf-summary {";
+    std::snprintf(text, sizeof(text), "\"title_id\":\"%08X\",\"digest\":\"%016llx\",", g.xex.execution.title_id,
+                  (unsigned long long)image_digest(g.xex.image));
+    out += text;
+    out += "\"state\":\"" + json_escape(state) + "\",\"detail\":\"" + json_escape(detail) + "\",";
+    std::snprintf(text, sizeof(text),
+                  "\"modules\":%zu,\"functions\":%zu,\"interpreted_entries\":%llu,\"interpreted_addresses\":%zu,"
+                  "\"swaps\":%llu,\"draws\":%llu,",
+                  g.generated_modules, g.generated_functions, (unsigned long long)k.interpreted_entries(),
+                  k.interpreted_targets().size(),
+                  (unsigned long long)kernel::gpu_command_processor(k).counts().swaps.load(),
+                  (unsigned long long)kernel::gpu_command_processor(k).counts().draws.load());
+    out += text;
+    // the exports called without an implementation, the most called first
+    std::vector<std::pair<uint64_t, std::string>> missing;
+    auto absent = k.unimplemented();
+    for (const auto &[name, n] : k.calls())
+        if (absent.count(name)) missing.push_back({n, name});
+    std::sort(missing.rbegin(), missing.rend());
+    out += "\"unimplemented\":[";
+    for (size_t i = 0; i < missing.size() && i < 8; i++)
+        out += (i ? ",\"" : "\"") + json_escape(missing[i].second) + "\"";
+    out += "],\"gpu\":[";
+    // the GPU's gaps: draws skipped and done approximately, by what (the renderer's, when it runs)
+    size_t listed = 0;
+    render::Report r;
+    if (g.renderer && g.renderer->try_report(r)) {
+        auto list = [&](const char *kind, const std::map<std::string, uint64_t> &counts) {
+            std::vector<std::pair<uint64_t, std::string>> by;
+            for (const auto &[what, n] : counts) by.push_back({n, what});
+            std::sort(by.rbegin(), by.rend());
+            for (size_t i = 0; i < by.size() && i < 4; i++, listed++)
+                out += std::string(listed ? ",\"" : "\"") + kind + ": " + json_escape(by[i].second) + "\"";
+        };
+        list("skipped", r.skipped);
+        list("approx", r.approximate);
+    }
+    out += "]}";
+    std::printf("%s\n", out.c_str());
+    std::fflush(stdout);
 }
 
 void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {

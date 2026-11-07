@@ -35,6 +35,9 @@
 // clock, the renderer's time), as the player's --rates does. --stall-report S
 // prints the threads (what each waits for, its guest stack by the back chain)
 // when no swap has come for S seconds (5 S before the first), once a stall.
+// The last line is "xf-summary {json}" (game.h, print_summary), what xfcompat
+// reads: title, digest, state (ok, stall, stopped, ended, crash), generated
+// code, interpreter entries, swaps, the exports and GPU gaps counted.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
@@ -195,6 +198,17 @@ int main(int argc, char **argv) {
         std::printf("still running after %u s\n", seconds);
     std::printf("threads:\n%s", k.thread_report().c_str());
     game::print_report(g, true);
+    // the machine-readable end (xfcompat reads it): a stall still under way at the end is the state
+    {
+        char text[64];
+        std::snprintf(text, sizeof(text), "exit code 0x%08X", exit_code);
+        if (k.stopped)
+            game::print_summary(g, "stopped", k.stop_reason);
+        else if (ended)
+            game::print_summary(g, "ended", text);
+        else
+            game::print_summary(g, stall_reported ? "stall" : "ok");
+    }
     // other threads may still run: no destructors under them
     std::fflush(stdout);
     std::_Exit(0);

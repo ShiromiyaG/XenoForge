@@ -191,6 +191,9 @@ int main() {
     CHECK(frontend::game_status(false, true, true) == frontend::GameStatus::Ready);
     CHECK(frontend::game_status(false, false, false) == frontend::GameStatus::NeedsPreparing);
     CHECK(frontend::game_status(false, false, true) == frontend::GameStatus::Interpreted);
+    CHECK(frontend::game_status(true, false, false, true) == frontend::GameStatus::Stale);
+    CHECK(frontend::game_status(false, false, false, true) == frontend::GameStatus::NeedsPreparing);
+    CHECK(std::string(frontend::status_class(frontend::GameStatus::Stale)) == "stale");
     {
         // which player: a cached library means the generic one, else the player carrying the code, else the generic
         frontend::PlayerBinary generic, carrying, other;

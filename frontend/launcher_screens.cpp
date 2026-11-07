@@ -45,7 +45,7 @@ std::vector<MenuItem> LauncherView::menu_items(const std::string &name) {
     const bool building = job_.active();
     const GameStatus status = g ? status_of(*g) : GameStatus::Ready;
     const bool playable = g && player_of(*g) && !running;
-    const char *prepare = status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : "Rebuild the library";
+    const char *prepare = status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild the library with the new code" : "Rebuild the library";
     if (name == "file")
         return {item("browse", "Open games folder...", "Ctrl+O", "folder-open"), item("rescan", "Rescan the folder", "F5", "refresh-cw"), menu_separator(),
                 item("exit", "Exit", "Alt+F4", "log-out")};
@@ -207,7 +207,7 @@ void LauncherView::show_about() {
 
 void LauncherView::begin_prepare(const GameEntry &game, bool demo) {
     PrepareJob::Runner runner = demo ? PrepareJob::demo_runner(opt_.demo_speed, opt_.demo_fail)
-                                     : PrepareJob::build_runner(game.path, build::default_cache_dir(), opt_.build_jobs);
+                                     : PrepareJob::build_runner(game.path, build::default_cache_dir(), opt_.build_jobs, cached_of(game));
     prepare_title_ = game.title;
     prepare_title_id_ = game.title_id;
     prepare_listed_ = false;
@@ -266,7 +266,7 @@ void LauncherView::update_prepare() {
     // its dialog is not showing
     if (s.finished && !prepare_listed_) {
         prepare_listed_ = true;
-        cached_.clear(), rows_sig_.clear();
+        cached_.clear(), stale_.clear(), rows_sig_.clear();
         if (failed) failed_.insert(prepare_title_id_);
         if (done) failed_.erase(prepare_title_id_);
         if (dialog_ != Dialog::Prepare || s.cancelled) {
@@ -409,6 +409,8 @@ void LauncherView::update() {
 
     // a game's end: how it went, in the status bar and the console
     if (core_.poll()) {
+        stale_.clear(); // the run may have logged entries the library lacks (stale_library.h)
+        rows_sig_.clear();
         const LauncherCore::Run &run = core_.run();
         const double seconds = std::chrono::duration<double>(Clock::now() - run.started).count();
         std::printf("launcher: %s ended after %.1f s\n", run.title.c_str(), seconds);
