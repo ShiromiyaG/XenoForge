@@ -178,3 +178,5 @@
 .msg { max-width: 100%; }
 /* the menus' layer starts below the menu bar, so the bar's titles stay live while a menu is open */
 #menu-layer { top: 30dp; height: auto; bottom: 0; }
+/* the open menu itself, placed in the window's coordinates from this corner */
+#menu-host { position: absolute; left: 0; top: 0; width: 0; height: 0; }

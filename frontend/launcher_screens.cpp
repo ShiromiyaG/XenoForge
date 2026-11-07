@@ -84,24 +84,28 @@ std::vector<MenuItem> LauncherView::menu_items(const std::string &name) {
 }
 
 void LauncherView::open_menu(const std::string &name, bool keyboard) {
+    // the layer below the menu bar catches a click outside the menu; the menu
+    // itself is in a host at the window's corner, so its place is the
+    // window's coordinates (the layer has no place of its own until it has
+    // been laid out open once)
     Rml::Element *layer = by_id("menu-layer");
-    if (!layer) return;
+    Rml::Element *host = by_id("menu-host");
+    if (!layer || !host) return;
     if (!menu_.empty() && menu_ != "context")
         if (Rml::Element *t = by_id(("menu-" + menu_).c_str())) t->SetClass("open", false);
     menu_ = name;
     menu_keyboard_ = keyboard;
     menu_items_ = menu_items(name);
-    layer->SetInnerRML(menu_html(menu_items_));
+    host->SetInnerRML(menu_html(menu_items_));
     layer->SetClass("open", true);
     hot_ = -1;
     Rml::Element *menu = by_id("menu");
     Rml::Element *title = by_id(("menu-" + name).c_str());
     if (menu && title) {
         title->SetClass("open", true);
-        const Rml::Vector2f origin = layer->GetAbsoluteOffset(Rml::BoxArea::Border);
         const Rml::Vector2f at = title->GetAbsoluteOffset(Rml::BoxArea::Border);
-        menu->SetProperty("left", px(at.x - origin.x));
-        menu->SetProperty("top", px(at.y + title->GetBox().GetSize(Rml::BoxArea::Border).y - origin.y + 1 * dp()));
+        menu->SetProperty("left", px(at.x));
+        menu->SetProperty("top", px(at.y + title->GetBox().GetSize(Rml::BoxArea::Border).y + 1 * dp()));
     }
     if (keyboard) menu_move(1);
     settle_until_ = std::max(settle_until_, now_ + 0.3);
@@ -109,25 +113,20 @@ void LauncherView::open_menu(const std::string &name, bool keyboard) {
 
 void LauncherView::open_context_menu(float x, float y) {
     open_menu("context", false);
-    Rml::Element *layer = by_id("menu-layer");
     Rml::Element *menu = by_id("menu");
-    if (!layer || !menu) return;
-    const Rml::Vector2f origin = layer->GetAbsoluteOffset(Rml::BoxArea::Border);
-    menu->SetProperty("left", px(x - origin.x));
-    menu->SetProperty("top", px(y - origin.y));
+    if (!menu) return;
+    // at the pointer, in the window's coordinates
+    menu->SetProperty("left", px(x));
+    menu->SetProperty("top", px(y));
     // kept inside the window once it has its size (the frame after next)
-    defer([this] {
-        defer([this] {
-            Rml::Element *layer = by_id("menu-layer");
+    defer([this, x, y] {
+        defer([this, x, y] {
             Rml::Element *menu = by_id("menu");
-            if (!layer || !menu || menu_ != "context") return;
+            if (!menu || menu_ != "context") return;
             const Rml::Vector2f size = menu->GetBox().GetSize(Rml::BoxArea::Border);
-            const float left = menu->GetOffsetLeft(), top = menu->GetOffsetTop();
-            // the room below and to the right of the layer's corner, in the window
-            const Rml::Vector2f origin = layer->GetAbsoluteOffset(Rml::BoxArea::Border);
-            const float room_w = float(ctx_->GetDimensions().x) - origin.x, room_h = float(ctx_->GetDimensions().y) - origin.y;
-            if (left + size.x > room_w) menu->SetProperty("left", px(std::max(0.f, room_w - size.x - 4 * dp())));
-            if (top + size.y > room_h) menu->SetProperty("top", px(std::max(0.f, top - size.y)));
+            const float room_w = float(ctx_->GetDimensions().x), room_h = float(ctx_->GetDimensions().y);
+            if (x + size.x > room_w) menu->SetProperty("left", px(std::max(0.f, room_w - size.x - 4 * dp())));
+            if (y + size.y > room_h) menu->SetProperty("top", px(std::max(0.f, y - size.y)));
         });
     });
 }
@@ -135,10 +134,8 @@ void LauncherView::open_context_menu(float x, float y) {
 void LauncherView::close_menu() {
     if (menu_.empty()) return;
     if (Rml::Element *t = by_id(("menu-" + menu_).c_str())) t->SetClass("open", false);
-    if (Rml::Element *layer = by_id("menu-layer")) {
-        layer->SetClass("open", false);
-        layer->SetInnerRML("");
-    }
+    if (Rml::Element *layer = by_id("menu-layer")) layer->SetClass("open", false);
+    if (Rml::Element *host = by_id("menu-host")) host->SetInnerRML("");
     menu_.clear();
     menu_items_.clear();
     hot_ = -1;
@@ -466,10 +463,15 @@ void LauncherView::update() {
     }
     if (context_pending_ && !listing_.busy && selected_game() && now_ > 0.8) { // the rows laid out by then
         context_pending_ = false;
-        if (Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str())) {
-            const Rml::Vector2f at = row->GetAbsoluteOffset(Rml::BoxArea::Border);
-            open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
-        }
+        // the row's place once it has been laid out (the rows may just have been made again)
+        defer([this] {
+            defer([this] {
+                if (Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str())) {
+                    const Rml::Vector2f at = row->GetAbsoluteOffset(Rml::BoxArea::Border);
+                    open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
+                }
+            });
+        });
     }
 
     if (job_.state().started) update_prepare();

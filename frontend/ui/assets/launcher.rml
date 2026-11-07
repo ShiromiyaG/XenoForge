@@ -40,6 +40,7 @@
         </div>
     </div>
     <div id="menu-layer"></div>
+    <div id="menu-host"></div>
     <div id="dialog-layer"></div>
 </body>
 </rml>
