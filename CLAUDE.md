@@ -41,7 +41,10 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
 - **Renderizador (B3)**: `build/xfreplay <xtr> -o frame.png --compare <png do trace-dump> [--diff d.png] [-v]`;
   regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 29 frames batem com o Xenia; a referência é o
   dump D3D12 do Xenia, `xenia-gpu-d3d12-trace-dump.exe`, em `../traces/dumps/d3d12`, com o Vulkan onde não há
-  D3D12 ou os dois discordam: parque e corrida do Chaves).
+  D3D12 ou os dois discordam: parque e corrida do Chaves). Desde 2026-11-06 o padrão é a EDRAM exata via
+  fragment shader interlock (FSI) onde o device tem: aí o `replay_test` compara sozinho com os dumps exatos do
+  Xenia em `../traces/dumps/rov` (`rov/d3d12` = ROV, `rov` = FSI do Vulkan); `XF_RENDER_TARGET_PATH=host` volta
+  aos render targets do host e aos dumps de antes.
   Saídas do replay em `../traces/replay/`. `XF_VK_VALIDATION=1` liga a validação do Vulkan.
 - **Traces das nossas execuções** (o oráculo sem jogar no Xenia): `boot_<jogo> <iso> --trace-frames N,M
   --trace-dir <pasta>` (no player, `XF_TRACE_FRAMES`/`XF_TRACE_DIR`) grava `.xtr` no formato do Xenia; o
