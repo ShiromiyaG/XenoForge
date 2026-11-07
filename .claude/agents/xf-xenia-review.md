@@ -62,6 +62,12 @@ output.
 - **The report is short:** about 30 lines, the essentials of the list below. Details belong in the docs
   you changed, not in the report.
 
+## Test budget (the owner's rule, 2026-11-06)
+
+A review reads; it runs something only to settle one question, once, under a timeout. No suites, no
+repeated runs: at most 10 minutes of running anything in the whole review. What a run cannot settle
+quickly goes in the report as a question.
+
 ## Report
 
 Return the findings, most severe first. For each one give:

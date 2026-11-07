@@ -96,6 +96,21 @@ output.
 - **The report is short:** about 30 lines, the essentials of the list below. Details belong in the docs
   you changed, not in the report.
 
+## Test budget (the owner's rule, 2026-11-06)
+
+Tests serve the work; they never become the work. An agent once spent over half an hour rerunning the
+whole replay suite while iterating.
+- **While iterating, run the narrowest check:** one test binary, one trace or frame, one test filter, one
+  20-30 s boot. The full suite (all of ctest, all of replay_test) runs once at the end, and once more
+  only if a fix followed a failure in it.
+- **At most 30 minutes of testing in a row** (wall time, builds aside) without a new finding. Past that,
+  stop and report what passes, what fails and what is left; whoever launched you decides what next.
+- **A run that hangs or passes its timeout is a finding, not something to retry:** kill it, note the
+  command and where it stopped, retry at most once; a second hang goes in the report as open.
+- **The same failing check gets at most three fix-and-rerun rounds.** Then it goes in the report as open,
+  with what was learned.
+- Never loop runs to watch a number, and never rerun a suite that passed to confirm it.
+
 ## Report
 
 When done, report:
