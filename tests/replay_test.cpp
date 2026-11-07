@@ -12,6 +12,13 @@
 // and the line says so: what differs between them is open (renderer.md).
 // With XF_LINKED_PIPELINES=1 every draw is drawn by a pipeline linked from
 // libraries (VK_EXT_graphics_pipeline_library), which must draw the same.
+//
+// The pictures are those of the render target path the renderer takes
+// (render::render_target_path; XF_RENDER_TARGET_PATH=fsi or host forces
+// one): on the interlock path Xenia's own exact ones, XF_DUMPS/rov (its
+// Direct3D 12 ROV dump in rov/d3d12, its Vulkan FSI dump in rov itself:
+// `--render_target_path_d3d12=rov`, `--render_target_path_vulkan=fsi`), where
+// they are; on host render targets Xenia's default ones, as above.
 
 #include "check.h"
 #include "xenoforge/renderer.h"
@@ -96,12 +103,18 @@ int main() {
         else
             std::printf("XF_LINKED_PIPELINES: the device has no graphics pipeline libraries; whole pipelines\n");
     }
+    std::filesystem::path pictures = dumps;
+    if (xf::render::render_target_path(*device, options) == xf::render::Options::RenderTargetPath::fsi &&
+        std::filesystem::is_directory(pictures / "rov")) {
+        pictures /= "rov";
+        std::printf("the interlock render target path: Xenia's ROV and FSI pictures (%s)\n", pictures.string().c_str());
+    }
     int compared = 0, vulkan_only = 0;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(traces)) {
         if (entry.path().extension() != ".xtr") continue;
         std::string name = entry.path().stem().string() + ".png";
-        std::optional<Picture> d3d12 = load(std::filesystem::path(dumps) / "d3d12" / name);
-        std::optional<Picture> vulkan = load(std::filesystem::path(dumps) / name);
+        std::optional<Picture> d3d12 = load(pictures / "d3d12" / name);
+        std::optional<Picture> vulkan = load(pictures / name);
         if (!d3d12 && !vulkan) continue;
         xf::GpuTrace trace;
         CHECK(xf::open_gpu_trace(entry.path(), trace, error));

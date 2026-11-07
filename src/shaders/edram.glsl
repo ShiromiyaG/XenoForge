@@ -7,7 +7,11 @@
 // Xenia's host render targets keep it (render_target_cache.h's
 // OwnershipRange, the host depth transfers of d3d12_render_target_cache.cc).
 // BSD; see LICENSE-xenia.
+//
+// With EDRAM_NO_TARGET defined (edram_fsi.frag, the pixel shader writing
+// EDRAM itself), only the conversions that need no push constants.
 
+#ifndef EDRAM_NO_TARGET
 layout(push_constant) uniform Target {
     uint base_tiles;
     uint pitch_tiles; // at the target's bits per sample
@@ -27,11 +31,15 @@ layout(push_constant) uniform Target {
     // 32_FLOAT, 32_32_FLOAT) moved by its bits, through a UINT view of its
     // image (pack_raw), so NaN payloads and denormals survive.
     uint flags;
+    // edram_clear.comp: the rectangle's corner and the clear's words
+    uint x, y, clear_lo, clear_hi;
 } target;
+#endif
 
 const uint TILE_DWORDS = 80u * 16u;
 const uint EDRAM_DWORDS = TILE_DWORDS * 2048u;
 
+#ifndef EDRAM_NO_TARGET
 // The dword of a pixel's guest sample. 4x: bit 0 of the sample horizontal,
 // bit 1 vertical; 2x: sample 0 the top one.
 uint edram_offset(uvec2 pixel, uint sample_index) {
@@ -60,6 +68,7 @@ uint edram_offset(uvec2 pixel, uint sample_index) {
 // The host's sample index to the guest's: Vulkan's standard 2x locations put
 // the top sample at index 1.
 uint guest_sample(uint host_sample) { return target.msaa == 1u ? host_sample ^ 1u : host_sample; }
+#endif
 
 float float7e3_to_32(uint f10) {
     f10 &= 0x3FFu;
@@ -105,6 +114,7 @@ float float20e4_to_32(uint f24) {
     return uintBitsToFloat((uint(exponent + 112) << 23u) | (mantissa << 3u));
 }
 
+#ifndef EDRAM_NO_TARGET
 // Depth as the host keeps it to the guest's 24 bits. D24FS8's 0-2 is kept as
 // 0-1 (halved, as Xenia's host render targets keep it), so all of it survives
 // the host's 0-1 depth: color bits moved through a depth target come back
@@ -126,6 +136,7 @@ float unpack_depth(uint word) {
     // xenos::UNorm24To32: exact, 0xFFFFFF to 1
     return target.format == 0u ? float(d24 + (d24 >> 23u)) * (1.0 / 16777216.0) : float20e4_to_32(d24) * 0.5;
 }
+#endif
 
 // xenos.cc's LinearToPWLGamma (saturated, NaN to 0): the 8-bit gamma code
 // over 255, for an 8_8_8_8_GAMMA target kept linear
@@ -160,6 +171,7 @@ float pwl_gamma_byte_to_linear_midpoint(uint b) {
 uint pack_snorm16(float v) { return uint(int(round(clamp(v, -1.0, 1.0) * 32767.0))) & 0xFFFFu; }
 float unpack_snorm16(uint bits) { return max(-1.0, float(int(bits << 16u) >> 16) / 32767.0); }
 
+#ifndef EDRAM_NO_TARGET
 // A color the host keeps to the guest's bits (two dwords for 64-bit formats).
 uvec2 pack_color(vec4 v) {
     switch (target.format) {
@@ -227,3 +239,4 @@ vec4 unpack_color(uvec2 b) {
     }
     return vec4(0.0);
 }
+#endif

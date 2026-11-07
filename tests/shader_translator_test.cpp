@@ -89,6 +89,26 @@ void translates(const ParsedShader &shader, const std::string &name) {
             CHECK(t.ok());
             if (t.ok()) CHECK(validates(t.spirv, name + "_float24_" + std::to_string(mode)));
         }
+#ifdef XF_EDRAM_FSI_LIBRARY
+    // the interlock path: the output merger taken in (edram_fsi.frag's
+    // library), under pixel and sample interlock, with centroids
+    if (shader.type == ShaderType::Pixel) {
+        static const uint32_t library[] = {
+#include XF_EDRAM_FSI_LIBRARY
+        };
+        for (uint8_t fsi = 1; fsi <= 2; fsi++) {
+            shader::PixelOptions options;
+            options.fsi = fsi;
+            options.centroid = fsi == 2 ? 0xFFFF : 0;
+            options.edram_library = library;
+            auto t = shader::translate(shader, shader::Stage::Pixel, {}, options);
+            CHECK(t.ok());
+            if (!t.ok())
+                for (auto &u : t.unsupported) std::printf("  %s fsi: %s\n", name.c_str(), u.c_str());
+            if (t.ok()) CHECK(validates(t.spirv, name + "_fsi_" + std::to_string(fsi)));
+        }
+    }
+#endif
 }
 
 void every_operation() {

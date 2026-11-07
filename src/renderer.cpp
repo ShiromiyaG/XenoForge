@@ -141,6 +141,20 @@ const uint32_t RESOLVE[] = {
 const uint32_t TEXTURE_LOAD[] = {
 #include "texture_load.comp.inc"
 };
+// the interlock path's (edram_fsi.frag): the output merger the translated
+// pixel shaders take in, the depth-only fragment shaders, and EDRAM's clears
+const uint32_t EDRAM_FSI_LIBRARY[] = {
+#include "edram_fsi_library.frag.inc"
+};
+const uint32_t EDRAM_FSI_DEPTH_PIXEL[] = {
+#include "edram_fsi_depth_pixel.frag.inc"
+};
+const uint32_t EDRAM_FSI_DEPTH_SAMPLE[] = {
+#include "edram_fsi_depth_sample.frag.inc"
+};
+const uint32_t EDRAM_CLEAR[] = {
+#include "edram_clear.comp.inc"
+};
 
 // registers xenos.h does not name
 namespace r {
@@ -459,7 +473,21 @@ struct RenderTarget {
 // edram.glsl's push constants
 struct EdramTarget {
     uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, flags;
+    uint32_t x, y, clear_lo, clear_hi; // edram_clear.comp's
 };
+
+// edram_fsi.frag's uniform block (set 0 binding 4): the interlock path's
+// render target state
+struct FsiConstants {
+    uint32_t flags, depth_base, pitch, zpd_index;
+    uint32_t rt[4], blend[4], rt_base[4], stencil[4];
+    float poly_offset[4], blend_constant[4], exp_bias[4];
+    bool operator==(const FsiConstants &) const = default;
+};
+static_assert(sizeof(FsiConstants) == 128);
+// its flags (edram_fsi.frag's F_ bits; the MSAA mode in bits 0-1)
+constexpr uint32_t FSI_2X_AS_4X = 4, FSI_DEPTH_STENCIL = 8, FSI_DEPTH_LESS = 16, FSI_DEPTH_WRITE = 128,
+                   FSI_STENCIL = 256, FSI_FLOAT24 = 512;
 
 // resolve.comp's push constants
 struct ResolveConstants {
@@ -691,6 +719,9 @@ struct Pass {
     VkImageView colors[4] = {};
     VkImageView depth = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0;
+    // the interlock path's passes have no attachments: their draws' samples
+    // apart (all pipelines in such a pass rasterize at one count)
+    uint32_t samples = 0;
     bool operator==(const Pass &) const = default;
 };
 
@@ -728,11 +759,29 @@ struct PipelineDesc {
     VkPipeline libraries[4]{};
     VkPipelineLibraryCreateInfoKHR library_list{};
     VkGraphicsPipelineCreateInfo info{};
+    // a stage's specialization (the interlock path's fragment shader)
+    VkSpecializationInfo spec{};
+    VkSpecializationMapEntry spec_entries[16]{};
+    uint32_t spec_data[16]{};
+    // the multisample state's sample locations (the interlock path's)
+    VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{};
+    VkSampleLocationEXT locations[4]{};
 
     explicit PipelineDesc(const VkGraphicsPipelineCreateInfo &from) : info(from) {
         info.stageCount = std::min<uint32_t>(from.stageCount, uint32_t(std::size(stages)));
         std::copy_n(from.pStages, info.stageCount, stages);
         info.pStages = stages;
+        for (uint32_t i = 0; i < info.stageCount; i++) {
+            const VkSpecializationInfo *s = stages[i].pSpecializationInfo;
+            if (!s) continue;
+            spec = *s;
+            spec.mapEntryCount = std::min<uint32_t>(spec.mapEntryCount, 16);
+            spec.dataSize = std::min<size_t>(spec.dataSize, sizeof(spec_data));
+            std::copy_n(s->pMapEntries, spec.mapEntryCount, spec_entries);
+            std::memcpy(spec_data, s->pData, spec.dataSize);
+            spec.pMapEntries = spec_entries, spec.pData = spec_data;
+            stages[i].pSpecializationInfo = &spec;
+        }
         // the chain, each structure copied and linked again in the same order
         const void **tail = &info.pNext;
         for (auto *in = static_cast<const VkBaseInStructure *>(from.pNext); in; in = in->pNext) {
@@ -777,7 +826,19 @@ struct PipelineDesc {
         own(info.pTessellationState, tessellation);
         own(info.pViewportState, viewport);
         own(info.pRasterizationState, raster);
-        own(info.pMultisampleState, multisample);
+        if (own(info.pMultisampleState, multisample) && multisample.pNext) {
+            const auto *in = static_cast<const VkBaseInStructure *>(multisample.pNext);
+            multisample.pNext = nullptr;
+            if (in->sType == VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT) {
+                sample_locations = *reinterpret_cast<const VkPipelineSampleLocationsStateCreateInfoEXT *>(in);
+                VkSampleLocationsInfoEXT &l = sample_locations.sampleLocationsInfo;
+                l.sampleLocationsCount = std::min<uint32_t>(l.sampleLocationsCount, 4);
+                std::copy_n(l.pSampleLocations, l.sampleLocationsCount, locations);
+                l.pSampleLocations = locations;
+                sample_locations.pNext = nullptr;
+                multisample.pNext = &sample_locations;
+            }
+        }
         own(info.pDepthStencilState, depth);
         if (own(info.pColorBlendState, blend) && blend.pAttachments) {
             blend.attachmentCount = std::min<uint32_t>(blend.attachmentCount, 4);
@@ -1297,7 +1358,8 @@ private:
     }
     void end_query() {
         if (zpd_active_ == UINT32_MAX) return;
-        vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
+        // (the interlock path's counters are no host queries)
+        if (!fsi_) vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
         zpd_active_ = UINT32_MAX;
     }
     void zpd_report_ended(uint64_t ended, uint64_t next) {
@@ -1311,7 +1373,7 @@ private:
     }
     // before a draw that rasterizes, in its render pass: the query its report counts it with
     void zpd_draw(VkCommandBuffer c) {
-        if (!zpd_current_ || zpd_active_ != UINT32_MAX) return;
+        if (fsi_ || !zpd_current_ || zpd_active_ != UINT32_MAX) return;
         Slot &s = slots_[current_];
         if (!s.occlusion || s.occlusion_reports.size() >= OCCLUSION_QUERIES) {
             zpd_counts_[zpd_current_].uncounted = true;
@@ -1328,8 +1390,15 @@ private:
     void zpd_collect(Slot &s) {
         if (s.occlusion_reports.empty()) return;
         std::vector<uint64_t> samples(s.occlusion_reports.size());
-        vkGetQueryPoolResults(dev_, s.occlusion, 0, uint32_t(samples.size()), samples.size() * 8, samples.data(), 8,
-                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (fsi_) {
+            // the shaders' counters (FsiConstants::zpd_index), read back as the slot ended
+            const uint32_t *counts = reinterpret_cast<const uint32_t *>(zpd_readback_.mapped) +
+                                     size_t(&s - slots_) * OCCLUSION_QUERIES;
+            std::copy(counts, counts + samples.size(), samples.begin());
+        } else {
+            vkGetQueryPoolResults(dev_, s.occlusion, 0, uint32_t(samples.size()), samples.size() * 8, samples.data(),
+                                  8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        }
         for (size_t i = 0; i < samples.size(); i++) {
             auto it = zpd_counts_.find(s.occlusion_reports[i]);
             if (it == zpd_counts_.end()) continue;
@@ -1528,6 +1597,26 @@ private:
     VkFormat d24s8_ = VK_FORMAT_D24_UNORM_S8_UINT;
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm (RenderTarget::gamma_linear)
     bool gamma_unorm16_ = false;
+
+    // ---- the interlock path (Options::render_target_path fsi) ----
+    // 0: host render targets; 1 under pixel interlock, 2 under sample
+    // interlock. The pixel shaders read and write edram_ themselves (set 0
+    // binding 5), with the state of FsiConstants (binding 4) or of the
+    // pipeline's specialization; no render targets are made, resolves read
+    // EDRAM, clears write it, and occlusion counts are the shaders' (binding
+    // 6, a slot's share each, read back at its end).
+    uint32_t fsi_ = 0;
+    bool fsi_2x_as_4x_ = false;         // the guest's 2x rasterized as 4x (no 2x without attachments)
+    VkShaderModule fsi_depth_fs_ = VK_NULL_HANDLE; // depth and stencil alone (no pixel shader)
+    VkPipeline clear_pipeline_ = VK_NULL_HANDLE;
+    vk::Buffer zpd_counters_, zpd_readback_;
+    FsiConstants last_fsi_{};
+    VkDeviceSize last_fsi_at_ = NONE;
+    // a target's place in EDRAM, as a resolve reads it: a RenderTarget
+    // without an image
+    RenderTarget edram_view(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format) const;
+    void fsi_clear(const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t lo, uint32_t hi);
+    uint32_t fsi_zpd_index(); // the counter the draw counts in, ~0 none
 };
 
 Impl::~Impl() {
@@ -1570,10 +1659,10 @@ Impl::~Impl() {
     for (VkShaderModule m : tessellation_hs_)
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (auto &[k, p] : load_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
-    for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_})
+    for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_, clear_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
     for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
-                             depth_float24_fs_[1], placeholder_fs_})
+                             depth_float24_fs_[1], placeholder_fs_, fsi_depth_fs_})
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (VkDescriptorPool p : edram_pools_) vkDestroyDescriptorPool(dev_, p, nullptr);
     for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_})
@@ -1583,7 +1672,8 @@ Impl::~Impl() {
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
                                     compute_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
-    for (vk::Buffer *b : {&edram_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_}) d_.destroy(*b);
+    for (vk::Buffer *b : {&edram_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_, &zpd_counters_, &zpd_readback_})
+        d_.destroy(*b);
 }
 
 // keep: destroyed with the renderer, else by the caller
@@ -1731,6 +1821,17 @@ bool Impl::init(std::string &error) {
     if (!mirror_.buffer || !arena_.buffer || !scratch_.buffer || !load_scratch_.buffer)
         return error = "could not make the renderer's buffers (512 MB of device memory for guest memory's mirror)", false;
 
+    // The render target path (Options::render_target_path): the interlock
+    // one where asked for (XF_RENDER_TARGET_PATH=fsi or host forces either)
+    // and the device has fragment shader interlock, host render targets
+    // otherwise; automatic is host (docs/renderer.md, "Exact EDRAM through
+    // fragment shader interlock", has the measurements). The guest's 2x is
+    // rasterized as 4x where a render pass without attachments takes no 2x.
+    {
+        if (render_target_path(d_, options_) == Options::RenderTargetPath::fsi) fsi_ = d_.fragment_shader_interlock();
+        fsi_2x_as_4x_ = fsi_ && !(d_.no_attachments_samples() & VK_SAMPLE_COUNT_2_BIT);
+        if (const char *e = std::getenv("XF_FSI_DYNAMIC"); e && *e && *e != '0') options_.fsi_specialized = false;
+    }
     // D24S8 as a 32-bit float depth where the device has no 24-bit unorm
     // depth (AMD), or where XF_DEPTH_FALLBACK=1 asks for it, to test that path
     const char *depth_fallback = std::getenv("XF_DEPTH_FALLBACK");
@@ -1788,11 +1889,16 @@ bool Impl::init(std::string &error) {
     VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     // the guest's vertex shader run as a domain shader reads all of it too
     if (d_.tessellation_shader()) stages |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
-    VkDescriptorSetLayoutBinding b0[4] = {
+    // (4 to 6 the interlock path's: its constants, EDRAM, the occlusion
+    // counters; bound in either path, read only by its pixel shaders)
+    VkDescriptorSetLayoutBinding b0[7] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr},
         {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
         {3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
     };
     VkDescriptorSetLayoutBinding b1[4] = {
         {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacity_[0], stages, nullptr},
@@ -1808,10 +1914,11 @@ bool Impl::init(std::string &error) {
     flags.bindingCount = 4;
     flags.pBindingFlags = partly;
     VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    set_info.bindingCount = 4;
+    set_info.bindingCount = 7;
     set_info.pBindings = b0;
     if (vkCreateDescriptorSetLayout(dev_, &set_info, nullptr, &set_layouts_[0]) != VK_SUCCESS)
         return error = "vkCreateDescriptorSetLayout failed", false;
+    set_info.bindingCount = 4;
     set_info.pNext = &flags;
     set_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
     set_info.pBindings = b1;
@@ -1823,7 +1930,7 @@ bool Impl::init(std::string &error) {
     if (vkCreatePipelineLayout(dev_, &layout_info, nullptr, &layout_) != VK_SUCCESS)
         return error = "vkCreatePipelineLayout failed", false;
     {
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 6}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool.maxSets = 2;
         pool.poolSizeCount = 2;
@@ -1903,6 +2010,35 @@ bool Impl::init(std::string &error) {
     host_depth_ = d_.create_buffer(EDRAM_BYTES * (host_depth_kept(0) ? 2 : 1),
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
     if (!host_depth_.buffer) return error = "could not make the host depth buffer", false;
+    // the interlock path's occlusion counters: a slot's share each, zeroed as
+    // it begins recording, copied for the CPU as it ends
+    zpd_counters_ = d_.create_buffer(VkDeviceSize(SLOTS) * OCCLUSION_QUERIES * 4,
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                     false);
+    zpd_readback_ = d_.create_buffer(VkDeviceSize(SLOTS) * OCCLUSION_QUERIES * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                     true, true);
+    if (!zpd_counters_.buffer || !zpd_readback_.buffer) return error = "could not make the occlusion counters", false;
+    for (int k = 0; k < 2; k++) {
+        VkDescriptorBufferInfo buffers[3] = {{arena_.buffer, 0, sizeof(FsiConstants)},
+                                             {edram_.buffer, 0, VK_WHOLE_SIZE},
+                                             {zpd_counters_.buffer, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[3] = {};
+        for (uint32_t b = 0; b < 3; b++) {
+            writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[b].dstSet = draw_sets_[k];
+            writes[b].dstBinding = 4 + b;
+            writes[b].descriptorCount = 1;
+            writes[b].descriptorType = b ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            writes[b].pBufferInfo = &buffers[b];
+        }
+        vkUpdateDescriptorSets(dev_, 3, writes, 0, nullptr);
+    }
+    if (fsi_) {
+        fsi_depth_fs_ = fsi_ == 2 ? module(EDRAM_FSI_DEPTH_SAMPLE, sizeof(EDRAM_FSI_DEPTH_SAMPLE))
+                                  : module(EDRAM_FSI_DEPTH_PIXEL, sizeof(EDRAM_FSI_DEPTH_PIXEL));
+        if (!fsi_depth_fs_) return error = "could not make the interlock path's depth shader", false;
+    }
     {
         VkDescriptorSetLayoutBinding store[5] = {
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
@@ -2012,6 +2148,11 @@ bool Impl::init(std::string &error) {
         resolve_pipeline_ = compute_pipeline(RESOLVE, sizeof(RESOLVE), resolve_layout_);
         load_pipeline_ = compute_pipeline(TEXTURE_LOAD, sizeof(TEXTURE_LOAD), load_layout_);
         if (!resolve_pipeline_ || !load_pipeline_) return error = "could not make the resolve and load pipelines", false;
+        // the interlock path's clears into EDRAM: the resolves' layout and
+        // their EDRAM set (EDRAM at binding 0), edram.glsl's push constants
+        static_assert(sizeof(EdramTarget) <= sizeof(ResolveConstants));
+        if (fsi_ && !(clear_pipeline_ = compute_pipeline(EDRAM_CLEAR, sizeof(EDRAM_CLEAR), resolve_layout_)))
+            return error = "could not make the EDRAM clear pipeline", false;
         VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool.maxSets = 3;
@@ -2104,7 +2245,7 @@ VkCommandBuffer Impl::cmd() {
         s.readback = 0, s.readback_used = 0;
         in_pass_ = false;
         bound_pipeline_ = VK_NULL_HANDLE;
-        last_constants_at_[0] = last_constants_at_[1] = last_system_at_ = NONE;
+        last_constants_at_[0] = last_constants_at_[1] = last_system_at_ = last_fsi_at_ = NONE;
         if (s.queries) {
             vkCmdResetQueryPool(s.cmd, s.queries, 0, TIMESTAMPS);
             s.marks.clear();
@@ -2119,6 +2260,12 @@ VkCommandBuffer Impl::cmd() {
             s.occlusion_used = OCCLUSION_QUERIES;
         }
         if (s.occlusion && s.occlusion_used) vkCmdResetQueryPool(s.cmd, s.occlusion, 0, s.occlusion_used);
+        // the interlock path's counters, the slot's share zeroed
+        if (fsi_ && s.occlusion_used) {
+            vkCmdFillBuffer(s.cmd, zpd_counters_.buffer, VkDeviceSize(current_) * OCCLUSION_QUERIES * 4,
+                            VkDeviceSize(s.occlusion_used) * 4, 0);
+            full_barrier(s.cmd);
+        }
         s.occlusion_used = 0;
     }
     return s.cmd;
@@ -2165,6 +2312,22 @@ void Impl::flush() {
     Slot &s = slots_[current_];
     if (!s.recording) return;
     end_pass();
+    if (fsi_ && !s.occlusion_reports.empty()) {
+        // the interlock path's occlusion counts, for zpd_collect
+        full_barrier(s.cmd);
+        VkDeviceSize at = VkDeviceSize(current_) * OCCLUSION_QUERIES * 4;
+        VkBufferCopy copy{at, at, VkDeviceSize(s.occlusion_reports.size()) * 4};
+        vkCmdCopyBuffer(s.cmd, zpd_counters_.buffer, zpd_readback_.buffer, 1, &copy);
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(s.cmd, &dep);
+    }
     if (s.queries && !s.marks.empty()) {
         vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.queries, uint32_t(s.marks.size()));
         s.marks.push_back(GPU_END);
@@ -2692,7 +2855,7 @@ VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options
         }
         it = s.variants.emplace(key, m).first;
     }
-    if (!it->second) why = "its float24 depth or centroid form could not be made";
+    if (!it->second) why = "its float24 depth, centroid or interlock form could not be made";
     return it->second;
 }
 
@@ -2783,7 +2946,9 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     // across too
     uint32_t samples_x = msaa >= 2 ? 2 : 1, samples_y = msaa >= 1 ? 2 : 1;
     uint32_t tile_width = (bytes == 8 ? 40 : 80) / samples_x, tile_height = 16 / samples_y;
-    uint32_t pitch_tiles = std::max(1u, (pitch + tile_width - 1) / tile_width);
+    // (xenos.h's GetSurfacePitchTiles: a 64bpp row of tiles is twice the
+    // 32bpp one, rounded at 32bpp)
+    uint32_t pitch_tiles = std::max(1u, (pitch * samples_x + 79) / 80) << (bytes == 8 ? 1 : 0);
     uint32_t rows = std::max(1u, (EDRAM_TILES - std::min(base, EDRAM_TILES - 1)) / pitch_tiles);
     t->width = std::clamp(pitch, 1u, 8192u);
     t->height = std::clamp(rows * tile_height, 1u, 8192u);
@@ -2930,6 +3095,62 @@ bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
     vkCmdPushConstants(c, edram_layouts_[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(c, (t->width + 7) / 8, (height + 7) / 8, 1);
     return true;
+}
+
+// The interlock path's view of a target in EDRAM, for resolves and clears:
+// what render_target() works out, without an image (the storage format's
+// host format for the resolve's texel size).
+RenderTarget Impl::edram_view(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format) const {
+    if (!depth && format == 10) format = 2;
+    if (!depth && format == 12) format = 3;
+    RenderTarget t;
+    t.depth = depth, t.base = base, t.pitch = pitch, t.msaa = msaa, t.format = format;
+    if (!depth) t.host = resolve::host_format_of_color_target(format);
+    t.wide = !depth && (format == 5 || format == 7 || format == 15);
+    uint32_t samples_x = msaa >= 2 ? 2 : 1, samples_y = msaa >= 1 ? 2 : 1;
+    t.tile_width = (t.wide ? 40 : 80) / samples_x, t.tile_height = 16 / samples_y;
+    // xenos.h's GetSurfacePitchTiles: 64bpp rows twice the 32bpp ones
+    t.pitch_tiles = std::max(1u, (pitch * samples_x + 79) / 80) << (t.wide ? 1 : 0);
+    uint32_t rows = std::max(1u, (EDRAM_TILES - std::min(base, EDRAM_TILES - 1)) / t.pitch_tiles);
+    t.width = std::clamp(pitch, 1u, 8192u);
+    t.height = std::clamp(rows * t.tile_height, 1u, 8192u);
+    return t;
+}
+
+// A resolve's clear into EDRAM on the interlock path (edram_clear.comp): the
+// rectangle's samples get the clear's words
+void Impl::fsi_clear(const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t lo, uint32_t hi) {
+    EdramTarget p{};
+    p.base_tiles = t.base, p.pitch_tiles = t.pitch_tiles, p.msaa = t.msaa, p.format = t.format;
+    p.width = w, p.height = h, p.is_depth = t.depth, p.ints_log2 = t.wide ? 1 : 0;
+    p.x = x, p.y = y, p.clear_lo = lo, p.clear_hi = hi;
+    VkCommandBuffer c = outside();
+    gpu_mark("resolves: clears");
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, clear_pipeline_);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 1, &resolve_edram_set_, 0, nullptr);
+    vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+    vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
+}
+
+// The interlock path's occlusion counter for the draw being recorded (the
+// report open, a counter per report in the slot's share, as zpd_draw opens
+// a host query; ~0 when none counts)
+uint32_t Impl::fsi_zpd_index() {
+    if (!zpd_current_) return UINT32_MAX;
+    cmd();
+    Slot &s = slots_[current_];
+    if (zpd_active_ == UINT32_MAX) {
+        if (s.occlusion_reports.size() >= OCCLUSION_QUERIES) {
+            zpd_counts_[zpd_current_].uncounted = true;
+            return UINT32_MAX;
+        }
+        zpd_active_ = uint32_t(s.occlusion_reports.size());
+        s.occlusion_reports.push_back(zpd_current_);
+        s.occlusion_used = uint32_t(s.occlusion_reports.size());
+        zpd_counts_[zpd_current_].open++;
+        report_.occlusion_queries++;
+    }
+    return current_ * OCCLUSION_QUERIES + zpd_active_;
 }
 
 // EDRAM as it stands, for a trace's start: every tile a render target holds
@@ -4360,6 +4581,10 @@ void Impl::draw(const gpu::Draw &d) {
     uint32_t gamma_targets = 0;
     bool any_gamma = false;
     uint32_t mask = regs_[reg::RB_COLOR_MASK];
+    // the interlock path makes no render targets: their places in EDRAM
+    // (edram_view), for the draw's extent
+    RenderTarget views[5];
+    bool viewed[5] = {};
     for (uint32_t i = 0; i < 4 && ps; i++) {
         color_masks[i] = (mask >> (4 * i)) & 0xF;
         if (!color_masks[i] || !(ps->colors_written & (1u << i))) {
@@ -4367,6 +4592,14 @@ void Impl::draw(const gpu::Draw &d) {
             continue;
         }
         uint32_t info = regs_[r::COLOR_INFO[i]], format = (info >> 16) & 0xF;
+        if (format == 1) any_gamma = true;
+        if (fsi_) {
+            if (format == 8 || format == 9 || format == 11 || format == 13)
+                return skip(std::string("color target format ") + color_target_format_name(format));
+            views[i] = edram_view(false, info & 0xFFF, pitch, msaa, format);
+            viewed[i] = true;
+            continue;
+        }
         // the exponent bias, and 16-bit fixed (-32..32, 10 fraction bits) kept as snorm
         color_scales[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
         if (format == 4 || format == 5) color_scales[i] *= 1024.0f / 32767.0f;
@@ -4374,10 +4607,7 @@ void Impl::draw(const gpu::Draw &d) {
         if (!colors[i]) return fatal_.empty() ? skip(std::string("color target format ") + color_target_format_name(format)) : void();
         // 8_8_8_8_GAMMA: the shader writes linear into a target kept linear,
         // else the gamma curve (blended in gamma then, unlike the console)
-        if (format == 1) {
-            any_gamma = true;
-            if (!colors[i]->gamma_linear) gamma_targets |= 1u << i;
-        }
+        if (format == 1 && !colors[i]->gamma_linear) gamma_targets |= 1u << i;
     }
     if (any_gamma) use("draws into 8_8_8_8_GAMMA color targets");
     if (gamma_targets) approximate("8_8_8_8_GAMMA color targets blended in gamma (no RGBA16 unorm attachments)");
@@ -4385,9 +4615,15 @@ void Impl::draw(const gpu::Draw &d) {
     RenderTarget *depth = nullptr;
     if (depth_control & 3) {
         uint32_t info = regs_[reg::RB_DEPTH_INFO], format = (info >> 16) & 1;
-        if (format == 1 && !options_.depth_float24_convert_in_pixel_shader) approximate("D24FS8 depth as 32-bit float");
-        depth = render_target(true, info & 0xFFF, pitch, msaa, format);
-        if (!depth) return;
+        if (fsi_) {
+            views[4] = edram_view(true, info & 0xFFF, pitch, msaa, format);
+            viewed[4] = true;
+        } else {
+            if (format == 1 && !options_.depth_float24_convert_in_pixel_shader)
+                approximate("D24FS8 depth as 32-bit float");
+            depth = render_target(true, info & 0xFFF, pitch, msaa, format);
+            if (!depth) return;
+        }
     } else {
         depth_control = 0;
     }
@@ -4395,6 +4631,8 @@ void Impl::draw(const gpu::Draw &d) {
     for (RenderTarget *t : colors)
         if (t) width = std::min(width, t->width), height = std::min(height, t->height);
     if (depth) width = std::min(width, depth->width), height = std::min(height, depth->height);
+    for (uint32_t i = 0; i < 5; i++)
+        if (viewed[i]) width = std::min(width, views[i].width), height = std::min(height, views[i].height);
     if (width == 8192 && height == 8192 && !export_only && !rasterizes_nothing()) {
         // no target the pixel shader writes and no depth: nothing it could change
         if (options_.verbose)
@@ -4415,7 +4653,89 @@ void Impl::draw(const gpu::Draw &d) {
     if (!export_only && (viewport.empty || !scissor.extent.width || !scissor.extent.height) && !rasterizes_nothing()) return;
     if (export_only) {
         std::fill(std::begin(colors), std::end(colors), nullptr);
+        std::fill(std::begin(viewed), std::end(viewed), false);
         depth = nullptr, depth_control = 0, float24_convert = false;
+    }
+    // The interlock path's render target state (edram_fsi.frag's Fsi block),
+    // as Xenia's UpdateSystemConstantValues makes it: per color target its
+    // format, write mask and base (the window offset's tiles not added, as
+    // the host path's), its blending and exponent bias; the depth and
+    // stencil tests (draw_util.cc's GetNormalizedDepthControl: a depth test
+    // that neither writes nor rejects is off), off where a color target over
+    // the same base writes bits they use (ColorOverlapsDepthStencil); the
+    // polygon offset in depth units (the slope's in 1/16 pixels) and the
+    // stencil's faces (the back's only for polygons with backface_enable).
+    FsiConstants fsi_constants{};
+    if (fsi_ && !export_only) {
+        FsiConstants &f = fsi_constants;
+        uint32_t flags = msaa | (msaa == 1 && fsi_2x_as_4x_ ? FSI_2X_AS_4X : 0u);
+        uint32_t dc = viewed[4] ? depth_control : 0;
+        if ((dc & 2) && !(dc & 4) && ((dc >> 4) & 7) == 7) dc &= ~2u;
+        bool depth_stencil = (dc & 3) != 0;
+        uint32_t depth_base = regs_[reg::RB_DEPTH_INFO] & 0xFFF;
+        for (uint32_t i = 0; i < 4; i++) {
+            if (!viewed[i]) continue;
+            uint32_t info = regs_[r::COLOR_INFO[i]], format = (info >> 16) & 0xF;
+            f.rt[i] = format | color_masks[i] << 4 | 0x100u;
+            f.blend[i] = regs_[r::RB_BLENDCONTROL[i]] & 0x1FFF1FFF;
+            f.rt_base[i] = ((info & 0xFFF) % EDRAM_TILES) * 1280;
+            f.exp_bias[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
+            if (depth_stencil && (info & 0xFFF) % EDRAM_TILES == depth_base % EDRAM_TILES) {
+                // the bits the color target writes (render_target_cache.cc's
+                // GetPSIColorFormatInfo keep masks), against those depth (bits
+                // 8-31) and stencil (0-7) use
+                uint32_t m = color_masks[i], written_bits = 0;
+                switch (format) {
+                case 0: case 1:
+                    for (uint32_t k = 0; k < 4; k++)
+                        if (m & (1u << k)) written_bits |= 0xFFu << (8 * k);
+                    break;
+                case 2: case 3: case 10: case 12:
+                    for (uint32_t k = 0; k < 3; k++)
+                        if (m & (1u << k)) written_bits |= 0x3FFu << (10 * k);
+                    if (m & 8) written_bits |= 3u << 30;
+                    break;
+                case 4: case 6: written_bits = (m & 1 ? 0xFFFFu : 0u) | (m & 2 ? 0xFFFF0000u : 0u); break;
+                case 5: case 7: // either half, conservatively
+                    written_bits = (m & 5 ? 0xFFFFu : 0u) | (m & 10 ? 0xFFFF0000u : 0u);
+                    break;
+                case 14: written_bits = m & 1 ? ~0u : 0u; break;
+                case 15: written_bits = m & 3 ? ~0u : 0u; break;
+                }
+                uint32_t used = (dc & 2 ? 0xFFFFFF00u : 0u) | (dc & 1 ? 0xFFu : 0u);
+                if (written_bits & used) depth_stencil = false;
+            }
+        }
+        if (depth_stencil) {
+            flags |= FSI_DEPTH_STENCIL;
+            if (dc & 2) {
+                flags |= ((dc >> 4) & 7) * FSI_DEPTH_LESS;
+                if (dc & 4) flags |= FSI_DEPTH_WRITE;
+            } else {
+                flags |= 7 * FSI_DEPTH_LESS; // stencil alone: depth always passes, kept
+            }
+            if (dc & 1) flags |= FSI_STENCIL;
+        }
+        if (viewed[4] && views[4].format == 1) flags |= FSI_FLOAT24;
+        f.flags = flags;
+        f.depth_base = (depth_base % EDRAM_TILES) * 1280;
+        f.pitch = std::max(1u, (pitch * (msaa >= 2 ? 2 : 1) + 79) / 80) * 1280;
+        f.zpd_index = UINT32_MAX; // (set as the draw is recorded)
+        uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
+        f.stencil[0] = f.stencil[2] = stencil & 0xFFFFFF;
+        f.stencil[1] = f.stencil[3] = (dc >> 8) & 0xFFF;
+        if (polygonal && (dc >> 7) & 1) f.stencil[2] = stencil_bf & 0xFFFFFF, f.stencil[3] = (dc >> 20) & 0xFFF;
+        const float *offsets = reinterpret_cast<const float *>(&regs_[r::PA_SU_POLY_OFFSET_FRONT_SCALE]);
+        uint32_t sc_mode = regs_[r::PA_SU_SC_MODE_CNTL];
+        if (polygonal) {
+            if ((sc_mode >> 11) & 1) f.poly_offset[0] = offsets[0], f.poly_offset[1] = offsets[1];
+            if ((sc_mode >> 12) & 1) f.poly_offset[2] = offsets[2], f.poly_offset[3] = offsets[3];
+        } else if ((sc_mode >> 13) & 1) {
+            f.poly_offset[0] = f.poly_offset[2] = offsets[0];
+            f.poly_offset[1] = f.poly_offset[3] = offsets[1];
+        }
+        f.poly_offset[0] *= 1.0f / 16.0f, f.poly_offset[2] *= 1.0f / 16.0f;
+        std::memcpy(f.blend_constant, &regs_[r::RB_BLEND_RED], 16);
     }
     // (the targets take over their EDRAM tiles below, once the draw's lowest
     // row is known: draw_max_y)
@@ -4777,9 +5097,42 @@ void Impl::draw(const gpu::Draw &d) {
             centroid = ~(regs_[r::SQ_INTERPOLATOR_CNTL] >> 16) & 0xFFFF;
     }
     bool sample_shading = false;
-    if (ps && (float24_convert || centroid)) {
+    if (fsi_ && !export_only) {
+        // the interlock path: the guest's shader with the output merger taken
+        // in, or for depth and stencil alone edram_fsi.frag's own
+        if (ps) {
+            shader::PixelOptions options;
+            options.centroid = uint16_t(centroid);
+            options.fsi = uint8_t(fsi_);
+            options.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
+            fragment = pixel_module(*ps, options, why);
+            if (!fragment) return skip("pixel shader: " + why);
+        } else {
+            fragment = fsi_constants.flags & FSI_DEPTH_STENCIL ? fsi_depth_fs_ : VK_NULL_HANDLE;
+        }
+        if (!fragment) {
+            if (options_.verbose)
+                std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
+            return;
+        }
+    } else if (ps && (float24_convert || centroid)) {
         fragment = pixel_module(*ps, {uint8_t(float24_mode), uint16_t(centroid)}, why);
         if (!fragment) return skip("pixel shader: " + why);
+    }
+    // the interlock path's state as the pipeline's specialization
+    // (Options::fsi_specialized; edram_fsi.frag's constant_id 0-9)
+    uint32_t spec_data[10] = {};
+    VkSpecializationMapEntry spec_entries[10];
+    VkSpecializationInfo spec{};
+    if (fsi_ && fragment) {
+        key.push_back(0xF5000000u | fsi_ | (options_.fsi_specialized ? 0x100u : 0u));
+        if (options_.fsi_specialized) {
+            spec_data[0] = 1, spec_data[1] = fsi_constants.flags;
+            for (uint32_t i = 0; i < 4; i++) spec_data[2 + i] = fsi_constants.rt[i], spec_data[6 + i] = fsi_constants.blend[i];
+            for (uint32_t k = 0; k < 10; k++) spec_entries[k] = {k, k * 4, 4};
+            spec = {10, spec_entries, sizeof(spec_data), spec_data};
+            key.insert(key.end(), spec_data + 1, spec_data + 10);
+        }
     }
     if (float24_convert) {
         if (!ps && ((depth_control & 4) || ((depth_control >> 4) & 7) != 7))
@@ -4804,7 +5157,10 @@ void Impl::draw(const gpu::Draw &d) {
         if ((rectangles || points) && !expanded)
             stage(VK_SHADER_STAGE_GEOMETRY_BIT, points ? point_gs_ : rectangle_gs_);
     }
-    if (fragment) stage(VK_SHADER_STAGE_FRAGMENT_BIT, fragment);
+    if (fragment) {
+        stage(VK_SHADER_STAGE_FRAGMENT_BIT, fragment);
+        if (spec.mapEntryCount) stages[stage_count - 1].pSpecializationInfo = &spec;
+    }
     // the vertex attributes: a tessellated draw's control points (two
     // floats), an expanded rectangle's guest indices (three)
     VkVertexInputBindingDescription vertex_binding{0, tessellated ? 8u : 12u, VK_VERTEX_INPUT_RATE_VERTEX};
@@ -4839,6 +5195,38 @@ void Impl::draw(const gpu::Draw &d) {
     multisample.rasterizationSamples = msaa == 0   ? VK_SAMPLE_COUNT_1_BIT
                                        : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT
                                                    : VK_SAMPLE_COUNT_4_BIT;
+    // (the interlock path's guest 2x as 4x where passes without attachments
+    // take no 2x: edram_fsi.frag's F_2X_AS_4X)
+    if (fsi_ && msaa == 1 && fsi_2x_as_4x_) multisample.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+    // The interlock path rasterizes at the Xenos's sample positions where the
+    // device places samples (VK_EXT_sample_locations), as Xenia's interlock
+    // paths always do (its xenos_sample_positions, for host render targets,
+    // is off by default; so is ours): each host sample at the position of the
+    // guest sample its coverage stands for (draw_util.cc's
+    // GetHostSampleXenosPositions with interlock: native 2x host samples 1
+    // and 0, 2x as 4x 0, 1, 0, 1, 4x 0, 3, 2, 1; positions in sixteenths
+    // from the pixel's center, kXenosSamplePositions2x and 4x).
+    VkSampleLocationEXT sample_positions[4];
+    VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
+        VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+    if (fsi_ && msaa && (d_.sample_locations() & multisample.rasterizationSamples)) {
+        static const int8_t positions_2x[2][2] = {{-4, 4}, {4, -4}};
+        static const int8_t positions_4x[4][2] = {{-2, -2}, {2, 2}, {-6, 6}, {6, -6}};
+        static const uint32_t remap_4x[4] = {0, 3, 2, 1};
+        uint32_t count = uint32_t(multisample.rasterizationSamples);
+        for (uint32_t k = 0; k < count; k++) {
+            const int8_t *p = msaa == 2 ? positions_4x[remap_4x[k]] : positions_2x[count == 2 ? k ^ 1 : k & 1];
+            sample_positions[k] = {0.5f + float(p[0]) / 16.0f, 0.5f + float(p[1]) / 16.0f};
+        }
+        sample_locations.sampleLocationsEnable = VK_TRUE;
+        sample_locations.sampleLocationsInfo = {VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT,
+                                                nullptr,
+                                                multisample.rasterizationSamples,
+                                                {1, 1},
+                                                count,
+                                                sample_positions};
+        multisample.pNext = &sample_locations;
+    }
     if (sample_shading) multisample.sampleShadingEnable = VK_TRUE, multisample.minSampleShading = 1.0f;
     VkPipelineDepthStencilStateCreateInfo depth_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     if (depth) {
@@ -4875,11 +5263,13 @@ void Impl::draw(const gpu::Draw &d) {
         VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
         VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states)) - (d_.dynamic_blend() ? 0u : 3u);
+    dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states)) - (d_.dynamic_blend() && !fsi_ ? 0u : 3u);
     dynamic.pDynamicStates = dynamic_states;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = 4;
     rendering.pColorAttachmentFormats = color_formats;
+    // the interlock path's passes have no attachments
+    if (fsi_) rendering.colorAttachmentCount = blend_state.attachmentCount = 0;
     rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat =
         depth ? depth->image.format : VK_FORMAT_UNDEFINED;
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -4933,9 +5323,14 @@ void Impl::draw(const gpu::Draw &d) {
                 words(parts.keys[1], uint64_t(stages[i].module));
             }
         if (!export_only) {
-            parts.keys[2] = {2, msaa, uint32_t(sample_shading)};
+            // (the samples the pipeline rasterizes at; the interlock path's
+            // specialization with its fragment shader, and no attachments)
+            const uint32_t samples = uint32_t(multisample.rasterizationSamples);
+            parts.keys[2] = {2, samples, uint32_t(sample_shading)};
             words(parts.keys[2], uint64_t(fragment));
-            parts.keys[3] = {3, msaa, uint32_t(sample_shading), uint32_t(rendering.depthAttachmentFormat)};
+            if (spec.mapEntryCount) parts.keys[2].insert(parts.keys[2].end(), spec_data, spec_data + 10);
+            parts.keys[3] = {3, samples, uint32_t(sample_shading), uint32_t(rendering.depthAttachmentFormat),
+                             rendering.colorAttachmentCount};
             parts.keys[3].insert(parts.keys[3].end(), color_key.begin(), color_key.end());
         }
     }
@@ -5005,13 +5400,23 @@ void Impl::draw(const gpu::Draw &d) {
     VkDeviceSize constants_size = (sizeof(harness::Constants) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     VkDeviceSize system_size = (sizeof(System) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     bool own_indices = index_bytes > ARENA_SLOT / 4, own_attributes = attribute_bytes > ARENA_SLOT / 4;
-    VkDeviceSize need = 2 * constants_size + system_size + 4 * ubo_align_ + (own_indices ? 0 : index_bytes + 4) +
-                        (own_attributes ? 0 : attribute_bytes + 4);
+    VkDeviceSize need = 2 * constants_size + system_size + 2 * sizeof(FsiConstants) + 6 * ubo_align_ +
+                        (own_indices ? 0 : index_bytes + 4) + (own_attributes ? 0 : attribute_bytes + 4);
     if (arena_take(need, 1) == NONE) flush();
     else slots_[current_].used -= need; // only a check that the draw fits
     if (!fatal_.empty()) return;
 
-    uint32_t dynamic_offsets[3];
+    // the interlock path's constants, with the occlusion counter the draw
+    // counts in (the slot's, so once the flush above is past)
+    if (fsi_ && fragment) {
+        fsi_constants.zpd_index = fsi_zpd_index();
+        if (last_fsi_at_ == NONE || std::memcmp(&last_fsi_, &fsi_constants, sizeof(FsiConstants)) != 0) {
+            last_fsi_at_ = arena_take(sizeof(FsiConstants), ubo_align_);
+            std::memcpy(arena_data(last_fsi_at_), &fsi_constants, sizeof(FsiConstants));
+            last_fsi_ = fsi_constants;
+        }
+    }
+    uint32_t dynamic_offsets[4] = {0, 0, 0, last_fsi_at_ == NONE ? 0u : uint32_t(last_fsi_at_)};
     for (int stage = 0; stage < 2; stage++) {
         if (last_constants_at_[stage] == NONE ||
             std::memcmp(&last_constants_[stage], &constants[stage], sizeof(harness::Constants)) != 0) {
@@ -5065,13 +5470,15 @@ void Impl::draw(const gpu::Draw &d) {
     for (uint32_t i = 0; i < 4; i++) pass.colors[i] = colors[i] ? colors[i]->view : VK_NULL_HANDLE;
     pass.depth = depth ? depth->view : VK_NULL_HANDLE;
     pass.width = export_only ? 1 : width, pass.height = export_only ? 1 : height;
+    if (fsi_ && !export_only)
+        pass.width = pass.height = 8192, pass.samples = uint32_t(multisample.rasterizationSamples);
     VkCommandBuffer c = begin_pass(pass, colors, depth);
     if (pipe != bound_pipeline_) {
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         bound_pipeline_ = pipe;
     }
     VkDescriptorSet sets[2] = {draw_sets_[1], bindless_};
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 3, dynamic_offsets);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 4, dynamic_offsets);
     if (index_buffer) vkCmdBindIndexBuffer(c, index_buffer, index_at, VK_INDEX_TYPE_UINT32);
     if (attribute_buffer) vkCmdBindVertexBuffers(c, 0, 1, &attribute_buffer, &attribute_at);
     if (export_only) {
@@ -5112,7 +5519,7 @@ void Impl::draw(const gpu::Draw &d) {
     vkCmdSetStencilOp(c, VK_STENCIL_FACE_FRONT_BIT, front.failOp, front.passOp, front.depthFailOp, front.compareOp);
     vkCmdSetStencilOp(c, VK_STENCIL_FACE_BACK_BIT, back.failOp, back.passOp, back.depthFailOp, back.compareOp);
     vkCmdSetDepthBiasEnable(c, raster.depthBiasEnable);
-    if (d_.dynamic_blend()) {
+    if (d_.dynamic_blend() && !fsi_) {
         // extended dynamic state 3: the blend and write masks of the four
         // attachments the pipelines have (those without a target unused)
         VkBool32 enables[4];
@@ -5212,12 +5619,21 @@ void Impl::resolve() {
     if (!resolve::get_info({regs_, REGISTER_COUNT}, memory_, info, why)) return skip("resolve: " + why);
     if (!info.copy && !why.empty()) approximate("resolve not copied: " + why);
     uint32_t pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
-    RenderTarget *source = render_target(info.depth, info.edram_base, info.surface_pitch ? info.surface_pitch : pitch,
-                                         info.msaa, info.source_format);
+    // (the interlock path reads EDRAM itself: the target's place there)
+    RenderTarget view;
+    RenderTarget *source = nullptr;
+    if (fsi_) {
+        view = edram_view(info.depth, info.edram_base, info.surface_pitch ? info.surface_pitch : pitch, info.msaa,
+                          info.source_format);
+        source = &view;
+    } else {
+        source = render_target(info.depth, info.edram_base, info.surface_pitch ? info.surface_pitch : pitch, info.msaa,
+                               info.source_format);
+    }
     if (!source) return fatal_.empty() ? skip("resolve: source format") : void();
     uint32_t x = std::min(info.x, source->width), y = std::min(info.y, source->height);
     uint32_t w = std::min(info.width, source->width - x), h = std::min(info.height, source->height - y);
-    acquire(source, y + h);
+    if (!fsi_) acquire(source, y + h);
     if (!fatal_.empty()) return;
     if (options_.verbose)
         std::fprintf(stderr,
@@ -5233,7 +5649,26 @@ void Impl::resolve() {
         if (!fatal_.empty()) return;
     }
 
-    // the clears, after the copy, over the same rectangle
+    // the clears, after the copy, over the same rectangle; on the interlock
+    // path written into EDRAM (the targets' words: RB_DEPTH_CLEAR, or
+    // RB_COLOR_CLEAR with RB_COLOR_CLEAR_LO first at 64 bits per sample)
+    if (fsi_ && (info.clear_color || info.clear_depth) && w && h) {
+        uint32_t msaa = (regs_[reg::RB_SURFACE_INFO] >> 16) & 3;
+        if (info.clear_depth) {
+            uint32_t depth_info = regs_[reg::RB_DEPTH_INFO], value = regs_[r::RB_DEPTH_CLEAR];
+            RenderTarget t = edram_view(true, depth_info & 0xFFF, source->pitch, msaa, (depth_info >> 16) & 1);
+            uint32_t cw = std::min(w, t.width - std::min(x, t.width)), ch = std::min(h, t.height - std::min(y, t.height));
+            if (cw && ch) fsi_clear(t, x, y, cw, ch, value, value);
+        }
+        if (info.clear_color) {
+            uint32_t color_info = regs_[r::COLOR_INFO[info.color_target & 3]];
+            RenderTarget t = edram_view(false, color_info & 0xFFF, source->pitch, msaa, (color_info >> 16) & 0xF);
+            uint32_t cw = std::min(w, t.width - std::min(x, t.width)), ch = std::min(h, t.height - std::min(y, t.height));
+            uint32_t value = regs_[r::RB_COLOR_CLEAR];
+            if (cw && ch) fsi_clear(t, x, y, cw, ch, t.wide ? regs_[r::RB_COLOR_CLEAR_LO] : value, value);
+        }
+        return;
+    }
     if ((info.clear_color || info.clear_depth) && w && h) {
         uint32_t msaa = (regs_[reg::RB_SURFACE_INFO] >> 16) & 3;
         RenderTarget *depth_target = nullptr, *color_target = nullptr;
@@ -5375,7 +5810,8 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // tiles stored there first by the target, which keeps them
     // (and an 8_8_8_8_GAMMA target kept linear, its gamma made in EDRAM's
     // bits, which Xenia's resolves always read)
-    const bool from_edram = info.msaa != 0 || (!info.depth && source.gamma_linear);
+    // (the interlock path: always, EDRAM being the targets)
+    const bool from_edram = fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear);
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!from_edram && !grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
@@ -5387,7 +5823,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         for (uint32_t row = info.y / source.tile_height; row <= (info.y + h - 1) / source.tile_height; row++)
             for (uint32_t column = info.x / source.tile_width; column <= (info.x + w - 1) / source.tile_width; column++)
                 tiles.push_back((source.base + row * source.pitch_tiles + column) % EDRAM_TILES);
-        if (!edram_store(&source, tiles)) return;
+        if (!fsi_ && !edram_store(&source, tiles)) return;
         c = outside();
         gpu_mark("resolves: copies");
     } else {
@@ -5732,6 +6168,24 @@ uint32_t display_gamma(uint32_t value, uint32_t bits, uint32_t channel, uint32_t
         (float(entry & 0xFFFF) + float((value & ((1u << increment) - 1)) * (entry >> 16)) / float(1u << increment)) *
         (1.0f / (64.0f * 1023.0f));
     return uint32_t(std::clamp(out, 0.0f, 1.0f) * 1023.0f + 0.5f);
+}
+
+// automatic: the interlock path where the device has fragment shader
+// interlock (docs/renderer.md, "Exact EDRAM through fragment shader
+// interlock": it matches Xenia's exact pictures and measured faster than
+// host render targets on every trace and live)
+Options::RenderTargetPath render_target_path(const vk::Device &device, const Options &options) {
+    Options::RenderTargetPath path = options.render_target_path;
+    if (const char *e = std::getenv("XF_RENDER_TARGET_PATH"); e && *e) {
+        if (std::strcmp(e, "fsi") == 0) path = Options::RenderTargetPath::fsi;
+        else if (std::strcmp(e, "host") == 0) path = Options::RenderTargetPath::host;
+    }
+    if (path != Options::RenderTargetPath::host && !device.fragment_shader_interlock()) {
+        if (path == Options::RenderTargetPath::fsi)
+            std::fprintf(stderr, "renderer: no fragment shader interlock on the device: host render targets\n");
+        path = Options::RenderTargetPath::host;
+    }
+    return path == Options::RenderTargetPath::host ? path : Options::RenderTargetPath::fsi;
 }
 
 std::unique_ptr<Renderer> Renderer::create(vk::Device &device, gpu::CommandProcessor &processor,

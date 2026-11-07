@@ -69,7 +69,10 @@ line width (A9, not counted), the screen-extent query (A10, not counted).
 | A10 | `command_processor.h:305`; `draw_util.cc:74` | EVENT_WRITE_EXT (screen extent) reports are not tracked; once they are, draws killed after hi-Z that feed only the VIZ survey must rasterize so the extents can come back empty | Xenia answers every screen-extent report with the full screen (x and y 0 to 8192/8 in the report's units, z 0 to 1; `pm4_command_processor_implement.h:957-966`), citing patent US20060055701 for the real meaning; its `occlusion_query_viz` option (off) does VIZ_QUERY predicates with coarse occlusion queries (`command_processor.cc:81-92`). Ours writes the same fake extents (`src/gpu/command_processor.cpp:575-583`) and `VIZ_QUERY` only marks the event (`:390`). Real extents: the min/max of the pixel positions and depths each draw between the events covers, by a pass in the renderer's occlusion-query bookkeeping (`renderer.cpp:1040-1100`, the same draw ranges); units and the hi-Z interplay want one measurement (C27). | M | `fragmentStoresAndAtomics` (required already) | not counted; nothing traced reads them |
 
 **Since (2026-11-06; `docs/renderer.md`, "Xenia's GPU TODOs, category A"):** A2 to A9 done, A10 counted and
-left at Xenia's defaults. Counted first over the 115 traces and live runs of El Chavo Kart and Ben 10:
+left at Xenia's defaults. A1 done the same day (renderer.md, "Exact EDRAM through fragment shader
+interlock"): Xenia's interlock path, with the render target state as specialization constants (the TODO's
+"static shader modifications"), the default where the device has fragment shader interlock; it matches
+Xenia's own ROV and FSI pictures and measured faster than host render targets. Counted first over the 115 traces and live runs of El Chavo Kart and Ben 10:
 EVENT_WRITE_EXT (Ben 10, live 48,676 in 300 s; RDR 4,878 in two traces), D24FS8 depth (El Chavo Kart, 2.75
 million draws in 420 s; Reach, RDR), user clip planes (RDR, 288 draws), gamma targets (RDR 91, FH 4, Reach 1),
 VIZ_QUERY (RDR, 232); no wide lines, immediate indices or getBCF anywhere.

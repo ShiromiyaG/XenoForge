@@ -294,6 +294,10 @@ private:
     // whether this invocation's exports are stored (a bool; 0: always), for
     // the host vertex types that run a guest vertex in several invocations
     Id export_allowed_ = 0;
+    // the interlock path (PixelOptions::fsi): the color targets written on
+    // the shader's path (a bit each), the library's xf_fsi and its parameters
+    Id colors_written_ = 0, fsi_function_ = 0;
+    std::vector<Id> fsi_parameters_;
 };
 
 void Translator::declare() {
@@ -396,6 +400,7 @@ void Translator::declare() {
     position_ = global(vec4_, spv::StorageClass::Private, "oPos");
     point_size_ = global(vec4_, spv::StorageClass::Private, "oPts");
     colors_ = global(m_.type_array(vec4_, 4), spv::StorageClass::Private, "oC");
+    if (stage_ == Stage::Pixel && pixel_.fsi) colors_written_ = global(uint_, spv::StorageClass::Private, "oC_written");
     depth_ = global(vec4_, spv::StorageClass::Private, "oDepth");
     ptr_private_uint_ = m_.type_pointer(spv::StorageClass::Private, uint_);
     ptr_private_int_ = m_.type_pointer(spv::StorageClass::Private, int_);
@@ -424,6 +429,7 @@ void Translator::reset_state() {
     store(position_, zero4_);
     store(point_size_, zero4_);
     for (uint32_t k = 0; k < 4; k++) store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))}), zero4_);
+    if (colors_written_) store(colors_written_, u(0));
     store(depth_, zero4_);
     store(loop_count_, m_.const_null(m_.type_array(uint_, 4)));
     store(loop_address_, m_.const_null(m_.type_array(int_, 4)));
@@ -454,6 +460,8 @@ void Translator::store_result(const Result &r, Id value, bool clamp_depth) {
     case StorageTarget::PointSizeEdgeFlagKillVertex: pointer = point_size_; break;
     case StorageTarget::Color:
         pointer = m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(r.index & 3))});
+        if (colors_written_)
+            store(colors_written_, m_.op(Op::OpBitwiseOr, uint_, {load(uint_, colors_written_), u(1u << (r.index & 3))}));
         break;
     case StorageTarget::Depth: pointer = depth_; break;
     // eA without any eM# written exports nothing (Xenia drops it)
@@ -2225,8 +2233,13 @@ void Translator::main_pixel() {
         inputs = global(m_.type_array(vec4_, 16), spv::StorageClass::Input, "interpolators");
         m_.decorate(inputs, spv::Decoration::Location, {0});
     }
-    Id outputs = global(m_.type_array(vec4_, 4), spv::StorageClass::Output, "colors");
-    m_.decorate(outputs, spv::Decoration::Location, {0});
+    // the interlock path (PixelOptions::fsi) writes EDRAM, no outputs
+    const bool fsi = pixel_.fsi != 0;
+    Id outputs = 0;
+    if (!fsi) {
+        outputs = global(m_.type_array(vec4_, 4), spv::StorageClass::Output, "colors");
+        m_.decorate(outputs, spv::Decoration::Location, {0});
+    }
     bool writes_depth = false;
     for (const ControlFlow &cf : s_.control_flow)
         if (const auto *e = std::get_if<Exec>(&cf.instruction))
@@ -2235,9 +2248,9 @@ void Translator::main_pixel() {
                     writes_depth |= a->vector_and_constant_result.target == StorageTarget::Depth ||
                                     a->scalar_result.target == StorageTarget::Depth;
     // the depth converted to 20e4 (PixelOptions), oDepth's or the rasterized one
-    const uint32_t float24 = pixel_.depth_float24;
+    const uint32_t float24 = fsi ? 0 : pixel_.depth_float24;
     Id frag_depth = 0;
-    if (writes_depth || float24) {
+    if (!fsi && (writes_depth || float24)) {
         frag_depth = global(float_, spv::StorageClass::Output, "depth");
         m_.decorate(frag_depth, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FragDepth)});
     }
@@ -2263,9 +2276,19 @@ void Translator::main_pixel() {
                     for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
                         writes_color_0 |= r->target == StorageTarget::Color && (r->index & 3) == 0 && r->used_write_mask();
     Id sample_mask = 0;
-    if (writes_color_0) {
+    if (writes_color_0 && !fsi) {
         sample_mask = global(m_.type_array(int_, 1), spv::StorageClass::Output, "sample_mask");
         m_.decorate(sample_mask, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::SampleMask)});
+    }
+    // the interlock path's: the host's coverage, and whether this is a
+    // helper invocation (Volatile: demotion changes it)
+    Id sample_mask_in = 0, helper = 0;
+    if (fsi) {
+        sample_mask_in = global(m_.type_array(int_, 1), spv::StorageClass::Input, "sample_mask_in");
+        m_.decorate(sample_mask_in, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::SampleMask)});
+        helper = global(bool_, spv::StorageClass::Input, "helper");
+        m_.decorate(helper, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::HelperInvocation)});
+        m_.decorate(helper, spv::Decoration::Volatile);
     }
 
     Id main = m_.begin_function(void_, m_.type_function(void_, {}));
@@ -2408,6 +2431,15 @@ void Translator::main_pixel() {
         for (uint32_t k = 0; k < 6; k++) pass = select(bool_, is(k + 1), m_.op(tests[k], bool_, {alpha, reference}), pass);
         pass = select(bool_, is(0), m_.const_bool(false), pass);
         Id enabled = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(8)}), u(0)});
+        // the interlock path as Xenia's: only where oC0 is written, on the
+        // shader's path too
+        if (fsi)
+            enabled = writes_color_0
+                          ? m_.op(Op::OpLogicalAnd, bool_,
+                                  {enabled, m_.op(Op::OpINotEqual, bool_,
+                                                  {m_.op(Op::OpBitwiseAnd, uint_, {load(uint_, colors_written_), u(1)}),
+                                                   u(0)})})
+                          : m_.const_bool(false);
         when(m_.op(Op::OpLogicalAnd, bool_, {enabled, m_.op(Op::OpLogicalNot, bool_, {pass})}), [&] {
             m_.op_void(Op::OpDemoteToHelperInvocation);
             return false;
@@ -2471,7 +2503,100 @@ void Translator::main_pixel() {
     // takes the alpha unscaled; then to the piecewise linear gamma for gamma
     // targets (system flags' z, a bit per target; xenos.cc's
     // LinearToPWLGamma).
-    {
+    if (fsi) {
+        // The interlock path: alpha to coverage as a mask in the guest's
+        // sample order (Xenia's FSI_AlphaToMask: 1x 1.0 by quarters, 2x 0.5
+        // and 1.0 by eighths, 4x 0.75, 0.25, 0.5, 1.0 by sixteenths, less the
+        // pixel's dither offset), where oC0 is written on the shader's path;
+        // then the depth's coarse derivatives outside the interlock, and the
+        // output merger (xf_fsi) inside it.
+        Id ptr_function_uint = m_.type_pointer(spv::StorageClass::Function, uint_);
+        Id coverage = m_.local_variable(ptr_function_uint);
+        store(coverage, u(0xF));
+        if (writes_color_0) {
+            Id flags_vector = load(
+                uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)}));
+            Id flags = m_.op(Op::OpCompositeExtract, uint_, {flags_vector, 0});
+            Id enabled = m_.op(
+                Op::OpLogicalAnd, bool_,
+                {m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(1u << 16)}), u(0)}),
+                 m_.op(Op::OpINotEqual, bool_,
+                       {m_.op(Op::OpBitwiseAnd, uint_, {load(uint_, colors_written_), u(1)}), u(0)})});
+            when(enabled, [&] {
+                Id position = load(vec4_, frag_coord);
+                Id px = m_.op(Op::OpConvertFToU, uint_, {comp(position, 0)});
+                Id py = m_.op(Op::OpConvertFToU, uint_, {comp(position, 1)});
+                Id index = m_.op(
+                    Op::OpBitwiseOr, uint_,
+                    {m_.op(Op::OpBitwiseAnd, uint_, {py, u(1)}),
+                     m_.op(Op::OpShiftLeftLogical, uint_, {m_.op(Op::OpBitwiseAnd, uint_, {px, u(1)}), u(1)})});
+                Id offset = m_.op(Op::OpConvertUToF, float_,
+                                  {m_.op(Op::OpBitFieldUExtract, uint_,
+                                         {flags, m_.op(Op::OpIAdd, uint_, {u(8), m_.op(Op::OpShiftLeftLogical, uint_, {index, u(1)})}),
+                                          u(2)})});
+                Id alpha = comp(load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(0)})), 3);
+                auto coverage_of = [&](std::initializer_list<std::pair<uint32_t, float>> samples, float step) {
+                    Id mask = u(0xF);
+                    for (auto [sample, base] : samples) {
+                        Id threshold = exact(Op::OpFAdd, float_, {f(base), exact(Op::OpFMul, float_, {offset, f(-step)})});
+                        Id passes = m_.op(Op::OpFOrdGreaterThanEqual, bool_, {alpha, threshold});
+                        mask = select(uint_, passes, mask, m_.op(Op::OpBitwiseAnd, uint_, {mask, u(~(1u << sample))}));
+                    }
+                    return mask;
+                };
+                Id msaa = m_.op(Op::OpBitFieldUExtract, uint_,
+                                {m_.op(Op::OpCompositeExtract, uint_, {flags_vector, 3}), u(1), u(2)});
+                Id one = coverage_of({{0, 1.0f}}, 1.0f / 4.0f);
+                Id two = coverage_of({{0, 0.5f}, {1, 1.0f}}, 1.0f / 8.0f);
+                Id four = coverage_of({{0, 0.75f}, {1, 0.25f}, {2, 0.5f}, {3, 1.0f}}, 1.0f / 16.0f);
+                store(coverage, select(uint_, m_.op(Op::OpIEqual, bool_, {msaa, u(2)}), four,
+                                       select(uint_, m_.op(Op::OpIEqual, bool_, {msaa, u(1)}), two, one)));
+                return false;
+            });
+        }
+        m_.capability(spv::Capability::DerivativeControl);
+        Id position = load(vec4_, frag_coord);
+        Id z = comp(position, 2);
+        Id dxy = m_.op(Op::OpCompositeConstruct, vec2_,
+                       {m_.op(Op::OpDPdxCoarse, float_, {z}), m_.op(Op::OpDPdyCoarse, float_, {z})});
+        Id ptr_in_int = m_.type_pointer(spv::StorageClass::Input, int_);
+        Id mask_in = m_.op(Op::OpBitcast, uint_, {load(int_, m_.op(Op::OpAccessChain, ptr_in_int, {sample_mask_in, i(0)}))});
+        Id alive = m_.op(Op::OpLogicalNot, bool_, {load(bool_, helper)});
+        Id facing = load(bool_, front_facing);
+        const std::pair<Id, Id> arguments[13] = {
+            {load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(0)})), vec4_},
+            {load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(1)})), vec4_},
+            {load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(2)})), vec4_},
+            {load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(3)})), vec4_},
+            {load(uint_, colors_written_), uint_},
+            {comp(load(vec4_, depth_), 0), float_},
+            {m_.const_bool(writes_depth), bool_},
+            {position, vec4_},
+            {dxy, vec2_},
+            {mask_in, uint_},
+            {facing, bool_},
+            {load(uint_, coverage), uint_},
+            {alive, bool_}};
+        // glslang's functions take their parameters as pointers
+        std::vector<uint32_t> call{fsi_function_};
+        for (uint32_t k = 0; k < 13; k++) {
+            auto [value, type] = arguments[k];
+            Id pointer_type = m_.type_pointer(spv::StorageClass::Function, type);
+            if (fsi_parameters_[k] == pointer_type) {
+                Id variable = m_.local_variable(pointer_type);
+                store(variable, value);
+                call.push_back(variable);
+            } else {
+                call.push_back(value);
+            }
+        }
+        m_.extension("SPV_EXT_fragment_shader_interlock");
+        m_.capability(pixel_.fsi == 2 ? spv::Capability::FragmentShaderSampleInterlockEXT
+                                      : spv::Capability::FragmentShaderPixelInterlockEXT);
+        m_.op_void(Op::OpBeginInvocationInterlockEXT);
+        m_.op(Op::OpFunctionCall, void_, std::span<const uint32_t>(call));
+        m_.op_void(Op::OpEndInvocationInterlockEXT);
+    } else {
         Id ptr_out_vec4 = m_.type_pointer(spv::StorageClass::Output, vec4_);
         Id ptr_u_vec4 = m_.type_pointer(spv::StorageClass::Uniform, vec4_);
         Id scales = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(5)}));
@@ -2502,6 +2627,9 @@ void Translator::main_pixel() {
     m_.end_function();
     m_.entry_point(spv::ExecutionModel::Fragment, main, "main", interface_);
     m_.execution_mode(main, spv::ExecutionMode::OriginUpperLeft);
+    if (fsi)
+        m_.execution_mode(main, pixel_.fsi == 2 ? spv::ExecutionMode::SampleInterlockOrderedEXT
+                                                : spv::ExecutionMode::PixelInterlockOrderedEXT);
     if (frag_depth) m_.execution_mode(main, spv::ExecutionMode::DepthReplacing);
     // truncation never raises the rasterized depth: early depth tests may
     // still reject (Xenia's SV_DepthLessEqual)
@@ -2510,6 +2638,18 @@ void Translator::main_pixel() {
 
 Translation Translator::run() {
     analyze_memexport();
+    if (stage_ == Stage::Pixel && pixel_.fsi) {
+        // the interlock path's output merger, taken in first (its ids stay)
+        spirv::Module::Imported imported;
+        if (m_.import(pixel_.edram_library, imported)) {
+            for (const auto &[name, function] : imported.functions)
+                if (name.starts_with("xf_fsi(")) fsi_function_ = function;
+            if (fsi_function_) fsi_parameters_ = imported.parameters[fsi_function_];
+            interface_.insert(interface_.end(), imported.globals.begin(), imported.globals.end());
+        }
+        if (!fsi_function_ || fsi_parameters_.size() != 13)
+            return {{}, {"the interlock path without its output merger (edram_fsi.frag's library)"}};
+    }
     declare();
     if (stage_ != Stage::Harness) {
         m_.capability(spv::Capability::RuntimeDescriptorArray);

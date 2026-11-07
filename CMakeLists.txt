@@ -134,6 +134,10 @@ xf_shader(edram_load.frag edram_load.frag)
 xf_shader(edram_load_uint.frag edram_load.frag -DUINT)
 xf_shader(edram_load_depth.frag edram_load.frag -DDEPTH)
 xf_shader(edram_load_stencil.frag edram_load.frag -DDEPTH -DSTENCIL)
+xf_shader(edram_fsi_library.frag edram_fsi.frag -DLIBRARY)
+xf_shader(edram_fsi_depth_pixel.frag edram_fsi.frag -DDEPTH_ONLY)
+xf_shader(edram_fsi_depth_sample.frag edram_fsi.frag -DDEPTH_ONLY -DSAMPLE_INTERLOCK)
+xf_shader(edram_clear.comp edram_clear.comp)
 xf_shader(depth_float24.frag depth_float24.frag)
 xf_shader(depth_float24_round.frag depth_float24.frag -DROUND)
 xf_shader(placeholder.frag placeholder.frag)
@@ -438,6 +442,10 @@ foreach(name spirv shader_translator)
     endif()
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+# the interlock path's translated pixel shaders, with edram_fsi.frag's library
+target_sources(shader_translator_test PRIVATE ${XF_SHADER_OUT}/edram_fsi_library.frag.inc)
+target_compile_definitions(shader_translator_test PRIVATE
+                           XF_EDRAM_FSI_LIBRARY="${XF_SHADER_OUT}/edram_fsi_library.frag.inc")
 add_test(NAME kernel_threads COMMAND kernel_threads_test)
 # a rare deadlock seen once under load (2026-11-05, not reproduced in 36
 # runs since): fail instead of hanging the suite

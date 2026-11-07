@@ -257,6 +257,24 @@ struct Options {
     // depth_float24_convert_in_pixel_shader, off by default as there (the
     // host's depth is kept beside EDRAM instead, renderer.md).
     bool depth_float24_convert_in_pixel_shader = false;
+    // How EDRAM is drawn into (docs/renderer.md, "Exact EDRAM through fragment
+    // shader interlock"): host render targets (images per EDRAM range, their
+    // contents moved through the EDRAM buffer when another takes their
+    // tiles: Xenia's render_target_path_vulkan=fbo, its default), or the
+    // pixel shader reading and writing the EDRAM buffer itself under fragment
+    // shader interlock (Xenia's fsi and its Direct3D 12 backend's rov:
+    // blending, the float formats, 20e4 depth and the stencil exact). fsi
+    // needs VK_EXT_fragment_shader_interlock, host where the device lacks it;
+    // automatic is the default the renderer chooses (docs/renderer.md says
+    // which and why). XF_RENDER_TARGET_PATH=fsi or host forces one.
+    enum class RenderTargetPath { automatic, host, fsi };
+    RenderTargetPath render_target_path = RenderTargetPath::automatic;
+    // The interlock path's render target state (formats, write masks,
+    // blending, the depth and stencil tests) as specialization constants of
+    // the pipeline, so the driver drops what does not apply, rather than read
+    // from the draw's constants (Xenia's, all dynamic; fewer pipelines).
+    // XF_FSI_DYNAMIC=1 turns it off.
+    bool fsi_specialized = true;
     // The texture cache's memory limits, in MB of the GPU memory its images
     // hold, as Xenia's texture_cache_memory_limit_* (its defaults): above the
     // soft limit, textures unused for soft_lifetime seconds are destroyed,
@@ -268,6 +286,11 @@ struct Options {
     uint32_t texture_memory_soft_lifetime_s = 30;
     uint32_t texture_memory_render_to_texture_mb = 24;
 };
+
+// The render target path a renderer takes with these options on the device
+// (Options::render_target_path, then XF_RENDER_TARGET_PATH): fsi or host,
+// never automatic. replay_test picks its pictures by it.
+Options::RenderTargetPath render_target_path(const vk::Device &device, const Options &options);
 
 // A trace writer (gpu_trace_writer.h) stands in front of it as the
 // processor's Sink and takes what it reads of guest memory (TraceSource):

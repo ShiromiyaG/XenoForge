@@ -269,6 +269,109 @@ void Module::end_function() {
     in_function_ = false;
 }
 
+bool Module::import(std::span<const uint32_t> words, Imported &out) {
+    if (words.size() < 5 || words[0] != spv::MagicNumber || next_id_ != 1 || !functions_.empty()) return false;
+    // the instructions, each as its opcode and its operand words
+    struct Instruction {
+        Op op;
+        std::span<const uint32_t> w;
+    };
+    std::vector<Instruction> code;
+    for (size_t at = 5; at < words.size();) {
+        uint32_t count = words[at] >> 16;
+        if (!count || at + count > words.size()) return false;
+        code.push_back({Op(words[at] & 0xFFFF), words.subspan(at + 1, count - 1)});
+        at += count;
+    }
+    // first: the entry point (its function left out), the arrays with an
+    // explicit stride (not shared: this module's arrays of a type and length
+    // are unstrided unless asked), the functions' names
+    Id entry = 0;
+    std::set<Id> strided;
+    std::map<Id, std::string> names;
+    for (const Instruction &i : code) {
+        if (i.op == Op::OpEntryPoint && i.w.size() >= 2) entry = i.w[1];
+        if (i.op == Op::OpDecorate && i.w.size() >= 2 && spv::Decoration(i.w[1]) == spv::Decoration::ArrayStride)
+            strided.insert(i.w[0]);
+        if (i.op == Op::OpName && i.w.size() >= 2) {
+            const char *s = reinterpret_cast<const char *>(i.w.data() + 1);
+            names[i.w[0]] = std::string(s, strnlen(s, (i.w.size() - 1) * 4));
+        }
+    }
+    next_id_ = words[3];
+    auto copy = [](std::vector<uint32_t> &to, const Instruction &i) { emit(to, i.op, i.w); };
+    auto share = [&](const Instruction &i, size_t result) {
+        // as unique() keys it: a type's operands, a constant's type then values
+        std::vector<uint32_t> key{uint32_t(i.op)};
+        for (size_t k = 0; k < i.w.size(); k++)
+            if (k != result) key.push_back(i.w[k]);
+        unique_.emplace(std::move(key), i.w[result]);
+    };
+    bool in_function = false, skipping = false;
+    Id function = 0;
+    for (const Instruction &i : code) {
+        if (in_function) {
+            if (i.op == Op::OpFunctionParameter && !skipping) out.parameters[function].push_back(i.w[0]);
+            if (!skipping) copy(functions_, i);
+            if (i.op == Op::OpFunctionEnd) in_function = false;
+            continue;
+        }
+        switch (i.op) {
+        case Op::OpCapability: capability(spv::Capability(i.w[0])); break;
+        case Op::OpExtension: copy(extensions_, i); break;
+        case Op::OpExtInstImport: {
+            const char *s = reinterpret_cast<const char *>(i.w.data() + 1);
+            if (std::string_view(s, strnlen(s, (i.w.size() - 1) * 4)) == "GLSL.std.450") glsl_ = i.w[0];
+            copy(imports_, i);
+            break;
+        }
+        case Op::OpDecorate: case Op::OpMemberDecorate: case Op::OpDecorateId: case Op::OpDecorateString:
+        case Op::OpMemberDecorateString:
+            if (i.w[0] != entry) copy(annotations_, i);
+            break;
+        case Op::OpTypeVoid: case Op::OpTypeBool: case Op::OpTypeInt: case Op::OpTypeFloat: case Op::OpTypeVector:
+        case Op::OpTypeMatrix: case Op::OpTypeImage: case Op::OpTypeSampler: case Op::OpTypeSampledImage:
+        case Op::OpTypePointer: case Op::OpTypeFunction:
+            copy(globals_, i);
+            share(i, 0);
+            break;
+        case Op::OpTypeArray:
+            copy(globals_, i);
+            if (!strided.count(i.w[0])) share(i, 0);
+            break;
+        case Op::OpConstant: case Op::OpConstantTrue: case Op::OpConstantFalse: case Op::OpConstantComposite:
+        case Op::OpConstantNull:
+            copy(globals_, i);
+            share(i, 1);
+            break;
+        case Op::OpVariable:
+            copy(globals_, i);
+            out.globals.push_back(i.w[1]);
+            break;
+        case Op::OpFunction:
+            in_function = true;
+            function = i.w[1];
+            skipping = function == entry;
+            if (!skipping) {
+                copy(functions_, i);
+                if (auto n = names.find(function); n != names.end()) out.functions[n->second] = function;
+            }
+            break;
+        // left out: the memory model, the entry point and its modes, debug
+        case Op::OpMemoryModel: case Op::OpEntryPoint: case Op::OpExecutionMode: case Op::OpExecutionModeId:
+        case Op::OpSource: case Op::OpSourceContinued: case Op::OpSourceExtension: case Op::OpName:
+        case Op::OpMemberName: case Op::OpString: case Op::OpLine: case Op::OpNoLine: case Op::OpModuleProcessed:
+            break;
+        default:
+            // the rest of the types and constants (structures, runtime arrays,
+            // specialization constants, undefined values), made apart
+            copy(globals_, i);
+            break;
+        }
+    }
+    return !in_function;
+}
+
 std::vector<uint32_t> Module::finish() {
     std::vector<uint32_t> out{spv::MagicNumber, version_, 0 /* generator */, next_id_ /* bound */, 0 /* schema */};
     for (const auto *section : {&capabilities_, &extensions_, &imports_, &memory_model_, &entry_points_,

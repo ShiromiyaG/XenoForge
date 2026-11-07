@@ -1,0 +1,25 @@
+// A resolve's clear written into EDRAM itself (the interlock render target
+// path, where EDRAM is the render targets): every sample of the rectangle's
+// pixels gets the clear's words (RB_DEPTH_CLEAR, or RB_COLOR_CLEAR, with
+// RB_COLOR_CLEAR_LO first for 64-bit targets), as Xenia's resolve clear
+// shaders write them (draw_util.h's GetResolveEdramClearShaderConstants).
+// BSD; see LICENSE-xenia.
+
+#version 460
+
+#include "edram.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) buffer Edram { uint words[]; } edram;
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= target.width || p.y >= target.height) return;
+    uvec2 pixel = p + uvec2(target.x, target.y);
+    uint samples = 1u << target.msaa;
+    for (uint s = 0u; s < samples; s++) {
+        uint at = edram_offset(pixel, s);
+        edram.words[at] = target.clear_lo;
+        if (target.ints_log2 != 0u) edram.words[(at + 1u) % EDRAM_DWORDS] = target.clear_hi;
+    }
+}

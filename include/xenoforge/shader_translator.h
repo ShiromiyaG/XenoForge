@@ -11,6 +11,7 @@
 #include "xenoforge/ucode_parse.h"
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -114,10 +115,24 @@ struct VertexOptions {
 // GetInterpolatorSamplingPattern: SQ_CONTEXT_MISC's sc_sample_cntl and
 // SQ_INTERPOLATOR_CNTL's sampling_pattern under MSAA). Without it, values a
 // triangle's edge pixels take are extrapolated past the triangle.
+//
+// fsi: the interlock render target path (docs/renderer.md, "Exact EDRAM
+// through fragment shader interlock"), 1 under pixel interlock, 2 under
+// sample interlock. The shader writes no color, depth or sample mask
+// outputs: after the alpha test (a demotion) and alpha to coverage (a mask in
+// the guest's sample order), it calls edram_library's xf_fsi (edram_fsi.frag
+// compiled as LIBRARY, taken in by spirv::Module::import) inside the
+// interlock with oC0-oC3, the targets it wrote on its path (D3D9's rule:
+// those it did not write keep EDRAM's), oDepth, the rasterized depth's coarse
+// derivatives and the coverage; the library tests depth and stencil, blends
+// and packs into EDRAM (binding 5) as the uniform block at binding 4 or the
+// pipeline's specialization constants say.
 struct PixelOptions {
     uint8_t depth_float24 = 0;
     uint16_t centroid = 0;
-    uint32_t key() const { return depth_float24 | uint32_t(centroid) << 8; }
+    uint8_t fsi = 0;
+    std::span<const uint32_t> edram_library; // with fsi; not part of the key
+    uint32_t key() const { return depth_float24 | uint32_t(centroid) << 8 | uint32_t(fsi) << 24; }
 };
 Translation translate(const ucode::ParsedShader &shader, Stage stage, const VertexOptions &vertex = {},
                       const PixelOptions &pixel = {});

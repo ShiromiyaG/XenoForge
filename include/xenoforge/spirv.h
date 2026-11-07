@@ -13,6 +13,7 @@
 #include <map>
 #include <set>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -26,6 +27,22 @@ public:
     explicit Module(uint32_t version = 0x00010600) : version_(version) {}
 
     Id id() { return next_id_++; }
+
+    // A module of functions written in GLSL and compiled ahead (glslc: a
+    // fragment shader whose main only keeps them; edram_fsi.frag), taken into
+    // this one before anything else is written in it. Its ids are kept as
+    // they are (this module's own start past its bound), its types and
+    // constants are the ones this module makes from then on (each still made
+    // once), and its capabilities, global variables, decorations and functions
+    // are copied; its main, entry point, execution modes and debug
+    // instructions are left out. False for words that are not such a module,
+    // or when this one has begun.
+    struct Imported {
+        std::map<std::string, Id, std::less<>> functions; // by OpName (glslang's mangled names)
+        std::map<Id, std::vector<Id>> parameters;          // each function's parameter types
+        std::vector<Id> globals;                           // its global variables, for the entry point
+    };
+    bool import(std::span<const uint32_t> words, Imported &out);
 
     void capability(spv::Capability capability);
     void extension(std::string_view name);

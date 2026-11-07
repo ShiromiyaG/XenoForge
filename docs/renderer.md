@@ -42,9 +42,12 @@ presents the frames the front end hands over.
 
 Vulkan 1.3 with descriptor indexing (bindless textures), buffer device
 address, extended dynamic state 1 and 2, 16-bit storage. GPUs since about
-2018 on Windows and Linux have all of it. No D3D12, no fragment shader
-interlock (not on every GPU), no fallback paths for older hardware: each of
-those is a second implementation Xenia carries and XenoForge does not.
+2018 on Windows and Linux have all of it. No D3D12, no fallback paths for
+older hardware: each of those is a second implementation Xenia carries and
+XenoForge does not. Above the floor, found by a query with the Xenia-like
+path beside it: fragment shader interlock, the exact EDRAM path and the
+default where the device has it ("Exact EDRAM through fragment shader
+interlock" below; host render targets elsewhere, as Xenia's default).
 
 ## Decisions
 
@@ -1708,6 +1711,155 @@ nothing else.
   skipped in copy mode) is not done; real extents (the pixels and depths
   the draws between two events cover) would be a pass over the occlusion
   queries' draw ranges, and how hi-Z interplays with them wants a console.
+
+## Exact EDRAM through fragment shader interlock (2026-11-06)
+
+Xenia's interlock render target path (`render_target_path_vulkan=fsi`, the
+Direct3D 12 backend's `rov`), ported: the pixel shader reads and writes EDRAM
+itself, under fragment shader interlock, so EDRAM holds the guest's bits as
+the console's does and every format blends as the console blends it. Item A1
+of `docs/xenia-todos-gpu.md`. `Options::render_target_path`
+(`XF_RENDER_TARGET_PATH=fsi` or `host` forces one); the device's
+`VK_EXT_fragment_shader_interlock` is found by a query (`XF_VK_NO_FSI=1`
+turns it off) and a device without it keeps host render targets.
+
+**How it is made.**
+- The output merger is GLSL, `src/shaders/edram_fsi.frag`, from
+  `spirv_shader_translator_rb.cc` (FSI_LoadSampleMask, FSI_LoadEdramOffsets,
+  FSI_DepthStencilTest, FSI_ClampAndPackColor, FSI_UnpackColor, the blend
+  factor and equation functions, CompleteFragmentShaderInMain's color writes)
+  and `vulkan_command_processor.cc`'s UpdateSystemConstantValues for the state.
+  Compiled ahead as a library (`-DLIBRARY`), it is taken into each translated
+  pixel shader by `spirv::Module::import` (its ids kept, this module's own
+  starting past its bound, its types and constants shared with what the
+  translator makes after); the translated shader, with `PixelOptions::fsi`,
+  writes no outputs: after the guest's body, the alpha test (a demotion) and
+  alpha to coverage (a mask in the guest's sample order, Xenia's
+  FSI_AlphaToMask, where oC0 is written on the shader's path), it takes the
+  rasterized depth's coarse derivatives and calls `xf_fsi` between
+  OpBeginInvocationInterlockEXT and OpEndInvocationInterlockEXT, with the
+  colors, the targets written on its path (Direct3D 9's rule: those it did
+  not write keep EDRAM's) and oDepth. Draws without a pixel shader that test
+  depth or stencil get the same file built as a whole fragment shader
+  (`-DDEPTH_ONLY`).
+- Coverage: the host's samples in the guest's order (2x from host samples 1
+  and 0, or 2 and 1 where a pass without attachments takes no 2x and the
+  guest's 2x is rasterized as 4x; 4x from 0, 3, 2, 1), minus helpers, kills,
+  the alpha test and alpha to coverage. The host rasterizes at the Xenos's
+  sample positions where the device places samples
+  (`VK_EXT_sample_locations`, `XF_VK_NO_SAMPLE_LOCATIONS=1`), as Xenia's
+  interlock paths always do; host render targets keep the standard ones, as
+  Xenia's default.
+- Depth and stencil per covered sample: the center's depth plus the
+  polygon offset (the registers' scale in 1/16 pixels and offset in depth
+  units, the front or back face's), extrapolated to the guest sample's
+  position by the derivatives, saturated, then 24-bit unorm or 20e4, both
+  rounded to the nearest even (oDepth instead, unbiased, where the shader
+  writes it); tested and written with the stencil's ops as RB_DEPTHCONTROL
+  says (GetNormalizedDepthControl's depth test that neither writes nor
+  rejects is off; off too where a color target over the same base writes the
+  bits they use, ColorOverlapsDepthStencil). The samples that fail leave the
+  coverage.
+- Colors per covered sample: times the exponent bias; blended where
+  RB_BLENDCONTROL is not one-zero-add, with the destination unpacked from
+  EDRAM's bits, sources, factors and results flushed of NaN and clamped for
+  fixed-point components, the factors applied before min and max as the
+  Xenos does; packed into the guest format (8_8_8_8 and 2_10_10_10 rounded
+  half up, the gamma curve made after blending, 7e3, 16-bit fixed in
+  -32..32 with 10 fraction bits, float16 in the Xenos's extended range
+  without infinity or NaN, 32-bit floats by their bits); the bits the write
+  mask keeps kept (GetPSIColorFormatInfo's keep masks).
+- Resolves read EDRAM, as the MSAA ones did (`resolve.comp`); a resolve's
+  clears write it (`edram_clear.comp`: RB_DEPTH_CLEAR, or RB_COLOR_CLEAR with
+  RB_COLOR_CLEAR_LO first at 64 bits per sample). No render targets are made,
+  no EDRAM transfers, no host depth beside EDRAM.
+- Occlusion queries: the shader adds the samples that passed depth and
+  stencil to a counter (binding 6), a counter per report in each
+  submission's share, zeroed as the submission begins and copied for the CPU
+  as it ends (Xenia's FSI_AddMSAASamplesToZPD).
+- The draw's descriptor set has three more bindings: the state's uniform
+  block (`FsiConstants`, binding 4), EDRAM (5), the counters (6). Passes have
+  no attachments, one a sample count.
+- The host path's approximations and their options do not apply: D24FS8 is
+  20e4 itself (`depth_float24_round`, `depth_float24_convert_in_pixel_shader`
+  and the host depth beside EDRAM are host render targets' answers to its
+  32-bit float), gamma targets blend in linear and are encoded after
+  (`gamma_render_target_as_unorm16`), float targets keep their bits without
+  UINT views, and the "D24FS8 depth as 32-bit float" and gamma counts are not
+  raised.
+
+**Beyond Xenia: the state as specialization.** Xenia's TODO says its path is
+slow mainly because everything in it is dynamic. Here the formats, write
+masks, blending and the depth and stencil tests' state (edram_fsi.frag's
+`constant_id` 0-9) are the pipeline's specialization constants, so the driver
+drops every branch that does not apply (`Options::fsi_specialized`;
+`XF_FSI_DYNAMIC=1` makes it Xenia's, all read from the uniform block). The
+pipelines keyed by it are as many as host render targets' (the race frame:
+97 against 96; dynamic 91).
+
+**Where it differs from Xenia.** The depth and stencil test is always late,
+after the shader (Xenia tests early, holding the interlock through the
+shader, where the shader neither writes depth nor exports); it measured
+faster than host render targets without that. EDRAM bases leave the window
+offset out, as the host path does (Xenia's newer `GetWindowOffsetTiles`).
+The keep masks are made in the shader from the format and the write mask.
+No resolution scale.
+
+**Measured, and the default.** Xenia's exact pictures of the 29 frames were
+made with its trace dumps (`--render_target_path_d3d12=rov`,
+`--render_target_path_vulkan=fsi`, in `../traces/dumps/rov` and
+`rov/d3d12`); `replay_test` compares with them when the renderer takes the
+interlock path (`render::render_target_path`). Against them all 29 pass:
+0.000-0.006 of 255 but Reach's menu (0.083, as the host path's 0.082 against
+Xenia's default) and El Chavo Kart's park and race (0.007 and 0.008 off the
+Vulkan FSI picture; Xenia's ROV picture is 3.08 and 1.75 off its own FSI one,
+the anisotropic filtering above). Where exactness shows, against Xenia's
+default pictures: Gears of War 3 0.25-0.27 (0.005 against ROV), Ben 10's 1800
+and 3600 0.043-0.051 (0.000), the park and race 0.554 and 0.245 off Vulkan's
+(0.007, 0.008). Red Dead Redemption's 850 and 950 (not in `replay_test`):
+0.112 and 0.118 off Xenia's Vulkan FSI picture, 0.247 off its ROV one
+(Xenia's two are 0.196 apart; without the Xenos sample positions they were
+1.11, edges of the 2x MSAA scene); host render targets are 1.27 and 1.36 off
+those. With `XF_FSI_DYNAMIC=1` and with `XF_LINKED_PIPELINES=1` the pictures
+are the same; validation is clean on both paths.
+
+GPU time a frame (`xfreplay --gpu-time --repeat 30`, twice interleaved, the
+texture loads' time equal across the three: same clocks):
+
+| trace | host render targets | interlock | interlock, dynamic |
+| --- | --- | --- | --- |
+| El Chavo Kart, race | 6.01-6.22 ms | 4.59-4.75 ms | 5.06-5.28 ms |
+| park | 4.46-4.50 ms | 3.11 ms | 3.39-3.43 ms |
+| Ben 10, 3600 | 1.81-1.84 ms | 1.65 ms | 1.81 ms |
+| Red Dead Redemption, 850 | 15.08-15.13 ms | 13.43 ms | 14.66-14.74 ms |
+
+The EDRAM transfers go (the race's stores and loads, the stencil's
+bit-by-bit loads without stencil export), and resolves read EDRAM rather
+than copying images; without early depth the draws themselves cost about
+what they did. Live (`boot_<game> --render --rates`, `XF_PIPELINES=library`
+as the player, `XF_GPU_TIME=1`, El Chavo Kart's press script to the race,
+600 s; Ben 10 240 s; nothing else on the machine):
+
+| | host render targets | interlock |
+| --- | --- | --- |
+| El Chavo Kart: title, menus and park, race (swaps/s; the cap is 30) | 30.0, 29.8, 29.9 | 30.0, 29.8, 30.0 |
+| renderer busy in those phases | 4%, 17%, 23% | 3%, 15%, 18% |
+| renderer's time, GPU time (600 s) | 128.4 s, 93.6 s | 98.9 s, 93.4 s |
+| hitches: frames over 4 ms making pipelines, swaps over 50 / 100 ms apart | 5, 26 / 6 | 0, 23 / 6 |
+| Ben 10, 70-150 s: swaps/s (vblank), renderer busy; GPU time (240 s) | 60.0, 5%; 19.7 s | 60.0, 3%; 21.5 s |
+
+The interlock path is the default where the device has fragment shader
+interlock: it matches Xenia's exact pictures as closely as host render
+targets match its default ones, is faster in every replay, and costs the
+same live (both at the games' caps) with a quarter less of the renderer's
+time. Its pipelines' shaders are larger: a cold driver cache made the first
+interlock run of El Chavo Kart spend 30.6 s making pipelines (boot's
+default, waiting for them), a warm one 0.01 s with libraries.
+
+**Fixed on the way (both paths):** a 64-bit target's row of tiles is twice
+the 32-bit one, rounded at 32 bits (xenos.h's GetSurfacePitchTiles); it was
+rounded at 64 bits, which differs for pitches whose samples are not a
+multiple of 80. No traced frame has such a pitch.
 
 ## What is asked and not done is counted
 

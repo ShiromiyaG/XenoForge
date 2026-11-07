@@ -241,6 +241,8 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fsi{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     {
         const bool has_eds3 =
             has_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && !turned_off("XF_VK_NO_EDS3");
@@ -269,6 +271,40 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
             *tail = &eds3, tail = &eds3.pNext;
             enabled.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
             d->dynamic_blend_ = true;
+        }
+        // Fragment shader interlock (VK_EXT_fragment_shader_interlock), for
+        // the renderer's exact EDRAM (render::Options::render_target_path):
+        // pixel interlock at least, sample interlock where the device has it
+        // too (Xenia's choice); XF_VK_NO_FSI=1 turns it off. The sample
+        // counts a render pass without attachments takes decide whether the
+        // guest's 2x is rasterized as 2x or as 4x.
+        if (has_extension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) && !turned_off("XF_VK_NO_FSI")) {
+            VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT has_fsi{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_fsi{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_fsi.pNext = &has_fsi;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_fsi);
+            if (has_fsi.fragmentShaderPixelInterlock) {
+                fsi.fragmentShaderPixelInterlock = VK_TRUE;
+                fsi.fragmentShaderSampleInterlock = has_fsi.fragmentShaderSampleInterlock;
+                *tail = &fsi, tail = &fsi.pNext;
+                enabled.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+                d->fragment_shader_interlock_ = has_fsi.fragmentShaderSampleInterlock ? 2 : 1;
+                d->no_attachments_samples_ = props.properties.limits.framebufferNoAttachmentsSampleCounts;
+            }
+        }
+        // VK_EXT_sample_locations: the interlock path rasterizes at the
+        // Xenos's sample positions, as Xenia's interlock paths always do where
+        // the host can (XF_VK_NO_SAMPLE_LOCATIONS=1 turns it off)
+        if (d->fragment_shader_interlock_ && has_extension(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME) &&
+            !turned_off("XF_VK_NO_SAMPLE_LOCATIONS")) {
+            VkPhysicalDeviceSampleLocationsPropertiesEXT locations{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 query_locations{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            query_locations.pNext = &locations;
+            vkGetPhysicalDeviceProperties2(d->physical_, &query_locations);
+            d->sample_locations_ = locations.sampleLocationSampleCounts;
+            if (d->sample_locations_) enabled.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
         }
         // (without fast linking a linked pipeline may cost as much as a whole
         // one, so the libraries would gain nothing)

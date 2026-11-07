@@ -100,6 +100,14 @@ public:
     // VK_EXT_graphics_pipeline_library with fast linking: pipelines linked
     // from libraries of their four parts in a fraction of a millisecond
     bool pipeline_library() const { return pipeline_library_; }
+    // VK_EXT_fragment_shader_interlock (0 none, 1 pixel interlock, 2 pixel
+    // and sample interlock), and the sample counts a render pass without
+    // attachments takes (framebufferNoAttachmentsSampleCounts)
+    uint32_t fragment_shader_interlock() const { return fragment_shader_interlock_; }
+    VkSampleCountFlags no_attachments_samples() const { return no_attachments_samples_; }
+    // VK_EXT_sample_locations's sample counts (0 without it; enabled only
+    // with fragment shader interlock, which uses it)
+    VkSampleCountFlags sample_locations() const { return sample_locations_; }
 
     // host-visible and coherent (mapped), or device-local; host_reads: the
     // host reads it back, so cached memory where the device has it
@@ -166,6 +174,8 @@ private:
     bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false;
     float line_width_range_[2] = {1.0f, 1.0f};
     bool dynamic_blend_ = false, pipeline_library_ = false;
+    uint32_t fragment_shader_interlock_ = 0;
+    VkSampleCountFlags no_attachments_samples_ = 0, sample_locations_ = 0;
     std::mutex queue_mutex_;
 };
 
