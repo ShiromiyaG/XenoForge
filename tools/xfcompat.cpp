@@ -225,6 +225,17 @@ int main(int argc, char **argv) {
             std::printf("  library cached\n");
         }
         row.library_bytes = std::filesystem::exists(library, ec) ? std::filesystem::file_size(library, ec) : 0;
+        // what the build left out (D2), from the report beside the library
+        if (auto report = build::read_build_report(cache, digest)) {
+            row.left_out = int64_t(report->left_out.size());
+            for (size_t i = 0; i < report->left_out.size() && i < 3; i++) {
+                const build::LeftOutFunction &f = report->left_out[i];
+                char address[16];
+                std::snprintf(address, sizeof(address), "0x%08X", f.address);
+                row.left_out_why += (i ? "; " : "") + f.module + " " + address + ": " + f.reason;
+            }
+            if (report->left_out.size()) std::printf("  %zu functions left out\n", report->left_out.size());
+        }
 
         // the boot: a fresh storage root, the hard timeout the run plus the time to start and to end
         const std::filesystem::path content = cache / "compat-content" / row.digest;

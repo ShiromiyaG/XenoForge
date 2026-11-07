@@ -162,6 +162,7 @@ std::string to_json(const Row &r) {
     str("state", r.state), str("detail", r.detail);
     num("build_seconds", number(r.build_seconds)), num("cached", r.cached ? "true" : "false");
     u("library_bytes", r.library_bytes), num("left_out", std::to_string(r.left_out));
+    str("left_out_why", r.left_out_why);
     u("modules", r.modules), u("functions", r.functions);
     u("interpreted_entries", r.interpreted_entries), u("interpreted_addresses", r.interpreted_addresses);
     u("swaps", r.swaps), u("draws", r.draws);
@@ -181,6 +182,7 @@ bool from_json(std::string_view line, Row &r) {
     r.build_seconds = real_of(o, "build_seconds"), r.cached = text_of(o, "cached") == "true";
     r.library_bytes = number_of(o, "library_bytes");
     r.left_out = std::strtoll(text_of(o, "left_out").c_str(), nullptr, 10);
+    r.left_out_why = text_of(o, "left_out_why");
     r.modules = number_of(o, "modules"), r.functions = number_of(o, "functions");
     r.interpreted_entries = number_of(o, "interpreted_entries");
     r.interpreted_addresses = number_of(o, "interpreted_addresses");
@@ -194,7 +196,7 @@ bool from_json(std::string_view line, Row &r) {
 }
 
 std::string csv_header() {
-    return "disc,title,title_id,digest,state,detail,build_seconds,cached,library_mb,left_out,modules,functions,"
+    return "disc,title,title_id,digest,state,detail,build_seconds,cached,library_mb,left_out,left_out_why,modules,functions,"
            "interpreted_entries,interpreted_addresses,swaps,draws,first_unimplemented,first_gpu,boot_seconds,"
            "exit_code,excerpt";
 }
@@ -206,7 +208,8 @@ std::string to_csv(const Row &r) {
     auto add = [&](const std::string &v) { out += (out.empty() ? "" : ",") + v; };
     add(csv_field(r.disc)), add(csv_field(r.title)), add(r.title_id), add(r.digest), add(r.state);
     add(csv_field(r.detail)), add(number(r.build_seconds)), add(r.cached ? "yes" : "no"), add(mb);
-    add(r.left_out < 0 ? "" : std::to_string(r.left_out)), add(std::to_string(r.modules));
+    add(r.left_out < 0 ? "" : std::to_string(r.left_out)), add(csv_field(r.left_out_why));
+    add(std::to_string(r.modules));
     add(std::to_string(r.functions)), add(std::to_string(r.interpreted_entries));
     add(std::to_string(r.interpreted_addresses)), add(std::to_string(r.swaps)), add(std::to_string(r.draws));
     add(csv_field(r.first_unimplemented)), add(csv_field(r.first_gpu)), add(number(r.boot_seconds));

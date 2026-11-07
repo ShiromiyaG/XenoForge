@@ -26,6 +26,7 @@ struct Row {
     bool cached = false;       // the library was in the cache already
     uint64_t library_bytes = 0;
     int64_t left_out = -1; // functions left out at build (-1: not reported)
+    std::string left_out_why; // the first few of them, "module 0xADDRESS: reason", "; " joined
     uint64_t modules = 0, functions = 0;
     uint64_t interpreted_entries = 0, interpreted_addresses = 0;
     uint64_t swaps = 0, draws = 0;

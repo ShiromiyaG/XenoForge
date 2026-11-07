@@ -1,8 +1,13 @@
 #include "stale_library.h"
 
+#include "xenoforge/game_build.h"
+
 namespace xf::frontend {
 
-// The stub: connect to game_build.h's "new entries since built" when it exists.
-bool library_has_new_entries(const std::filesystem::path &, std::string_view) { return false; }
+// game_build.h's count of the addresses the runtime logged since the cached
+// library was built (D3), but the functions that build left out
+bool library_has_new_entries(const std::filesystem::path &cache_dir, std::string_view digest) {
+    return build::has_new_entries(cache_dir, digest);
+}
 
 } // namespace xf::frontend
