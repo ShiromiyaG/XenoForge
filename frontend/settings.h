@@ -63,8 +63,8 @@ struct Settings {
         std::string games;           // the folder the launcher lists the games of
         std::string accent;          // the launcher's accent colour, "#RRGGBB" ("" for its own)
         std::string theme = "system"; // "system" (the desktop's light or dark), "light" or "dark"
-        std::string columns;         // the games table's column widths, "title=320 status=140" (dp)
         std::string sort = "title";  // the column the table is sorted by, "-" before it for descending
+        std::string backdrop = "animated"; // the window's ribbons: "animated", "still" or "off"
         // the main window where the user left it (pixels; width 0: never saved)
         int x = 0, y = 0, width = 0, height = 0;
         bool maximized = false;

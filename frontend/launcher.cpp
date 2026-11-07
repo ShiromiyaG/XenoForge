@@ -31,11 +31,12 @@
 // <arg> (repeatable) adds an argument to the player's command line
 // (--quit-after 20, say), --build-jobs N the compilers a Prepare runs at once
 // (4 unless told; each takes a gigabyte or two). For the pictures of the
-// windows: --demo-progress shows a fake build under way (--demo-fail: one
+// windows: --demo-games lists six titles instead of a folder's discs,
+// --demo-progress shows a fake build under way (--demo-fail: one
 // that fails, --demo-speed X: times real time, --show-log: its log open),
 // --snap-at S ends at S seconds whatever the view is waiting for,
 // --capture-binding <name> a binding waiting for its key, --menu <name> a menu
-// open (file, emulation, options, tools, help), --context-menu the selected
+// open (emulation, help), --context-menu the selected
 // row's menu open, --tab <name> the settings window's tab (video, sound,
 // controllers, keyboard, interface), --render-size WxH draws at that size without the window (a
 // 4K picture on a 1080p desktop), --scale F the interface's scale (else the
@@ -45,7 +46,7 @@
 // apart once the window has settled.
 //
 //   launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <page>] [--start N] [--keys <list>]
-//            [--player-arg <arg>]... [--build-jobs N] [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
+//            [--player-arg <arg>]... [--build-jobs N] [--quit-after S] [--screenshot <png>] [--demo-games] [--demo-progress] [--demo-fail]
 //            [--demo-speed X] [--show-log] [--capture-binding <name>] [--menu <name>] [--context-menu] [--tab <name>]
 //            [--render-size WxH] [--scale F] [--assets <dir>]
 
@@ -126,7 +127,7 @@ int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::filesystem::path config_file, screenshot, assets;
     std::string games_arg;
-    bool list = false, games_given = false;
+    bool list = false, games_given = false, demo_games = false;
     double quit_after = 0;
     float snap_at = 0;
     std::vector<std::string> key_script;
@@ -160,6 +161,8 @@ int main(int argc, char **argv) {
             quit_after = std::strtod(argv[++i], nullptr);
         else if (a == "--screenshot" && i + 1 < argc)
             screenshot = from_utf8(argv[++i]);
+        else if (a == "--demo-games")
+            demo_games = true;
         else if (a == "--demo-progress")
             options.demo_progress = true;
         else if (a == "--demo-fail")
@@ -203,7 +206,10 @@ int main(int argc, char **argv) {
     if (!core.load_error().empty())
         std::fprintf(stderr, "launcher: %s: %s (the defaults instead)\n", utf8(config_file).c_str(), core.load_error().c_str());
     std::string message;
-    if (games_given)
+    if (demo_games) {
+        if (games_given) core.set_games_folder(games_arg, false, message);
+        core.use_demo_games(frontend::LauncherCore::demo_list());
+    } else if (games_given)
         core.set_games_folder(games_arg, false, message); // for this run only
     else
         core.rescan();
@@ -266,9 +272,15 @@ int main(int argc, char **argv) {
     if (!Rml::Initialise()) return fail("RmlUi did not start");
     std::filesystem::path fonts = assets / "fonts";
     if (!std::filesystem::exists(fonts)) fonts = assets.parent_path() / "fonts";
-    const std::pair<const char *, int> faces[] = {{"Inter-Regular.ttf", 400}, {"Inter-Medium.ttf", 500}, {"Inter-SemiBold.ttf", 600}, {"Inter-Bold.ttf", 700}};
+    const std::pair<const char *, int> faces[] = {{"Inter-Light.ttf", 300},   {"Inter-Regular.ttf", 400}, {"Inter-Medium.ttf", 500},
+                                                  {"Inter-SemiBold.ttf", 600}, {"Inter-Bold.ttf", 700}};
     for (const auto &[file, weight] : faces)
         if (!Rml::LoadFontFace(utf8(fonts / file), "Inter", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(weight)))
+            std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / file).c_str());
+    // the list's and toolbar's condensed face (Roboto Condensed, Apache 2.0)
+    const std::pair<const char *, int> condensed[] = {{"RobotoCondensed-Light.ttf", 300}, {"RobotoCondensed-Regular.ttf", 400}, {"RobotoCondensed-Medium.ttf", 500}};
+    for (const auto &[file, weight] : condensed)
+        if (!Rml::LoadFontFace(utf8(fonts / file), "Condensed", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(weight)))
             std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / file).c_str());
     if (!Rml::LoadFontFace(utf8(fonts / "Lucide.ttf"), "Lucide", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(400)))
         std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / "Lucide.ttf").c_str());

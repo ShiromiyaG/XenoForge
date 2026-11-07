@@ -155,6 +155,7 @@ SettingsPage SettingsView::page() {
     p.folder = core_.games_folder();
     p.accent = accent_from_hex(core_.accent()).base;
     p.theme = theme_text(theme_from_text(core_.launcher().theme));
+    p.backdrop = core_.launcher().backdrop;
     if (tab_ == SettingsTab::Controllers) p.gamepads = LauncherCore::gamepads();
     p.capturing = capturing_;
     return p;
@@ -314,12 +315,14 @@ void SettingsView::toggle_setting(Rml::Element *row) {
 std::vector<Choice> SettingsView::choices_for(const std::string &key) const {
     if (key == "video.aspect") return aspect_choices();
     if (key == "theme") return theme_choices();
+    if (key == "backdrop") return backdrop_choices();
     return user_choices();
 }
 
 std::string SettingsView::choice_value(const std::string &key) const {
     if (key == "video.aspect") return edit_.video.aspect;
     if (key == "theme") return theme_text(theme_from_text(core_.launcher().theme));
+    if (key == "backdrop") return core_.launcher().backdrop;
     return std::to_string(edit_.input.keyboard_user);
 }
 
@@ -376,6 +379,12 @@ void SettingsView::choose_option(const std::string &key, const std::string &valu
         std::string error;
         core_.set_launcher(l, error);
         host_.look_changed();
+    } else if (key == "backdrop") {
+        // read by the launcher's window every frame: nothing to rebuild
+        Settings::Launcher l = core_.launcher();
+        l.backdrop = value;
+        std::string error;
+        core_.set_launcher(l, error);
     } else {
         if (key == "video.aspect") edit_.video.aspect = value;
         else if (key == "input.keyboard_user") edit_.input.keyboard_user = std::atoi(value.c_str());

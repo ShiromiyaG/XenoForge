@@ -30,10 +30,6 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
     Rml::Element *target = event.GetTargetElement();
     if (!target) return;
     if (type == "click") {
-        if (drag_click_) {
-            drag_click_ = false;
-            if (ancestor_with(target, "data-grip") || target->GetParentNode() == by_id("thead") || ancestor_with(target, "data-arg")) return;
-        }
         if (target->GetId() == "menu-layer") return close_menu();
         if (Rml::Element *title = ancestor_with(target, "data-menu")) {
             const std::string name = title->GetAttribute<Rml::String>("data-menu", "");
@@ -49,7 +45,16 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
             }
             return;
         }
-        if (ancestor_with(target, "data-grip")) return;
+        // a row's Options button: that row's menu, under the button
+        if (Rml::Element *opt = ancestor_with(target, "data-row-options")) {
+            if (Rml::Element *row = ancestor_with(opt, "data-index")) {
+                select_game(row->GetAttribute<int>("data-index", -1), false);
+                const Rml::Vector2f at = opt->GetAbsoluteOffset(Rml::BoxArea::Border);
+                if (menu_ == "context") close_menu();
+                else if (selected_game()) open_context_menu(at.x, at.y + opt->GetBox().GetSize(Rml::BoxArea::Border).y + 2 * dp());
+            }
+            return;
+        }
         if (Rml::Element *a = ancestor_with(target, "data-action")) {
             close_menu();
             do_action(a->GetAttribute<Rml::String>("data-action", ""), a->GetAttribute<Rml::String>("data-arg", ""));
@@ -70,25 +75,6 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
                 row->Focus();
                 if (selected_game()) open_context_menu(event.GetParameter<float>("mouse_x", 0), event.GetParameter<float>("mouse_y", 0));
             }
-        } else if (button == 0 && target->HasAttribute("data-grip")) {
-            drag_column_ = std::clamp(target->GetAttribute<int>("data-grip", 1), 1, COLUMNS - 1);
-            drag_x_ = event.GetParameter<float>("mouse_x", 0);
-            drag_width_ = widths_[size_t(drag_column_)];
-        }
-    } else if (type == "mousemove") {
-        if (drag_column_ >= 0) {
-            const float width = std::max(column_info(Column(drag_column_)).min, drag_width_ + (event.GetParameter<float>("mouse_x", 0) - drag_x_) / dp());
-            if (std::fabs(width - widths_[size_t(drag_column_)]) >= 1) {
-                widths_[size_t(drag_column_)] = std::round(width);
-                rebuild_head();
-                rebuild_rows(true);
-            }
-        }
-    } else if (type == "mouseup") {
-        if (drag_column_ >= 0) {
-            drag_column_ = -1;
-            drag_click_ = true;
-            save_layout();
         }
     } else if (type == "mouseover") {
         // with a menu open, moving over another title opens that one
@@ -132,16 +118,24 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
         open_settings(SettingsTab::Video);
     } else if (name == "controls") {
         open_settings(SettingsTab::Controllers);
+    } else if (name == "demo-games") {
+        core_.show_demo_games(!core_.demo_games());
+        selected_ = -1;
+        rows_sig_.clear();
+        cached_.clear();
+        last_listing_ = Clock::time_point();
+        if (settings_) settings_->set_game(nullptr);
+        set_message(core_.demo_games() ? "Listing the demo games" : "Listing the games folder", 0, 4);
+    } else if (name == "keyboard-settings") {
+        open_settings(SettingsTab::Keyboard);
+    } else if (name == "view-grid") {
+        set_message("The grid view is not available yet", 0, 6);
+    } else if (name == "xbox-home") {
+        set_message("Xbox home is not available yet", 0, 6);
     } else if (name == "about") {
         show_about();
     } else if (name == "exit") {
         quit_ = true;
-    } else if (name == "theme") {
-        Settings::Launcher l = core_.launcher();
-        l.theme = arg;
-        std::string error;
-        core_.set_launcher(l, error);
-        look_changed();
     } else if (name == "sort") {
         Column column = Column::Title;
         bool ascending = true;
@@ -348,7 +342,7 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
     }
     if (ctrl && key == SDLK_COMMA) return do_action("settings", ""), true;
     if (alt) {
-        const std::pair<SDL_Keycode, const char *> keys[] = {{SDLK_F, "file"}, {SDLK_E, "emulation"}, {SDLK_O, "options"}, {SDLK_T, "tools"}, {SDLK_H, "help"}};
+        const std::pair<SDL_Keycode, const char *> keys[] = {{SDLK_E, "emulation"}, {SDLK_H, "help"}};
         for (const auto &[k, name] : keys)
             if (key == k) return open_menu(name, true), true;
     }
@@ -360,7 +354,7 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
                 open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
             }
         } else {
-            open_menu("file", true);
+            open_menu("emulation", true);
         }
         return true;
     case SDLK_APPLICATION:
@@ -453,7 +447,7 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         if (down && !filter_.empty()) do_action("clear-search", "");
         break;
     case SDL_GAMEPAD_BUTTON_BACK:
-        if (down) open_menu("file", true);
+        if (down) open_menu("emulation", true);
         break;
     default: break;
     }

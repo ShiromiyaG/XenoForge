@@ -103,6 +103,7 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     void rebuild_rows(bool force = false);
     void update_toolbar();
     void update_status();
+    void update_backdrop();
     void set_message(const std::string &text, int kind, double seconds); // kind: 0 plain, 1 good, 2 error
 
     // state
@@ -111,7 +112,6 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     bool cached_of(const GameEntry &game) const;
     const PlayerBinary *player_of(const GameEntry &game) const;
     GameStatus status_of(const GameEntry &game) const;
-    std::string runs_in(const GameEntry &game) const;
     std::string icon_name(const GameEntry &game);
     void select_game(long index, bool scroll);
     void move_selection(int delta, bool to_end = false);
@@ -182,13 +182,12 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     std::string filter_;
     Column sort_ = Column::Title;
     bool ascending_ = true;
-    Widths widths_{};
-    int drag_column_ = -1; // a column's edge being dragged
-    float drag_x_ = 0, drag_width_ = 0;
-    bool drag_click_ = false; // the click a drag's release makes is not a sort
     // whether a library is cached for a disc, by its digest: asked of the
     // cache folder once, again after a rescan or a build
     mutable std::map<uint64_t, bool> cached_;
+
+    // the backdrop's ribbons: their clock (it stops with the window out of sight)
+    double backdrop_clock_ = 7.0, backdrop_seen_ = 0;
 
     // the status bar's message
     std::string message_;

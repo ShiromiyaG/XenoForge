@@ -14,7 +14,8 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *const MENUS[] = {"file", "emulation", "options", "tools", "help"};
+const char *const MENUS[] = {"emulation", "help"};
+constexpr int MENU_COUNT = 2;
 
 std::string px(float value) {
     char text[32];
@@ -46,9 +47,6 @@ std::vector<MenuItem> LauncherView::menu_items(const std::string &name) {
     const GameStatus status = g ? status_of(*g) : GameStatus::Ready;
     const bool playable = g && player_of(*g) && !running;
     const char *prepare = status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : "Rebuild the library";
-    if (name == "file")
-        return {item("browse", "Open games folder...", "Ctrl+O", "folder-open"), item("rescan", "Rescan the folder", "F5", "refresh-cw"), menu_separator(),
-                item("exit", "Exit", "Alt+F4", "log-out")};
     if (name == "emulation") {
         std::vector<MenuItem> m = {item("play", "Play", "Enter", "play", playable), item("play-interpreted", "Play interpreted", "", "cpu", playable),
                                    item("prepare", prepare, "", "hammer", g && !running && !building), menu_separator(),
@@ -56,25 +54,10 @@ std::vector<MenuItem> LauncherView::menu_items(const std::string &name) {
         if (building && dialog_ != Dialog::Prepare) m.push_back(item("show-prepare", "Show the build's progress", "", "loader-circle"));
         return m;
     }
-    if (name == "options") {
-        std::vector<MenuItem> m = {item("settings", "Settings...", "Ctrl+,", "settings"), item("controls", "Controls...", "", "gamepad-2"),
-                                   item("game-settings", "Game settings...", "F2", "sliders-horizontal", g != nullptr),
-                                   menu_separator()};
-        const ThemeChoice theme = theme_from_text(core_.launcher().theme);
-        const std::pair<ThemeChoice, const char *> themes[] = {
-            {ThemeChoice::System, "The system's theme"}, {ThemeChoice::Light, "Light theme"}, {ThemeChoice::Dark, "Dark theme"}};
-        for (const auto &[choice, label] : themes) {
-            MenuItem t = item("theme", label, "", "", true, theme_text(choice));
-            t.checked = choice == theme;
-            m.push_back(t);
-        }
-        return m;
-    }
-    if (name == "tools")
-        return {item("open-game-folder", "Open the disc's folder", "", "folder", g != nullptr), item("copy-id", "Copy the title ID", "", "copy", g != nullptr),
-                menu_separator(), item("open-cache", "Open the game libraries' folder", "", "package"),
+    if (name == "help")
+        return {item("about", "About XenoForge", "", "info"), menu_separator(),
+                item("open-cache", "Open the game libraries' folder", "", "hard-drive"),
                 item("open-config", "Open the settings file", "", "file-text"), item("open-logs", "Open the logs folder", "", "folder")};
-    if (name == "help") return {item("about", "About XenoForge", "", "info")};
     // a row's own menu
     return {item("play", "Play", "Enter", "play", playable), item("play-interpreted", "Play interpreted", "", "cpu", playable),
             item("prepare", prepare, "", "hammer", g && !running && !building), menu_separator(),
@@ -158,9 +141,9 @@ void LauncherView::menu_move(int delta) {
 
 void LauncherView::menu_switch(int delta) {
     int at = 0;
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < MENU_COUNT; i++)
         if (menu_ == MENUS[i]) at = i;
-    open_menu(MENUS[(at + delta + 5) % 5], true);
+    open_menu(MENUS[(at + delta + MENU_COUNT) % MENU_COUNT], true);
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +408,7 @@ void LauncherView::update() {
     }
     poll_listing();
     rebuild_rows();
+    update_backdrop();
 
     // the checks' and pictures' requests, once there is something to show
     if (demo_pending_ && (!listing_.games.empty() || !listing_.busy)) {

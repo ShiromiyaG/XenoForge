@@ -5,29 +5,49 @@
 </head>
 <body>
     <div id="app">
-        <div id="menubar">
-            <div class="menu-title" id="menu-file" data-menu="file">File</div>
-            <div class="menu-title" id="menu-emulation" data-menu="emulation">Emulation</div>
-            <div class="menu-title" id="menu-options" data-menu="options">Options</div>
-            <div class="menu-title" id="menu-tools" data-menu="tools">Tools</div>
-            <div class="menu-title" id="menu-help" data-menu="help">Help</div>
+        <div id="header">
+            <div id="brand">xeno<span>forge</span></div>
+            <div id="nav">
+                <div class="nav f" id="nav-home" data-action="xbox-home">xbox home</div>
+                <div class="nav f on" id="nav-games">games</div>
+                <div class="nav f" id="menu-emulation" data-menu="emulation">emulation</div>
+                <div class="nav f" id="nav-settings" data-action="settings">settings</div>
+                <div class="nav f" id="menu-help" data-menu="help">help</div>
+            </div>
+            <div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div>
         </div>
         <div id="toolbar">
             <div class="tb primary f" id="tb-play" data-action="play">{i:play}<div id="tb-play-label">Play</div></div>
             <div class="tb f" id="tb-prepare" data-action="prepare">{i:hammer}<div id="tb-prepare-label">Prepare</div></div>
-            <div class="tb-sep"></div>
-            <div class="tb f" id="tb-browse" data-action="browse">{i:folder-open}<div>Open folder</div></div>
+            <div class="tb f" id="tb-browse" data-action="browse">{i:folder-open}<div>Open Folder</div></div>
             <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
-            <div class="tb-sep"></div>
             <div class="tb f" id="tb-settings" data-action="settings">{i:settings}<div>Settings</div></div>
             <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
+            <div class="tb f" id="tb-demo" data-action="demo-games">{i:layers}<div>Demo games</div></div>
             <div id="tb-space"></div>
-            <div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div>
+            <div class="vb on f" id="vb-list">{i:list}</div>
+            <div class="vb f" id="vb-grid" data-action="view-grid">{i:grid-3x3}</div>
+            <div class="vb f" id="vb-keyboard" data-action="keyboard-settings">{i:mouse}</div>
+            <div class="vb f" id="vb-pad" data-action="controls">{i:gamepad-2}</div>
         </div>
         <div id="table">
             <div id="thead"></div>
             <div id="tbody"></div>
             <div id="tempty"></div>
+        </div>
+        <div id="hints">
+            <div class="pad-hints">
+                <div class="hint"><div class="pb a">A</div><div class="hl">Play</div></div>
+                <div class="hint"><div class="pb b">B</div><div class="hl">Back</div></div>
+                <div class="hint"><div class="pb x">X</div><div class="hl">Settings</div></div>
+                <div class="hint"><div class="pb y">Y</div><div class="hl">Rescan</div></div>
+            </div>
+            <div class="key-hints">
+                {i:keyboard}<div class="hint-dot"></div>{i:mouse}
+                <div class="keycap one"><div>Enter</div></div><div class="hl">Play</div>
+                <div class="keycap two"><div>Page</div><div>Up</div></div>
+                <div class="keycap two"><div>Page</div><div>Down</div></div><div class="hl">Scroll</div>
+            </div>
         </div>
         <div id="statusbar">
             <div class="st" id="st-count"></div>

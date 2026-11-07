@@ -43,7 +43,7 @@ constexpr VkDeviceSize UNIFORM_RING = 8u << 20;
 static_assert(std::is_same_v<Rml::Matrix4f, Rml::ColumnMajorMatrix4f>, "the shaders take column-major matrices");
 
 // the modes of ui.frag
-enum Mode : int32_t { M_TEXTURE, M_GRADIENT, M_COLOR_MATRIX, M_MASK, M_SHADOW, M_BLUR, M_CLAMPED };
+enum Mode : int32_t { M_TEXTURE, M_GRADIENT, M_COLOR_MATRIX, M_MASK, M_SHADOW, M_BLUR, M_CLAMPED, M_BACKDROP };
 enum class Blend { Over, Replace };
 enum class Clip { None, Test, WriteReplace, WriteIncrement };
 
@@ -177,6 +177,7 @@ struct Renderer::Impl {
     Rml::Matrix4f projection, transform;
 
     std::map<std::string, MemoryImage> images;
+    Backdrop backdrop;
 
     struct Deferred {
         uint64_t serial;
@@ -984,6 +985,22 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
     m.projection = Rml::Matrix4f::ProjectOrtho(0, float(width), 0, float(height), -10000, 10000);
     m.set_transform(nullptr);
     m.begin_pass(m.layer(0), true);
+    if (m.backdrop.on) {
+        const Backdrop &b = m.backdrop;
+        m.pass(m.layer(0), *m.white, M_BACKDROP, Blend::Replace, {}, false, [&](Impl::Draw &s) {
+            // ui.frag's MODE_BACKDROP: the tint in the first stop, the clock,
+            // the shape of the window and the strength in pv
+            for (int c = 0; c < 3; c++) s.u.stop_colors[0][c] = b.tint[c];
+            s.u.pv[0] = b.time;
+            s.u.pv[1] = float(m.width) / float(m.height);
+            s.u.pv[2] = b.strength;
+            s.u.limits[0] = float(m.width), s.u.limits[1] = float(m.height);
+        });
+    }
+}
+
+void Renderer::set_backdrop(const Backdrop &backdrop) {
+    if (impl_) impl_->backdrop = backdrop;
 }
 
 void Renderer::end_frame() {

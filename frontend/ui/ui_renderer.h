@@ -45,6 +45,18 @@ class Renderer final : public Rml::RenderInterface {
     // filter every frame (and fade at the window's edges) on the GPU.
     bool add_soft_image(const std::string &name, const std::vector<uint8_t> &png);
     void remove_image(const std::string &name);
+    // The window's backdrop, drawn under the interface at the start of every
+    // frame, in place of an element's own background: the launcher's grey
+    // gradient with ribbons over it (ui.frag, MODE_BACKDROP): two greys at the
+    // left, four greens at the right, tones of `tint`. `time` is the ribbons'
+    // clock in seconds (a fixed value holds them still); `strength` 0 leaves
+    // the gradient alone. Not `on`: nothing drawn, the base layer starts clear.
+    struct Backdrop {
+        bool on = false;
+        float time = 0, strength = 1;
+        float tint[3] = {0.33f, 0.66f, 0.16f};
+    };
+    void set_backdrop(const Backdrop &backdrop);
 
     // The frame recorded into cmd (its resources free: the frame this slot
     // had before is done). `serial` numbers the frame; `completed` is the

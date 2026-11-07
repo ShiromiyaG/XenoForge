@@ -252,13 +252,13 @@ int main() {
         // the windows' structure: escaped titles, every binding a row, the settings' keys
         frontend::RowInfo row;
         row.title = "A <b> & C", row.id_text = "4D5307E6", row.index = 3;
-        const frontend::Widths widths = frontend::default_widths();
-        const std::string rows_html = frontend::table_row_html(row, widths, true);
+        const std::string rows_html = frontend::table_row_html(row, true);
         CHECK(rows_html.find("A &lt;b&gt; &amp; C") != std::string::npos && rows_html.find("<b>") == std::string::npos);
         CHECK(rows_html.find("data-index=\"3\"") != std::string::npos && rows_html.find(" sel") != std::string::npos);
-        const std::string head = frontend::table_head_html(widths, frontend::Column::Version, false);
-        CHECK(head.find("data-arg=\"version\"") != std::string::npos && head.find("data-grip=\"3\"") != std::string::npos);
-        CHECK(head.find("class=\"th c-ver sorted\"") != std::string::npos);
+        CHECK(rows_html.find("data-row-options") != std::string::npos); // the Options button
+        const std::string head = frontend::table_head_html(frontend::Column::Version, false);
+        CHECK(head.find("data-arg=\"version\"") != std::string::npos && head.find("class=\"th c-ver sorted\"") != std::string::npos);
+        CHECK(head.find("data-arg=\"title\"") != std::string::npos && head.find("c-opts") != std::string::npos);
         frontend::Settings own;
         frontend::SettingsPage page;
         page.settings = &own, page.accent = "#ff7a45", page.theme = "system";
@@ -283,12 +283,7 @@ int main() {
         CHECK(frontend::expand_icons("a{i:x}b") == "a<span class=\"ic\">\xEE\x86\xB2</span>b");
     }
     {
-        // the games table: columns' widths, the sort, the order and the filter
-        const frontend::Widths w = frontend::parse_widths("title=320 status=10 nonsense=50 file=abc version=88");
-        CHECK(w[size_t(frontend::Column::Title)] == 320 && w[size_t(frontend::Column::Version)] == 88);
-        CHECK(w[size_t(frontend::Column::Status)] == frontend::column_info(frontend::Column::Status).min); // kept above the least
-        CHECK(w[size_t(frontend::Column::File)] == frontend::column_info(frontend::Column::File).width);  // a bad number: the default
-        CHECK(frontend::parse_widths(frontend::widths_text(w)) == w);
+        // the games table: the sort, the order and the filter
         frontend::Column c = frontend::Column::Title;
         bool ascending = false;
         frontend::parse_sort("-version", c, ascending);
@@ -317,17 +312,21 @@ int main() {
         CHECK(std::string(frontend::theme_text(frontend::ThemeChoice::Light)) == "light");
     }
     {
-        // the launcher's own section saved in config.toml: the folder, the look, the window and the table
+        // the launcher's own section saved in config.toml: the folder, the look, the window and the sort
         const std::filesystem::path file = std::filesystem::temp_directory_path() / "xf_frontend_test_accent.toml";
         std::filesystem::remove(file);
         frontend::Settings a, b;
         a.launcher.games = "D:/games", a.launcher.accent = "#9b7bff", a.launcher.theme = "light";
-        a.launcher.columns = "title=320", a.launcher.sort = "-status";
+        a.launcher.sort = "-status";
+        a.launcher.backdrop = "still";
         a.launcher.x = -1200, a.launcher.y = 40, a.launcher.width = 1500, a.launcher.height = 900, a.launcher.maximized = true;
         std::string err;
         CHECK(frontend::save(file, a, err) && frontend::load(file, b, err));
         CHECK(b.launcher.games == "D:/games" && b.launcher.accent == "#9b7bff" && b.launcher.theme == "light");
-        CHECK(b.launcher.columns == "title=320" && b.launcher.sort == "-status");
+        CHECK(b.launcher.sort == "-status");
+        CHECK(b.launcher.backdrop == "still");
+        CHECK(frontend::Settings().launcher.backdrop == "animated");
+        CHECK(frontend::backdrop_choices().size() == 3);
         CHECK(b.launcher.x == -1200 && b.launcher.y == 40 && b.launcher.width == 1500 && b.launcher.height == 900 && b.launcher.maximized);
         std::filesystem::remove(file);
     }

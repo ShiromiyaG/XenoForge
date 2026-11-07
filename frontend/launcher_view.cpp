@@ -40,7 +40,6 @@ LauncherView::LauncherView(LauncherCore &core, ui::Renderer &renderer, SDL_Windo
     menu_pending_ = opt_.menu;
     context_pending_ = opt_.context_menu;
     screen_pending_ = opt_.screen != Screen::Library;
-    widths_ = parse_widths(core_.launcher().columns);
     parse_sort(core_.launcher().sort, sort_, ascending_);
     last_update_ = Clock::now();
 }
@@ -83,7 +82,7 @@ bool LauncherView::build_document(std::string &error) {
     rml.replace(at, 12, "<style>\n" + styled(rcss_template_) + "\n</style>");
     doc_ = ctx_->LoadDocumentFromMemory(expand_icons(rml), "launcher.rml");
     if (!doc_) return error = "launcher.rml did not load", false;
-    for (const char *type : {"click", "dblclick", "mousedown", "mouseup", "mousemove", "mouseover", "change"}) doc_->AddEventListener(type, this);
+    for (const char *type : {"click", "dblclick", "mousedown", "mouseover", "change"}) doc_->AddEventListener(type, this);
     doc_->AddEventListener("focus", this, true);
     doc_->Show();
     rows_sig_.clear(), status_sig_.clear();
@@ -153,13 +152,6 @@ GameStatus LauncherView::status_of(const GameEntry &game) const {
     return game_status(cached, player && !player->generic, failed_.count(game.title_id) > 0);
 }
 
-std::string LauncherView::runs_in(const GameEntry &game) const {
-    const PlayerBinary *player = player_of(game);
-    if (!player) return "no player";
-    if (!player->generic) return player->path.stem().string();
-    return cached_of(game) ? "generic player, library" : "generic player";
-}
-
 std::string LauncherView::icon_name(const GameEntry &game) {
     if (game.icon.empty()) return {};
     const std::string name = "icon_" + game.title_id_text();
@@ -193,6 +185,30 @@ void LauncherView::poll_listing() {
     }
 }
 
+// The ribbons behind the list (ui.frag, MODE_BACKDROP), once a frame: the clock
+// runs only while the window can be seen (not minimized, hidden or covered);
+// the greens are tones of the accent, so the colours change only when the
+// accent does.
+void LauncherView::update_backdrop() {
+    const Settings::Launcher &l = core_.launcher();
+    const double dt = std::clamp(now_ - backdrop_seen_, 0.0, 0.1);
+    backdrop_seen_ = now_;
+    const SDL_WindowFlags flags = window_ ? SDL_GetWindowFlags(window_) : 0;
+    // it runs while the window can be seen (focus or not: one beside another is still looked at)
+    const bool seen = opt_.offscreen || !(flags & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN | SDL_WINDOW_OCCLUDED));
+    if (l.backdrop == "animated" && seen) backdrop_clock_ += dt;
+
+    int r = 0x4c, g = 0xa9, b = 0x28;
+    const std::string accent = accent_from_hex(core_.accent()).base;
+    if (accent.size() == 7) std::sscanf(accent.c_str() + 1, "%02x%02x%02x", &r, &g, &b);
+    ui::Renderer::Backdrop backdrop;
+    backdrop.on = true;
+    backdrop.time = float(backdrop_clock_);
+    backdrop.strength = l.backdrop == "off" ? 0.f : 1.f;
+    backdrop.tint[0] = float(r) / 255.f, backdrop.tint[1] = float(g) / 255.f, backdrop.tint[2] = float(b) / 255.f;
+    renderer_.set_backdrop(backdrop);
+}
+
 void LauncherView::select_game(long index, bool scroll) {
     if (index < 0 || index >= long(listing_.games.size())) return;
     const long before = selected_;
@@ -224,12 +240,11 @@ void LauncherView::move_selection(int delta, bool to_end) {
 int LauncherView::visible_rows() const {
     Rml::Element *body = by_id("tbody");
     if (!body) return 10;
-    return std::max(1, int(body->GetClientHeight() / (30 * dp())) - 1);
+    return std::max(1, int(body->GetClientHeight() / (74 * dp())) - 1); // a row and its gap
 }
 
 void LauncherView::save_layout() {
     Settings::Launcher l = core_.launcher();
-    l.columns = widths_text(widths_);
     l.sort = sort_text(sort_, ascending_);
     std::string error;
     if (!core_.set_launcher(l, error)) std::fprintf(stderr, "launcher: %s\n", error.c_str());
@@ -239,13 +254,13 @@ void LauncherView::save_layout() {
 // the table
 
 void LauncherView::rebuild_head() {
-    if (Rml::Element *head = by_id("thead")) head->SetInnerRML(table_head_html(widths_, sort_, ascending_));
+    if (Rml::Element *head = by_id("thead")) head->SetInnerRML(table_head_html(sort_, ascending_));
 }
 
 void LauncherView::rebuild_rows(bool force) {
     Rml::Element *body = by_id("tbody");
     if (!body) return;
-    const bool no_folder = core_.games_folder().empty();
+    const bool no_folder = core_.games_folder().empty() && !core_.demo_games(); // the demo games need no folder
     const LauncherCore::Run &run = core_.run();
 
     std::vector<RowKey> keys(listing_.games.size());
@@ -258,11 +273,11 @@ void LauncherView::rebuild_rows(bool force) {
             continue;
         }
         k.title = g.title, k.id_text = g.title_id_text(), k.version = g.version;
-        k.status = int(status_of(g)), k.runs_in = runs_in(g);
+        k.status = int(status_of(g));
     }
     std::string sig = core_.games_folder() + "|" + std::to_string(listing_.total) + (listing_.busy ? "b" : "i") + "|" + filter_ + "|" +
-                      sort_text(sort_, ascending_) + "|" + widths_text(widths_) + "|" + (run.running ? run.title : "") + "|";
-    for (const RowKey &k : keys) sig += k.title + "/" + std::to_string(k.status) + "/" + k.runs_in + ";";
+                      sort_text(sort_, ascending_) + "|" + (run.running ? run.title : "") + "|";
+    for (const RowKey &k : keys) sig += k.title + "/" + std::to_string(k.status) + ";";
     if (!force && sig == rows_sig_) return;
     rows_sig_ = sig;
     settle_until_ = std::max(settle_until_, now_ + 0.5);
@@ -277,16 +292,15 @@ void LauncherView::rebuild_rows(bool force) {
         const GameEntry &g = listing_.games[i];
         RowInfo r;
         r.index = int(i);
-        r.alternate = pos % 2 == 1;
         r.file = keys[i].file;
         if (!g.error.empty()) {
             r.unreadable = true, r.title = keys[i].title, r.file = g.error;
         } else {
             r.title = g.title, r.id_text = g.title_id_text(), r.version = version_text(g.version), r.title_id = g.title_id;
-            r.icon = icon_name(g), r.status = GameStatus(keys[i].status), r.runs_in = keys[i].runs_in;
+            r.icon = icon_name(g), r.status = GameStatus(keys[i].status);
             r.running = run.running && run.title == g.title;
         }
-        html += table_row_html(r, widths_, long(i) == selected_);
+        html += table_row_html(r, long(i) == selected_);
     }
     body->SetInnerRML(html);
 
@@ -318,6 +332,7 @@ void LauncherView::update_toolbar() {
         }
         play->SetClass("off", !running && (!g || !player_of(*g)));
     }
+    if (Rml::Element *demo = by_id("tb-demo")) demo->SetClass("on", core_.demo_games());
     if (Rml::Element *prepare = by_id("tb-prepare")) {
         const char *label = !g || status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : "Rebuild";
         if (Rml::Element *text = by_id("tb-prepare-label"))

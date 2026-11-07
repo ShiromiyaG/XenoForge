@@ -72,6 +72,34 @@ bool LauncherCore::set_launcher(const Settings::Launcher &launcher, std::string 
 
 void LauncherCore::rescan() { start_scan(); }
 
+void LauncherCore::use_demo_games(std::vector<GameEntry> games) {
+    demo_games_ = std::move(games);
+    start_scan();
+}
+
+std::vector<GameEntry> LauncherCore::demo_list() {
+    // six titles to see the list with (names, IDs and versions only)
+    static const struct {
+        const char *title;
+        uint32_t id, version;
+    } demo[] = {{"Battlefield Bad Co. 2", 0x454108A8, 1}, {"Gears of War 3", 0x4D5309C9, 10}, {"Forza Horizon", 0x4D5309C9, 1},
+                {"Halo: Reach", 0x4D53085B, 11},         {"Red Dead Redemption", 0x5454082B, 1}, {"SONIC UNLEASHED", 0x53450812, 1}};
+    std::vector<GameEntry> games;
+    for (const auto &d : demo) {
+        GameEntry g;
+        g.title = d.title, g.title_id = d.id, g.version = d.version, g.digest = uint64_t(games.size() + 1);
+        g.path = from_utf8(std::string("demo/") + d.title + ".iso");
+        games.push_back(std::move(g));
+    }
+    return games;
+}
+
+void LauncherCore::show_demo_games(bool on) {
+    stop_scan(); // the scan reads demo_games_
+    demo_games_ = on ? demo_list() : std::vector<GameEntry>();
+    start_scan();
+}
+
 // The folder read on a thread of its own: the players beside the launcher
 // asked first, then each game read in turn, the list growing as they come
 // (about a second a disc).
@@ -84,6 +112,17 @@ void LauncherCore::start_scan() {
     }
     busy_ = true;
     const std::filesystem::path folder = from_utf8(shared_.launcher.games), players_dir = players_dir_;
+    if (!demo_games_.empty()) { // listed as they are, nothing read from a disc
+        scan_ = std::thread([this, players_dir] {
+            auto players = find_players(players_dir);
+            std::lock_guard lock(mutex_);
+            players_ = std::move(players);
+            games_ = demo_games_;
+            total_ = games_.size();
+            busy_ = false;
+        });
+        return;
+    }
     scan_ = std::thread([this, folder, players_dir] {
         auto players = find_players(players_dir);
         auto paths = folder.empty() ? std::vector<std::filesystem::path>{} : find_games(folder);

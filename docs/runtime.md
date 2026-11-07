@@ -1463,26 +1463,51 @@ launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <p
 
 ### The launcher's interface (`frontend/ui`, `launcher_view.*`, `settings_view.*`)
 
-A desktop program in the manner of the classic emulator front ends
-(Dolphin, PCSX2, RPCS3), the owner's choice on 2026-11-06 over the first
-TV-style layout (big tiles, a detail panel and key hints), which it replaced
-entirely:
+The main window follows a mockup the owner gave on 2026-11-07, in the manner
+of the console's own dashboard (it replaced the first TV-style layout and the
+desktop-tool one after it), drawn for a window 1240dp wide:
 
-- **The main window** (`launcher.rml`, `launcher.rcss`): a menu bar (File,
-  Emulation, Options, Tools, Help: dropdowns with icons, shortcuts, greyed
-  items and the theme's check mark); a toolbar (Play, which becomes Stop
-  while a game runs; Prepare, Rebuild or Try preparing again by the selected
-  game's status; Open folder, Rescan, Settings, Controls; a search box that
-  filters on every word of the title, title ID and file name); the games as
-  a table (icon, Title, Title ID, Version, Status, Runs in, Disc file:
-  sorted by a header's click, again for descending; each column's edge
-  dragged to resize it; every other row shaded; a right click's menu: Play,
-  Play interpreted, Prepare, Game settings, Open the disc's folder, Copy the
-  title ID or path); and a status bar (the count or the scan's progress, the
-  folder, which opens the folder dialog on a click, the running game with
-  Stop, a message that fades, a build's progress while its dialog is
-  hidden). With nothing to list, the table says why (no folder, no games, a
-  search that hides them all) with the button that helps.
+- **The main window** (`launcher.rml`, `launcher.rcss`): a header (the
+  wordmark, and the sections: *xbox home*, which says it is not there yet,
+  *games*, the current one, *emulation* and *help*, which open their menus
+  under them, and *settings*, which opens the settings window; the search
+  box, filtering on every word of the title, title ID and file name); a
+  toolbar (Play, which becomes Stop while a game runs; Prepare, Rebuild or Try
+  preparing again by the selected game's status; Open Folder, Rescan,
+  Settings, Controls; at its right the views: the list, the grid, which is not
+  there yet, and the keyboard's and the pad's settings); the games as glossy
+  rows (cover, name, status, title ID, version and an Options button that
+  opens the row's menu: Play, Play interpreted, Prepare, Game settings, Open
+  the disc's folder, Copy the title ID or path; the same menu on a right
+  click) under a header whose labels sort, again for descending, the selected
+  row in Xbox green; the hints for the pad (A, B, X, Y) and the keyboard;
+  and a status bar (the count or the scan's progress, the folder, which opens
+  the folder dialog on a click, the running game with Stop, a message that
+  fades, a build's progress while its dialog is hidden). With nothing to
+  list, the table says why (no folder, no games, a search that hides them
+  all) with the button that helps. What the mockup shows and is not here yet:
+  its own window buttons (the system's frame is used).
+- **The backdrop**: the window's background is not an element's: the renderer
+  draws it under the interface at the start of every frame
+  (`Renderer::set_backdrop`, `ui.frag` `MODE_BACKDROP`; `#app` and `body` are
+  transparent). It is the grey gradient the window used to wear, so the text
+  keeps its contrast, with six broad ribbons of silk in layers, in fixed
+  colours, as in the mock: at the left a thick dark grey one (#6d6d6f) and a
+  thin light grey one (#aaaaaa), at the right four greens of different tones
+  (the accent's, darker and lighter; the colours change only when the accent
+  does, never with the selected game). They lean up to the right, sway slowly
+  and cross one another, translucent, so where they cross both show; so are
+  the header, the toolbar and the game rows (alpha in `launcher.rcss`'s
+  gradients), which lets the ribbons through behind them. A ribbon is always
+  full width: it folds, like a strip of paper folded back and forth, its
+  silhouette zigzagging and narrowing to a crease where it turns, the face
+  shown changing there (one lighter, one darker); it does not thin out and
+  fade. Edges are crisp, covered to the pixel (no glow, no blur). All of it
+  is a function of the position and a clock (one full-screen pass, no
+  texture, no geometry; sizes in window heights). `[launcher] backdrop`:
+  `animated`, `still` or `off` (the grey alone), in the Interface tab, read by
+  `LauncherView::update_backdrop` every frame; the clock stops while the
+  window is minimized, hidden or covered (focus does not matter).
 - **Dialogs** over the window (theme.rcss's `.dialog`): preparing a game (the
   stages, the bar, the time, the file, the log; Run in background hides it
   behind the status bar's progress, Cancel stops it; then Play, or Try again
@@ -1502,11 +1527,12 @@ entirely:
   (`SDL_GetWindowDisplayScale`: 100%, 150%...), not the window's, so a
   bigger window shows more rows; the window opens where it was left
   (`[launcher] x, y, width, height, maximized`, kept only while that place
-  is on a display), and the columns' widths and the sort are kept too
-  (`columns`, `sort`).
-- **Themes**: `[launcher] theme` is `system` (the desktop's light or dark,
-  followed live through `SDL_EVENT_SYSTEM_THEME_CHANGED`), `light` or
-  `dark` (Options or the Interface tab). Each is a palette of tokens
+  is on a display), and the sort is kept too (`sort`).
+- **Themes**: the main window's look is fixed (its colours are in
+  `launcher.rcss`); the dialogs, the menus and the settings window follow
+  `[launcher] theme`: `system` (the desktop's light or dark, followed live
+  through `SDL_EVENT_SYSTEM_THEME_CHANGED`), `light` or `dark` (the Interface
+  tab). Each is a palette of tokens
   (`palette()` in `launcher_model.cpp`: the window, its chrome, lines, three
   levels of text, the states, the selection from the accent) filled into
   the stylesheets when a document is made; changing it makes both windows'
@@ -1518,7 +1544,7 @@ entirely:
 Input: the mouse as a desktop program's; the keyboard: the arrows, Page Up
 and Down, Home and End move the selection, Enter plays, F2 opens the game's
 settings, F5 rescans, Ctrl+O the folder, Ctrl+F the search, Ctrl+, the
-settings, Alt+letter or F10 the menus (then the arrows, Enter, Escape),
+settings, Alt+E or Alt+H or F10 the menus (then the arrows, Enter, Escape),
 Shift+F10 or the menu key the row's menu; in the settings window the arrows
 move focus and change a value, Ctrl+Tab the tab, Escape closes. A pad:
 the d-pad or stick moves the selection (repeating), A or Start plays, X the
@@ -1550,7 +1576,7 @@ Pieces, each apart from the others:
   RmlUi's input.
 - **`launcher_model.*`, `launcher_html.*`**: what the windows say (a game's
   status, durations, the accent's shades, the themes' palettes, the table's
-  columns, widths, sort and filter, the bindings' names, the spatial
+  columns, sort and filter, the bindings' names, the spatial
   navigation) and their structure as RML strings, as plain functions with no
   RmlUi in them (`frontend_test` checks them). **`prepare_job.*`**: a build
   on its worker thread, as state to read (no UI, no SDL).
@@ -1562,8 +1588,9 @@ Pieces, each apart from the others:
 - **`ui/assets/theme.rcss`** (the base, the controls, menus and dialogs both
   windows share), **`launcher.rcss`**, **`settings.rcss`**, and the two `.rml`
   templates: the look, with `{tokens}` filled from the palette and the accent
-  (six swatches, `[launcher] accent`). `ui/fonts/`: Inter (SIL OFL 1.1), four
-  weights, and Lucide's icons (ISC), each license beside it.
+  (six swatches, `[launcher] accent`, green by default). `ui/fonts/`: Inter
+  (SIL OFL 1.1), five weights, Roboto Condensed (Apache 2.0), three, for the
+  games and the toolbar, and Lucide's icons (ISC), each license beside it.
 
 - **The games** (`library.cpp`): the ISOs (and bare `default.xex` files) in
   a folder the user picks (`launcher.games` in config.toml; the system's
