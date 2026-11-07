@@ -1,22 +1,26 @@
-// The launcher's screens in RmlUi (docs/runtime.md, "The launcher"): the
-// library with its detail panel, the preparing of a game, the settings, the
-// controls and the about page, over LauncherCore (what the launcher does) and
-// PrepareJob (a game being prepared). The text and structure of each screen
-// are launcher_html.cpp's, its look launcher.rcss's, what a status or a
-// shade is, launcher_model.cpp's; this file connects them to the document:
-// it rebuilds a screen's parts when what they show changes, turns clicks,
-// keys and the pad into actions, and moves focus (a pad has no pointer).
+// The launcher's main window in RmlUi (docs/runtime.md, "The launcher's
+// interface"), in the manner of the classic emulator front ends: a menu bar,
+// a toolbar, the games as a table (sortable, its columns resizable, filtered
+// by the search box) and a status bar; preparing a game, the about box and
+// messages as dialogs over it; the settings in a window of their own
+// (settings_view.h). Over LauncherCore (what the launcher does) and
+// PrepareJob (a game being prepared). The structure and words are
+// launcher_html.cpp's, the look the stylesheets' (ui/assets), what a status or
+// a colour is launcher_model.cpp's; this file connects them to the document.
 //
-// Input comes as SDL events: the mouse and keys the context takes as they
-// are (ui_system.h); the pad's d-pad and left stick move focus with the
-// spatial navigation of launcher_model.h, A presses, B goes back, the
-// shoulder buttons turn pages.
+// Input: the mouse and keys as a desktop program takes them (the arrows,
+// Page Up and Down, Home and End move the selection, Enter plays, F2 the
+// game's settings, F5 rescans, Ctrl+O opens a folder, Ctrl+F searches, Alt or
+// F10 the menus); a pad moves the selection with the d-pad or the stick, A or
+// Start plays, X opens the game's settings, Y rescans, B closes, Back opens
+// the menus.
 
 #pragma once
 
 #include "launcher_core.h"
 #include "launcher_html.h"
 #include "prepare_job.h"
+#include "settings_view.h"
 #include "ui/ui_renderer.h"
 
 #include <RmlUi/Core.h>
@@ -25,6 +29,7 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -34,117 +39,121 @@ namespace xf::frontend {
 enum class Screen { Library = 0, Settings, Controls, About };
 
 struct ViewOptions {
-    Screen screen = Screen::Library;
-    long select = -1;          // --select N
-    long start_index = -1;     // --start N: started as soon as it is listed
-    bool demo_progress = false; // --demo-progress: a fake build on show
-    bool demo_fail = false;     // ... that fails
-    double demo_speed = 12;     // times real time
-    bool show_log = false;      // the prepare screen's log open
-    std::string capture;        // --capture-binding: a binding waiting for a key, for pictures
+    Screen screen = Screen::Library; // --screen: settings and controls open the settings window, about the about box
+    long select = -1;                // --select N
+    long start_index = -1;           // --start N: started as soon as it is listed
+    bool demo_progress = false;      // --demo-progress: a fake build on show
+    bool demo_fail = false;          // ... that fails
+    double demo_speed = 12;          // times real time
+    bool show_log = false;           // the prepare dialog's log open
+    std::string capture;             // --capture-binding: a binding waiting for a key, for pictures
+    std::string menu;                // --menu <name>: that menu open, for pictures
+    std::string tab;                 // --tab <name>: the settings window's tab --screen settings opens
+    bool context_menu = false;       // --context-menu: the selected row's menu open, for pictures
     std::vector<std::string> player_args;
-    unsigned build_jobs = 0;    // --build-jobs N: compilers at once while preparing (0: the build's default)
+    unsigned build_jobs = 0; // --build-jobs N: compilers at once while preparing (0: the build's default)
+    float scale = 0;         // --scale: the interface's scale (0: the display's)
+    bool offscreen = false;  // --render-size: windows drawn without being shown
 };
 
-class LauncherView final : public Rml::EventListener {
+class LauncherView final : public Rml::EventListener, public SettingsHost {
   public:
     LauncherView(LauncherCore &core, ui::Renderer &renderer, SDL_Window *window, ViewOptions options);
     ~LauncherView() override;
 
-    // The document made from the files in assets_dir (launcher.rml and
-    // .rcss, with the accent's tokens filled in) on the context.
+    // The document made from the files in assets_dir (launcher.rml, theme.rcss
+    // and launcher.rcss, with the theme's and accent's tokens filled in).
     bool load(Rml::Context *context, const std::filesystem::path &assets_dir, std::string &error);
     // Once a frame, before the context's Update.
     void update();
-    // An SDL event: what the view uses it for (the pad, keys that act). True
-    // when it was used and the context should not see it.
+    // An SDL event of the main window (and the pad's while it has focus):
+    // true when it was used and the context should not see it.
     bool on_event(const SDL_Event &event);
+    // the desktop's theme changed (SDL_EVENT_SYSTEM_THEME_CHANGED)
+    void system_theme_changed();
 
     // The view is waiting for something that --quit-after must not cut: a
     // listing under way, a game it was told to start, one running.
     bool busy() const;
-    // the games listed and the run's end, for the check's last lines
     size_t games_listed() const { return listing_.games.size(); }
+    bool wants_quit() const { return quit_; } // File > Exit
+
+    // The settings window while it is open: the main loop gives it its
+    // events and draws it; closed when it asks or its window is closed.
+    SettingsView *settings_window() { return settings_.get(); }
+    void close_settings_window();
 
     void ProcessEvent(Rml::Event &event) override;
 
+    // SettingsHost
+    std::string styled(const std::string &rcss) const override;
+    void look_changed() override;
+    void browse_folder(SDL_Window *parent) override;
+    void set_folder(const std::string &folder) override;
+    void rescan() override;
+
   private:
-    struct Action {
-        std::string name, arg;
-        Rml::Element *element = nullptr;
-    };
+    enum class Dialog { None, Prepare, About, Message };
 
     // building
     bool build_document(std::string &error);
-    void reload_document(); // the accent changed: the same screens, new tokens
-    void rebuild_library();
-    void rebuild_detail();
-    void rebuild_settings();
-    void rebuild_controls();
-    void rebuild_hints();
-    void show_screen(Screen screen, bool instant = false);
-    void set_backdrop(const GameEntry *game);
-    void place_pill();
+    void reload_document();
+    bool resolve_dark() const;
+    void rebuild_head();
+    void rebuild_rows(bool force = false);
+    void update_toolbar();
+    void update_status();
+    void set_message(const std::string &text, int kind, double seconds); // kind: 0 plain, 1 good, 2 error
 
     // state
     void poll_listing();
     const GameEntry *selected_game() const;
-    bool prepare_listed_ = false; // the library was drawn again after the build ended
-    bool cached_of(const GameEntry &game) const; // a library is cached for the disc
+    bool cached_of(const GameEntry &game) const;
     const PlayerBinary *player_of(const GameEntry &game) const;
     GameStatus status_of(const GameEntry &game) const;
+    std::string runs_in(const GameEntry &game) const;
     std::string icon_name(const GameEntry &game);
-    void select_game(int index, bool focus_tile);
-    void reload_edit();
-    void save_edit();
+    void select_game(long index, bool scroll);
+    void move_selection(int delta, bool to_end = false);
+    int visible_rows() const;
+    void save_layout();
+
+    // menus
+    std::vector<MenuItem> menu_items(const std::string &name);
+    void open_menu(const std::string &name, bool keyboard);
+    void open_context_menu(float x, float y);
+    void close_menu();
+    void menu_move(int delta);
+    void menu_switch(int delta);
+
+    // dialogs
+    void show_dialog(Dialog dialog, const std::string &title, const std::string &body, const std::string &buttons, int width_dp);
+    void close_dialog();
+    void message_box(const std::string &title, const std::string &text);
+    void show_about();
 
     // actions
-    void do_action(const Action &action);
+    void do_action(const std::string &name, const std::string &arg);
     void play(const GameEntry &game, bool force_interpreted);
     void start_game(const GameEntry &game, bool interpreted);
     void begin_prepare(const GameEntry &game, bool demo);
-    void close_prepare();
+    void show_prepare();
+    void hide_prepare();
     void update_prepare();
-    void browse();
-    void set_folder(const std::string &folder);
-    void toast(const std::string &text, bool error, bool with_stop, double seconds);
-    void clear_toast();
-
-    // settings widgets
-    bool *bool_field(const std::string &key);
-    bool get_slider(const std::string &key, double &fraction, std::string &text);
-    void set_slider(const std::string &key, double fraction);
-    void toggle_setting(Rml::Element *row);
-    void refresh_slider(Rml::Element *row);
-    void open_popup(Rml::Element *row);
-    void close_popup();
-    void choose_option(const std::string &value);
-    std::vector<Choice> choices_for(const std::string &key) const;
-    std::string choice_value(const std::string &key) const;
-    void drag_slider(float mouse_x);
+    void open_settings(SettingsTab tab);
+    void open_path(const std::filesystem::path &path);
 
     // input
-    bool on_key(SDL_Keycode key, SDL_Scancode scancode, bool down, bool repeat);
+    bool on_key(SDL_Keycode key, bool repeat);
     bool on_pad_button(SDL_GamepadButton button, bool down);
     void on_pad_axis(SDL_GamepadAxis axis, int value);
-    void navigate(NavDir dir);
-    void activate();
-    void back();
-    void next_page(int delta);
-    std::vector<Rml::Element *> focusables();
-    void ensure_visible(Rml::Element *element);
-    void focus_first();
-    void light_part(const std::string &part, bool on);
-    void caption_for(Rml::Element *bind);
-    void begin_capture(const std::string &binding);
-    void end_capture(bool saved);
-    void defer(std::function<void()> fn) { deferred_.push_back(std::move(fn)); }
-    void defer_until(double when, std::function<void()> fn) { timers_.emplace_back(when, std::move(fn)); }
-    void update_input(double dt);
+    void dialog_navigate(NavDir dir);
+    void update_input();
     Rml::Element *ancestor_with(Rml::Element *element, const char *attribute) const;
-    Rml::Element *ancestor_with_class(Rml::Element *element, const char *name) const;
     Rml::Element *by_id(const char *id) const { return doc_ ? doc_->GetElementById(id) : nullptr; }
     float dp() const { return ctx_ ? ctx_->GetDensityIndependentPixelRatio() : 1.f; }
+    void defer(std::function<void()> fn) { deferred_.push_back(std::move(fn)); }
+    void defer_until(double when, std::function<void()> fn) { timers_.emplace_back(when, std::move(fn)); }
 
     LauncherCore &core_;
     ui::Renderer &renderer_;
@@ -154,71 +163,82 @@ class LauncherView final : public Rml::EventListener {
     Rml::ElementDocument *doc_ = nullptr;
     std::filesystem::path assets_;
     std::string rml_template_, rcss_template_;
+    bool dark_ = true;
 
     using Clock = std::chrono::steady_clock;
     Clock::time_point last_update_, last_listing_;
     double now_ = 0;
-    double settle_until_ = 1.0; // the screen still changing: a check's picture waits (busy)
+    double settle_until_ = 1.0; // the window still changing: a check's picture waits (busy)
+    std::vector<std::function<void()>> deferred_;
+    std::vector<std::pair<double, std::function<void()>>> timers_;
 
+    // the games and the table
     LauncherCore::Listing listing_;
-    std::string library_sig_, detail_sig_;
-    std::set<uint32_t> icons_;       // title IDs whose image the renderer has
-    std::set<uint32_t> failed_;      // games whose preparing failed here
+    std::vector<size_t> order_; // the listing's indices as the table shows them (sorted, filtered)
+    std::string rows_sig_;
+    std::set<uint32_t> icons_;  // title IDs whose image the renderer has
+    std::set<uint32_t> failed_; // games whose preparing failed here
     long selected_ = -1;
-    Settings edit_;
-    uint32_t edit_title_ = 0;
-    bool edit_valid_ = false;
+    std::string filter_;
+    Column sort_ = Column::Title;
+    bool ascending_ = true;
+    Widths widths_{};
+    int drag_column_ = -1; // a column's edge being dragged
+    float drag_x_ = 0, drag_width_ = 0;
+    bool drag_click_ = false; // the click a drag's release makes is not a sort
+    // whether a library is cached for a disc, by its digest: asked of the
+    // cache folder once, again after a rescan or a build
+    mutable std::map<uint64_t, bool> cached_;
+
+    // the status bar's message
     std::string message_;
-    std::string capturing_;
+    int message_kind_ = 0;
+    double message_until_ = 0;
+    std::string status_sig_;
+
+    // menus
+    std::string menu_;        // the open one ("" none; "context" the row's)
+    std::vector<MenuItem> menu_items_;
+    int hot_ = -1;            // the item the keys move
+    bool menu_keyboard_ = false;
+
+    // dialogs
+    Dialog dialog_ = Dialog::None;
+    bool pad_mode_ = false;
+
+    // preparing a game
+    PrepareJob job_;
+    bool prepare_hidden_ = false; // running behind the status bar
+    bool prepare_listed_ = false;
+    bool log_open_ = false;
+    long prepare_game_ = -1;
+    uint32_t prepare_title_id_ = 0;
+    std::string prepare_title_;
+    int prepare_stage_ = 0;
+    size_t prepare_log_lines_ = 0;
+    std::string prepare_kind_; // running, failed, done: which buttons are shown
+    std::string last_prep_count_, last_prep_time_, last_prep_file_, last_prep_state_;
+
+    // checks and pictures
     long start_pending_ = -1;
     long select_pending_ = -1;
     bool demo_pending_ = false;
+    std::string menu_pending_;
+    bool context_pending_ = false;
+    bool screen_pending_ = false;
 
-    Screen screen_ = Screen::Library;
-    bool pad_mode_ = false;
-    bool library_empty_ = false; // the library screen shows an empty state
-    int pill_frames_ = 3;
-    int art_front_ = 0; // which backdrop layer is showing
-    uint32_t art_title_ = 0xFFFFFFFF;
+    // the settings window
+    std::unique_ptr<SettingsView> settings_;
+    std::string capture_pending_;
 
-    // the prepare screen
-    PrepareJob job_;
-    bool prepare_open_ = false, log_open_ = false;
-    long prepare_game_ = -1;
-    uint32_t prepare_title_id_ = 0;
-    int prepare_stage_ = 0;
-    size_t prepare_log_lines_ = 0;
-    std::string prepare_kind_; // running, failed, done: which actions are shown
-    std::string last_prep_count_, last_prep_time_, last_prep_file_, last_prep_state_;
-
-    // popup (a dropdown's options)
-    std::string popup_key_;
-    Rml::Element *popup_row_ = nullptr;
-
-    // a slider being dragged
-    Rml::Element *drag_row_ = nullptr;
-
-    // toast
-    double toast_until_ = 0;
-    bool toast_stop_ = false;
-    std::string toast_text_;
-    bool toast_error_ = false;
-
-    // smooth scrolling and the pad's repeats
-    std::map<Rml::Element *, float> scroll_targets_;
+    // the pad's repeats
     struct Repeat {
         bool active = false;
-        NavDir dir = NavDir::Down;
+        int delta = 0;
         double next = 0;
     };
-    Repeat dpad_repeat_, stick_repeat_;
-    bool stick_dir_[4] = {false, false, false, false};
-    int stick_x_ = 0, stick_y_ = 0;
-
-    std::vector<std::function<void()>> deferred_;
-    std::vector<std::pair<double, std::function<void()>>> timers_;
-    double prepare_clear_at_ = 0;
-    std::string capture_pending_;
+    Repeat pad_repeat_, stick_repeat_;
+    bool quit_ = false;
 };
 
 } // namespace xf::frontend

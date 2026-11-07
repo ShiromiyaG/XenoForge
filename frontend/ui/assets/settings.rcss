@@ -1,0 +1,119 @@
+/*
+ * XenoForge launcher, the settings window: whose settings these are, the tabs,
+ * the rows of settings in groups, and the window's foot. theme.rcss comes
+ * before this file; the {tokens} are filled in the same way.
+ */
+
+#swin { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: flex; flex-direction: column; }
+
+#scope { flex: 0 0 auto; padding: 8dp 14dp; background-color: {chrome}; }
+.scope-text { padding: 4dp 6dp; }
+.scope-text .name { font-weight: 600; }
+.scope-text .hint { color: {text-2}; font-size: 12dp; }
+
+#tabs {
+    flex: 0 0 auto; display: flex; flex-direction: row; align-items: flex-end;
+    height: 38dp; padding: 0 12dp; background-color: {chrome}; border-bottom: 1dp {border};
+}
+.tab {
+    display: flex; flex-direction: row; align-items: center;
+    height: 38dp; padding: 0 13dp; border-bottom: 2dp transparent;
+    color: {text-2}; cursor: pointer; white-space: nowrap;
+}
+.tab .ic { font-size: 14dp; margin-right: 7dp; }
+.tab:hover { color: {text}; }
+.tab:focus-visible { background-color: {hover}; }
+.tab.active { color: {text}; border-bottom-color: {accent}; font-weight: 500; }
+.tab.active .ic { color: {accent}; }
+
+#pages { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 4dp 22dp 18dp 22dp; }
+.group { margin-top: 16dp; }
+.group-title { font-weight: 600; padding: 0 0 6dp 2dp; margin-bottom: 4dp; border-bottom: 1dp {border}; }
+.group-note { margin: 4dp 0 0 6dp; color: {text-3}; font-size: 12dp; }
+
+.setting { display: flex; flex-direction: row; align-items: center; min-height: 38dp; padding: 6dp 6dp; border-radius: 4dp; }
+.setting:focus-visible { background-color: {hover}; }
+.setting .label { flex: 1 1 0; min-width: 0; margin-right: 16dp; }
+.setting .name { color: {text}; }
+.setting .hint { color: {text-2}; font-size: 12dp; margin-top: 1dp; }
+.setting .control { flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; }
+
+/* a check box, its label beside it */
+.check-row { cursor: pointer; align-items: flex-start; }
+.check {
+    flex: 0 0 16dp; width: 16dp; height: 16dp; margin: 1dp 10dp 0 0;
+    border: 1dp {border-strong}; border-radius: 3dp; background-color: {input};
+    text-align: center;
+}
+.check .ic { font-size: 12dp; line-height: 14dp; color: {on-accent}; visibility: hidden; }
+.check.on { background-color: {accent}; border-color: {accent}; }
+.check.on .ic { visibility: visible; }
+.check-row:hover .check { border-color: {accent}; }
+.check-row:focus-visible .check { box-shadow: 0 0 0 2dp {accent40}; }
+
+/* a slider and its value */
+.slider { position: relative; width: 230dp; height: 20dp; cursor: pointer; }
+.slider .track { position: absolute; left: 0; top: 8dp; width: 100%; height: 4dp; border-radius: 2dp; background-color: {border-strong}; }
+.slider .fill { position: absolute; left: 0; top: 8dp; height: 4dp; border-radius: 2dp; background-color: {accent}; }
+.slider .thumb {
+    position: absolute; top: 2dp; width: 16dp; height: 16dp; margin-left: -8dp; border-radius: 8dp;
+    background-color: {button}; border: 1dp {border-strong}; box-shadow: 0 1dp 3dp 0 {shadow};
+}
+.slider:hover .thumb { border-color: {accent}; }
+.setting:focus-visible .thumb { border-color: {accent}; box-shadow: 0 0 0 2dp {accent40}; }
+.setting .value { width: 50dp; text-align: right; color: {text-2}; }
+
+/* a dropdown */
+.select {
+    display: flex; flex-direction: row; align-items: center;
+    width: 250dp; height: 28dp; padding: 0 8dp 0 10dp;
+    border: 1dp {border-strong}; border-radius: 4dp; background-color: {button}; cursor: pointer;
+}
+.select .value-text { flex: 1 1 0; }
+.select .chev { font-size: 13dp; color: {text-2}; }
+.select:hover { background-color: {button-hover}; }
+.select.open { border-color: {accent}; }
+.setting:focus-visible .select { border-color: {accent}; box-shadow: 0 0 0 2dp {accent40}; }
+#popup .mi { padding-left: 10dp; }
+#popup .mi.current { font-weight: 600; }
+
+/* the accent's swatches */
+.swatches { padding-right: 2dp; }
+.swatch { width: 20dp; height: 20dp; margin-left: 9dp; border-radius: 10dp; cursor: pointer; border: 2dp {bg}; }
+.swatch.on { box-shadow: 0 0 0 2dp {text}; }
+.swatch:focus-visible { box-shadow: 0 0 0 2dp {accent}; }
+
+/* the games folder */
+.folder-row { display: flex; flex-direction: row; align-items: center; padding: 0 6dp 6dp 6dp; }
+.folder-row input.text { flex: 1 1 0; width: 100dp; margin-right: 8dp; }
+.folder-row .btn { margin-left: 6dp; }
+
+/* the gamepads connected */
+.pads { padding: 4dp 6dp; }
+.gamepad { display: flex; flex-direction: row; align-items: center; height: 28dp; }
+.pad-user { width: 64dp; }
+
+/* the keyboard's bindings */
+.bind { display: flex; flex-direction: row; align-items: center; height: 34dp; padding: 0 6dp; border-radius: 4dp; cursor: pointer; }
+.bind:hover { background-color: {hover}; }
+.bind:focus-visible { background-color: {hover}; box-shadow: 0 0 0 2dp {accent40}; }
+.bind.capturing { background-color: {sel}; }
+.bname { width: 190dp; }
+.keys { flex: 1 1 0; display: flex; flex-direction: row; align-items: center; }
+.keycap {
+    height: 22dp; line-height: 19dp; padding: 0 7dp; margin-right: 5dp;
+    border: 1dp {border-strong}; border-bottom-width: 2dp; border-radius: 4dp;
+    background-color: {button}; font-size: 12dp;
+}
+.keycap.mod { color: {text-2}; }
+.keycap.press { border-color: {accent}; color: {text}; }
+.bset { color: {link}; font-size: 12dp; visibility: hidden; }
+.bind:hover .bset, .bind:focus-visible .bset { visibility: visible; }
+.page-buttons { display: flex; flex-direction: row; margin: 16dp 0 4dp 6dp; }
+
+#sfoot {
+    flex: 0 0 auto; display: flex; flex-direction: row; align-items: center;
+    padding: 10dp 16dp; background-color: {chrome}; border-top: 1dp {border};
+}
+#sfoot .note { flex: 1 1 0; color: {text-3}; font-size: 12dp; }
+#sfoot .btn { margin-left: 8dp; }

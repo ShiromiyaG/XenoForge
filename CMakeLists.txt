@@ -377,6 +377,7 @@ if(XF_PLAYER AND TARGET boot)
     add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
                              frontend/prepare_job.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
                              frontend/launcher_view.cpp frontend/launcher_screens.cpp frontend/launcher_input.cpp
+                             frontend/settings_view.cpp
                              ${XF_SHADER_OUT}/ui.vert.inc ${XF_SHADER_OUT}/ui.frag.inc)
     target_include_directories(xf_ui PRIVATE ${XF_SHADER_OUT})
     target_include_directories(xf_ui PUBLIC frontend)
@@ -390,7 +391,7 @@ if(XF_PLAYER AND TARGET boot)
     add_custom_command(TARGET launcher POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${XF_UI_ASSETS}/assets $<TARGET_FILE_DIR:launcher>/ui
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${XF_UI_ASSETS}/fonts $<TARGET_FILE_DIR:launcher>/ui/fonts
-        COMMENT "the launcher's screens and font")
+        COMMENT "the launcher's windows, fonts and icons")
     install(DIRECTORY ${XF_UI_ASSETS}/assets/ DESTINATION ui)
     install(DIRECTORY ${XF_UI_ASSETS}/fonts/ DESTINATION ui/fonts)
     # the settings file, the sound's fold to stereo, the scripted presses

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace xf::frontend {
@@ -152,6 +153,169 @@ std::string apply_tokens(std::string text, const Accent &a) {
             text.replace(at, length, *value);
     }
     return text;
+}
+
+ThemeChoice theme_from_text(const std::string &text) {
+    if (text == "light") return ThemeChoice::Light;
+    if (text == "dark") return ThemeChoice::Dark;
+    return ThemeChoice::System;
+}
+
+const char *theme_text(ThemeChoice choice) {
+    switch (choice) {
+    case ThemeChoice::Light: return "light";
+    case ThemeChoice::Dark: return "dark";
+    default: return "system";
+    }
+}
+
+Palette palette(bool dark, const Accent &accent) {
+    int r = 0, g = 0, b = 0;
+    parse_hex(accent.base, r, g, b);
+    Palette p;
+    p.dark = dark;
+    // neutral greys in the manner of desktop tools: the window, its chrome
+    // (menus, toolbar, status bar), lines, three levels of text, and the
+    // states; the selection is the accent, thinner on light
+    if (dark)
+        p.tokens = {{"{bg}", "#1e1f22"},          {"{bg-alt}", "#222326"},     {"{chrome}", "#2b2d30"},
+                    {"{head}", "#26282b"},        {"{border}", "#393b40"},     {"{border-strong}", "#4e5157"},
+                    {"{text}", "#dfe1e5"},        {"{text-2}", "#a1a4ab"},     {"{text-3}", "#6f737a"},
+                    {"{hover}", "#ffffff10"},     {"{press}", "#ffffff1c"},    {"{button}", "#3a3d42"},
+                    {"{button-hover}", "#44474d"}, {"{input}", "#1b1c1f"},     {"{menu}", "#2b2d30"},
+                    {"{menu-border}", "#45484e"}, {"{shadow}", "#000000a8"},   {"{good}", "#5fb878"},
+                    {"{warn}", "#e0b040"},        {"{bad}", "#e5676c"},        {"{scroll}", "#ffffff2e"},
+                    {"{scroll-hover}", "#ffffff4c"}, {"{overlay}", "#00000078"}, {"{dialog}", "#2b2d30"},
+                    {"{sel}", hex_of(r, g, b, 0x40)}, {"{sel-strong}", hex_of(r, g, b, 0x5c)}, {"{link}", accent.hi}};
+    else
+        p.tokens = {{"{bg}", "#ffffff"},          {"{bg-alt}", "#f7f7f8"},     {"{chrome}", "#f3f3f3"},
+                    {"{head}", "#f8f8f9"},        {"{border}", "#e3e3e6"},     {"{border-strong}", "#c4c6cb"},
+                    {"{text}", "#1f2023"},        {"{text-2}", "#5c5f66"},     {"{text-3}", "#9a9da4"},
+                    {"{hover}", "#0000000b"},     {"{press}", "#00000016"},    {"{button}", "#fdfdfd"},
+                    {"{button-hover}", "#f0f0f1"}, {"{input}", "#ffffff"},     {"{menu}", "#fbfbfb"},
+                    {"{menu-border}", "#d5d6da"}, {"{shadow}", "#0000003a"},   {"{good}", "#2f8f4e"},
+                    {"{warn}", "#a86e00"},        {"{bad}", "#c4373d"},        {"{scroll}", "#0000002b"},
+                    {"{scroll-hover}", "#00000048"}, {"{overlay}", "#00000030"}, {"{dialog}", "#fbfbfb"},
+                    {"{sel}", hex_of(r, g, b, 0x2c)}, {"{sel-strong}", hex_of(r, g, b, 0x48)}, {"{link}", accent.lo}};
+    return p;
+}
+
+std::string apply_tokens(std::string text, const Accent &accent, const Palette &palette) {
+    for (const auto &[token, value] : palette.tokens)
+        for (size_t at = text.find(token); at != std::string::npos; at = text.find(token, at + value.size()))
+            text.replace(at, token.size(), value);
+    return apply_tokens(std::move(text), accent);
+}
+
+namespace {
+
+const ColumnInfo COLUMN_INFOS[COLUMNS] = {
+    {Column::Icon, "icon", "", 34, 34},           {Column::Title, "title", "Title", 300, 120},
+    {Column::TitleId, "id", "Title ID", 96, 64},  {Column::Version, "version", "Version", 96, 60},
+    {Column::Status, "status", "Status", 150, 90}, {Column::RunsIn, "runs", "Runs in", 170, 80},
+    {Column::File, "file", "Disc file", 280, 80},
+};
+
+std::string lower(std::string_view text) {
+    std::string s(text);
+    for (char &c : s)
+        if (c >= 'A' && c <= 'Z') c = char(c + 32);
+    return s;
+}
+
+} // namespace
+
+const ColumnInfo &column_info(Column column) { return COLUMN_INFOS[std::clamp(int(column), 0, COLUMNS - 1)]; }
+
+Widths default_widths() {
+    Widths w{};
+    for (int i = 0; i < COLUMNS; i++) w[size_t(i)] = COLUMN_INFOS[i].width;
+    return w;
+}
+
+Widths parse_widths(const std::string &text) {
+    Widths w = default_widths();
+    size_t at = 0;
+    while (at < text.size()) {
+        const size_t end = std::min(text.find(' ', at), text.size());
+        const std::string item = text.substr(at, end - at);
+        at = end + 1;
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string name = item.substr(0, eq);
+        char *stop = nullptr;
+        const double value = std::strtod(item.c_str() + eq + 1, &stop);
+        if (stop == item.c_str() + eq + 1 || !(value > 0) || value > 4000) continue;
+        for (int i = 1; i < COLUMNS; i++) // the icon's width is fixed
+            if (name == COLUMN_INFOS[i].name) w[size_t(i)] = std::max(float(value), COLUMN_INFOS[i].min);
+    }
+    return w;
+}
+
+std::string widths_text(const Widths &w) {
+    std::string s;
+    for (int i = 1; i < COLUMNS; i++) {
+        char item[48];
+        std::snprintf(item, sizeof(item), "%s%s=%d", s.empty() ? "" : " ", COLUMN_INFOS[i].name, int(w[size_t(i)] + 0.5f));
+        s += item;
+    }
+    return s;
+}
+
+void parse_sort(const std::string &text, Column &column, bool &ascending) {
+    column = Column::Title, ascending = true;
+    std::string name = text;
+    if (!name.empty() && name[0] == '-') ascending = false, name.erase(0, 1);
+    for (int i = 1; i < COLUMNS; i++)
+        if (name == COLUMN_INFOS[i].name) return void(column = COLUMN_INFOS[i].id);
+    ascending = true; // an unknown name: the default as a whole
+}
+
+std::string sort_text(Column column, bool ascending) { return std::string(ascending ? "" : "-") + column_info(column).name; }
+
+std::vector<size_t> sorted_rows(const std::vector<RowKey> &rows, Column by, bool ascending) {
+    std::vector<size_t> order(rows.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    auto compare = [&](const RowKey &a, const RowKey &b) -> int {
+        auto text = [](const std::string &x, const std::string &y) {
+            const std::string lx = lower(x), ly = lower(y);
+            return lx < ly ? -1 : lx > ly ? 1 : 0;
+        };
+        switch (by) {
+        case Column::TitleId: return text(a.id_text, b.id_text);
+        case Column::Version: return a.version < b.version ? -1 : a.version > b.version ? 1 : 0;
+        case Column::Status: return a.status < b.status ? -1 : a.status > b.status ? 1 : 0;
+        case Column::RunsIn: return text(a.runs_in, b.runs_in);
+        case Column::File: return text(a.file, b.file);
+        default: return text(a.title, b.title);
+        }
+    };
+    std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+        int c = compare(rows[x], rows[y]);
+        if (!ascending) c = -c;
+        if (c == 0 && by != Column::Title) {
+            const std::string tx = lower(rows[x].title), ty = lower(rows[y].title);
+            c = tx < ty ? -1 : tx > ty ? 1 : 0;
+        }
+        return c < 0;
+    });
+    return order;
+}
+
+bool row_matches(const RowKey &row, std::string_view filter) {
+    const std::string haystack = lower(row.title) + " " + lower(row.id_text) + " " + lower(row.file);
+    const std::string words = lower(filter);
+    size_t at = 0;
+    while (at < words.size()) {
+        if (words[at] == ' ') {
+            at++;
+            continue;
+        }
+        const size_t end = std::min(words.find(' ', at), words.size());
+        if (haystack.find(words.substr(at, end - at)) == std::string::npos) return false;
+        at = end;
+    }
+    return true;
 }
 
 std::string key_label(const std::string &name) {

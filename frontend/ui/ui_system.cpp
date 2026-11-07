@@ -9,7 +9,7 @@
 namespace xf::ui {
 
 namespace {
-enum { CURSOR_DEFAULT, CURSOR_POINTER, CURSOR_TEXT, CURSOR_UNAVAILABLE };
+enum { CURSOR_DEFAULT, CURSOR_POINTER, CURSOR_TEXT, CURSOR_UNAVAILABLE, CURSOR_RESIZE };
 } // namespace
 
 SystemInterface::SystemInterface(SDL_Window *window) : window_(window) {
@@ -17,6 +17,7 @@ SystemInterface::SystemInterface(SDL_Window *window) : window_(window) {
     cursors_[CURSOR_POINTER] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
     cursors_[CURSOR_TEXT] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
     cursors_[CURSOR_UNAVAILABLE] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NOT_ALLOWED);
+    cursors_[CURSOR_RESIZE] = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_EW_RESIZE);
 }
 
 SystemInterface::~SystemInterface() {
@@ -49,6 +50,8 @@ void SystemInterface::SetMouseCursor(const Rml::String &cursor_name) {
         cursor = cursors_[CURSOR_TEXT];
     else if (cursor_name == "unavailable")
         cursor = cursors_[CURSOR_UNAVAILABLE];
+    else if (cursor_name == "resize")
+        cursor = cursors_[CURSOR_RESIZE];
     if (cursor) SDL_SetCursor(cursor);
 }
 

@@ -4,42 +4,42 @@
     <!--STYLE-->
 </head>
 <body>
-    <div id="backdrop">
-        <div id="art-a" class="art-layer"></div>
-        <div id="art-b" class="art-layer"></div>
-        <div id="backdrop-glow"></div>
-        <div id="backdrop-shade"></div>
-    </div>
     <div id="app">
-        <div id="topbar">
-            <div id="brand">
-                <div id="mark"><div id="mark-core"></div></div>
-                <div id="wordmark">XENO<span>FORGE</span></div>
-            </div>
-            <div id="tabs">
-                <div id="tab-pill"></div>
-                <div class="tab f" id="tab-library" data-action="tab" data-arg="library">Library</div>
-                <div class="tab f" id="tab-settings" data-action="tab" data-arg="settings">Settings</div>
-                <div class="tab f" id="tab-controls" data-action="tab" data-arg="controls">Controls</div>
-                <div class="tab f" id="tab-about" data-action="tab" data-arg="about">About</div>
-            </div>
-            <div id="top-spacer"></div>
-            <div id="folder-chip">
-                <div class="path nowrap" id="folder-path"></div>
-                <div class="mini-btn f" data-action="browse">Browse</div>
-                <div class="mini-btn f" data-action="rescan">Rescan</div>
-            </div>
+        <div id="menubar">
+            <div class="menu-title" id="menu-file" data-menu="file">File</div>
+            <div class="menu-title" id="menu-emulation" data-menu="emulation">Emulation</div>
+            <div class="menu-title" id="menu-options" data-menu="options">Options</div>
+            <div class="menu-title" id="menu-tools" data-menu="tools">Tools</div>
+            <div class="menu-title" id="menu-help" data-menu="help">Help</div>
         </div>
-        <div id="screens">
-            <div class="screen" id="screen-library"></div>
-            <div class="screen" id="screen-settings"></div>
-            <div class="screen" id="screen-controls"></div>
-            <div class="screen" id="screen-about"></div>
+        <div id="toolbar">
+            <div class="tb primary f" id="tb-play" data-action="play">{i:play}<div id="tb-play-label">Play</div></div>
+            <div class="tb f" id="tb-prepare" data-action="prepare">{i:hammer}<div id="tb-prepare-label">Prepare</div></div>
+            <div class="tb-sep"></div>
+            <div class="tb f" id="tb-browse" data-action="browse">{i:folder-open}<div>Open folder</div></div>
+            <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
+            <div class="tb-sep"></div>
+            <div class="tb f" id="tb-settings" data-action="settings">{i:settings}<div>Settings</div></div>
+            <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
+            <div id="tb-space"></div>
+            <div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div>
         </div>
-        <div id="hints"></div>
+        <div id="table">
+            <div id="thead"></div>
+            <div id="tbody"></div>
+            <div id="tempty"></div>
+        </div>
+        <div id="statusbar">
+            <div class="st" id="st-count"></div>
+            <div class="st-sep"></div>
+            <div class="st" id="st-folder" data-action="browse"></div>
+            <div class="st" id="st-message"></div>
+            <div class="st" id="st-progress" data-action="show-prepare"></div>
+            <div class="st-sep"></div>
+            <div class="st" id="st-version">XenoForge pre-release</div>
+        </div>
     </div>
-    <div id="running"></div>
-    <div id="prepare"><div id="prepare-card"></div></div>
-    <div id="popup-layer"></div>
+    <div id="menu-layer"></div>
+    <div id="dialog-layer"></div>
 </body>
 </rml>

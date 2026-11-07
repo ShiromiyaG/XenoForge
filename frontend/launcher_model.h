@@ -6,9 +6,11 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace xf::frontend {
@@ -41,6 +43,53 @@ struct Accent {
 Accent accent_from_hex(const std::string &hex);
 const std::vector<std::string> &accent_choices(); // the swatches the settings offer
 std::string apply_tokens(std::string text, const Accent &accent);
+
+// The interface's theme: the desktop's (light or dark, followed as it
+// changes) or one the user fixed in the settings.
+enum class ThemeChoice { System, Light, Dark };
+ThemeChoice theme_from_text(const std::string &text); // "light", "dark", anything else System
+const char *theme_text(ThemeChoice choice);           // "system", "light", "dark"
+// A theme's colours as {tokens} for the stylesheets ({bg}, {text}, {border},
+// {sel}...), the selection's made from the accent. The accent's own tokens
+// are applied too.
+struct Palette {
+    bool dark = true;
+    std::vector<std::pair<std::string, std::string>> tokens; // "{bg}", "#1e1f22"
+};
+Palette palette(bool dark, const Accent &accent);
+std::string apply_tokens(std::string text, const Accent &accent, const Palette &palette);
+
+// The games table: its columns, their widths (dp) and the order of its rows.
+enum class Column { Icon = 0, Title, TitleId, Version, Status, RunsIn, File };
+constexpr int COLUMNS = 7;
+struct ColumnInfo {
+    Column id;
+    const char *name;  // in config.toml: "title"
+    const char *label; // in the header: "Title"
+    float width, min;  // dp: the default and the least a drag leaves
+};
+const ColumnInfo &column_info(Column column);
+using Widths = std::array<float, COLUMNS>;
+Widths default_widths();
+// "title=320 status=140" over the defaults (unknown names and bad numbers are
+// ignored, widths kept above each column's least) and back
+Widths parse_widths(const std::string &text);
+std::string widths_text(const Widths &widths);
+// "title", "-version" (descending): the column and the direction
+void parse_sort(const std::string &text, Column &column, bool &ascending);
+std::string sort_text(Column column, bool ascending);
+// a row as the table sorts and filters it
+struct RowKey {
+    std::string title, id_text, runs_in, file;
+    uint32_t version = 0;
+    int status = 0; // GameStatus, or 3 for a file that could not be read
+};
+// the rows' indices in the order shown (equal keys keep their order; the
+// title breaks ties)
+std::vector<size_t> sorted_rows(const std::vector<RowKey> &rows, Column by, bool ascending);
+// whether a row shows under the filter typed in the search box: every word
+// in the title, the title ID or the file's name, case aside
+bool row_matches(const RowKey &row, std::string_view filter);
 
 // Keys as a binding holds them ("^A", "_W", "Left", "Q I"): each key's cap
 // and whether Shift is held or not.

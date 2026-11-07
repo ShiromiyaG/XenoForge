@@ -8,8 +8,8 @@
 // same file holding the video, audio, input and keyboard sections, read over
 // the shared ones for that game. The launcher makes and edits them; the
 // player reads them for the game it runs and saves its overlay's changes
-// back where they came from. The launcher's own section (the games folder, its accent colour)
-// is shared only.
+// back where they came from. The launcher's own section (the games folder, its
+// look, its window and table) is shared only.
 
 #pragma once
 
@@ -58,9 +58,16 @@ struct Settings {
     // where F12 and the overlay's button put screenshots ("" for the
     // screenshots folder beside the config file)
     std::string screenshots;
-    struct {
-        std::string games;  // the folder the launcher lists the games of
-        std::string accent; // the launcher's accent colour, "#RRGGBB" ("" for its own)
+    // the launcher's own: shared only, never a game's
+    struct Launcher {
+        std::string games;           // the folder the launcher lists the games of
+        std::string accent;          // the launcher's accent colour, "#RRGGBB" ("" for its own)
+        std::string theme = "system"; // "system" (the desktop's light or dark), "light" or "dark"
+        std::string columns;         // the games table's column widths, "title=320 status=140" (dp)
+        std::string sort = "title";  // the column the table is sorted by, "-" before it for descending
+        // the main window where the user left it (pixels; width 0: never saved)
+        int x = 0, y = 0, width = 0, height = 0;
+        bool maximized = false;
     } launcher;
     // the title ID ("4D5307E6") whose own settings these are, or "" for the
     // shared ones: where save() writes them

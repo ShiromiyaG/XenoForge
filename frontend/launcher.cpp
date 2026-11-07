@@ -1,42 +1,53 @@
 // launcher: the games in a folder, their settings and controls, and a start
 // button (plan track C2; docs/runtime.md, "The launcher"). This file is the
 // program around its view: the SDL3 window, the Vulkan device and RmlUi's
-// render interface on it (ui/), the context the screens live in
-// (launcher_view.cpp) and the loop. What the launcher does is LauncherCore's
+// render interface on it (ui/), the context the main window lives in
+// (launcher_view.cpp), the settings window's events and frames
+// (settings_view.cpp) and the loop. What the launcher does is LauncherCore's
 // (launcher_core.h), which has no UI code: the games are the folder's ISOs
 // (and bare default.xex files), read in place for their title, title ID,
 // picture and digest (library.h); a game with a library cached for its disc
 // starts in the generic player, which loads it; without one, in the player
 // beside the launcher that carries its code (player_<game>, asked with
-// --identify), else the card offers Prepare (the recompile step) and, if
+// --identify), else Play prepares it first (the recompile step) and, if
 // that fails, the generic player interprets; the settings are the player's
 // config.toml (settings.h), the shared ones or a game's own, which the player
 // then reads for it; the player runs as a process of its own with its output
 // in a log beside the settings (logs/<title ID>.log), and the launcher stays
 // and shows how the run ended.
 //
+// The window is a desktop program's: sized by the display's scale (100%,
+// 150%...), where the user left it (config.toml's [launcher]), its theme the
+// desktop's light or dark unless one is chosen.
+//
 // For checks without a person at the screen: --list prints the folder's
 // games and the player each would start in, without a window; --quit-after S
 // ends the launcher after S seconds (once a game it started has ended) and
-// --screenshot <png> saves its last picture; --select N selects the Nth game,
-// --screen <library|settings|controls|about> opens a page (--controls is
-// --screen controls) and --start N starts the Nth game as the button does,
-// --player-arg <arg> (repeatable) adds an argument to the player's command
-// line (--quit-after 20, say), --build-jobs N the compilers a Prepare runs at
-// once (4 unless told; each takes a gigabyte or two). For the pictures of the screens: --demo-progress
-// shows a fake build under way (--demo-fail: one that fails, --demo-speed X:
-// times real time, --show-log: its log open), --snap-at S ends at S seconds whatever the view is waiting for, --capture-binding <name> a
-// binding waiting for its key, --render-size WxH draws at that size without
-// the window (a 4K picture on a 1080p desktop), --scale F the interface's
-// size, --assets <dir> the screens' files (to edit them without a rebuild),
-// and --keys up,down,a,b,... presses of the pad (the d-pad, a b x y, lb rb,
-// start; "wait" waits) sent to the view a few tenths of a second apart once
-// the screen has settled, to check navigation without a person at the pad.
+// --screenshot <png> saves its last picture (the settings window's when
+// --screen opened it); --select N selects the Nth game, --screen
+// <library|settings|controls|about> opens the settings window (on Video, or
+// on Keyboard for controls) or the about box (--controls is --screen
+// controls) and --start N starts the Nth game as Play does, --player-arg
+// <arg> (repeatable) adds an argument to the player's command line
+// (--quit-after 20, say), --build-jobs N the compilers a Prepare runs at once
+// (4 unless told; each takes a gigabyte or two). For the pictures of the
+// windows: --demo-progress shows a fake build under way (--demo-fail: one
+// that fails, --demo-speed X: times real time, --show-log: its log open),
+// --snap-at S ends at S seconds whatever the view is waiting for,
+// --capture-binding <name> a binding waiting for its key, --menu <name> a menu
+// open (file, emulation, options, tools, help), --context-menu the selected
+// row's menu open, --tab <name> the settings window's tab (video, sound,
+// controllers, keyboard, interface), --render-size WxH draws at that size without the window (a
+// 4K picture on a 1080p desktop), --scale F the interface's scale (else the
+// display's), --assets <dir> the windows' files (to edit them without a
+// rebuild), and --keys up,down,a,b,... presses of the pad (the d-pad, a b x y,
+// lb rb, start, back; "wait" waits) sent to the view a few tenths of a second
+// apart once the window has settled.
 //
 //   launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <page>] [--start N] [--keys <list>]
 //            [--player-arg <arg>]... [--build-jobs N] [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
-//            [--demo-speed X] [--show-log] [--capture-binding <name>] [--render-size WxH] [--scale F]
-//            [--assets <dir>]
+//            [--demo-speed X] [--show-log] [--capture-binding <name>] [--menu <name>] [--context-menu] [--tab <name>]
+//            [--render-size WxH] [--scale F] [--assets <dir>]
 
 #include "launcher_core.h"
 #include "xenoforge/game_build.h"
@@ -80,6 +91,27 @@ int fail(const std::string &message) {
     return 1;
 }
 
+// the window an SDL event is for (0: none, as a pad's)
+SDL_WindowID window_of(const SDL_Event &e) {
+    switch (e.type) {
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP: return e.key.windowID;
+    case SDL_EVENT_TEXT_INPUT: return e.text.windowID;
+    case SDL_EVENT_TEXT_EDITING: return e.edit.windowID;
+    case SDL_EVENT_MOUSE_MOTION: return e.motion.windowID;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: return e.button.windowID;
+    case SDL_EVENT_MOUSE_WHEEL: return e.wheel.windowID;
+    default:
+        if (e.type >= SDL_EVENT_WINDOW_FIRST && e.type <= SDL_EVENT_WINDOW_LAST) return e.window.windowID;
+        return 0;
+    }
+}
+
+bool is_pad(const SDL_Event &e) {
+    return e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP || e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -96,7 +128,7 @@ int main(int argc, char **argv) {
     std::string games_arg;
     bool list = false, games_given = false;
     double quit_after = 0;
-    float scale = 0, snap_at = 0;
+    float snap_at = 0;
     std::vector<std::string> key_script;
     uint32_t render_w = 0, render_h = 0;
     frontend::ViewOptions options;
@@ -138,23 +170,28 @@ int main(int argc, char **argv) {
             options.show_log = true;
         else if (a == "--capture-binding" && i + 1 < argc)
             options.capture = argv[++i], options.screen = frontend::Screen::Controls;
+        else if (a == "--menu" && i + 1 < argc)
+            options.menu = argv[++i];
+        else if (a == "--tab" && i + 1 < argc)
+            options.tab = argv[++i];
+        else if (a == "--context-menu")
+            options.context_menu = true;
         else if (a == "--render-size" && i + 1 < argc)
             std::sscanf(argv[++i], "%ux%u", &render_w, &render_h);
         else if (a == "--snap-at" && i + 1 < argc)
             snap_at = std::strtof(argv[++i], nullptr);
         else if (a == "--scale" && i + 1 < argc)
-            scale = std::strtof(argv[++i], nullptr);
+            options.scale = std::strtof(argv[++i], nullptr);
         else if (a == "--assets" && i + 1 < argc)
             assets = from_utf8(argv[++i]);
         else if (a == "--keys" && i + 1 < argc) {
-            const std::string list = argv[++i];
-            for (size_t at = 0; at < list.size();) {
-                const size_t end = list.find(',', at);
-                key_script.push_back(list.substr(at, end == std::string::npos ? std::string::npos : end - at));
-                at = end == std::string::npos ? list.size() : end + 1;
+            const std::string text = argv[++i];
+            for (size_t at = 0; at < text.size();) {
+                const size_t end = text.find(',', at);
+                key_script.push_back(text.substr(at, end == std::string::npos ? std::string::npos : end - at));
+                at = end == std::string::npos ? text.size() : end + 1;
             }
-        }
-        else
+        } else
             std::fprintf(stderr, "launcher: %s ignored\n", a.c_str());
     }
     if (config_file.empty()) config_file = frontend::default_path();
@@ -195,11 +232,28 @@ int main(int argc, char **argv) {
     }
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return fail(std::string("SDL: ") + SDL_GetError());
-    Uint64 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     const bool offscreen = render_w && render_h;
+    options.offscreen = offscreen;
+
+    // the window: where it was left, else a size from the display's scale
+    const frontend::Settings::Launcher placed = core.launcher();
+    Uint64 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (offscreen) window_flags |= SDL_WINDOW_HIDDEN;
-    SDL_Window *window = SDL_CreateWindow("XenoForge", 1280, 720, window_flags);
+    float display_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+    if (!(display_scale > 0)) display_scale = 1;
+    int width = int(1240 * display_scale), height = int(760 * display_scale);
+    bool restore = false;
+    if (!offscreen && placed.width > 0 && placed.height > 0) {
+        const SDL_Rect r{placed.x, placed.y, placed.width, placed.height};
+        if (SDL_GetDisplayForRect(&r)) width = placed.width, height = placed.height, restore = true;
+    }
+    SDL_Window *window = SDL_CreateWindow("XenoForge", width, height, window_flags);
     if (!window) return fail(std::string("SDL: ") + SDL_GetError());
+    SDL_SetWindowMinimumSize(window, int(720 * display_scale), int(420 * display_scale));
+    if (restore) {
+        SDL_SetWindowPosition(window, placed.x, placed.y);
+        if (placed.maximized) SDL_MaximizeWindow(window);
+    }
 
     // the window on Vulkan, and RmlUi on it
     std::string error;
@@ -216,6 +270,8 @@ int main(int argc, char **argv) {
     for (const auto &[file, weight] : faces)
         if (!Rml::LoadFontFace(utf8(fonts / file), "Inter", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(weight)))
             std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / file).c_str());
+    if (!Rml::LoadFontFace(utf8(fonts / "Lucide.ttf"), "Lucide", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(400)))
+        std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / "Lucide.ttf").c_str());
 
     int pixel_w = 0, pixel_h = 0;
     SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
@@ -246,7 +302,7 @@ int main(int argc, char **argv) {
             {"up", SDL_GAMEPAD_BUTTON_DPAD_UP},       {"down", SDL_GAMEPAD_BUTTON_DPAD_DOWN}, {"left", SDL_GAMEPAD_BUTTON_DPAD_LEFT},
             {"right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT}, {"a", SDL_GAMEPAD_BUTTON_SOUTH},        {"b", SDL_GAMEPAD_BUTTON_EAST},
             {"x", SDL_GAMEPAD_BUTTON_WEST},           {"y", SDL_GAMEPAD_BUTTON_NORTH},        {"lb", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
-            {"rb", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER}, {"start", SDL_GAMEPAD_BUTTON_START}};
+            {"rb", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER}, {"start", SDL_GAMEPAD_BUTTON_START},   {"back", SDL_GAMEPAD_BUTTON_BACK}};
         for (const auto &[text, button] : buttons) {
             if (name != text) continue;
             for (bool down : {true, false}) {
@@ -258,26 +314,54 @@ int main(int argc, char **argv) {
             }
         }
     };
+    // the main window's place while it is not maximized, saved at the end
+    int last_x = placed.x, last_y = placed.y, last_w = placed.width, last_h = placed.height;
+    auto note_place = [&] {
+        if (offscreen || (SDL_GetWindowFlags(window) & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED | SDL_WINDOW_FULLSCREEN))) return;
+        SDL_GetWindowPosition(window, &last_x, &last_y);
+        SDL_GetWindowSize(window, &last_w, &last_h);
+    };
+    note_place();
+
     bool quit = false;
     uint64_t frames = 0;
     while (!quit) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit = true;
+            if (event.type == SDL_EVENT_QUIT) quit = true;
+            if (event.type == SDL_EVENT_SYSTEM_THEME_CHANGED) view.system_theme_changed();
             if (event.type == SDL_EVENT_GAMEPAD_ADDED)
                 if (SDL_Gamepad *g = SDL_OpenGamepad(event.gdevice.which)) pads.push_back(g);
+            if (event.type == SDL_EVENT_WINDOW_MOVED || event.type == SDL_EVENT_WINDOW_RESIZED)
+                if (event.window.windowID == SDL_GetWindowID(window)) note_place();
+            // the settings window's own events, and the pad's while it has focus
+            frontend::SettingsView *settings = view.settings_window();
+            const SDL_WindowID target = window_of(event);
+            if (settings && ((target && target == settings->window_id()) || (is_pad(event) && settings->has_focus()))) {
+                if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                    view.close_settings_window();
+                    continue;
+                }
+                system->set_window(settings->window());
+                if (!settings->on_event(event)) ui::process_event(settings->context(), settings->window(), event);
+                system->set_window(window);
+                continue;
+            }
+            if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit = true;
             if (view.on_event(event)) continue;
             ui::process_event(context, window, event);
         }
-        // the interface's size: made for 1280 x 720 dp, scaled to the window
+        if (view.wants_quit()) quit = true;
+        // the interface's size: the window's, at the display's scale
         SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
-        const uint32_t width = offscreen ? render_w : uint32_t(std::max(pixel_w, 0)), height = offscreen ? render_h : uint32_t(std::max(pixel_h, 0));
-        if (width && height) {
-            context->SetDimensions(Rml::Vector2i(int(width), int(height)));
-            context->SetDensityIndependentPixelRatio(scale > 0 ? scale : std::clamp(std::min(float(width) / 1280.f, float(height) / 720.f), 0.5f, 4.f));
+        const uint32_t w = offscreen ? render_w : uint32_t(std::max(pixel_w, 0)), h = offscreen ? render_h : uint32_t(std::max(pixel_h, 0));
+        if (w && h) {
+            const float display = SDL_GetWindowDisplayScale(window);
+            context->SetDimensions(Rml::Vector2i(int(w), int(h)));
+            context->SetDensityIndependentPixelRatio(options.scale > 0 ? options.scale : offscreen ? 1.f : (display > 0 ? display : 1.f));
         }
         view.update();
-        // the scripted pad presses, once the screen has settled
+        // the scripted pad presses, once the window has settled
         if (key_next < key_script.size() && !view.busy()) {
             const double now = std::chrono::duration<double>(Clock::now() - began).count();
             if (key_at == 0) key_at = now + 0.4;
@@ -292,29 +376,48 @@ int main(int argc, char **argv) {
         const double seconds = std::chrono::duration<double>(Clock::now() - began).count();
         const bool snap = snap_at > 0 && seconds >= snap_at; // the picture at that moment, busy or not
         const bool ending = snap || (quit_after > 0 && seconds >= quit_after && !view.busy() &&
-                                            (key_script.empty() || (key_next >= key_script.size() && seconds >= key_at + 0.6)));
+                                     (key_script.empty() || (key_next >= key_script.size() && seconds >= key_at + 0.6)));
         const bool last = ending || quit;
-        if (last && !screenshot.empty()) surface->capture_next();
+        // the picture is the settings window's when it is open, else the main one's
+        frontend::SettingsView *settings = view.settings_window();
+        ui::Window &shot = settings && options.screen != frontend::Screen::Library && options.screen != frontend::Screen::About ? settings->surface() : *surface;
+        if (last && !screenshot.empty()) shot.capture_next();
+        if (settings) {
+            system->set_window(settings->window());
+            settings->frame();
+            system->set_window(window);
+        }
         const bool shown = surface->frame([&] { context->Render(); }, offscreen ? render_w : 0, offscreen ? render_h : 0);
         frames++;
         if (last && !screenshot.empty()) {
             std::vector<uint8_t> rgba;
-            uint32_t w = 0, h = 0;
-            if (surface->take_capture(rgba, w, h) && write_png(rgba, w, h, screenshot))
+            uint32_t sw = 0, sh = 0;
+            if (shot.take_capture(rgba, sw, sh) && write_png(rgba, sw, sh, screenshot))
                 std::printf("launcher: screenshot %s\n", utf8(screenshot).c_str());
             else
                 std::fprintf(stderr, "launcher: no screenshot\n");
         }
+        if (settings && settings->closing()) view.close_settings_window();
         if (ending) quit = true;
         if (!shown || offscreen) SDL_Delay(offscreen ? 8 : 16);
-        else if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS)) SDL_Delay(8); // a form, not a game
+        else if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) && !(view.settings_window() && view.settings_window()->has_focus()))
+            SDL_Delay(8); // a form, not a game
+    }
+
+    // where the window was left, for the next start
+    if (!offscreen) {
+        frontend::Settings::Launcher l = core.launcher();
+        l.maximized = SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED;
+        if (last_w > 0 && last_h > 0) l.x = last_x, l.y = last_y, l.width = last_w, l.height = last_h;
+        std::string why;
+        if (!core.set_launcher(l, why)) std::fprintf(stderr, "launcher: %s\n", why.c_str());
     }
 
     const double total = std::chrono::duration<double>(Clock::now() - began).count();
     std::printf("launcher: %zu games listed, %llu frames in %.1f s (%.0f a second)\n", core.listing().games.size(),
                 (unsigned long long)frames, total, double(frames) / std::max(total, 0.001));
     if (core.run().running) std::printf("launcher: %s goes on running\n", core.run().title.c_str());
-    view_owner.reset(); // its document, before the context
+    view_owner.reset(); // its documents (and the settings window's context), before the context
     Rml::RemoveContext("launcher");
     Rml::Shutdown(); // the interfaces outlive RmlUi
     system.reset();

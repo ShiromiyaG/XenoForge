@@ -116,6 +116,32 @@ toml::table read_file(const std::filesystem::path &path) {
     }
 }
 
+// the launcher's section, shared only
+void read_launcher(const toml::table &t, Settings::Launcher &l) {
+    get(t, "launcher", "games", l.games);
+    get(t, "launcher", "accent", l.accent);
+    get(t, "launcher", "theme", l.theme);
+    get(t, "launcher", "columns", l.columns);
+    get(t, "launcher", "sort", l.sort);
+    int64_t x = l.x, y = l.y, width = l.width, height = l.height;
+    get(t, "launcher", "x", x);
+    get(t, "launcher", "y", y);
+    get(t, "launcher", "width", width);
+    get(t, "launcher", "height", height);
+    l.x = int(std::clamp<int64_t>(x, -100000, 100000)), l.y = int(std::clamp<int64_t>(y, -100000, 100000));
+    l.width = int(std::clamp<int64_t>(width, 0, 100000)), l.height = int(std::clamp<int64_t>(height, 0, 100000));
+    get(t, "launcher", "maximized", l.maximized);
+}
+
+toml::table launcher_table(const Settings::Launcher &l) {
+    toml::table t{{"games", l.games}, {"accent", l.accent}, {"theme", l.theme}, {"columns", l.columns}, {"sort", l.sort}};
+    if (l.width > 0) {
+        t.insert("x", l.x), t.insert("y", l.y), t.insert("width", l.width), t.insert("height", l.height);
+        t.insert("maximized", l.maximized);
+    }
+    return t;
+}
+
 bool write_file(const std::filesystem::path &path, const toml::table &t, std::string &error) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -140,8 +166,7 @@ bool load(const std::filesystem::path &path, Settings &s, std::string &error, co
     }
     read_sections(t, s);
     get(t, "player", "screenshots", s.screenshots);
-    get(t, "launcher", "games", s.launcher.games);
-    get(t, "launcher", "accent", s.launcher.accent);
+    read_launcher(t, s.launcher);
     if (!title.empty())
         if (const toml::table *own = t["games"][title].as_table()) {
             read_sections(*own, s);
@@ -155,7 +180,7 @@ bool save(const std::filesystem::path &path, const Settings &s, std::string &err
     if (s.game.empty()) {
         write_sections(t, s);
         t.insert_or_assign("player", toml::table{{"screenshots", s.screenshots}});
-        t.insert_or_assign("launcher", toml::table{{"games", s.launcher.games}, {"accent", s.launcher.accent}});
+        t.insert_or_assign("launcher", launcher_table(s.launcher));
     } else {
         // a new file gets the shared defaults beside the game's, so it has
         // the whole set to edit
@@ -163,7 +188,7 @@ bool save(const std::filesystem::path &path, const Settings &s, std::string &err
             Settings shared;
             write_sections(t, shared);
             t.insert_or_assign("player", toml::table{{"screenshots", s.screenshots}});
-            t.insert_or_assign("launcher", toml::table{{"games", s.launcher.games}, {"accent", s.launcher.accent}});
+            t.insert_or_assign("launcher", launcher_table(s.launcher));
         }
         if (!t["games"].as_table()) t.insert_or_assign("games", toml::table{});
         toml::table own;

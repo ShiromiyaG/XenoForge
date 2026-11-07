@@ -249,34 +249,86 @@ int main() {
         CHECK(frontend::nav_pick(r, 0, NavDir::Left) == -1 && frontend::nav_pick(r, 99, NavDir::Left) == -1);
     }
     {
-        // the screens' structure: escaped titles, every binding a row, the settings' keys
-        frontend::TileInfo tile;
-        tile.title = "A <b> & C", tile.id_text = "4D5307E6";
-        const std::string tiles = frontend::tiles_html({tile});
-        CHECK(tiles.find("A &lt;b&gt; &amp; C") != std::string::npos && tiles.find("<b>") == std::string::npos);
+        // the windows' structure: escaped titles, every binding a row, the settings' keys
+        frontend::RowInfo row;
+        row.title = "A <b> & C", row.id_text = "4D5307E6", row.index = 3;
+        const frontend::Widths widths = frontend::default_widths();
+        const std::string rows_html = frontend::table_row_html(row, widths, true);
+        CHECK(rows_html.find("A &lt;b&gt; &amp; C") != std::string::npos && rows_html.find("<b>") == std::string::npos);
+        CHECK(rows_html.find("data-index=\"3\"") != std::string::npos && rows_html.find(" sel") != std::string::npos);
+        const std::string head = frontend::table_head_html(widths, frontend::Column::Version, false);
+        CHECK(head.find("data-arg=\"version\"") != std::string::npos && head.find("data-grip=\"3\"") != std::string::npos);
+        CHECK(head.find("class=\"th c-ver sorted\"") != std::string::npos);
         frontend::Settings own;
         frontend::SettingsPage page;
-        page.settings = &own, page.accent = "#ff7a45";
-        const std::string settings = frontend::settings_html(page);
-        for (const char *key : {"video.fullscreen", "video.aspect", "audio.volume", "audio.mute"})
+        page.settings = &own, page.accent = "#ff7a45", page.theme = "system";
+        std::string settings;
+        for (int i = 0; i < frontend::SETTINGS_TABS; i++) settings += frontend::settings_page_html(frontend::SettingsTab(i), page);
+        for (const char *key : {"video.fullscreen", "video.aspect", "audio.volume", "audio.mute", "input.vibration", "input.keyboard", "theme"})
             CHECK(settings.find(std::string("data-key=\"") + key + "\"") != std::string::npos);
-        frontend::ControlsPage controls;
-        controls.settings = &own;
-        const std::string html = frontend::controls_html(controls);
-        size_t rows = 0;
-        for (size_t at = html.find("data-action=\"capture\""); at != std::string::npos; at = html.find("data-action=\"capture\"", at + 1)) rows++;
-        CHECK(rows == 25);
-        CHECK(frontend::about_html().find("FFmpeg") != std::string::npos);
+        size_t binds = 0;
+        for (size_t at = settings.find("data-action=\"capture\""); at != std::string::npos; at = settings.find("data-action=\"capture\"", at + 1)) binds++;
+        CHECK(binds == 25);
+        CHECK(frontend::settings_tabs_html(frontend::SettingsTab::Keyboard).find("tab f active\" data-action=\"tab\" data-arg=\"keyboard\"") != std::string::npos);
+        CHECK(frontend::about_body_html().find("FFmpeg") != std::string::npos && frontend::about_body_html().find("Lucide") != std::string::npos);
+        // menus: an item's action, a greyed one without, a check mark
+        frontend::MenuItem play, stop;
+        play.action = "play", play.label = "Play", play.shortcut = "Enter", play.icon = "play";
+        stop.action = "stop", stop.label = "Stop", stop.enabled = false;
+        const std::string menu = frontend::menu_html({play, frontend::menu_separator(), stop});
+        CHECK(menu.find("data-action=\"play\"") != std::string::npos && menu.find("data-action=\"stop\"") == std::string::npos);
+        CHECK(menu.find("class=\"msep\"") != std::string::npos && menu.find("Enter") != std::string::npos);
+        // icons: Lucide's private-use glyphs, and the template tokens made spans
+        CHECK(frontend::icon_glyph("play") == "\xEE\x85\x80" && frontend::icon_glyph("nonsense").empty());
+        CHECK(frontend::expand_icons("a{i:x}b") == "a<span class=\"ic\">\xEE\x86\xB2</span>b");
     }
     {
-        // the accent colour saved in config.toml, with the games folder beside it
+        // the games table: columns' widths, the sort, the order and the filter
+        const frontend::Widths w = frontend::parse_widths("title=320 status=10 nonsense=50 file=abc version=88");
+        CHECK(w[size_t(frontend::Column::Title)] == 320 && w[size_t(frontend::Column::Version)] == 88);
+        CHECK(w[size_t(frontend::Column::Status)] == frontend::column_info(frontend::Column::Status).min); // kept above the least
+        CHECK(w[size_t(frontend::Column::File)] == frontend::column_info(frontend::Column::File).width);  // a bad number: the default
+        CHECK(frontend::parse_widths(frontend::widths_text(w)) == w);
+        frontend::Column c = frontend::Column::Title;
+        bool ascending = false;
+        frontend::parse_sort("-version", c, ascending);
+        CHECK(c == frontend::Column::Version && !ascending && frontend::sort_text(c, ascending) == "-version");
+        frontend::parse_sort("bogus", c, ascending);
+        CHECK(c == frontend::Column::Title && ascending);
+        std::vector<frontend::RowKey> rows(4);
+        rows[0].title = "sonic", rows[0].version = 3, rows[0].status = 1, rows[0].id_text = "534507D6", rows[0].file = "Sonic.iso";
+        rows[1].title = "Halo", rows[1].version = 9, rows[1].status = 0, rows[1].id_text = "4D53085B", rows[1].file = "Reach.iso";
+        rows[2].title = "Forza", rows[2].version = 3, rows[2].status = 0, rows[2].id_text = "4D5309C9", rows[2].file = "FH.iso";
+        rows[3].title = "battlefield", rows[3].version = 1, rows[3].status = 1, rows[3].id_text = "454108D4", rows[3].file = "BC2.iso";
+        CHECK((frontend::sorted_rows(rows, frontend::Column::Title, true) == std::vector<size_t>{3, 2, 1, 0})); // case aside
+        CHECK((frontend::sorted_rows(rows, frontend::Column::Title, false) == std::vector<size_t>{0, 1, 2, 3}));
+        CHECK((frontend::sorted_rows(rows, frontend::Column::Version, true) == std::vector<size_t>{3, 2, 0, 1})); // ties by title
+        CHECK((frontend::sorted_rows(rows, frontend::Column::Status, true) == std::vector<size_t>{2, 1, 3, 0}));
+        CHECK(frontend::row_matches(rows[1], "") && frontend::row_matches(rows[1], "  HALO ") && frontend::row_matches(rows[1], "4d53 reach"));
+        CHECK(!frontend::row_matches(rows[1], "halo forza") && !frontend::row_matches(rows[0], "reach"));
+        // the themes: every token filled, light and dark different, the selection the accent's
+        const frontend::Accent accent = frontend::accent_from_hex("#4c9bff");
+        const std::string css = "{bg} {text} {sel} {border} {accent} {on-accent} {shadow} {good}";
+        const std::string dark = frontend::apply_tokens(css, accent, frontend::palette(true, accent));
+        const std::string light = frontend::apply_tokens(css, accent, frontend::palette(false, accent));
+        CHECK(dark.find('{') == std::string::npos && light.find('{') == std::string::npos && dark != light);
+        CHECK(dark.find("#4c9bff40") != std::string::npos && light.find("#4c9bff2c") != std::string::npos);
+        CHECK(frontend::theme_from_text("dark") == frontend::ThemeChoice::Dark && frontend::theme_from_text("x") == frontend::ThemeChoice::System);
+        CHECK(std::string(frontend::theme_text(frontend::ThemeChoice::Light)) == "light");
+    }
+    {
+        // the launcher's own section saved in config.toml: the folder, the look, the window and the table
         const std::filesystem::path file = std::filesystem::temp_directory_path() / "xf_frontend_test_accent.toml";
         std::filesystem::remove(file);
         frontend::Settings a, b;
-        a.launcher.games = "D:/games", a.launcher.accent = "#9b7bff";
+        a.launcher.games = "D:/games", a.launcher.accent = "#9b7bff", a.launcher.theme = "light";
+        a.launcher.columns = "title=320", a.launcher.sort = "-status";
+        a.launcher.x = -1200, a.launcher.y = 40, a.launcher.width = 1500, a.launcher.height = 900, a.launcher.maximized = true;
         std::string err;
         CHECK(frontend::save(file, a, err) && frontend::load(file, b, err));
-        CHECK(b.launcher.games == "D:/games" && b.launcher.accent == "#9b7bff");
+        CHECK(b.launcher.games == "D:/games" && b.launcher.accent == "#9b7bff" && b.launcher.theme == "light");
+        CHECK(b.launcher.columns == "title=320" && b.launcher.sort == "-status");
+        CHECK(b.launcher.x == -1200 && b.launcher.y == 40 && b.launcher.width == 1500 && b.launcher.height == 900 && b.launcher.maximized);
         std::filesystem::remove(file);
     }
     {

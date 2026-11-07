@@ -1,0 +1,129 @@
+/*
+ * XenoForge launcher, RCSS shared by its windows: the base, the controls, the
+ * menus and the dialogs. A desktop tool's look: neutral greys in two themes,
+ * the accent for selection, focus and the main buttons. The launcher fills the
+ * {tokens} when it loads the files (launcher_model.cpp: palette and accent),
+ * so light or dark and the accent are the user's. Sizes are dp: the display's
+ * scale (100%, 150%...) makes them pixels.
+ */
+
+body {
+    font-family: Inter;
+    font-size: 13dp;
+    font-weight: 400;
+    color: {text};
+    background-color: {bg};
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    line-height: 1.38;
+}
+
+* { box-sizing: border-box; }
+div { display: block; }
+b { font-weight: 600; }
+.ic { font-family: Lucide; font-weight: 400; font-size: 15dp; line-height: 1; }
+.row { display: flex; flex-direction: row; align-items: center; }
+.grow { flex: 1 1 0; min-width: 0; }
+.nowrap { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.f { tab-index: auto; focus: auto; }
+.dim { color: {text-2}; }
+.faint { color: {text-3}; }
+
+/* ------------------------------------------------------------------ buttons */
+
+.btn {
+    display: flex; flex-direction: row; align-items: center; justify-content: center;
+    height: 28dp; min-width: 80dp; padding: 0 12dp;
+    border: 1dp {border-strong}; border-radius: 4dp;
+    background-color: {button}; color: {text};
+    white-space: nowrap; cursor: pointer;
+}
+.btn .ic { font-size: 14dp; margin-right: 6dp; color: {text-2}; }
+.btn:hover { background-color: {button-hover}; }
+.btn:active { background-color: {press}; }
+.btn:focus-visible { border-color: {accent}; box-shadow: 0 0 0 2dp {accent40}; }
+.btn.primary { background-color: {accent}; border-color: {accent}; color: {on-accent}; font-weight: 500; }
+.btn.primary .ic { color: {on-accent}; }
+.btn.primary:hover { background-color: {accent-hi}; border-color: {accent-hi}; }
+.btn.primary:active { background-color: {accent-lo}; }
+.btn.danger { background-color: {bad}; border-color: {bad}; color: #ffffff; }
+.btn.off { opacity: 0.45; cursor: default; }
+
+/* ------------------------------------------------------------------ inputs */
+
+input.text {
+    display: block; height: 28dp; padding: 5dp 8dp;
+    border: 1dp {border-strong}; border-radius: 4dp;
+    background-color: {input}; color: {text}; cursor: text;
+}
+input.text:focus { border-color: {accent}; }
+input.text:placeholder-shown { color: {text-3}; }
+
+/* --------------------------------------------------------------- scrollbars */
+
+scrollbarvertical { width: 12dp; }
+scrollbarvertical slidertrack { background-color: transparent; }
+scrollbarvertical sliderbar { width: 6dp; margin: 0 3dp; border-radius: 3dp; background-color: {scroll}; }
+scrollbarvertical sliderbar:hover, scrollbarvertical sliderbar:active { background-color: {scroll-hover}; }
+scrollbarvertical sliderarrowdec, scrollbarvertical sliderarrowinc { width: 0; height: 0; }
+scrollbarhorizontal { height: 12dp; }
+scrollbarhorizontal slidertrack { background-color: transparent; }
+scrollbarhorizontal sliderbar { height: 6dp; margin: 3dp 0; border-radius: 3dp; background-color: {scroll}; }
+scrollbarhorizontal sliderarrowdec, scrollbarhorizontal sliderarrowinc { width: 0; height: 0; }
+
+/* ------------------------------------------------- menus and dropdown lists */
+
+#menu-layer, #popup-layer { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: none; }
+#menu-layer.open, #popup-layer.open { display: block; }
+.menu {
+    position: absolute; min-width: 230dp; padding: 4dp;
+    background-color: {menu}; border: 1dp {menu-border}; border-radius: 6dp;
+    box-shadow: 0 6dp 20dp 0 {shadow};
+}
+.mi {
+    display: flex; flex-direction: row; align-items: center;
+    height: 28dp; padding: 0 12dp 0 4dp; border-radius: 4dp;
+    color: {text}; cursor: pointer;
+}
+.mi-ic { width: 26dp; text-align: center; font-family: Lucide; font-size: 14dp; line-height: 1; color: {text-2}; }
+.mi-l { flex: 1 0 auto; white-space: nowrap; margin-left: 2dp; }
+.mi-k { margin-left: 28dp; white-space: nowrap; color: {text-3}; font-size: 12dp; }
+.mi:hover, .mi.hot { background-color: {sel}; }
+.mi.off { color: {text-3}; cursor: default; }
+.mi.off .mi-ic { color: {text-3}; }
+.mi.off:hover { background-color: transparent; }
+.msep { height: 1dp; margin: 4dp 8dp; background-color: {border}; }
+
+/* ------------------------------------------------------------------ dialogs */
+
+#dialog-layer { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: none; }
+#dialog-layer.open { display: flex; flex-direction: row; align-items: center; justify-content: center; background-color: {overlay}; }
+.dialog {
+    display: flex; flex-direction: column; max-height: 88vh;
+    background-color: {dialog}; border: 1dp {menu-border}; border-radius: 8dp;
+    box-shadow: 0 14dp 40dp 0 {shadow};
+}
+.dlg-title {
+    flex: 0 0 auto; display: flex; flex-direction: row; align-items: center;
+    height: 40dp; padding: 0 6dp 0 16dp; font-weight: 600; border-bottom: 1dp {border};
+}
+.dlg-x {
+    width: 28dp; height: 28dp; line-height: 28dp; text-align: center; border-radius: 4dp;
+    font-family: Lucide; font-size: 15dp; color: {text-2}; cursor: pointer;
+}
+.dlg-x:hover { background-color: {hover}; color: {text}; }
+.dlg-body { flex: 1 1 auto; min-height: 0; padding: 16dp 18dp; overflow-y: auto; }
+.dlg-foot {
+    flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; justify-content: flex-end;
+    padding: 12dp 16dp; border-top: 1dp {border}; background-color: {chrome}; border-radius: 0 0 8dp 8dp;
+}
+.dlg-foot .btn { margin-left: 8dp; }
+
+/* the status dots */
+.dot { flex: 0 0 8dp; width: 8dp; height: 8dp; border-radius: 4dp; margin-right: 7dp; background-color: {text-3}; }
+.dot.ready { background-color: {good}; }
+.dot.prep { background-color: {warn}; }
+.dot.interp, .dot.bad { background-color: {bad}; }
+.dot.run { background-color: {accent}; }
+.dot.off { background-color: {border-strong}; }

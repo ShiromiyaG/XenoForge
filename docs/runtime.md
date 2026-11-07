@@ -1457,10 +1457,74 @@ Dear ImGui kept for the debugging tools only (the player's F1 overlay).
 ```
 launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <page>] [--start N]
     [--player-arg <arg>]... [--build-jobs N] [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
-    [--demo-speed X] [--show-log] [--capture-binding <name>] [--render-size WxH] [--scale F] [--assets <dir>]
+    [--demo-speed X] [--show-log] [--capture-binding <name>] [--menu <name>] [--context-menu] [--tab <name>]
+    [--render-size WxH] [--scale F] [--assets <dir>]
 ```
 
-### The launcher's interface (`frontend/ui`, `launcher_view.*`)
+### The launcher's interface (`frontend/ui`, `launcher_view.*`, `settings_view.*`)
+
+A desktop program in the manner of the classic emulator front ends
+(Dolphin, PCSX2, RPCS3), the owner's choice on 2026-11-06 over the first
+TV-style layout (big tiles, a detail panel and key hints), which it replaced
+entirely:
+
+- **The main window** (`launcher.rml`, `launcher.rcss`): a menu bar (File,
+  Emulation, Options, Tools, Help: dropdowns with icons, shortcuts, greyed
+  items and the theme's check mark); a toolbar (Play, which becomes Stop
+  while a game runs; Prepare, Rebuild or Try preparing again by the selected
+  game's status; Open folder, Rescan, Settings, Controls; a search box that
+  filters on every word of the title, title ID and file name); the games as
+  a table (icon, Title, Title ID, Version, Status, Runs in, Disc file:
+  sorted by a header's click, again for descending; each column's edge
+  dragged to resize it; every other row shaded; a right click's menu: Play,
+  Play interpreted, Prepare, Game settings, Open the disc's folder, Copy the
+  title ID or path); and a status bar (the count or the scan's progress, the
+  folder, which opens the folder dialog on a click, the running game with
+  Stop, a message that fades, a build's progress while its dialog is
+  hidden). With nothing to list, the table says why (no folder, no games, a
+  search that hides them all) with the button that helps.
+- **Dialogs** over the window (theme.rcss's `.dialog`): preparing a game (the
+  stages, the bar, the time, the file, the log; Run in background hides it
+  behind the status bar's progress, Cancel stops it; then Play, or Try again
+  and Play interpreted), About (the licenses), and messages.
+- **The settings window** (`settings_view.*`, `settings.rml`,
+  `settings.rcss`): an OS window of its own over the main one, its own
+  `ui::Window` (device and swapchain) and RmlUi context with its own render
+  interface (fonts are RmlUi's, shared; `Rml::ReleaseRenderManagers()` after
+  its context is removed hands its textures back before its device goes).
+  Tabs Video, Sound, Controllers, Keyboard, Interface; above them, whose
+  settings these are and the "Settings of its own for <game>" check box;
+  check boxes, sliders and dropdowns in groups; the 25 bindings, each
+  changed by a click and the next key; the theme, the accent and the games
+  folder. Saved as they change; the look goes back to the main window
+  through `SettingsHost`.
+- **Desktop scale and place**: sizes are dp at the display's scale
+  (`SDL_GetWindowDisplayScale`: 100%, 150%...), not the window's, so a
+  bigger window shows more rows; the window opens where it was left
+  (`[launcher] x, y, width, height, maximized`, kept only while that place
+  is on a display), and the columns' widths and the sort are kept too
+  (`columns`, `sort`).
+- **Themes**: `[launcher] theme` is `system` (the desktop's light or dark,
+  followed live through `SDL_EVENT_SYSTEM_THEME_CHANGED`), `light` or
+  `dark` (Options or the Interface tab). Each is a palette of tokens
+  (`palette()` in `launcher_model.cpp`: the window, its chrome, lines, three
+  levels of text, the states, the selection from the accent) filled into
+  the stylesheets when a document is made; changing it makes both windows'
+  documents again.
+- **Icons**: Lucide (ISC; `ui/fonts/Lucide.ttf`, its license beside it), a
+  font of outline icons drawn as text; `{i:name}` in a template and
+  `icon_html()` give its glyphs (`launcher_html.cpp` lists the ones used).
+
+Input: the mouse as a desktop program's; the keyboard: the arrows, Page Up
+and Down, Home and End move the selection, Enter plays, F2 opens the game's
+settings, F5 rescans, Ctrl+O the folder, Ctrl+F the search, Ctrl+, the
+settings, Alt+letter or F10 the menus (then the arrows, Enter, Escape),
+Shift+F10 or the menu key the row's menu; in the settings window the arrows
+move focus and change a value, Ctrl+Tab the tab, Escape closes. A pad:
+the d-pad or stick moves the selection (repeating), A or Start plays, X the
+game's settings, Y rescans, Back the menus, the shoulders a page; in menus
+and dialogs the d-pad moves and B closes; in the settings window the
+shoulders change tabs.
 
 Pieces, each apart from the others:
 
@@ -1484,26 +1548,22 @@ Pieces, each apart from the others:
   its own without the window (`--render-size`) and read back.
 - **`ui/ui_system.*`**: RmlUi's system interface on SDL3 and SDL events as
   RmlUi's input.
-- **`launcher_model.*`, `launcher_html.*`**: what the screens say (a game's
-  status, durations, the accent colour's shades, the bindings' names, the
-  spatial navigation) and their structure as RML strings, as plain functions
-  with no RmlUi in them (`frontend_test` checks them). **`prepare_job.*`**: a
-  build on its worker thread, as state to read (no UI, no SDL).
+- **`launcher_model.*`, `launcher_html.*`**: what the windows say (a game's
+  status, durations, the accent's shades, the themes' palettes, the table's
+  columns, widths, sort and filter, the bindings' names, the spatial
+  navigation) and their structure as RML strings, as plain functions with no
+  RmlUi in them (`frontend_test` checks them). **`prepare_job.*`**: a build
+  on its worker thread, as state to read (no UI, no SDL).
 - **`launcher_view.*`, `launcher_screens.cpp`, `launcher_input.cpp`**: the
-  connection to the document: parts rebuilt when what they show changes,
-  clicks, keys and the pad into actions, focus moved by direction.
-- **`ui/assets/launcher.rml`, `launcher.rcss`**: the look. The stylesheet has
-  `{accent...}` tokens the launcher fills when it loads it, so the accent
-  colour (six swatches in Settings, `[launcher] accent` in config.toml) is the
-  user's; changing it loads the document again. `ui/fonts/`: Inter (SIL OFL
-  1.1; its license beside it), four weights.
-
-The layout is made for 1280 x 720 dp and scales with the window
-(`min(width / 1280, height / 720)`, 0.5 to 4), so 1080p is 1.5, 4K is 3.
-Navigation: the mouse as usual; the keyboard with the arrows, Enter, Escape
-and Tab (pages); the pad with the d-pad or left stick (repeating), A, B, X
-(game settings), Y (rescan), the shoulders (pages) and Start (play). The
-hints at the bottom follow the last device used.
+  main window's document: the table rebuilt when what it shows changes (a
+  signature of the rows), the menus, the dialogs, the status bar, clicks,
+  keys and the pad into actions. **`settings_view.*`**: the settings window,
+  its widgets and its input.
+- **`ui/assets/theme.rcss`** (the base, the controls, menus and dialogs both
+  windows share), **`launcher.rcss`**, **`settings.rcss`**, and the two `.rml`
+  templates: the look, with `{tokens}` filled from the palette and the accent
+  (six swatches, `[launcher] accent`). `ui/fonts/`: Inter (SIL OFL 1.1), four
+  weights, and Lucide's icons (ISC), each license beside it.
 
 - **The games** (`library.cpp`): the ISOs (and bare `default.xex` files) in
   a folder the user picks (`launcher.games` in config.toml; the system's
@@ -1520,8 +1580,8 @@ hints at the bottom follow the last device used.
   digest of every module whose generated code it carries. A game whose
   disc has a library in the cache (`find_cached` on its digest, in the
   default cache) starts in the generic `player`, which loads it; without
-  one, in the `player_<game>` that carries its `default.xex`, else the card
-  offers Prepare (the recompile step) and, if that fails, the generic
+  one, in the `player_<game>` that carries its `default.xex`, else Play
+  prepares it first (the recompile step) and, if that fails, the generic
   player interprets (the list says which: "Runs in"). `player_for` in
   `library.h` is that choice.
 - **Settings and controls**: the selected game's settings, edited in the
@@ -1605,6 +1665,22 @@ and fades at the window's edges, while the blur filter is kept for what
 RmlUi makes of it (box shadows). Left for a person: the folder dialog, typing
 in the games folder's field, the mouse (hover, drag on a slider), a real pad
 (only the scripted presses were run), how the transitions feel.
+
+Checked (2026-11-06, the desktop interface): pictures (`--render-size
+1600x900`, light and dark; `--scale 1.5`) of the table with a row selected,
+the Options menu (`--menu options`), the row's menu (`--context-menu`), the
+prepare dialog running with its log and failed (`--demo-progress`,
+`--demo-fail`), About, an empty folder, and the settings window's Video,
+Keyboard (a binding waiting for its key) and Interface tabs (`--screen
+settings --tab <name>`; the picture is the settings window's). With Vulkan
+validation on, offscreen and in real windows: nothing reported, and the
+settings window opened, closed and opened again in one run (`--keys
+x,wait,b,...`); before `Rml::ReleaseRenderManagers()` its device was destroyed
+with RmlUi's textures still on it and the exit crashed. A real window's run
+saved its place in `[launcher]`. Left for a person: the mouse (hover, a
+column's drag, a right click, a slider's drag), typing in the search and the
+folder's field, the folder dialog, a real pad, and the theme followed live
+when the desktop's changes.
 
 The prepare flow, end to end (2026-11-06): Sonic Unleashed's disc, never
 built before (its interrupted build resumed from the nine objects in the

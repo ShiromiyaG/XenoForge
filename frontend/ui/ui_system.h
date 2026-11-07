@@ -31,12 +31,16 @@ class SystemInterface final : public Rml::SystemInterface {
     void ActivateKeyboard(Rml::Vector2f caret_position, float line_height) override;
     void DeactivateKeyboard() override;
 
+    // the window text input goes to: the one whose context is being given
+    // its events (the launcher has two)
+    void set_window(SDL_Window *window) { window_ = window; }
+
     // whether the log has seen an error (the screens' files not found, say)
     int errors() const { return errors_; }
 
   private:
     SDL_Window *window_;
-    SDL_Cursor *cursors_[4] = {};
+    SDL_Cursor *cursors_[5] = {};
     int errors_ = 0;
 };
 

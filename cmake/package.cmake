@@ -15,8 +15,8 @@
 #   FFMPEG-SOURCE.txt            where ffmpeg-xma's source is: the fork's commit and the overlay
 #   ffmpeg-source/               the overlay itself (third_party/ffmpeg: configuration and build script)
 #   LICENSE-xenia, LICENSE-rexglue
-#   ui/                          the launcher's screens (RML, RCSS) and its font, Inter (SIL OFL)
-#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, stb
+#   ui/                          the launcher's windows (RML, RCSS), its font, Inter (SIL OFL), and icons, Lucide (ISC)
+#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Lucide, stb
 #
 # Included by CMakeLists.txt once the player's targets (XF_PLAYERS) and its
 # fetched dependencies exist.
@@ -47,6 +47,7 @@ file(READ "${tomlplusplus_SOURCE_DIR}/LICENSE" _toml)
 file(READ "${rmlui_SOURCE_DIR}/LICENSE.txt" _rmlui)
 file(READ "${freetype_SOURCE_DIR}/docs/FTL.TXT" _freetype)
 file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Inter.txt" _inter)
+file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Lucide.txt" _lucide)
 file(READ "${STB_DIR}/stb_image_write.h" _stb)
 string(FIND "${_stb}" "This software is available under 2 licenses" _stb_at)
 if(_stb_at LESS 0)
@@ -90,6 +91,11 @@ Inter (4.1), https://rsms.me/inter - the launcher's typeface, SIL Open Font
 License 1.1, shipped as ui/fonts/Inter-*.ttf
 ${_rule}
 ${_inter}
+${_rule}
+Lucide (lucide-static 0.460.0), https://lucide.dev - the launcher's icons, ISC
+license (portions from Feather, MIT), shipped as ui/fonts/Lucide.ttf
+${_rule}
+${_lucide}
 ${_rule}
 stb_image and stb_image_write, https://github.com/nothings/stb - MIT license or public domain
 ${_rule}

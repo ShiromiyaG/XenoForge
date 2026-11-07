@@ -1,8 +1,9 @@
-// The launcher's screens as RML (docs/runtime.md, "The launcher"): strings
-// built from plain values, which launcher_view.cpp puts into the document.
-// The look is launcher.rcss's; here are only the structure and the words.
-// Elements that do something carry data-action (and data-arg); the settings'
-// rows carry data-kind and data-key. No RmlUi here.
+// The launcher's windows as RML (docs/runtime.md, "The launcher's interface"):
+// strings built from plain values, which launcher_view.cpp and
+// settings_view.cpp put into their documents. The look is the stylesheets'
+// (ui/assets/*.rcss); here are only the structure and the words. Elements that
+// do something carry data-action (and data-arg); the settings' rows carry
+// data-kind and data-key. No RmlUi here.
 
 #pragma once
 
@@ -10,66 +11,92 @@
 #include "settings.h"
 
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace xf::frontend {
 
-struct TileInfo {
-    int index = 0;
-    std::string title, id_text;
-    std::string icon; // the renderer's name for the game's image ("" when it has none)
-    uint32_t title_id = 0;
-    GameStatus status = GameStatus::Ready;
-    std::string error; // set for a file that could not be read
-};
+// An icon of the Lucide font (ISC; ui/fonts/Lucide.ttf), by its name
+// ("play", "folder-open"): the glyph as UTF-8, "" for a name not listed here.
+std::string icon_glyph(std::string_view name);
+std::string icon_html(std::string_view name, const char *classes = "ic");
+// "{i:name}" in a template made the icon's span
+std::string expand_icons(std::string text);
 
-struct DetailInfo {
-    std::string title, id_text, version, file, runs_in, icon;
-    uint32_t title_id = 0;
-    GameStatus status = GameStatus::Ready;
-    bool has_player = true;
-    bool running = false;
-    std::vector<std::string> last_run; // how its last run ended
-};
-
-// the pictures: an image by name, or a coloured tile with the title's initial
+// A game's picture: an image by the renderer's name, or a coloured square
+// with the title's initial.
 std::string art_style(const std::string &icon, uint32_t title_id);
 std::string art_letter(const std::string &icon, const std::string &title);
 
-std::string tiles_html(const std::vector<TileInfo> &tiles);
-std::string skeleton_html(int count);
-std::string detail_html(const DetailInfo &game);
-std::string detail_empty_html(bool scanning);
-std::string empty_html(bool no_folder, const std::string &folder);
+// ----------------------------------------------------------------- the main window
+
+// A menu's item: an action (with its argument), what it says, its shortcut's
+// text and icon; greyed when it cannot be done now, a check mark for the
+// option that is chosen, or a line between groups.
+struct MenuItem {
+    std::string action, arg, label, shortcut, icon;
+    bool enabled = true, checked = false, separator = false;
+};
+MenuItem menu_separator();
+std::string menu_html(const std::vector<MenuItem> &items);
+
+// One row of the games table.
+struct RowInfo {
+    int index = 0; // in the listing
+    std::string title, id_text, version, runs_in, file;
+    std::string icon; // the renderer's name for the game's image ("" when it has none)
+    uint32_t title_id = 0;
+    GameStatus status = GameStatus::Ready;
+    bool running = false;
+    bool unreadable = false; // the file could not be read (then title is its name, file why)
+    bool alternate = false;  // every other row is shaded
+};
+std::string table_head_html(const Widths &widths, Column sort, bool ascending);
+std::string table_row_html(const RowInfo &row, const Widths &widths, bool selected);
+// what the table area says with nothing to list: no folder chosen, a folder
+// without games, or a filter that hides them all
+std::string empty_html(bool no_folder, bool filtered, const std::string &folder);
+
+// A dialog over the window: a title bar (with a close button), a body and a
+// row of buttons at the bottom.
+std::string dialog_html(const std::string &title, const std::string &body, const std::string &buttons, int width_dp);
+std::string button_html(const std::string &action, const std::string &label, bool primary = false, const std::string &id = {},
+                        const std::string &icon = {});
+std::string about_body_html();
+// the prepare dialog's body, whose parts the view then updates by id
+std::string prepare_body_html(const std::string &title, const std::string &icon, uint32_t title_id);
+const char *prepare_stage_label(int stage); // 0 to 4
+
+// ----------------------------------------------------------------- the settings window
+
+enum class SettingsTab { Video = 0, Sound, Controllers, Keyboard, Interface };
+constexpr int SETTINGS_TABS = 5;
+const char *settings_tab_label(SettingsTab tab);
+const char *settings_tab_name(SettingsTab tab); // "video", "sound"...
 
 struct SettingsPage {
     const Settings *settings = nullptr;
-    std::string game_title;  // "" when no game is selected
+    std::string game_title; // "" when no game is selected
     std::string title_id;
-    std::string folder;      // the games folder
-    std::string accent;      // the current accent, "#rrggbb"
+    std::string folder;     // the games folder
+    std::string accent;     // the current accent, "#rrggbb"
+    std::string theme;      // "system", "light", "dark"
+    std::vector<std::string> gamepads;
+    std::string capturing;  // the binding waiting for a key
 };
-std::string settings_html(const SettingsPage &page);
-// the labels of a select's options, and which is current
+std::string settings_tabs_html(SettingsTab current);
+// the strip above the tabs: whose settings these are, and the switch that
+// gives the selected game settings of its own
+std::string settings_scope_html(const SettingsPage &page);
+std::string settings_page_html(SettingsTab tab, const SettingsPage &page);
+
+// the labels of a dropdown's options
 struct Choice {
     std::string value, label;
 };
 std::vector<Choice> aspect_choices();
 std::vector<Choice> user_choices();
-
-struct ControlsPage {
-    const Settings *settings = nullptr;
-    std::vector<std::string> gamepads;
-    std::string capturing; // the binding waiting for a key
-    std::string game_title;
-};
-std::string controls_html(const ControlsPage &page);
+std::vector<Choice> theme_choices();
 std::string keycaps_html(const std::string &keys, bool waiting);
-
-std::string about_html();
-
-// the prepare screen's card, whose parts the view then updates by id
-std::string prepare_html(const std::string &title, const std::string &icon, uint32_t title_id);
-const char *prepare_stage_label(int stage); // 0 to 4
 
 } // namespace xf::frontend
