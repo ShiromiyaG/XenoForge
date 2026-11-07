@@ -3,7 +3,7 @@ name: xf-player
 description: Works on XenoForge's frontend (plan track C) - the player (SDL3 window, Vulkan presentation of the renderer's front buffer, controller and keyboard input into XAM, sound output, the ImGui overlay, config.toml) and the launcher - modelled on the 3DS runtime's frontend. Use for player, launcher, input or host audio output tasks in F:\RECOMPs\XenoForge.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
 model: sonnet
-effort: high
+effort: medium
 isolation: worktree
 ---
 

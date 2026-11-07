@@ -3,7 +3,7 @@ name: xf-recomp
 description: Works on XenoForge's CPU side - the PPC/VMX128 decoder, the instructions' semantics shared by the generated code and the interpreter, discovery (functions, jump tables, pointers), emission, xfrecomp and boot_<game> - checked against Xenia's instruction tests, rexglue's function lists and the interpreter. Use for recompiler or interpreter tasks in F:\RECOMPs\XenoForge.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
 model: inherit
-effort: xhigh
+effort: medium
 isolation: worktree
 ---
 

@@ -3,7 +3,7 @@ name: xf-gpu
 description: Works on XenoForge's GPU side - the Xenos renderer on Vulkan (trace replay, shader translation, textures, EDRAM, resolves) and the live GPU front end - checked frame by frame against Xenia's traces. Use for renderer, shader translator or command processor tasks in F:\RECOMPs\XenoForge.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
 model: inherit
-effort: xhigh
+effort: medium
 isolation: worktree
 ---
 
