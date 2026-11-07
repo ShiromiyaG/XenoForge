@@ -284,6 +284,32 @@ Object *Objects::by_guest(uint32_t address) {
 
 // ---- native objects (Xenia's CreateNative, GetNativeObject) ----
 
+// What a handle to an object the guest made means to the Ke* family (lock
+// held): when the object is of an Ex event, mutant, semaphore or timer type
+// (its header's type pointer says so) and its body's dispatcher header, which
+// the caller initialized (KeInitializeEvent and the others), says the same
+// kind, the host object behind that header, made on first use as Xenia's
+// XObject::GetNativeObject does; else the guest object itself. Xenia's
+// ObInsertObject is not implemented, so it has no handle to such an object.
+Object *Objects::resolve_guest(GuestObject &g) {
+    uint32_t type = k.load32(g.header() + object_header::OBJECT_TYPE);
+    uint8_t kind = k.host(g.guest)[header::TYPE];
+    bool match;
+    switch (GuestType(kind)) {
+    case GuestType::EventNotification:
+    case GuestType::EventSynchronization: match = type == type_event; break;
+    case GuestType::Mutant: match = type == type_mutant; break;
+    case GuestType::Semaphore: match = type == type_semaphore; break;
+    case GuestType::TimerNotification:
+    case GuestType::TimerSynchronization: match = type == type_timer; break;
+    default: match = false;
+    }
+    if (!match || !type) return &g;
+    Ref<Dispatcher> d = native_locked(g.guest);
+    // native_locked's reference is the table's own (the handle slot holds the object)
+    return d ? static_cast<Object *>(d.get()) : &g;
+}
+
 bool Objects::make_native(Dispatcher &d, GuestType type, uint32_t body_size) {
     uint32_t memory = k.memory().system_alloc(object_header::SIZE + body_size);
     if (!memory) return false;

@@ -482,6 +482,7 @@ public:
     bool retain_handle(uint32_t handle);
     bool release_handle(uint32_t handle);
     Object *object_in(uint32_t handle);  // not retained
+    Object *resolve_guest(GuestObject &g); // lock held: the host object behind a guest object's header, else g
     uint32_t translate(uint32_t handle); // -2: the current thread
     // a retained object by handle (nullptr: none, or not of type T)
     template <typename T> Ref<T> lookup(uint32_t handle);
@@ -622,6 +623,11 @@ template <typename T> Ref<T> Objects::lookup(uint32_t handle) {
     std::lock_guard<std::mutex> l(lock);
     Object *o = object_in(handle);
     if (!o) return {};
+    // a handle to an object the guest made, with a dispatcher header the caller initialized: the host object
+    // behind the header (the Ke* family and the waits see one object)
+    if constexpr (!std::is_base_of_v<GuestObject, T>) {
+        if (auto *g = dynamic_cast<GuestObject *>(o)) o = resolve_guest(*g);
+    }
     if constexpr (!std::is_same_v<T, Object>) {
         if (!dynamic_cast<T *>(o)) return {};
     }

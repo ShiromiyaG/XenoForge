@@ -108,6 +108,9 @@ enum : uint32_t {
     F_FIBER_THREAD = 0x82000140,
     F_FIBER_EXIT = 0x82000150,
     F_TIMER_DPC = 0x82000160,
+    F_SET_BODY_LATER = 0x82000170,
+    F_RELEASE_BODY_LATER = 0x82000180,
+    F_WAIT_BODY = 0x82000190,
 };
 
 std::atomic<uint32_t> flag{0}, apcs{0}, woken{0};
@@ -127,6 +130,26 @@ void set_event_later(ppc::Context &c) {
     uint32_t handle = uint32_t(c.r[3]);
     sleep_ms(c, 30);
     ex(c, "NtSetEvent", {handle, 0});
+}
+
+// a signal on an object's body (made with ObCreateObject), after the waiter has blocked
+void set_body_later(ppc::Context &c) {
+    uint32_t body = uint32_t(c.r[3]);
+    sleep_ms(c, 30);
+    ex(c, "KeSetEvent", {body, 0, 0});
+}
+
+void release_body_later(ppc::Context &c) {
+    uint32_t body = uint32_t(c.r[3]);
+    sleep_ms(c, 30);
+    ex(c, "KeReleaseSemaphore", {body, 0, 1, 0});
+}
+
+// takes the mutant at the context's address (held by the creator until it releases), then releases it
+void wait_body(ppc::Context &c) {
+    uint32_t body = uint32_t(c.r[3]);
+    if (ex(c, "KeWaitForSingleObject", {body, 0, 0, 0, 0}) == X_STATUS_SUCCESS) woken++;
+    ex(c, "KeReleaseMutant", {body, 1, 0, 0});
 }
 
 void wait_semaphore(ppc::Context &c) {
@@ -597,6 +620,78 @@ void locks(ppc::Context &c) {
     CHECK(K->load32(block + 0x24) == 0 && empty_list(block + 0x20)); // auto-reset: taken
 }
 
+// Objects of the Ex types made with ObCreateObject, their dispatcher headers
+// initialized by the caller (the XDK inlines it): a host object is made on
+// first use, as Xenia's XObject::GetNativeObject does, and waits and signals
+// across threads work on the body, as does a handle opened to it.
+uint32_t body_of(ppc::Context &c, const char *type_name, uint32_t size) {
+    uint32_t out = local(c, 0x3F0);
+    CHECK(ex(c, "ObCreateObject", {K->variable(type_name), 0, size, out}) == X_STATUS_SUCCESS);
+    return K->load32(out);
+}
+
+void created_dispatchers(ppc::Context &c) {
+    uint32_t manual = body_of(c, "ExEventObjectType", 0x10), autoreset = body_of(c, "ExEventObjectType", 0x10);
+    ex(c, "KeInitializeEvent", {manual, 0, 0});
+    ex(c, "KeInitializeEvent", {autoreset, 1, 0});
+    CHECK(ex(c, "KeWaitForSingleObject", {manual, 0, 0, 0, timeout_ms(c, 10)}) == X_STATUS_TIMEOUT);
+    uint32_t id = local(c, 0x3E0);
+    CHECK(ex(c, "ExCreateThread", {id, 0, id + 4, 0, F_SET_BODY_LATER, manual, 0}) == X_STATUS_SUCCESS);
+    uint32_t th = K->load32(id);
+    auto started = std::chrono::steady_clock::now();
+    CHECK(ex(c, "KeWaitForSingleObject", {manual, 0, 0, 0, 0}) == X_STATUS_SUCCESS);
+    CHECK(elapsed_ms(started) >= 20);
+    CHECK(K->load32(manual + 4) == 1); // a notification event stays signaled
+    CHECK(ex(c, "KeResetEvent", {manual}) == 1 && K->load32(manual + 4) == 0);
+    join_and_close(c, th);
+    // the synchronization event is taken by the wait it satisfies
+    CHECK(ex(c, "ExCreateThread", {id, 0, id + 4, 0, F_SET_BODY_LATER, autoreset, 0}) == X_STATUS_SUCCESS);
+    th = K->load32(id);
+    CHECK(ex(c, "KeWaitForSingleObject", {autoreset, 0, 0, 0, 0}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(autoreset + 4) == 0);
+    join_and_close(c, th);
+    // a handle to the body is the same host object: a wait on it sees the body's set
+    uint32_t handle_ptr = local(c, 0x3E8);
+    CHECK(ex(c, "ObOpenObjectByPointer", {manual, handle_ptr}) == X_STATUS_SUCCESS);
+    uint32_t handle = K->load32(handle_ptr);
+    CHECK(handle && wait_handle(c, handle, 10) == X_STATUS_TIMEOUT);
+    ex(c, "KeSetEvent", {manual, 0, 0});
+    CHECK(wait_handle(c, handle, 10) == X_STATUS_SUCCESS);
+    CHECK(ex(c, "NtClearEvent", {handle}) == X_STATUS_SUCCESS && K->load32(manual + 4) == 0);
+    CHECK(ex(c, "ExCreateThread", {id, 0, id + 4, 0, F_SET_BODY_LATER, manual, 0}) == X_STATUS_SUCCESS);
+    th = K->load32(id);
+    CHECK(wait_handle(c, handle) == X_STATUS_SUCCESS); // blocks on the handle until the body is set
+    join_and_close(c, th);
+    ex(c, "NtClose", {handle});
+
+    uint32_t sem = body_of(c, "ExSemaphoreObjectType", 0x14);
+    ex(c, "KeInitializeSemaphore", {sem, 0, 3});
+    CHECK(ex(c, "KeWaitForSingleObject", {sem, 0, 0, 0, timeout_ms(c, 10)}) == X_STATUS_TIMEOUT);
+    CHECK(ex(c, "ExCreateThread", {id, 0, id + 4, 0, F_RELEASE_BODY_LATER, sem, 0}) == X_STATUS_SUCCESS);
+    th = K->load32(id);
+    CHECK(ex(c, "KeWaitForSingleObject", {sem, 0, 0, 0, 0}) == X_STATUS_SUCCESS);
+    CHECK(K->load32(sem + 4) == 0);
+    join_and_close(c, th);
+    // released through a handle, taken through the body
+    CHECK(ex(c, "ObOpenObjectByPointer", {sem, handle_ptr}) == X_STATUS_SUCCESS);
+    handle = K->load32(handle_ptr);
+    CHECK(ex(c, "NtReleaseSemaphore", {handle, 2, local(c, 0x3EC)}) == X_STATUS_SUCCESS && K->load32(sem + 4) == 2);
+    CHECK(ex(c, "KeWaitForSingleObject", {sem, 0, 0, 0, 0}) == X_STATUS_SUCCESS && K->load32(sem + 4) == 1);
+    ex(c, "NtClose", {handle});
+
+    // a mutant, held here while a thread waits for it
+    uint32_t mu = body_of(c, "ExMutantObjectType", 0x20);
+    ex(c, "KeInitializeMutant", {mu, 1});
+    woken = 0;
+    CHECK(ex(c, "ExCreateThread", {id, 0, id + 4, 0, F_WAIT_BODY, mu, 0}) == X_STATUS_SUCCESS);
+    th = K->load32(id);
+    sleep_ms(c, 30);
+    CHECK(woken == 0);
+    CHECK(ex(c, "KeReleaseMutant", {mu, 1, 0, 0}) == 0);
+    join_and_close(c, th);
+    CHECK(woken == 1);
+}
+
 void slists(ppc::Context &c) {
     // header: next, depth, sequence; entries: next
     uint32_t head = scratch + 0x400, e1 = scratch + 0x410, e2 = scratch + 0x420;
@@ -832,6 +927,7 @@ void main_thread(ppc::Context &c) {
     timer_dpcs(c);
     tls(c);
     locks(c);
+    created_dispatchers(c);
     slists(c);
     links(c);
     apcs_and_dpcs(c);
@@ -863,6 +959,9 @@ const Generated generated[] = {
     {F_FIBER_THREAD, fiber_thread},
     {F_FIBER_EXIT, fiber_exit},
     {F_TIMER_DPC, timer_dpc},
+    {F_SET_BODY_LATER, set_body_later},
+    {F_RELEASE_BODY_LATER, release_body_later},
+    {F_WAIT_BODY, wait_body},
 };
 
 } // namespace
