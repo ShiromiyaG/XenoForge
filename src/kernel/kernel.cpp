@@ -120,7 +120,11 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         k.run_import(c, *import);
     };
     system_.call = [](ppc::Context &c, uint32_t target) {
-        return static_cast<Kernel *>(c.system->owner)->try_call(c, target);
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        if (k.try_call(c, target)) return true;
+        // the interpreter goes on into a function with no generated code
+        if (k.entry_hook_) k.entered(target);
+        return false;
     };
     system_.mmio_read = [](ppc::Context &c, uint32_t address) -> uint32_t {
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
@@ -441,7 +445,7 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
         const Generated *end = generated_ + generated_count_;
         const Generated *it =
             std::lower_bound(generated_, end, target, [](const Generated &g, uint32_t a) { return g.address < a; });
-        if (it != end && it->address == target) {
+        if (it != end && it->address == target && it->fn) { // (none: a function left out)
             it->fn(c);
             return true;
         }
@@ -516,6 +520,7 @@ void Kernel::dispatch(ppc::Context &c, uint32_t target) {
                 std::lock_guard<std::mutex> lock(counts_mutex_);
                 interpreted_targets_[pc]++;
             }
+            if (!unwound && entry_hook_) entered(pc);
             interpret_from(c, pc, until, stack_top);
             return;
         } catch (const ppc::Unwind &u) {
@@ -529,6 +534,7 @@ void Kernel::dispatch(ppc::Context &c, uint32_t target) {
 }
 
 void Kernel::run_from(ppc::Context &c, uint32_t pc) {
+    const uint32_t start = pc;
     while (!stopped) {
         if (try_call(c, pc)) {
             pc = uint32_t(c.lr) & ~3u; // where it returned
@@ -539,6 +545,7 @@ void Kernel::run_from(ppc::Context &c, uint32_t pc) {
             std::lock_guard<std::mutex> lock(counts_mutex_);
             interpreted_targets_[pc]++;
         }
+        if (pc == start && entry_hook_) entered(pc); // a start, not where a return went
         interpret_from(c, pc, SENTINEL, 0);
         return;
     }
@@ -606,6 +613,14 @@ std::map<std::string, uint64_t> Kernel::unimplemented() const {
     std::lock_guard<std::mutex> lock(counts_mutex_);
     return unimplemented_;
 }
+void Kernel::entered(uint32_t address) {
+    {
+        std::lock_guard<std::mutex> lock(counts_mutex_);
+        if (!entries_seen_.emplace(address, true).second) return;
+    }
+    entry_hook_(entry_hook_user_, address);
+}
+
 std::unordered_map<uint32_t, uint64_t> Kernel::interpreted_targets() const {
     std::lock_guard<std::mutex> lock(counts_mutex_);
     return interpreted_targets_;

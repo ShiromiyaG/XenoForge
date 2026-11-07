@@ -442,6 +442,12 @@ target_compile_definitions(game_library_test PRIVATE
 set_source_files_properties(tests/game_library/code.cpp PROPERTIES COMPILE_OPTIONS "-O2;-g0;-w;-mfma;-mavx2")
 add_test(NAME game_library COMMAND game_library_test)
 set_tests_properties(game_library PROPERTIES TIMEOUT 300)
+# the recompile step on an executable the test makes: functions failing the
+# emission and clang left out, the entry log taken in (needs clang and lld)
+add_executable(game_build_test tests/game_build_test.cpp)
+target_link_libraries(game_build_test PRIVATE xenoforge)
+add_test(NAME game_build COMMAND game_build_test)
+set_tests_properties(game_build PROPERTIES TIMEOUT 300)
 # the modules family loads DLLs and runs a guest thread through them
 target_include_directories(kernel_modules_test PRIVATE src/kernel)
 set_tests_properties(kernel_modules PROPERTIES TIMEOUT 120) # threads: fail, never hang

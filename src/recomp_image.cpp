@@ -37,6 +37,7 @@ const char *source_name(Source s) {
     case Source::Branch: return "branch";
     case Source::Call: return "call";
     case Source::Gap: return "gap";
+    case Source::Logged: return "logged";
     }
     return "?";
 }

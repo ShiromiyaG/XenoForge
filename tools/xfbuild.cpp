@@ -6,13 +6,15 @@
 // goes and how long it took.
 //
 //   xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
-//           [--cancel-after S] [--quiet]
+//           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log]
 //
 // The cache is game_build.h's default_cache_dir() unless named. --keep keeps
 // the work directory (the emitted code and the objects), --force builds even
 // when the cache has the library, --cancel-after stops the build after S
 // seconds as the launcher's cancel does, --quiet prints the stages without a
-// line per file.
+// line per file. --entry adds a function entry, --no-entry-log leaves the
+// runtime's entry log (D3) out. At the end it prints the extra entries taken
+// in and the functions left out, with why.
 
 #include "xenoforge/game_build.h"
 
@@ -47,11 +49,14 @@ const char *stage_name(build::Stage s) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] "
-                             "[--keep] [--force] [--cancel-after S] [--quiet]\n");
+                             "[--keep] [--force] [--cancel-after S] [--quiet] [--entry <hex>]... "
+                             "[--no-entry-log]\n");
         return 2;
     }
     std::filesystem::path disc = argv[1], cache = build::default_cache_dir();
     build::BuildOptions options;
+    build::BuildReport result;
+    options.report = &result;
     double cancel_after = 0;
     bool quiet = false;
     for (int k = 2; k < argc; k++) {
@@ -68,6 +73,10 @@ int main(int argc, char **argv) {
             cancel_after = std::strtod(argv[++k], nullptr);
         else if (a == "--quiet")
             quiet = true;
+        else if (a == "--no-entry-log")
+            options.use_entry_log = false;
+        else if (a == "--entry" && k + 1 < argc)
+            options.entries.push_back(uint32_t(std::strtoul(argv[++k], nullptr, 16)));
         else if (!a.starts_with("--") && k == 2)
             cache = a;
         else
@@ -118,5 +127,10 @@ int main(int argc, char **argv) {
     std::error_code ec;
     std::printf("library %s (%.1f MB)\nprepared in %.1f s\n", library.c_str(),
                 double(std::filesystem::file_size(library, ec)) / (1 << 20), total);
+    // what it took in (D3) and left out (D2)
+    std::printf("extra entries %zu (%zu from the entry log)\nleft out %zu functions\n", result.entries,
+                result.entries_taken, result.left_out.size());
+    for (const build::LeftOutFunction &f : result.left_out)
+        std::printf("  %s 0x%08X  %s\n", f.module.c_str(), f.address, f.reason.c_str());
     return 0;
 }

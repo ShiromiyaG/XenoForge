@@ -1805,9 +1805,62 @@ objects it left (an object newer than its source is not compiled again).
 The CPU must have AVX2 and FMA (checked first, `cpu_supported`).
 `find_cached(cache, digest)` finds `<digest>-<this version>.dll`.
 
+**A build that never fails whole** (D2, 2026-11-07). Only a disc that
+cannot be read, one without `default.xex` (or whose `default.xex` has no PE
+image), a missing toolchain, an unsupported CPU, or a fault in XenoForge's
+own files (a module's `table.cpp`, `modules.cpp`, the entry; or every file
+rejected at once) fails `prepare_game`. Otherwise:
+- a function the emitter cannot emit (it throws) becomes a one-line stub,
+  `XF_FN(xf_X) { ::xf::ppc::dispatch(c, 0xXu); }`, and its table entry
+  holds `nullptr`: its callers in other files still link and call the stub,
+  whose dispatch finds no code and interprets the function. Another
+  executable on the disc that cannot be read is left out whole (no table:
+  the kernel interprets it). `recomp::EmitOptions::leave_out` and
+  `keep_going`;
+- a functions file clang rejects is split by function (the layout
+  `recomp.h` documents for `emit_modules`) into 8 parts written beside it
+  (`functions_K_0.cpp` ...), compiled again; a rejected part is split again,
+  until single functions, the culprits. Bounded: 4 rounds, 256 extra
+  compiles in all; past either, a rejected part's functions are all left
+  out. The culprits' stubs go in `functions_K_left.cpp`, their entries in
+  the module's `table.cpp` become `nullptr`, and the parts that compiled
+  replace the file in the link (a file whose parts all compile, as when
+  clang ran out of memory on it, is simply replaced by them);
+- the left-out functions (module, address, why) and the entry log's
+  addresses taken in are written to `<cache>/<digest>-<version>.build.txt`
+  (`entries_taken N`, `entries N`, then `left<TAB>module<TAB>address<TAB>
+  reason` lines), read by `read_build_report`, and given to the caller
+  through `BuildOptions::report` (also on a cache hit). `xfbuild` prints
+  them. The kernel's `try_call` takes a `nullptr` entry as no code.
+
+The tests force both failures (`BuildOptions::fail_emit`, `fail_compile`:
+a line clang rejects put in the chosen functions' bodies):
+`game_build_test` builds an executable it makes, with 18 functions in one
+file, and finds the rejected one in two rounds.
+
+**What discovery missed** (D3, 2026-11-07). The kernel calls an entry hook
+(`Kernel::set_entry_hook`) the first time it enters the interpreter at an
+address as a function: a dispatch or a thread's start with no generated
+code, and a call interpreted code makes to an address with none (not the
+returns an Unwind goes on from). The generic `boot` and `player`, with a
+game library loaded, point it at an `EntryLog` on
+`<library's directory>/<digest>.entries.txt` (one address in hex per line,
+appended and flushed only for a new address; a lock and a lookup for one
+seen before; the file kept across XenoForge versions). `prepare_game` reads
+the log (`BuildOptions::use_entry_log`, on by default) and gives its
+addresses, with `BuildOptions::entries`, to discovery as extra entries
+(`DiscoverOptions::entries`, `Source::Logged`: registered after the
+exports, before the pointer scan's candidates; one inside a known function
+splits it, which costs speed, not correctness). For the launcher's rebuild
+offer, `new_entries(cache, digest)` (and `has_new_entries`) counts the log's
+addresses past the `entries_taken` the cached library's report holds, but
+the functions that build left out (their stubs enter the interpreter by
+design); 0 with no library cached for this interface version. A rebuild is
+`prepare_game` with `BuildOptions::force`.
+
 ```
 xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
-        [--cancel-after S] [--quiet]
+        [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log]
 boot <iso> [--cache <dir>] [--game-library <dll>] ...
 player <iso> [--cache <dir>] [--game-library <dll>] ...
 ```

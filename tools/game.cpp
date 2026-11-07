@@ -189,6 +189,13 @@ void load_game_library(const Options &options, Game &g) {
     g.generated_modules = loaded->count, g.generated_functions = functions;
     std::printf("generated code: %zu modules, %zu functions (the game library %s)\n", loaded->count, functions,
                 library.string().c_str());
+    // what discovery missed, logged beside the library for its next build
+    // (D3): the first entry into the interpreter at each address
+    const std::filesystem::path log = build::entry_log_path(library.parent_path(), digest);
+    if (g.entry_log.open(log)) {
+        g.kernel->set_entry_hook(&build::EntryLog::hook, &g.entry_log);
+        std::printf("entry log: %s (%zu addresses)\n", log.string().c_str(), g.entry_log.size());
+    }
 }
 #endif
 
@@ -345,6 +352,8 @@ void print_report(Game &g, bool waiting) {
     std::sort(entered.rbegin(), entered.rend());
     std::printf("interpreted entries: %llu, at %zu addresses\n", (unsigned long long)k.interpreted_entries(),
                 entered.size());
+    if (g.entry_log.size())
+        std::printf("entry log: %zu addresses, %zu new this run\n", g.entry_log.size(), g.entry_log.added());
     for (size_t i = 0; i < entered.size() && i < 20; i++)
         std::printf("  %10llu  0x%08X  %s\n", (unsigned long long)entered[i].first, entered[i].second,
                     kernel::module_at(k, entered[i].second).c_str());

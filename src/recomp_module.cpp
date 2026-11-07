@@ -102,12 +102,29 @@ bool emit_module(const ModuleFile &e, const std::filesystem::path &out, const st
     const std::string head = "// Written by xfrecomp emit from " + e.path +
                              ". Game code: not for the repository.\n#include \"xenoforge/ppc_generated.h\"\n\n";
     std::set<std::string> current;
+    std::set<uint32_t> left; // the functions left out: no generated code in the table
     size_t done = 0;
     for (const auto &[k, functions] : by_file) {
         std::string bodies;
         std::set<uint32_t> calls;
         for (const Function *fn : functions) {
-            bodies += emit_function(image, d, *fn, prefix, &calls) + "\n";
+            // a function the emitter cannot emit (or the options leave out)
+            // becomes a stub that dispatches to the interpreter
+            std::string reason = options.leave_out ? options.leave_out(e.path, fn->address) : std::string();
+            if (reason.empty()) {
+                try {
+                    std::set<uint32_t> its;
+                    bodies += emit_function(image, d, *fn, prefix, &its) + "\n";
+                    calls.insert(its.begin(), its.end());
+                } catch (const std::exception &x) {
+                    reason = std::string("the emitter failed: ") + x.what();
+                }
+            }
+            if (!reason.empty()) {
+                bodies += left_out_stub(prefix, fn->address, reason) + "\n";
+                left.insert(fn->address);
+                m.left_out.push_back({e.path, fn->address, reason});
+            }
             calls.insert(fn->address);
         }
         std::string text = head + open;
@@ -136,8 +153,11 @@ bool emit_module(const ModuleFile &e, const std::filesystem::path &out, const st
                     "#include \"xenoforge/ppc_generated.h\"\n\n" + open;
     for (const Function *fn : list) t += "XF_FN(" + function_name(prefix, fn->address) + ");\n";
     t += "\nconst ::xf::ppc::GeneratedFunction functions[] = {\n";
+    // (a function left out has none: dispatch runs its address in the
+    // interpreter, and its stub's own dispatch does not come back to it)
     for (const Function *fn : list)
-        t += "    {0x" + function_name("", fn->address) + "u, " + function_name(prefix, fn->address) + "},\n";
+        t += "    {0x" + function_name("", fn->address) + "u, " +
+             (left.count(fn->address) ? std::string("nullptr") : function_name(prefix, fn->address)) + "},\n";
     if (list.empty()) t += "    {0, nullptr}, // (none: the count says 0)\n";
     // where the functions take a return from a stack switch elsewhere, in
     // order (the kernel's dispatch lets those through to them)
@@ -200,6 +220,7 @@ bool find_modules(const std::filesystem::path &input, const std::vector<std::str
 bool emit_modules(const std::vector<ModuleFile> &modules, const std::filesystem::path &out, const EmitOptions &options,
                   std::vector<EmittedModule> &emitted, std::string &error) {
     emitted.clear();
+    std::vector<EmittedModule> skipped;
     std::filesystem::create_directories(out);
     std::set<std::string> names;
     for (size_t i = 0; i < modules.size(); i++) {
@@ -208,7 +229,22 @@ bool emit_modules(const std::vector<ModuleFile> &modules, const std::filesystem:
         for (int k = 2; !names.insert(name).second; k++) name = identifier(e.path) + "_" + std::to_string(k);
         if (stopped(options, EmitStage::Discovering, i, modules.size(), e.path)) return error = "stopped", false;
         EmittedModule m;
-        if (!emit_module(e, out, name, options, i, modules.size(), m, error)) return false;
+        bool emitted_it = false;
+        try {
+            emitted_it = emit_module(e, out, name, options, i, modules.size(), m, error);
+        } catch (const std::exception &x) {
+            if (!options.keep_going) throw;
+            error = e.path + ": " + x.what();
+        }
+        if (!emitted_it) {
+            if (!options.keep_going || error == "stopped") return false;
+            // left out whole: no table, so the kernel interprets it
+            EmittedModule whole;
+            whole.path = e.path;
+            whole.left_out = {{e.path, 0, "the module was not emitted: " + error}};
+            skipped.push_back(std::move(whole));
+            continue;
+        }
         emitted.push_back(std::move(m));
     }
     std::string t = "// Written by xfrecomp emit: every module's table, for the game library (ppc_module.h).\n"
@@ -219,7 +255,17 @@ bool emit_modules(const std::vector<ModuleFile> &modules, const std::filesystem:
     for (const EmittedModule &m : emitted) t += "    &" + m.ns + "::module,\n";
     t += "};\nextern \"C\" const size_t xf_module_count = " + std::to_string(emitted.size()) + ";\n";
     write_if_changed(out / "modules.cpp", t);
+    // the modules left out whole after the emitted ones: no directory, no
+    // table, no sources, only their left_out
+    for (EmittedModule &m : skipped) emitted.push_back(std::move(m));
     return true;
+}
+
+std::string left_out_stub(const std::string &prefix, uint32_t address, const std::string &reason) {
+    std::string why;
+    for (char ch : reason) why += ch == '\n' || ch == '\r' ? ' ' : ch;
+    return "// left out of the generated code: " + why + "\nXF_FN(" + function_name(prefix, address) +
+           ") { ::xf::ppc::dispatch(c, 0x" + function_name("", address) + "u); }\n";
 }
 
 } // namespace xf::recomp

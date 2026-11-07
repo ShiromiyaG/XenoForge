@@ -233,7 +233,10 @@ public:
     // `extra`: starts from the data pointer scan (Pointer, Branch), registered
     // after .pdata and before anything is walked, so the functions around
     // them stop there
-    Discoverer(const Image &image, const std::map<uint32_t, Source> &extra) : image_(image), extra_(extra) {}
+    // `entries`: starts the runtime logged (DiscoverOptions::entries),
+    // registered after the exports
+    Discoverer(const Image &image, const std::map<uint32_t, Source> &extra, const std::vector<uint32_t> &entries)
+        : image_(image), extra_(extra), entries_(entries) {}
 
     Discovery run() {
         add_imports();
@@ -249,6 +252,8 @@ public:
         if (image_.is_code(image_.entry)) add(image_.entry, Source::Entry);
         for (uint32_t a : image_.exports)
             if (add(a, Source::Export)) d_.counts["exports"]++;
+        for (uint32_t a : entries_)
+            if (add(a, Source::Logged)) d_.counts["logged entries"]++;
         for (const auto &[a, source] : extra_) add(a, source);
         settle();
         // gaps: code nothing covers, cut after each end of a function; a
@@ -695,6 +700,7 @@ private:
 
     const Image &image_;
     const std::map<uint32_t, Source> &extra_;
+    const std::vector<uint32_t> &entries_;
     Discovery d_;
     std::map<uint32_t, bool> sized_;
     std::deque<uint32_t> pending_;
@@ -896,7 +902,7 @@ std::vector<uint32_t> scan_pointers(const Image &image) {
 // across the split pointing at no start), until the set holds still.
 Discovery discover(const Image &image, const DiscoverOptions &options) {
     const std::map<uint32_t, Source> none;
-    Discovery d = Discoverer(image, none).run();
+    Discovery d = Discoverer(image, none, options.entries).run();
     if (!options.scan_pointers) {
         find_resumes(image, d);
         return d;
@@ -949,7 +955,7 @@ Discovery discover(const Image &image, const DiscoverOptions &options) {
     int pass = 0;
     while (true) {
         pass++;
-        d = Discoverer(image, candidates).run();
+        d = Discoverer(image, candidates, options.entries).run();
         if (pass == SCAN_PASSES) break;
         bool changed = false;
 

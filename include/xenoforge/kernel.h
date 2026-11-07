@@ -277,6 +277,15 @@ public:
     // the addresses the interpreter was entered at, and how often: with
     // generated code linked, what discovery missed
     std::unordered_map<uint32_t, uint64_t> interpreted_targets() const;
+    // Called once per address the first time the interpreter is entered at it
+    // as a function: a dispatch or a thread's start with no generated code,
+    // and a call the interpreted code makes to an address with none (not the
+    // returns an Unwind goes on from). With generated code loaded, what
+    // discovery missed: the generic runtime logs them beside the cached game
+    // library for the next build (docs/plan.md, D3; game_build.h's EntryLog).
+    // Set before the guest runs; the hook is called from any guest thread.
+    using EntryHook = void (*)(void *user, uint32_t address);
+    void set_entry_hook(EntryHook hook, void *user) { entry_hook_ = hook, entry_hook_user_ = user; }
 
     // a variable export's value (the kernel's object for it), by name
     uint32_t variable(const std::string &name);
@@ -380,6 +389,10 @@ private:
     std::map<std::string, uint64_t> calls_, unimplemented_;
     std::atomic<uint64_t> interpreted_{0};
     std::unordered_map<uint32_t, uint64_t> interpreted_targets_; // under counts_mutex_
+    EntryHook entry_hook_ = nullptr;
+    void *entry_hook_user_ = nullptr;
+    std::unordered_map<uint32_t, bool> entries_seen_; // under counts_mutex_
+    void entered(uint32_t address); // the entry hook, once per address
     // add_thunk's (a map: its entries stay where they are)
     mutable std::shared_mutex thunks_mutex_;
     std::map<uint32_t, Import> thunks_;

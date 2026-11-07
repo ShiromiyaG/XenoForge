@@ -71,6 +71,7 @@ enum class Source : uint8_t {
     Branch,  // a branch target no function held
     Call,    // a bl target
     Gap,     // code nothing else covered
+    Logged,  // an address the runtime entered the interpreter at as a function (DiscoverOptions::entries)
 };
 const char *source_name(Source s);
 
@@ -131,6 +132,13 @@ struct DiscoverOptions {
     // look for starts among the code addresses the image holds as data,
     // keeping those that do not split a function (recomp_discover.cpp)
     bool scan_pointers = true;
+    // Starts known from outside the image: the addresses the runtime entered
+    // the interpreter at as functions in earlier runs (docs/plan.md, D3;
+    // game_build.h's EntryLog). Each one in this image's code becomes a
+    // function (Source::Logged), registered after the exports and before the
+    // pointer scan's candidates; the others are ignored. One that lands
+    // inside a known function splits it, which costs speed, not correctness.
+    std::vector<uint32_t> entries;
 };
 
 Discovery discover(const Image &image, const DiscoverOptions &options = {});
@@ -163,12 +171,28 @@ bool find_modules(const std::filesystem::path &input, const std::vector<std::str
                   std::vector<ModuleFile> &out, std::string &error);
 
 enum class EmitStage { Discovering, Emitting };
+
+// A function (or a whole module, address 0) left out of the generated code,
+// and why: it runs in the interpreter, as any address without generated code.
+struct LeftOut {
+    std::string module; // its path on the disc
+    uint32_t address = 0;
+    std::string reason;
+};
+
 struct EmitOptions {
     int files = 0; // about this many files per module; 0: 64 KB of the image each
     DiscoverOptions discover;
     // as each module is discovered (done of the modules) and each of its
     // files written (done of its files); false stops the emission
     std::function<bool(EmitStage stage, size_t done, size_t total, const std::string &detail)> progress;
+    // Functions to leave out: a reason (not empty) leaves the function at that
+    // address of that module out; for the recompile step's tests, which force
+    // the failures it must survive (game_build.h, BuildOptions).
+    std::function<std::string(const std::string &module, uint32_t address)> leave_out;
+    // An executable that cannot be read is left out whole (a LeftOut with
+    // address 0) instead of stopping the emission.
+    bool keep_going = false;
 };
 struct EmittedModule {
     std::string path;      // on the disc: "default.xex", "waves\\L360.dll"
@@ -179,6 +203,7 @@ struct EmittedModule {
     uint64_t instructions = 0;
     int files = 0, written = 0;
     std::vector<std::string> sources; // what to compile, under the output: its functions_K.cpp, then table.cpp
+    std::vector<LeftOut> left_out;    // its functions left out of the generated code
 };
 
 // Each module's directory under `out`, holding its functions as C++ in a
@@ -189,8 +214,24 @@ struct EmittedModule {
 // written only when its text changes, so a build after a discovery fix
 // compiles the files that fix touched; files of an earlier emission that hold
 // nothing now are left empty. False, and why, when an executable cannot be
-// read or the progress stops it.
+// read (unless options.keep_going) or the progress stops it.
+//
+// A function the emitter cannot emit (or options.leave_out names) is left
+// out: its body becomes a stub that dispatches to its own address, so its
+// callers in other files still link, and its table entry holds no function
+// (nullptr), so that dispatch runs it in the interpreter. The recompile step
+// (game_build.cpp) relies on the files' layout to split a file clang rejects
+// and leave its culprits out the same way: in functions_K.cpp each function
+// starts at a line `XF_FN(xf_XXXXXXXX) {` and ends at the line `}` (a stub
+// is the one line `XF_FN(xf_XXXXXXXX) { ... }`), after the declarations
+// (`XF_FN(...);`); in table.cpp each function is the line
+// `    {0xXXXXXXXXu, xf_XXXXXXXX},`.
 bool emit_modules(const std::vector<ModuleFile> &modules, const std::filesystem::path &out,
                   const EmitOptions &options, std::vector<EmittedModule> &emitted, std::string &error);
+
+// The stub a left-out function's body becomes (recomp_module.cpp, and the
+// recompile step for the functions clang rejects): it dispatches to its own
+// address, which has no generated code, so the interpreter runs it.
+std::string left_out_stub(const std::string &prefix, uint32_t address, const std::string &reason);
 
 } // namespace xf::recomp

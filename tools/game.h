@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "xenoforge/game_build.h"
 #include "xenoforge/input.h"
 #include "xenoforge/kernel.h"
 #include "xenoforge/memory.h"
@@ -45,6 +46,9 @@ struct Options {
 };
 
 struct Game {
+    // where the kernel logs the addresses it enters the interpreter at, with
+    // a cached game library loaded (D3; first, so it outlives the kernel)
+    build::EntryLog entry_log;
     Xex xex;
     std::unique_ptr<Memory> memory;
     std::unique_ptr<kernel::Kernel> kernel;

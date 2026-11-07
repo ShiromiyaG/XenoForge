@@ -157,7 +157,10 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   32-bit and exception flags; with the exception flag, the handler and its
   scope or FuncInfo table give the funclets); the entry point; a DLL's
   exports (the XEX export table the security info points at, and the PE
-  export directory, as GetProcAddress reads them); the data pointer scan's
+  export directory, as GetProcAddress reads them); the addresses earlier
+  runs entered the interpreter at (`DiscoverOptions::entries`, source
+  `logged`: the runtime's entry log, D3, docs/runtime.md "The game
+  library"); the data pointer scan's
   (below); `bl` targets; last, gaps no function covers. On El Chavo Kart
   `.pdata` alone gives 52,360 of the 73,587 functions.
 - **The data pointer scan** (`scan_pointers`, `DiscoverOptions`; translated
