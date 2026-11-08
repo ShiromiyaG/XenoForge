@@ -584,6 +584,14 @@ target_link_libraries(kernel_xam_user_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_xam_user COMMAND kernel_xam_user_test)
 set_tests_properties(kernel_xam_user PROPERTIES TIMEOUT 120) # threads: fail, never hang
 
+# The system track: GPDs, a profile's settings and achievements kept across runs, the console's
+# settings, the title ending (launch, terminate)
+add_executable(kernel_system_test tests/kernel_system_test.cpp)
+target_include_directories(kernel_system_test PRIVATE src/kernel)
+target_link_libraries(kernel_system_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME kernel_system COMMAND kernel_system_test)
+set_tests_properties(kernel_system PROPERTIES TIMEOUT 120) # threads: fail, never hang
+
 # the exports ported from Xenia's inventory: locks, events, APCs, threads,
 # Ob, the HAL, Rtl, the wide printf family, xbdm; some on guest threads
 add_executable(kernel_inventory_test tests/kernel_inventory_test.cpp)

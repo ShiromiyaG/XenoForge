@@ -369,6 +369,23 @@ void cache_files(ppc::Context &c) {
     CHECK(o.status == X_STATUS_SUCCESS && o.action == 3 && size_of(c, o.handle) == 0);
     close(c, o.handle);
     CHECK(std::filesystem::exists(storage / "cache0" / "z.bin"));
+    // NtDeleteFile: a file goes, a directory with a file in it stays, a name that is not there is not found
+    Opened gone = create(c, "cache0:\\w.bin", GENERIC_WRITE, OPEN_IF, 0);
+    close(c, gone.handle);
+    CHECK(std::filesystem::exists(storage / "cache0" / "w.bin"));
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\w.bin")}) == X_STATUS_SUCCESS);
+    CHECK(!std::filesystem::exists(storage / "cache0" / "w.bin"));
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\w.bin")}) == X_STATUS_OBJECT_NAME_NOT_FOUND);
+    Opened keep = create(c, "cache0:\\keep", GENERIC_READ, OPEN_IF, DIRECTORY_FILE);
+    close(c, keep.handle);
+    Opened inner = create(c, "cache0:\\keep\\a.bin", GENERIC_WRITE, CREATE, 0);
+    close(c, inner.handle);
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\keep")}) == 0xC0000101);
+    CHECK(std::filesystem::exists(storage / "cache0" / "keep" / "a.bin"));
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\keep\\a.bin")}) == X_STATUS_SUCCESS);
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\keep")}) == X_STATUS_SUCCESS);
+    CHECK(!std::filesystem::exists(storage / "cache0" / "keep"));
+    CHECK(krnl(c, "NtDeleteFile", {attributes("\\Device\\Cdrom0\\media\\c.txt")}) == X_STATUS_ACCESS_DENIED);
     // FATX's limits: a name of 42 characters, a path of 240 (Free60's FATX page)
     std::string name42(42, 'n'), name43(43, 'n');
     o = create(c, "cache:\\" + name42, GENERIC_WRITE, CREATE, 0);

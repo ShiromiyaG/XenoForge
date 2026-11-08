@@ -1230,7 +1230,8 @@ uint32_t launch_image(Kernel &k, uint32_t image_location, uint32_t data, uint32_
         image = guest_string(k, image_location);
     }
     if (!file_system(k).resolve(image)) return 0xC000000F; // X_STATUS_NO_SUCH_FILE
-    end_title(k, "the title launches " + guest_string(k, xex_path) + " from " + image + " (XamContentLaunchImage)");
+    exit_title(k, true, image + "\\" + guest_string(k, xex_path), 0, 0,
+               "the title launches " + guest_string(k, xex_path) + " from " + image + " (XamContentLaunchImage)");
 }
 } // namespace
 

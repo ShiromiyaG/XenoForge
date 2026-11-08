@@ -54,6 +54,17 @@ struct Settings {
         double left_deadzone = 0, right_deadzone = 0; // 0-1 of the stick's range (Xenia's *_deadzone_percentage)
         bool vibration = true;
     } input;
+    // the console's own settings the games read, in config.toml's [system]: the
+    // user's language (XLanguage: 1 English, 2 Japanese, 3 German, 4 French,
+    // 5 Spanish, 6 Italian, ...) and country code, the screen size, widescreen
+    // and the refresh rate (50 or 60); 0, -1 and "" leave the console's defaults
+    struct System {
+        int language = 0;
+        int country = -1;
+        int width = 0, height = 0;
+        int widescreen = -1;
+        int refresh = 0;
+    } system;
     // the port's options (run.h's PortOption) by key, in config.toml's [port]
     std::map<std::string, std::variant<bool, int64_t, double>> port;
     // each binding's keys, space-separated (BINDINGS' names)

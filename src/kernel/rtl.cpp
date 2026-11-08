@@ -180,6 +180,21 @@ XF_EXPORT(xboxkrnl, RtlCopyString) {
     k.store16(destination, length);
 }
 
+// (destination, source): NT's RtlAppendStringToString (Xenia has none; the
+// console's XAM imports it): the source after the destination's text, or
+// STATUS_BUFFER_TOO_SMALL with nothing written when it does not fit
+XF_EXPORT(xboxkrnl, RtlAppendStringToString) {
+    uint32_t destination = arg(k, c, 0), source = arg(k, c, 1);
+    uint16_t length = source ? k.load16(source) : 0;
+    if (length) {
+        uint16_t used = k.load16(destination), maximum = k.load16(destination + 2);
+        if (uint32_t(maximum) - used < length) return result(c, 0xC0000023 /* STATUS_BUFFER_TOO_SMALL */);
+        std::memmove(k.host(k.load32(destination + 4) + used), k.host(k.load32(source + 4)), length);
+        k.store16(destination, uint16_t(used + length));
+    }
+    result(c, X_STATUS_SUCCESS);
+}
+
 XF_EXPORT(xboxkrnl, RtlCopyUnicodeString) {
     // (destination, source): as NT's and the console's: at most the destination's
     // maximum length in bytes (Xenia copies twice the byte count, past the

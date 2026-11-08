@@ -229,6 +229,14 @@ bool open(const Options &options, Game &g, std::string &error) {
                         : kernel::mount_disc(k, input, error);
     if (!mounted || !kernel::mount_storage(k, options.storage, error)) return error = "mount: " + error, false;
     std::printf("storage: %s\n", options.storage.string().c_str());
+    // the console's settings: what the player chose, and the settings titles wrote in earlier runs
+    // (kept in the storage root, except in the deterministic mode, which starts from the defaults)
+    {
+        kernel::SystemSettings system = options.system;
+        if (system.file.empty() && !options.deterministic && !options.storage.empty())
+            system.file = options.storage / "xconfig.bin";
+        kernel::apply_system_settings(k, system);
+    }
     // its module's path, which the DLLs it loads by a bare name are next to
     kernel::set_executable_path(k, "game:\\" +
                                        (bare ? std::filesystem::path(input).filename().string() : options.xex_path));

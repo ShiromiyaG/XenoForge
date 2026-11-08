@@ -1060,6 +1060,30 @@ XF_EXPORT(xboxkrnl, NtQueryFullAttributesFile) {
     result(c, X_STATUS_SUCCESS);
 }
 
+// (object_attributes): NT's NtDeleteFile (Xenia has none; the console's XAM
+// imports it): the file or empty directory at the path is removed; a name
+// that is not there is OBJECT_NAME_NOT_FOUND, a read-only device ACCESS_DENIED,
+// a directory with children DIRECTORY_NOT_EMPTY
+XF_EXPORT(xboxkrnl, NtDeleteFile) {
+    uint32_t attributes = arg(k, c, 0);
+    std::string path = guest_path(k, k.load32(attributes + object_attributes::NAME));
+    if (!valid_path(path, false)) return result(c, X_STATUS_OBJECT_NAME_INVALID);
+    vfs::FileSystem &fs = file_system(k);
+    std::string resolved = fs.resolve_links(path);
+    std::lock_guard<std::recursive_mutex> l(fs.mutex);
+    vfs::Entry *e = fs.find(resolved);
+    std::error_code ec;
+    bool occupied = e && e->directory() && !e->host_path.empty() &&
+                    std::filesystem::directory_iterator(e->host_path, ec) != std::filesystem::directory_iterator();
+    uint32_t status = !e ? X_STATUS_OBJECT_NAME_NOT_FOUND
+                      : e->device->read_only ? X_STATUS_ACCESS_DENIED
+                      : occupied             ? 0xC0000101 /* STATUS_DIRECTORY_NOT_EMPTY */
+                      : !fs.remove(*e)       ? X_STATUS_ACCESS_DENIED
+                                             : X_STATUS_SUCCESS;
+    if (log_files()) std::fprintf(stderr, "files: delete %s: 0x%08X\n", path.c_str(), status);
+    result(c, status);
+}
+
 // (file, event, apc_routine, apc_context, io_status_block, info, length,
 // file_name, restart_scan): one entry a call (XFile::QueryDirectory)
 XF_EXPORT(xboxkrnl, NtQueryDirectoryFile) {

@@ -1372,6 +1372,78 @@ Left, and why:
   a callback on our side; whether the interpreter stops before the call
   returns varies (one "faults (ours)" in the last run was CreateThread).
 
+## The title's end, the profile and the console's settings (plan step 7, 2026-11-08)
+
+**A process per title.** A title ends the run through `XamLoaderTerminateTitle`,
+`XamLoaderLaunchTitle`, `XamContentLaunchImage` or `ExTerminateTitleProcess`
+(Xenia has the first two only, and asks the user to restart). Each runs the
+routines registered with `ExRegisterTitleTerminateNotification` (the highest
+priority first, r3 = 0, on the calling thread; Xenia never runs them; the
+console's order and arguments are on the hardware list), records the exit in
+`Kernel::title_exit` (launched path, flags, exit code, the launch data the title
+set with `XamLoaderSetLaunchData`) and stops the run. The host starts the next
+title as a process of its own: `boot --follow-launches` takes a path on the disc
+(`game:\`, `d:\`, `\Device\Cdrom0\`) and runs boot again on the same disc with
+`--xex <path>`, `--launch-data <file>` (what the next title reads through
+`XamLoaderGetLaunchData`, `set_launch_data`) and the time that is left. A launch
+to the dashboard or to a package on a content device ends there with the
+request printed. The player does not follow launches yet. `ExTerminateTitleProcess`
+(the console's XAM calls it from its launcher with 0; the argument is the exit
+code, as far as the oracle shows) is new.
+
+**The profile in its package** (`gpd.h`, `xam_user.cpp`). Profile settings a
+title writes (`XamUserWriteProfileSettings`, the dashboard's user preferences)
+and the achievements it earns are kept in the user's GPD files in the profile's
+package, Xenia's layout: `content/<XUID>/FFFE07D1/00010000/<XUID>/<title>.gpd`
+(`FFFE07D1.gpd` for the dashboard's). A GPD is an XDBF file (header, entry
+table, free table, data; settings in section 3, achievements in section 1),
+read when first used and written aside and renamed at each change, so a run that
+ends in the middle leaves the old file whole. Where Xenia reuses the holes of its
+free list, a file here is laid out afresh at each write. The title's
+achievements come from its SPA (the executable's resource named by the title ID:
+the XACH table and its strings in the console's language, else the SPA's
+default, else English), added locked to the GPD at first use;
+`XGIUserWriteAchievements` earns each one: its unlock time is the guest's system
+time, and the log says `xam: achievement unlocked: "<name>" (<n> G, id <id>)`
+(the overlay's log is the only UI for now). `XamUserCreateAchievementEnumerator`
+lists them from the GPD, locked and unlocked, with the label, description and
+unachieved description as UTF-16 behind the records when its flags ask for them
+(Xenia's layout: 36-byte records, the strings after `items_per_enumerate`
+records). Not done: gamer pictures, the titles-played list in the dashboard's
+GPD, stats, a GPD inside an STFS package (a directory package still).
+
+**The console's settings** (`SystemSettings`, misc.cpp). The player's choice of the
+user's language and country, the screen size (640x480, 1280x720, 1920x1080), the
+widescreen flag and the refresh rate (50 or 60 Hz) are written into the console's
+own XConfig settings before the title runs (config.toml's `[system]`: `language`,
+`country`, `width`, `height`, `widescreen`, `refresh`; boot's `--language`,
+`--country`, `--resolution WxH`, `--widescreen 0|1`, `--refresh 50|60`), so what a
+title reads through XGetVideoMode, VdQueryVideoMode, XamGetLanguage and
+XamGetCountry follows, as it would on a console set up that way. 50 Hz writes the
+PAL AV region (standard 3, bit 23). The settings a title writes with
+`ExSetXConfigSetting` and `ExReadModifyWriteXConfigSettingUlong` are kept in
+`<storage>/xconfig.bin` (the deterministic mode starts from the defaults and writes
+nothing), read at the start; what the player chose wins over them.
+
+**Kernel speed (2026-11-08).** Every import call used to build the export's
+`library!name` string, lock a kernel-wide mutex and bump a map entry; with game
+A's main thread spinning in `KeDelayExecutionThread(0)` at millions of calls a
+second (44.3 M in 20 s) that was the bulk of the call. A count is now one relaxed
+atomic add on the `Import` itself (`CallCount`), summed by name when a report asks
+(`Kernel::calls`, `unimplemented`): the same boot made 72.5 M of those calls in
+20 s (1.6 times the rate, same 30 swaps a second). Game B's kernel calls are
+about 1 M in 20 s; its time is the game's and the disc's. Left: `yield_status`
+(the answer a yield gives) walks the thread list under the dispatcher's lock on
+every yield.
+
+**Exports the console's XAM imports and Xenia lacks, as they come:**
+`RtlAppendStringToString` and `NtDeleteFile` (NT's; the second answers
+OBJECT_NAME_NOT_FOUND, ACCESS_DENIED on a read-only device and
+DIRECTORY_NOT_EMPTY). The other 173 the oracle lists (`xfxam <xam.xex> imports`:
+XeKeys*, XInputd*, Hal callbacks, Nic*, Mtpd*, Etx*, Drv*, LDI*...) answer 0 as
+before: their arguments and results are not known without the console, and a
+guess would be a stub with a name.
+
 ## `boot`
 
 `boot <game.iso> [--seconds N] [--steps N] [--content <dir>] [--interpret]

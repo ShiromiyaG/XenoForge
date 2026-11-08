@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -77,8 +78,21 @@ constexpr uint32_t X_STATUS_NOT_IMPLEMENTED = 0xC0000002;
 constexpr uint32_t X_STATUS_INVALID_PARAMETER = 0xC000000D;
 constexpr uint32_t X_STATUS_NO_MEMORY = 0xC0000017;
 
+// A call count a call bumps with one relaxed atomic add (no lock, no string),
+// copyable so an Import is.
+struct CallCount {
+    mutable std::atomic<uint64_t> n{0};
+    CallCount() = default;
+    CallCount(const CallCount &o) : n(o.n.load(std::memory_order_relaxed)) {}
+    CallCount &operator=(const CallCount &o) {
+        n.store(o.n.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+};
+
 struct Import {
     std::string library, name; // name: the export's, or library_ordinal
+    CallCount calls;           // the calls made (Kernel::calls sums them by export)
     uint16_t ordinal = 0;
     uint32_t thunk = 0;
     ExportFn fn = nullptr;     // nullptr: not implemented yet
@@ -183,6 +197,25 @@ std::string video_report(Kernel &k);
 // before the game starts; the Sink's calls then come on the "GPU commands"
 // thread.
 gpu::CommandProcessor &gpu_command_processor(Kernel &k);
+
+// What the player chooses of the console's settings (config.toml's [system];
+// boot's --language, --resolution, --widescreen, --refresh), written into the
+// console's own settings before the title runs (apply_system_settings, misc.cpp).
+// Zero or -1 leaves a setting as it is.
+struct SystemSettings {
+    std::filesystem::path file; // where the settings a title writes are kept between runs ("": this run only)
+    uint32_t language = 0;      // XLanguage: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, ...
+    int country = -1;           // the console's country code (103: United States)
+    uint32_t width = 0, height = 0; // the screen size: 640x480, 1280x720, 1920x1080
+    int widescreen = -1;        // 1 or 0: the 16:9 video flag
+    int refresh = 0;            // 50 or 60 Hz
+};
+void apply_system_settings(Kernel &k, const SystemSettings &settings);
+
+// The launch data the next title finds through XamLoaderGetLaunchData (what
+// the title before it set with XamLoaderSetLaunchData; Kernel::title_exit),
+// set before the title runs.
+void set_launch_data(Kernel &k, const std::vector<uint8_t> &data);
 
 // The sound family's parts (audio.cpp, xma.cpp; its seams in
 // xenoforge/audio.h). setup_audio, as the kernel starts: the XMA decoder's
@@ -406,6 +439,20 @@ public:
     void stop(const std::string &reason);
     std::string stop_report, stop_stack; // the report's text, and its one-line stack
 
+    // What the title asked when it ended the run by launching another title
+    // (XamLoaderLaunchTitle and its variants) or by terminating itself
+    // (XamLoaderTerminateTitle, ExTerminateTitleProcess): the host starts the
+    // next title as a process of its own (boot's --follow-launches). Set under
+    // the stop's first reason, before the run stops; read after it.
+    struct TitleExit {
+        bool launch = false;             // another title follows (an empty path: the dashboard)
+        std::string path;                // the executable as the guest named it ("game:\Game.xex")
+        uint32_t flags = 0;              // the launch flags
+        uint32_t exit_code = 0;          // ExTerminateTitleProcess's code
+        std::vector<uint8_t> launch_data; // XamLoaderSetLaunchData's, for the next title
+    };
+    TitleExit title_exit;
+
     // Where a guest address is in the generated code's tables, for the
     // reports: its module's file name and the function it falls in (the last
     // one starting at or before it, within 64 KB). Locks nothing (the crash
@@ -490,6 +537,8 @@ private:
     std::map<std::string, uint32_t> variables_;
     mutable std::mutex counts_mutex_;
     std::map<std::string, uint64_t> calls_, unimplemented_;
+    std::set<std::string> unimplemented_logged_; // under counts_mutex_
+    void each_import(const std::function<void(const Import &)> &visit) const;
     std::atomic<uint64_t> interpreted_{0};
     std::unordered_map<uint32_t, uint64_t> interpreted_targets_; // under counts_mutex_
     EntryHook entry_hook_ = nullptr;

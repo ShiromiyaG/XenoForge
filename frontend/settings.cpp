@@ -82,6 +82,17 @@ void read_sections(const toml::table &t, Settings &s) {
     s.input.left_deadzone = std::clamp(s.input.left_deadzone, 0.0, 1.0);
     s.input.right_deadzone = std::clamp(s.input.right_deadzone, 0.0, 1.0);
     get(t, "input", "vibration", s.input.vibration);
+    auto integer = [&](const char *key, int &into) {
+        int64_t v = into;
+        get(t, "system", key, v);
+        into = int(std::clamp<int64_t>(v, -1, 100000));
+    };
+    integer("language", s.system.language);
+    integer("country", s.system.country);
+    integer("width", s.system.width);
+    integer("height", s.system.height);
+    integer("widescreen", s.system.widescreen);
+    integer("refresh", s.system.refresh);
     if (auto *table = t["keyboard"].as_table())
         for (auto &[key, value] : *table)
             if (auto v = value.value<std::string>(); v && s.keys.count(std::string(key.str())))
@@ -111,6 +122,12 @@ void write_sections(toml::table &t, const Settings &s) {
                                             {"right_deadzone", s.input.right_deadzone},
                                             {"vibration", s.input.vibration}});
     t.insert_or_assign("keyboard", std::move(keys));
+    t.insert_or_assign("system", toml::table{{"language", s.system.language},
+                                             {"country", s.system.country},
+                                             {"width", s.system.width},
+                                             {"height", s.system.height},
+                                             {"widescreen", s.system.widescreen},
+                                             {"refresh", s.system.refresh}});
     if (!s.port.empty()) {
         toml::table port;
         for (const auto &[key, value] : s.port)

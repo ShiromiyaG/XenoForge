@@ -587,13 +587,15 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
     GuestCodeScope in_kernel(*this, false);
     // (nothing of this frame outlives the count: a host stack may be dropped
     // while it waits in the export, KeSetCurrentStackPointers's switch)
-    {
-        std::string key = import.library + "!" + import.name;
+    // (counted on the import itself: no string made, no lock taken, per call)
+    if (import.calls.n.fetch_add(1, std::memory_order_relaxed) == 0 && !import.fn) {
+        // the first call of an import with no implementation is logged (once per
+        // import: a name bound twice, by ordinal and by name, logs for each)
         std::lock_guard<std::mutex> lock(counts_mutex_);
-        calls_[key]++;
-        if (!import.fn && unimplemented_[key]++ == 0)
-            std::fprintf(stderr, "kernel: %s is not implemented (r3 0x%08X, r4 0x%08X, from 0x%08X)\n", key.c_str(),
-                         uint32_t(c.r[3]), uint32_t(c.r[4]), uint32_t(c.lr));
+        if (unimplemented_logged_.insert(import.library + "!" + import.name).second)
+            std::fprintf(stderr, "kernel: %s!%s is not implemented (r3 0x%08X, r4 0x%08X, from 0x%08X)\n",
+                         import.library.c_str(), import.name.c_str(), uint32_t(c.r[3]), uint32_t(c.r[4]),
+                         uint32_t(c.lr));
     }
     note_kernel_call(import, uint32_t(c.lr));
     // the deterministic mode's clock moves, and another thread may run
@@ -894,13 +896,31 @@ bool Kernel::guest_function_of_host(const void *host, uint32_t &start) const {
     return start = found, true;
 }
 
+// every import's count, summed by export name (the executable's imports, the
+// modules' thunks, and those of modules unloaded since)
+void Kernel::each_import(const std::function<void(const Import &)> &visit) const {
+    for (const Import &im : imports_) visit(im);
+    std::shared_lock lock(thunks_mutex_);
+    for (const auto &[address, im] : thunks_) visit(im);
+    for (const auto &node : retired_thunks_) visit(node.mapped());
+}
 std::map<std::string, uint64_t> Kernel::calls() const {
+    std::map<std::string, uint64_t> out;
+    each_import([&](const Import &im) {
+        if (uint64_t n = im.calls.n.load(std::memory_order_relaxed)) out[im.library + "!" + im.name] += n;
+    });
     std::lock_guard<std::mutex> lock(counts_mutex_);
-    return calls_;
+    for (const auto &[key, n] : calls_) out[key] += n; // what else counted by name (the devices)
+    return out;
 }
 std::map<std::string, uint64_t> Kernel::unimplemented() const {
+    std::map<std::string, uint64_t> out;
+    each_import([&](const Import &im) {
+        if (uint64_t n = im.calls.n.load(std::memory_order_relaxed); n && !im.fn) out[im.library + "!" + im.name] += n;
+    });
     std::lock_guard<std::mutex> lock(counts_mutex_);
-    return unimplemented_;
+    for (const auto &[key, n] : unimplemented_) out[key] += n; // the devices' (mmio)
+    return out;
 }
 void Kernel::entered(uint32_t address) {
     {

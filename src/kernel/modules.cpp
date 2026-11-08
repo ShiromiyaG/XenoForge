@@ -738,6 +738,28 @@ void set_process_tls(Kernel &k, uint32_t process, uint32_t slots, uint32_t data_
 uint32_t title_process(Kernel &k) { return k.state<Modules>().globals + TITLE_PROCESS; }
 uint32_t system_process(Kernel &k) { return k.state<Modules>().globals + SYSTEM_PROCESS; }
 
+// The routines ExRegisterTitleTerminateNotification registered, run as the
+// title ends (XamLoaderTerminateTitle, ExTerminateTitleProcess, a launch),
+// the highest priority first, each once, with r3 = 0, on the thread that ends
+// the title. Xenia never runs them. NT's own order and arguments are not
+// known (docs/xenia-todos-kernel.md, the hardware list); this is the
+// natural reading of a priority.
+void run_title_terminate_notifications(Kernel &k, ppc::Context &c) {
+    std::vector<std::pair<uint32_t, uint32_t>> routines;
+    {
+        Modules &s = k.state<Modules>();
+        std::lock_guard lock(s.mutex);
+        routines.swap(s.terminate_notifications);
+    }
+    std::stable_sort(routines.begin(), routines.end(),
+                     [](const auto &x, const auto &y) { return x.second > y.second; });
+    for (const auto &[routine, priority] : routines) {
+        std::fprintf(stderr, "kernel: title terminate notification 0x%08X (priority %u)\n", routine, priority);
+        c.r[3] = 0;
+        k.call(c, routine);
+    }
+}
+
 void set_executable_path(Kernel &k, const std::string &path) {
     Modules &s = k.state<Modules>();
     std::lock_guard lock(s.mutex);

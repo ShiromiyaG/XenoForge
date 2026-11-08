@@ -67,8 +67,18 @@
 #include "xenoforge/lockstep.h"
 #include "xenoforge/run.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <cstdlib>
 #include <filesystem>
 #include <set>
@@ -80,6 +90,26 @@
 
 using namespace xf;
 
+namespace {
+// A path the guest launches, as the path on the disc --xex takes: the device
+// prefix (game:, d:, \Device\Cdrom0) dropped, slashes forward; "" for the
+// dashboard or a path that is not on the disc
+std::string disc_path(std::string path) {
+    std::string lower = path;
+    for (char &ch : lower) ch = char(std::tolower((unsigned char)ch));
+    for (const char *prefix : {"game:", "d:", "\\device\\cdrom0", "\\device\\harddisk0\\cdrom0"}) {
+        size_t n = std::strlen(prefix);
+        if (lower.compare(0, n, prefix) != 0) continue;
+        path = path.substr(n);
+        while (!path.empty() && (path[0] == '\\' || path[0] == '/')) path.erase(0, 1);
+        for (char &ch : path)
+            if (ch == '\\') ch = '/';
+        return path;
+    }
+    return {};
+}
+} // namespace
+
 int xf::run_boot(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
@@ -89,7 +119,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                         "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
                         "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
                         "[--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
-                        "[--option <key>=<value>]...\n";
+                        "[--language N] [--country N] [--resolution WxH] [--widescreen 0|1] [--refresh 50|60] "
+                        "[--follow-launches] [--launch-data <file>] [--option <key>=<value>]...\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -105,6 +136,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     uint64_t shot_every = 0;
     std::filesystem::path trace_dir = "traces";
     double reload_every = 0;
+    bool follow_launches = false;
+    std::filesystem::path launch_data_file;
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc)
@@ -161,6 +194,23 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             o.record_input = argv[++k];
         else if (a == "--replay-input" && k + 1 < argc)
             o.replay_input = argv[++k];
+        else if (a == "--language" && k + 1 < argc)
+            o.system.language = uint32_t(std::strtoul(argv[++k], nullptr, 10));
+        else if (a == "--country" && k + 1 < argc)
+            o.system.country = int(std::strtol(argv[++k], nullptr, 10));
+        else if (a == "--resolution" && k + 1 < argc) {
+            unsigned w = 0, h = 0;
+            if (std::sscanf(argv[++k], "%ux%u", &w, &h) != 2)
+                return std::fprintf(stderr, "bad --resolution\n%s", usage), 2;
+            o.system.width = w, o.system.height = h;
+        } else if (a == "--widescreen" && k + 1 < argc)
+            o.system.widescreen = std::atoi(argv[++k]) ? 1 : 0;
+        else if (a == "--refresh" && k + 1 < argc)
+            o.system.refresh = std::atoi(argv[++k]);
+        else if (a == "--follow-launches")
+            follow_launches = true;
+        else if (a == "--launch-data" && k + 1 < argc)
+            launch_data_file = argv[++k];
         else if (a == "--hook-stats")
             hooks::set_stats(true);
         else if (a == "--reload-hooks-every" && k + 1 < argc)
@@ -212,6 +262,11 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                     shots.string().c_str());
     }
 
+    if (!launch_data_file.empty()) {
+        std::ifstream in(launch_data_file, std::ios::binary);
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        kernel::set_launch_data(k, data);
+    }
     if (port.on_init) port.on_init(k);
     if (!port.hook_module.empty() && !game::load_port_module(g, port.hook_module, error))
         return std::fprintf(stderr, "%s\n", error.c_str()), 1;
@@ -278,6 +333,52 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             game::print_summary(g, stall_reported ? "stall" : "ok", halted ? "halted" : "");
     }
     if (port.on_shutdown) port.on_shutdown(k);
+    std::fflush(stdout);
+    if (k.stopped && k.title_exit.launch) {
+        std::string next = disc_path(k.title_exit.path);
+        std::printf("the title asks for %s", next.empty() ? "the dashboard" : next.c_str());
+        if (!follow_launches || next.empty()) {
+            std::printf("%s\n", next.empty() ? "" : " (--follow-launches starts it)");
+        } else {
+            // a title is a process: the next one starts as boot again on the same disc, with what
+            // the title left it (the launch data) and the time that remains
+            std::printf("; starting it\n");
+            std::fflush(stdout);
+            std::vector<std::string> args;
+            for (int i = 0; i < argc; i++) {
+                std::string a = argv[i];
+                if ((a == "--xex" || a == "--seconds" || a == "--launch-data") && i + 1 < argc) i++;
+                else args.push_back(a);
+            }
+            double used = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            args.insert(args.end(),
+                        {"--xex", next, "--seconds", std::to_string(uint32_t(std::max(1.0, seconds - used)))});
+            if (!k.title_exit.launch_data.empty()) {
+                std::filesystem::path file = o.storage / "launch-data.bin";
+                std::filesystem::create_directories(o.storage, ec);
+                std::ofstream out(file, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(k.title_exit.launch_data.data()),
+                          std::streamsize(k.title_exit.launch_data.size()));
+                args.insert(args.end(), {"--launch-data", file.string()});
+            }
+            std::vector<char *> v;
+#ifdef _WIN32
+            // _spawnv does not quote: an argument with a space (a disc's path) would split
+            for (std::string &s : args)
+                if (s.find(' ') != std::string::npos) s = "\"" + s + "\"";
+#endif
+            for (std::string &s : args) v.push_back(s.data());
+            v.push_back(nullptr);
+#ifdef _WIN32
+            int code = int(_spawnv(_P_WAIT, argv[0], v.data()));
+            std::fflush(stdout);
+            std::_Exit(code < 0 ? 1 : code);
+#else
+            execv(argv[0], v.data());
+            std::_Exit(1);
+#endif
+        }
+    }
     // other threads may still run: no destructors under them
     std::fflush(stdout);
     std::_Exit(0);

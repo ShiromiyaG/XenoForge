@@ -243,6 +243,18 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         std::string why;
         if (!port.set_option(assignment, why)) return fail(why);
     }
+    {
+        // the console's own settings the player chose (config.toml's [system]), before the title runs
+        kernel::SystemSettings system;
+        system.file = o.storage / "xconfig.bin";
+        system.language = uint32_t(std::max(0, settings.system.language));
+        system.country = settings.system.country;
+        system.width = uint32_t(std::max(0, settings.system.width));
+        system.height = uint32_t(std::max(0, settings.system.height));
+        system.widescreen = settings.system.widescreen;
+        system.refresh = settings.system.refresh;
+        kernel::apply_system_settings(*g.kernel, system);
+    }
     std::printf("settings: %s%s\n", config_file.string().c_str(),
                 settings.game.empty() ? "" : (std::string(" (the game's own, ") + title_id + ")").c_str());
     std::filesystem::path key_shots =
