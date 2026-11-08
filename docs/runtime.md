@@ -408,6 +408,23 @@ lists: what the game calls is what gets written next.
   moves with it every millisecond once threads run. On Windows the host
   timer is raised to its finest (0.5 ms), as Xenia does, or the clock and
   short waits would step at 15.6 ms.
+- **The host clock** (`src/kernel/host_clock.cpp`) under the scheduler's:
+  the CPU's own counter scaled by a 64-bit fixed-point multiply, no lock and
+  nothing shared written. x86-64 with an invariant TSC: `rdtscp` (lfence +
+  rdtsc without it), the frequency measured against steady_clock over 30 ms
+  at the first read; ARM64 Linux/Android: `cntvct_el0` (CNTFRQ checked by
+  the same measurement); elsewhere, or with `XF_HOST_CLOCK=steady_clock`,
+  steady_clock. Xenia reads QueryPerformanceCounter and takes a mutex per
+  read (its raw TSC mode takes the frequency from CPUID, Intel only).
+  A bare `rdtsc` costs half as much (9 against 18-21 ns here) but runs ahead
+  of a load still missing the cache: a thread that saw another's store and
+  then read it got values up to 500 ns older than the other's read before
+  the store (`host_clock_test`), a negative interval to a guest timing across
+  threads; so the fence stays. On a host whose QueryPerformanceCounter is
+  the TSC (frequency 10 MHz) the read costs about what it did (20.5-21.3
+  against 21.1-23.4 ns); the gain is the ARM64 counter and no system call
+  where the OS clock is not the TSC. Deadlines go to the host's waits as the
+  time left, so the measured frequency's few ppm never end a wait early.
 
 ## Threads and objects
 
@@ -440,6 +457,25 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
   host scheduler gives each guest thread a host thread with a 16 MB stack
   and a clock thread (timers, KeTimeStampBundle, every millisecond); the
   time base (mftb) is the same clock. The fiber scheduler replaces it.
+- **Polling threads nap.** A zero-interval KeDelayExecutionThread and
+  NtYieldExecution go through `give_up_slice`. Xenia answers both with
+  `Sleep(0)` (and a 100 ns NtDelayExecution for threads below normal
+  priority, which on Windows its priority mapping never reaches), and so did
+  we with `std::this_thread::yield`: both return at once when the host has
+  nothing else to run, so a guest thread polling a flag between zero delays
+  keeps a host core busy as long as it waits (game A: 1.3 M zero delays a
+  second, one core). The host scheduler now counts a thread as polling once
+  it has done nothing but yield, with at most 20 us of guest work between
+  yields, for 200 us; its yields then nap (NtDelayExecution of one unit:
+  the timer's next tick, 0.5-0.6 ms; 50 us on POSIX) until a gap longer than
+  20 us shows it working. The answers and which threads count as ready are
+  unchanged; the poll notices its flag up to a nap later. The fiber
+  scheduler keeps its yields. `XF_SPIN_NAP=0` turns it off; the thread
+  report prints the naps. Game A (attract, 25 s window, contaminated by
+  other agents' load): CPU 1.24 -> 0.42 s a second (Xenia D3D12 1.33), 30 fps
+  all, frame time p5-p95 no wider; KeDelayExecutionThread 39.0 M -> 0.59 M
+  calls in 30 s. Game D's spin is in guest code (two threads of its media
+  DLL, no kernel calls), which this does not reach: 1,711 naps in 30 s.
 - **Safe points**: a thread suspended by another, or with kernel APCs
   queued, stops at its next kernel call (Xenia suspends the host thread
   wherever it is). User APCs run in alertable waits; DPCs run on the

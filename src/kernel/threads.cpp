@@ -18,6 +18,7 @@
 // where Xenia knowingly approximates (priorities, suspension, a DPC left
 // queued after it ran), the NT kernel's behavior, as noted.
 
+#include "host_clock.h"
 #include "objects.h"
 #include "stacks.h"
 
@@ -25,6 +26,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -62,9 +64,31 @@ void fine_host_timer() {
 #endif
 }
 
+// The host's shortest sleep: Xenia's NanoSleep(100) (NtDelayExecution for one
+// 100 ns unit), which ends at the timer's next tick, 0.5-0.6 ms with the
+// timer at its finest; 50 us on POSIX, whose sleeps are as fine as asked.
+void nap() {
+#ifdef _WIN32
+    using Delay = LONG(NTAPI *)(BOOLEAN, PLARGE_INTEGER);
+    static const Delay delay = [] {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll ? reinterpret_cast<Delay>(reinterpret_cast<void *>(GetProcAddress(ntdll, "NtDelayExecution")))
+                     : nullptr;
+    }();
+    LARGE_INTEGER interval;
+    interval.QuadPart = -1;
+    if (delay)
+        delay(FALSE, &interval);
+    else
+        Sleep(1);
+#else
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+#endif
+}
+
 class HostScheduler final : public Scheduler {
 public:
-    explicit HostScheduler(Objects &o) : o_(o), epoch_(std::chrono::steady_clock::now()) {}
+    explicit HostScheduler(Objects &o) : o_(o), epoch_(host_clock::now()) {}
     ~HostScheduler() override {
         {
             std::lock_guard<std::mutex> l(o_.lock);
@@ -131,18 +155,62 @@ public:
 
     void yield() override { std::this_thread::yield(); }
 
+    // A zero-interval delay or NtYieldExecution. Xenia answers both with
+    // Sleep(0), which, like std::this_thread::yield, returns at once when the
+    // host has nothing else to run: a guest thread polling a flag that way
+    // keeps a host core busy for as long as it waits (a game's 1.3 M zero
+    // delays a second). A thread that has done nothing but yield, with at
+    // most SPIN_GAP of guest work between the yields, for SPIN_RUN, is
+    // polling: from then on its yields nap (the host's shortest sleep, as
+    // Xenia does for threads below normal priority) until it does some work.
+    // What the guest sees is unchanged (the answers, which threads are
+    // ready); the poll only notices its flag up to a nap later.
+    // XF_SPIN_NAP=0 keeps every yield a yield.
+    void give_up_slice() override {
+        static const bool napping = [] {
+            const char *v = std::getenv("XF_SPIN_NAP");
+            return !(v && v[0] == '0');
+        }();
+        if (!napping) return yield();
+        thread_local uint64_t returned = 0, polling_since = 0;
+        uint64_t t = now();
+        if (t - returned > SPIN_GAP) polling_since = t;
+        if (t - polling_since >= SPIN_RUN) {
+            naps_.fetch_add(1, std::memory_order_relaxed);
+            nap();
+        } else {
+            yield();
+        }
+        returned = now();
+    }
+
+    std::string report() override {
+        uint64_t n = naps_.load(std::memory_order_relaxed);
+        if (!n) return {};
+        char line[96];
+        std::snprintf(line, sizeof(line), "host scheduler: %llu naps of polling threads\n", (unsigned long long)n);
+        return line;
+    }
+
+    // the host clock (host_clock.h: the CPU's counter, scaled), read by
+    // every mftb: millions of times a second in some games
     uint64_t now() override {
-        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - epoch_)
-                            .count()) /
-               100;
+        uint64_t t = host_clock::now();
+        return t > epoch_ ? t - epoch_ : 0;
     }
 
     void timers_changed() override { clock_cv_.notify_one(); }
 
 private:
-    std::chrono::steady_clock::time_point time_point(uint64_t t) const {
+    // a deadline on now()'s clock as one on steady_clock's, which the host's
+    // waits take: by the time left, so that the two clocks' rates may differ
+    // a little (the counter's frequency is measured) without a wait ending
+    // early or late by the difference accumulated since the start
+    std::chrono::steady_clock::time_point time_point(uint64_t t) {
         constexpr uint64_t CENTURY = 100ull * 365 * 24 * 3600 * 10'000'000;
-        return epoch_ + std::chrono::nanoseconds(std::min(t, CENTURY) * 100);
+        uint64_t current = now();
+        uint64_t left = t > current ? std::min(t - current, CENTURY) : 0;
+        return std::chrono::steady_clock::now() + std::chrono::nanoseconds(left * 100);
     }
 
     // timers and KeTimeStampBundle, every millisecond (Xenia's 1 ms timer)
@@ -155,8 +223,13 @@ private:
         }
     }
 
+    // (100 ns units) the guest work between yields that still counts as
+    // polling, and how long a thread polls before its yields nap
+    static constexpr uint64_t SPIN_GAP = 200, SPIN_RUN = 2'000;
+
     Objects &o_;
-    std::chrono::steady_clock::time_point epoch_;
+    uint64_t epoch_; // host_clock::now() when the scheduler was made
+    std::atomic<uint64_t> naps_{0};
     std::once_flag clock_started_;
     std::thread clock_;
     std::condition_variable clock_cv_;
@@ -528,7 +601,7 @@ std::string Kernel::thread_report() {
         }
         if (!frames.empty()) out += "    stack:" + frames + "\n";
     }
-    out += o.scheduler->report(); // the deterministic mode's counts
+    out += o.scheduler->report(); // the deterministic mode's counts, the host's naps
     return out;
 }
 
@@ -1009,7 +1082,7 @@ XF_EXPORT(xboxkrnl, KeDelayExecutionThread) {
     int64_t interval = int64_t(k.load64(interval_ptr));
     if (!t) return result(c, X_STATUS_SUCCESS);
     if (!interval && !(alertable && o.user_apc_pending(*t))) {
-        o.scheduler->yield();
+        o.scheduler->give_up_slice();
         return result(c, yield_status(o, t));
     }
     uint32_t status = o.wait(*t, {}, false, alertable != 0, o.deadline(interval_ptr));
@@ -1022,7 +1095,7 @@ XF_EXPORT(xboxkrnl, KeDelayExecutionThread) {
 
 XF_EXPORT(xboxkrnl, NtYieldExecution) {
     Objects &o = objects(k);
-    o.scheduler->yield();
+    o.scheduler->give_up_slice();
     result(c, yield_status(o, current_thread()));
 }
 

@@ -470,6 +470,10 @@ public:
     virtual void wake(Thread &t) = 0;
     // another thread may run (spin locks, NtYieldExecution)
     virtual void yield() = 0;
+    // a guest thread gives up its time slice (a zero-interval
+    // KeDelayExecutionThread, NtYieldExecution): yield(), unless the host
+    // scheduler sees it polling (threads.cpp)
+    virtual void give_up_slice() { yield(); }
     // the clock: 100 ns units since the kernel started
     virtual uint64_t now() = 0;
     // the earliest timer (Objects::next_due) changed

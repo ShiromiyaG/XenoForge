@@ -723,6 +723,10 @@ What it showed (2026-11-08, `--render`, 20 to 60 s):
   a `std::map<std::string>` count per import call and its allocations 4%;
 - game B, at its cap: 25 ms a swap, the generated code over 60%, half of
   it the same spin wait (`__savegprlr`/`__restgprlr` 7-10%).
+Since then (docs/runtime.md, "Polling threads nap" and "The host clock"):
+the zero-delay poll naps, which took game A to 27 ms of CPU a swap at 30
+swaps a second; the clock's read was the counter read itself (QPC is the
+TSC with a fence here), which a spin loop only repeats faster.
 So swaps a second do not move with the code's speed in either, and CPU
 time a swap mostly measures the spinning. The measure for the generated
 code's speed is the deterministic mode, which runs every thread on one

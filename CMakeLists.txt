@@ -226,6 +226,11 @@ set(XF_GAME_LIBS "" CACHE PATH "prebuilt game_<name>.lib to link instead of comp
 add_executable(kernel_threads_test tests/kernel_threads_test.cpp)
 target_include_directories(kernel_threads_test PRIVATE src/kernel)
 target_link_libraries(kernel_threads_test PRIVATE xenoforge_kernel xenoforge)
+# the host clock behind the kernel's time (src/kernel/host_clock.h)
+add_executable(host_clock_test tests/host_clock_test.cpp)
+target_include_directories(host_clock_test PRIVATE src/kernel)
+target_link_libraries(host_clock_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME host_clock COMMAND host_clock_test)
 # the same on the deterministic mode's scheduler, and that mode's own test
 # (src/kernel/deterministic.cpp, input recordings)
 add_executable(kernel_threads_deterministic_test tests/kernel_threads_test.cpp)
