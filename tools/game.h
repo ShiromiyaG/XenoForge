@@ -36,6 +36,7 @@ struct Options {
     std::string xex_path = "default.xex"; // the executable on the disc
     std::filesystem::path storage;        // the storage root (content/, cache*/)
     kernel::SystemSettings system;        // the console's language, country and video the player chose
+    kernel::ContentFormat content_format = kernel::ContentFormat::Stfs; // how new saves are kept
     uint64_t steps = 2'000'000'000ull;    // the interpreter's instructions per entry
     bool interpret = false;               // the generated code left out (linked, or a game library)
     // Generated code linked into the executable (xfrecomp emit's modules.cpp: a

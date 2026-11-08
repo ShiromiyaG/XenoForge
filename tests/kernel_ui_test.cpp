@@ -10,6 +10,9 @@
 #include "objects.h"
 #include "xam.h"
 
+#include <thread>
+#include <vector>
+
 using namespace xf;
 using namespace xf::kernel;
 
@@ -184,12 +187,155 @@ void profiles() {
     CHECK(xam("XamShowAchievementsUI", {0, 0}) == X_ERROR_SUCCESS && shown_and_closed());
     if (title) CHECK(xam("XamShowAchievementsUI", {0, title}) == X_ERROR_SUCCESS && shown_and_closed());
     CHECK(xam("XamShowAchievementsUI", {0, title ^ 0x12345678}) == X_ERROR_NO_SUCH_USER);
-    CHECK(xam("XamShowAchievementsUI", {1, 0}) == X_ERROR_NO_SUCH_USER);
+    // with no user the console's XAM answers 0x65B (the oracle); Xenia has NO_SUCH_USER and ACCESS_DENIED
+    CHECK(xam("XamShowAchievementsUI", {1, 0}) == X_ERROR_FUNCTION_FAILED);
     CHECK(xam("XamShowGamerCardUI", {0}) == X_ERROR_SUCCESS && shown_and_closed());
-    CHECK(xam("XamShowGamerCardUI", {1}) == X_ERROR_ACCESS_DENIED);
+    CHECK(xam("XamShowGamerCardUI", {1}) == X_ERROR_FUNCTION_FAILED);
     CHECK(xam("XamShowEditProfileUI", {0}) == X_ERROR_SUCCESS && shown_and_closed());
     CHECK(xam("XamShowEditProfileUI", {2}) == X_ERROR_ACCESS_DENIED);
     CHECK(nothing_queued());
+}
+
+// the pages Xenia does not implement: refused with no user as the console's XAM does, shown for the user signed in
+void family() {
+    const char *pages[] = {"XamShowFriendsUI", "XamShowPlayersUI", "XamShowMessagesUI", "XamShowQuickChatUI"};
+    for (const char *page : pages) {
+        CHECK(xam(page, {0}) == X_ERROR_SUCCESS && shown_and_closed());
+        CHECK(xam(page, {1}) == X_ERROR_ACCESS_DENIED);
+        CHECK(xam(page, {7}) == X_ERROR_ACCESS_DENIED);
+    }
+    CHECK(xam("XamShowFriendRequestUI", {0, 0x0009000000000001ull}) == X_ERROR_SUCCESS && shown_and_closed());
+    CHECK(xam("XamShowFriendRequestUI", {2, 1}) == X_ERROR_ACCESS_DENIED);
+    CHECK(xam("XamShowPlayerReviewUI", {0, 1}) == X_ERROR_SUCCESS && shown_and_closed());
+    CHECK(xam("XamShowPlayerReviewUI", {3, 1}) == X_ERROR_ACCESS_DENIED);
+    CHECK(xam("XamShowGamerCardUIForXUID", {0, 0x0009000000000001ull}) == X_ERROR_SUCCESS && shown_and_closed());
+    CHECK(xam("XamShowGamerCardUIForXUID", {1, 1}) == X_ERROR_FUNCTION_FAILED);
+    // recipients and text: read only for a user shown the page
+    uint32_t recipients = h.alloc(16);
+    h.k->store64(recipients, 0x0009000000000011ull);
+    h.k->store64(recipients + 8, 0x0009000000000022ull);
+    CHECK(xam("XamShowGameInviteUI", {0, recipients, 2, 0}) == X_ERROR_SUCCESS && shown_and_closed());
+    CHECK(xam("XamShowMessageComposeUI", {0, recipients, 2, h.wide(u"hi")}) == X_ERROR_SUCCESS && shown_and_closed());
+    CHECK(xam("XamShowGameInviteUI", {1, 1, 1, 1}) == X_ERROR_ACCESS_DENIED); // (a bad pointer not read)
+    // null arguments: invalid, before the user is looked for (the oracle)
+    CHECK(xam("XamShowCustomMessageComposeUI", {0, 0, 0, 0, 0, 0}) == X_ERROR_INVALID_PARAMETER);
+    CHECK(xam("XamShowCustomMessageComposeUI", {5, 0, 0, 0, 0, 0}) == X_ERROR_INVALID_PARAMETER);
+    CHECK(xam("XamShowCustomMessageComposeUI", {0, recipients, 2, 0, 0, 0}) == X_ERROR_SUCCESS && shown_and_closed());
+    CHECK(xam("XamShowCustomPlayerListUI", {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}) == X_ERROR_INVALID_PARAMETER);
+    CHECK(xam("XamShowCustomPlayerListUI", {0, 0, 0, 0, 0, 0, recipients, 2, 0, 0}) == X_ERROR_SUCCESS &&
+          shown_and_closed());
+    CHECK(nothing_queued());
+}
+
+// A host's handler: the request it is given, an answer that comes later, a cancel, a request it declines.
+void host_handler() {
+    std::vector<UiRequest> seen;
+    UiDone pending;
+    bool take = true, answer_now = false;
+    UiResult now;
+    set_ui_handler(*h.k, [&](const UiRequest &r, UiDone done) {
+        seen.push_back(r);
+        if (!take) return false;
+        if (answer_now) done(now);
+        else pending = done;
+        return true;
+    });
+    auto on = [] { return next() == std::pair<uint32_t, uint32_t>{XN_SYS_UI, 1}; };
+    auto off = [] { return next() == std::pair<uint32_t, uint32_t>{XN_SYS_UI, 0}; };
+
+    // a message box held: the overlapped stays pending and the guide is up until the answer
+    uint32_t box = h.alloc(4), buttons = h.alloc(8);
+    h.k->store32(box, 0xEEEEEEEE);
+    h.k->store32(buttons, h.wide(u"Yes"));
+    h.k->store32(buttons + 4, h.wide(u"No"));
+    Overlapped ov = overlapped();
+    CHECK(xam("XamShowMessageBoxUI", {0, h.wide(u"Title"), h.wide(u"Text"), 2, buttons, 1, 2, box, ov.address}) ==
+          X_ERROR_IO_PENDING);
+    CHECK(seen.size() == 1 && seen[0].kind == UiKind::MessageBox && seen[0].title == u"Title" &&
+          seen[0].text == u"Text" && seen[0].buttons.size() == 2 && seen[0].buttons[1] == u"No" &&
+          seen[0].default_button == 1 && seen[0].user == 0 && seen[0].flags == 2);
+    CHECK(h.k->load32(box) == 0xEEEEEEEE && ov.event->signal_state() == 0 &&
+          h.k->load32(ov.address + xoverlapped::RESULT) == X_ERROR_IO_PENDING);
+    CHECK(xam("XamIsUIActive") == 1 && on() && nothing_queued());
+    UiResult result;
+    result.button = 0;
+    std::thread([&] { pending(result); }).join(); // from another thread
+    CHECK(h.k->load32(box) == 0 && completed(ov, X_ERROR_SUCCESS, X_ERROR_SUCCESS));
+    CHECK(xam("XamIsUIActive") == 0 && off());
+    pending(result); // a second answer changes nothing
+    CHECK(nothing_queued());
+
+    // cancelled: the overlapped's result is ERROR_CANCELLED, the box untouched
+    h.k->store32(box, 0xEEEEEEEE);
+    Overlapped cancelled = overlapped();
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 1, 0, 0, 0, box, cancelled.address}) == X_ERROR_IO_PENDING);
+    result = {};
+    result.cancelled = true;
+    pending(result);
+    CHECK(h.k->load32(box) == 0xEEEEEEEE && completed(cancelled, 0x4C7, 0x4C7) && on() && off());
+
+    // the keyboard answered later: the text, cut to the room
+    uint32_t buffer = h.alloc(64);
+    std::memset(h.k->host(buffer), 0xEE, 64);
+    Overlapped kb = overlapped();
+    CHECK(xam("XamShowKeyboardUI", {0, 4, h.wide(u"Marcus"), h.wide(u"Name"), h.wide(u"Your name"), buffer, 4,
+                                   kb.address}) == X_ERROR_IO_PENDING);
+    CHECK(seen.back().kind == UiKind::Keyboard && seen.back().default_text == u"Marcus" &&
+          seen.back().title == u"Name" && seen.back().text == u"Your name" && seen.back().max_length == 4 &&
+          seen.back().flags == 4);
+    result = {};
+    result.text = u"Zedd!";
+    pending(result);
+    CHECK(h.k->load16(buffer) == 'Z' && h.k->load16(buffer + 4) == 'd' && h.k->load16(buffer + 6) == 0 &&
+          completed(kb, X_ERROR_SUCCESS, X_ERROR_SUCCESS) && on() && off());
+
+    // answered inside the handler, with no overlapped: the call returns the answer
+    answer_now = true;
+    now = {};
+    now.text = u"Now";
+    CHECK(xam("XamShowKeyboardUI", {0, 0, 0, 0, 0, buffer, 8, 0}) == X_ERROR_SUCCESS);
+    CHECK(h.k->load16(buffer) == 'N' && h.k->load16(buffer + 4) == 'w' && on() && off());
+    now = {};
+    now.cancelled = true;
+    CHECK(xam("XamShowKeyboardUI", {0, 0, 0, 0, 0, buffer, 8, 0}) == 0x4C7 && on() && off());
+
+    // the device the user picked
+    uint32_t device = h.alloc(4);
+    now = {};
+    now.device_id = 2;
+    Overlapped sel = overlapped();
+    CHECK(xam("XamShowDeviceSelectorUI", {0xFF, 1, 0, 0x10000, device, sel.address}) == X_ERROR_IO_PENDING);
+    CHECK(seen.back().kind == UiKind::DeviceSelector && seen.back().content_type == 1 &&
+          seen.back().bytes_required == 0x10000);
+    CHECK(h.k->load32(device) == 2 && completed(sel, X_ERROR_SUCCESS, X_ERROR_SUCCESS) && on() && off());
+
+    // a page the title does not wait for: success at once, closed when the host says so
+    answer_now = false;
+    CHECK(xam("XamShowFriendsUI", {0}) == X_ERROR_SUCCESS && seen.back().kind == UiKind::Friends);
+    CHECK(xam("XamIsUIActive") == 1 && on() && nothing_queued());
+    pending(UiResult{});
+    CHECK(xam("XamIsUIActive") == 0 && off());
+    // sign-in: the notification of the users comes when the page closes, not when the host cancels it
+    CHECK(xam("XamShowSigninUI", {1, 0}) == X_ERROR_SUCCESS && seen.back().kind == UiKind::SignIn &&
+          seen.back().users_needed == 1);
+    CHECK(on() && nothing_queued());
+    pending(UiResult{});
+    CHECK((next() == std::pair<uint32_t, uint32_t>{XN_SYS_SIGNINCHANGED, 1}) && off());
+    CHECK(xam("XamShowSigninUI", {1, 0}) == X_ERROR_SUCCESS && on());
+    result = {};
+    result.cancelled = true;
+    pending(result);
+    CHECK(off() && nothing_queued());
+
+    // a handler that declines leaves the request to the default
+    take = false;
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 1, 0, 0, 0, box, ov.address}) == X_ERROR_IO_PENDING);
+    CHECK(h.k->load32(box) == 0 && completed(ov, X_ERROR_SUCCESS, X_ERROR_SUCCESS) && shown_and_closed());
+    CHECK(xam("XamIsUIActive") == 0);
+
+    set_ui_handler(*h.k, nullptr);
+    CHECK(xam("XamShowMessageBoxUI", {0, 0, 0, 1, 0, 0, 0, box, ov.address}) == X_ERROR_IO_PENDING);
+    CHECK(shown_and_closed() && nothing_queued());
 }
 
 void kinect() {
@@ -219,6 +365,8 @@ int main() {
         storage();
         live();
         profiles();
+        family();
+        host_handler();
         kinect();
     }
     return finish("kernel_ui");

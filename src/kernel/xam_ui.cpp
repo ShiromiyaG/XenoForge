@@ -29,42 +29,119 @@
 //     own) and finds no record of any other (X_ERROR_NO_SUCH_USER), as
 //     Xenia's user tracker finds none for a title the profile never played.
 //
-// A player overlay would take over in present() below (docs/runtime.md, "XAM").
+// A host that draws the dialogs sets a UiHandler (kernel.h, set_ui_handler); present() and present_async() below
+// hand each request to it and complete the title's overlapped when it answers (docs/runtime.md, "XAM").
+//
+// What the console's XAM answers with no user (the oracle, xfxam, the system update's own XAM): ERROR_ACCESS_DENIED
+// from the friends, players, messages, quick chat, game invite, friend request, player review and message compose
+// pages; 0x65B (ERROR_FUNCTION_FAILED) from the gamer card, the gamer card for an XUID and the achievements;
+// ERROR_INVALID_PARAMETER from the custom message and player list pages given null arguments. Xenia implements none
+// of the first group and answers the gamer card ERROR_ACCESS_DENIED and the achievements NO_SUCH_USER.
 // Kinect (NUI) is never there: its UI answers X_ERROR_ACCESS_DENIED, as
 // Xenia's NuiHudCheck does with no sensor initialized.
 
 #include "xam.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <future>
+#include <memory>
+#include <mutex>
 
 namespace xf::kernel {
 namespace {
 
 bool signed_in(Kernel &k, uint32_t index) { return index < 4 && user_at(k, index) != nullptr; }
 
+struct UiState {
+    std::mutex mutex;
+    UiHandler handler;
+    std::atomic<int> active{0}; // dialogs a host has taken and not yet answered
+};
+UiState &ui(Kernel &k) { return k.state<UiState>(); }
+
+UiHandler handler_of(Kernel &k) {
+    UiState &s = ui(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    return s.handler;
+}
+
+// The request given to the host. true: it took it, and `finish` runs once with its answer, from whichever thread
+// that is, before the dialog counts as closed (XN_SYS_UI off).
+bool hand_over(Kernel &k, const UiRequest &request, std::function<void(const UiResult &)> finish) {
+    UiHandler handler = handler_of(k);
+    if (!handler) return false;
+    UiState &s = ui(k);
+    s.active++;
+    auto once = std::make_shared<std::atomic<bool>>(false);
+    Kernel *kernel = &k;
+    UiDone done = [kernel, once, finish = std::move(finish)](const UiResult &result) {
+        if (once->exchange(true)) return;
+        finish(result);
+        ui(*kernel).active--;
+        broadcast(*kernel, XN_SYS_UI, 0);
+    };
+    if (handler(request, done)) return true;
+    once->store(true);
+    s.active--;
+    return false;
+}
+
+// writes a dialog's answer into the title's memory and says the status
+using UiApply = std::function<uint32_t(const UiResult &)>;
+
+constexpr uint32_t ERROR_CANCELLED = 0x4C7;
+
 // What the UI does with a dialog: shows it (XN_SYS_UI on), makes its answer,
-// hides it (XN_SYS_UI off). Headless, the answer is the dialog's default,
-// made at once. With an overlapped, the answer completes it and the export
-// returns X_ERROR_IO_PENDING (xeXamDispatchHeadless).
-uint32_t present(Kernel &k, uint32_t ov, const std::function<uint32_t()> &answer) {
+// hides it (XN_SYS_UI off). With no host handler the answer is the dialog's
+// default, made at once. With an overlapped, the answer completes it and the
+// export returns X_ERROR_IO_PENDING (xeXamDispatchHeadless); a host's answer
+// may come later, from another thread, and a cancelled dialog completes it
+// with ERROR_CANCELLED. Without an overlapped a host's answer is waited for.
+uint32_t present(Kernel &k, uint32_t ov, const UiRequest &request, const UiResult &defaults, UiApply apply) {
     broadcast(k, XN_SYS_UI, 1);
-    uint32_t r = run_or_defer(k, ov, [&](uint32_t &extended_error, uint32_t &length) {
-        uint32_t a = answer();
-        extended_error = a, length = 0;
-        return a;
-    });
+    auto status_of = [apply](const UiResult &r) { return r.cancelled ? ERROR_CANCELLED : apply(r); };
+    if (ov) {
+        begin_overlapped(k, ov);
+        Kernel *kernel = &k;
+        if (hand_over(k, request, [kernel, ov, status_of](const UiResult &r) {
+                uint32_t status = status_of(r);
+                complete_overlapped(*kernel, ov, status, status, 0);
+            }))
+            return X_ERROR_IO_PENDING;
+    } else {
+        auto answer = std::make_shared<std::promise<uint32_t>>();
+        std::future<uint32_t> future = answer->get_future();
+        if (hand_over(k, request, [answer, status_of](const UiResult &r) { answer->set_value(status_of(r)); }))
+            return future.get();
+    }
+    // no host: the default, at once
+    uint32_t a = apply(defaults);
+    if (ov) complete_overlapped(k, ov, a, a, 0);
     broadcast(k, XN_SYS_UI, 0);
-    return r;
+    return ov ? X_ERROR_IO_PENDING : a;
 }
 
 // a dialog the export does not wait for (xeXamDispatchHeadlessAsync and
-// xeXamDispatchDialogAsync): X_ERROR_SUCCESS, the answer made as it closes
-uint32_t present_async(Kernel &k, const std::function<void()> &answer) {
+// xeXamDispatchDialogAsync): X_ERROR_SUCCESS, `closed` run as it closes
+// (not when a host cancelled it)
+uint32_t present_async(Kernel &k, const UiRequest &request, std::function<void()> closed = {}) {
     broadcast(k, XN_SYS_UI, 1);
-    answer();
+    if (hand_over(k, request, [closed](const UiResult &r) {
+            if (closed && !r.cancelled) closed();
+        }))
+        return X_ERROR_SUCCESS;
+    if (closed) closed();
     broadcast(k, XN_SYS_UI, 0);
     return X_ERROR_SUCCESS;
+}
+
+UiRequest request_of(UiKind kind, uint32_t user = 0xFF) {
+    UiRequest r;
+    r.kind = kind;
+    r.user = user;
+    return r;
 }
 
 // NUIController::NuiHudCheck: no Kinect sensor initialized
@@ -78,14 +155,23 @@ uint32_t nui_hud_check() { return X_ERROR_ACCESS_DENIED; }
 // Xenia takes them all and answers the default button at once. With a valid
 // request and no UI to show it the console's XAM answers
 // ERROR_FUNCTION_FAILED; here the box is answered headless, as Xenia does.
-uint32_t message_box(Kernel &k, uint32_t user, uint32_t button_count, uint32_t active_button, uint32_t flags,
-                     uint32_t result_ptr, uint32_t ov) {
+uint32_t message_box(Kernel &k, uint32_t user, uint32_t title, uint32_t text, uint32_t button_count, uint32_t buttons,
+                     uint32_t active_button, uint32_t flags, uint32_t result_ptr, uint32_t ov) {
     constexpr uint32_t FLAGS_TAKEN = 0x003FF107;
     if (!ov || (user >= 4 && user != USER_INDEX_ANY) || button_count < 1 || button_count > 3 ||
         active_button >= button_count || !result_ptr || (flags & ~FLAGS_TAKEN))
         return X_ERROR_INVALID_PARAMETER;
-    return present(k, ov, [&] {
-        if (result_ptr) k.store32(result_ptr, active_button); // MESSAGEBOX_RESULT::ButtonPressed
+    UiRequest request = request_of(UiKind::MessageBox, user);
+    if (title) request.title = guest_u16(k, title);
+    if (text) request.text = guest_u16(k, text);
+    for (uint32_t i = 0; buttons && i < button_count; i++)
+        if (uint32_t label = k.load32(buttons + 4 * i)) request.buttons.push_back(guest_u16(k, label));
+    request.default_button = active_button;
+    request.flags = flags;
+    UiResult defaults;
+    defaults.button = active_button;
+    return present(k, ov, request, defaults, [&k, result_ptr](const UiResult &r) {
+        k.store32(result_ptr, r.button); // MESSAGEBOX_RESULT::ButtonPressed
         return X_ERROR_SUCCESS;
     });
 }
@@ -97,14 +183,16 @@ constexpr uint32_t MARKETPLACE_FORCED_NAME_CHANGE_V2 = 8, MARKETPLACE_MAX_ENTRYP
 uint32_t marketplace(Kernel &k, uint32_t user_index, uint32_t ui_type) {
     if (user_index >= 4 || ui_type >= MARKETPLACE_MAX_ENTRYPOINT) return X_ERROR_INVALID_PARAMETER;
     if (!signed_in(k, user_index)) return X_ERROR_NO_SUCH_USER;
-    return present_async(k, [] {});
+    return present_async(k, request_of(UiKind::Marketplace, user_index));
 }
 
 // xeXamShowSigninUI: the profiles needed signed in (the one user is, in
 // slot 0), told with XN_SYS_SIGNINCHANGED and the slots' mask
 uint32_t signin(Kernel &k, uint32_t users_needed) {
     if (users_needed != 1 && users_needed != 2 && users_needed != 4) return X_ERROR_INVALID_PARAMETER;
-    return present_async(k, [&] {
+    UiRequest request = request_of(UiKind::SignIn);
+    request.users_needed = users_needed;
+    return present_async(k, request, [&k, users_needed] {
         uint32_t slots = 0;
         for (uint32_t i = 0, found = 0; i < 4 && found < users_needed; i++)
             if (user_at(k, i)) slots |= 1u << i, found++;
@@ -114,20 +202,22 @@ uint32_t signin(Kernel &k, uint32_t users_needed) {
 
 } // namespace
 
-XF_EXPORT(xam, XamIsUIActive) { result(c, 0); } // no dialog is ever up
+XF_EXPORT(xam, XamIsUIActive) { result(c, ui(k).active.load() > 0); } // a dialog a host has taken and not answered
 
 // ---- message boxes ----
 
 // (user_index, title, text, button_count, buttons, active_button, flags,
 // result, overlapped)
 XF_EXPORT(xam, XamShowMessageBoxUI) {
-    result(c, message_box(k, arg(k, c, 0), arg(k, c, 3), arg(k, c, 5), arg(k, c, 6), arg(k, c, 7), arg(k, c, 8)));
+    result(c, message_box(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), arg(k, c, 5),
+                          arg(k, c, 6), arg(k, c, 7), arg(k, c, 8)));
 }
 
 // (user_index, title, text, button_count, buttons, active_button, flags,
 // unused, result, overlapped)
 XF_EXPORT(xam, XamShowMessageBoxUIEx) {
-    result(c, message_box(k, arg(k, c, 0), arg(k, c, 3), arg(k, c, 5), arg(k, c, 6), arg(k, c, 8), arg(k, c, 9)));
+    result(c, message_box(k, arg(k, c, 0), arg(k, c, 1), arg(k, c, 2), arg(k, c, 3), arg(k, c, 4), arg(k, c, 5),
+                          arg(k, c, 6), arg(k, c, 8), arg(k, c, 9)));
 }
 
 // (tracking_id, user_index, title, text, ...): Kinect's
@@ -141,13 +231,22 @@ XF_EXPORT(xam, XamShowNuiMessageBoxUI) { result(c, nui_hud_check()); }
 // (user_index, flags, default_text, title, description, buffer, length,
 // overlapped): the default text is the answer
 XF_EXPORT(xam, XamShowKeyboardUI) {
-    uint32_t default_text = arg(k, c, 2), buffer = arg(k, c, 5), length = arg(k, c, 6), ov = arg(k, c, 7);
+    uint32_t user = arg(k, c, 0), default_text = arg(k, c, 2), title = arg(k, c, 3), description = arg(k, c, 4);
+    uint32_t buffer = arg(k, c, 5), length = arg(k, c, 6), ov = arg(k, c, 7);
     if (!buffer) return result(c, X_ERROR_INVALID_PARAMETER);
-    result(c, present(k, ov, [&] {
-               if (!default_text)
+    UiRequest request = request_of(UiKind::Keyboard, user);
+    request.flags = arg(k, c, 1);
+    if (default_text) request.default_text = guest_u16(k, default_text);
+    if (title) request.title = guest_u16(k, title);
+    if (description) request.text = guest_u16(k, description);
+    request.max_length = length;
+    UiResult defaults;
+    defaults.text = request.default_text;
+    result(c, present(k, ov, request, defaults, [&k, buffer, length](const UiResult &r) {
+               if (r.text.empty())
                    std::memset(k.host(buffer), 0, size_t(length) * 2);
                else
-                   put_u16(k, buffer, guest_u16(k, default_text), length);
+                   put_u16(k, buffer, r.text, length);
                return X_ERROR_SUCCESS;
            }));
 }
@@ -163,8 +262,14 @@ XF_EXPORT(xam, XamShowDeviceSelectorUI) {
         k.store32(ov + xoverlapped::EXTENDED_ERROR, X_ERROR_INVALID_PARAMETER);
         return result(c, X_ERROR_INVALID_PARAMETER);
     }
-    result(c, present(k, ov, [&] {
-               k.store32(device_ptr, 1); // the HDD (xam_content.cpp's devices)
+    UiRequest request = request_of(UiKind::DeviceSelector, index);
+    request.content_type = arg(k, c, 1);
+    request.flags = flags;
+    request.bytes_required = arg64(k, c, 3);
+    UiResult defaults;
+    defaults.device_id = 1; // the HDD (xam_content.cpp's devices)
+    result(c, present(k, ov, request, defaults, [&k, device_ptr](const UiResult &r) {
+               k.store32(device_ptr, r.device_id);
                return X_ERROR_SUCCESS;
            }));
 }
@@ -206,10 +311,11 @@ XF_EXPORT(xam, XamShowMarketplaceDownloadItemsUI) {
         complete_overlapped_immediate(k, ov, X_ERROR_NO_SUCH_USER);
         return result(c, X_ERROR_IO_PENDING);
     }
-    result(c, present(k, ov, [&] {
-               if (hresult_ptr) k.store32(hresult_ptr, X_E_SUCCESS);
-               return X_ERROR_SUCCESS;
-           }));
+    result(c, present(k, ov, request_of(UiKind::Marketplace, index), UiResult{},
+                      [&k, hresult_ptr](const UiResult &) {
+                          if (hresult_ptr) k.store32(hresult_ptr, X_E_SUCCESS);
+                          return X_ERROR_SUCCESS;
+                      }));
 }
 
 // (user_index, unknown, title_id) and (user_index): no Gold to buy
@@ -249,20 +355,110 @@ XF_EXPORT(xam, XamShowCreateProfileUI) { result(c, X_ERROR_SUCCESS); }
 // (user_index, title_id): the running title's achievements, shown and closed
 XF_EXPORT(xam, XamShowAchievementsUI) {
     uint32_t index = arg(k, c, 0), title = arg(k, c, 1);
-    if (!user_at(k, index)) return result(c, X_ERROR_NO_SUCH_USER);
+    if (!user_at(k, index)) return result(c, X_ERROR_FUNCTION_FAILED); // the console's XAM, no user: 0x65B
     if (title && title != title_id(k)) return result(c, X_ERROR_NO_SUCH_USER);
-    result(c, present_async(k, [] {}));
+    result(c, present_async(k, request_of(UiKind::Achievements, index)));
 }
 
 // (user_index): the user's gamer card, and the profile editor
 XF_EXPORT(xam, XamShowGamerCardUI) {
-    if (!user_at(k, arg(k, c, 0))) return result(c, X_ERROR_ACCESS_DENIED);
-    result(c, present_async(k, [] {}));
+    if (!user_at(k, arg(k, c, 0))) return result(c, X_ERROR_FUNCTION_FAILED);
+    result(c, present_async(k, request_of(UiKind::GamerCard, arg(k, c, 0))));
 }
 
 XF_EXPORT(xam, XamShowEditProfileUI) {
     if (!user_at(k, arg(k, c, 0))) return result(c, X_ERROR_ACCESS_DENIED);
-    result(c, present_async(k, [] {}));
+    result(c, present_async(k, request_of(UiKind::EditProfile, arg(k, c, 0))));
+}
+
+// ---- the pages Xenia does not implement ----
+
+namespace {
+// a page of Live's: the console's XAM refuses with ERROR_ACCESS_DENIED where no user is signed in (the oracle,
+// above); a signed-in user is shown the page, closed at once headless
+uint32_t live_page(Kernel &k, UiRequest request) {
+    if (!user_at(k, request.user)) return X_ERROR_ACCESS_DENIED;
+    return present_async(k, request);
+}
+
+// (the XUIDs `count` points to, as a title passes a recipient list)
+std::vector<uint64_t> xuid_list(Kernel &k, uint32_t list, uint32_t count) {
+    std::vector<uint64_t> out;
+    if (list && count <= 0x100)
+        for (uint32_t i = 0; i < count; i++) out.push_back(k.load64(list + 8 * i));
+    return out;
+}
+
+uint32_t gamer_card_for_xuid(Kernel &k, ppc::Context &c) {
+    if (!user_at(k, arg(k, c, 0))) return X_ERROR_FUNCTION_FAILED;
+    UiRequest request = request_of(UiKind::GamerCard, arg(k, c, 0));
+    request.xuid = arg64(k, c, 1);
+    return present_async(k, request);
+}
+} // namespace
+
+// (user_index): the friends list, the recent players, the messages, quick chat
+XF_EXPORT(xam, XamShowFriendsUI) { result(c, live_page(k, request_of(UiKind::Friends, arg(k, c, 0)))); }
+XF_EXPORT(xam, XamShowFriendsUIp) { result(c, live_page(k, request_of(UiKind::Friends, arg(k, c, 0)))); }
+XF_EXPORT(xam, XamShowPlayersUI) { result(c, live_page(k, request_of(UiKind::Players, arg(k, c, 0)))); }
+XF_EXPORT(xam, XamShowMessagesUI) { result(c, live_page(k, request_of(UiKind::Messages, arg(k, c, 0)))); }
+XF_EXPORT(xam, XamShowQuickChatUI) { result(c, live_page(k, request_of(UiKind::QuickChat, arg(k, c, 0)))); }
+XF_EXPORT(xam, XamShowQuickChatUIp) { result(c, live_page(k, request_of(UiKind::QuickChat, arg(k, c, 0)))); }
+
+// (user_index, XUID): a friend request, a player's review, a gamer card by XUID. The gamer card is refused with
+// 0x65B with no user, as the gamer card of the user's own is.
+XF_EXPORT(xam, XamShowFriendRequestUI) {
+    UiRequest request = request_of(UiKind::FriendRequest, arg(k, c, 0));
+    request.xuid = arg64(k, c, 1);
+    result(c, live_page(k, request));
+}
+XF_EXPORT(xam, XamShowPlayerReviewUI) {
+    UiRequest request = request_of(UiKind::PlayerReview, arg(k, c, 0));
+    request.xuid = arg64(k, c, 1);
+    result(c, live_page(k, request));
+}
+XF_EXPORT(xam, XamShowGamerCardUIForXUID) { result(c, gamer_card_for_xuid(k, c)); }
+XF_EXPORT(xam, XamShowGamerCardUIForXUIDp) { result(c, gamer_card_for_xuid(k, c)); }
+
+// (user_index, recipients (XUIDs), count, text): a game invite, a message to compose
+XF_EXPORT(xam, XamShowGameInviteUI) {
+    UiRequest request = request_of(UiKind::GameInvite, arg(k, c, 0));
+    if (user_at(k, request.user)) request.xuids = xuid_list(k, arg(k, c, 1), arg(k, c, 2));
+    if (uint32_t text = arg(k, c, 3); text && user_at(k, request.user)) request.text = guest_u16(k, text);
+    result(c, live_page(k, request));
+}
+XF_EXPORT(xam, XamShowMessageComposeUI) {
+    UiRequest request = request_of(UiKind::MessageCompose, arg(k, c, 0));
+    if (user_at(k, request.user)) request.xuids = xuid_list(k, arg(k, c, 1), arg(k, c, 2));
+    if (uint32_t text = arg(k, c, 3); text && user_at(k, request.user)) request.text = guest_u16(k, text);
+    result(c, live_page(k, request));
+}
+
+// (user_index, recipients, count, ...) and (user_index, flags, title, description, image, image_size, players,
+// count, ...): the console's XAM answers ERROR_INVALID_PARAMETER to null arguments before it looks for a user
+// (the oracle); what else it checks is not known, and the list's arguments are the XDK's documented ones
+XF_EXPORT(xam, XamShowCustomMessageComposeUI) {
+    if (!arg(k, c, 1) || !arg(k, c, 2)) return result(c, X_ERROR_INVALID_PARAMETER);
+    UiRequest request = request_of(UiKind::CustomMessageCompose, arg(k, c, 0));
+    if (user_at(k, request.user)) request.xuids = xuid_list(k, arg(k, c, 1), arg(k, c, 2));
+    result(c, live_page(k, request));
+}
+XF_EXPORT(xam, XamShowCustomPlayerListUI) {
+    if (!arg(k, c, 6) || !arg(k, c, 7)) return result(c, X_ERROR_INVALID_PARAMETER);
+    UiRequest request = request_of(UiKind::CustomPlayerList, arg(k, c, 0));
+    request.flags = arg(k, c, 1);
+    if (user_at(k, request.user)) {
+        if (uint32_t title = arg(k, c, 2)) request.title = guest_u16(k, title);
+        if (uint32_t text = arg(k, c, 3)) request.text = guest_u16(k, text);
+        request.xuids = xuid_list(k, arg(k, c, 6), arg(k, c, 7));
+    }
+    result(c, live_page(k, request));
+}
+
+void set_ui_handler(Kernel &k, UiHandler handler) {
+    UiState &s = ui(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    s.handler = std::move(handler);
 }
 
 // ---- Kinect ----

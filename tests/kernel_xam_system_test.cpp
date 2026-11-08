@@ -136,6 +136,7 @@ uint32_t overlapped() { return alloc(0x1C); }
 
 void content(ppc::Context &c) {
     scratch_next = 0;
+    set_content_format(*K, ContentFormat::Directory); // Xenia's directory packages: the headers beside them
     auto title = storage / "content" / "B13EBABEBABEBABE" / "00000000";
     auto header_of = [&](const char *name) {
         return host_read(title / "Headers" / "00000001" / (std::string(name) + ".header"));
@@ -272,6 +273,28 @@ void content(ppc::Context &c) {
     CHECK(!std::filesystem::exists(title / "00000001" / "slot1"));
     CHECK(xam(c, "XamContentDeleteInternal", {internal, 0}) == X_ERROR_FILE_NOT_FOUND);
     xam(c, "XamContentRegisterChangeCallback", {0x82001000});
+
+    // the same in an STFS package: a thumbnail set while it is mounted goes into the package at the close, and
+    // one set on the package file at rest is patched into its header, the content ID made again
+    set_content_format(*K, ContentFormat::Stfs);
+    uint32_t sdata = content_data(1, 1, u"Slot S", "slots");
+    CHECK(xam(c, "XamContentCreate", {0, root, sdata, 1, disposition, license, 0}) == X_ERROR_SUCCESS);
+    CHECK(xam(c, "XamContentSetThumbnail", {0, sdata, text("MOUNTED"), 7, 0}) == X_ERROR_SUCCESS);
+    CHECK(xam(c, "XamContentClose", {root, 0}) == X_ERROR_SUCCESS);
+    auto package = title / "00000001" / "slots";
+    {
+        std::string error;
+        auto p = xf::Package::open(package, error);
+        CHECK(p && p->thumbnail().size() == 7 && std::memcmp(p->thumbnail().data(), "MOUNTED", 7) == 0);
+    }
+    CHECK(xam(c, "XamContentSetThumbnail", {0, sdata, text("AT-REST"), 7, 0}) == X_ERROR_SUCCESS);
+    {
+        std::string error;
+        auto p = xf::Package::open(package, error);
+        CHECK(p && p->thumbnail().size() == 7 && std::memcmp(p->thumbnail().data(), "AT-REST", 7) == 0 &&
+              p->warnings().empty());
+    }
+    CHECK(xam(c, "XamContentDelete", {0, sdata, 0}) == X_ERROR_SUCCESS);
 }
 
 // ---- the devices and the disc ----

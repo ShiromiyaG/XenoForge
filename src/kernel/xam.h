@@ -82,6 +82,9 @@ void complete_overlapped(Kernel &k, uint32_t overlapped, uint32_t result, uint32
 void complete_overlapped_immediate(Kernel &k, uint32_t overlapped, uint32_t result);
 void complete_overlapped_immediate_ex(Kernel &k, uint32_t overlapped, uint32_t result, uint32_t extended_error,
                                       uint32_t length);
+// The first half of a deferred completion: the request pending (result X_ERROR_IO_PENDING, the calling thread in
+// the context, the event cleared). complete_overlapped finishes it, from any thread, whenever the work is done.
+void begin_overlapped(Kernel &k, uint32_t overlapped);
 // CompleteOverlappedDeferredEx, run at once here (Xenia runs it 25 ms later
 // on its dispatch thread): returns X_ERROR_IO_PENDING
 using OverlappedRun = std::function<uint32_t(uint32_t &extended_error, uint32_t &length)>;

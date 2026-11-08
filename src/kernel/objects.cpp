@@ -429,10 +429,10 @@ uint32_t Objects::wait(Thread &self, std::span<Dispatcher *const> objects, bool 
         self.wait_all = all, self.alertable = alertable;
         self.wait_status = X_STATUS_PENDING;
         for (uint32_t i = 0; i < objects.size(); i++) objects[i]->waiters.push_back({&self, i});
-        self.blocked = Thread::Blocked::Wait;
+        self.set_blocked(Thread::Blocked::Wait);
         k.host(self.kthread())[kthread::STATE] = kthread::WAITING;
         scheduler->block(self, l, deadline);
-        self.blocked = Thread::Blocked::No;
+        self.set_blocked(Thread::Blocked::No);
         k.host(self.kthread())[kthread::STATE] = kthread::RUNNING;
         status = self.wait_status;
         if (status == X_STATUS_PENDING) { // the deadline (or a spurious wake): look again

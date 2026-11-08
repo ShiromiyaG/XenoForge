@@ -878,10 +878,8 @@ entries, names any case.
   (`content/<XUID>/<TITLE>/<TYPE>/<name>`) is opened by XamContentCreate
   with disposition open: its first bytes are its header (no header file),
   its license mask the or of the licenses', and it is listed by the
-  enumerators. Left: creating or writing STFS (Xenia's
-  ContentPackageContainer writes it; new content here is a directory
-  package), the hash and signature checks (Xenia does none), and deleting
-  an SVOD's `.data` with it.
+  enumerators. Left: the hash and signature checks (Xenia does none), and
+  deleting an SVOD's `.data` with it. Writing STFS is below, "The storage root".
 - **File objects** are dispatchers (an auto-reset event in guest memory,
   set when a request completes, as Xenia's XFile is waitable). A request
   that fails, or is made on a handle opened with FILE_SYNCHRONOUS_IO_*,
@@ -911,10 +909,35 @@ entries, names any case.
 - **The storage root** (`boot --content <dir>`, a temporary directory's
   `xenoforge` by default; never in the repository) has Xenia's layout, so
   saves are shared with it: `cache0`, `cache1` and `cache` (`cache0:`...),
-  and `content/<XUID>/<TITLE>/<TYPE>/<name>/` for a package with its header
-  at `content/<XUID>/<TITLE>/Headers/<TYPE>/<name>.header` (Xenia's
+  and `content/<XUID>/<TITLE>/<TYPE>/<name>` for a package: an STFS file
+  (below), or a directory with its header at
+  `content/<XUID>/<TITLE>/Headers/<TYPE>/<name>.header` (Xenia's
   XContentContainerHeader). The user is Xenia's default profile (XUID
   B13EBABEBABEBABE), or the first profile Xenia made there.
+- **STFS writing** (2026-11-08; `src/package_write.cpp`, xam_content.cpp). Saves
+  and other content a title creates are real STFS packages, the files the
+  console keeps (`CON ` magic, read-write hash tables with a primary and a
+  secondary table at each level, the file table first, consecutive file blocks,
+  SHA-1 hashes up to the volume descriptor's top hash, the content ID the SHA-1
+  of the metadata), read by `xf::Package` and by Xenia's reader (whose
+  `stfs_container_device` this follows; Xenia itself writes none: it keeps
+  directory packages). While a title has one open it is a directory device in
+  `<storage>/content-work/...` (extracted from the file, or new); XamContentClose
+  and XamContentFlush write the package file whole (to `<name>.tmp`, then a
+  rename: never half a package), the close removes the working directory, and
+  one found at an open (a run that never closed it) is what the title sees,
+  so a crash loses nothing. A new package is written empty at once, so it exists
+  and lists. A package of another form (LIVE, PIRS, SVOD, a directory) stays as it
+  is, read-only or writable as before. `ContentFormat::Directory`
+  (`set_content_format`, boot's `--directory-saves`) keeps Xenia's directory
+  packages for new content. The CON signature is zero: signing needs the
+  console's private key from its key vault, which a player's machine and this
+  repository do not have (the keys at the player's disposal are the 1BL's, which
+  signs nothing); Xenia's reader and ours do not check it, a console would refuse
+  the package. Names are 1 to 40 Windows-1252 bytes (a longer one fails the write
+  and keeps the working directory, with a message); no blocks are left free. Not
+  done: more than 4.9 M blocks (the format's three hash levels), a console's
+  in-place transactions (the package is rewritten whole at each flush).
 - `XF_LOG_FILES=1` logs each open and attribute query with its answer.
 
 ## XAM
@@ -961,18 +984,39 @@ dialog: each XamShow*UI answers as Xenia does headless, with the dialog's
 default (a message box's focused button, the keyboard's default text, the
 hard drive from the device selector, sign-in with the user already there
 and XN_SYS_SIGNINCHANGED, the marketplace's downloads succeeded), completes
-its overlapped, and sends XN_SYS_UI on and off around the answer (Xenia
-sends "off" 200 ms later). Kinect's UI is refused (no sensor), the party,
-community and Gold upgrade pages fail, XamIsUIActive is always 0. A player
-overlay would plug in at `present` and `present_async` in xam_ui.cpp, the
-one place every dialog goes through: it would send XN_SYS_UI on, show the
-dialog (title, text, buttons, default) on the player's thread, and make the
-answer when the player closes it, completing the overlapped then (the
-export already returns ERROR_IO_PENDING) and sending XN_SYS_UI off;
-XamIsUIActive would answer whether one is up, and XNotifyQueueUI's toasts
-(printed now, by xam_info.cpp) would be drawn by it. The XamShow*UI calls Xenia does not
-implement either (the friends, players, messages, game invites, gamer card
-for a XUID...) stay unimplemented here: counted, answering 0.
+its overlapped, and sends "off" 200 ms later). Kinect's UI is refused (no sensor), the party,
+community and Gold upgrade pages fail.
+
+**A host for the dialogs** (`UiHandler`, kernel.h; 2026-11-08). `set_ui_handler`
+gives the kernel a callback that is handed each request (a `UiRequest`: the kind,
+the user, a message box's title, text, buttons and default, the keyboard's default
+text and room, the device selector's type and size, the other player's XUID and the
+recipients) and an `UiDone` to call with the answer (a `UiResult`: the button, the
+text, the device, or cancelled), now or later, from any thread. It returns false to
+leave a request to the default. While it holds one the title's overlapped stays
+pending (`begin_overlapped`, finished by `complete_overlapped` when `UiDone` runs;
+without an overlapped the call waits for it), XamIsUIActive answers 1, XN_SYS_UI is
+"on" and goes "off" when the answer comes; a cancelled dialog completes its
+overlapped with ERROR_CANCELLED (0x4C7), as the XDK documents for a dialog the user
+backs out of, and a page the title does not wait for (sign-in, achievements, gamer
+card, the friends pages) returns success at once and runs its follow-up (the sign-in
+notification) when it closes, not when it is cancelled. With no handler every dialog
+answers as before. The overlay itself (drawing the requests on the player's
+window) is the player's work; XNotifyQueueUI's toasts (printed now, by
+xam_info.cpp) would be drawn by it too.
+
+The pages Xenia does not implement are in: friends (`XamShowFriendsUI`, `...UIp`),
+players, messages, quick chat (`...UIp`), game invite, friend request, player
+review, message compose, gamer card for an XUID (`...UIp`), custom message compose
+and custom player list. The console's XAM with no user (the oracle) answers
+ERROR_ACCESS_DENIED to the first group, 0x65B (ERROR_FUNCTION_FAILED) to the gamer
+cards and the achievements (Xenia answers the gamer card ACCESS_DENIED and the
+achievements NO_SUCH_USER), and ERROR_INVALID_PARAMETER to the two custom pages
+given null arguments, before it looks for the user; the recipients of an invite or
+a message are read only for a user that is signed in (the console's XAM reads them
+first: a bad pointer faults there). With a user the pages are shown and closed at
+once, headless; what else the console checks (the custom pages' arguments, what a
+non-Live profile is shown) is not known without a signed-in console.
 
 The network is offline, as Xenia's answers make it: no Ethernet link, the
 title's address the loopback, DNS and QoS lookups failed at once. The
@@ -1433,8 +1477,15 @@ atomic add on the `Import` itself (`CallCount`), summed by name when a report as
 (`Kernel::calls`, `unimplemented`): the same boot made 72.5 M of those calls in
 20 s (1.6 times the rate, same 30 swaps a second). Game B's kernel calls are
 about 1 M in 20 s; its time is the game's and the disc's. Left: `yield_status`
-(the answer a yield gives) walks the thread list under the dispatcher's lock on
-every yield.
+(the answer a yield gives) walked the thread list under the dispatcher's lock on
+every yield; it is now one atomic read of a count of ready threads
+(`Thread::refresh_ready`, kept under the lock where a thread starts, ends, blocks or
+wakes). Game A, 25 s, the same machine: 37.1 s of CPU before (6.1 kernel) and 28.6 s
+after (5.3 kernel), Xenia's 30.4 s (7.5 kernel); the swaps are 27-30 a second in
+both. A per-thread look at games A and B in steady state found no other kernel hot
+spot: A's spinning thread costs 0.23 us a call (the import's counters, the
+safe-point checks and `SwitchToThread`, 0.8 s of kernel in 15 s), B spends 99% of
+its CPU in generated code.
 
 **Exports the console's XAM imports and Xenia lacks, as they come:**
 `RtlAppendStringToString` and `NtDeleteFile` (NT's; the second answers

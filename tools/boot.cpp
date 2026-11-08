@@ -120,7 +120,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                         "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
                         "[--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
                         "[--language N] [--country N] [--resolution WxH] [--widescreen 0|1] [--refresh 50|60] "
-                        "[--follow-launches] [--launch-data <file>] [--option <key>=<value>]...\n";
+                        "[--follow-launches] [--launch-data <file>] [--option <key>=<value>]... [--directory-saves]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -148,6 +148,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             seconds = uint32_t(std::strtoul(argv[++k], nullptr, 10));
         else if (a == "--content" && k + 1 < argc)
             o.storage = argv[++k];
+        else if (a == "--directory-saves")
+            o.content_format = kernel::ContentFormat::Directory;
         else if (a == "--interpret")
             o.interpret = true;
         else if (a == "--cache" && k + 1 < argc)

@@ -28,6 +28,7 @@ add_library(xenoforge STATIC
     src/des.cpp
     src/disc.cpp
     src/package.cpp
+    src/package_write.cpp
     src/exports.cpp
     src/xex.cpp
     src/lzx.cpp
@@ -551,6 +552,11 @@ target_include_directories(package_test PRIVATE src/kernel)
 target_link_libraries(package_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME package COMMAND package_test)
 set_tests_properties(package PROPERTIES TIMEOUT 120)
+# writing STFS packages and reading them back
+add_executable(package_write_test tests/package_write_test.cpp)
+target_link_libraries(package_write_test PRIVATE xenoforge)
+add_test(NAME package_write COMMAND package_write_test)
+set_tests_properties(package_write PROPERTIES TIMEOUT 300)
 # the files family and XAM, through their exports on a guest thread
 add_executable(kernel_files_test tests/kernel_files_test.cpp)
 target_include_directories(kernel_files_test PRIVATE src/kernel)

@@ -317,6 +317,13 @@ uint32_t Thread::create(const Params &p) {
     return X_STATUS_SUCCESS;
 }
 
+void Thread::refresh_ready() {
+    bool now = started && !terminated && blocked == Blocked::No;
+    if (now == ready) return;
+    ready = now;
+    owner.ready_threads.fetch_add(now ? 1 : -1, std::memory_order_relaxed);
+}
+
 void Thread::body() {
     Objects &o = owner;
     Kernel &k = o.k;
@@ -324,10 +331,11 @@ void Thread::body() {
     {
         std::unique_lock<std::mutex> l(o.lock);
         started = true;
+        refresh_ready();
         while (suspend_count > 0) {
-            blocked = Blocked::Suspended;
+            set_blocked(Blocked::Suspended);
             o.scheduler->block(*this, l, Scheduler::NEVER);
-            blocked = Blocked::No;
+            set_blocked(Blocked::No);
         }
         pending.fetch_and(~uint32_t(PENDING_SUSPEND));
         k.host(guest)[kthread::STATE] = kthread::RUNNING;
@@ -383,6 +391,7 @@ void Thread::body() {
     list_remove(k, t + kthread::PROCESS_THREADS);
     k.store32(process + kprocess::THREAD_COUNT, k.load32(process + kprocess::THREAD_COUNT) - 1);
     terminated = true;
+    refresh_ready();
     set_signal_state(1);
     o.signaled(*this);
     std::erase(o.threads, this);
@@ -428,9 +437,9 @@ void Objects::safe_point(Thread &t) {
     if (p & Thread::PENDING_SUSPEND) {
         std::unique_lock<std::mutex> l(lock);
         while (t.suspend_count > 0) {
-            t.blocked = Thread::Blocked::Suspended;
+            t.set_blocked(Thread::Blocked::Suspended);
             scheduler->block(t, l, Scheduler::NEVER);
-            t.blocked = Thread::Blocked::No;
+            t.set_blocked(Thread::Blocked::No);
         }
         t.pending.fetch_and(~uint32_t(Thread::PENDING_SUSPEND));
     }
@@ -781,9 +790,9 @@ uint32_t suspend(Objects &o, Thread &t, std::unique_lock<std::mutex> &l) {
     o.k.host(t.kthread())[kthread::SUSPEND_COUNT] = uint8_t(t.suspend_count);
     if (&t == current_thread()) {
         while (t.suspend_count > 0) {
-            t.blocked = Thread::Blocked::Suspended;
+            t.set_blocked(Thread::Blocked::Suspended);
             o.scheduler->block(t, l, Scheduler::NEVER);
-            t.blocked = Thread::Blocked::No;
+            t.set_blocked(Thread::Blocked::No);
         }
     } else {
         t.pending.fetch_or(Thread::PENDING_SUSPEND);
@@ -972,12 +981,11 @@ XF_EXPORT(xboxkrnl, KeEnableFpuExceptions) {
 // is STATUS_NO_YIELD_PERFORMED (0x40000024) when no other thread is ready on the processor, success when one ran
 // (the oracle: with only the caller running it answers 0x40000024; Xenia answers 0 always). Ready here: another
 // guest thread that has started, has not finished, and is not blocked.
+// The count behind it is kept by Thread::refresh_ready, so the answer is one atomic read: the yield path ran
+// 3.6 M times a second in a game and used to walk the thread list under the dispatcher lock each time.
 static uint32_t yield_status(Objects &o, Thread *self) {
-    std::lock_guard<std::mutex> l(o.lock);
-    for (Thread *t : o.threads)
-        if (t != self && t->started && !t->finished && !t->terminated && t->blocked == Thread::Blocked::No)
-            return X_STATUS_SUCCESS;
-    return X_STATUS_NO_YIELD_PERFORMED;
+    int others = o.ready_threads.load(std::memory_order_relaxed) - (self && self->ready ? 1 : 0);
+    return others > 0 ? X_STATUS_SUCCESS : X_STATUS_NO_YIELD_PERFORMED;
 }
 
 // (mode, alertable, interval *): a null interval is not a zero wait. The

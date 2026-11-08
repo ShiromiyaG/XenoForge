@@ -108,7 +108,7 @@ void complete_overlapped_immediate(Kernel &k, uint32_t ov, uint32_t result) {
     complete_overlapped_immediate_ex(k, ov, result, result, result ? 0xFFFFFFFF : 0);
 }
 
-uint32_t complete_overlapped_deferred(Kernel &k, uint32_t ov, const OverlappedRun &run) {
+void begin_overlapped(Kernel &k, uint32_t ov) {
     k.store32(ov + xoverlapped::RESULT, X_ERROR_IO_PENDING);
     k.store32(ov + xoverlapped::CONTEXT, current_thread_handle());
     Objects &o = objects(k);
@@ -118,6 +118,10 @@ uint32_t complete_overlapped_deferred(Kernel &k, uint32_t ov, const OverlappedRu
             e->set_signal_state(0);
         }
     }
+}
+
+uint32_t complete_overlapped_deferred(Kernel &k, uint32_t ov, const OverlappedRun &run) {
+    begin_overlapped(k, ov);
     uint32_t extended_error = 0, length = 0;
     uint32_t result = run(extended_error, length);
     complete_overlapped(k, ov, result, extended_error, length);

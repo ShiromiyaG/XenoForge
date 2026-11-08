@@ -166,6 +166,13 @@ bool mount_disc(Kernel &k, const std::filesystem::path &iso, std::string &error)
 bool mount_directory(Kernel &k, const std::filesystem::path &dir, std::string &error);
 bool mount_storage(Kernel &k, const std::filesystem::path &root, std::string &error);
 
+// How content a title creates (saves, caches) is kept under the content root: as STFS packages, files the console
+// and Xenia's reader take (the default; a package is a working directory while a title has it open and is written
+// as a package file when it closes it, xam_content.cpp), or as Xenia's directory packages. Existing content keeps
+// the form it has. Set before the title runs.
+enum class ContentFormat { Stfs, Directory };
+void set_content_format(Kernel &k, ContentFormat format);
+
 // The DVD tray's state as the system management controller has it
 // (misc.cpp; Xenia's X_DVD_TRAY_STATE: 0 open, 2 closed), for
 // XamLoaderGetDvdTrayState.
@@ -211,6 +218,44 @@ struct SystemSettings {
     int refresh = 0;            // 50 or 60 Hz
 };
 void apply_system_settings(Kernel &k, const SystemSettings &settings);
+
+// The system's dialogs (the guide: message boxes, the keyboard, the device selector, sign-in, the friends, messages,
+// gamer card and other pages; xam_ui.cpp). With no handler each answers as a headless system does: the dialog's
+// default (the focused button, the default text, the hard drive, the user already signed in), at once. A host that
+// draws an overlay sets a handler: it is given each request and, when it takes it (returns true), calls `done`
+// with the user's answer, now or later and from any thread; until then the title's overlapped stays pending, the
+// guide counts as up (XamIsUIActive) and XN_SYS_UI is "on". A cancelled dialog completes its overlapped with
+// ERROR_CANCELLED, as the console's does when the user backs out. A handler that returns false leaves the request
+// to the default.
+enum class UiKind : uint32_t {
+    MessageBox, Keyboard, DeviceSelector, SignIn, Marketplace, Achievements, GamerCard, EditProfile, Friends,
+    Messages, Players, QuickChat, GameInvite, FriendRequest, PlayerReview, MessageCompose, CustomMessageCompose,
+    CustomPlayerList, Other,
+};
+struct UiRequest {
+    UiKind kind = UiKind::Other;
+    uint32_t user = 0xFF;                // the user index the title asked for (0xFF: any)
+    uint64_t xuid = 0;                   // the other player: gamer card, friend request, review
+    std::vector<uint64_t> xuids;         // recipients, players
+    std::u16string title, text;          // a message box's, a keyboard's title and description, a message's text
+    std::vector<std::u16string> buttons; // a message box's, in order
+    uint32_t default_button = 0;         // the focused one
+    uint32_t flags = 0;                  // the message box's icon and style, the device selector's, the keyboard's
+    std::u16string default_text;         // the keyboard's
+    uint32_t max_length = 0;             // the keyboard's, in characters
+    uint32_t content_type = 0;           // the device selector's
+    uint64_t bytes_required = 0;         // the device selector's
+    uint32_t users_needed = 0;           // sign-in's
+};
+struct UiResult {
+    bool cancelled = false;
+    uint32_t button = 0;     // the message box's button pressed
+    std::u16string text;     // the keyboard's text
+    uint32_t device_id = 1;  // the device selector's (1: the hard drive)
+};
+using UiDone = std::function<void(const UiResult &)>;
+using UiHandler = std::function<bool(const UiRequest &, UiDone done)>;
+void set_ui_handler(Kernel &k, UiHandler handler);
 
 // The launch data the next title finds through XamLoaderGetLaunchData (what
 // the title before it set with XamLoaderSetLaunchData; Kernel::title_exit),

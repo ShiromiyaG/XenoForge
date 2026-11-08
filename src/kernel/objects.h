@@ -424,6 +424,14 @@ public:
     enum class Blocked : uint8_t { No, Wait, Suspended };
     Blocked blocked = Blocked::No;
     bool started = false, terminated = false, finished = false; // finished: body() is done
+    // started, not terminated and not blocked: counted in Objects::ready_threads, which NtYieldExecution reads
+    // without the lock. Every change to the three fields goes through refresh_ready (lock held).
+    bool ready = false;
+    void set_blocked(Blocked b) {
+        blocked = b;
+        refresh_ready();
+    }
+    void refresh_ready();
     uint32_t suspend_count = 0;
     // the wait in progress
     std::vector<Dispatcher *> waiting_on;
@@ -591,6 +599,7 @@ public:
     Ref<Thread> create_thread(const Thread::Params &params, uint32_t &status);
     Ref<Thread> main_thread;
     std::vector<Thread *> threads; // under the lock, live
+    std::atomic<int> ready_threads{0}; // threads with Thread::ready: written under the lock, read without it
     uint32_t next_thread_id = 0;
     uint8_t next_cpu = 0;
     std::condition_variable thread_exited; // the host side's joins

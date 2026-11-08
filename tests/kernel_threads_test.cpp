@@ -114,6 +114,7 @@ enum : uint32_t {
     F_SET_BODY_LATER = 0x82000170,
     F_RELEASE_BODY_LATER = 0x82000180,
     F_WAIT_BODY = 0x82000190,
+    F_YIELD_SPINNER = 0x820001A0,
 };
 
 std::atomic<uint32_t> flag{0}, apcs{0}, woken{0};
@@ -301,6 +302,35 @@ void threads(ppc::Context &c) {
     CHECK(K->host(uint32_t(c.r[13]))[kpcr::CURRENT_CPU] == 4);
     CHECK(ex(c, "KeSetAffinityThread", {me, 1u << 2, local(c, 0x38)}) == X_STATUS_SUCCESS);
     CHECK(K->load32(local(c, 0x38)) == 1u << 4);
+}
+
+std::atomic<uint32_t> yield_release{0};
+void yield_spinner(ppc::Context &c) {
+    while (!yield_release) ex(c, "NtYieldExecution", {});
+}
+
+// What giving up the time slice answers: STATUS_NO_YIELD_PERFORMED while no other thread is ready, success while
+// one is (kept by a count, Thread::refresh_ready, not by a walk of the threads under the lock)
+void yield_status(ppc::Context &c) {
+    constexpr uint32_t NO_YIELD = 0x40000024;
+    auto settles_to = [&](uint32_t want) {
+        for (int i = 0; i < 20000; i++) {
+            if (ex(c, "NtYieldExecution", {}) == want) return true;
+            if (i % 64 == 63) sleep_ms(c, 1);
+        }
+        return false;
+    };
+    CHECK(settles_to(NO_YIELD)); // the earlier tests' threads have ended or wait
+    uint32_t zero = local(c, 0x3F0);
+    K->store64(zero, 0);
+    CHECK(ex(c, "KeDelayExecutionThread", {1, 0, zero}) == NO_YIELD);
+    yield_release = 0;
+    uint32_t h = create_thread(c, F_YIELD_SPINNER, 0);
+    CHECK(settles_to(X_STATUS_SUCCESS)); // the spinner started and is ready
+    CHECK(ex(c, "KeDelayExecutionThread", {1, 0, zero}) == X_STATUS_SUCCESS || settles_to(X_STATUS_SUCCESS));
+    yield_release = 1;
+    join_and_close(c, h);
+    CHECK(settles_to(NO_YIELD)); // it ended: nothing ready again
 }
 
 void events(ppc::Context &c) {
@@ -922,6 +952,7 @@ void fibers(ppc::Context &c) {
 
 void main_thread(ppc::Context &c) {
     threads(c);
+    yield_status(c);
     events(c);
     semaphores(c);
     mutants(c);
@@ -965,6 +996,7 @@ const Generated generated[] = {
     {F_SET_BODY_LATER, set_body_later},
     {F_RELEASE_BODY_LATER, release_body_later},
     {F_WAIT_BODY, wait_body},
+    {F_YIELD_SPINNER, yield_spinner},
 };
 
 } // namespace

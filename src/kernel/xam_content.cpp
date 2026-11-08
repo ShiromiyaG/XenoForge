@@ -8,11 +8,23 @@
  ******************************************************************************
  */
 
-// XAM's content: saves and other packages, as directories in Xenia's layout
-// under the content root, so the two share them:
+// XAM's content: saves and other packages under the content root in Xenia's
+// layout, so the two share them. A package is an STFS file, as the console
+// keeps it (xf::write_stfs_package; ContentFormat::Directory keeps Xenia's
+// directory packages instead, and a directory package already there stays
+// one):
 //
-//   content/<XUID>/<TITLE ID>/<TYPE>/<file name>/...          the package
-//   content/<XUID>/<TITLE ID>/Headers/<TYPE>/<file name>.header
+//   content/<XUID>/<TITLE ID>/<TYPE>/<file name>              the package file
+//   content/<XUID>/<TITLE ID>/<TYPE>/<file name>/...          or a directory package
+//   content/<XUID>/<TITLE ID>/Headers/<TYPE>/<file name>.header  (directory packages)
+//   content-work/<XUID>/<TITLE ID>/<TYPE>/<file name>/...     an STFS package while a title has it open
+//
+// An STFS package a title opens for writing is a directory device in the
+// content-work tree (extracted from the file, or new) for as long as it is
+// open; closing it, or XamContentFlush, writes the package file again whole
+// (to a temporary file and a rename, so the package is never half there),
+// and the closing removes the working directory. A working directory found
+// at an open is what a run that ended without closing left, and is used.
 //
 // (16, 8 and 8 uppercase hex digits; XUID 0 for content of no profile, the
 // marketplace's always). The header file is Xenia's XContentContainerHeader
@@ -29,11 +41,14 @@
 //     display name in the English slot and no title name or thumbnails
 //     (Xenia puts the name in the SPA's default language and takes the
 //     title's name and icon from it);
-//   - package files (STFS and SVOD: DLC, updates, XBLA titles, a console's
-//     own saves) are mounted through xf::Package as read-only devices, as
-//     Xenia mounts them (its ContentPackageContainer, which also creates
-//     and writes STFS, is not ported: new content is a directory package),
-//     and publisher content is looked up under the title's own ID only;
+//   - package files (STFS and SVOD: DLC, updates, XBLA titles) are mounted
+//     through xf::Package as read-only devices, as Xenia mounts them, and
+//     publisher content is looked up under the title's own ID only. New
+//     content, and a console-format STFS package opened to be written (a
+//     save), is an STFS package written back whole at its close, as above;
+//     Xenia creates directory packages (its ContentPackageContainer has no
+//     writing). Its CON signature is zero: the console's private key is not
+//     ours to have, and Xenia's reader and ours take it;
 //   - closing a package leaves the files still open in it usable (Xenia
 //     releases a handle of each);
 //   - the hard drive's size is the content root's volume's, the disc's
@@ -56,6 +71,9 @@
 // xam_content_device.cc: the devices' names, data and enumerator.
 
 #include "xam.h"
+
+#include "xenoforge/package.h"
+#include "xenoforge/sha1.h"
 
 #include <algorithm>
 #include <chrono>
@@ -184,16 +202,31 @@ struct Package {
     // a package file (STFS or SVOD: DLC, an update, an XBLA title), whose own
     // first bytes are the header, not a directory with a header file beside it
     bool file = false;
+    // an STFS package written as a file at its close: host_path is its working directory, this the file
+    std::filesystem::path stfs_path;
 };
 
 struct ContentState {
+    ~ContentState();
     std::mutex mutex;
+    bool stfs = true; // new content is an STFS package (set_content_format)
     std::vector<std::unique_ptr<Package>> mounted;
     uint32_t next_device = 0;
     uint32_t change_callback = 0; // XamContentRegisterChangeCallback's, kept (Xenia never calls it)
 };
 
+bool export_stfs(const Package &p);
+
 ContentState &content(Kernel &k) { return k.state<ContentState>(); }
+
+// A package still open as the kernel ends is written as at its close.
+ContentState::~ContentState() {
+    for (const auto &p : mounted) {
+        if (p->stfs_path.empty() || !export_stfs(*p)) continue;
+        std::error_code ec;
+        std::filesystem::remove_all(p->host_path, ec);
+    }
+}
 
 uint32_t running(Kernel &k, uint32_t title) { return title == CURRENTLY_RUNNING_TITLE || !title ? title_id(k) : title; }
 
@@ -270,8 +303,34 @@ bool read_header(const std::filesystem::path &path, std::vector<uint8_t> &h, uin
     return true;
 }
 
+// A console-format package file at rest takes a header changed in memory (a thumbnail set on it) in place: its
+// bytes up to the header's size, the content ID (the SHA-1 of the metadata) made again. Other package files
+// (LIVE, PIRS, SVOD) are read-only.
+bool patch_package_header(const Package &p) {
+    if (rd32(p.header.data()) != MAGIC_CON) return true;
+    size_t size = rd32(p.header.data() + 0x340);
+    if (!size) size = META + METADATA_SIZE;
+    if (size < META + 0x100 || size > p.header.size()) return true;
+    std::fstream f(p.host_path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!f) return false;
+    std::vector<uint8_t> disk(size);
+    f.read(reinterpret_cast<char *>(disk.data()), std::streamsize(size));
+    if (size_t(f.gcount()) != size) return true;
+    // skip the content ID: a package of the console's own was hashed as it was
+    if (std::equal(disk.begin(), disk.begin() + 0x32C, p.header.begin()) &&
+        std::equal(disk.begin() + 0x340, disk.end(), p.header.begin() + 0x340))
+        return true;
+    std::vector<uint8_t> out(p.header.begin(), p.header.begin() + std::ptrdiff_t(size));
+    sha1({out.data() + META, size - META}, out.data() + 0x32C);
+    f.clear();
+    f.seekp(0);
+    f.write(reinterpret_cast<const char *>(out.data()), std::streamsize(size));
+    return bool(f);
+}
+
 bool write_header(const Package &p) {
-    if (p.file) return true; // a package file's own header is read-only
+    if (!p.stfs_path.empty()) return true; // written with the package
+    if (p.file) return patch_package_header(p);
     std::error_code ec;
     std::filesystem::create_directories(p.header_path.parent_path(), ec);
     std::ofstream f(p.header_path, std::ios::binary | std::ios::trunc);
@@ -356,6 +415,54 @@ bool open_package(const std::filesystem::path &path, Package &p) {
     return true;
 }
 
+bool stfs_mode(Kernel &k) { return content(k).stfs && !content_root(k).empty(); }
+
+// where an STFS package's working directory is while a title has it open
+std::filesystem::path work_path(Kernel &k, const std::filesystem::path &package) {
+    std::filesystem::path root = content_root(k);
+    std::error_code ec;
+    std::filesystem::path rel = std::filesystem::relative(package, root, ec);
+    if (ec || rel.empty() || *rel.begin() == "..") rel = package.filename();
+    return root.parent_path() / "content-work" / rel;
+}
+
+// the package file written from its working directory (the header as it is in memory)
+bool export_stfs(const Package &p) {
+    if (p.stfs_path.empty()) return true;
+    std::string error;
+    if (xf::write_stfs_package(p.stfs_path, p.header, p.host_path, error)) return true;
+    std::fprintf(stderr, "xam: cannot write the package %s: %s (its files stay in %s)\n",
+                 p.stfs_path.string().c_str(), error.c_str(), p.host_path.string().c_str());
+    return false;
+}
+
+// A package file a title opens to write (a console-format STFS, not a read-only LIVE, PIRS or SVOD one) becomes
+// a working directory: extracted from the file unless one is left from a run that did not close it.
+void make_writable(Kernel &k, Package &p) {
+    if (!p.file || !stfs_mode(k) || rd32(p.header.data()) != MAGIC_CON) return;
+    std::string error;
+    std::unique_ptr<xf::Package> package = xf::Package::open(p.host_path, error);
+    if (!package || !package->is_stfs() || package->read_only()) return;
+    std::filesystem::path work = work_path(k, p.host_path);
+    std::error_code ec;
+    if (!std::filesystem::is_directory(work, ec)) {
+        std::filesystem::path partial = work;
+        partial += ".new";
+        std::filesystem::remove_all(partial, ec);
+        std::filesystem::create_directories(work.parent_path(), ec);
+        if (!xf::extract_package(*package, partial, error)) {
+            std::fprintf(stderr, "xam: cannot open %s for writing: %s\n", p.host_path.string().c_str(), error.c_str());
+            std::filesystem::remove_all(partial, ec);
+            return; // read-only, as a package file is
+        }
+        std::filesystem::rename(partial, work, ec);
+        if (ec) return;
+    }
+    p.stfs_path = p.host_path;
+    p.host_path = work;
+    p.file = false;
+}
+
 bool is_open(ContentState &s, std::string_view root) {
     return std::any_of(s.mounted.begin(), s.mounted.end(),
                        [&](const auto &p) { return equal_case(p->root_name, root); });
@@ -391,6 +498,11 @@ void unmount(Kernel &k, Package &p) {
     fs.remove_link(p.root_name + ":");
     write_header(p);
     fs.remove_device(p.device_path);
+    if (!p.stfs_path.empty() && export_stfs(p)) {
+        std::error_code ec;
+        std::filesystem::remove_all(p.host_path, ec);
+        p.stfs_path.clear();
+    }
 }
 
 bool content_exists(Kernel &k, uint64_t xuid, const ContentData &d) {
@@ -405,7 +517,9 @@ uint32_t delete_content(Kernel &k, ContentState &s, uint64_t xuid, const Content
     for (const auto &p : s.mounted)
         if (p->data.same(wanted)) return X_ERROR_ACCESS_DENIED;
     std::error_code ec;
-    return std::filesystem::remove_all(package_path(k, xuid, d), ec) > 0 ? X_ERROR_SUCCESS : X_ERROR_FILE_NOT_FOUND;
+    std::filesystem::path path = package_path(k, xuid, d);
+    if (!content_root(k).empty()) std::filesystem::remove_all(work_path(k, path), ec); // an STFS package's, if left
+    return std::filesystem::remove_all(path, ec) > 0 ? X_ERROR_SUCCESS : X_ERROR_FILE_NOT_FOUND;
 }
 
 // ContentManager::ListContent (the hard drive)
@@ -545,17 +659,33 @@ uint32_t content_create(Kernel &k, uint32_t user_index, uint32_t root_ptr, uint3
             if (!c.xuid) c.xuid = xuid;
             c.content_size = CONTENT_DATA_SIZE; // as Xenia (the structure's size)
             auto p = std::make_unique<Package>();
-            p->host_path = package_path(k, xuid, c);
-            p->header_path = header_path_of(p->host_path);
+            std::filesystem::path path = package_path(k, xuid, c);
+            const bool as_stfs = stfs_mode(k);
+            if (as_stfs) {
+                p->stfs_path = path;
+                p->host_path = work_path(k, path);
+            } else {
+                p->host_path = path;
+                p->header_path = header_path_of(path);
+            }
             std::error_code ec;
-            if (std::filesystem::exists(p->host_path, ec)) {
+            if (std::filesystem::exists(path, ec)) {
                 r = X_ERROR_ALREADY_EXISTS;
             } else {
-                std::filesystem::create_directories(p->host_path.parent_path(), ec);
+                std::filesystem::create_directories(path.parent_path(), ec);
                 p->header = new_header(k, c);
                 p->data = c;
                 p->data.device_id = DEVICE_HDD;
-                bool ok = write_header(*p) && mount(k, s, std::move(p), root);
+                bool ok = true;
+                if (as_stfs) {
+                    // a new package is on the host at once (it lists, it exists), and its working directory empty
+                    std::filesystem::remove_all(p->host_path, ec);
+                    std::filesystem::create_directories(p->host_path, ec);
+                    ok = !ec && export_stfs(*p);
+                } else {
+                    ok = write_header(*p);
+                }
+                ok = ok && mount(k, s, std::move(p), root);
                 r = ok ? X_ERROR_SUCCESS : X_ERROR_ACCESS_DENIED;
             }
         } else if (disposition == Open) {
@@ -565,6 +695,7 @@ uint32_t content_create(Kernel &k, uint32_t user_index, uint32_t root_ptr, uint3
                 r = X_ERROR_FILE_NOT_FOUND;
             } else {
                 license = p->data.license_mask;
+                make_writable(k, *p);
                 r = mount(k, s, std::move(p), root) ? X_ERROR_SUCCESS : X_ERROR_FILE_NOT_FOUND;
             }
         }
@@ -579,6 +710,8 @@ uint32_t content_create(Kernel &k, uint32_t user_index, uint32_t root_ptr, uint3
 }
 
 } // namespace
+
+void set_content_format(Kernel &k, ContentFormat format) { content(k).stfs = format == ContentFormat::Stfs; }
 
 // (user_index, root_name, XCONTENT_DATA *, flags, disposition_ptr,
 // license_mask_ptr, cache_size, content_size, overlapped)
@@ -642,7 +775,7 @@ XF_EXPORT(xam, XamContentClose) {
     result(c, r);
 }
 
-// (root_name, overlapped): the header written now
+// (root_name, overlapped): the header written now, and an STFS package's file
 XF_EXPORT(xam, XamContentFlush) {
     std::string root = guest_string(k, arg(k, c, 0));
     if (root.empty()) return result(c, X_ERROR_INVALID_NAME);
@@ -655,6 +788,7 @@ XF_EXPORT(xam, XamContentFlush) {
                                [&](const auto &p) { return equal_case(p->root_name, root); });
         if (it == s.mounted.end()) return result(c, X_STATUS_INVALID_PARAMETER);
         write_header(**it);
+        export_stfs(**it); // the package file as it is now; the working directory stays
     }
     if (ov) {
         complete_overlapped_immediate(k, ov, X_ERROR_SUCCESS);
