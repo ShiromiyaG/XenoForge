@@ -12,3 +12,5 @@ re/
 
 # the plan is the owner's working document, kept on this machine only
 docs/plan.md
+.vscode/settings.json
+xbox.jpg

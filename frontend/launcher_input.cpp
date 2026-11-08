@@ -29,15 +29,17 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
     const Rml::String &type = event.GetType();
     Rml::Element *target = event.GetTargetElement();
     if (!target) return;
-    if (type == "click") {
-        if (drag_click_) {
-            drag_click_ = false;
-            if (ancestor_with(target, "data-grip") || target->GetParentNode() == by_id("thead") || ancestor_with(target, "data-arg")) return;
+    // the settings page and its dropdowns are the settings view's; a click there only closes a menu
+    for (Rml::Element *e = target; e; e = e->GetParentNode())
+        if (e->GetId() == "spage" || e->GetId() == "popup-layer") {
+            if (type == "click") dismiss_menu();
+            return;
         }
-        if (target->GetId() == "menu-layer") return close_menu();
+    if (type == "click") {
+        if (target->GetId() == "menu-layer") return dismiss_menu();
         if (Rml::Element *title = ancestor_with(target, "data-menu")) {
             const std::string name = title->GetAttribute<Rml::String>("data-menu", "");
-            if (menu_ == name) close_menu();
+            if (menu_ == name) dismiss_menu();
             else open_menu(name, false);
             return;
         }
@@ -49,13 +51,22 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
             }
             return;
         }
-        if (ancestor_with(target, "data-grip")) return;
+        // a row's Options button: that row's menu, under the button
+        if (Rml::Element *opt = ancestor_with(target, "data-row-options")) {
+            if (Rml::Element *row = ancestor_with(opt, "data-index")) {
+                select_game(row->GetAttribute<int>("data-index", -1), false);
+                const Rml::Vector2f at = opt->GetAbsoluteOffset(Rml::BoxArea::Border);
+                if (menu_ == "context") dismiss_menu();
+                else if (selected_game()) open_context_menu(at.x, at.y + opt->GetBox().GetSize(Rml::BoxArea::Border).y + 2 * dp());
+            }
+            return;
+        }
         if (Rml::Element *a = ancestor_with(target, "data-action")) {
             close_menu();
             do_action(a->GetAttribute<Rml::String>("data-action", ""), a->GetAttribute<Rml::String>("data-arg", ""));
             return;
         }
-        close_menu();
+        dismiss_menu();
         if (Rml::Element *row = ancestor_with(target, "data-index")) select_game(row->GetAttribute<int>("data-index", -1), false);
     } else if (type == "dblclick") {
         if (Rml::Element *row = ancestor_with(target, "data-index")) {
@@ -70,25 +81,6 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
                 row->Focus();
                 if (selected_game()) open_context_menu(event.GetParameter<float>("mouse_x", 0), event.GetParameter<float>("mouse_y", 0));
             }
-        } else if (button == 0 && target->HasAttribute("data-grip")) {
-            drag_column_ = std::clamp(target->GetAttribute<int>("data-grip", 1), 1, COLUMNS - 1);
-            drag_x_ = event.GetParameter<float>("mouse_x", 0);
-            drag_width_ = widths_[size_t(drag_column_)];
-        }
-    } else if (type == "mousemove") {
-        if (drag_column_ >= 0) {
-            const float width = std::max(column_info(Column(drag_column_)).min, drag_width_ + (event.GetParameter<float>("mouse_x", 0) - drag_x_) / dp());
-            if (std::fabs(width - widths_[size_t(drag_column_)]) >= 1) {
-                widths_[size_t(drag_column_)] = std::round(width);
-                rebuild_head();
-                rebuild_rows(true);
-            }
-        }
-    } else if (type == "mouseup") {
-        if (drag_column_ >= 0) {
-            drag_column_ = -1;
-            drag_click_ = true;
-            save_layout();
         }
     } else if (type == "mouseover") {
         // with a menu open, moving over another title opens that one
@@ -106,7 +98,12 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
                 rebuild_rows();
             }
         }
+    } else if (type == "blur") {
+        if (target->GetId() == "search")
+            if (Rml::Element *box = by_id("search-box")) box->SetClass("focus", false);
     } else if (type == "focus") {
+        if (target->GetId() == "search")
+            if (Rml::Element *box = by_id("search-box")) box->SetClass("focus", true);
         if (Rml::Element *row = ancestor_with(target, "data-index"); row && row == target) select_game(row->GetAttribute<int>("data-index", -1), false);
     }
 }
@@ -116,6 +113,12 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
 
 void LauncherView::do_action(const std::string &name, const std::string &arg) {
     const GameEntry *game = selected_game();
+    // the page that slides, a dialog or a menu that opens, the window that closes: each has a sound of its own
+    if (name == "dialog-close" || name == "clear-search" || name == "prep-hide" || name == "prep-cancel") play_sound(Cue::Back);
+    else if (name == "toggle-log") play_sound(Cue::Toggle);
+    else if (name != "library" && name != "settings" && name != "game-settings" && name != "controls" && name != "about" && name != "show-prepare" &&
+             name != "exit")
+        play_sound(Cue::Select);
     if (name == "play") {
         if (game) play(*game, false);
     } else if (name == "play-interpreted") {
@@ -125,23 +128,28 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
     } else if (name == "stop") {
         core_.stop();
     } else if (name == "browse") {
-        browse_folder(window_);
+        browse_folder();
     } else if (name == "rescan") {
         rescan();
+    } else if (name == "library") {
+        show_section(Section::Library);
     } else if (name == "settings" || name == "game-settings") {
-        open_settings(SettingsTab::Video);
+        open_settings(settings_->tab(), name == "game-settings" && game != nullptr);
     } else if (name == "controls") {
         open_settings(SettingsTab::Controllers);
+    } else if (name == "demo-games") {
+        core_.show_demo_games(!core_.demo_games());
+        selected_ = -1;
+        rows_sig_.clear();
+        animate_rows_ = true;
+        cached_.clear();
+        last_listing_ = Clock::time_point();
+        settings_->set_game(nullptr);
+        set_message(core_.demo_games() ? "Listing the demo games" : "Listing the games folder", 0, 4);
     } else if (name == "about") {
         show_about();
     } else if (name == "exit") {
         quit_ = true;
-    } else if (name == "theme") {
-        Settings::Launcher l = core_.launcher();
-        l.theme = arg;
-        std::string error;
-        core_.set_launcher(l, error);
-        look_changed();
     } else if (name == "sort") {
         Column column = Column::Title;
         bool ascending = true;
@@ -149,6 +157,7 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
         if (column == sort_) ascending_ = !ascending_;
         else sort_ = column, ascending_ = true;
         rebuild_head();
+        animate_rows_ = true;
         rebuild_rows(true);
         save_layout();
     } else if (name == "clear-search") {
@@ -252,7 +261,7 @@ bool LauncherView::on_event(const SDL_Event &e) {
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
         if (pad_mode_) pad_mode_ = false, SDL_ShowCursor();
-        return on_key(e.key.key, e.key.repeat);
+        return on_key(e.key.key, e.key.scancode, e.key.repeat);
     case SDL_EVENT_MOUSE_MOTION:
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         if (pad_mode_) pad_mode_ = false, SDL_ShowCursor();
@@ -268,7 +277,7 @@ bool LauncherView::on_event(const SDL_Event &e) {
     }
 }
 
-bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
+bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
     const SDL_Keymod mods = SDL_GetModState();
     const bool ctrl = mods & SDL_KMOD_CTRL, alt = mods & SDL_KMOD_ALT, shift = mods & SDL_KMOD_SHIFT;
     // a menu open: the keys move in it
@@ -298,7 +307,7 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
         case SDLK_ESCAPE:
         case SDLK_LALT:
         case SDLK_RALT:
-        case SDLK_F10: close_menu(); return true;
+        case SDLK_F10: dismiss_menu(); return true;
         default: break;
         }
     }
@@ -306,7 +315,10 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
     if (dialog_ != Dialog::None) {
         switch (key) {
         case SDLK_ESCAPE:
-            if (!repeat) close_dialog();
+            if (!repeat) {
+                play_sound(Cue::Back);
+                close_dialog();
+            }
             return true;
         case SDLK_LEFT: dialog_navigate(NavDir::Left); return true;
         case SDLK_RIGHT: dialog_navigate(NavDir::Right); return true;
@@ -324,6 +336,13 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
             return true;
         default: return false;
         }
+    }
+    // the settings page: its keys first (a key being set takes them all)
+    if (section_ == Section::Settings && settings_->on_key(key, scancode, repeat)) return true;
+    // F5 rescans from wherever the focus is (the search box and the settings page included)
+    if (key == SDLK_F5) {
+        if (!repeat) do_action("rescan", "");
+        return true;
     }
     // the search box keeps its keys, but for these
     Rml::Element *focus = ctx_->GetFocusElement();
@@ -343,24 +362,28 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
     if (repeat && key != SDLK_UP && key != SDLK_DOWN && key != SDLK_PAGEUP && key != SDLK_PAGEDOWN) return false;
     if (ctrl && key == SDLK_O) return do_action("browse", ""), true;
     if (ctrl && key == SDLK_F) {
+        if (section_ != Section::Library) return false;
         if (Rml::Element *search = by_id("search")) search->Focus();
         return true;
     }
     if (ctrl && key == SDLK_COMMA) return do_action("settings", ""), true;
     if (alt) {
-        const std::pair<SDL_Keycode, const char *> keys[] = {{SDLK_F, "file"}, {SDLK_E, "emulation"}, {SDLK_O, "options"}, {SDLK_T, "tools"}, {SDLK_H, "help"}};
+        const std::pair<SDL_Keycode, const char *> keys[] = {{SDLK_H, "help"}};
         for (const auto &[k, name] : keys)
             if (key == k) return open_menu(name, true), true;
     }
+    // the list's keys belong to the library
+    if (section_ != Section::Library && (key == SDLK_PAGEUP || key == SDLK_PAGEDOWN || key == SDLK_HOME || key == SDLK_END || key == SDLK_APPLICATION))
+        return false;
     switch (key) {
     case SDLK_F10:
-        if (shift) {
+        if (shift && section_ == Section::Library) {
             if (Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str())) {
                 const Rml::Vector2f at = row->GetAbsoluteOffset(Rml::BoxArea::Border);
                 open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
             }
         } else {
-            open_menu("file", true);
+            open_menu("help", true);
         }
         return true;
     case SDLK_APPLICATION:
@@ -380,7 +403,6 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
         do_action("play", "");
         return true;
     case SDLK_F2: do_action("game-settings", ""); return true;
-    case SDLK_F5: do_action("rescan", ""); return true;
     case SDLK_ESCAPE:
         if (!filter_.empty()) do_action("clear-search", "");
         return true;
@@ -410,9 +432,9 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
             if (menu_ != "context") menu_switch(1);
             break;
-        case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, false); break;
+        case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, SDL_SCANCODE_RETURN, false); break;
         case SDL_GAMEPAD_BUTTON_EAST:
-        case SDL_GAMEPAD_BUTTON_BACK: close_menu(); break;
+        case SDL_GAMEPAD_BUTTON_BACK: dismiss_menu(); break;
         default: break;
         }
         return true;
@@ -424,9 +446,20 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         case SDL_GAMEPAD_BUTTON_DPAD_DOWN: dialog_navigate(NavDir::Down); break;
         case SDL_GAMEPAD_BUTTON_DPAD_LEFT: dialog_navigate(NavDir::Left); break;
         case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: dialog_navigate(NavDir::Right); break;
-        case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, false); break;
-        case SDL_GAMEPAD_BUTTON_EAST: close_dialog(); break;
+        case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, SDL_SCANCODE_RETURN, false); break;
+        case SDL_GAMEPAD_BUTTON_EAST:
+            play_sound(Cue::Back);
+            close_dialog();
+            break;
         default: break;
+        }
+        return true;
+    }
+    if (section_ == Section::Settings) {
+        if (button == SDL_GAMEPAD_BUTTON_BACK) {
+            if (down) open_menu("help", true);
+        } else {
+            settings_->on_pad_button(button, down);
         }
         return true;
     }
@@ -453,7 +486,7 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         if (down && !filter_.empty()) do_action("clear-search", "");
         break;
     case SDL_GAMEPAD_BUTTON_BACK:
-        if (down) open_menu("file", true);
+        if (down) open_menu("help", true);
         break;
     default: break;
     }
@@ -462,6 +495,11 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
 
 void LauncherView::on_pad_axis(SDL_GamepadAxis axis, int value) {
     if (axis != SDL_GAMEPAD_AXIS_LEFTY) return;
+    if (section_ == Section::Settings && menu_.empty() && dialog_ == Dialog::None) {
+        pad_mode_ = true;
+        settings_->on_pad_axis(axis, value);
+        return;
+    }
     if (std::abs(value) > STICK_THRESHOLD) {
         pad_mode_ = true;
         const int delta = value > 0 ? 1 : -1;
@@ -500,7 +538,10 @@ void LauncherView::dialog_navigate(NavDir dir) {
         rects.push_back({at.x, at.y, size.x, size.y});
     }
     const int to = nav_pick(rects, from, dir);
-    if (to >= 0) items[size_t(to)]->Focus(true);
+    if (to >= 0) {
+        items[size_t(to)]->Focus(true);
+        play_sound(Cue::Focus);
+    }
 }
 
 } // namespace xf::frontend

@@ -37,7 +37,7 @@ uint32_t hue_of(uint32_t title_id);
 std::string tile_background(uint32_t title_id);
 
 // The accent colour and its shades: tokens {accent}, {accent-hi}, ... in
-// the stylesheet. An empty or bad "#RRGGBB" gives the default (ember).
+// the stylesheet. An empty or bad "#RRGGBB" gives the default (green).
 struct Accent {
     std::string base, hi, lo, a08, a12, a15, a25, a40, a60, on;
 };
@@ -60,28 +60,22 @@ struct Palette {
 Palette palette(bool dark, const Accent &accent);
 std::string apply_tokens(std::string text, const Accent &accent, const Palette &palette);
 
-// The games table: its columns, their widths (dp) and the order of its rows.
-enum class Column { Icon = 0, Title, TitleId, Version, Status, RunsIn, File };
-constexpr int COLUMNS = 7;
+// The games table: the columns a header sorts by (the Options button at the
+// end of a row is not one) and the order of its rows.
+enum class Column { Title = 0, Status, TitleId, Version };
+constexpr int COLUMNS = 4;
 struct ColumnInfo {
     Column id;
     const char *name;  // in config.toml: "title"
-    const char *label; // in the header: "Title"
-    float width, min;  // dp: the default and the least a drag leaves
+    const char *label; // in the header: "Game"
 };
 const ColumnInfo &column_info(Column column);
-using Widths = std::array<float, COLUMNS>;
-Widths default_widths();
-// "title=320 status=140" over the defaults (unknown names and bad numbers are
-// ignored, widths kept above each column's least) and back
-Widths parse_widths(const std::string &text);
-std::string widths_text(const Widths &widths);
 // "title", "-version" (descending): the column and the direction
 void parse_sort(const std::string &text, Column &column, bool &ascending);
 std::string sort_text(Column column, bool ascending);
 // a row as the table sorts and filters it
 struct RowKey {
-    std::string title, id_text, runs_in, file;
+    std::string title, id_text, file;
     uint32_t version = 0;
     int status = 0; // GameStatus, or 3 for a file that could not be read
 };

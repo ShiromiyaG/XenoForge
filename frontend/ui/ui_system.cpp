@@ -2,9 +2,14 @@
 
 #include "ui_system.h"
 
+#include "cursor_file.h"
+
 #include <RmlUi/Core/Log.h>
 
 #include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iterator>
 
 namespace xf::ui {
 
@@ -24,6 +29,84 @@ SystemInterface::~SystemInterface() {
     SDL_SetCursor(nullptr);
     for (SDL_Cursor *c : cursors_)
         if (c) SDL_DestroyCursor(c);
+    for (auto &entry : custom_) SDL_DestroyCursor(entry.second);
+}
+
+namespace {
+
+SDL_Surface *plain_surface(const CursorImage &image) {
+    SDL_Surface *s = SDL_CreateSurface(image.width, image.height, SDL_PIXELFORMAT_RGBA32);
+    if (!s) return nullptr;
+    for (int y = 0; y < image.height; y++)
+        std::memcpy(static_cast<uint8_t *>(s->pixels) + size_t(y) * size_t(s->pitch), &image.rgba[size_t(y) * size_t(image.width) * 4],
+                    size_t(image.width) * 4);
+    return s;
+}
+
+// drawn for 100% display scale; a twice-as-large version is what a high-density screen takes
+SDL_Surface *surface_of(const CursorImage &image) {
+    SDL_Surface *s = plain_surface(image);
+    if (!s) return nullptr;
+    if (SDL_Surface *big = plain_surface(scaled_cursor(image, 2))) {
+        SDL_AddSurfaceAlternateImage(s, big);
+        SDL_DestroySurface(big); // the surface keeps its own reference
+    }
+    return s;
+}
+
+bool read_file(const std::filesystem::path &path, std::vector<uint8_t> &bytes) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return !bytes.empty();
+}
+
+} // namespace
+
+int SystemInterface::load_cursors(const std::filesystem::path &folder) {
+    // the CSS names the launcher's stylesheets use (and the others RmlUi's cursor property is likely to be given)
+    static const std::pair<const char *, const char *> still[] = {
+        {"default", "normal.cur"},      {"pointer", "link.cur"},         {"text", "text.cur"},          {"unavailable", "unavailable.cur"},
+        {"resize", "horizontal.cur"},   {"ns-resize", "vertical.cur"},   {"nwse-resize", "diagonal1.cur"}, {"nesw-resize", "diagonal2.cur"},
+        {"move", "move.cur"},           {"crosshair", "precision.cur"}};
+    static const std::pair<const char *, const char *> moving[] = {{"wait", "busy.ani"}, {"progress", "working.ani"}};
+    int made = 0;
+    std::vector<uint8_t> bytes;
+    std::string error;
+    for (const auto &[name, file] : still) {
+        CursorImage image;
+        if (!read_file(folder / file, bytes)) continue;
+        if (!parse_cursor(bytes.data(), bytes.size(), image, error)) {
+            std::fprintf(stderr, "launcher: ui: cursor %s: %s\n", file, error.c_str());
+            continue;
+        }
+        SDL_Surface *surface = surface_of(image);
+        SDL_Cursor *cursor = surface ? SDL_CreateColorCursor(surface, image.hot_x, image.hot_y) : nullptr;
+        if (surface) SDL_DestroySurface(surface);
+        if (cursor) custom_[name] = cursor, made++;
+    }
+    for (const auto &[name, file] : moving) {
+        AnimatedCursor animated;
+        if (!read_file(folder / file, bytes)) continue;
+        if (!parse_animated_cursor(bytes.data(), bytes.size(), animated, error)) {
+            std::fprintf(stderr, "launcher: ui: cursor %s: %s\n", file, error.c_str());
+            continue;
+        }
+        std::vector<SDL_Surface *> surfaces;
+        for (const CursorImage &frame : animated.frames) surfaces.push_back(surface_of(frame));
+        std::vector<SDL_CursorFrameInfo> frames;
+        bool ok = true;
+        for (size_t i = 0; i < animated.steps.size(); i++) {
+            SDL_Surface *surface = surfaces[size_t(animated.steps[i])];
+            ok = ok && surface;
+            frames.push_back({surface, Uint32(animated.duration_ms[i])});
+        }
+        SDL_Cursor *cursor = ok ? SDL_CreateAnimatedCursor(frames.data(), int(frames.size()), animated.frames[0].hot_x, animated.frames[0].hot_y) : nullptr;
+        for (SDL_Surface *surface : surfaces)
+            if (surface) SDL_DestroySurface(surface);
+        if (cursor) custom_[name] = cursor, made++;
+    }
+    return made;
 }
 
 double SystemInterface::GetElapsedTime() { return double(SDL_GetTicksNS()) * 1e-9; }
@@ -43,14 +126,19 @@ void SystemInterface::JoinPath(Rml::String &translated_path, const Rml::String &
 }
 
 void SystemInterface::SetMouseCursor(const Rml::String &cursor_name) {
+    std::string name = cursor_name.empty() ? "default" : cursor_name;
+    if (name == "not-allowed") name = "unavailable";
+    else if (name == "ew-resize" || name == "col-resize") name = "resize";
+    else if (name == "arrow" || name == "auto") name = "default";
+    if (auto it = custom_.find(name); it != custom_.end()) return void(SDL_SetCursor(it->second));
     SDL_Cursor *cursor = cursors_[CURSOR_DEFAULT];
-    if (cursor_name == "pointer")
+    if (name == "pointer")
         cursor = cursors_[CURSOR_POINTER];
-    else if (cursor_name == "text")
+    else if (name == "text")
         cursor = cursors_[CURSOR_TEXT];
-    else if (cursor_name == "unavailable")
+    else if (name == "unavailable")
         cursor = cursors_[CURSOR_UNAVAILABLE];
-    else if (cursor_name == "resize")
+    else if (name == "resize")
         cursor = cursors_[CURSOR_RESIZE];
     if (cursor) SDL_SetCursor(cursor);
 }
@@ -122,6 +210,16 @@ Rml::Input::KeyIdentifier convert_key(SDL_Keycode key) {
     }
 }
 
+// SDL numbers the buttons left, middle, right (1, 2, 3); RmlUi left, right, middle (0, 1, 2)
+static int rml_button(uint8_t sdl_button) {
+    switch (sdl_button) {
+    case SDL_BUTTON_LEFT: return 0;
+    case SDL_BUTTON_RIGHT: return 1;
+    case SDL_BUTTON_MIDDLE: return 2;
+    default: return sdl_button - 1;
+    }
+}
+
 bool process_event(Rml::Context *context, SDL_Window *window, const SDL_Event &event) {
     const float density = SDL_GetWindowPixelDensity(window);
     switch (event.type) {
@@ -130,10 +228,10 @@ bool process_event(Rml::Context *context, SDL_Window *window, const SDL_Event &e
                                          key_modifiers());
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         SDL_CaptureMouse(true);
-        return context->ProcessMouseButtonDown(event.button.button - 1, key_modifiers());
+        return context->ProcessMouseButtonDown(rml_button(event.button.button), key_modifiers());
     case SDL_EVENT_MOUSE_BUTTON_UP:
         SDL_CaptureMouse(false);
-        return context->ProcessMouseButtonUp(event.button.button - 1, key_modifiers());
+        return context->ProcessMouseButtonUp(rml_button(event.button.button), key_modifiers());
     case SDL_EVENT_MOUSE_WHEEL:
         return context->ProcessMouseWheel(Rml::Vector2f(-event.wheel.x, -event.wheel.y), key_modifiers());
     case SDL_EVENT_KEY_DOWN: return context->ProcessKeyDown(convert_key(event.key.key), key_modifiers());

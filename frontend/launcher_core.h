@@ -39,6 +39,14 @@ class LauncherCore {
     // A folder to list: rescanned, and saved in config.toml when `save`.
     bool set_games_folder(const std::string &folder, bool save, std::string &error);
     void rescan(); // the players asked again, the games read again
+    // For pictures and checks (--demo-games): the list is these entries, not
+    // what a folder holds; every scan after this lists them again.
+    void use_demo_games(std::vector<GameEntry> games);
+    // The same six titles --demo-games lists, switched on and off while the
+    // launcher runs (the toolbar's toggle): off lists the folder again.
+    static std::vector<GameEntry> demo_list();
+    bool demo_games() const { return !demo_games_.empty(); }
+    void show_demo_games(bool on);
     // The launcher's accent colour ("#RRGGBB", "" for the default), saved in config.toml.
     const std::string &accent() const { return shared_.launcher.accent; }
     bool set_accent(const std::string &accent, std::string &error);
@@ -100,7 +108,7 @@ class LauncherCore {
     Settings shared_; // the games folder and the screenshots' folder
 
     mutable std::mutex mutex_; // the scan's results
-    std::vector<GameEntry> games_;
+    std::vector<GameEntry> games_, demo_games_;
     std::vector<PlayerBinary> players_;
     size_t total_ = 0;
     std::atomic<bool> busy_{false}, cancel_{false};

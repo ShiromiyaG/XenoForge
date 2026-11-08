@@ -123,7 +123,7 @@ int mix(int from, int to, double t) { return std::clamp(int(std::lround(from + (
 } // namespace
 
 const std::vector<std::string> &accent_choices() {
-    static const std::vector<std::string> choices = {"#ff7a45", "#4c9bff", "#9b7bff", "#2fd6a1", "#ff5c8a", "#ffc247"};
+    static const std::vector<std::string> choices = {"#52b043", "#ff7a45", "#4c9bff", "#9b7bff", "#ff5c8a", "#ffc247"};
     return choices;
 }
 
@@ -214,10 +214,10 @@ std::string apply_tokens(std::string text, const Accent &accent, const Palette &
 namespace {
 
 const ColumnInfo COLUMN_INFOS[COLUMNS] = {
-    {Column::Icon, "icon", "", 34, 34},           {Column::Title, "title", "Title", 300, 120},
-    {Column::TitleId, "id", "Title ID", 96, 64},  {Column::Version, "version", "Version", 96, 60},
-    {Column::Status, "status", "Status", 150, 90}, {Column::RunsIn, "runs", "Runs in", 170, 80},
-    {Column::File, "file", "Disc file", 280, 80},
+    {Column::Title, "title", "Game"},
+    {Column::Status, "status", "Status"},
+    {Column::TitleId, "id", "Title ID"},
+    {Column::Version, "version", "Version"},
 };
 
 std::string lower(std::string_view text) {
@@ -231,46 +231,11 @@ std::string lower(std::string_view text) {
 
 const ColumnInfo &column_info(Column column) { return COLUMN_INFOS[std::clamp(int(column), 0, COLUMNS - 1)]; }
 
-Widths default_widths() {
-    Widths w{};
-    for (int i = 0; i < COLUMNS; i++) w[size_t(i)] = COLUMN_INFOS[i].width;
-    return w;
-}
-
-Widths parse_widths(const std::string &text) {
-    Widths w = default_widths();
-    size_t at = 0;
-    while (at < text.size()) {
-        const size_t end = std::min(text.find(' ', at), text.size());
-        const std::string item = text.substr(at, end - at);
-        at = end + 1;
-        const size_t eq = item.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string name = item.substr(0, eq);
-        char *stop = nullptr;
-        const double value = std::strtod(item.c_str() + eq + 1, &stop);
-        if (stop == item.c_str() + eq + 1 || !(value > 0) || value > 4000) continue;
-        for (int i = 1; i < COLUMNS; i++) // the icon's width is fixed
-            if (name == COLUMN_INFOS[i].name) w[size_t(i)] = std::max(float(value), COLUMN_INFOS[i].min);
-    }
-    return w;
-}
-
-std::string widths_text(const Widths &w) {
-    std::string s;
-    for (int i = 1; i < COLUMNS; i++) {
-        char item[48];
-        std::snprintf(item, sizeof(item), "%s%s=%d", s.empty() ? "" : " ", COLUMN_INFOS[i].name, int(w[size_t(i)] + 0.5f));
-        s += item;
-    }
-    return s;
-}
-
 void parse_sort(const std::string &text, Column &column, bool &ascending) {
     column = Column::Title, ascending = true;
     std::string name = text;
     if (!name.empty() && name[0] == '-') ascending = false, name.erase(0, 1);
-    for (int i = 1; i < COLUMNS; i++)
+    for (int i = 0; i < COLUMNS; i++)
         if (name == COLUMN_INFOS[i].name) return void(column = COLUMN_INFOS[i].id);
     ascending = true; // an unknown name: the default as a whole
 }
@@ -289,8 +254,6 @@ std::vector<size_t> sorted_rows(const std::vector<RowKey> &rows, Column by, bool
         case Column::TitleId: return text(a.id_text, b.id_text);
         case Column::Version: return a.version < b.version ? -1 : a.version > b.version ? 1 : 0;
         case Column::Status: return a.status < b.status ? -1 : a.status > b.status ? 1 : 0;
-        case Column::RunsIn: return text(a.runs_in, b.runs_in);
-        case Column::File: return text(a.file, b.file);
         default: return text(a.title, b.title);
         }
     };

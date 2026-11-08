@@ -46,16 +46,17 @@ std::string menu_html(const std::vector<MenuItem> &items);
 // One row of the games table.
 struct RowInfo {
     int index = 0; // in the listing
-    std::string title, id_text, version, runs_in, file;
+    std::string title, id_text, version, file;
     std::string icon; // the renderer's name for the game's image ("" when it has none)
     uint32_t title_id = 0;
     GameStatus status = GameStatus::Ready;
     bool running = false;
     bool unreadable = false; // the file could not be read (then title is its name, file why)
-    bool alternate = false;  // every other row is shaded
 };
-std::string table_head_html(const Widths &widths, Column sort, bool ascending);
-std::string table_row_html(const RowInfo &row, const Widths &widths, bool selected);
+// the header's labels (the sorted one marked) and a game's row: its cover and
+// name, its status, title ID and version, and the Options button
+std::string table_head_html(Column sort, bool ascending);
+std::string table_row_html(const RowInfo &row, bool selected);
 // what the table area says with nothing to list: no folder chosen, a folder
 // without games, or a filter that hides them all
 std::string empty_html(bool no_folder, bool filtered, const std::string &folder);
@@ -84,6 +85,8 @@ struct SettingsPage {
     std::string folder;     // the games folder
     std::string accent;     // the current accent, "#rrggbb"
     std::string theme;      // "system", "light", "dark"
+    std::string backdrop;   // the ribbons: "animated", "still", "off"
+    bool sounds = true;     // the window's own sounds
     std::vector<std::string> gamepads;
     std::string capturing;  // the binding waiting for a key
     // the Profile tab: the storage's profiles, a message for the last action, the profile asked to be deleted (the
@@ -108,6 +111,7 @@ std::vector<Choice> aspect_choices();
 std::vector<Choice> video_choice_list(const std::string &key);
 std::vector<Choice> user_choices();
 std::vector<Choice> theme_choices();
+std::vector<Choice> backdrop_choices();
 std::string keycaps_html(const std::string &keys, bool waiting);
 
 } // namespace xf::frontend

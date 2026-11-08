@@ -14,6 +14,9 @@
 #include "../frontend/library.h"
 #include "../frontend/sdl_audio.h"
 #include "../frontend/sdl_input.h"
+#include "../frontend/ui/cursor_file.h"
+#include "../frontend/ui/ribbons.h"
+#include "../frontend/ui_sound.h"
 #include "../frontend/settings.h"
 #include "../tools/game.h"
 #include "xenoforge/render_scale.h"
@@ -21,6 +24,8 @@
 #include <cmath>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <thread>
 #include <vector>
 
@@ -377,13 +382,13 @@ int main() {
         // the windows' structure: escaped titles, every binding a row, the settings' keys
         frontend::RowInfo row;
         row.title = "A <b> & C", row.id_text = "5846000A", row.index = 3;
-        const frontend::Widths widths = frontend::default_widths();
-        const std::string rows_html = frontend::table_row_html(row, widths, true);
+        const std::string rows_html = frontend::table_row_html(row, true);
         CHECK(rows_html.find("A &lt;b&gt; &amp; C") != std::string::npos && rows_html.find("<b>") == std::string::npos);
         CHECK(rows_html.find("data-index=\"3\"") != std::string::npos && rows_html.find(" sel") != std::string::npos);
-        const std::string head = frontend::table_head_html(widths, frontend::Column::Version, false);
-        CHECK(head.find("data-arg=\"version\"") != std::string::npos && head.find("data-grip=\"3\"") != std::string::npos);
-        CHECK(head.find("class=\"th c-ver sorted\"") != std::string::npos);
+        CHECK(rows_html.find("data-row-options") != std::string::npos); // the Options button
+        const std::string head = frontend::table_head_html(frontend::Column::Version, false);
+        CHECK(head.find("data-arg=\"version\"") != std::string::npos && head.find("class=\"th c-ver sorted\"") != std::string::npos);
+        CHECK(head.find("data-arg=\"title\"") != std::string::npos && head.find("c-opts") != std::string::npos);
         frontend::Settings own;
         frontend::SettingsPage page;
         page.settings = &own, page.accent = "#ff7a45", page.theme = "system";
@@ -409,12 +414,7 @@ int main() {
         CHECK(frontend::expand_icons("a{i:x}b") == "a<span class=\"ic\">\xEE\x86\xB2</span>b");
     }
     {
-        // the games table: columns' widths, the sort, the order and the filter
-        const frontend::Widths w = frontend::parse_widths("title=320 status=10 nonsense=50 file=abc version=88");
-        CHECK(w[size_t(frontend::Column::Title)] == 320 && w[size_t(frontend::Column::Version)] == 88);
-        CHECK(w[size_t(frontend::Column::Status)] == frontend::column_info(frontend::Column::Status).min); // kept above the least
-        CHECK(w[size_t(frontend::Column::File)] == frontend::column_info(frontend::Column::File).width);  // a bad number: the default
-        CHECK(frontend::parse_widths(frontend::widths_text(w)) == w);
+        // the games table: the sort, the order and the filter
         frontend::Column c = frontend::Column::Title;
         bool ascending = false;
         frontend::parse_sort("-version", c, ascending);
@@ -443,17 +443,123 @@ int main() {
         CHECK(std::string(frontend::theme_text(frontend::ThemeChoice::Light)) == "light");
     }
     {
-        // the launcher's own section saved in config.toml: the folder, the look, the window and the table
+        // the cursors' files (ui/cursor_file.h): a made 2x2 .cur and a two-frame .ani read back, then the shipped ones
+        auto cur = [](int hot_x, int hot_y, uint8_t alpha) {
+            std::vector<uint8_t> d;
+            auto w16 = [&](uint32_t v) { d.push_back(uint8_t(v)), d.push_back(uint8_t(v >> 8)); };
+            auto w32 = [&](uint32_t v) { w16(v & 0xffff), w16(v >> 16); };
+            w16(0), w16(2), w16(1);
+            d.push_back(2), d.push_back(2), d.push_back(0), d.push_back(0), w16(uint32_t(hot_x)), w16(uint32_t(hot_y));
+            w32(40 + 16 + 8), w32(22);
+            w32(40), w32(2), w32(4), w16(1), w16(32), w32(0), w32(24), w32(0), w32(0), w32(0), w32(0);
+            const uint8_t bottom_up[] = {0, 0, 255, alpha, 0, 255, 0, alpha, /* then the top row: */ 255, 0, 0, alpha, 255, 255, 255, alpha};
+            d.insert(d.end(), bottom_up, bottom_up + 16);
+            for (int i = 0; i < 8; i++) d.push_back(0); // the mask
+            return d;
+        };
+        ui::CursorImage image;
+        std::string why;
+        const std::vector<uint8_t> one = cur(1, 0, 255);
+        CHECK(ui::parse_cursor(one.data(), one.size(), image, why));
+        CHECK(image.width == 2 && image.height == 2 && image.hot_x == 1 && image.hot_y == 0);
+        CHECK(image.rgba[0] == 0 && image.rgba[1] == 0 && image.rgba[2] == 255 && image.rgba[3] == 255); // top left: blue (the file is bottom-up)
+        CHECK(image.rgba[8] == 255 && image.rgba[9] == 0 && image.rgba[10] == 0);                      // bottom left: red
+        const std::vector<uint8_t> clear = cur(0, 0, 0); // no alpha at all: the mask (all zero) makes it opaque
+        CHECK(ui::parse_cursor(clear.data(), clear.size(), image, why) && image.rgba[3] == 255);
+        const ui::CursorImage big = ui::scaled_cursor(image, 2);
+        CHECK(big.width == 4 && big.height == 4 && big.rgba.size() == 64);
+        std::vector<uint8_t> broken = one;
+        broken.resize(30);
+        CHECK(!ui::parse_cursor(broken.data(), broken.size(), image, why) && !why.empty());
+        // an .ani of two frames of 100 ms
+        std::vector<uint8_t> ani;
+        auto put32 = [&](uint32_t v) { for (int i = 0; i < 4; i++) ani.push_back(uint8_t(v >> (8 * i))); };
+        auto tag = [&](const char *t) { ani.insert(ani.end(), t, t + 4); };
+        const std::vector<uint8_t> a = cur(0, 0, 255), b = cur(0, 0, 200);
+        tag("RIFF"), put32(4 + 8 + 36 + 8 + 4 + 2 * (8 + uint32_t(a.size()))), tag("ACON");
+        tag("anih"), put32(36), put32(36), put32(2), put32(2), put32(0), put32(0), put32(0), put32(0), put32(6), put32(1);
+        tag("LIST"), put32(4 + 2 * (8 + uint32_t(a.size()))), tag("fram");
+        for (const std::vector<uint8_t> *f : {&a, &b}) tag("icon"), put32(uint32_t(f->size())), ani.insert(ani.end(), f->begin(), f->end());
+        ui::AnimatedCursor moving;
+        CHECK(ui::parse_animated_cursor(ani.data(), ani.size(), moving, why));
+        CHECK(moving.frames.size() == 2 && moving.steps == std::vector<int>({0, 1}) && moving.duration_ms == std::vector<int>({100, 100}));
+        CHECK(moving.frames[1].rgba[3] == 200);
+        CHECK(!ui::parse_animated_cursor(one.data(), one.size(), moving, why));
+        // the files that ship (found beside the program once the launcher is built, or in the source tree)
+        for (const char *folder : {"ui/cursors", "../frontend/ui/assets/cursors", "frontend/ui/assets/cursors"}) {
+            if (!std::filesystem::exists(std::filesystem::path(folder) / "normal.cur")) continue;
+            auto read = [&](const char *name) {
+                std::ifstream f(std::filesystem::path(folder) / name, std::ios::binary);
+                return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            };
+            for (const char *name : {"normal.cur", "link.cur", "text.cur", "unavailable.cur", "move.cur", "horizontal.cur", "vertical.cur",
+                                     "diagonal1.cur", "diagonal2.cur", "precision.cur"}) {
+                const std::vector<uint8_t> bytes = read(name);
+                CHECK(ui::parse_cursor(bytes.data(), bytes.size(), image, why) && image.width == 32 && image.height == 32);
+            }
+            for (const char *name : {"busy.ani", "working.ani"}) {
+                const std::vector<uint8_t> bytes = read(name);
+                CHECK(ui::parse_animated_cursor(bytes.data(), bytes.size(), moving, why) && moving.steps.size() == 8 && moving.duration_ms[0] == 300);
+            }
+            break;
+        }
+    }
+    {
+        // the window's own sounds: each cue is made, finite, audible, well under full scale and a fraction of a second long
+        for (int c = 0; c < int(frontend::Cue::Count); c++) {
+            const std::vector<float> cue = frontend::synth_cue(frontend::Cue(c));
+            float peak = 0;
+            bool finite = true;
+            for (float v : cue) finite = finite && std::isfinite(v), peak = std::max(peak, std::fabs(v));
+            CHECK(cue.size() % 2 == 0 && cue.size() >= 2 * 2000 && cue.size() <= 2 * frontend::UI_SOUND_RATE);
+            CHECK(finite && peak > 0.1f && peak < 0.5f);
+        }
+        CHECK(frontend::synth_cue(frontend::Cue::Page) == frontend::synth_cue(frontend::Cue::Page)); // the same every time
+        CHECK(frontend::synth_cue(frontend::Cue::Focus) != frontend::synth_cue(frontend::Cue::Select));
+    }
+    {
+        // the backdrop's ribbons: the mesh built on the CPU
+        const float tint[3] = {0.33f, 0.66f, 0.16f};
+        std::vector<ui::RibbonVertex> v, v2, v3;
+        std::vector<uint32_t> i, i2, i3, f, f2, f3;
+        ui::build_ribbons(5.f, 1240, 760, tint, 1.f, v, i, f);
+        ui::build_ribbons(5.f, 1240, 760, tint, 1.f, v2, i2, f2);
+        ui::build_ribbons(9.f, 1240, 760, tint, 1.f, v3, i3, f3);
+        CHECK(!v.empty() && !i.empty() && i.size() % 3 == 0 && !f.empty() && f.size() % 3 == 0);
+        bool ok = true, inside = false;
+        for (uint32_t k : i) ok = ok && k < v.size();
+        for (uint32_t k : f) ok = ok && k < v.size();
+        for (const ui::RibbonVertex &p : v) ok = ok && p.depth >= 0.f && p.depth <= 1.f;
+        for (const ui::RibbonVertex &p : v) {
+            ok = ok && std::isfinite(p.x) && std::isfinite(p.y) && p.r <= p.a && p.g <= p.a && p.b <= p.a; // premultiplied
+            inside = inside || (p.x > 0 && p.x < 1240 && p.y > 0 && p.y < 760);
+        }
+        CHECK(ok && inside);
+        CHECK(v.size() == v2.size() && i == i2 && f == f2 && v[100].x == v2[100].x && v[100].y == v2[100].y); // a pure function
+        CHECK(v3.size() == v.size() && (v3[100].x != v[100].x || v3[100].y != v[100].y));          // the clock moves them
+        std::vector<ui::RibbonVertex> none;
+        std::vector<uint32_t> no, no2;
+        ui::build_ribbons(5.f, 1240, 760, tint, 0.f, none, no, no2);
+        CHECK(none.empty() && no.empty() && no2.empty()); // strength 0: no ribbons
+    }
+    {
+        // the launcher's own section saved in config.toml: the folder, the look, the window and the sort
         const std::filesystem::path file = std::filesystem::temp_directory_path() / "xf_frontend_test_accent.toml";
         std::filesystem::remove(file);
         frontend::Settings a, b;
         a.launcher.games = "D:/games", a.launcher.accent = "#9b7bff", a.launcher.theme = "light";
-        a.launcher.columns = "title=320", a.launcher.sort = "-status";
+        a.launcher.sort = "-status";
+        a.launcher.backdrop = "still";
+        a.launcher.sounds = false;
         a.launcher.x = -1200, a.launcher.y = 40, a.launcher.width = 1500, a.launcher.height = 900, a.launcher.maximized = true;
         std::string err;
         CHECK(frontend::save(file, a, err) && frontend::load(file, b, err));
         CHECK(b.launcher.games == "D:/games" && b.launcher.accent == "#9b7bff" && b.launcher.theme == "light");
-        CHECK(b.launcher.columns == "title=320" && b.launcher.sort == "-status");
+        CHECK(b.launcher.sort == "-status");
+        CHECK(b.launcher.backdrop == "still");
+        CHECK(frontend::Settings().launcher.backdrop == "animated");
+        CHECK(!b.launcher.sounds && frontend::Settings().launcher.sounds); // on unless the file says off
+        CHECK(frontend::backdrop_choices().size() == 3);
         CHECK(b.launcher.x == -1200 && b.launcher.y == 40 && b.launcher.width == 1500 && b.launcher.height == 900 && b.launcher.maximized);
         std::filesystem::remove(file);
     }

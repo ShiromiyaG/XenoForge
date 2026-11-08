@@ -2,8 +2,8 @@
 // button (plan track C2; docs/runtime.md, "The launcher"). This file is the
 // program around its view: the SDL3 window, the Vulkan device and RmlUi's
 // render interface on it (ui/), the context the main window lives in
-// (launcher_view.cpp), the settings window's events and frames
-// (settings_view.cpp) and the loop. What the launcher does is LauncherCore's
+// (launcher_view.cpp; the settings are a page of the same window,
+// settings_view.cpp) and the loop. What the launcher does is LauncherCore's
 // (launcher_core.h), which has no UI code: the games are the folder's ISOs
 // (and bare default.xex files), read in place for their title, title ID,
 // picture and digest (library.h); a game with a library cached for its disc
@@ -23,29 +23,29 @@
 // For checks without a person at the screen: --list prints the folder's
 // games and the player each would start in, without a window; --quit-after S
 // ends the launcher after S seconds (once a game it started has ended) and
-// --screenshot <png> saves its last picture (the settings window's when
-// --screen opened it); --select N selects the Nth game, --screen
-// <library|settings|controls|about> opens the settings window (on Video, or
+// --screenshot <png> saves its last picture; --select N selects the Nth
+// game, --screen <library|settings|controls|about> slides to the settings page (on Video, or
 // on Keyboard for controls) or the about box (--controls is --screen
 // controls) and --start N starts the Nth game as Play does, --player-arg
 // <arg> (repeatable) adds an argument to the player's command line
 // (--quit-after 20, say), --build-jobs N the compilers a Prepare runs at once
 // (4 unless told; each takes a gigabyte or two). For the pictures of the
-// windows: --demo-progress shows a fake build under way (--demo-fail: one
+// windows: --demo-games lists six titles instead of a folder's discs,
+// --demo-progress shows a fake build under way (--demo-fail: one
 // that fails, --demo-speed X: times real time, --show-log: its log open),
 // --snap-at S ends at S seconds whatever the view is waiting for,
 // --capture-binding <name> a binding waiting for its key, --menu <name> a menu
-// open (file, emulation, options, tools, help), --context-menu the selected
-// row's menu open, --tab <name> the settings window's tab (video, sound,
+// open (help), --context-menu the selected
+// row's menu open, --tab <name> the settings page's tab (video, sound,
 // controllers, keyboard, system, profile, interface), --render-size WxH draws at that size without the window (a
 // 4K picture on a 1080p desktop), --scale F the interface's scale (else the
-// display's), --assets <dir> the windows' files (to edit them without a
+// display's), --assets <dir> the window's files (to edit them without a
 // rebuild), and --keys up,down,a,b,... presses of the pad (the d-pad, a b x y,
 // lb rb, start, back; "wait" waits) sent to the view a few tenths of a second
 // apart once the window has settled.
 //
 //   launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <page>] [--start N] [--keys <list>]
-//            [--player-arg <arg>]... [--build-jobs N] [--quit-after S] [--screenshot <png>] [--demo-progress] [--demo-fail]
+//            [--player-arg <arg>]... [--build-jobs N] [--quit-after S] [--screenshot <png>] [--demo-games] [--demo-progress] [--demo-fail]
 //            [--demo-speed X] [--show-log] [--capture-binding <name>] [--menu <name>] [--context-menu] [--tab <name>]
 //            [--render-size WxH] [--scale F] [--assets <dir>]
 
@@ -92,27 +92,6 @@ int fail(const std::string &message) {
     return 1;
 }
 
-// the window an SDL event is for (0: none, as a pad's)
-SDL_WindowID window_of(const SDL_Event &e) {
-    switch (e.type) {
-    case SDL_EVENT_KEY_DOWN:
-    case SDL_EVENT_KEY_UP: return e.key.windowID;
-    case SDL_EVENT_TEXT_INPUT: return e.text.windowID;
-    case SDL_EVENT_TEXT_EDITING: return e.edit.windowID;
-    case SDL_EVENT_MOUSE_MOTION: return e.motion.windowID;
-    case SDL_EVENT_MOUSE_BUTTON_DOWN:
-    case SDL_EVENT_MOUSE_BUTTON_UP: return e.button.windowID;
-    case SDL_EVENT_MOUSE_WHEEL: return e.wheel.windowID;
-    default:
-        if (e.type >= SDL_EVENT_WINDOW_FIRST && e.type <= SDL_EVENT_WINDOW_LAST) return e.window.windowID;
-        return 0;
-    }
-}
-
-bool is_pad(const SDL_Event &e) {
-    return e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP || e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION;
-}
-
 } // namespace
 
 int main(int argc, char **argv) {
@@ -127,7 +106,7 @@ int main(int argc, char **argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::filesystem::path config_file, screenshot, assets;
     std::string games_arg;
-    bool list = false, games_given = false;
+    bool list = false, games_given = false, demo_games = false;
     double quit_after = 0;
     float snap_at = 0;
     std::vector<std::string> key_script;
@@ -161,6 +140,8 @@ int main(int argc, char **argv) {
             quit_after = std::strtod(argv[++i], nullptr);
         else if (a == "--screenshot" && i + 1 < argc)
             screenshot = from_utf8(argv[++i]);
+        else if (a == "--demo-games")
+            demo_games = true;
         else if (a == "--demo-progress")
             options.demo_progress = true;
         else if (a == "--demo-fail")
@@ -204,7 +185,10 @@ int main(int argc, char **argv) {
     if (!core.load_error().empty())
         std::fprintf(stderr, "launcher: %s: %s (the defaults instead)\n", utf8(config_file).c_str(), core.load_error().c_str());
     std::string message;
-    if (games_given)
+    if (demo_games) {
+        if (games_given) core.set_games_folder(games_arg, false, message);
+        core.use_demo_games(frontend::LauncherCore::demo_list());
+    } else if (games_given)
         core.set_games_folder(games_arg, false, message); // for this run only
     else
         core.rescan();
@@ -264,13 +248,20 @@ int main(int argc, char **argv) {
     std::printf("launcher: Vulkan on %s\n", surface->device_name().c_str());
     auto system = std::make_unique<ui::SystemInterface>(window);
     Rml::SetSystemInterface(system.get());
+    system->load_cursors(assets / "cursors"); // the console browser's; the system's where a file is missing
     Rml::SetRenderInterface(&surface->renderer());
     if (!Rml::Initialise()) return fail("RmlUi did not start");
     std::filesystem::path fonts = assets / "fonts";
     if (!std::filesystem::exists(fonts)) fonts = assets.parent_path() / "fonts";
-    const std::pair<const char *, int> faces[] = {{"Inter-Regular.ttf", 400}, {"Inter-Medium.ttf", 500}, {"Inter-SemiBold.ttf", 600}, {"Inter-Bold.ttf", 700}};
+    const std::pair<const char *, int> faces[] = {{"Inter-Light.ttf", 300},   {"Inter-Regular.ttf", 400}, {"Inter-Medium.ttf", 500},
+                                                  {"Inter-SemiBold.ttf", 600}, {"Inter-Bold.ttf", 700}};
     for (const auto &[file, weight] : faces)
         if (!Rml::LoadFontFace(utf8(fonts / file), "Inter", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(weight)))
+            std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / file).c_str());
+    // the list's and toolbar's condensed face (Roboto Condensed, Apache 2.0)
+    const std::pair<const char *, int> condensed[] = {{"RobotoCondensed-Light.ttf", 300}, {"RobotoCondensed-Regular.ttf", 400}, {"RobotoCondensed-Medium.ttf", 500}};
+    for (const auto &[file, weight] : condensed)
+        if (!Rml::LoadFontFace(utf8(fonts / file), "Condensed", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(weight)))
             std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / file).c_str());
     if (!Rml::LoadFontFace(utf8(fonts / "Lucide.ttf"), "Lucide", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(400)))
         std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / "Lucide.ttf").c_str());
@@ -305,6 +296,14 @@ int main(int argc, char **argv) {
             {"right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT}, {"a", SDL_GAMEPAD_BUTTON_SOUTH},        {"b", SDL_GAMEPAD_BUTTON_EAST},
             {"x", SDL_GAMEPAD_BUTTON_WEST},           {"y", SDL_GAMEPAD_BUTTON_NORTH},        {"lb", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
             {"rb", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER}, {"start", SDL_GAMEPAD_BUTTON_START},   {"back", SDL_GAMEPAD_BUTTON_BACK}};
+        if (name == "f5" || name == "f2") { // a key of the keyboard
+            SDL_Event e{};
+            e.type = SDL_EVENT_KEY_DOWN;
+            e.key.key = name == "f5" ? SDLK_F5 : SDLK_F2;
+            e.key.down = true;
+            SDL_PushEvent(&e);
+            return;
+        }
         for (const auto &[text, button] : buttons) {
             if (name != text) continue;
             for (bool down : {true, false}) {
@@ -336,19 +335,6 @@ int main(int argc, char **argv) {
                 if (SDL_Gamepad *g = SDL_OpenGamepad(event.gdevice.which)) pads.push_back(g);
             if (event.type == SDL_EVENT_WINDOW_MOVED || event.type == SDL_EVENT_WINDOW_RESIZED)
                 if (event.window.windowID == SDL_GetWindowID(window)) note_place();
-            // the settings window's own events, and the pad's while it has focus
-            frontend::SettingsView *settings = view.settings_window();
-            const SDL_WindowID target = window_of(event);
-            if (settings && ((target && target == settings->window_id()) || (is_pad(event) && settings->has_focus()))) {
-                if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
-                    view.close_settings_window();
-                    continue;
-                }
-                system->set_window(settings->window());
-                if (!settings->on_event(event)) ui::process_event(settings->context(), settings->window(), event);
-                system->set_window(window);
-                continue;
-            }
             if (event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit = true;
             if (view.on_event(event)) continue;
             ui::process_event(context, window, event);
@@ -380,29 +366,20 @@ int main(int argc, char **argv) {
         const bool ending = snap || (quit_after > 0 && seconds >= quit_after && !view.busy() &&
                                      (key_script.empty() || (key_next >= key_script.size() && seconds >= key_at + 0.6)));
         const bool last = ending || quit;
-        // the picture is the settings window's when it is open, else the main one's
-        frontend::SettingsView *settings = view.settings_window();
-        ui::Window &shot = settings && options.screen != frontend::Screen::Library && options.screen != frontend::Screen::About ? settings->surface() : *surface;
-        if (last && !screenshot.empty()) shot.capture_next();
-        if (settings) {
-            system->set_window(settings->window());
-            settings->frame();
-            system->set_window(window);
-        }
+        if (last && !screenshot.empty()) surface->capture_next();
         const bool shown = surface->frame([&] { context->Render(); }, offscreen ? render_w : 0, offscreen ? render_h : 0);
         frames++;
         if (last && !screenshot.empty()) {
             std::vector<uint8_t> rgba;
             uint32_t sw = 0, sh = 0;
-            if (shot.take_capture(rgba, sw, sh) && write_png(rgba, sw, sh, screenshot))
+            if (surface->take_capture(rgba, sw, sh) && write_png(rgba, sw, sh, screenshot))
                 std::printf("launcher: screenshot %s\n", utf8(screenshot).c_str());
             else
                 std::fprintf(stderr, "launcher: no screenshot\n");
         }
-        if (settings && settings->closing()) view.close_settings_window();
         if (ending) quit = true;
         if (!shown || offscreen) SDL_Delay(offscreen ? 8 : 16);
-        else if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) && !(view.settings_window() && view.settings_window()->has_focus()))
+        else if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS))
             SDL_Delay(8); // a form, not a game
     }
 
@@ -419,7 +396,7 @@ int main(int argc, char **argv) {
     std::printf("launcher: %zu games listed, %llu frames in %.1f s (%.0f a second)\n", core.listing().games.size(),
                 (unsigned long long)frames, total, double(frames) / std::max(total, 0.001));
     if (core.run().running) std::printf("launcher: %s goes on running\n", core.run().title.c_str());
-    view_owner.reset(); // its documents (and the settings window's context), before the context
+    view_owner.reset(); // its document, before the context
     Rml::RemoveContext("launcher");
     Rml::Shutdown(); // the interfaces outlive RmlUi
     system.reset();

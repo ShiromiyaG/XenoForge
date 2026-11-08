@@ -15,8 +15,8 @@
 #   FFMPEG-SOURCE.txt            where ffmpeg-xma's source is: the fork's commit and the overlay
 #   ffmpeg-source/               the overlay itself (third_party/ffmpeg: configuration and build script)
 #   LICENSE-xenia, LICENSE-rexglue
-#   ui/                          the launcher's windows (RML, RCSS), its font, Inter (SIL OFL), and icons, Lucide (ISC)
-#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Lucide, stb,
+#   ui/                          the launcher's windows (RML, RCSS), its fonts, Inter (SIL OFL) and Roboto Condensed (Apache 2.0), and icons, Lucide (ISC)
+#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Roboto Condensed, Lucide, stb, the cursors (public domain),
 #                                FidelityFX, FXAA, volk, Vulkan-Headers
 #
 # Included by CMakeLists.txt once the player's targets (XF_PLAYERS) and its
@@ -54,6 +54,7 @@ file(READ "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-CAS/LICENSE.txt" _cas)
 file(READ "${CMAKE_SOURCE_DIR}/third_party/fxaa/LICENSE" _fxaa)
 file(READ "${volk_SOURCE_DIR}/LICENSE.md" _volk)
 file(READ "${vulkanheaders_SOURCE_DIR}/LICENSES/Apache-2.0.txt" _vulkan_headers)
+file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Roboto.txt" _roboto)
 file(READ "${STB_DIR}/stb_image_write.h" _stb)
 string(FIND "${_stb}" "This software is available under 2 licenses" _stb_at)
 if(_stb_at LESS 0)
@@ -98,10 +99,19 @@ License 1.1, shipped as ui/fonts/Inter-*.ttf
 ${_rule}
 ${_inter}
 ${_rule}
+Roboto Condensed (2.138), https://github.com/googlefonts/roboto-2 - the launcher's
+condensed typeface for the games and the toolbar, Apache License 2.0, shipped as
+ui/fonts/RobotoCondensed-*.ttf
+${_rule}
+${_roboto}
+${_rule}
 Lucide (lucide-static 0.460.0), https://lucide.dev - the launcher's icons, ISC
 license (portions from Feather, MIT), shipped as ui/fonts/Lucide.ttf
 ${_rule}
 ${_lucide}
+${_rule}
+Xbox 360 web cursors by MiniYak_YT, https://www.rw-designer.com/cursor-set/xbox-360-custom-web - the launcher's
+pointers, released to the public domain by the author, shipped as ui/cursors/ with the author's note (README.txt)
 ${_rule}
 stb_image and stb_image_write, https://github.com/nothings/stb - MIT license or public domain
 ${_rule}

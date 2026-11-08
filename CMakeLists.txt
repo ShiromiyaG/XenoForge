@@ -438,10 +438,10 @@ if(XF_PLAYER AND TARGET boot)
     foreach(shader vert frag)
         xf_spirv(XF_UI_SHADERS ui.${shader} frontend/ui/ui.${shader})
     endforeach()
-    add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
+    add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ribbons.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
                              frontend/prepare_job.cpp frontend/stale_library.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
                              frontend/launcher_view.cpp frontend/launcher_screens.cpp frontend/launcher_input.cpp
-                             frontend/settings_view.cpp
+                             frontend/settings_view.cpp frontend/ui_sound.cpp frontend/ui/cursor_file.cpp
                              ${XF_UI_SHADERS})
     target_include_directories(xf_ui PRIVATE ${XF_SPIRV_DIR})
     target_include_directories(xf_ui PUBLIC frontend)

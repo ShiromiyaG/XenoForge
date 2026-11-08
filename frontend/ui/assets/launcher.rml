@@ -5,29 +5,68 @@
 </head>
 <body>
     <div id="app">
-        <div id="menubar">
-            <div class="menu-title" id="menu-file" data-menu="file">File</div>
-            <div class="menu-title" id="menu-emulation" data-menu="emulation">Emulation</div>
-            <div class="menu-title" id="menu-options" data-menu="options">Options</div>
-            <div class="menu-title" id="menu-tools" data-menu="tools">Tools</div>
-            <div class="menu-title" id="menu-help" data-menu="help">Help</div>
+        <div id="header">
+            <div id="brand">xeno<span>forge</span></div>
+            <div id="nav">
+                <div class="nav f on" id="nav-games" data-action="library">games</div>
+                <div class="nav f" id="nav-settings" data-action="settings">settings</div>
+                <div class="nav f" id="menu-help" data-menu="help">help</div>
+            </div>
         </div>
-        <div id="toolbar">
-            <div class="tb primary f" id="tb-play" data-action="play">{i:play}<div id="tb-play-label">Play</div></div>
-            <div class="tb f" id="tb-prepare" data-action="prepare">{i:hammer}<div id="tb-prepare-label">Prepare</div></div>
-            <div class="tb-sep"></div>
-            <div class="tb f" id="tb-browse" data-action="browse">{i:folder-open}<div>Open folder</div></div>
-            <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
-            <div class="tb-sep"></div>
-            <div class="tb f" id="tb-settings" data-action="settings">{i:settings}<div>Settings</div></div>
-            <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
-            <div id="tb-space"></div>
-            <div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div>
-        </div>
-        <div id="table">
-            <div id="thead"></div>
-            <div id="tbody"></div>
-            <div id="tempty"></div>
+        <div id="stage">
+            <!-- two pages side by side, each as wide as the stage; the strip slides to show one -->
+            <div id="slide">
+                <div id="library" class="page-side">
+                    <div id="toolbar">
+                        <div class="tb primary f" id="tb-play" data-action="play">{i:play}<div id="tb-play-label">Play</div></div>
+                        <div class="tb f" id="tb-play-interpreted" data-action="play-interpreted">{i:cpu}<div>Play interpreted</div></div>
+                        <div class="tb f" id="tb-prepare"data-action="prepare">{i:hammer}<div id="tb-prepare-label">Prepare</div></div>
+                        <div class="tb f" id="tb-browse" data-action="browse">{i:folder-open}<div>Open Folder</div></div>
+                        <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
+                        <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
+                        <div class="tb f" id="tb-demo" data-action="demo-games">{i:layers}<div>Demo games</div></div>
+                    </div>
+                    <div id="table">
+                        <div id="searchbar"><div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div></div>
+                        <div id="thead"></div>
+                        <div id="tbody"></div>
+                        <div id="tempty"></div>
+                    </div>
+                    <div id="hints">
+                        <div class="pad-hints">
+                            <div class="hint"><div class="gl a"></div><div class="hl">Play</div></div>
+                            <div class="hint" id="hint-b" style="display: none;"><div class="gl b"></div><div class="hl">Clear search</div></div>
+                            <div class="hint"><div class="gl x"></div><div class="hl">Settings</div></div>
+                            <div class="hint"><div class="gl y"></div><div class="hl">Rescan</div></div>
+                        </div>
+                        <div class="key-hints">
+                            {i:keyboard}<div class="hint-dot"></div>{i:mouse}
+                            <div class="keycap one"><div>Enter</div></div><div class="hl">Play</div>
+                            <div class="keycap two"><div>Page</div><div>Up</div></div>
+                            <div class="keycap two"><div>Page</div><div>Down</div></div><div class="hl">Scroll</div>
+                        </div>
+                    </div>
+                </div>
+                <div id="spage" class="page-side hidden">
+                    <div id="tabs"></div>
+                    <div id="scope"></div>
+                    <div id="pages"></div>
+                    <div id="shints">
+                        <div class="pad-hints">
+                            <div class="hint"><div class="gl a"></div><div class="hl">Select</div></div>
+                            <div class="hint"><div class="gl b"></div><div class="hl">Back</div></div>
+                            <div class="hint"><div class="gl lb"></div><div class="gl rb"></div><div class="hl">Tabs</div></div>
+                        </div>
+                        <div class="note">Changes are saved as you make them.</div>
+                        <div class="key-hints">
+                            {i:keyboard}<div class="hint-dot"></div>{i:mouse}
+                            <div class="keycap one"><div>Esc</div></div><div class="hl">Back</div>
+                            <div class="keycap one"><div>Tab</div></div><div class="hl">Next tab</div>
+                            <div class="keycap two"><div>Ctrl</div><div>Tab</div></div><div class="hl">Previous</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
         <div id="statusbar">
             <div class="st" id="st-count"></div>
@@ -41,6 +80,7 @@
     </div>
     <div id="menu-layer"></div>
     <div id="menu-host"></div>
+    <div id="popup-layer"></div>
     <div id="dialog-layer"></div>
 </body>
 </rml>

@@ -34,27 +34,12 @@ std::string initial_of(const std::string &title) {
     return "?";
 }
 
-std::string dp(float value) {
-    char text[32];
-    std::snprintf(text, sizeof(text), "%.0fdp", value);
-    return text;
-}
-
-std::string column_style(Column c, const Widths &w) {
-    // the title takes what the others leave, never less than its width
-    if (c == Column::Title) return "flex: 1 1 0; min-width: " + dp(w[size_t(c)]) + ";";
-    return "flex: 0 0 auto; width: " + dp(w[size_t(c)]) + ";";
-}
-
 const char *column_class(Column c) {
     switch (c) {
-    case Column::Icon: return "c-icon";
-    case Column::Title: return "c-title";
+    case Column::Title: return "c-game";
     case Column::TitleId: return "c-id";
     case Column::Version: return "c-ver";
     case Column::Status: return "c-status";
-    case Column::RunsIn: return "c-runs";
-    case Column::File: return "c-file";
     }
     return "";
 }
@@ -130,7 +115,8 @@ std::string icon_glyph(std::string_view name) {
         {"monitor", 0xE121},       {"sun", 0xE17C},           {"moon", 0xE122},           {"keyboard", 0xE284},
         {"volume-2", 0xE1AB},      {"package", 0xE12D},       {"triangle-alert", 0xE193}, {"circle-check", 0xE226},
         {"circle-alert", 0xE07B},  {"loader-circle", 0xE10E}, {"hard-drive", 0xE0F0},     {"layers", 0xE104},
-        {"sliders-horizontal", 0xE29A}, {"cpu", 0xE0AD}};
+        {"sliders-horizontal", 0xE29A}, {"cpu", 0xE0AD},
+        {"list", 0xE10C},          {"grid-3x3", 0xE0EC},      {"mouse", 0xE28E}};
     for (const auto &[n, cp] : icons)
         if (name == n) return utf8_of(cp);
     return {};
@@ -185,51 +171,43 @@ std::string menu_html(const std::vector<MenuItem> &items) {
     return s + "</div>";
 }
 
-std::string table_head_html(const Widths &widths, Column sort, bool ascending) {
+std::string table_head_html(Column sort, bool ascending) {
     std::string s;
     for (int i = 0; i < COLUMNS; i++) {
         const Column c = Column(i);
         const ColumnInfo &info = column_info(c);
-        s += std::string("<div class=\"th ") + column_class(c) + (c == sort ? " sorted" : "") + "\" style=\"" + column_style(c, widths) + "\"";
-        if (c != Column::Icon) s += " data-action=\"sort\" data-arg=\"" + std::string(info.name) + "\"";
-        s += "><div class=\"th-l nowrap\">" + e(info.label) + "</div>";
+        s += std::string("<div class=\"th ") + column_class(c) + (c == sort ? " sorted" : "") + "\" data-action=\"sort\" data-arg=\"" + info.name + "\">";
+        s += "<div class=\"th-l nowrap\">" + e(info.label) + "</div>";
         if (c == sort) s += icon_html(ascending ? "chevron-up" : "chevron-down", "ic arrow");
-        if (c != Column::Icon) s += "<div class=\"grip\" data-grip=\"" + std::to_string(i) + "\"></div>";
         s += "</div>";
     }
-    return s;
+    return s + "<div class=\"th c-opts\"><div class=\"th-l nowrap\">Options</div></div>";
 }
 
-std::string table_row_html(const RowInfo &r, const Widths &w, bool selected) {
+std::string table_row_html(const RowInfo &r, bool selected) {
     std::string s = "<div class=\"tr f";
-    if (r.alternate) s += " alt";
     if (selected) s += " sel";
     if (r.unreadable) s += " broken";
     s += "\" data-index=\"" + std::to_string(r.index) + "\" id=\"row-" + std::to_string(r.index) + "\">";
-    auto cell = [&](Column c, const std::string &inner) {
-        s += std::string("<div class=\"td ") + column_class(c) + "\" style=\"" + column_style(c, w) + "\">" + inner + "</div>";
-    };
+    if (selected) s += "<div class=\"glow\"></div>"; // (the rest get one as they are selected: LauncherView::fade_glow)
+    auto cell = [&](Column c, const std::string &inner) { s += std::string("<div class=\"td ") + column_class(c) + "\">" + inner + "</div>"; };
     if (r.unreadable) {
-        cell(Column::Icon, "<div class=\"thumb broken\">" + icon_html("triangle-alert") + "</div>");
-        cell(Column::Title, "<div class=\"nowrap\">" + e(r.title) + "</div>");
+        cell(Column::Title, "<div class=\"thumb broken\">" + icon_html("triangle-alert") + "</div><div class=\"names\"><div class=\"title nowrap\">" + e(r.title) +
+                                "</div><div class=\"sub nowrap\">" + e(r.file) + "</div></div>");
+        cell(Column::Status, "<div class=\"dot bad\"></div><div class=\"nowrap\">Cannot be read</div>");
         cell(Column::TitleId, "");
         cell(Column::Version, "");
-        cell(Column::Status, "<div class=\"status\"><div class=\"dot bad\"></div><div class=\"nowrap\">Cannot be read</div></div>");
-        cell(Column::RunsIn, "");
-        cell(Column::File, "<div class=\"nowrap\">" + e(r.file) + "</div>");
     } else {
-        cell(Column::Icon, "<div class=\"thumb\" style=\"" + art_style(r.icon, r.title_id) + "\">" + art_letter(r.icon, r.title) + "</div>");
-        cell(Column::Title, "<div class=\"nowrap\">" + e(r.title) + "</div>");
-        cell(Column::TitleId, e(r.id_text));
-        cell(Column::Version, e(r.version));
-        const std::string status = r.running ? std::string("<div class=\"status\"><div class=\"dot run\"></div><div class=\"nowrap\">Running</div></div>")
-                                             : std::string("<div class=\"status\"><div class=\"dot ") + status_class(r.status) + "\"></div><div class=\"nowrap\">" +
-                                                   status_text(r.status) + "</div></div>";
-        cell(Column::Status, status);
-        cell(Column::RunsIn, "<div class=\"nowrap\">" + e(r.runs_in) + "</div>");
-        cell(Column::File, "<div class=\"nowrap\">" + e(r.file) + "</div>");
+        cell(Column::Title, "<div class=\"thumb\" style=\"" + art_style(r.icon, r.title_id) + "\">" + art_letter(r.icon, r.title) +
+                                "</div><div class=\"names\"><div class=\"title nowrap\">" + e(r.title) + "</div></div>");
+        cell(Column::Status, r.running ? std::string("<div class=\"dot run\"></div><div class=\"nowrap\">Running</div>")
+                                       : std::string("<div class=\"dot ") + status_class(r.status) + "\"></div><div class=\"nowrap\">" + status_text(r.status) + "</div>");
+        cell(Column::TitleId, "<div class=\"nowrap\">" + e(r.id_text) + "</div>");
+        cell(Column::Version, "<div class=\"nowrap\">" + e(r.version) + "</div>");
     }
-    return s + "</div>";
+    s += "<div class=\"td c-opts\">";
+    if (!r.unreadable) s += "<div class=\"opt-btn\" data-row-options=\"1\" title=\"Options\">" + icon_html("settings", "ic cog") + "</div>";
+    return s + "</div></div>";
 }
 
 std::string empty_html(bool no_folder, bool filtered, const std::string &folder) {
@@ -291,7 +269,12 @@ std::string about_body_html() {
     s += lic("FreeType", "FreeType License",
              "Renders the text. Portions of this software are copyright The FreeType Project (freetype.org). All rights reserved.");
     s += lic("Inter", "SIL OFL 1.1", "The typeface, by The Inter Project Authors (rsms.me/inter). Its license is in ui/fonts/LICENSE-Inter.txt.");
+    s += lic("Roboto Condensed", "Apache 2.0", "The typeface of the games' list and the toolbar. Its license is in ui/fonts/LICENSE-Roboto.txt.");
     s += lic("Lucide", "ISC", "The icons, by the Lucide Contributors (lucide.dev; parts from Feather, MIT). Its license is in ui/fonts/LICENSE-Lucide.txt.");
+    s += lic("Xbox 360 button pictures", "CC0",
+             "The controller buttons in the hint bars, from the Xbox 360 set of Free Controller & Key Prompts by Xelu (thoseawesomeguys.com/prompts). Its license is in ui/glyphs/LICENSE-Xelu.txt.");
+    s += lic("Xbox 360 web cursors", "Public domain",
+             "The pointers, the console browser's, as the set by MiniYak_YT (rw-designer.com) released to the public domain. Its note is ui/cursors/README.txt.");
     s += lic("Dear ImGui", "MIT", "The player's debugging overlay (F1).");
     s += lic("toml++", "MIT", "Reads and writes config.toml.");
     s += lic("stb", "MIT / public domain", "Image decoding and PNG writing.");
@@ -352,7 +335,7 @@ std::string settings_scope_html(const SettingsPage &page) {
         return "<div class=\"scope-text\"><div class=\"name\">Shared settings</div><div class=\"hint\">Every game uses these unless it has settings of its "
                "own. Select a game in the list to give it its own.</div></div>";
     const bool own = !st.game.empty();
-    std::string s = check_row("own", ("Settings of its own for " + page.game_title).c_str(),
+    std::string s = check_row("own", ("Custom settings for " + page.game_title).c_str(),
                               own ? "Only " + page.title_id + " reads the settings below; the shared ones are untouched."
                                   : "Off: " + page.game_title + " uses the settings every game shares, edited below.",
                               own);
@@ -372,6 +355,8 @@ std::vector<Choice> user_choices() { return {{"0", "User 1"}, {"1", "User 2"}, {
 std::vector<Choice> theme_choices() {
     return {{"system", "The system's (light or dark)"}, {"light", "Light"}, {"dark", "Dark"}};
 }
+
+std::vector<Choice> backdrop_choices() { return {{"animated", "Ribbons, moving"}, {"still", "Ribbons, still"}, {"off", "Plain grey"}}; }
 
 std::string keycaps_html(const std::string &keys, bool waiting) {
     if (waiting) return "<div class=\"keycap press\">Press a key... (Esc cancels)</div>";
@@ -542,6 +527,9 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
             look += "\" data-action=\"accent\" data-arg=\"" + hex + "\" style=\"background-color: " + hex + ";\"></div>";
         }
         look += "</div></div>";
+        look += select_row("backdrop", "Background", "The ribbons behind the list; they stop while the window is hidden or minimized.",
+                           label_of(backdrop_choices(), page.backdrop));
+        look += check_row("ui.sounds", "Interface sounds", "A tick as the selection moves, a swish between pages, notes for choosing and going back.", page.sounds);
         s += group("Appearance", look);
         std::string folder = "<div class=\"setting\"><div class=\"label\"><div class=\"name\">Games folder</div>"
                              "<div class=\"hint\">Discs are read in place, one level of subfolders deep.</div></div></div>"

@@ -1947,68 +1947,158 @@ launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <p
 
 ### The launcher's interface (`frontend/ui`, `launcher_view.*`, `settings_view.*`)
 
-A desktop program in the manner of the classic emulator front ends
-(Dolphin, PCSX2, RPCS3), the owner's choice on 2026-11-06 over the first
-TV-style layout (big tiles, a detail panel and key hints), which it replaced
-entirely:
+The main window follows a mockup the owner gave on 2026-11-07, in the manner
+of the console's own dashboard (it replaced the first TV-style layout and the
+desktop-tool one after it), drawn for a window 1240dp wide:
 
-- **The main window** (`launcher.rml`, `launcher.rcss`): a menu bar (File,
-  Emulation, Options, Tools, Help: dropdowns with icons, shortcuts, greyed
-  items and the theme's check mark); a toolbar (Play, which becomes Stop
-  while a game runs; Prepare, Rebuild or Try preparing again by the selected
-  game's status; Open folder, Rescan, Settings, Controls; a search box that
-  filters on every word of the title, title ID and file name); the games as
-  a table (icon, Title, Title ID, Version, Status, Runs in, Disc file:
-  sorted by a header's click, again for descending; each column's edge
-  dragged to resize it; every other row shaded; a right click's menu: Play,
-  Play interpreted, Prepare, Game settings, Open the disc's folder, Copy the
-  title ID or path); and a status bar (the count or the scan's progress, the
-  folder, which opens the folder dialog on a click, the running game with
-  Stop, a message that fades, a build's progress while its dialog is
-  hidden). With nothing to list, the table says why (no folder, no games, a
-  search that hides them all) with the button that helps.
+- **The main window** (`launcher.rml`, `launcher.rcss`): a header (the
+  wordmark, and the sections: *games* and *settings*, the pages of the
+  window, one of them lit; *help*, which opens its menu
+  under it); under it a strip twice the window's width with the library and
+  the settings side by side, which slides from one to the other (below); in
+  the library, the search box (above the list, there while it has games),
+  filtering on every word of the title, title ID and file name; a
+  toolbar (Play, which becomes Stop while a game runs; Play interpreted; Prepare, Rebuild or Try
+  preparing again by the selected game's status; Open Folder, Rescan,
+  Settings, Controls; at its right the views: the list, the grid, which is not
+  there yet, and the keyboard's and the pad's settings); the games as glossy
+  rows (cover, name, status, title ID, version and an Options button that
+  opens the row's menu: Play, Play interpreted, Prepare, Game settings, Open
+  the disc's folder, Copy the title ID or path; the same menu on a right
+  click) under a header whose labels sort, again for descending, the selected
+  row in Xbox green; the hints for the pad (A, B, X, Y) and the keyboard;
+  and a status bar (the count or the scan's progress, the folder, which opens
+  the folder dialog on a click, the running game with Stop, a message that
+  fades, a build's progress while its dialog is hidden). With nothing to
+  list, the table says why (no folder, no games, a search that hides them
+  all) with the button that helps. What the mockup shows and is not here yet:
+  its own window buttons (the system's frame is used).
+- **The backdrop**: the window's background is not an element's: the renderer
+  draws it under the interface at the start of every frame
+  (`Renderer::set_backdrop`, `ui.frag` `MODE_BACKDROP`; `#app` and `body` are
+  transparent). It is the grey gradient the window used to wear, so the text
+  keeps its contrast, with six broad ribbons of silk in layers, in fixed
+  colours, as in the mock: at the left a thick dark grey one (#6d6d6f) and a
+  thin light grey one (#aaaaaa), at the right four greens of different tones
+  (the accent's, darker and lighter; the colours change only when the accent
+  does, never with the selected game). They lean up to the right, sway slowly
+  and pass over and under one another; the header, the toolbar and the game
+  rows are translucent (alpha in `launcher.rcss`'s gradients), which lets the
+  ribbons through behind them. A ribbon is always
+  full width: a strip of constant width along a curve in space (it sweeps down
+  the window, leans up to the right, sways and winds round a spiral that turns
+  with the clock) whose width's direction twists about the curve, so it shows
+  its other face (a little darker) where it turns, goes edge-on and passes
+  over or under itself; it does not thin out and fade. The grey gradient is
+  one full-screen pass (`ui.frag`, no texture, a function of the position);
+  the ribbons are triangles built on the CPU every frame
+  (`frontend/ui/ribbons.cpp`, `build_ribbons`: 150 sections by 9 vertices
+  across, lit per vertex with a diffuse term and a silk sheen, a perspective
+  camera 2.2 window heights away). They are opaque and drawn with a real depth
+  test (the depth in the first texture coordinate, `imode.w = 2` in `ui.vert`;
+  the depth is cleared in the pass after the gradient), not sorted, so folds
+  and crossings are exact to the pixel; a hair of noise in `ui.frag` hides the
+  steps of 8 bits in their gradients. Each edge has a one-pixel fringe of
+  alpha 0 in place of multisampling, drawn after, tested against the depth but
+  not written, blended, so the edges
+  stay crisp (no glow, no blur). Sizes are in window heights. `[launcher] backdrop`:
+  `animated`, `still` or `off` (the grey alone), in the Interface tab, read by
+  `LauncherView::update_backdrop` every frame; the clock stops while the
+  window is minimized, hidden or covered (focus does not matter).
+- **Motion**: the dashboard's way of moving, in short times with an ease-out
+  (cubic out, as the console's blades; its own blade shuffle is about 180 ms
+  and the strip's slide here 340 ms). The selection fades from one row to
+  the next (`.tr` transitions its fill, border and margins; the glow is a
+  box-shadow, which RmlUi cannot animate, so it is a child `.glow` whose
+  opacity is animated, `LauncherView::fade_glow`, only on the row that is or
+  was just selected). A list that has just appeared (the start, a new
+  folder, a rescan, a new sort) comes in row by row, 40 ms apart, from 28 dp
+  to the left and fading in (`animate_rows_in`: each row holds still at
+  nothing for its turn and then rises, because RmlUi shows an element at
+  rest during an animation's delay). A tab's page comes in from the side the
+  tab lies on, 40 dp and fading in (`SettingsView::slide_page_in`); the
+  strip's page left behind dims to 30% while the other comes up; menus drop
+  in, dialogs rise and grow a little while the window dims (`@keyframes` in
+  theme.rcss). A box-shadow cannot change over time, so a state whose
+  shadows differ snaps while its fill fades.
+- **Pointers** (`ui/cursor_file.*`, `SystemInterface::load_cursors`,
+  `frontend/ui/assets/cursors/`): the console browser's, from the set by
+  MiniYak_YT that the author released to the public domain (README.txt beside
+  the files; the .cur and .ani are shipped as they came, renamed). They are read
+  at start as they are (a .cur is a DIB with a hot spot, an .ani a RIFF of
+  .cur frames with a time per step) and made SDL colour cursors, with a
+  twice-as-large copy for a high-density screen; RmlUi's `cursor` property
+  picks one by name: `default` the grey drop, `pointer` the hand (what can
+  be clicked), `text`, `unavailable` (the disabled toolbar buttons),
+  `progress` (over the build's bars) and `wait` the animated ones, and the
+  resize, move and crosshair ones. A name without a file keeps the system's
+  cursor, so a missing folder costs only the look. The reading is tested
+  (`frontend_test`) on made files and on the shipped ones.
+- **Sounds** (`ui_sound.*`, `[launcher] sounds`, the Interface tab): a tick as
+  the selection or the focus moves, a swish for a tab or between menu titles
+  and a longer one for the strip's slide, a note up for choosing and a note
+  down for going back, short pops for a menu or a dialog opening and
+  closing, a click for a check box, a low pair for what cannot be done or a
+  build that failed and three rising notes for one that finished. They are
+  synthesized when the device opens (`synth_cue`: sine notes with their
+  harmonics and a swept band of noise, scaled to a peak of 0.2 to 0.3; nothing
+  recorded or taken from any system, so no sound file ships), mixed by one
+  SDL3 audio stream on the default device; the same cue twice within 30 ms
+  plays once. A window drawn offscreen (`--render-size`) opens no device.
 - **Dialogs** over the window (theme.rcss's `.dialog`): preparing a game (the
   stages, the bar, the time, the file, the log; Run in background hides it
   behind the status bar's progress, Cancel stops it; then Play, or Try again
   and Play interpreted), About (the licenses), and messages.
-- **The settings window** (`settings_view.*`, `settings.rml`,
-  `settings.rcss`): an OS window of its own over the main one, its own
-  `ui::Window` (device and swapchain) and RmlUi context with its own render
-  interface (fonts are RmlUi's, shared; `Rml::ReleaseRenderManagers()` after
-  its context is removed hands its textures back before its device goes).
-  Tabs Video, Sound, Controllers, Keyboard, System, Profile, Interface (System and Profile: see "The player's system UI"); above them, whose
-  settings these are and the "Settings of its own for <game>" check box;
-  check boxes, sliders and dropdowns in groups; the 25 bindings, each
-  changed by a click and the next key; the theme, the accent and the games
-  folder. Saved as they change; the look goes back to the main window
-  through `SettingsHost`.
+- **The settings page** (`settings_view.*`, `settings.rcss`, `#spage` of
+  `launcher.rml`): the second page of the window's strip, beside the library
+  (`#slide`, `left` from 0 to -100% with a transition, as the console's
+  dashboard slides from one blade to the next; the page left behind is
+  `visibility: hidden` once it is out of sight, so nothing focuses it). Not a
+  window: it lives in the main document and context (`SettingsView::attach`
+  gives it the document each time it is made again; the keys, the pad and
+  the mouse reach it as LauncherView's input does, and `LauncherView`'s own
+  click handler leaves what is inside `#spage` and `#popup-layer` to it).
+  Tabs Video, Sound, Controllers, Keyboard, System, Profile (see "The player's
+  system UI"), Interface, which are the
+  toolbar's buttons; under them, whose settings these are and the "Custom
+  settings for <game>" check box; rows like the games' (check boxes,
+  sliders and dropdowns in groups, the one with focus in the selected row's
+  green); the 25 bindings, each changed by a click and the next key; the
+  theme, the accent and the games folder. Saved as they change; the look goes
+  back to the window through `SettingsHost`. Escape, B or the *games* section
+  slide back. Its look is fixed like the library's (`settings.rcss`, every rule
+  under `#spage`); only its dropdowns' lists follow the theme.
 - **Desktop scale and place**: sizes are dp at the display's scale
   (`SDL_GetWindowDisplayScale`: 100%, 150%...), not the window's, so a
   bigger window shows more rows; the window opens where it was left
   (`[launcher] x, y, width, height, maximized`, kept only while that place
-  is on a display), and the columns' widths and the sort are kept too
-  (`columns`, `sort`).
-- **Themes**: `[launcher] theme` is `system` (the desktop's light or dark,
-  followed live through `SDL_EVENT_SYSTEM_THEME_CHANGED`), `light` or
-  `dark` (Options or the Interface tab). Each is a palette of tokens
+  is on a display), and the sort is kept too (`sort`).
+- **Themes**: the main window's look is fixed (its colours are in
+  `launcher.rcss`, `settings.rcss`); the dialogs and the menus follow
+  `[launcher] theme`: `system` (the desktop's light or dark, followed live
+  through `SDL_EVENT_SYSTEM_THEME_CHANGED`), `light` or `dark` (the Interface
+  tab). Each is a palette of tokens
   (`palette()` in `launcher_model.cpp`: the window, its chrome, lines, three
   levels of text, the states, the selection from the accent) filled into
-  the stylesheets when a document is made; changing it makes both windows'
-  documents again.
+  the stylesheets when a document is made; changing it makes the document
+  again.
 - **Icons**: Lucide (ISC; `ui/fonts/Lucide.ttf`, its license beside it), a
   font of outline icons drawn as text; `{i:name}` in a template and
   `icon_html()` give its glyphs (`launcher_html.cpp` lists the ones used).
+- **Controller buttons**: the hint bars' A, B, X, Y, LB and RB are the Xbox 360 pictures of Xelu's Free
+  Controller & Key Prompts (CC0; `ui/glyphs/`, license beside them). `LauncherView::load` registers them
+  with the renderer as `mem:pad-<button>`, and the stylesheet draws them as `decorator: image(...)`.
 
 Input: the mouse as a desktop program's; the keyboard: the arrows, Page Up
 and Down, Home and End move the selection, Enter plays, F2 opens the game's
 settings, F5 rescans, Ctrl+O the folder, Ctrl+F the search, Ctrl+, the
-settings, Alt+letter or F10 the menus (then the arrows, Enter, Escape),
-Shift+F10 or the menu key the row's menu; in the settings window the arrows
-move focus and change a value, Ctrl+Tab the tab, Escape closes. A pad:
+settings, Alt+E or Alt+H or F10 the menus (then the arrows, Enter, Escape),
+Shift+F10 or the menu key the row's menu; on the settings page the arrows
+move focus and change a value, Tab the next tab, Ctrl+Tab the previous, Escape goes back to the library. A pad:
 the d-pad or stick moves the selection (repeating), A or Start plays, X the
 game's settings, Y rescans, Back the menus, the shoulders a page; in menus
-and dialogs the d-pad moves and B closes; in the settings window the
-shoulders change tabs.
+and dialogs the d-pad moves and B closes; on the settings page the
+shoulders change tabs and B goes back.
 
 Pieces, each apart from the others:
 
@@ -2034,20 +2124,21 @@ Pieces, each apart from the others:
   RmlUi's input.
 - **`launcher_model.*`, `launcher_html.*`**: what the windows say (a game's
   status, durations, the accent's shades, the themes' palettes, the table's
-  columns, widths, sort and filter, the bindings' names, the spatial
+  columns, sort and filter, the bindings' names, the spatial
   navigation) and their structure as RML strings, as plain functions with no
   RmlUi in them (`frontend_test` checks them). **`prepare_job.*`**: a build
   on its worker thread, as state to read (no UI, no SDL).
 - **`launcher_view.*`, `launcher_screens.cpp`, `launcher_input.cpp`**: the
   main window's document: the table rebuilt when what it shows changes (a
   signature of the rows), the menus, the dialogs, the status bar, clicks,
-  keys and the pad into actions. **`settings_view.*`**: the settings window,
+  keys and the pad into actions. **`settings_view.*`**: the settings page,
   its widgets and its input.
 - **`ui/assets/theme.rcss`** (the base, the controls, menus and dialogs both
-  windows share), **`launcher.rcss`**, **`settings.rcss`**, and the two `.rml`
-  templates: the look, with `{tokens}` filled from the palette and the accent
-  (six swatches, `[launcher] accent`). `ui/fonts/`: Inter (SIL OFL 1.1), four
-  weights, and Lucide's icons (ISC), each license beside it.
+  windows share), **`launcher.rcss`**, **`settings.rcss`**, and the `.rml`
+  template: the look, with `{tokens}` filled from the palette and the accent
+  (six swatches, `[launcher] accent`, green by default). `ui/fonts/`: Inter
+  (SIL OFL 1.1), five weights, Roboto Condensed (Apache 2.0), three, for the
+  games and the toolbar, and Lucide's icons (ISC), each license beside it.
 
 - **The games** (`library.cpp`): the ISOs (and bare `default.xex` files) in
   a folder the user picks (`launcher.games` in config.toml; the system's
@@ -2075,7 +2166,7 @@ Pieces, each apart from the others:
   deadzones, the keyboard as a controller (on or off, for which user) and
   each of the 25 bindings (typed, or "Set" and the next key pressed;
   "Xenia's keys" puts the defaults back). These are the shared settings
-  unless "Settings of its own for this game" is ticked: then a
+  unless "Custom settings for" the game is ticked: then a
   `[games.<title ID>]` table holds the game's own copy of the video, audio,
   input and keyboard sections, the player reads it over the shared ones for
   that game (its title ID, once the disc is open) and its overlay saves
@@ -2154,11 +2245,12 @@ the Options menu (`--menu options`), the row's menu (`--context-menu`), the
 prepare dialog running with its log and failed (`--demo-progress`,
 `--demo-fail`), About, an empty folder, and the settings window's Video,
 Keyboard (a binding waiting for its key) and Interface tabs (`--screen
-settings --tab <name>`; the picture is the settings window's). With Vulkan
-validation on, offscreen and in real windows: nothing reported, and the
-settings window opened, closed and opened again in one run (`--keys
-x,wait,b,...`); before `Rml::ReleaseRenderManagers()` its device was destroyed
-with RmlUi's textures still on it and the exit crashed. A real window's run
+settings --tab <name>`; the settings were then a window of their own, drawn
+by a second device: `Rml::ReleaseRenderManagers()` was needed so its textures
+went before it did). Since 2026-11-08 they are a page of the main window:
+pictures of every tab, of a dropdown open and of the slide there and back
+(`--keys x,rb,b`) show no RmlUi assertion (a slider's fill of width 0 with a
+shadow asserted: it has none now). A real window's run
 saved its place in `[launcher]`. Left for a person: the mouse (hover, a
 column's drag, a right click, a slider's drag), typing in the search and the
 folder's field, the folder dialog, a real pad, and the theme followed live

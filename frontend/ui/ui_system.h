@@ -12,6 +12,8 @@
 
 #include <SDL3/SDL.h>
 
+#include <filesystem>
+#include <map>
 #include <string>
 
 namespace xf::ui {
@@ -31,6 +33,10 @@ class SystemInterface final : public Rml::SystemInterface {
     void ActivateKeyboard(Rml::Vector2f caret_position, float line_height) override;
     void DeactivateKeyboard() override;
 
+    // The cursors drawn from the .cur and .ani files in a folder (cursors/ beside the screens: the console browser's,
+    // frontend/ui/assets/cursors/README.txt); a name without a file keeps the system's cursor. Returns how many were made.
+    int load_cursors(const std::filesystem::path &folder);
+
     // the window text input goes to: the one whose context is being given
     // its events (the launcher has two)
     void set_window(SDL_Window *window) { window_ = window; }
@@ -41,6 +47,7 @@ class SystemInterface final : public Rml::SystemInterface {
   private:
     SDL_Window *window_;
     SDL_Cursor *cursors_[5] = {};
+    std::map<std::string, SDL_Cursor *> custom_; // by the CSS name ("default", "pointer", "text", "wait"...)
     int errors_ = 0;
 };
 

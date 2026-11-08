@@ -16,7 +16,7 @@ layout(set = 1, binding = 0) uniform sampler2D tex;
 layout(set = 2, binding = 0) uniform sampler2D mask_tex;
 
 const int MODE_TEXTURE = 0, MODE_GRADIENT = 1, MODE_COLOR_MATRIX = 2, MODE_MASK = 3, MODE_SHADOW = 4, MODE_BLUR = 5,
-          MODE_CLAMPED = 6;
+          MODE_CLAMPED = 6, MODE_BACKDROP = 7;
 const int LINEAR = 0, RADIAL = 1, CONIC = 2, REPEATING_LINEAR = 3, REPEATING_RADIAL = 4, REPEATING_CONIC = 5;
 const float PI = 3.14159265;
 
@@ -31,10 +31,43 @@ vec4 gradient_color(float t) {
 
 float blur_weight(int i) { return draw.blur_weights[abs(i)]; }
 
+// ---- the backdrop: the launcher's grey
+//
+// The gradient the main window used to wear, top to bottom, so that the text
+// over it keeps its contrast, and a hair of noise against banding. The ribbons
+// over it are triangles (ribbons.cpp), drawn after this by the renderer, with a depth test.
+
+const vec3 BACKDROP_GREY[10] = vec3[](
+    vec3(0.247, 0.239, 0.263), vec3(0.247, 0.239, 0.263), vec3(0.278, 0.271, 0.294), vec3(0.345, 0.341, 0.361),
+    vec3(0.420, 0.416, 0.431), vec3(0.478, 0.478, 0.486), vec3(0.604, 0.604, 0.596), vec3(0.690, 0.682, 0.690),
+    vec3(0.729, 0.722, 0.733), vec3(0.769, 0.757, 0.769));
+const float BACKDROP_AT[10] = float[](0.0, 0.12, 0.21, 0.29, 0.47, 0.58, 0.69, 0.81, 0.90, 1.0);
+
+vec3 backdrop_grey(float y) {
+    vec3 c = BACKDROP_GREY[0];
+    for (int i = 1; i < 10; i++)
+        c = mix(c, BACKDROP_GREY[i], clamp((y - BACKDROP_AT[i - 1]) / (BACKDROP_AT[i] - BACKDROP_AT[i - 1]), 0.0, 1.0));
+    return c;
+}
+
+float hash12(vec2 p) {
+    vec3 q = fract(vec3(p.xyx) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+vec3 backdrop() {
+    vec3 col = backdrop_grey(in_uv.y);
+    col += (hash12(gl_FragCoord.xy) - 0.5) / 255.0;
+    return clamp(col, 0.0, 1.0);
+}
+
 void main() {
     const int mode = draw.imode.x;
     if (mode == MODE_TEXTURE) {
         out_color = in_color * draw.color * texture(tex, in_uv);
+        // the ribbons: a hair of noise against the steps of 8 bits in their gradients
+        if (draw.imode.w == 2) out_color.rgb += (hash12(gl_FragCoord.xy) - 0.5) / 255.0 * out_color.a;
     } else if (mode == MODE_GRADIENT) {
         const int func = draw.imode.y;
         const vec2 p = draw.pv.xy, v = draw.pv.zw;
@@ -55,6 +88,8 @@ void main() {
             t = t0 + mod(t - t0, t1 - t0);
         }
         out_color = in_color * gradient_color(t);
+    } else if (mode == MODE_BACKDROP) {
+        out_color = vec4(backdrop(), 1.0);
     } else if (mode == MODE_COLOR_MATRIX) {
         const vec4 c = texture(tex, in_uv);
         out_color = vec4(vec3(draw.color_matrix * c), c.a);

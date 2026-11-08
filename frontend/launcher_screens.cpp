@@ -14,7 +14,8 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *const MENUS[] = {"file", "emulation", "options", "tools", "help"};
+const char *const MENUS[] = {"help"};
+constexpr int MENU_COUNT = 1;
 
 std::string px(float value) {
     char text[32];
@@ -46,35 +47,10 @@ std::vector<MenuItem> LauncherView::menu_items(const std::string &name) {
     const GameStatus status = g ? status_of(*g) : GameStatus::Ready;
     const bool playable = g && player_of(*g) && !running;
     const char *prepare = status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild the library with the new code" : "Rebuild the library";
-    if (name == "file")
-        return {item("browse", "Open games folder...", "Ctrl+O", "folder-open"), item("rescan", "Rescan the folder", "F5", "refresh-cw"), menu_separator(),
-                item("exit", "Exit", "Alt+F4", "log-out")};
-    if (name == "emulation") {
-        std::vector<MenuItem> m = {item("play", "Play", "Enter", "play", playable), item("play-interpreted", "Play interpreted", "", "cpu", playable),
-                                   item("prepare", prepare, "", "hammer", g && !running && !building), menu_separator(),
-                                   item("stop", "Stop", "", "square", running)};
-        if (building && dialog_ != Dialog::Prepare) m.push_back(item("show-prepare", "Show the build's progress", "", "loader-circle"));
-        return m;
-    }
-    if (name == "options") {
-        std::vector<MenuItem> m = {item("settings", "Settings...", "Ctrl+,", "settings"), item("controls", "Controls...", "", "gamepad-2"),
-                                   item("game-settings", "Game settings...", "F2", "sliders-horizontal", g != nullptr),
-                                   menu_separator()};
-        const ThemeChoice theme = theme_from_text(core_.launcher().theme);
-        const std::pair<ThemeChoice, const char *> themes[] = {
-            {ThemeChoice::System, "The system's theme"}, {ThemeChoice::Light, "Light theme"}, {ThemeChoice::Dark, "Dark theme"}};
-        for (const auto &[choice, label] : themes) {
-            MenuItem t = item("theme", label, "", "", true, theme_text(choice));
-            t.checked = choice == theme;
-            m.push_back(t);
-        }
-        return m;
-    }
-    if (name == "tools")
-        return {item("open-game-folder", "Open the disc's folder", "", "folder", g != nullptr), item("copy-id", "Copy the title ID", "", "copy", g != nullptr),
-                menu_separator(), item("open-cache", "Open the game libraries' folder", "", "package"),
+    if (name == "help")
+        return {item("about", "About XenoForge", "", "info"), menu_separator(),
+                item("open-cache", "Open the game libraries' folder", "", "hard-drive"),
                 item("open-config", "Open the settings file", "", "file-text"), item("open-logs", "Open the logs folder", "", "folder")};
-    if (name == "help") return {item("about", "About XenoForge", "", "info")};
     // a row's own menu
     return {item("play", "Play", "Enter", "play", playable), item("play-interpreted", "Play interpreted", "", "cpu", playable),
             item("prepare", prepare, "", "hammer", g && !running && !building), menu_separator(),
@@ -93,6 +69,7 @@ void LauncherView::open_menu(const std::string &name, bool keyboard) {
     if (!layer || !host) return;
     if (!menu_.empty() && menu_ != "context")
         if (Rml::Element *t = by_id(("menu-" + menu_).c_str())) t->SetClass("open", false);
+    play_sound(menu_.empty() || menu_ == "context" ? Cue::MenuOpen : Cue::Tab); // from one title to the next: the tab's swish
     menu_ = name;
     menu_keyboard_ = keyboard;
     menu_items_ = menu_items(name);
@@ -141,6 +118,12 @@ void LauncherView::close_menu() {
     hot_ = -1;
 }
 
+void LauncherView::dismiss_menu() {
+    if (menu_.empty()) return;
+    play_sound(Cue::MenuClose);
+    close_menu();
+}
+
 void LauncherView::menu_move(int delta) {
     Rml::Element *menu = by_id("menu");
     if (!menu) return;
@@ -152,15 +135,16 @@ void LauncherView::menu_move(int delta) {
         at = at < 0 ? (delta > 0 ? 0 : int(items.size()) - 1) : (at + delta + int(items.size())) % int(items.size());
         if (items[size_t(at)]->HasAttribute("data-action")) break;
     }
+    if (at != hot_) play_sound(Cue::Focus);
     hot_ = at;
     for (size_t i = 0; i < items.size(); i++) items[i]->SetClass("hot", int(i) == hot_);
 }
 
 void LauncherView::menu_switch(int delta) {
     int at = 0;
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < MENU_COUNT; i++)
         if (menu_ == MENUS[i]) at = i;
-    open_menu(MENUS[(at + delta + 5) % 5], true);
+    open_menu(MENUS[(at + delta + MENU_COUNT) % MENU_COUNT], true);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +156,7 @@ void LauncherView::show_dialog(Dialog dialog, const std::string &title, const st
     if (!layer) return;
     layer->SetInnerRML(dialog_html(title, body, buttons, width_dp));
     layer->SetClass("open", true);
+    play_sound(Cue::MenuOpen);
     dialog_ = dialog;
     defer([this] {
         if (Rml::Element *b = by_id("dlg-first")) b->Focus(pad_mode_);
@@ -269,6 +254,8 @@ void LauncherView::update_prepare() {
         cached_.clear(), stale_.clear(), rows_sig_.clear();
         if (failed) failed_.insert(prepare_title_id_);
         if (done) failed_.erase(prepare_title_id_);
+        if (done) play_sound(Cue::Done);
+        else if (failed) play_sound(Cue::Deny);
         if (dialog_ != Dialog::Prepare || s.cancelled) {
             if (s.cancelled) set_message("Preparing " + prepare_title_ + " was cancelled", 0, 8);
             else if (failed) set_message("Preparing " + prepare_title_ + " failed: " + s.error, 2, 0);
@@ -397,6 +384,7 @@ void LauncherView::update() {
     auto work = std::move(deferred_);
     deferred_.clear();
     for (auto &fn : work) fn();
+    settings_->update();
     for (size_t i = 0; i < timers_.size();) {
         if (timers_[i].first <= now_) {
             auto fn = std::move(timers_[i].second);
@@ -423,10 +411,11 @@ void LauncherView::update() {
         }
         set_message(summary, 0, 15);
         rows_sig_.clear();
-        if (settings_) settings_->set_game(selected_game()); // the overlay may have changed the settings
+        settings_->set_game(selected_game()); // the overlay may have changed the settings
     }
     poll_listing();
     rebuild_rows();
+    update_backdrop();
 
     // the checks' and pictures' requests, once there is something to show
     if (demo_pending_ && (!listing_.games.empty() || !listing_.busy)) {
@@ -454,7 +443,7 @@ void LauncherView::update() {
                 if (opt_.tab == settings_tab_name(SettingsTab(i))) tab = SettingsTab(i);
             open_settings(tab);
         }
-        if (settings_ && !capture_pending_.empty()) {
+        if (!capture_pending_.empty()) {
             settings_->begin_capture(capture_pending_);
             capture_pending_.clear();
         }
