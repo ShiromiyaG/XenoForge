@@ -66,6 +66,11 @@ class Presenter {
     void capture_next() { capture_ = true; }
     bool capturing() const { return capture_; } // asked, and no picture taken since
     bool captured(render::Image &picture, uint64_t &swap);
+    // The window's next present is copied back too, with the overlay and the dialogs drawn over the picture (what a
+    // person sees; --window-shots): the window's thread waits for that one present to finish. window_captured()
+    // hands the copy over (RGBA) once, on the window's thread.
+    void capture_window_next() { window_capture_ = true; }
+    bool window_captured(render::Image &out);
     // the window's work on the GPU done (the renderer's goes on)
     void idle();
 
@@ -126,7 +131,10 @@ class Presenter {
     Picture pictures_[PICTURES];
     std::mutex mutex_; // latest_, showing_ and each picture's read and copying, between the threads
     int latest_ = -1, showing_ = -1;
-    std::atomic<bool> capture_{false};
+    std::atomic<bool> capture_{false}, window_capture_{false};
+    vk::Buffer window_copy_;
+    bool window_ready_ = false;
+    uint32_t window_w_ = 0, window_h_ = 0;
 
     // the window (its thread)
     VkCommandPool commands_ = VK_NULL_HANDLE;

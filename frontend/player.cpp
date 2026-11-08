@@ -22,6 +22,8 @@
 // run and prints the report (frames presented, swaps, input states
 // delivered, sound frames played, then boot's); --screenshots <dir> writes
 // every --screenshot-every N swaps' front buffer there (300 by default);
+// --window-shots <dir> saves the window itself (the overlay and the system's dialogs over the picture) every
+// --window-shot-every S seconds (2); --ui-demo <list> opens samples of the system's dialogs (docs/runtime.md);
 // --press start@40 (repeatable; tools/game.h) holds buttons on user 0's
 // controller at times on the scheduler's clock; --overlay opens the overlay
 // from the start; --rates prints a line a second (boot's, with the frames
@@ -222,6 +224,10 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     uint64_t screenshot_every = 300;
     bool sound_wanted = true, overlay = false, print_rates = false;
     bool storage_given = false, directory_saves = false, system_ui = true;
+    std::filesystem::path window_shots; // --window-shots: the window itself (the overlay and dialogs on it) saved here
+    double window_shot_every = 2.0, next_window_shot = 1.0;
+    uint64_t window_shots_written = 0;
+    double restart_after = 0; // --restart-after S: the overlay's "Restart the title" pressed at S seconds (a check of it)
     std::string ui_demo; // --ui-demo's list of dialogs to open at the start (a check without a game's help)
     std::vector<game::Press> presses;
     for (int i = 2; i < argc; i++) {
@@ -232,6 +238,12 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             o.storage = argv[++i], storage_given = true;
         else if (a == "--directory-saves")
             directory_saves = true;
+        else if (a == "--window-shots" && i + 1 < argc)
+            window_shots = argv[++i];
+        else if (a == "--window-shot-every" && i + 1 < argc)
+            window_shot_every = std::strtod(argv[++i], nullptr);
+        else if (a == "--restart-after" && i + 1 < argc)
+            restart_after = std::strtod(argv[++i], nullptr);
         else if (a == "--no-system-ui")
             system_ui = false;
         else if (a == "--ui-demo" && i + 1 < argc)
@@ -358,8 +370,11 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     // model does not know is left to the kernel's default
     frontend::SystemUi sysui([&k] { return kernel::profile_summary(k); });
     if (system_ui) {
-        kernel::set_ui_handler(k, [&sysui](const kernel::UiRequest &r, kernel::UiDone done) {
-            return sysui.handle(r, std::move(done));
+        kernel::set_ui_handler(k, [&sysui, &k](const kernel::UiRequest &r, kernel::UiDone done) {
+            const bool taken = sysui.handle(r, std::move(done));
+            std::printf("ui: dialog kind %u (user %u) %s at %.1f s\n", unsigned(r.kind), r.user,
+                        taken ? "opened" : "declined", k.uptime_ms() / 1000.0);
+            return taken;
         });
         kernel::set_toast_handler(k, [&sysui](const kernel::Toast &t) { sysui.toast(t); });
     }
@@ -424,12 +439,14 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     frontend::ConsolePages pages;
     frontend::PadNavigator pad_nav;
     bool dialog_was_up = false, restart_requested = false;
+    uint64_t answered_seen = 0;
     // --ui-demo: dialogs opened at the start with samples of what titles ask, answered by the pad and keyboard
     for (size_t at = 0; at < ui_demo.size();) {
         size_t comma = ui_demo.find(',', at);
         std::string name = ui_demo.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
         at = comma == std::string::npos ? ui_demo.size() : comma + 1;
         kernel::UiRequest r;
+        if (name == "console") continue; // (opens the overlay's console section)
         if (name == "toast") {
             kernel::Toast t;
             t.kind = kernel::Toast::Kind::Achievement;
@@ -581,7 +598,10 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         if (dialog_up) {
             const uint64_t at = k.uptime_ms();
             const input::Gamepad pad = controllers.view(at)[sysui.user()].pad;
-            if (!dialog_was_up)
+            // (a dialog answered and the next one up at once is a new dialog too)
+            const bool opened = !dialog_was_up || sysui.answered() != answered_seen;
+            answered_seen = sysui.answered();
+            if (opened)
                 pad_nav.reset(pad, at); // a button already down when it opened is not an answer
             else
                 for (frontend::Nav nav : pad_nav.feed(pad, at)) sysui.navigate(nav);
@@ -593,6 +613,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         const double seconds = std::chrono::duration<double>(now - started).count();
         if (quit_after > 0 && seconds >= quit_after)
             quit = true, ended = "quit after " + std::to_string(seconds) + " s";
+        if (restart_after > 0 && seconds >= restart_after && !quit) restart_requested = quit = true, ended = "restart";
         if (k.stopped) quit = true, ended = "stopped: " + k.stop_reason;
         uint32_t exit_code = 0;
         if (k.wait_main(0, &exit_code)) quit = true, ended = "the main thread ended";
@@ -777,6 +798,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                     ImGui::EndTable();
                 }
             }
+            if (ui_demo.find("console") != std::string::npos) ImGui::SetNextItemOpen(true, ImGuiCond_Once); // (--ui-demo console)
             if (ImGui::CollapsingHeader("Console: system, profile, achievements")) {
                 frontend::ConsolePages::Host host{settings,
                                                   o.storage,
@@ -804,8 +826,20 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         view.vsync = settings.video.vsync;
         view.smooth = settings.video.smooth;
         view.stretch = settings.video.aspect == "stretch";
+        if (!window_shots.empty() && seconds >= next_window_shot) {
+            presenter.capture_window_next();
+            next_window_shot = seconds + window_shot_every;
+        }
         const bool fresh = presenter.present(
             view, [](VkCommandBuffer cmd) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd); });
+        if (render::Image shot; presenter.window_captured(shot)) {
+            std::filesystem::path path =
+                window_shots / (std::string(title_id) + "_window_" + std::to_string(++window_shots_written) + ".png");
+            if (write_png(path, shot))
+                std::printf("screenshot: the window, %s\n", path.string().c_str());
+            else
+                std::fprintf(stderr, "could not write %s\n", path.string().c_str());
+        }
         last_present = Clock::now();
         refreshes++;
         if (fresh) presented++, shown_any = true;
@@ -853,7 +887,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             std::printf("%s\n", next.empty() ? "" : settings.follow_launches ? "; starting it" : " (follow_launches is off)");
         }
         if (restart_requested || (!next.empty() && settings.follow_launches)) {
-            std::vector<std::pair<std::string, std::string>> replace = {{"--launch-data", ""}, {"--quit-after", ""}};
+            std::vector<std::pair<std::string, std::string>> replace = {{"--launch-data", ""}, {"--quit-after", ""}, {"--restart-after", ""}};
             if (!restart_requested) replace.push_back({"--xex", next});
             if (!restart_requested && !k.title_exit.launch_data.empty()) {
                 std::filesystem::path file = o.storage / "launch-data.bin";

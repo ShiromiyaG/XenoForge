@@ -245,8 +245,16 @@ void achievements(const std::filesystem::path &storage) {
         out.write(reinterpret_cast<const char *>(bytes.data()), std::streamsize(bytes.size()));
     }
     run(storage, [](ppc::Context &c) {
+        std::vector<Toast> toasts; // the host's handler sees the unlock once (a repeat is no new toast)
+        set_toast_handler(*K, [&](const Toast &t) { toasts.push_back(t); });
         CHECK(earn_achievement(*K, 0, 2));
-        CHECK(earn_achievement(*K, 0, 2));   // again: still true, nothing changes
+        CHECK(toasts.size() == 1 && toasts[0].kind == Toast::Kind::Achievement && toasts[0].title == u"Label 2" &&
+              toasts[0].gamerscore == 20 && toasts[0].text == u"Done");
+        CHECK(earn_achievement(*K, 0, 2) && toasts.size() == 1); // again: still true, nothing changes
+        ProfileSummary summary = profile_summary(*K);
+        CHECK(summary.achievements.size() == 2 && summary.gamerscore == 20 && summary.gamerscore_total == 30 &&
+              summary.achievements[1].unlocked && !summary.achievements[0].unlocked);
+        set_toast_handler(*K, nullptr);
         CHECK(!earn_achievement(*K, 0, 99)); // not in the title
         CHECK(!earn_achievement(*K, 3, 1));  // nobody signed in at index 3
         // XGIUserWriteAchievements through the app dispatcher's message is the same call

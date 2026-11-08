@@ -8,6 +8,8 @@
 #include "stb_image.h"
 
 #include <cstring>
+#include <functional>
+#include <string_view>
 
 namespace xf::frontend {
 
@@ -101,7 +103,7 @@ void choices_row(SystemUi &ui, Dialog &d) {
         if (i) ImGui::SameLine();
         const bool on = i == d.selected;
         if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-        if (ImGui::Button((d.choices[i] + "##c" + std::to_string(i)).c_str(), ImVec2(120, 0))) {
+        if (ImGui::Button((d.choices[i] + "##c" + std::to_string(i)).c_str(), ImVec2(150, 0))) {
             d.selected = i;
             if (on) ImGui::PopStyleColor();
             ui.navigate(Nav::Accept);
@@ -124,6 +126,7 @@ void draw_dialog(SystemUi &ui, IconCache &icons, Dialog &d) {
     ImGui::Begin(d.title.c_str(), nullptr,
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
                      ImGuiWindowFlags_NoSavedSettings | (d.achievements ? 0 : ImGuiWindowFlags_AlwaysAutoResize));
+    ImGui::SetWindowFontScale(1.3f); // the dialogs are read from the sofa
     if (const char *name = icon_name(d.icon)) ImGui::TextDisabled("%s", name);
     for (const std::string &line : d.lines) ImGui::TextWrapped("%s", line.c_str());
     if (d.text_entry) {
@@ -192,8 +195,9 @@ void draw_toasts(SystemUi &ui, IconCache &icons, double now) {
                      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
                          ImGuiWindowFlags_NoNav);
+        ImGui::SetWindowFontScale(1.2f);
         if (achievement) {
-            if (ImTextureID tex = icons.get(0x80000000u + uint32_t(n), t.toast.icon)) {
+            if (ImTextureID tex = icons.get(0x80000000u | (uint32_t(std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char *>(t.toast.icon.data()), t.toast.icon.size()))) & 0x7FFFFFFFu), t.toast.icon)) {
                 ImGui::Image(tex, ImVec2(48, 48));
                 ImGui::SameLine();
             }

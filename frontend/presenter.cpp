@@ -360,6 +360,18 @@ bool Presenter::captured(render::Image &picture, uint64_t &swap) {
     return false;
 }
 
+bool Presenter::window_captured(render::Image &out) {
+    if (!window_ready_) return false;
+    window_ready_ = false;
+    out.width = window_w_, out.height = window_h_;
+    const uint8_t *bytes = static_cast<const uint8_t *>(window_copy_.mapped);
+    out.rgba.assign(bytes, bytes + size_t(out.width) * out.height * 4);
+    if (format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_B8G8R8A8_SRGB)
+        for (size_t i = 0; i + 3 < out.rgba.size(); i += 4) std::swap(out.rgba[i], out.rgba[i + 2]);
+    for (size_t i = 3; i < out.rgba.size(); i += 4) out.rgba[i] = 255;
+    return true;
+}
+
 // ---- the window's thread ----
 
 void Presenter::drop_swapchain() {
@@ -403,7 +415,7 @@ bool Presenter::make_swapchain(const View &view) {
     ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     ci.imageExtent = extent;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     ci.presentMode = mode;
@@ -513,7 +525,26 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
     vkCmdBeginRendering(cmd, &ri);
     if (overlay) overlay(cmd);
     vkCmdEndRendering(cmd);
-    barrier(cmd, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    // a screenshot of the window itself: the finished image copied back (the overlay on it)
+    bool grab = window_capture_.exchange(false);
+    if (grab) {
+        const VkDeviceSize need = VkDeviceSize(extent_.width) * extent_.height * 4;
+        if (window_copy_.size < need) {
+            device_->destroy(window_copy_);
+            window_copy_ = device_->create_buffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
+        }
+        grab = window_copy_.mapped != nullptr;
+    }
+    if (grab) {
+        barrier(cmd, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {extent_.width, extent_.height, 1};
+        vkCmdCopyImageToBuffer(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, window_copy_.buffer, 1, &region);
+        barrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    } else {
+        barrier(cmd, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    }
     vkEndCommandBuffer(cmd);
 
     // after the swapchain's image is free and the picture's conversion done;
@@ -562,6 +593,10 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
         r = vkQueuePresentKHR(queue(), &pi);
     }
     present_seconds += std::chrono::duration<double>(Clock::now() - t2).count();
+    if (grab) {
+        vkWaitForFences(dev_, 1, &f.fence, VK_TRUE, UINT64_MAX); // (a check's screenshot: this one present is waited for)
+        window_w_ = extent_.width, window_h_ = extent_.height, window_ready_ = true;
+    }
     if (shown >= 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         pictures_[shown].read = done;

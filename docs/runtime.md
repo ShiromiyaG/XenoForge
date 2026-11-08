@@ -1827,9 +1827,12 @@ kernel's own result shapes. The logic is apart from the view:
   game in the launcher's process (Android) can start it its own way.
 - **For checks without a person**: `--ui-demo message,keyboard,device,signin,achievements,gamercard,friends,
   messages,players,quickchat,gameinvite,friendrequest,playerreview,compose,customcompose,playerlist,marketplace,
-  editprofile,toast` opens a sample of each at the start (answered by `--press a@5`, `b@5`...; the player prints each
-  answer: `ui-demo: <name> answered: ...`) and `--screenshots` shows the window with the dialog on it
-  (`<swap>_window.png`). `--no-system-ui` leaves every dialog to the kernel's default. `tests/system_ui_test.cpp`
+  editprofile,toast,console` opens a sample of each at the start (`console` opens the overlay's console section;
+  answered by `--press a@5`, `b@5`...; the player prints each answer, `ui-demo: <name> answered: ...`, and every
+  dialog a title opens, `ui: dialog kind N ... opened at S s`). `--window-shots <dir> [--window-shot-every S]` saves
+  the window itself with the dialogs and the overlay over the picture (`--screenshots` saves the picture without
+  them; the presenter's `capture_window_next`). `--restart-after S` presses the overlay's "Restart the title" at S
+  seconds. `--no-system-ui` leaves every dialog to the kernel's default. `tests/system_ui_test.cpp`
   drives the model, the kernel's exports through the handler, the pad's repeat, the toasts, the profile store and the
   settings, and the relaunch's arguments.
 - **Left for a person**: the dialogs' look and feel with a real pad and the mouse; the keyboard dialog's text field

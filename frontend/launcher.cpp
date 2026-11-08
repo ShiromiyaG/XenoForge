@@ -37,7 +37,7 @@
 // --capture-binding <name> a binding waiting for its key, --menu <name> a menu
 // open (file, emulation, options, tools, help), --context-menu the selected
 // row's menu open, --tab <name> the settings window's tab (video, sound,
-// controllers, keyboard, interface), --render-size WxH draws at that size without the window (a
+// controllers, keyboard, system, profile, interface), --render-size WxH draws at that size without the window (a
 // 4K picture on a 1080p desktop), --scale F the interface's scale (else the
 // display's), --assets <dir> the windows' files (to edit them without a
 // rebuild), and --keys up,down,a,b,... presses of the pad (the d-pad, a b x y,
