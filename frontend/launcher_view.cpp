@@ -42,10 +42,11 @@ LauncherView::LauncherView(LauncherCore &core, ui::Renderer &renderer, SDL_Windo
     screen_pending_ = opt_.screen != Screen::Library;
     parse_sort(core_.launcher().sort, sort_, ascending_);
     last_update_ = Clock::now();
+    settings_ = std::make_unique<SettingsView>(core_, *this);
 }
 
 LauncherView::~LauncherView() {
-    settings_.reset(); // its context and window first
+    if (settings_) settings_->detach(); // its listeners off the document before it goes
     if (doc_ && ctx_) {
         ctx_->UnloadDocument(doc_);
         ctx_->Update(); // the document goes while this listener is alive
@@ -56,7 +57,8 @@ bool LauncherView::load(Rml::Context *context, const std::filesystem::path &asse
     ctx_ = context;
     assets_ = assets_dir;
     rml_template_ = read_text(assets_ / "launcher.rml");
-    rcss_template_ = read_text(assets_ / "theme.rcss") + "\n" + read_text(assets_ / "launcher.rcss");
+    rcss_template_ = read_text(assets_ / "theme.rcss") + "\n" + read_text(assets_ / "launcher.rcss") + "\n" +
+                    read_text(assets_ / "settings.rcss");
     if (rml_template_.empty() || rcss_template_.size() < 2) return error = "no launcher.rml or its stylesheets in " + assets_.string(), false;
     return build_document(error);
 }
@@ -86,6 +88,14 @@ bool LauncherView::build_document(std::string &error) {
     doc_->AddEventListener("focus", this, true);
     doc_->AddEventListener("blur", this, true);
     doc_->Show();
+    settings_->attach(ctx_, doc_);
+    // the page of the strip that was shown stays shown (no slide: the document is new)
+    const bool in_settings = section_ == Section::Settings;
+    if (Rml::Element *slide = by_id("slide")) slide->SetClass("to-settings", in_settings);
+    if (Rml::Element *e = by_id("library")) e->SetClass("hidden", in_settings);
+    if (Rml::Element *e = by_id("spage")) e->SetClass("hidden", !in_settings);
+    if (Rml::Element *e = by_id("nav-games")) e->SetClass("on", !in_settings);
+    if (Rml::Element *e = by_id("nav-settings")) e->SetClass("on", in_settings);
     rows_sig_.clear(), status_sig_.clear();
     menu_.clear(), menu_items_.clear();
     if (Rml::Element *search = by_id("search")) search->SetAttribute("value", filter_);
@@ -107,6 +117,7 @@ void LauncherView::reload_document() {
     defer([this] {
         Rml::ElementDocument *old = doc_;
         std::string error;
+        settings_->detach();
         doc_ = nullptr;
         if (old) ctx_->UnloadDocument(old);
         if (!build_document(error)) std::fprintf(stderr, "launcher: %s\n", error.c_str());
@@ -117,7 +128,6 @@ void LauncherView::reload_document() {
 void LauncherView::look_changed() {
     dark_ = resolve_dark();
     reload_document();
-    if (settings_) settings_->restyle();
 }
 
 void LauncherView::system_theme_changed() {
@@ -126,7 +136,7 @@ void LauncherView::system_theme_changed() {
 
 bool LauncherView::busy() const {
     return listing_.busy || start_pending_ >= 0 || core_.run().running || job_.active() || now_ < settle_until_ || !deferred_.empty() ||
-           (settings_ && settings_->busy());
+           settings_->busy();
 }
 
 // ---------------------------------------------------------------------------
@@ -400,25 +410,40 @@ void LauncherView::update_status() {
 }
 
 // ---------------------------------------------------------------------------
-// the settings window and the games folder
+// the settings page and the games folder
 
-void LauncherView::open_settings(SettingsTab tab) {
-    if (settings_) {
-        settings_->show_tab(tab);
-        if (!opt_.offscreen) SDL_RaiseWindow(settings_->window());
-        return;
+// The strip slides to a page; the one left behind is hidden once it is out of
+// sight, so nothing focuses it or reads its keys.
+void LauncherView::show_section(Section section) {
+    if (section == section_) return;
+    section_ = section;
+    const bool in_settings = section == Section::Settings;
+    close_menu();
+    if (Rml::Element *focus = ctx_->GetFocusElement()) focus->Blur(); // a search box in the page that goes
+    if (Rml::Element *slide = by_id("slide")) slide->SetClass("to-settings", in_settings);
+    if (Rml::Element *e = by_id("nav-games")) e->SetClass("on", !in_settings);
+    if (Rml::Element *e = by_id("nav-settings")) e->SetClass("on", in_settings);
+    // the page that arrives is shown at once, the one that leaves when the slide is done
+    if (Rml::Element *e = by_id(in_settings ? "spage" : "library")) e->SetClass("hidden", false);
+    const double slid = now_ + 0.5;
+    defer_until(slid, [this, in_settings] {
+        if (section_ == (in_settings ? Section::Settings : Section::Library))
+            if (Rml::Element *e = by_id(in_settings ? "library" : "spage")) e->SetClass("hidden", true);
+    });
+    settle_until_ = std::max(settle_until_, slid + 0.1);
+    if (!in_settings) {
+        settings_->leave();
+        if (Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str())) row->Focus(pad_mode_);
     }
-    settings_ = std::make_unique<SettingsView>(core_, *this);
-    std::string error;
-    if (!settings_->open(window_, assets_, tab, opt_.scale, opt_.offscreen, error)) {
-        settings_.reset();
-        message_box("The settings cannot be shown", error);
-        return;
-    }
-    settings_->set_game(selected_game());
 }
 
-void LauncherView::close_settings_window() { settings_.reset(); }
+void LauncherView::open_settings(SettingsTab tab) {
+    settings_->set_game(selected_game());
+    settings_->enter(tab);
+    show_section(Section::Settings);
+}
+
+void LauncherView::leave_settings() { show_section(Section::Library); }
 
 namespace {
 
@@ -437,8 +462,8 @@ void SDLCALL on_picked(void *, const char *const *files, int) {
 
 } // namespace
 
-void LauncherView::browse_folder(SDL_Window *parent) {
-    SDL_ShowOpenFolderDialog(on_picked, nullptr, parent ? parent : window_, core_.games_folder().empty() ? nullptr : core_.games_folder().c_str(), false);
+void LauncherView::browse_folder() {
+    SDL_ShowOpenFolderDialog(on_picked, nullptr, window_, core_.games_folder().empty() ? nullptr : core_.games_folder().c_str(), false);
 }
 
 void LauncherView::update_input() {
@@ -464,7 +489,7 @@ void LauncherView::set_folder(const std::string &folder) {
     rows_sig_.clear();
     cached_.clear();
     last_listing_ = Clock::time_point();
-    if (settings_) settings_->set_game(nullptr), settings_->folder_changed();
+    settings_->set_game(nullptr), settings_->folder_changed();
 }
 
 void LauncherView::rescan() {
@@ -473,7 +498,7 @@ void LauncherView::rescan() {
     rows_sig_.clear();
     cached_.clear();
     last_listing_ = Clock::time_point();
-    if (settings_) settings_->set_game(nullptr);
+    settings_->set_game(nullptr);
 }
 
 void LauncherView::open_path(const std::filesystem::path &path) {

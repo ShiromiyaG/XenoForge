@@ -1,48 +1,48 @@
-// The launcher's settings window (docs/runtime.md, "The launcher's
-// interface"): a window of its own beside the main one, with tabs (video,
-// sound, controllers, keyboard, interface) over the selected game's settings
-// as the player reads them (the shared ones, or the game's own). It has its
-// own Vulkan device and swapchain (ui::Window) and its own RmlUi context;
-// fonts are RmlUi's, shared. What it changes is saved as it changes; the look
-// (theme, accent) and the games folder go back to the main window through
-// SettingsHost.
+// The launcher's settings (docs/runtime.md, "The launcher's interface"): the
+// second page of the main window, beside the library (launcher.rml's #spage;
+// choosing "settings" in the header slides the window's strip to it, as the
+// console's dashboard slides from one blade to the next). Tabs (video, sound,
+// controllers, keyboard, interface) over the selected game's settings as the
+// player reads them (the shared ones, or the game's own). It lives in the
+// main window's document and context: LauncherView gives it the document
+// (attach) and its keys and pad buttons while the page is the one shown;
+// the mouse reaches it as events of the document. What it changes is saved
+// as it changes; the look (theme, accent) and the games folder go back to
+// the window through SettingsHost.
 //
-// Input: the mouse and keys of its window as RmlUi takes them; the arrows and
-// a pad move focus by direction (launcher_model.h's nav_pick) and Left and
-// Right change a slider, a dropdown or a check box; Ctrl+Tab or the shoulder
-// buttons change tabs; Escape or B closes a dropdown, a key being set, then
-// the window.
+// Input: the arrows and a pad move focus by direction (launcher_model.h's
+// nav_pick) and Left and Right change a slider, a dropdown or a check box;
+// Ctrl+Tab or the shoulder buttons change tabs; Escape or B closes a
+// dropdown, a key being set, then leaves the page.
 
 #pragma once
 
 #include "launcher_core.h"
 #include "launcher_html.h"
-#include "ui/ui_window.h"
 
 #include <RmlUi/Core.h>
 #include <SDL3/SDL.h>
 
-#include <filesystem>
 #include <functional>
-#include <map>
-#include <memory>
 #include <string>
 #include <vector>
 
 namespace xf::frontend {
 
-// What the settings window asks of the main one.
+// What the settings page asks of the main window.
 class SettingsHost {
   public:
     virtual ~SettingsHost() = default;
-    // a stylesheet with the theme's and the accent's tokens filled in
-    virtual std::string styled(const std::string &rcss) const = 0;
-    // the theme or the accent changed: both windows drawn again with it
+    // the theme or the accent changed: the window drawn again with it
     virtual void look_changed() = 0;
-    // the system's folder dialog over this window, and a folder chosen or typed
-    virtual void browse_folder(SDL_Window *parent) = 0;
+    // the system's folder dialog over the window, and a folder chosen or typed
+    virtual void browse_folder() = 0;
     virtual void set_folder(const std::string &folder) = 0;
     virtual void rescan() = 0;
+    // Escape or B at the page's top: back to the library
+    virtual void leave_settings() = 0;
+    // the pad (not the mouse or keys) is what the user last used: focus shows
+    virtual bool pad_mode() const = 0;
 };
 
 class SettingsView final : public Rml::EventListener {
@@ -50,37 +50,36 @@ class SettingsView final : public Rml::EventListener {
     SettingsView(LauncherCore &core, SettingsHost &host);
     ~SettingsView() override;
 
-    // The window made over the main one (parent) on a tab. scale > 0 fixes the
-    // interface's scale (else the display's); offscreen: never shown, drawn at
-    // its own size for a picture.
-    bool open(SDL_Window *parent, const std::filesystem::path &assets, SettingsTab tab, float scale, bool offscreen, std::string &error);
+    // The page in a document (made again whenever the look changes: detach
+    // before the old one goes, attach to the new one).
+    void attach(Rml::Context *context, Rml::ElementDocument *document);
+    void detach();
+
+    // The page becomes the one shown, on a tab; or is left.
+    void enter(SettingsTab tab);
+    void leave();
+    bool active() const { return active_; }
+    SettingsTab tab() const { return tab_; }
+
     // the game selected in the list (nullptr: none): whose settings are edited
     void set_game(const GameEntry *game);
     void show_tab(SettingsTab tab);
-    void restyle();        // the theme or the accent changed (done at the next frame)
     void folder_changed(); // the games folder changed elsewhere
     void begin_capture(const std::string &binding);
 
-    SDL_Window *window() const { return window_; }
-    SDL_WindowID window_id() const { return window_ ? SDL_GetWindowID(window_) : 0; }
-    Rml::Context *context() const { return ctx_; }
-    ui::Window &surface() { return *surface_; }
-    bool has_focus() const;
-
-    // An event of this window (or the pad's while it has focus): true when
-    // the window used it and its context should not see it.
-    bool on_event(const SDL_Event &event);
-    // Once a frame: its own updates, the layout and the picture.
-    void frame();
-    // its Close or Escape asked for the window to go
-    bool closing() const { return close_; }
+    // The keys and the pad's buttons and stick while the page is shown:
+    // true when it used them.
+    bool on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat);
+    bool on_pad_button(SDL_GamepadButton button, bool down);
+    void on_pad_axis(SDL_GamepadAxis axis, int value);
+    // Once a frame: the work put off to after the layout.
+    void update();
     // still changing: a picture of it waits
-    bool busy() const { return now_ < settle_until_ || !deferred_.empty() || restyle_; }
+    bool busy() const { return !deferred_.empty(); }
 
     void ProcessEvent(Rml::Event &event) override;
 
   private:
-    bool build_document(std::string &error);
     void rebuild(); // the scope, the tabs and the page
     void reload_edit();
     void save_edit();
@@ -100,30 +99,21 @@ class SettingsView final : public Rml::EventListener {
     void choose_option(const std::string &key, const std::string &value, Rml::Element *row);
     void end_capture();
 
-    bool on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat);
-    bool on_pad_button(SDL_GamepadButton button, bool down);
     void navigate(NavDir dir);
     void activate();
     void back();
     std::vector<Rml::Element *> focusables();
     void ensure_visible(Rml::Element *element);
     void focus_first();
+    bool mine(Rml::Element *element) const; // inside the page or its dropdown's layer
     Rml::Element *ancestor_with(Rml::Element *element, const char *attribute) const;
     Rml::Element *by_id(const char *id) const { return doc_ ? doc_->GetElementById(id) : nullptr; }
     void defer(std::function<void()> fn) { deferred_.push_back(std::move(fn)); }
 
     LauncherCore &core_;
     SettingsHost &host_;
-    SDL_Window *window_ = nullptr;
-    std::unique_ptr<ui::Window> surface_;
     Rml::Context *ctx_ = nullptr;
     Rml::ElementDocument *doc_ = nullptr;
-    std::string name_; // the context's
-    std::filesystem::path assets_;
-    std::string rml_template_, rcss_template_;
-    float scale_ = 0;
-    bool offscreen_ = false;
-    uint32_t off_w_ = 0, off_h_ = 0;
 
     SettingsTab tab_ = SettingsTab::Video;
     GameEntry game_;
@@ -134,11 +124,10 @@ class SettingsView final : public Rml::EventListener {
     std::string popup_key_;
     Rml::Element *popup_row_ = nullptr;
     Rml::Element *drag_row_ = nullptr;
-    bool close_ = false, restyle_ = false;
-    bool pad_mode_ = false;
+    bool active_ = false;
+    float scroll_ = 0;  // the rows' scroll, kept while the document is made again
+    int stick_dir_ = 0;
 
-    double now_ = 0, settle_until_ = 0.6;
-    uint64_t last_ticks_ = 0;
     std::vector<std::function<void()>> deferred_;
 };
 

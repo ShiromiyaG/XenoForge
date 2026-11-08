@@ -2,8 +2,9 @@
 // interface"), in the manner of the classic emulator front ends: a menu bar,
 // a toolbar, the games as a table (sortable, its columns resizable, filtered
 // by the search box) and a status bar; preparing a game, the about box and
-// messages as dialogs over it; the settings in a window of their own
-// (settings_view.h). Over LauncherCore (what the launcher does) and
+// messages as dialogs over it; the settings as a second page beside the
+// library, which the window's strip slides to (settings_view.h). Over
+// LauncherCore (what the launcher does) and
 // PrepareJob (a game being prepared). The structure and words are
 // launcher_html.cpp's, the look the stylesheets' (ui/assets), what a status or
 // a colour is launcher_model.cpp's; this file connects them to the document.
@@ -37,9 +38,10 @@
 namespace xf::frontend {
 
 enum class Screen { Library = 0, Settings, Controls, About };
+enum class Section { Library, Settings }; // the page of the strip that is shown
 
 struct ViewOptions {
-    Screen screen = Screen::Library; // --screen: settings and controls open the settings window, about the about box
+    Screen screen = Screen::Library; // --screen: settings and controls slide to the settings page, about opens the about box
     long select = -1;                // --select N
     long start_index = -1;           // --start N: started as soon as it is listed
     bool demo_progress = false;      // --demo-progress: a fake build on show
@@ -48,12 +50,12 @@ struct ViewOptions {
     bool show_log = false;           // the prepare dialog's log open
     std::string capture;             // --capture-binding: a binding waiting for a key, for pictures
     std::string menu;                // --menu <name>: that menu open, for pictures
-    std::string tab;                 // --tab <name>: the settings window's tab --screen settings opens
+    std::string tab;                 // --tab <name>: the settings page's tab --screen settings opens
     bool context_menu = false;       // --context-menu: the selected row's menu open, for pictures
     std::vector<std::string> player_args;
     unsigned build_jobs = 0; // --build-jobs N: compilers at once while preparing (0: the build's default)
     float scale = 0;         // --scale: the interface's scale (0: the display's)
-    bool offscreen = false;  // --render-size: windows drawn without being shown
+    bool offscreen = false;  // --render-size: the window drawn without being shown
 };
 
 class LauncherView final : public Rml::EventListener, public SettingsHost {
@@ -78,24 +80,21 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     size_t games_listed() const { return listing_.games.size(); }
     bool wants_quit() const { return quit_; } // File > Exit
 
-    // The settings window while it is open: the main loop gives it its
-    // events and draws it; closed when it asks or its window is closed.
-    SettingsView *settings_window() { return settings_.get(); }
-    void close_settings_window();
-
     void ProcessEvent(Rml::Event &event) override;
 
     // SettingsHost
-    std::string styled(const std::string &rcss) const override;
     void look_changed() override;
-    void browse_folder(SDL_Window *parent) override;
+    void browse_folder() override;
     void set_folder(const std::string &folder) override;
     void rescan() override;
+    void leave_settings() override;
+    bool pad_mode() const override { return pad_mode_; }
 
   private:
     enum class Dialog { None, Prepare, About, Message };
 
     // building
+    std::string styled(const std::string &rcss) const; // a stylesheet with the theme's and the accent's tokens filled in
     bool build_document(std::string &error);
     void reload_document();
     bool resolve_dark() const;
@@ -141,10 +140,11 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     void hide_prepare();
     void update_prepare();
     void open_settings(SettingsTab tab);
+    void show_section(Section section);
     void open_path(const std::filesystem::path &path);
 
     // input
-    bool on_key(SDL_Keycode key, bool repeat);
+    bool on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat);
     bool on_pad_button(SDL_GamepadButton button, bool down);
     void on_pad_axis(SDL_GamepadAxis axis, int value);
     void dialog_navigate(NavDir dir);
@@ -226,8 +226,9 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     bool context_pending_ = false;
     bool screen_pending_ = false;
 
-    // the settings window
+    // the settings page, and which page of the strip is shown
     std::unique_ptr<SettingsView> settings_;
+    Section section_ = Section::Library;
     std::string capture_pending_;
 
     // the pad's repeats

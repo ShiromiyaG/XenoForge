@@ -1468,10 +1468,12 @@ of the console's own dashboard (it replaced the first TV-style layout and the
 desktop-tool one after it), drawn for a window 1240dp wide:
 
 - **The main window** (`launcher.rml`, `launcher.rcss`): a header (the
-  wordmark, and the sections: *xbox home*, which says it is not there yet,
-  *games*, the current one, *emulation* and *help*, which open their menus
-  under them, and *settings*, which opens the settings window; the search
-  box, filtering on every word of the title, title ID and file name); a
+  wordmark, and the sections: *games* and *settings*, the pages of the
+  window, one of them lit; *emulation* and *help*, which open their menus
+  under them); under it a strip twice the window's width with the library and
+  the settings side by side, which slides from one to the other (below); in
+  the library, the search box (above the list, there while it has games),
+  filtering on every word of the title, title ID and file name; a
   toolbar (Play, which becomes Stop while a game runs; Prepare, Rebuild or Try
   preparing again by the selected game's status; Open Folder, Rescan,
   Settings, Controls; at its right the views: the list, the grid, which is not
@@ -1523,31 +1525,38 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   stages, the bar, the time, the file, the log; Run in background hides it
   behind the status bar's progress, Cancel stops it; then Play, or Try again
   and Play interpreted), About (the licenses), and messages.
-- **The settings window** (`settings_view.*`, `settings.rml`,
-  `settings.rcss`): an OS window of its own over the main one, its own
-  `ui::Window` (device and swapchain) and RmlUi context with its own render
-  interface (fonts are RmlUi's, shared; `Rml::ReleaseRenderManagers()` after
-  its context is removed hands its textures back before its device goes).
-  Tabs Video, Sound, Controllers, Keyboard, Interface; above them, whose
-  settings these are and the "Settings of its own for <game>" check box;
-  check boxes, sliders and dropdowns in groups; the 25 bindings, each
-  changed by a click and the next key; the theme, the accent and the games
-  folder. Saved as they change; the look goes back to the main window
-  through `SettingsHost`.
+- **The settings page** (`settings_view.*`, `settings.rcss`, `#spage` of
+  `launcher.rml`): the second page of the window's strip, beside the library
+  (`#slide`, `left` from 0 to -100% with a transition, as the console's
+  dashboard slides from one blade to the next; the page left behind is
+  `visibility: hidden` once it is out of sight, so nothing focuses it). Not a
+  window: it lives in the main document and context (`SettingsView::attach`
+  gives it the document each time it is made again; the keys, the pad and
+  the mouse reach it as LauncherView's input does, and `LauncherView`'s own
+  click handler leaves what is inside `#spage` and `#popup-layer` to it).
+  Tabs Video, Sound, Controllers, Keyboard, Interface, which are the
+  toolbar's buttons; under them, whose settings these are and the "Settings
+  of its own for <game>" check box; rows like the games' (check boxes,
+  sliders and dropdowns in groups, the one with focus in the selected row's
+  green); the 25 bindings, each changed by a click and the next key; the
+  theme, the accent and the games folder. Saved as they change; the look goes
+  back to the window through `SettingsHost`. Escape, B or the *games* section
+  slide back. Its look is fixed like the library's (`settings.rcss`, every rule
+  under `#spage`); only its dropdowns' lists follow the theme.
 - **Desktop scale and place**: sizes are dp at the display's scale
   (`SDL_GetWindowDisplayScale`: 100%, 150%...), not the window's, so a
   bigger window shows more rows; the window opens where it was left
   (`[launcher] x, y, width, height, maximized`, kept only while that place
   is on a display), and the sort is kept too (`sort`).
 - **Themes**: the main window's look is fixed (its colours are in
-  `launcher.rcss`); the dialogs, the menus and the settings window follow
+  `launcher.rcss`, `settings.rcss`); the dialogs and the menus follow
   `[launcher] theme`: `system` (the desktop's light or dark, followed live
   through `SDL_EVENT_SYSTEM_THEME_CHANGED`), `light` or `dark` (the Interface
   tab). Each is a palette of tokens
   (`palette()` in `launcher_model.cpp`: the window, its chrome, lines, three
   levels of text, the states, the selection from the accent) filled into
-  the stylesheets when a document is made; changing it makes both windows'
-  documents again.
+  the stylesheets when a document is made; changing it makes the document
+  again.
 - **Icons**: Lucide (ISC; `ui/fonts/Lucide.ttf`, its license beside it), a
   font of outline icons drawn as text; `{i:name}` in a template and
   `icon_html()` give its glyphs (`launcher_html.cpp` lists the ones used).
@@ -1556,12 +1565,12 @@ Input: the mouse as a desktop program's; the keyboard: the arrows, Page Up
 and Down, Home and End move the selection, Enter plays, F2 opens the game's
 settings, F5 rescans, Ctrl+O the folder, Ctrl+F the search, Ctrl+, the
 settings, Alt+E or Alt+H or F10 the menus (then the arrows, Enter, Escape),
-Shift+F10 or the menu key the row's menu; in the settings window the arrows
-move focus and change a value, Ctrl+Tab the tab, Escape closes. A pad:
+Shift+F10 or the menu key the row's menu; on the settings page the arrows
+move focus and change a value, Ctrl+Tab the tab, Escape goes back to the library. A pad:
 the d-pad or stick moves the selection (repeating), A or Start plays, X the
 game's settings, Y rescans, Back the menus, the shoulders a page; in menus
-and dialogs the d-pad moves and B closes; in the settings window the
-shoulders change tabs.
+and dialogs the d-pad moves and B closes; on the settings page the
+shoulders change tabs and B goes back.
 
 Pieces, each apart from the others:
 
@@ -1594,11 +1603,11 @@ Pieces, each apart from the others:
 - **`launcher_view.*`, `launcher_screens.cpp`, `launcher_input.cpp`**: the
   main window's document: the table rebuilt when what it shows changes (a
   signature of the rows), the menus, the dialogs, the status bar, clicks,
-  keys and the pad into actions. **`settings_view.*`**: the settings window,
+  keys and the pad into actions. **`settings_view.*`**: the settings page,
   its widgets and its input.
 - **`ui/assets/theme.rcss`** (the base, the controls, menus and dialogs both
-  windows share), **`launcher.rcss`**, **`settings.rcss`**, and the two `.rml`
-  templates: the look, with `{tokens}` filled from the palette and the accent
+  windows share), **`launcher.rcss`**, **`settings.rcss`**, and the `.rml`
+  template: the look, with `{tokens}` filled from the palette and the accent
   (six swatches, `[launcher] accent`, green by default). `ui/fonts/`: Inter
   (SIL OFL 1.1), five weights, Roboto Condensed (Apache 2.0), three, for the
   games and the toolbar, and Lucide's icons (ISC), each license beside it.
@@ -1710,11 +1719,12 @@ the Options menu (`--menu options`), the row's menu (`--context-menu`), the
 prepare dialog running with its log and failed (`--demo-progress`,
 `--demo-fail`), About, an empty folder, and the settings window's Video,
 Keyboard (a binding waiting for its key) and Interface tabs (`--screen
-settings --tab <name>`; the picture is the settings window's). With Vulkan
-validation on, offscreen and in real windows: nothing reported, and the
-settings window opened, closed and opened again in one run (`--keys
-x,wait,b,...`); before `Rml::ReleaseRenderManagers()` its device was destroyed
-with RmlUi's textures still on it and the exit crashed. A real window's run
+settings --tab <name>`; the settings were then a window of their own, drawn
+by a second device: `Rml::ReleaseRenderManagers()` was needed so its textures
+went before it did). Since 2026-11-08 they are a page of the main window:
+pictures of every tab, of a dropdown open and of the slide there and back
+(`--keys x,rb,b`) show no RmlUi assertion (a slider's fill of width 0 with a
+shadow asserted: it has none now). A real window's run
 saved its place in `[launcher]`. Left for a person: the mouse (hover, a
 column's drag, a right click, a slider's drag), typing in the search and the
 folder's field, the folder dialog, a real pad, and the theme followed live

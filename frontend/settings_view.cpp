@@ -1,24 +1,17 @@
-// The launcher's settings window (settings_view.h).
+// The launcher's settings page (settings_view.h).
 
 #include "settings_view.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <fstream>
-#include <iterator>
 
 namespace xf::frontend {
 
 namespace {
 
-constexpr float WIDTH_DP = 780, HEIGHT_DP = 640;
 constexpr int STICK_THRESHOLD = 17000;
-
-std::string read_text(const std::filesystem::path &path) {
-    std::ifstream f(path, std::ios::binary);
-    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-}
+const char *const EVENTS[] = {"click", "mousedown", "mouseup", "mousemove", "change"};
 
 std::string px(float value) {
     char text[32];
@@ -32,78 +25,52 @@ std::string pct(double fraction) {
     return text;
 }
 
-int contexts_made = 0;
-
 } // namespace
 
 SettingsView::SettingsView(LauncherCore &core, SettingsHost &host) : core_(core), host_(host) {}
 
-SettingsView::~SettingsView() {
-    if (ctx_) {
-        if (doc_) ctx_->UnloadDocument(doc_), doc_ = nullptr;
-        ctx_->Update();
-        Rml::RemoveContext(name_);
-        ctx_ = nullptr;
-        // RmlUi keeps a render manager per render interface until told: its
-        // textures and geometry go back to this window's renderer now, while
-        // it lives (CreateContext's documented lifetime)
-        Rml::ReleaseRenderManagers();
+SettingsView::~SettingsView() { detach(); }
+
+void SettingsView::attach(Rml::Context *context, Rml::ElementDocument *document) {
+    detach();
+    ctx_ = context;
+    doc_ = document;
+    for (const char *type : EVENTS) doc_->AddEventListener(type, this);
+    if (active_) {
+        rebuild();
+        defer([this] {
+            if (Rml::Element *pages = by_id("pages")) pages->SetScrollTop(scroll_);
+        });
     }
-    surface_.reset(); // the render interface after the context that used it
-    if (window_) SDL_DestroyWindow(window_);
 }
 
-bool SettingsView::open(SDL_Window *parent, const std::filesystem::path &assets, SettingsTab tab, float scale, bool offscreen,
-                        std::string &error) {
-    assets_ = assets;
+void SettingsView::detach() {
+    if (!doc_) return;
+    if (Rml::Element *pages = by_id("pages")) scroll_ = pages->GetScrollTop();
+    for (const char *type : EVENTS) doc_->RemoveEventListener(type, this);
+    doc_ = nullptr;
+    popup_row_ = nullptr, drag_row_ = nullptr;
+    popup_key_.clear();
+}
+
+void SettingsView::enter(SettingsTab tab) {
+    active_ = true;
+    if (!capturing_.empty()) capturing_.clear();
+    close_popup();
+    const bool changed = tab != tab_;
     tab_ = tab;
-    scale_ = scale;
-    offscreen_ = offscreen;
-    rml_template_ = read_text(assets_ / "settings.rml");
-    rcss_template_ = read_text(assets_ / "theme.rcss") + "\n" + read_text(assets_ / "settings.rcss");
-    if (rml_template_.empty() || rcss_template_.size() < 2) return error = "no settings.rml or settings.rcss in " + assets_.string(), false;
-
-    // the window: its size in dp at the parent's display scale, over the parent
-    const float display = parent ? SDL_GetWindowDisplayScale(parent) : 1.f;
-    const float s = scale_ > 0 ? scale_ : (display > 0 ? display : 1.f);
-    Uint64 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    if (offscreen_) flags |= SDL_WINDOW_HIDDEN;
-    window_ = SDL_CreateWindow("Settings", int(WIDTH_DP * s), int(HEIGHT_DP * s), flags);
-    if (!window_) return error = std::string("SDL: ") + SDL_GetError(), false;
-    off_w_ = uint32_t(WIDTH_DP * s), off_h_ = uint32_t(HEIGHT_DP * s);
-    SDL_SetWindowMinimumSize(window_, int(560 * s), int(420 * s));
-    if (parent && !offscreen_) {
-        SDL_SetWindowParent(window_, parent);
-        int px_ = 0, py = 0, pw = 0, ph = 0;
-        SDL_GetWindowPosition(parent, &px_, &py);
-        SDL_GetWindowSize(parent, &pw, &ph);
-        SDL_SetWindowPosition(window_, px_ + std::max(0, (pw - int(WIDTH_DP * s)) / 2), py + std::max(0, (ph - int(HEIGHT_DP * s)) / 3));
-    }
-    surface_ = std::make_unique<ui::Window>();
-    if (!surface_->open(window_, error)) return error = "Vulkan: " + error, false;
-    name_ = "settings" + std::to_string(++contexts_made);
-    ctx_ = Rml::CreateContext(name_, Rml::Vector2i(int(off_w_), int(off_h_)), &surface_->renderer());
-    if (!ctx_) return error = "RmlUi has no context for the settings", false;
-    return build_document(error);
-}
-
-bool SettingsView::build_document(std::string &error) {
-    std::string rml = rml_template_;
-    const size_t at = rml.find("<!--STYLE-->");
-    if (at == std::string::npos) return error = "settings.rml has no <!--STYLE--> mark", false;
-    rml.replace(at, 12, "<style>\n" + host_.styled(rcss_template_) + "\n</style>");
-    doc_ = ctx_->LoadDocumentFromMemory(expand_icons(rml), "settings.rml");
-    if (!doc_) return error = "settings.rml did not load", false;
-    for (const char *type : {"click", "mousedown", "mouseup", "mousemove", "change"}) doc_->AddEventListener(type, this);
-    doc_->Show();
+    edit_valid_ = false; // the player's overlay may have changed the settings meanwhile
     rebuild();
-    settle_until_ = now_ + 0.5;
-    return true;
+    if (changed)
+        if (Rml::Element *pages = by_id("pages")) pages->SetScrollTop(0);
 }
 
-void SettingsView::restyle() { restyle_ = true; }
-
-bool SettingsView::has_focus() const { return window_ && (SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS); }
+void SettingsView::leave() {
+    if (!capturing_.empty()) end_capture();
+    close_popup();
+    drag_row_ = nullptr;
+    active_ = false;
+}
 
 void SettingsView::set_game(const GameEntry *game) {
     const bool had = has_game_;
@@ -114,20 +81,20 @@ void SettingsView::set_game(const GameEntry *game) {
     if (!capturing_.empty()) capturing_.clear();
     close_popup();
     edit_valid_ = false;
-    rebuild();
+    if (active_) rebuild();
 }
 
 void SettingsView::folder_changed() {
-    if (tab_ == SettingsTab::Interface) defer([this] { rebuild(); });
+    if (active_ && tab_ == SettingsTab::Interface) defer([this] { rebuild(); });
 }
 
 void SettingsView::show_tab(SettingsTab tab) {
     if (!capturing_.empty()) end_capture();
     close_popup();
     tab_ = tab;
+    if (!active_) return; // made when the page is entered
     rebuild();
     if (Rml::Element *pages = by_id("pages")) pages->SetScrollTop(0);
-    settle_until_ = std::max(settle_until_, now_ + 0.3);
 }
 
 void SettingsView::reload_edit() {
@@ -171,9 +138,6 @@ void SettingsView::rebuild() {
         pages->SetInnerRML(settings_page_html(tab_, p));
         pages->SetScrollTop(scroll);
     }
-    std::string title = "Settings";
-    if (has_game_) title += std::string(" \xE2\x80\x94 ") + game_.title + (edit_.game.empty() ? " (shared)" : " (its own)");
-    if (window_) SDL_SetWindowTitle(window_, title.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -184,10 +148,26 @@ Rml::Element *SettingsView::ancestor_with(Rml::Element *element, const char *att
     return element;
 }
 
+bool SettingsView::mine(Rml::Element *element) const {
+    for (; element; element = element->GetParentNode())
+        if (element->GetId() == "spage" || element->GetId() == "popup-layer") return true;
+    return false;
+}
+
 void SettingsView::ProcessEvent(Rml::Event &event) {
     const Rml::String &type = event.GetType();
     Rml::Element *target = event.GetTargetElement();
     if (!target) return;
+    // a drag goes on wherever the pointer is
+    if (type == "mousemove") {
+        if (drag_row_) drag_slider(event.GetParameter("mouse_x", 0.f));
+        return;
+    }
+    if (type == "mouseup") {
+        drag_row_ = nullptr;
+        return;
+    }
+    if (!mine(target)) return;
     if (type == "click") {
         if (target->GetId() == "popup-layer") return close_popup();
         if (Rml::Element *a = ancestor_with(target, "data-action"))
@@ -201,10 +181,6 @@ void SettingsView::ProcessEvent(Rml::Event &event) {
             drag_row_ = ancestor_with(slider, "data-kind");
             drag_slider(event.GetParameter("mouse_x", 0.f));
         }
-    } else if (type == "mousemove") {
-        if (drag_row_) drag_slider(event.GetParameter("mouse_x", 0.f));
-    } else if (type == "mouseup") {
-        drag_row_ = nullptr;
     } else if (type == "change") {
         if (target->GetId() == "folder-input" && event.GetParameter("linebreak", false))
             host_.set_folder(target->GetAttribute<Rml::String>("value", ""));
@@ -235,11 +211,9 @@ void SettingsView::do_action(const std::string &name, const std::string &arg, Rm
         save_edit();
         rebuild();
     } else if (name == "browse") {
-        host_.browse_folder(window_);
+        host_.browse_folder();
     } else if (name == "rescan") {
         host_.rescan();
-    } else if (name == "close") {
-        close_ = true;
     }
 }
 
@@ -353,7 +327,7 @@ void SettingsView::open_popup(Rml::Element *row) {
             Rml::ElementList options;
             p->QuerySelectorAll(options, ".mi.current");
             if (options.empty()) p->QuerySelectorAll(options, ".mi");
-            if (!options.empty()) options[0]->Focus(pad_mode_);
+            if (!options.empty()) options[0]->Focus(host_.pad_mode());
         }
     });
 }
@@ -364,11 +338,13 @@ void SettingsView::close_popup() {
     if (Rml::Element *box = popup_row_->QuerySelector(".select")) box->SetClass("open", false);
     layer->SetClass("open", false);
     layer->SetInnerRML("");
-    Rml::Element *row = popup_row_;
+    const std::string key = popup_row_->GetAttribute<Rml::String>("data-key", "");
     popup_row_ = nullptr;
     popup_key_.clear();
-    defer([row, this] {
-        if (doc_ && row->GetOwnerDocument() == doc_) row->Focus(pad_mode_);
+    // the row that opened it takes focus back (found again by its key: the page may have been made again)
+    defer([key, this] {
+        if (Rml::Element *pages = by_id("pages"))
+            if (Rml::Element *row = pages->QuerySelector("[data-key=\"" + key + "\"]")) row->Focus(host_.pad_mode());
     });
 }
 
@@ -380,7 +356,7 @@ void SettingsView::choose_option(const std::string &key, const std::string &valu
         core_.set_launcher(l, error);
         host_.look_changed();
     } else if (key == "backdrop") {
-        // read by the launcher's window every frame: nothing to rebuild
+        // read by the window every frame: nothing to rebuild
         Settings::Launcher l = core_.launcher();
         l.backdrop = value;
         std::string error;
@@ -399,6 +375,7 @@ void SettingsView::choose_option(const std::string &key, const std::string &valu
 
 void SettingsView::begin_capture(const std::string &binding) {
     if (tab_ != SettingsTab::Keyboard) show_tab(SettingsTab::Keyboard);
+    if (!doc_) return;
     const std::string before = capturing_;
     capturing_ = binding;
     Rml::ElementList rows;
@@ -412,7 +389,7 @@ void SettingsView::begin_capture(const std::string &binding) {
             keys->SetInnerRML(keycaps_html(it == edit_.keys.end() ? "" : it->second, name == binding));
         }
         if (name == binding) {
-            row->Focus(pad_mode_);
+            row->Focus(host_.pad_mode());
             ensure_visible(row);
         }
     }
@@ -437,31 +414,6 @@ void SettingsView::end_capture() {
 // ---------------------------------------------------------------------------
 // input
 
-bool SettingsView::on_event(const SDL_Event &e) {
-    switch (e.type) {
-    case SDL_EVENT_KEY_DOWN:
-        pad_mode_ = false;
-        return on_key(e.key.key, e.key.scancode, e.key.repeat);
-    case SDL_EVENT_MOUSE_MOTION:
-    case SDL_EVENT_MOUSE_BUTTON_DOWN: pad_mode_ = false; return false;
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-    case SDL_EVENT_GAMEPAD_BUTTON_UP:
-        pad_mode_ = true;
-        return on_pad_button(SDL_GamepadButton(e.gbutton.button), e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
-    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
-        if (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY && std::abs(int(e.gaxis.value)) > STICK_THRESHOLD) {
-            pad_mode_ = true;
-            navigate(e.gaxis.value > 0 ? NavDir::Down : NavDir::Up);
-        }
-        return true;
-    case SDL_EVENT_GAMEPAD_ADDED:
-    case SDL_EVENT_GAMEPAD_REMOVED:
-        if (tab_ == SettingsTab::Controllers) defer([this] { rebuild(); });
-        return false;
-    default: return false;
-    }
-}
-
 bool SettingsView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
     if (!capturing_.empty()) {
         if (!repeat) {
@@ -481,7 +433,8 @@ bool SettingsView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         }
         return false;
     }
-    const bool ctrl = SDL_GetModState() & SDL_KMOD_CTRL;
+    const SDL_Keymod mods = SDL_GetModState();
+    const bool ctrl = mods & SDL_KMOD_CTRL, shift = mods & SDL_KMOD_SHIFT;
     switch (key) {
     case SDLK_UP: navigate(NavDir::Up); return true;
     case SDLK_DOWN: navigate(NavDir::Down); return true;
@@ -496,8 +449,11 @@ bool SettingsView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         if (!repeat) back();
         return true;
     case SDLK_TAB:
-        if (!ctrl) return false; // focus moves as RmlUi moves it
-        if (!repeat) show_tab(SettingsTab((int(tab_) + ((SDL_GetModState() & SDL_KMOD_SHIFT) ? SETTINGS_TABS - 1 : 1)) % SETTINGS_TABS));
+        if (ctrl) {
+            if (!repeat) show_tab(SettingsTab((int(tab_) + (shift ? SETTINGS_TABS - 1 : 1)) % SETTINGS_TABS));
+        } else {
+            navigate(shift ? NavDir::Up : NavDir::Down); // the page's own order, not the whole window's
+        }
         return true;
     default: return false;
     }
@@ -517,15 +473,23 @@ bool SettingsView::on_pad_button(SDL_GamepadButton button, bool down) {
     case SDL_GAMEPAD_BUTTON_EAST: back(); break;
     case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: show_tab(SettingsTab((int(tab_) + SETTINGS_TABS - 1) % SETTINGS_TABS)); break;
     case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: show_tab(SettingsTab((int(tab_) + 1) % SETTINGS_TABS)); break;
-    default: break;
+    default: return false;
     }
     return true;
+}
+
+void SettingsView::on_pad_axis(SDL_GamepadAxis axis, int value) {
+    if (axis != SDL_GAMEPAD_AXIS_LEFTY) return;
+    const int dir = std::abs(value) > STICK_THRESHOLD ? (value > 0 ? 1 : -1) : 0;
+    if (dir == stick_dir_) return;
+    stick_dir_ = dir;
+    if (dir) navigate(dir > 0 ? NavDir::Down : NavDir::Up);
 }
 
 std::vector<Rml::Element *> SettingsView::focusables() {
     std::vector<Rml::Element *> roots;
     if (popup_row_) roots.push_back(by_id("popup-layer"));
-    else roots = {by_id("scope"), by_id("tabs"), by_id("pages"), by_id("sfoot")};
+    else roots = {by_id("tabs"), by_id("scope"), by_id("pages")};
     std::vector<Rml::Element *> found;
     for (Rml::Element *root : roots) {
         if (!root) continue;
@@ -616,7 +580,7 @@ void SettingsView::navigate(NavDir dir) {
 
 void SettingsView::activate() {
     Rml::Element *focus = ctx_->GetFocusElement();
-    if (!focus || focus == doc_) return focus_first();
+    if (!focus || focus == doc_ || !mine(focus)) return focus_first();
     if (Rml::Element *a = ancestor_with(focus, "data-action"))
         do_action(a->GetAttribute<Rml::String>("data-action", ""), a->GetAttribute<Rml::String>("data-arg", ""), a);
 }
@@ -624,41 +588,16 @@ void SettingsView::activate() {
 void SettingsView::back() {
     if (popup_row_) return close_popup();
     if (!capturing_.empty()) return end_capture();
-    close_ = true;
+    host_.leave_settings();
 }
 
 // ---------------------------------------------------------------------------
 // once a frame
 
-void SettingsView::frame() {
-    const uint64_t ticks = SDL_GetTicksNS();
-    now_ += last_ticks_ ? double(ticks - last_ticks_) * 1e-9 : 0;
-    last_ticks_ = ticks;
-    if (restyle_) {
-        restyle_ = false;
-        const float scroll = by_id("pages") ? by_id("pages")->GetScrollTop() : 0;
-        popup_row_ = nullptr, drag_row_ = nullptr;
-        if (doc_) ctx_->UnloadDocument(doc_), doc_ = nullptr;
-        std::string error;
-        if (!build_document(error)) std::fprintf(stderr, "launcher: %s\n", error.c_str());
-        defer([this, scroll] {
-            if (Rml::Element *p = by_id("pages")) p->SetScrollTop(scroll);
-        });
-    }
+void SettingsView::update() {
     auto work = std::move(deferred_);
     deferred_.clear();
     for (auto &fn : work) fn();
-
-    int w = 0, h = 0;
-    SDL_GetWindowSizeInPixels(window_, &w, &h);
-    const uint32_t width = offscreen_ ? off_w_ : uint32_t(std::max(w, 0)), height = offscreen_ ? off_h_ : uint32_t(std::max(h, 0));
-    if (width && height) {
-        ctx_->SetDimensions(Rml::Vector2i(int(width), int(height)));
-        const float display = SDL_GetWindowDisplayScale(window_);
-        ctx_->SetDensityIndependentPixelRatio(scale_ > 0 ? scale_ : offscreen_ ? 1.f : (display > 0 ? display : 1.f));
-    }
-    ctx_->Update();
-    surface_->frame([this] { ctx_->Render(); }, offscreen_ ? off_w_ : 0, offscreen_ ? off_h_ : 0);
 }
 
 } // namespace xf::frontend

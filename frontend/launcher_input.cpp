@@ -29,6 +29,12 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
     const Rml::String &type = event.GetType();
     Rml::Element *target = event.GetTargetElement();
     if (!target) return;
+    // the settings page and its dropdowns are the settings view's; a click there only closes a menu
+    for (Rml::Element *e = target; e; e = e->GetParentNode())
+        if (e->GetId() == "spage" || e->GetId() == "popup-layer") {
+            if (type == "click") close_menu();
+            return;
+        }
     if (type == "click") {
         if (target->GetId() == "menu-layer") return close_menu();
         if (Rml::Element *title = ancestor_with(target, "data-menu")) {
@@ -116,11 +122,13 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
     } else if (name == "stop") {
         core_.stop();
     } else if (name == "browse") {
-        browse_folder(window_);
+        browse_folder();
     } else if (name == "rescan") {
         rescan();
+    } else if (name == "library") {
+        show_section(Section::Library);
     } else if (name == "settings" || name == "game-settings") {
-        open_settings(SettingsTab::Video);
+        open_settings(settings_->tab());
     } else if (name == "controls") {
         open_settings(SettingsTab::Controllers);
     } else if (name == "demo-games") {
@@ -129,7 +137,7 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
         rows_sig_.clear();
         cached_.clear();
         last_listing_ = Clock::time_point();
-        if (settings_) settings_->set_game(nullptr);
+        settings_->set_game(nullptr);
         set_message(core_.demo_games() ? "Listing the demo games" : "Listing the games folder", 0, 4);
     } else if (name == "about") {
         show_about();
@@ -245,7 +253,7 @@ bool LauncherView::on_event(const SDL_Event &e) {
     switch (e.type) {
     case SDL_EVENT_KEY_DOWN:
         if (pad_mode_) pad_mode_ = false, SDL_ShowCursor();
-        return on_key(e.key.key, e.key.repeat);
+        return on_key(e.key.key, e.key.scancode, e.key.repeat);
     case SDL_EVENT_MOUSE_MOTION:
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         if (pad_mode_) pad_mode_ = false, SDL_ShowCursor();
@@ -261,7 +269,7 @@ bool LauncherView::on_event(const SDL_Event &e) {
     }
 }
 
-bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
+bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
     const SDL_Keymod mods = SDL_GetModState();
     const bool ctrl = mods & SDL_KMOD_CTRL, alt = mods & SDL_KMOD_ALT, shift = mods & SDL_KMOD_SHIFT;
     // a menu open: the keys move in it
@@ -318,6 +326,8 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
         default: return false;
         }
     }
+    // the settings page: its keys first (a key being set takes them all)
+    if (section_ == Section::Settings && settings_->on_key(key, scancode, repeat)) return true;
     // the search box keeps its keys, but for these
     Rml::Element *focus = ctx_->GetFocusElement();
     if (focus && focus->GetTagName() == "input") {
@@ -336,6 +346,7 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
     if (repeat && key != SDLK_UP && key != SDLK_DOWN && key != SDLK_PAGEUP && key != SDLK_PAGEDOWN) return false;
     if (ctrl && key == SDLK_O) return do_action("browse", ""), true;
     if (ctrl && key == SDLK_F) {
+        if (section_ != Section::Library) return false;
         if (Rml::Element *search = by_id("search")) search->Focus();
         return true;
     }
@@ -345,9 +356,12 @@ bool LauncherView::on_key(SDL_Keycode key, bool repeat) {
         for (const auto &[k, name] : keys)
             if (key == k) return open_menu(name, true), true;
     }
+    // the list's keys belong to the library
+    if (section_ != Section::Library && (key == SDLK_PAGEUP || key == SDLK_PAGEDOWN || key == SDLK_HOME || key == SDLK_END || key == SDLK_APPLICATION))
+        return false;
     switch (key) {
     case SDLK_F10:
-        if (shift) {
+        if (shift && section_ == Section::Library) {
             if (Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str())) {
                 const Rml::Vector2f at = row->GetAbsoluteOffset(Rml::BoxArea::Border);
                 open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
@@ -403,7 +417,7 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
             if (menu_ != "context") menu_switch(1);
             break;
-        case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, false); break;
+        case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, SDL_SCANCODE_RETURN, false); break;
         case SDL_GAMEPAD_BUTTON_EAST:
         case SDL_GAMEPAD_BUTTON_BACK: close_menu(); break;
         default: break;
@@ -417,9 +431,17 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         case SDL_GAMEPAD_BUTTON_DPAD_DOWN: dialog_navigate(NavDir::Down); break;
         case SDL_GAMEPAD_BUTTON_DPAD_LEFT: dialog_navigate(NavDir::Left); break;
         case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: dialog_navigate(NavDir::Right); break;
-        case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, false); break;
+        case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, SDL_SCANCODE_RETURN, false); break;
         case SDL_GAMEPAD_BUTTON_EAST: close_dialog(); break;
         default: break;
+        }
+        return true;
+    }
+    if (section_ == Section::Settings) {
+        if (button == SDL_GAMEPAD_BUTTON_BACK) {
+            if (down) open_menu("emulation", true);
+        } else {
+            settings_->on_pad_button(button, down);
         }
         return true;
     }
@@ -455,6 +477,11 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
 
 void LauncherView::on_pad_axis(SDL_GamepadAxis axis, int value) {
     if (axis != SDL_GAMEPAD_AXIS_LEFTY) return;
+    if (section_ == Section::Settings && menu_.empty() && dialog_ == Dialog::None) {
+        pad_mode_ = true;
+        settings_->on_pad_axis(axis, value);
+        return;
+    }
     if (std::abs(value) > STICK_THRESHOLD) {
         pad_mode_ = true;
         const int delta = value > 0 ? 1 : -1;

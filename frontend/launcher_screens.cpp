@@ -380,6 +380,7 @@ void LauncherView::update() {
     auto work = std::move(deferred_);
     deferred_.clear();
     for (auto &fn : work) fn();
+    settings_->update();
     for (size_t i = 0; i < timers_.size();) {
         if (timers_[i].first <= now_) {
             auto fn = std::move(timers_[i].second);
@@ -404,7 +405,7 @@ void LauncherView::update() {
         }
         set_message(summary, 0, 15);
         rows_sig_.clear();
-        if (settings_) settings_->set_game(selected_game()); // the overlay may have changed the settings
+        settings_->set_game(selected_game()); // the overlay may have changed the settings
     }
     poll_listing();
     rebuild_rows();
@@ -436,7 +437,7 @@ void LauncherView::update() {
                 if (opt_.tab == settings_tab_name(SettingsTab(i))) tab = SettingsTab(i);
             open_settings(tab);
         }
-        if (settings_ && !capture_pending_.empty()) {
+        if (!capture_pending_.empty()) {
             settings_->begin_capture(capture_pending_);
             capture_pending_.clear();
         }

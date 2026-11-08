@@ -8,39 +8,64 @@
         <div id="header">
             <div id="brand">xeno<span>forge</span></div>
             <div id="nav">
-                <div class="nav f on" id="nav-games">games</div>
+                <div class="nav f on" id="nav-games" data-action="library">games</div>
                 <div class="nav f" id="menu-emulation" data-menu="emulation">emulation</div>
                 <div class="nav f" id="nav-settings" data-action="settings">settings</div>
                 <div class="nav f" id="menu-help" data-menu="help">help</div>
             </div>
         </div>
-        <div id="toolbar">
-            <div class="tb primary f" id="tb-play" data-action="play">{i:play}<div id="tb-play-label">Play</div></div>
-            <div class="tb f" id="tb-prepare" data-action="prepare">{i:hammer}<div id="tb-prepare-label">Prepare</div></div>
-            <div class="tb f" id="tb-browse" data-action="browse">{i:folder-open}<div>Open Folder</div></div>
-            <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
-            <div class="tb f" id="tb-settings" data-action="settings">{i:settings}<div>Settings</div></div>
-            <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
-            <div class="tb f" id="tb-demo" data-action="demo-games">{i:layers}<div>Demo games</div></div>
-        </div>
-        <div id="table">
-            <div id="searchbar"><div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div></div>
-            <div id="thead"></div>
-            <div id="tbody"></div>
-            <div id="tempty"></div>
-        </div>
-        <div id="hints">
-            <div class="pad-hints">
-                <div class="hint"><div class="pb a">A</div><div class="hl">Play</div></div>
-                <div class="hint" id="hint-b" style="display: none;"><div class="pb b">B</div><div class="hl">Clear search</div></div>
-                <div class="hint"><div class="pb x">X</div><div class="hl">Settings</div></div>
-                <div class="hint"><div class="pb y">Y</div><div class="hl">Rescan</div></div>
-            </div>
-            <div class="key-hints">
-                {i:keyboard}<div class="hint-dot"></div>{i:mouse}
-                <div class="keycap one"><div>Enter</div></div><div class="hl">Play</div>
-                <div class="keycap two"><div>Page</div><div>Up</div></div>
-                <div class="keycap two"><div>Page</div><div>Down</div></div><div class="hl">Scroll</div>
+        <div id="stage">
+            <!-- two pages side by side, each as wide as the stage; the strip slides to show one -->
+            <div id="slide">
+                <div id="library" class="page-side">
+                    <div id="toolbar">
+                        <div class="tb primary f" id="tb-play" data-action="play">{i:play}<div id="tb-play-label">Play</div></div>
+                        <div class="tb f" id="tb-prepare" data-action="prepare">{i:hammer}<div id="tb-prepare-label">Prepare</div></div>
+                        <div class="tb f" id="tb-browse" data-action="browse">{i:folder-open}<div>Open Folder</div></div>
+                        <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
+                        <div class="tb f" id="tb-settings" data-action="settings">{i:settings}<div>Settings</div></div>
+                        <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
+                        <div class="tb f" id="tb-demo" data-action="demo-games">{i:layers}<div>Demo games</div></div>
+                    </div>
+                    <div id="table">
+                        <div id="searchbar"><div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div></div>
+                        <div id="thead"></div>
+                        <div id="tbody"></div>
+                        <div id="tempty"></div>
+                    </div>
+                    <div id="hints">
+                        <div class="pad-hints">
+                            <div class="hint"><div class="pb a">A</div><div class="hl">Play</div></div>
+                            <div class="hint" id="hint-b" style="display: none;"><div class="pb b">B</div><div class="hl">Clear search</div></div>
+                            <div class="hint"><div class="pb x">X</div><div class="hl">Settings</div></div>
+                            <div class="hint"><div class="pb y">Y</div><div class="hl">Rescan</div></div>
+                        </div>
+                        <div class="key-hints">
+                            {i:keyboard}<div class="hint-dot"></div>{i:mouse}
+                            <div class="keycap one"><div>Enter</div></div><div class="hl">Play</div>
+                            <div class="keycap two"><div>Page</div><div>Up</div></div>
+                            <div class="keycap two"><div>Page</div><div>Down</div></div><div class="hl">Scroll</div>
+                        </div>
+                    </div>
+                </div>
+                <div id="spage" class="page-side hidden">
+                    <div id="tabs"></div>
+                    <div id="scope"></div>
+                    <div id="pages"></div>
+                    <div id="shints">
+                        <div class="pad-hints">
+                            <div class="hint"><div class="pb a">A</div><div class="hl">Select</div></div>
+                            <div class="hint"><div class="pb b">B</div><div class="hl">Back</div></div>
+                            <div class="hint"><div class="bumper">LB</div><div class="bumper">RB</div><div class="hl">Tabs</div></div>
+                        </div>
+                        <div class="note">Changes are saved as you make them.</div>
+                        <div class="key-hints">
+                            {i:keyboard}<div class="hint-dot"></div>{i:mouse}
+                            <div class="keycap one"><div>Esc</div></div><div class="hl">Back</div>
+                            <div class="keycap two"><div>Ctrl</div><div>Tab</div></div><div class="hl">Next tab</div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
         <div id="statusbar">
@@ -55,6 +80,7 @@
     </div>
     <div id="menu-layer"></div>
     <div id="menu-host"></div>
+    <div id="popup-layer"></div>
     <div id="dialog-layer"></div>
 </body>
 </rml>
