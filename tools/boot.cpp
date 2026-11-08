@@ -58,6 +58,7 @@
 
 #include "game.h"
 #include "xenoforge/lockstep.h"
+#include "xenoforge/run.h"
 
 #include <chrono>
 #include <cstdio>
@@ -72,7 +73,7 @@
 
 using namespace xf;
 
-int main(int argc, char **argv) {
+int xf::run_boot(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
                         "[--render [--shots <dir> [--shot-swaps <list>] "
@@ -80,10 +81,11 @@ int main(int argc, char **argv) {
                         "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
                         "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
                         "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
-                        "[--replay-input <file>]\n";
+                        "[--replay-input <file>] [--option <key>=<value>]...\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
+    o.modules = port.modules, o.module_count = port.module_count;
     std::error_code ec;
     o.storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
     uint32_t seconds = 30;
@@ -150,7 +152,10 @@ int main(int argc, char **argv) {
             o.record_input = argv[++k];
         else if (a == "--replay-input" && k + 1 < argc)
             o.replay_input = argv[++k];
-        else if (a == "--press" && k + 1 < argc) {
+        else if (a == "--option" && k + 1 < argc) {
+            std::string why;
+            if (!port.set_option(argv[++k], why)) return std::fprintf(stderr, "%s\n", why.c_str()), 2;
+        } else if (a == "--press" && k + 1 < argc) {
             std::string why;
             if (!game::parse_press(argv[++k], presses.emplace_back(), why))
                 return std::fprintf(stderr, "%s\n", why.c_str()), 2;
@@ -194,6 +199,7 @@ int main(int argc, char **argv) {
                     shots.string().c_str());
     }
 
+    if (port.on_init) port.on_init(k);
     if (!game::launch(g, error)) return std::fprintf(stderr, "launch: %s\n", error.c_str()), 1;
     // until the main thread ends, the code hits what cannot run, or time is up
     uint32_t exit_code = 0;
@@ -251,6 +257,7 @@ int main(int argc, char **argv) {
         else
             game::print_summary(g, stall_reported ? "stall" : "ok", halted ? "halted" : "");
     }
+    if (port.on_shutdown) port.on_shutdown(k);
     // other threads may still run: no destructors under them
     std::fflush(stdout);
     std::_Exit(0);

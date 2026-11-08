@@ -30,12 +30,6 @@
 #include <unistd.h>
 #endif
 
-#ifdef XF_GENERATED
-// the game library's tables, one per module (xfrecomp emit's modules.cpp)
-extern "C" const xf::ppc::GeneratedModule *const xf_modules[];
-extern "C" const size_t xf_module_count;
-#endif
-
 namespace xf::game {
 namespace {
 
@@ -146,7 +140,6 @@ void print_renderer_report(const render::Report &r) {
     for (const auto &[what, n] : r.used) std::printf("  uses    %8llu  %s\n", (unsigned long long)n, what.c_str());
 }
 
-#ifndef XF_GENERATED
 // The game library the recompile step cached for this executable (or the one
 // named), its modules given to the kernel as a linked game's are; with none,
 // or one that does not load, the game is interpreted.
@@ -184,7 +177,6 @@ void load_game_library(const Options &options, Game &g) {
         std::printf("entry log: %s (%zu addresses)\n", log.string().c_str(), g.entry_log.size());
     }
 }
-#endif
 
 } // namespace
 
@@ -229,18 +221,18 @@ bool open(const Options &options, Game &g, std::string &error) {
     // its module's path, which the DLLs it loads by a bare name are next to
     kernel::set_executable_path(k, "game:\\" +
                                        (bare ? std::filesystem::path(input).filename().string() : options.xex_path));
-#ifdef XF_GENERATED
-    // each module's code runs once an image it was made from is loaded
-    // (the executable's in load(), a DLL's as XexLoadImage loads it)
-    size_t functions = 0;
-    for (size_t i = 0; i < xf_module_count; i++) functions += xf_modules[i]->count;
-    if (!options.interpret) k.set_generated_modules(xf_modules, xf_module_count);
-    if (!options.interpret) g.generated_modules = xf_module_count, g.generated_functions = functions;
-    std::printf("generated code: %zu modules, %zu functions%s\n", size_t(xf_module_count), functions,
-                options.interpret ? " (left out: --interpret)" : "");
-#else
-    if (!options.interpret) load_game_library(options, g);
-#endif
+    if (options.module_count) {
+        // generated code linked in: each module's code runs once an image it was
+        // made from is loaded (the executable's in load(), a DLL's as XexLoadImage loads it)
+        size_t functions = 0;
+        for (size_t i = 0; i < options.module_count; i++) functions += options.modules[i]->count;
+        if (!options.interpret) k.set_generated_modules(options.modules, options.module_count);
+        if (!options.interpret) g.generated_modules = options.module_count, g.generated_functions = functions;
+        std::printf("generated code: %zu modules, %zu functions%s\n", options.module_count, functions,
+                    options.interpret ? " (left out: --interpret)" : "");
+    } else if (!options.interpret) {
+        load_game_library(options, g);
+    }
     if (!k.load(g.xex, error)) return error = "load: " + error, false;
     k.step_limit = options.steps;
     {

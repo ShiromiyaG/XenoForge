@@ -1,0 +1,3 @@
+# The port's project file (docs/recompiler.md, "The project file"): empty, so
+# the recompiler's own discovery stands. Names for functions, functions to add or
+# skip, jump tables and the functions the port replaces go here.

@@ -86,6 +86,15 @@ void read_sections(const toml::table &t, Settings &s) {
         for (auto &[key, value] : *table)
             if (auto v = value.value<std::string>(); v && s.keys.count(std::string(key.str())))
                 s.keys[std::string(key.str())] = *v;
+    if (auto *table = t["port"].as_table())
+        for (auto &[key, value] : *table) {
+            if (auto b = value.value<bool>())
+                s.port[std::string(key.str())] = *b;
+            else if (auto i = value.value<int64_t>())
+                s.port[std::string(key.str())] = *i;
+            else if (auto d = value.value<double>())
+                s.port[std::string(key.str())] = *d;
+        }
 }
 
 void write_sections(toml::table &t, const Settings &s) {
@@ -102,6 +111,12 @@ void write_sections(toml::table &t, const Settings &s) {
                                             {"right_deadzone", s.input.right_deadzone},
                                             {"vibration", s.input.vibration}});
     t.insert_or_assign("keyboard", std::move(keys));
+    if (!s.port.empty()) {
+        toml::table port;
+        for (const auto &[key, value] : s.port)
+            std::visit([&](auto v) { port.insert_or_assign(key, v); }, value);
+        t.insert_or_assign("port", std::move(port));
+    }
 }
 
 // the file as it is, or an empty table when it is missing or does not parse

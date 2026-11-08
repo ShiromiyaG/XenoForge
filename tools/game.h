@@ -6,10 +6,9 @@
 // the report of what the kernel, the GPU, the sound and the input did, and
 // the scripted presses (--press) both take.
 //
-// Compiled into each executable (with XF_GENERATED in the ones linked with a
-// game's generated code), so the tables it installs (one per module) are
-// that game's; the generic ones load the game library cached for the disc
-// (game_library.h) instead.
+// A port or game linked with its generated code gives the tables (one per
+// module) in Options; the generic boot and player load the game library
+// cached for the disc (game_library.h) instead.
 
 #pragma once
 
@@ -37,6 +36,10 @@ struct Options {
     std::filesystem::path storage;        // the storage root (content/, cache*/)
     uint64_t steps = 2'000'000'000ull;    // the interpreter's instructions per entry
     bool interpret = false;               // the generated code left out (linked, or a game library)
+    // Generated code linked into the executable (xfrecomp emit's modules.cpp: a
+    // table per module), when there is any; else the game library below.
+    const ppc::GeneratedModule *const *modules = nullptr;
+    size_t module_count = 0;
     // Built without generated code (the generic boot and player): the game
     // library the recompile step cached for the executable (game_build.h),
     // from this cache (game_build.h's default_cache_dir() when empty), or the
