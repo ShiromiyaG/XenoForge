@@ -199,6 +199,9 @@ constexpr VkDeviceSize NONE = ~VkDeviceSize(0);
 // holds 14 bits of index) and samplers
 constexpr uint32_t IMAGES[3] = {16384, 4096, 4096};
 constexpr uint32_t SAMPLERS = 1024;
+// the textures resolves write as well, of 32- and of 64-bit texels each
+// (Impl::resolve_target)
+constexpr uint32_t RESOLVE_TARGETS = 64;
 
 float as_float(uint32_t bits) {
     float f;
@@ -503,6 +506,7 @@ struct ResolveConstants {
     // a multisampled source read from EDRAM
     uint32_t edram, edram_base, edram_pitch, msaa, ints_log2, src_x, src_y, first_sample, samples;
     uint32_t depth_round; // D24FS8 from the host's float: 20e4 rounded to the nearest even
+    uint32_t target;      // the texture written too (resolve.comp's p.target), 0 none
 };
 static_assert(sizeof(ResolveConstants) <= 128, "the push constants every device has room for");
 
@@ -582,6 +586,13 @@ struct Texture {
     VkDeviceSize bytes = 0;
     uint64_t used_serial = 0, used_ms = 0;
     Texture *older = nullptr, *newer = nullptr;
+    // a resolve target (Impl::resolve_target): its slot in the resolves'
+    // target table plus one (0: not one) and bit 7 for a 64-bit texel; its
+    // unsigned view there; and what a resolve must write to feed it (its
+    // base, pitch in texels, guest format and endianness)
+    uint32_t target = 0;
+    VkImageView target_view = VK_NULL_HANDLE;
+    uint32_t target_base = 0, target_pitch = 0, target_endian = 0;
 };
 
 // the translated shaders' and the geometry shaders' system constants
@@ -882,6 +893,8 @@ struct PipelineEntry {
     // when a draw first asked for it, until one is first drawn with it or
     // its stand-in (Report::pipeline_wait_*); zero once counted
     std::chrono::steady_clock::time_point asked{};
+    // when a worker finished making it (zero: not made on a worker)
+    std::chrono::steady_clock::time_point made{};
     // the libraries it is linked from (vertex input, pre-rasterization,
     // fragment shader, fragment output; the last two null when rasterization
     // is discarded), once asked for
@@ -961,6 +974,7 @@ private:
             desc.reset();
             lock.lock();
             entry->pipeline = p;
+            entry->made = std::chrono::steady_clock::now();
             entry->state.store(1, std::memory_order_release);
             busy_--;
             if (late) {
@@ -1203,6 +1217,14 @@ private:
     bool make_room(uint32_t kind, uint32_t needed);
     void destroy_texture(Texture *t);
     void release_index(uint32_t kind, uint32_t index);
+    // a resolve target's slot given back and its view destroyed (the GPU done with them)
+    void release_target(uint32_t target, VkImageView view) {
+        if (view) vkDestroyImageView(dev_, view, nullptr);
+        if (target & 0x7F) free_targets_[(target >> 7) & 1].push_back((target & 0x7F) - 1);
+    }
+    // the textures (up to two) a resolve to this destination feeds, written
+    // by it as well (resolve targets not loaded again since): how many
+    uint32_t resolve_targets(const resolve::Info &info, Texture *targets[2]);
     uint32_t take_index(uint32_t kind);
     uint32_t room(uint32_t kind) const {
         return uint32_t(free_indices_[kind].size()) + (capacity_[kind] - next_index_[kind]);
@@ -1218,8 +1240,9 @@ private:
     void index_texture(Texture &t);
     void unindex_texture(Texture &t);
     // the textures over what the GPU wrote, loaded again (from the mirror) at
-    // their next use (Xenia's FireWatches with invalidated_by_gpu)
-    void textures_written_by_gpu(const std::vector<Range> &written);
+    // their next use (Xenia's FireWatches with invalidated_by_gpu); but for
+    // written_too, resolve targets the GPU wrote as well (null ones none)
+    void textures_written_by_gpu(const std::vector<Range> &written, Texture *const written_too[2] = nullptr);
     Texture *lru_oldest_ = nullptr, *lru_newest_ = nullptr;
     VkDeviceSize texture_bytes_ = 0;
     std::vector<uint32_t> free_indices_[3]; // each table's places given back
@@ -1616,6 +1639,15 @@ private:
     VkPipeline resolve_pipeline_ = VK_NULL_HANDLE, load_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool compute_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet resolve_set_ = VK_NULL_HANDLE, load_set_ = VK_NULL_HANDLE, resolve_edram_set_ = VK_NULL_HANDLE;
+    // the resolves' set 1: the textures they write as well, through 32- and
+    // 64-bit unsigned views (RESOLVE_TARGETS each, updated after binding),
+    // their free slots
+    VkDescriptorSetLayout target_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool target_pool_ = VK_NULL_HANDLE;
+    VkDescriptorSet target_set_ = VK_NULL_HANDLE;
+    bool resolve_targets_ = false;
+    uint32_t next_target_[2] = {};
+    std::vector<uint32_t> free_targets_[2];
 
     // EDRAM: the render targets' contents move through it when another
     // target takes over its tiles (Xenia's ownership transfers); it starts
@@ -1717,6 +1749,7 @@ Impl::~Impl() {
     for (auto &[k, t] : targets_) d_.destroy(t->image);
     for (auto &[k, t] : textures_) {
         for (const TextureView &v : t->views) vkDestroyImageView(dev_, v.view, nullptr);
+        if (t->target_view) vkDestroyImageView(dev_, t->target_view, nullptr);
         d_.destroy(t->image);
         if (t->signed_image.image) d_.destroy(t->signed_image);
     }
@@ -1735,12 +1768,12 @@ Impl::~Impl() {
                              depth_float24_fs_[1], placeholder_fs_, fsi_depth_fs_})
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (VkDescriptorPool p : edram_pools_) vkDestroyDescriptorPool(dev_, p, nullptr);
-    for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_})
+    for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_, target_pool_})
         if (p) vkDestroyDescriptorPool(dev_, p, nullptr);
     for (VkPipelineLayout l : {edram_layouts_[0], edram_layouts_[1], layout_, resolve_layout_, load_layout_})
         if (l) vkDestroyPipelineLayout(dev_, l, nullptr);
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
-                                    compute_set_layout_})
+                                    compute_set_layout_, target_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
     for (vk::Buffer *b : {&edram_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_, &zpd_counters_, &zpd_readback_})
         d_.destroy(*b);
@@ -2203,13 +2236,56 @@ bool Impl::init(std::string &error) {
         info.pBindings = bindings;
         if (vkCreateDescriptorSetLayout(dev_, &info, nullptr, &compute_set_layout_) != VK_SUCCESS)
             return error = "vkCreateDescriptorSetLayout failed", false;
+        // the resolves' set 1, the textures they write as well (resolve.comp's
+        // targets32 and targets64): partially bound, updated after binding
+        // where the device can (else never written, the resolves writing
+        // memory alone)
+        const char *targets_env = std::getenv("XF_RESOLVE_TARGETS");
+        resolve_targets_ = d_.storage_image_update_after_bind() && !options_.no_resolve_targets &&
+                           !(targets_env && targets_env[0] == '0');
+        VkDescriptorSetLayoutBinding target_bindings[2] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, RESOLVE_TARGETS, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, RESOLVE_TARGETS, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        };
+        VkDescriptorBindingFlags target_flags[2];
+        for (VkDescriptorBindingFlags &f : target_flags)
+            f = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                (resolve_targets_ ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                                        VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT
+                                  : 0);
+        VkDescriptorSetLayoutBindingFlagsCreateInfo target_flag_info{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+        target_flag_info.bindingCount = 2;
+        target_flag_info.pBindingFlags = target_flags;
+        VkDescriptorSetLayoutCreateInfo target_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        target_info.pNext = &target_flag_info;
+        target_info.flags = resolve_targets_ ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
+        target_info.bindingCount = 2;
+        target_info.pBindings = target_bindings;
+        if (vkCreateDescriptorSetLayout(dev_, &target_info, nullptr, &target_set_layout_) != VK_SUCCESS)
+            return error = "vkCreateDescriptorSetLayout failed", false;
+        VkDescriptorPoolSize target_size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * RESOLVE_TARGETS};
+        VkDescriptorPoolCreateInfo target_pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        target_pool.flags = resolve_targets_ ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0;
+        target_pool.maxSets = 1;
+        target_pool.poolSizeCount = 1;
+        target_pool.pPoolSizes = &target_size;
+        if (vkCreateDescriptorPool(dev_, &target_pool, nullptr, &target_pool_) != VK_SUCCESS)
+            return error = "vkCreateDescriptorPool failed", false;
+        VkDescriptorSetAllocateInfo target_alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        target_alloc.descriptorPool = target_pool_;
+        target_alloc.descriptorSetCount = 1;
+        target_alloc.pSetLayouts = &target_set_layout_;
+        if (vkAllocateDescriptorSets(dev_, &target_alloc, &target_set_) != VK_SUCCESS)
+            return error = "vkAllocateDescriptorSets failed", false;
         uint32_t push_sizes[2] = {sizeof(ResolveConstants), sizeof(LoadConstants)};
         VkPipelineLayout *layouts[2] = {&resolve_layout_, &load_layout_};
         for (int k = 0; k < 2; k++) {
             VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_sizes[k]};
             VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-            layout.setLayoutCount = 1;
-            layout.pSetLayouts = &compute_set_layout_;
+            const VkDescriptorSetLayout set_layouts[2] = {compute_set_layout_, target_set_layout_};
+            layout.setLayoutCount = k == 0 ? 2 : 1; // the resolves' with their targets
+            layout.pSetLayouts = set_layouts;
             layout.pushConstantRangeCount = 1;
             layout.pPushConstantRanges = &range;
             if (vkCreatePipelineLayout(dev_, &layout, nullptr, layouts[k]) != VK_SUCCESS)
@@ -2813,7 +2889,7 @@ void Impl::unindex_texture(Texture &t) {
     t.bucket_first = 1, t.bucket_last = 0;
 }
 
-void Impl::textures_written_by_gpu(const std::vector<Range> &written) {
+void Impl::textures_written_by_gpu(const std::vector<Range> &written, Texture *const written_too[2]) {
     uint32_t low = UINT32_MAX, high = 0;
     for (const Range &r : written)
         if (r.second > r.first) low = std::min(low, r.first), high = std::max(high, r.second);
@@ -2822,7 +2898,9 @@ void Impl::textures_written_by_gpu(const std::vector<Range> &written) {
     for (uint32_t b = first; b <= last; b++)
         for (Texture *t : texture_buckets_[b]) {
             // each texture once: in the first bucket both it and the write span
-            if (b != std::max(first, t->bucket_first)) continue;
+            if (b != std::max(first, t->bucket_first) ||
+                (written_too && (t == written_too[0] || t == written_too[1])))
+                continue;
             if (t->high <= low || t->low >= high || (t->stale && t->load_why == LoadWhy::GpuWritten)) continue;
             bool hit = false;
             for (const Range &r : written) {
@@ -3671,6 +3749,7 @@ void Impl::destroy_texture(Texture *t) {
         vkDestroyImageView(dev_, v.view, nullptr);
     }
     report_.texture_views -= t->views.size();
+    release_target(t->target, t->target_view);
     if (t->image.image) d_.destroy(t->image);
     if (t->signed_image.image) d_.destroy(t->signed_image);
     textures_.erase(t->key);
@@ -3804,14 +3883,18 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             // with it (work under way may still read them)
             vk::Image old = t->image, old_signed_image = t->signed_image;
             std::vector<TextureView> old_views = std::move(t->views);
-            uint32_t old_kind = t->kind;
+            uint32_t old_kind = t->kind, old_target = t->target;
+            VkImageView old_target_view = t->target_view;
+            t->target = 0, t->target_view = VK_NULL_HANDLE;
             report_.texture_views -= old_views.size();
             cmd();
-            slots_[current_].after.push_back([this, old, old_signed_image, old_views, old_kind]() mutable {
+            slots_[current_].after.push_back([this, old, old_signed_image, old_views, old_kind, old_target,
+                                              old_target_view]() mutable {
                 for (const TextureView &v : old_views) {
                     release_index(old_kind, v.index);
                     vkDestroyImageView(dev_, v.view, nullptr);
                 }
+                release_target(old_target, old_target_view);
                 if (old.image) d_.destroy(old);
                 if (old_signed_image.image) d_.destroy(old_signed_image);
             });
@@ -3831,13 +3914,60 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         t->host = plan.format, t->host_swizzle = plan.host_swizzle;
         t->signed_read = plan.signed_read, t->signed_format = signed_format;
         // a source of copies too: a front buffer read back, or copied by a presenter
-        const VkImageUsageFlags usage =
+        VkImageUsageFlags usage =
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        const VkImageCreateFlags flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+        VkImageCreateFlags flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+        // A resolve target (resolve_target): a texture over memory a resolve
+        // wrote, one 2D level of 32- or 64-bit texels whose image holds the
+        // guest's bits as they are (a plain copy), tiled, made storable
+        // through an unsigned view of its texel's size, which resolves write.
+        const uint32_t texel_bytes = texture::format_block(info.format).bytes;
+        const bool target = resolve_targets_ && mirror && !separate && !three && !cube && layers == 1 &&
+                            level_count == 1 && plan.slices.size() == 1 && plan.slices[0].level == 0 &&
+                            plan.slices[0].tiled && plan.load == texture::Load::Copy &&
+                            plan.half == texture::Half::None && plan.block_width == 1 && plan.block_height == 1 &&
+                            (texel_bytes == 4 || texel_bytes == 8) && plan.bytes_per_block == texel_bytes;
+        const VkFormat target_format = texel_bytes == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
+        if (target) usage |= VK_IMAGE_USAGE_STORAGE_BIT, flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         // a signed view of the same bits: the image mutable, with the snorm
         // format listed (Xenia's Vulkan textures with both formats)
         t->image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, format, extent, level_count, layers,
-                                   VK_SAMPLE_COUNT_1_BIT, usage, flags, separate ? VK_FORMAT_UNDEFINED : signed_format);
+                                   VK_SAMPLE_COUNT_1_BIT, usage, flags, separate ? VK_FORMAT_UNDEFINED : signed_format,
+                                   target ? target_format : VK_FORMAT_UNDEFINED);
+        if (target && t->image.image) {
+            const uint32_t wide = texel_bytes == 8 ? 1 : 0;
+            uint32_t slot = UINT32_MAX;
+            if (!free_targets_[wide].empty()) {
+                slot = free_targets_[wide].back();
+                free_targets_[wide].pop_back();
+            } else if (next_target_[wide] < RESOLVE_TARGETS) {
+                slot = next_target_[wide]++;
+            }
+            VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            view.image = t->image.image;
+            view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            view.format = target_format;
+            view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageViewUsageCreateInfo view_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+            view_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+            view.pNext = &view_usage;
+            if (slot != UINT32_MAX && vkCreateImageView(dev_, &view, nullptr, &t->target_view) == VK_SUCCESS) {
+                VkDescriptorImageInfo image{VK_NULL_HANDLE, t->target_view, VK_IMAGE_LAYOUT_GENERAL};
+                VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                write.dstSet = target_set_;
+                write.dstBinding = wide;
+                write.dstArrayElement = slot;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                write.pImageInfo = &image;
+                vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+                t->target = (slot + 1) | wide << 7;
+                t->target_base = plan.slices[0].base & 0x1FFFFFFF, t->target_pitch = plan.slices[0].pitch_blocks;
+                t->target_endian = info.endian;
+            } else if (slot != UINT32_MAX) {
+                free_targets_[wide].push_back(slot);
+            }
+        }
         if (separate)
             t->signed_image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, signed_format, extent,
                                               level_count, layers, VK_SAMPLE_COUNT_1_BIT, usage, flags);
@@ -4022,9 +4152,21 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
     pending = stand_in = false;
     async = async && pipeline_workers_ && !options_.linked_pipelines_only;
     // how long a pipeline made on the workers left its draws without one
+    // (until it, or for a linked stand-in its last library, was made: a
+    // draw asking again only later, as a scene shown once more a minute
+    // after, waited no longer than that)
     auto drawn_with = [this](PipelineEntry &entry) {
-        if (entry.asked == std::chrono::steady_clock::time_point{}) return;
-        double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - entry.asked).count();
+        using clock = std::chrono::steady_clock;
+        if (entry.asked == clock::time_point{}) return;
+        clock::time_point end = clock::now(), ready{};
+        if (entry.pipeline) {
+            ready = entry.made;
+        } else {
+            for (PipelineEntry *l : entry.libraries)
+                if (l) ready = std::max(ready, l->made);
+        }
+        if (ready != clock::time_point{} && ready < end) end = std::max(ready, entry.asked);
+        double waited = std::chrono::duration<double>(end - entry.asked).count();
         entry.asked = {};
         report_.pipeline_waits++;
         report_.pipeline_wait_seconds += waited;
@@ -6600,6 +6742,37 @@ void Impl::resolve() {
     }
 }
 
+// Beyond Xenia, whose resolves write memory and whose textures over it are
+// loaded from there again: the textures a later draw reads over a resolve's
+// destination are written by the resolve too, their images kept current, not
+// loaded again (renderer.md, "Resolve targets"). Such a texture is one made
+// as a resolve target (one tiled 2D level of 32- or 64-bit texels whose
+// image holds the guest's bits as they are), current before the resolve
+// (not stale), with the destination's base, pitch, texel size and
+// endianness, whatever its format (the same bits under another name, as a
+// 16_16_FLOAT render target read as 16_16_EXPAND): then the rectangle's
+// pixel (x, y) is its texel (texel_x0 + dest_x + x, texel_y0 + dest_y + y),
+// and the resolve leaves the rest of its memory as it was. Up to two (the
+// push constants' room); a third is loaded again as before.
+uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2]) {
+    targets[0] = targets[1] = nullptr;
+    if (!resolve_targets_ || info.depth || info.dest_array || !info.texture_base) return 0;
+    const uint32_t bytes = texture::format_block(info.dest_format).bytes;
+    if (bytes != 4 && bytes != 8) return 0;
+    if ((info.texel_x0 >> 5) > 0xFF || (info.texel_y0 >> 5) > 0xFF) return 0;
+    const uint32_t base = info.texture_base & 0x1FFFFFFF, wide = bytes == 8 ? 1 : 0;
+    const uint32_t bucket = base >> TEXTURE_BUCKET_SHIFT;
+    if (bucket >= std::size(texture_buckets_)) return 0;
+    uint32_t count = 0;
+    for (Texture *t : texture_buckets_[bucket])
+        if (t->target && ((t->target >> 7) & 1) == wide && !t->stale && t->target_base == base &&
+            t->target_pitch == info.dest_pitch && t->target_endian == info.dest_endian) {
+            targets[count++] = t;
+            if (count == 2) break;
+        }
+    return count;
+}
+
 // The copy on the GPU: the rectangle (resolved to one sample per pixel when
 // multisampled) copied into a scratch buffer as the host keeps it, then
 // written into the mirror as the destination says (resolve.comp, resolve.cpp's
@@ -6702,6 +6875,13 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     p.dest_log2_bytes = uint32_t(std::countr_zero(texture::format_block(info.dest_format).bytes));
     p.dest_endian = info.dest_endian, p.dest_number = info.dest_number, p.dest_swap = info.dest_swap;
     p.exp_factor = std::ldexp(1.0f, info.dest_exp_bias);
+    Texture *targets[2];
+    if (uint32_t count = resolve_targets(info, targets)) {
+        p.target = (targets[0]->target & 0xFF) | (count > 1 ? (targets[1]->target & 0x7F) << 8 : 0) |
+                   (info.texel_x0 >> 5) << 16 | (info.texel_y0 >> 5) << 24;
+        for (uint32_t k = 0; k < count; k++) use(*targets[k], submission_serial() + 1);
+        report_.resolve_targets_written += count;
+    }
     if (from_edram) {
         p.edram = 1;
         p.edram_base = source.base, p.edram_pitch = source.pitch_tiles, p.msaa = source.msaa;
@@ -6711,14 +6891,14 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         p.samples = resolve::sample_count(info.sample_select);
     }
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_pipeline_);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 1,
-                            from_edram ? &resolve_edram_set_ : &resolve_set_, 0, nullptr);
+    const VkDescriptorSet resolve_sets[2] = {from_edram ? resolve_edram_set_ : resolve_set_, target_set_};
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 2, resolve_sets, 0, nullptr);
     vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
     full_barrier(c);
 
     gpu_written(written);
-    textures_written_by_gpu(written);
+    textures_written_by_gpu(written, targets);
     if (options_.readback_resolve != ReadbackResolve::none) read_back_resolve(written);
 }
 

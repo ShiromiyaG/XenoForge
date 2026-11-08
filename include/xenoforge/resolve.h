@@ -37,6 +37,12 @@ struct Info {
     uint32_t dest_x = 0, dest_y = 0, dest_slice = 0;
     uint32_t dest_number = 0;    // xenos.h's SurfaceNumberFormat: 0 unsigned fraction, 1 signed, 2/3 integer, 7 float
     bool dest_array = false;     // a 3D (array) destination, slice dest_slice
+    // a 2D destination as a texture over it sees it: the address
+    // RB_COPY_DEST_BASE names (less the x offset Direct3D carries in it),
+    // and the texel there of the rectangle's corner less dest_x and dest_y
+    // (a texture at texture_base with the same pitch holds the rectangle's
+    // pixel (x, y) at texel (texel_x0 + dest_x + x, texel_y0 + dest_y + y))
+    uint32_t texture_base = 0, texel_x0 = 0, texel_y0 = 0;
     bool copy = true;            // false: a clear alone
     // the clears done after the copy
     bool clear_color = false, clear_depth = false;

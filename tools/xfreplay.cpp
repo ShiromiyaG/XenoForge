@@ -168,9 +168,11 @@ int main(int argc, char **argv) {
                 double(report.texture_bytes) / (1 << 20),
                 double(report.texture_bytes_peak) / (1 << 20), (unsigned long long)report.textures_evicted,
                 (unsigned long long)report.textures_evicted_for_room, (unsigned long long)report.textures_refused);
-    std::printf("  texture loads: %llu new, %llu after the CPU wrote their memory, %llu after a resolve or an export\n",
+    std::printf("  texture loads: %llu new, %llu after the CPU wrote their memory, %llu after a resolve or an export; "
+                "%llu resolves wrote the texture they feed\n",
                 (unsigned long long)report.texture_loads_new, (unsigned long long)report.texture_loads_cpu_written,
-                (unsigned long long)report.texture_loads_gpu_written);
+                (unsigned long long)report.texture_loads_gpu_written,
+                (unsigned long long)report.resolve_targets_written);
     if (report.zpd_reports)
         std::printf("  occlusion: %llu queries for %llu reports\n", (unsigned long long)report.occlusion_queries,
                     (unsigned long long)report.zpd_reports);

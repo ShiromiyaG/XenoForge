@@ -995,7 +995,8 @@ adjust), and what else differed from Xenia without being counted:
 - **Pixel parameters** (SQ_PROGRAM_CNTL's param_gen): the pixel's
   position, its facing and the kind of primitive in the interpolator
   SQ_CONTEXT_MISC names, as Xenia writes them (VPOS for screen-space
-  passes); point sprite coordinates are still 0 there.
+  passes); point sprite coordinates there since 2026-11-08 ("Resolve
+  targets, and Xenia's approximations closed").
 - **The LOD**: the fetch constant's bias (word 4) and per-axis gradient
   exponents on every fetch, computed LOD as explicit gradients from coarse
   derivatives (cube maps: the implicit LOD with a bias), as Xenia samples.
@@ -1954,6 +1955,83 @@ default, waiting for them), a warm one 0.01 s with libraries.
 the 32-bit one, rounded at 32 bits (xenos.h's GetSurfacePitchTiles); it was
 rounded at 64 bits, which differs for pitches whose samples are not a
 multiple of 80. No traced frame has such a pitch.
+
+## Resolve targets, and Xenia's approximations closed (2026-11-08)
+
+**Resolve targets** (beyond Xenia; `Options::no_resolve_targets`,
+`XF_RESOLVE_TARGETS=0`, `XF_VK_NO_RESOLVE_TARGETS=1`). Xenia's resolves
+write memory, and every texture over what they wrote is loaded again from
+it at its next use; in game A's race those loads were about 14% of the
+GPU's frame. Here a resolve also writes the texture a later draw reads over
+its destination, and that texture is not loaded again. A texture is made a
+resolve target when it is loaded from memory the GPU wrote and is one tiled
+2D level of 32- or 64-bit texels whose image holds the guest's bits as they
+are (a plain copy load, no 16-bit fallback): its image is then storable
+through an `R32_UINT` or `R32G32_UINT` view (mutable, extended usage), in
+one of 64 places per size of the resolves' set 1 (partially bound, updated
+after binding). A resolve feeds up to two of them (the push constants'
+room) that are current (not stale), with the destination's base (the
+`RB_COPY_DEST_BASE` address less the x offset Direct3D carries in it), pitch,
+texel size and endianness, whatever their format: a 16_16_FLOAT target read
+back as 16_16_EXPAND is the same bits. `resolve.comp` stores each pixel's
+words before the destination's byte swap at texel `texel_x0 + dest_x + x`
+(`resolve::Info::texture_base`, `texel_x0`, `texel_y0`), bounds checked;
+the rest of the texture is memory the resolve left as it was. Textures over
+the same memory with another pitch or texel size, depth (24_8, not a
+copy), and a third alias are loaded again as before. Needs
+`descriptorBindingStorageImageUpdateAfterBind` and storage image array
+indexing (the RTX 5060 has both); without them the resolves write memory
+alone.
+
+Game A's race trace (`xfreplay --gpu-time --repeat 10`, the fastest play):
+4.573 ms of GPU a play before, 4.163 after (-9%; the trace's front buffer
+read-back, 0.50 ms, is the trace's own); its texture loads after resolves
+from 13 (0.639 ms) to 5 (0.229 ms) a play, 143 of the 10 plays' resolves
+writing the texture they feed, the resolves' own cost 0.273 to 0.292 ms;
+the picture unchanged (0.008 off Xenia's Vulkan FSI picture), validation
+clean. Xenia's "base and mips loaded apart" was measured first: every
+texture the race loads after a resolve is one level, so it would gain
+nothing there and is left.
+
+**Xenia's approximations, closed or explained** (the "Approximated" list):
+- **Polygon modes** (`PA_SU_SC_MODE_CNTL` poly_mode, front and back types):
+  as Xenia's Vulkan pipeline cache, one mode for both faces, the lowest type
+  of the faces not culled; points and lines through `fillModeNonSolid`
+  (optional, `XF_VK_NO_FILL_MODES=1`; without it filled and counted). The
+  mode is in the pipeline key.
+- **Point sprite coordinates** in the pixel parameters: the point
+  expansion (point_list.geom, or the vertex shader's) writes the corner's
+  coordinates at location 17 and a point list's pixel shader
+  (`PixelOptions::point_coordinates`, Xenia's `param_gen_point`) puts them,
+  clamped to 0-1, in the parameters' z and w. The hardware's order and
+  sampling point stay a hardware question (Xenia's TODO C19).
+- **YCbCr border colors**: (Cr, Y, Cb) and (Y, Cr, Cb) black, through
+  `VK_EXT_custom_border_color` without a format, as Xenia's Vulkan cache
+  (`XF_VK_NO_CUSTOM_BORDER=1`: black, counted); `force_bc_w_to_max` (dword
+  5 bit 2) gives the border an alpha of 1, as Xenia's both caches.
+- **Samplers past the bindless table**: a full table (1,024) destroys the
+  sampler least recently used by a finished submission and takes its place,
+  as Xenia keeps its samplers within the device's limit; only with all in
+  use by running work is the stand-in taken, counted.
+- **An ALU operand from a fetch constant**: not something the microcode
+  can say. An ALU operand is a register or a float constant by its source
+  select bit, all the parser makes of it (as Xenia's); the translator's
+  check stays as an internal one.
+- **Vertex fetches from a texture fetch constant**: drawn with the
+  constant's bits read as a vertex constant, as Xenia (its
+  `gpu_allow_invalid_fetch_constants`, on by default); what the fetch unit
+  does with the type bits only hardware can say. Counted.
+
+**The disc's shaders the build step rejected** (29 of game A's 88): all are
+vertex shaders as Direct3D keeps them in a shader container, before binding:
+their full vertex fetches have no format (0) and no stride, because Direct3D
+writes each fetch's format, stride and offset into the microcode from the
+vertex declaration when it binds the shader (the container lists the
+fetches by usage; XenosRecomp maps them to host vertex inputs for the same
+reason). The copy a draw runs is that patched one, under another hash,
+which the runs record. `ucode::awaits_vertex_declaration` tells them; the
+build step counts them apart ("vertex shaders awaiting a vertex
+declaration") and translates the 59 pixel shaders, all of which translate.
 
 ## What is asked and not done is counted
 

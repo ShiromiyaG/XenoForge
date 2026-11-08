@@ -538,6 +538,7 @@ bool get_info(std::span<const uint32_t> regs, const GuestMemory &memory, Info &o
                                                                       out.dest_height, bpp_log2));
     else
         out.dest_base = addr_base + texture::tiled_offset_2d(base_x, base_y, out.dest_pitch, bpp_log2);
+    if (!out.dest_array) out.texture_base = addr_base, out.texel_x0 = base_x, out.texel_y0 = base_y;
     return true;
 }
 

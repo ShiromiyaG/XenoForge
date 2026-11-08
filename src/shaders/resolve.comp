@@ -16,6 +16,12 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) readonly buffer Source { uint words[]; } src;
 layout(set = 0, binding = 1) coherent buffer Memory { uint words[]; } memory;
+// The textures over a destination that the resolve writes as well
+// (renderer.cpp's resolve targets): their images through 32- and 64-bit
+// unsigned views, the guest's texel bits as the texture's load would make
+// them (before the destination's byte swap).
+layout(set = 1, binding = 0, r32ui) uniform writeonly uimage2D targets32[64];
+layout(set = 1, binding = 1, rg32ui) uniform writeonly uimage2D targets64[64];
 
 layout(push_constant) uniform Resolve {
     uint width, height;     // the rectangle
@@ -37,6 +43,12 @@ layout(push_constant) uniform Resolve {
     // (Xenia's depth_float24_round, which its resolves follow, made from its
     // EDRAM dump)
     uint depth_round;
+    // the textures the resolve writes too: bits 0-6 the first's slot plus
+    // one (0: none), bit 7 64-bit texels, bits 8-14 the second's slot plus
+    // one, bits 16-23 and 24-31 the texel of the destination's pixel (0, 0)
+    // less dest_x and dest_y, in 32-texel units (resolve::Info's texel_x0
+    // and texel_y0)
+    uint target;
 } p;
 
 #include "tiling.glsl"
@@ -434,6 +446,20 @@ void main() {
         atomicAnd(memory.words[address >> 2u], ~mask);
         atomicOr(memory.words[address >> 2u], value << shift);
         return;
+    }
+    if ((p.target & 0x7Fu) != 0u) {
+        ivec2 texel = ivec2(x + ((p.target >> 16u) & 0xFFu) * 32u, y + (p.target >> 24u) * 32u);
+        for (uint k = 0u; k < 2u; k++) {
+            uint slot = (p.target >> (8u * k)) & 0x7Fu;
+            if (slot == 0u) continue;
+            slot -= 1u;
+            if ((p.target & 0x80u) != 0u) {
+                if (all(lessThan(texel, imageSize(targets64[slot]))))
+                    imageStore(targets64[slot], texel, uvec4(w[0], w[1], 0u, 0u));
+            } else if (all(lessThan(texel, imageSize(targets32[slot])))) {
+                imageStore(targets32[slot], texel, uvec4(w[0], 0u, 0u, 0u));
+            }
+        }
     }
     swap_words(w, words, p.dest_endian);
     for (uint i = 0u; i < dest_bytes / 4u; i++) memory.words[(address >> 2u) + i] = w[i];

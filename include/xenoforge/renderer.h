@@ -61,6 +61,7 @@ struct Report {
     // CPU wrote (its watches), one whose memory a resolve or a memory export
     // wrote (render to texture, loaded again from the mirror on the GPU)
     uint64_t texture_loads_new = 0, texture_loads_cpu_written = 0, texture_loads_gpu_written = 0;
+    uint64_t resolve_targets_written = 0; // resolves that wrote the texture they feed too (not loaded again)
     uint64_t textures_evicted = 0, textures_evicted_for_room = 0, textures_refused = 0;
     uint64_t occlusion_queries = 0, zpd_reports = 0; // host queries begun, reports answered with their counts
     double seconds = 0;                          // spent in the renderer's calls, of which:
@@ -239,6 +240,12 @@ struct Options {
     // whole ones do (xfreplay --linked-pipelines); needs the device's
     // libraries
     bool linked_pipelines_only = false;
+    // Resolves write the texture a later draw reads over their destination
+    // as well as memory, instead of the texture being loaded again from
+    // memory (beyond Xenia; docs/renderer.md, "Resolve targets"). On where
+    // the device updates storage image descriptors after binding;
+    // true (or XF_RESOLVE_TARGETS=0) turns it off: Xenia's reload.
+    bool no_resolve_targets = false;
     // what replay() has its processor write in occlusion query reports
     // (live, the caller sets its processor's: tools/game.cpp)
     gpu::OcclusionQueries occlusion_queries = gpu::OcclusionQueries::Fake;

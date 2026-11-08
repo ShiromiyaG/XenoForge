@@ -162,14 +162,17 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     v12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
     v12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
     v12.timelineSemaphore = VK_TRUE;
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &v12;
     // optional: storage images updated after binding, for the textures a
     // resolve writes as well as memory (the renderer's resolve targets;
     // XF_VK_NO_RESOLVE_TARGETS=1 turns them off)
     const char *no_targets = std::getenv("XF_VK_NO_RESOLVE_TARGETS");
-    if (has12.descriptorBindingStorageImageUpdateAfterBind && !(no_targets && no_targets[0] == '1'))
+    if (has12.descriptorBindingStorageImageUpdateAfterBind && has.features.shaderStorageImageArrayDynamicIndexing &&
+        !(no_targets && no_targets[0] == '1')) {
         v12.descriptorBindingStorageImageUpdateAfterBind = d->storage_image_update_after_bind_ = true;
-    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    features.pNext = &v12;
+        features.features.shaderStorageImageArrayDynamicIndexing = VK_TRUE;
+    }
     // optional: geometry shaders (rectangle and point lists; without them
     // those draws are skipped and counted). XF_VK_NO_GEOMETRY_SHADER=1 turns
     // them off where the device has them, to check the path without.
