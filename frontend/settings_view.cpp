@@ -449,11 +449,8 @@ bool SettingsView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         if (!repeat) back();
         return true;
     case SDLK_TAB:
-        if (ctrl) {
-            if (!repeat) show_tab(SettingsTab((int(tab_) + (shift ? SETTINGS_TABS - 1 : 1)) % SETTINGS_TABS));
-        } else {
-            navigate(shift ? NavDir::Up : NavDir::Down); // the page's own order, not the whole window's
-        }
+        // Tab goes to the next page, Ctrl+Tab (or Shift+Tab) to the previous one
+        if (!repeat) show_tab(SettingsTab((int(tab_) + ((ctrl || shift) ? SETTINGS_TABS - 1 : 1)) % SETTINGS_TABS));
         return true;
     default: return false;
     }

@@ -1535,8 +1535,8 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   the mouse reach it as LauncherView's input does, and `LauncherView`'s own
   click handler leaves what is inside `#spage` and `#popup-layer` to it).
   Tabs Video, Sound, Controllers, Keyboard, Interface, which are the
-  toolbar's buttons; under them, whose settings these are and the "Settings
-  of its own for <game>" check box; rows like the games' (check boxes,
+  toolbar's buttons; under them, whose settings these are and the "Custom
+  settings for <game>" check box; rows like the games' (check boxes,
   sliders and dropdowns in groups, the one with focus in the selected row's
   green); the 25 bindings, each changed by a click and the next key; the
   theme, the accent and the games folder. Saved as they change; the look goes
@@ -1566,7 +1566,7 @@ and Down, Home and End move the selection, Enter plays, F2 opens the game's
 settings, F5 rescans, Ctrl+O the folder, Ctrl+F the search, Ctrl+, the
 settings, Alt+E or Alt+H or F10 the menus (then the arrows, Enter, Escape),
 Shift+F10 or the menu key the row's menu; on the settings page the arrows
-move focus and change a value, Ctrl+Tab the tab, Escape goes back to the library. A pad:
+move focus and change a value, Tab the next tab, Ctrl+Tab the previous, Escape goes back to the library. A pad:
 the d-pad or stick moves the selection (repeating), A or Start plays, X the
 game's settings, Y rescans, Back the menus, the shoulders a page; in menus
 and dialogs the d-pad moves and B closes; on the settings page the
@@ -1638,7 +1638,7 @@ Pieces, each apart from the others:
   deadzones, the keyboard as a controller (on or off, for which user) and
   each of the 25 bindings (typed, or "Set" and the next key pressed;
   "Xenia's keys" puts the defaults back). These are the shared settings
-  unless "Settings of its own for this game" is ticked: then a
+  unless "Custom settings for" the game is ticked: then a
   `[games.<title ID>]` table holds the game's own copy of the video, audio,
   input and keyboard sections, the player reads it over the shared ones for
   that game (its title ID, once the disc is open) and its overlay saves

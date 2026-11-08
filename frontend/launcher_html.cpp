@@ -318,7 +318,7 @@ std::string settings_scope_html(const SettingsPage &page) {
         return "<div class=\"scope-text\"><div class=\"name\">Shared settings</div><div class=\"hint\">Every game uses these unless it has settings of its "
                "own. Select a game in the list to give it its own.</div></div>";
     const bool own = !st.game.empty();
-    std::string s = check_row("own", ("Settings of its own for " + page.game_title).c_str(),
+    std::string s = check_row("own", ("Custom settings for " + page.game_title).c_str(),
                               own ? "Only " + page.title_id + " reads the settings below; the shared ones are untouched."
                                   : "Off: " + page.game_title + " uses the settings every game shares, edited below.",
                               own);

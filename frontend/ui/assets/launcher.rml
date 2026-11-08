@@ -62,7 +62,8 @@
                         <div class="key-hints">
                             {i:keyboard}<div class="hint-dot"></div>{i:mouse}
                             <div class="keycap one"><div>Esc</div></div><div class="hl">Back</div>
-                            <div class="keycap two"><div>Ctrl</div><div>Tab</div></div><div class="hl">Next tab</div>
+                            <div class="keycap one"><div>Tab</div></div><div class="hl">Next tab</div>
+                            <div class="keycap two"><div>Ctrl</div><div>Tab</div></div><div class="hl">Previous</div>
                         </div>
                     </div>
                 </div>

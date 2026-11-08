@@ -12,7 +12,7 @@
 //
 // Input: the arrows and a pad move focus by direction (launcher_model.h's
 // nav_pick) and Left and Right change a slider, a dropdown or a check box;
-// Ctrl+Tab or the shoulder buttons change tabs; Escape or B closes a
+// Tab (forward) and Ctrl+Tab or Shift+Tab (back), or the shoulder buttons, change tabs; Escape or B closes a
 // dropdown, a key being set, then leaves the page.
 
 #pragma once
