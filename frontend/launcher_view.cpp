@@ -84,6 +84,7 @@ bool LauncherView::build_document(std::string &error) {
     if (!doc_) return error = "launcher.rml did not load", false;
     for (const char *type : {"click", "dblclick", "mousedown", "mouseover", "change"}) doc_->AddEventListener(type, this);
     doc_->AddEventListener("focus", this, true);
+    doc_->AddEventListener("blur", this, true);
     doc_->Show();
     rows_sig_.clear(), status_sig_.clear();
     menu_.clear(), menu_items_.clear();
@@ -307,7 +308,10 @@ void LauncherView::rebuild_rows(bool force) {
 
     const bool filtered = !filter_.empty() && order_.empty() && !listing_.games.empty();
     const bool show_empty = no_folder || filtered || (listing_.games.empty() && !listing_.busy);
-    if (Rml::Element *table = by_id("table")) table->SetClass("no-rows", show_empty);
+    if (Rml::Element *table = by_id("table")) {
+        table->SetClass("no-rows", show_empty);
+        table->SetClass("has-games", !listing_.games.empty()); // the search box is for a list that has games
+    }
     if (Rml::Element *empty = by_id("tempty")) {
         empty->SetClass("on", show_empty);
         empty->SetInnerRML(show_empty ? empty_html(no_folder, filtered, core_.games_folder()) : std::string());
@@ -334,8 +338,7 @@ void LauncherView::update_toolbar() {
         }
         play->SetClass("off", !running && (!g || !player_of(*g)));
     }
-    // the demo games are a development aid (--demo-games): the button is there only while they are listed, to turn them off
-    if (Rml::Element *demo = by_id("tb-demo")) demo->SetClass("on", core_.demo_games()), demo->SetProperty("display", core_.demo_games() ? "flex" : "none");
+    if (Rml::Element *demo = by_id("tb-demo")) demo->SetClass("on", core_.demo_games());
     if (Rml::Element *back = by_id("hint-b")) back->SetProperty("display", filter_.empty() ? "none" : "flex"); // B only clears the search
     if (Rml::Element *prepare = by_id("tb-prepare")) {
         const char *label = !g || status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : "Rebuild";

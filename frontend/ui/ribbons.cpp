@@ -36,14 +36,16 @@ struct Spec {
     float twist;     // the twist's start
 };
 
-// two greys at the left, four greens at the right
+// two greys at the left, four greens at the right. They all sweep the same way (the top leaning to the
+// right, a gentle bow through the middle) and differ a little in lean, sway and phase; the spiral they wind
+// round is small and their twist slight, so they flow side by side and show a fold only here and there
 constexpr Spec SPECS[6] = {
-    {0, 0.100f, 0.04f, 0.12f, 0.06f, 0.07f, 0.9f, -0.05f, 0.17f, 0.4f, 0.3f},
-    {1, 0.034f, 0.12f, 0.10f, 0.05f, 0.09f, 1.3f, 0.10f, -0.21f, 2.1f, 1.7f},
-    {2, 0.085f, 0.90f, 0.20f, 0.07f, 0.10f, 1.0f, -0.10f, 0.15f, 3.3f, 0.9f},
-    {3, 0.065f, 0.97f, 0.17f, 0.06f, 0.11f, 1.4f, 0.00f, -0.19f, 5.0f, 2.6f},
-    {4, 0.080f, 0.82f, 0.22f, 0.08f, 0.12f, 0.8f, 0.08f, 0.13f, 0.9f, 4.1f},
-    {5, 0.050f, 0.94f, 0.15f, 0.05f, 0.09f, 1.6f, 0.18f, -0.17f, 4.2f, 5.4f},
+    {0, 0.100f, 0.05f, 0.30f, 0.030f, 0.020f, 0.6f, -0.05f, 0.10f, 0.4f, 0.20f},
+    {1, 0.034f, 0.13f, 0.28f, 0.028f, 0.025f, 0.7f, 0.10f, -0.12f, 2.1f, 0.50f},
+    {2, 0.085f, 0.90f, 0.42f, 0.040f, 0.022f, 0.6f, -0.10f, 0.09f, 3.3f, 0.00f},
+    {3, 0.065f, 0.97f, 0.40f, 0.035f, 0.026f, 0.7f, 0.00f, -0.11f, 5.0f, 0.40f},
+    {4, 0.080f, 0.82f, 0.46f, 0.045f, 0.028f, 0.5f, 0.08f, 0.08f, 0.9f, -0.30f},
+    {5, 0.050f, 0.94f, 0.37f, 0.030f, 0.024f, 0.8f, 0.18f, -0.10f, 4.2f, 0.60f},
 };
 
 V3 tone_color(int tone, const float tint[3]) {
@@ -62,7 +64,8 @@ V3 centre(const Spec &r, float s, float t, float aspect) {
     const float y = -0.2f + 1.4f * s;
     const float phi = 2 * PI * r.turns * s + r.speed * t + r.phase;
     V3 c;
-    c.x = aspect * r.base + r.lean * (0.5f - y) + r.amp * std::sin(2.1f * y + 0.11f * t + r.phase) + r.radius * std::sin(phi);
+    const float bow = 0.20f * (y - 0.5f) * (y - 0.5f); // the common curve: they all bend the same way
+    c.x = aspect * r.base + r.lean * (0.5f - y) - bow + r.amp * std::sin(2.1f * y + 0.11f * t + r.phase) + r.radius * std::sin(phi);
     c.y = y;
     c.z = r.z + r.radius * 1.8f * std::cos(phi);
     return c;
@@ -99,7 +102,7 @@ void build_ribbons(float time, uint32_t width, uint32_t height, const float tint
             const V3 n0 = norm(V3{1, 0, 0} - T * T.x);
             const V3 m0 = cross(T, n0);
             const float phi = 2 * PI * r.turns * s + r.speed * time + r.phase;
-            const float theta = r.twist + 0.9f * phi + 0.6f * std::sin(3.1f * s + 0.13f * time);
+            const float theta = r.twist + 0.30f * std::sin(0.8f * phi) + 0.25f * std::sin(3.1f * s + 0.13f * time + r.phase); // a slight twist
             const V3 B = n0 * std::cos(theta) + m0 * std::sin(theta);
             V3 face = norm(cross(T, B));
             const bool back = dot(face, view) < 0;

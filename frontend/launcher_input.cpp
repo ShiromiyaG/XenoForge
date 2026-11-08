@@ -92,7 +92,12 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
                 rebuild_rows();
             }
         }
+    } else if (type == "blur") {
+        if (target->GetId() == "search")
+            if (Rml::Element *box = by_id("search-box")) box->SetClass("focus", false);
     } else if (type == "focus") {
+        if (target->GetId() == "search")
+            if (Rml::Element *box = by_id("search-box")) box->SetClass("focus", true);
         if (Rml::Element *row = ancestor_with(target, "data-index"); row && row == target) select_game(row->GetAttribute<int>("data-index", -1), false);
     }
 }

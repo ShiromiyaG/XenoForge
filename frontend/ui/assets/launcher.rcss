@@ -34,19 +34,33 @@ body { background-color: transparent; }
 .nav.on { color: #ffffff; font-weight: 400; font-size: 33dp; cursor: default; }
 .nav:focus-visible { color: #ffffff; }
 
+
+/* --------------------------------------------------------------- search bar
+   above the list, there only while the list has games; a recessed slot, the rows' counterpart: they are raised, this is let in */
+
+#searchbar { display: none; flex: 0 0 auto; height: 52dp; padding: 12dp 8.8% 0 8.8%; flex-direction: row; align-items: center; }
+#table.has-games #searchbar { display: flex; }
 #search-box {
-    display: flex; flex-direction: row; align-items: center; margin-left: auto;
-    width: 192dp; height: 22dp; padding: 0 3dp 0 8dp;
-    border: 1dp #2a2a2c; border-radius: 3dp; background-color: #1e1e20;
+    flex: 1 1 0; display: flex; flex-direction: row; align-items: center; height: 38dp; padding: 0 8dp 0 14dp;
+    border: 2dp #3c3c3f; border-radius: 9dp;
+    decorator: linear-gradient(180deg, #161618d8, #232325d0);
+    box-shadow: 0 1dp 0 0 #ffffff38, inset 0 2dp 6dp 0 #000000a0;
+    transition: border-color 0.16s cubic-out;
 }
-#search-box .ic { font-size: 12dp; margin-right: 6dp; color: #8d8c92; }
-#search { flex: 1 1 0; width: 100dp; height: 20dp; padding: 3dp 2dp; border: 0; background-color: transparent; font-size: 12dp; color: #e8e8ea; }
+#search-box:hover { border-color: #55555a; }
+#search-box.focus {
+    border-color: #c9ffc2; decorator: linear-gradient(180deg, #1a1c19e0, #272a25d8);
+    box-shadow: 0 0 0 1dp #2c7a1a, 0 0 14dp 2dp #6dff3a90, inset 0 2dp 6dp 0 #000000a0;
+}
+#search-box .ic { font-size: 18dp; margin-right: 10dp; color: #8d8c92; }
+#search-box.focus .ic { color: #b4ff94; }
+#search { flex: 1 1 0; width: 100dp; height: 34dp; padding: 0 2dp; line-height: 34dp; border: 0; background-color: transparent; font-family: Condensed; font-size: 21dp; color: #f6f6f6; }
 #search:focus { border: 0; }
 #search:placeholder-shown { color: #8d8c92; }
-#search-clear { display: none; width: 16dp; height: 16dp; line-height: 16dp; text-align: center; border-radius: 3dp; font-family: Lucide; font-size: 10dp; color: #a8a7ad; cursor: pointer; }
+#search-clear { display: none; width: 24dp; height: 24dp; line-height: 24dp; text-align: center; border-radius: 12dp; cursor: pointer; }
 #search-clear.on { display: block; }
-#search-clear .ic { font-size: 10dp; line-height: 16dp; color: #a8a7ad; margin: 0; }
-#search-clear:hover { background-color: #ffffff18; }
+#search-clear .ic { font-size: 14dp; line-height: 24dp; color: #c4c3c9; margin: 0; }
+#search-clear:hover { background-color: #ffffff22; }
 
 /* ----------------------------------------------------------------- toolbar */
 
@@ -149,6 +163,7 @@ body { background-color: transparent; }
 .opt-btn:active { decorator: linear-gradient(180deg, #4a4949 0%, #545353 60%, #636262 100%); box-shadow: 0 0 0 1dp #1f1f20, inset 0 1dp 3dp 0 #00000090; }
 
 #tempty { position: absolute; left: 0; top: 38dp; width: 100%; bottom: 0; display: none; padding: 0 8.8%; }
+#table.has-games #tempty { top: 90dp; }
 #tempty.on { display: flex; flex-direction: column; align-items: center; justify-content: center; }
 .empty { display: flex; flex-direction: column; align-items: center; width: 460dp; }
 .empty .big-ic { font-family: Lucide; font-size: 46dp; line-height: 1; color: #d6d5da; margin-bottom: 14dp; }

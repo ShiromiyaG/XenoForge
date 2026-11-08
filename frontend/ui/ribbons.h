@@ -2,10 +2,11 @@
 // ribbons in three dimensions, made as triangles on the CPU every frame and
 // drawn by the UI renderer under the interface.
 //
-// Each ribbon is a strip of constant width along a space curve (it sweeps down
-// the window, leaning, and winds round a spiral that turns slowly with the
-// clock) and is twisted about its length as it goes, so where it turns it
-// shows its other face, passes edge-on and, curled, goes over or under itself.
+// Each ribbon is a strip of constant width along a space curve (they all sweep
+// down the window the same way, leaning and bowed, with slight differences,
+// and wind round a small spiral that turns slowly with the clock) and is
+// twisted a little about its length, so it catches the light and, here and
+// there, turns edge-on and passes over or under a neighbour.
 // The picture is a perspective projection; the triangles are lit (a diffuse
 // term, a silk sheen, the back face a little darker) and opaque: the renderer
 // draws them with a depth test (each vertex has its depth), so folds and

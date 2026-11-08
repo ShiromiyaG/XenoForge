@@ -13,7 +13,6 @@
                 <div class="nav f" id="nav-settings" data-action="settings">settings</div>
                 <div class="nav f" id="menu-help" data-menu="help">help</div>
             </div>
-            <div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div>
         </div>
         <div id="toolbar">
             <div class="tb primary f" id="tb-play" data-action="play">{i:play}<div id="tb-play-label">Play</div></div>
@@ -22,9 +21,10 @@
             <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
             <div class="tb f" id="tb-settings" data-action="settings">{i:settings}<div>Settings</div></div>
             <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
-            <div class="tb f" id="tb-demo" style="display: none;" data-action="demo-games">{i:layers}<div>Demo games</div></div>
+            <div class="tb f" id="tb-demo" data-action="demo-games">{i:layers}<div>Demo games</div></div>
         </div>
         <div id="table">
+            <div id="searchbar"><div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div></div>
             <div id="thead"></div>
             <div id="tbody"></div>
             <div id="tempty"></div>
