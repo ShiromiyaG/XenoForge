@@ -144,7 +144,7 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     void show_prepare();
     void hide_prepare();
     void update_prepare();
-    void open_settings(SettingsTab tab);
+    void open_settings(SettingsTab tab, bool own = false);
     void show_section(Section section);
     void open_path(const std::filesystem::path &path);
 

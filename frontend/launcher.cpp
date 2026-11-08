@@ -35,7 +35,7 @@
 // that fails, --demo-speed X: times real time, --show-log: its log open),
 // --snap-at S ends at S seconds whatever the view is waiting for,
 // --capture-binding <name> a binding waiting for its key, --menu <name> a menu
-// open (emulation, help), --context-menu the selected
+// open (help), --context-menu the selected
 // row's menu open, --tab <name> the settings page's tab (video, sound,
 // controllers, keyboard, interface), --render-size WxH draws at that size without the window (a
 // 4K picture on a 1080p desktop), --scale F the interface's scale (else the
@@ -294,6 +294,14 @@ int main(int argc, char **argv) {
             {"right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT}, {"a", SDL_GAMEPAD_BUTTON_SOUTH},        {"b", SDL_GAMEPAD_BUTTON_EAST},
             {"x", SDL_GAMEPAD_BUTTON_WEST},           {"y", SDL_GAMEPAD_BUTTON_NORTH},        {"lb", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
             {"rb", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER}, {"start", SDL_GAMEPAD_BUTTON_START},   {"back", SDL_GAMEPAD_BUTTON_BACK}};
+        if (name == "f5" || name == "f2") { // a key of the keyboard
+            SDL_Event e{};
+            e.type = SDL_EVENT_KEY_DOWN;
+            e.key.key = name == "f5" ? SDLK_F5 : SDLK_F2;
+            e.key.down = true;
+            SDL_PushEvent(&e);
+            return;
+        }
         for (const auto &[text, button] : buttons) {
             if (name != text) continue;
             for (bool down : {true, false}) {

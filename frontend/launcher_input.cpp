@@ -134,7 +134,7 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
     } else if (name == "library") {
         show_section(Section::Library);
     } else if (name == "settings" || name == "game-settings") {
-        open_settings(settings_->tab());
+        open_settings(settings_->tab(), name == "game-settings" && game != nullptr);
     } else if (name == "controls") {
         open_settings(SettingsTab::Controllers);
     } else if (name == "demo-games") {
@@ -339,6 +339,11 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
     }
     // the settings page: its keys first (a key being set takes them all)
     if (section_ == Section::Settings && settings_->on_key(key, scancode, repeat)) return true;
+    // F5 rescans from wherever the focus is (the search box and the settings page included)
+    if (key == SDLK_F5) {
+        if (!repeat) do_action("rescan", "");
+        return true;
+    }
     // the search box keeps its keys, but for these
     Rml::Element *focus = ctx_->GetFocusElement();
     if (focus && focus->GetTagName() == "input") {
@@ -363,7 +368,7 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
     }
     if (ctrl && key == SDLK_COMMA) return do_action("settings", ""), true;
     if (alt) {
-        const std::pair<SDL_Keycode, const char *> keys[] = {{SDLK_E, "emulation"}, {SDLK_H, "help"}};
+        const std::pair<SDL_Keycode, const char *> keys[] = {{SDLK_H, "help"}};
         for (const auto &[k, name] : keys)
             if (key == k) return open_menu(name, true), true;
     }
@@ -378,7 +383,7 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
                 open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
             }
         } else {
-            open_menu("emulation", true);
+            open_menu("help", true);
         }
         return true;
     case SDLK_APPLICATION:
@@ -398,7 +403,6 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         do_action("play", "");
         return true;
     case SDLK_F2: do_action("game-settings", ""); return true;
-    case SDLK_F5: do_action("rescan", ""); return true;
     case SDLK_ESCAPE:
         if (!filter_.empty()) do_action("clear-search", "");
         return true;
@@ -453,7 +457,7 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
     }
     if (section_ == Section::Settings) {
         if (button == SDL_GAMEPAD_BUTTON_BACK) {
-            if (down) open_menu("emulation", true);
+            if (down) open_menu("help", true);
         } else {
             settings_->on_pad_button(button, down);
         }
@@ -482,7 +486,7 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         if (down && !filter_.empty()) do_action("clear-search", "");
         break;
     case SDL_GAMEPAD_BUTTON_BACK:
-        if (down) open_menu("emulation", true);
+        if (down) open_menu("help", true);
         break;
     default: break;
     }

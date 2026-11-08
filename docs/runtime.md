@@ -1675,12 +1675,12 @@ desktop-tool one after it), drawn for a window 1240dp wide:
 
 - **The main window** (`launcher.rml`, `launcher.rcss`): a header (the
   wordmark, and the sections: *games* and *settings*, the pages of the
-  window, one of them lit; *emulation* and *help*, which open their menus
-  under them); under it a strip twice the window's width with the library and
+  window, one of them lit; *help*, which opens its menu
+  under it); under it a strip twice the window's width with the library and
   the settings side by side, which slides from one to the other (below); in
   the library, the search box (above the list, there while it has games),
   filtering on every word of the title, title ID and file name; a
-  toolbar (Play, which becomes Stop while a game runs; Prepare, Rebuild or Try
+  toolbar (Play, which becomes Stop while a game runs; Play interpreted; Prepare, Rebuild or Try
   preparing again by the selected game's status; Open Folder, Rescan,
   Settings, Controls; at its right the views: the list, the grid, which is not
   there yet, and the keyboard's and the pad's settings); the games as glossy

@@ -66,6 +66,8 @@ class SettingsView final : public Rml::EventListener {
 
     // the game selected in the list (nullptr: none): whose settings are edited
     void set_game(const GameEntry *game);
+    // the game's settings become its own ("Custom settings for ..." checked), when they are not yet
+    void use_own_settings();
     // direction: which way the page comes in, +1 from the right (a later tab), -1 from the left; 0: by the tabs' order
     void show_tab(SettingsTab tab, int direction = 0);
     void folder_changed(); // the games folder changed elsewhere

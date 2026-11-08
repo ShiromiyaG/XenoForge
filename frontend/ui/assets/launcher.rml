@@ -9,7 +9,6 @@
             <div id="brand">xeno<span>forge</span></div>
             <div id="nav">
                 <div class="nav f on" id="nav-games" data-action="library">games</div>
-                <div class="nav f" id="menu-emulation" data-menu="emulation">emulation</div>
                 <div class="nav f" id="nav-settings" data-action="settings">settings</div>
                 <div class="nav f" id="menu-help" data-menu="help">help</div>
             </div>
@@ -20,10 +19,10 @@
                 <div id="library" class="page-side">
                     <div id="toolbar">
                         <div class="tb primary f" id="tb-play" data-action="play">{i:play}<div id="tb-play-label">Play</div></div>
-                        <div class="tb f" id="tb-prepare" data-action="prepare">{i:hammer}<div id="tb-prepare-label">Prepare</div></div>
+                        <div class="tb f" id="tb-play-interpreted" data-action="play-interpreted">{i:cpu}<div>Play interpreted</div></div>
+                        <div class="tb f" id="tb-prepare"data-action="prepare">{i:hammer}<div id="tb-prepare-label">Prepare</div></div>
                         <div class="tb f" id="tb-browse" data-action="browse">{i:folder-open}<div>Open Folder</div></div>
                         <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
-                        <div class="tb f" id="tb-settings" data-action="settings">{i:settings}<div>Settings</div></div>
                         <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
                         <div class="tb f" id="tb-demo" data-action="demo-games">{i:layers}<div>Demo games</div></div>
                     </div>

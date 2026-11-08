@@ -14,8 +14,8 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *const MENUS[] = {"emulation", "help"};
-constexpr int MENU_COUNT = 2;
+const char *const MENUS[] = {"help"};
+constexpr int MENU_COUNT = 1;
 
 std::string px(float value) {
     char text[32];
@@ -47,13 +47,6 @@ std::vector<MenuItem> LauncherView::menu_items(const std::string &name) {
     const GameStatus status = g ? status_of(*g) : GameStatus::Ready;
     const bool playable = g && player_of(*g) && !running;
     const char *prepare = status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild the library with the new code" : "Rebuild the library";
-    if (name == "emulation") {
-        std::vector<MenuItem> m = {item("play", "Play", "Enter", "play", playable), item("play-interpreted", "Play interpreted", "", "cpu", playable),
-                                   item("prepare", prepare, "", "hammer", g && !running && !building), menu_separator(),
-                                   item("stop", "Stop", "", "square", running)};
-        if (building && dialog_ != Dialog::Prepare) m.push_back(item("show-prepare", "Show the build's progress", "", "loader-circle"));
-        return m;
-    }
     if (name == "help")
         return {item("about", "About XenoForge", "", "info"), menu_separator(),
                 item("open-cache", "Open the game libraries' folder", "", "hard-drive"),

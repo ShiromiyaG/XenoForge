@@ -84,6 +84,16 @@ void SettingsView::set_game(const GameEntry *game) {
     if (active_) rebuild();
 }
 
+void SettingsView::use_own_settings() {
+    if (!has_game_) return;
+    reload_edit(); // as the file has them now
+    if (!edit_.game.empty()) return;
+    std::string error;
+    core_.set_own_settings(game_, true, edit_, error);
+    edit_valid_ = true;
+    if (!error.empty()) std::fprintf(stderr, "launcher: settings: %s\n", error.c_str());
+}
+
 void SettingsView::folder_changed() {
     if (active_ && tab_ == SettingsTab::Interface) defer([this] { rebuild(); });
 }

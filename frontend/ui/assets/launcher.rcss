@@ -20,13 +20,12 @@ body { background-color: transparent; }
    slides the strip, as the console's dashboard slides from one blade to the next */
 
 #stage { position: relative; flex: 1 1 0; min-height: 0; overflow: hidden; }
-#slide { position: absolute; left: 0; top: 0; bottom: 0; width: 200%; display: flex; flex-direction: row; transition: left 0.34s cubic-out; }
-#slide.to-settings { left: -100%; }
-.page-side { flex: 0 0 50%; min-width: 0; display: flex; flex-direction: column; transition: opacity 0.34s cubic-out; }
-/* the page that is not shown dims as the strip leaves it, and comes up as the strip arrives */
-#spage { opacity: 0.3; }
-#slide.to-settings #spage { opacity: 1; }
-#slide.to-settings #library { opacity: 0.3; }
+/* (a transform, not `left`: moving the strip by `left` lays the whole document out again on every frame of the slide) */
+#slide { position: absolute; left: 0; top: 0; bottom: 0; width: 200%; display: flex; flex-direction: row; transition: transform 0.34s cubic-out; }
+#slide.to-settings { transform: translateX(-50%); }
+.page-side { flex: 0 0 50%; min-width: 0; display: flex; flex-direction: column; }
+/* (no opacity on the pages: each one would be drawn into a layer of its own, the window's size, on every frame of the slide,
+   which doubled the frame's time) */
 .page-side.hidden { visibility: hidden; }
 
 /* ------------------------------------------------------------------ header */

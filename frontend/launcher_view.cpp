@@ -423,8 +423,19 @@ void LauncherView::update_toolbar() {
         }
         play->SetClass("off", !running && (!g || !player_of(*g)));
     }
+    if (Rml::Element *interpreted = by_id("tb-play-interpreted")) interpreted->SetClass("off", running || !g || !player_of(*g));
     if (Rml::Element *demo = by_id("tb-demo")) demo->SetClass("on", core_.demo_games());
-    if (Rml::Element *back = by_id("hint-b")) back->SetProperty("display", filter_.empty() ? "none" : "flex"); // B only clears the search
+    // B only clears the search. (Set only when it changes: a property set every frame, the same or not, dirties the
+    // layout and the whole document is laid out again each frame.)
+    if (Rml::Element *back = by_id("hint-b")) {
+        const bool shown = !filter_.empty();
+        if (back->HasAttribute("data-shown") != shown || !back->HasAttribute("data-built")) {
+            if (shown) back->SetAttribute("data-shown", "1");
+            else back->RemoveAttribute("data-shown");
+            back->SetAttribute("data-built", "1");
+            back->SetProperty("display", shown ? "flex" : "none");
+        }
+    }
     if (Rml::Element *prepare = by_id("tb-prepare")) {
         const char *label = !g || status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild (new code)" : "Rebuild";
         if (Rml::Element *text = by_id("tb-prepare-label"))
@@ -513,8 +524,9 @@ void LauncherView::show_section(Section section) {
     }
 }
 
-void LauncherView::open_settings(SettingsTab tab) {
+void LauncherView::open_settings(SettingsTab tab, bool own) {
     settings_->set_game(selected_game());
+    if (own) settings_->use_own_settings(); // "Game settings": the game's own, already checked
     settings_->enter(tab);
     show_section(Section::Settings);
 }
