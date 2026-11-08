@@ -105,7 +105,7 @@ body { background-color: transparent; }
 .c-status { flex: 0 0 auto; width: 208dp; }
 .c-id { flex: 0 0 auto; width: 176dp; }
 .c-ver { flex: 0 0 auto; width: 159dp; }
-.c-opts { flex: 0 0 auto; width: 100dp; }
+.c-opts { flex: 0 0 auto; width: 60dp; }
 
 /* room around the rows for the selected one's glow, which the list's clipping would cut */
 #tbody { flex: 1 1 0; min-height: 0; margin-top: -12dp; padding: 16dp 8.8% 20dp 8.8%; overflow-y: auto; overflow-x: hidden; }
@@ -152,13 +152,13 @@ body { background-color: transparent; }
 .td .dot.interp, .td .dot.bad { background-color: #ff6a5e; }
 .td .dot.run { background-color: #ffffff; }
 .td.c-opts { justify-content: flex-end; padding-right: 12dp; }
-.th.c-opts { padding-left: 0; }
 .opt-btn {
-    height: 30dp; width: 87dp; line-height: 27dp; text-align: center; border: 1.5dp #858484; border-radius: 6dp;
+    width: 30dp; height: 30dp; line-height: 27dp; text-align: center; border: 1.5dp #858484; border-radius: 6dp;
     decorator: linear-gradient(180deg, #747373 0%, #5d5c5c 38%, #4c4b4b 58%, #5b5a5a 100%);
     box-shadow: 0 0 0 1dp #343435, 0 2dp 3dp 1dp #00000050, inset 0 1dp 1dp 0 #ffffff30;
-    font-family: Condensed; font-size: 19dp; font-weight: 400; color: #ffffff; cursor: pointer;
+    color: #ffffff; cursor: pointer;
 }
+.opt-btn .cog { font-size: 19dp; line-height: 27dp; }
 .opt-btn:hover { border-color: #9a9999; decorator: linear-gradient(180deg, #838282 0%, #6a6969 38%, #585757 58%, #686767 100%); }
 .opt-btn:active { decorator: linear-gradient(180deg, #4a4949 0%, #545353 60%, #636262 100%); box-shadow: 0 0 0 1dp #1f1f20, inset 0 1dp 3dp 0 #00000090; }
 
