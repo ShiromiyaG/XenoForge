@@ -221,6 +221,7 @@ void LauncherView::select_game(long index, bool scroll) {
         row->SetClass("sel", true);
         if (scroll) row->ScrollIntoView(Rml::ScrollIntoViewOptions(Rml::ScrollAlignment::Nearest, Rml::ScrollAlignment::Nearest));
     }
+    settle_until_ = std::max(settle_until_, now_ + 0.3); // the rows' transition
     update_toolbar();
     update_status();
 }
@@ -306,6 +307,7 @@ void LauncherView::rebuild_rows(bool force) {
 
     const bool filtered = !filter_.empty() && order_.empty() && !listing_.games.empty();
     const bool show_empty = no_folder || filtered || (listing_.games.empty() && !listing_.busy);
+    if (Rml::Element *table = by_id("table")) table->SetClass("no-rows", show_empty);
     if (Rml::Element *empty = by_id("tempty")) {
         empty->SetClass("on", show_empty);
         empty->SetInnerRML(show_empty ? empty_html(no_folder, filtered, core_.games_folder()) : std::string());

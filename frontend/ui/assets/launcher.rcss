@@ -100,7 +100,7 @@ body { background-color: transparent; }
 .c-status { flex: 0 0 auto; width: 208dp; }
 .c-id { flex: 0 0 auto; width: 176dp; }
 .c-ver { flex: 0 0 auto; width: 159dp; }
-.c-opts { flex: 0 0 auto; width: 60dp; }
+.c-opts { flex: 0 0 auto; width: 100dp; }
 
 /* room around the rows for the selected one's glow, which the list's clipping would cut */
 #tbody { flex: 1 1 0; min-height: 0; margin-top: -12dp; padding: 16dp 8.8% 20dp 8.8%; overflow-y: auto; overflow-x: hidden; }
@@ -109,14 +109,15 @@ body { background-color: transparent; }
     border: 2dp #666668; border-radius: 9dp;
     decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, #ffffff30, #ffffff00),
                radial-gradient(ellipse 17% 125% at 75.4% 0%, #ffffff30, #ffffff00),
-               linear-gradient(180deg, #2c2c2eb8, #2f2f31b8);
+               linear-gradient(180deg, #2c2c2eb8 0%, #2d2d2fb8 55%, #2e2e30b8 95%, #2f2f31b8 100%);
     box-shadow: 0 0 0 1dp #1c1c1d, 0 3dp 6dp 1dp #00000080, inset 0 1dp 0 0 #ffffff1a;
+    transition: decorator 0.16s cubic-out, border-color 0.16s cubic-out; /* the gradients have the same layers and stops in each state, so they blend (the shadows differ in number and snap) */
 }
 .tr:hover {
     border-color: #77777a;
     decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, #ffffff34, #ffffff00),
                radial-gradient(ellipse 17% 125% at 75.4% 0%, #ffffff34, #ffffff00),
-               linear-gradient(180deg, #343436c0, #373739c0);
+               linear-gradient(180deg, #343436c0 0%, #353537c0 55%, #363638c0 95%, #373739c0 100%);
 }
 .tr.sel, .tr.sel:hover {
     border: 3dp #c9ffc2; border-radius: 10dp; margin: -2dp -2dp 6dp -2dp; border-color: #c9ffc2;
@@ -146,12 +147,13 @@ body { background-color: transparent; }
 .td .dot.interp, .td .dot.bad { background-color: #ff6a5e; }
 .td .dot.run { background-color: #ffffff; }
 .td.c-opts { justify-content: flex-end; padding-right: 12dp; }
+.th.c-opts { padding-left: 0; }
 .opt-btn {
-    width: 30dp; height: 30dp; line-height: 27dp; text-align: center; border: 1.5dp #858484; border-radius: 6dp;
+    height: 30dp; width: 87dp; line-height: 27dp; text-align: center; border: 1.5dp #858484; border-radius: 6dp;
     decorator: linear-gradient(180deg, #747373 0%, #5d5c5c 38%, #4c4b4b 58%, #5b5a5a 100%);
-    box-shadow: 0 0 0 1dp #343435, 0 2dp 3dp 1dp #00000050, inset 0 1dp 1dp 0 #ffffff30; color: #ffffff; cursor: pointer;
+    box-shadow: 0 0 0 1dp #343435, 0 2dp 3dp 1dp #00000050, inset 0 1dp 1dp 0 #ffffff30;
+    font-family: Condensed; font-size: 19dp; font-weight: 400; color: #ffffff; cursor: pointer;
 }
-.opt-btn .cog { font-size: 19dp; line-height: 27dp; }
 .opt-btn:hover { border-color: #9a9999; decorator: linear-gradient(180deg, #838282 0%, #6a6969 38%, #585757 58%, #686767 100%); }
 .opt-btn:active { decorator: linear-gradient(180deg, #4a4949 0%, #545353 60%, #636262 100%); box-shadow: 0 0 0 1dp #1f1f20, inset 0 1dp 3dp 0 #00000090; }
 
@@ -297,7 +299,35 @@ body { background-color: transparent; }
 .lic-text { margin-top: 3dp; color: {text-2}; font-size: 12dp; }
 .about-foot { margin-top: 12dp; font-size: 12dp; }
 .msg { max-width: 100%; }
+/* ------------------------------------------- menus and dialogs, the console's way
+   (they follow the light or dark theme, so only what reads the same in both is fixed here: the typeface,
+   the selected item as the selected row, the main button as the toolbar's glossy green) */
+
+.menu { border-radius: 8dp; padding: 5dp; }
+.mi { height: 31dp; border-radius: 5dp; font-family: Condensed; font-size: 18dp; font-weight: 400; }
+.mi-ic { font-size: 15dp; }
+.mi-k { font-size: 14dp; }
+.mi:hover, .mi.hot {
+    color: #ffffff; decorator: linear-gradient(180deg, #55a928 0%, #52a326 55%, #458536 100%);
+    box-shadow: inset 0 1dp 0 0 #ffffff40, 0 0 8dp 0 #6dff3a90;
+}
+.mi:hover .mi-ic, .mi.hot .mi-ic, .mi:hover .mi-k, .mi.hot .mi-k { color: #ffffffd0; }
+.mi.off:hover { color: {text-3}; decorator: none; box-shadow: none; }
+
+.dlg-title { height: 44dp; font-family: Condensed; font-size: 21dp; font-weight: 400; }
+.dlg-foot .btn { height: 31dp; border-radius: 6dp; font-family: Condensed; font-size: 18dp; font-weight: 400; }
+.dlg-foot .btn.primary, .dlg-foot .btn.primary:hover {
+    color: #ffffff; border: 1.5dp #c9ffc2; border-color: #c9ffc2; background-color: transparent;
+    decorator: linear-gradient(180deg, #62b834 0%, #52a326 55%, #458536 100%);
+    box-shadow: 0 0 0 1dp #2c7a1a, 0 0 12dp 2dp #6dff3a90, inset 0 1dp 1dp 0 #ffffff40;
+}
+.dlg-foot .btn.primary:active { decorator: linear-gradient(180deg, #3f7d32 0%, #458536 45%, #52a326 100%); }
+.dlg-foot .btn.primary .ic { color: #ffffff; }
+
+/* nothing to list: no column heads over the empty state */
+#table.no-rows #thead { visibility: hidden; }
+
 /* the menus' layer starts below the header, so its sections stay live while a menu is open */
 #menu-layer { top: 74dp; height: auto; bottom: 0; }
-/* the open menu itself, placed in the window's coordinates from this corner */
-#menu-host { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+/* the open menu itself, placed in the window's coordinates from this corner (as wide as the window, so a menu is as wide as its items) */
+#menu-host { position: absolute; left: 0; top: 0; width: 100%; height: 0; }

@@ -169,7 +169,7 @@ std::string table_head_html(Column sort, bool ascending) {
         if (c == sort) s += icon_html(ascending ? "chevron-up" : "chevron-down", "ic arrow");
         s += "</div>";
     }
-    return s + "<div class=\"th c-opts\"></div>";
+    return s + "<div class=\"th c-opts\"><div class=\"th-l nowrap\">Options</div></div>";
 }
 
 std::string table_row_html(const RowInfo &r, bool selected) {
@@ -193,7 +193,7 @@ std::string table_row_html(const RowInfo &r, bool selected) {
         cell(Column::Version, "<div class=\"nowrap\">" + e(r.version) + "</div>");
     }
     s += "<div class=\"td c-opts\">";
-    if (!r.unreadable) s += "<div class=\"opt-btn\" data-row-options=\"1\" title=\"Options\">" + icon_html("settings", "ic cog") + "</div>";
+    if (!r.unreadable) s += "<div class=\"opt-btn\" data-row-options=\"1\">Options</div>";
     return s + "</div></div>";
 }
 
