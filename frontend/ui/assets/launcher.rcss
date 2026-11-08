@@ -381,6 +381,12 @@ body { background-color: transparent; }
 .dlg-x:hover { background-color: #ffffff30; color: #ffffff; }
 .dlg-body { color: {dlg-text}; }
 .dlg-foot { background-color: transparent; border-top: 1dp {dlg-line}; border-radius: 0; }
+/* one button: not a button, a strip across the whole foot */
+.dlg-foot.single { padding: 0; border-top: 0; }
+.dlg-foot.single .btn {
+    flex: 1 1 0; width: 100%; height: 48dp; margin: 0; padding: 0; border-radius: 0 0 7dp 7dp; font-size: 20dp;
+}
+.dlg-foot.single .btn.primary:focus-visible { border-color: #008001; box-shadow: inset 0 0 0 3dp #7be07c; }
 .dlg-hints { flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; height: 44dp; padding: 0 2dp; }
 .dlg-hints .hint { margin-right: 24dp; }
 .dlg-foot .btn { height: 31dp; border-radius: 6dp; font-family: Condensed; font-size: 18dp; font-weight: 400; background-color: {dlg-btn}; color: {dlg-text}; border-color: {dlg-btn-border}; }

@@ -195,7 +195,7 @@ void LauncherView::message_box(const std::string &title, const std::string &text
 }
 
 void LauncherView::show_about() {
-    show_dialog(Dialog::About, "About XenoForge", about_body_html(), button_html("dialog-close", "Close", true, "dlg-first"), 540);
+    show_dialog(Dialog::About, "About XenoForge", about_body_html(), button_html("dialog-close", "OK", true, "dlg-first"), 540);
 }
 
 // ---------------------------------------------------------------------------

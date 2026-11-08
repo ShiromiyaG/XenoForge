@@ -228,10 +228,17 @@ std::string button_html(const std::string &action, const std::string &label, boo
 }
 
 std::string dialog_html(const std::string &title, const std::string &body, const std::string &buttons, int width_dp) {
+    // a dialog with one button has it as a strip across the whole foot (.single)
+    const size_t buttons_count = [&] {
+        size_t n = 0;
+        for (size_t at = buttons.find("class=\"btn "); at != std::string::npos; at = buttons.find("class=\"btn ", at + 1)) n++;
+        return n;
+    }();
+    const std::string foot_class = buttons_count == 1 ? "dlg-foot single" : "dlg-foot";
     // the block, and under it, as wide as it, the pad's hints for it
     return "<div class=\"dlg-wrap\" style=\"width: " + std::to_string(width_dp) + "dp;\"><div class=\"dialog\" id=\"dialog\"><div class=\"dlg-title\"><div class=\"grow nowrap\" id=\"dlg-title\">" +
            e(title) + "</div><div class=\"dlg-x\" data-action=\"dialog-close\">" + icon_glyph("x") + "</div></div><div class=\"dlg-body\" id=\"dlg-body\">" + body +
-           "</div><div class=\"dlg-foot\" id=\"dlg-foot\">" + buttons + "</div></div>"
+           "</div><div class=\"" + foot_class + "\" id=\"dlg-foot\">" + buttons + "</div></div>"
            "<div class=\"dlg-hints\"><div class=\"hint\"><div class=\"gl a\"></div><div class=\"hl\">Select</div></div>"
            "<div class=\"hint\"><div class=\"gl b\"></div><div class=\"hl\">Back</div></div></div></div>";
 }

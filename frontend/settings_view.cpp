@@ -380,7 +380,10 @@ void SettingsView::open_popup(Rml::Element *row) {
     layer->SetInnerRML(html);
     layer->SetClass("open", true);
     Rml::Element *popup = by_id("popup");
-    const Rml::Vector2f at = box->GetAbsoluteOffset(Rml::BoxArea::Border);
+    // the layer is in the window's own coordinates, the box on the page strip, which slid left by the page's
+    // own offset to show the settings (a transform: the layout offsets do not know of it)
+    Rml::Vector2f at = box->GetAbsoluteOffset(Rml::BoxArea::Border);
+    if (Rml::Element *page = by_id("spage")) at.x -= page->GetAbsoluteOffset(Rml::BoxArea::Border).x;
     const Rml::Vector2f size = box->GetBox().GetSize(Rml::BoxArea::Border);
     popup->SetProperty("left", px(at.x));
     popup->SetProperty("top", px(at.y + size.y + 2 * ctx_->GetDensityIndependentPixelRatio()));
