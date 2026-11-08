@@ -8,6 +8,7 @@
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
 #include "xenoforge/lockstep.h"
+#include "xenoforge/shader_storage.h"
 
 #include <algorithm>
 #include <cctype>
@@ -101,6 +102,10 @@ void print_renderer_report(const render::Report &r) {
         (unsigned long long)r.textures_evicted_for_room, (unsigned long long)r.textures_refused);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
                 r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
+    std::printf("renderer: shader storage: %llu shaders and %llu pipelines added; made at once as the build step made "
+                "them: %llu pipelines, %llu libraries\n",
+                (unsigned long long)r.shaders_stored, (unsigned long long)r.pipelines_stored,
+                (unsigned long long)r.pipelines_prebuilt, (unsigned long long)r.pipeline_libraries_prebuilt);
     std::printf(
         "renderer: %llu pipeline libraries, %llu pipelines linked, %llu placeholders, %llu draws by a stand-in; "
         "hitches: %llu frames with more than 4 ms making pipelines (at most %.1f ms), %llu swaps more than 50 ms "
@@ -186,6 +191,7 @@ void load_game_library(const Options &options, Game &g) {
 bool open(const Options &options, Game &g, std::string &error) {
     const std::string &input = options.input;
     if (!load(input, options.xex_path, g.xex, error)) return false;
+    g.cache = options.cache.empty() ? build::default_cache_dir() : options.cache;
     g.memory = Memory::create(error);
     if (!g.memory) return error = "memory: " + error, false;
     g.kernel = std::make_unique<kernel::Kernel>(*g.memory);
@@ -274,18 +280,19 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     if (!g.device) g.device = vk::Device::open(error);
     if (!g.device) return error = "Vulkan: " + error, false;
     gpu::CommandProcessor &processor = kernel::gpu_command_processor(*g.kernel);
-    // the game's pipeline cache: a temporary directory's xenoforge-cache
-    // unless the caller names one (the player: beside its config.toml)
+    // the game's pipeline cache and shader and pipeline storage, beside its
+    // game library in the cache (<title id>.vkpipelines, .xfshaders), where
+    // the launcher's build step makes the pipelines earlier runs met
+    // (render::precompile), unless the caller names them
     render::Options o = options;
-    if (o.pipeline_cache.empty()) {
-        std::error_code ec;
-        char name[32];
-        std::snprintf(name, sizeof(name), "%08X.vkpipelines", g.xex.execution.title_id);
-        o.pipeline_cache = std::filesystem::temp_directory_path(ec) / "xenoforge-cache" / name;
-    }
+    const uint32_t title = g.xex.execution.title_id;
+    if (o.pipeline_cache.empty()) o.pipeline_cache = ShaderStorage::pipeline_cache_path(g.cache, title);
+    if (o.shader_storage.empty()) o.shader_storage = ShaderStorage::path(g.cache, title);
     // XF_PIPELINE_CACHE=<file>: the pipeline cache elsewhere (an empty one
-    // for a cold start)
+    // for a cold start); XF_SHADER_STORAGE=<file>, or =none for no storage
     if (const char *cache = std::getenv("XF_PIPELINE_CACHE")) o.pipeline_cache = cache;
+    if (const char *storage = std::getenv("XF_SHADER_STORAGE"))
+        o.shader_storage = std::string(storage) == "none" ? std::filesystem::path() : std::filesystem::path(storage);
     // XF_PIPELINES=wait|skip|placeholder|library: each pipeline waited for
     // (boot's default), or made on worker threads with the draws meanwhile
     // skipped, drawn by a placeholder or by a linked pipeline (renderer.h,
@@ -554,11 +561,13 @@ void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
         auto waiting = report.skipped.find("pipeline not ready (being made)");
         std::snprintf(renderer, sizeof(renderer),
                       ", renderer busy %.0f%%, textures %llu (%.0f MB, %.0f loads/s), pipelines %llu (%llu draws "
-                      "skipped, %llu by a stand-in)",
+                      "skipped, %llu by a stand-in; %llu libraries, %llu and %llu as built)",
                       busy * 100, (unsigned long long)report.textures_held, double(report.texture_bytes) / (1 << 20),
                       loads, (unsigned long long)report.pipelines,
                       (unsigned long long)(waiting == report.skipped.end() ? 0 : waiting->second),
-                      (unsigned long long)report.stand_in_draws);
+                      (unsigned long long)report.stand_in_draws, (unsigned long long)report.pipeline_libraries,
+                      (unsigned long long)report.pipelines_prebuilt,
+                      (unsigned long long)report.pipeline_libraries_prebuilt);
     }
     char resident[96] = "";
     if (uint64_t bytes = resident_bytes())

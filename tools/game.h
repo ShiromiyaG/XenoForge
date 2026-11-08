@@ -73,6 +73,9 @@ struct Game {
     std::unique_ptr<render::Renderer> renderer;
     std::unique_ptr<gpu::TraceWriter> trace; // in front of the renderer, when frames are traced
     size_t generated_modules = 0, generated_functions = 0; // the generated code installed (none: interpreted)
+    // the cache (Options::cache, else default_cache_dir()): the title's
+    // pipeline cache and shader storage are kept there by default
+    std::filesystem::path cache;
 };
 
 // The game read, its memory and kernel made, the disc (or the executable's

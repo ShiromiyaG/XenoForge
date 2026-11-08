@@ -36,6 +36,7 @@ add_library(xenoforge STATIC
     src/gpu_trace.cpp
     src/game_build.cpp
     src/game_library.cpp
+    src/shader_storage.cpp
     src/trace_stats.cpp
     src/ucode.cpp
     src/ucode_parse.cpp
@@ -144,7 +145,7 @@ xf_shader(placeholder.frag placeholder.frag)
 xf_shader(resolve.comp resolve.comp)
 xf_shader(texture_load.comp texture_load.comp)
 xf_shader(texture_load_test.comp texture_load.comp -DPARAMS_BUFFER) # texture_gpu_test's
-add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/replay.cpp ${XF_SHADER_WORDS})
+add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/replay.cpp src/shader_step.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SHADER_OUT})
 target_link_libraries(xenoforge_vk PUBLIC xenoforge Vulkan::Vulkan)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -166,7 +167,7 @@ add_executable(xfrecomp tools/xfrecomp.cpp)
 target_link_libraries(xfrecomp PRIVATE xenoforge)
 # the recompile step from the command line (game_build.h): a disc into the cache, timed
 add_executable(xfbuild tools/xfbuild.cpp)
-target_link_libraries(xfbuild PRIVATE xenoforge)
+target_link_libraries(xfbuild PRIVATE xenoforge_vk xenoforge)
 
 # The kernel (step A4; docs/runtime.md): an object library, so every
 # export's registration (XF_EXPORT, a static initializer) is linked in.
@@ -431,7 +432,7 @@ target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
 foreach(name aes disc xex lzx sha1 snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor
-             recomp_discover gpu_trace_writer)
+             recomp_discover gpu_trace_writer shader_storage)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)

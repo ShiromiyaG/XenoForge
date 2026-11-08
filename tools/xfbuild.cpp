@@ -6,7 +6,7 @@
 // goes and how long it took.
 //
 //   xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
-//           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log]
+//           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only]
 //
 // The cache is game_build.h's default_cache_dir() unless named. --keep keeps
 // the work directory (the emitted code and the objects), --force builds even
@@ -14,9 +14,15 @@
 // seconds as the launcher's cancel does, --quiet prints the stages without a
 // line per file. --entry adds a function entry, --no-entry-log leaves the
 // runtime's entry log (D3) out. At the end it prints the extra entries taken
-// in and the functions left out, with why.
+// in and the functions left out, with why. Then the shader step
+// (shader_step.h; also on a cached library): the shaders and pipelines runs
+// of the game recorded, and the shaders found on the disc, made into the
+// title's pipeline cache on a Vulkan device; --no-shaders leaves it out,
+// --no-disc-shaders leaves out the disc's search, --shaders-only runs the shader
+// step alone (no library built).
 
 #include "xenoforge/game_build.h"
+#include "xenoforge/shader_step.h"
 
 #include <algorithm>
 #include <atomic>
@@ -50,13 +56,14 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] "
                              "[--keep] [--force] [--cancel-after S] [--quiet] [--entry <hex>]... "
-                             "[--no-entry-log]\n");
+                             "[--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only]\n");
         return 2;
     }
     std::filesystem::path disc = argv[1], cache = build::default_cache_dir();
     build::BuildOptions options;
     build::BuildReport result;
     options.report = &result;
+    options.shader_step = &render::run_shader_step;
     double cancel_after = 0;
     bool quiet = false;
     for (int k = 2; k < argc; k++) {
@@ -75,6 +82,12 @@ int main(int argc, char **argv) {
             quiet = true;
         else if (a == "--no-entry-log")
             options.use_entry_log = false;
+        else if (a == "--no-shaders")
+            options.shader_step = {};
+        else if (a == "--shaders-only")
+            options.shaders_only = true;
+        else if (a == "--no-disc-shaders")
+            options.disc_shaders = false;
         else if (a == "--entry" && k + 1 < argc)
             options.entries.push_back(uint32_t(std::strtoul(argv[++k], nullptr, 16)));
         else if (!a.starts_with("--") && k == 2)
@@ -125,6 +138,11 @@ int main(int argc, char **argv) {
         return 1;
     }
     std::error_code ec;
+    if (options.shaders_only) {
+        for (const std::string &line : result.shaders) std::printf("shaders: %s\n", line.c_str());
+        std::printf("shader step in %.1f s\n", total);
+        return 0;
+    }
     std::printf("library %s (%.1f MB)\nprepared in %.1f s\n", library.c_str(),
                 double(std::filesystem::file_size(library, ec)) / (1 << 20), total);
     // what it took in (D3) and left out (D2)
@@ -132,5 +150,6 @@ int main(int argc, char **argv) {
                 result.entries_taken, result.left_out.size());
     for (const build::LeftOutFunction &f : result.left_out)
         std::printf("  %s 0x%08X  %s\n", f.module.c_str(), f.address, f.reason.c_str());
+    for (const std::string &line : result.shaders) std::printf("shaders: %s\n", line.c_str());
     return 0;
 }

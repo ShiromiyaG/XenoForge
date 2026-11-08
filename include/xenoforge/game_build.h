@@ -82,6 +82,9 @@ struct BuildReport {
     // the entry log's addresses the build read (the log's first lines: it
     // only grows), and the extra entries it was given in all
     size_t entries_taken = 0, entries = 0;
+    // what the shader step (BuildOptions::shader_step) made or why it made
+    // nothing, a line each ("shaders <TAB> line" in the report)
+    std::vector<std::string> shaders;
 };
 
 // the build report of the library cached for this digest at this interface
@@ -127,6 +130,27 @@ class EntryLog {
 
 // ---- extensions (the launcher may leave them alone) ----
 
+// The shader step (docs/renderer.md, "Shaders and pipelines at the
+// launcher's build step"): once the library is built, or found in the cache,
+// the title's shader and pipeline storage (shader_storage.h, beside the
+// library) and the shaders found on the disc are made into the title's
+// pipeline cache by the caller's function, as it needs a Vulkan device and
+// this library links none (the launcher and xfbuild give
+// render::run_shader_step, shader_step.h). It never fails the build: what it
+// made, or why it made nothing, is the report's `shaders` lines.
+struct ShaderStep {
+    std::filesystem::path cache_dir;
+    uint32_t title_id = 0;
+    std::string digest;
+    // the shader containers in the disc's files (shader_container.h): type
+    // (0 vertex, 1 pixel) and microcode, each once; and how many files were
+    // read for them, in how long
+    std::vector<std::pair<uint32_t, std::vector<uint32_t>>> disc_shaders;
+    size_t disc_files = 0;
+    double disc_seconds = 0;
+    const std::atomic<bool> *cancel = nullptr;
+};
+
 struct BuildOptions {
     unsigned jobs = 4;               // compilers at once (more ran out of memory on 16 GB)
     std::filesystem::path toolchain; // where clang and lld are; empty: find_toolchain's search
@@ -137,6 +161,14 @@ struct BuildOptions {
     // what the build left out and took in, when given (also on a cache hit,
     // from the report beside the library)
     BuildReport *report = nullptr;
+    // the shader step, run after the library is built or found; the disc's
+    // files searched for shader containers for it first (files up to 64 MB,
+    // media left out)
+    std::function<std::vector<std::string>(const ShaderStep &step)> shader_step;
+    bool disc_shaders = true;
+    // the shader step alone, the library neither built nor needed (its
+    // report updated when there is one)
+    bool shaders_only = false;
     // For the tests: functions (by address, in any module) made to fail the
     // emission, or to fail clang (a line that does not compile put in their
     // body), so the build's recovery is exercised.

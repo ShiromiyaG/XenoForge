@@ -67,7 +67,11 @@ interlock" below; host render targets elsewhere, as Xenia's default).
   `drain()`. El Chavo Kart's title screen makes about 24 pipelines in its
   first frame: 0.2 s on an idle CPU (2.5 s once with every core busy), 0.03
   s from the cache. The report counts the time spent making pipelines.
-  The shader cache and the compile on a worker thread are not built.
+  Since 2026-11-07 the pipeline cache lives beside the game library in the
+  launcher's cache (`<cache>/<title id>.vkpipelines`, boot's and the
+  player's alike), with the title's shader and pipeline storage
+  (`<title id>.xfshaders`), and the build step makes what earlier runs met
+  ("Shaders and pipelines at the launcher's build step").
 - A shader seen for the first time is drawn by a **generic pipeline while the
   translated one compiles on a worker thread**: an interpreter of Xenos
   microcode written as a SPIR-V vertex and pixel shader, reading the program
@@ -1312,23 +1316,12 @@ swaps' gaps vary too much from run to run to rank them. A first form of
 skipped more draws than `skip` (2,184 against 1,449 in 500 s): the
 workers made every new shader twice at the same time.
 
-**Not done yet: the libraries at the launcher's build step.** What costs
-is the driver compiling the shaders (the race frame's 96 pipelines: 9.2 s
-from an empty driver cache, 0.3 s from a full one). The libraries make that
-cost per shader rather than per pipeline (153 libraries for the race's 96
-pipelines, the fragment shader's keyed by the
-module and the samples alone, the pre-rasterization one by the module's
-host form, patch size, depth clamp and bias), which makes compiling ahead
-practical: a run could keep, beside the pipeline cache on disk, the
-microcode of every shader it met and the keys of its pipelines and
-libraries (Xenia keeps such a shader and pipeline storage per title and
-compiles all of it on its creation threads when the title starts), and the
-launcher's build step, which has the device, would translate those and the
-shaders found on the disc (`xfeffect`'s containers) and make their
-libraries into the game's pipeline cache. The player would then link every
-draw's pipeline at once, the libraries found in the cache. The cache is
-the device's and driver's (Vulkan checks its header), so a new driver
-means doing it again.
+**The libraries at the launcher's build step.** What costs is the driver
+compiling the shaders (the race frame's 96 pipelines: 9.2 s from an empty
+driver cache, 0.3 s from a full one). The libraries make that cost per
+shader rather than per pipeline (153 libraries for the race's 96
+pipelines), which makes compiling ahead practical: built on 2026-11-07, in
+"Shaders and pipelines at the launcher's build step" below.
 
 **Extended dynamic state 3** (`vk::Device::dynamic_blend`; `XF_VK_NO_EDS3=1`
 turns it off): the blend enables, blend equations and color write masks
@@ -1373,6 +1366,107 @@ interpolators through InterpolateAtCentroid instead of the decoration
 (identical), an invariant position (identical; kept, as Xenia's outputs
 are invariant), and the samplers, made as Xenia's Vulkan backend makes
 them. The 29 frames of `replay_test` are unchanged.
+
+## Shaders and pipelines at the launcher's build step (2026-11-07)
+
+A game played again compiles no shader: the runs record what they meet,
+the launcher's build step makes it into the game's pipeline cache, and the
+next run finds every library and pipeline made.
+
+**The storage** (`shader_storage.h`, as Xenia's per-title shader storage,
+its pipeline caches' `InitializeShaderStorage`: `<title id>.xsh` for the
+microcode, `.xpso` for the pipelines' descriptions, both appended to while
+the game runs): one file, `<cache>/<title id>.xfshaders`, beside the game
+library in the launcher's cache, and the pipeline cache beside it,
+`<title id>.vkpipelines` (boot and the player alike; `game::start_renderer`;
+`XF_SHADER_STORAGE=<file>|none`, `XF_PIPELINE_CACHE=<file>`). A header
+(magic, version), then records appended and flushed as they come, so a run
+cut short keeps what it met: each shader's microcode the first time it is
+loaded; each new pipeline's description; and what a build step made, for
+the device and driver it made it on. The renderer writes it
+(`render::Options::shader_storage`).
+
+**A pipeline's description** is the whole `VkGraphicsPipelineCreateInfo`
+the draw made, state by state, with its shader modules by name rather than
+handle: a guest shader's hash and host form (`Shader::variants`' key: the
+vertex shader's `VertexOptions`, the pixel shader's `PixelOptions`, both
+of which the key gives back), or one of the renderer's own (the geometry,
+tessellation, interlock depth and float24 shaders). Before it is described
+or made, the values of the states the pipeline sets dynamically are set to
+one each (topology to its class's first, cull mode, front face, the depth
+and stencil tests, the blend under extended dynamic state 3): Vulkan
+ignores them, and so the same pipeline gets the same description, and the
+same entry in the driver's cache, whichever draw asked for it first. The
+libraries' keys are taken from the description the same way (the modules
+by name), so a run and the build step key them alike.
+
+**The build step** (`render::precompile`; `render::run_shader_step` is
+`BuildOptions::shader_step`, given by the launcher's prepare job and by
+`xfbuild`, which runs it after building the library and also when the
+library is cached; `xfbuild --shaders-only` runs it alone,
+`--no-shaders` and `--no-disc-shaders` leave parts out). On a Vulkan
+device of its own and a renderer made as a run's (its layout and own
+modules): the storage's shaders translated, every description made back
+into a pipeline's (a description naming a shader or form the renderer
+cannot make here is counted and left), then the libraries of its four
+parts (each once) and the whole pipeline queued on the pipeline workers,
+the cache written, and a record of the libraries' and pipelines' key
+hashes appended to the storage with the device's vendor, device, driver
+version and pipeline cache UUID. Descriptions an earlier record names for
+the same device and driver are not made again while the cache file's
+header is still that device's. Without a device it reports why and
+builds the library all the same; a cache of another device or driver is
+dropped by Vulkan and everything is made again. What it made goes in the
+library's `.build.txt` (`shaders` lines, `BuildReport::shaders`). The disc
+is searched for shader containers too (`xfeffect`'s search over each file
+up to 64 MB, media left out): they are translated and counted, but
+without a pipeline state no library is made of them (a pipeline's fixed
+state, its targets' formats and the pixel shader's form all come from the
+draw).
+
+**The run** reads the records that match its device and driver, while the
+pipeline cache file's header is still theirs: a library the build step
+made is made at once on the renderer's thread (a lookup in the cache)
+instead of being queued for the workers, so a new pipeline whose libraries
+are all made links at once and draws; a pipeline the build step made whole
+is made at once too where the draw would otherwise wait for the workers
+(the `skip` and `placeholder` modes, or a device without graphics pipeline
+libraries). The report and the `--rates` lines count the pipelines and
+libraries made so ("as built").
+
+Measured on El Chavo Kart (`boot_chaves --render --rates --seconds 430`,
+`XF_PIPELINES=library` as the player's default, the press script to the
+race of "Traces of live runs", about 12,500 swaps with the race from
+swap 10,750; RTX 5060, other agents' builds and boots on the machine): a
+cold run (both caches empty), then from the same caches and storage a
+second run without the build step, and one after it.
+
+| | cold | second run | after the build step |
+| --- | --- | --- | --- |
+| pipelines (whole) | 175 | 168 (5 new) | 169 (4 new to the storage) |
+| libraries made (as built) | 233 | 222 (none) | 225 (221) |
+| draws skipped waiting for a pipeline | 2,852 | 246 | 17 |
+| draws by a linked stand-in | 10,531 | 247 | 251 |
+| the renderer's thread making pipelines | 1.82 s | 0.01 s | 0.06 s |
+| frames with more than 4 ms of it (the most) | 8 (476 ms) | 0 (1 ms) | 3 (8 ms) |
+| draws without a pipeline, on average (the most) | 1,563 ms (69 s) | 972 ms (62 s) | 6 ms (299 ms) |
+
+The build step for those: the storage's 229 shaders and 175 descriptions
+made into 247 libraries and 175 whole pipelines in 2.2 s from the caches
+the cold run had warmed (14.2 s of the driver's on 9 workers); from empty caches (a new driver) the same took 14.3 s (125.5 s of the driver's), the cache written 25.4 MB.
+The disc's search read 374 files in 19-31 s and found 88 shaders, 75 of
+them not met by the run (UE3's global shader cache, packages being
+compressed), 29 the translator cannot translate yet. The 17 draws still
+skipped are those of the 4 pipelines the cold run had not met. The second
+run without the build step already had both caches warm: its libraries
+cost the workers little, but every new pipeline's draws still went
+without one until a worker had looked its libraries up (246 skipped, 972
+ms on average, the longest 62 s, not looked into); with the build step's
+record they are made on the renderer's thread in 0.06 s for the whole run.
+The swaps' long gaps (33-36 above 100 ms) are the loading screens in all
+three runs. The race frame's replay is unchanged by the descriptions'
+dynamic states set to one each (0.008 of 255, 0.014% of pixels off, whole
+and linked).
 
 ## Texture formats (2026-11-06)
 

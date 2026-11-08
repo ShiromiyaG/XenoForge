@@ -252,6 +252,24 @@ int main() {
     CHECK(build::prepare_game(xex_path, second, quiet, error, cached));
     CHECK(cached_report.entries_taken == 2 && cached_report.left_out.size() == 2);
 
+    // the shader step on the cached library: given the cache and the digest,
+    // its lines kept in the report beside the library and read back
+    build::BuildOptions shaders;
+    build::BuildReport shaders_report;
+    shaders.report = &shaders_report;
+    shaders.disc_shaders = false;
+    std::string step_digest;
+    shaders.shader_step = [&](const build::ShaderStep &step) {
+        step_digest = step.digest;
+        CHECK(step.cache_dir == second);
+        return std::vector<std::string>{"made nothing", "a second line"};
+    };
+    CHECK(build::prepare_game(xex_path, second, quiet, error, shaders));
+    CHECK(shaders_report.shaders.size() == 2 && shaders_report.left_out.size() == 2);
+    auto reread = build::read_build_report(second, step_digest);
+    CHECK(reread && reread->shaders.size() == 2 && reread->shaders[1] == "a second line" &&
+          reread->entries_taken == 2 && reread->left_out.size() == 2);
+
     // the libraries stay loaded: the directory is left for the next run's
     // remove_all
     return finish("game_build");

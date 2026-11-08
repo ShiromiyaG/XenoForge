@@ -297,8 +297,9 @@ int main(int argc, char **argv) {
     auto shot_wanted = [&](uint64_t swap) { return !screenshots.empty() && swap % screenshot_every == 0; };
     std::atomic<int> keys_wanted{0};
     options.on_swap = [&](const render::FrontBuffer &front) { presenter.take(front); };
-    // the driver's compiled pipelines kept between runs, beside the settings
-    options.pipeline_cache = config_file.parent_path() / "cache" / (std::string(title_id) + ".vkpipelines");
+    // (the driver's compiled pipelines and the shader storage are kept
+    // between runs beside the game library, in the cache, where the
+    // launcher's build step makes them: game::start_renderer's default)
     // new pipelines made on worker threads, their draws drawn meanwhile by
     // Options::pipeline_stand_in's default (boot and the replays wait for
     // each, as Xenia's trace dump does)

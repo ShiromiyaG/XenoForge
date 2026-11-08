@@ -19,7 +19,10 @@
 #include "xenoforge/game_build.h"
 
 #include "xenoforge/game_interface.h" // XF_GAME_INTERFACE_VERSION, made by the build
+#include "xenoforge/disc.h"
 #include "xenoforge/recomp.h"
+#include "xenoforge/shader_container.h"
+#include "xenoforge/shader_storage.h"
 #include "xenoforge/xex.h"
 
 #include <algorithm>
@@ -144,6 +147,11 @@ bool write_report(const fs::path &path, const fs::path &library, const BuildRepo
         std::string reason;
         for (char ch : f.reason) reason += ch == '\n' || ch == '\r' || ch == '\t' ? ' ' : ch;
         t += "left\t" + f.module + "\t" + hex8(f.address) + "\t" + reason + "\n";
+    }
+    for (const std::string &line : r.shaders) {
+        std::string clean;
+        for (char ch : line) clean += ch == '\n' || ch == '\r' ? ' ' : ch;
+        t += "shaders\t" + clean + "\n";
     }
     std::ofstream f(path, std::ios::binary);
     f << t;
@@ -436,6 +444,57 @@ Job beside(const Job &j, const std::string &stem) {
 // how a file clang rejects is split (recover)
 constexpr size_t SPLIT_PARTS = 8, SPLIT_ROUNDS = 4, SPLIT_COMPILES = 256;
 
+// The shader containers in a disc's files (shader_container.h's search, as
+// xfeffect's), for the shader step: each file up to 64 MB but the media
+// (video, sound), on a disc image or in a directory; each shader once.
+void find_disc_shaders(const fs::path &disc, ShaderStep &step, const std::atomic<bool> *cancel) {
+    const auto started = std::chrono::steady_clock::now();
+    constexpr uint64_t LIMIT = 64ull << 20;
+    std::unordered_set<uint64_t> seen;
+    auto wanted = [&](const std::string &name, uint64_t size) {
+        if (size < 64 || size > LIMIT || (cancel && cancel->load())) return false;
+        std::string lower = name;
+        for (char &ch : lower) ch = char(std::tolower(uint8_t(ch)));
+        for (const char *media : {".xmv", ".wmv", ".bik", ".xma", ".wav", ".xwm", ".mp3", ".wma", ".xwb", ".xsb"})
+            if (lower.ends_with(media)) return false;
+        return true;
+    };
+    auto take = [&](std::span<const uint8_t> data) {
+        step.disc_files++;
+        for (ShaderContainer &c : find_shader_containers(data)) {
+            const uint32_t type = c.vertex ? 0 : 1;
+            if (seen.insert(ShaderStorage::hash(type, c.microcode)).second)
+                step.disc_shaders.emplace_back(type, std::move(c.microcode));
+        }
+    };
+    std::error_code ec;
+    if (fs::is_directory(disc, ec)) {
+        for (auto it = fs::recursive_directory_iterator(disc, ec); !ec && it != fs::recursive_directory_iterator();
+             it.increment(ec)) {
+            if (!it->is_regular_file(ec) || !wanted(utf8(it->path().filename()), it->file_size(ec))) continue;
+            const std::string bytes = read_file(it->path());
+            take(std::span<const uint8_t>(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size()));
+        }
+    } else {
+        std::string why;
+        std::unique_ptr<Disc> image = Disc::open(disc, why);
+        if (image) {
+            std::vector<const DiscEntry *> pending{&image->root()};
+            while (!pending.empty()) {
+                const DiscEntry *e = pending.back();
+                pending.pop_back();
+                for (const DiscEntry &child : e->children) {
+                    if (child.directory)
+                        pending.push_back(&child);
+                    else if (wanted(child.name, child.size))
+                        take(image->read_all(child));
+                }
+            }
+        }
+    }
+    step.disc_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+}
+
 class Build {
   public:
     Build(Progress &progress, const BuildOptions &options) : progress_(progress), options_(options) {}
@@ -451,6 +510,9 @@ class Build {
     }
 
     bool run(const fs::path &disc, const fs::path &cache, std::string &error);
+    // the shader step (BuildOptions::shader_step), its lines into the report
+    void shaders(const fs::path &disc, const fs::path &cache, const Xex &xex, const std::string &digest,
+                 BuildReport &result);
     // the headers and the entry written into work, then sources (relative
     // to src_root) compiled and linked into out
     bool compile_and_link(const fs::path &src_root, const std::vector<std::string> &sources, const fs::path &work,
@@ -550,7 +612,7 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     std::string why;
     if (!cpu_supported(why)) return fail(error, why);
     report(Stage::Reading, 0, 0, utf8(disc.filename()));
-    if (!find_toolchain(options_.toolchain))
+    if (!options_.shaders_only && !find_toolchain(options_.toolchain))
         return fail(error, "no clang and lld found (toolchain/bin beside the launcher, XF_TOOLCHAIN, an installed "
                            "LLVM or the PATH)");
     std::vector<recomp::ModuleFile> modules;
@@ -570,8 +632,20 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     const std::string digest = hex_digest(image_digest(xex.image));
     const fs::path library = library_path(cache, digest);
     std::error_code ec;
-    if (!options_.force && fs::exists(library, ec)) {
-        if (options_.report) *options_.report = read_build_report(cache, digest).value_or(BuildReport{});
+    if (options_.shaders_only && !fs::exists(library, ec)) {
+        BuildReport found;
+        if (options_.shader_step) shaders(disc, cache, xex, digest, found);
+        if (options_.report) *options_.report = found;
+        report(Stage::Done, 1, 1, "");
+        return true;
+    }
+    if ((options_.shaders_only || !options_.force) && fs::exists(library, ec)) {
+        BuildReport found = read_build_report(cache, digest).value_or(BuildReport{});
+        if (options_.shader_step) {
+            shaders(disc, cache, xex, digest, found);
+            write_report(report_path(cache, digest), library, found);
+        }
+        if (options_.report) *options_.report = found;
         report(Stage::Done, 1, 1, utf8(library));
         return true;
     }
@@ -631,6 +705,7 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     fs::rename(built, library, ec);
     if (ec) return fail(error, "cannot move the library into " + utf8(library) + ": " + ec.message());
     result.left_out = left_;
+    if (options_.shader_step) shaders(disc, cache, xex, digest, result);
     if (!write_report(report_path(cache, digest), library, result))
         return fail(error, "cannot write " + utf8(report_path(cache, digest)));
     if (options_.report) *options_.report = result;
@@ -646,6 +721,25 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     }
     report(Stage::Done, 1, 1, utf8(library));
     return true;
+}
+
+void Build::shaders(const fs::path &disc, const fs::path &cache, const Xex &xex, const std::string &digest,
+                    BuildReport &result) {
+    ShaderStep step;
+    step.cache_dir = cache;
+    step.title_id = xex.execution.title_id;
+    step.digest = digest;
+    step.cancel = progress_.cancel;
+    if (options_.disc_shaders) {
+        report(Stage::Linking, 0, 0, "shaders: the disc's");
+        find_disc_shaders(disc, step, progress_.cancel);
+    }
+    report(Stage::Linking, 0, 0, "shaders: their pipelines");
+    try {
+        result.shaders = options_.shader_step(step);
+    } catch (const std::exception &e) {
+        result.shaders = {std::string("skipped: ") + e.what()};
+    }
 }
 
 bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job> &jobs, std::vector<size_t> batch,
@@ -952,6 +1046,8 @@ std::optional<BuildReport> read_build_report(const fs::path &cache_dir, std::str
             r.left_out.push_back({line.substr(5, a - 5),
                                   uint32_t(std::strtoul(line.substr(a + 1, b - a - 1).c_str(), nullptr, 16)),
                                   line.substr(b + 1)});
+        } else if (line.starts_with("shaders\t")) {
+            r.shaders.push_back(line.substr(8));
         }
     }
     return r;

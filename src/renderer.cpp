@@ -45,9 +45,11 @@
 #include "xenoforge/renderer.h"
 
 #include "xenoforge/guest_memory.h"
+#include "xenoforge/memory.h"
 #include "xenoforge/resolve.h"
 #include "xenoforge/shader_harness.h"
 #include "xenoforge/shader_interpreter.h"
+#include "xenoforge/shader_storage.h"
 #include "xenoforge/shader_translator.h"
 #include "xenoforge/texture.h"
 #include "xenoforge/ucode.h"
@@ -424,6 +426,7 @@ VkBlendOp blend_op(uint32_t o) {
 }
 
 struct Shader {
+    uint64_t hash = 0; // hash_words(type, microcode), its name in the shader storage
     xf::ucode::ParsedShader parsed;
     xf::ucode::ShaderSummary summary;
     bool translated = false;
@@ -1233,8 +1236,40 @@ private:
     // failed, or (pending) when worker threads are making it and the draw may
     // not wait (async); or its stand-in (Options::pipeline_stand_in) while
     // they make it
-    VkPipeline pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info,
-                        const PipelineParts &parts, bool async, bool &pending, bool &stand_in);
+    VkPipeline pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info, bool async,
+                        bool &pending, bool &stand_in);
+    // ---- the shader and pipeline storage (Options::shader_storage) ----
+    std::unique_ptr<ShaderStorage> storage_;
+    // The modules' names in the storage's descriptions and the libraries'
+    // keys, the same from run to run: a guest shader's hash and host form
+    // (Shader::variants' key, 0 for Shader::module), or one of the
+    // renderer's own (OwnModule)
+    struct ModuleName {
+        uint32_t kind = 0; // 1 a guest shader's, 2 the renderer's own
+        uint32_t form = 0;
+        uint64_t id = 0;
+    };
+    std::unordered_map<VkShaderModule, ModuleName> module_names_;
+    // the libraries' and pipelines' keys the build step made into the
+    // pipeline cache for this device and driver (hashes)
+    std::unordered_set<uint64_t> built_libraries_, built_pipelines_;
+    void open_storage();
+    // a pipeline's description in the storage, empty when one of its modules
+    // has no name; and back, null (why) when it cannot be made here
+    std::vector<uint32_t> describe(const VkGraphicsPipelineCreateInfo &info) const;
+    std::unique_ptr<PipelineDesc> undescribe(std::span<const uint32_t> words, std::string &why);
+    void module_words(VkShaderModule m, std::vector<uint32_t> &out) const;
+    // a pipeline's description as it is made: the values of its dynamic
+    // states set to one each (canonicalize)
+    static std::unique_ptr<PipelineDesc> canonical(const VkGraphicsPipelineCreateInfo &info);
+    // its libraries' keys
+    void library_keys(const VkGraphicsPipelineCreateInfo &info, PipelineParts &parts) const;
+
+public:
+    bool precompile(const PrecompileOptions &options, PrecompileReport &out, std::string &error);
+    void set_storage_path(const std::filesystem::path &path) { options_.shader_storage = path; }
+
+private:
     // a part's library, made now (async: those with shaders queued for the
     // workers, ahead of the whole pipelines); null for a part without a key
     PipelineEntry *library(uint32_t part, const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &whole,
@@ -2228,6 +2263,14 @@ bool Impl::init(std::string &error) {
     }
     sync();
     if (!fatal_.empty()) return error = fatal_, false;
+    // the renderer's own modules' names in the storage's descriptions (fixed:
+    // a new one goes last)
+    const VkShaderModule own[] = {rectangle_gs_,       point_gs_,           tessellation_vs_,    tessellation_hs_[0],
+                                  tessellation_hs_[1], tessellation_hs_[2], tessellation_hs_[3], tessellation_hs_[4],
+                                  fsi_depth_fs_,       depth_float24_fs_[0], depth_float24_fs_[1], placeholder_fs_};
+    for (uint32_t k = 0; k < std::size(own); k++)
+        if (own[k]) module_names_[own[k]] = {2, own[k] == fsi_depth_fs_ ? fsi_ : 0u, k + 1};
+    open_storage();
     return true;
 }
 
@@ -2769,7 +2812,9 @@ void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
         s = std::make_unique<Shader>();
         s->parsed = xf::ucode::parse_shader(type == 0 ? xf::ucode::ShaderType::Vertex : xf::ucode::ShaderType::Pixel, code);
         s->summary = xf::ucode::analyze(code);
+        s->hash = hash;
         report_.shaders++;
+        if (storage_ && storage_->add_shader(type, hash, code)) report_.shaders_stored++;
         if (!options_.dump_shaders.empty()) {
             char name[64];
             std::snprintf(name, sizeof(name), "/shader_%016llX.ucode.bin.%s", (unsigned long long)hash,
@@ -2830,7 +2875,10 @@ bool Impl::translate(Shader &s, std::string &why) {
             VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             info.codeSize = t.spirv.size() * 4;
             info.pCode = t.spirv.data();
-            if (vkCreateShaderModule(dev_, &info, nullptr, &s.module) != VK_SUCCESS) s.unsupported = "vkCreateShaderModule failed";
+            if (vkCreateShaderModule(dev_, &info, nullptr, &s.module) != VK_SUCCESS)
+                s.unsupported = "vkCreateShaderModule failed";
+            else
+                module_names_[s.module] = {1, 0, s.hash};
         }
     }
     if (!s.unsupported.empty()) why = s.unsupported;
@@ -2852,6 +2900,7 @@ VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options
             info.codeSize = t.spirv.size() * 4;
             info.pCode = t.spirv.data();
             if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
+            if (m) module_names_[m] = {1, key, s.hash};
         }
         it = s.variants.emplace(key, m).first;
     }
@@ -2871,6 +2920,7 @@ VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &optio
             info.codeSize = t.spirv.size() * 4;
             info.pCode = t.spirv.data();
             if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
+            if (m) module_names_[m] = {1, key, s.hash};
         }
         it = s.variants.emplace(key, m).first;
     }
@@ -3886,12 +3936,12 @@ bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &pla
 
 // ---- pipelines ----
 
-VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &info,
-                          const PipelineParts &parts, bool async, bool &pending, bool &stand_in) {
+VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipelineCreateInfo &drawn, bool async,
+                          bool &pending, bool &stand_in) {
     pending = stand_in = false;
     async = async && pipeline_workers_ && !options_.linked_pipelines_only;
     // how long a pipeline made on the workers left its draws without one
-    auto drawn = [this](PipelineEntry &entry) {
+    auto drawn_with = [this](PipelineEntry &entry) {
         if (entry.asked == std::chrono::steady_clock::time_point{}) return;
         double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - entry.asked).count();
         entry.asked = {};
@@ -3905,14 +3955,14 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
         e = it->second.get();
         if (e->state.load(std::memory_order_acquire)) {
             if (e->stand_in) retire_stand_in(*e);
-            if (e->pipeline) drawn(*e);
+            if (e->pipeline) drawn_with(*e);
             return e->pipeline;
         }
         if (!async) {
             // being made on a worker, and the draw waits for it
             Timer timer(report_.pipeline_seconds);
             if (!e->queued) {
-                pipeline_workers_->queue(e, std::make_unique<PipelineDesc>(info), PipelinePriority::normal);
+                pipeline_workers_->queue(e, canonical(drawn), PipelinePriority::normal);
                 e->queued = true;
             }
             pipeline_workers_->wait(e);
@@ -3928,6 +3978,22 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             for (uint32_t word : key) std::fprintf(stderr, " %X", word);
             std::fprintf(stderr, "\n");
         }
+        // made as described: its dynamic states' values one each, so that
+        // the driver's pipeline cache finds it whichever draw asks first
+        std::unique_ptr<PipelineDesc> desc = canonical(drawn);
+        const VkGraphicsPipelineCreateInfo &info = desc->info;
+        // kept in the storage for the build step; made by it already?
+        bool built = false;
+        if (storage_ || !built_pipelines_.empty()) {
+            const std::vector<uint32_t> description = describe(info);
+            if (!description.empty()) {
+                built = built_pipelines_.count(ShaderStorage::hash(0, description)) != 0;
+                if (storage_ && storage_->add_pipeline(description)) report_.pipelines_stored++;
+            }
+        }
+        if (built) report_.pipelines_prebuilt++;
+        PipelineParts parts;
+        if (use_libraries_) library_keys(info, parts);
         if (options_.linked_pipelines_only) {
             // linked from libraries made now, never made whole
             for (uint32_t part = 0; part < 4; part++) e->libraries[part] = library(part, parts.keys[part], info, false);
@@ -3935,7 +4001,10 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             e->state.store(1, std::memory_order_release);
             return e->pipeline;
         }
-        if (!async) {
+        const bool linked = stand_in_ == Options::PipelineStandIn::library && use_libraries_;
+        // made now: waited for, or (built, and not linked from libraries
+        // that are) found in the pipeline cache
+        if (!async || (built && !linked)) {
             VkPipeline p = VK_NULL_HANDLE;
             {
                 Timer timer(report_.pipeline_seconds);
@@ -3947,17 +4016,18 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             return p;
         }
         // made on the workers: the whole pipeline, or first its libraries
+        // (made now, those the build step made)
         e->asked = std::chrono::steady_clock::now();
-        if (stand_in_ == Options::PipelineStandIn::library && use_libraries_) {
+        if (linked) {
             for (uint32_t part = 0; part < 4; part++) e->libraries[part] = library(part, parts.keys[part], info, true);
         } else {
-            pipeline_workers_->queue(e, std::make_unique<PipelineDesc>(info), PipelinePriority::normal);
-            e->queued = true;
             if (stand_in_ == Options::PipelineStandIn::placeholder) {
                 e->stand_in = placeholder(info);
                 if (e->stand_in) report_.pipeline_placeholders++;
                 e->stand_in_failed = !e->stand_in;
             }
+            pipeline_workers_->queue(e, std::move(desc), PipelinePriority::normal);
+            e->queued = true;
         }
     }
     // being made on the workers: its stand-in meanwhile, linked as soon as
@@ -3966,12 +4036,11 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
     // at once when its libraries failed)
     if (!e->stand_in && !e->stand_in_failed && e->libraries[0]) e->stand_in = link(*e);
     if (!e->queued && (e->stand_in || e->stand_in_failed)) {
-        pipeline_workers_->queue(e, std::make_unique<PipelineDesc>(info),
-                                 e->stand_in ? PipelinePriority::later : PipelinePriority::normal);
+        pipeline_workers_->queue(e, canonical(drawn), e->stand_in ? PipelinePriority::later : PipelinePriority::normal);
         e->queued = true;
     }
     if (e->stand_in) {
-        drawn(*e);
+        drawn_with(*e);
         return stand_in = true, e->stand_in;
     }
     return pending = true, VK_NULL_HANDLE;
@@ -4050,8 +4119,11 @@ PipelineEntry *Impl::library(uint32_t part, const std::vector<uint32_t> &key, co
     report_.pipeline_libraries++;
     LibraryDesc desc(whole, part);
     // the parts with the guest's shaders are the slow ones: on the workers,
-    // ahead of the whole pipelines; the others are made here
-    if (async && (part == 1 || part == 2)) {
+    // ahead of the whole pipelines; the others are made here, and so are
+    // those the build step made into the pipeline cache (a lookup there)
+    const bool built = !built_libraries_.empty() && built_libraries_.count(ShaderStorage::hash(part, key)) != 0;
+    if (built) report_.pipeline_libraries_prebuilt++;
+    if (async && !built && (part == 1 || part == 2)) {
         pipeline_workers_->queue(slot.get(), std::make_unique<PipelineDesc>(desc.info), PipelinePriority::first);
         return slot.get();
     }
@@ -4123,6 +4195,663 @@ void Impl::retire_stand_in(PipelineEntry &e) {
     e.stand_in = VK_NULL_HANDLE;
     cmd();
     slots_[current_].after.push_back([this, old] { vkDestroyPipeline(dev_, old, nullptr); });
+}
+
+// ---- the shader and pipeline storage (Options::shader_storage) ----
+//
+// docs/renderer.md, "Shaders and pipelines at the launcher's build step". A
+// run appends every shader it meets and every pipeline's description to the
+// title's storage; the build step (precompile) makes their libraries and
+// whole pipelines into the pipeline cache and records which, for the device
+// and driver; a later run on them makes those at once from the cache.
+
+namespace {
+
+// the description's format: a new one leaves the older descriptions unmade
+constexpr uint32_t DESCRIPTION_VERSION = 1;
+
+// The device and driver a pipeline cache is made for (the cache's header
+// names the vendor, the device and the pipelineCacheUUID; the driver's
+// version is kept beside them)
+ShaderStorage::Built device_ids(VkPhysicalDevice physical) {
+    VkPhysicalDeviceProperties p{};
+    vkGetPhysicalDeviceProperties(physical, &p);
+    ShaderStorage::Built b;
+    b.vendor = p.vendorID, b.device = p.deviceID, b.driver = p.driverVersion;
+    std::memcpy(b.uuid.data(), p.pipelineCacheUUID, 16);
+    return b;
+}
+
+bool same_device(const ShaderStorage::Built &a, const ShaderStorage::Built &b) {
+    return a.vendor == b.vendor && a.device == b.device && a.driver == b.driver && a.uuid == b.uuid;
+}
+
+// whether a pipeline cache file's header (VkPipelineCacheHeaderVersionOne)
+// is the device's
+bool cache_is_devices(const std::filesystem::path &file, const ShaderStorage::Built &ids) {
+    std::FILE *f = std::fopen(file.string().c_str(), "rb");
+    if (!f) return false;
+    uint32_t header[8] = {};
+    const bool read = std::fread(header, 4, 8, f) == 8;
+    std::fclose(f);
+    return read && header[0] >= 32 && header[1] == VK_PIPELINE_CACHE_HEADER_VERSION_ONE && header[2] == ids.vendor &&
+           header[3] == ids.device && std::memcmp(&header[4], ids.uuid.data(), 16) == 0;
+}
+
+} // namespace
+
+void Impl::open_storage() {
+    if (options_.shader_storage.empty()) return;
+    storage_ = std::make_unique<ShaderStorage>();
+    if (!storage_->open(options_.shader_storage)) {
+        std::fprintf(stderr, "renderer: cannot open the shader storage %s\n", options_.shader_storage.string().c_str());
+        storage_.reset();
+        return;
+    }
+    // what the build step made, while the pipeline cache read is still of
+    // this device and driver
+    const ShaderStorage::Built ids = device_ids(d_.physical());
+    if (!report_.pipeline_cache_read || !cache_is_devices(options_.pipeline_cache, ids)) return;
+    for (const ShaderStorage::Built &b : storage_->built()) {
+        if (!same_device(b, ids)) continue;
+        built_libraries_.insert(b.libraries.begin(), b.libraries.end());
+        built_pipelines_.insert(b.pipelines.begin(), b.pipelines.end());
+    }
+}
+
+void Impl::module_words(VkShaderModule m, std::vector<uint32_t> &out) const {
+    auto it = module_names_.find(m);
+    if (it == module_names_.end()) {
+        out.insert(out.end(), {0u, 0u, uint32_t(uint64_t(m)), uint32_t(uint64_t(m) >> 32)});
+        return;
+    }
+    const ModuleName &n = it->second;
+    out.insert(out.end(), {n.kind, n.form, uint32_t(n.id), uint32_t(n.id >> 32)});
+}
+
+// Vulkan ignores the values of the states a pipeline sets dynamically; they
+// are set to one each (the topology to its class's first), so a pipeline's
+// description is the same whichever draw asked for it first.
+std::unique_ptr<PipelineDesc> Impl::canonical(const VkGraphicsPipelineCreateInfo &info) {
+    auto d = std::make_unique<PipelineDesc>(info);
+    if (!d->info.pDynamicState) return d; // (rasterization discarded: all of it fixed)
+    const VkDynamicState *first = d->dynamic_states, *last = first + d->dynamic.dynamicStateCount;
+    auto dynamic = [&](VkDynamicState s) { return std::find(first, last, s) != last; };
+    if (d->info.pInputAssemblyState) {
+        VkPrimitiveTopology &t = d->assembly.topology;
+        if (dynamic(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY))
+            t = t == VK_PRIMITIVE_TOPOLOGY_POINT_LIST          ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST
+                : t <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP        ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+                : t == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST        ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST
+                : t <= VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN      ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                : t <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY
+                                                                       : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+        if (dynamic(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE)) d->assembly.primitiveRestartEnable = VK_FALSE;
+    }
+    if (d->info.pRasterizationState) {
+        VkPipelineRasterizationStateCreateInfo &r = d->raster;
+        if (dynamic(VK_DYNAMIC_STATE_CULL_MODE)) r.cullMode = VK_CULL_MODE_NONE;
+        if (dynamic(VK_DYNAMIC_STATE_FRONT_FACE)) r.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        if (dynamic(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE)) r.depthBiasEnable = VK_FALSE;
+        if (dynamic(VK_DYNAMIC_STATE_DEPTH_BIAS))
+            r.depthBiasConstantFactor = r.depthBiasClamp = r.depthBiasSlopeFactor = 0.0f;
+        if (dynamic(VK_DYNAMIC_STATE_LINE_WIDTH)) r.lineWidth = 1.0f;
+    }
+    if (d->info.pDepthStencilState) {
+        VkPipelineDepthStencilStateCreateInfo &s = d->depth;
+        if (dynamic(VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE)) s.depthTestEnable = VK_FALSE;
+        if (dynamic(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE)) s.depthWriteEnable = VK_FALSE;
+        if (dynamic(VK_DYNAMIC_STATE_DEPTH_COMPARE_OP)) s.depthCompareOp = VK_COMPARE_OP_NEVER;
+        if (dynamic(VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE)) s.stencilTestEnable = VK_FALSE;
+        for (VkStencilOpState *face : {&s.front, &s.back}) {
+            if (dynamic(VK_DYNAMIC_STATE_STENCIL_OP))
+                face->failOp = face->passOp = face->depthFailOp = VK_STENCIL_OP_KEEP,
+                face->compareOp = VK_COMPARE_OP_NEVER;
+            if (dynamic(VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK)) face->compareMask = 0;
+            if (dynamic(VK_DYNAMIC_STATE_STENCIL_WRITE_MASK)) face->writeMask = 0;
+            if (dynamic(VK_DYNAMIC_STATE_STENCIL_REFERENCE)) face->reference = 0;
+        }
+    }
+    if (d->info.pColorBlendState) {
+        VkPipelineColorBlendStateCreateInfo &b = d->blend;
+        if (dynamic(VK_DYNAMIC_STATE_BLEND_CONSTANTS)) std::fill_n(b.blendConstants, 4, 0.0f);
+        for (uint32_t i = 0; i < b.attachmentCount; i++) {
+            VkPipelineColorBlendAttachmentState &a = d->blends[i];
+            if (dynamic(VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT)) a.blendEnable = VK_FALSE;
+            if (dynamic(VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT))
+                a.srcColorBlendFactor = a.dstColorBlendFactor = a.srcAlphaBlendFactor = a.dstAlphaBlendFactor =
+                    VK_BLEND_FACTOR_ZERO,
+                a.colorBlendOp = a.alphaBlendOp = VK_BLEND_OP_ADD;
+            if (dynamic(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT)) a.colorWriteMask = 0;
+        }
+    }
+    return d;
+}
+
+namespace {
+const VkPipelineRenderingCreateInfo *rendering_of(const VkGraphicsPipelineCreateInfo &info) {
+    for (auto *in = static_cast<const VkBaseInStructure *>(info.pNext); in; in = in->pNext)
+        if (in->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO)
+            return reinterpret_cast<const VkPipelineRenderingCreateInfo *>(in);
+    return nullptr;
+}
+const VkPipelineSampleLocationsStateCreateInfoEXT *locations_of(const VkPipelineMultisampleStateCreateInfo &m) {
+    for (auto *in = static_cast<const VkBaseInStructure *>(m.pNext); in; in = in->pNext)
+        if (in->sType == VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT)
+            return reinterpret_cast<const VkPipelineSampleLocationsStateCreateInfoEXT *>(in);
+    return nullptr;
+}
+uint32_t bits(float f) { return std::bit_cast<uint32_t>(f); }
+} // namespace
+
+// The description: each state the pipeline has, its fields in order, and the
+// modules by name; what the renderer's draws give and nothing else (one
+// vertex binding and attribute, five stages, four targets, sample
+// locations, the dynamic rendering formats).
+std::vector<uint32_t> Impl::describe(const VkGraphicsPipelineCreateInfo &info) const {
+    std::vector<uint32_t> w{DESCRIPTION_VERSION, info.flags, info.stageCount};
+    if (info.layout != layout_ || info.stageCount > 5) return {};
+    for (uint32_t i = 0; i < info.stageCount; i++) {
+        const VkPipelineShaderStageCreateInfo &st = info.pStages[i];
+        if (!module_names_.count(st.module) || std::strcmp(st.pName, "main") != 0) return {};
+        w.push_back(uint32_t(st.stage));
+        module_words(st.module, w);
+        const VkSpecializationInfo *sp = st.pSpecializationInfo;
+        if (!sp) {
+            w.push_back(UINT32_MAX);
+            continue;
+        }
+        if (sp->mapEntryCount > 16 || sp->dataSize > 64) return {};
+        w.push_back(sp->mapEntryCount);
+        for (uint32_t k = 0; k < sp->mapEntryCount; k++)
+            w.insert(w.end(), {sp->pMapEntries[k].constantID, sp->pMapEntries[k].offset,
+                               uint32_t(sp->pMapEntries[k].size)});
+        w.push_back(uint32_t(sp->dataSize));
+        uint32_t data[16] = {};
+        std::memcpy(data, sp->pData, sp->dataSize);
+        w.insert(w.end(), data, data + (sp->dataSize + 3) / 4);
+    }
+    const auto *vi = info.pVertexInputState;
+    w.push_back(vi != nullptr);
+    if (vi) {
+        if (vi->vertexBindingDescriptionCount > 1 || vi->vertexAttributeDescriptionCount > 1) return {};
+        w.push_back(vi->vertexBindingDescriptionCount);
+        for (uint32_t k = 0; k < vi->vertexBindingDescriptionCount; k++) {
+            const auto &b = vi->pVertexBindingDescriptions[k];
+            w.insert(w.end(), {b.binding, b.stride, uint32_t(b.inputRate)});
+        }
+        w.push_back(vi->vertexAttributeDescriptionCount);
+        for (uint32_t k = 0; k < vi->vertexAttributeDescriptionCount; k++) {
+            const auto &a = vi->pVertexAttributeDescriptions[k];
+            w.insert(w.end(), {a.location, a.binding, uint32_t(a.format), a.offset});
+        }
+    }
+    const auto *ia = info.pInputAssemblyState;
+    w.push_back(ia != nullptr);
+    if (ia) w.insert(w.end(), {uint32_t(ia->topology), ia->primitiveRestartEnable});
+    const auto *ts = info.pTessellationState;
+    w.push_back(ts != nullptr);
+    if (ts) w.push_back(ts->patchControlPoints);
+    const auto *vp = info.pViewportState;
+    w.push_back(vp != nullptr);
+    if (vp) w.insert(w.end(), {vp->viewportCount, vp->scissorCount});
+    const auto *rs = info.pRasterizationState;
+    w.push_back(rs != nullptr);
+    if (rs)
+        w.insert(w.end(), {rs->depthClampEnable, rs->rasterizerDiscardEnable, uint32_t(rs->polygonMode), rs->cullMode,
+                           uint32_t(rs->frontFace), rs->depthBiasEnable, bits(rs->depthBiasConstantFactor),
+                           bits(rs->depthBiasClamp), bits(rs->depthBiasSlopeFactor), bits(rs->lineWidth)});
+    const auto *ms = info.pMultisampleState;
+    w.push_back(ms != nullptr);
+    if (ms) {
+        if (ms->pSampleMask) return {};
+        w.insert(w.end(), {uint32_t(ms->rasterizationSamples), ms->sampleShadingEnable, bits(ms->minSampleShading),
+                           ms->alphaToCoverageEnable, ms->alphaToOneEnable});
+        const auto *sl = locations_of(*ms);
+        w.push_back(sl != nullptr);
+        if (sl) {
+            const VkSampleLocationsInfoEXT &l = sl->sampleLocationsInfo;
+            if (l.sampleLocationsCount > 4) return {};
+            w.insert(w.end(), {sl->sampleLocationsEnable, uint32_t(l.sampleLocationsPerPixel),
+                               l.sampleLocationGridSize.width, l.sampleLocationGridSize.height,
+                               l.sampleLocationsCount});
+            for (uint32_t k = 0; k < l.sampleLocationsCount; k++)
+                w.insert(w.end(), {bits(l.pSampleLocations[k].x), bits(l.pSampleLocations[k].y)});
+        }
+    }
+    const auto *ds = info.pDepthStencilState;
+    w.push_back(ds != nullptr);
+    if (ds) {
+        w.insert(w.end(), {ds->depthTestEnable, ds->depthWriteEnable, uint32_t(ds->depthCompareOp),
+                           ds->depthBoundsTestEnable, ds->stencilTestEnable});
+        for (const VkStencilOpState *f : {&ds->front, &ds->back})
+            w.insert(w.end(), {uint32_t(f->failOp), uint32_t(f->passOp), uint32_t(f->depthFailOp),
+                               uint32_t(f->compareOp), f->compareMask, f->writeMask, f->reference});
+        w.insert(w.end(), {bits(ds->minDepthBounds), bits(ds->maxDepthBounds)});
+    }
+    const auto *cb = info.pColorBlendState;
+    w.push_back(cb != nullptr);
+    if (cb) {
+        if (cb->attachmentCount > 4) return {};
+        w.insert(w.end(), {cb->logicOpEnable, uint32_t(cb->logicOp), cb->attachmentCount});
+        for (uint32_t k = 0; k < cb->attachmentCount; k++) {
+            const auto &a = cb->pAttachments[k];
+            w.insert(w.end(), {a.blendEnable, uint32_t(a.srcColorBlendFactor), uint32_t(a.dstColorBlendFactor),
+                               uint32_t(a.colorBlendOp), uint32_t(a.srcAlphaBlendFactor),
+                               uint32_t(a.dstAlphaBlendFactor), uint32_t(a.alphaBlendOp), a.colorWriteMask});
+        }
+        for (float c : cb->blendConstants) w.push_back(bits(c));
+    }
+    const auto *dy = info.pDynamicState;
+    w.push_back(dy != nullptr);
+    if (dy) {
+        if (dy->dynamicStateCount > 32) return {};
+        w.push_back(dy->dynamicStateCount);
+        for (uint32_t k = 0; k < dy->dynamicStateCount; k++) w.push_back(uint32_t(dy->pDynamicStates[k]));
+    }
+    const auto *rd = rendering_of(info);
+    w.push_back(rd != nullptr);
+    if (rd) {
+        if (rd->colorAttachmentCount > 4) return {};
+        w.insert(w.end(), {rd->viewMask, rd->colorAttachmentCount});
+        for (uint32_t k = 0; k < rd->colorAttachmentCount; k++) w.push_back(uint32_t(rd->pColorAttachmentFormats[k]));
+        w.insert(w.end(), {uint32_t(rd->depthAttachmentFormat), uint32_t(rd->stencilAttachmentFormat)});
+    }
+    return w;
+}
+
+std::unique_ptr<PipelineDesc> Impl::undescribe(std::span<const uint32_t> words, std::string &why) {
+    struct Reader {
+        std::span<const uint32_t> w;
+        size_t at = 0;
+        bool ok = true;
+        uint32_t u() {
+            if (at >= w.size()) return ok = false, 0u;
+            return w[at++];
+        }
+        float f() { return std::bit_cast<float>(u()); }
+    } r{words};
+    auto fail = [&](const char *reason) {
+        why = reason;
+        return nullptr;
+    };
+    if (r.u() != DESCRIPTION_VERSION) return fail("a description of another version");
+    VkGraphicsPipelineCreateInfo empty{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    auto d = std::make_unique<PipelineDesc>(empty);
+    VkGraphicsPipelineCreateInfo &info = d->info;
+    info.flags = r.u();
+    const uint32_t stage_count = r.u();
+    if (stage_count > 5) return fail("more stages than the renderer makes");
+    for (uint32_t i = 0; i < stage_count && r.ok; i++) {
+        VkPipelineShaderStageCreateInfo &st = d->stages[i];
+        st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        st.stage = VkShaderStageFlagBits(r.u());
+        st.pName = "main";
+        const uint32_t kind = r.u(), form = r.u();
+        const uint64_t id = r.u() | uint64_t(r.u()) << 32;
+        if (kind == 1) {
+            Shader *s = shader(id);
+            if (!s) return fail("a shader the storage does not hold");
+            std::string reason;
+            if (!translate(*s, reason)) return fail("a shader the translator cannot translate");
+            if (!form) {
+                st.module = s->module;
+            } else if (form >> 31) {
+                shader::PixelOptions o;
+                o.depth_float24 = uint8_t(form & 0xFF);
+                o.centroid = uint16_t(form >> 8);
+                o.fsi = uint8_t((form >> 24) & 0x7F);
+                if (o.fsi) o.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
+                if ((o.key() | 1u << 31) != form) return fail("a pixel shader's form unknown here");
+                st.module = pixel_module(*s, o, reason);
+            } else {
+                shader::VertexOptions o;
+                o.host = shader::HostVertex(form & 0xFF);
+                o.equal_spacing = (form >> 8) & 1;
+                o.clip_planes = uint8_t((form >> 9) & 7);
+                o.clip_planes_cull = (form >> 12) & 1;
+                o.point_ucp_mode = uint8_t((form >> 13) & 3);
+                if (o.key() != form) return fail("a vertex shader's form unknown here");
+                st.module = vertex_module(*s, o, reason);
+            }
+        } else if (kind == 2) {
+            for (const auto &[m, n] : module_names_)
+                if (n.kind == 2 && n.id == id && n.form == form) st.module = m;
+        }
+        if (!st.module) return fail("a module the renderer does not make here");
+        const uint32_t entries = r.u();
+        if (entries == UINT32_MAX) continue;
+        if (entries > 16) return fail("a specialization larger than the renderer's");
+        for (uint32_t k = 0; k < entries; k++) d->spec_entries[k] = {r.u(), r.u(), size_t(r.u())};
+        const uint32_t size = r.u();
+        if (size > sizeof(d->spec_data)) return fail("a specialization larger than the renderer's");
+        for (uint32_t k = 0; k < (size + 3) / 4; k++) d->spec_data[k] = r.u();
+        d->spec = {entries, d->spec_entries, size, d->spec_data};
+        st.pSpecializationInfo = &d->spec;
+    }
+    info.stageCount = stage_count;
+    info.pStages = d->stages;
+    if (r.u()) {
+        VkPipelineVertexInputStateCreateInfo &v = d->vertex_input;
+        v = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        v.vertexBindingDescriptionCount = r.u();
+        if (v.vertexBindingDescriptionCount > 1) return fail("more vertex bindings than the renderer makes");
+        for (uint32_t k = 0; k < v.vertexBindingDescriptionCount; k++)
+            d->vertex_bindings[k] = {r.u(), r.u(), VkVertexInputRate(r.u())};
+        v.vertexAttributeDescriptionCount = r.u();
+        if (v.vertexAttributeDescriptionCount > 1) return fail("more vertex attributes than the renderer makes");
+        for (uint32_t k = 0; k < v.vertexAttributeDescriptionCount; k++)
+            d->vertex_attributes[k] = {r.u(), r.u(), VkFormat(r.u()), r.u()};
+        v.pVertexBindingDescriptions = d->vertex_bindings;
+        v.pVertexAttributeDescriptions = d->vertex_attributes;
+        info.pVertexInputState = &v;
+    }
+    if (r.u()) {
+        d->assembly = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        d->assembly.topology = VkPrimitiveTopology(r.u());
+        d->assembly.primitiveRestartEnable = r.u();
+        info.pInputAssemblyState = &d->assembly;
+    }
+    if (r.u()) {
+        d->tessellation = {VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+        d->tessellation.patchControlPoints = r.u();
+        info.pTessellationState = &d->tessellation;
+    }
+    if (r.u()) {
+        d->viewport = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        d->viewport.viewportCount = r.u();
+        d->viewport.scissorCount = r.u();
+        info.pViewportState = &d->viewport;
+    }
+    if (r.u()) {
+        VkPipelineRasterizationStateCreateInfo &s = d->raster;
+        s = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        s.depthClampEnable = r.u();
+        s.rasterizerDiscardEnable = r.u();
+        s.polygonMode = VkPolygonMode(r.u());
+        s.cullMode = r.u();
+        s.frontFace = VkFrontFace(r.u());
+        s.depthBiasEnable = r.u();
+        s.depthBiasConstantFactor = r.f();
+        s.depthBiasClamp = r.f();
+        s.depthBiasSlopeFactor = r.f();
+        s.lineWidth = r.f();
+        info.pRasterizationState = &s;
+    }
+    if (r.u()) {
+        VkPipelineMultisampleStateCreateInfo &m = d->multisample;
+        m = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        m.rasterizationSamples = VkSampleCountFlagBits(r.u());
+        m.sampleShadingEnable = r.u();
+        m.minSampleShading = r.f();
+        m.alphaToCoverageEnable = r.u();
+        m.alphaToOneEnable = r.u();
+        if (r.u()) {
+            VkPipelineSampleLocationsStateCreateInfoEXT &sl = d->sample_locations;
+            sl = {VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+            sl.sampleLocationsEnable = r.u();
+            VkSampleLocationsInfoEXT &l = sl.sampleLocationsInfo;
+            l = {VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT};
+            l.sampleLocationsPerPixel = VkSampleCountFlagBits(r.u());
+            l.sampleLocationGridSize = {r.u(), r.u()};
+            l.sampleLocationsCount = r.u();
+            if (l.sampleLocationsCount > 4) return fail("more sample locations than the renderer sets");
+            for (uint32_t k = 0; k < l.sampleLocationsCount; k++) d->locations[k] = {r.f(), r.f()};
+            l.pSampleLocations = d->locations;
+            m.pNext = &sl;
+        }
+        info.pMultisampleState = &m;
+    }
+    if (r.u()) {
+        VkPipelineDepthStencilStateCreateInfo &s = d->depth;
+        s = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        s.depthTestEnable = r.u();
+        s.depthWriteEnable = r.u();
+        s.depthCompareOp = VkCompareOp(r.u());
+        s.depthBoundsTestEnable = r.u();
+        s.stencilTestEnable = r.u();
+        for (VkStencilOpState *f : {&s.front, &s.back})
+            *f = {VkStencilOp(r.u()), VkStencilOp(r.u()), VkStencilOp(r.u()), VkCompareOp(r.u()), r.u(), r.u(), r.u()};
+        s.minDepthBounds = r.f();
+        s.maxDepthBounds = r.f();
+        info.pDepthStencilState = &s;
+    }
+    if (r.u()) {
+        VkPipelineColorBlendStateCreateInfo &b = d->blend;
+        b = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        b.logicOpEnable = r.u();
+        b.logicOp = VkLogicOp(r.u());
+        b.attachmentCount = r.u();
+        if (b.attachmentCount > 4) return fail("more targets than the renderer binds");
+        for (uint32_t k = 0; k < b.attachmentCount; k++) {
+            VkPipelineColorBlendAttachmentState &a = d->blends[k];
+            a.blendEnable = r.u();
+            a.srcColorBlendFactor = VkBlendFactor(r.u());
+            a.dstColorBlendFactor = VkBlendFactor(r.u());
+            a.colorBlendOp = VkBlendOp(r.u());
+            a.srcAlphaBlendFactor = VkBlendFactor(r.u());
+            a.dstAlphaBlendFactor = VkBlendFactor(r.u());
+            a.alphaBlendOp = VkBlendOp(r.u());
+            a.colorWriteMask = r.u();
+        }
+        b.pAttachments = d->blends;
+        for (float &c : b.blendConstants) c = r.f();
+        info.pColorBlendState = &b;
+    }
+    if (r.u()) {
+        VkPipelineDynamicStateCreateInfo &y = d->dynamic;
+        y = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        y.dynamicStateCount = r.u();
+        if (y.dynamicStateCount > 32) return fail("more dynamic states than the renderer sets");
+        for (uint32_t k = 0; k < y.dynamicStateCount; k++) d->dynamic_states[k] = VkDynamicState(r.u());
+        y.pDynamicStates = d->dynamic_states;
+        info.pDynamicState = &y;
+    }
+    if (r.u()) {
+        VkPipelineRenderingCreateInfo &g = d->rendering;
+        g = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        g.viewMask = r.u();
+        g.colorAttachmentCount = r.u();
+        if (g.colorAttachmentCount > 4) return fail("more targets than the renderer binds");
+        for (uint32_t k = 0; k < g.colorAttachmentCount; k++) d->color_formats[k] = VkFormat(r.u());
+        g.pColorAttachmentFormats = d->color_formats;
+        g.depthAttachmentFormat = VkFormat(r.u());
+        g.stencilAttachmentFormat = VkFormat(r.u());
+        info.pNext = &g;
+    }
+    info.layout = layout_;
+    if (!r.ok || r.at != words.size()) return fail("a description cut short or too long");
+    return d;
+}
+
+// The libraries' keys: the vertex input's attribute and topology; the
+// pre-rasterization stages' modules with the patch size and the fixed
+// rasterization state; the pixel shader's module (and specialization) with
+// the samples; the targets' formats and samples (with their blend state where
+// it is not dynamic). The modules by name, so the keys are the same from run
+// to run, as the build step makes them.
+void Impl::library_keys(const VkGraphicsPipelineCreateInfo &info, PipelineParts &parts) const {
+    const uint32_t dynamic = info.pDynamicState ? info.pDynamicState->dynamicStateCount : 0;
+    const auto *vi = info.pVertexInputState;
+    const auto *ia = info.pInputAssemblyState;
+    parts.keys[0] = {0, dynamic,
+                     vi && vi->vertexAttributeDescriptionCount ? uint32_t(vi->pVertexAttributeDescriptions[0].format) : 0u,
+                     vi && vi->vertexBindingDescriptionCount ? vi->pVertexBindingDescriptions[0].stride : 0u,
+                     ia ? uint32_t(ia->topology) : 0u, ia ? uint32_t(ia->primitiveRestartEnable) : 0u};
+    const auto *rs = info.pRasterizationState;
+    parts.keys[1] = {1,
+                     dynamic,
+                     info.pTessellationState ? info.pTessellationState->patchControlPoints : 0u,
+                     info.pViewportState != nullptr,
+                     rs ? uint32_t(rs->depthClampEnable) : 0u,
+                     rs ? uint32_t(rs->rasterizerDiscardEnable) : 0u,
+                     rs ? uint32_t(rs->polygonMode) : 0u,
+                     rs ? uint32_t(rs->cullMode) : 0u,
+                     rs ? uint32_t(rs->frontFace) : 0u,
+                     rs ? uint32_t(rs->depthBiasEnable) : 0u};
+    const VkPipelineShaderStageCreateInfo *fragment = nullptr;
+    for (uint32_t i = 0; i < info.stageCount; i++) {
+        if (info.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+            fragment = &info.pStages[i];
+            continue;
+        }
+        parts.keys[1].push_back(info.pStages[i].stage);
+        module_words(info.pStages[i].module, parts.keys[1]);
+    }
+    parts.keys[2].clear(), parts.keys[3].clear();
+    const auto *ms = info.pMultisampleState;
+    if (!ms) return; // rasterization discarded: no fragment parts
+    const auto *sl = locations_of(*ms);
+    const uint32_t samples = uint32_t(ms->rasterizationSamples), shading = ms->sampleShadingEnable,
+                   located = sl && sl->sampleLocationsEnable;
+    parts.keys[2] = {2, dynamic, samples, shading, located};
+    if (fragment) {
+        module_words(fragment->module, parts.keys[2]);
+        if (const VkSpecializationInfo *sp = fragment->pSpecializationInfo) {
+            uint32_t data[16] = {};
+            std::memcpy(data, sp->pData, std::min<size_t>(sp->dataSize, sizeof(data)));
+            parts.keys[2].insert(parts.keys[2].end(), data, data + (std::min<size_t>(sp->dataSize, 64) + 3) / 4);
+        }
+    }
+    const auto *rd = rendering_of(info);
+    parts.keys[3] = {3, dynamic, samples, shading, located};
+    if (rd) {
+        parts.keys[3].insert(parts.keys[3].end(), {uint32_t(rd->depthAttachmentFormat),
+                                                   uint32_t(rd->stencilAttachmentFormat), rd->colorAttachmentCount});
+        for (uint32_t k = 0; k < rd->colorAttachmentCount; k++)
+            parts.keys[3].push_back(uint32_t(rd->pColorAttachmentFormats[k]));
+    }
+    if (const auto *cb = info.pColorBlendState) {
+        parts.keys[3].push_back(cb->attachmentCount);
+        for (uint32_t k = 0; k < cb->attachmentCount; k++) {
+            const auto &a = cb->pAttachments[k];
+            parts.keys[3].insert(parts.keys[3].end(),
+                                 {a.blendEnable, uint32_t(a.srcColorBlendFactor), uint32_t(a.dstColorBlendFactor),
+                                  uint32_t(a.colorBlendOp), uint32_t(a.srcAlphaBlendFactor),
+                                  uint32_t(a.dstAlphaBlendFactor), uint32_t(a.alphaBlendOp), a.colorWriteMask});
+        }
+    }
+}
+
+// The build step's part (render::precompile, on its renderer): the storage's
+// shaders and the extra ones translated, its descriptions' libraries and
+// whole pipelines made on the workers into the pipeline cache, which is
+// written, and what was made recorded in the storage.
+bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::string &error) {
+    const auto started = std::chrono::steady_clock::now();
+    out = {};
+    out.cache_read = report_.pipeline_cache_read;
+    ShaderStorage storage;
+    if (options_.shader_storage.empty() || !storage.open(options_.shader_storage))
+        return error = "cannot open the shader storage " + options_.shader_storage.string(), false;
+    const ShaderStorage::Built ids = device_ids(d_.physical());
+    out.cache_matched = report_.pipeline_cache_read && cache_is_devices(options_.pipeline_cache, ids);
+    // what earlier build steps made into this cache: not made again
+    std::unordered_set<uint64_t> made_libraries, made_pipelines;
+    if (out.cache_matched)
+        for (const ShaderStorage::Built &b : storage.built())
+            if (same_device(b, ids)) {
+                made_libraries.insert(b.libraries.begin(), b.libraries.end());
+                made_pipelines.insert(b.pipelines.begin(), b.pipelines.end());
+            }
+    auto cancelled = [&] { return o.cancel && o.cancel->load(); };
+
+    // the shaders, translated in their first form (the others as the
+    // descriptions ask for them)
+    std::string why;
+    for (const ShaderStorage::Shader &s : storage.shaders()) {
+        load_shader(s.type, s.code);
+        Shader *sh = shader(s.hash);
+        out.shaders++;
+        if (!sh || !translate(*sh, why)) out.shaders_failed++;
+    }
+    for (const auto &[type, code] : o.extra_shaders) {
+        if (type > 1) continue;
+        const uint64_t hash = hash_words(type, code);
+        out.extra_shaders++;
+        if (!storage.has_shader(hash)) out.extra_new++;
+        load_shader(type, code);
+        Shader *sh = shader(hash);
+        if (!sh || !translate(*sh, why)) out.extra_failed++;
+    }
+    if (cancelled()) return error = "cancelled", false;
+
+    // the descriptions' libraries and whole pipelines, queued for the
+    // workers, each library once
+    struct Made {
+        uint64_t hash = 0;
+        bool library = false;
+        std::unique_ptr<PipelineEntry> entry;
+    };
+    std::vector<Made> made;
+    std::unordered_set<uint64_t> queued_libraries;
+    ShaderStorage::Built record = ids;
+    const bool libraries = d_.pipeline_library();
+    for (const std::vector<uint32_t> &words : storage.pipelines()) {
+        out.descriptions++;
+        const uint64_t hash = ShaderStorage::hash(0, words);
+        if (made_pipelines.count(hash)) {
+            out.descriptions_done_before++;
+            continue;
+        }
+        std::unique_ptr<PipelineDesc> desc = undescribe(words, why);
+        if (!desc) {
+            out.descriptions_failed++;
+            if (options_.verbose) std::fprintf(stderr, "  description %016llX: %s\n", (unsigned long long)hash, why.c_str());
+            continue;
+        }
+        if (libraries) {
+            PipelineParts parts;
+            library_keys(desc->info, parts);
+            for (uint32_t part = 0; part < 4; part++) {
+                if (parts.keys[part].empty()) continue;
+                const uint64_t lh = ShaderStorage::hash(part, parts.keys[part]);
+                if (made_libraries.count(lh) || !queued_libraries.insert(lh).second) continue;
+                Made m{lh, true, std::make_unique<PipelineEntry>()};
+                LibraryDesc ld(desc->info, part);
+                pipeline_workers_->queue(m.entry.get(), std::make_unique<PipelineDesc>(ld.info),
+                                         PipelinePriority::normal);
+                made.push_back(std::move(m));
+            }
+        }
+        if (o.whole_pipelines) {
+            Made m{hash, false, std::make_unique<PipelineEntry>()};
+            pipeline_workers_->queue(m.entry.get(), std::move(desc), PipelinePriority::normal);
+            made.push_back(std::move(m));
+        }
+    }
+    // waited for in order, with the progress
+    for (size_t i = 0; i < made.size(); i++) {
+        if (cancelled()) {
+            pipeline_workers_.reset(); // stopped: what is under way finishes, the rest is left
+            break;
+        }
+        pipeline_workers_->wait(made[i].entry.get());
+        if (o.progress) o.progress(i + 1, made.size());
+    }
+    const bool stopped = !pipeline_workers_;
+    for (Made &m : made) {
+        if (!m.entry->state.load(std::memory_order_acquire)) continue;
+        const bool ok = m.entry->pipeline != VK_NULL_HANDLE;
+        if (m.library)
+            (ok ? out.libraries : out.libraries_failed)++;
+        else
+            (ok ? out.pipelines : out.pipelines_failed)++;
+        if (ok) (m.library ? record.libraries : record.pipelines).push_back(m.hash);
+        if (m.entry->pipeline) vkDestroyPipeline(dev_, m.entry->pipeline, nullptr);
+        m.entry->pipeline = VK_NULL_HANDLE;
+    }
+    out.driver_seconds = stopped ? 0.0 : pipeline_workers_->seconds();
+    // the cache written when anything was made, and the record appended
+    report_.pipelines = out.libraries + out.pipelines;
+    pipelines_saved_ = 0;
+    if (report_.pipelines) save_pipeline_cache();
+    out.cache_written = report_.pipeline_cache_written;
+    if (report_.pipelines && !out.cache_written) return error = "cannot write the pipeline cache", false;
+    if (!record.libraries.empty() || !record.pipelines.empty()) storage.add_built(record);
+    out.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    if (stopped) return error = "cancelled", false;
+    return true;
 }
 
 // ---- a draw ----
@@ -5302,43 +6031,11 @@ void Impl::draw(const gpu::Draw &d) {
         info.pDynamicState = nullptr;
         rendering.colorAttachmentCount = 0;
     }
-    // The libraries' keys (use_libraries_): the vertex input's attribute and
-    // topology class; the pre-rasterization stages' modules (each module is
-    // one shader in one host form for the renderer's life), the patch size,
-    // depth clamp and bias, and rasterization discarded; the pixel shader's
-    // module with the samples; the targets' formats and samples (with their
-    // blend state where it is not dynamic).
-    PipelineParts parts;
-    if (use_libraries_) {
-        auto words = [](std::vector<uint32_t> &out, uint64_t v) {
-            out.insert(out.end(), {uint32_t(v), uint32_t(v >> 32)});
-        };
-        parts.keys[0] = {0, uint32_t(vertex_input.vertexAttributeDescriptionCount ? vertex_attribute.format : 0),
-                         topology_class};
-        parts.keys[1] = {1, patch_points, uint32_t(raster.depthClampEnable), uint32_t(raster.depthBiasEnable),
-                         uint32_t(raster.rasterizerDiscardEnable)};
-        for (uint32_t i = 0; i < info.stageCount; i++)
-            if (stages[i].stage != VK_SHADER_STAGE_FRAGMENT_BIT) {
-                parts.keys[1].push_back(stages[i].stage);
-                words(parts.keys[1], uint64_t(stages[i].module));
-            }
-        if (!export_only) {
-            // (the samples the pipeline rasterizes at; the interlock path's
-            // specialization with its fragment shader, and no attachments)
-            const uint32_t samples = uint32_t(multisample.rasterizationSamples);
-            parts.keys[2] = {2, samples, uint32_t(sample_shading)};
-            words(parts.keys[2], uint64_t(fragment));
-            if (spec.mapEntryCount) parts.keys[2].insert(parts.keys[2].end(), spec_data, spec_data + 10);
-            parts.keys[3] = {3, samples, uint32_t(sample_shading), uint32_t(rendering.depthAttachmentFormat),
-                             rendering.colorAttachmentCount};
-            parts.keys[3].insert(parts.keys[3].end(), color_key.begin(), color_key.end());
-        }
-    }
     // made on a worker while the draw goes without it, or with a stand-in,
     // when there is a pixel shader (Xenia's D3D12 pipeline cache: draws
     // without one get theirs at once)
     bool pending = false, stand_in = false;
-    VkPipeline pipe = pipeline(key, info, parts, options_.async_pipelines && ps, pending, stand_in);
+    VkPipeline pipe = pipeline(key, info, options_.async_pipelines && ps, pending, stand_in);
     if (pending) return skip("pipeline not ready (being made)");
     if (!pipe) return skip("vkCreateGraphicsPipelines failed");
     if (stand_in) report_.stand_in_draws++;
@@ -6193,6 +6890,31 @@ std::unique_ptr<Renderer> Renderer::create(vk::Device &device, gpu::CommandProce
     auto renderer = std::make_unique<Impl>(device, processor, options);
     if (!renderer->init(error)) return nullptr;
     return renderer;
+}
+
+bool precompile(vk::Device &device, const Options &options, const PrecompileOptions &precompile,
+                PrecompileReport &report, std::string &error) {
+    // a renderer of its own (its layout and its own modules, as a run's),
+    // over a processor that runs nothing
+    class Idle final : public gpu::CommandProcessor::Host {
+    public:
+        void interrupt(uint32_t) override {}
+        bool wait(uint32_t) override { return false; }
+    } host;
+    std::unique_ptr<Memory> memory = Memory::create(error);
+    if (!memory) return false;
+    gpu::CommandProcessor processor(*memory, host);
+    Options o = options;
+    o.async_pipelines = true;
+    o.pipeline_stand_in = Options::PipelineStandIn::library;
+    o.linked_pipelines_only = false;
+    o.on_frame = {}, o.on_swap = {}, o.frame_wanted = {};
+    // (the storage is the build step's to read: the renderer's own is not opened)
+    o.shader_storage.clear();
+    auto renderer = std::make_unique<Impl>(device, processor, o);
+    if (!renderer->init(error)) return false;
+    renderer->set_storage_path(options.shader_storage);
+    return renderer->precompile(precompile, report, error);
 }
 
 } // namespace xf::render
