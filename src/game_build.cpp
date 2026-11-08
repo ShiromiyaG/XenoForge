@@ -608,11 +608,35 @@ bool Build::compile_and_link(const fs::path &src_root, const std::vector<std::st
     // the headers, as this XenoForge has them, and the library's entry
     for (const Header &h : HEADERS)
         if (!write_if_changed(work / "include" / h.name, h.text)) return fail(error, "cannot write the headers");
-    const fs::path entry = work / "xf_library_entry.cpp";
-    if (!write_if_changed(entry, "// Written by the recompile step: the game library's entry (game_library.h).\n"
-                                 "#define XF_GAME_LIBRARY_ENTRY\n#include \"xenoforge/game_library.h\"\n"))
-        return fail(error, "cannot write " + utf8(entry));
+    // The objects a build left are reused when their source has not changed
+    // since (a recompiler change rewrites only the files whose text it
+    // changes) and they were compiled against the same headers and flags:
+    // their digest is kept beside them, and another one discards them all.
+    // The interface version is in the entry's text, the one file that uses
+    // it, so that file alone is recompiled when only the version moved.
     std::error_code ec;
+    {
+        uint64_t key = 0xCBF29CE484222325ull;
+        auto mix = [&key](std::string_view s) {
+            for (unsigned char ch : s) key = (key ^ ch) * 0x100000001B3ull;
+            key = (key ^ 0xFF) * 0x100000001B3ull;
+        };
+        for (const Header &h : HEADERS) mix(h.name), mix(h.text);
+        for (const std::string &f : compile_flags())
+            if (!f.starts_with("-DXF_GAME_INTERFACE_VERSION=")) mix(f);
+        const fs::path stamp = work / "objects.key";
+        const std::string text = hex_digest(key) + "\n";
+        if (read_file(stamp) != text) {
+            fs::remove_all(work / "obj", ec);
+            if (!write_if_changed(stamp, text)) return fail(error, "cannot write " + utf8(stamp));
+        }
+    }
+    const fs::path entry = work / "xf_library_entry.cpp";
+    if (!write_if_changed(entry, "// Written by the recompile step: the game library's entry (game_library.h), for "
+                                 "interface version " +
+                                     hex_version() +
+                                     ".\n#define XF_GAME_LIBRARY_ENTRY\n#include \"xenoforge/game_library.h\"\n"))
+        return fail(error, "cannot write " + utf8(entry));
     std::vector<Job> jobs;
     auto add = [&](const fs::path &source, const fs::path &relative) {
         Job j;
@@ -724,8 +748,10 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     result.entries = entries.size();
 
     // the emitted code, in a work directory of its own (a build stopped
-    // before goes on from the objects it left)
-    const fs::path work = cache / "work" / (digest + "-" + hex_version());
+    // before goes on from the objects it left, and with keep_work another
+    // XenoForge's build recompiles only the files whose text or headers
+    // changed: compile_and_link)
+    const fs::path work = cache / "work" / digest;
     const fs::path src = work / "src";
     fs::create_directories(src, ec);
     if (ec) return fail(error, "cannot make " + utf8(src) + ": " + ec.message());

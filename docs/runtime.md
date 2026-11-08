@@ -2113,7 +2113,7 @@ bundle), an installed LLVM (`%ProgramFiles%\LLVM\bin`), the PATH.
 **The build** (`prepare_game`): the disc's executables read (all XEX2 files
 but title updates and the system update's), `default.xex`'s image digest
 taken; discovery and emission in process (`recomp::emit_modules`, what
-`xfrecomp emit` writes) into `<cache>/work/<digest>-<version>/src`, the
+`xfrecomp emit` writes) into `<cache>/work/<digest>/src`, the
 headers and the library's entry (`xf_library_entry.cpp`) beside them; each
 file compiled by its own clang process (`-std=c++20 -O2 -g0 -w -mfma
 -mavx2 -fno-math-errno -nostdinc -nostdinc++ -DXF_GAME_LIBRARY`, the
@@ -2129,6 +2129,14 @@ keeps it). Progress is reported per module (discovery), per file (emission
 and compiling) and for the link, always from the caller's thread; the
 cancel flag ends the compilers under way. A stopped build goes on from the
 objects it left (an object newer than its source is not compiled again).
+The work directory is the disc's, not the version's (2026-11-08): with
+`keep_work`, another XenoForge's build of the same disc recompiles only the
+files whose text changed (the emission writes a file only when its text
+does) as long as the headers and flags are the same; a digest of those
+(`objects.key` beside the objects) that differs discards every object. The
+interface version is in the entry's text, so the entry alone is
+recompiled when only the version moved (a recompiler change that leaves
+the headers alone).
 The CPU must have AVX2 and FMA (checked first, `cpu_supported`).
 `find_cached(cache, digest)` finds `<digest>-<this version>.dll`.
 
