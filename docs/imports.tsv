@@ -1,4 +1,4 @@
-library	ordinal	name	kind	chaves	ben10
+library	ordinal	name	kind	A	B
 xam.xex	0x001	NetDll_WSAStartup	function	x	x
 xam.xex	0x002	NetDll_WSACleanup	function	x	x
 xam.xex	0x003	NetDll_socket	function	x	x

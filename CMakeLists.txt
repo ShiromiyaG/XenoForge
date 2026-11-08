@@ -4,6 +4,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
 project(xenoforge VERSION 0.1.0 LANGUAGES C CXX)
+# the player's flat folder (package.cmake) is the default install component; the SDK package (install_sdk.cmake) is "sdk"
+set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME player)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +38,7 @@ add_library(xenoforge STATIC
     src/gpu_trace.cpp
     src/game_build.cpp
     src/game_library.cpp
+    src/shader_storage.cpp
     src/trace_stats.cpp
     src/ucode.cpp
     src/ucode_parse.cpp
@@ -55,6 +58,9 @@ add_library(xenoforge STATIC
     src/recomp_discover.cpp
     src/recomp_emit.cpp
     src/recomp_module.cpp
+    src/recomp_project.cpp
+    src/toml.cpp
+    src/hooks.cpp
     src/memory.cpp
     src/guest_memory.cpp
     src/gpu/command_processor.cpp
@@ -144,7 +150,7 @@ xf_shader(placeholder.frag placeholder.frag)
 xf_shader(resolve.comp resolve.comp)
 xf_shader(texture_load.comp texture_load.comp)
 xf_shader(texture_load_test.comp texture_load.comp -DPARAMS_BUFFER) # texture_gpu_test's
-add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/replay.cpp ${XF_SHADER_WORDS})
+add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/native_render.cpp src/replay.cpp src/shader_step.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SHADER_OUT})
 target_link_libraries(xenoforge_vk PUBLIC xenoforge Vulkan::Vulkan)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -166,17 +172,13 @@ add_executable(xfrecomp tools/xfrecomp.cpp)
 target_link_libraries(xfrecomp PRIVATE xenoforge)
 # the recompile step from the command line (game_build.h): a disc into the cache, timed
 add_executable(xfbuild tools/xfbuild.cpp)
-target_link_libraries(xfbuild PRIVATE xenoforge)
+target_link_libraries(xfbuild PRIVATE xenoforge_vk xenoforge)
 
 # The kernel (step A4; docs/runtime.md): an object library, so every
 # export's registration (XF_EXPORT, a static initializer) is linked in.
 file(GLOB XF_KERNEL_SOURCES CONFIGURE_DEPENDS src/kernel/*.cpp)
 add_library(xenoforge_kernel OBJECT ${XF_KERNEL_SOURCES})
-target_link_libraries(xenoforge_kernel PUBLIC xenoforge)
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/memory.cpp) # the guest memory, being written
-    add_executable(boot tools/boot.cpp tools/game.cpp)
-    target_link_libraries(boot PRIVATE xenoforge_kernel xenoforge)
-endif()
+target_link_libraries(xenoforge_kernel PUBLIC xenoforge ${CMAKE_DL_LIBS}) # (dladdr and dlopen on POSIX: crash.cpp, port_module.cpp)
 # the console's own XAM (the player's system update) as the oracle for ours
 add_executable(xfxam tools/xfxam.cpp)
 target_include_directories(xfxam PRIVATE src/kernel)
@@ -187,7 +189,7 @@ add_test(NAME xam_oracle COMMAND xam_oracle_test $<TARGET_FILE:xfxam>)
 set_tests_properties(xam_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 # boot linked with a game's generated code: `xfrecomp emit <iso> <XF_GEN_DIR>/<name>`
 # writes it, a directory per executable and DLL on the disc and modules.cpp
-# listing their tables (game code: outside the repository); -DXF_GAMES="chaves;ben10"
+# listing their tables (game code: outside the repository); -DXF_GAMES="<name>;<name>"
 # builds boot_<name> for each, with one game library carrying every module. The
 # code is built here, against these headers, so it follows every change to the
 # instructions' semantics. XF_GAME_OPT is the game libraries' optimization
@@ -202,43 +204,25 @@ set(XF_GAME_OPT "-O2" CACHE STRING "the game libraries' optimization level")
 # headers alone (ppc_context.h, ppc_ops*, ppc_generated.h, ppc_module.h): a
 # build that changes them must compile the game libraries itself.
 set(XF_GAME_LIBS "" CACHE PATH "prebuilt game_<name>.lib to link instead of compiling the games")
-foreach(game ${XF_GAMES})
-    if(XF_GAME_LIBS)
-        set(prebuilt ${XF_GAME_LIBS}/game_${game}${CMAKE_STATIC_LIBRARY_SUFFIX})
-        if(NOT EXISTS ${prebuilt})
-            message(FATAL_ERROR "XF_GAME_LIBS: no ${prebuilt}")
-        endif()
-        add_library(game_${game} STATIC IMPORTED)
-        set_target_properties(game_${game} PROPERTIES IMPORTED_LOCATION ${prebuilt})
-        add_executable(boot_${game} tools/boot.cpp tools/game.cpp)
-        target_compile_definitions(boot_${game} PRIVATE XF_GENERATED)
-        target_link_libraries(boot_${game} PRIVATE xenoforge_kernel xenoforge game_${game})
-        continue()
-    endif()
-    if(NOT EXISTS ${XF_GEN_DIR}/${game}/modules.cpp)
-        message(FATAL_ERROR "XF_GAMES: no modules.cpp in ${XF_GEN_DIR}/${game}: run xfrecomp emit <iso> "
-                            "${XF_GEN_DIR}/${game} (an emission before the per-module tables has none)")
-    endif()
-    file(GLOB game_sources CONFIGURE_DEPENDS ${XF_GEN_DIR}/${game}/modules.cpp
-         ${XF_GEN_DIR}/${game}/*/functions_*.cpp ${XF_GEN_DIR}/${game}/*/table.cpp)
-    set(game_opt ${XF_GAME_OPT})
-    if(DEFINED XF_GAME_OPT_${game})
-        set(game_opt ${XF_GAME_OPT_${game}})
-    endif()
-    add_library(game_${game} STATIC ${game_sources})
-    target_include_directories(game_${game} PRIVATE include)
-    # optimized, without debug information (it is large) or warnings; never
-    # -ffast-math (docs/recompiler.md)
-    target_compile_options(game_${game} PRIVATE ${game_opt} -g0 -w -mfma -mavx2)
-    add_executable(boot_${game} tools/boot.cpp tools/game.cpp)
-    target_compile_definitions(boot_${game} PRIVATE XF_GENERATED)
-    target_link_libraries(boot_${game} PRIVATE xenoforge_kernel xenoforge game_${game})
-endforeach()
 # the kernel's threads and objects, tested through their exports and
 # src/kernel/objects.h
 add_executable(kernel_threads_test tests/kernel_threads_test.cpp)
 target_include_directories(kernel_threads_test PRIVATE src/kernel)
 target_link_libraries(kernel_threads_test PRIVATE xenoforge_kernel xenoforge)
+# the same on the deterministic mode's scheduler, and that mode's own test
+# (src/kernel/deterministic.cpp, input recordings)
+add_executable(kernel_threads_deterministic_test tests/kernel_threads_test.cpp)
+target_compile_definitions(kernel_threads_deterministic_test PRIVATE XF_DETERMINISTIC_TEST)
+target_include_directories(kernel_threads_deterministic_test PRIVATE src/kernel)
+target_link_libraries(kernel_threads_deterministic_test PRIVATE xenoforge_kernel xenoforge)
+add_executable(kernel_deterministic_test tests/kernel_deterministic_test.cpp)
+target_include_directories(kernel_deterministic_test PRIVATE src/kernel)
+target_link_libraries(kernel_deterministic_test PRIVATE xenoforge_kernel xenoforge)
+# crash and stop reports: a thread's report, the interpreter's stop, and real
+# faults in child processes (include/xenoforge/crash.h)
+add_executable(kernel_crash_test tests/kernel_crash_test.cpp)
+target_include_directories(kernel_crash_test PRIVATE src/kernel)
+target_link_libraries(kernel_crash_test PRIVATE xenoforge_kernel xenoforge)
 # the exception dispatch on a guest program (tests/seh_program.h), interpreted
 # and recompiled: seh_gen emits the program's functions as xfrecomp would
 add_executable(seh_gen tests/seh_gen.cpp)
@@ -254,6 +238,43 @@ target_include_directories(kernel_exceptions_test PRIVATE src/kernel tests)
 target_link_libraries(kernel_exceptions_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_exceptions COMMAND kernel_exceptions_test)
 set_tests_properties(kernel_exceptions PROPERTIES TIMEOUT 120)
+# the port's side (docs/recompiler.md, "The project file", "Replacing and
+# hooking"): the project file and the hooks on a guest program port_gen emits
+# with its project file, run generated and interpreted
+add_executable(port_gen tests/port_gen.cpp)
+target_link_libraries(port_gen PRIVATE xenoforge)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp
+    COMMAND port_gen ${CMAKE_CURRENT_BINARY_DIR}/port_gen
+    DEPENDS port_gen
+    COMMENT "port_gen")
+set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp
+                            ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp PROPERTIES COMPILE_OPTIONS "-O1;-g0;-w")
+add_executable(port_test tests/port_test.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp
+                         ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp)
+target_include_directories(port_test PRIVATE tests)
+target_link_libraries(port_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME port COMMAND port_test)
+set_tests_properties(port PROPERTIES TIMEOUT 120)
+# debugging for porters (plan E5): the hook frames, the counts, the owners,
+# the guest paused, and a hook module (a DLL built as xenoforge_add_port's
+# HOT_RELOAD builds one) loaded and reloaded
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/port_test_hooks_entry.cpp.tmp
+     "#define XF_PORT_MODULE_ENTRY\n#include <xenoforge/port_module.h>\n")
+file(COPY_FILE ${CMAKE_CURRENT_BINARY_DIR}/port_test_hooks_entry.cpp.tmp
+     ${CMAKE_CURRENT_BINARY_DIR}/port_test_hooks_entry.cpp ONLY_IF_DIFFERENT)
+add_library(port_test_hooks SHARED tests/port_module_hooks.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_test_hooks_entry.cpp)
+target_compile_definitions(port_test_hooks PRIVATE XF_PORT_MODULE)
+target_include_directories(port_test_hooks PRIVATE include tests)
+set_target_properties(port_test_hooks PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+add_executable(port_debug_test tests/port_debug_test.cpp)
+target_include_directories(port_debug_test PRIVATE tests src/kernel)
+target_link_libraries(port_debug_test PRIVATE xenoforge_kernel xenoforge)
+target_compile_definitions(port_debug_test PRIVATE "XF_TEST_HOOK_MODULE=\"$<TARGET_FILE:port_test_hooks>\""
+                                                   "XF_TEST_NOT_A_MODULE=\"$<TARGET_FILE:port_gen>\"")
+add_dependencies(port_debug_test port_test_hooks port_gen)
+add_test(NAME port_debug COMMAND port_debug_test)
+set_tests_properties(port_debug PROPERTIES TIMEOUT 120)
 
 # stb_image and stb_image_write (public domain / MIT), for PNGs in the tools;
 # Xenia's copy unless STB_DIR says otherwise
@@ -266,13 +287,14 @@ add_executable(xfreplay tools/xfreplay.cpp)
 target_link_libraries(xfreplay PRIVATE xenoforge_vk stb)
 add_executable(xfcompare tools/xfcompare.cpp)
 target_link_libraries(xfcompare PRIVATE stb)
-if(TARGET boot)
-    # boot --render: the renderer as the command processor's Sink, and its shots
-    target_link_libraries(boot PRIVATE xenoforge_vk stb)
-endif()
-foreach(game ${XF_GAMES})
-    target_link_libraries(boot_${game} PRIVATE xenoforge_vk stb)
-endforeach()
+# boot as a library (a port's boot_<name> links it: tools/boot.cpp's run_boot, the shared tools/game.cpp) and the
+# generic boot: the game library cached for the disc, else the interpreter. --render draws what the GPU is sent (the
+# renderer as the command processor's Sink) and writes shots
+add_library(xenoforge_boot STATIC tools/boot.cpp tools/game.cpp)
+target_link_libraries(xenoforge_boot PUBLIC xenoforge_vk xenoforge PRIVATE stb)
+add_executable(boot tools/stub_main.cpp)
+target_compile_definitions(boot PRIVATE XF_PORT_BOOT)
+target_link_libraries(boot PRIVATE xenoforge_boot xenoforge_kernel xenoforge_vk xenoforge)
 # The player (track C1; docs/runtime.md, "The player"): a game in an SDL3
 # window with its input and sound, the overlay in Dear ImGui, the settings in
 # config.toml. SDL3, Dear ImGui and toml++ are fetched as the 3DS runtime pins
@@ -348,20 +370,16 @@ if(XF_PLAYER AND TARGET boot)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(xf_frontend PRIVATE -Wno-missing-field-initializers)
     endif()
-    set(XF_PLAYERS player)
-    add_executable(player frontend/player.cpp tools/game.cpp)
-    foreach(game ${XF_GAMES})
-        add_executable(player_${game} frontend/player.cpp tools/game.cpp)
-        target_compile_definitions(player_${game} PRIVATE XF_GENERATED)
-        target_link_libraries(player_${game} PRIVATE game_${game})
-        list(APPEND XF_PLAYERS player_${game})
-    endforeach()
-    foreach(target ${XF_PLAYERS})
-        target_link_libraries(${target} PRIVATE xf_frontend xf_imgui xenoforge_kernel xenoforge_vk stb)
-        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-            target_compile_options(${target} PRIVATE -Wno-missing-field-initializers)
-        endif()
-    endforeach()
+    # the player as a library (frontend/player.cpp's run_player; a port's player_<name> links it) and the
+    # generic player, which carries no game code
+    add_library(xenoforge_player STATIC frontend/player.cpp tools/game.cpp)
+    target_link_libraries(xenoforge_player PUBLIC xf_frontend xf_imgui xenoforge_vk xenoforge PRIVATE stb)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(xenoforge_player PRIVATE -Wno-missing-field-initializers)
+    endif()
+    add_executable(player tools/stub_main.cpp)
+    target_link_libraries(player PRIVATE xenoforge_player xenoforge_kernel xenoforge_vk xenoforge)
+    add_library(XenoForge::player ALIAS xenoforge_player)
     # the launcher (track C2; docs/runtime.md, "The launcher"): the games in a
     # folder, their settings and controls, and each started in the player
     # beside it that carries its code; a window program, its form drawn by
@@ -379,7 +397,7 @@ if(XF_PLAYER AND TARGET boot)
             COMMENT "glslc ui.${shader}")
     endforeach()
     add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ribbons.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
-                             frontend/prepare_job.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
+                             frontend/prepare_job.cpp frontend/stale_library.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
                              frontend/launcher_view.cpp frontend/launcher_screens.cpp frontend/launcher_input.cpp
                              frontend/settings_view.cpp
                              ${XF_SHADER_OUT}/ui.vert.inc ${XF_SHADER_OUT}/ui.frag.inc)
@@ -402,22 +420,83 @@ if(XF_PLAYER AND TARGET boot)
     add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
     target_link_libraries(frontend_test PRIVATE xf_ui xf_frontend xenoforge_kernel xenoforge_vk)
     add_test(NAME frontend COMMAND frontend_test)
+    # the batch compatibility run (tools/xfcompat.cpp): the discs of a folder prepared and booted, a row each.
+    # It reads the discs with the launcher's library and runs boot with SDL3's process calls, so it is built
+    # with the player (which brings SDL3); its rows and the parser of boot's output are compat_test's.
+    add_executable(xfcompat tools/xfcompat.cpp tools/compat.cpp)
+    target_include_directories(xfcompat PRIVATE tools frontend)
+    target_link_libraries(xfcompat PRIVATE xf_frontend xenoforge)
+    add_dependencies(xfcompat boot)
+endif()
+
+# The games of XF_GAMES through the same function a port uses (cmake/xenoforge_port.cmake): game_<name>,
+# boot_<name> and, with the player, player_<name>
+add_library(XenoForge::core ALIAS xenoforge)
+add_library(XenoForge::vk ALIAS xenoforge_vk)
+add_library(XenoForge::kernel ALIAS xenoforge_kernel)
+add_library(XenoForge::boot ALIAS xenoforge_boot)
+add_executable(XenoForge::xfrecomp ALIAS xfrecomp)
+set(XENOFORGE_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set(XENOFORGE_RUNTIME_FILES)
+if(XF_XMA)
+    set(XENOFORGE_RUNTIME_FILES $<TARGET_FILE:ffmpeg_xma>)
+endif()
+include(cmake/xenoforge_port.cmake)
+set(XF_PLAYERS)
+if(TARGET player)
+    set(XF_PLAYERS player)
+endif()
+# XF_GAME_HOOKS_<name>: hook sources (xenoforge/port.h, kept outside the
+# repository) tried on that game as a port's would be, built as a module
+# reloaded while it runs (HOT_RELOAD; docs/sdk.md, "Reloading the hooks")
+foreach(game ${XF_GAMES})
+    set(port_hooks)
+    if(XF_GAME_HOOKS_${game})
+        set(port_hooks HOOK_SOURCES ${XF_GAME_HOOKS_${game}} HOT_RELOAD)
+    endif()
+    if(XF_GAME_LIBS)
+        xenoforge_add_port(${game} PREBUILT ${XF_GAME_LIBS}/game_${game}${CMAKE_STATIC_LIBRARY_SUFFIX} ${port_hooks})
+    else()
+        xenoforge_add_port(${game} GENERATED_DIR ${XF_GEN_DIR}/${game} ${port_hooks})
+    endif()
+    if(TARGET player_${game})
+        list(APPEND XF_PLAYERS player_${game})
+    endif()
+endforeach()
+# examples/native_port (a port drawing its own frames, docs/sdk.md "Native rendering") built here on one of XF_GAMES'
+# generated code: player_native and boot_native in build/examples/native_port
+set(XF_NATIVE_PORT_GAME "" CACHE STRING "a game of XF_GAMES to build examples/native_port on")
+if(XF_NATIVE_PORT_GAME)
+    if(XF_GAME_LIBS)
+        set(NATIVE_PREBUILT ${XF_GAME_LIBS}/game_${XF_NATIVE_PORT_GAME}${CMAKE_STATIC_LIBRARY_SUFFIX})
+    else()
+        set(NATIVE_GENERATED_DIR ${XF_GEN_DIR}/${XF_NATIVE_PORT_GAME})
+    endif()
+    add_subdirectory(examples/native_port)
+endif()
+if(TARGET player)
     # the player as it is shipped: cmake --install, or the player_package target
     include(cmake/package.cmake)
 endif()
+# the SDK: find_package(XenoForge) in a port's own repository (docs/sdk.md)
+include(cmake/install_sdk.cmake)
 add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
 foreach(name aes disc xex lzx sha1 snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor
-             recomp_discover gpu_trace_writer)
+             recomp_discover gpu_trace_writer shader_storage)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+# xfcompat's rows, files and the parser of boot's output, on canned output
+add_executable(compat_test tests/compat_test.cpp tools/compat.cpp)
+target_include_directories(compat_test PRIVATE tools)
+add_test(NAME compat COMMAND compat_test)
 # the kernel's exports, called through a Kernel (the object library brings
 # their registrations)
-foreach(name kernel_memory kernel_modules kernel_crypt)
+foreach(name kernel_memory kernel_modules kernel_crypt lockstep)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge_kernel xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
@@ -431,6 +510,12 @@ target_compile_definitions(game_library_test PRIVATE
 set_source_files_properties(tests/game_library/code.cpp PROPERTIES COMPILE_OPTIONS "-O2;-g0;-w;-mfma;-mavx2")
 add_test(NAME game_library COMMAND game_library_test)
 set_tests_properties(game_library PROPERTIES TIMEOUT 300)
+# the recompile step on an executable the test makes: functions failing the
+# emission and clang left out, the entry log taken in (needs clang and lld)
+add_executable(game_build_test tests/game_build_test.cpp)
+target_link_libraries(game_build_test PRIVATE xenoforge)
+add_test(NAME game_build COMMAND game_build_test)
+set_tests_properties(game_build PROPERTIES TIMEOUT 300)
 # the modules family loads DLLs and runs a guest thread through them
 target_include_directories(kernel_modules_test PRIVATE src/kernel)
 set_tests_properties(kernel_modules PROPERTIES TIMEOUT 120) # threads: fail, never hang
@@ -447,9 +532,13 @@ target_sources(shader_translator_test PRIVATE ${XF_SHADER_OUT}/edram_fsi_library
 target_compile_definitions(shader_translator_test PRIVATE
                            XF_EDRAM_FSI_LIBRARY="${XF_SHADER_OUT}/edram_fsi_library.frag.inc")
 add_test(NAME kernel_threads COMMAND kernel_threads_test)
+add_test(NAME kernel_crash COMMAND kernel_crash_test)
 # a rare deadlock seen once under load (2026-11-05, not reproduced in 36
 # runs since): fail instead of hanging the suite
 set_tests_properties(kernel_threads PROPERTIES TIMEOUT 120)
+add_test(NAME kernel_threads_deterministic COMMAND kernel_threads_deterministic_test)
+add_test(NAME kernel_deterministic COMMAND kernel_deterministic_test)
+set_tests_properties(kernel_threads_deterministic kernel_deterministic PROPERTIES TIMEOUT 120)
 # the video family: the GPU live through its exports, MMIO and threads
 add_executable(kernel_video_test tests/kernel_video_test.cpp)
 target_include_directories(kernel_video_test PRIVATE src/kernel)
@@ -571,3 +660,10 @@ add_test(NAME replay COMMAND replay_test)
 add_executable(primitives_test tests/primitives_test.cpp)
 target_link_libraries(primitives_test PRIVATE xenoforge_vk stb)
 add_test(NAME primitives COMMAND primitives_test)
+
+# the SDK package without a game: installed to a temporary prefix, the example port configured and built against it
+# (tests/sdk_test.cmake)
+add_test(NAME sdk COMMAND ${CMAKE_COMMAND} -DBUILD=${CMAKE_BINARY_DIR} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}
+         -DWORK=${CMAKE_BINARY_DIR}/sdk_test -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
+         -DGENERATOR=${CMAKE_GENERATOR} -DMAKE=${CMAKE_MAKE_PROGRAM} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/sdk_test.cmake)
+set_tests_properties(sdk PROPERTIES TIMEOUT 600)

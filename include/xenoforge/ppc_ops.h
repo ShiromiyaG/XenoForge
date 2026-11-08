@@ -165,6 +165,31 @@ XF_INLINE void set_ov(Context &c, bool overflow) {
     c.xer_so |= overflow;
 }
 
+// ---- yield points (docs/recompiler.md, "Yield points") ----
+
+// A yield point's weight, in the budget's units (a 32nd of the deterministic
+// clock's 100 ns, about ten Xenon cycles): a loop's back edge one, a priority
+// hint (or rx,rx,rx, which the XDK's spin loops run) eight, so a spin reaches
+// the end of its slice sooner than a loop doing work.
+constexpr int64_t YIELD_BACK_EDGE = 1;
+constexpr int64_t YIELD_PRIORITY_HINT = 8;
+
+// the budget ran out: the system's hook, or a fresh budget when there is none
+[[gnu::cold]] [[gnu::noinline]] inline void yield_hook(Context &c) {
+    if (c.system && c.system->yield)
+        c.system->yield(c);
+    else
+        c.yield_budget = INT64_MAX;
+}
+// Not counting (playing): a load and a branch. Counting: the weight off the
+// budget, and the hook below 0 (it may hand the processor over).
+XF_INLINE void yield_point(Context &c, int64_t weight) {
+    if (c.yield_counting) [[unlikely]] {
+        c.yield_budget -= weight;
+        if (c.yield_budget < 0) yield_hook(c);
+    }
+}
+
 } // namespace xf::ppc::ops
 
 #include "xenoforge/ppc_ops/integer.h"

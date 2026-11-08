@@ -910,8 +910,9 @@ XF_EXPORT(xboxkrnl, XeCryptBnDwLePkcs1Verify) {
 
 XF_EXPORT(xboxkrnl, XeCryptRandom) {
     // (buffer, size): random bytes, from a generator per thread seeded by
-    // the host, as Xenia
-    thread_local std::mt19937_64 generator(std::random_device{}());
+    // the host, as Xenia; in the deterministic mode, where every guest thread
+    // is on one host thread, from one generator with a fixed seed
+    thread_local std::mt19937_64 generator(k.deterministic() ? 0x58656E6F466F7267ull : std::random_device{}());
     uint32_t buffer = arg(k, c, 0), size = arg(k, c, 1);
     for (uint32_t i = 0; i < size; i++) k.host(buffer + i)[0] = uint8_t(generator());
 }

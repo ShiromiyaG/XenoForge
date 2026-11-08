@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -172,5 +173,12 @@ void set_input_deadzones(Kernel &k, double left, double right);
 // user, for boot and the player's exit report
 std::string input_report(Kernel &k);
 uint64_t input_states_delivered(Kernel &k);
+// Recordings (docs/input.md, "Recordings"), set before the game runs: every
+// answer the input exports give written to path as it changes, at its time on
+// the scheduler's clock; or a recording's answers given in place of the
+// drivers'. In the deterministic mode a replay repeats the run it was
+// recorded in exactly. False, and why, when the file cannot be used.
+bool record_input(Kernel &k, const std::filesystem::path &path, std::string &error);
+bool replay_input(Kernel &k, const std::filesystem::path &path, std::string &error);
 
 } // namespace xf::kernel

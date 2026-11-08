@@ -10,7 +10,7 @@
 
 .EXAMPLE
   tools\capture_traces.ps1 -Xenia ..\xenia-canary\build\bin\Windows\Release\xenia_canary.exe `
-      -Game "..\Chaves\El Chavo Kart (USA).iso" -Out ..\traces\chaves -Frames 300,900,1800,3000
+      -Game "D:\games\game.iso" -Out ..\traces\game -Frames 300,900,1800,3000
 #>
 param(
     [Parameter(Mandatory)] [string]$Xenia,

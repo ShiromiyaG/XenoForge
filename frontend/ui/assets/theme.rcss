@@ -123,7 +123,7 @@ scrollbarhorizontal sliderarrowdec, scrollbarhorizontal sliderarrowinc { width: 
 /* the status dots */
 .dot { flex: 0 0 8dp; width: 8dp; height: 8dp; border-radius: 4dp; margin-right: 7dp; background-color: {text-3}; }
 .dot.ready { background-color: {good}; }
-.dot.prep { background-color: {warn}; }
+.dot.prep, .dot.stale { background-color: {warn}; }
 .dot.interp, .dot.bad { background-color: {bad}; }
 .dot.run { background-color: {accent}; }
 .dot.off { background-color: {border-strong}; }

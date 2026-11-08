@@ -25,11 +25,15 @@
 
 #include "xenoforge/kernel.h"
 
+#include "lockstep_check.h"
 #include "objects.h"
+#include "xenoforge/crash.h"
 #include "xenoforge/exports.h"
+#include "xenoforge/hooks.h"
 #include "xenoforge/ppc_interp.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 namespace xf::kernel {
@@ -104,6 +108,27 @@ struct Kernel::Code {
     std::vector<std::unique_ptr<CodeMap>> maps;
 };
 
+// A guest thread running guest code (running) or in the kernel (not), for
+// Kernel::pause: set for the scope, put back after; a thread that goes back
+// to guest code while a pause is asked parks first.
+struct GuestCodeScope {
+    Kernel &k;
+    Thread *t;
+    bool was = false;
+    GuestCodeScope(Kernel &kernel, bool running) : k(kernel), t(current_thread()) {
+        if (!t) return;
+        was = t->guest_running.exchange(running, std::memory_order_seq_cst);
+        if (running && k.pause_requested_.load(std::memory_order_seq_cst)) [[unlikely]]
+            k.park();
+    }
+    ~GuestCodeScope() {
+        if (!t) return;
+        t->guest_running.store(was, std::memory_order_seq_cst);
+        if (was && k.pause_requested_.load(std::memory_order_seq_cst)) [[unlikely]]
+            k.park();
+    }
+};
+
 Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()) {
     system_.owner = this;
     system_.syscall = [](ppc::Context &c) {
@@ -120,7 +145,11 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         k.run_import(c, *import);
     };
     system_.call = [](ppc::Context &c, uint32_t target) {
-        return static_cast<Kernel *>(c.system->owner)->try_call(c, target);
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        if (k.try_call(c, target)) return true;
+        // the interpreter goes on into a function with no generated code
+        if (k.entry_hook_) k.entered(target);
+        return false;
     };
     system_.mmio_read = [](ppc::Context &c, uint32_t address) -> uint32_t {
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
@@ -140,12 +169,70 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
         char reason[96];
         std::snprintf(reason, sizeof(reason), "%s (0x%08X) at 0x%08X has no semantics", ppc::info(op).name, code, c.pc);
-        if (!k.stopped.exchange(true)) k.stop_reason = reason;
+        k.stop(reason);
     };
     system_.time_base = [](ppc::Context &c) {
         // the Xenon's time base runs at 50 MHz: 5 ticks in the scheduler's
         // clock's 100 ns
-        return static_cast<Kernel *>(c.system->owner)->objects_->now() * 5;
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        // what the lockstep check's interpreter read here, read again (the
+        // read was counted on the clock once, as it was made)
+        uint64_t replayed;
+        if (k.lockstep_ && k.lockstep_->replay_time_base(c, replayed)) [[unlikely]]
+            return replayed;
+        // a read moves the deterministic mode's clock: a loop that waits on
+        // the time base gets there, and may hand over
+        k.objects_->scheduler->advance(k.deterministic_time_base_cost_);
+        return k.objects_->now() * 5;
+    };
+    // the port's hooks (xenoforge/hooks.h), for the interpreter
+    system_.hook_pages = hooks::pages();
+    system_.enter_hooked = [](ppc::Context &c, uint32_t target, uint32_t from) {
+        // a branch from outside a hooked function to its start (its size from
+        // its slot; unknown, every branch there: a loop back to a function's
+        // first instruction is rarer than a tail call to it)
+        const hooks::Entry *e = hooks::find(target);
+        if (!e || !e->function()) return false;
+        const uint32_t size = hooks::function_size(target);
+        if (from >= target && from - target < size) return false;
+        return static_cast<Kernel *>(c.system->owner)->try_call(c, target);
+    };
+    system_.mid_hook = [](ppc::Context &c, uint32_t pc) -> uint32_t {
+        hooks::Pin pin;
+        const hooks::Entry *e = pin.find(pc);
+        return e && !e->mid.empty() ? hooks::run_mid(c, *e) : 0;
+    };
+    system_.run_original = [](ppc::Context &c, uint32_t address) {
+        static_cast<Kernel *>(c.system->owner)->run_original(c, address);
+    };
+    system_.hook_boundary = [](ppc::Context &c, uint32_t address, bool after, uint32_t resume) {
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        if (!k.lockstep_) return;
+        // the port's code is to the check what an import is: run once, for
+        // real, between two segments
+        if (!after) k.lockstep_->before_import(c, *k.hook_marker(address));
+        else k.lockstep_->after_import(c, resume, resume == address);
+    };
+    system_.yield = [](ppc::Context &c) {
+        // the yield points' budget ran out (ppc_ops.h): the clock moves by
+        // the whole ticks spent, and another thread may run (a spin on a flag
+        // with no kernel call reaches its slice's end here)
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        // a pause (Kernel::pause) parks the thread here
+        if (k.pause_requested_.load(std::memory_order_relaxed)) [[unlikely]]
+            k.park();
+        const int64_t units = k.deterministic_yield_units_;
+        if (!units) {
+            // (counting was turned on for a pause: off again)
+            c.yield_budget = INT64_MAX;
+            c.yield_counting = false;
+            return;
+        }
+        const int64_t ticks = 1 + (-(c.yield_budget + 1)) / units;
+        c.yield_budget += ticks * units;
+        // handing over is a safe point: the thread waiting there is parked
+        GuestCodeScope parked(k, false);
+        k.objects_->scheduler->advance(uint64_t(ticks));
     };
     // the globals first: the objects and threads use their processes,
     // object types and KeTimeStampBundle
@@ -159,6 +246,8 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
 
 // the devices' threads end while the objects they run on are still here
 Kernel::~Kernel() {
+    // the port's hooks no longer reach this kernel's modules through their slots
+    for (const auto &[base, m] : code_->loaded) hooks::unbind(*m);
     shutdown_xam_tasks(*this);
     shutdown_file_completion(*this);
     shutdown_audio(*this);
@@ -358,6 +447,22 @@ void Kernel::set_generated_modules(const ppc::GeneratedModule *const *modules, s
     code_->available.assign(modules, modules + count);
 }
 
+std::pair<uintptr_t, uintptr_t> Kernel::generated_code_span() {
+    uintptr_t low = UINTPTR_MAX, high = 0;
+    auto take = [&](void (*fn)(ppc::Context &)) {
+        if (!fn) return;
+        uintptr_t a = reinterpret_cast<uintptr_t>(fn);
+        low = std::min(low, a), high = std::max(high, a);
+    };
+    {
+        std::lock_guard lock(code_->mutex);
+        for (const ppc::GeneratedModule *m : code_->available)
+            for (size_t i = 0; i < m->count; i++) take(m->functions[i].fn);
+    }
+    for (size_t i = 0; i < generated_count_; i++) take(generated_[i].fn);
+    return low < high ? std::pair{low, high} : std::pair<uintptr_t, uintptr_t>{0, 0};
+}
+
 std::string Kernel::add_module_code(const Xex &xex) {
     std::lock_guard lock(code_->mutex);
     if (code_->available.empty()) return {};
@@ -393,12 +498,18 @@ std::string Kernel::add_module_code(const Xex &xex) {
     }
     code_->loaded[base] = match;
     publish_code();
+    // its hook slots bound to the port's hooks, its names taken in
+    hooks::bind(*match);
     return "generated code, " + std::to_string(match->count) + " functions";
 }
 
 void Kernel::remove_module_code(uint32_t base) {
     std::lock_guard lock(code_->mutex);
-    if (code_->loaded.erase(base)) publish_code();
+    auto it = code_->loaded.find(base);
+    if (it == code_->loaded.end()) return;
+    hooks::unbind(*it->second);
+    code_->loaded.erase(it);
+    publish_code();
 }
 
 // (code_->mutex held)
@@ -415,9 +526,65 @@ void Kernel::publish_code() {
 void Kernel::attach(ppc::Context &c) {
     c.base = memory_.base();
     c.system = &system_;
+    // the deterministic mode counts the yield points (system_.yield)
+    c.yield_counting = deterministic_yield_units_ != 0;
+    c.yield_budget = 0;
+}
+
+void Kernel::park() {
+    Thread *t = current_thread();
+    if (!t) return;
+    std::unique_lock l(pause_mutex_);
+    const bool was = t->guest_running.load(std::memory_order_seq_cst);
+    for (;;) {
+        t->guest_running.store(false, std::memory_order_seq_cst);
+        pause_cv_.notify_all();
+        pause_cv_.wait(l, [&] { return !pause_requested_.load(std::memory_order_seq_cst); });
+        t->guest_running.store(was, std::memory_order_seq_cst);
+        if (!was || !pause_requested_.load(std::memory_order_seq_cst)) break;
+    }
+}
+
+bool Kernel::pause(uint32_t timeout_ms) {
+    pause_requested_.store(true, std::memory_order_seq_cst);
+    const bool exact = deterministic();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        uint32_t running = 0;
+        {
+            std::lock_guard l(objects_->lock);
+            for (Thread *t : objects_->threads) {
+                if (!t->guest_running.load(std::memory_order_seq_cst)) continue;
+                running++;
+                // Not in the deterministic mode, the yield points count only for
+                // this: the thread's next back edge calls System::yield, which
+                // parks it. (Written from here as it runs, as the deterministic
+                // mode's watchdog does: a store it misses is made again.)
+                if (!exact && t->context) {
+                    t->context->yield_budget = -1;
+                    t->context->yield_counting = true;
+                }
+            }
+        }
+        pause_unparked_ = running;
+        if (!running) return true;
+        if (std::chrono::steady_clock::now() >= until) return false;
+        std::unique_lock l(pause_mutex_);
+        pause_cv_.wait_for(l, std::chrono::milliseconds(2));
+    }
+}
+
+void Kernel::resume() {
+    {
+        std::lock_guard l(pause_mutex_);
+        pause_requested_.store(false, std::memory_order_seq_cst);
+    }
+    pause_cv_.notify_all();
 }
 
 void Kernel::run_import(ppc::Context &c, const Import &import) {
+    // in the kernel: a safe point for a pause, on the way in and out
+    GuestCodeScope in_kernel(*this, false);
     // (nothing of this frame outlives the count: a host stack may be dropped
     // while it waits in the export, KeSetCurrentStackPointers's switch)
     {
@@ -428,21 +595,34 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
             std::fprintf(stderr, "kernel: %s is not implemented (r3 0x%08X, r4 0x%08X, from 0x%08X)\n", key.c_str(),
                          uint32_t(c.r[3]), uint32_t(c.r[4]), uint32_t(c.lr));
     }
+    note_kernel_call(import, uint32_t(c.lr));
+    // the deterministic mode's clock moves, and another thread may run
+    objects_->scheduler->advance(deterministic_call_cost_);
     // a suspension or kernel APCs waiting for this thread happen here
     if (Thread *t = current_thread(); t && t->pending.load(std::memory_order_relaxed)) objects_->safe_point(*t);
     if (import_hook_) import_hook_(import_hook_user_, import, c, false);
+    // (the lockstep check compares at an import, and starts its next segment
+    // from what the import left)
+    if (lockstep_) [[unlikely]]
+        lockstep_->before_import(c, import);
     if (import.fn) import.fn(*this, c);
     else result(c, 0);
+    if (lockstep_) [[unlikely]]
+        lockstep_->after_import(c);
     if (import_hook_) import_hook_(import_hook_user_, import, c, true);
 }
 
-bool Kernel::try_call(ppc::Context &c, uint32_t target) {
+bool Kernel::try_call(ppc::Context &c, uint32_t target, bool hooks) {
+    // the port's hooks, where a page holds any (a function with a slot runs
+    // its own, below)
+    if (hooks && hooks::in_hooked_page(target)) [[unlikely]]
+        if (call_hooked(c, target)) return true;
     if (generated_count_) {
         const Generated *end = generated_ + generated_count_;
         const Generated *it =
             std::lower_bound(generated_, end, target, [](const Generated &g, uint32_t a) { return g.address < a; });
-        if (it != end && it->address == target) {
-            it->fn(c);
+        if (it != end && it->address == target && it->fn) { // (none: a function left out)
+            run_generated(c, target, it->fn);
             return true;
         }
     }
@@ -452,7 +632,7 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
             uint32_t offset = target - r.begin;
             if (offset >= r.size) continue;
             if (CodeMap::Fn fn = r.table[offset / 4]; fn && !(offset & 3)) {
-                fn(c);
+                run_generated(c, target, fn);
                 return true;
             }
             break;
@@ -477,6 +657,70 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
     return false;
 }
 
+bool Kernel::call_hooked(ppc::Context &c, uint32_t target) {
+    hooks::Pin pin;
+    const hooks::Entry *e = pin.find(target);
+    if (!e || !e->function() || hooks::slotted(target)) return false;
+    hooks::run(c, *e, nullptr); // the original through run_original
+    return true;
+}
+
+void Kernel::run_original(ppc::Context &c, uint32_t address) {
+    // the function as dispatch runs it, its hooks left out: generated code,
+    // an import, else the interpreter until it returns
+    const uint32_t until = uint32_t(c.lr) & ~3u, stack_top = uint32_t(c.r[1]);
+    // (a function with a hook slot asks only when its body was left out of
+    // the generated code, game_build's left_out_original_stub: its table
+    // entry is the wrapper that ran the hooks, so the interpreter it is)
+    if (!hooks::slotted(address) && try_call(c, address, false)) return;
+    interpreted_++;
+    {
+        std::lock_guard<std::mutex> lock(counts_mutex_);
+        interpreted_targets_[address]++;
+    }
+    if (entry_hook_) entered(address);
+    interpret_from(c, address, until, stack_top);
+}
+
+const Import *Kernel::hook_marker(uint32_t address) {
+    // named by the hooks there now ("before count_frames, replace clamp:
+    // Update (0x82012340)"): a marker per text, so a reload's new hooks get
+    // theirs
+    std::string hooks;
+    if (const hooks::Entry *e = hooks::find(address)) {
+        auto add = [&](const char *kind, const std::string &name) {
+            hooks += (hooks.empty() ? "" : ", ") + std::string(kind) + (name.empty() ? "" : " " + name);
+        };
+        for (const auto &h : e->before) add("before", h.name);
+        if (e->replace.fn) add("replace", e->replace.name);
+        for (const auto &h : e->after) add("after", h.name);
+        for (const auto &h : e->mid) add("mid", h.name);
+    }
+    std::string name = port::name_of(address);
+    char hex[16];
+    std::snprintf(hex, sizeof(hex), "0x%08X", address);
+    std::string text = (hooks.empty() ? std::string() : hooks + ": ") + (name.empty() ? hex : name + " (" + hex + ")");
+    std::lock_guard lock(hook_markers_mutex_);
+    auto [it, made] = hook_markers_.try_emplace(text);
+    if (made) it->second.library = "port", it->second.name = text, it->second.thunk = address;
+    return &it->second;
+}
+
+void Kernel::run_generated(ppc::Context &c, uint32_t target, void (*fn)(ppc::Context &)) {
+    if (lockstep_ && lockstep_->wanted(c, target)) [[unlikely]]
+        return lockstep_->check(c, target, fn);
+    fn(c);
+}
+
+bool Kernel::enable_lockstep(const LockstepOptions &options, std::string &error) {
+    auto lockstep = std::make_unique<Lockstep>(*this, options);
+    if (!lockstep->usable(error)) return false;
+    lockstep_ = std::move(lockstep);
+    return true;
+}
+LockstepCounts Kernel::lockstep_counts() const { return lockstep_ ? lockstep_->counts() : LockstepCounts{}; }
+std::string Kernel::lockstep_report() const { return lockstep_ ? lockstep_->report() : std::string(); }
+
 // A return to another frame (docs/runtime.md, "Code"; ppc::Unwind): a
 // longjmp, a catch's continuation, a stack switched back to elsewhere than
 // where it left; an interpreted blr out of the frames its dispatch began in,
@@ -491,6 +735,9 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
 // caller's frame when that frame's generated code takes it.
 void Kernel::dispatch(ppc::Context &c, uint32_t target) {
     if (stopped) return;
+    // an indirect call moves the deterministic mode's clock and may hand over
+    // (a loop that waits on another thread through virtual calls gets there)
+    if (deterministic_dispatch_cost_) objects_->scheduler->advance(deterministic_dispatch_cost_);
     // what a return from this call comes back to
     const uint32_t until = uint32_t(c.lr), stack_top = uint32_t(c.r[1]);
     uint32_t pc = target;
@@ -516,6 +763,7 @@ void Kernel::dispatch(ppc::Context &c, uint32_t target) {
                 std::lock_guard<std::mutex> lock(counts_mutex_);
                 interpreted_targets_[pc]++;
             }
+            if (!unwound && entry_hook_) entered(pc);
             interpret_from(c, pc, until, stack_top);
             return;
         } catch (const ppc::Unwind &u) {
@@ -529,6 +777,7 @@ void Kernel::dispatch(ppc::Context &c, uint32_t target) {
 }
 
 void Kernel::run_from(ppc::Context &c, uint32_t pc) {
+    const uint32_t start = pc;
     while (!stopped) {
         if (try_call(c, pc)) {
             pc = uint32_t(c.lr) & ~3u; // where it returned
@@ -539,6 +788,7 @@ void Kernel::run_from(ppc::Context &c, uint32_t pc) {
             std::lock_guard<std::mutex> lock(counts_mutex_);
             interpreted_targets_[pc]++;
         }
+        if (pc == start && entry_hook_) entered(pc); // a start, not where a return went
         interpret_from(c, pc, SENTINEL, 0);
         return;
     }
@@ -550,17 +800,19 @@ void Kernel::interpret_from(ppc::Context &c, uint32_t pc, uint32_t until, uint32
         unwinds_thrown++;
         throw ppc::Unwind{s.pc};
     }
-    if (s.reason != ppc::Stopped::Returned && !stopped.exchange(true)) {
+    if (s.reason != ppc::Stopped::Returned && !stopped) {
         char reason[128];
         std::snprintf(reason, sizeof(reason), "the interpreter stopped at 0x%08X: %s", s.pc,
                       s.reason == ppc::Stopped::Invalid ? "an invalid instruction"
                       : s.reason == ppc::Stopped::Steps ? "the step limit"
                                                         : (std::string(ppc::info(s.op).name) + " has no semantics").c_str());
-        stop_reason = reason;
+        stop(reason);
     }
 }
 
 void Kernel::call(ppc::Context &c, uint32_t address) {
+    // guest code from here (a thread's start, a callback the kernel makes)
+    GuestCodeScope running(*this, true);
     c.lr = SENTINEL;
     uint32_t target;
     try {
@@ -598,6 +850,50 @@ void Kernel::call(ppc::Context &c, uint32_t address) {
     }
 }
 
+void Kernel::stop(const std::string &reason) {
+    if (stopped.exchange(true)) return;
+    stop_reason = reason;
+    CrashReport report = make_crash_report(*this, reason);
+    stop_report = std::move(report.text), stop_stack = std::move(report.stack);
+}
+
+bool Kernel::guest_function(uint32_t address, const char *&module, uint32_t &start) const {
+    // the last function starting at or before address, if within 64 KB
+    auto find = [&](const Generated *f, size_t n, uint32_t &found) {
+        const Generated *end = f + n;
+        const Generated *it = std::upper_bound(f, end, address,
+                                               [](uint32_t a, const Generated &g) { return a < g.address; });
+        if (it == f || address - (it - 1)->address >= 0x10000) return false;
+        return found = (it - 1)->address, true;
+    };
+    if (const CodeMap *map = code_map_.load(std::memory_order_acquire))
+        for (const CodeMap::Range &r : map->ranges) {
+            const ppc::GeneratedModule *m = r.module;
+            if (address - m->base >= m->size) continue;
+            module = m->name;
+            return find(m->functions, m->count, start);
+        }
+    module = nullptr;
+    return generated_count_ && find(generated_, generated_count_, start);
+}
+
+bool Kernel::guest_function_of_host(const void *host, uint32_t &start) const {
+    const uintptr_t at = uintptr_t(host);
+    uintptr_t best = 0;
+    uint32_t found = 0;
+    auto scan = [&](const Generated *f, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            uintptr_t p = uintptr_t(f[i].fn);
+            if (p && p <= at && p > best) best = p, found = f[i].address;
+        }
+    };
+    scan(generated_, generated_count_);
+    if (const CodeMap *map = code_map_.load(std::memory_order_acquire))
+        for (const CodeMap::Range &r : map->ranges) scan(r.module->functions, r.module->count);
+    if (!best || at - best >= 0x10000) return false;
+    return start = found, true;
+}
+
 std::map<std::string, uint64_t> Kernel::calls() const {
     std::lock_guard<std::mutex> lock(counts_mutex_);
     return calls_;
@@ -606,6 +902,14 @@ std::map<std::string, uint64_t> Kernel::unimplemented() const {
     std::lock_guard<std::mutex> lock(counts_mutex_);
     return unimplemented_;
 }
+void Kernel::entered(uint32_t address) {
+    {
+        std::lock_guard<std::mutex> lock(counts_mutex_);
+        if (!entries_seen_.emplace(address, true).second) return;
+    }
+    entry_hook_(entry_hook_user_, address);
+}
+
 std::unordered_map<uint32_t, uint64_t> Kernel::interpreted_targets() const {
     std::lock_guard<std::mutex> lock(counts_mutex_);
     return interpreted_targets_;
@@ -620,7 +924,7 @@ void invalid(Context &c, uint32_t pc) {
     auto &k = *static_cast<kernel::Kernel *>(c.system->owner);
     char reason[64];
     std::snprintf(reason, sizeof(reason), "an invalid instruction at 0x%08X", pc);
-    if (!k.stopped.exchange(true)) k.stop_reason = reason;
+    k.stop(reason);
 }
 [[noreturn]] void unwind(Context &c) {
     static_cast<kernel::Kernel *>(c.system->owner)->unwinds_thrown++;

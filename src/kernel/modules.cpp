@@ -200,21 +200,31 @@ struct Module {
 // The loader lock (NT's LdrpLoaderLock, a critical section): recursive,
 // owned by a host thread (a guest thread's, or a host caller's). Held across
 // guest code (the DllMains), so a guest thread waiting for it waits on the
-// host, outside the guest's waits; the report names its owner.
+// host, outside the guest's waits; the report names its owner. In the
+// deterministic mode every guest thread is a fiber on one host thread: the
+// owner is the guest thread, and a waiter yields to the others instead.
 class LoaderLock {
   public:
     void lock() {
         std::unique_lock l(mutex_);
         std::thread::id self = std::this_thread::get_id();
-        if (depth_ && owner_ == self) {
+        Thread *t = current_thread();
+        if (depth_ && owner_ == self && owner_guest_ == t) {
             depth_++;
             return;
         }
         waiting_++;
-        released_.wait(l, [&] { return depth_ == 0; });
+        if (t && t->owner.scheduler->deterministic()) {
+            while (depth_ != 0) {
+                l.unlock();
+                t->owner.scheduler->yield();
+                l.lock();
+            }
+        } else {
+            released_.wait(l, [&] { return depth_ == 0; });
+        }
         waiting_--;
-        owner_ = self, depth_ = 1;
-        Thread *t = current_thread();
+        owner_ = self, owner_guest_ = t, depth_ = 1;
         owner_thread_ = t ? int64_t(t->id) : -1;
     }
     void unlock() {
@@ -236,6 +246,7 @@ class LoaderLock {
     std::mutex mutex_;
     std::condition_variable released_;
     std::thread::id owner_;
+    Thread *owner_guest_ = nullptr;
     uint32_t depth_ = 0, waiting_ = 0;
     int64_t owner_thread_ = -1;
 };
@@ -1255,6 +1266,19 @@ std::string module_at(Kernel &k, uint32_t address) {
         if (address - m->base_address < m->image_size)
             return m->path.empty() ? m->name : std::string(name_from_path(m->path));
     return {};
+}
+
+bool module_at_try(Kernel &k, uint32_t address, std::string &name, uint32_t &base) {
+    Modules &s = k.state<Modules>();
+    std::unique_lock lock(s.mutex, std::try_to_lock);
+    if (!lock) return false;
+    for (auto &m : s.user_modules)
+        if (address - m->base_address < m->image_size) {
+            name = m->path.empty() ? m->name : std::string(name_from_path(m->path));
+            base = m->base_address;
+            return true;
+        }
+    return false;
 }
 
 bool module_range(Kernel &k, uint32_t address, uint32_t &base, uint32_t &size) {

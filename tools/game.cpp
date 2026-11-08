@@ -3,9 +3,14 @@
 #include "game.h"
 
 #include "xenoforge/command_processor.h"
+#include "xenoforge/crash.h"
 #include "xenoforge/disc.h"
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
+#include "xenoforge/hooks.h"
+#include "xenoforge/lockstep.h"
+#include "xenoforge/native_render.h"
+#include "xenoforge/shader_storage.h"
 
 #include <algorithm>
 #include <cctype>
@@ -25,12 +30,6 @@
 #include <psapi.h>
 #else
 #include <unistd.h>
-#endif
-
-#ifdef XF_GENERATED
-// the game library's tables, one per module (xfrecomp emit's modules.cpp)
-extern "C" const xf::ppc::GeneratedModule *const xf_modules[];
-extern "C" const size_t xf_module_count;
 #endif
 
 namespace xf::game {
@@ -55,25 +54,20 @@ bool load(const std::string &input, const std::string &xex_path, Xex &xex, std::
     return parse_xex(file, xex, error) && load_xex_image(file, xex, error);
 }
 
-#ifdef _WIN32
-// An access fault in the guest's code: where, in guest terms, then the report.
-LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
-    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
-    uint64_t at = e->ExceptionRecord->ExceptionInformation[1];
-    uint64_t offset = the_game ? at - uint64_t(the_game->memory->base()) : ~0ull;
-    std::printf("fault: %s host 0x%llX", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
-                (unsigned long long)at);
-    if (offset < (1ull << 33)) std::printf(" (guest 0x%08llX)", (unsigned long long)offset);
-    // the faulting thread's own context (the handler runs on it)
-    if (ppc::Context *c = kernel::Kernel::current_context())
-        std::printf(", its guest thread last at 0x%08X, lr 0x%08X", c->pc, uint32_t(c->lr));
-    std::printf("\n");
+std::filesystem::path crash_directory = ".";
+
+// What boot and the player do after the kernel's crash handler wrote the
+// report (kernel/crash.h): print it, the run's report, and the summary.
+void on_crash(kernel::Kernel &, kernel::CrashReport &report, void *) {
+    std::printf("fault: %s\n%s", report.what.c_str(), report.text.c_str());
+    if (!report.file.empty()) std::printf("crash report written to %s\n", report.file.string().c_str());
     // the renderer's report only if no call of its is under way (this may be its thread)
-    if (the_game) print_report(*the_game, false);
+    if (the_game) {
+        print_report(*the_game, false);
+        print_summary(*the_game, "crash", report.what, report.stack, report.file.string());
+    }
     std::fflush(stdout);
-    ExitProcess(3);
 }
-#endif
 
 // the renderer's counts: draws drawn and skipped by reason, what is
 // approximate, resolves, swaps, the time it took
@@ -81,6 +75,15 @@ void print_renderer_report(const render::Report &r) {
     std::printf("renderer: %llu draws (%llu drawn), %llu resolves, %llu swaps (%llu front buffers written)\n",
                 (unsigned long long)r.draws, (unsigned long long)r.drawn, (unsigned long long)r.resolves,
                 (unsigned long long)r.swaps, (unsigned long long)r.frames);
+    // a port's own frames (native_render.h), when it drew or yielded any
+    if (const native::Counters n = native::counters(); n.frames_native || n.frames_yielded)
+        std::printf("renderer: the port drew %llu frames, yielded %llu (%llu held); skipped %llu draws and %llu "
+                    "resolves, kept %llu and %llu by its filter, %llu exporting memory; %llu occlusion reports faked\n",
+                    (unsigned long long)n.frames_native, (unsigned long long)n.frames_yielded,
+                    (unsigned long long)n.frames_held, (unsigned long long)n.draws_skipped,
+                    (unsigned long long)n.resolves_skipped, (unsigned long long)n.draws_kept,
+                    (unsigned long long)n.resolves_kept, (unsigned long long)n.memexport_kept,
+                    (unsigned long long)n.occlusion_faked);
     std::printf("renderer: %.1f s spent: %.1f s in submissions (%.1f s waiting for the GPU), %.1f s in resolves, "
                 "%.1f s checking textures, %.1f s decoding them, %.1f s on vertex data (%.1f MB uploaded), %.1f s "
                 "copying %.1f MB that resolves wrote into memory\n",
@@ -104,6 +107,10 @@ void print_renderer_report(const render::Report &r) {
         (unsigned long long)r.textures_evicted_for_room, (unsigned long long)r.textures_refused);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
                 r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
+    std::printf("renderer: shader storage: %llu shaders and %llu pipelines added; made at once as the build step made "
+                "them: %llu pipelines, %llu libraries\n",
+                (unsigned long long)r.shaders_stored, (unsigned long long)r.pipelines_stored,
+                (unsigned long long)r.pipelines_prebuilt, (unsigned long long)r.pipeline_libraries_prebuilt);
     std::printf(
         "renderer: %llu pipeline libraries, %llu pipelines linked, %llu placeholders, %llu draws by a stand-in; "
         "hitches: %llu frames with more than 4 ms making pipelines (at most %.1f ms), %llu swaps more than 50 ms "
@@ -144,7 +151,6 @@ void print_renderer_report(const render::Report &r) {
     for (const auto &[what, n] : r.used) std::printf("  uses    %8llu  %s\n", (unsigned long long)n, what.c_str());
 }
 
-#ifndef XF_GENERATED
 // The game library the recompile step cached for this executable (or the one
 // named), its modules given to the kernel as a linked game's are; with none,
 // or one that does not load, the game is interpreted.
@@ -171,20 +177,53 @@ void load_game_library(const Options &options, Game &g) {
     size_t functions = 0;
     for (size_t i = 0; i < loaded->count; i++) functions += loaded->modules[i]->count;
     g.kernel->set_generated_modules(loaded->modules, loaded->count);
+    g.generated_modules = loaded->count, g.generated_functions = functions;
     std::printf("generated code: %zu modules, %zu functions (the game library %s)\n", loaded->count, functions,
                 library.string().c_str());
+    // what discovery missed, logged beside the library for its next build
+    // (D3): the first entry into the interpreter at each address
+    const std::filesystem::path log = build::entry_log_path(library.parent_path(), digest);
+    if (g.entry_log.open(log)) {
+        g.kernel->set_entry_hook(&build::EntryLog::hook, &g.entry_log);
+        std::printf("entry log: %s (%zu addresses)\n", log.string().c_str(), g.entry_log.size());
+    }
 }
-#endif
 
 } // namespace
 
 bool open(const Options &options, Game &g, std::string &error) {
     const std::string &input = options.input;
     if (!load(input, options.xex_path, g.xex, error)) return false;
+    g.cache = options.cache.empty() ? build::default_cache_dir() : options.cache;
     g.memory = Memory::create(error);
     if (!g.memory) return error = "memory: " + error, false;
     g.kernel = std::make_unique<kernel::Kernel>(*g.memory);
     kernel::Kernel &k = *g.kernel;
+    // the deterministic mode and input recordings, before anything runs
+    int deterministic = options.deterministic;
+    if (const char *d = std::getenv("XF_DETERMINISTIC"); !deterministic && d && *d && *d != '0')
+        deterministic = std::strcmp(d, "paced") == 0 ? 2 : 1;
+    if (deterministic) {
+        kernel::Deterministic d;
+        d.paced = deterministic == 2;
+        if (const char *ms = std::getenv("XF_DETERMINISTIC_FORCE_MS"); ms && *ms)
+            d.force_after_ms = uint32_t(std::strtoul(ms, nullptr, 10));
+        if (options.halt_swap || options.halt_seconds > 0) {
+            kernel::Kernel *kp = &k;
+            uint64_t swap = options.halt_swap, clock = uint64_t(options.halt_seconds * 1e7);
+            d.halt = [kp, swap, clock] {
+                return (swap && kernel::gpu_command_processor(*kp).counts().swaps.load() >= swap) ||
+                       (clock && kp->interrupt_time() >= clock);
+            };
+        }
+        k.make_deterministic(d);
+        std::printf("deterministic mode (%s)\n", d.paced ? "paced" : "as fast as the host goes");
+    }
+    std::filesystem::path record = options.record_input, replay = options.replay_input;
+    if (const char *r = std::getenv("XF_INPUT_RECORD"); record.empty() && r && *r) record = r;
+    if (const char *r = std::getenv("XF_INPUT_REPLAY"); replay.empty() && r && *r) replay = r;
+    if (!replay.empty() && !kernel::replay_input(k, replay, error)) return error = "input: " + error, false;
+    if (!record.empty() && !kernel::record_input(k, record, error)) return error = "input: " + error, false;
     bool bare = input.ends_with(".xex") || input.ends_with(".XEX");
     bool mounted = bare ? kernel::mount_directory(k, std::filesystem::path(input).parent_path(), error)
                         : kernel::mount_disc(k, input, error);
@@ -193,23 +232,39 @@ bool open(const Options &options, Game &g, std::string &error) {
     // its module's path, which the DLLs it loads by a bare name are next to
     kernel::set_executable_path(k, "game:\\" +
                                        (bare ? std::filesystem::path(input).filename().string() : options.xex_path));
-#ifdef XF_GENERATED
-    // each module's code runs once an image it was made from is loaded
-    // (the executable's in load(), a DLL's as XexLoadImage loads it)
-    size_t functions = 0;
-    for (size_t i = 0; i < xf_module_count; i++) functions += xf_modules[i]->count;
-    if (!options.interpret) k.set_generated_modules(xf_modules, xf_module_count);
-    std::printf("generated code: %zu modules, %zu functions%s\n", size_t(xf_module_count), functions,
-                options.interpret ? " (left out: --interpret)" : "");
-#else
-    if (!options.interpret) load_game_library(options, g);
-#endif
+    if (options.module_count) {
+        // generated code linked in: each module's code runs once an image it was
+        // made from is loaded (the executable's in load(), a DLL's as XexLoadImage loads it)
+        size_t functions = 0;
+        for (size_t i = 0; i < options.module_count; i++) functions += options.modules[i]->count;
+        if (!options.interpret) k.set_generated_modules(options.modules, options.module_count);
+        if (!options.interpret) g.generated_modules = options.module_count, g.generated_functions = functions;
+        std::printf("generated code: %zu modules, %zu functions%s\n", options.module_count, functions,
+                    options.interpret ? " (left out: --interpret)" : "");
+    } else if (!options.interpret) {
+        load_game_library(options, g);
+    }
     if (!k.load(g.xex, error)) return error = "load: " + error, false;
     k.step_limit = options.steps;
+    {
+        kernel::LockstepOptions lockstep;
+        lockstep.functions = options.lockstep, lockstep.sample = options.lockstep_sample;
+        std::string why;
+        bool wanted =
+            !lockstep.functions.empty() || lockstep.sample || kernel::lockstep_options_from_env(lockstep, why);
+        if (!why.empty()) return error = why, false;
+        if (wanted && g.generated_functions) {
+            if (!k.enable_lockstep(lockstep, error)) return error = "lockstep: " + error, false;
+            std::printf("lockstep: %zu functions chosen, one call in %u sampled\n", lockstep.functions.size(),
+                        lockstep.sample);
+        } else if (wanted) {
+            std::printf("lockstep: no generated code to check\n");
+        }
+    }
     std::printf("loaded %s: base 0x%08X, entry 0x%08X, %zu imported functions\n", options.xex_path.c_str(),
                 g.xex.base_address, k.entry_point(), k.imports().size());
     // a DLL's entry point is its DllMain, which returns at once: another
-    // executable loads it (BC2's Game.xex and Splash.xex, which its
+    // executable loads it (a launcher's game and splash DLLs, which its
     // default.xex loads one after the other and calls by their export)
     if (g.xex.module_flags & 0x8)
         std::printf("note: %s is a DLL (module flags 0x%X, %s): run as the executable, its DllMain returns at once; "
@@ -228,18 +283,19 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     if (!g.device) g.device = vk::Device::open(error);
     if (!g.device) return error = "Vulkan: " + error, false;
     gpu::CommandProcessor &processor = kernel::gpu_command_processor(*g.kernel);
-    // the game's pipeline cache: a temporary directory's xenoforge-cache
-    // unless the caller names one (the player: beside its config.toml)
+    // the game's pipeline cache and shader and pipeline storage, beside its
+    // game library in the cache (<title id>.vkpipelines, .xfshaders), where
+    // the launcher's build step makes the pipelines earlier runs met
+    // (render::precompile), unless the caller names them
     render::Options o = options;
-    if (o.pipeline_cache.empty()) {
-        std::error_code ec;
-        char name[32];
-        std::snprintf(name, sizeof(name), "%08X.vkpipelines", g.xex.execution.title_id);
-        o.pipeline_cache = std::filesystem::temp_directory_path(ec) / "xenoforge-cache" / name;
-    }
+    const uint32_t title = g.xex.execution.title_id;
+    if (o.pipeline_cache.empty()) o.pipeline_cache = ShaderStorage::pipeline_cache_path(g.cache, title);
+    if (o.shader_storage.empty()) o.shader_storage = ShaderStorage::path(g.cache, title);
     // XF_PIPELINE_CACHE=<file>: the pipeline cache elsewhere (an empty one
-    // for a cold start)
+    // for a cold start); XF_SHADER_STORAGE=<file>, or =none for no storage
     if (const char *cache = std::getenv("XF_PIPELINE_CACHE")) o.pipeline_cache = cache;
+    if (const char *storage = std::getenv("XF_SHADER_STORAGE"))
+        o.shader_storage = std::string(storage) == "none" ? std::filesystem::path() : std::filesystem::path(storage);
     // XF_PIPELINES=wait|skip|placeholder|library: each pipeline waited for
     // (boot's default), or made on worker threads with the draws meanwhile
     // skipped, drawn by a placeholder or by a linked pipeline (renderer.h,
@@ -311,15 +367,55 @@ bool start_trace(Game &g, const std::set<uint64_t> &frames, const std::filesyste
 
 bool launch(Game &g, std::string &error) {
     the_game = &g;
-#ifdef _WIN32
-    AddVectoredExceptionHandler(1, on_fault);
-#endif
+    // before any write watch, so memory's fault handler comes first in the chain
+    if (const char *dir = std::getenv("XF_CRASH_DIR")) crash_directory = dir;
+    kernel::install_crash_handler(*g.kernel, crash_directory, on_crash, nullptr);
     return g.kernel->launch(error);
+}
+
+bool load_port_module(Game &g, const std::filesystem::path &path, std::string &error) {
+    std::filesystem::path file = path;
+    if (!file.has_parent_path()) {
+        // beside the executable
+#ifdef _WIN32
+        wchar_t self[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, self, MAX_PATH);
+        if (n && n < MAX_PATH) file = std::filesystem::path(self).parent_path() / path;
+#else
+        std::error_code ec;
+        const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (!ec) file = self.parent_path() / path;
+#endif
+    }
+    auto m = std::make_unique<kernel::PortModule>();
+    if (!m->load(file, error)) return false;
+    std::printf("port: hooks from %s (reloaded when it changes)\n", file.string().c_str());
+    g.port_module = std::move(m);
+    return true;
+}
+
+bool poll_port_module(Game &g, bool force) {
+    if (!g.port_module) return false;
+    if (!force && !g.port_module->changed()) {
+        g.port_module->collect();
+        return false;
+    }
+    std::string error, line;
+    if (!g.port_module->reload(*g.kernel, error, &line)) {
+        std::fprintf(stderr, "port: not reloaded: %s\n", error.c_str());
+        return false;
+    }
+    std::printf("%s", line.c_str());
+    std::fflush(stdout);
+    return true;
 }
 
 void print_report(Game &g, bool waiting) {
     kernel::Kernel &k = *g.kernel;
     std::printf("%s", kernel::modules_report(k).c_str());
+    if (k.lockstep_enabled()) std::printf("%s", k.lockstep_report().c_str());
+    if (hooks::stats_on()) std::printf("%s", hooks::stats_report().c_str());
+    if (g.port_module) std::printf("port module: %u reloads\n", g.port_module->reloads());
     // where the interpreter was entered: with generated code, what
     // discovery missed (the most entered first)
     auto targets = k.interpreted_targets();
@@ -328,6 +424,8 @@ void print_report(Game &g, bool waiting) {
     std::sort(entered.rbegin(), entered.rend());
     std::printf("interpreted entries: %llu, at %zu addresses\n", (unsigned long long)k.interpreted_entries(),
                 entered.size());
+    if (g.entry_log.size())
+        std::printf("entry log: %zu addresses, %zu new this run\n", g.entry_log.size(), g.entry_log.added());
     for (size_t i = 0; i < entered.size() && i < 20; i++)
         std::printf("  %10llu  0x%08X  %s\n", (unsigned long long)entered[i].first, entered[i].second,
                     kernel::module_at(k, entered[i].second).c_str());
@@ -400,6 +498,85 @@ uint64_t resident_bytes() {
 #endif
 }
 
+namespace {
+// a JSON string's body
+std::string json_escape(const std::string &text) {
+    std::string out;
+    for (unsigned char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += char(c);
+        } else if (c < 0x20 || c == 0x7F) {
+            char hex[8];
+            std::snprintf(hex, sizeof(hex), "\\u%04x", c);
+            out += hex;
+        } else
+            out += char(c);
+    }
+    return out;
+}
+} // namespace
+
+void set_crash_directory(const std::filesystem::path &directory) { crash_directory = directory; }
+
+std::string write_stop_report(Game &g) {
+    kernel::Kernel &k = *g.kernel;
+    if (k.stop_report.empty()) return {};
+    kernel::CrashReport report;
+    report.text = k.stop_report;
+    kernel::write_crash_report(report, crash_directory);
+    std::printf("%s", report.text.c_str());
+    if (!report.file.empty()) std::printf("crash report written to %s\n", report.file.string().c_str());
+    return report.file.string();
+}
+
+void print_summary(Game &g, const std::string &state, const std::string &detail, const std::string &stack,
+                   const std::string &report_file) {
+    kernel::Kernel &k = *g.kernel;
+    char text[256];
+    std::string out = "xf-summary {";
+    std::snprintf(text, sizeof(text), "\"title_id\":\"%08X\",\"digest\":\"%016llx\",", g.xex.execution.title_id,
+                  (unsigned long long)image_digest(g.xex.image));
+    out += text;
+    out += "\"state\":\"" + json_escape(state) + "\",\"detail\":\"" + json_escape(detail) + "\",";
+    out += "\"stack\":\"" + json_escape(stack) + "\",\"report\":\"" + json_escape(report_file) + "\",";
+    std::snprintf(text, sizeof(text),
+                  "\"modules\":%zu,\"functions\":%zu,\"interpreted_entries\":%llu,\"interpreted_addresses\":%zu,"
+                  "\"swaps\":%llu,\"draws\":%llu,",
+                  g.generated_modules, g.generated_functions, (unsigned long long)k.interpreted_entries(),
+                  k.interpreted_targets().size(),
+                  (unsigned long long)kernel::gpu_command_processor(k).counts().swaps.load(),
+                  (unsigned long long)kernel::gpu_command_processor(k).counts().draws.load());
+    out += text;
+    // the exports called without an implementation, the most called first
+    std::vector<std::pair<uint64_t, std::string>> missing;
+    auto absent = k.unimplemented();
+    for (const auto &[name, n] : k.calls())
+        if (absent.count(name)) missing.push_back({n, name});
+    std::sort(missing.rbegin(), missing.rend());
+    out += "\"unimplemented\":[";
+    for (size_t i = 0; i < missing.size() && i < 8; i++)
+        out += (i ? ",\"" : "\"") + json_escape(missing[i].second) + "\"";
+    out += "],\"gpu\":[";
+    // the GPU's gaps: draws skipped and done approximately, by what (the renderer's, when it runs)
+    size_t listed = 0;
+    render::Report r;
+    if (g.renderer && g.renderer->try_report(r)) {
+        auto list = [&](const char *kind, const std::map<std::string, uint64_t> &counts) {
+            std::vector<std::pair<uint64_t, std::string>> by;
+            for (const auto &[what, n] : counts) by.push_back({n, what});
+            std::sort(by.rbegin(), by.rend());
+            for (size_t i = 0; i < by.size() && i < 4; i++, listed++)
+                out += std::string(listed ? ",\"" : "\"") + kind + ": " + json_escape(by[i].second) + "\"";
+        };
+        list("skipped", r.skipped);
+        list("approx", r.approximate);
+    }
+    out += "]}";
+    std::printf("%s\n", out.c_str());
+    std::fflush(stdout);
+}
+
 void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
     const gpu::Counts &counts = kernel::gpu_command_processor(*g.kernel).counts();
     const uint64_t swaps = counts.swaps.load(), draws = counts.draws.load(), resolves = counts.resolves.load();
@@ -426,11 +603,13 @@ void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
         auto waiting = report.skipped.find("pipeline not ready (being made)");
         std::snprintf(renderer, sizeof(renderer),
                       ", renderer busy %.0f%%, textures %llu (%.0f MB, %.0f loads/s), pipelines %llu (%llu draws "
-                      "skipped, %llu by a stand-in)",
+                      "skipped, %llu by a stand-in; %llu libraries, %llu and %llu as built)",
                       busy * 100, (unsigned long long)report.textures_held, double(report.texture_bytes) / (1 << 20),
                       loads, (unsigned long long)report.pipelines,
                       (unsigned long long)(waiting == report.skipped.end() ? 0 : waiting->second),
-                      (unsigned long long)report.stand_in_draws);
+                      (unsigned long long)report.stand_in_draws, (unsigned long long)report.pipeline_libraries,
+                      (unsigned long long)report.pipelines_prebuilt,
+                      (unsigned long long)report.pipeline_libraries_prebuilt);
     }
     char resident[96] = "";
     if (uint64_t bytes = resident_bytes())

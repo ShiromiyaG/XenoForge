@@ -64,10 +64,14 @@ interlock" below; host render targets elsewhere, as Xenia's default).
   directory's `xenoforge-cache`, the player's in a `cache` folder beside
   its config.toml), read when the renderer is made, given to every
   pipeline, written once 300 swaps pass without a new pipeline and at
-  `drain()`. El Chavo Kart's title screen makes about 24 pipelines in its
+  `drain()`. Game A's title screen makes about 24 pipelines in its
   first frame: 0.2 s on an idle CPU (2.5 s once with every core busy), 0.03
   s from the cache. The report counts the time spent making pipelines.
-  The shader cache and the compile on a worker thread are not built.
+  Since 2026-11-07 the pipeline cache lives beside the game library in the
+  launcher's cache (`<cache>/<title id>.vkpipelines`, boot's and the
+  player's alike), with the title's shader and pipeline storage
+  (`<title id>.xfshaders`), and the build step makes what earlier runs met
+  ("Shaders and pipelines at the launcher's build step").
 - A shader seen for the first time is drawn by a **generic pipeline while the
   translated one compiles on a worker thread**: an interpreter of Xenos
   microcode written as a SPIR-V vertex and pixel shader, reading the program
@@ -185,7 +189,7 @@ agree on the shared memory):
   when it reads the packet, before the GPU has run the export, so the CPU
   goes on and may write the stream's memory again before a late copy lands
   over it. A first form did copy the changed bytes back (as
-  `readback_memexport` would, without its wait); in its run El Chavo
+  `readback_memexport` would, without its wait); in its run game A
   Kart's race loading screen lasted about 3,000 swaps (two and a half
   minutes), where the runs before and after it took 200 to 300.
 - A draw that rasterizes nothing (it writes no target, or the vertex
@@ -252,7 +256,7 @@ case by case, and they agree, the traces' shaders included (`XF_SHADERS`).
 
 Version 2 adds the dispatcher (loops, calls, jumps), cube maps,
 getGradients and the LOD and gradient setters; the corpus is the traces'
-shaders, the UE3 global shader cache of El Chavo Kart's data and HLSL
+shaders, the UE3 global shader cache of game A's data and HLSL
 compiled by Microsoft's Xbox 360 compiler (`tests/hlsl/`, `tools/xna/`),
 each with the literal constants its container defines.
 
@@ -342,9 +346,9 @@ at each draw.
 
 Against Xenia's trace dumps (`replay_test` with `XF_TRACES` and
 `XF_DUMPS`): all eleven frames of the two games within 0.005 of 255 on
-average (Ben 10's within 0.001 since the rounding epsilon), no pixel off by
-more than 16: El Chavo Kart's video (three planes) and its title screen,
-Ben 10's intro, and Ben 10's title, drawn in two predicated tiles of a 2x
+average (game B's within 0.001 since the rounding epsilon), no pixel off by
+more than 16: Game A's video (three planes) and its title screen,
+Game B's intro, and game B's title, drawn in two predicated tiles of a 2x
 MSAA target that the game clears by drawing into the same samples seen as a
 640 4x target.
 
@@ -376,7 +380,7 @@ drew with its own front end, and match Xenia's as before.
 Live, against Xenia's dumps of the traces' frames (the games' intros with
 no input):
 
-- **El Chavo Kart**: all four frames are drawn exactly (mean 0.003 to
+- **game A**: all four frames are drawn exactly (mean 0.003 to
   0.005 of 255, no pixel off by more than 16), at other swaps: Xenia's 300
   and 301 (the Unreal Engine logo) by swaps 289 and 290 of one run (286 for
   301 in another), its 900 (the intro movie's beach) by swap 604, its 1800
@@ -384,21 +388,21 @@ no input):
   interpreted game swaps about 7 to 10 times a second where Xenia swaps up
   to 60, so a movie frame comes at a lower swap, and not at the same one
   from run to run; boot's run reaches the title screen by swap 1800.
-- **Ben 10**: XAM reports no controller, where Xenia's default input (its
+- **game B**: XAM reports no controller, where Xenia's default input (its
   keyboard driver) answers for user 0; the game pauses on "Controller Lost
   Connection" from about swap 100, which the renderer draws, so its frames
   are not Xenia's. With user 0 answered as Xenia's keyboard driver answers
   (an experiment, not kept), the intro plays (the Cartoon Network logo) and
   then stops swapping before Xenia's frame 600, headless as well as
   rendered (at 506 and 345 swaps): what it waits for next is not in the
-  kernel yet (sound, most likely). Ben 10's six traces replay through the
+  kernel yet (sound, most likely). Game B's six traces replay through the
   same Sink and match. (Later the same day boot answered from an idle pad
   for user 0, [input.md](input.md), and with the generated code the game
   plays on past the Cartoon Network logo to Papaya's, past swap 700.)
 
-El Chavo Kart's title screen ("Press START" over clouds, from about swap
+Game A's title screen ("Press START" over clouds, from about swap
 1800 live, Xenia's frame 2400 and later) came out in red alone. Its trace
-(`475807D7_2400`, in the regression) showed why: the menu's frame moves
+(`A_2400`, in the regression) showed why: the menu's frame moves
 its 8_8_8_8 target's tiles through a D24FS8 depth target and back (its
 depth-only draws take EDRAM whole), and the depth, kept as 0-2 in the
 host's 0-1 depth, was clamped to 1: the 24 bits above the stencil byte
@@ -422,7 +426,7 @@ exactly). A 600 s live run (6,398 swaps, the title from swap 2100 on)
 issued 1,258,016 draws, 198,176 of them drawn and the rest writing
 nothing, and skipped none. What the live runs still ask for and the
 renderer does not do: D24FS8 depth kept as 32-bit float (Xenia's default
-too), Ben 10's texture slots without a texture constant. On the title the
+too), game B's texture slots without a texture constant. On the title the
 renderer is the bottleneck: 590 s of the 600 busy, 442 s of them in its
 fifteen resolves a frame, read back and tiled by the CPU (B4). Its "Press
 START" pulse shows one phase at every hundredth swap from 2100 to 6300,
@@ -430,9 +434,9 @@ not the phase of Xenia's frame 2400 nor that of its 3000 and 3600: the
 pulse is the game's (its clock or its frame count), not the renderer's.
 
 The cost, before B4 (runs of the same length back to back, other work
-sharing the machine): El Chavo Kart is bound by the interpreter, and rendering on the
+sharing the machine): Game A is bound by the interpreter, and rendering on the
 processor's thread costs it nothing measurable (747 swaps in 90 s headless,
-742 rendered; the renderer busy 24 s of the 90). Ben 10 is bound by the
+742 rendered; the renderer busy 24 s of the 90). Game B is bound by the
 renderer: 59.4 swaps a second headless (vblank's pace), 18.4 rendered, the
 renderer busy 39 s of the 45 after the first swap, 30 s of them in its
 three resolves a frame (12 ms each) and most of the rest in its 72 draws a
@@ -452,32 +456,32 @@ last 5 s:
 
 | | before (648464d) | after |
 | --- | --- | --- |
-| Ben 10, 45 s headless | 60.0, 60.0 | 40.9, 60.0 |
-| Ben 10, 45 s rendered | 14.7, 19.4 | 43.2, 60.0 |
+| Game B, 45 s headless | 60.0, 60.0 | 40.9, 60.0 |
+| Game B, 45 s rendered | 14.7, 19.4 | 43.2, 60.0 |
 | renderer busy | 41.3 s (25.9 resolves, 19.6 submissions) | 2.3 s |
-| El Chavo Kart, 150 s headless | 22.3, 30.0 (3,353 swaps) | 29.9, 29.9 (4,590) |
-| El Chavo Kart, 150 s rendered | 17.0, 8.0 on the title (2,566) | 30.0, 30.0 on the title (4,504) |
+| Game A, 150 s headless | 22.3, 30.0 (3,353 swaps) | 29.9, 29.9 (4,590) |
+| Game A, 150 s rendered | 17.0, 8.0 on the title (2,566) | 30.0, 30.0 on the title (4,504) |
 | renderer busy | 146.6 s (90.1 resolves, 37.1 submissions, 25.3 decoding textures) | 11.5 s |
 
-(Ben 10's whole-run rate fell headless as well: since the player's merge
+(game B's whole-run rate fell headless as well: since the player's merge
 boot answers an idle pad, and the game plays past its logo into scenes
-that pace themselves; both runs end at 60.) After, El Chavo Kart's 11.5 s
+that pace themselves; both runs end at 60.) After, game A's 11.5 s
 are 3.9 s copying vertex data (103 GB: the fetch constants' whole ranges,
 about 1 MB a draw), 1.8 s recording resolves, 1.3 s checking textures, 1.1
 s decoding them (the intro movie's three planes a frame, written by the
 CPU), 1.1 s copying what resolves wrote into guest memory (16 GB), 0.4 s
 submitting (0.1 s of it waiting for the GPU); 4,508 submissions and 4 waits
-in the run. Ben 10's 2.3 s: 0.7 s in resolves, 0.5 s checking textures,
+in the run. Game B's 2.3 s: 0.7 s in resolves, 0.5 s checking textures,
 0.4 s decoding, 0.4 s copying 6.9 GB back; 2 waits. On the title every
 texture reloaded in a frame (about 17) is a resolve's, loaded on the GPU.
 
 Live against Xenia's dumps (shots of every swap around each frame): El
-Chavo Kart's 300 at swap 290 (0.005 of 255, no pixel off by 16), its 900
+Game A's 300 at swap 290 (0.005 of 255, no pixel off by 16), its 900
 at swap 818 (0.003), 1800 at 1615 (0.004), its title (2400) at swap 2910
 (0.000, the "Press START" pulse in the same phase); its 301 lies between
 two of our swaps (the logo's fade runs on the clock, and Xenia swaps twice
 as often there: our 290 differs from Xenia's 301 by what Xenia's 300 does,
-5.08). Ben 10, now past its logo: 600 and 601 at swaps 574 and 575 (0.000),
+5.08). Game B, now past its logo: 600 and 601 at swaps 574 and 575 (0.000),
 1800 and 1801 at 1481 and 1482 (0.154 and 0.006); its 3600 (the title's
 glow in another phase) was not reached within 1.55. The eleven trace
 frames match as before. Vulkan's validation layer, on the trace
@@ -492,7 +496,7 @@ resolution scale and the pipeline cache (B4's other half).
 
 ## GPU time (2026-11-06)
 
-El Chavo Kart and Ben 10 kept an RTX 5060 at 100% in their 3D scenes and
+Game A and game B kept an RTX 5060 at 100% in their 3D scenes and
 lost frames there. Measured, not assumed: `Options::gpu_timing` writes a
 timestamp wherever the kind of work being recorded changes (draws by render
 pass, EDRAM loads and stores by target, resolves, read-backs, texture loads,
@@ -512,7 +516,7 @@ Four causes, in the order found, each fixed as Xenia does it:
   constants, a variable index, and the driver's compiler then keeps the
   whole array (128 registers) in memory for every pixel shader, even those
   that never take the branch. Stored by constant indices now (a select per
-  interpolator): El Chavo Kart's FXAA pass went from 5.5 ms to 0.12 ms at
+  interpolator): Game A's FXAA pass went from 5.5 ms to 0.12 ms at
   1280x720. (Sizing the array to the registers the shader names, as
   Xenia's register_static_address_bound, changed nothing measurable once
   the indices were constant; not kept.)
@@ -535,7 +539,7 @@ Four causes, in the order found, each fixed as Xenia does it:
   (up to 1024 of them; Xenia has no limit).
 - **Resolves read back what later resolves overwrote.** Every resolve's
   bytes were copied to host memory for guest memory at once; the games
-  resolve to the same memory many times a frame (El Chavo Kart's
+  resolve to the same memory many times a frame (game A's
   post-processing chain goes through one texture's memory). The read-backs
   are recorded at the submission's end now, for what no later resolve wrote
   over (26 MB a race frame became 18 MB).
@@ -545,13 +549,13 @@ GPU time a frame, before (master's renderer with the timing added) and after,
 
 | trace | before | after |
 | --- | --- | --- |
-| El Chavo Kart, race (`xf_race`) | 55.5 ms | 8.9 ms |
+| Game A, race (`xf_race`) | 55.5 ms | 8.9 ms |
 | park behind "Press START" (`xf_park`) | 44.7 ms | 7.5 ms |
 | Cups menu (`xf_menu`) | 56.3 ms | 9.4 ms |
 | loading screen (`xf_loading`) | 6.5 ms | 1.3 ms |
 | title (2400) | 35.0 ms | 7.5 ms |
 | intro movie (1800) | 6.5 ms | 1.5 ms |
-| Ben 10, 600 / 1800 / 3600 | 21.2 / 43.1 / 43.1 ms | 2.7 / 3.0 / 3.0 ms |
+| Game B, 600 / 1800 / 3600 | 21.2 / 43.1 / 43.1 ms | 2.7 / 3.0 / 3.0 ms |
 
 The race after: read-backs 2.8 ms (18 MB over the bus), the 3D scene's draws
 1.0 ms, texture loads from the mirror 0.7 ms, resolves' copies 0.7 ms, the
@@ -566,18 +570,18 @@ GPU busy is `nvidia-smi`'s utilization, averaged over the phase):
 
 | | before | after |
 | --- | --- | --- |
-| Ben 10, its 3D scene (70-150 s) | 14.2 swaps/s, GPU busy 98.9% | 59.5 swaps/s (vblank), 58.5% |
-| Ben 10, 150 s: GPU time, renderer waiting for it | 146.8 s, 110.6 s | 29.7 s, 0.0 s |
-| El Chavo Kart, title (swaps 2100-3350) | 28.3 swaps/s, 97.6% | 29.4 swaps/s, 90.6% |
+| Game B, its 3D scene (70-150 s) | 14.2 swaps/s, GPU busy 98.9% | 59.5 swaps/s (vblank), 58.5% |
+| Game B, 150 s: GPU time, renderer waiting for it | 146.8 s, 110.6 s | 29.7 s, 0.0 s |
+| Game A, title (swaps 2100-3350) | 28.3 swaps/s, 97.6% | 29.4 swaps/s, 90.6% |
 | menus and the park (4000-6800) | 15.6 swaps/s, 94.6% | 23.9 swaps/s, 88.9% |
 | the race (7700 on) | 5.9 swaps/s, 88.9% | 15.1 swaps/s, 80.9% |
 | 500 s: GPU time, renderer waiting for it | 392.3 s, 245.6 s | 166.8 s, 0.1 s |
 
-The renderer no longer waits for the GPU; El Chavo Kart's race is bound by
+The renderer no longer waits for the GPU; game A's race is bound by
 the renderer's thread now (68.8 s checking textures by hash, 72.5 s
 comparing vertex data, of 342 s busy). `nvidia-smi` keeps reporting a busy
 GPU where the timestamps add up to far less: what it counts is mostly the
-read-backs, which live take 38% (El Chavo Kart) and 65% (Ben 10) of the
+read-backs, which live take 38% (game A) and 65% (game B) of the
 GPU's time and cross the bus at about 1.2 GB/s, five times slower than in
 a trace's replay (6.5 GB/s, the link's speed), for reasons not found yet
 (the link stays at PCIe 3.0; the read-back memory being cached or not made
@@ -680,11 +684,11 @@ Measured, the race trace (`xf_race`, `xfreplay --gpu-time --repeat 10`):
 | `fast`, `full` | | 10.0 ms, 9.9 ms a frame |
 
 The picture is byte for byte the same; the 17 frames of `replay_test` match
-as before, Ben 10's 3600 and 3601 and Sonic's title closer (0.001 to
+as before, game B's 3600 and 3601 and game H's title closer (0.001 to
 0.000, 0.007 to 0.000: their MSAA resolves).
 
-Live, El Chavo Kart (`boot_chaves --render --rates`, 600 s, the press
-script of "El Chavo Kart past the title" with the race's presses at
+Live, game A (`boot_<A> --render --rates`, 600 s, the press
+script of "game A past the title" with the race's presses at
 10000-10750, `XF_GPU_TIME=1`, other agents' builds sharing the machine):
 
 | | before | after |
@@ -702,10 +706,10 @@ time 90.3 s. The watches there: 1.43 million pages watched, 55,572 write
 faults (about 90 a second, 7-10 us each), 7.3 million pages numbered as
 written (most of them the XMA decoder's output and faults' widening). The
 title's shot matches Xenia's 2400 exactly (0.000), and the logo's 300 is
-in its fade's next phase (the clock's). Ben 10 plays at 49-60 swaps a
+in its fade's next phase (the clock's). Game B plays at 49-60 swaps a
 second, its watches taking 12,593 faults in 120 s.
 
-Red Dead Redemption's title (`5454082B_850` and `_950`): 10.7-10.9 of 255
+Game G's title (`G_850` and `_950`): 10.7-10.9 of 255
 off Xenia (15% of pixels) before, 9.21 and 9.29 (13.4% and 13.5%) with its
 MSAA resolves (4x MSAA depth resolved to 24_8 textures among them) done. The colored noise over its
 ground and buildings is left: they sample 4_4_4_4 textures with gamma
@@ -760,7 +764,7 @@ is refused only when the submission being recorded holds the whole table.
 Xenia's since: "The texture cache's key, its loads and the image pool"
 below.)
 
-Measured live, El Chavo Kart's 600 s race run (`boot_chaves --render
+Measured live, game A's 600 s race run (`boot_<A> --render
 --rates`, the press script above, `XF_GPU_TIME=1`, two other agents
 building): no load refused (33,165 before), 16,385 textures destroyed by
 the limits and none to make room, 304,950 loads. The cache reached the soft
@@ -784,7 +788,7 @@ gave the same pictures as one play.
 
 ## The texture cache's key, its loads and the image pool (2026-11-06)
 
-**Why El Chavo Kart loads about 500 textures a second.** The suspicion
+**Why game A loads about 500 textures a second.** The suspicion
 was the write watches: a fault widens to the 64 pages around (as Xenia's
 shared memory does) and would invalidate textures beside what the CPU
 wrote. Measured with a build that kept, by watch page, the last exact write
@@ -867,7 +871,7 @@ the device's memory allocations (`vk::Device::memory_counts`: live, most at
 once, made; the pool's blocks and images), and the loads a second and the
 allocations on the `--rates` line.
 
-Measured live, El Chavo Kart's 600 s race run (the press script of
+Measured live, game A's 600 s race run (the press script of
 "The texture cache's lifetime", the pipeline cache warm in both, other
 agents building on the machine; "before" is master with the loads a second
 counted):
@@ -882,7 +886,7 @@ counted):
 | resident memory | 998 MB at 180 s, 1,103 at 360 s, 1,177 at 600 s | 886, 1,016, 1,140 MB |
 
 A run with the key and the pool but before the buckets spent 9.4 s in
-resolves (20.4 before, 4.8 with the buckets). Ben 10 (120 s, no input):
+resolves (20.4 before, 4.8 with the buckets). Game B (120 s, no input):
 6,399 swaps before and 6,387 after (60 a second), 60 loads a second in both
 (one render to texture a frame), 47 textures in 17.7 MB before and 44 in
 13.5 MB after, 423 MB resident in both, 12 device memory allocations with
@@ -942,7 +946,7 @@ playing it in Xenia.
   EDRAM's snapshot out; `xfreplay --no-edram` does the same, for frames
   that read an earlier frame's EDRAM).
 
-**El Chavo Kart past the title** (traces in `../traces/xf_chaves`, Xenia's
+**Game A past the title** (traces in `../traces/xf_<A>`, Xenia's
 dumps in `../traces/xf_dumps`). Presses by swap reach everything the same
 way whatever the run's speed: `--press start@#3400` brings the main menu
 and its first-time dialog; A takes it to Challenges, whose loading screen
@@ -962,11 +966,11 @@ share of pixels off by more than 16):
 | race tip over the track (3 frames) | 64.0-88.5, 85-88% | 0.009-0.136, 0.02-0.13% |
 | race (5 frames) | 55.0-68.8, 72-86% | 0.010-0.140, 0.01-0.14% |
 
-Four of them are in the regression now (`../traces/chaves_xf`, Xenia's
-dumps as `../traces/dumps/475807D7_xf_*.png`): the Cups menu, a loading
+Four of them are in the regression now (`../traces/<A>_xf`, Xenia's
+dumps as `../traces/dumps/A_xf_*.png`): the Cups menu, a loading
 screen, the park and the race, all within 0.017 and 0.03%; with a frame
-each of Forza Horizon and Sonic Unleashed (below, `../traces/fh_xf` and
-`../traces/sonic_xf`) `replay_test` compares 17 frames. The loading
+each of game D and game H (below, `../traces/<D>_xf` and
+`../traces/<H>_xf`) `replay_test` compares 17 frames. The loading
 screens' top half is garbage in Xenia's picture as in ours (the game draws
 it so, or both read the same uninitialized memory).
 
@@ -1033,7 +1037,7 @@ come late).
 unless said; traces in `../traces/xf_<game>`, Xenia's dumps beside the
 others in `../traces/xf_dumps`):
 
-- **Forza Horizon** draws everything it sends; its front buffer is
+- **game D** draws everything it sends; its front buffer is
   2_10_10_10, shown through the display's piecewise linear gamma ramp
   (Xenia's apply_gamma_pwl: a component's 10 bits choose an entry by their
   top 7, base plus delta times the low 3 over 8), which was left out:
@@ -1041,14 +1045,14 @@ others in `../traces/xf_dumps`):
   pixels), and are 0.001-0.014 (none off by 16) with it. Counted: depth
   resolves of MSAA targets (7,857 in 150 s), not in those frames (done
   since, from EDRAM).
-- **Sonic Unleashed** reaches its title; its title's draws use
+- **game H** reaches its title; its title's draws use
   getCompTexLOD (27,146 skipped in 180 s) and then getWeights (46,844),
   now translated as Xenia's (OpImageQueryLod's unclamped level in x, in
   pixel shaders with the computed LOD; the bilinear lerp factors, the LOD
   disregarded as Xenia does). Its frames 300, 450, 600 and 800 match
   Xenia's (0.000 skipping those draws, 0.007-0.008 drawing them). Also
   counted: MSAA depth resolves, texture slots without a texture constant.
-- **Red Dead Redemption** reaches its title (a 3D scene behind "Press
+- **game G** reaches its title (a 3D scene behind "Press
   START") at about 7 swaps a second rendered: the renderer is its
   bottleneck, 136 s of 160 busy, 101 s of them checking textures by hash
   (over 500 textures a frame). It asked for alpha to coverage on 665,197
@@ -1077,7 +1081,7 @@ Xenia's default; `pipeline_threads`), and is skipped meanwhile, counted as
 made. That is what Xenia's D3D12 backend does (its Vulkan one draws with a
 placeholder pixel shader instead). Draws without a pixel shader get theirs
 at once, as Xenia's do. Replays and `boot` wait for each pipeline, as
-Xenia's trace dump does. El Chavo Kart's race frame, cold (no cache on
+Xenia's trace dump does. Game A's race frame, cold (no cache on
 disk): 1.11 s of the renderer's thread waiting for pipelines, 0.58 s with
 them made aside (334 of its draws skipped that frame, 6 the next, none
 after). The Vulkan pipeline cache on disk is shared by the workers.
@@ -1113,7 +1117,7 @@ rectangles and quads natively (`InitializeCommon(true, false, false, true,
 true, true)`) and its pipeline cache makes geometry shaders. So geometry
 shaders stay the path where the device has them; `XF_VK_EXPAND_IN_VS=1` (or
 `Options::expand_in_vertex_shader`) forces the expansion. Measured on the
-RTX 5060 with `xfreplay --gpu-time-draws --repeat`: Red Dead Redemption's
+RTX 5060 with `xfreplay --gpu-time-draws --repeat`: Game G's
 frame 850, 82 rectangle draws, 0.884 ms with geometry shaders and 0.905 ms
 expanded; 600,000 points of 2 pixels (the synthetic frame below, made
 heavier), 0.625 ms and 1.797 ms. All 29 frames of `replay_test` match the
@@ -1277,8 +1281,8 @@ Measured cold, which needs both caches empty: the pipeline cache on disk
 frame's 96 pipelines take 0.3 s, cold 9.2 s). The report counts hitches:
 frames in which the renderer's thread spent more than 4 ms making
 pipelines, the most it spent in one, and swaps more than 50 and 100 ms
-apart. El Chavo Kart live (`boot_chaves --render --rates`, 680 s, the press
-script of "El Chavo Kart past the title" with the race's presses at
+apart. Game A live (`boot_<A> --render --rates`, 680 s, the press
+script of "game A past the title" with the race's presses at
 10000-10750; title, menus and park up to swap 10000, the race after it, to
 swap 19,900-20,100; RTX 5060, 12 logical cores, so 9 workers, other agents
 building; the `--rates` lines now give the pipelines and skipped draws so
@@ -1301,7 +1305,7 @@ long, so its links and shaderless libraries add none. `library` is the
 default: fewer draws skipped than `skip` in both runs (2,149 and 1,648
 against 2,299; the runs vary with the machine's load, other agents'
 builds), every stand-in drawing exactly, no more time on the renderer's
-thread. Its gain is bounded by El Chavo Kart's pipelines being new pairs of
+thread. Its gain is bounded by game A's pipelines being new pairs of
 shaders (89 of the race frame's 96): a new shader's draws wait for its
 library as they waited for the whole pipeline, and only new combinations
 of known shaders and states draw at once. `placeholder` skips nothing but
@@ -1312,40 +1316,29 @@ swaps' gaps vary too much from run to run to rank them. A first form of
 skipped more draws than `skip` (2,184 against 1,449 in 500 s): the
 workers made every new shader twice at the same time.
 
-**Not done yet: the libraries at the launcher's build step.** What costs
-is the driver compiling the shaders (the race frame's 96 pipelines: 9.2 s
-from an empty driver cache, 0.3 s from a full one). The libraries make that
-cost per shader rather than per pipeline (153 libraries for the race's 96
-pipelines, the fragment shader's keyed by the
-module and the samples alone, the pre-rasterization one by the module's
-host form, patch size, depth clamp and bias), which makes compiling ahead
-practical: a run could keep, beside the pipeline cache on disk, the
-microcode of every shader it met and the keys of its pipelines and
-libraries (Xenia keeps such a shader and pipeline storage per title and
-compiles all of it on its creation threads when the title starts), and the
-launcher's build step, which has the device, would translate those and the
-shaders found on the disc (`xfeffect`'s containers) and make their
-libraries into the game's pipeline cache. The player would then link every
-draw's pipeline at once, the libraries found in the cache. The cache is
-the device's and driver's (Vulkan checks its header), so a new driver
-means doing it again.
+**The libraries at the launcher's build step.** What costs is the driver
+compiling the shaders (the race frame's 96 pipelines: 9.2 s from an empty
+driver cache, 0.3 s from a full one). The libraries make that cost per
+shader rather than per pipeline (153 libraries for the race's 96
+pipelines), which makes compiling ahead practical: built on 2026-11-07, in
+"Shaders and pipelines at the launcher's build step" below.
 
 **Extended dynamic state 3** (`vk::Device::dynamic_blend`; `XF_VK_NO_EDS3=1`
 turns it off): the blend enables, blend equations and color write masks
 set at the draw, so pipelines key the targets' formats alone (and the
 fragment output libraries the formats and samples alone). Counted on the
-traces, without and with it: El Chavo Kart's race 96 and 96 (its 96
+traces, without and with it: Game A's race 96 and 96 (its 96
 pipelines are 89 pairs of shaders; the other 7 differ by MSAA, depth format
-or a color format, none by blend), park 54/54, menu 36/36; Ben 10 8/5;
-Gears of War 3 44/39 (45/39 at 3600); Sonic's title 32/30; Red Dead
-Redemption 148/148 and 147/147. Live (the table above), El Chavo Kart's
+or a color format, none by blend), park 54/54, menu 36/36; game B 8/5;
+Game E 44/39 (45/39 at 3600); game H's title 32/30; game G
+148/148 and 147/147. Live (the table above), game A's
 680 s made 177 whole pipelines with it and 179 without, and 244 libraries
 against 258 (the fragment output's). The earlier guess that the race's
 pipelines differed mostly in blend state was wrong: what makes pipelines
 there is shaders, so B5's stand-in is what removes the skips, not fewer
 keys.
 
-**Red Dead Redemption's edges: the interpolators' centroids.** Frames 850
+**Game G's edges: the interpolators' centroids.** Frames 850
 and 950 were 0.45 off Xenia's D3D12 picture (0.46% of pixels off by more
 than 16) after the host depth kept across transfers, on the edges of
 geometry, brighter than Xenia's: 3,818 of the 4,226 pixels off D3D12's were
@@ -1373,6 +1366,107 @@ interpolators through InterpolateAtCentroid instead of the decoration
 (identical), an invariant position (identical; kept, as Xenia's outputs
 are invariant), and the samplers, made as Xenia's Vulkan backend makes
 them. The 29 frames of `replay_test` are unchanged.
+
+## Shaders and pipelines at the launcher's build step (2026-11-07)
+
+A game played again compiles no shader: the runs record what they meet,
+the launcher's build step makes it into the game's pipeline cache, and the
+next run finds every library and pipeline made.
+
+**The storage** (`shader_storage.h`, as Xenia's per-title shader storage,
+its pipeline caches' `InitializeShaderStorage`: `<title id>.xsh` for the
+microcode, `.xpso` for the pipelines' descriptions, both appended to while
+the game runs): one file, `<cache>/<title id>.xfshaders`, beside the game
+library in the launcher's cache, and the pipeline cache beside it,
+`<title id>.vkpipelines` (boot and the player alike; `game::start_renderer`;
+`XF_SHADER_STORAGE=<file>|none`, `XF_PIPELINE_CACHE=<file>`). A header
+(magic, version), then records appended and flushed as they come, so a run
+cut short keeps what it met: each shader's microcode the first time it is
+loaded; each new pipeline's description; and what a build step made, for
+the device and driver it made it on. The renderer writes it
+(`render::Options::shader_storage`).
+
+**A pipeline's description** is the whole `VkGraphicsPipelineCreateInfo`
+the draw made, state by state, with its shader modules by name rather than
+handle: a guest shader's hash and host form (`Shader::variants`' key: the
+vertex shader's `VertexOptions`, the pixel shader's `PixelOptions`, both
+of which the key gives back), or one of the renderer's own (the geometry,
+tessellation, interlock depth and float24 shaders). Before it is described
+or made, the values of the states the pipeline sets dynamically are set to
+one each (topology to its class's first, cull mode, front face, the depth
+and stencil tests, the blend under extended dynamic state 3): Vulkan
+ignores them, and so the same pipeline gets the same description, and the
+same entry in the driver's cache, whichever draw asked for it first. The
+libraries' keys are taken from the description the same way (the modules
+by name), so a run and the build step key them alike.
+
+**The build step** (`render::precompile`; `render::run_shader_step` is
+`BuildOptions::shader_step`, given by the launcher's prepare job and by
+`xfbuild`, which runs it after building the library and also when the
+library is cached; `xfbuild --shaders-only` runs it alone,
+`--no-shaders` and `--no-disc-shaders` leave parts out). On a Vulkan
+device of its own and a renderer made as a run's (its layout and own
+modules): the storage's shaders translated, every description made back
+into a pipeline's (a description naming a shader or form the renderer
+cannot make here is counted and left), then the libraries of its four
+parts (each once) and the whole pipeline queued on the pipeline workers,
+the cache written, and a record of the libraries' and pipelines' key
+hashes appended to the storage with the device's vendor, device, driver
+version and pipeline cache UUID. Descriptions an earlier record names for
+the same device and driver are not made again while the cache file's
+header is still that device's. Without a device it reports why and
+builds the library all the same; a cache of another device or driver is
+dropped by Vulkan and everything is made again. What it made goes in the
+library's `.build.txt` (`shaders` lines, `BuildReport::shaders`). The disc
+is searched for shader containers too (`xfeffect`'s search over each file
+up to 64 MB, media left out): they are translated and counted, but
+without a pipeline state no library is made of them (a pipeline's fixed
+state, its targets' formats and the pixel shader's form all come from the
+draw).
+
+**The run** reads the records that match its device and driver, while the
+pipeline cache file's header is still theirs: a library the build step
+made is made at once on the renderer's thread (a lookup in the cache)
+instead of being queued for the workers, so a new pipeline whose libraries
+are all made links at once and draws; a pipeline the build step made whole
+is made at once too where the draw would otherwise wait for the workers
+(the `skip` and `placeholder` modes, or a device without graphics pipeline
+libraries). The report and the `--rates` lines count the pipelines and
+libraries made so ("as built").
+
+Measured on game A (`boot_<A> --render --rates --seconds 430`,
+`XF_PIPELINES=library` as the player's default, the press script to the
+race of "Traces of live runs", about 12,500 swaps with the race from
+swap 10,750; RTX 5060, other agents' builds and boots on the machine): a
+cold run (both caches empty), then from the same caches and storage a
+second run without the build step, and one after it.
+
+| | cold | second run | after the build step |
+| --- | --- | --- | --- |
+| pipelines (whole) | 175 | 168 (5 new) | 169 (4 new to the storage) |
+| libraries made (as built) | 233 | 222 (none) | 225 (221) |
+| draws skipped waiting for a pipeline | 2,852 | 246 | 17 |
+| draws by a linked stand-in | 10,531 | 247 | 251 |
+| the renderer's thread making pipelines | 1.82 s | 0.01 s | 0.06 s |
+| frames with more than 4 ms of it (the most) | 8 (476 ms) | 0 (1 ms) | 3 (8 ms) |
+| draws without a pipeline, on average (the most) | 1,563 ms (69 s) | 972 ms (62 s) | 6 ms (299 ms) |
+
+The build step for those: the storage's 229 shaders and 175 descriptions
+made into 247 libraries and 175 whole pipelines in 2.2 s from the caches
+the cold run had warmed (14.2 s of the driver's on 9 workers); from empty caches (a new driver) the same took 14.3 s (125.5 s of the driver's), the cache written 25.4 MB.
+The disc's search read 374 files in 19-31 s and found 88 shaders, 75 of
+them not met by the run (UE3's global shader cache, packages being
+compressed), 29 the translator cannot translate yet. The 17 draws still
+skipped are those of the 4 pipelines the cold run had not met. The second
+run without the build step already had both caches warm: its libraries
+cost the workers little, but every new pipeline's draws still went
+without one until a worker had looked its libraries up (246 skipped, 972
+ms on average, the longest 62 s, not looked into); with the build step's
+record they are made on the renderer's thread in 0.06 s for the whole run.
+The swaps' long gaps (33-36 above 100 ms) are the loading screens in all
+three runs. The race frame's replay is unchanged by the descriptions'
+dynamic states set to one each (0.008 of 255, 0.014% of pixels off, whole
+and linked).
 
 ## Texture formats (2026-11-06)
 
@@ -1423,7 +1517,7 @@ and the 4:2:2 formats read RGBB, 6_5_5 RBGG) and its signed version.
   ("a texture format held with fewer bits"). `XF_TEXTURE_FALLBACKS=1` (or a
   list of `bc`, `norm16`, `packed`, `snorm`, `linear32`) forces them on a
   device that has everything. With all of them, the 17 frames of
-  `replay_test` stay within a mean of 0.34 of Xenia's; El Chavo Kart's park
+  `replay_test` stay within a mean of 0.34 of Xenia's; game A's park
   has 0.108% of its pixels off by more than 16 (alpha-tested foliage: Xenia's
   integer DXT decompression against the GPU's BC decoder, the same difference
   Xenia's fallback has), the rest at most 0.068%. Validation stays clean.
@@ -1457,35 +1551,35 @@ passes too and the line says so (the frames below).
 
 Xenia's two pictures of the same traces (mean of 255, share of pixels off
 by more than 16):
-- the same (0.000) on Ben 10's six frames, seven of El Chavo Kart's (the
-  five of `chaves`, the loading and menu screens of `chaves_xf`), Forza
-  Horizon's four, Sonic Unleashed's five and Red Dead Redemption's frame
+- the same (0.000) on game B's six frames, seven of game A's (the
+  five of `<A>`, the loading and menu screens of `<A>_xf`), game
+  D's four, game H's five and game G's frame
   600;
-- El Chavo Kart's park and race (`chaves_xf`): D3D12 3.144 (6.9%) and 1.707
+- Game A's park and race (`<A>_xf`): D3D12 3.144 (6.9%) and 1.707
   (4.4%) off Vulkan, darker in the brightest parts (the blossoming trees,
   lamps and curbs of the HDR scene); ours is 0.017 and 0.010 off Vulkan's,
   so 3.142 and 1.712 off D3D12's. The cause is the host's anisotropic
   filtering (found 2026-11-06, below), not Xenia's logic, and ours stays as
   it is;
-- the memory export frames of the race (`xf_chaves/memexport4`): 0.13-0.15
+- the memory export frames of the race (`xf_<A>/memexport4`): 0.13-0.15
   (0.1-0.3%) between Xenia's two, ours 0.01-0.05 off Vulkan's;
-- Red Dead Redemption's frames 850 and 950: 0.21-0.22 (0.1%); ours 0.45
+- Game G's frames 850 and 950: 0.21-0.22 (0.1%); ours 0.45
   off D3D12's since the host depth (below).
 
 **New traces from Xenia** (`tools/capture_traces.ps1`, no input, frames
-600, 1200, 2400 and 3600; `../traces/xenia_bc2`, `xenia_gow3`,
-`xenia_reach`), all twelve in `replay_test`'s corpus, Xenia's two pictures
+600, 1200, 2400 and 3600; `../traces/xenia_<C>`, `xenia_<E>`,
+`xenia_<F>`), all twelve in `replay_test`'s corpus, Xenia's two pictures
 the same on each:
-- Battlefield: Bad Company 2 (454108A8): the title, two frames of the intro
+- Game C (C): the title, two frames of the intro
   video, the Frostbite logo; ours 0.000-0.002 off;
-- Gears of War 3 (4D5308AB): the start screen behind its "Connection Lost"
+- Game E (E): the start screen behind its "Connection Lost"
   dialog, three frames, and a white one; ours 0.039-0.043 off;
-- Halo: Reach (4D53085B): the copyright screen, a dark frame, the intro's
+- Game F (F): the copyright screen, a dark frame, the intro's
   planet and the main menu over its 3D scene; ours 0.000-0.082 off (the menu
   counts 25 draws with D24FS8 depth as 32-bit float and 7 texture slots
   without a texture constant).
 
-**Red Dead Redemption's noise** (frames 850 and 950 of `xf_rdr`, 10.8 of
+**Game G's noise** (frames 850 and 950 of `xf_<G>`, 10.8 of
 255 off Xenia's): it is the depth's precision, not its textures. The scene
 is lit in two passes over a 2x MSAA D24FS8 depth buffer: a depth and normal
 pre-pass, a light pass, then the material pass (draws 1688-2415 of frame
@@ -1530,7 +1624,7 @@ copies the 32 bits), one through a color target or the other depth format
 takes the old host depth back where the guest's bits were not changed
 (`kColorAndHostDepthToDepth`, `kDepthAndHostDepthToDepth`), and the buffer
 starts as zeros, which round to EDRAM's 0, so a sample no such target held
-loads EDRAM's value as before. Red Dead Redemption's frames 850 and 950
+loads EDRAM's value as before. Game G's frames 850 and 950
 went from 9.20 and 9.28 off D3D12's picture to 0.45 and 0.46 (0.46-0.47%
 of pixels off by more than 16; 0.36 and 0.38 off Vulkan's, whose two
 pictures are 0.21 apart): the noise is gone, what is left are edges (the
@@ -1544,10 +1638,10 @@ EDRAM stores and the loads' comparison round 20e4 to the nearest even
 rather than towards zero. Single-sample depth resolves follow the option
 too since, and `depth_float24_convert_in_pixel_shader` is an option of its
 own ("Xenia's GPU TODOs, category A" below); off, as Xenia's default, the
-25 draws of Reach's menu and the rest keep counting "D24FS8 depth as
+25 draws of game F's menu and the rest keep counting "D24FS8 depth as
 32-bit float".
 
-**El Chavo Kart's park and race, D3D12 against Vulkan** (2026-11-06): the
+**Game A's park and race, D3D12 against Vulkan** (2026-11-06): the
 host's anisotropic filtering. Found by patching the trace (a script
 rewriting the pixel shader's words in the trace's memory reads) and
 dumping it with both of Xenia's backends: the bright blossoming trees
@@ -1581,16 +1675,16 @@ say what the registers mean.
 
 **What the corpus and the games use** (`Report::used`, printed as `uses`
 by `xfreplay` and the runs: what the draws and packets ask for, done or
-not). Over the 115 traces in `../traces`: Red Dead Redemption's title (two
+not). Over the 115 traces in `../traces`: Game G's title (two
 traces) has 288 draws with user clip planes, 4,878 EVENT_WRITE_EXT packets,
 232 VIZ_QUERY packets, 844 draws predicated on a VIZ query, 116 VIZ survey
-draws and 91 draws into 8_8_8_8_GAMMA targets; Ben 10's four traces 128
-EVENT_WRITE_EXT; Forza Horizon 4 draws and Reach 1 into gamma targets.
+draws and 91 draws into 8_8_8_8_GAMMA targets; game B's four traces 128
+EVENT_WRITE_EXT; game D 4 draws and game F 1 into gamma targets.
 None draws wide lines, with immediate indices or getBCF, or a point list
-with user clip planes. `DC_LUTA_CONTROL` is 0 at every swap but Forza
-Horizon's (3, its 10-bit front buffer). Live, El Chavo Kart (420 s to the
+with user clip planes. `DC_LUTA_CONTROL` is 0 at every swap but game
+D's (3, its 10-bit front buffer). Live, game A (420 s to the
 race, 11,139 swaps) asks for none of them but D24FS8 depth (2,751,412
-draws); Ben 10 (300 s, 7,067 swaps) for 48,676 EVENT_WRITE_EXT packets and
+draws); game B (300 s, 7,067 swaps) for 48,676 EVENT_WRITE_EXT packets and
 nothing else.
 
 - **8_8_8_8_GAMMA targets blended in linear** (Xenia's
@@ -1605,9 +1699,9 @@ nothing else.
   comes back to the same byte through the 16-bit unorm); clears hold the
   clear color linear (PWLGammaToLinear); resolves of such a target read
   EDRAM's bits, as Xenia's always do. Without it the shader writes the
-  curve and the blend works on it (counted). Red Dead Redemption's frame
+  curve and the blend works on it (counted). Game G's frame
   950 went from 0.457 to 0.453 of 255 off Xenia's Direct3D 12 picture
-  (0.469% to 0.458% of pixels), frame 850 and Forza Horizon's and Reach's
+  (0.469% to 0.458% of pixels), frame 850 and game D's and game F's
   frames did not move.
 - **User clip planes** (`PA_CL_CLIP_CNTL`'s `ucp_ena_0-5` while clipping is
   on, `PA_CL_UCP_0_X` on), as Xenia's shader modifications
@@ -1627,7 +1721,7 @@ nothing else.
   Mode 1's "radius-based distance" is the center's, as Xenia's TODO says;
   the radius it means is not documented. Without clip or cull distances on
   the device (`XF_VK_NO_CLIP_DISTANCE=1`) the draw is skipped and counted.
-  Red Dead Redemption's 144 draws a frame (a water plane's
+  game G's 144 draws a frame (a water plane's
   `(-0.0001, -0.386, 586.3, -586.5)`) cut nothing visible: frames 850 and
   950 did not move; with the planes negated the frame changes (0.018), so
   the distances are in effect.
@@ -1643,7 +1737,7 @@ nothing else.
   `CompletePixelShader_DSV_DepthTo24Bit`). It runs per sample under MSAA
   through a sample-decorated position, as Xenia's `IsSampleRate` (the other
   inputs stay at the pixel's center: with the pipeline's sample shading
-  instead they moved to the samples, and Red Dead Redemption's foliage
+  instead they moved to the samples, and game G's foliage
   edges came out 1.09 of 255 off). Depth-only draws that test or write
   depth get `depth_float24.frag` (Xenia's float24 truncate and round
   fragment shaders), per sample by the pipeline. The viewport's depth
@@ -1651,7 +1745,7 @@ nothing else.
   beside EDRAM for D24FS8, and EDRAM stores do not round again (Xenia's
   `IsHostDepthEncodingDifferent` and dump). Not done: Xenia's newer polygon
   offset in the shader (`depth_bias_shader_offset`, off by default there).
-  Red Dead Redemption's frame 950 with it is 0.660 of 255 (1.04% of pixels)
+  game G's frame 950 with it is 0.660 of 255 (1.04% of pixels)
   off Xenia's Vulkan picture with the same option; Xenia's Direct3D 12
   picture with it is broken (colored noise over the scene, 20.6 off either),
   so the Vulkan one is the reference there.
@@ -1675,7 +1769,7 @@ nothing else.
   `render::display_gamma`, in the read-back and in the player's presenter
   (which had applied no ramp to 10-bit fronts). The RV630 has an increment
   per component (blue bits 0-3, green 8-11, red 16-19); Direct3D writes 3
-  for Forza Horizon's 10-bit front buffer, which read per component turned
+  for game D's 10-bit front buffer, which read per component turned
   red and green to the table and its intro 3.955 of 255 off Xenia's
   picture, so on the Xenos the blue field's increment applies to all three
   (the others counted when set). Xenia picks by the front buffer's format
@@ -1810,13 +1904,13 @@ made with its trace dumps (`--render_target_path_d3d12=rov`,
 `--render_target_path_vulkan=fsi`, in `../traces/dumps/rov` and
 `rov/d3d12`); `replay_test` compares with them when the renderer takes the
 interlock path (`render::render_target_path`). Against them all 29 pass:
-0.000-0.006 of 255 but Reach's menu (0.083, as the host path's 0.082 against
-Xenia's default) and El Chavo Kart's park and race (0.007 and 0.008 off the
+0.000-0.006 of 255 but game F's menu (0.083, as the host path's 0.082 against
+Xenia's default) and game A's park and race (0.007 and 0.008 off the
 Vulkan FSI picture; Xenia's ROV picture is 3.08 and 1.75 off its own FSI one,
 the anisotropic filtering above). Where exactness shows, against Xenia's
-default pictures: Gears of War 3 0.25-0.27 (0.005 against ROV), Ben 10's 1800
+default pictures: Game E 0.25-0.27 (0.005 against ROV), game B's 1800
 and 3600 0.043-0.051 (0.000), the park and race 0.554 and 0.245 off Vulkan's
-(0.007, 0.008). Red Dead Redemption's 850 and 950 (not in `replay_test`):
+(0.007, 0.008). Game G's 850 and 950 (not in `replay_test`):
 0.112 and 0.118 off Xenia's Vulkan FSI picture, 0.247 off its ROV one
 (Xenia's two are 0.196 apart; without the Xenos sample positions they were
 1.11, edges of the 2x MSAA scene); host render targets are 1.27 and 1.36 off
@@ -1828,32 +1922,32 @@ texture loads' time equal across the three: same clocks):
 
 | trace | host render targets | interlock | interlock, dynamic |
 | --- | --- | --- | --- |
-| El Chavo Kart, race | 6.01-6.22 ms | 4.59-4.75 ms | 5.06-5.28 ms |
+| Game A, race | 6.01-6.22 ms | 4.59-4.75 ms | 5.06-5.28 ms |
 | park | 4.46-4.50 ms | 3.11 ms | 3.39-3.43 ms |
-| Ben 10, 3600 | 1.81-1.84 ms | 1.65 ms | 1.81 ms |
-| Red Dead Redemption, 850 | 15.08-15.13 ms | 13.43 ms | 14.66-14.74 ms |
+| Game B, 3600 | 1.81-1.84 ms | 1.65 ms | 1.81 ms |
+| Game G, 850 | 15.08-15.13 ms | 13.43 ms | 14.66-14.74 ms |
 
 The EDRAM transfers go (the race's stores and loads, the stencil's
 bit-by-bit loads without stencil export), and resolves read EDRAM rather
 than copying images; without early depth the draws themselves cost about
 what they did. Live (`boot_<game> --render --rates`, `XF_PIPELINES=library`
-as the player, `XF_GPU_TIME=1`, El Chavo Kart's press script to the race,
-600 s; Ben 10 240 s; nothing else on the machine):
+as the player, `XF_GPU_TIME=1`, game A's press script to the race,
+600 s; game B 240 s; nothing else on the machine):
 
 | | host render targets | interlock |
 | --- | --- | --- |
-| El Chavo Kart: title, menus and park, race (swaps/s; the cap is 30) | 30.0, 29.8, 29.9 | 30.0, 29.8, 30.0 |
+| Game A: title, menus and park, race (swaps/s; the cap is 30) | 30.0, 29.8, 29.9 | 30.0, 29.8, 30.0 |
 | renderer busy in those phases | 4%, 17%, 23% | 3%, 15%, 18% |
 | renderer's time, GPU time (600 s) | 128.4 s, 93.6 s | 98.9 s, 93.4 s |
 | hitches: frames over 4 ms making pipelines, swaps over 50 / 100 ms apart | 5, 26 / 6 | 0, 23 / 6 |
-| Ben 10, 70-150 s: swaps/s (vblank), renderer busy; GPU time (240 s) | 60.0, 5%; 19.7 s | 60.0, 3%; 21.5 s |
+| Game B, 70-150 s: swaps/s (vblank), renderer busy; GPU time (240 s) | 60.0, 5%; 19.7 s | 60.0, 3%; 21.5 s |
 
 The interlock path is the default where the device has fragment shader
 interlock: it matches Xenia's exact pictures as closely as host render
 targets match its default ones, is faster in every replay, and costs the
 same live (both at the games' caps) with a quarter less of the renderer's
 time. Its pipelines' shaders are larger: a cold driver cache made the first
-interlock run of El Chavo Kart spend 30.6 s making pipelines (boot's
+interlock run of game A spend 30.6 s making pipelines (boot's
 default, waiting for them), a warm one 0.01 s with libraries.
 
 **Fixed on the way (both paths):** a 64-bit target's row of tiles is twice
@@ -1898,15 +1992,63 @@ games as the user owns.
 The generic renderer draws everything. Ports add, where it pays:
 
 - **The XDK's D3D, by signature.** Both games link D3D as a static library
-  (El Chavo Kart XDK 21250, Ben 10 XDK 8276; `xfinspect` prints it). A
+  (game A XDK 21250, game B XDK 8276; `xfinspect` prints it). A
   database of the D3D functions' signatures per XDK version names them in
   any game, so hooks on `D3DDevice_*` (render target roles, the back buffer,
   viewport and aspect) come without reverse engineering each game: the way
   to widescreen, a separate UI and resolution independence.
-- **The engine** (the skate3 model): a port's renderer receives the device
+- **The engine** (the native-renderer port model): a port's renderer receives the device
   and the frame's command buffer and replaces passes (UE3's scene, Scaleform
-  UI); the generic renderer keeps everything else. F5 switches between the
-  two for comparison.
+  UI); the generic renderer keeps everything else. F6 switches between the
+  two for comparison. In since 2026-11-08: below.
+
+## A port's own renderer (2026-11-08)
+
+`xenoforge/native_render.h` (docs/sdk.md, "Native rendering"; plan E4). The
+renderer stays general: it calls what a port registered and skips what the
+port's filter selects; nothing in it knows a game.
+
+- **Where.** `Impl::swap`, before the front buffer is taken:
+  `native_frame` takes the port's settings (copied again only when their
+  version moved: one relaxed load a swap otherwise), and when an output
+  renderer is set and the toggle is on, makes the output image
+  (`R8G8B8A8_UNORM`, remade on a resize, the old one destroyed when its
+  submission is done), records a full barrier and calls the port with a
+  `NativeFrame` (the command buffer through `outside()`, the texture cache's
+  `texture()` and `texture_view()`, the arena). After it, `bound_pipeline_`
+  is reset so the draws bind theirs again; the swap's `flush()` follows. A
+  frame the port drew is handed to `on_swap` as the front buffer, with an
+  identity display table (the presenter's conversion leaves it as it is), and
+  the guest's front texture is not loaded unless a read-back wants it.
+- **What is skipped.** `native_suppress_` is set for the frame after one the
+  port drew. In `draw`, after the check for draws that write nothing (so the
+  memexport test is already made): a draw exporting memory is kept and
+  counted; any other goes through the filter (`native_keep`) and, skipped,
+  marks its occlusion report `suppressed`, answered with at least the port's
+  fake count (1000, Xenia's `query_occlusion_fake_sample_count`, as the
+  rexglue fork answers while it suppresses). In `resolve`, first thing. The
+  command processor is untouched: packets, registers, fences, events,
+  interrupts and swaps run as ever, since the skipping is in the Sink.
+- **Held frames.** The decision is a frame late (the callback's answer comes
+  at the swap, after the frame's draws). A frame whose passes were skipped
+  and that the port did not draw (it yielded, or the toggle went off) has no
+  picture: `on_swap` is not called, the window keeps the port's last, and the
+  next frame is emulated in full. Read-backs (`frame_wanted`, boot's
+  `--shots`) are always the guest's front buffer.
+- **Without a port.** Nothing registered: one relaxed load and two branches a
+  swap, one branch a draw and a resolve; replay_test is unchanged.
+- **Measured** (game B's first 30 s, its intros and logos: about 5 draws and
+  3 resolves a swap, guest-paced at 60 then 32 swaps a second;
+  `examples/native_port`, `XF_GPU_TIME=1`). Boot with `--render`: emulated,
+  1102 swaps, 1.87 s of GPU time and 0.8 s in the renderer's calls; the
+  port's frames with everything skipped, 1116 swaps, 0.02 s of GPU time (the
+  port's frame 17 µs a swap) and 0.2 s, 5389 draws and 3347 resolves skipped;
+  the port drawing over the emulated work (`suppress=false`), 1105 swaps,
+  2.39 s and 1.0 s. The player: 37.3 swaps/s either way (the guest sets the
+  pace), 1.98 s against 0.04 s of GPU time. 0 interpreted entries; the window
+  shows the port's frames (window screenshots), with `yield_every=200` the
+  two alternate and each switch to emulated holds one frame (3 in 30 s).
+  Validation (`XF_VK_VALIDATION=1`): no message.
 
 ## Reference files in xenia-canary
 

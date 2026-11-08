@@ -141,7 +141,7 @@ endif()
 # the folder in the build directory, and a zip of it
 add_custom_target(player_package
     COMMAND ${CMAKE_COMMAND} -E rm -rf ${XF_PACKAGE_DIR}
-    COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --prefix ${XF_PACKAGE_DIR}
+    COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --component player --prefix ${XF_PACKAGE_DIR}
     COMMAND ${CMAKE_COMMAND} -E tar cf ${CMAKE_BINARY_DIR}/xenoforge-player.zip --format=zip -- xenoforge-player
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DEPENDS ${_installed}

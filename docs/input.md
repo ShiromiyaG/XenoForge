@@ -36,7 +36,7 @@ and the input system behind them (Xenia's InputSystem):
   vibrations and connection changes.
 
 The games: both call XamInputGetCapabilities, GetState and SetState for
-users 0-3 every frame; Ben 10 also polls XamInputGetKeystrokeEx with
+users 0-3 every frame; one (game B) also polls XamInputGetKeystrokeEx with
 `ANY_USER | KEYBOARD` (0x40000002), which only a keyboard in Xenia's
 passthrough mode answers, so it gets "not connected" here as in Xenia
 with its default drivers.
@@ -45,7 +45,7 @@ with its default drivers.
 
 Boot installs an **idle pad**: a controller for user 0, nothing pressed
 (`input::make_idle_pad`). Xenia's default drivers answer nothing without a
-pad plugged in, and Ben 10 then pauses on "Controller Lost Connection";
+pad plugged in, and game B then pauses on "Controller Lost Connection";
 with the idle pad it plays its intro. `--no-controller` leaves every user
 disconnected, as Xenia without a pad.
 
@@ -58,6 +58,29 @@ still varies). Buttons: `a b x y start back guide lb rb ls rs up down left
 right lt rt`. The packet number moves with the press, as a real pad's
 does. The player takes the same option, and prints when each screenshot's
 swap came on the scheduler's clock, to choose the times from.
+
+## Recordings
+
+`kernel::record_input(k, path)` writes what the input exports answer, and
+`kernel::replay_input(k, path)` answers from such a file in place of the
+drivers (boot's `--record-input`/`--replay-input`, `XF_INPUT_RECORD` and
+`XF_INPUT_REPLAY` for boot and the player). The file is text, a line each
+time a user's answer changes, at the time it was asked on the scheduler's
+clock (100 ns):
+
+    s <time> <user> <result> <packet> <buttons> <lt> <rt> <lx> <ly> <rx> <ry>   XamInputGetState
+    k <time> <user> <result> <virtual key> <unicode> <flags> <hid code>          a keystroke
+    c <time> <user> <result>                                                     the capabilities
+
+Results, packets, buttons and keys in hex. Every keystroke delivered is a
+line; a state, the capabilities and a keystroke call's other answers
+(empty, not connected) only when they change. A replay answers a state or
+the capabilities with the last line at or before the time asked (the first
+before it), deadzones and packet numbers as recorded, and the keystrokes in
+order once their time has come. In the deterministic mode (runtime.md) the
+polls come at the same times, so a replay repeats the recorded run exactly;
+recorded while playing, it is close (the times are the host's).
+Vibration is not replayed.
 
 ## The player
 

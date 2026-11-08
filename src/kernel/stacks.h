@@ -50,6 +50,18 @@ struct GuestStacks {
 // call goes on at its own return address (LR at the call: a bl, a dispatch).
 constexpr uint32_t STACK_RESUME_ANYWHERE = 1;
 
+// Host fibers, also the deterministic scheduler's (deterministic.cpp), which
+// runs every guest thread on one host thread: a thread converted to one
+// (converted: made one here, not already one), made (a 16 MB reservation),
+// switched to, deleted (from another), and the one running (nullptr: the
+// thread is no fiber).
+void *convert_thread(bool &converted);
+void revert_thread();
+void *create_fiber(void (*entry)(void *), void *arg);
+void switch_fiber(void *fiber);
+void delete_fiber(void *fiber);
+void *current_fiber();
+
 // KeSetCurrentStackPointers on the calling thread's context, r1 already set
 // to the new stack (from_sp: where the old one was): when the new stack is
 // another, its host fiber runs (made the first time, from LR), and this one
@@ -59,5 +71,15 @@ void switch_guest_stack(Kernel &k, Thread &t, ppc::Context &c, uint32_t from_sp,
 void guest_stacks_freed(Kernel &k, uint32_t base, uint32_t end);
 // The thread ends, on its own stack: its other host fibers go.
 void end_guest_stacks(Kernel &k, Thread &t);
+
+// A guest stack's frames by its back chain from sp: each frame's saved LR
+// (the XDK's prologues store it 8 bytes below the caller's frame), at most
+// `max`. Read only where the pages are readable: inside [low, high) when
+// given (a thread's own stack: no lock is taken, as the crash report needs),
+// else by asking the heap (a stack's guard pages are not readable). `frames`,
+// when given, gets the frame each LR was saved in (r1 of the function it
+// returns into).
+std::vector<uint32_t> guest_backtrace(Kernel &k, uint32_t sp, uint32_t low = 0, uint32_t high = 0, int max = 16,
+                                      std::vector<uint32_t> *frames = nullptr);
 
 } // namespace xf::kernel

@@ -3,7 +3,7 @@ name: xf-gpu
 description: Works on XenoForge's GPU side - the Xenos renderer on Vulkan (trace replay, shader translation, textures, EDRAM, resolves) and the live GPU front end - checked frame by frame against Xenia's traces. Use for renderer, shader translator or command processor tasks in F:\RECOMPs\XenoForge.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
 model: inherit
-effort: xhigh
+effort: medium
 isolation: worktree
 ---
 
@@ -72,7 +72,7 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
   Outputs go to F:\RECOMPs\traces\replay\.
 - The regression: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test`. All 29 frames match
   Xenia today and must keep matching: Xenia's D3D12 picture first (`../traces/dumps/d3d12`), its Vulkan
-  one where there is none or the two disagree (2 frames, El Chavo Kart's park and race).
+  one where there is none or the two disagree (2 frames of game A).
 - Shaders: `XF_SHADERS=<dir> build/shader_compare_test`. The corpora are ../traces/shaders,
   ../traces/ue3_global and ../external/xna/work/shaders.
 - `XF_VK_VALIDATION=1` turns on Vulkan validation; run with it before reporting.
@@ -92,6 +92,14 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
   you finish.
 - Shell: Bash is Git Bash on Windows. Heredocs mangle backslashes, so make code changes with
   Edit/Write.
+
+## No game names (the owner's rule, 2026-11-08)
+
+Nothing in the repository names a specific game: no title, codename or port
+name in code, comments, tests, CMake, scripts, examples, READMEs, docs or
+commit messages. Write "a game", "<game>", "a UE3 game with 4.7M
+instructions", made-up addresses in examples. Running real discs by hand to
+test is fine; say which ones only in the report to the main session.
 
 ## Token economy (the owner's rule, 2026-11-06)
 

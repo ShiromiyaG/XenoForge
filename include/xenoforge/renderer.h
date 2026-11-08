@@ -27,6 +27,7 @@
 #include "xenoforge/vk_device.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -81,6 +82,12 @@ struct Report {
     // stand-in (a placeholder or a linked pipeline) while their own pipeline
     // was made
     uint64_t pipeline_libraries = 0, pipelines_linked = 0, pipeline_placeholders = 0, stand_in_draws = 0;
+    // The shader and pipeline storage (Options::shader_storage): the shaders
+    // and pipeline descriptions this run added to it; the pipelines and
+    // libraries the launcher's build step had made into the pipeline cache
+    // for this device and driver, made at once from it (render::precompile)
+    uint64_t shaders_stored = 0, pipelines_stored = 0;
+    uint64_t pipelines_prebuilt = 0, pipeline_libraries_prebuilt = 0;
     // The pipelines made on the workers, and how long their draws went
     // without one (from the first draw asking to the first drawn, by the
     // pipeline or its stand-in): in all and at most
@@ -189,6 +196,14 @@ struct Options {
     // written once new pipelines have settled (300 swaps without one) and at
     // drain(). Empty: a cache in memory only.
     std::filesystem::path pipeline_cache;
+    // The title's shader and pipeline storage (shader_storage.h; docs/
+    // renderer.md, "Shaders and pipelines at the launcher's build step"):
+    // every shader met and every pipeline's description appended to it, for
+    // the build step (render::precompile), whose records there name the
+    // pipelines and libraries it made into the pipeline cache; those are
+    // made at once on the renderer's thread (a lookup in the cache) rather
+    // than on the workers. Empty: none.
+    std::filesystem::path shader_storage;
     // Graphics pipelines made off the renderer's thread, as Xenia's pipeline
     // creation threads with its async_shader_compilation (on by default
     // there; its trace dump turns it off): a draw whose pipeline is not made
@@ -333,5 +348,35 @@ public:
 // the GPU before the next: other work sharing the GPU only adds to a play's).
 bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, Image &frame, Report &report,
             std::string &error, bool restore_edram = true, uint32_t repeat = 1);
+
+// The launcher's build step's part of the renderer (docs/renderer.md,
+// "Shaders and pipelines at the launcher's build step"): the shaders a
+// title's storage holds (Options::shader_storage), and the extra ones given
+// (those found on the disc), translated; every pipeline description there
+// made into the pipeline cache (Options::pipeline_cache) as the libraries of
+// its four parts (with the device's graphics pipeline libraries) and whole,
+// on worker threads; the cache written; and a record of what was made
+// appended to the storage for this device and driver, so the renderer makes
+// those at once while playing. Descriptions a record already names for the
+// device and driver are not made again while the cache is still theirs.
+struct PrecompileOptions {
+    bool whole_pipelines = true;                 // besides the libraries
+    std::vector<std::pair<uint32_t, std::vector<uint32_t>>> extra_shaders; // type (0 vertex, 1 pixel), microcode
+    std::function<void(uint64_t done, uint64_t total)> progress;
+    const std::atomic<bool> *cancel = nullptr;
+};
+struct PrecompileReport {
+    // the pipeline cache read was this device's and driver's (false: none,
+    // or another's, so everything was made again)
+    bool cache_matched = false;
+    uint64_t cache_read = 0, cache_written = 0; // bytes
+    uint64_t shaders = 0, shaders_failed = 0;   // from the storage, translated or not
+    uint64_t extra_shaders = 0, extra_failed = 0, extra_new = 0; // the extra ones; not in the storage
+    uint64_t descriptions = 0, descriptions_failed = 0, descriptions_done_before = 0;
+    uint64_t libraries = 0, libraries_failed = 0, pipelines = 0, pipelines_failed = 0;
+    double seconds = 0, driver_seconds = 0; // in all; the workers' time making them
+};
+bool precompile(vk::Device &device, const Options &options, const PrecompileOptions &precompile,
+                PrecompileReport &report, std::string &error);
 
 } // namespace xf::render

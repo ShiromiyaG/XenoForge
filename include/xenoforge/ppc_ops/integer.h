@@ -306,9 +306,14 @@ XF_OP(andcx) { store_x(c, i, c.r[i.X.RT] & ~c.r[i.X.RB]); }
 XF_OP(eqvx) { store_x(c, i, ~(c.r[i.X.RT] ^ c.r[i.X.RB])); }
 XF_OP(nandx) { store_x(c, i, ~(c.r[i.X.RT] & c.r[i.X.RB])); }
 XF_OP(norx) { store_x(c, i, ~(c.r[i.X.RT] | c.r[i.X.RB])); }
-// or rx,rx,rx is a no-op (or a priority hint, 0x7FFFFB78 "db16cyc" in
-// spin loops): the store below changes nothing
-XF_OP(orx) { store_x(c, i, c.r[i.X.RT] | c.r[i.X.RB]); }
+// or rx,rx,rx is a no-op, or a priority hint (or r1,r1,r1 low, or 31,31,31
+// "db16cyc", in spin loops): the store below changes nothing, and it is a
+// yield point (the code's word is a constant in the generated code, so the
+// test folds away there)
+XF_OP(orx) {
+    if (i.X.RT == i.X.RA && i.X.RA == i.X.RB && !i.X.Rc) yield_point(c, YIELD_PRIORITY_HINT);
+    store_x(c, i, c.r[i.X.RT] | c.r[i.X.RB]);
+}
 XF_OP(orcx) { store_x(c, i, c.r[i.X.RT] | ~c.r[i.X.RB]); }
 XF_OP(xorx) { store_x(c, i, c.r[i.X.RT] ^ c.r[i.X.RB]); }
 

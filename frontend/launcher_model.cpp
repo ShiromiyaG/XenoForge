@@ -10,7 +10,8 @@
 
 namespace xf::frontend {
 
-GameStatus game_status(bool cached_library, bool generated_player, bool prepare_failed) {
+GameStatus game_status(bool cached_library, bool generated_player, bool prepare_failed, bool stale) {
+    if (cached_library && stale) return GameStatus::Stale;
     if (cached_library || generated_player) return GameStatus::Ready;
     return prepare_failed ? GameStatus::Interpreted : GameStatus::NeedsPreparing;
 }
@@ -20,6 +21,7 @@ const char *status_class(GameStatus status) {
     case GameStatus::Ready: return "ready";
     case GameStatus::NeedsPreparing: return "prep";
     case GameStatus::Interpreted: return "interp";
+    case GameStatus::Stale: return "stale";
     }
     return "";
 }
@@ -29,6 +31,7 @@ const char *status_text(GameStatus status) {
     case GameStatus::Ready: return "Ready";
     case GameStatus::NeedsPreparing: return "Needs preparing";
     case GameStatus::Interpreted: return "Interpreted";
+    case GameStatus::Stale: return "Update available";
     }
     return "";
 }
@@ -38,6 +41,7 @@ const char *status_detail(GameStatus status) {
     case GameStatus::Ready: return "Its game library is built.";
     case GameStatus::NeedsPreparing: return "Built once here from your disc, in a few minutes.";
     case GameStatus::Interpreted: return "No library could be built: it runs interpreted.";
+    case GameStatus::Stale: return "The game ran code its library lacks: rebuilding takes it in.";
     }
     return "";
 }

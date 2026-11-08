@@ -220,7 +220,7 @@ XF_EXPORT(xam, XMsgCompleteIORequest) {
 }
 
 // ---- parties (xam_party.cc) and their UI (xam_ui.cc): never in one ----
-// El Chavo Kart asks for these by ordinal (XexGetProcedureAddress).
+// Games ask for these by ordinal (XexGetProcedureAddress).
 
 namespace {
 constexpr uint32_t X_PARTY_E_NOT_IN_PARTY = 0x807D0003;

@@ -43,6 +43,30 @@ struct System {
     // and up; ppc_ops.h): what the device answers, what it is told.
     uint32_t (*mmio_read)(Context &c, uint32_t address) = nullptr;
     void (*mmio_write)(Context &c, uint32_t address, uint32_t value) = nullptr;
+    // A yield point whose budget ran out (Context::yield_budget; ppc_ops.h's
+    // yield_point): charges the time those points stood for and may hand the
+    // processor over (the kernel's deterministic mode). Unset: the budget is
+    // refilled and the code goes on.
+    void (*yield)(Context &c) = nullptr;
+    // The port's hooks (xenoforge/hooks.h; docs/recompiler.md, "Replacing and
+    // hooking"), for the interpreter. hook_pages: a bit per 4 KB page of the
+    // guest's addresses that holds a hook (nullptr: it looks for none).
+    const uint8_t *hook_pages = nullptr;
+    // A branch without LK taken from `from` to `target`, in a page with a
+    // hook: true when a hooked function was entered there and ran (the
+    // interpreter goes on at LR, as after a call).
+    bool (*enter_hooked)(Context &c, uint32_t target, uint32_t from) = nullptr;
+    // The mid-function hooks at pc, before its instruction runs: 0 to run it,
+    // 1 to return (a blr), else the address to go on at.
+    uint32_t (*mid_hook)(Context &c, uint32_t pc) = nullptr;
+    // A hooked function's original body when it has no generated code: the
+    // function at `address` run until it returns (LR as set), its own hooks
+    // left out.
+    void (*run_original)(Context &c, uint32_t address) = nullptr;
+    // The port's native code around guest code, before it runs (after
+    // false) and after (where the guest code goes on): the lockstep check's
+    // segments end and start there.
+    void (*hook_boundary)(Context &c, uint32_t address, bool after, uint32_t resume) = nullptr;
     void *owner = nullptr; // whoever set these up (the kernel)
 };
 
@@ -70,6 +94,13 @@ struct alignas(64) Context {
     // the instruction being run, for the system's callbacks
     uint32_t pc;
     System *system;
+    // Yield points (docs/recompiler.md, "Yield points"): loops' back edges and
+    // the priority hints (or rx,rx,rx). With yield_counting set (the
+    // deterministic mode), each takes its weight off yield_budget, and one
+    // that takes it below 0 calls System::yield; unset (playing, the tests),
+    // a yield point is a load and a branch not taken.
+    int64_t yield_budget;
+    bool yield_counting;
 
     // CR as the 32-bit register (mfcr), field 0 in the top nibble
     uint32_t cr_word() const {

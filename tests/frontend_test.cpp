@@ -192,6 +192,9 @@ int main() {
     CHECK(frontend::game_status(false, true, true) == frontend::GameStatus::Ready);
     CHECK(frontend::game_status(false, false, false) == frontend::GameStatus::NeedsPreparing);
     CHECK(frontend::game_status(false, false, true) == frontend::GameStatus::Interpreted);
+    CHECK(frontend::game_status(true, false, false, true) == frontend::GameStatus::Stale);
+    CHECK(frontend::game_status(false, false, false, true) == frontend::GameStatus::NeedsPreparing);
+    CHECK(std::string(frontend::status_class(frontend::GameStatus::Stale)) == "stale");
     {
         // which player: a cached library means the generic one, else the player carrying the code, else the generic
         frontend::PlayerBinary generic, carrying, other;
@@ -292,16 +295,16 @@ int main() {
         frontend::parse_sort("bogus", c, ascending);
         CHECK(c == frontend::Column::Title && ascending);
         std::vector<frontend::RowKey> rows(4);
-        rows[0].title = "sonic", rows[0].version = 3, rows[0].status = 1, rows[0].id_text = "534507D6", rows[0].file = "Sonic.iso";
-        rows[1].title = "Halo", rows[1].version = 9, rows[1].status = 0, rows[1].id_text = "4D53085B", rows[1].file = "Reach.iso";
-        rows[2].title = "Forza", rows[2].version = 3, rows[2].status = 0, rows[2].id_text = "4D5309C9", rows[2].file = "FH.iso";
-        rows[3].title = "battlefield", rows[3].version = 1, rows[3].status = 1, rows[3].id_text = "454108D4", rows[3].file = "BC2.iso";
+        rows[0].title = "delta", rows[0].version = 3, rows[0].status = 1, rows[0].id_text = "58460001", rows[0].file = "One.iso";
+        rows[1].title = "Charlie", rows[1].version = 9, rows[1].status = 0, rows[1].id_text = "58460002", rows[1].file = "Two.iso";
+        rows[2].title = "Bravo", rows[2].version = 3, rows[2].status = 0, rows[2].id_text = "58460003", rows[2].file = "Three.iso";
+        rows[3].title = "alpha", rows[3].version = 1, rows[3].status = 1, rows[3].id_text = "58460004", rows[3].file = "Four.iso";
         CHECK((frontend::sorted_rows(rows, frontend::Column::Title, true) == std::vector<size_t>{3, 2, 1, 0})); // case aside
         CHECK((frontend::sorted_rows(rows, frontend::Column::Title, false) == std::vector<size_t>{0, 1, 2, 3}));
         CHECK((frontend::sorted_rows(rows, frontend::Column::Version, true) == std::vector<size_t>{3, 2, 0, 1})); // ties by title
         CHECK((frontend::sorted_rows(rows, frontend::Column::Status, true) == std::vector<size_t>{2, 1, 3, 0}));
-        CHECK(frontend::row_matches(rows[1], "") && frontend::row_matches(rows[1], "  HALO ") && frontend::row_matches(rows[1], "4d53 reach"));
-        CHECK(!frontend::row_matches(rows[1], "halo forza") && !frontend::row_matches(rows[0], "reach"));
+        CHECK(frontend::row_matches(rows[1], "") && frontend::row_matches(rows[1], "  CHARLIE ") && frontend::row_matches(rows[1], "5846 two"));
+        CHECK(!frontend::row_matches(rows[1], "charlie bravo") && !frontend::row_matches(rows[0], "two"));
         // the themes: every token filled, light and dark different, the selection the accent's
         const frontend::Accent accent = frontend::accent_from_hex("#4c9bff");
         const std::string css = "{bg} {text} {sel} {border} {accent} {on-accent} {shadow} {good}";

@@ -435,7 +435,7 @@ XF_EXPORT(xboxkrnl, MicDeviceRequest) {
     char message[96];
     std::snprintf(message, sizeof(message), "*** STOP: 0x%08X (0x%08X, 0x%08X, 0x%08X, 0x%08X)", code, p1, p2, p3, p4);
     std::fprintf(stderr, "kernel: %s\n", message);
-    if (!k.stopped.exchange(true)) k.stop_reason = std::string("KeBugCheck: ") + message;
+    k.stop(std::string("KeBugCheck: ") + message);
     std::fflush(stdout);
     std::fflush(stderr);
     std::exit(4);

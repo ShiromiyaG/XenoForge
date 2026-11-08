@@ -409,6 +409,9 @@ public:
     // what makes the thread stop at its next kernel call (a safe point)
     enum : uint32_t { PENDING_SUSPEND = 1, PENDING_KERNEL_APC = 2 };
     std::atomic<uint32_t> pending{0};
+    // running guest code (generated or interpreted), not in a kernel call or
+    // parked: what Kernel::pause waits to see false on every thread
+    std::atomic<bool> guest_running{false};
 
     // the guest stacks it switched between and their host fibers (stacks.h),
     // from its first switch; where the generated code that branched to
@@ -432,6 +435,7 @@ public:
     // the scheduler's
     bool woken = false;
     std::condition_variable cv;
+    void *scheduled = nullptr; // the deterministic scheduler's record of it
 };
 
 // The thread running on this host thread (nullptr off guest threads).
@@ -441,8 +445,9 @@ Thread *current_thread();
 
 // How guest threads get time. Playing mode: a host thread each, waits the
 // host's (make_host_scheduler). The deterministic mode replaces it with
-// fibers on one host thread and a virtual clock. Everything here is called
-// with the kernel's lock held, except start, join and yield.
+// fibers on one host thread and a virtual clock (deterministic.cpp). Everything
+// here is called with the kernel's lock held, except start, join, yield and
+// advance.
 class Scheduler {
 public:
     static constexpr uint64_t NEVER = UINT64_MAX;
@@ -461,9 +466,26 @@ public:
     virtual uint64_t now() = 0;
     // the earliest timer (Objects::next_due) changed
     virtual void timers_changed() = 0;
+    // The deterministic mode: the guest code on this thread spent cost of
+    // the clock (a kernel call, a time base read; its only measure of the
+    // guest's work), and may hand over there. Nothing when playing.
+    virtual void advance(uint64_t cost) { (void)cost; }
+    virtual bool deterministic() const { return false; }
+    // its counts, for the thread report (empty when playing)
+    virtual std::string report() { return {}; }
 };
 
 std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects);
+// deterministic.cpp: every guest thread a fiber on one host thread, in a fixed
+// order, on a virtual clock (xenoforge/kernel.h, Deterministic)
+std::unique_ptr<Scheduler> make_deterministic_scheduler(Objects &objects, const Deterministic &options);
+
+// The host thread-locals the kernel keeps per guest thread, which the
+// deterministic scheduler swaps as it switches guest threads on its one host
+// thread: the current thread (threads.cpp) and the exception dispatches under
+// way (exceptions.cpp).
+void set_current_thread(Thread *t);
+void *exchange_exception_walks(void *walks);
 
 // ---- the kernel's state for its objects ----
 
@@ -482,6 +504,7 @@ public:
     bool retain_handle(uint32_t handle);
     bool release_handle(uint32_t handle);
     Object *object_in(uint32_t handle);  // not retained
+    Object *resolve_guest(GuestObject &g); // lock held: the host object behind a guest object's header, else g
     uint32_t translate(uint32_t handle); // -2: the current thread
     // a retained object by handle (nullptr: none, or not of type T)
     template <typename T> Ref<T> lookup(uint32_t handle);
@@ -622,6 +645,11 @@ template <typename T> Ref<T> Objects::lookup(uint32_t handle) {
     std::lock_guard<std::mutex> l(lock);
     Object *o = object_in(handle);
     if (!o) return {};
+    // a handle to an object the guest made, with a dispatcher header the caller initialized: the host object
+    // behind the header (the Ke* family and the waits see one object)
+    if constexpr (!std::is_base_of_v<GuestObject, T>) {
+        if (auto *g = dynamic_cast<GuestObject *>(o)) o = resolve_guest(*g);
+    }
     if constexpr (!std::is_same_v<T, Object>) {
         if (!dynamic_cast<T *>(o)) return {};
     }

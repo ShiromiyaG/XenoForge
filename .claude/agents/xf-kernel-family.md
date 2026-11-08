@@ -3,7 +3,7 @@ name: xf-kernel-family
 description: Implements one XenoForge kernel export family (xboxkrnl/xam exports, the objects and state behind them) translated from Xenia, with tests and measurements from boot. Use for kernel work in F:\RECOMPs\XenoForge, one family per agent; the brief names the family, the Xenia sources, and what other agents are touching.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
 model: sonnet
-effort: high
+effort: medium
 isolation: worktree
 ---
 
@@ -73,12 +73,19 @@ threads.cpp, sync.cpp. Follow their style.
   and never leave a process running when you finish: a hung test once blocked the whole suite.
 - Measure with boot, which prints every export called, the unimplemented ones and where the run
   stopped:
-  - `build/boot.exe "F:/RECOMPs/Chaves/Chavo Kart, El (Latin America) (En,Es,Pt).iso" --seconds 30`
-  - `build/boot.exe "F:/RECOMPs/Ben-10/Ben 10 - Alien Force - Vilgax Attacks (USA, Europe) (En,Fr,De,Es,It).iso" --seconds 30`
-  - the other games in F:\RECOMPs\games\*.iso (Battlefield Bad Company 2: `--xex Game.xex`).
+  `build/boot.exe <iso> --seconds 30` on the test discs listed in F:\RECOMPs\XenoForge\docs\plan.md,
+  "Test discs" (local only: the discs' paths and names never go into the repository).
   `build/xfinspect.exe <iso> --imports` lists a game's imports.
 - Shell: Bash is Git Bash on Windows. Heredocs mangle backslashes (`\n` turns into a real newline),
   so make code changes with Edit/Write, not with scripts in heredocs.
+
+## No game names (the owner's rule, 2026-11-08)
+
+Nothing in the repository names a specific game: no title, codename or port
+name in code, comments, tests, CMake, scripts, examples, READMEs, docs or
+commit messages. Write "a game", "<game>", "a UE3 game with 4.7M
+instructions", made-up addresses in examples. Running real discs by hand to
+test is fine; say which ones only in the report to the main session.
 
 ## Token economy (the owner's rule, 2026-11-06)
 

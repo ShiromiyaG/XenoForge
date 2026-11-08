@@ -5,7 +5,10 @@
 // SDL3's gamepads and the keyboard (sdl_input.h, docs/input.md); the sound
 // goes to the sound card (sdl_audio.h). F1 opens the overlay (Dear ImGui):
 // the rates, the controllers, the volume, a screenshot; F11 switches
-// fullscreen, F12 saves a screenshot. The settings are config.toml
+// fullscreen, F12 saves a screenshot. With a port drawing its own frames
+// (xenoforge/native_render.h), F6 switches between them and the emulated
+// ones and the overlay shows what it skipped. F9 reloads the port's hooks
+// (when they are a module; also when its file changes). The settings are config.toml
 // (settings.h).
 //
 // One clock, the scheduler's: the guest runs on its own threads and never
@@ -30,7 +33,7 @@
 //
 //   player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] [--steps N]
 //        [--interpret] [--cache <dir>] [--game-library <file>] [--quit-after S] [--screenshots <dir>]
-//        [--screenshot-every N] [--press <b@s>]... [--no-sound] [--overlay] [--rates]
+//        [--screenshot-every N] [--press <b@s>]... [--no-sound] [--overlay] [--rates] [--hook-stats]
 //   player[_<game>] --identify
 
 #include "presenter.h"
@@ -39,6 +42,9 @@
 #include "settings.h"
 
 #include "../tools/game.h"
+#include "xenoforge/hooks.h"
+#include "xenoforge/native_render.h"
+#include "xenoforge/run.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -57,13 +63,6 @@
 #include <mutex>
 #include <string>
 #include <vector>
-
-#ifdef XF_GENERATED
-#include "xenoforge/ppc_module.h"
-// the game library's tables, one per module (xfrecomp emit's modules.cpp)
-extern "C" const xf::ppc::GeneratedModule *const xf_modules[];
-extern "C" const size_t xf_module_count;
-#endif
 
 using namespace xf;
 using Clock = std::chrono::steady_clock;
@@ -127,25 +126,26 @@ int fail(const std::string &message) {
 
 } // namespace
 
-int main(int argc, char **argv) {
+int xf::run_player(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: player <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] "
                         "[--steps N] [--interpret] [--cache <dir>] [--game-library <file>] [--quit-after S] "
                         "[--screenshots <dir>] [--screenshot-every N] "
-                        "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay] [--rates]\n";
+                        "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay] [--rates] [--hook-stats] "
+                        "[--option <key>=<value>]...\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     if (std::string(argv[1]) == "--identify") {
         // for the launcher (library.h): the modules whose generated code
         // this player carries, by the digest of the image each was made
         // from; the generic player carries none
         std::printf("player\n");
-#ifdef XF_GENERATED
-        for (size_t i = 0; i < xf_module_count; i++)
-            std::printf("module %016llx %s\n", (unsigned long long)xf_modules[i]->digest, xf_modules[i]->name);
-#endif
+        for (size_t i = 0; i < port.module_count; i++)
+            std::printf("module %016llx %s\n", (unsigned long long)port.modules[i]->digest, port.modules[i]->name);
         return 0;
     }
     game::Options o;
     o.input = argv[1];
+    o.modules = port.modules, o.module_count = port.module_count;
+    std::vector<std::string> option_args; // --option's, applied over the config file's values
     std::error_code ec;
     o.storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
     std::filesystem::path config_file, screenshots;
@@ -177,10 +177,14 @@ int main(int argc, char **argv) {
             screenshot_every = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--overlay")
             overlay = true;
+        else if (a == "--hook-stats")
+            hooks::set_stats(true);
         else if (a == "--no-sound")
             sound_wanted = false;
         else if (a == "--rates")
             print_rates = true;
+        else if (a == "--option" && i + 1 < argc)
+            option_args.push_back(argv[++i]);
         else if (a == "--press" && i + 1 < argc) {
             std::string why;
             if (!game::parse_press(argv[++i], presses.emplace_back(), why)) return fail(why);
@@ -203,16 +207,48 @@ int main(int argc, char **argv) {
     // defaults the first time so there is a file to edit
     frontend::Settings settings;
     if (config_file.empty()) config_file = frontend::default_path();
-    if (!frontend::load(config_file, settings, error, title_id))
+    const bool config_read = frontend::load(config_file, settings, error, title_id);
+    if (!config_read)
         std::fprintf(stderr, "%s: %s (the defaults instead)\n", config_file.string().c_str(), error.c_str());
-    else if (!std::filesystem::exists(config_file, ec) && !frontend::save(config_file, settings, error))
-        std::fprintf(stderr, "%s\n", error.c_str());
+    // the port's options: the file's values into the port's variables, the
+    // defaults (the variables as the port set them) into the file where it has
+    // none, then --option over the variables for this run
+    bool port_new = false;
+    for (const PortOption &op : port.options) {
+        auto at = settings.port.find(op.key);
+        if (at == settings.port.end()) {
+            port_new = true;
+            if (op.kind == PortOption::Kind::Boolean)
+                settings.port[op.key] = *op.flag;
+            else if (op.kind == PortOption::Kind::Integer)
+                settings.port[op.key] = int64_t(*op.integer);
+            else
+                settings.port[op.key] = *op.real;
+            continue;
+        }
+        const auto &v = at->second;
+        if (op.kind == PortOption::Kind::Boolean) {
+            if (auto *b = std::get_if<bool>(&v)) *op.flag = *b;
+        } else if (op.kind == PortOption::Kind::Integer) {
+            if (auto *i = std::get_if<int64_t>(&v)) *op.integer = int(std::clamp<double>(double(*i), op.min, op.max));
+        } else if (auto *d = std::get_if<double>(&v)) {
+            *op.real = std::clamp(*d, op.min, op.max);
+        } else if (auto *i = std::get_if<int64_t>(&v)) {
+            *op.real = std::clamp(double(*i), op.min, op.max);
+        }
+    }
+    if (config_read && (!std::filesystem::exists(config_file, ec) || port_new))
+        if (!frontend::save(config_file, settings, error)) std::fprintf(stderr, "%s\n", error.c_str());
+    for (const std::string &assignment : option_args) {
+        std::string why;
+        if (!port.set_option(assignment, why)) return fail(why);
+    }
     std::printf("settings: %s%s\n", config_file.string().c_str(),
                 settings.game.empty() ? "" : (std::string(" (the game's own, ") + title_id + ")").c_str());
     std::filesystem::path key_shots =
         settings.screenshots.empty() ? config_file.parent_path() / "screenshots" : settings.screenshots;
 
-    SDL_Window *window = SDL_CreateWindow((std::string("XenoForge - ") + title_id).c_str(), 1280, 720,
+    SDL_Window *window = SDL_CreateWindow((std::string("XenoForge - ") + (port.name.empty() ? title_id : port.name)).c_str(), 1280, 720,
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!window) return fail(std::string("SDL: ") + SDL_GetError());
     // one Vulkan device for the renderer and the window: the front buffers
@@ -297,8 +333,9 @@ int main(int argc, char **argv) {
     auto shot_wanted = [&](uint64_t swap) { return !screenshots.empty() && swap % screenshot_every == 0; };
     std::atomic<int> keys_wanted{0};
     options.on_swap = [&](const render::FrontBuffer &front) { presenter.take(front); };
-    // the driver's compiled pipelines kept between runs, beside the settings
-    options.pipeline_cache = config_file.parent_path() / "cache" / (std::string(title_id) + ".vkpipelines");
+    // (the driver's compiled pipelines and the shader storage are kept
+    // between runs beside the game library, in the cache, where the
+    // launcher's build step makes them: game::start_renderer's default)
     // new pipelines made on worker threads, their draws drawn meanwhile by
     // Options::pipeline_stand_in's default (boot and the replays wait for
     // each, as Xenia's trace dump does)
@@ -316,6 +353,8 @@ int main(int argc, char **argv) {
     std::printf("rendering on %s, the window on the same device (%s)\n", g.device->name().c_str(),
                 presenter.own_queue() ? "a queue of its own" : "the renderer's queue");
     stbi_write_png_compression_level = 1;
+    if (port.on_init) port.on_init(k);
+    if (!port.hook_module.empty() && !game::load_port_module(g, port.hook_module, error)) return fail(error);
     if (!game::launch(g, error)) return fail("launch: " + error);
     const Clock::time_point started = Clock::now();
 
@@ -353,6 +392,10 @@ int main(int argc, char **argv) {
                     changed = true;
                 }
                 if (e.key.scancode == SDL_SCANCODE_F12) key_screenshot();
+                // the port's frames or the emulated ones, for this run (the
+                // port's option, when it binds one, keeps the setting)
+                if (e.key.scancode == SDL_SCANCODE_F6 && native::has_output_renderer()) native::toggle();
+                if (e.key.scancode == SDL_SCANCODE_F9) game::poll_port_module(g, true); // the port's hooks reloaded
             }
             ImGui_ImplSDL3_ProcessEvent(&e);
         }
@@ -367,6 +410,7 @@ int main(int argc, char **argv) {
         if (k.stopped) quit = true, ended = "stopped: " + k.stop_reason;
         uint32_t exit_code = 0;
         if (k.wait_main(0, &exit_code)) quit = true, ended = "the main thread ended";
+        game::poll_port_module(g, false); // the port's hooks, loaded again when their module changed
 
         // the screenshots asked for
         std::deque<Shot> shots;
@@ -492,6 +536,59 @@ int main(int argc, char **argv) {
             ImGui::SameLine();
             moved |= ImGui::Checkbox("Fullscreen (F11)", &settings.video.fullscreen);
             if (moved) apply(), changed = true;
+            if (!port.options.empty()) {
+                ImGui::SeparatorText(port.name.empty() ? "Port" : port.name.c_str());
+                bool port_moved = false;
+                for (const PortOption &op : port.options) {
+                    const char *label = op.label.empty() ? op.key.c_str() : op.label.c_str();
+                    bool one = false;
+                    if (op.kind == PortOption::Kind::Boolean) {
+                        one = ImGui::Checkbox(label, op.flag);
+                        if (one) settings.port[op.key] = *op.flag;
+                    } else if (op.kind == PortOption::Kind::Integer) {
+                        one = ImGui::SliderInt(label, op.integer, int(op.min), int(op.max));
+                        if (one) settings.port[op.key] = int64_t(*op.integer);
+                    } else {
+                        one = ImGui::SliderScalar(label, ImGuiDataType_Double, op.real, &op.min, &op.max, "%.3f");
+                        if (one) settings.port[op.key] = *op.real;
+                    }
+                    port_moved |= one;
+                }
+                if (port_moved) changed = true;
+            }
+            if (native::has_output_renderer()) {
+                const native::Counters n = native::counters();
+                ImGui::SeparatorText("Native renderer (F6)");
+                ImGui::Text("%s; %llu frames the port's, %llu yielded (%llu held)",
+                            !native::enabled() ? "off: the emulated frames"
+                            : native::active() ? "on: the port's frames"
+                                               : "on: the port yields",
+                            (unsigned long long)n.frames_native, (unsigned long long)n.frames_yielded,
+                            (unsigned long long)n.frames_held);
+                ImGui::Text("skipped %llu draws, %llu resolves; kept %llu, %llu; %llu exporting memory; %llu "
+                            "occlusion reports faked",
+                            (unsigned long long)n.draws_skipped, (unsigned long long)n.resolves_skipped,
+                            (unsigned long long)n.draws_kept, (unsigned long long)n.resolves_kept,
+                            (unsigned long long)n.memexport_kept, (unsigned long long)n.occlusion_faked);
+            }
+            if (hooks::stats_on()) {
+                // the port's hooks and their calls (--hook-stats)
+                ImGui::SeparatorText("Port hooks");
+                if (ImGui::BeginTable("hooks", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+                    for (const hooks::Stat &st : hooks::stats()) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("0x%08X %s", st.address, st.function.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(hooks::kind_name(st.kind));
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(st.hook.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%llu", (unsigned long long)st.calls);
+                    }
+                    ImGui::EndTable();
+                }
+            }
             ImGui::SeparatorText("Screenshot");
             if (ImGui::Button("Save (F12)")) key_screenshot();
             ImGui::SameLine();
@@ -538,6 +635,7 @@ int main(int argc, char **argv) {
         std::printf("player: no sound device\n");
     std::printf("threads:\n%s", k.thread_report().c_str());
     game::print_report(g, true);
+    if (port.on_shutdown) port.on_shutdown(k);
     // the guest's threads still run: no destructors under them (boot's way)
     presenter.idle();
     std::fflush(stdout);

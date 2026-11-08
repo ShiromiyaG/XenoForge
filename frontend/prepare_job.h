@@ -30,7 +30,9 @@ class PrepareJob {
 
     // The real build of a disc into the cache, with `jobs` compilers at once
     // (0: the build's default).
-    static Runner build_runner(std::filesystem::path disc, std::filesystem::path cache_dir, unsigned jobs = 0);
+    // `force` builds although the cache has the library (a rebuild).
+    static Runner build_runner(std::filesystem::path disc, std::filesystem::path cache_dir, unsigned jobs = 0,
+                               bool force = false);
     // A build that is not one, for --demo-progress: a few minutes of stages
     // at `speed` times real time, ending in a failure when `fail`.
     static Runner demo_runner(double speed, bool fail);

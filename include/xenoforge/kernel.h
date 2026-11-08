@@ -18,9 +18,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -37,6 +39,9 @@ namespace xf::kernel {
 
 class Kernel;
 class Objects; // the objects and threads (src/kernel/objects.h)
+class Lockstep; // the lockstep check (lockstep.h, src/kernel/lockstep.cpp)
+struct LockstepOptions;
+struct LockstepCounts;
 using ExportFn = void (*)(Kernel &k, ppc::Context &c);
 
 // Registers an export's implementation by library ("xboxkrnl", "xam") and
@@ -121,6 +126,9 @@ std::string modules_report(Kernel &k);
 // the file name of the game's module loaded at address ("" if none), for
 // boot's report of where the interpreter was entered
 std::string module_at(Kernel &k, uint32_t address);
+// module_at for the crash report: the name and base, false when none holds
+// address or the modules' lock is taken (it never waits)
+bool module_at_try(Kernel &k, uint32_t address, std::string &name, uint32_t &base);
 // the base and size of the game's image (the executable or a DLL) holding
 // address, for the exception dispatch's function tables (its .pdata)
 bool module_range(Kernel &k, uint32_t address, uint32_t &base, uint32_t &size);
@@ -186,6 +194,35 @@ void setup_audio(Kernel &k);
 void shutdown_audio(Kernel &k);
 std::string audio_report(Kernel &k);
 
+// The deterministic mode (plan A5; docs/runtime.md, "The deterministic mode"):
+// every guest thread a fiber on one host thread, handed over in a fixed order,
+// on a virtual clock that moves with the guest's kernel calls and time base
+// reads and jumps to the next deadline when every thread waits. The same disc
+// and the same input give the same run. Costs and the slice are in the clock's
+// 100 ns.
+struct Deterministic {
+    uint64_t system_time = 133'801'632'000'000'000ull; // the guest's system time at the start: 2025-01-01 00:00 UTC
+    uint64_t call_cost = 10;      // a kernel call: 1 us
+    uint64_t time_base_cost = 1;  // a time base read (mftb): 100 ns
+    uint64_t dispatch_cost = 1;   // an indirect call (Kernel::dispatch): 100 ns
+    // The recompiler's yield points (a loop's back edge, a priority hint;
+    // ppc_ops.h) are counted in units of 1/yield_units of 100 ns: a back edge
+    // one (about 3 ns), a priority hint eight. 0: not counted.
+    uint32_t yield_units = 32;
+    uint64_t slice = 10'000;      // a thread runs 1 ms of the clock before the next ready one does
+    // Guest code that runs this long on the host without handing over (a spin
+    // with no kernel call, time base read or indirect call) is handed over
+    // where it is: the run goes on, no longer exact (0: never; Windows only).
+    uint32_t force_after_ms = 100;
+    // Paced: the clock never runs ahead of the host's (the player's, so the
+    // game plays at its speed); else it runs as fast as the host can (boot).
+    bool paced = false;
+    // Asked as each thread is handed over (on the scheduler's thread, the
+    // kernel's lock held): true stops the run there for good, every guest
+    // thread parked where it handed over (boot's --until-swap, --until).
+    std::function<bool()> halt;
+};
+
 class Kernel {
 public:
     explicit Kernel(Memory &memory);
@@ -247,6 +284,19 @@ public:
     bool wait_main(uint32_t timeout_ms, uint32_t *exit_code = nullptr);
     // the guest threads alive: each one's state and where it was
     std::string thread_report();
+    // The deterministic mode (Deterministic), chosen before launch: false
+    // when a guest thread has started already. halted: its halt said stop,
+    // and every guest thread is parked.
+    bool make_deterministic(const Deterministic &options);
+    bool deterministic() const;
+    bool halted() const;
+    // a hash (FNV-1a, 64-bit) of the guest memory committed and readable,
+    // region by region in address order: two runs that left the same memory
+    // give the same one
+    uint64_t memory_hash();
+    // the host addresses the generated code spans (its lowest and highest
+    // function), where the deterministic mode may stop a thread
+    std::pair<uintptr_t, uintptr_t> generated_code_span();
     // the context of the guest thread on this host thread (nullptr off one)
     static ppc::Context *current_context();
     Objects &objects() { return *objects_; }
@@ -258,7 +308,9 @@ public:
     void call(ppc::Context &c, uint32_t address);
     // what generated code's dispatch() and the interpreter's calls reach
     void dispatch(ppc::Context &c, uint32_t target);
-    bool try_call(ppc::Context &c, uint32_t target); // generated or import: ran it
+    // generated, an import or the port's hooks there (hooks false: those
+    // left out, for a hooked function's original body): ran it
+    bool try_call(ppc::Context &c, uint32_t target, bool hooks = true);
     // Runs the guest from pc with no frame to return to (a guest stack's
     // host stack, from where the stack was entered): the function at pc,
     // generated or imported, then on where it returns; the interpreter where
@@ -277,6 +329,15 @@ public:
     // the addresses the interpreter was entered at, and how often: with
     // generated code linked, what discovery missed
     std::unordered_map<uint32_t, uint64_t> interpreted_targets() const;
+    // Called once per address the first time the interpreter is entered at it
+    // as a function: a dispatch or a thread's start with no generated code,
+    // and a call the interpreted code makes to an address with none (not the
+    // returns an Unwind goes on from). With generated code loaded, what
+    // discovery missed: the generic runtime logs them beside the cached game
+    // library for the next build (docs/plan.md, D3; game_build.h's EntryLog).
+    // Set before the guest runs; the hook is called from any guest thread.
+    using EntryHook = void (*)(void *user, uint32_t address);
+    void set_entry_hook(EntryHook hook, void *user) { entry_hook_ = hook, entry_hook_user_ = user; }
 
     // a variable export's value (the kernel's object for it), by name
     uint32_t variable(const std::string &name);
@@ -340,8 +401,54 @@ public:
     // instruction with no semantics): where, and why
     std::atomic<bool> stopped{false};
     std::string stop_reason;
+    // Stops the run (the first reason stays), with the crash report (crash.h)
+    // of the calling guest thread, as it was when it stopped it.
+    void stop(const std::string &reason);
+    std::string stop_report, stop_stack; // the report's text, and its one-line stack
+
+    // Where a guest address is in the generated code's tables, for the
+    // reports: its module's file name and the function it falls in (the last
+    // one starting at or before it, within 64 KB). Locks nothing (the crash
+    // path uses them).
+    bool guest_function(uint32_t address, const char *&module, uint32_t &start) const;
+    // The generated function whose host code is nearest below a host code
+    // address (within 64 KB): the guest function a fault there came from.
+    bool guest_function_of_host(const void *host, uint32_t &start) const;
+
+    // The lockstep check (lockstep.h): the interpreter checks the generated
+    // code of the calls chosen, mismatches printed as they are found. Set
+    // before guest threads run; off by default.
+    bool enable_lockstep(const LockstepOptions &options, std::string &error);
+    bool lockstep_enabled() const { return lockstep_ != nullptr; }
+    LockstepCounts lockstep_counts() const;
+    std::string lockstep_report() const; // the counts, a few lines
+
+    // Every guest thread parked at a safe point (docs/runtime.md, "Pausing
+    // the guest"): at a kernel call (as it enters or leaves one; a thread
+    // waiting inside one counts as parked, and stays there until resume),
+    // or at a yield point of the generated code (the deterministic mode's,
+    // and in the other mode the next back edge, the yield points being
+    // turned on for the pause). True once none runs guest code; false after
+    // timeout_ms (the threads still running are left to park as they come).
+    // Either way the pause holds until resume(). What the port's hooks are
+    // reloaded under (port_module.h). Not from a guest thread.
+    bool pause(uint32_t timeout_ms);
+    void resume();
+    bool pause_requested() const { return pause_requested_.load(std::memory_order_relaxed); }
+    // the guest threads that ran guest code when pause() returned
+    uint32_t pause_unparked() const { return pause_unparked_; }
 
 private:
+    friend class Lockstep;
+    // (try_call's) generated code run, or checked by the lockstep check
+    void run_generated(ppc::Context &c, uint32_t target, void (*fn)(ppc::Context &));
+    // The port's hooks (xenoforge/hooks.h): a hooked function reached through
+    // dispatch whose generated code has no hook slot (or none at all) run
+    // with its hooks; its original body (System::run_original); and the
+    // marker the lockstep check names a hook by, as an import.
+    bool call_hooked(ppc::Context &c, uint32_t target);
+    void run_original(ppc::Context &c, uint32_t address);
+    const Import *hook_marker(uint32_t address);
     void bind(const Xex &xex, bool executable);
     void run_import(ppc::Context &c, const Import &import);
     void publish_code();
@@ -358,6 +465,11 @@ private:
     }
 
     Memory &memory_;
+    // what a kernel call and a time base read cost the deterministic mode's
+    // clock (0 when playing)
+    uint64_t deterministic_call_cost_ = 0, deterministic_time_base_cost_ = 0, deterministic_dispatch_cost_ = 0;
+    // the yield points' units in 100 ns (0: not counted; attach)
+    uint32_t deterministic_yield_units_ = 0;
     const Xex *xex_ = nullptr;
     uint32_t entry_ = 0;
     ppc::System system_;
@@ -380,6 +492,10 @@ private:
     std::map<std::string, uint64_t> calls_, unimplemented_;
     std::atomic<uint64_t> interpreted_{0};
     std::unordered_map<uint32_t, uint64_t> interpreted_targets_; // under counts_mutex_
+    EntryHook entry_hook_ = nullptr;
+    void *entry_hook_user_ = nullptr;
+    std::unordered_map<uint32_t, bool> entries_seen_; // under counts_mutex_
+    void entered(uint32_t address); // the entry hook, once per address
     // add_thunk's (a map: its entries stay where they are)
     mutable std::shared_mutex thunks_mutex_;
     std::map<uint32_t, Import> thunks_;
@@ -392,6 +508,17 @@ private:
     // destroyed after the objects and threads, before the rest
     std::mutex states_mutex_;
     std::map<const void *, std::shared_ptr<void>> states_;
+    std::unique_ptr<Lockstep> lockstep_;
+    std::mutex hook_markers_mutex_;
+    std::map<std::string, Import> hook_markers_; // never dropped: the lockstep check keeps pointers
+    // pause(): asked, and where threads wait for resume()
+    std::atomic<bool> pause_requested_{false};
+    std::mutex pause_mutex_;
+    std::condition_variable pause_cv_;
+    uint32_t pause_unparked_ = 0;
+    // a guest thread at a safe point: parked until resume() (pause_requested_ set)
+    void park();
+    friend struct GuestCodeScope;
     std::unique_ptr<Objects> objects_; // last: it reaches the rest
 };
 

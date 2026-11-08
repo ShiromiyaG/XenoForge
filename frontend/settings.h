@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace xf::frontend {
@@ -53,6 +54,8 @@ struct Settings {
         double left_deadzone = 0, right_deadzone = 0; // 0-1 of the stick's range (Xenia's *_deadzone_percentage)
         bool vibration = true;
     } input;
+    // the port's options (run.h's PortOption) by key, in config.toml's [port]
+    std::map<std::string, std::variant<bool, int64_t, double>> port;
     // each binding's keys, space-separated (BINDINGS' names)
     std::map<std::string, std::string> keys;
     // where F12 and the overlay's button put screenshots ("" for the

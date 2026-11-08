@@ -185,6 +185,8 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     // whether a library is cached for a disc, by its digest: asked of the
     // cache folder once, again after a rescan or a build
     mutable std::map<uint64_t, bool> cached_;
+    mutable std::map<uint64_t, bool> stale_; // by digest: the cached library lacks entries the runtime logged
+    bool stale_of(const GameEntry &game) const;
 
     // the backdrop's ribbons: their clock (it stops with the window out of sight)
     double backdrop_clock_ = 7.0, backdrop_seen_ = 0;

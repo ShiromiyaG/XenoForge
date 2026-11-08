@@ -25,6 +25,8 @@
 //   drivers the null pointer).
 // - The drivers get the scheduler's clock (the keystrokes' repeats; Xenia's
 //   guest uptime, the same clock).
+// - The answers can be recorded to a file and replayed from it in place of
+//   the drivers (docs/input.md, "Recordings"; Xenia has none).
 
 #include "xam.h"
 #include "xenoforge/input.h"
@@ -34,6 +36,7 @@
 #include <bitset>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -188,10 +191,162 @@ using namespace input;
 
 constexpr uint32_t XN_SYS_INPUTDEVICESCHANGED = 0x00000012;
 
+// A recording of the answers (docs/input.md, "Recordings"): a text file, a
+// line each time a user's answer changes, at the time on the scheduler's
+// clock (100 ns) it was asked:
+//   s <time> <user> <result> <packet> <buttons> <lt> <rt> <lx> <ly> <rx> <ry>   XamInputGetState
+//   k <time> <user> <result> <virtual key> <unicode> <flags> <hid code>          a keystroke
+//   c <time> <user> <result>                                                     the capabilities
+// (results, packets, buttons and keys in hex). Every keystroke delivered is a
+// line; for the others, a line when the answer differs from the user's last.
+struct InputRecorder {
+    std::FILE *file = nullptr;
+    ~InputRecorder() {
+        if (file) std::fclose(file);
+    }
+    struct Last {
+        bool seen = false;
+        uint32_t result = 0, packet = 0;
+        Gamepad pad;
+    };
+    Last states[USERS], keys[USERS], caps[USERS];
+
+    void line(const char *text) {
+        std::fputs(text, file);
+        std::fflush(file); // a run cut short keeps what it saw
+    }
+    void state(uint64_t time, uint32_t user, uint32_t result, const State &st) {
+        Last &l = states[user];
+        Gamepad pad = result == SUCCESS ? st.gamepad : Gamepad{};
+        uint32_t packet = result == SUCCESS ? st.packet_number : 0;
+        if (l.seen && l.result == result && l.packet == packet && l.pad == pad) return;
+        l = {true, result, packet, pad};
+        char text[160];
+        std::snprintf(text, sizeof(text), "s %llu %u %X %X %X %u %u %d %d %d %d\n", (unsigned long long)time, user,
+                      result, packet, pad.buttons, pad.left_trigger, pad.right_trigger, pad.thumb_lx, pad.thumb_ly,
+                      pad.thumb_rx, pad.thumb_ry);
+        line(text);
+    }
+    void keystroke(uint64_t time, uint32_t user, uint32_t result, const Keystroke &key) {
+        Last &l = keys[user];
+        if (result != SUCCESS) {
+            if (l.seen && l.result == result) return;
+            l.seen = true, l.result = result;
+        }
+        Keystroke out = result == SUCCESS ? key : Keystroke{};
+        char text[128];
+        std::snprintf(text, sizeof(text), "k %llu %u %X %X %X %X %X\n", (unsigned long long)time, user, result,
+                      out.virtual_key, out.unicode, out.flags, out.hid_code);
+        line(text);
+    }
+    void capabilities(uint64_t time, uint32_t user, uint32_t result) {
+        Last &l = caps[user];
+        if (l.seen && l.result == result) return;
+        l.seen = true, l.result = result;
+        char text[64];
+        std::snprintf(text, sizeof(text), "c %llu %u %X\n", (unsigned long long)time, user, result);
+        line(text);
+    }
+};
+
+// A recording answering in place of the drivers: a state or the capabilities
+// as the last line at or before the time asked (the first line before it), the
+// keystrokes in order, each once its time has come.
+struct InputReplay {
+    struct Point {
+        uint64_t time = 0;
+        uint32_t result = DEVICE_NOT_CONNECTED, packet = 0;
+        Gamepad pad;
+    };
+    struct Key {
+        uint64_t time = 0;
+        uint32_t result = EMPTY;
+        Keystroke key;
+    };
+    std::vector<Point> states[USERS], caps[USERS];
+    std::deque<Key> keys[USERS];
+    uint32_t key_result[USERS] = {EMPTY, EMPTY, EMPTY, EMPTY}; // the last one not a keystroke
+    uint64_t lines = 0;
+
+    static const Point *at(const std::vector<Point> &points, uint64_t time) {
+        if (points.empty()) return nullptr;
+        auto it = std::upper_bound(points.begin(), points.end(), time,
+                                   [](uint64_t t, const Point &p) { return t < p.time; });
+        return it == points.begin() ? &points.front() : &*(it - 1);
+    }
+    uint32_t state(uint64_t time, uint32_t user, State &out) {
+        const Point *p = at(states[user], time);
+        if (!p) return DEVICE_NOT_CONNECTED;
+        if (p->result == SUCCESS) out.packet_number = p->packet, out.gamepad = p->pad;
+        return p->result;
+    }
+    uint32_t capabilities(uint64_t time, uint32_t user, Capabilities &out) {
+        const Point *p = at(caps[user], time);
+        if (!p) p = at(states[user], time);
+        if (!p) return DEVICE_NOT_CONNECTED;
+        if (p->result == SUCCESS) out = gamepad_capabilities();
+        return p->result;
+    }
+    uint32_t keystroke(uint64_t time, uint32_t user, Keystroke &out) {
+        auto &q = keys[user];
+        while (!q.empty() && q.front().time <= time) {
+            Key key = q.front();
+            q.pop_front();
+            if (key.result != SUCCESS) {
+                key_result[user] = key.result;
+                continue;
+            }
+            out = key.key;
+            return SUCCESS;
+        }
+        return key_result[user];
+    }
+    bool read(std::FILE *f, std::string &error) {
+        char text[256];
+        for (uint64_t n = 1; std::fgets(text, sizeof(text), f); n++) {
+            if (text[0] == '#' || text[0] == '\n' || text[0] == '\r') continue;
+            unsigned long long time = 0;
+            unsigned user = USERS, result = 0, a = 0, b = 0, c = 0, d = 0, e = 0;
+            int lx = 0, ly = 0, rx = 0, ry = 0;
+            bool ok = false;
+            if (text[0] == 's') {
+                ok = std::sscanf(text, "s %llu %u %X %X %X %u %u %d %d %d %d", &time, &user, &result, &a, &b, &c, &d,
+                                 &lx, &ly, &rx, &ry) == 11;
+                if (ok && user < USERS) {
+                    Point p{time, result, a, {}};
+                    p.pad = {uint16_t(b), uint8_t(c), uint8_t(d), int16_t(lx), int16_t(ly), int16_t(rx), int16_t(ry)};
+                    states[user].push_back(p);
+                }
+            } else if (text[0] == 'k') {
+                ok = std::sscanf(text, "k %llu %u %X %X %X %X %X", &time, &user, &result, &a, &b, &c, &e) == 7;
+                if (ok && user < USERS) {
+                    Key k{time, result, {}};
+                    k.key = {uint16_t(a), uint16_t(b), uint16_t(c), uint8_t(user), uint8_t(e)};
+                    keys[user].push_back(k);
+                }
+            } else if (text[0] == 'c') {
+                ok = std::sscanf(text, "c %llu %u %X", &time, &user, &result) == 3;
+                if (ok && user < USERS) caps[user].push_back({time, result, 0, {}});
+            }
+            if (!ok || user >= USERS) {
+                error = "line " + std::to_string(n) + " is not a recording's: " + text;
+                return false;
+            }
+            lines++;
+        }
+        return true;
+    }
+};
+
 // Xenia's InputSystem: the drivers in order, the users seen connected, the
 // deadzones, what was answered
 struct InputSystem {
     std::mutex mutex;
+    Kernel *k = nullptr;
+    // a recording made, or answering in place of the drivers
+    std::unique_ptr<InputRecorder> recorder;
+    std::unique_ptr<InputReplay> replay;
+    uint64_t time() const { return k ? k->interrupt_time() : 0; }
     std::vector<std::unique_ptr<Driver>> drivers;
     std::bitset<USERS> connected;
     double deadzone[2] = {0, 0}; // left, right
@@ -232,12 +387,34 @@ struct InputSystem {
     }
 
     uint32_t capabilities(uint32_t user, uint32_t flags, Capabilities &out) {
+        if (replay) return user < USERS ? replay->capabilities(time(), user, out) : DEVICE_NOT_CONNECTED;
+        uint32_t r = DEVICE_NOT_CONNECTED;
         for (Driver *d : filter(flags))
-            if (d->capabilities(user, flags, out) == SUCCESS) return SUCCESS;
-        return DEVICE_NOT_CONNECTED;
+            if (d->capabilities(user, flags, out) == SUCCESS) {
+                r = SUCCESS;
+                break;
+            }
+        if (recorder && user < USERS) recorder->capabilities(time(), user, r);
+        return r;
     }
 
     uint32_t state(uint32_t user, uint32_t flags, uint64_t now_ms, State &out, bool &changed) {
+        if (replay) {
+            // the answer recorded, deadzones and all
+            uint32_t r = replay->state(time(), user, out);
+            changed = update_slot(nullptr, user, r == SUCCESS);
+            if (r == SUCCESS)
+                states[user]++;
+            else
+                not_connected++;
+            return r;
+        }
+        uint32_t r = drivers_state(user, flags, now_ms, out, changed);
+        if (recorder) recorder->state(time(), user, r, out);
+        return r;
+    }
+
+    uint32_t drivers_state(uint32_t user, uint32_t flags, uint64_t now_ms, State &out, bool &changed) {
         std::vector<Driver *> list = filter(flags);
         if (list.empty()) {
             not_connected++;
@@ -257,12 +434,28 @@ struct InputSystem {
 
     uint32_t vibrate(uint32_t user, const Vibration &v) {
         vibrations++;
+        if (replay) {
+            // the pad as the recording has it at this time
+            State st;
+            return user < USERS ? replay->state(time(), user, st) : DEVICE_NOT_CONNECTED;
+        }
         for (auto &d : drivers)
             if (d->vibrate(user, v) == SUCCESS) return SUCCESS;
         return DEVICE_NOT_CONNECTED;
     }
 
     uint32_t keystroke(uint32_t user, uint32_t flags, uint64_t now_ms, Keystroke &out) {
+        if (replay) {
+            uint32_t r = user < USERS ? replay->keystroke(time(), user, out) : DEVICE_NOT_CONNECTED;
+            if (r == SUCCESS) keystrokes[user]++;
+            return r;
+        }
+        uint32_t r = drivers_keystroke(user, flags, now_ms, out);
+        if (recorder && user < USERS) recorder->keystroke(time(), user, r, out);
+        return r;
+    }
+
+    uint32_t drivers_keystroke(uint32_t user, uint32_t flags, uint64_t now_ms, Keystroke &out) {
         bool any_connected = false;
         for (Driver *d : filter(flags)) {
             uint32_t r = d->keystroke(user, flags, now_ms, out);
@@ -277,7 +470,11 @@ struct InputSystem {
     }
 };
 
-InputSystem &inputs(Kernel &k) { return k.state<InputSystem>(); }
+InputSystem &inputs(Kernel &k) {
+    InputSystem &s = k.state<InputSystem>();
+    s.k = &k; // (the same kernel every time)
+    return s;
+}
 
 // the guest's structures, big-endian
 void write_gamepad(Kernel &k, uint32_t at, const Gamepad &g) {
@@ -348,6 +545,32 @@ void set_input_deadzones(Kernel &k, double left, double right) {
     InputSystem &s = inputs(k);
     std::lock_guard<std::mutex> lock(s.mutex);
     s.deadzone[0] = left, s.deadzone[1] = right;
+}
+
+bool record_input(Kernel &k, const std::filesystem::path &path, std::string &error) {
+    std::FILE *f = std::fopen(path.string().c_str(), "w");
+    if (!f) return error = "cannot write " + path.string(), false;
+    std::fputs("# xenoforge input recording 1: s/k/c <time in 100 ns> <user> <result> ... (docs/input.md)\n", f);
+    InputSystem &s = inputs(k);
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.recorder = std::make_unique<InputRecorder>();
+    s.recorder->file = f;
+    return true;
+}
+
+bool replay_input(Kernel &k, const std::filesystem::path &path, std::string &error) {
+    std::FILE *f = std::fopen(path.string().c_str(), "r");
+    if (!f) return error = "cannot read " + path.string(), false;
+    auto replay = std::make_unique<InputReplay>();
+    bool ok = replay->read(f, error);
+    std::fclose(f);
+    if (!ok) return error = path.string() + ": " + error, false;
+    std::fprintf(stderr, "input: replaying %llu lines from %s\n", (unsigned long long)replay->lines,
+                 path.string().c_str());
+    InputSystem &s = inputs(k);
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.replay = std::move(replay);
+    return true;
 }
 
 uint64_t input_states_delivered(Kernel &k) {

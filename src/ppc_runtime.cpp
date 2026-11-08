@@ -53,6 +53,8 @@ Runtime core_runtime() {
     Runtime r{};
     r.size = sizeof(Runtime);
     r.resumable = &resumable;
+    r.hooked = &hooked;
+    r.mid_hook = &mid_hook;
     r.memcpy = [](void *to, const void *from, size_t n) { return std::memcpy(to, from, n); };
     r.memmove = [](void *to, const void *from, size_t n) { return std::memmove(to, from, n); };
     r.memset = [](void *to, int value, size_t n) { return std::memset(to, value, n); };

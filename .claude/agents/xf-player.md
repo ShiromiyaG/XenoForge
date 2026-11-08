@@ -3,7 +3,7 @@ name: xf-player
 description: Works on XenoForge's frontend (plan track C) - the player (SDL3 window, Vulkan presentation of the renderer's front buffer, controller and keyboard input into XAM, sound output, the ImGui overlay, config.toml) and the launcher - modelled on the 3DS runtime's frontend. Use for player, launcher, input or host audio output tasks in F:\RECOMPs\XenoForge.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
 model: sonnet
-effort: high
+effort: medium
 isolation: worktree
 ---
 
@@ -73,6 +73,14 @@ Then:
 - Run every test, tool and game under a timeout; never leave a process or a window open when you finish.
 - Shell: Bash is Git Bash on Windows. Heredocs mangle backslashes, so make code changes with
   Edit/Write.
+
+## No game names (the owner's rule, 2026-11-08)
+
+Nothing in the repository names a specific game: no title, codename or port
+name in code, comments, tests, CMake, scripts, examples, READMEs, docs or
+commit messages. Write "a game", "<game>", "a UE3 game with 4.7M
+instructions", made-up addresses in examples. Running real discs by hand to
+test is fine; say which ones only in the report to the main session.
 
 ## Token economy (the owner's rule, 2026-11-06)
 

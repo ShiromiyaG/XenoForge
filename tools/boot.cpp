@@ -35,13 +35,37 @@
 // clock, the renderer's time), as the player's --rates does. --stall-report S
 // prints the threads (what each waits for, its guest stack by the back chain)
 // when no swap has come for S seconds (5 S before the first), once a stall.
+// --deterministic runs every guest thread as a fiber on one host thread in a
+// fixed order on a virtual clock (docs/runtime.md, "The deterministic mode";
+// --paced keeps that clock behind the host's): the same disc and input give
+// the same run. --until-swap N or --until S (seconds of its clock) halts it
+// there, every thread parked, and the report adds a hash of guest memory.
+// --record-input <file> writes what XAM's input answered, --replay-input
+// <file> answers from such a recording (docs/input.md, "Recordings").
+// The last line is "xf-summary {json}" (game.h, print_summary), what xfcompat
+// reads: title, digest, state (ok, stall, stopped, ended, crash), generated
+// code, interpreter entries, swaps, the exports and GPU gaps counted.
+// --lockstep 82001234,... and --lockstep-sample N have the interpreter check
+// the generated code of the calls to those functions and of one call in N
+// (xenoforge/lockstep.h; XF_LOCKSTEP and XF_LOCKSTEP_SAMPLE in the player):
+// mismatches are printed as found, the counts in the report.
+// --hook-stats counts the calls of each of the port's hooks (before, after,
+// replace, mid) and the report lists them. A port whose hooks are a module
+// of their own (PortInfo::hook_module) loads it before the game runs and
+// loads it again when the file changes, or every S seconds with
+// --reload-hooks-every S (docs/sdk.md, "Reloading the hooks").
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
-//        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S]
+//        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
+//        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
+//        [--hook-stats] [--reload-hooks-every S]
 
 #include "game.h"
+#include "xenoforge/hooks.h"
+#include "xenoforge/lockstep.h"
+#include "xenoforge/run.h"
 
 #include <chrono>
 #include <cstdio>
@@ -56,15 +80,20 @@
 
 using namespace xf;
 
-int main(int argc, char **argv) {
+int xf::run_boot(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
                         "[--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
-                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>]\n";
+                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
+                        "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
+                        "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
+                        "[--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
+                        "[--option <key>=<value>]...\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
+    o.modules = port.modules, o.module_count = port.module_count;
     std::error_code ec;
     o.storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
     uint32_t seconds = 30;
@@ -75,6 +104,7 @@ int main(int argc, char **argv) {
     std::set<uint64_t> shot_swaps, trace_frames;
     uint64_t shot_every = 0;
     std::filesystem::path trace_dir = "traces";
+    double reload_every = 0;
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc)
@@ -110,9 +140,35 @@ int main(int argc, char **argv) {
             controller = false;
         else if (a == "--rates")
             rates = true;
+        else if (a == "--crash-dir" && k + 1 < argc)
+            game::set_crash_directory(argv[++k]);
         else if (a == "--stall-report" && k + 1 < argc)
             stall_report = std::strtod(argv[++k], nullptr);
-        else if (a == "--press" && k + 1 < argc) {
+        else if (a == "--lockstep" && k + 1 < argc) {
+            if (!kernel::parse_lockstep_functions(argv[++k], o.lockstep))
+                return std::fprintf(stderr, "bad --lockstep\n%s", usage), 2;
+        } else if (a == "--lockstep-sample" && k + 1 < argc)
+            o.lockstep_sample = uint32_t(std::strtoul(argv[++k], nullptr, 10));
+        else if (a == "--deterministic")
+            o.deterministic = std::max(o.deterministic, 1);
+        else if (a == "--paced")
+            o.deterministic = 2;
+        else if (a == "--until-swap" && k + 1 < argc)
+            o.halt_swap = std::strtoull(argv[++k], nullptr, 10);
+        else if (a == "--until" && k + 1 < argc)
+            o.halt_seconds = std::strtod(argv[++k], nullptr);
+        else if (a == "--record-input" && k + 1 < argc)
+            o.record_input = argv[++k];
+        else if (a == "--replay-input" && k + 1 < argc)
+            o.replay_input = argv[++k];
+        else if (a == "--hook-stats")
+            hooks::set_stats(true);
+        else if (a == "--reload-hooks-every" && k + 1 < argc)
+            reload_every = std::strtod(argv[++k], nullptr);
+        else if (a == "--option" && k + 1 < argc) {
+            std::string why;
+            if (!port.set_option(argv[++k], why)) return std::fprintf(stderr, "%s\n", why.c_str()), 2;
+        } else if (a == "--press" && k + 1 < argc) {
             std::string why;
             if (!game::parse_press(argv[++k], presses.emplace_back(), why))
                 return std::fprintf(stderr, "%s\n", why.c_str()), 2;
@@ -156,6 +212,9 @@ int main(int argc, char **argv) {
                     shots.string().c_str());
     }
 
+    if (port.on_init) port.on_init(k);
+    if (!port.hook_module.empty() && !game::load_port_module(g, port.hook_module, error))
+        return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     if (!game::launch(g, error)) return std::fprintf(stderr, "launch: %s\n", error.c_str()), 1;
     // until the main thread ends, the code hits what cannot run, or time is up
     uint32_t exit_code = 0;
@@ -170,9 +229,16 @@ int main(int argc, char **argv) {
     uint64_t last_swaps = 0;
     double last_swap_at = 0;
     bool stall_reported = false;
+    bool halted = false;
+    double next_reload = reload_every;
     for (double elapsed = 0; elapsed < seconds && !k.stopped;) {
         if ((ended = k.wait_main(100, &exit_code))) break;
+        if ((halted = k.halted())) break;
         elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        // the port's hooks: loaded again when the module's file changed, or on the clock asked
+        const bool due = reload_every > 0 && elapsed >= next_reload;
+        if (due) next_reload += reload_every;
+        game::poll_port_module(g, due);
         if (rates && elapsed >= next_rates) game::print_rates(g, rate_log, elapsed), next_rates += 1;
         if (stall_report > 0) {
             uint64_t now_swaps = swaps();
@@ -191,10 +257,27 @@ int main(int argc, char **argv) {
         std::printf("stopped: %s\n", k.stop_reason.c_str());
     else if (ended)
         std::printf("the main thread ended (exit code 0x%08X)\n", exit_code);
+    else if (halted)
+        std::printf("halted (the deterministic mode's --until-swap or --until)\n");
     else
         std::printf("still running after %u s\n", seconds);
+    // a stop's report (the guest stack, the last kernel calls), written to a file
+    std::string stop_file = k.stopped ? game::write_stop_report(g) : std::string();
     std::printf("threads:\n%s", k.thread_report().c_str());
     game::print_report(g, true);
+    if (k.deterministic()) std::printf("guest memory hash %016llx\n", (unsigned long long)k.memory_hash());
+    // the machine-readable end (xfcompat reads it): a stall still under way at the end is the state
+    {
+        char text[64];
+        std::snprintf(text, sizeof(text), "exit code 0x%08X", exit_code);
+        if (k.stopped)
+            game::print_summary(g, "stopped", k.stop_reason, k.stop_stack, stop_file);
+        else if (ended)
+            game::print_summary(g, "ended", text);
+        else
+            game::print_summary(g, stall_reported ? "stall" : "ok", halted ? "halted" : "");
+    }
+    if (port.on_shutdown) port.on_shutdown(k);
     // other threads may still run: no destructors under them
     std::fflush(stdout);
     std::_Exit(0);

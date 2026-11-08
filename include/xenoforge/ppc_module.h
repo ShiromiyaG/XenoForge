@@ -27,6 +27,25 @@ struct GeneratedFunction {
     void (*fn)(Context &);
 };
 
+// A hook slot (docs/recompiler.md, "Replacing and hooking"): where the
+// generated code of a function the project file hooks, or of an address
+// inside one it hooks mid-function, asks the runtime what the port runs
+// there. Written by the emitter in table.cpp, filled by the runtime
+// (xenoforge/hooks.h) as the module's code is taken in and as the port
+// registers hooks; read by the generated code once per call (XF_HOOKS).
+struct HookSlot {
+    uint32_t address;
+    uint32_t size;               // a function's bytes (0: a mid-function hook's slot)
+    void (*original)(Context &); // a function's own body (nullptr: a mid-function hook's slot)
+    const void *hooks;           // the runtime's: what the port runs there (nullptr: nothing)
+};
+
+// A name the project file gives a function, for the reports.
+struct FunctionName {
+    uint32_t address;
+    const char *name;
+};
+
 // One module's generated code: the image it was made from (its file name, for
 // the reports; where it is placed; the digest of its bytes as the loader
 // unpacks them, before any import is bound, xf::image_digest), its functions
@@ -41,6 +60,12 @@ struct GeneratedModule {
     size_t count;
     const uint32_t *resumes = nullptr;
     size_t resume_count = 0;
+    // the hook slots of the functions and addresses the project file hooks,
+    // and its names (none without a project file)
+    HookSlot *const *hooks = nullptr;
+    size_t hook_count = 0;
+    const FunctionName *names = nullptr; // by address
+    size_t name_count = 0;
 };
 
 } // namespace xf::ppc

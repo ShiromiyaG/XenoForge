@@ -26,8 +26,8 @@ build it; to run anything you need your own copy of a game.
   (F1). The launcher lists your discs and their settings, recompiles a disc on
   your machine into a cached game library (Prepare), and starts the generic
   player on it.
-- **Games:** El Chavo Kart and Ben 10: Alien Force – Vilgax Attacks play with
-  picture, sound and pad. Six more games boot.
+- **Games:** two retail games play with
+  picture, sound and pad; six more boot.
 
 ## Building
 

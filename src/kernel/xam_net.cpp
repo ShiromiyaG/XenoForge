@@ -69,6 +69,7 @@
 
 #include "xam.h"
 
+#include <atomic>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -547,7 +548,7 @@ XF_EXPORT(xam, XNetLogonGetMachineID) {
 
 // (index): the running title's ID. Xenia has no implementation (its
 // undefined import leaves r3, the argument, as it is); the title's own ID
-// is what the name asks for, and Gears of War 3, the one caller seen, only
+// is what the name asks for, and the one caller seen (a UE3 game) only
 // puts it in a Live request that fails earlier (no user signed in to Live).
 XF_EXPORT(xam, XNetLogonGetTitleID) { result(c, title_id(k)); }
 
@@ -569,8 +570,9 @@ XF_EXPORT(xam, NetDll_XNetGetOpt) {
 XF_EXPORT(xam, NetDll_XNetRandom) {
     uint32_t buffer = arg(k, c, 1), length = arg(k, c, 2);
     if (buffer && length) {
-        std::random_device device;
-        std::mt19937_64 gen(device());
+        // (a fixed seed in the deterministic mode, as XeCryptRandom's)
+        static std::atomic<uint64_t> calls{0};
+        std::mt19937_64 gen(k.deterministic() ? 0x584E657452616E64ull + calls++ : std::random_device{}());
         for (uint32_t i = 0; i < length; i++) k.host(buffer + i)[0] = uint8_t(gen());
     }
     result(c, X_ERROR_SUCCESS);

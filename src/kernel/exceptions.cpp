@@ -470,6 +470,12 @@ struct Active {
 
 thread_local Active *active_walks = nullptr;
 
+} // namespace
+
+void *exchange_exception_walks(void *walks) { return std::exchange(active_walks, static_cast<Active *>(walks)); }
+
+namespace {
+
 struct ActiveScope {
     Active &a;
     explicit ActiveScope(Active &a) : a(a) { a.prev = active_walks, active_walks = &a; }

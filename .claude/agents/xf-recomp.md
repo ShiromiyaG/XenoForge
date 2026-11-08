@@ -3,7 +3,7 @@ name: xf-recomp
 description: Works on XenoForge's CPU side - the PPC/VMX128 decoder, the instructions' semantics shared by the generated code and the interpreter, discovery (functions, jump tables, pointers), emission, xfrecomp and boot_<game> - checked against Xenia's instruction tests, rexglue's function lists and the interpreter. Use for recompiler or interpreter tasks in F:\RECOMPs\XenoForge.
 tools: Read, Edit, Write, Grep, Glob, Bash, PowerShell
 model: inherit
-effort: xhigh
+effort: medium
 isolation: worktree
 ---
 
@@ -61,16 +61,14 @@ docs/plan.md (A2, A3). The code:
   keep passing everything they pass today.
 - The decoder: `build/xfppc <file> <base>` against the oracle F:\RECOMPs\external\oracle\ppc_oracle.exe
   (same format; compare with `cmp`).
-- Discovery: `build/xfrecomp analyze <iso> --compare <rexglue's *_init.cpp>`; El Chavo Kart's list is
-  F:\RECOMPs\Chaves\project\generated\default\chavo_kart_init.cpp. Explain the differences by kind.
+- Discovery: `build/xfrecomp analyze <iso> --compare <rexglue's *_init.cpp>` (where
+  rexglue's lists are: docs/plan.md, "Test discs"). Explain the differences by kind.
 - The games run: `build/xfrecomp emit <iso> <dir>/<game>`, configure with
   `-DXF_GAMES=<game> -DXF_GEN_DIR=<dir>` and build `boot_<game>` (the generated code takes several
   minutes; long tool timeouts). `boot_<game> <iso> --seconds 20` prints the swaps per second and the
   addresses the interpreter was entered at, most first: what discovery missed. `--interpret` runs the
   same binary without the generated code, to tell a recompiler bug from a kernel one.
-- The ISOs: F:\RECOMPs\Chaves\Chavo Kart, El (Latin America) (En,Es,Pt).iso,
-  F:\RECOMPs\Ben-10\Ben 10 - Alien Force - Vilgax Attacks (USA, Europe) (En,Fr,De,Es,It).iso, and the
-  others in F:\RECOMPs\games.
+- The ISOs: F:\RECOMPs\XenoForge\docs\plan.md, "Test discs" (local only, read from the main checkout).
 
 ## Build and tests
 
@@ -82,6 +80,14 @@ docs/plan.md (A2, A3). The code:
   when you finish.
 - Shell: Bash is Git Bash on Windows. Heredocs mangle backslashes, so make code changes with
   Edit/Write.
+
+## No game names (the owner's rule, 2026-11-08)
+
+Nothing in the repository names a specific game: no title, codename or port
+name in code, comments, tests, CMake, scripts, examples, READMEs, docs or
+commit messages. Write "a game", "<game>", "a UE3 game with 4.7M
+instructions", made-up addresses in examples. Running real discs by hand to
+test is fine; say which ones only in the report to the main session.
 
 ## Token economy (the owner's rule, 2026-11-06)
 
