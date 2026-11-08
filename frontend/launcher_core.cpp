@@ -82,8 +82,8 @@ std::vector<GameEntry> LauncherCore::demo_list() {
     static const struct {
         const char *title;
         uint32_t id, version;
-    } demo[] = {{"Battlefield Bad Co. 2", 0x454108A8, 1}, {"Gears of War 3", 0x4D5309C9, 10}, {"Forza Horizon", 0x4D5309C9, 1},
-                {"Halo: Reach", 0x4D53085B, 11},         {"Red Dead Redemption", 0x5454082B, 1}, {"SONIC UNLEASHED", 0x53450812, 1}};
+    } demo[] = {{"Sample Racer", 0x58460001, 1},   {"Sample Shooter 3", 0x58460002, 10}, {"Sample Open Road", 0x58460003, 1},
+                {"Sample Frontier", 0x58460004, 11}, {"Sample Western", 0x58460005, 1},    {"SAMPLE PLATFORMER", 0x58460006, 1}};
     std::vector<GameEntry> games;
     for (const auto &d : demo) {
         GameEntry g;
