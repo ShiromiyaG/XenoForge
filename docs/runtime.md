@@ -2391,7 +2391,11 @@ Windows' own DLLs (KERNEL32, ADVAPI32, ntdll, ole32, OLEAUT32, SHELL32,
 VERSION): the LLVM release links its C runtime statically. Apache 2.0 with
 LLVM's exception, redistributable. The search (`find_toolchain`):
 `--toolchain`, `XF_TOOLCHAIN`, `toolchain/bin` beside the executable (the
-bundle), an installed LLVM (`%ProgramFiles%\LLVM\bin`), the PATH.
+bundle), an installed LLVM (`%ProgramFiles%\LLVM\bin`), the PATH. The
+package puts them there (`cmake/package.cmake`, `XF_PACKAGE_TOOLCHAIN`, on:
+the clang and lld beside the compiler that built XenoForge, with LLVM's
+license in `toolchain/LICENSE-llvm.txt`); without them a machine with no
+LLVM runs games interpreted only.
 
 **The build** (`prepare_game`): the disc's executables read (all XEX2 files
 but title updates and the system update's), `default.xex`'s image digest

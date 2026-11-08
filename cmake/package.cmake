@@ -15,6 +15,8 @@
 #   FFMPEG-SOURCE.txt            where ffmpeg-xma's source is: the fork's commit and the overlay
 #   ffmpeg-source/               the overlay itself (third_party/ffmpeg: configuration and build script)
 #   LICENSE-xenia, LICENSE-rexglue
+#   toolchain/bin/               clang and lld (LLVM, Apache 2.0 with LLVM exceptions; toolchain/LICENSE-llvm.txt),
+#                                which Prepare builds the game's library with (XF_PACKAGE_TOOLCHAIN, on)
 #   ui/                          the launcher's windows (RML, RCSS), its fonts, Inter (SIL OFL) and Roboto Condensed (Apache 2.0), and icons, Lucide (ISC)
 #   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Roboto Condensed, Lucide, stb, the cursors (public domain),
 #                                FidelityFX, FXAA, volk, Vulkan-Headers
@@ -37,6 +39,25 @@ endif()
 install(TARGETS ${_installed} RUNTIME DESTINATION .)
 install(FILES ${CMAKE_SOURCE_DIR}/LICENSE ${CMAKE_SOURCE_DIR}/LICENSE-xenia ${CMAKE_SOURCE_DIR}/LICENSE-rexglue
         DESTINATION .)
+
+# The toolchain the launcher's Prepare builds a game's library with
+# (docs/runtime.md, "The toolchain shipped"): clang and lld from the LLVM that
+# builds XenoForge, into toolchain/bin, where find_toolchain looks first after
+# --toolchain and XF_TOOLCHAIN. Without it a machine with no LLVM installed
+# can only run games interpreted. lld is copied once (run as `lld -flavor link`
+# when there is no lld-link).
+option(XF_PACKAGE_TOOLCHAIN "ship clang and lld in toolchain/bin" ON)
+if(XF_PACKAGE_TOOLCHAIN)
+    get_filename_component(_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(_clang "${_llvm_bin}/clang${CMAKE_EXECUTABLE_SUFFIX}")
+    set(_lld "${_llvm_bin}/lld${CMAKE_EXECUTABLE_SUFFIX}")
+    if(NOT EXISTS "${_clang}" OR NOT EXISTS "${_lld}")
+        message(FATAL_ERROR "XF_PACKAGE_TOOLCHAIN: no clang and lld beside ${CMAKE_CXX_COMPILER} "
+                            "(build with LLVM's clang, or -DXF_PACKAGE_TOOLCHAIN=OFF for a package without them)")
+    endif()
+    install(PROGRAMS "${_clang}" "${_lld}" DESTINATION toolchain/bin)
+    install(FILES ${CMAKE_SOURCE_DIR}/third_party/llvm/LICENSE.TXT DESTINATION toolchain RENAME LICENSE-llvm.txt)
+endif()
 
 # The libraries linked into the player, each with its license as fetched
 set(_notices "${CMAKE_BINARY_DIR}/THIRD-PARTY-NOTICES.txt")
