@@ -1224,7 +1224,8 @@ private:
     }
     // the textures (up to two) a resolve to this destination feeds, written
     // by it as well (resolve targets not loaded again since): how many
-    uint32_t resolve_targets(const resolve::Info &info, Texture *targets[2]);
+    // (and the rows of texels the destination starts at in them, the same in both)
+    uint32_t resolve_targets(const resolve::Info &info, Texture *targets[2], uint32_t &extra_rows);
     uint32_t take_index(uint32_t kind);
     uint32_t room(uint32_t kind) const {
         return uint32_t(free_indices_[kind].size()) + (capacity_[kind] - next_index_[kind]);
@@ -6784,8 +6785,9 @@ void Impl::resolve() {
 // pixel (x, y) is its texel (texel_x0 + dest_x + x, texel_y0 + dest_y + y),
 // and the resolve leaves the rest of its memory as it was. Up to two (the
 // push constants' room); a third is loaded again as before.
-uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2]) {
+uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2], uint32_t &extra_rows) {
     targets[0] = targets[1] = nullptr;
+    extra_rows = 0;
     if (!resolve_targets_ || info.depth || info.dest_array || !info.texture_base) return 0;
     const uint32_t bytes = texture::format_block(info.dest_format).bytes;
     if (bytes != 4 && bytes != 8) return 0;
@@ -6793,13 +6795,33 @@ uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2]) {
     const uint32_t base = info.texture_base & 0x1FFFFFFF, wide = bytes == 8 ? 1 : 0;
     const uint32_t bucket = base >> TEXTURE_BUCKET_SHIFT;
     if (bucket >= std::size(texture_buckets_)) return 0;
+    // A stale one (written since its load) is fed too when the resolve
+    // writes every texel it has: its image is then what memory holds again.
+    const uint32_t x0 = info.texel_x0 + info.dest_x, y0 = info.texel_y0 + info.dest_y;
+    auto covers = [&](const Texture &t) {
+        const uint32_t width = (t.key[2] & 0x1FFF) + 1, height = ((t.key[2] >> 13) & 0x1FFF) + 1;
+        return x0 == 0 && y0 == 0 && info.width >= width && info.height >= height;
+    };
+    // A texture whose memory holds the destination further down, a whole
+    // number of 32-row macro tile rows in (a smaller surface placed inside a
+    // larger one), is fed at that many rows more: a tiled 2D texture's row of
+    // macro tiles is its pitch times 32 texels, contiguous (Xenia's
+    // GetTiledOffset2D), so the destination's texel (x, y) is the texture's
+    // (x, y + rows).
     uint32_t count = 0;
-    for (Texture *t : texture_buckets_[bucket])
-        if (t->target && ((t->target >> 7) & 1) == wide && !t->stale && t->target_base == base &&
-            t->target_pitch == info.dest_pitch && t->target_endian == info.dest_endian) {
-            targets[count++] = t;
-            if (count == 2) break;
-        }
+    for (Texture *t : texture_buckets_[bucket]) {
+        if (!t->target || ((t->target >> 7) & 1) != wide || t->target_pitch != info.dest_pitch ||
+            t->target_endian != info.dest_endian || base < t->target_base)
+            continue;
+        const uint32_t offset = base - t->target_base, macro_row = t->target_pitch * bytes * 32;
+        if (!macro_row || offset % macro_row) continue;
+        const uint32_t rows = offset / macro_row * 32;
+        if ((info.texel_y0 + rows) >> 5 > 0xFF || (count && rows != extra_rows)) continue;
+        if (t->stale && (rows || !covers(*t))) continue;
+        extra_rows = rows;
+        targets[count++] = t;
+        if (count == 2) break;
+    }
     return count;
 }
 
@@ -6906,10 +6928,15 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     p.dest_endian = info.dest_endian, p.dest_number = info.dest_number, p.dest_swap = info.dest_swap;
     p.exp_factor = std::ldexp(1.0f, info.dest_exp_bias);
     Texture *targets[2];
-    if (uint32_t count = resolve_targets(info, targets)) {
+    uint32_t extra_rows = 0;
+    if (uint32_t count = resolve_targets(info, targets, extra_rows)) {
         p.target = (targets[0]->target & 0xFF) | (count > 1 ? (targets[1]->target & 0x7F) << 8 : 0) |
-                   (info.texel_x0 >> 5) << 16 | (info.texel_y0 >> 5) << 24;
-        for (uint32_t k = 0; k < count; k++) use(*targets[k], submission_serial() + 1);
+                   (info.texel_x0 >> 5) << 16 | ((info.texel_y0 + extra_rows) >> 5) << 24;
+        for (uint32_t k = 0; k < count; k++) {
+            use(*targets[k], submission_serial() + 1);
+            // current again if it was stale: the resolve wrote all of it
+            if (targets[k]->stale) targets[k]->stale = false, targets[k]->load_why = LoadWhy::CpuWritten;
+        }
         report_.resolve_targets_written += count;
     }
     if (from_edram) {

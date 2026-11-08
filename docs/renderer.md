@@ -2070,6 +2070,126 @@ which the runs record. `ucode::awaits_vertex_declaration` tells them; the
 build step counts them apart ("vertex shaders awaiting a vertex
 declaration") and translates the 59 pixel shaders, all of which translate.
 
+## The standing benchmark against Xenia (2026-11-08)
+
+The bar is Xenia, beaten on the same scene: frame time and GPU time a frame,
+ours against xenia_canary's Direct3D 12 and Vulkan backends, live, on scenes
+both reach without input (title screens, attract loops, the first seconds).
+
+**The method** (`tools/bench/`, Windows only, as Xenia is). PresentMon and
+any ETW tracing need an administrator or the Performance Log Users group,
+which the machine's account is not; GPU timestamps are not something Xenia
+gives. So both programs are timed from outside by the same code:
+- `xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--vk | --dxgi]
+  -- <program> [args]` starts the program (in a job object, killed at the
+  end) and times the window from `--warmup` to `--seconds`.
+- **Frames**: `xfbench_hook.dll` records the time of every present.
+  `--vk` loads it as a Vulkan layer (`VK_LAYER_XF_bench`, its manifest
+  beside it, through `VK_ADD_LAYER_PATH`) wrapping `vkQueuePresentKHR`;
+  `--dxgi` injects it into a Direct3D 12 program before its main thread runs
+  (a remote `LoadLibraryW`, then its `xfbench_hook_dxgi`), which patches the
+  DXGI factory class's `CreateSwapChainForHwnd` so that every swap chain's
+  `Present` and `Present1` are wrapped. Both programs present once a new
+  frame (ours: the player's window shows only fresh pictures, Xenia's
+  presenter paints on a guest output refresh), so presents are frames.
+- **GPU time**: the process's running time on each engine as Windows'
+  scheduler counts it, the "GPU Engine(pid_*)\Running Time" performance
+  counter (100 ns units; checked against a replay's own utilization), the
+  same accounting for Vulkan and Direct3D 12. Reported as ms a frame and a
+  second, the 3D and compute engines summed, copy apart. It includes all the
+  process's GPU work: the presenter's, the transfers, the idle gaps the
+  driver bills.
+- **CPU time**: the process's user and kernel time a second.
+- `--timeline` prints each `--step`'s frames a second and GPU time a frame,
+  to find a run's phases and pick a window both programs spend in the same
+  scene.
+
+`tools/bench/bench_vs_xenia.ps1 -Disc <iso> -Ours <player> -Xenia <exe>
+-Seconds S -Warmup W -Runs 3 -Configs ours,ours-host,xenia-d3d12,xenia-vulkan`
+runs the configurations in turn (A B C D A B C D ...), appends one line a
+run and prints the median and the spread of each. `ours-host` forces host
+render targets; `xenia-d3d12-rov` and `xenia-vulkan-fsi` are Xenia's exact
+EDRAM paths (its defaults are host render targets). Xenia's defaults
+otherwise (vsync on, no resolution scale, its shader storage warm). The load
+is read before each set (`Get-Process clang*,ninja*,...`); another agent's
+builds or games on the machine are named with the numbers.
+
+**Results** (RTX 5060, Ryzen 5 5600G; median of 3 runs, spread in
+brackets; GPU ms a frame by the counter):
+
+| scene (window) | ours (interlock) | ours, host targets | Xenia D3D12 | Xenia Vulkan |
+| --- | --- | --- | --- | --- |
+| Game B, 3D title scene (90-130 s, 60 fps cap) | 1.39 (1.38-1.39) | 1.53 (1.52-1.56) | 0.83 (0.83-0.85) | 1.12 (1.07-1.13) |
+
+Game B's exact paths: Xenia's ROV 1.26, its Vulkan FSI 1.42 (one run each),
+ours 1.39. Every configuration holds the 60 fps cap (frame time median
+16.6-17.0 ms); CPU 1.33 (ours) against 1.24 (D3D12) and 1.76 (Vulkan) s a
+second. Load: an xfbuild of another disc at below-normal priority (2 jobs)
+during the first runs.
+
+Where we lose and why, for game B:
+- Our default is the exact EDRAM (interlock), Xenia's is host render
+  targets. Exact against exact, we are between Xenia's two (ROV 1.26, FSI
+  1.42); the interlock's draws cost about twice the host's (the scene's
+  32 2x-MSAA draws: 0.55 against 0.25 ms in the 3600 trace's replay), the
+  price of exactness.
+- Our host path loses to Xenia's host path because its ownership transfers
+  go through the EDRAM buffer, a store by the holder and a load by the new
+  target (0.50 ms of the replay's frame, eight passes), where Xenia's
+  render target cache draws the holder's image straight into the new target
+  (one pass, no EDRAM buffer). Porting Xenia's direct transfers is the next
+  step for the host path.
+- Fixed here: a texture the game renders to every frame was loaded again
+  every frame (0.15 ms of the live frame): a second, smaller surface is
+  placed inside the first one's memory, 384 rows down, and its resolve made
+  the first texture stale. A resolve now feeds a target texture whose memory
+  holds the destination a whole number of 32-row macro tile rows in (the
+  texel rows offset by as many), and a stale target the resolve covers
+  whole is current again. Game B's 3600 trace: 29 loads after resolves a
+  run to 0, 87 resolves writing the texture they feed instead of 58, GPU
+  1.483 to 1.426 ms a play, the picture unchanged (0.000 off Xenia's ROV).
+
+**Screen extents: what the guest does with them** (game G's 850 trace,
+read packet by packet). Direct3D's predicated tiling draws the scene twice,
+once a tile (`SET_BIN_SELECT` 0x80000003, then 0xC). In the first pass every
+draw is followed by an `EVENT_WRITE_EXT` (`SCREEN_EXT_RPT`, 26) and an
+`EVENT_WRITE` (the next `SCREEN_EXT_INIT`), both predicated on bin 31, so
+they run in the first pass alone: 1,219 extent reports into an array of
+16-byte records. The pass ends with an `INTERRUPT` and `WAIT_REG_MEM`s (also
+bin 31): the CPU reads the extents and patches the `SET_BIN_MASK_LO`
+payload in front of each draw in the command buffer, which the second pass
+then runs. With Xenia's whole-screen answer every mask is 0x8000000F (all
+four bins), so every draw runs in both passes; with real extents a draw
+inside the top tile would get 0x80000003 and be skipped in the second.
+So exact extents change no picture (the CPU only narrows the bins a draw
+runs in), only how many draws the second pass makes: up to half of game G's
+3D draws. What it would take: the extent of each draw between an INIT and
+a RPT (its clipped primitives' bounding box, in 8-pixel units as Xenia's
+`>> 3` reads them), in guest memory before the CPU reads it after the
+interrupt: the vertex shader's positions bounded on the GPU (an atomic min
+and max a report, as a pipeline variant) and the interrupt held until that
+submission is done, or the positions bounded on the CPU (the shader
+interpreter Xenia's draw extent estimator uses, too slow for 1,219 draws of
+hundreds of vertices). The rounding of the 8-pixel units and the z range
+(Xenia writes 0 and 1) are hardware questions; a bounding box rounded
+outwards is safe, since a wider extent only keeps a draw in more bins.
+Open; the gain is only measurable live in game G, whose library is not
+built for this interface.
+
+**Game G's frames 850 and 950, what is left** (0.149% and 0.150% of pixels
+off Xenia's ROV picture; Xenia's ROV and FSI pictures are 0.083% apart).
+Of the 1,374 pixels off ROV's, 1,070 are off Xenia's FSI picture too where
+Xenia's two agree; 895 of those are in the ground's band (rows 520-600:
+small foliage drawn with alpha to coverage), 175 elsewhere. Above the band
+ours is nearer Xenia's FSI picture (0.17 of 255 mean, no bias: +0.07,
++0.07, +0.06 signed) than Xenia's two pictures are to each other (0.54). In
+the band the foliage's covered pixels differ in shape, about as many
+brighter as darker (497, 573): coverage, not color. Alpha to coverage
+itself is Xenia's code; what feeds it (the alpha of DXT5 foliage
+textures at a distance: the filtering, the mip chosen, the packed mip
+tail) is where to look next, draw by draw, which needs a replay that stops
+after a given draw against a reference that can too (Xenia's trace viewer).
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that

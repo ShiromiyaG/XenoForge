@@ -300,6 +300,21 @@ add_executable(xfreplay tools/xfreplay.cpp)
 target_link_libraries(xfreplay PRIVATE xenoforge_vk stb)
 add_executable(xfcompare tools/xfcompare.cpp)
 target_link_libraries(xfcompare PRIVATE stb)
+# The standing benchmark against Xenia (docs/renderer.md, "The standing
+# benchmark"): xfbench runs a program and times its presents (through
+# xfbench_hook.dll, a Vulkan layer or a DXGI hook) and its GPU and CPU time.
+if(WIN32)
+    add_library(xfbench_hook SHARED tools/bench/xfbench_hook.cpp)
+    target_include_directories(xfbench_hook PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_link_libraries(xfbench_hook PRIVATE dxgi)
+    set_target_properties(xfbench_hook PROPERTIES PREFIX "")
+    add_custom_command(TARGET xfbench_hook POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/tools/bench/xfbench_hook.json
+                $<TARGET_FILE_DIR:xfbench_hook>/xfbench_hook.json)
+    add_executable(xfbench tools/bench/xfbench.cpp)
+    target_link_libraries(xfbench PRIVATE pdh psapi)
+    add_dependencies(xfbench xfbench_hook)
+endif()
 # boot as a library (a port's boot_<name> links it: tools/boot.cpp's run_boot, the shared tools/game.cpp) and the
 # generic boot: the game library cached for the disc, else the interpreter. --render draws what the GPU is sent (the
 # renderer as the command processor's Sink) and writes shots
