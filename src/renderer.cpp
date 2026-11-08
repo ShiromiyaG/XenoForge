@@ -7254,14 +7254,22 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     }
     VkDeviceSize pixel_bytes = VkDeviceSize(w) * h * texel;
     VkDeviceSize stencil_bytes = info.depth ? (VkDeviceSize(w) * h + 3) & ~VkDeviceSize(3) : 0;
-    // a multisampled source is read from EDRAM, its samples as the guest
-    // keeps them, as Xenia's resolve shaders read them (the sample or the
-    // average RB_COPY_CONTROL selects; depth one sample): the rectangle's
-    // tiles stored there first by the target, which keeps them
-    // (and an 8_8_8_8_GAMMA target kept linear, its gamma made in EDRAM's
-    // bits, which Xenia's resolves always read)
-    // (the interlock path: always, EDRAM being the targets)
-    const bool from_edram = fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear);
+    // The source is read from EDRAM, its samples as the guest keeps them, as
+    // Xenia's resolve shaders read them (the sample or the average
+    // RB_COPY_CONTROL selects; depth one sample): the rectangle's tiles
+    // stored there first by the target, which keeps them (on the interlock
+    // path EDRAM is the targets). Single-sampled ones too: the store and the
+    // read cost less than copying the image into a buffer first (game B's
+    // final 1280x720 resolve, 0.064 against 0.099 ms; docs/renderer.md,
+    // "Direct ownership transfers"). XF_RESOLVE_FROM_IMAGE=1 copies a
+    // single-sampled target's image, as before (not an 8_8_8_8_GAMMA one
+    // kept linear, whose gamma is made in EDRAM's bits).
+    static const bool from_image = [] {
+        const char *v = std::getenv("XF_RESOLVE_FROM_IMAGE");
+        return v && std::string(v) == "1";
+    }();
+    const bool from_edram =
+        !from_image || fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear);
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!from_edram && !grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
@@ -7275,10 +7283,10 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
                 tiles.push_back((source.base + row * source.pitch_tiles + column) % EDRAM_TILES);
         if (!fsi_ && !edram_store(&source, tiles)) return;
         c = outside();
-        gpu_mark("resolves: copies");
+        if (options_.gpu_timing) gpu_mark("resolves: copies from EDRAM: " + target_name(source));
     } else {
         c = outside();
-        gpu_mark("resolves: copies");
+        if (options_.gpu_timing) gpu_mark("resolves: copies from the image: " + target_name(source));
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VkImageAspectFlags(info.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
                                  0, 0, 1};
