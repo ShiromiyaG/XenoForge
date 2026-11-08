@@ -110,6 +110,8 @@ run the baseline and the change back to back and interleaved (A B A B), at
 least 3 runs each, and report the median, the spread and what else was
 running. Prefer CPU time, GPU timestamps and call rates over wall-clock
 rates when the machine is busy. Comparisons with Xenia the same way.
+Benchmarks count as testing for the Test budget: at most 30 minutes of them without
+a new finding, then report with the numbers in hand (the owner, 2026-11-08).
 
 ## Token economy (the owner's rule, 2026-11-06)
 
