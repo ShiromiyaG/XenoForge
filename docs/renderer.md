@@ -2326,6 +2326,133 @@ replay went from 1.36-1.38 to 1.29-1.35 ms a play, its scene draws 0.25 to
 arena's 192 MB, so it is not taken: it wants a heap at least twice the
 arena (resizable BAR) or a smaller arena of its own for the draws' data.
 
+## Resolution scale (2026-11-08)
+
+The console's pixels drawn as more (or fewer) host pixels: 50% to 800% in
+steps of 25%, one value, as RPCS3's resolution scale (the model the player
+shows), laid out as Xenia's `draw_resolution_scale_x/y` lays EDRAM and the
+resolves out (d3d12_render_target_cache.cc, resolve.xesli,
+edram.xesli's XeEdramOffsetBytes with a resolution scale), beyond it in the
+steps it takes (Xenia: whole multiples). `Options::resolution_scale` (in
+quarters), `XF_RESOLUTION_SCALE=<percent>`, `xfreplay --scale <percent>`,
+config.toml's `video.resolution_scale` (docs/runtime.md, "Picture
+options"). The arithmetic is `render_scale.h`'s, checked by
+frontend_test.
+
+**Why every quarter is exact.** An EDRAM tile is 80x16 samples of 32 bits;
+at a scale s it is 80s x 16s, whole for every quarter (20 and 4 samples a
+quarter), and so is every resolve rectangle and destination offset (multiples
+of 8 console pixels) and every texel offset a resolve writes a texture at
+(multiples of 8 and 32). A host pixel maps to the console pixel it lies in,
+and a console pixel to the host pixel at its center (render_scale.h's
+`Scale::map`), with no rounding left over.
+
+**What is drawn at the scale:**
+- EDRAM: the buffer 2048 tiles of 80s x 16s (and the host depth beside it),
+  every render target's image `Scale::up` its console size (both clamped to
+  the device's largest image), the EDRAM stores, loads and clears of the
+  host render target path in the scaled grid (edram.glsl's `edram_offset`
+  with the scale in its push constants), the interlock path's addressing
+  scaled (edram_fsi.frag's `fsi_offsets`, `sample_offset`; the Fsi block's
+  `scale`). A trace's EDRAM snapshot goes in and out through EDRAM at the
+  console's size, each tile resampled (`edram_rescale.comp`).
+- Draws: the viewport's bounds and the scissor's edges in host pixels, the
+  NDC transform unchanged (so points' and rectangles' sizes stay the
+  guest's); the polygon offset's slope term times the scale (Xenia's
+  poly_offset_scale_factor); the pixel parameters' position and alpha to
+  coverage's dither the console pixel's (the system values' w, 1/s);
+  occlusion counts divided by the scale's area (Xenia's
+  UpdateQuerySegment).
+- Resolves read EDRAM's scaled samples (the host path stores the source's
+  tiles first, as for MSAA). They write **guest memory at the console's
+  size**, each console pixel from the host pixel at its center: guest
+  memory is the CPU's, so read-backs (`readback_resolve`), memory exports
+  and the front buffer a game copies all see the console's size, as RPCS3
+  keeps CPU-visible data native and as Xenia's resolve downscale does for
+  its read-backs. The textures a resolve feeds (the resolve targets,
+  "Resolve targets" above) are written at their own scale by a second pass
+  over their texels.
+- Textures: a resolve target of 32-bit texels the resolve writes whole, no
+  smaller than the minimum scalable dimension, is made the scale's (`scale_texture`: an image
+  of the same format, its old one gone with the submission). A resolve no
+  texture is over yet keeps its scaled texels in an image of its own
+  (`ScaledResolve`, dropped when anything else writes there or two swaps
+  on); the texture a later draw makes over the destination copies them in
+  and is the scale's from its first use, so a one-frame trace and a game's
+  first frame show the scaled picture too. Every other texture is the
+  console's size: loaded from guest memory, a resolve's included. The
+  shaders' texture coordinates are scale-free: sizes and offsets come from
+  the fetch constants (shader_translator.cpp), so a scaled image needs no
+  shader change (Xenia scales unnormalized coordinates for its scaled
+  textures, `textures_resolution_scaled`; the translator divides them by
+  the fetch constant's size first, which the scale leaves alone).
+- The front buffer is a texture: scaled when its resolve is, so the window
+  gets the scaled picture (`FrontBuffer` carries the image's size).
+
+**The minimum scalable dimension** (RPCS3's, `Options::min_scalable`, 16
+console pixels by default): a resolve narrower or shorter than it does not
+make a texture the scale's, and a texture smaller than it is never one.
+Small buffers (look-up tables, 1x1 reductions, atlases' tiles, render to
+texture tricks) leave EDRAM at the console's size, so a shader that steps
+through them in console texels reads what it wrote. Render targets
+themselves are all drawn at the scale: they share EDRAM's tiles whatever
+their sizes (a small target aliases a large one's tiles, as on the
+console), so a per-target scale would need tiles converted between scales
+at every change of hands; the rule acts where a surface leaves EDRAM, which
+is where a small buffer is read back. (Open: per-target scales with tiles
+tagged by scale and converted by `edram_rescale.comp` where they change
+hands.)
+
+**The interlock path takes multiples of 50%.** It addresses a pixel's MSAA
+samples from its first sample's dword (Xenia's ROV layout), which keeps
+them in one half of a tile only where the half (10 samples a quarter) is a
+whole number of 4-sample groups: even quarters. An odd quarter (75%, 125%,
+175%, ...) is drawn at the even one below it, and the renderer's notice
+says so (the player prints it and shows it on the System page). The host
+render target path takes every quarter. A GPU without room for EDRAM at the
+scale (800%: 640 MB of EDRAM, 1.3 GB of host depth) gets the largest that
+fits, with a notice.
+
+**Checked** against Xenia's own scaled pictures: its Direct3D 12 trace dump
+takes `--draw_resolution_scale_x/y` (with `--render_target_path_d3d12=rov`
+for our default path), so every trace has Xenia's picture at 200% and 300%
+(`../traces/dumps_scale/rov2x`, `rov3x`; game data, outside the
+repository). `XF_REPLAY_SCALES=200,300 XF_SCALED_DUMPS=../traces/dumps_scale
+build/replay_test` compares each scaled frame with Xenia's at its size and
+holds the frames whose 100% picture is Xenia's within a mean difference of 4
+(of 255) and 5% of pixels off by more than 16; it also prints each one
+against our 100% frame, box filtered (`render_scale.h`'s `resample_box`),
+which is no bound: a scaled picture is not the console's (blurs made of
+bilinear taps between texels blur less over finer texels, in Xenia's
+scaled pictures as in ours). Results (2026-11-08, interlock path):
+- 23 of the 29 frames within 0.7 of Xenia's at both scales, 0-1% of pixels
+  (game B's 1800-3601: 0.67-0.69 at 200%, 0.29-0.30 at 300%; game A's
+  title and menu 0.02-0.17; games C, D, H and F's 600-2400 0.00-0.04).
+- Game E's 1200-3600: 2.8-2.9 at 200% (no pixel off by 16), 1.2-1.4 at 300%
+  (3-4% of pixels): its blurred background is drawn through textures over
+  resolved memory that no resolve feeds whole, which Xenia scales and we
+  keep at the console's size.
+- Game F's 3600: 1.65 at 200% (0.5%). With 64-bit resolve targets scaled
+  as well its bloom showed magenta strips Xenia's does not have (9.4), so
+  64-bit textures stay at the console's size (open: the 64-bit texels'
+  scaled feed; the same resolves at 100% go through guest memory).
+- Game A's park and race (frames whose 100% picture is off Xenia's by 1.8
+  and 3.1 already, from what the trace does not hold): 4.0-4.4 at 200%,
+  1.6-1.7 at 300%.
+Against our own 100% frames, box filtered: game B 0.8 (200%) and 0.4
+(300%), game A's title 0.15-0.45.
+
+**Where it differs from Xenia:** Xenia keeps a scaled copy of guest memory
+for resolves (its scaled resolve buffer, in 2 GB ranges on tiled resources)
+and loads textures from it with scaled addressing; here a resolve writes
+guest memory at the console's size and its scaled texels into the textures
+it feeds (or keeps them for the next texture), so no scaled memory exists
+and the CPU's view needs no downscale pass. A texture made over resolved
+memory that no resolve fed whole (a part of a resolve, another format's
+view of it, a 3D or cube texture) is the console's size where Xenia's would
+be scaled. Not done: a pixel shader's memory export runs once a host pixel
+(as Xenia's), counted.
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that

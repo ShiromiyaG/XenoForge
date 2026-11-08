@@ -4465,7 +4465,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
                         plan.half == texture::Half::None && plan.block_width == 1 && plan.block_height == 1 &&
                         (texel_bytes == 4 || texel_bytes == 8) && plan.bytes_per_block == texel_bytes;
     ScaledResolve *kept = nullptr;
-    if (target && !scale_.one() && scalable(plan.width, plan.height, min_scalable_)) {
+    if (target && !scale_.one() && scalable(plan.width, plan.height, min_scalable_) && texel_bytes == 4) {
         auto found = scaled_resolves_.find(plan.slices[0].base & 0x1FFFFFFF);
         if (found != scaled_resolves_.end() && found->second.pitch == plan.slices[0].pitch_blocks &&
             found->second.endian == info.endian && ((found->second.target >> 7) & 1) == (texel_bytes == 8 ? 1u : 0u) &&
@@ -4597,6 +4597,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         std::vector<Range> its{{kept->low, kept->high}};
         drop_scaled_resolves(its);
         report_.textures_scaled++;
+        if (options_.verbose) std::fprintf(stderr, "  texture %08X: a scaled resolve's texels copied in\n", info.base_address);
     } else if (gpu) {
         if (!gpu_load(*t, t->image, plan, fresh, true)) return nullptr;
         if (separate && !gpu_load(*t, t->signed_image, signed_plan, fresh, false)) return nullptr;
@@ -6201,6 +6202,10 @@ void Impl::draw(const gpu::Draw &d) {
         if (format == 1 && !colors[i]->gamma_linear) gamma_targets |= 1u << i;
     }
     if (any_gamma) use("draws into 8_8_8_8_GAMMA color targets");
+    // (a pixel shader's export runs for each host pixel: as many times more
+    // as the scale's area, to the same addresses; Xenia's the same)
+    if (!scale_.one() && ps && ps->exports)
+        approximate("pixel shader memory export at a resolution scale (run once a host pixel)");
     if (gamma_targets) approximate("8_8_8_8_GAMMA color targets blended in gamma (no RGBA16 unorm attachments)");
     uint32_t depth_control = export_only ? 0 : regs_[reg::RB_DEPTHCONTROL];
     RenderTarget *depth = nullptr;
@@ -7456,7 +7461,8 @@ uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2], u
 // eight kept. Null when the resolve is not one.
 Impl::ScaledResolve *Impl::scaled_resolve(const resolve::Info &info, const std::vector<Range> &written) {
     const uint32_t bytes = texture::format_block(info.dest_format).bytes;
-    if (info.depth || info.dest_array || !info.texture_base || (bytes != 4 && bytes != 8) ||
+    // (32-bit texels only, as scale_texture's callers)
+    if (info.depth || info.dest_array || !info.texture_base || bytes != 4 ||
         info.texel_x0 + info.dest_x || info.texel_y0 + info.dest_y || !scalable(info.width, info.height, min_scalable_) ||
         written.empty() || scaled_resolves_.size() >= 8)
         return nullptr;
@@ -7591,6 +7597,8 @@ void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
     t.scaled = true;
     begin_image(outside(), image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
     report_.textures_scaled++;
+    if (options_.verbose)
+        std::fprintf(stderr, "  texture %08X made the resolution scale's (%ux%u)\n", t.target_base, width, height);
 }
 
 // The copy on the GPU: the rectangle (resolved to one sample per pixel when
@@ -7720,11 +7728,14 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
             use(t, submission_serial() + 1);
             // Made the resolution scale's when this resolve writes all of it
             // and both are no smaller than the minimum scalable dimension
-            // (RPCS3's rule): the resolve then writes every scaled texel.
+            // (RPCS3's rule): the resolve then writes every scaled texel. Only
+            // 32-bit texels: a 64-bit one's scaled feed showed wrong colors in
+            // game F's bloom against Xenia's scaled picture (open; renderer.md,
+            // "Resolution scale"), so those stay the console's size.
             const uint32_t tw = (t.key[2] & 0x1FFF) + 1, th = ((t.key[2] >> 13) & 0x1FFF) + 1;
             if (!scale_.one() && !t.scaled && !extra_rows && info.texel_x0 + info.dest_x == 0 &&
                 info.texel_y0 + info.dest_y == 0 && info.width >= tw && info.height >= th &&
-                scalable(tw, th, min_scalable_) && scalable(info.width, info.height, min_scalable_))
+                scalable(tw, th, min_scalable_) && scalable(info.width, info.height, min_scalable_) && !(t.target & 0x80))
                 scale_texture(t, tw, th);
             // current again if it was stale: the resolve wrote all of it
             if (t.stale) t.stale = false, t.load_why = LoadWhy::CpuWritten;

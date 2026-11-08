@@ -43,11 +43,13 @@ class ConsolePages {
     bool draw_guide(Host &host, double now, bool &open);
     // the guide's page: 0 achievements, 1 profile, 2 system
     void set_guide_page(int page) { tab_ = page % 3; }
+    // The picture options alone (the F1 overlay shows them open, the guide in its System page); true when the
+    // settings changed
+    bool picture_page(Host &host);
 
   private:
     void load(Host &h);
     bool system_page(Host &h);
-    bool picture_page(Host &h);
     bool profile_page(Host &h, float field_width);
     void restart_notice(Host &h);
     void achievements_page(Host &h, double now, float icon);

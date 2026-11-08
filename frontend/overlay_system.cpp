@@ -104,7 +104,11 @@ bool ConsolePages::picture_page(Host &h) {
     };
     combo("Resolution scale", "video.resolution_scale");
     combo("Minimum scalable size", "video.min_scalable");
-    if (!h.picture_notice.empty()) ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), "%s", h.picture_notice.c_str());
+    if (!h.picture_notice.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 0.85f, 0.4f, 1));
+        ImGui::TextWrapped("%s", h.picture_notice.c_str());
+        ImGui::PopStyleColor();
+    }
     combo("Output scaling", "video.upscaler");
     if (s.video.upscaler == "fsr") {
         float v = float(s.video.fsr_sharpness);
@@ -128,6 +132,8 @@ bool ConsolePages::picture_page(Host &h) {
         clamp_video(s);
         if (h.apply_video) h.apply_video();
     }
+    // (the guide's System page shows the restart notice under all of its sections)
+    if (g_label_w <= 0) restart_notice(h);
     return changed;
 }
 
@@ -273,8 +279,6 @@ bool ConsolePages::draw(Host &h, double now) {
     bool changed = false;
     ImGui::SeparatorText("System");
     changed |= system_page(h);
-    ImGui::SeparatorText("Picture (beyond the console)");
-    changed |= picture_page(h);
     ImGui::SeparatorText("Profile");
     changed |= profile_page(h, 220);
     restart_notice(h);

@@ -556,7 +556,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     };
     if (!game::start_renderer(g, options, error)) return fail(error);
     const std::string scale_notice = g.renderer->scale_notice();
-    if (g.renderer->resolution_scale() != 4)
+    if (g.renderer->resolution_scale() != 4 || !scale_notice.empty())
         std::printf("drawing at %u%% of the console's resolution%s%s\n", g.renderer->resolution_scale() * 25,
                     scale_notice.empty() ? "" : ": ", scale_notice.c_str());
     std::printf("rendering on %s, the window on the same device (%s)\n", g.device->name().c_str(),
@@ -840,6 +840,18 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                                  ImVec2(-FLT_MIN, 70));
             }
             if (moved) apply(), changed = true;
+            {
+                // the picture beyond the console (the guide's System page has the same)
+                ImGui::SeparatorText("Picture (beyond the console)");
+                frontend::ConsolePages::Host host{settings,     o.storage, k, icons, apply_system,
+                                                  [&] {
+                                                      restart_requested = true;
+                                                      quit = true;
+                                                      ended = "restart";
+                                                  },
+                                                  [&] { apply(); }, scale_notice};
+                if (pages.picture_page(host)) changed = true;
+            }
             if (!port.options.empty()) {
                 ImGui::SeparatorText(port.name.empty() ? "Port" : port.name.c_str());
                 bool port_moved = false;

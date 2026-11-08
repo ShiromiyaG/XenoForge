@@ -110,6 +110,10 @@ The rest is under its own license:
 - **FFmpeg (LGPL 2.1 or later, `LICENSE-ffmpeg`):** XMA is decoded by FFmpeg,
   built as a separate library (`ffmpeg-xma`) that the programs load at run
   time. Without it, they run with XMA silent.
+- **AMD FidelityFX FSR 1 and CAS (MIT, `third_party/FidelityFX-FSR`,
+  `third_party/FidelityFX-CAS`) and NVIDIA FXAA 3.11 (BSD 3-clause,
+  `third_party/fxaa`):** their headers, unchanged, compiled into the
+  player's output scaling shaders; each folder holds its license.
 - **The player's package:** `cmake --install build --prefix <folder>` makes
   it, with the notices of everything linked in. A game's own player, which
   holds that game's recompiled code, is never part of the package.

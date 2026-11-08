@@ -48,6 +48,9 @@ file(READ "${rmlui_SOURCE_DIR}/LICENSE.txt" _rmlui)
 file(READ "${freetype_SOURCE_DIR}/docs/FTL.TXT" _freetype)
 file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Inter.txt" _inter)
 file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Lucide.txt" _lucide)
+file(READ "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-FSR/LICENSE.txt" _fsr)
+file(READ "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-CAS/LICENSE.txt" _cas)
+file(READ "${CMAKE_SOURCE_DIR}/third_party/fxaa/LICENSE" _fxaa)
 file(READ "${STB_DIR}/stb_image_write.h" _stb)
 string(FIND "${_stb}" "This software is available under 2 licenses" _stb_at)
 if(_stb_at LESS 0)
@@ -100,6 +103,20 @@ ${_rule}
 stb_image and stb_image_write, https://github.com/nothings/stb - MIT license or public domain
 ${_rule}
 ${_stb}
+${_rule}
+AMD FidelityFX FSR 1 (ffx_a.h, ffx_fsr1.h), https://github.com/GPUOpen-Effects/FidelityFX-FSR - MIT
+license (the player's FSR output scaling)
+${_rule}
+${_fsr}
+${_rule}
+AMD FidelityFX CAS (ffx_a.h, ffx_cas.h), https://github.com/GPUOpen-Effects/FidelityFX-CAS - MIT
+license (the player's CAS output scaling)
+${_rule}
+${_cas}
+${_rule}
+NVIDIA FXAA 3.11 (FXAA3_11.h) - BSD 3-clause license (the player's FXAA)
+${_rule}
+${_fxaa}
 ")
 install(FILES "${_notices}" DESTINATION .)
 
