@@ -105,7 +105,8 @@ body { background-color: transparent; }
 .c-status { flex: 0 0 auto; width: 208dp; }
 .c-id { flex: 0 0 auto; width: 176dp; }
 .c-ver { flex: 0 0 auto; width: 159dp; }
-.c-opts { flex: 0 0 auto; width: 60dp; }
+.c-opts { flex: 0 0 auto; width: 100dp; }
+.th.c-opts { justify-content: center; }
 
 /* room around the rows for the selected one's glow, which the list's clipping would cut */
 #tbody { flex: 1 1 0; min-height: 0; margin-top: -12dp; padding: 16dp 8.8% 20dp 8.8%; overflow-y: auto; overflow-x: hidden; }
@@ -151,7 +152,7 @@ body { background-color: transparent; }
 .td .dot.ready { background-color: #8bdc55; }
 .td .dot.interp, .td .dot.bad { background-color: #ff6a5e; }
 .td .dot.run { background-color: #ffffff; }
-.td.c-opts { justify-content: flex-end; padding-right: 12dp; }
+.td.c-opts { justify-content: center; }
 .opt-btn {
     width: 30dp; height: 30dp; line-height: 27dp; text-align: center; border: 1.5dp #858484; border-radius: 6dp;
     decorator: linear-gradient(180deg, #747373 0%, #5d5c5c 38%, #4c4b4b 58%, #5b5a5a 100%);
