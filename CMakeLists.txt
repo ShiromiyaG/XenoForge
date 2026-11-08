@@ -4,6 +4,14 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()
 project(xenoforge VERSION 0.1.0 LANGUAGES C CXX)
+# the executables' icon on Windows needs a resource compiler (llvm-rc beside clang); without one, no icon
+if(WIN32)
+    include(CheckLanguage)
+    check_language(RC)
+    if(CMAKE_RC_COMPILER)
+        enable_language(RC)
+    endif()
+endif()
 # the player's flat folder (package.cmake) is the default install component; the SDK package (install_sdk.cmake) is "sdk"
 set(CMAKE_INSTALL_DEFAULT_COMPONENT_NAME player)
 
@@ -366,10 +374,17 @@ if(XF_PLAYER AND TARGET boot)
                 ${CMAKE_CURRENT_SOURCE_DIR}/frontend/front_buffer.comp
         DEPENDS frontend/front_buffer.comp
         COMMENT "glslc front_buffer.comp")
+    # XenoForge's mark for the windows' icon (assets/branding), built into the frontend
+    add_custom_command(OUTPUT ${XF_SHADER_OUT}/xenoforge_icon.inc
+        COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_CURRENT_SOURCE_DIR}/assets/branding/xenoforge-256.png
+                -DOUT=${XF_SHADER_OUT}/xenoforge_icon.inc -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake
+        DEPENDS assets/branding/xenoforge-256.png cmake/embed_bytes.cmake
+        COMMENT "the windows' icon")
     add_library(xf_frontend STATIC frontend/settings.cpp frontend/presenter.cpp frontend/sdl_input.cpp
                                    frontend/profiles.cpp frontend/console_options.cpp frontend/system_ui.cpp
                                    frontend/sdl_audio.cpp frontend/library.cpp frontend/launcher_core.cpp
-                                   ${XF_SHADER_OUT}/front_buffer.comp.inc)
+                                   frontend/window_icon.cpp
+                                   ${XF_SHADER_OUT}/front_buffer.comp.inc ${XF_SHADER_OUT}/xenoforge_icon.inc)
     target_include_directories(xf_frontend PRIVATE ${XF_SHADER_OUT})
     target_link_libraries(xf_frontend PUBLIC xenoforge xenoforge_vk SDL3::SDL3-static Vulkan::Vulkan
                                              tomlplusplus::tomlplusplus)
@@ -384,7 +399,12 @@ if(XF_PLAYER AND TARGET boot)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(xenoforge_player PRIVATE -Wno-missing-field-initializers)
     endif()
-    add_executable(player tools/stub_main.cpp)
+    # the executables' icon on Windows (frontend/xenoforge.rc)
+    set(XF_EXE_ICON)
+    if(WIN32 AND CMAKE_RC_COMPILER)
+        set(XF_EXE_ICON frontend/xenoforge.rc)
+    endif()
+    add_executable(player tools/stub_main.cpp ${XF_EXE_ICON})
     target_link_libraries(player PRIVATE xenoforge_player xenoforge_kernel xenoforge_vk xenoforge)
     add_library(XenoForge::player ALIAS xenoforge_player)
     # the launcher (track C2; docs/runtime.md, "The launcher"): the games in a
@@ -414,7 +434,7 @@ if(XF_PLAYER AND TARGET boot)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(xf_ui PRIVATE -Wno-missing-field-initializers)
     endif()
-    add_executable(launcher WIN32 frontend/launcher.cpp)
+    add_executable(launcher WIN32 frontend/launcher.cpp ${XF_EXE_ICON})
     target_link_libraries(launcher PRIVATE xf_ui xf_frontend stb)
     set(XF_UI_ASSETS ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui)
     add_custom_command(TARGET launcher POST_BUILD

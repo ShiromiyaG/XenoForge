@@ -4,6 +4,7 @@
 
 #include "console_options.h"
 #include "profiles.h"
+#include "window_icon.h"
 
 #include "xenoforge/profile_gpd.h"
 
@@ -75,6 +76,7 @@ bool SettingsView::open(SDL_Window *parent, const std::filesystem::path &assets,
     if (offscreen_) flags |= SDL_WINDOW_HIDDEN;
     window_ = SDL_CreateWindow("Settings", int(WIDTH_DP * s), int(HEIGHT_DP * s), flags);
     if (!window_) return error = std::string("SDL: ") + SDL_GetError(), false;
+    set_window_icon(window_, xenoforge_icon_png());
     off_w_ = uint32_t(WIDTH_DP * s), off_h_ = uint32_t(HEIGHT_DP * s);
     SDL_SetWindowMinimumSize(window_, int(560 * s), int(420 * s));
     if (parent && !offscreen_) {

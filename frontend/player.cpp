@@ -43,6 +43,8 @@
 #include "sdl_input.h"
 #include "console_options.h"
 #include "guide_theme.h"
+#include "library.h"
+#include "window_icon.h"
 #include "overlay_system.h"
 #include "profiles.h"
 #include "settings.h"
@@ -391,9 +393,16 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     std::filesystem::path key_shots =
         settings.screenshots.empty() ? config_file.parent_path() / "screenshots" : settings.screenshots;
 
-    SDL_Window *window = SDL_CreateWindow((std::string("XenoForge - ") + (port.name.empty() ? title_id : port.name)).c_str(), 1280, 720,
+    // the window: the game's name and image (its executable's XDBF), else the port's name or the title ID and
+    // XenoForge's mark
+    std::string window_title = port.name;
+    if (window_title.empty()) window_title = frontend::title_name(g.xex);
+    if (window_title.empty()) window_title = title_id;
+    SDL_Window *window = SDL_CreateWindow((window_title + " - XenoForge").c_str(), 1280, 720,
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!window) return fail(std::string("SDL: ") + SDL_GetError());
+    if (!frontend::set_window_icon(window, frontend::title_icon(g.xex)))
+        frontend::set_window_icon(window, frontend::xenoforge_icon_png());
     // one Vulkan device for the renderer and the window: the front buffers
     // never leave the GPU
     vk::Device::Window surface;

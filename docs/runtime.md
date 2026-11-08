@@ -1804,6 +1804,11 @@ kernel's own result shapes. The logic is apart from the view:
   start; panels with a soft shadow and a top-lit gradient, items lit green when focused, A/B/X/Y as coloured discs,
   XenoForge's mark drawn as vectors (the ring of light and the anvil, `assets/branding`). `push_widgets` gives ImGui's
   own widgets the same look inside the guide.
+- **The windows' icons** (`frontend/window_icon.*`): the launcher's windows carry XenoForge's mark (built in from
+  `assets/branding/xenoforge-256.png` by `cmake/embed_bytes.cmake`); the player's window carries the running game's
+  own image and name from its executable's XDBF (`title_icon`, `title_name`), the mark when it has none. The
+  executables' icon on Windows is `frontend/xenoforge.rc` (`assets/branding/xenoforge.ico`), when CMake finds a
+  resource compiler (llvm-rc beside clang).
 - **The guide** (F2, the controller's Guide button, or Back and Start held together for half a second: Windows' Game
   Bar often takes the Guide button): the console pages as a panel sliding in from the left, the profile on top (the
   mark, the gamertag, the title's gamerscore), three pages switched by LB/RB, Page Up/Down or the mouse:

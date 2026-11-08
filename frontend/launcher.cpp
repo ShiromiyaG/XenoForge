@@ -50,6 +50,7 @@
 //            [--render-size WxH] [--scale F] [--assets <dir>]
 
 #include "launcher_core.h"
+#include "window_icon.h"
 #include "xenoforge/game_build.h"
 #include "launcher_view.h"
 #include "ui/ui_system.h"
@@ -249,6 +250,7 @@ int main(int argc, char **argv) {
     }
     SDL_Window *window = SDL_CreateWindow("XenoForge", width, height, window_flags);
     if (!window) return fail(std::string("SDL: ") + SDL_GetError());
+    frontend::set_window_icon(window, frontend::xenoforge_icon_png());
     SDL_SetWindowMinimumSize(window, int(720 * display_scale), int(420 * display_scale));
     if (restore) {
         SDL_SetWindowPosition(window, placed.x, placed.y);
