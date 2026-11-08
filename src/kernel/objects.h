@@ -494,6 +494,9 @@ std::unique_ptr<Scheduler> make_deterministic_scheduler(Objects &objects, const 
 // way (exceptions.cpp).
 void set_current_thread(Thread *t);
 void *exchange_exception_walks(void *walks);
+// A trap instruction that fired at `at` (exceptions.cpp): a debug print, or a
+// breakpoint raised through the title's handlers.
+void trap(Kernel &k, ppc::Context &c, uint32_t at);
 
 // ---- the kernel's state for its objects ----
 

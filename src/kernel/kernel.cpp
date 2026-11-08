@@ -171,6 +171,10 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         std::snprintf(reason, sizeof(reason), "%s (0x%08X) at 0x%08X has no semantics", ppc::info(op).name, code, c.pc);
         k.stop(reason);
     };
+    // a trap that fired: a debug print, or a breakpoint through the title's handlers (exceptions.cpp)
+    system_.trap = [](ppc::Context &c, uint32_t address) {
+        trap(*static_cast<Kernel *>(c.system->owner), c, address);
+    };
     system_.time_base = [](ppc::Context &c) {
         // the Xenon's time base runs at 50 MHz: 5 ticks in the scheduler's
         // clock's 100 ns

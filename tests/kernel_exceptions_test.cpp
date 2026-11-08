@@ -2,7 +2,8 @@
 // "Structured exceptions") on a guest program (seh_program.h), interpreted
 // and then recompiled (seh_gen's output, built with the test): __except and
 // its filters, nested __try with __finally run on the unwind, a continued
-// exception, a noncontinuable one continued, DbgBreakPoint, SetThreadName's
+// exception, a noncontinuable one continued, DbgBreakPoint and a
+// breakpoint trap instruction (twi 31, r0, 22), SetThreadName's
 // exception with no handler, RtlUnwind to its own frame and two frames up,
 // and a C++ throw caught two frames up, rethrown from the catch and caught
 // again. A child process checks that an exception no handler takes stops the
@@ -176,6 +177,8 @@ void main_thread(ppc::Context &c) {
     CHECK_LOG(0x50, 0x50, 0xC0000025, 0xE0000004, 0x52);
     scenario(c, "f_break");
     CHECK_LOG(0x80000003, 0x61);
+    scenario(c, "f_trap");
+    CHECK_LOG(0x80000003, 0x62);
     scenario(c, "f_threadname");
     CHECK_LOG(0x70);
     CHECK(current_thread() && current_thread()->guest_name == "seh-thread");

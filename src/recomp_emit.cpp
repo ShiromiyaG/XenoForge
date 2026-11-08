@@ -309,6 +309,10 @@ private:
         }
         default:
             if (first) return;
+            // a trap that fires tells the system where it is (System::trap reads
+            // c.pc, which the generated code keeps nowhere else)
+            if (op == Opcode::tw || op == Opcode::twi || op == Opcode::td || op == Opcode::tdi)
+                line("c.pc = 0x" + hex8(pc) + ";");
             line("I(" + std::string(ppc::info(op).name) + ", 0x" + hex8(i.code) + ");");
             fall_through(pc);
             return;

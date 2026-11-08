@@ -352,6 +352,21 @@ inline Program build_program() {
     end();
     t.label("scope_b"), t.word(1), t.word("b_begin"), t.word("b_end"), t.word("filter_code"), t.word("b_except");
 
+    // S5b: __try { __debugbreak() } __except (filter_code) { 0x62 }: the
+    // breakpoint is the instruction itself (twi 31, r0, 22), raised at it
+    begin("f_trap", 4, C, "scope_tr");
+    prologue_b(0x80);
+    a.label("tr_begin");
+    a.word(0x0FE00016);
+    a.label("tr_end");
+    a.b("tr_after");
+    a.label("tr_except");
+    log(0x62);
+    a.label("tr_after");
+    epilogue_b(0x80);
+    end();
+    t.label("scope_tr"), t.word(1), t.word("tr_begin"), t.word("tr_end"), t.word("filter_code"), t.word("tr_except");
+
     // S6: SetThreadName's exception with no handler: on, silently
     begin("f_threadname", 5);
     prologue_a(0x90);

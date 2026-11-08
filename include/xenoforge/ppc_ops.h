@@ -72,7 +72,18 @@ constexpr uint64_t mask(uint32_t mstart, uint32_t mstop) {
 
 // the 4 KB offset of the 0xE0000000 physical view (memory.h; Xenia's
 // host_address_offset)
-XF_INLINE uint8_t *host(Context &c, uint32_t ea) { return c.base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u); }
+// The guest's memory and the Context are separate allocations (the context
+// lives on the host's heap, never inside the guest's reservation): said to
+// the compiler, a guest store no longer makes it reload the registers it
+// holds from the context, nor the base (game B: about 12% less CPU time
+// running deterministically; docs/recompiler.md, "Where the time goes").
+XF_INLINE uint8_t *host(Context &c, uint32_t ea) {
+    uint8_t *p = c.base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u);
+#if __has_builtin(__builtin_assume_separate_storage)
+    __builtin_assume_separate_storage(p, &c);
+#endif
+    return p;
+}
 XF_INLINE uint8_t load8(Context &c, uint32_t ea) { return *host(c, ea); }
 XF_INLINE uint16_t load16(Context &c, uint32_t ea) {
     uint16_t v;

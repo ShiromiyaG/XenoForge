@@ -87,6 +87,10 @@ struct alignas(64) Context {
     // XER's byte count (bits 57-63), what lswx and stswx move; kept in the
     // padding here so the fields around it stay where they were
     uint8_t xer_bc;
+    // VSCR[NJ] clear (Java mode: VMX floating point keeps denormals; mtvscr
+    // sets it), 0 by default, so a zeroed context is in non-Java mode as the
+    // console starts a thread; also in the padding
+    uint8_t vscr_java;
     // msr, as mfmsr/mtmsr see it (EE only)
     uint64_t msr;
     // where guest address 0 is

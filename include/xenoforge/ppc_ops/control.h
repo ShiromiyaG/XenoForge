@@ -5,9 +5,9 @@
 //
 // Where this differs from Xenia, it follows the hardware: XER is SO, OV and
 // CA (Xenia's has only CA), so mfxer/mtxer/mcrxr see all three; VSCR is
-// built from vscr_sat with NJ always set (the vector unit runs in non-Java
-// mode; Xenia keeps a separate copy of VSCR whose SAT the saturating
-// instructions never update). VRSAVE reads 0 and ignores writes.
+// built from vscr_sat and vscr_java (NJ set unless mtvscr cleared it; Xenia
+// keeps a separate copy of VSCR whose SAT the saturating instructions never
+// update). VRSAVE reads 0 and ignores writes.
 
 #pragma once
 
@@ -182,10 +182,15 @@ XF_OP(mtmsrd) { c.msr = (c.r[i.X.RT] & 0x8000) | (c.msr & ~uint64_t(0x8000)); }
 
 XF_OP(mfvscr) {
     c.v[i.VX.VD] = Vec128{};
-    c.v[i.VX.VD].u32[3] = 0x00010000u | (c.vscr_sat & 1);
+    c.v[i.VX.VD].u32[3] = (c.vscr_java ? 0u : 0x00010000u) | (c.vscr_sat & 1);
 }
 
-XF_OP(mtvscr) { c.vscr_sat = c.v[i.VX.VB].u32[3] & 1; }
+// SAT and NJ from the last word (Xenia switches its denormal mode on NJ too,
+// but leaves its SAT alone)
+XF_OP(mtvscr) {
+    c.vscr_sat = c.v[i.VX.VB].u32[3] & 1;
+    c.vscr_java = !(c.v[i.VX.VB].u32[3] & 0x00010000u);
+}
 
 // ---- traps: TO is the RT field; tw/twi compare the low words, signed ----
 
