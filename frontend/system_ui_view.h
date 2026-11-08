@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "guide_theme.h"
 #include "system_ui.h"
 
 #include "xenoforge/vk_device.h"
@@ -37,5 +38,11 @@ class IconCache {
 // Draws the top dialog and the toasts (between ImGui::NewFrame and Render); `now` in seconds. The dialog's
 // choices clicked and a keyboard dialog's Enter answer through `ui`.
 void draw_system_ui(SystemUi &ui, IconCache &icons, double now);
+
+// One achievement as a row of the console's lists (the achievements dialog, the guide's page): its picture, its
+// name and description, its gamerscore in a pill; lit when focused, greyed while locked.
+void draw_achievement_row(ImDrawList *dl, const guide::Scale &sc, ImVec2 min, ImVec2 max,
+                          const kernel::ProfileAchievement &achievement, ImTextureID picture, bool focused,
+                          bool hovered, float alpha);
 
 } // namespace xf::frontend

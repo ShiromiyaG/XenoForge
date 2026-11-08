@@ -1,20 +1,47 @@
 #include "overlay_system.h"
 
 #include "console_options.h"
+#include "guide_theme.h"
 #include "profiles.h"
 
 #include <imgui.h>
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace xf::frontend {
 
 namespace {
 
+// In the guide, a setting's name at the left and its control filling the rest of the row; elsewhere ImGui's own
+// layout (the name after the control). Returns the label to give the control.
+float g_label_w = 0;
+std::string labelled(const char *label) {
+    if (g_label_w <= 0) return label;
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(g_label_w);
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    return std::string("##") + label;
+}
+
+// a section's caption in the guide: small, dim, spaced
+void caption(const char *text) {
+    if (g_label_w <= 0) {
+        ImGui::SeparatorText(text);
+        return;
+    }
+    ImGui::Dummy(ImVec2(0, ImGui::GetStyle().ItemSpacing.y * 0.5f));
+    ImGui::PushStyleColor(ImGuiCol_Text, guide::col::green_hi);
+    ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
+}
+
 // a combo over a list of choices; true when another was picked (its value into `value`)
 bool choice_combo(const char *label, const std::vector<Option> &list, int &value) {
     bool changed = false;
-    if (ImGui::BeginCombo(label, list[index_of(list, value)].name)) {
+    if (ImGui::BeginCombo(labelled(label).c_str(), list[index_of(list, value)].name)) {
         for (const Option &c : list) {
             if (ImGui::Selectable(c.name, c.value == value)) {
                 value = c.value;
@@ -28,18 +55,18 @@ bool choice_combo(const char *label, const std::vector<Option> &list, int &value
 
 } // namespace
 
-bool ConsolePages::draw(Host &h, double now) {
-    Settings &s = h.settings;
-    bool changed = false;
-    if (!loaded_) {
-        loaded_ = true;
-        std::snprintf(gamertag_, sizeof(gamertag_), "%s", kernel::profile_summary(h.kernel).gamertag.c_str());
-    }
+void ConsolePages::load(Host &h) {
+    if (loaded_) return;
+    loaded_ = true;
+    std::snprintf(gamertag_, sizeof(gamertag_), "%s", kernel::profile_summary(h.kernel).gamertag.c_str());
+}
 
-    ImGui::SeparatorText("System");
+bool ConsolePages::system_page(Host &h) {
+    Settings &s = h.settings;
     bool system = false;
     system |= choice_combo("Language", languages(), s.system.language);
     system |= choice_combo("Country", countries(), s.system.country);
+    if (g_label_w > 0) caption("Video");
     int height = resolution_of(s.system);
     if (choice_combo("Resolution", resolutions(), height)) set_resolution(s.system, height), system = true;
     system |= choice_combo("Aspect", widescreen_modes(), s.system.widescreen);
@@ -47,14 +74,21 @@ bool ConsolePages::draw(Host &h, double now) {
     if (system) {
         clamp_system(s.system);
         h.apply_system();
-        restart_needed_ = true, changed = true;
+        restart_needed_ = true;
     }
+    return system;
+}
 
-    ImGui::SeparatorText("Profile");
+bool ConsolePages::profile_page(Host &h, float field_width) {
+    Settings &s = h.settings;
+    bool changed = false;
     std::string why;
     const bool valid = valid_gamertag(gamertag_, why);
-    ImGui::SetNextItemWidth(220);
-    ImGui::InputText("Gamertag", gamertag_, sizeof(gamertag_));
+    caption("Gamertag");
+    const float rename_w = ImGui::CalcTextSize("Rename").x + ImGui::GetStyle().FramePadding.x * 2;
+    ImGui::SetNextItemWidth(g_label_w > 0 ? ImGui::GetContentRegionAvail().x - rename_w - ImGui::GetStyle().ItemSpacing.x
+                                          : field_width);
+    ImGui::InputText(g_label_w > 0 ? "##gamertag" : "Gamertag", gamertag_, sizeof(gamertag_));
     ImGui::SameLine();
     ImGui::BeginDisabled(!valid);
     if (ImGui::Button("Rename")) {
@@ -76,11 +110,16 @@ bool ConsolePages::draw(Host &h, double now) {
     if (!valid && gamertag_[0]) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", why.c_str());
     if (!error_.empty()) ImGui::TextColored(ImVec4(1, 0.5f, 0.4f, 1), "%s", error_.c_str());
 
+    caption("Profiles");
     if (ImGui::BeginTable("profiles", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
         for (const ProfileEntry &e : list_profiles(h.storage, s)) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::Text("%s%s", e.selected ? "> " : "  ", e.name.empty() ? "(unnamed)" : e.name.c_str());
+            if (e.selected)
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(guide::col::green_hi), "%s",
+                                   e.name.empty() ? "(unnamed)" : e.name.c_str());
+            else
+                ImGui::Text("%s", e.name.empty() ? "(unnamed)" : e.name.c_str());
             ImGui::TableNextColumn();
             ImGui::TextDisabled("%s", e.xuid.c_str());
             ImGui::TableNextColumn();
@@ -103,8 +142,11 @@ bool ConsolePages::draw(Host &h, double now) {
         }
         ImGui::EndTable();
     }
-    ImGui::SetNextItemWidth(220);
-    ImGui::InputText("New profile", new_name_, sizeof(new_name_));
+    caption("New profile");
+    const float create_w = ImGui::CalcTextSize("Create").x + ImGui::GetStyle().FramePadding.x * 2;
+    ImGui::SetNextItemWidth(g_label_w > 0 ? ImGui::GetContentRegionAvail().x - create_w - ImGui::GetStyle().ItemSpacing.x
+                                          : field_width);
+    ImGui::InputTextWithHint(g_label_w > 0 ? "##new" : "New profile", "A gamertag", new_name_, sizeof(new_name_));
     ImGui::SameLine();
     std::string new_why;
     ImGui::BeginDisabled(!valid_gamertag(new_name_, new_why));
@@ -114,6 +156,7 @@ bool ConsolePages::draw(Host &h, double now) {
     }
     ImGui::EndDisabled();
 
+    caption("Saves");
     bool directory = s.saves.format == "directory";
     if (ImGui::RadioButton("Saves as STFS packages", !directory) && directory) {
         s.saves.format = "stfs", changed = true;
@@ -124,35 +167,194 @@ bool ConsolePages::draw(Host &h, double now) {
         s.saves.format = "directory", changed = true;
         kernel::set_content_format(h.kernel, kernel::ContentFormat::Directory);
     }
+    return changed;
+}
 
-    if (restart_needed_) {
-        ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1),
-                           "The title reads these when it starts: restart it to apply them.");
-        if (ImGui::Button("Restart the title")) h.restart();
+void ConsolePages::restart_notice(Host &h) {
+    if (!restart_needed_) return;
+    ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), "The title reads these when it starts: restart it to apply them.");
+    if (ImGui::Button("Restart the title")) h.restart();
+}
+
+void ConsolePages::achievements_page(Host &h, double now, float icon) {
+    if (now - summary_at_ >= 1.0) summary_ = kernel::profile_summary(h.kernel), summary_at_ = now;
+    if (summary_.achievements.empty()) ImGui::TextDisabled("No achievements listed for this title.");
+    for (const kernel::ProfileAchievement &a : summary_.achievements) {
+        ImGui::PushID(int(a.id));
+        if (ImTextureID tex = h.icons.get(a.image_id, a.icon))
+            ImGui::ImageWithBg(tex, ImVec2(icon, icon), ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0),
+                               a.unlocked ? ImVec4(1, 1, 1, 1) : ImVec4(0.45f, 0.45f, 0.45f, 1));
+        else
+            ImGui::Dummy(ImVec2(icon, icon));
+        ImGui::SameLine();
+        ImGui::BeginGroup();
+        ImGui::TextColored(a.unlocked ? ImGui::ColorConvertU32ToFloat4(guide::col::green_hi) : ImVec4(0.7f, 0.7f, 0.7f, 1),
+                           "%s  %u G%s", utf8_of(a.label).c_str(), a.gamerscore, a.unlocked ? "  (unlocked)" : "");
+        ImGui::TextWrapped("%s", utf8_of(a.unlocked || a.unachieved.empty() ? a.description : a.unachieved).c_str());
+        ImGui::EndGroup();
+        ImGui::PopID();
     }
+}
 
+void ConsolePages::achievement_rows(Host &h, double now, const guide::Scale &sc, float width) {
+    if (now - summary_at_ >= 1.0) summary_ = kernel::profile_summary(h.kernel), summary_at_ = now;
+    if (summary_.achievements.empty()) {
+        ImGui::TextDisabled("No achievements listed for this title.");
+        return;
+    }
+    const float row_h = sc.px(74);
+    for (size_t i = 0; i < summary_.achievements.size(); i++) {
+        const kernel::ProfileAchievement &ach = summary_.achievements[i];
+        ImGui::PushID(int(i));
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        // a selectable under each row: the pad's and the mouse's focus, the list's scrolling
+        ImGui::Selectable("##row", false, ImGuiSelectableFlags_None, ImVec2(width, row_h - sc.px(8)));
+        const bool focused = ImGui::IsItemFocused() && ImGui::GetIO().NavActive;
+        draw_achievement_row(ImGui::GetWindowDrawList(), sc, at, ImVec2(at.x + width, at.y + row_h - sc.px(8)), ach,
+                             h.icons.get(ach.image_id, ach.icon), focused, ImGui::IsItemHovered(), 1);
+        ImGui::PopID();
+    }
+}
+
+bool ConsolePages::draw(Host &h, double now) {
+    load(h);
+    bool changed = false;
+    ImGui::SeparatorText("System");
+    changed |= system_page(h);
+    ImGui::SeparatorText("Profile");
+    changed |= profile_page(h, 220);
+    restart_notice(h);
     if (ImGui::CollapsingHeader("Achievements")) {
         if (now - summary_at_ >= 1.0) summary_ = kernel::profile_summary(h.kernel), summary_at_ = now;
         ImGui::Text("%s: %u / %u G", summary_.gamertag.c_str(), summary_.gamerscore, summary_.gamerscore_total);
-        if (summary_.achievements.empty()) ImGui::TextDisabled("No achievements listed for this title.");
         ImGui::BeginChild("achievements", ImVec2(0, 260), ImGuiChildFlags_Borders);
-        for (const kernel::ProfileAchievement &a : summary_.achievements) {
-            ImGui::PushID(int(a.id));
-            if (ImTextureID tex = h.icons.get(a.image_id, a.icon))
-                ImGui::ImageWithBg(tex, ImVec2(40, 40), ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0),
-                             a.unlocked ? ImVec4(1, 1, 1, 1) : ImVec4(0.45f, 0.45f, 0.45f, 1));
-            else
-                ImGui::Dummy(ImVec2(40, 40));
-            ImGui::SameLine();
-            ImGui::BeginGroup();
-            ImGui::TextColored(a.unlocked ? ImVec4(0.55f, 0.9f, 0.4f, 1) : ImVec4(0.7f, 0.7f, 0.7f, 1), "%s  %u G%s",
-                               utf8_of(a.label).c_str(), a.gamerscore, a.unlocked ? "  (unlocked)" : "");
-            ImGui::TextWrapped("%s", utf8_of(a.unlocked || a.unachieved.empty() ? a.description : a.unachieved).c_str());
-            ImGui::EndGroup();
-            ImGui::PopID();
-        }
+        achievements_page(h, now, 40);
         ImGui::EndChild();
     }
+    return changed;
+}
+
+// The guide: a panel sliding in from the left over the game, the profile on top (the mark, the gamertag, the
+// title's gamerscore), three pages switched by the shoulders (or the mouse), ImGui's widgets in the guide's look,
+// the controller's buttons at the bottom. `open` goes false when it is closed from inside (B, Escape, the X).
+bool ConsolePages::draw_guide(Host &h, double now, bool &open) {
+    load(h);
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    const guide::Scale sc = guide::scale_for(vp->Size);
+    const guide::Fonts &f = guide::fonts();
+    if (guide_shown_at_ < 0) guide_shown_at_ = now;
+    const float a = guide::ease_out(float((now - guide_shown_at_) / 0.22));
+    if (now - summary_at_ >= 1.0) summary_ = kernel::profile_summary(h.kernel), summary_at_ = now;
+
+    const float width = std::min(std::max(sc.px(560), vp->Size.x * 0.40f), vp->Size.x - sc.px(24));
+    const float slide = (1 - a) * (width + sc.px(40));
+    const ImVec2 min(vp->Pos.x - sc.px(16) - slide, vp->Pos.y + sc.px(16));
+    const ImVec2 max(min.x + sc.px(16) + width, vp->Pos.y + vp->Size.y - sc.px(16));
+    const float pad = sc.px(26);
+
+    ImGui::GetBackgroundDrawList()->AddRectFilled(vp->Pos, ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y),
+                                                  guide::fade(IM_COL32(0, 0, 0, 255), 0.35f * a));
+    ImGui::SetNextWindowPos(min);
+    ImGui::SetNextWindowSize(ImVec2(max.x - min.x, max.y - min.y));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::Begin("##guide", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PopStyleVar(2);
+    if (ImGui::IsWindowAppearing()) ImGui::SetWindowFocus();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    guide::panel(dl, min, max, sc.px(14), a);
+
+    // the profile: the mark, the gamertag, the gamerscore
+    const float x = min.x + sc.px(16) + pad;
+    float y = min.y + pad;
+    const float disc = sc.px(30);
+    guide::mark(dl, ImVec2(x + disc, y + disc), disc, a);
+    const std::string tag = summary_.gamertag.empty() ? std::string("Player") : summary_.gamertag;
+    guide::text(dl, f.title, sc.px(28), ImVec2(x + 2 * disc + sc.px(16), y + sc.px(2)), guide::fade(guide::col::text, a),
+                tag.c_str());
+    char score[64];
+    std::snprintf(score, sizeof(score), "%u / %u G in this title", summary_.gamerscore, summary_.gamerscore_total);
+    guide::text(dl, f.small, sc.px(16), ImVec2(x + 2 * disc + sc.px(16), y + sc.px(38)),
+                guide::fade(guide::col::text_dim, a), score);
+    y += 2 * disc + sc.px(18);
+    const float inner = max.x - pad - x;
+    guide::accent_line(dl, ImVec2(x, y), inner, sc.px(2), a);
+    y += sc.px(16);
+
+    // the pages' tabs
+    static const char *names[] = {"Achievements", "Profile", "System"};
+    const float tab_h = sc.px(40), tab_gap = sc.px(8);
+    const float tab_w = (inner - 2 * tab_gap) / 3;
+    for (int i = 0; i < 3; i++) {
+        const ImVec2 tmin(x + float(i) * (tab_w + tab_gap), y), tmax(tmin.x + tab_w, y + tab_h);
+        ImGui::SetCursorScreenPos(tmin);
+        ImGui::PushID(i);
+        if (ImGui::InvisibleButton("##tab", ImVec2(tab_w, tab_h))) tab_ = i;
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::PopID();
+        guide::item(dl, tmin, tmax, sc.px(8), tab_ == i, hovered, a);
+        const ImVec2 ts = guide::measure(f.strong, sc.px(18), names[i]);
+        guide::text(dl, f.strong, sc.px(18), ImVec2(tmin.x + (tab_w - ts.x) / 2, tmin.y + (tab_h - ts.y) / 2),
+                    guide::fade(tab_ == i ? guide::col::text_on_green : guide::col::text_dim, a), names[i]);
+    }
+    y += tab_h + sc.px(16);
+
+    // the page: ImGui's widgets in the guide's look, scrolling inside
+    const float footer_h = sc.px(52);
+    ImGui::SetCursorScreenPos(ImVec2(x, y));
+    guide::push_widgets(sc);
+    ImGui::PushFont(f.body);
+    ImGui::SetWindowFontScale(sc.px(19) / (f.body->FontSize * ImGui::GetIO().FontGlobalScale));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
+    bool changed = false;
+    if (ImGui::BeginChild("##page", ImVec2(inner, max.y - footer_h - y), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NavFlattened)) {
+        ImGui::SetWindowFontScale(sc.px(19) / (f.body->FontSize * ImGui::GetIO().FontGlobalScale));
+        g_label_w = inner * 0.36f;
+        switch (tab_) {
+        case 0: achievement_rows(h, now, sc, inner - sc.px(14)); break;
+        case 1:
+            changed |= profile_page(h, inner * 0.55f);
+            restart_notice(h);
+            break;
+        default:
+            caption("Language and region");
+            changed |= system_page(h);
+            restart_notice(h);
+            break;
+        }
+        g_label_w = 0;
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    ImGui::SetWindowFontScale(1);
+    ImGui::PopFont();
+    guide::pop_widgets();
+
+    // the footer: the controller's buttons
+    const float hh = sc.px(28), fy = max.y - pad * 0.5f - hh - sc.px(6);
+    dl->AddLine(ImVec2(x, fy - sc.px(10)), ImVec2(x + inner, fy - sc.px(10)),
+                guide::fade(IM_COL32(255, 255, 255, 18), a), 1.0f);
+    float hx = x;
+    hx += guide::hint(dl, ImVec2(hx, fy), hh, 'A', "Select", a) + sc.px(22);
+    hx += guide::hint(dl, ImVec2(hx, fy), hh, 'B', "Close", a) + sc.px(22);
+    const ImVec2 ps = guide::measure(f.small, hh * 0.62f, "LB / RB  pages");
+    guide::text(dl, f.small, hh * 0.62f, ImVec2(hx, fy + (hh - ps.y) / 2), guide::fade(guide::col::text_dim, a),
+                "LB / RB  pages");
+
+    // closing from inside: Escape, or B with nothing being edited
+    if (!ImGui::IsAnyItemActive() &&
+        (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
+        open = false;
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_PageUp, false))
+        tab_ = (tab_ + 2) % 3;
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_PageDown, false))
+        tab_ = (tab_ + 1) % 3;
+    ImGui::End();
+    if (!open) guide_shown_at_ = -1;
     return changed;
 }
 

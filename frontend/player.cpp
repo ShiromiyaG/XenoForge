@@ -42,6 +42,7 @@
 #include "sdl_audio.h"
 #include "sdl_input.h"
 #include "console_options.h"
+#include "guide_theme.h"
 #include "overlay_system.h"
 #include "profiles.h"
 #include "settings.h"
@@ -61,6 +62,7 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -413,6 +415,15 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     // the overlay (Dear ImGui) on the presenter's device
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
+    {
+        // the console screens' typeface (guide_theme.h), made for the window's size at the start
+        int ww = 0, wh = 0;
+        SDL_GetWindowSizeInPixels(window, &ww, &wh);
+        const float font_scale = std::clamp(float(wh) / 720.0f, 1.0f, 2.0f);
+        if (!frontend::guide::load_fonts(frontend::guide::find_fonts(), font_scale))
+            std::fprintf(stderr, "player: no Inter fonts beside the executable (ui/fonts); the overlay's own font\n");
+        ImGui::GetIO().FontGlobalScale = 1.0f / font_scale;
+    }
     ImGui_ImplSDL3_InitForVulkan(window);
     VkFormat format = presenter.format();
     ImGui_ImplVulkan_InitInfo info{};
@@ -440,13 +451,18 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     frontend::PadNavigator pad_nav;
     bool dialog_was_up = false, restart_requested = false;
     uint64_t answered_seen = 0;
+    int guide_page_demo = 0; // --ui-demo guide-profile, guide-system: the guide opened on that page
     // --ui-demo: dialogs opened at the start with samples of what titles ask, answered by the pad and keyboard
     for (size_t at = 0; at < ui_demo.size();) {
         size_t comma = ui_demo.find(',', at);
         std::string name = ui_demo.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
         at = comma == std::string::npos ? ui_demo.size() : comma + 1;
         kernel::UiRequest r;
-        if (name == "console") continue; // (opens the overlay's console section)
+        if (name == "console" || name == "guide") continue; // (the overlay's console section; the guide)
+        if (name == "guide-profile" || name == "guide-system") {
+            guide_page_demo = name == "guide-profile" ? 1 : 2;
+            continue;
+        }
         if (name == "toast") {
             kernel::Toast t;
             t.kind = kernel::Toast::Kind::Achievement;
@@ -529,6 +545,19 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     const Clock::time_point started = Clock::now();
 
     bool quit = false, changed = false, shown_any = false;
+    // the guide (F2 or the controller's Guide button): the console pages in the guide's look
+    bool guide_open = ui_demo.find("guide") != std::string::npos;
+    if (guide_page_demo) pages.set_guide_page(guide_page_demo);
+    uint16_t guide_buttons_before = 0;
+    uint64_t guide_combo_since = 0; // when Back and Start were both down (0: not both)
+    bool guide_combo_fired = false;
+    auto close_guide = [&] {
+        guide_open = false;
+        if (changed) {
+            if (!frontend::save(config_file, settings, error)) std::fprintf(stderr, "%s\n", error.c_str());
+            changed = false;
+        }
+    };
     uint64_t presented = 0, refreshes = 0, key_screenshots = 0, shots_written = 0;
     std::string ended;
     Rates rates;
@@ -583,6 +612,10 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                     changed = true;
                 }
                 if (e.key.scancode == SDL_SCANCODE_F12) key_screenshot();
+                if (e.key.scancode == SDL_SCANCODE_F2 && !sysui.active()) {
+                    if (guide_open) close_guide();
+                    else guide_open = true;
+                }
                 // the port's frames or the emulated ones, for this run (the
                 // port's option, when it binds one, keeps the setting)
                 if (e.key.scancode == SDL_SCANCODE_F6 && native::has_output_renderer()) native::toggle();
@@ -593,8 +626,31 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         const bool focused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
         // a dialog of the system takes the controllers and the keyboard from the title, as the console's guide does
         const bool dialog_up = sysui.active();
-        controllers.set_taken(dialog_up);
-        controllers.read_keyboard(focused, overlay || dialog_up);
+        {
+            // the Guide button opens and closes the guide, and so do Back and Start held together for half a second
+            // (Windows' Game Bar often takes the Guide button); a dialog of the title's closes it
+            const uint64_t at = k.uptime_ms();
+            const uint16_t buttons = controllers.view(at)[0].pad.buttons;
+            bool toggle = (buttons & input::GUIDE) && !(guide_buttons_before & input::GUIDE);
+            constexpr uint16_t combo = input::BACK | input::START;
+            if ((buttons & combo) == combo) {
+                if (!guide_combo_since) guide_combo_since = at ? at : 1;
+                if (!guide_combo_fired && at - guide_combo_since >= 500) toggle = true, guide_combo_fired = true;
+            } else {
+                guide_combo_since = 0, guide_combo_fired = false;
+            }
+            if (toggle && !dialog_up) {
+                if (guide_open) close_guide();
+                else guide_open = true;
+            }
+            guide_buttons_before = buttons;
+            if (dialog_up && guide_open) close_guide();
+            ImGuiIO &io = ImGui::GetIO();
+            if (guide_open) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
+            else io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard);
+        }
+        controllers.set_taken(dialog_up || guide_open);
+        controllers.read_keyboard(focused, overlay || dialog_up || guide_open);
         if (dialog_up) {
             const uint64_t at = k.uptime_ms();
             const input::Gamepad pad = controllers.view(at)[sysui.user()].pad;
@@ -689,7 +745,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         int pw = 0, ph = 0;
         SDL_GetWindowSizeInPixels(window, &pw, &ph);
         const bool minimized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) || !pw || !ph;
-        const bool ui_busy = sysui.active() || sysui.has_toasts();
+        const bool ui_busy = sysui.active() || sysui.has_toasts() || guide_open;
         if (minimized ||
             (!presenter.fresh() && !overlay && !ui_busy && now - last_present < std::chrono::milliseconds(100))) {
             SDL_Delay(minimized ? 10 : 1);
@@ -818,6 +874,16 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             ImGui::TextDisabled("%s", key_shots.string().c_str());
             ImGui::End();
             if (!keep) overlay = false;
+        }
+        if (guide_open) {
+            frontend::ConsolePages::Host host{settings, o.storage, k, icons, apply_system, [&] {
+                                                  restart_requested = true;
+                                                  quit = true;
+                                                  ended = "restart";
+                                              }};
+            bool keep = true;
+            if (pages.draw_guide(host, seconds, keep)) changed = true;
+            if (!keep) close_guide();
         }
         frontend::draw_system_ui(sysui, icons, seconds);
         ImGui::Render();

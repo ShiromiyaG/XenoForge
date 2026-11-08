@@ -31,10 +31,25 @@ class ConsolePages {
     };
     // Between Begin and End of the overlay's window; true when the settings changed (to be saved).
     bool draw(Host &host, double now);
+    // The same pages as the console's guide (guide_theme.h): a window of their own sliding in from the left,
+    // Achievements, Profile and System switched by the shoulders; `open` goes false when closed from inside.
+    // True when the settings changed.
+    bool draw_guide(Host &host, double now, bool &open);
+    // the guide's page: 0 achievements, 1 profile, 2 system
+    void set_guide_page(int page) { tab_ = page % 3; }
 
   private:
+    void load(Host &h);
+    bool system_page(Host &h);
+    bool profile_page(Host &h, float field_width);
+    void restart_notice(Host &h);
+    void achievements_page(Host &h, double now, float icon);
+    void achievement_rows(Host &h, double now, const guide::Scale &sc, float width);
+
     char gamertag_[32] = {}, new_name_[32] = {};
     bool loaded_ = false;
+    int tab_ = 0;
+    double guide_shown_at_ = -1;
     std::string error_, confirm_delete_;
     bool restart_needed_ = false;
     double summary_at_ = -10;

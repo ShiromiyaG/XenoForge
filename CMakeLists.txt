@@ -378,7 +378,7 @@ if(XF_PLAYER AND TARGET boot)
     endif()
     # the player as a library (frontend/player.cpp's run_player; a port's player_<name> links it) and the
     # generic player, which carries no game code
-    add_library(xenoforge_player STATIC frontend/player.cpp frontend/system_ui_view.cpp frontend/overlay_system.cpp
+    add_library(xenoforge_player STATIC frontend/player.cpp frontend/system_ui_view.cpp frontend/guide_theme.cpp frontend/overlay_system.cpp
                                         tools/game.cpp)
     target_link_libraries(xenoforge_player PUBLIC xf_frontend xf_imgui xenoforge_vk xenoforge PRIVATE stb)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

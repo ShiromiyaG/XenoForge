@@ -1791,10 +1791,26 @@ kernel's own result shapes. The logic is apart from the view:
   headless default stands. `PadNavigator` turns the pad's state into navigation (press once; a direction repeats after
   400 ms, every 100 ms; the left stick counts). `toast()` takes the kernel's toasts (`set_toast_handler`: an
   unlocked achievement with its icon, and `XNotifyQueueUI`'s text); they live five seconds.
-- **`frontend/system_ui_view.*`** (ImGui, in the player): the top dialog as a centered modal over the dimmed game, the
-  toasts stacked in the top-right corner, the achievements' PNG icons made into textures on first use (`IconCache`:
-  stb_image, a staging buffer and one copy on the shared device). A click on a choice accepts it; Enter in the
-  keyboard's text field is the field's own.
+- **`frontend/system_ui_view.*`** (ImGui draw lists, in the player): the top dialog as a lit panel over the dimmed
+  game, easing in (title under XenoForge's mark or the message's icon, a green rule, the text, the choices stacked as
+  items with the focused one lit green, the controller's A and B in the footer), the toasts as capsules rising at the
+  bottom centre (the mark at the left, the achievement's picture at the right), the achievements as rows
+  (`draw_achievement_row`: picture, name, description, a gamerscore pill). The PNG icons become textures on first use
+  (`IconCache`: stb_image, a staging buffer and one copy on the shared device). A click on a choice accepts it; Enter
+  in the keyboard's text field is the field's own.
+- **The look** (`frontend/guide_theme.*`, 2026-11-08, the owner's request): an original look in the spirit of the
+  console's dashboard of its time, nothing of the console maker's art, fonts or marks. Inter (the launcher's copy in
+  `ui/fonts` beside the executable or above it; ImGui's own font without it) at sizes made for the window's height at
+  start; panels with a soft shadow and a top-lit gradient, items lit green when focused, A/B/X/Y as coloured discs,
+  XenoForge's mark drawn as vectors (the ring of light and the anvil, `assets/branding`). `push_widgets` gives ImGui's
+  own widgets the same look inside the guide.
+- **The guide** (F2, the controller's Guide button, or Back and Start held together for half a second: Windows' Game
+  Bar often takes the Guide button): the console pages as a panel sliding in from the left, the profile on top (the
+  mark, the gamertag, the title's gamerscore), three pages switched by LB/RB, Page Up/Down or the mouse:
+  Achievements (the rows above), Profile and System (a setting's name at the left, its control at the right, green
+  section captions). While it is open the title gets neutral controller states and no keyboard, as with a dialog;
+  ImGui's own pad and keyboard navigation drives it; B or Escape closes it and saves config.toml if anything changed.
+  A dialog the title opens closes it. `--ui-demo guide`, `guide-profile`, `guide-system` open it at the start.
 - **The game stays in charge of its own time.** While a dialog is up the player gives the title neutral controller
   states and no keyboard (`Controllers::set_taken`; the console's guide takes the controller from the title), and
   `XamIsUIActive` answers 1 until the answer; the guest's threads, the sound and the scheduler's clock keep running

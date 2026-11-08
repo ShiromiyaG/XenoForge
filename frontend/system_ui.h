@@ -63,6 +63,8 @@ struct Dialog {
     size_t first_row = 0;
     // how it ends: Accept on choice i gives this answer; Cancel gives `cancelled`
     kernel::UiRequest request;
+    // the view's: when it was first drawn (its entrance), in the view's seconds; -1 before
+    double shown_at = -1;
 };
 
 // a toast the window shows: an unlocked achievement or a notice, for a few seconds from the first time it is seen
