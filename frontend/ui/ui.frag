@@ -35,7 +35,7 @@ float blur_weight(int i) { return draw.blur_weights[abs(i)]; }
 //
 // The gradient the main window used to wear, top to bottom, so that the text
 // over it keeps its contrast, and a hair of noise against banding. The ribbons
-// over it are triangles (ribbons.cpp), drawn after this by the renderer.
+// over it are triangles (ribbons.cpp), drawn after this by the renderer, with a depth test.
 
 const vec3 BACKDROP_GREY[10] = vec3[](
     vec3(0.247, 0.239, 0.263), vec3(0.247, 0.239, 0.263), vec3(0.278, 0.271, 0.294), vec3(0.345, 0.341, 0.361),
@@ -66,6 +66,8 @@ void main() {
     const int mode = draw.imode.x;
     if (mode == MODE_TEXTURE) {
         out_color = in_color * draw.color * texture(tex, in_uv);
+        // the ribbons: a hair of noise against the steps of 8 bits in their gradients
+        if (draw.imode.w == 2) out_color.rgb += (hash12(gl_FragCoord.xy) - 0.5) / 255.0 * out_color.a;
     } else if (mode == MODE_GRADIENT) {
         const int func = draw.imode.y;
         const vec2 p = draw.pv.xy, v = draw.pv.zw;

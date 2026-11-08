@@ -1496,9 +1496,9 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   thin light grey one (#aaaaaa), at the right four greens of different tones
   (the accent's, darker and lighter; the colours change only when the accent
   does, never with the selected game). They lean up to the right, sway slowly
-  and cross one another, translucent, so where they cross both show; so are
-  the header, the toolbar and the game rows (alpha in `launcher.rcss`'s
-  gradients), which lets the ribbons through behind them. A ribbon is always
+  and pass over and under one another; the header, the toolbar and the game
+  rows are translucent (alpha in `launcher.rcss`'s gradients), which lets the
+  ribbons through behind them. A ribbon is always
   full width: a strip of constant width along a curve in space (it sweeps down
   the window, leans up to the right, sways and winds round a spiral that turns
   with the clock) whose width's direction twists about the curve, so it shows
@@ -1506,11 +1506,15 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   over or under itself; it does not thin out and fade. The grey gradient is
   one full-screen pass (`ui.frag`, no texture, a function of the position);
   the ribbons are triangles built on the CPU every frame
-  (`frontend/ui/ribbons.cpp`, `build_ribbons`: 150 sections by 5 vertices
+  (`frontend/ui/ribbons.cpp`, `build_ribbons`: 150 sections by 9 vertices
   across, lit per vertex with a diffuse term and a silk sheen, a perspective
-  camera 2.2 window heights away, sorted far to near and drawn blended with
-  the interface's own geometry path, one allocation freed a frame). Each edge
-  has a one-pixel fringe of alpha 0 in place of multisampling, so the edges
+  camera 2.2 window heights away). They are opaque and drawn with a real depth
+  test (the depth in the first texture coordinate, `imode.w = 2` in `ui.vert`;
+  the depth is cleared in the pass after the gradient), not sorted, so folds
+  and crossings are exact to the pixel; a hair of noise in `ui.frag` hides the
+  steps of 8 bits in their gradients. Each edge has a one-pixel fringe of
+  alpha 0 in place of multisampling, drawn after, tested against the depth but
+  not written, blended, so the edges
   stay crisp (no glow, no blur). Sizes are in window heights. `[launcher] backdrop`:
   `animated`, `still` or `off` (the grey alone), in the Interface tab, read by
   `LauncherView::update_backdrop` every frame; the clock stops while the

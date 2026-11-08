@@ -134,7 +134,7 @@ struct Renderer::Impl {
     VkSampler sampler = VK_NULL_HANDLE;
     VkDescriptorSetLayout ubo_layout = VK_NULL_HANDLE, tex_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-    VkPipeline pipelines[2][4] = {};
+    VkPipeline pipelines[3][2][4] = {}; // by depth (none, test and write, test), blend and clip
     VkShaderModule vert = VK_NULL_HANDLE, frag = VK_NULL_HANDLE;
     VkFormat stencil_format = VK_FORMAT_UNDEFINED;
 
@@ -235,6 +235,7 @@ struct Renderer::Impl {
         Rml::Rectanglei rect;
         uint32_t viewport_w = 0, viewport_h = 0; // 0: the frame's
         uint32_t stencil_ref = 1;
+        int depth = 0; // 0: none, 1: test and write, 2: test only (the backdrop's ribbons)
     };
     Draw make_draw(Texture &target) const;
     void draw(Draw &s);
@@ -377,6 +378,7 @@ bool Renderer::Impl::make_pipelines(std::string &error) {
     rendering.depthAttachmentFormat = stencil_format;
     rendering.stencilAttachmentFormat = stencil_format;
 
+    for (int dm = 0; dm < 3; dm++)
     for (int b = 0; b < 2; b++) {
         for (int c = 0; c < 4; c++) {
             VkPipelineColorBlendAttachmentState att{};
@@ -393,6 +395,9 @@ bool Renderer::Impl::make_pipelines(std::string &error) {
             cb.pAttachments = &att;
             VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
             dss.stencilTestEnable = VK_TRUE;
+            dss.depthTestEnable = dm != 0;
+            dss.depthWriteEnable = dm == 1;
+            dss.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
             VkStencilOpState st{};
             st.failOp = VK_STENCIL_OP_KEEP;
             st.depthFailOp = VK_STENCIL_OP_KEEP;
@@ -417,7 +422,7 @@ bool Renderer::Impl::make_pipelines(std::string &error) {
             pi.pColorBlendState = &cb;
             pi.pDynamicState = &ds;
             pi.layout = pipeline_layout;
-            if (vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pi, nullptr, &pipelines[b][c]) != VK_SUCCESS)
+            if (vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pi, nullptr, &pipelines[dm][b][c]) != VK_SUCCESS)
                 return error = "no pipeline", false;
         }
     }
@@ -435,8 +440,9 @@ void Renderer::Impl::close() {
     for (vk::Buffer &b : ubo) dev->destroy(b);
     for (VkDescriptorPool p : tex_pools) vkDestroyDescriptorPool(d, p, nullptr);
     vkDestroyDescriptorPool(d, ubo_pool, nullptr);
-    for (auto &row : pipelines)
-        for (VkPipeline p : row) vkDestroyPipeline(d, p, nullptr);
+    for (auto &plane : pipelines)
+        for (auto &row : plane)
+            for (VkPipeline p : row) vkDestroyPipeline(d, p, nullptr);
     vkDestroyShaderModule(d, vert, nullptr);
     vkDestroyShaderModule(d, frag, nullptr);
     vkDestroyPipelineLayout(d, pipeline_layout, nullptr);
@@ -735,7 +741,7 @@ void Renderer::Impl::draw(Draw &s) {
     std::memcpy(static_cast<uint8_t *>(ubo[slot].mapped) + offset, &s.u, sizeof(DrawUniforms));
     ubo_offset += ubo_stride;
 
-    VkPipeline pipeline = pipelines[int(s.blend)][int(s.clip)];
+    VkPipeline pipeline = pipelines[s.depth][int(s.blend)][int(s.clip)];
     if (pipeline != bound) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline), bound = pipeline;
     const uint32_t vw = s.viewport_w ? s.viewport_w : uint32_t(s.target->width);
     const uint32_t vh = s.viewport_h ? s.viewport_h : uint32_t(s.target->height);
@@ -990,31 +996,45 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
         const Backdrop &b = m.backdrop;
         // the grey gradient: ui.frag's MODE_BACKDROP (the clock-free part)
         m.pass(m.layer(0), *m.white, M_BACKDROP, Blend::Replace, {}, false, [](Impl::Draw &) {});
-        // the ribbons over it: triangles, built on the CPU (ribbons.cpp)
+        // the ribbons over it: triangles built on the CPU (ribbons.cpp), opaque, with a depth test (no
+        // sorting: where they cross or fold the edge is exact), then their one-pixel fringes, tested
+        // against the depth but not written, blended, standing in for multisampling
         if (b.strength > 0) {
             std::vector<RibbonVertex> rv;
-            std::vector<uint32_t> ri;
-            build_ribbons(b.time, m.width, m.height, b.tint, b.strength, rv, ri);
-            if (!ri.empty()) {
+            std::vector<uint32_t> body, fringe;
+            build_ribbons(b.time, m.width, m.height, b.tint, b.strength, rv, body, fringe);
+            if (!body.empty()) {
                 std::vector<Rml::Vertex> verts(rv.size());
                 for (size_t i = 0; i < rv.size(); i++) {
                     verts[i].position = {rv[i].x, rv[i].y};
                     verts[i].colour = Rml::ColourbPremultiplied(rv[i].r, rv[i].g, rv[i].b, rv[i].a);
-                    verts[i].tex_coord = {0.f, 0.f};
+                    verts[i].tex_coord = {rv[i].depth, 0.f};
                 }
-                std::vector<int> idx(ri.begin(), ri.end());
-                auto *g = new Geometry;
-                if (m.alloc_geometry(*g, verts.data(), verts.size() * sizeof(Rml::Vertex), idx.data(), idx.size() * sizeof(int))) {
-                    Impl::Draw s = m.make_draw(m.layer(0));
-                    s.geometry = g;
-                    std::memcpy(s.u.transform, m.projection.data(), sizeof(float) * 16);
-                    m.draw(s);
-                    m.defer([&m, g] {
-                        m.free_geometry_now(*g);
+                VkClearAttachment ca{};
+                ca.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                ca.clearValue.depthStencil = {1.f, 0};
+                VkClearRect cr{{{0, 0}, {m.width, m.height}}, 0, 1};
+                vkCmdClearAttachments(m.cmd, 1, &ca, 1, &cr);
+                const std::vector<uint32_t> *lists[2] = {&body, &fringe};
+                for (int part = 0; part < 2; part++) {
+                    if (lists[part]->empty()) continue;
+                    std::vector<int> idx(lists[part]->begin(), lists[part]->end());
+                    auto *g = new Geometry;
+                    if (m.alloc_geometry(*g, verts.data(), verts.size() * sizeof(Rml::Vertex), idx.data(),
+                                         idx.size() * sizeof(int))) {
+                        Impl::Draw s = m.make_draw(m.layer(0));
+                        s.geometry = g;
+                        s.depth = part == 0 ? 1 : 2;
+                        s.u.imode[3] = 2;
+                        std::memcpy(s.u.transform, m.projection.data(), sizeof(float) * 16);
+                        m.draw(s);
+                        m.defer([&m, g] {
+                            m.free_geometry_now(*g);
+                            delete g;
+                        });
+                    } else {
                         delete g;
-                    });
-                } else {
-                    delete g;
+                    }
                 }
             }
         }

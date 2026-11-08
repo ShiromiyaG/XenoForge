@@ -68,28 +68,24 @@ V3 centre(const Spec &r, float s, float t, float aspect) {
     return c;
 }
 
-struct Tri {
-    uint32_t a, b, c;
-    float depth;
-};
-
 } // namespace
 
 void build_ribbons(float time, uint32_t width, uint32_t height, const float tint[3], float alpha,
-                   std::vector<RibbonVertex> &vertices, std::vector<uint32_t> &indices) {
+                   std::vector<RibbonVertex> &vertices, std::vector<uint32_t> &body, std::vector<uint32_t> &fringe) {
     vertices.clear();
-    indices.clear();
+    body.clear();
+    fringe.clear();
     if (alpha <= 0 || width == 0 || height == 0) return;
     const float H = float(height), aspect = float(width) / H;
     constexpr int N = 150;                       // sections along a ribbon
-    constexpr int M = 7;                         // across: fringe, 5 on the surface, fringe
-    constexpr float VS[5] = {-1.f, -0.5f, 0.f, 0.5f, 1.f};
+    constexpr int NV = 9;                        // across the surface
+    constexpr int M = NV + 2;                    // and the two fringes
+    constexpr float VS[NV] = {-1.f, -0.75f, -0.5f, -0.25f, 0.f, 0.25f, 0.5f, 0.75f, 1.f};
     constexpr float CAMERA = 2.2f;               // the viewer's distance, in window heights
     const V3 light = norm({-0.35f, -0.55f, 0.75f});
     const V3 view{0, 0, 1};
     const V3 half_vec = norm(light + view);
-    std::vector<Tri> tris;
-    std::vector<float> depth;                    // per vertex
+    constexpr float Z_SCALE = 0.8f;              // depth in 0..1 from the space's z (toward the viewer)
 
     for (const Spec &r : SPECS) {
         const V3 hue = tone_color(r.tone, tint);
@@ -109,8 +105,8 @@ void build_ribbons(float time, uint32_t width, uint32_t height, const float tint
             const bool back = dot(face, view) < 0;
             if (back) face = face * -1.f;
 
-            float sx[5], sy[5], sz[5];
-            for (int k = 0; k < 5; k++) {
+            float sx[NV], sy[NV], sz[NV];
+            for (int k = 0; k < NV; k++) {
                 const V3 p = c + B * (VS[k] * r.half);
                 const float scale = CAMERA / (CAMERA - p.z);
                 sx[k] = (aspect * 0.5f + (p.x - aspect * 0.5f) * scale) * H;
@@ -128,13 +124,13 @@ void build_ribbons(float time, uint32_t width, uint32_t height, const float tint
             };
             float lx, ly, rx, ry;
             outward(0, 1, lx, ly);
-            outward(4, 3, rx, ry);
+            outward(NV - 1, NV - 2, rx, ry);
 
             for (int k = 0; k < M; k++) {
                 RibbonVertex v{};
                 float x, y, z, a = 1.f, vv = 0;
                 if (k == 0) x = lx, y = ly, z = sz[0], a = 0, vv = -1;
-                else if (k == M - 1) x = rx, y = ry, z = sz[4], a = 0, vv = 1;
+                else if (k == M - 1) x = rx, y = ry, z = sz[NV - 1], a = 0, vv = 1;
                 else x = sx[k - 1], y = sy[k - 1], z = sz[k - 1], vv = VS[k - 1];
                 // lit: the surface bends a little across its width, which gives the
                 // sheen its band; the back face is a little darker
@@ -146,28 +142,24 @@ void build_ribbons(float time, uint32_t width, uint32_t height, const float tint
                 const float lit = (0.78f + 0.34f * diffuse) * (back ? 0.86f : 1.f);
                 const float cr = std::min(hue.x * lit + spec, 0.97f), cg = std::min(hue.y * lit + spec, 0.97f),
                             cb = std::min(hue.z * lit + spec, 0.97f);
-                const float al = a * 0.90f * std::min(alpha, 1.f);
+                const float al = a * std::min(alpha, 1.f);
                 v.x = x, v.y = y;
                 v.r = uint8_t(std::lround(std::clamp(cr * al, 0.f, 1.f) * 255.f));
                 v.g = uint8_t(std::lround(std::clamp(cg * al, 0.f, 1.f) * 255.f));
                 v.b = uint8_t(std::lround(std::clamp(cb * al, 0.f, 1.f) * 255.f));
                 v.a = uint8_t(std::lround(std::clamp(al, 0.f, 1.f) * 255.f));
+                v.depth = std::clamp(0.5f - z * Z_SCALE, 0.f, 1.f);
                 vertices.push_back(v);
-                depth.push_back(z);
             }
         }
         for (int i = 0; i < N; i++)
             for (int k = 0; k + 1 < M; k++) {
                 const uint32_t a = first + uint32_t(i * M + k), b = a + 1, c = first + uint32_t((i + 1) * M + k), d = c + 1;
-                const float z = (depth[a] + depth[b] + depth[c] + depth[d]) * 0.25f;
-                tris.push_back({a, b, c, z});
-                tris.push_back({b, d, c, z});
+                // the outer quads are the fringes
+                std::vector<uint32_t> &list = (k == 0 || k == M - 2) ? fringe : body;
+                list.insert(list.end(), {a, b, c, b, d, c});
             }
     }
-    // far to near (a stable sort: equal depths keep the ribbons' order)
-    std::stable_sort(tris.begin(), tris.end(), [](const Tri &x, const Tri &y) { return x.depth < y.depth; });
-    indices.reserve(tris.size() * 3);
-    for (const Tri &t : tris) indices.push_back(t.a), indices.push_back(t.b), indices.push_back(t.c);
 }
 
 } // namespace xf::ui

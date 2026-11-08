@@ -316,24 +316,26 @@ int main() {
         // the backdrop's ribbons: the mesh built on the CPU
         const float tint[3] = {0.33f, 0.66f, 0.16f};
         std::vector<ui::RibbonVertex> v, v2, v3;
-        std::vector<uint32_t> i, i2, i3;
-        ui::build_ribbons(5.f, 1240, 760, tint, 1.f, v, i);
-        ui::build_ribbons(5.f, 1240, 760, tint, 1.f, v2, i2);
-        ui::build_ribbons(9.f, 1240, 760, tint, 1.f, v3, i3);
-        CHECK(!v.empty() && !i.empty() && i.size() % 3 == 0);
+        std::vector<uint32_t> i, i2, i3, f, f2, f3;
+        ui::build_ribbons(5.f, 1240, 760, tint, 1.f, v, i, f);
+        ui::build_ribbons(5.f, 1240, 760, tint, 1.f, v2, i2, f2);
+        ui::build_ribbons(9.f, 1240, 760, tint, 1.f, v3, i3, f3);
+        CHECK(!v.empty() && !i.empty() && i.size() % 3 == 0 && !f.empty() && f.size() % 3 == 0);
         bool ok = true, inside = false;
         for (uint32_t k : i) ok = ok && k < v.size();
+        for (uint32_t k : f) ok = ok && k < v.size();
+        for (const ui::RibbonVertex &p : v) ok = ok && p.depth >= 0.f && p.depth <= 1.f;
         for (const ui::RibbonVertex &p : v) {
             ok = ok && std::isfinite(p.x) && std::isfinite(p.y) && p.r <= p.a && p.g <= p.a && p.b <= p.a; // premultiplied
             inside = inside || (p.x > 0 && p.x < 1240 && p.y > 0 && p.y < 760);
         }
         CHECK(ok && inside);
-        CHECK(v.size() == v2.size() && i == i2 && v[100].x == v2[100].x && v[100].y == v2[100].y); // a pure function
+        CHECK(v.size() == v2.size() && i == i2 && f == f2 && v[100].x == v2[100].x && v[100].y == v2[100].y); // a pure function
         CHECK(v3.size() == v.size() && (v3[100].x != v[100].x || v3[100].y != v[100].y));          // the clock moves them
         std::vector<ui::RibbonVertex> none;
-        std::vector<uint32_t> no;
-        ui::build_ribbons(5.f, 1240, 760, tint, 0.f, none, no);
-        CHECK(none.empty() && no.empty()); // strength 0: no ribbons
+        std::vector<uint32_t> no, no2;
+        ui::build_ribbons(5.f, 1240, 760, tint, 0.f, none, no, no2);
+        CHECK(none.empty() && no.empty() && no2.empty()); // strength 0: no ribbons
     }
     {
         // the launcher's own section saved in config.toml: the folder, the look, the window and the sort
