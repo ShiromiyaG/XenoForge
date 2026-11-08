@@ -2073,8 +2073,10 @@ declaration") and translates the 59 pixel shaders, all of which translate.
 ## The standing benchmark against Xenia (2026-11-08)
 
 The bar is Xenia, beaten on the same scene: frame time and GPU time a frame,
-ours against xenia_canary's Direct3D 12 and Vulkan backends, live, on scenes
-both reach without input (title screens, attract loops, the first seconds).
+ours against xenia_canary's Direct3D 12 backend, live, on scenes both reach
+without input (title screens, attract loops, the first seconds). Direct3D 12
+is Xenia's best renderer, so it is the bar (the owner, 2026-11-08); its
+Vulkan backend stays only where it is a trace's accuracy reference.
 
 **The method** (`tools/bench/`, Windows only, as Xenia is). PresentMon and
 any ETW tracing need an administrator or the Performance Log Users group,
@@ -2095,7 +2097,7 @@ gives. So both programs are timed from outside by the same code:
 - **GPU time**: the process's running time on each engine as Windows'
   scheduler counts it, the "GPU Engine(pid_*)\Running Time" performance
   counter (100 ns units; checked against a replay's own utilization), the
-  same accounting for Vulkan and Direct3D 12. Reported as ms a frame and a
+  same accounting for our Vulkan and Xenia's Direct3D 12. Reported as ms a frame and a
   second, the 3D and compute engines summed, copy apart. It includes all the
   process's GPU work: the presenter's, the transfers, the idle gaps the
   driver bills.
@@ -2105,11 +2107,11 @@ gives. So both programs are timed from outside by the same code:
   scene.
 
 `tools/bench/bench_vs_xenia.ps1 -Disc <iso> -Ours <player> -Xenia <exe>
--Seconds S -Warmup W -Runs 3 -Configs ours,ours-host,xenia-d3d12,xenia-vulkan`
-runs the configurations in turn (A B C D A B C D ...), appends one line a
-run and prints the median and the spread of each. `ours-host` forces host
-render targets; `xenia-d3d12-rov` and `xenia-vulkan-fsi` are Xenia's exact
-EDRAM paths (its defaults are host render targets). Xenia's defaults
+-Seconds S -Warmup W -Runs 3 -Configs ours,xenia-d3d12 [-Timeline]` runs the
+configurations in turn (A B A B ...), appends one line a run and prints the
+median and the spread of each. `ours-host` forces our host render targets;
+`xenia-d3d12-rov` is Xenia's exact EDRAM path (its default is host render
+targets). Xenia's defaults
 otherwise (vsync on, no resolution scale, its shader storage warm). The load
 is read before each set (`Get-Process clang*,ninja*,...`); another agent's
 builds or games on the machine are named with the numbers.
@@ -2117,20 +2119,33 @@ builds or games on the machine are named with the numbers.
 **Results** (RTX 5060, Ryzen 5 5600G; median of 3 runs, spread in
 brackets; GPU ms a frame by the counter):
 
-| scene (window) | ours (interlock) | ours, host targets | Xenia D3D12 | Xenia Vulkan |
-| --- | --- | --- | --- | --- |
-| Game B, 3D title scene (90-130 s, 60 fps cap) | 1.39 (1.38-1.39) | 1.53 (1.52-1.56) | 0.83 (0.83-0.85) | 1.12 (1.07-1.13) |
+| scene (window) | ours (interlock, the default) | ours, host targets | Xenia D3D12 (host targets, its default) |
+| --- | --- | --- | --- |
+| Game B, 3D title scene (90-130 s, 60 fps cap) | 1.39 (1.38-1.39) | 1.53 (1.52-1.56) | 0.83 (0.83-0.85) |
+| Game A, attract loop (120-160 s, 30 fps cap) | 4.90 (2.16-5.04) | not run | 5.64 (1.99-6.17) |
 
-Game B's exact paths: Xenia's ROV 1.26, its Vulkan FSI 1.42 (one run each),
-ours 1.39. Every configuration holds the 60 fps cap (frame time median
-16.6-17.0 ms); CPU 1.33 (ours) against 1.24 (D3D12) and 1.76 (Vulkan) s a
-second. Load: an xfbuild of another disc at below-normal priority (2 jobs)
-during the first runs.
+Game B: Xenia's exact path (ROV) 1.26, one run, against our 1.39 on ours.
+Every configuration holds the cap (frame time medians 16.6-17.0 ms); CPU
+1.33 (1.33-1.49) s a second ours, 1.24 (1.20-1.29) Xenia's. Load: an xfbuild
+of another disc (2 jobs, below-normal priority) during the first runs, an
+idle machine otherwise. Before the resolve fix below, one run: 1.46.
+
+Game A: its attract loop alternates a 3D scene and lighter ones, at times
+that differ run to run, so the window is not always the same scene (the
+low ends of both spreads are runs that were in the lighter one). Where the
+timelines show both in the 3D scene (one run each with `--timeline`,
+120-180 s): ours 4.80 ms a frame, Xenia's 5.94 (19% less); 30 fps both,
+frame time median 33.3 ms both, CPU 1.33 against 1.30 s a second. A
+standing scene for game A needs input (the race) or a fixed point of the
+loop; until then its numbers are rough.
+
+Not measured: games D and H (their libraries were rebuilt for the interface
+of the time, stale after the merge that changed it); game G (no library).
 
 Where we lose and why, for game B:
 - Our default is the exact EDRAM (interlock), Xenia's is host render
-  targets. Exact against exact, we are between Xenia's two (ROV 1.26, FSI
-  1.42); the interlock's draws cost about twice the host's (the scene's
+  targets. Exact against exact we lose by 10% (ROV 1.26); the interlock's
+  draws cost about twice the host's (the scene's
   32 2x-MSAA draws: 0.55 against 0.25 ms in the 3600 trace's replay), the
   price of exactness.
 - Our host path loses to Xenia's host path because its ownership transfers
