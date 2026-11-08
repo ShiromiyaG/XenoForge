@@ -22,7 +22,10 @@ body { background-color: transparent; }
 #stage { position: relative; flex: 1 1 0; min-height: 0; overflow: hidden; }
 /* (a transform, not `left`: moving the strip by `left` lays the whole document out again on every frame of the slide) */
 #slide { position: absolute; left: 0; top: 0; bottom: 0; width: 200%; display: flex; flex-direction: row; transition: transform 0.34s cubic-out; }
-#slide.to-settings { transform: translateX(-50%); }
+/* (100vw, not -50%: RmlUi does not resolve the percentage again when the window changes size, so a window
+   maximized or made fullscreen while on the settings page kept the old width's offset, the page shoved off to the right;
+   viewport units are made again by every change of the context's size) */
+#slide.to-settings { transform: translateX(-100vw); }
 .page-side { flex: 0 0 50%; min-width: 0; display: flex; flex-direction: column; }
 /* (no opacity on the pages: each one would be drawn into a layer of its own, the window's size, on every frame of the slide,
    which doubled the frame's time) */
@@ -36,7 +39,9 @@ body { background-color: transparent; }
     decorator: linear-gradient(90deg, #2f2e33b4, #3a393eb4 45%, #57565cb4);
 }
 #brand { flex: 0 0 236dp; font-weight: 300; font-size: 29dp; line-height: 1; color: #f4f4f4; white-space: nowrap; }
-#brand span { color: #a9a8ad; }
+/* the same diamond as the About dialog's, with the header's own colour in its core */
+#brand .mark { width: 42dp; height: 42dp; margin: 0 0 0 14dp; }
+#brand .mark-core { left: 13dp; top: 13dp; width: 16dp; height: 16dp; background-color: #2f2e33; }
 #nav { flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; }
 .nav {
     padding: 0 17dp; font-weight: 300; font-size: 29.5dp; line-height: 1; white-space: nowrap;
@@ -239,7 +244,11 @@ body { background-color: transparent; }
 .gl.y { decorator: image(mem:pad-y contain); }
 .gl.lb { decorator: image(mem:pad-lb contain); margin-right: -6dp; }
 .gl.rb { decorator: image(mem:pad-rb contain); }
-.hint { display: flex; flex-direction: row; align-items: center; margin-right: 24dp; }
+.gl.lt { decorator: image(mem:pad-lt contain); margin-right: -6dp; }
+.gl.rt { decorator: image(mem:pad-rt contain); }
+.gl.back { decorator: image(mem:pad-back contain); }
+.gl.start { decorator: image(mem:pad-start contain); }
+.hint { display: flex; flex: 0 0 auto; flex-direction: row; align-items: center; margin-right: 24dp; }
 .hl { margin-left: 8dp; font-family: Condensed; font-weight: 400; font-size: 15dp; line-height: 1; color: #2e2d30; white-space: nowrap; }
 .key-hints { display: flex; flex-direction: row; align-items: center; flex: 0 0 auto; }
 .key-hints .ic { font-size: 24dp; color: #ffffff; }

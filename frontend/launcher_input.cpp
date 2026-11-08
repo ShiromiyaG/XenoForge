@@ -14,6 +14,7 @@ namespace xf::frontend {
 namespace {
 
 constexpr int STICK_THRESHOLD = 17000;
+constexpr int TRIGGER_PRESS = 16000, TRIGGER_RELEASE = 8000; // of 32767
 
 } // namespace
 
@@ -377,21 +378,10 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         return false;
     switch (key) {
     case SDLK_F10:
-        if (shift && section_ == Section::Library) {
-            if (Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str())) {
-                const Rml::Vector2f at = row->GetAbsoluteOffset(Rml::BoxArea::Border);
-                open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
-            }
-        } else {
-            open_menu("help", true);
-        }
+        if (shift && section_ == Section::Library) open_row_menu(false);
+        else open_menu("help", true);
         return true;
-    case SDLK_APPLICATION:
-        if (Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str())) {
-            const Rml::Vector2f at = row->GetAbsoluteOffset(Rml::BoxArea::Border);
-            open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
-        }
-        return true;
+    case SDLK_APPLICATION: open_row_menu(false); return true;
     case SDLK_UP: move_selection(-1); return true;
     case SDLK_DOWN: move_selection(1); return true;
     case SDLK_PAGEUP: move_selection(-visible_rows()); return true;
@@ -432,9 +422,12 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
             if (menu_ != "context") menu_switch(1);
             break;
+        // X chooses (A too, as everywhere), B leaves; Select and Start close the menu they opened
+        case SDL_GAMEPAD_BUTTON_WEST:
         case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, SDL_SCANCODE_RETURN, false); break;
         case SDL_GAMEPAD_BUTTON_EAST:
-        case SDL_GAMEPAD_BUTTON_BACK: dismiss_menu(); break;
+        case SDL_GAMEPAD_BUTTON_BACK:
+        case SDL_GAMEPAD_BUTTON_START: dismiss_menu(); break;
         default: break;
         }
         return true;
@@ -456,7 +449,7 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         return true;
     }
     if (section_ == Section::Settings) {
-        if (button == SDL_GAMEPAD_BUTTON_BACK) {
+        if (button == SDL_GAMEPAD_BUTTON_START) {
             if (down) open_menu("help", true);
         } else {
             settings_->on_pad_button(button, down);
@@ -473,19 +466,21 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         if (down) move_selection(visible_rows());
         break;
     case SDL_GAMEPAD_BUTTON_SOUTH:
-    case SDL_GAMEPAD_BUTTON_START:
         if (down) do_action("play", "");
         break;
     case SDL_GAMEPAD_BUTTON_WEST:
         if (down) do_action("game-settings", "");
         break;
     case SDL_GAMEPAD_BUTTON_NORTH:
-        if (down) do_action("rescan", "");
+        if (down) do_action("prepare", "");
         break;
     case SDL_GAMEPAD_BUTTON_EAST:
         if (down && !filter_.empty()) do_action("clear-search", "");
         break;
-    case SDL_GAMEPAD_BUTTON_BACK:
+    case SDL_GAMEPAD_BUTTON_BACK: // Select: the selected game's menu
+        if (down) open_row_menu(true);
+        break;
+    case SDL_GAMEPAD_BUTTON_START: // Start: the Help menu
         if (down) open_menu("help", true);
         break;
     default: break;
@@ -494,7 +489,29 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
 }
 
 void LauncherView::on_pad_axis(SDL_GamepadAxis axis, int value) {
+    // the triggers (L2, R2) switch between the two pages, once a press (never under a menu or a dialog)
+    if (axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+        bool &held = axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ? lt_held_ : rt_held_;
+        if (value > TRIGGER_PRESS && !held) {
+            held = true;
+            pad_mode_ = true;
+            if (menu_.empty() && dialog_ == Dialog::None) do_action(section_ == Section::Library ? "settings" : "library", "");
+        } else if (value < TRIGGER_RELEASE) {
+            held = false;
+        }
+        return;
+    }
     if (axis != SDL_GAMEPAD_AXIS_LEFTY) return;
+    // in a menu the stick steps once a push
+    if (!menu_.empty()) {
+        const int dir = std::abs(value) > STICK_THRESHOLD ? (value > 0 ? 1 : -1) : 0;
+        if (dir != menu_stick_dir_) {
+            menu_stick_dir_ = dir;
+            if (dir) pad_mode_ = true, menu_move(dir);
+        }
+        return;
+    }
+    menu_stick_dir_ = 0;
     if (section_ == Section::Settings && menu_.empty() && dialog_ == Dialog::None) {
         pad_mode_ = true;
         settings_->on_pad_axis(axis, value);

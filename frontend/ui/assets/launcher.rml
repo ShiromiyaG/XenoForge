@@ -6,7 +6,7 @@
 <body>
     <div id="app">
         <div id="header">
-            <div id="brand">xeno<span>forge</span></div>
+            <div id="brand"><div class="mark"><div class="mark-core"></div></div></div>
             <div id="nav">
                 <div class="nav f on" id="nav-games" data-action="library">games</div>
                 <div class="nav f" id="nav-settings" data-action="settings">settings</div>
@@ -37,7 +37,10 @@
                             <div class="hint"><div class="gl a"></div><div class="hl">Play</div></div>
                             <div class="hint" id="hint-b" style="display: none;"><div class="gl b"></div><div class="hl">Clear search</div></div>
                             <div class="hint"><div class="gl x"></div><div class="hl">Settings</div></div>
-                            <div class="hint"><div class="gl y"></div><div class="hl">Rescan</div></div>
+                            <div class="hint"><div class="gl y"></div><div class="hl">Prepare</div></div>
+                            <div class="hint"><div class="gl back"></div><div class="hl">Menu</div></div>
+                            <div class="hint"><div class="gl start"></div><div class="hl">Help</div></div>
+                            <div class="hint"><div class="gl lt"></div><div class="gl rt"></div><div class="hl">Change tab</div></div>
                         </div>
                         <div class="key-hints">
                             {i:keyboard}<div class="hint-dot"></div>{i:mouse}
@@ -56,6 +59,8 @@
                             <div class="hint"><div class="gl a"></div><div class="hl">Select</div></div>
                             <div class="hint"><div class="gl b"></div><div class="hl">Back</div></div>
                             <div class="hint"><div class="gl lb"></div><div class="gl rb"></div><div class="hl">Tabs</div></div>
+                            <div class="hint"><div class="gl start"></div><div class="hl">Help</div></div>
+                            <div class="hint"><div class="gl lt"></div><div class="gl rt"></div><div class="hl">Change tab</div></div>
                         </div>
                         <div class="note">Changes are saved as you make them.</div>
                         <div class="key-hints">

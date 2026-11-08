@@ -1721,12 +1721,25 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   the depth is cleared in the pass after the gradient), not sorted, so folds
   and crossings are exact to the pixel; a hair of noise in `ui.frag` hides the
   steps of 8 bits in their gradients. Each edge has a one-pixel fringe of
-  alpha 0 in place of multisampling, drawn after, tested against the depth but
-  not written, blended, so the edges
-  stay crisp (no glow, no blur). Sizes are in window heights. `[launcher] backdrop`:
+  alpha 0, drawn after, tested against the depth but not written, blended, so
+  the edges stay crisp (no glow, no blur); with multisampling on (below) the
+  fringe is not drawn, the samples do that work. Sizes are in window heights. `[launcher] backdrop`:
   `animated`, `still` or `off` (the grey alone), in the Interface tab, read by
   `LauncherView::update_backdrop` every frame; the clock stops while the
   window is minimized, hidden or covered (focus does not matter).
+- **Smooth edges**: the window's layers are drawn with 4x multisampling (RmlUi
+  draws tilted and rounded shapes, such as the header's diamond, as plain
+  geometry and leaves the edges to the renderer). `Renderer::set_msaa`, from
+  `[launcher] smooth_edges` (the Interface tab; on unless the file says off),
+  read every frame by `LauncherView::update_backdrop`; the most of 8, 4 and 2
+  not above the request that the device takes is used, else none. Each layer
+  has a multisampled image beside its own: the passes draw into the first, with
+  the stencil (so the clip masks are smooth too) at the same count, and resolve
+  into the second as they end, which is the image everything else reads; the
+  samples are kept, so the next pass over the layer loads them. The filters'
+  images (blur, shadow, masks) stay at one sample, with their own pipelines
+  without a stencil: their passes are whole-window quads. Changing the count
+  makes the targets and the pipelines again at the next frame.
 - **Motion**: the dashboard's way of moving, in short times with an ease-out
   (cubic out, as the console's blades; its own blade shuffle is about 180 ms
   and the strip's slide here 340 ms). The selection fades from one row to
@@ -1816,10 +1829,23 @@ settings, F5 rescans, Ctrl+O the folder, Ctrl+F the search, Ctrl+, the
 settings, Alt+E or Alt+H or F10 the menus (then the arrows, Enter, Escape),
 Shift+F10 or the menu key the row's menu; on the settings page the arrows
 move focus and change a value, Tab the next tab, Ctrl+Tab the previous, Escape goes back to the library. A pad:
-the d-pad or stick moves the selection (repeating), A or Start plays, X the
-game's settings, Y rescans, Back the menus, the shoulders a page; in menus
-and dialogs the d-pad moves and B closes; on the settings page the
-shoulders change tabs and B goes back.
+the d-pad or stick moves the selection (repeating), A plays, X the game's
+settings, Y prepares, Select (Back) opens the selected game's menu (Rescan is
+in it), Start the Help menu, the shoulders a page, the triggers (L2, R2)
+switch between the games and the settings; in a menu the d-pad or the stick
+(one step a push) moves, X or A chooses, B, Select or Start close it; in
+dialogs the d-pad moves and B closes; on the settings page the shoulders
+change tabs and B goes back; Up and Down leave the games folder's text box
+(Left and Right stay the caret's), and the accent's row, one row like the
+dropdowns', takes Left and Right to choose a colour and A for the next. A
+look change (theme, accent) makes the document again; the row that had the
+pad's focus gets it back (`SettingsView::detach` keeps its `data-key`). The hint bars show these with the Xbox 360
+pictures; `--keys` takes `lt` and `rt` too.
+
+The strip that slides between the two pages moves by `translateX(-100vw)`, not
+`-50%`: RmlUi does not resolve a percentage in a transform again when the
+window's size changes, and a window maximized or made fullscreen on the
+settings page kept the old width's offset (the page cut off at the right).
 
 Pieces, each apart from the others:
 

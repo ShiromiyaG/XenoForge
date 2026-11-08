@@ -428,6 +428,7 @@ int main() {
         a.launcher.sort = "-status";
         a.launcher.backdrop = "still";
         a.launcher.sounds = false;
+        a.launcher.smooth_edges = false;
         a.launcher.x = -1200, a.launcher.y = 40, a.launcher.width = 1500, a.launcher.height = 900, a.launcher.maximized = true;
         std::string err;
         CHECK(frontend::save(file, a, err) && frontend::load(file, b, err));
@@ -436,6 +437,7 @@ int main() {
         CHECK(b.launcher.backdrop == "still");
         CHECK(frontend::Settings().launcher.backdrop == "animated");
         CHECK(!b.launcher.sounds && frontend::Settings().launcher.sounds); // on unless the file says off
+        CHECK(!b.launcher.smooth_edges && frontend::Settings().launcher.smooth_edges); // on unless the file says off
         CHECK(frontend::backdrop_choices().size() == 3);
         CHECK(b.launcher.x == -1200 && b.launcher.y == 40 && b.launcher.width == 1500 && b.launcher.height == 900 && b.launcher.maximized);
         std::filesystem::remove(file);

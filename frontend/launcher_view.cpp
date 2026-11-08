@@ -70,7 +70,7 @@ bool LauncherView::load(Rml::Context *context, const std::filesystem::path &asse
     rcss_template_ = read_text(assets_ / "theme.rcss") + "\n" + read_text(assets_ / "launcher.rcss") + "\n" +
                     read_text(assets_ / "settings.rcss");
     // the controller button pictures the hint bars name as mem:pad-<button> (ui/assets/glyphs, Xbox 360 set)
-    for (const char *button : {"A", "B", "X", "Y", "LB", "RB"}) {
+    for (const char *button : {"A", "B", "X", "Y", "LB", "RB", "LT", "RT", "Back", "Start"}) {
         const std::string file = std::string("360_") + button + ".png";
         std::string name = std::string("pad-") + button;
         for (char &c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
@@ -245,6 +245,7 @@ void LauncherView::update_backdrop() {
     backdrop.strength = l.backdrop == "off" ? 0.f : 1.f;
     backdrop.tint[0] = float(r) / 255.f, backdrop.tint[1] = float(g) / 255.f, backdrop.tint[2] = float(b) / 255.f;
     renderer_.set_backdrop(backdrop);
+    renderer_.set_msaa(l.smooth_edges ? 4 : 1);
 }
 
 // The selected row's glow comes up as the row is selected and goes down as it is left (a box-shadow cannot

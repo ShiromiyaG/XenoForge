@@ -56,7 +56,18 @@ std::vector<MenuItem> LauncherView::menu_items(const std::string &name) {
             item("prepare", prepare, "", "hammer", g && !running && !building), menu_separator(),
             item("game-settings", "Game settings...", "F2", "sliders-horizontal", g != nullptr), menu_separator(),
             item("open-game-folder", "Open the disc's folder", "", "folder", g != nullptr), item("copy-id", "Copy the title ID", "", "copy", g != nullptr),
-            item("copy-path", "Copy the disc's path", "", "copy", g != nullptr)};
+            item("copy-path", "Copy the disc's path", "", "copy", g != nullptr), menu_separator(),
+            item("rescan", "Rescan the folder", "F5", "refresh-cw")};
+}
+
+// The selected game's menu at its row, as the Menu key and the pad's Select open it. With first_hot the first
+// item is lit at once (the pad has no pointer to point at one).
+void LauncherView::open_row_menu(bool first_hot) {
+    Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str());
+    if (!row || !selected_game()) return;
+    const Rml::Vector2f at = row->GetAbsoluteOffset(Rml::BoxArea::Border);
+    open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
+    if (first_hot) menu_move(1);
 }
 
 void LauncherView::open_menu(const std::string &name, bool keyboard) {

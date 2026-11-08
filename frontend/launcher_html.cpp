@@ -335,7 +335,7 @@ std::vector<Choice> aspect_choices() { return {{"auto", "The picture's own shape
 std::vector<Choice> user_choices() { return {{"0", "User 1"}, {"1", "User 2"}, {"2", "User 3"}, {"3", "User 4"}}; }
 
 std::vector<Choice> theme_choices() {
-    return {{"system", "The system's (light or dark)"}, {"light", "Light"}, {"dark", "Dark"}};
+    return {{"system", "Follow system setting"}, {"light", "Light"}, {"dark", "Dark"}};
 }
 
 std::vector<Choice> backdrop_choices() { return {{"animated", "Ribbons, moving"}, {"still", "Ribbons, still"}, {"off", "Plain grey"}}; }
@@ -410,18 +410,20 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
         break;
     }
     case SettingsTab::Interface: {
-        std::string look = select_row("theme", "Theme", "Light or dark; the system's follows the desktop as it changes.",
+        std::string look = select_row("theme", "Theme", "Light or dark; \"Follow system setting\" changes with the desktop's.",
                                       label_of(theme_choices(), page.theme));
-        look += "<div class=\"setting\" data-kind=\"swatches\"><div class=\"label\"><div class=\"name\">Accent colour</div>"
+        // the row has the focus (Left and Right choose a colour, A the next one); a click on a swatch chooses it
+        look += "<div class=\"setting f\" data-kind=\"swatches\" data-key=\"accent\"><div class=\"label\"><div class=\"name\">Accent colour</div>"
                 "<div class=\"hint\">Selections, focus and the main buttons.</div></div><div class=\"control swatches\">";
         for (const std::string &hex : accent_choices()) {
-            look += "<div class=\"swatch f";
+            look += "<div class=\"swatch";
             if (hex == page.accent) look += " on";
             look += "\" data-action=\"accent\" data-arg=\"" + hex + "\" style=\"background-color: " + hex + ";\"></div>";
         }
         look += "</div></div>";
         look += select_row("backdrop", "Background", "The ribbons behind the list; they stop while the window is hidden or minimized.",
                            label_of(backdrop_choices(), page.backdrop));
+        look += check_row("ui.smooth_edges", "Smooth edges", "4x multisampling for the window's drawing, so tilted and rounded shapes have no jagged edges. Uses a little more graphics memory; turn it off on a weak GPU.", page.smooth_edges);
         look += check_row("ui.sounds", "Interface sounds", "A tick as the selection moves, a swish between pages, notes for choosing and going back.", page.sounds);
         s += group("Appearance", look);
         std::string folder = "<div class=\"setting\"><div class=\"label\"><div class=\"name\">Games folder</div>"
