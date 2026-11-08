@@ -13,12 +13,14 @@
 #include "objects.h"
 #include "stacks.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/hooks.h"
 #include "xenoforge/port.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <fstream>
 #include <mutex>
@@ -28,6 +30,7 @@
 #include <windows.h>
 #else
 #include <csignal>
+#include <dlfcn.h>
 #endif
 
 namespace xf::kernel {
@@ -115,6 +118,8 @@ std::string brief(Kernel &k, uint32_t address) {
     return at + (label.empty() ? std::string() : label + " ") + text;
 }
 
+std::string brief_of(Kernel &k, uint32_t address) { return brief(k, address); }
+
 void append_calls(std::string &out, const Ring &r, uint32_t most) {
     uint32_t n = r.count.load(std::memory_order_relaxed);
     uint32_t shown = std::min({n, RING, most});
@@ -126,6 +131,85 @@ void append_calls(std::string &out, const Ring &r, uint32_t most) {
                       import->fn ? "" : "  not implemented");
         out += "    " + import->library + "!" + import->name + line;
     }
+}
+
+// "player.exe+0x1234": the host module holding an address
+std::string host_place(const void *address) {
+    char text[300];
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    if (address && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                      static_cast<LPCSTR>(address), &module) &&
+        module) {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(module, path, MAX_PATH);
+        const char *name = path;
+        for (const char *p = path; *p; p++)
+            if (*p == '\\' || *p == '/') name = p + 1;
+        std::snprintf(text, sizeof(text), "%s+0x%llX", name,
+                      (unsigned long long)(uintptr_t(address) - uintptr_t(module)));
+        return text;
+    }
+#else
+    Dl_info info = {};
+    if (address && dladdr(address, &info) && info.dli_fname) {
+        const char *name = std::strrchr(info.dli_fname, '/');
+        name = name ? name + 1 : info.dli_fname;
+        if (info.dli_sname)
+            std::snprintf(text, sizeof(text), "%s!%s+0x%llX", name, info.dli_sname,
+                          (unsigned long long)(uintptr_t(address) - uintptr_t(info.dli_saddr)));
+        else
+            std::snprintf(text, sizeof(text), "%s+0x%llX", name,
+                          (unsigned long long)(uintptr_t(address) - uintptr_t(info.dli_fbase)));
+        return text;
+    }
+#endif
+    return "no module";
+}
+
+// A line of the stack: in full and in the one-line form.
+struct StackItem {
+    std::string full, brief;
+};
+
+// The guest frames by the back chain (each LR and the frame it was saved
+// in) with the port's hooks between them. A hook ran with r1 at `sp`: it
+// sits above the frames saved below that (the hooked function's body, or
+// what the hook called), and is followed by where the guest goes on after
+// it, its LR (a function hook's caller) or its own address (a mid hook's
+// function). A frame saved at the hook's r1 holds that same LR, or
+// CALL_RETURN when the hook called guest code itself, so it is not shown
+// again.
+std::vector<StackItem> merge_hook_frames(Kernel &k, const std::vector<uint32_t> &lrs, const std::vector<uint32_t> &at,
+                                         const std::vector<hooks::FrameInfo> &hook_frames) {
+    std::vector<StackItem> items;
+    auto hook_item = [&](const hooks::FrameInfo &h) {
+        char where[64];
+        std::snprintf(where, sizeof(where), ", host %p", h.fn);
+        std::string brief = std::string("port:") + hooks::kind_name(h.kind) + " " +
+                            (h.hook.empty() ? (h.function.empty() ? "hook" : h.function) : h.hook);
+        items.push_back({"port: " + hooks::describe(h) + where + " (" + host_place(h.fn) + ")", brief});
+        const uint32_t next = h.kind == hooks::Kind::Mid ? h.address : h.lr;
+        if (next && next != port::CALL_RETURN) items.push_back({describe(k, next), brief_of(k, next)});
+    };
+    size_t h = 0;
+    for (size_t i = 0; i < lrs.size(); i++) {
+        bool shown = false;
+        while (h < hook_frames.size() && at[i] >= hook_frames[h].sp) {
+            const hooks::FrameInfo &f = hook_frames[h++];
+            hook_item(f);
+            if (at[i] == f.sp && (lrs[i] == port::CALL_RETURN || (f.kind != hooks::Kind::Mid && lrs[i] == f.lr)))
+                shown = true;
+        }
+        if (shown) continue;
+        if (lrs[i] == port::CALL_RETURN)
+            items.push_back({"native code's call (the kernel's or the port's)", "native"});
+        else
+            items.push_back({describe(k, lrs[i]), brief_of(k, lrs[i])});
+    }
+    for (; h < hook_frames.size(); h++) hook_item(hook_frames[h]);
+    return items;
 }
 
 } // namespace
@@ -159,9 +243,24 @@ CrashReport make_crash_report(Kernel &k, const std::string &what, const void *ho
         out += line;
 
         report.pc = c->pc, report.lr = uint32_t(c->lr);
+        // the port's hooks running on this thread, innermost first
+        const std::vector<hooks::FrameInfo> hook_frames = hooks::frames(*c);
+        // A fault in the port's own code: the innermost hook has not called
+        // back into guest code. (Its code may lie among the generated code's
+        // host addresses: a port links both.)
+        const bool in_port = host_pc && !hook_frames.empty() && !hook_frames[0].in_guest;
         // a fault in generated code: its function, from the host address
         uint32_t function = 0;
-        if (host_pc && k.guest_function_of_host(host_pc, function)) {
+        if (in_port) {
+            const hooks::FrameInfo &h = hook_frames[0];
+            out += "faulted in: the port's " + hooks::describe(h) + "\n";
+            std::snprintf(line, sizeof(line), "  host code %p (%s); the hook at %p (%s)\n", host_pc,
+                          host_place(host_pc).c_str(), h.fn, host_place(h.fn).c_str());
+            out += line;
+            std::snprintf(line, sizeof(line), "  entered with r1 0x%08X, lr 0x%08X; the guest context as it is now:\n",
+                          h.sp, h.lr);
+            out += line;
+        } else if (host_pc && k.guest_function_of_host(host_pc, function)) {
             std::snprintf(line, sizeof(line), "faulted in: generated function 0x%08X (host code %p)\n", function,
                           host_pc);
             out += line;
@@ -170,26 +269,38 @@ CrashReport make_crash_report(Kernel &k, const std::string &what, const void *ho
         }
         out += "context pc: " + describe(k, c->pc) + (function ? " (the last call's or store's, not the fault's)" : "") +
                "\n";
-        out += "lr: " + describe(k, uint32_t(c->lr)) + "\n";
+        out += "lr: " + (uint32_t(c->lr) == port::CALL_RETURN ? std::string("native code's call (the kernel's or the port's)")
+                                                               : describe(k, uint32_t(c->lr))) +
+               "\n";
         const uint32_t sp = uint32_t(c->r[1]);
-        std::snprintf(line, sizeof(line), "r1: 0x%08X, r3: 0x%08X, r4: 0x%08X, r13: 0x%08X\n", sp, uint32_t(c->r[3]),
-                      uint32_t(c->r[4]), uint32_t(c->r[13]));
+        std::snprintf(line, sizeof(line), "r1: 0x%08X, r3: 0x%08X, r4: 0x%08X, r5: 0x%08X, r6: 0x%08X, r13: 0x%08X\n",
+                      sp, uint32_t(c->r[3]), uint32_t(c->r[4]), uint32_t(c->r[5]), uint32_t(c->r[6]),
+                      uint32_t(c->r[13]));
         out += line;
 
         // the stack, inside the thread's own range when r1 is in it
         const bool own = sp >= t->stack_limit && sp < t->stack_base;
+        std::vector<uint32_t> at;
         std::vector<uint32_t> frames =
-            guest_backtrace(k, sp, own ? t->stack_limit : 0, own ? t->stack_base : 0, 24);
-        out += "stack (return addresses by the r1 back chain):\n";
-        report.stack = brief(k, report.pc);
-        if (function) report.stack += " <- " + brief(k, c->pc);
-        report.stack += " <- lr " + brief(k, uint32_t(c->lr));
-        for (size_t i = 0; i < frames.size(); i++) {
-            std::snprintf(line, sizeof(line), "  #%zu ", i);
-            out += line + describe(k, frames[i]) + "\n";
-            if (i < 12) report.stack += " <- " + brief(k, frames[i]);
+            guest_backtrace(k, sp, own ? t->stack_limit : 0, own ? t->stack_base : 0, 24, &at);
+        out += "stack (return addresses by the r1 back chain, the port's hooks between them):\n";
+        std::vector<StackItem> items = merge_hook_frames(k, frames, at, hook_frames);
+        if (in_port) {
+            report.stack = items.empty() ? std::string() : items[0].brief;
+            if (!items.empty()) items.erase(items.begin());
+            out += "  #0 port: " + hooks::describe(hook_frames[0]) + " (faulted here)\n";
+        } else {
+            report.stack = brief(k, report.pc);
+            if (function) report.stack += " <- " + brief(k, c->pc);
+            report.stack += " <- lr " + brief(k, uint32_t(c->lr));
         }
-        if (frames.empty()) out += "  (none readable)\n";
+        const size_t first = in_port ? 1 : 0;
+        for (size_t i = 0; i < items.size(); i++) {
+            std::snprintf(line, sizeof(line), "  #%zu ", i + first);
+            out += line + items[i].full + "\n";
+            if (i < 12) report.stack += (report.stack.empty() ? "" : " <- ") + items[i].brief;
+        }
+        if (items.empty() && !in_port) out += "  (none readable)\n";
     }
 
     // the last kernel calls: this thread's, then the others' (if the lock on

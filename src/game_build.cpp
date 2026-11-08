@@ -148,6 +148,7 @@ bool write_report(const fs::path &path, const fs::path &library, const BuildRepo
         for (char ch : f.reason) reason += ch == '\n' || ch == '\r' || ch == '\t' ? ' ' : ch;
         t += "left\t" + f.module + "\t" + hex8(f.address) + "\t" + reason + "\n";
     }
+    if (!r.project.empty()) t += "project " + r.project + "\n";
     for (const std::string &line : r.shaders) {
         std::string clean;
         for (char ch : line) clean += ch == '\n' || ch == '\r' ? ' ' : ch;
@@ -163,6 +164,11 @@ bool write_report(const fs::path &path, const fs::path &library, const BuildRepo
 struct Chunk {
     uint32_t address = 0;
     std::string text; // its lines, from `XF_FN(...) {` to `}`
+    // A function the port hooks (recomp.h's EmitHooks::slot): its body is
+    // xfo_<address>, and the one-line wrapper xf_<address> that follows it
+    // (XF_HOOKED) is kept in the same chunk, as one needs the other.
+    bool hooked = false;
+    std::string wrapper;
 };
 struct SplitFile {
     std::string head, tail; // up to the first function (the declarations); after the last
@@ -187,6 +193,22 @@ bool split_source(const std::string &text, SplitFile &out) {
             if (trimmed == "}") current = nullptr;
             continue;
         }
+        // a hooked function's wrapper, right after its body: the body's chunk
+        if (trimmed.starts_with("XF_FN(xf_") && trimmed.find("{ XF_HOOKED(") != std::string::npos &&
+            !out.chunks.empty() && out.chunks.back().hooked && out.chunks.back().wrapper.empty() &&
+            trimmed.find("xfo_" + hex8(out.chunks.back().address) + ")") != std::string::npos) {
+            out.chunks.back().text += line;
+            out.chunks.back().wrapper = line;
+            continue;
+        }
+        // a project name's alias after a function (recomp_module.cpp's
+        // alias_line): its chunk's
+        if (!out.chunks.empty() && (trimmed == "#ifdef _MSC_VER" || trimmed == "#else" || trimmed == "#endif" ||
+                                    (trimmed.starts_with("XF_FN(") && trimmed.find("__attribute__((alias(") !=
+                                                                          std::string::npos))) {
+            out.chunks.back().text += line;
+            continue;
+        }
         if (trimmed.starts_with("XF_FN(") && !trimmed.ends_with(";")) {
             size_t close = trimmed.find(')');
             if (close == std::string::npos || close < 6 + 8) return false;
@@ -195,14 +217,42 @@ bool split_source(const std::string &text, SplitFile &out) {
             if (!seen) out.head = pending, seen = true;
             pending.clear();
             out.chunks.push_back({uint32_t(std::strtoul(digits.c_str(), nullptr, 16)), line});
+            out.chunks.back().hooked = trimmed.starts_with("XF_FN(xfo_");
             if (!trimmed.ends_with("}")) current = &out.chunks.back().text;
             continue;
         }
         pending += line;
     }
     if (current || !seen) return false;
+    // (a hooked body without its wrapper: not the emitter's layout)
+    for (const Chunk &c : out.chunks)
+        if (c.hooked && c.wrapper.empty()) return false;
     out.tail = pending;
     return true;
+}
+
+// A project's digest: what it says (each module's starts, names, hooks,
+// mid hooks, skips and jump tables), FNV-1a over a text of it, so the same
+// project read from other files (includes, imported names) has the same one.
+std::string digest_of(const recomp::Project &p) {
+    std::string t;
+    auto words = [&](const char *what, const auto &list) {
+        t += what;
+        for (uint32_t a : list) t += " " + hex8(a);
+        t += "\n";
+    };
+    for (const recomp::ProjectModule &m : p.modules) {
+        t += "module " + m.path + "\n";
+        for (const auto &[a, end] : m.starts) t += "start " + hex8(a) + " " + hex8(end) + "\n";
+        for (const auto &[a, name] : m.names) t += "name " + hex8(a) + " " + name + "\n";
+        words("hooks", m.hooks);
+        words("skip", m.skip);
+        for (const auto &[a, jumps] : m.mid_hooks) words(("mid " + hex8(a)).c_str(), jumps);
+        for (const auto &[a, targets] : m.jump_tables) words(("table " + hex8(a)).c_str(), targets);
+    }
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (unsigned char ch : t) h = (h ^ ch) * 0x100000001B3ull;
+    return hex_digest(h);
 }
 
 bool is_functions_file(const fs::path &source) { return utf8(source.filename()).starts_with("functions_"); }
@@ -594,8 +644,9 @@ void Build::force_failures(const std::vector<Job> &jobs) {
         std::string text = read_file(j.source);
         bool changed = false;
         for (uint32_t a : options_.fail_compile) {
-            const std::string head = "\nXF_FN(" + recomp::function_name("xf_", a) + ") {";
+            std::string head = "\nXF_FN(" + recomp::function_name("xfo_", a) + ") {"; // a hooked one's body
             size_t at = text.find(head);
+            if (at == std::string::npos) at = text.find(head = "\nXF_FN(" + recomp::function_name("xf_", a) + ") {");
             if (at == std::string::npos) continue;
             size_t end = text.find('\n', at + 1);
             if (end == std::string::npos || text.compare(end - 1, 1, "}") == 0) continue; // a stub: one line
@@ -632,6 +683,15 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     const std::string digest = hex_digest(image_digest(xex.image));
     const fs::path library = library_path(cache, digest);
     std::error_code ec;
+    // the port's project file, read first: what it says is part of what the
+    // cached library must have been made with
+    recomp::Project project;
+    std::string project_digest;
+    if (!options_.project.empty()) {
+        if (!recomp::load_project(options_.project, project, why)) return fail(error, why);
+        for (const std::string &w : project.warnings) report(Stage::Reading, 0, 0, "project file: " + w);
+        project_digest = digest_of(project);
+    }
     if (options_.shaders_only && !fs::exists(library, ec)) {
         BuildReport found;
         if (options_.shader_step) shaders(disc, cache, xex, digest, found);
@@ -639,7 +699,8 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
         report(Stage::Done, 1, 1, "");
         return true;
     }
-    if ((options_.shaders_only || !options_.force) && fs::exists(library, ec)) {
+    const bool same_project = read_build_report(cache, digest).value_or(BuildReport{}).project == project_digest;
+    if ((options_.shaders_only || (!options_.force && same_project)) && fs::exists(library, ec)) {
         BuildReport found = read_build_report(cache, digest).value_or(BuildReport{});
         if (options_.shader_step) {
             shaders(disc, cache, xex, digest, found);
@@ -653,6 +714,7 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     // the addresses earlier runs entered the interpreter at (D3), and the
     // ones given: discovery's extra entries
     BuildReport result;
+    result.project = project_digest;
     std::vector<uint32_t> entries;
     if (options_.use_entry_log) entries = read_entry_log(entry_log_path(cache, digest));
     result.entries_taken = entries.size();
@@ -669,6 +731,7 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     if (ec) return fail(error, "cannot make " + utf8(src) + ": " + ec.message());
     recomp::EmitOptions emit;
     emit.discover.entries = std::move(entries);
+    if (!options_.project.empty()) emit.project = &project;
     emit.keep_going = true; // an executable that cannot be read is interpreted
     emit.progress = [&](recomp::EmitStage stage, size_t done, size_t total, const std::string &detail) {
         report(stage == recomp::EmitStage::Discovering ? Stage::Discovering : Stage::Emitting, done, total, detail);
@@ -912,10 +975,19 @@ bool Build::recover(const fs::path &clang, const fs::path &work, std::vector<Job
         const std::string module = module_of(origin.source);
         std::string text = o.file.head;
         for (const auto &[c, reason] : o.culprits) {
-            const uint32_t a = o.file.chunks[c].address;
-            text += recomp::left_out_stub("xf_", a, "clang rejected it: " + reason) + "\n";
+            const Chunk &chunk = o.file.chunks[c];
+            const uint32_t a = chunk.address;
+            if (chunk.hooked) {
+                // A hooked function's body left out: the body a stub that runs
+                // the original in the interpreter, the wrapper (the hooks) kept,
+                // and so the table's entry (it is the wrapper).
+                text += recomp::left_out_original_stub("xfo_", a, "clang rejected it: " + reason) + chunk.wrapper +
+                        "\n";
+            } else {
+                text += recomp::left_out_stub("xf_", a, "clang rejected it: " + reason) + "\n";
+                tables[(origin.source.parent_path() / "table.cpp").lexically_normal()].insert(a);
+            }
             left_.push_back({module, a, "clang rejected it: " + reason});
-            tables[(origin.source.parent_path() / "table.cpp").lexically_normal()].insert(a);
             report(Stage::Compiling, 0, 0, "left out " + module + " 0x" + hex8(a) + ": " + reason);
         }
         text += o.file.tail;
@@ -1048,6 +1120,8 @@ std::optional<BuildReport> read_build_report(const fs::path &cache_dir, std::str
                                   line.substr(b + 1)});
         } else if (line.starts_with("shaders\t")) {
             r.shaders.push_back(line.substr(8));
+        } else if (line.starts_with("project ")) {
+            r.project = line.substr(8);
         }
     }
     return r;

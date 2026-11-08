@@ -49,14 +49,21 @@
 // the generated code of the calls to those functions and of one call in N
 // (xenoforge/lockstep.h; XF_LOCKSTEP and XF_LOCKSTEP_SAMPLE in the player):
 // mismatches are printed as found, the counts in the report.
+// --hook-stats counts the calls of each of the port's hooks (before, after,
+// replace, mid) and the report lists them. A port whose hooks are a module
+// of their own (PortInfo::hook_module) loads it before the game runs and
+// loads it again when the file changes, or every S seconds with
+// --reload-hooks-every S (docs/sdk.md, "Reloading the hooks").
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 //        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
+//        [--hook-stats] [--reload-hooks-every S]
 
 #include "game.h"
+#include "xenoforge/hooks.h"
 #include "xenoforge/lockstep.h"
 #include "xenoforge/run.h"
 
@@ -81,7 +88,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                         "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
                         "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
                         "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
-                        "[--replay-input <file>] [--option <key>=<value>]...\n";
+                        "[--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
+                        "[--option <key>=<value>]...\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -96,6 +104,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     std::set<uint64_t> shot_swaps, trace_frames;
     uint64_t shot_every = 0;
     std::filesystem::path trace_dir = "traces";
+    double reload_every = 0;
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc)
@@ -152,6 +161,10 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             o.record_input = argv[++k];
         else if (a == "--replay-input" && k + 1 < argc)
             o.replay_input = argv[++k];
+        else if (a == "--hook-stats")
+            hooks::set_stats(true);
+        else if (a == "--reload-hooks-every" && k + 1 < argc)
+            reload_every = std::strtod(argv[++k], nullptr);
         else if (a == "--option" && k + 1 < argc) {
             std::string why;
             if (!port.set_option(argv[++k], why)) return std::fprintf(stderr, "%s\n", why.c_str()), 2;
@@ -200,6 +213,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     }
 
     if (port.on_init) port.on_init(k);
+    if (!port.hook_module.empty() && !game::load_port_module(g, port.hook_module, error))
+        return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     if (!game::launch(g, error)) return std::fprintf(stderr, "launch: %s\n", error.c_str()), 1;
     // until the main thread ends, the code hits what cannot run, or time is up
     uint32_t exit_code = 0;
@@ -215,10 +230,15 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     double last_swap_at = 0;
     bool stall_reported = false;
     bool halted = false;
+    double next_reload = reload_every;
     for (double elapsed = 0; elapsed < seconds && !k.stopped;) {
         if ((ended = k.wait_main(100, &exit_code))) break;
         if ((halted = k.halted())) break;
         elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        // the port's hooks: loaded again when the module's file changed, or on the clock asked
+        const bool due = reload_every > 0 && elapsed >= next_reload;
+        if (due) next_reload += reload_every;
+        game::poll_port_module(g, due);
         if (rates && elapsed >= next_rates) game::print_rates(g, rate_log, elapsed), next_rates += 1;
         if (stall_report > 0) {
             uint64_t now_swaps = swaps();

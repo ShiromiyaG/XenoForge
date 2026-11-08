@@ -76,7 +76,10 @@ void end_guest_stacks(Kernel &k, Thread &t);
 // (the XDK's prologues store it 8 bytes below the caller's frame), at most
 // `max`. Read only where the pages are readable: inside [low, high) when
 // given (a thread's own stack: no lock is taken, as the crash report needs),
-// else by asking the heap (a stack's guard pages are not readable).
-std::vector<uint32_t> guest_backtrace(Kernel &k, uint32_t sp, uint32_t low = 0, uint32_t high = 0, int max = 16);
+// else by asking the heap (a stack's guard pages are not readable). `frames`,
+// when given, gets the frame each LR was saved in (r1 of the function it
+// returns into).
+std::vector<uint32_t> guest_backtrace(Kernel &k, uint32_t sp, uint32_t low = 0, uint32_t high = 0, int max = 16,
+                                      std::vector<uint32_t> *frames = nullptr);
 
 } // namespace xf::kernel

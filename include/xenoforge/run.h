@@ -101,6 +101,12 @@ struct PortInfo {
     // the disc, else the interpreter.
     const ppc::GeneratedModule *const *modules = nullptr;
     size_t module_count = 0;
+    // The port's hooks built as a module of their own (xenoforge_add_port's
+    // HOOK_SOURCES with HOT_RELOAD; xenoforge/port_module.h): its file (a
+    // bare name: beside the executable), loaded after on_init and reloaded
+    // when it changes (the player: also F9; boot: --reload-hooks-every S).
+    // xf::run sets it from the build. Empty: none.
+    std::string hook_module;
 
     // --option key=value: the option set, or false and why
     bool set_option(const std::string &assignment, std::string &why) const {
@@ -135,6 +141,9 @@ namespace xf {
 #ifdef XF_PORT_LINKED
 inline int run(int argc, char **argv, PortInfo &port) {
     port.modules = xf_modules, port.module_count = xf_module_count;
+#ifdef XF_PORT_HOOK_MODULE
+    if (port.hook_module.empty()) port.hook_module = XF_PORT_HOOK_MODULE;
+#endif
 #ifdef XF_PORT_BOOT
     return run_boot(argc, argv, port);
 #else

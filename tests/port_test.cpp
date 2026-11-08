@@ -21,7 +21,9 @@
 
 namespace xfm_m {
 extern const xf::ppc::GeneratedModule module;
-}
+// a project name's alias (port_gen's functions_0.cpp: xfo_82100100, ADD's body)
+void add_one(xf::ppc::Context &);
+} // namespace xfm_m
 
 using namespace xf;
 using namespace port_program;
@@ -243,6 +245,30 @@ void emission() {
           std::string::npos);
     CHECK(hooked_table.find("hooks, 3, names, 2};") != std::string::npos);
     CHECK(read(dir / "full" / "names.h").find("inline constexpr uint32_t add_one = 0x82100100u;") != std::string::npos);
+    // the names as symbols: aliases of the bodies (a hooked one's original)
+    CHECK(hooked.find("XF_FN(add_one) __attribute__((alias(\"?xfo_82100100@xfm_full@@YAXAEAUContext@ppc@xf@@@Z\")));") !=
+          std::string::npos);
+    CHECK(hooked.find("XF_FN(caller) __attribute__((alias(\"_ZN8xfm_full11xf_82100200ERN2xf3ppc7ContextE\")));") !=
+          std::string::npos);
+    CHECK(plain.find("alias") == std::string::npos);
+    // linked, the body's code (port_gen's module, compiled into this test;
+    // compared by what it does: an incremental link gives each symbol a
+    // jump of its own)
+    {
+        auto c = std::make_unique<Context>();
+        std::memset(c.get(), 0, sizeof(Context));
+        c->r[3] = 5;
+        xfm_m::add_one(*c);
+        CHECK(c->r[3] == 6);
+    }
+    {
+        std::set<std::string> used;
+        CHECK(recomp::alias_identifier("?Update@Camera@@QAAXXZ", 0x82010000, used) == "_Update_Camera__QAAXXZ");
+        CHECK(recomp::alias_identifier("Camera::Update", 0x82010000, used) == "Camera__Update");
+        CHECK(recomp::alias_identifier("Camera::Update", 0x82010100, used) == "Camera__Update_82010100");
+        CHECK(recomp::alias_identifier("delete", 0x82010200, used) == "delete_82010200");
+        CHECK(recomp::alias_identifier("BC", 0x82010300, used) == "BC_82010300");
+    }
     // an unknown address, said
     recomp::Project wrong;
     CHECK(recomp::parse_project("hooks = [0x82200000]\n[[mid_hooks]]\naddress = 0x82200080\n[project]\nmodule = "

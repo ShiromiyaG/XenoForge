@@ -7,6 +7,7 @@
 #include "xenoforge/disc.h"
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
+#include "xenoforge/hooks.h"
 #include "xenoforge/lockstep.h"
 #include "xenoforge/native_render.h"
 #include "xenoforge/shader_storage.h"
@@ -372,10 +373,49 @@ bool launch(Game &g, std::string &error) {
     return g.kernel->launch(error);
 }
 
+bool load_port_module(Game &g, const std::filesystem::path &path, std::string &error) {
+    std::filesystem::path file = path;
+    if (!file.has_parent_path()) {
+        // beside the executable
+#ifdef _WIN32
+        wchar_t self[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, self, MAX_PATH);
+        if (n && n < MAX_PATH) file = std::filesystem::path(self).parent_path() / path;
+#else
+        std::error_code ec;
+        const std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (!ec) file = self.parent_path() / path;
+#endif
+    }
+    auto m = std::make_unique<kernel::PortModule>();
+    if (!m->load(file, error)) return false;
+    std::printf("port: hooks from %s (reloaded when it changes)\n", file.string().c_str());
+    g.port_module = std::move(m);
+    return true;
+}
+
+bool poll_port_module(Game &g, bool force) {
+    if (!g.port_module) return false;
+    if (!force && !g.port_module->changed()) {
+        g.port_module->collect();
+        return false;
+    }
+    std::string error, line;
+    if (!g.port_module->reload(*g.kernel, error, &line)) {
+        std::fprintf(stderr, "port: not reloaded: %s\n", error.c_str());
+        return false;
+    }
+    std::printf("%s", line.c_str());
+    std::fflush(stdout);
+    return true;
+}
+
 void print_report(Game &g, bool waiting) {
     kernel::Kernel &k = *g.kernel;
     std::printf("%s", kernel::modules_report(k).c_str());
     if (k.lockstep_enabled()) std::printf("%s", k.lockstep_report().c_str());
+    if (hooks::stats_on()) std::printf("%s", hooks::stats_report().c_str());
+    if (g.port_module) std::printf("port module: %u reloads\n", g.port_module->reloads());
     // where the interpreter was entered: with generated code, what
     // discovery missed (the most entered first)
     auto targets = k.interpreted_targets();

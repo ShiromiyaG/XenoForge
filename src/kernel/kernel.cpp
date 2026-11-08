@@ -33,6 +33,7 @@
 #include "xenoforge/ppc_interp.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 
 namespace xf::kernel {
@@ -107,6 +108,27 @@ struct Kernel::Code {
     std::vector<std::unique_ptr<CodeMap>> maps;
 };
 
+// A guest thread running guest code (running) or in the kernel (not), for
+// Kernel::pause: set for the scope, put back after; a thread that goes back
+// to guest code while a pause is asked parks first.
+struct GuestCodeScope {
+    Kernel &k;
+    Thread *t;
+    bool was = false;
+    GuestCodeScope(Kernel &kernel, bool running) : k(kernel), t(current_thread()) {
+        if (!t) return;
+        was = t->guest_running.exchange(running, std::memory_order_seq_cst);
+        if (running && k.pause_requested_.load(std::memory_order_seq_cst)) [[unlikely]]
+            k.park();
+    }
+    ~GuestCodeScope() {
+        if (!t) return;
+        t->guest_running.store(was, std::memory_order_seq_cst);
+        if (was && k.pause_requested_.load(std::memory_order_seq_cst)) [[unlikely]]
+            k.park();
+    }
+};
+
 Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()) {
     system_.owner = this;
     system_.syscall = [](ppc::Context &c) {
@@ -176,7 +198,8 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         return static_cast<Kernel *>(c.system->owner)->try_call(c, target);
     };
     system_.mid_hook = [](ppc::Context &c, uint32_t pc) -> uint32_t {
-        const hooks::Entry *e = hooks::find(pc);
+        hooks::Pin pin;
+        const hooks::Entry *e = pin.find(pc);
         return e && !e->mid.empty() ? hooks::run_mid(c, *e) : 0;
     };
     system_.run_original = [](ppc::Context &c, uint32_t address) {
@@ -195,13 +218,20 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         // the whole ticks spent, and another thread may run (a spin on a flag
         // with no kernel call reaches its slice's end here)
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        // a pause (Kernel::pause) parks the thread here
+        if (k.pause_requested_.load(std::memory_order_relaxed)) [[unlikely]]
+            k.park();
         const int64_t units = k.deterministic_yield_units_;
         if (!units) {
+            // (counting was turned on for a pause: off again)
             c.yield_budget = INT64_MAX;
+            c.yield_counting = false;
             return;
         }
         const int64_t ticks = 1 + (-(c.yield_budget + 1)) / units;
         c.yield_budget += ticks * units;
+        // handing over is a safe point: the thread waiting there is parked
+        GuestCodeScope parked(k, false);
         k.objects_->scheduler->advance(uint64_t(ticks));
     };
     // the globals first: the objects and threads use their processes,
@@ -501,7 +531,60 @@ void Kernel::attach(ppc::Context &c) {
     c.yield_budget = 0;
 }
 
+void Kernel::park() {
+    Thread *t = current_thread();
+    if (!t) return;
+    std::unique_lock l(pause_mutex_);
+    const bool was = t->guest_running.load(std::memory_order_seq_cst);
+    for (;;) {
+        t->guest_running.store(false, std::memory_order_seq_cst);
+        pause_cv_.notify_all();
+        pause_cv_.wait(l, [&] { return !pause_requested_.load(std::memory_order_seq_cst); });
+        t->guest_running.store(was, std::memory_order_seq_cst);
+        if (!was || !pause_requested_.load(std::memory_order_seq_cst)) break;
+    }
+}
+
+bool Kernel::pause(uint32_t timeout_ms) {
+    pause_requested_.store(true, std::memory_order_seq_cst);
+    const bool exact = deterministic();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        uint32_t running = 0;
+        {
+            std::lock_guard l(objects_->lock);
+            for (Thread *t : objects_->threads) {
+                if (!t->guest_running.load(std::memory_order_seq_cst)) continue;
+                running++;
+                // Not in the deterministic mode, the yield points count only for
+                // this: the thread's next back edge calls System::yield, which
+                // parks it. (Written from here as it runs, as the deterministic
+                // mode's watchdog does: a store it misses is made again.)
+                if (!exact && t->context) {
+                    t->context->yield_budget = -1;
+                    t->context->yield_counting = true;
+                }
+            }
+        }
+        pause_unparked_ = running;
+        if (!running) return true;
+        if (std::chrono::steady_clock::now() >= until) return false;
+        std::unique_lock l(pause_mutex_);
+        pause_cv_.wait_for(l, std::chrono::milliseconds(2));
+    }
+}
+
+void Kernel::resume() {
+    {
+        std::lock_guard l(pause_mutex_);
+        pause_requested_.store(false, std::memory_order_seq_cst);
+    }
+    pause_cv_.notify_all();
+}
+
 void Kernel::run_import(ppc::Context &c, const Import &import) {
+    // in the kernel: a safe point for a pause, on the way in and out
+    GuestCodeScope in_kernel(*this, false);
     // (nothing of this frame outlives the count: a host stack may be dropped
     // while it waits in the export, KeSetCurrentStackPointers's switch)
     {
@@ -575,7 +658,8 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target, bool hooks) {
 }
 
 bool Kernel::call_hooked(ppc::Context &c, uint32_t target) {
-    const hooks::Entry *e = hooks::find(target);
+    hooks::Pin pin;
+    const hooks::Entry *e = pin.find(target);
     if (!e || !e->function() || hooks::slotted(target)) return false;
     hooks::run(c, *e, nullptr); // the original through run_original
     return true;
@@ -585,7 +669,10 @@ void Kernel::run_original(ppc::Context &c, uint32_t address) {
     // the function as dispatch runs it, its hooks left out: generated code,
     // an import, else the interpreter until it returns
     const uint32_t until = uint32_t(c.lr) & ~3u, stack_top = uint32_t(c.r[1]);
-    if (try_call(c, address, false)) return;
+    // (a function with a hook slot asks only when its body was left out of
+    // the generated code, game_build's left_out_original_stub: its table
+    // entry is the wrapper that ran the hooks, so the interpreter it is)
+    if (!hooks::slotted(address) && try_call(c, address, false)) return;
     interpreted_++;
     {
         std::lock_guard<std::mutex> lock(counts_mutex_);
@@ -596,15 +683,26 @@ void Kernel::run_original(ppc::Context &c, uint32_t address) {
 }
 
 const Import *Kernel::hook_marker(uint32_t address) {
-    std::lock_guard lock(hook_markers_mutex_);
-    auto [it, made] = hook_markers_.try_emplace(address);
-    if (made) {
-        std::string name = port::name_of(address);
-        char hex[16];
-        std::snprintf(hex, sizeof(hex), "0x%08X", address);
-        it->second.library = "port", it->second.name = name.empty() ? hex : name + " (" + hex + ")";
-        it->second.thunk = address;
+    // named by the hooks there now ("before count_frames, replace clamp:
+    // Update (0x82012340)"): a marker per text, so a reload's new hooks get
+    // theirs
+    std::string hooks;
+    if (const hooks::Entry *e = hooks::find(address)) {
+        auto add = [&](const char *kind, const std::string &name) {
+            hooks += (hooks.empty() ? "" : ", ") + std::string(kind) + (name.empty() ? "" : " " + name);
+        };
+        for (const auto &h : e->before) add("before", h.name);
+        if (e->replace.fn) add("replace", e->replace.name);
+        for (const auto &h : e->after) add("after", h.name);
+        for (const auto &h : e->mid) add("mid", h.name);
     }
+    std::string name = port::name_of(address);
+    char hex[16];
+    std::snprintf(hex, sizeof(hex), "0x%08X", address);
+    std::string text = (hooks.empty() ? std::string() : hooks + ": ") + (name.empty() ? hex : name + " (" + hex + ")");
+    std::lock_guard lock(hook_markers_mutex_);
+    auto [it, made] = hook_markers_.try_emplace(text);
+    if (made) it->second.library = "port", it->second.name = text, it->second.thunk = address;
     return &it->second;
 }
 
@@ -713,6 +811,8 @@ void Kernel::interpret_from(ppc::Context &c, uint32_t pc, uint32_t until, uint32
 }
 
 void Kernel::call(ppc::Context &c, uint32_t address) {
+    // guest code from here (a thread's start, a callback the kernel makes)
+    GuestCodeScope running(*this, true);
     c.lr = SENTINEL;
     uint32_t target;
     try {

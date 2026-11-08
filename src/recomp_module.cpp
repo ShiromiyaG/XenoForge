@@ -159,6 +159,42 @@ std::string names_header(const std::string &path, const std::string &ns, const s
     return t + "} // namespace " + ns + "::names\n";
 }
 
+} // namespace
+
+std::string alias_identifier(const std::string &name, uint32_t address, std::set<std::string> &used) {
+    static const std::set<std::string> keywords = {
+        "alignas", "alignof", "and", "asm", "auto", "bool", "break", "case", "catch", "char", "class", "concept",
+        "const", "consteval", "constexpr", "constinit", "continue", "co_await", "co_return", "co_yield", "decltype",
+        "default", "delete", "do", "double", "else", "enum", "explicit", "export", "extern", "false", "float", "for",
+        "friend", "goto", "if", "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "not", "nullptr",
+        "operator", "or", "private", "protected", "public", "register", "requires", "return", "short", "signed",
+        "sizeof", "static", "struct", "switch", "template", "this", "throw", "true", "try", "typedef", "typeid",
+        "typename", "union", "unsigned", "using", "virtual", "void", "volatile", "while", "xor", "c"};
+    std::string id;
+    for (char ch : name) id += std::isalnum(uint8_t(ch)) || ch == '_' ? ch : '_';
+    if (id.empty() || std::isdigit(uint8_t(id[0]))) id = "_" + id;
+    bool capitals = true;
+    for (char ch : id) capitals &= !std::islower(uint8_t(ch));
+    if (keywords.count(id) || capitals || id.starts_with("xf") || id.starts_with("XF") || id.starts_with("__") ||
+        used.count(id))
+        id += "_" + hex(address, 8);
+    used.insert(id);
+    return id;
+}
+
+namespace {
+
+// The alias's declaration: the target's symbol as the C++ ABI of the
+// compiler mangles `void <ns>::<target>(xf::ppc::Context &)` (MSVC's, else
+// the Itanium ABI's), so the alias needs no change to the target.
+std::string alias_line(const std::string &ns, const std::string &target, const std::string &alias) {
+    const std::string msvc = "?" + target + "@" + ns + "@@YAXAEAUContext@ppc@xf@@@Z";
+    const std::string itanium =
+        "_ZN" + std::to_string(ns.size()) + ns + std::to_string(target.size()) + target + "ERN2xf3ppc7ContextE";
+    return "#ifdef _MSC_VER\nXF_FN(" + alias + ") __attribute__((alias(\"" + msvc + "\")));\n#else\nXF_FN(" + alias +
+           ") __attribute__((alias(\"" + itanium + "\")));\n#endif\n";
+}
+
 // One module's directory from its image (recomp.h's emit_image); false, and
 // why, when the emission is stopped.
 bool emit_image_at(const Image &image, const std::string &path, uint64_t digest, const std::filesystem::path &out,
@@ -199,6 +235,7 @@ bool emit_image_at(const Image &image, const std::string &path, uint64_t digest,
     // xfo_), mid-function hooks
     std::map<uint32_t, uint32_t> slots; // address, the function's size
     std::set<uint32_t> mids;
+    std::set<std::string> aliases; // the alias symbols made (project names only)
     size_t done = 0;
     for (const auto &[k, functions] : by_file) {
         std::string bodies;
@@ -216,7 +253,13 @@ bool emit_image_at(const Image &image, const std::string &path, uint64_t digest,
                     auto h = p.hooks.find(fn->address);
                     const EmitHooks *hooks = h == p.hooks.end() ? nullptr : &h->second;
                     if (hooks) hooks->placed.clear();
-                    bodies += emit_function(image, d, *fn, prefix, &its, hooks) + "\n";
+                    bodies += emit_function(image, d, *fn, prefix, &its, hooks);
+                    // the project file's name as a symbol of its own: the body's
+                    // (a hooked function's original, xfo_)
+                    if (auto n = p.names.find(fn->address); n != p.names.end())
+                        bodies += alias_line(ns, (hooks && hooks->slot ? "xfo_" : prefix) + hex(fn->address, 8),
+                                             alias_identifier(n->second, fn->address, aliases));
+                    bodies += "\n";
                     calls.insert(its.begin(), its.end());
                     if (hooks && hooks->slot) file_slots.insert(fn->address), slots[fn->address] = fn->size;
                     if (hooks) file_mids.insert(hooks->placed.begin(), hooks->placed.end());
@@ -425,6 +468,13 @@ std::string left_out_stub(const std::string &prefix, uint32_t address, const std
     for (char ch : reason) why += ch == '\n' || ch == '\r' ? ' ' : ch;
     return "// left out of the generated code: " + why + "\nXF_FN(" + function_name(prefix, address) +
            ") { ::xf::ppc::dispatch(c, 0x" + function_name("", address) + "u); }\n";
+}
+
+std::string left_out_original_stub(const std::string &prefix, uint32_t address, const std::string &reason) {
+    std::string why;
+    for (char ch : reason) why += ch == '\n' || ch == '\r' ? ' ' : ch;
+    return "// left out of the generated code: " + why + "\nXF_FN(" + function_name(prefix, address) +
+           ") { c.system->run_original(c, 0x" + function_name("", address) + "u); }\n";
 }
 
 } // namespace xf::recomp

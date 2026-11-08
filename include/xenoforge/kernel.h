@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -422,6 +423,21 @@ public:
     LockstepCounts lockstep_counts() const;
     std::string lockstep_report() const; // the counts, a few lines
 
+    // Every guest thread parked at a safe point (docs/runtime.md, "Pausing
+    // the guest"): at a kernel call (as it enters or leaves one; a thread
+    // waiting inside one counts as parked, and stays there until resume),
+    // or at a yield point of the generated code (the deterministic mode's,
+    // and in the other mode the next back edge, the yield points being
+    // turned on for the pause). True once none runs guest code; false after
+    // timeout_ms (the threads still running are left to park as they come).
+    // Either way the pause holds until resume(). What the port's hooks are
+    // reloaded under (port_module.h). Not from a guest thread.
+    bool pause(uint32_t timeout_ms);
+    void resume();
+    bool pause_requested() const { return pause_requested_.load(std::memory_order_relaxed); }
+    // the guest threads that ran guest code when pause() returned
+    uint32_t pause_unparked() const { return pause_unparked_; }
+
 private:
     friend class Lockstep;
     // (try_call's) generated code run, or checked by the lockstep check
@@ -494,7 +510,15 @@ private:
     std::map<const void *, std::shared_ptr<void>> states_;
     std::unique_ptr<Lockstep> lockstep_;
     std::mutex hook_markers_mutex_;
-    std::map<uint32_t, Import> hook_markers_; // never dropped: the lockstep check keeps pointers
+    std::map<std::string, Import> hook_markers_; // never dropped: the lockstep check keeps pointers
+    // pause(): asked, and where threads wait for resume()
+    std::atomic<bool> pause_requested_{false};
+    std::mutex pause_mutex_;
+    std::condition_variable pause_cv_;
+    uint32_t pause_unparked_ = 0;
+    // a guest thread at a safe point: parked until resume() (pause_requested_ set)
+    void park();
+    friend struct GuestCodeScope;
     std::unique_ptr<Objects> objects_; // last: it reaches the rest
 };
 

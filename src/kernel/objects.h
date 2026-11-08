@@ -409,6 +409,9 @@ public:
     // what makes the thread stop at its next kernel call (a safe point)
     enum : uint32_t { PENDING_SUSPEND = 1, PENDING_KERNEL_APC = 2 };
     std::atomic<uint32_t> pending{0};
+    // running guest code (generated or interpreted), not in a kernel call or
+    // parked: what Kernel::pause waits to see false on every thread
+    std::atomic<bool> guest_running{false};
 
     // the guest stacks it switched between and their host fibers (stacks.h),
     // from its first switch; where the generated code that branched to

@@ -85,6 +85,9 @@ struct BuildReport {
     // what the shader step (BuildOptions::shader_step) made or why it made
     // nothing, a line each ("shaders <TAB> line" in the report)
     std::vector<std::string> shaders;
+    // the project file the library was emitted with (BuildOptions::project):
+    // a digest of what it says, empty without one ("project <digest>")
+    std::string project;
 };
 
 // the build report of the library cached for this digest at this interface
@@ -173,6 +176,11 @@ struct BuildOptions {
     // emission, or to fail clang (a line that does not compile put in their
     // body), so the build's recovery is exercised.
     std::vector<uint32_t> fail_emit, fail_compile;
+    // A port's project file (docs/recompiler.md, "The project file"): its
+    // hooks' slots, names, starts and tables emitted into the library. The
+    // library cached for the executable is built again when it was made
+    // with another project file, or none (BuildReport::project).
+    std::filesystem::path project;
 };
 bool prepare_game(const std::filesystem::path &disc, const std::filesystem::path &cache_dir, Progress &progress,
                   std::string &error, const BuildOptions &options);

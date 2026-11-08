@@ -321,5 +321,16 @@ bool emit_image(const Image &image, const std::string &path, uint64_t digest, co
 // recompile step for the functions clang rejects): it dispatches to its own
 // address, which has no generated code, so the interpreter runs it.
 std::string left_out_stub(const std::string &prefix, uint32_t address, const std::string &reason);
+// The same for a hooked function's body (xfo_<address>; its wrapper, which
+// runs the hooks, stays): the original run by the system, the interpreter
+// (System::run_original; a dispatch would come back to the wrapper).
+std::string left_out_original_stub(const std::string &prefix, uint32_t address, const std::string &reason);
+// A symbol for a name the project file gives a function (an alias of its
+// generated code in the module's namespace, so debuggers and profilers show
+// "xfm_default_xex::Camera_Update" where they would show xf_82010000): the
+// name made an identifier, other characters made '_'; a name that is a
+// keyword, looks like a macro (no lower case), starts as the generated
+// symbols do (xf, XF, __) or is in `used` already gets the address after it.
+std::string alias_identifier(const std::string &name, uint32_t address, std::set<std::string> &used);
 
 } // namespace xf::recomp

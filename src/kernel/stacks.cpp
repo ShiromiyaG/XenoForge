@@ -303,7 +303,8 @@ void end_guest_stacks(Kernel &k, Thread &t) {
     if (converted) revert_thread();
 }
 
-std::vector<uint32_t> guest_backtrace(Kernel &k, uint32_t sp, uint32_t low, uint32_t high, int max) {
+std::vector<uint32_t> guest_backtrace(Kernel &k, uint32_t sp, uint32_t low, uint32_t high, int max,
+                                      std::vector<uint32_t> *frames_at) {
     auto readable = [&](uint32_t address) {
         if (high) return address >= low && address + 4 <= high;
         Heap *heap = k.memory().heap_for(address);
@@ -318,6 +319,7 @@ std::vector<uint32_t> guest_backtrace(Kernel &k, uint32_t sp, uint32_t low, uint
         uint32_t lr = k.load32(next - 8);
         if (!lr) break; // the chain's end
         frames.push_back(lr);
+        if (frames_at) frames_at->push_back(next);
         sp = next;
     }
     return frames;

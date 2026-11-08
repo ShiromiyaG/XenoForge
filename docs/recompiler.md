@@ -692,9 +692,27 @@ hooks = [0x82500000]
   view of the function); to the module's table (`GeneratedModule::names`),
   from which the crash and stop reports and the lockstep check's report name
   the function; and to `names.h` beside `table.cpp`, constants for the port's
-  sources (`xfm_default_xex::names::Camera_Update`). Readable symbol aliases
-  are not made: the generated symbols stay `xf_<address>`, and the name sits
-  beside each in the source the debugger shows.
+  sources (`xfm_default_xex::names::Camera_Update`). And each named
+  function gets a symbol of that name (plan E5): an alias of its generated
+  code, written after it in its file, in the module's namespace,
+
+  ```cpp
+  #ifdef _MSC_VER
+  XF_FN(Camera_Update) __attribute__((alias("?xf_82010000@xfm_default_xex@@YAXAEAUContext@ppc@xf@@@Z")));
+  #else
+  XF_FN(Camera_Update) __attribute__((alias("_ZN15xfm_default_xex11xf_82010000ERN2xf3ppc7ContextE")));
+  #endif
+  ```
+
+  (the target's symbol as the compiler's C++ ABI mangles it, so the
+  generated symbols and every call stay `xf_<address>`; a hooked function's
+  alias names its body, `xfo_`). Debuggers and profilers then show
+  `xfm_default_xex::Camera_Update`. A name is made an identifier (other
+  characters `_`); one that is a keyword, has no lower case (it could be a
+  macro), starts as the generated symbols do (`xf`, `XF`, `__`) or is used
+  twice gets `_<address>` after it (`recomp::alias_identifier`). Without a
+  project file nothing is written: re-emitting games A and B gave the same
+  files byte for byte as before.
 - **Jump tables**: `[[jump_tables]]` (`bctr`, `targets`) or rexglue's
   `[[switch_tables]]` (`address`, `labels`; `register` ignored).
 - **Skip**: the function's generated code is a stub that dispatches to its
@@ -769,6 +787,19 @@ if (XF_HOOKS(xf_mid_82010010)) { // the port's mid-function hook
 
 Everything the project file does not list is emitted as before, byte for
 byte, so its cost is nil.
+
+**Through the recompile step** (`xfbuild --project <file>`,
+`BuildOptions::project`; plan E5): the project file goes into the
+emission, its digest into the build report beside the library (`project
+<digest>`), and a library cached with another project file, or none, is
+built again. The step's splitter, which cuts a file clang rejects into
+parts by function, keeps a hooked function's body (`xfo_`) and its wrapper
+(`xf_`, `XF_HOOKED`) in one part, and a name's alias with its function. A
+hooked function clang rejects keeps its wrapper (the hooks, and the
+table's entry) and its body becomes a stub that asks the system for the
+original (`System::run_original`, which interprets a function with a hook
+slot instead of dispatching to it, as a dispatch would come back to the
+wrapper; `recomp::left_out_original_stub`).
 
 **The registry** (`xenoforge/hooks.h`, `src/hooks.cpp`) is the process's, by
 address. The kernel binds a module's slots as it takes the module's code in

@@ -8,7 +8,8 @@
 #
 #   xenoforge_add_port(<name>
 #       [ISO <disc image>] [XEX <path on the disc>] [PROJECT <project.toml>]
-#       [SOURCES <port sources>...] [DEFINITIONS ...] [INCLUDES ...] [LIBRARIES ...]
+#       [SOURCES <port sources>...] [HOOK_SOURCES <hook sources>... [HOT_RELOAD]]
+#       [DEFINITIONS ...] [INCLUDES ...] [LIBRARIES ...]
 #       [OPT <-O2>] [NO_PLAYER] [NO_BOOT]
 #       [GENERATED_DIR <dir> | PREBUILT <game library file>])
 #
@@ -24,13 +25,21 @@
 #   boot_<name>     the same linked to boot (headless: tests, traces, --render)
 # SOURCES holds the port's main (xenoforge/run.h's xf::run); it is compiled for
 # each executable, boot's with XF_PORT_BOOT defined. The runtime files are copied
-# next to both.
+# next to both. HOOK_SOURCES are the port's hooks (xenoforge/port.h): compiled
+# into both executables as SOURCES are, or with HOT_RELOAD into a module of
+# their own, <name>_hooks (a DLL, a .so on POSIX) beside the executables, which
+# load it as the game opens and again when it changes (xenoforge/port_module.h;
+# docs/sdk.md, "Reloading the hooks"). The module links nothing of XenoForge:
+# its sources see port.h alone, built with XF_PORT_MODULE.
 
 set(_XF_PORT_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
 function(xenoforge_add_port name)
-    cmake_parse_arguments(P "NO_PLAYER;NO_BOOT" "ISO;XEX;PROJECT;OPT;GENERATED_DIR;PREBUILT"
-                          "SOURCES;DEFINITIONS;INCLUDES;LIBRARIES" ${ARGN})
+    cmake_parse_arguments(P "NO_PLAYER;NO_BOOT;HOT_RELOAD" "ISO;XEX;PROJECT;OPT;GENERATED_DIR;PREBUILT"
+                          "SOURCES;HOOK_SOURCES;DEFINITIONS;INCLUDES;LIBRARIES" ${ARGN})
+    if(P_HOT_RELOAD AND NOT P_HOOK_SOURCES)
+        message(FATAL_ERROR "xenoforge_add_port(${name}): HOT_RELOAD reloads HOOK_SOURCES, and there are none")
+    endif()
     if(P_UNPARSED_ARGUMENTS)
         message(FATAL_ERROR "xenoforge_add_port(${name}): unknown arguments ${P_UNPARSED_ARGUMENTS}")
     endif()
@@ -107,6 +116,19 @@ function(xenoforge_add_port name)
         message(FATAL_ERROR "xenoforge_add_port(${name}): one of ISO, GENERATED_DIR or PREBUILT is needed")
     endif()
 
+    # the hooks as a module of their own, reloaded while the game runs
+    if(P_HOT_RELOAD)
+        set(entry ${CMAKE_CURRENT_BINARY_DIR}/xenoforge/${name}/port_module_entry.cpp)
+        file(WRITE ${entry}.tmp "// written by xenoforge_add_port: the module's side of xenoforge/port_module.h\n"
+                                "#define XF_PORT_MODULE_ENTRY\n#include <xenoforge/port_module.h>\n")
+        file(COPY_FILE ${entry}.tmp ${entry} ONLY_IF_DIFFERENT)
+        add_library(${name}_hooks SHARED ${P_HOOK_SOURCES} ${entry})
+        target_compile_definitions(${name}_hooks PRIVATE XF_PORT_MODULE ${P_DEFINITIONS})
+        target_include_directories(${name}_hooks PRIVATE ${XENOFORGE_INCLUDE_DIR} ${P_INCLUDES})
+        target_compile_features(${name}_hooks PRIVATE cxx_std_20)
+        set_target_properties(${name}_hooks PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+    endif()
+
     # the executables
     set(kinds)
     if(NOT P_NO_PLAYER AND TARGET XenoForge::player)
@@ -124,8 +146,15 @@ function(xenoforge_add_port name)
             file(COPY_FILE ${stub}.tmp ${stub} ONLY_IF_DIFFERENT)
             set(sources ${stub})
         endif()
+        if(NOT P_HOT_RELOAD)
+            list(APPEND sources ${P_HOOK_SOURCES})
+        endif()
         add_executable(${kind}_${name} ${sources})
         target_compile_definitions(${kind}_${name} PRIVATE XF_PORT_LINKED ${P_DEFINITIONS})
+        if(P_HOT_RELOAD)
+            target_compile_definitions(${kind}_${name} PRIVATE "XF_PORT_HOOK_MODULE=\"$<TARGET_FILE_NAME:${name}_hooks>\"")
+            add_dependencies(${kind}_${name} ${name}_hooks)
+        endif()
         if(kind STREQUAL boot)
             target_compile_definitions(${kind}_${name} PRIVATE XF_PORT_BOOT)
         endif()

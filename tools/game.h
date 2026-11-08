@@ -16,6 +16,7 @@
 #include "xenoforge/input.h"
 #include "xenoforge/kernel.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/port_module.h"
 #include "xenoforge/renderer.h"
 #include "xenoforge/vk_device.h"
 #include "xenoforge/xex.h"
@@ -79,6 +80,8 @@ struct Game {
     // the cache (Options::cache, else default_cache_dir()): the title's
     // pipeline cache and shader storage are kept there by default
     std::filesystem::path cache;
+    // the port's hooks as a module loaded at run time (port_module.h), when it has one
+    std::unique_ptr<kernel::PortModule> port_module;
 };
 
 // The game read, its memory and kernel made, the disc (or the executable's
@@ -105,9 +108,19 @@ bool start_trace(Game &game, const std::set<uint64_t> &frames, const std::filesy
 // guest's code: where, in guest terms, then the report) in place.
 bool launch(Game &game, std::string &error);
 
+// The port's hooks built as a module (xenoforge_add_port's HOT_RELOAD;
+// port_module.h): loaded from `path` (a bare name: beside the executable)
+// before the game runs. False, and why, when it cannot be.
+bool load_port_module(Game &game, const std::filesystem::path &path, std::string &error);
+// The module loaded again while the game runs when its file changed (and
+// settled), or when `force`: the line saying so printed. False when it was
+// not (unchanged, none, or the new file unusable: said on stderr).
+bool poll_port_module(Game &game, bool force);
+
 // The modules, the interpreter's entries, the kernel calls, what the GPU,
-// the sound and the input did, and the renderer's counts (waiting: for a
-// call of its under way; else skipped if one is).
+// the sound and the input did, the port's hook calls (--hook-stats), and the
+// renderer's counts (waiting: for a call of its under way; else skipped if
+// one is).
 void print_report(Game &game, bool waiting);
 
 // One machine-readable line for the batch compatibility run (xfcompat),

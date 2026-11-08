@@ -270,6 +270,63 @@ int main() {
     CHECK(reread && reread->shaders.size() == 2 && reread->shaders[1] == "a second line" &&
           reread->entries_taken == 2 && reread->left_out.size() == 2);
 
+    // E2/E3: a project file through the build. Two leaves hooked (their
+    // bodies xfo_, their wrappers the table's), one of them made to fail
+    // clang: its body left out as a stub that asks the system for the
+    // original, its wrapper (the hooks) kept in the table. The library is
+    // built again when the project changes.
+    {
+        const std::filesystem::path third = root / "cache3", project = root / "port.toml";
+        std::ofstream(project) << "hooks = [0x" << std::hex << LEAVES + 0x30 << ", 0x" << BAD_COMPILE
+                               << "]\n[names]\n\"0x" << LEAVES + 0x30 << "\" = \"leaf_three\"\n";
+        uint64_t links = 0;
+        build::Progress counting;
+        counting.report = [&](build::Stage stage, uint64_t done, uint64_t total, std::string_view detail) {
+            if (stage == build::Stage::Linking && done == 0 && total == 1) links++; // a link begun
+            if (stage == build::Stage::Failed) std::printf("  %.*s\n", int(detail.size()), detail.data());
+        };
+        build::BuildOptions options;
+        options.project = project;
+        options.fail_compile = {BAD_COMPILE};
+        build::BuildReport with;
+        options.report = &with;
+        CHECK(build::prepare_game(xex_path, third, counting, error, options));
+        CHECK(with.left_out.size() == 1 && has(with, BAD_COMPILE, "clang rejected it") && !with.project.empty());
+        static const ppc::Runtime runtime = ppc::host_runtime();
+        const ppc::GameLibrary *hooked = nullptr;
+        for (const auto &entry : std::filesystem::directory_iterator(third))
+            if (entry.path().extension() == ".dll" || entry.path().extension() == ".so") {
+                // (a copy loaded: the cache's file is built again below)
+                const std::filesystem::path copy = root / ("hooked" + entry.path().extension().string());
+                std::filesystem::copy_file(entry.path(), copy, std::filesystem::copy_options::overwrite_existing, ec);
+                hooked = ppc::load_game_library(copy, runtime, error);
+            }
+        CHECK(hooked && hooked->count == 1);
+        if (hooked && hooked->count == 1) {
+            const ppc::GeneratedModule *m = hooked->modules[0];
+            CHECK(m->hook_count == 2 && m->name_count == 1);
+            CHECK(entry_of(m, BAD_COMPILE) && entry_of(m, BAD_COMPILE)->fn); // the wrapper
+            // the leaves' sum, the one left out asked of the system (the interpreter)
+            auto c = std::make_unique<ppc::Context>();
+            std::memset(c.get(), 0, sizeof(ppc::Context));
+            ppc::System system;
+            system.run_original = [](ppc::Context &, uint32_t address) { missed += address == BAD_COMPILE; };
+            c->system = &system;
+            current = m;
+            missed = 0;
+            ppc::dispatch(*c, E);
+            CHECK(c->r[3] == 136 - (5 + 1) && missed == 1);
+        }
+        // the same project: the cached library; none: built again
+        const uint64_t built = links;
+        CHECK(build::prepare_game(xex_path, third, counting, error, options) && links == built);
+        build::BuildOptions plain;
+        build::BuildReport without;
+        plain.report = &without;
+        CHECK(build::prepare_game(xex_path, third, counting, error, plain) && links == built + 1);
+        CHECK(without.project.empty() && without.left_out.empty());
+    }
+
     // the libraries stay loaded: the directory is left for the next run's
     // remove_all
     return finish("game_build");

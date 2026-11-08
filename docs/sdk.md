@@ -76,6 +76,86 @@ The port's sources are compiled for each executable, boot's with
 (`ffmpeg-xma.dll`, the sound's XMA decoder, loaded at run time) copied next to
 them. Without SOURCES the function writes a main with no port code.
 
+`HOOK_SOURCES <files>` are the port's hooks (`xenoforge/port.h`): compiled into
+both executables as SOURCES are, or, with `HOT_RELOAD`, into a module of their
+own, `<name>_hooks` (a DLL; a .so on POSIX), beside the executables, which
+load it as the game opens and load it again when it changes (below).
+
+## Reloading the hooks
+
+(Plan E5, 2026-11-08.) With `HOT_RELOAD`, a port's hooks are edited and
+rebuilt (`cmake --build build --target mygame_hooks`) while the player runs,
+and the player takes the new ones without restarting the game:
+
+- **When.** The player and boot look at the module's file as they run; a
+  change that has stayed for half a second (the build done writing) is
+  reloaded. F9 in the player reloads at once; boot's `--reload-hooks-every S`
+  reloads on a clock (the tests' way).
+- **How** (`xenoforge/port_module.h`, `src/kernel/port_module.cpp`). The new
+  file is copied to a name of its own in the temporary directory (so the
+  build can write the file again, and a debugger holds no lock on it) and
+  loaded; its interface is checked before anything stops, so a bad build
+  changes nothing. Then every guest thread is parked at a safe point
+  (`Kernel::pause`: a kernel call, or a yield point of the generated code;
+  docs/runtime.md, "Pausing the guest"), the old module's hooks are dropped
+  and the new one's registered, and the threads go on. The pause lasts the
+  registration (well under a millisecond on game B); a thread that has not
+  parked within a second is left running, and said so.
+- **The old copy** is unloaded once no thread runs its code: a thread inside
+  one of its hooks (a replacement whose original waits in a kernel call)
+  keeps it loaded until it comes back out (`hooks::drained`). Each reload, and
+  the player's loop, unload the copies so drained.
+- **What survives** is what the runtime keeps: the registry (names,
+  `--hook-stats` counts, by address, kind and hook name, so counts go on
+  across reloads) and `port::persistent` blocks:
+
+  ```cpp
+  struct Stats { uint64_t frames; float speed; };       // plain data
+  XF_BEFORE(0x82012400, count_frames) {
+      Stats &s = xf::port::persistent<Stats>("stats");  // the same block after a reload
+      s.frames++;
+  }
+  ```
+
+  A block is zeroed (or value-initialized) the first time, kept by its key
+  for the life of the process, and made anew (with a warning) when its size
+  changes. **What does not survive**: the module's statics and its heap (a
+  pointer to either kept in a persistent block dangles after a reload),
+  function pointers into the module held anywhere but the registry, and
+  threads the module starts (it must not leave any running). Hooks
+  registered at run time by the module (from a hook body) belong to it and
+  go with it; hooks the executable registers are never touched.
+- **The module's side.** Built with `XF_PORT_MODULE`, port.h's functions go
+  to the runtime through a table of C functions the module's one export
+  receives (`ModuleApi`): the module links nothing of XenoForge, sees port.h
+  alone (no kernel, no renderer), and its static registrations wait for the
+  table. `xenoforge_add_port` compiles the table's side into the module
+  (a written `port_module_entry.cpp`).
+- **What is not reloaded**: the executable's own SOURCES (the main,
+  `on_init`, options, a native renderer); only HOOK_SOURCES.
+
+## Debugging a port
+
+- **The hooks in the reports** (docs/runtime.md, "Crash and stop
+  reports"): crash and stop reports put each running hook between the guest
+  frames, `#0 port: before hook count_frames on Camera_Update 0x82012400
+  (mygame_hooks.dll#2)`, followed by where the guest goes on after it, and
+  walk on across it. A fault in a hook's own code is reported as one: the
+  hook, the host code address in its module, the r1 and LR it was entered
+  with and the guest context as it is. The lockstep check names hooks the
+  same way ("port!before count_frames: Camera_Update (0x82012400)").
+- **`--hook-stats`** (boot and the player): each hook's calls are counted,
+  listed in the run's report (`hook calls:`, a line per hook: address,
+  function, kind, hook name, calls) and in the player's overlay (F1). Off,
+  a hook pays one load and a branch for it.
+- **Names as symbols**: the project file's names are aliases of the
+  generated functions (`xfm_default_xex::Camera_Update`), for a debugger's
+  or profiler's view (docs/recompiler.md, "The project file").
+- **On the repository's own games**: `-DXF_GAME_HOOKS_<name>=<files>` builds
+  hook sources (kept outside the repository) as a reloadable module for
+  `boot_<name>` and `player_<name>`, with a project file's emission in
+  `XF_GEN_DIR` for their slots.
+
 ## A port's main
 
 ```cpp

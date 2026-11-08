@@ -7,6 +7,7 @@
 //
 //   xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
 //           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only]
+//           [--project <file.toml>]
 //
 // The cache is game_build.h's default_cache_dir() unless named. --keep keeps
 // the work directory (the emitted code and the objects), --force builds even
@@ -19,7 +20,9 @@
 // of the game recorded, and the shaders found on the disc, made into the
 // title's pipeline cache on a Vulkan device; --no-shaders leaves it out,
 // --no-disc-shaders leaves out the disc's search, --shaders-only runs the shader
-// step alone (no library built).
+// step alone (no library built). --project emits with a port's project file
+// (docs/recompiler.md, "The project file": hook slots, names, starts); the
+// cached library is built again when it was made with another one or none.
 
 #include "xenoforge/game_build.h"
 #include "xenoforge/shader_step.h"
@@ -56,7 +59,8 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] "
                              "[--keep] [--force] [--cancel-after S] [--quiet] [--entry <hex>]... "
-                             "[--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only]\n");
+                             "[--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only] "
+                             "[--project <file.toml>]\n");
         return 2;
     }
     std::filesystem::path disc = argv[1], cache = build::default_cache_dir();
@@ -88,6 +92,8 @@ int main(int argc, char **argv) {
             options.shaders_only = true;
         else if (a == "--no-disc-shaders")
             options.disc_shaders = false;
+        else if (a == "--project" && k + 1 < argc)
+            options.project = argv[++k];
         else if (a == "--entry" && k + 1 < argc)
             options.entries.push_back(uint32_t(std::strtoul(argv[++k], nullptr, 16)));
         else if (!a.starts_with("--") && k == 2)

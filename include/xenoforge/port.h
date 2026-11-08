@@ -35,6 +35,9 @@
 // A port links the generated code statically (its sources in the executable,
 // or an OBJECT library: a static library would drop a source holding only
 // registrations). The guest's state is the Context: c.r[n], c.f[n], c.lr...
+// Its hooks may also be a module of their own, reloaded while the game runs
+// (xenoforge_add_port's HOOK_SOURCES and HOT_RELOAD; xenoforge/port_module.h):
+// the same code, built with XF_PORT_MODULE, seeing this header alone.
 
 #pragma once
 
@@ -44,6 +47,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <string>
 #include <type_traits>
 
@@ -133,13 +137,9 @@ inline void fresult(Context &c, double v) { c.f[1] = v; }
 // function at `address` with the registers as they are (arguments in r3...),
 // back when it returns; LR is kept. Generated code where there is some, the
 // interpreter where not, and the hooks there too.
+// The crash and stop reports show the call as the hook that made it.
 constexpr uint32_t CALL_RETURN = 0xBCBCBCBC; // the return address it runs with: no code is there
-inline void call(Context &c, uint32_t address) {
-    const uint64_t lr = c.lr;
-    c.lr = CALL_RETURN;
-    ppc::dispatch(c, address);
-    c.lr = lr;
-}
+void call(Context &c, uint32_t address);
 
 // ---- hooks ----
 
@@ -179,6 +179,25 @@ void remove(uint32_t address);
 // check's (the project file's names are there already)
 void name(uint32_t address, const std::string &name);
 std::string name_of(uint32_t address); // empty: none
+
+// Port state that outlives a reload of the port's hooks (a module loaded at
+// run time, xenoforge_add_port's HOT_RELOAD; docs/sdk.md, "Reloading the
+// hooks"): a block of `size` bytes kept by the runtime under `key`, zeroed
+// the first time, the same block every time after (in this load and the
+// next ones). `made` says it was just made. What a module keeps elsewhere
+// (its statics, its heap, its threads) is gone with it. In an executable it
+// is a block that lives as long as the process.
+void *persistent(const char *key, size_t size, bool *made = nullptr);
+// A T (trivially copyable, so a reloaded module may read what the last one
+// wrote) kept as persistent() keeps it, value-initialized the first time.
+// A T whose size changed between two loads is a new block (a warning).
+template <class T> T &persistent(const char *key) {
+    static_assert(std::is_trivially_copyable_v<T>, "port state that outlives a reload is plain data");
+    bool made = false;
+    void *p = persistent(key, sizeof(T), &made);
+    if (made) new (p) T{};
+    return *static_cast<T *>(p);
+}
 
 // A static registration (the macros below).
 struct Registration {

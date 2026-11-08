@@ -102,6 +102,48 @@ The lockstep check takes the port's code as it takes an import
 (`hook_boundary`). Ports register in `PortInfo::on_init` (xenoforge/run.h) or
 with static registrations, before the guest's first thread.
 
+What the debugging side keeps (plan E5, 2026-11-08; `xenoforge/hooks.h`):
+
+- **Hook frames.** Each run of a hooked function or a mid hook pushes a
+  frame on its context's list (on the host stack of the run, linked from a
+  head per context, found through a one-entry cache per host thread, so the
+  deterministic mode's fibers keep theirs apart): the entry, which hook of it
+  runs, r1 and LR as it was entered, and whether it called back into guest
+  code (`Original`, `port::call`) that has not returned. Popped by its
+  destructor, so an Unwind or a thread's exit through a hook leaves none.
+  `hooks::frames(c)` reads them for the reports.
+- **Counts.** A counter per address, kind and hook name, kept across
+  registrations; one relaxed increment per call while `hooks::set_stats` is
+  on (boot's and the player's `--hook-stats`), a load and a branch when off.
+- **Owners and pins.** Each hook belongs to an owner: the executable, or a
+  module loaded at run time (`port_module.h`), whose hooks
+  `hooks::remove_owner` drops together. A run pins the owners of the entry it
+  read (`hooks::Pin`: a count of threads between reading an entry and pinning
+  it, then a count per owner), so `hooks::drained` says when a module's code
+  is no longer run by any thread and it can be unloaded.
+
+## Pausing the guest
+
+(2026-11-08, `Kernel::pause`, `resume`; for reloading the port's hooks.)
+Every guest thread parked at a safe point: as it enters or leaves a kernel
+call (a thread waiting inside one counts as parked, and does not leave it
+until the pause ends), when the deterministic mode hands the processor over,
+or at a yield point of the generated code or the interpreter (a loop's back
+edge, a priority hint). Outside the deterministic mode the yield points are
+not counted, so `pause` turns counting on in each running thread's context
+with a budget below zero (written from the pausing thread, as the
+deterministic mode's watchdog writes a context; a missed write is made again
+on the next round): the thread's next back edge calls `System::yield`, which
+parks it and turns counting off again. Each thread says whether it runs
+guest code (`Thread::guest_running`: set by `Kernel::call`, cleared around a
+kernel call and while parked), and `pause` returns once none does, or after
+its timeout with the count of those that did not park
+(`pause_unparked`). A thread that goes back to guest code while a pause is
+asked parks first (the flag and the thread's state are sequentially
+consistent, so a thread starting during the pause cannot be missed). Host
+threads that call guest code with no guest thread of their own are not
+paused.
+
 ## Structured exceptions
 
 (2026-11-06, `src/kernel/exceptions.cpp`; docs/xenia-todos-kernel.md A1
@@ -1417,7 +1459,20 @@ read inside its own range) gives:
   `module+offset` and `function start+offset` from the module tables;
 - the stack: LR, then the return addresses by the r1 back chain
   (`guest_backtrace`, the walk `thread_report` also uses), each as a
-  function;
+  function, with the port's hooks running on the thread between them
+  (`hooks::frames`): a hook entered with r1 at some frame sits above the
+  frames saved below it, as `port: <kind> hook <hook> on <function>
+  <address> (<module>)` with its host code, followed by where the guest
+  goes on after it (a function hook's LR, its caller; a mid hook's own
+  address), and the walk goes on across it. A frame saved at the hook's r1
+  holds that same LR, or the native-call return address (`port::call`'s
+  and `Kernel::call`'s 0xBCBCBCBC) when the hook called guest code itself,
+  and is not shown twice;
+- a fault in the port's own code (the innermost hook has not called back
+  into guest code): "faulted in: the port's before hook ... on ...", the
+  host code address and the hook's, each as `module+offset` (Windows'
+  `GetModuleHandleEx`, POSIX's `dladdr`), and the r1 and LR it was entered
+  with; the guest context printed is as the hook left it;
 - the last kernel calls (`note_kernel_call`, a ring of 16 per thread filled
   in `run_import`: library, export, the LR it was called from, "not
   implemented" marked), this thread's in full and the others' last 6;

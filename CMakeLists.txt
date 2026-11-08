@@ -178,7 +178,7 @@ target_link_libraries(xfbuild PRIVATE xenoforge_vk xenoforge)
 # export's registration (XF_EXPORT, a static initializer) is linked in.
 file(GLOB XF_KERNEL_SOURCES CONFIGURE_DEPENDS src/kernel/*.cpp)
 add_library(xenoforge_kernel OBJECT ${XF_KERNEL_SOURCES})
-target_link_libraries(xenoforge_kernel PUBLIC xenoforge)
+target_link_libraries(xenoforge_kernel PUBLIC xenoforge ${CMAKE_DL_LIBS}) # (dladdr and dlopen on POSIX: crash.cpp, port_module.cpp)
 # the console's own XAM (the player's system update) as the oracle for ours
 add_executable(xfxam tools/xfxam.cpp)
 target_include_directories(xfxam PRIVATE src/kernel)
@@ -256,6 +256,25 @@ target_include_directories(port_test PRIVATE tests)
 target_link_libraries(port_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME port COMMAND port_test)
 set_tests_properties(port PROPERTIES TIMEOUT 120)
+# debugging for porters (plan E5): the hook frames, the counts, the owners,
+# the guest paused, and a hook module (a DLL built as xenoforge_add_port's
+# HOT_RELOAD builds one) loaded and reloaded
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/port_test_hooks_entry.cpp.tmp
+     "#define XF_PORT_MODULE_ENTRY\n#include <xenoforge/port_module.h>\n")
+file(COPY_FILE ${CMAKE_CURRENT_BINARY_DIR}/port_test_hooks_entry.cpp.tmp
+     ${CMAKE_CURRENT_BINARY_DIR}/port_test_hooks_entry.cpp ONLY_IF_DIFFERENT)
+add_library(port_test_hooks SHARED tests/port_module_hooks.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_test_hooks_entry.cpp)
+target_compile_definitions(port_test_hooks PRIVATE XF_PORT_MODULE)
+target_include_directories(port_test_hooks PRIVATE include tests)
+set_target_properties(port_test_hooks PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden)
+add_executable(port_debug_test tests/port_debug_test.cpp)
+target_include_directories(port_debug_test PRIVATE tests src/kernel)
+target_link_libraries(port_debug_test PRIVATE xenoforge_kernel xenoforge)
+target_compile_definitions(port_debug_test PRIVATE "XF_TEST_HOOK_MODULE=\"$<TARGET_FILE:port_test_hooks>\""
+                                                   "XF_TEST_NOT_A_MODULE=\"$<TARGET_FILE:port_gen>\"")
+add_dependencies(port_debug_test port_test_hooks port_gen)
+add_test(NAME port_debug COMMAND port_debug_test)
+set_tests_properties(port_debug PROPERTIES TIMEOUT 120)
 
 # stb_image and stb_image_write (public domain / MIT), for PNGs in the tools;
 # Xenia's copy unless STB_DIR says otherwise
@@ -427,11 +446,18 @@ set(XF_PLAYERS)
 if(TARGET player)
     set(XF_PLAYERS player)
 endif()
+# XF_GAME_HOOKS_<name>: hook sources (xenoforge/port.h, kept outside the
+# repository) tried on that game as a port's would be, built as a module
+# reloaded while it runs (HOT_RELOAD; docs/sdk.md, "Reloading the hooks")
 foreach(game ${XF_GAMES})
+    set(port_hooks)
+    if(XF_GAME_HOOKS_${game})
+        set(port_hooks HOOK_SOURCES ${XF_GAME_HOOKS_${game}} HOT_RELOAD)
+    endif()
     if(XF_GAME_LIBS)
-        xenoforge_add_port(${game} PREBUILT ${XF_GAME_LIBS}/game_${game}${CMAKE_STATIC_LIBRARY_SUFFIX})
+        xenoforge_add_port(${game} PREBUILT ${XF_GAME_LIBS}/game_${game}${CMAKE_STATIC_LIBRARY_SUFFIX} ${port_hooks})
     else()
-        xenoforge_add_port(${game} GENERATED_DIR ${XF_GEN_DIR}/${game})
+        xenoforge_add_port(${game} GENERATED_DIR ${XF_GEN_DIR}/${game} ${port_hooks})
     endif()
     if(TARGET player_${game})
         list(APPEND XF_PLAYERS player_${game})

@@ -7,7 +7,8 @@
 // the rates, the controllers, the volume, a screenshot; F11 switches
 // fullscreen, F12 saves a screenshot. With a port drawing its own frames
 // (xenoforge/native_render.h), F6 switches between them and the emulated
-// ones and the overlay shows what it skipped. The settings are config.toml
+// ones and the overlay shows what it skipped. F9 reloads the port's hooks
+// (when they are a module; also when its file changes). The settings are config.toml
 // (settings.h).
 //
 // One clock, the scheduler's: the guest runs on its own threads and never
@@ -32,7 +33,7 @@
 //
 //   player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] [--steps N]
 //        [--interpret] [--cache <dir>] [--game-library <file>] [--quit-after S] [--screenshots <dir>]
-//        [--screenshot-every N] [--press <b@s>]... [--no-sound] [--overlay] [--rates]
+//        [--screenshot-every N] [--press <b@s>]... [--no-sound] [--overlay] [--rates] [--hook-stats]
 //   player[_<game>] --identify
 
 #include "presenter.h"
@@ -41,6 +42,7 @@
 #include "settings.h"
 
 #include "../tools/game.h"
+#include "xenoforge/hooks.h"
 #include "xenoforge/native_render.h"
 #include "xenoforge/run.h"
 
@@ -128,7 +130,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: player <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] "
                         "[--steps N] [--interpret] [--cache <dir>] [--game-library <file>] [--quit-after S] "
                         "[--screenshots <dir>] [--screenshot-every N] "
-                        "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay] [--rates] "
+                        "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay] [--rates] [--hook-stats] "
                         "[--option <key>=<value>]...\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     if (std::string(argv[1]) == "--identify") {
@@ -175,6 +177,8 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             screenshot_every = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--overlay")
             overlay = true;
+        else if (a == "--hook-stats")
+            hooks::set_stats(true);
         else if (a == "--no-sound")
             sound_wanted = false;
         else if (a == "--rates")
@@ -350,6 +354,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                 presenter.own_queue() ? "a queue of its own" : "the renderer's queue");
     stbi_write_png_compression_level = 1;
     if (port.on_init) port.on_init(k);
+    if (!port.hook_module.empty() && !game::load_port_module(g, port.hook_module, error)) return fail(error);
     if (!game::launch(g, error)) return fail("launch: " + error);
     const Clock::time_point started = Clock::now();
 
@@ -390,6 +395,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                 // the port's frames or the emulated ones, for this run (the
                 // port's option, when it binds one, keeps the setting)
                 if (e.key.scancode == SDL_SCANCODE_F6 && native::has_output_renderer()) native::toggle();
+                if (e.key.scancode == SDL_SCANCODE_F9) game::poll_port_module(g, true); // the port's hooks reloaded
             }
             ImGui_ImplSDL3_ProcessEvent(&e);
         }
@@ -404,6 +410,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         if (k.stopped) quit = true, ended = "stopped: " + k.stop_reason;
         uint32_t exit_code = 0;
         if (k.wait_main(0, &exit_code)) quit = true, ended = "the main thread ended";
+        game::poll_port_module(g, false); // the port's hooks, loaded again when their module changed
 
         // the screenshots asked for
         std::deque<Shot> shots;
@@ -563,6 +570,24 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                             (unsigned long long)n.draws_skipped, (unsigned long long)n.resolves_skipped,
                             (unsigned long long)n.draws_kept, (unsigned long long)n.resolves_kept,
                             (unsigned long long)n.memexport_kept, (unsigned long long)n.occlusion_faked);
+            }
+            if (hooks::stats_on()) {
+                // the port's hooks and their calls (--hook-stats)
+                ImGui::SeparatorText("Port hooks");
+                if (ImGui::BeginTable("hooks", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
+                    for (const hooks::Stat &st : hooks::stats()) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("0x%08X %s", st.address, st.function.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(hooks::kind_name(st.kind));
+                        ImGui::TableNextColumn();
+                        ImGui::TextUnformatted(st.hook.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%llu", (unsigned long long)st.calls);
+                    }
+                    ImGui::EndTable();
+                }
             }
             ImGui::SeparatorText("Screenshot");
             if (ImGui::Button("Save (F12)")) key_screenshot();

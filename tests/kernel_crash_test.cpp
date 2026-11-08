@@ -2,12 +2,16 @@
 // thread (its function, stack by the back chain, last kernel calls), a stop
 // by the interpreter, and real host faults in a child process, in generated
 // code (a host function in the table) and in interpreted code: the handler
-// writes crash-<time>.txt and the process ends with exit code 3.
+// writes crash-<time>.txt and the process ends with exit code 3. The port's
+// hooks in them (docs/runtime.md, "Crash and stop reports"): a hook's frame
+// between the guest frames, the walk across a hook that called guest code,
+// and a fault in a hook's own code.
 
 #include "check.h"
 
 #include "objects.h"
 #include "xenoforge/crash.h"
+#include "xenoforge/hooks.h"
 #include "xenoforge/kernel.h"
 #include "xenoforge/memory.h"
 
@@ -28,7 +32,18 @@ Kernel *K = nullptr;
 uint32_t interpreted_code = 0; // guest memory with PPC code
 std::string report_text, report_stack;
 
-enum : uint32_t { F_FAULT = 0x82000000, F_B = 0x82000100, F_C = 0x82000200, F_REPORT = 0x82000300 };
+enum : uint32_t {
+    F_FAULT = 0x82000000,
+    F_B = 0x82000100,
+    F_C = 0x82000200,
+    F_REPORT = 0x82000300,
+    F_HOOKED = 0x82000400,  // hooked: a before hook takes the report
+    F_REPLACED = 0x82000500, // replaced: its original body takes the report
+    F_CALLER = 0x82000600,   // calls F_HOOKED, then F_REPLACED
+    F_FAULTY = 0x82000700,   // hooked: its before hook faults
+    F_CALLER2 = 0x82000800,  // calls F_FAULTY
+};
+std::string hook_text, hook_stack, original_text, original_stack;
 
 // two frames on the stack as the XDK's prologues leave them: r1 back chains
 // and the LRs saved 8 below each frame's top, returning into F_B and F_C
@@ -76,8 +91,43 @@ void report(ppc::Context &c) {
     report_text = r.text, report_stack = r.stack;
 }
 
+// the port's hooks: a before hook that takes the report (its frame on top),
+// and a replacement whose original body takes it (the body's own frame,
+// then the hook's)
+void take_report(ppc::Context &) {
+    CrashReport r = make_crash_report(*K, "in a hook");
+    hook_text = r.text, hook_stack = r.stack;
+}
+void original_body(ppc::Context &c) {
+    // a frame of its own, as a compiled body makes one: LR saved, r1 down
+    const uint32_t sp = uint32_t(c.r[1]);
+    K->store32(sp - 8, uint32_t(c.lr));
+    c.r[1] = sp - 0x60;
+    K->store32(sp - 0x60, sp);
+    c.lr = F_REPLACED + 0x24; // (a call it made)
+    CrashReport r = make_crash_report(*K, "in an original body");
+    original_text = r.text, original_stack = r.stack;
+    c.r[1] = sp;
+}
+void replacement(ppc::Context &c, const port::Original &original) { original(c); }
+void caller(ppc::Context &c) {
+    fake_frames(c);
+    c.lr = F_CALLER + 0x10;
+    K->dispatch(c, F_HOOKED);
+    c.lr = F_CALLER + 0x20;
+    K->dispatch(c, F_REPLACED);
+}
+// a fault in the port's own code: a write to guest page 0
+void faulty_hook(ppc::Context &c) { *reinterpret_cast<volatile uint32_t *>(c.base + 0x10) = 2; }
+void caller2(ppc::Context &c) {
+    fake_frames(c);
+    c.lr = F_CALLER2 + 0x10;
+    K->dispatch(c, F_FAULTY);
+}
+
 const Generated generated[] = {
-    {F_FAULT, fault}, {F_B, nop}, {F_C, nop}, {F_REPORT, report},
+    {F_FAULT, fault},          {F_B, nop},        {F_C, nop},           {F_REPORT, report}, {F_HOOKED, nop},
+    {F_REPLACED, original_body}, {F_CALLER, caller}, {F_FAULTY, nop}, {F_CALLER2, caller2},
 };
 
 // runs a guest thread from start to its end
@@ -113,7 +163,8 @@ int child(const std::string &mode, const char *directory) {
     uint32_t code = memory->system_alloc(0x1000);
     // li r4, 0x10; stw r3, 0(r4); blr
     put_code(k, code, {0x38800010, 0x90640000, 0x4E800020});
-    run(k, mode == "generated" ? F_FAULT : code);
+    port::before(F_FAULTY, faulty_hook, "faulty_hook");
+    run(k, mode == "generated" ? F_FAULT : mode == "hook" ? F_CALLER2 : code);
     return 0; // the handler ends the process before this
 }
 
@@ -174,10 +225,34 @@ int main(int argc, char **argv) {
         CHECK(has(k.stop_report, "crash report: the interpreter stopped") && has(k.stop_report, "thread: "));
         CHECK(!k.stop_stack.empty());
     }
+    {
+        // the port's hooks in the report: a hook's frame between the guest's
+        Kernel k(*memory);
+        K = &k;
+        k.set_generated(generated, std::size(generated));
+        k.objects().set_tls(64, 0, 0, 0);
+        port::name(F_HOOKED, "Hooked");
+        port::before(F_HOOKED, take_report, "take_report");
+        port::replace(F_REPLACED, replacement, "replacement");
+        run(k, F_CALLER);
+        // the before hook on top, then its caller (its LR), then the back chain
+        CHECK(has(hook_text, "#0 port: before hook take_report on Hooked 0x82000400"));
+        CHECK(has(hook_text, "#1 0x82000610") && has(hook_text, "function 0x82000600+0x10"));
+        CHECK(has(hook_text, "#2 0x82000114") && has(hook_text, "#3 0x82000228"));
+        CHECK(has(hook_stack, "port:before take_report <- 0x82000610 (0x82000600+0x10) <- 0x82000114"));
+        // the original body's frame, the replacement's, its caller, the chain:
+        // the body's saved LR (the caller's) shown once
+        CHECK(has(original_text, "lr: 0x82000524"));
+        CHECK(has(original_text, "#0 port: replace hook replacement on 0x82000500"));
+        CHECK(has(original_text, "#1 0x82000620") && has(original_text, "#2 0x82000114"));
+        CHECK(!has(original_text, "#3 0x82000620"));
+        if (failures) std::printf("%s\n%s\n", hook_text.c_str(), original_text.c_str());
+        port::remove(F_HOOKED), port::remove(F_REPLACED);
+    }
 
     // real faults, each in a process of its own
     std::filesystem::path root = std::filesystem::temp_directory_path() / ("xf_crash_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-    for (const char *mode : {"generated", "interpreted"}) {
+    for (const char *mode : {"generated", "interpreted", "hook"}) {
         std::filesystem::path dir = root / mode;
         std::filesystem::remove_all(dir);
         std::filesystem::create_directories(dir);
@@ -189,7 +264,13 @@ int main(int argc, char **argv) {
         CHECK(!file.empty());
         std::string text = read_file(file);
         CHECK(has(text, "crash report: writing host 0x") && has(text, "(guest 0x00000010)"));
-        if (std::string(mode) == "generated") {
+        if (std::string(mode) == "hook") {
+            // a fault in the port's code: the hook named, its host code, the stack across it
+            CHECK(has(text, "faulted in: the port's before hook faulty_hook on 0x82000700"));
+            CHECK(has(text, "host code ") && has(text, "; the hook at "));
+            CHECK(has(text, "#0 port: before hook faulty_hook on 0x82000700 (faulted here)"));
+            CHECK(has(text, "#1 0x82000810") && has(text, "#2 0x82000114"));
+        } else if (std::string(mode) == "generated") {
             CHECK(has(text, "faulted in: generated function 0x82000000"));
             CHECK(has(text, "#0 0x82000114"));
             CHECK(has(text, "xboxkrnl!KeQueryPerformanceFrequency"));
