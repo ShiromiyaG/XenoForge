@@ -14,14 +14,14 @@ using namespace xf;
 int main() {
     // a boot that ran to the end of its time
     const char *ok = "storage: x\ngenerated code: 3 modules, 120 functions\n"
-                     "xf-summary {\"title_id\":\"4D5307E6\",\"digest\":\"00ff00ff00ff00ff\",\"state\":\"ok\","
+                     "xf-summary {\"title_id\":\"5846000A\",\"digest\":\"00ff00ff00ff00ff\",\"state\":\"ok\","
                      "\"detail\":\"\",\"modules\":3,\"functions\":120,\"interpreted_entries\":57,"
                      "\"interpreted_addresses\":4,\"swaps\":900,\"draws\":1234,"
                      "\"unimplemented\":[\"XamFoo\",\"XamBar\"],\"gpu\":[\"skipped: no \\\"shader\\\"\"]}\n";
     auto r = compat::parse_boot_output(ok, 0, false);
     CHECK(r.summary);
     CHECK(r.row.state == "ok");
-    CHECK(r.row.title_id == "4D5307E6" && r.row.digest == "00ff00ff00ff00ff");
+    CHECK(r.row.title_id == "5846000A" && r.row.digest == "00ff00ff00ff00ff");
     CHECK(r.row.modules == 3 && r.row.functions == 120);
     CHECK(r.row.interpreted_entries == 57 && r.row.interpreted_addresses == 4);
     CHECK(r.row.swaps == 900 && r.row.draws == 1234);
@@ -73,7 +73,7 @@ int main() {
 
     // a row through JSON and back, and its CSV line
     compat::Row row;
-    row.disc = "D:\\discs\\a \"b\".iso", row.title = "A, B", row.title_id = "4D5307E6", row.digest = "abc";
+    row.disc = "D:\\discs\\a \"b\".iso", row.title = "A, B", row.title_id = "5846000A", row.digest = "abc";
     row.state = "crash", row.detail = "line\nbreak \\ \"q\"", row.build_seconds = 12.5, row.cached = true;
     row.library_bytes = 5u << 20, row.left_out = 7, row.swaps = 3, row.first_unimplemented = "XamFoo";
     row.excerpt = "a | b", row.exit_code = 3;

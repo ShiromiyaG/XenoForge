@@ -1698,7 +1698,7 @@ code. As built (`frontend/`):
   [keyboard] # each pad control's keys (input.md)
   [player]   # screenshots: the folder F12 writes to
   [launcher] # games: the folder the launcher lists
-  [games.4D5307E6.video] # a game's own settings (the launcher's), any of the four sections above
+  [games.5846000A.video] # a game's own settings (the launcher's), any of the four sections above
   ```
 
 ### Picture options (2026-11-08)

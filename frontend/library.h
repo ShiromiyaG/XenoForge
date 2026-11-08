@@ -25,7 +25,7 @@ struct GameEntry {
     uint64_t size = 0;                  // the file's
     std::vector<uint8_t> icon;          // the title's image from its XDBF (a PNG; empty when it has none), read at run time
     std::string error;                  // why it could not be read (then only path is set)
-    std::string title_id_text() const;  // "4D5307E6"
+    std::string title_id_text() const;  // "5846000A"
 };
 
 // A player executable and the modules it carries generated code for (none:

@@ -122,7 +122,7 @@ struct Settings {
         int x = 0, y = 0, width = 0, height = 0;
         bool maximized = false;
     } launcher;
-    // the title ID ("4D5307E6") whose own settings these are, or "" for the
+    // the title ID ("5846000A") whose own settings these are, or "" for the
     // shared ones: where save() writes them
     std::string game;
     // The settings as load() read them (or save() last wrote them): save() writes into the file only the fields

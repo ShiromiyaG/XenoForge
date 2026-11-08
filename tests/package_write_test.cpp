@@ -63,7 +63,7 @@ Bytes make_header() {
     const size_t m = 0x344;
     put32(h, m, 1); // saved game
     put32(h, m + 4, 2);
-    put32(h, m + 0x1C, 0x4D5307E6);
+    put32(h, m + 0x1C, 0x5846000A);
     const char16_t name[] = u"Slot one";
     for (size_t i = 0; i < 8; i++) {
         h[m + 0xCD + 2 * i] = uint8_t(name[i] >> 8);
@@ -153,7 +153,7 @@ void round_trip(const Tree &t, uint32_t expect_blocks_at_least, bool raw) {
         CHECK(p->is_stfs());
         CHECK(p->info().magic == PACKAGE_MAGIC_CON);
         CHECK(p->info().content_type == 1);
-        CHECK(p->info().title_id == 0x4D5307E6);
+        CHECK(p->info().title_id == 0x5846000A);
         CHECK(p->info().display_name[0] == u"Slot one");
         CHECK(p->info().stfs.total_block_count >= expect_blocks_at_least);
         CHECK(!p->read_only());

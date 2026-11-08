@@ -87,7 +87,7 @@ Bytes make_header(uint32_t magic, uint32_t volume_type, uint32_t header_size, co
     put32(h, m, 0xB0000);      // content type
     put32(h, m + 4, 2);        // metadata version
     put64(h, m + 8, 0x123456); // content size
-    put32(h, m + 0x1C, 0x4D5307E6); // title id
+    put32(h, m + 0x1C, 0x5846000A); // title id
     std::memcpy(&h[m + 0x35], descriptor.data(), 0x24);
     put32(h, m + 0x59, data_file_count);
     put32(h, m + 0x65, volume_type);
@@ -292,7 +292,7 @@ void stfs_test(bool read_only, bool root_active, uint32_t header_size, const std
         const PackageInfo &i = p->info();
         CHECK(i.magic == PACKAGE_MAGIC_CON);
         CHECK(p->is_stfs());
-        CHECK(i.title_id == 0x4D5307E6 && i.content_type == 0xB0000 && i.metadata_version == 2);
+        CHECK(i.title_id == 0x5846000A && i.content_type == 0xB0000 && i.metadata_version == 2);
         CHECK(i.content_size == 0x123456);
         CHECK(i.licenses[0].licensee_id == 0x1122334455667788ull && i.licenses[0].bits == 0xAABBCCDD);
         CHECK(i.display_name[0] == u"Test Package" && i.display_name[9] == u"Idioma 10" && i.publisher == u"Pub");

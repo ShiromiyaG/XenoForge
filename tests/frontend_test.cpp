@@ -47,19 +47,19 @@ int main() {
     s.launcher.games = "D:/games";
     CHECK(frontend::save(dir / "config.toml", s, error));
     frontend::Settings own;
-    CHECK(frontend::load(dir / "config.toml", own, error, "4D5307E6") && own.game.empty());
-    own.game = "4D5307E6", own.audio.volume = 70, own.keys["start"] = "Space";
+    CHECK(frontend::load(dir / "config.toml", own, error, "5846000A") && own.game.empty());
+    own.game = "5846000A", own.audio.volume = 70, own.keys["start"] = "Space";
     CHECK(frontend::save(dir / "config.toml", own, error));
-    CHECK(frontend::load(dir / "config.toml", back, error, "4D5307E6") && back.game == "4D5307E6");
+    CHECK(frontend::load(dir / "config.toml", back, error, "5846000A") && back.game == "5846000A");
     CHECK(back.audio.volume == 70 && back.keys.at("start") == "Space" && back.video.aspect == "stretch");
     CHECK(frontend::load(dir / "config.toml", back, error) && back.game.empty());
     CHECK(back.audio.volume == 40 && back.keys.at("start") == "Return" && back.launcher.games == "D:/games");
     CHECK(frontend::load(dir / "config.toml", back, error, "41560817") && back.game.empty() && back.audio.volume == 40);
     s.audio.volume = 30; // the shared ones saved again keep the game's table
     CHECK(frontend::save(dir / "config.toml", s, error));
-    CHECK(frontend::load(dir / "config.toml", back, error, "4D5307E6") && back.audio.volume == 70);
-    CHECK(frontend::forget_game(dir / "config.toml", "4D5307E6", error));
-    CHECK(frontend::load(dir / "config.toml", back, error, "4D5307E6") && back.game.empty() && back.audio.volume == 30);
+    CHECK(frontend::load(dir / "config.toml", back, error, "5846000A") && back.audio.volume == 70);
+    CHECK(frontend::forget_game(dir / "config.toml", "5846000A", error));
+    CHECK(frontend::load(dir / "config.toml", back, error, "5846000A") && back.game.empty() && back.audio.volume == 30);
     // the picture options (settings.h's video section): saved and read back,
     // per game too, the values out of range or unknown made valid
     {
@@ -78,9 +78,9 @@ int main() {
         CHECK(r.video.aspect == "integer");
         // a game's own scale over the shared one
         frontend::Settings g = r;
-        g.game = "4D5307E6", g.video.resolution_scale = 300;
+        g.game = "5846000A", g.video.resolution_scale = 300;
         CHECK(frontend::save(dir / "video.toml", g, error));
-        CHECK(frontend::load(dir / "video.toml", r, error, "4D5307E6") && r.video.resolution_scale == 300);
+        CHECK(frontend::load(dir / "video.toml", r, error, "5846000A") && r.video.resolution_scale == 300);
         CHECK(frontend::load(dir / "video.toml", r, error) && r.video.resolution_scale == 150);
         // made valid: 25% steps within 50-800, the known choices, powers of two
         CHECK(frontend::clamp_resolution_scale(10) == 50 && frontend::clamp_resolution_scale(112) == 100);
@@ -130,12 +130,12 @@ int main() {
         CHECK(r.audio.volume == 20 && r.video.antialiasing == "fxaa_extreme" && r.video.upscaler == "cas");
         // a game's own table: its fields merged too
         frontend::Settings a, b;
-        CHECK(frontend::load(file, a, error, "4D5307E6") && frontend::load(file, b, error, "4D5307E6"));
-        a.game = b.game = "4D5307E6";
+        CHECK(frontend::load(file, a, error, "5846000A") && frontend::load(file, b, error, "5846000A"));
+        a.game = b.game = "5846000A";
         a.video.antialiasing = "fxaa", b.audio.volume = 10;
         CHECK(frontend::save(file, a, error));
         CHECK(frontend::save(file, b, error));
-        CHECK(frontend::load(file, r, error, "4D5307E6") && r.game == "4D5307E6");
+        CHECK(frontend::load(file, r, error, "5846000A") && r.game == "5846000A");
         CHECK(r.video.antialiasing == "fxaa" && r.audio.volume == 10);
     }
     // the resolution scale's arithmetic (render_scale.h)
@@ -186,14 +186,14 @@ int main() {
         frontend::LauncherCore core(dir / "config.toml", dir);
         CHECK(core.games_folder() == "D:/games");
         frontend::GameEntry game;
-        game.title_id = 0x4D5307E6;
+        game.title_id = 0x5846000A;
         frontend::Settings edit;
         CHECK(core.load_settings(game, edit, error) && edit.game.empty() && edit.audio.volume == 30);
-        CHECK(core.set_own_settings(game, true, edit, error) && edit.game == "4D5307E6" && edit.audio.volume == 30);
+        CHECK(core.set_own_settings(game, true, edit, error) && edit.game == "5846000A" && edit.audio.volume == 30);
         edit.audio.volume = 10;
         frontend::LauncherCore::default_keys(edit);
         CHECK(core.save_settings(edit, error));
-        CHECK(frontend::load(dir / "config.toml", back, error, "4D5307E6") && back.audio.volume == 10);
+        CHECK(frontend::load(dir / "config.toml", back, error, "5846000A") && back.audio.volume == 10);
         CHECK(back.keys.at("start") == "X" && back.launcher.games == "D:/games");
         CHECK(frontend::load(dir / "config.toml", back, error) && back.audio.volume == 30);
         CHECK(core.set_own_settings(game, false, edit, error) && edit.game.empty() && edit.audio.volume == 30);
@@ -229,14 +229,14 @@ int main() {
         };
         for (bool english : {true, false}) {
             Xex xex;
-            xex.execution.title_id = 0x4D5307E6;
+            xex.execution.title_id = 0x5846000A;
             xex.base_address = 0x82000000;
             xex.image.assign(0x100, 0);
             std::vector<uint8_t> data = xdbf(english);
             xex.image.insert(xex.image.end(), data.begin(), data.end());
             xex.header.assign(0x20, 0);
             put32(xex.header, 4 + 16 * 2);
-            for (const char *name : {"other", "4D5307E6"}) {
+            for (const char *name : {"other", "5846000A"}) {
                 std::string n = name;
                 n.resize(8, '\0');
                 xex.header.insert(xex.header.end(), n.begin(), n.end());
@@ -376,7 +376,7 @@ int main() {
     {
         // the windows' structure: escaped titles, every binding a row, the settings' keys
         frontend::RowInfo row;
-        row.title = "A <b> & C", row.id_text = "4D5307E6", row.index = 3;
+        row.title = "A <b> & C", row.id_text = "5846000A", row.index = 3;
         const frontend::Widths widths = frontend::default_widths();
         const std::string rows_html = frontend::table_row_html(row, widths, true);
         CHECK(rows_html.find("A &lt;b&gt; &amp; C") != std::string::npos && rows_html.find("<b>") == std::string::npos);
