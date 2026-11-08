@@ -119,6 +119,9 @@ public:
     // VK_EXT_graphics_pipeline_library with fast linking: pipelines linked
     // from libraries of their four parts in a fraction of a millisecond
     bool pipeline_library() const { return pipeline_library_; }
+    // pipelineCreationCacheControl: a pipeline asked for from the pipeline
+    // cache alone, VK_PIPELINE_COMPILE_REQUIRED when the driver would compile
+    bool cache_control() const { return cache_control_; }
     // VK_EXT_fragment_shader_interlock (0 none, 1 pixel interlock, 2 pixel
     // and sample interlock), and the sample counts a render pass without
     // attachments takes (framebufferNoAttachmentsSampleCounts)
@@ -194,7 +197,7 @@ private:
     bool maintenance8_ = false;
     bool custom_border_color_ = false, storage_image_update_after_bind_ = false;
     float line_width_range_[2] = {1.0f, 1.0f};
-    bool dynamic_blend_ = false, pipeline_library_ = false;
+    bool dynamic_blend_ = false, pipeline_library_ = false, cache_control_ = false;
     uint32_t fragment_shader_interlock_ = 0;
     VkSampleCountFlags no_attachments_samples_ = 0, sample_locations_ = 0;
     std::mutex queue_mutex_;

@@ -1373,6 +1373,23 @@ private:
     std::vector<uint32_t> describe(const VkGraphicsPipelineCreateInfo &info) const;
     std::unique_ptr<PipelineDesc> undescribe(std::span<const uint32_t> words, std::string &why);
     void module_words(VkShaderModule m, std::vector<uint32_t> &out) const;
+    // Each module's SPIR-V by its hash. A description names its modules (the
+    // guest shader and form), which stay the same when the translator
+    // changes what it writes for them; the build step's record of what it
+    // made keys the modules' code too (built_key), so a run after such a
+    // change does not take a library for made when the pipeline cache holds
+    // only an older code's.
+    std::unordered_map<VkShaderModule, uint64_t> module_content_;
+    // a description's or a library key's hash with the code of its modules
+    // (which: a library's part, or 4 for a whole pipeline's stages)
+    uint64_t built_key(uint32_t seed, const std::vector<uint32_t> &words, const VkGraphicsPipelineCreateInfo &info,
+                       uint32_t which) const;
+    // a pipeline or library the build step made, looked up in the pipeline
+    // cache alone (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT
+    // where the device has it): false when the driver would have to compile
+    // it, which is then left to the workers rather than done on the
+    // renderer's thread
+    bool from_cache(const VkGraphicsPipelineCreateInfo &info, VkPipeline &out);
     // a pipeline's description as it is made: the values of its dynamic
     // states set to one each (canonicalize)
     static std::unique_ptr<PipelineDesc> canonical(const VkGraphicsPipelineCreateInfo &info);
@@ -1436,6 +1453,7 @@ private:
         m.pCode = words;
         VkShaderModule out = VK_NULL_HANDLE;
         vkCreateShaderModule(dev_, &m, nullptr, &out);
+        if (out) module_content_[out] = ShaderStorage::hash(0, {words, bytes / 4});
         return out;
     }
     VkPipeline compute_pipeline(const uint32_t *words, size_t bytes, VkPipelineLayout layout);
@@ -1982,6 +2000,7 @@ VkPipeline Impl::compute_pipeline(const uint32_t *words, size_t bytes, VkPipelin
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(dev_, pipeline_cache_, 1, &c, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
     vkDestroyShaderModule(dev_, m, nullptr);
+    module_content_.erase(m);
     return p;
 }
 
@@ -3329,7 +3348,7 @@ bool Impl::translate(Shader &s, std::string &why) {
             if (vkCreateShaderModule(dev_, &info, nullptr, &s.module) != VK_SUCCESS)
                 s.unsupported = "vkCreateShaderModule failed";
             else
-                module_names_[s.module] = {1, 0, s.hash};
+                module_names_[s.module] = {1, 0, s.hash}, module_content_[s.module] = ShaderStorage::hash(0, t.spirv);
         }
     }
     if (!s.unsupported.empty()) why = s.unsupported;
@@ -3351,7 +3370,7 @@ VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options
             info.codeSize = t.spirv.size() * 4;
             info.pCode = t.spirv.data();
             if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
-            if (m) module_names_[m] = {1, key, s.hash};
+            if (m) module_names_[m] = {1, key, s.hash}, module_content_[m] = ShaderStorage::hash(0, t.spirv);
         }
         it = s.variants.emplace(key, m).first;
     }
@@ -3371,7 +3390,7 @@ VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &optio
             info.codeSize = t.spirv.size() * 4;
             info.pCode = t.spirv.data();
             if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
-            if (m) module_names_[m] = {1, key, s.hash};
+            if (m) module_names_[m] = {1, key, s.hash}, module_content_[m] = ShaderStorage::hash(0, t.spirv);
         }
         it = s.variants.emplace(key, m).first;
     }
@@ -4827,7 +4846,7 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
         if (storage_ || !built_pipelines_.empty()) {
             const std::vector<uint32_t> description = describe(info);
             if (!description.empty()) {
-                built = built_pipelines_.count(ShaderStorage::hash(0, description)) != 0;
+                built = !built_pipelines_.empty() && built_pipelines_.count(built_key(0, description, info, 4)) != 0;
                 if (storage_ && storage_->add_pipeline(description)) report_.pipelines_stored++;
             }
         }
@@ -4842,9 +4861,10 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             return e->pipeline;
         }
         const bool linked = stand_in_ == Options::PipelineStandIn::library && use_libraries_;
-        // made now: waited for, or (built, and not linked from libraries
-        // that are) found in the pipeline cache
-        if (!async || (built && !linked)) {
+        // made now: waited for (a draw without a pixel shader, as Xenia), or
+        // (built, and not linked from libraries that are) found in the
+        // pipeline cache, unless the driver would compile it there
+        if (!async) {
             VkPipeline p = VK_NULL_HANDLE;
             {
                 Timer timer(report_.pipeline_seconds);
@@ -4854,6 +4874,15 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             e->pipeline = p;
             e->state.store(1, std::memory_order_release);
             return p;
+        }
+        if (built && !linked) {
+            VkPipeline p = VK_NULL_HANDLE;
+            if (from_cache(info, p)) {
+                e->pipeline = p;
+                e->state.store(1, std::memory_order_release);
+                return p;
+            }
+            report_.pipelines_prebuilt_missed++; // made on the workers below, as any other
         }
         // made on the workers: the whole pipeline, or first its libraries
         // (made now, those the build step made)
@@ -4961,9 +4990,21 @@ PipelineEntry *Impl::library(uint32_t part, const std::vector<uint32_t> &key, co
     // the parts with the guest's shaders are the slow ones: on the workers,
     // ahead of the whole pipelines; the others are made here, and so are
     // those the build step made into the pipeline cache (a lookup there)
-    const bool built = !built_libraries_.empty() && built_libraries_.count(ShaderStorage::hash(part, key)) != 0;
+    const bool built =
+        !built_libraries_.empty() && built_libraries_.count(built_key(part, key, desc.info, part)) != 0;
     if (built) report_.pipeline_libraries_prebuilt++;
-    if (async && !built && (part == 1 || part == 2)) {
+    if (async && (part == 1 || part == 2)) {
+        if (built) {
+            // a lookup in the pipeline cache, unless the driver would have to
+            // compile it after all
+            VkPipeline p = VK_NULL_HANDLE;
+            if (from_cache(desc.info, p)) {
+                slot->pipeline = p;
+                slot->state.store(1, std::memory_order_release);
+                return slot.get();
+            }
+            report_.pipeline_libraries_prebuilt_missed++;
+        }
         pipeline_workers_->queue(slot.get(), std::make_unique<PipelineDesc>(desc.info), PipelinePriority::first);
         return slot.get();
     }
@@ -4976,6 +5017,40 @@ PipelineEntry *Impl::library(uint32_t part, const std::vector<uint32_t> &key, co
     slot->pipeline = p;
     slot->state.store(1, std::memory_order_release);
     return slot.get();
+}
+
+uint64_t Impl::built_key(uint32_t seed, const std::vector<uint32_t> &words, const VkGraphicsPipelineCreateInfo &info,
+                         uint32_t which) const {
+    // the stages a part holds, as LibraryDesc splits them: the pre-
+    // rasterization part all but the fragment shader, the fragment shader's
+    // part that one; the vertex input and fragment output none
+    if (which == 0 || which == 3) return ShaderStorage::hash(seed, words);
+    std::vector<uint32_t> keyed = words;
+    for (uint32_t i = 0; i < info.stageCount; i++) {
+        const bool fragment = info.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+        if ((which == 1 && fragment) || (which == 2 && !fragment)) continue;
+        auto it = module_content_.find(info.pStages[i].module);
+        const uint64_t code = it == module_content_.end() ? 0 : it->second;
+        keyed.insert(keyed.end(), {uint32_t(code), uint32_t(code >> 32)});
+    }
+    return ShaderStorage::hash(seed, keyed);
+}
+
+bool Impl::from_cache(const VkGraphicsPipelineCreateInfo &info, VkPipeline &out) {
+    out = VK_NULL_HANDLE;
+    VkGraphicsPipelineCreateInfo asked = info;
+    // without the device's cache control the record is trusted, as before
+    if (d_.cache_control() && pipeline_cache_) asked.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    VkResult r;
+    {
+        Timer timer(report_.pipeline_seconds);
+        r = vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &asked, nullptr, &out);
+    }
+    if (r == VK_SUCCESS) return true;
+    out = VK_NULL_HANDLE;
+    // VK_PIPELINE_COMPILE_REQUIRED: not in the cache; any other result a
+    // failure, which the workers would meet too
+    return r != VK_PIPELINE_COMPILE_REQUIRED;
 }
 
 VkPipeline Impl::link(PipelineEntry &e) {
@@ -5636,15 +5711,20 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
     const bool libraries = d_.pipeline_library();
     for (const std::vector<uint32_t> &words : storage.pipelines()) {
         out.descriptions++;
-        const uint64_t hash = ShaderStorage::hash(0, words);
-        if (made_pipelines.count(hash)) {
-            out.descriptions_done_before++;
-            continue;
-        }
+        // made back first: what an earlier build step made is known by the
+        // description with its modules' code (built_key), which a newer
+        // translator changes
         std::unique_ptr<PipelineDesc> desc = undescribe(words, why);
         if (!desc) {
             out.descriptions_failed++;
-            if (options_.verbose) std::fprintf(stderr, "  description %016llX: %s\n", (unsigned long long)hash, why.c_str());
+            if (options_.verbose)
+                std::fprintf(stderr, "  description %016llX: %s\n", (unsigned long long)ShaderStorage::hash(0, words),
+                             why.c_str());
+            continue;
+        }
+        const uint64_t hash = built_key(0, words, desc->info, 4);
+        if (made_pipelines.count(hash)) {
+            out.descriptions_done_before++;
             continue;
         }
         if (libraries) {
@@ -5652,10 +5732,10 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
             library_keys(desc->info, parts);
             for (uint32_t part = 0; part < 4; part++) {
                 if (parts.keys[part].empty()) continue;
-                const uint64_t lh = ShaderStorage::hash(part, parts.keys[part]);
+                LibraryDesc ld(desc->info, part);
+                const uint64_t lh = built_key(part, parts.keys[part], ld.info, part);
                 if (made_libraries.count(lh) || !queued_libraries.insert(lh).second) continue;
                 Made m{lh, true, std::make_unique<PipelineEntry>()};
-                LibraryDesc ld(desc->info, part);
                 pipeline_workers_->queue(m.entry.get(), std::make_unique<PipelineDesc>(ld.info),
                                          PipelinePriority::normal);
                 made.push_back(std::move(m));

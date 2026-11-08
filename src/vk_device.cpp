@@ -154,7 +154,9 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
 
     // the renderer's bindless textures: sampled images and samplers written
     // into a bound set while submissions that do not use them run
+    VkPhysicalDeviceVulkan13Features has13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features has12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    has12.pNext = &has13;
     VkPhysicalDeviceFeatures2 has{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     has.pNext = &has12;
     vkGetPhysicalDeviceFeatures2(d->physical_, &has);
@@ -172,6 +174,16 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     v13.dynamicRendering = VK_TRUE;
     v13.synchronization2 = VK_TRUE;
     v13.shaderDemoteToHelperInvocation = VK_TRUE;
+    // pipelines asked for from the pipeline cache alone
+    // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT): what the
+    // renderer's thread expects to find made is looked up there, and left to
+    // the workers when the driver would have to compile it. Required by
+    // Vulkan 1.3, queried all the same; XF_VK_NO_CACHE_CONTROL=1 turns it off.
+    {
+        const char *v = std::getenv("XF_VK_NO_CACHE_CONTROL");
+        if (has13.pipelineCreationCacheControl && !(v && v[0] && v[0] != '0'))
+            v13.pipelineCreationCacheControl = d->cache_control_ = true;
+    }
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.pNext = &v13;
     v12.descriptorIndexing = VK_TRUE;

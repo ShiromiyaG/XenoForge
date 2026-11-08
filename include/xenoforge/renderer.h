@@ -91,6 +91,10 @@ struct Report {
     // for this device and driver, made at once from it (render::precompile)
     uint64_t shaders_stored = 0, pipelines_stored = 0;
     uint64_t pipelines_prebuilt = 0, pipeline_libraries_prebuilt = 0;
+    // of those, the ones the pipeline cache did not hold after all (the
+    // driver would have compiled them: a cache another build of the driver
+    // or of the translator wrote), left to the workers instead
+    uint64_t pipelines_prebuilt_missed = 0, pipeline_libraries_prebuilt_missed = 0;
     // The pipelines made on the workers, and how long their draws went
     // without one (from the first draw asking to the first drawn, by the
     // pipeline or its stand-in): in all and at most

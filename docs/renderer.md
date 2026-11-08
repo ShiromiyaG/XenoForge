@@ -1472,6 +1472,38 @@ three runs. The race frame's replay is unchanged by the descriptions'
 dynamic states set to one each (0.008 of 255, 0.014% of pixels off, whole
 and linked).
 
+**A record that outlived its code (2026-11-08).** Game D, played from the
+launcher, froze for seconds at a time: 61.9 s of a 158 s run on the
+renderer's thread making pipelines, one frame 14.2 s long, 43 swaps more
+than 100 ms apart. The build step had recorded its 387 libraries as made,
+and the run made each "at once from the cache" on the renderer's thread;
+but the translator had changed since (the resolution scale), so every
+module's SPIR-V differed from what the cache held, and each lookup was a
+full compile by the driver. A description names its modules by the guest
+shader and form, which a translator change leaves alone, and the record
+named only the description. Two changes:
+- **The record keys the code** (`built_key`): a description's or library
+  key's hash takes the hash of each of its modules' SPIR-V
+  (`module_content_`, kept as modules are made), so a run after a
+  translator or own-shader change finds nothing made, and the next build
+  step makes it again. The storage's descriptions are unchanged; records
+  of older builds simply stop matching (the vertex input and fragment
+  output libraries, which hold no shader, still do).
+- **The renderer's thread never compiles what it took for made**
+  (`from_cache`): a library or whole pipeline the record names is asked of
+  the pipeline cache alone, with
+  `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`
+  (`pipelineCreationCacheControl`, core in Vulkan 1.3, queried:
+  `vk::Device::cache_control`, `XF_VK_NO_CACHE_CONTROL=1` turns it off and
+  trusts the record as before). `VK_PIPELINE_COMPILE_REQUIRED` sends it to
+  the workers as if it had never been made, its draws meanwhile drawn by a
+  linked stand-in or skipped. The report counts them ("not in the pipeline
+  cache, left to the workers"). Any stale cache is covered this way: another
+  driver build with the same cache UUID, a cache file replaced, the
+  driver's own cache cleared. Pipelines of draws without a pixel shader
+  are still made at once whatever the cache holds, as Xenia's D3D12
+  backend makes them.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches

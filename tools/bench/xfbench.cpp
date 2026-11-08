@@ -317,7 +317,20 @@ int main(int argc, char **argv) {
         if (type != "copy") gpu_total += busy;
         std::printf(" gpu_%s_ms_per_s=%.2f", type.c_str(), busy * 1000.0 / window);
     }
-    std::printf(" gpu_ms_per_frame=%.3f gpu_ms_per_s=%.2f cpu_s_per_s=%.3f\n", frames ? gpu_total * 1000.0 / frames : 0,
+    std::printf(" gpu_ms_per_frame=%.3f gpu_ms_per_s=%.2f cpu_s_per_s=%.3f", frames ? gpu_total * 1000.0 / frames : 0,
                 gpu_total * 1000.0 / window, (cpu_end - cpu_start) / window);
+    // the whole run's, from the start: the first present (the time to the
+    // first frame), and the longest gap between presents with when it ended
+    // (the worst hitch), and the gaps over 100 ms
+    double first_present = -1, longest = 0, longest_at = 0;
+    uint32_t over_100 = 0;
+    if (!all.empty()) first_present = double(all.front() - started.QuadPart) / qpf.QuadPart;
+    for (size_t i = 1; i < all.size(); i++) {
+        const double gap = double(all[i] - all[i - 1]) * 1000.0 / qpf.QuadPart;
+        over_100 += gap > 100;
+        if (gap > longest) longest = gap, longest_at = double(all[i] - started.QuadPart) / qpf.QuadPart;
+    }
+    std::printf(" first_present_s=%.2f longest_gap_ms=%.0f longest_gap_ends_s=%.1f gaps_over_100ms=%u\n", first_present, longest,
+                longest_at, over_100);
     return 0;
 }
