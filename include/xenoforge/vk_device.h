@@ -99,6 +99,10 @@ public:
     // samplers with a border color of their own (VK_EXT_custom_border_color
     // without a format), for the textures' YCbCr border colors
     bool custom_border_color() const { return custom_border_color_; }
+    // copies between a depth/stencil aspect and a color image of the same
+    // texel size (VK_KHR_maintenance8): the stencil of an EDRAM transfer
+    // copied from an R8_UINT image where the device has no stencil export
+    bool depth_stencil_color_copies() const { return maintenance8_; }
     // storage image descriptors updated after binding (the resolve targets)
     bool storage_image_update_after_bind() const { return storage_image_update_after_bind_; }
     // VK_EXT_extended_dynamic_state3's blend enables, blend equations and
@@ -179,6 +183,7 @@ private:
     bool geometry_shader_ = false;
     bool tessellation_shader_ = false;
     bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false, fill_mode_non_solid_ = false;
+    bool maintenance8_ = false;
     bool custom_border_color_ = false, storage_image_update_after_bind_ = false;
     float line_width_range_[2] = {1.0f, 1.0f};
     bool dynamic_blend_ = false, pipeline_library_ = false;

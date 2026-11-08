@@ -258,6 +258,7 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
     VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     {
         const bool has_eds3 =
             has_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && !turned_off("XF_VK_NO_EDS3");
@@ -336,6 +337,22 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
                 *tail = &custom_border, tail = &custom_border.pNext;
                 enabled.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
                 d->custom_border_color_ = true;
+            }
+        }
+        // VK_KHR_maintenance8: depth/stencil aspects copied to and from color
+        // images, so that an EDRAM transfer into a depth target without stencil
+        // export writes its stencil with one copy rather than a pass a bit
+        // (beyond Xenia; XF_VK_NO_MAINTENANCE8=1 turns it off: a pass a bit)
+        if (has_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) && !turned_off("XF_VK_NO_MAINTENANCE8")) {
+            VkPhysicalDeviceMaintenance8FeaturesKHR has_m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+            VkPhysicalDeviceFeatures2 query_m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_m8.pNext = &has_m8;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_m8);
+            if (has_m8.maintenance8) {
+                maintenance8.maintenance8 = VK_TRUE;
+                *tail = &maintenance8, tail = &maintenance8.pNext;
+                enabled.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+                d->maintenance8_ = true;
             }
         }
         // (without fast linking a linked pipeline may cost as much as a whole

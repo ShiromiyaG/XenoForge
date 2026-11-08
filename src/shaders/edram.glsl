@@ -9,9 +9,17 @@
 // BSD; see LICENSE-xenia.
 //
 // With EDRAM_NO_TARGET defined (edram_fsi.frag, the pixel shader writing
-// EDRAM itself), only the conversions that need no push constants.
+// EDRAM itself), only the conversions that need no push constants. With
+// EDRAM_TWO_TARGETS (edram_transfer.frag, a target's samples drawn straight
+// into another), `target` is a variable the shader sets to the side it works
+// on, from push constants of its own.
 
-#ifndef EDRAM_NO_TARGET
+#if defined(EDRAM_TWO_TARGETS)
+struct EdramParams {
+    uint base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, flags;
+};
+EdramParams target;
+#elif !defined(EDRAM_NO_TARGET)
 layout(push_constant) uniform Target {
     uint base_tiles;
     uint pitch_tiles; // at the target's bits per sample

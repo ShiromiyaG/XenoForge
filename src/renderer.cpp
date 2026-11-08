@@ -130,6 +130,37 @@ const uint32_t EDRAM_LOAD_DEPTH[] = {
 const uint32_t EDRAM_LOAD_STENCIL[] = {
 #include "edram_load_stencil.frag.inc"
 };
+// edram_transfer.frag: [single-sampled source, multisampled][color, UINT color, depth, depth and stencil]
+const uint32_t EDRAM_TRANSFER[] = {
+#include "edram_transfer.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_UINT[] = {
+#include "edram_transfer_uint.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_DEPTH[] = {
+#include "edram_transfer_depth.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_STENCIL[] = {
+#include "edram_transfer_stencil.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_STENCIL_COPY[] = {
+#include "edram_transfer_stencil_copy.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS_STENCIL_COPY[] = {
+#include "edram_transfer_ms_stencil_copy.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS[] = {
+#include "edram_transfer_ms.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS_UINT[] = {
+#include "edram_transfer_ms_uint.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS_DEPTH[] = {
+#include "edram_transfer_ms_depth.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS_STENCIL[] = {
+#include "edram_transfer_ms_stencil.frag.inc"
+};
 const uint32_t DEPTH_FLOAT24[] = {
 #include "depth_float24.frag.inc"
 };
@@ -476,6 +507,11 @@ struct RenderTarget {
     // denormals), through a UINT view of its image: the view, its format
     VkImageView raw = VK_NULL_HANDLE;
     VkFormat raw_format = VK_FORMAT_UNDEFINED;
+    // a depth target's stencil as an R8_UINT image of its size, which EDRAM
+    // transfers into it write and copy into its stencil aspect where the
+    // device has no stencil export (Impl::edram_transfer); made at the first
+    vk::Image stencil_copy;
+    VkImageView stencil_copy_view = VK_NULL_HANDLE;
 };
 
 // edram.glsl's push constants
@@ -483,6 +519,12 @@ struct EdramTarget {
     uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, flags;
     uint32_t x, y, clear_lo, clear_hi; // edram_clear.comp's
 };
+// edram_transfer.frag's push constants: the destination's and the source's
+// EdramTarget, up to the flags (edram.glsl's EdramParams)
+struct EdramTransfer {
+    uint32_t dest[10], source[10];
+};
+static_assert(sizeof(EdramTransfer) <= 128);
 
 // edram_fsi.frag's uniform block (set 0 binding 4): the interlock path's
 // render target state
@@ -697,6 +739,10 @@ struct ResolveReadback {
 // its read-back buffers, and what waits for the GPU to be done with it.
 struct Slot {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    // uploads into the mirror run ahead of cmd, in the same submission
+    // (Impl::request: pages nothing in the submission has used yet)
+    VkCommandBuffer pre = VK_NULL_HANDLE;
+    bool pre_recording = false;
     VkFence fence = VK_NULL_HANDLE;
     uint64_t serial = 0; // the submission it holds, recording or in flight; 0 when free
     bool recording = false;
@@ -1553,11 +1599,25 @@ private:
         std::vector<Range> ranges;
         uint32_t count = 0;
         uint64_t epoch = 0;
+        uint64_t used_serial = 0; // the submission its pages were last marked used in
     };
     VkDeviceSize request(const std::vector<Range> &ranges, RequestMemo *memo = nullptr);
     RequestMemo vertex_memo_;
     uint64_t mirror_epoch_ = 1; // advanced where pages of the mirror stop being current but for a write
     void gpu_written(const std::vector<Range> &ranges);
+    // The submission that last used each page of the mirror (read or wrote
+    // it on the GPU, or uploaded it): an upload of pages the recording
+    // submission has not used yet goes into its slot's pre command buffer,
+    // ahead of everything in the submission, rather than between its draws,
+    // which would end the render pass and drain the GPU (beyond Xenia, whose
+    // uploads go between its draws). XF_HOISTED_UPLOADS=0 turns it off.
+    std::vector<uint64_t> page_used_;
+    bool hoisted_uploads_ = [] {
+        const char *v = std::getenv("XF_HOISTED_UPLOADS");
+        return !(v && std::string(v) == "0");
+    }();
+    void mark_used(const std::vector<Range> &ranges);
+    VkCommandBuffer pre_cmd();
     bool unwritten(Texture &t);
     static std::pair<uint32_t, uint32_t> watch_bounds(void *self, uint32_t first, uint32_t last);
     // guest memory given a resolve's bytes, as readback_resolve says
@@ -1676,6 +1736,24 @@ private:
     void acquire(RenderTarget *t, uint32_t rows);
     bool edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles);
     bool edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows);
+    // tiles drawn straight from their holders into the target, one pass
+    // (edram_transfer.frag, Xenia's ownership transfers)
+    bool edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::vector<uint32_t>> &held);
+    VkPipeline transfer_pipeline(const RenderTarget &t, bool source_ms);
+    // Direct transfers, the default; XF_EDRAM_TRANSFERS=store moves the
+    // tiles through the EDRAM buffer, a store by the holder and a load by the
+    // new target, as before
+    bool direct_transfers_ = [] {
+        const char *v = std::getenv("XF_EDRAM_TRANSFERS");
+        return !(v && std::string(v) == "store");
+    }();
+    // [single-sampled source, multisampled][color, UINT color, depth, depth
+    // and stencil exported, depth and the stencil into an R8_UINT image]
+    VkShaderModule transfer_fs_[2][5] = {};
+    // the stencil of transfers into depth targets copied from an R8_UINT
+    // image (no stencil export, VK_KHR_maintenance8)
+    bool stencil_copies_ = false;
+    std::map<std::tuple<VkFormat, uint32_t, bool>, VkPipeline> transfer_pipelines_;
     VkDeviceSize edram_mask(const std::vector<uint32_t> &tiles);
     EdramTarget edram_target(const RenderTarget &t, uint32_t height) const {
         // (20e4 rounded only where the host's depth is not already 20e4, as
@@ -1696,14 +1774,15 @@ private:
         return format == 1 ? !options_.depth_float24_convert_in_pixel_shader : d24s8_ != VK_FORMAT_D24_UNORM_S8_UINT;
     }
     VkPipeline load_pipeline(const RenderTarget &t);
+    VkPipeline edram_pipeline(const RenderTarget &t, VkShaderModule fs, VkPipelineLayout layout, bool stencil_copy);
     VkDescriptorSet edram_set(uint32_t which);
     std::vector<RenderTarget *> owners_ = std::vector<RenderTarget *>(EDRAM_TILES, nullptr); // null: EDRAM holds it
     // EDRAM, and beside it the host's 32-bit depth of the last D24FS8 target
     // (and D24S8 where the host keeps it as a float) to store each sample,
     // in the same layout (edram.glsl's host_depth_offset)
     vk::Buffer edram_, host_depth_;
-    VkDescriptorSetLayout edram_set_layouts_[2] = {}; // store, load
-    VkPipelineLayout edram_layouts_[2] = {};
+    VkDescriptorSetLayout edram_set_layouts_[2] = {}; // store (and transfer), load
+    VkPipelineLayout edram_layouts_[3] = {};          // store, load, transfer
     std::vector<VkDescriptorPool> edram_pools_;
     VkDescriptorSet edram_load_set_ = VK_NULL_HANDLE;
     VkPipeline store_pipelines_[2] = {}; // 1x, multisampled
@@ -1737,6 +1816,8 @@ private:
     // without an image
     RenderTarget edram_view(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format) const;
     void fsi_clear(const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t lo, uint32_t hi);
+    void edram_clear_rows(VkCommandBuffer c, const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                          uint32_t lo, uint32_t hi);
     uint32_t fsi_zpd_index(); // the counter the draw counts in, ~0 none
 };
 
@@ -1767,7 +1848,10 @@ Impl::~Impl() {
                 if (pipe) vkDestroyPipeline(dev_, pipe, nullptr);
     for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.sampler, nullptr);
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
-    for (auto &[k, t] : targets_) d_.destroy(t->image);
+    for (auto &[k, t] : targets_) {
+        d_.destroy(t->image);
+        if (t->stencil_copy.image) d_.destroy(t->stencil_copy);
+    }
     for (auto &[k, t] : textures_) {
         for (const TextureView &v : t->views) vkDestroyImageView(dev_, v.view, nullptr);
         if (t->target_view) vkDestroyImageView(dev_, t->target_view, nullptr);
@@ -1783,6 +1867,11 @@ Impl::~Impl() {
     for (VkShaderModule m : tessellation_hs_)
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (auto &[k, p] : load_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
+    for (auto &[k, p] : transfer_pipelines_)
+        if (p) vkDestroyPipeline(dev_, p, nullptr);
+    for (auto &modules : transfer_fs_)
+        for (VkShaderModule m : modules)
+            if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_, clear_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
     for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
@@ -1791,7 +1880,7 @@ Impl::~Impl() {
     for (VkDescriptorPool p : edram_pools_) vkDestroyDescriptorPool(dev_, p, nullptr);
     for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_, target_pool_})
         if (p) vkDestroyDescriptorPool(dev_, p, nullptr);
-    for (VkPipelineLayout l : {edram_layouts_[0], edram_layouts_[1], layout_, resolve_layout_, load_layout_})
+    for (VkPipelineLayout l : {edram_layouts_[0], edram_layouts_[1], edram_layouts_[2], layout_, resolve_layout_, load_layout_})
         if (l) vkDestroyPipelineLayout(dev_, l, nullptr);
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
                                     compute_set_layout_, target_set_layout_})
@@ -1988,6 +2077,7 @@ bool Impl::init(std::string &error) {
         alloc.commandBufferCount = 1;
         VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (vkAllocateCommandBuffers(dev_, &alloc, &s.cmd) != VK_SUCCESS ||
+            vkAllocateCommandBuffers(dev_, &alloc, &s.pre) != VK_SUCCESS ||
             vkCreateFence(dev_, &fence, nullptr, &s.fence) != VK_SUCCESS)
             return error = "could not make the submission slots", false;
     }
@@ -2164,12 +2254,14 @@ bool Impl::init(std::string &error) {
         if (!fsi_depth_fs_) return error = "could not make the interlock path's depth shader", false;
     }
     {
+        constexpr VkShaderStageFlags store_stages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutBinding store[5] = {
-            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            // (the fragment stage's too: a transfer from the target reads it, edram_transfer.frag)
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, store_stages, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, store_stages, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, store_stages, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, store_stages, nullptr},
+            {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, store_stages, nullptr},
         };
         VkDescriptorBindingFlags store_flags[5] = {0, 0, 0, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, 0};
         VkDescriptorSetLayoutBindingFlagsCreateInfo store_binding_flags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
@@ -2200,6 +2292,17 @@ bool Impl::init(std::string &error) {
             if (vkCreatePipelineLayout(dev_, &layout, nullptr, &edram_layouts_[k]) != VK_SUCCESS)
                 return error = "could not make the EDRAM pipeline layouts", false;
         }
+        {
+            // transfers: the source's store set, both targets in the push constants
+            VkPushConstantRange range{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(EdramTransfer)};
+            VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layout.setLayoutCount = 1;
+            layout.pSetLayouts = &edram_set_layouts_[0];
+            layout.pushConstantRangeCount = 1;
+            layout.pPushConstantRanges = &range;
+            if (vkCreatePipelineLayout(dev_, &layout, nullptr, &edram_layouts_[2]) != VK_SUCCESS)
+                return error = "could not make the EDRAM pipeline layouts", false;
+        }
         store_pipelines_[0] = compute_pipeline(EDRAM_STORE, sizeof(EDRAM_STORE), edram_layouts_[0]);
         store_pipelines_[1] = compute_pipeline(EDRAM_STORE_MS, sizeof(EDRAM_STORE_MS), edram_layouts_[0]);
         if (!store_pipelines_[0] || !store_pipelines_[1]) return error = "could not make the EDRAM store pipelines", false;
@@ -2209,6 +2312,25 @@ bool Impl::init(std::string &error) {
         if (d_.stencil_export()) load_fs_[2] = module(EDRAM_LOAD_STENCIL, sizeof(EDRAM_LOAD_STENCIL));
         load_uint_fs_ = module(EDRAM_LOAD_UINT, sizeof(EDRAM_LOAD_UINT));
         if (!load_uint_fs_) return error = "could not make the EDRAM load shaders", false;
+        transfer_fs_[0][0] = module(EDRAM_TRANSFER, sizeof(EDRAM_TRANSFER));
+        transfer_fs_[0][1] = module(EDRAM_TRANSFER_UINT, sizeof(EDRAM_TRANSFER_UINT));
+        transfer_fs_[0][2] = module(EDRAM_TRANSFER_DEPTH, sizeof(EDRAM_TRANSFER_DEPTH));
+        transfer_fs_[1][0] = module(EDRAM_TRANSFER_MS, sizeof(EDRAM_TRANSFER_MS));
+        transfer_fs_[1][1] = module(EDRAM_TRANSFER_MS_UINT, sizeof(EDRAM_TRANSFER_MS_UINT));
+        transfer_fs_[1][2] = module(EDRAM_TRANSFER_MS_DEPTH, sizeof(EDRAM_TRANSFER_MS_DEPTH));
+        if (d_.stencil_export()) {
+            transfer_fs_[0][3] = module(EDRAM_TRANSFER_STENCIL, sizeof(EDRAM_TRANSFER_STENCIL));
+            transfer_fs_[1][3] = module(EDRAM_TRANSFER_MS_STENCIL, sizeof(EDRAM_TRANSFER_MS_STENCIL));
+        } else if (d_.depth_stencil_color_copies() &&
+                   d_.format_supported(VK_FORMAT_R8_UINT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                              VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
+            transfer_fs_[0][4] = module(EDRAM_TRANSFER_STENCIL_COPY, sizeof(EDRAM_TRANSFER_STENCIL_COPY));
+            transfer_fs_[1][4] = module(EDRAM_TRANSFER_MS_STENCIL_COPY, sizeof(EDRAM_TRANSFER_MS_STENCIL_COPY));
+            stencil_copies_ = transfer_fs_[0][4] && transfer_fs_[1][4];
+        }
+        for (auto &modules : transfer_fs_)
+            for (int k = 0; k < 3; k++)
+                if (!modules[k]) return error = "could not make the EDRAM transfer shaders", false;
         {
             // integer images at the guest's sample counts: sampled, and
             // rendered to (Vulkan 1.2's framebufferIntegerColorSampleCounts)
@@ -2509,11 +2631,20 @@ void Impl::flush() {
     }
     vkEndCommandBuffer(s.cmd);
     s.recording = false;
+    VkCommandBuffer buffers[2] = {s.cmd, VK_NULL_HANDLE};
+    uint32_t buffer_count = 1;
+    if (s.pre_recording) {
+        // the uploads seen by everything after them
+        full_barrier(s.pre);
+        vkEndCommandBuffer(s.pre);
+        s.pre_recording = false;
+        buffers[0] = s.pre, buffers[1] = s.cmd, buffer_count = 2;
+    }
     {
         Timer timer(report_.submit_seconds);
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &s.cmd;
+        submit.commandBufferCount = buffer_count;
+        submit.pCommandBuffers = buffers;
         vkResetFences(dev_, 1, &s.fence);
         if (VkResult r = d_.submit(1, &submit, s.fence); r != VK_SUCCESS)
             fatal_ = "a submission failed (" + std::to_string(r) + ")";
@@ -2717,7 +2848,13 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) 
     if (ranges.empty()) return 0;
     if (trace_) traced(cpu_parts(ranges));
     const uint32_t count_before = mem_.write_count();
-    if (memo && memo->epoch == mirror_epoch_ && memo->count == count_before && memo->ranges == ranges) return 0;
+    if (memo && memo->epoch == mirror_epoch_ && memo->count == count_before && memo->ranges == ranges) {
+        if (hoisted_uploads_ && memo->used_serial != submission_serial()) {
+            mark_used(ranges);
+            memo->used_serial = submission_serial();
+        }
+        return 0;
+    }
     // runs of pages to give, [first, end); a page taken is marked current
     // (UINT32_MAX) until the count is known, so ranges sharing it give it once
     std::vector<std::pair<uint32_t, uint32_t>> runs;
@@ -2733,7 +2870,8 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) 
         }
     }
     if (runs.empty()) {
-        if (memo) *memo = {ranges, count_before, mirror_epoch_};
+        mark_used(ranges);
+        if (memo) *memo = {ranges, count_before, mirror_epoch_, submission_serial()};
         return 0;
     }
     for (auto [first, end] : runs) mem_.watch(first << page_shift_, (end - first) << page_shift_);
@@ -2748,27 +2886,61 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) 
         mirror_epoch_++;
         return 0;
     }
-    std::vector<VkBufferCopy> copies;
+    // runs of pages the submission has not used go ahead of it (pre_cmd)
+    std::vector<VkBufferCopy> copies, ahead;
+    const uint64_t serial = submission_serial();
     VkDeviceSize offset = 0;
     for (auto [first, end] : runs) {
         uint32_t start = first << page_shift_;
         VkDeviceSize bytes = VkDeviceSize(end - first) << page_shift_;
         std::memcpy(data + offset, memory_.data() + start, bytes);
-        copies.push_back({at + offset, start, bytes});
+        bool unused = hoisted_uploads_;
+        for (uint32_t p = first; p < end && unused; p++) unused = p >= page_used_.size() || page_used_[p] != serial;
+        (unused ? ahead : copies).push_back({at + offset, start, bytes});
         offset += bytes;
         for (uint32_t p = first; p < end; p++) {
             mirror_at_[p] = count;
             set_gpu_page(p, false);
         }
     }
-    VkCommandBuffer c = outside();
-    gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
-    vkCmdCopyBuffer(c, from, mirror_.buffer, uint32_t(copies.size()), copies.data());
+    if (!ahead.empty()) vkCmdCopyBuffer(pre_cmd(), from, mirror_.buffer, uint32_t(ahead.size()), ahead.data());
+    if (!copies.empty()) {
+        VkCommandBuffer c = outside();
+        gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
+        vkCmdCopyBuffer(c, from, mirror_.buffer, uint32_t(copies.size()), copies.data());
+    }
+    mark_used(ranges);
     // (every page of the ranges current as of count, while nothing is
     // written after it: those just given, and the rest found current above
     // if nothing was written since that check either)
-    if (memo && count == count_before) *memo = {ranges, count, mirror_epoch_};
+    if (memo && count == count_before) *memo = {ranges, count, mirror_epoch_, serial};
     return total;
+}
+
+void Impl::mark_used(const std::vector<Range> &ranges) {
+    if (!hoisted_uploads_) return;
+    const uint64_t serial = submission_serial();
+    if (page_used_.size() < mirror_at_.size()) page_used_.resize(mirror_at_.size(), 0);
+    for (const Range &r : ranges) {
+        if (r.second <= r.first) continue;
+        for (uint32_t p = first_page(r); p <= last_page(r) && p < page_used_.size(); p++) page_used_[p] = serial;
+    }
+}
+
+// The slot's command buffer that runs ahead of its submission, begun with a
+// barrier after everything submitted before (whose draws may still read
+// what it overwrites)
+VkCommandBuffer Impl::pre_cmd() {
+    cmd();
+    Slot &s = slots_[current_];
+    if (!s.pre_recording) {
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(s.pre, &begin);
+        s.pre_recording = true;
+        full_barrier(s.pre);
+    }
+    return s.pre;
 }
 
 // The GPU wrote the ranges in the mirror (a resolve, a memory export; Xenia's
@@ -2776,6 +2948,7 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) 
 // until the CPU writes them, so they are watched. What else those pages hold
 // was made current before (request).
 void Impl::gpu_written(const std::vector<Range> &ranges) {
+    mark_used(ranges);
     std::vector<std::pair<uint32_t, uint32_t>> runs;
     for (const Range &r : ranges) {
         if (r.second <= r.first) continue;
@@ -3238,23 +3411,33 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
 // ---- EDRAM: tiles change hands between render targets ----
 
 // The target takes over the tiles of its first `rows` pixel rows: those
-// another target holds are stored into EDRAM by their holder, then all it
-// did not hold are loaded from EDRAM, as Xenia's ownership transfers do.
+// another target holds are drawn into it from their holder (edram_transfer),
+// and those no target holds are loaded from EDRAM, as Xenia's ownership
+// transfers do. (XF_EDRAM_TRANSFERS=store: the holders store theirs into
+// EDRAM first, then all are loaded from there.)
 void Impl::acquire(RenderTarget *t, uint32_t rows) {
     uint32_t tile_rows = std::min((rows + t->tile_height - 1) / t->tile_height, t->height / t->tile_height);
     uint32_t count = std::min(tile_rows * t->pitch_tiles, EDRAM_TILES);
-    std::vector<uint32_t> needed;
+    std::vector<uint32_t> needed, unheld;
     std::map<RenderTarget *, std::vector<uint32_t>> held;
     for (uint32_t k = 0; k < count; k++) {
         uint32_t tile = (t->base + k) % EDRAM_TILES;
         if (owners_[tile] == t) continue;
         needed.push_back(tile);
-        if (owners_[tile]) held[owners_[tile]].push_back(tile);
+        if (owners_[tile])
+            held[owners_[tile]].push_back(tile);
+        else
+            unheld.push_back(tile);
     }
     if (needed.empty()) return;
-    for (auto &[holder, tiles] : held)
-        if (!edram_store(holder, tiles)) return;
-    if (!edram_load(t, needed, tile_rows * t->tile_height)) return;
+    if (direct_transfers_) {
+        if (!held.empty() && !edram_transfer(t, held)) return;
+        if (!unheld.empty() && !edram_load(t, unheld, tile_rows * t->tile_height)) return;
+    } else {
+        for (auto &[holder, tiles] : held)
+            if (!edram_store(holder, tiles)) return;
+        if (!edram_load(t, needed, tile_rows * t->tile_height)) return;
+    }
     for (uint32_t tile : needed) owners_[tile] = t;
     if (options_.verbose)
         std::fprintf(stderr, "  EDRAM: %zu tiles to %s base %u (from %zu targets)\n", needed.size(), t->depth ? "depth" : "color",
@@ -3314,12 +3497,38 @@ RenderTarget Impl::edram_view(bool depth, uint32_t base, uint32_t pitch, uint32_
 // A resolve's clear into EDRAM on the interlock path (edram_clear.comp): the
 // rectangle's samples get the clear's words
 void Impl::fsi_clear(const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t lo, uint32_t hi) {
+    VkCommandBuffer c = outside();
+    gpu_mark("resolves: clears");
+    // Whole rows of tiles the rectangle covers, all of their samples one
+    // word (where the pitch is a whole number of tiles and a 64-bit clear's
+    // two words are the same), are a run of EDRAM filled as it is, without
+    // the shader's scattered writes; the rows above and below go through it.
+    if ((!t.wide || lo == hi) && x == 0 && w == t.pitch_tiles * t.tile_width) {
+        uint32_t first_row = (y + t.tile_height - 1) / t.tile_height, end_row = (y + h) / t.tile_height;
+        if (end_row > first_row) {
+            uint32_t first = (t.base + first_row * t.pitch_tiles) % EDRAM_TILES;
+            uint32_t count = std::min((end_row - first_row) * t.pitch_tiles, EDRAM_TILES);
+            uint32_t before_wrap = std::min(count, EDRAM_TILES - first);
+            const VkDeviceSize tile_bytes = 80 * 16 * 4;
+            vkCmdFillBuffer(c, edram_.buffer, first * tile_bytes, before_wrap * tile_bytes, lo);
+            if (count > before_wrap) vkCmdFillBuffer(c, edram_.buffer, 0, (count - before_wrap) * tile_bytes, lo);
+            // the rows above and below the filled ones
+            uint32_t top = first_row * t.tile_height - y, bottom_y = end_row * t.tile_height;
+            uint32_t bottom = y + h - bottom_y;
+            if (top) edram_clear_rows(c, t, x, y, w, top, lo, hi);
+            if (bottom) edram_clear_rows(c, t, x, bottom_y, w, bottom, lo, hi);
+            return;
+        }
+    }
+    edram_clear_rows(c, t, x, y, w, h, lo, hi);
+}
+
+void Impl::edram_clear_rows(VkCommandBuffer c, const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                            uint32_t lo, uint32_t hi) {
     EdramTarget p{};
     p.base_tiles = t.base, p.pitch_tiles = t.pitch_tiles, p.msaa = t.msaa, p.format = t.format;
     p.width = w, p.height = h, p.is_depth = t.depth, p.ints_log2 = t.wide ? 1 : 0;
     p.x = x, p.y = y, p.clear_lo = lo, p.clear_hi = hi;
-    VkCommandBuffer c = outside();
-    gpu_mark("resolves: clears");
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, clear_pipeline_);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 1, &resolve_edram_set_, 0, nullptr);
     vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
@@ -3421,6 +3630,27 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     auto it = load_pipelines_.find(key);
     if (it != load_pipelines_.end()) return it->second;
     VkShaderModule fs = !t.depth ? (t.raw ? load_uint_fs_ : load_fs_[0]) : load_fs_[2] ? load_fs_[2] : load_fs_[1];
+    return load_pipelines_[key] = edram_pipeline(t, fs, edram_layouts_[1], false);
+}
+
+VkPipeline Impl::transfer_pipeline(const RenderTarget &t, bool source_ms) {
+    VkFormat color_format = t.raw ? t.raw_format : t.image.format;
+    auto key = std::make_tuple(color_format, t.msaa, source_ms);
+    auto it = transfer_pipelines_.find(key);
+    if (it != transfer_pipelines_.end()) return it->second;
+    const VkShaderModule *fs = transfer_fs_[source_ms ? 1 : 0];
+    VkShaderModule module = !t.depth ? fs[t.raw ? 1 : 0] : fs[3] ? fs[3] : stencil_copies_ ? fs[4] : fs[2];
+    return transfer_pipelines_[key] = edram_pipeline(t, module, edram_layouts_[2], t.depth && stencil_copies_);
+}
+
+// A pipeline drawing a whole target's samples from a fragment shader (the
+// fullscreen triangle, the scissor picking the region): EDRAM loads and
+// transfers. Depth targets write depth and stencil always (the stencil a bit
+// per pass without stencil export: its write mask and reference dynamic).
+// With stencil_copy, a depth target's pipeline writes depth alone and the
+// stencil into an R8_UINT color attachment.
+VkPipeline Impl::edram_pipeline(const RenderTarget &t, VkShaderModule fs, VkPipelineLayout layout, bool stencil_copy) {
+    VkFormat color_format = t.raw ? t.raw_format : t.image.format;
     VkPipelineShaderStageCreateInfo stages[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, fullscreen_vs_, "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr}};
@@ -3438,14 +3668,15 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     if (t.depth) {
         depth.depthTestEnable = depth.depthWriteEnable = VK_TRUE;
         depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
-        depth.stencilTestEnable = VK_TRUE;
+        // (the stencil left alone where it is copied in after the pass)
+        depth.stencilTestEnable = stencil_copy ? VK_FALSE : VK_TRUE;
         depth.front = depth.back = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE,
                                     VK_COMPARE_OP_ALWAYS, 0xFF, 0xFF, 0};
     }
     VkPipelineColorBlendAttachmentState blend{};
-    blend.colorWriteMask = 0xF;
+    blend.colorWriteMask = stencil_copy ? VK_COLOR_COMPONENT_R_BIT : 0xF;
     VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend_state.attachmentCount = t.depth ? 0 : 1;
+    blend_state.attachmentCount = t.depth && !stencil_copy ? 0 : 1;
     blend_state.pAttachments = &blend;
     // depth: the stencil a bit per pass without stencil export
     const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
@@ -3457,7 +3688,9 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     if (t.depth) {
         rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = t.image.format;
-    } else {
+        if (stencil_copy) color_format = VK_FORMAT_R8_UINT;
+    }
+    if (!t.depth || stencil_copy) {
         rendering.colorAttachmentCount = 1;
         rendering.pColorAttachmentFormats = &color_format;
     }
@@ -3473,10 +3706,10 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     info.pDepthStencilState = &depth;
     info.pColorBlendState = &blend_state;
     info.pDynamicState = &dynamic;
-    info.layout = edram_layouts_[1];
+    info.layout = layout;
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
-    return load_pipelines_[key] = p;
+    return p;
 }
 
 bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows) {
@@ -3533,6 +3766,152 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
         }
     }
     vkCmdEndRendering(c);
+    return true;
+}
+
+// The tiles each holder has of what the target takes over, drawn straight
+// from the holder's image into the target (edram_transfer.frag), in one
+// render pass: a draw per rectangle of the target's tiles a holder has
+// (Xenia's Transfer::GetRangeRectangles: a run of tiles is at most a part of
+// a row, whole rows, a part of a row), a pass per stencil bit more for depth
+// without stencil export.
+bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::vector<uint32_t>> &held) {
+    struct Draw {
+        RenderTarget *source;
+        std::vector<VkRect2D> rects;
+    };
+    std::vector<Draw> draws;
+    uint32_t height = 0;
+    for (auto &[holder, tiles] : held) {
+        VkPipeline pipeline = transfer_pipeline(*t, holder->msaa != 0);
+        if (!pipeline) return fatal_ = "could not make an EDRAM transfer pipeline", false;
+        Draw d{holder, {}};
+        // the tiles as the target's, in runs
+        std::vector<uint32_t> at;
+        at.reserve(tiles.size());
+        for (uint32_t tile : tiles) at.push_back((tile + EDRAM_TILES - t->base) % EDRAM_TILES);
+        std::sort(at.begin(), at.end());
+        auto rect = [&](uint32_t row, uint32_t first, uint32_t columns, uint32_t rows) {
+            uint32_t x = first * t->tile_width, y = row * t->tile_height;
+            if (x >= t->width || y >= t->height) return;
+            VkRect2D r{{int32_t(x), int32_t(y)},
+                       {std::min(columns * t->tile_width, t->width - x), std::min(rows * t->tile_height, t->height - y)}};
+            d.rects.push_back(r);
+            height = std::max(height, y + r.extent.height);
+        };
+        for (size_t i = 0; i < at.size();) {
+            size_t j = i + 1;
+            while (j < at.size() && at[j] == at[j - 1] + 1) j++;
+            uint32_t start = at[i], end = at[j - 1] + 1, pitch = t->pitch_tiles;
+            uint32_t row = start / pitch, column = start % pitch;
+            if (column) { // a part of the first row
+                uint32_t columns = std::min(pitch - column, end - start);
+                rect(row, column, columns, 1);
+                start += columns, row++;
+            }
+            if (end - start >= pitch) { // whole rows
+                uint32_t rows = (end - start) / pitch;
+                rect(row, 0, pitch, rows);
+                start += rows * pitch, row += rows;
+            }
+            if (start < end) rect(row, 0, end - start, 1); // a part of the last row
+            i = j;
+        }
+        if (!d.rects.empty()) draws.push_back(std::move(d));
+    }
+    if (draws.empty()) return true;
+    bool stencil_copy = t->depth && stencil_copies_, fresh = false;
+    if (stencil_copy && !t->stencil_copy.image) {
+        t->stencil_copy = d_.create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UINT, {t->width, t->height, 1}, 1, 1,
+                                          t->image.samples,
+                                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0);
+        if (!t->stencil_copy.image) return fatal_ = "could not make a depth target's stencil image", false;
+        t->stencil_copy_view = make_view(t->stencil_copy.image, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8_UINT,
+                                         VK_IMAGE_ASPECT_COLOR_BIT);
+        fresh = true;
+    }
+    VkCommandBuffer c = outside();
+    if (fresh) begin_image(c, t->stencil_copy.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    if (options_.gpu_timing) gpu_mark("EDRAM transfer: " + target_name(*t));
+    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    attachment.imageView = t->raw ? t->raw : t->view;
+    attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, {t->width, height}};
+    rendering.layerCount = 1;
+    VkRenderingAttachmentInfo stencil_attachment = attachment;
+    stencil_attachment.imageView = t->stencil_copy_view;
+    stencil_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    if (t->depth) {
+        rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
+        if (stencil_copy) rendering.colorAttachmentCount = 1, rendering.pColorAttachments = &stencil_attachment;
+    } else {
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &attachment;
+    }
+    vkCmdBeginRendering(c, &rendering);
+    bound_pipeline_ = VK_NULL_HANDLE; // the draws' pipeline and sets are bound again after it
+    VkViewport viewport{0, 0, float(t->width), float(t->height), 0, 1};
+    vkCmdSetViewport(c, 0, 1, &viewport);
+    EdramTarget dest = edram_target(*t, t->height);
+    bool stencil_passes = t->depth && !transfer_fs_[0][3] && !stencil_copy;
+    VkPipeline bound = VK_NULL_HANDLE;
+    for (const Draw &d : draws) {
+        VkPipeline pipeline = transfer_pipeline(*t, d.source->msaa != 0);
+        if (pipeline != bound) vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, bound = pipeline);
+        uint32_t offset = 0;
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, edram_layouts_[2], 0, 1, &d.source->store_set, 1,
+                                &offset);
+        EdramTarget source = edram_target(*d.source, d.source->height);
+        EdramTransfer push{};
+        std::memcpy(push.dest, &dest, sizeof(push.dest));
+        std::memcpy(push.source, &source, sizeof(push.source));
+        vkCmdPushConstants(c, edram_layouts_[2], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+        if (t->depth) {
+            // the depth and the stencil (exported, or cleared to 0 for the
+            // bit passes that follow)
+            vkCmdSetDepthWriteEnable(c, VK_TRUE);
+            vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+            vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+        }
+        for (const VkRect2D &r : d.rects) {
+            vkCmdSetScissor(c, 0, 1, &r);
+            vkCmdDraw(c, 3, 1, 0, 0);
+        }
+        if (!stencil_passes) continue;
+        vkCmdSetDepthWriteEnable(c, VK_FALSE);
+        vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+        for (uint32_t bit = 0; bit < 8; bit++) {
+            EdramTransfer pass = push;
+            pass.dest[8] = bit; // stencil_bit
+            vkCmdPushConstants(c, edram_layouts_[2], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pass), &pass);
+            vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_AND_BACK, 1u << bit);
+            for (const VkRect2D &r : d.rects) {
+                vkCmdSetScissor(c, 0, 1, &r);
+                vkCmdDraw(c, 3, 1, 0, 0);
+            }
+        }
+    }
+    vkCmdEndRendering(c);
+    if (stencil_copy) {
+        // the stencil the pass wrote into the R8_UINT image, into the
+        // target's stencil aspect, rectangle by rectangle
+        full_barrier(c);
+        std::vector<VkImageCopy> copies;
+        for (const Draw &d : draws)
+            for (const VkRect2D &r : d.rects) {
+                VkImageCopy copy{};
+                copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.dstSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
+                copy.srcOffset = copy.dstOffset = {r.offset.x, r.offset.y, 0};
+                copy.extent = {r.extent.width, r.extent.height, 1};
+                copies.push_back(copy);
+            }
+        vkCmdCopyImage(c, t->stencil_copy.image, VK_IMAGE_LAYOUT_GENERAL, t->image.image, VK_IMAGE_LAYOUT_GENERAL,
+                       uint32_t(copies.size()), copies.data());
+    }
     return true;
 }
 
@@ -4145,7 +4524,10 @@ bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &pla
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!grow(load_scratch_, std::max<VkDeviceSize>(total, 16), usage, load_set_, 1)) return false;
-    if (upload) request(t.ranges);
+    if (upload)
+        request(t.ranges);
+    else
+        mark_used(t.ranges); // read from the mirror in this submission
     VkCommandBuffer c = outside();
     gpu_mark("textures: loads on the GPU (texture_load)");
     if (fresh) begin_image(c, image.image, VK_IMAGE_ASPECT_COLOR_BIT, image.levels, image.layers);
@@ -6406,8 +6788,14 @@ void Impl::draw(const gpu::Draw &d) {
     bool own_indices = index_bytes > ARENA_SLOT / 4, own_attributes = attribute_bytes > ARENA_SLOT / 4;
     VkDeviceSize need = 2 * constants_size + system_size + 2 * sizeof(FsiConstants) + 6 * ubo_align_ +
                         (own_indices ? 0 : index_bytes + 4) + (own_attributes ? 0 : attribute_bytes + 4);
-    if (arena_take(need, 1) == NONE) flush();
-    else slots_[current_].used -= need; // only a check that the draw fits
+    if (arena_take(need, 1) == NONE) {
+        flush();
+        // the draw reads its streams in the new submission
+        mark_used(vertex_ranges);
+        mark_used(exported);
+    } else {
+        slots_[current_].used -= need; // only a check that the draw fits
+    }
     if (!fatal_.empty()) return;
 
     // the interlock path's constants, with the occlusion counter the draw
