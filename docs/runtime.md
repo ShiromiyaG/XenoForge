@@ -575,9 +575,12 @@ Measured (El Chavo Kart, `boot_chaves`, headless, game-libs 7ac73df):
 | deterministic, `--until-swap 200` | 200 | 4.2 s | 47 | 6.98 s |
 | deterministic, `--until-swap 1200` | 1200 | 19.1-19.9 s | 60-63 | 40.66 s |
 
-Two runs to swap 200 (1 forced hand-over) and two to swap 1200 (7) left the
-same memory hash, the same runs, the same export counts, the whole report
-alike but for host times. The cost of one host thread is more than paid
+Two runs to swap 200 (1 forced hand-over) and three to swap 1200 (7) left
+the same memory hash, the same runs, the same export counts, the whole
+report alike but for host times; a fourth to swap 1200, beside other
+agents' builds, had an 8th forced hand-over (a thread past 100 ms of the
+busy host's time outside a spin) and differed. A longer
+`XF_DETERMINISTIC_FORCE_MS` trades speed for that. The cost of one host thread is more than paid
 back by the idle clock not waiting for the host's. Ben 10 (`boot_ben10`)
 reaches 347 swaps in 30 s with 209 forced hand-overs (its main thread spins
 before its first kernel call), and two runs to swap 150 differ (clock 12.00
