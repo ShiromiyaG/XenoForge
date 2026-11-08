@@ -228,9 +228,12 @@ std::string button_html(const std::string &action, const std::string &label, boo
 }
 
 std::string dialog_html(const std::string &title, const std::string &body, const std::string &buttons, int width_dp) {
-    return "<div class=\"dialog\" id=\"dialog\" style=\"width: " + std::to_string(width_dp) + "dp;\"><div class=\"dlg-title\"><div class=\"grow nowrap\" id=\"dlg-title\">" +
+    // the block, and under it, as wide as it, the pad's hints for it
+    return "<div class=\"dlg-wrap\" style=\"width: " + std::to_string(width_dp) + "dp;\"><div class=\"dialog\" id=\"dialog\"><div class=\"dlg-title\"><div class=\"grow nowrap\" id=\"dlg-title\">" +
            e(title) + "</div><div class=\"dlg-x\" data-action=\"dialog-close\">" + icon_glyph("x") + "</div></div><div class=\"dlg-body\" id=\"dlg-body\">" + body +
-           "</div><div class=\"dlg-foot\" id=\"dlg-foot\">" + buttons + "</div></div>";
+           "</div><div class=\"dlg-foot\" id=\"dlg-foot\">" + buttons + "</div></div>"
+           "<div class=\"dlg-hints\"><div class=\"hint\"><div class=\"gl a\"></div><div class=\"hl\">Select</div></div>"
+           "<div class=\"hint\"><div class=\"gl b\"></div><div class=\"hl\">Back</div></div></div></div>";
 }
 
 std::string about_body_html() {

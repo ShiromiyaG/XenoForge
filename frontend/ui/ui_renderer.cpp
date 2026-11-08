@@ -1136,7 +1136,7 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
         if (b.strength > 0) {
             std::vector<RibbonVertex> rv;
             std::vector<uint32_t> body, fringe;
-            build_ribbons(b.time, m.width, m.height, b.tint, b.strength, rv, body, fringe, b.greys);
+            build_ribbons(b.time, m.width, m.height, b.tint, b.strength, rv, body, fringe);
             if (!body.empty()) {
                 std::vector<Rml::Vertex> verts(rv.size());
                 for (size_t i = 0; i < rv.size(); i++) {

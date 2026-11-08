@@ -119,13 +119,13 @@ body { background-color: transparent; }
 #thead { flex: 0 0 auto; height: 38dp; padding: 0 8.8%; display: flex; flex-direction: row; align-items: center; }
 .th {
     display: flex; flex-direction: row; align-items: center; height: 38dp;
-    font-family: Condensed; font-weight: 400; font-size: 19.5dp; line-height: 1; color: {th}; cursor: pointer; text-transform: uppercase;
+    font-family: Condensed; font-weight: 400; font-size: 19.5dp; line-height: 1; color: #f0f0f2; cursor: pointer; text-transform: uppercase;
 }
 .th.c-opts { cursor: default; }
-.th:hover { color: {g-on}; }
-.th.c-opts:hover { color: {th}; }
-.th.sorted { color: {g-on}; font-weight: 400; }
-.th .arrow { font-size: 14dp; margin-left: 5dp; color: {g-on}; }
+.th:hover { color: #ffffff; }
+.th.c-opts:hover { color: #f0f0f2; }
+.th.sorted { color: #ffffff; font-weight: 400; }
+.th .arrow { font-size: 14dp; margin-left: 5dp; color: #ffffff; }
 .c-game { flex: 1 1 0; min-width: 160dp; }
 .th.c-game { padding-left: 4dp; }
 .c-status { flex: 0 0 auto; width: 208dp; }
@@ -210,9 +210,9 @@ body { background-color: transparent; }
 #table.has-games #tempty { top: 90dp; }
 #tempty.on { display: flex; flex-direction: column; align-items: center; justify-content: center; }
 .empty { display: flex; flex-direction: column; align-items: center; width: 460dp; }
-.empty .big-ic { font-family: Lucide; font-size: 46dp; line-height: 1; color: {empty-ic}; margin-bottom: 14dp; }
-.empty-title { font-size: 20dp; font-weight: 300; color: {g-on}; margin-bottom: 6dp; }
-.empty-text { color: {empty-text}; text-align: center; }
+.empty .big-ic { font-family: Lucide; font-size: 46dp; line-height: 1; color: #d6d5da; margin-bottom: 14dp; }
+.empty-title { font-size: 20dp; font-weight: 300; color: #ffffff; margin-bottom: 6dp; }
+.empty-text { color: #ecebef; text-align: center; }
 .empty-buttons { display: flex; flex-direction: row; margin-top: 16dp; }
 /* the buttons wear the game rows' look: the primary one the selected row's green glow, the others the plain row */
 .empty-buttons .btn {
@@ -259,10 +259,10 @@ body { background-color: transparent; }
 .gl.back { decorator: image(mem:pad-back contain); }
 .gl.start { decorator: image(mem:pad-start contain); }
 .hint { display: flex; flex: 0 0 auto; flex-direction: row; align-items: center; margin-right: 24dp; }
-.hl { margin-left: 8dp; font-family: Condensed; font-weight: 400; font-size: 15dp; line-height: 1; color: #2e2d30; white-space: nowrap; }
+.hl { margin-left: 8dp; font-family: Condensed; font-weight: 400; font-size: 15dp; line-height: 1; color: #ffffff; white-space: nowrap; filter: drop-shadow(#000000b0 0dp 1dp 1.5dp); }
 .key-hints { display: flex; flex-direction: row; align-items: center; flex: 0 0 auto; }
-.key-hints .ic { font-size: 24dp; color: {key-ic}; }
-.hint-dot { width: 3dp; height: 3dp; border-radius: 2dp; margin: 8dp 6dp 0 6dp; background-color: {key-ic}; }
+.key-hints .ic { font-size: 24dp; color: #ffffff; filter: drop-shadow(#000000b0 0dp 1dp 1.5dp); }
+.hint-dot { width: 3dp; height: 3dp; border-radius: 2dp; margin: 8dp 6dp 0 6dp; background-color: #ffffff; }
 .keycap {
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     height: 25dp; margin-left: 12dp; padding: 0 6dp; border: 1dp {key-border}; border-radius: 5dp;
@@ -366,15 +366,44 @@ body { background-color: transparent; }
 .mi:hover .mi-ic, .mi.hot .mi-ic, .mi:hover .mi-k, .mi.hot .mi-k { color: {sel-text}d0; }
 .mi.off:hover { color: {text-3}; decorator: none; box-shadow: none; }
 
-.dlg-title { height: 44dp; font-family: Condensed; font-size: 21dp; font-weight: 400; }
-.dlg-foot .btn { height: 31dp; border-radius: 6dp; font-family: Condensed; font-size: 18dp; font-weight: 400; }
-.dlg-foot .btn.primary, .dlg-foot .btn.primary:hover {
-    color: {sel-text}; border: 1.5dp {ac-edge}; border-color: {ac-edge}; background-color: transparent;
-    decorator: linear-gradient(180deg, {ac-lit} 0%, {ac-mid} 55%, {ac-low} 100%);
-    box-shadow: 0 0 0 1dp {ac-ring}, 0 0 12dp 2dp {ac-glow}90, inset 0 1dp 1dp 0 #ffffff40;
+/* the modal: a grey header under white text, the content white under #4f5655 text (inverted in the dark
+   theme), the main button a flat green, and under the block, as wide as it, the pad's hints */
+.dlg-wrap { display: flex; flex-direction: column; max-height: 92vh; animation: dialog-in 0.22s cubic-out; }
+.dialog {
+    flex: 0 1 auto; min-height: 0; max-height: 80vh; width: 100%; overflow: hidden;
+    background-color: {dlg-bg}; color: {dlg-text}; border: 1dp {dlg-border}; border-radius: 8dp; animation: none;
 }
-.dlg-foot .btn.primary:active { decorator: linear-gradient(180deg, {ac-end} 0%, {ac-low} 45%, {ac-mid} 100%); }
-.dlg-foot .btn.primary .ic { color: {sel-text}; }
+.dlg-title {
+    height: 44dp; color: #ffffff; font-family: Condensed; font-size: 21dp; font-weight: 400; border-bottom: 0;
+    decorator: linear-gradient(180deg, #889193, #4e5454);
+}
+.dlg-x { color: #ffffffd0; }
+.dlg-x:hover { background-color: #ffffff30; color: #ffffff; }
+.dlg-body { color: {dlg-text}; }
+.dlg-foot { background-color: transparent; border-top: 1dp {dlg-line}; border-radius: 0; }
+.dlg-hints { flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; height: 44dp; padding: 0 2dp; }
+.dlg-hints .hint { margin-right: 24dp; }
+.dlg-foot .btn { height: 31dp; border-radius: 6dp; font-family: Condensed; font-size: 18dp; font-weight: 400; background-color: {dlg-btn}; color: {dlg-text}; border-color: {dlg-btn-border}; }
+.dlg-foot .btn:hover { background-color: {dlg-btn-h}; }
+.dlg-foot .btn .ic { color: {dlg-text-2}; }
+/* what the dialogs' bodies draw, in the content's colours */
+.about-ver, .lic-text, .lic-tag { color: {dlg-text-2}; }
+.about-note { background-color: {dlg-soft}; color: {dlg-text-2}; }
+.lic { border-bottom: 1dp {dlg-line}; }
+.lic-tag { border-color: {dlg-btn-border}; }
+.mark-core { background-color: {dlg-bg}; }
+.stage .bar, .pbar { background-color: {dlg-line}; }
+.stage .nm, .prep-file { color: {dlg-text-3}; }
+.stage.now .nm, .errbox, .log .l.head { color: {dlg-text}; }
+.stage.done .nm, .log { color: {dlg-text-2}; }
+.log { border-color: {dlg-line}; background-color: {dlg-soft}; }
+.dlg-foot .btn.primary, .dlg-foot .btn.primary:hover {
+    color: #ffffff; border: 1dp #008001; background-color: #008001; font-weight: 500;
+}
+.dlg-foot .btn.primary:hover { background-color: #0a940b; border-color: #0a940b; }
+.dlg-foot .btn.primary:active { background-color: #006a01; border-color: #006a01; }
+.dlg-foot .btn.primary:focus-visible { border-color: #7be07c; box-shadow: 0 0 0 3dp #00800170; }
+.dlg-foot .btn.primary .ic { color: #ffffff; }
 
 /* nothing to list: no column heads over the empty state */
 #table.no-rows #thead { visibility: hidden; }

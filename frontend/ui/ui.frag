@@ -43,18 +43,14 @@ const vec3 BACKDROP_GREY[10] = vec3[](
     vec3(0.729, 0.722, 0.733), vec3(0.769, 0.757, 0.769));
 const float BACKDROP_AT[10] = float[](0.0, 0.12, 0.21, 0.29, 0.47, 0.58, 0.69, 0.81, 0.90, 1.0);
 
-// the light theme's: silver at the top, nearly white at the foot, the same stops
-const vec3 BACKDROP_LIGHT[10] = vec3[](
-    vec3(0.835, 0.835, 0.863), vec3(0.855, 0.855, 0.882), vec3(0.878, 0.878, 0.902), vec3(0.898, 0.898, 0.918),
-    vec3(0.922, 0.922, 0.937), vec3(0.937, 0.937, 0.949), vec3(0.949, 0.949, 0.957), vec3(0.961, 0.961, 0.969),
-    vec3(0.969, 0.969, 0.973), vec3(0.976, 0.976, 0.980));
+// the light theme's: one vertical gradient, #3e4241 at the top to #919191 at the foot
+const vec3 BACKDROP_LIGHT_TOP = vec3(0.243, 0.259, 0.255), BACKDROP_LIGHT_FOOT = vec3(0.569, 0.569, 0.569);
 
 vec3 backdrop_grey(float y) {
-    const bool light = draw.imode.y == 1; // set by the renderer for the light theme
-    vec3 c = light ? BACKDROP_LIGHT[0] : BACKDROP_GREY[0];
+    if (draw.imode.y == 1) return mix(BACKDROP_LIGHT_TOP, BACKDROP_LIGHT_FOOT, clamp(y, 0.0, 1.0)); // set by the renderer for the light theme
+    vec3 c = BACKDROP_GREY[0];
     for (int i = 1; i < 10; i++)
-        c = mix(c, light ? BACKDROP_LIGHT[i] : BACKDROP_GREY[i],
-                clamp((y - BACKDROP_AT[i - 1]) / (BACKDROP_AT[i] - BACKDROP_AT[i - 1]), 0.0, 1.0));
+        c = mix(c, BACKDROP_GREY[i], clamp((y - BACKDROP_AT[i - 1]) / (BACKDROP_AT[i] - BACKDROP_AT[i - 1]), 0.0, 1.0));
     return c;
 }
 

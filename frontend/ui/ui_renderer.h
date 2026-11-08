@@ -51,13 +51,11 @@ class Renderer final : public Rml::RenderInterface {
     // left, four greens at the right, tones of `tint`. `time` is the ribbons'
     // clock in seconds (a fixed value holds them still); `strength` 0 leaves
     // the gradient alone. Not `on`: nothing drawn, the base layer starts clear.
-    // `light` swaps the dark-to-silver gradient for a silver-to-white one, with the two greys' ribbons `greys`
-    // (the thick one's colour, then the thin one's) in place of the default dark pair.
+    // `light` is the light theme's gradient, #3e4241 to #919191, in place of the dark theme's.
     struct Backdrop {
         bool on = false, light = false;
         float time = 0, strength = 1;
         float tint[3] = {0.33f, 0.66f, 0.16f};
-        float greys[6] = {0.427f, 0.427f, 0.435f, 0.667f, 0.667f, 0.667f};
     };
     void set_backdrop(const Backdrop &backdrop);
     // Multisampling for the interface's layers (the stencil and the clip masks too): the most of 8, 4 and 2

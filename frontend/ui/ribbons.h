@@ -34,10 +34,7 @@ struct RibbonVertex {
 // ribbons' opacity (0 makes none). The vertices, the indices of the triangles
 // of the surface (in any order) and those of the edges' fringes; all three are
 // cleared first.
-// `greys` (two colours, six floats: the thick ribbon's and the thin one's) replaces the defaults, #6d6d6f and
-// #aaaaaa, which suit the dark backdrop; the light one wants paler ones.
 void build_ribbons(float time, uint32_t width, uint32_t height, const float tint[3], float alpha,
-                   std::vector<RibbonVertex> &vertices, std::vector<uint32_t> &body, std::vector<uint32_t> &fringe,
-                   const float *greys = nullptr);
+                   std::vector<RibbonVertex> &vertices, std::vector<uint32_t> &body, std::vector<uint32_t> &fringe);
 
 } // namespace xf::ui

@@ -209,12 +209,13 @@ Palette palette(bool dark, const Accent &accent) {
                     {"{button-hover}", "#f0f0f1"}, {"{input}", "#ffffff"},     {"{menu}", "#fbfbfb"},
                     {"{menu-border}", "#d5d6da"}, {"{shadow}", "#0000003a"},   {"{good}", "#2f8f4e"},
                     {"{warn}", "#a86e00"},        {"{bad}", "#c4373d"},        {"{scroll}", "#0000002b"},
-                    {"{scroll-hover}", "#00000048"}, {"{overlay}", "#00000030"}, {"{dialog}", "#fbfbfb"},
+                    {"{scroll-hover}", "#00000048"}, {"{overlay}", "#00000060"}, {"{dialog}", "#fbfbfb"},
                     {"{sel}", hex_of(r, g, b, 0x2c)}, {"{sel-strong}", hex_of(r, g, b, 0x48)}, {"{link}", accent.lo}};
 
     // The console's look (launcher.rcss and settings.rcss: glass over the backdrop, glossy buttons, let-in slots):
     // dark is the original, grey glass under white text over the dark-to-silver gradient; light is pearl glass under
-    // graphite text over a silver-to-white one. A value may name the accent's tones ({ac-edge}...), which are applied
+    // graphite text over a #3e4241-to-#919191 one (what sits straight on the backdrop is white in both: the column
+    // heads, the group titles, the hints). A value may name the accent's tones ({ac-edge}...), which are applied
     // after these.
     struct Pair {
         const char *token, *dark, *light;
@@ -223,9 +224,7 @@ Palette palette(bool dark, const Accent &accent) {
         // text over the backdrop and the glass, from strongest to faintest
         {"{g-text}", "#f6f6f6", "#1d1d20"},        {"{g-text-1}", "#e0dfe4", "#3a3a40"},     {"{g-text-2}", "#c8c8cc", "#55555c"},
         {"{g-text-3}", "#8d8c92", "#85858c"},      {"{g-ic}", "#c4c3c9", "#55555c"},         {"{g-on}", "#ffffff", "#0b0b0d"},
-        {"{th}", "#f0f0f2", "#26262a"},            {"{g-line}", "#ffffff50", "#00000033"},   {"{g-bad}", "#ff8a80", "#c4373d"},
-        {"{g-link}", "#9fd98a", "#1f7a35"},        {"{bad-ic}", "#ff7a6e", "#d03a36"},       {"{empty-ic}", "#d6d5da", "#55555c"},
-        {"{empty-text}", "#ecebef", "#3a3a40"},
+        {"{g-bad}", "#ff8a80", "#c4373d"},         {"{g-link}", "#9fd98a", "#1f7a35"},       {"{bad-ic}", "#ff7a6e", "#d03a36"},
         // text on the selected row and the focused setting (the accent's glossy green, in both themes)
         {"{sel-text}", "#f6f6f6", "#ffffff"},      {"{sel-sub}", "#c8c8cc", "#f0f0f0"},      {"{sel-hint}", "#e8ffe0", "#f4fff0"},
         {"{bset}", "#e8ffe0", "#3a3a40"},
@@ -274,7 +273,11 @@ Palette palette(bool dark, const Accent &accent) {
         // the keys' caps and the hint bar's icons
         {"{key-0}", "#3b3a3b", "#ffffff"},         {"{key-1}", "#232223", "#e6e6ea"},        {"{key-border}", "#777677", "#a8a8b0"},
         {"{key-text}", "#ffffff", "#1d1d20"},      {"{key-mod}", "#c8c8cc", "#6a6a72"},      {"{key-press}", "{ac-edge}", "{accent-lo}"},
-        {"{key-ic}", "#ffffff", "#3a3a40"},
+        // the modals' content: white under #4f5655 text in the light theme, inverted in the dark one
+        {"{dlg-bg}", "#4f5655", "#ffffff"},        {"{dlg-text}", "#ffffff", "#4f5655"},     {"{dlg-text-2}", "#d3d8d7", "#7b8382"},
+        {"{dlg-text-3}", "#b3bab9", "#9aa1a0"},    {"{dlg-line}", "#ffffff2e", "#e3e6e6"},   {"{dlg-soft}", "#ffffff18", "#f1f3f3"},
+        {"{dlg-border}", "#2f3534", "#b9bfbf"},    {"{dlg-btn}", "#646c6b", "#ffffff"},      {"{dlg-btn-h}", "#6f7877", "#f0f2f2"},
+        {"{dlg-btn-border}", "#7f8887", "#c4c9c9"},
         // the accent's swatches
         {"{sw}", "#ffffff50", "#00000040"},        {"{sw-hover}", "#ffffffb0", "#00000090"}, {"{sw-on}", "#ffffff", "#1d1d20"},
         {"{sw-halo}", "#ffffff50", "#00000040"},

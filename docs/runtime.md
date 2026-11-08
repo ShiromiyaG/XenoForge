@@ -1817,10 +1817,15 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   made; changing it makes the document again. The accent's glossy greens
   (`{ac-*}`, tones of the accent from `accent_from_hex`) fill the selected
   row, the focused setting, the main buttons and the menus' hot item. Dark is
-  grey glass under white text over the dark-to-silver backdrop; light is
-  pearl glass under graphite text over a silver-to-white one, with paler grey
-  ribbons (`Backdrop::light` and `greys`: `ui.frag` takes the ramp from
-  `imode.y`).
+  grey glass over the dark-to-silver backdrop; light is pearl glass under
+  graphite text over a plain `#3e4241`-to-`#919191` one (`Backdrop::light`:
+  `ui.frag` takes the ramp from `imode.y`). What sits straight on the backdrop
+  (column heads, group titles, the hints at the foot, which carry a dark
+  `drop-shadow` for relief) is white in both. The modals are the same in both
+  but for their content: a `#889193`-to-`#4e5454` header under white text, the
+  content white under `#4f5655` text (inverted in the dark theme), the main
+  button a flat `#008001`, and under the block, as wide as it, the pad's
+  A Select and B Back (`dialog_html`).
 - **Icons**: Lucide (ISC; `ui/fonts/Lucide.ttf`, its license beside it), a
   font of outline icons drawn as text; `{i:name}` in a template and
   `icon_html()` give its glyphs (`launcher_html.cpp` lists the ones used).

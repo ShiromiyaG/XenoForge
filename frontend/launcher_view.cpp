@@ -244,12 +244,7 @@ void LauncherView::update_backdrop() {
     backdrop.time = float(backdrop_clock_);
     backdrop.strength = l.backdrop == "off" ? 0.f : 1.f;
     backdrop.tint[0] = float(r) / 255.f, backdrop.tint[1] = float(g) / 255.f, backdrop.tint[2] = float(b) / 255.f;
-    // the light theme: a silver-to-white gradient with paler grey ribbons (the dark one keeps the defaults)
-    if (!dark_) {
-        backdrop.light = true;
-        const float greys[6] = {0.702f, 0.702f, 0.729f, 0.812f, 0.812f, 0.835f}; // #b3b3ba, #cfcfd5
-        std::copy(greys, greys + 6, backdrop.greys);
-    }
+    backdrop.light = !dark_; // the light theme's gradient (#3e4241 to #919191)
     renderer_.set_backdrop(backdrop);
     renderer_.set_msaa(l.smooth_edges ? 4 : 1);
 }

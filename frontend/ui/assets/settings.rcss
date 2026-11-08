@@ -13,17 +13,17 @@
 
 #scope { flex: 0 0 auto; padding: 10dp 8.8% 0 8.8%; }
 #scope .scope-text { padding: 4dp 8dp 0 8dp; }
-#scope .scope-text .name { font-family: Condensed; font-size: 22dp; color: {g-on}; }
-#scope .scope-text .hint { display: block; margin: 0; font-family: Condensed; font-size: 15dp; color: {g-text-1}; }
+#scope .scope-text .name { font-family: Condensed; font-size: 22dp; color: #ffffff; }
+#scope .scope-text .hint { display: block; margin: 0; font-family: Condensed; font-size: 15dp; color: #e0dfe4; }
 
 #pages { flex: 1 1 0; min-height: 0; padding: 4dp 8.8% 18dp 8.8%; overflow-y: auto; overflow-x: hidden; }
 #pages .page { position: relative; } /* (left: a tab's page comes in from the side, SettingsView::slide_page_in) */
 #pages .group { margin-top: 14dp; }
 #pages .group-title {
-    margin-bottom: 8dp; padding: 0 0 5dp 4dp; border-bottom: 1dp {g-line};
-    font-family: Condensed; font-size: 19.5dp; line-height: 1; color: {g-on}; text-transform: uppercase;
+    margin-bottom: 8dp; padding: 0 0 5dp 4dp; border-bottom: 1dp #ffffff50;
+    font-family: Condensed; font-size: 19.5dp; line-height: 1; color: #ffffff; text-transform: uppercase;
 }
-#pages .group-note { margin: 2dp 0 0 8dp; font-family: Condensed; font-size: 15dp; color: {g-text-1}; }
+#pages .group-note { margin: 2dp 0 0 8dp; font-family: Condensed; font-size: 15dp; color: #e0dfe4; }
 
 /* a row: the games' rows, shorter; the one with focus is the selected row's green */
 #spage .setting, #spage .bind {
@@ -170,4 +170,4 @@
 /* the hints at the foot: the note between the pad's and the keyboard's */
 /* (the buttons keep their size; the note takes what is left and is cut short, then gone, as the window narrows) */
 #shints .pad-hints { flex: 0 0 auto; }
-#shints .note { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-align: center; font-family: Condensed; font-size: 15dp; color: #2e2d30; }
+#shints .note { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-align: center; font-family: Condensed; font-size: 15dp; color: #ffffff; filter: drop-shadow(#000000b0 0dp 1dp 1.5dp); }
