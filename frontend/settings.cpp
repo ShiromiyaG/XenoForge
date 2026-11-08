@@ -82,6 +82,13 @@ void read_sections(const toml::table &t, Settings &s) {
     s.input.left_deadzone = std::clamp(s.input.left_deadzone, 0.0, 1.0);
     s.input.right_deadzone = std::clamp(s.input.right_deadzone, 0.0, 1.0);
     get(t, "input", "vibration", s.input.vibration);
+    get(t, "saves", "format", s.saves.format);
+    get(t, "saves", "root", s.saves.root);
+    get(t, "profile", "gamertag", s.profile.gamertag);
+    get(t, "profile", "xuid", s.profile.xuid);
+    if (auto *names = t["profile"]["names"].as_table())
+        for (auto &[key, value] : *names)
+            if (auto v = value.value<std::string>()) s.profile.names[std::string(key.str())] = *v;
     auto integer = [&](const char *key, int &into) {
         int64_t v = into;
         get(t, "system", key, v);
@@ -108,7 +115,17 @@ void read_sections(const toml::table &t, Settings &s) {
         }
 }
 
+toml::table player_table(const Settings &s) {
+    return toml::table{{"screenshots", s.screenshots}, {"follow_launches", s.follow_launches}};
+}
+
 void write_sections(toml::table &t, const Settings &s) {
+    t.insert_or_assign("saves", toml::table{{"format", s.saves.format}, {"root", s.saves.root}});
+    toml::table names;
+    for (const auto &[xuid, name] : s.profile.names) names.insert_or_assign(xuid, name);
+    t.insert_or_assign("profile", toml::table{{"gamertag", s.profile.gamertag},
+                                              {"xuid", s.profile.xuid},
+                                              {"names", std::move(names)}});
     toml::table keys;
     for (const Binding &b : BINDINGS) keys.insert(b.name, s.keys.at(b.name));
     t.insert_or_assign("video", toml::table{{"fullscreen", s.video.fullscreen},
@@ -198,6 +215,7 @@ bool load(const std::filesystem::path &path, Settings &s, std::string &error, co
     }
     read_sections(t, s);
     get(t, "player", "screenshots", s.screenshots);
+    get(t, "player", "follow_launches", s.follow_launches);
     read_launcher(t, s.launcher);
     if (!title.empty())
         if (const toml::table *own = t["games"][title].as_table()) {
@@ -211,7 +229,7 @@ bool save(const std::filesystem::path &path, const Settings &s, std::string &err
     toml::table t = read_file(path);
     if (s.game.empty()) {
         write_sections(t, s);
-        t.insert_or_assign("player", toml::table{{"screenshots", s.screenshots}});
+        t.insert_or_assign("player", player_table(s));
         t.insert_or_assign("launcher", launcher_table(s.launcher));
     } else {
         // a new file gets the shared defaults beside the game's, so it has
@@ -219,7 +237,7 @@ bool save(const std::filesystem::path &path, const Settings &s, std::string &err
         if (!t.contains("video")) {
             Settings shared;
             write_sections(t, shared);
-            t.insert_or_assign("player", toml::table{{"screenshots", s.screenshots}});
+            t.insert_or_assign("player", player_table(s));
             t.insert_or_assign("launcher", launcher_table(s.launcher));
         }
         if (!t["games"].as_table()) t.insert_or_assign("games", toml::table{});

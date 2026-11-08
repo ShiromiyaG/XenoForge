@@ -2,6 +2,9 @@
 
 #include "launcher_html.h"
 
+#include "console_options.h"
+#include "system_ui.h"
+
 #include <cstdio>
 #include <cstring>
 
@@ -97,6 +100,15 @@ std::string group(const std::string &title, const std::string &rows, const std::
     std::string s = "<div class=\"group\"><div class=\"group-title\">" + e(title) + "</div>" + rows;
     if (!note.empty()) s += "<div class=\"group-note\">" + e(note) + "</div>";
     return s + "</div>";
+}
+
+std::string utf16_to_utf8(const std::u16string &text) { return xf::frontend::utf8_of(text); }
+
+// the gamertag of the profile the games use
+std::string selected_gamertag_of(const SettingsPage &page) {
+    for (const ProfileEntry &p : page.profiles)
+        if (p.selected && !p.name.empty()) return p.name;
+    return page.settings->profile.gamertag;
 }
 
 std::string label_of(const std::vector<Choice> &choices, const std::string &value) {
@@ -315,17 +327,17 @@ std::string prepare_body_html(const std::string &title, const std::string &icon,
 // the settings window
 
 const char *settings_tab_label(SettingsTab tab) {
-    static const char *labels[] = {"Video", "Sound", "Controllers", "Keyboard", "Interface"};
+    static const char *labels[] = {"Video", "Sound", "Controllers", "Keyboard", "System", "Profile", "Interface"};
     return labels[int(tab)];
 }
 
 const char *settings_tab_name(SettingsTab tab) {
-    static const char *names[] = {"video", "sound", "controllers", "keyboard", "interface"};
+    static const char *names[] = {"video", "sound", "controllers", "keyboard", "system", "profile", "interface"};
     return names[int(tab)];
 }
 
 std::string settings_tabs_html(SettingsTab current) {
-    static const char *icons[] = {"monitor", "volume-2", "gamepad-2", "keyboard", "sliders-horizontal"};
+    static const char *icons[] = {"monitor", "volume-2", "gamepad-2", "keyboard", "cpu", "hard-drive", "sliders-horizontal"};
     std::string s;
     for (int i = 0; i < SETTINGS_TABS; i++)
         s += std::string("<div class=\"tab f") + (i == int(current) ? " active" : "") + "\" data-action=\"tab\" data-arg=\"" +
@@ -422,6 +434,74 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
             s += group(name, list);
         }
         s += "<div class=\"page-buttons\">" + button_html("default-keys", "Use Xenia's keys", false, {}, "refresh-cw") + "</div>";
+        break;
+    }
+    case SettingsTab::System: {
+        std::string rows = select_row("system.language", "Language", "What games show their menus in.",
+                                      languages()[index_of(languages(), st.system.language)].name);
+        rows += select_row("system.country", "Country or region", "Where the console says it is: some games choose content by it.",
+                           countries()[index_of(countries(), st.system.country)].name);
+        s += group("Region", rows);
+        std::string video = select_row("system.resolution", "Resolution", "The screen the console says is attached.",
+                                       resolutions()[index_of(resolutions(), resolution_of(st.system))].name);
+        video += select_row("system.widescreen", "Aspect ratio", "The console's 4:3 or 16:9 video flag.",
+                            widescreen_modes()[index_of(widescreen_modes(), st.system.widescreen)].name);
+        video += select_row("system.refresh", "Refresh rate", "50 or 60 Hz, as a PAL or an NTSC console.",
+                            refresh_rates()[index_of(refresh_rates(), st.system.refresh)].name);
+        s += group("Video", video, "Games read these when they start; a game that is running keeps what it read.");
+        break;
+    }
+    case SettingsTab::Profile: {
+        const std::string &confirm = page.confirm_delete;
+        std::string list;
+        for (const ProfileEntry &p : page.profiles) {
+            list += std::string("<div class=\"profile-row") + (p.selected ? " current" : "") + "\"><div class=\"pname nowrap\">" +
+                    e(p.name.empty() ? std::string("(no gamertag)") : p.name) + (p.selected ? "  (used by the games)" : "") + "</div><div class=\"pid\">" +
+                    e(p.xuid) + "</div>";
+            if (!p.selected)
+                list += "<div class=\"btn f\" data-action=\"profile-use\" data-arg=\"" + p.xuid + "\"><div class=\"btn-l\">Use</div></div>";
+            if (confirm == p.xuid)
+                list += "<div class=\"btn f primary\" data-action=\"profile-delete\" data-arg=\"" + p.xuid +
+                        "\"><div class=\"btn-l\">Delete it and its saves?</div></div><div class=\"btn f\" data-action=\"profile-keep\"><div class=\"btn-l\">Keep</div></div>";
+            else
+                list += "<div class=\"btn f\" data-action=\"profile-delete\" data-arg=\"" + p.xuid + "\"><div class=\"btn-l\">Delete</div></div>";
+            list += "</div>";
+        }
+        if (page.profiles.empty())
+            list += "<div class=\"profile-row\"><div class=\"pname dim\">No profile yet: the first game that runs makes the console's default one.</div></div>";
+        s += group("Profiles", list,
+                   "A profile is a folder of the storage root with its saves and achievements. The game uses the one marked; "
+                   "changing it takes a restart of the game.");
+        std::string name = "<div class=\"folder-row\"><input type=\"text\" id=\"gamertag-input\" class=\"text f\" maxlength=\"15\" value=\"" +
+                           e(selected_gamertag_of(page)) + "\" placeholder=\"Gamertag\"/>" +
+                           button_html("profile-rename", "Rename", false, {}, "check") + "</div>";
+        name += "<div class=\"folder-row\"><input type=\"text\" id=\"new-profile-input\" class=\"text f\" maxlength=\"15\" value=\"\" "
+                "placeholder=\"A new profile's gamertag\"/>" +
+                button_html("profile-create", "Create", false, {}, "check") + "</div>";
+        if (!page.profile_message.empty()) name += "<div class=\"pmsg\" id=\"profile-message\">" + e(page.profile_message) + "</div>";
+        else name += "<div class=\"pmsg\" id=\"profile-message\"></div>";
+        s += group("Gamertag", name, "1 to 15 letters, digits and spaces; it starts with a letter and has no double spaces. The games show it from the next start.");
+        s += group("Saves", select_row("saves.format", "Format", "STFS packages are what the console keeps; folders are Xenia's layout.",
+                                       st.saves.format == "directory" ? "Folders (Xenia's)" : "STFS packages (the console's)"));
+        std::string ach;
+        if (page.game_title.empty()) {
+            ach = "<div class=\"profile-row\"><div class=\"pname dim\">Select a game to see its achievements.</div></div>";
+        } else if (page.achievements.empty()) {
+            ach = "<div class=\"profile-row\"><div class=\"pname dim\">" +
+                  e(page.achievements_read ? "This game lists no achievements." : "None yet: the profile has no record of this game until it runs.") + "</div></div>";
+        } else {
+            uint32_t earned = 0, total = 0;
+            for (const auto &a : page.achievements) {
+                total += a.gamerscore;
+                if (a.unlocked) earned += a.gamerscore;
+                ach += std::string("<div class=\"ach") + (a.unlocked ? "" : " locked") + "\"><div class=\"ach-icon\">" + (a.unlocked ? icon_html("check") : std::string()) +
+                       "</div><div class=\"ach-text\"><div class=\"ach-name\">" + e(utf16_to_utf8(a.label)) + "  " + std::to_string(a.gamerscore) + " G" +
+                       "</div><div class=\"dim\">" + e(utf16_to_utf8(a.unlocked || a.unachieved.empty() ? a.description : a.unachieved)) + "</div></div></div>";
+            }
+            ach = "<div class=\"profile-row\"><div class=\"pname\">" + std::to_string(earned) + " / " + std::to_string(total) + " G earned</div></div>" + ach;
+        }
+        s += group("Achievements" + (page.game_title.empty() ? std::string() : " - " + page.game_title), ach,
+                   "Read from the selected profile's record; the game writes it as the player earns them.");
         break;
     }
     case SettingsTab::Interface: {

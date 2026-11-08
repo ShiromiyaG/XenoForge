@@ -29,6 +29,8 @@ add_library(xenoforge STATIC
     src/disc.cpp
     src/package.cpp
     src/package_write.cpp
+    src/kernel/gpd.cpp
+    src/profile_gpd.cpp
     src/exports.cpp
     src/xex.cpp
     src/lzx.cpp
@@ -179,6 +181,7 @@ target_link_libraries(xfbuild PRIVATE xenoforge_vk xenoforge)
 # The kernel (step A4; docs/runtime.md): an object library, so every
 # export's registration (XF_EXPORT, a static initializer) is linked in.
 file(GLOB XF_KERNEL_SOURCES CONFIGURE_DEPENDS src/kernel/*.cpp)
+list(REMOVE_ITEM XF_KERNEL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/kernel/gpd.cpp) # (in the core: the launcher reads GPDs too)
 add_library(xenoforge_kernel OBJECT ${XF_KERNEL_SOURCES})
 target_link_libraries(xenoforge_kernel PUBLIC xenoforge ${CMAKE_DL_LIBS}) # (dladdr and dlopen on POSIX: crash.cpp, port_module.cpp)
 # the console's own XAM (the player's system update) as the oracle for ours
@@ -364,6 +367,7 @@ if(XF_PLAYER AND TARGET boot)
         DEPENDS frontend/front_buffer.comp
         COMMENT "glslc front_buffer.comp")
     add_library(xf_frontend STATIC frontend/settings.cpp frontend/presenter.cpp frontend/sdl_input.cpp
+                                   frontend/profiles.cpp frontend/console_options.cpp frontend/system_ui.cpp
                                    frontend/sdl_audio.cpp frontend/library.cpp frontend/launcher_core.cpp
                                    ${XF_SHADER_OUT}/front_buffer.comp.inc)
     target_include_directories(xf_frontend PRIVATE ${XF_SHADER_OUT})
@@ -374,7 +378,8 @@ if(XF_PLAYER AND TARGET boot)
     endif()
     # the player as a library (frontend/player.cpp's run_player; a port's player_<name> links it) and the
     # generic player, which carries no game code
-    add_library(xenoforge_player STATIC frontend/player.cpp tools/game.cpp)
+    add_library(xenoforge_player STATIC frontend/player.cpp frontend/system_ui_view.cpp frontend/overlay_system.cpp
+                                        tools/game.cpp)
     target_link_libraries(xenoforge_player PUBLIC xf_frontend xf_imgui xenoforge_vk xenoforge PRIVATE stb)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(xenoforge_player PRIVATE -Wno-missing-field-initializers)
@@ -422,6 +427,11 @@ if(XF_PLAYER AND TARGET boot)
     add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
     target_link_libraries(frontend_test PRIVATE xf_ui xf_frontend xenoforge_kernel xenoforge_vk)
     add_test(NAME frontend COMMAND frontend_test)
+    # the player's system UI without a window: the dialogs' model, the profiles, the kernel's exports through the handler
+    add_executable(system_ui_test tests/system_ui_test.cpp tools/game.cpp)
+    target_include_directories(system_ui_test PRIVATE src/kernel)
+    target_link_libraries(system_ui_test PRIVATE xf_frontend xenoforge_kernel xenoforge_vk xenoforge)
+    add_test(NAME system_ui COMMAND system_ui_test)
     # the batch compatibility run (tools/xfcompat.cpp): the discs of a folder prepared and booted, a row each.
     # It reads the discs with the launcher's library and runs boot with SDL3's process calls, so it is built
     # with the player (which brings SDL3); its rows and the parser of boot's output are compat_test's.

@@ -117,3 +117,15 @@
 }
 #sfoot .note { flex: 1 1 0; color: {text-3}; font-size: 12dp; }
 #sfoot .btn { margin-left: 8dp; }
+
+/* the Profile tab: the profiles, the gamertag, the achievements */
+.profile-row { display: flex; flex-direction: row; align-items: center; padding: 4dp 6dp; }
+.profile-row .pname { flex: 1 1 0; }
+.profile-row .pid { color: {text-3}; font-size: 12dp; margin-right: 8dp; }
+.profile-row .btn { margin-left: 6dp; }
+.profile-row.current .pname { font-weight: 500; }
+.pmsg { margin: 2dp 0 4dp 6dp; color: {bad}; }
+.ach { display: flex; flex-direction: row; align-items: center; padding: 4dp 6dp; }
+.ach-icon { width: 40dp; height: 40dp; margin-right: 10dp; border-radius: 4dp; background-color: {button-hover}; }
+.ach-text { flex: 1 1 0; }
+.ach.locked .ach-name { color: {text-2}; }

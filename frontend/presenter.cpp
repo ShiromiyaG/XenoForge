@@ -110,11 +110,11 @@ bool Presenter::open(vk::Device &device, std::string &error) {
         vkCreateFence(dev_, &fci, nullptr, &f.fence);
         vkCreateSemaphore(dev_, &sci, nullptr, &f.acquired);
     }
-    // the overlay's textures (Dear ImGui's font)
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16};
+    // the overlay's textures: Dear ImGui's font and the achievements' icons
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpi.maxSets = 16;
+    dpi.maxSets = 64;
     dpi.poolSizeCount = 1;
     dpi.pPoolSizes = &size;
     vkCreateDescriptorPool(dev_, &dpi, nullptr, &overlay_pool_);

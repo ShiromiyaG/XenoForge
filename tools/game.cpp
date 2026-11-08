@@ -652,6 +652,39 @@ bool parse_numbers(const std::string &list, std::set<uint64_t> &out) {
     return true;
 }
 
+std::string disc_path(std::string path) {
+    std::string lower = path;
+    for (char &ch : lower) ch = char(std::tolower((unsigned char)ch));
+    for (const char *prefix : {"game:", "d:", "\\device\\cdrom0", "\\device\\harddisk0\\cdrom0"}) {
+        size_t n = std::strlen(prefix);
+        if (lower.compare(0, n, prefix) != 0) continue;
+        path = path.substr(n);
+        while (!path.empty() && (path[0] == '\\' || path[0] == '/')) path.erase(0, 1);
+        for (char &ch : path)
+            if (ch == '\\') ch = '/';
+        return path;
+    }
+    return {};
+}
+
+std::vector<std::string> relaunch_args(const std::vector<std::string> &args,
+                                       const std::vector<std::pair<std::string, std::string>> &replace) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < args.size(); i++) {
+        bool dropped = false;
+        for (const auto &r : replace)
+            if (i > 0 && args[i] == r.first) {
+                dropped = true;
+                if (i + 1 < args.size()) i++;
+                break;
+            }
+        if (!dropped) out.push_back(args[i]);
+    }
+    for (const auto &r : replace)
+        if (!r.second.empty()) out.insert(out.end(), {r.first, r.second});
+    return out;
+}
+
 bool parse_press(const std::string &text, Press &out, std::string &error) {
     static const std::map<std::string, uint16_t> buttons = {
         {"a", input::A},

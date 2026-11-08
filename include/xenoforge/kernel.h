@@ -257,6 +257,43 @@ using UiDone = std::function<void(const UiResult &)>;
 using UiHandler = std::function<bool(const UiRequest &, UiDone done)>;
 void set_ui_handler(Kernel &k, UiHandler handler);
 
+// What a host that draws notifications shows: an achievement the title unlocked (its name, its gamerscore, the icon
+// as the SPA's PNG when it has one) and the text of XNotifyQueueUI. Called from the guest's threads with no kernel
+// lock held; it must not block. With no handler they are only logged.
+struct Toast {
+    enum class Kind { Achievement, Notice } kind = Kind::Notice;
+    std::u16string title, text; // an achievement's name and description; a notice's text (title empty)
+    uint32_t gamerscore = 0;    // an achievement's
+    std::vector<uint8_t> icon;  // an achievement's icon, PNG bytes (none when the SPA has no such image)
+};
+using ToastHandler = std::function<void(const Toast &)>;
+void set_toast_handler(Kernel &k, ToastHandler handler);
+
+// The profile a host shows (its gamer card, its achievements page): the user, and the running title's achievements
+// as the user's GPD for it holds them (a locked one for each the SPA lists), with their icons as PNG bytes.
+struct ProfileAchievement {
+    uint32_t id = 0, gamerscore = 0, image_id = 0;
+    bool unlocked = false;
+    uint64_t unlock_time = 0; // FILETIME
+    std::u16string label, description, unachieved;
+    std::vector<uint8_t> icon;
+};
+struct ProfileSummary {
+    std::string gamertag;
+    uint64_t xuid = 0;
+    bool signed_in = false;
+    uint32_t title_id = 0;
+    std::vector<ProfileAchievement> achievements;
+    uint32_t gamerscore = 0;       // the earned ones' sum, in this title
+    uint32_t gamerscore_total = 0; // all the title's
+};
+ProfileSummary profile_summary(Kernel &k);
+// The user's gamertag (config.toml's), before the title runs
+void set_gamertag(Kernel &k, const std::string &name);
+// The user a profile is: its XUID (the directory its saves and GPDs are under) and gamertag, set before the title runs;
+// a zero XUID leaves the one the storage root has (the first profile found, else the default).
+void set_user(Kernel &k, uint64_t xuid, const std::string &name);
+
 // The launch data the next title finds through XamLoaderGetLaunchData (what
 // the title before it set with XamLoaderSetLaunchData; Kernel::title_exit),
 // set before the title runs.

@@ -153,6 +153,16 @@ struct Rates {
 };
 void print_rates(Game &game, Rates &rates, double wall_seconds, const std::string &extra = {});
 
+// A path the guest launches (kernel::Kernel::title_exit.path) as the path on the disc --xex takes: the device
+// prefix (game:, d:, \Device\Cdrom0) dropped, slashes forward; "" for the dashboard or a path that is not on the disc.
+std::string disc_path(std::string path);
+// The command line of the process that runs the title this one launched (boot --follow-launches, the player's
+// follow_launches): `args` as this process got them (argv[0] first) without the options named in `replace` (each
+// with its value), then those with a value appended with it (an empty value only drops the option). What decides which title follows is
+// disc_path; how it is started (a process here, in the launcher's process on Android) is the caller's.
+std::vector<std::string> relaunch_args(const std::vector<std::string> &args,
+                                       const std::vector<std::pair<std::string, std::string>> &replace);
+
 // "300,301,890-910": numbers and ranges of them
 bool parse_numbers(const std::string &list, std::set<uint64_t> &out);
 

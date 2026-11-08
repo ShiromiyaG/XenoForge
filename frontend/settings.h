@@ -65,6 +65,21 @@ struct Settings {
         int widescreen = -1;
         int refresh = 0;
     } system;
+    // how new saves are kept, in [saves]: "stfs" (the console's own packages, the default) or "directory" (Xenia's
+    // layout: a folder of files)
+    struct Saves {
+        std::string format = "stfs";
+        std::string root; // the storage root (content/, cache*/): "" for storage/ beside config.toml
+    } saves;
+    // the profiles, in [profile]: the one the games use (its XUID as 16 hex digits, "" for the first the storage has)
+    // and its gamertag ("" for the default), and every profile's gamertag by XUID in [profile.names]
+    struct Profile {
+        std::string gamertag, xuid;
+        std::map<std::string, std::string> names;
+    } profile;
+    // [player]: when a title launches another (XamLoaderLaunchTitle), the player restarts on the executable it
+    // launched, from the same disc, as boot's --follow-launches does
+    bool follow_launches = true;
     // the port's options (run.h's PortOption) by key, in config.toml's [port]
     std::map<std::string, std::variant<bool, int64_t, double>> port;
     // each binding's keys, space-separated (BINDINGS' names)

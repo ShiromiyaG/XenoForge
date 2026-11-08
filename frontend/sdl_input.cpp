@@ -54,7 +54,7 @@ class PadDriver final : public Driver {
         std::lock_guard<std::mutex> lock(c_.mutex_);
         Controllers::Pad &p = c_.pads_[user];
         if (!p.sdl) return DEVICE_NOT_CONNECTED;
-        Gamepad pad = combine(p.state, c_.overlay(user, now_ms));
+        Gamepad pad = c_.pads_taken_ ? Gamepad{} : combine(p.state, c_.overlay(user, now_ms));
         // the packet moves when the state does (a scripted press too)
         if (p.changed || !(pad == last_[user])) p.packet++, p.changed = false;
         last_[user] = pad;
@@ -76,7 +76,7 @@ class PadDriver final : public Driver {
         std::lock_guard<std::mutex> lock(c_.mutex_);
         Controllers::Pad &p = c_.pads_[user];
         if (!p.sdl) return DEVICE_NOT_CONNECTED;
-        return p.keys.next(combine(p.state, c_.overlay(user, now_ms)), user, now_ms, out);
+        return p.keys.next(c_.pads_taken_ ? Gamepad{} : combine(p.state, c_.overlay(user, now_ms)), user, now_ms, out);
     }
 
   private:

@@ -267,7 +267,8 @@ int main() {
         page.settings = &own, page.accent = "#ff7a45", page.theme = "system";
         std::string settings;
         for (int i = 0; i < frontend::SETTINGS_TABS; i++) settings += frontend::settings_page_html(frontend::SettingsTab(i), page);
-        for (const char *key : {"video.fullscreen", "video.aspect", "audio.volume", "audio.mute", "input.vibration", "input.keyboard", "theme"})
+        for (const char *key : {"video.fullscreen", "video.aspect", "audio.volume", "audio.mute", "input.vibration", "input.keyboard", "theme", "system.language", "system.country",
+                                 "system.resolution", "system.widescreen", "system.refresh", "saves.format"})
             CHECK(settings.find(std::string("data-key=\"") + key + "\"") != std::string::npos);
         size_t binds = 0;
         for (size_t at = settings.find("data-action=\"capture\""); at != std::string::npos; at = settings.find("data-action=\"capture\"", at + 1)) binds++;

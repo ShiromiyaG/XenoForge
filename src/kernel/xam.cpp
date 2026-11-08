@@ -282,6 +282,16 @@ const User *user_by_xuid(Kernel &k, uint64_t xuid) {
 
 const User &user_profile(Kernel &k) { return xam(k).user; }
 
+// (a gamertag: 15 characters at most, as the console's accounts have)
+void set_gamertag(Kernel &k, const std::string &name) {
+    if (!name.empty()) xam(k).user.name = name.substr(0, 15);
+}
+
+void set_user(Kernel &k, uint64_t xuid, const std::string &name) {
+    if (xuid) xam(k).user.xuid = xuid;
+    set_gamertag(k, name);
+}
+
 bool set_signed_in(Kernel &k, bool signed_in) { return xam(k).signed_out.exchange(!signed_in) == signed_in; }
 
 uint32_t title_id(Kernel &k) { return k.xex() ? k.xex()->execution.title_id : 0; }

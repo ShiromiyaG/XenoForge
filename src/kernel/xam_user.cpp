@@ -474,10 +474,37 @@ namespace {
 // The running title's SPA, read once from its executable's resources (lock held)
 const Gpd &title_spa(Kernel &k, UserState &s) {
     if (s.spa_read) return s.spa;
-    s.spa_read = true;
     ppc::Context *c = Kernel::current_context();
     uint32_t module = k.load32(k.variable("XexExecutableModuleHandle"));
+    if (!c && module && k.xex()) {
+        // a host's thread has no guest context to call the export with: it reads the executable's resource table
+        // (its header's RESOURCE_INFO: a size, then 16-byte entries of name, address, size) itself
+        const Xex &x = *k.xex();
+        auto be32 = [&](size_t at) {
+            return at + 4 <= x.header.size() ? uint32_t(x.header[at]) << 24 | uint32_t(x.header[at + 1]) << 16 |
+                                                   uint32_t(x.header[at + 2]) << 8 | x.header[at + 3]
+                                             : 0u;
+        };
+        char want[9];
+        std::snprintf(want, sizeof(want), "%08X", title_id(k));
+        for (const auto &[key, offset] : x.opt_headers) {
+            if (key != xex_key::RESOURCE_INFO) continue;
+            for (uint32_t i = 0, count = (be32(offset) - 4) / 16; i < count && i < 64; i++) {
+                size_t entry = offset + 4 + 16 * size_t(i);
+                if (entry + 16 > x.header.size() || std::memcmp(&x.header[entry], want, 8) != 0) continue;
+                uint32_t base = be32(entry + 8), size = be32(entry + 12);
+                if (base && size) {
+                    s.spa_read = true;
+                    s.spa.parse(k.host(base), size);
+                }
+                return s.spa;
+            }
+        }
+        return s.spa;
+    }
+    // (with no guest context and no module yet it asks again later)
     if (!c || !module) return s.spa;
+    s.spa_read = true;
     uint32_t name = export_scratch(*c), data_ptr = name + 16, size_ptr = name + 20;
     std::snprintf(reinterpret_cast<char *>(k.host(name)), 16, "%08X", title_id(k));
     k.store32(data_ptr, 0), k.store32(size_ptr, 0);
@@ -519,26 +546,61 @@ std::string utf8_of(std::u16string_view s) {
 }
 } // namespace
 
+namespace {
+// the SPA's image of an id, as PNG bytes (lock held); none when it has no such image
+std::vector<uint8_t> spa_icon(Kernel &k, UserState &s, uint32_t image_id) {
+    const std::vector<uint8_t> *png = title_spa(k, s).find(gpd_section::IMAGE, image_id);
+    return png ? *png : std::vector<uint8_t>{};
+}
+} // namespace
+
 bool earn_achievement(Kernel &k, uint32_t user_index, uint32_t achievement_id) {
     if (!user_at(k, user_index)) return false;
     UserState &s = users(k);
-    std::lock_guard<std::mutex> l(s.mutex);
-    uint32_t title = title_id(k);
-    Gpd &g = title_gpd(k, s, title);
-    auto it = g.entries.find({gpd_section::ACHIEVEMENT, achievement_id});
-    Achievement a;
-    if (it == g.entries.end() || !a.decode(it->second)) {
-        std::fprintf(stderr, "xam: achievement %u does not exist in the title's SPA\n", achievement_id);
-        return false;
+    Toast t;
+    {
+        std::lock_guard<std::mutex> l(s.mutex);
+        uint32_t title = title_id(k);
+        Gpd &g = title_gpd(k, s, title);
+        auto it = g.entries.find({gpd_section::ACHIEVEMENT, achievement_id});
+        Achievement a;
+        if (it == g.entries.end() || !a.decode(it->second)) {
+            std::fprintf(stderr, "xam: achievement %u does not exist in the title's SPA\n", achievement_id);
+            return false;
+        }
+        if (a.unlocked()) return true;
+        a.flags |= ACHIEVEMENT_ACHIEVED;
+        a.unlock_time = k.system_time();
+        it->second = a.encode();
+        save_gpd(k, s, title);
+        std::fprintf(stderr, "xam: achievement unlocked: \"%s\" (%u G, id %u)\n", utf8_of(a.label).c_str(),
+                     a.gamerscore, a.id);
+        t.kind = Toast::Kind::Achievement;
+        t.title = a.label, t.text = a.description, t.gamerscore = a.gamerscore;
+        t.icon = spa_icon(k, s, a.image_id);
     }
-    if (a.unlocked()) return true;
-    a.flags |= ACHIEVEMENT_ACHIEVED;
-    a.unlock_time = k.system_time();
-    it->second = a.encode();
-    save_gpd(k, s, title);
-    std::fprintf(stderr, "xam: achievement unlocked: \"%s\" (%u G, id %u)\n", utf8_of(a.label).c_str(), a.gamerscore,
-                 a.id);
+    toast(k, t); // with the lock released: the host's handler is not ours to hold it for
     return true;
+}
+
+ProfileSummary profile_summary(Kernel &k) {
+    ProfileSummary out;
+    const User &u = user_profile(k);
+    out.gamertag = u.name, out.xuid = u.xuid, out.signed_in = user_at(k, 0) != nullptr;
+    out.title_id = title_id(k);
+    UserState &s = users(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    for (const Achievement &a : achievements_of(title_gpd(k, s, out.title_id))) {
+        ProfileAchievement p;
+        p.id = a.id, p.gamerscore = a.gamerscore, p.image_id = a.image_id, p.unlocked = a.unlocked();
+        p.unlock_time = p.unlocked ? a.unlock_time : 0;
+        p.label = a.label, p.description = a.description, p.unachieved = a.unachieved;
+        p.icon = spa_icon(k, s, a.image_id);
+        out.gamerscore_total += a.gamerscore;
+        if (p.unlocked) out.gamerscore += a.gamerscore;
+        out.achievements.push_back(std::move(p));
+    }
+    return out;
 }
 
 // (title_id, user_index, xuid, flags, offset, count, buffer_size_ptr,

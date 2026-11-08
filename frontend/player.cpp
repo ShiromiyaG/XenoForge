@@ -39,7 +39,11 @@
 #include "presenter.h"
 #include "sdl_audio.h"
 #include "sdl_input.h"
+#include "console_options.h"
+#include "overlay_system.h"
+#include "profiles.h"
 #include "settings.h"
+#include "system_ui_view.h"
 
 #include "../tools/game.h"
 #include "xenoforge/hooks.h"
@@ -60,6 +64,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -119,6 +125,69 @@ struct Rates {
     double swaps = 0, presented = 0, refreshes = 0, sound = 0, states = 0;
 };
 
+// A sample of each dialog a title can open, for --ui-demo (what a check can see without the title's help)
+bool demo_request(const std::string &name, kernel::UiRequest &r) {
+    using kernel::UiKind;
+    r = {};
+    r.user = 0;
+    if (name == "message") {
+        r.kind = UiKind::MessageBox;
+        r.title = u"Save game";
+        r.text = u"Do you want to overwrite the existing save? This cannot be undone.";
+        r.buttons = {u"Yes", u"No", u"Cancel"};
+        r.default_button = 1;
+        r.flags = 2;
+    } else if (name == "keyboard") {
+        r.kind = UiKind::Keyboard;
+        r.title = u"Name your profile";
+        r.text = u"Type a name (up to 15 characters)";
+        r.default_text = u"Player";
+        r.max_length = 15;
+    } else if (name == "device") {
+        r.kind = UiKind::DeviceSelector;
+        r.bytes_required = 3u << 20;
+    } else if (name == "signin") {
+        r.kind = UiKind::SignIn;
+        r.users_needed = 1;
+    } else if (name == "marketplace") {
+        r.kind = UiKind::Marketplace;
+    } else if (name == "achievements") {
+        r.kind = UiKind::Achievements;
+    } else if (name == "gamercard") {
+        r.kind = UiKind::GamerCard;
+    } else if (name == "editprofile") {
+        r.kind = UiKind::EditProfile;
+    } else if (name == "friends") {
+        r.kind = UiKind::Friends;
+    } else if (name == "messages") {
+        r.kind = UiKind::Messages;
+    } else if (name == "players") {
+        r.kind = UiKind::Players;
+    } else if (name == "quickchat") {
+        r.kind = UiKind::QuickChat;
+    } else if (name == "gameinvite") {
+        r.kind = UiKind::GameInvite;
+    } else if (name == "friendrequest") {
+        r.kind = UiKind::FriendRequest;
+        r.xuid = 0xE000123456789ABCull;
+    } else if (name == "playerreview") {
+        r.kind = UiKind::PlayerReview;
+        r.xuid = 0xE000123456789ABCull;
+    } else if (name == "compose") {
+        r.kind = UiKind::MessageCompose;
+        r.xuids = {0xE000123456789ABCull};
+    } else if (name == "customcompose") {
+        r.kind = UiKind::CustomMessageCompose;
+        r.text = u"Join my game!";
+    } else if (name == "playerlist") {
+        r.kind = UiKind::CustomPlayerList;
+        r.xuids = {0xE000123456789ABCull, 0xE0000FEDCBA98765ull};
+    } else {
+        return false;
+    }
+    return true;
+}
+
 int fail(const std::string &message) {
     std::fprintf(stderr, "%s\n", message.c_str());
     return 1;
@@ -148,17 +217,27 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     std::vector<std::string> option_args; // --option's, applied over the config file's values
     std::error_code ec;
     o.storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
-    std::filesystem::path config_file, screenshots;
+    std::filesystem::path config_file, screenshots, launch_data_file;
     double quit_after = 0;
     uint64_t screenshot_every = 300;
     bool sound_wanted = true, overlay = false, print_rates = false;
+    bool storage_given = false, directory_saves = false, system_ui = true;
+    std::string ui_demo; // --ui-demo's list of dialogs to open at the start (a check without a game's help)
     std::vector<game::Press> presses;
     for (int i = 2; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--xex" && i + 1 < argc)
             o.xex_path = argv[++i];
         else if (a == "--content" && i + 1 < argc)
-            o.storage = argv[++i];
+            o.storage = argv[++i], storage_given = true;
+        else if (a == "--directory-saves")
+            directory_saves = true;
+        else if (a == "--no-system-ui")
+            system_ui = false;
+        else if (a == "--ui-demo" && i + 1 < argc)
+            ui_demo = argv[++i];
+        else if (a == "--launch-data" && i + 1 < argc)
+            launch_data_file = argv[++i];
         else if (a == "--steps" && i + 1 < argc)
             o.steps = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--interpret")
@@ -195,8 +274,20 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | (sound_wanted ? SDL_INIT_AUDIO : 0)))
         return fail(std::string("SDL: ") + SDL_GetError());
-    // the game, opened as boot opens it
     std::string error;
+    // the storage root and the saves' format come from the shared settings before the game opens (it mounts them);
+    // the game's own settings, read after, may change the format and the profile
+    if (config_file.empty()) config_file = frontend::default_path();
+    {
+        frontend::Settings shared;
+        std::string why;
+        if (frontend::load(config_file, shared, why)) {
+            if (!storage_given) o.storage = frontend::storage_root(shared, config_file);
+            if (shared.saves.format == "directory") o.content_format = kernel::ContentFormat::Directory;
+        }
+    }
+    if (directory_saves) o.content_format = kernel::ContentFormat::Directory;
+    // the game, opened as boot opens it
     game::Game g;
     if (!game::open(o, g, error)) return fail(error);
     kernel::Kernel &k = *g.kernel;
@@ -206,7 +297,6 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     // the settings (the game's own when it has them), written with the
     // defaults the first time so there is a file to edit
     frontend::Settings settings;
-    if (config_file.empty()) config_file = frontend::default_path();
     const bool config_read = frontend::load(config_file, settings, error, title_id);
     if (!config_read)
         std::fprintf(stderr, "%s: %s (the defaults instead)\n", config_file.string().c_str(), error.c_str());
@@ -243,8 +333,10 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         std::string why;
         if (!port.set_option(assignment, why)) return fail(why);
     }
-    {
-        // the console's own settings the player chose (config.toml's [system]), before the title runs
+    // the console's own settings the player chose (config.toml's [system]), before the title runs and again when
+    // the overlay changes them
+    auto apply_system = [&] {
+        frontend::clamp_system(settings.system);
         kernel::SystemSettings system;
         system.file = o.storage / "xconfig.bin";
         system.language = uint32_t(std::max(0, settings.system.language));
@@ -254,6 +346,28 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         system.widescreen = settings.system.widescreen;
         system.refresh = settings.system.refresh;
         kernel::apply_system_settings(*g.kernel, system);
+    };
+    apply_system();
+    // the saves' format (a game's own may differ from the shared one) and the profile the games use: its XUID and
+    // gamertag (the storage root's first profile and the default name when the settings name none)
+    if (!directory_saves)
+        kernel::set_content_format(k, settings.saves.format == "directory" ? kernel::ContentFormat::Directory
+                                                                           : kernel::ContentFormat::Stfs);
+    kernel::set_user(k, frontend::selected_xuid(settings), frontend::selected_gamertag(o.storage, settings));
+    // the system's dialogs and toasts on the window (docs/runtime.md, "The player's system UI"); a request the
+    // model does not know is left to the kernel's default
+    frontend::SystemUi sysui([&k] { return kernel::profile_summary(k); });
+    if (system_ui) {
+        kernel::set_ui_handler(k, [&sysui](const kernel::UiRequest &r, kernel::UiDone done) {
+            return sysui.handle(r, std::move(done));
+        });
+        kernel::set_toast_handler(k, [&sysui](const kernel::Toast &t) { sysui.toast(t); });
+    }
+    if (!launch_data_file.empty()) {
+        // what the title before this one left it (a launch: XamLoaderSetLaunchData)
+        std::ifstream in(launch_data_file, std::ios::binary);
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        kernel::set_launch_data(k, data);
     }
     std::printf("settings: %s%s\n", config_file.string().c_str(),
                 settings.game.empty() ? "" : (std::string(" (the game's own, ") + title_id + ")").c_str());
@@ -305,6 +419,33 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     {
         std::lock_guard<std::mutex> lock(presenter.queue_mutex()); // it submits on the window's queue
         ImGui_ImplVulkan_CreateFontsTexture();
+    }
+    frontend::IconCache icons(*g.device);
+    frontend::ConsolePages pages;
+    frontend::PadNavigator pad_nav;
+    bool dialog_was_up = false, restart_requested = false;
+    // --ui-demo: dialogs opened at the start with samples of what titles ask, answered by the pad and keyboard
+    for (size_t at = 0; at < ui_demo.size();) {
+        size_t comma = ui_demo.find(',', at);
+        std::string name = ui_demo.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+        at = comma == std::string::npos ? ui_demo.size() : comma + 1;
+        kernel::UiRequest r;
+        if (name == "toast") {
+            kernel::Toast t;
+            t.kind = kernel::Toast::Kind::Achievement;
+            t.title = u"First steps", t.text = u"Finish the tutorial", t.gamerscore = 15;
+            sysui.toast(t);
+            continue;
+        }
+        if (!demo_request(name, r)) {
+            std::fprintf(stderr, "player: --ui-demo %s: no such dialog\n", name.c_str());
+            continue;
+        }
+        sysui.handle(r, [name](const kernel::UiResult &answer) {
+            std::printf("ui-demo: %s answered: %s, button %u, text \"%s\", device %u\n", name.c_str(),
+                        answer.cancelled ? "cancelled" : "accepted", answer.button,
+                        frontend::utf8_of(answer.text).c_str(), answer.device_id);
+        });
     }
 
     // the sound: SDL's device for each client, else the pacing output alone
@@ -389,6 +530,27 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit = true, ended = "closed";
             controllers.event(e);
+            if (e.type == SDL_EVENT_KEY_DOWN && sysui.active()) {
+                // the keyboard drives the dialog on top (Enter in a text field is the field's own)
+                frontend::Dialog *d = sysui.front();
+                const bool typing = d && d->text_entry;
+                switch (e.key.scancode) {
+                case SDL_SCANCODE_UP: sysui.navigate(frontend::Nav::Up); break;
+                case SDL_SCANCODE_DOWN: sysui.navigate(frontend::Nav::Down); break;
+                case SDL_SCANCODE_LEFT: if (!typing) sysui.navigate(frontend::Nav::Left); break;
+                case SDL_SCANCODE_RIGHT: if (!typing) sysui.navigate(frontend::Nav::Right); break;
+                case SDL_SCANCODE_PAGEUP: sysui.navigate(frontend::Nav::PageUp); break;
+                case SDL_SCANCODE_PAGEDOWN: sysui.navigate(frontend::Nav::PageDown); break;
+                case SDL_SCANCODE_RETURN:
+                case SDL_SCANCODE_KP_ENTER:
+                    if (!typing && !e.key.repeat) sysui.navigate(frontend::Nav::Accept);
+                    break;
+                case SDL_SCANCODE_ESCAPE:
+                    if (!e.key.repeat) sysui.navigate(frontend::Nav::Cancel);
+                    break;
+                default: break;
+                }
+            }
             if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
                 if (e.key.scancode == SDL_SCANCODE_F1) {
                     overlay = !overlay;
@@ -412,7 +574,19 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             ImGui_ImplSDL3_ProcessEvent(&e);
         }
         const bool focused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
-        controllers.read_keyboard(focused, overlay);
+        // a dialog of the system takes the controllers and the keyboard from the title, as the console's guide does
+        const bool dialog_up = sysui.active();
+        controllers.set_taken(dialog_up);
+        controllers.read_keyboard(focused, overlay || dialog_up);
+        if (dialog_up) {
+            const uint64_t at = k.uptime_ms();
+            const input::Gamepad pad = controllers.view(at)[sysui.user()].pad;
+            if (!dialog_was_up)
+                pad_nav.reset(pad, at); // a button already down when it opened is not an answer
+            else
+                for (frontend::Nav nav : pad_nav.feed(pad, at)) sysui.navigate(nav);
+        }
+        dialog_was_up = dialog_up;
 
         // the run's end: time asked for, the code stopped, the main thread done
         const Clock::time_point now = Clock::now();
@@ -494,7 +668,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         int pw = 0, ph = 0;
         SDL_GetWindowSizeInPixels(window, &pw, &ph);
         const bool minimized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) || !pw || !ph;
-        if (minimized || (!presenter.fresh() && !overlay && now - last_present < std::chrono::milliseconds(100))) {
+        const bool ui_busy = sysui.active() || sysui.has_toasts();
+        if (minimized ||
+            (!presenter.fresh() && !overlay && !ui_busy && now - last_present < std::chrono::milliseconds(100))) {
             SDL_Delay(minimized ? 10 : 1);
             continue;
         }
@@ -601,6 +777,19 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                     ImGui::EndTable();
                 }
             }
+            if (ImGui::CollapsingHeader("Console: system, profile, achievements")) {
+                frontend::ConsolePages::Host host{settings,
+                                                  o.storage,
+                                                  k,
+                                                  icons,
+                                                  apply_system,
+                                                  [&] {
+                                                      restart_requested = true;
+                                                      quit = true;
+                                                      ended = "restart";
+                                                  }};
+                if (pages.draw(host, seconds)) changed = true;
+            }
             ImGui::SeparatorText("Screenshot");
             if (ImGui::Button("Save (F12)")) key_screenshot();
             ImGui::SameLine();
@@ -608,6 +797,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             ImGui::End();
             if (!keep) overlay = false;
         }
+        frontend::draw_system_ui(sysui, icons, seconds);
         ImGui::Render();
         frontend::Presenter::View view;
         view.width = uint32_t(pw), view.height = uint32_t(ph);
@@ -648,6 +838,52 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     std::printf("threads:\n%s", k.thread_report().c_str());
     game::print_report(g, true);
     if (port.on_shutdown) port.on_shutdown(k);
+    std::printf("player: system dialogs taken %llu, answered %llu (the rest cancelled as the player closed)\n",
+                (unsigned long long)sysui.taken(), (unsigned long long)sysui.answered());
+    sysui.cancel_all();
+    // the title that follows: the one this launched (XamLoaderLaunchTitle) when its executable is on the same disc,
+    // or this one again when the overlay asked for a restart. It is a process of its own, as a console's titles are:
+    // the next player starts on the same disc with the launch data the title left it, and this one waits for it.
+    std::vector<std::string> next_args;
+    if (restart_requested || (ended.rfind("stopped", 0) == 0 && k.title_exit.launch)) {
+        std::string next;
+        if (!restart_requested) {
+            next = game::disc_path(k.title_exit.path);
+            std::printf("the title asks for %s", next.empty() ? "the dashboard" : next.c_str());
+            std::printf("%s\n", next.empty() ? "" : settings.follow_launches ? "; starting it" : " (follow_launches is off)");
+        }
+        if (restart_requested || (!next.empty() && settings.follow_launches)) {
+            std::vector<std::pair<std::string, std::string>> replace = {{"--launch-data", ""}, {"--quit-after", ""}};
+            if (!restart_requested) replace.push_back({"--xex", next});
+            if (!restart_requested && !k.title_exit.launch_data.empty()) {
+                std::filesystem::path file = o.storage / "launch-data.bin";
+                std::filesystem::create_directories(o.storage, ec);
+                std::ofstream out(file, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(k.title_exit.launch_data.data()),
+                          std::streamsize(k.title_exit.launch_data.size()));
+                replace[0].second = file.string();
+            }
+            if (quit_after > 0) replace[1].second = std::to_string(std::max(1.0, quit_after - seconds));
+            next_args = game::relaunch_args(std::vector<std::string>(argv, argv + argc), replace);
+        }
+    }
+    if (!next_args.empty()) {
+        k.stop("the player starts the next title");
+        SDL_HideWindow(window);
+        std::vector<const char *> cargs;
+        for (const std::string &a : next_args) cargs.push_back(a.c_str());
+        cargs.push_back(nullptr);
+        std::fflush(stdout);
+        std::fflush(stderr);
+        int code = 1;
+        if (SDL_Process *process = SDL_CreateProcess(cargs.data(), false)) {
+            if (!SDL_WaitProcess(process, true, &code)) code = 1;
+        } else {
+            std::fprintf(stderr, "player: cannot start %s: %s\n", cargs[0], SDL_GetError());
+        }
+        std::fflush(stdout);
+        std::_Exit(code);
+    }
     // the guest's threads still run: no destructors under them (boot's way)
     presenter.idle();
     std::fflush(stdout);

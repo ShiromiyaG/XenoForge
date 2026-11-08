@@ -1771,6 +1771,72 @@ logs in `../traces/player/`):
   are checked here), that the sound is heard and sounds right, how the
   window feels resized, fullscreen and with vsync off.
 
+## The player's system UI
+
+Plan step 7 (2026-11-08), the player's side of the dialogs `xam_ui.cpp` hands to a host (`set_ui_handler`,
+"XAM"). Xenia draws a message box, the keyboard, the device selector and sign-in and cancels or stubs the rest;
+here every page the kernel asks for is shown, driven by the pad and the keyboard, and answered through `UiDone` in the
+kernel's own result shapes. The logic is apart from the view:
+
+- **`frontend/system_ui.*`** (the model, no ImGui, in `xf_frontend`): `SystemUi::handle` is the `UiHandler`. It
+  queues each request (from any guest thread), makes it a `Dialog` (title, paragraphs, choices, selection) and, when
+  the window's thread navigates (`Nav`: up, down, left, right, accept, cancel, page up and down), answers it:
+  message box = the button (B: cancelled, the kernel's ERROR_CANCELLED), keyboard = the text cut to its room in
+  characters (UTF-16 for the guest; the OK/Cancel choices), device selector = the hard drive (device 1) or cancel,
+  sign-in = sign in as the profile or cancel (the title's follow-up runs only on the first), gamer card and
+  achievements from the profile (`kernel::profile_summary`: the user's GPD for the running title, read on the guest's
+  thread that asked), and the pages an offline console shows with nothing to list: friends, players, messages, quick
+  chat, game invite, friend request, player review, message compose (both), the custom player list, the
+  marketplace ("not available"), profile editing. An unknown request (`UiKind::Other`) is declined: the kernel's
+  headless default stands. `PadNavigator` turns the pad's state into navigation (press once; a direction repeats after
+  400 ms, every 100 ms; the left stick counts). `toast()` takes the kernel's toasts (`set_toast_handler`: an
+  unlocked achievement with its icon, and `XNotifyQueueUI`'s text); they live five seconds.
+- **`frontend/system_ui_view.*`** (ImGui, in the player): the top dialog as a centered modal over the dimmed game, the
+  toasts stacked in the top-right corner, the achievements' PNG icons made into textures on first use (`IconCache`:
+  stb_image, a staging buffer and one copy on the shared device). A click on a choice accepts it; Enter in the
+  keyboard's text field is the field's own.
+- **The game stays in charge of its own time.** While a dialog is up the player gives the title neutral controller
+  states and no keyboard (`Controllers::set_taken`; the console's guide takes the controller from the title), and
+  `XamIsUIActive` answers 1 until the answer; the guest's threads, the sound and the scheduler's clock keep running
+  (nothing waits for the window; a title that opened a dialog with no overlapped waits on its own thread only).
+- **The F1 overlay** has a "Console" section (`frontend/overlay_system.*`): System (language, country, resolution,
+  aspect, refresh), Profile (the gamertag with its rules, the profiles with Use and Delete, a new profile, the saves'
+  format) and the title's achievements, read only. The same choices are the launcher's System and Profile tabs
+  (`console_options.*`, `profiles.*`): one list of languages (XLanguage), countries (XOnlineCountry) and video modes
+  and one validation (`valid_gamertag`: 1 to 15 letters, digits and single spaces, starting with a letter, no space at
+  the end; `clamp_system` puts values the kernel would not know back to its default). In the player the system
+  settings go to the kernel at once (`apply_system_settings`: xconfig.bin) but a running title reads them at its start,
+  so the overlay says so and offers "Restart the title"; the gamertag (`set_gamertag`) and the saves' format
+  (`set_content_format`) apply live; choosing or deleting a profile needs the restart.
+- **Profiles** are directories of the storage root, `content/<XUID>/` with the package
+  `FFFE07D1/00010000/<XUID>` (where the kernel keeps the GPDs); the gamertags are config.toml's `[profile.names]`,
+  the one the games use `[profile] xuid` (else the first the storage has, as the kernel picks) and `gamertag`. Creating
+  one makes a new offline XUID (0xE03...) and its directory; deleting removes the directory with its saves (asked
+  twice, never the only profile). The launcher's Profile tab also lists the selected game's achievements from the
+  profile's GPD file (`read_gpd_achievements`, no kernel running).
+- **config.toml**: `[saves] format` = `"stfs"` (default) or `"directory"` (Xenia's layout; `--directory-saves`),
+  `[saves] root` (the storage root; by default `storage/` beside config.toml, where the player used to use a temporary
+  directory), `[profile]` as above, `[player] follow_launches` (default true). Per-game tables may override `[saves]`,
+  `[profile]` and `[system]` as they do the other sections.
+- **A title that launches another** (`XamLoaderLaunchTitle`; `Kernel::title_exit`): when the executable is on the same
+  disc (`game::disc_path`) and `follow_launches` is on, the player starts a process of its own for it (SDL3's
+  `SDL_CreateProcess`, `game::relaunch_args`: the same command line with `--xex`, `--launch-data` and what is left of
+  `--quit-after`), hides its window and waits for it, then exits with its code, as `boot --follow-launches` does; the
+  launch data the title left goes through a file (`--launch-data`). A launch to the dashboard or to another disc ends
+  the run. What decides the next title is `disc_path` and how it is started is the caller's, so a host that runs the
+  game in the launcher's process (Android) can start it its own way.
+- **For checks without a person**: `--ui-demo message,keyboard,device,signin,achievements,gamercard,friends,
+  messages,players,quickchat,gameinvite,friendrequest,playerreview,compose,customcompose,playerlist,marketplace,
+  editprofile,toast` opens a sample of each at the start (answered by `--press a@5`, `b@5`...; the player prints each
+  answer: `ui-demo: <name> answered: ...`) and `--screenshots` shows the window with the dialog on it
+  (`<swap>_window.png`). `--no-system-ui` leaves every dialog to the kernel's default. `tests/system_ui_test.cpp`
+  drives the model, the kernel's exports through the handler, the pad's repeat, the toasts, the profile store and the
+  settings, and the relaunch's arguments.
+- **Left for a person**: the dialogs' look and feel with a real pad and the mouse; the keyboard dialog's text field
+  with a physical keyboard (a pad alone cannot type: it accepts the default text); that a dialog the title raises
+  mid-game takes the pad without a stray press reaching the game on the frame it opens; the launcher's System and
+  Profile tabs with the mouse and the pad; the title restart the overlay offers.
+
 ## The launcher
 
 Plan track C2 (2026-11-05, a first one), after the 3DS runtime's
@@ -1821,7 +1887,7 @@ entirely:
   `ui::Window` (device and swapchain) and RmlUi context with its own render
   interface (fonts are RmlUi's, shared; `Rml::ReleaseRenderManagers()` after
   its context is removed hands its textures back before its device goes).
-  Tabs Video, Sound, Controllers, Keyboard, Interface; above them, whose
+  Tabs Video, Sound, Controllers, Keyboard, System, Profile, Interface (System and Profile: see "The player's system UI"); above them, whose
   settings these are and the "Settings of its own for <game>" check box;
   check boxes, sliders and dropdowns in groups; the 25 bindings, each
   changed by a click and the next key; the theme, the accent and the games

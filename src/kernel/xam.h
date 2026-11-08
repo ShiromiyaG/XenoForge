@@ -174,6 +174,9 @@ std::map<uint16_t, std::u16string> spa_strings(Kernel &k, uint32_t base, uint32_
 // earned already (xam_user.cpp).
 bool earn_achievement(Kernel &k, uint32_t user_index, uint32_t achievement_id);
 
+// A toast for the host's handler (kernel.h, set_toast_handler); false, and nothing done, when there is none
+bool toast(Kernel &k, const Toast &t);
+
 // the running title's ID (its execution info)
 uint32_t title_id(Kernel &k);
 

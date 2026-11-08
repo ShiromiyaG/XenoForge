@@ -94,26 +94,6 @@
 
 using namespace xf;
 
-namespace {
-// A path the guest launches, as the path on the disc --xex takes: the device
-// prefix (game:, d:, \Device\Cdrom0) dropped, slashes forward; "" for the
-// dashboard or a path that is not on the disc
-std::string disc_path(std::string path) {
-    std::string lower = path;
-    for (char &ch : lower) ch = char(std::tolower((unsigned char)ch));
-    for (const char *prefix : {"game:", "d:", "\\device\\cdrom0", "\\device\\harddisk0\\cdrom0"}) {
-        size_t n = std::strlen(prefix);
-        if (lower.compare(0, n, prefix) != 0) continue;
-        path = path.substr(n);
-        while (!path.empty() && (path[0] == '\\' || path[0] == '/')) path.erase(0, 1);
-        for (char &ch : path)
-            if (ch == '\\') ch = '/';
-        return path;
-    }
-    return {};
-}
-} // namespace
-
 int xf::run_boot(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
@@ -364,7 +344,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     if (port.on_shutdown) port.on_shutdown(k);
     std::fflush(stdout);
     if (k.stopped && k.title_exit.launch) {
-        std::string next = disc_path(k.title_exit.path);
+        std::string next = game::disc_path(k.title_exit.path);
         std::printf("the title asks for %s", next.empty() ? "the dashboard" : next.c_str());
         if (!follow_launches || next.empty()) {
             std::printf("%s\n", next.empty() ? "" : " (--follow-launches starts it)");
