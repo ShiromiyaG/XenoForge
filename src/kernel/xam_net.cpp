@@ -548,7 +548,7 @@ XF_EXPORT(xam, XNetLogonGetMachineID) {
 
 // (index): the running title's ID. Xenia has no implementation (its
 // undefined import leaves r3, the argument, as it is); the title's own ID
-// is what the name asks for, and Gears of War 3, the one caller seen, only
+// is what the name asks for, and the one caller seen (a UE3 game) only
 // puts it in a Live request that fails earlier (no user signed in to Live).
 XF_EXPORT(xam, XNetLogonGetTitleID) { result(c, title_id(k)); }
 

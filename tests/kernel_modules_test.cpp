@@ -725,7 +725,7 @@ const ppc::GeneratedFunction app_functions[] = {{APP + FUNCTION, app_function}};
 ppc::GeneratedModule lib_module{"lib.dll", LIB, 0, 0, lib_functions, 1};
 ppc::GeneratedModule app_module{"app.dll", APP, 0, 0, app_functions, 1};
 
-// BC2's launcher chain (docs/runtime.md, "Modules, memory, Rtl"): its
+// A launcher chain (docs/runtime.md, "Modules, memory, Rtl"): a
 // default.xex loads splash.xex, calls its export 1, unloads it and loads
 // game.xex at the same base. Each DLL's export 1 returns its own constant
 // in guest code (interpreted) and another in its generated code, which
@@ -926,7 +926,7 @@ void user_modules(KernelHarness &h, uint32_t log, const std::vector<uint8_t> &li
     CHECK(int32_t(h.krnl("XexLoadImageHeaders", {ansi(h, "game:\\missing.dll"), buffer, 0x2000})) < 0);
 }
 
-// BC2's chain, as its launcher (default.xex) runs it: splash.xex loaded, its
+// A launcher chain, as its launcher (default.xex) runs it: splash.xex loaded, its
 // export 1 found (and no export 2) and called, unloaded; game.xex loaded at
 // the same base, its export 1 called. Each call runs the generated code of
 // the DLL loaded then, never the other's; each DllMain sees its own module.

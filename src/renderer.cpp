@@ -1743,8 +1743,8 @@ VkPipeline Impl::compute_pipeline(const uint32_t *words, size_t bytes, VkPipelin
 // Vulkan's pipeline cache, made from the file the options name when it is
 // there (Vulkan checks the data's header against the device and the driver
 // and starts empty on a mismatch), and given to every pipeline made: a
-// game's pipelines are compiled by the driver once, not at each run (El Chavo
-// Kart's title screen made 24 in its first frame, 2.5 s on this thread).
+// game's pipelines are compiled by the driver once, not at each run (a UE3
+// game's title screen made 24 in its first frame, 2.5 s on this thread).
 void Impl::open_pipeline_cache() {
     std::vector<char> data;
     if (!options_.pipeline_cache.empty()) {
@@ -4989,7 +4989,7 @@ int32_t float_to_fixed_16p8(float f32) {
 // ways, as Direct3D 9 leaves it for clears and other screen-space
 // rectangles), the lowest row the vertices reach, the vertex shader run on
 // the CPU. Without it a 1280-wide target took over all of EDRAM at such a
-// draw, every target there stored and loaded again (El Chavo Kart's race:
+// draw, every target there stored and loaded again (a racing game's race:
 // its depth target took 2048 tiles three times a frame). A tessellated draw's
 // vertices are not run (the estimator's "not reproducing tessellation").
 uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
@@ -5112,7 +5112,7 @@ void Impl::draw(const gpu::Draw &d) {
         // stencil off, no memory export) leaves EDRAM and memory as they
         // were, and the occlusion queries' counts are the processor's fake
         // ones (EVENT_WRITE_ZPD, as Xenia's): nothing to draw, whatever its
-        // primitive. El Chavo Kart issues hundreds of such point lists a
+        // primitive. A UE3 game issues hundreds of such point lists a
         // frame.
         const Shader *v = have_vertex_ ? shader(vertex_hash_) : nullptr;
         const Shader *p = have_pixel_ ? shader(pixel_hash_) : nullptr;
@@ -6046,7 +6046,7 @@ void Impl::draw(const gpu::Draw &d) {
     // shared memory, guest memory's bytes put there where the CPU wrote them
     // since (request) and where a resolve or an export has not written newer
     // ones. (Read from host memory, the arena's copies, they made the
-    // scene's vertex shaders wait on the bus: 6.7 ms of El Chavo Kart's race
+    // scene's vertex shaders wait on the bus: 6.7 ms of a UE3 game's race
     // frame.)
     struct VertexSlot {
         uint32_t slot, start, end;

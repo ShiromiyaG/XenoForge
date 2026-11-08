@@ -2333,7 +2333,7 @@ void Translator::main_pixel() {
             // into the register the index names, each by a constant index: a
             // variable index into the registers made the host's compiler keep
             // the whole array in memory, every access of every pixel shader a
-            // memory access (the post-processing passes of El Chavo Kart's race
+            // memory access (the post-processing passes of a UE3 game's race
             // took 5 ms of the GPU each at 1280x720, 0.2 ms without)
             Id value = vec4_of(x, y, z, f(0));
             for (uint32_t k = 0; k < 16; k++) {

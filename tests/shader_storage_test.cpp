@@ -18,9 +18,9 @@ int main() {
     std::error_code ec;
     const fs::path dir = fs::temp_directory_path(ec) / "xf_shader_storage_test";
     fs::remove_all(dir, ec);
-    const fs::path file = ShaderStorage::path(dir, 0x475807D7);
-    CHECK(file.filename() == "475807D7.xfshaders");
-    CHECK(ShaderStorage::pipeline_cache_path(dir, 0x475807D7).filename() == "475807D7.vkpipelines");
+    const fs::path file = ShaderStorage::path(dir, 0x58460001);
+    CHECK(file.filename() == "58460001.xfshaders");
+    CHECK(ShaderStorage::pipeline_cache_path(dir, 0x58460001).filename() == "58460001.vkpipelines");
 
     const std::vector<uint32_t> vs = {1, 2, 3, 4}, ps = {5, 6, 7};
     const uint64_t vh = ShaderStorage::hash(0, vs), ph = ShaderStorage::hash(1, ps);

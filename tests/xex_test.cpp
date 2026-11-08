@@ -126,7 +126,7 @@ std::vector<uint8_t> make_xex(const uint8_t *console_key, bool lzx = false) {
     uint8_t *exec = p + 0x340;
     put_be32(exec, 0x11223344);      // media id
     put_be32(exec + 4, 0x10000300);  // version 1.0.3.0
-    put_be32(exec + 0xC, 0x475807D7); // title id
+    put_be32(exec + 0xC, 0x58460001); // title id
     exec[0x12] = 1;
     exec[0x13] = 1;
 
@@ -186,7 +186,7 @@ void reads_an_executable(const uint8_t *console_key, bool devkit) {
     CHECK(xex.pages.size() == 1 && xex.pages[0].type == uint8_t(XexSection::Code) && xex.pages[0].count == 1);
     CHECK(xex.encryption == XexEncryption::Normal && xex.compression == XexCompression::Basic);
     CHECK(xex.stack_size == 0x40000);
-    CHECK(xex.has_execution_info && xex.execution.title_id == 0x475807D7 && xex.execution.media_id == 0x11223344);
+    CHECK(xex.has_execution_info && xex.execution.title_id == 0x58460001 && xex.execution.media_id == 0x11223344);
     CHECK(xex.static_libraries.size() == 2);
     if (xex.static_libraries.size() == 2) {
         CHECK(xex.static_libraries[0].name == "XAPILIB" && xex.static_libraries[0].major == 2 &&

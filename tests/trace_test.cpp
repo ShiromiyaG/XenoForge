@@ -53,7 +53,7 @@ std::vector<uint8_t> make_trace() {
     Writer w;
     w.u32(1); // version
     for (int i = 0; i < 40; i++) w.out.push_back('0' + i % 10);
-    w.u32(0x475807D7);
+    w.u32(0x58460001);
 
     // the register snapshot
     std::vector<uint32_t> regs(REGISTER_COUNT);
@@ -138,7 +138,7 @@ void counts_a_trace() {
     TraceStats s;
     std::string error;
     CHECK(open_gpu_trace(path, trace, error));
-    CHECK(trace.title_id == 0x475807D7 && trace.commit.size() == 40);
+    CHECK(trace.title_id == 0x58460001 && trace.commit.size() == 40);
     CHECK(count_gpu_trace(trace, s, error));
     if (!error.empty()) std::printf("  %s\n", error.c_str());
     std::filesystem::remove(path);

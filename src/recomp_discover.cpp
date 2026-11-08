@@ -664,7 +664,7 @@ private:
         // where a function .pdata (or a helper's or a thunk's size) bounds
         // ends: an end whatever its last instruction, which may be a call
         // that never returns (bl _CxxThrowException), so the code after it
-        // is another function's (Sonic's adjustor thunks there are reached
+        // is another function's (one game's adjustor thunks there are reached
         // only through vtables)
         std::set<uint32_t> sized_ends;
         for (const auto &[a, f] : d_.functions)

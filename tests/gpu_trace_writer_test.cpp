@@ -111,7 +111,7 @@ void frames(bool compress) {
     TraceOptions options;
     options.directory = dir;
     options.frames = {1};
-    options.title_id = 0x475807D7;
+    options.title_id = 0x58460001;
     options.compress = compress;
     TraceWriter writer(cp, &backend, &backend, options);
     cp.set_sink(&writer);
@@ -131,7 +131,7 @@ void frames(bool compress) {
     draw();
     swap();
     cp.run(w.n);
-    CHECK(!std::filesystem::exists(dir / "475807D7_0.xtr"));
+    CHECK(!std::filesystem::exists(dir / "58460001_0.xtr"));
     CHECK(backend.settled == 1);
 
     // frame 1: a register write, constants from memory, a fence, an
@@ -164,13 +164,13 @@ void frames(bool compress) {
     cp.run(w.n);
 
     std::vector<std::filesystem::path> done = writer.finished();
-    CHECK(done.size() == 1 && done[0].filename() == "475807D7_1.xtr");
+    CHECK(done.size() == 1 && done[0].filename() == "58460001_1.xtr");
     CHECK(writer.errors().empty());
     if (done.size() != 1) return;
     GpuTrace trace;
     std::string error;
     CHECK(open_gpu_trace(done[0], trace, error));
-    CHECK(trace.version == 1 && trace.title_id == 0x475807D7);
+    CHECK(trace.version == 1 && trace.title_id == 0x58460001);
     Seen seen;
     CHECK(walk_gpu_trace(trace, seen, error));
     std::string pages = std::to_string(vertices + 100) + " " + std::to_string(4096 - 100);

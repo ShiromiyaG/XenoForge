@@ -432,7 +432,7 @@ void LauncherView::update() {
     if (demo_pending_ && (!listing_.games.empty() || !listing_.busy)) {
         demo_pending_ = false;
         GameEntry fake;
-        fake.title = "El Chavo Kart", fake.title_id = 0x475807D7;
+        fake.title = "Demo game", fake.title_id = 0x58460001;
         const GameEntry *g = selected_game();
         begin_prepare(g ? *g : fake, true);
     }

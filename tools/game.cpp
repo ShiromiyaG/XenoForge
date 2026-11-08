@@ -253,7 +253,7 @@ bool open(const Options &options, Game &g, std::string &error) {
     std::printf("loaded %s: base 0x%08X, entry 0x%08X, %zu imported functions\n", options.xex_path.c_str(),
                 g.xex.base_address, k.entry_point(), k.imports().size());
     // a DLL's entry point is its DllMain, which returns at once: another
-    // executable loads it (BC2's Game.xex and Splash.xex, which its
+    // executable loads it (a launcher's game and splash DLLs, which its
     // default.xex loads one after the other and calls by their export)
     if (g.xex.module_flags & 0x8)
         std::printf("note: %s is a DLL (module flags 0x%X, %s): run as the executable, its DllMain returns at once; "

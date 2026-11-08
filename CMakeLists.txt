@@ -189,7 +189,7 @@ add_test(NAME xam_oracle COMMAND xam_oracle_test $<TARGET_FILE:xfxam>)
 set_tests_properties(xam_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 # boot linked with a game's generated code: `xfrecomp emit <iso> <XF_GEN_DIR>/<name>`
 # writes it, a directory per executable and DLL on the disc and modules.cpp
-# listing their tables (game code: outside the repository); -DXF_GAMES="chaves;ben10"
+# listing their tables (game code: outside the repository); -DXF_GAMES="<name>;<name>"
 # builds boot_<name> for each, with one game library carrying every module. The
 # code is built here, against these headers, so it follows every change to the
 # instructions' semantics. XF_GAME_OPT is the game libraries' optimization
