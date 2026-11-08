@@ -46,6 +46,20 @@
 //           ...
 //       }, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, 2);
 //   }
+// A hook slot's hooks (ppc_module.h's HookSlot; nullptr: nothing hooked),
+// read once per call.
+#define XF_HOOKS(slot) __atomic_load_n(&(slot).hooks, __ATOMIC_ACQUIRE)
+// A function the port hooks (docs/recompiler.md, "Replacing and hooking"):
+// what every caller and the table call, its body being `original`
+// (xfo_<address>). With nothing in its slot it is a load, a compare and a
+// tail call; with hooks, the runtime runs them (ppc_runtime.h's hooked).
+//
+//   XF_FN(xf_82123456) { XF_HOOKED(xf_hook_82123456, xfo_82123456); }
+#define XF_HOOKED(slot, original)                                                                                      \
+    do {                                                                                                               \
+        if (XF_HOOKS(slot)) return ::xf::ppc::hooked(c, slot);                                                         \
+        XF_TAIL(original);                                                                                             \
+    } while (0)
 #define XF_RESUMABLE_BODY                                                                                              \
     [](::xf::ppc::Context &c, [[maybe_unused]] uint32_t xf_at, [[maybe_unused]] uint32_t xf_lr,                        \
        [[maybe_unused]] uint32_t xf_sp)

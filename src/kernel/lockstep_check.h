@@ -31,7 +31,9 @@ class Lockstep {
     // an import the code calls, on any thread: in a call being checked, the
     // end of a segment (compared) and the start of the next (after it)
     void before_import(ppc::Context &c, const Import &import);
-    void after_import(ppc::Context &c);
+    // resume: where the code goes on (0: LR); skip_mid: past a mid-function
+    // hook there, which ran (the port's hooks end segments as imports do)
+    void after_import(ppc::Context &c, uint32_t resume = 0, bool skip_mid = false);
     // mftb in a segment's generated code: what the interpreter read
     bool replay_time_base(ppc::Context &c, uint64_t &value);
 

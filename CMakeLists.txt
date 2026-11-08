@@ -58,6 +58,9 @@ add_library(xenoforge STATIC
     src/recomp_discover.cpp
     src/recomp_emit.cpp
     src/recomp_module.cpp
+    src/recomp_project.cpp
+    src/toml.cpp
+    src/hooks.cpp
     src/memory.cpp
     src/guest_memory.cpp
     src/gpu/command_processor.cpp
@@ -235,6 +238,24 @@ target_include_directories(kernel_exceptions_test PRIVATE src/kernel tests)
 target_link_libraries(kernel_exceptions_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_exceptions COMMAND kernel_exceptions_test)
 set_tests_properties(kernel_exceptions PROPERTIES TIMEOUT 120)
+# the port's side (docs/recompiler.md, "The project file", "Replacing and
+# hooking"): the project file and the hooks on a guest program port_gen emits
+# with its project file, run generated and interpreted
+add_executable(port_gen tests/port_gen.cpp)
+target_link_libraries(port_gen PRIVATE xenoforge)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp
+    COMMAND port_gen ${CMAKE_CURRENT_BINARY_DIR}/port_gen
+    DEPENDS port_gen
+    COMMENT "port_gen")
+set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp
+                            ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp PROPERTIES COMPILE_OPTIONS "-O1;-g0;-w")
+add_executable(port_test tests/port_test.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp
+                         ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp)
+target_include_directories(port_test PRIVATE tests)
+target_link_libraries(port_test PRIVATE xenoforge_kernel xenoforge)
+add_test(NAME port COMMAND port_test)
+set_tests_properties(port PROPERTIES TIMEOUT 120)
 
 # stb_image and stb_image_write (public domain / MIT), for PNGs in the tools;
 # Xenia's copy unless STB_DIR says otherwise

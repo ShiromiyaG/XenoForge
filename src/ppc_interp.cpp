@@ -31,8 +31,33 @@ constexpr bool IMPLEMENTED[] = {
 template <class Watch>
 Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_t stack_top, Watch *watch) {
     constexpr bool watched = !std::is_same_v<Watch, std::nullptr_t>;
+    // the port's hooks (System::hook_pages): a page holding one is looked at
+    // further, for mid-function hooks here and hooked functions entered by a
+    // branch (calls reach them through System::call)
+    const uint8_t *const hook_pages = c.system ? c.system->hook_pages : nullptr;
+    auto hooked_page = [&](uint32_t a) { return hook_pages && ((hook_pages[a >> 15] >> ((a >> 12) & 7)) & 1); };
+    // a branch without LK to a hooked function's start from outside it: the
+    // hooks and the function run, then on at LR as after a call
+    auto entered = [&](uint32_t target, uint32_t from) {
+        return hooked_page(target) && c.system->enter_hooked && c.system->enter_hooked(c, target, from);
+    };
     for (uint64_t step = 0; step < max_steps; step++) {
         if (pc == until && uint32_t(c.r[1]) >= stack_top) return {Stopped::Returned, pc};
+        if (hooked_page(pc) && c.system->mid_hook) [[unlikely]] {
+            c.pc = pc;
+            const uint32_t to = c.system->mid_hook(c, pc);
+            if (to == 1) {
+                // a return, as blr
+                const uint32_t target = uint32_t(c.lr) & ~3u;
+                if (stack_top && target != until && uint32_t(c.r[1]) > stack_top) return {Stopped::Unwound, target};
+                pc = target;
+                continue;
+            }
+            if (to) {
+                pc = to;
+                continue;
+            }
+        }
         Instr i{ops::load32(c, pc)};
         Opcode op = decode(i.code);
         c.pc = pc;
@@ -44,8 +69,12 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
             if (i.I.LK) {
                 c.lr = next;
                 if (c.system && c.system->call && c.system->call(c, target)) break; // ran it: on after the call
-            } else if (target <= pc) {
-                ops::yield_point(c, ops::YIELD_BACK_EDGE); // a loop's back edge, as the generated code's
+            } else {
+                if (target <= pc) ops::yield_point(c, ops::YIELD_BACK_EDGE); // a loop's back edge, as the generated code's
+                if (entered(target, pc)) [[unlikely]] {
+                    next = uint32_t(c.lr) & ~3u;
+                    break;
+                }
             }
             next = target;
             break;
@@ -56,8 +85,12 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
             if (i.B.LK) {
                 c.lr = next;
                 if (taken && c.system && c.system->call && c.system->call(c, target)) break;
-            } else if (taken && target <= pc) {
-                ops::yield_point(c, ops::YIELD_BACK_EDGE);
+            } else if (taken) {
+                if (target <= pc) ops::yield_point(c, ops::YIELD_BACK_EDGE);
+                if (entered(target, pc)) [[unlikely]] {
+                    next = uint32_t(c.lr) & ~3u;
+                    break;
+                }
             }
             if (taken) next = target;
             break;
@@ -81,6 +114,9 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
             if (i.XL.LK) {
                 c.lr = next;
                 if (taken && c.system && c.system->call && c.system->call(c, target)) break;
+            } else if (taken && entered(target, pc)) [[unlikely]] {
+                next = uint32_t(c.lr) & ~3u;
+                break;
             }
             if (taken) next = target;
             break;

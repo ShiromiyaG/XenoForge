@@ -13,6 +13,7 @@
 #include "objects.h"
 #include "stacks.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/port.h"
 
 #include <algorithm>
 #include <atomic>
@@ -92,8 +93,10 @@ std::string describe(Kernel &k, uint32_t address) {
         out += " " + name;
     }
     if (function) {
-        std::snprintf(text, sizeof(text), ", function 0x%08X+0x%X", start, address - start);
-        out += text;
+        // with the port's name for it (the project file's, or one it registered)
+        std::string label = port::name_of(start);
+        std::snprintf(text, sizeof(text), "0x%08X+0x%X", start, address - start);
+        out += ", function " + (label.empty() ? std::string() : label + " ") + text;
     }
     return out;
 }
@@ -105,8 +108,11 @@ std::string brief(Kernel &k, uint32_t address) {
     const char *module;
     uint32_t start;
     if (!k.guest_function(address, module, start)) return text;
-    std::snprintf(text, sizeof(text), "0x%08X (0x%08X+0x%X)", address, start, address - start);
-    return text;
+    std::string label = port::name_of(start);
+    std::snprintf(text, sizeof(text), "0x%08X+0x%X)", start, address - start);
+    char at[16];
+    std::snprintf(at, sizeof(at), "0x%08X (", address);
+    return at + (label.empty() ? std::string() : label + " ") + text;
 }
 
 void append_calls(std::string &out, const Ring &r, uint32_t most) {

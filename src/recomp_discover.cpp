@@ -233,14 +233,17 @@ public:
     // `extra`: starts from the data pointer scan (Pointer, Branch), registered
     // after .pdata and before anything is walked, so the functions around
     // them stop there
-    // `entries`: starts the runtime logged (DiscoverOptions::entries),
-    // registered after the exports
-    Discoverer(const Image &image, const std::map<uint32_t, Source> &extra, const std::vector<uint32_t> &entries)
-        : image_(image), extra_(extra), entries_(entries) {}
+    // `options`: the starts the runtime logged (entries), registered after
+    // the exports; the project file's starts (functions: those with an end
+    // before .pdata, the others after the logged ones) and jump tables
+    Discoverer(const Image &image, const std::map<uint32_t, Source> &extra, const DiscoverOptions &options)
+        : image_(image), extra_(extra), entries_(options.entries), options_(options) {}
 
     Discovery run() {
         add_imports();
         add_helpers();
+        for (const auto &[a, end] : options_.functions)
+            if (end > a && add(a, Source::Project, end - a)) d_.counts["project file's functions"]++;
         for (const PdataEntry &p : image_.pdata) {
             if (!image_.is_code(p.begin)) continue;
             if (add(p.begin, Source::Pdata, p.length)) d_.counts["pdata"]++;
@@ -254,6 +257,8 @@ public:
             if (add(a, Source::Export)) d_.counts["exports"]++;
         for (uint32_t a : entries_)
             if (add(a, Source::Logged)) d_.counts["logged entries"]++;
+        for (const auto &[a, end] : options_.functions)
+            if (end <= a && add(a, Source::Project)) d_.counts["project file's functions"]++;
         for (const auto &[a, source] : extra_) add(a, source);
         settle();
         // gaps: code nothing covers, cut after each end of a function; a
@@ -451,7 +456,10 @@ private:
                         continue;
                     }
                     JumpTable table;
-                    if (read_table(f.address, pc, end, table)) {
+                    // the project file's, in place of what would be read here
+                    auto given = options_.jump_tables.find(pc);
+                    if (given != options_.jump_tables.end()) table.bctr = pc, table.targets = given->second;
+                    if (given != options_.jump_tables.end() || read_table(f.address, pc, end, table)) {
                         for (uint32_t t : table.targets)
                             if (internal(t)) work.push_back(t);
                             else exits.push_back({pc, t});
@@ -701,6 +709,7 @@ private:
     const Image &image_;
     const std::map<uint32_t, Source> &extra_;
     const std::vector<uint32_t> &entries_;
+    const DiscoverOptions &options_;
     Discovery d_;
     std::map<uint32_t, bool> sized_;
     std::deque<uint32_t> pending_;
@@ -823,6 +832,7 @@ void find_resumes(const Image &image, Discovery &d) {
         if (p.exception) handlers.insert(p.begin);
     std::map<uint32_t, uint32_t> tables; // inline jump tables: start, end
     for (const auto &[bctr, t] : d.tables) {
+        if (!t.table) continue; // (the project file's: no table read)
         uint32_t entry = t.kind == JumpTable::Absolute ? 4 : t.kind == JumpTable::HalfwordOffset ? 2 : 1;
         uint32_t &end = tables[t.table];
         end = std::max<uint32_t>(end, t.table + std::max<uint32_t>(entry * uint32_t(t.targets.size()), 4));
@@ -902,7 +912,7 @@ std::vector<uint32_t> scan_pointers(const Image &image) {
 // across the split pointing at no start), until the set holds still.
 Discovery discover(const Image &image, const DiscoverOptions &options) {
     const std::map<uint32_t, Source> none;
-    Discovery d = Discoverer(image, none, options.entries).run();
+    Discovery d = Discoverer(image, none, options).run();
     if (!options.scan_pointers) {
         find_resumes(image, d);
         return d;
@@ -919,6 +929,7 @@ Discovery discover(const Image &image, const DiscoverOptions &options) {
     // as a table is not one (rexglue's scan has no such check).
     std::map<uint32_t, uint32_t> tables; // start, end
     for (const auto &[bctr, t] : d.tables) {
+        if (!t.table) continue; // (the project file's: no table read)
         uint32_t entry = t.kind == JumpTable::Absolute ? 4 : t.kind == JumpTable::HalfwordOffset ? 2 : 1;
         uint32_t &end = tables[t.table];
         end = std::max<uint32_t>(end, t.table + std::max<uint32_t>(entry * uint32_t(t.targets.size()), 4));
@@ -955,7 +966,7 @@ Discovery discover(const Image &image, const DiscoverOptions &options) {
     int pass = 0;
     while (true) {
         pass++;
-        d = Discoverer(image, candidates, options.entries).run();
+        d = Discoverer(image, candidates, options).run();
         if (pass == SCAN_PASSES) break;
         bool changed = false;
 

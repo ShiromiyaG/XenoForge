@@ -14,6 +14,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace xf::recomp {
@@ -72,6 +73,7 @@ enum class Source : uint8_t {
     Call,    // a bl target
     Gap,     // code nothing else covered
     Logged,  // an address the runtime entered the interpreter at as a function (DiscoverOptions::entries)
+    Project, // the project file's (DiscoverOptions::functions)
 };
 const char *source_name(Source s);
 
@@ -139,6 +141,14 @@ struct DiscoverOptions {
     // pointer scan's candidates; the others are ignored. One that lands
     // inside a known function splits it, which costs speed, not correctness.
     std::vector<uint32_t> entries;
+    // Starts the project file gives (docs/recompiler.md, "The project file"):
+    // start, end (0: walked as any start). One with an end is registered
+    // before .pdata, so its size wins; one without, after the exports (a
+    // .pdata start keeps its size).
+    std::map<uint32_t, uint32_t> functions;
+    // Jump tables the project file gives: the bctr, its targets. Read in
+    // place of whatever discovery would read there.
+    std::map<uint32_t, std::vector<uint32_t>> jump_tables;
 };
 
 Discovery discover(const Image &image, const DiscoverOptions &options = {});
@@ -148,12 +158,75 @@ Discovery discover(const Image &image, const DiscoverOptions &options = {});
 // instruction. Sorted, without repeats.
 std::vector<uint32_t> scan_pointers(const Image &image);
 
+// What a port hooks in a function (the project file's hooks and mid hooks;
+// docs/recompiler.md, "Replacing and hooking"). Nothing: the function is
+// emitted as ever.
+struct EmitHooks {
+    // Its callers reach it through a hook slot: its body is emitted as
+    // xfo_<address> (the original), and xf_<address>, what every caller and
+    // the table call, runs the port's hooks when the slot holds any
+    // (ppc_generated.h's XF_HOOKED; the slot xf_hook_<address> is table.cpp's).
+    bool slot = false;
+    // Mid-function hooks inside it: the address (before its instruction runs),
+    // and where the hook may send the code on (labels; the next instruction is
+    // always one). Each one's slot is xf_mid_<address>.
+    std::map<uint32_t, std::vector<uint32_t>> mid;
+    // the mid-function hooks the emitter placed (an address its walk never
+    // reaches has none)
+    mutable std::set<uint32_t> placed;
+    bool empty() const { return !slot && mid.empty(); }
+};
+
 // A function's C++ (ppc_generated.h's form), named prefix + its address in
 // hex; what it calls is named the same way, and added to `calls` when given
-// (what the file holding it declares).
+// (what the file holding it declares). `hooks`: what the port hooks in it.
 std::string emit_function(const Image &image, const Discovery &d, const Function &f, const std::string &prefix,
-                          std::set<uint32_t> *calls = nullptr);
+                          std::set<uint32_t> *calls = nullptr, const EmitHooks *hooks = nullptr);
 std::string function_name(const std::string &prefix, uint32_t address);
+
+// ---- The project file (recomp_project.cpp; docs/recompiler.md, "The project file") ----
+
+// One module's part of a project: what the port says about an executable
+// on the disc.
+struct ProjectModule {
+    std::string path;                      // on the disc ("default.xex"), compared without case
+    std::map<uint32_t, uint32_t> starts;   // functions to add: start, end (0: walked)
+    std::map<uint32_t, std::string> names; // the port's names for functions
+    std::set<uint32_t> hooks;              // functions the port replaces or hooks: reached through a slot
+    std::map<uint32_t, std::vector<uint32_t>> mid_hooks; // address, where the hook may jump
+    std::set<uint32_t> skip;               // functions left to the interpreter
+    std::map<uint32_t, std::vector<uint32_t>> jump_tables; // bctr, targets
+    bool empty() const {
+        return starts.empty() && names.empty() && hooks.empty() && mid_hooks.empty() && skip.empty() &&
+               jump_tables.empty();
+    }
+};
+
+struct Project {
+    std::string name;
+    std::vector<ProjectModule> modules;
+    std::vector<std::string> warnings; // what was read and ignored (an unknown key, a name file's bad lines)
+    // the module's part (nullptr: the project says nothing of it)
+    const ProjectModule *find(const std::string &path) const;
+    ProjectModule &module(const std::string &path); // made when missing
+};
+
+// Reads a project file (and the files it includes and imports names from,
+// relative to it); false, and why, when it cannot be read or is not one.
+bool load_project(const std::filesystem::path &file, Project &out, std::string &error);
+// The same from text; `dir` is where its relative paths start.
+bool parse_project(std::string_view text, const std::filesystem::path &dir, Project &out, std::string &error);
+
+// Names from an MSVC linker map (`/MAP`): its "Publics by Value" and "Static
+// symbols" lines (`0001:00000000  ?Name@@...  82000000 f  obj`), functions
+// only when the map marks them (`f`); the names as the map has them. How many
+// were read.
+size_t read_msvc_map(std::string_view text, std::map<uint32_t, std::string> &names);
+// Names from a Ghidra function list: the Functions window exported as CSV or
+// tab-separated text (a header naming the "Name" and "Location" or "Address"
+// or "Entry Point" columns), or plain lines of an address and a name in
+// either order. How many were read.
+size_t read_ghidra_functions(std::string_view text, std::map<uint32_t, std::string> &names);
 
 // ---- Modules: a disc's executables emitted (recomp_module.cpp) ----
 
@@ -193,6 +266,11 @@ struct EmitOptions {
     // An executable that cannot be read is left out whole (a LeftOut with
     // address 0) instead of stopping the emission.
     bool keep_going = false;
+    // The port's project file (nullptr or empty: the emission is exactly
+    // what it is without one): starts, names, jump tables, functions left
+    // out, and the hook slots of the functions it hooks (docs/recompiler.md,
+    // "The project file").
+    const Project *project = nullptr;
 };
 struct EmittedModule {
     std::string path;      // on the disc: "default.xex", "waves\\L360.dll"
@@ -204,6 +282,9 @@ struct EmittedModule {
     int files = 0, written = 0;
     std::vector<std::string> sources; // what to compile, under the output: its functions_K.cpp, then table.cpp
     std::vector<LeftOut> left_out;    // its functions left out of the generated code
+    // what the project file did: hook slots (functions, mid-function), names
+    size_t hooks = 0, mid_hooks = 0, names = 0;
+    std::vector<std::string> warnings; // what of the project file did not apply (an address no function starts at)
 };
 
 // Each module's directory under `out`, holding its functions as C++ in a
@@ -228,6 +309,13 @@ struct EmittedModule {
 // `    {0xXXXXXXXXu, xf_XXXXXXXX},`.
 bool emit_modules(const std::vector<ModuleFile> &modules, const std::filesystem::path &out,
                   const EmitOptions &options, std::vector<EmittedModule> &emitted, std::string &error);
+
+// One module from an image already read (what emit_modules does for each
+// executable after reading it): its directory under `out`, named `directory`,
+// for the image at `path` on the disc with that digest (xf::image_digest of
+// the image as the loader unpacks it). For the tests, which make images.
+bool emit_image(const Image &image, const std::string &path, uint64_t digest, const std::filesystem::path &out,
+                const std::string &directory, const EmitOptions &options, EmittedModule &m, std::string &error);
 
 // The stub a left-out function's body becomes (recomp_module.cpp, and the
 // recompile step for the functions clang rejects): it dispatches to its own

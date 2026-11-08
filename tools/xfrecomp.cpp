@@ -3,6 +3,7 @@
 //   xfrecomp analyze <game.iso | default.xex> [--xex <path on the disc>]
 //            [--compare <rexglue's *_init.cpp>] [--functions <out.tsv>]
 //            [--tables <out.tsv>] [--unresolved <out.tsv>] [--no-pointers]
+//            [--project <file.toml>] [--check-functions <file.toml>]
 //
 // prints what discovery found by kind; --compare sets the function starts
 // against rexglue's PPCFuncMappings for the same executable; --functions
@@ -10,6 +11,10 @@
 // saves the stack, its resume sites), --tables the jump
 // tables, --unresolved the branches out of a function to no start (function,
 // branch, target); --no-pointers leaves the data pointer scan out.
+// --project discovers with a project file's starts and jump tables for the
+// executable (docs/recompiler.md, "The project file"); --check-functions
+// says how many of a project file's starts (ours, or rexglue's function list)
+// discovery finds without them, and where the others fall.
 //
 //   xfrecomp tests <assembled tests dir> <out dir> [--files N]
 //
@@ -18,6 +23,7 @@
 // every test label a function as long as the code up to the next label.
 //
 //   xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] [--no-pointers] [--listing]
+//                 [--project <file.toml>]
 //
 // writes the generated code of every executable on the disc (each file that
 // is an XEX2 executable, but title updates and the system update's), or of
@@ -33,7 +39,10 @@
 // repository. --listing writes functions_K.ppc beside each functions_K.cpp
 // (each instruction's address, word and disassembly) and #line directives
 // in the C++ pointing at it, so a debugger steps PPC instructions
-// (docs/recompiler.md, "PPC in the host debugger").
+// (docs/recompiler.md, "PPC in the host debugger"). --project applies a
+// port's project file: its starts, names, jump tables, functions left to the
+// interpreter, and the hook slots of what the port hooks; without one (or
+// with an empty one) the emission is the same as ever.
 
 #include "xenoforge/disc.h"
 #include "xenoforge/recomp.h"
@@ -49,6 +58,7 @@
 #include <functional>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <regex>
 #include <set>
 #include <string>
@@ -62,9 +72,10 @@ namespace {
 int usage() {
     std::fprintf(stderr, "usage: xfrecomp analyze <game.iso | default.xex> [--xex <path>] [--compare <init.cpp>] "
                          "[--functions <out.tsv>] [--tables <out.tsv>] [--unresolved <out.tsv>] [--no-pointers]\n"
+                         "                [--project <file.toml>] [--check-functions <file.toml>]\n"
                          "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n"
                          "       xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] "
-                         "[--no-pointers] [--listing]\n");
+                         "[--no-pointers] [--listing] [--project <file.toml>]\n");
     return 2;
 }
 
@@ -213,18 +224,25 @@ bool add_listing(const std::filesystem::path &cpp, const std::function<uint32_t(
 
 // the disc's modules through recomp::emit_modules (recomp_module.cpp), a line each
 int emit(const std::string &input, const std::vector<std::string> &only, const std::filesystem::path &out, int files,
-         const recomp::DiscoverOptions &options, bool listing) {
+         const recomp::DiscoverOptions &options, bool listing, const recomp::Project *project) {
     std::string error;
     std::vector<recomp::ModuleFile> modules;
     if (!recomp::find_modules(input, only, modules, error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     recomp::EmitOptions o;
     o.files = files;
     o.discover = options;
+    o.project = project;
     std::vector<recomp::EmittedModule> emitted;
     if (!recomp::emit_modules(modules, out, o, emitted, error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
     for (const recomp::EmittedModule &m : emitted)
         std::printf("%-28s %7zu functions, %9llu instructions, %4d files, %4d written (%s)\n", m.path.c_str(),
                     m.functions, (unsigned long long)m.instructions, m.files, m.written, m.directory.c_str());
+    for (const recomp::EmittedModule &m : emitted) {
+        if (m.hooks || m.mid_hooks || m.names)
+            std::printf("%-28s %7zu hook slots, %zu mid-function, %zu names\n", m.path.c_str(), m.hooks, m.mid_hooks,
+                        m.names);
+        for (const std::string &w : m.warnings) std::printf("%-28s project: %s\n", m.path.c_str(), w.c_str());
+    }
     if (listing) {
         // the words from each module's image, as the emitter read them
         for (size_t k = 0; k < emitted.size(); k++) {
@@ -248,21 +266,36 @@ int emit(const std::string &input, const std::vector<std::string> &only, const s
     return 0;
 }
 
+// a project file, its warnings printed (nullptr, and why, when it cannot be read)
+std::unique_ptr<recomp::Project> load_project(const char *path) {
+    auto p = std::make_unique<recomp::Project>();
+    std::string error;
+    if (!recomp::load_project(path, *p, error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
+        return nullptr;
+    }
+    for (const std::string &w : p->warnings) std::fprintf(stderr, "project: %s\n", w.c_str());
+    return p;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 4 && std::string(argv[1]) == "emit") {
         std::vector<std::string> only;
         int files = 0; // by each module's size
         bool listing = false;
         recomp::DiscoverOptions options;
+        std::unique_ptr<recomp::Project> project;
         for (int k = 4; k < argc; k++) {
             std::string a = argv[k];
-            if (a == "--files" && k + 1 < argc) files = std::max(1, std::atoi(argv[++k]));
+            if (a == "--project" && k + 1 < argc) {
+                if (!(project = load_project(argv[++k]))) return 1;
+            } else if (a == "--files" && k + 1 < argc) files = std::max(1, std::atoi(argv[++k]));
             else if (a == "--xex" && k + 1 < argc) only.push_back(argv[++k]);
             else if (a == "--no-pointers") options.scan_pointers = false;
             else if (a == "--listing") listing = true;
             else return usage();
         }
-        return emit(argv[2], only, argv[3], files, options, listing);
+        return emit(argv[2], only, argv[3], files, options, listing, project.get());
     }
     if (argc >= 4 && std::string(argv[1]) == "tests") {
         int files = 16;
@@ -273,6 +306,7 @@ int main(int argc, char **argv) {
     if (argc < 3 || std::string(argv[1]) != "analyze") return usage();
     std::string input = argv[2], xex_path = "default.xex", compare, functions_out, tables_out, unresolved_out;
     recomp::DiscoverOptions options;
+    std::unique_ptr<recomp::Project> project, checked;
     for (int k = 3; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc) xex_path = argv[++k];
@@ -281,7 +315,11 @@ int main(int argc, char **argv) {
         else if (a == "--tables" && k + 1 < argc) tables_out = argv[++k];
         else if (a == "--unresolved" && k + 1 < argc) unresolved_out = argv[++k];
         else if (a == "--no-pointers") options.scan_pointers = false;
-        else return usage();
+        else if (a == "--project" && k + 1 < argc) {
+            if (!(project = load_project(argv[++k]))) return 1;
+        } else if (a == "--check-functions" && k + 1 < argc) {
+            if (!(checked = load_project(argv[++k]))) return 1;
+        } else return usage();
     }
     std::string error;
     Xex xex;
@@ -295,6 +333,11 @@ int main(int argc, char **argv) {
         if (s.code) std::printf("code          %-10s 0x%08X-0x%08X\n", s.name.c_str(), s.address, s.address + s.size);
     std::printf(".pdata        %zu entries; %zu imported functions\n", image.pdata.size(), image.imports.size());
 
+    if (const recomp::ProjectModule *pm = project ? project->find(xex_path) : nullptr) {
+        for (const auto &[a, end] : pm->starts) options.functions.emplace(a, end);
+        for (uint32_t a : pm->hooks) options.functions.emplace(a, 0);
+        for (const auto &[bctr, targets] : pm->jump_tables) options.jump_tables[bctr] = targets;
+    }
     recomp::Discovery d = recomp::discover(image, options);
     for (const auto &[what, n] : d.counts) std::printf("  %-36s %llu\n", what.c_str(), (unsigned long long)n);
     std::map<int, uint64_t> kinds;
@@ -329,6 +372,36 @@ int main(int argc, char **argv) {
             f << std::hex << at << '\t' << int(t.kind) << '\t' << t.table << '\t' << std::dec << t.index;
             for (uint32_t target : t.targets) f << '\t' << std::hex << target;
             f << '\n';
+        }
+    }
+
+    if (const recomp::ProjectModule *pm = checked ? checked->find(xex_path) : nullptr) {
+        // the list's starts against this discovery (made without them)
+        uint64_t found = 0, inside = 0, labels = 0, outside = 0, not_code = 0;
+        std::vector<uint32_t> examples;
+        for (const auto &[a, end] : pm->starts) {
+            if (d.functions.count(a)) {
+                found++;
+                continue;
+            }
+            if (!image.is_code(a)) {
+                not_code++;
+                continue;
+            }
+            auto it = d.functions.upper_bound(a);
+            bool in = it != d.functions.begin() && a < std::prev(it)->first + std::prev(it)->second.size;
+            (in ? inside : outside)++;
+            if (in && std::prev(it)->second.blocks.count(a)) labels++;
+            if (examples.size() < 12) examples.push_back(a);
+        }
+        std::printf("the project file's %zu starts: %llu found here, %llu inside a function here (%llu of them "
+                    "branch targets there), %llu in no function, %llu not code\n",
+                    pm->starts.size(), (unsigned long long)found, (unsigned long long)inside,
+                    (unsigned long long)labels, (unsigned long long)outside, (unsigned long long)not_code);
+        if (!examples.empty()) {
+            std::printf("  not found:");
+            for (uint32_t a : examples) std::printf(" %08X", a);
+            std::printf("\n");
         }
     }
 

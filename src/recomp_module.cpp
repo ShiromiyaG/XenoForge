@@ -68,16 +68,108 @@ bool stopped(const EmitOptions &o, EmitStage stage, size_t done, size_t total, c
     return o.progress && !o.progress(stage, done, total, detail);
 }
 
-// One module's directory (recomp.h); false, and why, when the executable
-// cannot be read or the emission is stopped.
-bool emit_module(const ModuleFile &e, const std::filesystem::path &out, const std::string &directory,
-                 const EmitOptions &options, size_t index, size_t count, EmittedModule &m, std::string &error) {
-    Xex xex;
-    Image image;
-    if (!parse_xex(e.file, xex, error) || !load_xex_image(e.file, xex, error) || !read_image(xex, image, error))
-        return error = e.path + ": " + error, false;
-    Discovery d = discover(image, options.discover);
-    if (stopped(options, EmitStage::Discovering, index + 1, count, e.path)) return error = "stopped", false;
+// a name as a C++ string literal's text
+std::string escaped(const std::string &text) {
+    std::string out;
+    for (char ch : text) {
+        if (ch == '\\' || ch == '"') out += '\\', out += ch;
+        else if (uint8_t(ch) < 0x20 || uint8_t(ch) >= 0x7F) {
+            char b[8];
+            std::snprintf(b, sizeof(b), "\\%03o", unsigned(uint8_t(ch)));
+            out += b;
+        } else out += ch;
+    }
+    return out;
+}
+
+// What the project file asks of one module: the discovery's extra starts and
+// tables, the functions' names, hooks and mid hooks by function, the ones
+// left out, and what of it did not apply.
+struct ModulePlan {
+    DiscoverOptions discover;
+    std::map<uint32_t, EmitHooks> hooks;    // by function
+    std::map<uint32_t, std::string> names;  // the names given to functions
+    std::set<uint32_t> skip;
+};
+
+ModulePlan plan(const ProjectModule *pm, const EmitOptions &options) {
+    ModulePlan p;
+    p.discover = options.discover;
+    if (!pm) return p;
+    for (const auto &[a, end] : pm->starts) p.discover.functions.emplace(a, end);
+    // a function the port hooks is a function, wherever discovery would put it
+    for (uint32_t a : pm->hooks) p.discover.functions.emplace(a, 0);
+    for (const auto &[bctr, targets] : pm->jump_tables) p.discover.jump_tables[bctr] = targets;
+    p.skip = pm->skip;
+    return p;
+}
+
+// Applies the project's names and hooks to what discovery found; warnings for
+// what has nowhere to go.
+void apply_project(const ProjectModule &pm, Discovery &d, ModulePlan &p, EmittedModule &m) {
+    size_t unplaced_names = 0;
+    for (const auto &[a, name] : pm.names) {
+        auto it = d.functions.find(a);
+        if (it == d.functions.end() || name.empty()) {
+            unplaced_names += !pm.mid_hooks.count(a); // (a mid hook's name is the hook's)
+            continue;
+        }
+        it->second.name = name;
+        p.names[a] = name;
+    }
+    if (unplaced_names)
+        m.warnings.push_back(std::to_string(unplaced_names) + " names at addresses no function starts at");
+    for (uint32_t a : pm.hooks) {
+        auto it = d.functions.find(a);
+        if (it == d.functions.end()) {
+            m.warnings.push_back("hook 0x" + hex(a, 8) + ": no function there (not code?)");
+        } else if (it->second.source == Source::Import) {
+            m.warnings.push_back("hook 0x" + hex(a, 8) +
+                                 ": an import's thunk, reached through dispatch: its hooks need no slot");
+        } else if (p.skip.count(a)) {
+            m.warnings.push_back("hook 0x" + hex(a, 8) + ": skipped too, so interpreted: its hooks run there");
+        } else {
+            p.hooks[a].slot = true;
+        }
+    }
+    for (const auto &[a, jumps] : pm.mid_hooks) {
+        auto it = d.functions.upper_bound(a);
+        if (it == d.functions.begin() || a >= std::prev(it)->first + std::max<uint32_t>(std::prev(it)->second.size, 4) ||
+            std::prev(it)->second.source == Source::Import) {
+            m.warnings.push_back("mid hook 0x" + hex(a, 8) + ": inside no function");
+            continue;
+        }
+        p.hooks[std::prev(it)->first].mid[a] = jumps;
+    }
+}
+
+// The port's names as constants, for its sources (names.h beside table.cpp)
+std::string names_header(const std::string &path, const std::string &ns, const std::map<uint32_t, std::string> &names) {
+    std::string t = "// Written by xfrecomp emit from " + path +
+                    ": the project file's names for its functions, for the port's sources.\n#pragma once\n\n"
+                    "#include <cstdint>\n\nnamespace " + ns + "::names {\n";
+    std::set<std::string> used;
+    for (const auto &[a, name] : names) {
+        std::string id;
+        for (char ch : name) id += std::isalnum(uint8_t(ch)) ? ch : '_';
+        if (id.empty() || std::isdigit(uint8_t(id[0]))) id = "_" + id;
+        if (!used.insert(id).second) used.insert(id += "_" + hex(a, 8));
+        t += "inline constexpr uint32_t " + id + " = 0x" + hex(a, 8) + "u;\n";
+    }
+    return t + "} // namespace " + ns + "::names\n";
+}
+
+// One module's directory from its image (recomp.h's emit_image); false, and
+// why, when the emission is stopped.
+bool emit_image_at(const Image &image, const std::string &path, uint64_t digest, const std::filesystem::path &out,
+                   const std::string &directory, const EmitOptions &options, size_t index, size_t count,
+                   EmittedModule &m, std::string &error) {
+    const ProjectModule *pm = options.project ? options.project->find(path) : nullptr;
+    if (pm && pm->empty()) pm = nullptr;
+    ModulePlan p = plan(pm, options);
+    Discovery d = discover(image, p.discover);
+    if (pm) apply_project(*pm, d, p, m);
+    if (stopped(options, EmitStage::Discovering, index + 1, count, path)) return error = "stopped", false;
     const std::filesystem::path dir = out / directory;
     std::filesystem::create_directories(dir);
     const std::string ns = "xfm_" + directory, prefix = "xf_";
@@ -99,23 +191,35 @@ bool emit_module(const ModuleFile &e, const std::filesystem::path &out, const st
     std::map<uint32_t, std::vector<const Function *>> by_file;
     for (const Function *fn : list) by_file[(fn->address - image.base) / bucket].push_back(fn);
     const std::string open = "namespace " + ns + " {\n\n", close = "\n} // namespace " + ns + "\n";
-    const std::string head = "// Written by xfrecomp emit from " + e.path +
+    const std::string head = "// Written by xfrecomp emit from " + path +
                              ". Game code: not for the repository.\n#include \"xenoforge/ppc_generated.h\"\n\n";
     std::set<std::string> current;
     std::set<uint32_t> left; // the functions left out: no generated code in the table
+    // the hook slots the emitted code holds: functions (their original body
+    // xfo_), mid-function hooks
+    std::map<uint32_t, uint32_t> slots; // address, the function's size
+    std::set<uint32_t> mids;
     size_t done = 0;
     for (const auto &[k, functions] : by_file) {
         std::string bodies;
         std::set<uint32_t> calls;
+        std::set<uint32_t> file_slots, file_mids;
         for (const Function *fn : functions) {
-            // a function the emitter cannot emit (or the options leave out)
-            // becomes a stub that dispatches to the interpreter
-            std::string reason = options.leave_out ? options.leave_out(e.path, fn->address) : std::string();
+            // a function the emitter cannot emit (or the options or the
+            // project leave out) becomes a stub that dispatches to the
+            // interpreter
+            std::string reason = options.leave_out ? options.leave_out(path, fn->address) : std::string();
+            if (reason.empty() && p.skip.count(fn->address)) reason = "the project file skips it";
             if (reason.empty()) {
                 try {
                     std::set<uint32_t> its;
-                    bodies += emit_function(image, d, *fn, prefix, &its) + "\n";
+                    auto h = p.hooks.find(fn->address);
+                    const EmitHooks *hooks = h == p.hooks.end() ? nullptr : &h->second;
+                    if (hooks) hooks->placed.clear();
+                    bodies += emit_function(image, d, *fn, prefix, &its, hooks) + "\n";
                     calls.insert(its.begin(), its.end());
+                    if (hooks && hooks->slot) file_slots.insert(fn->address), slots[fn->address] = fn->size;
+                    if (hooks) file_mids.insert(hooks->placed.begin(), hooks->placed.end());
                 } catch (const std::exception &x) {
                     reason = std::string("the emitter failed: ") + x.what();
                 }
@@ -123,33 +227,47 @@ bool emit_module(const ModuleFile &e, const std::filesystem::path &out, const st
             if (!reason.empty()) {
                 bodies += left_out_stub(prefix, fn->address, reason) + "\n";
                 left.insert(fn->address);
-                m.left_out.push_back({e.path, fn->address, reason});
+                m.left_out.push_back({path, fn->address, reason});
             }
             calls.insert(fn->address);
         }
+        mids.insert(file_mids.begin(), file_mids.end());
         std::string text = head + open;
         for (uint32_t a : calls) text += "XF_FN(" + function_name(prefix, a) + ");\n";
+        // (the slots are table.cpp's)
+        for (uint32_t a : file_slots) text += "extern ::xf::ppc::HookSlot xf_hook_" + hex(a, 8) + ";\n";
+        for (uint32_t a : file_mids) text += "extern ::xf::ppc::HookSlot xf_mid_" + hex(a, 8) + ";\n";
         text += "\n" + bodies + close;
         std::string name = "functions_" + std::to_string(k) + ".cpp";
         current.insert(name);
         m.written += write_if_changed(dir / name, text);
         m.sources.push_back(directory + "/" + name);
-        if (stopped(options, EmitStage::Emitting, ++done, by_file.size() + 1, e.path + ": " + name))
+        if (stopped(options, EmitStage::Emitting, ++done, by_file.size() + 1, path + ": " + name))
             return error = "stopped", false;
     }
+    if (pm)
+        for (const auto &[a, jumps] : pm->mid_hooks)
+            if (!mids.count(a)) {
+                bool inside = false;
+                for (const auto &[f, h] : p.hooks) inside |= h.mid.count(a) != 0;
+                if (inside) m.warnings.push_back("mid hook 0x" + hex(a, 8) + ": no instruction its function runs");
+            }
     // files of an earlier emission that hold nothing now: left empty
     for (const auto &entry : std::filesystem::directory_iterator(dir)) {
         std::string name = entry.path().filename().string();
         if (name.starts_with("functions_") && name.ends_with(".cpp") && !current.count(name))
             m.written += write_if_changed(entry.path(), "\n");
     }
-    // an earlier layout's header of every function
+    // an earlier layout's header of every function, and an earlier
+    // project's names
     std::error_code ec;
     std::filesystem::remove(dir / "functions.h", ec);
+    if (p.names.empty()) std::filesystem::remove(dir / "names.h", ec);
+    else m.written += write_if_changed(dir / "names.h", names_header(path, ns, p.names));
     // the path as a C++ string
     std::string literal;
-    for (char ch : e.path) literal += ch == '\\' ? std::string("\\\\") : std::string(1, ch);
-    std::string t = "// Written by xfrecomp emit: " + e.path + "'s functions by address, for dispatch.\n" +
+    for (char ch : path) literal += ch == '\\' ? std::string("\\\\") : std::string(1, ch);
+    std::string t = "// Written by xfrecomp emit: " + path + "'s functions by address, for dispatch.\n" +
                     "#include \"xenoforge/ppc_generated.h\"\n\n" + open;
     for (const Function *fn : list) t += "XF_FN(" + function_name(prefix, fn->address) + ");\n";
     t += "\nconst ::xf::ppc::GeneratedFunction functions[] = {\n";
@@ -166,19 +284,55 @@ bool emit_module(const ModuleFile &e, const std::filesystem::path &out, const st
     t += "};\n\nconst uint32_t resumes[] = {";
     for (uint32_t a : resumes) t += "0x" + function_name("", a) + "u, ";
     if (resumes.empty()) t += "0 /* (none: the count says 0) */";
-    m.digest = image_digest(xex.image);
-    t += "};\n\n// the image it was made from: path, base, size, digest (xf::image_digest)\n"
+    t += "};\n\n";
+    // The project file's: the hook slots (the runtime fills them; the
+    // generated code reads them) and the names, for the reports. Nothing
+    // without one, so the table is what it was.
+    std::string extra;
+    if (!slots.empty() || !mids.empty()) {
+        t += "// the hook slots of what the port hooks (ppc_module.h's HookSlot): functions, then mid-function\n";
+        for (const auto &[a, size] : slots) t += "XF_FN(xfo_" + hex(a, 8) + ");\n";
+        for (const auto &[a, size] : slots)
+            t += "::xf::ppc::HookSlot xf_hook_" + hex(a, 8) + " = {0x" + hex(a, 8) + "u, 0x" + hex(size, 0) + "u, xfo_" +
+                 hex(a, 8) + ", nullptr};\n";
+        for (uint32_t a : mids) t += "::xf::ppc::HookSlot xf_mid_" + hex(a, 8) + " = {0x" + hex(a, 8) + "u, 0u, nullptr, nullptr};\n";
+        t += "::xf::ppc::HookSlot *const hooks[] = {";
+        for (const auto &[a, size] : slots) t += "&xf_hook_" + hex(a, 8) + ", ";
+        for (uint32_t a : mids) t += "&xf_mid_" + hex(a, 8) + ", ";
+        t += "};\n\n";
+        extra = ", hooks, " + std::to_string(slots.size() + mids.size());
+    }
+    if (!p.names.empty()) {
+        t += "// the project file's names for its functions\nconst ::xf::ppc::FunctionName names[] = {\n";
+        for (const auto &[a, name] : p.names) t += "    {0x" + hex(a, 8) + "u, \"" + escaped(name) + "\"},\n";
+        t += "};\n\n";
+        extra = (extra.empty() ? std::string(", nullptr, 0") : extra) + ", names, " + std::to_string(p.names.size());
+    }
+    m.hooks = slots.size(), m.mid_hooks = mids.size(), m.names = p.names.size();
+    m.digest = digest;
+    t += "// the image it was made from: path, base, size, digest (xf::image_digest)\n"
          "extern const ::xf::ppc::GeneratedModule module = {\"" +
-         literal + "\", 0x" + hex(xex.base_address, 8) + "u, 0x" + hex(xex.image.size(), 8) + "u, 0x" +
-         hex(m.digest, 16) + "ull, functions, " + std::to_string(list.size()) + ", resumes, " +
-         std::to_string(resumes.size()) + "};\n" + close;
+         literal + "\", 0x" + hex(image.base, 8) + "u, 0x" + hex(image.bytes.size(), 8) + "u, 0x" + hex(m.digest, 16) +
+         "ull, functions, " + std::to_string(list.size()) + ", resumes, " + std::to_string(resumes.size()) + extra +
+         "};\n" + close;
     m.written += write_if_changed(dir / "table.cpp", t);
     m.sources.push_back(directory + "/table.cpp");
-    if (stopped(options, EmitStage::Emitting, ++done, by_file.size() + 1, e.path + ": table.cpp"))
+    if (stopped(options, EmitStage::Emitting, ++done, by_file.size() + 1, path + ": table.cpp"))
         return error = "stopped", false;
-    m.path = e.path, m.directory = directory, m.ns = ns;
+    m.path = path, m.directory = directory, m.ns = ns;
     m.functions = list.size(), m.instructions = total, m.files = int(by_file.size());
     return true;
+}
+
+// One module's directory (recomp.h); false, and why, when the executable
+// cannot be read or the emission is stopped.
+bool emit_module(const ModuleFile &e, const std::filesystem::path &out, const std::string &directory,
+                 const EmitOptions &options, size_t index, size_t count, EmittedModule &m, std::string &error) {
+    Xex xex;
+    Image image;
+    if (!parse_xex(e.file, xex, error) || !load_xex_image(e.file, xex, error) || !read_image(xex, image, error))
+        return error = e.path + ": " + error, false;
+    return emit_image_at(image, e.path, image_digest(xex.image), out, directory, options, index, count, m, error);
 }
 
 } // namespace
@@ -259,6 +413,11 @@ bool emit_modules(const std::vector<ModuleFile> &modules, const std::filesystem:
     // table, no sources, only their left_out
     for (EmittedModule &m : skipped) emitted.push_back(std::move(m));
     return true;
+}
+
+bool emit_image(const Image &image, const std::string &path, uint64_t digest, const std::filesystem::path &out,
+                const std::string &directory, const EmitOptions &options, EmittedModule &m, std::string &error) {
+    return emit_image_at(image, path, digest, out, directory, options, 0, 1, m, error);
 }
 
 std::string left_out_stub(const std::string &prefix, uint32_t address, const std::string &reason) {

@@ -21,6 +21,8 @@
 
 #include "objects.h"
 
+#include "xenoforge/hooks.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cfenv>
@@ -160,6 +162,9 @@ struct Lockstep::Check {
     // time the generated code started (address, the load's pc; pc 0: none)
     uint32_t changed = 0, changed_pc = 0;
     uint64_t steps = 0;
+    // a mid-function hook the segment starts at, which ran already (the
+    // generated code went on there after it)
+    uint32_t skip_mid = ~0u;
     std::vector<uint64_t> times;
     size_t time_next = 0;
 };
@@ -172,8 +177,32 @@ Lockstep::Lockstep(Kernel &k, const LockstepOptions &options)
     : k_(k), options_(options), functions_(options.functions.begin(), options.functions.end()),
       generation_(next_generation++) {
     system_.owner = this;
-    // every call interpreted: the segment is the call's whole tree
-    system_.call = [](ppc::Context &, uint32_t) { return false; };
+    // every call interpreted: the segment is the call's whole tree, but for
+    // the port's hooks, which end it as an import does (the generated code
+    // runs them once, for real: Kernel's hook_boundary)
+    system_.call = [](ppc::Context &c, uint32_t target) {
+        if (hooks::in_hooked_page(target))
+            if (const hooks::Entry *e = hooks::find(target); e && e->function())
+                throw Stop{static_cast<Lockstep *>(c.system->owner)->k_.hook_marker(target), nullptr};
+        return false;
+    };
+    system_.hook_pages = hooks::pages();
+    system_.enter_hooked = [](ppc::Context &c, uint32_t target, uint32_t from) {
+        const hooks::Entry *e = hooks::find(target);
+        if (!e || !e->function()) return false;
+        const uint32_t size = hooks::function_size(target);
+        if (from >= target && from - target < size) return false;
+        throw Stop{static_cast<Lockstep *>(c.system->owner)->k_.hook_marker(target), nullptr};
+    };
+    system_.mid_hook = [](ppc::Context &c, uint32_t pc) -> uint32_t {
+        const hooks::Entry *e = hooks::find(pc);
+        if (!e || e->mid.empty()) return 0;
+        if (t_check && t_check->skip_mid == pc) {
+            t_check->skip_mid = ~0u;
+            return 0;
+        }
+        throw Stop{static_cast<Lockstep *>(c.system->owner)->k_.hook_marker(pc), nullptr};
+    };
     system_.syscall = [](ppc::Context &c) {
         Lockstep &l = *static_cast<Lockstep *>(c.system->owner);
         const Import *import = nullptr;
@@ -235,7 +264,7 @@ void Lockstep::check(ppc::Context &c, uint32_t target, void (*fn)(ppc::Context &
     Check &check = *t_check;
     check.active = true, check.c = &c, check.root = target;
     check.until = uint32_t(c.lr) & ~3u, check.stack_top = uint32_t(c.r[1]);
-    check.import_depth = 0, check.previous = nullptr;
+    check.import_depth = 0, check.previous = nullptr, check.skip_mid = ~0u;
     {
         std::lock_guard lock(mutex_);
         counts_.calls++;
@@ -267,11 +296,13 @@ void Lockstep::before_import(ppc::Context &c, const Import &import) {
     compare(*check, c, &import);
 }
 
-void Lockstep::after_import(ppc::Context &c) {
+void Lockstep::after_import(ppc::Context &c, uint32_t resume, bool skip_mid) {
     Check *check = current(c);
     if (!check || --check->import_depth > 0) return;
     // the import returns to LR (its thunk's blr): the next segment from there
-    begin_segment(*check, c, uint32_t(c.lr) & ~3u);
+    // (a hook's: where the code goes on, past the mid hook that ran there)
+    check->skip_mid = skip_mid ? resume : ~0u;
+    begin_segment(*check, c, resume ? resume : uint32_t(c.lr) & ~3u);
 }
 
 std::unique_ptr<Memory::PrivateView> Lockstep::acquire_view(std::string &error) {
@@ -549,6 +580,9 @@ void Lockstep::compare(Check &check, ppc::Context &c, const Import *import) {
     const Import *after = check.previous; // the import the segment started after (none: the call's start)
     check.previous = import;
     if (number > (raced ? 3 : options_.print_limit)) return;
+    // the port's name for the function, when it has one
+    std::string root_name = port::name_of(check.root);
+    if (!root_name.empty()) root_name += " ";
     std::lock_guard lock(print_mutex);
     if (raced) {
         // a line: where it read what changed
@@ -559,9 +593,9 @@ void Lockstep::compare(Check &check, ppc::Context &c, const Import *import) {
         return;
     }
     std::fprintf(stderr,
-                 "lockstep: mismatch %" PRIu64 " in the call to 0x%08X: the segment from 0x%08X (%s%s) to %s, %" PRIu64
+                 "lockstep: mismatch %" PRIu64 " in the call to %s0x%08X: the segment from 0x%08X (%s%s) to %s, %" PRIu64
                  " instructions interpreted\n",
-                 number, check.root, check.from, after ? "after " : "the call's start",
+                 number, root_name.c_str(), check.root, check.from, after ? "after " : "the call's start",
                  after ? (after->library + "!" + after->name).c_str() : "", name(check.import).c_str(), check.steps);
     for (const std::string &line : lines) std::fprintf(stderr, "%s\n", line.c_str());
     std::fflush(stderr);

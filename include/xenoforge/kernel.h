@@ -307,7 +307,9 @@ public:
     void call(ppc::Context &c, uint32_t address);
     // what generated code's dispatch() and the interpreter's calls reach
     void dispatch(ppc::Context &c, uint32_t target);
-    bool try_call(ppc::Context &c, uint32_t target); // generated or import: ran it
+    // generated, an import or the port's hooks there (hooks false: those
+    // left out, for a hooked function's original body): ran it
+    bool try_call(ppc::Context &c, uint32_t target, bool hooks = true);
     // Runs the guest from pc with no frame to return to (a guest stack's
     // host stack, from where the stack was entered): the function at pc,
     // generated or imported, then on where it returns; the interpreter where
@@ -424,6 +426,13 @@ private:
     friend class Lockstep;
     // (try_call's) generated code run, or checked by the lockstep check
     void run_generated(ppc::Context &c, uint32_t target, void (*fn)(ppc::Context &));
+    // The port's hooks (xenoforge/hooks.h): a hooked function reached through
+    // dispatch whose generated code has no hook slot (or none at all) run
+    // with its hooks; its original body (System::run_original); and the
+    // marker the lockstep check names a hook by, as an import.
+    bool call_hooked(ppc::Context &c, uint32_t target);
+    void run_original(ppc::Context &c, uint32_t address);
+    const Import *hook_marker(uint32_t address);
     void bind(const Xex &xex, bool executable);
     void run_import(ppc::Context &c, const Import &import);
     void publish_code();
@@ -484,6 +493,8 @@ private:
     std::mutex states_mutex_;
     std::map<const void *, std::shared_ptr<void>> states_;
     std::unique_ptr<Lockstep> lockstep_;
+    std::mutex hook_markers_mutex_;
+    std::map<uint32_t, Import> hook_markers_; // never dropped: the lockstep check keeps pointers
     std::unique_ptr<Objects> objects_; // last: it reaches the rest
 };
 

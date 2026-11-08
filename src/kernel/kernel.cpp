@@ -29,6 +29,7 @@
 #include "objects.h"
 #include "xenoforge/crash.h"
 #include "xenoforge/exports.h"
+#include "xenoforge/hooks.h"
 #include "xenoforge/ppc_interp.h"
 
 #include <algorithm>
@@ -162,6 +163,33 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         k.objects_->scheduler->advance(k.deterministic_time_base_cost_);
         return k.objects_->now() * 5;
     };
+    // the port's hooks (xenoforge/hooks.h), for the interpreter
+    system_.hook_pages = hooks::pages();
+    system_.enter_hooked = [](ppc::Context &c, uint32_t target, uint32_t from) {
+        // a branch from outside a hooked function to its start (its size from
+        // its slot; unknown, every branch there: a loop back to a function's
+        // first instruction is rarer than a tail call to it)
+        const hooks::Entry *e = hooks::find(target);
+        if (!e || !e->function()) return false;
+        const uint32_t size = hooks::function_size(target);
+        if (from >= target && from - target < size) return false;
+        return static_cast<Kernel *>(c.system->owner)->try_call(c, target);
+    };
+    system_.mid_hook = [](ppc::Context &c, uint32_t pc) -> uint32_t {
+        const hooks::Entry *e = hooks::find(pc);
+        return e && !e->mid.empty() ? hooks::run_mid(c, *e) : 0;
+    };
+    system_.run_original = [](ppc::Context &c, uint32_t address) {
+        static_cast<Kernel *>(c.system->owner)->run_original(c, address);
+    };
+    system_.hook_boundary = [](ppc::Context &c, uint32_t address, bool after, uint32_t resume) {
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        if (!k.lockstep_) return;
+        // the port's code is to the check what an import is: run once, for
+        // real, between two segments
+        if (!after) k.lockstep_->before_import(c, *k.hook_marker(address));
+        else k.lockstep_->after_import(c, resume, resume == address);
+    };
     system_.yield = [](ppc::Context &c) {
         // the yield points' budget ran out (ppc_ops.h): the clock moves by
         // the whole ticks spent, and another thread may run (a spin on a flag
@@ -188,6 +216,8 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
 
 // the devices' threads end while the objects they run on are still here
 Kernel::~Kernel() {
+    // the port's hooks no longer reach this kernel's modules through their slots
+    for (const auto &[base, m] : code_->loaded) hooks::unbind(*m);
     shutdown_xam_tasks(*this);
     shutdown_file_completion(*this);
     shutdown_audio(*this);
@@ -438,12 +468,18 @@ std::string Kernel::add_module_code(const Xex &xex) {
     }
     code_->loaded[base] = match;
     publish_code();
+    // its hook slots bound to the port's hooks, its names taken in
+    hooks::bind(*match);
     return "generated code, " + std::to_string(match->count) + " functions";
 }
 
 void Kernel::remove_module_code(uint32_t base) {
     std::lock_guard lock(code_->mutex);
-    if (code_->loaded.erase(base)) publish_code();
+    auto it = code_->loaded.find(base);
+    if (it == code_->loaded.end()) return;
+    hooks::unbind(*it->second);
+    code_->loaded.erase(it);
+    publish_code();
 }
 
 // (code_->mutex held)
@@ -493,7 +529,11 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
     if (import_hook_) import_hook_(import_hook_user_, import, c, true);
 }
 
-bool Kernel::try_call(ppc::Context &c, uint32_t target) {
+bool Kernel::try_call(ppc::Context &c, uint32_t target, bool hooks) {
+    // the port's hooks, where a page holds any (a function with a slot runs
+    // its own, below)
+    if (hooks && hooks::in_hooked_page(target)) [[unlikely]]
+        if (call_hooked(c, target)) return true;
     if (generated_count_) {
         const Generated *end = generated_ + generated_count_;
         const Generated *it =
@@ -532,6 +572,40 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
         return true;
     }
     return false;
+}
+
+bool Kernel::call_hooked(ppc::Context &c, uint32_t target) {
+    const hooks::Entry *e = hooks::find(target);
+    if (!e || !e->function() || hooks::slotted(target)) return false;
+    hooks::run(c, *e, nullptr); // the original through run_original
+    return true;
+}
+
+void Kernel::run_original(ppc::Context &c, uint32_t address) {
+    // the function as dispatch runs it, its hooks left out: generated code,
+    // an import, else the interpreter until it returns
+    const uint32_t until = uint32_t(c.lr) & ~3u, stack_top = uint32_t(c.r[1]);
+    if (try_call(c, address, false)) return;
+    interpreted_++;
+    {
+        std::lock_guard<std::mutex> lock(counts_mutex_);
+        interpreted_targets_[address]++;
+    }
+    if (entry_hook_) entered(address);
+    interpret_from(c, address, until, stack_top);
+}
+
+const Import *Kernel::hook_marker(uint32_t address) {
+    std::lock_guard lock(hook_markers_mutex_);
+    auto [it, made] = hook_markers_.try_emplace(address);
+    if (made) {
+        std::string name = port::name_of(address);
+        char hex[16];
+        std::snprintf(hex, sizeof(hex), "0x%08X", address);
+        it->second.library = "port", it->second.name = name.empty() ? hex : name + " (" + hex + ")";
+        it->second.thunk = address;
+    }
+    return &it->second;
 }
 
 void Kernel::run_generated(ppc::Context &c, uint32_t target, void (*fn)(ppc::Context &)) {

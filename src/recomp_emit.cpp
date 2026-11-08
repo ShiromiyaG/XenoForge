@@ -39,9 +39,9 @@ std::string hex8(uint32_t v) {
 class Emitter {
 public:
     Emitter(const Image &image, const Discovery &d, const Function &f, const std::string &prefix,
-            std::set<uint32_t> *calls)
+            std::set<uint32_t> *calls, const EmitHooks *hooks)
         : image_(image), d_(d), f_(f), prefix_(prefix), end_(f.address + std::max<uint32_t>(f.size, 4)), calls_(calls),
-          checked_(f.switches_stack) {
+          checked_(f.switches_stack), hooks_(hooks && !hooks->empty() ? hooks : nullptr) {
         for (uint32_t a : f.resumes)
             if (a > f.address && a < end_) resumes_.insert(a);
     }
@@ -60,13 +60,20 @@ public:
             if (referenced_.count(pc)) line("L_" + hex8(pc) + ":", -1);
             instruction(pc, false);
         }
-        std::string head = "XF_FN(" + name(f_.address) + ") {";
+        // A function the port hooks: its body is the original (xfo_), and
+        // its own name the hook slot's call (XF_HOOKED), what every caller
+        // and the table reach.
+        const bool slot = hooks_ && hooks_->slot;
+        std::string head = "XF_FN(" + (slot ? "xfo_" + hex8(f_.address) : name(f_.address)) + ") {";
         if (!f_.name.empty()) head += " // " + f_.name;
         head += "\n";
+        const std::string wrapper = slot ? "XF_FN(" + name(f_.address) + ") { XF_HOOKED(xf_hook_" + hex8(f_.address) +
+                                               ", xfo_" + hex8(f_.address) + "); }\n"
+                                         : std::string();
         if (resumes_.empty()) {
             // where its returns are checked against (XF_CHECKED_RETURN)
             if (checked_) head += "    const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);\n";
-            return head + body + "}\n";
+            return head + body + "}\n" + wrapper;
         }
         // Its body a function the runtime runs (ppc_generated.h's
         // XF_RESUMABLE_BODY), from the entry and again from the resume site an
@@ -82,7 +89,7 @@ public:
         return head + "    static constexpr uint32_t xf_sites[] = {" + sites + "};\n" +
                "    ::xf::ppc::resumable(c, XF_RESUMABLE_BODY {\n" + "        switch (xf_at) {\n" + cases +
                "        }\n" + body + "    }, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, " +
-               std::to_string(resumes_.size()) + ");\n" + "}\n";
+               std::to_string(resumes_.size()) + ");\n" + "}\n" + wrapper;
     }
 
     std::string name(uint32_t address) const { return prefix_ + hex8(address); }
@@ -187,9 +194,36 @@ private:
         line("::xf::ppc::invalid(c, 0x" + hex8(next) + "); return;");
     }
 
+    // A mid-function hook before the instruction at pc (EmitHooks::mid): when
+    // its slot holds hooks, the runtime runs them and says where the code
+    // goes on: here (0), a return (1), one of the labels the project file
+    // gave or the next instruction, else a dispatch to the address, as a
+    // branch to an address with no label is.
+    void mid_hook(uint32_t pc, bool first) {
+        if (!hooks_) return;
+        auto it = hooks_->mid.find(pc);
+        if (it == hooks_->mid.end()) return;
+        std::set<uint32_t> jumps(it->second.begin(), it->second.end());
+        jumps.insert(pc + 4);
+        std::erase_if(jumps, [&](uint32_t t) { return t == 0 || t == 1 || !internal(t); });
+        if (first) {
+            referenced_.insert(jumps.begin(), jumps.end());
+            hooks_->placed.insert(pc);
+            return;
+        }
+        const std::string slot = "xf_mid_" + hex8(pc);
+        std::string cases = "case 1: " + ret();
+        for (uint32_t t : jumps) cases += " case 0x" + hex8(t) + ": goto L_" + hex8(t) + ";";
+        line("if (XF_HOOKS(" + slot + ")) { // the port's mid-function hook");
+        line("const uint32_t xf_to = ::xf::ppc::mid_hook(c, " + slot + ");", 1);
+        line("if (xf_to) switch (xf_to) { " + cases + " default: ::xf::ppc::dispatch(c, xf_to); " + ret() + " }", 1);
+        line("}");
+    }
+
     void instruction(uint32_t pc, bool first) {
         Instr i{image_.word(pc)};
         Opcode op = ppc::decode(i.code);
+        mid_hook(pc, first);
         if (!first) line("// " + hex8(pc) + " " + ppc::disassemble(pc, i.code));
         std::string next = "0x" + hex8(pc + 4);
         auto bc = [&](uint32_t bo, uint32_t bi, bool ctr) {
@@ -292,6 +326,7 @@ private:
     bool checked_;               // it switches the stack: its returns are checked
     std::set<uint32_t> resumes_; // its resume sites inside its range
     int base_ = 1;               // the body's indentation
+    const EmitHooks *hooks_;     // what the port hooks in it (nullptr: nothing)
 };
 
 } // namespace
@@ -299,8 +334,8 @@ private:
 std::string function_name(const std::string &prefix, uint32_t address) { return prefix + hex8(address); }
 
 std::string emit_function(const Image &image, const Discovery &d, const Function &f, const std::string &prefix,
-                          std::set<uint32_t> *calls) {
-    return Emitter(image, d, f, prefix, calls).run();
+                          std::set<uint32_t> *calls, const EmitHooks *hooks) {
+    return Emitter(image, d, f, prefix, calls, hooks).run();
 }
 
 } // namespace xf::recomp

@@ -53,6 +53,7 @@ typedef __UINTPTR_TYPE__ uintptr_t;
 namespace xf::ppc {
 
 struct Context;
+struct HookSlot; // ppc_module.h
 
 // The body of a function with resume sites (docs/recompiler.md, "Stack
 // switches"), entered at `at` (0: its entry), with its entry's LR and r1.
@@ -80,6 +81,8 @@ struct Runtime {
     int (*fesetround)(int mode);
     int (*feclearexcept)(int flags);
     int (*fetestexcept)(int flags);
+    void (*hooked)(Context &c, HookSlot &slot);
+    uint32_t (*mid_hook)(Context &c, HookSlot &slot);
 };
 
 #ifdef XF_GAME_LIBRARY
@@ -101,6 +104,8 @@ XF_INLINE void resumable(Context &c, ResumableBody body, uint32_t lr, uint32_t s
                          size_t count) {
     runtime.resumable(c, body, lr, sp, sites, count);
 }
+XF_INLINE void hooked(Context &c, HookSlot &slot) { runtime.hooked(c, slot); }
+XF_INLINE uint32_t mid_hook(Context &c, HookSlot &slot) { return runtime.mid_hook(c, slot); }
 #else
 // An indirect call or jump, or a call to code with no generated function:
 // the function at `target`, else the interpreter from there until it
@@ -124,6 +129,13 @@ void switch_stack(Context &c, uint32_t thunk, uint32_t resume);
 // by the runtime alone, so a game library carries no C++ runtime. Defined in
 // the core (ppc_runtime.cpp).
 void resumable(Context &c, ResumableBody body, uint32_t lr, uint32_t sp, const uint32_t *sites, size_t count);
+// A hooked function called while its slot holds the port's hooks (ppc_module.h,
+// xenoforge/hooks.h): before, the replacement or the original body, after.
+// Defined in the core (hooks.cpp).
+void hooked(Context &c, HookSlot &slot);
+// The port's mid-function hooks at a slot's address: 0 to run on, 1 to
+// return, else the address to go on at. Defined in the core (hooks.cpp).
+uint32_t mid_hook(Context &c, HookSlot &slot);
 #endif
 
 // ---- the standard library's pieces, freestanding ----
