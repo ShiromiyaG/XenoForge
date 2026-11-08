@@ -19,6 +19,9 @@
 // after windows.h
 #include <dbghelp.h>
 #include <mmsystem.h>
+// carried by the object, so whatever links boot (a port, the SDK's package) links these too
+#pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "winmm.lib")
 #include <tlhelp32.h>
 
 #include <atomic>
