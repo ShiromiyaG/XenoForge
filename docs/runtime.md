@@ -525,15 +525,20 @@ stack's generated frames wait where they are:
   switches back where the kernel sees it: a wait that blocks, a yield
   (NtYieldExecution, a spin lock's spins, the loader lock's waiters), and the
   end of its slice or a deadline come due, checked at each kernel call
-  (`Kernel::run_import`), time base read (the `time_base` callback) and
+  (`Kernel::run_import`), time base read (the `time_base` callback),
   indirect call (`Kernel::dispatch`, which the generated code's `bctrl`s
-  reach). The thread that ran goes to the tail of the ready queue, woken
+  reach) and the recompiler's yield points (a loop's back edge, a priority
+  hint `or rx,rx,rx`; the `System::yield` callback, docs/recompiler.md,
+  "Yield points"). The thread that ran goes to the tail of the ready queue, woken
   threads join it in the order they were woken, timed-out waits end in the
   order the threads were made. Nothing is handed over at DISPATCH_LEVEL or
   above (NT does not preempt there; the video family holds a host mutex per
   CPU around an interrupt's callback).
 - **A virtual clock.** A kernel call costs 1 us of it, a time base read and
-  an indirect call 100 ns, a slice is 1 ms (all `Deterministic` fields); when
+  an indirect call 100 ns, a loop's back edge 1/32 of 100 ns (about ten
+  Xenon cycles) and a priority hint 8/32, a slice is 1 ms (all
+  `Deterministic` fields; `yield_units` 0 stops counting the yield points);
+  when
   every thread waits, it jumps to the earliest deadline (a timeout, a timer).
   KeQueryPerformanceCounter, mftb, KeQuerySystemTime (from a fixed date,
   2025-01-01), waits, timers, KeTimeStampBundle (every millisecond of it),
@@ -547,17 +552,19 @@ stack's generated frames wait where they are:
   thread (all are one). Not covered: the storage root's contents (saves left
   by an earlier run; boot's default is a temporary directory), a fresh
   profile's random XUID, the network.
-- **Forced hand-overs.** Guest code that waits for another thread with no
-  kernel call, time base read or indirect call (the XDK's spin loops on a
-  flag, with the Xenon's `or r1,r1,r1` priority hints) never hands over. A
-  watchdog host thread stops such a thread after `force_after_ms` (100) of
-  the host's time if it is in the generated code at IRQL below 2
+- **Yield points.** The XDK's spin loops on a flag (with the Xenon's
+  `or r1,r1,r1` / `or 31,31,31` priority hints) make no kernel call, time
+  base read or indirect call; the generated code and the interpreter count
+  each loop's back edge and each hint (docs/recompiler.md, "Yield points"),
+  so such a spin runs its slice out on the clock and hands over at the same
+  instruction every run. Playing, a yield point is a load and a branch.
+- **Forced hand-overs**, a safety net that should no longer fire: a watchdog
+  host thread stops a thread that has not handed over for `force_after_ms`
+  (100) of the host's time if it is in the generated code at IRQL below 2
   (`SuspendThread`, a call to a hand-over on its stack, `RtlRestoreContext`
   to go on), and it sleeps as long on the clock as it spun. Where it stops
-  depends on the host's speed, so such a run is only exact when the stop
-  falls in a pure spin; the report counts them. Windows only (TODO: a
-  signal handler on POSIX). The real answer is the recompiler's yield points
-  (plan, "Threads"): at those priority hints and at loops' back edges.
+  depends on the host's speed, so a run with one is no longer exact; the
+  report counts them. Windows only (TODO: a signal handler on POSIX).
 - **Halting and checking.** `--until-swap N` / `--until S` stop the run at
   the first hand-over after swap N or S seconds of the clock, every thread
   parked; boot then prints `guest memory hash` (`Kernel::memory_hash`,
@@ -567,27 +574,30 @@ stack's generated frames wait where they are:
 - **Input**: recorded and replayed (docs/input.md, "Recordings"); in this
   mode a replay repeats the recorded run.
 
-Measured (El Chavo Kart, `boot_chaves`, headless, game-libs 7ac73df):
+Measured with the yield points (2026-11-07, headless, beside another
+agent's builds; "before" is the code just before them, the playing runs
+measured back to back with the same load, the deterministic ones from the
+runs above them in this file's history, on game-libs 7ac73df):
 
-| run | swaps | host time | swaps/s (host) | clock |
-|---|---|---|---|---|
-| playing, `--seconds 30` | 897 | 30 s | 30 | (the host's) |
-| deterministic, `--until-swap 200` | 200 | 4.2 s | 47 | 6.98 s |
-| deterministic, `--until-swap 1200` | 1200 | 19.1-19.9 s | 60-63 | 40.66 s |
+| game, run | swaps | host time | swaps/s (host) | clock | forced |
+|---|---|---|---|---|---|
+| El Chavo Kart, playing, `--seconds 20` | 597 | 20 s | 30 (30 before) | (the host's) | |
+| El Chavo Kart, deterministic, `--until-swap 1200` | 1200 | 16.2 s | 74 (60-63 before) | 40.42 s | 0 (7 before) |
+| Ben 10, playing, `--seconds 20` | 802 | 20 s | 41 (40 before, same load) | (the host's) | |
+| Ben 10, deterministic, `--seconds 30` | 8118 | 30 s | 271 (12 before) | 144.6 s | 0 (209 before) |
+| Ben 10, deterministic, `--until-swap 1200` | 1200 | 8.4 s | 143 | 28.07 s | 0 |
 
-Two runs to swap 200 (1 forced hand-over) and three to swap 1200 (7) left
-the same memory hash, the same runs, the same export counts, the whole
-report alike but for host times; a fourth to swap 1200, beside other
-agents' builds, had an 8th forced hand-over (a thread past 100 ms of the
-busy host's time outside a spin) and differed. A longer
-`XF_DETERMINISTIC_FORCE_MS` trades speed for that. The cost of one host thread is more than paid
-back by the idle clock not waiting for the host's. Ben 10 (`boot_ben10`)
-reaches 347 swaps in 30 s with 209 forced hand-overs (its main thread spins
-before its first kernel call), and two runs to swap 150 differ (clock 12.00
-s and 11.90 s): it needs the recompiler's yield points to be exact.
+Three runs of each game to swap 1200 left the same memory hash and the
+whole report alike but for host times (El Chavo Kart 17951072 runs,
+150981 slices; Ben 10 85548 runs, 22722 slices). Before the yield points,
+El Chavo Kart was exact only when its 7 forced hand-overs landed in pure
+spins, and Ben 10 (whose main thread spins before its first kernel call)
+never was. The cost of one host thread is more than paid back by the idle
+clock not waiting for the host's.
 `kernel_threads_deterministic_test` runs the threads' scenarios on this
 scheduler; `kernel_deterministic_test` checks a mixed workload (sleeps,
-ping-pong, slices) and a recording and its replay, run after run.
+ping-pong, slices, a spin on a flag with the watchdog off, handed over by
+its yield points alone) and a recording and its replay, run after run.
 
 ## The GPU
 

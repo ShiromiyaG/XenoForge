@@ -204,6 +204,10 @@ struct Deterministic {
     uint64_t call_cost = 10;      // a kernel call: 1 us
     uint64_t time_base_cost = 1;  // a time base read (mftb): 100 ns
     uint64_t dispatch_cost = 1;   // an indirect call (Kernel::dispatch): 100 ns
+    // The recompiler's yield points (a loop's back edge, a priority hint;
+    // ppc_ops.h) are counted in units of 1/yield_units of 100 ns: a back edge
+    // one (about 3 ns), a priority hint eight. 0: not counted.
+    uint32_t yield_units = 32;
     uint64_t slice = 10'000;      // a thread runs 1 ms of the clock before the next ready one does
     // Guest code that runs this long on the host without handing over (a spin
     // with no kernel call, time base read or indirect call) is handed over
@@ -439,6 +443,8 @@ private:
     // what a kernel call and a time base read cost the deterministic mode's
     // clock (0 when playing)
     uint64_t deterministic_call_cost_ = 0, deterministic_time_base_cost_ = 0, deterministic_dispatch_cost_ = 0;
+    // the yield points' units in 100 ns (0: not counted; attach)
+    uint32_t deterministic_yield_units_ = 0;
     const Xex *xex_ = nullptr;
     uint32_t entry_ = 0;
     ppc::System system_;

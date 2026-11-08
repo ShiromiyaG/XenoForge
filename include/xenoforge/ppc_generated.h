@@ -8,6 +8,7 @@
 //   I(lwz, 0x81430008);        // ops::run<Opcode::lwz>(c, Instr{...})
 //   if (BC(12, 26)) goto L_822D28E4;
 //   XF_TAIL(xf_822D2910);      // a tail call, no frame left behind
+//   if (BC(4, 2)) { XF_YIELD(); goto L_822D28C0; } // a backward branch
 
 #pragma once
 
@@ -19,6 +20,9 @@
 #define I(op, code) ::xf::ppc::ops::run<::xf::ppc::Opcode::op>(c, ::xf::ppc::Instr{code})
 #define BC(bo, bi) ::xf::ppc::ops::branch_condition(c, bo, bi)
 #define BCCTR(bo, bi) ::xf::ppc::ops::branch_condition_ctr(c, bo, bi)
+// a taken branch backward (to its own address or before it, no LK): a yield
+// point (ppc_ops.h), as the interpreter's
+#define XF_YIELD() ::xf::ppc::ops::yield_point(c, ::xf::ppc::ops::YIELD_BACK_EDGE)
 #if defined(__clang__)
 #define XF_TAIL(f) [[clang::musttail]] return f(c)
 #else

@@ -44,6 +44,8 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
             if (i.I.LK) {
                 c.lr = next;
                 if (c.system && c.system->call && c.system->call(c, target)) break; // ran it: on after the call
+            } else if (target <= pc) {
+                ops::yield_point(c, ops::YIELD_BACK_EDGE); // a loop's back edge, as the generated code's
             }
             next = target;
             break;
@@ -54,6 +56,8 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
             if (i.B.LK) {
                 c.lr = next;
                 if (taken && c.system && c.system->call && c.system->call(c, target)) break;
+            } else if (taken && target <= pc) {
+                ops::yield_point(c, ops::YIELD_BACK_EDGE);
             }
             if (taken) next = target;
             break;

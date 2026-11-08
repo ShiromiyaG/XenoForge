@@ -43,6 +43,11 @@ struct System {
     // and up; ppc_ops.h): what the device answers, what it is told.
     uint32_t (*mmio_read)(Context &c, uint32_t address) = nullptr;
     void (*mmio_write)(Context &c, uint32_t address, uint32_t value) = nullptr;
+    // A yield point whose budget ran out (Context::yield_budget; ppc_ops.h's
+    // yield_point): charges the time those points stood for and may hand the
+    // processor over (the kernel's deterministic mode). Unset: the budget is
+    // refilled and the code goes on.
+    void (*yield)(Context &c) = nullptr;
     void *owner = nullptr; // whoever set these up (the kernel)
 };
 
@@ -70,6 +75,13 @@ struct alignas(64) Context {
     // the instruction being run, for the system's callbacks
     uint32_t pc;
     System *system;
+    // Yield points (docs/recompiler.md, "Yield points"): loops' back edges and
+    // the priority hints (or rx,rx,rx). With yield_counting set (the
+    // deterministic mode), each takes its weight off yield_budget, and one
+    // that takes it below 0 calls System::yield; unset (playing, the tests),
+    // a yield point is a load and a branch not taken.
+    int64_t yield_budget;
+    bool yield_counting;
 
     // CR as the 32-bit register (mfcr), field 0 in the top nibble
     uint32_t cr_word() const {

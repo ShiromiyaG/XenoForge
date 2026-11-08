@@ -16,6 +16,7 @@
 #include "xenoforge/input.h"
 #include "xenoforge/kernel.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/ppc_ops.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -63,9 +64,17 @@ void sleep_ms(ppc::Context &c, int64_t ms) {
     kr(c, "KeDelayExecutionThread", {1, 0, p});
 }
 
-enum : uint32_t { F_MAIN = 0x82000000, F_SLEEPER = 0x82000010, F_BUSY = 0x82000020, F_PINGER = 0x82000030 };
+enum : uint32_t {
+    F_MAIN = 0x82000000,
+    F_SLEEPER = 0x82000010,
+    F_BUSY = 0x82000020,
+    F_PINGER = 0x82000030,
+    F_SPINNER = 0x82000040
+};
 
 uint32_t ping = 0, pong = 0; // two auto-reset events' handles
+uint32_t flag = 0;           // a guest word the main thread sets and the spinner waits for
+uint64_t spins = 0;          // the spinner's loops
 
 // sleeps of different lengths, noting each wake
 void sleeper(ppc::Context &c) {
@@ -95,6 +104,18 @@ void pinger(ppc::Context &c) {
     }
 }
 
+// a spin on a flag with no kernel call, as the XDK's: a priority hint and a
+// loop's back edge, the yield points the generated code has (ppc_ops.h); the
+// watchdog is off, so only they hand it over
+void spinner(ppc::Context &c) {
+    while (!K->load32(flag)) {
+        ppc::ops::yield_point(c, ppc::ops::YIELD_PRIORITY_HINT); // or r1,r1,r1
+        spins++;
+        ppc::ops::yield_point(c, ppc::ops::YIELD_BACK_EDGE); // the bne back
+    }
+    note("spinner saw the flag");
+}
+
 uint32_t create_thread(ppc::Context &c, uint32_t start, uint32_t context) {
     uint32_t handle_ptr = local(c, 0x200), id_ptr = local(c, 0x204);
     CHECK(kr(c, "ExCreateThread", {handle_ptr, 0, id_ptr, 0, start, context, 0}) == X_STATUS_SUCCESS);
@@ -111,7 +132,7 @@ void main_thread(ppc::Context &c) {
     ping = create_event(c), pong = create_event(c);
     std::vector<uint32_t> threads = {create_thread(c, F_SLEEPER, 1), create_thread(c, F_BUSY, 2),
                                      create_thread(c, F_SLEEPER, 3), create_thread(c, F_BUSY, 4),
-                                     create_thread(c, F_PINGER, 5)};
+                                     create_thread(c, F_PINGER, 5), create_thread(c, F_SPINNER, 6)};
     // the pad polled every 16 ms (a frame), between the pings
     uint32_t state = local(c, 0x100);
     for (uint32_t i = 0; i < 40; i++) {
@@ -125,6 +146,10 @@ void main_thread(ppc::Context &c) {
                       K->load16(state + 4));
         trace += line;
         sleep_ms(c, 16);
+        if (i == 30) {
+            K->store32(flag, 1);
+            note("flag set");
+        }
     }
     for (uint32_t h : threads) {
         CHECK(kr(c, "NtWaitForSingleObjectEx", {h, 0, 0, 0}) == X_STATUS_SUCCESS);
@@ -139,11 +164,12 @@ const Generated generated[] = {
     {F_SLEEPER, sleeper},
     {F_BUSY, busy},
     {F_PINGER, pinger},
+    {F_SPINNER, spinner},
 };
 
 struct Run {
     std::string trace, input;
-    uint64_t clock = 0, hash = 0;
+    uint64_t clock = 0, hash = 0, spins = 0;
     std::map<std::string, uint64_t> calls;
 };
 
@@ -162,9 +188,14 @@ Run run(int input, const std::filesystem::path &recording) {
         Kernel k(*memory);
         K = &k;
         trace.clear();
-        CHECK(k.make_deterministic({}));
+        Deterministic d;
+        d.force_after_ms = 0; // no watchdog: the spinner is handed over by its yield points alone
+        CHECK(k.make_deterministic(d));
         k.set_generated(generated, std::size(generated));
         qpc_thunk = memory->system_alloc(0x10);
+        flag = memory->system_alloc(0x10);
+        K->store32(flag, 0);
+        spins = 0;
         k.add_thunk(qpc_thunk, "xboxkrnl", "KeQueryInterruptTime");
         if (input < 2) {
             add_input_driver(k, input::make_idle_pad([](uint32_t, uint64_t now_ms) {
@@ -196,6 +227,7 @@ Run run(int input, const std::filesystem::path &recording) {
         }
         out.clock = k.interrupt_time();
         out.hash = k.memory_hash();
+        out.spins = spins;
         out.calls = k.calls();
         shutdown_timer_dpcs(k);
     }
@@ -218,6 +250,11 @@ int main() {
     CHECK(first.clock == second.clock && first.clock > 0);
     CHECK(first.hash == second.hash);
     CHECK(first.calls == second.calls);
+    // the spinner ran its slices out at its yield points, the same loops each
+    // run, and saw the flag after it was set
+    CHECK(first.spins > 0 && first.spins == second.spins);
+    size_t set = first.trace.find("flag set"), seen = first.trace.find("spinner saw the flag");
+    CHECK(set != std::string::npos && seen != std::string::npos && set < seen);
     // the busy threads were handed over by their slices: their notes interleave
     size_t busy2 = first.trace.find("busy 2 25000"), busy4 = first.trace.find("busy 4 2500\n");
     CHECK(busy2 != std::string::npos && busy4 != std::string::npos && busy4 < busy2);
@@ -230,7 +267,8 @@ int main() {
         std::printf("first run:\n%s\nsecond run:\n%s\nreplayed:\n%s\n", first.trace.c_str(), second.trace.c_str(),
                     replayed.input.c_str());
     }
-    std::printf("deterministic: clock %.4f s, %zu trace lines, memory %016llx\n", double(first.clock) / 1e7,
-                size_t(std::count(first.trace.begin(), first.trace.end(), '\n')), (unsigned long long)first.hash);
+    std::printf("deterministic: clock %.4f s, %zu trace lines, memory %016llx, %llu spins\n",
+                double(first.clock) / 1e7, size_t(std::count(first.trace.begin(), first.trace.end(), '\n')),
+                (unsigned long long)first.hash, (unsigned long long)first.spins);
     return finish("kernel_deterministic");
 }

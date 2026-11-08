@@ -162,6 +162,20 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         k.objects_->scheduler->advance(k.deterministic_time_base_cost_);
         return k.objects_->now() * 5;
     };
+    system_.yield = [](ppc::Context &c) {
+        // the yield points' budget ran out (ppc_ops.h): the clock moves by
+        // the whole ticks spent, and another thread may run (a spin on a flag
+        // with no kernel call reaches its slice's end here)
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        const int64_t units = k.deterministic_yield_units_;
+        if (!units) {
+            c.yield_budget = INT64_MAX;
+            return;
+        }
+        const int64_t ticks = 1 + (-(c.yield_budget + 1)) / units;
+        c.yield_budget += ticks * units;
+        k.objects_->scheduler->advance(uint64_t(ticks));
+    };
     // the globals first: the objects and threads use their processes,
     // object types and KeTimeStampBundle
     setup_kernel(*this);
@@ -446,6 +460,9 @@ void Kernel::publish_code() {
 void Kernel::attach(ppc::Context &c) {
     c.base = memory_.base();
     c.system = &system_;
+    // the deterministic mode counts the yield points (system_.yield)
+    c.yield_counting = deterministic_yield_units_ != 0;
+    c.yield_budget = 0;
 }
 
 void Kernel::run_import(ppc::Context &c, const Import &import) {

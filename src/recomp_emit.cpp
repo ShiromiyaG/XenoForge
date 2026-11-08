@@ -204,7 +204,8 @@ private:
                 fall_through(pc);
             } else {
                 std::string s = go(t, first);
-                if (!first) line(s);
+                // a branch backward is a yield point (a loop's back edge)
+                if (!first) line(t <= pc ? "XF_YIELD(); " + s : s);
             }
             return;
         }
@@ -220,6 +221,8 @@ private:
             }
             std::string s = go(t, first);
             if (first) return;
+            // taken backward: a yield point
+            if (t <= pc) s = "{ XF_YIELD(); " + s + " }";
             if (always) line(s);
             else {
                 line("if (" + bc(i.B.BO, i.B.BI, false) + ") " + s);

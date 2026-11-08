@@ -139,10 +139,37 @@ added to its base; loads and stores swap bytes.
 As the 3DS runtime's interface 6: each guest thread runs on its own stack
 (a host thread when playing, a fiber in the deterministic mode); a system
 call is a C++ call that comes back. The generated code never leaves partway;
-yield points where loops turn back and functions start hand over in the
-deterministic mode (plan, "Threads"). Each guest stack a thread moves to (a
+yield points where loops turn back and at the priority hints hand over in
+the deterministic mode ("Yield points" below). Each guest stack a thread moves to (a
 fiber's) runs on a host stack of its own, so KeSetCurrentStackPointers is a
 call that comes back when its stack is switched back to ("Stack switches").
+
+### Yield points (2026-11-07)
+
+Where guest code that waits for another thread with no kernel call (the
+XDK's spins on a flag) can be handed over, exactly, in the deterministic
+mode (docs/runtime.md, "The deterministic mode"):
+
+- **Where**: every taken branch backward (`b`/`bc` without LK to its own
+  address or before it: a loop's back edge, emitted as
+  `{ XF_YIELD(); goto L_...; }`, and the same for a backward tail branch to
+  another function), and every priority hint, `or rx,rx,rx` with Rc 0
+  (`or r1,r1,r1`, `or 31,31,31`; in `orx`'s semantics in ppc_ops, where the
+  constant word folds the test away). The interpreter counts the same
+  points, so a function counts alike run either way.
+- **Cost when playing**: `Context::yield_counting` is false, so a yield
+  point is a load and a branch not taken (no store, no call).
+- **Counting** (set by `Kernel::attach` in the deterministic mode): each
+  point takes its weight off `Context::yield_budget` (a back edge 1, a hint
+  8; units of 1/32 of the clock's 100 ns, `Deterministic::yield_units`, so
+  about ten Xenon cycles); below 0, `System::yield` moves the clock by the
+  whole ticks spent, refills the budget and may hand over at the slice's
+  end, as a kernel call does. The hook is a cold out-of-line function in
+  the header, so a game library needs no new runtime call.
+- The lockstep check's interpreter never counts (its copy of the context has
+  `yield_counting` false), so it never hands over in the middle of a check.
+- Not yet: yield points at function starts (the plan's other half); none of
+  the measured spins needed them, as every spin has a back edge.
 
 ## Discovery
 

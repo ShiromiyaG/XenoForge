@@ -5,14 +5,14 @@
 //
 // - One guest thread runs at a time; it hands over only where the kernel sees
 //   it: a wait that blocks, a yield (NtYieldExecution, a spin lock's spins),
-//   and, at a kernel call, a time base read or an indirect call (dispatch),
-//   the end of its slice or a
-//   deadline come due. The thread that ran goes to the tail of the ready
+//   and, at a kernel call, a time base read, an indirect call (dispatch) or
+//   the recompiler's yield points (a loop's back edge, a priority hint;
+//   Kernel's system_.yield), the end of its slice or a deadline come due. The thread that ran goes to the tail of the ready
 //   queue; woken threads join the tail in the order they were woken; waits
 //   whose deadline passed are ended in the order the threads were made. All
 //   of it follows from the guest's own steps, so the same disc and the same
 //   input give the same order.
-// - The clock is virtual: those three move it by fixed
+// - The clock is virtual: those four move it by fixed
 //   costs (Deterministic), and when every thread waits it jumps to the
 //   earliest deadline (a wait's timeout, a timer). KeTimeStampBundle and the
 //   timers move on it every millisecond, as the host scheduler's clock thread
@@ -21,12 +21,13 @@
 //   a spin lock held) is not handed over at a kernel call, as NT does not
 //   preempt there; the video family also holds a host mutex per CPU around an
 //   interrupt's callback.
-// - Guest code that waits for another thread without any of those (a spin
-//   on a flag) never hands over by itself: a watchdog stops it after a while
-//   of the host's time and hands it over from there (watchdog(); the run is
-//   then exact only if it stopped in a pure spin). The recompiler's yield
-//   points (plan, "Threads") are what would take it exactly. report() names
-//   a thread that has run a second without handing over.
+// - Guest code that runs without any of those (a straight run of code with
+//   no loop, or a thread stuck at DISPATCH_LEVEL) never hands over by
+//   itself: a watchdog stops it after a while of the host's time and hands
+//   it over from there (watchdog(); the run is then exact only if it stopped
+//   in a pure spin). With the yield points it should not fire; report()
+//   counts it, and names a thread that has run a second without handing
+//   over.
 
 #include "objects.h"
 #include "stacks.h"
@@ -499,6 +500,7 @@ bool Kernel::make_deterministic(const Deterministic &options) {
     deterministic_call_cost_ = options.call_cost;
     deterministic_time_base_cost_ = options.time_base_cost;
     deterministic_dispatch_cost_ = options.dispatch_cost;
+    deterministic_yield_units_ = options.yield_units;
     return true;
 }
 

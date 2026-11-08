@@ -321,6 +321,7 @@ void Lockstep::begin_segment(Check &check, ppc::Context &c, uint32_t pc) {
     ic = c;
     ic.base = view->base();
     ic.system = &system_;
+    ic.yield_counting = false; // the check's interpreter never hands over
     Recorder recorder(ic);
     const char *why = nullptr;
     // the interpreter's floating-point environment (rounding, flags) is put

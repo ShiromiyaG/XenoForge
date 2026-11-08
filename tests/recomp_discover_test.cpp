@@ -261,7 +261,9 @@ int main() {
     CHECK(contains(lj, "const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);"));
     CHECK(contains(lj, "XF_CHECKED_RETURN();") && !contains(lj, "    return;"));
     CHECK(contains(fs, "{ ::xf::ppc::switch_stack(c, 0x82000A40, xf_lr); XF_CHECKED_RETURN(); }"));
-    CHECK(contains(fs3, "if (BC(12, 2)) { ::xf::ppc::switch_stack(c, 0x82000A40, xf_lr); XF_CHECKED_RETURN(); }"));
+    // (a branch backward, so a yield point first: docs/recompiler.md, "Yield points")
+    CHECK(contains(fs3, "if (BC(12, 2)) { XF_YIELD(); { ::xf::ppc::switch_stack(c, 0x82000A40, xf_lr); "
+                        "XF_CHECKED_RETURN(); } }"));
     CHECK(contains(sc, "static constexpr uint32_t xf_sites[] = {0x82000B4Cu, 0x82000B54u};") &&
           contains(sc, "::xf::ppc::resumable(c, XF_RESUMABLE_BODY {") &&
           contains(sc, "case 0x82000B4C: goto L_82000B4C;") && contains(sc, "case 0x82000B54: goto L_82000B54;") &&
