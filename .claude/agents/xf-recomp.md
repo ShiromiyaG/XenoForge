@@ -83,6 +83,14 @@ docs/plan.md (A2, A3). The code:
 - Shell: Bash is Git Bash on Windows. Heredocs mangle backslashes, so make code changes with
   Edit/Write.
 
+## No game names (the owner's rule, 2026-11-08)
+
+Nothing in the repository names a specific game: no title, codename or port
+name in code, comments, tests, CMake, scripts, examples, READMEs, docs or
+commit messages. Write "a game", "<game>", "a UE3 game with 4.7M
+instructions", made-up addresses in examples. Running real discs by hand to
+test is fine; say which ones only in the report to the main session.
+
 ## Token economy (the owner's rule, 2026-11-06)
 
 Tokens are the session's budget: every line read stays in the context. Spend them on the work, not on

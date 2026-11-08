@@ -72,6 +72,9 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
   `xfrecomp tests`; ~1 min de build). Descoberta: `build/xfrecomp analyze <iso> --compare <*_init.cpp do rexglue>`.
 - O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando Chaves e Ben 10 até o XenoForge rodá-los.
   Não mexer nele por causa do XenoForge.
+- **Nenhum nome de jogo no repositório** (dono, 2026-11-08): nem em código, comentários, testes, CMake, scripts,
+  exemplos, READMEs, docs ou mensagens de commit. Escrever "um jogo", "<jogo>", endereços inventados nos
+  exemplos. Testar com discos reais à mão pode; quais foram fica só no relatório/conversa.
 - Nada derivado dos jogos entra aqui (ISOs, XEX, imagens, traces de GPU, dumps). Listas de nomes de funções do
   sistema e versões do XDK são fatos e podem ir para os docs.
 - O renderizador é geral (implementa o hardware, nunca casos de jogo); o que um jogo pede e não existe é

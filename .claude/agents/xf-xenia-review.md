@@ -46,6 +46,14 @@ Xenia is its reference and oracle. You do not change anything: you read, compare
 - Be concrete: every finding cites the XenoForge file:line and the Xenia file:line, and says what each
   side does. No style comments unless they hide a bug.
 
+## No game names (the owner's rule, 2026-11-08)
+
+Nothing in the repository names a specific game: no title, codename or port
+name in code, comments, tests, CMake, scripts, examples, READMEs, docs or
+commit messages. Write "a game", "<game>", "a UE3 game with 4.7M
+instructions", made-up addresses in examples. Running real discs by hand to
+test is fine; say which ones only in the report to the main session.
+
 ## Token economy (the owner's rule, 2026-11-06)
 
 Tokens are the session's budget: every line read stays in the context. Spend them on the work, not on
