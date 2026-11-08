@@ -2453,7 +2453,8 @@ both hold 60 fps at every scale):
 | 200% | 5.18 (5.11-5.21), 3 runs | 2.92 (2.92-2.99), 2 runs |
 | 300% | 11.81 (11.81-12.03), 2 runs | 6.22 (6.22-6.28), 2 runs |
 
-The 100% row is the standing benchmark's above. Not interleaved (ours'
+The 100% row is the standing benchmark's above; ours at 200% and 300% ran
+before the direct ownership transfers above were merged. Not interleaved (ours'
 runs, then Xenia's, minutes apart); another agent's player and a Xenia ran
 on the machine during parts of both. Both grow about as the pixels do
 (ours 3.7x and 8.5x of its 100%, Xenia's 3.5x and 7.5x): we lose by the
