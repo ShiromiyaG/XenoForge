@@ -126,12 +126,6 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
         last_listing_ = Clock::time_point();
         if (settings_) settings_->set_game(nullptr);
         set_message(core_.demo_games() ? "Listing the demo games" : "Listing the games folder", 0, 4);
-    } else if (name == "keyboard-settings") {
-        open_settings(SettingsTab::Keyboard);
-    } else if (name == "view-grid") {
-        set_message("The grid view is not available yet", 0, 6);
-    } else if (name == "xbox-home") {
-        set_message("Xbox home is not available yet", 0, 6);
     } else if (name == "about") {
         show_about();
     } else if (name == "exit") {

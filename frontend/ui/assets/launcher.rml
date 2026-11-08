@@ -8,7 +8,6 @@
         <div id="header">
             <div id="brand">xeno<span>forge</span></div>
             <div id="nav">
-                <div class="nav f" id="nav-home" data-action="xbox-home">xbox home</div>
                 <div class="nav f on" id="nav-games">games</div>
                 <div class="nav f" id="menu-emulation" data-menu="emulation">emulation</div>
                 <div class="nav f" id="nav-settings" data-action="settings">settings</div>
@@ -23,12 +22,7 @@
             <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
             <div class="tb f" id="tb-settings" data-action="settings">{i:settings}<div>Settings</div></div>
             <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
-            <div class="tb f" id="tb-demo" data-action="demo-games">{i:layers}<div>Demo games</div></div>
-            <div id="tb-space"></div>
-            <div class="vb on f" id="vb-list">{i:list}</div>
-            <div class="vb f" id="vb-grid" data-action="view-grid">{i:grid-3x3}</div>
-            <div class="vb f" id="vb-keyboard" data-action="keyboard-settings">{i:mouse}</div>
-            <div class="vb f" id="vb-pad" data-action="controls">{i:gamepad-2}</div>
+            <div class="tb f" id="tb-demo" style="display: none;" data-action="demo-games">{i:layers}<div>Demo games</div></div>
         </div>
         <div id="table">
             <div id="thead"></div>
@@ -38,7 +32,7 @@
         <div id="hints">
             <div class="pad-hints">
                 <div class="hint"><div class="pb a">A</div><div class="hl">Play</div></div>
-                <div class="hint"><div class="pb b">B</div><div class="hl">Back</div></div>
+                <div class="hint" id="hint-b" style="display: none;"><div class="pb b">B</div><div class="hl">Clear search</div></div>
                 <div class="hint"><div class="pb x">X</div><div class="hl">Settings</div></div>
                 <div class="hint"><div class="pb y">Y</div><div class="hl">Rescan</div></div>
             </div>

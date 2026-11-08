@@ -72,15 +72,6 @@ body { background-color: transparent; }
 .tb.off:hover { border-color: #7c7b79; decorator: linear-gradient(180deg, #62615f 0%, #504f4e 40%, #444342 62%, #504f4e 100%); }
 .tb.stop .ic { color: #ff7a6e; }
 #tb-space { flex: 1 1 0; }
-.vb {
-    width: 29dp; height: 28dp; margin-left: 7dp; line-height: 28dp; text-align: center;
-    border: 1.5dp #6f6f70; border-radius: 6dp; decorator: linear-gradient(180deg, #4f4f50 0%, #3f3f40 50%, #363637 100%);
-    box-shadow: 0 0 0 1dp #1f1f20, 0 2dp 3dp 1dp #00000050, inset 0 1dp 1dp 0 #ffffff22; cursor: pointer;
-}
-.vb .ic { font-size: 20dp; line-height: 28dp; color: #ececee; }
-.vb:hover { border-color: #858586; decorator: linear-gradient(180deg, #5d5d5e 0%, #4b4b4c 50%, #404041 100%); }
-.vb.on { decorator: linear-gradient(180deg, #2a2a2b, #38383a); box-shadow: inset 0 1dp 2dp 0 #00000080; cursor: default; }
-.vb.on .ic { color: #ffffff; }
 
 /* ------------------------------------------------------------------- table */
 

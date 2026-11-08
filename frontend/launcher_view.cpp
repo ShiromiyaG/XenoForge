@@ -334,7 +334,9 @@ void LauncherView::update_toolbar() {
         }
         play->SetClass("off", !running && (!g || !player_of(*g)));
     }
-    if (Rml::Element *demo = by_id("tb-demo")) demo->SetClass("on", core_.demo_games());
+    // the demo games are a development aid (--demo-games): the button is there only while they are listed, to turn them off
+    if (Rml::Element *demo = by_id("tb-demo")) demo->SetClass("on", core_.demo_games()), demo->SetProperty("display", core_.demo_games() ? "flex" : "none");
+    if (Rml::Element *back = by_id("hint-b")) back->SetProperty("display", filter_.empty() ? "none" : "flex"); // B only clears the search
     if (Rml::Element *prepare = by_id("tb-prepare")) {
         const char *label = !g || status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : "Rebuild";
         if (Rml::Element *text = by_id("tb-prepare-label"))
