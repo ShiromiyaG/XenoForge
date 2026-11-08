@@ -201,6 +201,7 @@ void set_cpu(Kernel &k, Thread &t, uint8_t cpu) {
 } // namespace
 
 Thread *current_thread() { return current_; }
+void set_current_thread(Thread *t) { current_ = t; }
 
 std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects) { return std::make_unique<HostScheduler>(objects); }
 

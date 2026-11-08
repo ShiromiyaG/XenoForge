@@ -190,6 +190,29 @@ bool open(const Options &options, Game &g, std::string &error) {
     if (!g.memory) return error = "memory: " + error, false;
     g.kernel = std::make_unique<kernel::Kernel>(*g.memory);
     kernel::Kernel &k = *g.kernel;
+    // the deterministic mode and input recordings, before anything runs
+    int deterministic = options.deterministic;
+    if (const char *d = std::getenv("XF_DETERMINISTIC"); !deterministic && d && *d && *d != '0')
+        deterministic = std::strcmp(d, "paced") == 0 ? 2 : 1;
+    if (deterministic) {
+        kernel::Deterministic d;
+        d.paced = deterministic == 2;
+        if (options.halt_swap || options.halt_seconds > 0) {
+            kernel::Kernel *kp = &k;
+            uint64_t swap = options.halt_swap, clock = uint64_t(options.halt_seconds * 1e7);
+            d.halt = [kp, swap, clock] {
+                return (swap && kernel::gpu_command_processor(*kp).counts().swaps.load() >= swap) ||
+                       (clock && kp->interrupt_time() >= clock);
+            };
+        }
+        k.make_deterministic(d);
+        std::printf("deterministic mode (%s)\n", d.paced ? "paced" : "as fast as the host goes");
+    }
+    std::filesystem::path record = options.record_input, replay = options.replay_input;
+    if (const char *r = std::getenv("XF_INPUT_RECORD"); record.empty() && r && *r) record = r;
+    if (const char *r = std::getenv("XF_INPUT_REPLAY"); replay.empty() && r && *r) replay = r;
+    if (!replay.empty() && !kernel::replay_input(k, replay, error)) return error = "input: " + error, false;
+    if (!record.empty() && !kernel::record_input(k, record, error)) return error = "input: " + error, false;
     bool bare = input.ends_with(".xex") || input.ends_with(".XEX");
     bool mounted = bare ? kernel::mount_directory(k, std::filesystem::path(input).parent_path(), error)
                         : kernel::mount_disc(k, input, error);

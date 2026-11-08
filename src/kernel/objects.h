@@ -432,6 +432,7 @@ public:
     // the scheduler's
     bool woken = false;
     std::condition_variable cv;
+    void *scheduled = nullptr; // the deterministic scheduler's record of it
 };
 
 // The thread running on this host thread (nullptr off guest threads).
@@ -441,8 +442,9 @@ Thread *current_thread();
 
 // How guest threads get time. Playing mode: a host thread each, waits the
 // host's (make_host_scheduler). The deterministic mode replaces it with
-// fibers on one host thread and a virtual clock. Everything here is called
-// with the kernel's lock held, except start, join and yield.
+// fibers on one host thread and a virtual clock (deterministic.cpp). Everything
+// here is called with the kernel's lock held, except start, join, yield and
+// advance.
 class Scheduler {
 public:
     static constexpr uint64_t NEVER = UINT64_MAX;
@@ -461,9 +463,26 @@ public:
     virtual uint64_t now() = 0;
     // the earliest timer (Objects::next_due) changed
     virtual void timers_changed() = 0;
+    // The deterministic mode: the guest code on this thread spent cost of
+    // the clock (a kernel call, a time base read; its only measure of the
+    // guest's work), and may hand over there. Nothing when playing.
+    virtual void advance(uint64_t cost) { (void)cost; }
+    virtual bool deterministic() const { return false; }
+    // its counts, for boot's report (empty when playing)
+    virtual std::string report() { return {}; }
 };
 
 std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects);
+// deterministic.cpp: every guest thread a fiber on one host thread, in a fixed
+// order, on a virtual clock (xenoforge/kernel.h, Deterministic)
+std::unique_ptr<Scheduler> make_deterministic_scheduler(Objects &objects, const Deterministic &options);
+
+// The host thread-locals the kernel keeps per guest thread, which the
+// deterministic scheduler swaps as it switches guest threads on its one host
+// thread: the current thread (threads.cpp) and the exception dispatches under
+// way (exceptions.cpp).
+void set_current_thread(Thread *t);
+void *exchange_exception_walks(void *walks);
 
 // ---- the kernel's state for its objects ----
 

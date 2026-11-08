@@ -49,6 +49,17 @@ struct Options {
     // is given (the player's way). The report gives the counts.
     std::vector<uint32_t> lockstep;
     uint32_t lockstep_sample = 0;
+    // The deterministic mode (xenoforge/kernel.h, Deterministic; docs/runtime.md):
+    // 0 off, 1 as fast as the host goes, 2 paced to the host's clock. When 0,
+    // XF_DETERMINISTIC says (1, or "paced"). It halts at the first hand-over
+    // after swap halt_swap, or after halt_seconds of its clock (0: never).
+    int deterministic = 0;
+    uint64_t halt_swap = 0;
+    double halt_seconds = 0;
+    // Input recordings (xenoforge/input.h; docs/input.md): the answers written
+    // to record_input, or given from replay_input; XF_INPUT_RECORD and
+    // XF_INPUT_REPLAY when empty.
+    std::filesystem::path record_input, replay_input;
 };
 
 struct Game {

@@ -43,7 +43,9 @@ namespace {
 
 constexpr size_t HOST_STACK = 16u << 20; // reserved; as a thread's (generated code recurses as deep as the guest's)
 
-// ---- host fibers ----
+} // namespace
+
+// ---- host fibers (stacks.h; the deterministic scheduler's too) ----
 
 // (FIBER_FLAG_FLOAT_SWITCH: each fiber its own MXCSR, though the generated
 // code leaves it at the default between instructions anyway)
@@ -60,7 +62,9 @@ void *create_fiber(void (*entry)(void *), void *arg) {
 }
 void switch_fiber(void *fiber) { SwitchToFiber(fiber); }
 void delete_fiber(void *fiber) { DeleteFiber(fiber); }
+void *current_fiber() { return IsThreadAFiber() ? GetCurrentFiber() : nullptr; }
 #else
+namespace {
 struct PosixFiber {
     ucontext_t context;
     void *stack = nullptr;
@@ -72,6 +76,7 @@ void trampoline() {
     running->entry(running->arg);
     std::abort(); // a stack's code never returns (stack_main)
 }
+} // namespace
 void *convert_thread(bool &converted) {
     converted = !running;
     return running ? running : running = new PosixFiber();
@@ -102,7 +107,10 @@ void delete_fiber(void *fiber) {
     munmap(f->stack, HOST_STACK);
     delete f;
 }
+void *current_fiber() { return running; }
 #endif
+
+namespace {
 
 // ---- the guest stacks of every thread ----
 

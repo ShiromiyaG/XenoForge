@@ -152,10 +152,14 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         // the Xenon's time base runs at 50 MHz: 5 ticks in the scheduler's
         // clock's 100 ns
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
-        // what the lockstep check's interpreter read here, read again
+        // what the lockstep check's interpreter read here, read again (the
+        // read was counted on the clock once, as it was made)
         uint64_t replayed;
         if (k.lockstep_ && k.lockstep_->replay_time_base(c, replayed)) [[unlikely]]
             return replayed;
+        // a read moves the deterministic mode's clock: a loop that waits on
+        // the time base gets there, and may hand over
+        k.objects_->scheduler->advance(k.deterministic_time_base_cost_);
         return k.objects_->now() * 5;
     };
     // the globals first: the objects and threads use their processes,
@@ -440,6 +444,8 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
                          uint32_t(c.r[3]), uint32_t(c.r[4]), uint32_t(c.lr));
     }
     note_kernel_call(import, uint32_t(c.lr));
+    // the deterministic mode's clock moves, and another thread may run
+    objects_->scheduler->advance(deterministic_call_cost_);
     // a suspension or kernel APCs waiting for this thread happen here
     if (Thread *t = current_thread(); t && t->pending.load(std::memory_order_relaxed)) objects_->safe_point(*t);
     if (import_hook_) import_hook_(import_hook_user_, import, c, false);

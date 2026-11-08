@@ -50,6 +50,18 @@ struct GuestStacks {
 // call goes on at its own return address (LR at the call: a bl, a dispatch).
 constexpr uint32_t STACK_RESUME_ANYWHERE = 1;
 
+// Host fibers, also the deterministic scheduler's (deterministic.cpp), which
+// runs every guest thread on one host thread: a thread converted to one
+// (converted: made one here, not already one), made (a 16 MB reservation),
+// switched to, deleted (from another), and the one running (nullptr: the
+// thread is no fiber).
+void *convert_thread(bool &converted);
+void revert_thread();
+void *create_fiber(void (*entry)(void *), void *arg);
+void switch_fiber(void *fiber);
+void delete_fiber(void *fiber);
+void *current_fiber();
+
 // KeSetCurrentStackPointers on the calling thread's context, r1 already set
 // to the new stack (from_sp: where the old one was): when the new stack is
 // another, its host fiber runs (made the first time, from LR), and this one

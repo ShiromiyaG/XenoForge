@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -192,6 +193,26 @@ void setup_audio(Kernel &k);
 void shutdown_audio(Kernel &k);
 std::string audio_report(Kernel &k);
 
+// The deterministic mode (plan A5; docs/runtime.md, "The deterministic mode"):
+// every guest thread a fiber on one host thread, handed over in a fixed order,
+// on a virtual clock that moves with the guest's kernel calls and time base
+// reads and jumps to the next deadline when every thread waits. The same disc
+// and the same input give the same run. Costs and the slice are in the clock's
+// 100 ns.
+struct Deterministic {
+    uint64_t system_time = 133'801'632'000'000'000ull; // the guest's system time at the start: 2025-01-01 00:00 UTC
+    uint64_t call_cost = 10;      // a kernel call: 1 us
+    uint64_t time_base_cost = 1;  // a time base read (mftb): 100 ns
+    uint64_t slice = 10'000;      // a thread runs 1 ms of the clock before the next ready one does
+    // Paced: the clock never runs ahead of the host's (the player's, so the
+    // game plays at its speed); else it runs as fast as the host can (boot).
+    bool paced = false;
+    // Asked as each thread is handed over (on the scheduler's thread, the
+    // kernel's lock held): true stops the run there for good, every guest
+    // thread parked where it handed over (boot's --until-swap, --until).
+    std::function<bool()> halt;
+};
+
 class Kernel {
 public:
     explicit Kernel(Memory &memory);
@@ -253,6 +274,16 @@ public:
     bool wait_main(uint32_t timeout_ms, uint32_t *exit_code = nullptr);
     // the guest threads alive: each one's state and where it was
     std::string thread_report();
+    // The deterministic mode (Deterministic), chosen before launch: false
+    // when a guest thread has started already. halted: its halt said stop,
+    // and every guest thread is parked.
+    bool make_deterministic(const Deterministic &options);
+    bool deterministic() const;
+    bool halted() const;
+    // a hash (FNV-1a, 64-bit) of the guest memory committed and readable,
+    // region by region in address order: two runs that left the same memory
+    // give the same one
+    uint64_t memory_hash();
     // the context of the guest thread on this host thread (nullptr off one)
     static ppc::Context *current_context();
     Objects &objects() { return *objects_; }
@@ -397,6 +428,9 @@ private:
     }
 
     Memory &memory_;
+    // what a kernel call and a time base read cost the deterministic mode's
+    // clock (0 when playing)
+    uint64_t deterministic_call_cost_ = 0, deterministic_time_base_cost_ = 0;
     const Xex *xex_ = nullptr;
     uint32_t entry_ = 0;
     ppc::System system_;
