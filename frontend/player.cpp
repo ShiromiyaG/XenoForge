@@ -593,7 +593,11 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     uint64_t presented = 0, refreshes = 0, key_screenshots = 0, shots_written = 0;
     std::string ended;
     Rates rates;
-    Clock::time_point second = started, last_present = started;
+    Clock::time_point second = started;
+    // The window presents a fresh picture, the overlay or a dialog of the system, and otherwise only when it must be
+    // drawn again: shown, uncovered, resized, moved to another display (redraw), or the overlay or dialog it showed
+    // last is gone (drew_extra). A guest that stops swapping leaves the window still, as Xenia's presenter does.
+    bool redraw = true, drew_extra = false;
     uint64_t swaps_before = 0, presented_before = 0, refreshes_before = 0, sound_before = 0, states_before = 0;
     uint64_t taken_before = 0;
     game::Rates rate_log;
@@ -607,6 +611,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) quit = true, ended = "closed";
+            if (e.type >= SDL_EVENT_WINDOW_FIRST && e.type <= SDL_EVENT_WINDOW_LAST) redraw = true;
             controllers.event(e);
             if (e.type == SDL_EVENT_KEY_DOWN && sysui.active()) {
                 // the keyboard drives the dialog on top (Enter in a text field is the field's own)
@@ -778,11 +783,12 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         SDL_GetWindowSizeInPixels(window, &pw, &ph);
         const bool minimized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) || !pw || !ph;
         const bool ui_busy = sysui.active() || sysui.has_toasts() || guide_open;
-        if (minimized ||
-            (!presenter.fresh() && !overlay && !ui_busy && now - last_present < std::chrono::milliseconds(100))) {
+        const bool extra = overlay || ui_busy;
+        if (minimized || (!presenter.fresh() && !extra && !drew_extra && !redraw)) {
             SDL_Delay(minimized ? 10 : 1);
             continue;
         }
+        redraw = false, drew_extra = extra;
 
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -973,7 +979,6 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             else
                 std::fprintf(stderr, "could not write %s\n", path.string().c_str());
         }
-        last_present = Clock::now();
         refreshes++;
         if (fresh) {
             presented++, shown_any = true;

@@ -2137,6 +2137,11 @@ gives. So both programs are timed from outside by the same code:
 - `--timeline` prints each `--step`'s frames a second and GPU time a frame,
   to find a run's phases and pick a window both programs spend in the same
   scene.
+- `--gaps` lists every gap between presents over 100 ms with when it
+  ended (on stderr); the summary line counts them (`gaps_over_100ms`) and
+  gives the longest. A gap is a stall of the guest's swaps in both
+  programs: neither presents without a new frame (the player's window
+  until 2026-11-08 did, every 100 ms; "Game D's gaps" below).
 
 `tools/bench/bench_vs_xenia.ps1 -Disc <iso> -Ours <player> -Xenia <exe>
 -Seconds S -Warmup W -Runs 3 -Configs ours,xenia-d3d12 [-Timeline]` runs the
@@ -2172,8 +2177,69 @@ frame time median 33.3 ms both, CPU 1.33 against 1.30 s a second. A
 standing scene for game A needs input (the race) or a fixed point of the
 loop; until then its numbers are rough.
 
-Not measured: games D and H (their libraries were rebuilt for the interface
-of the time, stale after the merge that changed it); game G (no library).
+Not measured: game H (its library was rebuilt for the interface of the
+time, stale after the merge that changed it); game G (no library). Game D
+below.
+
+**Game D's gaps, its first frame and its yields (2026-11-08).** An earlier
+set on game D's intro (window 10-50 s, the generic player with the cache)
+had ours at 33-179 gaps over 100 ms, all of 101-102 ms, against Xenia's
+3-6, and our first present at 1.37-10.5 s. What that was:
+- **The 102 ms were the player's, not a wait.** The window presented its
+  last picture again whenever 100 ms passed without a new one, so a guest
+  that stopped swapping for a second showed as ten 101-102 ms gaps, where
+  Xenia (whose presenter paints on a guest output refresh or a paint
+  request) shows one long one. No wait times out at 100 ms: every kernel
+  call over 15 ms was logged through such stalls, and none ended near
+  100 ms. The window now presents only something new (runtime.md, "The
+  window"), so `xfbench` counts the same thing in both programs.
+- **The long stalls of that set were the pipeline record** ("A record that
+  outlived its code" above: swaps up to 7.6 s apart in those runs' logs),
+  fixed since. What is left are the game's own loads where a movie starts
+  or stops: the main thread waits on a semaphore while its workers load and
+  the movie's threads are made; 6-9 stalls of 85-230 ms in 100 s, as Xenia
+  has 4-5 of 100-266 ms at the same points. They do not grow with load
+  (8 or 12 busy host threads beside it: 5-8 stalls, the same lengths).
+- **The first frame** was not reproduced: 1.26-2.80 s to the first present
+  in 21 runs, 1.26-1.54 in the last 12 (the first picture of the game
+  about 0.2 s later), Xenia 1.28-1.78 s with its first game picture
+  0.8-1.9 s after that. The
+  start, on this machine: SDL 0.28 s, the disc and executable 0.3 s, the
+  library 4-75 ms (a new copy of it included), the device 0.15 s, the
+  renderer 0.28-0.31 s (most of it the 99 MB pipeline cache), the first
+  swap 0.5 s after the launch. The 10.5 s run was the first after the
+  build step had rewritten the library's cache, while the pipeline record
+  was being fixed; what took the time then is not known.
+- **The yields.** The owner's play log has 193 M `NtYieldExecution` in
+  70 s. On the title screen two of the game's threads spin: one sets an
+  event in a loop with no wait, about 145,000 times a second; the other
+  asks XMP for its playback controller, polls an event with no wait and
+  yields as often. The console runs the same loops; Xenia makes the same
+  calls (its `MaybeYield` is a `Sleep(0)`; ours is `SwitchToThread`
+  through `std::this_thread::yield`). Ours as `Sleep(0)`, 3 runs each
+  interleaved on the 3D title (45-85 s): CPU 2.59 (2.58-2.61) against
+  2.61 (2.61-2.63) s a second, 30 fps both. Nothing to gain while the
+  guest spins; CPU could only be saved by changing how it spins.
+
+Game D against Xenia D3D12 (window 10-50 s: the 60 fps intro, then the 3D
+title at 30 from about 35 s; 3 runs each, the old player, the new and
+Xenia in turn; nothing else running but an idle clangd):
+
+| | ours, before | ours, now | Xenia D3D12 |
+| --- | --- | --- | --- |
+| presents a second | 47.65 (47.61-47.67) | 47.59 (47.54-47.64) | 48.47 (48.25-49.41) |
+| gaps over 100 ms (longest) | 3 (3-4), 101-102 ms | 4 (3-4), 228 (211-237) ms | 3, 771 (762-1854) ms |
+| first present | 1.30 (1.26-1.34) s | 1.26 (1.26-1.28) s | 1.55 (1.28-1.56) s |
+| GPU ms a frame | 1.58 (1.58-1.61) | 1.59 (1.56-1.60) | 2.90 (2.39-3.32) |
+| CPU s a second | 1.85 (1.84-1.86) | 1.87 (1.85-1.88) | 1.75 (1.73-1.76) |
+
+The frame rates differ by where the window cuts the change to 30 fps,
+which Xenia reaches about a second later; frame time medians 17.0 both.
+Our longest gap is the one before the first picture of the game; Xenia's
+the same, three to eight times as long. We use 45% less GPU time a frame
+and 6% more CPU. Game B, the same check (the old player and the new, its
+3D title, 90-130 s): the old one's 3 gaps were its heartbeat before the
+first frame; the new one has one, 489 ms, the same wait.
 
 Where we lose and why, for game B:
 - Our default is the exact EDRAM (interlock), Xenia's is host render

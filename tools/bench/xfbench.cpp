@@ -15,11 +15,12 @@
 // its 5th and 95th percentiles, GPU ms a frame and a second by engine type,
 // CPU seconds a second.
 //
-// xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--vk | --dxgi] [--stdout <file>] [--label L]
+// xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--gaps] [--vk | --dxgi] [--stdout <file>] [--label L]
 //         -- <program> [args...]
 //
 // --step: how often the GPU and CPU times are sampled (5 s); --timeline
 // prints each step's presents a second and GPU time, to find a run's phases.
+// --gaps lists every gap between presents over 100 ms with when it ended.
 //
 // Windows only, as is Xenia.
 
@@ -141,7 +142,7 @@ double percentile(std::vector<double> v, double p) {
 
 int main(int argc, char **argv) {
     double seconds = 60, warmup = 20, step = 5;
-    bool vk = false, dxgi = false, timeline = false;
+    bool vk = false, dxgi = false, timeline = false, gaps = false;
     std::string stdout_file, label = "run";
     int first = 0;
     for (int i = 1; i < argc; i++) {
@@ -154,6 +155,8 @@ int main(int argc, char **argv) {
             step = std::max(0.5, std::atof(argv[++i]));
         else if (a == "--timeline")
             timeline = true;
+        else if (a == "--gaps")
+            gaps = true;
         else if (a == "--vk")
             vk = true;
         else if (a == "--dxgi")
@@ -168,7 +171,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!first || first >= argc || warmup >= seconds) {
-        std::fprintf(stderr, "usage: xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--vk | --dxgi] [--stdout <file>] "
+        std::fprintf(stderr, "usage: xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--gaps] [--vk | --dxgi] [--stdout <file>] "
                              "[--label L] -- <program> [args...]\n");
         return 2;
     }
@@ -328,6 +331,9 @@ int main(int argc, char **argv) {
     for (size_t i = 1; i < all.size(); i++) {
         const double gap = double(all[i] - all[i - 1]) * 1000.0 / qpf.QuadPart;
         over_100 += gap > 100;
+        if (gaps && gap > 100)
+            std::fprintf(stderr, "gap %.0f ms ending at %.3f s\n", gap,
+                         double(all[i] - started.QuadPart) / qpf.QuadPart);
         if (gap > longest) longest = gap, longest_at = double(all[i] - started.QuadPart) / qpf.QuadPart;
     }
     std::printf(" first_present_s=%.2f longest_gap_ms=%.0f longest_gap_ends_s=%.1f gaps_over_100ms=%u\n", first_present, longest,

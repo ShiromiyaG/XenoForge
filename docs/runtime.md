@@ -1660,6 +1660,15 @@ code. As built (`frontend/`):
   its alone: it presents on its own queue, so even a present that blocks
   for the display holds nothing of the renderer's. (A device whose
   graphics family has one queue shares it, under the queue's lock.)
+  The window presents only when there is something new to show: a fresh
+  picture, the overlay or a dialog of the system (and once more when they
+  close), or a window event that asks for it (shown, uncovered, resized,
+  moved to another display). A guest that stops swapping, as at a loading
+  screen, leaves the last picture on screen with no present, as Xenia's
+  presenter paints only on a guest output refresh or a paint request.
+  (Until 2026-11-08 it also presented the last picture again every 100 ms,
+  which a frame timer such as `xfbench` saw as a run of 101-102 ms gaps
+  where Xenia showed one long one; renderer.md, "Game D's gaps".)
 - **Input** ([input.md](input.md)): SDL3's gamepads (Xenia's SDL driver),
   then the keyboard as a controller (Xenia's keyboard driver, its
   bindings), the deadzones; the scripted presses on user 0.
