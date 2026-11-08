@@ -1499,12 +1499,19 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   and cross one another, translucent, so where they cross both show; so are
   the header, the toolbar and the game rows (alpha in `launcher.rcss`'s
   gradients), which lets the ribbons through behind them. A ribbon is always
-  full width: it folds, like a strip of paper folded back and forth, its
-  silhouette zigzagging and narrowing to a crease where it turns, the face
-  shown changing there (one lighter, one darker); it does not thin out and
-  fade. Edges are crisp, covered to the pixel (no glow, no blur). All of it
-  is a function of the position and a clock (one full-screen pass, no
-  texture, no geometry; sizes in window heights). `[launcher] backdrop`:
+  full width: a strip of constant width along a curve in space (it sweeps down
+  the window, leans up to the right, sways and winds round a spiral that turns
+  with the clock) whose width's direction twists about the curve, so it shows
+  its other face (a little darker) where it turns, goes edge-on and passes
+  over or under itself; it does not thin out and fade. The grey gradient is
+  one full-screen pass (`ui.frag`, no texture, a function of the position);
+  the ribbons are triangles built on the CPU every frame
+  (`frontend/ui/ribbons.cpp`, `build_ribbons`: 150 sections by 5 vertices
+  across, lit per vertex with a diffuse term and a silk sheen, a perspective
+  camera 2.2 window heights away, sorted far to near and drawn blended with
+  the interface's own geometry path, one allocation freed a frame). Each edge
+  has a one-pixel fringe of alpha 0 in place of multisampling, so the edges
+  stay crisp (no glow, no blur). Sizes are in window heights. `[launcher] backdrop`:
   `animated`, `still` or `off` (the grey alone), in the Interface tab, read by
   `LauncherView::update_backdrop` every frame; the clock stops while the
   window is minimized, hidden or covered (focus does not matter).

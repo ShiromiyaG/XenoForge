@@ -378,7 +378,7 @@ if(XF_PLAYER AND TARGET boot)
             DEPENDS frontend/ui/ui.${shader} frontend/ui/ui_draw.glsl
             COMMENT "glslc ui.${shader}")
     endforeach()
-    add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
+    add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ribbons.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
                              frontend/prepare_job.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
                              frontend/launcher_view.cpp frontend/launcher_screens.cpp frontend/launcher_input.cpp
                              frontend/settings_view.cpp

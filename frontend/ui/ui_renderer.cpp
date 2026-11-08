@@ -3,6 +3,7 @@
 // RmlUi_Renderer_GL3.cpp); the Vulkan side is this project's own.
 
 #include "ui_renderer.h"
+#include "ribbons.h"
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/DecorationTypes.h>
@@ -987,15 +988,36 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
     m.begin_pass(m.layer(0), true);
     if (m.backdrop.on) {
         const Backdrop &b = m.backdrop;
-        m.pass(m.layer(0), *m.white, M_BACKDROP, Blend::Replace, {}, false, [&](Impl::Draw &s) {
-            // ui.frag's MODE_BACKDROP: the tint in the first stop, the clock,
-            // the shape of the window and the strength in pv
-            for (int c = 0; c < 3; c++) s.u.stop_colors[0][c] = b.tint[c];
-            s.u.pv[0] = b.time;
-            s.u.pv[1] = float(m.width) / float(m.height);
-            s.u.pv[2] = b.strength;
-            s.u.limits[0] = float(m.width), s.u.limits[1] = float(m.height);
-        });
+        // the grey gradient: ui.frag's MODE_BACKDROP (the clock-free part)
+        m.pass(m.layer(0), *m.white, M_BACKDROP, Blend::Replace, {}, false, [](Impl::Draw &) {});
+        // the ribbons over it: triangles, built on the CPU (ribbons.cpp)
+        if (b.strength > 0) {
+            std::vector<RibbonVertex> rv;
+            std::vector<uint32_t> ri;
+            build_ribbons(b.time, m.width, m.height, b.tint, b.strength, rv, ri);
+            if (!ri.empty()) {
+                std::vector<Rml::Vertex> verts(rv.size());
+                for (size_t i = 0; i < rv.size(); i++) {
+                    verts[i].position = {rv[i].x, rv[i].y};
+                    verts[i].colour = Rml::ColourbPremultiplied(rv[i].r, rv[i].g, rv[i].b, rv[i].a);
+                    verts[i].tex_coord = {0.f, 0.f};
+                }
+                std::vector<int> idx(ri.begin(), ri.end());
+                auto *g = new Geometry;
+                if (m.alloc_geometry(*g, verts.data(), verts.size() * sizeof(Rml::Vertex), idx.data(), idx.size() * sizeof(int))) {
+                    Impl::Draw s = m.make_draw(m.layer(0));
+                    s.geometry = g;
+                    std::memcpy(s.u.transform, m.projection.data(), sizeof(float) * 16);
+                    m.draw(s);
+                    m.defer([&m, g] {
+                        m.free_geometry_now(*g);
+                        delete g;
+                    });
+                } else {
+                    delete g;
+                }
+            }
+        }
     }
 }
 
