@@ -14,6 +14,23 @@ namespace {
 std::string failed(const char *what, VkResult r) { return std::string(what) + " failed (" + std::to_string(r) + ")"; }
 } // namespace
 
+bool load_vulkan(std::string &error) {
+    static std::once_flag once;
+    static VkResult result = VK_SUCCESS;
+    std::call_once(once, [] { result = volkInitialize(); });
+    if (result != VK_SUCCESS) {
+        error = "no Vulkan loader on this system (vulkan-1.dll / libvulkan.so.1): install a GPU driver with Vulkan";
+        return false;
+    }
+    return true;
+}
+
+void load_instance(VkInstance instance) {
+    static std::mutex m;
+    std::lock_guard lock(m);
+    volkLoadInstance(instance);
+}
+
 // A block of the image pool: device memory of one type, its free ranges by
 // offset (merged with their neighbors as they come back) and by size (for
 // the best fit).
@@ -69,6 +86,7 @@ struct Device::Block {
 };
 
 std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
+    if (!load_vulkan(error)) return nullptr;
     std::unique_ptr<Device> d(new Device());
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "xenoforge";
@@ -89,6 +107,7 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         error = failed("vkCreateInstance", r);
         return nullptr;
     }
+    load_instance(d->instance_);
     if (window) {
         d->surface_ = window->make_surface ? window->make_surface(d->instance_) : VK_NULL_HANDLE;
         if (!d->surface_) {

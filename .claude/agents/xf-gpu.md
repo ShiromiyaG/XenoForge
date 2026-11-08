@@ -88,6 +88,10 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
 - Build: `cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`, then
   `cmake --build build`, then `ctest --test-dir build`. Everything must pass. Other agents build on the
   same machine, so builds can be slow; use long tool timeouts.
+- Internal shaders (src/shaders, frontend/*.comp, frontend/ui/ui.*) are committed compiled as
+  `src/shaders/spirv/<name>.inc` (cmake/vulkan.cmake; no Vulkan SDK needed to build). The build
+  recompiles a changed shader there when glslc is found: commit the `.inc` together with the shader.
+  New shaders go through `xf_spirv`/`xf_shader`. Vulkan functions come from volk (`<volk.h>`).
 - Run every test and tool under a timeout (`timeout 300 ...`), and never leave a process running when
   you finish.
 - Shell: Bash is Git Bash on Windows. Heredocs mangle backslashes, so make code changes with

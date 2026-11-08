@@ -11,7 +11,6 @@
 #   XenoForge::xfrecomp  the recompiler (an executable), and XenoForge_XFINSPECT beside it
 
 include(CMakeFindDependencyMacro)
-find_dependency(Vulkan)
 
 # The libraries are built for the release runtime: a port built as Debug does not
 # link (the linker refuses the mismatch). Set CMAKE_BUILD_TYPE before project().
@@ -36,13 +35,8 @@ macro(_xf_static target file)
     endif()
 endmacro()
 
-# Khronos's SPIR-V headers (from the Vulkan SDK), which the core's headers include
-find_path(_xf_spirv spirv.hpp11 HINTS "$ENV{VULKAN_SDK}/Include/spirv-headers" "$ENV{VULKAN_SDK}/include/spirv-headers"
-          "${Vulkan_INCLUDE_DIR}/spirv-headers")
-set(_xf_includes "${XENOFORGE_INCLUDE_DIR}")
-if(_xf_spirv)
-    list(APPEND _xf_includes "${_xf_spirv}")
-endif()
+# Khronos's Vulkan and SPIR-V headers and volk come with the package (cmake/vulkan.cmake): no Vulkan SDK
+set(_xf_includes "${XENOFORGE_INCLUDE_DIR}" "${XENOFORGE_INCLUDE_DIR}/spirv-headers")
 
 _xf_static(XenoForge::core xenoforge)
 set_target_properties(XenoForge::core PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${_xf_includes}"
@@ -52,8 +46,13 @@ if(UNIX)
     find_dependency(Threads)
 endif()
 
+# volk: Vulkan's functions loaded from the system's loader at run time (no prototypes, no import library)
+_xf_static(XenoForge::volk xenoforge_volk)
+set_target_properties(XenoForge::volk PROPERTIES INTERFACE_COMPILE_DEFINITIONS VK_NO_PROTOTYPES
+                                                 INTERFACE_LINK_LIBRARIES "${CMAKE_DL_LIBS}"
+                                                 IMPORTED_LINK_INTERFACE_LANGUAGES C)
 _xf_static(XenoForge::vk xenoforge_vk)
-set_target_properties(XenoForge::vk PROPERTIES INTERFACE_LINK_LIBRARIES "XenoForge::core;Vulkan::Vulkan")
+set_target_properties(XenoForge::vk PROPERTIES INTERFACE_LINK_LIBRARIES "XenoForge::core;XenoForge::volk")
 
 _xf_static(XenoForge::kernel_archive xenoforge_kernel)
 add_library(XenoForge::kernel INTERFACE IMPORTED)
@@ -70,6 +69,7 @@ if(XENOFORGE_PLAYER)
     _xf_static(XenoForge::player xenoforge_player)
     _xf_static(XenoForge::_frontend xf_frontend)
     _xf_static(XenoForge::_imgui xf_imgui)
+    set_target_properties(XenoForge::_imgui PROPERTIES INTERFACE_COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_USE_VOLK)
     _xf_static(XenoForge::_sdl3 SDL3-static)
     # SDL3's system libraries, as the build that made the package linked them
     set(_xf_sdl_libs)

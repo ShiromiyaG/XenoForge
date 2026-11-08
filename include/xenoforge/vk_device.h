@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include <vulkan/vulkan.h>
+#include <volk.h> // Vulkan without prototypes, its functions loaded at run time (cmake/vulkan.cmake)
 
 #include <cstdint>
 #include <functional>
@@ -19,6 +19,14 @@
 #include <vector>
 
 namespace xf::vk {
+
+// Finds the system's Vulkan loader (vulkan-1.dll, libvulkan.so.1) and loads
+// the global functions through volk, once per process; false with the reason
+// where there is none. Device::open and Compute::open call it first.
+bool load_vulkan(std::string &error);
+// Loads the instance's and its devices' functions (volkLoadInstance: the
+// loader's trampolines, valid for every instance and device of the process).
+void load_instance(VkInstance instance);
 
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;

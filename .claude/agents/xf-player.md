@@ -63,6 +63,10 @@ Then:
 - Build: `cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++` (in a
   worktree also `-DSTB_DIR=F:/RECOMPs/xenia-canary/third_party/stb`), then `cmake --build build`, then
   `ctest --test-dir build --timeout 300`. Everything must pass.
+- Internal shaders (src/shaders, frontend/*.comp, frontend/ui/ui.*) are committed compiled as
+  `src/shaders/spirv/<name>.inc` (cmake/vulkan.cmake; no Vulkan SDK needed to build). The build
+  recompiles a changed shader there when glslc is found: commit the `.inc` together with the shader.
+  New shaders go through `xf_spirv`/`xf_shader`. Vulkan functions come from volk (`<volk.h>`).
 - A game with its code generated: `xfrecomp emit <iso> <dir>/<game>` and `-DXF_GAMES=<game>
   -DXF_GEN_DIR=<dir>` (several minutes to build). F:\RECOMPs\external\gen is the main build's; emit into
   a directory of your own unless the brief says otherwise.

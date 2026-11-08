@@ -43,7 +43,7 @@
 
 #include "xenoforge/vk_device.h"
 
-#include <vulkan/vulkan.h>
+#include <volk.h> // Vulkan without prototypes, its functions loaded at run time (cmake/vulkan.cmake)
 
 #include <atomic>
 #include <cstdint>

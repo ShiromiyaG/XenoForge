@@ -113,29 +113,22 @@ if(XF_XMA)
     target_link_libraries(xenoforge PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
-# Khronos's SPIR-V headers (MIT), from the Vulkan SDK; spirv-val checks what
-# the translator writes in the tests
-find_path(SPIRV_HEADERS_DIR spirv.hpp11 HINTS "$ENV{VULKAN_SDK}/Include/spirv-headers" REQUIRED)
-target_include_directories(xenoforge PUBLIC ${SPIRV_HEADERS_DIR})
-find_program(SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin")
+# Vulkan's and SPIR-V's headers, volk and the committed internal shaders
+# (cmake/vulkan.cmake): no Vulkan SDK needed. spirv-val, where the SDK is,
+# checks what the translator writes in the tests.
+include(cmake/vulkan.cmake)
+target_include_directories(xenoforge SYSTEM PUBLIC ${XF_SPIRV_INCLUDE})
+find_program(SPIRV_VAL spirv-val HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
 
 # The parts that talk to a GPU, apart, so the rest builds without Vulkan:
-# the compute runner of the shader checks, and the renderer (plan B3), whose
-# rectangle list geometry shader glslc compiles to SPIR-V words it includes.
-find_package(Vulkan REQUIRED)
-find_program(GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" REQUIRED)
-set(XF_SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+# the compute runner of the shader checks, and the renderer (plan B3), with
+# its internal shaders' SPIR-V words (src/shaders/spirv).
+set(XF_SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders) # generated files that are not shaders (the icon)
 set(XF_SHADER_WORDS)
-# xf_shader(<name> <source> [defines...]): src/shaders/<source> to <name>.inc
+# xf_shader(<name> <source> [defines...]): src/shaders/<source> as src/shaders/spirv/<name>.inc
 function(xf_shader name source)
-    add_custom_command(
-        OUTPUT ${XF_SHADER_OUT}/${name}.inc
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
-        COMMAND ${GLSLC} --target-env=vulkan1.3 -mfmt=num ${ARGN} -o ${XF_SHADER_OUT}/${name}.inc
-                ${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/${source}
-        DEPENDS src/shaders/${source} src/shaders/edram.glsl src/shaders/tiling.glsl
-        COMMENT "glslc ${name}")
-    set(XF_SHADER_WORDS ${XF_SHADER_WORDS} ${XF_SHADER_OUT}/${name}.inc PARENT_SCOPE)
+    xf_spirv(XF_SHADER_WORDS ${name} src/shaders/${source} ${ARGN})
+    set(XF_SHADER_WORDS ${XF_SHADER_WORDS} PARENT_SCOPE)
 endfunction()
 xf_shader(rectangle_list.geom rectangle_list.geom)
 xf_shader(point_list.geom point_list.geom)
@@ -174,8 +167,8 @@ xf_shader(resolve.comp resolve.comp)
 xf_shader(texture_load.comp texture_load.comp)
 xf_shader(texture_load_test.comp texture_load.comp -DPARAMS_BUFFER) # texture_gpu_test's
 add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/native_render.cpp src/replay.cpp src/shader_step.cpp ${XF_SHADER_WORDS})
-target_include_directories(xenoforge_vk PRIVATE ${XF_SHADER_OUT})
-target_link_libraries(xenoforge_vk PUBLIC xenoforge Vulkan::Vulkan)
+target_include_directories(xenoforge_vk PRIVATE ${XF_SPIRV_DIR})
+target_link_libraries(xenoforge_vk PUBLIC xenoforge xf_volk)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     # Vulkan's structures are filled as VkX info{VK_STRUCTURE_TYPE_X}, the rest zero
     target_compile_options(xenoforge_vk PRIVATE -Wno-missing-field-initializers)
@@ -316,7 +309,7 @@ target_link_libraries(xfcompare PRIVATE stb)
 # xfbench_hook.dll, a Vulkan layer or a DXGI hook) and its GPU and CPU time.
 if(WIN32)
     add_library(xfbench_hook SHARED tools/bench/xfbench_hook.cpp)
-    target_include_directories(xfbench_hook PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_link_libraries(xfbench_hook PRIVATE xf_vulkan_headers) # a layer: Vulkan's prototypes, not volk
     target_link_libraries(xfbench_hook PRIVATE dxgi)
     set_target_properties(xfbench_hook PROPERTIES PREFIX "")
     add_custom_command(TARGET xfbench_hook POST_BUILD
@@ -389,29 +382,17 @@ if(XF_PLAYER AND TARGET boot)
         ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp
         ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
     target_include_directories(xf_imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-    target_link_libraries(xf_imgui PUBLIC SDL3::SDL3-static Vulkan::Vulkan)
+    target_link_libraries(xf_imgui PUBLIC SDL3::SDL3-static xf_volk)
+    target_compile_definitions(xf_imgui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK)
     target_compile_options(xf_imgui PRIVATE -w)
     # the window, input, sound and settings, apart from the kernel they feed;
-    # the window's front buffer conversion, a compute shader glslc compiles
-    add_custom_command(
-        OUTPUT ${XF_SHADER_OUT}/front_buffer.comp.inc
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
-        COMMAND ${GLSLC} --target-env=vulkan1.3 -mfmt=num -o ${XF_SHADER_OUT}/front_buffer.comp.inc
-                ${CMAKE_CURRENT_SOURCE_DIR}/frontend/front_buffer.comp
-        DEPENDS frontend/front_buffer.comp
-        COMMENT "glslc front_buffer.comp")
+    # the window's front buffer conversion, a compute shader (src/shaders/spirv)
+    set(XF_FRONTEND_SHADERS)
+    xf_spirv(XF_FRONTEND_SHADERS front_buffer.comp frontend/front_buffer.comp)
     # the window's picture effects (FSR 1's EASU and RCAS, CAS, FXAA), one compute shader each
-    set(XF_PRESENT_EFFECTS)
     foreach(effect EASU RCAS CAS FXAA FXAA_EXTREME)
-        add_custom_command(
-            OUTPUT ${XF_SHADER_OUT}/present_${effect}.comp.inc
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
-            COMMAND ${GLSLC} --target-env=vulkan1.3 -fshader-stage=comp -w -mfmt=num -D${effect}
-                    -o ${XF_SHADER_OUT}/present_${effect}.comp.inc ${CMAKE_CURRENT_SOURCE_DIR}/frontend/present_effects.comp
-            DEPENDS frontend/present_effects.comp third_party/FidelityFX-FSR/ffx_a.h third_party/FidelityFX-FSR/ffx_fsr1.h
-                    third_party/FidelityFX-CAS/ffx_a.h third_party/FidelityFX-CAS/ffx_cas.h third_party/fxaa/FXAA3_11.h
-            COMMENT "glslc present_effects.comp ${effect}")
-        list(APPEND XF_PRESENT_EFFECTS ${XF_SHADER_OUT}/present_${effect}.comp.inc)
+        xf_spirv(XF_FRONTEND_SHADERS present_${effect}.comp frontend/present_effects.comp -fshader-stage=comp -w
+                 -D${effect})
     endforeach()
     # XenoForge's mark for the windows' icon (assets/branding), built into the frontend
     add_custom_command(OUTPUT ${XF_SHADER_OUT}/xenoforge_icon.inc
@@ -423,10 +404,9 @@ if(XF_PLAYER AND TARGET boot)
                                    frontend/profiles.cpp frontend/console_options.cpp frontend/system_ui.cpp
                                    frontend/sdl_audio.cpp frontend/library.cpp frontend/launcher_core.cpp
                                    frontend/window_icon.cpp
-                                   ${XF_SHADER_OUT}/front_buffer.comp.inc ${XF_SHADER_OUT}/xenoforge_icon.inc
-                                   ${XF_PRESENT_EFFECTS})
-    target_include_directories(xf_frontend PRIVATE ${XF_SHADER_OUT})
-    target_link_libraries(xf_frontend PUBLIC xenoforge xenoforge_vk SDL3::SDL3-static Vulkan::Vulkan
+                                   ${XF_SHADER_OUT}/xenoforge_icon.inc ${XF_FRONTEND_SHADERS})
+    target_include_directories(xf_frontend PRIVATE ${XF_SHADER_OUT} ${XF_SPIRV_DIR})
+    target_link_libraries(xf_frontend PUBLIC xenoforge xenoforge_vk SDL3::SDL3-static xf_volk
                                              tomlplusplus::tomlplusplus)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(xf_frontend PRIVATE -Wno-missing-field-initializers)
@@ -454,21 +434,16 @@ if(XF_PLAYER AND TARGET boot)
     # The view is RmlUi (frontend/ui): its Vulkan render interface on the
     # frontend's own vk::Device, the screens written as RML and RCSS beside
     # the executable (ui/), and the font (Inter, SIL OFL) with them.
+    set(XF_UI_SHADERS)
     foreach(shader vert frag)
-        add_custom_command(
-            OUTPUT ${XF_SHADER_OUT}/ui.${shader}.inc
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
-            COMMAND ${GLSLC} --target-env=vulkan1.3 -mfmt=num -o ${XF_SHADER_OUT}/ui.${shader}.inc
-                    ${CMAKE_CURRENT_SOURCE_DIR}/frontend/ui/ui.${shader}
-            DEPENDS frontend/ui/ui.${shader} frontend/ui/ui_draw.glsl
-            COMMENT "glslc ui.${shader}")
+        xf_spirv(XF_UI_SHADERS ui.${shader} frontend/ui/ui.${shader})
     endforeach()
     add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
                              frontend/prepare_job.cpp frontend/stale_library.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
                              frontend/launcher_view.cpp frontend/launcher_screens.cpp frontend/launcher_input.cpp
                              frontend/settings_view.cpp
-                             ${XF_SHADER_OUT}/ui.vert.inc ${XF_SHADER_OUT}/ui.frag.inc)
-    target_include_directories(xf_ui PRIVATE ${XF_SHADER_OUT})
+                             ${XF_UI_SHADERS})
+    target_include_directories(xf_ui PRIVATE ${XF_SPIRV_DIR})
     target_include_directories(xf_ui PUBLIC frontend)
     target_link_libraries(xf_ui PUBLIC xf_frontend RmlUi::Core stb)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -600,9 +575,9 @@ foreach(name spirv shader_translator)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
 # the interlock path's translated pixel shaders, with edram_fsi.frag's library
-target_sources(shader_translator_test PRIVATE ${XF_SHADER_OUT}/edram_fsi_library.frag.inc)
+target_sources(shader_translator_test PRIVATE ${XF_SPIRV_DIR}/edram_fsi_library.frag.inc)
 target_compile_definitions(shader_translator_test PRIVATE
-                           XF_EDRAM_FSI_LIBRARY="${XF_SHADER_OUT}/edram_fsi_library.frag.inc")
+                           XF_EDRAM_FSI_LIBRARY="${XF_SPIRV_DIR}/edram_fsi_library.frag.inc")
 add_test(NAME kernel_threads COMMAND kernel_threads_test)
 add_test(NAME kernel_crash COMMAND kernel_crash_test)
 # a rare deadlock seen once under load (2026-11-05, not reproduced in 36
@@ -707,7 +682,7 @@ target_link_libraries(vk_compute_test PRIVATE xenoforge_vk)
 add_test(NAME vk_compute COMMAND vk_compute_test)
 # texture_load.comp against the CPU's decode, every format and fallback
 add_executable(texture_gpu_test tests/texture_gpu_test.cpp)
-target_include_directories(texture_gpu_test PRIVATE ${XF_SHADER_OUT})
+target_include_directories(texture_gpu_test PRIVATE ${XF_SPIRV_DIR})
 target_link_libraries(texture_gpu_test PRIVATE xenoforge_vk)
 add_test(NAME texture_gpu COMMAND texture_gpu_test)
 set_tests_properties(texture_gpu PROPERTIES TIMEOUT 300)

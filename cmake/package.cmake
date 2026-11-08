@@ -16,7 +16,8 @@
 #   ffmpeg-source/               the overlay itself (third_party/ffmpeg: configuration and build script)
 #   LICENSE-xenia, LICENSE-rexglue
 #   ui/                          the launcher's windows (RML, RCSS), its font, Inter (SIL OFL), and icons, Lucide (ISC)
-#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Lucide, stb
+#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Lucide, stb,
+#                                FidelityFX, FXAA, volk, Vulkan-Headers
 #
 # Included by CMakeLists.txt once the player's targets (XF_PLAYERS) and its
 # fetched dependencies exist.
@@ -51,6 +52,8 @@ file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Lucide.txt" _lucide)
 file(READ "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-FSR/LICENSE.txt" _fsr)
 file(READ "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-CAS/LICENSE.txt" _cas)
 file(READ "${CMAKE_SOURCE_DIR}/third_party/fxaa/LICENSE" _fxaa)
+file(READ "${volk_SOURCE_DIR}/LICENSE.md" _volk)
+file(READ "${vulkanheaders_SOURCE_DIR}/LICENSES/Apache-2.0.txt" _vulkan_headers)
 file(READ "${STB_DIR}/stb_image_write.h" _stb)
 string(FIND "${_stb}" "This software is available under 2 licenses" _stb_at)
 if(_stb_at LESS 0)
@@ -117,6 +120,16 @@ ${_rule}
 NVIDIA FXAA 3.11 (FXAA3_11.h) - BSD 3-clause license (the player's FXAA)
 ${_rule}
 ${_fxaa}
+${_rule}
+volk (vulkan-sdk-${XF_VULKAN_SDK_TAG}.0), https://github.com/zeux/volk - MIT license (Vulkan's
+functions loaded from the system's loader)
+${_rule}
+${_volk}
+${_rule}
+Vulkan-Headers (v${XF_VULKAN_SDK_TAG}), https://github.com/KhronosGroup/Vulkan-Headers - Apache
+License 2.0 (the C headers compiled in; unchanged)
+${_rule}
+${_vulkan_headers}
 ")
 install(FILES "${_notices}" DESTINATION .)
 
