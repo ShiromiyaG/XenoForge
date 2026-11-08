@@ -2442,6 +2442,27 @@ scaled pictures as in ours). Results (2026-11-08, interlock path):
 Against our own 100% frames, box filtered: game B 0.8 (200%) and 0.4
 (300%), game A's title 0.15-0.45.
 
+**Cost against Xenia** (game B's 3D title scene, `bench_vs_xenia.ps1 -Scale`,
+GPU ms a frame by the counter, median and spread; ours on its default
+interlock path, Xenia's Direct3D 12 on its default host render targets;
+both hold 60 fps at every scale):
+
+| scale | ours | Xenia D3D12 |
+| --- | --- | --- |
+| 100% | 1.39 (1.38-1.39) | 0.83 (0.83-0.85) |
+| 200% | 5.18 (5.11-5.21), 3 runs | 2.92 (2.92-2.99), 2 runs |
+| 300% | 11.81 (11.81-12.03), 2 runs | 6.22 (6.22-6.28), 2 runs |
+
+The 100% row is the standing benchmark's above. Not interleaved (ours'
+runs, then Xenia's, minutes apart); another agent's player and a Xenia ran
+on the machine during parts of both. Both grow about as the pixels do
+(ours 3.7x and 8.5x of its 100%, Xenia's 3.5x and 7.5x): we lose by the
+same factor as at 100%, the interlock path's draws costing about twice
+Xenia's host render targets' (the standing benchmark's analysis), which the
+interlock work aims at. What the scale adds besides the pixels (the
+resolves' second pass over scaled texels, the host path's EDRAM stores
+before every resolve) is not measured apart.
+
 **Where it differs from Xenia:** Xenia keeps a scaled copy of guest memory
 for resolves (its scaled resolve buffer, in 2 GB ranges on tiled resources)
 and loads textures from it with scaled addressing; here a resolve writes
