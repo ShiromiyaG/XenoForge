@@ -51,6 +51,18 @@ int main() {
     CHECK(r.row.detail.find("reading host 0x10") == 0);
     CHECK(r.row.excerpt.find("lr 0x82004004") != std::string::npos);
 
+    // a crash the handler reported: the summary carries the guest stack and the report's file
+    const char *reported = "fault: writing host 0x10\n"
+                           "xf-summary {\"title_id\":\"1\",\"digest\":\"2\",\"state\":\"crash\","
+                           "\"detail\":\"writing host 0x10\",\"stack\":\"0x82000000 (0x82000000+0x0) <- lr 0x82000114\","
+                           "\"report\":\"C:\\\\out\\\\crash-1.txt\",\"swaps\":0,\"unimplemented\":[],\"gpu\":[]}\n";
+    r = compat::parse_boot_output(reported, 3, false);
+    CHECK(r.summary && r.row.state == "crash");
+    CHECK(r.row.stack == "0x82000000 (0x82000000+0x0) <- lr 0x82000114");
+    CHECK(r.row.report == "C:\\out\\crash-1.txt");
+    compat::Row again;
+    CHECK(compat::from_json(compat::to_json(r.row), again) && again.stack == r.row.stack && again.report == r.row.report);
+
     // killed at the hard timeout without a word, and a boot that ended silently
     r = compat::parse_boot_output("loaded\n", -1, true);
     CHECK(r.row.state == "stall" && r.row.detail.find("hard timeout") != std::string::npos);

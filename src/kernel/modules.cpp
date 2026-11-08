@@ -1257,6 +1257,19 @@ std::string module_at(Kernel &k, uint32_t address) {
     return {};
 }
 
+bool module_at_try(Kernel &k, uint32_t address, std::string &name, uint32_t &base) {
+    Modules &s = k.state<Modules>();
+    std::unique_lock lock(s.mutex, std::try_to_lock);
+    if (!lock) return false;
+    for (auto &m : s.user_modules)
+        if (address - m->base_address < m->image_size) {
+            name = m->path.empty() ? m->name : std::string(name_from_path(m->path));
+            base = m->base_address;
+            return true;
+        }
+    return false;
+}
+
 bool module_range(Kernel &k, uint32_t address, uint32_t &base, uint32_t &size) {
     Modules &s = k.state<Modules>();
     std::lock_guard lock(s.mutex);

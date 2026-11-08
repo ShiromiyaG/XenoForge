@@ -239,6 +239,11 @@ endforeach()
 add_executable(kernel_threads_test tests/kernel_threads_test.cpp)
 target_include_directories(kernel_threads_test PRIVATE src/kernel)
 target_link_libraries(kernel_threads_test PRIVATE xenoforge_kernel xenoforge)
+# crash and stop reports: a thread's report, the interpreter's stop, and real
+# faults in child processes (include/xenoforge/crash.h)
+add_executable(kernel_crash_test tests/kernel_crash_test.cpp)
+target_include_directories(kernel_crash_test PRIVATE src/kernel)
+target_link_libraries(kernel_crash_test PRIVATE xenoforge_kernel xenoforge)
 # the exception dispatch on a guest program (tests/seh_program.h), interpreted
 # and recompiled: seh_gen emits the program's functions as xfrecomp would
 add_executable(seh_gen tests/seh_gen.cpp)
@@ -464,6 +469,7 @@ target_sources(shader_translator_test PRIVATE ${XF_SHADER_OUT}/edram_fsi_library
 target_compile_definitions(shader_translator_test PRIVATE
                            XF_EDRAM_FSI_LIBRARY="${XF_SHADER_OUT}/edram_fsi_library.frag.inc")
 add_test(NAME kernel_threads COMMAND kernel_threads_test)
+add_test(NAME kernel_crash COMMAND kernel_crash_test)
 # a rare deadlock seen once under load (2026-11-05, not reproduced in 36
 # runs since): fail instead of hanging the suite
 set_tests_properties(kernel_threads PROPERTIES TIMEOUT 120)

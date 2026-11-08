@@ -321,7 +321,7 @@ constexpr uint32_t MAX_LAUNCH_DATA_SIZE = 0x3FC;
 
 void end_title(Kernel &k, const std::string &why) {
     std::fprintf(stderr, "xam: %s\n", why.c_str());
-    if (!k.stopped.exchange(true)) k.stop_reason = why;
+    k.stop(why);
     throw ThreadExit{0};
 }
 

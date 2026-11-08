@@ -34,6 +34,8 @@ struct Row {
     std::string first_gpu; // the first GPU gap the renderer counted ("skipped: reason", "approx: what")
     std::string unimplemented_all, gpu_all; // "; " joined
     std::string excerpt;                    // the guest stack excerpt of a stall or crash
+    std::string stack;  // a crash's or stop's guest stack, one line, as functions (boot's summary)
+    std::string report; // the file of its crash report
     double boot_seconds = 0;
     int exit_code = 0;
 };

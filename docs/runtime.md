@@ -1288,6 +1288,54 @@ run 30 times beside other load (16 beside 12 busy processes, 8 beside two
 writers flushing to the hard disk the disc image is on, 6 under a game
 library's build): the first swap came at 2 to 11 s every time.
 
+### Crash and stop reports
+
+`include/xenoforge/crash.h`, `src/kernel/crash.cpp`; test
+`kernel_crash_test`. `install_crash_handler` (called by `game::launch`, so
+boot and the player have it; before any write watch, so memory's fault
+handler comes first in the chain and the handler sees only the faults
+memory does not take) catches access faults, illegal instructions and
+integer division by zero: a vectored exception handler on Windows, signals
+on POSIX (SIGSEGV, SIGBUS, SIGILL, SIGFPE; compiled only there, not yet
+built on a POSIX host; TODO there: the faulting host pc from the ucontext,
+so a generated function is named). It writes `crash-<date>-<time>.txt` into
+the crash directory (`XF_CRASH_DIR`, boot's `--crash-dir`, else the current
+directory), calls the tool's hook (boot and the player print the report,
+the run's report and the summary) and ends the process with exit code 3.
+
+The report (`make_crash_report`, which takes no lock the faulting code may
+hold: the kernel's lock and the rings' are only tried, a thread's stack is
+read inside its own range) gives:
+- what: the access (reading, writing, executing; the host address and the
+  guest address it is);
+- the thread: id, name, start address, stack range;
+- where: for a fault in generated code, the guest function whose host code
+  is nearest below the faulting host address (the generated code does not
+  keep the pc; the context's pc is only the last call's, so it is marked so);
+  in the interpreter, its exact pc. Each guest address is shown as
+  `module+offset` and `function start+offset` from the module tables;
+- the stack: LR, then the return addresses by the r1 back chain
+  (`guest_backtrace`, the walk `thread_report` also uses), each as a
+  function;
+- the last kernel calls (`note_kernel_call`, a ring of 16 per thread filled
+  in `run_import`: library, export, the LR it was called from, "not
+  implemented" marked), this thread's in full and the others' last 6;
+- the other threads' state, pc and LR.
+
+A stop (an invalid instruction, an instruction with no semantics, the
+interpreter's step limit, KeBugCheck, XamLoaderTerminateTitle: all through
+`Kernel::stop`) keeps the report of the thread that stopped it in
+`Kernel::stop_report` and its one-line stack in `stop_stack`; boot writes
+and prints it. The `xf-summary` line carries `stack` (the one-line stack,
+`pc (function+offset) <- ... <- lr ...`) and `report` (the file) for
+crash and stopped; xfcompat reads them into the rows' `stack` and `report`
+columns (JSON and CSV).
+
+Where it differs from what could be had: an export that is missing returns
+0 as before (stderr says so once, and the call shows in the ring marked); it
+does not stop the run. An export that fails with an error status is not a
+crash.
+
 ## The player
 
 Plan track C1 (2026-11-05), after the 3DS runtime's `frontend/player.cpp`:

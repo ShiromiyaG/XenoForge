@@ -3,6 +3,7 @@
 #include "game.h"
 
 #include "xenoforge/command_processor.h"
+#include "xenoforge/crash.h"
 #include "xenoforge/disc.h"
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
@@ -55,40 +56,20 @@ bool load(const std::string &input, const std::string &xex_path, Xex &xex, std::
     return parse_xex(file, xex, error) && load_xex_image(file, xex, error);
 }
 
-#ifdef _WIN32
-// An access fault in the guest's code: where, in guest terms, then the report.
-LONG WINAPI on_fault(EXCEPTION_POINTERS *e) {
-    if (e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
-    uint64_t at = e->ExceptionRecord->ExceptionInformation[1];
-    uint64_t offset = the_game ? at - uint64_t(the_game->memory->base()) : ~0ull;
-    std::printf("fault: %s host 0x%llX", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
-                (unsigned long long)at);
-    if (offset < (1ull << 33)) std::printf(" (guest 0x%08llX)", (unsigned long long)offset);
-    // the faulting thread's own context (the handler runs on it)
-    if (ppc::Context *c = kernel::Kernel::current_context())
-        std::printf(", its guest thread last at 0x%08X, lr 0x%08X", c->pc, uint32_t(c->lr));
-    std::printf("\n");
+std::filesystem::path crash_directory = ".";
+
+// What boot and the player do after the kernel's crash handler wrote the
+// report (kernel/crash.h): print it, the run's report, and the summary.
+void on_crash(kernel::Kernel &, kernel::CrashReport &report, void *) {
+    std::printf("fault: %s\n%s", report.what.c_str(), report.text.c_str());
+    if (!report.file.empty()) std::printf("crash report written to %s\n", report.file.string().c_str());
     // the renderer's report only if no call of its is under way (this may be its thread)
-    if (the_game) print_report(*the_game, false);
     if (the_game) {
-        char detail[256];
-        std::snprintf(detail, sizeof(detail), "%s host 0x%llX", e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
-                      (unsigned long long)at);
-        std::string text = detail;
-        if (offset < (1ull << 33)) {
-            std::snprintf(detail, sizeof(detail), " (guest 0x%08llX)", (unsigned long long)offset);
-            text += detail;
-        }
-        if (ppc::Context *c = kernel::Kernel::current_context()) {
-            std::snprintf(detail, sizeof(detail), ", guest thread at 0x%08X, lr 0x%08X", c->pc, uint32_t(c->lr));
-            text += detail;
-        }
-        print_summary(*the_game, "crash", text);
+        print_report(*the_game, false);
+        print_summary(*the_game, "crash", report.what, report.stack, report.file.string());
     }
     std::fflush(stdout);
-    ExitProcess(3);
 }
-#endif
 
 // the renderer's counts: draws drawn and skipped by reason, what is
 // approximate, resolves, swaps, the time it took
@@ -335,9 +316,9 @@ bool start_trace(Game &g, const std::set<uint64_t> &frames, const std::filesyste
 
 bool launch(Game &g, std::string &error) {
     the_game = &g;
-#ifdef _WIN32
-    AddVectoredExceptionHandler(1, on_fault);
-#endif
+    // before any write watch, so memory's fault handler comes first in the chain
+    if (const char *dir = std::getenv("XF_CRASH_DIR")) crash_directory = dir;
+    kernel::install_crash_handler(*g.kernel, crash_directory, on_crash, nullptr);
     return g.kernel->launch(error);
 }
 
@@ -445,7 +426,21 @@ std::string json_escape(const std::string &text) {
 }
 } // namespace
 
-void print_summary(Game &g, const std::string &state, const std::string &detail) {
+void set_crash_directory(const std::filesystem::path &directory) { crash_directory = directory; }
+
+std::string write_stop_report(Game &g) {
+    kernel::Kernel &k = *g.kernel;
+    if (k.stop_report.empty()) return {};
+    kernel::CrashReport report;
+    report.text = k.stop_report;
+    kernel::write_crash_report(report, crash_directory);
+    std::printf("%s", report.text.c_str());
+    if (!report.file.empty()) std::printf("crash report written to %s\n", report.file.string().c_str());
+    return report.file.string();
+}
+
+void print_summary(Game &g, const std::string &state, const std::string &detail, const std::string &stack,
+                   const std::string &report_file) {
     kernel::Kernel &k = *g.kernel;
     char text[256];
     std::string out = "xf-summary {";
@@ -453,6 +448,7 @@ void print_summary(Game &g, const std::string &state, const std::string &detail)
                   (unsigned long long)image_digest(g.xex.image));
     out += text;
     out += "\"state\":\"" + json_escape(state) + "\",\"detail\":\"" + json_escape(detail) + "\",";
+    out += "\"stack\":\"" + json_escape(stack) + "\",\"report\":\"" + json_escape(report_file) + "\",";
     std::snprintf(text, sizeof(text),
                   "\"modules\":%zu,\"functions\":%zu,\"interpreted_entries\":%llu,\"interpreted_addresses\":%zu,"
                   "\"swaps\":%llu,\"draws\":%llu,",

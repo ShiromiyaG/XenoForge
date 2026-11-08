@@ -60,4 +60,11 @@ void guest_stacks_freed(Kernel &k, uint32_t base, uint32_t end);
 // The thread ends, on its own stack: its other host fibers go.
 void end_guest_stacks(Kernel &k, Thread &t);
 
+// A guest stack's frames by its back chain from sp: each frame's saved LR
+// (the XDK's prologues store it 8 bytes below the caller's frame), at most
+// `max`. Read only where the pages are readable: inside [low, high) when
+// given (a thread's own stack: no lock is taken, as the crash report needs),
+// else by asking the heap (a stack's guard pages are not readable).
+std::vector<uint32_t> guest_backtrace(Kernel &k, uint32_t sp, uint32_t low = 0, uint32_t high = 0, int max = 16);
+
 } // namespace xf::kernel

@@ -26,6 +26,7 @@
 #include "xenoforge/kernel.h"
 
 #include "objects.h"
+#include "xenoforge/crash.h"
 #include "xenoforge/exports.h"
 #include "xenoforge/ppc_interp.h"
 
@@ -144,7 +145,7 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
         char reason[96];
         std::snprintf(reason, sizeof(reason), "%s (0x%08X) at 0x%08X has no semantics", ppc::info(op).name, code, c.pc);
-        if (!k.stopped.exchange(true)) k.stop_reason = reason;
+        k.stop(reason);
     };
     system_.time_base = [](ppc::Context &c) {
         // the Xenon's time base runs at 50 MHz: 5 ticks in the scheduler's
@@ -432,6 +433,7 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
             std::fprintf(stderr, "kernel: %s is not implemented (r3 0x%08X, r4 0x%08X, from 0x%08X)\n", key.c_str(),
                          uint32_t(c.r[3]), uint32_t(c.r[4]), uint32_t(c.lr));
     }
+    note_kernel_call(import, uint32_t(c.lr));
     // a suspension or kernel APCs waiting for this thread happen here
     if (Thread *t = current_thread(); t && t->pending.load(std::memory_order_relaxed)) objects_->safe_point(*t);
     if (import_hook_) import_hook_(import_hook_user_, import, c, false);
@@ -557,13 +559,13 @@ void Kernel::interpret_from(ppc::Context &c, uint32_t pc, uint32_t until, uint32
         unwinds_thrown++;
         throw ppc::Unwind{s.pc};
     }
-    if (s.reason != ppc::Stopped::Returned && !stopped.exchange(true)) {
+    if (s.reason != ppc::Stopped::Returned && !stopped) {
         char reason[128];
         std::snprintf(reason, sizeof(reason), "the interpreter stopped at 0x%08X: %s", s.pc,
                       s.reason == ppc::Stopped::Invalid ? "an invalid instruction"
                       : s.reason == ppc::Stopped::Steps ? "the step limit"
                                                         : (std::string(ppc::info(s.op).name) + " has no semantics").c_str());
-        stop_reason = reason;
+        stop(reason);
     }
 }
 
@@ -605,6 +607,50 @@ void Kernel::call(ppc::Context &c, uint32_t address) {
     }
 }
 
+void Kernel::stop(const std::string &reason) {
+    if (stopped.exchange(true)) return;
+    stop_reason = reason;
+    CrashReport report = make_crash_report(*this, reason);
+    stop_report = std::move(report.text), stop_stack = std::move(report.stack);
+}
+
+bool Kernel::guest_function(uint32_t address, const char *&module, uint32_t &start) const {
+    // the last function starting at or before address, if within 64 KB
+    auto find = [&](const Generated *f, size_t n, uint32_t &found) {
+        const Generated *end = f + n;
+        const Generated *it = std::upper_bound(f, end, address,
+                                               [](uint32_t a, const Generated &g) { return a < g.address; });
+        if (it == f || address - (it - 1)->address >= 0x10000) return false;
+        return found = (it - 1)->address, true;
+    };
+    if (const CodeMap *map = code_map_.load(std::memory_order_acquire))
+        for (const CodeMap::Range &r : map->ranges) {
+            const ppc::GeneratedModule *m = r.module;
+            if (address - m->base >= m->size) continue;
+            module = m->name;
+            return find(m->functions, m->count, start);
+        }
+    module = nullptr;
+    return generated_count_ && find(generated_, generated_count_, start);
+}
+
+bool Kernel::guest_function_of_host(const void *host, uint32_t &start) const {
+    const uintptr_t at = uintptr_t(host);
+    uintptr_t best = 0;
+    uint32_t found = 0;
+    auto scan = [&](const Generated *f, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            uintptr_t p = uintptr_t(f[i].fn);
+            if (p && p <= at && p > best) best = p, found = f[i].address;
+        }
+    };
+    scan(generated_, generated_count_);
+    if (const CodeMap *map = code_map_.load(std::memory_order_acquire))
+        for (const CodeMap::Range &r : map->ranges) scan(r.module->functions, r.module->count);
+    if (!best || at - best >= 0x10000) return false;
+    return start = found, true;
+}
+
 std::map<std::string, uint64_t> Kernel::calls() const {
     std::lock_guard<std::mutex> lock(counts_mutex_);
     return calls_;
@@ -635,7 +681,7 @@ void invalid(Context &c, uint32_t pc) {
     auto &k = *static_cast<kernel::Kernel *>(c.system->owner);
     char reason[64];
     std::snprintf(reason, sizeof(reason), "an invalid instruction at 0x%08X", pc);
-    if (!k.stopped.exchange(true)) k.stop_reason = reason;
+    k.stop(reason);
 }
 [[noreturn]] void unwind(Context &c) {
     static_cast<kernel::Kernel *>(c.system->owner)->unwinds_thrown++;

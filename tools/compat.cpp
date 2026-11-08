@@ -168,6 +168,7 @@ std::string to_json(const Row &r) {
     u("swaps", r.swaps), u("draws", r.draws);
     str("first_unimplemented", r.first_unimplemented), str("first_gpu", r.first_gpu);
     str("unimplemented", r.unimplemented_all), str("gpu", r.gpu_all), str("excerpt", r.excerpt);
+    str("stack", r.stack), str("report", r.report);
     num("boot_seconds", number(r.boot_seconds));
     out += "\"exit_code\":" + std::to_string(r.exit_code) + "}";
     return out;
@@ -190,6 +191,7 @@ bool from_json(std::string_view line, Row &r) {
     r.first_unimplemented = text_of(o, "first_unimplemented"), r.first_gpu = text_of(o, "first_gpu");
     r.unimplemented_all = text_of(o, "unimplemented"), r.gpu_all = text_of(o, "gpu");
     r.excerpt = text_of(o, "excerpt");
+    r.stack = text_of(o, "stack"), r.report = text_of(o, "report");
     r.boot_seconds = real_of(o, "boot_seconds");
     r.exit_code = int(std::strtol(text_of(o, "exit_code").c_str(), nullptr, 10));
     return true;
@@ -198,7 +200,7 @@ bool from_json(std::string_view line, Row &r) {
 std::string csv_header() {
     return "disc,title,title_id,digest,state,detail,build_seconds,cached,library_mb,left_out,left_out_why,modules,functions,"
            "interpreted_entries,interpreted_addresses,swaps,draws,first_unimplemented,first_gpu,boot_seconds,"
-           "exit_code,excerpt";
+           "exit_code,excerpt,stack,report";
 }
 
 std::string to_csv(const Row &r) {
@@ -213,7 +215,7 @@ std::string to_csv(const Row &r) {
     add(std::to_string(r.functions)), add(std::to_string(r.interpreted_entries));
     add(std::to_string(r.interpreted_addresses)), add(std::to_string(r.swaps)), add(std::to_string(r.draws));
     add(csv_field(r.first_unimplemented)), add(csv_field(r.first_gpu)), add(number(r.boot_seconds));
-    add(std::to_string(r.exit_code)), add(csv_field(r.excerpt));
+    add(std::to_string(r.exit_code)), add(csv_field(r.excerpt)), add(csv_field(r.stack)), add(csv_field(r.report));
     return out;
 }
 
@@ -251,6 +253,7 @@ BootResult parse_boot_output(std::string_view output, int exit_code, bool timed_
         result.summary = true;
         row.title_id = text_of(o, "title_id"), row.digest = text_of(o, "digest");
         row.state = text_of(o, "state"), row.detail = text_of(o, "detail");
+        row.stack = text_of(o, "stack"), row.report = text_of(o, "report");
         row.modules = number_of(o, "modules"), row.functions = number_of(o, "functions");
         row.interpreted_entries = number_of(o, "interpreted_entries");
         row.interpreted_addresses = number_of(o, "interpreted_addresses");

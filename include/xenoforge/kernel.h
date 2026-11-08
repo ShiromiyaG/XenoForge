@@ -121,6 +121,9 @@ std::string modules_report(Kernel &k);
 // the file name of the game's module loaded at address ("" if none), for
 // boot's report of where the interpreter was entered
 std::string module_at(Kernel &k, uint32_t address);
+// module_at for the crash report: the name and base, false when none holds
+// address or the modules' lock is taken (it never waits)
+bool module_at_try(Kernel &k, uint32_t address, std::string &name, uint32_t &base);
 // the base and size of the game's image (the executable or a DLL) holding
 // address, for the exception dispatch's function tables (its .pdata)
 bool module_range(Kernel &k, uint32_t address, uint32_t &base, uint32_t &size);
@@ -349,6 +352,19 @@ public:
     // instruction with no semantics): where, and why
     std::atomic<bool> stopped{false};
     std::string stop_reason;
+    // Stops the run (the first reason stays), with the crash report (crash.h)
+    // of the calling guest thread, as it was when it stopped it.
+    void stop(const std::string &reason);
+    std::string stop_report, stop_stack; // the report's text, and its one-line stack
+
+    // Where a guest address is in the generated code's tables, for the
+    // reports: its module's file name and the function it falls in (the last
+    // one starting at or before it, within 64 KB). Locks nothing (the crash
+    // path uses them).
+    bool guest_function(uint32_t address, const char *&module, uint32_t &start) const;
+    // The generated function whose host code is nearest below a host code
+    // address (within 64 KB): the guest function a fault there came from.
+    bool guest_function_of_host(const void *host, uint32_t &start) const;
 
 private:
     void bind(const Xex &xex, bool executable);

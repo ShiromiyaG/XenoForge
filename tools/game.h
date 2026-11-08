@@ -92,8 +92,18 @@ void print_report(Game &game, bool waiting);
 // digest, the generated code installed, the interpreter's entries, the
 // swaps, the exports called without an implementation (the most called
 // first), the GPU's gaps (draws skipped, approximate) and `state` (ok,
-// stall, stopped, ended, crash) with `detail` (the stop reason, the fault).
-void print_summary(Game &game, const std::string &state, const std::string &detail = {});
+// stall, stopped, ended, crash) with `detail` (the stop reason, the fault),
+// `stack` (the guest stack of a crash or stop, one line, as functions) and
+// `report` (the crash report's file).
+void print_summary(Game &game, const std::string &state, const std::string &detail = {},
+                   const std::string &stack = {}, const std::string &report_file = {});
+
+// Where crash and stop reports are written (crash-<time>.txt; the current
+// directory by default, XF_CRASH_DIR, or boot's --crash-dir).
+void set_crash_directory(const std::filesystem::path &directory);
+// A stop's report (the kernel's stop_report) written there and printed, with
+// the path; the path, or empty.
+std::string write_stop_report(Game &game);
 
 // --rates: one line a second of the run (the swaps, the scheduler's clock,
 // the renderer's time), so runs of boot and the player can be set side by

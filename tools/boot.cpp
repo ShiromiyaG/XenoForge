@@ -42,7 +42,7 @@
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
-//        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S]
+//        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 
 #include "game.h"
 
@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
                         "[--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
-                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>]\n";
+                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] [--crash-dir <dir>]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -113,6 +113,8 @@ int main(int argc, char **argv) {
             controller = false;
         else if (a == "--rates")
             rates = true;
+        else if (a == "--crash-dir" && k + 1 < argc)
+            game::set_crash_directory(argv[++k]);
         else if (a == "--stall-report" && k + 1 < argc)
             stall_report = std::strtod(argv[++k], nullptr);
         else if (a == "--press" && k + 1 < argc) {
@@ -196,6 +198,8 @@ int main(int argc, char **argv) {
         std::printf("the main thread ended (exit code 0x%08X)\n", exit_code);
     else
         std::printf("still running after %u s\n", seconds);
+    // a stop's report (the guest stack, the last kernel calls), written to a file
+    std::string stop_file = k.stopped ? game::write_stop_report(g) : std::string();
     std::printf("threads:\n%s", k.thread_report().c_str());
     game::print_report(g, true);
     // the machine-readable end (xfcompat reads it): a stall still under way at the end is the state
@@ -203,7 +207,7 @@ int main(int argc, char **argv) {
         char text[64];
         std::snprintf(text, sizeof(text), "exit code 0x%08X", exit_code);
         if (k.stopped)
-            game::print_summary(g, "stopped", k.stop_reason);
+            game::print_summary(g, "stopped", k.stop_reason, k.stop_stack, stop_file);
         else if (ended)
             game::print_summary(g, "ended", text);
         else

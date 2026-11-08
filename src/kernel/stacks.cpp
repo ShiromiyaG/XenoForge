@@ -295,6 +295,26 @@ void end_guest_stacks(Kernel &k, Thread &t) {
     if (converted) revert_thread();
 }
 
+std::vector<uint32_t> guest_backtrace(Kernel &k, uint32_t sp, uint32_t low, uint32_t high, int max) {
+    auto readable = [&](uint32_t address) {
+        if (high) return address >= low && address + 4 <= high;
+        Heap *heap = k.memory().heap_for(address);
+        RegionInfo info;
+        return heap && heap->query(address & ~3u, info) && (info.state & ALLOCATE_COMMIT) &&
+               (info.protect & PROTECT_READ);
+    };
+    std::vector<uint32_t> frames;
+    for (int n = 0; n < max && sp && readable(sp); n++) {
+        uint32_t next = k.load32(sp);
+        if (next <= sp || next - sp > 0x100000 || !readable(next - 8)) break;
+        uint32_t lr = k.load32(next - 8);
+        if (!lr) break; // the chain's end
+        frames.push_back(lr);
+        sp = next;
+    }
+    return frames;
+}
+
 std::string stacks_report(Kernel &k) {
     Registry &r = k.state<Registry>();
     uint64_t switches, made, elsewhere, dropped;

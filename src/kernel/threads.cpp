@@ -19,6 +19,7 @@
 // queued after it ran), the NT kernel's behavior, as noted.
 
 #include "objects.h"
+#include "stacks.h"
 
 #include <algorithm>
 #include <bit>
@@ -509,23 +510,11 @@ std::string Kernel::thread_report() {
             }
             out += t->alertable ? ", alertable\n" : "\n";
         }
-        // the guest's stack, by its back chain: each frame's saved LR (the
-        // XDK's prologues store it 8 bytes below the caller's frame), read
-        // only where the pages are readable (a stack's guard pages are not)
-        auto readable = [this](uint32_t address) {
-            Heap *heap = memory().heap_for(address);
-            RegionInfo info;
-            return heap && heap->query(address & ~3u, info) && (info.state & ALLOCATE_COMMIT) &&
-                   (info.protect & PROTECT_READ);
-        };
-        uint32_t sp = uint32_t(t->context->r[1]);
+        // the guest's stack, by its back chain
         std::string frames;
-        for (int n = 0; n < 16 && sp && readable(sp); n++) {
-            uint32_t next = load32(sp);
-            if (next <= sp || next - sp > 0x100000 || !readable(next - 8)) break;
-            std::snprintf(line, sizeof(line), " 0x%08X", load32(next - 8));
+        for (uint32_t lr : guest_backtrace(*this, uint32_t(t->context->r[1]))) {
+            std::snprintf(line, sizeof(line), " 0x%08X", lr);
             frames += line;
-            sp = next;
         }
         if (!frames.empty()) out += "    stack:" + frames + "\n";
     }
