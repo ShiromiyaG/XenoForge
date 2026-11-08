@@ -1689,7 +1689,10 @@ code. As built (`frontend/`):
   the first time and saved when the overlay closes:
 
   ```toml
-  [video]    # fullscreen, vsync (true), smooth (true), aspect ("auto" or "stretch")
+  [video]    # fullscreen, vsync (true), smooth (true), aspect ("auto", "integer" or "stretch"), and the
+             # picture options below: resolution_scale (100), min_scalable (16), upscaler ("none"),
+             # fsr_sharpness (0.2), cas_sharpness (0), antialiasing ("none"), anisotropy (0),
+             # texture_filter ("game"), frame_graph (false)
   [audio]    # volume (0-100), mute
   [input]    # keyboard (true), keyboard_user (0), left_deadzone, right_deadzone (0-1), vibration (true)
   [keyboard] # each pad control's keys (input.md)
@@ -1697,6 +1700,58 @@ code. As built (`frontend/`):
   [launcher] # games: the folder the launcher lists
   [games.4D5307E6.video] # a game's own settings (the launcher's), any of the four sections above
   ```
+
+### Picture options (2026-11-08)
+
+What players expect from modern emulators (RPCS3, Xenia, Dolphin), beyond
+the console and never changing what the game computes: everything the CPU
+reads stays at the console's size. All of them are in config.toml's
+`[video]` (shared and per game), the launcher's Video tab (Display,
+Rendering, Overlay) and the player's System page (the F1 overlay's
+"Picture" section and the guide's System page, in the guide's look),
+from one table of choices (`settings.h`'s `video_choices`):
+- **Resolution scale** (`resolution_scale`, 50-800% in steps of 25, RPCS3's
+  model) and **minimum scalable dimension** (`min_scalable`, console
+  pixels, RPCS3's): the renderer's `Options::resolution_scale` and
+  `min_scalable` (docs/renderer.md, "Resolution scale"). Taken when the
+  title starts: the pages say "restart the title" and offer it. Where the
+  renderer draws at another scale than asked (the interlock path takes
+  multiples of 50%; a GPU without room for EDRAM at the scale), the F1
+  overlay and the guide show its notice and the player prints it.
+- **Output scaling** (`upscaler`, RPCS3's separate "output scaling"): a
+  plain blit (`smooth` picks linear or nearest), AMD FSR 1 (EASU in passes
+  of at most 2x, then RCAS with `fsr_sharpness` stops of sharpness
+  reduction) or AMD CAS (sharpening, resampling to the window's size, with
+  `cas_sharpness`), as Xenia's presenter offers them (its
+  guest_output_ffx_* shaders, ported to compute in
+  `frontend/present_effects.comp`; AMD's FidelityFX headers, MIT, in
+  `third_party/FidelityFX-*`). FSR asked for where the window is no larger
+  than the picture takes CAS, as Xenia's does. **Antialiasing**
+  (`antialiasing`): FXAA 3.11 at Xenia's two presets (NVIDIA's header,
+  BSD, `third_party/fxaa`), with green as luma (Xenia puts luma in the
+  alpha in its gamma pass). The effects run on the window's thread into
+  images of the destination rectangle's size, then a 1:1 blit; live.
+- **Picture shape** (`aspect`): fitted, whole multiples (integer scaling;
+  fitted where not even 1x fits), or stretched; live.
+- **Texture filtering** (`anisotropy`: the game's, or 1-16x forced;
+  `texture_filter`: the game's, trilinear, nearest): live, through
+  `Renderer::set_texture_filtering` (the samplers made as draws ask). The
+  anisotropy and trilinear apply where Xenia's `anisotropic_override` does:
+  mipmapped textures (not a base map alone) the game filters linearly;
+  nearest is everywhere (a look, not a fix).
+- **Frame-time graph** (`frame_graph`): the F1 overlay plots the intervals
+  between the frames the window showed (the last 240), with the average and
+  the worst.
+
+Considered and left out: a frame-rate unlock or a vblank rate above the
+console's. The guest's frame pacing is its own (its vblank interrupt,
+`VdSwap`, the scheduler's clock): raising the vblank rate makes most games
+run their logic faster (physics and timers counted in vblanks), so it is
+not safe as a general option; a game's port can do it where the game
+measures time (docs/sdk.md). Vsync is the window's only (the guest never
+waits for the display). Not done yet, cheap and asked of emulators:
+a pixel shader of the player's own after the picture (CRT filters), an
+HDR output; and per-game "unlock" presets belong in ports.
 
 For checks without a person at the screen: `--quit-after <seconds>`
 ends the run with a report (the swaps, the front buffers taken on the GPU

@@ -65,9 +65,10 @@ bool source_depth_valid = false;
 // which of its dwords `at` is (the inverse of edram_offset). `target` is the
 // source's while it runs.
 uvec2 source_bits(uint at, out uint half_index) {
-    uint tile = at / TILE_DWORDS, in_tile = at % TILE_DWORDS;
+    uint tile = at / tile_dwords(), in_tile = at % tile_dwords();
     uint relative = (tile + 2048u - target.base_tiles) % 2048u;
-    uvec2 tile_size = uvec2(80u >> target.ints_log2, 16u);
+    // (at the resolution scale, as edram_offset)
+    uvec2 tile_size = uvec2((20u * target.scale) >> target.ints_log2, 4u * target.scale);
     uint index = in_tile >> target.ints_log2;
     half_index = in_tile & target.ints_log2;
     uvec2 s = uvec2(index % tile_size.x, index / tile_size.x);
@@ -135,7 +136,7 @@ void main() {
             high = bits.y; // the same 64-bit sample (at is its first dword)
         } else {
             uint unused;
-            high = source_bits((at + 1u) % EDRAM_DWORDS, unused).x;
+            high = source_bits((at + 1u) % edram_dwords(), unused).x;
         }
     }
     target = p.dest;

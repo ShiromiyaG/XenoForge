@@ -10,11 +10,13 @@
 #include "../frontend/launcher_html.h"
 #include "../frontend/launcher_model.h"
 #include "../frontend/prepare_job.h"
+#include "../frontend/presenter.h"
 #include "../frontend/library.h"
 #include "../frontend/sdl_audio.h"
 #include "../frontend/sdl_input.h"
 #include "../frontend/settings.h"
 #include "../tools/game.h"
+#include "xenoforge/render_scale.h"
 
 #include <cmath>
 #include <chrono>
@@ -58,6 +60,86 @@ int main() {
     CHECK(frontend::load(dir / "config.toml", back, error, "4D5307E6") && back.audio.volume == 70);
     CHECK(frontend::forget_game(dir / "config.toml", "4D5307E6", error));
     CHECK(frontend::load(dir / "config.toml", back, error, "4D5307E6") && back.game.empty() && back.audio.volume == 30);
+    // the picture options (settings.h's video section): saved and read back,
+    // per game too, the values out of range or unknown made valid
+    {
+        frontend::Settings v;
+        CHECK(v.video.resolution_scale == 100 && v.video.min_scalable == 16 && v.video.upscaler == "none");
+        v.video.resolution_scale = 150, v.video.min_scalable = 32, v.video.upscaler = "fsr";
+        v.video.fsr_sharpness = 0.5, v.video.cas_sharpness = 0.25, v.video.antialiasing = "fxaa_extreme";
+        v.video.anisotropy = 16, v.video.texture_filter = "trilinear", v.video.frame_graph = true;
+        v.video.aspect = "integer";
+        CHECK(frontend::save(dir / "video.toml", v, error));
+        frontend::Settings r;
+        CHECK(frontend::load(dir / "video.toml", r, error));
+        CHECK(r.video.resolution_scale == 150 && r.video.min_scalable == 32 && r.video.upscaler == "fsr");
+        CHECK(r.video.fsr_sharpness == 0.5 && r.video.cas_sharpness == 0.25 && r.video.antialiasing == "fxaa_extreme");
+        CHECK(r.video.anisotropy == 16 && r.video.texture_filter == "trilinear" && r.video.frame_graph);
+        CHECK(r.video.aspect == "integer");
+        // a game's own scale over the shared one
+        frontend::Settings g = r;
+        g.game = "4D5307E6", g.video.resolution_scale = 300;
+        CHECK(frontend::save(dir / "video.toml", g, error));
+        CHECK(frontend::load(dir / "video.toml", r, error, "4D5307E6") && r.video.resolution_scale == 300);
+        CHECK(frontend::load(dir / "video.toml", r, error) && r.video.resolution_scale == 150);
+        // made valid: 25% steps within 50-800, the known choices, powers of two
+        CHECK(frontend::clamp_resolution_scale(10) == 50 && frontend::clamp_resolution_scale(112) == 100);
+        CHECK(frontend::clamp_resolution_scale(113) == 125 && frontend::clamp_resolution_scale(5000) == 800);
+        frontend::Settings bad;
+        bad.video.upscaler = "dlss", bad.video.anisotropy = 6, bad.video.fsr_sharpness = 9, bad.video.aspect = "x";
+        bad.video.min_scalable = -4;
+        frontend::clamp_video(bad);
+        CHECK(bad.video.upscaler == "none" && bad.video.anisotropy == 4 && bad.video.fsr_sharpness == 2.0);
+        CHECK(bad.video.aspect == "auto" && bad.video.min_scalable == 0);
+        // the shared choice lists (the launcher's Video tab and the player's pages)
+        CHECK(frontend::video_choices("video.resolution_scale").size() == 31);
+        CHECK(frontend::set_video_value(bad, "video.resolution_scale", "175") && bad.video.resolution_scale == 175);
+        CHECK(!frontend::set_video_value(bad, "video.resolution_scale", "130"));
+        CHECK(frontend::video_value(bad, "video.upscaler") == "none" && frontend::video_needs_restart("video.min_scalable"));
+        CHECK(!frontend::video_needs_restart("video.upscaler"));
+    }
+    // the resolution scale's arithmetic (render_scale.h)
+    {
+        using xf::render::Scale;
+        CHECK(Scale::from_percent(150).q4 == 6 && Scale::from_percent(40).q4 == 2 && Scale::from_percent(900).q4 == 32);
+        CHECK(Scale{6}.percent() == 150 && Scale{4}.one() && !Scale{8}.one());
+        // a 1280x720 surface at 125%, 150%, 50%; lengths not a multiple of 4 rounded up for a surface's size
+        CHECK(Scale{5}.up(1280) == 1600 && Scale{5}.up(720) == 900 && Scale{6}.down(8) == 12 && Scale{2}.up(5) == 3);
+        // EDRAM's tiles: 80x16 at 100%, whole at every quarter
+        CHECK(Scale{4}.tile_dwords() == 1280 && Scale{5}.tile_width() == 100 && Scale{5}.tile_height() == 20);
+        CHECK(Scale{2}.tile_dwords() == 320 && Scale{32}.tile_dwords() == 81920);
+        // the host pixel a console pixel is taken from: its center's (at 300%, 1 of 0-2; at 200%, 1 of 0-1)
+        CHECK(Scale::map(0, Scale{4}, Scale{12}) == 1 && Scale::map(5, Scale{4}, Scale{12}) == 16);
+        CHECK(Scale::map(0, Scale{4}, Scale{8}) == 1 && Scale::map(3, Scale{4}, Scale{2}) == 1);
+        CHECK(Scale::map(7, Scale{8}, Scale{4}) == 3 && Scale::map(4, Scale{4}, Scale{4}) == 4);
+        CHECK(xf::render::scalable(16, 16, 16) && !xf::render::scalable(1280, 8, 16) && xf::render::scalable(1, 1, 0));
+        // a picture box filtered down: 2x2 blocks averaged
+        std::vector<uint8_t> four = {0, 0, 0, 255, 100, 100, 100, 255, 200, 200, 200, 255, 100, 100, 100, 255};
+        std::vector<uint8_t> one = xf::render::resample_box(four, 2, 2, 1, 1);
+        CHECK(one.size() == 4 && one[0] == 100 && one[3] == 255);
+        CHECK(xf::render::resample_box(four, 2, 2, 4, 4).size() == 64); // made larger: nearest
+    }
+    // the window's picture placement and FSR's passes (presenter.h)
+    {
+        frontend::Rect r = frontend::fit_picture(1920, 1080, 1280, 720, frontend::Fit::aspect);
+        CHECK(r.x == 0 && r.y == 0 && r.width == 1920 && r.height == 1080);
+        r = frontend::fit_picture(1920, 1200, 1280, 720, frontend::Fit::aspect);
+        CHECK(r.width == 1920 && r.height == 1080 && r.y == 60);
+        r = frontend::fit_picture(2000, 1200, 640, 360, frontend::Fit::integer);
+        CHECK(r.width == 1920 && r.height == 1080 && r.x == 40 && r.y == 60);
+        r = frontend::fit_picture(1000, 600, 1280, 720, frontend::Fit::integer); // not even 1x: fitted
+        CHECK(r.width == 1000 && r.height == 563);
+        r = frontend::fit_picture(800, 800, 1280, 720, frontend::Fit::stretch);
+        CHECK(r.width == 800 && r.height == 800);
+        auto passes = frontend::easu_passes(640, 360, 2560, 1440);
+        CHECK(passes.size() == 2 && passes[0].first == 1280 && passes[1].first == 2560 && passes[1].second == 1440);
+        CHECK(frontend::easu_passes(1280, 720, 1920, 1080).size() == 1);
+        CHECK(frontend::easu_passes(1280, 720, 1280, 720).empty() && frontend::easu_passes(2560, 1440, 1920, 1080).empty());
+        CHECK(frontend::easu_passes(100, 100, 10000, 100, 2).size() == 2 &&
+              frontend::easu_passes(100, 100, 10000, 100, 2)[1].first == 10000);
+        CHECK(std::abs(frontend::cas_sharpness_constant(0.0f) + 0.125f) < 1e-6f &&
+              std::abs(frontend::cas_sharpness_constant(1.0f) + 0.2f) < 1e-6f);
+    }
     // the launcher's logic: a game given settings of its own and put back,
     // the games folder kept through both
     {

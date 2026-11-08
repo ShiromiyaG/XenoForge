@@ -27,7 +27,7 @@ layout(location = 0) out vec4 color;
 void main() {
     uvec2 pixel = uvec2(gl_FragCoord.xy);
     uint at = edram_offset(pixel, guest_sample(uint(gl_SampleID)));
-    if (mask.tiles[at / TILE_DWORDS] == 0u) discard;
+    if (mask.tiles[at / tile_dwords()] == 0u) discard;
     uint low = edram.words[at];
 #ifdef DEPTH
     float depth = unpack_depth(low);
@@ -46,7 +46,7 @@ void main() {
     if (target.stencil_bit < 8u && ((low >> target.stencil_bit) & 1u) == 0u) discard;
 #endif
 #else
-    uint high = target.ints_log2 != 0u ? edram.words[(at + 1u) % EDRAM_DWORDS] : 0u;
+    uint high = target.ints_log2 != 0u ? edram.words[(at + 1u) % edram_dwords()] : 0u;
 #ifdef UINT
     color = unpack_raw(uvec2(low, high));
 #else

@@ -44,6 +44,10 @@ layout(set = 0, binding = 4, std140) uniform Fsi {
     vec4 poly_offset; // front scale (in depth units per pixel), front offset, back scale, back offset
     vec4 blend_constant;
     vec4 exp_bias; // per color target: its exponent bias's scale
+    // the resolution scale in quarters (render_scale.h; even on this path),
+    // and a tile's dwords at it: tiles of 80x16 samples that many quarters
+    // across and down
+    uvec4 scale;
 } fsi;
 layout(set = 0, binding = 5, std430) coherent restrict buffer Edram { uint words[]; } edram;
 layout(set = 0, binding = 6, std430) buffer Zpd { uint counts[]; } zpd;
@@ -94,6 +98,10 @@ uint guest_coverage(uint host, uint flags) {
 struct Offsets {
     uint depth, c32, c64;
 };
+// (at the resolution scale: the grid of host pixels, the tiles and their
+// halves scaled, as Xenia's ROV addressing with draw_resolution_scale)
+uint tile_width() { return 20u * fsi.scale.x; }
+uint edram_dwords() { return fsi.scale.y * 2048u; }
 Offsets fsi_offsets(uvec2 pixel, uint msaa) {
     uint u = pixel.x, v = pixel.y;
     if (msaa >= 2u) {
@@ -104,18 +112,19 @@ Offsets fsi_offsets(uvec2 pixel, uint msaa) {
         v = ((pixel.y >> 1u) << 2u) | (pixel.y & 1u) | (pixel.x & 2u);
     }
     // 40x16-sample halves of 32bpp tiles (whole 64bpp tiles)
-    uvec2 half_index = uvec2(u / 40u, v / 16u), in_half = uvec2(u % 40u, v % 16u);
-    uint row_in_tile = in_half.y * 80u, tile_row = fsi.pitch * half_index.y;
-    uint first_half = tile_row + TILE_DWORDS * (half_index.x >> 1u) + row_in_tile + in_half.x;
+    uint tw = tile_width(), half_width = tw >> 1u, th = 4u * fsi.scale.x;
+    uvec2 half_index = uvec2(u / half_width, v / th), in_half = uvec2(u % half_width, v % th);
+    uint row_in_tile = in_half.y * tw, tile_row = fsi.pitch * half_index.y;
+    uint first_half = tile_row + fsi.scale.y * (half_index.x >> 1u) + row_in_tile + in_half.x;
     bool second = (half_index.x & 1u) != 0u;
     Offsets o;
     // depth tiles have their halves swapped
-    o.depth = (fsi.depth_base + first_half + (second ? 0u : 40u)) % EDRAM_DWORDS;
-    o.c32 = first_half + (second ? 40u : 0u);
-    o.c64 = (tile_row << 1u) + TILE_DWORDS * half_index.x + row_in_tile + (in_half.x << 1u);
+    o.depth = (fsi.depth_base + first_half + (second ? 0u : half_width)) % edram_dwords();
+    o.c32 = first_half + (second ? half_width : 0u);
+    o.c64 = (tile_row << 1u) + fsi.scale.y * half_index.x + row_in_tile + (in_half.x << 1u);
     return o;
 }
-uint sample_offset(uint i, bool wide) { return (i >> 1u) * 160u + (i & 1u) * (wide ? 4u : 2u); }
+uint sample_offset(uint i, bool wide) { return (i >> 1u) * 2u * tile_width() + (i & 1u) * (wide ? 4u : 2u); }
 
 // The guest's sample positions in pixels (draw_util.h's kXenosSamplePositions)
 vec2 sample_location(uint i, uint msaa) {
@@ -413,7 +422,7 @@ void fsi_color(uint i, vec4 color, uint rt, uint blend, uint mask, Offsets o) {
     if (keep == uvec2(~0u)) return;
     bool wide = is_64bpp(format);
     precise vec4 c = color * fsi.exp_bias[i];
-    uint base = (fsi.rt_base[i] + (wide ? o.c64 : o.c32)) % EDRAM_DWORDS;
+    uint base = (fsi.rt_base[i] + (wide ? o.c64 : o.c32)) % edram_dwords();
     if (blend != 0x00010001u) {
         bool fc = fixed_color(format), fa = fixed_alpha(format);
         vec2 range = fixed_range(format);

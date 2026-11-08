@@ -62,6 +62,7 @@ struct Report {
     // wrote (render to texture, loaded again from the mirror on the GPU)
     uint64_t texture_loads_new = 0, texture_loads_cpu_written = 0, texture_loads_gpu_written = 0;
     uint64_t resolve_targets_written = 0; // resolves that wrote the texture they feed too (not loaded again)
+    uint64_t textures_scaled = 0;         // textures made the resolution scale's (Options::resolution_scale)
     uint64_t textures_evicted = 0, textures_evicted_for_room = 0, textures_refused = 0;
     uint64_t occlusion_queries = 0, zpd_reports = 0; // host queries begun, reports answered with their counts
     double seconds = 0;                          // spent in the renderer's calls, of which:
@@ -308,6 +309,21 @@ struct Options {
     uint32_t texture_memory_hard_mb = 768;
     uint32_t texture_memory_soft_lifetime_s = 30;
     uint32_t texture_memory_render_to_texture_mb = 24;
+    // The resolution scale (docs/renderer.md, "Resolution scale"; render_scale.h), in quarters: 4 draws at the
+    // console's size, 2-32 at 50-800% of it, as RPCS3's resolution scale and Xenia's draw_resolution_scale. Render
+    // targets and EDRAM drawn at it, resolves read it and write the textures they feed at it; guest memory, and so
+    // everything the CPU reads (read-backs, memory exports, the front buffer a game copies) at the console's size.
+    // XF_RESOLUTION_SCALE=<percent> sets it too.
+    uint32_t resolution_scale = 4;
+    // RPCS3's minimum scalable dimension, in console pixels: a resolve or a texture smaller than it along either
+    // axis stays at the console's size
+    uint32_t min_scalable = 16;
+    // Texture filtering beyond the game's (set_texture_filtering changes them live): anisotropy forced (0: the
+    // game's; else 1, 2, 4, 8 or 16) on mipmapped textures the game filters linearly, as Xenia's
+    // anisotropic_override; and the filters: 0 the game's, 1 trilinear (linear between mips where the game filters
+    // each linearly), 2 nearest everywhere
+    uint32_t anisotropy = 0;
+    uint32_t texture_filter = 0;
 };
 
 // The render target path a renderer takes with these options on the device
@@ -342,6 +358,13 @@ public:
     // buffers asked for so far have gone to on_frame (on this thread) and
     // guest memory holds what resolves wrote; from any thread
     virtual void drain() = 0;
+    // Options::anisotropy and texture_filter changed while it runs: the draws after it sample with them (their
+    // samplers made as they are asked for); from any thread
+    virtual void set_texture_filtering(uint32_t anisotropy, uint32_t filter) = 0;
+    // the resolution scale it draws at, in quarters (Options::resolution_scale, or less where the device could not
+    // hold EDRAM at that scale: the notice says so), and why it differs from the one asked for ("" when it does not)
+    virtual uint32_t resolution_scale() const = 0;
+    virtual std::string scale_notice() const = 0;
 };
 
 // Replays the trace through a command processor of its own, as Xenia's trace

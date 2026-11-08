@@ -2272,6 +2272,17 @@ void Translator::main_pixel() {
     // for the pixel parameters
     Id frag_coord = global(vec4_, spv::StorageClass::Input, "frag_coord");
     m_.decorate(frag_coord, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FragCoord)});
+    // A host pixel's position as the console's pixel at a resolution scale:
+    // times the system values' w (1 / the scale; 0 where a caller leaves it,
+    // taken as 1). What the guest sees of the pixel's position (the pixel
+    // parameters, alpha to coverage's dither) is the console pixel's.
+    auto console_position = [&](Id position, uint32_t component) {
+        Id per_pixel = comp(load(vec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, vec4_),
+                                              {system_, u(4)})),
+                            3);
+        per_pixel = select(float_, m_.op(Op::OpFOrdEqual, bool_, {per_pixel, f(0)}), f(1), per_pixel);
+        return exact(Op::OpFMul, float_, {comp(position, component), per_pixel});
+    };
     if (float24 && !writes_depth) {
         // the rasterized depth converted per sample, for the antialiasing of
         // intersections: a Sample-decorated input runs the shader per sample
@@ -2344,8 +2355,8 @@ void Translator::main_pixel() {
                 return m_.op(Op::OpBitcast, float_,
                              {m_.op(Op::OpBitwiseXor, uint_, {m_.op(Op::OpBitcast, uint_, {x}), sign_bit})});
             };
-            Id x = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {comp(position, 0)})});
-            Id y = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {comp(position, 1)})});
+            Id x = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {console_position(position, 0)})});
+            Id y = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {console_position(position, 1)})});
             Id back = m_.op(Op::OpLogicalAnd, bool_, {flag(15), m_.op(Op::OpLogicalNot, bool_, {load(bool_, front_facing)})});
             x = select(float_, back, negated(x), x);
             y = select(float_, flag(13), negated(y), y);
@@ -2494,8 +2505,8 @@ void Translator::main_pixel() {
         Id enabled = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(1u << 16)}), u(0)});
         when(enabled, [&] {
             Id position = load(vec4_, frag_coord);
-            Id px = m_.op(Op::OpConvertFToU, uint_, {comp(position, 0)});
-            Id py = m_.op(Op::OpConvertFToU, uint_, {comp(position, 1)});
+            Id px = m_.op(Op::OpConvertFToU, uint_, {console_position(position, 0)});
+            Id py = m_.op(Op::OpConvertFToU, uint_, {console_position(position, 1)});
             Id index = m_.op(Op::OpBitwiseOr, uint_,
                              {m_.op(Op::OpBitwiseAnd, uint_, {py, u(1)}),
                               m_.op(Op::OpShiftLeftLogical, uint_, {m_.op(Op::OpBitwiseAnd, uint_, {px, u(1)}), u(1)})});
@@ -2554,8 +2565,8 @@ void Translator::main_pixel() {
                        {m_.op(Op::OpBitwiseAnd, uint_, {load(uint_, colors_written_), u(1)}), u(0)})});
             when(enabled, [&] {
                 Id position = load(vec4_, frag_coord);
-                Id px = m_.op(Op::OpConvertFToU, uint_, {comp(position, 0)});
-                Id py = m_.op(Op::OpConvertFToU, uint_, {comp(position, 1)});
+                Id px = m_.op(Op::OpConvertFToU, uint_, {console_position(position, 0)});
+                Id py = m_.op(Op::OpConvertFToU, uint_, {console_position(position, 1)});
                 Id index = m_.op(
                     Op::OpBitwiseOr, uint_,
                     {m_.op(Op::OpBitwiseAnd, uint_, {py, u(1)}),

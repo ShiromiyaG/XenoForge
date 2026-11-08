@@ -38,7 +38,30 @@ struct Settings {
         bool fullscreen = false;
         bool vsync = true;           // the window waits for the display (the guest never does)
         bool smooth = true;          // scaled with linear filtering, else nearest
-        std::string aspect = "auto"; // "auto" (the front buffer's own shape, letterboxed) or "stretch"
+        // "auto" (the front buffer's own shape, letterboxed), "integer" (the largest whole multiple of it that fits,
+        // centered) or "stretch"
+        std::string aspect = "auto";
+        // The picture options beyond the console (docs/renderer.md, "Resolution scale"; docs/runtime.md, "Picture
+        // options"). They never change what the game computes: what the CPU reads back stays at the console's size.
+        // The internal resolution in percent of the console's, 50-800 in steps of 25 (RPCS3's resolution scale);
+        // taken when the title starts.
+        int resolution_scale = 100;
+        // render targets, resolves and textures narrower or shorter than this many console pixels stay at the
+        // console's size (RPCS3's minimum scalable dimension); taken when the title starts
+        int min_scalable = 16;
+        // The window's output scaling, apart from the internal resolution (RPCS3's "output scaling"): "none" (a
+        // blit, linear or nearest by `smooth`), "fsr" (AMD FSR 1: EASU, then RCAS) or "cas" (AMD CAS, sharpening
+        // and resampling), as Xenia's presenter offers them; live.
+        std::string upscaler = "none";
+        double fsr_sharpness = 0.2; // RCAS's sharpness reduction in stops, 0-2 (Xenia's default)
+        double cas_sharpness = 0.0; // CAS's additional sharpness, 0-1 (Xenia's default)
+        std::string antialiasing = "none"; // "none", "fxaa" or "fxaa_extreme", on the picture before scaling; live
+        // Texture filtering, live: anisotropic filtering forced (0 the game's, else 1, 2, 4, 8 or 16) on mipmapped
+        // textures the game filters linearly (Xenia's anisotropic_override rule), and "game", "trilinear" (linear
+        // between mips where the game filters each one linearly) or "nearest" (everything point sampled)
+        int anisotropy = 0;
+        std::string texture_filter = "game";
+        bool frame_graph = false; // the frame-time graph in the F1 overlay
     } video;
     struct {
         int volume = 100; // percent
@@ -104,6 +127,24 @@ struct Settings {
 
     Settings(); // Xenia's default bindings
 };
+
+// A resolution scale in percent made one the renderer draws at: the nearest step of 25 within 50-800.
+int clamp_resolution_scale(int percent);
+// The video section's values made valid (choices not known go back to their defaults, numbers into their ranges).
+void clamp_video(Settings &settings);
+
+// The video section's choices, shared by the launcher's Video tab and the player's overlay and guide: for a key
+// ("video.resolution_scale", "video.min_scalable", "video.upscaler", "video.antialiasing", "video.anisotropy",
+// "video.texture_filter", "video.aspect") its values (as text) and their labels, the current value as text, and a
+// value set (false for a key or value not known). Empty for other keys.
+struct VideoChoice {
+    std::string value, label;
+};
+std::vector<VideoChoice> video_choices(const std::string &key);
+std::string video_value(const Settings &settings, const std::string &key);
+bool set_video_value(Settings &settings, const std::string &key, const std::string &value);
+// the video keys a running title takes only when it starts again
+bool video_needs_restart(const std::string &key);
 
 // SDL's preference folder's xenoforge\config.toml
 std::filesystem::path default_path();

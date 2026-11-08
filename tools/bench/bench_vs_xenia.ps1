@@ -7,7 +7,11 @@
 #
 #   tools/bench/bench_vs_xenia.ps1 -Disc <iso> -Ours <exe> [-OursArgs ...]
 #       [-Xenia <xenia_canary.exe>] [-Seconds 150] [-Warmup 90] [-Runs 3]
-#       [-Configs ours,ours-host,xenia-d3d12,xenia-d3d12-rov] [-Out <file>] [-Timeline]
+#       [-Configs ours,ours-host,xenia-d3d12,xenia-d3d12-rov] [-Out <file>] [-Timeline] [-Scale <percent>]
+#
+# -Scale draws both at a resolution scale: ours through XF_RESOLUTION_SCALE
+# (any 25% step), Xenia through draw_resolution_scale_x/y (whole multiples:
+# 200, 300).
 #
 # -Ours is a player (player_<game> or player with --cache); it runs with the
 # Vulkan layer of xfbench_hook, Xenia with the DXGI hook. Disc paths stay on
@@ -24,14 +28,18 @@ param(
     [string[]]$Configs = @('ours', 'xenia-d3d12'),
     [string]$Out = "bench.txt",
     [string]$Bench = "$PSScriptRoot\..\..\build\xfbench.exe",
-    [switch]$Timeline
+    [switch]$Timeline,
+    [int]$Scale = 100
 )
 
 $extra = @()
 if ($Timeline) { $extra += '--timeline' }
 for ($run = 1; $run -le $Runs; $run++) {
     foreach ($config in $Configs) {
-        $label = "$config#$run"
+        $label = if ($Scale -eq 100) { "$config#$run" } else { "$config-$Scale#$run" }
+        if ($Scale -ne 100) { $env:XF_RESOLUTION_SCALE = "$Scale" }
+        $xeniaScale = @()
+        if ($Scale -ne 100) { $xeniaScale = @("--draw_resolution_scale_x=$($Scale / 100)", "--draw_resolution_scale_y=$($Scale / 100)") }
         # ours: the default render target path (interlock where the device
         # has it); ours-host: host render targets. Xenia: its defaults
         # (host render targets), or -rov for its exact path.
@@ -41,13 +49,14 @@ for ($run = 1; $run -le $Runs; $run++) {
                 $line = & $Bench --seconds $Seconds --warmup $Warmup --vk @extra --stdout "$Out.$config.$run.log" --label $label -- $Ours $Disc @OursArgs
             }
             'xenia-d3d12' {
-                $line = & $Bench --seconds $Seconds --warmup $Warmup --dxgi @extra --label $label -- $Xenia --gpu=d3d12 $Disc
+                $line = & $Bench --seconds $Seconds --warmup $Warmup --dxgi @extra --label $label -- $Xenia --gpu=d3d12 @xeniaScale $Disc
             }
             'xenia-d3d12-rov' {
-                $line = & $Bench --seconds $Seconds --warmup $Warmup --dxgi @extra --label $label -- $Xenia --gpu=d3d12 --render_target_path_d3d12=rov $Disc
+                $line = & $Bench --seconds $Seconds --warmup $Warmup --dxgi @extra --label $label -- $Xenia --gpu=d3d12 --render_target_path_d3d12=rov @xeniaScale $Disc
             }
         }
         Remove-Item Env:XF_RENDER_TARGET_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:XF_RESOLUTION_SCALE -ErrorAction SilentlyContinue
         $line | Add-Content $Out
         $line | Select-Object -Last 1
     }

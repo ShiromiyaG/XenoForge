@@ -502,9 +502,14 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             std::fprintf(stderr, "sound: %s (paced, not heard)\n", error.c_str());
         }
     }
+    auto texture_filter_of = [](const std::string &f) { return f == "trilinear" ? 1u : f == "nearest" ? 2u : 0u; };
     auto apply = [&] {
         sound.set_gain(settings.audio.mute ? 0.0f : settings.audio.volume / 100.0f);
         SDL_SetWindowFullscreen(window, settings.video.fullscreen);
+        // the texture filtering, live (the resolution scale waits for a restart)
+        if (g.renderer)
+            g.renderer->set_texture_filtering(uint32_t(settings.video.anisotropy),
+                                              texture_filter_of(settings.video.texture_filter));
     };
 
     // the input: the gamepads, then the keyboard, as Xenia asks its drivers;
@@ -535,6 +540,11 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     // Options::pipeline_stand_in's default (boot and the replays wait for
     // each, as Xenia's trace dump does)
     options.async_pipelines = true;
+    // the picture beyond the console (settings.h's video section)
+    options.resolution_scale = uint32_t(settings.video.resolution_scale / 25);
+    options.min_scalable = uint32_t(settings.video.min_scalable);
+    options.anisotropy = uint32_t(settings.video.anisotropy);
+    options.texture_filter = texture_filter_of(settings.video.texture_filter);
     options.frame_wanted = [&](uint64_t swap) {
         if (!shot_wanted(swap)) return false;
         presenter.capture_next(); // this swap's picture, taken after this
@@ -545,6 +555,10 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         mailbox.shots.push_back({swap, k.uptime_ms(), frame});
     };
     if (!game::start_renderer(g, options, error)) return fail(error);
+    const std::string scale_notice = g.renderer->scale_notice();
+    if (g.renderer->resolution_scale() != 4)
+        std::printf("drawing at %u%% of the console's resolution%s%s\n", g.renderer->resolution_scale() * 25,
+                    scale_notice.empty() ? "" : ": ", scale_notice.c_str());
     std::printf("rendering on %s, the window on the same device (%s)\n", g.device->name().c_str(),
                 presenter.own_queue() ? "a queue of its own" : "the renderer's queue");
     stbi_write_png_compression_level = 1;
@@ -554,6 +568,11 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     const Clock::time_point started = Clock::now();
 
     bool quit = false, changed = false, shown_any = false;
+    // the frame-time graph's: the intervals between the frames the window showed
+    constexpr uint32_t FRAME_TIMES = 240;
+    float frame_times[FRAME_TIMES] = {};
+    uint32_t frame_time_at = 0;
+    Clock::time_point last_fresh{};
     // the guide (F2 or the controller's Guide button): the console pages in the guide's look
     bool guide_open = ui_demo.find("guide") != std::string::npos;
     if (guide_page_demo) pages.set_guide_page(guide_page_demo);
@@ -804,11 +823,22 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             moved |= ImGui::Checkbox("Vertical sync (the window's only)", &settings.video.vsync);
             ImGui::SameLine();
             moved |= ImGui::Checkbox("Smooth scaling", &settings.video.smooth);
-            bool stretch = settings.video.aspect == "stretch";
-            if (ImGui::Checkbox("Stretch", &stretch))
-                settings.video.aspect = stretch ? "stretch" : "auto", moved = true;
             ImGui::SameLine();
             moved |= ImGui::Checkbox("Fullscreen (F11)", &settings.video.fullscreen);
+            if (settings.video.frame_graph) {
+                // the time between the frames the window showed, the last 240
+                float values[FRAME_TIMES];
+                float worst = 0, sum = 0;
+                for (uint32_t i = 0; i < FRAME_TIMES; i++) {
+                    values[i] = frame_times[(frame_time_at + i) % FRAME_TIMES];
+                    worst = std::max(worst, values[i]), sum += values[i];
+                }
+                char caption[96];
+                std::snprintf(caption, sizeof(caption), "frame time: %.1f ms average, %.1f ms worst", sum / FRAME_TIMES,
+                              worst);
+                ImGui::PlotLines("##frames", values, int(FRAME_TIMES), 0, caption, 0.0f, std::max(50.0f, worst * 1.1f),
+                                 ImVec2(-FLT_MIN, 70));
+            }
             if (moved) apply(), changed = true;
             if (!port.options.empty()) {
                 ImGui::SeparatorText(port.name.empty() ? "Port" : port.name.c_str());
@@ -874,7 +904,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                                                       restart_requested = true;
                                                       quit = true;
                                                       ended = "restart";
-                                                  }};
+                                                  },
+                                                  [&] { apply(); },
+                                                  scale_notice};
                 if (pages.draw(host, seconds)) changed = true;
             }
             ImGui::SeparatorText("Screenshot");
@@ -885,11 +917,13 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             if (!keep) overlay = false;
         }
         if (guide_open) {
-            frontend::ConsolePages::Host host{settings, o.storage, k, icons, apply_system, [&] {
+            frontend::ConsolePages::Host host{settings,     o.storage, k, icons, apply_system,
+                                              [&] {
                                                   restart_requested = true;
                                                   quit = true;
                                                   ended = "restart";
-                                              }};
+                                              },
+                                              [&] { apply(); }, scale_notice};
             bool keep = true;
             if (pages.draw_guide(host, seconds, keep)) changed = true;
             if (!keep) close_guide();
@@ -900,7 +934,15 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         view.width = uint32_t(pw), view.height = uint32_t(ph);
         view.vsync = settings.video.vsync;
         view.smooth = settings.video.smooth;
-        view.stretch = settings.video.aspect == "stretch";
+        view.fit = settings.video.aspect == "stretch"   ? frontend::Fit::stretch
+                   : settings.video.aspect == "integer" ? frontend::Fit::integer
+                                                        : frontend::Fit::aspect;
+        view.upscaler = settings.video.upscaler == "fsr" ? 1u : settings.video.upscaler == "cas" ? 2u : 0u;
+        view.fsr_sharpness_reduction = float(settings.video.fsr_sharpness);
+        view.cas_sharpness = float(settings.video.cas_sharpness);
+        view.antialiasing = settings.video.antialiasing == "fxaa"           ? 1u
+                            : settings.video.antialiasing == "fxaa_extreme" ? 2u
+                                                                            : 0u;
         if (!window_shots.empty() && seconds >= next_window_shot) {
             presenter.capture_window_next();
             next_window_shot = seconds + window_shot_every;
@@ -917,7 +959,15 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         }
         last_present = Clock::now();
         refreshes++;
-        if (fresh) presented++, shown_any = true;
+        if (fresh) {
+            presented++, shown_any = true;
+            const Clock::time_point shown_at = Clock::now();
+            if (last_fresh != Clock::time_point{}) {
+                frame_times[frame_time_at] = std::chrono::duration<float, std::milli>(shown_at - last_fresh).count();
+                frame_time_at = (frame_time_at + 1) % FRAME_TIMES;
+            }
+            last_fresh = shown_at;
+        }
     }
 
     // the report: the player's counts, then boot's

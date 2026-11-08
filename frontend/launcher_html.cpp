@@ -359,7 +359,13 @@ std::string settings_scope_html(const SettingsPage &page) {
     return s;
 }
 
-std::vector<Choice> aspect_choices() { return {{"auto", "The picture's own shape"}, {"stretch", "Stretched to the window"}}; }
+std::vector<Choice> aspect_choices() { return video_choice_list("video.aspect"); }
+
+std::vector<Choice> video_choice_list(const std::string &key) {
+    std::vector<Choice> out;
+    for (const VideoChoice &c : video_choices(key)) out.push_back({c.value, c.label});
+    return out;
+}
 
 std::vector<Choice> user_choices() { return {{"0", "User 1"}, {"1", "User 2"}, {"2", "User 3"}, {"3", "User 4"}}; }
 
@@ -388,7 +394,28 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
         std::string rows = check_row("video.fullscreen", "Start in fullscreen", "F11 switches in the game.", st.video.fullscreen);
         rows += select_row("video.aspect", "Picture shape", "How the game's picture fits the window.", label_of(aspect_choices(), st.video.aspect));
         rows += check_row("video.smooth", "Smooth scaling", "Linear filtering when the picture is scaled to the window.", st.video.smooth);
+        rows += select_row("video.upscaler", "Output scaling", "FSR or CAS to the window's size, instead of a plain scale. Changes at once.",
+                           label_of(video_choice_list("video.upscaler"), st.video.upscaler));
+        char sharp[32];
+        std::snprintf(sharp, sizeof(sharp), "%.2f stops", st.video.fsr_sharpness);
+        rows += slider_row("video.fsr_sharpness", "FSR sharpness reduction", "0 is the sharpest (Xenia's default 0.2).", st.video.fsr_sharpness / 2.0, sharp);
+        std::snprintf(sharp, sizeof(sharp), "%.0f%%", st.video.cas_sharpness * 100);
+        rows += slider_row("video.cas_sharpness", "CAS additional sharpness", "", st.video.cas_sharpness, sharp);
+        rows += select_row("video.antialiasing", "Antialiasing", "FXAA over the game's picture, before it is scaled.",
+                           label_of(video_choice_list("video.antialiasing"), st.video.antialiasing));
         s += group("Display", rows);
+        std::string inner = select_row("video.resolution_scale", "Resolution scale",
+                                       "The resolution the game is drawn at, in percent of the console's. What the game reads back stays at the console's size. Takes effect when the game starts.",
+                                       label_of(video_choice_list("video.resolution_scale"), std::to_string(st.video.resolution_scale)));
+        inner += select_row("video.min_scalable", "Minimum scalable dimension",
+                            "Render targets, copies and textures smaller than this stay at the console's size, so small buffers keep working. Takes effect when the game starts.",
+                            label_of(video_choice_list("video.min_scalable"), std::to_string(st.video.min_scalable)));
+        inner += select_row("video.anisotropy", "Anisotropic filtering", "Forced on mipmapped textures the game filters smoothly.",
+                            label_of(video_choice_list("video.anisotropy"), std::to_string(st.video.anisotropy)));
+        inner += select_row("video.texture_filter", "Texture filtering", "",
+                            label_of(video_choice_list("video.texture_filter"), st.video.texture_filter));
+        s += group("Rendering", inner, "Beyond the console: none of these change what the game computes.");
+        s += group("Overlay", check_row("video.frame_graph", "Frame-time graph", "In the F1 overlay.", st.video.frame_graph));
         s += group("Timing", check_row("video.vsync", "Vertical sync", "The window waits for the display; the game keeps its own pace.", st.video.vsync));
         break;
     }

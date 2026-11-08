@@ -9,7 +9,10 @@
 #include <toml++/toml.hpp>
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <initializer_list>
 
 namespace xf::frontend {
 
@@ -43,6 +46,91 @@ const Binding BINDINGS[25] = {
     {"right_shoulder", input::RIGHT_SHOULDER, 0, "3"},
 };
 
+int clamp_resolution_scale(int percent) {
+    // to the nearest step of 25 (halves up), then into 50-800
+    int steps = (std::clamp(percent, 0, 100000) + 12) / 25;
+    return std::clamp(steps * 25, 50, 800);
+}
+
+void clamp_video(Settings &s) {
+    auto one_of = [](std::string &value, std::initializer_list<const char *> choices) {
+        for (const char *c : choices)
+            if (value == c) return;
+        value = *choices.begin();
+    };
+    s.video.resolution_scale = clamp_resolution_scale(s.video.resolution_scale);
+    s.video.min_scalable = std::clamp(s.video.min_scalable, 0, 256);
+    one_of(s.video.aspect, {"auto", "integer", "stretch"});
+    one_of(s.video.upscaler, {"none", "fsr", "cas"});
+    one_of(s.video.antialiasing, {"none", "fxaa", "fxaa_extreme"});
+    one_of(s.video.texture_filter, {"game", "trilinear", "nearest"});
+    s.video.fsr_sharpness = std::isfinite(s.video.fsr_sharpness) ? std::clamp(s.video.fsr_sharpness, 0.0, 2.0) : 0.2;
+    s.video.cas_sharpness = std::isfinite(s.video.cas_sharpness) ? std::clamp(s.video.cas_sharpness, 0.0, 1.0) : 0.0;
+    // the powers of two up to 16, a value between taken down to one
+    int a = std::clamp(s.video.anisotropy, 0, 16);
+    s.video.anisotropy = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : a;
+}
+
+std::vector<VideoChoice> video_choices(const std::string &key) {
+    std::vector<VideoChoice> out;
+    if (key == "video.resolution_scale") {
+        for (int p = 50; p <= 800; p += 25) {
+            std::string label = std::to_string(p) + "%";
+            if (p == 100) label += " (the console's)";
+            if (p % 100 == 0 && p > 100) label += " (" + std::to_string(p / 100) + "x)";
+            out.push_back({std::to_string(p), label});
+        }
+    } else if (key == "video.min_scalable") {
+        out = {{"0", "None (everything scaled)"}, {"8", "8 pixels"}, {"16", "16 pixels (default)"}, {"32", "32 pixels"},
+               {"64", "64 pixels"}, {"128", "128 pixels"}};
+    } else if (key == "video.upscaler") {
+        out = {{"none", "None (bilinear or nearest)"}, {"fsr", "AMD FSR 1 (upscale and sharpen)"},
+               {"cas", "AMD CAS (sharpen and resample)"}};
+    } else if (key == "video.antialiasing") {
+        out = {{"none", "None"}, {"fxaa", "FXAA"}, {"fxaa_extreme", "FXAA (extreme)"}};
+    } else if (key == "video.anisotropy") {
+        out = {{"0", "The game's"}, {"1", "Off (1x)"}, {"2", "2x"}, {"4", "4x"}, {"8", "8x"}, {"16", "16x"}};
+    } else if (key == "video.texture_filter") {
+        out = {{"game", "The game's"}, {"trilinear", "Trilinear (smooth between mipmaps)"},
+               {"nearest", "Nearest (point sampled)"}};
+    } else if (key == "video.aspect") {
+        out = {{"auto", "The picture's own shape"}, {"integer", "Whole multiples (integer scaling)"},
+               {"stretch", "Stretched to the window"}};
+    }
+    return out;
+}
+
+std::string video_value(const Settings &s, const std::string &key) {
+    if (key == "video.resolution_scale") return std::to_string(s.video.resolution_scale);
+    if (key == "video.min_scalable") return std::to_string(s.video.min_scalable);
+    if (key == "video.upscaler") return s.video.upscaler;
+    if (key == "video.antialiasing") return s.video.antialiasing;
+    if (key == "video.anisotropy") return std::to_string(s.video.anisotropy);
+    if (key == "video.texture_filter") return s.video.texture_filter;
+    if (key == "video.aspect") return s.video.aspect;
+    return {};
+}
+
+bool set_video_value(Settings &s, const std::string &key, const std::string &value) {
+    bool known = false;
+    for (const VideoChoice &c : video_choices(key)) known |= c.value == value;
+    if (!known) return false;
+    const int number = std::atoi(value.c_str());
+    if (key == "video.resolution_scale") s.video.resolution_scale = number;
+    else if (key == "video.min_scalable") s.video.min_scalable = number;
+    else if (key == "video.upscaler") s.video.upscaler = value;
+    else if (key == "video.antialiasing") s.video.antialiasing = value;
+    else if (key == "video.anisotropy") s.video.anisotropy = number;
+    else if (key == "video.texture_filter") s.video.texture_filter = value;
+    else if (key == "video.aspect") s.video.aspect = value;
+    clamp_video(s);
+    return true;
+}
+
+bool video_needs_restart(const std::string &key) {
+    return key == "video.resolution_scale" || key == "video.min_scalable";
+}
+
 Settings::Settings() {
     for (const Binding &b : BINDINGS) keys[b.name] = b.keys;
 }
@@ -69,6 +157,21 @@ void read_sections(const toml::table &t, Settings &s) {
     get(t, "video", "vsync", s.video.vsync);
     get(t, "video", "smooth", s.video.smooth);
     get(t, "video", "aspect", s.video.aspect);
+    auto video_int = [&](const char *key, int &into) {
+        int64_t v = into;
+        get(t, "video", key, v);
+        into = int(std::clamp<int64_t>(v, -100000, 100000));
+    };
+    video_int("resolution_scale", s.video.resolution_scale);
+    video_int("min_scalable", s.video.min_scalable);
+    video_int("anisotropy", s.video.anisotropy);
+    get(t, "video", "upscaler", s.video.upscaler);
+    get(t, "video", "fsr_sharpness", s.video.fsr_sharpness);
+    get(t, "video", "cas_sharpness", s.video.cas_sharpness);
+    get(t, "video", "antialiasing", s.video.antialiasing);
+    get(t, "video", "texture_filter", s.video.texture_filter);
+    get(t, "video", "frame_graph", s.video.frame_graph);
+    clamp_video(s);
     int64_t volume = s.audio.volume;
     get(t, "audio", "volume", volume);
     s.audio.volume = int(std::clamp<int64_t>(volume, 0, 100));
@@ -131,7 +234,16 @@ void write_sections(toml::table &t, const Settings &s) {
     t.insert_or_assign("video", toml::table{{"fullscreen", s.video.fullscreen},
                                             {"vsync", s.video.vsync},
                                             {"smooth", s.video.smooth},
-                                            {"aspect", s.video.aspect}});
+                                            {"aspect", s.video.aspect},
+                                            {"resolution_scale", s.video.resolution_scale},
+                                            {"min_scalable", s.video.min_scalable},
+                                            {"upscaler", s.video.upscaler},
+                                            {"fsr_sharpness", s.video.fsr_sharpness},
+                                            {"cas_sharpness", s.video.cas_sharpness},
+                                            {"antialiasing", s.video.antialiasing},
+                                            {"anisotropy", s.video.anisotropy},
+                                            {"texture_filter", s.video.texture_filter},
+                                            {"frame_graph", s.video.frame_graph}});
     t.insert_or_assign("audio", toml::table{{"volume", s.audio.volume}, {"mute", s.audio.mute}});
     t.insert_or_assign("input", toml::table{{"keyboard", s.input.keyboard},
                                             {"keyboard_user", s.input.keyboard_user},

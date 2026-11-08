@@ -79,6 +79,58 @@ bool ConsolePages::system_page(Host &h) {
     return system;
 }
 
+// The emulator's picture options (settings.h's video section): the resolution scale and the minimum scalable
+// dimension wait for a restart, the rest applies at once.
+bool ConsolePages::picture_page(Host &h) {
+    Settings &s = h.settings;
+    bool changed = false, live = false;
+    auto combo = [&](const char *label, const char *key) {
+        const std::vector<VideoChoice> list = video_choices(key);
+        const std::string current = video_value(s, key);
+        std::string shown = current;
+        for (const VideoChoice &c : list)
+            if (c.value == current) shown = c.label;
+        if (ImGui::BeginCombo(labelled(label).c_str(), shown.c_str())) {
+            for (const VideoChoice &c : list) {
+                if (ImGui::Selectable(c.label.c_str(), c.value == current) && c.value != current &&
+                    set_video_value(s, key, c.value)) {
+                    changed = true;
+                    if (video_needs_restart(key)) restart_needed_ = true;
+                    else live = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    };
+    combo("Resolution scale", "video.resolution_scale");
+    combo("Minimum scalable size", "video.min_scalable");
+    if (!h.picture_notice.empty()) ImGui::TextColored(ImVec4(1, 0.85f, 0.4f, 1), "%s", h.picture_notice.c_str());
+    combo("Output scaling", "video.upscaler");
+    if (s.video.upscaler == "fsr") {
+        float v = float(s.video.fsr_sharpness);
+        if (ImGui::SliderFloat(labelled("FSR sharpness reduction").c_str(), &v, 0.0f, 2.0f, "%.2f stops"))
+            s.video.fsr_sharpness = v, changed = live = true;
+    } else if (s.video.upscaler == "cas") {
+        float v = float(s.video.cas_sharpness);
+        if (ImGui::SliderFloat(labelled("CAS sharpness").c_str(), &v, 0.0f, 1.0f, "%.2f"))
+            s.video.cas_sharpness = v, changed = live = true;
+    }
+    combo("Antialiasing", "video.antialiasing");
+    combo("Picture shape", "video.aspect");
+    combo("Anisotropic filtering", "video.anisotropy");
+    combo("Texture filtering", "video.texture_filter");
+    if (g_label_w > 0) {
+        changed |= ImGui::Checkbox(labelled("Frame-time graph (F1)").c_str(), &s.video.frame_graph);
+    } else {
+        changed |= ImGui::Checkbox("Frame-time graph", &s.video.frame_graph);
+    }
+    if (live) {
+        clamp_video(s);
+        if (h.apply_video) h.apply_video();
+    }
+    return changed;
+}
+
 bool ConsolePages::profile_page(Host &h, float field_width) {
     Settings &s = h.settings;
     bool changed = false;
@@ -221,6 +273,8 @@ bool ConsolePages::draw(Host &h, double now) {
     bool changed = false;
     ImGui::SeparatorText("System");
     changed |= system_page(h);
+    ImGui::SeparatorText("Picture (beyond the console)");
+    changed |= picture_page(h);
     ImGui::SeparatorText("Profile");
     changed |= profile_page(h, 220);
     restart_notice(h);
@@ -323,6 +377,8 @@ bool ConsolePages::draw_guide(Host &h, double now, bool &open) {
         default:
             caption("Language and region");
             changed |= system_page(h);
+            caption("Picture (beyond the console)");
+            changed |= picture_page(h);
             restart_notice(h);
             break;
         }

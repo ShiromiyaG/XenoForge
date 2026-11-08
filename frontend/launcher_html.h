@@ -104,6 +104,8 @@ struct Choice {
     std::string value, label;
 };
 std::vector<Choice> aspect_choices();
+// the video section's choices (settings.h's video_choices) for a dropdown
+std::vector<Choice> video_choice_list(const std::string &key);
 std::vector<Choice> user_choices();
 std::vector<Choice> theme_choices();
 std::string keycaps_html(const std::string &keys, bool waiting);

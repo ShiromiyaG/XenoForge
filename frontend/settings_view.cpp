@@ -280,6 +280,7 @@ bool *SettingsView::bool_field(const std::string &key) {
     if (key == "video.fullscreen") return &edit_.video.fullscreen;
     if (key == "video.vsync") return &edit_.video.vsync;
     if (key == "video.smooth") return &edit_.video.smooth;
+    if (key == "video.frame_graph") return &edit_.video.frame_graph;
     if (key == "audio.mute") return &edit_.audio.mute;
     if (key == "input.vibration") return &edit_.input.vibration;
     if (key == "input.keyboard") return &edit_.input.keyboard;
@@ -287,7 +288,15 @@ bool *SettingsView::bool_field(const std::string &key) {
 }
 
 bool SettingsView::get_slider(const std::string &key, double &fraction, std::string &text) {
+    if (key == "video.fsr_sharpness") {
+        fraction = edit_.video.fsr_sharpness / 2.0;
+        char t[32];
+        std::snprintf(t, sizeof(t), "%.2f stops", edit_.video.fsr_sharpness);
+        text = t;
+        return true;
+    }
     if (key == "audio.volume") fraction = edit_.audio.volume / 100.0;
+    else if (key == "video.cas_sharpness") fraction = edit_.video.cas_sharpness;
     else if (key == "input.left_deadzone") fraction = edit_.input.left_deadzone;
     else if (key == "input.right_deadzone") fraction = edit_.input.right_deadzone;
     else return false;
@@ -298,6 +307,8 @@ bool SettingsView::get_slider(const std::string &key, double &fraction, std::str
 void SettingsView::set_slider(const std::string &key, double fraction) {
     fraction = std::clamp(std::round(fraction * 100.0) / 100.0, 0.0, 1.0);
     if (key == "audio.volume") edit_.audio.volume = int(fraction * 100 + 0.5);
+    else if (key == "video.fsr_sharpness") edit_.video.fsr_sharpness = fraction * 2.0;
+    else if (key == "video.cas_sharpness") edit_.video.cas_sharpness = fraction;
     else if (key == "input.left_deadzone") edit_.input.left_deadzone = fraction;
     else if (key == "input.right_deadzone") edit_.input.right_deadzone = fraction;
 }
@@ -352,7 +363,7 @@ std::vector<Choice> as_choices(const std::vector<Option> &options) {
 } // namespace
 
 std::vector<Choice> SettingsView::choices_for(const std::string &key) const {
-    if (key == "video.aspect") return aspect_choices();
+    if (key.rfind("video.", 0) == 0) return video_choice_list(key);
     if (key == "theme") return theme_choices();
     if (key == "system.language") return as_choices(languages());
     if (key == "system.country") return as_choices(countries());
@@ -364,7 +375,7 @@ std::vector<Choice> SettingsView::choices_for(const std::string &key) const {
 }
 
 std::string SettingsView::choice_value(const std::string &key) const {
-    if (key == "video.aspect") return edit_.video.aspect;
+    if (key.rfind("video.", 0) == 0) return video_value(edit_, key);
     if (key == "theme") return theme_text(theme_from_text(core_.launcher().theme));
     if (key == "system.language") return std::to_string(edit_.system.language);
     if (key == "system.country") return std::to_string(edit_.system.country);
@@ -474,7 +485,9 @@ void SettingsView::choose_option(const std::string &key, const std::string &valu
         core_.set_launcher(l, error);
         host_.look_changed();
     } else {
-        if (key == "video.aspect") edit_.video.aspect = value;
+        if (key.rfind("video.", 0) == 0) {
+            if (!set_video_value(edit_, key, value)) return;
+        }
         else if (key == "input.keyboard_user") edit_.input.keyboard_user = std::atoi(value.c_str());
         else if (key == "system.language") edit_.system.language = std::atoi(value.c_str());
         else if (key == "system.country") edit_.system.country = std::atoi(value.c_str());

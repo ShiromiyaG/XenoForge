@@ -22,6 +22,7 @@
 //            [--depth-float24-convert] [--no-gamma-unorm16]
 //            [--texture-memory soft,hard[,lifetime]] [-v]
 
+#include "xenoforge/render_scale.h"
 #include "xenoforge/renderer.h"
 
 #include <algorithm>
@@ -45,7 +46,7 @@ int usage() {
                          "[--stand-in skip|placeholder|library] [--linked-pipelines] "
                          "[--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] "
                          "[--depth-float24-convert] [--no-gamma-unorm16] "
-                         "[--texture-memory soft,hard[,lifetime]] [-v]\n");
+                         "[--texture-memory soft,hard[,lifetime]] [--scale percent] [--min-scalable pixels] [-v]\n");
     return 2;
 }
 
@@ -70,6 +71,11 @@ int main(int argc, char **argv) {
         // pipelines made on worker threads, their draws skipped meanwhile (as
         // the player plays; a replay otherwise waits for each)
         else if (a == "--async-pipelines") options.async_pipelines = true;
+        // the resolution scale in percent (50-800 in steps of 25) and the
+        // minimum scalable dimension (docs/renderer.md, "Resolution scale")
+        else if (a == "--scale" && i + 1 < argc)
+            options.resolution_scale = xf::render::Scale::from_percent(std::atoi(argv[++i])).q4;
+        else if (a == "--min-scalable" && i + 1 < argc) options.min_scalable = uint32_t(std::atoi(argv[++i]));
         // what draws while they are made: skip, placeholder or library
         else if (a == "--stand-in" && i + 1 < argc) {
             std::string m = argv[++i];
@@ -173,6 +179,8 @@ int main(int argc, char **argv) {
                 (unsigned long long)report.texture_loads_new, (unsigned long long)report.texture_loads_cpu_written,
                 (unsigned long long)report.texture_loads_gpu_written,
                 (unsigned long long)report.resolve_targets_written);
+    if (report.textures_scaled)
+        std::printf("  %llu textures made the resolution scale's\n", (unsigned long long)report.textures_scaled);
     if (report.zpd_reports)
         std::printf("  occlusion: %llu queries for %llu reports\n", (unsigned long long)report.occlusion_queries,
                     (unsigned long long)report.zpd_reports);
@@ -212,9 +220,16 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (uint32_t(w) != frame.width || uint32_t(h) != frame.height) {
-        std::printf("  compare: Xenia's frame is %dx%d, ours %ux%u\n", w, h, frame.width, frame.height);
-        stbi_image_free(ref);
-        return 1;
+        // a frame drawn at a resolution scale: compared at the console's size,
+        // box filtered down (or nearest up) to the reference's
+        if (options.resolution_scale == 4) {
+            std::printf("  compare: Xenia's frame is %dx%d, ours %ux%u\n", w, h, frame.width, frame.height);
+            stbi_image_free(ref);
+            return 1;
+        }
+        std::printf("  compared at %dx%d, resampled from %ux%u\n", w, h, frame.width, frame.height);
+        frame.rgba = xf::render::resample_box(frame.rgba, frame.width, frame.height, uint32_t(w), uint32_t(h));
+        frame.width = uint32_t(w), frame.height = uint32_t(h);
     }
     // the color only: both are shown opaque
     uint64_t sum = 0, off = 0;

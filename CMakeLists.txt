@@ -166,6 +166,7 @@ xf_shader(edram_fsi_library.frag edram_fsi.frag -DLIBRARY)
 xf_shader(edram_fsi_depth_pixel.frag edram_fsi.frag -DDEPTH_ONLY)
 xf_shader(edram_fsi_depth_sample.frag edram_fsi.frag -DDEPTH_ONLY -DSAMPLE_INTERLOCK)
 xf_shader(edram_clear.comp edram_clear.comp)
+xf_shader(edram_rescale.comp edram_rescale.comp)
 xf_shader(depth_float24.frag depth_float24.frag)
 xf_shader(depth_float24_round.frag depth_float24.frag -DROUND)
 xf_shader(placeholder.frag placeholder.frag)
@@ -399,6 +400,19 @@ if(XF_PLAYER AND TARGET boot)
                 ${CMAKE_CURRENT_SOURCE_DIR}/frontend/front_buffer.comp
         DEPENDS frontend/front_buffer.comp
         COMMENT "glslc front_buffer.comp")
+    # the window's picture effects (FSR 1's EASU and RCAS, CAS, FXAA), one compute shader each
+    set(XF_PRESENT_EFFECTS)
+    foreach(effect EASU RCAS CAS FXAA FXAA_EXTREME)
+        add_custom_command(
+            OUTPUT ${XF_SHADER_OUT}/present_${effect}.comp.inc
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${XF_SHADER_OUT}
+            COMMAND ${GLSLC} --target-env=vulkan1.3 -fshader-stage=comp -w -mfmt=num -D${effect}
+                    -o ${XF_SHADER_OUT}/present_${effect}.comp.inc ${CMAKE_CURRENT_SOURCE_DIR}/frontend/present_effects.comp
+            DEPENDS frontend/present_effects.comp third_party/FidelityFX-FSR/ffx_a.h third_party/FidelityFX-FSR/ffx_fsr1.h
+                    third_party/FidelityFX-CAS/ffx_a.h third_party/FidelityFX-CAS/ffx_cas.h third_party/fxaa/FXAA3_11.h
+            COMMENT "glslc present_effects.comp ${effect}")
+        list(APPEND XF_PRESENT_EFFECTS ${XF_SHADER_OUT}/present_${effect}.comp.inc)
+    endforeach()
     # XenoForge's mark for the windows' icon (assets/branding), built into the frontend
     add_custom_command(OUTPUT ${XF_SHADER_OUT}/xenoforge_icon.inc
         COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_CURRENT_SOURCE_DIR}/assets/branding/xenoforge-256.png
@@ -409,7 +423,8 @@ if(XF_PLAYER AND TARGET boot)
                                    frontend/profiles.cpp frontend/console_options.cpp frontend/system_ui.cpp
                                    frontend/sdl_audio.cpp frontend/library.cpp frontend/launcher_core.cpp
                                    frontend/window_icon.cpp
-                                   ${XF_SHADER_OUT}/front_buffer.comp.inc ${XF_SHADER_OUT}/xenoforge_icon.inc)
+                                   ${XF_SHADER_OUT}/front_buffer.comp.inc ${XF_SHADER_OUT}/xenoforge_icon.inc
+                                   ${XF_PRESENT_EFFECTS})
     target_include_directories(xf_frontend PRIVATE ${XF_SHADER_OUT})
     target_link_libraries(xf_frontend PUBLIC xenoforge xenoforge_vk SDL3::SDL3-static Vulkan::Vulkan
                                              tomlplusplus::tomlplusplus)

@@ -48,6 +48,7 @@
 
 #include "xenoforge/guest_memory.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/render_scale.h"
 #include "xenoforge/resolve.h"
 #include "xenoforge/shader_harness.h"
 #include "xenoforge/shader_interpreter.h"
@@ -189,6 +190,9 @@ const uint32_t EDRAM_FSI_DEPTH_SAMPLE[] = {
 };
 const uint32_t EDRAM_CLEAR[] = {
 #include "edram_clear.comp.inc"
+};
+const uint32_t EDRAM_RESCALE[] = {
+#include "edram_rescale.comp.inc"
 };
 
 // registers xenos.h does not name
@@ -495,7 +499,9 @@ struct RenderTarget {
     VkImageView view = VK_NULL_HANDLE;
     VkImageView sampled = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE; // color or depth alone, stencil alone
     VkDescriptorSet store_set = VK_NULL_HANDLE;                     // its EDRAM store's
-    uint32_t width = 0, height = 0;
+    uint32_t width = 0, height = 0; // in the console's pixels
+    // its image's size: width and height at the resolution scale (Impl::scale_)
+    uint32_t host_width = 0, host_height = 0;
     // in EDRAM: tiles per row (at its bits per sample), a tile's size in pixels
     uint32_t pitch_tiles = 1, tile_width = 80, tile_height = 16;
     bool wide = false; // 64 bits per sample
@@ -514,15 +520,16 @@ struct RenderTarget {
     VkImageView stencil_copy_view = VK_NULL_HANDLE;
 };
 
-// edram.glsl's push constants
+// edram.glsl's push constants (width, height, x and y in the scaled grid's pixels)
 struct EdramTarget {
     uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, flags;
     uint32_t x, y, clear_lo, clear_hi; // edram_clear.comp's
+    uint32_t scale;                    // the resolution scale in quarters
 };
 // edram_transfer.frag's push constants: the destination's and the source's
 // EdramTarget, up to the flags (edram.glsl's EdramParams)
 struct EdramTransfer {
-    uint32_t dest[10], source[10];
+    uint32_t dest[11], source[11]; // (the 11th: the resolution scale)
 };
 static_assert(sizeof(EdramTransfer) <= 128);
 
@@ -532,9 +539,11 @@ struct FsiConstants {
     uint32_t flags, depth_base, pitch, zpd_index;
     uint32_t rt[4], blend[4], rt_base[4], stencil[4];
     float poly_offset[4], blend_constant[4], exp_bias[4];
+    // the resolution scale in quarters and a tile's dwords at it (render_scale.h)
+    uint32_t scale[4];
     bool operator==(const FsiConstants &) const = default;
 };
-static_assert(sizeof(FsiConstants) == 128);
+static_assert(sizeof(FsiConstants) == 144);
 // its flags (edram_fsi.frag's F_ bits; the MSAA mode in bits 0-1)
 constexpr uint32_t FSI_2X_AS_4X = 4, FSI_DEPTH_STENCIL = 8, FSI_DEPTH_LESS = 16, FSI_DEPTH_WRITE = 128,
                    FSI_STENCIL = 256, FSI_FLOAT24 = 512;
@@ -547,8 +556,10 @@ struct ResolveConstants {
     float exp_factor;
     // a multisampled source read from EDRAM
     uint32_t edram, edram_base, edram_pitch, msaa, ints_log2, src_x, src_y, first_sample, samples;
-    uint32_t depth_round; // D24FS8 from the host's float: 20e4 rounded to the nearest even
-    uint32_t target;      // the texture written too (resolve.comp's p.target), 0 none
+    // bit 0: D24FS8 from the host's float, 20e4 rounded to the nearest even;
+    // the resolution scales (resolve.comp's p.flags)
+    uint32_t flags;
+    uint32_t target; // the texture written too (resolve.comp's p.target), 0 none
 };
 static_assert(sizeof(ResolveConstants) <= 128, "the push constants every device has room for");
 
@@ -635,6 +646,10 @@ struct Texture {
     uint32_t target = 0;
     VkImageView target_view = VK_NULL_HANDLE;
     uint32_t target_base = 0, target_pitch = 0, target_endian = 0;
+    // its image at the resolution scale (Impl::scale_texture), the resolves
+    // feeding it writing its scaled texels; a load makes it the console's
+    // size again
+    bool scaled = false;
 };
 
 // the translated shaders' and the geometry shaders' system constants
@@ -1117,7 +1132,9 @@ public:
         VkBufferCopy copy{at, 0, EDRAM_BYTES};
         VkCommandBuffer c = outside();
         gpu_mark("EDRAM: a trace's snapshot restored");
-        vkCmdCopyBuffer(c, from, edram_.buffer, 1, &copy);
+        // (at a resolution scale, through EDRAM at the console's size)
+        vkCmdCopyBuffer(c, from, scale_.one() ? edram_.buffer : edram_1x_.buffer, 1, &copy);
+        if (!scale_.one()) rescale_edram(true);
     }
     Report report() const override {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1148,6 +1165,12 @@ public:
         trace_ = trace;
     }
     void settle() override { drain(); }
+    void set_texture_filtering(uint32_t anisotropy, uint32_t filter) override {
+        anisotropy_.store(anisotropy, std::memory_order_relaxed);
+        texture_filter_.store(filter, std::memory_order_relaxed);
+    }
+    uint32_t resolution_scale() const override { return scale_.q4; }
+    std::string scale_notice() const override { return scale_notice_; }
     bool snapshot_edram(std::vector<uint8_t> &out) override;
     void gpu_memory(std::vector<std::pair<uint32_t, std::vector<uint8_t>>> &out) override;
 
@@ -1272,6 +1295,25 @@ private:
     // by it as well (resolve targets not loaded again since): how many
     // (and the rows of texels the destination starts at in them, the same in both)
     uint32_t resolve_targets(const resolve::Info &info, Texture *targets[2], uint32_t &extra_rows);
+    void scale_texture(Texture &t, uint32_t width, uint32_t height);
+    // A scaled resolve no texture was over yet (docs/renderer.md,
+    // "Resolution scale"): its texels at the resolution scale, kept in an
+    // image of its own for the texture a later draw makes over the
+    // destination (texture() copies it in and makes that texture scaled),
+    // instead of the console's size its memory holds. By the destination's
+    // base; what the resolve wrote, for dropping it when anything else writes
+    // there; the swap it was made at, dropped two swaps on.
+    struct ScaledResolve {
+        vk::Image image;
+        VkImageView view = VK_NULL_HANDLE;
+        uint32_t target = 0; // its place in the resolves' table plus one, bit 7 64-bit
+        uint32_t pitch = 0, endian = 0, width = 0, height = 0;
+        uint32_t low = 0, high = 0;
+        uint64_t swap = 0;
+    };
+    std::map<uint32_t, ScaledResolve> scaled_resolves_;
+    ScaledResolve *scaled_resolve(const resolve::Info &info, const std::vector<Range> &written);
+    void drop_scaled_resolves(const std::vector<Range> &written, bool all = false);
     uint32_t take_index(uint32_t kind);
     uint32_t room(uint32_t kind) const {
         return uint32_t(free_indices_[kind].size()) + (capacity_[kind] - next_index_[kind]);
@@ -1532,7 +1574,7 @@ private:
         for (size_t i = 0; i < samples.size(); i++) {
             auto it = zpd_counts_.find(s.occlusion_reports[i]);
             if (it == zpd_counts_.end()) continue;
-            it->second.samples += samples[i];
+            it->second.samples += samples[i] * 16 / (scale_.q4 * scale_.q4); // (the console's samples, at a resolution scale)
             if (--it->second.open == 0 && it->second.ended) zpd_answer(it->first, it->second);
         }
         s.occlusion_reports.clear();
@@ -1636,6 +1678,21 @@ private:
     VkDevice dev_;
     gpu::CommandProcessor &processor_;
     Options options_;
+    // the texture filtering forced (Options::anisotropy, texture_filter; set_texture_filtering)
+    std::atomic<uint32_t> anisotropy_{0}, texture_filter_{0};
+    // The resolution scale everything drawn into EDRAM is drawn at (docs/
+    // renderer.md, "Resolution scale"), the minimum scalable dimension, and
+    // why the scale is not the one asked for. EDRAM's tiles are scale_'s
+    // size: every render target is drawn at it (they share EDRAM's tiles
+    // whatever their sizes, as the console's do); a resolve or a texture
+    // smaller than min_scalable_ leaves EDRAM at the console's size.
+    Scale scale_{};
+    uint32_t min_scalable_ = 16;
+    std::string scale_notice_;
+    // EDRAM's tiles and dwords at scale_
+    uint32_t tile_dwords_ = 1280;
+    uint32_t max_image_ = 16384; // the device's largest 2D image
+    VkDeviceSize edram_bytes_ = 0;
     mutable std::mutex mutex_; // held through each of the processor's calls
     Report report_;
     std::string fatal_;
@@ -1761,8 +1818,9 @@ private:
         bool round = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader;
         uint32_t flags = t.depth ? (host_depth_kept(t.format) ? 1u : 0u) | (round ? 2u : 0u)
                                  : (t.gamma_linear ? 4u : 0u) | (t.raw ? 8u : 0u);
-        return {t.base, t.pitch_tiles,     t.msaa,           t.format, t.width,
-                height, t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u,       flags};
+        return {t.base,  t.pitch_tiles,     t.msaa,           t.format, t.host_width,
+                height,  t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u,       flags,
+                0,       0,                 0,                0,        scale_.q4};
     }
     // Whether a depth format is encoded differently on the host, so that its
     // 32-bit depth is kept beside EDRAM across transfers (Xenia's
@@ -1809,6 +1867,13 @@ private:
     bool fsi_2x_as_4x_ = false;         // the guest's 2x rasterized as 4x (no 2x without attachments)
     VkShaderModule fsi_depth_fs_ = VK_NULL_HANDLE; // depth and stencil alone (no pixel shader)
     VkPipeline clear_pipeline_ = VK_NULL_HANDLE;
+    // EDRAM between the console's size and scale_'s (edram_rescale.comp), for
+    // traces' snapshots: through edram_1x_, EDRAM at the console's size; the
+    // sets from it into EDRAM and back
+    VkPipeline rescale_pipeline_ = VK_NULL_HANDLE;
+    vk::Buffer edram_1x_;
+    VkDescriptorSet rescale_sets_[2] = {};
+    void rescale_edram(bool to_scaled);
     vk::Buffer zpd_counters_, zpd_readback_;
     FsiConstants last_fsi_{};
     VkDeviceSize last_fsi_at_ = NONE;
@@ -1858,6 +1923,10 @@ Impl::~Impl() {
         d_.destroy(t->image);
         if (t->signed_image.image) d_.destroy(t->signed_image);
     }
+    for (auto &[base, kept] : scaled_resolves_) {
+        if (kept.view) vkDestroyImageView(dev_, kept.view, nullptr);
+        d_.destroy(kept.image);
+    }
     for (auto &im : dummy_) d_.destroy(im);
     if (native_output_view_) vkDestroyImageView(dev_, native_output_view_, nullptr);
     if (native_output_.image) d_.destroy(native_output_);
@@ -1872,7 +1941,7 @@ Impl::~Impl() {
     for (auto &modules : transfer_fs_)
         for (VkShaderModule m : modules)
             if (m) vkDestroyShaderModule(dev_, m, nullptr);
-    for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_, clear_pipeline_})
+    for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_, clear_pipeline_, rescale_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
     for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
                              depth_float24_fs_[1], placeholder_fs_, fsi_depth_fs_})
@@ -1885,7 +1954,7 @@ Impl::~Impl() {
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
                                     compute_set_layout_, target_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
-    for (vk::Buffer *b : {&edram_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_, &zpd_counters_, &zpd_readback_})
+    for (vk::Buffer *b : {&edram_, &edram_1x_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_, &zpd_counters_, &zpd_readback_})
         d_.destroy(*b);
 }
 
@@ -2214,16 +2283,54 @@ bool Impl::init(std::string &error) {
 
     // EDRAM: the buffer, store (compute) and load (draw) pipelines; the tile
     // masks come from the arena
-    edram_ = d_.create_buffer(EDRAM_BYTES,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                              false);
-    if (!edram_.buffer) return error = "could not make the EDRAM buffer", false;
-    // the host's depth beside it: D24FS8's, then D24S8's where the host keeps
-    // that as a float too
-    host_depth_ = d_.create_buffer(EDRAM_BYTES * (host_depth_kept(0) ? 2 : 1),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
-    if (!host_depth_.buffer) return error = "could not make the host depth buffer", false;
+    // At the resolution scale (Options::resolution_scale, or XF_RESOLUTION_SCALE
+    // in percent): EDRAM's tiles that many times wider and taller. Where the
+    // device cannot hold it, the next smaller scale that it can, said in the
+    // notice (the player shows it).
+    {
+        Scale wanted{std::clamp(options_.resolution_scale, Scale::MIN_Q4, Scale::MAX_Q4)};
+        if (const char *percent = std::getenv("XF_RESOLUTION_SCALE"); percent && *percent)
+            wanted = Scale::from_percent(std::atoi(percent));
+        // The interlock path addresses a pixel's samples from its first one
+        // (edram_fsi.frag's fsi_offsets and sample_offset), which keeps them
+        // in one half of a tile only where the half (10 samples a quarter of
+        // scale) is a whole number of 4-sample groups: even quarters (50%,
+        // 100%, 150%, ...). An odd quarter is drawn at the even one below it,
+        // said in the notice; the host render target path takes every quarter.
+        Scale asked = wanted;
+        if (fsi_ && (wanted.q4 & 1)) wanted.q4 = std::max(wanted.q4 - 1, Scale::MIN_Q4);
+        min_scalable_ = options_.min_scalable;
+        if (const char *min = std::getenv("XF_MIN_SCALABLE"); min && *min) min_scalable_ = uint32_t(std::atoi(min));
+        for (scale_ = wanted;; scale_.q4 -= fsi_ ? 2 : 1) {
+            tile_dwords_ = scale_.tile_dwords();
+            edram_bytes_ = VkDeviceSize(EDRAM_TILES) * tile_dwords_ * 4;
+            edram_ = d_.create_buffer(edram_bytes_,
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                      false);
+            // the host's depth beside it: D24FS8's, then D24S8's where the
+            // host keeps that as a float too
+            if (edram_.buffer)
+                host_depth_ =
+                    d_.create_buffer(edram_bytes_ * (host_depth_kept(0) ? 2 : 1),
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+            if (edram_.buffer && host_depth_.buffer) break;
+            d_.destroy(edram_), d_.destroy(host_depth_);
+            if (scale_.q4 <= Scale::MIN_Q4 || (scale_.q4 <= 4 && wanted.q4 > 4))
+                return error = "could not make the EDRAM buffer", false;
+        }
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(d_.physical(), &properties);
+        max_image_ = std::min(properties.limits.maxImageDimension2D,
+                              std::min(properties.limits.maxFramebufferWidth, properties.limits.maxFramebufferHeight));
+        anisotropy_ = options_.anisotropy, texture_filter_ = options_.texture_filter;
+        if (scale_.q4 != wanted.q4)
+            scale_notice_ = "drawn at " + std::to_string(scale_.percent()) + "%: the GPU could not hold EDRAM at " +
+                            std::to_string(wanted.percent()) + "%";
+        else if (scale_.q4 != asked.q4)
+            scale_notice_ = "drawn at " + std::to_string(scale_.percent()) + "%: the exact EDRAM path (interlock) takes " +
+                            "multiples of 50%, not " + std::to_string(asked.percent()) + "%";
+    }
     // the interlock path's occlusion counters: a slot's share each, zeroed as
     // it begins recording, copied for the CPU as it ends
     zpd_counters_ = d_.create_buffer(VkDeviceSize(SLOTS) * OCCLUSION_QUERIES * 4,
@@ -2442,9 +2549,9 @@ bool Impl::init(std::string &error) {
         static_assert(sizeof(EdramTarget) <= sizeof(ResolveConstants));
         if (fsi_ && !(clear_pipeline_ = compute_pipeline(EDRAM_CLEAR, sizeof(EDRAM_CLEAR), resolve_layout_)))
             return error = "could not make the EDRAM clear pipeline", false;
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pool.maxSets = 3;
+        pool.maxSets = 5;
         pool.poolSizeCount = 1;
         pool.pPoolSizes = sizes;
         if (vkCreateDescriptorPool(dev_, &pool, nullptr, &compute_pool_) != VK_SUCCESS)
@@ -2473,6 +2580,32 @@ bool Impl::init(std::string &error) {
             writes[k].pBufferInfo = &buffers[k];
         }
         vkUpdateDescriptorSets(dev_, 6, writes, 0, nullptr);
+        // at a resolution scale, EDRAM at the console's size beside it, and
+        // the sets that move a snapshot between the two
+        if (!scale_.one()) {
+            edram_1x_ = d_.create_buffer(EDRAM_BYTES,
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                         false);
+            rescale_pipeline_ = compute_pipeline(EDRAM_RESCALE, sizeof(EDRAM_RESCALE), load_layout_);
+            VkDescriptorSetLayout twice[2] = {compute_set_layout_, compute_set_layout_};
+            alloc.descriptorSetCount = 2;
+            alloc.pSetLayouts = twice;
+            if (!edram_1x_.buffer || !rescale_pipeline_ ||
+                vkAllocateDescriptorSets(dev_, &alloc, rescale_sets_) != VK_SUCCESS)
+                return error = "could not make the EDRAM rescale", false;
+            VkDescriptorBufferInfo ends[4] = {{edram_1x_.buffer, 0, VK_WHOLE_SIZE}, {edram_.buffer, 0, VK_WHOLE_SIZE},
+                                              {edram_.buffer, 0, VK_WHOLE_SIZE}, {edram_1x_.buffer, 0, VK_WHOLE_SIZE}};
+            for (uint32_t k = 0; k < 4; k++) {
+                writes[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                writes[k].dstSet = rescale_sets_[k >> 1];
+                writes[k].dstBinding = k & 1;
+                writes[k].descriptorCount = 1;
+                writes[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[k].pBufferInfo = &ends[k];
+            }
+            vkUpdateDescriptorSets(dev_, 4, writes, 0, nullptr);
+        }
     }
 
     // the stand-ins for slots without a texture, index 0 of each table: 1x1
@@ -3067,6 +3200,7 @@ void Impl::export_ranges(const Shader &s, uint32_t stage, std::vector<Range> &ra
 void Impl::end_export(const std::vector<Range> &pages) {
     if (pages.empty()) return;
     end_pass();
+    drop_scaled_resolves(pages);
     gpu_written(pages);
     textures_written_by_gpu(pages);
 }
@@ -3319,6 +3453,8 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     uint32_t rows = std::max(1u, (EDRAM_TILES - std::min(base, EDRAM_TILES - 1)) / pitch_tiles);
     t->width = std::clamp(pitch, 1u, 8192u);
     t->height = std::clamp(rows * tile_height, 1u, 8192u);
+    t->host_width = std::min(scale_.up(t->width), max_image_);
+    t->host_height = std::min(scale_.up(t->height), max_image_);
     t->wide = bytes == 8;
     t->tile_width = tile_width, t->tile_height = tile_height;
     t->pitch_tiles = pitch_tiles;
@@ -3344,7 +3480,7 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
              (msaa && !(integer_samples_ & samples))))
             raw_format = VK_FORMAT_UNDEFINED;
     }
-    t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->width, t->height, 1}, 1, 1, samples, usage,
+    t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->host_width, t->host_height, 1}, 1, 1, samples, usage,
                                raw_format != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
     if (!t->image.image) {
         fatal_ = "could not make a render target";
@@ -3404,7 +3540,7 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     report_.render_targets++;
     if (options_.verbose)
         std::fprintf(stderr, "  render target: %s base %u pitch %u msaa %u format %u -> %ux%u\n", depth ? "depth" : "color",
-                     base, pitch, msaa, format, t->width, t->height);
+                     base, pitch, msaa, format, t->host_width, t->host_height);
     return (targets_[key] = std::move(t)).get();
 }
 
@@ -3460,7 +3596,7 @@ VkDeviceSize Impl::edram_mask(const std::vector<uint32_t> &tiles) {
 bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
     uint32_t last_row = 0;
     for (uint32_t tile : tiles) last_row = std::max(last_row, ((tile + EDRAM_TILES - t->base) % EDRAM_TILES) / t->pitch_tiles);
-    uint32_t height = std::min((last_row + 1) * t->tile_height, t->height);
+    uint32_t height = std::min(scale_.up((last_row + 1) * t->tile_height), t->host_height);
     VkDeviceSize mask = edram_mask(tiles);
     if (mask == NONE) return false;
     EdramTarget push = edram_target(*t, height);
@@ -3470,7 +3606,7 @@ bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, store_pipelines_[t->msaa ? 1 : 0]);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, edram_layouts_[0], 0, 1, &t->store_set, 1, &offset);
     vkCmdPushConstants(c, edram_layouts_[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(c, (t->width + 7) / 8, (height + 7) / 8, 1);
+    vkCmdDispatch(c, (t->host_width + 7) / 8, (height + 7) / 8, 1);
     return true;
 }
 
@@ -3491,6 +3627,7 @@ RenderTarget Impl::edram_view(bool depth, uint32_t base, uint32_t pitch, uint32_
     uint32_t rows = std::max(1u, (EDRAM_TILES - std::min(base, EDRAM_TILES - 1)) / t.pitch_tiles);
     t.width = std::clamp(pitch, 1u, 8192u);
     t.height = std::clamp(rows * t.tile_height, 1u, 8192u);
+    t.host_width = scale_.up(t.width), t.host_height = scale_.up(t.height);
     return t;
 }
 
@@ -3509,7 +3646,7 @@ void Impl::fsi_clear(const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, 
             uint32_t first = (t.base + first_row * t.pitch_tiles) % EDRAM_TILES;
             uint32_t count = std::min((end_row - first_row) * t.pitch_tiles, EDRAM_TILES);
             uint32_t before_wrap = std::min(count, EDRAM_TILES - first);
-            const VkDeviceSize tile_bytes = 80 * 16 * 4;
+            const VkDeviceSize tile_bytes = VkDeviceSize(tile_dwords_) * 4; // (at the resolution scale)
             vkCmdFillBuffer(c, edram_.buffer, first * tile_bytes, before_wrap * tile_bytes, lo);
             if (count > before_wrap) vkCmdFillBuffer(c, edram_.buffer, 0, (count - before_wrap) * tile_bytes, lo);
             // the rows above and below the filled ones
@@ -3527,12 +3664,30 @@ void Impl::edram_clear_rows(VkCommandBuffer c, const RenderTarget &t, uint32_t x
                             uint32_t lo, uint32_t hi) {
     EdramTarget p{};
     p.base_tiles = t.base, p.pitch_tiles = t.pitch_tiles, p.msaa = t.msaa, p.format = t.format;
-    p.width = w, p.height = h, p.is_depth = t.depth, p.ints_log2 = t.wide ? 1 : 0;
-    p.x = x, p.y = y, p.clear_lo = lo, p.clear_hi = hi;
+    // (the rectangle's pixels at the resolution scale: x, y, w and h are
+    // multiples of 8, whole at every quarter)
+    p.width = scale_.down(w), p.height = scale_.down(h), p.is_depth = t.depth, p.ints_log2 = t.wide ? 1 : 0;
+    p.x = scale_.down(x), p.y = scale_.down(y), p.clear_lo = lo, p.clear_hi = hi;
+    p.scale = scale_.q4;
+    w = p.width, h = p.height;
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, clear_pipeline_);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 1, &resolve_edram_set_, 0, nullptr);
     vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
+}
+
+// EDRAM between the console's size (edram_1x_) and scale_'s, tile by tile
+// (edram_rescale.comp), between full barriers
+void Impl::rescale_edram(bool to_scaled) {
+    VkCommandBuffer c = outside();
+    full_barrier(c);
+    uint32_t push[2] = {to_scaled ? 4u : scale_.q4, to_scaled ? scale_.q4 : 4u};
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, rescale_pipeline_);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1, &rescale_sets_[to_scaled ? 0 : 1], 0,
+                            nullptr);
+    vkCmdPushConstants(c, load_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    vkCmdDispatch(c, (Scale{push[1]}.tile_dwords() + 63) / 64, EDRAM_TILES, 1);
+    full_barrier(c);
 }
 
 // The interlock path's occlusion counter for the draw being recorded (the
@@ -3572,7 +3727,9 @@ bool Impl::snapshot_edram(std::vector<uint8_t> &out) {
     uint8_t *data = readback(EDRAM_BYTES, back, at);
     if (!data) return false;
     VkBufferCopy copy{0, at, EDRAM_BYTES};
-    vkCmdCopyBuffer(outside(), edram_.buffer, back, 1, &copy);
+    // (at a resolution scale, EDRAM given back at the console's size)
+    if (!scale_.one()) rescale_edram(false);
+    vkCmdCopyBuffer(outside(), scale_.one() ? edram_.buffer : edram_1x_.buffer, back, 1, &copy);
     sync();
     if (!fatal_.empty()) return false;
     out.assign(data, data + EDRAM_BYTES);
@@ -3717,7 +3874,7 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
     if (!pipeline) return fatal_ = "could not make an EDRAM load pipeline", false;
     VkDeviceSize mask = edram_mask(tiles);
     if (mask == NONE) return false;
-    uint32_t height = std::min(rows, t->height), offset = uint32_t(mask);
+    uint32_t height = std::min(scale_.up(rows), t->host_height), offset = uint32_t(mask);
     EdramTarget push = edram_target(*t, height);
     VkCommandBuffer c = outside();
     if (options_.gpu_timing) gpu_mark("EDRAM load: " + target_name(*t));
@@ -3727,7 +3884,7 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    rendering.renderArea = {{0, 0}, {t->width, height}};
+    rendering.renderArea = {{0, 0}, {t->host_width, height}};
     rendering.layerCount = 1;
     if (t->depth) {
         rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
@@ -3740,8 +3897,8 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
     bound_pipeline_ = VK_NULL_HANDLE; // the draws' pipeline and sets are bound again after it
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, edram_layouts_[1], 0, 1, &edram_load_set_, 1, &offset);
     vkCmdPushConstants(c, edram_layouts_[1], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-    VkViewport viewport{0, 0, float(t->width), float(height), 0, 1};
-    VkRect2D scissor{{0, 0}, {t->width, height}};
+    VkViewport viewport{0, 0, float(t->host_width), float(height), 0, 1};
+    VkRect2D scissor{{0, 0}, {t->host_width, height}};
     vkCmdSetViewport(c, 0, 1, &viewport);
     vkCmdSetScissor(c, 0, 1, &scissor);
     if (!t->depth) {
@@ -3792,10 +3949,13 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         for (uint32_t tile : tiles) at.push_back((tile + EDRAM_TILES - t->base) % EDRAM_TILES);
         std::sort(at.begin(), at.end());
         auto rect = [&](uint32_t row, uint32_t first, uint32_t columns, uint32_t rows) {
-            uint32_t x = first * t->tile_width, y = row * t->tile_height;
-            if (x >= t->width || y >= t->height) return;
+            // (in host pixels at the resolution scale: whole tiles, whole at
+            // every quarter)
+            uint32_t x = scale_.down(first * t->tile_width), y = scale_.down(row * t->tile_height);
+            if (x >= t->host_width || y >= t->host_height) return;
             VkRect2D r{{int32_t(x), int32_t(y)},
-                       {std::min(columns * t->tile_width, t->width - x), std::min(rows * t->tile_height, t->height - y)}};
+                       {std::min(scale_.down(columns * t->tile_width), t->host_width - x),
+                        std::min(scale_.down(rows * t->tile_height), t->host_height - y)}};
             d.rects.push_back(r);
             height = std::max(height, y + r.extent.height);
         };
@@ -3822,7 +3982,7 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
     if (draws.empty()) return true;
     bool stencil_copy = t->depth && stencil_copies_, fresh = false;
     if (stencil_copy && !t->stencil_copy.image) {
-        t->stencil_copy = d_.create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UINT, {t->width, t->height, 1}, 1, 1,
+        t->stencil_copy = d_.create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UINT, {t->host_width, t->host_height, 1}, 1, 1,
                                           t->image.samples,
                                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0);
         if (!t->stencil_copy.image) return fatal_ = "could not make a depth target's stencil image", false;
@@ -3839,7 +3999,7 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    rendering.renderArea = {{0, 0}, {t->width, height}};
+    rendering.renderArea = {{0, 0}, {t->host_width, height}};
     rendering.layerCount = 1;
     VkRenderingAttachmentInfo stencil_attachment = attachment;
     stencil_attachment.imageView = t->stencil_copy_view;
@@ -3853,9 +4013,9 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
     }
     vkCmdBeginRendering(c, &rendering);
     bound_pipeline_ = VK_NULL_HANDLE; // the draws' pipeline and sets are bound again after it
-    VkViewport viewport{0, 0, float(t->width), float(t->height), 0, 1};
+    VkViewport viewport{0, 0, float(t->host_width), float(t->host_height), 0, 1};
     vkCmdSetViewport(c, 0, 1, &viewport);
-    EdramTarget dest = edram_target(*t, t->height);
+    EdramTarget dest = edram_target(*t, t->host_height);
     bool stencil_passes = t->depth && !transfer_fs_[0][3] && !stencil_copy;
     VkPipeline bound = VK_NULL_HANDLE;
     for (const Draw &d : draws) {
@@ -3864,10 +4024,11 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         uint32_t offset = 0;
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, edram_layouts_[2], 0, 1, &d.source->store_set, 1,
                                 &offset);
-        EdramTarget source = edram_target(*d.source, d.source->height);
+        EdramTarget source = edram_target(*d.source, d.source->host_height);
         EdramTransfer push{};
-        std::memcpy(push.dest, &dest, sizeof(push.dest));
-        std::memcpy(push.source, &source, sizeof(push.source));
+        std::memcpy(push.dest, &dest, 10 * sizeof(uint32_t));
+        std::memcpy(push.source, &source, 10 * sizeof(uint32_t));
+        push.dest[10] = push.source[10] = scale_.q4;
         vkCmdPushConstants(c, edram_layouts_[2], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
         if (t->depth) {
             // the depth and the stencil (exported, or cleared to 0 for the
@@ -3933,11 +4094,25 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     if (overrides[2] != 3) mip = overrides[2];
     if (overrides[3] != 7) aniso = overrides[3];
     texture::Info parsed = texture::parse_fetch_constant(fetch);
+    texture::Levels levels = texture::levels(parsed);
+    // The player's filtering beyond the game's (Options::anisotropy and
+    // texture_filter): nearest everywhere; or, on mipmapped textures (not a
+    // base map alone) the game filters linearly, linear between mips and the
+    // anisotropy forced, as Xenia's anisotropic_override picks them
+    // (vulkan_texture_cache.cc's GetSamplerParameters).
+    const uint32_t forced_filter = texture_filter_.load(std::memory_order_relaxed);
+    const uint32_t forced_aniso = anisotropy_.load(std::memory_order_relaxed);
+    if (forced_filter == 2) {
+        mag = min = 0, mip = mip == 2 ? 2 : 0, aniso = 0;
+    } else if (levels.mip_max > levels.mip_min && mip != 2 && mag == 1 && min == 1) {
+        if (forced_filter == 1) mip = 1;
+        // 1x, 2x, 4x, 8x, 16x as Xenos' AnisoFilter 1-5
+        if (forced_aniso) aniso = uint32_t(std::bit_width(std::min(forced_aniso, 16u)));
+    }
     // points where the host does not filter the formats it reads (Xenia's
     // GetSamplerParameters; anisotropy filters linearly too)
     if ((mag == 1 || min == 1 || mip == 1 || (aniso && aniso < 6)) && !texture::filterable(parsed, support_))
         mag = min = 0, mip = mip == 2 ? 2 : 0, aniso = 0;
-    texture::Levels levels = texture::levels(parsed);
     uint32_t mip_min = mip == 2 && levels.base ? 0 : levels.mip_min;
     uint32_t clamp[3];
     bool border = false;
@@ -4280,6 +4455,25 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     uint32_t layers = three ? 1 : std::max(1u, plan.depth);
     VkExtent3D extent{plan.width, plan.height, three ? plan.depth : 1};
     uint32_t level_count = plan.level_count;
+    // A resolve target (the resolves write it as well: below), and one a
+    // scaled resolve kept the scaled texels of: made at the resolution scale,
+    // those copied in rather than loaded (docs/renderer.md, "Resolution scale")
+    const uint32_t texel_bytes = texture::format_block(info.format).bytes;
+    const bool target = resolve_targets_ && mirror && !separate && !three && !cube && layers == 1 &&
+                        level_count == 1 && plan.slices.size() == 1 && plan.slices[0].level == 0 &&
+                        plan.slices[0].tiled && plan.load == texture::Load::Copy &&
+                        plan.half == texture::Half::None && plan.block_width == 1 && plan.block_height == 1 &&
+                        (texel_bytes == 4 || texel_bytes == 8) && plan.bytes_per_block == texel_bytes;
+    ScaledResolve *kept = nullptr;
+    if (target && !scale_.one() && scalable(plan.width, plan.height, min_scalable_)) {
+        auto found = scaled_resolves_.find(plan.slices[0].base & 0x1FFFFFFF);
+        if (found != scaled_resolves_.end() && found->second.pitch == plan.slices[0].pitch_blocks &&
+            found->second.endian == info.endian && ((found->second.target >> 7) & 1) == (texel_bytes == 8 ? 1u : 0u) &&
+            found->second.width >= plan.width && found->second.height >= plan.height) {
+            kept = &found->second;
+            extent = {scale_.up(plan.width), scale_.up(plan.height), 1};
+        }
+    }
     bool fresh = !t || t->image.format != format || t->image.extent.width != extent.width ||
                  t->image.extent.height != extent.height || t->image.extent.depth != extent.depth ||
                  t->image.levels != level_count || t->image.layers != layers ||
@@ -4331,12 +4525,6 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         // wrote, one 2D level of 32- or 64-bit texels whose image holds the
         // guest's bits as they are (a plain copy), tiled, made storable
         // through an unsigned view of its texel's size, which resolves write.
-        const uint32_t texel_bytes = texture::format_block(info.format).bytes;
-        const bool target = resolve_targets_ && mirror && !separate && !three && !cube && layers == 1 &&
-                            level_count == 1 && plan.slices.size() == 1 && plan.slices[0].level == 0 &&
-                            plan.slices[0].tiled && plan.load == texture::Load::Copy &&
-                            plan.half == texture::Half::None && plan.block_width == 1 && plan.block_height == 1 &&
-                            (texel_bytes == 4 || texel_bytes == 8) && plan.bytes_per_block == texel_bytes;
         const VkFormat target_format = texel_bytes == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
         if (target) usage |= VK_IMAGE_USAGE_STORAGE_BIT, flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         // a signed view of the same bits: the image mutable, with the snorm
@@ -4394,7 +4582,22 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     t->low = UINT32_MAX, t->high = 0;
     for (auto [start, end] : t->ranges) t->low = std::min(t->low, start), t->high = std::max(t->high, end);
     index_texture(*t);
-    if (gpu) {
+    t->scaled = kept != nullptr;
+    if (kept) {
+        // the scaled resolve's texels, of the same size (the texture's format
+        // holds the guest's bits as they are, as the resolve wrote them)
+        VkCommandBuffer c = outside();
+        if (fresh) begin_image(c, t->image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+        full_barrier(c);
+        VkImageCopy copy{};
+        copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.extent = extent;
+        vkCmdCopyImage(c, kept->image.image, VK_IMAGE_LAYOUT_GENERAL, t->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        full_barrier(c);
+        std::vector<Range> its{{kept->low, kept->high}};
+        drop_scaled_resolves(its);
+        report_.textures_scaled++;
+    } else if (gpu) {
         if (!gpu_load(*t, t->image, plan, fresh, true)) return nullptr;
         if (separate && !gpu_load(*t, t->signed_image, signed_plan, fresh, false)) return nullptr;
     } else {
@@ -6016,9 +6219,17 @@ void Impl::draw(const gpu::Draw &d) {
         depth_control = 0;
     }
     uint32_t width = 8192, height = 8192;
+    // (and the pass's, at the resolution scale: the targets' images)
+    uint32_t host_width = max_image_, host_height = max_image_;
     for (RenderTarget *t : colors)
-        if (t) width = std::min(width, t->width), height = std::min(height, t->height);
-    if (depth) width = std::min(width, depth->width), height = std::min(height, depth->height);
+        if (t) {
+            width = std::min(width, t->width), height = std::min(height, t->height);
+            host_width = std::min(host_width, t->host_width), host_height = std::min(host_height, t->host_height);
+        }
+    if (depth) {
+        width = std::min(width, depth->width), height = std::min(height, depth->height);
+        host_width = std::min(host_width, depth->host_width), host_height = std::min(host_height, depth->host_height);
+    }
     for (uint32_t i = 0; i < 5; i++)
         if (viewed[i]) width = std::min(width, views[i].width), height = std::min(height, views[i].height);
     if (width == 8192 && height == 8192 && !export_only && !rasterizes_nothing()) {
@@ -6033,7 +6244,7 @@ void Impl::draw(const gpu::Draw &d) {
     // D24FS8 depth converted to 20e4 in the pixel shader (Options), for draws
     // with the depth test on, as Xenia's depth_float24_convert_in_pixel_shader
     bool float24_convert = options_.depth_float24_convert_in_pixel_shader && depth_float24 && (depth_control & 2);
-    Viewport viewport = host_viewport(regs_, max_viewport_[0], max_viewport_[1], ps && ps->writes_depth,
+    Viewport viewport = host_viewport(regs_, max_viewport_[0] / scale_.factor(), max_viewport_[1] / scale_.factor(), ps && ps->writes_depth,
                                       depth_float24 && (depth_control & 2), float24_convert);
     VkRect2D scissor = host_scissor(regs_, pitch);
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
@@ -6066,7 +6277,7 @@ void Impl::draw(const gpu::Draw &d) {
             uint32_t info = regs_[r::COLOR_INFO[i]], format = (info >> 16) & 0xF;
             f.rt[i] = format | color_masks[i] << 4 | 0x100u;
             f.blend[i] = regs_[r::RB_BLENDCONTROL[i]] & 0x1FFF1FFF;
-            f.rt_base[i] = ((info & 0xFFF) % EDRAM_TILES) * 1280;
+            f.rt_base[i] = ((info & 0xFFF) % EDRAM_TILES) * tile_dwords_;
             f.exp_bias[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
             if (depth_stencil && (info & 0xFFF) % EDRAM_TILES == depth_base % EDRAM_TILES) {
                 // the bits the color target writes (render_target_cache.cc's
@@ -6106,8 +6317,9 @@ void Impl::draw(const gpu::Draw &d) {
         }
         if (viewed[4] && views[4].format == 1) flags |= FSI_FLOAT24;
         f.flags = flags;
-        f.depth_base = (depth_base % EDRAM_TILES) * 1280;
-        f.pitch = std::max(1u, (pitch * (msaa >= 2 ? 2 : 1) + 79) / 80) * 1280;
+        f.depth_base = (depth_base % EDRAM_TILES) * tile_dwords_;
+        f.pitch = std::max(1u, (pitch * (msaa >= 2 ? 2 : 1) + 79) / 80) * tile_dwords_;
+        f.scale[0] = scale_.q4, f.scale[1] = tile_dwords_;
         f.zpd_index = UINT32_MAX; // (set as the draw is recorded)
         uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
         f.stencil[0] = f.stencil[2] = stencil & 0xFFFFFF;
@@ -6122,7 +6334,9 @@ void Impl::draw(const gpu::Draw &d) {
             f.poly_offset[0] = f.poly_offset[2] = offsets[0];
             f.poly_offset[1] = f.poly_offset[3] = offsets[1];
         }
-        f.poly_offset[0] *= 1.0f / 16.0f, f.poly_offset[2] *= 1.0f / 16.0f;
+        // (the slope's per host pixel: the depth changes 1/scale as much
+        // from one to the next, Xenia's poly_offset_scale_factor)
+        f.poly_offset[0] *= scale_.factor() / 16.0f, f.poly_offset[2] *= scale_.factor() / 16.0f;
         std::memcpy(f.blend_constant, &regs_[r::RB_BLEND_RED], 16);
     }
     // (the targets take over their EDRAM tiles below, once the draw's lowest
@@ -6294,6 +6508,9 @@ void Impl::draw(const gpu::Draw &d) {
     uint32_t color_control = regs_[r::RB_COLORCONTROL];
     if (color_control & 8) sys.flags[0] = 8 | (color_control & 7);
     sys.values[0] = as_float(regs_[r::RB_ALPHA_REF]);
+    // the host pixel's size in console pixels: the pixel parameters' position
+    // is the console's pixel (shader_translator.cpp's param_gen)
+    sys.values[3] = 1.0f / scale_.factor();
     uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
     sys.flags[1] = ((vte >> 10) & 1) | ((vte >> 8) & 1) << 1 | ((vte >> 9) & 1) << 2;
     // the pixel parameters (SQ_PROGRAM_CNTL's param_gen) into the
@@ -6861,9 +7078,10 @@ void Impl::draw(const gpu::Draw &d) {
     Pass pass;
     for (uint32_t i = 0; i < 4; i++) pass.colors[i] = colors[i] ? colors[i]->view : VK_NULL_HANDLE;
     pass.depth = depth ? depth->view : VK_NULL_HANDLE;
-    pass.width = export_only ? 1 : width, pass.height = export_only ? 1 : height;
+    pass.width = export_only ? 1 : host_width, pass.height = export_only ? 1 : host_height;
     if (fsi_ && !export_only)
-        pass.width = pass.height = 8192, pass.samples = uint32_t(multisample.rasterizationSamples);
+        pass.width = pass.height = std::min(scale_.up(8192), max_image_),
+        pass.samples = uint32_t(multisample.rasterizationSamples);
     VkCommandBuffer c = begin_pass(pass, colors, depth);
     if (pipe != bound_pipeline_) {
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -6889,8 +7107,22 @@ void Impl::draw(const gpu::Draw &d) {
     uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
     if (!((depth_control >> 7) & 1)) stencil_bf = stencil;
     const float *blend_constants = reinterpret_cast<const float *>(&regs_[r::RB_BLEND_RED]);
-    vkCmdSetViewport(c, 0, 1, &viewport.viewport);
-    vkCmdSetScissor(c, 0, 1, &scissor);
+    // at the resolution scale (Xenia's GetHostViewportInfo and GetScissor
+    // with draw_resolution_scale): the viewport's bounds and the scissor's
+    // edges in host pixels, the NDC transform the same
+    VkViewport host_viewport_rect = viewport.viewport;
+    VkRect2D host_scissor_rect = scissor;
+    if (!scale_.one()) {
+        const float f = scale_.factor();
+        host_viewport_rect.x *= f, host_viewport_rect.y *= f;
+        host_viewport_rect.width *= f, host_viewport_rect.height *= f;
+        const uint32_t x0 = scale_.down(uint32_t(scissor.offset.x)), y0 = scale_.down(uint32_t(scissor.offset.y));
+        host_scissor_rect.offset = {int32_t(x0), int32_t(y0)};
+        host_scissor_rect.extent = {scale_.down(uint32_t(scissor.offset.x) + scissor.extent.width) - x0,
+                                    scale_.down(uint32_t(scissor.offset.y) + scissor.extent.height) - y0};
+    }
+    vkCmdSetViewport(c, 0, 1, &host_viewport_rect);
+    vkCmdSetScissor(c, 0, 1, &host_scissor_rect);
     vkCmdSetBlendConstants(c, blend_constants);
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, stencil & 0xFF);
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, stencil_bf & 0xFF);
@@ -6965,7 +7197,7 @@ void Impl::draw(const gpu::Draw &d) {
             scale = offsets[0], offset = offsets[1];
         }
         float constant = offset * (depth && depth->format == 1 ? float(1u << 24) : float((1u << 24) - 1));
-        vkCmdSetDepthBias(c, constant, 0.0f, scale * (1.0f / 16.0f));
+        vkCmdSetDepthBias(c, constant, 0.0f, scale * (scale_.factor() / 16.0f));
     }
     if (options_.gpu_timing_draws) {
         // each draw timed on its own, counted to its shaders
@@ -7136,7 +7368,12 @@ void Impl::resolve() {
                     break;
                 }
             }
-            VkClearRect rect{{{int32_t(x), int32_t(y)}, {std::min(w, t->width - std::min(x, t->width)), std::min(h, t->height - std::min(y, t->height))}}, 0, 1};
+            // (at the resolution scale: x, y, w and h are multiples of 8)
+            const uint32_t cw = std::min(w, t->width - std::min(x, t->width)), ch = std::min(h, t->height - std::min(y, t->height));
+            VkClearRect rect{{{int32_t(scale_.down(x)), int32_t(scale_.down(y))},
+                              {std::min(scale_.down(cw), t->host_width - std::min(scale_.down(x), t->host_width)),
+                               std::min(scale_.down(ch), t->host_height - std::min(scale_.down(y), t->host_height))}},
+                             0, 1};
             if (!rect.rect.extent.width || !rect.rect.extent.height) continue;
             VkCommandBuffer c = outside();
             gpu_mark("resolves: clears");
@@ -7146,7 +7383,7 @@ void Impl::resolve() {
             attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            rendering.renderArea = {{0, 0}, {t->width, t->height}};
+            rendering.renderArea = {{0, 0}, {t->host_width, t->host_height}};
             rendering.layerCount = 1;
             if (t->depth) {
                 rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
@@ -7213,6 +7450,149 @@ uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2], u
     return count;
 }
 
+// The scaled resolve kept for a resolve no scaled texture is over (Impl::
+// ScaledResolve): one of the resolves' targets, 32- or 64-bit texels, from the
+// texture's corner, no smaller than the minimum scalable dimension; at most
+// eight kept. Null when the resolve is not one.
+Impl::ScaledResolve *Impl::scaled_resolve(const resolve::Info &info, const std::vector<Range> &written) {
+    const uint32_t bytes = texture::format_block(info.dest_format).bytes;
+    if (info.depth || info.dest_array || !info.texture_base || (bytes != 4 && bytes != 8) ||
+        info.texel_x0 + info.dest_x || info.texel_y0 + info.dest_y || !scalable(info.width, info.height, min_scalable_) ||
+        written.empty() || scaled_resolves_.size() >= 8)
+        return nullptr;
+    const uint32_t wide = bytes == 8 ? 1 : 0;
+    const VkFormat format = wide ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
+    ScaledResolve kept;
+    kept.image = d_.create_image(VK_IMAGE_TYPE_2D, format, {scale_.up(info.width), scale_.up(info.height), 1}, 1, 1,
+                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (!kept.image.image) return nullptr;
+    uint32_t slot = UINT32_MAX;
+    if (!free_targets_[wide].empty()) {
+        slot = free_targets_[wide].back();
+        free_targets_[wide].pop_back();
+    } else if (next_target_[wide] < RESOLVE_TARGETS) {
+        slot = next_target_[wide]++;
+    }
+    kept.view = slot == UINT32_MAX ? VK_NULL_HANDLE
+                                   : make_view(kept.image.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, {}, 1, 1, false);
+    if (!kept.view) {
+        if (slot != UINT32_MAX) free_targets_[wide].push_back(slot);
+        d_.destroy(kept.image);
+        return nullptr;
+    }
+    VkDescriptorImageInfo descriptor{VK_NULL_HANDLE, kept.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = target_set_;
+    write.dstBinding = wide;
+    write.dstArrayElement = slot;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &descriptor;
+    vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+    begin_image(outside(), kept.image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    kept.target = (slot + 1) | wide << 7;
+    kept.pitch = info.dest_pitch, kept.endian = info.dest_endian;
+    kept.width = info.width, kept.height = info.height;
+    kept.low = UINT32_MAX, kept.high = 0;
+    for (auto [start, end] : written) kept.low = std::min(kept.low, start), kept.high = std::max(kept.high, end);
+    kept.swap = report_.swaps;
+    return &(scaled_resolves_[info.texture_base & 0x1FFFFFFF] = kept);
+}
+
+// The scaled resolves kept over memory something else writes, gone once the
+// work recorded so far is done
+void Impl::drop_scaled_resolves(const std::vector<Range> &written, bool all) {
+    for (auto it = scaled_resolves_.begin(); it != scaled_resolves_.end();) {
+        bool hit = all;
+        for (auto [start, end] : written) hit |= start < it->second.high && it->second.low < end;
+        if (!hit) {
+            ++it;
+            continue;
+        }
+        ScaledResolve old = it->second;
+        it = scaled_resolves_.erase(it);
+        cmd();
+        slots_[current_].after.push_back([this, old]() mutable {
+            release_target(old.target, old.view);
+            d_.destroy(old.image);
+        });
+    }
+}
+
+// A resolve target made the resolution scale's (docs/renderer.md,
+// "Resolution scale"): a new image of the same format width x height console
+// texels at the scale, with its own place in the resolves' table; the old
+// one, its views and its place go once the submission being recorded is
+// done, as texture() replaces an image. Its views are made again as draws
+// ask. The resolve that calls it writes every texel.
+void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
+    const uint32_t wide = (t.target >> 7) & 1;
+    const VkFormat target_format = wide ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
+    vk::Image image = d_.create_image(
+        VK_IMAGE_TYPE_2D, t.image.format, {scale_.up(width), scale_.up(height), 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_STORAGE_BIT,
+        VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, t.signed_format, target_format);
+    if (!image.image) return;
+    uint32_t slot = UINT32_MAX;
+    if (!free_targets_[wide].empty()) {
+        slot = free_targets_[wide].back();
+        free_targets_[wide].pop_back();
+    } else if (next_target_[wide] < RESOLVE_TARGETS) {
+        slot = next_target_[wide]++;
+    }
+    VkImageView target_view = VK_NULL_HANDLE;
+    if (slot != UINT32_MAX) {
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = image.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = target_format;
+        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageViewUsageCreateInfo view_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        view_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        view.pNext = &view_usage;
+        if (vkCreateImageView(dev_, &view, nullptr, &target_view) != VK_SUCCESS) target_view = VK_NULL_HANDLE;
+    }
+    if (!target_view) {
+        if (slot != UINT32_MAX) free_targets_[wide].push_back(slot);
+        d_.destroy(image);
+        return;
+    }
+    VkDescriptorImageInfo descriptor{VK_NULL_HANDLE, target_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = target_set_;
+    write.dstBinding = wide;
+    write.dstArrayElement = slot;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &descriptor;
+    vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+    // the old image, views and place, once the work recorded so far is done
+    vk::Image old = t.image;
+    std::vector<TextureView> old_views = std::move(t.views);
+    const uint32_t old_kind = t.kind, old_target = t.target;
+    const VkImageView old_target_view = t.target_view;
+    report_.texture_views -= old_views.size();
+    cmd();
+    slots_[current_].after.push_back([this, old, old_views, old_kind, old_target, old_target_view]() mutable {
+        for (const TextureView &v : old_views) {
+            release_index(old_kind, v.index);
+            vkDestroyImageView(dev_, v.view, nullptr);
+        }
+        release_target(old_target, old_target_view);
+        d_.destroy(old);
+    });
+    t.views.clear();
+    const VkDeviceSize bytes = image_bytes(image);
+    count_texture_bytes(bytes, t.bytes);
+    t.bytes = bytes;
+    t.image = image;
+    t.target = (slot + 1) | wide << 7, t.target_view = target_view;
+    t.scaled = true;
+    begin_image(outside(), image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    report_.textures_scaled++;
+}
+
 // The copy on the GPU: the rectangle (resolved to one sample per pixel when
 // multisampled) copied into a scratch buffer as the host keeps it, then
 // written into the mirror as the destination says (resolve.comp, resolve.cpp's
@@ -7268,8 +7648,10 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         const char *v = std::getenv("XF_RESOLVE_FROM_IMAGE");
         return v && std::string(v) == "1";
     }();
+    // (and at a resolution scale, always: the resolve reads EDRAM's scaled
+    // samples)
     const bool from_edram =
-        !from_image || fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear);
+        !from_image || fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear) || !scale_.one();
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!from_edram && !grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
@@ -7315,7 +7697,9 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // as EDRAM's bits would be (Xenia resolves from its EDRAM dump, which
     // follows depth_float24_round; a depth converted in the pixel shader is
     // exact either way)
-    p.depth_round = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader;
+    p.flags = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader ? 1u : 0u;
+    // EDRAM read at the resolution scale, over the console's pixels
+    p.flags |= scale_.q4 << 8 | 4u << 16;
     p.raw = resolve::raw_copy(info);
     p.dest_base = info.dest_base, p.dest_pitch = info.dest_pitch, p.dest_height = info.dest_height;
     p.dest_x = info.dest_x, p.dest_y = info.dest_y, p.dest_slice = info.dest_slice, p.dest_array = info.dest_array;
@@ -7325,16 +7709,39 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     p.exp_factor = std::ldexp(1.0f, info.dest_exp_bias);
     Texture *targets[2];
     uint32_t extra_rows = 0;
+    // the textures fed at the console's size (written by the pass over its
+    // pixels) and at the resolution scale (by a pass of their own after it)
+    uint32_t target_1x = 0, target_scaled = 0;
     if (uint32_t count = resolve_targets(info, targets, extra_rows)) {
-        p.target = (targets[0]->target & 0xFF) | (count > 1 ? (targets[1]->target & 0x7F) << 8 : 0) |
-                   (info.texel_x0 >> 5) << 16 | ((info.texel_y0 + extra_rows) >> 5) << 24;
+        const uint32_t corner = (info.texel_x0 >> 5) << 16 | ((info.texel_y0 + extra_rows) >> 5) << 24;
+        uint32_t places[2] = {0, 0};
         for (uint32_t k = 0; k < count; k++) {
-            use(*targets[k], submission_serial() + 1);
+            Texture &t = *targets[k];
+            use(t, submission_serial() + 1);
+            // Made the resolution scale's when this resolve writes all of it
+            // and both are no smaller than the minimum scalable dimension
+            // (RPCS3's rule): the resolve then writes every scaled texel.
+            const uint32_t tw = (t.key[2] & 0x1FFF) + 1, th = ((t.key[2] >> 13) & 0x1FFF) + 1;
+            if (!scale_.one() && !t.scaled && !extra_rows && info.texel_x0 + info.dest_x == 0 &&
+                info.texel_y0 + info.dest_y == 0 && info.width >= tw && info.height >= th &&
+                scalable(tw, th, min_scalable_) && scalable(info.width, info.height, min_scalable_))
+                scale_texture(t, tw, th);
             // current again if it was stale: the resolve wrote all of it
-            if (targets[k]->stale) targets[k]->stale = false, targets[k]->load_why = LoadWhy::CpuWritten;
+            if (t.stale) t.stale = false, t.load_why = LoadWhy::CpuWritten;
+            uint32_t &into = t.scaled ? target_scaled : target_1x;
+            into |= (t.target & (places[t.scaled] ? 0x7Fu : 0xFFu)) << (8 * places[t.scaled]++);
         }
+        if (target_1x) target_1x |= corner;
+        if (target_scaled) target_scaled |= corner | (targets[0]->target & 0x80u);
         report_.resolve_targets_written += count;
     }
+    // at a resolution scale, a resolve no scaled texture is over keeps its
+    // scaled texels for the texture a later draw makes there
+    drop_scaled_resolves(written);
+    if (!scale_.one() && !target_scaled && resolve_targets_)
+        if (ScaledResolve *kept = scaled_resolve(info, written))
+            target_scaled = (kept->target & 0xFFu) | (info.texel_x0 >> 5) << 16 | (info.texel_y0 >> 5) << 24;
+    p.target = target_1x;
     if (from_edram) {
         p.edram = 1;
         p.edram_base = source.base, p.edram_pitch = source.pitch_tiles, p.msaa = source.msaa;
@@ -7348,6 +7755,15 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 2, resolve_sets, 0, nullptr);
     vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
+    if (target_scaled) {
+        // the scaled textures alone, over their texels at the resolution scale
+        ResolveConstants scaled = p;
+        scaled.target = target_scaled;
+        scaled.flags = (p.flags & 1u) | 2u | scale_.q4 << 8 | scale_.q4 << 16;
+        scaled.width = scale_.down(w), scaled.height = scale_.down(h);
+        vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scaled), &scaled);
+        vkCmdDispatch(c, (scaled.width + 7) / 8, (scaled.height + 7) / 8, 1);
+    }
     full_barrier(c);
 
     gpu_written(written);
@@ -7622,6 +8038,11 @@ void Impl::swap() {
     end_query();
     zpd_current_ = 0;
     uint64_t number = report_.swaps++;
+    // the scaled resolves no texture took within two swaps go
+    std::vector<Range> unused;
+    for (const auto &[base, kept] : scaled_resolves_)
+        if (kept.swap + 2 < report_.swaps) unused.push_back({kept.low, kept.high});
+    if (!unused.empty()) drop_scaled_resolves(unused);
     {
         // hitches: the frame's time making pipelines on this thread, and the
         // time since the last swap
