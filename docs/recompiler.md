@@ -520,6 +520,88 @@ Here nothing is named by hand: the game's own XAPI code runs generated, the
 kernel export it ends in does the host side, and discovery finds setjmp's
 callers and the catch continuations.
 
+## The lockstep check
+
+The interpreter checks the generated code while a game runs
+(`xenoforge/lockstep.h`, `src/kernel/lockstep.cpp`): `boot --lockstep
+82001234,... --lockstep-sample N`, or `XF_LOCKSTEP` and `XF_LOCKSTEP_SAMPLE`
+for the player. A chosen function, or one call in N to any generated
+function, runs twice from the same registers and memory:
+
+1. **the interpreter first**, on a copy of the context and a private view of
+   the guest memory (`Memory::PrivateView`: the section mapped again copy on
+   write, in placeholders on Windows and over a reserved range on POSIX), so
+   nothing it stores is seen by the game or another thread. Every call
+   inside is interpreted too: the check is of the call's whole tree. Its
+   observer (`interpret_observed`) records each store and load
+   (`store_extent`, `load_extent`) with the bytes it read, and which
+   instruction last wrote each register;
+2. **then the generated code, for real**, as it always runs.
+
+The comparison is at the call's return or at the first import, whichever
+comes first. An import ends a *segment*: it runs once, for real, from the
+generated code's state, and the next segment starts from what it left (the
+interpreter again on a fresh view, then the generated code on). So a call
+is checked whole while the kernel sees each import once, and nothing is run
+twice for real. mftb's reads in a segment are the interpreter's, replayed to
+the generated code. Compared: every register (r, f and v bit for bit, CR,
+LR, CTR, XER, FPSCR, VSCR, MSR, the reservation) and every byte the
+interpreter stored, against the guest memory as the generated code left it.
+A difference is printed with the instruction that wrote the interpreter's
+value:
+
+    lockstep: mismatch 1 in the call to 0x3000D040: the segment from 0x3000D050 (after
+    xboxkrnl!KeQueryPerformanceFrequency) to the call's return, 10 instructions interpreted
+      r3     generated 0x0000000002FAF087, interpreter 0x0000000002FAF086 (the interpreter's
+             from 0x3000D000: addi r3, r3, 0x1)
+      [3000F003] 1 byte: generated 87, interpreter 86 (the interpreter's from 0x3000D004: stw r3, 0x0(r4))
+
+Choices and limits:
+
+- **Where a check starts**: a call the kernel makes to generated code
+  (`Kernel::try_call`: a dispatch, an indirect call, a thread's start, a call
+  interpreted code makes). Generated functions call each other directly, so a
+  chosen function only ever called that way is checked inside a caller's
+  tree (choose a caller, or sample).
+- **Other writers**: another thread, a device or the kernel's clock in
+  memory may change what the call reads between the two runs. A difference
+  after a byte the interpreter read (and had not stored) changed, by the time
+  the generated code started or by the comparison, or in a byte an atomic
+  update (`stwcx.`, `stdcx.`) left, is counted apart ("different after
+  memory they read changed"), not as a mismatch. The deterministic mode will
+  remove these.
+- **Given up, counted**: an MMIO access, a trap, a stack switch, an unwind,
+  the step limit (4 million instructions a segment), what the interpreter
+  cannot run. A store the generated code makes where the interpreter stored
+  nothing is not seen; the physical windows do not alias inside a private
+  view once it writes them.
+- **Cost**: four private views shared by the threads (each holds commit
+  charge for 4.5 GB on Windows), taken only while a segment's interpreter
+  runs. El Chavo Kart, 30 s at one call in 100: 30 swaps a second fall to 29.
+
+El Chavo Kart (2026-11-07, one call in 100, 30 s): 200,455 calls, 283,219
+segments, 0 mismatches, 20 differences after memory read changed (the
+kernel's time stamp bundle, audio positions), 130 given up at MMIO; one in 5,
+40 s: 396,431 segments, 0 mismatches.
+
+## PPC in the host debugger
+
+`xfrecomp emit ... --listing` writes `functions_K.ppc` beside each
+`functions_K.cpp`: a line per function (`xf_82640868:`) and a line per
+instruction (address, word, disassembly). In the C++, a `#line` directive
+before each instruction's code points at its line there, and one before each
+function at its name, so the debug information (CodeView or DWARF) maps the
+generated code to the listing: Visual Studio or WinDbg step PPC instructions
+and set breakpoints on them (build the generated code with `-g` and little
+optimization: `-O0` or `-Og` keep one instruction's code apart from the
+next). The listing is made from the emitter's own comment before each
+instruction, after the emission, so the emitter and the game library's
+interface version stay as they are; `xfbuild` does not offer it (its
+emission is the recompile step's, whose text is in the interface's digest).
+`tools/xenoforge.natvis` shows `xf::ppc::Context` as the PPC registers (the
+condition register by field, the vector registers by word) in the watch
+windows: the linker's `/NATVIS:`, or WinDbg's `.nvload`.
+
 ## Steps
 
 1. Decoder and disassembler, checked against Xenia's (above).

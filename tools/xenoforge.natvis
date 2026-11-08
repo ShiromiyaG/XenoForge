@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The guest context's registers in Visual Studio's and WinDbg's watch windows
+  (docs/recompiler.md, "PPC in the host debugger"): xf::ppc::Context
+  (ppc_context.h) as the PPC registers, the condition register as its eight
+  fields, the vector registers in guest word order. Load it with the linker's
+  /NATVIS:tools/xenoforge.natvis (lld-link takes it too), or put it in
+  Visual Studio's Visualizers directory; WinDbg: .nvload tools\xenoforge.natvis
+-->
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+  <Type Name="xf::ppc::Vec128">
+    <DisplayString>{u32[0],X} {u32[1],X} {u32[2],X} {u32[3],X}</DisplayString>
+    <Expand>
+      <Item Name="words">u32,x</Item>
+      <Item Name="floats">f32</Item>
+    </Expand>
+  </Type>
+  <Type Name="xf::ppc::Context">
+    <DisplayString>pc={pc,X} lr={(unsigned)lr,X} r1={(unsigned)r[1],X} r3={r[3],X}</DisplayString>
+    <Expand>
+      <Item Name="pc">pc,X</Item>
+      <Item Name="lr">lr,X</Item>
+      <Item Name="ctr">ctr,X</Item>
+      <Synthetic Name="cr">
+        <DisplayString>{cr[0]}{cr[1]}{cr[2]}{cr[3]} {cr[4]}{cr[5]}{cr[6]}{cr[7]} {cr[8]}{cr[9]}{cr[10]}{cr[11]} {cr[12]}{cr[13]}{cr[14]}{cr[15]} {cr[16]}{cr[17]}{cr[18]}{cr[19]} {cr[20]}{cr[21]}{cr[22]}{cr[23]} {cr[24]}{cr[25]}{cr[26]}{cr[27]} {cr[28]}{cr[29]}{cr[30]}{cr[31]} (lt gt eq so)</DisplayString>
+        <Expand>
+          <Item Name="cr0">cr[0]*8 + cr[1]*4 + cr[2]*2 + cr[3],x</Item>
+          <Item Name="cr1">cr[4]*8 + cr[5]*4 + cr[6]*2 + cr[7],x</Item>
+          <Item Name="cr2">cr[8]*8 + cr[9]*4 + cr[10]*2 + cr[11],x</Item>
+          <Item Name="cr3">cr[12]*8 + cr[13]*4 + cr[14]*2 + cr[15],x</Item>
+          <Item Name="cr4">cr[16]*8 + cr[17]*4 + cr[18]*2 + cr[19],x</Item>
+          <Item Name="cr5">cr[20]*8 + cr[21]*4 + cr[22]*2 + cr[23],x</Item>
+          <Item Name="cr6">cr[24]*8 + cr[25]*4 + cr[26]*2 + cr[27],x</Item>
+          <Item Name="cr7">cr[28]*8 + cr[29]*4 + cr[30]*2 + cr[31],x</Item>
+        </Expand>
+      </Synthetic>
+      <Synthetic Name="xer">
+        <DisplayString>so={xer_so} ov={xer_ov} ca={xer_ca} bc={xer_bc}</DisplayString>
+      </Synthetic>
+      <Item Name="fpscr">fpscr,X</Item>
+      <Synthetic Name="r">
+        <DisplayString>r0-r31</DisplayString>
+        <Expand>
+          <IndexListItems>
+            <Size>32</Size>
+            <ValueNode>r[$i],X</ValueNode>
+          </IndexListItems>
+        </Expand>
+      </Synthetic>
+      <Synthetic Name="f">
+        <DisplayString>f0-f31</DisplayString>
+        <Expand>
+          <ArrayItems>
+            <Size>32</Size>
+            <ValuePointer>f</ValuePointer>
+          </ArrayItems>
+        </Expand>
+      </Synthetic>
+      <Synthetic Name="v">
+        <DisplayString>v0-v127</DisplayString>
+        <Expand>
+          <ArrayItems>
+            <Size>128</Size>
+            <ValuePointer>v</ValuePointer>
+          </ArrayItems>
+        </Expand>
+      </Synthetic>
+      <Item Name="vscr_sat">vscr_sat</Item>
+      <Item Name="msr">msr,X</Item>
+      <Item Name="reserved">reserved</Item>
+      <Item Name="reserve_address">reserve_address,X</Item>
+      <Item Name="base">(void*)base</Item>
+    </Expand>
+  </Type>
+</AutoVisualizer>

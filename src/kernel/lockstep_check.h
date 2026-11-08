@@ -7,15 +7,18 @@
 #include "xenoforge/kernel.h"
 #include "xenoforge/lockstep.h"
 
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace xf::kernel {
 
 class Lockstep {
-public:
+  public:
     Lockstep(Kernel &k, const LockstepOptions &options);
     // whether a private view of the guest memory can be made
     bool usable(std::string &error);
@@ -37,11 +40,16 @@ public:
 
     struct Check; // a thread's call being checked (lockstep.cpp)
 
-private:
+  private:
     void begin_segment(Check &check, ppc::Context &c, uint32_t pc);
     void compare(Check &check, ppc::Context &c, const Import *import);
     void give_up(const std::string &why);
     Check *current(ppc::Context &c);
+    // The private views, a few shared by the threads: one is needed only
+    // while a segment's interpreter runs, and each costs the host commit
+    // charge (a copy-on-write view of 4.5 GB on Windows).
+    std::unique_ptr<Memory::PrivateView> acquire_view(std::string &error);
+    void release_view(std::unique_ptr<Memory::PrivateView> view); // clean again (null: one dropped)
 
     Kernel &k_;
     LockstepOptions options_;
@@ -50,6 +58,10 @@ private:
     ppc::System system_;  // the interpreter's, in a segment
     mutable std::mutex mutex_;
     LockstepCounts counts_; // under mutex_
+    std::mutex views_mutex_;
+    std::condition_variable view_freed_;
+    std::vector<std::unique_ptr<Memory::PrivateView>> free_views_; // under views_mutex_
+    size_t views_ = 0;                                             // made and not dropped
 };
 
 } // namespace xf::kernel

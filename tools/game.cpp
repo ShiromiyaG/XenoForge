@@ -216,7 +216,8 @@ bool open(const Options &options, Game &g, std::string &error) {
         kernel::LockstepOptions lockstep;
         lockstep.functions = options.lockstep, lockstep.sample = options.lockstep_sample;
         std::string why;
-        bool wanted = !lockstep.functions.empty() || lockstep.sample || kernel::lockstep_options_from_env(lockstep, why);
+        bool wanted =
+            !lockstep.functions.empty() || lockstep.sample || kernel::lockstep_options_from_env(lockstep, why);
         if (!why.empty()) return error = why, false;
         if (wanted && g.generated_functions) {
             if (!k.enable_lockstep(lockstep, error)) return error = "lockstep: " + error, false;

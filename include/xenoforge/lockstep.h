@@ -1,4 +1,4 @@
-// The lockstep check (docs/runtime.md, "The lockstep check"; docs/plan.md,
+// The lockstep check (docs/recompiler.md, "The lockstep check"; docs/plan.md,
 // "Debugging"): the interpreter checks the generated code. A call the
 // kernel makes to generated code (Kernel::try_call: a dispatch, a thread's
 // start, a call interpreted code makes), chosen by address or one in N, runs
@@ -40,7 +40,7 @@ namespace xf::ppc {
 // before it runs, decoded, and after it ran (a call the system ran is
 // inside the bl's run).
 class Observer {
-public:
+  public:
     virtual ~Observer() = default;
     virtual void before(Context &c, uint32_t pc, Opcode op, Instr i) = 0;
     virtual void after(Context &c, uint32_t pc, Opcode op) = 0;
@@ -54,6 +54,9 @@ Stopped interpret_observed(Context &c, uint32_t pc, uint32_t until, uint64_t max
 // from the registers before it runs; false for one that stores nothing. A
 // vector store gives its aligned 16 bytes, dcbz and dcbz128 the 128-byte line.
 bool store_extent(const Context &c, Opcode op, Instr i, uint32_t *address, uint32_t *size);
+// The same for the bytes an instruction is about to load (a vector load: its
+// aligned 16 bytes).
+bool load_extent(const Context &c, Opcode op, Instr i, uint32_t *address, uint32_t *size);
 
 } // namespace xf::ppc
 
@@ -67,12 +70,15 @@ struct LockstepOptions {
 };
 
 struct LockstepCounts {
-    uint64_t calls = 0;     // calls checked
-    uint64_t segments = 0;  // segments compared
-    uint64_t matched = 0;   // of them, the same
+    uint64_t calls = 0;    // calls checked
+    uint64_t segments = 0; // segments compared
+    uint64_t matched = 0;  // of them, the same
     uint64_t mismatched = 0;
+    // different, but a byte the interpreter read (and did not store) changed
+    // meanwhile: another thread's or a device's write, not the recompiler's
+    uint64_t raced = 0;
     std::map<std::string, uint64_t> given_up; // segments not compared, by why
-    std::map<uint32_t, uint64_t> mismatches;   // by the address the segment started at
+    std::map<uint32_t, uint64_t> mismatches;  // by the address the segment started at
 };
 
 // XF_LOCKSTEP=<address,...> and XF_LOCKSTEP_SAMPLE=N, as boot's --lockstep and

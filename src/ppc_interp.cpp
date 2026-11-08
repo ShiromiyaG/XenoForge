@@ -150,4 +150,38 @@ bool store_extent(const Context &c, Opcode op, Instr i, uint32_t *address, uint3
     }
 }
 
+bool load_extent(const Context &c, Opcode op, Instr i, uint32_t *address, uint32_t *size) {
+    auto reg = [&](uint32_t n) { return n ? c.r[n] : 0; };
+    const uint32_t d = uint32_t(reg(i.D.RA) + uint64_t(ops::exts16(i.D.DS)));
+    const uint32_t ds = uint32_t(reg(i.DS.RA) + uint64_t(ops::exts16(i.DS.DS << 2)));
+    const uint32_t x = uint32_t(reg(i.X.RA) + c.r[i.X.RB]);
+    auto out = [&](uint32_t a, uint32_t n) {
+        *address = a, *size = n;
+        return true;
+    };
+    switch (op) {
+    case Opcode::lbz: case Opcode::lbzu: return out(d, 1);
+    case Opcode::lhz: case Opcode::lhzu: case Opcode::lha: case Opcode::lhau: return out(d, 2);
+    case Opcode::lwz: case Opcode::lwzu: case Opcode::lfs: case Opcode::lfsu: return out(d, 4);
+    case Opcode::lfd: case Opcode::lfdu: return out(d, 8);
+    case Opcode::lmw: return out(d, 4 * (32 - i.D.RT));
+    case Opcode::ld: case Opcode::ldu: return out(ds, 8);
+    case Opcode::lwa: return out(ds, 4);
+    case Opcode::lbzx: case Opcode::lbzux: return out(x, 1);
+    case Opcode::lhzx: case Opcode::lhzux: case Opcode::lhax: case Opcode::lhaux: case Opcode::lhbrx: return out(x, 2);
+    case Opcode::lwzx: case Opcode::lwzux: case Opcode::lwax: case Opcode::lwaux: case Opcode::lwbrx:
+    case Opcode::lwarx: case Opcode::lfsx: case Opcode::lfsux: return out(x, 4);
+    case Opcode::ldx: case Opcode::ldux: case Opcode::ldbrx: case Opcode::ldarx:
+    case Opcode::lfdx: case Opcode::lfdux: return out(x, 8);
+    case Opcode::lswi: return out(uint32_t(reg(i.X.RA)), i.X.RB ? i.X.RB : 32);
+    case Opcode::lswx: return out(x, c.xer_bc & 0x7F);
+    case Opcode::lvebx: case Opcode::lvehx: case Opcode::lvewx: case Opcode::lvewx128:
+    case Opcode::lvx: case Opcode::lvx128: case Opcode::lvxl: case Opcode::lvxl128:
+    case Opcode::lvlx: case Opcode::lvlx128: case Opcode::lvlxl: case Opcode::lvlxl128:
+    case Opcode::lvrx: case Opcode::lvrx128: case Opcode::lvrxl: case Opcode::lvrxl128:
+        return out(x & ~15u, 16);
+    default: return false;
+    }
+}
+
 } // namespace xf::ppc

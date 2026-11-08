@@ -19,7 +19,6 @@ namespace {
 
 uint32_t code = 0, thunk = 0;
 bool wrong = false;
-uint32_t time_reads = 0;
 
 uint32_t bl(uint32_t from, uint32_t to) { return 0x48000001u | ((to - from) & 0x03FFFFFCu); }
 
@@ -51,8 +50,12 @@ void write_program(KernelHarness &h) {
     h.k->add_thunk(thunk = h.alloc(0x10), "xboxkrnl", "KeQueryPerformanceFrequency");
     const uint32_t a[] = {0x38630001, 0x90640000, 0x4E800020};
     for (uint32_t n = 0; n < 3; n++) h.k->store32(code + 4 * n, a[n]);
-    const uint32_t b[] = {0x7D8802A6, 0x9181FFF8, 0x9421FFA0, bl(code + 0x4C, thunk), 0x38630005,
-                          bl(code + 0x54, code), 0x7CAC42E6, 0x38210060, 0x8181FFF8, 0x7D8803A6, 0x4E800020};
+    const uint32_t b[] = {0x7D8802A6, 0x9181FFF8,
+                          0x9421FFA0, bl(code + 0x4C, thunk),
+                          0x38630005, bl(code + 0x54, code),
+                          0x7CAC42E6, 0x38210060,
+                          0x8181FFF8, 0x7D8803A6,
+                          0x4E800020};
     for (uint32_t n = 0; n < 11; n++) h.k->store32(code + 0x40 + 4 * n, b[n]);
 }
 
@@ -97,7 +100,8 @@ void lockstep(KernelHarness &h) {
     CHECK(uint32_t(h.c->r[3]) == 50'000'007);
     CHECK(h.k->load32(out) == 50'000'007);
     std::string report = h.k->lockstep_report();
-    CHECK(report.find("2 calls checked, 4 segments compared, 3 the same, 1 different") != std::string::npos);
+    CHECK(report.find("2 calls checked, 4 segments compared, 3 the same, 1 different, 0 different after") !=
+          std::string::npos);
 
     // a call not chosen runs unchecked
     h.c->r[3] = 0, h.c->r[4] = out;
@@ -107,7 +111,10 @@ void lockstep(KernelHarness &h) {
 
 void sampling() {
     KernelHarness h;
-    if (!h.init()) return (void)CHECK(false);
+    if (!h.init()) {
+        CHECK(false);
+        return;
+    }
     write_program(h);
     static xf::ppc::GeneratedFunction table[2];
     table[0] = {code, gen_a}, table[1] = {code + 0x40, gen_b};
@@ -135,7 +142,8 @@ void extents() {
     for (uint32_t k = 0; k < xf::ppc::OPCODE_COUNT; k++) {
         auto op = xf::ppc::Opcode(k);
         const xf::ppc::OpcodeInfo &info = xf::ppc::info(op);
-        bool stores = info.group == 'm' && (std::strncmp(info.name, "st", 2) == 0 || std::strncmp(info.name, "dcbz", 4) == 0);
+        bool stores =
+            info.group == 'm' && (std::strncmp(info.name, "st", 2) == 0 || std::strncmp(info.name, "dcbz", 4) == 0);
         uint32_t address = 0, size = 0;
         // RT 3, RA 4, RB 5, D 8
         xf::ppc::Instr i{info.opcode | 3u << 21 | 4u << 16 | 5u << 11 | 8u};

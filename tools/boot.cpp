@@ -69,8 +69,8 @@ int main(int argc, char **argv) {
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
                         "[--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
-                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] [--crash-dir <dir>] "
-                        "[--lockstep <address,...>] [--lockstep-sample N]\n";
+                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
+                        "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];

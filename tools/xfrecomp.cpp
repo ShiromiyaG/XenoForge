@@ -17,7 +17,7 @@
 // out/ppc_tests_0..N-1.cpp and ppc_tests_table.cpp for ppc_recompiled_test:
 // every test label a function as long as the code up to the next label.
 //
-//   xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] [--no-pointers]
+//   xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] [--no-pointers] [--listing]
 //
 // writes the generated code of every executable on the disc (each file that
 // is an XEX2 executable, but title updates and the system update's), or of
@@ -30,7 +30,10 @@
 // module's table for the game library (xf_modules). A file is written only
 // when its text changes, so the build after a discovery fix compiles the
 // files that fix touched. Game code: the out dir stays outside the
-// repository.
+// repository. --listing writes functions_K.ppc beside each functions_K.cpp
+// (each instruction's address, word and disassembly) and #line directives
+// in the C++ pointing at it, so a debugger steps PPC instructions
+// (docs/recompiler.md, "PPC in the host debugger").
 
 #include "xenoforge/disc.h"
 #include "xenoforge/recomp.h"
@@ -43,6 +46,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <regex>
@@ -60,7 +64,7 @@ int usage() {
                          "[--functions <out.tsv>] [--tables <out.tsv>] [--unresolved <out.tsv>] [--no-pointers]\n"
                          "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n"
                          "       xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] "
-                         "[--no-pointers]\n");
+                         "[--no-pointers] [--listing]\n");
     return 2;
 }
 
@@ -156,9 +160,60 @@ int tests(const std::filesystem::path &dir, const std::filesystem::path &out, in
 }
 } // namespace
 
+// The PPC listing of a generated file (--listing; docs/recompiler.md, "PPC in
+// the host debugger"): functions_K.ppc beside functions_K.cpp, a line per
+// instruction (address, word, disassembly) under a line per function, and
+// in the C++ a #line before each instruction's code pointing at its line
+// there, so a debugger steps the generated code by PPC instructions. The
+// emitter's own comment before each instruction ("// 822D28E4 lwz ...") is
+// what is listed, so the emitter, and the game library's interface, stay as
+// they are. Written only when the text changes.
+bool add_listing(const std::filesystem::path &cpp, const std::function<uint32_t(uint32_t)> &word) {
+    std::ifstream in(cpp, std::ios::binary);
+    if (!in) return false;
+    std::filesystem::path ppc = cpp;
+    ppc.replace_extension(".ppc");
+    std::string ppc_name = std::filesystem::absolute(ppc).generic_string();
+    static const std::regex fn_line(R"(^XF_FN\((\w+)\) \{(.*)$)");
+    static const std::regex instr_line(R"(^\s*// ([0-9A-F]{8}) (.*)$)");
+    std::string code, listing, line;
+    uint32_t listed = 0; // lines in the listing so far
+    std::smatch m;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.starts_with("#line ")) continue; // an earlier listing's
+        if (std::regex_match(line, m, fn_line) && !line.ends_with("}")) {
+            if (listed) listing += "\n", listed++;
+            listing += m[1].str() + ":" + m[2].str() + "\n";
+            code += "#line " + std::to_string(++listed) + " \"" + ppc_name + "\"\n" + line + "\n";
+            continue;
+        }
+        if (std::regex_match(line, m, instr_line)) {
+            uint32_t address = uint32_t(std::stoul(m[1].str(), nullptr, 16));
+            char text[32];
+            std::snprintf(text, sizeof(text), "    %08X  %08X  ", address, word(address));
+            listing += text + m[2].str() + "\n";
+            code += line + "\n#line " + std::to_string(++listed) + " \"" + ppc_name + "\"\n";
+            continue;
+        }
+        code += line + "\n";
+    }
+    in.close();
+    auto write = [](const std::filesystem::path &path, const std::string &text) {
+        std::ifstream old(path, std::ios::binary);
+        std::string now((std::istreambuf_iterator<char>(old)), std::istreambuf_iterator<char>());
+        if (old && now == text) return;
+        old.close();
+        std::ofstream(path, std::ios::binary) << text;
+    };
+    write(ppc, listing);
+    write(cpp, code);
+    return true;
+}
+
 // the disc's modules through recomp::emit_modules (recomp_module.cpp), a line each
 int emit(const std::string &input, const std::vector<std::string> &only, const std::filesystem::path &out, int files,
-         const recomp::DiscoverOptions &options) {
+         const recomp::DiscoverOptions &options, bool listing) {
     std::string error;
     std::vector<recomp::ModuleFile> modules;
     if (!recomp::find_modules(input, only, modules, error)) return std::fprintf(stderr, "%s\n", error.c_str()), 1;
@@ -170,6 +225,26 @@ int emit(const std::string &input, const std::vector<std::string> &only, const s
     for (const recomp::EmittedModule &m : emitted)
         std::printf("%-28s %7zu functions, %9llu instructions, %4d files, %4d written (%s)\n", m.path.c_str(),
                     m.functions, (unsigned long long)m.instructions, m.files, m.written, m.directory.c_str());
+    if (listing) {
+        // the words from each module's image, as the emitter read them
+        for (size_t k = 0; k < emitted.size(); k++) {
+            const recomp::EmittedModule &m = emitted[k];
+            auto module = std::find_if(modules.begin(), modules.end(),
+                                       [&](const recomp::ModuleFile &f) { return f.path == m.path; });
+            Xex xex;
+            recomp::Image image;
+            std::string why;
+            bool loaded = module != modules.end() && parse_xex(module->file, xex, why) &&
+                          load_xex_image(module->file, xex, why) && recomp::read_image(xex, image, why);
+            auto word = [&](uint32_t address) { return loaded ? image.word(address) : 0u; };
+            size_t listed = 0;
+            for (const std::string &source : m.sources)
+                if (std::filesystem::path(source).filename().string().starts_with("functions_"))
+                    listed += add_listing(out / source, word);
+            std::printf("%-28s %7zu files listed (.ppc beside each)%s\n", m.path.c_str(), listed,
+                        loaded ? "" : ", without the words");
+        }
+    }
     return 0;
 }
 
@@ -177,15 +252,17 @@ int main(int argc, char **argv) {
     if (argc >= 4 && std::string(argv[1]) == "emit") {
         std::vector<std::string> only;
         int files = 0; // by each module's size
+        bool listing = false;
         recomp::DiscoverOptions options;
         for (int k = 4; k < argc; k++) {
             std::string a = argv[k];
             if (a == "--files" && k + 1 < argc) files = std::max(1, std::atoi(argv[++k]));
             else if (a == "--xex" && k + 1 < argc) only.push_back(argv[++k]);
             else if (a == "--no-pointers") options.scan_pointers = false;
+            else if (a == "--listing") listing = true;
             else return usage();
         }
-        return emit(argv[2], only, argv[3], files, options);
+        return emit(argv[2], only, argv[3], files, options, listing);
     }
     if (argc >= 4 && std::string(argv[1]) == "tests") {
         int files = 16;

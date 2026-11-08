@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace xf::kernel {
@@ -51,6 +52,12 @@ struct Writers {
 
 struct Store {
     uint32_t address, size, pc;
+    uint64_t seq; // the instruction's number in the segment
+};
+// a load: its bytes as the interpreter read them, at `at` in the arena
+struct Load {
+    uint32_t address, size, pc, at;
+    uint64_t seq;
 };
 struct Byte {
     uint32_t address;
@@ -58,19 +65,33 @@ struct Byte {
     uint32_t pc; // the store that left it
 };
 
-// The interpreter's observer in a segment: its stores (before each one runs,
-// with the registers it reads) and the last writer of each register.
+// the host offset of a guest address (Memory::translate's)
+uint64_t host_offset(uint32_t address) { return uint64_t(address) + (address >= 0xE0000000u ? 0x1000u : 0u); }
+
+// the loads' limit on the bytes kept (past it, a difference is not told
+// from memory another thread changed)
+constexpr size_t LOADED_LIMIT = 16u << 20;
+
+// The interpreter's observer in a segment: its stores and loads (before each
+// one runs, with the registers it reads; a load's bytes as it reads them)
+// and the last writer of each register.
 class Recorder final : public ppc::Observer {
-public:
+  public:
     explicit Recorder(const ppc::Context &start) : prev_(std::make_unique<ppc::Context>(start)) {}
 
     void before(ppc::Context &c, uint32_t pc, ppc::Opcode op, ppc::Instr i) override {
         steps++;
         if (op == ppc::Opcode::Invalid || ppc::info(op).group != 'm') return;
         uint32_t address, size;
-        if (ppc::store_extent(c, op, i, &address, &size) && size) {
-            stores.push_back({address, size, pc});
-            stored += size;
+        if (ppc::store_extent(c, op, i, &address, &size)) {
+            if (size) stores.push_back({address, size, pc, steps}), stored += size;
+        } else if (ppc::load_extent(c, op, i, &address, &size) && size && !loads_dropped) {
+            if (arena.size() + size > LOADED_LIMIT) {
+                loads_dropped = true;
+                return;
+            }
+            loads.push_back({address, size, pc, uint32_t(arena.size()), steps});
+            for (uint32_t n = 0; n < size; n++) arena.push_back(c.base[host_offset(address + n)]);
         }
     }
     void after(ppc::Context &c, uint32_t pc, ppc::Opcode op) override {
@@ -97,18 +118,18 @@ public:
     }
 
     std::vector<Store> stores;
+    std::vector<Load> loads;
+    std::vector<uint8_t> arena;
+    bool loads_dropped = false;
     uint64_t stored = 0, steps = 0;
     Writers writers;
 
-private:
+  private:
     std::unique_ptr<ppc::Context> prev_;
 };
 
 // the segments' limit on the bytes stored (past it, given up)
 constexpr uint64_t STORED_LIMIT = 4u << 20;
-
-// the host offset of a guest address (Memory::translate's)
-uint64_t host_offset(uint32_t address) { return uint64_t(address) + (address >= 0xE0000000u ? 0x1000u : 0u); }
 
 // the guest ranges the private view's views cover (memory.cpp's map_info),
 // so a segment's stores drop each view's copies once
@@ -117,10 +138,9 @@ constexpr uint32_t VIEW_STARTS[] = {0x00000000, 0x40000000, 0x7F000000, 0x800000
 
 } // namespace
 
-// a thread's call being checked, and its private view (kept between calls)
+// a thread's call being checked
 struct Lockstep::Check {
     uint64_t generation = 0;
-    std::unique_ptr<Memory::PrivateView> view;
     bool active = false;
     ppc::Context *c = nullptr; // the generated code's
     uint32_t root = 0, until = 0, stack_top = 0;
@@ -132,7 +152,13 @@ struct Lockstep::Check {
     const Import *import = nullptr; // where it stopped (nullptr: the return)
     std::unique_ptr<ppc::Context> ctx = std::make_unique<ppc::Context>();
     Writers writers;
-    std::vector<Byte> bytes;
+    std::vector<Byte> bytes; // what it stored, by address
+    std::vector<Load> loads; // what it loaded, in order
+    std::vector<uint8_t> arena;
+    bool loads_dropped = false;
+    // a byte it read before storing it that another writer changed by the
+    // time the generated code started (address, the load's pc; pc 0: none)
+    uint32_t changed = 0, changed_pc = 0;
     uint64_t steps = 0;
     std::vector<uint64_t> times;
     size_t time_next = 0;
@@ -151,8 +177,10 @@ Lockstep::Lockstep(Kernel &k, const LockstepOptions &options)
     system_.syscall = [](ppc::Context &c) {
         Lockstep &l = *static_cast<Lockstep *>(c.system->owner);
         const Import *import = nullptr;
-        if (auto it = l.k_.by_thunk_.find(c.pc); it != l.k_.by_thunk_.end()) import = &l.k_.imports_[it->second];
-        else import = l.k_.find_thunk(c.pc);
+        if (auto it = l.k_.by_thunk_.find(c.pc); it != l.k_.by_thunk_.end())
+            import = &l.k_.imports_[it->second];
+        else
+            import = l.k_.find_thunk(c.pc);
         if (!import) throw Stop{nullptr, "a system call outside an import's thunk"};
         if (import->name == "KeSetCurrentStackPointers") throw Stop{nullptr, "a stack switch"};
         throw Stop{import, nullptr};
@@ -171,7 +199,13 @@ Lockstep::Lockstep(Kernel &k, const LockstepOptions &options)
     };
 }
 
-bool Lockstep::usable(std::string &error) { return k_.memory().private_view(error) != nullptr; }
+bool Lockstep::usable(std::string &error) {
+    auto view = k_.memory().private_view(error);
+    if (!view) return false;
+    std::lock_guard lock(views_mutex_);
+    free_views_.push_back(std::move(view)), views_++;
+    return true;
+}
 
 Lockstep::Check *Lockstep::current(ppc::Context &c) {
     Check *check = t_check.get();
@@ -240,6 +274,35 @@ void Lockstep::after_import(ppc::Context &c) {
     begin_segment(*check, c, uint32_t(c.lr) & ~3u);
 }
 
+std::unique_ptr<Memory::PrivateView> Lockstep::acquire_view(std::string &error) {
+    constexpr size_t MAX_VIEWS = 4;
+    std::unique_lock lock(views_mutex_);
+    view_freed_.wait(lock, [&] { return !free_views_.empty() || views_ < MAX_VIEWS; });
+    if (!free_views_.empty()) {
+        auto view = std::move(free_views_.back());
+        free_views_.pop_back();
+        return view;
+    }
+    views_++;
+    lock.unlock();
+    auto view = k_.memory().private_view(error);
+    if (!view) {
+        lock.lock();
+        views_--;
+        view_freed_.notify_one();
+    }
+    return view;
+}
+
+void Lockstep::release_view(std::unique_ptr<Memory::PrivateView> view) {
+    std::lock_guard lock(views_mutex_);
+    if (view)
+        free_views_.push_back(std::move(view));
+    else
+        views_--;
+    view_freed_.notify_one();
+}
+
 bool Lockstep::replay_time_base(ppc::Context &c, uint64_t &value) {
     Check *check = current(c);
     if (!check || !check->live || check->import_depth || check->time_next >= check->times.size()) return false;
@@ -250,14 +313,13 @@ bool Lockstep::replay_time_base(ppc::Context &c, uint64_t &value) {
 void Lockstep::begin_segment(Check &check, ppc::Context &c, uint32_t pc) {
     check.live = false;
     check.from = pc, check.import = nullptr, check.times.clear(), check.time_next = 0, check.bytes.clear();
-    if (!check.view) {
-        std::string error;
-        check.view = k_.memory().private_view(error);
-        if (!check.view) return give_up("no private view: " + error);
-    }
+    check.loads.clear(), check.arena.clear();
+    std::string error;
+    std::unique_ptr<Memory::PrivateView> view = acquire_view(error);
+    if (!view) return give_up("no private view: " + error);
     ppc::Context &ic = *check.ctx;
     ic = c;
-    ic.base = check.view->base();
+    ic.base = view->base();
     ic.system = &system_;
     Recorder recorder(ic);
     const char *why = nullptr;
@@ -286,7 +348,7 @@ void Lockstep::begin_segment(Check &check, ppc::Context &c, uint32_t pc) {
         for (const Store &s : recorder.stores)
             for (uint32_t n = 0; n < s.size; n++) {
                 uint32_t a = s.address + n;
-                check.bytes.push_back({a, check.view->base()[host_offset(a)], s.pc});
+                check.bytes.push_back({a, view->base()[host_offset(a)], s.pc});
             }
         std::stable_sort(check.bytes.begin(), check.bytes.end(),
                          [](const Byte &a, const Byte &b) { return a.address < b.address; });
@@ -301,16 +363,38 @@ void Lockstep::begin_segment(Check &check, ppc::Context &c, uint32_t pc) {
     bool touched[std::size(VIEW_STARTS)] = {};
     for (const Store &s : recorder.stores)
         for (uint32_t a : {s.address, s.address + (s.size ? s.size - 1 : 0)})
-            touched[std::upper_bound(std::begin(VIEW_STARTS), std::end(VIEW_STARTS), a) - std::begin(VIEW_STARTS) -
-                    1] = true;
+            touched[std::upper_bound(std::begin(VIEW_STARTS), std::end(VIEW_STARTS), a) - std::begin(VIEW_STARTS) - 1] =
+                true;
     for (size_t n = 0; n < std::size(VIEW_STARTS); n++)
-        if (touched[n] && !check.view->reset(VIEW_STARTS[n], 1)) {
-            check.view.reset();
+        if (touched[n] && !view->reset(VIEW_STARTS[n], 1)) {
+            view.reset(); // (dropped: the pool makes another)
             if (!why) why = "a private view that could not be mapped again";
+            break;
         }
+    release_view(std::move(view));
     if (why) {
         give_up(why);
         return;
+    }
+    check.loads.swap(recorder.loads), check.arena.swap(recorder.arena);
+    check.loads_dropped = recorder.loads_dropped;
+    // The bytes it read before any store of its own to them, as the guest
+    // memory has them now, as the generated code starts: one another writer
+    // changed while the interpreter ran makes a difference not the
+    // recompiler's (the interpreter is slow: this is the long window).
+    check.changed = check.changed_pc = 0;
+    if (!check.loads_dropped && !check.loads.empty()) {
+        std::unordered_map<uint32_t, uint64_t> first_store;
+        for (const Store &s : recorder.stores)
+            for (uint32_t n = 0; n < s.size; n++) first_store.emplace(s.address + n, s.seq);
+        for (const Load &l : check.loads) {
+            for (uint32_t n = 0; n < l.size && !check.changed_pc; n++) {
+                uint32_t a = l.address + n;
+                if (auto it = first_store.find(a); it != first_store.end() && it->second < l.seq) continue;
+                if (*k_.memory().translate(a) != check.arena[l.at + n]) check.changed = a, check.changed_pc = l.pc;
+            }
+            if (check.changed_pc) break;
+        }
     }
     check.writers = recorder.writers;
     check.steps = recorder.steps;
@@ -328,11 +412,13 @@ void Lockstep::compare(Check &check, ppc::Context &c, const Import *import) {
     char text[256];
     auto where = [&](uint32_t pc) {
         if (!pc) return std::string("(not written in the segment)");
-        return "(the interpreter's from 0x" + [&] {
-            char b[16];
-            std::snprintf(b, sizeof(b), "%08X", pc);
-            return std::string(b);
-        }() + ": " + ppc::disassemble(pc, k_.load32(pc)) + ")";
+        return "(the interpreter's from 0x" +
+               [&] {
+                   char b[16];
+                   std::snprintf(b, sizeof(b), "%08X", pc);
+                   return std::string(b);
+               }() +
+               ": " + ppc::disassemble(pc, k_.load32(pc)) + ")";
     };
     auto name = [](const Import *i) { return i ? i->library + "!" + i->name : std::string("the call's return"); };
     if (import != check.import) {
@@ -343,8 +429,10 @@ void Lockstep::compare(Check &check, ppc::Context &c, const Import *import) {
     auto reg = [&](const char *what, int n, uint64_t g, uint64_t i, uint32_t pc) {
         if (g == i) return;
         char label[16];
-        if (n >= 0) std::snprintf(label, sizeof(label), "%s%d", what, n);
-        else std::snprintf(label, sizeof(label), "%s", what);
+        if (n >= 0)
+            std::snprintf(label, sizeof(label), "%s%d", what, n);
+        else
+            std::snprintf(label, sizeof(label), "%s", what);
         std::snprintf(text, sizeof(text), "  %-6s generated 0x%016" PRIX64 ", interpreter 0x%016" PRIX64 " ", label, g,
                       i);
         lines.push_back(text + where(pc));
@@ -384,15 +472,20 @@ void Lockstep::compare(Check &check, ppc::Context &c, const Import *import) {
     // the bytes the interpreter stored, against the guest memory now: runs of
     // consecutive differing bytes from the same store
     size_t runs = 0;
+    uint32_t atomic = 0, atomic_pc = 0; // a differing byte a store conditional left (shared memory)
     for (size_t n = 0; n < check.bytes.size();) {
         const Byte &b = check.bytes[n];
         if (*k_.memory().translate(b.address) == b.value) {
             n++;
             continue;
         }
+        if (!atomic_pc) {
+            ppc::Opcode op = ppc::decode(k_.load32(b.pc));
+            if (op == ppc::Opcode::stwcx || op == ppc::Opcode::stdcx) atomic = b.address, atomic_pc = b.pc;
+        }
         size_t end = n + 1;
-        while (end < check.bytes.size() && end - n < 16 && check.bytes[end].address == check.bytes[end - 1].address + 1 &&
-               check.bytes[end].pc == b.pc)
+        while (end < check.bytes.size() && end - n < 16 &&
+               check.bytes[end].address == check.bytes[end - 1].address + 1 && check.bytes[end].pc == b.pc)
             end++;
         if (++runs <= 8) {
             std::string g, i;
@@ -401,14 +494,42 @@ void Lockstep::compare(Check &check, ppc::Context &c, const Import *import) {
                 std::snprintf(h, sizeof(h), "%02X", *k_.memory().translate(check.bytes[m].address)), g += h;
                 std::snprintf(h, sizeof(h), "%02X", check.bytes[m].value), i += h;
             }
-            std::snprintf(text, sizeof(text), "  [%08X] %zu bytes: generated %s, interpreter %s ", b.address, end - n,
-                          g.c_str(), i.c_str());
+            std::snprintf(text, sizeof(text), "  [%08X] %zu byte%s: generated %s, interpreter %s ", b.address, end - n,
+                          end - n == 1 ? "" : "s", g.c_str(), i.c_str());
             lines.push_back(text + where(b.pc));
         }
         n = end;
     }
     if (runs > 8) lines.push_back("  ... " + std::to_string(runs - 8) + " more runs of bytes differ");
     uint64_t number;
+    // A difference after a byte the interpreter read changed, read again or
+    // in the guest memory now, is another writer's (a thread, a device, the
+    // clock in memory), not the recompiler's: the first such byte the
+    // interpreter read and never stored, or one it read before storing it
+    // that had changed when the generated code started (begin_segment).
+    // (Its loads past the limit unknown, the difference counts as one.)
+    // An atomic update (lwarx ... stwcx.) is of memory other threads share:
+    // a difference in a byte one left counts as another writer's too.
+    uint32_t raced = check.changed_pc, raced_at = check.changed;
+    if (!raced && atomic_pc) raced = atomic_pc, raced_at = atomic;
+    if (!lines.empty() && !raced && !check.loads_dropped) {
+        auto stored = [&](uint32_t a) {
+            auto it = std::lower_bound(check.bytes.begin(), check.bytes.end(), a,
+                                       [](const Byte &b, uint32_t x) { return b.address < x; });
+            return it != check.bytes.end() && it->address == a;
+        };
+        std::unordered_map<uint32_t, uint8_t> first;
+        for (const Load &l : check.loads) {
+            for (uint32_t n = 0; n < l.size && !raced; n++) {
+                uint32_t a = l.address + n;
+                uint8_t value = check.arena[l.at + n];
+                if (stored(a)) continue;
+                auto [it, fresh] = first.emplace(a, value);
+                if ((!fresh && it->second != value) || *k_.memory().translate(a) != value) raced = l.pc, raced_at = a;
+            }
+            if (raced) break;
+        }
+    }
     {
         std::lock_guard lock(mutex_);
         counts_.segments++;
@@ -417,13 +538,25 @@ void Lockstep::compare(Check &check, ppc::Context &c, const Import *import) {
             check.previous = import;
             return;
         }
-        number = ++counts_.mismatched;
-        counts_.mismatches[check.from]++;
+        if (raced) {
+            number = ++counts_.raced;
+        } else {
+            number = ++counts_.mismatched;
+            counts_.mismatches[check.from]++;
+        }
     }
     const Import *after = check.previous; // the import the segment started after (none: the call's start)
     check.previous = import;
-    if (number > options_.print_limit) return;
+    if (number > (raced ? 3 : options_.print_limit)) return;
     std::lock_guard lock(print_mutex);
+    if (raced) {
+        // a line: where it read what changed
+        std::fprintf(stderr,
+                     "lockstep: a difference in the call to 0x%08X (segment from 0x%08X) after [%08X], read at 0x%08X, "
+                     "changed meanwhile: another writer's, not counted as a mismatch\n",
+                     check.root, check.from, raced_at, raced);
+        return;
+    }
     std::fprintf(stderr,
                  "lockstep: mismatch %" PRIu64 " in the call to 0x%08X: the segment from 0x%08X (%s%s) to %s, %" PRIu64
                  " instructions interpreted\n",
@@ -444,8 +577,8 @@ std::string Lockstep::report() const {
     char line[256];
     std::snprintf(line, sizeof(line),
                   "lockstep: %" PRIu64 " calls checked, %" PRIu64 " segments compared, %" PRIu64 " the same, %" PRIu64
-                  " different\n",
-                  n.calls, n.segments, n.matched, n.mismatched);
+                  " different, %" PRIu64 " different after memory they read changed\n",
+                  n.calls, n.segments, n.matched, n.mismatched, n.raced);
     out += line;
     for (const auto &[why, count] : n.given_up) {
         std::snprintf(line, sizeof(line), "  given up: %" PRIu64 " at %s\n", count, why.c_str());
