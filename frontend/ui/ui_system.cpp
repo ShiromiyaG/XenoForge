@@ -122,6 +122,16 @@ Rml::Input::KeyIdentifier convert_key(SDL_Keycode key) {
     }
 }
 
+// SDL numbers the buttons left, middle, right (1, 2, 3); RmlUi left, right, middle (0, 1, 2)
+static int rml_button(uint8_t sdl_button) {
+    switch (sdl_button) {
+    case SDL_BUTTON_LEFT: return 0;
+    case SDL_BUTTON_RIGHT: return 1;
+    case SDL_BUTTON_MIDDLE: return 2;
+    default: return sdl_button - 1;
+    }
+}
+
 bool process_event(Rml::Context *context, SDL_Window *window, const SDL_Event &event) {
     const float density = SDL_GetWindowPixelDensity(window);
     switch (event.type) {
@@ -130,10 +140,10 @@ bool process_event(Rml::Context *context, SDL_Window *window, const SDL_Event &e
                                          key_modifiers());
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         SDL_CaptureMouse(true);
-        return context->ProcessMouseButtonDown(event.button.button - 1, key_modifiers());
+        return context->ProcessMouseButtonDown(rml_button(event.button.button), key_modifiers());
     case SDL_EVENT_MOUSE_BUTTON_UP:
         SDL_CaptureMouse(false);
-        return context->ProcessMouseButtonUp(event.button.button - 1, key_modifiers());
+        return context->ProcessMouseButtonUp(rml_button(event.button.button), key_modifiers());
     case SDL_EVENT_MOUSE_WHEEL:
         return context->ProcessMouseWheel(Rml::Vector2f(-event.wheel.x, -event.wheel.y), key_modifiers());
     case SDL_EVENT_KEY_DOWN: return context->ProcessKeyDown(convert_key(event.key.key), key_modifiers());
