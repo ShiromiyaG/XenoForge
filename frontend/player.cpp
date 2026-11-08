@@ -559,6 +559,10 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     if (g.renderer->resolution_scale() != 4 || !scale_notice.empty())
         std::printf("drawing at %u%% of the console's resolution%s%s\n", g.renderer->resolution_scale() * 25,
                     scale_notice.empty() ? "" : ": ", scale_notice.c_str());
+    // what the settings asked of the picture, so a log shows what reached the player
+    std::printf("picture: resolution scale %d%%, output scaling %s, antialiasing %s, shape %s\n",
+                settings.video.resolution_scale, settings.video.upscaler.c_str(), settings.video.antialiasing.c_str(),
+                settings.video.aspect.c_str());
     std::printf("rendering on %s, the window on the same device (%s)\n", g.device->name().c_str(),
                 presenter.own_queue() ? "a queue of its own" : "the renderer's queue");
     stbi_write_png_compression_level = 1;

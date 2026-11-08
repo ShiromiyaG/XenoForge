@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 namespace xf::frontend {
@@ -715,9 +716,16 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
         // picture's, antialiased alone), then blitted
         uint32_t from_w = width, from_h = height;
         VkImage from = picture;
-        if (r.width && r.height && (view.upscaler || view.antialiasing))
-            if (EffectImage *out = run_effects(cmd, view, picture_view, width, height, r.width, r.height, from_w, from_h))
-                from = out->image.image;
+        if (r.width && r.height && (view.upscaler || view.antialiasing)) {
+            EffectImage *out = run_effects(cmd, view, picture_view, width, height, r.width, r.height, from_w, from_h);
+            if (out) from = out->image.image;
+            // once, why the chosen effects are not on the screen
+            if (!out && !effects_failure_told_) {
+                effects_failure_told_ = true;
+                std::fprintf(stderr, "presenter: the picture effects could not run (%s)\n",
+                             effects_tried_ && !effects_ok_ ? "their pipelines could not be made" : "no picture view");
+            }
+        }
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[1] = {int32_t(from_w), int32_t(from_h), 1};

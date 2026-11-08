@@ -306,10 +306,21 @@ toml::table launcher_table(const Settings::Launcher &l) {
 bool write_file(const std::filesystem::path &path, const toml::table &t, std::string &error) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
-    std::ofstream out(path);
-    if (!out) return error = "cannot write " + path.string(), false;
-    out << "# XenoForge's player (docs/runtime.md, \"The player\"; docs/input.md for the keyboard)\n" << t << "\n";
-    return out.good() || (error = "cannot write " + path.string(), false);
+    // written beside and renamed over, so a reader (the launcher and the player share this file) never sees it cut
+    std::filesystem::path temporary = path;
+    temporary += ".new";
+    {
+        std::ofstream out(temporary);
+        if (!out) return error = "cannot write " + path.string(), false;
+        out << "# XenoForge's player (docs/runtime.md, \"The player\"; docs/input.md for the keyboard)\n" << t << "\n";
+        if (!out.good()) return error = "cannot write " + path.string(), false;
+    }
+    std::filesystem::rename(temporary, path, ec);
+    if (ec) {
+        std::filesystem::remove(temporary, ec);
+        return error = "cannot write " + path.string(), false;
+    }
+    return true;
 }
 
 } // namespace

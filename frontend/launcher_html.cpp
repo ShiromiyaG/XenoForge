@@ -394,14 +394,14 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
         std::string rows = check_row("video.fullscreen", "Start in fullscreen", "F11 switches in the game.", st.video.fullscreen);
         rows += select_row("video.aspect", "Picture shape", "How the game's picture fits the window.", label_of(aspect_choices(), st.video.aspect));
         rows += check_row("video.smooth", "Smooth scaling", "Linear filtering when the picture is scaled to the window.", st.video.smooth);
-        rows += select_row("video.upscaler", "Output scaling", "FSR or CAS to the window's size, instead of a plain scale. Changes at once.",
+        rows += select_row("video.upscaler", "Output scaling", "FSR or CAS to the window's size, instead of a plain scale. Only visible when the window (or fullscreen) is larger than the picture; at the same size FSR only sharpens a little and CAS barely changes it. Changes at once.",
                            label_of(video_choice_list("video.upscaler"), st.video.upscaler));
         char sharp[32];
         std::snprintf(sharp, sizeof(sharp), "%.2f stops", st.video.fsr_sharpness);
         rows += slider_row("video.fsr_sharpness", "FSR sharpness reduction", "0 is the sharpest (Xenia's default 0.2).", st.video.fsr_sharpness / 2.0, sharp);
         std::snprintf(sharp, sizeof(sharp), "%.0f%%", st.video.cas_sharpness * 100);
         rows += slider_row("video.cas_sharpness", "CAS additional sharpness", "", st.video.cas_sharpness, sharp);
-        rows += select_row("video.antialiasing", "Antialiasing", "FXAA over the game's picture, before it is scaled.",
+        rows += select_row("video.antialiasing", "Antialiasing", "FXAA over the game's picture, before it is scaled: smooths jagged edges, a subtle change on a smooth picture. Changes at once.",
                            label_of(video_choice_list("video.antialiasing"), st.video.antialiasing));
         s += group("Display", rows);
         std::string inner = select_row("video.resolution_scale", "Resolution scale",

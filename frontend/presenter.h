@@ -176,7 +176,7 @@ class Presenter {
         vk::Image image;
         VkImageView view = VK_NULL_HANDLE;
     };
-    bool effects_tried_ = false, effects_ok_ = false;
+    bool effects_tried_ = false, effects_ok_ = false, effects_failure_told_ = false;
     VkDescriptorSetLayout effect_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout effect_layout_ = VK_NULL_HANDLE;
     VkPipeline effect_pipelines_[EFFECTS] = {};

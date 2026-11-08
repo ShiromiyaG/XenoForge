@@ -1761,7 +1761,8 @@ with sound, dropped and starved, then boot's report); `--screenshots <dir>`
 writes every `--screenshot-every N` swaps' front buffer (300 by default)
 as `<title>_<swap>.png` (the renderer's read-back, boot's `--shots`
 picture) and the window's picture of the same swap beside it as
-`<title>_<swap>_window.png`, printing the time on the scheduler's clock
+`<title>_<swap>_window.png` (the converted picture, before the output scaling and antialiasing: to see
+those use `--window-shots`, which copies back the swapchain's image), printing the time on the scheduler's clock
 each came at, which is the clock `--press` takes (or `--press
 start@#1100`, at a swap); `--overlay` opens the overlay from the start;
 `--no-sound` keeps the pacing output alone; `--rates` prints a line a
