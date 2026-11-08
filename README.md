@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/xenoforge-wordmark-dark.png">
+    <img alt="XenoForge" src="assets/branding/xenoforge-wordmark-light.png" width="420">
+  </picture>
+</p>
+
 # XenoForge
 
 An ahead-of-time Xbox 360 emulator, and an SDK for ports of specific games.
