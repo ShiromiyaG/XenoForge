@@ -399,7 +399,7 @@ if(XF_PLAYER AND TARGET boot)
     add_library(xf_ui STATIC frontend/ui/ui_renderer.cpp frontend/ui/ribbons.cpp frontend/ui/ui_system.cpp frontend/ui/ui_window.cpp
                              frontend/prepare_job.cpp frontend/stale_library.cpp frontend/launcher_model.cpp frontend/launcher_html.cpp
                              frontend/launcher_view.cpp frontend/launcher_screens.cpp frontend/launcher_input.cpp
-                             frontend/settings_view.cpp
+                             frontend/settings_view.cpp frontend/ui_sound.cpp frontend/ui/cursor_file.cpp
                              ${XF_SHADER_OUT}/ui.vert.inc ${XF_SHADER_OUT}/ui.frag.inc)
     target_include_directories(xf_ui PRIVATE ${XF_SHADER_OUT})
     target_include_directories(xf_ui PUBLIC frontend)

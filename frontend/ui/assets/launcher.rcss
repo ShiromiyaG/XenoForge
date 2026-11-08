@@ -20,9 +20,13 @@ body { background-color: transparent; }
    slides the strip, as the console's dashboard slides from one blade to the next */
 
 #stage { position: relative; flex: 1 1 0; min-height: 0; overflow: hidden; }
-#slide { position: absolute; left: 0; top: 0; bottom: 0; width: 200%; display: flex; flex-direction: row; transition: left 0.42s cubic-out; }
+#slide { position: absolute; left: 0; top: 0; bottom: 0; width: 200%; display: flex; flex-direction: row; transition: left 0.34s cubic-out; }
 #slide.to-settings { left: -100%; }
-.page-side { flex: 0 0 50%; min-width: 0; display: flex; flex-direction: column; }
+.page-side { flex: 0 0 50%; min-width: 0; display: flex; flex-direction: column; transition: opacity 0.34s cubic-out; }
+/* the page that is not shown dims as the strip leaves it, and comes up as the strip arrives */
+#spage { opacity: 0.3; }
+#slide.to-settings #spage { opacity: 1; }
+#slide.to-settings #library { opacity: 0.3; }
 .page-side.hidden { visibility: hidden; }
 
 /* ------------------------------------------------------------------ header */
@@ -37,7 +41,7 @@ body { background-color: transparent; }
 #nav { flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; }
 .nav {
     padding: 0 17dp; font-weight: 300; font-size: 29.5dp; line-height: 1; white-space: nowrap;
-    color: #8b8a90; cursor: pointer;
+    color: #8b8a90; cursor: pointer; transition: color 0.18s cubic-out;
 }
 .nav:hover { color: #c9c8cd; }
 .nav.open { color: #ffffff; }
@@ -85,14 +89,19 @@ body { background-color: transparent; }
     decorator: linear-gradient(180deg, #62615f 0%, #504f4e 40%, #444342 62%, #504f4e 100%);
     box-shadow: 0 0 0 1dp #2b2b2a, 0 2dp 3dp 1dp #00000050, inset 0 1dp 1dp 0 #ffffff26;
     font-family: Condensed; font-size: 16dp; font-weight: 400; color: #f4f4f4; cursor: pointer; white-space: nowrap;
+    transition: decorator 0.14s cubic-out, border-color 0.14s cubic-out, opacity 0.2s cubic-out; /* (a box-shadow cannot be animated: RmlUi says so) */
 }
 .tb .ic, .tab .ic { font-size: 19dp; margin-right: 6dp; color: #f4f4f4; }
 .tb.primary .ic { color: #f28a38; }
 .tb:hover, .tab:hover { border-color: #918f8d; decorator: linear-gradient(180deg, #727170 0%, #5e5d5c 40%, #504f4e 62%, #5c5b5a 100%); }
-.tb:active, .tab:active { decorator: linear-gradient(180deg, #424140 0%, #4c4b4a 60%, #565554 100%); box-shadow: 0 0 0 1dp #2b2b2a, inset 0 1dp 3dp 0 #00000090; }
+.tb:active, .tab:active { decorator: linear-gradient(180deg, #424140 0%, #494847 40%, #4c4b4a 62%, #565554 100%); box-shadow: 0 0 0 1dp #2b2b2a, 0 0 0 0 #00000000, inset 0 1dp 3dp 0 #00000090; }
 .tb:focus-visible, .tab:focus-visible { border-color: #ffffff; }
-.tb.on, .tb.on:hover, .tab.active, .tab.active:hover { border-color: #c9ffc2; decorator: linear-gradient(180deg, #55a928 0%, #458536 100%); box-shadow: 0 0 0 1dp #2c7a1a, inset 0 1dp 1dp 0 #ffffff40; }
-.tb.off { opacity: 0.5; cursor: default; }
+/* the same number of stops and shadows as the plain button, so the change blends (the gradient's colours are those of the old two stops) */
+.tb.on, .tb.on:hover, .tab.active, .tab.active:hover {
+    border-color: #c9ffc2; decorator: linear-gradient(180deg, #55a928 0%, #4f9b2e 40%, #4b9331 62%, #458536 100%);
+    box-shadow: 0 0 0 1dp #2c7a1a, 0 0 0 0 #00000000, inset 0 1dp 1dp 0 #ffffff40;
+}
+.tb.off { opacity: 0.5; cursor: unavailable; }
 .tb.off:hover { border-color: #7c7b79; decorator: linear-gradient(180deg, #62615f 0%, #504f4e 40%, #444342 62%, #504f4e 100%); }
 .tb.stop .ic { color: #ff7a6e; }
 #tb-space { flex: 1 1 0; }
@@ -121,13 +130,17 @@ body { background-color: transparent; }
 /* room around the rows for the selected one's glow, which the list's clipping would cut */
 #tbody { flex: 1 1 0; min-height: 0; margin-top: -12dp; padding: 16dp 8.8% 20dp 8.8%; overflow-y: auto; overflow-x: hidden; }
 .tr {
-    display: flex; flex-direction: row; align-items: center; height: 66dp; margin: 0 0 8dp 0; cursor: default;
+    position: relative; /* (left: the rows slide in, LauncherView::animate_rows_in) */
+    display: flex; flex-direction: row; align-items: center; height: 66dp; margin: 0 0 8dp 0; cursor: pointer;
     border: 2dp #666668; border-radius: 9dp;
     decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, #ffffff30, #ffffff00),
                radial-gradient(ellipse 17% 125% at 75.4% 0%, #ffffff30, #ffffff00),
                linear-gradient(180deg, #2c2c2eb8 0%, #2d2d2fb8 55%, #2e2e30b8 95%, #2f2f31b8 100%);
     box-shadow: 0 0 0 1dp #1c1c1d, 0 3dp 6dp 1dp #00000080, inset 0 1dp 0 0 #ffffff1a;
-    transition: decorator 0.16s cubic-out, border-color 0.16s cubic-out; /* the gradients have the same layers and stops in each state, so they blend (the shadows differ in number and snap) */
+    /* the selection's change is a fade out of one row and a fade in of the next, the borders and margins growing and shrinking to match
+       (and the glow, which is a box-shadow and cannot be animated, a child of the row whose opacity is: LauncherView::fade_glow);
+       the gradients have the same layers and stops in each state, so they blend */
+    transition: decorator 0.2s cubic-out, border-color 0.2s cubic-out, border-width 0.2s cubic-out, margin 0.2s cubic-out;
 }
 .tr:hover {
     border-color: #77777a;
@@ -140,8 +153,14 @@ body { background-color: transparent; }
     decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, #ffffff4a, #ffffff00),
                radial-gradient(ellipse 17% 125% at 75.4% 0%, #ffffff4a, #ffffff00),
                linear-gradient(180deg, #55a928e0 0%, #52a326e0 55%, #458536e0 95%, #3f7d32e0 100%);
+    box-shadow: none; /* the glow below is the shadow */
+}
+/* the selected row's glow and its green ring, over the row's own background (its text comes after, so on top of it) */
+.tr .glow {
+    position: absolute; left: -3dp; top: -3dp; right: -3dp; bottom: -3dp; border-radius: 10dp; opacity: 0; pointer-events: none;
     box-shadow: 0 0 0 1dp #2c7a1a, 0 0 24dp 6dp #6dff3ae0, 0 0 8dp 2dp #b4ff94, inset 0 0 14dp 0 #c8ffb090;
 }
+.tr.sel .glow { opacity: 1; }
 .td {
     height: 100%; display: flex; flex-direction: row; align-items: center; min-width: 0; overflow: hidden;
     font-family: Condensed; font-weight: 400; font-size: 24dp; line-height: 1; color: #f6f6f6; white-space: nowrap;
@@ -270,7 +289,7 @@ body { background-color: transparent; }
 .prep-icon .letter { width: 48dp; height: 48dp; line-height: 48dp; text-align: center; font-size: 20dp; font-weight: 700; color: #ffffffe0; }
 .prep-title { font-size: 15dp; font-weight: 600; }
 .prep-state { display: flex; flex-direction: row; align-items: center; margin-top: 3dp; }
-.stages { display: flex; flex-direction: row; margin-bottom: 14dp; }
+.stages { cursor: progress; display: flex; flex-direction: row; margin-bottom: 14dp; }
 .stage { flex: 1 1 0; margin-right: 6dp; }
 .stage .bar { height: 4dp; border-radius: 2dp; background-color: {border}; }
 .stage .in { height: 4dp; border-radius: 2dp; background-color: {accent}; width: 0%; }
@@ -279,7 +298,7 @@ body { background-color: transparent; }
 .stage.done .nm { color: {text-2}; }
 .stage.bad .in { background-color: {bad}; }
 .stage.bad .nm { color: {bad}; }
-.pbar { height: 8dp; border-radius: 4dp; background-color: {border}; }
+.pbar { cursor: progress; height: 8dp; border-radius: 4dp; background-color: {border}; }
 .pfill { height: 8dp; border-radius: 4dp; background-color: {accent}; width: 0%; }
 .pbar.failed .pfill { background-color: {bad}; }
 .pbar.done .pfill { background-color: {good}; }

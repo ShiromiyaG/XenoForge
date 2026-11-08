@@ -88,13 +88,32 @@ void SettingsView::folder_changed() {
     if (active_ && tab_ == SettingsTab::Interface) defer([this] { rebuild(); });
 }
 
-void SettingsView::show_tab(SettingsTab tab) {
+void SettingsView::show_tab(SettingsTab tab, int direction) {
     if (!capturing_.empty()) end_capture();
     close_popup();
+    const bool changed = tab != tab_;
+    if (direction == 0) direction = int(tab) >= int(tab_) ? 1 : -1;
     tab_ = tab;
     if (!active_) return; // made when the page is entered
     rebuild();
     if (Rml::Element *pages = by_id("pages")) pages->SetScrollTop(0);
+    if (changed) {
+        host_.play_sound(Cue::Tab);
+        slide_page_in(direction);
+    }
+}
+
+// The tab's page comes in from the side the tab lies on, over a fifth of a second: the console's blades
+// shuffle one place, here the content does. The scroll box stays still (and clips what is outside it).
+void SettingsView::slide_page_in(int direction) {
+    Rml::Element *pages = by_id("pages");
+    Rml::Element *page = pages ? pages->GetFirstChild() : nullptr;
+    if (!page) return;
+    const Rml::Tween tween(Rml::Tween::Cubic, Rml::Tween::Out);
+    const Rml::Property from_left(float(40 * direction), Rml::Unit::DP), to_left(0.f, Rml::Unit::DP);
+    page->Animate("left", to_left, 0.22f, tween, 1, false, 0.f, &from_left);
+    const Rml::Property from_opacity(0.f, Rml::Unit::NUMBER), to_opacity(1.f, Rml::Unit::NUMBER);
+    page->Animate("opacity", to_opacity, 0.2f, Rml::Tween(Rml::Tween::Quadratic, Rml::Tween::Out), 1, false, 0.f, &from_opacity);
 }
 
 void SettingsView::reload_edit() {
@@ -123,6 +142,7 @@ SettingsPage SettingsView::page() {
     p.accent = accent_from_hex(core_.accent()).base;
     p.theme = theme_text(theme_from_text(core_.launcher().theme));
     p.backdrop = core_.launcher().backdrop;
+    p.sounds = core_.launcher().sounds;
     if (tab_ == SettingsTab::Controllers) p.gamepads = LauncherCore::gamepads();
     p.capturing = capturing_;
     return p;
@@ -189,6 +209,10 @@ void SettingsView::ProcessEvent(Rml::Event &event) {
 
 void SettingsView::do_action(const std::string &name, const std::string &arg, Rml::Element *element) {
     if (!capturing_.empty() && name != "capture") end_capture();
+    // "tab" sounds in show_tab, a dropdown's own list when it opens; the rest are choices
+    if (name == "toggle" || name == "option" || name == "accent") host_.play_sound(Cue::Toggle);
+    else if (name == "select") host_.play_sound(Cue::MenuOpen);
+    else if (name != "tab") host_.play_sound(Cue::Select);
     if (name == "tab") {
         for (int i = 0; i < SETTINGS_TABS; i++)
             if (arg == settings_tab_name(SettingsTab(i))) show_tab(SettingsTab(i));
@@ -277,6 +301,16 @@ void SettingsView::toggle_setting(Rml::Element *row) {
         edit_valid_ = true;
         if (!error.empty()) std::fprintf(stderr, "launcher: settings: %s\n", error.c_str());
         defer([this] { rebuild(); });
+        return;
+    }
+    if (key == "ui.sounds") {
+        // the launcher's own, shared like the theme: not a game's setting
+        Settings::Launcher l = core_.launcher();
+        l.sounds = !l.sounds;
+        std::string error;
+        core_.set_launcher(l, error);
+        if (Rml::Element *box = row->QuerySelector(".check")) box->SetClass("on", l.sounds);
+        if (l.sounds) host_.play_sound(Cue::Toggle); // turned on: this is the first one heard
         return;
     }
     bool *field = bool_field(key);
@@ -450,7 +484,7 @@ bool SettingsView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         return true;
     case SDLK_TAB:
         // Tab goes to the next page, Ctrl+Tab (or Shift+Tab) to the previous one
-        if (!repeat) show_tab(SettingsTab((int(tab_) + ((ctrl || shift) ? SETTINGS_TABS - 1 : 1)) % SETTINGS_TABS));
+        if (!repeat) show_tab(SettingsTab((int(tab_) + ((ctrl || shift) ? SETTINGS_TABS - 1 : 1)) % SETTINGS_TABS), (ctrl || shift) ? -1 : 1);
         return true;
     default: return false;
     }
@@ -468,8 +502,8 @@ bool SettingsView::on_pad_button(SDL_GamepadButton button, bool down) {
         else activate();
         break;
     case SDL_GAMEPAD_BUTTON_EAST: back(); break;
-    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: show_tab(SettingsTab((int(tab_) + SETTINGS_TABS - 1) % SETTINGS_TABS)); break;
-    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: show_tab(SettingsTab((int(tab_) + 1) % SETTINGS_TABS)); break;
+    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: show_tab(SettingsTab((int(tab_) + SETTINGS_TABS - 1) % SETTINGS_TABS), -1); break;
+    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: show_tab(SettingsTab((int(tab_) + 1) % SETTINGS_TABS), 1); break;
     default: return false;
     }
     return true;
@@ -538,6 +572,7 @@ void SettingsView::navigate(NavDir dir) {
                 set_slider(key, fraction + (dir == NavDir::Right ? 0.05 : -0.05));
                 refresh_slider(row);
                 save_edit();
+                host_.play_sound(Cue::Focus);
             }
             return;
         }
@@ -547,13 +582,18 @@ void SettingsView::navigate(NavDir dir) {
             int at = 0;
             for (size_t i = 0; i < choices.size(); i++)
                 if (choices[i].value == current) at = int(i);
-            at = std::clamp(at + (dir == NavDir::Right ? 1 : -1), 0, int(choices.size()) - 1);
-            choose_option(key, choices[size_t(at)].value, row);
+            const int next = std::clamp(at + (dir == NavDir::Right ? 1 : -1), 0, int(choices.size()) - 1);
+            if (next != at) host_.play_sound(Cue::Toggle);
+            choose_option(key, choices[size_t(next)].value, row);
+            return;
+        }
+        if (kind == "toggle" && key == "ui.sounds") {
+            if (core_.launcher().sounds != (dir == NavDir::Right)) toggle_setting(row);
             return;
         }
         if (kind == "toggle" && key != "own") {
             bool *field = bool_field(key);
-            if (field && *field != (dir == NavDir::Right)) toggle_setting(row);
+            if (field && *field != (dir == NavDir::Right)) host_.play_sound(Cue::Toggle), toggle_setting(row);
             return;
         }
     }
@@ -573,6 +613,7 @@ void SettingsView::navigate(NavDir dir) {
     if (to < 0) return;
     items[size_t(to)]->Focus(true);
     ensure_visible(items[size_t(to)]);
+    host_.play_sound(Cue::Focus);
 }
 
 void SettingsView::activate() {
@@ -583,6 +624,7 @@ void SettingsView::activate() {
 }
 
 void SettingsView::back() {
+    host_.play_sound(Cue::Back);
     if (popup_row_) return close_popup();
     if (!capturing_.empty()) return end_capture();
     host_.leave_settings();

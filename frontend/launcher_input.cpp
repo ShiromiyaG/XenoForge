@@ -32,14 +32,14 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
     // the settings page and its dropdowns are the settings view's; a click there only closes a menu
     for (Rml::Element *e = target; e; e = e->GetParentNode())
         if (e->GetId() == "spage" || e->GetId() == "popup-layer") {
-            if (type == "click") close_menu();
+            if (type == "click") dismiss_menu();
             return;
         }
     if (type == "click") {
-        if (target->GetId() == "menu-layer") return close_menu();
+        if (target->GetId() == "menu-layer") return dismiss_menu();
         if (Rml::Element *title = ancestor_with(target, "data-menu")) {
             const std::string name = title->GetAttribute<Rml::String>("data-menu", "");
-            if (menu_ == name) close_menu();
+            if (menu_ == name) dismiss_menu();
             else open_menu(name, false);
             return;
         }
@@ -56,7 +56,7 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
             if (Rml::Element *row = ancestor_with(opt, "data-index")) {
                 select_game(row->GetAttribute<int>("data-index", -1), false);
                 const Rml::Vector2f at = opt->GetAbsoluteOffset(Rml::BoxArea::Border);
-                if (menu_ == "context") close_menu();
+                if (menu_ == "context") dismiss_menu();
                 else if (selected_game()) open_context_menu(at.x, at.y + opt->GetBox().GetSize(Rml::BoxArea::Border).y + 2 * dp());
             }
             return;
@@ -66,7 +66,7 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
             do_action(a->GetAttribute<Rml::String>("data-action", ""), a->GetAttribute<Rml::String>("data-arg", ""));
             return;
         }
-        close_menu();
+        dismiss_menu();
         if (Rml::Element *row = ancestor_with(target, "data-index")) select_game(row->GetAttribute<int>("data-index", -1), false);
     } else if (type == "dblclick") {
         if (Rml::Element *row = ancestor_with(target, "data-index")) {
@@ -113,6 +113,12 @@ void LauncherView::ProcessEvent(Rml::Event &event) {
 
 void LauncherView::do_action(const std::string &name, const std::string &arg) {
     const GameEntry *game = selected_game();
+    // the page that slides, a dialog or a menu that opens, the window that closes: each has a sound of its own
+    if (name == "dialog-close" || name == "clear-search" || name == "prep-hide" || name == "prep-cancel") play_sound(Cue::Back);
+    else if (name == "toggle-log") play_sound(Cue::Toggle);
+    else if (name != "library" && name != "settings" && name != "game-settings" && name != "controls" && name != "about" && name != "show-prepare" &&
+             name != "exit")
+        play_sound(Cue::Select);
     if (name == "play") {
         if (game) play(*game, false);
     } else if (name == "play-interpreted") {
@@ -135,6 +141,7 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
         core_.show_demo_games(!core_.demo_games());
         selected_ = -1;
         rows_sig_.clear();
+        animate_rows_ = true;
         cached_.clear();
         last_listing_ = Clock::time_point();
         settings_->set_game(nullptr);
@@ -150,6 +157,7 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
         if (column == sort_) ascending_ = !ascending_;
         else sort_ = column, ascending_ = true;
         rebuild_head();
+        animate_rows_ = true;
         rebuild_rows(true);
         save_layout();
     } else if (name == "clear-search") {
@@ -299,7 +307,7 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         case SDLK_ESCAPE:
         case SDLK_LALT:
         case SDLK_RALT:
-        case SDLK_F10: close_menu(); return true;
+        case SDLK_F10: dismiss_menu(); return true;
         default: break;
         }
     }
@@ -307,7 +315,10 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
     if (dialog_ != Dialog::None) {
         switch (key) {
         case SDLK_ESCAPE:
-            if (!repeat) close_dialog();
+            if (!repeat) {
+                play_sound(Cue::Back);
+                close_dialog();
+            }
             return true;
         case SDLK_LEFT: dialog_navigate(NavDir::Left); return true;
         case SDLK_RIGHT: dialog_navigate(NavDir::Right); return true;
@@ -419,7 +430,7 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
             break;
         case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, SDL_SCANCODE_RETURN, false); break;
         case SDL_GAMEPAD_BUTTON_EAST:
-        case SDL_GAMEPAD_BUTTON_BACK: close_menu(); break;
+        case SDL_GAMEPAD_BUTTON_BACK: dismiss_menu(); break;
         default: break;
         }
         return true;
@@ -432,7 +443,10 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         case SDL_GAMEPAD_BUTTON_DPAD_LEFT: dialog_navigate(NavDir::Left); break;
         case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: dialog_navigate(NavDir::Right); break;
         case SDL_GAMEPAD_BUTTON_SOUTH: on_key(SDLK_RETURN, SDL_SCANCODE_RETURN, false); break;
-        case SDL_GAMEPAD_BUTTON_EAST: close_dialog(); break;
+        case SDL_GAMEPAD_BUTTON_EAST:
+            play_sound(Cue::Back);
+            close_dialog();
+            break;
         default: break;
         }
         return true;
@@ -520,7 +534,10 @@ void LauncherView::dialog_navigate(NavDir dir) {
         rects.push_back({at.x, at.y, size.x, size.y});
     }
     const int to = nav_pick(rects, from, dir);
-    if (to >= 0) items[size_t(to)]->Focus(true);
+    if (to >= 0) {
+        items[size_t(to)]->Focus(true);
+        play_sound(Cue::Focus);
+    }
 }
 
 } // namespace xf::frontend

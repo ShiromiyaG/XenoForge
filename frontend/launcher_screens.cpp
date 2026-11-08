@@ -76,6 +76,7 @@ void LauncherView::open_menu(const std::string &name, bool keyboard) {
     if (!layer || !host) return;
     if (!menu_.empty() && menu_ != "context")
         if (Rml::Element *t = by_id(("menu-" + menu_).c_str())) t->SetClass("open", false);
+    play_sound(menu_.empty() || menu_ == "context" ? Cue::MenuOpen : Cue::Tab); // from one title to the next: the tab's swish
     menu_ = name;
     menu_keyboard_ = keyboard;
     menu_items_ = menu_items(name);
@@ -124,6 +125,12 @@ void LauncherView::close_menu() {
     hot_ = -1;
 }
 
+void LauncherView::dismiss_menu() {
+    if (menu_.empty()) return;
+    play_sound(Cue::MenuClose);
+    close_menu();
+}
+
 void LauncherView::menu_move(int delta) {
     Rml::Element *menu = by_id("menu");
     if (!menu) return;
@@ -135,6 +142,7 @@ void LauncherView::menu_move(int delta) {
         at = at < 0 ? (delta > 0 ? 0 : int(items.size()) - 1) : (at + delta + int(items.size())) % int(items.size());
         if (items[size_t(at)]->HasAttribute("data-action")) break;
     }
+    if (at != hot_) play_sound(Cue::Focus);
     hot_ = at;
     for (size_t i = 0; i < items.size(); i++) items[i]->SetClass("hot", int(i) == hot_);
 }
@@ -155,6 +163,7 @@ void LauncherView::show_dialog(Dialog dialog, const std::string &title, const st
     if (!layer) return;
     layer->SetInnerRML(dialog_html(title, body, buttons, width_dp));
     layer->SetClass("open", true);
+    play_sound(Cue::MenuOpen);
     dialog_ = dialog;
     defer([this] {
         if (Rml::Element *b = by_id("dlg-first")) b->Focus(pad_mode_);
@@ -252,6 +261,8 @@ void LauncherView::update_prepare() {
         cached_.clear(), stale_.clear(), rows_sig_.clear();
         if (failed) failed_.insert(prepare_title_id_);
         if (done) failed_.erase(prepare_title_id_);
+        if (done) play_sound(Cue::Done);
+        else if (failed) play_sound(Cue::Deny);
         if (dialog_ != Dialog::Prepare || s.cancelled) {
             if (s.cancelled) set_message("Preparing " + prepare_title_ + " was cancelled", 0, 8);
             else if (failed) set_message("Preparing " + prepare_title_ + " failed: " + s.error, 2, 0);

@@ -17,6 +17,7 @@
 #scope .scope-text .hint { display: block; margin: 0; font-family: Condensed; font-size: 15dp; color: #e0dfe4; }
 
 #pages { flex: 1 1 0; min-height: 0; padding: 4dp 8.8% 18dp 8.8%; overflow-y: auto; overflow-x: hidden; }
+#pages .page { position: relative; } /* (left: a tab's page comes in from the side, SettingsView::slide_page_in) */
 #pages .group { margin-top: 14dp; }
 #pages .group-title {
     margin-bottom: 8dp; padding: 0 0 5dp 4dp; border-bottom: 1dp #ffffff50;
@@ -32,7 +33,7 @@
                radial-gradient(ellipse 17% 125% at 75.4% 0%, #ffffff30, #ffffff00),
                linear-gradient(180deg, #2c2c2eb8 0%, #2d2d2fb8 55%, #2e2e30b8 95%, #2f2f31b8 100%);
     box-shadow: 0 0 0 1dp #1c1c1d, 0 3dp 6dp 1dp #00000080, inset 0 1dp 0 0 #ffffff1a;
-    transition: decorator 0.16s cubic-out, border-color 0.16s cubic-out;
+    transition: decorator 0.18s cubic-out, border-color 0.18s cubic-out;
 }
 #spage .setting:hover, #spage .bind:hover {
     border-color: #77777a;

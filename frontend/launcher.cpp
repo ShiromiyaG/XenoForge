@@ -246,6 +246,7 @@ int main(int argc, char **argv) {
     std::printf("launcher: Vulkan on %s\n", surface->device_name().c_str());
     auto system = std::make_unique<ui::SystemInterface>(window);
     Rml::SetSystemInterface(system.get());
+    system->load_cursors(assets / "cursors"); // the console browser's; the system's where a file is missing
     Rml::SetRenderInterface(&surface->renderer());
     if (!Rml::Initialise()) return fail("RmlUi did not start");
     std::filesystem::path fonts = assets / "fonts";

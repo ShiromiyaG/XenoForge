@@ -89,6 +89,7 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     void rescan() override;
     void leave_settings() override;
     bool pad_mode() const override { return pad_mode_; }
+    void play_sound(Cue cue) override;
 
   private:
     enum class Dialog { None, Prepare, About, Message };
@@ -103,6 +104,8 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     void update_toolbar();
     void update_status();
     void update_backdrop();
+    void fade_glow(Rml::Element *row, bool on);
+    void animate_rows_in(); // the rows slide in from the left one after another (a list that has just appeared)
     void set_message(const std::string &text, int kind, double seconds); // kind: 0 plain, 1 good, 2 error
 
     // state
@@ -121,7 +124,9 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     std::vector<MenuItem> menu_items(const std::string &name);
     void open_menu(const std::string &name, bool keyboard);
     void open_context_menu(float x, float y);
-    void close_menu();
+    void close_menu();   // closed, no sound: what was chosen sounds for itself
+    void dismiss_menu(); // closed without choosing: its sound
+
     void menu_move(int delta);
     void menu_switch(int delta);
 
@@ -176,6 +181,8 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     LauncherCore::Listing listing_;
     std::vector<size_t> order_; // the listing's indices as the table shows them (sorted, filtered)
     std::string rows_sig_;
+    bool animate_rows_ = true; // the next full list of rows comes in animated (the start, a new folder, a new sort)
+    UiSound sound_;
     std::set<uint32_t> icons_;  // title IDs whose image the renderer has
     std::set<uint32_t> failed_; // games whose preparing failed here
     long selected_ = -1;

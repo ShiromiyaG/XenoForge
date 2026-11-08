@@ -83,6 +83,7 @@ struct SettingsPage {
     std::string accent;     // the current accent, "#rrggbb"
     std::string theme;      // "system", "light", "dark"
     std::string backdrop;   // the ribbons: "animated", "still", "off"
+    bool sounds = true;     // the window's own sounds
     std::vector<std::string> gamepads;
     std::string capturing;  // the binding waiting for a key
 };

@@ -1727,6 +1727,46 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   `animated`, `still` or `off` (the grey alone), in the Interface tab, read by
   `LauncherView::update_backdrop` every frame; the clock stops while the
   window is minimized, hidden or covered (focus does not matter).
+- **Motion**: the dashboard's way of moving, in short times with an ease-out
+  (cubic out, as the console's blades; its own blade shuffle is about 180 ms
+  and the strip's slide here 340 ms). The selection fades from one row to
+  the next (`.tr` transitions its fill, border and margins; the glow is a
+  box-shadow, which RmlUi cannot animate, so it is a child `.glow` whose
+  opacity is animated, `LauncherView::fade_glow`, only on the row that is or
+  was just selected). A list that has just appeared (the start, a new
+  folder, a rescan, a new sort) comes in row by row, 40 ms apart, from 28 dp
+  to the left and fading in (`animate_rows_in`: each row holds still at
+  nothing for its turn and then rises, because RmlUi shows an element at
+  rest during an animation's delay). A tab's page comes in from the side the
+  tab lies on, 40 dp and fading in (`SettingsView::slide_page_in`); the
+  strip's page left behind dims to 30% while the other comes up; menus drop
+  in, dialogs rise and grow a little while the window dims (`@keyframes` in
+  theme.rcss). A box-shadow cannot change over time, so a state whose
+  shadows differ snaps while its fill fades.
+- **Pointers** (`ui/cursor_file.*`, `SystemInterface::load_cursors`,
+  `frontend/ui/assets/cursors/`): the console browser's, from the set by
+  MiniYak_YT that the author released to the public domain (README.txt beside
+  the files; the .cur and .ani are shipped as they came, renamed). They are read
+  at start as they are (a .cur is a DIB with a hot spot, an .ani a RIFF of
+  .cur frames with a time per step) and made SDL colour cursors, with a
+  twice-as-large copy for a high-density screen; RmlUi's `cursor` property
+  picks one by name: `default` the grey drop, `pointer` the hand (what can
+  be clicked), `text`, `unavailable` (the disabled toolbar buttons),
+  `progress` (over the build's bars) and `wait` the animated ones, and the
+  resize, move and crosshair ones. A name without a file keeps the system's
+  cursor, so a missing folder costs only the look. The reading is tested
+  (`frontend_test`) on made files and on the shipped ones.
+- **Sounds** (`ui_sound.*`, `[launcher] sounds`, the Interface tab): a tick as
+  the selection or the focus moves, a swish for a tab or between menu titles
+  and a longer one for the strip's slide, a note up for choosing and a note
+  down for going back, short pops for a menu or a dialog opening and
+  closing, a click for a check box, a low pair for what cannot be done or a
+  build that failed and three rising notes for one that finished. They are
+  synthesized when the device opens (`synth_cue`: sine notes with their
+  harmonics and a swept band of noise, scaled to a peak of 0.2 to 0.3; nothing
+  recorded or taken from any system, so no sound file ships), mixed by one
+  SDL3 audio stream on the default device; the same cue twice within 30 ms
+  plays once. A window drawn offscreen (`--render-size`) opens no device.
 - **Dialogs** over the window (theme.rcss's `.dialog`): preparing a game (the
   stages, the bar, the time, the file, the log; Run in background hides it
   behind the status bar's progress, Cancel stops it; then Play, or Try again

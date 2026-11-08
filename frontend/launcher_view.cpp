@@ -44,6 +44,14 @@ LauncherView::LauncherView(LauncherCore &core, ui::Renderer &renderer, SDL_Windo
     parse_sort(core_.launcher().sort, sort_, ascending_);
     last_update_ = Clock::now();
     settings_ = std::make_unique<SettingsView>(core_, *this);
+    if (!opt_.offscreen) { // a picture of the window needs no sound
+        std::string why;
+        if (!sound_.open(why)) std::fprintf(stderr, "launcher: %s\n", why.c_str());
+    }
+}
+
+void LauncherView::play_sound(Cue cue) {
+    if (core_.launcher().sounds) sound_.play(cue);
 }
 
 LauncherView::~LauncherView() {
@@ -229,16 +237,40 @@ void LauncherView::update_backdrop() {
     renderer_.set_backdrop(backdrop);
 }
 
+// The selected row's glow comes up as the row is selected and goes down as it is left (a box-shadow cannot
+// be animated, its opacity can). Only the rows that are, or have just been, selected carry one.
+void LauncherView::fade_glow(Rml::Element *row, bool on) {
+    Rml::Element *glow = row->QuerySelector(".glow");
+    if (!glow && on) {
+        Rml::ElementPtr made = doc_->CreateElement("div");
+        made->SetClass("glow", true);
+        glow = row->InsertBefore(std::move(made), row->GetFirstChild());
+    }
+    if (!glow) return;
+    const Rml::Property zero(0.f, Rml::Unit::NUMBER), one(1.f, Rml::Unit::NUMBER);
+    glow->Animate("opacity", on ? one : zero, 0.2f, Rml::Tween(Rml::Tween::Cubic, Rml::Tween::Out), 1, false, 0.f, on ? &zero : &one);
+    if (!on) {
+        const std::string id = row->GetId();
+        defer_until(now_ + 0.3, [this, id] {
+            Rml::Element *left = by_id(id.c_str());
+            Rml::Element *g = left ? left->QuerySelector(".glow") : nullptr;
+            if (g && !left->IsClassSet("sel")) left->RemoveChild(g);
+        });
+    }
+}
+
 void LauncherView::select_game(long index, bool scroll) {
     if (index < 0 || index >= long(listing_.games.size())) return;
     const long before = selected_;
     selected_ = index;
     if (before != index) {
-        if (Rml::Element *old = by_id(("row-" + std::to_string(before)).c_str())) old->SetClass("sel", false);
+        if (Rml::Element *old = by_id(("row-" + std::to_string(before)).c_str())) old->SetClass("sel", false), fade_glow(old, false);
         if (settings_) settings_->set_game(selected_game());
+        if (before >= 0) play_sound(Cue::Focus); // not the first selection of a list: nobody moved
     }
     if (Rml::Element *row = by_id(("row-" + std::to_string(index)).c_str())) {
         row->SetClass("sel", true);
+        if (before != index) fade_glow(row, true);
         if (scroll) row->ScrollIntoView(Rml::ScrollIntoViewOptions(Rml::ScrollAlignment::Nearest, Rml::ScrollAlignment::Nearest));
     }
     settle_until_ = std::max(settle_until_, now_ + 0.3); // the rows' transition
@@ -324,6 +356,10 @@ void LauncherView::rebuild_rows(bool force) {
         html += table_row_html(r, long(i) == selected_);
     }
     body->SetInnerRML(html);
+    if (animate_rows_ && !listing_.busy && !order_.empty()) { // the whole list is in: it comes in
+        animate_rows_ = false;
+        animate_rows_in();
+    }
 
     const bool filtered = !filter_.empty() && order_.empty() && !listing_.games.empty();
     const bool show_empty = no_folder || filtered || (listing_.games.empty() && !listing_.busy);
@@ -337,6 +373,26 @@ void LauncherView::rebuild_rows(bool force) {
     }
     update_toolbar();
     update_status();
+}
+
+// The rows slide in from the left and fade in, one after another (the first ten; the rest with the tenth),
+// as the console's list does when a page opens. A hold at nothing for the row's turn comes first: an
+// animation's delay would leave the row shown at rest until its turn.
+void LauncherView::animate_rows_in() {
+    Rml::Element *body = by_id("tbody");
+    if (!body) return;
+    const Rml::Tween out(Rml::Tween::Cubic, Rml::Tween::Out);
+    const Rml::Property zero(0.f, Rml::Unit::NUMBER), one(1.f, Rml::Unit::NUMBER);
+    const Rml::Property away(-28.f, Rml::Unit::DP), home(0.f, Rml::Unit::DP);
+    for (int i = 0, n = body->GetNumChildren(); i < n; i++) {
+        Rml::Element *row = body->GetChild(i);
+        const float wait = 0.001f + 0.04f * float(std::min(i, 9));
+        row->Animate("opacity", zero, wait, Rml::Tween{}, 1, false, 0.f, &zero);
+        row->AddAnimationKey("opacity", one, 0.3f, out);
+        row->Animate("left", away, wait, Rml::Tween{}, 1, false, 0.f, &away);
+        row->AddAnimationKey("left", home, 0.3f, out);
+    }
+    settle_until_ = std::max(settle_until_, now_ + 0.9);
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +484,7 @@ void LauncherView::show_section(Section section) {
     section_ = section;
     const bool in_settings = section == Section::Settings;
     close_menu();
+    play_sound(Cue::Page);
     if (Rml::Element *focus = ctx_->GetFocusElement()) focus->Blur(); // a search box in the page that goes
     if (Rml::Element *slide = by_id("slide")) slide->SetClass("to-settings", in_settings);
     if (Rml::Element *e = by_id("nav-games")) e->SetClass("on", !in_settings);
@@ -496,6 +553,7 @@ void LauncherView::set_folder(const std::string &folder) {
     if (!core_.set_games_folder(folder, true, message)) message_box("The folder was not saved", message);
     selected_ = -1;
     rows_sig_.clear();
+    animate_rows_ = true;
     cached_.clear(), stale_.clear();
     last_listing_ = Clock::time_point();
     settings_->set_game(nullptr), settings_->folder_changed();
@@ -505,6 +563,7 @@ void LauncherView::rescan() {
     core_.rescan();
     selected_ = -1;
     rows_sig_.clear();
+    animate_rows_ = true;
     cached_.clear(), stale_.clear();
     last_listing_ = Clock::time_point();
     settings_->set_game(nullptr);

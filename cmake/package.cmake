@@ -16,7 +16,7 @@
 #   ffmpeg-source/               the overlay itself (third_party/ffmpeg: configuration and build script)
 #   LICENSE-xenia, LICENSE-rexglue
 #   ui/                          the launcher's windows (RML, RCSS), its fonts, Inter (SIL OFL) and Roboto Condensed (Apache 2.0), and icons, Lucide (ISC)
-#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Roboto Condensed, Lucide, stb
+#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Roboto Condensed, Lucide, stb, the cursors (public domain)
 #
 # Included by CMakeLists.txt once the player's targets (XF_PLAYERS) and its
 # fetched dependencies exist.
@@ -103,6 +103,9 @@ Lucide (lucide-static 0.460.0), https://lucide.dev - the launcher's icons, ISC
 license (portions from Feather, MIT), shipped as ui/fonts/Lucide.ttf
 ${_rule}
 ${_lucide}
+${_rule}
+Xbox 360 web cursors by MiniYak_YT, https://www.rw-designer.com/cursor-set/xbox-360-custom-web - the launcher's
+pointers, released to the public domain by the author, shipped as ui/cursors/ with the author's note (README.txt)
 ${_rule}
 stb_image and stb_image_write, https://github.com/nothings/stb - MIT license or public domain
 ${_rule}

@@ -177,6 +177,7 @@ std::string table_row_html(const RowInfo &r, bool selected) {
     if (selected) s += " sel";
     if (r.unreadable) s += " broken";
     s += "\" data-index=\"" + std::to_string(r.index) + "\" id=\"row-" + std::to_string(r.index) + "\">";
+    if (selected) s += "<div class=\"glow\"></div>"; // (the rest get one as they are selected: LauncherView::fade_glow)
     auto cell = [&](Column c, const std::string &inner) { s += std::string("<div class=\"td ") + column_class(c) + "\">" + inner + "</div>"; };
     if (r.unreadable) {
         cell(Column::Title, "<div class=\"thumb broken\">" + icon_html("triangle-alert") + "</div><div class=\"names\"><div class=\"title nowrap\">" + e(r.title) +
@@ -258,6 +259,8 @@ std::string about_body_html() {
     s += lic("Inter", "SIL OFL 1.1", "The typeface, by The Inter Project Authors (rsms.me/inter). Its license is in ui/fonts/LICENSE-Inter.txt.");
     s += lic("Roboto Condensed", "Apache 2.0", "The typeface of the games' list and the toolbar. Its license is in ui/fonts/LICENSE-Roboto.txt.");
     s += lic("Lucide", "ISC", "The icons, by the Lucide Contributors (lucide.dev; parts from Feather, MIT). Its license is in ui/fonts/LICENSE-Lucide.txt.");
+    s += lic("Xbox 360 web cursors", "Public domain",
+             "The pointers, the console browser's, as the set by MiniYak_YT (rw-designer.com) released to the public domain. Its note is ui/cursors/README.txt.");
     s += lic("Dear ImGui", "MIT", "The player's debugging overlay (F1).");
     s += lic("toml++", "MIT", "Reads and writes config.toml.");
     s += lic("stb", "MIT / public domain", "Image decoding and PNG writing.");
@@ -417,6 +420,7 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
         look += "</div></div>";
         look += select_row("backdrop", "Background", "The ribbons behind the list; they stop while the window is hidden or minimized.",
                            label_of(backdrop_choices(), page.backdrop));
+        look += check_row("ui.sounds", "Interface sounds", "A tick as the selection moves, a swish between pages, notes for choosing and going back.", page.sounds);
         s += group("Appearance", look);
         std::string folder = "<div class=\"setting\"><div class=\"label\"><div class=\"name\">Games folder</div>"
                              "<div class=\"hint\">Discs are read in place, one level of subfolders deep.</div></div></div>"

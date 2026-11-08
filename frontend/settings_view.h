@@ -19,6 +19,7 @@
 
 #include "launcher_core.h"
 #include "launcher_html.h"
+#include "ui_sound.h"
 
 #include <RmlUi/Core.h>
 #include <SDL3/SDL.h>
@@ -43,6 +44,8 @@ class SettingsHost {
     virtual void leave_settings() = 0;
     // the pad (not the mouse or keys) is what the user last used: focus shows
     virtual bool pad_mode() const = 0;
+    // a cue of the window's own sounds (nothing when they are off)
+    virtual void play_sound(Cue cue) = 0;
 };
 
 class SettingsView final : public Rml::EventListener {
@@ -63,7 +66,8 @@ class SettingsView final : public Rml::EventListener {
 
     // the game selected in the list (nullptr: none): whose settings are edited
     void set_game(const GameEntry *game);
-    void show_tab(SettingsTab tab);
+    // direction: which way the page comes in, +1 from the right (a later tab), -1 from the left; 0: by the tabs' order
+    void show_tab(SettingsTab tab, int direction = 0);
     void folder_changed(); // the games folder changed elsewhere
     void begin_capture(const std::string &binding);
 
@@ -81,6 +85,7 @@ class SettingsView final : public Rml::EventListener {
 
   private:
     void rebuild(); // the scope, the tabs and the page
+    void slide_page_in(int direction); // the page's rows come in from that side (+1 right, -1 left), fading in
     void reload_edit();
     void save_edit();
     SettingsPage page();
