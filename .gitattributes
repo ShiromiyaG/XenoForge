@@ -1,2 +1,5 @@
 # the repository keeps LF; checkouts follow core.autocrlf
 * text=auto
+# the committed SPIR-V words are written by glslc with LF: keep them LF in every checkout,
+# so a build that compiles them again leaves the tree clean
+src/shaders/spirv/*.inc text eol=lf
