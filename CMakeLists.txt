@@ -54,6 +54,7 @@ add_library(xenoforge STATIC
     src/ppc.cpp
     src/ppc_interp.cpp
     src/ppc_runtime.cpp
+    src/fuzz.cpp
     src/guest_space.cpp
     src/recomp_image.cpp
     src/recomp_discover.cpp
@@ -291,8 +292,11 @@ target_link_libraries(xfcompare PRIVATE stb)
 # boot as a library (a port's boot_<name> links it: tools/boot.cpp's run_boot, the shared tools/game.cpp) and the
 # generic boot: the game library cached for the disc, else the interpreter. --render draws what the GPU is sent (the
 # renderer as the command processor's Sink) and writes shots
-add_library(xenoforge_boot STATIC tools/boot.cpp tools/game.cpp)
+add_library(xenoforge_boot STATIC tools/boot.cpp tools/game.cpp tools/sampler.cpp)
 target_link_libraries(xenoforge_boot PUBLIC xenoforge_vk xenoforge PRIVATE stb)
+if(WIN32)
+    target_link_libraries(xenoforge_boot PRIVATE dbghelp winmm)
+endif()
 add_executable(boot tools/stub_main.cpp)
 target_compile_definitions(boot PRIVATE XF_PORT_BOOT)
 target_link_libraries(boot PRIVATE xenoforge_boot xenoforge_kernel xenoforge_vk xenoforge)
@@ -663,6 +667,27 @@ if(XF_PPC_TESTS_DIR)
     add_test(NAME ppc_recompiled COMMAND ppc_recompiled_test)
     set_tests_properties(ppc_recompiled PROPERTIES ENVIRONMENT "XF_PPC_TESTS=${XF_PPC_TESTS_DIR}")
 endif()
+# The differential fuzzer (docs/recompiler.md, "The differential fuzzer"):
+# xffuzz makes the cases (a fixed seed) and recompiles them; ppc_fuzz_test runs
+# each through the interpreter and its generated code, built as the games' is
+add_executable(xffuzz tools/xffuzz.cpp)
+target_link_libraries(xffuzz PRIVATE xenoforge)
+set(XF_FUZZ_OUT ${CMAKE_CURRENT_BINARY_DIR}/fuzz)
+set(XF_FUZZ_SOURCES ${XF_FUZZ_OUT}/fuzz_table.cpp)
+foreach(n RANGE 7)
+    list(APPEND XF_FUZZ_SOURCES ${XF_FUZZ_OUT}/fuzz_${n}.cpp)
+endforeach()
+add_custom_command(
+    OUTPUT ${XF_FUZZ_OUT}/cases.xfz ${XF_FUZZ_SOURCES}
+    COMMAND xffuzz gen ${XF_FUZZ_OUT}/cases.xfz --seed 1 --per-op 12
+    COMMAND xffuzz emit ${XF_FUZZ_OUT}/cases.xfz ${XF_FUZZ_OUT} --files 8
+    DEPENDS xffuzz
+    COMMENT "xffuzz gen and emit")
+set_source_files_properties(${XF_FUZZ_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-g0;-w;-mfma;-mavx2")
+add_executable(ppc_fuzz_test tests/ppc_fuzz_test.cpp ${XF_FUZZ_SOURCES})
+target_compile_definitions(ppc_fuzz_test PRIVATE XF_FUZZ_CASES="${XF_FUZZ_OUT}/cases.xfz")
+target_link_libraries(ppc_fuzz_test PRIVATE xenoforge)
+add_test(NAME ppc_fuzz COMMAND ppc_fuzz_test)
 add_executable(shader_compare_test tests/shader_compare_test.cpp)
 target_link_libraries(shader_compare_test PRIVATE xenoforge_vk)
 add_test(NAME shader_compare COMMAND shader_compare_test)

@@ -54,15 +54,19 @@
 // of their own (PortInfo::hook_module) loads it before the game runs and
 // loads it again when the file changes, or every S seconds with
 // --reload-hooks-every S (docs/sdk.md, "Reloading the hooks").
+// --profile N samples where the CPU time goes (sampler.h; from S seconds on
+// with --profile-from S) and prints the swaps a second over that span, the
+// shares and the N most sampled functions at the end.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 //        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
-//        [--hook-stats] [--reload-hooks-every S]
+//        [--hook-stats] [--reload-hooks-every S] [--profile N [--profile-from S]]
 
 #include "game.h"
+#include "sampler.h"
 #include "xenoforge/hooks.h"
 #include "xenoforge/lockstep.h"
 #include "xenoforge/run.h"
@@ -120,7 +124,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                         "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
                         "[--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
                         "[--language N] [--country N] [--resolution WxH] [--widescreen 0|1] [--refresh 50|60] "
-                        "[--follow-launches] [--launch-data <file>] [--option <key>=<value>]... [--directory-saves]\n";
+                        "[--follow-launches] [--launch-data <file>] [--option <key>=<value>]... [--directory-saves] "
+                        "[--profile N [--profile-from S]]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -138,6 +143,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     double reload_every = 0;
     bool follow_launches = false;
     std::filesystem::path launch_data_file;
+    size_t profile_top = 0;
+    double profile_from = 0;
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc)
@@ -177,6 +184,10 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             rates = true;
         else if (a == "--crash-dir" && k + 1 < argc)
             game::set_crash_directory(argv[++k]);
+        else if (a == "--profile" && k + 1 < argc)
+            profile_top = size_t(std::strtoul(argv[++k], nullptr, 10));
+        else if (a == "--profile-from" && k + 1 < argc)
+            profile_from = std::strtod(argv[++k], nullptr);
         else if (a == "--stall-report" && k + 1 < argc)
             stall_report = std::strtod(argv[++k], nullptr);
         else if (a == "--lockstep" && k + 1 < argc) {
@@ -288,6 +299,9 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     bool stall_reported = false;
     bool halted = false;
     double next_reload = reload_every;
+    bool profiling = false;
+    uint64_t profile_swaps = 0;
+    double profile_started = 0, profile_cpu = 0;
     for (double elapsed = 0; elapsed < seconds && !k.stopped;) {
         if ((ended = k.wait_main(100, &exit_code))) break;
         if ((halted = k.halted())) break;
@@ -297,6 +311,11 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         if (due) next_reload += reload_every;
         game::poll_port_module(g, due);
         if (rates && elapsed >= next_rates) game::print_rates(g, rate_log, elapsed), next_rates += 1;
+        if (profile_top && !profiling && elapsed >= profile_from) {
+            profiling = true, profile_swaps = swaps(), profile_started = elapsed;
+            profile_cpu = sampler::process_cpu_seconds();
+            if (!sampler::start()) std::fprintf(stderr, "boot: --profile is not supported on this host\n");
+        }
         if (stall_report > 0) {
             uint64_t now_swaps = swaps();
             if (now_swaps != last_swaps) {
@@ -310,6 +329,14 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         }
     }
 
+    if (profiling) {
+        double span = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() - profile_started;
+        uint64_t swapped = swaps() - profile_swaps;
+        double cpu = sampler::process_cpu_seconds() - profile_cpu;
+        std::printf("profile: %.1f s, %.2f swaps a second, %.1f ms of CPU (all threads) a swap\n", span,
+                    double(swapped) / span, swapped ? 1000.0 * cpu / double(swapped) : 0.0);
+        sampler::stop_and_report(profile_top);
+    }
     if (k.stopped)
         std::printf("stopped: %s\n", k.stop_reason.c_str());
     else if (ended)

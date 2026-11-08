@@ -1,0 +1,217 @@
+// The sampling profiler (sampler.h).
+
+#include "sampler.h"
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+// after windows.h
+#include <dbghelp.h>
+#include <mmsystem.h>
+#include <tlhelp32.h>
+
+#include <atomic>
+#include <mutex>
+#include <thread>
+
+namespace xf::sampler {
+
+namespace {
+
+struct Sampled {
+    HANDLE handle = nullptr;
+    uint64_t cycles = 0; // the thread's cycle count at the last sample
+};
+
+std::atomic<bool> running{false};
+std::thread worker;
+std::mutex mutex;
+std::map<uint64_t, uint64_t> weights; // rip -> cycles spent there (the interval's)
+uint64_t total = 0;
+
+void sample_loop(unsigned interval_us) {
+    timeBeginPeriod(1);
+    DWORD self = GetCurrentThreadId(), process = GetCurrentProcessId();
+    std::map<DWORD, Sampled> threads;
+    auto refresh = [&] {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return;
+        THREADENTRY32 e{sizeof(e)};
+        for (BOOL ok = Thread32First(snap, &e); ok; ok = Thread32Next(snap, &e)) {
+            if (e.th32OwnerProcessID != process || e.th32ThreadID == self || threads.count(e.th32ThreadID)) continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+                                  e.th32ThreadID);
+            if (!h) continue;
+            Sampled s{h, 0};
+            QueryThreadCycleTime(h, &s.cycles);
+            threads[e.th32ThreadID] = s;
+        }
+        CloseHandle(snap);
+    };
+    refresh();
+    auto last_refresh = std::chrono::steady_clock::now();
+    std::map<uint64_t, uint64_t> local;
+    uint64_t local_total = 0;
+    while (running.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
+        for (auto it = threads.begin(); it != threads.end();) {
+            Sampled &s = it->second;
+            ULONG64 cycles = 0;
+            if (!QueryThreadCycleTime(s.handle, &cycles)) {
+                CloseHandle(s.handle);
+                it = threads.erase(it);
+                continue;
+            }
+            uint64_t spent = cycles - s.cycles;
+            s.cycles = cycles;
+            // a thread that ran: where it is now stands for the interval's cycles
+            if (spent > 0 && SuspendThread(s.handle) != DWORD(-1)) {
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(s.handle, &ctx)) local[ctx.Rip] += spent, local_total += spent;
+                ResumeThread(s.handle);
+            }
+            ++it;
+        }
+        if (std::chrono::steady_clock::now() - last_refresh > std::chrono::milliseconds(200)) {
+            refresh();
+            last_refresh = std::chrono::steady_clock::now();
+        }
+    }
+    for (auto &[id, s] : threads) CloseHandle(s.handle);
+    timeEndPeriod(1);
+    std::lock_guard lock(mutex);
+    weights = std::move(local);
+    total = local_total;
+}
+
+bool generated_name(std::string n) {
+    // a module's functions sit in its namespace (xfm_default_xex::xf_822D5D18)
+    if (size_t colons = n.rfind("::"); colons != std::string::npos) n = n.substr(colons + 2);
+    // <prefix>_<8 hex digits>: a generated function (xf_822D5D18, xfo_..., a DLL's prefix)
+    if (n.size() < 10) return false;
+    size_t u = n.size() - 9;
+    if (n[u] != '_') return false;
+    for (size_t k = u + 1; k < n.size(); k++)
+        if (!std::isxdigit(uint8_t(n[k]))) return false;
+    for (size_t k = 0; k < u; k++)
+        if (!std::isalnum(uint8_t(n[k]))) return false;
+    return true;
+}
+
+std::string category(const std::string &name, const std::string &module) {
+    if (generated_name(name)) return "generated code";
+    if (name.find("ppc::ops::") != std::string::npos) return "instructions' cold paths";
+    if (name.find("ppc::interpret") != std::string::npos || name.find("ppc_interp") != std::string::npos ||
+        name.find("ppc::Interpreter") != std::string::npos)
+        return "interpreter";
+    if (name.find("ppc::") != std::string::npos) return "ppc runtime (dispatch, unwind)";
+    if (name.find("kernel::") != std::string::npos) return "kernel";
+    if (name.find("render::") != std::string::npos || name.find("gpu::") != std::string::npos ||
+        name.find("vk::") != std::string::npos)
+        return "GPU emulation";
+    if (module.find("ntdll") != std::string::npos || module.find("KERNELBASE") != std::string::npos ||
+        module.find("kernel32") != std::string::npos)
+        return "host OS (" + module + ")";
+    if (module.find("boot") == std::string::npos && module.find("player") == std::string::npos)
+        return "other module (" + module + ")";
+    return "other";
+}
+
+} // namespace
+
+double process_cpu_seconds() {
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return -1;
+    auto value = [](FILETIME t) { return double(uint64_t(t.dwHighDateTime) << 32 | t.dwLowDateTime) * 1e-7; };
+    return value(kernel) + value(user);
+}
+
+bool start(unsigned interval_us) {
+    if (running.exchange(true)) return true;
+    worker = std::thread(sample_loop, interval_us);
+    return true;
+}
+
+void stop_and_report(size_t top) {
+    if (!running.exchange(false)) return;
+    worker.join();
+    std::lock_guard lock(mutex);
+    if (!total) return (void)std::printf("profile: no samples\n");
+    HANDLE process = GetCurrentProcess();
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(process, nullptr, TRUE);
+    struct Fn {
+        uint64_t weight = 0;
+        std::string cat;
+        std::map<uint64_t, uint64_t> offsets;
+    };
+    std::map<std::string, Fn> fns;
+    std::map<std::string, uint64_t> cats;
+    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 512];
+    for (auto &[rip, w] : weights) {
+        auto *sym = reinterpret_cast<SYMBOL_INFO *>(buffer);
+        std::memset(buffer, 0, sizeof(buffer));
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 511;
+        DWORD64 displacement = 0;
+        std::string name = "?", module = "?";
+        IMAGEHLP_MODULE64 mod{sizeof(mod)};
+        if (SymGetModuleInfo64(process, rip, &mod)) module = mod.ModuleName;
+        if (SymFromAddr(process, rip, &displacement, sym)) name = sym->Name;
+        else name = module + "+?";
+        Fn &f = fns[name];
+        if (f.cat.empty()) f.cat = category(name, module);
+        f.weight += w;
+        f.offsets[displacement] += w;
+        cats[f.cat] += w;
+    }
+    SymCleanup(process);
+    std::printf("profile: where the CPU time went (%llu Mcycles sampled)\n", (unsigned long long)(total / 1000000));
+    std::vector<std::pair<uint64_t, std::string>> by_cat;
+    for (auto &[c, w] : cats) by_cat.push_back({w, c});
+    std::sort(by_cat.rbegin(), by_cat.rend());
+    for (auto &[w, c] : by_cat) std::printf("  %5.1f%%  %s\n", 100.0 * double(w) / double(total), c.c_str());
+    std::vector<std::pair<uint64_t, std::string>> by_fn;
+    for (auto &[n, f] : fns) by_fn.push_back({f.weight, n});
+    std::sort(by_fn.rbegin(), by_fn.rend());
+    std::printf("profile: top functions\n");
+    for (size_t k = 0; k < by_fn.size() && k < top; k++) {
+        const Fn &f = fns[by_fn[k].second];
+        std::vector<std::pair<uint64_t, uint64_t>> offs;
+        for (auto &[o, w] : f.offsets) offs.push_back({w, o});
+        std::sort(offs.rbegin(), offs.rend());
+        std::string hot;
+        for (size_t j = 0; j < offs.size() && j < 3; j++) {
+            char b[32];
+            std::snprintf(b, sizeof(b), " +0x%llx", (unsigned long long)offs[j].second);
+            hot += b;
+        }
+        std::printf("  %5.2f%%  %-48s %s [%s ]\n", 100.0 * double(f.weight) / double(total), by_fn[k].second.c_str(),
+                    f.cat.c_str(), hot.c_str());
+    }
+}
+
+} // namespace xf::sampler
+
+#else
+
+namespace xf::sampler {
+// TODO: POSIX (a profiling timer's signal reading the interrupted context)
+bool start(unsigned) { return false; }
+double process_cpu_seconds() { return -1; } // TODO: getrusage
+void stop_and_report(size_t) {}
+} // namespace xf::sampler
+
+#endif
