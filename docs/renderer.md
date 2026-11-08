@@ -2122,6 +2122,7 @@ brackets; GPU ms a frame by the counter):
 | scene (window) | ours (interlock, the default) | ours, host targets | Xenia D3D12 (host targets, its default) |
 | --- | --- | --- | --- |
 | Game B, 3D title scene (90-130 s, 60 fps cap) | 1.39 (1.38-1.39) | 1.53 (1.52-1.56) | 0.83 (0.83-0.85) |
+| the same, after "Direct ownership transfers" below | 1.29 (1.28-1.32) | 1.21 (1.19-2.61) | 0.78 (0.75-0.80) |
 | Game A, attract loop (120-160 s, 30 fps cap) | 4.90 (2.16-5.04) | not run | 5.64 (1.99-6.17) |
 
 Game B: Xenia's exact path (ROV) 1.26, one run, against our 1.39 on ours.
@@ -2148,12 +2149,23 @@ Where we lose and why, for game B:
   draws cost about twice the host's (the scene's
   32 2x-MSAA draws: 0.55 against 0.25 ms in the 3600 trace's replay), the
   price of exactness.
-- Our host path loses to Xenia's host path because its ownership transfers
-  go through the EDRAM buffer, a store by the holder and a load by the new
+- Our host path lost to Xenia's host path because its ownership transfers
+  went through the EDRAM buffer, a store by the holder and a load by the new
   target (0.50 ms of the replay's frame, eight passes), where Xenia's
   render target cache draws the holder's image straight into the new target
-  (one pass, no EDRAM buffer). Porting Xenia's direct transfers is the next
-  step for the host path.
+  (one pass, no EDRAM buffer). Ported, with the rest of "Direct ownership
+  transfers, and the frame's fixed costs" below; the second row of the
+  table is after it (3 runs each, A B A B; Xenia's ROV then 1.23
+  (1.22-1.33); the host path's 2.61 is a run during which another agent's
+  player of the same disc ran beside it, as it did for one Xenia ROV run;
+  an earlier set, two runs: ours 1.31-1.32, host 1.25, Xenia 0.82, ROV
+  1.24). We still lose: the interlock path by 5% to Xenia's ROV, the host
+  path by about half to Xenia's host path. The replay of the 3600 trace
+  puts the host path's frame at 0.81 ms without the trace's read-back
+  (scene draws 0.27, the final composite 0.12, resolves 0.13, transfers
+  0.20, resolves' EDRAM stores 0.08); where Xenia spends less is not known
+  without a GPU profile of Xenia (Nsight Systems times D3D12 command lists
+  as a whole; Xenia submits a frame as one).
 - Fixed here: a texture the game renders to every frame was loaded again
   every frame (0.15 ms of the live frame): a second, smaller surface is
   placed inside the first one's memory, 384 rows down, and its resolve made
@@ -2204,6 +2216,115 @@ itself is Xenia's code; what feeds it (the alpha of DXT5 foliage
 textures at a distance: the filtering, the mip chosen, the packed mip
 tail) is where to look next, draw by draw, which needs a replay that stops
 after a given draw against a reference that can too (Xenia's trace viewer).
+
+## Direct ownership transfers, and the frame's fixed costs (2026-11-08)
+
+**Ownership transfers straight from the holder** (host render targets;
+Xenia's render target cache, `GetTransferShader` and the D3D12 transfer
+pixel shaders). A target taking over EDRAM tiles another target holds now
+draws them from the holder's image in one pass (`edram_transfer.frag`,
+`Impl::edram_transfer`), instead of a compute store of the holder into the
+EDRAM buffer and a load from there. Each destination sample finds its
+EDRAM dword by the destination's layout (`edram_offset`), the source pixel
+and sample holding that dword by the inverse of the source's, and goes
+through the guest's bits: the shader is the store's packing followed by the
+load's unpacking (`edram.glsl` with `EDRAM_TWO_TARGETS`: `target` is a
+variable set to either side's push constants), so the pictures are the
+same bit for bit. A 64-bit destination over a 32-bit source takes its two
+dwords from two source samples, a 32-bit one over a 64-bit source the
+half of the sample. The source's own store set is the transfer's
+descriptor set (its views and the host depth buffer, now visible to the
+fragment stage too). Draws are rectangles of tiles (Xenia's
+`GetRangeRectangles`: a run of tiles is at most a part of a row, whole rows
+and a part of a row), one render pass a destination, every holder in it.
+The host's 32-bit depth beside EDRAM is kept as before: a depth source of a
+format the host encodes differently writes its depth into `host_depth_`
+from the transfer's fragment shader, a destination of such a format takes
+it back where it still rounds to the guest's bits (the source's own value
+when they share the format). Tiles no target holds (a trace's start) are
+still loaded from EDRAM. `XF_EDRAM_TRANSFERS=store` keeps the two passes.
+
+**Stencil by copy** (beyond Xenia). Without stencil export (the RTX 5060)
+the stencil was written a pass a bit, eight more passes over every
+transferred depth sample: the depth transfers cost 0.13 ms each in game B's
+3600 trace, 0.21 as single-pass transfers with the bit passes. With
+`VK_KHR_maintenance8` (a query; `XF_VK_NO_MAINTENANCE8=1` turns it off)
+copies between a depth/stencil aspect and a color image of the same texel
+size are allowed: the transfer's one pass writes depth and, into an
+`R8_UINT` color attachment the size of the target (`RenderTarget::
+stencil_copy`, made at the first transfer), the stencil; `vkCmdCopyImage`
+then copies its rectangles into the stencil aspect. 0.05 ms a depth
+transfer. Devices with stencil export export it; devices with neither keep
+the bit passes.
+
+**Uploads ahead of the submission** (beyond Xenia; both paths). A draw
+whose vertex pages the CPU wrote copied them into the mirror between its
+draws: the render pass ended, a full barrier drained the GPU, the copy ran,
+the next draw began a new pass. Game B's title scene does it 4.7 times a
+frame (2.4 of them inside a pass). Now the pages of a run nothing in the
+recording submission has used yet (read by a draw or a texture load,
+written by a resolve or an export: `page_used_`, the submission's serial a
+page) are copied in the slot's `pre` command buffer, submitted ahead of the
+main one with a barrier on each side; the others are copied in between as
+before. A draw that flushes the submission for room after requesting its
+pages marks them in the new one. `XF_HOISTED_UPLOADS=0` turns it off. Game
+B live (interlock, `boot --render`, 130 s): the GPU time marked "other"
+(barriers and uploads) from 0.812 s to 0.108 s, the run's GPU time from
+9.33 s to 8.59 s.
+
+**Interlock clears by fill.** A resolve's clear into EDRAM wrote each
+sample from `edram_clear.comp`, scattered across tiles. Whole rows of tiles
+the rectangle covers (the pitch a whole number of tiles; a 64-bit clear's
+two words equal) are now one `vkCmdFillBuffer` of the run of tiles, the
+rows above and below through the shader. Game B's three clears a frame:
+0.079 to 0.040 ms in the replay.
+
+**Host resolves from EDRAM always.** A single-sampled target's resolve
+copied its image into a buffer and converted that; now its tiles are stored
+into EDRAM and the resolve reads them there, as multisampled ones (and
+Xenia's resolve shaders, always) do. Game B's final 1280x720 resolve: 0.099
+ms against 0.030 + 0.034; live (`boot --render`, `XF_GPU_TIME=1`, the marks
+now name the resolve's source) that resolve took 0.27 ms a frame. Game E's
+frames come nearer Xenia's picture with it (0.040 to 0.006 of 255).
+`XF_RESOLVE_FROM_IMAGE=1` keeps the copy.
+
+Game B's 3600 trace, `xfreplay --gpu-time --repeat 30` (the fastest play;
+0.50 ms of it is the trace's front buffer read-back): host render targets
+1.639 ms, with direct transfers 1.642 (the bit passes made the depth
+transfers dearer than the loads), with the stencil copied 1.31-1.38;
+interlock 1.452, with clears by fill 1.441. Pictures unchanged
+(`replay_test` 29/29 both paths, also with `XF_VK_NO_MAINTENANCE8=1`;
+validation clean) but game E's three frames, nearer Xenia's with the
+resolves above. Game A's race trace (`--repeat 10`): host render targets
+4.27-4.37 ms a play, 5.49 with the old ways (`XF_EDRAM_TRANSFERS=store
+XF_VK_NO_MAINTENANCE8=1 XF_RESOLVE_FROM_IMAGE=1`); interlock 4.19-4.23.
+
+**The default stays the interlock path.** Live in game B the host path is
+now 6% faster (1.21 against 1.29 ms a frame), in game A's race replay 3%
+slower; the interlock path is exact, matches Xenia's exact pictures, and
+needs none of the host path's approximations. Both are within a few
+percent of each other, so exactness decides.
+
+**Tried and left** (interlock draws; game B's 32 scene draws, 0.533 ms in
+the replay against the host path's 0.269): reading every covered sample's
+depth before writing any, and the blended target's destinations before the
+depth test (one wait for EDRAM rather than two), changed nothing; pixel
+against sample interlock, nothing; without `Coherent` on EDRAM 0.454 (not
+kept: the interlock orders the critical sections, coherence makes their
+writes visible, Xenia keeps it too). Without the depth test's work the
+draws take 0.388, so about 0.15 ms is the depth's read-modify-write and
+the rest the colors' and the guest shader's own; the host path's early
+depth and the ROPs' compression have no counterpart without host
+attachments.
+
+**A lead: the arena in video memory.** The arena (constants, indices,
+attributes, uploads' staging) is the first host-visible type, system memory
+on the RTX 5060, so every draw's constants cross PCIe. Put in the
+device-local host-visible type instead (an experiment), game B's host-path
+replay went from 1.36-1.38 to 1.29-1.35 ms a play, its scene draws 0.25 to
+0.23. That type is a 214 MB heap here (no resizable BAR), against the
+arena's 192 MB, so it is not taken: it wants a heap at least twice the
+arena (resizable BAR) or a smaller arena of its own for the draws' data.
 
 ## What is asked and not done is counted
 
