@@ -97,7 +97,21 @@ uint8_t *map_view(MappingHandle handle, uint8_t *base, size_t length, uint64_t o
         MapViewOfFileEx(handle, FILE_MAP_ALL_ACCESS, DWORD(offset >> 32), DWORD(offset), length, base));
 }
 
+// copy on write (Memory::PrivateView)
+uint8_t *map_private_view(MappingHandle handle, uint8_t *base, size_t length, uint64_t offset) {
+    return static_cast<uint8_t *>(
+        MapViewOfFileEx(handle, FILE_MAP_COPY, DWORD(offset >> 32), DWORD(offset), length, base));
+}
+
 void unmap_view(uint8_t *view, size_t) { UnmapViewOfFile(view); }
+
+// a private view's copies dropped: unmapped and mapped again at the same base
+// (Windows cannot replace a view in place; another thread may take the hole
+// meanwhile, and then this fails)
+uint8_t *remap_private_view(MappingHandle handle, uint8_t *view, size_t length, uint64_t offset) {
+    UnmapViewOfFile(view);
+    return map_private_view(handle, view, length, offset);
+}
 
 bool host_commit(void *address, size_t length, Access access) {
     return VirtualAlloc(address, length, MEM_COMMIT, win32_protect(access)) != nullptr;
@@ -179,6 +193,29 @@ uint8_t *map_view(MappingHandle handle, uint8_t *base, size_t length, uint64_t o
 }
 
 void unmap_view(uint8_t *view, size_t length) { munmap(view, length); }
+
+// copy on write (Memory::PrivateView): a private mapping of the shared
+// memory's descriptor, which reads the shared pages until it writes them
+uint8_t *map_private_view(MappingHandle handle, uint8_t *base, size_t length, uint64_t offset) {
+    int flags = MAP_PRIVATE;
+#ifdef MAP_FIXED_NOREPLACE
+    flags |= MAP_FIXED_NOREPLACE;
+#endif
+    void *view = mmap(base, length, PROT_READ | PROT_WRITE, flags, handle, off_t(offset));
+    if (view == MAP_FAILED) return nullptr;
+    if (view != base) {
+        munmap(view, length);
+        return nullptr;
+    }
+    return static_cast<uint8_t *>(view);
+}
+
+// a private view's copies dropped: mapped again over itself (MAP_FIXED
+// replaces the old mapping at once)
+uint8_t *remap_private_view(MappingHandle handle, uint8_t *view, size_t length, uint64_t offset) {
+    void *again = mmap(view, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, handle, off_t(offset));
+    return again == MAP_FAILED ? nullptr : static_cast<uint8_t *>(again);
+}
 
 bool host_commit(void *address, size_t length, Access access) {
     return mprotect(address, length, posix_protect(access)) == 0;
@@ -1060,6 +1097,56 @@ constexpr struct {
 constexpr size_t view_count = sizeof(map_info) / sizeof(map_info[0]);
 constexpr uint64_t section_size = 0x120000000; // 4 GB and the 512 MB of physical memory
 
+// Memory::PrivateView: the same views of the section, copy on write, at a
+// base of their own
+class PrivateViewImpl final : public Memory::PrivateView {
+public:
+    explicit PrivateViewImpl(MappingHandle mapping) : mapping_(mapping) {}
+    ~PrivateViewImpl() override { unmap(); }
+
+    bool map(uint8_t *at) {
+        for (size_t n = 0; n < view_count; n++) {
+            views_[n] = map_private_view(mapping_, at + map_info[n].start, length(n), offset(n));
+            if (!views_[n]) {
+                unmap();
+                return false;
+            }
+        }
+        base_ = at;
+        return true;
+    }
+
+    bool reset(uint32_t address, uint32_t size) override {
+        if (!base_) return false;
+        // the host offsets the guest range reaches (translate's)
+        uint64_t first = uint64_t(address) + (address >= 0xE0000000u ? 0x1000u : 0u);
+        uint64_t last = first + (size ? size - 1 : 0);
+        for (size_t n = 0; n < view_count; n++) {
+            if (last < map_info[n].start || first > map_info[n].end) continue;
+            views_[n] = remap_private_view(mapping_, views_[n], length(n), offset(n));
+            if (!views_[n]) {
+                unmap();
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    static size_t length(size_t n) { return size_t(map_info[n].end - map_info[n].start + 1); }
+    static uint64_t offset(size_t n) { return map_info[n].target & ~(view_granularity - 1); }
+    void unmap() {
+        for (size_t n = 0; n < view_count; n++) {
+            if (views_[n]) unmap_view(views_[n], length(n));
+            views_[n] = nullptr;
+        }
+        base_ = nullptr;
+    }
+
+    MappingHandle mapping_;
+    uint8_t *views_[view_count] = {};
+};
+
 void store_be32(uint8_t *p, uint32_t value) {
     p[0] = uint8_t(value >> 24);
     p[1] = uint8_t(value >> 16);
@@ -1116,6 +1203,15 @@ public:
     Heap *heap_by_type(bool physical, uint32_t page_size) override { return lookup_heap_by_type(physical, page_size); }
     uint32_t system_alloc(uint32_t size, uint32_t alignment, bool physical) override;
     void system_free(uint32_t address) override;
+    std::unique_ptr<PrivateView> private_view(std::string &error) override {
+        auto view = std::make_unique<PrivateViewImpl>(mapping_);
+        // where the host has room, as init() finds it for the guest's own
+        for (int n = 32; n < 64; n++)
+            if (auto *at = reinterpret_cast<uint8_t *>(uintptr_t(1) << n); at != virtual_membase_ && view->map(at))
+                return view;
+        error = "no room in the host's address space for a private view of the guest memory";
+        return nullptr;
+    }
 
 private:
     bool map_views(uint8_t *mapping_base);

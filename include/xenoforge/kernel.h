@@ -37,6 +37,9 @@ namespace xf::kernel {
 
 class Kernel;
 class Objects; // the objects and threads (src/kernel/objects.h)
+class Lockstep; // the lockstep check (lockstep.h, src/kernel/lockstep.cpp)
+struct LockstepOptions;
+struct LockstepCounts;
 using ExportFn = void (*)(Kernel &k, ppc::Context &c);
 
 // Registers an export's implementation by library ("xboxkrnl", "xam") and
@@ -366,7 +369,18 @@ public:
     // address (within 64 KB): the guest function a fault there came from.
     bool guest_function_of_host(const void *host, uint32_t &start) const;
 
+    // The lockstep check (lockstep.h): the interpreter checks the generated
+    // code of the calls chosen, mismatches printed as they are found. Set
+    // before guest threads run; off by default.
+    bool enable_lockstep(const LockstepOptions &options, std::string &error);
+    bool lockstep_enabled() const { return lockstep_ != nullptr; }
+    LockstepCounts lockstep_counts() const;
+    std::string lockstep_report() const; // the counts, a few lines
+
 private:
+    friend class Lockstep;
+    // (try_call's) generated code run, or checked by the lockstep check
+    void run_generated(ppc::Context &c, uint32_t target, void (*fn)(ppc::Context &));
     void bind(const Xex &xex, bool executable);
     void run_import(ppc::Context &c, const Import &import);
     void publish_code();
@@ -421,6 +435,7 @@ private:
     // destroyed after the objects and threads, before the rest
     std::mutex states_mutex_;
     std::map<const void *, std::shared_ptr<void>> states_;
+    std::unique_ptr<Lockstep> lockstep_;
     std::unique_ptr<Objects> objects_; // last: it reaches the rest
 };
 

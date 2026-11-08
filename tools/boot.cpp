@@ -38,6 +38,10 @@
 // The last line is "xf-summary {json}" (game.h, print_summary), what xfcompat
 // reads: title, digest, state (ok, stall, stopped, ended, crash), generated
 // code, interpreter entries, swaps, the exports and GPU gaps counted.
+// --lockstep 82001234,... and --lockstep-sample N have the interpreter check
+// the generated code of the calls to those functions and of one call in N
+// (xenoforge/lockstep.h; XF_LOCKSTEP and XF_LOCKSTEP_SAMPLE in the player):
+// mismatches are printed as found, the counts in the report.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
@@ -45,6 +49,7 @@
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 
 #include "game.h"
+#include "xenoforge/lockstep.h"
 
 #include <chrono>
 #include <cstdio>
@@ -64,7 +69,8 @@ int main(int argc, char **argv) {
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
                         "[--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
-                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] [--crash-dir <dir>]\n";
+                        "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] [--crash-dir <dir>] "
+                        "[--lockstep <address,...>] [--lockstep-sample N]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -117,6 +123,11 @@ int main(int argc, char **argv) {
             game::set_crash_directory(argv[++k]);
         else if (a == "--stall-report" && k + 1 < argc)
             stall_report = std::strtod(argv[++k], nullptr);
+        else if (a == "--lockstep" && k + 1 < argc) {
+            if (!kernel::parse_lockstep_functions(argv[++k], o.lockstep))
+                return std::fprintf(stderr, "bad --lockstep\n%s", usage), 2;
+        } else if (a == "--lockstep-sample" && k + 1 < argc)
+            o.lockstep_sample = uint32_t(std::strtoul(argv[++k], nullptr, 10));
         else if (a == "--press" && k + 1 < argc) {
             std::string why;
             if (!game::parse_press(argv[++k], presses.emplace_back(), why))

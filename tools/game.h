@@ -43,6 +43,12 @@ struct Options {
     // one named; with none, the game is interpreted.
     std::filesystem::path cache;
     std::filesystem::path game_library;
+    // The lockstep check (xenoforge/lockstep.h): the interpreter checks the
+    // generated code of the calls to these functions and of one call in
+    // lockstep_sample to any; XF_LOCKSTEP and XF_LOCKSTEP_SAMPLE when neither
+    // is given (the player's way). The report gives the counts.
+    std::vector<uint32_t> lockstep;
+    uint32_t lockstep_sample = 0;
 };
 
 struct Game {

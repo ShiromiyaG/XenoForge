@@ -7,6 +7,7 @@
 #include "xenoforge/disc.h"
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
+#include "xenoforge/lockstep.h"
 
 #include <algorithm>
 #include <cctype>
@@ -211,6 +212,20 @@ bool open(const Options &options, Game &g, std::string &error) {
 #endif
     if (!k.load(g.xex, error)) return error = "load: " + error, false;
     k.step_limit = options.steps;
+    {
+        kernel::LockstepOptions lockstep;
+        lockstep.functions = options.lockstep, lockstep.sample = options.lockstep_sample;
+        std::string why;
+        bool wanted = !lockstep.functions.empty() || lockstep.sample || kernel::lockstep_options_from_env(lockstep, why);
+        if (!why.empty()) return error = why, false;
+        if (wanted && g.generated_functions) {
+            if (!k.enable_lockstep(lockstep, error)) return error = "lockstep: " + error, false;
+            std::printf("lockstep: %zu functions chosen, one call in %u sampled\n", lockstep.functions.size(),
+                        lockstep.sample);
+        } else if (wanted) {
+            std::printf("lockstep: no generated code to check\n");
+        }
+    }
     std::printf("loaded %s: base 0x%08X, entry 0x%08X, %zu imported functions\n", options.xex_path.c_str(),
                 g.xex.base_address, k.entry_point(), k.imports().size());
     // a DLL's entry point is its DllMain, which returns at once: another
@@ -325,6 +340,7 @@ bool launch(Game &g, std::string &error) {
 void print_report(Game &g, bool waiting) {
     kernel::Kernel &k = *g.kernel;
     std::printf("%s", kernel::modules_report(k).c_str());
+    if (k.lockstep_enabled()) std::printf("%s", k.lockstep_report().c_str());
     // where the interpreter was entered: with generated code, what
     // discovery missed (the most entered first)
     auto targets = k.interpreted_targets();

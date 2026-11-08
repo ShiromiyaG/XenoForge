@@ -25,6 +25,7 @@
 
 #include "xenoforge/kernel.h"
 
+#include "lockstep_check.h"
 #include "objects.h"
 #include "xenoforge/crash.h"
 #include "xenoforge/exports.h"
@@ -150,7 +151,12 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
     system_.time_base = [](ppc::Context &c) {
         // the Xenon's time base runs at 50 MHz: 5 ticks in the scheduler's
         // clock's 100 ns
-        return static_cast<Kernel *>(c.system->owner)->objects_->now() * 5;
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        // what the lockstep check's interpreter read here, read again
+        uint64_t replayed;
+        if (k.lockstep_ && k.lockstep_->replay_time_base(c, replayed)) [[unlikely]]
+            return replayed;
+        return k.objects_->now() * 5;
     };
     // the globals first: the objects and threads use their processes,
     // object types and KeTimeStampBundle
@@ -437,8 +443,14 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
     // a suspension or kernel APCs waiting for this thread happen here
     if (Thread *t = current_thread(); t && t->pending.load(std::memory_order_relaxed)) objects_->safe_point(*t);
     if (import_hook_) import_hook_(import_hook_user_, import, c, false);
+    // (the lockstep check compares at an import, and starts its next segment
+    // from what the import left)
+    if (lockstep_) [[unlikely]]
+        lockstep_->before_import(c, import);
     if (import.fn) import.fn(*this, c);
     else result(c, 0);
+    if (lockstep_) [[unlikely]]
+        lockstep_->after_import(c);
     if (import_hook_) import_hook_(import_hook_user_, import, c, true);
 }
 
@@ -448,7 +460,7 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
         const Generated *it =
             std::lower_bound(generated_, end, target, [](const Generated &g, uint32_t a) { return g.address < a; });
         if (it != end && it->address == target && it->fn) { // (none: a function left out)
-            it->fn(c);
+            run_generated(c, target, it->fn);
             return true;
         }
     }
@@ -458,7 +470,7 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
             uint32_t offset = target - r.begin;
             if (offset >= r.size) continue;
             if (CodeMap::Fn fn = r.table[offset / 4]; fn && !(offset & 3)) {
-                fn(c);
+                run_generated(c, target, fn);
                 return true;
             }
             break;
@@ -482,6 +494,21 @@ bool Kernel::try_call(ppc::Context &c, uint32_t target) {
     }
     return false;
 }
+
+void Kernel::run_generated(ppc::Context &c, uint32_t target, void (*fn)(ppc::Context &)) {
+    if (lockstep_ && lockstep_->wanted(c, target)) [[unlikely]]
+        return lockstep_->check(c, target, fn);
+    fn(c);
+}
+
+bool Kernel::enable_lockstep(const LockstepOptions &options, std::string &error) {
+    auto lockstep = std::make_unique<Lockstep>(*this, options);
+    if (!lockstep->usable(error)) return false;
+    lockstep_ = std::move(lockstep);
+    return true;
+}
+LockstepCounts Kernel::lockstep_counts() const { return lockstep_ ? lockstep_->counts() : LockstepCounts{}; }
+std::string Kernel::lockstep_report() const { return lockstep_ ? lockstep_->report() : std::string(); }
 
 // A return to another frame (docs/runtime.md, "Code"; ppc::Unwind): a
 // longjmp, a catch's continuation, a stack switched back to elsewhere than

@@ -433,7 +433,7 @@ target_include_directories(compat_test PRIVATE tools)
 add_test(NAME compat COMMAND compat_test)
 # the kernel's exports, called through a Kernel (the object library brings
 # their registrations)
-foreach(name kernel_memory kernel_modules kernel_crypt)
+foreach(name kernel_memory kernel_modules kernel_crypt lockstep)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge_kernel xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)

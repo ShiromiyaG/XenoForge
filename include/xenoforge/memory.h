@@ -169,6 +169,28 @@ public:
         uint64_t faults = 0, retried = 0, watched = 0, written = 0;
     };
     virtual WatchCounts watch_counts() const = 0;
+
+    // ---- a private view, for the lockstep check (lockstep.h) ----
+    // The whole guest memory mapped again at another host base, copy on
+    // write: a page reads as the guest's memory is now until this view writes
+    // it, and what this view writes stays in it (each of its views copies on
+    // its own, so the physical windows stop aliasing each other here once
+    // written). Its base stands for base(): guest address a is at
+    // base() + a (+ 0x1000 from 0xE0000000, as translate()).
+    class PrivateView {
+    public:
+        virtual ~PrivateView() = default;
+        uint8_t *base() const { return base_; }
+        // The views holding [address, address + length) mapped again, their
+        // copies dropped: they read the guest's memory again. False when one
+        // could not be mapped again (the view is unusable then).
+        virtual bool reset(uint32_t address, uint32_t length) = 0;
+
+    protected:
+        uint8_t *base_ = nullptr;
+    };
+    // nullptr, and why, when the host has no room for it
+    virtual std::unique_ptr<PrivateView> private_view(std::string &error) = 0;
 };
 
 } // namespace xf
