@@ -488,6 +488,41 @@ Buffer Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool h
     return b;
 }
 
+Buffer Device::create_device_local_mapped_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                                 VkDeviceSize heap_at_least) {
+    Buffer b;
+    b.size = size;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = size ? size : 4;
+    info.usage = usage;
+    if (vkCreateBuffer(device_, &info, nullptr, &b.buffer) != VK_SUCCESS) return {};
+    VkMemoryRequirements need;
+    vkGetBufferMemoryRequirements(device_, b.buffer, &need);
+    const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const uint32_t plain = memory_type(need.memoryTypeBits, visible);
+    const uint32_t local = memory_type(need.memoryTypeBits, visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // (where the first host-visible type is already video memory, as on a
+    // device with resizable BAR or one memory, create_buffer gives the same)
+    if (local == UINT32_MAX || local == plain ||
+        memory_.memoryHeaps[memory_.memoryTypes[local].heapIndex].size < heap_at_least) {
+        vkDestroyBuffer(device_, b.buffer, nullptr);
+        return {};
+    }
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = need.size;
+    alloc.memoryTypeIndex = local;
+    if (allocate(alloc, b.memory) != VK_SUCCESS) {
+        vkDestroyBuffer(device_, b.buffer, nullptr);
+        return {};
+    }
+    vkBindBufferMemory(device_, b.buffer, b.memory, 0);
+    if (vkMapMemory(device_, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped) != VK_SUCCESS) {
+        destroy(b);
+        return {};
+    }
+    return b;
+}
+
 void Device::destroy(Buffer &b) {
     if (b.buffer) vkDestroyBuffer(device_, b.buffer, nullptr);
     if (b.memory) free_memory(b.memory);

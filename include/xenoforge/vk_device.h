@@ -137,6 +137,12 @@ public:
     // host-visible and coherent (mapped), or device-local; host_reads: the
     // host reads it back, so cached memory where the device has it
     Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, bool host_reads = false);
+    // video memory the host writes through a mapping (a device-local,
+    // host-visible and coherent type that is not also the first host-visible
+    // one): none where the device has no such type, or where its heap is
+    // smaller than `heap_at_least` (without resizable BAR it is a 256 MB
+    // window, shared with the driver)
+    Buffer create_device_local_mapped_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkDeviceSize heap_at_least);
     void destroy(Buffer &buffer);
     // view_format: a second format views of it read it as (a mutable format
     // with the two listed, as Xenia's textures with a signed view)

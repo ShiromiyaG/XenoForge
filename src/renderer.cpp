@@ -226,6 +226,10 @@ constexpr VkDeviceSize EDRAM_BYTES = VkDeviceSize(EDRAM_TILES) * 80 * 16 * 4;
 // submissions in flight, and each one's share of the upload arena
 constexpr uint32_t SLOTS = 3;
 constexpr VkDeviceSize ARENA_SLOT = 64u << 20;
+// A slot's share of the draw-data arena (the draws' constants in video
+// memory, Impl::draw_data_take): about 1,500 draws that change both stages'
+// constants, after which the submission is flushed as for the arena
+constexpr VkDeviceSize DRAW_DATA_SLOT = 16u << 20;
 constexpr VkDeviceSize READBACK_CHUNK = 32u << 20;
 // GPU timestamps a submission holds at most (Options::gpu_timing)
 constexpr uint32_t TIMESTAMPS = 8192;
@@ -768,6 +772,7 @@ struct Slot {
     uint64_t serial = 0; // the submission it holds, recording or in flight; 0 when free
     bool recording = false;
     VkDeviceSize used = 0;
+    VkDeviceSize draw_used = 0; // of its share of the draw-data arena
     std::vector<std::function<void()>> after;
     std::vector<vk::Buffer> readbacks;
     size_t readback = 0;
@@ -807,6 +812,28 @@ struct FrontRead {
 };
 
 // The attachments of the render pass under way.
+// The dynamic state a draw sets (Impl::draw_state_: what the recording
+// command buffer holds since the last draw), compared bytewise
+struct DrawState {
+    VkViewport viewport;
+    VkRect2D scissor;
+    float blend_constants[4];
+    uint32_t stencil_reference[2], stencil_compare_mask[2], stencil_write_mask[2]; // front, back
+    VkStencilOp stencil_op[2][4];                                                    // fail, pass, depth fail, compare
+    VkPrimitiveTopology topology;
+    VkBool32 restart;
+    VkCullModeFlags cull_mode;
+    VkFrontFace front_face;
+    VkBool32 depth_test, depth_write;
+    VkCompareOp depth_compare;
+    VkBool32 stencil_test, depth_bias_enable;
+    VkBool32 blend_enables[4];
+    VkColorBlendEquationEXT blend_equations[4];
+    VkColorComponentFlags write_masks[4];
+    float line_width;
+    float depth_bias[2]; // the constant factor, the slope factor
+};
+
 struct Pass {
     VkImageView colors[4] = {};
     VkImageView depth = VK_NULL_HANDLE;
@@ -1866,6 +1893,14 @@ private:
         return arena_take(bytes, align);
     }
     uint8_t *arena_data(VkDeviceSize at) { return static_cast<uint8_t *>(arena_.mapped) + at; }
+    // the draws' constants (both stages', the system's, the interlock's):
+    // the draw-data arena in video memory where there is one, the arena
+    // otherwise. Offsets are into draw_buffer().
+    VkDeviceSize draw_data_take(VkDeviceSize bytes, VkDeviceSize align);
+    uint8_t *draw_data(VkDeviceSize at) {
+        return static_cast<uint8_t *>((draw_data_.buffer ? draw_data_ : arena_).mapped) + at;
+    }
+    VkBuffer draw_buffer() const { return draw_data_.buffer ? draw_data_.buffer : arena_.buffer; }
     // room for bytes to copy from: the arena, or a buffer of their own that
     // goes when the submission is done
     uint8_t *staging(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &offset);
@@ -1998,12 +2033,21 @@ private:
     bool in_pass_ = false;
     Pass pass_;
     VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
+    // the draws' dynamic state the recording command buffer holds (invalid
+    // after a new command buffer or another pipeline of the renderer's;
+    // XF_VK_DRAW_STATE_ALWAYS=1 sets all of it at every draw)
+    DrawState draw_state_{};
+    bool draw_state_valid_ = false, draw_state_elision_ = true;
     // the last constants and system constants put in the arena, and where
     harness::Constants last_constants_[2];
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
 
     vk::Buffer mirror_, arena_, scratch_, load_scratch_;
+    // the draw-data arena (draw_data_take): a share a slot, in device-local
+    // host-visible memory; none without such memory or with
+    // XF_VK_NO_DEVICE_LOCAL_DRAW_DATA=1
+    vk::Buffer draw_data_;
     std::deque<FrontRead> front_reads_; // oldest first
 
     // draws: set 0 (constants, system constants, vertex memory: the mirror),
@@ -2220,7 +2264,7 @@ Impl::~Impl() {
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
                                     compute_set_layout_, target_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
-    for (vk::Buffer *b : {&edram_, &edram_1x_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_,
+    for (vk::Buffer *b : {&edram_, &edram_1x_, &host_depth_, &mirror_, &arena_, &draw_data_, &scratch_, &load_scratch_,
                           &zpd_counters_, &zpd_readback_, &extents_, &extents_readback_, &viz_predicates_})
         d_.destroy(*b);
 }
@@ -2370,6 +2414,20 @@ bool Impl::init(std::string &error) {
     load_scratch_ = d_.create_buffer(16u << 20, scratch_usage, false);
     if (!mirror_.buffer || !arena_.buffer || !scratch_.buffer || !load_scratch_.buffer)
         return error = "could not make the renderer's buffers (512 MB of device memory for guest memory's mirror)", false;
+    // The draws' constants in video memory the host writes through its
+    // mapping (beyond Xenia, whose upload buffers are system memory): the
+    // shaders read them without crossing the bus each draw. Without
+    // resizable BAR that memory is a window of about 256 MB, so only where
+    // its heap is at least four times the 48 MB taken; the arena otherwise.
+    if (const char *off = std::getenv("XF_VK_NO_DEVICE_LOCAL_DRAW_DATA"); !off || !off[0] || off[0] == '0')
+        draw_data_ = d_.create_device_local_mapped_buffer(VkDeviceSize(SLOTS) * DRAW_DATA_SLOT,
+                                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                          4 * VkDeviceSize(SLOTS) * DRAW_DATA_SLOT);
+    if (const char *always = std::getenv("XF_VK_DRAW_STATE_ALWAYS"); always && always[0] && always[0] != '0')
+        draw_state_elision_ = false;
+    if (options_.verbose)
+        std::fprintf(stderr, "renderer: the draws' constants in %s\n",
+                     draw_data_.buffer ? "video memory (device-local, host-visible)" : "the arena (host memory)");
 
     // The render target path (Options::render_target_path): the interlock
     // one where asked for (XF_RENDER_TARGET_PATH=fsi or host forces either)
@@ -2514,10 +2572,11 @@ bool Impl::init(std::string &error) {
         if (vkAllocateDescriptorSets(dev_, &alloc, &bindless_) != VK_SUCCESS)
             return error = "vkAllocateDescriptorSets failed", false;
         for (int k = 0; k < 2; k++) {
-            VkDescriptorBufferInfo buffers[4] = {{arena_.buffer, 0, sizeof(harness::Constants)},
+            // (the constants by dynamic offsets from draw_data_take)
+            VkDescriptorBufferInfo buffers[4] = {{draw_buffer(), 0, sizeof(harness::Constants)},
                                                  {k ? mirror_.buffer : arena_.buffer, 0, VK_WHOLE_SIZE},
-                                                 {arena_.buffer, 0, sizeof(System)},
-                                                 {arena_.buffer, 0, sizeof(harness::Constants)}};
+                                                 {draw_buffer(), 0, sizeof(System)},
+                                                 {draw_buffer(), 0, sizeof(harness::Constants)}};
             VkWriteDescriptorSet writes[4] = {};
             for (uint32_t b = 0; b < 4; b++) {
                 writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2632,7 +2691,7 @@ bool Impl::init(std::string &error) {
         if (!viz_predicates_.buffer) return error = "could not make the VIZ queries' predicates", false;
     }
     for (int k = 0; k < 2; k++) {
-        VkDescriptorBufferInfo buffers[4] = {{arena_.buffer, 0, sizeof(FsiConstants)},
+        VkDescriptorBufferInfo buffers[4] = {{draw_buffer(), 0, sizeof(FsiConstants)},
                                              {edram_.buffer, 0, VK_WHOLE_SIZE},
                                              {zpd_counters_.buffer, 0, VK_WHOLE_SIZE},
                                              {extents_.buffer, 0, VK_WHOLE_SIZE}};
@@ -2963,10 +3022,11 @@ VkCommandBuffer Impl::cmd() {
         vkBeginCommandBuffer(s.cmd, &begin);
         s.recording = true;
         s.serial = next_serial_++;
-        s.used = 0;
+        s.used = 0, s.draw_used = 0;
         s.readback = 0, s.readback_used = 0;
         in_pass_ = false;
         bound_pipeline_ = VK_NULL_HANDLE;
+        draw_state_valid_ = false;
         last_constants_at_[0] = last_constants_at_[1] = last_system_at_ = last_fsi_at_ = NONE;
         if (s.queries) {
             vkCmdResetQueryPool(s.cmd, s.queries, 0, TIMESTAMPS);
@@ -3197,6 +3257,16 @@ VkDeviceSize Impl::arena_take(VkDeviceSize bytes, VkDeviceSize align) {
     if (at + bytes > ARENA_SLOT) return NONE;
     s.used = at + bytes;
     return VkDeviceSize(current_) * ARENA_SLOT + at;
+}
+
+VkDeviceSize Impl::draw_data_take(VkDeviceSize bytes, VkDeviceSize align) {
+    if (!draw_data_.buffer) return arena_take(bytes, align);
+    cmd();
+    Slot &s = slots_[current_];
+    VkDeviceSize at = (s.draw_used + align - 1) / align * align;
+    if (at + bytes > DRAW_DATA_SLOT) return NONE;
+    s.draw_used = at + bytes;
+    return VkDeviceSize(current_) * DRAW_DATA_SLOT + at;
 }
 
 uint8_t *Impl::staging(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &offset) {
@@ -7410,15 +7480,22 @@ void Impl::draw(const gpu::Draw &d) {
     VkDeviceSize constants_size = (sizeof(harness::Constants) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     VkDeviceSize system_size = (sizeof(System) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     bool own_indices = index_bytes > ARENA_SLOT / 4, own_attributes = attribute_bytes > ARENA_SLOT / 4;
-    VkDeviceSize need = 2 * constants_size + system_size + 2 * sizeof(FsiConstants) + 6 * ubo_align_ +
-                        (own_indices ? 0 : index_bytes + 4) + (own_attributes ? 0 : attribute_bytes + 4);
-    if (arena_take(need, 1) == NONE) {
+    // (the constants in the draw-data arena where there is one, the streams
+    // in the arena)
+    VkDeviceSize draw_need = 2 * constants_size + system_size + 2 * sizeof(FsiConstants) + 6 * ubo_align_;
+    VkDeviceSize need = (draw_data_.buffer ? 0 : draw_need) + (own_indices ? 0 : index_bytes + 4) +
+                        (own_attributes ? 0 : attribute_bytes + 4);
+    bool fits = arena_take(need, 1) != NONE;
+    if (fits) slots_[current_].used -= need; // only a check that the draw fits
+    if (fits && draw_data_.buffer) {
+        fits = draw_data_take(draw_need, 1) != NONE;
+        if (fits) slots_[current_].draw_used -= draw_need;
+    }
+    if (!fits) {
         flush();
         // the draw reads its streams in the new submission
         mark_used(vertex_ranges);
         mark_used(exported);
-    } else {
-        slots_[current_].used -= need; // only a check that the draw fits
     }
     if (!fatal_.empty()) return;
 
@@ -7427,8 +7504,8 @@ void Impl::draw(const gpu::Draw &d) {
     if (fsi_ && fragment) {
         fsi_constants.zpd_index = viz_survey_ != UINT32_MAX ? viz_fsi_index() : fsi_zpd_index();
         if (last_fsi_at_ == NONE || std::memcmp(&last_fsi_, &fsi_constants, sizeof(FsiConstants)) != 0) {
-            last_fsi_at_ = arena_take(sizeof(FsiConstants), ubo_align_);
-            std::memcpy(arena_data(last_fsi_at_), &fsi_constants, sizeof(FsiConstants));
+            last_fsi_at_ = draw_data_take(sizeof(FsiConstants), ubo_align_);
+            std::memcpy(draw_data(last_fsi_at_), &fsi_constants, sizeof(FsiConstants));
             last_fsi_ = fsi_constants;
         }
     }
@@ -7436,14 +7513,14 @@ void Impl::draw(const gpu::Draw &d) {
     for (int stage = 0; stage < 2; stage++) {
         if (last_constants_at_[stage] == NONE ||
             std::memcmp(&last_constants_[stage], &constants[stage], sizeof(harness::Constants)) != 0) {
-            last_constants_at_[stage] = arena_take(sizeof(harness::Constants), ubo_align_);
-            std::memcpy(arena_data(last_constants_at_[stage]), &constants[stage], sizeof(harness::Constants));
+            last_constants_at_[stage] = draw_data_take(sizeof(harness::Constants), ubo_align_);
+            std::memcpy(draw_data(last_constants_at_[stage]), &constants[stage], sizeof(harness::Constants));
             last_constants_[stage] = constants[stage];
         }
     }
     if (last_system_at_ == NONE || std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
-        last_system_at_ = arena_take(sizeof(System), ubo_align_);
-        std::memcpy(arena_data(last_system_at_), &sys, sizeof(System));
+        last_system_at_ = draw_data_take(sizeof(System), ubo_align_);
+        std::memcpy(draw_data(last_system_at_), &sys, sizeof(System));
         last_system_ = sys;
     }
     dynamic_offsets[0] = uint32_t(last_constants_at_[0]);
@@ -7491,9 +7568,15 @@ void Impl::draw(const gpu::Draw &d) {
         pass.samples = uint32_t(multisample.rasterizationSamples);
     VkCommandBuffer c = begin_pass(pass, colors, depth);
     if (pipe != bound_pipeline_) {
+        // (after another pipeline of the renderer's own, a transfer's or a
+        // port's, whose state is not the draws': every state set again)
+        if (!bound_pipeline_) draw_state_valid_ = false;
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         bound_pipeline_ = pipe;
     }
+    // an export's pipeline has no dynamic state, so binding it leaves the
+    // draws' undefined
+    if (export_only) draw_state_valid_ = false;
     VkDescriptorSet sets[2] = {draw_sets_[1], bindless_};
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 4, dynamic_offsets);
     if (index_buffer) vkCmdBindIndexBuffer(c, index_buffer, index_at, VK_INDEX_TYPE_UINT32);
@@ -7528,44 +7611,77 @@ void Impl::draw(const gpu::Draw &d) {
         host_scissor_rect.extent = {scale_.down(uint32_t(scissor.offset.x) + scissor.extent.width) - x0,
                                     scale_.down(uint32_t(scissor.offset.y) + scissor.extent.height) - y0};
     }
-    vkCmdSetViewport(c, 0, 1, &host_viewport_rect);
-    vkCmdSetScissor(c, 0, 1, &host_scissor_rect);
-    vkCmdSetBlendConstants(c, blend_constants);
-    vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, stencil & 0xFF);
-    vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, stencil_bf & 0xFF);
-    vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, (stencil >> 8) & 0xFF);
-    vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 8) & 0xFF);
-    vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, (stencil >> 16) & 0xFF);
-    vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 16) & 0xFF);
-    // the extended dynamic state, as the pipeline's description has it
-    vkCmdSetPrimitiveTopology(c, topology);
-    vkCmdSetPrimitiveRestartEnable(c, restart);
-    vkCmdSetCullMode(c, raster.cullMode);
-    vkCmdSetFrontFace(c, raster.frontFace);
-    vkCmdSetDepthTestEnable(c, depth_state.depthTestEnable);
-    vkCmdSetDepthWriteEnable(c, depth_state.depthWriteEnable);
-    vkCmdSetDepthCompareOp(c, depth_state.depthCompareOp);
-    vkCmdSetStencilTestEnable(c, depth_state.stencilTestEnable);
-    const VkStencilOpState &front = depth_state.front, &back = depth_state.back;
-    vkCmdSetStencilOp(c, VK_STENCIL_FACE_FRONT_BIT, front.failOp, front.passOp, front.depthFailOp, front.compareOp);
-    vkCmdSetStencilOp(c, VK_STENCIL_FACE_BACK_BIT, back.failOp, back.passOp, back.depthFailOp, back.compareOp);
-    vkCmdSetDepthBiasEnable(c, raster.depthBiasEnable);
-    if (d_.dynamic_blend() && !fsi_) {
-        // extended dynamic state 3: the blend and write masks of the four
-        // attachments the pipelines have (those without a target unused)
-        VkBool32 enables[4];
-        VkColorBlendEquationEXT equations[4];
-        VkColorComponentFlags masks[4];
+    // The draws' dynamic state, each set only where it differs from what the
+    // command buffer holds (draw_state_; Xenia's D3D12 command processor sets
+    // its viewport, scissor, blend factor and stencil reference the same way,
+    // the rest is in its pipelines): most draws change a few of the 25.
+    DrawState n;
+    std::memset(&n, 0, sizeof(n)); // (compared bytewise, padding included)
+    n.viewport = host_viewport_rect;
+    n.scissor = host_scissor_rect;
+    std::memcpy(n.blend_constants, blend_constants, sizeof(n.blend_constants));
+    for (uint32_t face = 0; face < 2; face++) {
+        const uint32_t s = face ? stencil_bf : stencil;
+        n.stencil_reference[face] = s & 0xFF;
+        n.stencil_compare_mask[face] = (s >> 8) & 0xFF;
+        n.stencil_write_mask[face] = (s >> 16) & 0xFF;
+        const VkStencilOpState &op = face ? depth_state.back : depth_state.front;
+        n.stencil_op[face][0] = op.failOp, n.stencil_op[face][1] = op.passOp;
+        n.stencil_op[face][2] = op.depthFailOp, n.stencil_op[face][3] = VkStencilOp(op.compareOp);
+    }
+    n.topology = topology;
+    n.restart = restart;
+    n.cull_mode = raster.cullMode;
+    n.front_face = raster.frontFace;
+    n.depth_test = depth_state.depthTestEnable;
+    n.depth_write = depth_state.depthWriteEnable;
+    n.depth_compare = depth_state.depthCompareOp;
+    n.stencil_test = depth_state.stencilTestEnable;
+    n.depth_bias_enable = raster.depthBiasEnable;
+    const bool blend_dynamic = d_.dynamic_blend() && !fsi_;
+    if (blend_dynamic)
         for (uint32_t i = 0; i < 4; i++) {
             const VkPipelineColorBlendAttachmentState &b = blends[i];
-            enables[i] = b.blendEnable;
-            equations[i] = {b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp,
-                            b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp};
-            masks[i] = b.colorWriteMask;
+            n.blend_enables[i] = b.blendEnable;
+            n.blend_equations[i] = {b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp,
+                                    b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp};
+            n.write_masks[i] = b.colorWriteMask;
         }
-        set_blend_enable_(c, 0, 4, enables);
-        set_blend_equation_(c, 0, 4, equations);
-        set_write_mask_(c, 0, 4, masks);
+    const bool all = !draw_state_valid_ || !draw_state_elision_;
+    const DrawState &o = draw_state_;
+    auto differs = [all](const auto &a, const auto &b) { return all || std::memcmp(&a, &b, sizeof(a)) != 0; };
+    if (differs(n.viewport, o.viewport)) vkCmdSetViewport(c, 0, 1, &n.viewport);
+    if (differs(n.scissor, o.scissor)) vkCmdSetScissor(c, 0, 1, &n.scissor);
+    if (differs(n.blend_constants, o.blend_constants)) vkCmdSetBlendConstants(c, n.blend_constants);
+    static constexpr VkStencilFaceFlags FACES[2] = {VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_FACE_BACK_BIT};
+    for (uint32_t face = 0; face < 2; face++) {
+        if (differs(n.stencil_reference[face], o.stencil_reference[face]))
+            vkCmdSetStencilReference(c, FACES[face], n.stencil_reference[face]);
+        if (differs(n.stencil_compare_mask[face], o.stencil_compare_mask[face]))
+            vkCmdSetStencilCompareMask(c, FACES[face], n.stencil_compare_mask[face]);
+        if (differs(n.stencil_write_mask[face], o.stencil_write_mask[face]))
+            vkCmdSetStencilWriteMask(c, FACES[face], n.stencil_write_mask[face]);
+    }
+    // the extended dynamic state, as the pipeline's description has it
+    if (differs(n.topology, o.topology)) vkCmdSetPrimitiveTopology(c, n.topology);
+    if (differs(n.restart, o.restart)) vkCmdSetPrimitiveRestartEnable(c, n.restart);
+    if (differs(n.cull_mode, o.cull_mode)) vkCmdSetCullMode(c, n.cull_mode);
+    if (differs(n.front_face, o.front_face)) vkCmdSetFrontFace(c, n.front_face);
+    if (differs(n.depth_test, o.depth_test)) vkCmdSetDepthTestEnable(c, n.depth_test);
+    if (differs(n.depth_write, o.depth_write)) vkCmdSetDepthWriteEnable(c, n.depth_write);
+    if (differs(n.depth_compare, o.depth_compare)) vkCmdSetDepthCompareOp(c, n.depth_compare);
+    if (differs(n.stencil_test, o.stencil_test)) vkCmdSetStencilTestEnable(c, n.stencil_test);
+    for (uint32_t face = 0; face < 2; face++)
+        if (differs(n.stencil_op[face], o.stencil_op[face]))
+            vkCmdSetStencilOp(c, FACES[face], n.stencil_op[face][0], n.stencil_op[face][1], n.stencil_op[face][2],
+                              VkCompareOp(n.stencil_op[face][3]));
+    if (differs(n.depth_bias_enable, o.depth_bias_enable)) vkCmdSetDepthBiasEnable(c, n.depth_bias_enable);
+    if (blend_dynamic) {
+        // extended dynamic state 3: the blend and write masks of the four
+        // attachments the pipelines have (those without a target unused)
+        if (differs(n.blend_enables, o.blend_enables)) set_blend_enable_(c, 0, 4, n.blend_enables);
+        if (differs(n.blend_equations, o.blend_equations)) set_blend_equation_(c, 0, 4, n.blend_equations);
+        if (differs(n.write_masks, o.write_masks)) set_write_mask_(c, 0, 4, n.write_masks);
     }
     {
         // Lines as wide as PA_SU_LINE_CNTL's WIDTH says (half the width in
@@ -7580,7 +7696,8 @@ void Impl::draw(const gpu::Draw &d) {
                 approximate(d_.wide_lines() ? "line widths outside the device's range (clamped)"
                                             : "wide lines drawn one pixel wide (no wide lines on the device)");
         }
-        vkCmdSetLineWidth(c, width);
+        n.line_width = width;
+        if (differs(n.line_width, o.line_width)) vkCmdSetLineWidth(c, width);
     }
     {
         // the polygon offset as Xenia's Vulkan backend sets it
@@ -7604,8 +7721,11 @@ void Impl::draw(const gpu::Draw &d) {
             scale = offsets[0], offset = offsets[1];
         }
         float constant = offset * (depth && depth->format == 1 ? float(1u << 24) : float((1u << 24) - 1));
-        vkCmdSetDepthBias(c, constant, 0.0f, scale * (scale_.factor() / 16.0f));
+        n.depth_bias[0] = constant, n.depth_bias[1] = scale * (scale_.factor() / 16.0f);
+        if (differs(n.depth_bias, o.depth_bias)) vkCmdSetDepthBias(c, n.depth_bias[0], 0.0f, n.depth_bias[1]);
     }
+    draw_state_ = n;
+    draw_state_valid_ = true;
     if (options_.gpu_timing_draws) {
         // each draw timed on its own, counted to its shaders
         char kind[96];

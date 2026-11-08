@@ -2475,6 +2475,81 @@ replay went from 1.36-1.38 to 1.29-1.35 ms a play, its scene draws 0.25 to
 0.23. That type is a 214 MB heap here (no resizable BAR), against the
 arena's 192 MB, so it is not taken: it wants a heap at least twice the
 arena (resizable BAR) or a smaller arena of its own for the draws' data.
+Done since (below, "The draws' constants in video memory").
+
+## Game B's frame against Xenia's, call by call (2026-11-08)
+
+**A "regression" that was a setting.** A run had game B at 2.69 ms of GPU
+time a frame against the table's 1.29; the same build measured 4.95 again,
+1.36 with the same settings as the table. The player read the user's
+config.toml, which by then asked for a 200% resolution scale and FXAA (the
+output-scaling options of ecd0997). Nothing in the renderer had slowed: the
+3600 trace's replay is 1.48 ms a play on the interlock path, 1.44 before.
+`bench_vs_xenia.ps1` now gives ours a config of its own (the video defaults,
+as Xenia runs; the saves where the user's config keeps them) unless
+`-OursArgs` names one, and its `-base` configurations (`ours-base`,
+`ours-host-base`) are the same build with the speedups below turned off.
+
+**What each frame is made of** (RenderDoc 1.46 captures of the title scene,
+`qrenderdoc --python`: one frame of each, listed with its targets; RenderDoc
+gives no event timings for Direct3D 12 here). The two do the same work in
+the same order: the 4x MSAA pass at pitch 640 (its color and depth taken
+over from the 2x targets), the scene twice at 2x MSAA (16 draws each), each
+followed by a resolve (a store of the target into EDRAM and the copy) and
+its clears, a color transfer into the 1x target, 20 2D draws, the last
+resolve, and the presenter's conversion and blit. Differences:
+- Xenia's targets are as tall as the draws use (`EstimateMaxY`): 640x384,
+  1280x384 and 1280x720; ours as tall as EDRAM holds from the base (640x1024,
+  1280x1024, 1280x2048). Transfers, stores and resolves cover only the rows
+  used in both, so this is memory, not work.
+- Xenia's depth transfers are a depth draw and 8 stencil-bit draws each
+  (no stencil export on this GPU); ours one draw and a copy
+  (`VK_KHR_maintenance8`, "Stencil by copy" above).
+- Xenia's resolves are 2 dispatches of 32x48 and 40x48 groups (several
+  pixels a thread), ours 2 of 160x48 (a pixel a thread); the bytes moved
+  are the same.
+- Xenia sets a pipeline state object a draw (54) and 221 root constant
+  buffer views; we bound 21 pipelines and set all 25 dynamic states at every
+  draw: 1,369 `vkCmdSet*` calls a frame, against Xenia's 13 viewports, 13
+  scissors, 8 stencil references and 3 blend factors.
+- 35 barriers a frame in both.
+Where the host path's remaining GPU time goes is still not known: the work
+is the same, call for call, and only timing either program's passes can
+tell (the machine was shared, so none was taken).
+
+**The draws' constants in video memory** (beyond Xenia, whose upload
+buffers are system memory). Both stages' constants, the system constants
+and the interlock path's constants now come from an arena of their own,
+16 MB a slot (48 MB), in device-local host-visible memory: the shaders read
+them from video memory, not across the bus. Without resizable BAR that
+memory is a 256 MB window (214 MB on the RTX 5060), so it is taken only
+where its heap is at least four times the 48 MB, and only where it is not
+the first host-visible type already; the arena otherwise. A draw whose
+constants do not fit flushes the submission as the arena does (game A's
+race trace: 3 submissions with and without). `XF_VK_NO_DEVICE_LOCAL_DRAW_DATA=1`
+keeps them in the arena; `-v` says where they are. The experiment above
+(the whole arena moved) took game B's host-path replay from 1.36-1.38 to
+1.29-1.35 ms a play.
+
+**Dynamic state only where it changes.** A draw sets each of its 25 dynamic
+states only where it differs from what the command buffer holds
+(`DrawState`, compared bytewise); a new command buffer, another of the
+renderer's pipelines (a transfer's, a port's: `bound_pipeline_` cleared)
+or a memory export's pipeline (no dynamic state) makes all of it set
+again. Game B's title frame: 1,369 `vkCmdSet*` calls to 149, 1,698 calls in
+all to 480. `XF_VK_DRAW_STATE_ALWAYS=1` sets everything at every draw.
+
+**Checked:** `replay_test` 29/29 on both paths and at 200%
+(`XF_REPLAY_SCALES=200`), game B's 3600 with validation on both paths
+(0.000 off Xenia's D3D12 and ROV pictures, no messages), game A's race
+trace the same picture byte for byte with both turned off. **Not measured**
+(the machine was shared by three agents). To measure, alone on the machine:
+`bench_vs_xenia.ps1 -Disc <B> -Ours build/player_<B>.exe -Xenia <xenia_canary.exe>
+-Seconds 130 -Warmup 90 -Runs 3 -Configs ours-base,ours,ours-host-base,ours-host,xenia-d3d12,xenia-d3d12-rov`;
+the bar is Xenia D3D12's 0.78 ms (host) and 1.23 ms (ROV).
+
+The presenter clears the window only where the picture leaves bars (a
+picture covering the window was cleared and then blitted over).
 
 ## Resolution scale (2026-11-08)
 

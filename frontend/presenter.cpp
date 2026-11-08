@@ -705,19 +705,24 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
     vkBeginCommandBuffer(cmd, &begin);
     VkImage target = images_[index];
     barrier(cmd, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkClearColorValue black{{0, 0, 0, 1}};
-    VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    // the front buffer's shape kept (letterboxed or pillarboxed), in whole
+    // multiples, or stretched over the window; the bars black (the whole
+    // window cleared only where the picture leaves some of it)
+    const Rect place = picture ? fit_picture(extent_.width, extent_.height, width, height, view.fit) : Rect{};
+    const bool covered = picture && place.x == 0 && place.y == 0 && place.width == extent_.width &&
+                         place.height == extent_.height;
+    if (!covered) {
+        VkClearColorValue black{{0, 0, 0, 1}};
+        VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    }
     if (picture) {
-        // the front buffer's shape kept (letterboxed or pillarboxed), in
-        // whole multiples, or stretched over the window
-        const Rect r = fit_picture(extent_.width, extent_.height, width, height, view.fit);
         // the effects first, into an image of the rectangle's size (or the
         // picture's, antialiased alone), then blitted
         uint32_t from_w = width, from_h = height;
         VkImage from = picture;
-        if (r.width && r.height && (view.upscaler || view.antialiasing)) {
-            EffectImage *out = run_effects(cmd, view, picture_view, width, height, r.width, r.height, from_w, from_h);
+        if (place.width && place.height && (view.upscaler || view.antialiasing)) {
+            EffectImage *out = run_effects(cmd, view, picture_view, width, height, place.width, place.height, from_w, from_h);
             if (out) from = out->image.image;
             // once, why the chosen effects are not on the screen
             if (!out && !effects_failure_told_) {
@@ -729,9 +734,9 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blit.srcOffsets[1] = {int32_t(from_w), int32_t(from_h), 1};
-        blit.dstOffsets[0] = {r.x, r.y, 0};
-        blit.dstOffsets[1] = {r.x + int32_t(r.width), r.y + int32_t(r.height), 1};
-        const bool same = from_w == r.width && from_h == r.height;
+        blit.dstOffsets[0] = {place.x, place.y, 0};
+        blit.dstOffsets[1] = {place.x + int32_t(place.width), place.y + int32_t(place.height), 1};
+        const bool same = from_w == place.width && from_h == place.height;
         vkCmdBlitImage(cmd, from, VK_IMAGE_LAYOUT_GENERAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                        view.smooth && !same ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
