@@ -48,10 +48,10 @@ constexpr Spec SPECS[6] = {
     {5, 0.050f, 0.94f, 0.37f, 0.030f, 0.024f, 0.8f, 0.18f, -0.10f, 4.2f, 0.60f},
 };
 
-V3 tone_color(int tone, const float tint[3]) {
+V3 tone_color(int tone, const float tint[3], const float *greys) {
     switch (tone) {
-    case 0: return {0.427f, 0.427f, 0.435f}; // #6d6d6f
-    case 1: return {0.667f, 0.667f, 0.667f}; // #aaaaaa
+    case 0: return greys ? V3{greys[0], greys[1], greys[2]} : V3{0.427f, 0.427f, 0.435f}; // #6d6d6f
+    case 1: return greys ? V3{greys[3], greys[4], greys[5]} : V3{0.667f, 0.667f, 0.667f}; // #aaaaaa
     case 2: return {tint[0] * 0.55f, tint[1] * 0.55f, tint[2] * 0.55f};
     case 3: return {tint[0] * 0.80f, tint[1] * 0.80f, tint[2] * 0.80f};
     case 4: return {tint[0], tint[1], tint[2]};
@@ -74,7 +74,8 @@ V3 centre(const Spec &r, float s, float t, float aspect) {
 } // namespace
 
 void build_ribbons(float time, uint32_t width, uint32_t height, const float tint[3], float alpha,
-                   std::vector<RibbonVertex> &vertices, std::vector<uint32_t> &body, std::vector<uint32_t> &fringe) {
+                   std::vector<RibbonVertex> &vertices, std::vector<uint32_t> &body, std::vector<uint32_t> &fringe,
+                   const float *greys) {
     vertices.clear();
     body.clear();
     fringe.clear();
@@ -91,7 +92,7 @@ void build_ribbons(float time, uint32_t width, uint32_t height, const float tint
     constexpr float Z_SCALE = 0.8f;              // depth in 0..1 from the space's z (toward the viewer)
 
     for (const Spec &r : SPECS) {
-        const V3 hue = tone_color(r.tone, tint);
+        const V3 hue = tone_color(r.tone, tint, greys);
         const uint32_t first = uint32_t(vertices.size());
         for (int i = 0; i <= N; i++) {
             const float s = float(i) / float(N);

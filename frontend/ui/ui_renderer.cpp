@@ -1128,14 +1128,15 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
     if (m.backdrop.on) {
         const Backdrop &b = m.backdrop;
         // the grey gradient: ui.frag's MODE_BACKDROP (the clock-free part)
-        m.pass(m.layer(0), *m.white, M_BACKDROP, Blend::Replace, {}, false, [](Impl::Draw &) {});
+        m.pass(m.layer(0), *m.white, M_BACKDROP, Blend::Replace, {}, false,
+               [&b](Impl::Draw &d) { d.u.imode[1] = b.light ? 1 : 0; });
         // the ribbons over it: triangles built on the CPU (ribbons.cpp), opaque, with a depth test (no
         // sorting: where they cross or fold the edge is exact), then their one-pixel fringes, tested
         // against the depth but not written, blended, standing in for multisampling
         if (b.strength > 0) {
             std::vector<RibbonVertex> rv;
             std::vector<uint32_t> body, fringe;
-            build_ribbons(b.time, m.width, m.height, b.tint, b.strength, rv, body, fringe);
+            build_ribbons(b.time, m.width, m.height, b.tint, b.strength, rv, body, fringe, b.greys);
             if (!body.empty()) {
                 std::vector<Rml::Vertex> verts(rv.size());
                 for (size_t i = 0; i < rv.size(); i++) {

@@ -19,6 +19,7 @@
 #include "../frontend/settings.h"
 #include "../tools/game.h"
 
+#include <cctype>
 #include <cmath>
 #include <chrono>
 #include <filesystem>
@@ -318,6 +319,30 @@ int main() {
         CHECK(dark.find("#4c9bff40") != std::string::npos && light.find("#4c9bff2c") != std::string::npos);
         CHECK(frontend::theme_from_text("dark") == frontend::ThemeChoice::Dark && frontend::theme_from_text("x") == frontend::ThemeChoice::System);
         CHECK(std::string(frontend::theme_text(frontend::ThemeChoice::Light)) == "light");
+        // the console look: every token of the shipped stylesheets is filled in both themes, and the two differ
+        for (const char *folder : {"ui", "../frontend/ui/assets", "frontend/ui/assets"}) {
+            std::string all;
+            for (const char *file : {"theme.rcss", "launcher.rcss", "settings.rcss"}) {
+                std::ifstream in(std::string(folder) + "/" + file, std::ios::binary);
+                all.append(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            if (all.find("#spage") == std::string::npos) continue;
+            const std::string d = frontend::apply_tokens(all, accent, frontend::palette(true, accent));
+            const std::string l = frontend::apply_tokens(all, accent, frontend::palette(false, accent));
+            // (the rules' own braces remain: a token is '{', lower-case letters, digits and dashes, '}')
+            auto unfilled = [](const std::string &css) {
+                for (size_t at = css.find('{'); at != std::string::npos; at = css.find('{', at + 1)) {
+                    const size_t end = css.find('}', at);
+                    if (end == std::string::npos || end - at > 24) continue;
+                    bool name = end > at + 1;
+                    for (size_t i = at + 1; i < end; i++) name = name && (std::islower(uint8_t(css[i])) || std::isdigit(uint8_t(css[i])) || css[i] == '-');
+                    if (name) return css.substr(at, end - at + 1);
+                }
+                return std::string();
+            };
+            CHECK(unfilled(d).empty() && unfilled(l).empty() && d != l);
+            break;
+        }
     }
     {
         // the cursors' files (ui/cursor_file.h): a made 2x2 .cur and a two-frame .ani read back, then the shipped ones

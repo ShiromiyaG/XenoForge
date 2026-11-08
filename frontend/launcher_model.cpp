@@ -143,10 +143,20 @@ Accent accent_from_hex(const std::string &hex) {
     // a dark label on a light accent, a white one on a dark accent
     const double luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
     a.on = luminance > 0.55 ? "#1a0f08" : "#ffffff";
+    auto toward = [&](const char *token, int to, double t) {
+        a.shades.emplace_back(token, hex_of(mix(r, to, t), mix(g, to, t), mix(b, to, t)));
+    };
+    toward("{ac-top}", 0, 0.0), toward("{ac-mid}", 0, 0.04), toward("{ac-b1}", 0, 0.07), toward("{ac-b2}", 0, 0.12);
+    toward("{ac-low}", 0, 0.20), toward("{ac-end}", 0, 0.26), toward("{ac-ring}", 0, 0.42);
+    toward("{ac-lit}", 255, 0.10), toward("{ac-glow}", 255, 0.20), toward("{ac-shine}", 255, 0.45);
+    toward("{ac-edge}", 255, 0.65), toward("{ac-pale}", 255, 0.82);
     return a;
 }
 
 std::string apply_tokens(std::string text, const Accent &a) {
+    for (const auto &[token, value] : a.shades)
+        for (size_t at = text.find(token); at != std::string::npos; at = text.find(token, at + value.size()))
+            text.replace(at, token.size(), value);
     const std::pair<const char *, const std::string *> tokens[] = {
         {"{accent-hi}", &a.hi},   {"{accent-lo}", &a.lo}, {"{accent08}", &a.a08}, {"{accent12}", &a.a12},
         {"{accent15}", &a.a15},   {"{accent25}", &a.a25}, {"{accent40}", &a.a40}, {"{accent60}", &a.a60},
@@ -201,6 +211,86 @@ Palette palette(bool dark, const Accent &accent) {
                     {"{warn}", "#a86e00"},        {"{bad}", "#c4373d"},        {"{scroll}", "#0000002b"},
                     {"{scroll-hover}", "#00000048"}, {"{overlay}", "#00000030"}, {"{dialog}", "#fbfbfb"},
                     {"{sel}", hex_of(r, g, b, 0x2c)}, {"{sel-strong}", hex_of(r, g, b, 0x48)}, {"{link}", accent.lo}};
+
+    // The console's look (launcher.rcss and settings.rcss: glass over the backdrop, glossy buttons, let-in slots):
+    // dark is the original, grey glass under white text over the dark-to-silver gradient; light is pearl glass under
+    // graphite text over a silver-to-white one. A value may name the accent's tones ({ac-edge}...), which are applied
+    // after these.
+    struct Pair {
+        const char *token, *dark, *light;
+    };
+    static const Pair console[] = {
+        // text over the backdrop and the glass, from strongest to faintest
+        {"{g-text}", "#f6f6f6", "#1d1d20"},        {"{g-text-1}", "#e0dfe4", "#3a3a40"},     {"{g-text-2}", "#c8c8cc", "#55555c"},
+        {"{g-text-3}", "#8d8c92", "#85858c"},      {"{g-ic}", "#c4c3c9", "#55555c"},         {"{g-on}", "#ffffff", "#0b0b0d"},
+        {"{th}", "#f0f0f2", "#26262a"},            {"{g-line}", "#ffffff50", "#00000033"},   {"{g-bad}", "#ff8a80", "#c4373d"},
+        {"{g-link}", "#9fd98a", "#1f7a35"},        {"{bad-ic}", "#ff7a6e", "#d03a36"},       {"{empty-ic}", "#d6d5da", "#55555c"},
+        {"{empty-text}", "#ecebef", "#3a3a40"},
+        // text on the selected row and the focused setting (the accent's glossy green, in both themes)
+        {"{sel-text}", "#f6f6f6", "#ffffff"},      {"{sel-sub}", "#c8c8cc", "#f0f0f0"},      {"{sel-hint}", "#e8ffe0", "#f4fff0"},
+        {"{bset}", "#e8ffe0", "#3a3a40"},
+        // the header and the sections
+        {"{hd-a}", "#2f2e33b4", "#ffffffb4"},      {"{hd-b}", "#3a393eb4", "#f6f6f8b4"},     {"{hd-c}", "#57565cb4", "#dcdce2b4"},
+        {"{hd-text}", "#f4f4f4", "#1d1d20"},       {"{mark-core}", "#2f2e33", "#f6f6f8"},    {"{nav}", "#8b8a90", "#7a7a82"},
+        {"{nav-hover}", "#c9c8cd", "#45454c"},     {"{nav-on}", "#ffffff", "#0b0b0d"},
+        // the toolbar and the tab bar
+        {"{bar-top}", "#a3a2a8", "#ffffff"},       {"{bar-bot}", "#6f6e74", "#b8b8be"},      {"{bar-a}", "#74737ac4", "#ffffffa8"},
+        {"{bar-b}", "#908f94c4", "#e8e8ecc4"},
+        // the glossy buttons: at rest, hovered, pressed
+        {"{btn-border}", "#7c7b79", "#a4a4aa"},    {"{btn-0}", "#62615f", "#ffffff"},        {"{btn-1}", "#504f4e", "#f4f4f6"},
+        {"{btn-2}", "#444342", "#e3e3e7"},         {"{btn-3}", "#504f4e", "#ececf0"},        {"{btn-ring}", "#2b2b2a", "#b4b4ba"},
+        {"{btn-drop}", "#00000050", "#00000028"},  {"{btn-inset}", "#ffffff26", "#ffffffe0"}, {"{btn-text}", "#f4f4f4", "#1d1d20"},
+        {"{btn-h-border}", "#918f8d", "#8a8a92"},  {"{btn-h0}", "#727170", "#ffffff"},       {"{btn-h1}", "#5e5d5c", "#fafafb"},
+        {"{btn-h2}", "#504f4e", "#ececf0"},        {"{btn-h3}", "#5c5b5a", "#f3f3f6"},       {"{btn-p0}", "#424140", "#d9d9de"},
+        {"{btn-p1}", "#494847", "#e0e0e5"},        {"{btn-p2}", "#4c4b4a", "#e6e6ea"},       {"{btn-p3}", "#565554", "#eeeef2"},
+        {"{btn-p-inset}", "#00000090", "#00000040"}, {"{btn-focus}", "#ffffff", "#1d1d20"},  {"{btn-focus-glow}", "#ffffffa0", "#1d1d2060"},
+        // the row's Options button, a little lighter than the toolbar's
+        {"{opt-border}", "#858484", "#a4a4aa"},    {"{opt-0}", "#747373", "#ffffff"},        {"{opt-1}", "#5d5c5c", "#f4f4f6"},
+        {"{opt-2}", "#4c4b4b", "#e3e3e7"},         {"{opt-3}", "#5b5a5a", "#ececf0"},        {"{opt-ring}", "#343435", "#b4b4ba"},
+        {"{opt-inset}", "#ffffff30", "#ffffffe0"}, {"{opt-h-border}", "#9a9999", "#8a8a92"}, {"{opt-h0}", "#838282", "#ffffff"},
+        {"{opt-h1}", "#6a6969", "#fafafb"},        {"{opt-h2}", "#585757", "#ececf0"},       {"{opt-h3}", "#686767", "#f3f3f6"},
+        {"{opt-p0}", "#4a4949", "#d9d9de"},        {"{opt-p1}", "#545353", "#e6e6ea"},       {"{opt-p2}", "#636262", "#eeeef2"},
+        {"{opt-p-ring}", "#1f1f20", "#b4b4ba"},
+        // the let-in slots (the search box, the dropdowns, the text fields, the check boxes and slider tracks)
+        {"{slot-border}", "#3c3c3f", "#bcbcc2"},   {"{slot-border-h}", "#55555a", "#9a9aa2"}, {"{slot-0}", "#161618d8", "#e6e6eae6"},
+        {"{slot-1}", "#232325d0", "#f6f6f8e0"},    {"{slot-lip}", "#ffffff38", "#ffffffd0"}, {"{slot-inset}", "#000000a0", "#00000030"},
+        {"{slot-f0}", "#1a1c19e0", "#eef3ece8"},   {"{slot-f1}", "#272a25d8", "#fafcf9e0"},  {"{check-0}", "#151517", "#e2e2e6"},
+        {"{check-1}", "#282829", "#f6f6f8"},       {"{check-border}", "#8d8c92", "#8d8c94"},
+        // the rows (games and settings): glass, hovered; the same opaque, for the empty page's buttons
+        {"{row-border}", "#666668", "#c6c6cc"},    {"{row-border-h}", "#77777a", "#aeaeb6"}, {"{row-ring}", "#1c1c1d", "#b4b4ba"},
+        {"{row-drop}", "#00000080", "#00000030"},  {"{row-inset}", "#ffffff1a", "#ffffffe0"}, {"{row-shine}", "#ffffff30", "#ffffffa0"},
+        {"{row-shine-h}", "#ffffff34", "#ffffffc0"}, {"{row-0}", "#2c2c2eb8", "#ffffffd0"},  {"{row-1}", "#2d2d2fb8", "#fbfbfcd0"},
+        {"{row-2}", "#2e2e30b8", "#f4f4f6d0"},     {"{row-3}", "#2f2f31b8", "#eeeef1d0"},    {"{row-h0}", "#343436c0", "#ffffffe6"},
+        {"{row-h1}", "#353537c0", "#ffffffe6"},    {"{row-h2}", "#363638c0", "#f8f8fae6"},   {"{row-h3}", "#373739c0", "#f3f3f6e6"},
+        {"{row-0o}", "#2c2c2e", "#ffffff"},        {"{row-3o}", "#2f2f31", "#eeeef1"},       {"{row-h0o}", "#343436", "#ffffff"},
+        {"{row-h3o}", "#373739", "#f3f3f6"},
+        // the status dots, on a row and on the selected one
+        {"{dot-ready}", "#8bdc55", "#2e9e44"},     {"{dot-prep}", "#fad145", "#d99a00"},     {"{dot-bad}", "#ff6a5e", "#d6403f"},
+        {"{dot-run}", "#ffffff", "#3a3a40"},       {"{sel-dot-ready}", "#8bdc55", "#eaffdc"}, {"{sel-dot-prep}", "#fad145", "#fff0a0"},
+        {"{sel-dot-bad}", "#ff6a5e", "#ffd6d0"},   {"{sel-dot-run}", "#ffffff", "#ffffff"},
+        // the status bar
+        {"{sb-bg}", "#313131", "#e8e8eb"},         {"{sb-top}", "#3e3e3e", "#cacad0"},       {"{sb-text}", "#9f9ea3", "#5f5f66"},
+        {"{sb-sep}", "#4a4a4c", "#c4c4ca"},        {"{sb-ok}", "#e8e8ea", "#26262a"},
+        // the keys' caps and the hint bar's icons
+        {"{key-0}", "#3b3a3b", "#ffffff"},         {"{key-1}", "#232223", "#e6e6ea"},        {"{key-border}", "#777677", "#a8a8b0"},
+        {"{key-text}", "#ffffff", "#1d1d20"},      {"{key-mod}", "#c8c8cc", "#6a6a72"},      {"{key-press}", "{ac-edge}", "{accent-lo}"},
+        {"{key-ic}", "#ffffff", "#3a3a40"},
+        // the accent's swatches
+        {"{sw}", "#ffffff50", "#00000040"},        {"{sw-hover}", "#ffffffb0", "#00000090"}, {"{sw-on}", "#ffffff", "#1d1d20"},
+        {"{sw-halo}", "#ffffff50", "#00000040"},
+    };
+    for (const Pair &pair : console) p.tokens.emplace_back(pair.token, dark ? pair.dark : pair.light);
+    // under a light accent (yellow) the selection's text is dark, as the accent's own label is; the default
+    // green and the other swatches (all below the threshold) keep the light text
+    if ((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0 > 0.65) {
+        const std::pair<const char *, const char *> ink[] = {
+            {"{sel-text}", "#1a0f08"},      {"{sel-sub}", "#3a2a14"},       {"{sel-hint}", "#2a1c0c"},
+            {"{sel-dot-ready}", "#1d6b2a"}, {"{sel-dot-prep}", "#7a5200"},  {"{sel-dot-bad}", "#8a1c1c"},
+            {"{sel-dot-run}", "#1a0f08"}};
+        for (auto &[token, value] : p.tokens)
+            for (const auto &[name, ink_value] : ink)
+                if (token == name) value = ink_value;
+    }
     return p;
 }
 

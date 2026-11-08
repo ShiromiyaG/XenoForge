@@ -1807,15 +1807,20 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   bigger window shows more rows; the window opens where it was left
   (`[launcher] x, y, width, height, maximized`, kept only while that place
   is on a display), and the sort is kept too (`sort`).
-- **Themes**: the main window's look is fixed (its colours are in
-  `launcher.rcss`, `settings.rcss`); the dialogs and the menus follow
-  `[launcher] theme`: `system` (the desktop's light or dark, followed live
-  through `SDL_EVENT_SYSTEM_THEME_CHANGED`), `light` or `dark` (the Interface
-  tab). Each is a palette of tokens
-  (`palette()` in `launcher_model.cpp`: the window, its chrome, lines, three
-  levels of text, the states, the selection from the accent) filled into
-  the stylesheets when a document is made; changing it makes the document
-  again.
+- **Themes**: the whole window follows `[launcher] theme`: `system` (the
+  desktop's light or dark, followed live through
+  `SDL_EVENT_SYSTEM_THEME_CHANGED`), `light` or `dark` (the Interface tab).
+  Each is a palette of tokens (`palette()` in `launcher_model.cpp`: the
+  window, its chrome, lines, three levels of text, the states, the selection
+  from the accent, and the console look's glass, glossy buttons, slots and
+  the text over the backdrop) filled into the stylesheets when a document is
+  made; changing it makes the document again. The accent's glossy greens
+  (`{ac-*}`, tones of the accent from `accent_from_hex`) fill the selected
+  row, the focused setting, the main buttons and the menus' hot item. Dark is
+  grey glass under white text over the dark-to-silver backdrop; light is
+  pearl glass under graphite text over a silver-to-white one, with paler grey
+  ribbons (`Backdrop::light` and `greys`: `ui.frag` takes the ramp from
+  `imode.y`).
 - **Icons**: Lucide (ISC; `ui/fonts/Lucide.ttf`, its license beside it), a
   font of outline icons drawn as text; `{i:name}` in a template and
   `icon_html()` give its glyphs (`launcher_html.cpp` lists the ones used).

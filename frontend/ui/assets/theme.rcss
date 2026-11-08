@@ -2,7 +2,7 @@
  * XenoForge launcher, RCSS shared by its windows: the base, the controls, the
  * menus and the dialogs. A desktop tool's look: neutral greys in two themes,
  * the accent for selection, focus and the main buttons. The launcher fills the
- * {tokens} when it loads the files (launcher_model.cpp: palette and accent),
+ * tokens in braces when it loads the files (launcher_model.cpp: palette and accent),
  * so light or dark and the accent are the user's. Sizes are dp: the display's
  * scale (100%, 150%...) makes them pixels.
  */
