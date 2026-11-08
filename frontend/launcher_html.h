@@ -87,6 +87,7 @@ struct SettingsPage {
     std::string theme;      // "system", "light", "dark"
     std::string backdrop;   // the ribbons: "animated", "still", "off"
     bool sounds = true;     // the window's own sounds
+    bool smooth_edges = true; // multisampling for the window's drawing
     std::vector<std::string> gamepads;
     std::string capturing;  // the binding waiting for a key
     // the Profile tab: the storage's profiles, a message for the last action, the profile asked to be deleted (the

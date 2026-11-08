@@ -41,7 +41,7 @@
 // 4K picture on a 1080p desktop), --scale F the interface's scale (else the
 // display's), --assets <dir> the window's files (to edit them without a
 // rebuild), and --keys up,down,a,b,... presses of the pad (the d-pad, a b x y,
-// lb rb, start, back; "wait" waits) sent to the view a few tenths of a second
+// lb rb, lt rt, start, back; "wait" waits) sent to the view a few tenths of a second
 // apart once the window has settled.
 //
 //   launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <page>] [--start N] [--keys <list>]
@@ -302,6 +302,16 @@ int main(int argc, char **argv) {
             e.key.key = name == "f5" ? SDLK_F5 : SDLK_F2;
             e.key.down = true;
             SDL_PushEvent(&e);
+            return;
+        }
+        if (name == "lt" || name == "rt") { // a trigger pressed all the way and let go
+            for (Sint16 value : {Sint16(32767), Sint16(0)}) {
+                SDL_Event e{};
+                e.type = SDL_EVENT_GAMEPAD_AXIS_MOTION;
+                e.gaxis.axis = Uint8(name == "lt" ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+                e.gaxis.value = value;
+                SDL_PushEvent(&e);
+            }
             return;
         }
         for (const auto &[text, button] : buttons) {

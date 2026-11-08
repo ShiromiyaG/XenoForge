@@ -240,9 +240,19 @@ std::string button_html(const std::string &action, const std::string &label, boo
 }
 
 std::string dialog_html(const std::string &title, const std::string &body, const std::string &buttons, int width_dp) {
-    return "<div class=\"dialog\" id=\"dialog\" style=\"width: " + std::to_string(width_dp) + "dp;\"><div class=\"dlg-title\"><div class=\"grow nowrap\" id=\"dlg-title\">" +
+    // a dialog with one button has it as a strip across the whole foot (.single)
+    const size_t buttons_count = [&] {
+        size_t n = 0;
+        for (size_t at = buttons.find("class=\"btn "); at != std::string::npos; at = buttons.find("class=\"btn ", at + 1)) n++;
+        return n;
+    }();
+    const std::string foot_class = buttons_count == 1 ? "dlg-foot single" : "dlg-foot";
+    // the block, and under it, as wide as it, the pad's hints for it
+    return "<div class=\"dlg-wrap\" style=\"width: " + std::to_string(width_dp) + "dp;\"><div class=\"dialog\" id=\"dialog\"><div class=\"dlg-title\"><div class=\"grow nowrap\" id=\"dlg-title\">" +
            e(title) + "</div><div class=\"dlg-x\" data-action=\"dialog-close\">" + icon_glyph("x") + "</div></div><div class=\"dlg-body\" id=\"dlg-body\">" + body +
-           "</div><div class=\"dlg-foot\" id=\"dlg-foot\">" + buttons + "</div></div>";
+           "</div><div class=\"" + foot_class + "\" id=\"dlg-foot\">" + buttons + "</div></div>"
+           "<div class=\"dlg-hints\"><div class=\"hint\"><div class=\"gl a\"></div><div class=\"hl\">Select</div></div>"
+           "<div class=\"hint\"><div class=\"gl b\"></div><div class=\"hl\">Back</div></div></div></div>";
 }
 
 std::string about_body_html() {
@@ -353,7 +363,7 @@ std::vector<Choice> video_choice_list(const std::string &key) {
 std::vector<Choice> user_choices() { return {{"0", "User 1"}, {"1", "User 2"}, {"2", "User 3"}, {"3", "User 4"}}; }
 
 std::vector<Choice> theme_choices() {
-    return {{"system", "The system's (light or dark)"}, {"light", "Light"}, {"dark", "Dark"}};
+    return {{"system", "Follow system setting"}, {"light", "Light"}, {"dark", "Dark"}};
 }
 
 std::vector<Choice> backdrop_choices() { return {{"animated", "Ribbons, moving"}, {"still", "Ribbons, still"}, {"off", "Plain grey"}}; }
@@ -517,18 +527,20 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
         break;
     }
     case SettingsTab::Interface: {
-        std::string look = select_row("theme", "Theme", "Light or dark; the system's follows the desktop as it changes.",
+        std::string look = select_row("theme", "Theme", "Light or dark; \"Follow system setting\" changes with the desktop's.",
                                       label_of(theme_choices(), page.theme));
-        look += "<div class=\"setting\" data-kind=\"swatches\"><div class=\"label\"><div class=\"name\">Accent colour</div>"
+        // the row has the focus (Left and Right choose a colour, A the next one); a click on a swatch chooses it
+        look += "<div class=\"setting f\" data-kind=\"swatches\" data-key=\"accent\"><div class=\"label\"><div class=\"name\">Accent colour</div>"
                 "<div class=\"hint\">Selections, focus and the main buttons.</div></div><div class=\"control swatches\">";
         for (const std::string &hex : accent_choices()) {
-            look += "<div class=\"swatch f";
+            look += "<div class=\"swatch";
             if (hex == page.accent) look += " on";
             look += "\" data-action=\"accent\" data-arg=\"" + hex + "\" style=\"background-color: " + hex + ";\"></div>";
         }
         look += "</div></div>";
         look += select_row("backdrop", "Background", "The ribbons behind the list; they stop while the window is hidden or minimized.",
                            label_of(backdrop_choices(), page.backdrop));
+        look += check_row("ui.smooth_edges", "Smooth edges", "4x multisampling for the window's drawing, so tilted and rounded shapes have no jagged edges. Uses a little more graphics memory; turn it off on a weak GPU.", page.smooth_edges);
         look += check_row("ui.sounds", "Interface sounds", "A tick as the selection moves, a swish between pages, notes for choosing and going back.", page.sounds);
         s += group("Appearance", look);
         std::string folder = "<div class=\"setting\"><div class=\"label\"><div class=\"name\">Games folder</div>"

@@ -111,6 +111,7 @@ class SettingsView final : public Rml::EventListener {
 
     void navigate(NavDir dir);
     void activate();
+    void step_accent(int delta, bool wrap); // the next or previous swatch's colour
     void back();
     std::vector<Rml::Element *> focusables();
     void ensure_visible(Rml::Element *element);
@@ -137,6 +138,7 @@ class SettingsView final : public Rml::EventListener {
     Rml::Element *drag_row_ = nullptr;
     bool active_ = false;
     float scroll_ = 0;  // the rows' scroll, kept while the document is made again
+    std::string focus_key_; // and the key of the row that had the focus (the pad's), given back to it
     int stick_dir_ = 0;
 
     std::vector<std::function<void()>> deferred_;

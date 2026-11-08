@@ -119,6 +119,7 @@ struct Settings {
         std::string sort = "title";  // the column the table is sorted by, "-" before it for descending
         std::string backdrop = "animated"; // the window's ribbons: "animated", "still" or "off"
         bool sounds = true;          // the window's own sounds (ui_sound.h): a tick on moving, a swish on changing page
+        bool smooth_edges = true;    // 4x multisampling for the window's drawing (ui::Renderer::set_msaa)
         // the main window where the user left it (pixels; width 0: never saved)
         int x = 0, y = 0, width = 0, height = 0;
         bool maximized = false;

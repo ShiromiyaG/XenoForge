@@ -43,7 +43,11 @@ const vec3 BACKDROP_GREY[10] = vec3[](
     vec3(0.729, 0.722, 0.733), vec3(0.769, 0.757, 0.769));
 const float BACKDROP_AT[10] = float[](0.0, 0.12, 0.21, 0.29, 0.47, 0.58, 0.69, 0.81, 0.90, 1.0);
 
+// the light theme's: one vertical gradient, #3e4241 at the top to #919191 at the foot
+const vec3 BACKDROP_LIGHT_TOP = vec3(0.243, 0.259, 0.255), BACKDROP_LIGHT_FOOT = vec3(0.569, 0.569, 0.569);
+
 vec3 backdrop_grey(float y) {
+    if (draw.imode.y == 1) return mix(BACKDROP_LIGHT_TOP, BACKDROP_LIGHT_FOOT, clamp(y, 0.0, 1.0)); // set by the renderer for the light theme
     vec3 c = BACKDROP_GREY[0];
     for (int i = 1; i < 10; i++)
         c = mix(c, BACKDROP_GREY[i], clamp((y - BACKDROP_AT[i - 1]) / (BACKDROP_AT[i] - BACKDROP_AT[i - 1]), 0.0, 1.0));

@@ -51,12 +51,18 @@ class Renderer final : public Rml::RenderInterface {
     // left, four greens at the right, tones of `tint`. `time` is the ribbons'
     // clock in seconds (a fixed value holds them still); `strength` 0 leaves
     // the gradient alone. Not `on`: nothing drawn, the base layer starts clear.
+    // `light` is the light theme's gradient, #3e4241 to #919191, in place of the dark theme's.
     struct Backdrop {
-        bool on = false;
+        bool on = false, light = false;
         float time = 0, strength = 1;
         float tint[3] = {0.33f, 0.66f, 0.16f};
     };
     void set_backdrop(const Backdrop &backdrop);
+    // Multisampling for the interface's layers (the stencil and the clip masks too): the most of 8, 4 and 2
+    // that is not above `samples` and that the device takes, applied at the next frame (the targets and
+    // pipelines are made again); 1 draws without. The filters' images stay at one sample.
+    void set_msaa(uint32_t samples);
+    uint32_t msaa() const; // the sample count in use
 
     // The frame recorded into cmd (its resources free: the frame this slot
     // had before is done). `serial` numbers the frame; `completed` is the

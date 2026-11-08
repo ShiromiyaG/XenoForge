@@ -40,6 +40,10 @@ std::string tile_background(uint32_t title_id);
 // the stylesheet. An empty or bad "#RRGGBB" gives the default (green).
 struct Accent {
     std::string base, hi, lo, a08, a12, a15, a25, a40, a60, on;
+    // the glossy greens of the console's look, as tones of the accent: {ac-top}, {ac-mid}, {ac-b1}, {ac-b2},
+    // {ac-low}, {ac-end} (the gradient's stops, light to dark), {ac-lit}, {ac-edge}, {ac-pale}, {ac-shine},
+    // {ac-glow} (toward white) and {ac-ring} (toward black)
+    std::vector<std::pair<std::string, std::string>> shades;
 };
 Accent accent_from_hex(const std::string &hex);
 const std::vector<std::string> &accent_choices(); // the swatches the settings offer

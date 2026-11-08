@@ -1,9 +1,9 @@
 /*
  * XenoForge launcher, the settings page: the second page of the main window's
  * strip (launcher.rml's #spage), beside the library. Like the library it wears
- * the console's look, fixed (it does not follow the light or dark theme): the tabs are the
+ * the console's look, in the theme's and the accent's tokens: the tabs are the
  * toolbar's glossy buttons, the settings are rows like the games' with the
- * focused one in Xbox green, the controls are dark slots let into them. Every
+ * focused one in the accent's green, the controls are slots let into them. Every
  * rule is under #spage, because the page shares the window's stylesheet.
  * launcher.rcss comes before this file.
  */
@@ -28,57 +28,59 @@
 /* a row: the games' rows, shorter; the one with focus is the selected row's green */
 #spage .setting, #spage .bind {
     display: flex; flex-direction: row; align-items: center; min-height: 50dp; margin-bottom: 6dp; padding: 6dp 14dp;
-    border: 2dp #666668; border-radius: 9dp; cursor: default;
-    decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, #ffffff30, #ffffff00),
-               radial-gradient(ellipse 17% 125% at 75.4% 0%, #ffffff30, #ffffff00),
-               linear-gradient(180deg, #2c2c2eb8 0%, #2d2d2fb8 55%, #2e2e30b8 95%, #2f2f31b8 100%);
-    box-shadow: 0 0 0 1dp #1c1c1d, 0 3dp 6dp 1dp #00000080, inset 0 1dp 0 0 #ffffff1a;
+    border: 2dp {row-border}; border-radius: 9dp; cursor: default;
+    decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, {row-shine}, #ffffff00),
+               radial-gradient(ellipse 17% 125% at 75.4% 0%, {row-shine}, #ffffff00),
+               linear-gradient(180deg, {row-0} 0%, {row-1} 55%, {row-2} 95%, {row-3} 100%);
+    box-shadow: 0 0 0 1dp {row-ring}, 0 3dp 6dp 1dp {row-drop}, inset 0 1dp 0 0 {row-inset};
     transition: decorator 0.18s cubic-out, border-color 0.18s cubic-out;
 }
 #spage .setting:hover, #spage .bind:hover {
-    border-color: #77777a;
-    decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, #ffffff34, #ffffff00),
-               radial-gradient(ellipse 17% 125% at 75.4% 0%, #ffffff34, #ffffff00),
-               linear-gradient(180deg, #343436c0 0%, #353537c0 55%, #363638c0 95%, #373739c0 100%);
+    border-color: {row-border-h};
+    decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, {row-shine-h}, #ffffff00),
+               radial-gradient(ellipse 17% 125% at 75.4% 0%, {row-shine-h}, #ffffff00),
+               linear-gradient(180deg, {row-h0} 0%, {row-h1} 55%, {row-h2} 95%, {row-h3} 100%);
 }
 #spage .setting:focus-visible, #spage .bind:focus-visible, #spage .bind.capturing {
-    border-color: #c9ffc2;
+    border-color: {ac-edge};
     decorator: radial-gradient(ellipse 17% 125% at 25.7% 0%, #ffffff4a, #ffffff00),
                radial-gradient(ellipse 17% 125% at 75.4% 0%, #ffffff4a, #ffffff00),
-               linear-gradient(180deg, #55a928e0 0%, #52a326e0 55%, #458536e0 95%, #3f7d32e0 100%);
-    box-shadow: 0 0 0 1dp #2c7a1a, 0 0 14dp 3dp #6dff3ad0, inset 0 0 12dp 0 #c8ffb080;
+               linear-gradient(180deg, {ac-top}e0 0%, {ac-mid}e0 55%, {ac-low}e0 95%, {ac-end}e0 100%);
+    box-shadow: 0 0 0 1dp {ac-ring}, 0 0 14dp 3dp {ac-glow}d0, inset 0 0 12dp 0 {ac-edge}80;
 }
 #spage .check-row, #spage .setting[data-action], #spage .bind { cursor: pointer; }
 
 #spage .setting .label { flex: 1 1 0; min-width: 0; margin-right: 16dp; }
-#spage .setting .name { font-family: Condensed; font-size: 22dp; line-height: 1.15; color: #f6f6f6; }
-#spage .setting .hint { display: block; margin: 1dp 0 0 0; font-family: Condensed; font-size: 15dp; line-height: 1.15; color: #c8c8cc; }
-#spage .setting:focus-visible .hint { color: #e8ffe0; }
+#spage .setting .name { font-family: Condensed; font-size: 22dp; line-height: 1.15; color: {g-text}; }
+#spage .setting .hint { display: block; margin: 1dp 0 0 0; font-family: Condensed; font-size: 15dp; line-height: 1.15; color: {g-text-2}; }
+/* the focused row is the accent's green under light text, in both themes */
+#spage .setting:focus-visible .name, #spage .setting:focus-visible .value { color: {sel-text}; }
+#spage .setting:focus-visible .hint { color: {sel-hint}; }
 #spage .setting .control { flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; }
 
 /* a check box, its label beside it */
 #spage .check {
     flex: 0 0 26dp; width: 26dp; height: 26dp; margin: 0 14dp 0 0; text-align: center;
-    border: 2dp #8d8c92; border-radius: 6dp;
-    decorator: linear-gradient(180deg, #151517, #282829);
-    box-shadow: inset 0 2dp 4dp 0 #000000a0;
+    border: 2dp {check-border}; border-radius: 6dp;
+    decorator: linear-gradient(180deg, {check-0}, {check-1});
+    box-shadow: inset 0 2dp 4dp 0 {slot-inset};
 }
-#spage .check .ic { margin: 0; font-size: 17dp; line-height: 22dp; color: #ffffff; visibility: hidden; }
+#spage .check .ic { margin: 0; font-size: 17dp; line-height: 22dp; color: {sel-text}; visibility: hidden; }
 #spage .check.on {
-    border-color: #c9ffc2; decorator: linear-gradient(180deg, #62b834, #458536);
-    box-shadow: 0 0 0 1dp #2c7a1a, 0 0 8dp 1dp #6dff3a90, inset 0 1dp 1dp 0 #ffffff40;
+    border-color: {ac-edge}; decorator: linear-gradient(180deg, {ac-lit}, {ac-low});
+    box-shadow: 0 0 0 1dp {ac-ring}, 0 0 8dp 1dp {ac-glow}90, inset 0 1dp 1dp 0 #ffffff40;
 }
 #spage .check.on .ic { visibility: visible; }
 
 /* a slider and its value */
 #spage .slider { position: relative; width: 260dp; height: 26dp; cursor: pointer; }
 #spage .slider .track {
-    position: absolute; left: 0; top: 8dp; width: 100%; height: 10dp; border: 1dp #3c3c3f; border-radius: 5dp;
-    decorator: linear-gradient(180deg, #151517, #28282a); box-shadow: 0 1dp 0 0 #ffffff30;
+    position: absolute; left: 0; top: 8dp; width: 100%; height: 10dp; border: 1dp {slot-border}; border-radius: 5dp;
+    decorator: linear-gradient(180deg, {check-0}, {check-1}); box-shadow: 0 1dp 0 0 {slot-lip};
 }
 #spage .slider .fill {
     position: absolute; left: 0; top: 9dp; height: 8dp; border-radius: 4dp;
-    decorator: linear-gradient(180deg, #62b834, #458536); /* no shadow: the fill is often 0 wide, and a shadow of nothing asserts */
+    decorator: linear-gradient(180deg, {ac-lit}, {ac-low}); /* no shadow: the fill is often 0 wide, and a shadow of nothing asserts */
 }
 #spage .slider .thumb {
     position: absolute; top: 3dp; width: 20dp; height: 20dp; margin-left: -10dp; border: 1.5dp #d4d3d8; border-radius: 10dp;
@@ -86,93 +88,97 @@
     box-shadow: 0 1dp 3dp 0 #00000090;
 }
 #spage .slider:hover .thumb { border-color: #ffffff; }
-#spage .setting .value { width: 58dp; text-align: right; font-family: Condensed; font-size: 21dp; color: #f6f6f6; }
+#spage .setting .value { width: 58dp; text-align: right; font-family: Condensed; font-size: 21dp; color: {g-text}; }
 
 /* a dropdown: the search bar's let-in slot */
 #spage .select {
     display: flex; flex-direction: row; align-items: center; width: 290dp; height: 34dp; padding: 0 10dp 0 14dp;
-    border: 2dp #3c3c3f; border-radius: 9dp; cursor: pointer;
-    decorator: linear-gradient(180deg, #161618d8, #232325d0);
-    box-shadow: 0 1dp 0 0 #ffffff38, inset 0 2dp 6dp 0 #000000a0;
-    font-family: Condensed; font-size: 20dp; color: #f6f6f6;
+    border: 2dp {slot-border}; border-radius: 9dp; cursor: pointer;
+    decorator: linear-gradient(180deg, {slot-0}, {slot-1});
+    box-shadow: 0 1dp 0 0 {slot-lip}, inset 0 2dp 6dp 0 {slot-inset};
+    font-family: Condensed; font-size: 20dp; color: {g-text};
     transition: border-color 0.16s cubic-out;
 }
 #spage .select .value-text { flex: 1 1 0; }
-#spage .select .chev { margin: 0; font-size: 16dp; color: #c4c3c9; }
-#spage .select:hover { border-color: #55555a; }
-#spage .select.open { border-color: #c9ffc2; }
+#spage .select .chev { margin: 0; font-size: 16dp; color: {g-ic}; }
+#spage .select:hover { border-color: {slot-border-h}; }
+#spage .select.open { border-color: {ac-edge}; }
 #popup .mi { padding-left: 10dp; }
 #popup .mi.current { font-weight: 500; }
 
 /* the accent's swatches */
 #spage .swatches { padding-right: 2dp; }
-#spage .swatch { width: 24dp; height: 24dp; margin-left: 10dp; border: 2dp #ffffff50; border-radius: 12dp; cursor: pointer; }
-#spage .swatch:hover { border-color: #ffffffb0; }
-#spage .swatch.on { border-color: #ffffff; box-shadow: 0 0 0 2dp #ffffff50; }
-#spage .swatch:focus-visible { border-color: #ffffff; box-shadow: 0 0 0 3dp #ffffff; }
+#spage .swatch { width: 24dp; height: 24dp; margin-left: 10dp; border: 2dp {sw}; border-radius: 12dp; cursor: pointer; }
+#spage .swatch:hover { border-color: {sw-hover}; }
+#spage .swatch.on { border-color: {sw-on}; box-shadow: 0 0 0 2dp {sw-halo}; }
+#spage .swatch:focus-visible { border-color: {sw-on}; box-shadow: 0 0 0 3dp {sw-on}; }
 
 /* the games folder */
 #spage .folder-row { display: flex; flex-direction: row; align-items: center; margin: 0 0 6dp 0; padding: 0 2dp; }
 #spage input.text {
     flex: 1 1 0; width: 100dp; height: 36dp; margin-right: 6dp; padding: 0 12dp; line-height: 32dp;
-    border: 2dp #3c3c3f; border-radius: 9dp; cursor: text;
-    decorator: linear-gradient(180deg, #161618d8, #232325d0);
-    box-shadow: 0 1dp 0 0 #ffffff38, inset 0 2dp 6dp 0 #000000a0;
-    font-family: Condensed; font-size: 20dp; color: #f6f6f6;
+    border: 2dp {slot-border}; border-radius: 9dp; cursor: text;
+    decorator: linear-gradient(180deg, {slot-0}, {slot-1});
+    box-shadow: 0 1dp 0 0 {slot-lip}, inset 0 2dp 6dp 0 {slot-inset};
+    font-family: Condensed; font-size: 20dp; color: {g-text};
 }
-#spage input.text:hover { border-color: #55555a; }
-#spage input.text:focus { border-color: #c9ffc2; }
-#spage input.text:placeholder-shown { color: #8d8c92; }
+#spage input.text:hover { border-color: {slot-border-h}; }
+#spage input.text:focus { border-color: {ac-edge}; }
+#spage input.text:placeholder-shown { color: {g-text-3}; }
 
 /* the buttons: the toolbar's */
 #spage .btn {
-    height: 34dp; min-width: 0; margin-left: 6dp; padding: 0 14dp 0 12dp; border: 1.5dp #7c7b79; border-radius: 6dp;
-    decorator: linear-gradient(180deg, #62615f 0%, #504f4e 40%, #444342 62%, #504f4e 100%);
+    height: 34dp; min-width: 0; margin-left: 6dp; padding: 0 14dp 0 12dp; border: 1.5dp {btn-border}; border-radius: 6dp;
+    decorator: linear-gradient(180deg, {btn-0} 0%, {btn-1} 40%, {btn-2} 62%, {btn-3} 100%);
     background-color: transparent;
-    box-shadow: 0 0 0 1dp #2b2b2a, 0 2dp 3dp 1dp #00000050, inset 0 1dp 1dp 0 #ffffff26;
-    font-family: Condensed; font-size: 19dp; font-weight: 400; color: #f4f4f4;
+    box-shadow: 0 0 0 1dp {btn-ring}, 0 2dp 3dp 1dp {btn-drop}, inset 0 1dp 1dp 0 {btn-inset};
+    font-family: Condensed; font-size: 19dp; font-weight: 400; color: {btn-text};
 }
-#spage .btn .ic { margin-right: 7dp; font-size: 18dp; color: #f4f4f4; }
-#spage .btn:hover { border-color: #918f8d; background-color: transparent; decorator: linear-gradient(180deg, #727170 0%, #5e5d5c 40%, #504f4e 62%, #5c5b5a 100%); }
-#spage .btn:active { background-color: transparent; decorator: linear-gradient(180deg, #424140 0%, #4c4b4a 60%, #565554 100%); }
-#spage .btn:focus-visible { border-color: #ffffff; box-shadow: 0 0 0 1dp #2b2b2a, 0 0 10dp 2dp #ffffffa0; }
+#spage .btn .ic { margin-right: 7dp; font-size: 18dp; color: {btn-text}; }
+#spage .btn:hover { border-color: {btn-h-border}; background-color: transparent; decorator: linear-gradient(180deg, {btn-h0} 0%, {btn-h1} 40%, {btn-h2} 62%, {btn-h3} 100%); }
+#spage .btn:active { background-color: transparent; decorator: linear-gradient(180deg, {btn-p0} 0%, {btn-p2} 60%, {btn-p3} 100%); }
+#spage .btn:focus-visible { border-color: {btn-focus}; box-shadow: 0 0 0 1dp {btn-ring}, 0 0 10dp 2dp {btn-focus-glow}; }
 #pages .page-buttons { display: flex; flex-direction: row; margin: 14dp 0 0 0; }
 #pages .page-buttons .btn { margin-left: 0; }
 
 /* the gamepads connected */
 #spage .pads { padding: 4dp 8dp; }
-#spage .gamepad { display: flex; flex-direction: row; align-items: center; height: 32dp; font-family: Condensed; font-size: 20dp; color: #f6f6f6; }
+#spage .gamepad { display: flex; flex-direction: row; align-items: center; height: 32dp; font-family: Condensed; font-size: 20dp; color: {g-text}; }
 #spage .gamepad .dot { flex: 0 0 12dp; width: 12dp; height: 12dp; border-radius: 6dp; margin-right: 11dp; }
-#spage .gamepad .dot.ready { background-color: #8bdc55; }
-#spage .gamepad .dot.off { background-color: #8d8c92; }
+#spage .gamepad .dot.ready { background-color: {dot-ready}; }
+#spage .gamepad .dot.off { background-color: {g-text-3}; }
 #spage .pad-user { width: 84dp; }
-#spage .dim { color: #c8c8cc; }
+#spage .dim { color: {g-text-2}; }
 
 /* the keyboard's bindings */
 #spage .bind { height: 46dp; min-height: 46dp; padding: 0 14dp; }
-#spage .bname { width: 230dp; font-family: Condensed; font-size: 21dp; color: #f6f6f6; }
+#spage .bname { width: 230dp; font-family: Condensed; font-size: 21dp; color: {g-text}; }
+#spage .bind:focus-visible .bname, #spage .bind.capturing .bname { color: {sel-text}; }
 #spage .keys { flex: 1 1 0; display: flex; flex-direction: row; align-items: center; }
 #pages .keycap {
     display: block; height: 28dp; margin: 0 6dp 0 0; padding: 0 10dp; line-height: 24dp;
-    border: 1dp #777677; border-bottom-width: 2dp; border-radius: 5dp;
-    decorator: linear-gradient(180deg, #3b3a3b, #232223);
-    font-family: Condensed; font-size: 17dp; color: #ffffff;
+    border: 1dp {key-border}; border-bottom-width: 2dp; border-radius: 5dp;
+    decorator: linear-gradient(180deg, {key-0}, {key-1});
+    font-family: Condensed; font-size: 17dp; color: {key-text};
 }
-#pages .keycap.mod { color: #c8c8cc; }
-#pages .keycap.press { border-color: #c9ffc2; color: #ffffff; }
-#spage .bset { font-family: Condensed; font-size: 16dp; color: #e8ffe0; visibility: hidden; }
+#pages .keycap.mod { color: {key-mod}; }
+#pages .keycap.press { border-color: {key-press}; color: {key-text}; }
+#spage .bset { font-family: Condensed; font-size: 16dp; color: {bset}; visibility: hidden; }
+#spage .bind:focus-visible .bset, #spage .bind.capturing .bset { color: {sel-hint}; }
 #spage .bind:hover .bset, #spage .bind:focus-visible .bset { visibility: visible; }
 
 /* the hints at the foot: the note between the pad's and the keyboard's */
-#shints .note { flex: 1 1 0; text-align: center; font-family: Condensed; font-size: 15dp; color: #2e2d30; }
+/* (the buttons keep their size; the note takes what is left and is cut short, then gone, as the window narrows) */
+#shints .pad-hints { flex: 0 0 auto; }
+#shints .note { flex: 1 1 0; min-width: 0; overflow: hidden; white-space: nowrap; text-align: center; font-family: Condensed; font-size: 15dp; color: #ffffff; filter: drop-shadow(#000000b0 0dp 1dp 1.5dp); }
 
 /* the Profile tab: the profiles, the gamertag, the achievements */
-#spage .profile-row { display: flex; flex-direction: row; align-items: center; min-height: 40dp; padding: 2dp 8dp; font-family: Condensed; font-size: 20dp; color: #f6f6f6; }
+#spage .profile-row { display: flex; flex-direction: row; align-items: center; min-height: 40dp; padding: 2dp 8dp; font-family: Condensed; font-size: 20dp; color: {g-text}; }
 #spage .profile-row .pname { flex: 1 1 0; }
-#spage .profile-row .pid { margin-right: 8dp; font-size: 15dp; color: #c8c8cc; }
-#spage .profile-row.current .pname { color: #e8ffe0; }
-#spage .pmsg { margin: 2dp 0 4dp 8dp; font-family: Condensed; font-size: 16dp; color: #ff9a8a; }
-#spage .ach { display: flex; flex-direction: row; align-items: center; padding: 4dp 8dp; font-family: Condensed; font-size: 19dp; color: #f6f6f6; }
-#spage .ach-icon { width: 40dp; height: 40dp; margin-right: 12dp; border: 1dp #3c3c3f; border-radius: 6dp; decorator: linear-gradient(180deg, #2c2c2e, #1c1c1d); text-align: center; line-height: 38dp; }
+#spage .profile-row .pid { margin-right: 8dp; font-size: 15dp; color: {g-text-2}; }
+#spage .profile-row.current .pname { color: {g-link}; }
+#spage .pmsg { margin: 2dp 0 4dp 8dp; font-family: Condensed; font-size: 16dp; color: {g-bad}; }
+#spage .ach { display: flex; flex-direction: row; align-items: center; padding: 4dp 8dp; font-family: Condensed; font-size: 19dp; color: {g-text}; }
+#spage .ach-icon { width: 40dp; height: 40dp; margin-right: 12dp; border: 1dp {g-text-3}; border-radius: 6dp; text-align: center; line-height: 38dp; color: {g-link}; }
 #spage .ach-text { flex: 1 1 0; }
-#spage .ach.locked .ach-name { color: #c8c8cc; }
+#spage .ach.locked .ach-name { color: {g-text-2}; }

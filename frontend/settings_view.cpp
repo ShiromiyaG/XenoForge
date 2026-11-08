@@ -44,7 +44,13 @@ void SettingsView::attach(Rml::Context *context, Rml::ElementDocument *document)
     if (active_) {
         rebuild();
         defer([this] {
-            if (Rml::Element *pages = by_id("pages")) pages->SetScrollTop(scroll_);
+            if (Rml::Element *pages = by_id("pages")) {
+                pages->SetScrollTop(scroll_);
+                // a look change (the theme, the accent) makes the whole document again: the pad's selection stays where it was
+                if (!focus_key_.empty() && host_.pad_mode())
+                    if (Rml::Element *row = pages->QuerySelector("[data-key=\"" + focus_key_ + "\"]")) row->Focus(true);
+            }
+            focus_key_.clear();
         });
     }
 }
@@ -52,6 +58,10 @@ void SettingsView::attach(Rml::Context *context, Rml::ElementDocument *document)
 void SettingsView::detach() {
     if (!doc_) return;
     if (Rml::Element *pages = by_id("pages")) scroll_ = pages->GetScrollTop();
+    focus_key_.clear();
+    if (active_ && ctx_)
+        if (Rml::Element *focus = ctx_->GetFocusElement())
+            if (Rml::Element *row = ancestor_with(focus, "data-key")) focus_key_ = row->GetAttribute<Rml::String>("data-key", "");
     for (const char *type : EVENTS) doc_->RemoveEventListener(type, this);
     doc_ = nullptr;
     popup_row_ = nullptr, drag_row_ = nullptr;
@@ -158,6 +168,7 @@ SettingsPage SettingsView::page() {
     p.theme = theme_text(theme_from_text(core_.launcher().theme));
     p.backdrop = core_.launcher().backdrop;
     p.sounds = core_.launcher().sounds;
+    p.smooth_edges = core_.launcher().smooth_edges;
     if (tab_ == SettingsTab::Controllers) p.gamepads = LauncherCore::gamepads();
     if (tab_ == SettingsTab::Profile) {
         const std::filesystem::path storage = storage_root(edit_, core_.config_file());
@@ -363,6 +374,15 @@ void SettingsView::toggle_setting(Rml::Element *row) {
         if (l.sounds) host_.play_sound(Cue::Toggle); // turned on: this is the first one heard
         return;
     }
+    if (key == "ui.smooth_edges") {
+        // also the launcher's own; the window reads it every frame and makes its targets again
+        Settings::Launcher l = core_.launcher();
+        l.smooth_edges = !l.smooth_edges;
+        std::string error;
+        core_.set_launcher(l, error);
+        if (Rml::Element *box = row->QuerySelector(".check")) box->SetClass("on", l.smooth_edges);
+        return;
+    }
     bool *field = bool_field(key);
     if (!field) return;
     *field = !*field;
@@ -466,7 +486,10 @@ void SettingsView::open_popup(Rml::Element *row) {
     layer->SetInnerRML(html);
     layer->SetClass("open", true);
     Rml::Element *popup = by_id("popup");
-    const Rml::Vector2f at = box->GetAbsoluteOffset(Rml::BoxArea::Border);
+    // the layer is in the window's own coordinates, the box on the page strip, which slid left by the page's
+    // own offset to show the settings (a transform: the layout offsets do not know of it)
+    Rml::Vector2f at = box->GetAbsoluteOffset(Rml::BoxArea::Border);
+    if (Rml::Element *page = by_id("spage")) at.x -= page->GetAbsoluteOffset(Rml::BoxArea::Border).x;
     const Rml::Vector2f size = box->GetBox().GetSize(Rml::BoxArea::Border);
     popup->SetProperty("left", px(at.x));
     popup->SetProperty("top", px(at.y + size.y + 2 * ctx_->GetDensityIndependentPixelRatio()));
@@ -684,12 +707,17 @@ void SettingsView::focus_first() {
 void SettingsView::navigate(NavDir dir) {
     if (!doc_) return;
     Rml::Element *focus = ctx_->GetFocusElement();
-    if (focus && focus->GetTagName() == "input") return;
+    // in a text box Left and Right are the caret's; Up and Down (here only from the pad) leave it
+    if (focus && focus->GetTagName() == "input" && (dir == NavDir::Left || dir == NavDir::Right)) return;
     // Left and Right change the value of a slider, a dropdown or a check box that has focus
     if (focus && (dir == NavDir::Left || dir == NavDir::Right) && !popup_row_) {
         Rml::Element *row = ancestor_with(focus, "data-kind");
         const std::string kind = row ? row->GetAttribute<Rml::String>("data-kind", "") : "";
         const std::string key = row ? row->GetAttribute<Rml::String>("data-key", "") : "";
+        if (kind == "swatches") {
+            step_accent(dir == NavDir::Right ? 1 : -1, false);
+            return;
+        }
         if (kind == "slider") {
             double fraction = 0;
             std::string text;
@@ -714,6 +742,10 @@ void SettingsView::navigate(NavDir dir) {
         }
         if (kind == "toggle" && key == "ui.sounds") {
             if (core_.launcher().sounds != (dir == NavDir::Right)) toggle_setting(row);
+            return;
+        }
+        if (kind == "toggle" && key == "ui.smooth_edges") {
+            if (core_.launcher().smooth_edges != (dir == NavDir::Right)) host_.play_sound(Cue::Toggle), toggle_setting(row);
             return;
         }
         if (kind == "toggle" && key != "own") {
@@ -744,8 +776,27 @@ void SettingsView::navigate(NavDir dir) {
 void SettingsView::activate() {
     Rml::Element *focus = ctx_->GetFocusElement();
     if (!focus || focus == doc_ || !mine(focus)) return focus_first();
+    if (Rml::Element *row = ancestor_with(focus, "data-kind"); row && row->GetAttribute<Rml::String>("data-kind", "") == "swatches")
+        return step_accent(1, true);
     if (Rml::Element *a = ancestor_with(focus, "data-action"))
         do_action(a->GetAttribute<Rml::String>("data-action", ""), a->GetAttribute<Rml::String>("data-arg", ""), a);
+}
+
+// The swatches' row with the pad: Left and Right choose the neighbour (not past the ends), A the next, round again.
+void SettingsView::step_accent(int delta, bool wrap) {
+    const std::vector<std::string> &choices = accent_choices();
+    const int count = int(choices.size());
+    if (count == 0) return;
+    const std::string current = accent_from_hex(core_.accent()).base;
+    int at = 0;
+    for (int i = 0; i < count; i++)
+        if (choices[size_t(i)] == current) at = i;
+    const int next = wrap ? (at + delta + count) % count : std::clamp(at + delta, 0, count - 1);
+    if (next == at) return;
+    host_.play_sound(Cue::Toggle);
+    std::string error;
+    core_.set_accent(choices[size_t(next)], error);
+    host_.look_changed();
 }
 
 void SettingsView::back() {

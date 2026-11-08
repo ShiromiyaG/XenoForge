@@ -124,6 +124,7 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     std::vector<MenuItem> menu_items(const std::string &name);
     void open_menu(const std::string &name, bool keyboard);
     void open_context_menu(float x, float y);
+    void open_row_menu(bool first_hot); // the selected game's menu, at its row (the pad's Select, the Menu key)
     void close_menu();   // closed, no sound: what was chosen sounds for itself
     void dismiss_menu(); // closed without choosing: its sound
 
@@ -247,6 +248,8 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
         double next = 0;
     };
     Repeat pad_repeat_, stick_repeat_;
+    int menu_stick_dir_ = 0;                // the left stick's push in a menu: one step a push
+    bool lt_held_ = false, rt_held_ = false; // the triggers, which switch between the pages once a press
     bool quit_ = false;
 };
 

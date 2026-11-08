@@ -68,6 +68,9 @@ static_assert(sizeof(DrawUniforms) == 576);
 struct Texture {
     vk::Image image;
     VkImageView view = VK_NULL_HANDLE;
+    // a layer with multisampling draws into this, and `image` is what it resolves to at the end of every pass
+    vk::Image ms;
+    VkImageView ms_view = VK_NULL_HANDLE;
     VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorPool pool = VK_NULL_HANDLE;
     int width = 0, height = 0;
@@ -135,8 +138,14 @@ struct Renderer::Impl {
     VkDescriptorSetLayout ubo_layout = VK_NULL_HANDLE, tex_layout = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkPipeline pipelines[3][2][4] = {}; // by depth (none, test and write, test), blend and clip
+    VkPipeline flat[2] = {};            // with multisampling, the passes over single-sample images (by blend): no stencil
     VkShaderModule vert = VK_NULL_HANDLE, frag = VK_NULL_HANDLE;
     VkFormat stencil_format = VK_FORMAT_UNDEFINED;
+
+    // multisampling: what the layers are drawn with (1: none), what was asked, and what the device does
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    uint32_t requested = 1;
+    VkSampleCountFlags supported = VK_SAMPLE_COUNT_1_BIT;
 
     // descriptors and per-draw uniforms
     VkDescriptorPool ubo_pool = VK_NULL_HANDLE;
@@ -191,6 +200,8 @@ struct Renderer::Impl {
     bool open(vk::Device &device, std::string &error);
     void close();
     bool make_pipelines(std::string &error);
+    void destroy_pipelines();
+    VkSampleCountFlagBits pick_samples() const;
 
     // ---- resources
 
@@ -213,6 +224,7 @@ struct Renderer::Impl {
                         size_t index_bytes);
     void free_geometry_now(const Geometry &g);
     void make_stencil();
+    void make_ms(Texture &t);
     void drop_targets();
     Texture &layer(size_t i);
     Texture &filter_image(int i);
@@ -265,6 +277,19 @@ bool Renderer::Impl::open(vk::Device &device, std::string &error) {
     stencil_format = device.format_supported(VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
                          ? VK_FORMAT_D24_UNORM_S8_UINT
                          : VK_FORMAT_D32_SFLOAT_S8_UINT;
+
+    // the sample counts the layers' formats take as attachments
+    supported = props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts &
+                props.limits.framebufferStencilSampleCounts;
+    for (const auto &[format, usage] : {std::pair{COLOR_FORMAT, VkImageUsageFlags(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)},
+                                        std::pair{stencil_format, VkImageUsageFlags(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)}}) {
+        VkImageFormatProperties fp{};
+        if (vkGetPhysicalDeviceImageFormatProperties(physical, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, 0,
+                                                     &fp) == VK_SUCCESS)
+            supported &= fp.sampleCounts;
+        else
+            supported = VK_SAMPLE_COUNT_1_BIT;
+    }
 
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = si.minFilter = VK_FILTER_LINEAR;
@@ -329,14 +354,31 @@ bool Renderer::Impl::open(vk::Device &device, std::string &error) {
     return true;
 }
 
+// the most samples, up to what was asked, that the device takes for the layers (1: none)
+VkSampleCountFlagBits Renderer::Impl::pick_samples() const {
+    for (const VkSampleCountFlagBits count : {VK_SAMPLE_COUNT_8_BIT, VK_SAMPLE_COUNT_4_BIT, VK_SAMPLE_COUNT_2_BIT})
+        if (uint32_t(count) <= requested && (supported & count)) return count;
+    return VK_SAMPLE_COUNT_1_BIT;
+}
+
+void Renderer::Impl::destroy_pipelines() {
+    for (auto &plane : pipelines)
+        for (auto &row : plane)
+            for (VkPipeline &p : row) vkDestroyPipeline(d, p, nullptr), p = VK_NULL_HANDLE;
+    for (VkPipeline &p : flat) vkDestroyPipeline(d, p, nullptr), p = VK_NULL_HANDLE;
+    bound = VK_NULL_HANDLE;
+}
+
 bool Renderer::Impl::make_pipelines(std::string &error) {
-    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    mi.codeSize = sizeof(vert_spv);
-    mi.pCode = vert_spv;
-    vkCreateShaderModule(d, &mi, nullptr, &vert);
-    mi.codeSize = sizeof(frag_spv);
-    mi.pCode = frag_spv;
-    vkCreateShaderModule(d, &mi, nullptr, &frag);
+    if (!vert) {
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = sizeof(vert_spv);
+        mi.pCode = vert_spv;
+        vkCreateShaderModule(d, &mi, nullptr, &vert);
+        mi.codeSize = sizeof(frag_spv);
+        mi.pCode = frag_spv;
+        vkCreateShaderModule(d, &mi, nullptr, &frag);
+    }
 
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                                  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -366,7 +408,7 @@ bool Renderer::Impl::make_pipelines(std::string &error) {
     rs.cullMode = VK_CULL_MODE_NONE;
     rs.lineWidth = 1;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = samples;
     const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                       VK_DYNAMIC_STATE_STENCIL_REFERENCE};
     VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
@@ -426,6 +468,44 @@ bool Renderer::Impl::make_pipelines(std::string &error) {
                 return error = "no pipeline", false;
         }
     }
+
+    // with multisampling, the passes over the filters' images (one sample, no stencil): whole-window quads,
+    // never clipped
+    if (samples != VK_SAMPLE_COUNT_1_BIT) {
+        VkPipelineMultisampleStateCreateInfo ms1{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms1.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineRenderingCreateInfo plain{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        plain.colorAttachmentCount = 1;
+        plain.pColorAttachmentFormats = &COLOR_FORMAT;
+        for (int b = 0; b < 2; b++) {
+            VkPipelineColorBlendAttachmentState att{};
+            att.blendEnable = b == int(Blend::Over);
+            att.srcColorBlendFactor = att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            att.dstColorBlendFactor = att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            att.colorBlendOp = att.alphaBlendOp = VK_BLEND_OP_ADD;
+            att.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                                 VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+            cb.attachmentCount = 1;
+            cb.pAttachments = &att;
+            VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+            VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+            pi.pNext = &plain;
+            pi.stageCount = 2;
+            pi.pStages = stages;
+            pi.pVertexInputState = &vi;
+            pi.pInputAssemblyState = &ia;
+            pi.pViewportState = &vp;
+            pi.pRasterizationState = &rs;
+            pi.pMultisampleState = &ms1;
+            pi.pDepthStencilState = &dss;
+            pi.pColorBlendState = &cb;
+            pi.pDynamicState = &ds;
+            pi.layout = pipeline_layout;
+            if (vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pi, nullptr, &flat[b]) != VK_SUCCESS)
+                return error = "no pipeline", false;
+        }
+    }
     return true;
 }
 
@@ -440,9 +520,7 @@ void Renderer::Impl::close() {
     for (vk::Buffer &b : ubo) dev->destroy(b);
     for (VkDescriptorPool p : tex_pools) vkDestroyDescriptorPool(d, p, nullptr);
     vkDestroyDescriptorPool(d, ubo_pool, nullptr);
-    for (auto &plane : pipelines)
-        for (auto &row : plane)
-            for (VkPipeline p : row) vkDestroyPipeline(d, p, nullptr);
+    destroy_pipelines();
     vkDestroyShaderModule(d, vert, nullptr);
     vkDestroyShaderModule(d, frag, nullptr);
     vkDestroyPipelineLayout(d, pipeline_layout, nullptr);
@@ -549,6 +627,8 @@ void Renderer::Impl::destroy_texture_now(Texture *t) {
     vkFreeDescriptorSets(d, t->pool, 1, &t->set);
     vkDestroyImageView(d, t->view, nullptr);
     dev->destroy(t->image);
+    if (t->ms_view) vkDestroyImageView(d, t->ms_view, nullptr);
+    if (t->ms.image) dev->destroy(t->ms);
     delete t;
 }
 
@@ -603,7 +683,7 @@ void Renderer::Impl::free_geometry_now(const Geometry &g) {
 }
 
 void Renderer::Impl::make_stencil() {
-    stencil = dev->create_image(VK_IMAGE_TYPE_2D, stencil_format, {width, height, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+    stencil = dev->create_image(VK_IMAGE_TYPE_2D, stencil_format, {width, height, 1}, 1, 1, samples,
                                 VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
     VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = stencil.image;
@@ -630,6 +710,36 @@ void Renderer::Impl::make_stencil() {
         error);
 }
 
+// the multisampled image a layer is drawn into (the layer's own image is what it resolves to)
+void Renderer::Impl::make_ms(Texture &t) {
+    t.ms = dev->create_image(VK_IMAGE_TYPE_2D, COLOR_FORMAT, {uint32_t(t.width), uint32_t(t.height), 1}, 1, 1, samples,
+                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (!t.ms.image) return;
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = t.ms.image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = COLOR_FORMAT;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCreateImageView(d, &vi, nullptr, &t.ms_view);
+    const VkImage image = t.ms.image;
+    std::string error;
+    dev->run(
+        [&](VkCommandBuffer c) {
+            VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.image = image;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.imageMemoryBarrierCount = 1;
+            dep.pImageMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(c, &dep);
+        },
+        error);
+}
+
 void Renderer::Impl::drop_targets() {
     for (auto &l : layers) destroy_texture_now(l.release());
     layers.clear();
@@ -643,7 +753,11 @@ void Renderer::Impl::drop_targets() {
 Texture &Renderer::Impl::layer(size_t i) {
     constexpr VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    while (layers.size() <= i) layers.emplace_back(make_texture(int(width), int(height), usage, nullptr));
+    while (layers.size() <= i) {
+        Texture *t = make_texture(int(width), int(height), usage, nullptr);
+        if (t && samples != VK_SAMPLE_COUNT_1_BIT) make_ms(*t);
+        layers.emplace_back(t);
+    }
     return *layers[i];
 }
 
@@ -684,6 +798,14 @@ void Renderer::Impl::begin_pass(Texture &target, bool clear) {
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     color.imageView = target.view;
     color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    if (target.ms_view) {
+        // drawn multisampled, resolved into the layer's image as the pass ends; the samples are kept for the
+        // next pass over this layer, which loads them
+        color.imageView = target.ms_view;
+        color.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        color.resolveImageView = target.view;
+        color.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
     color.loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
     color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     color.clearValue.color = {{0, 0, 0, 1}};
@@ -702,8 +824,11 @@ void Renderer::Impl::begin_pass(Texture &target, bool clear) {
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &color;
-    ri.pDepthAttachment = &depth;
-    ri.pStencilAttachment = &st;
+    // the stencil has the layers' sample count: the single-sample images of the filters go without
+    if (samples == VK_SAMPLE_COUNT_1_BIT || target.ms_view) {
+        ri.pDepthAttachment = &depth;
+        ri.pStencilAttachment = &st;
+    }
     vkCmdBeginRendering(cmd, &ri);
     pass_target = &target;
     passes++;
@@ -741,7 +866,8 @@ void Renderer::Impl::draw(Draw &s) {
     std::memcpy(static_cast<uint8_t *>(ubo[slot].mapped) + offset, &s.u, sizeof(DrawUniforms));
     ubo_offset += ubo_stride;
 
-    VkPipeline pipeline = pipelines[s.depth][int(s.blend)][int(s.clip)];
+    const bool plain = samples != VK_SAMPLE_COUNT_1_BIT && !s.target->ms_view;
+    VkPipeline pipeline = plain ? flat[int(s.blend)] : pipelines[s.depth][int(s.blend)][int(s.clip)];
     if (pipeline != bound) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline), bound = pipeline;
     const uint32_t vw = s.viewport_w ? s.viewport_w : uint32_t(s.target->width);
     const uint32_t vh = s.viewport_h ? s.viewport_h : uint32_t(s.target->height);
@@ -970,10 +1096,17 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
     Impl &m = *impl_;
     width = std::max(width, 1u), height = std::max(height, 1u);
     m.run_deferred(completed);
-    if (width != m.width || height != m.height) {
+    const VkSampleCountFlagBits want = m.pick_samples();
+    if (width != m.width || height != m.height || want != m.samples) {
         vkDeviceWaitIdle(m.d);
         m.run_deferred(UINT64_MAX);
         m.drop_targets();
+        if (want != m.samples) { // the pipelines are made for a sample count
+            m.destroy_pipelines();
+            m.samples = want;
+            std::string error;
+            if (!m.make_pipelines(error)) Rml::Log::Message(Rml::Log::LT_ERROR, "the launcher's pipelines: %s", error.c_str());
+        }
         m.width = width_ = width, m.height = height_ = height;
         m.make_stencil();
     }
@@ -995,7 +1128,8 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
     if (m.backdrop.on) {
         const Backdrop &b = m.backdrop;
         // the grey gradient: ui.frag's MODE_BACKDROP (the clock-free part)
-        m.pass(m.layer(0), *m.white, M_BACKDROP, Blend::Replace, {}, false, [](Impl::Draw &) {});
+        m.pass(m.layer(0), *m.white, M_BACKDROP, Blend::Replace, {}, false,
+               [&b](Impl::Draw &d) { d.u.imode[1] = b.light ? 1 : 0; });
         // the ribbons over it: triangles built on the CPU (ribbons.cpp), opaque, with a depth test (no
         // sorting: where they cross or fold the edge is exact), then their one-pixel fringes, tested
         // against the depth but not written, blended, standing in for multisampling
@@ -1018,6 +1152,7 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
                 const std::vector<uint32_t> *lists[2] = {&body, &fringe};
                 for (int part = 0; part < 2; part++) {
                     if (lists[part]->empty()) continue;
+                    if (part == 1 && m.samples != VK_SAMPLE_COUNT_1_BIT) continue; // multisampling softens the edges
                     std::vector<int> idx(lists[part]->begin(), lists[part]->end());
                     auto *g = new Geometry;
                     if (m.alloc_geometry(*g, verts.data(), verts.size() * sizeof(Rml::Vertex), idx.data(),
@@ -1044,6 +1179,12 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
 void Renderer::set_backdrop(const Backdrop &backdrop) {
     if (impl_) impl_->backdrop = backdrop;
 }
+
+void Renderer::set_msaa(uint32_t samples) {
+    if (impl_) impl_->requested = std::max(samples, 1u);
+}
+
+uint32_t Renderer::msaa() const { return impl_ ? uint32_t(impl_->samples) : 1; }
 
 void Renderer::end_frame() {
     impl_->end_pass();
