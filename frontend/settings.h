@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <string>
 #include <variant>
 #include <vector>
@@ -124,6 +125,10 @@ struct Settings {
     // the title ID ("4D5307E6") whose own settings these are, or "" for the
     // shared ones: where save() writes them
     std::string game;
+    // The settings as load() read them (or save() last wrote them): save() writes into the file only the fields
+    // that differ from this, over the file as it is then, so what another process (the launcher, a player) saved
+    // meanwhile survives. Null for settings never loaded: all of them are written.
+    mutable std::shared_ptr<const Settings> loaded;
 
     Settings(); // Xenia's default bindings
 };

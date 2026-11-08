@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <initializer_list>
+#include <memory>
+#include <sstream>
 
 namespace xf::frontend {
 
@@ -345,15 +347,64 @@ bool load(const std::filesystem::path &path, Settings &s, std::string &error, co
             read_sections(*own, s);
             s.game = title;
         }
+    s.loaded.reset();
+    s.loaded = std::make_shared<const Settings>(s);
     return true;
 }
 
-bool save(const std::filesystem::path &path, const Settings &s, std::string &error) {
-    toml::table t = read_file(path);
+namespace {
+
+bool same_node(const toml::node &a, const toml::node &b) {
+    std::ostringstream x, y;
+    x << toml::toml_formatter{a};
+    y << toml::toml_formatter{b};
+    return a.type() == b.type() && x.str() == y.str();
+}
+
+// `cur`'s values into `file`, the ones that differ from `base` only (all of them without a base): what this process
+// changed since it read the file, over what others wrote since
+void merge_changes(toml::table &file, const toml::table &cur, const toml::table *base) {
+    for (auto &&[key, value] : cur) {
+        const toml::node *before = base ? base->get(key) : nullptr;
+        const std::string name(key.str());
+        if (const toml::table *sub = value.as_table()) {
+            toml::table *into = file.get_as<toml::table>(name);
+            if (!into) {
+                file.insert_or_assign(name, toml::table{});
+                into = file.get_as<toml::table>(name);
+            }
+            merge_changes(*into, *sub, before ? before->as_table() : nullptr);
+        } else if (!before || !same_node(value, *before)) {
+            value.visit([&](auto &&leaf) { file.insert_or_assign(name, leaf); });
+        }
+    }
+}
+
+// the tables save() writes for settings: the shared ones with [player] and [launcher], or a game's own sections
+toml::table written_tables(const Settings &s) {
+    toml::table t;
+    write_sections(t, s);
     if (s.game.empty()) {
-        write_sections(t, s);
         t.insert_or_assign("player", player_table(s));
         t.insert_or_assign("launcher", launcher_table(s.launcher));
+    }
+    return t;
+}
+
+} // namespace
+
+bool save(const std::filesystem::path &path, const Settings &s, std::string &error) {
+    toml::table t = read_file(path);
+    const toml::table cur = written_tables(s);
+    // the baseline: what these settings were when read, for the same scope
+    toml::table base_table;
+    const toml::table *base = nullptr;
+    // (a game's table is compared with what was read even when that was the shared settings: the game's fields
+    // that were not changed are then not written)
+    if (s.loaded && (s.loaded->game == s.game || !s.game.empty()))
+        base_table = written_tables(*s.loaded), base = &base_table;
+    if (s.game.empty()) {
+        merge_changes(t, cur, base);
     } else {
         // a new file gets the shared defaults beside the game's, so it has
         // the whole set to edit
@@ -364,11 +415,21 @@ bool save(const std::filesystem::path &path, const Settings &s, std::string &err
             t.insert_or_assign("launcher", launcher_table(s.launcher));
         }
         if (!t["games"].as_table()) t.insert_or_assign("games", toml::table{});
-        toml::table own;
-        write_sections(own, s);
-        t["games"].as_table()->insert_or_assign(s.game, std::move(own));
+        // a game's table not there yet is written whole
+        toml::table *games = t["games"].as_table();
+        toml::table *own = games->get_as<toml::table>(s.game);
+        if (!own) {
+            games->insert_or_assign(s.game, toml::table{});
+            own = games->get_as<toml::table>(s.game);
+            base = nullptr;
+        }
+        merge_changes(*own, cur, base);
     }
-    return write_file(path, t, error);
+    if (!write_file(path, t, error)) return false;
+    auto now = std::make_shared<Settings>(s);
+    now->loaded.reset();
+    s.loaded = std::move(now);
+    return true;
 }
 
 bool forget_game(const std::filesystem::path &path, const std::string &title, std::string &error) {

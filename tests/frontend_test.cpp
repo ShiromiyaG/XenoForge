@@ -98,6 +98,46 @@ int main() {
         CHECK(frontend::video_value(bad, "video.upscaler") == "none" && frontend::video_needs_restart("video.min_scalable"));
         CHECK(!frontend::video_needs_restart("video.upscaler"));
     }
+    // no lost updates: two processes (the launcher and a player) load the file, each changes a few fields and
+    // saves; the other's fields survive, whichever saves first
+    {
+        const auto file = dir / "shared.toml";
+        frontend::Settings first;
+        CHECK(frontend::save(file, first, error));
+        frontend::Settings launcher, player;
+        CHECK(frontend::load(file, launcher, error) && frontend::load(file, player, error));
+        launcher.video.upscaler = "fsr", launcher.video.antialiasing = "fxaa", launcher.video.resolution_scale = 200;
+        CHECK(frontend::save(file, launcher, error));
+        player.audio.volume = 55; // the player closes having changed only the volume
+        CHECK(frontend::save(file, player, error));
+        frontend::Settings r;
+        CHECK(frontend::load(file, r, error));
+        CHECK(r.video.upscaler == "fsr" && r.video.antialiasing == "fxaa" && r.video.resolution_scale == 200);
+        CHECK(r.audio.volume == 55);
+        // the reverse: the launcher saves after the player did
+        player.audio.volume = 55, player.video.smooth = false;
+        CHECK(frontend::save(file, player, error));
+        launcher.video.upscaler = "cas";
+        CHECK(frontend::save(file, launcher, error));
+        CHECK(frontend::load(file, r, error));
+        CHECK(r.video.upscaler == "cas" && !r.video.smooth && r.audio.volume == 55 && r.video.resolution_scale == 200);
+        // a field both changed: the later save wins; the one saved twice keeps writing only what changed since
+        launcher.audio.volume = 20;
+        CHECK(frontend::save(file, launcher, error));
+        player.video.antialiasing = "fxaa_extreme";
+        CHECK(frontend::save(file, player, error));
+        CHECK(frontend::load(file, r, error));
+        CHECK(r.audio.volume == 20 && r.video.antialiasing == "fxaa_extreme" && r.video.upscaler == "cas");
+        // a game's own table: its fields merged too
+        frontend::Settings a, b;
+        CHECK(frontend::load(file, a, error, "4D5307E6") && frontend::load(file, b, error, "4D5307E6"));
+        a.game = b.game = "4D5307E6";
+        a.video.antialiasing = "fxaa", b.audio.volume = 10;
+        CHECK(frontend::save(file, a, error));
+        CHECK(frontend::save(file, b, error));
+        CHECK(frontend::load(file, r, error, "4D5307E6") && r.game == "4D5307E6");
+        CHECK(r.video.antialiasing == "fxaa" && r.audio.volume == 10);
+    }
     // the resolution scale's arithmetic (render_scale.h)
     {
         using xf::render::Scale;
