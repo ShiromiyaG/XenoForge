@@ -84,8 +84,17 @@ added to its base; loads and stores swap bytes.
   tests: `tests/ppc` has some). `lswx`/`stswx` move the byte count XER
   keeps in bits 57-63, which mtxer sets and mfxer reads back (the context's
   `xer_bc`); with a count of 0 nothing moves.
-- Traps call `system->trap` when they fire (Xenia ignores them by default);
-  `sc` calls `system->syscall`. VSCR is SAT alone, NJ always set.
+- Traps call `system->trap` when they fire (Xenia ignores them by default;
+  the emitter sets `c.pc` before each trap instruction, the interpreter
+  always does); `sc` calls `system->syscall`. The kernel's trap
+  (`exceptions.cpp`): `twi 31, r0, 20` and `26` are the XDK's debug print
+  (r3 the text, r4 its length; printed as `guest: ...` and the code goes on,
+  as Xenia's TrapDebugPrint), `25` is ignored as Xenia does, and any other
+  fired trap is the console's breakpoint (`DbgBreakPoint` is `twi 31, r0,
+  22`): STATUS_BREAKPOINT raised at the instruction through the title's
+  handlers, which end the title when none takes it, as the console does
+  with no debugger (Xenia logs "This should be a crash!" and goes on). A
+  handler that continues goes on after the trap.
 - VMX: VSCR[SAT] is sticky (Xenia's backends always clear it). `vsl`/`vsr`
   shift each byte by its own count with the neighbour's bits, as the
   console does where the counts differ (Xenia uses byte 15's for all and
@@ -93,7 +102,16 @@ added to its base; loads and stores swap bytes.
   (`vmsum*`, `vmul[eo]*`, `vsum*`, `vmhaddshs`, `vmhraddshs`, `vmladduhm`,
   `vupk[hl]px`) follow the AltiVec PEM.
 - VMX floating point runs in non-Java mode: denormals in and out flush to
-  a zero of their sign. `vmaddfp`/`vnmsubfp` round once (`std::fma`; one
+  a zero of their sign. **VSCR** (2026-11-08): SAT, and NJ as `mtvscr`
+  sets it (`Context::vscr_java`, in the context's padding, 0 = NJ set);
+  `mfvscr` and the exception contexts read both. Java mode (NJ clear) keeps
+  denormal operands and results (IEEE 754) in the arithmetic, compares,
+  rounding, conversions and dot products; each instruction runs its
+  non-Java form inline and its Java form out of line (`XF_VFP` in
+  `vmx_float.h`: a load and a branch not taken). The D3D packs and the
+  estimate tables are the same in both modes (unknown on the console; an
+  estimate of a denormal divides). Restoring a CONTEXT leaves NJ alone.
+  Xenia switches its denormal mode on `mtvscr`'s NJ too. `vmaddfp`/`vnmsubfp` round once (`std::fma`; one
   instruction with FMA in the build). Where the console's tests contradict
   Xenia, the console wins: a NaN comes out quieted, the first in operand
   order vA, vB, vC; `vnmsubfp` does not negate a NaN; invalid operations
@@ -610,6 +628,132 @@ Game A (2026-11-07, one call in 100, 30 s): 200,455 calls, 283,219
 segments, 0 mismatches, 20 differences after memory read changed (the
 kernel's time stamp bundle, audio positions), 130 given up at MMIO; one in 5,
 40 s: 396,431 segments, 0 mismatches.
+
+## The differential fuzzer
+
+Random instruction sequences through three runners, every field of the
+state after compared (2026-11-08; `xenoforge/fuzz.h`, `fuzz_format.h`,
+`tools/xffuzz.cpp`):
+
+- **The cases**: for each of the 442 instructions the generator makes (all
+  456 but branches, `sc`, the traps, `mftb` and the MSR writes, which the
+  emitter's and kernel's own tests cover), N cases whose focus it is: alone
+  (60%) or followed by one to three random others, now and then with a
+  forward `bc` over the next one (reading CR or CTR, decrementing CTR). The
+  words are random in every field that still decodes to the instruction;
+  loads and stores are made r1-relative (r1 points into a 2 KB window of
+  random words; r2 is a small index) and nothing writes r1 or r2. Operands
+  come from edge pools: GPRs (0, -1, the 32- and 64-bit extremes, carries'
+  edges, shift counts), doubles (signed zeros, infinities, quiet and
+  signalling NaNs with payloads, double and single denormals, the single
+  range's edges, rounding ties to single, the integer conversions' edges),
+  floats and words for the vectors (the same, plus saturation's edges and
+  the D3D packs' 3.0 + x), random FPSCR status, exception and enable bits,
+  XER, CR, CTR and VSCR[SAT]. The rounding mode starts at nearest: Xenia
+  applies FPSCR[RN] only when mtfsf/mtfsfi/mtfsb set it, so the sequences
+  set it themselves.
+- **The runners**: the interpreter (`xffuzz run`); the generated code
+  (`xffuzz emit` recompiles the cases, built at `-O2 -mfma -mavx2` as the
+  games are; `ppc_fuzz_test`, in ctest, runs a fixed seed's 5,308 cases
+  both ways); Xenia's x64 JIT (`tools/xenia_oracle/ppc_exec_oracle.cc`,
+  its test runner's setup: `build.bat exec`).
+- **The comparison** (`xffuzz compare <cases> <a> <b> [--singles] [--known]
+  [--ignore fields] [--only ops] [--examples N]`): the cases by their focus
+  instruction, the fields that differ counted, examples with the operands
+  the instructions name. `--known` takes out of Xenia's state the
+  departures this document makes on purpose (the list above: OE and
+  CR's SO, CA in the OE forms, SAT, mfxer's and mcrxr's OV and SO,
+  sraw/srad's CA, the FPSCR without Rc, and the instructions Xenia lacks),
+  so what is left is what nothing here explains yet.
+
+Run 2026-11-08 (seed 2, 60 cases per instruction, 26,540 cases):
+
+- interpreter and generated code: 0 differences (and 0 in ctest's 5,303);
+- the interpreter and Xenia: 9,376 of 26,376 differ before `--known`;
+  with it, and singles only, 797 of 14,886 in 53 instructions, every one
+  explained by the departures above, which follow the console's tests or
+  the manuals:
+  - the FP Rc forms' CR1 and FPSCR (ours: the exception and status bits the
+    console-generated tests hold; Xenia clears FEX and VX, keeps few bits);
+  - FP values: the positive default NaN (Xenia's is x86's, negative), NaNs
+    not negated by `fnm*`, `fctiw*` of a NaN, single forms with a
+    double-denormal operand, one rounding in the fused single forms and
+    in `fsubs` and the like with operands that are not singles (Xenia
+    rounds twice: a tie to single rounded to even where the exact result
+    is below it), `frsp` quieting a signalling NaN, `fres`'s estimate
+    (neither side has the console's);
+  - VMX floating point in non-Java mode: denormal operands and results
+    flushed (Xenia's x64 path takes some denormal operands as they are,
+    and rounds results up to the smallest normal where the exact result
+    is denormal), NaNs quieted in `vmaxfp`/`vminfp`, `vnmsubfp` not
+    negating a NaN, `vcmpbfp` on a NaN, the console's `vrefp` estimate,
+    invalid results 0x7FC00000 (`vlogefp` of a negative number);
+  - `mtvscr`'s NJ bit, found here: ignored then, modeled since (VSCR,
+    above; NJ now agrees in all 59 `mtvscr` cases), and its SAT (Xenia's
+    `mtvscr` sets only its copy of VSCR).
+- Xenia ran 1 case into a fault (an `addze` sequence); the interpreter
+  reports 30 `vpkd3d128`/`vupkd3d128` cases with a pack type the console's
+  D3D never uses as unimplemented, where Xenia compiles them as nothing.
+
+Running it again: `xffuzz gen cases.xfz --seed S --per-op N`, `xffuzz run
+cases.xfz ours.xfs`, `ppc_exec_oracle cases.xfz xenia.xfs`, then `xffuzz
+compare cases.xfz ours.xfs xenia.xfs --names xf,xenia --known --ignore
+fpscr --singles`. A case file holds 4.7 KB a case (the vector registers
+and the memory window): 60 per instruction is 125 MB, outside the
+repository (`../external/fuzz`).
+
+## Where the time goes
+
+`boot --profile N [--profile-from S]` (`tools/sampler.cpp`) samples every
+thread of the process about once a millisecond, weighting each sample by
+the cycles the thread spent since the last one (so waiting threads count
+nothing), and prints the swaps a second over the span, the CPU time a swap
+(all threads), the shares by part of the program and the N most sampled
+functions with their hottest offsets. The generated functions' names come
+from the PDB's public symbols (their code is built without debug
+information). Windows only for now.
+
+What it showed (2026-11-08, `--render`, 20 to 60 s):
+- game A, at 30 swaps a second (its cap): 52 ms of CPU a swap, of which
+  the generated code about 23% (much of it the engine's spin waits:
+  `or r31,r31,r31` priority hints in a `bdnz` loop polling a flag), the
+  host's waits and yields about 60% (a guest thread polling
+  `KeDelayExecutionThread(0)`: `SwitchToThread`), the kernel's clock
+  (`QueryPerformanceCounter` behind `mftb` and the scheduler's `now`) 5%,
+  a `std::map<std::string>` count per import call and its allocations 4%;
+- game B, at its cap: 25 ms a swap, the generated code over 60%, half of
+  it the same spin wait (`__savegprlr`/`__restgprlr` 7-10%).
+So swaps a second do not move with the code's speed in either, and CPU
+time a swap mostly measures the spinning. The measure for the generated
+code's speed is the deterministic mode, which runs every thread on one
+host thread as fast as it can (`--deterministic --until-swap N`): the
+process's CPU time to the same swap with the same guest memory hash.
+
+**Guest memory apart from the context** (`ppc_ops.h`, `host`): the
+compiler did not know a guest store cannot write the `Context`, so after
+every store it reloaded the base and every register it held. Telling it
+(`__builtin_assume_separate_storage`) lets registers stay in host
+registers across stores. Game B, deterministic to swap 3,000, CPU time,
+three runs each interleaved (another agent's clang and Xenia running,
+59-79% load): before 18.80, 19.67, 18.97 s (median 18.97); after 16.66,
+16.44, 18.97 s (median 16.66): 12% less. The same guest memory hash.
+
+**VSCR[NJ]'s cost** (the same measure, with and without it, interleaved,
+13-49% load): without 16.78, 16.81, 16.09 s; with 16.56, 17.16, 16.67 s
+(medians 16.78 and 16.67): none measurable, so it is not behind a switch.
+Two of those six runs, both slow on the wall clock (24 and 30 s for 17 s
+of CPU), ended with another guest memory hash than the other four: the
+deterministic mode is not quite deterministic under the host's load
+(open, the kernel's).
+
+**Against Xenia** (game B, `--render` and Xenia's Vulkan window, 20 to
+60 s, interleaved, 18-99% load from other builds): CPU time a frame, ours
+before the change 26.8, 26.3, 23.5 ms against Xenia's 31.2, 29.8, 27.6 ms
+(ratio of medians 0.88); after 32.5, 28.5, 28.9 ms against 31.4, 32.5,
+33.1 ms (0.89). Both run at the game's own pace (ours 30-50 swaps a
+second, Xenia 32-45 frames a second by its title bar, through the Vulkan
+SDK's monitor layer), so these mostly compare the spinning, and the load
+moved them more than the change did.
 
 ## PPC in the host debugger
 
