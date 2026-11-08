@@ -239,6 +239,15 @@ endforeach()
 add_executable(kernel_threads_test tests/kernel_threads_test.cpp)
 target_include_directories(kernel_threads_test PRIVATE src/kernel)
 target_link_libraries(kernel_threads_test PRIVATE xenoforge_kernel xenoforge)
+# the same on the deterministic mode's scheduler, and that mode's own test
+# (src/kernel/deterministic.cpp, input recordings)
+add_executable(kernel_threads_deterministic_test tests/kernel_threads_test.cpp)
+target_compile_definitions(kernel_threads_deterministic_test PRIVATE XF_DETERMINISTIC_TEST)
+target_include_directories(kernel_threads_deterministic_test PRIVATE src/kernel)
+target_link_libraries(kernel_threads_deterministic_test PRIVATE xenoforge_kernel xenoforge)
+add_executable(kernel_deterministic_test tests/kernel_deterministic_test.cpp)
+target_include_directories(kernel_deterministic_test PRIVATE src/kernel)
+target_link_libraries(kernel_deterministic_test PRIVATE xenoforge_kernel xenoforge)
 # crash and stop reports: a thread's report, the interpreter's stop, and real
 # faults in child processes (include/xenoforge/crash.h)
 add_executable(kernel_crash_test tests/kernel_crash_test.cpp)
@@ -473,6 +482,9 @@ add_test(NAME kernel_crash COMMAND kernel_crash_test)
 # a rare deadlock seen once under load (2026-11-05, not reproduced in 36
 # runs since): fail instead of hanging the suite
 set_tests_properties(kernel_threads PROPERTIES TIMEOUT 120)
+add_test(NAME kernel_threads_deterministic COMMAND kernel_threads_deterministic_test)
+add_test(NAME kernel_deterministic COMMAND kernel_deterministic_test)
+set_tests_properties(kernel_threads_deterministic kernel_deterministic PROPERTIES TIMEOUT 120)
 # the video family: the GPU live through its exports, MMIO and threads
 add_executable(kernel_video_test tests/kernel_video_test.cpp)
 target_include_directories(kernel_video_test PRIVATE src/kernel)

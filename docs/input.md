@@ -59,6 +59,29 @@ right lt rt`. The packet number moves with the press, as a real pad's
 does. The player takes the same option, and prints when each screenshot's
 swap came on the scheduler's clock, to choose the times from.
 
+## Recordings
+
+`kernel::record_input(k, path)` writes what the input exports answer, and
+`kernel::replay_input(k, path)` answers from such a file in place of the
+drivers (boot's `--record-input`/`--replay-input`, `XF_INPUT_RECORD` and
+`XF_INPUT_REPLAY` for boot and the player). The file is text, a line each
+time a user's answer changes, at the time it was asked on the scheduler's
+clock (100 ns):
+
+    s <time> <user> <result> <packet> <buttons> <lt> <rt> <lx> <ly> <rx> <ry>   XamInputGetState
+    k <time> <user> <result> <virtual key> <unicode> <flags> <hid code>          a keystroke
+    c <time> <user> <result>                                                     the capabilities
+
+Results, packets, buttons and keys in hex. Every keystroke delivered is a
+line; a state, the capabilities and a keystroke call's other answers
+(empty, not connected) only when they change. A replay answers a state or
+the capabilities with the last line at or before the time asked (the first
+before it), deadzones and packet numbers as recorded, and the keystrokes in
+order once their time has come. In the deterministic mode (runtime.md) the
+polls come at the same times, so a replay repeats the recorded run exactly;
+recorded while playing, it is close (the times are the host's).
+Vibration is not replayed.
+
 ## The player
 
 `frontend/sdl_input.cpp`, two drivers in Xenia's order:

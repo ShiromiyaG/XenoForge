@@ -519,6 +519,7 @@ std::string Kernel::thread_report() {
         }
         if (!frames.empty()) out += "    stack:" + frames + "\n";
     }
+    out += o.scheduler->report(); // the deterministic mode's counts
     return out;
 }
 

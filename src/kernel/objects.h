@@ -468,7 +468,7 @@ public:
     // guest's work), and may hand over there. Nothing when playing.
     virtual void advance(uint64_t cost) { (void)cost; }
     virtual bool deterministic() const { return false; }
-    // its counts, for boot's report (empty when playing)
+    // its counts, for the thread report (empty when playing)
     virtual std::string report() { return {}; }
 };
 

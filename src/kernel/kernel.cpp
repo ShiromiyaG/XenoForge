@@ -373,6 +373,22 @@ void Kernel::set_generated_modules(const ppc::GeneratedModule *const *modules, s
     code_->available.assign(modules, modules + count);
 }
 
+std::pair<uintptr_t, uintptr_t> Kernel::generated_code_span() {
+    uintptr_t low = UINTPTR_MAX, high = 0;
+    auto take = [&](void (*fn)(ppc::Context &)) {
+        if (!fn) return;
+        uintptr_t a = reinterpret_cast<uintptr_t>(fn);
+        low = std::min(low, a), high = std::max(high, a);
+    };
+    {
+        std::lock_guard lock(code_->mutex);
+        for (const ppc::GeneratedModule *m : code_->available)
+            for (size_t i = 0; i < m->count; i++) take(m->functions[i].fn);
+    }
+    for (size_t i = 0; i < generated_count_; i++) take(generated_[i].fn);
+    return low < high ? std::pair{low, high} : std::pair<uintptr_t, uintptr_t>{0, 0};
+}
+
 std::string Kernel::add_module_code(const Xex &xex) {
     std::lock_guard lock(code_->mutex);
     if (code_->available.empty()) return {};
@@ -530,6 +546,9 @@ std::string Kernel::lockstep_report() const { return lockstep_ ? lockstep_->repo
 // caller's frame when that frame's generated code takes it.
 void Kernel::dispatch(ppc::Context &c, uint32_t target) {
     if (stopped) return;
+    // an indirect call moves the deterministic mode's clock and may hand over
+    // (a loop that waits on another thread through virtual calls gets there)
+    if (deterministic_dispatch_cost_) objects_->scheduler->advance(deterministic_dispatch_cost_);
     // what a return from this call comes back to
     const uint32_t until = uint32_t(c.lr), stack_top = uint32_t(c.r[1]);
     uint32_t pc = target;

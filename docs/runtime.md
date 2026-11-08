@@ -360,7 +360,8 @@ PCR (r13) and TLS as Xenia's XThread sets them up. Kernel objects (events,
 semaphores, mutants, timers, threads) live in guest memory where the game
 put them (KEVENT and friends) and are backed by host objects found by the
 guest address, as Xenia's XObject does. The deterministic mode (fibers on
-one host thread, plan "Threads") comes on the same interface later.
+one host thread, plan "Threads") runs on the same interface ("The
+deterministic mode", below).
 
 As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
 
@@ -501,16 +502,89 @@ stack's generated frames wait where they are:
   threads) starts over on a fiber of the new thread from LR, as those
   frames use the other thread's context; its outer frames run interpreted.
   None of the eight games does it.
-- **The deterministic mode** (fibers on one host thread) will have to resume
-  a guest thread on the host fiber of the stack it is on
-  (`GuestStacks::current`), not on its own; a thread that is a fiber
-  already is used as it is, and not made a thread again at its end.
+- **The deterministic mode** (fibers on one host thread) resumes a guest
+  thread on the host fiber it handed over from (a guest stack's, or its
+  own), and a thread that is a fiber already is used as it is, not made a
+  thread again at its end. The fiber primitives are stacks.h's, shared.
 - Xenia runs a fiber switch on the thread's one host stack: its JIT can
   enter any address, so KeSetCurrentStackPointers drops the host frames and
   re-enters the thread at LR (`XThread::Reenter`). rexglue's fork replaces
   the XAPI's CreateFiber, SwitchToFiber and ConvertThreadToFiber, hooked by
   address, with host fibers of its own; here the game's own XAPI code runs,
   and only the kernel export it ends in is the system's.
+
+### The deterministic mode (plan A5, 2026-11-07)
+
+`src/kernel/deterministic.cpp`, chosen before launch with
+`Kernel::make_deterministic(Deterministic)` (`boot --deterministic`,
+`XF_DETERMINISTIC=1` or `=paced` for boot and the player, through
+`game::open`). Written anew: Xenia has no such mode.
+
+- **One host thread, a fiber per guest thread.** The scheduler's host thread
+  is a fiber that picks the next ready thread and switches to it; the thread
+  switches back where the kernel sees it: a wait that blocks, a yield
+  (NtYieldExecution, a spin lock's spins, the loader lock's waiters), and the
+  end of its slice or a deadline come due, checked at each kernel call
+  (`Kernel::run_import`), time base read (the `time_base` callback) and
+  indirect call (`Kernel::dispatch`, which the generated code's `bctrl`s
+  reach). The thread that ran goes to the tail of the ready queue, woken
+  threads join it in the order they were woken, timed-out waits end in the
+  order the threads were made. Nothing is handed over at DISPATCH_LEVEL or
+  above (NT does not preempt there; the video family holds a host mutex per
+  CPU around an interrupt's callback).
+- **A virtual clock.** A kernel call costs 1 us of it, a time base read and
+  an indirect call 100 ns, a slice is 1 ms (all `Deterministic` fields); when
+  every thread waits, it jumps to the earliest deadline (a timeout, a timer).
+  KeQueryPerformanceCounter, mftb, KeQuerySystemTime (from a fixed date,
+  2025-01-01), waits, timers, KeTimeStampBundle (every millisecond of it),
+  vblank, the sound worker and XMA all run on it. The sound clients' outputs
+  answer what has played from a pacing output on that clock
+  (`VirtualClockOutput`; the player's device still gets the frames).
+  Unpaced (boot), it runs as fast as the host goes; paced (the player), it
+  never runs ahead of the host's clock.
+- **What else would differ run to run**: XeCryptRandom and XNetRandom take a
+  fixed seed; the loader lock's owner is the guest thread, not the host
+  thread (all are one). Not covered: the storage root's contents (saves left
+  by an earlier run; boot's default is a temporary directory), a fresh
+  profile's random XUID, the network.
+- **Forced hand-overs.** Guest code that waits for another thread with no
+  kernel call, time base read or indirect call (the XDK's spin loops on a
+  flag, with the Xenon's `or r1,r1,r1` priority hints) never hands over. A
+  watchdog host thread stops such a thread after `force_after_ms` (100) of
+  the host's time if it is in the generated code at IRQL below 2
+  (`SuspendThread`, a call to a hand-over on its stack, `RtlRestoreContext`
+  to go on), and it sleeps as long on the clock as it spun. Where it stops
+  depends on the host's speed, so such a run is only exact when the stop
+  falls in a pure spin; the report counts them. Windows only (TODO: a
+  signal handler on POSIX). The real answer is the recompiler's yield points
+  (plan, "Threads"): at those priority hints and at loops' back edges.
+- **Halting and checking.** `--until-swap N` / `--until S` stop the run at
+  the first hand-over after swap N or S seconds of the clock, every thread
+  parked; boot then prints `guest memory hash` (`Kernel::memory_hash`,
+  FNV-1a over every committed readable region). The thread report ends with
+  the scheduler's counts (runs, slices, yields, waits, idle jumps, forced
+  hand-overs) and names a thread that has run a second without handing over.
+- **Input**: recorded and replayed (docs/input.md, "Recordings"); in this
+  mode a replay repeats the recorded run.
+
+Measured (El Chavo Kart, `boot_chaves`, headless, game-libs 7ac73df):
+
+| run | swaps | host time | swaps/s (host) | clock |
+|---|---|---|---|---|
+| playing, `--seconds 30` | 897 | 30 s | 30 | (the host's) |
+| deterministic, `--until-swap 200` | 200 | 4.2 s | 47 | 6.98 s |
+| deterministic, `--until-swap 1200` | 1200 | 19.1-19.9 s | 60-63 | 40.66 s |
+
+Two runs to swap 200 (1 forced hand-over) and two to swap 1200 (7) left the
+same memory hash, the same runs, the same export counts, the whole report
+alike but for host times. The cost of one host thread is more than paid
+back by the idle clock not waiting for the host's. Ben 10 (`boot_ben10`)
+reaches 347 swaps in 30 s with 209 forced hand-overs (its main thread spins
+before its first kernel call), and two runs to swap 150 differ (clock 12.00
+s and 11.90 s): it needs the recompiler's yield points to be exact.
+`kernel_threads_deterministic_test` runs the threads' scenarios on this
+scheduler; `kernel_deterministic_test` checks a mixed workload (sleeps,
+ping-pong, slices) and a recording and its replay, run after run.
 
 ## The GPU
 

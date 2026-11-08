@@ -203,7 +203,12 @@ struct Deterministic {
     uint64_t system_time = 133'801'632'000'000'000ull; // the guest's system time at the start: 2025-01-01 00:00 UTC
     uint64_t call_cost = 10;      // a kernel call: 1 us
     uint64_t time_base_cost = 1;  // a time base read (mftb): 100 ns
+    uint64_t dispatch_cost = 1;   // an indirect call (Kernel::dispatch): 100 ns
     uint64_t slice = 10'000;      // a thread runs 1 ms of the clock before the next ready one does
+    // Guest code that runs this long on the host without handing over (a spin
+    // with no kernel call, time base read or indirect call) is handed over
+    // where it is: the run goes on, no longer exact (0: never; Windows only).
+    uint32_t force_after_ms = 100;
     // Paced: the clock never runs ahead of the host's (the player's, so the
     // game plays at its speed); else it runs as fast as the host can (boot).
     bool paced = false;
@@ -284,6 +289,9 @@ public:
     // region by region in address order: two runs that left the same memory
     // give the same one
     uint64_t memory_hash();
+    // the host addresses the generated code spans (its lowest and highest
+    // function), where the deterministic mode may stop a thread
+    std::pair<uintptr_t, uintptr_t> generated_code_span();
     // the context of the guest thread on this host thread (nullptr off one)
     static ppc::Context *current_context();
     Objects &objects() { return *objects_; }
@@ -430,7 +438,7 @@ private:
     Memory &memory_;
     // what a kernel call and a time base read cost the deterministic mode's
     // clock (0 when playing)
-    uint64_t deterministic_call_cost_ = 0, deterministic_time_base_cost_ = 0;
+    uint64_t deterministic_call_cost_ = 0, deterministic_time_base_cost_ = 0, deterministic_dispatch_cost_ = 0;
     const Xex *xex_ = nullptr;
     uint32_t entry_ = 0;
     ppc::System system_;

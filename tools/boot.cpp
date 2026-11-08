@@ -35,6 +35,13 @@
 // clock, the renderer's time), as the player's --rates does. --stall-report S
 // prints the threads (what each waits for, its guest stack by the back chain)
 // when no swap has come for S seconds (5 S before the first), once a stall.
+// --deterministic runs every guest thread as a fiber on one host thread in a
+// fixed order on a virtual clock (docs/runtime.md, "The deterministic mode";
+// --paced keeps that clock behind the host's): the same disc and input give
+// the same run. --until-swap N or --until S (seconds of its clock) halts it
+// there, every thread parked, and the report adds a hash of guest memory.
+// --record-input <file> writes what XAM's input answered, --replay-input
+// <file> answers from such a recording (docs/input.md, "Recordings").
 // The last line is "xf-summary {json}" (game.h, print_summary), what xfcompat
 // reads: title, digest, state (ok, stall, stopped, ended, crash), generated
 // code, interpreter entries, swaps, the exports and GPU gaps counted.
@@ -47,6 +54,7 @@
 //        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
+//        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
 
 #include "game.h"
 #include "xenoforge/lockstep.h"
@@ -70,7 +78,9 @@ int main(int argc, char **argv) {
                         "[--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
                         "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
-                        "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N]\n";
+                        "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
+                        "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
+                        "[--replay-input <file>]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -128,6 +138,18 @@ int main(int argc, char **argv) {
                 return std::fprintf(stderr, "bad --lockstep\n%s", usage), 2;
         } else if (a == "--lockstep-sample" && k + 1 < argc)
             o.lockstep_sample = uint32_t(std::strtoul(argv[++k], nullptr, 10));
+        else if (a == "--deterministic")
+            o.deterministic = std::max(o.deterministic, 1);
+        else if (a == "--paced")
+            o.deterministic = 2;
+        else if (a == "--until-swap" && k + 1 < argc)
+            o.halt_swap = std::strtoull(argv[++k], nullptr, 10);
+        else if (a == "--until" && k + 1 < argc)
+            o.halt_seconds = std::strtod(argv[++k], nullptr);
+        else if (a == "--record-input" && k + 1 < argc)
+            o.record_input = argv[++k];
+        else if (a == "--replay-input" && k + 1 < argc)
+            o.replay_input = argv[++k];
         else if (a == "--press" && k + 1 < argc) {
             std::string why;
             if (!game::parse_press(argv[++k], presses.emplace_back(), why))
@@ -186,8 +208,10 @@ int main(int argc, char **argv) {
     uint64_t last_swaps = 0;
     double last_swap_at = 0;
     bool stall_reported = false;
+    bool halted = false;
     for (double elapsed = 0; elapsed < seconds && !k.stopped;) {
         if ((ended = k.wait_main(100, &exit_code))) break;
+        if ((halted = k.halted())) break;
         elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (rates && elapsed >= next_rates) game::print_rates(g, rate_log, elapsed), next_rates += 1;
         if (stall_report > 0) {
@@ -207,12 +231,15 @@ int main(int argc, char **argv) {
         std::printf("stopped: %s\n", k.stop_reason.c_str());
     else if (ended)
         std::printf("the main thread ended (exit code 0x%08X)\n", exit_code);
+    else if (halted)
+        std::printf("halted (the deterministic mode's --until-swap or --until)\n");
     else
         std::printf("still running after %u s\n", seconds);
     // a stop's report (the guest stack, the last kernel calls), written to a file
     std::string stop_file = k.stopped ? game::write_stop_report(g) : std::string();
     std::printf("threads:\n%s", k.thread_report().c_str());
     game::print_report(g, true);
+    if (k.deterministic()) std::printf("guest memory hash %016llx\n", (unsigned long long)k.memory_hash());
     // the machine-readable end (xfcompat reads it): a stall still under way at the end is the state
     {
         char text[64];
@@ -222,7 +249,7 @@ int main(int argc, char **argv) {
         else if (ended)
             game::print_summary(g, "ended", text);
         else
-            game::print_summary(g, stall_reported ? "stall" : "ok");
+            game::print_summary(g, stall_reported ? "stall" : "ok", halted ? "halted" : "");
     }
     // other threads may still run: no destructors under them
     std::fflush(stdout);

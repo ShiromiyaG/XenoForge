@@ -240,7 +240,7 @@ uint32_t Audio::register_client(uint32_t callback, uint32_t callback_arg, uint32
     k->store32(wrapped, callback_arg);
     Client &c = *free;
     c.output = make_output();
-    if (c.output && k->deterministic()) c.output = std::make_unique<VirtualClockOutput>(std::move(c.output));
+    if (c.output && k->deterministic()) c.output = std::make_unique<audio::VirtualClockOutput>(std::move(c.output));
     // XF_AUDIO_WAV=<prefix>: the client's frames also to <prefix>.client<N>.wav
     if (const char *wav = std::getenv("XF_AUDIO_WAV"); wav && *wav && c.output) {
         const std::string path = std::string(wav) + ".client" + std::to_string(free - clients_.begin()) + ".wav";

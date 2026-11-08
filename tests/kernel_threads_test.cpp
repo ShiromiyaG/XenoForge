@@ -78,8 +78,11 @@ uint32_t create_event(ppc::Context &c, bool manual, bool initial) {
     return K->load32(handle_ptr);
 }
 
-int64_t elapsed_ms(std::chrono::steady_clock::time_point since) {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - since).count();
+// the kernel's clock (the host's when playing, the virtual one in the
+// deterministic mode), in 100 ns
+uint64_t clock_now() { return K->interrupt_time(); }
+int64_t elapsed_ms(uint64_t since) {
+    return int64_t((clock_now() - since) / 10'000);
 }
 
 // ---- the guest functions ----
@@ -303,11 +306,11 @@ void threads(ppc::Context &c) {
 void events(ppc::Context &c) {
     // a timeout, then the signal from another thread
     uint32_t e = create_event(c, false, false);
-    auto start = std::chrono::steady_clock::now();
+    auto start = clock_now();
     CHECK(wait_handle(c, e, 20) == X_STATUS_TIMEOUT);
     CHECK(elapsed_ms(start) >= 15);
     uint32_t h = create_thread(c, F_SET_EVENT_LATER, e);
-    start = std::chrono::steady_clock::now();
+    start = clock_now();
     CHECK(wait_handle(c, e) == X_STATUS_SUCCESS);
     CHECK(elapsed_ms(start) >= 20);
     join_and_close(c, h);
@@ -445,7 +448,7 @@ void timers(ppc::Context &c) {
     uint32_t handle_ptr = local(c, 0x80);
     CHECK(ex(c, "NtCreateTimer", {handle_ptr, 0, 0}) == X_STATUS_SUCCESS);
     uint32_t t = K->load32(handle_ptr);
-    auto start = std::chrono::steady_clock::now();
+    auto start = clock_now();
     CHECK(ex(c, "NtSetTimerEx", {t, timeout_ms(c, 25, 1), 0, 1, 0, 0, 0, 0}) == X_STATUS_SUCCESS);
     CHECK(wait_handle(c, t, 0) == X_STATUS_TIMEOUT);
     CHECK(wait_handle(c, t) == X_STATUS_SUCCESS);
@@ -456,7 +459,7 @@ void timers(ppc::Context &c) {
     // synchronization, periodic: one wait per period
     CHECK(ex(c, "NtCreateTimer", {handle_ptr, 0, 1}) == X_STATUS_SUCCESS);
     t = K->load32(handle_ptr);
-    start = std::chrono::steady_clock::now();
+    start = clock_now();
     CHECK(ex(c, "NtSetTimerEx", {t, timeout_ms(c, 5, 1), 0, 1, 0, 0, 10, 0}) == X_STATUS_SUCCESS);
     for (int i = 0; i < 3; i++) CHECK(wait_handle(c, t, 1000) == X_STATUS_SUCCESS);
     CHECK(elapsed_ms(start) >= 20);
@@ -638,7 +641,7 @@ void created_dispatchers(ppc::Context &c) {
     uint32_t id = local(c, 0x3E0);
     CHECK(ex(c, "ExCreateThread", {id, 0, id + 4, 0, F_SET_BODY_LATER, manual, 0}) == X_STATUS_SUCCESS);
     uint32_t th = K->load32(id);
-    auto started = std::chrono::steady_clock::now();
+    auto started = clock_now();
     CHECK(ex(c, "KeWaitForSingleObject", {manual, 0, 0, 0, 0}) == X_STATUS_SUCCESS);
     CHECK(elapsed_ms(started) >= 20);
     CHECK(K->load32(manual + 4) == 1); // a notification event stays signaled
@@ -973,6 +976,12 @@ int main() {
     {
         Kernel k(*memory);
         K = &k;
+#ifdef XF_DETERMINISTIC_TEST
+        // the same scenarios with every guest thread a fiber on one host
+        // thread, on the virtual clock (deterministic.cpp)
+        CHECK(k.make_deterministic({}));
+        CHECK(k.deterministic());
+#endif
         k.set_generated(generated, std::size(generated));
         scratch = memory->system_alloc(0x1000);
         ksp_thunk = memory->system_alloc(0x10);
@@ -996,9 +1005,15 @@ int main() {
         // KeTimeStampBundle: the clock, running since the first thread,
         // moves it every millisecond
         uint32_t bundle = k.variable("KeTimeStampBundle");
+#ifndef XF_DETERMINISTIC_TEST
         uint32_t tick = k.load32(bundle + 0x10);
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
         CHECK(k.load32(bundle + 0x10) >= tick + 20);
+#else
+        // the virtual clock stands while no thread runs: the bundle has its
+        // last millisecond
+        CHECK(k.load32(bundle + 0x10) == k.uptime_ms());
+#endif
         CHECK(k.load64(bundle + 8) <= k.system_time() && k.system_time() - k.load64(bundle + 8) < 10'000'000);
         CHECK(!k.stopped);
         if (k.stopped) std::printf("stopped: %s\n", k.stop_reason.c_str());

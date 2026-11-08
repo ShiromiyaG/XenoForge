@@ -201,6 +201,9 @@ constexpr uint32_t XN_SYS_INPUTDEVICESCHANGED = 0x00000012;
 // line; for the others, a line when the answer differs from the user's last.
 struct InputRecorder {
     std::FILE *file = nullptr;
+    ~InputRecorder() {
+        if (file) std::fclose(file);
+    }
     struct Last {
         bool seen = false;
         uint32_t result = 0, packet = 0;

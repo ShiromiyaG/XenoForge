@@ -5,13 +5,14 @@
 //
 // - One guest thread runs at a time; it hands over only where the kernel sees
 //   it: a wait that blocks, a yield (NtYieldExecution, a spin lock's spins),
-//   and, at a kernel call or a time base read, the end of its slice or a
+//   and, at a kernel call, a time base read or an indirect call (dispatch),
+//   the end of its slice or a
 //   deadline come due. The thread that ran goes to the tail of the ready
 //   queue; woken threads join the tail in the order they were woken; waits
 //   whose deadline passed are ended in the order the threads were made. All
 //   of it follows from the guest's own steps, so the same disc and the same
 //   input give the same order.
-// - The clock is virtual: a kernel call and a time base read move it by fixed
+// - The clock is virtual: those three move it by fixed
 //   costs (Deterministic), and when every thread waits it jumps to the
 //   earliest deadline (a wait's timeout, a timer). KeTimeStampBundle and the
 //   timers move on it every millisecond, as the host scheduler's clock thread
@@ -20,10 +21,12 @@
 //   a spin lock held) is not handed over at a kernel call, as NT does not
 //   preempt there; the video family also holds a host mutex per CPU around an
 //   interrupt's callback.
-// - Guest code that waits for another thread without a kernel call or a time
-//   base read (a lwarx loop on a flag) never hands over: the run stops there.
-//   The recompiler's yield points (plan, "Threads") are what would take it.
-//   report() names the thread that has run longest without handing over.
+// - Guest code that waits for another thread without any of those (a spin
+//   on a flag) never hands over by itself: a watchdog stops it after a while
+//   of the host's time and hands it over from there (watchdog(); the run is
+//   then exact only if it stopped in a pure spin). The recompiler's yield
+//   points (plan, "Threads") are what would take it exactly. report() names
+//   a thread that has run a second without handing over.
 
 #include "objects.h"
 #include "stacks.h"
@@ -36,6 +39,10 @@
 #include <deque>
 #include <memory>
 #include <thread>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace xf::kernel {
 namespace {
@@ -72,6 +79,11 @@ public:
             idle = idle_;
         }
         wake_cv_.notify_all();
+        watchdog_stop_ = true;
+        if (watchdog_.joinable()) watchdog_.join();
+#ifdef _WIN32
+        if (runner_handle_) CloseHandle(runner_handle_);
+#endif
         // a guest thread still running holds the runner: it is left be, as
         // the host scheduler leaves its threads
         if (runner_.joinable()) {
@@ -90,8 +102,12 @@ public:
         ready_.push_back(e.get());
         entries_.push_back(std::move(e));
         made_++;
-        if (!runner_.joinable()) runner_ = std::thread([this] { run(); });
-        else if (!on_runner) wake_cv_.notify_one();
+        if (!runner_.joinable()) {
+            runner_ = std::thread([this] { run(); });
+            if (d_.force_after_ms) watchdog_ = std::thread([this] { watchdog(); });
+        } else if (!on_runner) {
+            wake_cv_.notify_one();
+        }
         return true;
     }
 
@@ -165,35 +181,43 @@ public:
         now_.store(now, std::memory_order_relaxed);
         if (now < switch_at_) return;
         Thread *t = running_->thread;
-        if (t && o_.k.host(t->pcr)[kpcr::CURRENT_IRQL] >= 2) return; // at DISPATCH_LEVEL: on to its end
+        if (t && o_.k.host(t->pcr)[kpcr::CURRENT_IRQL] >= 2) { // at DISPATCH_LEVEL: on to its end
+            deferred_++;
+            return;
+        }
         slices_++;
         hand_over(*running_);
     }
 
     bool deterministic() const override { return true; }
 
-    std::string report() override {
-        std::lock_guard<std::mutex> l(o_.lock);
+    std::string report() override { // (the kernel's lock held)
         char line[640];
         double wall = seconds_since(started_);
         std::snprintf(line, sizeof(line),
                       "deterministic: clock %.3f s in %.3f s on the host (%s); %llu threads made, %llu runs: %llu "
                       "slices ended, %llu yields, %llu waits blocked (%llu ended by their deadline), %llu wakes from "
                       "host threads; %llu jumps of the idle clock (%.3f s); %llu times every thread waited with no "
-                      "deadline%s\n",
+                      "deadline; %llu hand-overs forced%s%s\n",
                       double(now_.load()) / 1e7, wall, d_.paced ? "paced" : "as fast as it goes",
                       (unsigned long long)made_, (unsigned long long)switches_, (unsigned long long)slices_,
                       (unsigned long long)yields_, (unsigned long long)blocks_, (unsigned long long)timeouts_,
                       (unsigned long long)foreign_wakes_, (unsigned long long)jumps_, double(idle_clock_) / 1e7,
-                      (unsigned long long)stuck_, halted_ ? "; halted" : "");
+                      (unsigned long long)stuck_, (unsigned long long)forced_.load(),
+                      forced_ ? " (the run is not exact)" : "", halted_ ? "; halted" : "");
         std::string out = line;
         // a thread that has not handed over for a second of the host's: guest
         // code waiting without a kernel call (the header's last point)
         uint32_t id = running_id_.load();
         double running = seconds_since(running_since_.load());
-        if (id && running >= 1) {
-            std::snprintf(line, sizeof(line), "deterministic: thread %u has run %.1f s without handing over\n", id,
-                          running);
+        Entry *e = running_;
+        if (id && running >= 1 && e) {
+            Thread *t = e->thread;
+            std::snprintf(line, sizeof(line),
+                          "deterministic: thread %u has run %.1f s without handing over (IRQL %u, %llu deferred "
+                          "hand-overs)\n",
+                          id, running, t ? unsigned(o_.k.host(t->pcr)[kpcr::CURRENT_IRQL]) : 0u,
+                          (unsigned long long)deferred_);
             out += line;
         }
         return out;
@@ -244,6 +268,72 @@ private:
         l.lock();
     }
 
+    // The forced hand-over: guest code that has not handed over for
+    // force_after_ms of the host's time (a spin on a flag, with no kernel call,
+    // time base read or indirect call) is stopped where it is, if that is in
+    // the generated code, and handed over from there; its registers are put
+    // back as it was when it is picked again. Where it stops depends on the
+    // host's speed, so a run with one is no longer exact (the report counts
+    // them). Windows only so far.
+    // TODO(posix): pthread_kill and a signal handler that swaps the ucontext.
+    void watchdog() {
+#ifdef _WIN32
+        uint64_t last = UINT64_MAX;
+        auto since = Clock::now();
+        bool forced_this_run = false;
+        auto [low, high] = o_.k.generated_code_span();
+        while (!watchdog_stop_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            uint64_t gen = generation_.load();
+            if (gen != last || !running_id_.load()) {
+                last = gen, since = Clock::now(), forced_this_run = false;
+                continue;
+            }
+            if (forced_this_run || !runner_handle_ || low == high ||
+                Clock::now() - since < std::chrono::milliseconds(d_.force_after_ms))
+                continue;
+            if (SuspendThread(runner_handle_) == DWORD(-1)) continue;
+            alignas(16) CONTEXT ctx = {};
+            ctx.ContextFlags = CONTEXT_ALL;
+            Entry *e = running_;
+            bool ok = generation_.load() == gen && e && e->thread && GetThreadContext(runner_handle_, &ctx) &&
+                      ctx.Rip >= low && ctx.Rip < high && o_.k.host(e->thread->pcr)[kpcr::CURRENT_IRQL] < 2;
+            if (ok) {
+                // a call to forced_entry on the same stack, below what the
+                // code had (a frame aligned as a call leaves it)
+                forced_context_ = ctx;
+                ctx.Rsp = ((ctx.Rsp - 1024) & ~uint64_t(15)) - 8;
+                ctx.Rip = reinterpret_cast<DWORD64>(&forced_entry);
+                ok = SetThreadContext(runner_handle_, &ctx);
+                if (ok) forced_++, forced_this_run = true;
+            }
+            ResumeThread(runner_handle_);
+        }
+#endif
+    }
+
+#ifdef _WIN32
+    // where a forced hand-over enters on the scheduler's thread: the thread
+    // sleeps as long on the clock as it spun on the host (time passes for a
+    // spinning thread: what it waits for may move on the clock, a timeout, the
+    // sound's pace), then the registers as the code had them
+    static void forced_entry() {
+        DeterministicScheduler *s = runner_scheduler;
+        alignas(16) CONTEXT ctx = s->forced_context_;
+        Entry &e = *s->running_;
+        {
+            std::lock_guard<std::mutex> l(s->o_.lock);
+            e.state = Entry::State::Blocked;
+            e.deadline = s->now_.load() + std::max<uint64_t>(s->d_.slice, s->d_.force_after_ms * MILLISECOND);
+        }
+        s->hand_over(e);
+        RtlRestoreContext(&ctx, nullptr);
+    }
+    static thread_local DeterministicScheduler *runner_scheduler;
+    CONTEXT forced_context_ = {};
+    std::atomic<HANDLE> runner_handle_{nullptr};
+#endif
+
     void run() {
         on_runner = true;
         bool converted;
@@ -252,6 +342,13 @@ private:
             std::fprintf(stderr, "deterministic: the scheduler's thread could not be made a fiber\n");
             return;
         }
+#ifdef _WIN32
+        runner_scheduler = this;
+        HANDLE self = nullptr;
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, 0);
+        runner_handle_ = self;
+#endif
         started_ = Clock::now().time_since_epoch().count();
         wall_start_ = Clock::now();
         std::unique_lock<std::mutex> l(o_.lock);
@@ -311,6 +408,7 @@ private:
             running_ = e;
             switch_at_ = std::min({now + d_.slice, next_clock, next_event()});
             switches_++;
+            generation_++;
             running_id_ = e->thread ? e->thread->id : 0;
             running_since_ = Clock::now().time_since_epoch().count();
             set_current_thread(e->thread);
@@ -360,6 +458,11 @@ private:
     std::atomic<uint32_t> running_id_{0};
     uint64_t made_ = 0, switches_ = 0, slices_ = 0, yields_ = 0, blocks_ = 0, timeouts_ = 0, foreign_wakes_ = 0;
     uint64_t jumps_ = 0, idle_clock_ = 0, stuck_ = 0;
+    std::atomic<uint64_t> deferred_{0}; // hand-overs put off at DISPATCH_LEVEL
+    // the forced hand-overs' (watchdog)
+    std::thread watchdog_;
+    std::atomic<bool> watchdog_stop_{false};
+    std::atomic<uint64_t> generation_{0}, forced_{0}; // runs started; hand-overs forced
 };
 
 // A guest thread's fiber: its body, then the runner, for good (the fiber is
@@ -372,6 +475,10 @@ void fiber_main(void *arg) {
     e->walks = nullptr;
     switch_fiber(e->owner->runner_fiber_);
 }
+
+#ifdef _WIN32
+thread_local DeterministicScheduler *DeterministicScheduler::runner_scheduler = nullptr;
+#endif
 
 } // namespace
 
@@ -391,6 +498,7 @@ bool Kernel::make_deterministic(const Deterministic &options) {
     o.system_time_base = options.system_time;
     deterministic_call_cost_ = options.call_cost;
     deterministic_time_base_cost_ = options.time_base_cost;
+    deterministic_dispatch_cost_ = options.dispatch_cost;
     return true;
 }
 
