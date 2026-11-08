@@ -1999,8 +1999,56 @@ The generic renderer draws everything. Ports add, where it pays:
   to widescreen, a separate UI and resolution independence.
 - **The engine** (the native-renderer port model): a port's renderer receives the device
   and the frame's command buffer and replaces passes (UE3's scene, Scaleform
-  UI); the generic renderer keeps everything else. F5 switches between the
-  two for comparison.
+  UI); the generic renderer keeps everything else. F6 switches between the
+  two for comparison. In since 2026-11-08: below.
+
+## A port's own renderer (2026-11-08)
+
+`xenoforge/native_render.h` (docs/sdk.md, "Native rendering"; plan E4). The
+renderer stays general: it calls what a port registered and skips what the
+port's filter selects; nothing in it knows a game.
+
+- **Where.** `Impl::swap`, before the front buffer is taken:
+  `native_frame` takes the port's settings (copied again only when their
+  version moved: one relaxed load a swap otherwise), and when an output
+  renderer is set and the toggle is on, makes the output image
+  (`R8G8B8A8_UNORM`, remade on a resize, the old one destroyed when its
+  submission is done), records a full barrier and calls the port with a
+  `NativeFrame` (the command buffer through `outside()`, the texture cache's
+  `texture()` and `texture_view()`, the arena). After it, `bound_pipeline_`
+  is reset so the draws bind theirs again; the swap's `flush()` follows. A
+  frame the port drew is handed to `on_swap` as the front buffer, with an
+  identity display table (the presenter's conversion leaves it as it is), and
+  the guest's front texture is not loaded unless a read-back wants it.
+- **What is skipped.** `native_suppress_` is set for the frame after one the
+  port drew. In `draw`, after the check for draws that write nothing (so the
+  memexport test is already made): a draw exporting memory is kept and
+  counted; any other goes through the filter (`native_keep`) and, skipped,
+  marks its occlusion report `suppressed`, answered with at least the port's
+  fake count (1000, Xenia's `query_occlusion_fake_sample_count`, as the
+  rexglue fork answers while it suppresses). In `resolve`, first thing. The
+  command processor is untouched: packets, registers, fences, events,
+  interrupts and swaps run as ever, since the skipping is in the Sink.
+- **Held frames.** The decision is a frame late (the callback's answer comes
+  at the swap, after the frame's draws). A frame whose passes were skipped
+  and that the port did not draw (it yielded, or the toggle went off) has no
+  picture: `on_swap` is not called, the window keeps the port's last, and the
+  next frame is emulated in full. Read-backs (`frame_wanted`, boot's
+  `--shots`) are always the guest's front buffer.
+- **Without a port.** Nothing registered: one relaxed load and two branches a
+  swap, one branch a draw and a resolve; replay_test is unchanged.
+- **Measured** (game B's first 30 s, its intros and logos: about 5 draws and
+  3 resolves a swap, guest-paced at 60 then 32 swaps a second;
+  `examples/native_port`, `XF_GPU_TIME=1`). Boot with `--render`: emulated,
+  1102 swaps, 1.87 s of GPU time and 0.8 s in the renderer's calls; the
+  port's frames with everything skipped, 1116 swaps, 0.02 s of GPU time (the
+  port's frame 17 µs a swap) and 0.2 s, 5389 draws and 3347 resolves skipped;
+  the port drawing over the emulated work (`suppress=false`), 1105 swaps,
+  2.39 s and 1.0 s. The player: 37.3 swaps/s either way (the guest sets the
+  pace), 1.98 s against 0.04 s of GPU time. 0 interpreted entries; the window
+  shows the port's frames (window screenshots), with `yield_every=200` the
+  two alternate and each switch to emulated holds one frame (3 in 30 s).
+  Validation (`XF_VK_VALIDATION=1`): no message.
 
 ## Reference files in xenia-canary
 

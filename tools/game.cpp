@@ -8,6 +8,7 @@
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
 #include "xenoforge/lockstep.h"
+#include "xenoforge/native_render.h"
 #include "xenoforge/shader_storage.h"
 
 #include <algorithm>
@@ -73,6 +74,15 @@ void print_renderer_report(const render::Report &r) {
     std::printf("renderer: %llu draws (%llu drawn), %llu resolves, %llu swaps (%llu front buffers written)\n",
                 (unsigned long long)r.draws, (unsigned long long)r.drawn, (unsigned long long)r.resolves,
                 (unsigned long long)r.swaps, (unsigned long long)r.frames);
+    // a port's own frames (native_render.h), when it drew or yielded any
+    if (const native::Counters n = native::counters(); n.frames_native || n.frames_yielded)
+        std::printf("renderer: the port drew %llu frames, yielded %llu (%llu held); skipped %llu draws and %llu "
+                    "resolves, kept %llu and %llu by its filter, %llu exporting memory; %llu occlusion reports faked\n",
+                    (unsigned long long)n.frames_native, (unsigned long long)n.frames_yielded,
+                    (unsigned long long)n.frames_held, (unsigned long long)n.draws_skipped,
+                    (unsigned long long)n.resolves_skipped, (unsigned long long)n.draws_kept,
+                    (unsigned long long)n.resolves_kept, (unsigned long long)n.memexport_kept,
+                    (unsigned long long)n.occlusion_faked);
     std::printf("renderer: %.1f s spent: %.1f s in submissions (%.1f s waiting for the GPU), %.1f s in resolves, "
                 "%.1f s checking textures, %.1f s decoding them, %.1f s on vertex data (%.1f MB uploaded), %.1f s "
                 "copying %.1f MB that resolves wrote into memory\n",

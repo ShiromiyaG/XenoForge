@@ -107,6 +107,84 @@ defaults the first time, shown in the overlay (F1) under the port's name,
 saved when the overlay closes, and overridden for a run by `--option`. In
 boot only `--option` sets them.
 
+## Native rendering
+
+A port can draw a game's scene itself on XenoForge's Vulkan device, from what
+its hooks capture of the game's engine, while the emulated GPU skips the work
+the port replaces: the model of the rexglue fork's native guest renderer, on
+Vulkan only. The header is `xenoforge/native_render.h`; the renderer's side is
+in docs/renderer.md, "A port's own renderer".
+
+```cpp
+#include <xenoforge/native_render.h>
+
+static bool draw(const xf::native::OutputContext &ctx) {
+    if (!scene_captured) return false;               // this frame is the emulated one
+    xf::native::TextureImage albedo;
+    std::string why;
+    ctx.frame->texture(captured_fetch, albedo, why); // a guest texture, detiled by the texture cache
+    VkBuffer vb; VkDeviceSize at;
+    ctx.frame->upload(vertices, bytes, 16, vb, at);  // host-visible for this frame
+    VkCommandBuffer cmd = ctx.frame->commands();     // after the helpers
+    // vkCmdBeginRendering into ctx.output_view (VK_IMAGE_LAYOUT_GENERAL), draw, end
+    return true;
+}
+
+port.on_init = [](xf::kernel::Kernel &) {
+    xf::native::set_output_renderer(draw);
+    xf::native::set_pass_filter([](const xf::native::PassInfo &p) { return p.surface_pitch >= 1280; });
+};
+port.options.push_back(xf::PortOption::boolean("native_render", "Native renderer", xf::native::enabled_flag()));
+```
+
+- **The call.** At each swap, on the renderer's thread, with: the device
+  (`vk::Device`, the raw handles, the queue family), `frame`, an output image
+  (`R8G8B8A8_UNORM`, color attachment, storage, sampled, transfer; in
+  `VK_IMAGE_LAYOUT_GENERAL` at the call and left in it; the guest front
+  buffer's size unless `set_output_size` says otherwise), the guest's front
+  buffer (fetch constant 0: address, size, format, tiling, the six words), the
+  register file and guest memory's physical view. It returns whether it drew
+  the frame: true shows the output image as it is (no display gamma); false
+  shows the emulated picture.
+- **Recording.** `frame->commands()` is the renderer's command buffer, outside
+  any render pass, after a full barrier. Ask for it again after `texture()` or
+  `upload()`: they may submit the renderer's work and begin a new one (the
+  queue keeps the order). The port never submits; it leaves no render pass
+  open; its bindings end with the callback.
+- **Skipped.** After a frame the port drew, the next frame's draws and
+  resolves are skipped where the pass filter says so (all, without one). The
+  filter gets a `PassInfo` (resolve or draw, the surface pitch, the color
+  target's base and format, the primitive and count, the shaders' hashes, a
+  resolve's destination, the registers). **Kept always**: the command
+  processor's packets and register writes, fences, `EVENT_WRITE*`,
+  interrupts, the swaps and their timing, and draws exporting memory
+  (memexport). Occlusion query reports a skipped draw counted for are answered
+  with `set_occlusion_samples` (1000 by default, Xenia's fake count).
+- **Yielding.** A port may yield any frame. The frame after one it drew had
+  its passes skipped, so it has no emulated picture: it is *held* (the window
+  keeps the port's last picture), and the frame after is emulated in full.
+- **The toggle.** `enabled_flag()` (on by default) is read at each swap; a
+  port option can bind it, the player's F6 flips it, and the overlay (F1)
+  shows the state and the counters (`counters()`: frames drawn, yielded, held;
+  draws and resolves skipped and kept; memexport draws kept; faked reports).
+  Boot and the player print the same counts in their report.
+- **The guest's data.** `vertex_fetch`, `texture_fetch`, `float_constant`
+  (0-255 vertex, 256-511 pixel), `bool_constant`, `loop_constant` read the
+  registers; `read_words`, `read_floats`, `read_indices` read guest memory
+  swapped as the GPU swaps it. On the CPU side, a hook reads the engine's
+  structures with `xenoforge/port.h` (`be<T>`, `load<T>`).
+- **Shaders.** SPIR-V the port compiles itself: `examples/native_port`'s
+  CMakeLists runs glslc (the Vulkan SDK's) and includes the words with
+  `-mfmt=num`.
+
+`examples/native_port` is the test port: the guest's last front buffer
+(through `Frame::texture`), tinted, with a spinning triangle (through
+`Frame::upload`) over it; `--capture <hex address>` hooks a guest function
+with `xf::port::before` and yields every frame it was not called in. Options
+`native_render`, `suppress` (skip the emulated work, else draw over it) and
+`background`. Inside XenoForge's build, `-DXF_NATIVE_PORT_GAME=<one of
+XF_GAMES>` builds it as `build/examples/native_port/{player,boot}_native`.
+
 ## Building and running a port
 
 ```
@@ -125,7 +203,8 @@ and the CMake above (`-DMINIMAL_ISO=<iso>`). The project file's schema is in
 - `ctest -R sdk` (tests/sdk_test.cmake): installs the `sdk` component to a
   temporary prefix, configures and builds `examples/minimal_port` against it on
   an empty generated-code table (`tests/sdk/modules.cpp`), and runs what it
-  built. It checks the package (headers, libraries, imported targets, the
-  function, the runtime files), not a game's recompile.
+  built; then `examples/native_port` the same way when glslc is found. It
+  checks the package (headers, libraries, imported targets, the function, the
+  runtime files, a port's own shaders), not a game's recompile.
 - By hand, a real port end to end: the example with `-DMINIMAL_ISO=<a disc>`,
   then `boot_minimal <disc> --seconds 20`.

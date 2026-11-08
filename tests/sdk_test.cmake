@@ -1,7 +1,8 @@
 # The SDK package, end to end without a game (docs/sdk.md): installs the SDK
 # component to a temporary prefix, configures examples/minimal_port against it
 # (find_package(XenoForge), xenoforge_add_port on tests/sdk's empty generated
-# code), builds it and runs what it built. The recompile of a real disc is
+# code), builds it and runs what it built; then examples/native_port the same
+# way (its shaders through glslc), when the Vulkan SDK's glslc is there. The recompile of a real disc is
 # the manual check (docs/sdk.md); this one is the package: headers, libraries,
 # the imported targets, the function, the runtime files beside the executables.
 #
@@ -27,7 +28,7 @@ file(REMOVE_RECURSE ${WORK})
 file(MAKE_DIRECTORY ${WORK})
 set(prefix ${WORK}/prefix)
 step("install" ${CMAKE_COMMAND} --install ${BUILD} --component sdk --prefix ${prefix})
-foreach(f include/xenoforge/run.h include/xenoforge/game_library.h include/xenoforge/ppc_runtime.h
+foreach(f include/xenoforge/run.h include/xenoforge/native_render.h include/xenoforge/game_library.h include/xenoforge/ppc_runtime.h
           lib/cmake/XenoForge/XenoForgeConfig.cmake lib/cmake/XenoForge/XenoForgeConfigVersion.cmake
           lib/cmake/XenoForge/xenoforge_port.cmake)
     if(NOT EXISTS ${prefix}/${f})
@@ -57,5 +58,22 @@ execute_process(COMMAND ${boot_exe} nothing.iso --option nothing=1 RESULT_VARIAB
                 ERROR_VARIABLE out)
 if(NOT rc EQUAL 2 OR NOT out MATCHES "no option nothing")
     message(FATAL_ERROR "sdk_test: boot_minimal with a bad option: ${rc}\n${out}")
+endif()
+# the native rendering example: the header, the renderer's library and a port's own SPIR-V
+find_program(GLSLC glslc HINTS $ENV{VULKAN_SDK}/Bin $ENV{VULKAN_SDK}/bin)
+if(GLSLC)
+    step("configure the native example" ${CMAKE_COMMAND} -S ${SOURCE}/examples/native_port -B ${WORK}/native -G
+         ${GENERATOR} -DCMAKE_MAKE_PROGRAM=${MAKE} -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX}
+         -DCMAKE_PREFIX_PATH=${prefix} -DNATIVE_GENERATED_DIR=${SOURCE}/tests/sdk -DGLSLC=${GLSLC})
+    step("build the native example" ${CMAKE_COMMAND} --build ${WORK}/native)
+    file(GLOB booted ${WORK}/native/boot_native*)
+    list(FILTER booted EXCLUDE REGEX "\\.(pdb|ilk|exp|lib)$")
+    list(GET booted 0 boot_exe)
+    execute_process(COMMAND ${boot_exe} RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE out)
+    if(NOT rc EQUAL 2 OR NOT out MATCHES "usage: boot")
+        message(FATAL_ERROR "sdk_test: boot_native without arguments: ${rc}\n${out}")
+    endif()
+else()
+    message(STATUS "sdk_test: no glslc, the native example left out")
 endif()
 message(STATUS "sdk_test: ok")

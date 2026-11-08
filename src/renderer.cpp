@@ -44,6 +44,8 @@
 
 #include "xenoforge/renderer.h"
 
+#include "native_internal.h"
+
 #include "xenoforge/guest_memory.h"
 #include "xenoforge/memory.h"
 #include "xenoforge/resolve.h"
@@ -1296,6 +1298,23 @@ private:
     // the last swap, and when it came
     double pipeline_seconds_at_swap_ = 0;
     std::chrono::steady_clock::time_point last_swap_time_{};
+
+    // ---- the port's frames (native_render.h) ----
+    // The port's settings as the last swap took them (copied again when
+    // their version moves), whether this frame's passes are skipped (the
+    // port drew the frame before), and the output image it draws into.
+    uint64_t native_version_ = 0;
+    native::detail::Settings native_settings_;
+    bool native_suppress_ = false;
+    vk::Image native_output_;
+    VkImageView native_output_view_ = VK_NULL_HANDLE;
+    class NativeFrame;
+    // at a swap: the port's frame drawn (true), or not; held: this frame's
+    // passes were skipped and the port did not draw it, so nothing is shown
+    bool native_frame(uint64_t number, bool &held);
+    bool native_output(uint32_t width, uint32_t height);
+    // a draw or a resolve while suppressing: false when it is skipped
+    bool native_keep(native::PassInfo &pass);
     VkImageView make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
                           VkComponentMapping components = {}, uint32_t levels = 1, uint32_t layers = 1,
                           bool keep = true);
@@ -1380,6 +1399,7 @@ private:
         uint64_t samples = 0;
         uint32_t open = 0; // queries not read yet
         bool ended = false, uncounted = false;
+        bool suppressed = false; // a draw the port's frame skipped counted for it (native_render.h)
     };
     static constexpr uint32_t OCCLUSION_QUERIES = 4096; // a slot's
     uint64_t zpd_current_ = 0;                          // the report draws count for (0: none)
@@ -1388,7 +1408,12 @@ private:
     std::vector<std::pair<uint64_t, uint64_t>> zpd_resolved_; // for zpd_poll
     void zpd_answer(uint64_t handle, ZpdCount &count) {
         report_.zpd_reports++;
-        zpd_resolved_.emplace_back(handle, count.uncounted ? std::max<uint64_t>(count.samples, 1) : count.samples);
+        uint64_t samples = count.uncounted ? std::max<uint64_t>(count.samples, 1) : count.samples;
+        if (count.suppressed) {
+            samples = std::max<uint64_t>(samples, native_settings_.occlusion_samples);
+            native::detail::bump(native::detail::atomic_counters().occlusion_faked);
+        }
+        zpd_resolved_.emplace_back(handle, samples);
         zpd_counts_.erase(handle);
     }
     void end_query() {
@@ -1688,6 +1713,8 @@ Impl::~Impl() {
         if (t->signed_image.image) d_.destroy(t->signed_image);
     }
     for (auto &im : dummy_) d_.destroy(im);
+    if (native_output_view_) vkDestroyImageView(dev_, native_output_view_, nullptr);
+    if (native_output_.image) d_.destroy(native_output_);
     if (dummy_sampler_) vkDestroySampler(dev_, dummy_sampler_, nullptr);
     for (VkShaderModule m : {rectangle_gs_, point_gs_, tessellation_vs_})
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
@@ -5122,6 +5149,22 @@ void Impl::draw(const gpu::Draw &d) {
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
             return;
         }
+        // the port draws this frame (native_render.h): the draws its filter
+        // selects skipped, never one exporting memory (the CPU may read it)
+        if (native_suppress_) {
+            if (exports) {
+                native::detail::bump(native::detail::atomic_counters().memexport_kept);
+            } else {
+                native::PassInfo pass;
+                pass.color = color, pass.has_pixel_shader = p != nullptr;
+                pass.primitive = primitive, pass.count = count;
+                pass.vertex_shader = have_vertex_ ? vertex_hash_ : 0, pass.pixel_shader = have_pixel_ ? pixel_hash_ : 0;
+                if (!native_keep(pass)) {
+                    if (zpd_current_) zpd_counts_[zpd_current_].suppressed = true;
+                    return;
+                }
+            }
+        }
     }
     // What the draw asks for, counted whether it is drawn or not
     // (Report::used): user clip planes (PA_CL_CLIP_CNTL's ucp_ena_0-5 while
@@ -6308,6 +6351,12 @@ void Impl::draw(const gpu::Draw &d) {
 
 void Impl::resolve() {
     report_.resolves++;
+    if (native_suppress_) {
+        native::PassInfo pass;
+        pass.resolve = true;
+        pass.copy_dest = regs_[reg::RB_COPY_DEST_BASE];
+        if (!native_keep(pass)) return;
+    }
     poll();
     resolve::Info info;
     std::string why;
@@ -6673,6 +6722,167 @@ void Impl::next_readback_frame() {
     }
 }
 
+// ---- the port's frames (native_render.h; docs/renderer.md, "A port's own
+// renderer") ----
+
+// What the port's output renderer records through, while it runs: the
+// renderer's command buffer, its texture cache and its arena.
+class Impl::NativeFrame final : public native::Frame {
+public:
+    explicit NativeFrame(Impl &r) : r_(r) {}
+    VkCommandBuffer commands() override {
+        // the port's bindings are its own: the draws bind theirs again
+        r_.bound_pipeline_ = VK_NULL_HANDLE;
+        return r_.outside();
+    }
+    bool texture(const uint32_t fetch[6], native::TextureImage &out, std::string &why) override {
+        const texture::Info info = texture::parse_fetch_constant(fetch);
+        if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture || info.dimension != 1 || !info.base_address)
+            return why = "not a 2D texture's fetch constant", false;
+        Texture *t = r_.texture(fetch, why);
+        if (!t || !r_.fatal_.empty()) return false;
+        const uint32_t index = r_.texture_view(*t, info.swizzle, false, why);
+        if (!index && !why.empty()) return false;
+        const uint32_t key = texture::compose_swizzle(info.swizzle, t->host_swizzle);
+        for (const TextureView &v : t->views)
+            if (v.key == key) {
+                out.image = t->image.image, out.view = v.view, out.format = t->image.format;
+                out.width = t->image.extent.width, out.height = t->image.extent.height;
+                out.levels = t->image.levels, out.layers = t->image.layers;
+                return true;
+            }
+        return why = "no view of the texture", false;
+    }
+    bool upload(const void *data, size_t bytes, size_t alignment, VkBuffer &buffer, VkDeviceSize &offset) override {
+        const VkDeviceSize align = std::max<VkDeviceSize>({VkDeviceSize(alignment), r_.ubo_align_, 16});
+        if (bytes == 0 || bytes + align > ARENA_SLOT || !r_.fatal_.empty()) return false;
+        const VkDeviceSize at = r_.arena(bytes, align);
+        if (at == NONE) return false;
+        std::memcpy(r_.arena_data(at), data, bytes);
+        buffer = r_.arena_.buffer, offset = at;
+        return true;
+    }
+
+private:
+    Impl &r_;
+};
+
+// The output image at this size (made again when it changes; the old one
+// goes once the GPU is done with it), in the general layout.
+bool Impl::native_output(uint32_t width, uint32_t height) {
+    if (native_output_.image && native_output_.extent.width == width && native_output_.extent.height == height)
+        return true;
+    if (native_output_.image) {
+        vk::Image old = native_output_;
+        VkImageView old_view = native_output_view_;
+        cmd();
+        slots_[current_].after.push_back([this, old, old_view]() mutable {
+            vkDestroyImageView(dev_, old_view, nullptr);
+            d_.destroy(old);
+        });
+        native_output_ = {}, native_output_view_ = VK_NULL_HANDLE;
+    }
+    native_output_ = d_.create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {width, height, 1}, 1, 1,
+                                     VK_SAMPLE_COUNT_1_BIT,
+                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    if (!native_output_.image) return false;
+    native_output_view_ = make_view(native_output_.image, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_ASPECT_COLOR_BIT, {}, 1, 1, false);
+    if (!native_output_view_) {
+        d_.destroy(native_output_);
+        native_output_ = {};
+        return false;
+    }
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = native_output_.image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.imageMemoryBarrierCount = 1, dep.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(outside(), &dep);
+    return true;
+}
+
+// At a swap, before its front buffer is taken: the port's output renderer
+// called when there is one and the toggle is on. What it returns decides the
+// next frame's passes: skipped after a frame the port drew. A frame whose
+// passes were skipped and that the port did not draw has no picture of its
+// own; held, and the window keeps the port's last.
+bool Impl::native_frame(uint64_t number, bool &held) {
+    const uint64_t version = native::detail::version();
+    if (version != native_version_) native::detail::settings(native_settings_), native_version_ = version;
+    const bool on = native_settings_.renderer && native::enabled();
+    const bool was_suppressed = native_suppress_;
+    if (!on && !was_suppressed) return false;
+    native::detail::AtomicCounters &counts = native::detail::atomic_counters();
+    bool drew = false;
+    if (on) {
+        native::OutputContext ctx;
+        ctx.swap = number;
+        ctx.device = &d_, ctx.instance = d_.instance(), ctx.physical = d_.physical(), ctx.vk_device = dev_;
+        ctx.queue_family = d_.queue_family();
+        ctx.registers = regs_, ctx.physical_memory = memory_.data();
+        ctx.suppressed = was_suppressed;
+        const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS];
+        const texture::Info info = texture::parse_fetch_constant(fetch);
+        if (FetchConstantType(fetch[0] & 3) == FetchConstantType::Texture && info.dimension == 1 && info.base_address) {
+            native::GuestFrontBuffer &g = ctx.guest;
+            g.address = info.base_address, g.width = info.width, g.height = info.height, g.pitch = info.pitch;
+            g.format = info.format, g.tiled = info.tiled, g.endian = info.endian;
+        }
+        ctx.guest.fetch = fetch;
+        uint32_t width = native_settings_.width, height = native_settings_.height;
+        if (!width || !height) {
+            width = ctx.guest.width ? ctx.guest.width : 1280;
+            height = ctx.guest.width ? ctx.guest.height : 720;
+        }
+        if (native_output(width, height) && fatal_.empty()) {
+            ctx.output = native_output_.image, ctx.output_view = native_output_view_;
+            ctx.width = width, ctx.height = height;
+            NativeFrame frame(*this);
+            ctx.frame = &frame;
+            gpu_mark("the port's frame (native rendering)");
+            drew = native_settings_.renderer(ctx);
+            // whatever the port bound is not the draws'
+            bound_pipeline_ = VK_NULL_HANDLE;
+        } else {
+            approximate("the port's output image could not be made");
+        }
+    }
+    if (drew) {
+        native::detail::bump(counts.frames_native);
+    } else {
+        if (on) native::detail::bump(counts.frames_yielded);
+        held = was_suppressed;
+        if (held) native::detail::bump(counts.frames_held);
+    }
+    native_suppress_ = drew;
+    native::detail::set_active(drew);
+    return drew;
+}
+
+// A draw or resolve while the port's frame is shown: the filter's answer
+// (none: skip everything), counted.
+bool Impl::native_keep(native::PassInfo &pass) {
+    native::detail::AtomicCounters &counts = native::detail::atomic_counters();
+    bool skip = true;
+    if (native_settings_.filter) {
+        pass.surface_pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
+        pass.color_base = regs_[reg::RB_COLOR_INFO] & 0xFFF;
+        pass.color_format = (regs_[reg::RB_COLOR_INFO] >> 16) & 0xF;
+        pass.registers = regs_, pass.swap = report_.swaps;
+        skip = native_settings_.filter(pass);
+    }
+    native::detail::bump(skip ? (pass.resolve ? counts.resolves_skipped : counts.draws_skipped)
+                              : (pass.resolve ? counts.resolves_kept : counts.draws_kept));
+    return !skip;
+}
+
 // ---- the swap: texture fetch constant 0, as Xenia's RequestSwapTexture ----
 
 // Swaps are numbered from 0; the front buffer is read back for the ones the
@@ -6711,11 +6921,25 @@ void Impl::swap() {
         use(what);
     }
     const bool read = options_.frame_wanted && options_.frame_wanted(number);
+    // the port's frame (native_render.h), shown in the emulated one's place;
+    // held: neither is shown (the port's last stays in the window)
+    bool held = false;
+    const bool native = native_frame(number, held);
     texture::Info info;
-    Texture *t = read || options_.on_swap ? front_texture(info) : nullptr;
+    Texture *t = read || (options_.on_swap && !native && !held) ? front_texture(info) : nullptr;
     if (read && t) read_front_buffer(number, *t, info);
     FrontBuffer front;
-    if (t && options_.on_swap) {
+    if (native && options_.on_swap && fatal_.empty()) {
+        // shown as it is: an identity table for the display's gamma
+        front.swap = number;
+        front.image = native_output_.image, front.format = native_output_.format;
+        front.width = native_output_.extent.width, front.height = native_output_.extent.height;
+        front.swizzle = texture::SWIZZLE_RGBA, front.components = 4, front.bits = 8, front.luta_control = 0;
+        for (uint32_t i = 0; i < 256; i++) {
+            const uint32_t ten = i << 2 | i >> 6;
+            front.gamma[i] = ten << 20 | ten << 10 | ten;
+        }
+    } else if (t && options_.on_swap && !held) {
         front.swap = number;
         front.image = t->image.image, front.format = t->image.format;
         front.width = t->image.extent.width, front.height = t->image.extent.height;

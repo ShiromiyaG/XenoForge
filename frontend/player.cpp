@@ -5,7 +5,9 @@
 // SDL3's gamepads and the keyboard (sdl_input.h, docs/input.md); the sound
 // goes to the sound card (sdl_audio.h). F1 opens the overlay (Dear ImGui):
 // the rates, the controllers, the volume, a screenshot; F11 switches
-// fullscreen, F12 saves a screenshot. The settings are config.toml
+// fullscreen, F12 saves a screenshot. With a port drawing its own frames
+// (xenoforge/native_render.h), F6 switches between them and the emulated
+// ones and the overlay shows what it skipped. The settings are config.toml
 // (settings.h).
 //
 // One clock, the scheduler's: the guest runs on its own threads and never
@@ -39,6 +41,7 @@
 #include "settings.h"
 
 #include "../tools/game.h"
+#include "xenoforge/native_render.h"
 #include "xenoforge/run.h"
 
 #include <SDL3/SDL.h>
@@ -384,6 +387,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                     changed = true;
                 }
                 if (e.key.scancode == SDL_SCANCODE_F12) key_screenshot();
+                // the port's frames or the emulated ones, for this run (the
+                // port's option, when it binds one, keeps the setting)
+                if (e.key.scancode == SDL_SCANCODE_F6 && native::has_output_renderer()) native::toggle();
             }
             ImGui_ImplSDL3_ProcessEvent(&e);
         }
@@ -542,6 +548,21 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                     port_moved |= one;
                 }
                 if (port_moved) changed = true;
+            }
+            if (native::has_output_renderer()) {
+                const native::Counters n = native::counters();
+                ImGui::SeparatorText("Native renderer (F6)");
+                ImGui::Text("%s; %llu frames the port's, %llu yielded (%llu held)",
+                            !native::enabled() ? "off: the emulated frames"
+                            : native::active() ? "on: the port's frames"
+                                               : "on: the port yields",
+                            (unsigned long long)n.frames_native, (unsigned long long)n.frames_yielded,
+                            (unsigned long long)n.frames_held);
+                ImGui::Text("skipped %llu draws, %llu resolves; kept %llu, %llu; %llu exporting memory; %llu "
+                            "occlusion reports faked",
+                            (unsigned long long)n.draws_skipped, (unsigned long long)n.resolves_skipped,
+                            (unsigned long long)n.draws_kept, (unsigned long long)n.resolves_kept,
+                            (unsigned long long)n.memexport_kept, (unsigned long long)n.occlusion_faked);
             }
             ImGui::SeparatorText("Screenshot");
             if (ImGui::Button("Save (F12)")) key_screenshot();

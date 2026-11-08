@@ -1503,7 +1503,9 @@ code. As built (`frontend/`):
   switches fullscreen; F12 saves the window's next picture (copied back
   from the GPU) as `<title>_<swap>_key<n>.png` in `player.screenshots`
   (default: a `screenshots` folder beside config.toml, never the
-  repository).
+  repository). With a port drawing its own frames (docs/sdk.md, "Native
+  rendering"), F6 switches between them and the emulated ones, and the
+  overlay shows which and what was skipped.
 - **config.toml** (`settings.cpp`; `--config`, else SDL's preference folder,
   `%APPDATA%\xenoforge\config.toml` on Windows), written with the defaults
   the first time and saved when the overlay closes:
