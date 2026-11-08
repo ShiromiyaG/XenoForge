@@ -1462,7 +1462,10 @@ skipped are those of the 4 pipelines the cold run had not met. The second
 run without the build step already had both caches warm: its libraries
 cost the workers little, but every new pipeline's draws still went
 without one until a worker had looked its libraries up (246 skipped, 972
-ms on average, the longest 62 s, not looked into); with the build step's
+ms on average, the longest 62 s: measured until a draw next asked for
+the pipeline, so a scene shown again a minute later counted the minute; since
+2026-11-08 the wait ends when the worker made the pipeline, or a linked
+stand-in's last library); with the build step's
 record they are made on the renderer's thread in 0.06 s for the whole run.
 The swaps' long gaps (33-36 above 100 ms) are the loading screens in all
 three runs. The race frame's replay is unchanged by the descriptions'
@@ -1983,15 +1986,49 @@ copy), and a third alias are loaded again as before. Needs
 indexing (the RTX 5060 has both); without them the resolves write memory
 alone.
 
-Game A's race trace (`xfreplay --gpu-time --repeat 10`, the fastest play):
-4.573 ms of GPU a play before, 4.163 after (-9%; the trace's front buffer
-read-back, 0.50 ms, is the trace's own); its texture loads after resolves
-from 13 (0.639 ms) to 5 (0.229 ms) a play, 143 of the 10 plays' resolves
-writing the texture they feed, the resolves' own cost 0.273 to 0.292 ms;
-the picture unchanged (0.008 off Xenia's Vulkan FSI picture), validation
+Game A's race trace (`xfreplay --gpu-time --repeat 10`, the fastest play
+of each run; three runs each way, interleaved, the machine otherwise idle
+but for another agent's boot): 4.620 ms of GPU a play without (4.540-4.644),
+4.198 with (4.198-4.200), -9% (the trace's front buffer read-back, 0.50 ms,
+is the trace's own); its texture loads after resolves from 13 (0.62-0.64 ms)
+to 5 (0.23 ms) a play, the resolves' own cost 0.273 to 0.292 ms; the
+picture unchanged (0.008 off Xenia's Vulkan FSI picture), validation
 clean. Xenia's "base and mips loaded apart" was measured first: every
 texture the race loads after a resolve is one level, so it would gain
 nothing there and is left.
+
+**Vertex data and the CPU's decodes.** Two costs of the renderer's thread:
+- *Every texture loaded on the GPU* (`XF_TEXTURE_LOADS=cpu` for the CPU's
+  decode of memory the GPU did not write, as before): guest memory's pages
+  go into the mirror as for a vertex stream, and `texture_load.comp` makes
+  the texture, as it already did over a resolve's memory and for the DXT
+  fallbacks (the same loads, byte for byte: `texture_gpu_test`). The race
+  trace's first play (282 new textures; three runs each way, interleaved):
+  the renderer's thread 0.866 s (0.771-0.868) with the CPU's decodes, 0.760 s
+  (0.740-0.785) without, its 0.061 s of decoding gone; the GPU's first play
+  32.3 ms (31.3-32.6) against 36.2 ms (35.2-36.7), the raw pages uploaded and
+  converted on the GPU rather than the decoded texels uploaded. The GPU being
+  idle most of a frame and the renderer's thread the one hitches come from,
+  the GPU's way is the default.
+- *A vertex stream's pages checked once* (`Impl::RequestMemo`): a draw
+  requests its streams' pages from the mirror, which looked at every page of
+  them (an atomic load each) at every draw, and built the list of their CPU
+  parts for a trace writer whether or not one was there. Now the ranges last
+  found current are remembered with the write count and a mirror epoch: while
+  nothing was written since, a draw with the same streams checks no page.
+
+Game A live (`boot_<A> --render --rates --seconds 480`, the press script to
+the race above, `XF_GPU_TIME=1`; one run each, so these are rough: other
+agents' builds and a boot shared the machine): without resolve targets, the
+GPU decodes and the memo, then with all three:
+
+| | before | after |
+| --- | --- | --- |
+| swaps, draws | 14,342, 8.19 M | 14,180, 8.10 M |
+| GPU time | 68.97 s (4.81 ms a swap) | 66.07 s (4.66 ms a swap) |
+| of it texture loads / CPU decodes' uploads / mirror uploads | 6.78 / 1.22 / 1.11 s | 2.85 / 0 / 1.88 s |
+| texture loads after resolves | 165,693 (424 a second in the race) | 53,080 (150-165 a second) |
+| the renderer's thread | 97.8 s: 5.2 vertex data, 2.1 decoding, 3.7 resolves | 74.7 s: 3.2, 0, 2.9 |
 
 **Xenia's approximations, closed or explained** (the "Approximated" list):
 - **Polygon modes** (`PA_SU_SC_MODE_CNTL` poly_mode, front and back types):

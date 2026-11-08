@@ -1544,7 +1544,18 @@ private:
     uint32_t last_page(const Range &r) const { return (r.second - 1) >> page_shift_; }
     bool gpu_held(const std::vector<Range> &ranges) const;
     std::vector<Range> cpu_parts(const std::vector<Range> &ranges) const;
-    VkDeviceSize request(const std::vector<Range> &ranges);
+    // A request's memo (the draws' vertex streams): the ranges last found
+    // current in the mirror, at which write count and mirror epoch. While
+    // nothing was written since, the same ranges are current still, and a
+    // draw with the streams of the draw before it checks no page.
+    struct RequestMemo {
+        std::vector<Range> ranges;
+        uint32_t count = 0;
+        uint64_t epoch = 0;
+    };
+    VkDeviceSize request(const std::vector<Range> &ranges, RequestMemo *memo = nullptr);
+    RequestMemo vertex_memo_;
+    uint64_t mirror_epoch_ = 1; // advanced where pages of the mirror stop being current but for a write
     void gpu_written(const std::vector<Range> &ranges);
     bool unwritten(Texture &t);
     static std::pair<uint32_t, uint32_t> watch_bounds(void *self, uint32_t first, uint32_t last);
@@ -1646,6 +1657,15 @@ private:
     VkDescriptorPool target_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet target_set_ = VK_NULL_HANDLE;
     bool resolve_targets_ = false;
+    // Every texture loaded on the GPU from the mirror (texture_load.comp,
+    // guest memory's pages put there first), none decoded on the CPU: the
+    // renderer's thread spends nothing decoding (docs/renderer.md, "Vertex
+    // data and the CPU's decodes"). XF_TEXTURE_LOADS=cpu decodes on the CPU
+    // what memory the GPU did not write, as before.
+    bool texture_loads_on_gpu_ = [] {
+        const char *v = std::getenv("XF_TEXTURE_LOADS");
+        return !(v && std::string(v) == "cpu");
+    }();
     uint32_t next_target_[2] = {};
     std::vector<uint32_t> free_targets_[2];
 
@@ -2692,9 +2712,11 @@ std::vector<Range> Impl::cpu_parts(const std::vector<Range> &ranges) const {
 // write after the watch numbers its page above it, so the copy is seen to be
 // old). Pages the GPU holds are current and keep its bytes. The bytes
 // uploaded.
-VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
+VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) {
     if (ranges.empty()) return 0;
-    traced(cpu_parts(ranges));
+    if (trace_) traced(cpu_parts(ranges));
+    const uint32_t count_before = mem_.write_count();
+    if (memo && memo->epoch == mirror_epoch_ && memo->count == count_before && memo->ranges == ranges) return 0;
     // runs of pages to give, [first, end); a page taken is marked current
     // (UINT32_MAX) until the count is known, so ranges sharing it give it once
     std::vector<std::pair<uint32_t, uint32_t>> runs;
@@ -2709,7 +2731,10 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
                 runs.push_back({p, p + 1});
         }
     }
-    if (runs.empty()) return 0;
+    if (runs.empty()) {
+        if (memo) *memo = {ranges, count_before, mirror_epoch_};
+        return 0;
+    }
     for (auto [first, end] : runs) mem_.watch(first << page_shift_, (end - first) << page_shift_);
     uint32_t count = mem_.write_count();
     VkDeviceSize total = 0;
@@ -2719,6 +2744,7 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
     uint8_t *data = staging(total, from, at);
     if (!data) {
         for (auto [first, end] : runs) std::fill(mirror_at_.begin() + first, mirror_at_.begin() + end, 0u);
+        mirror_epoch_++;
         return 0;
     }
     std::vector<VkBufferCopy> copies;
@@ -2737,6 +2763,10 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
     VkCommandBuffer c = outside();
     gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
     vkCmdCopyBuffer(c, from, mirror_.buffer, uint32_t(copies.size()), copies.data());
+    // (every page of the ranges current as of count, while nothing is
+    // written after it: those just given, and the rest found current above
+    // if nothing was written since that check either)
+    if (memo && count == count_before) *memo = {ranges, count, mirror_epoch_};
     return total;
 }
 
@@ -3847,7 +3877,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     // decompressed are decompressed on the GPU too, from guest memory put into
     // the mirror
     bool mirror = gpu_held(ranges);
-    bool gpu = mirror || (texture::is_compressed(info.host) && !texture::is_compressed(plan.format));
+    bool gpu = mirror || texture_loads_on_gpu_ || (texture::is_compressed(info.host) && !texture::is_compressed(plan.format));
     // the write count before anything is watched or read: a write after it
     // that the load may have missed numbers a page above it
     uint32_t checked = mem_.write_count();
@@ -6356,7 +6386,7 @@ void Impl::draw(const gpu::Draw &d) {
     }
     {
         Timer timer(report_.vertex_seconds);
-        report_.vertex_bytes += request(vertex_ranges);
+        report_.vertex_bytes += request(vertex_ranges, &vertex_memo_);
         // guest memory's bytes under the streams' pages, where the mirror has
         // nothing newer (Xenia's RequestRange of each stream)
         report_.vertex_bytes += request(exported);
