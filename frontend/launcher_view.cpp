@@ -7,6 +7,7 @@
 #include "xenoforge/game_build.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -68,6 +69,15 @@ bool LauncherView::load(Rml::Context *context, const std::filesystem::path &asse
     rml_template_ = read_text(assets_ / "launcher.rml");
     rcss_template_ = read_text(assets_ / "theme.rcss") + "\n" + read_text(assets_ / "launcher.rcss") + "\n" +
                     read_text(assets_ / "settings.rcss");
+    // the controller button pictures the hint bars name as mem:pad-<button> (ui/assets/glyphs, Xbox 360 set)
+    for (const char *button : {"A", "B", "X", "Y", "LB", "RB"}) {
+        const std::string file = std::string("360_") + button + ".png";
+        std::string name = std::string("pad-") + button;
+        for (char &c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
+        const std::string png = read_text(assets_ / "glyphs" / file);
+        if (!renderer_.add_image(name, std::vector<uint8_t>(png.begin(), png.end())))
+            std::fprintf(stderr, "launcher: no button picture %s\n", file.c_str());
+    }
     if (rml_template_.empty() || rcss_template_.size() < 2) return error = "no launcher.rml or its stylesheets in " + assets_.string(), false;
     return build_document(error);
 }

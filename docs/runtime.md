@@ -1806,6 +1806,9 @@ desktop-tool one after it), drawn for a window 1240dp wide:
 - **Icons**: Lucide (ISC; `ui/fonts/Lucide.ttf`, its license beside it), a
   font of outline icons drawn as text; `{i:name}` in a template and
   `icon_html()` give its glyphs (`launcher_html.cpp` lists the ones used).
+- **Controller buttons**: the hint bars' A, B, X, Y, LB and RB are the Xbox 360 pictures of Xelu's Free
+  Controller & Key Prompts (CC0; `ui/glyphs/`, license beside them). `LauncherView::load` registers them
+  with the renderer as `mem:pad-<button>`, and the stylesheet draws them as `decorator: image(...)`.
 
 Input: the mouse as a desktop program's; the keyboard: the arrows, Page Up
 and Down, Home and End move the selection, Enter plays, F2 opens the game's

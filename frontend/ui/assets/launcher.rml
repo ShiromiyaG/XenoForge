@@ -35,10 +35,10 @@
                     </div>
                     <div id="hints">
                         <div class="pad-hints">
-                            <div class="hint"><div class="pb a">A</div><div class="hl">Play</div></div>
-                            <div class="hint" id="hint-b" style="display: none;"><div class="pb b">B</div><div class="hl">Clear search</div></div>
-                            <div class="hint"><div class="pb x">X</div><div class="hl">Settings</div></div>
-                            <div class="hint"><div class="pb y">Y</div><div class="hl">Rescan</div></div>
+                            <div class="hint"><div class="gl a"></div><div class="hl">Play</div></div>
+                            <div class="hint" id="hint-b" style="display: none;"><div class="gl b"></div><div class="hl">Clear search</div></div>
+                            <div class="hint"><div class="gl x"></div><div class="hl">Settings</div></div>
+                            <div class="hint"><div class="gl y"></div><div class="hl">Rescan</div></div>
                         </div>
                         <div class="key-hints">
                             {i:keyboard}<div class="hint-dot"></div>{i:mouse}
@@ -54,9 +54,9 @@
                     <div id="pages"></div>
                     <div id="shints">
                         <div class="pad-hints">
-                            <div class="hint"><div class="pb a">A</div><div class="hl">Select</div></div>
-                            <div class="hint"><div class="pb b">B</div><div class="hl">Back</div></div>
-                            <div class="hint"><div class="bumper">LB</div><div class="bumper">RB</div><div class="hl">Tabs</div></div>
+                            <div class="hint"><div class="gl a"></div><div class="hl">Select</div></div>
+                            <div class="hint"><div class="gl b"></div><div class="hl">Back</div></div>
+                            <div class="hint"><div class="gl lb"></div><div class="gl rb"></div><div class="hl">Tabs</div></div>
                         </div>
                         <div class="note">Changes are saved as you make them.</div>
                         <div class="key-hints">

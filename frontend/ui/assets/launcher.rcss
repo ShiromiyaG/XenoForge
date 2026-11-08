@@ -233,14 +233,13 @@ body { background-color: transparent; }
 
 #hints, #shints { flex: 0 0 auto; height: 44dp; display: flex; flex-direction: row; align-items: center; padding: 0 31dp 0 41dp; }
 .pad-hints { display: flex; flex-direction: row; align-items: center; flex: 1 1 0; }
-.pb {
-    width: 25dp; height: 25dp; margin-right: 0; line-height: 24dp; text-align: center; border-radius: 13dp;
-    font-family: Inter; font-weight: 400; font-size: 15dp; color: #ffffff; border: 2dp #ffffff;
-}
-.pb.a { border-color: #bfe39a; decorator: linear-gradient(180deg, #6fb140, #3e7f22); }
-.pb.b { border-color: #f5b6ad; decorator: linear-gradient(180deg, #d9584c, #a02a20); }
-.pb.x { border-color: #b3d6f5; decorator: linear-gradient(180deg, #4a8fd0, #265f9c); }
-.pb.y { border-color: #f7e2a2; decorator: linear-gradient(180deg, #e3ae2e, #b98414); }
+.gl { width: 38dp; height: 38dp; flex: 0 0 auto; }
+.gl.a { decorator: image(mem:pad-a contain); }
+.gl.b { decorator: image(mem:pad-b contain); }
+.gl.x { decorator: image(mem:pad-x contain); }
+.gl.y { decorator: image(mem:pad-y contain); }
+.gl.lb { decorator: image(mem:pad-lb contain); margin-right: -6dp; }
+.gl.rb { decorator: image(mem:pad-rb contain); }
 .hint { display: flex; flex-direction: row; align-items: center; margin-right: 24dp; }
 .hl { margin-left: 8dp; font-family: Condensed; font-weight: 400; font-size: 15dp; line-height: 1; color: #2e2d30; white-space: nowrap; }
 .key-hints { display: flex; flex-direction: row; align-items: center; flex: 0 0 auto; }
@@ -250,10 +249,6 @@ body { background-color: transparent; }
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     height: 25dp; margin-left: 12dp; padding: 0 6dp; border: 1dp #777677; border-radius: 5dp;
     decorator: linear-gradient(180deg, #3b3a3b, #232223); color: #ffffff; font-family: Condensed; font-size: 13.5dp; line-height: 1;
-}
-.bumper {
-    height: 22dp; min-width: 34dp; margin-right: 4dp; padding: 0 7dp; line-height: 20dp; text-align: center; border: 1dp #777677; border-radius: 6dp;
-    decorator: linear-gradient(180deg, #5a595a, #3a393a); color: #ffffff; font-family: Condensed; font-size: 14dp;
 }
 .key-hints .hl { margin-right: 0; }
 .key-hints .hl.gap { margin-right: 0; }

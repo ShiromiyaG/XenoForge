@@ -259,6 +259,8 @@ std::string about_body_html() {
     s += lic("Inter", "SIL OFL 1.1", "The typeface, by The Inter Project Authors (rsms.me/inter). Its license is in ui/fonts/LICENSE-Inter.txt.");
     s += lic("Roboto Condensed", "Apache 2.0", "The typeface of the games' list and the toolbar. Its license is in ui/fonts/LICENSE-Roboto.txt.");
     s += lic("Lucide", "ISC", "The icons, by the Lucide Contributors (lucide.dev; parts from Feather, MIT). Its license is in ui/fonts/LICENSE-Lucide.txt.");
+    s += lic("Xbox 360 button pictures", "CC0",
+             "The controller buttons in the hint bars, from the Xbox 360 set of Free Controller & Key Prompts by Xelu (thoseawesomeguys.com/prompts). Its license is in ui/glyphs/LICENSE-Xelu.txt.");
     s += lic("Xbox 360 web cursors", "Public domain",
              "The pointers, the console browser's, as the set by MiniYak_YT (rw-designer.com) released to the public domain. Its note is ui/cursors/README.txt.");
     s += lic("Dear ImGui", "MIT", "The player's debugging overlay (F1).");
