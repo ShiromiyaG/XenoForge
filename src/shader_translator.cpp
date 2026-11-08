@@ -369,10 +369,14 @@ void Translator::declare() {
         // diameter's bounds), the color targets' scales and the point
         // constants (renderer.cpp's System, point_list.geom), then per fetch
         // slot its texture's signs and the signed view's image and sampler,
-        // then the user clip planes enabled, packed (VertexOptions)
+        // then the user clip planes enabled, packed (VertexOptions), then the
+        // screen extents' map from the host's NDC to console pixels (x scale
+        // and offset, y scale and offset) and the report's first word
+        // (VertexOptions::extents)
         Id slot_table = m_.type_array(uvec4_, 8, 16);
         const Id system_members[] = {vec4_, vec4_, slot_table, uvec4_,     vec4_,
-                                     vec4_, vec4_, slot_table, slot_table, m_.type_array(vec4_, 6, 16)};
+                                     vec4_, vec4_, slot_table, slot_table, m_.type_array(vec4_, 6, 16),
+                                     vec4_, uvec4_};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
@@ -385,6 +389,8 @@ void Translator::declare() {
         m_.member_decorate(system_block, 7, spv::Decoration::Offset, {224});
         m_.member_decorate(system_block, 8, spv::Decoration::Offset, {352});
         m_.member_decorate(system_block, 9, spv::Decoration::Offset, {480});
+        m_.member_decorate(system_block, 10, spv::Decoration::Offset, {576});
+        m_.member_decorate(system_block, 11, spv::Decoration::Offset, {592});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -1898,6 +1904,17 @@ void Translator::main_vertex() {
     m_.decorate(position, spv::Decoration::Invariant);
     Id outputs = global(m_.type_array(vec4_, 16), spv::StorageClass::Output, "interpolators");
     m_.decorate(outputs, spv::Decoration::Location, {0});
+    // the screen extents' reports (VertexOptions::extents), as words
+    Id extents = 0;
+    if (vertex_.extents) {
+        const Id extent_members[] = {m_.type_runtime_array(uint_, 4)};
+        Id extent_block = m_.type_struct(extent_members);
+        m_.decorate(extent_block, spv::Decoration::Block);
+        m_.member_decorate(extent_block, 0, spv::Decoration::Offset, {0});
+        extents = global(extent_block, spv::StorageClass::StorageBuffer, "extents");
+        m_.decorate(extents, spv::Decoration::DescriptorSet, {0});
+        m_.decorate(extents, spv::Decoration::Binding, {7});
+    }
     // the point diameter for point lists' geometry shader (point_list.geom),
     // after the interpolators
     Id point_size = global(float_, spv::StorageClass::Output, "point_size");
@@ -2032,6 +2049,57 @@ void Translator::main_vertex() {
                   m_.op(Op::OpDot, float_, {xyzw, plane}));
         }
     };
+    // The final host position bounding its report (VertexOptions::extents):
+    // xy over w, clamped to the viewport's NDC square (the host clips there),
+    // mapped to console pixels (system member 10), then the edges as whole
+    // pixels outwards, clamped to 0-8192; the whole viewport for a position
+    // whose w is not above 0 (its primitive's clipped part can reach any
+    // edge) or whose xy are not numbers. Atomic maxima at the report's
+    // words (system member 11's x): 8192 less the left and top edges, the
+    // right and bottom ones plus one.
+    auto bound_extent = [&](Id p) {
+        if (!extents) return;
+        Id w = comp(p, 3);
+        Id ndc =
+            m_.op(Op::OpFDiv, vec2_,
+                  {m_.op(Op::OpVectorShuffle, vec2_, {p, p, 0, 1}), m_.op(Op::OpCompositeConstruct, vec2_, {w, w})});
+        Id in_front = m_.op(Op::OpFOrdGreaterThan, bool_, {w, f(0)});
+        Id bvec2 = m_.type_vector(bool_, 2);
+        Id numbers = m_.op(Op::OpLogicalNot, bool_, {m_.op(Op::OpAny, bool_, {m_.op(Op::OpIsNan, bvec2, {ndc})})});
+        Id valid = m_.op(Op::OpLogicalAnd, bool_, {in_front, numbers});
+        Id ones = m_.op(Op::OpCompositeConstruct, vec2_, {f(1), f(1)});
+        Id minus_ones = m_.op(Op::OpCompositeConstruct, vec2_, {f(-1), f(-1)});
+        Id lo = select(vec2_, valid, glsl(GLSLstd450FClamp, vec2_, {ndc, minus_ones, ones}), minus_ones);
+        Id hi = select(vec2_, valid, glsl(GLSLstd450FClamp, vec2_, {ndc, minus_ones, ones}), ones);
+        Id map = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(10)}));
+        Id scale = m_.op(Op::OpVectorShuffle, vec2_, {map, map, 0, 2});
+        Id offset = m_.op(Op::OpVectorShuffle, vec2_, {map, map, 1, 3});
+        // both ends mapped, as a negative scale swaps them
+        Id a = m_.op(Op::OpFAdd, vec2_, {m_.op(Op::OpFMul, vec2_, {lo, scale}), offset});
+        Id b = m_.op(Op::OpFAdd, vec2_, {m_.op(Op::OpFMul, vec2_, {hi, scale}), offset});
+        Id zeros = m_.op(Op::OpCompositeConstruct, vec2_, {f(0), f(0)});
+        Id limits = m_.op(Op::OpCompositeConstruct, vec2_, {f(8192), f(8192)});
+        Id low = glsl(GLSLstd450FClamp, vec2_,
+                      {glsl(GLSLstd450Floor, vec2_, {glsl(GLSLstd450FMin, vec2_, {a, b})}), zeros, limits});
+        Id high = glsl(GLSLstd450FClamp, vec2_,
+                       {glsl(GLSLstd450Ceil, vec2_, {glsl(GLSLstd450FMax, vec2_, {a, b})}), zeros, limits});
+        Id uvec2 = m_.type_vector(uint_, 2);
+        Id low_u = m_.op(Op::OpConvertFToU, uvec2, {low}), high_u = m_.op(Op::OpConvertFToU, uvec2, {high});
+        Id first = m_.op(Op::OpCompositeExtract, uint_,
+                         {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                             {system_, u(11)})),
+                          0});
+        Id ptr = m_.type_pointer(spv::StorageClass::StorageBuffer, uint_);
+        Id device = u(uint32_t(spv::Scope::Device)), relaxed = u(0);
+        const Id values[4] = {m_.op(Op::OpISub, uint_, {u(8192), m_.op(Op::OpCompositeExtract, uint_, {low_u, 0})}),
+                              m_.op(Op::OpISub, uint_, {u(8192), m_.op(Op::OpCompositeExtract, uint_, {low_u, 1})}),
+                              m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpCompositeExtract, uint_, {high_u, 0}), u(1)}),
+                              m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpCompositeExtract, uint_, {high_u, 1}), u(1)})};
+        for (uint32_t k = 0; k < 4; k++) {
+            Id at = m_.op(Op::OpAccessChain, ptr, {extents, u(0), m_.op(Op::OpIAdd, uint_, {first, u(k)})});
+            m_.op(Op::OpAtomicUMax, uint_, {at, device, relaxed, values[k]});
+        }
+    };
     // oPts.x clamped to PA_SU_POINT_MINMAX (system values' y and z) as Xenia
     // does, like signed integers (-NaN and negatives to the minimum, NaN to
     // the maximum); -1 when the shader does not write it, for the constant
@@ -2098,6 +2166,7 @@ void Translator::main_vertex() {
             return select(vec4_, fourth, mirrored, at(chosen));
         };
         store(position, pick(rectangle_positions, 0));
+        bound_extent(load(vec4_, position));
         if (rectangle_guest_positions) {
             // the corner's guest position, made as its host one: distances
             // mirrored as the position is
@@ -2208,6 +2277,7 @@ void Translator::main_vertex() {
             put_distances(cull_distances, guest);
         }
         store(position, p);
+        bound_extent(p);
         put_interpolators();
         store(point_size, size);
     }

@@ -22,8 +22,14 @@
 //   follow command_processor.cc's "fast" mode (QueueZPDReport,
 //   PumpPendingRetire; 2026), with the ZPass counts of host occlusion
 //   queries and without its VIZ queries, hybrid totals or the deadline for
-//   reports that never resolve (the sink answers each). VIZ_QUERY only marks
-//   VGT_EVENT_INITIATOR (Xenia's default, occlusion_query_viz off).
+//   reports that never resolve (the sink answers each). VIZ_QUERY marks
+//   VGT_EVENT_INITIATOR and tells the sink, which measures the query's
+//   survey draws and predicates its draws itself (Xenia's
+//   occlusion_query_viz, there off by default; the renderer's "VIZ
+//   queries").
+// - EVENT_WRITE_EXT's screen extents are, with ScreenExtents::Measured and a
+//   sink that measures, the bounds of what the report's draws rasterized
+//   (beyond Xenia, which writes the whole screen; event_write_ext).
 // - A type-3 packet ends where its header's count says, even when a handler
 //   read less (IM_LOAD_IMMEDIATE's padding) or more; Xenia asserts the two
 //   agree. Type 1 and XE_SWAP do not read past their buffer.
@@ -309,6 +315,8 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::NOP: reader_.skip(count * 4); return true;
     case pm4::INTERRUPT: {
         uint32_t cpu_mask = reader_.next();
+        // the CPU may read the screen extents in its interrupt
+        poll_extents(true);
         for (uint32_t n = 0; n < 6; n++)
             if (cpu_mask & (1u << n)) {
                 bump(counts_.interrupts);
@@ -347,7 +355,11 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::COND_WRITE: return cond_write();
     case pm4::EVENT_WRITE: {
         // an event flag; a write to an address (count > 1) is not known
-        regs_.set(reg::VGT_EVENT_INITIATOR, reader_.next() & 0x3F);
+        uint32_t initiator = reader_.next() & 0x3F;
+        regs_.set(reg::VGT_EVENT_INITIATOR, initiator);
+        if (initiator == EVENT_SCREEN_EXT_INIT && extents_ == ScreenExtents::Measured && sink_ &&
+            sink_->measures_extents())
+            sink_->extent_init();
         if (count > 1) reader_.skip((count - 1) * 4);
         return true;
     }
@@ -390,6 +402,7 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::VIZ_QUERY: {
         uint32_t dword0 = reader_.next();
         regs_.set(reg::VGT_EVENT_INITIATOR, dword0 & 0x100 ? EVENT_VIZQUERY_END : EVENT_VIZQUERY_START);
+        if (sink_) sink_->viz_query(dword0 & 0x3F, dword0 & 0x100);
         return true;
     }
     case pm4::SET_BIN_MASK_LO: bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | reader_.next(); return true;
@@ -529,6 +542,8 @@ bool CommandProcessor::wait_reg_mem() {
         }
         if (match(value & mask, ref, wait_info)) return true;
         bump(counts_.waits);
+        // the CPU may read the screen extents before it lets the wait end
+        poll_extents(true);
         if (!host_.wait(wait)) return false;
     }
 }
@@ -570,16 +585,64 @@ bool CommandProcessor::event_write_shd() {
     return true;
 }
 
-// a screen extent event: the area a draw touched, which nothing measures
-// here; the whole of the largest texture, as Xenia writes
+// A screen extent event (SCREEN_EXT_RPT): the area the draws since the last
+// SCREEN_EXT_INIT touched, six 16-bit words (x, y and z, min and max; x and
+// y in 8-pixel units, as Xenia's >> 3 writes them) byte-swapped in 16 bits
+// (Xenia asserts that endianness and writes it so). Written at once as Xenia
+// writes it, the whole of the largest texture; with ScreenExtents::Measured
+// and a sink that measures, written again with the sink's bounds when they
+// are in (poll_extents), and those are in before the next interrupt or wait,
+// after which the CPU may read them. Direct3D's predicated tiling reads them
+// to choose the tiles a draw runs in: a bound too small would drop the
+// draw's pixels in a tile, one too large only runs it in more tiles, so the
+// bounds are rounded outwards. The z range stays 0-1 (a hardware question,
+// as is the rounding the console does).
 bool CommandProcessor::event_write_ext() {
     uint32_t initiator = reader_.next(), address = reader_.next() & ~3u;
     regs_.set(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
-    const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1}; // x, y and z, min and max
+    const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
+    write_extent(address, extents);
+    if (extents_ == ScreenExtents::Measured && sink_ && sink_->measures_extents()) {
+        uint64_t handle = sink_->extent_report();
+        if (handle) {
+            extent_reports_[handle] = address;
+            extent_latest_[address] = handle;
+        } else {
+            extent_latest_.erase(address);
+        }
+    }
+    return true;
+}
+
+void CommandProcessor::write_extent(uint32_t address, const uint16_t (&extents)[6]) {
     uint8_t *p = physical(address);
     for (int i = 0; i < 6; i++) p[2 * i] = uint8_t(extents[i] >> 8), p[2 * i + 1] = uint8_t(extents[i]);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, sizeof(extents));
-    return true;
+}
+
+// The sink's answers to the screen extent reports in (all of them, waited
+// for, with wait), each written where no later report has been since.
+void CommandProcessor::poll_extents(bool wait) {
+    if (extent_reports_.empty() || !sink_) return;
+    if (wait) sink_->extent_wait();
+    extent_resolved_.clear();
+    sink_->extent_poll(extent_resolved_);
+    for (const Extent &e : extent_resolved_) {
+        auto report = extent_reports_.find(e.handle);
+        if (report == extent_reports_.end()) continue;
+        uint32_t address = report->second;
+        extent_reports_.erase(report);
+        auto latest = extent_latest_.find(address);
+        if (latest == extent_latest_.end() || latest->second != e.handle) continue;
+        extent_latest_.erase(latest);
+        if (e.whole) continue;
+        // in 8-pixel units, outwards: the left and top down, the right and
+        // bottom (exclusive) up
+        uint32_t right = std::min<uint32_t>(e.right, 8192), bottom = std::min<uint32_t>(e.bottom, 8192);
+        const uint16_t extents[6] = {uint16_t(std::min(e.left, right) >> 3), uint16_t((right + 7) >> 3),
+                                     uint16_t(std::min(e.top, bottom) >> 3), uint16_t((bottom + 7) >> 3), 0, 1};
+        write_extent(address, extents);
+    }
 }
 
 // a z-pass done event: an occlusion query's report (xe_gpu_depth_sample_
@@ -788,8 +851,9 @@ bool CommandProcessor::xe_swap(uint32_t count) {
     Swap s{words[1], words[2], words[3]};
     bump(counts_.swaps);
     if (sink_) sink_->swap(regs_, s);
-    // the counts of the frame's reports, as they come in
+    // the counts of the frame's reports, as they come in, and the extents
     poll_zpd();
+    poll_extents(false);
     counter_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

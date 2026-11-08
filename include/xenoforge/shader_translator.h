@@ -94,10 +94,18 @@ struct VertexOptions {
     uint8_t clip_planes = 0;       // 0-6
     bool clip_planes_cull = false; // ucp_cull_only_ena
     uint8_t point_ucp_mode = 0;    // ps_ucp_mode, for points
+    // Screen extents (EVENT_WRITE_EXT; renderer.cpp, "Screen extents"): each
+    // final position bounds the draw's report, in console pixels through the
+    // system constants' extent map (members 10 and 11), with atomic maxima
+    // into the storage buffer at set 0, binding 7, four words a report at
+    // the report's index: 8192 less the left and top edges, the right and
+    // bottom ones plus one (zero: nothing yet). A position not in front of
+    // the eye (w not above 0, or not a number) takes the whole viewport.
+    bool extents = false;
     // a word naming the variant (the renderer's key for the module)
     uint32_t key() const {
         return uint32_t(host) | (equal_spacing ? 1u << 8 : 0u) | uint32_t(clip_planes) << 9 |
-               (clip_planes_cull ? 1u << 12 : 0u) | uint32_t(point_ucp_mode & 3) << 13;
+               (clip_planes_cull ? 1u << 12 : 0u) | uint32_t(point_ucp_mode & 3) << 13 | (extents ? 1u << 15 : 0u);
     }
 };
 // How a pixel shader writes depth (Xenia's DepthStencilMode on the host

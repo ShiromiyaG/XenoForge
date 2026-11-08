@@ -197,6 +197,7 @@ const uint32_t EDRAM_RESCALE[] = {
 
 // registers xenos.h does not name
 namespace r {
+constexpr uint32_t RB_HIZCONTROL = 0x2203;
 constexpr uint32_t PA_SC_SCREEN_SCISSOR_TL = 0x200E, PA_SC_SCREEN_SCISSOR_BR = 0x200F;
 constexpr uint32_t PA_SC_WINDOW_OFFSET = 0x2080, PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082;
 constexpr uint32_t VGT_MAX_VTX_INDX = 0x2100, VGT_MIN_VTX_INDX = 0x2101, VGT_INDX_OFFSET = 0x2102;
@@ -668,8 +669,13 @@ struct System {
     uint32_t signs[32];
     uint32_t signed_slots[32]; // per slot, its texture's signed view as slots has it; 0 none
     float clip_planes[6][4];   // the user clip planes enabled, packed (shader::VertexOptions)
+    // screen extents (shader::VertexOptions::extents): the host's NDC to
+    // console pixels (x scale, x offset, y scale, y offset), and the
+    // report's first word in the extents buffer
+    float extent_map[4];
+    uint32_t extent_report[4];
 };
-static_assert(sizeof(System) == 576);
+static_assert(sizeof(System) == 608);
 
 // The bits of each component of a fixed-point guest texture format, in the
 // texel's order (Xenia's texture_info_formats.inl, its fixed formats); zeros
@@ -775,6 +781,15 @@ struct Slot {
     VkQueryPool occlusion = VK_NULL_HANDLE;
     uint32_t occlusion_used = 0; // the queries to reset before the next use
     std::vector<uint64_t> occlusion_reports;
+    // screen extents (Impl's "screen extents"): per report bounded in the
+    // slot's share of the extents buffer, its handle and the pixels added
+    // around its bounds (wide lines)
+    struct ExtentReport {
+        uint64_t handle = 0;
+        uint32_t margin = 0;
+    };
+    std::vector<ExtentReport> extent_reports;
+    uint32_t extents_used = 0; // the reports to zero before the next use
 };
 
 // A swap's front buffer being read back: where its texels wait for the GPU
@@ -1086,7 +1101,18 @@ public:
     }
     void draw(const gpu::RegisterFile &registers, const gpu::Draw &d) override {
         Call call(*this, &registers);
+        extent_drawn_ = false;
+        uint32_t survey = viz_survey_begin();
         if (call) draw(d);
+        // a draw in a screen extent report that did not bound it
+        if (extent_open_ && !extent_drawn_) extent_whole_ = true;
+        // a survey draw not measured: its query stays visible
+        if (survey != UINT32_MAX && !viz_measured_) viz_[survey].fallback = true;
+        viz_survey_ = viz_predicate_ = UINT32_MAX;
+    }
+    void viz_query(uint32_t id, bool end) override {
+        Call call(*this, nullptr);
+        if (call) viz_query_event(id & 63, end);
     }
     void resolve(const gpu::RegisterFile &registers, const gpu::Draw &) override {
         Call call(*this, &registers);
@@ -1107,6 +1133,30 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         resolved.insert(resolved.end(), zpd_resolved_.begin(), zpd_resolved_.end());
         zpd_resolved_.clear();
+    }
+    // screen extents (gpu::ScreenExtents::Measured; "screen extents" below)
+    bool measures_extents() override { return extents_.buffer != VK_NULL_HANDLE; }
+    void extent_init() override {
+        Call call(*this, nullptr);
+        extent_open_ = true, extent_whole_ = false, extent_index_ = UINT32_MAX, extent_margin_ = 0;
+    }
+    uint64_t extent_report() override {
+        Call call(*this, nullptr);
+        return extent_reported();
+    }
+    void extent_wait() override {
+        Call call(*this, nullptr);
+        if (!call) return;
+        uint64_t serial = 0;
+        for (const Slot &s : slots_)
+            for (const Slot::ExtentReport &e : s.extent_reports)
+                if (e.handle && s.serial) serial = std::max(serial, s.serial);
+        if (serial) wait_serial(serial);
+    }
+    void extent_poll(std::vector<gpu::Extent> &resolved) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        resolved.insert(resolved.end(), extent_resolved_.begin(), extent_resolved_.end());
+        extent_resolved_.clear();
     }
     // the processor's own writes (fences, reports), and a trace's memory
     // (Xenia's TracePlaybackWroteMemory): written through the physical view,
@@ -1531,6 +1581,202 @@ private:
         bool ended = false, uncounted = false;
         bool suppressed = false; // a draw the port's frame skipped counted for it (native_render.h)
     };
+    // ---- VIZ queries ----
+    // VIZ_QUERY (Xenia's occlusion_query_viz, off by default there; beyond
+    // its default here, where the device has conditional rendering): the
+    // survey draws of a query (PA_SC_VIZ_QUERY's viz_query_ena with
+    // kill_pix_post_hi_z, killed after hi-Z on the console) counted by a host
+    // occlusion query, or the interlock path's counter, of their own (never
+    // for an occlusion report, as Xenia's); at the query's end that count
+    // copied to the ID's word in viz_predicates_, and the draws predicated
+    // on the ID after it (DRAW_INDX's VIZ token, bit 8) drawn under
+    // conditional rendering on that word, so the GPU skips them where the
+    // survey passed no sample. A query whose survey draws were not all
+    // measured, in one count, is visible (its draws drawn, as Xenia's
+    // fallback); one with no survey draw at all is not (its draws dropped, as
+    // Xenia's). A survey is measured only as the console would see it: no
+    // color, depth or stencil writes, hi-Z on (Xenia tests depth then; with
+    // hi-Z off nothing rejects a survey, and our depth test could). Draws
+    // exporting memory are never predicated or dropped.
+    struct VizQuery {
+        bool active = false, ended = false;
+        bool surveyed = false; // a survey draw came
+        bool fallback = false; // one was not measured: visible
+        bool armed = false;    // its count copied to its word
+        uint32_t segments = 0; // the counts its surveys went into
+        uint64_t serial = 0;   // the submission of its count
+        uint32_t index = 0;    // its query (host) or counter (interlock) in that submission
+    };
+    vk::Buffer viz_predicates_; // a word an ID (the device has conditional rendering)
+    VizQuery viz_[64];
+    uint32_t viz_open_ = UINT32_MAX;      // the ID whose host query is open in the pass
+    uint32_t viz_survey_ = UINT32_MAX;    // the draw being made is a survey measured for this ID
+    uint32_t viz_predicate_ = UINT32_MAX; // the draw being made is predicated on this ID's word
+    bool viz_measured_ = false;           // the survey being made was counted
+    // the draw about to be made: a survey of an active query (its ID), and
+    // whether it can be measured (viz_survey_)
+    uint32_t viz_survey_begin() {
+        viz_survey_ = viz_predicate_ = UINT32_MAX, viz_measured_ = false;
+        uint32_t viz = regs_[reg::PA_SC_VIZ_QUERY];
+        if (!viz_predicates_.buffer || (viz & 0x81) != 0x81) return UINT32_MAX;
+        uint32_t id = (viz >> 1) & 63;
+        VizQuery &q = viz_[id];
+        if (!q.active) return UINT32_MAX;
+        q.surveyed = true;
+        uint32_t mode = regs_[reg::RB_MODECONTROL] & 7, depth = regs_[reg::RB_DEPTHCONTROL];
+        bool color = EdramMode(mode) == EdramMode::ColorDepth && (regs_[reg::RB_COLOR_MASK] & 0xFFFF);
+        bool hiz = (regs_[r::RB_HIZCONTROL] >> 1) & 1;
+        if (!color && !(depth & 5) && hiz) viz_survey_ = id;
+        return id;
+    }
+    void viz_end_host() {
+        if (viz_open_ == UINT32_MAX) return;
+        vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, viz_[viz_open_].index);
+        viz_open_ = UINT32_MAX;
+    }
+    // a survey's count in this submission: its own, or the one its query's
+    // earlier surveys opened (a second makes the query visible)
+    bool viz_count(VizQuery &q) {
+        Slot &s = slots_[current_];
+        if (q.segments && q.serial == s.serial && (fsi_ || viz_open_ == viz_survey_)) return true;
+        if (s.occlusion_reports.size() >= OCCLUSION_QUERIES || (!fsi_ && !s.occlusion)) return false;
+        q.index = uint32_t(s.occlusion_reports.size());
+        s.occlusion_reports.push_back(0); // no report's
+        s.occlusion_used = uint32_t(s.occlusion_reports.size());
+        q.serial = s.serial;
+        q.segments++;
+        return true;
+    }
+    // the host path: the survey's draw counted in its query's host query
+    void viz_draw(VkCommandBuffer c) {
+        VizQuery &q = viz_[viz_survey_];
+        if (viz_open_ != viz_survey_) {
+            end_query(); // the report's and another ID's: one occlusion query at a time
+            if (!viz_count(q)) return;
+            vkCmdBeginQuery(c, slots_[current_].occlusion, q.index, 0);
+            viz_open_ = viz_survey_;
+        }
+        viz_measured_ = true;
+    }
+    // the interlock path: the survey's counter
+    uint32_t viz_fsi_index() {
+        VizQuery &q = viz_[viz_survey_];
+        if (!viz_count(q)) return UINT32_MAX;
+        viz_measured_ = true;
+        return current_ * OCCLUSION_QUERIES + q.index;
+    }
+    void viz_query_event(uint32_t id, bool end) {
+        if (!viz_predicates_.buffer) return;
+        VizQuery &q = viz_[id];
+        if (viz_open_ == id) viz_end_host();
+        if (!end) {
+            q = {};
+            q.active = true;
+            return;
+        }
+        if (!q.active) return;
+        q.active = false, q.ended = true;
+        report_.viz_queries++;
+        if (!q.surveyed) return;
+        Slot &s = slots_[current_];
+        if (q.fallback || q.segments != 1 || !s.recording || q.serial != s.serial) {
+            q.fallback = true;
+            return;
+        }
+        // the count to the ID's word, outside the render pass
+        end_pass();
+        VkCommandBuffer c = cmd();
+        full_barrier(c);
+        if (fsi_) {
+            VkBufferCopy copy{VkDeviceSize(current_ * OCCLUSION_QUERIES + q.index) * 4, VkDeviceSize(id) * 4, 4};
+            vkCmdCopyBuffer(c, zpd_counters_.buffer, viz_predicates_.buffer, 1, &copy);
+        } else {
+            vkCmdCopyQueryPoolResults(c, s.occlusion, q.index, 1, viz_predicates_.buffer, VkDeviceSize(id) * 4, 4,
+                                      VK_QUERY_RESULT_WAIT_BIT);
+        }
+        full_barrier(c);
+        q.armed = true;
+        report_.viz_armed++;
+    }
+    // ---- screen extents ----
+    // EVENT_WRITE_EXT (gpu::ScreenExtents::Measured, beyond Xenia, which
+    // answers the whole screen): the draws between a SCREEN_EXT_INIT and the
+    // SCREEN_EXT_RPT after it bound their report on the GPU, each final
+    // vertex position taking the report's rectangle out to it
+    // (shader::VertexOptions::extents) in the slot's share of extents_
+    // (device-local: atomics over the bus cost a UE3 game's frame ten times
+    // its GPU time), zeroed as the slot begins recording, copied to
+    // extents_readback_ as it ends and read as its submission is done. A report the renderer cannot bound whole
+    // (a draw there skipped, drawn some other way, or after a submission
+    // began; more reports than a slot holds) is answered as the whole
+    // screen. Wide lines add half their width around.
+    static constexpr uint32_t EXTENT_REPORTS = 4096; // a slot's
+    vk::Buffer extents_, extents_readback_;
+    bool extent_open_ = false;                 // between an init and its report
+    bool extent_whole_ = false;                // a draw there not bounded
+    uint32_t extent_index_ = UINT32_MAX;       // its report in the slot, once a draw bounds it
+    uint64_t extent_serial_ = 0;               // the submission that report is in
+    uint32_t extent_margin_ = 0;               // pixels around the bounds
+    uint64_t extent_next_ = 1;                 // the next report's handle
+    bool extent_drawn_ = false;                // the draw being made bounded its report
+    std::vector<gpu::Extent> extent_resolved_; // for extent_poll
+    // the draw being made bounds the open report (the index of its words in
+    // extents_), or UINT32_MAX: it cannot, and the report is the whole screen
+    uint32_t extent_draw_words() {
+        if (!extent_open_ || extent_whole_) return UINT32_MAX;
+        cmd();
+        Slot &s = slots_[current_];
+        if (extent_index_ == UINT32_MAX) {
+            if (s.extent_reports.size() >= EXTENT_REPORTS) {
+                extent_whole_ = true;
+                return UINT32_MAX;
+            }
+            extent_index_ = uint32_t(s.extent_reports.size());
+            extent_serial_ = s.serial;
+            s.extent_reports.push_back({});
+            s.extents_used = uint32_t(s.extent_reports.size());
+        } else if (extent_serial_ != s.serial) {
+            extent_whole_ = true; // a submission began inside the report
+            return UINT32_MAX;
+        }
+        return (current_ * EXTENT_REPORTS + extent_index_) * 4;
+    }
+    uint64_t extent_reported() {
+        bool bounded = extent_open_ && !extent_whole_ && extent_index_ != UINT32_MAX && slots_[current_].recording &&
+                       extent_serial_ == slots_[current_].serial;
+        extent_open_ = false;
+        report_.extent_reports++;
+        if (!bounded) return 0;
+        report_.extent_bounded++;
+        Slot::ExtentReport &e = slots_[current_].extent_reports[extent_index_];
+        e.handle = extent_next_++, e.margin = extent_margin_;
+        return e.handle;
+    }
+    // the slot's reports bounded, as its submission is done: 8192 less the
+    // left and top edges, the right and bottom ones plus one (0: no position
+    // reached it, the whole screen), widened by the margin and a pixel
+    void extent_collect(Slot &s, uint32_t slot) {
+        if (s.extent_reports.empty()) return;
+        const uint32_t *words =
+            reinterpret_cast<const uint32_t *>(extents_readback_.mapped) + slot * EXTENT_REPORTS * 4;
+        for (size_t i = 0; i < s.extent_reports.size(); i++) {
+            const Slot::ExtentReport &e = s.extent_reports[i];
+            if (!e.handle) continue;
+            const uint32_t *w = words + i * 4;
+            gpu::Extent x;
+            x.handle = e.handle;
+            x.whole = !w[0] || !w[1] || !w[2] || !w[3];
+            if (!x.whole) {
+                int32_t margin = int32_t(e.margin) + 1;
+                x.left = uint32_t(std::max(0, int32_t(8192 - std::min(w[0], 8192u)) - margin));
+                x.top = uint32_t(std::max(0, int32_t(8192 - std::min(w[1], 8192u)) - margin));
+                x.right = std::min(8192u, w[2] - 1 + uint32_t(margin));
+                x.bottom = std::min(8192u, w[3] - 1 + uint32_t(margin));
+            }
+            extent_resolved_.push_back(x);
+        }
+        s.extent_reports.clear();
+    }
     static constexpr uint32_t OCCLUSION_QUERIES = 4096; // a slot's
     uint64_t zpd_current_ = 0;                          // the report draws count for (0: none)
     uint32_t zpd_active_ = UINT32_MAX;                  // the query open in the render pass
@@ -1547,6 +1793,7 @@ private:
         zpd_counts_.erase(handle);
     }
     void end_query() {
+        viz_end_host();
         if (zpd_active_ == UINT32_MAX) return;
         // (the interlock path's counters are no host queries)
         if (!fsi_) vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
@@ -1563,6 +1810,7 @@ private:
     }
     // before a draw that rasterizes, in its render pass: the query its report counts it with
     void zpd_draw(VkCommandBuffer c) {
+        viz_end_host(); // a survey's query: one occlusion query at a time
         if (fsi_ || !zpd_current_ || zpd_active_ != UINT32_MAX) return;
         Slot &s = slots_[current_];
         if (!s.occlusion || s.occlusion_reports.size() >= OCCLUSION_QUERIES) {
@@ -1972,7 +2220,8 @@ Impl::~Impl() {
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
                                     compute_set_layout_, target_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
-    for (vk::Buffer *b : {&edram_, &edram_1x_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_, &zpd_counters_, &zpd_readback_})
+    for (vk::Buffer *b : {&edram_, &edram_1x_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_,
+                          &zpd_counters_, &zpd_readback_, &extents_, &extents_readback_, &viz_predicates_})
         d_.destroy(*b);
 }
 
@@ -2192,8 +2441,11 @@ bool Impl::init(std::string &error) {
     // the guest's vertex shader run as a domain shader reads all of it too
     if (d_.tessellation_shader()) stages |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     // (4 to 6 the interlock path's: its constants, EDRAM, the occlusion
-    // counters; bound in either path, read only by its pixel shaders)
-    VkDescriptorSetLayoutBinding b0[7] = {
+    // counters; bound in either path, read only by its pixel shaders; 7 the
+    // screen extents, written by the vertex shaders that bound them)
+    const VkShaderStageFlags vertex_stages =
+        stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT);
+    VkDescriptorSetLayoutBinding b0[8] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr},
         {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
@@ -2201,6 +2453,7 @@ bool Impl::init(std::string &error) {
         {4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vertex_stages, nullptr},
     };
     VkDescriptorSetLayoutBinding b1[4] = {
         {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacity_[0], stages, nullptr},
@@ -2216,7 +2469,7 @@ bool Impl::init(std::string &error) {
     flags.bindingCount = 4;
     flags.pBindingFlags = partly;
     VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    set_info.bindingCount = 7;
+    set_info.bindingCount = 8;
     set_info.pBindings = b0;
     if (vkCreateDescriptorSetLayout(dev_, &set_info, nullptr, &set_layouts_[0]) != VK_SUCCESS)
         return error = "vkCreateDescriptorSetLayout failed", false;
@@ -2232,7 +2485,8 @@ bool Impl::init(std::string &error) {
     if (vkCreatePipelineLayout(dev_, &layout_info, nullptr, &layout_) != VK_SUCCESS)
         return error = "vkCreatePipelineLayout failed", false;
     {
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool.maxSets = 2;
         pool.poolSizeCount = 2;
@@ -2359,12 +2613,31 @@ bool Impl::init(std::string &error) {
     zpd_readback_ = d_.create_buffer(VkDeviceSize(SLOTS) * OCCLUSION_QUERIES * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                      true, true);
     if (!zpd_counters_.buffer || !zpd_readback_.buffer) return error = "could not make the occlusion counters", false;
+    // the screen extents' reports ("screen extents"), zeroed by the first
+    // command buffer
+    extents_ = d_.create_buffer(VkDeviceSize(SLOTS) * EXTENT_REPORTS * 16,
+                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                false);
+    extents_readback_ =
+        d_.create_buffer(VkDeviceSize(SLOTS) * EXTENT_REPORTS * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
+    if (!extents_.buffer || !extents_readback_.buffer)
+        return error = "could not make the screen extents' buffers", false;
+    for (Slot &s : slots_) s.extents_used = EXTENT_REPORTS;
+    // the VIZ queries' predicates ("VIZ queries"), where the device has
+    // conditional rendering
+    if (d_.conditional_rendering()) {
+        viz_predicates_ = d_.create_buffer(
+            64 * 4, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+        if (!viz_predicates_.buffer) return error = "could not make the VIZ queries' predicates", false;
+    }
     for (int k = 0; k < 2; k++) {
-        VkDescriptorBufferInfo buffers[3] = {{arena_.buffer, 0, sizeof(FsiConstants)},
+        VkDescriptorBufferInfo buffers[4] = {{arena_.buffer, 0, sizeof(FsiConstants)},
                                              {edram_.buffer, 0, VK_WHOLE_SIZE},
-                                             {zpd_counters_.buffer, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet writes[3] = {};
-        for (uint32_t b = 0; b < 3; b++) {
+                                             {zpd_counters_.buffer, 0, VK_WHOLE_SIZE},
+                                             {extents_.buffer, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[4] = {};
+        for (uint32_t b = 0; b < 4; b++) {
             writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[b].dstSet = draw_sets_[k];
             writes[b].dstBinding = 4 + b;
@@ -2372,7 +2645,7 @@ bool Impl::init(std::string &error) {
             writes[b].descriptorType = b ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             writes[b].pBufferInfo = &buffers[b];
         }
-        vkUpdateDescriptorSets(dev_, 3, writes, 0, nullptr);
+        vkUpdateDescriptorSets(dev_, 4, writes, 0, nullptr);
     }
     if (fsi_) {
         fsi_depth_fs_ = fsi_ == 2 ? module(EDRAM_FSI_DEPTH_SAMPLE, sizeof(EDRAM_FSI_DEPTH_SAMPLE))
@@ -2716,6 +2989,14 @@ VkCommandBuffer Impl::cmd() {
             full_barrier(s.cmd);
         }
         s.occlusion_used = 0;
+        // the screen extents' share its last submission used zeroed
+        if (s.extents_used) {
+            vkCmdFillBuffer(s.cmd, extents_.buffer, VkDeviceSize(current_) * EXTENT_REPORTS * 16,
+                            VkDeviceSize(s.extents_used) * 16, 0);
+            full_barrier(s.cmd);
+        }
+        s.extents_used = 0;
+        s.extent_reports.clear();
     }
     return s.cmd;
 }
@@ -2767,6 +3048,22 @@ void Impl::flush() {
         VkDeviceSize at = VkDeviceSize(current_) * OCCLUSION_QUERIES * 4;
         VkBufferCopy copy{at, at, VkDeviceSize(s.occlusion_reports.size()) * 4};
         vkCmdCopyBuffer(s.cmd, zpd_counters_.buffer, zpd_readback_.buffer, 1, &copy);
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(s.cmd, &dep);
+    }
+    if (!s.extent_reports.empty()) {
+        // the screen extents' atomics, for extent_collect
+        full_barrier(s.cmd);
+        VkDeviceSize at = VkDeviceSize(current_) * EXTENT_REPORTS * 16;
+        VkBufferCopy copy{at, at, VkDeviceSize(s.extent_reports.size()) * 16};
+        vkCmdCopyBuffer(s.cmd, extents_.buffer, extents_readback_.buffer, 1, &copy);
         VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
         b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -2833,6 +3130,7 @@ bool Impl::finish_oldest(bool wait) {
 void Impl::finish(Slot &s) {
     gpu_collect(s);
     zpd_collect(s);
+    extent_collect(s, uint32_t(&s - slots_));
     for (auto &f : s.after) f();
     s.after.clear();
     done_serial_ = s.serial;
@@ -6019,12 +6317,14 @@ uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constant
 // the draw, which Xenia does not draw).
 void Impl::draw(const gpu::Draw &d) {
     report_.draws++;
-    // VIZ queries, as Xenia's default (occlusion_query_viz off), counted:
-    // draws predicated on one (DRAW_INDX's VIZ token, bit 8) are drawn, and
-    // survey draws (PA_SC_VIZ_QUERY's viz_query_ena with kill_pix_post_hi_z)
-    // are drawn as they are
-    if (d.viz_query & 0x100) use("draws predicated on a VIZ query (drawn, as Xenia's default)");
-    if ((regs_[reg::PA_SC_VIZ_QUERY] & 0x81) == 0x81) use("VIZ survey draws (drawn, as Xenia's default)");
+    // VIZ queries ("VIZ queries" above), counted: draws predicated on one
+    // (DRAW_INDX's VIZ token, bit 8), and survey draws (PA_SC_VIZ_QUERY's
+    // viz_query_ena with kill_pix_post_hi_z), drawn as they are; without
+    // conditional rendering, every predicated draw is drawn (Xenia's default)
+    if (d.viz_query & 0x100)
+        use(viz_predicates_.buffer ? "draws predicated on a VIZ query"
+                                   : "draws predicated on a VIZ query (drawn, as Xenia's default)");
+    if ((regs_[reg::PA_SC_VIZ_QUERY] & 0x81) == 0x81) use("VIZ survey draws");
     uint32_t mode = regs_[reg::RB_MODECONTROL] & 7;
     if (EdramMode(mode) != EdramMode::ColorDepth && EdramMode(mode) != EdramMode::DepthOnly) return skip("EDRAM mode " + std::to_string(mode));
 
@@ -6048,6 +6348,16 @@ void Impl::draw(const gpu::Draw &d) {
             if (options_.verbose)
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
             return;
+        }
+        // predicated on a VIZ query that ended: dropped when it had no
+        // survey, else on the GPU by its word when that holds its count
+        if ((d.viz_query & 0x100) && viz_predicates_.buffer && !exports) {
+            const VizQuery &q = viz_[d.viz_query & 63];
+            if (q.ended && !q.surveyed) {
+                use("draws predicated on a VIZ query without survey draws (dropped)");
+                return;
+            }
+            if (q.ended && q.armed) viz_predicate_ = d.viz_query & 63;
         }
         // the port draws this frame (native_render.h): the draws its filter
         // selects skipped, never one exporting memory (the CPU may read it)
@@ -6171,6 +6481,11 @@ void Impl::draw(const gpu::Draw &d) {
             points ? shader::HostVertex::PointListAsTriangleStrip : shader::HostVertex::RectangleListAsTriangleStrip;
     bool expanded = host_vertex.host == shader::HostVertex::PointListAsTriangleStrip ||
                     host_vertex.host == shader::HostVertex::RectangleListAsTriangleStrip;
+    // in a screen extent report, the vertex shader bounding it where its
+    // positions are the final ones (not points or rectangles a geometry
+    // shader expands: a sprite's corners, a rectangle's fourth corner)
+    const uint32_t extent_words = (!points && !rectangles) || expanded ? extent_draw_words() : UINT32_MAX;
+    host_vertex.extents = extent_words != UINT32_MAX;
     // triangles, quads and polygons (draw_util.h's IsPrimitivePolygonal, the
     // triangle and quad patches with it): faces, culling, the front and back
     // polygon offsets
@@ -6590,6 +6905,13 @@ void Impl::draw(const gpu::Draw &d) {
     System sys{};
     for (int i = 0; i < 3; i++) sys.ndc_scale[i] = viewport.ndc_scale[i], sys.ndc_offset[i] = viewport.ndc_offset[i];
     sys.ndc_scale[3] = 1.0f;
+    if (host_vertex.extents) {
+        // the host's NDC to the viewport's console pixels
+        const VkViewport &v = viewport.viewport;
+        sys.extent_map[0] = v.width * 0.5f, sys.extent_map[1] = v.x + v.width * 0.5f;
+        sys.extent_map[2] = v.height * 0.5f, sys.extent_map[3] = v.y + v.height * 0.5f;
+        sys.extent_report[0] = extent_words;
+    }
     uint32_t color_control = regs_[r::RB_COLORCONTROL];
     if (color_control & 8) sys.flags[0] = 8 | (color_control & 7);
     sys.values[0] = as_float(regs_[r::RB_ALPHA_REF]);
@@ -7103,7 +7425,7 @@ void Impl::draw(const gpu::Draw &d) {
     // the interlock path's constants, with the occlusion counter the draw
     // counts in (the slot's, so once the flush above is past)
     if (fsi_ && fragment) {
-        fsi_constants.zpd_index = fsi_zpd_index();
+        fsi_constants.zpd_index = viz_survey_ != UINT32_MAX ? viz_fsi_index() : fsi_zpd_index();
         if (last_fsi_at_ == NONE || std::memcmp(&last_fsi_, &fsi_constants, sizeof(FsiConstants)) != 0) {
             last_fsi_at_ = arena_take(sizeof(FsiConstants), ubo_align_);
             std::memcpy(arena_data(last_fsi_at_), &fsi_constants, sizeof(FsiConstants));
@@ -7291,11 +7613,30 @@ void Impl::draw(const gpu::Draw &d) {
                       (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull);
         gpu_mark(kind);
     }
-    zpd_draw(c);
+    if (viz_survey_ == UINT32_MAX)
+        zpd_draw(c);
+    else if (!fsi_)
+        viz_draw(c);
+    if (viz_predicate_ != UINT32_MAX) {
+        // drawn where the query's survey passed samples
+        VkConditionalRenderingBeginInfoEXT conditional{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+        conditional.buffer = viz_predicates_.buffer;
+        conditional.offset = VkDeviceSize(viz_predicate_) * 4;
+        vkCmdBeginConditionalRenderingEXT(c, &conditional);
+        report_.viz_predicated++;
+    }
+    if (host_vertex.extents && extent_serial_ == slots_[current_].serial) {
+        // bounded (lines half their width wider: PA_SU_LINE_CNTL's width is
+        // half the width in 12.4 fixed point)
+        extent_drawn_ = true;
+        if (topology_class == 1)
+            extent_margin_ = std::max(extent_margin_, ((regs_[r::PA_SU_LINE_CNTL] & 0xFFFF) + 15) / 16);
+    }
     if (tessellated)
         vkCmdDraw(c, uint32_t(control_points.size() / 2), 1, 0, 0);
     else
         vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
+    if (viz_predicate_ != UINT32_MAX) vkCmdEndConditionalRenderingEXT(c);
     if (options_.gpu_timing_draws) gpu_mark("draws: between draws");
     report_.drawn++;
     end_export(exported);

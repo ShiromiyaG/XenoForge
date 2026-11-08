@@ -65,6 +65,12 @@ struct Report {
     uint64_t textures_scaled = 0;         // textures made the resolution scale's (Options::resolution_scale)
     uint64_t textures_evicted = 0, textures_evicted_for_room = 0, textures_refused = 0;
     uint64_t occlusion_queries = 0, zpd_reports = 0; // host queries begun, reports answered with their counts
+    // screen extent reports (EVENT_WRITE_EXT) the sink was asked for, and
+    // those it bounded (the others the whole screen)
+    uint64_t extent_reports = 0, extent_bounded = 0;
+    // VIZ queries ended, those whose count predicates their draws (the
+    // device's conditional rendering), and the draws drawn so predicated
+    uint64_t viz_queries = 0, viz_armed = 0, viz_predicated = 0;
     double seconds = 0;                          // spent in the renderer's calls, of which:
     double submit_seconds = 0;                   //   submitting work and waiting for the GPU, of which:
     double wait_seconds = 0;                     //     waiting for the GPU to finish work
@@ -254,6 +260,8 @@ struct Options {
     // what replay() has its processor write in occlusion query reports
     // (live, the caller sets its processor's: tools/game.cpp)
     gpu::OcclusionQueries occlusion_queries = gpu::OcclusionQueries::Fake;
+    // and in screen extent reports (live, the caller's: XF_SCREEN_EXTENTS)
+    gpu::ScreenExtents screen_extents = gpu::ScreenExtents::Measured;
     // GPU timestamps around each kind of work (draws by render pass, EDRAM
     // loads and stores, resolves, texture loads, the swap's read-back), summed
     // into Report::gpu_time as submissions finish

@@ -290,6 +290,8 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     {
         const bool has_eds3 =
             has_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && !turned_off("XF_VK_NO_EDS3");
@@ -384,6 +386,24 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
                 *tail = &maintenance8, tail = &maintenance8.pNext;
                 enabled.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
                 d->maintenance8_ = true;
+            }
+        }
+        // VK_EXT_conditional_rendering: draws predicated on a VIZ query run
+        // only where its survey passed samples (Xenia's occlusion_query_viz,
+        // through D3D12's predication there); XF_VK_NO_CONDITIONAL_RENDERING=1
+        // turns it off: every such draw drawn, as Xenia's default
+        if (has_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) &&
+            !turned_off("XF_VK_NO_CONDITIONAL_RENDERING")) {
+            VkPhysicalDeviceConditionalRenderingFeaturesEXT has_cr{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_cr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_cr.pNext = &has_cr;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_cr);
+            if (has_cr.conditionalRendering) {
+                conditional.conditionalRendering = VK_TRUE;
+                *tail = &conditional, tail = &conditional.pNext;
+                enabled.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+                d->conditional_rendering_ = true;
             }
         }
         // (without fast linking a linked pipeline may cost as much as a whole

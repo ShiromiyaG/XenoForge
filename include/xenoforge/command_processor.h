@@ -101,6 +101,15 @@ struct Swap {
 // do nothing. Xenia's backend calls (IssueDraw, IssueCopy, IssueSwap,
 // LoadShader) and its trace writer's (packets, buffers, memory read and
 // written), so a renderer or a trace writer can stand behind it.
+// A screen extent report's answer (Sink::extent_poll): the console pixels
+// its draws can have rasterized, left and top inclusive, right and bottom
+// exclusive; whole when the sink cannot tell (the whole screen).
+struct Extent {
+    uint64_t handle = 0;
+    bool whole = true;
+    uint32_t left = 0, top = 0, right = 0, bottom = 0;
+};
+
 class Sink {
 public:
     virtual ~Sink() = default;
@@ -134,6 +143,21 @@ public:
     virtual void zpd_report(uint64_t /*ended*/, uint64_t /*next*/) {}
     // The samples of the reports whose counts are in since the last poll.
     virtual void zpd_poll(std::vector<std::pair<uint64_t, uint64_t>> & /*resolved*/) {}
+    // Screen extents (EVENT_WRITE_EXT; ScreenExtents::Measured). Whether the
+    // sink bounds what its draws rasterize; if not, every report is the
+    // whole screen, as Xenia writes.
+    virtual bool measures_extents() { return false; }
+    // SCREEN_EXT_INIT: the draws from here count for the next report.
+    virtual void extent_init() {}
+    // SCREEN_EXT_RPT: the draws since the last init end a report, answered
+    // once through extent_poll; 0: none (the whole screen).
+    virtual uint64_t extent_report() { return 0; }
+    // The reports so far answered, waiting for the GPU if it must (before an
+    // interrupt or a wait, after which the CPU may read them).
+    virtual void extent_wait() {}
+    virtual void extent_poll(std::vector<Extent> & /*resolved*/) {}
+    // VIZ_QUERY: query id (0-63) begins, or ends
+    virtual void viz_query(uint32_t /*id*/, bool /*end*/) {}
 };
 
 // What EVENT_WRITE_ZPD's occlusion query reports hold (Xenia's
@@ -146,6 +170,16 @@ enum class OcclusionQueries {
     // once with a guess (the last count at that address, or one sample) and
     // again when the counts are in (Xenia's "fast", its default)
     Fast,
+};
+
+// What EVENT_WRITE_EXT's screen extent reports hold.
+enum class ScreenExtents {
+    // the whole of the largest texture, 8192 pixels square (Xenia's answer)
+    Whole,
+    // that at once, then the bounds of what the report's draws rasterized
+    // once the sink has measured them, where it measures (beyond Xenia):
+    // ready before the next interrupt or wait the CPU could read them after
+    Measured,
 };
 
 // What the command processor counts, read from any thread.
@@ -244,6 +278,9 @@ public:
     // What occlusion query reports hold; set before the processor runs.
     void set_occlusion_queries(OcclusionQueries mode) { occlusion_ = mode; }
     OcclusionQueries occlusion_queries() const { return occlusion_; }
+    // What screen extent reports hold; set before the processor runs.
+    void set_screen_extents(ScreenExtents mode) { extents_ = mode; }
+    ScreenExtents screen_extents() const { return extents_; }
 
 private:
     // a buffer being read: a ring (the primary buffer) or a straight run (an
@@ -324,6 +361,15 @@ private:
         uint64_t speculative_value = 0; // the counter the guess wrote
         uint64_t speculative_delta = 0;
     };
+    // Screen extents measured (ScreenExtents::Measured): the reports
+    // waiting for the sink's answer, and the latest report at each address
+    // (an answer only lands where no later report has written since)
+    ScreenExtents extents_ = ScreenExtents::Measured;
+    std::unordered_map<uint64_t, uint32_t> extent_reports_; // handle to address
+    std::unordered_map<uint32_t, uint64_t> extent_latest_;  // address to handle
+    std::vector<Extent> extent_resolved_;
+    void write_extent(uint32_t address, const uint16_t (&extents)[6]);
+    void poll_extents(bool wait);
     OcclusionQueries occlusion_ = OcclusionQueries::Fake;
     std::deque<ZpdReport> zpd_reports_;
     uint64_t zpd_current_ = 0, zpd_next_ = 1;

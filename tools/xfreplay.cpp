@@ -18,7 +18,7 @@
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
 //            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
 //            [--stand-in skip|placeholder|library] [--linked-pipelines]
-//            [--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round]
+//            [--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] [--depth-float24-round]
 //            [--depth-float24-convert] [--no-gamma-unorm16]
 //            [--texture-memory soft,hard[,lifetime]] [-v]
 
@@ -44,7 +44,8 @@ int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
                          "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
                          "[--stand-in skip|placeholder|library] [--linked-pipelines] "
-                         "[--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] "
+                         "[--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] "
+                         "[--depth-float24-round] "
                          "[--depth-float24-convert] [--no-gamma-unorm16] "
                          "[--texture-memory soft,hard[,lifetime]] [--scale percent] [--min-scalable pixels] [-v]\n");
     return 2;
@@ -94,6 +95,9 @@ int main(int argc, char **argv) {
             options.linked_pipelines_only = true;
         // occlusion query reports with the GPU's counts (else the fake ones)
         else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
+        // screen extent reports as Xenia answers them, the whole screen
+        else if (a == "--whole-extents")
+            options.screen_extents = xf::gpu::ScreenExtents::Whole;
         // Xenia's depth_float24_round
         else if (a == "--depth-float24-round") options.depth_float24_round = true;
         // Xenia's depth_float24_convert_in_pixel_shader
@@ -184,6 +188,13 @@ int main(int argc, char **argv) {
     if (report.zpd_reports)
         std::printf("  occlusion: %llu queries for %llu reports\n", (unsigned long long)report.occlusion_queries,
                     (unsigned long long)report.zpd_reports);
+    if (report.viz_queries)
+        std::printf("  VIZ queries: %llu, %llu predicating %llu draws on the GPU\n",
+                    (unsigned long long)report.viz_queries, (unsigned long long)report.viz_armed,
+                    (unsigned long long)report.viz_predicated);
+    if (report.extent_reports)
+        std::printf("  screen extents: %llu reports, %llu bounded\n", (unsigned long long)report.extent_reports,
+                    (unsigned long long)report.extent_bounded);
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)
         std::printf("  approx  %6llu  %s\n", (unsigned long long)n, what.c_str());

@@ -329,6 +329,11 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     const char *queries = std::getenv("XF_OCCLUSION_QUERIES");
     processor.set_occlusion_queries(queries && std::string(queries) == "fake" ? gpu::OcclusionQueries::Fake
                                                                               : gpu::OcclusionQueries::Fast);
+    // screen extents: the bounds of what the draws rasterized (beyond
+    // Xenia); XF_SCREEN_EXTENTS=whole keeps Xenia's whole screen
+    const char *extents = std::getenv("XF_SCREEN_EXTENTS");
+    processor.set_screen_extents(extents && std::string(extents) == "whole" ? gpu::ScreenExtents::Whole
+                                                                            : gpu::ScreenExtents::Measured);
     // when the CPU sees what resolves wrote (Xenia's readback_resolve):
     // XF_READBACK_RESOLVE=none (the default, as Xenia's), fast or full
     if (const char *mode = std::getenv("XF_READBACK_RESOLVE")) {

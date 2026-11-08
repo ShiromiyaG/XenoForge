@@ -1221,8 +1221,8 @@ submission is done; draws after a swap count for no report until the next
 event, as Xenia's EndZPDFrame; a draw that finds no free query makes its
 report at least one sample. The race frame: 315 reports, 235 queries,
 validation clean, the picture unchanged. Not done: Xenia's "strict" mode
-(the guest waiting on the real count), VIZ queries, the hybrid ZFail and
-Total counts.
+(the guest waiting on the real count), the hybrid ZFail and Total counts.
+VIZ queries: "Screen extents and VIZ queries (2026-11-08)" below.
 
 **Shaders**: unnormalized cube map coordinates are translated as Xenia's
 `ProcessTextureFetchInstruction` takes them (the face's xy divided by its
@@ -1833,14 +1833,10 @@ nothing else.
   from the register where the device has wide lines
   (`XF_VK_NO_WIDE_LINES=1` turns them off), clamped to its range; without
   them one pixel, as Xenia draws every line (a TODO there), counted.
-- **Screen extents and VIZ queries** stay as Xenia's defaults: every
-  EVENT_WRITE_EXT is answered with the whole screen, draws predicated on a
-  VIZ query and VIZ survey draws are drawn (counted: "draws predicated on a
-  VIZ query", "VIZ survey draws"). Xenia's `occlusion_query_viz` (off by
-  default: coarse occlusion queries feeding VIZ predicates, survey draws
-  skipped in copy mode) is not done; real extents (the pixels and depths
-  the draws between two events cover) would be a pass over the occlusion
-  queries' draw ranges, and how hi-Z interplays with them wants a console.
+- **Screen extents and VIZ queries**: measured and predicated on the GPU
+  since 2026-11-08 ("Screen extents and VIZ queries (2026-11-08)" below);
+  `XF_SCREEN_EXTENTS=whole` (xfreplay `--whole-extents`) and
+  `XF_VK_NO_CONDITIONAL_RENDERING=1` go back to Xenia's defaults.
 
 ## Exact EDRAM through fragment shader interlock (2026-11-06)
 
@@ -2298,8 +2294,64 @@ interpreter Xenia's draw extent estimator uses, too slow for 1,219 draws of
 hundreds of vertices). The rounding of the 8-pixel units and the z range
 (Xenia writes 0 and 1) are hardware questions; a bounding box rounded
 outwards is safe, since a wider extent only keeps a draw in more bins.
-Open; the gain is only measurable live in game G, whose library is not
-built for this interface.
+Done 2026-11-08 on the GPU (next section).
+
+## Screen extents and VIZ queries (2026-11-08)
+
+**Screen extents** (`gpu::ScreenExtents::Measured`, the default;
+`XF_SCREEN_EXTENTS=whole` live, `xfreplay --whole-extents`, keep Xenia's
+whole screen). Beyond Xenia, which answers every `EVENT_WRITE_EXT` with the
+whole 8192-pixel square. The processor still writes that at once; the draws
+between a `SCREEN_EXT_INIT` and its `SCREEN_EXT_RPT` run a vertex shader
+variant (`VertexOptions::extents`) whose every final host position takes the
+report's rectangle out to it: xy over w, clamped to the viewport's NDC
+square, through the viewport (system constants 10 and 11) to console pixels,
+floor and ceiling, into four atomic maxima a report in a device-local buffer
+(set 0, binding 7; in host-visible memory the atomics cost game G's frame
+ten times its GPU time). A position with w not above 0 or not a number takes
+the whole viewport (its primitive's clipped part can reach any edge). The
+buffer is copied back as the submission ends; the processor writes the
+bounds (8-pixel units, outwards, plus a pixel and half a wide line's width)
+where no later report has written since, and before the next `INTERRUPT` or
+unmatched `WAIT_REG_MEM` it waits for the GPU (`Sink::extent_wait`): the
+CPU reads them in its interrupt. A report is the whole screen when a draw in
+it was not bounded (skipped, written nothing, points or rectangles a
+geometry shader expands, a submission begun inside it). Not clipped by the
+scissor: game G's first pass runs with tile 0's window scissor (rows
+0-511) while its extents must cover the whole screen. Extents are in the
+render target's pixels (the window offset applied); with game G's first pass
+at offset 0 the two agree; which one the console reports, the rounding and
+the z range (0-1, as Xenia) are hardware questions.
+
+Game G's frames 850/950: 1,219/1,220 reports a frame, 1,212/1,213 bounded;
+of those 1,022 lie in tile 0 alone, 110 in tile 1 alone, 80 in both. The
+CPU's patch of `SET_BIN_MASK_LO` cannot run in a replay, so it was
+simulated by a throwaway change (a second-pass draw skipped where its
+first-pass report misses the second tile's scissor rows): 650 of the 1,438
+predicated second-pass draws skipped, the picture unchanged (0.112/0.118
+of 255 off Xenia's ROV picture, as before). Game B's menus: 16 reports a
+frame, nearly all full-screen quads. What the waits at the interrupts cost
+live is to be measured (game G's library is not built for this interface).
+
+**VIZ queries** (Xenia's `occlusion_query_viz`, off by default there; here
+where the device has `VK_EXT_conditional_rendering`,
+`XF_VK_NO_CONDITIONAL_RENDERING=1` off). A query's survey draws
+(`PA_SC_VIZ_QUERY` viz_query_ena with kill_pix_post_hi_z) count samples in
+a host occlusion query of their own (host path) or a counter of the
+interlock path, never for an occlusion report (Xenia: "surveys never count
+for a report"); at the query's end the count is copied to the ID's word,
+and the draws whose DRAW_INDX token names the ID (bit 8) run under
+conditional rendering on it. As Xenia's: a query with no survey draw drops
+its draws; one whose surveys were not all measured in one count is visible
+(drawn); draws exporting memory are never predicated. Unlike Xenia, a
+survey is not normalized (its writes turned off): one that writes color,
+depth or stencil, or runs with hi-Z off (Xenia then drops the depth test;
+ours would keep it and could undercount), is not measured, so its query
+stays visible. Game G's 850/950: 58 queries a frame (29 a tile pass), all
+measured, 422 predicated draws of which the GPU skipped 216 (28 queries
+with no sample; counted with a throwaway read-back), the picture unchanged
+(FSI 0.112/0.118; host 0.167/0.175, 850 checked against the host path without
+conditional rendering).
 
 **Game G's frames 850 and 950, what is left** (0.149% and 0.150% of pixels
 off Xenia's ROV picture; Xenia's ROV and FSI pictures are 0.083% apart).
