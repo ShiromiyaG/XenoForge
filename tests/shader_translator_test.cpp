@@ -89,6 +89,15 @@ void translates(const ParsedShader &shader, const std::string &name) {
             CHECK(t.ok());
             if (t.ok()) CHECK(validates(t.spirv, name + "_float24_" + std::to_string(mode)));
         }
+    // a point list's: the pixel parameters' sprite coordinates read from
+    // the point expansion (shader::PixelOptions::point_coordinates)
+    if (shader.type == ShaderType::Pixel) {
+        shader::PixelOptions options;
+        options.point_coordinates = true;
+        auto t = shader::translate(shader, shader::Stage::Pixel, {}, options);
+        CHECK(t.ok());
+        if (t.ok()) CHECK(validates(t.spirv, name + "_point_coordinates"));
+    }
 #ifdef XF_EDRAM_FSI_LIBRARY
     // the interlock path: the output merger taken in (edram_fsi.frag's
     // library), under pixel and sample interlock, with centroids

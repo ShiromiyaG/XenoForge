@@ -162,6 +162,12 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     v12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
     v12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
     v12.timelineSemaphore = VK_TRUE;
+    // optional: storage images updated after binding, for the textures a
+    // resolve writes as well as memory (the renderer's resolve targets;
+    // XF_VK_NO_RESOLVE_TARGETS=1 turns them off)
+    const char *no_targets = std::getenv("XF_VK_NO_RESOLVE_TARGETS");
+    if (has12.descriptorBindingStorageImageUpdateAfterBind && !(no_targets && no_targets[0] == '1'))
+        v12.descriptorBindingStorageImageUpdateAfterBind = d->storage_image_update_after_bind_ = true;
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &v12;
     // optional: geometry shaders (rectangle and point lists; without them
@@ -195,6 +201,10 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         d->line_width_range_[0] = props.limits.lineWidthRange[0];
         d->line_width_range_[1] = props.limits.lineWidthRange[1];
     }
+    // polygons as lines or points (PA_SU_SC_MODE_CNTL's polygon modes;
+    // without it they are filled, counted); XF_VK_NO_FILL_MODES=1 turns it off
+    if (has.features.fillModeNonSolid && !turned_off("XF_VK_NO_FILL_MODES"))
+        features.features.fillModeNonSolid = d->fill_mode_non_solid_ = true;
     features.features.depthClamp = VK_TRUE;
     features.features.sampleRateShading = VK_TRUE;
     features.features.independentBlend = VK_TRUE;
@@ -243,6 +253,8 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fsi{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     {
         const bool has_eds3 =
             has_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && !turned_off("XF_VK_NO_EDS3");
@@ -305,6 +317,23 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
             vkGetPhysicalDeviceProperties2(d->physical_, &query_locations);
             d->sample_locations_ = locations.sampleLocationSampleCounts;
             if (d->sample_locations_) enabled.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+        }
+        // VK_EXT_custom_border_color without a format: the textures' two
+        // YCbCr border colors, as Xenia's Vulkan texture cache takes them
+        // (XF_VK_NO_CUSTOM_BORDER=1 turns it off: transparent black, counted)
+        if (has_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME) && !turned_off("XF_VK_NO_CUSTOM_BORDER")) {
+            VkPhysicalDeviceCustomBorderColorFeaturesEXT has_border{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_border.pNext = &has_border;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_border);
+            if (has_border.customBorderColors && has_border.customBorderColorWithoutFormat) {
+                custom_border.customBorderColors = VK_TRUE;
+                custom_border.customBorderColorWithoutFormat = VK_TRUE;
+                *tail = &custom_border, tail = &custom_border.pNext;
+                enabled.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+                d->custom_border_color_ = true;
+            }
         }
         // (without fast linking a linked pipeline may cost as much as a whole
         // one, so the libraries would gain nothing)
@@ -396,7 +425,7 @@ void Device::destroy(Buffer &b) {
 
 Image Device::create_image(VkImageType type, VkFormat format, VkExtent3D extent, uint32_t levels, uint32_t layers,
                            VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags,
-                           VkFormat view_format) {
+                           VkFormat view_format, VkFormat view_format2) {
     Image im;
     im.format = format, im.extent = extent, im.levels = levels, im.layers = layers, im.samples = samples;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -410,14 +439,17 @@ Image Device::create_image(VkImageType type, VkFormat format, VkExtent3D extent,
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    // read through views of a second format too: mutable, the two formats
-    // listed (Vulkan 1.2's image format list, which lets a driver keep the
-    // image's compression where it can), as Xenia's Vulkan textures
-    const VkFormat formats[2] = {format, view_format};
+    // read through views of other formats too (one or two): mutable, the
+    // formats listed (Vulkan 1.2's image format list, which lets a driver
+    // keep the image's compression where it can), as Xenia's Vulkan textures
+    VkFormat formats[3] = {format};
+    uint32_t format_count = 1;
+    for (VkFormat f : {view_format, view_format2})
+        if (f != VK_FORMAT_UNDEFINED && f != format) formats[format_count++] = f;
     VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
-    if (view_format != VK_FORMAT_UNDEFINED && view_format != format) {
+    if (format_count > 1) {
         info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        list.viewFormatCount = 2;
+        list.viewFormatCount = format_count;
         list.pViewFormats = formats;
         info.pNext = &list;
     }

@@ -1561,7 +1561,15 @@ private:
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
     std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<RenderTarget>> targets_;
     std::map<std::array<uint32_t, 6>, std::unique_ptr<Texture>> textures_;
-    std::map<std::array<uint32_t, 8>, std::pair<VkSampler, uint32_t>> samplers_;
+    // the samplers by their parameters: the sampler, its slot in the
+    // bindless table, the last submission that used it
+    struct SamplerEntry {
+        VkSampler sampler = VK_NULL_HANDLE;
+        uint32_t index = 0;
+        uint64_t used_serial = 0;
+    };
+    std::map<std::array<uint32_t, 8>, SamplerEntry> samplers_;
+    std::vector<uint32_t> free_samplers_; // slots of samplers destroyed, to reuse
     std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> pipelines_;
 
     // submissions
@@ -1704,7 +1712,7 @@ Impl::~Impl() {
         for (auto &[k, p] : *table)
             for (VkPipeline pipe : {p->pipeline, p->stand_in})
                 if (pipe) vkDestroyPipeline(dev_, pipe, nullptr);
-    for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.first, nullptr);
+    for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.sampler, nullptr);
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
     for (auto &[k, t] : targets_) d_.destroy(t->image);
     for (auto &[k, t] : textures_) {
@@ -3451,16 +3459,41 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
         if (clamp[k] == 3 || clamp[k] == 5 || clamp[k] == 7) clamp[k] = d_.mirror_clamp_to_edge() ? 3 : 1;
         border |= clamp[k] == 6;
     }
-    uint32_t border_color = border ? fetch[5] & 3 : 0;
-    if (border_color >= 2) approximate("YCbCr border colors (transparent black)");
+    // the border color (dword 5 bits 0-1: black, white, and the two YCbCr
+    // blacks) and force_bc_w_to_max (bit 2: its alpha 1), where a clamp uses
+    // the border, as Xenia's texture caches take them; the YCbCr ones as a
+    // custom border color where the device has it, as Xenia's Vulkan cache
+    uint32_t border_color = border ? fetch[5] & 3 : 0, border_alpha = border ? (fetch[5] >> 2) & 1 : 0;
+    if (border_color >= 2 && !d_.custom_border_color())
+        approximate("YCbCr border colors (black: no custom border colors on the device)");
     if (d_.max_anisotropy() < 1.0f) aniso = 0;
-    std::array<uint32_t, 8> key = {clamp[0] | clamp[1] << 3 | clamp[2] << 6 | border_color << 9,
+    std::array<uint32_t, 8> key = {clamp[0] | clamp[1] << 3 | clamp[2] << 6 | border_color << 9 | border_alpha << 11,
                                    mag, min, mip, aniso, mip_min, 0, 0};
     auto it = samplers_.find(key);
-    if (it != samplers_.end()) return it->second.second;
-    if (next_sampler_ >= sampler_capacity_) {
-        approximate("samplers past the bindless table's size (the stand-in's used)");
-        return 0;
+    if (it != samplers_.end()) {
+        it->second.used_serial = submission_serial();
+        return it->second.index;
+    }
+    // The table full: the sampler least recently used by a submission the
+    // GPU has finished is destroyed and its slot taken, as Xenia's texture
+    // caches keep their samplers within the device's limit (the binding is
+    // updated while unused submissions are pending). Only with every one
+    // used by a submission still running is the stand-in's taken, counted.
+    if (next_sampler_ >= sampler_capacity_ && free_samplers_.empty()) {
+        while (finish_oldest(false)) {}
+        auto oldest = samplers_.end();
+        for (auto s = samplers_.begin(); s != samplers_.end(); ++s)
+            if (s->second.used_serial <= done_serial_ &&
+                (oldest == samplers_.end() || s->second.used_serial < oldest->second.used_serial))
+                oldest = s;
+        if (oldest == samplers_.end()) {
+            approximate("samplers past the bindless table's size, all in use (the stand-in's used)");
+            return 0;
+        }
+        vkDestroySampler(dev_, oldest->second.sampler, nullptr);
+        free_samplers_.push_back(oldest->second.index);
+        samplers_.erase(oldest);
+        report_.samplers_reused++;
     }
     static const VkSamplerAddressMode modes[8] = {
         VK_SAMPLER_ADDRESS_MODE_REPEAT,          VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
@@ -3480,10 +3513,31 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     }
     info.minLod = float(mip_min);
     info.maxLod = mip == 2 ? info.minLod + 0.25f : VK_LOD_CLAMP_NONE; // 2: the base map alone
-    info.borderColor = border_color == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    VkSamplerCustomBorderColorCreateInfoEXT custom{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
+    if (border_color == 1) {
+        info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    } else if (border_color >= 2 && d_.custom_border_color()) {
+        // (Cr, Y, Cb) and (Y, Cr, Cb) unsigned, Y 0 and the chroma 0.5
+        float *c = custom.customBorderColor.float32;
+        c[0] = border_color == 2 ? 0.5f : 0.0f;
+        c[1] = border_color == 2 ? 0.0f : 0.5f;
+        c[2] = 0.5f;
+        c[3] = border_alpha ? 1.0f : 0.0f;
+        custom.format = VK_FORMAT_UNDEFINED;
+        info.pNext = &custom;
+        info.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+    } else {
+        info.borderColor = border_alpha ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    }
     VkSampler s = VK_NULL_HANDLE;
     vkCreateSampler(dev_, &info, nullptr, &s);
-    uint32_t index = next_sampler_++;
+    uint32_t index;
+    if (!free_samplers_.empty()) {
+        index = free_samplers_.back();
+        free_samplers_.pop_back();
+    } else {
+        index = next_sampler_++;
+    }
     VkDescriptorImageInfo image{s, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = bindless_;
@@ -3493,7 +3547,7 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     write.pImageInfo = &image;
     vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
-    samplers_[key] = {s, index};
+    samplers_[key] = {s, index, submission_serial()};
     return index;
 }
 
@@ -4527,7 +4581,8 @@ std::unique_ptr<PipelineDesc> Impl::undescribe(std::span<const uint32_t> words, 
                 shader::PixelOptions o;
                 o.depth_float24 = uint8_t(form & 0xFF);
                 o.centroid = uint16_t(form >> 8);
-                o.fsi = uint8_t((form >> 24) & 0x7F);
+                o.fsi = uint8_t((form >> 24) & 0x3F);
+                o.point_coordinates = (form >> 30) & 1;
                 if (o.fsi) o.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
                 if ((o.key() | 1u << 31) != form) return fail("a pixel shader's form unknown here");
                 st.module = pixel_module(*s, o, reason);
@@ -4799,6 +4854,12 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
         if (!storage.has_shader(hash)) out.extra_new++;
         load_shader(type, code);
         Shader *sh = shader(hash);
+        // a vertex shader whose fetches Direct3D fills in from the vertex
+        // declaration at bind time: the copy a draw runs is another shader
+        if (sh && xf::ucode::awaits_vertex_declaration(sh->parsed)) {
+            out.extra_undeclared++;
+            continue;
+        }
         if (!sh || !translate(*sh, why)) out.extra_failed++;
     }
     if (cancelled()) return error = "cancelled", false;
@@ -5689,8 +5750,7 @@ void Impl::draw(const gpu::Draw &d) {
         if (position < 16) {
             sys.flags[1] |= 1u << 8 | position << 9;
             if (points) {
-                sys.flags[1] |= 1u << 13;
-                approximate("point sprite coordinates in the pixel parameters (0)");
+                sys.flags[1] |= 1u << 13; // the sprite's coordinates: PixelOptions::point_coordinates
             } else if (polygonal) {
                 sys.flags[1] |= 1u << 15;
             } else if (primitive == 2 || primitive == 3 || primitive == 12) {
@@ -5813,6 +5873,27 @@ void Impl::draw(const gpu::Draw &d) {
     // the vertex shader's host form, with a tessellated draw's hull shader
     // and patch size
     uint32_t host_key = host_vertex.key() | hull << 16 | patch_points << 20;
+    // The polygon modes (PA_SU_SC_MODE_CNTL's poly_mode bits 3-4, dual mode
+    // 1; the front's and back's types in bits 5-7 and 8-10: 0 points, 1
+    // lines, 2 triangles), as Xenia's Vulkan pipeline cache takes them:
+    // Vulkan has one mode for both faces, so the lowest type of the faces
+    // not culled (the most deliberate one: points, then lines, then fill).
+    VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
+    if (primitive >= 4 && !rectangles) {
+        const uint32_t sc_mode = regs_[r::PA_SU_SC_MODE_CNTL];
+        if (((sc_mode >> 3) & 3) == 1) {
+            uint32_t type = 2;
+            if (!(sc_mode & 1)) type = std::min(type, (sc_mode >> 5) & 7);
+            if (!(sc_mode & 2)) type = std::min(type, (sc_mode >> 8) & 7);
+            if (type < 2) {
+                if (d_.fill_mode_non_solid())
+                    polygon_mode = type == 0 ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_LINE;
+                else
+                    approximate("polygon modes other than fill (the device has no fillModeNonSolid)");
+            }
+        }
+    }
+    host_key |= uint32_t(polygon_mode) << 24;
     std::vector<uint32_t> key = {uint32_t(vertex_hash_),
                                  uint32_t(vertex_hash_ >> 32),
                                  ps ? uint32_t(pixel_hash_) : 0,
@@ -5868,6 +5949,10 @@ void Impl::draw(const gpu::Draw &d) {
         else if (sample_control == 2)
             centroid = ~(regs_[r::SQ_INTERPOLATOR_CNTL] >> 16) & 0xFFFF;
     }
+    // a point list's pixel parameters take the sprite's coordinates from the
+    // point expansion (Xenia's param_gen_point)
+    const bool point_coordinates =
+        ps && points && ((regs_[reg::SQ_PROGRAM_CNTL] >> 18) & 1) && ((regs_[r::SQ_CONTEXT_MISC] >> 8) & 0xFF) < 16;
     bool sample_shading = false;
     if (fsi_ && !export_only) {
         // the interlock path: the guest's shader with the output merger taken
@@ -5876,6 +5961,7 @@ void Impl::draw(const gpu::Draw &d) {
             shader::PixelOptions options;
             options.centroid = uint16_t(centroid);
             options.fsi = uint8_t(fsi_);
+            options.point_coordinates = point_coordinates;
             options.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
             fragment = pixel_module(*ps, options, why);
             if (!fragment) return skip("pixel shader: " + why);
@@ -5887,8 +5973,12 @@ void Impl::draw(const gpu::Draw &d) {
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
             return;
         }
-    } else if (ps && (float24_convert || centroid)) {
-        fragment = pixel_module(*ps, {uint8_t(float24_mode), uint16_t(centroid)}, why);
+    } else if (ps && (float24_convert || centroid || point_coordinates)) {
+        shader::PixelOptions options;
+        options.depth_float24 = uint8_t(float24_mode);
+        options.centroid = uint16_t(centroid);
+        options.point_coordinates = point_coordinates;
+        fragment = pixel_module(*ps, options, why);
         if (!fragment) return skip("pixel shader: " + why);
     }
     // the interlock path's state as the pipeline's specialization
@@ -5913,7 +6003,8 @@ void Impl::draw(const gpu::Draw &d) {
         // position; the depth-only one by the pipeline's sample shading)
         sample_shading = msaa && fragment && !ps;
     }
-    key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) | centroid << 16);
+    key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) |
+                  (point_coordinates ? 16u : 0u) | centroid << 16);
     VkPipelineShaderStageCreateInfo stages[4] = {};
     uint32_t stage_count = 0;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
@@ -5959,8 +6050,8 @@ void Impl::draw(const gpu::Draw &d) {
     if (triangles) {
         raster.cullMode = (sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0);
         raster.frontFace = sc_mode & 4 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        if ((sc_mode >> 3) & 3) approximate("polygon modes other than fill");
     }
+    raster.polygonMode = polygon_mode; // (above, with the key)
     raster.depthClampEnable = (regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1;
     raster.depthBiasEnable = depth ? VK_TRUE : VK_FALSE; // the polygon offset, set at the draw
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};

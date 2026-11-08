@@ -94,6 +94,13 @@ public:
     bool wide_lines() const { return wide_lines_; }
     float min_line_width() const { return wide_lines_ ? line_width_range_[0] : 1.0f; }
     float max_line_width() const { return wide_lines_ ? line_width_range_[1] : 1.0f; }
+    // polygons drawn as lines or points (the guest's polygon modes)
+    bool fill_mode_non_solid() const { return fill_mode_non_solid_; }
+    // samplers with a border color of their own (VK_EXT_custom_border_color
+    // without a format), for the textures' YCbCr border colors
+    bool custom_border_color() const { return custom_border_color_; }
+    // storage image descriptors updated after binding (the resolve targets)
+    bool storage_image_update_after_bind() const { return storage_image_update_after_bind_; }
     // VK_EXT_extended_dynamic_state3's blend enables, blend equations and
     // color write masks set at the draw (all three, or none of them)
     bool dynamic_blend() const { return dynamic_blend_; }
@@ -117,7 +124,7 @@ public:
     // with the two listed, as Xenia's textures with a signed view)
     Image create_image(VkImageType type, VkFormat format, VkExtent3D extent, uint32_t levels, uint32_t layers,
                        VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags = 0,
-                       VkFormat view_format = VK_FORMAT_UNDEFINED);
+                       VkFormat view_format = VK_FORMAT_UNDEFINED, VkFormat view_format2 = VK_FORMAT_UNDEFINED);
     void destroy(Image &image);
     // The image pool (Xenia's Vulkan backend has VMA place its images in
     // larger blocks of memory): images lie in blocks of device memory shared
@@ -171,7 +178,8 @@ private:
     bool precise_occlusion_ = false;
     bool geometry_shader_ = false;
     bool tessellation_shader_ = false;
-    bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false;
+    bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false, fill_mode_non_solid_ = false;
+    bool custom_border_color_ = false, storage_image_update_after_bind_ = false;
     float line_width_range_[2] = {1.0f, 1.0f};
     bool dynamic_blend_ = false, pipeline_library_ = false;
     uint32_t fragment_shader_interlock_ = 0;

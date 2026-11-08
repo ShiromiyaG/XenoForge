@@ -698,6 +698,19 @@ uint32_t AluInstruction::memexport_stream_constant() const {
     return UINT32_MAX;
 }
 
+bool awaits_vertex_declaration(const ParsedShader &shader) {
+    if (shader.type != ShaderType::Vertex) return false;
+    for (const ControlFlow &cf : shader.control_flow) {
+        const Exec *exec = std::get_if<Exec>(&cf.instruction);
+        if (!exec) continue;
+        for (const ExecSlot &slot : exec->slots) {
+            const auto *v = std::get_if<VertexFetchInstruction>(&slot.instruction);
+            if (v && !v->is_mini_fetch && v->data_format == 0 && v->stride == 0) return true;
+        }
+    }
+    return false;
+}
+
 ParsedShader parse_shader(ShaderType type, std::span<const uint32_t> dwords) {
     ParsedShader s;
     s.type = type;

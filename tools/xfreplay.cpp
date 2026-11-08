@@ -138,9 +138,11 @@ int main(int argc, char **argv) {
     std::printf("  packets %llu, draws %llu: drawn %llu, resolves %llu, swaps %llu\n", (unsigned long long)report.packets,
                 (unsigned long long)report.draws, (unsigned long long)report.drawn, (unsigned long long)report.resolves,
                 (unsigned long long)report.swaps);
-    std::printf("  made: %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
+    std::printf("  made: %llu render targets, %llu textures, %llu pipelines, %llu shaders (%llu samplers' slots "
+                "reused)\n",
                 (unsigned long long)report.render_targets, (unsigned long long)report.textures,
-                (unsigned long long)report.pipelines, (unsigned long long)report.shaders);
+                (unsigned long long)report.pipelines, (unsigned long long)report.shaders,
+                (unsigned long long)report.samplers_reused);
     std::printf("  pipelines: %.3f s making them, %llu libraries, %llu linked, %llu placeholders, %llu draws by a "
                 "stand-in\n",
                 report.pipeline_seconds, (unsigned long long)report.pipeline_libraries,

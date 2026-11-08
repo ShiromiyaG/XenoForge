@@ -130,9 +130,15 @@ struct VertexOptions {
 struct PixelOptions {
     uint8_t depth_float24 = 0;
     uint16_t centroid = 0;
-    uint8_t fsi = 0;
+    uint8_t fsi = 0; // up to 63
+    // a point list's: the pixel parameters' z and w are the sprite's
+    // coordinates, read from location 17 (the point expansion's), as
+    // Xenia's param_gen_point
+    bool point_coordinates = false;
     std::span<const uint32_t> edram_library; // with fsi; not part of the key
-    uint32_t key() const { return depth_float24 | uint32_t(centroid) << 8 | uint32_t(fsi) << 24; }
+    uint32_t key() const {
+        return depth_float24 | uint32_t(centroid) << 8 | uint32_t(fsi) << 24 | uint32_t(point_coordinates) << 30;
+    }
 };
 Translation translate(const ucode::ParsedShader &shader, Stage stage, const VertexOptions &vertex = {},
                       const PixelOptions &pixel = {});

@@ -165,8 +165,11 @@ private:
     }
     Id load_storage(const Operand &o) {
         if (o.source == StorageSource::Register) return load(vec4_, register_pointer(o.index, o.addressing));
+        // (the microcode's ALU operands are registers or float constants by
+        // their source select bit, all ucode_parse makes of them; the fetch
+        // constants are the fetches' operands only, as in Xenia's parser)
         if (o.source != StorageSource::ConstantFloat) {
-            unsupported("an ALU operand from a fetch constant");
+            unsupported("an ALU operand neither a register nor a float constant");
             return zero4_;
         }
         if (o.addressing == StorageAddressing::Absolute) {
@@ -1899,6 +1902,15 @@ void Translator::main_vertex() {
     // after the interpolators
     Id point_size = global(float_, spv::StorageClass::Output, "point_size");
     m_.decorate(point_size, spv::Decoration::Location, {16});
+    // an expanded point's sprite coordinates (0 to 1 from the left and top
+    // corners), for the pixel parameters (PixelOptions::point_coordinates),
+    // as Xenia's xe_out_point_coordinates; point_list.geom writes the same
+    Id point_coordinates = 0;
+    if (points) {
+        point_coordinates = global(m_.type_vector(float_, 2), spv::StorageClass::Output, "point_coordinates");
+        m_.decorate(point_coordinates, spv::Decoration::Location, {17});
+        m_.decorate(point_coordinates, spv::Decoration::Invariant);
+    }
     // A shader that exports memory is drawn alone as a point list when the
     // draw rasterizes nothing (renderer.cpp), and Vulkan without
     // maintenance5 wants a point size from it then: 1.
@@ -2167,6 +2179,8 @@ void Translator::main_vertex() {
             Id y = exact(Op::OpFAdd, float_,
                          {comp(p, 1), select(float_, side(1), ry, exact(Op::OpFNegate, float_, {ry}))});
             p = vec4_of(x, y, comp(p, 2), w);
+            store(point_coordinates, m_.op(Op::OpCompositeConstruct, m_.type_vector(float_, 2),
+                                           {select(float_, side(2), f(1), f(0)), select(float_, side(1), f(1), f(0))}));
             if (planes) {
                 // the center's distances, and the corner's: its offset from
                 // the center taken back to the guest's clip space through the
@@ -2267,6 +2281,11 @@ void Translator::main_pixel() {
     }
     Id front_facing = global(bool_, spv::StorageClass::Input, "front_facing");
     m_.decorate(front_facing, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FrontFacing)});
+    Id point_coordinates = 0;
+    if (pixel_.point_coordinates) {
+        point_coordinates = global(m_.type_vector(float_, 2), spv::StorageClass::Input, "point_coordinates");
+        m_.decorate(point_coordinates, spv::Decoration::Location, {17});
+    }
     // for alpha to coverage, when the shader writes oC0
     bool writes_color_0 = false;
     for (const ControlFlow &cf : s_.control_flow)
@@ -2306,8 +2325,10 @@ void Translator::main_pixel() {
     // SQ_CONTEXT_MISC names, by the system flags' y (bit 8 on, bits 9-12
     // the interpolator, bit 13 a point, 14 a line, 15 a polygon): x the
     // pixel's column (floored), negative for a polygon's back face; y its
-    // row, negative for a point; z -0 for a line, else 0 (a point's sprite
-    // coordinates are not made: 0), w 0.
+    // row, negative for a point; z -0 for a line, else 0, w 0; for a point
+    // list (PixelOptions::point_coordinates) z and w the sprite's
+    // coordinates, clamped to 0-1 (NClamp: where the pixel's center is not
+    // covered they are extrapolated).
     {
         Id flags = m_.op(Op::OpCompositeExtract, uint_,
                          {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
@@ -2329,13 +2350,22 @@ void Translator::main_pixel() {
             x = select(float_, back, negated(x), x);
             y = select(float_, flag(13), negated(y), y);
             Id z = select(float_, flag(14), negated(f(0)), f(0));
+            Id w = f(0);
+            if (point_coordinates) {
+                Id vec2 = m_.type_vector(float_, 2);
+                Id zero2 = m_.op(Op::OpCompositeConstruct, vec2, {f(0), f(0)});
+                Id one2 = m_.op(Op::OpCompositeConstruct, vec2, {f(1), f(1)});
+                Id st = glsl(GLSLstd450NClamp, vec2, {load(vec2, point_coordinates), zero2, one2});
+                z = m_.op(Op::OpCompositeExtract, float_, {st, 0});
+                w = m_.op(Op::OpCompositeExtract, float_, {st, 1});
+            }
             Id index = m_.op(Op::OpBitFieldUExtract, uint_, {flags, u(9), u(4)});
             // into the register the index names, each by a constant index: a
             // variable index into the registers made the host's compiler keep
             // the whole array in memory, every access of every pixel shader a
             // memory access (the post-processing passes of a UE3 game's race
             // took 5 ms of the GPU each at 1280x720, 0.2 ms without)
-            Id value = vec4_of(x, y, z, f(0));
+            Id value = vec4_of(x, y, z, w);
             for (uint32_t k = 0; k < 16; k++) {
                 Id pointer = m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))});
                 Id here = m_.op(Op::OpIEqual, bool_, {index, u(k)});

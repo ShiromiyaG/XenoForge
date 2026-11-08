@@ -48,11 +48,11 @@ std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
                   r.cache_read / 1024.0, r.cache_written / 1024.0);
     lines.push_back(line);
     std::snprintf(line, sizeof(line),
-                  "shaders: %llu from runs (%llu not translated), %llu from the disc (%llu not met in runs, %llu not "
-                  "translated)",
+                  "shaders: %llu from runs (%llu not translated), %llu from the disc (%llu not met in runs, %llu "
+                  "vertex shaders awaiting a vertex declaration, %llu not translated)",
                   (unsigned long long)r.shaders, (unsigned long long)r.shaders_failed,
                   (unsigned long long)r.extra_shaders, (unsigned long long)r.extra_new,
-                  (unsigned long long)r.extra_failed);
+                  (unsigned long long)r.extra_undeclared, (unsigned long long)r.extra_failed);
     lines.push_back(line);
     std::snprintf(line, sizeof(line),
                   "pipelines: %llu described by runs (%llu made before, %llu not made here); made %llu libraries "

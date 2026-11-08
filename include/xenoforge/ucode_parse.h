@@ -315,6 +315,15 @@ struct ParsedShader {
 // dwords in host order: a guest's big-endian words already swapped.
 ParsedShader parse_shader(ShaderType type, std::span<const uint32_t> dwords);
 
+// A vertex shader as Direct3D keeps it in a shader container, before a
+// draw binds it: a full vertex fetch with no format (0, which no vertex
+// format is) and no stride. Direct3D writes each fetch's format, stride
+// and offset into the microcode from the vertex declaration when it binds
+// the shader (the container lists the fetches' addresses by usage, which
+// XenosRecomp's shader_recompiler.cpp reads for the same reason), so what
+// the GPU runs is that patched copy, under another hash.
+bool awaits_vertex_declaration(const ParsedShader &shader);
+
 // The microcode as Xenia disassembles it (Shader::AnalyzeUcode), character for character.
 std::string disassemble(const ParsedShader &shader);
 

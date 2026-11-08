@@ -50,6 +50,7 @@ struct Report {
     uint64_t resolves = 0, swaps = 0; // draws in copy mode; XE_SWAP packets
     uint64_t frames = 0;              // front buffers read back (the swaps asked for)
     uint64_t render_targets = 0, textures = 0, pipelines = 0, shaders = 0; // textures: loads
+    uint64_t samplers_reused = 0; // samplers destroyed to free their slot in the full bindless table
     // The texture cache: the textures it holds now and the GPU memory their
     // images take (the most it took), those destroyed by the memory limits
     // (Options::texture_memory_*) and to make room in a full bindless table,
@@ -372,6 +373,10 @@ struct PrecompileReport {
     uint64_t cache_read = 0, cache_written = 0; // bytes
     uint64_t shaders = 0, shaders_failed = 0;   // from the storage, translated or not
     uint64_t extra_shaders = 0, extra_failed = 0, extra_new = 0; // the extra ones; not in the storage
+    // extra vertex shaders as Direct3D keeps them before binding, their
+    // fetches' formats left for the vertex declaration
+    // (ucode::awaits_vertex_declaration): not translated, not failures
+    uint64_t extra_undeclared = 0;
     uint64_t descriptions = 0, descriptions_failed = 0, descriptions_done_before = 0;
     uint64_t libraries = 0, libraries_failed = 0, pipelines = 0, pipelines_failed = 0;
     double seconds = 0, driver_seconds = 0; // in all; the workers' time making them

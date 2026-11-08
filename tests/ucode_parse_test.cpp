@@ -216,11 +216,24 @@ void reads_past_the_end_as_zeros() {
     CHECK(s.reads_past_end && std::get<Exec>(s.control_flow[0].instruction).slots.size() == 2);
 }
 
+// A shader container's vertex shader before Direct3D binds it: the full
+// fetch's format and stride left zero for the vertex declaration.
+void tells_a_vertex_shader_awaiting_its_declaration() {
+    std::vector<uint32_t> d = vertex_shader();
+    CHECK(!awaits_vertex_declaration(parse_shader(ShaderType::Vertex, d)));
+    const size_t full = 5 * 3; // instruction 5, the full fetch
+    d[full + 1] &= ~(0x3Fu << 16);
+    d[full + 2] &= ~0xFFu;
+    CHECK(awaits_vertex_declaration(parse_shader(ShaderType::Vertex, d)));
+    CHECK(!awaits_vertex_declaration(parse_shader(ShaderType::Pixel, d)));
+}
+
 } // namespace
 
 int main() {
     parses_and_disassembles_a_vertex_shader();
     parses_a_pixel_shader();
     reads_past_the_end_as_zeros();
+    tells_a_vertex_shader_awaiting_its_declaration();
     return finish("ucode_parse");
 }
