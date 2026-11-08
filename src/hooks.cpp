@@ -146,8 +146,10 @@ void run(ppc::Context &c, const Entry &e, void (*fn)(ppc::Context &)) {
     boundary(c, e.address, false, 0);
     for (port::Callback b : e.before) b(c);
     const port::Original original(e.address, fn);
-    if (e.replace) e.replace(c, original);
-    else original(c);
+    if (e.replace)
+        e.replace(c, original);
+    else
+        original(c);
     for (port::Callback a : e.after) a(c);
     boundary(c, e.address, true, uint32_t(c.lr) & ~3u);
 }

@@ -88,6 +88,20 @@ interpreter reaches the export through `sc` (the kernel looks the thunk up
 by the address), generated code through `dispatch`. Variable imports
 receive the address of the kernel's object for them.
 
+### The port's hooks
+
+A port's replacements and hooks (docs/recompiler.md, "Replacing and hooking";
+`xenoforge/port.h`) sit on this path: `Kernel::try_call` runs a hooked
+function's hooks when its generated code has no hook slot (or it has none),
+the interpreter asks the kernel at a branch into a hooked function and before
+an instruction with a mid hook (`ppc::System`'s `enter_hooked`, `mid_hook`;
+`run_original` runs a hooked function's own body, its hooks left out), and
+`add_module_code` binds a module's hook slots to the process's registry
+(`xenoforge/hooks.h`), `remove_module_code` and the kernel's end unbind them.
+The lockstep check takes the port's code as it takes an import
+(`hook_boundary`). Ports register in `PortInfo::on_init` (xenoforge/run.h) or
+with static registrations, before the guest's first thread.
+
 ## Structured exceptions
 
 (2026-11-06, `src/kernel/exceptions.cpp`; docs/xenia-todos-kernel.md A1

@@ -60,11 +60,16 @@ inline uint8_t *host(const Context &c, uint32_t address) {
 }
 
 template <class T> constexpr T byteswap(T v) {
-    static_assert(std::is_trivially_copyable_v<T> && (sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8));
-    if constexpr (sizeof(T) == 1) return v;
-    else if constexpr (sizeof(T) == 2) return std::bit_cast<T>(__builtin_bswap16(std::bit_cast<uint16_t>(v)));
-    else if constexpr (sizeof(T) == 4) return std::bit_cast<T>(__builtin_bswap32(std::bit_cast<uint32_t>(v)));
-    else return std::bit_cast<T>(__builtin_bswap64(std::bit_cast<uint64_t>(v)));
+    static_assert(std::is_trivially_copyable_v<T> &&
+                  (sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8));
+    if constexpr (sizeof(T) == 1)
+        return v;
+    else if constexpr (sizeof(T) == 2)
+        return std::bit_cast<T>(__builtin_bswap16(std::bit_cast<uint16_t>(v)));
+    else if constexpr (sizeof(T) == 4)
+        return std::bit_cast<T>(__builtin_bswap32(std::bit_cast<uint32_t>(v)));
+    else
+        return std::bit_cast<T>(__builtin_bswap64(std::bit_cast<uint64_t>(v)));
 }
 
 // A value as the guest stores it (big-endian), for the fields of guest
@@ -140,12 +145,12 @@ inline void call(Context &c, uint32_t address) {
 
 // A replaced function's own body: generated code, else the interpreter.
 class Original {
-public:
+  public:
     Original(uint32_t address, void (*fn)(Context &)) : address_(address), fn_(fn) {}
     void operator()(Context &c) const;
     uint32_t address() const { return address_; }
 
-private:
+  private:
     uint32_t address_;
     void (*fn_)(Context &);
 };
@@ -204,8 +209,8 @@ struct Registration {
 // void name(Context &c) { ... } after it, its result in r3 or f1
 #define XF_AFTER(address, name)                                                                                        \
     static void name(::xf::port::Context &c);                                                                          \
-    static const ::xf::port::Registration XF_PORT_CAT(xf_registration_, name){                                         \
-        (address), ::xf::port::Registration::After, &name, #name};                                                     \
+    static const ::xf::port::Registration XF_PORT_CAT(xf_registration_,                                                \
+                                                      name){(address), ::xf::port::Registration::After, &name, #name}; \
     static void name([[maybe_unused]] ::xf::port::Context &c)
 // uint32_t name(Context &c) { ...; return CONTINUE; } before the instruction at `address`
 #define XF_MID(address, name)                                                                                          \

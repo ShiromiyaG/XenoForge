@@ -173,7 +173,7 @@ void name_files() {
 
  0001:00000200       _helper                    82010200 f   main.obj
 )",
-                                  names) == 3);
+                                names) == 3);
     CHECK(names.at(0x82010000) == "?Update@Camera@@QAAXM@Z" && names.at(0x82010200) == "_helper");
     CHECK(!names.count(0x82200000));
     names.clear();

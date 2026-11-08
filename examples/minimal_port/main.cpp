@@ -14,7 +14,11 @@ int main(int argc, char **argv) {
     xf::PortInfo port;
     port.name = "Minimal port";
     port.options.push_back(xf::PortOption::boolean("verbose", "Say when the game starts", g_verbose));
-    // where a real port registers its hooks and replacements (xenoforge/port.h)
+    // where a real port registers its hooks and replacements (xenoforge/port.h;
+    // docs/recompiler.md, "Replacing and hooking"), for instance
+    //   xf::port::before(0x82012340, [](xf::port::Context &c) { ... }, "Camera_Update");
+    // with 0x82012340 in project.toml's `hooks` so the generated code's direct
+    // calls reach it too
     port.on_init = [](xf::kernel::Kernel &) {
         if (g_verbose) std::printf("minimal port: starting\n");
     };

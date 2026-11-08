@@ -34,9 +34,7 @@ struct Entry {
 // A bit per 4 KB page of the guest's addresses holding a hook (ppc::System's
 // hook_pages): what the interpreter and dispatch test before looking further.
 const uint8_t *pages();
-inline bool in_hooked_page(uint32_t address) {
-    return (pages()[address >> 15] >> ((address >> 12) & 7)) & 1;
-}
+inline bool in_hooked_page(uint32_t address) { return (pages()[address >> 15] >> ((address >> 12) & 7)) & 1; }
 
 // the hooks at an address (nullptr: none)
 const Entry *find(uint32_t address);

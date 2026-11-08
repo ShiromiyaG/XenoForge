@@ -50,7 +50,7 @@ bool parse_address(std::string_view s, uint32_t &out) {
 }
 
 class Loader {
-public:
+  public:
     Loader(Project &p, std::string &error) : p_(p), error_(error) {}
 
     bool file(const std::filesystem::path &path, int depth) {
@@ -69,10 +69,14 @@ public:
         if (const toml::Value *project = root.find("project")) {
             if (!project->is_table()) return fail(where + ": [project] is not a table");
             for (const auto &[key, v] : project->table) {
-                if (key == "name" && v.is_string()) p_.name = v.string;
-                else if (key == "module" && v.is_string()) module = v.string;
-                else if (key == "includes" || key == "include") strings(v, includes, where);
-                else warn(where, v.line, "[project] " + key + " is not read");
+                if (key == "name" && v.is_string())
+                    p_.name = v.string;
+                else if (key == "module" && v.is_string())
+                    module = v.string;
+                else if (key == "includes" || key == "include")
+                    strings(v, includes, where);
+                else
+                    warn(where, v.line, "[project] " + key + " is not read");
             }
         }
         if (const toml::Value *v = root.find("includes")) strings(*v, includes, where);
@@ -89,7 +93,7 @@ public:
         return true;
     }
 
-private:
+  private:
     bool fail(const std::string &why) {
         error_ = why;
         return false;
@@ -98,12 +102,16 @@ private:
         p_.warnings.push_back(where + (line ? ":" + std::to_string(line) : std::string()) + ": " + what);
     }
     void strings(const toml::Value &v, std::vector<std::string> &out, const std::string &where) {
-        if (v.is_string()) out.push_back(v.string);
+        if (v.is_string())
+            out.push_back(v.string);
         else if (v.is_array())
             for (const toml::Value &e : v.array)
-                if (e.is_string()) out.push_back(e.string);
-                else warn(where, e.line, "expected a file name");
-        else warn(where, v.line, "expected a file name or a list of them");
+                if (e.is_string())
+                    out.push_back(e.string);
+                else
+                    warn(where, e.line, "expected a file name");
+        else
+            warn(where, v.line, "expected a file name or a list of them");
     }
     // an address: an integer, or a string in hex
     bool address(const toml::Value &v, uint32_t &out) {
@@ -114,7 +122,8 @@ private:
         if (!v.is_array()) return fail(where + ":" + std::to_string(v.line) + ": " + what + " is not a list");
         for (const toml::Value &e : v.array) {
             uint32_t a;
-            if (!address(e, a)) return fail(where + ":" + std::to_string(e.line) + ": " + what + " holds a non-address");
+            if (!address(e, a))
+                return fail(where + ":" + std::to_string(e.line) + ": " + what + " holds a non-address");
             out.push_back(a);
         }
         return true;
@@ -136,7 +145,8 @@ private:
                 for (const auto &[k, name] : v.table) {
                     uint32_t a;
                     if (!parse_address(k, a) || !name.is_string())
-                        return fail(where + ":" + std::to_string(name.line) + ": [names] wants \"0xADDRESS\" = \"name\"");
+                        return fail(where + ":" + std::to_string(name.line) +
+                                    ": [names] wants \"0xADDRESS\" = \"name\"");
                     m.names[a] = name.string;
                 }
             } else if (key == "hooks" || key == "skip") {
@@ -209,15 +219,20 @@ private:
     // [functions] "0xADDRESS" = { name, end | size, hook, skip }
     bool function(const std::string &key, const toml::Value &e, ProjectModule &m, const std::string &where) {
         uint32_t a;
-        if (!parse_address(key, a)) return fail(where + ":" + std::to_string(e.line) + ": [functions] key " + key + " is not an address");
-        if (!e.is_table()) return fail(where + ":" + std::to_string(e.line) + ": [functions] " + key + " is not a table");
+        if (!parse_address(key, a))
+            return fail(where + ":" + std::to_string(e.line) + ": [functions] key " + key + " is not an address");
+        if (!e.is_table())
+            return fail(where + ":" + std::to_string(e.line) + ": [functions] " + key + " is not a table");
         uint32_t end = 0;
         bool start = true;
         for (const auto &[k, v] : e.table) {
             uint32_t x;
-            if (k == "name" && v.is_string()) m.names[a] = v.string;
-            else if (k == "end" && address(v, x)) end = x;
-            else if (k == "size" && address(v, x)) end = x ? a + x : 0;
+            if (k == "name" && v.is_string())
+                m.names[a] = v.string;
+            else if (k == "end" && address(v, x))
+                end = x;
+            else if (k == "size" && address(v, x))
+                end = x ? a + x : 0;
             else if (k == "hook" && v.is_bool()) {
                 if (v.boolean) m.hooks.insert(a);
             } else if (k == "skip" && v.is_bool()) {
@@ -229,7 +244,8 @@ private:
                 warn(where, v.line, "[functions] " + key + "." + k + " is not read");
             }
         }
-        if (end && end <= a) return fail(where + ":" + std::to_string(e.line) + ": [functions] " + key + ": end before start");
+        if (end && end <= a)
+            return fail(where + ":" + std::to_string(e.line) + ": [functions] " + key + ": end before start");
         if (start) m.starts[a] = end;
         return true;
     }
@@ -244,8 +260,10 @@ std::vector<std::string> split_csv(const std::string &line, char delimiter) {
     for (size_t k = 0; k < line.size(); k++) {
         char ch = line[k];
         if (ch == '"') {
-            if (quoted && k + 1 < line.size() && line[k + 1] == '"') out.back() += '"', k++;
-            else quoted = !quoted;
+            if (quoted && k + 1 < line.size() && line[k + 1] == '"')
+                out.back() += '"', k++;
+            else
+                quoted = !quoted;
         } else if (ch == delimiter && !quoted) {
             out.emplace_back();
         } else if (ch != '\r') {
@@ -367,9 +385,12 @@ size_t read_ghidra_functions(std::string_view text, std::map<uint32_t, std::stri
             // an address and a name, either order (a hex word is the address)
             std::vector<std::string> w = line.find(',') != std::string::npos ? split_csv(line, ',') : split_space(line);
             if (w.size() < 2) continue;
-            if (parse_address(w[0], a) && (w[0].size() >= 8 || w[0].starts_with("0x"))) name = w[1];
-            else if (parse_address(w[1], a)) name = w[0];
-            else continue;
+            if (parse_address(w[0], a) && (w[0].size() >= 8 || w[0].starts_with("0x")))
+                name = w[1];
+            else if (parse_address(w[1], a))
+                name = w[0];
+            else
+                continue;
         }
         while (!name.empty() && (name.back() == ' ' || name.back() == '\r')) name.pop_back();
         if (meaningful(name) && a) n += names.emplace(a, std::move(name)).second;

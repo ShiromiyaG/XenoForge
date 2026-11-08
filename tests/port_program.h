@@ -60,7 +60,7 @@ inline xf::recomp::Image image() {
     i.base = BASE;
     i.bytes = image_bytes();
     i.sections.push_back({".text", BASE, SIZE, true, false});
-    i.pdata = {{ADD, 8, 0, false},   {CALLER, 32, 3, false}, {MID, 24, 0, false}, {TAIL, 4, 0, false},
+    i.pdata = {{ADD, 8, 0, false},   {CALLER, 32, 3, false},  {MID, 24, 0, false},  {TAIL, 4, 0, false},
                {PLAIN, 8, 0, false}, {CALLER2, 32, 3, false}, {STATIC, 8, 0, false}};
     return i;
 }

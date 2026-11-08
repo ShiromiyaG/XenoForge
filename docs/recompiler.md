@@ -629,6 +629,194 @@ emission is the recompile step's, whose text is in the interface's digest).
 condition register by field, the vector registers by word) in the watch
 windows: the linker's `/NATVIS:`, or WinDbg's `.nvload`.
 
+## The project file
+
+(Plan E2, 2026-11-08.) What a port says about the executables on its disc,
+in TOML: `xfrecomp emit <iso> <dir> --project <file.toml>` (and
+`recomp::emit_modules` through `EmitOptions::project`, `recomp::load_project`
+reading it; `xenoforge_add_port(... PROJECT <file>)` passes it on). No project
+file, or one that says nothing of a module, emits exactly what the
+recompiler emits without one (checked byte for byte on a whole disc).
+
+The top level describes one module, `[project] module` (default
+`default.xex`, compared without case); `[modules."<path on the disc>"]`
+holds the same keys for any other (a disc has several executables). TOML puts
+a table's plain keys before its first `[header]`, so the top level's `hooks`,
+`skip` and `names_from` come first.
+
+```toml
+# my_game.toml: the port's project file
+hooks = [0x82012340]            # functions the port replaces or hooks (a hook slot each, below)
+skip = [0x82013000]             # functions left to the interpreter
+names_from = { map = "my_game.map", ghidra = ["functions.csv"] } # names, relative to this file
+includes = ["more.toml"]        # other project files, read first
+
+[project]
+name = "my_game"
+module = "default.xex"          # what the top level describes
+
+[functions]                     # starts to add, with what the port knows of them
+"0x82010000" = { name = "Camera_Update", end = 0x82010100, hook = true }
+"0x82010200" = {}               # a start the discovery missed (rexglue's form)
+"0x82010400" = { size = 0x40 }  # an end by size (rexglue's)
+"0x82010800" = { skip = true, start = false } # left out, not added
+
+[names]                         # names only
+"0x82011000" = "Render"
+
+[[jump_tables]]                 # a bctr's targets, read in place of discovery's
+bctr = 0x82010080
+targets = [0x82010090, 0x820100A0]
+
+[[mid_hooks]]                   # a hook before the instruction at an address
+address = 0x82010010
+jumps = [0x82010020]            # where the hook may send the code (labels)
+name = "skip_check"
+
+[modules."Other.xex"]           # another executable on the disc
+hooks = [0x82500000]
+[modules."Other.xex".names]
+"0x82500000" = "Other_Entry"
+```
+
+- **Starts** (`[functions]`, and every hook): one with an end is registered
+  before `.pdata` (its size wins); one without, after the exports and the
+  logged entries, so a `.pdata` start keeps its size (`Source::Project`).
+- **Names** (`[functions]`'s `name`, `[names]`, and below them those
+  `names_from` imports: an MSVC linker map's "Publics by Value" and "Static
+  symbols", the functions alone when the map marks them `f`; a Ghidra
+  function list, the Functions window exported as CSV or tab-separated text,
+  or plain lines of an address and a name, Ghidra's own `FUN_` names left
+  out). They go to the function's line in the C++ (`XF_FN(xf_82010000) { //
+  Camera_Update`) and so to the listing and its `#line` (the debugger's
+  view of the function); to the module's table (`GeneratedModule::names`),
+  from which the crash and stop reports and the lockstep check's report name
+  the function; and to `names.h` beside `table.cpp`, constants for the port's
+  sources (`xfm_default_xex::names::Camera_Update`). Readable symbol aliases
+  are not made: the generated symbols stay `xf_<address>`, and the name sits
+  beside each in the source the debugger shows.
+- **Jump tables**: `[[jump_tables]]` (`bctr`, `targets`) or rexglue's
+  `[[switch_tables]]` (`address`, `labels`; `register` ignored).
+- **Skip**: the function's generated code is a stub that dispatches to its
+  own address, its table entry empty, so it runs in the interpreter.
+- **Hooks and mid hooks**: below, "Replacing and hooking".
+- **rexglue's function list** is read as a port has it (`[functions]
+  "0x82012340" = {}`, `size`, `name`; `parent` and `share_registers` are
+  warned of and ignored; `[[midasm_hook]]` is a mid hook, its
+  `jump_address*` its jumps, its `registers` and `return*` meaningless here,
+  where the hook gets the whole context and says itself where to go on).
+  `xfrecomp analyze <iso> --check-functions <file.toml>` says how many of a
+  list's starts the discovery finds without it, and where the others fall
+  (inside a function, at one of its branch targets, in none); `--project`
+  discovers with a project file's starts and tables.
+- What does not apply (a hook where no function can be, a mid hook no
+  emitted instruction is at, names at no start, unknown keys) is printed as a
+  warning by `xfrecomp`, never an error.
+
+The reader is the core's own (`xenoforge/toml.h`: the TOML a project file
+uses, without multi-line strings or dates), so xfrecomp needs no TOML
+library.
+
+## Replacing and hooking
+
+(Plan E3, 2026-11-08.) A port puts native code on guest functions by their
+address (`xenoforge/port.h`):
+
+- **a replacement**, `void fn(Context &c, const Original &original)`, in
+  the function's place; `original(c)` runs the function's own body
+  (generated code, else the interpreter);
+- **before and after**, `void fn(Context &c)`, around the function, which
+  runs as ever (after sees its result in r3 or f1);
+- **mid-function**, `uint32_t fn(Context &c)`, before the instruction at an
+  address inside a function, with the whole context: it returns `CONTINUE`
+  (the instruction runs, then the rest), `RETURN` (the function returns, as
+  a `blr`: undoing the frame is the hook's) or an address to go on at (one
+  of the project file's `jumps` or the next instruction is a `goto`; any
+  other is dispatched, as a branch to an address with no label is). This is
+  XenonRecomp's midasm hook (`../XenonRecomp`, MIT), made a run-time
+  registration with one signature for its return and jump variants.
+
+Registered at link time (`XF_REPLACE(address, name) { ... }`, `XF_BEFORE`,
+`XF_AFTER`, `XF_MID`: static registrations in the port's sources, done before
+`main`) or at run time (`xf::port::replace`, `before`, `after`, `mid`,
+`remove`; a port's `PortInfo::on_init` is the place, xenoforge/run.h). The
+porter's ergonomics follow rexglue's `REX_FUNC`/`__imp__` and re:Blue's
+`REX_HOOK` in what they let a port say; the mechanism is our own: no weak
+symbols, so a hook binds the same way to a statically linked game and to a
+game library, and a port's code builds without the game's.
+
+**How the generated code reaches them.** Direct `bl` calls between generated
+functions bypass dispatch, so a function the project file lists in `hooks` is
+emitted with a **hook slot**: its body becomes `xfo_<address>`, and
+`xf_<address>`, what every caller, tail call and the table reach, is
+
+```cpp
+XF_FN(xf_82012340) { XF_HOOKED(xf_hook_82012340, xfo_82012340); }
+```
+
+a load of the slot, a compare and a tail call to the body while nothing is
+hooked there; the slot (`ppc_module.h`'s `HookSlot`, defined in `table.cpp`,
+listed in `GeneratedModule::hooks`) holds the hooks when the port registers
+any, and the runtime runs them (`ppc_runtime.h`'s `hooked`). A mid hook's
+address gets a slot `xf_mid_<address>` and, before its instruction,
+
+```cpp
+if (XF_HOOKS(xf_mid_82010010)) { // the port's mid-function hook
+    const uint32_t xf_to = ::xf::ppc::mid_hook(c, xf_mid_82010010);
+    if (xf_to) switch (xf_to) { case 1: return; case 0x82010014: goto L_82010014; case 0x82010020: goto L_82010020; default: ::xf::ppc::dispatch(c, xf_to); return; }
+}
+```
+
+Everything the project file does not list is emitted as before, byte for
+byte, so its cost is nil.
+
+**The registry** (`xenoforge/hooks.h`, `src/hooks.cpp`) is the process's, by
+address. The kernel binds a module's slots as it takes the module's code in
+(`Kernel::add_module_code`) and unbinds them as it drops it; a registration
+publishes a new, never-changed entry and stores it in the slots of that
+address with one atomic store, so threads running the code see the old hooks
+or the new ones. A bit per 4 KB page says where hooks are, so dispatch and
+the interpreter look further only there.
+
+**Every way in runs the same hooks.**
+
+- Dispatch (indirect calls, imports' thunks, calls from interpreted code,
+  `Kernel::call`): `Kernel::try_call` runs a hooked function's hooks itself
+  when its code has no slot (`call_hooked`), the original body being the
+  generated function or the interpreter (`System::run_original`).
+- The interpreter: calls come through dispatch; a branch without LK to a
+  hooked function's start from outside it (a tail call; the size comes from
+  the slot, and with no slot every branch there counts, a loop back to a
+  function's first instruction being rarer than a tail call) runs it and goes
+  on at LR (`System::enter_hooked`); before each instruction in a page with a
+  hook, its mid hooks (`System::mid_hook`).
+- **An address the project file does not list** has no slot: direct calls
+  in the generated code go past its hooks, and only dispatch and the
+  interpreter reach them; a mid hook there runs only interpreted. The
+  registry says so on stderr (`port: 0x82012400 ... is not among the project
+  file's hooks`), at registration or when the module's code is taken in.
+- **The lockstep check** treats the port's code as an import: the check's
+  interpreter stops at a hooked call or a mid hook (a segment's end), the
+  generated code runs the hooks once, for real, and the next segment starts
+  where the code goes on (after the call, or after the mid hook that ran:
+  `System::hook_boundary`). So hooks never run twice and the guest code
+  around them is still checked.
+- The reports name functions by the project file's names and those a port
+  registers (`port::name`): "function Camera_Update 0x82010000+0x34".
+
+Memory and registers for ports, in the same header: `be<T>` (a big-endian
+field of a guest structure), `ptr<T>` (a guest pointer), `ref<T>(c, a)`,
+`load<T>`/`store<T>`, `arg`, `farg`, `result`, `r`, `f`, and `call(c, a)`
+(a guest function called from native code, through dispatch, LR kept).
+
+`port_test` checks all of it on a small program `port_gen` emits with a
+project file at build time: replace, before, after, a tail call, dispatch,
+each mid-hook answer, an unlisted address (reached through dispatch, not by
+the generated code's direct call; by the interpreter's), link-time and
+run-time registration, generated and interpreted alike, and a lockstep run
+with hooks (4 segments matched). The game library's interface gained the
+two calls (`Runtime::hooked`, `mid_hook`), so its version changed.
+
 ## Steps
 
 1. Decoder and disassembler, checked against Xenia's (above).

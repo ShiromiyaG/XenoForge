@@ -11,7 +11,7 @@ namespace xf::toml {
 namespace {
 
 class Reader {
-public:
+  public:
     Reader(std::string_view text, Value &root) : text_(text), root_(root) {}
 
     bool run(std::string &error) {
@@ -34,7 +34,7 @@ public:
         return true;
     }
 
-private:
+  private:
     char peek(size_t ahead = 0) const { return pos_ + ahead < text_.size() ? text_[pos_ + ahead] : '\0'; }
     bool fail(std::string &error) const {
         error = "line " + std::to_string(error_line_ ? error_line_ : line_) + ": " + why_;
@@ -159,8 +159,7 @@ private:
         Value *t = &into;
         for (size_t n = 0; n + 1 < parts.size(); n++)
             if (!(t = descend(t, parts[n], false))) return false;
-        if (!t->table.emplace(parts.back(), std::move(v)).second)
-            return bad("\"" + parts.back() + "\" is given twice");
+        if (!t->table.emplace(parts.back(), std::move(v)).second) return bad("\"" + parts.back() + "\" is given twice");
         return true;
     }
 
@@ -235,9 +234,9 @@ private:
                 continue;
             }
             bool digit = base == 16 ? std::strchr("0123456789abcdefABCDEF", ch) != nullptr : ch >= '0' && ch <= '9';
-            if (base == 10 && (ch == '.' || ch == 'e' || ch == 'E' ||
-                               ((ch == '+' || ch == '-') && !digits.empty() &&
-                                (digits.back() == 'e' || digits.back() == 'E')))) {
+            if (base == 10 &&
+                (ch == '.' || ch == 'e' || ch == 'E' ||
+                 ((ch == '+' || ch == '-') && !digits.empty() && (digits.back() == 'e' || digits.back() == 'E')))) {
                 real = true;
                 digit = true;
             }
@@ -252,8 +251,8 @@ private:
                 pos_ += 3;
                 v.kind = Value::Float;
                 v.number = rest[0] == 'i' ? (negative ? -std::numeric_limits<double>::infinity()
-                                                   : std::numeric_limits<double>::infinity())
-                                       : std::numeric_limits<double>::quiet_NaN();
+                                                      : std::numeric_limits<double>::infinity())
+                                          : std::numeric_limits<double>::quiet_NaN();
                 return true;
             }
             pos_ = start;
@@ -321,7 +320,9 @@ private:
             }
         }
         std::string_view rest = text_.substr(pos_);
-        auto word = [&](std::string_view w) { return rest.starts_with(w) && !bare(rest.size() > w.size() ? rest[w.size()] : ' '); };
+        auto word = [&](std::string_view w) {
+            return rest.starts_with(w) && !bare(rest.size() > w.size() ? rest[w.size()] : ' ');
+        };
         if (word("true") || word("false")) {
             v.kind = Value::Boolean, v.boolean = rest[0] == 't', v.line = line_;
             pos_ += v.boolean ? 4 : 5;
