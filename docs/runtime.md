@@ -39,14 +39,14 @@ with the same base and size and, only then, digests the image as unpacked
 30 MB) and compares (`add_module_code`); the module's report line says
 which: "generated code, N functions", or why it runs interpreted. A table
 that matches gets the module's range and a slot per instruction from its
-first function to its last ((address - first) / 4: 36 MB for El Chavo
+first function to its last ((address - first) / 4: 36 MB for game A
 Kart's 4.7M-instruction range, made the first time the image loads and
 kept). Dispatch reads one immutable map of those ranges (an atomic
 pointer, a new map published at each load and unload, the old ones kept
 for threads still reading them): one compare per module loaded and one
 load, about 2 ns, where the binary search over one table it replaced took
-29 to 79 ns on El Chavo Kart's 73,293 functions. XexUnloadImage drops the range with the pages,
-so BC2's Splash.xex and Game.xex, one after the other at 0x82A00000, each
+29 to 79 ns on game A's 73,293 functions. XexUnloadImage drops the range with the pages,
+so game C's Splash.xex and Game.xex, one after the other at 0x82A00000, each
 run their own code. Functions given with `set_generated` (any address, the
 tests' host functions) are looked up first.
 
@@ -267,7 +267,7 @@ lists: what the game calls is what gets written next.
   DLL_PROCESS_ATTACH at the load (the libraries it brought first),
   DLL_THREAD_ATTACH and DETACH as guest threads start and end,
   DLL_PROCESS_DETACH when XexUnloadImage takes the last load, which
-  releases the pages (BC2 loads Splash.xex and Game.xex at the same base,
+  releases the pages (game C loads Splash.xex and Game.xex at the same base,
   one after the other). Every DllMain call runs under the loader lock
   (NT's), recursive, also held across XexLoadImage's lookup and load,
   XexUnloadImage's detach and removal and XexGetModuleHandle: a load waits
@@ -275,7 +275,7 @@ lists: what the game calls is what gets written next.
   boot's module report names the lock's owner when it is held. Each
   module's code is generated or interpreted as its image matches a table
   of the game library ("Code" above).
-- **BC2's launcher chain** (`kernel_modules_test`'s `launcher_chain` runs
+- **game C's launcher chain** (`kernel_modules_test`'s `launcher_chain` runs
   the same sequence). Its `default.xex` (Frost.Game.Launcher) is a small
   executable; `Splash.xex` (splash.dll) and `Game.xex` (game.dll) are DLLs
   (module flags 0x9) at 0x82A00000, each exporting one function, ordinal 1,
@@ -474,7 +474,7 @@ object manager as the console keeps it (`guest_objects.cpp`, `devices.cpp`;
 A guest thread may move between guest stacks: the XDK's fibers
 (SwitchToFiber saves the registers into the current fiber, loads the next
 one's and branches to KeSetCurrentStackPointers, which moves r1 to the next
-fiber's stack; Reach's streaming decompressor runs on one). Each guest stack
+fiber's stack; game F's streaming decompressor runs on one). Each guest stack
 runs on a host stack of its own (`src/kernel/stacks.h`, stacks.cpp; Windows
 fibers, ucontext elsewhere), so a guest switch is a host switch and each
 stack's generated frames wait where they are:
@@ -492,7 +492,7 @@ stack's generated frames wait where they are:
   the range that holds the new r1. A stack first entered at an address no
   function starts at (the code after a `bl` to the thunk, going on on the
   new stack) runs the frames it returns through interpreted, their calls
-  generated; the XDK's fibers start at a routine's start (Reach's at
+  generated; the XDK's fibers start at a routine's start (game F's at
   0x8295DCD0, which calls the fiber's procedure).
 - **Resumed as it left, or unwound.** A stack is resumed as it left only
   when the switch back comes with the r1 it left with and with LR where its
@@ -595,17 +595,17 @@ runs above them in this file's history, on game-libs 7ac73df):
 
 | game, run | swaps | host time | swaps/s (host) | clock | forced |
 |---|---|---|---|---|---|
-| El Chavo Kart, playing, `--seconds 20` | 597 | 20 s | 30 (30 before) | (the host's) | |
-| El Chavo Kart, deterministic, `--until-swap 1200` | 1200 | 16.2 s | 74 (60-63 before) | 40.42 s | 0 (7 before) |
-| Ben 10, playing, `--seconds 20` | 802 | 20 s | 41 (40 before, same load) | (the host's) | |
-| Ben 10, deterministic, `--seconds 30` | 8118 | 30 s | 271 (12 before) | 144.6 s | 0 (209 before) |
-| Ben 10, deterministic, `--until-swap 1200` | 1200 | 8.4 s | 143 | 28.07 s | 0 |
+| Game A, playing, `--seconds 20` | 597 | 20 s | 30 (30 before) | (the host's) | |
+| Game A, deterministic, `--until-swap 1200` | 1200 | 16.2 s | 74 (60-63 before) | 40.42 s | 0 (7 before) |
+| Game B, playing, `--seconds 20` | 802 | 20 s | 41 (40 before, same load) | (the host's) | |
+| Game B, deterministic, `--seconds 30` | 8118 | 30 s | 271 (12 before) | 144.6 s | 0 (209 before) |
+| Game B, deterministic, `--until-swap 1200` | 1200 | 8.4 s | 143 | 28.07 s | 0 |
 
 Three runs of each game to swap 1200 left the same memory hash and the
-whole report alike but for host times (El Chavo Kart 17951072 runs,
-150981 slices; Ben 10 85548 runs, 22722 slices). Before the yield points,
-El Chavo Kart was exact only when its 7 forced hand-overs landed in pure
-spins, and Ben 10 (whose main thread spins before its first kernel call)
+whole report alike but for host times (game A 17951072 runs,
+150981 slices; game B 85548 runs, 22722 slices). Before the yield points,
+Game A was exact only when its 7 forced hand-overs landed in pure
+spins, and game B (whose main thread spins before its first kernel call)
 never was. The cost of one host thread is more than paid back by the idle
 clock not waiting for the host's.
 `kernel_threads_deterministic_test` runs the threads' scenarios on this
@@ -782,7 +782,7 @@ As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
   data before and after, its input buffers and its output buffer before
   and after, each distinct buffer once) and the clears and releases
   between them (`xenoforge/xma_recording.h`); it hashes every buffer of
-  every run, which slows a game that kicks often (Reach's client fell to
+  every run, which slows a game that kicks often (game F's client fell to
   a few frames a second while recording). `xma_oracle`
   (`tools/xenia_oracle/build.bat xma`, against the xenia-canary build and
   its FFmpeg) walks a recording through Xenia's own XmaContextNew and
@@ -948,14 +948,14 @@ Winsock: a send completes at once, a receive takes a queued datagram or
 pends (WSA_IO_PENDING) until one comes, it is cancelled or the socket is
 closed; the WSAOVERLAPPED's Internal and InternalHigh hold the status and
 the bytes, and its event is set or its completion routine queued as a user
-APC. Gears of War 3 polled
+APC. Game E polled
 recvfrom on an unimplemented socket (an answer of 0, an empty datagram)
 and stalled its frame loop there; with these it goes on.
 
 ## XAM's oracle
 
 The console's own XAM is the system update's `$flash_xam.xex` (plan,
-"Accuracy beyond Xenia"): El Chavo Kart's disc carries 2.0.16202
+"Accuracy beyond Xenia"): Game A's disc carries 2.0.16202
 unencrypted (xamc.dll, base 0x815F0000, 6 MB, 1,570 exports in a table of
 2,890 slots). `xfinspect --package` extracts it; `xfxam` (tools/xfxam.cpp)
 runs it on our kernel and sets each of its answers beside ours. The file is
@@ -1166,8 +1166,8 @@ fixes, each confirmed with `xfxam call` before and after, each commented
 beside its code with the console's answer and Xenia's:
 - the versions: XamGetSystemVersion and XamUpdateGetCurrentSystemVersion
   0x20076000, XamUpdateGetBaseSystemVersion 0. Xenia's 0 was on purpose
-  ("if we pretend to be old we have less to implement"); El Chavo Kart and
-  Ben 10 import XamGetSystemVersion and both boot as before (same swaps per
+  ("if we pretend to be old we have less to implement"); game A and
+  game B import XamGetSystemVersion and both boot as before (same swaps per
   second as on the build without the fix, no interpreted entry);
 - XamInputGetCapabilities: the kernel's HidGetCapabilities is now ours
   (xam_input.cpp), answering from the input drivers (success for a pad that
@@ -1345,9 +1345,9 @@ swaps per second) and interrupts, the sound's frames and XMA contexts, and
 where it stopped. Built as `boot_<game>` (CMake's `XF_GAMES`), it runs the
 game's generated code, every module's ("Code" above); `--interpret` leaves it out. `--steps` bounds the
 interpreter's instructions per entry (2 billion by default: about 20 s of
-El Chavo Kart's main thread). XAM's input answers from an idle pad for
+Game A's main thread). XAM's input answers from an idle pad for
 user 0, a controller plugged in with nothing pressed, so a game waiting
-for one goes on (Ben 10 paused on "Controller Lost Connection" without
+for one goes on (game B paused on "Controller Lost Connection" without
 it); `--no-controller` leaves every user disconnected, and `--press
 start@40` holds buttons at a time on the scheduler's clock
 ([input.md](input.md)). What boot shares with the player (opening the
@@ -1375,13 +1375,13 @@ each thread's name (the host's, or what the guest named it with
 SetThreadName), its state, what a waiting thread waits for (each object's
 kind, handle, body, type and signal state) and its guest stack: the saved
 LR of each frame on the back chain, read where the pages are readable. A
-title's main thread often waits for good on its game thread (Reach's
+title's main thread often waits for good on its game thread (game F's
 `main` waits at lr 0x820CCFA8, in WaitForSingleObjectEx, for its
 MAIN_THREAD), so the thread to look at is the one that stopped, not the
-main one. Booting a DLL as the executable (`--xex Game.xex` on BC2) says
+main one. Booting a DLL as the executable (`--xex Game.xex` on game C) says
 so: its entry point is a DllMain that returns at once.
 
-Reach with its game library (2026-11-06): the intro at 60 swaps a second;
+Game F with its game library (2026-11-06): the intro at 60 swaps a second;
 2,300 to 2,750 swaps in, MAIN_THREAD loads the main menu itself (running,
 16 frames deep; 0 to 6 s with no swap, longer as the machine is busier),
 then the menu at 30 swaps a second, 6,349 swaps in 180 s. Its start was
@@ -1570,7 +1570,7 @@ Checked (2026-11-05, both games with their generated code, on a machine
 other builds were loading, so the rates vary from run to run; the shots and
 logs in `../traces/player/`):
 
-- **El Chavo Kart**: the intro movie at 10 to 20 swaps a second, each front
+- **game A**: the intro movie at 10 to 20 swaps a second, each front
   buffer handed over shown (1204 of 1221 swaps in 60 s, 1600 of 1615 in
   270 s); its title screen came at 96.5 s on the scheduler's clock, and
   `--press start@100` took it to the main menu, where the game's
@@ -1581,7 +1581,7 @@ logs in `../traces/player/`):
   599 times in a run). A capture of the window with `--overlay` shows the
   front buffer letterboxed under the overlay's rates, controllers and
   settings.
-- **Ben 10**: no "Controller Lost Connection": in 90 s, 738 swaps, the
+- **game B**: no "Controller Lost Connection": in 90 s, 738 swaps, the
   Cartoon Network logo by swap 300 and Papaya's by 600 (where boot used to
   stop swapping before 600); one XAudio client at 187.5 frames a second,
   3,867 of 16,160 with sound. It polls XamInputGetKeystrokeEx with
@@ -1766,14 +1766,12 @@ once a game it started has ended, printing how it ended, and `--screenshot`
 saves its window's last picture.
 
 Checked (2026-11-05): `--list` over `F:\RECOMPs` found the 9 discs in
-its subfolders (over `F:\RECOMPs\Chaves`, the extracted `assets\default.xex`
-too) with their names from the XDBF (BEN 10: VILGAX ATTACKS, El Chavo Kart, Battlefield Bad Co. 2, Forza
-Horizon, Gears of War 3, Halo: Reach, Red Dead Redemption, SONIC
-UNLEASHED), 0.1 to 1.7 s each; both El Chavo Kart discs matched
-`player_chaves` by digest, Ben 10 `player_ben10`, the rest the generic
-player. `--start` ran El Chavo Kart's USA disc in `player_chaves` with a
-`[games.475807D7]` table in the settings ("settings: ... (the game's own,
-475807D7)" in its log): 1153 swaps in 120 s, 1130 frames presented, 20,713
+its subfolders (over a port's folder, the extracted `assets\default.xex`
+too) with their names from the XDBF (games A to H), 0.1 to 1.7 s each; both game A discs matched
+`player_<A>` by digest, game B `player_<B>`, the rest the generic
+player. `--start` ran game A's USA disc in `player_<A>` with a
+`[games.A]` table in the settings ("settings: ... (the game's own,
+A)" in its log): 1153 swaps in 120 s, 1130 frames presented, 20,713
 sound frames played, 5,380 input states delivered, its screenshots and
 its closing lines shown in the launcher. The launcher's own pictures (the
 list, the controls' tab, a run's end) are saved by `--screenshot`. Once,
@@ -1792,7 +1790,7 @@ settings (with a dropdown open), controls (a binding lit on the drawn pad, one
 waiting for a key) and about. `--keys` sent pad presses through the whole
 navigation (d-pad focus, the dropdown, the scrolled list); Vulkan validation
 reported nothing. A window run drew 168 frames a second (the display's rate);
-`--start 0` ran El Chavo Kart in `player_chaves` as before and `--list` is
+`--start 0` ran game A in `player_<A>` as before and `--list` is
 unchanged. RmlUi quirks learned, kept in launcher.rcss: `div` is not block
 until the stylesheet says so; text directly inside a flex container is not
 drawn (wrap it in a block); `box-shadow` cannot be transitioned; an element
@@ -1831,7 +1829,7 @@ column's drag, a right click, a slider's drag), typing in the search and the
 folder's field, the folder dialog, a real pad, and the theme followed live
 when the desktop's changes.
 
-The prepare flow, end to end (2026-11-06): Sonic Unleashed's disc, never
+The prepare flow, end to end (2026-11-06): Game H's disc, never
 built before (its interrupted build resumed from the nine objects in the
 cache's work folder, `--build-jobs 2`): Play opened the preparing screen
 (reading, analysing, writing code, "9 of 252 files" compiling with the time
@@ -1903,7 +1901,7 @@ continuation, a stack switched back elsewhere) is a C++ exception. It is
 thrown only by the runtime (`unwind()`, the kernel's dispatch) and caught
 only by the runtime (the kernel's dispatch, `resumable()`): the emitter
 used to write a try block into each function with resume sites (9 in El
-Chavo Kart, 274 in the eight games), and now writes its body as a lambda
+Game A, 274 in the eight games), and now writes its body as a lambda
 the runtime's `resumable` runs and runs again at a resume site. So the
 exception only passes through the library's frames, which carry their
 unwind tables (`.pdata` and `.xdata` on Windows, which RtlUnwindEx finds in
@@ -1925,7 +1923,7 @@ header), the files are compiled with `-nostdinc -nostdinc++` (so clang
 looks for no Visual Studio, Windows SDK or resource headers) and linked
 with `/nodefaultlib /noentry` (so no C runtime and no import library). The
 library's import directory is empty (checked by game_library_test, and on
-El Chavo Kart's and Ben 10's libraries). Both binaries import only
+Game A's and game B's libraries). Both binaries import only
 Windows' own DLLs (KERNEL32, ADVAPI32, ntdll, ole32, OLEAUT32, SHELL32,
 VERSION): the LLVM release links its C runtime statically. Apache 2.0 with
 LLVM's exception, redistributable. The search (`find_toolchain`):
@@ -2026,8 +2024,8 @@ the two builds):
 
 | | reading | discovery | emission | compiling | linking | total | library |
 |---|---|---|---|---|---|---|---|
-| El Chavo Kart (291 files + 2) | 3.2 s | 4.4 s | 7.9 s | 543.6 s | 15.8 s | 575 s | 180 MB |
-| Ben 10 (106 files + 2) | 2.7 s | 1.4 s | 2.2 s | 266.2 s | 6.6 s | 279 s | 62 MB |
+| Game A (291 files + 2) | 3.2 s | 4.4 s | 7.9 s | 543.6 s | 15.8 s | 575 s | 180 MB |
+| Game B (106 files + 2) | 2.7 s | 1.4 s | 2.2 s | 266.2 s | 6.6 s | 279 s | 62 MB |
 
 Neither library imports anything (an empty import directory, one export,
 `.pdata` for the unwinds, no initializers). A build cancelled after 40 s
@@ -2042,13 +2040,13 @@ in every run):
 
 | | 30 s | 45 s |
 |---|---|---|
-| El Chavo Kart, linked | 878 | 1,337 (59.0 s of CPU) |
-| El Chavo Kart, library | 898 | 1,347 (59.8 s of CPU) |
-| Ben 10, linked | 1,119; 1,123 | 1,652; 1,669 |
-| Ben 10, library | 1,132 | 1,803; 1,872 |
+| Game A, linked | 878 | 1,337 (59.0 s of CPU) |
+| Game A, library | 898 | 1,347 (59.8 s of CPU) |
+| Game B, linked | 1,119; 1,123 | 1,652; 1,669 |
+| Game B, library | 1,132 | 1,803; 1,872 |
 
-El Chavo Kart's menus run at the game's 30 frames a second either way.
-Ben 10 over 15 s: 585 and 650 swaps linked, 627 and 640 in the library;
+Game A's menus run at the game's 30 frames a second either way.
+Game B over 15 s: 585 and 650 swaps linked, 627 and 640 in the library;
 with ten compilers running beside (a library build), 604 and 622 linked,
 599 and 607 in the library. The start varies between runs of either
 (a first swap at 4.7 s instead of 1.2 s: one library run at 30 s, 881

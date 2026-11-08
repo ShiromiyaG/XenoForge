@@ -72,7 +72,7 @@ Read CLAUDE.md (Portuguese: the project's rules, including the renderer's tools)
   Outputs go to F:\RECOMPs\traces\replay\.
 - The regression: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test`. All 29 frames match
   Xenia today and must keep matching: Xenia's D3D12 picture first (`../traces/dumps/d3d12`), its Vulkan
-  one where there is none or the two disagree (2 frames, El Chavo Kart's park and race).
+  one where there is none or the two disagree (2 frames of game A).
 - Shaders: `XF_SHADERS=<dir> build/shader_compare_test`. The corpora are ../traces/shaders,
   ../traces/ue3_global and ../external/xna/work/shaders.
 - `XF_VK_VALIDATION=1` turns on Vulkan validation; run with it before reporting.

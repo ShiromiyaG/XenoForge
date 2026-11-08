@@ -76,7 +76,7 @@ added to its base; loads and stores swap bytes.
 - Division by zero (and the most negative number by -1) gives 0, as Xenia's
   backend does.
 - `dcbz` clears 128 bytes, as Xenia canary ("no short cache line" on the
-  Xbox 360); El Chavo Kart's own `dcbz` loops step by 128.
+  Xbox 360); game A's own `dcbz` loops step by 128.
 - Reservations: `lwarx`/`ldarx` record address and value after a fence;
   `stwcx.`/`stdcx.` store with one compare-exchange against the reserved
   value and drop the reservation; CR0's SO is left alone, as Xenia.
@@ -188,7 +188,7 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   runs entered the interpreter at (`DiscoverOptions::entries`, source
   `logged`: the runtime's entry log, D3, docs/runtime.md "The game
   library"); the data pointer scan's
-  (below); `bl` targets; last, gaps no function covers. On El Chavo Kart
+  (below); `bl` targets; last, gaps no function covers. On game A
   `.pdata` alone gives 52,360 of the 73,587 functions.
 - **The data pointer scan** (`scan_pointers`, `DiscoverOptions`; translated
   from the fork's `codegen/pointer_scan.cpp`, its `[analysis]
@@ -209,8 +209,8 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   holds are added the same way, and so are those inside a function whose
   end was only walked to (no `.pdata` size) when the branch reaches no start
   without the scan either: the XDK's context-save routine after a call that
-  never returns (the walk runs on past the `bl`; Forza Horizon and Reach),
-  a tail two functions share (Reach); the holder then runs on into it as a
+  never returns (the walk runs on past the `bl`; game D and game F),
+  a tail two functions share (game F); the holder then runs on into it as a
   tail call. Branches unresolved without the scan say
   nothing about the candidates. Not in rexglue: an address inside a jump
   table discovery read is no start (the `lis`/`addi` that loads a table's
@@ -224,7 +224,7 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   `bctr`, `b`, or where `.pdata` says a function ends, which may be a call
   that never returns) and after padding, as rexglue splits its gaps; each is
   walked as soon as it is found, so a run of leaf methods is cut in one
-  pass (rounds of one gap per run left all but the first 8 of El Chavo
+  pass (rounds of one gap per run left all but the first 8 of game A
   Kart's longer runs to the interpreter). A `blr` alone right after an end
   is the compiler's dead return after a tail call, a function only when a
   `bl`, a pointer or a branch reaches it (an empty virtual method comes back
@@ -250,7 +250,7 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   address (`ld r1, 0x90(r7)`: the CRT's longjmp; `ld r1, 0x20(r4); blr`:
   the C++ exception machinery's jump to a catch's continuation) or branches
   to KeSetCurrentStackPointers' thunk (`b`, `bc` or `bl`: the XDK's
-  SwitchToFiber, in Reach) may return to another frame than its caller's
+  SwitchToFiber, in game F) may return to another frame than its caller's
   (`Function::switches_stack`); one that keeps r1 in memory r1 does not
   address and returns (setjmp, or a tail branch to one) saves the stack
   (`saves_stack`); the return sites of the calls to those, the catch
@@ -265,17 +265,17 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   address with no generated code runs in the interpreter: a wrong guess
   costs speed, never correctness. `boot` counts those entries, which is how
   discovery is improved, game by game, without traps (rexglue leaves 26
-  unresolved branches and 26 unresolved table entries on El Chavo Kart, and
+  unresolved branches and 26 unresolved table entries on game A, and
   needed 633 starts added by hand; here no direct branch or table case of
   either game reaches an address without a start).
 - **Checked** against rexglue's lists (`xfrecomp analyze --compare`): El
-  Chavo Kart's project (74,112 entries: 294 imports, 73,818 bodies, 633 of
+  game A's project (74,112 entries: 294 imports, 73,818 bodies, 633 of
   them added by hand) and lists the fork wrote with its own scan for both
   games (`rexglue init` and `codegen` with `[entrypoint.analysis]
-  scan_data_pointers = true`, outside the repository; Ben 10's fails
+  scan_data_pointers = true`, outside the repository; game B's fails
   validation without it). Counts on 2026-11-05:
 
-  | | El Chavo Kart | Ben 10 |
+  | | game A | game B |
   |---|---|---|
   | functions (before the scan and the gap fix) | 73,182 | 22,493 |
   | functions now | 73,587 | 21,896 |
@@ -291,27 +291,27 @@ runs both games today, and from XenonAnalyse (`../XenonRecomp`, MIT):
   What is only in rexglue's list now: dead `blr`s nothing reaches (365
   and 214); the data of jump tables inline after their `bctr` (189 and
   135), which rexglue's scan takes as starts; code after a `blr` that the
-  function's own branch reaches (105 on El Chavo Kart, `bne` over `li r3;
+  function's own branch reaches (105 on game A, `bne` over `li r3;
   blr`), labels here; a `stwu r1` inside a prologue (1); 2 on each game
   after a `b` inside a function the scan found, labels here. Only here:
   leaf methods and adjustor thunks right after another function's `bctr`
   or `b` that rexglue merges into it (115 and 8), and 3 functions without
-  `.pdata` after a `blr` (El Chavo Kart). Before, El Chavo Kart's project
+  `.pdata` after a `blr` (game A). Before, game A's project
   list had 1,369 starts only there: the leaf method runs the gap filler's
   rounds left uncovered, besides its hand-added labels and table data.
-  In 20 s of `boot` linked with the generated code, El Chavo Kart entered
+  In 20 s of `boot` linked with the generated code, game A entered
   the interpreter 262,094 times at 802 addresses before (those leaf runs:
   `lwz r11, 0xA8(r3); lwz r10, 0x624(r11); rlwinm r3, ...; blr`, reached
-  through vtables) and Ben 10 10 times at 9 (small functions the same
-  rounds left uncovered); now neither does. El Chavo Kart's first swap comes at 1.0 s instead of 1.5 s, 593
+  through vtables) and game B 10 times at 9 (small functions the same
+  rounds left uncovered); now neither does. Game A's first swap comes at 1.0 s instead of 1.5 s, 593
   swaps in the 20 s instead of 509 (30 a second, its cap), and it gets as
-  far as registering its XAudio client; Ben 10 1,154 instead of 1,043 (60
+  far as registering its XAudio client; game B 1,154 instead of 1,043 (60
   a second).
 
 ## Modules and the game library
 
-A game is every executable on its disc, not one: Forza Horizon loads
-`XMediaFacade_default.xex`, Reach four Waves DLLs, BC2 boots a launcher
+A game is every executable on its disc, not one: Game D loads
+`XMediaFacade_default.xex`, game F four Waves DLLs, game C boots a launcher
 that loads `Splash.xex` and then `Game.xex`, both at 0x82A00000. So the
 generated code is per module:
 
@@ -326,22 +326,22 @@ generated code is per module:
 - **The table** (`ppc_module.h`, `table.cpp`): the module's path, base,
   image size and the digest of its image as the loader unpacks it
   (`image_digest`: 64 bits, four lanes of multiply-folds, as fast as memory
-  reads; SHA-1 would have cost 80 ms of El Chavo Kart's start), and its
+  reads; SHA-1 would have cost 80 ms of game A's start), and its
   functions by address. `modules.cpp` lists every module's table
   (`xf_modules`); the kernel gives a table its module's range when an image
   with that digest loads, so another version of a module or a title update
   runs interpreted, never another image's code.
 - **Files**: one per 64 KB of the image (about 16,000 instructions), each
   declaring only what it calls, written only when its text changes. A
-  discovery fix then rebuilds the files it touched (Forza Horizon's and
-  Reach's below: 2 and 4 files of 224 and 149), where one header declaring
+  discovery fix then rebuilds the files it touched (game D's and
+  game F's below: 2 and 4 files of 224 and 149), where one header declaring
   every function made any change rebuild the whole game, and every file
   parsed 1.5 MB of declarations (about 4 minutes per million instructions
   were measured with that layout under other builds' load).
 - **Optimization**: `XF_GAME_OPT` (default `-O2`) and `XF_GAME_OPT_<game>`.
-  Measured here at -O2 (12 threads): El Chavo Kart's 4.7M instructions in
+  Measured here at -O2 (12 threads): Game A's 4.7M instructions in
   269 s; the other six games' 21.7M in 1,465 s, part of it beside another
-  build; Ben 10's 1.7M in 143 s, and 100 s at -O1. Linking a `boot_<game>`
+  build; game B's 1.7M in 143 s, and 100 s at -O1. Linking a `boot_<game>`
   takes about a minute, which dominates a rebuild after a discovery fix (60
   files of the eight games and eight links: 534 s). -O2 stays the default:
   every game builds in under half an hour.
@@ -363,34 +363,34 @@ the scan):
 
 | game | module | functions | instructions | switches | resumes | unresolved |
 |---|---|---|---|---|---|---|
-| El Chavo Kart | default.xex | 73,293 | 4,720,516 | 1 | 9 in 9 | 0 |
-| Ben 10 | default.xex | 21,720 | 1,712,043 | 2 | 7 in 7 | 0 |
-| BC2 | Default.xex | 292 | 12,518 | 0 | 0 | 0 |
+| Game A | default.xex | 73,293 | 4,720,516 | 1 | 9 in 9 | 0 |
+| Game B | default.xex | 21,720 | 1,712,043 | 2 | 7 in 7 | 0 |
+| Game C | Default.xex | 292 | 12,518 | 0 | 0 | 0 |
 | | Splash.xex | 6,834 | 679,357 | 1 | 7 in 7 | 0 |
 | | Game.xex | 54,018 | 2,773,730 | 2 | 2 in 2 | 0 |
-| Forza Horizon | default.xex | 76,047 | 3,655,459 | 3 | 11 in 11 | 0 |
+| Game D | default.xex | 76,047 | 3,655,459 | 3 | 11 in 11 | 0 |
 | | XMediaFacade_default.xex | 3,163 | 525,032 | 0 | 0 | 0 |
 | | SpeechFacade_default.xex | 6,649 | 374,049 | 1 | 1 in 1 | 0 |
-| Gears of War 3 | default.xex | 56,302 | 3,465,904 | 2 | 2 in 2 | 0 |
-| Reach | default.xex | 37,904 | 2,424,688 | 3 | 41 in 25 | 0 |
+| Game E | default.xex | 56,302 | 3,465,904 | 2 | 2 in 2 | 0 |
+| Game F | default.xex | 37,904 | 2,424,688 | 3 | 41 in 25 | 0 |
 | | waveShell-Xbox.dll | 2,653 | 104,041 | 1 | 49 in 43 | 0 |
 | | wavesLibDLL.dll | 3,373 | 142,016 | 1 | 64 in 56 | 0 |
 | | waves\L360.dll | 1,352 | 47,348 | 1 | 2 in 2 | 0 |
 | | waves\Q10.dll | 1,147 | 38,123 | 1 | 2 in 2 | 0 |
-| Red Dead Redemption | default.xex | 69,231 | 3,418,826 | 0 | 1 in 1 | 0 |
-| Sonic Unleashed | default.xex | 65,842 | 4,046,585 | 2 | 156 in 106 | 0 |
+| Game G | default.xex | 69,231 | 3,418,826 | 0 | 1 in 1 | 0 |
+| Game H | default.xex | 65,842 | 4,046,585 | 2 | 156 in 106 | 0 |
 
 Two discovery fixes came from running them: the branch targets inside a
 walked function (above, "The data pointer scan"), and a .pdata function's
 end as an end for the gap filler and the pointer scan whatever its last
 instruction: a function that ends calling one that never returns (`bl
-_CxxThrowException`) is followed by another, Sonic's adjustor thunks
+_CxxThrowException`) is followed by another, game H's adjustor thunks
 (`addi r3, r3, 0xC; b ...`) reached only through vtables, which the gap
-filler skipped for want of a `blr` or `b` before them (Sonic entered the
-interpreter 135,471 times at 4 of them in 30 s; 12 such starts on Sonic, 1
-each on Forza Horizon, Reach and two of its DLLs).
+filler skipped for want of a `blr` or `b` before them (game H entered the
+interpreter 135,471 times at 4 of them in 30 s; 12 such starts on game H, 1
+each on game D, game F and two of its DLLs).
 
-Forza Horizon had 8, one byte-offset table's cases (0x829EB474: `rlwinm
+Game D had 8, one byte-offset table's cases (0x829EB474: `rlwinm
 r10, r9, 0, 26, 31`, so 64 entries by the mask, no compare) past the end of
 its function, into the middle of the next: the table is shorter than the
 mask allows (9 cases, MSVC's `default: __assume(0)` leaving the bound out)
@@ -407,23 +407,23 @@ same; no unresolved branch is left.
 another stack and return into another frame than their caller's:
 
 - **longjmp**, the CRT's: the registers, r1 and LR back from the `jmp_buf`
-  setjmp filled, r3 the value (BC2's Splash.xex, 8 times in 30 s; Reach's
+  setjmp filled, r3 the value (game C's Splash.xex, 8 times in 30 s; game F's
   streaming decompressor, to bail out of bad input);
 - **the jump to a catch's continuation** in the C++ exception machinery: a
   CONTEXT restored and a `blr` to the address the catch block returned;
 - **SwitchToFiber**, the XDK's: the registers saved into the current fiber,
   the next one's loaded (LR and r1 among them), then a tail branch to
   KeSetCurrentStackPointers, which moves r1 to the next fiber's stack
-  (Reach's decompressor runs on a fiber of its own and switches back to its
+  (game F's decompressor runs on a fiber of its own and switches back to its
   caller whenever its input runs out: 1,202 switches in 30 s of `boot`, 34
   fibers made and deleted).
 
 A C++ return cannot go into the middle of another function's frame. Until
 now those functions were left to the interpreter, and their returns were
 thrown up to the dispatch whose frames held the restored r1, which
-interpreted the guest's frames from there up to its own return (Reach
-entered the interpreter 1,803 times in 30 s, BC2 16; after its first
-switch, a fiber of Reach's ran interpreted for good). Now the generated
+interpreted the guest's frames from there up to its own return (game F
+entered the interpreter 1,803 times in 30 s, game C 16; after its first
+switch, a fiber of game F's ran interpreted for good). Now the generated
 code follows them, and nothing between is interpreted:
 
 - **Each guest stack runs on a host stack of its own** (docs/runtime.md,
@@ -457,12 +457,12 @@ code follows them, and nothing between is interpreted:
   (`.pdata`'s flag), at each address inside it, past its start, that a
   lis/addi pair makes anywhere in the code: a catch block is a funclet with
   its own `.pdata` that ends `lis r3, cont@ha; addi r3, r3, cont@l; blr`
-  (checked on Reach: 0x821D6038's two catch funclets return 0x821D60AC and
+  (checked on game F: 0x821D6038's two catch funclets return 0x821D60AC and
   0x821D60B0; the pointer scan took the first for a start, which it stays,
   and the label is emitted in the parent too). A function with resume sites
   has its body run by the runtime (`resumable`, ppc_runtime.h), which runs
   it again from a resume site when an Unwind to one of them comes back with
-  r1 inside its frame (Reach's setjmp caller, a decompressor entry):
+  r1 inside its frame (game F's setjmp caller, a decompressor entry):
 
   ```cpp
   XF_FN(xf_827D2B80) {
@@ -505,22 +505,22 @@ code follows them, and nothing between is interpreted:
 - **Cost**: nothing where nothing switches. The checked returns are in the
   switching functions alone (20 in the 16 modules), a call through
   `resumable` for each call of a function with resume sites (274
-  functions, 354 sites, most of them catch continuations in Sonic and
-  Reach's Waves DLLs: the table above), and an Unwind is a C++ exception
+  functions, 354 sites, most of them catch continuations in game H and
+  game F's Waves DLLs: the table above), and an Unwind is a C++ exception
   (3.7 microseconds through 2 frames, 6.2 through 17, the same in a game
   library: game_library_test), only for longjmps and catches.
 
 Measured (2026-11-05, 30 s of `boot_<game>`, whose report now says what
-took each switch): Reach enters the interpreter 0 times (1,803 before: 1,202
+took each switch): Game F enters the interpreter 0 times (1,803 before: 1,202
 at SwitchToFiber, 567 at the decompressor's return from it, 34 at the fiber
 start routine); its 1,202 switches are host fiber switches, its 34 fibers
 get 34 host fibers, dropped with their stacks (MmDeleteKernelStack), and
-nothing is unwound. BC2 enters it 0 times (16 before: 8 at longjmp, 8 at the
+nothing is unwound. Game C enters it 0 times (16 before: 8 at longjmp, 8 at the
 setjmp caller's return site); its 8 longjmps are taken by the setjmp
 caller's generated frame at its resume site. The other six games enter it 0
 times, as before, and none of them switches stacks or unwinds in its first
 30 s. Swaps a second are as before, at the games' caps when the machine is
-not loaded (Reach 58 to 60, BC2 29.3); the switches and longjmps were too
+not loaded (game F 58 to 60, game C 29.3); the switches and longjmps were too
 few for their interpretation to show in the rate.
 
 Left to the interpreter, correct and slower (none of it seen in the eight
@@ -604,9 +604,9 @@ Choices and limits:
   view once it writes them.
 - **Cost**: four private views shared by the threads (each holds commit
   charge for 4.5 GB on Windows), taken only while a segment's interpreter
-  runs. El Chavo Kart, 30 s at one call in 100: 30 swaps a second fall to 29.
+  runs. Game A, 30 s at one call in 100: 30 swaps a second fall to 29.
 
-El Chavo Kart (2026-11-07, one call in 100, 30 s): 200,455 calls, 283,219
+Game A (2026-11-07, one call in 100, 30 s): 200,455 calls, 283,219
 segments, 0 mismatches, 20 differences after memory read changed (the
 kernel's time stamp bundle, audio positions), 130 given up at MMIO; one in 5,
 40 s: 396,431 segments, 0 mismatches.

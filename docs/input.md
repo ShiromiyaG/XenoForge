@@ -36,7 +36,7 @@ and the input system behind them (Xenia's InputSystem):
   vibrations and connection changes.
 
 The games: both call XamInputGetCapabilities, GetState and SetState for
-users 0-3 every frame; Ben 10 also polls XamInputGetKeystrokeEx with
+users 0-3 every frame; one (game B) also polls XamInputGetKeystrokeEx with
 `ANY_USER | KEYBOARD` (0x40000002), which only a keyboard in Xenia's
 passthrough mode answers, so it gets "not connected" here as in Xenia
 with its default drivers.
@@ -45,7 +45,7 @@ with its default drivers.
 
 Boot installs an **idle pad**: a controller for user 0, nothing pressed
 (`input::make_idle_pad`). Xenia's default drivers answer nothing without a
-pad plugged in, and Ben 10 then pauses on "Controller Lost Connection";
+pad plugged in, and game B then pauses on "Controller Lost Connection";
 with the idle pad it plays its intro. `--no-controller` leaves every user
 disconnected, as Xenia without a pad.
 

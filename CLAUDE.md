@@ -35,13 +35,13 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
   Xenia leva o aviso BSD no topo do arquivo e é conferido contra o Xenia na mesma sessão. As tabelas de exports
   em `src/exports/` são cópias sem mudança (xenia-canary `838850fed`).
 - **Corpus de shaders** (fora do repo, dados de jogo): `../traces/shaders` (13, dos traces via `--dump_shaders`),
-  `../traces/ue3_global` (118, do `GlobalShaderCache-Xbox360.bin` do Chaves via `xfeffect`),
+  `../traces/ue3_global` (118, do `GlobalShaderCache-Xbox360.bin` do jogo A via `xfeffect`),
   `../external/xna/work/shaders` (10, de `tests/hlsl/`). Rodar: `XF_SHADERS=<pasta> build/shader_compare_test`.
   O `.defs` ao lado de cada shader traz as constantes literais do contêiner (o D3D as carrega com o shader).
 - **Renderizador (B3)**: `build/xfreplay <xtr> -o frame.png --compare <png do trace-dump> [--diff d.png] [-v]`;
   regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 29 frames batem com o Xenia; a referência é o
   dump D3D12 do Xenia, `xenia-gpu-d3d12-trace-dump.exe`, em `../traces/dumps/d3d12`, com o Vulkan onde não há
-  D3D12 ou os dois discordam: parque e corrida do Chaves). Desde 2026-11-06 o padrão é a EDRAM exata via
+  D3D12 ou os dois discordam: 2 frames do jogo A). Desde 2026-11-06 o padrão é a EDRAM exata via
   fragment shader interlock (FSI) onde o device tem: aí o `replay_test` compara sozinho com os dumps exatos do
   Xenia em `../traces/dumps/rov` (`rov/d3d12` = ROV, `rov` = FSI do Vulkan); `XF_RENDER_TARGET_PATH=host` volta
   aos render targets do host e aos dumps de antes.
@@ -52,7 +52,7 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
 - **Som (A6)**: XMA pelo `xmaframes` do FFmpeg do Xenia (`ffmpeg-xma.dll`, LGPL). Regressão contra o Xenia:
   `XF_XMA_TRACES=../traces/xma build/xma_replay_test` (gravações com `XF_XMA_RECORD=<arquivo.xmar>`; o oráculo
   `xma_oracle` sai de `tools/xenia_oracle/build.bat xma`). `XF_AUDIO_WAV=<prefixo>` grava a mixagem para ouvir.
-- **Jogos com código gerado**: `-DXF_GAMES="chaves;ben10"` gera `boot_<jogo>` e `player_<jogo>` (janela SDL3,
+- **Jogos com código gerado**: `-DXF_GAMES="<nome>;<nome>"` (nomes das pastas em `gen-modules`) gera `boot_<jogo>` e `player_<jogo>` (janela SDL3,
   controle, som), com o código de `../external/gen-modules` (padrão do `XF_GEN_DIR`; `xfrecomp emit` grava lá).
 - **Biblioteca do jogo (D1/D2)**: `build/xfbuild <iso> [cache]` recompila o disco numa DLL em cache
   (`<cache>/<digest>-<versão da interface>.dll`; padrão `%LOCALAPPDATA%\xenoforge\cache`; clang e lld, 4 jobs); o
@@ -70,11 +70,12 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
   Rodar: `XF_PPC_TESTS=../external/ppc_tests build/ppc_test [filtros] [-v]` (interpretador) e, configurando com
   `-DXF_PPC_TESTS_DIR=F:/RECOMPs/external/ppc_tests`, `build/ppc_recompiled_test` (os testes recompilados pelo
   `xfrecomp tests`; ~1 min de build). Descoberta: `build/xfrecomp analyze <iso> --compare <*_init.cpp do rexglue>`.
-- O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando Chaves e Ben 10 até o XenoForge rodá-los.
+- O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando os ports dos jogos A e B até o XenoForge rodá-los.
   Não mexer nele por causa do XenoForge.
 - **Nenhum nome de jogo no repositório** (dono, 2026-11-08): nem em código, comentários, testes, CMake, scripts,
   exemplos, READMEs, docs ou mensagens de commit. Escrever "um jogo", "<jogo>", endereços inventados nos
-  exemplos. Testar com discos reais à mão pode; quais foram fica só no relatório/conversa.
+  exemplos; medições por jogo usam "jogo A".."jogo H", com a chave (nomes, title IDs, caminhos dos discos) só
+  no `docs/plan.md` local, seção "Test discs". Testar com discos reais à mão pode.
 - Nada derivado dos jogos entra aqui (ISOs, XEX, imagens, traces de GPU, dumps). Listas de nomes de funções do
   sistema e versões do XDK são fatos e podem ir para os docs.
 - O renderizador é geral (implementa o hardware, nunca casos de jogo); o que um jogo pede e não existe é
@@ -83,5 +84,5 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
   de `_WIN32` com o par POSIX, tamanhos vindos do host, processos via SDL3. Vulkan 1.3 é o piso; acima disso, tudo
   opcional com fallback no caminho do Xenia. A GPU vai além do Xenia onde o AoT ou o Vulkan moderno permitem,
   com o trace do Xenia como imagem a bater ("Beyond Xenia on the GPU").
-- Verificação real feita: imagem do `default.xex` do Chaves via `xfinspect --dump-image` idêntica byte a byte a
-  `../Chaves/re/image.bin` (script Python com PyCryptodome).
+- Verificação real feita: imagem do `default.xex` do jogo A via `xfinspect --dump-image` idêntica byte a byte a
+  imagem tirada à parte pelo script Python do port (PyCryptodome).
