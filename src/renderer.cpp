@@ -1119,7 +1119,7 @@ public:
     // unwritten (memory.h's watches: watched, the count taken, then the
     // copy). Never while a trace is recorded (it wants each load's words).
     bool shader_again(uint32_t type, uint32_t address, uint32_t dwords) override {
-        Call call(*this, nullptr);
+        Call call(*this, nullptr, true);
         shader_at_open_ = false;
         if (!call || trace_ || type > 1 || !dwords || address + uint64_t(dwords) * 4 > GuestMemory::SIZE) return false;
         const uint64_t key = shader_at(type, address, dwords);
@@ -1211,8 +1211,9 @@ public:
     // which no watch sees, so the watches are told; the mirror's pages and
     // the textures there are loaded again at their next use
     void memory_written(uint32_t address, uint32_t bytes) override {
-        Call call(*this, nullptr);
-        std::vector<Range> written;
+        Call call(*this, nullptr, true);
+        std::vector<Range> &written = draw_lists_.written; // (kept for its room)
+        written.clear();
         add_span(written, address, bytes);
         for (auto [start, stop] : written) mem_.physical_written(start, stop - start);
     }
@@ -1277,20 +1278,33 @@ private:
     // adds the time from its making to its end to a count of seconds
     class Timer {
     public:
-        explicit Timer(double &into) : into_(into), start_(std::chrono::steady_clock::now()) {}
-        ~Timer() { into_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count(); }
+        // (on false: nothing timed, no clock read)
+        explicit Timer(double &into, bool on = true) : into_(into), on_(on) {
+            if (on_) start_ = std::chrono::steady_clock::now();
+        }
+        ~Timer() {
+            if (on_) into_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+        }
 
     private:
         double &into_;
+        bool on_;
         std::chrono::steady_clock::time_point start_;
     };
+    // Options::cpu_times (or XF_RENDERER_CPU_TIMES=1): the clock read around the work done at
+    // every draw, texture and shader load too. Off, Report::check_seconds and vertex_seconds stay
+    // 0 and Report::seconds leaves out the calls that neither draw, resolve nor swap: two clock
+    // reads around each were 4% of the command thread in a scene of 3,000 draws.
+    bool cpu_times_ = false; // (set in init)
 
     // One of the processor's calls: the renderer's state is its alone while
     // it runs (report() waits), the registers are the processor's as they
     // stand, and its time is counted. False once the device has failed.
     class Call {
     public:
-        Call(Impl &r, const gpu::RegisterFile *registers) : r_(r), lock_(r.mutex_), timer_(r.report_.seconds) {
+        // (small: one of the many short calls, timed only with cpu_times_)
+        Call(Impl &r, const gpu::RegisterFile *registers, bool small = false)
+            : r_(r), lock_(r.mutex_), timer_(r.report_.seconds, !small || r.cpu_times_) {
             if (registers) r.regs_ = registers->data(), r.file_ = registers;
         }
         explicit operator bool() const { return r_.fatal_.empty(); }
@@ -2151,7 +2165,7 @@ private:
     // the command thread in the heap). Each is cleared where draw() starts
     // filling it; the swaps (not moves) between them keep every buffer.
     struct DrawScratch {
-        std::vector<Range> exported, vertex_ranges, sorted;
+        std::vector<Range> exported, vertex_ranges, sorted, written;
         std::vector<uint32_t> indices, triangles, converted, guest_indices, strips, key, color_key;
         std::vector<uint8_t> raw_indices;
     } draw_lists_;
@@ -2565,6 +2579,8 @@ void Impl::save_pipeline_cache() {
 }
 
 bool Impl::init(std::string &error) {
+    if (const char *v = std::getenv("XF_RENDERER_CPU_TIMES")) cpu_times_ = v[0] == '1';
+    cpu_times_ = cpu_times_ || options_.cpu_times;
     open_pipeline_cache();
     support_ = texture_support(d_);
     if (options_.async_pipelines) {
@@ -5168,7 +5184,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     if (t && !t->stale) {
         bool same;
         {
-            Timer timer(report_.check_seconds);
+            Timer timer(report_.check_seconds, cpu_times_);
             same = unwritten(*t);
         }
         if (same) {
@@ -8027,7 +8043,7 @@ void Impl::draw(const gpu::Draw &d) {
         }
     }
     {
-        Timer timer(report_.vertex_seconds);
+        Timer timer(report_.vertex_seconds, cpu_times_);
         report_.vertex_bytes += request(vertex_ranges, &vertex_memo_);
         // guest memory's bytes under the streams' pages, where the mirror has
         // nothing newer (Xenia's RequestRange of each stream)

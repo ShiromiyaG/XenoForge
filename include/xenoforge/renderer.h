@@ -187,6 +187,10 @@ enum class ReadbackResolve {
 
 struct Options {
     bool verbose = false; // a line per draw and resolve on stderr
+    // The clock read around the work done at every draw, texture and shader load too: without it
+    // Report::check_seconds and vertex_seconds stay 0 and Report::seconds leaves out the calls that
+    // neither draw, resolve nor swap. For the tools that print them (XF_RENDERER_CPU_TIMES=1 anywhere).
+    bool cpu_times = false;
     ReadbackResolve readback_resolve = ReadbackResolve::none;
     // where to write each shader loaded, as Xenia's --dump_shaders writes
     // them (shader_<hash>.ucode.bin.vert or .frag, words in host order; the

@@ -61,6 +61,7 @@ int usage() {
 int main(int argc, char **argv) {
     std::string trace_path, out_path, compare_path, diff_path;
     xf::render::Options options;
+    options.cpu_times = true; // the report's times are printed whole
     bool restore_edram = true;
     uint32_t repeat = 1;
     size_t profile_top = 0;
