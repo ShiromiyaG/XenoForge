@@ -292,6 +292,7 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    VkPhysicalDeviceFaultFeaturesEXT fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     {
         const bool has_eds3 =
             has_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && !turned_off("XF_VK_NO_EDS3");
@@ -404,6 +405,29 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
                 *tail = &conditional, tail = &conditional.pNext;
                 enabled.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
                 d->conditional_rendering_ = true;
+            }
+        }
+        // VK_EXT_device_fault: on a lost device, the addresses the GPU faulted
+        // on and the vendor's codes, for the report (nothing is drawn
+        // differently; XF_VK_NO_DEVICE_FAULT=1 turns it off)
+        // VK_EXT_memory_budget: each heap's use and what the system lets this
+        // process have of it, for the reports (heap_report)
+        if (has_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+            enabled.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+            d->memory_budget_ = true;
+        }
+        if (has_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) && !turned_off("XF_VK_NO_DEVICE_FAULT")) {
+            VkPhysicalDeviceFaultFeaturesEXT has_fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_fault.pNext = &has_fault;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_fault);
+            if (has_fault.deviceFault) {
+                fault.deviceFault = VK_TRUE;
+                fault.deviceFaultVendorBinary = has_fault.deviceFaultVendorBinary;
+                *tail = &fault, tail = &fault.pNext;
+                enabled.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+                d->device_fault_ = true;
+                d->device_fault_vendor_binary_ = has_fault.deviceFaultVendorBinary;
             }
         }
         // (without fast linking a linked pipeline may cost as much as a whole
@@ -747,6 +771,70 @@ bool Device::run(const std::function<void(VkCommandBuffer)> &record, std::string
 VkResult Device::submit(uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     return vkQueueSubmit(queue_, count, submits, fence);
+}
+
+std::string Device::heap_report() {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    if (memory_budget_) props.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(physical_, &props);
+    std::string out;
+    for (uint32_t h = 0; h < props.memoryProperties.memoryHeapCount; h++) {
+        const VkMemoryHeap &heap = props.memoryProperties.memoryHeaps[h];
+        // what the heap's types are: device-local, host-visible
+        bool visible = false;
+        for (uint32_t t = 0; t < props.memoryProperties.memoryTypeCount; t++)
+            if (props.memoryProperties.memoryTypes[t].heapIndex == h &&
+                (props.memoryProperties.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+                visible = true;
+        char line[200];
+        if (memory_budget_)
+            std::snprintf(line, sizeof(line), "%sheap %u (%s%s, %llu MB): %llu MB used of a %llu MB budget",
+                          out.empty() ? "" : "; ", h, heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "device-local" : "host",
+                          visible ? ", host-visible" : "", (unsigned long long)(heap.size >> 20),
+                          (unsigned long long)(budget.heapUsage[h] >> 20), (unsigned long long)(budget.heapBudget[h] >> 20));
+        else
+            std::snprintf(line, sizeof(line), "%sheap %u (%s%s, %llu MB)", out.empty() ? "" : "; ", h,
+                          heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "device-local" : "host",
+                          visible ? ", host-visible" : "", (unsigned long long)(heap.size >> 20));
+        out += line;
+    }
+    return out;
+}
+
+std::string Device::fault_report() {
+    if (!device_fault_ || !vkGetDeviceFaultInfoEXT) return {};
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (vkGetDeviceFaultInfoEXT(device_, &counts, nullptr) != VK_SUCCESS) return "no fault information";
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendor.data();
+    counts.vendorBinarySize = 0; // (the vendor's binary dump is not kept)
+    VkResult r = vkGetDeviceFaultInfoEXT(device_, &counts, &info);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) return "no fault information (" + std::to_string(r) + ")";
+    std::string out = info.description[0] ? info.description : "a fault";
+    static const char *const kinds[] = {"none", "an invalid read", "an invalid write", "an invalid execute",
+                                        "an instruction pointer unknown", "an instruction pointer invalid",
+                                        "an instruction pointer fault"};
+    for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+        const VkDeviceFaultAddressInfoEXT &a = addresses[i];
+        char line[160];
+        const uint64_t precision = a.addressPrecision ? a.addressPrecision : 1;
+        std::snprintf(line, sizeof(line), "; %s at %016llX-%016llX",
+                      size_t(a.addressType) < std::size(kinds) ? kinds[a.addressType] : "an unknown kind",
+                      (unsigned long long)(a.reportedAddress & ~(precision - 1)),
+                      (unsigned long long)((a.reportedAddress | (precision - 1))));
+        out += line;
+    }
+    for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
+        char line[320];
+        std::snprintf(line, sizeof(line), "; vendor: %s (code %016llX, data %016llX)", vendor[i].description,
+                      (unsigned long long)vendor[i].vendorFaultCode, (unsigned long long)vendor[i].vendorFaultData);
+        out += line;
+    }
+    return out;
 }
 
 } // namespace xf::vk

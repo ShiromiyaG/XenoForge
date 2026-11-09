@@ -1330,6 +1330,15 @@ private:
         gpu_mark(it->second);
     }
     void gpu_mark(uint32_t kind);
+    // after a lost device: when (the swaps and draws so far) and what the
+    // driver says went wrong (vk::Device::fault_report); empty otherwise
+    std::string lost_device_report(VkResult r) {
+        if (r != VK_ERROR_DEVICE_LOST) return {};
+        std::string out = ", the device lost after " + std::to_string(report_.swaps) + " swaps and " +
+                          std::to_string(report_.draws) + " draws";
+        std::string fault = d_.fault_report();
+        return (fault.empty() ? out : out + ": " + fault) + "; " + d_.heap_report();
+    }
     void gpu_collect(Slot &s);
     std::string target_name(const RenderTarget &t) const;
 
@@ -3176,7 +3185,7 @@ void Impl::flush() {
         submit.pCommandBuffers = buffers;
         vkResetFences(dev_, 1, &s.fence);
         if (VkResult r = d_.submit(1, &submit, s.fence); r != VK_SUCCESS)
-            fatal_ = "a submission failed (" + std::to_string(r) + ")";
+            fatal_ = "a submission failed (" + std::to_string(r) + ")" + lost_device_report(r);
     }
     report_.submissions++;
     current_ = (current_ + 1) % SLOTS;
@@ -3198,7 +3207,7 @@ bool Impl::finish_oldest(bool wait) {
         status = vkWaitForFences(dev_, 1, &oldest->fence, VK_TRUE, 20'000'000'000ull);
     }
     if (status != VK_SUCCESS) {
-        fatal_ = "waiting for the GPU failed (" + std::to_string(status) + ")";
+        fatal_ = "waiting for the GPU failed (" + std::to_string(status) + ")" + lost_device_report(status);
         return false;
     }
     finish(*oldest);
@@ -7581,6 +7590,14 @@ void Impl::draw(const gpu::Draw &d) {
         mark_used(exported);
     }
     if (!fatal_.empty()) return;
+    // The submission the draw is in begun now: a flush above leaves the next
+    // one unbegun, and the constants' offsets kept from the last draw
+    // (last_*_at_, cleared as a submission begins) would otherwise still be
+    // the flushed one's. A draw reusing them read that slot's share, which
+    // the host writes again as soon as the slot records again, while this
+    // submission may still be on the GPU: garbage constants (a lost device
+    // with the constants in their own buffer, which fills a slot mid-frame).
+    cmd();
 
     // the interlock path's constants, with the occlusion counter the draw
     // counts in (the slot's, so once the flush above is past)
@@ -7605,6 +7622,18 @@ void Impl::draw(const gpu::Draw &d) {
         last_system_at_ = draw_data_take(sizeof(System), ubo_align_);
         std::memcpy(draw_data(last_system_at_), &sys, sizeof(System));
         last_system_ = sys;
+    }
+    // Every block the draw reads lies in its own submission's share: one in
+    // another's is the host's to write again while this one runs (the lost
+    // device above). A renderer bug, stopped here rather than on the GPU.
+    {
+        const VkDeviceSize share = draw_data_.buffer ? DRAW_DATA_SLOT : ARENA_SLOT;
+        const VkDeviceSize fsi_at = fsi_ && fragment ? last_fsi_at_ : NONE;
+        for (VkDeviceSize at : {last_constants_at_[0], last_constants_at_[1], last_system_at_, fsi_at})
+            if (at != NONE && at / share != current_) {
+                fatal_ = "a draw's constants lie outside its submission's share of the arena";
+                return;
+            }
     }
     dynamic_offsets[0] = uint32_t(last_constants_at_[0]);
     dynamic_offsets[1] = uint32_t(last_system_at_);

@@ -167,6 +167,13 @@ public:
     // submissions made one at a time.
     VkResult submit(uint32_t count, const VkSubmitInfo *submits, VkFence fence);
     std::mutex &queue_mutex() { return queue_mutex_; }
+    // After VK_ERROR_DEVICE_LOST: what the driver says went wrong
+    // (VK_EXT_device_fault: each faulting address with its kind, and the
+    // vendor's codes), one line; empty where the device has no fault report
+    std::string fault_report();
+    // each memory heap: its kind and size, and with VK_EXT_memory_budget what
+    // this process uses of it and may have; one line
+    std::string heap_report();
 
 private:
     Device() = default;
@@ -205,6 +212,7 @@ private:
     bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false, fill_mode_non_solid_ = false;
     bool maintenance8_ = false;
     bool conditional_rendering_ = false;
+    bool device_fault_ = false, device_fault_vendor_binary_ = false, memory_budget_ = false;
     bool custom_border_color_ = false, storage_image_update_after_bind_ = false;
     float line_width_range_[2] = {1.0f, 1.0f};
     bool dynamic_blend_ = false, pipeline_library_ = false, cache_control_ = false;

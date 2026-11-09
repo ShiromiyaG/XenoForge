@@ -2531,6 +2531,35 @@ keeps them in the arena; `-v` says where they are. The experiment above
 (the whole arena moved) took game B's host-path replay from 1.36-1.38 to
 1.29-1.35 ms a play.
 
+**The lost device it exposed (fixed 2026-11-09).** Game D's played drive
+lost the device in every run (5 of 5, between swaps 4,468 and 5,543, some
+160 s in): `VK_ERROR_DEVICE_LOST`, the driver's fault report an invalid
+write at 0x0-0xFFF. Turning the four speedups of the round off one half at
+a time left this one: without it no run lost the device (2 runs of 200 s).
+The cause was older than it. A draw whose blocks did not fit flushed the
+submission, and nothing began the next one before the constants' cache
+(`last_*_at_`, cleared as a submission begins) was consulted, so a draw
+whose constants had not changed reused the flushed submission's offsets: it
+read that slot's share, which the host writes again as soon as the slot
+records again, while this submission may still be on the GPU. A slot's
+share of the constants' buffer is 16 MB against the arena's 64 MB, and a
+heavy scene's constants (about 3,000 draws a frame) fill it mid-frame: a
+flush every frame, where the arena's came rarely. The draw now begins its
+submission before the cache is consulted, and every block it reads is
+checked to lie in its own submission's share (a renderer bug stopped there,
+with a message, not on the GPU). Game D's drive since: 230 s, 6,858 swaps,
+no lost device.
+
+**What a lost device reports.** The renderer's failure line names the
+swaps and draws so far, the driver's fault report where the device has
+`VK_EXT_device_fault` (each faulting address with its kind: read, write,
+execute; the vendor's codes) and each memory heap's use against its budget
+(`VK_EXT_memory_budget`). `XF_VK_NO_DEVICE_FAULT=1` leaves the fault report
+out. Game D's line before the fix: "the device lost after 5543 swaps and
+3145200 draws: a fault; an invalid write at 0000000000000000-0000000000000FFF;
+... heap 2 (device-local, host-visible, 214 MB): 49 MB used of a 164 MB
+budget" (the window was not the cause).
+
 **Dynamic state only where it changes.** A draw sets each of its 25 dynamic
 states only where it differs from what the command buffer holds
 (`DrawState`, compared bytewise); a new command buffer, another of the
