@@ -251,6 +251,11 @@ struct Counts {
     std::atomic<uint64_t> immediate_draws{0};                 // with immediate indices (Xenia fails them)
     std::atomic<uint64_t> interrupts{0};                      // INTERRUPT's, one per CPU in its mask
     std::atomic<uint64_t> waits{0};                           // WAIT_REG_MEM polls that did not match
+    // of them: on memory (the rest on a register), and with a sleep (a wait field of 0x100 or
+    // more: the rest yield); the WAIT_REG_MEM packets that did not match at once, and the last
+    // such packet's poll address (bit 31: memory), reference, mask and wait field
+    std::atomic<uint64_t> waits_on_memory{0}, waits_asleep{0}, waiting_packets{0};
+    std::atomic<uint32_t> last_wait_poll{0}, last_wait_ref{0}, last_wait_mask{0}, last_wait_field{0};
     std::atomic<uint64_t> bad_packets{0};                     // ones that stopped their buffer
     std::array<std::atomic<uint64_t>, 128> opcodes{};         // type-3 packets by opcode
     std::array<std::atomic<uint64_t>, 128> unknown_opcodes{}; // the ones it has no handler for

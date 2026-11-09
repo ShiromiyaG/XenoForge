@@ -567,7 +567,7 @@ bool CommandProcessor::wait_reg_mem() {
     uint32_t wait_info = reader_.next(), poll = reader_.next(), ref = reader_.next(), mask = reader_.next();
     uint32_t wait = reader_.next();
     bool is_memory = wait_info & 0x10;
-    for (;;) {
+    for (bool first = true;; first = false) {
         uint32_t value;
         if (is_memory) {
             if (sink_) sink_->memory_read(poll & ~3u & PHYSICAL_MASK, 4);
@@ -578,6 +578,16 @@ bool CommandProcessor::wait_reg_mem() {
         }
         if (match(value & mask, ref, wait_info)) return true;
         bump(counts_.waits);
+        // what was waited for, for the report (the kernel's video line)
+        if (is_memory) bump(counts_.waits_on_memory);
+        if (wait >= 0x100) bump(counts_.waits_asleep);
+        if (first) {
+            bump(counts_.waiting_packets);
+            counts_.last_wait_poll.store((poll & 0x7FFFFFFF) | (is_memory ? 0x80000000u : 0u), std::memory_order_relaxed);
+            counts_.last_wait_ref.store(ref, std::memory_order_relaxed);
+            counts_.last_wait_mask.store(mask, std::memory_order_relaxed);
+            counts_.last_wait_field.store(wait, std::memory_order_relaxed);
+        }
         // the CPU may read the screen extents before it lets the wait end
         poll_extents(true);
         if (!host_.wait(wait)) return false;

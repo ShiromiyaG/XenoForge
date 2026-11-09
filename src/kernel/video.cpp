@@ -363,6 +363,19 @@ std::string video_report(Kernel &k) {
                   (unsigned long long)n.waits.load(), (unsigned long long)n.failed_draws.load(),
                   (unsigned long long)n.bad_packets.load());
     out += line;
+    if (uint64_t waits = n.waits.load()) {
+        // what the processor waited for (WAIT_REG_MEM polls that did not match)
+        uint32_t poll = n.last_wait_poll.load();
+        std::snprintf(line, sizeof(line),
+                      "gpu: of %llu WAIT_REG_MEM packets %llu did not match at once: %llu polls, %llu on memory, %llu "
+                      "with a sleep; the last on %s 0x%X, reference 0x%X, mask 0x%X, wait 0x%X\n",
+                      (unsigned long long)n.opcodes[pm4::WAIT_REG_MEM].load(),
+                      (unsigned long long)n.waiting_packets.load(), (unsigned long long)waits,
+                      (unsigned long long)n.waits_on_memory.load(), (unsigned long long)n.waits_asleep.load(),
+                      poll & 0x80000000u ? "memory" : "register", poll & 0x7FFFFFFF, n.last_wait_ref.load(),
+                      n.last_wait_mask.load(), n.last_wait_field.load());
+        out += line;
+    }
     if (uint64_t waits = v.spin_waits.load()) {
         std::snprintf(line, sizeof(line), "gpu: %llu sleeps of threads spinning while it worked (%u write-backs)\n",
                       (unsigned long long)waits, v.write_backs.load());
