@@ -680,7 +680,8 @@ struct System {
     // per slot, its texture's signs on the result components (bits 0-7, two
     // each: unsigned, signed, biased, gamma; Xenia's SwizzleSigns) and the
     // width less one of each one's component (bits 8-23, four each; 0
-    // unknown), for biased components
+    // unknown), for biased components, and the components rounded to 16
+    // fractional bits (bits 24-27, texture::q16_components)
     uint32_t signs[32];
     uint32_t signed_slots[32]; // per slot, its texture's signed view as slots has it; 0 none
     float clip_planes[6][4];   // the user clip planes enabled, packed (shader::VertexOptions)
@@ -692,36 +693,15 @@ struct System {
 };
 static_assert(sizeof(System) == 608);
 
-// The bits of each component of a fixed-point guest texture format, in the
-// texel's order (Xenia's texture_info_formats.inl, its fixed formats); zeros
-// for the others.
-std::array<uint32_t, 4> component_bits(uint32_t format) {
-    switch (format) {
-    case 2: case 8: case 9: case 58: case 59: return {8, 0, 0, 0};       // 8, 8_A, 8_B, DXT3A, DXT5A
-    case 3: return {5, 5, 5, 1};                                         // 1_5_5_5
-    case 4: return {5, 6, 5, 0};                                         // 5_6_5
-    case 5: return {5, 5, 6, 0};                                         // 6_5_5
-    case 6: case 14: case 50: case 62: return {8, 8, 8, 8};              // 8_8_8_8 and its kin
-    case 7: case 54: return {10, 10, 10, 2};                             // 2_10_10_10
-    case 10: case 49: case 60: return {8, 8, 0, 0};                      // 8_8, DXN, CTX1
-    case 13: case 25: return {16, 16, 0, 0};                             // 16_16
-    case 15: return {4, 4, 4, 4};                                        // 4_4_4_4
-    case 16: case 55: return {11, 11, 10, 0};                            // 10_11_11
-    case 17: case 56: return {10, 11, 11, 0};                            // 11_11_10
-    case 21: case 26: return {16, 16, 16, 16};                           // 16_16_16_16
-    case 24: return {16, 0, 0, 0};                                       // 16
-    default: return {0, 0, 0, 0};
-    }
-}
-
 // A slot's signs word (System::signs): the fetch constant's signs through its
 // swizzle onto the result components, as Xenia's SwizzleSigns (constant
-// components unsigned, or signed when everything else is), and the biased
-// ones' component widths as its GetIntegerScaleBits gives them.
+// components unsigned, or signed when everything else is), the biased ones'
+// component widths as its GetIntegerScaleBits gives them, and the components
+// rounded to 16 fractional bits.
 uint32_t swizzled_signs(const texture::Info &info) {
-    uint32_t signs = 0, constants = 0;
+    uint32_t signs = texture::q16_components(info) << 24, constants = 0;
     bool any_signed = false, any_not_signed = false;
-    std::array<uint32_t, 4> bits = component_bits(info.format);
+    std::array<uint32_t, 4> bits = texture::component_bits(info.format);
     uint32_t last_stored = 0;
     for (uint32_t c = 1; c < 4; c++)
         if (bits[c]) last_stored = c;
@@ -1366,6 +1346,12 @@ private:
         return v && v[0] == '1';
     }();
     Texture::StaleBy stale_by_; // the resolve under way, for textures_written_by_gpu
+    // depth resolves feeding textures, and depth textures as targets
+    // (resolve_targets; XF_RESOLVE_TARGETS_DEPTH=0 turns both off)
+    bool depth_targets_ = [] {
+        const char *v = std::getenv("XF_RESOLVE_TARGETS_DEPTH");
+        return !(v && v[0] == '0');
+    }();
     void approximate(const char *what) { approximate_by_literal_[what]++; }
     void use(const char *what) { used_by_literal_[what]++; }
     // the report with what the processor counted of the packets the renderer
@@ -5056,7 +5042,8 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     const uint32_t texel_bytes = texture::format_block(info.format).bytes;
     // (a depth texture's float made from the depth bits by the resolve as its
     // load makes it: beyond the copies, 32-bit texels)
-    const uint32_t convert = plan.load == texture::Load::DepthUnormToFloat   ? 1u
+    const uint32_t convert = !depth_targets_                                 ? 0u
+                             : plan.load == texture::Load::DepthUnormToFloat ? 1u
                              : plan.load == texture::Load::DepthFloatToFloat ? 2u
                                                                              : 0u;
     const bool target = resolve_targets_ && mirror && !separate && !three && !cube && layers == 1 &&
@@ -8299,8 +8286,9 @@ uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2], u
     extra_rows = 0;
     // (depth resolves too: they copy the guest's depth words as they are,
     // which a texture reading the bits takes, and a depth texture takes as
-    // the float its load would make; Texture::target_convert)
-    if (!resolve_targets_ || info.dest_array || !info.texture_base) return 0;
+    // the float its load would make; Texture::target_convert;
+    // XF_RESOLVE_TARGETS_DEPTH=0 leaves them to memory alone)
+    if (!resolve_targets_ || info.dest_array || !info.texture_base || (info.depth && !depth_targets_)) return 0;
     const uint32_t bytes = texture::format_block(info.dest_format).bytes;
     if (bytes != 4 && bytes != 8) return 0;
     if ((info.texel_x0 >> 5) > 0xFF || (info.texel_y0 >> 5) > 0xFF) return 0;

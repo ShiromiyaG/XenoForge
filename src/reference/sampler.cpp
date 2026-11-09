@@ -24,7 +24,9 @@
 // derivatives) times 2 to the LOD plus the constant's per-axis exponents;
 // cube maps from the face coordinates; stacked textures by layer, two of
 // them blended when the volume filter is linear; the result through the
-// fetch constant's swizzle, times 2 to its exponent adjust. The sampler's
+// fetch constant's swizzle, the unsigned components of fixed-point formats
+// read as fractions rounded to 16 fractional bits (texture::q16_components),
+// times 2 to its exponent adjust. The sampler's
 // state is Xenia's texture caches' (GetSamplerParameters): the
 // instruction's filters over the constant's, the lowest mip as the lowest
 // LOD, a base map at it, the border colors.
@@ -592,11 +594,14 @@ bool sample(const Texture *t, const shader::TextureFetch &fetch, float out[4], s
     }
     if (taps > 1)
         for (int i = 0; i < 4; i++) value[i] = sum[i] / float(taps);
-    // the fetch constant's swizzle and exponent adjust
+    // the fetch constant's swizzle, the components rounded to 16 fractional
+    // bits (texture::q16_components, half to even) and the exponent adjust
     float scale = std::ldexp(1.0f, info.exp_adjust);
+    const uint32_t q16 = texture::q16_components(info);
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t sw = (info.swizzle >> (3 * i)) & 7;
         float v = sw < 4 ? value[sw] : sw == 5 ? 1.0f : 0.0f;
+        if (q16 & (1u << i)) v = std::nearbyint(v * 65536.0f) / 65536.0f;
         out[i] = v * scale;
     }
     return true;

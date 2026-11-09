@@ -17,6 +17,7 @@
 
 #include "xenoforge/guest_memory.h"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -99,6 +100,21 @@ struct Info {
 };
 
 Info parse_fetch_constant(const uint32_t dwords[6]);
+
+// The bits of each component of a fixed-point guest format, in the texel's
+// order (Xenia's texture_info_formats.inl, its fixed formats); zeros for the
+// others.
+std::array<uint32_t, 4> component_bits(uint32_t format);
+
+// The result components (a bit each, after the constant's swizzle) a fetch
+// rounds to 16 fractional bits, as Xenia's translators since "Round
+// normalized unsigned fixed fetches" (GetIntegerScaleBits' bit 24 and the
+// per-component signs, texture_cache.h): a fixed-point format read as
+// fractions, its unsigned components (the console's filtered value is Q16;
+// games compare samples against Q16 constants, so 128/255 must read as
+// 32897/65536), after the signs and before the exponent adjust. Constant
+// components round to themselves.
+uint32_t q16_components(const Info &info);
 
 // The levels the constant gives (Xenia's GetSubresourcesFromFetchConstant):
 // the base (level 0) when there is a base address, the mips (1 to mip_max)

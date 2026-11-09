@@ -1362,7 +1362,9 @@ Id Translator::slot_word(uint32_t member, uint32_t slot) {
 // sample as it is, which float formats already give signed); biased as
 // signed offset binary, (n - 2^(w-1)) / (2^(w-1) - 1) for a width known,
 // else 2u - 1, no lower than -1; gamma back to linear through the piecewise
-// linear curve.
+// linear curve. Then the components the word's bits 24-27 name rounded to 16
+// fractional bits, half to even (Xenia's OpRoundNE: the console's Q16
+// filtered values, texture::q16_components).
 Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample) {
     const uint32_t slot = t.operands[1].index;
     Id info = slot_word(7, slot), signed_entry = slot_word(8, slot);
@@ -1398,7 +1400,12 @@ Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, I
         auto is = [&](uint32_t sign) { return m_.op(Op::OpIEqual, bool_, {signs[k], u(sign)}); };
         Id r = select(float_, is(3), pwl_gamma_to_linear(value), value);
         r = select(float_, is(2), biased, r);
-        out[k] = select(float_, is(1), comp(signed_sample, k), r);
+        r = select(float_, is(1), comp(signed_sample, k), r);
+        // to 16 fractional bits where the word says (texture::q16_components)
+        Id q16 = exact(Op::OpFMul, float_,
+                       {glsl(GLSLstd450RoundEven, float_, {exact(Op::OpFMul, float_, {r, f(65536.0f)})}),
+                        f(1.0f / 65536.0f)});
+        out[k] = select(float_, m_.op(Op::OpINotEqual, bool_, {field(24 + k, 1), u(0)}), q16, r);
     }
     return vec4_of(out[0], out[1], out[2], out[3]);
 }

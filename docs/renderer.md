@@ -992,6 +992,14 @@ adjust), and what else differed from Xenia without being counted:
   else 2u - 1.
 - **The exponent adjust** (fetch constant word 3): the result times its
   power of two.
+- **Unsigned fixed-point components rounded to Q16** (since 2026-11-09):
+  formats with fixed-point components read as fractions (num_format 0)
+  return their unsigned components rounded to 16 fractional bits, half to
+  even, after the signs and before the exponent adjust (Xenia's 0c843efb3
+  and c3cd8617b, GetIntegerScaleBits' bit 24; `texture::q16_components`,
+  bits 24-27 of the slot's signs word). The console filters in Q16, so a
+  byte of 128 reads 32897/65536, not 128/255, and games compare samples
+  against that constant ("Motion blur near the car").
 - **Pixel parameters** (SQ_PROGRAM_CNTL's param_gen): the pixel's
   position, its facing and the kind of primitive in the interpolator
   SQ_CONTEXT_MISC names, as Xenia writes them (VPOS for screen-space
@@ -2052,7 +2060,8 @@ target's format, size and pitch beside the resolve's):
   taking the float its load makes from them (XeUNorm24To32 or
   XeFloat20e4To32 of the high 24 bits, `resolve.comp`'s write_targets, the
   kind in `flags` bits 24-27; never at the resolution scale, whose images
-  hold guest bits).
+  hold guest bits). `XF_RESOLVE_TARGETS_DEPTH=0` turns this part off
+  alone, to tell it apart when a picture differs.
 Game D's drive after the three: 13,800 loads after resolves (324,000
 resolves wrote the texture they feed), the loads 5.6 -> 1.5 s of the run's
 GPU time (14.5% -> 4.6%). Its two recorded frames replay identically with
@@ -2909,7 +2918,13 @@ from without a console.
 **Running it.** `build/xfref <xtr> -o frame.png [--compare <png>] [--diff
 d.png] [--threads N] [-v]`; `XF_REF_TRACE_PIXEL=x,y` prints that pixel's
 quad's shader inputs and texture fetches, and every depth test and color
-write at the pixel, draw by draw. The three-way regression:
+write at the pixel, draw by draw, with the face and the draw's depth control,
+stencil words, mode and clip registers; `XF_REF_TRACE_DRAW=n` prints draw n's
+shaders (disassembled), texture fetch constants, nonzero float constants,
+indices and clip-space vertices; `XF_REF_DUMP_MEMORY=<hex address>:<hex
+size>:<file>` writes that physical memory after the trace (resolves
+included), to compare with Xenia's (a local `--trace_dump_memory` in its
+trace dump, with `--readback_resolve=full`). The three-way regression:
 `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/reference_test`
 (`XF_REFERENCE_FILTER=<name>`, `XF_REFERENCE_OUT=<dir>` for its frames); it
 fails on crashes and failed replays, not yet on differences.
@@ -3076,6 +3091,50 @@ number format (read as fractions); occlusion query counts and screen
 extents (the processor's fake reports); getBCF (0, as Xenia). Performance:
 one interpreter invocation per vertex and per pixel lane, heap-allocated;
 the 29 frames take a minute, the work is bound by the interpreter.
+
+## Motion blur near the car: fetches in Q16 (2026-11-09)
+
+Game D, driving: the ground around the player's car came out sharp and
+grainy in ours and in the reference, motion-blurred in every Xenia backend.
+The frame's motion blur reads a half-size velocity buffer made by a pass that
+reads the frame's depth and stencil, resolved as 24_8_FLOAT and fetched as
+8_8_8_8 (with the constant's ZYXW swizzle: depth's three bytes and the
+stencil). Its pixel shader picks a reprojection matrix per pixel by the
+stencil: a stencil from a threshold constant up is the static world (the
+camera's matrix), else the stencil times 85 (rounded) times 4 indexes the
+per-object matrices. The threshold is 0x3F008100, 32897/65536. A box drawn
+around the car before (depth only, inverting stencil bit 7 where its faces
+lie in front of the scene, for the car's ground shadow) leaves 0x80 on the
+ground near the car, in Xenia's frame as in ours (their resolved stencils
+differ at 1891 pixels, on edges). Read as 128/255 (0x3F008081),
+0x80 is below the threshold: index 43, an identity matrix, zero velocity,
+no blur. The console filters in Q16, where 128 is 32897/65536: the
+comparison passes and the ground takes the camera's motion.
+
+Xenia rounds normalized unsigned components of fixed-point formats to 16
+fractional bits since its commit 0c843efb3 (2026-08-25, per component since
+c3cd8617b; texture_cache.h's GetIntegerScaleBits documents it, a game's SSAO
+masks among the reasons). Done the same way in the translator
+(`texture_signs`, after the signs, before the exponent adjust, half to even)
+and the reference's sampler. Frame 5400 of a drive against Xenia's picture:
+mean difference 0.658 to 0.450 of 255, pixels off by more than 16 from
+0.856% to 0.369%. In `replay_test` game A's park and race come closer to
+Xenia's FSI pictures (0.007 and 0.008 to 0.001 and 0.003) and game D's
+intro too (0.013 to 0.011); the rest unchanged.
+
+How it was found, for the next one: the reference's pixel trace
+(`XF_REF_TRACE_PIXEL`, the stencil's history and the face), its draw trace
+(`XF_REF_TRACE_DRAW`: the velocity pass's shader and constants), Xenia's
+resolved memory from its trace dump (a local `--trace_dump_memory` with
+`--readback_resolve=full`) beside the reference's (`XF_REF_DUMP_MEMORY`):
+same stencil, a different velocity buffer (37658 of 230400 pixels), and the
+shader run by hand on Xenia's bytes giving Xenia's output only with the Q16
+value.
+
+Not done yet from the same family of Xenia's commits: the integer number
+format's scaling back to the guest's integers (d11950528), and point-sampled
+fetches snapped to texel centers with 4-6 bit unsigned components rebuilt by
+the console's bit repetition (c3cd8617b).
 
 ## What is asked and not done is counted
 

@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace xf::reference {
@@ -468,6 +469,17 @@ bool replay(const GpuTrace &trace, const Options &options, Image &frame, Report 
     bool walked = walk_gpu_trace(trace, player, error);
     processor.set_sink(nullptr);
     report = renderer.report();
+    // XF_REF_DUMP_MEMORY=<hex address>:<hex size>:<file>: that physical memory
+    // after the trace, resolves included (to set beside Xenia's, docs/renderer.md)
+    if (const char *dump = std::getenv("XF_REF_DUMP_MEMORY")) {
+        unsigned address = 0, size = 0;
+        char path[512] = {};
+        if (std::sscanf(dump, "%x:%x:%511[^\n]", &address, &size, path) == 3)
+            if (FILE *f = std::fopen(path, "wb")) {
+                std::fwrite(memory->translate_physical(address), 1, size, f);
+                std::fclose(f);
+            }
+    }
     return walked;
 }
 

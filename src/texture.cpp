@@ -817,6 +817,35 @@ Info parse_fetch_constant(const uint32_t d[6]) {
     return info;
 }
 
+std::array<uint32_t, 4> component_bits(uint32_t format) {
+    switch (format) {
+    case 2: case 8: case 9: case 58: case 59: return {8, 0, 0, 0};       // 8, 8_A, 8_B, DXT3A, DXT5A
+    case 3: return {5, 5, 5, 1};                                         // 1_5_5_5
+    case 4: return {5, 6, 5, 0};                                         // 5_6_5
+    case 5: return {5, 5, 6, 0};                                         // 6_5_5
+    case 6: case 14: case 50: case 62: return {8, 8, 8, 8};              // 8_8_8_8 and its kin
+    case 7: case 54: return {10, 10, 10, 2};                             // 2_10_10_10
+    case 10: case 49: case 60: return {8, 8, 0, 0};                      // 8_8, DXN, CTX1
+    case 13: case 25: return {16, 16, 0, 0};                             // 16_16
+    case 15: return {4, 4, 4, 4};                                        // 4_4_4_4
+    case 16: case 55: return {11, 11, 10, 0};                            // 10_11_11
+    case 17: case 56: return {10, 11, 11, 0};                            // 11_11_10
+    case 21: case 26: return {16, 16, 16, 16};                           // 16_16_16_16
+    case 24: return {16, 0, 0, 0};                                       // 16
+    default: return {0, 0, 0, 0};
+    }
+}
+
+uint32_t q16_components(const Info &info) {
+    if (info.num_format || !component_bits(info.format)[0]) return 0;
+    uint32_t mask = 0;
+    for (uint32_t k = 0; k < 4; k++) {
+        uint32_t source = (info.swizzle >> (3 * k)) & 7;
+        if (source >= 4 || info.signs[source] == 0) mask |= 1u << k;
+    }
+    return mask;
+}
+
 Levels levels(const Info &info) {
     uint32_t width = info.width, height = info.dimension == 0 ? 1 : info.height;
     uint32_t longest = std::max(width, height);

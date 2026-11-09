@@ -78,6 +78,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -672,6 +673,36 @@ void Renderer::Impl::draw(const uint32_t *regs, const gpu::Draw &d) {
     auto vertex_of = [&](uint32_t index) -> const ShadedVertex & {
         return shaded[std::lower_bound(unique.begin(), unique.end(), index) - unique.begin()];
     };
+    // XF_REF_TRACE_DRAW=n: that draw's shaders, indices and its vertices'
+    // clip-space positions, on stderr
+    static const char *trace_draw = std::getenv("XF_REF_TRACE_DRAW");
+    if (trace_draw && report.draws == std::strtoull(trace_draw, nullptr, 10)) {
+        std::fprintf(stderr, "  trace draw %llu: the vertex shader\n%s", (unsigned long long)report.draws,
+                     ucode::disassemble(vs->parsed).c_str());
+        if (ps)
+            std::fprintf(stderr, "  trace draw %llu: the pixel shader\n%s", (unsigned long long)report.draws,
+                         ucode::disassemble(ps->parsed).c_str());
+        for (int k = 0; k < 32; k++) {
+            const uint32_t *f = &regs[FETCH_CONSTANTS + k * 6];
+            if ((f[0] & 3) == 2)
+                std::fprintf(stderr, "    texture fetch %d: %08X %08X %08X %08X %08X %08X\n", k, f[0], f[1], f[2], f[3],
+                             f[4], f[5]);
+        }
+        for (int stage = 0; stage < 2; stage++)
+            for (int k = 0; k < 256; k++) {
+                const float *c = constants[stage].float_constants[k];
+                if (c[0] != 0.0f || c[1] != 0.0f || c[2] != 0.0f || c[3] != 0.0f)
+                    std::fprintf(stderr, "    %s c%d: %.9g %.9g %.9g %.9g\n", stage ? "pixel" : "vertex", k, c[0],
+                                 c[1], c[2], c[3]);
+            }
+        std::fprintf(stderr, "  trace draw %llu: %s, indices", (unsigned long long)report.draws,
+                     xenos::primitive_name(primitive));
+        for (uint32_t i : indices) std::fprintf(stderr, " %d", int(i));
+        std::fprintf(stderr, "\n");
+        for (size_t i = 0; i < unique.size(); i++)
+            std::fprintf(stderr, "    vertex %u: %g %g %g %g%s\n", unique[i], shaded[i].pos[0], shaded[i].pos[1],
+                         shaded[i].pos[2], shaded[i].pos[3], shaded[i].killed ? " (killed)" : "");
+    }
 
     // ---- primitives ----
     // each primitive as the vertices it is made of (3 for triangles and
@@ -1188,9 +1219,12 @@ void Renderer::Impl::draw(const uint32_t *regs, const gpu::Draw &d) {
                         uint32_t written = ps ? inv[lane]->colors_written() : 0;
                         if (env.debug_here && int32_t(px) == debug_x && int32_t(py) == debug_y)
                             std::fprintf(stderr,
-                                         "  trace draw %llu: covered %x, written %x, killed %d, depth test %d\n",
+                                         "  trace draw %llu: covered %x, written %x, killed %d, depth test %d, %s "
+                                         "face (depth control %08X, stencil %06X/%06X, mode %08X, clip %08X)\n",
                                          (unsigned long long)report.draws, mask, written,
-                                         ps ? int(inv[lane]->killed()) : -1, int(st.depth_stencil));
+                                         ps ? int(inv[lane]->killed()) : -1, int(st.depth_stencil),
+                                         face ? "back" : "front", regs[RB_DEPTHCONTROL], st.stencil_word[0],
+                                         st.stencil_word[1], sc_mode, clip);
                         if (ps && inv[lane]->killed()) continue;
                         if (ps && st.alpha_test && (written & 1)) {
                             float a = o->colors[0][3], ref = st.alpha_ref;
