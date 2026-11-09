@@ -507,6 +507,7 @@ struct Shader {
     // vertex fetch slots as masks, and the blocks of 32 fetch constant words they lie in
     uint64_t texture_mask = 0, vertex_mask[2] = {};
     uint32_t fetch_blocks = 0;
+    uint32_t filter_mask = 0; // the slots (below 32) filters has
 };
 
 struct RenderTarget {
@@ -1338,7 +1339,7 @@ private:
             std::fprintf(stderr, "  draw %llu skipped: %s (shaders %016llX %016llX)\n", (unsigned long long)report_.draws,
                          reason.c_str(), (unsigned long long)vertex_hash_, (unsigned long long)pixel_hash_);
     }
-    void approximate(const std::string &what) { report_.approximate[what]++; }
+    void approximate(const std::string &what) { report_.approximate[what]++, approximations_++; }
     void use(const std::string &what) { report_.used[what]++; }
     // A literal's counts by its address: no string made and no map of
     // strings searched at each draw (1.8% of the command thread and the
@@ -1358,7 +1359,7 @@ private:
         const char *v = std::getenv("XF_RESOLVE_TARGETS_DEPTH");
         return !(v && v[0] == '0');
     }();
-    void approximate(const char *what) { approximate_by_literal_[what]++; }
+    void approximate(const char *what) { approximate_by_literal_[what]++, approximations_++; }
     void use(const char *what) { used_by_literal_[what]++; }
     // the report with what the processor counted of the packets the renderer
     // does not see (Report::used)
@@ -2182,6 +2183,29 @@ private:
         uint64_t used_serial = 0;
     };
     std::map<std::array<uint32_t, 8>, SamplerEntry> samplers_;
+    SamplerEntry *last_sampler_ = nullptr; // the one sampler() just returned (null: the stand-in's)
+    // What a texture slot gave the last draw that read it (Impl::draw): the fetch constant's
+    // words and the filters it was made from, and the system constants' words made of them. Good
+    // while texture_epoch_ stands: it moves when a texture is loaded or loaded again, a place in
+    // the bindless tables is given back (a view or a texture destroyed) or a sampler is destroyed.
+    // XF_TEXTURE_SLOT_MEMO=0: every slot looked up at every draw, as before.
+    struct SlotMemo {
+        uint64_t epoch = 0; // 0: none
+        uint32_t fetch[6] = {};
+        std::array<uint32_t, 4> overrides = {};
+        uint32_t forced_filter = 0, forced_aniso = 0;
+        Texture *texture = nullptr;
+        SamplerEntry *sampler = nullptr;
+        uint32_t slot_word = 0, signs = 0, integer_scale = 0, signed_word = 0;
+        uint32_t uses = 0; // the Report::used counts a draw adds for it (bit 0, bit 1)
+    };
+    SlotMemo slot_memos_[32];
+    uint64_t texture_epoch_ = 1;
+    uint64_t approximations_ = 0; // approximate()'s calls
+    bool slot_memos_on_ = [] {
+        const char *v = std::getenv("XF_TEXTURE_SLOT_MEMO");
+        return !(v && v[0] == '0');
+    }();
     std::vector<uint32_t> free_samplers_; // slots of samplers destroyed, to reuse
     std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> pipelines_;
 
@@ -4020,9 +4044,11 @@ bool Impl::translate(Shader &s, std::string &why) {
                     if (uint32_t c = a->memexport_stream_constant(); c != UINT32_MAX) s.stream_constants.insert(c);
                 } else if (const auto *t = std::get_if<xf::ucode::TextureFetchInstruction>(&slot.instruction)) {
                     if (t->has_result()) s.fetches_textures = true;
-                    if (t->opcode == xf::ucode::FetchOpcode::TextureFetch && !s.filters.count(t->operands[1].index))
+                    if (t->opcode == xf::ucode::FetchOpcode::TextureFetch && !s.filters.count(t->operands[1].index)) {
                         s.filters[t->operands[1].index] = {uint32_t(t->mag_filter), uint32_t(t->min_filter),
                                                            uint32_t(t->mip_filter), uint32_t(t->aniso_filter)};
+                        if (t->operands[1].index < 32) s.filter_mask |= 1u << t->operands[1].index;
+                    }
                 }
             }
         }
@@ -4922,9 +4948,11 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     if (d_.max_anisotropy() < 1.0f) aniso = 0;
     std::array<uint32_t, 8> key = {clamp[0] | clamp[1] << 3 | clamp[2] << 6 | border_color << 9 | border_alpha << 11,
                                    mag, min, mip, aniso, mip_min, 0, 0};
+    last_sampler_ = nullptr;
     auto it = samplers_.find(key);
     if (it != samplers_.end()) {
         it->second.used_serial = submission_serial();
+        last_sampler_ = &it->second;
         return it->second.index;
     }
     // The table full: the sampler least recently used by a submission the
@@ -4946,6 +4974,7 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
         vkDestroySampler(dev_, oldest->second.sampler, nullptr);
         free_samplers_.push_back(oldest->second.index);
         samplers_.erase(oldest);
+        texture_epoch_++;
         report_.samplers_reused++;
     }
     static const VkSamplerAddressMode modes[8] = {
@@ -5000,7 +5029,7 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     write.pImageInfo = &image;
     vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
-    samplers_[key] = {s, index, submission_serial()};
+    last_sampler_ = &(samplers_[key] = {s, index, submission_serial()});
     return index;
 }
 
@@ -5116,6 +5145,7 @@ bool Impl::make_room(uint32_t kind, uint32_t needed) {
 // A texture the GPU is done with: its places given back, its views and
 // images destroyed, and out of the cache.
 void Impl::destroy_texture(Texture *t) {
+    texture_epoch_++; // (what the draws kept of it: SlotMemo)
     unlink(*t);
     unindex_texture(*t);
     count_texture_bytes(0, t->bytes);
@@ -5144,6 +5174,7 @@ void Impl::release_index(uint32_t kind, uint32_t index) {
     write.pImageInfo = &image;
     vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
     free_indices_[kind].push_back(index);
+    texture_epoch_++; // (what read through it: SlotMemo)
 }
 
 // A place in a table with room: one given back, else a new one.
@@ -5198,6 +5229,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         t->load_why = LoadWhy::CpuWritten;
     }
     if (t) t->stale = true; // until it is loaded again
+    texture_epoch_++;       // a load: what the draws kept of their texture slots goes (SlotMemo)
 
     texture::Plan plan, signed_plan;
     if (!texture::plan(info, plan, why, support_)) return nullptr;
@@ -7597,6 +7629,39 @@ void Impl::draw(const gpu::Draw &d) {
             approximate("a texture slot without a texture constant");
             continue;
         }
+        // the first fetch's filters over the constant's, the vertex shader's first
+        std::array<uint32_t, 4> overrides = {3, 3, 3, 7};
+        for (Shader *s : {vs, ps})
+            if (s && slot < 32 && (s->filter_mask & (1u << slot))) {
+                overrides = s->filters[slot];
+                break;
+            }
+        // What the slot gave the last draw that read it, again: the same constant's words and
+        // filters, no texture, view or sampler destroyed or loaded since (texture_epoch_), and
+        // the texture's memory unwritten. The constant is not parsed, nor the texture, its view
+        // and its sampler looked up (three maps, a tenth of the command thread).
+        const uint32_t forced_filter = texture_filter_.load(std::memory_order_relaxed);
+        const uint32_t forced_aniso = anisotropy_.load(std::memory_order_relaxed);
+        SlotMemo *memo = slot_memos_on_ && slot < 32 && !trace_ ? &slot_memos_[slot] : nullptr;
+        if (memo) {
+            if (done_serial_ != limits_applied_at_) apply_texture_limits(); // (as texture() begins)
+            SlotMemo &m = *memo;
+            if (m.epoch == texture_epoch_ && std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0 &&
+                m.overrides == overrides && m.forced_filter == forced_filter && m.forced_aniso == forced_aniso &&
+                !m.texture->stale && unwritten(*m.texture)) {
+                use(*m.texture, submission_serial() + 1);
+                m.sampler->used_serial = submission_serial();
+                sys.slots[slot] = m.slot_word, sys.signs[slot] = m.signs;
+                sys.integer_scale[slot] = m.integer_scale, sys.signed_slots[slot] = m.signed_word;
+                if (m.uses & 1) use("textures read with the integer number format (scaled to the guest's integers)");
+                if (m.uses & 2)
+                    use("4-6 bit unsigned components of point-filtered textures (rebuilt as the console expands them)");
+                continue;
+            }
+            m.epoch = 0; // (kept again below, when the slot comes out whole)
+        }
+        const uint64_t approximations = approximations_;
+        uint32_t uses = 0;
         std::string reason;
         Texture *t = texture(fetch, reason);
         if (!fatal_.empty()) return;
@@ -7608,13 +7673,8 @@ void Impl::draw(const gpu::Draw &d) {
             approximate("texture not decoded: " + reason);
             continue;
         }
-        std::array<uint32_t, 4> overrides = {3, 3, 3, 7};
-        for (Shader *s : {vs, ps})
-            if (s && s->filters.count(slot)) {
-                overrides = s->filters[slot];
-                break;
-            }
         uint32_t sampler_bits = sampler(fetch, overrides) << 16;
+        SamplerEntry *const sampler_entry = last_sampler_;
         sys.slots[slot] = index | t->kind << 14 | sampler_bits;
         sys.signs[slot] = texture::swizzled_signs(info);
         // (XF_TEXTURE_NUMBER_FORMAT=0: none of it, to measure what it costs)
@@ -7624,14 +7684,17 @@ void Impl::draw(const gpu::Draw &d) {
         }();
         sys.integer_scale[slot] = number_format ? texture::integer_scale_bits(info, sys.signs[slot]) : 0u;
         if (sys.integer_scale[slot] & ((1u << 24) - 1)) {
-            if (!(sys.integer_scale[slot] & (1u << 24)))
+            if (!(sys.integer_scale[slot] & (1u << 24))) {
                 use("textures read with the integer number format (scaled to the guest's integers)");
-            else
+                uses |= 1;
+            } else {
                 for (uint32_t k = 0; k < 4; k++)
                     if (((sys.integer_scale[slot] >> (6 * k)) & 0x3F) - 1 < 15) {
                         use("4-6 bit unsigned components of point-filtered textures (rebuilt as the console expands them)");
+                        uses |= 2;
                         break;
                     }
+            }
         }
         if (info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1) {
             if (t->signed_read == texture::Signed::None) {
@@ -7644,6 +7707,18 @@ void Impl::draw(const gpu::Draw &d) {
                 else
                     approximate("signed texture components read as unsigned: " + reason);
             }
+        }
+        // kept for the next draw, when nothing about it was counted as approximate (those counts
+        // are per draw) and its sampler is one of the table's
+        if (memo && approximations == approximations_ && sampler_entry && !t->stale) {
+            SlotMemo &m = *memo;
+            m.epoch = texture_epoch_;
+            std::memcpy(m.fetch, fetch, sizeof(m.fetch));
+            m.overrides = overrides, m.forced_filter = forced_filter, m.forced_aniso = forced_aniso;
+            m.texture = t, m.sampler = sampler_entry;
+            m.slot_word = sys.slots[slot], m.signs = sys.signs[slot];
+            m.integer_scale = sys.integer_scale[slot], m.signed_word = sys.signed_slots[slot];
+            m.uses = uses;
         }
     }
 
