@@ -1531,6 +1531,59 @@ XeKeys*, XInputd*, Hal callbacks, Nic*, Mtpd*, Etx*, Drv*, LDI*...) answer 0 as
 before: their arguments and results are not known without the console, and a
 guess would be a stub with a name.
 
+## Exports nothing implemented (2026-11-09)
+
+Xenia implements 310 of xboxkrnl's exports and 382 of xam's; the console has
+more, and games import or look up some of them. The eight test discs' imports
+and a run of each (docs/lean-kernel.md, the last section) found 47. Each
+answers as the console's own kernel and XAM do with the device absent (XAM's
+answers checked with `xfxam call`); the tests are `tests/kernel_absent_test.cpp`, and the answers of
+the Winsock side stay with `kernel_net_test`'s threads. Files:
+`src/kernel/kernel_absent.cpp` (xboxkrnl), `src/kernel/xam_absent.cpp`, and
+next to their neighbours `xam_net.cpp` and `xam_input.cpp`.
+
+| Export | The console's answer here |
+| --- | --- |
+| `PsCamDeviceRequest(request)` | by the request's type (a word, 0 to 0x69): 0, 10, 29, 38, 45 succeed (0 and 29 write a status in the second word, 0 and not-connected); 13 is `0xC00000A3`; 1-3, 5, 8, 14, 15, 18-21, 24, 25, 27, 30, 33-37, 40, 41, 43, 44, 46, 47 are `0xC000009D`; anything else `0xC0000010` |
+| `RmcDeviceRequest(request)` | a u16 type and a u16 receiver: receiver 4 or more `0xC000000D`; type 0 succeeds and zeroes the second word; any other `0xC000009D` |
+| `XInputdFF*` (8) | the handle's top nibble must be 1 (else `0xC0000001`); ports 0-3 `0xC0000010`, others `0xC000009D`; `XInputdFFCancelIo` the first for every port |
+| `EtxProducerRegister`, `Unregister`, `Log` | the producer registry the console keeps (128 slots, the block's layout: size, flags' high half, events and count, id, the slot in the top ten bits of the word at +0x18); no session is ever open, so `Log` bumps the event's drop count and answers `0xC0000188`; a block under 0x40 bytes `0xC000000D`; a full table `0x8000001A` |
+| `LDICreateDecompression`, `LDIDecompress`, `LDIDestroyDecompression` | the cabinet library's LZX on frames (`LzxStream`, `include/xenoforge/lzx.h`): a context starting `'CIDL'`, the block maximum, the configuration's second word; the first configuration word is the window in bytes (a power of two from 0x8000 to 0x2000000; 0 is taken; a window in bits is "not enough memory", 1); the source buffer's minimum is the block plus 0x1800; a frame past the block maximum is 3, a context that is not one 2, a frame the decoder refuses 4 |
+| `XamInputGetUserVibrationLevel(user, level *)` | the user's pad as the HID layer says (a pad that is not there `0x48F`); the level is the default, 3 |
+| `XamInputRawState` | `0x48F` |
+| `XamVoiceSetMicArrayIdleUsers`, `XamBackgroundDownloadSetMode` | 0 |
+| `XamNuiCameraElevationSetAngle`, `StopMovement`, `RememberFloor` | `0x8007048F`; `TiltReportStatus(s)` returns `s` |
+| `XamReadBiometricData`, `XamWriteBiometricData`, `XamContentInstall` | `0x57` |
+| `XamUserGetAgeGroup(user, out *)` | `0x57` for a null pointer, else `0x65B`, signed in or not |
+| `XamUserNuiGetEnrollmentIndex(user, out *)` | users 0-3: `0x80070525` and -2 written; a null pointer or a user past them `0x80070057` |
+| `XamCacheOpenFile`, `CloseFile`, `Reset` | open: a null structure or a cache id other than 2 (at +4) `0x57`; id 2 is a partition the console has and holds no such file (2, the byte at +2 set to 0x40); close -1; reset of -1 is 0, of any other id 1 |
+| `XamXlfsInitializeUploadQueue`, `Uninitialize`, `MountUploadQueueInstance`, `UnmountUploadQueueInstance` | `0x80070005`, `0x80150005`, `0x80070006`, `0x80070006` (initialize's is read from the code's no-service branch: the console, started beside this one, faulted in its init path) |
+| `XCustomGetCurrentGamercard`, `GetLastActionPressEx`, `SetDynamicActions`, `UnregisterDynamicActions` | no gamercard selected (xuid 0, FALSE); no action pressed (outputs zeroed, `0xE8`); a set of more than three actions `0x57`, a clearing one 0, a real one `5` (no session); unregister returns nothing |
+| `NetDll_XNetConnect`, `XNetServerToInAddr`, `XNetUnregisterInAddr`, `XNetQosGetListenStats` | WSAEINVAL (10022), whatever the caller or address, started or not |
+| `NetDll_XNetGetConnectStatus` | 3 (XNET_CONNECT_STATUS_LOST) |
+| `NetDll_XNetQosLookup` | nothing to look up: 0, no result; secure addresses without their arrays: WSAEINVAL; else an XNQOS (count, none pending, each entry flagged complete) and the event set at once (the console probes; nothing answers offline) |
+| `NetDll_getpeername` | no such socket: SOCKET_ERROR (WSAENOTSOCK); not connected: WSAENOTCONN; else the peer's address, length 0x10 |
+
+Where it is not the console's: `LDICreateDecompression` does not call the
+caller's allocator (the context is in the caller's buffer, or the system heap
+when one was given); the event trace registry is kept host-side; the flag the
+console sets in a producer's block from the processor's mode is not set; the
+vibration level is the default whatever the user's setting; the XNQOS's
+entries say complete where the console's, in a network that answers, would
+say what the probe found; the `getpeername` error codes for a socket that is
+not there are Winsock's (the console's call went on to a routine whose error
+was not read).
+
+Also followed from the console, in the same round (the exports that were
+Xenia's guesses): `_snprintf` and `_vsnprintf` with no buffer format and
+answer the length (the count is not looked at; with a buffer and no room, -1,
+as before); `FscSetCacheElementCount(cache, count)` refuses a count past
+0x400 (invalid parameter); `StfsCreateDevice(parameters, size)` wants the
+0x58-byte structure with its version byte (+0x50) at 5 or more before it looks
+at anything else; `XeCryptBnQwNeRsaPubCrypt` computes with a key of one to five
+words (Xenia refuses under 512 bits; the larger ones follow Xenia, the console's
+own code stopping on state that is not built).
+
 ## `boot`
 
 `boot <game.iso> [--seconds N] [--steps N] [--content <dir>] [--interpret]

@@ -42,8 +42,9 @@
 // XeKeysConsoleSignatureVerification, which Xenia lacks too, accepts every
 // signature (see there). SHA-1's length field takes the whole 64-bit bit
 // count where TinySHA1 keeps 32 bits (messages from 512 MB up).
-// XeCryptBnQwNeRsaPubCrypt fails for an even modulus or one past 4096 bits,
-// which Xenia's generic arithmetic would take.
+// XeCryptBnQwNeRsaPubCrypt takes a key from one word up (Xenia: from 512
+// bits, as the console's kernel answers for a small one) and fails for an even
+// modulus or one past 4096 bits, which Xenia's generic arithmetic would take.
 
 #include "xenoforge/aes.h"
 #include "xenoforge/bignum.h"
@@ -719,11 +720,13 @@ XF_EXPORT(xboxkrnl, XeCryptBnQwNeRsaPubCrypt) {
     // (a, b, XECRYPT_RSA *): b = a ^ exponent mod modulus. XECRYPT_RSA: the
     // modulus's size in 64-bit words, the public exponent, 8 bytes, then
     // the modulus; the numbers are big-endian words, least significant
-    // first. Keys under 512 bits fail, as in Xenia; so do keys over 4096
-    // bits and even moduli (Montgomery's method).
+    // first. A key of no words fails, and so does one over 4096 bits, and
+    // even moduli (Montgomery's method). The console computes with a key of 1
+    // to 5 words (Xenia refuses them under 512 bits); for the larger ones its
+    // code stops on state not built here, so they are followed as before.
     uint32_t a = arg(k, c, 0), b = arg(k, c, 1), rsa = arg(k, c, 2);
     uint32_t words = k.load32(rsa), exponent = k.load32(rsa + 4);
-    if (words < 8 || words > 64) return result(c, 0);
+    if (words < 1 || words > 64) return result(c, 0);
     std::vector<uint64_t> base(words), modulus(words), out(words);
     for (uint32_t i = 0; i < words; i++) {
         base[i] = k.load64(a + 8 * i);

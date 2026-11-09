@@ -531,7 +531,9 @@ if(TARGET player)
     include(cmake/package.cmake)
 endif()
 # the SDK: find_package(XenoForge) in a port's own repository (docs/sdk.md)
-include(cmake/install_sdk.cmake)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    include(cmake/install_sdk.cmake)
+endif()
 add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)
 
@@ -615,10 +617,14 @@ target_link_libraries(kernel_files_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_files COMMAND kernel_files_test)
 set_tests_properties(kernel_files PROPERTIES TIMEOUT 120) # threads: fail, never hang
 # XAM's network offline: sockets on guest threads
+add_executable(kernel_absent_test tests/kernel_absent_test.cpp)
+target_include_directories(kernel_absent_test PRIVATE src/kernel)
+target_link_libraries(kernel_absent_test PRIVATE xenoforge_kernel xenoforge)
 add_executable(kernel_net_test tests/kernel_net_test.cpp)
 target_include_directories(kernel_net_test PRIVATE src/kernel)
 target_link_libraries(kernel_net_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME kernel_net COMMAND kernel_net_test)
+add_test(NAME kernel_absent COMMAND kernel_absent_test)
 set_tests_properties(kernel_net PROPERTIES TIMEOUT 120) # threads: fail, never hang
 # XAM's system families: content, devices, the dashboard, avatars, Kinect, tiles
 add_executable(kernel_xam_system_test tests/kernel_xam_system_test.cpp)

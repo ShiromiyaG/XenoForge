@@ -691,6 +691,57 @@ XF_EXPORT(xam, NetDll_XNetQosRelease) {
     result(c, 0);
 }
 
+// (caller, cxna, XNADDR *[], XNKID *[], XNKEY *[], cina, IN_ADDR[], DWORD
+// service_ids[], probes, bits_per_sec, flags, event, XNQOS **): Xenia has no
+// such call. The console's XAM answers a lookup of secure addresses it was not
+// given (an array missing or an address it has no association for) with
+// WSAEINVAL, and a lookup of nothing with 0 and no result; otherwise it makes
+// an XNQOS (8 bytes and an XNQOSINFO of 0x18 for each address) and probes
+// them. Nothing answers a probe offline, so the lookup is complete at once:
+// none pending, each entry flagged complete and not contacted, the event set.
+XF_EXPORT(xam, NetDll_XNetQosLookup) {
+    uint32_t xna_count = arg(k, c, 1), xna = arg(k, c, 2), kid = arg(k, c, 3), ina_count = arg(k, c, 5),
+             ina = arg(k, c, 6), event = arg(k, c, 11), qos_ptr = arg(k, c, 12);
+    if (xna_count && (!xna || !kid)) return result(c, WSAEINVAL);
+    uint32_t count = xna_count + ina_count;
+    if (!count) return result(c, 0);
+    if (!qos_ptr || (ina_count && !ina)) return result(c, WSAEINVAL);
+    constexpr uint32_t XNQOS_HEADER = 8, XNQOSINFO_SIZE = 0x18, XNET_XNQOSINFO_COMPLETE = 1;
+    uint32_t size = XNQOS_HEADER + XNQOSINFO_SIZE * count;
+    uint32_t qos = k.memory().system_alloc(size);
+    std::memset(k.host(qos), 0, size);
+    k.store32(qos + 0, count); // cxnqos
+    k.store32(qos + 4, 0);     // cxnqosPending
+    for (uint32_t i = 0; i < count; i++) k.host(qos + XNQOS_HEADER + XNQOSINFO_SIZE * i)[0] = XNET_XNQOSINFO_COMPLETE;
+    k.store32(qos_ptr, qos);
+    if (event) {
+        Objects &o = objects(k);
+        if (Ref<Event> e = o.lookup<Event>(event)) {
+            std::lock_guard<std::mutex> l(o.lock);
+            set_event(o, *e);
+        }
+    }
+    result(c, 0);
+}
+
+// (caller, XNKID *, XNQOSLISTENSTATS *): no listen is running to report on:
+// WSAEINVAL, the console's answer to every call tried
+XF_EXPORT(xam, NetDll_XNetQosGetListenStats) { result(c, WSAEINVAL); }
+
+// (caller, in_addr): a connection is made to a secure address the title was
+// given by XNetXnAddrToInAddr or XNetServerToInAddr; none ever is offline, so
+// the address is one the console does not know: WSAEINVAL
+XF_EXPORT(xam, NetDll_XNetConnect) { result(c, WSAEINVAL); }
+
+// (caller, in_addr, service_id, IN_ADDR *) and (caller, in_addr): the same
+// associations, the same WSAEINVAL
+XF_EXPORT(xam, NetDll_XNetServerToInAddr) { result(c, WSAEINVAL); }
+XF_EXPORT(xam, NetDll_XNetUnregisterInAddr) { result(c, WSAEINVAL); }
+
+// (caller, in_addr): XNET_CONNECT_STATUS_LOST (3) for every address: no
+// connection is ever made, so the one asked about is not up
+XF_EXPORT(xam, NetDll_XNetGetConnectStatus) { result(c, 3); }
+
 XF_EXPORT(xam, NetDll_XNetQosListen) { result(c, X_ERROR_FUNCTION_FAILED); }
 XF_EXPORT(xam, NetDll_XNetSetSystemLinkPort) { result(c, 1); }
 XF_EXPORT(xam, NetDll_XNetRegisterKey) { result(c, 0); }
@@ -1121,6 +1172,26 @@ XF_EXPORT(xam, NetDll_getsockname) {
     std::lock_guard<std::mutex> l(o.lock);
     if (!s->bound) return fail(k, c, X_WSAEINVAL);
     store_sockaddr(k, name, s->bound_address, s->bound_port);
+    k.store32(length_ptr, SOCKADDR_IN_SIZE);
+    result(c, 0);
+}
+
+// (caller, socket, XSOCKADDR_IN *, length_ptr): who a connected socket is
+// connected to. The console's XAM answers SOCKET_ERROR for a socket it has not
+// (xfxam), WSAENOTCONN for one that is not connected, else the peer's address
+// and 0x10 as the length. It does not look at the buffer before it has found
+// the connection, which is why the order of the checks is this one.
+XF_EXPORT(xam, NetDll_getpeername) {
+    uint32_t name = arg(k, c, 2), length_ptr = arg(k, c, 3);
+    Ref<Socket> s = socket_by_handle(k, arg(k, c, 1));
+    if (!s) return fail(k, c, X_WSAENOTSOCK);
+    {
+        Objects &o = objects(k);
+        std::lock_guard<std::mutex> l(o.lock);
+        if (!s->connected) return fail(k, c, X_WSAENOTCONN);
+        if (!name || !length_ptr || k.load32(length_ptr) < SOCKADDR_IN_SIZE) return fail(k, c, X_WSAEFAULT);
+        store_sockaddr(k, name, s->peer_address, s->peer_port);
+    }
     k.store32(length_ptr, SOCKADDR_IN_SIZE);
     result(c, 0);
 }

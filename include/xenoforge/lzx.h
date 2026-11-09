@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 
@@ -27,5 +28,29 @@ bool lzx_decompress(std::span<const uint8_t> in, std::span<uint8_t> out, uint32_
 // the delta extensions off).
 bool lzx_decompress_delta(std::span<const uint8_t> in, std::span<const uint8_t> reference, std::span<uint8_t> out,
                           uint32_t window_size, std::string &error);
+
+// A stream decoded a frame at a time, as a cabinet's data blocks are: each
+// call is given one frame's compressed bytes (a whole number of 16-bit words,
+// the frame ending its word) and the size it decompresses to, at most 32 KB.
+// What a frame needs of the ones before it (the block's trees, the repeated
+// offsets, the window) is kept here. The stream's first frame starts with the
+// header bit that says whether E8 calls are translated.
+class LzxStream {
+public:
+    LzxStream();
+    ~LzxStream();
+    LzxStream(const LzxStream &) = delete;
+    LzxStream &operator=(const LzxStream &) = delete;
+
+    // a window of 2^15 to 2^25 bytes; false with a reason otherwise
+    bool start(uint32_t window_size, std::string &error);
+    // the frame's bytes; false with a reason for a malformed frame, which leaves
+    // the stream as it was (the bytes it would have decoded are not kept)
+    bool frame(std::span<const uint8_t> in, std::span<uint8_t> out, std::string &error);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 } // namespace xf

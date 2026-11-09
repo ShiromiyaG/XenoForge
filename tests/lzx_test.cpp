@@ -263,6 +263,7 @@ class Encoder {
 
     uint32_t r[3] = {1, 1, 1};
     uint64_t pos = 0;
+    std::vector<size_t> chunk_ends; // the stream's size at the end of each full 32 KB chunk
     Stats stats;
     int slots() const { return slots_; }
 
@@ -270,7 +271,7 @@ class Encoder {
     // each 32 KB of output ends the word
     void advance(uint32_t size) {
         pos += size;
-        if (pos % CHUNK == 0) w_.align();
+        if (pos % CHUNK == 0) w_.align(), chunk_ends.push_back(w_.out.size());
     }
 
     // [first, last) of a tree's path lengths, against the previous block's
@@ -442,7 +443,7 @@ struct PlannedBlock {
 
 // The data packed block by block as planned (the last block takes the rest)
 std::vector<uint8_t> pack(const std::vector<uint8_t> &d, uint32_t window, const std::vector<PlannedBlock> &plan,
-                          Stats &stats, bool e8 = false, uint32_t e8_size = 0) {
+                          Stats &stats, bool e8 = false, uint32_t e8_size = 0, std::vector<size_t> *chunk_ends = nullptr) {
     Encoder encoder(window, e8, e8_size);
     MatchFinder finder(d);
     size_t at = 0;
@@ -458,7 +459,9 @@ std::vector<uint8_t> pack(const std::vector<uint8_t> &d, uint32_t window, const 
         at = end;
     }
     stats = encoder.stats;
-    return encoder.finish();
+    auto stream = encoder.finish();
+    if (chunk_ends) *chunk_ends = encoder.chunk_ends;
+    return stream;
 }
 
 bool unpacks(const std::vector<uint8_t> &stream, const std::vector<uint8_t> &expected, uint32_t window) {
@@ -632,6 +635,42 @@ void decodes_with_reference(uint32_t window, uint64_t seed) {
     CHECK(!decoded || out != target);
 }
 
+// The stream a frame at a time (LzxStream), as the cabinet library hands it
+// frames: the same bytes as the whole-stream decoder, in blocks that start and
+// end inside frames, with E8 translation; a bad frame leaves the stream where
+// it was; the window slides past its size.
+void decodes_a_frame_at_a_time(uint32_t window, size_t size, uint64_t seed, bool e8) {
+    auto original = make_data(size, seed);
+    auto data = original;
+    int translated = 0;
+    const int32_t file_size = 1 << 24;
+    if (e8) translate_e8(data, file_size, translated);
+    Stats stats;
+    std::vector<size_t> ends;
+    auto stream = pack(data, window, {{VERBATIM, 50000}, {ALIGNED, 70001}, {VERBATIM, 30000}, {ALIGNED, 0}}, stats, e8,
+                       uint32_t(file_size), &ends);
+    ends.push_back(stream.size());
+    LzxStream decoder;
+    std::string error;
+    CHECK(decoder.start(window, error));
+    std::vector<uint8_t> out(size, 0xCC);
+    size_t from = 0;
+    for (size_t frame = 0, at = 0; at < size; frame++, at += CHUNK) {
+        size_t n = std::min<size_t>(CHUNK, size - at), to = ends[std::min(frame, ends.size() - 1)];
+        if (frame == 1) { // a frame cut short is refused and changes nothing
+            std::vector<uint8_t> scratch(n);
+            CHECK(!decoder.frame({stream.data() + from, 3}, scratch, error));
+        }
+        CHECK(decoder.frame({stream.data() + from, to - from}, {out.data() + at, n}, error));
+        from = to;
+    }
+    CHECK(out == original);
+    LzxStream bad;
+    CHECK(!bad.start(1 << 14, error));
+    std::vector<uint8_t> one(CHUNK + 1);
+    CHECK(!decoder.frame({stream.data(), 4}, one, error)); // more than a frame
+}
+
 } // namespace
 
 int main() {
@@ -645,5 +684,7 @@ int main() {
     pads_a_whole_word();
     undoes_e8_translation();
     refuses_bad_streams();
+    decodes_a_frame_at_a_time(1 << 17, 150000, 8, false);
+    decodes_a_frame_at_a_time(1 << 15, 300000, 9, true); // the window slides
     return finish("lzx");
 }

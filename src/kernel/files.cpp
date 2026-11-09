@@ -1327,8 +1327,11 @@ XF_EXPORT(xboxkrnl, IoDismountVolumeByFileHandle) {
     result(c, file_by_handle(objects(k), arg(k, c, 0)) ? X_STATUS_SUCCESS : not_a_file(objects(k), arg(k, c, 0)));
 }
 
-// the file system cache's size: nothing is cached here
-XF_EXPORT(xboxkrnl, FscSetCacheElementCount) { result(c, X_STATUS_SUCCESS); }
+// the file system cache's size: nothing is cached here. (cache, count): the
+// console refuses a count past 0x400 as an invalid parameter.
+XF_EXPORT(xboxkrnl, FscSetCacheElementCount) {
+    result(c, arg(k, c, 1) > 0x400 ? X_STATUS_INVALID_PARAMETER : X_STATUS_SUCCESS);
+}
 XF_EXPORT(xboxkrnl, FscGetCacheElementCount) { result(c, 0); }
 
 // ---- symbolic link objects (Xenia's XSymbolicLink) ----
@@ -1384,6 +1387,11 @@ XF_EXPORT(xboxkrnl, NtQuerySymbolicLinkObject) {
 // An STFS package mounted by the title's own code: no device is made (the
 // content family mounts packages as directories, as Xenia does)
 XF_EXPORT(xboxkrnl, StfsCreateDevice) {
+    // (parameters, size): the console wants the 0x58-byte structure, whose
+    // version byte at +0x50 is 5 or more, before it looks at the package
+    uint32_t parameters = arg(k, c, 0);
+    if (arg(k, c, 1) != 0x58 || !parameters || k.host(parameters)[0x50] < 5)
+        return result(c, X_STATUS_INVALID_PARAMETER);
     static std::once_flag once;
     std::call_once(once, [&] {
         std::fprintf(stderr, "files: StfsCreateDevice (r3 0x%08X, from 0x%08X) makes no device\n", uint32_t(c.r[3]),

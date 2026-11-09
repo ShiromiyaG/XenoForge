@@ -207,36 +207,60 @@ void undo_e8(uint8_t *chunk, uint32_t size, uint32_t chunk_offset, int32_t file_
 
 namespace {
 
-// The decoder over a flat buffer: out is the first output byte and `prefix`
-// bytes before it are readable (reference data, or zeros), so a match may
-// reach back into them.
-bool decode(std::span<const uint8_t> in, uint8_t *out, size_t size, size_t prefix, uint32_t window_size,
-            std::string &error) {
-    if (window_size < (1u << 15) || window_size > (1u << 25) || (window_size & (window_size - 1))) {
-        error = "the LZX window is not a power of two from 32 KB to 32 MB";
-        return false;
-    }
-    int slots = 0;
-    while (SLOTS.base[slots] < window_size) slots++;
-    const int main_size = NUM_CHARS + 8 * slots;
-
-    BitReader bits(in);
+// What a decoder carries from one chunk to the next: the code lengths and
+// trees of the block it is in, the repeated offsets, where the block ends.
+struct DecoderState {
+    uint32_t window_size = 0;
+    int slots = 0, main_size = 0;
     uint8_t main_lengths[MAIN_MAX + RUN_MARGIN] = {};
     uint8_t length_lengths[LENGTH_SIZE + RUN_MARGIN] = {};
     uint8_t aligned_lengths[ALIGNED_SIZE] = {};
     Tree main_tree, length_tree, aligned_tree;
     uint32_t r[3] = {1, 1, 1};
-
-    bool e8 = bits.read(1) != 0;
+    bool e8 = false, header_read = false;
     int32_t e8_size = 0;
-    if (e8) {
-        uint32_t high = bits.read(16);
-        e8_size = int32_t(high << 16 | bits.read(16));
-    }
-
     int block_type = 0;
     uint32_t block_size = 0, block_left = 0;
     size_t raw = 0; // in an uncompressed block: where its next byte is
+};
+
+bool start_state(DecoderState &s, uint32_t window_size, std::string &error) {
+    if (window_size < (1u << 15) || window_size > (1u << 25) || (window_size & (window_size - 1))) {
+        error = "the LZX window is not a power of two from 32 KB to 32 MB";
+        return false;
+    }
+    s.window_size = window_size;
+    while (SLOTS.base[s.slots] < window_size) s.slots++;
+    s.main_size = NUM_CHARS + 8 * s.slots;
+    return true;
+}
+
+// The stream's first bits: whether the E8 calls are translated, and the size
+// the translation is for.
+void read_header(DecoderState &s, BitReader &bits) {
+    s.header_read = true;
+    s.e8 = bits.read(1) != 0;
+    s.e8_size = 0;
+    if (s.e8) {
+        uint32_t high = bits.read(16);
+        s.e8_size = int32_t(high << 16 | bits.read(16));
+    }
+}
+
+// The decoder over a flat buffer: out is the first output byte and `prefix`
+// bytes before it are readable (reference data, or zeros), so a match may
+// reach back into them. Decodes `size` bytes in chunks of 32 KB, the last
+// one short, each chunk ending its word.
+bool run(DecoderState &s, BitReader &bits, std::span<const uint8_t> in, uint8_t *out, size_t size, size_t prefix,
+         std::string &error) {
+    const uint32_t window_size = s.window_size;
+    const int main_size = s.main_size;
+    uint8_t *main_lengths = s.main_lengths, *length_lengths = s.length_lengths, *aligned_lengths = s.aligned_lengths;
+    Tree &main_tree = s.main_tree, &length_tree = s.length_tree, &aligned_tree = s.aligned_tree;
+    uint32_t *r = s.r;
+    int &block_type = s.block_type;
+    uint32_t &block_size = s.block_size, &block_left = s.block_left;
+    size_t &raw = s.raw;
     for (size_t pos = 0; pos < size;) {
         const size_t chunk_end = std::min(size, pos + CHUNK);
         while (pos < chunk_end) {
@@ -251,7 +275,7 @@ bool decode(std::span<const uint8_t> in, uint8_t *out, size_t size, size_t prefi
                     return false;
                 }
                 if (block_type == ALIGNED) {
-                    for (uint8_t &l : aligned_lengths) l = uint8_t(bits.read(3));
+                    for (int i = 0; i < ALIGNED_SIZE; i++) aligned_lengths[i] = uint8_t(bits.read(3));
                     if (!aligned_tree.build(aligned_lengths, ALIGNED_SIZE, false)) {
                         error = "an LZX aligned offset tree is not a valid code";
                         return false;
@@ -365,13 +389,63 @@ bool decode(std::span<const uint8_t> in, uint8_t *out, size_t size, size_t prefi
         }
     }
 
-    if (e8)
+    return true;
+}
+
+bool decode(std::span<const uint8_t> in, uint8_t *out, size_t size, size_t prefix, uint32_t window_size,
+            std::string &error) {
+    DecoderState s;
+    if (!start_state(s, window_size, error)) return false;
+    BitReader bits(in);
+    read_header(s, bits);
+    if (!run(s, bits, in, out, size, prefix, error)) return false;
+    if (s.e8)
         for (size_t at = 0; at < size; at += CHUNK)
-            undo_e8(out + at, uint32_t(std::min<size_t>(CHUNK, size - at)), uint32_t(at), e8_size);
+            undo_e8(out + at, uint32_t(std::min<size_t>(CHUNK, size - at)), uint32_t(at), s.e8_size);
     return true;
 }
 
 } // namespace
+
+struct LzxStream::Impl {
+    DecoderState state;
+    std::vector<uint8_t> flat; // the window's last bytes, then room for a frame
+    size_t filled = 0;         // bytes of flat in use
+    uint64_t total = 0;        // bytes decoded since the start
+};
+
+LzxStream::LzxStream() : impl_(std::make_unique<Impl>()) {}
+LzxStream::~LzxStream() = default;
+
+bool LzxStream::start(uint32_t window_size, std::string &error) {
+    impl_ = std::make_unique<Impl>();
+    if (!start_state(impl_->state, window_size, error)) return false;
+    impl_->flat.assign(size_t(window_size) + CHUNK, 0);
+    return true;
+}
+
+bool LzxStream::frame(std::span<const uint8_t> in, std::span<uint8_t> out, std::string &error) {
+    Impl &m = *impl_;
+    const uint32_t window = m.state.window_size;
+    if (!window) return error = "the LZX stream was not started", false;
+    if (out.size() > CHUNK) return error = "an LZX frame is at most 32 KB", false;
+    if (m.filled + out.size() > m.flat.size()) { // slide: keep the last window
+        std::memmove(m.flat.data(), m.flat.data() + m.filled - window, window);
+        m.filled = window;
+    }
+    BitReader bits(in);
+    if (!m.state.header_read) read_header(m.state, bits);
+    DecoderState saved = m.state; // a refused frame leaves the stream where it was
+    if (!run(m.state, bits, in, m.flat.data() + m.filled, out.size(), m.filled, error)) {
+        m.state = saved;
+        return false;
+    }
+    if (m.state.e8) undo_e8(m.flat.data() + m.filled, uint32_t(out.size()), uint32_t(m.total), m.state.e8_size);
+    std::memcpy(out.data(), m.flat.data() + m.filled, out.size());
+    m.filled += out.size();
+    m.total += out.size();
+    return true;
+}
 
 bool lzx_decompress(std::span<const uint8_t> in, std::span<uint8_t> out, uint32_t window_size, std::string &error) {
     return decode(in, out.data(), out.size(), 0, window_size, error);

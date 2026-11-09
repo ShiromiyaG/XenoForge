@@ -1141,10 +1141,13 @@ XF_EXPORT(xboxkrnl, DbgPrint) {
 XF_EXPORT(xboxkrnl, _snprintf) {
     // (buffer, buffer_count, format, ...)
     uint32_t buffer = arg(k, c, 0), buffer_count = arg(k, c, 1), format = arg(k, c, 2);
-    if (!buffer || !buffer_count || !format) return result(c, uint32_t(-1));
+    if (!format || (buffer && !buffer_count)) return result(c, uint32_t(-1));
     ArgList args(k, c, 3);
     FormatData data(k, format, false);
     int32_t count = format_core(k, data, args, false);
+    // a null buffer formats and answers the length (the console's kernel; its
+    // count is not looked at)
+    if (!buffer) return result(c, uint32_t(count));
     result(c, uint32_t(write_bounded(k, buffer, buffer_count, count, data.str())));
 }
 
@@ -1161,10 +1164,11 @@ XF_EXPORT(xboxkrnl, sprintf) {
 XF_EXPORT(xboxkrnl, _vsnprintf) {
     // (buffer, buffer_count, format, va_list)
     uint32_t buffer = arg(k, c, 0), buffer_count = arg(k, c, 1), format = arg(k, c, 2), arg_ptr = arg(k, c, 3);
-    if (!buffer || !buffer_count || !format) return result(c, uint32_t(-1));
+    if (!format || (buffer && !buffer_count)) return result(c, uint32_t(-1));
     ArgList args(k, c, arg_ptr, true);
     FormatData data(k, format, false);
     int32_t count = format_core(k, data, args, false);
+    if (!buffer) return result(c, uint32_t(count)); // as _snprintf: the length
     result(c, uint32_t(write_bounded(k, buffer, buffer_count, count, data.str())));
 }
 
