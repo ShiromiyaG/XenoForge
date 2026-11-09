@@ -500,6 +500,36 @@ VkBlendOp blend_op(uint32_t o) {
     return o < 5 ? ops[o] : VK_BLEND_OP_ADD;
 }
 
+// RB_BLENDCONTROL for the host's blending. The console applies the factors
+// before a minimum or maximum (Xenia's interlock paths do: "unlike Vulkan/D3D12
+// fixed-function blend which ignores factors for MIN/MAX, the Xbox 360 applies
+// blend factors before min/max", dxbc_shader_translator_om.cc); the host takes
+// the minimum or maximum of the source and the destination as they are. With
+// factors of zero and one the console's result is a plain copy, where values
+// are never negative (non_negative: the target's format): max(0, d) is d,
+// max(s, 0) is s, a minimum with zero is zero; those become additions the
+// host does. Both factors one need nothing. Any other factor would have to be
+// multiplied in by the pixel shader (Xenia's Direct3D 12 pipelines do it for
+// the source's alpha with a destination factor of one): left as the host
+// blends, and `ignored` set for the count.
+uint32_t host_blend_control(uint32_t blend, bool non_negative, bool &ignored) {
+    for (uint32_t shift : {0u, 16u}) { // color, alpha
+        const uint32_t half = (blend >> shift) & 0x1FFF;
+        const uint32_t source = half & 0x1F, op = (half >> 5) & 7, destination = (half >> 8) & 0x1F;
+        if (op != 2 && op != 3) continue;                // not MIN, MAX
+        if (source == 1 && destination == 1) continue; // the host's own
+        if (source > 1 || destination > 1 || !non_negative) {
+            ignored = true;
+            continue;
+        }
+        // (ADD, with the factors that leave the console's result)
+        uint32_t replaced = 0; // ZERO, ADD, ZERO
+        if (op == 3) replaced = source | destination << 8;
+        blend = (blend & ~(0x1FFFu << shift)) | replaced << shift;
+    }
+    return blend;
+}
+
 struct Shader {
     uint64_t hash = 0; // hash_words(type, microcode), its name in the shader storage
     xf::ucode::ParsedShader parsed;
@@ -7859,7 +7889,14 @@ void Impl::draw(const gpu::Draw &d) {
     for (uint32_t i = 0; i < 4; i++) {
         if (!colors[i]) continue;
         color_formats[i] = colors[i]->image.format;
-        uint32_t blend = regs_[r::RB_BLENDCONTROL[i]];
+        // (the factors of a minimum or maximum, where the host can: host_blend_control)
+        bool factors_ignored = false;
+        const uint32_t guest_format = colors[i]->format;
+        uint32_t blend = host_blend_control(
+            regs_[r::RB_BLENDCONTROL[i]],
+            guest_format <= 3 || guest_format == 10 || guest_format == 12, // unorm and 7e3 targets: never negative
+            factors_ignored);
+        if (factors_ignored) approximate("minimum and maximum blending with factors (the host ignores them)");
         VkPipelineColorBlendAttachmentState &b = blends[i];
         b.colorWriteMask = color_masks[i];
         b.srcColorBlendFactor = blend_factor(blend & 0x1F);
