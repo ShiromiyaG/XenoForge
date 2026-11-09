@@ -650,6 +650,16 @@ stack's generated frames wait where they are:
   each loop's back edge and each hint (docs/recompiler.md, "Yield points"),
   so such a spin runs its slice out on the clock and hands over at the same
   instruction every run. Playing, a yield point is a load and a branch.
+- **Spins, playing (2026-11-09).** `or 31,31,31` ("db16cyc", the XDK's
+  spin-wait hint) is the host's spin-wait hint too (`ppc_ops.h`'s
+  `spin_hint`: x86's pause, ARM's yield, as Xenia's DELAY_EXECUTION, so the
+  SMT sibling gets the core), and every 2048 of them in a row the thread
+  gives the host processor to whatever else is ready on it
+  (`System::spin`, `std::this_thread::yield`; back at once when nothing
+  is), beyond Xenia, which pauses only. Game D's render thread spins in such
+  a loop while it waits for the GPU (a full core before): the played drive
+  went from 27.4 to 28.6 frames a second and 3.25 to 2.79 s of CPU a second
+  (Xenia 30 and 1.96).
 - **Forced hand-overs**, a safety net that should no longer fire: a watchdog
   host thread stops a thread that has not handed over for `force_after_ms`
   (100) of the host's time if it is in the generated code at IRQL below 2

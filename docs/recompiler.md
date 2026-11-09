@@ -713,10 +713,14 @@ functions with their hottest offsets (with their source lines where the
 PDB has them; inlined and folded code can be named after a neighbour, and
 `llvm-symbolizer --inlines` on the address gives the inline chain). The
 generated functions' names come from the PDB's public symbols (their code
-is built without debug information). `--profile-thread <name>` samples the
-one guest thread so named (the kernel's own, as "GPU commands", or the
-guest's SetThreadName) with its stack walked at each sample (x64 unwind
-data) and adds each function's inclusive share. The thread report gives
+is built without debug information); a game library has none, so its
+addresses are named from the modules' function tables (the nearest
+function at or below, `xf_<guest address>`; `sampler::name_generated`).
+`--profile-thread <name>` samples the one guest thread so named (the
+kernel's own, as "GPU commands", or the guest's SetThreadName; `0x...`, the
+one starting at that address, for threads without a name) with its stack
+walked at each sample (x64 unwind data) and adds each function's inclusive
+share. The thread report gives
 each guest thread's host CPU time and host thread id (host threads are
 named "xf guest <id> <name>"), for matching any outside tool's samples.
 Windows only for now.

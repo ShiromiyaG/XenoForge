@@ -605,9 +605,13 @@ ppc::Context *Kernel::current_context() {
 uint32_t Kernel::host_thread_id(const std::string &name) {
     Objects &o = *objects_;
     std::lock_guard<std::mutex> l(o.lock);
+    // (0x... names the thread by its start address, for those without a name)
+    const bool by_start = name.size() > 2 && name[0] == '0' && (name[1] == 'x' || name[1] == 'X');
+    const uint32_t start = by_start ? uint32_t(std::strtoul(name.c_str() + 2, nullptr, 16)) : 0;
     for (Thread *t : o.threads) {
+        if (!t->host_thread_id || t->finished) continue;
         const std::string own = t->params.name ? t->params.name : t->guest_name;
-        if (t->host_thread_id && !t->finished && own.find(name) != std::string::npos) return t->host_thread_id;
+        if (by_start ? t->params.start_address == start : own.find(name) != std::string::npos) return t->host_thread_id;
     }
     return 0;
 }

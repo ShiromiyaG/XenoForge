@@ -201,6 +201,30 @@ XF_INLINE void yield_point(Context &c, int64_t weight) {
     }
 }
 
+// db16cyc (or 31,31,31), the XDK's spin-wait hint: the Xenon gives the
+// core's other hardware thread the pipeline. Here, by how long the spin has
+// gone on: the host's own spin-wait hint each time (x86's pause, ARM's
+// yield, as Xenia's DELAY_EXECUTION: the SMT sibling gets the core), and
+// every SPIN_HINTS_BEFORE_YIELD of them in a row, the processor given to
+// whatever else is ready on it (System::spin), so a spin that lasts frees
+// the core for the host's threads, at no cost when nothing else is ready.
+// (Beyond Xenia, which pauses only.) The deterministic mode counts the hint
+// as a yield point and hands over there instead.
+constexpr uint32_t SPIN_HINTS_BEFORE_YIELD = 2048;
+[[gnu::cold]] [[gnu::noinline]] inline void spin_hook(Context &c) {
+    c.spin_hints = 0;
+    if (c.system && c.system->spin) c.system->spin(c);
+}
+XF_INLINE void spin_hint(Context &c) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __builtin_arm_yield();
+#endif
+    if (++c.spin_hints >= SPIN_HINTS_BEFORE_YIELD) [[unlikely]]
+        spin_hook(c);
+}
+
 } // namespace xf::ppc::ops
 
 #include "xenoforge/ppc_ops/integer.h"

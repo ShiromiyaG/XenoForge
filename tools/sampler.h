@@ -21,6 +21,11 @@ namespace xf::sampler {
 // inclusive share too (the samples it was on the stack for), what it and
 // everything it calls cost.
 bool start(unsigned interval_us = 1000, unsigned long only_thread = 0);
+// The generated functions' host addresses and the guest addresses they were
+// made from, for naming samples where no symbol does (a game library has no
+// symbols): an address there is named after the nearest function at or
+// below it, xf_<guest address>
+void name_generated(const void *const *hosts, const unsigned *guests, size_t count);
 // stop and print the top `top` functions and the shares
 void stop_and_report(size_t top);
 // the CPU time the process has used, all threads, in seconds (-1: unknown)

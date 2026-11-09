@@ -309,9 +309,13 @@ XF_OP(norx) { store_x(c, i, ~(c.r[i.X.RT] | c.r[i.X.RB])); }
 // or rx,rx,rx is a no-op, or a priority hint (or r1,r1,r1 low, or 31,31,31
 // "db16cyc", in spin loops): the store below changes nothing, and it is a
 // yield point (the code's word is a constant in the generated code, so the
-// test folds away there)
+// test folds away there). db16cyc is also the spin-wait hint the host is
+// given (ppc_ops.h's spin_hint).
 XF_OP(orx) {
-    if (i.X.RT == i.X.RA && i.X.RA == i.X.RB && !i.X.Rc) yield_point(c, YIELD_PRIORITY_HINT);
+    if (i.X.RT == i.X.RA && i.X.RA == i.X.RB && !i.X.Rc) {
+        yield_point(c, YIELD_PRIORITY_HINT);
+        if (i.code == 0x7FFFFB78u && !c.yield_counting) spin_hint(c);
+    }
     store_x(c, i, c.r[i.X.RT] | c.r[i.X.RB]);
 }
 XF_OP(orcx) { store_x(c, i, c.r[i.X.RT] | ~c.r[i.X.RB]); }

@@ -181,7 +181,7 @@ void load_game_library(const Options &options, Game &g) {
     size_t functions = 0;
     for (size_t i = 0; i < loaded->count; i++) functions += loaded->modules[i]->count;
     g.kernel->set_generated_modules(loaded->modules, loaded->count);
-    g.generated_modules = loaded->count, g.generated_functions = functions;
+    g.generated_modules = loaded->count, g.generated_functions = functions, g.installed_modules = loaded->modules;
     std::printf("generated code: %zu modules, %zu functions (the game library %s)\n", loaded->count, functions,
                 library.string().c_str());
     // what discovery missed, logged beside the library for its next build
@@ -251,7 +251,9 @@ bool open(const Options &options, Game &g, std::string &error) {
         size_t functions = 0;
         for (size_t i = 0; i < options.module_count; i++) functions += options.modules[i]->count;
         if (!options.interpret) k.set_generated_modules(options.modules, options.module_count);
-        if (!options.interpret) g.generated_modules = options.module_count, g.generated_functions = functions;
+        if (!options.interpret)
+            g.generated_modules = options.module_count, g.generated_functions = functions,
+            g.installed_modules = options.modules;
         std::printf("generated code: %zu modules, %zu functions%s\n", options.module_count, functions,
                     options.interpret ? " (left out: --interpret)" : "");
     } else if (!options.interpret) {

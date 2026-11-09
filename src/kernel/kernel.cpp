@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <thread>
 
 namespace xf::kernel {
 namespace {
@@ -217,6 +218,9 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         if (!after) k.lockstep_->before_import(c, *k.hook_marker(address));
         else k.lockstep_->after_import(c, resume, resume == address);
     };
+    // a long spin on db16cyc hints (ppc_ops.h's spin_hint): the host
+    // processor to whatever else is ready on it (SwitchToThread, sched_yield)
+    system_.spin = [](ppc::Context &) { std::this_thread::yield(); };
     system_.yield = [](ppc::Context &c) {
         // the yield points' budget ran out (ppc_ops.h): the clock moves by
         // the whole ticks spent, and another thread may run (a spin on a flag
@@ -533,6 +537,7 @@ void Kernel::attach(ppc::Context &c) {
     // the deterministic mode counts the yield points (system_.yield)
     c.yield_counting = deterministic_yield_units_ != 0;
     c.yield_budget = 0;
+    c.spin_hints = 0;
 }
 
 void Kernel::park() {

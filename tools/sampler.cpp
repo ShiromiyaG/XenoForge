@@ -45,6 +45,21 @@ uint64_t total = 0;
 // with one thread sampled: each sample's stack (return addresses, the
 // interrupted rip first) and its cycles
 std::vector<std::pair<std::vector<uint64_t>, uint64_t>> stacks;
+// name_generated's table, by host address
+std::vector<std::pair<uint64_t, uint32_t>> generated;
+
+// a generated function's name for a host address with no symbol, and how far in
+bool generated_at(uint64_t address, std::string &name, uint64_t &displacement) {
+    auto it = std::upper_bound(generated.begin(), generated.end(), std::make_pair(address, UINT32_MAX));
+    if (it == generated.begin()) return false;
+    --it;
+    // (beyond 64 KB of the nearest start: not one of them)
+    if (address - it->first > 0x10000) return false;
+    char b[24];
+    std::snprintf(b, sizeof(b), "xf_%08X", it->second);
+    name = b, displacement = address - it->first;
+    return true;
+}
 
 // The suspended thread's stack by x64 unwind data (RtlVirtualUnwind), at
 // most 48 frames; a frame without unwind data is a leaf (its return address
@@ -175,6 +190,14 @@ double process_cpu_seconds() {
     return value(kernel) + value(user);
 }
 
+void name_generated(const void *const *hosts, const unsigned *guests, size_t count) {
+    std::lock_guard lock(mutex);
+    generated.clear();
+    generated.reserve(count);
+    for (size_t k = 0; k < count; k++) generated.push_back({uint64_t(uintptr_t(hosts[k])), uint32_t(guests[k])});
+    std::sort(generated.begin(), generated.end());
+}
+
 bool start(unsigned interval_us, unsigned long only_thread) {
     if (running.exchange(true)) return true;
     worker = std::thread(sample_loop, interval_us, DWORD(only_thread));
@@ -208,7 +231,7 @@ void stop_and_report(size_t top) {
         IMAGEHLP_MODULE64 mod{sizeof(mod)};
         if (SymGetModuleInfo64(process, rip, &mod)) module = mod.ModuleName;
         if (SymFromAddr(process, rip, &displacement, sym)) name = sym->Name;
-        else name = module + "+?";
+        else if (!generated_at(rip, name, displacement)) name = module + "+?";
         Fn &f = fns[name];
         if (f.cat.empty()) f.cat = category(name, module);
         if (!f.base) f.base = rip - displacement;
@@ -264,6 +287,7 @@ void stop_and_report(size_t top) {
         // (a return address is the instruction after the call: look one byte back)
         if (SymFromAddr(process, address - 1, &displacement, sym)) {
             name = sym->Name;
+        } else if (generated_at(address - 1, name, displacement)) {
         } else {
             IMAGEHLP_MODULE64 mod{sizeof(mod)};
             name = SymGetModuleInfo64(process, address, &mod) ? std::string(mod.ModuleName) + "+?" : "?";
@@ -298,7 +322,8 @@ void stop_and_report(size_t top) {
 
 namespace xf::sampler {
 // TODO: POSIX (a profiling timer's signal reading the interrupted context)
-bool start(unsigned) { return false; }
+bool start(unsigned, unsigned long) { return false; }
+void name_generated(const void *const *, const unsigned *, size_t) {}
 double process_cpu_seconds() { return -1; } // TODO: getrusage
 void stop_and_report(size_t) {}
 } // namespace xf::sampler

@@ -307,6 +307,16 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                 else std::fprintf(stderr, "boot: --profile-thread: no running thread named \"%s\"; all of them\n",
                                   profile_thread.c_str());
             }
+            // the generated functions named for the samples a game library's
+            // missing symbols leave unnamed
+            std::vector<const void *> hosts;
+            std::vector<unsigned> guests;
+            for (size_t m = 0; g.installed_modules && m < g.generated_modules; m++)
+                for (size_t f = 0; f < g.installed_modules[m]->count; f++) {
+                    hosts.push_back(reinterpret_cast<const void *>(g.installed_modules[m]->functions[f].fn));
+                    guests.push_back(g.installed_modules[m]->functions[f].address);
+                }
+            sampler::name_generated(hosts.data(), guests.data(), hosts.size());
             if (!sampler::start(1000, only)) std::fprintf(stderr, "boot: --profile is not supported on this host\n");
         }
         if (stall_report > 0) {

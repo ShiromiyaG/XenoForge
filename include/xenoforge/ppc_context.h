@@ -48,6 +48,11 @@ struct System {
     // processor over (the kernel's deterministic mode). Unset: the budget is
     // refilled and the code goes on.
     void (*yield)(Context &c) = nullptr;
+    // A long spin (ppc_ops.h's spin_hint: SPIN_HINTS_BEFORE_YIELD db16cyc
+    // hints in a row): the host processor given to whatever else is ready on
+    // it (the kernel's: SwitchToThread, sched_yield), back at once when
+    // nothing is. Unset: the spin goes on.
+    void (*spin)(Context &c) = nullptr;
     // The port's hooks (xenoforge/hooks.h; docs/recompiler.md, "Replacing and
     // hooking"), for the interpreter. hook_pages: a bit per 4 KB page of the
     // guest's addresses that holds a hook (nullptr: it looks for none).
@@ -105,6 +110,8 @@ struct alignas(64) Context {
     // a yield point is a load and a branch not taken.
     int64_t yield_budget;
     bool yield_counting;
+    // db16cyc hints since the spin last gave the processor up (spin_hint)
+    uint32_t spin_hints;
 
     // CR as the 32-bit register (mfcr), field 0 in the top nibble
     uint32_t cr_word() const {
