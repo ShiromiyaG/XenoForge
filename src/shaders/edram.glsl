@@ -12,7 +12,8 @@
 // EDRAM itself), only the conversions that need no push constants. With
 // EDRAM_TWO_TARGETS (edram_transfer.frag, a target's samples drawn straight
 // into another), `target` is a variable the shader sets to the side it works
-// on, from push constants of its own.
+// on, from push constants of its own. EDRAM_NO_ADDRESSING (resolve.comp
+// reading a target's image) leaves out where samples live in EDRAM.
 
 #if defined(EDRAM_TWO_TARGETS)
 struct EdramParams {
@@ -49,10 +50,10 @@ layout(push_constant) uniform Target {
 } target;
 #endif
 
+#if !defined(EDRAM_NO_TARGET) && !defined(EDRAM_NO_ADDRESSING)
 const uint TILE_DWORDS = 80u * 16u;
 const uint EDRAM_DWORDS = TILE_DWORDS * 2048u;
 
-#ifndef EDRAM_NO_TARGET
 // a tile's dwords, and EDRAM's, at the target's scale
 uint tile_dwords() { return 80u * target.scale * target.scale; }
 uint edram_dwords() { return tile_dwords() * 2048u; }
@@ -148,7 +149,9 @@ uint pack_depth(float depth, uint stencil) { return (depth_to_guest(depth) << 8u
 // D24FS8's in the first half, D24S8's in the second (Xenia's
 // OwnershipRange::host_depth_render_target_float24 and _unorm24, tracked
 // apart so that clearing through the other format does not drop it).
+#ifndef EDRAM_NO_ADDRESSING
 uint host_depth_offset(uint at) { return at + (target.format == 0u ? edram_dwords() : 0u); }
+#endif
 float unpack_depth(uint word) {
     uint d24 = word >> 8u;
     // xenos::UNorm24To32: exact, 0xFFFFFF to 1

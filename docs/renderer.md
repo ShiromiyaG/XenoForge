@@ -2757,6 +2757,26 @@ way (ours 9.2-9.4 ms of GPU a frame in the drive's window against Xenia's
 spares Xenia's; finding it needs the same timing in Xenia's live executable
 (the whole xenia_canary built with it) beside `XF_GPU_TIME=1`.
 
+**Resolves straight from the target's image (2026-11-09).** On the host
+path every resolve stored its rectangle's tiles into EDRAM (a pass and a
+barrier) only for the copy to read them back from there at once. The copy
+now reads the source target's image itself (`resolve.comp` with `IMAGE`,
+`resolve_image*.comp.inc`, the target's store set as its set 2): each guest
+sample's words made from the host sample at the same pixel by edram.glsl's
+packing, as the store makes them (the target's format and the store's
+flags in the push constants' flags, bits 28-31 and 4-7). Nothing else read
+those words: the source holds every tile of the rectangle (`acquire`) and
+keeps them. The pictures are the same bits as before (game D's drive frame
+at 100% and 200%, game A's race at 150%, `replay_test` on both paths);
+`XF_RESOLVE_THROUGH_EDRAM=1` goes back to the store. The same frame, timed
+the same way after a warm-up run (a first run after a pause finds the GPU's
+clocks down and takes twice as long): 9.18-9.32 to 8.17-8.21 ms a play, the
+stores' 1.02 ms gone and the copies 1.32 to 1.23 ms; Xenia D3D12 10.0 ms.
+Still behind Xenia there: copies (1.23 against 0.67, mostly the chain's 48
+small ones at 7 us each) and clears (0.35 against 0.12: each a full barrier
+and a rendering pass of its own; candidates: a clear kept for the target's
+next render pass, narrower barriers).
+
 ## Resolution scale (2026-11-08)
 
 The console's pixels drawn as more (or fewer) host pixels: 50% to 800% in

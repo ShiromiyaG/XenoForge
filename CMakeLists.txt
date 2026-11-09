@@ -172,6 +172,8 @@ xf_shader(depth_float24.frag depth_float24.frag)
 xf_shader(depth_float24_round.frag depth_float24.frag -DROUND)
 xf_shader(placeholder.frag placeholder.frag)
 xf_shader(resolve.comp resolve.comp)
+xf_shader(resolve_image.comp resolve.comp -DIMAGE)
+xf_shader(resolve_image_ms.comp resolve.comp -DIMAGE -DMS)
 xf_shader(texture_load.comp texture_load.comp)
 xf_shader(texture_load_test.comp texture_load.comp -DPARAMS_BUFFER) # texture_gpu_test's
 add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/native_render.cpp src/replay.cpp src/shader_step.cpp ${XF_SHADER_WORDS})

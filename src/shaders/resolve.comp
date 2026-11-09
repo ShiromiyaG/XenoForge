@@ -11,10 +11,31 @@
 // LICENSE-xenia.
 #version 450
 #extension GL_GOOGLE_include_directive : require
+#ifdef IMAGE
+#extension GL_EXT_samplerless_texture_functions : require
+#endif
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) readonly buffer Source { uint words[]; } src;
+#ifdef IMAGE
+// IMAGE (the host render target path): the source target's image read
+// directly, each guest sample's words made from its host value as the EDRAM
+// store makes them (edram_store.comp, edram.glsl's packing), instead of the
+// store into EDRAM and the read from there: the target's store set (set 2),
+// its image at binding 2, the stencil (depth) or the UINT view (a float
+// target moved by its bits) at binding 3. MS: the image is multisampled.
+#ifdef MS
+layout(set = 2, binding = 2) uniform texture2DMS image_source;
+layout(set = 2, binding = 3) uniform utexture2DMS image_bits;
+#else
+layout(set = 2, binding = 2) uniform texture2D image_source;
+layout(set = 2, binding = 3) uniform utexture2D image_bits;
+#endif
+#define EDRAM_TWO_TARGETS
+#define EDRAM_NO_ADDRESSING
+#include "edram.glsl"
+#endif
 layout(set = 0, binding = 1) coherent buffer Memory { uint words[]; } memory;
 // The textures over a destination that the resolve writes as well
 // (renderer.cpp's resolve targets): their images through 32- and 64-bit
@@ -46,7 +67,8 @@ layout(push_constant) uniform Resolve {
     // bits 16-23 the grid the invocations run over (0 both: 100%); bit 1, a
     // pass writing the textures alone, over their scaled texels (memory is
     // written by a pass over the console's pixels, each from the host pixel
-    // at its center)
+    // at its center). IMAGE: bits 4-7 the EDRAM store's flags for the
+    // target (edram.glsl's), bits 28-31 its format.
     uint flags;
     // the textures the resolve writes too: bits 0-6 the first's slot plus
     // one (0: none), bit 7 64-bit texels, bits 8-14 the second's slot plus
@@ -98,6 +120,30 @@ uvec2 edram_pixel(uvec2 at) {
     return ((g * 2u + 1u) * edram_q4()) / (2u * grid_q4());
 }
 
+// The guest's words (the second for 64-bit samples) of an EDRAM pixel's
+// guest sample: from EDRAM, or with IMAGE from the target's host sample at
+// the same pixel (Vulkan's standard 2x locations put the top sample, the
+// guest's 0, at index 1: edram.glsl's guest_sample)
+uvec2 guest_words(uvec2 pixel, uint sample_index) {
+#ifdef IMAGE
+    ivec2 at = ivec2(pixel);
+    int host = int(p.msaa == 1u ? sample_index ^ 1u : sample_index);
+#ifdef MS
+#define FETCH(image) texelFetch(image, at, host)
+#else
+#define FETCH(image) texelFetch(image, at, 0)
+#endif
+    if (p.depth != 0u) return uvec2(pack_depth(FETCH(image_source).r, FETCH(image_bits).r), 0u);
+    if ((target.flags & 8u) != 0u) return pack_raw(FETCH(image_bits));
+    return pack_color(FETCH(image_source));
+#undef FETCH
+#else
+    uint d = edram_dword(pixel, sample_index);
+    return uvec2(src.words[d], p.ints_log2 != 0u ? src.words[(d + 1u) % edram_dwords()] : 0u);
+#endif
+}
+
+#ifndef IMAGE // (included above with IMAGE)
 // edram.glsl's: a 7e3 float (2_10_10_10_FLOAT's components in EDRAM)
 float float7e3_to_32(uint f10) {
     f10 &= 0x3FFu;
@@ -111,6 +157,7 @@ float float7e3_to_32(uint f10) {
     }
     return uintBitsToFloat((uint(exponent + 124) << 23u) | (mantissa << 16u));
 }
+#endif
 
 // color render target formats (xenos.h's ColorRenderTargetFormat)
 const uint RT_8_8_8_8 = 0u, RT_8_8_8_8_GAMMA = 1u, RT_2_10_10_10 = 2u, RT_2_10_10_10_FLOAT = 3u, RT_16_16 = 4u,
@@ -266,8 +313,8 @@ vec4 load_colors(uvec2 at, uint index) {
     for (uint k = 0u; k < count; k++) {
         vec4 c;
         if (p.edram != 0u) {
-            uint d = edram_dword(edram_pixel(at), p.first_sample + k);
-            c = unpack_guest(src.words[d], p.ints_log2 != 0u ? src.words[(d + 1u) % edram_dwords()] : 0u);
+            uvec2 g = guest_words(edram_pixel(at), p.first_sample + k);
+            c = unpack_guest(g.x, g.y);
         } else {
             c = unpack(src.words[index * p.src_words], p.src_words > 1u ? src.words[index * p.src_words + 1u] : 0u);
         }
@@ -460,13 +507,18 @@ void write_targets(ivec2 texel, uint w[4]) {
 void main() {
     uvec2 at = gl_GlobalInvocationID.xy;
     if (at.x >= p.width || at.y >= p.height) return;
+#ifdef IMAGE
+    // edram.glsl's packing: the target's format, and the EDRAM store's flags
+    // (flags bits 28-31 and 4-7)
+    target.format = p.flags >> 28u;
+    target.flags = (p.flags >> 4u) & 0xFu;
+#endif
     uint index = at.y * p.width + at.x;
     uint w0, w1 = 0u;
     if (p.edram != 0u && (p.depth != 0u || p.raw != 0u)) {
         // the guest's words of the one sample taken, as they are
-        uint d = edram_dword(edram_pixel(at), p.first_sample);
-        w0 = src.words[d];
-        if (p.ints_log2 != 0u) w1 = src.words[(d + 1u) % edram_dwords()];
+        uvec2 g = guest_words(edram_pixel(at), p.first_sample);
+        w0 = g.x, w1 = g.y;
     } else if (p.depth != 0u) {
         // as the guest's words: depth in the high 24 bits, as the EDRAM store
         // writes them (D24FS8 kept halved)

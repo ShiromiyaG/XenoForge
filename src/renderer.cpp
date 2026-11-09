@@ -174,6 +174,13 @@ const uint32_t PLACEHOLDER[] = {
 const uint32_t RESOLVE[] = {
 #include "resolve.comp.inc"
 };
+// (the host render target path's, reading the source target's image)
+const uint32_t RESOLVE_IMAGE[] = {
+#include "resolve_image.comp.inc"
+};
+const uint32_t RESOLVE_IMAGE_MS[] = {
+#include "resolve_image_ms.comp.inc"
+};
 const uint32_t TEXTURE_LOAD[] = {
 #include "texture_load.comp.inc"
 };
@@ -2182,6 +2189,15 @@ private:
     VkDescriptorSetLayout compute_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout resolve_layout_ = VK_NULL_HANDLE, load_layout_ = VK_NULL_HANDLE;
     VkPipeline resolve_pipeline_ = VK_NULL_HANDLE, load_pipeline_ = VK_NULL_HANDLE;
+    // the host path's resolves from the source target's image (resolve.comp
+    // with IMAGE, the target's store set as set 2), 1x and multisampled;
+    // XF_RESOLVE_THROUGH_EDRAM=1: stored into EDRAM and read from there, as before
+    VkPipelineLayout resolve_image_layout_ = VK_NULL_HANDLE;
+    VkPipeline resolve_image_pipelines_[2] = {};
+    bool resolve_through_edram_ = [] {
+        const char *v = std::getenv("XF_RESOLVE_THROUGH_EDRAM");
+        return v && v[0] == '1';
+    }();
     VkDescriptorPool compute_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet resolve_set_ = VK_NULL_HANDLE, load_set_ = VK_NULL_HANDLE, resolve_edram_set_ = VK_NULL_HANDLE;
     // the resolves' set 1: the textures they write as well, through 32- and
@@ -2377,7 +2393,8 @@ Impl::~Impl() {
     for (auto &modules : transfer_fs_)
         for (VkShaderModule m : modules)
             if (m) vkDestroyShaderModule(dev_, m, nullptr);
-    for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_, clear_pipeline_, rescale_pipeline_})
+    for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, resolve_image_pipelines_[0],
+                         resolve_image_pipelines_[1], load_pipeline_, clear_pipeline_, rescale_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
     for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
                              depth_float24_fs_[1], placeholder_fs_, fsi_depth_fs_})
@@ -2385,7 +2402,8 @@ Impl::~Impl() {
     for (VkDescriptorPool p : edram_pools_) vkDestroyDescriptorPool(dev_, p, nullptr);
     for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_, target_pool_})
         if (p) vkDestroyDescriptorPool(dev_, p, nullptr);
-    for (VkPipelineLayout l : {edram_layouts_[0], edram_layouts_[1], edram_layouts_[2], layout_, resolve_layout_, load_layout_})
+    for (VkPipelineLayout l : {edram_layouts_[0], edram_layouts_[1], edram_layouts_[2], layout_, resolve_layout_,
+                               resolve_image_layout_, load_layout_})
         if (l) vkDestroyPipelineLayout(dev_, l, nullptr);
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
                                     compute_set_layout_, target_set_layout_})
@@ -3021,6 +3039,21 @@ bool Impl::init(std::string &error) {
         resolve_pipeline_ = compute_pipeline(RESOLVE, sizeof(RESOLVE), resolve_layout_);
         load_pipeline_ = compute_pipeline(TEXTURE_LOAD, sizeof(TEXTURE_LOAD), load_layout_);
         if (!resolve_pipeline_ || !load_pipeline_) return error = "could not make the resolve and load pipelines", false;
+        if (!fsi_) {
+            VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ResolveConstants)};
+            const VkDescriptorSetLayout set_layouts[3] = {compute_set_layout_, target_set_layout_, edram_set_layouts_[0]};
+            VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layout.setLayoutCount = 3;
+            layout.pSetLayouts = set_layouts;
+            layout.pushConstantRangeCount = 1;
+            layout.pPushConstantRanges = &range;
+            if (vkCreatePipelineLayout(dev_, &layout, nullptr, &resolve_image_layout_) != VK_SUCCESS)
+                return error = "vkCreatePipelineLayout failed", false;
+            resolve_image_pipelines_[0] = compute_pipeline(RESOLVE_IMAGE, sizeof(RESOLVE_IMAGE), resolve_image_layout_);
+            resolve_image_pipelines_[1] = compute_pipeline(RESOLVE_IMAGE_MS, sizeof(RESOLVE_IMAGE_MS), resolve_image_layout_);
+            if (!resolve_image_pipelines_[0] || !resolve_image_pipelines_[1])
+                return error = "could not make the image resolve pipelines", false;
+        }
         // the interlock path's clears into EDRAM: the resolves' layout and
         // their EDRAM set (EDRAM at binding 0), edram.glsl's push constants
         static_assert(sizeof(EdramTarget) <= sizeof(ResolveConstants));
@@ -8543,14 +8576,15 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     }
     VkDeviceSize pixel_bytes = VkDeviceSize(w) * h * texel;
     VkDeviceSize stencil_bytes = info.depth ? (VkDeviceSize(w) * h + 3) & ~VkDeviceSize(3) : 0;
-    // The source is read from EDRAM, its samples as the guest keeps them, as
+    // The source is read as EDRAM's samples, as the guest keeps them, as
     // Xenia's resolve shaders read them (the sample or the average
-    // RB_COPY_CONTROL selects; depth one sample): the rectangle's tiles
-    // stored there first by the target, which keeps them (on the interlock
-    // path EDRAM is the targets). Single-sampled ones too: the store and the
-    // read cost less than copying the image into a buffer first (game B's
-    // final 1280x720 resolve, 0.064 against 0.099 ms; docs/renderer.md,
-    // "Direct ownership transfers"). XF_RESOLVE_FROM_IMAGE=1 copies a
+    // RB_COPY_CONTROL selects; depth one sample): on the interlock path from
+    // EDRAM, which is the targets; on the host path from the target's image,
+    // each sample packed as the EDRAM store would pack it (from_target_image
+    // below). Single-sampled ones too: that costs less than copying the image
+    // into a buffer first (game B's final 1280x720 resolve, 0.064 against
+    // 0.099 ms with the store; docs/renderer.md, "Direct ownership
+    // transfers"). XF_RESOLVE_FROM_IMAGE=1 copies a
     // single-sampled target's image, as before (not an 8_8_8_8_GAMMA one
     // kept linear, whose gamma is made in EDRAM's bits).
     static const bool from_image = [] {
@@ -8567,7 +8601,16 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     request(keep);
 
     VkCommandBuffer c;
-    if (from_edram) {
+    // On the host path the guest samples come from the source's image itself,
+    // packed as the EDRAM store packs them (resolve.comp's IMAGE), with no
+    // store and no barrier between the two: the source holds every tile of
+    // the rectangle (acquire), and keeps holding them, so EDRAM's copy of
+    // them is read by nothing (XF_RESOLVE_THROUGH_EDRAM=1: as before).
+    const bool from_target_image = from_edram && !fsi_ && !resolve_through_edram_;
+    if (from_target_image) {
+        c = outside();
+        if (options_.gpu_timing) gpu_mark("resolves: copies from the target: " + target_name(source));
+    } else if (from_edram) {
         std::vector<uint32_t> tiles;
         for (uint32_t row = info.y / source.tile_height; row <= (info.y + h - 1) / source.tile_height; row++)
             for (uint32_t column = info.x / source.tile_width; column <= (info.x + w - 1) / source.tile_width; column++)
@@ -8669,18 +8712,25 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         p.first_sample = resolve::first_sample(info.sample_select);
         p.samples = resolve::sample_count(info.sample_select);
     }
-    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_pipeline_);
-    const VkDescriptorSet resolve_sets[2] = {from_edram ? resolve_edram_set_ : resolve_set_, target_set_};
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 2, resolve_sets, 0, nullptr);
-    vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+    // the store's packing for the target: its flags (bits 4-7) and format (28-31)
+    if (from_target_image) p.flags |= (edram_target(source, 0).flags & 0xFu) << 4 | (source.format & 0xFu) << 28;
+    const VkPipelineLayout layout = from_target_image ? resolve_image_layout_ : resolve_layout_;
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      from_target_image ? resolve_image_pipelines_[source.msaa ? 1 : 0] : resolve_pipeline_);
+    const VkDescriptorSet resolve_sets[3] = {from_edram ? resolve_edram_set_ : resolve_set_, target_set_,
+                                             source.store_set};
+    const uint32_t mask_offset = 0; // (the store set's tile mask, which the resolve does not read)
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, from_target_image ? 3 : 2, resolve_sets,
+                            from_target_image ? 1 : 0, &mask_offset);
+    vkCmdPushConstants(c, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
     if (target_scaled) {
         // the scaled textures alone, over their texels at the resolution scale
         ResolveConstants scaled = p;
         scaled.target = target_scaled;
-        scaled.flags = (p.flags & 1u) | 2u | scale_.q4 << 8 | scale_.q4 << 16;
+        scaled.flags = (p.flags & (1u | 0xF0u | 0xF0000000u)) | 2u | scale_.q4 << 8 | scale_.q4 << 16;
         scaled.width = scale_.down(w), scaled.height = scale_.down(h);
-        vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scaled), &scaled);
+        vkCmdPushConstants(c, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scaled), &scaled);
         vkCmdDispatch(c, (scaled.width + 7) / 8, (scaled.height + 7) / 8, 1);
     }
     full_barrier(c);
