@@ -55,6 +55,9 @@ bool choice_combo(const char *label, const std::vector<Option> &list, int &value
 
 } // namespace
 
+std::string guide_label(const char *label) { return labelled(label); }
+void guide_caption(const char *text) { caption(text); }
+
 void ConsolePages::load(Host &h) {
     if (loaded_) return;
     loaded_ = true;
@@ -235,26 +238,6 @@ void ConsolePages::restart_notice(Host &h) {
     if (ImGui::Button("Restart the title")) h.restart();
 }
 
-void ConsolePages::achievements_page(Host &h, double now, float icon) {
-    if (now - summary_at_ >= 1.0) summary_ = kernel::profile_summary(h.kernel), summary_at_ = now;
-    if (summary_.achievements.empty()) ImGui::TextDisabled("No achievements listed for this title.");
-    for (const kernel::ProfileAchievement &a : summary_.achievements) {
-        ImGui::PushID(int(a.id));
-        if (ImTextureID tex = h.icons.get(a.image_id, a.icon))
-            ImGui::ImageWithBg(tex, ImVec2(icon, icon), ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0),
-                               a.unlocked ? ImVec4(1, 1, 1, 1) : ImVec4(0.45f, 0.45f, 0.45f, 1));
-        else
-            ImGui::Dummy(ImVec2(icon, icon));
-        ImGui::SameLine();
-        ImGui::BeginGroup();
-        ImGui::TextColored(a.unlocked ? ImGui::ColorConvertU32ToFloat4(guide::col::green_hi) : ImVec4(0.7f, 0.7f, 0.7f, 1),
-                           "%s  %u G%s", utf8_of(a.label).c_str(), a.gamerscore, a.unlocked ? "  (unlocked)" : "");
-        ImGui::TextWrapped("%s", utf8_of(a.unlocked || a.unachieved.empty() ? a.description : a.unachieved).c_str());
-        ImGui::EndGroup();
-        ImGui::PopID();
-    }
-}
-
 void ConsolePages::achievement_rows(Host &h, double now, const guide::Scale &sc, float width) {
     if (now - summary_at_ >= 1.0) summary_ = kernel::profile_summary(h.kernel), summary_at_ = now;
     if (summary_.achievements.empty()) {
@@ -273,24 +256,6 @@ void ConsolePages::achievement_rows(Host &h, double now, const guide::Scale &sc,
                              h.icons.get(ach.image_id, ach.icon), focused, ImGui::IsItemHovered(), 1);
         ImGui::PopID();
     }
-}
-
-bool ConsolePages::draw(Host &h, double now) {
-    load(h);
-    bool changed = false;
-    ImGui::SeparatorText("System");
-    changed |= system_page(h);
-    ImGui::SeparatorText("Profile");
-    changed |= profile_page(h, 220);
-    restart_notice(h);
-    if (ImGui::CollapsingHeader("Achievements")) {
-        if (now - summary_at_ >= 1.0) summary_ = kernel::profile_summary(h.kernel), summary_at_ = now;
-        ImGui::Text("%s: %u / %u G", summary_.gamertag.c_str(), summary_.gamerscore, summary_.gamerscore_total);
-        ImGui::BeginChild("achievements", ImVec2(0, 260), ImGuiChildFlags_Borders);
-        achievements_page(h, now, 40);
-        ImGui::EndChild();
-    }
-    return changed;
 }
 
 // The guide: a panel sliding in from the left over the game, the profile on top (the mark, the gamertag, the
@@ -344,20 +309,31 @@ bool ConsolePages::draw_guide(Host &h, double now, bool &open) {
     y += sc.px(16);
 
     // the pages' tabs
-    static const char *names[] = {"Achievements", "Profile", "System"};
-    const float tab_h = sc.px(40), tab_gap = sc.px(8);
-    const float tab_w = (inner - 2 * tab_gap) / 3;
-    for (int i = 0; i < 3; i++) {
-        const ImVec2 tmin(x + float(i) * (tab_w + tab_gap), y), tmax(tmin.x + tab_w, y + tab_h);
+    std::vector<std::string> names = {"Achievements", "Profile", "System"};
+    for (const Host::Page &page : h.extra_pages) names.push_back(page.name);
+    const int pages = int(names.size());
+    tab_ = std::min(tab_, pages - 1);
+    const float tab_h = sc.px(40), tab_gap = sc.px(6);
+    // the names at 18 pixels, shrunk together when the row would not fit; each tab as wide as its name
+    float want = 0;
+    for (const std::string &n : names) want += guide::measure(f.strong, sc.px(18), n.c_str()).x + sc.px(24);
+    const float fit = std::min(1.0f, (inner - float(pages - 1) * tab_gap) / want);
+    const float tab_font = sc.px(18) * fit;
+    float tab_x = x;
+    for (int i = 0; i < pages; i++) {
+        const float tab_w = (guide::measure(f.strong, sc.px(18), names[size_t(i)].c_str()).x + sc.px(24)) * fit;
+        const ImVec2 tmin(tab_x, y), tmax(tmin.x + tab_w, y + tab_h);
+        tab_x += tab_w + tab_gap;
         ImGui::SetCursorScreenPos(tmin);
         ImGui::PushID(i);
         if (ImGui::InvisibleButton("##tab", ImVec2(tab_w, tab_h))) tab_ = i;
         const bool hovered = ImGui::IsItemHovered();
         ImGui::PopID();
         guide::item(dl, tmin, tmax, sc.px(8), tab_ == i, hovered, a);
-        const ImVec2 ts = guide::measure(f.strong, sc.px(18), names[i]);
-        guide::text(dl, f.strong, sc.px(18), ImVec2(tmin.x + (tab_w - ts.x) / 2, tmin.y + (tab_h - ts.y) / 2),
-                    guide::fade(tab_ == i ? guide::col::text_on_green : guide::col::text_dim, a), names[i]);
+        const ImVec2 ts = guide::measure(f.strong, tab_font, names[size_t(i)].c_str());
+        guide::text(dl, f.strong, tab_font, ImVec2(tmin.x + (tab_w - ts.x) / 2, tmin.y + (tab_h - ts.y) / 2),
+                    guide::fade(tab_ == i ? guide::col::text_on_green : guide::col::text_dim, a),
+                    names[size_t(i)].c_str());
     }
     y += tab_h + sc.px(16);
 
@@ -379,12 +355,15 @@ bool ConsolePages::draw_guide(Host &h, double now, bool &open) {
             changed |= profile_page(h, inner * 0.55f);
             restart_notice(h);
             break;
-        default:
+        case 2:
             caption("Language and region");
             changed |= system_page(h);
             caption("Picture (beyond the console)");
             changed |= picture_page(h);
             restart_notice(h);
+            break;
+        default:
+            changed |= h.extra_pages[size_t(tab_ - 3)].draw();
             break;
         }
         g_label_w = 0;
@@ -411,9 +390,9 @@ bool ConsolePages::draw_guide(Host &h, double now, bool &open) {
         (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)))
         open = false;
     if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_PageUp, false))
-        tab_ = (tab_ + 2) % 3;
+        tab_ = (tab_ + pages - 1) % pages;
     if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_PageDown, false))
-        tab_ = (tab_ + 1) % 3;
+        tab_ = (tab_ + 1) % pages;
     ImGui::End();
     if (!open) guide_shown_at_ = -1;
     return changed;

@@ -1860,11 +1860,13 @@ code. As built (`frontend/`):
   by playing a little faster or slower (half a percent at most), primed
   with silence when it ran dry, and a frame is let go when a quarter second
   is queued. `audio.volume` and `audio.mute` are the device's gain.
-- **The overlay** (F1, Dear ImGui): the guest's swaps per second, the
+- **The F1 pages** (since 2026-11-09 F1 opens the guide, in its look, on its Settings page, with the pad as well
+  as the mouse and keyboard; a second F1 closes it and saves): Settings (volume, mute, vsync, smooth scaling,
+  fullscreen, the picture options, the port's options) and Debug (the guest's swaps per second, the
   frames presented and the window's refreshes per second, the sound frames
   played (and how many had sound), the input states delivered, each user's
-  controller (what drives it, its buttons, triggers and sticks), the
-  volume, mute, vsync, scaling, fullscreen, and a screenshot button. F11
+  controller (what drives it, its buttons, triggers and sticks), the frame-time graph, the native renderer's and
+  the hooks' counters, and a screenshot button). F11
   switches fullscreen; F12 saves the window's next picture (copied back
   from the GPU) as `<title>_<swap>_key<n>.png` in `player.screenshots`
   (default: a `screenshots` folder beside config.toml, never the
@@ -1873,7 +1875,7 @@ code. As built (`frontend/`):
   overlay shows which and what was skipped.
 - **config.toml** (`settings.cpp`; `--config`, else SDL's preference folder,
   `%APPDATA%\xenoforge\config.toml` on Windows), written with the defaults
-  the first time and saved when the overlay closes:
+  the first time and saved when the F1 pages close:
 
   ```toml
   [video]    # fullscreen, vsync (true), smooth (true), aspect ("auto", "integer" or "stretch"), and the
@@ -1934,7 +1936,7 @@ from one table of choices (`settings.h`'s `video_choices`):
   anisotropy and trilinear apply where Xenia's `anisotropic_override` does:
   mipmapped textures (not a base map alone) the game filters linearly;
   nearest is everywhere (a look, not a fix).
-- **Frame-time graph** (`frame_graph`): the F1 overlay plots the intervals
+- **Frame-time graph** (`frame_graph`): the Debug page plots the intervals
   between the frames the window showed (the last 240), with the average and
   the worst.
 
@@ -2066,19 +2068,19 @@ kernel's own result shapes. The logic is apart from the view:
   Achievements (the rows above), Profile and System (a setting's name at the left, its control at the right, green
   section captions). While it is open the title gets neutral controller states and no keyboard, as with a dialog;
   ImGui's own pad and keyboard navigation drives it; B or Escape closes it and saves config.toml if anything changed.
-  A dialog the title opens closes it. `--ui-demo guide`, `guide-profile`, `guide-system` open it at the start.
+  A dialog the title opens closes it. `--ui-demo guide`, `guide-profile`, `guide-system`, `guide-settings`, `guide-debug` open it at the start.
 - **The game stays in charge of its own time.** While a dialog is up the player gives the title neutral controller
   states and no keyboard (`Controllers::set_taken`; the console's guide takes the controller from the title), and
   `XamIsUIActive` answers 1 until the answer; the guest's threads, the sound and the scheduler's clock keep running
   (nothing waits for the window; a title that opened a dialog with no overlapped waits on its own thread only).
-- **The F1 overlay** has a "Console" section (`frontend/overlay_system.*`): System (language, country, resolution,
+- **The guide's console pages** (`frontend/overlay_system.*`; F1 adds Settings and Debug to them, `Host::extra_pages`): System (language, country, resolution,
   aspect, refresh), Profile (the gamertag with its rules, the profiles with Use and Delete, a new profile, the saves'
   format) and the title's achievements, read only. The same choices are the launcher's System and Profile tabs
   (`console_options.*`, `profiles.*`): one list of languages (XLanguage), countries (XOnlineCountry) and video modes
   and one validation (`valid_gamertag`: 1 to 15 letters, digits and single spaces, starting with a letter, no space at
   the end; `clamp_system` puts values the kernel would not know back to its default). In the player the system
   settings go to the kernel at once (`apply_system_settings`: xconfig.bin) but a running title reads them at its start,
-  so the overlay says so and offers "Restart the title"; the gamertag (`set_gamertag`) and the saves' format
+  so the page says so and offers "Restart the title"; the gamertag (`set_gamertag`) and the saves' format
   (`set_content_format`) apply live; choosing or deleting a profile needs the restart.
 - **Profiles** are directories of the storage root, `content/<XUID>/` with the package
   `FFFE07D1/00010000/<XUID>` (where the kernel keeps the GPDs); the gamertags are config.toml's `[profile.names]`,

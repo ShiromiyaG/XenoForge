@@ -471,8 +471,8 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         at = comma == std::string::npos ? ui_demo.size() : comma + 1;
         kernel::UiRequest r;
         if (name == "console" || name == "guide") continue; // (the overlay's console section; the guide)
-        if (name == "guide-profile" || name == "guide-system") {
-            guide_page_demo = name == "guide-profile" ? 1 : 2;
+        if (name == "guide-profile" || name == "guide-system" || name == "guide-settings" || name == "guide-debug") {
+            guide_page_demo = name == "guide-profile" ? 1 : name == "guide-system" ? 2 : name == "guide-settings" ? 3 : 4;
             continue;
         }
         if (name == "toast") {
@@ -584,7 +584,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     uint32_t frame_time_at = 0;
     Clock::time_point last_fresh{};
     // the guide (F2 or the controller's Guide button): the console pages in the guide's look
-    bool guide_open = ui_demo.find("guide") != std::string::npos;
+    bool guide_open = overlay || ui_demo.find("guide") != std::string::npos || ui_demo.find("console") != std::string::npos;
+    if (overlay) guide_page_demo = 3; // --overlay: F1 pressed at the start
+    if (ui_demo.find("console") != std::string::npos) guide_page_demo = 2;
     if (guide_page_demo) pages.set_guide_page(guide_page_demo);
     uint16_t guide_buttons_before = 0;
     uint64_t guide_combo_since = 0; // when Back and Start were both down (0: not both)
@@ -645,11 +647,8 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             }
             if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
                 if (e.key.scancode == SDL_SCANCODE_F1) {
-                    overlay = !overlay;
-                    if (!overlay && changed) {
-                        if (!frontend::save(config_file, settings, error)) std::fprintf(stderr, "%s\n", error.c_str());
-                        changed = false;
-                    }
+                    if (guide_open) close_guide(); // (saves what changed)
+                    else guide_open = true, pages.set_guide_page(3);
                     continue;
                 }
                 if (e.key.scancode == SDL_SCANCODE_F11) {
@@ -711,7 +710,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         {
             // the pointer: over the game's picture it rests hidden; the overlay, the guide and the dialogs get it
             const bool full = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
-            const bool show = pointer.visible(SDL_GetTicks(), overlay || dialog_up || guide_open, full);
+            const bool show = pointer.visible(SDL_GetTicks(), dialog_up || guide_open, full);
             if (show != pointer_shown) {
                 pointer_shown = show;
                 std::printf("player: pointer %s at %.1f s\n", show ? "shown" : "hidden", double(SDL_GetTicks()) / 1000.0);
@@ -720,7 +719,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             }
         }
         controllers.set_taken(dialog_up || guide_open);
-        controllers.read_keyboard(focused, overlay || dialog_up || guide_open);
+        controllers.read_keyboard(focused, dialog_up || guide_open);
         if (dialog_up) {
             const uint64_t at = k.uptime_ms();
             const input::Gamepad pad = controllers.view(at)[sysui.user()].pad;
@@ -816,7 +815,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         SDL_GetWindowSizeInPixels(window, &pw, &ph);
         const bool minimized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) || !pw || !ph;
         const bool ui_busy = sysui.active() || sysui.has_toasts() || guide_open;
-        const bool extra = overlay || ui_busy;
+        const bool extra = ui_busy;
         if (minimized || (!presenter.fresh() && !extra && !drew_extra && !redraw)) {
             SDL_Delay(minimized ? 10 : 1);
             continue;
@@ -826,151 +825,6 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        if (overlay) {
-            ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(600, 0), ImGuiCond_FirstUseEver);
-            bool keep = true;
-            ImGui::Begin("XenoForge (F1)", &keep, ImGuiWindowFlags_NoSavedSettings);
-            ImGui::Text("guest swaps %.1f/s (%llu), frames presented %.1f/s (%llu)", rates.swaps,
-                        (unsigned long long)swapped, rates.presented, (unsigned long long)presented);
-            ImGui::Text("window refreshes %.1f/s, run %.0f s; front buffers not shown (no picture free) %llu",
-                        rates.refreshes, seconds, (unsigned long long)presenter.skipped.load());
-            ImGui::Text("sound: %llu frames played (%.1f/s, %u channels), %llu with sound, %llu starved",
-                        (unsigned long long)sound.sent.load(), rates.sound, sound.channels(),
-                        (unsigned long long)sound.audible.load(), (unsigned long long)sound.starved.load());
-            ImGui::Text("input: %llu states delivered (%.1f/s)", (unsigned long long)kernel::input_states_delivered(k),
-                        rates.states);
-            ImGui::SeparatorText("Controllers");
-            if (ImGui::BeginTable("pads", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
-                auto view = controllers.view(k.uptime_ms());
-                for (uint32_t u = 0; u < input::USERS; u++) {
-                    const auto &v = view[u];
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%u", u);
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(v.source.empty() ? "(none)" : v.source.c_str());
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(v.source.empty() ? "" : button_names(v.pad.buttons, button_text));
-                    ImGui::TableNextColumn();
-                    if (!v.source.empty())
-                        ImGui::Text("LT %3u RT %3u  L %6d %6d  R %6d %6d", v.pad.left_trigger, v.pad.right_trigger,
-                                    v.pad.thumb_lx, v.pad.thumb_ly, v.pad.thumb_rx, v.pad.thumb_ry);
-                }
-                ImGui::EndTable();
-            }
-            ImGui::SeparatorText("Settings");
-            bool moved = false;
-            moved |= ImGui::SliderInt("Volume", &settings.audio.volume, 0, 100, "%d%%");
-            moved |= ImGui::Checkbox("Mute", &settings.audio.mute);
-            moved |= ImGui::Checkbox("Vertical sync (the window's only)", &settings.video.vsync);
-            ImGui::SameLine();
-            moved |= ImGui::Checkbox("Smooth scaling", &settings.video.smooth);
-            ImGui::SameLine();
-            moved |= ImGui::Checkbox("Fullscreen (F11)", &settings.video.fullscreen);
-            if (settings.video.frame_graph) {
-                // the time between the frames the window showed, the last 240
-                float values[FRAME_TIMES];
-                float worst = 0, sum = 0;
-                for (uint32_t i = 0; i < FRAME_TIMES; i++) {
-                    values[i] = frame_times[(frame_time_at + i) % FRAME_TIMES];
-                    worst = std::max(worst, values[i]), sum += values[i];
-                }
-                char caption[96];
-                std::snprintf(caption, sizeof(caption), "frame time: %.1f ms average, %.1f ms worst", sum / FRAME_TIMES,
-                              worst);
-                ImGui::PlotLines("##frames", values, int(FRAME_TIMES), 0, caption, 0.0f, std::max(50.0f, worst * 1.1f),
-                                 ImVec2(-FLT_MIN, 70));
-            }
-            if (moved) apply(), changed = true;
-            {
-                // the picture beyond the console (the guide's System page has the same)
-                ImGui::SeparatorText("Picture (beyond the console)");
-                frontend::ConsolePages::Host host{settings,     o.storage, k, icons, apply_system,
-                                                  [&] {
-                                                      restart_requested = true;
-                                                      quit = true;
-                                                      ended = "restart";
-                                                  },
-                                                  [&] { apply(); }, scale_notice};
-                if (pages.picture_page(host)) changed = true;
-            }
-            if (!port.options.empty()) {
-                ImGui::SeparatorText(port.name.empty() ? "Port" : port.name.c_str());
-                bool port_moved = false;
-                for (const PortOption &op : port.options) {
-                    const char *label = op.label.empty() ? op.key.c_str() : op.label.c_str();
-                    bool one = false;
-                    if (op.kind == PortOption::Kind::Boolean) {
-                        one = ImGui::Checkbox(label, op.flag);
-                        if (one) settings.port[op.key] = *op.flag;
-                    } else if (op.kind == PortOption::Kind::Integer) {
-                        one = ImGui::SliderInt(label, op.integer, int(op.min), int(op.max));
-                        if (one) settings.port[op.key] = int64_t(*op.integer);
-                    } else {
-                        one = ImGui::SliderScalar(label, ImGuiDataType_Double, op.real, &op.min, &op.max, "%.3f");
-                        if (one) settings.port[op.key] = *op.real;
-                    }
-                    port_moved |= one;
-                }
-                if (port_moved) changed = true;
-            }
-            if (native::has_output_renderer()) {
-                const native::Counters n = native::counters();
-                ImGui::SeparatorText("Native renderer (F6)");
-                ImGui::Text("%s; %llu frames the port's, %llu yielded (%llu held)",
-                            !native::enabled() ? "off: the emulated frames"
-                            : native::active() ? "on: the port's frames"
-                                               : "on: the port yields",
-                            (unsigned long long)n.frames_native, (unsigned long long)n.frames_yielded,
-                            (unsigned long long)n.frames_held);
-                ImGui::Text("skipped %llu draws, %llu resolves; kept %llu, %llu; %llu exporting memory; %llu "
-                            "occlusion reports faked",
-                            (unsigned long long)n.draws_skipped, (unsigned long long)n.resolves_skipped,
-                            (unsigned long long)n.draws_kept, (unsigned long long)n.resolves_kept,
-                            (unsigned long long)n.memexport_kept, (unsigned long long)n.occlusion_faked);
-            }
-            if (hooks::stats_on()) {
-                // the port's hooks and their calls (--hook-stats)
-                ImGui::SeparatorText("Port hooks");
-                if (ImGui::BeginTable("hooks", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
-                    for (const hooks::Stat &st : hooks::stats()) {
-                        ImGui::TableNextRow();
-                        ImGui::TableNextColumn();
-                        ImGui::Text("0x%08X %s", st.address, st.function.c_str());
-                        ImGui::TableNextColumn();
-                        ImGui::TextUnformatted(hooks::kind_name(st.kind));
-                        ImGui::TableNextColumn();
-                        ImGui::TextUnformatted(st.hook.c_str());
-                        ImGui::TableNextColumn();
-                        ImGui::Text("%llu", (unsigned long long)st.calls);
-                    }
-                    ImGui::EndTable();
-                }
-            }
-            if (ui_demo.find("console") != std::string::npos) ImGui::SetNextItemOpen(true, ImGuiCond_Once); // (--ui-demo console)
-            if (ImGui::CollapsingHeader("Console: system, profile, achievements")) {
-                frontend::ConsolePages::Host host{settings,
-                                                  o.storage,
-                                                  k,
-                                                  icons,
-                                                  apply_system,
-                                                  [&] {
-                                                      restart_requested = true;
-                                                      quit = true;
-                                                      ended = "restart";
-                                                  },
-                                                  [&] { apply(); },
-                                                  scale_notice};
-                if (pages.draw(host, seconds)) changed = true;
-            }
-            ImGui::SeparatorText("Screenshot");
-            if (ImGui::Button("Save (F12)")) key_screenshot();
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", key_shots.string().c_str());
-            ImGui::End();
-            if (!keep) overlay = false;
-        }
         if (guide_open) {
             frontend::ConsolePages::Host host{settings,     o.storage, k, icons, apply_system,
                                               [&] {
@@ -979,6 +833,115 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                                                   ended = "restart";
                                               },
                                               [&] { apply(); }, scale_notice};
+            namespace fe = frontend;
+            // F1 opens the guide on these two pages: the settings of the sound, the window, the picture and the port,
+            // and the counters of the run (the guide's look, so the pad drives them as the console's pages)
+            host.extra_pages.push_back({"Settings", [&] {
+                bool moved = false, picture = false;
+                fe::guide_caption("Sound");
+                moved |= ImGui::SliderInt(fe::guide_label("Volume").c_str(), &settings.audio.volume, 0, 100, "%d%%");
+                moved |= ImGui::Checkbox(fe::guide_label("Mute").c_str(), &settings.audio.mute);
+                fe::guide_caption("Window");
+                moved |= ImGui::Checkbox(fe::guide_label("Vertical sync").c_str(),
+                                         &settings.video.vsync);
+                moved |= ImGui::Checkbox(fe::guide_label("Smooth scaling").c_str(), &settings.video.smooth);
+                moved |= ImGui::Checkbox(fe::guide_label("Fullscreen (F11)").c_str(), &settings.video.fullscreen);
+                if (moved) apply();
+                fe::guide_caption("Picture (beyond the console)");
+                picture = pages.picture_page(host);
+                pages.restart_notice(host);
+                bool port_moved = false;
+                if (!port.options.empty()) {
+                    fe::guide_caption(port.name.empty() ? "Port" : port.name.c_str());
+                    for (const PortOption &op : port.options) {
+                        const char *label = op.label.empty() ? op.key.c_str() : op.label.c_str();
+                        bool one = false;
+                        if (op.kind == PortOption::Kind::Boolean) {
+                            one = ImGui::Checkbox(fe::guide_label(label).c_str(), op.flag);
+                            if (one) settings.port[op.key] = *op.flag;
+                        } else if (op.kind == PortOption::Kind::Integer) {
+                            one = ImGui::SliderInt(fe::guide_label(label).c_str(), op.integer, int(op.min), int(op.max));
+                            if (one) settings.port[op.key] = int64_t(*op.integer);
+                        } else {
+                            one = ImGui::SliderScalar(fe::guide_label(label).c_str(), ImGuiDataType_Double, op.real,
+                                                      &op.min, &op.max, "%.3f");
+                            if (one) settings.port[op.key] = *op.real;
+                        }
+                        port_moved |= one;
+                    }
+                }
+                return moved || picture || port_moved;
+            }});
+            host.extra_pages.push_back({"Debug", [&] {
+                fe::guide_caption("Run");
+                ImGui::TextWrapped("guest swaps %.1f/s (%llu), frames presented %.1f/s (%llu)", rates.swaps,
+                                   (unsigned long long)swapped, rates.presented, (unsigned long long)presented);
+                ImGui::TextWrapped("window refreshes %.1f/s, run %.0f s; front buffers not shown (no picture free) %llu",
+                                   rates.refreshes, seconds, (unsigned long long)presenter.skipped.load());
+                ImGui::TextWrapped("sound: %llu frames played (%.1f/s, %u channels), %llu with sound, %llu starved",
+                                   (unsigned long long)sound.sent.load(), rates.sound, sound.channels(),
+                                   (unsigned long long)sound.audible.load(), (unsigned long long)sound.starved.load());
+                ImGui::TextWrapped("input: %llu states delivered (%.1f/s)",
+                                   (unsigned long long)kernel::input_states_delivered(k), rates.states);
+                fe::guide_caption("Controllers");
+                auto view = controllers.view(k.uptime_ms());
+                for (uint32_t u = 0; u < input::USERS; u++) {
+                    const auto &v = view[u];
+                    if (v.source.empty()) {
+                        ImGui::TextDisabled("%u  (none)", u);
+                        continue;
+                    }
+                    ImGui::TextWrapped("%u  %s  %s", u, v.source.c_str(), button_names(v.pad.buttons, button_text));
+                    ImGui::TextDisabled("LT %3u RT %3u  L %6d %6d  R %6d %6d", v.pad.left_trigger, v.pad.right_trigger,
+                                        v.pad.thumb_lx, v.pad.thumb_ly, v.pad.thumb_rx, v.pad.thumb_ry);
+                }
+                fe::guide_caption("Frame time");
+                if (settings.video.frame_graph) {
+                    // the time between the frames the window showed, the last 240
+                    float values[FRAME_TIMES];
+                    float worst = 0, sum = 0;
+                    for (uint32_t i = 0; i < FRAME_TIMES; i++) {
+                        values[i] = frame_times[(frame_time_at + i) % FRAME_TIMES];
+                        worst = std::max(worst, values[i]), sum += values[i];
+                    }
+                    char caption[96];
+                    std::snprintf(caption, sizeof(caption), "%.1f ms average, %.1f ms worst", sum / FRAME_TIMES, worst);
+                    ImGui::PushStyleColor(ImGuiCol_PlotLines, fe::guide::col::green_hi);
+                    ImGui::PushStyleColor(ImGuiCol_PlotLinesHovered, fe::guide::col::text);
+                    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(12, 15, 13, 200));
+                    ImGui::PlotLines("##frames", values, int(FRAME_TIMES), 0, caption, 0.0f, std::max(50.0f, worst * 1.1f),
+                                     ImVec2(-FLT_MIN, 80));
+                    ImGui::PopStyleColor(3);
+                } else {
+                    ImGui::TextDisabled("Off: the graph is a switch of the Picture settings.");
+                }
+                if (native::has_output_renderer()) {
+                    const native::Counters n = native::counters();
+                    fe::guide_caption("Native renderer (F6)");
+                    ImGui::TextWrapped("%s; %llu frames the port's, %llu yielded (%llu held)",
+                                       !native::enabled() ? "off: the emulated frames"
+                                       : native::active() ? "on: the port's frames"
+                                                          : "on: the port yields",
+                                       (unsigned long long)n.frames_native, (unsigned long long)n.frames_yielded,
+                                       (unsigned long long)n.frames_held);
+                    ImGui::TextWrapped("skipped %llu draws, %llu resolves; kept %llu, %llu; %llu exporting memory; "
+                                       "%llu occlusion reports faked",
+                                       (unsigned long long)n.draws_skipped, (unsigned long long)n.resolves_skipped,
+                                       (unsigned long long)n.draws_kept, (unsigned long long)n.resolves_kept,
+                                       (unsigned long long)n.memexport_kept, (unsigned long long)n.occlusion_faked);
+                }
+                if (hooks::stats_on()) {
+                    // the port's hooks and their calls (--hook-stats)
+                    fe::guide_caption("Port hooks");
+                    for (const hooks::Stat &st : hooks::stats())
+                        ImGui::TextWrapped("0x%08X %s  %s  %s  %llu", st.address, st.function.c_str(),
+                                           hooks::kind_name(st.kind), st.hook.c_str(), (unsigned long long)st.calls);
+                }
+                fe::guide_caption("Screenshot");
+                if (ImGui::Button("Save (F12)")) key_screenshot();
+                ImGui::TextDisabled("%s", key_shots.string().c_str());
+                return false;
+            }});
             bool keep = true;
             if (pages.draw_guide(host, seconds, keep)) changed = true;
             if (!keep) close_guide();
