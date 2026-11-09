@@ -6,6 +6,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <map>
@@ -47,6 +48,8 @@ uint64_t total = 0;
 std::vector<std::pair<std::vector<uint64_t>, uint64_t>> stacks;
 // name_generated's table, by host address
 std::vector<std::pair<uint64_t, uint32_t>> generated;
+// scope's function name's part: with stacks, only the samples under such a function count
+std::string scope_name;
 
 // a generated function's name for a host address with no symbol, and how far in
 bool generated_at(uint64_t address, std::string &name, uint64_t &displacement) {
@@ -183,6 +186,8 @@ std::string category(const std::string &name, const std::string &module) {
 
 } // namespace
 
+unsigned long current_thread() { return GetCurrentThreadId(); }
+
 double process_cpu_seconds() {
     FILETIME created, exited, kernel, user;
     if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return -1;
@@ -196,6 +201,11 @@ void name_generated(const void *const *hosts, const unsigned *guests, size_t cou
     generated.reserve(count);
     for (size_t k = 0; k < count; k++) generated.push_back({uint64_t(uintptr_t(hosts[k])), uint32_t(guests[k])});
     std::sort(generated.begin(), generated.end());
+}
+
+void scope(const char *function) {
+    std::lock_guard lock(mutex);
+    scope_name = function ? function : "";
 }
 
 bool start(unsigned interval_us, unsigned long only_thread) {
@@ -216,11 +226,43 @@ void stop_and_report(size_t top) {
         uint64_t weight = 0;
         std::string cat;
         std::map<uint64_t, uint64_t> offsets;
+        std::map<uint64_t, uint64_t> addresses; // the samples' own (overloads share a name, not a base)
         uint64_t base = 0; // the function's address (for its hot offsets' source lines)
     };
     std::map<std::string, Fn> fns;
     std::map<std::string, uint64_t> cats;
     alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 512];
+    if (!scope_name.empty() && !stacks.empty()) {
+        // the samples under the scope's function alone: the others dropped, the totals made again
+        std::map<uint64_t, bool> scoped; // by return address
+        auto in_scope = [&](uint64_t address) {
+            auto it = scoped.find(address);
+            if (it != scoped.end()) return it->second;
+            auto *sym = reinterpret_cast<SYMBOL_INFO *>(buffer);
+            std::memset(buffer, 0, sizeof(buffer));
+            sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+            sym->MaxNameLen = 511;
+            DWORD64 displacement = 0;
+            bool is = SymFromAddr(process, address - 1, &displacement, sym) &&
+                      std::strstr(sym->Name, scope_name.c_str()) != nullptr;
+            return scoped[address] = is;
+        };
+        std::vector<std::pair<std::vector<uint64_t>, uint64_t>> kept;
+        weights.clear();
+        uint64_t all = total;
+        total = 0;
+        for (auto &[frames, w] : stacks) {
+            bool under = false;
+            for (size_t k = 1; k < frames.size() && !under; k++) under = in_scope(frames[k]);
+            if (!under) continue;
+            weights[frames[0]] += w, total += w;
+            kept.emplace_back(std::move(frames), w);
+        }
+        stacks = std::move(kept);
+        std::printf("profile: under %s alone, %.1f%% of the thread's samples\n", scope_name.c_str(),
+                    100.0 * double(total) / double(all));
+        if (!total) return SymCleanup(process), void();
+    }
     for (auto &[rip, w] : weights) {
         auto *sym = reinterpret_cast<SYMBOL_INFO *>(buffer);
         std::memset(buffer, 0, sizeof(buffer));
@@ -237,6 +279,7 @@ void stop_and_report(size_t top) {
         if (!f.base) f.base = rip - displacement;
         f.weight += w;
         f.offsets[displacement] += w;
+        f.addresses[rip] += w;
         cats[f.cat] += w;
     }
     std::printf("profile: where the CPU time went (%llu Mcycles sampled)\n", (unsigned long long)(total / 1000000));
@@ -248,12 +291,39 @@ void stop_and_report(size_t top) {
     for (auto &[n, f] : fns) by_fn.push_back({f.weight, n});
     std::sort(by_fn.rbegin(), by_fn.rend());
     std::printf("profile: top functions\n");
+    const char *lines_wanted = std::getenv("XF_PROFILE_LINES");
+    const size_t lines_shown = lines_wanted ? size_t(std::strtoul(lines_wanted, nullptr, 10)) : 3;
     for (size_t k = 0; k < by_fn.size() && k < top; k++) {
         const Fn &f = fns[by_fn[k].second];
         std::vector<std::pair<uint64_t, uint64_t>> offs;
         for (auto &[o, w] : f.offsets) offs.push_back({w, o});
         std::sort(offs.rbegin(), offs.rend());
         std::string hot;
+        if (lines_shown > 3) {
+            // by source line instead (XF_PROFILE_LINES=N): the function's N most sampled lines with
+            // their shares of the whole, the code inlined into it under its own files' lines
+            std::map<std::string, uint64_t> by_line;
+            for (auto &[address, w] : f.addresses) {
+                IMAGEHLP_LINE64 line{sizeof(line)};
+                DWORD column = 0;
+                std::string where = "?";
+                if (SymGetLineFromAddr64(process, address, &column, &line) && line.FileName) {
+                    const char *file = std::max(std::strrchr(line.FileName, '\\'), std::strrchr(line.FileName, '/'));
+                    where = std::string(file ? file + 1 : line.FileName) + ":" + std::to_string(line.LineNumber);
+                }
+                by_line[where] += w;
+            }
+            std::vector<std::pair<uint64_t, std::string>> lines;
+            for (auto &[where, w] : by_line) lines.push_back({w, where});
+            std::sort(lines.rbegin(), lines.rend());
+            for (size_t j = 0; j < lines.size() && j < lines_shown; j++) {
+                char b[160];
+                std::snprintf(b, sizeof(b), " %s %.2f%%", lines[j].second.c_str(),
+                              100.0 * double(lines[j].first) / double(total));
+                hot += b;
+            }
+            offs.clear();
+        }
         for (size_t j = 0; j < offs.size() && j < 3; j++) {
             char b[160];
             // with the source line where the PDB has it (file name only)
@@ -307,7 +377,26 @@ void stop_and_report(size_t top) {
             inclusive[n] += w;
         }
     }
+    // who called the functions the samples were in: each with its caller and the caller's line
+    std::map<std::string, uint64_t> callers;
+    for (auto &[frames, w] : stacks) {
+        if (frames.size() < 2) continue;
+        std::string pair = name_of(frames[0] + 1) + " <- " + name_of(frames[1]);
+        IMAGEHLP_LINE64 line{sizeof(line)};
+        DWORD column = 0;
+        if (SymGetLineFromAddr64(process, frames[1] - 1, &column, &line) && line.FileName) {
+            const char *file = std::max(std::strrchr(line.FileName, '\\'), std::strrchr(line.FileName, '/'));
+            pair += std::string(" (") + (file ? file + 1 : line.FileName) + ":" + std::to_string(line.LineNumber) + ")";
+        }
+        callers[pair] += w;
+    }
     SymCleanup(process);
+    std::vector<std::pair<uint64_t, std::string>> by_caller;
+    for (auto &[n, w] : callers) by_caller.push_back({w, n});
+    std::sort(by_caller.rbegin(), by_caller.rend());
+    std::printf("profile: callers (the function sampled and what called it)\n");
+    for (size_t k = 0; k < by_caller.size() && k < 2 * top; k++)
+        std::printf("  %5.2f%%  %s\n", 100.0 * double(by_caller[k].first) / double(total), by_caller[k].second.c_str());
     std::vector<std::pair<uint64_t, std::string>> by_inclusive;
     for (auto &[n, w] : inclusive) by_inclusive.push_back({w, n});
     std::sort(by_inclusive.rbegin(), by_inclusive.rend());
@@ -322,7 +411,9 @@ void stop_and_report(size_t top) {
 
 namespace xf::sampler {
 // TODO: POSIX (a profiling timer's signal reading the interrupted context)
+void scope(const char *) {}
 bool start(unsigned, unsigned long) { return false; }
+unsigned long current_thread() { return 0; }
 void name_generated(const void *const *, const unsigned *, size_t) {}
 double process_cpu_seconds() { return -1; } // TODO: getrusage
 void stop_and_report(size_t) {}

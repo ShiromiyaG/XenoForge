@@ -26,6 +26,11 @@ bool start(unsigned interval_us = 1000, unsigned long only_thread = 0);
 // symbols): an address there is named after the nearest function at or
 // below it, xf_<guest address>
 void name_generated(const void *const *hosts, const unsigned *guests, size_t count);
+// With one thread sampled: only the samples taken under a function whose name has `function` in it
+// count in the report (a tool's other work on the thread left out); null or empty for all of them.
+void scope(const char *function);
+// the calling thread's host id, for start's only_thread (0 where sampling is not supported)
+unsigned long current_thread();
 // stop and print the top `top` functions and the shares
 void stop_and_report(size_t top);
 // the CPU time the process has used, all threads, in seconds (-1: unknown)

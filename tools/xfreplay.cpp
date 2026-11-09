@@ -6,7 +6,10 @@
 // --gpu-time prints the GPU's time by kind of work (timestamps), and
 // --gpu-time-draws each draw's too, by its shaders; --repeat N
 // plays the trace N times through the same renderer, as a game draws a frame
-// again, the GPU time then being the fastest of the plays after the first.
+// again, the GPU time then being the fastest of the plays after the first, and
+// prints the time a play spent in the command processor and the renderer's
+// CPU side (the command thread's work). --profile N samples this thread over
+// the repeated plays and prints the N most sampled functions (sampler.h).
 // --readback-resolve none|fast|full is Xenia's readback_resolve, --depth-float24-round its
 // depth_float24_round, --depth-float24-convert its depth_float24_convert_in_pixel_shader,
 // --no-gamma-unorm16 its gamma_render_target_as_unorm16 off (renderer.h). --texture-memory soft,hard[,lifetime] sets
@@ -16,7 +19,7 @@
 // libraries and never makes one whole.
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
-//            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
+//            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--profile N] [--async-pipelines]
 //            [--stand-in skip|placeholder|library] [--linked-pipelines]
 //            [--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] [--depth-float24-round]
 //            [--depth-float24-convert] [--no-gamma-unorm16]
@@ -24,6 +27,8 @@
 
 #include "xenoforge/render_scale.h"
 #include "xenoforge/renderer.h"
+
+#include "sampler.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -58,6 +63,7 @@ int main(int argc, char **argv) {
     xf::render::Options options;
     bool restore_edram = true;
     uint32_t repeat = 1;
+    size_t profile_top = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) out_path = argv[++i];
@@ -72,6 +78,7 @@ int main(int argc, char **argv) {
         // the driver's pipeline cache kept in a file between runs (timing runs
         // otherwise spend most of their time making the frame's pipelines)
         else if (a == "--pipeline-cache" && i + 1 < argc) options.pipeline_cache = argv[++i];
+        else if (a == "--profile" && i + 1 < argc) profile_top = size_t(std::max(1, std::atoi(argv[++i])));
         // pipelines made on worker threads, their draws skipped meanwhile (as
         // the player plays; a replay otherwise waits for each)
         else if (a == "--async-pipelines") options.async_pipelines = true;
@@ -142,10 +149,27 @@ int main(int argc, char **argv) {
     }
     xf::render::Image frame;
     xf::render::Report report;
-    if (!xf::render::replay(trace, *device, options, frame, report, error, restore_edram, repeat)) {
+    // sampled from the first frame shown on: the plays after the first, with everything made
+    bool profiling = false;
+    if (profile_top) {
+        unsigned long thread = xf::sampler::current_thread();
+        // the command processor's work alone, not the trace's walk
+        xf::sampler::scope("CommandProcessor::execute_packets");
+        options.on_frame = [&profiling, thread](uint64_t, const xf::render::Image &) {
+            if (!profiling) profiling = xf::sampler::start(1000, thread);
+        };
+    }
+    double cpu_before = xf::sampler::process_cpu_seconds();
+    bool replayed = xf::render::replay(trace, *device, options, frame, report, error, restore_edram, repeat);
+    double cpu = xf::sampler::process_cpu_seconds() - cpu_before;
+    if (profiling) xf::sampler::stop_and_report(profile_top);
+    if (!replayed) {
         std::fprintf(stderr, "replay: %s\n", error.c_str());
         return 1;
     }
+    if (repeat > 1 && cpu_before >= 0)
+        std::printf("  %.3f ms of CPU (all threads) a play, the trace's walk and the first play included\n",
+                    cpu * 1000 / repeat);
 
     std::printf("%s (title %08X) on %s\n", trace_path.c_str(), trace.title_id, device->name().c_str());
     std::printf("  packets %llu, draws %llu: drawn %llu, resolves %llu, swaps %llu\n", (unsigned long long)report.packets,
@@ -198,6 +222,13 @@ int main(int argc, char **argv) {
     if (report.extent_reports)
         std::printf("  screen extents: %llu reports, %llu bounded\n", (unsigned long long)report.extent_reports,
                     (unsigned long long)report.extent_bounded);
+    if (!report.command_seconds.empty()) {
+        // the command thread's work a play: the median and the fastest of the plays after the first
+        std::vector<double> plays = report.command_seconds;
+        std::sort(plays.begin(), plays.end());
+        std::printf("  commands a play: %.3f ms median, %.3f ms fastest, of %zu plays\n",
+                    plays[plays.size() / 2] * 1000, plays.front() * 1000, plays.size());
+    }
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)
         std::printf("  approx  %6llu  %s\n", (unsigned long long)n, what.c_str());

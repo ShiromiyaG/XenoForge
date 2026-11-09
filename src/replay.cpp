@@ -31,6 +31,7 @@
 #include "xenoforge/memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace xf::render {
@@ -53,7 +54,13 @@ public:
         uint32_t count = uint32_t(words.size() / 4);
         if (!count) return;
         write(address, words);
+        if (!repeating_) {
+            processor_.execute_packets(address, count);
+            return;
+        }
+        auto start = std::chrono::steady_clock::now();
         processor_.execute_packets(address, count);
+        command_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     }
     void memory_read(uint32_t address, std::span<const uint8_t> bytes) override {
         // a repeated play: what memory holds already is not written again
@@ -75,6 +82,7 @@ public:
     }
 
     bool repeating_ = false;
+    double command_seconds_ = 0; // in the processor, over the repeated plays
 
 private:
     bool unchanged(uint32_t address, std::span<const uint8_t> bytes) const {
@@ -129,12 +137,15 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     // of the fastest one (other work on the GPU only ever adds to a play's)
     std::map<std::string, Report::GpuTime> fastest_gpu_time;
     double fastest_gpu_seconds = -1;
+    std::vector<double> command_seconds;
     if (walked && repeat > 1) {
         renderer->drain();
         Report before = renderer->report();
         player.repeating_ = true;
         for (uint32_t k = 1; k < repeat && walked; k++) {
+            player.command_seconds_ = 0;
             walked = walk_gpu_trace(trace, player, error);
+            command_seconds.push_back(player.command_seconds_);
             renderer->drain();
             Report after = renderer->report();
             double seconds = after.gpu_seconds - before.gpu_seconds;
@@ -159,6 +170,7 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
         report.gpu_seconds = fastest_gpu_seconds;
     }
     report.packets = processor.counts().packets.load();
+    report.command_seconds = std::move(command_seconds);
     if (!walked) return false;
     return !renderer->failed(error);
 }
