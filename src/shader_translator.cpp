@@ -2899,14 +2899,45 @@ void Translator::main_pixel() {
             Id truncated = glsl(GLSLstd450Trunc, float_, {exact(Op::OpFMul, float_, {l, scale})});
             return exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {truncated, f(1.0f / 255.0f)}), offset});
         };
+        // Lean (the default): a target the shader never writes gets the
+        // zeros its register holds, with no arithmetic, and the gamma curve is
+        // computed behind a branch on the target's flag (as Xenia's, which
+        // declares only the written targets and branches on the flag) rather
+        // than for every pixel and then selected. XF_PIXEL_OUTPUTS=full: every
+        // target scaled and curved, then selected, as before.
+        static const bool lean = [] {
+            const char *v = std::getenv("XF_PIXEL_OUTPUTS");
+            return !(v && std::string(v) == "full");
+        }();
+        uint32_t written = 0;
+        for (const ControlFlow &cf : s_.control_flow)
+            if (const auto *e = std::get_if<Exec>(&cf.instruction))
+                for (const ExecSlot &slot : e->slots)
+                    if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
+                        for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
+                            if (r->target == StorageTarget::Color) written |= 1u << (r->index & 3);
         for (uint32_t k = 0; k < 4; k++) {
+            Id out = m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))});
+            if (lean && !(written & (1u << k))) {
+                store(out, zero4_);
+                continue;
+            }
             Id color = load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))}));
             color = exact(Op::OpVectorTimesScalar, vec4_, {color, comp(scales, k)});
             Id gamma = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {gamma_flags, u(1u << k)}), u(0)});
+            if (lean) {
+                store(out, color);
+                when(gamma, [&] {
+                    Id r = comp(color, 0), g = comp(color, 1), b = comp(color, 2);
+                    store(out, vec4_of(pwl(r), pwl(g), pwl(b), comp(color, 3)));
+                    return false;
+                });
+                continue;
+            }
             Id r = comp(color, 0), g = comp(color, 1), b = comp(color, 2);
             color = vec4_of(select(float_, gamma, pwl(r), r), select(float_, gamma, pwl(g), g),
                             select(float_, gamma, pwl(b), b), comp(color, 3));
-            store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))}), color);
+            store(out, color);
         }
     }
     m_.op_void(Op::OpReturn);
