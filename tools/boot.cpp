@@ -56,14 +56,17 @@
 // --reload-hooks-every S (docs/sdk.md, "Reloading the hooks").
 // --profile N samples where the CPU time goes (sampler.h; from S seconds on
 // with --profile-from S) and prints the swaps a second over that span, the
-// shares and the N most sampled functions at the end.
+// shares and the N most sampled functions at the end. --profile-thread
+// <name> samples the one guest thread so named (the kernel's own, as
+// "GPU commands", or the guest's SetThreadName) with its stacks walked,
+// and adds each function's inclusive share.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 //        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
-//        [--hook-stats] [--reload-hooks-every S] [--profile N [--profile-from S]]
+//        [--hook-stats] [--reload-hooks-every S] [--profile N [--profile-from S] [--profile-thread <name>]]
 
 #include "game.h"
 #include "sampler.h"
@@ -105,7 +108,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                         "[--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
                         "[--language N] [--country N] [--resolution WxH] [--widescreen 0|1] [--refresh 50|60] "
                         "[--follow-launches] [--launch-data <file>] [--option <key>=<value>]... [--directory-saves] "
-                        "[--profile N [--profile-from S]]\n";
+                        "[--profile N [--profile-from S] [--profile-thread <name>]]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -125,6 +128,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     std::filesystem::path launch_data_file;
     size_t profile_top = 0;
     double profile_from = 0;
+    std::string profile_thread; // --profile-thread: one guest thread by name, with its stacks
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc)
@@ -168,6 +172,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             profile_top = size_t(std::strtoul(argv[++k], nullptr, 10));
         else if (a == "--profile-from" && k + 1 < argc)
             profile_from = std::strtod(argv[++k], nullptr);
+        else if (a == "--profile-thread" && k + 1 < argc)
+            profile_thread = argv[++k];
         else if (a == "--stall-report" && k + 1 < argc)
             stall_report = std::strtod(argv[++k], nullptr);
         else if (a == "--lockstep" && k + 1 < argc) {
@@ -294,7 +300,14 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         if (profile_top && !profiling && elapsed >= profile_from) {
             profiling = true, profile_swaps = swaps(), profile_started = elapsed;
             profile_cpu = sampler::process_cpu_seconds();
-            if (!sampler::start()) std::fprintf(stderr, "boot: --profile is not supported on this host\n");
+            uint32_t only = 0;
+            if (!profile_thread.empty()) {
+                only = k.host_thread_id(profile_thread);
+                if (only) std::printf("profile: guest thread \"%s\" alone (host thread %u)\n", profile_thread.c_str(), only);
+                else std::fprintf(stderr, "boot: --profile-thread: no running thread named \"%s\"; all of them\n",
+                                  profile_thread.c_str());
+            }
+            if (!sampler::start(1000, only)) std::fprintf(stderr, "boot: --profile is not supported on this host\n");
         }
         if (stall_report > 0) {
             uint64_t now_swaps = swaps();

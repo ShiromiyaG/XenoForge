@@ -42,17 +42,44 @@ std::thread worker;
 std::mutex mutex;
 std::map<uint64_t, uint64_t> weights; // rip -> cycles spent there (the interval's)
 uint64_t total = 0;
+// with one thread sampled: each sample's stack (return addresses, the
+// interrupted rip first) and its cycles
+std::vector<std::pair<std::vector<uint64_t>, uint64_t>> stacks;
 
-void sample_loop(unsigned interval_us) {
+// The suspended thread's stack by x64 unwind data (RtlVirtualUnwind), at
+// most 48 frames; a frame without unwind data is a leaf (its return address
+// at rsp)
+void walk(CONTEXT ctx, std::vector<uint64_t> &out) {
+    out.clear();
+    for (int depth = 0; depth < 48 && ctx.Rip; depth++) {
+        out.push_back(ctx.Rip);
+        DWORD64 image = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+        if (!fn) {
+            if (!ctx.Rsp) break;
+            ctx.Rip = *reinterpret_cast<const DWORD64 *>(ctx.Rsp);
+            ctx.Rsp += 8;
+        } else {
+            void *handler_data = nullptr;
+            DWORD64 frame = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
+        }
+    }
+}
+
+void sample_loop(unsigned interval_us, DWORD only) {
     timeBeginPeriod(1);
     DWORD self = GetCurrentThreadId(), process = GetCurrentProcessId();
     std::map<DWORD, Sampled> threads;
+    std::vector<std::pair<std::vector<uint64_t>, uint64_t>> local_stacks;
+    std::vector<uint64_t> stack;
     auto refresh = [&] {
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap == INVALID_HANDLE_VALUE) return;
         THREADENTRY32 e{sizeof(e)};
         for (BOOL ok = Thread32First(snap, &e); ok; ok = Thread32Next(snap, &e)) {
             if (e.th32OwnerProcessID != process || e.th32ThreadID == self || threads.count(e.th32ThreadID)) continue;
+            if (only && e.th32ThreadID != only) continue;
             HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
                                   e.th32ThreadID);
             if (!h) continue;
@@ -81,8 +108,14 @@ void sample_loop(unsigned interval_us) {
             // a thread that ran: where it is now stands for the interval's cycles
             if (spent > 0 && SuspendThread(s.handle) != DWORD(-1)) {
                 CONTEXT ctx{};
-                ctx.ContextFlags = CONTEXT_CONTROL;
-                if (GetThreadContext(s.handle, &ctx)) local[ctx.Rip] += spent, local_total += spent;
+                ctx.ContextFlags = only ? CONTEXT_FULL : CONTEXT_CONTROL;
+                if (GetThreadContext(s.handle, &ctx)) {
+                    local[ctx.Rip] += spent, local_total += spent;
+                    if (only) {
+                        walk(ctx, stack);
+                        local_stacks.emplace_back(stack, spent);
+                    }
+                }
                 ResumeThread(s.handle);
             }
             ++it;
@@ -97,6 +130,7 @@ void sample_loop(unsigned interval_us) {
     std::lock_guard lock(mutex);
     weights = std::move(local);
     total = local_total;
+    stacks = std::move(local_stacks);
 }
 
 bool generated_name(std::string n) {
@@ -141,9 +175,9 @@ double process_cpu_seconds() {
     return value(kernel) + value(user);
 }
 
-bool start(unsigned interval_us) {
+bool start(unsigned interval_us, unsigned long only_thread) {
     if (running.exchange(true)) return true;
-    worker = std::thread(sample_loop, interval_us);
+    worker = std::thread(sample_loop, interval_us, DWORD(only_thread));
     return true;
 }
 
@@ -153,12 +187,13 @@ void stop_and_report(size_t top) {
     std::lock_guard lock(mutex);
     if (!total) return (void)std::printf("profile: no samples\n");
     HANDLE process = GetCurrentProcess();
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
     SymInitialize(process, nullptr, TRUE);
     struct Fn {
         uint64_t weight = 0;
         std::string cat;
         std::map<uint64_t, uint64_t> offsets;
+        uint64_t base = 0; // the function's address (for its hot offsets' source lines)
     };
     std::map<std::string, Fn> fns;
     std::map<std::string, uint64_t> cats;
@@ -176,11 +211,11 @@ void stop_and_report(size_t top) {
         else name = module + "+?";
         Fn &f = fns[name];
         if (f.cat.empty()) f.cat = category(name, module);
+        if (!f.base) f.base = rip - displacement;
         f.weight += w;
         f.offsets[displacement] += w;
         cats[f.cat] += w;
     }
-    SymCleanup(process);
     std::printf("profile: where the CPU time went (%llu Mcycles sampled)\n", (unsigned long long)(total / 1000000));
     std::vector<std::pair<uint64_t, std::string>> by_cat;
     for (auto &[c, w] : cats) by_cat.push_back({w, c});
@@ -197,13 +232,64 @@ void stop_and_report(size_t top) {
         std::sort(offs.rbegin(), offs.rend());
         std::string hot;
         for (size_t j = 0; j < offs.size() && j < 3; j++) {
-            char b[32];
-            std::snprintf(b, sizeof(b), " +0x%llx", (unsigned long long)offs[j].second);
+            char b[160];
+            // with the source line where the PDB has it (file name only)
+            IMAGEHLP_LINE64 line{sizeof(line)};
+            DWORD column = 0;
+            if (f.base && SymGetLineFromAddr64(process, f.base + offs[j].second, &column, &line) && line.FileName) {
+                const char *file = std::max(std::strrchr(line.FileName, '\\'), std::strrchr(line.FileName, '/'));
+                std::snprintf(b, sizeof(b), " +0x%llx (%s:%lu)", (unsigned long long)offs[j].second,
+                              file ? file + 1 : line.FileName, (unsigned long)line.LineNumber);
+            } else {
+                std::snprintf(b, sizeof(b), " +0x%llx", (unsigned long long)offs[j].second);
+            }
             hot += b;
         }
         std::printf("  %5.2f%%  %-48s %s [%s ]\n", 100.0 * double(f.weight) / double(total), by_fn[k].second.c_str(),
                     f.cat.c_str(), hot.c_str());
     }
+    if (stacks.empty()) return SymCleanup(process), void();
+    // one thread's stacks: each function's share of the samples it was on
+    // the stack for (counted once a sample, however deep it recurs)
+    std::map<uint64_t, std::string> names;
+    auto name_of = [&](uint64_t address) -> const std::string & {
+        auto it = names.find(address);
+        if (it != names.end()) return it->second;
+        auto *sym = reinterpret_cast<SYMBOL_INFO *>(buffer);
+        std::memset(buffer, 0, sizeof(buffer));
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 511;
+        DWORD64 displacement = 0;
+        std::string name;
+        // (a return address is the instruction after the call: look one byte back)
+        if (SymFromAddr(process, address - 1, &displacement, sym)) {
+            name = sym->Name;
+        } else {
+            IMAGEHLP_MODULE64 mod{sizeof(mod)};
+            name = SymGetModuleInfo64(process, address, &mod) ? std::string(mod.ModuleName) + "+?" : "?";
+        }
+        return names.emplace(address, std::move(name)).first->second;
+    };
+    std::map<std::string, uint64_t> inclusive;
+    for (auto &[frames, w] : stacks) {
+        std::vector<const std::string *> seen;
+        for (uint64_t address : frames) {
+            const std::string &n = name_of(address);
+            if (std::find(seen.begin(), seen.end(), &n) != seen.end()) continue;
+            bool again = false;
+            for (const std::string *s : seen) again |= *s == n;
+            if (again) continue;
+            seen.push_back(&n);
+            inclusive[n] += w;
+        }
+    }
+    SymCleanup(process);
+    std::vector<std::pair<uint64_t, std::string>> by_inclusive;
+    for (auto &[n, w] : inclusive) by_inclusive.push_back({w, n});
+    std::sort(by_inclusive.rbegin(), by_inclusive.rend());
+    std::printf("profile: inclusive (the sampled thread's stacks: each function with all it calls)\n");
+    for (size_t k = 0; k < by_inclusive.size() && k < 2 * top; k++)
+        std::printf("  %5.2f%%  %s\n", 100.0 * double(by_inclusive[k].first) / double(total), by_inclusive[k].second.c_str());
 }
 
 } // namespace xf::sampler

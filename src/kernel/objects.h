@@ -405,6 +405,13 @@ public:
     uint32_t self_handle = 0; // the handle its hold on itself is on
     bool main = false;
     std::string guest_name; // what the guest named it (SetThreadName), for the thread report
+    // the host thread it runs on, for the report's CPU time (a Windows
+    // handle, or a POSIX thread's CPU clock id); none in the deterministic
+    // mode, whose threads are fibers on one host thread
+    void *host_thread = nullptr;
+    int host_cpu_clock = -1;
+    uint32_t host_thread_id = 0; // the host's id of it (Windows), for matching outside tools' samples
+    double host_cpu_seconds() const; // -1: not known
 
     // what makes the thread stop at its next kernel call (a safe point)
     enum : uint32_t { PENDING_SUSPEND = 1, PENDING_KERNEL_APC = 2 };

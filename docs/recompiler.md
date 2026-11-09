@@ -709,9 +709,17 @@ thread of the process about once a millisecond, weighting each sample by
 the cycles the thread spent since the last one (so waiting threads count
 nothing), and prints the swaps a second over the span, the CPU time a swap
 (all threads), the shares by part of the program and the N most sampled
-functions with their hottest offsets. The generated functions' names come
-from the PDB's public symbols (their code is built without debug
-information). Windows only for now.
+functions with their hottest offsets (with their source lines where the
+PDB has them; inlined and folded code can be named after a neighbour, and
+`llvm-symbolizer --inlines` on the address gives the inline chain). The
+generated functions' names come from the PDB's public symbols (their code
+is built without debug information). `--profile-thread <name>` samples the
+one guest thread so named (the kernel's own, as "GPU commands", or the
+guest's SetThreadName) with its stack walked at each sample (x64 unwind
+data) and adds each function's inclusive share. The thread report gives
+each guest thread's host CPU time and host thread id (host threads are
+named "xf guest <id> <name>"), for matching any outside tool's samples.
+Windows only for now.
 
 What it showed (2026-11-08, `--render`, 20 to 60 s):
 - game A, at 30 swaps a second (its cap): 52 ms of CPU a swap, of which

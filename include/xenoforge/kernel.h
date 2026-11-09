@@ -399,6 +399,10 @@ public:
     bool wait_main(uint32_t timeout_ms, uint32_t *exit_code = nullptr);
     // the guest threads alive: each one's state and where it was
     std::string thread_report();
+    // the host id of the first running guest thread whose name (the
+    // kernel's own, or the guest's SetThreadName) contains `name`; 0 none
+    // (or the deterministic mode, whose threads are fibers)
+    uint32_t host_thread_id(const std::string &name);
     // The deterministic mode (Deterministic), chosen before launch: false
     // when a guest thread has started already. halted: its halt said stop,
     // and every guest thread is parked.

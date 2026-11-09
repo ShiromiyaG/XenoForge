@@ -15,8 +15,12 @@
 
 namespace xf::sampler {
 
-// start sampling (every `interval_us` microseconds); false where it is not supported
-bool start(unsigned interval_us = 1000);
+// start sampling (every `interval_us` microseconds); false where it is not
+// supported. With `only_thread` (a host thread id), that thread alone, with
+// its stack walked at each sample: the report then lists each function's
+// inclusive share too (the samples it was on the stack for), what it and
+// everything it calls cost.
+bool start(unsigned interval_us = 1000, unsigned long only_thread = 0);
 // stop and print the top `top` functions and the shares
 void stop_and_report(size_t top);
 // the CPU time the process has used, all threads, in seconds (-1: unknown)

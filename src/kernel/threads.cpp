@@ -283,6 +283,9 @@ std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects) { return std::m
 Thread::Thread(Objects &owner) : Dispatcher(owner, Type::Thread) {}
 
 Thread::~Thread() {
+#ifdef _WIN32
+    if (host_thread) CloseHandle(host_thread);
+#endif
     Memory &memory = owner.k.memory();
     memory.system_free(tls_static);
     memory.system_free(pcr);
@@ -397,10 +400,45 @@ void Thread::refresh_ready() {
     owner.ready_threads.fetch_add(now ? 1 : -1, std::memory_order_relaxed);
 }
 
+double Thread::host_cpu_seconds() const {
+#ifdef _WIN32
+    FILETIME created, exited, kernel_time, user_time;
+    if (!host_thread || !GetThreadTimes(host_thread, &created, &exited, &kernel_time, &user_time)) return -1;
+    auto ticks = [](const FILETIME &f) { return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    return double(ticks(kernel_time) + ticks(user_time)) * 1e-7;
+#else
+    timespec ts;
+    if (host_cpu_clock < 0 || clock_gettime(clockid_t(host_cpu_clock), &ts) != 0) return -1;
+    return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+#endif
+}
+
 void Thread::body() {
     Objects &o = owner;
     Kernel &k = o.k;
     current_ = this;
+    if (!k.deterministic()) {
+        // the host thread named after the guest's (for debuggers and
+        // profilers), and kept for its CPU time in the thread report
+        char name[48];
+        std::snprintf(name, sizeof(name), "xf guest %u%s%s", id, params.name ? " " : "",
+                      params.name ? params.name : "");
+#ifdef _WIN32
+        host_thread_id = GetCurrentThreadId();
+        host_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, host_thread_id);
+        wchar_t wide[48];
+        for (size_t i = 0; i < sizeof(name); i++)
+            if (!(wide[i] = wchar_t(static_cast<unsigned char>(name[i])))) break;
+        SetThreadDescription(GetCurrentThread(), wide);
+#else
+        clockid_t clock;
+        if (pthread_getcpuclockid(pthread_self(), &clock) == 0) host_cpu_clock = int(clock);
+#if defined(__linux__) || defined(__ANDROID__)
+        name[15] = 0; // the 16 bytes Linux keeps
+        pthread_setname_np(pthread_self(), name);
+#endif
+#endif
+    }
     {
         std::unique_lock<std::mutex> l(o.lock);
         started = true;
@@ -564,6 +602,16 @@ ppc::Context *Kernel::current_context() {
     return t ? t->context.get() : nullptr;
 }
 
+uint32_t Kernel::host_thread_id(const std::string &name) {
+    Objects &o = *objects_;
+    std::lock_guard<std::mutex> l(o.lock);
+    for (Thread *t : o.threads) {
+        const std::string own = t->params.name ? t->params.name : t->guest_name;
+        if (t->host_thread_id && !t->finished && own.find(name) != std::string::npos) return t->host_thread_id;
+    }
+    return 0;
+}
+
 std::string Kernel::thread_report() {
     Objects &o = *objects_;
     std::lock_guard<std::mutex> l(o.lock);
@@ -574,10 +622,20 @@ std::string Kernel::thread_report() {
                                                                        : "running";
         char line[320];
         const char *name = t->params.name ? t->params.name : t->guest_name.c_str();
-        std::snprintf(line, sizeof(line), "  thread %u%s%s%s (handle 0x%08X, start 0x%08X): %s, pc 0x%08X, lr 0x%08X\n",
+        std::snprintf(line, sizeof(line), "  thread %u%s%s%s (handle 0x%08X, start 0x%08X): %s, pc 0x%08X, lr 0x%08X",
                       t->id, t->main ? " (main)" : "", name[0] ? ", " : "", name, t->self_handle,
                       t->params.start_address, state, t->context->pc, uint32_t(t->context->lr));
         out += line;
+        // the host CPU time it has used (its host thread's; none in the deterministic mode)
+        if (double cpu = t->host_cpu_seconds(); cpu >= 0) {
+            std::snprintf(line, sizeof(line), ", %.1f s of host CPU", cpu);
+            out += line;
+        }
+        if (t->host_thread_id) {
+            std::snprintf(line, sizeof(line), " (host thread %u)", t->host_thread_id);
+            out += line;
+        }
+        out += "\n";
         // what a waiting thread waits on: each object's kind, handle, body
         // and signal state
         if (t->blocked == Thread::Blocked::Wait && !t->waiting_on.empty()) {
