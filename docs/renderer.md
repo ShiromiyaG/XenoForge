@@ -3459,6 +3459,97 @@ The rest of the same family of Xenia's commits followed the same day: the
 integer number format's scaling back to the guest's integers (d11950528)
 and the point-sampled parts (c3cd8617b), above in "The number format".
 
+## The host path against the exact one (2026-11-09)
+
+The player draws on host render targets by default since the same day, so
+played frames were set beside three pictures each: Xenia's Direct3D 12 host
+render targets (its default), our interlock path, and Xenia's ROV. Frames: a
+drive of game D at swaps 4300 (the loading screen before it), 5000, 5600 and
+6400, a race of game A (recorded earlier, with memory exports) and game G's
+title over its 3D scene. Differences are of three kinds: ours wrong where
+Xenia's host path is right; both host paths wrong where the exact ones are
+right; noise.
+
+**Polygon offsets in exact depth units** (ours wrong). A drive's shadow maps
+(24-bit unorm depth, a constant offset of 0.0002 and 0.00005) came out deeper
+than Xenia's by exactly that offset again, and the car's self shadows were
+lost (a lighter air intake). Vulkan lets a device take up to twice 2^-24 as
+a 24-bit fixed-point format's bias unit ("minimum resolvable difference"),
+and NVIDIA takes twice: every constant offset was doubled. With
+`VK_EXT_depth_bias_control` (`depthBiasExact`, `vkCmdSetDepthBias2EXT`) the
+unit is exactly 2^-24. Float depth (D24FS8, and D24S8 where the device has no
+24-bit unorm) takes the forced unorm representation with it, as Xenia's
+Vulkan backend (`vulkan_depth_bias_force_unorm`): the guest's offset as it is
+(halved with D24FS8's halved range), where a float format's own unit shrinks
+with the depth and loses small offsets far from 1. The constant is a whole
+number of units rounded up, as Xenia's Direct3D 12 pipelines take it
+(`GetD3D10IntegerPolygonOffset`). Without the extension, or with
+`XF_VK_NO_DEPTH_BIAS_CONTROL=1`, the device's units as before, counted
+("polygon offsets in the device's depth units"); `XF_DEPTH_BIAS_FLOAT_UNITS=1`
+keeps a float format's own units (Xenia's Direct3D 12 behavior). Found with
+`XF_REPLAY_DUMP_MEMORY=<hex address>:<hex size>:<file>` (guest memory after a
+replay; `xfreplay --readback-resolve full` puts the resolves in it) beside
+Xenia's trace dump of the same memory: the shadow maps then agree within one
+unit. Swap 5000 against Xenia's host picture: 0.126 of 255 and 592 pixels off
+by more than 16 before, 0.092 and none after.
+
+**The factors of minimum and maximum blending** (both hosts wrong). The
+console applies the blend factors before a minimum or maximum; fixed-function
+blending ignores them. A map overlay drawn into an 8_8_8_8 target keeps the
+target's alpha with "maximum of zero times the source and one times the
+destination", which the host turned into the source's alpha: the route drawn
+on the map came out opaque white, in Xenia's host picture too. With factors
+of zero and one on targets that hold no negative values (unorm and 7e3) the
+console's result is a copy of one side or zero, which `host_blend_control`
+gives the host as an addition. Other factors would have to be multiplied in
+by the pixel shader (Xenia's Direct3D 12 pipelines do that for the source's
+alpha against a destination factor of one; not done here): they stay the
+host's, counted ("minimum and maximum blending with factors"). Swap 5600
+against our exact picture: 3,105 pixels off before, 1,749 after; it now
+differs from Xenia's host picture there (0.004% to 0.151%).
+
+**The Xenos's sample positions on host targets** (both hosts differ from the
+exact paths). What was left of the drive's differences lay along edges: the
+host rasterizes 4x at Direct3D's standard positions, the console and the
+interlock paths at its own, so the sample a depth resolve takes sits a
+quarter of a pixel away and everything computed from it (the shadow mask,
+motion blur) moves with it. `Options::xenos_sample_positions`
+(`XF_XENOS_SAMPLE_POSITIONS=1`, `xfreplay --xenos-sample-positions`) is
+Xenia's option of that name, off by default as there: 4x host targets
+rasterize at the console's positions through `VK_EXT_sample_locations`
+(draws and EDRAM transfers; multisampled depth images are made with
+`VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT`). With it the
+drive's frames are the exact path's:
+
+| swap | host against exact, at first | with the two fixes above | and the sample positions |
+| --- | --- | --- | --- |
+| 5000 (the cars, no overlay) | 0.216, 2,380 pixels | 0.184, 1,792 | 0.066, 1 |
+| 5600 (driving, with the map) | 0.304, 3,105 | 0.210, 1,749 | 0.070, 40 |
+| 6400 (driving, with the map) | 0.214, 2,281 | 0.113, 889 | 0.043, 9 |
+
+(mean difference of 255 and pixels off by more than 16; 5600 and 6400 were
+first drawn with the polygon offsets already fixed). 2x targets are left at
+the host's positions: with the console's, game G's title drew stray colors
+over its alpha to coverage surfaces (70,000 pixels off), not understood yet,
+which is also why the option stays off. Not done with it: the viewport's
+sample offset at a resolution scale above one (draw_util.cc's
+`GetHostViewportInfo`).
+
+**Left as they are**, both hosts alike, the exact path right:
+- 2x MSAA edges (game G's title: 18,009 pixels against our exact picture),
+  the 2x sample positions above;
+- colors above 31.875 and alpha of more than 2 bits in 2_10_10_10_FLOAT
+  targets kept as RGBA16F (not seen to matter in these frames);
+- D24FS8 depth as a 32-bit float (resolved depth differs in its low bits);
+- minimum and maximum blending with other factors.
+Game A's race differs from Xenia's Direct3D 12 picture (0.133, 0.207%: a
+poster on a wall) on both of our paths alike, as its older frames in the
+corpus do; our two paths agree there (103 pixels).
+
+**The corpus.** Swaps 4300 and 5000 of the drive are in `replay_test` on both
+paths; 5600 and 6400 on the exact path alone (their pictures are in
+`dumps/rov/d3d12` only: Xenia's host picture has the opaque overlay).
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that
