@@ -2901,6 +2901,112 @@ Ours outside the renderer's timing (the player's presentation): about 0.45
 ms a frame (8.33 counted against 7.88 timed). Next: the translated
 shaders' cost against Xenia's on the same draws.
 
+## The host path's GPU time: barriers, early depth and stencil (2026-11-09)
+
+Game D's drive frame again (a new recording of swap 5000,
+`XF_RENDER_TARGET_PATH=host xfreplay --gpu-time --repeat 12`, with
+`--pipeline-cache <file>` so a timing run does not spend 30 s making the
+frame's pipelines), ms a play without the trace's front buffer read-back.
+Three changes, each with a switch that turns it off; the pictures are the
+same bits with each on or off (the frame, and `replay_test` on both paths).
+
+**The barriers' accesses.** Every pass here is separated from the next by
+one global memory barrier (`full_barrier`), which named the generic
+`MEMORY_WRITE` to `MEMORY_READ | MEMORY_WRITE`. Timed by its masks (the
+barrier taken out altogether, as a measurement only: 5.91 ms; generic: 7.37):
+the stage masks cost nothing, and neither do the accesses of shaders,
+attachments and transfers; what costs is a destination that includes
+`INDIRECT_COMMAND_READ` or `CONDITIONAL_RENDERING_READ`, either alone
+(7.03-7.29 and 7.20-7.40 against 6.26-6.27 without them). The generic
+`MEMORY_READ` includes both, and for them the NVIDIA driver stalls the GPU
+until the work before the barrier is done, since the next command's front
+end may read what it wrote: about 2 us a barrier, 7 us after a small compute
+dispatch (the chain of 48 small resolves: 0.39 ms of copies became 0.044).
+The barrier now names what the renderer's commands do (shader, color and
+depth attachment and transfer writes; those reads and uniform, index and
+vertex reads). Nothing here draws or dispatches indirectly. The one
+predicate buffer of conditional rendering is written in one place (a VIZ
+query's end), which now has its own barrier to the conditional rendering
+stage; and what the host reads after a submission (read-back buffers) has
+one barrier to the host stage at the submission's end. Xenia's D3D12
+transitions name resources and states, so it never paid this; its Vulkan
+backend names stages and accesses per resource too.
+`XF_BARRIER_ACCESSES=generic`: as before. (The presenter's and the UI's own
+barriers, a few a frame, still name the generic accesses.) A barrier removed
+where the next pass begins with one (the resolve's trailing one) changed
+nothing measurable (3 pairs, 0.01 ms), and was left.
+
+**The early depth and stencil form** (Xenia's
+`DepthStencilMode::kEarlyHint`, pipeline_cache.cc and
+`IsForceEarlyDepthStencilGlobalFlagEnabled`). Every translated pixel shader
+ended with the alpha test and the alpha to coverage read from the system
+constants, a demotion and a coverage output behind them: the driver cannot
+test and write depth before a shader that may discard, so every hidden
+pixel was shaded. Xenia picks a form of the shader by the draw's state, and
+so does this now (`PixelOptions::early_depth_stencil`, part of the pipeline's
+key): on the host path, with no float24 conversion in the shader, a shader
+that neither kills, writes oDepth nor exports memory
+(`implicit_early_z_write_allowed`), drawn with no alpha test other than
+always and no alpha to coverage (`DoesCoverageDependOnAlpha`) or not writing
+oC0, is translated without the alpha test, the alpha to coverage and the
+coverage output, with `EarlyFragmentTests`. `XF_EARLY_DEPTH_STENCIL=0`: never.
+
+**Lean color outputs.** The four color outputs were each scaled, run
+through the gamma curve and then selected by the target's gamma flag, for
+every pixel of every shader. Now a target the shader never writes is given
+zeros (what its register holds), and the curve runs behind a branch on the
+flag, as Xenia's (which declares only the written targets).
+`XF_PIXEL_OUTPUTS=full`: as before.
+
+The frame, six runs of each form interleaved, the runs during which
+another replay was on the GPU left out (3 to 4 clean runs each; the others
+agree within 0.2 ms), fastest and median play:
+
+| ms a play | total | draws | resolve copies | transfers |
+| --- | --- | --- | --- | --- |
+| all three off | 7.32 (7.46) | 4.35 | 1.11 | 1.53 |
+| the barriers' accesses | 6.25 (6.27) | 4.29 | 0.47 | 1.19 |
+| and the early form | 5.54 (5.56) | 3.59 | 0.47 | 1.19 |
+| and lean outputs | 5.50 (5.51) | 3.56 | 0.46 | 1.17 |
+
+Xenia D3D12 on the earlier recording of the frame: draws 3.58 and 0.54 of
+uploads and barriers, transfers 2.42, copies 0.67. The lean outputs' 0.04
+ms is at the edge of what these runs resolve. Live numbers are the main
+session's to take.
+
+Measured and not taken further:
+- The translated arithmetic is not where the draws' time is. With every
+  multiply's zero check left out (a measurement only: wrong pictures are
+  possible) the frame's draws went from 4.32 to 4.16-4.35 ms, with the 21-bit
+  precision of exp, log, rcp, rsq and sqrt left out 4.24-4.45, with both
+  4.09-4.28 (two pairs, another agent's replays on the GPU at times: an upper
+  bound of about 0.2 ms, not a result). Xenia does both too; what it has
+  and this lacks is the zero check skipped where the two operands are the
+  same (open, small).
+- A resolve's copy as a draw instead of a compute dispatch was not built:
+  with the chain's 48 dispatches left out (a measurement only) the frame
+  loses 0.31 ms, 6.4 us a dispatch, but a pass of one small draw costs about
+  as much here (the chain's own draws: 5.8 us each with no dispatch
+  between), so a pass in place of a dispatch gains little. What would is the
+  copy inside the target's own pass (reading an attachment being drawn to:
+  VK_EXT_attachment_feedback_loop_layout), open.
+- The top draws left (35 triangle strips of one alpha-tested, blended
+  shader pair, 0.60 ms) cannot take the early form, in Xenia either.
+
+**What is left of the frame**: draws about 3.6 ms, transfers 1.19, resolve
+copies 0.47, texture loads 0.22, clears 0.08. The depth transfers are the
+next target (0.9 ms in about 20): the game clears a 4x depth target through
+a single-sampled view of the same EDRAM twice as wide and tall (depth-only
+rectangle lists: the console's own clear), so each clear first transfers
+the 4x target's 416 tiles into that view (7 transfers, 0.25 ms) only to
+overwrite them, and then transfers the cleared view back (5, 0.18 ms). A
+transfer could be skipped where the draw that asks for it provably writes
+every sample of the tiles whatever they held (one rectangle over them,
+depth always and written, stencil replaced or untouched and then
+transferred alone), and the way back done as a clear where the rectangle's
+depth is one value (`tile_cleared_` set by such a draw as it is by a
+resolve's clear); neither is in Xenia.
+
 ## Resolution scale (2026-11-08)
 
 The console's pixels drawn as more (or fewer) host pixels: 50% to 800% in
