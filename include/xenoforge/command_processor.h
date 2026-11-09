@@ -26,9 +26,11 @@
 #include "xenoforge/memory.h"
 #include "xenoforge/xenos.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <span>
 #include <unordered_map>
@@ -52,23 +54,71 @@ constexpr uint32_t gpu_swap(uint32_t v, Endian e) {
 // The GPU's registers (Xenia's RegisterFile), by index (xenos.h's reg). Each
 // access is a relaxed atomic one: the CPU reads and writes some of them
 // through MMIO while the command processor runs.
+//
+// What changed, for a Sink that keeps what it made of the registers (beyond
+// Xenia, whose backends compare the values again at each draw): the
+// processor's own writes go through write and write_big_endian, which stamp
+// the register's block of BLOCK registers with a serial when the value
+// differs from the one held; a sink that remembers the serial as of its last
+// look finds with changed_since whether a range was written to another value
+// since. Writes from other threads (set: the CPU's MMIO) stamp nothing and
+// count in foreign_writes instead, which the sink compares too.
 class RegisterFile {
 public:
     static constexpr uint32_t COUNT = xenos::REGISTER_COUNT;
-    RegisterFile() : values_(COUNT, 0) {}
+    static constexpr uint32_t BLOCK_SHIFT = 5, BLOCK = 1u << BLOCK_SHIFT;
+    RegisterFile() : values_(COUNT, 0), stamps_((COUNT + BLOCK - 1) >> BLOCK_SHIFT, 0) {}
     uint32_t operator[](uint32_t index) const { return index < COUNT ? get(index) : 0; }
     uint32_t get(uint32_t index) const {
         return std::atomic_ref<uint32_t>(const_cast<uint32_t &>(values_[index])).load(std::memory_order_relaxed);
     }
+    // from any thread
     void set(uint32_t index, uint32_t value) {
         std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
+        foreign_writes_.fetch_add(1, std::memory_order_relaxed);
     }
+    // on the command processor's thread
+    void write(uint32_t index, uint32_t value) {
+        if (get(index) == value) return;
+        std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
+        stamps_[index >> BLOCK_SHIFT] = ++serial_;
+    }
+    // count registers from first, from big-endian words (a packet's, guest
+    // memory's); first + count within COUNT. On the command processor's thread.
+    void write_big_endian(uint32_t first, const uint8_t *words, uint32_t count) {
+        while (count) {
+            const uint32_t n = std::min(count, BLOCK - (first & (BLOCK - 1)));
+            uint32_t differs = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                uint32_t value;
+                std::memcpy(&value, words + 4 * k, 4);
+                value = __builtin_bswap32(value);
+                differs |= get(first + k) ^ value;
+                std::atomic_ref<uint32_t>(values_[first + k]).store(value, std::memory_order_relaxed);
+            }
+            if (differs) stamps_[first >> BLOCK_SHIFT] = ++serial_;
+            first += n, words += 4 * n, count -= n;
+        }
+    }
+    // The serial of the processor's last write that changed a value; whether
+    // any of count registers from first changed after a serial (by blocks: a
+    // neighbour in the same block counts); the writes from other threads.
+    uint64_t serial() const { return serial_; }
+    bool changed_since(uint32_t first, uint32_t count, uint64_t serial) const {
+        for (uint32_t b = first >> BLOCK_SHIFT, last = (first + count - 1) >> BLOCK_SHIFT; b <= last; b++)
+            if (stamps_[b] > serial) return true;
+        return false;
+    }
+    uint64_t foreign_writes() const { return foreign_writes_.load(std::memory_order_relaxed); }
     // all of them, for whoever runs on the command processor's thread (a
     // Sink's callbacks): constants copied in bulk
     const uint32_t *data() const { return values_.data(); }
 
 private:
     std::vector<uint32_t> values_;
+    std::vector<uint64_t> stamps_; // per block, the serial of the last write that changed a value there
+    uint64_t serial_ = 0;
+    std::atomic<uint64_t> foreign_writes_{0};
 };
 
 // A draw as DRAW_INDX and DRAW_INDX_2 give it (VGT_DRAW_INITIATOR's fields);
@@ -322,9 +372,15 @@ private:
     bool type3_opcode(uint32_t opcode, uint32_t count);
     // a packet that runs, to the sink: its header and the count words after it
     void report_packet(uint32_t address, uint32_t packet, uint32_t count);
+    // (to the sink that was given the packet: one that wants none gets no end either)
     void end_packet() {
-        if (sink_) sink_->packet_end();
+        if (packets_wanted_) sink_->packet_end();
     }
+    // Registers written as a run: count big-endian words to the registers from base. Where none of
+    // them has a side effect (special_register_write's all lie below PLAIN_REGISTERS) they are
+    // stored in one loop (RegisterFile::write_big_endian); else one by one through write_register.
+    static constexpr uint32_t PLAIN_REGISTERS = 0x2000;
+    void write_register_run(uint32_t base, const uint8_t *words, uint32_t count);
     void special_register_write(uint32_t index, uint32_t value);
     void write_registers_from_ring(uint32_t base, uint32_t count);
     void write_registers_from_memory(uint32_t base, uint32_t physical, uint32_t count);

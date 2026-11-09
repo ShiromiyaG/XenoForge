@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace xf::gpu {
@@ -222,7 +223,7 @@ void CommandProcessor::execute_straight(uint32_t start, uint32_t count) {
 
 void CommandProcessor::restore_registers(uint32_t first, std::span<const uint32_t> values) {
     for (size_t i = 0; i < values.size() && first + i < RegisterFile::COUNT; i++)
-        regs_.set(uint32_t(first + i), values[i]);
+        regs_.write(uint32_t(first + i), values[i]);
 }
 
 void CommandProcessor::restore_gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t> pwl) {
@@ -268,7 +269,13 @@ bool CommandProcessor::type0(uint32_t address, uint32_t packet) {
     report_packet(address, packet, count);
     uint32_t base = packet & 0x7FFF;
     bool one_register = (packet >> 15) & 1;
-    for (uint32_t i = 0; i < count; i++) write_register(one_register ? base : base + i, reader_.next());
+    if (!one_register && reader_.read + count * 4 <= reader_.capacity) {
+        // the words lie in a row in the buffer: written as a run
+        write_register_run(base, reader_.base + reader_.read, count);
+        reader_.skip(count * 4);
+    } else {
+        for (uint32_t i = 0; i < count; i++) write_register(one_register ? base : base + i, reader_.next());
+    }
     end_packet();
     return true;
 }
@@ -358,7 +365,7 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::EVENT_WRITE: {
         // an event flag; a write to an address (count > 1) is not known
         uint32_t initiator = reader_.next() & 0x3F;
-        regs_.set(reg::VGT_EVENT_INITIATOR, initiator);
+        regs_.write(reg::VGT_EVENT_INITIATOR, initiator);
         if (initiator == EVENT_SCREEN_EXT_INIT && extents_ == ScreenExtents::Measured && sink_ &&
             sink_->measures_extents())
             sink_->extent_init();
@@ -403,7 +410,7 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::INVALIDATE_STATE: reader_.next(); return true; // a mask of state pointers to drop
     case pm4::VIZ_QUERY: {
         uint32_t dword0 = reader_.next();
-        regs_.set(reg::VGT_EVENT_INITIATOR, dword0 & 0x100 ? EVENT_VIZQUERY_END : EVENT_VIZQUERY_START);
+        regs_.write(reg::VGT_EVENT_INITIATOR, dword0 & 0x100 ? EVENT_VIZQUERY_END : EVENT_VIZQUERY_START);
         if (sink_) sink_->viz_query(dword0 & 0x3F, dword0 & 0x100);
         return true;
     }
@@ -443,18 +450,45 @@ void CommandProcessor::write_register(uint32_t index, uint32_t value) {
         std::fprintf(stderr, "gpu: a register write past the register file (0x%X)\n", index);
         return;
     }
-    regs_.set(index, value);
+    regs_.write(index, value);
     if (index - reg::SCRATCH_REG0 < 8 || index == reg::COHER_STATUS_HOST ||
         index - reg::DC_LUT_RW_INDEX <= reg::DC_LUT_30_COLOR - reg::DC_LUT_RW_INDEX)
         special_register_write(index, value);
 }
 
+// A run of registers: one loop over the words where no register in it has a
+// side effect and all are in the file (a type-0 packet's state, SET_CONSTANT's
+// and LOAD_ALU_CONSTANT's constants: a seventh of the command thread went to
+// writing them one by one through write_register, each with its checks);
+// XF_GPU_REGISTER_RUNS=0 writes them one by one again.
+void CommandProcessor::write_register_run(uint32_t base, const uint8_t *words, uint32_t count) {
+    static const bool runs = [] {
+        const char *v = std::getenv("XF_GPU_REGISTER_RUNS");
+        return !(v && v[0] == '0');
+    }();
+    if (runs && base >= PLAIN_REGISTERS && uint64_t(base) + count <= RegisterFile::COUNT) {
+        regs_.write_big_endian(base, words, count);
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) write_register(base + i, be32(words + 4 * i));
+}
+
 void CommandProcessor::write_registers_from_ring(uint32_t base, uint32_t count) {
+    if (reader_.read + uint64_t(count) * 4 <= reader_.capacity) {
+        write_register_run(base, reader_.base + reader_.read, count);
+        reader_.skip(count * 4);
+        return;
+    }
     for (uint32_t i = 0; i < count; i++) write_register(base + i, reader_.next());
 }
 
 void CommandProcessor::write_registers_from_memory(uint32_t base, uint32_t address, uint32_t count) {
     if (sink_) sink_->memory_read(address & PHYSICAL_MASK, count * 4);
+    // (in a row in physical memory, short of its end)
+    if (uint64_t(address & PHYSICAL_MASK) + uint64_t(count) * 4 <= PHYSICAL_SIZE) {
+        if (count) write_register_run(base, physical(address), count);
+        return;
+    }
     for (uint32_t i = 0; i < count; i++) write_register(base + i, be32(physical(address + 4 * i)));
 }
 
@@ -472,7 +506,7 @@ void CommandProcessor::special_register_write(uint32_t index, uint32_t value) {
     switch (index) {
     case reg::COHER_STATUS_HOST:
         // marked pending: the next WAIT_REG_MEM on it makes memory coherent
-        regs_.set(index, regs_.get(index) | 0x80000000u);
+        regs_.write(index, regs_.get(index) | 0x80000000u);
         break;
     case reg::DC_LUT_RW_INDEX: gamma_component_ = 0; break;
     case reg::DC_LUT_SEQ_COLOR: {
@@ -524,7 +558,7 @@ void CommandProcessor::special_register_write(uint32_t index, uint32_t value) {
 // COHER_STATUS_HOST's pending bit cleared: memory is coherent (there are no
 // caches to flush here)
 void CommandProcessor::make_coherent() {
-    if (regs_.get(reg::COHER_STATUS_HOST) & 0x80000000u) regs_.set(reg::COHER_STATUS_HOST, 0);
+    if (regs_.get(reg::COHER_STATUS_HOST) & 0x80000000u) regs_.write(reg::COHER_STATUS_HOST, 0);
 }
 
 // ---- waits, conditional writes, events ----
@@ -572,7 +606,7 @@ bool CommandProcessor::cond_write() {
 // memory; how the CPU learns a fence has passed
 bool CommandProcessor::event_write_shd() {
     uint32_t initiator = reader_.next(), address = reader_.next(), value = reader_.next();
-    regs_.set(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
+    regs_.write(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
     uint32_t data = (initiator >> 31) & 1 ? counter() : value;
     data = gpu_swap(data, Endian(address & 3));
     address &= ~3u;
@@ -602,7 +636,7 @@ bool CommandProcessor::event_write_shd() {
 // as is the rounding the console does).
 bool CommandProcessor::event_write_ext() {
     uint32_t initiator = reader_.next(), address = reader_.next() & ~3u;
-    regs_.set(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
+    regs_.write(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
     const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
     write_extent(address, extents);
     if (extents_ == ScreenExtents::Measured && sink_ && sink_->measures_extents()) {
@@ -653,7 +687,7 @@ void CommandProcessor::poll_extents(bool wait) {
 // counts, little-endian, each counter split in two lanes) at
 // RB_SAMPLE_COUNT_ADDR
 bool CommandProcessor::event_write_zpd() {
-    regs_.set(reg::VGT_EVENT_INITIATOR, reader_.next() & 0x3F);
+    regs_.write(reg::VGT_EVENT_INITIATOR, reader_.next() & 0x3F);
     uint32_t report = regs_.get(reg::RB_SAMPLE_COUNT_ADDR);
     if (!report) return true;
     if (occlusion_ == OcclusionQueries::Fast && sink_ && sink_->counts_samples()) {
@@ -753,7 +787,7 @@ bool CommandProcessor::draw(uint32_t viz_query, uint32_t remaining) {
     d.viz_query = viz_query;
     d.initiator = reader_.next();
     remaining--;
-    regs_.set(reg::VGT_DRAW_INITIATOR, d.initiator);
+    regs_.write(reg::VGT_DRAW_INITIATOR, d.initiator);
     d.primitive = d.initiator & 0x3F;
     d.source = (d.initiator >> 6) & 3;
     uint32_t major_mode = (d.initiator >> 8) & 3;
@@ -767,11 +801,11 @@ bool CommandProcessor::draw(uint32_t viz_query, uint32_t remaining) {
         if (!remaining) return false;
         uint32_t base = reader_.next() & PHYSICAL_MASK;
         remaining--;
-        regs_.set(reg::VGT_DMA_BASE, base);
+        regs_.write(reg::VGT_DMA_BASE, base);
         if (!remaining) return false;
         uint32_t size = reader_.next();
         remaining--;
-        regs_.set(reg::VGT_DMA_SIZE, size);
+        regs_.write(reg::VGT_DMA_SIZE, size);
         uint32_t index_size = d.index32 ? 4 : 2;
         d.indexed = true;
         d.index_base = base & ~(index_size - 1);
