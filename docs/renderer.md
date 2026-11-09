@@ -2551,6 +2551,41 @@ the bar is Xenia D3D12's 0.78 ms (host) and 1.23 ms (ROV).
 The presenter clears the window only where the picture leaves bars (a
 picture covering the window was cleared and then blitted over).
 
+**Measured afterwards, alone on the machine** (3D title window 90-130 s, 2
+runs each, A B A B): interlock 1.38 -> 1.32 ms a frame (both speedups) against
+Xenia ROV 1.29; CPU 1.13 s/s against 1.19.
+
+**Transfers of cleared tiles as clears** (beyond Xenia). The host path's
+frame (traces of the window, 4000/5000/6000) moved 5 transfers, and 3 of them
+read tiles a resolve had just cleared: the next frame's 4x color and depth
+take over what the last resolves cleared, and the 1x target what the scene's
+second resolve cleared. A tile now remembers that its holder's pixels there
+are one clear's value (`tile_cleared_`: set where a resolve's clear covers
+the whole tile, dropped where a draw's scissor rows reach it, a transfer
+draws into it or EDRAM is loaded into it); a target of the same format
+(format, host format, gamma kept linear, UINT view) taking it over is
+cleared to that value over those rectangles instead (`vkCmdClearAttachments`,
+the stencil into the R8_UINT image too where the stencil is copied), and the
+tile keeps the value. The same pixels: the source's samples were all the
+value, and the same format holds it in every sample count. Game B's 3600
+replay on the host path: 1.416 -> 1.288 ms a play (the transfers 0.233 ->
+0.120 ms); live, 2 runs each: 1.28 -> 1.18 ms a frame against Xenia D3D12's
+host path 0.83. Pictures: replay_test 29/29 on both paths, at 200% and with
+validation; deterministic runs of games A and B on the host path
+(`--deterministic --shots`, swaps 300 to 4500) byte-identical with and
+without. `XF_TRANSFER_CLEARS=0` draws every transfer, as before.
+
+**What is left of the host path's gap.** The window's frames replay at
+about 0.80 ms of passes (draws 0.41, resolves 0.14, transfers 0.12, stores
+0.08) but take 1.18 live: one submission a frame, 11 waits for the GPU in
+6,700 swaps, no presenter in that number (boot alone, without the player,
+measures the same), so the live passes themselves run slower (a GPU at a
+fraction of its load runs at lower clocks; Xenia's live number has the same
+handicap). The rest is per-pass cost, which only Xenia's own pass timings
+can locate: its D3D12 backend has no GPU timestamps a pass and RenderDoc
+gives none on D3D12 here, so the next step is timestamp queries around its
+render target cache's transfers, dumps, resolves and draws in a local build.
+
 ## Resolution scale (2026-11-08)
 
 The console's pixels drawn as more (or fewer) host pixels: 50% to 800% in

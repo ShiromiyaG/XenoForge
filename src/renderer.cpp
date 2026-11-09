@@ -2145,6 +2145,26 @@ private:
     VkPipeline edram_pipeline(const RenderTarget &t, VkShaderModule fs, VkPipelineLayout layout, bool stencil_copy);
     VkDescriptorSet edram_set(uint32_t which);
     std::vector<RenderTarget *> owners_ = std::vector<RenderTarget *>(EDRAM_TILES, nullptr); // null: EDRAM holds it
+    // Beyond Xenia: a tile whose holder's pixels are all one clear's value
+    // (a resolve's clear covered the whole tile, and no draw has reached it
+    // since). A target of the same format taking it over is cleared to that
+    // value there instead of drawn from the holder (edram_transfer): the same
+    // pixels, without reading the holder. XF_TRANSFER_CLEARS=0: always drawn.
+    std::vector<uint8_t> tile_cleared_ = std::vector<uint8_t>(EDRAM_TILES, 0);
+    std::vector<VkClearValue> tile_clear_value_ = std::vector<VkClearValue>(EDRAM_TILES);
+    bool transfer_clears_ = [] {
+        const char *v = std::getenv("XF_TRANSFER_CLEARS");
+        return !(v && std::string(v) == "0");
+    }();
+    // the tiles of t in its pixel rows [top, bottom), every column: a draw
+    // may have written them, so they no longer hold a clear's value
+    void tiles_drawn(const RenderTarget &t, uint32_t top, uint32_t bottom) {
+        if (bottom <= top) return;
+        uint32_t first = top / t.tile_height, last = std::min((bottom + t.tile_height - 1) / t.tile_height, t.height / t.tile_height);
+        for (uint32_t row = first; row < last; row++)
+            for (uint32_t column = 0; column < t.pitch_tiles; column++)
+                tile_cleared_[(t.base + row * t.pitch_tiles + column) % EDRAM_TILES] = 0;
+    }
     // EDRAM, and beside it the host's 32-bit depth of the last D24FS8 target
     // (and D24S8 where the host keeps it as a float) to store each sample,
     // in the same layout (edram.glsl's host_depth_offset)
@@ -3954,9 +3974,12 @@ void Impl::acquire(RenderTarget *t, uint32_t rows) {
     }
     if (needed.empty()) return;
     if (direct_transfers_) {
+        // (edram_transfer keeps the clears it moves as clears, and drops the rest)
         if (!held.empty() && !edram_transfer(t, held)) return;
+        for (uint32_t tile : unheld) tile_cleared_[tile] = 0;
         if (!unheld.empty() && !edram_load(t, unheld, tile_rows * t->tile_height)) return;
     } else {
+        for (uint32_t tile : needed) tile_cleared_[tile] = 0;
         for (auto &[holder, tiles] : held)
             if (!edram_store(holder, tiles)) return;
         if (!edram_load(t, needed, tile_rows * t->tile_height)) return;
@@ -4323,13 +4346,49 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
     struct Draw {
         RenderTarget *source;
         std::vector<VkRect2D> rects;
+        bool clear = false; // the tiles hold one clear's value: cleared to it, not drawn
+        VkClearValue value{};
     };
     std::vector<Draw> draws;
     uint32_t height = 0;
+    // the holder's tiles that hold a clear's value, by value, where the
+    // target has the holder's format (the same bits: the same clear value
+    // whatever the sample count); the rest drawn
+    struct Group {
+        RenderTarget *holder;
+        std::vector<uint32_t> tiles;
+        bool clear;
+        VkClearValue value;
+    };
+    std::vector<Group> groups;
     for (auto &[holder, tiles] : held) {
-        VkPipeline pipeline = transfer_pipeline(*t, holder->msaa != 0);
-        if (!pipeline) return fatal_ = "could not make an EDRAM transfer pipeline", false;
-        Draw d{holder, {}};
+        const bool same = transfer_clears_ && holder->depth == t->depth && holder->format == t->format &&
+                          holder->host == t->host && holder->gamma_linear == t->gamma_linear &&
+                          (holder->raw != VK_NULL_HANDLE) == (t->raw != VK_NULL_HANDLE);
+        Group drawn{holder, {}, false, {}};
+        std::vector<Group> cleared;
+        for (uint32_t tile : tiles) {
+            if (!same || !tile_cleared_[tile]) {
+                drawn.tiles.push_back(tile);
+                continue;
+            }
+            const VkClearValue &v = tile_clear_value_[tile];
+            auto g = std::find_if(cleared.begin(), cleared.end(),
+                                  [&](const Group &c) { return std::memcmp(&c.value, &v, sizeof(v)) == 0; });
+            if (g == cleared.end()) cleared.push_back({holder, {tile}, true, v});
+            else g->tiles.push_back(tile);
+        }
+        if (!drawn.tiles.empty()) groups.push_back(std::move(drawn));
+        for (Group &g : cleared) groups.push_back(std::move(g));
+    }
+    for (const Group &g : groups) {
+        RenderTarget *holder = g.holder;
+        const std::vector<uint32_t> &tiles = g.tiles;
+        // (the tiles drawn hold what the holder drew; those cleared keep their value)
+        for (uint32_t tile : tiles) tile_cleared_[tile] = g.clear;
+        if (!g.clear && !transfer_pipeline(*t, holder->msaa != 0))
+            return fatal_ = "could not make an EDRAM transfer pipeline", false;
+        Draw d{holder, {}, g.clear, g.value};
         // the tiles as the target's, in runs
         std::vector<uint32_t> at;
         at.reserve(tiles.size());
@@ -4406,6 +4465,30 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
     bool stencil_passes = t->depth && !transfer_fs_[0][3] && !stencil_copy;
     VkPipeline bound = VK_NULL_HANDLE;
     for (const Draw &d : draws) {
+        if (d.clear) {
+            // the clear's value over the rectangles (and the stencil into
+            // the R8_UINT image the copy after the pass reads)
+            std::vector<VkClearRect> rects;
+            for (const VkRect2D &r : d.rects) rects.push_back({r, 0, 1});
+            VkClearAttachment clears[2] = {};
+            uint32_t count = 1;
+            if (t->depth) {
+                clears[0].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                clears[0].clearValue = d.value;
+                if (stencil_copy) {
+                    clears[1].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    clears[1].colorAttachment = 0;
+                    clears[1].clearValue.color.uint32[0] = d.value.depthStencil.stencil;
+                    count = 2;
+                }
+            } else {
+                clears[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                clears[0].colorAttachment = 0;
+                clears[0].clearValue = d.value;
+            }
+            vkCmdClearAttachments(c, count, clears, uint32_t(rects.size()), rects.data());
+            continue;
+        }
         VkPipeline pipeline = transfer_pipeline(*t, d.source->msaa != 0);
         if (pipeline != bound) vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, bound = pipeline);
         uint32_t offset = 0;
@@ -6968,8 +7051,8 @@ void Impl::draw(const gpu::Draw &d) {
         uint32_t rows = std::min(scissor.offset.y + scissor.extent.height,
                                  draw_max_y(*vs, constants[0], indices, primitive, tessellated));
         for (RenderTarget *t : colors)
-            if (t) acquire(t, rows);
-        if (depth) acquire(depth, rows);
+            if (t) acquire(t, rows), tiles_drawn(*t, uint32_t(scissor.offset.y), rows);
+        if (depth) acquire(depth, rows), tiles_drawn(*depth, uint32_t(scissor.offset.y), rows);
         if (!fatal_.empty()) return;
     }
     System sys{};
@@ -7921,6 +8004,22 @@ void Impl::resolve() {
                                std::min(scale_.down(ch), t->host_height - std::min(scale_.down(y), t->host_height))}},
                              0, 1};
             if (!rect.rect.extent.width || !rect.rect.extent.height) continue;
+            // the target's tiles the clear covers whole now hold its value;
+            // those it covers in part, not one value any more
+            {
+                const uint32_t x1 = std::min(x, t->width) + cw, y1 = std::min(y, t->height) + ch;
+                const uint32_t rows = t->height / t->tile_height;
+                for (uint32_t row = y / t->tile_height; row < std::min(rows, (y1 + t->tile_height - 1) / t->tile_height); row++)
+                    for (uint32_t column = x / t->tile_width;
+                         column < std::min(t->pitch_tiles, (x1 + t->tile_width - 1) / t->tile_width); column++) {
+                        const uint32_t tile = (t->base + row * t->pitch_tiles + column) % EDRAM_TILES;
+                        if (owners_[tile] != t) continue;
+                        const bool whole = column * t->tile_width >= x && (column + 1) * t->tile_width <= x1 &&
+                                           row * t->tile_height >= y && (row + 1) * t->tile_height <= y1;
+                        tile_cleared_[tile] = whole;
+                        if (whole) tile_clear_value_[tile] = clear.clearValue;
+                    }
+            }
             VkCommandBuffer c = outside();
             gpu_mark("resolves: clears");
             VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
