@@ -123,6 +123,7 @@ bool ConsolePages::picture_page(Host &h) {
     combo("Picture shape", "video.aspect");
     combo("Anisotropic filtering", "video.anisotropy");
     combo("Texture filtering", "video.texture_filter");
+    combo("Render targets", "video.edram");
     if (g_label_w > 0) {
         changed |= ImGui::Checkbox(labelled("Frame-time graph (F1)").c_str(), &s.video.frame_graph);
     } else {

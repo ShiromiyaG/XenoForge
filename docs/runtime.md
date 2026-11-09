@@ -1879,7 +1879,7 @@ code. As built (`frontend/`):
   [video]    # fullscreen, vsync (true), smooth (true), aspect ("auto", "integer" or "stretch"), and the
              # picture options below: resolution_scale (100), min_scalable (16), upscaler ("none"),
              # fsr_sharpness (0.2), cas_sharpness (0), antialiasing ("none"), anisotropy (0),
-             # texture_filter ("game"), frame_graph (false)
+             # texture_filter ("game"), edram ("fast" or "exact"), frame_graph (false)
   [audio]    # volume (0-100), mute
   [input]    # keyboard (true), keyboard_user (0), left_deadzone, right_deadzone (0-1), vibration (true)
   [keyboard] # each pad control's keys (input.md)
@@ -1920,6 +1920,14 @@ from one table of choices (`settings.h`'s `video_choices`):
   images of the destination rectangle's size, then a 1:1 blit; live.
 - **Picture shape** (`aspect`): fitted, whole multiples (integer scaling;
   fitted where not even 1x fits), or stretched; live.
+- **Render targets** (`edram`, as the game starts): `fast`, the default,
+  draws into host render targets (Xenia's default; game D's played drive:
+  8.1 ms of GPU a frame); `exact` has the pixel shaders read and write
+  EDRAM themselves under fragment shader interlock (blending, the float
+  formats, 20e4 depth and the stencil as the console's; 10.6 ms), host
+  render targets where the device lacks it. The player's choice only:
+  boot, the replays and the tests keep the renderer's own default (exact
+  where the device can), and `XF_RENDER_TARGET_PATH` forces either.
 - **Texture filtering** (`anisotropy`: the game's, or 1-16x forced;
   `texture_filter`: the game's, trilinear, nearest): live, through
   `Renderer::set_texture_filtering` (the samplers made as draws ask). The

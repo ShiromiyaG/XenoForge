@@ -147,7 +147,8 @@ for ($run = 1; $run -le $Runs; $run++) {
         # baseline to set them against in one run.
         $base = $config -like '*-base'
         $kind = $config -replace '-base$', ''
-        $env:XF_RENDER_TARGET_PATH = if ($kind -eq 'ours-host') { 'host' } else { '' }
+        # (forced either way: the player's own default is its video.edram setting)
+        $env:XF_RENDER_TARGET_PATH = if ($kind -eq 'ours-host') { 'host' } else { 'fsi' }
         # (each NAME set to 1, or NAME=VALUE to that value)
         if ($base) {
             foreach ($name in $BaseEnv) {

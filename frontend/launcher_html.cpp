@@ -409,6 +409,9 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
                             label_of(video_choice_list("video.anisotropy"), std::to_string(st.video.anisotropy)));
         inner += select_row("video.texture_filter", "Texture filtering", "",
                             label_of(video_choice_list("video.texture_filter"), st.video.texture_filter));
+        inner += select_row("video.edram", "Render targets",
+                            "Fast draws into the host's own render targets. Exact draws as the console does (blending, float formats, depth and stencil bit for bit) at more GPU time a frame, where the graphics card allows it. Takes effect when the game starts.",
+                            label_of(video_choice_list("video.edram"), st.video.edram));
         s += group("Rendering", inner, "Beyond the console: none of these change what the game computes.");
         s += group("Overlay", check_row("video.frame_graph", "Frame-time graph", "In the F1 overlay.", st.video.frame_graph));
         s += group("Timing", check_row("video.vsync", "Vertical sync", "The window waits for the display; the game keeps its own pace.", st.video.vsync));

@@ -545,6 +545,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     options.min_scalable = uint32_t(settings.video.min_scalable);
     options.anisotropy = uint32_t(settings.video.anisotropy);
     options.texture_filter = texture_filter_of(settings.video.texture_filter);
+    // (XF_RENDER_TARGET_PATH still forces either)
+    options.render_target_path = settings.video.edram == "exact" ? render::Options::RenderTargetPath::fsi
+                                                                 : render::Options::RenderTargetPath::host;
     options.frame_wanted = [&](uint64_t swap) {
         if (!shot_wanted(swap)) return false;
         presenter.capture_next(); // this swap's picture, taken after this

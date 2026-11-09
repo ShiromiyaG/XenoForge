@@ -2589,6 +2589,8 @@ bool Impl::init(std::string &error) {
     {
         if (render_target_path(d_, options_) == Options::RenderTargetPath::fsi) fsi_ = d_.fragment_shader_interlock();
         fsi_2x_as_4x_ = fsi_ && !(d_.no_attachments_samples() & VK_SAMPLE_COUNT_2_BIT);
+        std::fprintf(stderr, "renderer: render targets: %s\n",
+                     fsi_ ? "exact EDRAM (fragment shader interlock)" : "the host's");
         if (const char *e = std::getenv("XF_FSI_DYNAMIC"); e && *e && *e != '0') options_.fsi_specialized = false;
     }
     // D24S8 as a 32-bit float depth where the device has no 24-bit unorm

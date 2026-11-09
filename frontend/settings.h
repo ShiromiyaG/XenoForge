@@ -62,6 +62,11 @@ struct Settings {
         // between mips where the game filters each one linearly) or "nearest" (everything point sampled)
         int anisotropy = 0;
         std::string texture_filter = "game";
+        // How the console's render target memory (EDRAM) is drawn into, as the game starts: "fast" (host render
+        // targets, Xenia's default: less GPU time a frame) or "exact" (the pixel shaders read and write EDRAM
+        // themselves: blending, float formats, depth and stencil as the console's, where the device has fragment
+        // shader interlock; host render targets where it has not)
+        std::string edram = "fast";
         bool frame_graph = false; // the frame-time graph in the F1 overlay
     } video;
     struct {

@@ -66,6 +66,7 @@ void clamp_video(Settings &s) {
     one_of(s.video.upscaler, {"none", "fsr", "cas"});
     one_of(s.video.antialiasing, {"none", "fxaa", "fxaa_extreme"});
     one_of(s.video.texture_filter, {"game", "trilinear", "nearest"});
+    one_of(s.video.edram, {"fast", "exact"});
     s.video.fsr_sharpness = std::isfinite(s.video.fsr_sharpness) ? std::clamp(s.video.fsr_sharpness, 0.0, 2.0) : 0.2;
     s.video.cas_sharpness = std::isfinite(s.video.cas_sharpness) ? std::clamp(s.video.cas_sharpness, 0.0, 1.0) : 0.0;
     // the powers of two up to 16, a value between taken down to one
@@ -95,6 +96,8 @@ std::vector<VideoChoice> video_choices(const std::string &key) {
     } else if (key == "video.texture_filter") {
         out = {{"game", "The game's"}, {"trilinear", "Trilinear (smooth between mipmaps)"},
                {"nearest", "Nearest (point sampled)"}};
+    } else if (key == "video.edram") {
+        out = {{"fast", "Fast (host render targets)"}, {"exact", "Exact (as the console's, more GPU time)"}};
     } else if (key == "video.aspect") {
         out = {{"auto", "The picture's own shape"}, {"integer", "Whole multiples (integer scaling)"},
                {"stretch", "Stretched to the window"}};
@@ -109,6 +112,7 @@ std::string video_value(const Settings &s, const std::string &key) {
     if (key == "video.antialiasing") return s.video.antialiasing;
     if (key == "video.anisotropy") return std::to_string(s.video.anisotropy);
     if (key == "video.texture_filter") return s.video.texture_filter;
+    if (key == "video.edram") return s.video.edram;
     if (key == "video.aspect") return s.video.aspect;
     return {};
 }
@@ -124,13 +128,14 @@ bool set_video_value(Settings &s, const std::string &key, const std::string &val
     else if (key == "video.antialiasing") s.video.antialiasing = value;
     else if (key == "video.anisotropy") s.video.anisotropy = number;
     else if (key == "video.texture_filter") s.video.texture_filter = value;
+    else if (key == "video.edram") s.video.edram = value;
     else if (key == "video.aspect") s.video.aspect = value;
     clamp_video(s);
     return true;
 }
 
 bool video_needs_restart(const std::string &key) {
-    return key == "video.resolution_scale" || key == "video.min_scalable";
+    return key == "video.resolution_scale" || key == "video.min_scalable" || key == "video.edram";
 }
 
 Settings::Settings() {
@@ -172,6 +177,7 @@ void read_sections(const toml::table &t, Settings &s) {
     get(t, "video", "cas_sharpness", s.video.cas_sharpness);
     get(t, "video", "antialiasing", s.video.antialiasing);
     get(t, "video", "texture_filter", s.video.texture_filter);
+    get(t, "video", "edram", s.video.edram);
     get(t, "video", "frame_graph", s.video.frame_graph);
     clamp_video(s);
     int64_t volume = s.audio.volume;
@@ -245,6 +251,7 @@ void write_sections(toml::table &t, const Settings &s) {
                                             {"antialiasing", s.video.antialiasing},
                                             {"anisotropy", s.video.anisotropy},
                                             {"texture_filter", s.video.texture_filter},
+                                            {"edram", s.video.edram},
                                             {"frame_graph", s.video.frame_graph}});
     t.insert_or_assign("audio", toml::table{{"volume", s.audio.volume}, {"mute", s.audio.mute}});
     t.insert_or_assign("input", toml::table{{"keyboard", s.input.keyboard},
