@@ -503,6 +503,10 @@ struct Shader {
     std::set<uint32_t> stream_constants;
     // per texture slot, the first fetch's filter overrides: mag, min, mip, aniso (3: the constant's)
     std::map<uint32_t, std::array<uint32_t, 4>> filters;
+    // what a draw asks of the summary's sets, made once (load_shader): the texture slots and the
+    // vertex fetch slots as masks, and the blocks of 32 fetch constant words they lie in
+    uint64_t texture_mask = 0, vertex_mask[2] = {};
+    uint32_t fetch_blocks = 0;
 };
 
 struct RenderTarget {
@@ -1287,7 +1291,7 @@ private:
     class Call {
     public:
         Call(Impl &r, const gpu::RegisterFile *registers) : r_(r), lock_(r.mutex_), timer_(r.report_.seconds) {
-            if (registers) r.regs_ = registers->data();
+            if (registers) r.regs_ = registers->data(), r.file_ = registers;
         }
         explicit operator bool() const { return r_.fatal_.empty(); }
 
@@ -2114,6 +2118,7 @@ private:
     Report report_;
     std::string fatal_;
     const uint32_t *regs_ = nullptr; // the processor's register file, during a call
+    const gpu::RegisterFile *file_ = nullptr; // the same, for what changed in it (RegisterFile's stamps)
     GuestMemory memory_;             // the processor's physical memory
     Memory &mem_;                    // the same memory, with its write watches
     const std::atomic<uint32_t> *stamps_ = nullptr;
@@ -2181,6 +2186,19 @@ private:
     bool draw_state_valid_ = false, draw_state_elision_ = true;
     // the last constants and system constants put in the arena, and where
     harness::Constants last_constants_[2];
+    // The constants kept from draw to draw: last_constants_ are the registers' as of the register
+    // file's serial constants_serial_ (and its count of other threads' writes), so a draw copies
+    // only the blocks written to another value since, and uploads a stage's again only then. The
+    // fetch constants count for a stage only in the blocks its shader's slots lie in (a draw's new
+    // vertex buffers leave the pixel shader's constants as they were). XF_CONSTANT_STAMPS=0: copied
+    // and compared whole at every draw, as before.
+    const gpu::RegisterFile *constants_file_[2] = {};
+    uint64_t constants_serial_[2] = {}, constants_foreign_[2] = {};
+    uint32_t constants_fetch_blocks_[2] = {}; // the fetch constants' blocks current as of the serial
+    bool constant_stamps_ = [] {
+        const char *v = std::getenv("XF_CONSTANT_STAMPS");
+        return !(v && v[0] == '0');
+    }();
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
 
@@ -3926,6 +3944,16 @@ void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
         s = std::make_unique<Shader>();
         s->parsed = xf::ucode::parse_shader(type == 0 ? xf::ucode::ShaderType::Vertex : xf::ucode::ShaderType::Pixel, code);
         s->summary = xf::ucode::analyze(code);
+        for (uint32_t slot : s->summary.texture_slots)
+            if (slot < 64) {
+                s->texture_mask |= 1ull << slot;
+                if (slot < 32) s->fetch_blocks |= 1u << (slot * 6 / 32) | 1u << ((slot * 6 + 5) / 32);
+            }
+        for (uint32_t slot : s->summary.vertex_slots)
+            if (slot < 128) {
+                s->vertex_mask[slot >> 6] |= 1ull << (slot & 63);
+                if (slot < 96) s->fetch_blocks |= 1u << (slot * 2 / 32);
+            }
         s->hash = hash;
         report_.shaders++;
         if (storage_ && storage_->add_shader(type, hash, code)) report_.shaders_stored++;
@@ -7414,20 +7442,65 @@ void Impl::draw(const gpu::Draw &d) {
     }
 
     // constants
-    harness::Constants constants[2];
     for (int stage = 0; stage < 2; stage++) {
-        harness::Constants &c = constants[stage];
-        std::memcpy(c.float_constants, &regs_[reg::ALU_CONSTANTS + stage * 1024], 4096);
-        std::memcpy(c.bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(c.bool_constants));
-        std::memcpy(c.loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(c.loop_constants));
-        std::memcpy(c.fetch_constants, &regs_[reg::FETCH_CONSTANTS], sizeof(c.fetch_constants));
+        harness::Constants &c = last_constants_[stage];
+        const Shader *s = stage == 0 ? vs : ps;
+        if (!constant_stamps_ || !file_) {
+            // copied whole, uploaded again where they differ from the last upload
+            harness::Constants now;
+            std::memcpy(now.float_constants, &regs_[reg::ALU_CONSTANTS + stage * 1024], 4096);
+            std::memcpy(now.bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(now.bool_constants));
+            std::memcpy(now.loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(now.loop_constants));
+            std::memcpy(now.fetch_constants, &regs_[reg::FETCH_CONSTANTS], sizeof(now.fetch_constants));
+            if (std::memcmp(&c, &now, sizeof(now)) != 0) c = now, last_constants_at_[stage] = NONE;
+            constants_file_[stage] = nullptr;
+            continue;
+        }
+        // Only the blocks of registers written to another value since the kept copy was made
+        // (the 5 KB of each stage copied, compared and copied again at every draw were a sixth
+        // of the command thread)
+        using File = gpu::RegisterFile;
+        const File &file = *file_;
+        const uint64_t foreign = file.foreign_writes();
+        const bool kept = constants_file_[stage] == file_ && constants_foreign_[stage] == foreign;
+        const uint64_t since = constants_serial_[stage], serial = file.serial();
+        bool changed = false;
+        const uint32_t alu = reg::ALU_CONSTANTS + stage * 1024;
+        for (uint32_t first = 0; first < 1024; first += File::BLOCK)
+            if (!kept || file.changed_since(alu + first, File::BLOCK, since)) {
+                std::memcpy(&c.float_constants[first / 4], &regs_[alu + first], File::BLOCK * 4);
+                changed = true;
+            }
+        if (!kept || file.changed_since(reg::BOOL_CONSTANTS, 8 + 32, since)) {
+            std::memcpy(c.bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(c.bool_constants));
+            std::memcpy(c.loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(c.loop_constants));
+            changed = true;
+        }
+        // the fetch constants: the blocks the stage's shader reads brought up to date; the others
+        // are no longer current once written
+        static_assert(reg::FETCH_CONSTANTS % File::BLOCK == 0 && (32 * 6) % File::BLOCK == 0);
+        uint32_t current = kept ? constants_fetch_blocks_[stage] : 0u;
+        const uint32_t wanted = s ? s->fetch_blocks : 0u;
+        for (uint32_t b = 0; b < 32 * 6 / File::BLOCK; b++) {
+            const uint32_t first = b * File::BLOCK;
+            if ((current & (1u << b)) && file.changed_since(reg::FETCH_CONSTANTS + first, File::BLOCK, since))
+                current &= ~(1u << b);
+            if ((wanted & (1u << b)) && !(current & (1u << b))) {
+                std::memcpy(&c.fetch_constants[first], &regs_[reg::FETCH_CONSTANTS + first], File::BLOCK * 4);
+                current |= 1u << b;
+                changed = true;
+            }
+        }
+        if (changed) last_constants_at_[stage] = NONE;
+        constants_file_[stage] = file_, constants_foreign_[stage] = foreign;
+        constants_serial_[stage] = serial, constants_fetch_blocks_[stage] = current;
     }
 
     // the targets take over the EDRAM tiles down to the lowest row the draw
     // can reach (draw_max_y), within the scissor
     {
         uint32_t rows = std::min(scissor.offset.y + scissor.extent.height,
-                                 draw_max_y(*vs, constants[0], indices, primitive, tessellated));
+                                 draw_max_y(*vs, last_constants_[0], indices, primitive, tessellated));
         for (RenderTarget *t : colors)
             if (t) acquire(t, rows), tiles_drawn(*t, uint32_t(scissor.offset.y), rows);
         if (depth) acquire(depth, rows), tiles_drawn(*depth, uint32_t(scissor.offset.y), rows);
@@ -7500,11 +7573,7 @@ void Impl::draw(const gpu::Draw &d) {
     // textures: per slot the shaders read, an image's index in the table of
     // its dimension and a sampler's
     // (a mask of the 32 texture fetch constants, in order)
-    uint64_t texture_slots = 0;
-    for (const Shader *s : {vs, ps})
-        if (s)
-            for (uint32_t slot : s->summary.texture_slots)
-                if (slot < 64) texture_slots |= 1ull << slot;
+    uint64_t texture_slots = vs->texture_mask | (ps ? ps->texture_mask : 0);
     for (uint64_t left = texture_slots; left; left &= left - 1) {
         const uint32_t slot = uint32_t(std::countr_zero(left));
         const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS + slot * 6];
@@ -7935,11 +8004,8 @@ void Impl::draw(const gpu::Draw &d) {
         // constants, three to a texture constant's six words)
         std::vector<Range> &sorted = draw_lists_.sorted;
         sorted.clear();
-        uint64_t fetch_slots[2] = {};
-        for (const Shader *s : {vs, ps})
-            if (s)
-                for (uint32_t slot : s->summary.vertex_slots)
-                    if (slot < 128) fetch_slots[slot >> 6] |= 1ull << (slot & 63);
+        const uint64_t fetch_slots[2] = {vs->vertex_mask[0] | (ps ? ps->vertex_mask[0] : 0),
+                                         vs->vertex_mask[1] | (ps ? ps->vertex_mask[1] : 0)};
         for (uint32_t slot = 0; slot < 128; slot++) {
             if (!(fetch_slots[slot >> 6] >> (slot & 63) & 1)) continue;
             const uint32_t *f = &regs_[reg::FETCH_CONSTANTS + slot * 2];
@@ -8018,11 +8084,10 @@ void Impl::draw(const gpu::Draw &d) {
     }
     uint32_t dynamic_offsets[4] = {0, 0, 0, last_fsi_at_ == NONE ? 0u : uint32_t(last_fsi_at_)};
     for (int stage = 0; stage < 2; stage++) {
-        if (last_constants_at_[stage] == NONE ||
-            std::memcmp(&last_constants_[stage], &constants[stage], sizeof(harness::Constants)) != 0) {
+        // (uploaded again when a draw found them changed, and in each new submission)
+        if (last_constants_at_[stage] == NONE) {
             last_constants_at_[stage] = draw_data_take(sizeof(harness::Constants), ubo_align_);
-            std::memcpy(draw_data(last_constants_at_[stage]), &constants[stage], sizeof(harness::Constants));
-            last_constants_[stage] = constants[stage];
+            std::memcpy(draw_data(last_constants_at_[stage]), &last_constants_[stage], sizeof(harness::Constants));
         }
     }
     if (last_system_at_ == NONE || std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
