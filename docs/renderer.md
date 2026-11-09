@@ -2571,6 +2571,29 @@ reads indices on the GPU from shared memory); each write-back's
 `memory_written` and `wrote_back`; on the host path `render_target`'s map
 lookup per target.
 
+**The drive live after the three tracks (2026-11-09, night).** With the
+barriers' accesses, the early depth-stencil form and the lean outputs
+("The host path's GPU time"), the command thread's stamps, register runs
+and slot memo ("What stands still costs nothing") and the host path's
+fixes ("The host path against the exact one") together, the played drive,
+alone on the machine, one run each (the host path twice: its first run
+made the pipelines of the new pixel shader forms, 2.46 s of CPU a second):
+
+| | fps | frame p95 | GPU ms a frame | CPU s a second |
+| --- | --- | --- | --- | --- |
+| host path, before | 29.83 | 35.0 | 8.08 | 2.03 |
+| host path, now | 29.62, 29.73 | 35.0, 34.9 | 6.05, 6.13 | 2.03 (warm) |
+| exact path, before | 29.83 | 35.0 | 10.63 | 1.90 |
+| exact path, now | 29.49 | 34.6 | 8.53 | 1.70 |
+| Xenia D3D12 (host render targets) | 29.9 | | 6.24 | 2.0 |
+
+The command processor's time a play of the drive frame (`xfreplay --repeat
+100 --whole-extents`, host path, three runs each, fastest play and
+median): all three switches on 17.4-18.0 ms (19.3-20.2), all off
+20.3-21.1 (21.9-23.4); one off at a time 18.1-19.5 fastest, so each pays.
+The changes without a switch (the draw's locals, the clock reads) do not
+show beside the agent's baseline (20.6 fastest).
+
 **VIZ queries** (Xenia's `occlusion_query_viz`, off by default there; here
 where the device has `VK_EXT_conditional_rendering`,
 `XF_VK_NO_CONDITIONAL_RENDERING=1` off). A query's survey draws
