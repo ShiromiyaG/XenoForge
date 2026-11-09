@@ -12,7 +12,8 @@
 // the repeated plays and prints the N most sampled functions (sampler.h).
 // --readback-resolve none|fast|full is Xenia's readback_resolve, --depth-float24-round its
 // depth_float24_round, --depth-float24-convert its depth_float24_convert_in_pixel_shader,
-// --no-gamma-unorm16 its gamma_render_target_as_unorm16 off (renderer.h). --texture-memory soft,hard[,lifetime] sets
+// --no-gamma-unorm16 its gamma_render_target_as_unorm16 off, --xenos-sample-positions its xenos_sample_positions
+// (renderer.h). --texture-memory soft,hard[,lifetime] sets
 // the texture cache's memory limits (Xenia's texture_cache_memory_limit_*; renderer.h).
 // --async-pipelines makes pipelines on worker threads as the player does, --stand-in says what
 // draws meanwhile (renderer.h's PipelineStandIn), --linked-pipelines links every pipeline from
@@ -22,7 +23,7 @@
 //            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--profile N] [--async-pipelines]
 //            [--stand-in skip|placeholder|library] [--linked-pipelines]
 //            [--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] [--depth-float24-round]
-//            [--depth-float24-convert] [--no-gamma-unorm16]
+//            [--depth-float24-convert] [--no-gamma-unorm16] [--xenos-sample-positions]
 //            [--texture-memory soft,hard[,lifetime]] [-v]
 
 #include "xenoforge/render_scale.h"
@@ -51,7 +52,7 @@ int usage() {
                          "[--stand-in skip|placeholder|library] [--linked-pipelines] "
                          "[--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] "
                          "[--depth-float24-round] "
-                         "[--depth-float24-convert] [--no-gamma-unorm16] "
+                         "[--depth-float24-convert] [--no-gamma-unorm16] [--xenos-sample-positions] "
                          "[--texture-memory soft,hard[,lifetime]] [--scale percent] [--min-scalable pixels] [-v]\n");
     return 2;
 }
@@ -114,6 +115,9 @@ int main(int argc, char **argv) {
         // Xenia's depth_float24_convert_in_pixel_shader
         else if (a == "--depth-float24-convert")
             options.depth_float24_convert_in_pixel_shader = true;
+        // Xenia's xenos_sample_positions
+        else if (a == "--xenos-sample-positions")
+            options.xenos_sample_positions = true;
         // Xenia's gamma_render_target_as_unorm16 off
         else if (a == "--no-gamma-unorm16")
             options.gamma_render_target_as_unorm16 = false;

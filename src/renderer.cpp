@@ -335,6 +335,27 @@ float pwl_gamma_to_linear(float gamma) {
     return linear * (1.0f / 1023.0f);
 }
 
+// Each host sample at the position of the guest sample it stands for
+// (draw_util.cc's GetHostSampleXenosPositions; positions in sixteenths from
+// the pixel's center, draw_util.h's kXenosSamplePositions2x and 4x): 4x in
+// the guest's order on host render targets and 0, 3, 2, 1 on the interlock
+// path, native 2x host samples 1 and 0, the interlock path's 2x as 4x
+// 0, 1, 0, 1. msaa: 1 for the guest's 2x, 2 for its 4x.
+void xenos_sample_locations(uint32_t msaa, VkSampleCountFlagBits samples, bool interlock, VkSampleLocationEXT *positions,
+                            VkPipelineSampleLocationsStateCreateInfoEXT &state) {
+    static const int8_t positions_2x[2][2] = {{-4, 4}, {4, -4}};
+    static const int8_t positions_4x[4][2] = {{-2, -2}, {2, 2}, {-6, 6}, {6, -6}};
+    static const uint32_t remap_4x_interlock[4] = {0, 3, 2, 1};
+    uint32_t count = uint32_t(samples);
+    for (uint32_t k = 0; k < count; k++) {
+        const int8_t *p = msaa == 2 ? positions_4x[interlock ? remap_4x_interlock[k] : k]
+                                    : positions_2x[count == 2 ? k ^ 1 : k & 1];
+        positions[k] = {0.5f + float(p[0]) / 16.0f, 0.5f + float(p[1]) / 16.0f};
+    }
+    state.sampleLocationsEnable = VK_TRUE;
+    state.sampleLocationsInfo = {VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT, nullptr, samples, {1, 1}, count, positions};
+}
+
 // xenos::Float32To20e4: towards zero, or to the nearest even
 uint32_t float_to_float24(float f, bool round_to_nearest_even) {
     if (!(f > 0.0f)) return 0;
@@ -2419,6 +2440,9 @@ private:
     VkFormat d24s8_ = VK_FORMAT_D24_UNORM_S8_UINT;
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm (RenderTarget::gamma_linear)
     bool gamma_unorm16_ = false;
+    // host render targets rasterized at the Xenos's sample positions
+    // (Options::xenos_sample_positions, XF_XENOS_SAMPLE_POSITIONS)
+    bool xenos_positions_ = false;
     // polygon offsets on float depth in the format's own units even with
     // VK_EXT_depth_bias_control (XF_DEPTH_BIAS_FLOAT_UNITS=1)
     bool depth_bias_float_units_ = false;
@@ -2710,6 +2734,18 @@ bool Impl::init(std::string &error) {
         (depth_fallback && depth_fallback[0] == '1'))
         d24s8_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
     if (const char *e = std::getenv("XF_DEPTH_BIAS_FLOAT_UNITS")) depth_bias_float_units_ = e[0] && e[0] != '0';
+    // Host render targets at the Xenos's sample positions (Xenia's
+    // xenos_sample_positions, off by default there and here): needs
+    // VK_EXT_sample_locations for both 2x and 4x
+    {
+        const char *e = std::getenv("XF_XENOS_SAMPLE_POSITIONS");
+        const bool wanted = e && e[0] ? e[0] != '0' : options_.xenos_sample_positions;
+        const VkSampleCountFlags both = VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+        xenos_positions_ = wanted && !fsi_ && (d_.sample_locations() & both) == both;
+        if (wanted && !fsi_)
+            std::fprintf(stderr, "renderer: host render targets at %s sample positions\n",
+                         xenos_positions_ ? "the Xenos's" : "the host's (no VK_EXT_sample_locations for 2x and 4x)");
+    }
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm, blended in linear
     // (Xenia's gamma_render_target_as_unorm16, on by default), where the
     // device samples, renders to and blends that format; without it, or with
@@ -4228,8 +4264,11 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
              (msaa && !(integer_samples_ & samples))))
             raw_format = VK_FORMAT_UNDEFINED;
     }
+    // (a multisampled depth target drawn at sample positions of our own must say so)
+    VkImageCreateFlags image_flags = raw_format != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    if (depth && msaa && xenos_positions_) image_flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
     t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->host_width, t->host_height, 1}, 1, 1, samples, usage,
-                               raw_format != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+                               image_flags);
     if (!t->image.image) {
         fatal_ = "could not make a render target";
         return nullptr;
@@ -4579,6 +4618,15 @@ VkPipeline Impl::edram_pipeline(const RenderTarget &t, VkShaderModule fs, VkPipe
     raster.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = t.image.samples;
+    // (at the positions the target's draws rasterize at: a depth image keeps
+    // one set of sample positions)
+    VkSampleLocationEXT sample_positions[4];
+    VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
+        VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+    if (xenos_positions_ && t.msaa) {
+        xenos_sample_locations(t.msaa, t.image.samples, false, sample_positions, sample_locations);
+        multisample.pNext = &sample_locations;
+    }
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     if (t.depth) {
         depth.depthTestEnable = depth.depthWriteEnable = VK_TRUE;
@@ -7984,31 +8032,14 @@ void Impl::draw(const gpu::Draw &d) {
     if (fsi_ && msaa == 1 && fsi_2x_as_4x_) multisample.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
     // The interlock path rasterizes at the Xenos's sample positions where the
     // device places samples (VK_EXT_sample_locations), as Xenia's interlock
-    // paths always do (its xenos_sample_positions, for host render targets,
-    // is off by default; so is ours): each host sample at the position of the
-    // guest sample its coverage stands for (draw_util.cc's
-    // GetHostSampleXenosPositions with interlock: native 2x host samples 1
-    // and 0, 2x as 4x 0, 1, 0, 1, 4x 0, 3, 2, 1; positions in sixteenths
-    // from the pixel's center, kXenosSamplePositions2x and 4x).
+    // paths always do; host render targets do with
+    // Options::xenos_sample_positions (Xenia's option of that name, off by
+    // default there and here): xenos_sample_locations.
     VkSampleLocationEXT sample_positions[4];
     VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
         VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
-    if (fsi_ && msaa && (d_.sample_locations() & multisample.rasterizationSamples)) {
-        static const int8_t positions_2x[2][2] = {{-4, 4}, {4, -4}};
-        static const int8_t positions_4x[4][2] = {{-2, -2}, {2, 2}, {-6, 6}, {6, -6}};
-        static const uint32_t remap_4x[4] = {0, 3, 2, 1};
-        uint32_t count = uint32_t(multisample.rasterizationSamples);
-        for (uint32_t k = 0; k < count; k++) {
-            const int8_t *p = msaa == 2 ? positions_4x[remap_4x[k]] : positions_2x[count == 2 ? k ^ 1 : k & 1];
-            sample_positions[k] = {0.5f + float(p[0]) / 16.0f, 0.5f + float(p[1]) / 16.0f};
-        }
-        sample_locations.sampleLocationsEnable = VK_TRUE;
-        sample_locations.sampleLocationsInfo = {VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT,
-                                                nullptr,
-                                                multisample.rasterizationSamples,
-                                                {1, 1},
-                                                count,
-                                                sample_positions};
+    if (msaa && (fsi_ ? (d_.sample_locations() & multisample.rasterizationSamples) != 0 : xenos_positions_)) {
+        xenos_sample_locations(msaa, multisample.rasterizationSamples, fsi_, sample_positions, sample_locations);
         multisample.pNext = &sample_locations;
     }
     if (sample_shading) multisample.sampleShadingEnable = VK_TRUE, multisample.minSampleShading = 1.0f;

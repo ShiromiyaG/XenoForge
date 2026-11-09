@@ -295,6 +295,14 @@ struct Options {
     // default as there); off, or on a device that cannot blend that format,
     // the pixel shader writes the gamma curve and the blend works on it
     bool gamma_render_target_as_unorm16 = true;
+    // Host render targets rasterized at the Xenos's 2x and 4x sample
+    // positions rather than the host's standard ones, where the device
+    // places samples (VK_EXT_sample_locations): edges, alpha to coverage and
+    // the depth a resolve takes from a sample then lie where the console's
+    // do, as on the interlock path, which always takes them (Xenia's
+    // xenos_sample_positions, off by default as there; XF_XENOS_SAMPLE_POSITIONS=1
+    // or 0 overrides)
+    bool xenos_sample_positions = false;
     // The depth of draws into a D24FS8 target with the depth test on written
     // by the pixel shader rounded to 20e4 (towards zero, or to the nearest
     // even with depth_float24_round), so the host's depth holds only what
