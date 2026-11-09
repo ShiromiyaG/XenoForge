@@ -588,6 +588,7 @@ struct Shader {
     // vertex kill it writes
     bool fetches_textures = false;
     bool writes_position_y = false, writes_position_w = false, writes_point_size = false, writes_vertex_kill = false;
+    uint32_t writes_position_xz = 0; // bit 0: x, bit 2: z (Impl::depth_overwrite)
     // memexport: whether it writes any eM#, and the float constants its eA
     // writes take the stream from (Shader::memexport_stream_constants)
     bool exports = false;
@@ -599,6 +600,29 @@ struct Shader {
     uint64_t texture_mask = 0, vertex_mask[2] = {};
     uint32_t fetch_blocks = 0;
     uint32_t filter_mask = 0; // the slots (below 32) filters has
+};
+
+// A rectangle of a render target's EDRAM tiles: columns [c0, c1) of its tile
+// rows [r0, r1), as the target lays its tiles out (pitch_tiles a row).
+struct TileRect {
+    uint32_t c0 = 0, r0 = 0, c1 = 0, r1 = 0;
+    bool empty() const { return c1 <= c0 || r1 <= r0; }
+    bool within(const TileRect &o) const { return c0 >= o.c0 && r0 >= o.r0 && c1 <= o.c1 && r1 <= o.r1; }
+    uint32_t area() const { return empty() ? 0 : (c1 - c0) * (r1 - r0); }
+    // a memo of tiles known to be some way, after `more` are found to be so
+    // too: both when they make one rectangle, else the larger
+    void remember(const TileRect &more) {
+        if (more.within(*this)) return;
+        if (empty() || within(more)) {
+            *this = more;
+        } else if (more.c0 == c0 && more.c1 == c1 && more.r0 <= r1 && more.r1 >= r0) {
+            r0 = std::min(r0, more.r0), r1 = std::max(r1, more.r1);
+        } else if (more.r0 == r0 && more.r1 == r1 && more.c0 <= c1 && more.c1 >= c0) {
+            c0 = std::min(c0, more.c0), c1 = std::max(c1, more.c1);
+        } else if (more.area() > area()) {
+            *this = more;
+        }
+    }
 };
 
 struct RenderTarget {
@@ -616,11 +640,11 @@ struct RenderTarget {
     uint32_t width = 0, height = 0; // in the console's pixels
     // What a draw's bookkeeping found last (Impl::acquire, tiles_drawn), so
     // the next draw into the same target does not walk its tiles again: it
-    // held its first owned_tiles tiles as of owners_epoch_ == owned_epoch,
-    // and none of its tile rows [drawn_first, drawn_last) held a clear's
-    // value as of cleared_epoch_ == drawn_epoch.
+    // held the tiles of `owned` as of owners_epoch_ == owned_epoch, and none
+    // of the tiles of `drawn` held a clear's value as of cleared_epoch_ ==
+    // drawn_epoch.
     uint64_t owned_epoch = 0, drawn_epoch = 0;
-    uint32_t owned_tiles = 0, drawn_first = 0, drawn_last = 0;
+    TileRect owned, drawn;
     // its image's size: width and height at the resolution scale (Impl::scale_)
     uint32_t host_width = 0, host_height = 0;
     // in EDRAM: tiles per row (at its bits per sample), a tile's size in pixels
@@ -1418,10 +1442,52 @@ private:
 
     // draws
     void draw(const gpu::Draw &d);
+    // a vertex on the screen as the vertex shader run on the CPU places it
+    // (the viewport's scale and offset applied; not the window offset nor
+    // the pixel centers' half)
+    struct ScreenVertex {
+        uint32_t index;
+        float x, y;
+    };
     uint32_t draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                        uint32_t primitive, bool tessellated) const;
+                        uint32_t primitive, bool tessellated, std::vector<ScreenVertex> *screen = nullptr) const;
     uint32_t vertex_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                          uint32_t primitive) const;
+                          uint32_t primitive, std::vector<ScreenVertex> *screen = nullptr) const;
+    // the console's pixels a draw can reach, [x0, x1) x [y0, y1) each
+    struct Reach {
+        uint32_t x0, y0, x1, y1;
+    };
+    void draw_reach(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                    uint32_t primitive, bool tessellated, const VkViewport &viewport, const VkRect2D &scissor,
+                    std::vector<Reach> &reach) const;
+    mutable std::vector<ScreenVertex> reach_vertices_; // (draw_reach's own, kept for its room)
+    std::vector<Reach> reach_;                         // (the draw's)
+    std::vector<TileRect> reach_rects_;
+    // What a draw provably writes into its depth target whatever the target
+    // held (Impl::depth_overwrite): every sample of the console's pixels
+    // [x0, x1) x [y0, y1), and whether with one known word (the guest's
+    // depth and stencil, D24S8 or D24FS8 as the target's format).
+    struct DepthOverwrite {
+        bool whole = false;
+        uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        bool constant = false;
+        uint32_t word = 0;
+    };
+    DepthOverwrite depth_overwrite(const gpu::Draw &d, const Shader &vs, const Shader *ps,
+                                   const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                                   uint32_t depth_control, const RenderTarget &depth, const VkViewport &viewport,
+                                   const float *ndc_scale, const float *ndc_offset, const VkRect2D &scissor,
+                                   const char *&why) const;
+    // a depth target's clear value of the guest's word, as the target keeps it
+    // (xenos::UNorm24To32, or D24FS8 halved)
+    static VkClearValue depth_clear_value(uint32_t format, uint32_t word) {
+        VkClearValue v{};
+        uint32_t d24 = word >> 8;
+        v.depthStencil.depth =
+            format == 0 ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f) : float24_to_float(d24) * 0.5f;
+        v.depthStencil.stencil = word & 0xFF;
+        return v;
+    }
     void resolve();
     void gpu_resolve(const resolve::Info &info, RenderTarget &source);
     void swap();
@@ -2419,7 +2485,9 @@ private:
     // EDRAM: the render targets' contents move through it when another
     // target takes over its tiles (Xenia's ownership transfers); it starts
     // as zeros, or as a trace's snapshot
-    void acquire(RenderTarget *t, uint32_t rows);
+    void acquire(RenderTarget *t, uint32_t rows, const DepthOverwrite *overwritten = nullptr);
+    void acquire(RenderTarget *t, std::span<const TileRect> rects, const DepthOverwrite *overwritten = nullptr);
+    std::vector<uint32_t> acquire_tiles_; // (acquire's own, kept for its room)
     bool edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles);
     bool edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows);
     // tiles drawn straight from their holders into the target, one pass
@@ -2475,25 +2543,71 @@ private:
         const char *v = std::getenv("XF_TRANSFER_CLEARS");
         return !(v && std::string(v) == "0");
     }();
+    // Beyond Xenia too, for the console's own clears (a rectangle drawn over
+    // a depth target with the depth test always passing and written), which
+    // games also make through another view of the same tiles (a 4x target
+    // cleared as a single-sampled one twice as wide and tall):
+    // - a target taking tiles for a draw that provably writes every sample
+    //   of them whatever they held (depth_overwrite) takes them without the
+    //   transfer from their holder, or the load from EDRAM, the draw would
+    //   only overwrite. XF_OVERWRITE_TRANSFERS=0: transferred, as Xenia does.
+    // - where such a draw writes one known word, the tiles it covers whole
+    //   hold a clear's value as after a resolve's clear, and a depth target of
+    //   the other depth format taking a cleared tile is cleared to the same
+    //   guest word in its own format (tile_clear_word_). XF_DRAW_CLEARS=0:
+    //   a draw never makes a tile a clear's, and the other format is drawn.
+    std::vector<uint32_t> tile_clear_word_ = std::vector<uint32_t>(EDRAM_TILES, 0); // depth tiles: the guest's word
+    bool overwrite_transfers_ = [] {
+        const char *v = std::getenv("XF_OVERWRITE_TRANSFERS");
+        return !(v && std::string(v) == "0");
+    }();
+    bool draw_clears_ = [] {
+        const char *v = std::getenv("XF_DRAW_CLEARS");
+        return !(v && std::string(v) == "0");
+    }();
+    // whether all of a tile's pixels, as the target lays them out, are in
+    // the target's image and among those the draw overwrites
+    static bool tile_within(const RenderTarget &t, uint32_t tile, const DepthOverwrite &o) {
+        const uint32_t k = (tile + EDRAM_TILES - t.base % EDRAM_TILES) % EDRAM_TILES;
+        const uint32_t x = (k % t.pitch_tiles) * t.tile_width, y = (k / t.pitch_tiles) * t.tile_height;
+        const uint32_t x1 = x + t.tile_width, y1 = y + t.tile_height;
+        return o.whole && x1 <= t.width && y1 <= t.height && x >= o.x0 && y >= o.y0 && x1 <= o.x1 && y1 <= o.y1;
+    }
     // the tiles of t in its pixel rows [top, bottom), every column: a draw
     // may have written them, so they no longer hold a clear's value
     // (A draw after another into the same rows, no tile made a clear's
     // since, has nothing to do: a game's hundred thousand draws a second
     // walked 720 tiles each.)
-    void tiles_drawn(RenderTarget &t, uint32_t top, uint32_t bottom) {
-        if (bottom <= top) return;
-        uint32_t first = top / t.tile_height, last = std::min((bottom + t.tile_height - 1) / t.tile_height, t.height / t.tile_height);
+    void tiles_drawn(RenderTarget &t, const TileRect &tiles) {
+        if (tiles.empty()) return;
         const bool known = t.drawn_epoch == cleared_epoch_;
-        if (known && first >= t.drawn_first && last <= t.drawn_last) return;
-        for (uint32_t row = first; row < last; row++)
-            for (uint32_t column = 0; column < t.pitch_tiles; column++)
+        if (known && tiles.within(t.drawn)) return;
+        for (uint32_t row = tiles.r0; row < tiles.r1; row++)
+            for (uint32_t column = tiles.c0; column < tiles.c1; column++)
                 tile_cleared_[(t.base + row * t.pitch_tiles + column) % EDRAM_TILES] = 0;
-        if (last <= first) return;
-        if (known && first <= t.drawn_last && last >= t.drawn_first)
-            t.drawn_first = std::min(t.drawn_first, first), t.drawn_last = std::max(t.drawn_last, last);
-        else
-            t.drawn_epoch = cleared_epoch_, t.drawn_first = first, t.drawn_last = last;
+        if (!known) t.drawn_epoch = cleared_epoch_, t.drawn = {};
+        t.drawn.remember(tiles);
     }
+    // The tiles of a target that hold the console's pixels [x0, x1) x [y0, y1)
+    // (within its pitch and its height).
+    static TileRect tiles_of(const RenderTarget &t, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+        TileRect r;
+        r.c0 = x0 / t.tile_width, r.c1 = std::min((x1 + t.tile_width - 1) / t.tile_width, t.pitch_tiles);
+        r.r0 = y0 / t.tile_height, r.r1 = std::min((y1 + t.tile_height - 1) / t.tile_height, t.height / t.tile_height);
+        return r;
+    }
+    // Beyond Xenia, which takes whole rows of tiles from the first down to
+    // the draw's lowest: a draw's targets take over only the tiles the draw
+    // can reach (Impl::draw_reach: the scissor, and the viewport with
+    // clipping on or the vertices' extent without), so a target drawn to in
+    // part while another holds the rest of the same rows (a shadow atlas
+    // cleared a region at a time, through views of two sample counts) moves
+    // that part alone. XF_DRAW_REACH=rows: whole rows from the first, as
+    // Xenia.
+    bool reach_tiles_ = [] {
+        const char *v = std::getenv("XF_DRAW_REACH");
+        return !(v && std::string(v) == "rows");
+    }();
     // counted up as a tile changes hands (owners_) and as one is made a
     // clear's (tile_cleared_ set): what the targets' memos are as of
     uint64_t owners_epoch_ = 1, cleared_epoch_ = 1;
@@ -4189,6 +4303,7 @@ bool Impl::translate(Shader &s, std::string &why) {
                             s.colors_written |= 1u << (r->index & 3);
                         if (r->target == xf::ucode::StorageTarget::Depth && mask) s.writes_depth = true;
                         if (r->target == xf::ucode::StorageTarget::Position) {
+                            s.writes_position_xz |= mask & 5;
                             s.writes_position_y |= (mask & 2) != 0;
                             s.writes_position_w |= (mask & 8) != 0;
                         }
@@ -4453,26 +4568,64 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
 // and those no target holds are loaded from EDRAM, as Xenia's ownership
 // transfers do. (XF_EDRAM_TRANSFERS=store: the holders store theirs into
 // EDRAM first, then all are loaded from there.)
-void Impl::acquire(RenderTarget *t, uint32_t rows) {
-    uint32_t tile_rows = std::min((rows + t->tile_height - 1) / t->tile_height, t->height / t->tile_height);
-    uint32_t count = std::min(tile_rows * t->pitch_tiles, EDRAM_TILES);
+void Impl::acquire(RenderTarget *t, uint32_t rows, const DepthOverwrite *overwritten) {
+    const TileRect whole_rows = tiles_of(*t, 0, 0, t->pitch_tiles * t->tile_width, rows);
+    acquire(t, std::span<const TileRect>(&whole_rows, 1), overwritten);
+}
+
+void Impl::acquire(RenderTarget *t, std::span<const TileRect> rects, const DepthOverwrite *overwritten) {
     // (it held them at its last draw and no tile changed hands since)
-    if (t->owned_epoch == owners_epoch_ && count <= t->owned_tiles) return;
+    const bool known = t->owned_epoch == owners_epoch_;
+    if (known && std::all_of(rects.begin(), rects.end(), [&](const TileRect &r) { return r.empty() || r.within(t->owned); }))
+        return;
+    // the tiles, as the target numbers them from its base, in order (once
+    // each: a draw's rectangles may share some), within EDRAM's 2048
+    std::vector<uint32_t> &wanted = acquire_tiles_;
+    wanted.clear();
+    uint32_t bottom_row = 0;
+    for (const TileRect &r : rects) {
+        if (r.empty()) continue;
+        bottom_row = std::max(bottom_row, r.r1);
+        for (uint32_t row = r.r0; row < r.r1; row++)
+            for (uint32_t column = r.c0; column < r.c1; column++)
+                if (row * t->pitch_tiles + column < EDRAM_TILES) wanted.push_back(row * t->pitch_tiles + column);
+    }
+    if (rects.size() > 1) {
+        std::sort(wanted.begin(), wanted.end());
+        wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    }
     std::vector<uint32_t> needed, unheld;
     std::map<RenderTarget *, std::vector<uint32_t>> held;
-    for (uint32_t k = 0; k < count; k++) {
+    uint32_t taken_unread = 0;
+    for (uint32_t k : wanted) {
         uint32_t tile = (t->base + k) % EDRAM_TILES;
         if (owners_[tile] == t) continue;
         needed.push_back(tile);
+        // (the draw this is for writes every sample of the tile whatever it
+        // holds: taken as it is, nothing read from its holder or from EDRAM)
+        if (overwritten && tile_within(*t, tile, *overwritten)) {
+            tile_cleared_[tile] = 0;
+            taken_unread++;
+            continue;
+        }
         if (owners_[tile])
             held[owners_[tile]].push_back(tile);
         else
             unheld.push_back(tile);
     }
+    // what is known to be the target's now: these rectangles, with what was
+    // known before where no tile changes hands
+    auto remember = [&](bool keep) {
+        if (!keep) t->owned = {};
+        for (const TileRect &r : rects)
+            if (!r.empty()) t->owned.remember(r);
+    };
     if (needed.empty()) {
-        t->owned_epoch = owners_epoch_, t->owned_tiles = count;
+        t->owned_epoch = owners_epoch_;
+        remember(known);
         return;
     }
+    const uint32_t tile_rows = bottom_row;
     if (direct_transfers_) {
         // (edram_transfer keeps the clears it moves as clears, and drops the rest)
         if (!held.empty() && !edram_transfer(t, held)) return;
@@ -4482,13 +4635,20 @@ void Impl::acquire(RenderTarget *t, uint32_t rows) {
         for (uint32_t tile : needed) tile_cleared_[tile] = 0;
         for (auto &[holder, tiles] : held)
             if (!edram_store(holder, tiles)) return;
-        if (!edram_load(t, needed, tile_rows * t->tile_height)) return;
+        std::vector<uint32_t> loaded; // (needed, without the tiles taken unread)
+        for (uint32_t tile : needed)
+            if (!overwritten || !tile_within(*t, tile, *overwritten)) loaded.push_back(tile);
+        if (!loaded.empty() && !edram_load(t, loaded, tile_rows * t->tile_height)) return;
     }
     for (uint32_t tile : needed) owners_[tile] = t;
-    t->owned_epoch = ++owners_epoch_, t->owned_tiles = count;
-    if (options_.verbose)
-        std::fprintf(stderr, "  EDRAM: %zu tiles to %s base %u (from %zu targets)\n", needed.size(), t->depth ? "depth" : "color",
-                     t->base, held.size());
+    t->owned_epoch = ++owners_epoch_;
+    remember(known); // (it lost none of what it was known to hold)
+    if (options_.verbose) {
+        std::string from;
+        for (auto &[holder, tiles] : held) from += " [" + std::to_string(tiles.size()) + " of " + target_name(*holder) + "]";
+        std::fprintf(stderr, "  EDRAM: %zu tiles to %s (from %zu targets, %u taken unread)%s\n", needed.size(),
+                     target_name(*t).c_str(), held.size(), taken_unread, from.c_str());
+    }
 }
 
 // the tiles a transfer moves, a word each, in the arena
@@ -4881,14 +5041,21 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         const bool same = transfer_clears_ && holder->depth == t->depth && holder->format == t->format &&
                           holder->host == t->host && holder->gamma_linear == t->gamma_linear &&
                           (holder->raw != VK_NULL_HANDLE) == (t->raw != VK_NULL_HANDLE);
+        // (and a depth target of the other depth format: the same guest word
+        // as its own format keeps it, which is what the transfer would draw.
+        // Where the host keeps the target's depth as a float beside EDRAM,
+        // the transfer would rather take a float left there that still
+        // rounds to the word, if one happened to: the same guest bits either
+        // way.)
+        const bool other_depth = transfer_clears_ && draw_clears_ && holder->depth && t->depth && holder->format != t->format;
         Group drawn{holder, {}, false, {}};
         std::vector<Group> cleared;
         for (uint32_t tile : tiles) {
-            if (!same || !tile_cleared_[tile]) {
+            if ((!same && !other_depth) || !tile_cleared_[tile]) {
                 drawn.tiles.push_back(tile);
                 continue;
             }
-            const VkClearValue &v = tile_clear_value_[tile];
+            const VkClearValue v = same ? tile_clear_value_[tile] : depth_clear_value(t->format, tile_clear_word_[tile]);
             auto g = std::find_if(cleared.begin(), cleared.end(),
                                   [&](const Group &c) { return std::memcmp(&c.value, &v, sizeof(v)) == 0; });
             if (g == cleared.end()) cleared.push_back({holder, {tile}, true, v});
@@ -4901,7 +5068,10 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         RenderTarget *holder = g.holder;
         const std::vector<uint32_t> &tiles = g.tiles;
         // (the tiles drawn hold what the holder drew; those cleared keep their value)
-        for (uint32_t tile : tiles) tile_cleared_[tile] = g.clear;
+        for (uint32_t tile : tiles) {
+            tile_cleared_[tile] = g.clear;
+            if (g.clear) tile_clear_value_[tile] = g.value; // (as the target keeps it)
+        }
         if (g.clear) cleared_epoch_++;
         if (!g.clear && !transfer_pipeline(*t, holder->msaa != 0))
             return fatal_ = "could not make an EDRAM transfer pipeline", false;
@@ -4922,24 +5092,35 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
             d.rects.push_back(r);
             height = std::max(height, y + r.extent.height);
         };
+        // (the runs of each row, a run that is the same columns as one of the
+        // row above joined to it: whole rows are one rectangle, and so is a
+        // column of tiles a draw reached)
+        struct Open {
+            uint32_t row, first, columns, rows;
+        };
+        std::vector<Open> open, next;
         for (size_t i = 0; i < at.size();) {
-            size_t j = i + 1;
-            while (j < at.size() && at[j] == at[j - 1] + 1) j++;
-            uint32_t start = at[i], end = at[j - 1] + 1, pitch = t->pitch_tiles;
-            uint32_t row = start / pitch, column = start % pitch;
-            if (column) { // a part of the first row
-                uint32_t columns = std::min(pitch - column, end - start);
-                rect(row, column, columns, 1);
-                start += columns, row++;
+            const uint32_t pitch = t->pitch_tiles, row = at[i] / pitch;
+            next.clear();
+            while (i < at.size() && at[i] / pitch == row) {
+                size_t j = i + 1;
+                while (j < at.size() && at[j] == at[j - 1] + 1 && at[j] / pitch == row) j++;
+                const uint32_t first = at[i] % pitch, columns = uint32_t(j - i);
+                auto above = std::find_if(open.begin(), open.end(), [&](const Open &o) {
+                    return o.row + o.rows == row && o.first == first && o.columns == columns;
+                });
+                if (above != open.end()) {
+                    next.push_back({above->row, first, columns, above->rows + 1});
+                    open.erase(above);
+                } else {
+                    next.push_back({row, first, columns, 1});
+                }
+                i = j;
             }
-            if (end - start >= pitch) { // whole rows
-                uint32_t rows = (end - start) / pitch;
-                rect(row, 0, pitch, rows);
-                start += rows * pitch, row += rows;
-            }
-            if (start < end) rect(row, 0, end - start, 1); // a part of the last row
-            i = j;
+            for (const Open &o : open) rect(o.row, o.first, o.columns, o.rows);
+            open.swap(next);
         }
+        for (const Open &o : open) rect(o.row, o.first, o.columns, o.rows);
         if (!d.rects.empty()) draws.push_back(std::move(d));
     }
     if (draws.empty()) return true;
@@ -6958,7 +7139,8 @@ int32_t float_to_fixed_16p8(float f32) {
 // its depth target took 2048 tiles three times a frame). A tessellated draw's
 // vertices are not run (the estimator's "not reproducing tessellation").
 uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                          uint32_t primitive, bool tessellated) const {
+                          uint32_t primitive, bool tessellated, std::vector<ScreenVertex> *screen) const {
+    if (screen) screen->clear();
     uint32_t window = regs_[r::PA_SC_WINDOW_OFFSET];
     int32_t window_x = sign_extend(window & 0x7FFF, 15), window_y = sign_extend((window >> 16) & 0x7FFF, 15);
     uint32_t tl = regs_[r::PA_SC_WINDOW_SCISSOR_TL], br = regs_[r::PA_SC_WINDOW_SCISSOR_BR];
@@ -6975,7 +7157,7 @@ uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants,
         // the vertices' extent, where there is no scissor (Xenia's
         // execute_unclipped_draw_vs_on_cpu, without _with_scissor)
         if (scissor_bottom >= 8192 && scissor_right >= 8192 && !tessellated)
-            max_y = std::min(max_y, vertex_max_y(vs, constants, indices, primitive));
+            max_y = std::min(max_y, vertex_max_y(vs, constants, indices, primitive, screen));
     } else {
         // the viewport's bottom, truncated
         uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
@@ -6998,7 +7180,10 @@ uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants,
 // 1024 vertices is not run (8192): the CPU's time, for what a scissor
 // usually bounds anyway.
 uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                            uint32_t primitive) const {
+                            uint32_t primitive, std::vector<ScreenVertex> *screen) const {
+    // (screen: where each vertex that is not killed lands, for draw_reach;
+    // left empty when the shader cannot be run for all of them)
+    if (screen) screen->clear();
     if (indices.empty()) return 0;
     if (vs.fetches_textures || !vs.writes_position_y) return 8192;
     uint32_t min_index = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, max_index = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
@@ -7011,6 +7196,8 @@ uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constant
     uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
     const float *vport = reinterpret_cast<const float *>(&regs_[r::PA_CL_VPORT_XSCALE]);
     float y_scale = vte & 4 ? vport[2] : 1.0f, y_offset = vte & 8 ? vport[3] : 0.0f;
+    float x_scale = vte & 1 ? vport[0] : 1.0f, x_offset = vte & 2 ? vport[1] : 0.0f;
+    if (screen && !(vs.writes_position_xz & 1)) screen = nullptr;
     bool divide_by_w = !((vte >> 8) & 1);
     if (divide_by_w && !vs.writes_position_w) return 8192;
     int32_t point_min_diameter = 0, point_max_diameter = 0;
@@ -7029,11 +7216,20 @@ uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constant
     std::string unsupported;
     for (uint32_t vertex : vertices) {
         input.registers[0][0] = float(vertex);
-        if (!shader::interpret(vs.parsed, input, constants, memory, output, unsupported)) return 8192;
+        if (!shader::interpret(vs.parsed, input, constants, memory, output, unsupported)) {
+            if (screen) screen->clear();
+            return 8192;
+        }
         if (vs.writes_vertex_kill && (std::bit_cast<uint32_t>(output.point_size[2]) & ~(1u << 31))) continue;
         float y = output.position[1];
         if (divide_by_w) y /= output.position[3];
         y = y * y_scale + y_offset;
+        if (screen) {
+            float x = output.position[0];
+            // (behind the eye, a polygon is not within its vertices' box)
+            if (divide_by_w) x = output.position[3] > 0.0f ? x / output.position[3] : NAN;
+            screen->push_back({vertex, x * x_scale + x_offset, y});
+        }
         if (points) {
             float radius = point_constant_radius_y;
             if (vs.writes_point_size)
@@ -7051,6 +7247,267 @@ uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constant
     // the top-left rule: .5 exclusive without MSAA, 1. with
     uint32_t msaa = (regs_[reg::RB_SURFACE_INFO] >> 16) & 3;
     return (uint32_t(std::max(0, max_y_24p8)) + (msaa == 0 ? 127u : 255u)) >> 8;
+}
+
+// Beyond Xenia (whose estimate is the lowest row alone, draw_max_y): the
+// pixels of its render targets a draw can reach, as rectangles, for the
+// targets to take over the tiles under them and no others (Impl::draw's
+// acquire). Never less than the draw can write:
+// - the scissor, down to draw_max_y's row, always;
+// - with clipping on, polygons are clipped to the host's viewport: its
+//   rectangle;
+// - with clipping off, where the vertex shader runs on the CPU for the
+//   draw's vertices (draw_max_y's own run when there is no scissor, else for
+//   draws of at most twelve vertices: the clears and the screen-space
+//   rectangles), the box of a polygon draw's vertices, none of them behind
+//   the eye; for a rectangle list of up to four rectangles a box each, with
+//   the corner the rasterizer adds, whichever of the three it completes.
+// Points and lines (sprites and widths reach past their vertices) and
+// tessellated draws keep the scissor's rectangle.
+void Impl::draw_reach(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                      uint32_t primitive, bool tessellated, const VkViewport &viewport, const VkRect2D &scissor,
+                      std::vector<Reach> &reach) const {
+    reach.clear();
+    std::vector<ScreenVertex> &screen = reach_vertices_;
+    const uint32_t left = uint32_t(scissor.offset.x), top = uint32_t(scissor.offset.y);
+    const uint32_t right = left + scissor.extent.width;
+    const uint32_t bottom =
+        std::min(top + scissor.extent.height, draw_max_y(vs, constants, indices, primitive, tessellated, &screen));
+    const Reach all{left, top, right, bottom};
+    const bool polygons = (primitive >= 4 && primitive <= 8) || (primitive >= 13 && primitive <= 15);
+    if (!reach_tiles_ || !polygons || bottom <= top || right <= left) return reach.push_back(all);
+    // A box of screen positions (in the console's pixels, the window offset
+    // and the pixel centers' half added) as the pixels with a sample inside
+    // it, within the scissor; nothing when the box is not finite. A host
+    // pixel's samples are at least a sixteenth of it from its edges (the
+    // standard positions and the Xenos's), and the host's own vertices are
+    // taken to be within a 512th of a host pixel (the rasterizer's snapping)
+    // and a 1024th of a console pixel (the arithmetic) of these: so a pixel
+    // the box enters by less than `inside` has no sample in it, and an edge
+    // on a pixel boundary (a clear's, a viewport's) takes no pixel beyond.
+    // Polygons drawn as lines or points (the polygon mode) reach a pixel
+    // past their edges.
+    const double inside = (1.0 / 16.0 - 1.0 / 512.0) / double(scale_.factor()) - 1.0 / 1024.0;
+    const double past = primitive != 8 && ((regs_[r::PA_SU_SC_MODE_CNTL] >> 3) & 3) == 1 ? 1.0 : 0.0;
+    auto add = [&](double x0, double y0, double x1, double y1) {
+        if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) || !std::isfinite(y1) || !(inside > 0.0))
+            return false;
+        Reach r = all;
+        r.x0 = uint32_t(std::clamp(std::floor(x0 + inside - past), double(left), double(right)));
+        r.y0 = uint32_t(std::clamp(std::floor(y0 + inside - past), double(top), double(bottom)));
+        r.x1 = uint32_t(std::clamp(std::ceil(x1 - inside + past), double(left), double(right)));
+        r.y1 = uint32_t(std::clamp(std::ceil(y1 - inside + past), double(top), double(bottom)));
+        reach.push_back(r);
+        return true;
+    };
+    if (!((regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1)) {
+        if (!add(viewport.x, viewport.y, double(viewport.x) + viewport.width, double(viewport.y) + viewport.height))
+            reach.push_back(all);
+        return;
+    }
+    if (tessellated) return reach.push_back(all);
+    // (draw_max_y ran the shader only where there is no scissor)
+    if (screen.empty() && indices.size() <= 12) vertex_max_y(vs, constants, indices, primitive, &screen);
+    if (screen.empty()) return reach.push_back(all);
+    double add_x = 0.0, add_y = 0.0;
+    if (!(regs_[r::PA_SU_VTX_CNTL] & 1)) add_x += 0.5, add_y += 0.5;
+    if ((regs_[r::PA_SU_SC_MODE_CNTL] >> 16) & 1) {
+        const uint32_t window = regs_[r::PA_SC_WINDOW_OFFSET];
+        add_x += sign_extend(window & 0x7FFF, 15), add_y += sign_extend((window >> 16) & 0x7FFF, 15);
+    }
+    if (primitive == 8 && indices.size() <= 12 && indices.size() % 3 == 0) {
+        // a box a rectangle (vertex_max_y's vertices are the indices
+        // clamped as the draw's, sorted)
+        const uint32_t min_index = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, max_index = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
+        bool each = true;
+        for (size_t k = 0; k < indices.size() && each; k += 3) {
+            double x[3], y[3];
+            for (size_t i = 0; i < 3 && each; i++) {
+                const uint32_t index = std::min(max_index, std::max(min_index, indices[k + i] & 0xFFFFFF));
+                auto at = std::lower_bound(screen.begin(), screen.end(), index,
+                                           [](const ScreenVertex &v, uint32_t value) { return v.index < value; });
+                if (indices[k + i] == UINT32_MAX || at == screen.end() || at->index != index) each = false;
+                else x[i] = at->x + add_x, y[i] = at->y + add_y;
+            }
+            if (!each) break;
+            // The fourth corner mirrors the vertex opposite the longest edge
+            // (rectangle_list.geom). Three corners of an axis-aligned box:
+            // the diagonal is the longest however the axes are scaled, and
+            // the fourth is the box's. Else opposite any of the three.
+            const double bx0 = std::min({x[0], x[1], x[2]}), bx1 = std::max({x[0], x[1], x[2]});
+            const double by0 = std::min({y[0], y[1], y[2]}), by1 = std::max({y[0], y[1], y[2]});
+            uint32_t corners = 0;
+            for (int i = 0; i < 3; i++)
+                if ((x[i] == bx0 || x[i] == bx1) && (y[i] == by0 || y[i] == by1))
+                    corners |= 1u << ((x[i] == bx1 ? 1 : 0) | (y[i] == by1 ? 2 : 0));
+            if (std::popcount(corners) == 3 && bx1 > bx0 && by1 > by0) {
+                each = add(bx0, by0, bx1, by1);
+                continue;
+            }
+            const double fx[3] = {x[1] + x[2] - x[0], x[0] + x[2] - x[1], x[0] + x[1] - x[2]};
+            const double fy[3] = {y[1] + y[2] - y[0], y[0] + y[2] - y[1], y[0] + y[1] - y[2]};
+            each = add(std::min({bx0, fx[0], fx[1], fx[2]}), std::min({by0, fy[0], fy[1], fy[2]}),
+                       std::max({bx1, fx[0], fx[1], fx[2]}), std::max({by1, fy[0], fy[1], fy[2]}));
+        }
+        if (each) return;
+        reach.clear();
+        // (a killed vertex or a position that is not finite: the scissor's)
+        return reach.push_back(all);
+    }
+    if (primitive == 8) return reach.push_back(all);
+    double x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+    for (const ScreenVertex &v : screen) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y)) return reach.push_back(all);
+        x0 = std::min(x0, double(v.x)), x1 = std::max(x1, double(v.x));
+        y0 = std::min(y0, double(v.y)), y1 = std::max(y1, double(v.y));
+    }
+    if (!add(x0 + add_x, y0 + add_y, x1 + add_x, y1 + add_y)) reach.push_back(all);
+}
+
+// Beyond Xenia: whether a draw is the console's clear of its depth target,
+// one rectangle that writes the depth and the stencil of every sample it
+// covers whatever they held, and which pixels and word then. Only what is
+// certain: anything else answers no (`why`), and the draw's tiles are
+// transferred as always.
+// - one rectangle (a rectangle list of three vertices), not tessellated, not
+//   predicated on a VIZ query nor a survey draw, no user clip planes, no
+//   vertex kill;
+// - the depth test on, always passing and written; the stencil test on,
+//   always passing, replacing (or zeroing) with the whole write mask, so
+//   that no bit of the old word is left;
+// - nothing in the pixel shader that drops a sample: no kill, no oDepth, no
+//   alpha test other than always, no alpha to coverage;
+// - the vertex shader run on the CPU (as draw_max_y's) gives three corners
+//   of an axis-aligned rectangle with W 1 and one Z; the pixels are those
+//   wholly inside it, the scissor and the viewport (a thirty-second of a
+//   pixel of slack: sample positions are no nearer than a sixteenth to a
+//   pixel's edge), so every sample of them at any sample count and
+//   resolution scale;
+// - the word is known where the host's depth is one value whatever the
+//   order and the contraction of the operations that make it (each
+//   intermediate exact as a float: the clears' 0 and 1 are), with no polygon
+//   offset, and it is the target's own encoding of a guest word (a 24-bit
+//   unorm host depth rounds without doubt; a float one is exactly the
+//   word's value).
+Impl::DepthOverwrite Impl::depth_overwrite(const gpu::Draw &d, const Shader &vs, const Shader *ps,
+                                           const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                                           uint32_t depth_control, const RenderTarget &depth, const VkViewport &viewport,
+                                           const float *ndc_scale, const float *ndc_offset, const VkRect2D &scissor,
+                                           const char *&why) const {
+    DepthOverwrite o;
+    auto no = [&](const char *reason) { return why = reason, o; };
+    if (indices.size() != 3) return no("not one rectangle");
+    if ((d.viz_query & 0x100) || viz_predicate_ != UINT32_MAX || (regs_[reg::PA_SC_VIZ_QUERY] & 1))
+        return no("a VIZ query");
+    const uint32_t clip = regs_[r::PA_CL_CLIP_CNTL], vte = regs_[r::PA_CL_VTE_CNTL];
+    const bool clipping = !((clip >> 16) & 1);
+    if (clipping && (clip & 0x3F)) return no("user clip planes");
+    if ((depth_control & 0x76) != 0x76) return no("depth not always written");
+    // stencil: on, always, the pass operation replace (2) or zero (1), every bit written
+    const uint32_t stencil_state = regs_[r::RB_STENCILREFMASK];
+    const uint32_t pass = (depth_control >> 14) & 7;
+    if (!(depth_control & 1)) return no("stencil kept");
+    if (((depth_control >> 8) & 7) != 7 || (pass != 1 && pass != 2) || ((stencil_state >> 16) & 0xFF) != 0xFF)
+        return no("stencil not replaced");
+    // (the back face's own state, which the rectangle's triangles may take: the same)
+    if (((depth_control >> 7) & 1) && (((depth_control >> 20) & 0xFFF) != ((depth_control >> 8) & 0xFFF) ||
+                                       ((regs_[r::RB_STENCILREFMASK_BF] ^ stencil_state) & 0xFFFFFF)))
+        return no("stencil not replaced");
+    const uint32_t stencil = pass == 2 ? stencil_state & 0xFF : 0;
+    if (ps) {
+        const uint32_t color_control = regs_[r::RB_COLORCONTROL];
+        if (ps->summary.kills || ps->writes_depth) return no("the pixel shader kills or writes depth");
+        if (((color_control & 8) && (color_control & 7) != 7) || (color_control & 16)) return no("alpha test or alpha to coverage");
+    }
+    if (depth.format == 1 && options_.depth_float24_convert_in_pixel_shader) return no("depth converted in the pixel shader");
+    if (vs.fetches_textures || vs.writes_vertex_kill || !vs.writes_position_y || !vs.writes_position_w ||
+        vs.writes_position_xz != 5)
+        return no("the vertex shader");
+    // the three corners on the screen, in the console's pixels, as the
+    // host's vertex shader and viewport place them
+    const uint32_t min_index = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, max_index = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
+    std::span<const uint8_t> memory(memory_.data(), GuestMemory::SIZE);
+    harness::CaseInput input{};
+    harness::CaseOutput output;
+    std::string unsupported;
+    double x[3], y[3];
+    float z = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        if (indices[i] == UINT32_MAX) return no("not one rectangle");
+        input.registers[0][0] = float(std::min(max_index, std::max(min_index, indices[i] & 0xFFFFFF)));
+        if (!shader::interpret(vs.parsed, input, constants, memory, output, unsupported)) return no("the vertex shader");
+        // (W 1, given as W or as 1/W: the position's formats change nothing then)
+        if (output.position[3] != 1.0f) return no("W is not 1");
+        if (i && std::bit_cast<uint32_t>(output.position[2]) != std::bit_cast<uint32_t>(z)) return no("Z is not one value");
+        z = output.position[2];
+        const double ndc_x = double(output.position[0]) * ndc_scale[0] + ndc_offset[0];
+        const double ndc_y = double(output.position[1]) * ndc_scale[1] + ndc_offset[1];
+        x[i] = viewport.x + (ndc_x + 1.0) * 0.5 * viewport.width;
+        y[i] = viewport.y + (ndc_y + 1.0) * 0.5 * viewport.height;
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i])) return no("the vertex shader");
+    }
+    (void)vte;
+    double x0 = std::min({x[0], x[1], x[2]}), x1 = std::max({x[0], x[1], x[2]});
+    double y0 = std::min({y[0], y[1], y[2]}), y1 = std::max({y[0], y[1], y[2]});
+    // three different corners of that box: the fourth is the rectangle's
+    uint32_t corners = 0;
+    for (int i = 0; i < 3; i++) {
+        if ((x[i] != x0 && x[i] != x1) || (y[i] != y0 && y[i] != y1)) return no("not axis-aligned");
+        corners |= 1u << ((x[i] == x1 ? 1 : 0) | (y[i] == y1 ? 2 : 0));
+    }
+    if (std::popcount(corners) != 3 || !(x1 > x0) || !(y1 > y0)) return no("not axis-aligned");
+    if (clipping) {
+        // (clipped to the viewport)
+        x0 = std::max(x0, double(viewport.x)), x1 = std::min(x1, double(viewport.x) + viewport.width);
+        y0 = std::max(y0, double(viewport.y)), y1 = std::min(y1, double(viewport.y) + viewport.height);
+    }
+    const double slack = 1.0 / 32.0;
+    const double left = std::max(std::ceil(x0 - slack), double(scissor.offset.x));
+    const double top = std::max(std::ceil(y0 - slack), double(scissor.offset.y));
+    const double right = std::min(std::floor(x1 + slack), double(scissor.offset.x) + scissor.extent.width);
+    const double bottom = std::min(std::floor(y1 + slack), double(scissor.offset.y) + scissor.extent.height);
+    if (!(left >= 0.0 && top >= 0.0 && right > left && bottom > top && right <= 16384.0 && bottom <= 16384.0))
+        return no("covers nothing");
+    // the host's depth: z * scale + offset, then the viewport's range, each
+    // step exact (so the same however it is computed)
+    auto exact = [](double v) { return double(float(v)) == v; };
+    const double z_scaled = double(z) * ndc_scale[2], z_ndc = z_scaled + ndc_offset[2];
+    const double range = double(viewport.maxDepth) - viewport.minDepth, z_ranged = z_ndc * range;
+    double host = z_ranged + viewport.minDepth;
+    const bool known = exact(z_scaled) && exact(z_ndc) && exact(range) && exact(z_ranged) && exact(host);
+    const double low = std::min(viewport.minDepth, viewport.maxDepth), high = std::max(viewport.minDepth, viewport.maxDepth);
+    if (clipping) {
+        // inside the clip volume, or the rectangle is clipped away (or its
+        // depth is not known to be inside)
+        if (!known || !(z_ndc >= 0.0 && z_ndc <= 1.0)) return no("the depth may be clipped");
+    } else {
+        host = std::min(std::max(host, low), high); // (the depth clamp)
+    }
+    o.whole = true;
+    o.x0 = uint32_t(left), o.y0 = uint32_t(top), o.x1 = uint32_t(right), o.y1 = uint32_t(bottom);
+    why = "the depth is not one known word";
+    if (!known || !(host >= 0.0 && host <= 1.0)) return o;
+    // no polygon offset (a rectangle's is the front's, with the offset of
+    // points and lines enabled)
+    if ((regs_[r::PA_SU_SC_MODE_CNTL] >> 13) & 1) {
+        const float *offsets = reinterpret_cast<const float *>(&regs_[r::PA_SU_POLY_OFFSET_FRONT_SCALE]);
+        if (offsets[0] != 0.0f || offsets[1] != 0.0f) return o;
+    }
+    uint32_t d24;
+    if (depth.format == 0) {
+        const double scaled = host * 16777215.0;
+        d24 = uint32_t(std::llround(scaled));
+        if (std::fabs(scaled - double(d24)) > 1.0 / 64.0) return o;
+    } else {
+        d24 = float_to_float24(float(host * 2.0), options_.depth_float24_round);
+    }
+    const uint32_t word = d24 << 8 | stencil;
+    // (a float host depth holds the draw's value itself, which transfers keep)
+    if (depth.image.format != VK_FORMAT_D24_UNORM_S8_UINT && double(depth_clear_value(depth.format, word).depthStencil.depth) != host)
+        return o;
+    o.constant = true, o.word = word;
+    why = nullptr;
+    return o;
 }
 
 // A draw outside copy mode, as the processor gives it (immediate indices in
@@ -7732,11 +8189,55 @@ void Impl::draw(const gpu::Draw &d) {
     // the targets take over the EDRAM tiles down to the lowest row the draw
     // can reach (draw_max_y), within the scissor
     {
-        uint32_t rows = std::min(scissor.offset.y + scissor.extent.height,
-                                 draw_max_y(*vs, last_constants_[0], indices, primitive, tessellated));
+        // (the tiles under the pixels the draw can reach, draw_reach; with
+        // XF_DRAW_REACH=rows every tile of the rows from the first down to
+        // the lowest, as Xenia takes them)
+        draw_reach(*vs, last_constants_[0], indices, primitive, tessellated, viewport.viewport, scissor, reach_);
+        auto take = [&](RenderTarget *t, const DepthOverwrite *overwritten) {
+            std::vector<TileRect> &rects = reach_rects_;
+            rects.clear();
+            for (const Reach &r : reach_) {
+                TileRect tiles = tiles_of(*t, r.x0, r.y0, r.x1, r.y1);
+                if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
+                if (!reach_tiles_) tiles.c0 = 0, tiles.c1 = t->pitch_tiles, tiles.r0 = 0;
+                rects.push_back(tiles);
+            }
+            acquire(t, std::span<const TileRect>(rects), overwritten);
+            for (TileRect tiles : rects) {
+                if (!reach_tiles_) tiles.r0 = uint32_t(scissor.offset.y) / t->tile_height;
+                tiles_drawn(*t, tiles);
+            }
+        };
         for (RenderTarget *t : colors)
-            if (t) acquire(t, rows), tiles_drawn(*t, uint32_t(scissor.offset.y), rows);
-        if (depth) acquire(depth, rows), tiles_drawn(*depth, uint32_t(scissor.offset.y), rows);
+            if (t) take(t, nullptr);
+        if (depth) {
+            // the console's clear of the depth target (depth_overwrite): the
+            // tiles it overwrites are taken without their transfer, and hold
+            // a clear's value after it where it writes one word
+            DepthOverwrite over;
+            if (rectangles && !export_only && (overwrite_transfers_ || draw_clears_) && (depth_control & 0x76) == 0x76) {
+                const char *why = nullptr;
+                over = depth_overwrite(d, *vs, ps, last_constants_[0], indices, depth_control, *depth, viewport.viewport,
+                                       viewport.ndc_scale, viewport.ndc_offset, scissor, why);
+                if (options_.verbose)
+                    std::fprintf(stderr, "  draw %llu: a depth rectangle, %s%s (%u, %u)-(%u, %u) word %08X\n",
+                                 (unsigned long long)report_.draws, over.whole ? "overwrites" : "not an overwrite: ",
+                                 why ? why : "", over.x0, over.y0, over.x1, over.y1, over.word);
+            }
+            take(depth, overwrite_transfers_ && over.whole ? &over : nullptr);
+            if (draw_clears_ && over.constant && fatal_.empty()) {
+                const VkClearValue value = depth_clear_value(depth->format, over.word);
+                const uint32_t tiles = std::min(depth->height / depth->tile_height * depth->pitch_tiles, EDRAM_TILES);
+                bool any = false;
+                for (uint32_t k = 0; k < tiles; k++) {
+                    const uint32_t tile = (depth->base + k) % EDRAM_TILES;
+                    if (owners_[tile] != depth || !tile_within(*depth, tile, over)) continue;
+                    tile_cleared_[tile] = 1, tile_clear_value_[tile] = value, tile_clear_word_[tile] = over.word;
+                    any = true;
+                }
+                if (any) cleared_epoch_++;
+            }
+        }
         if (!fatal_.empty()) return;
     }
     System sys{};
@@ -8840,6 +9341,7 @@ void Impl::resolve() {
                                            row * t->tile_height >= y && (row + 1) * t->tile_height <= y1;
                         tile_cleared_[tile] = whole;
                         if (whole) tile_clear_value_[tile] = clear.clearValue, cleared_epoch_++;
+                        if (whole && t->depth) tile_clear_word_[tile] = regs_[r::RB_DEPTH_CLEAR];
                     }
             }
             // kept for the target's next render pass, whose draws need it
