@@ -10,6 +10,7 @@
 #include "../frontend/launcher_html.h"
 #include "../frontend/launcher_model.h"
 #include "../frontend/prepare_job.h"
+#include "../frontend/pointer_hider.h"
 #include "../frontend/presenter.h"
 #include "../frontend/library.h"
 #include "../frontend/sdl_audio.h"
@@ -33,6 +34,19 @@
 using namespace xf;
 
 int main() {
+    // the pointer over the game's picture: gone after 2 s at rest (windowed), at once in fullscreen, back on a move, and
+    // always there for the overlay, the guide and the dialogs
+    {
+        frontend::PointerHider p;
+        p.moved(10000);
+        CHECK(p.visible(10500, false, false));
+        CHECK(!p.visible(12100, false, false));
+        CHECK(p.visible(12100, true, false));
+        CHECK(p.visible(10100, false, true));
+        CHECK(!p.visible(10300, false, true));
+        p.moved(20000);
+        CHECK(p.visible(20001, false, false));
+    }
     // the settings
     std::error_code ec;
     std::filesystem::path dir = std::filesystem::temp_directory_path(ec) / "xenoforge_frontend_test";

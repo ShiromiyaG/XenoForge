@@ -46,6 +46,7 @@
 #include "library.h"
 #include "window_icon.h"
 #include "overlay_system.h"
+#include "pointer_hider.h"
 #include "profiles.h"
 #include "settings.h"
 #include "system_ui_view.h"
@@ -433,6 +434,8 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             std::fprintf(stderr, "player: no Inter fonts beside the executable (ui/fonts); the overlay's own font\n");
         ImGui::GetIO().FontGlobalScale = 1.0f / font_scale;
     }
+    // the pointer is ours (frontend/pointer_hider.h): ImGui's backend must not show it again each frame
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui_ImplSDL3_InitForVulkan(window);
     VkFormat format = presenter.format();
     ImGui_ImplVulkan_InitInfo info{};
@@ -601,6 +604,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     // drawn again: shown, uncovered, resized, moved to another display (redraw), or the overlay or dialog it showed
     // last is gone (drew_extra). A guest that stops swapping leaves the window still, as Xenia's presenter does.
     bool redraw = true, drew_extra = false;
+    frontend::PointerHider pointer;
+    bool pointer_shown = true;
+    pointer.moved(SDL_GetTicks()); // shown at the start, as a window opens with its pointer over it
     uint64_t swaps_before = 0, presented_before = 0, refreshes_before = 0, sound_before = 0, states_before = 0;
     uint64_t taken_before = 0;
     game::Rates rate_log;
@@ -672,6 +678,8 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                 if (e.key.scancode == SDL_SCANCODE_F6 && native::has_output_renderer()) native::toggle();
                 if (e.key.scancode == SDL_SCANCODE_F9) game::poll_port_module(g, true); // the port's hooks reloaded
             }
+            if (e.type == SDL_EVENT_MOUSE_MOTION || e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_WHEEL)
+                pointer.moved(SDL_GetTicks());
             ImGui_ImplSDL3_ProcessEvent(&e);
         }
         const bool focused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
@@ -699,6 +707,17 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             ImGuiIO &io = ImGui::GetIO();
             if (guide_open) io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard;
             else io.ConfigFlags &= ~(ImGuiConfigFlags_NavEnableGamepad | ImGuiConfigFlags_NavEnableKeyboard);
+        }
+        {
+            // the pointer: over the game's picture it rests hidden; the overlay, the guide and the dialogs get it
+            const bool full = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
+            const bool show = pointer.visible(SDL_GetTicks(), overlay || dialog_up || guide_open, full);
+            if (show != pointer_shown) {
+                pointer_shown = show;
+                std::printf("player: pointer %s at %.1f s\n", show ? "shown" : "hidden", double(SDL_GetTicks()) / 1000.0);
+                if (show) SDL_ShowCursor();
+                else SDL_HideCursor();
+            }
         }
         controllers.set_taken(dialog_up || guide_open);
         controllers.read_keyboard(focused, overlay || dialog_up || guide_open);
