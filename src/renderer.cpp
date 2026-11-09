@@ -1614,11 +1614,39 @@ private:
         if (trace_)
             for (auto [start, end] : ranges) trace_->read(start, end - start);
     }
+    // every way the renderer's commands write memory, and read it (full_barrier):
+    // shaders, attachments, transfers, uniform, index and vertex buffers. No
+    // draw or dispatch is indirect; the conditional rendering's predicate
+    // has its own barrier where it is written (viz_end).
+    static constexpr VkAccessFlags2 BARRIER_WRITES =
+        VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    static constexpr VkAccessFlags2 BARRIER_READS =
+        VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
+        VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+    static inline const bool barrier_generic_ = [] {
+        const char *v = std::getenv("XF_BARRIER_ACCESSES");
+        return v && std::string(v) == "generic";
+    }();
     static void full_barrier(VkCommandBuffer cmd) {
+        // Everything the GPU wrote, seen by everything the GPU does next. The
+        // accesses are named one by one: the generic MEMORY_READ covers reads
+        // nothing here makes after most barriers (indirect commands, the
+        // conditional rendering's predicate, the host's), and a barrier whose
+        // destination has the first two makes the NVIDIA driver stall the
+        // GPU: 2 to 7 us each against under 1 us for these (docs/renderer.md,
+        // "The barriers' accesses"). What the host reads is covered once, at
+        // the submission's end (flush). XF_BARRIER_ACCESSES=generic: as before.
         VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        if (barrier_generic_) {
+            b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        } else {
+            b.srcAccessMask = BARRIER_WRITES;
+            b.dstAccessMask = BARRIER_WRITES | BARRIER_READS;
+        }
         VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         dep.memoryBarrierCount = 1;
         dep.pMemoryBarriers = &b;
@@ -1794,6 +1822,20 @@ private:
                                       VK_QUERY_RESULT_WAIT_BIT);
         }
         full_barrier(c);
+        if (!barrier_generic_) {
+            // the predicate's word for the draws predicated on it: the one
+            // read full_barrier's accesses leave out (a barrier that names it
+            // makes the driver wait for the GPU, so only here, where it is written)
+            VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
+            b.dstAccessMask = VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT;
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(c, &dep);
+        }
         q.armed = true;
         report_.viz_armed++;
     }
@@ -3305,6 +3347,19 @@ void Impl::flush() {
     if (s.queries && !s.marks.empty()) {
         vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.queries, uint32_t(s.marks.size()));
         s.marks.push_back(GPU_END);
+    }
+    if (!barrier_generic_) {
+        // what the submission wrote, for the host's reads once it is done (the
+        // read-backs' buffers): full_barrier's accesses leave the host's out
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = BARRIER_WRITES;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(s.cmd, &dep);
     }
     vkEndCommandBuffer(s.cmd);
     s.recording = false;
