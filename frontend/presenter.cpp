@@ -10,11 +10,40 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace xf::frontend {
 
 namespace {
+
+// xfbench --self (tools/bench/xfbench.cpp): the time of each present, as its
+// Vulkan layer would record it (a QueryPerformanceCounter value, 8 bytes,
+// appended to XF_BENCH_LOG), written by the player itself so that no layer
+// sits between it and the driver while it is measured
+void bench_present() {
+#ifdef _WIN32
+    static std::once_flag once;
+    static FILE *log = nullptr;
+    std::call_once(once, [] {
+        const char *self = std::getenv("XF_BENCH_SELF"), *path = std::getenv("XF_BENCH_LOG");
+        if (self && std::string(self) == "1" && path) log = std::fopen(path, "ab");
+    });
+    if (!log) return;
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    std::fwrite(&t.QuadPart, sizeof(t.QuadPart), 1, log);
+    std::fflush(log);
+#endif
+}
 
 const uint32_t FRONT_BUFFER[] = {
 #include "front_buffer.comp.inc"
@@ -820,6 +849,7 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
             return false;
         }
         r = vkQueuePresentKHR(queue(), &pi);
+        bench_present();
     }
     present_seconds += std::chrono::duration<double>(Clock::now() - t2).count();
     if (grab) {

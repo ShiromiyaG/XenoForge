@@ -15,12 +15,15 @@
 // its 5th and 95th percentiles, GPU ms a frame and a second by engine type,
 // CPU seconds a second.
 //
-// xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--gaps] [--vk | --dxgi] [--stdout <file>] [--label L]
+// xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--gaps] [--vk | --dxgi | --self] [--stdout <file>] [--label L]
 //         -- <program> [args...]
 //
 // --step: how often the GPU and CPU times are sampled (5 s); --timeline
 // prints each step's presents a second and GPU time, to find a run's phases.
 // --gaps lists every gap between presents over 100 ms with when it ended.
+// --self: the program records its own presents (XenoForge's player, with
+// XF_BENCH_SELF=1), so no layer sits in it: --vk's layer slowed and froze
+// the player in some scenes (a game's drive), which the player alone does not.
 //
 // Windows only, as is Xenia.
 
@@ -142,7 +145,7 @@ double percentile(std::vector<double> v, double p) {
 
 int main(int argc, char **argv) {
     double seconds = 60, warmup = 20, step = 5;
-    bool vk = false, dxgi = false, timeline = false, gaps = false;
+    bool vk = false, dxgi = false, self_timed = false, timeline = false, gaps = false;
     std::string stdout_file, label = "run";
     int first = 0;
     for (int i = 1; i < argc; i++) {
@@ -161,6 +164,8 @@ int main(int argc, char **argv) {
             vk = true;
         else if (a == "--dxgi")
             dxgi = true;
+        else if (a == "--self")
+            self_timed = true;
         else if (a == "--stdout" && i + 1 < argc)
             stdout_file = argv[++i];
         else if (a == "--label" && i + 1 < argc)
@@ -171,7 +176,7 @@ int main(int argc, char **argv) {
         }
     }
     if (!first || first >= argc || warmup >= seconds) {
-        std::fprintf(stderr, "usage: xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--gaps] [--vk | --dxgi] [--stdout <file>] "
+        std::fprintf(stderr, "usage: xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--gaps] [--vk | --dxgi | --self] [--stdout <file>] "
                              "[--label L] -- <program> [args...]\n");
         return 2;
     }
@@ -186,6 +191,9 @@ int main(int argc, char **argv) {
         std::filesystem::path(temp) / ("xfbench_" + std::to_string(GetCurrentProcessId()) + ".presents");
     std::filesystem::remove(log);
     SetEnvironmentVariableW(L"XF_BENCH_LOG", log.wstring().c_str());
+    // --self: the program records its presents itself (XenoForge's player),
+    // with no layer or hook in it
+    if (self_timed) SetEnvironmentVariableW(L"XF_BENCH_SELF", L"1");
     if (vk) {
         // the layer's manifest (xfbench_hook.json) is beside the DLL
         SetEnvironmentVariableW(L"VK_ADD_LAYER_PATH", dir.wstring().c_str());

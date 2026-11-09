@@ -14,8 +14,8 @@
 # (any 25% step), Xenia through draw_resolution_scale_x/y (whole multiples:
 # 200, 300).
 #
-# -Ours is a player (player_<game> or player with --cache); it runs with the
-# Vulkan layer of xfbench_hook, Xenia with the DXGI hook. Disc paths stay on
+# -Ours is a player (player_<game> or player with --cache); it records its own
+# presents (xfbench --self: no layer in it), Xenia runs with the DXGI hook. Disc paths stay on
 # the command line: nothing here names a game.
 
 param(
@@ -91,7 +91,7 @@ for ($run = 1; $run -le $Runs; $run++) {
         }
         switch ($kind) {
             { $_ -in 'ours', 'ours-host' } {
-                $line = & $Bench --seconds $Seconds --warmup $Warmup --vk @extra --stdout "$Out.$config.$run.log" --label $label -- $Ours $Disc @OursArgs
+                $line = & $Bench --seconds $Seconds --warmup $Warmup --self @extra --stdout "$Out.$config.$run.log" --label $label -- $Ours $Disc @OursArgs
             }
             'xenia-d3d12' {
                 $line = & $Bench --seconds $Seconds --warmup $Warmup --dxgi @extra --label $label -- $Xenia --gpu=d3d12 @xeniaScale $Disc
