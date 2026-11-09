@@ -473,9 +473,12 @@ if(XF_PLAYER AND TARGET boot)
     add_custom_command(TARGET launcher POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${XF_UI_ASSETS}/assets $<TARGET_FILE_DIR:launcher>/ui
         COMMAND ${CMAKE_COMMAND} -E copy_directory ${XF_UI_ASSETS}/fonts $<TARGET_FILE_DIR:launcher>/ui/fonts
+        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_SOURCE_DIR}/assets/branding/xenoforge-256.png $<TARGET_FILE_DIR:launcher>/ui/xenoforge.png
         COMMENT "the launcher's windows, fonts and icons")
     install(DIRECTORY ${XF_UI_ASSETS}/assets/ DESTINATION ui)
     install(DIRECTORY ${XF_UI_ASSETS}/fonts/ DESTINATION ui/fonts)
+    # the mark the pages draw: the one logo (assets/branding), not a copy kept in the interface's folder
+    install(FILES assets/branding/xenoforge-256.png DESTINATION ui RENAME xenoforge.png)
     # the settings file, the sound's fold to stereo, the scripted presses
     add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
     target_link_libraries(frontend_test PRIVATE xf_ui xf_frontend xenoforge_kernel xenoforge_vk)

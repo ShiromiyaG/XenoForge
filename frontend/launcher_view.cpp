@@ -78,6 +78,12 @@ bool LauncherView::load(Rml::Context *context, const std::filesystem::path &asse
         if (!renderer_.add_image(name, std::vector<uint8_t>(png.begin(), png.end())))
             std::fprintf(stderr, "launcher: no button picture %s\n", file.c_str());
     }
+    // XenoForge's mark, from the one logo (assets/branding, copied beside the pages by the build)
+    {
+        const std::string png = read_text(assets_ / "xenoforge.png");
+        if (!renderer_.add_image("xenoforge", std::vector<uint8_t>(png.begin(), png.end())))
+            std::fprintf(stderr, "launcher: no mark picture xenoforge.png\n");
+    }
     if (rml_template_.empty() || rcss_template_.size() < 2) return error = "no launcher.rml or its stylesheets in " + assets_.string(), false;
     return build_document(error);
 }

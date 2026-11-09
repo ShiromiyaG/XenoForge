@@ -6,7 +6,7 @@
 <body>
     <div id="app">
         <div id="header">
-            <div id="brand"><div class="mark"><div class="mark-core"></div></div></div>
+            <div id="brand"><div class="mark"></div></div>
             <div id="nav">
                 <div class="nav f on" id="nav-games" data-action="library">games</div>
                 <div class="nav f" id="nav-settings" data-action="settings">settings</div>

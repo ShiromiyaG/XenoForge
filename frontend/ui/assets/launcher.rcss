@@ -40,9 +40,7 @@ body { background-color: transparent; }
     decorator: linear-gradient(90deg, {hd-a}, {hd-b} 45%, {hd-c});
 }
 #brand { flex: 0 0 236dp; font-weight: 300; font-size: 29dp; line-height: 1; color: {hd-text}; white-space: nowrap; }
-/* the same diamond as the About dialog's, with the header's own colour in its core */
 #brand .mark { width: 42dp; height: 42dp; margin: 0 0 0 14dp; }
-#brand .mark-core { left: 13dp; top: 13dp; width: 16dp; height: 16dp; background-color: {mark-core}; }
 #nav { flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; }
 .nav {
     padding: 0 17dp; font-weight: 300; font-size: 29.5dp; line-height: 1; white-space: nowrap;
@@ -335,11 +333,8 @@ body { background-color: transparent; }
 /* ------------------------------------------------------------ about dialog */
 
 .about-head { display: flex; flex-direction: row; align-items: center; margin-bottom: 12dp; }
-.mark {
-    width: 38dp; height: 38dp; border-radius: 9dp; margin: 0 16dp 0 4dp; transform: rotate(45deg);
-    decorator: linear-gradient(135deg, {accent-hi}, {accent-lo});
-}
-.mark-core { position: absolute; left: 12dp; top: 12dp; width: 14dp; height: 14dp; border-radius: 3dp; background-color: {dialog}; }
+/* XenoForge's mark (assets/branding, registered as mem:xenoforge by the view) */
+.mark { width: 44dp; height: 44dp; margin: 0 14dp 0 2dp; decorator: image(mem:xenoforge contain); }
 .about-name { font-size: 18dp; font-weight: 700; }
 .about-ver { color: {text-2}; font-size: 12dp; }
 .about-text { margin-bottom: 10dp; }
@@ -397,7 +392,6 @@ body { background-color: transparent; }
 .about-note { background-color: {dlg-soft}; color: {dlg-text-2}; }
 .lic { border-bottom: 1dp {dlg-line}; }
 .lic-tag { border-color: {dlg-btn-border}; }
-.mark-core { background-color: {dlg-bg}; }
 .stage .bar, .pbar { background-color: {dlg-line}; }
 .stage .nm, .prep-file { color: {dlg-text-3}; }
 .stage.now .nm, .errbox, .log .l.head { color: {dlg-text}; }

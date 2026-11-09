@@ -260,7 +260,7 @@ std::string about_body_html() {
         return std::string("<div class=\"lic\"><div class=\"lic-top\"><div class=\"lic-name\">") + name + "</div><div class=\"lic-tag\">" + license +
                "</div></div><div class=\"lic-text\">" + text + "</div></div>";
     };
-    std::string s = "<div class=\"about-head\"><div class=\"mark\"><div class=\"mark-core\"></div></div><div><div class=\"about-name\">XenoForge</div>"
+    std::string s = "<div class=\"about-head\"><div class=\"mark\"></div><div><div class=\"about-name\">XenoForge</div>"
                     "<div class=\"about-ver\">Pre-release build, " __DATE__ "</div></div></div>";
     s += "<div class=\"about-text\">A lean Xbox 360 system for statically recompiled games. Your discs are prepared into game libraries on this "
          "computer, once, and played from there.</div>";
