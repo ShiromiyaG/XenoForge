@@ -4,9 +4,9 @@
 // fetch constant; level 0, its first slice, with the constant's swizzle
 // applied, as a shader would see it. The resolves on the way are read
 // (resolve.h) and listed. What could not be decoded is listed with the
-// reason.
+// reason. --levels writes every level the constant gives, each its own PNG.
 //
-//   xftexture <trace.xtr> -o <folder>
+//   xftexture <trace.xtr> -o <folder> [--levels]
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
@@ -189,29 +189,45 @@ private:
             unsupported_[why]++;
             return;
         }
-        std::vector<uint8_t> rgba = texture::to_rgba8(image, image.levels[0].empty() ? 1 : 0);
-        uint32_t level = image.levels[0].empty() ? 1 : 0;
-        uint32_t w = std::max(image.width >> level, 1u), h = std::max(image.height >> level, 1u);
-        // the swizzle: per component x y z w 0 1
-        for (size_t i = 0; i < rgba.size(); i += 4) {
-            uint8_t c[4] = {rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]};
-            for (int k = 0; k < 4; k++) {
-                uint32_t s = (info.swizzle >> (3 * k)) & 7;
-                rgba[i + k] = s < 4 ? c[s] : s == 4 ? 0 : 255;
+        // the first level the constant gives, or with --levels every one
+        // (each its own PNG, _L<n> in the name)
+        const uint32_t first = image.levels[0].empty() ? 1 : 0;
+        const uint32_t last = all_levels_ ? uint32_t(image.levels.size()) - 1 : first;
+        std::string written;
+        for (uint32_t level = first; level <= last; level++) {
+            std::vector<uint8_t> rgba = texture::to_rgba8(image, level);
+            uint32_t w = std::max(image.width >> level, 1u), h = std::max(image.height >> level, 1u);
+            // the swizzle: per component x y z w 0 1
+            for (size_t i = 0; i < rgba.size(); i += 4) {
+                uint8_t c[4] = {rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]};
+                for (int k = 0; k < 4; k++) {
+                    uint32_t s = (info.swizzle >> (3 * k)) & 7;
+                    rgba[i + k] = s < 4 ? c[s] : s == 4 ? 0 : 255;
+                }
             }
+            char file[176];
+            if (all_levels_)
+                std::snprintf(file, sizeof file, "%s_%s_%08X_%s_%ux%u_L%u.png", stem_.c_str(), name.c_str(),
+                              info.base_address, format_name(info.format), w, h, level);
+            else
+                std::snprintf(file, sizeof file, "%s_%s_%08X_%s_%ux%u.png", stem_.c_str(), name.c_str(),
+                              info.base_address, format_name(info.format), w, h);
+            std::filesystem::path path = out_ / file;
+            if (rgba.empty() || !stbi_write_png(path.string().c_str(), int(w), int(h), 4, rgba.data(), int(w * 4))) {
+                std::printf(": decoded, PNG of level %u not written\n", level);
+                failed++;
+                return;
+            }
+            if (written.empty()) written = file;
         }
-        char file[160];
-        std::snprintf(file, sizeof file, "%s_%s_%08X_%s_%ux%u.png", stem_.c_str(), name.c_str(), info.base_address,
-                      format_name(info.format), w, h);
-        std::filesystem::path path = out_ / file;
-        if (rgba.empty() || !stbi_write_png(path.string().c_str(), int(w), int(h), 4, rgba.data(), int(w * 4))) {
-            std::printf(": decoded, PNG not written\n");
-            failed++;
-            return;
-        }
-        std::printf(": %zu levels -> %s\n", image.levels.size(), file);
+        std::printf(": %zu levels -> %s%s\n", image.levels.size(), written.c_str(), all_levels_ ? " ..." : "");
         decoded++;
     }
+
+public:
+    bool all_levels_ = false;
+
+private:
 
     std::filesystem::path out_;
     std::string stem_;
@@ -230,13 +246,15 @@ public:
 
 int main(int argc, char **argv) {
     std::filesystem::path trace_path, out;
+    bool all_levels = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) out = argv[++i];
+        else if (a == "--levels") all_levels = true;
         else trace_path = a;
     }
     if (trace_path.empty() || out.empty()) {
-        std::fprintf(stderr, "usage: xftexture <trace.xtr> -o <folder>\n");
+        std::fprintf(stderr, "usage: xftexture <trace.xtr> -o <folder> [--levels]\n");
         return 2;
     }
     GpuTrace trace;
@@ -247,6 +265,7 @@ int main(int argc, char **argv) {
     }
     std::filesystem::create_directories(out);
     Replay replay(out, trace_path.stem().string());
+    replay.all_levels_ = all_levels;
     if (!walk_gpu_trace(trace, replay, error)) {
         std::fprintf(stderr, "%s: %s\n", trace_path.string().c_str(), error.c_str());
         return 1;

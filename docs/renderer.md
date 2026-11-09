@@ -3012,6 +3012,26 @@ integer number format read as fractions (game A, E, F, D, H).
   own mip offsets (XGraphics' GetMipLevelOffset in a game's code, or the
   XDK's documentation of the packed layout).
 
+**Both settled (2026-11-09): the traces, not the renderers.** The race
+vehicle's color pass reads a 1024x1024 DXT1 texture with 11 levels
+(1E31E000, its mips at 1E39E000 right after level 0's 512 KB): in the race
+trace every level from 1 down is zero (`xftexture --levels`, the levels'
+mean colors 53/49/46 for level 0 and 0 for each of the others), and with
+the depth test forced to always for the color pass (a throwaway knob) the
+vehicle stays black on the host path too: the color pass draws, and the
+mip it samples is black. The reference's LOD (the anisotropic footprint's
+minor axis) stays on level 0 there; the hosts' reach level 1. The game makes
+these mips on the GPU with its memory-export copies ("The race's kart was
+drawn black" above), and the race and park traces in `replay_test` were
+recorded on 2026-11-05, while those draws were skipped: their mips are
+never written (zero, or what the pages held before: the magenta and
+yellow). A race frame recorded since (`xf_chaves/memexport4`, frame 11200,
+2026-11-06) has the same textures' mips filled, each level the atlas of
+the one above at half the size. Neither is a renderer bug; game A's park
+and race traces in the regression set are to be recorded again with memory
+exports live (and Xenia's dumps of them made again) before their numbers
+mean anything.
+
 **Not done yet (counted where a draw asks):** tessellation; the 2D
 engine's primitive types and triangles with wireframe flags; polygon fill
 modes other than solid (filled); lines are parallelograms (Vulkan's
