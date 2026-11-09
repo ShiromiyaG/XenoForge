@@ -132,8 +132,8 @@ uint32_t vertex_format_components(uint32_t format) {
 class Machine {
 public:
     Machine(const ParsedShader &shader, const harness::Constants &k, std::span<const uint8_t> memory,
-            harness::CaseOutput &out)
-        : shader_(shader), k_(k), memory_(memory), out_(out) {}
+            harness::CaseOutput &out, Environment *environment = nullptr, bool pixel = false)
+        : shader_(shader), k_(k), memory_(memory), out_(out), env_(environment), pixel_(pixel) {}
 
     float r[harness::REGISTERS][4] = {};
     float ps = 0.0f;
@@ -141,13 +141,20 @@ public:
     int32_t a0 = 0;
     bool killed = false;
     std::string unsupported;
+    uint32_t colors_written = 0; // oC# written on the shader's path, a bit each
 
-    bool run() {
+    bool run() { return steps() == Invocation::Status::Done; }
+
+    // Runs from where it stands: to its end, a failure, or (a pixel shader's
+    // with an environment) a fetch that waits for its quad's coordinates.
+    Invocation::Status steps() {
         const auto &flow = shader_.control_flow;
-        uint32_t pc = 0;
-        for (uint64_t steps = 0; pc < flow.size(); steps++) {
-            if (steps > (1u << 20)) return fail("the control flow does not end");
-            uint32_t next = pc + 1;
+        for (; pc_ < flow.size(); steps_++) {
+            if (steps_ > (1u << 20)) {
+                fail("the control flow does not end");
+                return Invocation::Status::Failed;
+            }
+            uint32_t pc = pc_, next = pc + 1;
             bool end = false;
             std::visit(
                 [&](const auto &cf) {
@@ -162,15 +169,30 @@ public:
                         if (taken(cf.type == JumpInstruction::Type::Unconditional,
                                   cf.type == JumpInstruction::Type::Predicated, cf.bool_constant, cf.condition))
                             next = cf.target;
+                    } else if constexpr (std::is_same_v<T, AllocInstruction>) {
+                        alloc(cf);
                     }
-                    // nop, mark_vs_fetch_done and alloc change nothing here
+                    // nop and mark_vs_fetch_done change nothing here
                 },
                 flow[pc].instruction);
-            if (!unsupported.empty()) return false;
-            if (end) return true;
-            pc = next;
+            if (!unsupported.empty()) return Invocation::Status::Failed;
+            if (waiting_) return Invocation::Status::Waiting;
+            if (end) break;
+            pc_ = next;
         }
-        return true; // ran off the end of the control flow
+        pc_ = uint32_t(flow.size());
+        // the export under way at the end
+        export_now();
+        return Invocation::Status::Done; // ended, or ran off the end of the control flow
+    }
+
+    uint64_t waiting_at() const { return uint64_t(pc_) << 32 | resume_slot_; }
+    const float *waiting() const { return waiting_coordinates_; }
+    void resume(const float quad[4][4], uint32_t lane) {
+        std::memcpy(quad_, quad, sizeof(quad_));
+        lane_ = lane;
+        have_quad_ = true;
+        waiting_ = false;
     }
 
 private:
@@ -191,11 +213,20 @@ private:
 
     // Whether the shader ends here: an exec end that ran.
     bool exec(const Exec &e) {
-        bool run = true;
-        if (e.cf.type == ExecInstruction::Type::Conditional) run = bool_constant(e.cf.bool_constant) == e.cf.condition;
-        else if (e.cf.type == ExecInstruction::Type::Predicated) run = p == e.cf.condition;
-        if (!run) return false;
-        for (const ExecSlot &slot : e.slots) {
+        size_t first = 0;
+        if (resume_slot_ != NOT_WAITING) {
+            // back at the fetch it waited at, its condition already met
+            first = resume_slot_;
+            resume_slot_ = NOT_WAITING;
+        } else {
+            bool run = true;
+            if (e.cf.type == ExecInstruction::Type::Conditional)
+                run = bool_constant(e.cf.bool_constant) == e.cf.condition;
+            else if (e.cf.type == ExecInstruction::Type::Predicated)
+                run = p == e.cf.condition;
+            if (!run) return false;
+        }
+        for (size_t i = first; i < e.slots.size(); i++) {
             std::visit(
                 [&](const auto &instruction) {
                     using T = std::decay_t<decltype(instruction)>;
@@ -203,10 +234,31 @@ private:
                     else if constexpr (std::is_same_v<T, VertexFetchInstruction>) vertex_fetch(instruction);
                     else texture_fetch(instruction);
                 },
-                slot.instruction);
+                e.slots[i].instruction);
             if (!unsupported.empty()) return false;
+            if (waiting_) {
+                resume_slot_ = uint32_t(i);
+                return false;
+            }
         }
         return e.cf.is_end;
+    }
+
+    // An alloc ends the export under way; an alloc of exports starts with
+    // eA invalid (Xenia's ProcessAllocInstruction, as the translator).
+    void alloc(const AllocInstruction &a) {
+        if (!env_) return;
+        export_now();
+        if (a.type == AllocType::Memory) std::memset(export_address_, 0, sizeof(export_address_));
+    }
+
+    // The eM# written since the last export, to the environment; none once
+    // a pixel was killed (a helper invocation's stores are dropped).
+    void export_now() {
+        if (!env_ || !export_written_) return;
+        if (exports_allowed_) env_->memory_export(export_address_, export_data_, export_written_);
+        export_written_ = 0;
+        std::memset(export_data_, 0, sizeof(export_data_));
     }
 
     // The translator's loop: a four-deep stack of counts and of aL, the top at 0.
@@ -317,10 +369,25 @@ private:
         case StorageTarget::Color:
             if (result.index >= 4) return;
             target = out_.colors[result.index];
+            colors_written |= 1u << result.index;
             break;
         case StorageTarget::Depth: target = out_.depth; break;
         case StorageTarget::ExportAddress:
-        case StorageTarget::ExportData: fail("memory export (eA, eM)"); return;
+            if (!env_) {
+                fail("memory export (eA, eM)");
+                return;
+            }
+            target = export_address_;
+            break;
+        case StorageTarget::ExportData:
+            if (!env_) {
+                fail("memory export (eA, eM)");
+                return;
+            }
+            if (result.index >= 5) return;
+            target = export_data_[result.index];
+            export_written_ |= 1u << result.index;
+            break;
         }
         for (uint32_t i = 0; i < 4; i++) {
             if (!(mask & (1u << i))) continue;
@@ -361,6 +428,11 @@ private:
         }
         store(in.vector_and_constant_result, vector, false);
         store(in.scalar_result, &scalar, true);
+        // a kill: the exports under way done first, none after (Xenia's KillPixel)
+        if (killed && env_ && pixel_ && exports_allowed_) {
+            export_now();
+            exports_allowed_ = false;
+        }
     }
 
     void vector_operation(const AluInstruction &in, float res[4]) {
@@ -765,6 +837,11 @@ private:
     // shader_harness.h's stand-ins: sampling and derivatives are the GPU's
     void texture_fetch(const TextureFetchInstruction &f) {
         if (f.is_predicated && p != f.predicate_condition) return;
+        if (env_ && f.opcode != FetchOpcode::SetTextureLod && f.opcode != FetchOpcode::SetTextureGradientsHorz &&
+            f.opcode != FetchOpcode::SetTextureGradientsVert) {
+            environment_fetch(f);
+            return;
+        }
         switch (f.opcode) {
         case FetchOpcode::SetTextureLod: tfetch_lod_ = component(f.operands[0], 0, false); return;
         case FetchOpcode::SetTextureGradientsHorz:
@@ -793,10 +870,60 @@ private:
         if (f.has_result()) store_fetch(f.result, value);
     }
 
+    // A texture operation through the environment: in a pixel shader, one
+    // that takes implicit derivatives (a computed LOD without register
+    // gradients, getGradients) waits for its quad's coordinates first.
+    void environment_fetch(const TextureFetchInstruction &f) {
+        if (!f.has_result()) return;
+        TextureFetch t;
+        t.instruction = &f;
+        t.fetch_constant = &k_.fetch_constants[(f.operands[1].index & 31) * 6];
+        for (uint32_t i = 0; i < 4; i++) t.coordinates[i] = component(f.operands[0], i, false);
+        t.lod = tfetch_lod_;
+        std::memcpy(t.gradient_h, gradient_h_, sizeof(t.gradient_h));
+        std::memcpy(t.gradient_v, gradient_v_, sizeof(t.gradient_v));
+        const bool implicit =
+            f.opcode == FetchOpcode::GetTextureGradients ||
+            ((f.opcode == FetchOpcode::TextureFetch || f.opcode == FetchOpcode::GetTextureComputedLod) &&
+             f.use_computed_lod && !f.use_register_gradients);
+        if (pixel_ && implicit) {
+            if (!have_quad_) {
+                std::memcpy(waiting_coordinates_, t.coordinates, sizeof(waiting_coordinates_));
+                waiting_ = true;
+                return;
+            }
+            have_quad_ = false;
+            t.pixel = true;
+            std::memcpy(t.quad, quad_, sizeof(t.quad));
+            t.lane = lane_;
+        } else if (pixel_) {
+            t.pixel = true;
+            for (auto &lane : t.quad) std::memcpy(lane, t.coordinates, sizeof(lane));
+        }
+        float value[4] = {};
+        std::string why;
+        if (!env_->texture(t, value, why)) {
+            if (unsupported.empty()) unsupported = why.empty() ? "a texture operation" : why;
+            return;
+        }
+        store_fetch(f.result, value);
+    }
+
+    static constexpr uint32_t NOT_WAITING = UINT32_MAX;
     const ParsedShader &shader_;
     const harness::Constants &k_;
     std::span<const uint8_t> memory_;
     harness::CaseOutput &out_;
+    Environment *env_ = nullptr;
+    bool pixel_ = false;
+    uint32_t pc_ = 0, resume_slot_ = NOT_WAITING;
+    uint64_t steps_ = 0;
+    bool waiting_ = false, have_quad_ = false;
+    float waiting_coordinates_[4] = {}, quad_[4][4] = {};
+    uint32_t lane_ = 0;
+    float export_address_[4] = {}, export_data_[5][4] = {};
+    uint32_t export_written_ = 0;
+    bool exports_allowed_ = true;
     uint32_t loop_count_[4] = {};
     int32_t loop_address_[4] = {}; // aL is loop_address_[0]
     uint32_t call_stack_[4] = {};
@@ -833,5 +960,31 @@ bool interpret(const ParsedShader &shader, const harness::CaseInput &input, cons
     unsupported = m.unsupported;
     return ok;
 }
+
+struct Invocation::State {
+    harness::CaseOutput out{};
+    Machine machine;
+    State(const ParsedShader &shader, const harness::Constants &constants, std::span<const uint8_t> memory,
+          Environment *environment, bool pixel)
+        : machine(shader, constants, memory, out, environment, pixel) {}
+};
+
+Invocation::Invocation(const ParsedShader &shader, const harness::Constants &constants,
+                       std::span<const uint8_t> memory, Environment *environment, bool pixel)
+    : state_(new State(shader, constants, memory, environment, pixel)) {}
+Invocation::~Invocation() { delete state_; }
+float (*Invocation::registers())[4] { return state_->machine.r; }
+Invocation::Status Invocation::run() {
+    Status s = state_->machine.steps();
+    if (s == Status::Done) state_->out.killed = state_->machine.killed ? 1 : 0;
+    return s;
+}
+uint64_t Invocation::waiting_at() const { return state_->machine.waiting_at(); }
+const float *Invocation::waiting() const { return state_->machine.waiting(); }
+void Invocation::resume(const float quad[4][4], uint32_t lane) { state_->machine.resume(quad, lane); }
+const harness::CaseOutput &Invocation::output() const { return state_->out; }
+uint32_t Invocation::colors_written() const { return state_->machine.colors_written; }
+bool Invocation::killed() const { return state_->machine.killed; }
+const std::string &Invocation::unsupported() const { return state_->machine.unsupported; }
 
 } // namespace xf::shader

@@ -61,6 +61,10 @@ add_library(xenoforge STATIC
     src/shader_container.cpp
     src/texture.cpp
     src/resolve.cpp
+    src/reference/draw.cpp
+    src/reference/pieces.cpp
+    src/reference/renderer.cpp
+    src/reference/sampler.cpp
     src/ppc.cpp
     src/ppc_interp.cpp
     src/ppc_runtime.cpp
@@ -104,6 +108,10 @@ add_custom_command(
 # (src/xma_decoder.cpp): the core is compiled against FFmpeg's headers, never
 # linked to it, so a program without the library still runs and decodes XMA as
 # silence. Off, the core builds without FFmpeg at all.
+# the reference renderer's workers (src/reference) are std::threads
+find_package(Threads REQUIRED)
+target_link_libraries(xenoforge PUBLIC Threads::Threads)
+
 option(XF_XMA "decode XMA with FFmpeg (a shared library, LGPL, loaded at run time)" ON)
 if(XF_XMA)
     include(third_party/ffmpeg/ffmpeg.cmake)
@@ -307,6 +315,9 @@ if(NOT TARGET stb)
 endif()
 add_executable(xfreplay tools/xfreplay.cpp)
 target_link_libraries(xfreplay PRIVATE xenoforge_vk stb)
+# the software reference renderer on a trace (docs/renderer.md, "The software reference renderer")
+add_executable(xfref tools/xfref.cpp)
+target_link_libraries(xfref PRIVATE xenoforge stb)
 add_executable(xfcompare tools/xfcompare.cpp)
 target_link_libraries(xfcompare PRIVATE stb)
 # The standing benchmark against Xenia (docs/renderer.md, "The standing
@@ -748,6 +759,16 @@ add_test(NAME shader_compare COMMAND shader_compare_test)
 add_executable(replay_test tests/replay_test.cpp)
 target_link_libraries(replay_test PRIVATE xenoforge_vk stb)
 add_test(NAME replay COMMAND replay_test)
+# the software reference renderer against Xenia's pictures and the Vulkan
+# renderer's (three ways), where XF_TRACES and XF_DUMPS say; its pieces
+# against the documents' values
+add_executable(reference_test tests/reference_test.cpp)
+target_link_libraries(reference_test PRIVATE xenoforge_vk stb)
+add_test(NAME reference COMMAND reference_test)
+set_tests_properties(reference PROPERTIES TIMEOUT 1800)
+add_executable(reference_units_test tests/reference_units_test.cpp)
+target_link_libraries(reference_units_test PRIVATE xenoforge)
+add_test(NAME reference_units COMMAND reference_units_test)
 # points, rectangles and the tessellator from hand-built packets and microcode
 add_executable(primitives_test tests/primitives_test.cpp)
 target_link_libraries(primitives_test PRIVATE xenoforge_vk stb)

@@ -81,6 +81,20 @@ texture::HostFormat host_format_of_color_target(uint32_t format);
 // sample of an MSAA target already resolved to one.
 bool write(const Info &info, std::span<const uint8_t> pixels, GuestMemory &memory, std::string &error);
 
+// A resolve from EDRAM's own bits (the software reference renderer,
+// reference.h): per pixel of the rectangle, row by row, the first selected
+// sample's guest words (what a raw copy and a depth copy take: D24S8 and
+// D24FS8 as EDRAM holds them, depth in the high 24 bits) and its components
+// as Xenia's resolve shaders load them (resolve.comp's load_colors: the
+// selected samples unpacked from the guest's bits, 7e3 included, summed in
+// their order and averaged, 8_8_8_8_GAMMA's through its linear codes, the
+// exponent bias applied), converted for the destination as write() does.
+struct LoadedPixel {
+    uint32_t words[2] = {};
+    float loaded[4] = {};
+};
+bool write_loaded(const Info &info, std::span<const LoadedPixel> pixels, GuestMemory &memory, std::string &error);
+
 // The copy keeps the source's bits (Xenia's fast resolve shaders): depth,
 // or a color format bitwise equal to the destination's, unscaled.
 bool raw_copy(const Info &info);

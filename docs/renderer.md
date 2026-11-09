@@ -2863,6 +2863,166 @@ view of it, a 3D or cube texture) is the console's size where Xenia's would
 be scaled. Not done: a pixel shader's memory export runs once a host pixel
 (as Xenia's), counted.
 
+## The software reference renderer (2026-11-09)
+
+A third witness beside the Vulkan renderer and Xenia: the Xenos drawn on the
+CPU alone, deterministic, independent of host GPUs and drivers, built from the
+documents first (`include/xenoforge/reference.h`, `src/reference/`). Where the
+Vulkan renderer and Xenia agree with each other and not with it, or the three
+disagree, the spec says which is right; the reference is the base to argue
+from without a console.
+
+**Running it.** `build/xfref <xtr> -o frame.png [--compare <png>] [--diff
+d.png] [--threads N] [-v]`; `XF_REF_TRACE_PIXEL=x,y` prints that pixel's
+quad's shader inputs and texture fetches, and every depth test and color
+write at the pixel, draw by draw. The three-way regression:
+`XF_TRACES=../traces XF_DUMPS=../traces/dumps build/reference_test`
+(`XF_REFERENCE_FILTER=<name>`, `XF_REFERENCE_OUT=<dir>` for its frames); it
+fails on crashes and failed replays, not yet on differences.
+`reference_units_test` checks the pieces against the documents' values.
+
+**Design.** `reference::Renderer` is a `gpu::Sink` played by the same trace
+player as `render::replay` (src/replay.cpp, Xenia's trace_player.cc). EDRAM is
+the hardware's: 2048 tiles of 80x16 samples of 32 bits, in the guest's bits,
+addressed per sample as Xenia's ROV and FSI paths address it (64-bit formats
+as two dwords, 2x and 4x layouts, depth tiles' halves swapped; reference
+`edram_address`). Draws run in `src/reference/draw.cpp`: indices, primitives,
+the vertex shader (shader_interpreter.h's machine, each vertex once, in chunks
+across the workers), clipping in homogeneous space, the viewport, setup, then
+rasterization by bands of 32 rows, each band drawing every primitive in order
+so every sample sees the draw's order; pixel shaders run in 2x2 quads with
+helpers, in lockstep at each fetch that takes implicit derivatives (the
+interpreter's `Invocation` stops there, `Waiting`, and the quad's lanes'
+coordinates resume it: the translator's coarse derivatives). Textures
+(`sampler.cpp`) are texture.h's decode (Xenia's untiling and loads, the DXT
+formats decompressed) turned into floats per texel through the fetch
+constant's signs, filtered on the CPU. Resolves read EDRAM's bits as Xenia's
+resolve shaders load them (resolve.comp's load_colors) and write memory
+through resolve.h's conversion (`resolve::write_loaded`, new). The 29 frames
+take 62 s together on 12 threads (game A's race 9.6 s, the longest).
+
+**Sources, stage by stage** (the spec where it speaks; Xenia's file and
+function where it is silent):
+
+| stage | source |
+| --- | --- |
+| indices: endianness, VGT_INDX_OFFSET, min/max clamp, reset index | R6xx 3D register reference (VGT_*); Xenia's RemapAndConvertVertexIndices and primitive processor (which types the reset index cuts) |
+| primitive types | lists, strips, fans as Direct3D; line loops closed; quads as two triangles; quad strips and polygons as Mesa's r600 and a2xx give GL_QUAD_STRIP and GL_POLYGON; rectangle lists: Xenia's geometry shader (the fourth vertex mirrored across the longest edge; spec silent); points: PA_SU_POINT_SIZE / oPts.x clamped by PA_SU_POINT_MINMAX |
+| vertex position formats | PA_CL_VTE_CNTL (vtx_w0_fmt, vtx_xy_fmt, vtx_z_fmt) as Xenia's CompleteVertexOrTessEvalShaderInMain |
+| clipping | PA_CL_CLIP_CNTL: dx_clip_space_def's near and far, the guard band PA_CL_GB_*_CLIP_ADJ (x, y clipped at that many w; 1 is the viewport, R6xx register reference), user clip planes (clip or cull only), clip_disable |
+| viewport, half pixel, window offset | PA_CL_VPORT_*, PA_SU_VTX_CNTL's pix_center, PA_SU_SC_MODE_CNTL's vtx_window_offset_enable (draw_util.cc's GetHostViewportInfo for the offsets' arithmetic) |
+| vertex snapping | PA_SU_VTX_CNTL's quant_mode (1/16 to 1 pixel) and round_mode (a2xx register database: truncate, round, to even, to odd) |
+| faces, culling, polygon offset | PA_SU_SC_MODE_CNTL (face, cull_front, cull_back, poly_offset_*_enable), the offsets as Direct3D 9's absolute ones (Xenia's draw_util.h on POLY_OFFSET_DB_IS_FLOAT_FMT); polygonal types as Xenia's IsPrimitivePolygonal (rectangles not) |
+| sample positions | R6xx/R7xx PA_SC_AA_SAMPLE_LOCS (2x: (-4,4), (4,-4); 4x: (-2,-2), (2,2), (-6,6), (6,-6) in 1/16), Xenia's kXenosSamplePositions |
+| fill rule | the top-left rule of Direct3D-class rasterizers, on 1/256 pixel fixed point |
+| scissor | PA_SC_WINDOW_SCISSOR_* plus the window offset unless window_offset_disable, PA_SC_SCREEN_SCISSOR_*, the surface (draw_util.cc's GetScissor) |
+| interpolation | perspective-correct (PERSP_CORR_DIS: linear), centroid by SQ_CONTEXT_MISC's sc_sample_cntl and SQ_INTERPOLATOR_CNTL's sampling_pattern (the first covered sample of a partly covered pixel); param_gen as Xenia's StartFragmentShaderInMain |
+| shaders | shader_interpreter.cpp (Xenia's interpreter, its SPIR-V translator where they differ), extended for whole draws: an Environment for texture operations and memory exports, quads |
+| texture fetch | the translator's sample_texture (Xenia's ProcessTextureFetchInstruction): sizes, offsets plus Xenia's kTextureCoordEpsilon, LOD from the constant's bias, the register's and the instruction's, per-axis exponents, cube faces, stacked layers; filters and clamps from the fetch constant and the instruction (Xenia's GetSamplerParameters), border colors |
+| filtering | point, bilinear, trilinear, anisotropic as Vulkan's and Direct3D 10's reference footprint (up to AnisoFilter's 16 taps), exact weights; signs applied per texel before filtering |
+| alpha test, alpha to coverage | RB_COLORCONTROL; Xenia's FSI (test only where oC0 is written; FSI_AlphaToMask's thresholds and dither) |
+| depth, stencil | Xenia's FSI_DepthStencilTest (GetNormalizedDepthControl, ColorOverlapsDepthStencil, both faces), the depth from the primitive's plane at each sample (exact; Xenia extrapolates the center's by derivatives), D24S8 rounded to the nearest even, D24FS8 by xenos.cc's Float32To20e4 rounded to the nearest even |
+| color formats, blending, write masks | Xenia's FSI_ClampAndPackColor, FSI_UnpackColor, the blend factor and equation functions (factors before min and max, as the Xenos), GetPSIColorFormatInfo's keep masks; 7e3, PWL gamma, extended float16 as xenos.cc |
+| resolves | resolve.h's get_info (Xenia's GetResolveInfo), the samples loaded as resolve.xesli's XeResolveLoad*, resolve.cpp's conversion, endianness and tiling; clears into EDRAM after the copy |
+| memory exports | the translator's export_to_memory (Xenia's ExportToMemory, the D3D12 translator's integer clamps) |
+| the front buffer | fetch constant 0's texture, opaque, the display's gamma ramp (renderer.cpp's deliver and display_gamma) |
+
+**Where it differs from Xenia, on purpose.** Texel signs (signed, biased,
+gamma) before filtering: Xenia applies them after the host filters and says
+it "likely should be before" (dxbc_shader_translator_fetch.cc); R6xx and
+Direct3D 10 convert texels before filtering. Exact bilinear weights and LOD:
+hosts use 8 bits of weight; this is what gives the reference's 0.1 of 255 on
+game B's 1800 and 3600 (edges of filtered text only, no pixel over 16). The
+guard band from the registers (Xenia's host viewport clips at the viewport).
+Vertices snapped by PA_SU_VTX_CNTL (hosts snap to 1/256). Per-sample depth
+from the plane, not extrapolated. SQ_INTERPOLATOR_CNTL's param_shade: every
+interpolator smooth, as Xenia's (the traces set it to the mask of the
+interpolators used, so it is not a flat-shading mask; counted).
+
+**The three-way results** (mean difference of 255, share of pixels off by
+more than 16; Xenia's exact pictures: Direct3D 12 ROV `rov/d3d12`, Vulkan FSI
+`rov`; "ours" the Vulkan renderer on its default interlock path):
+
+| frame | reference : Xenia ROV | reference : Xenia FSI | reference : ours | ours : Xenia ROV |
+| --- | --- | --- | --- | --- |
+| Game B 1800 | 0.100, 0.00% | 0.100, 0.00% | 0.100, 0.00% | 0.000, 0.00% |
+| Game B 1801 | 0.089, 0.00% | 0.089, 0.00% | 0.089, 0.00% | 0.000, 0.00% |
+| Game B 3600 | 0.100, 0.00% | 0.100, 0.00% | 0.100, 0.00% | 0.000, 0.00% |
+| Game B 3601 | 0.092, 0.00% | 0.092, 0.00% | 0.092, 0.00% | 0.000, 0.00% |
+| Game B 600 | 0.001, 0.00% | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% |
+| Game B 601 | 0.001, 0.00% | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% |
+| Game A 1800 | 0.010, 0.00% | 0.010, 0.00% | 0.008, 0.00% | 0.003, 0.00% |
+| Game A 2400 | 0.197, 0.01% | 0.197, 0.01% | 0.197, 0.01% | 0.000, 0.00% |
+| Game A 300 | 0.004, 0.00% | 0.004, 0.00% | 0.004, 0.00% | 0.001, 0.00% |
+| Game A 301 | 0.005, 0.00% | 0.005, 0.00% | 0.004, 0.00% | 0.002, 0.00% |
+| Game A 900 | 0.009, 0.00% | 0.009, 0.00% | 0.008, 0.00% | 0.003, 0.00% |
+| Game A loading | 0.013, 0.04% | 0.013, 0.04% | 0.013, 0.04% | 0.000, 0.00% |
+| Game A menu | 0.320, 0.21% | 0.320, 0.21% | 0.320, 0.21% | 0.001, 0.00% |
+| Game A park | 3.643, 7.91% | 5.589, 9.93% | 5.589, 9.93% | 3.086, 6.78% |
+| Game A race | 3.802, 7.39% | 4.887, 8.00% | 4.888, 8.00% | 1.751, 4.35% |
+| Game D intro | 0.056, 0.00% | 0.056, 0.00% | 0.045, 0.00% | 0.013, 0.00% |
+| Game H title | 0.022, 0.00% | 0.022, 0.00% | 0.022, 0.00% | 0.000, 0.00% |
+| Game C 1200 | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% |
+| Game C 2400 | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% | 0.001, 0.00% |
+| Game C 3600 | 0.002, 0.00% | 0.002, 0.00% | 0.000, 0.00% | 0.002, 0.00% |
+| Game C 600 | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% | 0.001, 0.00% |
+| Game E 1200 | 0.301, 0.00% | 0.301, 0.00% | 0.299, 0.00% | 0.005, 0.00% |
+| Game E 2400 | 0.296, 0.00% | 0.296, 0.00% | 0.294, 0.00% | 0.005, 0.00% |
+| Game E 3600 | 0.268, 0.00% | 0.268, 0.00% | 0.267, 0.00% | 0.003, 0.00% |
+| Game E 600 | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% |
+| Game F 1200 | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% | 0.000, 0.00% |
+| Game F 2400 | 0.008, 0.00% | 0.008, 0.00% | 0.003, 0.00% | 0.006, 0.00% |
+| Game F 3600 | 0.231, 0.02% | 0.231, 0.02% | 0.199, 0.02% | 0.083, 0.00% |
+| Game F 600 | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% |
+
+Nothing is skipped in any of the 29; the only count is textures with the
+integer number format read as fractions (game A, E, F, D, H).
+
+**Where the three disagree, and what the spec supports.**
+- Game B 1800-3601, game E, game A's menu and 2400, game F's 3600: the
+  reference is 0.1-0.3 off both Xenia and ours, which agree; no pixel or a
+  few over 16. The differences sit on filtered edges and in blurred
+  backgrounds made by chains of downsampling passes: the hosts' bilinear
+  weights (8 bits) against the reference's exact ones. The spec gives no
+  weight precision; open (the hardware's would settle it).
+- Game A's race: the player's vehicle is black in Xenia's pictures and
+  ours, textured in the reference. Its color pass tests depth with
+  greater-or-equal (reverse Z) against its own depth prepass, an equality in
+  effect: in the reference the two passes' depths are the same bits (the
+  same vertices through the interpreter's exact arithmetic, the same plane
+  at the same sample: `XF_REF_TRACE_PIXEL=640,600` shows the prepass's
+  0x912899 met by the color pass's 0x912899), so the color pass draws.
+  Why Xenia's and ours leave it as cleared is not settled: the depth test
+  failing on the host (the two passes' depths an ulp apart) is the
+  candidate; the trace was recorded while our runs skipped memory exports
+  ("The race's kart was drawn black" above: the color it reads comes from
+  exported pages), which may also be involved. The invariance a rasterizer
+  gives (the same vertices make the same depths) supports the reference
+  where the depth test is the cause.
+- Game A's race and park: distant road and foliage. The textures there are
+  512x512 and 1024x1024 DXT1 with full mip chains whose levels 0-2 agree with
+  one another (mean colors within a few codes) and whose levels 3 and up do
+  not (magenta, yellow, near black): texture.h's layout, which is Xenia's
+  TextureGuestLayout, reads them at offsets that hold other data, or the
+  game had not streamed them. Xenia shows that magenta too (the park's
+  foliage); which mips each picture reaches depends on the anisotropic LOD,
+  which differs between Xenia's ROV and FSI pictures themselves by 1.75 and
+  3.09 of 255. Open: the mip addresses past level 2 are a candidate bug in
+  texture.cpp and Xenia's texture_util alike, to be settled from the guest's
+  own mip offsets (XGraphics' GetMipLevelOffset in a game's code, or the
+  XDK's documentation of the packed layout).
+
+**Not done yet (counted where a draw asks):** tessellation; the 2D
+engine's primitive types and triangles with wireframe flags; polygon fill
+modes other than solid (filled); lines are parallelograms (Vulkan's
+non-strict lines), with no stipple; seamless cube filtering; clamp to
+halfway (as to the edge); signed versions of the widened formats
+(10_11_11, 11_11_10 read unsigned when signed); textures with the integer
+number format (read as fractions); occlusion query counts and screen
+extents (the processor's fake reports); getBCF (0, as Xenia). Performance:
+one interpreter invocation per vertex and per pixel lane, heap-allocated;
+the 29 frames take a minute, the work is bound by the interpreter.
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that

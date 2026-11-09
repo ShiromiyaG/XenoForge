@@ -249,6 +249,8 @@ void unpack(uint32_t rt, const uint8_t *p, float c[4]) {
 // The destination's words for one pixel, converted (the full resolve
 // shaders); returns the word count, 0 for a 1-byte or 2-byte destination,
 // which goes in small.
+uint32_t convert_loaded(const Info &info, const float loaded[4], uint32_t dest_bytes, uint32_t w[4], uint32_t &small);
+
 uint32_t convert(const Info &info, const uint8_t *src, uint32_t dest_bytes, uint32_t w[4], uint32_t &small) {
     uint32_t rt = info.source_format;
     float c[4];
@@ -269,6 +271,18 @@ uint32_t convert(const Info &info, const uint8_t *src, uint32_t dest_bytes, uint
         c[3] *= factor;
     } else {
         for (float &v : c) v *= factor;
+    }
+    return convert_loaded(info, c, dest_bytes, w, small);
+}
+
+// The destination's words for a pixel's components as the resolve shaders
+// load them (the samples averaged, 8_8_8_8_GAMMA's through its curve, the
+// exponent bias applied): resolve.comp's convert.
+uint32_t convert_loaded(const Info &info, const float loaded[4], uint32_t dest_bytes, uint32_t w[4], uint32_t &small) {
+    float c[4] = {loaded[0], loaded[1], loaded[2], loaded[3]};
+    if (dest_bytes == 1) {
+        small = pack_fixed(info.dest_swap ? c[3] : c[0], 8, info.dest_number);
+        return 0;
     }
     if (info.dest_swap) std::swap(c[0], c[2]);
     uint32_t n = info.dest_number;
@@ -589,6 +603,66 @@ bool write(const Info &info, std::span<const uint8_t> pixels, GuestMemory &memor
             uint8_t *d = dest.data() + (offset(i, j) - low);
             uint32_t w[4] = {}, small = 0;
             uint32_t words = raw ? copy_raw(info, src, w) : convert(info, src, dest_bytes, w, small);
+            if (dest_bytes == 1) {
+                d[0] = uint8_t(small);
+            } else if (dest_bytes == 2) {
+                uint16_t v = uint16_t(swap16(small, info.dest_endian));
+                std::memcpy(d, &v, 2);
+            } else {
+                swap_words(w, words, info.dest_endian);
+                std::memcpy(d, w, dest_bytes);
+            }
+        }
+    memory.write(uint32_t(info.dest_base + low), dest);
+    return true;
+}
+
+bool write_loaded(const Info &info, std::span<const LoadedPixel> pixels, GuestMemory &memory, std::string &error) {
+    if (!info.copy || !info.width || !info.height) return true;
+    if (pixels.size() < size_t(info.width) * info.height) {
+        error = "resolve: fewer pixels than the rectangle";
+        return false;
+    }
+    uint32_t dest_bytes = texture::format_block(info.dest_format).bytes;
+    if (!dest_bytes || !std::has_single_bit(dest_bytes) || dest_bytes > 16) {
+        error = std::string("resolve to ") + xenos::format_name(info.dest_format);
+        return false;
+    }
+    uint32_t bpp_log2 = std::countr_zero(dest_bytes);
+    const bool raw = raw_copy(info);
+    auto offset = [&](uint32_t i, uint32_t j) -> uint64_t {
+        uint32_t x = info.dest_x + i, y = info.dest_y + j;
+        if (info.dest_array)
+            return texture::tiled_offset_3d(x, y, info.dest_slice, info.dest_pitch, info.dest_height, bpp_log2);
+        return texture::tiled_offset_2d(x, y, info.dest_pitch, bpp_log2);
+    };
+    uint64_t low = UINT64_MAX, high = 0;
+    for (uint32_t j = 0; j < info.height; j++)
+        for (uint32_t i = 0; i < info.width; i++) {
+            uint64_t o = offset(i, j);
+            low = std::min(low, o), high = std::max(high, o);
+        }
+    uint64_t span = high - low + dest_bytes;
+    if (span > (256u << 20)) {
+        error = "resolve destination span too large";
+        return false;
+    }
+    std::vector<uint8_t> dest(span);
+    memory.read(uint32_t(info.dest_base + low), dest);
+    for (uint32_t j = 0; j < info.height; j++)
+        for (uint32_t i = 0; i < info.width; i++) {
+            const LoadedPixel &px = pixels[size_t(j) * info.width + i];
+            uint8_t *d = dest.data() + (offset(i, j) - low);
+            uint32_t w[4] = {}, small = 0, words;
+            if (raw) {
+                // the source's guest bits, red and blue swapped in place
+                // (copy_raw from little-endian bytes of the same words)
+                uint8_t bytes[8];
+                std::memcpy(bytes, px.words, 8);
+                words = copy_raw(info, bytes, w);
+            } else {
+                words = convert_loaded(info, px.loaded, dest_bytes, w, small);
+            }
             if (dest_bytes == 1) {
                 d[0] = uint8_t(small);
             } else if (dest_bytes == 2) {
