@@ -236,6 +236,7 @@ private:
     enum class Query { Sample, Lod, Weights };
     Id sample_texture(const TextureFetchInstruction &t, Id coordinates, uint32_t member = 2, Query query = Query::Sample);
     Id texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample);
+    static bool allows_point_sampling(const TextureFetchInstruction &t);
     Id pwl_gamma_to_linear(Id gamma);
     Id slot_word(uint32_t member, uint32_t slot);
     Id swap_endian(Id word, Id endian);
@@ -283,6 +284,7 @@ private:
     // the texture LOD and gradients the setters leave for later fetches
     Id tfetch_lod_ = 0, gradient_h_ = 0, gradient_v_ = 0;
     Id signed_sample_ = 0; // a fetch's sample from the texture's signed view
+    Id fetch_scaled_ = 0;  // a fetch's result through its number format (texture_signs)
     Id body_ = 0;
     bool ended_ = false; // the straight control flow has returned
     // memexport: which eM# the shader writes; per control flow instruction,
@@ -372,11 +374,12 @@ void Translator::declare() {
         // then the user clip planes enabled, packed (VertexOptions), then the
         // screen extents' map from the host's NDC to console pixels (x scale
         // and offset, y scale and offset) and the report's first word
-        // (VertexOptions::extents)
+        // (VertexOptions::extents), then per fetch slot its texture's integer
+        // scale word (texture::integer_scale_bits, Xenia's GetIntegerScaleBits)
         Id slot_table = m_.type_array(uvec4_, 8, 16);
         const Id system_members[] = {vec4_, vec4_, slot_table, uvec4_,     vec4_,
                                      vec4_, vec4_, slot_table, slot_table, m_.type_array(vec4_, 6, 16),
-                                     vec4_, uvec4_};
+                                     vec4_, uvec4_, slot_table};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
@@ -391,6 +394,7 @@ void Translator::declare() {
         m_.member_decorate(system_block, 9, spv::Decoration::Offset, {480});
         m_.member_decorate(system_block, 10, spv::Decoration::Offset, {576});
         m_.member_decorate(system_block, 11, spv::Decoration::Offset, {592});
+        m_.member_decorate(system_block, 12, spv::Decoration::Offset, {608});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -423,6 +427,7 @@ void Translator::declare() {
     gradient_h_ = global(vec4_, spv::StorageClass::Private, "gradient_h");
     gradient_v_ = global(vec4_, spv::StorageClass::Private, "gradient_v");
     signed_sample_ = global(vec4_, spv::StorageClass::Private, "signed_sample");
+    fetch_scaled_ = global(vec4_, spv::StorageClass::Private, "fetch_scaled");
 }
 
 void Translator::reset_state() {
@@ -1352,29 +1357,46 @@ Id Translator::slot_word(uint32_t member, uint32_t slot) {
                   slot & 3});
 }
 
-// The fetch constant's signs on the sampled components, as Xenia's
-// ProcessTextureFetchInstruction applies them (spirv_shader_translator_
-// fetch.cc), by the renderer's per-slot word (system member 7): two bits per
-// result component, already through the constant's swizzle (Xenia's
-// SwizzleSigns), and four bits more for a biased component's width less
-// one. Unsigned as sampled; signed from the texture's signed view (member 8,
-// sampled only when a component asks for it and there is one; else the
-// sample as it is, which float formats already give signed); biased as
-// signed offset binary, (n - 2^(w-1)) / (2^(w-1) - 1) for a width known,
-// else 2u - 1, no lower than -1; gamma back to linear through the piecewise
-// linear curve. Then the components the word's bits 24-27 name rounded to 16
-// fractional bits, half to even (Xenia's OpRoundNE: the console's Q16
-// filtered values, texture::q16_components).
+// The fetch constant's signs on the sampled components, then its number
+// format, as Xenia's ProcessTextureFetchInstruction applies them
+// (spirv_shader_translator_fetch.cc), by two per-slot words of the
+// renderer's: the signs (system member 7: two bits per result component,
+// already through the constant's swizzle, Xenia's SwizzleSigns) and the
+// integer scale word (member 12: texture::integer_scale_bits, Xenia's
+// GetIntegerScaleBits: per component six bits, the width less one and the
+// sign; bit 24 a fixed-point format read as fractions; bit 26 the constant
+// filters by point).
+// The signs: unsigned as sampled; signed from the texture's signed view
+// (member 8, sampled only when a component asks for it and there is one;
+// else the sample as it is, which float formats already give signed);
+// biased as signed offset binary, (n - 2^(w-1)) / (2^(w-1) - 1) for a width
+// known, else 2u - 1, unclamped; gamma back to linear through the piecewise
+// linear curve.
+// The number format, where the word has more than bit 26 (fixed-point
+// formats; behind a uniform branch, as Xenia's): read as fractions, a
+// point-sampled fetch's 4 to 6 bit unsigned components rebuilt as the
+// console expands them (the texel n as n (2^w + 1) / 2^2w, its bits
+// repeated), the unsigned ones rounded to 16 fractional bits (half to even:
+// the console's filtered values are Q16, and games compare them with Q16
+// constants), the biased ones no lower than -1; read as integers, each
+// component times 2^w - 1 (unsigned) or 2^(w-1) - 1 (signed, biased; a
+// 1-bit biased one times a half less a half), rounded when the fetch and the
+// constant both sample by point.
 Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample) {
     const uint32_t slot = t.operands[1].index;
-    Id info = slot_word(7, slot), signed_entry = slot_word(8, slot);
-    auto field = [&](uint32_t offset, uint32_t count) {
-        return m_.op(Op::OpBitFieldUExtract, uint_, {info, u(offset), u(count)});
+    Id info = slot_word(7, slot), signed_entry = slot_word(8, slot), scale_word = slot_word(12, slot);
+    auto field = [&](Id word, uint32_t offset, uint32_t count) {
+        return m_.op(Op::OpBitFieldUExtract, uint_, {word, u(offset), u(count)});
     };
+    auto mul = [&](Id a, Id b) { return exact(Op::OpFMul, float_, {a, b}); };
+    auto add = [&](Id a, Id b) { return exact(Op::OpFAdd, float_, {a, b}); };
+    auto sub = [&](Id a, Id b) { return exact(Op::OpFSub, float_, {a, b}); };
+    auto div = [&](Id a, Id b) { return exact(Op::OpFDiv, float_, {a, b}); };
+    auto ieq = [&](Id a, uint32_t b) { return m_.op(Op::OpIEqual, bool_, {a, u(b)}); };
     Id signs[4], any_signed = m_.const_bool(false);
     for (uint32_t k = 0; k < 4; k++) {
-        signs[k] = field(2 * k, 2);
-        any_signed = m_.op(Op::OpLogicalOr, bool_, {any_signed, m_.op(Op::OpIEqual, bool_, {signs[k], u(1)})});
+        signs[k] = field(info, 2 * k, 2);
+        any_signed = m_.op(Op::OpLogicalOr, bool_, {any_signed, ieq(signs[k], 1)});
     }
     store(signed_sample_, sample);
     when(m_.op(Op::OpLogicalAnd, bool_, {any_signed, m_.op(Op::OpINotEqual, bool_, {signed_entry, u(0)})}), [&] {
@@ -1385,29 +1407,88 @@ Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, I
     Id out[4];
     for (uint32_t k = 0; k < 4; k++) {
         Id value = comp(sample, k);
-        Id width_less_one = field(8 + 4 * k, 4);
+        Id width_less_one = field(scale_word, 6 * k, 4);
         Id half = m_.op(Op::OpConvertUToF, float_, {m_.op(Op::OpShiftLeftLogical, uint_, {u(1), width_less_one})});
-        Id offset_binary = exact(
-            Op::OpFDiv, float_,
-            {exact(Op::OpFSub, float_,
-                   {exact(Op::OpFMul, float_,
-                          {value, exact(Op::OpFSub, float_, {exact(Op::OpFMul, float_, {half, f(2)}), f(1)})}),
-                    half}),
-             exact(Op::OpFSub, float_, {half, f(1)})});
-        Id twice_less_one = exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {value, f(2)}), f(-1)});
+        Id offset_binary = div(sub(mul(value, sub(mul(half, f(2)), f(1))), half), sub(half, f(1)));
+        Id twice_less_one = add(mul(value, f(2)), f(-1));
         Id biased = select(float_, m_.op(Op::OpINotEqual, bool_, {width_less_one, u(0)}), offset_binary, twice_less_one);
-        biased = glsl(GLSLstd450NMax, float_, {biased, f(-1)});
-        auto is = [&](uint32_t sign) { return m_.op(Op::OpIEqual, bool_, {signs[k], u(sign)}); };
-        Id r = select(float_, is(3), pwl_gamma_to_linear(value), value);
-        r = select(float_, is(2), biased, r);
-        r = select(float_, is(1), comp(signed_sample, k), r);
-        // to 16 fractional bits where the word says (texture::q16_components)
-        Id q16 = exact(Op::OpFMul, float_,
-                       {glsl(GLSLstd450RoundEven, float_, {exact(Op::OpFMul, float_, {r, f(65536.0f)})}),
-                        f(1.0f / 65536.0f)});
-        out[k] = select(float_, m_.op(Op::OpINotEqual, bool_, {field(24 + k, 1), u(0)}), q16, r);
+        Id r = select(float_, ieq(signs[k], 3), pwl_gamma_to_linear(value), value);
+        r = select(float_, ieq(signs[k], 2), biased, r);
+        out[k] = select(float_, ieq(signs[k], 1), comp(signed_sample, k), r);
     }
-    return vec4_of(out[0], out[1], out[2], out[3]);
+    store(fetch_scaled_, vec4_of(out[0], out[1], out[2], out[3]));
+
+    // the number format (bit 26 alone: nothing to scale)
+    const bool point_allowed = allows_point_sampling(t);
+    Id active = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {scale_word, u((1u << 26) - 1)}), u(0)});
+    // (each part behind a uniform branch of its own, as Xenia's: a fetch runs
+    // only the part its constant asks for)
+    auto lane_of = [&](uint32_t k) { return field(scale_word, 6 * k, 6); };
+    auto word_has = [&](uint32_t mask) {
+        return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {scale_word, u(mask)}), u(0)});
+    };
+    when(active, [&] {
+        Id normalized = word_has(1u << 24);
+        // as fractions
+        when(normalized, [&] {
+            if (point_allowed) {
+                when(word_has((1u << 24) - 1), [&] {
+                    Id v4 = load(vec4_, fetch_scaled_), rebuilt[4];
+                    for (uint32_t k = 0; k < 4; k++) {
+                        Id v = comp(v4, k), lane = lane_of(k);
+                        Id pow2 = m_.op(Op::OpConvertUToF, float_,
+                                        {m_.op(Op::OpShiftLeftLogical, uint_, {u(2), m_.op(Op::OpBitwiseAnd, uint_, {lane, u(0xF)})})});
+                        Id texel = glsl(GLSLstd450RoundEven, float_, {mul(v, sub(pow2, f(1)))});
+                        // (where the lane is 1 to 15: unsigned with a width)
+                        Id grid_lane = m_.op(Op::OpULessThan, bool_, {m_.op(Op::OpISub, uint_, {lane, u(1)}), u(15)});
+                        rebuilt[k] = select(float_, grid_lane, div(mul(texel, add(pow2, f(1))), mul(pow2, pow2)), v);
+                    }
+                    store(fetch_scaled_, vec4_of(rebuilt[0], rebuilt[1], rebuilt[2], rebuilt[3]));
+                    return false;
+                });
+            }
+            Id v4 = load(vec4_, fetch_scaled_), n[4];
+            for (uint32_t k = 0; k < 4; k++) {
+                Id v = comp(v4, k), sign = m_.op(Op::OpShiftRightLogical, uint_, {lane_of(k), u(4)});
+                Id q16 = mul(glsl(GLSLstd450RoundEven, float_, {mul(v, f(65536.0f))}), f(1.0f / 65536.0f));
+                n[k] = select(float_, ieq(sign, 0), q16, v);
+                n[k] = select(float_, ieq(sign, 2), glsl(GLSLstd450FMax, float_, {n[k], f(-1)}), n[k]);
+            }
+            store(fetch_scaled_, vec4_of(n[0], n[1], n[2], n[3]));
+            return false;
+        });
+        // as integers
+        when(m_.op(Op::OpLogicalNot, bool_, {normalized}), [&] {
+            Id point = word_has(1u << 26);
+            Id v4 = load(vec4_, fetch_scaled_), r[4];
+            for (uint32_t k = 0; k < 4; k++) {
+                Id v = comp(v4, k), lane = lane_of(k);
+                Id width = m_.op(Op::OpBitwiseAnd, uint_, {lane, u(0xF)});
+                Id sign = m_.op(Op::OpShiftRightLogical, uint_, {lane, u(4)});
+                Id halved = m_.op(Op::OpULessThan, bool_, {m_.op(Op::OpISub, uint_, {sign, u(1)}), u(2)});
+                Id shift =
+                    m_.op(Op::OpISub, uint_, {m_.op(Op::OpIAdd, uint_, {width, u(1)}), select(uint_, halved, u(1), u(0))});
+                Id scale = m_.op(Op::OpConvertUToF, float_,
+                                 {m_.op(Op::OpISub, uint_, {m_.op(Op::OpShiftLeftLogical, uint_, {u(1), shift}), u(1)})});
+                Id offset = sub(glsl(GLSLstd450FMin, float_, {scale, f(0.5f)}), f(0.5f));
+                r[k] = add(mul(v, glsl(GLSLstd450FMax, float_, {scale, f(0.5f)})), offset);
+                if (point_allowed) r[k] = select(float_, point, glsl(GLSLstd450RoundEven, float_, {r[k]}), r[k]);
+            }
+            store(fetch_scaled_, vec4_of(r[0], r[1], r[2], r[3]));
+            return false;
+        });
+        return false;
+    });
+    return load(vec4_, fetch_scaled_);
+}
+
+// Xenia's ParsedTextureFetchInstruction::AllowsPointSampling: the fetch can
+// return a single texel, no filter of the instruction's linear (nor
+// anisotropic, with a computed LOD)
+bool Translator::allows_point_sampling(const TextureFetchInstruction &t) {
+    return t.mag_filter != TextureFilter::Linear && t.min_filter != TextureFilter::Linear &&
+           t.mip_filter != TextureFilter::Linear &&
+           (!t.use_computed_lod || t.aniso_filter == AnisoFilter::Disabled || t.aniso_filter == AnisoFilter::UseFetchConst);
 }
 
 // xenos.cc's PWLGammaToLinear as Xenia's translators write it
@@ -1494,10 +1575,17 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates, 
         }
     }
 
-    // the coordinates, offset and normalized
+    // the coordinates, offset and normalized; with the point snap
+    // (VertexOptions::texture_point_snap, Xenia's CanSnapToTexelCenter: a
+    // point-sampled 2D fetch with normalized coordinates) the epsilon comes
+    // at the sample, where the snap does not take its place
+    const bool snap = (stage_ == Stage::Pixel ? pixel_.texture_point_snap : vertex_.texture_point_snap) &&
+                      t.opcode == FetchOpcode::TextureFetch && t.dimension == FetchOpDimension::D2 &&
+                      !t.unnormalized_coordinates && allows_point_sampling(t) && query == Query::Sample;
+    const float rounding = snap ? 0.0f : epsilon;
     Id c[3] = {comp(coordinates, 0), one ? f(0) : comp(coordinates, 1), cube || volume ? comp(coordinates, 2) : f(0)};
-    const float offsets[3] = {t.offset_x + epsilon, one ? 0.0f : t.offset_y + epsilon,
-                              cube ? t.offset_z : volume ? t.offset_z + epsilon : 0.0f};
+    const float offsets[3] = {t.offset_x + rounding, one ? 0.0f : t.offset_y + rounding,
+                              cube ? t.offset_z : volume ? t.offset_z + rounding : 0.0f};
     if (query == Query::Weights) {
         // getWeights as Xenia's (the LOD disregarded, as it does): per axis
         // the bilinear lerp factor, fract of the coordinate in texels plus
@@ -1600,7 +1688,21 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates, 
                            select(vec3, m_.op(Op::OpIEqual, bool_, {axis, u(1)}), on_y, on_z));
         return sample(sampled_image(2), coords, 3, coords);
     }
-    if (!volume) return sample(sampled_image(0), vec3_of(c[0], c[1], f(0)), 2, vec2_of(c[0], c[1]));
+    if (!volume) {
+        Id x = c[0], y = c[1];
+        if (snap) {
+            // the texel's center where the constant filters by point too
+            // (the integer scale word's bit 26), else the epsilon after all
+            Id point = m_.op(Op::OpINotEqual, bool_,
+                             {m_.op(Op::OpBitwiseAnd, uint_, {slot_word(12, slot), u(1u << 26)}), u(0)});
+            Id *axes[2] = {&x, &y};
+            for (uint32_t k = 0; k < 2; k++) {
+                Id snapped = div(add(glsl(GLSLstd450Floor, float_, {mul(c[k], size[k])}), f(0.5f)), size[k]);
+                *axes[k] = select(float_, point, snapped, add(c[k], div(f(epsilon), size[k])));
+            }
+        }
+        return sample(sampled_image(0), vec3_of(x, y, f(0)), 2, vec2_of(c[0], c[1]));
+    }
 
     // 3D, or stacked; both sampled (the right one chosen after, so the
     // implicit LOD's derivatives stay in uniform control flow)

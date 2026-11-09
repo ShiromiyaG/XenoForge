@@ -106,15 +106,28 @@ Info parse_fetch_constant(const uint32_t dwords[6]);
 // others.
 std::array<uint32_t, 4> component_bits(uint32_t format);
 
-// The result components (a bit each, after the constant's swizzle) a fetch
-// rounds to 16 fractional bits, as Xenia's translators since "Round
-// normalized unsigned fixed fetches" (GetIntegerScaleBits' bit 24 and the
-// per-component signs, texture_cache.h): a fixed-point format read as
-// fractions, its unsigned components (the console's filtered value is Q16;
-// games compare samples against Q16 constants, so 128/255 must read as
-// 32897/65536), after the signs and before the exponent adjust. Constant
-// components round to themselves.
-uint32_t q16_components(const Info &info);
+// The fetch constant's signs through its swizzle onto the result
+// components, two bits each (unsigned, signed, biased, gamma), as Xenia's
+// SwizzleSigns: constant components unsigned, or signed when everything else
+// is (all four constant: signed when the four signs are).
+uint32_t swizzled_signs(const Info &info);
+
+// Xenia's GetIntegerScaleBits (texture_cache.cc; its documentation in
+// texture_cache.h): how a fetch's result goes through the constant's number
+// format after the signs, before the exponent adjust. Bits 0-23, six a
+// result component: the width less one of the component it reads (from
+// component_bits, the source clamped to the last stored component) where it
+// is needed, and its sign (bits 4-5); constant components, gamma ones read as
+// integers, and components of no width, none. Bit 24: a fixed-point format
+// read as fractions (num_format 0): its unsigned components rounded to 16
+// fractional bits (the console's filtered values are Q16, and games compare
+// them with Q16 constants: 128/255 must read as 32897/65536), its 4-6 bit
+// unsigned ones, point-sampled, rebuilt as the console expands them (their
+// width carried only then). Bit 26: the constant filters by point (mag and
+// min point, mip point or base map, no anisotropy): integer results rounded,
+// the coordinate snap's condition. Nothing else for formats that are not
+// fixed-point.
+uint32_t integer_scale_bits(const Info &info, uint32_t swizzled_signs);
 
 // The levels the constant gives (Xenia's GetSubresourcesFromFetchConstant):
 // the base (level 0) when there is a base address, the mips (1 to mip_max)

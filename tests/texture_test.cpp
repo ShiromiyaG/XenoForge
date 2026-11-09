@@ -130,6 +130,43 @@ void test_parse() {
     CHECK(f.info().depth == 6);
 }
 
+// Xenia's GetIntegerScaleBits, by hand for each rule (texture_cache.h's
+// documentation of it), and SwizzleSigns' constants
+void test_number_format() {
+    using texture::integer_scale_bits;
+    using texture::swizzled_signs;
+    texture::Info i;
+    const uint32_t XYZW = 0 | 1 << 3 | 2 << 6 | 3 << 9;
+    // 8_8_8_8 read as fractions, linear: bit 24 only (no widths carried for
+    // unsigned components), the signs in the lanes
+    i.format = 6, i.swizzle = XYZW, i.mag_filter = i.min_filter = 1;
+    CHECK(integer_scale_bits(i, swizzled_signs(i)) == 1u << 24);
+    i.signs[1] = 2, i.signs[3] = 1; // biased y carries its width, signed w its sign and width
+    CHECK(integer_scale_bits(i, swizzled_signs(i)) == (1u << 24 | (0x20u | 7) << 6 | (0x10u | 7) << 18));
+    // point-filtered: bit 26; a 5_6_5's unsigned components carry their
+    // widths (4-6 bits), blue's 5 for w (clamped to the last stored)
+    i = {}, i.format = 4, i.swizzle = XYZW;
+    CHECK(integer_scale_bits(i, swizzled_signs(i)) == (1u << 26 | 1u << 24 | 4u | 5u << 6 | 4u << 12 | 4u << 18));
+    // and with a mip filter linear, no point and no widths
+    i.mip_filter = 1;
+    CHECK(integer_scale_bits(i, swizzled_signs(i)) == 1u << 24);
+    // read as integers: every component's width, gamma ones nothing,
+    // constant components nothing
+    i = {}, i.format = 6, i.num_format = 1, i.swizzle = 0 | 1 << 3 | 3 << 6 | 5 << 9, i.signs[1] = 3;
+    i.mag_filter = i.min_filter = 1;
+    CHECK(integer_scale_bits(i, swizzled_signs(i)) == (7u | 7u << 12));
+    // not fixed-point (DXT1, 32_FLOAT): nothing but the point bit
+    i = {}, i.format = 18, i.swizzle = XYZW;
+    CHECK(integer_scale_bits(i, swizzled_signs(i)) == 1u << 26);
+    i.format = 36, i.mag_filter = 1;
+    CHECK(integer_scale_bits(i, swizzled_signs(i)) == 0);
+    // SwizzleSigns: constants unsigned, or signed when every other is signed
+    i = {}, i.swizzle = 0 | 1 << 3 | 4 << 6 | 5 << 9, i.signs[0] = i.signs[1] = 1;
+    CHECK(swizzled_signs(i) == (1u | 1u << 2 | 1u << 4 | 1u << 6));
+    i.signs[1] = 0;
+    CHECK(swizzled_signs(i) == 1u);
+}
+
 // Each of these is laid out in guest memory as the hand computation says and
 // read back.
 void test_decode_linear_rgba8() {
@@ -779,6 +816,7 @@ int main() {
     test_tiled_addresses();
     test_packed_mips();
     test_parse();
+    test_number_format();
     test_decode_linear_rgba8();
     test_decode_tiled_8();
     test_plan_spans();

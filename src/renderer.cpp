@@ -513,6 +513,8 @@ struct RenderTarget {
     VkImageView view = VK_NULL_HANDLE;
     VkImageView sampled = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE; // color or depth alone, stencil alone
     VkDescriptorSet store_set = VK_NULL_HANDLE;                     // its EDRAM store's
+    // resolves' clears kept for its next render pass (Impl::flush_clears)
+    std::vector<std::pair<VkClearAttachment, VkClearRect>> pending_clears;
     uint32_t width = 0, height = 0; // in the console's pixels
     // its image's size: width and height at the resolution scale (Impl::scale_)
     uint32_t host_width = 0, host_height = 0;
@@ -684,11 +686,8 @@ struct System {
     float values[4];    // alpha reference, the point diameter's bounds (PA_SU_POINT_MINMAX)
     float color_scales[4];
     float point[4]; // the constant diameter (PA_SU_POINT_SIZE), guest pixel diameter to NDC radius
-    // per slot, its texture's signs on the result components (bits 0-7, two
-    // each: unsigned, signed, biased, gamma; Xenia's SwizzleSigns) and the
-    // width less one of each one's component (bits 8-23, four each; 0
-    // unknown), for biased components, and the components rounded to 16
-    // fractional bits (bits 24-27, texture::q16_components)
+    // per slot, its texture's signs on the result components (two bits
+    // each: unsigned, signed, biased, gamma; texture::swizzled_signs)
     uint32_t signs[32];
     uint32_t signed_slots[32]; // per slot, its texture's signed view as slots has it; 0 none
     float clip_planes[6][4];   // the user clip planes enabled, packed (shader::VertexOptions)
@@ -697,39 +696,11 @@ struct System {
     // report's first word in the extents buffer
     float extent_map[4];
     uint32_t extent_report[4];
+    // per slot, how its result goes through the constant's number format
+    // (texture::integer_scale_bits, Xenia's GetIntegerScaleBits)
+    uint32_t integer_scale[32];
 };
-static_assert(sizeof(System) == 608);
-
-// A slot's signs word (System::signs): the fetch constant's signs through its
-// swizzle onto the result components, as Xenia's SwizzleSigns (constant
-// components unsigned, or signed when everything else is), the biased ones'
-// component widths as its GetIntegerScaleBits gives them, and the components
-// rounded to 16 fractional bits.
-uint32_t swizzled_signs(const texture::Info &info) {
-    uint32_t signs = texture::q16_components(info) << 24, constants = 0;
-    bool any_signed = false, any_not_signed = false;
-    std::array<uint32_t, 4> bits = texture::component_bits(info.format);
-    uint32_t last_stored = 0;
-    for (uint32_t c = 1; c < 4; c++)
-        if (bits[c]) last_stored = c;
-    for (uint32_t k = 0; k < 4; k++) {
-        uint32_t source = (info.swizzle >> (3 * k)) & 7;
-        if (source & 4) {
-            constants |= 1u << (2 * k);
-            continue;
-        }
-        uint32_t sign = info.signs[source];
-        signs |= sign << (2 * k);
-        (sign == 1 ? any_signed : any_not_signed) = true;
-        uint32_t width = bits[std::min(source, last_stored)];
-        if (sign == 2 && width && width <= 16) signs |= (width - 1) << (8 + 4 * k);
-    }
-    bool constants_signed = constants == 0x55 ? info.signs[0] == 1 && info.signs[1] == 1 && info.signs[2] == 1 &&
-                                                    info.signs[3] == 1
-                                              : any_signed && !any_not_signed;
-    if (constants_signed) signs |= constants; // 1 for each constant component
-    return signs;
-}
+static_assert(sizeof(System) == 736);
 
 // The snorm format of a unorm one's bits, where the host has one (a signed
 // view of the same image); undefined for the rest.
@@ -2200,6 +2171,19 @@ private:
         const char *v = std::getenv("XF_RESOLVE_THROUGH_EDRAM");
         return v && v[0] == '1';
     }();
+    // resolves' clears kept for the target's next render pass
+    // (RenderTarget::pending_clears); XF_DEFER_CLEARS=0: drawn at once
+    bool defer_clears_ = [] {
+        const char *v = std::getenv("XF_DEFER_CLEARS");
+        return !(v && v[0] == '0');
+    }();
+    void flush_clears(RenderTarget *t);
+    // Xenia's texture_point_snap, off as there (shader::VertexOptions::
+    // texture_point_snap): XF_TEXTURE_POINT_SNAP=1
+    bool point_snap_ = [] {
+        const char *v = std::getenv("XF_TEXTURE_POINT_SNAP");
+        return v && v[0] == '1';
+    }();
     VkDescriptorPool compute_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet resolve_set_ = VK_NULL_HANDLE, load_set_ = VK_NULL_HANDLE, resolve_edram_set_ = VK_NULL_HANDLE;
     // the resolves' set 1: the textures they write as well, through 32- and
@@ -3373,6 +3357,18 @@ VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4]
     VkCommandBuffer c = cmd();
     if (in_pass_ && pass_ == pass) return c;
     end_pass();
+    // a target's kept clears (pending_clears) beyond this pass's area drawn
+    // before it, the rest in it once it begins
+    for (RenderTarget *t : {colors[0], colors[1], colors[2], colors[3], depth}) {
+        if (!t) continue;
+        for (const auto &[clear, rect] : t->pending_clears)
+            if (rect.rect.offset.x < 0 || rect.rect.offset.y < 0 ||
+                uint64_t(rect.rect.offset.x) + rect.rect.extent.width > pass.width ||
+                uint64_t(rect.rect.offset.y) + rect.rect.extent.height > pass.height) {
+                flush_clears(t);
+                break;
+            }
+    }
     full_barrier(c);
     VkRenderingAttachmentInfo attachments[4] = {};
     for (uint32_t i = 0; i < 4; i++) {
@@ -3403,9 +3399,42 @@ VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4]
         if (depth) kind += " " + target_name(*depth);
         gpu_mark(kind);
     }
+    // a kept clear over the whole render area as the attachment's load
+    // operation (the driver's fast clear, as Xenia's ClearRenderTargetView
+    // gets): the last such one, the kept clears before it dropped (it
+    // covers them), those after drawn in the pass
+    static const bool clear_load_op = [] {
+        const char *v = std::getenv("XF_CLEAR_LOAD_OP");
+        return !(v && v[0] == '0');
+    }();
+    for (uint32_t i = 0; i < 5 && clear_load_op; i++) {
+        RenderTarget *t = i < 4 ? colors[i] : depth;
+        if (!t || t->pending_clears.empty()) continue;
+        for (size_t j = t->pending_clears.size(); j-- > 0;) {
+            const auto &[clear, rect] = t->pending_clears[j];
+            if (rect.rect.offset.x || rect.rect.offset.y || rect.rect.extent.width != pass.width ||
+                rect.rect.extent.height != pass.height)
+                continue;
+            VkRenderingAttachmentInfo &a = i < 4 ? attachments[i] : depth_attachment;
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            a.clearValue = clear.clearValue;
+            t->pending_clears.erase(t->pending_clears.begin(), t->pending_clears.begin() + ptrdiff_t(j) + 1);
+            break;
+        }
+    }
     vkCmdBeginRendering(c, &rendering_info);
     in_pass_ = true;
     pass_ = pass;
+    for (uint32_t i = 0; i < 5; i++) {
+        RenderTarget *t = i < 4 ? colors[i] : depth;
+        if (!t || t->pending_clears.empty()) continue;
+        // (timed with the pass's draws)
+        for (auto [clear, rect] : t->pending_clears) {
+            clear.colorAttachment = i < 4 ? i : 0;
+            vkCmdClearAttachments(c, 1, &clear, 1, &rect);
+        }
+        t->pending_clears.clear();
+    }
     return c;
 }
 
@@ -3869,7 +3898,11 @@ bool Impl::translate(Shader &s, std::string &why) {
                 }
             }
         }
-        shader::Translation t = shader::translate(s.parsed, pixel ? shader::Stage::Pixel : shader::Stage::Vertex);
+        shader::VertexOptions vertex;
+        shader::PixelOptions pixel_options;
+        vertex.texture_point_snap = pixel_options.texture_point_snap = point_snap_;
+        shader::Translation t = shader::translate(s.parsed, pixel ? shader::Stage::Pixel : shader::Stage::Vertex,
+                                                  vertex, pixel_options);
         s.approximate = t.approximate;
         if (!t.ok()) {
             s.unsupported = t.unsupported.empty() ? "the translator wrote nothing" : t.unsupported.front();
@@ -3896,7 +3929,9 @@ VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options
     auto it = s.variants.find(key);
     if (it == s.variants.end()) {
         VkShaderModule m = VK_NULL_HANDLE;
-        shader::Translation t = shader::translate(s.parsed, shader::Stage::Pixel, {}, options);
+        shader::PixelOptions o = options;
+        o.texture_point_snap = point_snap_;
+        shader::Translation t = shader::translate(s.parsed, shader::Stage::Pixel, {}, o);
         if (t.ok()) {
             VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             info.codeSize = t.spirv.size() * 4;
@@ -3916,7 +3951,9 @@ VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &optio
     auto it = s.variants.find(key);
     if (it == s.variants.end()) {
         VkShaderModule m = VK_NULL_HANDLE;
-        shader::Translation t = shader::translate(s.parsed, shader::Stage::Vertex, options);
+        shader::VertexOptions o = options;
+        o.texture_point_snap = point_snap_;
+        shader::Translation t = shader::translate(s.parsed, shader::Stage::Vertex, o);
         if (t.ok()) {
             VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             info.codeSize = t.spirv.size() * 4;
@@ -4148,6 +4185,7 @@ VkDeviceSize Impl::edram_mask(const std::vector<uint32_t> &tiles) {
 }
 
 bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
+    flush_clears(t);
     uint32_t last_row = 0;
     for (uint32_t tile : tiles) last_row = std::max(last_row, ((tile + EDRAM_TILES - t->base) % EDRAM_TILES) / t->pitch_tiles);
     uint32_t height = std::min(scale_.up((last_row + 1) * t->tile_height), t->host_height);
@@ -4424,6 +4462,7 @@ VkPipeline Impl::edram_pipeline(const RenderTarget &t, VkShaderModule fs, VkPipe
 }
 
 bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows) {
+    flush_clears(t);
     VkPipeline pipeline = load_pipeline(*t);
     if (!pipeline) return fatal_ = "could not make an EDRAM load pipeline", false;
     VkDeviceSize mask = edram_mask(tiles);
@@ -4487,6 +4526,8 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
 // a row, whole rows, a part of a row), a pass per stencil bit more for depth
 // without stencil export.
 bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::vector<uint32_t>> &held) {
+    flush_clears(t);
+    for (const auto &[holder, tiles] : held) flush_clears(holder);
     struct Draw {
         RenderTarget *source;
         std::vector<VkRect2D> rects;
@@ -7385,7 +7426,23 @@ void Impl::draw(const gpu::Draw &d) {
             }
         uint32_t sampler_bits = sampler(fetch, overrides) << 16;
         sys.slots[slot] = index | t->kind << 14 | sampler_bits;
-        sys.signs[slot] = swizzled_signs(info);
+        sys.signs[slot] = texture::swizzled_signs(info);
+        // (XF_TEXTURE_NUMBER_FORMAT=0: none of it, to measure what it costs)
+        static const bool number_format = [] {
+            const char *v = std::getenv("XF_TEXTURE_NUMBER_FORMAT");
+            return !(v && v[0] == '0');
+        }();
+        sys.integer_scale[slot] = number_format ? texture::integer_scale_bits(info, sys.signs[slot]) : 0u;
+        if (sys.integer_scale[slot] & ((1u << 24) - 1)) {
+            if (!(sys.integer_scale[slot] & (1u << 24)))
+                use("textures read with the integer number format (scaled to the guest's integers)");
+            else
+                for (uint32_t k = 0; k < 4; k++)
+                    if (((sys.integer_scale[slot] >> (6 * k)) & 0x3F) - 1 < 15) {
+                        use("4-6 bit unsigned components of point-filtered textures (rebuilt as the console expands them)");
+                        break;
+                    }
+        }
         if (info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1) {
             if (t->signed_read == texture::Signed::None) {
                 approximate("signed texture components read as unsigned (no signed version of the format)");
@@ -8281,27 +8338,43 @@ void Impl::resolve() {
                         if (whole) tile_clear_value_[tile] = clear.clearValue;
                     }
             }
-            VkCommandBuffer c = outside();
-            gpu_mark("resolves: clears");
-            VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            attachment.imageView = t->raw ? t->raw : t->view;
-            attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            rendering.renderArea = {{0, 0}, {t->host_width, t->host_height}};
-            rendering.layerCount = 1;
-            if (t->depth) {
-                rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
-            } else {
-                rendering.colorAttachmentCount = 1;
-                rendering.pColorAttachments = &attachment;
-            }
-            vkCmdBeginRendering(c, &rendering);
-            vkCmdClearAttachments(c, 1, &clear, 1, &rect);
-            vkCmdEndRendering(c);
+            // kept for the target's next render pass, whose draws need it
+            // first, and drawn there (begin_pass), without a barrier and a
+            // rendering pass of its own; anything else that reads or writes
+            // the image first has it drawn before (flush_clears). Not for a
+            // target cleared through its UINT view (begin_pass draws through
+            // the other), nor with XF_DEFER_CLEARS=0.
+            t->pending_clears.push_back({clear, rect});
+            if (t->raw || !defer_clears_) flush_clears(t);
         }
     }
+}
+
+// A target's kept clears drawn now, in a rendering pass of their own (as
+// Xenia's resolves clear), before something other than its next render pass
+// takes its image
+void Impl::flush_clears(RenderTarget *t) {
+    if (!t || t->pending_clears.empty()) return;
+    VkCommandBuffer c = outside();
+    gpu_mark("resolves: clears");
+    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    attachment.imageView = t->raw ? t->raw : t->view;
+    attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, {t->host_width, t->host_height}};
+    rendering.layerCount = 1;
+    if (t->depth) {
+        rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
+    } else {
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &attachment;
+    }
+    vkCmdBeginRendering(c, &rendering);
+    for (const auto &[clear, rect] : t->pending_clears) vkCmdClearAttachments(c, 1, &clear, 1, &rect);
+    vkCmdEndRendering(c);
+    t->pending_clears.clear();
 }
 
 // Beyond Xenia, whose resolves write memory and whose textures over it are
@@ -8545,6 +8618,7 @@ void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
 // Its pages are then the GPU's (gpu_written); textures over it are loaded
 // again; guest memory gets the bytes as readback_resolve says.
 void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
+    flush_clears(&source);
     std::vector<Range> written, partial;
     if (!resolve::destination_ranges(info, written, partial)) {
         approximate(std::string("resolve not written: resolve to ") + format_name(info.dest_format));

@@ -992,14 +992,32 @@ adjust), and what else differed from Xenia without being counted:
   else 2u - 1.
 - **The exponent adjust** (fetch constant word 3): the result times its
   power of two.
-- **Unsigned fixed-point components rounded to Q16** (since 2026-11-09):
-  formats with fixed-point components read as fractions (num_format 0)
-  return their unsigned components rounded to 16 fractional bits, half to
-  even, after the signs and before the exponent adjust (Xenia's 0c843efb3
-  and c3cd8617b, GetIntegerScaleBits' bit 24; `texture::q16_components`,
-  bits 24-27 of the slot's signs word). The console filters in Q16, so a
-  byte of 128 reads 32897/65536, not 128/255, and games compare samples
-  against that constant ("Motion blur near the car").
+- **The number format** (since 2026-11-09; Xenia's d11950528, 0c843efb3,
+  052cb95f2, c3cd8617b): after the signs and before the exponent adjust,
+  by the slot's integer scale word (system member 12,
+  `texture::integer_scale_bits`, Xenia's GetIntegerScaleBits ported as it
+  is: six bits a component, its width less one and its sign; bit 24 a
+  fixed-point format read as fractions; bit 26 the constant filtering by
+  point), each part behind a uniform branch so that a fetch runs only its
+  own (computed for every fetch and selected, the parts cost game D's frame
+  0.3 ms of draws; branched, nothing measurable). Read as fractions: the
+  unsigned components rounded to 16 fractional bits, half to even (the
+  console filters in Q16, so a byte of 128 reads 32897/65536, not 128/255,
+  and games compare samples against that constant: "Motion blur near the
+  car"); point-sampled 4-6 bit unsigned components rebuilt as the console
+  expands them, n (2^w + 1) / 2^2w; biased ones no lower than -1 (decoded
+  unclamped before). Read as integers (num_format 1): scaled back to the
+  guest's integers, times 2^w - 1 unsigned or 2^(w-1) - 1 signed and
+  biased (a 1-bit biased one times a half less a half), rounded when both
+  the fetch and the constant sample by point. Xenia's `texture_point_snap`
+  (off there and here, `XF_TEXTURE_POINT_SNAP=1`): point-sampled 2D fetches
+  with normalized coordinates sample at their texel's center where the
+  constant filters by point too, instead of adding the rounding epsilon.
+  The reference renderer's sampler does the same after filtering.
+  `XF_TEXTURE_NUMBER_FORMAT=0` leaves it all out (to measure its cost). No
+  frame of the corpus (121 traces) has an integer-format fixed-point
+  texture or a point-filtered 4-6 bit one; `texture_test` checks the word
+  against Xenia's rules by hand.
 - **Pixel parameters** (SQ_PROGRAM_CNTL's param_gen): the pixel's
   position, its facing and the kind of primitive in the interpolator
   SQ_CONTEXT_MISC names, as Xenia writes them (VPOS for screen-space
@@ -2777,6 +2795,28 @@ small ones at 7 us each) and clears (0.35 against 0.12: each a full barrier
 and a rendering pass of its own; candidates: a clear kept for the target's
 next render pass, narrower barriers).
 
+**Clears kept for the target's next render pass (2026-11-09).** A
+resolve's clear on the host path was a full barrier and a rendering pass
+of its own with `vkCmdClearAttachments` (84 in the drive frame, 0.35 ms).
+Now it is kept with the target (`RenderTarget::pending_clears`) and drawn
+by its next render pass (`begin_pass`): as the attachment's load operation
+when it covers the pass's whole area (the driver's fast clear, as Xenia's
+`ClearRenderTargetView` gets), else inside the pass; anything else that
+takes the image first (an EDRAM store, load or transfer, a resolve from
+it) draws it before, in a pass of its own as before (`flush_clears`), and
+so do targets cleared through their UINT view. The same picture bit for
+bit; the frame, fastest of four runs interleaved: 8.40-8.55 ms clearing at
+once, 8.21-8.26 kept (`XF_DEFER_CLEARS=0` and `XF_CLEAR_LOAD_OP=0` turn the
+two parts off), the clears left 0.06 ms (Xenia 0.12). The small resolve
+chain's copies stay: about 8 us each, the dispatch's and the barrier's
+latency rather than its work, as Xenia's own (5.5-7 us).
+
+**Timing these replays.** The GPU's clock is chosen per process: a run is
+either fast (8.0-8.5 ms a play here) or about twice as slow for its whole
+life, warm-up or not, 30 or 150 plays (nvidia-smi shows the clock low
+throughout; the constants were in video memory in both). Comparisons take
+the fastest of several runs of each, interleaved.
+
 **The drive timed live (2026-11-09).** The same timing in Xenia's whole
 executable (the local measuring build logs `xf-gpu-timing swap N at T s
 total X ms/frame; kind ms ...` every 300 swaps with `--d3d12_gpu_timing`;
@@ -3137,8 +3177,7 @@ engine's primitive types and triangles with wireframe flags; polygon fill
 modes other than solid (filled); lines are parallelograms (Vulkan's
 non-strict lines), with no stipple; seamless cube filtering; clamp to
 halfway (as to the edge); signed versions of the widened formats
-(10_11_11, 11_11_10 read unsigned when signed); textures with the integer
-number format (read as fractions); occlusion query counts and screen
+(10_11_11, 11_11_10 read unsigned when signed); occlusion query counts and screen
 extents (the processor's fake reports); getBCF (0, as Xenia). Performance:
 one interpreter invocation per vertex and per pixel lane, heap-allocated;
 the 29 frames take a minute, the work is bound by the interpreter.
@@ -3182,10 +3221,9 @@ same stencil, a different velocity buffer (37658 of 230400 pixels), and the
 shader run by hand on Xenia's bytes giving Xenia's output only with the Q16
 value.
 
-Not done yet from the same family of Xenia's commits: the integer number
-format's scaling back to the guest's integers (d11950528), and point-sampled
-fetches snapped to texel centers with 4-6 bit unsigned components rebuilt by
-the console's bit repetition (c3cd8617b).
+The rest of the same family of Xenia's commits followed the same day: the
+integer number format's scaling back to the guest's integers (d11950528)
+and the point-sampled parts (c3cd8617b), above in "The number format".
 
 ## What is asked and not done is counted
 

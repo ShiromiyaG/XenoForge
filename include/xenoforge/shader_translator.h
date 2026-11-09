@@ -102,6 +102,12 @@ struct VertexOptions {
     // bottom ones plus one (zero: nothing yet). A position not in front of
     // the eye (w not above 0, or not a number) takes the whole viewport.
     bool extents = false;
+    // Xenia's texture_point_snap (off by default there too): point-sampled
+    // 2D fetches with normalized coordinates, where the fetch constant
+    // filters by point too (texture::integer_scale_bits' bit 26), sample at
+    // their texel's center instead of adding the rounding epsilon. One
+    // setting for the whole run (the renderer's), so not part of the key.
+    bool texture_point_snap = false;
     // a word naming the variant (the renderer's key for the module)
     uint32_t key() const {
         return uint32_t(host) | (equal_spacing ? 1u << 8 : 0u) | uint32_t(clip_planes) << 9 |
@@ -143,6 +149,7 @@ struct PixelOptions {
     // coordinates, read from location 17 (the point expansion's), as
     // Xenia's param_gen_point
     bool point_coordinates = false;
+    bool texture_point_snap = false; // VertexOptions::texture_point_snap's; not part of the key
     std::span<const uint32_t> edram_library; // with fsi; not part of the key
     uint32_t key() const {
         return depth_float24 | uint32_t(centroid) << 8 | uint32_t(fsi) << 24 | uint32_t(point_coordinates) << 30;

@@ -135,13 +135,15 @@ bool fields(HostFormat format, const uint8_t *p, Fields &out) {
 }
 
 // a component through its sign (texture_signs): unsigned, signed (snorm,
-// no lower than -1), biased (offset binary), gamma (the piecewise linear
-// curve back to linear)
-float signed_component(const Fields &f, uint32_t i, uint32_t sign) {
+// no lower than -1), biased (offset binary; no lower than -1 for a
+// fixed-point format read as fractions, `clamp`, as the number format then
+// takes it in the translator), gamma (the piecewise linear curve back to
+// linear)
+float signed_component(const Fields &f, uint32_t i, uint32_t sign, bool clamp) {
     if (f.is_float) {
         float v = f.f[i];
         if (sign == 3) return pieces::pwl_gamma_to_linear(v);
-        if (sign == 2) return std::max(v * 2.0f - 1.0f, -1.0f);
+        if (sign == 2) return v * 2.0f - 1.0f;
         return v;
     }
     uint32_t w = f.width[i], value = f.bits[i];
@@ -153,9 +155,14 @@ float signed_component(const Fields &f, uint32_t i, uint32_t sign) {
         return std::max(-1.0f, float(s) / float((1u << (w - 1)) - 1));
     }
     case 2: {
-        if (w < 2) return std::max(unorm * 2.0f - 1.0f, -1.0f);
-        float half = float(1u << (w - 1));
-        return std::max((float(value) - half) / (half - 1.0f), -1.0f);
+        float v;
+        if (w < 2) {
+            v = unorm * 2.0f - 1.0f;
+        } else {
+            float half = float(1u << (w - 1));
+            v = (float(value) - half) / (half - 1.0f);
+        }
+        return clamp ? std::max(v, -1.0f) : v;
     }
     case 3: return pieces::pwl_gamma_to_linear(unorm);
     default: return unorm;
@@ -184,7 +191,7 @@ std::shared_ptr<const Texture> Textures::get(const uint32_t fetch[6], std::strin
     if (any_signed && plan.signed_read == texture::Signed::Separate)
         counts.add("signed components of a widened texture format read from its unsigned version");
     if (plan.half != texture::Half::None) counts.add("16-bit fixed texels as halves");
-    if (info.num_format == 1) counts.add("textures with the integer number format (read as fractions)");
+    const bool biased_clamp = !info.num_format && texture::component_bits(info.format)[0] != 0;
 
     auto t = std::make_shared<Texture>();
     t->info = info;
@@ -223,7 +230,7 @@ std::shared_ptr<const Texture> Textures::get(const uint32_t fetch[6], std::strin
             for (uint32_t g = 0; g < 4; g++) {
                 uint32_t h = (plan.host_swizzle >> (3 * g)) & 7;
                 if (h < 4 && h < f.count)
-                    out[g] = signed_component(f, h, info.signs[g]);
+                    out[g] = signed_component(f, h, info.signs[g], biased_clamp);
                 else
                     out[g] = h == 5 ? 1.0f : 0.0f;
             }
@@ -594,14 +601,43 @@ bool sample(const Texture *t, const shader::TextureFetch &fetch, float out[4], s
     }
     if (taps > 1)
         for (int i = 0; i < 4; i++) value[i] = sum[i] / float(taps);
-    // the fetch constant's swizzle, the components rounded to 16 fractional
-    // bits (texture::q16_components, half to even) and the exponent adjust
+    // the fetch constant's swizzle, its number format (the translator's
+    // texture_signs, Xenia's: texture::integer_scale_bits) and the exponent
+    // adjust
     float scale = std::ldexp(1.0f, info.exp_adjust);
-    const uint32_t q16 = texture::q16_components(info);
+    const uint32_t bits = texture::integer_scale_bits(info, texture::swizzled_signs(info));
+    // (Xenia's AllowsPointSampling: no filter of the instruction's linear)
+    const bool point_allowed =
+        in.mag_filter != TextureFilter::Linear && in.min_filter != TextureFilter::Linear &&
+        in.mip_filter != TextureFilter::Linear &&
+        (!in.use_computed_lod || in.aniso_filter == ucode::AnisoFilter::Disabled ||
+         in.aniso_filter == ucode::AnisoFilter::UseFetchConst);
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t sw = (info.swizzle >> (3 * i)) & 7;
         float v = sw < 4 ? value[sw] : sw == 5 ? 1.0f : 0.0f;
-        if (q16 & (1u << i)) v = std::nearbyint(v * 65536.0f) / 65536.0f;
+        const uint32_t lane = (bits >> (6 * i)) & 0x3F, width_less_one = lane & 0xF, sign = lane >> 4;
+        if (bits & ((1u << 26) - 1)) {
+            if (bits & (1u << 24)) {
+                // as fractions: 4-6 bit unsigned components point-sampled
+                // rebuilt as the console expands them, n (2^w + 1) / 2^2w;
+                // unsigned ones to Q16; biased ones no lower than -1
+                if (point_allowed && (bits & ((1u << 24) - 1)) && lane - 1 < 15) {
+                    const float pow2 = float(2u << width_less_one);
+                    const float texel = std::nearbyint(v * (pow2 - 1.0f));
+                    v = texel * (pow2 + 1.0f) / (pow2 * pow2);
+                }
+                if (sign == 0) v = std::nearbyint(v * 65536.0f) / 65536.0f;
+                if (sign == 2) v = std::max(v, -1.0f);
+            } else {
+                // as integers: times 2^w - 1, or 2^(w-1) - 1 signed or biased
+                // (a 1-bit biased one times a half, less a half), rounded
+                // when the fetch and the constant both sample by point
+                const uint32_t shift = width_less_one + 1 - (sign - 1 < 2 ? 1u : 0u);
+                const float s = float((1u << shift) - 1);
+                v = v * std::max(s, 0.5f) + (std::min(s, 0.5f) - 0.5f);
+                if (point_allowed && (bits & (1u << 26))) v = std::nearbyint(v);
+            }
+        }
         out[i] = v * scale;
     }
     return true;
