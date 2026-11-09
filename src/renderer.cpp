@@ -2208,6 +2208,8 @@ private:
     }();
     std::vector<uint32_t> free_samplers_; // slots of samplers destroyed, to reuse
     std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> pipelines_;
+    PipelineEntry *last_pipeline_ = nullptr; // the entry pipeline() found last, and its key
+    std::vector<uint32_t> last_pipeline_key_;
 
     // submissions
     VkCommandPool pool_ = VK_NULL_HANDLE;
@@ -5661,10 +5663,18 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
         report_.pipeline_wait_seconds += waited;
         report_.pipeline_wait_max = std::max(report_.pipeline_wait_max, waited);
     };
+    // The last draw's pipeline again (most draws follow one of the same state): one comparison of
+    // the key instead of the map's search, a compare of two keys at each of its levels. Entries
+    // are never dropped.
+    if (last_pipeline_ && last_pipeline_->pipeline && !last_pipeline_->stand_in && key == last_pipeline_key_ &&
+        last_pipeline_->asked == std::chrono::steady_clock::time_point{} &&
+        last_pipeline_->state.load(std::memory_order_acquire))
+        return last_pipeline_->pipeline;
     PipelineEntry *e = nullptr;
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) {
         e = it->second.get();
+        last_pipeline_ = e, last_pipeline_key_ = key;
         if (e->state.load(std::memory_order_acquire)) {
             if (e->stand_in) retire_stand_in(*e);
             if (e->pipeline) drawn_with(*e);
