@@ -258,6 +258,18 @@ void achievements(const std::filesystem::path &storage) {
         CHECK(!earn_achievement(*K, 0, 99)); // not in the title
         CHECK(!earn_achievement(*K, 3, 1));  // nobody signed in at index 3
         // XGIUserWriteAchievements through the app dispatcher's message is the same call
+        // XGIUserSetContext and XGIUserSetPropertyEx are their own messages: a
+        // context's user index and XUID are no achievement count and list
+        // (they fell into the achievements' case, and a game read guest 0x20)
+        {
+            uint32_t context = K->memory().system_alloc(0x18);
+            K->store32(context + 0, 1);    // user index (taken as a count)
+            K->store32(context + 4, 0x20); // the XUID's high word (taken as the list)
+            K->store32(context + 8, 0), K->store32(context + 12, 0x8000), K->store32(context + 16, 1);
+            CHECK(xam(c, "XMsgInProcessCall", {0xFB, 0x000B0006, context, 0x18}) == 0);
+            CHECK(xam(c, "XMsgInProcessCall", {0xFB, 0x000B0007, context, 0x18}) == 0);
+            CHECK(profile_summary(*K).gamerscore == 20); // nothing earned by them
+        }
         // the enumerator, strings behind the records
         uint32_t size_ptr = K->memory().system_alloc(4), handle_ptr = K->memory().system_alloc(4);
         CHECK(xam(c, "XamUserCreateAchievementEnumerator", {0, 0, 0, 7, 0, 4, size_ptr, handle_ptr}) ==
