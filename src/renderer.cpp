@@ -6184,7 +6184,8 @@ std::unique_ptr<PipelineDesc> Impl::undescribe(std::span<const uint32_t> words, 
                 st.module = s->module;
             } else if (form >> 31) {
                 shader::PixelOptions o;
-                o.depth_float24 = uint8_t(form & 0xFF);
+                o.depth_float24 = uint8_t(form & 3);
+                o.early_depth_stencil = (form >> 2) & 1;
                 o.centroid = uint16_t(form >> 8);
                 o.fsi = uint8_t((form >> 24) & 0x3F);
                 o.point_coordinates = (form >> 30) & 1;
@@ -7661,6 +7662,23 @@ void Impl::draw(const gpu::Draw &d) {
     // point expansion (Xenia's param_gen_point)
     const bool point_coordinates =
         ps && points && ((regs_[reg::SQ_PROGRAM_CNTL] >> 18) & 1) && ((regs_[r::SQ_CONTEXT_MISC] >> 8) & 0xFF) < 16;
+    // Xenia's DepthStencilMode::kEarlyHint (pipeline_cache.cc): on the host
+    // path, without a float24 conversion, a shader that may write depth early
+    // (Shader::implicit_early_z_write_allowed: no kill, no oDepth, no memory
+    // export) is given its early form (PixelOptions::early_depth_stencil)
+    // where the coverage does not depend on its alpha (draw_util's
+    // DoesCoverageDependOnAlpha: an alpha test other than always, or alpha to
+    // coverage), or it does not write oC0. XF_EARLY_DEPTH_STENCIL=0: never.
+    static const bool early_allowed = [] {
+        const char *v = std::getenv("XF_EARLY_DEPTH_STENCIL");
+        return !(v && v[0] == '0');
+    }();
+    const uint32_t color_control_now = regs_[r::RB_COLORCONTROL];
+    const bool early =
+        early_allowed && ps && !fsi_ && !export_only && !float24_convert && !ps->summary.kills && !ps->writes_depth &&
+        !ps->exports &&
+        (!(ps->colors_written & 1) ||
+         !(((color_control_now & 8) && (color_control_now & 7) != 7) || (color_control_now & 16)));
     bool sample_shading = false;
     if (fsi_ && !export_only) {
         // the interlock path: the guest's shader with the output merger taken
@@ -7681,9 +7699,10 @@ void Impl::draw(const gpu::Draw &d) {
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
             return;
         }
-    } else if (ps && (float24_convert || centroid || point_coordinates)) {
+    } else if (ps && (float24_convert || centroid || point_coordinates || early)) {
         shader::PixelOptions options;
         options.depth_float24 = uint8_t(float24_mode);
+        options.early_depth_stencil = early;
         options.centroid = uint16_t(centroid);
         options.point_coordinates = point_coordinates;
         fragment = pixel_module(*ps, options, why);
@@ -7712,7 +7731,7 @@ void Impl::draw(const gpu::Draw &d) {
         sample_shading = msaa && fragment && !ps;
     }
     key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) |
-                  (point_coordinates ? 16u : 0u) | centroid << 16);
+                  (point_coordinates ? 16u : 0u) | (early ? 32u : 0u) | centroid << 16);
     VkPipelineShaderStageCreateInfo stages[4] = {};
     uint32_t stage_count = 0;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {

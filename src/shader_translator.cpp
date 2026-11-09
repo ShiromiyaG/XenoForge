@@ -2491,15 +2491,22 @@ void Translator::main_pixel() {
         outputs = global(m_.type_array(vec4_, 4), spv::StorageClass::Output, "colors");
         m_.decorate(outputs, spv::Decoration::Location, {0});
     }
-    bool writes_depth = false;
+    bool writes_depth = false, kills = false;
     for (const ControlFlow &cf : s_.control_flow)
         if (const auto *e = std::get_if<Exec>(&cf.instruction))
             for (const ExecSlot &slot : e->slots)
-                if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
+                if (const auto *a = std::get_if<AluInstruction>(&slot.instruction)) {
                     writes_depth |= a->vector_and_constant_result.target == StorageTarget::Depth ||
                                     a->scalar_result.target == StorageTarget::Depth;
+                    kills |= (vector_opcode_info(a->vector_opcode).changed_state & CHANGES_PIXEL_KILL) ||
+                             (scalar_opcode_info(a->scalar_opcode).changed_state & CHANGES_PIXEL_KILL);
+                }
     // the depth converted to 20e4 (PixelOptions), oDepth's or the rasterized one
     const uint32_t float24 = fsi ? 0 : pixel_.depth_float24;
+    // Xenia's IsForceEarlyDepthStencilGlobalFlagEnabled: the early hint, for a
+    // shader whose implicit early depth write is allowed (no kill, no oDepth,
+    // no memory export)
+    const bool early = pixel_.early_depth_stencil && !fsi && !float24 && !writes_depth && !kills && !em_written_;
     Id frag_depth = 0;
     if (!fsi && (writes_depth || float24)) {
         frag_depth = global(float_, spv::StorageClass::Output, "depth");
@@ -2543,7 +2550,7 @@ void Translator::main_pixel() {
                     for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
                         writes_color_0 |= r->target == StorageTarget::Color && (r->index & 3) == 0 && r->used_write_mask();
     Id sample_mask = 0;
-    if (writes_color_0 && !fsi) {
+    if (writes_color_0 && !fsi && !early) {
         sample_mask = global(m_.type_array(int_, 1), spv::StorageClass::Output, "sample_mask");
         m_.decorate(sample_mask, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::SampleMask)});
     }
@@ -2695,8 +2702,9 @@ void Translator::main_pixel() {
         store(frag_depth, select(float_, float24, exact(Op::OpFMul, float_, {depth, f(0.5f)}), depth));
     }
     // the alpha test (state, not microcode): oC0's alpha against the
-    // reference, by the function in the system constants
-    {
+    // reference, by the function in the system constants (the early form is
+    // for draws without one)
+    if (!early) {
         Id flags = m_.op(Op::OpCompositeExtract, uint_, {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)})), 0});
         Id reference = comp(load(vec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, vec4_), {system_, u(4)})), 0);
         Id alpha = comp(load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(0)})), 3);
@@ -2909,6 +2917,7 @@ void Translator::main_pixel() {
         m_.execution_mode(main, pixel_.fsi == 2 ? spv::ExecutionMode::SampleInterlockOrderedEXT
                                                 : spv::ExecutionMode::PixelInterlockOrderedEXT);
     if (frag_depth) m_.execution_mode(main, spv::ExecutionMode::DepthReplacing);
+    if (early) m_.execution_mode(main, spv::ExecutionMode::EarlyFragmentTests);
     // truncation never raises the rasterized depth: early depth tests may
     // still reject (Xenia's SV_DepthLessEqual)
     if (float24 == 1 && !writes_depth) m_.execution_mode(main, spv::ExecutionMode::DepthLess);

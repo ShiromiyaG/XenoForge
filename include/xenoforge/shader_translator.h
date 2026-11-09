@@ -149,10 +149,19 @@ struct PixelOptions {
     // coordinates, read from location 17 (the point expansion's), as
     // Xenia's param_gen_point
     bool point_coordinates = false;
+    // Xenia's DepthStencilMode::kEarlyHint: the draw's state has no alpha test
+    // and no alpha to coverage, so a shader that neither kills, writes depth
+    // nor exports memory has its depth and stencil tested and written before
+    // it runs (EarlyFragmentTests), and the alpha test, the alpha to coverage
+    // and the coverage output are left out. Ignored for a shader that does any
+    // of those, with a float24 conversion and on the interlock path.
+    bool early_depth_stencil = false;
     bool texture_point_snap = false; // VertexOptions::texture_point_snap's; not part of the key
     std::span<const uint32_t> edram_library; // with fsi; not part of the key
     uint32_t key() const {
-        return depth_float24 | uint32_t(centroid) << 8 | uint32_t(fsi) << 24 | uint32_t(point_coordinates) << 30;
+        // (depth_float24 is 0-2: bit 2 is free)
+        return depth_float24 | uint32_t(early_depth_stencil) << 2 | uint32_t(centroid) << 8 | uint32_t(fsi) << 24 |
+               uint32_t(point_coordinates) << 30;
     }
 };
 Translation translate(const ucode::ParsedShader &shader, Stage stage, const VertexOptions &vertex = {},
