@@ -43,7 +43,13 @@ param(
     # window (--hid=keyboard --keyboard_mode=1, its default bindings), which
     # need no focus, so nothing else on the desktop gets them. The scene a
     # benchmark measures can then be one that is played, not a title screen.
-    [string[]]$Press = @()
+    [string[]]$Press = @(),
+    # more arguments for Xenia (a measuring build's switches, say)
+    [string[]]$XeniaArgs = @(),
+    # the GPU's graphics clock every 250 ms of each run, beside its log
+    # (nvidia-smi): GPU time a frame counts at whatever clock the driver
+    # chose, and a lightly loaded GPU is often clocked down
+    [switch]$Clocks
 )
 
 $extra = @()
@@ -150,12 +156,17 @@ for ($run = 1; $run -le $Runs; $run++) {
             }
         }
         if ($storage) { Remove-Item -Recurse -Force $storage -ErrorAction SilentlyContinue }
+        $clockLog = $null
+        if ($Clocks) {
+            $clockLog = Start-Process -FilePath nvidia-smi -ArgumentList '--query-gpu=clocks.gr --format=csv,noheader,nounits -lms 250' `
+                -RedirectStandardOutput "$Out.$config.$run.clocks.txt" -PassThru -WindowStyle Hidden
+        }
         switch ($kind) {
             { $_ -in 'ours', 'ours-host' } {
                 $line = & $Bench --seconds $Seconds --warmup $Warmup --self @extra --stdout "$Out.$config.$run.log" --label $label -- $Ours $Disc @OursArgs @pressArgs
             }
             { $_ -in 'xenia-d3d12', 'xenia-d3d12-rov' } {
-                $xeniaArgs = @('--gpu=d3d12') + $xeniaScale
+                $xeniaArgs = @('--gpu=d3d12') + $xeniaScale + $XeniaArgs
                 if ($kind -eq 'xenia-d3d12-rov') { $xeniaArgs += '--render_target_path_d3d12=rov' }
                 $benchArgs = @('--seconds', "$Seconds", '--warmup', "$Warmup", '--dxgi') + $extra + @('--label', $label, '--', $Xenia)
                 if ($keyEvents.Count) {
@@ -168,6 +179,16 @@ for ($run = 1; $run -le $Runs; $run++) {
         Remove-Item Env:XF_RENDER_TARGET_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:XF_RESOLUTION_SCALE -ErrorAction SilentlyContinue
         if ($base) { foreach ($name in $BaseEnv) { Remove-Item "Env:$(($name -split '=', 2)[0])" -ErrorAction SilentlyContinue } }
+        if ($clockLog) {
+            Stop-Process -Id $clockLog.Id -ErrorAction SilentlyContinue
+            # (the window's samples: four a second from the start)
+            $mhz = @(Get-Content "$Out.$config.$run.clocks.txt" | Where-Object { $_ -match '^\s*\d+\s*$' } | ForEach-Object { [int]$_ } |
+                Select-Object -Skip ([int]($Warmup * 4)) -First ([int]($Seconds * 4)))
+            if ($mhz.Count) {
+                $sorted = $mhz | Sort-Object
+                $line = @($line | Select-Object -SkipLast 1) + "$(@($line)[-1]) gpu_clock_mhz_median=$($sorted[[int][Math]::Floor(($sorted.Count - 1) / 2)])"
+            }
+        }
         $line | Add-Content $Out
         $line | Select-Object -Last 1
     }

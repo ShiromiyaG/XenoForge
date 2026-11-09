@@ -2777,6 +2777,37 @@ small ones at 7 us each) and clears (0.35 against 0.12: each a full barrier
 and a rendering pass of its own; candidates: a clear kept for the target's
 next render pass, narrower barriers).
 
+**The drive timed live (2026-11-09).** The same timing in Xenia's whole
+executable (the local measuring build logs `xf-gpu-timing swap N at T s
+total X ms/frame; kind ms ...` every 300 swaps with `--d3d12_gpu_timing`;
+ours the same line with `XF_GPU_TIME=1 XF_GPU_TIME_LOG=1`), the played
+drive, host render targets, the 125-200 s window, one run each
+(`bench_vs_xenia.ps1 -XeniaArgs ... -Clocks`):
+
+| ms a frame | ours (host) | Xenia D3D12 (timed) |
+| --- | --- | --- |
+| draws (Xenia: and its uploads and barriers) | 4.35 | 2.75 + 0.77 |
+| render target transfers | 1.52 | 2.52 |
+| resolve copies | 1.19 | 0.52 |
+| EDRAM stores (Xenia's dumps) | - | 0.46 |
+| texture loads | 0.47 | 0.83 |
+| clears | 0.35 | 0.15 |
+| total | 7.88 | 8.00 |
+
+Untimed, by the system's GPU counters (xfbench): ours 8.33 ms a frame
+(9.2-9.4 before the resolves above), Xenia 6.24. Xenia's timing costs
+Xenia itself: 6.24 untimed against 8.39 timed (it waits for every
+submission), so its column is a fair split but not its untimed total. The
+GPU clock (nvidia-smi every 250 ms) does not normalize the two: its median
+is mostly the idle GPU's (Xenia's 1312 MHz untimed against ours 1710),
+not the clock its work ran at. What stands: live as on the replayed frame,
+the draws are where ours spends more (about a quarter more than Xenia's,
+the replay's 4.22 against 3.58 too), then the copies and the clears; the
+transfers, the stores and the texture loads are where ours spends less.
+Ours outside the renderer's timing (the player's presentation): about 0.45
+ms a frame (8.33 counted against 7.88 timed). Next: the translated
+shaders' cost against Xenia's on the same draws.
+
 ## Resolution scale (2026-11-08)
 
 The console's pixels drawn as more (or fewer) host pixels: 50% to 800% in

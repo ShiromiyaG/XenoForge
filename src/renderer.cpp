@@ -1595,6 +1595,8 @@ private:
     // the last swap, and when it came
     double pipeline_seconds_at_swap_ = 0;
     std::chrono::steady_clock::time_point last_swap_time_{};
+    std::chrono::steady_clock::time_point first_swap_time_{}; // XF_GPU_TIME_LOG's
+    std::map<std::string, double> gpu_time_logged_;            // its totals at the last line
 
     // ---- the port's frames (native_render.h) ----
     // The port's settings as the last swap took them (copied again when
@@ -9031,6 +9033,35 @@ void Impl::swap() {
             report_.swap_gap_max = std::max(report_.swap_gap_max, gap);
         }
         last_swap_time_ = now;
+        // XF_GPU_TIME_LOG=1 (with the GPU timing on): the GPU time a frame by
+        // kind of work over every 300 swaps, with the seconds since the
+        // first swap, on stderr (the line Xenia's local measuring build
+        // logs, docs/renderer.md "Xenia's passes timed", for a window of a
+        // played run)
+        static const bool log_gpu_time = [] {
+            const char *v = std::getenv("XF_GPU_TIME_LOG");
+            return v && v[0] == '1';
+        }();
+        if (log_gpu_time && options_.gpu_timing) {
+            if (!number) first_swap_time_ = now;
+            if (report_.swaps % 300 == 0) {
+                std::string line;
+                double total = 0.0;
+                for (const auto &[kind, time] : report_.gpu_time) {
+                    double seconds = time.seconds - gpu_time_logged_[kind];
+                    gpu_time_logged_[kind] = time.seconds;
+                    total += seconds;
+                    char part[256];
+                    // (kinds' names hold "; " themselves)
+                    std::snprintf(part, sizeof(part), " | %s %.3f", kind.c_str(), seconds * 1000.0 / 300.0);
+                    if (seconds > 0.0) line += part;
+                }
+                std::fprintf(stderr, "xf-gpu-timing swap %llu at %.1f s total %.3f ms/frame%s\n",
+                             (unsigned long long)report_.swaps,
+                             std::chrono::duration<double>(now - first_swap_time_).count(), total * 1000.0 / 300.0,
+                             line.c_str());
+            }
+        }
     }
     {
         // the display's look-up table mode (display_gamma), counted
