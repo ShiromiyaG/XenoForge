@@ -1122,9 +1122,48 @@ public:
     void save_pipeline_cache();
 
     // ---- the Sink: the processor's calls, on its thread ----
-    void shader(uint32_t type, uint32_t, std::span<const uint32_t> code) override {
+    void shader(uint32_t type, uint32_t address, std::span<const uint32_t> code) override {
         Call call(*this, nullptr);
-        if (call) load_shader(type, code);
+        if (!call) return;
+        load_shader(type, code);
+        // the IM_LOAD shader_again just let through: kept by where it came from
+        if (shader_at_open_ && shader_at_key_ == shader_at(type, address, uint32_t(code.size())))
+            shaders_at_[shader_at_key_] = {type == 0 ? vertex_hash_ : pixel_hash_, shader_at_count_};
+        shader_at_open_ = false;
+    }
+    // IM_LOAD's shaders by where they were loaded from (beyond Xenia, which
+    // copies and hashes the microcode at every load: a game loading its
+    // shaders at each draw spent 15% of the command thread there): the hash
+    // a load from the same words found, again while their pages are
+    // unwritten (memory.h's watches: watched, the count taken, then the
+    // copy). Never while a trace is recorded (it wants each load's words).
+    bool shader_again(uint32_t type, uint32_t address, uint32_t dwords) override {
+        Call call(*this, nullptr);
+        shader_at_open_ = false;
+        if (!call || trace_ || type > 1 || !dwords || address + uint64_t(dwords) * 4 > GuestMemory::SIZE) return false;
+        const uint64_t key = shader_at(type, address, dwords);
+        const uint32_t count = mem_.write_count();
+        auto it = shaders_at_.find(key);
+        if (it != shaders_at_.end()) {
+            bool same = it->second.checked == count;
+            if (!same) {
+                same = true;
+                for (uint32_t p = address >> page_shift_, last = (address + dwords * 4 - 1) >> page_shift_; p <= last;
+                     p++)
+                    if (stamps_[p].load(std::memory_order_acquire) > it->second.checked) same = false;
+            }
+            if (same && shaders_.count(it->second.hash)) {
+                it->second.checked = count;
+                (type == 0 ? vertex_hash_ : pixel_hash_) = it->second.hash;
+                (type == 0 ? have_vertex_ : have_pixel_) = true;
+                report_.shader_loads_again++;
+                return true;
+            }
+        }
+        // the processor copies it next
+        mem_.watch(address, dwords * 4);
+        shader_at_key_ = key, shader_at_count_ = mem_.write_count(), shader_at_open_ = true;
+        return false;
     }
     void draw(const gpu::RegisterFile &registers, const gpu::Draw &d) override {
         Call call(*this, &registers);
@@ -1304,9 +1343,18 @@ private:
     }
     void approximate(const std::string &what) { report_.approximate[what]++; }
     void use(const std::string &what) { report_.used[what]++; }
+    // A literal's counts by its address: no string made and no map of
+    // strings searched at each draw (1.8% of the command thread and the
+    // allocations with it in a heavy scene), folded into the report's maps
+    // as it is taken (with_processor_counts).
+    std::unordered_map<const char *, uint64_t> used_by_literal_, approximate_by_literal_;
+    void approximate(const char *what) { approximate_by_literal_[what]++; }
+    void use(const char *what) { used_by_literal_[what]++; }
     // the report with what the processor counted of the packets the renderer
     // does not see (Report::used)
     Report with_processor_counts(Report r) const {
+        for (const auto &[what, count] : used_by_literal_) r.used[what] += count;
+        for (const auto &[what, count] : approximate_by_literal_) r.approximate[what] += count;
         const gpu::Counts &n = processor_.counts();
         auto put = [&](const char *what, uint64_t count) {
             if (count) r.used[what] = count;
@@ -2021,6 +2069,28 @@ private:
     VkDeviceSize ubo_align_ = 256, ssbo_align_ = 64;
 
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
+    // IM_LOAD's shaders by type, size and address (shader_again): the
+    // shader's hash and the write count its words were last found unwritten at
+    struct ShaderAt {
+        uint64_t hash = 0;
+        uint32_t checked = 0;
+    };
+    std::unordered_map<uint64_t, ShaderAt> shaders_at_;
+    static uint64_t shader_at(uint32_t type, uint32_t address, uint32_t dwords) {
+        return uint64_t(type) << 63 | uint64_t(dwords & 0xFFFF) << 32 | address;
+    }
+    // The draw's lists, kept from draw to draw for their room: a heavy
+    // scene's 3,000 draws a frame made and freed each of them (a tenth of
+    // the command thread in the heap). Each is cleared where draw() starts
+    // filling it; the swaps (not moves) between them keep every buffer.
+    struct DrawScratch {
+        std::vector<Range> exported, vertex_ranges, sorted;
+        std::vector<uint32_t> indices, triangles, converted, guest_indices, strips, key, color_key;
+        std::vector<uint8_t> raw_indices;
+    } draw_lists_;
+    uint64_t shader_at_key_ = 0;  // the load shader_again let through, for shader()
+    uint32_t shader_at_count_ = 0; // the write count taken before its copy
+    bool shader_at_open_ = false;
     std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<RenderTarget>> targets_;
     std::map<std::array<uint32_t, 6>, std::unique_ptr<Texture>> textures_;
     // the samplers by their parameters: the sampler, its slot in the
@@ -4878,8 +4948,10 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         }
         if (same) {
             // a trace gets what guest memory gave it (a replay makes the
-            // GPU's parts with its own resolves and exports)
-            traced(t->gpu ? cpu_parts(t->ranges) : t->ranges);
+            // GPU's parts with its own resolves and exports); only while one
+            // is recorded (cpu_parts makes a list and walks the pages: 13% of
+            // the command thread in a heavy scene when it ran for every draw)
+            if (trace_) traced(t->gpu ? cpu_parts(t->ranges) : t->ranges);
             return t;
         }
         t->load_why = LoadWhy::CpuWritten;
@@ -6906,7 +6978,8 @@ void Impl::draw(const gpu::Draw &d) {
 
     // the pages of the streams the shaders export to (the pixel shader's only
     // when it runs)
-    std::vector<Range> exported;
+    std::vector<Range> &exported = draw_lists_.exported;
+    exported.clear();
     export_ranges(*vs, 0, exported);
     if (ps) export_ranges(*ps, 1, exported);
     bool exports = vs->exports || (ps && ps->exports);
@@ -6915,7 +6988,8 @@ void Impl::draw(const gpu::Draw &d) {
     // and clamped to VGT_MIN_VTX_INDX and VGT_MAX_VTX_INDX (as Xenia's vertex
     // shaders do it: RemapAndConvertVertexIndices), reset indices kept as the
     // host's restart index; adaptive tessellation's edge factors only swapped
-    std::vector<uint32_t> indices;
+    std::vector<uint32_t> &indices = draw_lists_.indices;
+    indices.clear();
     indices.reserve(count);
     uint32_t offset = regs_[r::VGT_INDX_OFFSET];
     bool restart = strip && (regs_[r::PA_SU_SC_MODE_CNTL] >> 21) & 1;
@@ -6941,21 +7015,55 @@ void Impl::draw(const gpu::Draw &d) {
     } else if (d.indexed) {
         uint32_t size = index32 ? 4 : 2;
         gpu::Endian endian = d.index_endian;
-        std::vector<uint8_t> raw_indices(size_t(count) * size);
-        traced(d.index_base, uint32_t(raw_indices.size()));
-        memory_.read(d.index_base, raw_indices);
-        for (uint32_t i = 0; i < count; i++) {
-            const uint8_t *b = raw_indices.data() + size_t(i) * size;
-            uint32_t raw = index32 ? uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24
-                                   : uint32_t(b[0]) | uint32_t(b[1]) << 8;
-            uint32_t index = index32 ? gpu::gpu_swap(raw, endian)
-                                     : (endian == gpu::Endian::In16 ? ((raw >> 8) | (raw << 8)) & 0xFFFF : raw);
-            if (!index32) index &= 0xFFFF;
-            if (restart && index == (index32 ? reset_index : reset_index & 0xFFFF)) indices.push_back(UINT32_MAX);
-            else indices.push_back(vertex(index));
+        traced(d.index_base, count * size);
+        // Each step a loop of its own over the whole list, its choices made
+        // outside it (the index buffer of a heavy scene's draws was a fifth
+        // of the command thread, a push_back and every branch per index):
+        // the guest's words in host order as the fetch's endianness says,
+        // then the reset indices kept and the rest offset and clamped.
+        indices.resize(count);
+        uint32_t *out = indices.data();
+        if (index32) {
+            memory_.read(d.index_base, std::span<uint8_t>(reinterpret_cast<uint8_t *>(out), size_t(count) * 4));
+            switch (endian) {
+            case gpu::Endian::In16:
+                for (uint32_t i = 0; i < count; i++) out[i] = (out[i] << 8 & 0xFF00FF00) | (out[i] >> 8 & 0x00FF00FF);
+                break;
+            case gpu::Endian::In32:
+                for (uint32_t i = 0; i < count; i++) out[i] = __builtin_bswap32(out[i]);
+                break;
+            case gpu::Endian::Half:
+                for (uint32_t i = 0; i < count; i++) out[i] = out[i] >> 16 | out[i] << 16;
+                break;
+            default: break;
+            }
+        } else {
+            std::vector<uint8_t> &raw_indices = draw_lists_.raw_indices;
+            raw_indices.resize(size_t(count) * 2);
+            memory_.read(d.index_base, raw_indices);
+            const uint8_t *in = raw_indices.data();
+            if (endian == gpu::Endian::In16)
+                for (uint32_t i = 0; i < count; i++) out[i] = uint32_t(in[2 * i]) << 8 | in[2 * i + 1];
+            else
+                for (uint32_t i = 0; i < count; i++) out[i] = uint32_t(in[2 * i]) | uint32_t(in[2 * i + 1]) << 8;
+        }
+        const uint32_t reset = index32 ? reset_index : reset_index & 0xFFFF;
+        if (factors) {
+            if (restart)
+                for (uint32_t i = 0; i < count; i++)
+                    if (out[i] == reset) out[i] = UINT32_MAX;
+        } else if (restart) {
+            for (uint32_t i = 0; i < count; i++) out[i] = out[i] == reset ? UINT32_MAX : remap(out[i]);
+        } else {
+            for (uint32_t i = 0; i < count; i++) out[i] = remap(out[i]);
         }
     } else {
-        for (uint32_t i = 0; i < count; i++) indices.push_back(vertex(i));
+        indices.resize(count);
+        uint32_t *out = indices.data();
+        if (factors)
+            for (uint32_t i = 0; i < count; i++) out[i] = i;
+        else
+            for (uint32_t i = 0; i < count; i++) out[i] = remap(i);
     }
     if (export_only) {
         // each index a point, the reset indices left out
@@ -6970,17 +7078,19 @@ void Impl::draw(const gpu::Draw &d) {
         restart = false;
     } else if (primitive == 13) {
         // quads to triangle pairs
-        std::vector<uint32_t> triangles;
+        std::vector<uint32_t> &triangles = draw_lists_.triangles;
+        triangles.clear();
         for (uint32_t q = 0; q + 3 < indices.size(); q += 4)
             for (uint32_t k : {0, 1, 2, 0, 2, 3}) triangles.push_back(indices[q + k]);
-        indices = std::move(triangles);
+        indices.swap(triangles);
         if (indices.empty()) return;
     } else if (primitive == 12 || primitive == 14 || primitive == 15) {
         // each primitive between reset indices on its own: a line loop closed
         // by its first index (2 vertices give two lines, 1 nothing: Xenia's
         // GetLineLoopStripIndexCount); a quad strip's whole quads; a polygon
         // of at least a triangle
-        std::vector<uint32_t> converted;
+        std::vector<uint32_t> &converted = draw_lists_.converted;
+        converted.clear();
         converted.reserve(indices.size() + indices.size() / 2 + 1);
         for (size_t first = 0; first < indices.size();) {
             size_t end = first;
@@ -6996,7 +7106,7 @@ void Impl::draw(const gpu::Draw &d) {
             }
             first = end + 1;
         }
-        indices = std::move(converted);
+        indices.swap(converted);
         if (indices.empty()) return;
     }
 
@@ -7130,9 +7240,14 @@ void Impl::draw(const gpu::Draw &d) {
 
     // textures: per slot the shaders read, an image's index in the table of
     // its dimension and a sampler's
-    std::set<uint32_t> slots(vs->summary.texture_slots.begin(), vs->summary.texture_slots.end());
-    if (ps) slots.insert(ps->summary.texture_slots.begin(), ps->summary.texture_slots.end());
-    for (uint32_t slot : slots) {
+    // (a mask of the 32 texture fetch constants, in order)
+    uint64_t texture_slots = 0;
+    for (const Shader *s : {vs, ps})
+        if (s)
+            for (uint32_t slot : s->summary.texture_slots)
+                if (slot < 64) texture_slots |= 1ull << slot;
+    for (uint64_t left = texture_slots; left; left &= left - 1) {
+        const uint32_t slot = uint32_t(std::countr_zero(left));
         const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS + slot * 6];
         if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture) {
             approximate("a texture slot without a texture constant");
@@ -7178,9 +7293,11 @@ void Impl::draw(const gpu::Draw &d) {
     // vertices are its index shifted left by 2 plus the corner; a
     // rectangle's are numbered from 4 times its number, each with the
     // rectangle's three guest indices as its attribute (guest_indices).
-    std::vector<uint32_t> guest_indices;
+    std::vector<uint32_t> &guest_indices = draw_lists_.guest_indices;
+    guest_indices.clear();
     if (expanded) {
-        std::vector<uint32_t> strips;
+        std::vector<uint32_t> &strips = draw_lists_.strips;
+        strips.clear();
         uint32_t primitives = uint32_t(points ? indices.size() : indices.size() / 3);
         strips.reserve(size_t(primitives) * 5);
         for (uint32_t k = 0; k < primitives; k++) {
@@ -7192,7 +7309,7 @@ void Impl::draw(const gpu::Draw &d) {
                     guest_indices.insert(guest_indices.end(), indices.begin() + k * 3, indices.begin() + k * 3 + 3);
         }
         if (strips.empty()) return;
-        indices = std::move(strips);
+        indices.swap(strips);
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
         restart = true;
     }
@@ -7235,17 +7352,12 @@ void Impl::draw(const gpu::Draw &d) {
         }
     }
     host_key |= uint32_t(polygon_mode) << 24;
-    std::vector<uint32_t> key = {uint32_t(vertex_hash_),
-                                 uint32_t(vertex_hash_ >> 32),
-                                 ps ? uint32_t(pixel_hash_) : 0,
-                                 ps ? uint32_t(pixel_hash_ >> 32) : 0,
-                                 topology_class,
-                                 rectangles,
-                                 msaa,
-                                 depth ? depth->image.format : 0u,
-                                 regs_[r::PA_CL_CLIP_CNTL] & (1u << 16),
-                                 host_key};
-    std::vector<uint32_t> color_key; // the targets' part of the key
+    std::vector<uint32_t> &key = draw_lists_.key;
+    key.assign({uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), ps ? uint32_t(pixel_hash_) : 0,
+                ps ? uint32_t(pixel_hash_ >> 32) : 0, topology_class, uint32_t(rectangles), uint32_t(msaa),
+                depth ? uint32_t(depth->image.format) : 0u, regs_[r::PA_CL_CLIP_CNTL] & (1u << 16), host_key});
+    std::vector<uint32_t> &color_key = draw_lists_.color_key; // the targets' part of the key
+    color_key.clear();
     for (uint32_t i = 0; i < 4; i++) {
         if (!colors[i]) continue;
         color_formats[i] = colors[i]->image.format;
@@ -7527,12 +7639,18 @@ void Impl::draw(const gpu::Draw &d) {
         uint32_t slot, start, end;
     };
     std::vector<VertexSlot> vertex_slots;
-    std::vector<Range> vertex_ranges;
+    std::vector<Range> &vertex_ranges = draw_lists_.vertex_ranges;
+    vertex_ranges.clear();
     {
-        std::set<uint32_t> fetch_slots;
+        // the slots both shaders fetch, in order (a mask: 96 vertex fetch
+        // constants, three to a texture constant's six words)
+        uint64_t fetch_slots[2] = {};
         for (const Shader *s : {vs, ps})
-            if (s) fetch_slots.insert(s->summary.vertex_slots.begin(), s->summary.vertex_slots.end());
-        for (uint32_t slot : fetch_slots) {
+            if (s)
+                for (uint32_t slot : s->summary.vertex_slots)
+                    if (slot < 128) fetch_slots[slot >> 6] |= 1ull << (slot & 63);
+        for (uint32_t slot = 0; slot < 128; slot++) {
+            if (!(fetch_slots[slot >> 6] >> (slot & 63) & 1)) continue;
             const uint32_t *f = &regs_[reg::FETCH_CONSTANTS + slot * 2];
             // Xenia draws with any type here (its gpu_allow_invalid_fetch_constants
             // is on by default), warning about texture constants
@@ -7543,7 +7661,8 @@ void Impl::draw(const gpu::Draw &d) {
             uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(start) + uint64_t(words) * 4, GuestMemory::SIZE));
             if (end > start) vertex_slots.push_back({slot, start, end});
         }
-        std::vector<Range> sorted;
+        std::vector<Range> &sorted = draw_lists_.sorted;
+        sorted.clear();
         for (const VertexSlot &v : vertex_slots) sorted.push_back({v.start, v.end});
         std::sort(sorted.begin(), sorted.end());
         for (const Range &r : sorted) {

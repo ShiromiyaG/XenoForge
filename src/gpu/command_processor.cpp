@@ -233,7 +233,7 @@ void CommandProcessor::restore_gamma_ramp(std::span<const uint32_t> table, std::
 // ---- packets ----
 
 void CommandProcessor::report_packet(uint32_t address, uint32_t packet, uint32_t count) {
-    if (!sink_) return;
+    if (!packets_wanted_) return;
     words_.resize(1 + count);
     words_[0] = packet;
     for (uint32_t i = 0; i < count; i++) words_[1 + i] = reader_.peek(i);
@@ -822,6 +822,8 @@ bool CommandProcessor::im_load() {
     if (type > 1) return false;
     if (sink_) {
         sink_->memory_read(address & PHYSICAL_MASK, size * 4);
+        // the same shader from unwritten memory: nothing to copy
+        if (sink_->shader_again(type, address & PHYSICAL_MASK, size)) return true;
         words_.resize(size);
         for (uint32_t i = 0; i < size; i++) words_[i] = be32(physical(address + 4 * i));
         sink_->shader(type, address & PHYSICAL_MASK, words_);

@@ -92,9 +92,10 @@ void print_renderer_report(const render::Report &r) {
                 double(r.writeback_bytes) / (1 << 20));
     std::printf("renderer: %llu submissions, %llu waits for the GPU\n", (unsigned long long)r.submissions,
                 (unsigned long long)r.waits);
-    std::printf("renderer: made %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
+    std::printf("renderer: made %llu render targets, %llu textures, %llu pipelines, %llu shaders (%llu shader loads "
+                "from unwritten words, nothing copied)\n",
                 (unsigned long long)r.render_targets, (unsigned long long)r.textures, (unsigned long long)r.pipelines,
-                (unsigned long long)r.shaders);
+                (unsigned long long)r.shaders, (unsigned long long)r.shader_loads_again);
     std::printf("renderer: texture loads: %llu new, %llu again after the CPU wrote their memory, %llu after a resolve "
                 "or a memory export did\n",
                 (unsigned long long)r.texture_loads_new, (unsigned long long)r.texture_loads_cpu_written,
@@ -329,11 +330,17 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     const char *queries = std::getenv("XF_OCCLUSION_QUERIES");
     processor.set_occlusion_queries(queries && std::string(queries) == "fake" ? gpu::OcclusionQueries::Fake
                                                                               : gpu::OcclusionQueries::Fast);
-    // screen extents: the bounds of what the draws rasterized (beyond
-    // Xenia); XF_SCREEN_EXTENTS=whole keeps Xenia's whole screen
+    // screen extents: the whole screen, as Xenia answers (the default);
+    // XF_SCREEN_EXTENTS=measured, the bounds of what the draws rasterized
+    // (beyond Xenia). The answer changes no picture, only how many of
+    // predicated tiling's tiles a draw runs in, and measured bounds have the
+    // command processor wait for the GPU at each interrupt or wait the
+    // guest's extents may be read at: a game with ~120 reports a frame fell
+    // from 30 to 20 frames a second (docs/renderer.md, "Screen extents
+    // live").
     const char *extents = std::getenv("XF_SCREEN_EXTENTS");
-    processor.set_screen_extents(extents && std::string(extents) == "whole" ? gpu::ScreenExtents::Whole
-                                                                            : gpu::ScreenExtents::Measured);
+    processor.set_screen_extents(extents && std::string(extents) == "measured" ? gpu::ScreenExtents::Measured
+                                                                               : gpu::ScreenExtents::Whole);
     // when the CPU sees what resolves wrote (Xenia's readback_resolve):
     // XF_READBACK_RESOLVE=none (the default, as Xenia's), fast or full
     if (const char *mode = std::getenv("XF_READBACK_RESOLVE")) {

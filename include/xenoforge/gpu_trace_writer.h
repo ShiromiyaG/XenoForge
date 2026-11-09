@@ -92,6 +92,7 @@ public:
     void buffer_end(bool indirect) override;
     void packet(uint32_t address, std::span<const uint32_t> words) override;
     void packet_end() override;
+    bool wants_packets() override { return true; }
     void memory_read(uint32_t address, uint32_t bytes) override;
     void memory_written(uint32_t address, uint32_t bytes) override;
     void shader(uint32_t type, uint32_t address, std::span<const uint32_t> code) override;

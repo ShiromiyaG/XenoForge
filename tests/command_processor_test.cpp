@@ -85,6 +85,7 @@ struct Recorder : Sink {
     void packet(uint32_t, std::span<const uint32_t> words) override {
         packets.emplace_back(words.begin(), words.end());
     }
+    bool wants_packets() override { return true; }
     void memory_read(uint32_t, uint32_t) override { read++; }
     void memory_written(uint32_t, uint32_t) override { written++; }
     void shader(uint32_t type, uint32_t, std::span<const uint32_t> code) override {

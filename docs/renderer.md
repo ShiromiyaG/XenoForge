@@ -2298,9 +2298,10 @@ Done 2026-11-08 on the GPU (next section).
 
 ## Screen extents and VIZ queries (2026-11-08)
 
-**Screen extents** (`gpu::ScreenExtents::Measured`, the default;
-`XF_SCREEN_EXTENTS=whole` live, `xfreplay --whole-extents`, keep Xenia's
-whole screen). Beyond Xenia, which answers every `EVENT_WRITE_EXT` with the
+**Screen extents** (`gpu::ScreenExtents::Measured`, the replays' default and
+`XF_SCREEN_EXTENTS=measured` live; live play answers Xenia's whole screen
+since 2026-11-09, "Screen extents live" below; `xfreplay --whole-extents`).
+Beyond Xenia, which answers every `EVENT_WRITE_EXT` with the
 whole 8192-pixel square. The processor still writes that at once; the draws
 between a `SCREEN_EXT_INIT` and its `SCREEN_EXT_RPT` run a vertex shader
 variant (`VertexOptions::extents`) whose every final host position takes the
@@ -2332,6 +2333,69 @@ predicated second-pass draws skipped, the picture unchanged (0.112/0.118
 of 255 off Xenia's ROV picture, as before). Game B's menus: 16 reports a
 frame, nearly all full-screen quads. What the waits at the interrupts cost
 live is to be measured (game G's library is not built for this interface).
+
+**Screen extents live (2026-11-09).** Game D's played drive (about 120
+reports and several interrupts and waits a frame) measured what the waits
+cost: the command thread stopped for the GPU 2,200-2,800 times in a 200 s
+run (2 with Xenia's answer), so the CPU's and the GPU's work a frame added
+up instead of overlapping, and the drive held 20 frames a second from
+about 140 s on (21.2-22.0 over the 125-200 s window, 2 runs) against 25.2-25.5
+with the whole screen. After the command thread's own costs came down
+("The command thread's costs" below), 2 runs each: measured 29.67-29.73
+fps, p99 49 ms, 12.0-12.2 ms of GPU a frame; whole 29.75-29.86 fps, p99
+36-38 ms, 11.6-11.7 ms. The bins the measurement saves did not pay for the
+waits, so live play answers the whole screen, as Xenia; measuring stays a
+choice (`XF_SCREEN_EXTENTS=measured`) and the replays' default (no live
+CPU waits for them).
+
+## The command thread's costs (2026-11-09)
+
+The thread that runs the command processor and the renderer ("GPU
+commands") was the frame's limit in game D's drive: 84% of a core at 21
+frames a second while the GPU stood idle three quarters of the time.
+Sampled alone with its stacks (`boot --profile N --profile-thread "GPU
+commands"`: tools/sampler.cpp walks the sampled thread's stack by x64
+unwind data and lists each function's inclusive share; the thread report
+now gives each guest thread's host CPU time and host thread id, and host
+threads are named after their guest thread), its time went to:
+- **a trace's bookkeeping with no trace recorded** (13%): each draw's
+  textures found in the cache built `cpu_parts` (a list of ranges less the
+  GPU's pages, every page walked) for `traced()`, which drops it unless a
+  trace is open. Now built only while one is.
+- **shaders copied and hashed at every load** (15%: `im_load`, `shader`,
+  `load_shader`). The game loads its shaders with an `IM_LOAD` before each
+  draw (8.3 million in 200 s); the processor copied and byte-swapped the
+  words and the renderer hashed them all and looked the hash up, as Xenia
+  does. Now the renderer keeps each load's hash by type, size and address
+  (`Sink::shader_again`): while the words' pages are unwritten (memory.h's
+  watches: watched and the write count taken before the copy, a later
+  write stamps the page higher), the load takes the kept shader and the
+  processor copies nothing. 5,084,672 of the run's loads took a kept one.
+  Never while a trace is recorded.
+- **each packet's words copied for a sink that drops them** (5%):
+  `Sink::wants_packets()` (asked once as the sink is set; the trace writer
+  wants them, the renderer not).
+- **the draw's own lists made and freed at each draw** (~10% in the heap):
+  the indices, the pipeline key, the streams' ranges and two `std::set`s of
+  slots. The lists are kept between draws (`draw_lists_`, cleared where a
+  draw starts filling each, swapped rather than moved), the sets are bit
+  masks; usage counted by a literal's address, not by a string made and
+  looked up at each draw (`use` and `approximate` with a `const char *`,
+  folded into the report's maps as it is taken).
+- **the guest's indices converted one by one** (a fifth of `draw`): a
+  `push_back` and every choice (index size, endianness, reset index,
+  offset and clamps) per index. Now a loop over the whole list per step,
+  the choices made outside it, 32-bit indices read straight into the list.
+  Xenia reads indices on the GPU from its shared memory (primitive
+  processor); doing so here is the next step for this thread.
+
+Result in the same played window (2 runs each, alone on the machine, the
+screen extents as Xenia): 25.2-25.5 -> 29.75-29.86 frames a second (Xenia
+D3D12: 29.92-29.98), median frame 34.0 -> 33.4 ms, CPU 3.1-3.3 -> 2.9 s/s
+(Xenia 2.0). The swaps a second of the slowest span in `boot` (140-170 s):
+24.5 -> 29.3. Pictures: replay_test 29/29 on both paths. Left on the thread
+(inclusive): the driver's recording (~11%), register writes (`type0`,
+14%), texture checks (9%), per-draw state compares.
 
 **VIZ queries** (Xenia's `occlusion_query_viz`, off by default there; here
 where the device has `VK_EXT_conditional_rendering`,

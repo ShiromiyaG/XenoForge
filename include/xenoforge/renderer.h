@@ -85,6 +85,7 @@ struct Report {
     uint64_t vertex_bytes = 0;                   // the vertex data uploaded (the pages that differed)
     uint64_t writeback_bytes = 0;                // what resolves wrote, copied into guest memory
     uint64_t submissions = 0, waits = 0;         // command buffers submitted; waits for the GPU
+    uint64_t shader_loads_again = 0;             // IM_LOADs of a shader from its unwritten words (none copied)
     // Pipelines (Options::pipeline_stand_in): besides the whole ones counted
     // in `pipelines` above, the libraries of their parts made, the pipelines
     // linked from them and the placeholders made; the draws drawn by a

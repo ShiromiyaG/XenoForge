@@ -122,12 +122,21 @@ public:
     // one longer than what is left of its buffer is not.
     virtual void packet(uint32_t /*address*/, std::span<const uint32_t> /*words*/) {}
     virtual void packet_end() {}
+    // whether packet() is wanted: a sink that does not take the packets
+    // (the renderer) spares the processor copying each one's words (asked
+    // once, as the sink is set)
+    virtual bool wants_packets() { return false; }
     // memory the processor read (constants, shaders, polled words) or wrote
     // (fences, write-backs, reports), physical
     virtual void memory_read(uint32_t /*address*/, uint32_t /*bytes*/) {}
     virtual void memory_written(uint32_t /*address*/, uint32_t /*bytes*/) {}
     // a shader loaded (IM_LOAD, IM_LOAD_IMMEDIATE): 0 vertex, 1 pixel
     virtual void shader(uint32_t /*type*/, uint32_t /*address*/, std::span<const uint32_t> /*code*/) {}
+    // IM_LOAD of `dwords` words at a physical address: true when the sink
+    // has the shader it last loaded from there, that memory unwritten since,
+    // and takes it again (the processor copies nothing and calls no
+    // shader()); false, the processor copies the words and calls shader()
+    virtual bool shader_again(uint32_t /*type*/, uint32_t /*address*/, uint32_t /*dwords*/) { return false; }
     // a draw outside copy mode, and a resolve (a draw with RB_MODECONTROL in
     // copy mode: EDRAM to memory, RB_COPY_*)
     virtual void draw(const RegisterFile &, const Draw &) {}
@@ -216,7 +225,10 @@ public:
     CommandProcessor(Memory &memory, Host &host);
 
     // Set before the processor's thread runs, or on it.
-    void set_sink(Sink *sink) { sink_ = sink; }
+    void set_sink(Sink *sink) {
+        sink_ = sink;
+        packets_wanted_ = sink && sink->wants_packets();
+    }
     Memory &memory() const { return memory_; }
     RegisterFile &registers() { return regs_; }
     const Counts &counts() const { return counts_; }
@@ -332,6 +344,7 @@ private:
     Memory &memory_;
     Host &host_;
     Sink *sink_ = nullptr;
+    bool packets_wanted_ = false; // sink_->wants_packets(), asked as it was set
     RegisterFile regs_;
     Counts counts_;
     Reader reader_;
