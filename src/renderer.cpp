@@ -516,6 +516,13 @@ struct RenderTarget {
     // resolves' clears kept for its next render pass (Impl::flush_clears)
     std::vector<std::pair<VkClearAttachment, VkClearRect>> pending_clears;
     uint32_t width = 0, height = 0; // in the console's pixels
+    // What a draw's bookkeeping found last (Impl::acquire, tiles_drawn), so
+    // the next draw into the same target does not walk its tiles again: it
+    // held its first owned_tiles tiles as of owners_epoch_ == owned_epoch,
+    // and none of its tile rows [drawn_first, drawn_last) held a clear's
+    // value as of cleared_epoch_ == drawn_epoch.
+    uint64_t owned_epoch = 0, drawn_epoch = 0;
+    uint32_t owned_tiles = 0, drawn_first = 0, drawn_last = 0;
     // its image's size: width and height at the resolution scale (Impl::scale_)
     uint32_t host_width = 0, host_height = 0;
     // in EDRAM: tiles per row (at its bits per sample), a tile's size in pixels
@@ -1209,6 +1216,7 @@ public:
         Call call(*this, nullptr);
         if (bytes.size() != EDRAM_BYTES || !call) return;
         std::fill(owners_.begin(), owners_.end(), nullptr);
+        owners_epoch_++;
         VkBuffer from;
         VkDeviceSize at;
         uint8_t *data = staging(EDRAM_BYTES, from, at);
@@ -2266,13 +2274,26 @@ private:
     }();
     // the tiles of t in its pixel rows [top, bottom), every column: a draw
     // may have written them, so they no longer hold a clear's value
-    void tiles_drawn(const RenderTarget &t, uint32_t top, uint32_t bottom) {
+    // (A draw after another into the same rows, no tile made a clear's
+    // since, has nothing to do: a game's hundred thousand draws a second
+    // walked 720 tiles each.)
+    void tiles_drawn(RenderTarget &t, uint32_t top, uint32_t bottom) {
         if (bottom <= top) return;
         uint32_t first = top / t.tile_height, last = std::min((bottom + t.tile_height - 1) / t.tile_height, t.height / t.tile_height);
+        const bool known = t.drawn_epoch == cleared_epoch_;
+        if (known && first >= t.drawn_first && last <= t.drawn_last) return;
         for (uint32_t row = first; row < last; row++)
             for (uint32_t column = 0; column < t.pitch_tiles; column++)
                 tile_cleared_[(t.base + row * t.pitch_tiles + column) % EDRAM_TILES] = 0;
+        if (last <= first) return;
+        if (known && first <= t.drawn_last && last >= t.drawn_first)
+            t.drawn_first = std::min(t.drawn_first, first), t.drawn_last = std::max(t.drawn_last, last);
+        else
+            t.drawn_epoch = cleared_epoch_, t.drawn_first = first, t.drawn_last = last;
     }
+    // counted up as a tile changes hands (owners_) and as one is made a
+    // clear's (tile_cleared_ set): what the targets' memos are as of
+    uint64_t owners_epoch_ = 1, cleared_epoch_ = 1;
     // EDRAM, and beside it the host's 32-bit depth of the last D24FS8 target
     // (and D24S8 where the host keeps it as a float) to store each sample,
     // in the same layout (edram.glsl's host_depth_offset)
@@ -4142,6 +4163,8 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
 void Impl::acquire(RenderTarget *t, uint32_t rows) {
     uint32_t tile_rows = std::min((rows + t->tile_height - 1) / t->tile_height, t->height / t->tile_height);
     uint32_t count = std::min(tile_rows * t->pitch_tiles, EDRAM_TILES);
+    // (it held them at its last draw and no tile changed hands since)
+    if (t->owned_epoch == owners_epoch_ && count <= t->owned_tiles) return;
     std::vector<uint32_t> needed, unheld;
     std::map<RenderTarget *, std::vector<uint32_t>> held;
     for (uint32_t k = 0; k < count; k++) {
@@ -4153,7 +4176,10 @@ void Impl::acquire(RenderTarget *t, uint32_t rows) {
         else
             unheld.push_back(tile);
     }
-    if (needed.empty()) return;
+    if (needed.empty()) {
+        t->owned_epoch = owners_epoch_, t->owned_tiles = count;
+        return;
+    }
     if (direct_transfers_) {
         // (edram_transfer keeps the clears it moves as clears, and drops the rest)
         if (!held.empty() && !edram_transfer(t, held)) return;
@@ -4166,6 +4192,7 @@ void Impl::acquire(RenderTarget *t, uint32_t rows) {
         if (!edram_load(t, needed, tile_rows * t->tile_height)) return;
     }
     for (uint32_t tile : needed) owners_[tile] = t;
+    t->owned_epoch = ++owners_epoch_, t->owned_tiles = count;
     if (options_.verbose)
         std::fprintf(stderr, "  EDRAM: %zu tiles to %s base %u (from %zu targets)\n", needed.size(), t->depth ? "depth" : "color",
                      t->base, held.size());
@@ -4571,6 +4598,7 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         const std::vector<uint32_t> &tiles = g.tiles;
         // (the tiles drawn hold what the holder drew; those cleared keep their value)
         for (uint32_t tile : tiles) tile_cleared_[tile] = g.clear;
+        if (g.clear) cleared_epoch_++;
         if (!g.clear && !transfer_pipeline(*t, holder->msaa != 0))
             return fatal_ = "could not make an EDRAM transfer pipeline", false;
         Draw d{holder, {}, g.clear, g.value};
@@ -8335,7 +8363,7 @@ void Impl::resolve() {
                         const bool whole = column * t->tile_width >= x && (column + 1) * t->tile_width <= x1 &&
                                            row * t->tile_height >= y && (row + 1) * t->tile_height <= y1;
                         tile_cleared_[tile] = whole;
-                        if (whole) tile_clear_value_[tile] = clear.clearValue;
+                        if (whole) tile_clear_value_[tile] = clear.clearValue, cleared_epoch_++;
                     }
             }
             // kept for the target's next render pass, whose draws need it

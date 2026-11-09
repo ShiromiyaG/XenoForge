@@ -2475,6 +2475,27 @@ D3D12: 29.92-29.98), median frame 34.0 -> 33.4 ms, CPU 3.1-3.3 -> 2.9 s/s
 (inclusive): the driver's recording (~11%), register writes (`type0`,
 14%), texture checks (9%), per-draw state compares.
 
+**The host path's tiles, walked once (2026-11-09, later).** The played
+drive's 27-28 frames a second were the host render target path's alone
+(`ours-host`, the benchmark's configuration against Xenia's host path):
+the same window on the default path (exact EDRAM) ran at 29.8, frame p95
+35 ms against 50. On the host path each draw walked every EDRAM tile of
+each of its targets twice, to see that the target still held them
+(`acquire`) and to drop their clears' values (`tiles_drawn`): 720 tiles a
+1280x720 target, a hundred thousand draws a second, a fifth of the
+command thread (`boot --profile --profile-thread "GPU commands"` with
+`XF_RENDER_TARGET_PATH=host`), so a frame in five missed its vblank. Each
+target now remembers what the last walk found (the tiles it held as of the
+last change of hands, the rows without a clear's value as of the last
+tile cleared: `owners_epoch_`, `cleared_epoch_`) and a draw with nothing
+new walks nothing. The pictures are the same (`replay_test`, both paths).
+The drive, one run each: host path 27.24-27.83 -> 29.83 frames a second,
+p95 50.3 -> 35.0 ms, GPU 8.08 ms a frame, CPU 2.03 s a second; default
+path 29.83, 35.0, 10.63, 1.90 (Xenia D3D12: 29.9, 6.24 ms, 2.0). What is
+left against Xenia is GPU time a frame: the draws on the host path, and
+the interlock's cost on the default one (2.5 ms a frame more than the
+host path's).
+
 **VIZ queries** (Xenia's `occlusion_query_viz`, off by default there; here
 where the device has `VK_EXT_conditional_rendering`,
 `XF_VK_NO_CONDITIONAL_RENDERING=1` off). A query's survey draws
