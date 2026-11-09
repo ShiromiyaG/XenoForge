@@ -569,6 +569,8 @@ struct RenderTarget {
     VkImageView view = VK_NULL_HANDLE;
     VkImageView sampled = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE; // color or depth alone, stencil alone
     VkDescriptorSet store_set = VK_NULL_HANDLE;                     // its EDRAM store's
+    // a depth image drawn into since a shader last read it (Impl::settle_depth_samples)
+    bool samples_unsettled = false;
     // resolves' clears kept for its next render pass (Impl::flush_clears)
     std::vector<std::pair<VkClearAttachment, VkClearRect>> pending_clears;
     uint32_t width = 0, height = 0; // in the console's pixels
@@ -2473,10 +2475,43 @@ private:
     // host render targets rasterized at the Xenos's sample positions
     // (Options::xenos_sample_positions, XF_XENOS_SAMPLE_POSITIONS)
     bool xenos_positions_ = false;
-    // (4x targets alone, msaa 2: with 2x ones at the Xenos's positions a
-    // game's frame drew stray colors over its alpha to coverage surfaces,
-    // not understood yet; docs/renderer.md, "The host path against the exact one")
-    bool xenos_at(uint32_t msaa) const { return xenos_positions_ && msaa == 2; }
+    bool xenos_at(uint32_t msaa) const { return xenos_positions_ && msaa != 0; }
+    // A multisampled depth image rasterized at the Xenos's positions, before
+    // a shader reads it as a texture (an EDRAM store, a transfer out of it, a
+    // resolve): taken to the attachment layout and back with its sample
+    // locations named (VkSampleLocationsInfoEXT on the barriers, what
+    // VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT asks for at
+    // each transition). A device that keeps depth as planes per block of
+    // pixels works the samples out when the image is read, and without the
+    // locations it does so at its standard ones: each sample then reads the
+    // surface's depth a part of a pixel away, and a pass testing for equal
+    // depth after a transfer out and back fails over whole surfaces. Only
+    // once after the image was last an attachment (RenderTarget::samples_unsettled).
+    void settle_depth_samples(VkCommandBuffer c, RenderTarget &t) {
+        if (!t.samples_unsettled) return;
+        t.samples_unsettled = false;
+        if (!t.depth || !xenos_at(t.msaa)) return;
+        VkSampleLocationEXT positions[4];
+        VkPipelineSampleLocationsStateCreateInfoEXT state{};
+        xenos_sample_locations(t.msaa, t.image.samples, false, positions, state);
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.pNext = &state.sampleLocationsInfo;
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        b.image = t.image.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(c, &dep);
+        b.srcAccessMask = b.dstAccessMask;
+        b.oldLayout = b.newLayout, b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        vkCmdPipelineBarrier2(c, &dep);
+    }
     // polygon offsets on float depth in the format's own units even with
     // VK_EXT_depth_bias_control (XF_DEPTH_BIAS_FLOAT_UNITS=1)
     bool depth_bias_float_units_ = false;
@@ -2777,7 +2812,7 @@ bool Impl::init(std::string &error) {
         const VkSampleCountFlags both = VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
         xenos_positions_ = wanted && !fsi_ && (d_.sample_locations() & both) == both;
         if (wanted && !fsi_)
-            std::fprintf(stderr, "renderer: 4x host render targets at %s sample positions\n",
+            std::fprintf(stderr, "renderer: 2x and 4x host render targets at %s sample positions\n",
                          xenos_positions_ ? "the Xenos's" : "the host's (no VK_EXT_sample_locations for 2x and 4x)");
     }
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm, blended in linear
@@ -3640,6 +3675,7 @@ VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4]
         }
     }
     vkCmdBeginRendering(c, &rendering_info);
+    if (depth) depth->samples_unsettled = true;
     in_pass_ = true;
     pass_ = pass;
     for (uint32_t i = 0; i < 5; i++) {
@@ -4434,6 +4470,7 @@ bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
     uint32_t offset = uint32_t(mask);
     VkCommandBuffer c = outside();
     if (options_.gpu_timing) gpu_mark("EDRAM store: " + target_name(*t));
+    settle_depth_samples(c, *t);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, store_pipelines_[t->msaa ? 1 : 0]);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, edram_layouts_[0], 0, 1, &t->store_set, 1, &offset);
     vkCmdPushConstants(c, edram_layouts_[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
@@ -4734,6 +4771,7 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
         rendering.pColorAttachments = &attachment;
     }
     vkCmdBeginRendering(c, &rendering);
+    t->samples_unsettled = t->depth;
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     bound_pipeline_ = VK_NULL_HANDLE; // the draws' pipeline and sets are bound again after it
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, edram_layouts_[1], 0, 1, &edram_load_set_, 1, &offset);
@@ -4891,7 +4929,11 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         rendering.colorAttachmentCount = 1;
         rendering.pColorAttachments = &attachment;
     }
+    // (the sources' depth at the positions they were rasterized at)
+    for (const Draw &d : draws)
+        if (!d.clear) settle_depth_samples(c, *d.source);
     vkCmdBeginRendering(c, &rendering);
+    t->samples_unsettled = t->depth;
     bound_pipeline_ = VK_NULL_HANDLE; // the draws' pipeline and sets are bound again after it
     VkViewport viewport{0, 0, float(t->host_width), float(t->host_height), 0, 1};
     vkCmdSetViewport(c, 0, 1, &viewport);
@@ -8779,6 +8821,7 @@ void Impl::flush_clears(RenderTarget *t) {
         rendering.pColorAttachments = &attachment;
     }
     vkCmdBeginRendering(c, &rendering);
+    t->samples_unsettled = t->depth;
     for (const auto &[clear, rect] : t->pending_clears) vkCmdClearAttachments(c, 1, &clear, 1, &rect);
     vkCmdEndRendering(c);
     t->pending_clears.clear();
@@ -9198,6 +9241,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // the store's packing for the target: its flags (bits 4-7) and format (28-31)
     if (from_target_image) p.flags |= (edram_target(source, 0).flags & 0xFu) << 4 | (source.format & 0xFu) << 28;
     const VkPipelineLayout layout = from_target_image ? resolve_image_layout_ : resolve_layout_;
+    if (from_target_image) settle_depth_samples(c, source);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE,
                       from_target_image ? resolve_image_pipelines_[source.msaa ? 1 : 0] : resolve_pipeline_);
     const VkDescriptorSet resolve_sets[3] = {from_edram ? resolve_edram_set_ : resolve_set_, target_set_,
