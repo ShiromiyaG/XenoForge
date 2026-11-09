@@ -82,7 +82,13 @@ for ($run = 1; $run -le $Runs; $run++) {
         $base = $config -like '*-base'
         $kind = $config -replace '-base$', ''
         $env:XF_RENDER_TARGET_PATH = if ($kind -eq 'ours-host') { 'host' } else { '' }
-        if ($base) { foreach ($name in $BaseEnv) { Set-Item "Env:$name" '1' } }
+        # (each NAME set to 1, or NAME=VALUE to that value)
+        if ($base) {
+            foreach ($name in $BaseEnv) {
+                $pair = $name -split '=', 2
+                Set-Item "Env:$($pair[0])" $(if ($pair.Count -eq 2) { $pair[1] } else { '1' })
+            }
+        }
         switch ($kind) {
             { $_ -in 'ours', 'ours-host' } {
                 $line = & $Bench --seconds $Seconds --warmup $Warmup --vk @extra --stdout "$Out.$config.$run.log" --label $label -- $Ours $Disc @OursArgs
@@ -96,7 +102,7 @@ for ($run = 1; $run -le $Runs; $run++) {
         }
         Remove-Item Env:XF_RENDER_TARGET_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:XF_RESOLUTION_SCALE -ErrorAction SilentlyContinue
-        if ($base) { foreach ($name in $BaseEnv) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue } }
+        if ($base) { foreach ($name in $BaseEnv) { Remove-Item "Env:$(($name -split '=', 2)[0])" -ErrorAction SilentlyContinue } }
         $line | Add-Content $Out
         $line | Select-Object -Last 1
     }
