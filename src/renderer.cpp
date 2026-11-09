@@ -1104,7 +1104,8 @@ public:
         load_shader(type, code);
         // the IM_LOAD shader_again just let through: kept by where it came from
         if (shader_at_open_ && shader_at_key_ == shader_at(type, address, uint32_t(code.size())))
-            shaders_at_[shader_at_key_] = {type == 0 ? vertex_hash_ : pixel_hash_, shader_at_count_};
+            shaders_at_[shader_at_key_] = {type == 0 ? vertex_hash_ : pixel_hash_, shader_at_count_,
+                                           type == 0 ? vertex_shader_ : pixel_shader_};
         shader_at_open_ = false;
     }
     // IM_LOAD's shaders by where they were loaded from (beyond Xenia, which
@@ -1128,10 +1129,11 @@ public:
                      p++)
                     if (stamps_[p].load(std::memory_order_acquire) > it->second.checked) same = false;
             }
-            if (same && shaders_.count(it->second.hash)) {
+            if (same && it->second.shader) {
                 it->second.checked = count;
                 (type == 0 ? vertex_hash_ : pixel_hash_) = it->second.hash;
                 (type == 0 ? have_vertex_ : have_pixel_) = true;
+                (type == 0 ? vertex_shader_ : pixel_shader_) = it->second.shader;
                 report_.shader_loads_again++;
                 return true;
             }
@@ -2122,6 +2124,8 @@ private:
     gpu::MemoryTrace *trace_ = nullptr; // a trace writer's, told what is read
     uint64_t vertex_hash_ = 0, pixel_hash_ = 0;
     bool have_vertex_ = false, have_pixel_ = false;
+    // the loaded shaders themselves (shaders_ never drops one), so a draw looks neither up by hash
+    Shader *vertex_shader_ = nullptr, *pixel_shader_ = nullptr;
     float max_viewport_[2] = {};
     VkDeviceSize ubo_align_ = 256, ssbo_align_ = 64;
 
@@ -2131,6 +2135,7 @@ private:
     struct ShaderAt {
         uint64_t hash = 0;
         uint32_t checked = 0;
+        Shader *shader = nullptr;
     };
     std::unordered_map<uint64_t, ShaderAt> shaders_at_;
     static uint64_t shader_at(uint32_t type, uint32_t address, uint32_t dwords) {
@@ -3936,6 +3941,7 @@ void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
     }
     (type == 0 ? vertex_hash_ : pixel_hash_) = hash;
     (type == 0 ? have_vertex_ : have_pixel_) = true;
+    (type == 0 ? vertex_shader_ : pixel_shader_) = s.get();
 }
 
 Shader *Impl::shader(uint64_t hash) {
@@ -6815,8 +6821,8 @@ void Impl::draw(const gpu::Draw &d) {
         // ones (EVENT_WRITE_ZPD, as Xenia's): nothing to draw, whatever its
         // primitive. A UE3 game issues hundreds of such point lists a
         // frame.
-        const Shader *v = have_vertex_ ? shader(vertex_hash_) : nullptr;
-        const Shader *p = have_pixel_ ? shader(pixel_hash_) : nullptr;
+        const Shader *v = have_vertex_ ? vertex_shader_ : nullptr;
+        const Shader *p = have_pixel_ ? pixel_shader_ : nullptr;
         bool exports = (v && v->summary.memexport) || (color && p && p->summary.memexport);
         if (!writes_targets && !exports) {
             if (options_.verbose)
@@ -6996,9 +7002,9 @@ void Impl::draw(const gpu::Draw &d) {
                  !(tessellated && tess_mode == 2);
 
     // shaders
-    Shader *vs = have_vertex_ ? shader(vertex_hash_) : nullptr;
+    Shader *vs = have_vertex_ ? vertex_shader_ : nullptr;
     if (!vs) return skip("no vertex shader");
-    Shader *ps = color && have_pixel_ ? shader(pixel_hash_) : nullptr;
+    Shader *ps = color && have_pixel_ ? pixel_shader_ : nullptr;
     std::string why;
     if (!translate(*vs, why)) return skip("vertex shader: " + why);
     if (ps && !translate(*ps, why)) return skip("pixel shader: " + why);
@@ -7043,9 +7049,18 @@ void Impl::draw(const gpu::Draw &d) {
     bool any_gamma = false;
     uint32_t mask = regs_[reg::RB_COLOR_MASK];
     // the interlock path makes no render targets: their places in EDRAM
-    // (edram_view), for the draw's extent
-    RenderTarget views[5];
+    // (edram_view), for the draw's extent; only what the draw reads of each
+    // (a RenderTarget each, made and destroyed at every draw, was a tenth of
+    // the draw's own time)
+    struct View {
+        uint32_t width, height, format;
+    };
+    View views[5];
     bool viewed[5] = {};
+    auto view_of = [&](bool is_depth, uint32_t base, uint32_t format) {
+        const RenderTarget t = edram_view(is_depth, base, pitch, msaa, format);
+        return View{t.width, t.height, t.format};
+    };
     for (uint32_t i = 0; i < 4 && ps; i++) {
         color_masks[i] = (mask >> (4 * i)) & 0xF;
         if (!color_masks[i] || !(ps->colors_written & (1u << i))) {
@@ -7057,7 +7072,7 @@ void Impl::draw(const gpu::Draw &d) {
         if (fsi_) {
             if (format == 8 || format == 9 || format == 11 || format == 13)
                 return skip(std::string("color target format ") + color_target_format_name(format));
-            views[i] = edram_view(false, info & 0xFFF, pitch, msaa, format);
+            views[i] = view_of(false, info & 0xFFF, format);
             viewed[i] = true;
             continue;
         }
@@ -7081,7 +7096,7 @@ void Impl::draw(const gpu::Draw &d) {
     if (depth_control & 3) {
         uint32_t info = regs_[reg::RB_DEPTH_INFO], format = (info >> 16) & 1;
         if (fsi_) {
-            views[4] = edram_view(true, info & 0xFFF, pitch, msaa, format);
+            views[4] = view_of(true, info & 0xFFF, format);
             viewed[4] = true;
         } else {
             if (format == 1 && !options_.depth_float24_convert_in_pixel_shader)
@@ -7319,9 +7334,13 @@ void Impl::draw(const gpu::Draw &d) {
     } else if (primitive == 13) {
         // quads to triangle pairs
         std::vector<uint32_t> &triangles = draw_lists_.triangles;
-        triangles.clear();
-        for (uint32_t q = 0; q + 3 < indices.size(); q += 4)
-            for (uint32_t k : {0, 1, 2, 0, 2, 3}) triangles.push_back(indices[q + k]);
+        triangles.resize(indices.size() / 4 * 6);
+        const uint32_t *quad = indices.data();
+        uint32_t *triangle = triangles.data();
+        for (size_t q = 0; q + 3 < indices.size(); q += 4, quad += 4, triangle += 6) {
+            triangle[0] = quad[0], triangle[1] = quad[1], triangle[2] = quad[2];
+            triangle[3] = quad[0], triangle[4] = quad[2], triangle[5] = quad[3];
+        }
         indices.swap(triangles);
         if (indices.empty()) return;
     } else if (primitive == 12 || primitive == 14 || primitive == 15) {
@@ -7909,15 +7928,13 @@ void Impl::draw(const gpu::Draw &d) {
     // ones. (Read from host memory, the arena's copies, they made the
     // scene's vertex shaders wait on the bus: 6.7 ms of a UE3 game's race
     // frame.)
-    struct VertexSlot {
-        uint32_t slot, start, end;
-    };
-    std::vector<VertexSlot> vertex_slots;
     std::vector<Range> &vertex_ranges = draw_lists_.vertex_ranges;
     vertex_ranges.clear();
     {
         // the slots both shaders fetch, in order (a mask: 96 vertex fetch
         // constants, three to a texture constant's six words)
+        std::vector<Range> &sorted = draw_lists_.sorted;
+        sorted.clear();
         uint64_t fetch_slots[2] = {};
         for (const Shader *s : {vs, ps})
             if (s)
@@ -7933,11 +7950,8 @@ void Impl::draw(const gpu::Draw &d) {
                 approximate("a vertex fetch from a texture fetch constant");
             uint32_t start = f[0] & 0x1FFFFFFC, words = (f[1] >> 2) & 0xFFFFFF;
             uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(start) + uint64_t(words) * 4, GuestMemory::SIZE));
-            if (end > start) vertex_slots.push_back({slot, start, end});
+            if (end > start) sorted.push_back({start, end});
         }
-        std::vector<Range> &sorted = draw_lists_.sorted;
-        sorted.clear();
-        for (const VertexSlot &v : vertex_slots) sorted.push_back({v.start, v.end});
         std::sort(sorted.begin(), sorted.end());
         for (const Range &r : sorted) {
             if (!vertex_ranges.empty() && r.first <= vertex_ranges.back().second)
