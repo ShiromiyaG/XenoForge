@@ -235,8 +235,7 @@ void CommandProcessor::restore_gamma_ramp(std::span<const uint32_t> table, std::
 
 // ---- packets ----
 
-void CommandProcessor::report_packet(uint32_t address, uint32_t packet, uint32_t count) {
-    if (!packets_wanted_) return;
+void CommandProcessor::report_packet_words(uint32_t address, uint32_t packet, uint32_t count) {
     words_.resize(1 + count);
     words_[0] = packet;
     for (uint32_t i = 0; i < count; i++) words_[1 + i] = reader_.peek(i);

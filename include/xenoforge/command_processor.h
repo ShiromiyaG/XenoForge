@@ -376,7 +376,11 @@ private:
     bool type3(uint32_t address, uint32_t packet);
     bool type3_opcode(uint32_t opcode, uint32_t count);
     // a packet that runs, to the sink: its header and the count words after it
-    void report_packet(uint32_t address, uint32_t packet, uint32_t count);
+    // (nothing called for a sink that wants no packets)
+    void report_packet(uint32_t address, uint32_t packet, uint32_t count) {
+        if (packets_wanted_) report_packet_words(address, packet, count);
+    }
+    void report_packet_words(uint32_t address, uint32_t packet, uint32_t count);
     // (to the sink that was given the packet: one that wants none gets no end either)
     void end_packet() {
         if (packets_wanted_) sink_->packet_end();
