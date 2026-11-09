@@ -2714,6 +2714,40 @@ can locate: its D3D12 backend has no GPU timestamps a pass and RenderDoc
 gives none on D3D12 here, so the next step is timestamp queries around its
 render target cache's transfers, dumps, resolves and draws in a local build.
 
+**Xenia's passes timed (2026-11-09).** A local measuring build of Xenia's
+D3D12 backend (not upstream, kept out of both repositories): a timestamp
+query at each change of the kind of work (`--d3d12_gpu_timing`: draws, the
+render target cache's transfers, EDRAM dumps, resolve copies and clears,
+texture loads, uploads and barriers before a draw; each submission waited
+for and read as it is submitted) and `--trace_dump_repeat N` in its trace
+dump (the frame played again with the caches kept, the fastest play after
+the first printed by kind, as `xfreplay --repeat` does). Game D's drive
+frame (swap 5000 of a played run, recorded by `boot --trace-frames`), host
+render targets on both, ms a play (ours without the trace's front buffer
+read-back, which Xenia's dump does not time):
+
+| | ours | Xenia D3D12 |
+| --- | --- | --- |
+| draws | 4.03 | 3.58 |
+| render target transfers | 1.66 | 2.42 |
+| resolves: copies | 1.25 | 0.67 |
+| EDRAM stores (Xenia's dumps) | 1.01 | 0.44 |
+| resolves: clears | 0.35 | 0.12 |
+| texture loads | 0.27 | 2.22 |
+| uploads and barriers | (in the above) | 0.54 |
+| total | 8.57 | 9.98 |
+
+On the frame itself ours is ahead (the resolve targets spare most of
+Xenia's texture loads, the transfers cost less), and behind in the EDRAM
+compute passes: stores, resolve copies and clears at about twice Xenia's.
+The frame has a chain of 48 small ones (pitch 160, 1x); ours run a pixel a
+thread with a full barrier after each pass, Xenia's several pixels a thread
+with narrower barriers: the next target here. Live the order is the other
+way (ours 9.2-9.4 ms of GPU a frame in the drive's window against Xenia's
+6.2, 2 and 1 runs), so something only a live run does costs ours more or
+spares Xenia's; finding it needs the same timing in Xenia's live executable
+(the whole xenia_canary built with it) beside `XF_GPU_TIME=1`.
+
 ## Resolution scale (2026-11-08)
 
 The console's pixels drawn as more (or fewer) host pixels: 50% to 800% in
