@@ -2496,6 +2496,81 @@ left against Xenia is GPU time a frame: the draws on the host path, and
 the interlock's cost on the default one (2.5 ms a frame more than the
 host path's).
 
+**What stands still costs nothing (2026-11-09, night).** The thread's work
+alone is measured without a game: `xfreplay <xtr> --repeat N` prints the
+time each play after the first spent in the command processor and what it
+calls ("commands a play", the median and the fastest; the trace's walk and
+the memory it restores left out), and `--profile N` samples that thread
+over the plays (tools/sampler.cpp, now with a scope: only the samples under
+`CommandProcessor::execute_packets`; a table of each sampled function with
+its caller and the caller's line; `XF_PROFILE_LINES=N` lists a function's
+hottest source lines). `--whole-extents` plays as live play does. The drive
+frame's baseline (2,735 draws, 111,000 packets a play; 100 plays, other
+agents building and running on the machine): 22.4 ms median and 20.1 ms
+fastest a play on the default path, 23.2 and 20.6 on the host path. Its
+profile, as shares of the processor's work: `Impl::draw` itself 16-23%
+(5.6% in its locals' destructors and 2.2% in making them: five
+`RenderTarget`s a draw for the interlock path's views; 4.3% in hash map
+lookups of the two shaders, four a draw; 2% turning quads into triangles
+with `push_back`), the C runtime's block copy 14% plus `memmove` 3.5%
+(the sampler names it `_NLG_Return2`, the nearest export below the copy's
+code in VCRUNTIME140: no unwinding anywhere; its callers are the two 5 KB
+constant blocks copied from the registers, compared with the last upload and
+copied twice more at every draw), the driver 12.7%, register writes 15%
+(`write_register` per word with its checks, `type0`, `report_packet` and
+`packet_end` called for a sink that takes neither), the clock 4.5% (two
+reads around every sink call, texture check and vertex request), textures
+and samplers 7% (the constant parsed twice, three maps searched per slot),
+the heap 4%. The changes, one commit each, none timed after the baseline
+(the machine was given to another agent's GPU timings; to be timed alone):
+- **Registers as runs, stamped.** A type-0 packet, `SET_CONSTANT`,
+  `SET_CONSTANT2`, `SET_SHADER_CONSTANTS` and `LOAD_ALU_CONSTANT` store
+  their words in one loop when they lie in a row in the buffer and none of
+  the registers has a side effect (those all lie below 0x2000:
+  `CommandProcessor::write_register_run`; `XF_GPU_REGISTER_RUNS=0` writes
+  them one by one). The register file stamps each block of 32 registers
+  with a serial when a write changes a value there
+  (`RegisterFile::write`, `write_big_endian`, `changed_since`); writes from
+  other threads (`set`: the CPU's MMIO) count in `foreign_writes` instead.
+  Xenia compares values at the draw.
+- **Constants by the stamps** (`XF_CONSTANT_STAMPS=0` off). The renderer's
+  copy of each stage's constants is brought up to date block by block where
+  the stamps say a value changed, and uploaded again only then (and in each
+  new submission). The fetch constants count for a stage only in the blocks
+  its shader's texture and vertex fetch slots lie in, so the vertex buffers
+  a draw sets leave the pixel stage's upload alone.
+- **A draw's own locals**: the interlock path's views keep three numbers,
+  not a `RenderTarget`; the loaded shaders are kept by pointer (`shaders_`
+  never drops one), also by `shader_again`; the shaders' slots are masks
+  made once at load, not sets walked at each draw; quads become triangles
+  through a sized list; the vertex ranges skip a list of their own.
+- **Texture slots kept** (`XF_TEXTURE_SLOT_MEMO=0` off). A slot whose six
+  fetch words, filters and forced filtering are the last draw's, with no
+  texture loaded or loaded again, no place in the bindless tables given back
+  and no sampler destroyed since (`texture_epoch_`), takes the slot's words
+  of the system constants again after the texture's own check
+  (`unwritten`) and its uses' marks. Never while a trace is recorded, and
+  only for slots that came out with nothing counted as approximate.
+- **The clock** only around draws, resolves and swaps:
+  `Report::check_seconds` and `vertex_seconds` and the short calls' share of
+  `Report::seconds` are timed with `Options::cpu_times` (xfreplay sets it)
+  or `XF_RENDERER_CPU_TIMES=1`.
+- **The last pipeline again** by one compare of the key before the map.
+- `report_packet` and `packet_end` only for a sink that wants packets.
+
+`WAIT_REG_MEM` is as Xenia's where it sleeps (a wait field of 0x100 or
+more: `wait / 0x100` ms; Xenia spins below that, ours yields to the
+scheduler). What a game polls is now counted: the video report's line gives
+the packets that did not match at once, the polls on memory and with a
+sleep, and the last such packet's address, reference, mask and wait field.
+Left on the thread: the driver's recording; the rest of `Impl::draw` (the
+pipeline's description built before the key is looked up; the viewport and
+scissor and the system constants made again at each draw: the stamps would
+tell when the state registers stood still); index conversion (3%; Xenia
+reads indices on the GPU from shared memory); each write-back's
+`memory_written` and `wrote_back`; on the host path `render_target`'s map
+lookup per target.
+
 **VIZ queries** (Xenia's `occlusion_query_viz`, off by default there; here
 where the device has `VK_EXT_conditional_rendering`,
 `XF_VK_NO_CONDITIONAL_RENDERING=1` off). A query's survey draws
