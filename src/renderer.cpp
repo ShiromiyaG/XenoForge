@@ -6959,7 +6959,8 @@ void Impl::draw(const gpu::Draw &d) {
             if (width != 8) {
                 char what[96];
                 std::snprintf(what, sizeof(what), "line draws %g pixels wide (PA_SU_LINE_CNTL)", double(width) / 8.0);
-                use(what);
+                // (by its text: the literals' count is kept by address, and this one is on the stack)
+                use(std::string(what));
             }
         }
     }
@@ -7649,7 +7650,7 @@ void Impl::draw(const gpu::Draw &d) {
         // What the slot gave the last draw that read it, again: the same constant's words and
         // filters, no texture, view or sampler destroyed or loaded since (texture_epoch_), and
         // the texture's memory unwritten. The constant is not parsed, nor the texture, its view
-        // and its sampler looked up (three maps, a tenth of the command thread).
+        // and its sampler looked up (three maps, 7% of the command thread).
         const uint32_t forced_filter = texture_filter_.load(std::memory_order_relaxed);
         const uint32_t forced_aniso = anisotropy_.load(std::memory_order_relaxed);
         SlotMemo *memo = slot_memos_on_ && slot < 32 && !trace_ ? &slot_memos_[slot] : nullptr;
@@ -9425,7 +9426,8 @@ void Impl::swap() {
         // the display's look-up table mode (display_gamma), counted
         char what[96];
         std::snprintf(what, sizeof(what), "swaps with DC_LUTA_CONTROL 0x%06X", regs_[r::DC_LUTA_CONTROL]);
-        use(what);
+        // (by its text: the literals' count is kept by address, and this one is on the stack)
+        use(std::string(what));
     }
     const bool read = options_.frame_wanted && options_.frame_wanted(number);
     // the port's frame (native_render.h), shown in the emulated one's place;
