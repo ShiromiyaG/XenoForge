@@ -754,6 +754,62 @@ three runs each interleaved (another agent's clang and Xenia running,
 59-79% load): before 18.80, 19.67, 18.97 s (median 18.97); after 16.66,
 16.44, 18.97 s (median 16.66): 12% less. The same guest memory hash.
 
+**The floating point slow paths take no context** (`ppc_ops/fpu.h`,
+2026-11-09). An arithmetic instruction leaves its fast path for
+`fp_arith`, a conversion to integer for `fp_to_int`, an unordered compare
+for `fp_compare_unordered`. Each took the `Context`, so to the compiler
+each call (one per instruction, though it rarely runs) could write any
+register in it and any memory: every register the code held was reloaded
+after it, and clang's GVN looked for what was stored where through every
+one of those calls. Without Rc they only read the FPSCR, so they now take
+it by value and return their result (`fp_arith_value`,
+`fp_to_int_value`, `[[gnu::const]]`); the Rc forms and the unordered
+compare write the FPSCR and CR1 from what the call returns, in the
+generated code. Game D's longest function (27,500 instructions, almost
+all `lfs`, `stfs` and single-precision arithmetic: about 14 minutes of a
+15-minute build, the other 283 files done in 4) went from 14 minutes of
+clang to 261 s, GVN from most of it to 78 s.
+
+**Very long functions in parts** (`recomp_emit.cpp`, `XF_PART`): clang's
+optimizer still took time growing faster than the function's length (GVN,
+the SLP vectorizer, DSE, the code generator: 9 ms an instruction there
+against about 0.5 in ordinary code). In a function of more than 4,096
+instructions, each stretch of straight-line code (no branch, no label
+inside, no hook) of 256 instructions or more goes, 1,024 at a time, into
+a part: a static member function, never inlined, of a class local to the
+function (`struct xf_parts`, so the file splitting of a rejected file
+keeps it with its function), which the body calls where the stretch was;
+a label at the stretch's start stays before the call. Game D's longest
+in 1,024-instruction parts: 38 s (2,048: 48 s; 512: 33 s). A part costs a
+call and the registers it holds in the context read again, once every
+thousand instructions. Compiler memory barriers every 2,048 instructions
+in the one function instead changed nothing (255 s), nor did GVN's own
+limits (`-memdep-block-number-limit`, `-enable-load-pre=false`); the
+MemorySSA GVN took twice as long. Game D has 11 functions over 4,096
+instructions of its 85,859. The 3DS runtime, whose generated C keeps the
+guest's registers in locals synced with the context around calls, does
+not meet this: its longest function in a game we built (21,742 lines of C)
+compiles in 12 s, GVN 0.5 s.
+
+**Registers in locals, weighed and not done** (2026-11-09). With the long
+functions in parts, clang's time on an ordinary file has no one cost that
+locals would remove (`-ftime-report`, game A, two files of 34,000 lines:
+4.5 and 7.5 s): instruction selection 20-23%, InstCombine 10%, the SLP
+vectorizer 6-10%, the always-inliner 6-8%, GVN 6-9%, EarlyCSE 3-5%, DSE
+3-4%, the front end 6-21%. The passes that follow the context through
+memory (GVN, EarlyCSE, DSE, LICM) are 15-23% together, and locals would
+trade part of that for SROA's work and for the emitter's: which registers
+each instruction reads and writes, and every one written stored back
+before each call, return and yield point (a PPC function calls every ten
+to twenty instructions). A tenth of the time at best, for a second
+description of each instruction.
+
+**The header precompiled** (`game_build.cpp`, `Build::compile`): every
+functions file parsed `ppc_generated.h` again, 0.55-0.6 s of clang each
+(a tenth of an ordinary file's time; 290 files in game A). The recompile
+step precompiles it once a build (0.7 s) for the functions files
+(`-include-pch`); the objects' code is the same, byte for byte.
+
 **VSCR[NJ]'s cost** (the same measure, with and without it, interleaved,
 13-49% load): without 16.78, 16.81, 16.09 s; with 16.56, 17.16, 16.67 s
 (medians 16.78 and 16.67): none measurable, so it is not behind a switch.

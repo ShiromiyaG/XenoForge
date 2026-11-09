@@ -28,6 +28,15 @@
 #else
 #define XF_TAIL(f) return f(c)
 #endif
+// A part of a very long function (recomp_emit.cpp, "parts"): a stretch of
+// its straight-line code in a function of its own, a static member of a
+// class local to the function, never inlined back (the optimizer's time on
+// one function grows faster than its length)
+#if defined(__clang__) || defined(__GNUC__)
+#define XF_PART(name) [[gnu::noinline]] static void name([[maybe_unused]] ::xf::ppc::Context &c)
+#else
+#define XF_PART(name) __declspec(noinline) static void name([[maybe_unused]] ::xf::ppc::Context &c)
+#endif
 // A return from a function that switches the stack: to its caller when LR
 // and r1 are its entry's (xf_lr, xf_sp), else thrown to the frame it goes to.
 #define XF_CHECKED_RETURN()                                                                                            \

@@ -8,20 +8,103 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace xf::render {
+namespace {
+
+namespace fs = std::filesystem;
+
+// a file by its size and time ("" when it is not there)
+std::string file_stamp(const fs::path &p) {
+    std::error_code ec;
+    const auto size = fs::file_size(p, ec);
+    if (ec) return {};
+    const auto time = fs::last_write_time(p, ec);
+    if (ec) return {};
+    return std::to_string(size) + ":" + std::to_string(time.time_since_epoch().count());
+}
+
+// the program this runs in (the launcher, xfbuild), by its file: another
+// XenoForge (its translator, its pipelines' state) makes other pipelines
+std::string program_stamp() {
+#ifdef _WIN32
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&program_stamp), &self))
+        return {};
+    wchar_t path[4096];
+    const DWORD n = GetModuleFileNameW(self, path, DWORD(std::size(path)));
+    if (!n || n >= std::size(path)) return {};
+    return file_stamp(fs::path(std::wstring(path, n)));
+#else
+    std::error_code ec;
+    const fs::path self = fs::read_symlink("/proc/self/exe", ec);
+    return ec ? std::string() : file_stamp(self);
+#endif
+}
+
+uint64_t mix(uint64_t key, std::string_view text) {
+    for (unsigned char ch : text) key = (key ^ ch) * 0x100000001B3ull;
+    return (key ^ 0xFF) * 0x100000001B3ull;
+}
+
+// What the step would start from: this program, the title's storage and
+// pipeline cache (both written by runs and by the step), the disc's shaders
+// and the device and driver. The same as when the step last finished: it
+// would make nothing (every pipeline is in the record) and only translate
+// the shaders again, so it is skipped. "" when something cannot be told.
+std::string step_key(const build::ShaderStep &step, const fs::path &storage, const fs::path &cache,
+                     const vk::Device &device) {
+    const std::string program = program_stamp(), stored = file_stamp(storage);
+    if (program.empty() || stored.empty()) return {};
+    uint64_t key = mix(0xCBF29CE484222325ull, "xf shader step 1");
+    key = mix(key, program);
+    key = mix(key, stored);
+    key = mix(key, file_stamp(cache));
+    VkPhysicalDeviceProperties p{};
+    vkGetPhysicalDeviceProperties(device.physical(), &p);
+    key = mix(key, std::to_string(p.vendorID) + ":" + std::to_string(p.deviceID) + ":" +
+                       std::to_string(p.driverVersion));
+    key = mix(key, std::string_view(reinterpret_cast<const char *>(p.pipelineCacheUUID), VK_UUID_SIZE));
+    key = mix(key, std::to_string(step.disc_shaders.size()));
+    for (const auto &[type, code] : step.disc_shaders) {
+        const uint64_t h = ShaderStorage::hash(type, code);
+        key = mix(key, std::string_view(reinterpret_cast<const char *>(&h), sizeof(h)));
+    }
+    char text[24];
+    std::snprintf(text, sizeof(text), "%016llX\n", (unsigned long long)key);
+    return text;
+}
+
+std::string read_text(const fs::path &p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), {});
+}
+
+} // namespace
 
 std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
     std::vector<std::string> lines;
     char line[512];
     if (!step.disc_shaders.empty() || step.disc_files) {
-        std::snprintf(line, sizeof(line), "the disc: %zu shaders in %zu files read (%.1f s)", step.disc_shaders.size(),
-                      step.disc_files, step.disc_seconds);
+        if (step.disc_from_earlier)
+            std::snprintf(line, sizeof(line),
+                          "the disc: %zu shaders in %zu files (an earlier step's search, of %.1f s, kept)",
+                          step.disc_shaders.size(), step.disc_files, step.disc_seconds);
+        else
+            std::snprintf(line, sizeof(line), "the disc: %zu shaders in %zu files read (%.1f s)",
+                          step.disc_shaders.size(), step.disc_files, step.disc_seconds);
         lines.push_back(line);
     }
-    const std::filesystem::path storage = ShaderStorage::path(step.cache_dir, step.title_id);
+    const fs::path storage = ShaderStorage::path(step.cache_dir, step.title_id);
     std::error_code ec;
-    if (!std::filesystem::exists(storage, ec) && step.disc_shaders.empty()) {
+    if (!fs::exists(storage, ec) && step.disc_shaders.empty()) {
         lines.push_back("skipped: no shader storage yet (" + storage.filename().string() +
                         ": a run of the game writes it)");
         return lines;
@@ -37,6 +120,15 @@ std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
     Options options;
     options.shader_storage = storage;
     options.pipeline_cache = ShaderStorage::pipeline_cache_path(step.cache_dir, step.title_id);
+    // nothing new since the step last finished: nothing to make
+    fs::path stamp = storage;
+    stamp.replace_extension(".shaderstep");
+    if (const std::string key = step_key(step, storage, options.pipeline_cache, *device);
+        !key.empty() && read_text(stamp) == key) {
+        lines.push_back("unchanged since the last shader step (this XenoForge, the storage, the pipeline cache, "
+                        "the disc's shaders and the device the same): nothing to make");
+        return lines;
+    }
     PrecompileOptions precompile_options;
     precompile_options.extra_shaders = step.disc_shaders;
     precompile_options.cancel = step.cancel;
@@ -63,7 +155,13 @@ std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
                   (unsigned long long)r.libraries_failed, (unsigned long long)r.pipelines,
                   (unsigned long long)r.pipelines_failed, r.seconds, r.driver_seconds);
     lines.push_back(line);
-    if (!ok) lines.push_back("stopped: " + error);
+    if (!ok) {
+        lines.push_back("stopped: " + error);
+    } else {
+        // the files as the step left them (it wrote the cache and the record)
+        const std::string key = step_key(step, storage, options.pipeline_cache, *device);
+        if (!key.empty()) std::ofstream(stamp, std::ios::binary | std::ios::trunc) << key;
+    }
     return lines;
 }
 

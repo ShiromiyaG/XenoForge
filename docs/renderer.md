@@ -1454,6 +1454,19 @@ without a pipeline state no library is made of them (a pipeline's fixed
 state, its targets' formats and the pixel shader's form all come from the
 draw).
 
+**Nothing redone** (2026-11-09). The search's result is kept beside the
+library, `<cache>/<digest>.discshaders` (the shaders' microcode, the image's
+size and time, the files and seconds it took): a later step on the same
+image reads it instead of the disc (game D: 2,921 shaders in 2,371 files,
+35 s). And a step whose inputs are those it finished with last time is
+skipped whole, translation included: `<title id>.shaderstep` keeps a key of
+this XenoForge (the program's file, by size and time: its translator makes
+the modules), the storage and the pipeline cache (each by size and time;
+runs and the step write both), the device and driver, and the disc's
+shaders, taken after the step wrote what it made. A run of the game since,
+another XenoForge, another driver or a new disc search makes the step run
+again, where the records still keep it from making what it made.
+
 **The run** reads the records that match its device and driver, while the
 pipeline cache file's header is still theirs: a library the build step
 made is made at once on the renderer's thread (a lookup in the cache)

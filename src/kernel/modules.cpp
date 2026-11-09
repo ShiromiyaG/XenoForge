@@ -200,9 +200,12 @@ struct Module {
 // The loader lock (NT's LdrpLoaderLock, a critical section): recursive,
 // owned by a host thread (a guest thread's, or a host caller's). Held across
 // guest code (the DllMains), so a guest thread waiting for it waits on the
-// host, outside the guest's waits; the report names its owner. In the
-// deterministic mode every guest thread is a fiber on one host thread: the
-// owner is the guest thread, and a waiter yields to the others instead.
+// host, outside the guest's waits; the report names its owner. A guest
+// thread that is a fiber (the deterministic scheduler's, all on one host
+// thread; the console scheduler's, on six) shares its host thread: the owner
+// is the guest thread, and a waiter gives its processor to the others instead
+// (a yield in the deterministic mode, whose order it keeps; a slice given up
+// on the console scheduler, which naps once the wait goes on).
 class LoaderLock {
   public:
     void lock() {
@@ -214,10 +217,13 @@ class LoaderLock {
             return;
         }
         waiting_++;
-        if (t && t->owner.scheduler->deterministic()) {
+        if (t && t->scheduled) {
+            Scheduler &s = *t->owner.scheduler;
+            const bool exact = s.deterministic();
             while (depth_ != 0) {
                 l.unlock();
-                t->owner.scheduler->yield();
+                if (exact) s.yield();
+                else s.give_up_slice();
                 l.lock();
             }
         } else {

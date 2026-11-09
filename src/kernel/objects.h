@@ -451,6 +451,11 @@ public:
     bool woken = false;
     std::condition_variable cv;
     void *scheduled = nullptr; // the deterministic scheduler's record of it
+    // its spin on the spin-wait hint (kernel.cpp's system_.spin; its own
+    // thread's only): when the run of hand-overs began, when the last one
+    // returned, and the GPU's write-backs counted then
+    uint64_t spin_since = 0, spin_last = 0;
+    uint32_t spin_seen = 0;
 };
 
 // The thread running on this host thread (nullptr off guest threads).
@@ -492,9 +497,36 @@ public:
     virtual bool deterministic() const { return false; }
     // its counts, for the thread report (empty when playing)
     virtual std::string report() { return {}; }
+    // A long spin on the XDK's spin-wait hint (ppc_ops.h's spin_hint, from
+    // guest code, no lock): the host's processor to another thread
+    virtual void spin() { yield(); }
+    // The same spin, gone on while the GPU works (kernel.cpp's system_.spin:
+    // the thread most likely polls what the GPU writes back): the calling
+    // thread sleeps until `word` is no longer `seen` (spin_wake() after a
+    // change to it), another thread needs its processor, or `us` have
+    // passed (no lock)
+    virtual void spin_wait(const std::atomic<uint32_t> &word, uint32_t seen, uint32_t us) {
+        (void)word, (void)seen, (void)us;
+        spin();
+    }
+    // `word` changed (any thread, no lock): spin_wait's sleepers go on
+    virtual void spin_wake() {}
+    // A yield point reached after preempt-at-yield-points was asked for the
+    // calling thread (the console scheduler's quantum; no lock)
+    virtual void preempt_point() {}
+    // t's processor (KPCR CURRENT_CPU) changed (KeSetAffinityThread; lock held)
+    virtual void affinity_changed(Thread &t) { (void)t; }
 };
 
 std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects);
+// console_scheduler.cpp: the console's way (docs/runtime.md, "The console
+// scheduler"): six host threads for the Xenon's six hardware threads, each
+// guest thread a fiber on its processor, waits switching fibers there; the
+// kernel's host-code threads host threads of their own (XF_SCHEDULER=console)
+std::unique_ptr<Scheduler> make_console_scheduler(Objects &objects);
+// threads.cpp's: the host timer at its finest, and the host's shortest sleep
+void host_fine_timer();
+void host_nap();
 // deterministic.cpp: every guest thread a fiber on one host thread, in a fixed
 // order, on a virtual clock (xenoforge/kernel.h, Deterministic)
 std::unique_ptr<Scheduler> make_deterministic_scheduler(Objects &objects, const Deterministic &options);

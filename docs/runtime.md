@@ -452,11 +452,71 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
   oldest first (KiWaitTest), taking what they acquire (auto-reset events,
   semaphore counts, mutant ownership); wait-any, wait-all, timeouts
   relative and absolute, abandoned mutants, alertable waits.
-- **The scheduler** is an interface of seven calls (start, join, block
-  until woken or a deadline, wake, yield, the clock, timers changed). The
-  host scheduler gives each guest thread a host thread with a 16 MB stack
-  and a clock thread (timers, KeTimeStampBundle, every millisecond); the
-  time base (mftb) is the same clock. The fiber scheduler replaces it.
+- **The scheduler** is an interface (`Scheduler`, objects.h: start, join,
+  block until woken or a deadline, wake, yield, give up a slice, the clock,
+  timers changed; and the spin-wait hint's hand-over, a preemption's yield
+  point and an affinity changed). The host scheduler gives each guest thread
+  a host thread with a 16 MB stack and a clock thread (timers,
+  KeTimeStampBundle, every millisecond); the time base (mftb) is the same
+  clock. The deterministic mode's fiber scheduler replaces it, and so does
+  the console scheduler (below, `XF_SCHEDULER=console`).
+- **The console scheduler** (`console_scheduler.cpp`, 2026-11-09;
+  `XF_SCHEDULER=console`): the guest's threads scheduled as the console's
+  kernel schedules them, on six processors for the Xenon's six hardware
+  threads, rather than each a host thread for the host to schedule (Xenia's
+  way, and the host scheduler's). The model is Cemu's (the Wii U's threads
+  as fibers on a host thread per core), written anew.
+  - A processor is a host thread (started at its first thread) with a fiber
+    per guest thread on it. A thread is on the processor KPCR CURRENT_CPU
+    names when it is made (ExCreateThread's mask, else its parent's, as
+    Xenia's GetFakeCpuNumber), or the one KeSetAffinityThread names before
+    it first runs: a thread made suspended is held until resumed, so the
+    XDK's CreateThread suspended, XSetThreadProcessor, ResumeThread puts it
+    where the game asked. A thread that has run stays on its processor's
+    host thread (the kernel's code reads host thread-locals, whose addresses
+    the compiler may keep across a call that would move it); the moves asked
+    then are counted. The thread-locals the kernel keeps per guest thread
+    (the current thread, the exception walks) are swapped at each switch.
+  - A wait that blocks, a yield, a thread's end: its processor switches to
+    the next ready fiber there in user mode, no host wait or wake; with
+    nothing ready it sleeps on its condition variable until a wait's
+    deadline or a wake from elsewhere. A wake from another processor or a
+    host thread puts the fiber on its processor's queue and wakes the
+    processor if it sleeps.
+  - Each processor runs its ready fibers by their KTHREAD priority, first
+    come first among equals. One made ready above the one running preempts
+    it at its next yield point (a loop's back edge, a priority hint, as
+    `Kernel::pause` stops threads: the yield points' counting turned on for
+    that thread, an atomic flag the generated code loads at each); one that
+    has run 2 ms with another as high ready is preempted there too, as a
+    quantum ends; one that has waited 8 ms runs next whatever its priority
+    (Xenia gives every thread to the host with the priorities ignored: no
+    game is left waiting on a low thread a high one starves). The
+    spin-wait hint (db16cyc, every 2,048 in a row), a yield and a slice given
+    up hand the processor to the others ready there, whatever their
+    priority, and queue behind them.
+  - The kernel's own threads whose body is host code (the GPU's, the
+    sound's, XAM's workers) stay host threads of their own, waiting on
+    their condition variables as the host scheduler's; so does guest code a
+    host thread calls. The loader lock, a host lock held across guest code,
+    gives its processor up while it waits (a fiber must not wait on the
+    host for another fiber of its processor).
+  - The clock is the host's; a clock thread moves the timers every
+    millisecond, makes the waits of busy processors whose deadline passed
+    ready, and asks for the preemptions.
+  - The thread report prints its counts (switches, waits, yields, spins
+    handed over, preemptions, moves) and each processor's host CPU time.
+    `kernel_threads_console` runs the threads' tests on it.
+  - Measured (2026-11-09), game D's played drive (`bench_vs_xenia.ps1
+    -Configs ours-host`, the drive's press script, window 125-200 s), one
+    run at a time: the host scheduler 27.55 fps, frame p95 50.1 ms, CPU
+    2.74 s a second (an earlier run 28.63, 49.3, 2.79); the console
+    scheduler 29.17, 35.6, 2.63 and, again, 27.68, 50.3, 2.82. No gain it
+    keeps, so the host scheduler stays the default. Its 40 s boot of game
+    D: 46 threads, 65,229 switches, 61,916 waits blocked, 2,314
+    preemptions (1,202 for a higher thread made ready), 787 threads run
+    starving; processor 0 (2 threads, one of them the game's render thread
+    polling the GPU) 38.9 s of CPU in 40, the other five 13.4 s together.
 - **Polling threads nap.** A zero-interval KeDelayExecutionThread and
   NtYieldExecution go through `give_up_slice`. Xenia answers both with
   `Sleep(0)` (and a 100 ns NtDelayExecution for threads below normal
@@ -660,6 +720,25 @@ stack's generated frames wait where they are:
   a loop while it waits for the GPU (a full core before): the played drive
   went from 27.4 to 28.6 frames a second and 3.25 to 2.79 s of CPU a second
   (Xenia 30 and 1.96).
+- **Spins on the GPU sleep (2026-11-09).** That loop is Direct3D's wait
+  for the GPU: 32 hints, then a read of what the command processor writes
+  back to guest memory (the read pointer's copy, a fence's value), with no
+  kernel call; the hand-over above returns at once on a host with idle
+  cores, so the thread still kept one busy for as long as the GPU took. A
+  thread whose hand-overs have followed each other (less than 1 ms apart)
+  for 200 us while the command processor has commands to run now sleeps
+  until the processor's next write-back or interrupt
+  (`CommandProcessor::Host::wrote_back`, `Video::write_backs`,
+  `Scheduler::spin_wait`), 1 ms at most, and not at all when one came
+  since its last hand-over. With the processor idle the spin is handed
+  over as before. On the console scheduler the thread's processor runs
+  its other ready fibers first and sleeps with none. `XF_SPIN_WAIT=0`
+  turns it off; the GPU's report counts the sleeps. Game D's played drive,
+  one run each, the same session: off 27.83 frames a second, p95 50.3 ms,
+  2.83 s of CPU a second; on 27.24, 50.5, 2.15; on, with the console
+  scheduler, 27.48, 50.3, 2.12. A quarter less CPU, the frames unchanged
+  (they wait for the GPU either way), and the console scheduler no better
+  than the host's with it.
 - **Forced hand-overs**, a safety net that should no longer fire: a watchdog
   host thread stops a thread that has not handed over for `force_after_ms`
   (100) of the host's time if it is in the generated code at IRQL below 2
@@ -2510,19 +2589,29 @@ first, at below-normal priority with only its log inherited; then
 `lld-link /dll /noentry /nodefaultlib /opt:ref /Brepro` through a response
 file (`ld.lld -shared --eh-frame-hdr --gc-sections` on Linux).
 The library goes to `<cache>/<digest>-<version>.dll`, replacing any other
-version's for that digest, and the work directory is removed (`keep_work`
-keeps it). Progress is reported per module (discovery), per file (emission
-and compiling) and for the link, always from the caller's thread; the
-cancel flag ends the compilers under way. A stopped build goes on from the
-objects it left (an object newer than its source is not compiled again).
-The work directory is the disc's, not the version's (2026-11-08): with
-`keep_work`, another XenoForge's build of the same disc recompiles only the
-files whose text changed (the emission writes a file only when its text
-does) as long as the headers and flags are the same; a digest of those
-(`objects.key` beside the objects) that differs discards every object. The
-interface version is in the entry's text, so the entry alone is
-recompiled when only the version moved (a recompiler change that leaves
-the headers alone).
+version's for that digest. Progress is reported per module (discovery), per
+file (emission and compiling) and for the link, always from the caller's
+thread; the cancel flag ends the compilers under way.
+
+**The objects are kept** (`BuildOptions::keep_objects`, on by default,
+2026-11-09): after a build the work directory keeps `obj/` and
+`objects.key` (game D: 284 objects, about 185 MB) and loses the emitted
+code, which the next build writes again (`keep_work` keeps that too,
+`--keep`). Beside each object, `<file>.source` holds a key of the text it
+was compiled from, so an object is reused whenever its source's text is
+the same, however the source was written; a stopped build goes on the same
+way. The work directory is the disc's, not the version's: another
+XenoForge's build of the same disc (or a rebuild for the entry log)
+recompiles only the files whose text changed. `objects.key` is a key of the
+headers' code (`code_of`: comments, blank lines and the spaces around lines
+left out, so editing a header's comments keeps the objects; no
+generated-code header uses `__LINE__`), the flags and the compiler (clang's
+size and time); one that differs discards every object. The interface
+version is in the entry's text, so the entry alone is recompiled when only
+the version moved (a recompiler change that leaves the headers' code
+alone, or a comment edited). A change to the generated code's own
+semantics (an inline header's code) still recompiles everything, as it
+must: every function's code changes.
 The CPU must have AVX2 and FMA (checked first, `cpu_supported`).
 `find_cached(cache, digest)` finds `<digest>-<this version>.dll`.
 

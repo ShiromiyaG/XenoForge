@@ -27,6 +27,7 @@
 
 #include "lockstep_check.h"
 #include "objects.h"
+#include "video.h"
 #include "xenoforge/crash.h"
 #include "xenoforge/exports.h"
 #include "xenoforge/hooks.h"
@@ -35,7 +36,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <thread>
 
 namespace xf::kernel {
 namespace {
@@ -218,9 +218,46 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         if (!after) k.lockstep_->before_import(c, *k.hook_marker(address));
         else k.lockstep_->after_import(c, resume, resume == address);
     };
-    // a long spin on db16cyc hints (ppc_ops.h's spin_hint): the host
-    // processor to whatever else is ready on it (SwitchToThread, sched_yield)
-    system_.spin = [](ppc::Context &) { std::this_thread::yield(); };
+    // a long spin on db16cyc hints (ppc_ops.h's spin_hint): the processor to
+    // whatever else is ready on it (the host scheduler's: SwitchToThread,
+    // sched_yield; the console scheduler's: its next ready fiber)
+    // A spin that goes on (hand-overs less than SPIN_STREAK_GAP apart for
+    // SPIN_WAIT_AFTER) while the command processor has commands to run is,
+    // most likely, Direct3D's wait for the GPU: a loop of hints around a
+    // read of what the processor writes back (the read pointer's copy, a
+    // fence's value), which kept a host core busy for as long as the GPU
+    // took. Such a thread sleeps until the next write-back or interrupt
+    // (video.h's write_backs), SPIN_WAIT_US at most, and not at all when
+    // one came since its last hand-over (its loop has yet to see it). A
+    // spin on something else meanwhile (another thread's flag) looks again
+    // at each write-back and each SPIN_WAIT_US. XF_SPIN_WAIT=0: hand-overs
+    // only.
+    system_.spin = [](ppc::Context &c) {
+        static constexpr uint64_t SPIN_STREAK_GAP = 10'000, SPIN_WAIT_AFTER = 2'000; // 100 ns units
+        static constexpr uint32_t SPIN_WAIT_US = 1'000;
+        static const bool waiting = [] {
+            const char *v = std::getenv("XF_SPIN_WAIT");
+            return !(v && v[0] == '0');
+        }();
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        // handing over is a safe point: the thread waiting there is parked
+        GuestCodeScope parked(k, false);
+        Scheduler &s = *k.objects_->scheduler;
+        Thread *t = waiting ? current_thread() : nullptr;
+        if (!t) return s.spin();
+        Video &v = video_state(k);
+        const uint64_t now = s.now();
+        const uint32_t seen = v.write_backs.load(std::memory_order_acquire);
+        if (now - t->spin_last > SPIN_STREAK_GAP) t->spin_since = now;
+        if (now - t->spin_since >= SPIN_WAIT_AFTER && seen == t->spin_seen && v.busy.load(std::memory_order_relaxed)) {
+            v.spin_waits.fetch_add(1, std::memory_order_relaxed);
+            s.spin_wait(v.write_backs, seen, SPIN_WAIT_US);
+        } else {
+            s.spin();
+        }
+        t->spin_seen = seen;
+        t->spin_last = s.now();
+    };
     system_.yield = [](ppc::Context &c) {
         // the yield points' budget ran out (ppc_ops.h): the clock moves by
         // the whole ticks spent, and another thread may run (a spin on a flag
@@ -231,9 +268,12 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
             k.park();
         const int64_t units = k.deterministic_yield_units_;
         if (!units) {
-            // (counting was turned on for a pause: off again)
+            // (counting was turned on for a pause or a preemption: off again,
+            // and the processor handed over if the scheduler asked for it)
             c.yield_budget = INT64_MAX;
-            c.yield_counting = false;
+            __atomic_store_n(&c.yield_counting, false, __ATOMIC_RELAXED);
+            GuestCodeScope parked(k, false);
+            k.objects_->scheduler->preempt_point();
             return;
         }
         const int64_t ticks = 1 + (-(c.yield_budget + 1)) / units;
@@ -570,8 +610,8 @@ bool Kernel::pause(uint32_t timeout_ms) {
                 // parks it. (Written from here as it runs, as the deterministic
                 // mode's watchdog does: a store it misses is made again.)
                 if (!exact && t->context) {
-                    t->context->yield_budget = -1;
-                    t->context->yield_counting = true;
+                    __atomic_store_n(&t->context->yield_budget, int64_t(-1), __ATOMIC_RELAXED);
+                    __atomic_store_n(&t->context->yield_counting, true, __ATOMIC_RELEASE);
                 }
             }
         }

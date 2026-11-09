@@ -220,6 +220,11 @@ public:
         // packet's wait field: wait / 0x100 ms from 0x100 up, else no more
         // than a yield). False: stop executing (the GPU is shutting down).
         virtual bool wait(uint32_t wait) = 0;
+        // The processor wrote something the CPU reads back to guest memory
+        // (the read pointer's copy, a scratch register's, an event's value,
+        // screen extents, a query's report): what the CPU's code polls for
+        // while it waits for the GPU.
+        virtual void wrote_back() {}
     };
 
     CommandProcessor(Memory &memory, Host &host);

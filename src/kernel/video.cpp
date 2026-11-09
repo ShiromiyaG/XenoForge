@@ -235,8 +235,17 @@ void Video::commands_loop(Thread &self) {
             o.wait(self, kick, false, false, Scheduler::NEVER);
             continue;
         }
+        busy.store(true, std::memory_order_relaxed);
         cp->run(write);
+        busy.store(write_pointer.load() != cp->read_pointer(), std::memory_order_relaxed);
+        wrote_back(); // (the last of the run: the spins see the processor idle)
     }
+}
+
+// what the CPU polls for changed: the threads asleep in a spin look again
+void Video::wrote_back() {
+    write_backs.fetch_add(1, std::memory_order_release);
+    objects(*k).scheduler->spin_wake();
 }
 
 void Video::interrupt(uint32_t cpu) {
@@ -308,6 +317,7 @@ void Video::dispatch_interrupt(Thread &self, uint32_t source, uint32_t cpu) {
     p[kpcr::CURRENT_IRQL] = irql;
     k->store32(pcr + kpcr::DPC_ACTIVE, 0);
     interrupts[source & 1].fetch_add(1);
+    wrote_back(); // (the callback may have set what a spin waits for)
 }
 
 // ---- the report ----
@@ -353,6 +363,11 @@ std::string video_report(Kernel &k) {
                   (unsigned long long)n.waits.load(), (unsigned long long)n.failed_draws.load(),
                   (unsigned long long)n.bad_packets.load());
     out += line;
+    if (uint64_t waits = v.spin_waits.load()) {
+        std::snprintf(line, sizeof(line), "gpu: %llu sleeps of threads spinning while it worked (%u write-backs)\n",
+                      (unsigned long long)waits, v.write_backs.load());
+        out += line;
+    }
     std::string opcodes, unknown;
     for (uint32_t op = 0; op < 128; op++) {
         if (uint64_t c = n.opcodes[op].load()) {

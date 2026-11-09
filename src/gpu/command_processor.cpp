@@ -119,11 +119,13 @@ uint32_t CommandProcessor::load_swapped(uint32_t address, Endian e) const {
 void CommandProcessor::store_swapped(uint32_t address, uint32_t value, Endian e) {
     put_le32(physical(address), gpu_swap(value, e));
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, 4);
+    host_.wrote_back();
 }
 
 void CommandProcessor::store_be32(uint32_t address, uint32_t value) {
     put_be32(physical(address), value);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, 4);
+    host_.wrote_back();
 }
 
 // ---- the ring buffer ----
@@ -582,6 +584,7 @@ bool CommandProcessor::event_write_shd() {
     }
     put_le32(destination, data);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, 4);
+    host_.wrote_back();
     return true;
 }
 
@@ -618,6 +621,7 @@ void CommandProcessor::write_extent(uint32_t address, const uint16_t (&extents)[
     uint8_t *p = physical(address);
     for (int i = 0; i < 6; i++) p[2 * i] = uint8_t(extents[i] >> 8), p[2 * i + 1] = uint8_t(extents[i]);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, sizeof(extents));
+    host_.wrote_back();
 }
 
 // The sink's answers to the screen extent reports in (all of them, waited
@@ -673,6 +677,7 @@ void CommandProcessor::write_zpd(uint32_t address, uint64_t z_pass) {
     uint8_t *p = physical(address);
     for (int i = 0; i < 8; i++) put_le32(p + 4 * i, values[i]);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, sizeof(values));
+    host_.wrote_back();
 }
 
 // QueueZPDReport: the report of the draws since the last event (the current

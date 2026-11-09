@@ -92,7 +92,7 @@ target_include_directories(xenoforge PUBLIC include PRIVATE src ${CMAKE_CURRENT_
 # beside the code it compiles (cmake/game_interface.cmake)
 file(GLOB XF_GAME_INTERFACE_INPUTS CONFIGURE_DEPENDS include/xenoforge/ppc*.h include/xenoforge/ppc_ops/*.h
      include/xenoforge/ppc_opcodes.inc include/xenoforge/game_library.h include/xenoforge/recomp.h src/recomp_*.cpp
-     src/game_build.cpp)
+     src/game_build_flags.h)
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/game_interface.stamp
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/xenoforge/game_interface.h
@@ -603,6 +603,9 @@ add_test(NAME kernel_crash COMMAND kernel_crash_test)
 # a rare deadlock seen once under load (2026-11-05, not reproduced in 36
 # runs since): fail instead of hanging the suite
 set_tests_properties(kernel_threads PROPERTIES TIMEOUT 120)
+# the same on the console scheduler (src/kernel/console_scheduler.cpp)
+add_test(NAME kernel_threads_console COMMAND kernel_threads_test)
+set_tests_properties(kernel_threads_console PROPERTIES TIMEOUT 120 ENVIRONMENT XF_SCHEDULER=console)
 add_test(NAME kernel_threads_deterministic COMMAND kernel_threads_deterministic_test)
 add_test(NAME kernel_deterministic COMMAND kernel_deterministic_test)
 set_tests_properties(kernel_threads_deterministic kernel_deterministic PROPERTIES TIMEOUT 120)

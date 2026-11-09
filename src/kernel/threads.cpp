@@ -184,6 +184,20 @@ public:
         returned = now();
     }
 
+    // A spin that waits for the GPU sleeps on a condition variable of its
+    // own, which spin_wake() notifies only with a sleeper there.
+    void spin_wait(const std::atomic<uint32_t> &word, uint32_t seen, uint32_t us) override {
+        std::unique_lock<std::mutex> l(spin_lock_);
+        spin_sleepers_.fetch_add(1);
+        spin_cv_.wait_for(l, std::chrono::microseconds(us), [&] { return word.load() != seen; });
+        spin_sleepers_.fetch_sub(1);
+    }
+    void spin_wake() override {
+        if (!spin_sleepers_.load()) return;
+        { std::lock_guard<std::mutex> l(spin_lock_); }
+        spin_cv_.notify_all();
+    }
+
     std::string report() override {
         uint64_t n = naps_.load(std::memory_order_relaxed);
         if (!n) return {};
@@ -230,6 +244,9 @@ private:
     Objects &o_;
     uint64_t epoch_; // host_clock::now() when the scheduler was made
     std::atomic<uint64_t> naps_{0};
+    std::mutex spin_lock_; // spin_wait's sleepers
+    std::condition_variable spin_cv_;
+    std::atomic<uint32_t> spin_sleepers_{0};
     std::once_flag clock_started_;
     std::thread clock_;
     std::condition_variable clock_cv_;
@@ -275,6 +292,8 @@ void set_cpu(Kernel &k, Thread &t, uint8_t cpu) {
 
 Thread *current_thread() { return current_; }
 void set_current_thread(Thread *t) { current_ = t; }
+void host_fine_timer() { fine_host_timer(); }
+void host_nap() { nap(); }
 
 std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects) { return std::make_unique<HostScheduler>(objects); }
 
@@ -417,9 +436,11 @@ void Thread::body() {
     Objects &o = owner;
     Kernel &k = o.k;
     current_ = this;
-    if (!k.deterministic()) {
+    if (!scheduled) {
         // the host thread named after the guest's (for debuggers and
-        // profilers), and kept for its CPU time in the thread report
+        // profilers), and kept for its CPU time in the thread report (a
+        // fiber of the deterministic or the console scheduler has none of its
+        // own: the scheduler reports its processors)
         char name[48];
         std::snprintf(name, sizeof(name), "xf guest %u%s%s", id, params.name ? " " : "",
                       params.name ? params.name : "");
@@ -969,6 +990,7 @@ XF_EXPORT(xboxkrnl, KeSetAffinityThread) {
     // the previous affinity through the pointer, the status returned
     if (previous_ptr) k.store32(previous_ptr, 1u << k.host(t->pcr)[kpcr::CURRENT_CPU]);
     set_cpu(k, *t, fake_cpu(objects(k), uint8_t(affinity)));
+    objects(k).scheduler->affinity_changed(*t);
     result(c, X_STATUS_SUCCESS);
 }
 

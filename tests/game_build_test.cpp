@@ -327,9 +327,12 @@ int main() {
         CHECK(without.project.empty() && without.left_out.empty());
     }
 
-    // With the work kept, a build again recompiles nothing whose text and
-    // headers are the same (the objects' key beside them), and everything
-    // once the key differs (other headers or flags)
+    // The objects kept (the default), a build again recompiles nothing whose
+    // text and headers are the same (each object's source key beside it, and
+    // the objects' key), and everything once the objects' key differs (other
+    // headers' code, flags or compiler); the emitted code itself goes. The
+    // work kept whole (keep_work) reuses them the same way. Without either,
+    // nothing is left.
     {
         const std::filesystem::path fourth = root / "cache4";
         uint64_t reused = 0, total = 0;
@@ -339,19 +342,23 @@ int main() {
             if (stage == build::Stage::Compiling && !seen) seen = true, reused = done, total = all;
         };
         build::BuildOptions kept;
-        kept.keep_work = true, kept.force = true;
+        kept.force = true;
         auto build_once = [&] {
             reused = total = 0, seen = false;
             return build::prepare_game(xex_path, fourth, counting, error, kept);
         };
         CHECK(build_once() && reused == 0 && total > 0);
-        CHECK(build_once() && reused == total && total > 0);
-        std::filesystem::path key;
+        std::filesystem::path key, work;
         for (const auto &entry : std::filesystem::recursive_directory_iterator(fourth / "work"))
-            if (entry.path().filename() == "objects.key") key = entry.path();
-        CHECK(!key.empty());
+            if (entry.path().filename() == "objects.key") key = entry.path(), work = entry.path().parent_path();
+        CHECK(!key.empty() && std::filesystem::is_directory(work / "obj") && !std::filesystem::exists(work / "src"));
+        CHECK(build_once() && reused == total && total > 0);
+        kept.keep_work = true;
+        CHECK(build_once() && reused == total && total > 0 && std::filesystem::is_directory(work / "src"));
         std::ofstream(key) << "0\n";
         CHECK(build_once() && reused == 0 && total > 0);
+        kept.keep_work = false, kept.keep_objects = false;
+        CHECK(build_once() && !std::filesystem::exists(work));
     }
 
     // the libraries stay loaded: the directory is left for the next run's

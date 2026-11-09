@@ -39,8 +39,12 @@
 
 #if defined(__clang__) || defined(__GNUC__)
 #define XF_FP_SLOW __attribute__((noinline, cold))
+// a slow path that is a function of its arguments alone: no memory read or
+// written, so the code around its call keeps what it holds across it
+#define XF_FP_PURE __attribute__((const))
 #else
 #define XF_FP_SLOW __declspec(noinline)
+#define XF_FP_PURE
 #endif
 
 namespace xf::ppc::ops {
@@ -78,11 +82,14 @@ XF_INLINE uint32_t fpscr_summarize(uint32_t v) {
 }
 
 // An instruction's exceptions (sticky; FX when one goes from 0 to 1) and
-// status bits into the FPSCR, then CR1 from it
+// status bits into an FPSCR; into the context's, then CR1 from it
+XF_INLINE uint32_t fp_recorded(uint32_t fpscr, uint32_t exceptions, uint32_t status, uint32_t status_mask) {
+    uint32_t v = fpscr | exceptions;
+    if (exceptions & ~fpscr) v |= FPSCR_FX;
+    return fpscr_summarize((v & ~status_mask) | status);
+}
 inline void fp_record(Context &c, uint32_t exceptions, uint32_t status, uint32_t status_mask) {
-    uint32_t v = c.fpscr | exceptions;
-    if (exceptions & ~c.fpscr) v |= FPSCR_FX;
-    c.fpscr = fpscr_summarize((v & ~status_mask) | status);
+    c.fpscr = fp_recorded(c.fpscr, exceptions, status, status_mask);
     fpscr_to_cr1(c);
 }
 
@@ -137,8 +144,18 @@ inline double fp_compute(uint32_t kind, double a, double b, double c) {
 }
 
 // An arithmetic instruction past the fast path (top of the file). a, b, c
-// are FRA, FRB, FRC.
-inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, double b, double cc) {
+// are FRA, FRB, FRC; fpscr the FPSCR it runs under (its rounding mode and
+// NI), and with rc the FPSCR it leaves (its exceptions and status recorded)
+// in `recorded`. It reads and writes nothing else (the host's rounding mode
+// is put back to nearest; the host's exception flags are cleared before
+// each use), so without Rc it is a function of its arguments: fp_slow calls
+// it so (fp_arith_value), and the generated code around an instruction that
+// leaves the fast path keeps the registers it holds in the context's place
+// across it (a call that may write the context, as one taking it would,
+// makes the optimizer reload them, and look for what it stored through
+// every one of them: most of the compile time of a long run of floating
+// point code).
+inline double fp_arith_core(uint32_t fpscr, uint32_t op, bool rc, double a, double b, double cc, uint32_t &recorded) {
 #ifdef __clang__
 #pragma STDC FENV_ACCESS ON
 #endif
@@ -169,7 +186,8 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
         // the NaN quieted (a single keeps the top of its fraction), never negated
         uint64_t v = fp_bits(operands[nan]) | 0x0008000000000000;
         if (single) v &= 0xFFFFFFFFE0000000;
-        if (rc) fp_record(c, exceptions, fp_class(fp_double(v), single), FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
+        if (rc)
+            recorded = fp_recorded(fpscr, exceptions, fp_class(fp_double(v), single), FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
         return fp_double(v);
     }
     // A single form with a double-denormal operand, as the console's tests
@@ -182,7 +200,7 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
         if (denormal && (kind == FP_DIV || kind == FP_SQRT)) {
             single = false;
         } else if (denormal && !infinite) {
-            if (rc) fp_record(c, 0, 0x11u << 12, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
+            if (rc) recorded = fp_recorded(fpscr, 0, 0x11u << 12, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
             return fp_double(FP_DEFAULT_NAN);
         }
     }
@@ -204,11 +222,11 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
         exceptions = FPSCR_VXSQRT;
     }
     if (exceptions) {
-        if (rc) fp_record(c, exceptions, 0x11u << 12, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
+        if (rc) recorded = fp_recorded(fpscr, exceptions, 0x11u << 12, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
         return fp_double(FP_DEFAULT_NAN);
     }
     static constexpr int MODES[4] = {lib::ROUND_NEAREST, lib::ROUND_ZERO, lib::ROUND_UP, lib::ROUND_DOWN};
-    const int mode = MODES[c.fpscr & FPSCR_RN];
+    const int mode = MODES[fpscr & FPSCR_RN];
     double r, rz = 0; // rz: toward zero, for FR
     int flags;
     if (!single) {
@@ -235,7 +253,7 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
     }
     lib::fesetround(lib::ROUND_NEAREST);
     if (kind == FP_NMADD || kind == FP_NMSUB) r = -r, rz = -rz;
-    if ((c.fpscr & FPSCR_NI) && r != 0 && lib::fabs(r) < (single ? 0x1p-126 : 0x1p-1022)) {
+    if ((fpscr & FPSCR_NI) && r != 0 && lib::fabs(r) < (single ? 0x1p-126 : 0x1p-1022)) {
         r = rz = lib::copysign(0.0, r);
         flags |= lib::EXCEPT_UNDERFLOW | lib::EXCEPT_INEXACT;
     }
@@ -246,9 +264,27 @@ inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, bool rc, double a, do
         // fres: XX untouched, FR and FI undefined (left 0)
         if (kind != FP_RES && (flags & lib::EXCEPT_INEXACT))
             exceptions |= FPSCR_XX, status |= FPSCR_FI | (r != rz ? FPSCR_FR : 0);
-        fp_record(c, exceptions, status, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
+        recorded = fp_recorded(fpscr, exceptions, status, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
     }
     return r;
+}
+// without Rc: the result alone (the FPSCR read, nothing written)
+inline XF_FP_SLOW XF_FP_PURE double fp_arith_value(uint32_t fpscr, uint32_t op, double a, double b, double cc) {
+    uint32_t unused = fpscr;
+    return fp_arith_core(fpscr, op, false, a, b, cc, unused);
+}
+// with Rc: the FPSCR's exceptions and status recorded, CR1 from them
+inline XF_FP_SLOW double fp_arith(Context &c, uint32_t op, double a, double b, double cc) {
+    uint32_t recorded = c.fpscr;
+    const double r = fp_arith_core(c.fpscr, op, true, a, b, cc, recorded);
+    c.fpscr = recorded;
+    fpscr_to_cr1(c);
+    return r;
+}
+// the slow path of an arithmetic instruction (rc is the instruction's: a
+// constant in the generated code)
+XF_INLINE double fp_slow(Context &c, uint32_t op, bool rc, double a, double b, double cc) {
+    return rc ? fp_arith(c, op, a, b, cc) : fp_arith_value(c.fpscr, op, a, b, cc);
 }
 
 // The fast path's condition: no Rc, the guest rounds to nearest as the host
@@ -278,7 +314,7 @@ XF_INLINE bool fp_ordinary_operands(uint32_t kind, double a, double b = 1, doubl
         if (fp_plain(c, i.A.Rc, kind, r) && fp_ordinary_operands(kind, a, b)) [[likely]]                               \
             c.f[i.A.FRT] = r;                                                                                          \
         else                                                                                                           \
-            c.f[i.A.FRT] = fp_arith(c, kind, i.A.Rc, a, b, b);                                                         \
+            c.f[i.A.FRT] = fp_slow(c, kind, i.A.Rc, a, b, b);                                                          \
     }
 // frD <- (frA) + (frB), and so on (fmul's second operand is frC)
 // clang-format off
@@ -302,7 +338,7 @@ XF_FP_BINARY(fdivsx, FP_DIV | FP_SINGLE, double(float(a / b)), FRB)
             fp_ordinary_operands(kind, a, b, cc)) [[likely]]                                                           \
             c.f[i.A.FRT] = r;                                                                                          \
         else                                                                                                           \
-            c.f[i.A.FRT] = fp_arith(c, kind, i.A.Rc, a, b, cc);                                                        \
+            c.f[i.A.FRT] = fp_slow(c, kind, i.A.Rc, a, b, cc);                                                         \
     }
 XF_FP_FUSED(fmaddx, FP_MADD, +, b)
 XF_FP_FUSED(fmaddsx, FP_MADD | FP_SINGLE, +, b)
@@ -321,7 +357,7 @@ XF_FP_FUSED(fnmsubsx, FP_NMSUB | FP_SINGLE, -, -b)
             fp_ordinary_operands(((kind) & 0xFF) == FP_SQRT ? (kind) : 0, b)) [[likely]]                               \
             c.f[i.form.rt] = r;                                                                                        \
         else                                                                                                           \
-            c.f[i.form.rt] = fp_arith(c, kind, i.form.rc, b, b, b);                                                    \
+            c.f[i.form.rt] = fp_slow(c, kind, i.form.rc, b, b, b);                                                     \
     }
 // frD <- sqrt(frB)
 XF_FP_UNARY(fsqrtx, FP_SQRT, lib::sqrt(b), A, FRT, FRB, Rc)
@@ -374,8 +410,9 @@ XF_OP(frsqrtex) { fp_frsqrte(c, i.A.FRT, c.f[i.A.FRB], i.A.Rc); }
 // fctiw[z], fctid[z] past the fast path: NaNs and what does not fit saturate
 // (VXCVI), rounding by FPSCR[RN] or toward zero, a word sign-extended (the
 // console's high word; Xenia leaves 0x00000000_80000000 for a NaN). FPRF
-// undefined, left alone.
-inline XF_FP_SLOW double fp_to_int(Context &c, double b, bool word, bool toward_zero, bool rc) {
+// undefined, left alone. As fp_arith_core: the FPSCR given, and with rc the
+// one it leaves in `recorded`; nothing else read or written.
+inline double fp_to_int_core(uint32_t fpscr, double b, bool word, bool toward_zero, bool rc, uint32_t &recorded) {
     const int64_t lo = word ? INT32_MIN : INT64_MIN, hi = word ? INT32_MAX : INT64_MAX;
     int64_t v;
     uint32_t exceptions = 0, status = 0;
@@ -386,7 +423,7 @@ inline XF_FP_SLOW double fp_to_int(Context &c, double b, bool word, bool toward_
     } else {
         double t = lib::trunc(b), fraction = b - t; // both exact
         bool away = false;                          // rounded away from zero
-        switch (toward_zero ? 1 : c.fpscr & FPSCR_RN) {
+        switch (toward_zero ? 1 : fpscr & FPSCR_RN) {
         case 0: away = lib::fabs(fraction) > 0.5 || (lib::fabs(fraction) == 0.5 && lib::fmod(t, 2.0) != 0); break;
         case 2: away = fraction > 0; break;
         case 3: away = fraction < 0; break;
@@ -399,8 +436,22 @@ inline XF_FP_SLOW double fp_to_int(Context &c, double b, bool word, bool toward_
             if (fraction != 0) exceptions = FPSCR_XX, status = FPSCR_FI | (away ? FPSCR_FR : 0);
         }
     }
-    if (rc) fp_record(c, exceptions, status, FPSCR_FR | FPSCR_FI);
+    if (rc) recorded = fp_recorded(fpscr, exceptions, status, FPSCR_FR | FPSCR_FI);
     return lib::bit_cast<double>(word ? int64_t(int32_t(v)) : v);
+}
+inline XF_FP_SLOW XF_FP_PURE double fp_to_int_value(uint32_t fpscr, double b, bool word, bool toward_zero) {
+    uint32_t unused = fpscr;
+    return fp_to_int_core(fpscr, b, word, toward_zero, false, unused);
+}
+inline XF_FP_SLOW double fp_to_int_recorded(Context &c, double b, bool word, bool toward_zero) {
+    uint32_t recorded = c.fpscr;
+    const double r = fp_to_int_core(c.fpscr, b, word, toward_zero, true, recorded);
+    c.fpscr = recorded;
+    fpscr_to_cr1(c);
+    return r;
+}
+XF_INLINE double fp_to_int(Context &c, double b, bool word, bool toward_zero, bool rc) {
+    return rc ? fp_to_int_recorded(c, b, word, toward_zero) : fp_to_int_value(c.fpscr, b, word, toward_zero);
 }
 
 XF_OP(fctidx) {
@@ -469,16 +520,16 @@ XF_OP(fnegx) {
 
 // ---- compares ----
 
-// Unordered: CR field and FPCC 0001, VXSNAN for an SNaN, and for fcmpo VXVC
-// (for an SNaN only when VE is clear)
-inline XF_FP_SLOW void fp_compare_unordered(Context &c, uint32_t bf, double a, double b, bool ordered) {
-    c.cr[4 * bf + 0] = 0, c.cr[4 * bf + 1] = 0, c.cr[4 * bf + 2] = 0, c.cr[4 * bf + 3] = 1;
+// Unordered: FPCC 0001 (the CR field too, by the caller), VXSNAN for an
+// SNaN, and for fcmpo VXVC (for an SNaN only when VE is clear): the FPSCR
+// it leaves, nothing else read or written (as fp_arith_value)
+inline XF_FP_SLOW XF_FP_PURE uint32_t fp_compare_unordered(uint32_t fpscr, double a, double b, bool ordered) {
     bool snan = fp_is_snan(fp_bits(a)) || fp_is_snan(fp_bits(b));
     uint32_t exceptions = snan ? FPSCR_VXSNAN : 0;
-    if (ordered && (!snan || !(c.fpscr & FPSCR_VE))) exceptions |= FPSCR_VXVC;
-    uint32_t v = (c.fpscr & ~FPSCR_FPCC) | (1u << 12) | exceptions;
-    if (exceptions & ~c.fpscr) v |= FPSCR_FX;
-    c.fpscr = fpscr_summarize(v);
+    if (ordered && (!snan || !(fpscr & FPSCR_VE))) exceptions |= FPSCR_VXVC;
+    uint32_t v = (fpscr & ~FPSCR_FPCC) | (1u << 12) | exceptions;
+    if (exceptions & ~fpscr) v |= FPSCR_FX;
+    return fpscr_summarize(v);
 }
 
 XF_INLINE void fp_compare(Context &c, uint32_t bf, double a, double b, bool ordered) {
@@ -494,7 +545,8 @@ XF_INLINE void fp_compare(Context &c, uint32_t bf, double a, double b, bool orde
         }
         c.fpscr = (c.fpscr & ~FPSCR_FPCC) | (lt ? 0x8000u : gt ? 0x4000u : 0x2000u);
     } else {
-        fp_compare_unordered(c, bf, a, b, ordered);
+        c.cr[4 * bf + 0] = 0, c.cr[4 * bf + 1] = 0, c.cr[4 * bf + 2] = 0, c.cr[4 * bf + 3] = 1;
+        c.fpscr = fp_compare_unordered(c.fpscr, a, b, ordered);
     }
 }
 

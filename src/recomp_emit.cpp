@@ -18,8 +18,11 @@
 
 #include "xenoforge/ppc.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <map>
 #include <set>
+#include <vector>
 
 namespace xf::recomp {
 namespace {
@@ -35,6 +38,19 @@ std::string hex8(uint32_t v) {
     std::snprintf(b, sizeof(b), "%08X", v);
     return b;
 }
+
+// In a function of more than PART_FUNCTION instructions, each stretch of
+// straight-line code (no branch, no label inside, no hook) of PART_MINIMUM
+// instructions or more goes, PART_LENGTH at a time, into a part: a function
+// of its own (ppc_generated.h's XF_PART, a static member of a class local
+// to the function) that the body calls. clang's optimizer takes time that
+// grows faster than a function's length: game D's longest, 27,500
+// instructions of floating point, took 4.3 minutes in one function (14
+// before fpu.h's slow paths stopped taking the context) and 38 s in parts.
+// Functions that long are a handful in a game (game D: 11 over 4,096 of
+// 85,859); a part costs a call and the registers it holds in the context
+// read again, once every thousand instructions.
+constexpr size_t PART_FUNCTION = 4096, PART_LENGTH = 1024, PART_MINIMUM = 256;
 
 class Emitter {
 public:
@@ -54,12 +70,31 @@ public:
         if (!resumes_.empty()) base_ = 2;
         // first pass: which labels are jumped to
         for (uint32_t pc : code_) instruction(pc, true);
-        std::string body;
+        place_parts();
+        std::string body, parts;
         out_ = &body;
-        for (uint32_t pc : code_) {
+        for (auto it = code_.begin(); it != code_.end(); ++it) {
+            const uint32_t pc = *it;
             if (referenced_.count(pc)) line("L_" + hex8(pc) + ":", -1);
-            instruction(pc, false);
+            auto part = parts_.find(pc);
+            if (part == parts_.end()) {
+                instruction(pc, false);
+                continue;
+            }
+            // the stretch into its part, the call here
+            const std::string name = "p" + std::to_string(parts_emitted_++);
+            line("xf_parts::" + name + "(c);");
+            const int base = base_;
+            out_ = &parts, base_ = 2;
+            line("XF_PART(" + name + ") {", 0);
+            base_ = 3;
+            for (size_t k = 0; k < part->second; k++, ++it) instruction(*it, false);
+            --it;
+            base_ = 2;
+            line("}");
+            out_ = &body, base_ = base;
         }
+        if (!parts.empty()) parts = "    struct xf_parts {\n" + parts + "    };\n";
         // A function the port hooks: its body is the original (xfo_), and
         // its own name the hook slot's call (XF_HOOKED), what every caller
         // and the table reach.
@@ -70,6 +105,7 @@ public:
         const std::string wrapper = slot ? "XF_FN(" + name(f_.address) + ") { XF_HOOKED(xf_hook_" + hex8(f_.address) +
                                                ", xfo_" + hex8(f_.address) + "); }\n"
                                          : std::string();
+        head += parts;
         if (resumes_.empty()) {
             // where its returns are checked against (XF_CHECKED_RETURN)
             if (checked_) head += "    const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);\n";
@@ -145,6 +181,35 @@ private:
                 }
             }
         }
+    }
+
+    // A long function's parts (PART_FUNCTION): its stretches of plain
+    // instructions (not a branch, no hook, the next one emitted: a line or
+    // two each, no control flow), each begun anew at a label (one may be
+    // jumped to only at a part's start, before its call), PART_LENGTH at a
+    // time, those of PART_MINIMUM or more
+    bool plain(uint32_t pc) const {
+        const Opcode op = ppc::decode(image_.word(pc));
+        if (op == Opcode::bx || op == Opcode::bcx || op == Opcode::bclrx || op == Opcode::bcctrx) return false;
+        if (hooks_ && hooks_->mid.count(pc)) return false;
+        return code_.count(pc + 4) != 0;
+    }
+    void place_parts() {
+        if (code_.size() <= PART_FUNCTION) return;
+        std::vector<uint32_t> run;
+        auto flush = [&] {
+            for (size_t k = 0; k < run.size(); k += PART_LENGTH) {
+                const size_t n = std::min(PART_LENGTH, run.size() - k);
+                if (n >= PART_MINIMUM) parts_[run[k]] = n;
+            }
+            run.clear();
+        };
+        for (uint32_t pc : code_) {
+            const bool p = plain(pc);
+            if (!run.empty() && (!p || referenced_.count(pc) || run.back() + 4 != pc)) flush();
+            if (p) run.push_back(pc);
+        }
+        flush();
     }
 
     // a line of the body, indent levels past the body's own
@@ -325,6 +390,8 @@ private:
     std::string prefix_;
     uint32_t end_;
     std::set<uint32_t> code_, referenced_;
+    std::map<uint32_t, size_t> parts_; // a part's first instruction: its length
+    size_t parts_emitted_ = 0;
     std::string *out_ = nullptr;
     std::set<uint32_t> *calls_;  // the functions it calls by name, when asked
     bool checked_;               // it switches the stack: its returns are checked

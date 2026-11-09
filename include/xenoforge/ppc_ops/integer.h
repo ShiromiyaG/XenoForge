@@ -314,7 +314,7 @@ XF_OP(norx) { store_x(c, i, ~(c.r[i.X.RT] | c.r[i.X.RB])); }
 XF_OP(orx) {
     if (i.X.RT == i.X.RA && i.X.RA == i.X.RB && !i.X.Rc) {
         yield_point(c, YIELD_PRIORITY_HINT);
-        if (i.code == 0x7FFFFB78u && !c.yield_counting) spin_hint(c);
+        if (i.code == 0x7FFFFB78u && !yield_counting(c)) spin_hint(c);
     }
     store_x(c, i, c.r[i.X.RT] | c.r[i.X.RB]);
 }

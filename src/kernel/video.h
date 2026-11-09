@@ -44,6 +44,7 @@ public:
     // the command processor's requests, on its thread
     void interrupt(uint32_t cpu) override;
     bool wait(uint32_t wait) override;
+    void wrote_back() override;
 
     // the CPU's MMIO (Xenia's GraphicsSystem::ReadRegister, WriteRegister)
     uint32_t read_register(uint32_t address);
@@ -59,6 +60,13 @@ public:
     std::atomic<uint32_t> write_pointer{0}; // CP_RB_WPTR, in dwords
     std::atomic<uint32_t> callback{0}, callback_data{0};
     std::atomic<bool> running{false};
+    // What a thread spinning on the GPU sleeps on (kernel.cpp's
+    // system_.spin): the command processor's write-backs to guest memory
+    // and the interrupts delivered, counted; whether the processor has
+    // commands left to run; and the sleeps taken, for the report.
+    std::atomic<uint32_t> write_backs{0};
+    std::atomic<bool> busy{false};
+    std::atomic<uint64_t> spin_waits{0};
     // VdInitializeScalerCommandBuffer's output size (the presentation's aspect)
     std::atomic<uint32_t> scaled_width{0}, scaled_height{0};
 

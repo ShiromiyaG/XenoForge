@@ -193,9 +193,13 @@ constexpr int64_t YIELD_PRIORITY_HINT = 8;
         c.yield_budget = INT64_MAX;
 }
 // Not counting (playing): a load and a branch. Counting: the weight off the
-// budget, and the hook below 0 (it may hand the processor over).
+// budget, and the hook below 0 (it may hand the processor over). The flag is
+// loaded as an atomic (relaxed: a plain load on the hosts) because other
+// threads set it as the thread runs (Kernel::pause, the console scheduler's
+// preemption), and a loop must see it: a plain load could be hoisted out.
+XF_INLINE bool yield_counting(const Context &c) { return __atomic_load_n(&c.yield_counting, __ATOMIC_RELAXED); }
 XF_INLINE void yield_point(Context &c, int64_t weight) {
-    if (c.yield_counting) [[unlikely]] {
+    if (yield_counting(c)) [[unlikely]] {
         c.yield_budget -= weight;
         if (c.yield_budget < 0) yield_hook(c);
     }

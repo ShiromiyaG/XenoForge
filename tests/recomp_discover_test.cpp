@@ -276,5 +276,37 @@ int main() {
     std::string mb = emitted(MB);
     CHECK(contains(mb, "case 0x82000D3C:") && !contains(mb, "case 0x82000D48:") &&
           contains(mb, "default: ::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u);"));
+    CHECK(!contains(lj + fs + sc + ep + mb, "xf_parts"));
+
+    // A very long function (recomp_emit.cpp, "parts"): 3,000 additions, a
+    // loop of 1,000 more (from a label, back by a bc), 999 more and a blr. Its
+    // stretches go into parts of up to 1,024 instructions: 1,024, 1,024 and
+    // 952; the loop's body, begun anew at its label, called after it; the
+    // last 999. The loop's branch stays in the body.
+    {
+        constexpr uint32_t N = 5000, LOOP = T + 3000 * 4, BACK = T + 4000 * 4;
+        Image big;
+        big.base = T, big.entry = T;
+        big.bytes.assign(size_t(N + 4) * 4, 0);
+        big.sections.push_back({".text", T, uint32_t(big.bytes.size()), true, false});
+        auto put = [&](uint32_t at, uint32_t w) {
+            uint8_t *p = &big.bytes[at - T];
+            p[0] = uint8_t(w >> 24), p[1] = uint8_t(w >> 16), p[2] = uint8_t(w >> 8), p[3] = uint8_t(w);
+        };
+        for (uint32_t k = 0; k < N; k++) put(T + k * 4, addi(3, 3, 1));
+        put(BACK, bc(4, 0, BACK, LOOP));
+        put(T + N * 4, BLR);
+        Discovery bd = discover(big, {.scan_pointers = false});
+        CHECK(bd.functions.count(T) && bd.functions.at(T).size == (N + 1) * 4);
+        if (bd.functions.count(T)) {
+            const std::string text = emit_function(big, bd, bd.functions.at(T), "xf_");
+            CHECK(contains(text, "    struct xf_parts {\n        XF_PART(p0) {\n"));
+            CHECK(contains(text, "XF_PART(p4) {") && !contains(text, "XF_PART(p5)"));
+            CHECK(contains(text, "    xf_parts::p0(c);\n    xf_parts::p1(c);\n    xf_parts::p2(c);\n"));
+            CHECK(contains(text, "L_82002EE0:\n    xf_parts::p3(c);\n")); // LOOP
+            CHECK(contains(text, "if (BC(4, 0)) { XF_YIELD(); goto L_82002EE0; }\n"));
+            CHECK(contains(text, "    xf_parts::p4(c);\n    // 82004E20 ") && contains(text, "    return;\n}\n"));
+        }
+    }
     return finish("recomp_discover");
 }
