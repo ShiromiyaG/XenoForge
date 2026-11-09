@@ -498,6 +498,41 @@ void occlusion_queries() {
     CHECK(z_pass(m + 0x60) == 1007 + 100);
 }
 
+// What changed in the register file: a packet's writes stamp a block only
+// where a value differs from the one held, as a run and one by one; another
+// thread's write (set) counts apart.
+void register_stamps() {
+    Fixture f;
+    RegisterFile &r = f.cp.registers();
+    uint32_t at = physical_alloc(0x1000);
+    Words w(at);
+    w({type0(0x4000, 40), 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+       21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40});
+    f.cp.execute_packets(at, 41);
+    CHECK(r[0x4000] == 1 && r[0x401F] == 32 && r[0x4027] == 40);
+    const uint64_t written = r.serial();
+    CHECK(written != 0 && r.changed_since(0x4000, 40, 0) && !r.changed_since(0x4000, 40, written));
+    CHECK(!r.changed_since(0x4040, 32, 0)); // a block not written
+    // the same values again: nothing changed
+    f.cp.execute_packets(at, 41);
+    CHECK(r.serial() == written);
+    // one value in the second block
+    Words again(at + 0x400);
+    again({type0(0x4021, 1), 99});
+    f.cp.execute_packets(at + 0x400, 2);
+    CHECK(r[0x4021] == 99 && r.changed_since(0x4020, 32, written) && !r.changed_since(0x4000, 32, written));
+    // a register with a side effect goes one by one, stamped too
+    const uint64_t before = r.serial(), foreign = r.foreign_writes();
+    Words low(at + 0x800);
+    low({type0(0x0300, 2), 7, 8, type3(pm4::SET_CONSTANT, 3), 4u << 16 | 0x100, 0x51, 0x52});
+    f.cp.execute_packets(at + 0x800, 7);
+    CHECK(r[0x0300] == 7 && r[0x0301] == 8 && r.changed_since(0x0300, 2, before));
+    CHECK(r[0x2100] == 0x51 && r[0x2101] == 0x52 && r.changed_since(0x2100, 2, before));
+    CHECK(r.foreign_writes() == foreign);
+    r.set(0x2100, 1);
+    CHECK(r.foreign_writes() == foreign + 1);
+}
+
 int main() {
     std::string error;
     auto memory = Memory::create(error);
@@ -512,6 +547,7 @@ int main() {
     interrupts_and_waits();
     ring_wrap_and_bad_packets();
     trace_player();
+    register_stamps();
     occlusion_queries();
     return finish("command_processor");
 }
