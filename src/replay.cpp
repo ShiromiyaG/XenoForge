@@ -32,6 +32,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace xf::render {
@@ -171,6 +173,19 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     }
     report.packets = processor.counts().packets.load();
     report.command_seconds = std::move(command_seconds);
+    // XF_REPLAY_DUMP_MEMORY=<hex address>:<hex size>:<file>: that physical
+    // memory after the trace, to set beside Xenia's and the reference's
+    // (XF_REF_DUMP_MEMORY). What resolves wrote is in it with
+    // Options::readback_resolve full (xfreplay --readback-resolve full).
+    if (const char *dump = std::getenv("XF_REPLAY_DUMP_MEMORY")) {
+        unsigned address = 0, size = 0;
+        char path[512] = {};
+        if (std::sscanf(dump, "%x:%x:%511[^\n]", &address, &size, path) == 3)
+            if (FILE *f = std::fopen(path, "wb")) {
+                std::fwrite(memory->translate_physical(address), 1, size, f);
+                std::fclose(f);
+            }
+    }
     if (!walked) return false;
     return !renderer->failed(error);
 }
