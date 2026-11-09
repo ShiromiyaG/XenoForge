@@ -2811,6 +2811,22 @@ two parts off), the clears left 0.06 ms (Xenia 0.12). The small resolve
 chain's copies stay: about 8 us each, the dispatch's and the barrier's
 latency rather than its work, as Xenia's own (5.5-7 us).
 
+**The fetches' own cost (2026-11-09).** A fetch's signs and number format
+ran every alternative for all four components and picked by selects (the
+gamma curve, the biased decode, the number format's parts). Now, as
+Xenia's: only the components the instruction keeps (its
+GetNonZeroResultComponents), each sign's work behind a uniform branch, the
+number format's parts nested the same way, all in one function of the
+module per set of components (`fetch_post`, called by each fetch). The same
+pictures; the drive frame's draws 4.53 to 4.22 ms (fastest runs), the frame
+7.78 ms against Xenia's 10.0. Counted alike (ours times barriers and the
+kept clears with the draws, Xenia apart), the draws are even: ours 4.22 +
+0.06, Xenia 3.58 + 0.54 + 0.12. The pipelines' compile time is another
+matter: the frame's 148 pipelines take 18.7 s to make, 12.0 s without any
+of this post-processing (a measurement only); in one function rather than
+inline it is the same (the driver inlines it), so what would shrink it is
+less code per fetch for the driver to see (open).
+
 **Timing these replays.** The GPU's clock is chosen per process: a run is
 either fast (8.0-8.5 ms a play here) or about twice as slow for its whole
 life, warm-up or not, 30 or 150 plays (nvidia-smi shows the clock low

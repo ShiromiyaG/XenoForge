@@ -85,9 +85,10 @@ public:
 
     Id global_variable(Id pointer_type, spv::StorageClass storage, Id initializer = 0);
 
-    // One function at a time.
+    // One function at a time; result: an id made earlier (calls made before
+    // the function), or none.
     Id begin_function(Id result_type, Id function_type,
-                      spv::FunctionControlMask control = spv::FunctionControlMask::MaskNone);
+                      spv::FunctionControlMask control = spv::FunctionControlMask::MaskNone, Id result = 0);
     Id function_parameter(Id type);
     Id local_variable(Id pointer_type, Id initializer = 0); // placed in the first block
     // Begins a block; pass an id made earlier (a branch's target) or none.

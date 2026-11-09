@@ -196,13 +196,13 @@ Id Module::global_variable(Id pointer_type, spv::StorageClass storage, Id initia
     return result;
 }
 
-Id Module::begin_function(Id result_type, Id function_type, spv::FunctionControlMask control) {
+Id Module::begin_function(Id result_type, Id function_type, spv::FunctionControlMask control, Id result) {
     in_function_ = true;
     first_block_ = true;
     function_head_.clear();
     function_variables_.clear();
     function_body_.clear();
-    Id result = id();
+    if (!result) result = id();
     const uint32_t w[] = {result_type, result, uint32_t(control), function_type};
     emit(function_head_, Op::OpFunction, w);
     return result;

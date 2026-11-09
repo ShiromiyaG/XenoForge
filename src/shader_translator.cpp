@@ -236,6 +236,9 @@ private:
     enum class Query { Sample, Lod, Weights };
     Id sample_texture(const TextureFetchInstruction &t, Id coordinates, uint32_t member = 2, Query query = Query::Sample);
     Id texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample);
+    Id fetch_post(uint32_t used, bool point_allowed, Id sample, Id signed_sample, Id info, Id scale_word);
+    void emit_fetch_posts();
+    std::map<uint32_t, Id> fetch_posts_; // texture_signs' functions by components kept and point sampling
     static bool allows_point_sampling(const TextureFetchInstruction &t);
     Id pwl_gamma_to_linear(Id gamma);
     Id slot_word(uint32_t member, uint32_t slot);
@@ -1382,9 +1385,51 @@ Id Translator::slot_word(uint32_t member, uint32_t slot) {
 // component times 2^w - 1 (unsigned) or 2^(w-1) - 1 (signed, biased; a
 // 1-bit biased one times a half less a half), rounded when the fetch and the
 // constant both sample by point.
+//
+// The signs and the number format are one function of the module's for each
+// set of components kept and point sampling allowed, called by each fetch
+// (fetch_post): the drivers compile them once, not once a fetch (inlined at
+// every fetch, they were a third of the pipelines' compile time).
 Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample) {
     const uint32_t slot = t.operands[1].index;
     Id info = slot_word(7, slot), signed_entry = slot_word(8, slot), scale_word = slot_word(12, slot);
+    // only the components the instruction keeps (Xenia's
+    // GetNonZeroResultComponents); the others go nowhere
+    const uint32_t used = t.non_zero_result_components();
+    if (!used) return sample;
+    Id any_signed = m_.const_bool(false);
+    for (uint32_t k = 0; k < 4; k++)
+        if (used & (1u << k))
+            any_signed = m_.op(Op::OpLogicalOr, bool_,
+                               {any_signed, m_.op(Op::OpIEqual, bool_,
+                                                  {m_.op(Op::OpBitFieldUExtract, uint_, {info, u(2 * k), u(2)}), u(1)})});
+    store(signed_sample_, sample);
+    when(m_.op(Op::OpLogicalAnd, bool_, {any_signed, m_.op(Op::OpINotEqual, bool_, {signed_entry, u(0)})}), [&] {
+        store(signed_sample_, sample_texture(t, coordinates, 8));
+        return false;
+    });
+    Id signed_sample = load(vec4_, signed_sample_);
+    const uint32_t key = used | (allows_point_sampling(t) ? 16u : 0u);
+    auto it = fetch_posts_.find(key);
+    if (it == fetch_posts_.end()) it = fetch_posts_.emplace(key, m_.id()).first;
+    return m_.op(Op::OpFunctionCall, vec4_, {it->second, sample, signed_sample, info, scale_word});
+}
+
+// fetch_posts_' functions, after the body that calls them
+void Translator::emit_fetch_posts() {
+    for (const auto &[key, function] : fetch_posts_) {
+        const Id parameters[4] = {vec4_, vec4_, uint_, uint_};
+        m_.begin_function(vec4_, m_.type_function(vec4_, parameters), spv::FunctionControlMask::MaskNone, function);
+        Id sample = m_.function_parameter(vec4_), signed_sample = m_.function_parameter(vec4_);
+        Id info = m_.function_parameter(uint_), scale_word = m_.function_parameter(uint_);
+        m_.label();
+        m_.op_void(Op::OpReturnValue, {fetch_post(key & 15, (key & 16) != 0, sample, signed_sample, info, scale_word)});
+        m_.end_function();
+    }
+}
+
+// The signs and the number format on a fetch's sample (texture_signs)
+Id Translator::fetch_post(uint32_t used, bool point_allowed, Id sample, Id signed_sample, Id info, Id scale_word) {
     auto field = [&](Id word, uint32_t offset, uint32_t count) {
         return m_.op(Op::OpBitFieldUExtract, uint_, {word, u(offset), u(count)});
     };
@@ -1393,33 +1438,38 @@ Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, I
     auto sub = [&](Id a, Id b) { return exact(Op::OpFSub, float_, {a, b}); };
     auto div = [&](Id a, Id b) { return exact(Op::OpFDiv, float_, {a, b}); };
     auto ieq = [&](Id a, uint32_t b) { return m_.op(Op::OpIEqual, bool_, {a, u(b)}); };
-    Id signs[4], any_signed = m_.const_bool(false);
-    for (uint32_t k = 0; k < 4; k++) {
-        signs[k] = field(info, 2 * k, 2);
-        any_signed = m_.op(Op::OpLogicalOr, bool_, {any_signed, ieq(signs[k], 1)});
-    }
-    store(signed_sample_, sample);
-    when(m_.op(Op::OpLogicalAnd, bool_, {any_signed, m_.op(Op::OpINotEqual, bool_, {signed_entry, u(0)})}), [&] {
-        store(signed_sample_, sample_texture(t, coordinates, 8));
-        return false;
-    });
-    Id signed_sample = load(vec4_, signed_sample_);
+    Id signs[4] = {};
+    for (uint32_t k = 0; k < 4; k++)
+        if (used & (1u << k)) signs[k] = field(info, 2 * k, 2);
     Id out[4];
-    for (uint32_t k = 0; k < 4; k++) {
-        Id value = comp(sample, k);
-        Id width_less_one = field(scale_word, 6 * k, 4);
-        Id half = m_.op(Op::OpConvertUToF, float_, {m_.op(Op::OpShiftLeftLogical, uint_, {u(1), width_less_one})});
-        Id offset_binary = div(sub(mul(value, sub(mul(half, f(2)), f(1))), half), sub(half, f(1)));
-        Id twice_less_one = add(mul(value, f(2)), f(-1));
-        Id biased = select(float_, m_.op(Op::OpINotEqual, bool_, {width_less_one, u(0)}), offset_binary, twice_less_one);
-        Id r = select(float_, ieq(signs[k], 3), pwl_gamma_to_linear(value), value);
-        r = select(float_, ieq(signs[k], 2), biased, r);
-        out[k] = select(float_, ieq(signs[k], 1), comp(signed_sample, k), r);
-    }
+    for (uint32_t k = 0; k < 4; k++)
+        out[k] = used & (1u << k) ? select(float_, ieq(signs[k], 1), comp(signed_sample, k), comp(sample, k))
+                                  : comp(sample, k);
     store(fetch_scaled_, vec4_of(out[0], out[1], out[2], out[3]));
+    // biased and gamma components, each behind a uniform branch of its own
+    // (Xenia's switch on the sign), from the unsigned sample
+    auto set_component = [&](uint32_t k, Id value) {
+        store(fetch_scaled_, m_.op(Op::OpCompositeInsert, vec4_, {value, load(vec4_, fetch_scaled_), k}));
+    };
+    for (uint32_t k = 0; k < 4; k++) {
+        if (!(used & (1u << k))) continue;
+        Id value = comp(sample, k);
+        when(ieq(signs[k], 2), [&] {
+            Id width_less_one = field(scale_word, 6 * k, 4);
+            Id half = m_.op(Op::OpConvertUToF, float_, {m_.op(Op::OpShiftLeftLogical, uint_, {u(1), width_less_one})});
+            Id offset_binary = div(sub(mul(value, sub(mul(half, f(2)), f(1))), half), sub(half, f(1)));
+            Id twice_less_one = add(mul(value, f(2)), f(-1));
+            set_component(k, select(float_, m_.op(Op::OpINotEqual, bool_, {width_less_one, u(0)}), offset_binary,
+                                    twice_less_one));
+            return false;
+        });
+        when(ieq(signs[k], 3), [&] {
+            set_component(k, pwl_gamma_to_linear(value));
+            return false;
+        });
+    }
 
     // the number format (bit 26 alone: nothing to scale)
-    const bool point_allowed = allows_point_sampling(t);
     Id active = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {scale_word, u((1u << 26) - 1)}), u(0)});
     // (each part behind a uniform branch of its own, as Xenia's: a fetch runs
     // only the part its constant asks for)
@@ -1436,7 +1486,11 @@ Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, I
                     Id v4 = load(vec4_, fetch_scaled_), rebuilt[4];
                     for (uint32_t k = 0; k < 4; k++) {
                         Id v = comp(v4, k), lane = lane_of(k);
-                        Id pow2 = m_.op(Op::OpConvertUToF, float_,
+                        if (!(used & (1u << k))) {
+                            rebuilt[k] = v;
+                            continue;
+                        }
+                        Id pow2 =m_.op(Op::OpConvertUToF, float_,
                                         {m_.op(Op::OpShiftLeftLogical, uint_, {u(2), m_.op(Op::OpBitwiseAnd, uint_, {lane, u(0xF)})})});
                         Id texel = glsl(GLSLstd450RoundEven, float_, {mul(v, sub(pow2, f(1)))});
                         // (where the lane is 1 to 15: unsigned with a width)
@@ -1449,7 +1503,9 @@ Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, I
             }
             Id v4 = load(vec4_, fetch_scaled_), n[4];
             for (uint32_t k = 0; k < 4; k++) {
-                Id v = comp(v4, k), sign = m_.op(Op::OpShiftRightLogical, uint_, {lane_of(k), u(4)});
+                n[k] = comp(v4, k);
+                if (!(used & (1u << k))) continue;
+                Id v = n[k], sign = m_.op(Op::OpShiftRightLogical, uint_, {lane_of(k), u(4)});
                 Id q16 = mul(glsl(GLSLstd450RoundEven, float_, {mul(v, f(65536.0f))}), f(1.0f / 65536.0f));
                 n[k] = select(float_, ieq(sign, 0), q16, v);
                 n[k] = select(float_, ieq(sign, 2), glsl(GLSLstd450FMax, float_, {n[k], f(-1)}), n[k]);
@@ -1462,7 +1518,9 @@ Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, I
             Id point = word_has(1u << 26);
             Id v4 = load(vec4_, fetch_scaled_), r[4];
             for (uint32_t k = 0; k < 4; k++) {
-                Id v = comp(v4, k), lane = lane_of(k);
+                r[k] = comp(v4, k);
+                if (!(used & (1u << k))) continue;
+                Id v = r[k], lane = lane_of(k);
                 Id width = m_.op(Op::OpBitwiseAnd, uint_, {lane, u(0xF)});
                 Id sign = m_.op(Op::OpShiftRightLogical, uint_, {lane, u(4)});
                 Id halved = m_.op(Op::OpULessThan, bool_, {m_.op(Op::OpISub, uint_, {sign, u(1)}), u(2)});
@@ -2911,6 +2969,7 @@ Translation Translator::run() {
     if (s_.reads_past_end) unsupported("an exec past the end of the microcode");
     if (!ended_) m_.op_void(Op::OpReturn);
     m_.end_function();
+    emit_fetch_posts();
 
     switch (stage_) {
     case Stage::Harness: main_harness(); break;
