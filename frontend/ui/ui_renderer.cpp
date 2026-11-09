@@ -201,6 +201,13 @@ struct Renderer::Impl {
     void close();
     bool make_pipelines(std::string &error);
     void destroy_pipelines();
+    // the pipelines' compiled form kept in a file between runs: the driver's compile of the 26 pipelines is most of
+    // the time to the first frame on a cold start, and a file read on every later one
+    std::filesystem::path pipeline_cache_file;
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    size_t pipeline_cache_loaded = 0; // the bytes the file had
+    void open_pipeline_cache();
+    void save_pipeline_cache();
     VkSampleCountFlagBits pick_samples() const;
 
     // ---- resources
@@ -337,6 +344,7 @@ bool Renderer::Impl::open(vk::Device &device, std::string &error) {
         vkUpdateDescriptorSets(d, 1, &w, 0, nullptr);
     }
     if (!make_pipelines(error)) return false;
+    save_pipeline_cache();
 
     // a white texel for the draws without a texture, and the layers' quad
     const uint8_t one[4] = {255, 255, 255, 255};
@@ -369,7 +377,40 @@ void Renderer::Impl::destroy_pipelines() {
     bound = VK_NULL_HANDLE;
 }
 
+void Renderer::Impl::open_pipeline_cache() {
+    if (pipeline_cache) return;
+    std::vector<char> data;
+    if (!pipeline_cache_file.empty()) {
+        std::ifstream f(pipeline_cache_file, std::ios::binary);
+        if (f) data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = data.size(); // the driver ignores data that is not its own (another driver, another version)
+    ci.pInitialData = data.data();
+    if (vkCreatePipelineCache(d, &ci, nullptr, &pipeline_cache) != VK_SUCCESS) pipeline_cache = VK_NULL_HANDLE;
+    pipeline_cache_loaded = data.size();
+}
+
+void Renderer::Impl::save_pipeline_cache() {
+    if (!pipeline_cache || pipeline_cache_file.empty()) return;
+    size_t size = 0;
+    if (vkGetPipelineCacheData(d, pipeline_cache, &size, nullptr) != VK_SUCCESS || !size || size == pipeline_cache_loaded) return;
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(d, pipeline_cache, &size, data.data()) != VK_SUCCESS) return;
+    std::error_code ec;
+    std::filesystem::create_directories(pipeline_cache_file.parent_path(), ec);
+    const std::filesystem::path tmp = pipeline_cache_file.string() + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        f.write(data.data(), std::streamsize(size));
+        if (!f) return;
+    }
+    std::filesystem::rename(tmp, pipeline_cache_file, ec);
+    pipeline_cache_loaded = size;
+}
+
 bool Renderer::Impl::make_pipelines(std::string &error) {
+    open_pipeline_cache();
     if (!vert) {
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = sizeof(vert_spv);
@@ -464,7 +505,7 @@ bool Renderer::Impl::make_pipelines(std::string &error) {
             pi.pColorBlendState = &cb;
             pi.pDynamicState = &ds;
             pi.layout = pipeline_layout;
-            if (vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pi, nullptr, &pipelines[dm][b][c]) != VK_SUCCESS)
+            if (vkCreateGraphicsPipelines(d, pipeline_cache, 1, &pi, nullptr, &pipelines[dm][b][c]) != VK_SUCCESS)
                 return error = "no pipeline", false;
         }
     }
@@ -502,7 +543,7 @@ bool Renderer::Impl::make_pipelines(std::string &error) {
             pi.pColorBlendState = &cb;
             pi.pDynamicState = &ds;
             pi.layout = pipeline_layout;
-            if (vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pi, nullptr, &flat[b]) != VK_SUCCESS)
+            if (vkCreateGraphicsPipelines(d, pipeline_cache, 1, &pi, nullptr, &flat[b]) != VK_SUCCESS)
                 return error = "no pipeline", false;
         }
     }
@@ -521,6 +562,7 @@ void Renderer::Impl::close() {
     for (VkDescriptorPool p : tex_pools) vkDestroyDescriptorPool(d, p, nullptr);
     vkDestroyDescriptorPool(d, ubo_pool, nullptr);
     destroy_pipelines();
+    if (pipeline_cache) vkDestroyPipelineCache(d, pipeline_cache, nullptr), pipeline_cache = VK_NULL_HANDLE;
     vkDestroyShaderModule(d, vert, nullptr);
     vkDestroyShaderModule(d, frag, nullptr);
     vkDestroyPipelineLayout(d, pipeline_layout, nullptr);
@@ -1026,6 +1068,7 @@ Renderer::~Renderer() {
 bool Renderer::open(vk::Device &device, std::string &error) {
     device_ = &device;
     impl_ = std::make_unique<Impl>();
+    impl_->pipeline_cache_file = pipeline_cache_file_;
     return impl_->open(device, error);
 }
 
@@ -1106,6 +1149,7 @@ void Renderer::begin_frame(VkCommandBuffer cmd, uint32_t slot, uint32_t width, u
             m.samples = want;
             std::string error;
             if (!m.make_pipelines(error)) Rml::Log::Message(Rml::Log::LT_ERROR, "the launcher's pipelines: %s", error.c_str());
+            m.save_pipeline_cache();
         }
         m.width = width_ = width, m.height = height_ = height;
         m.make_stencil();

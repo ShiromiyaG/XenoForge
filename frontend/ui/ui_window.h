@@ -15,6 +15,7 @@
 
 #include <functional>
 #include <memory>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -24,7 +25,10 @@ class Window {
   public:
     ~Window();
     // the device with the window's surface, the renderer on it
-    bool open(SDL_Window *window, std::string &error);
+    bool open(SDL_Window *window, std::string &error, const std::filesystem::path &pipeline_cache = {});
+    // The swapchain at that size, made ahead of the first frame (creating it is the slowest step of the start, and
+    // can run on another thread while the interface loads; nothing else may use the window until it returns)
+    bool prepare_swapchain(uint32_t width, uint32_t height) { return swapchain_ || make_swapchain(width, height); }
     Renderer &renderer() { return renderer_; }
 
     // One frame: `draw` records the UI (the context's Render()) between the

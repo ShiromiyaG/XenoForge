@@ -2131,6 +2131,18 @@ launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <p
     [--render-size WxH] [--scale F] [--assets <dir>]
 ```
 
+### Start-up
+
+The window is created hidden and shown once its first picture has been presented, so it never opens black. What
+runs before that (`launcher --startup-times` prints each step, in milliseconds since the program began): SDL's
+video, the window, the Vulkan device (the interface's 26 pipelines compile against a pipeline cache kept in
+`ui_pipelines.bin` beside config.toml, which took the step from about 600 ms to about 190 ms), the swapchain (the
+slowest single step, about 230 ms, made on another thread while the fonts and the document load) and the first
+frame. The controllers' subsystem (a quarter of a second of drivers) starts after the first picture; the pads
+already connected arrive as events. On the development machine, a warm start reaches its first presented frame
+at about 0.58 s (it was 1.65 s). The library scan was already on its own thread, and the games' pictures are
+read by it, not by the first frame.
+
 ### The launcher's interface (`frontend/ui`, `launcher_view.*`, `settings_view.*`)
 
 The main window follows a mockup the owner gave on 2026-11-07, in the manner

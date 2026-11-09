@@ -67,6 +67,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -85,6 +86,14 @@ bool write_png(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t height
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     return stbi_write_png(utf8(path).c_str(), int(width), int(height), 4, rgba.data(), int(width) * 4) != 0;
+}
+
+// --startup-times: the time since the program began at each step of the start, to see what a black window waits for
+bool g_startup_times = false;
+const Clock::time_point g_process_start = Clock::now();
+void mark(const char *step) {
+    if (g_startup_times)
+        std::printf("startup: %7.1f ms  %s\n", std::chrono::duration<double, std::milli>(Clock::now() - g_process_start).count(), step);
 }
 
 int fail(const std::string &message) {
@@ -120,6 +129,8 @@ int main(int argc, char **argv) {
             games_arg = argv[++i], games_given = true;
         else if (a == "--list")
             list = true;
+        else if (a == "--startup-times")
+            g_startup_times = true;
         else if (a == "--controls")
             options.screen = frontend::Screen::Controls;
         else if (a == "--screen" && i + 1 < argc) {
@@ -176,6 +187,7 @@ int main(int argc, char **argv) {
         } else
             std::fprintf(stderr, "launcher: %s ignored\n", a.c_str());
     }
+    mark("arguments");
     if (config_file.empty()) config_file = frontend::default_path();
     std::filesystem::path players_dir;
     if (const char *base = SDL_GetBasePath()) players_dir = from_utf8(base);
@@ -193,6 +205,7 @@ int main(int argc, char **argv) {
     else
         core.rescan();
 
+    mark("library scan started");
     // --list: the games and their players, no window
     if (list) {
         while (core.listing().busy) SDL_Delay(10);
@@ -216,14 +229,15 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return fail(std::string("SDL: ") + SDL_GetError());
+    if (!SDL_Init(SDL_INIT_VIDEO)) return fail(std::string("SDL: ") + SDL_GetError());
     const bool offscreen = render_w && render_h;
     options.offscreen = offscreen;
 
     // the window: where it was left, else a size from the display's scale
     const frontend::Settings::Launcher placed = core.launcher();
     Uint64 window_flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    if (offscreen) window_flags |= SDL_WINDOW_HIDDEN;
+    // hidden until its first picture is ready: a window that opens black while the rest starts looks broken
+    window_flags |= SDL_WINDOW_HIDDEN;
     float display_scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (!(display_scale > 0)) display_scale = 1;
     int width = int(1240 * display_scale), height = int(760 * display_scale);
@@ -232,9 +246,11 @@ int main(int argc, char **argv) {
         const SDL_Rect r{placed.x, placed.y, placed.width, placed.height};
         if (SDL_GetDisplayForRect(&r)) width = placed.width, height = placed.height, restore = true;
     }
+    mark("SDL initialised");
     SDL_Window *window = SDL_CreateWindow("XenoForge", width, height, window_flags);
     if (!window) return fail(std::string("SDL: ") + SDL_GetError());
     frontend::set_window_icon(window, frontend::xenoforge_icon_png());
+    mark("window created");
     SDL_SetWindowMinimumSize(window, int(720 * display_scale), int(420 * display_scale));
     if (restore) {
         SDL_SetWindowPosition(window, placed.x, placed.y);
@@ -243,8 +259,20 @@ int main(int argc, char **argv) {
 
     // the window on Vulkan, and RmlUi on it
     std::string error;
+    const std::filesystem::path core_dir = config_file.parent_path();
     auto surface = std::make_unique<ui::Window>();
-    if (!surface->open(window, error)) return fail("Vulkan: " + error);
+    if (!surface->open(window, error, core_dir / "ui_pipelines.bin")) return fail("Vulkan: " + error);
+    mark("Vulkan device");
+    // the swapchain, the slowest step of the start, made while the interface loads
+    std::future<void> swapchain;
+    if (!offscreen) {
+        int w = 0, h = 0;
+        SDL_GetWindowSizeInPixels(window, &w, &h);
+        swapchain = std::async(std::launch::async, [&surface, w, h] {
+            surface->prepare_swapchain(uint32_t(std::max(w, 1)), uint32_t(std::max(h, 1)));
+            mark("swapchain");
+        });
+    }
     std::printf("launcher: Vulkan on %s\n", surface->device_name().c_str());
     auto system = std::make_unique<ui::SystemInterface>(window);
     Rml::SetSystemInterface(system.get());
@@ -266,6 +294,7 @@ int main(int argc, char **argv) {
     if (!Rml::LoadFontFace(utf8(fonts / "Lucide.ttf"), "Lucide", Rml::Style::FontStyle::Normal, Rml::Style::FontWeight(400)))
         std::fprintf(stderr, "launcher: no font %s\n", utf8(fonts / "Lucide.ttf").c_str());
 
+    mark("RmlUi and fonts");
     int pixel_w = 0, pixel_h = 0;
     SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
     const uint32_t first_w = offscreen ? render_w : uint32_t(std::max(pixel_w, 1)), first_h = offscreen ? render_h : uint32_t(std::max(pixel_h, 1));
@@ -276,6 +305,8 @@ int main(int argc, char **argv) {
     frontend::LauncherView &view = *view_owner;
     if (!view.load(context, assets, error)) return fail(error);
 
+    mark("view loaded");
+    if (swapchain.valid()) swapchain.get();
     // the pads connected
     std::vector<SDL_Gamepad *> pads;
     {
@@ -336,6 +367,7 @@ int main(int argc, char **argv) {
 
     bool quit = false;
     uint64_t frames = 0;
+    bool window_shown = false;
     while (!quit) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -358,7 +390,9 @@ int main(int argc, char **argv) {
             context->SetDimensions(Rml::Vector2i(int(w), int(h)));
             context->SetDensityIndependentPixelRatio(options.scale > 0 ? options.scale : offscreen ? 1.f : (display > 0 ? display : 1.f));
         }
+        if (frames == 0) mark("first loop: events handled");
         view.update();
+        if (frames == 0) mark("first loop: view updated");
         // the scripted pad presses, once the window has settled
         if (key_next < key_script.size() && !view.busy()) {
             const double now = std::chrono::duration<double>(Clock::now() - began).count();
@@ -369,6 +403,7 @@ int main(int argc, char **argv) {
             }
         }
         context->Update();
+        if (frames == 0) mark("first loop: layout done");
 
         // the end asked for: after the time, once what the view waits for is done
         const double seconds = std::chrono::duration<double>(Clock::now() - began).count();
@@ -377,8 +412,16 @@ int main(int argc, char **argv) {
                                      (key_script.empty() || (key_next >= key_script.size() && seconds >= key_at + 0.6)));
         const bool last = ending || quit;
         if (last && !screenshot.empty()) surface->capture_next();
-        const bool shown = surface->frame([&] { context->Render(); }, offscreen ? render_w : 0, offscreen ? render_h : 0);
+        const bool shown = surface->frame([&] { if (frames == 0) mark("first frame: recording"); context->Render(); if (frames == 0) mark("first frame: rendered"); }, offscreen ? render_w : 0, offscreen ? render_h : 0);
         frames++;
+        if (!window_shown && (shown || frames >= 60)) { // (a window that never draws still shows, to be closed)
+            window_shown = true;
+            mark("first frame presented");
+            if (!offscreen) SDL_ShowWindow(window);
+            // the controllers: their drivers take a quarter of a second to start, so after the picture; the pads
+            // already connected arrive as events
+            if (SDL_InitSubSystem(SDL_INIT_GAMEPAD)) mark("gamepads");
+        }
         if (last && !screenshot.empty()) {
             std::vector<uint8_t> rgba;
             uint32_t sw = 0, sh = 0;

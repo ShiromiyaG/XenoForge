@@ -53,7 +53,7 @@ uint32_t Window::pixel_height() const {
     return uint32_t(std::max(h, 0));
 }
 
-bool Window::open(SDL_Window *window, std::string &error) {
+bool Window::open(SDL_Window *window, std::string &error, const std::filesystem::path &pipeline_cache) {
     window_ = window;
     vk::Device::Window surface;
     Uint32 count = 0;
@@ -69,6 +69,7 @@ bool Window::open(SDL_Window *window, std::string &error) {
     device_ = vk::Device::open(error, &surface);
     if (!device_) return false;
     dev_ = device_->device();
+    renderer_.set_pipeline_cache_file(pipeline_cache);
     if (!renderer_.open(*device_, error)) return false;
 
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
