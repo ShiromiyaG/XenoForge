@@ -42,7 +42,7 @@ namespace {
 
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
-                         "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
+                         "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--pipeline-cache file] [--async-pipelines] "
                          "[--stand-in skip|placeholder|library] [--linked-pipelines] "
                          "[--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] "
                          "[--depth-float24-round] "
@@ -69,6 +69,9 @@ int main(int argc, char **argv) {
         else if (a == "--gpu-time") options.gpu_timing = true;
         else if (a == "--gpu-time-draws") options.gpu_timing = options.gpu_timing_draws = true;
         else if (a == "--repeat" && i + 1 < argc) repeat = uint32_t(std::max(1, std::atoi(argv[++i])));
+        // the driver's pipeline cache kept in a file between runs (timing runs
+        // otherwise spend most of their time making the frame's pipelines)
+        else if (a == "--pipeline-cache" && i + 1 < argc) options.pipeline_cache = argv[++i];
         // pipelines made on worker threads, their draws skipped meanwhile (as
         // the player plays; a replay otherwise waits for each)
         else if (a == "--async-pipelines") options.async_pipelines = true;
