@@ -107,6 +107,10 @@ public:
     // samplers with a border color of their own (VK_EXT_custom_border_color
     // without a format), for the textures' YCbCr border colors
     bool custom_border_color() const { return custom_border_color_; }
+    // the depth bias in exact units of 2^-24, on float depth too
+    // (VK_EXT_depth_bias_control: depthBiasExact and the forced unorm
+    // representation, through vkCmdSetDepthBias2EXT)
+    bool depth_bias_control() const { return depth_bias_control_; }
     // copies between a depth/stencil aspect and a color image of the same
     // texel size (VK_KHR_maintenance8): the stencil of an EDRAM transfer
     // copied from an R8_UINT image where the device has no stencil export
@@ -214,6 +218,7 @@ private:
     bool conditional_rendering_ = false;
     bool device_fault_ = false, device_fault_vendor_binary_ = false, memory_budget_ = false;
     bool custom_border_color_ = false, storage_image_update_after_bind_ = false;
+    bool depth_bias_control_ = false;
     float line_width_range_[2] = {1.0f, 1.0f};
     bool dynamic_blend_ = false, pipeline_library_ = false, cache_control_ = false;
     uint32_t fragment_shader_interlock_ = 0;

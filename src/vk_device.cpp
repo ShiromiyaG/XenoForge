@@ -293,6 +293,8 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     VkPhysicalDeviceFaultFeaturesEXT fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT bias_control{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
     {
         const bool has_eds3 =
             has_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && !turned_off("XF_VK_NO_EDS3");
@@ -371,6 +373,29 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
                 *tail = &custom_border, tail = &custom_border.pNext;
                 enabled.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
                 d->custom_border_color_ = true;
+            }
+        }
+        // VK_EXT_depth_bias_control with an exact bias and the unorm
+        // representation forced on float depth: the polygon offset's constant
+        // in units of 2^-24 whatever the device and the depth format (without
+        // it a device may double a fixed-point format's unit, and a float
+        // format's shrinks with the depth; Xenia's Vulkan backend takes the
+        // same three features for float depth). XF_VK_NO_DEPTH_BIAS_CONTROL=1
+        // turns it off: the device's units, counted.
+        if (has_extension(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) && !turned_off("XF_VK_NO_DEPTH_BIAS_CONTROL")) {
+            VkPhysicalDeviceDepthBiasControlFeaturesEXT has_bias{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_bias{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_bias.pNext = &has_bias;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_bias);
+            if (has_bias.depthBiasControl && has_bias.leastRepresentableValueForceUnormRepresentation &&
+                has_bias.depthBiasExact) {
+                bias_control.depthBiasControl = VK_TRUE;
+                bias_control.leastRepresentableValueForceUnormRepresentation = VK_TRUE;
+                bias_control.depthBiasExact = VK_TRUE;
+                *tail = &bias_control, tail = &bias_control.pNext;
+                enabled.push_back(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
+                d->depth_bias_control_ = true;
             }
         }
         // VK_KHR_maintenance8: depth/stencil aspects copied to and from color

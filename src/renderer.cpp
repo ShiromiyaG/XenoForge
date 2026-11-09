@@ -812,7 +812,7 @@ struct DrawState {
     VkColorBlendEquationEXT blend_equations[4];
     VkColorComponentFlags write_masks[4];
     float line_width;
-    float depth_bias[2]; // the constant factor, the slope factor
+    float depth_bias[3]; // the constant factor, the slope factor, the representation (VK_EXT_depth_bias_control)
 };
 
 struct Pass {
@@ -2419,6 +2419,9 @@ private:
     VkFormat d24s8_ = VK_FORMAT_D24_UNORM_S8_UINT;
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm (RenderTarget::gamma_linear)
     bool gamma_unorm16_ = false;
+    // polygon offsets on float depth in the format's own units even with
+    // VK_EXT_depth_bias_control (XF_DEPTH_BIAS_FLOAT_UNITS=1)
+    bool depth_bias_float_units_ = false;
 
     // ---- the interlock path (Options::render_target_path fsi) ----
     // 0: host render targets; 1 under pixel interlock, 2 under sample
@@ -2706,6 +2709,7 @@ bool Impl::init(std::string &error) {
     if (!d_.format_supported(d24s8_, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
         (depth_fallback && depth_fallback[0] == '1'))
         d24s8_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    if (const char *e = std::getenv("XF_DEPTH_BIAS_FLOAT_UNITS")) depth_bias_float_units_ = e[0] && e[0] != '0';
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm, blended in linear
     // (Xenia's gamma_render_target_as_unorm16, on by default), where the
     // device samples, renders to and blends that format; without it, or with
@@ -8406,9 +8410,55 @@ void Impl::draw(const gpu::Draw &d) {
         } else if ((sc_mode >> 13) & 1) {
             scale = offsets[0], offset = offsets[1];
         }
-        float constant = offset * (depth && depth->format == 1 ? float(1u << 24) : float((1u << 24) - 1));
+        // The constant, in the host's units (Xenia's draw_util.h). Direct3D's
+        // bias is a whole number of units, rounded up (GetD3D10IntegerPolygonOffset:
+        // more offset is better than none), of 2^-24 on 24-bit unorm depth and of
+        // the primitive's own float unit on float depth, where a D24FS8 unit
+        // is 8 of the host's (and the target's halved range halves the unit
+        // by itself).
+        // With VK_EXT_depth_bias_control the unit is exactly 2^-24 on both:
+        // without it a device may take up to twice that on unorm depth (the
+        // specification's minimum resolvable difference; NVIDIA does, which
+        // doubled every constant offset there), and a float format's unit
+        // shrinks with the depth, losing small offsets far from 1 (decals
+        // with reversed depth). Float depth then takes the guest's offset as
+        // it is, as the console and the exact path do and as Xenia's Vulkan
+        // backend (vulkan_depth_bias_force_unorm), halved with D24FS8's range.
+        // XF_DEPTH_BIAS_FLOAT_UNITS=1 keeps a float format's own units, as
+        // Xenia's Direct3D 12 backend draws.
+        const bool float24 = depth && depth->format == 1;
+        const bool host_float = depth && depth->image.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        const bool exact_units = d_.depth_bias_control() && !(host_float && depth_bias_float_units_);
+        float constant = 0.0f;
+        if (offset != 0.0f) {
+            if (host_float && exact_units)
+                constant = offset * (float24 ? float(1u << 24) * 0.5f : float((1u << 24) - 1));
+            else if (float24)
+                constant = std::copysign(std::ceil(std::fabs(offset) * float(1u << 21)) * 8.0f, offset);
+            else
+                constant = std::copysign(std::ceil(std::fabs(offset) * float((1u << 24) - 1)), offset);
+            if (!exact_units)
+                approximate(host_float ? "polygon offsets in a float depth format's units (no VK_EXT_depth_bias_control)"
+                                       : "polygon offsets in the device's depth units (no VK_EXT_depth_bias_control)");
+        }
+        // (the representation is part of the state: 1 the format's, 2 unorm forced)
         n.depth_bias[0] = constant, n.depth_bias[1] = scale * (scale_.factor() / 16.0f);
-        if (differs(n.depth_bias, o.depth_bias)) vkCmdSetDepthBias(c, n.depth_bias[0], 0.0f, n.depth_bias[1]);
+        n.depth_bias[2] = !exact_units ? 0.0f : host_float ? 2.0f : 1.0f;
+        if (differs(n.depth_bias, o.depth_bias)) {
+            if (exact_units) {
+                VkDepthBiasRepresentationInfoEXT representation{VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT};
+                representation.depthBiasRepresentation =
+                    host_float ? VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT
+                               : VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
+                representation.depthBiasExact = VK_TRUE;
+                VkDepthBiasInfoEXT bias{VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, &representation};
+                bias.depthBiasConstantFactor = n.depth_bias[0];
+                bias.depthBiasSlopeFactor = n.depth_bias[1];
+                vkCmdSetDepthBias2EXT(c, &bias);
+            } else {
+                vkCmdSetDepthBias(c, n.depth_bias[0], 0.0f, n.depth_bias[1]);
+            }
+        }
     }
     draw_state_ = n;
     draw_state_valid_ = true;
