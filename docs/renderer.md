@@ -936,7 +936,10 @@ playing it in Xenia.
   `--trace_gpu_frames`: frame N is what the swap after the first N shows,
   `<title id>_<N>.xtr`. `boot --trace-frames 4500,4800 --trace-dir <dir>`
   (it renders), or `XF_TRACE_FRAMES` and `XF_TRACE_DIR` for anything that
-  starts the renderer through `game::start_renderer` (the player).
+  starts the renderer through `game::start_renderer` (the player). With
+  `XF_TRACE_DIR` set, the player's F4 traces the next frame and takes a
+  screenshot of the one on screen, as Xenia's F4 (`TraceWriter::trace_next`):
+  a scene reached by playing, traced where it is seen.
 - **Checked**: `gpu_trace_writer_test` (a processor's packets written and
   read back: the commands in order, the indirect buffer's packet giving way,
   memory recorded once and again where it changed, not where the GPU wrote,

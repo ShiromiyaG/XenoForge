@@ -649,6 +649,17 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                     changed = true;
                 }
                 if (e.key.scancode == SDL_SCANCODE_F12) key_screenshot();
+                // F4: the next frame traced (with XF_TRACE_DIR set), and a
+                // screenshot of this one beside it, as Xenia's F4
+                if (e.key.scancode == SDL_SCANCODE_F4) {
+                    if (g.trace) {
+                        g.trace->trace_next();
+                        key_screenshot();
+                        std::printf("tracing the next frame (F4)\n");
+                    } else {
+                        std::printf("F4: no trace writer; set XF_TRACE_DIR to a folder to trace frames\n");
+                    }
+                }
                 if (e.key.scancode == SDL_SCANCODE_F2 && !sysui.active()) {
                     if (guide_open) close_guide();
                     else guide_open = true;

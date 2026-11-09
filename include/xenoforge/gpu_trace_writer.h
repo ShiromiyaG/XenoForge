@@ -83,6 +83,9 @@ public:
     TraceWriter(CommandProcessor &processor, Sink *next, TraceSource *source, TraceOptions options);
     ~TraceWriter() override; // a trace still open is closed as it stands
 
+    // the frame after the one under way recorded too (the player's F4, as
+    // Xenia's); from any thread
+    void trace_next();
     // the traces finished so far, and the errors met (a file not opened)
     std::vector<std::filesystem::path> finished() const;
     std::vector<std::string> errors() const;

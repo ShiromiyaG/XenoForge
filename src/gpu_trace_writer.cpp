@@ -386,6 +386,11 @@ void TraceWriter::resolve(const RegisterFile &registers, const Draw &d) {
     if (next_) next_->resolve(registers, d);
 }
 
+void TraceWriter::trace_next() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    options_.frames.insert(swaps_ + 1);
+}
+
 void TraceWriter::swap(const RegisterFile &registers, const Swap &s) {
     {
         std::lock_guard<std::mutex> lock(mutex_);

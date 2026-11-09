@@ -365,11 +365,12 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     if (!g.renderer) return error = "renderer: " + error, false;
     processor.set_sink(g.renderer.get());
     // frames traced as XF_TRACE_FRAMES and XF_TRACE_DIR say (the player's
-    // way to them; boot has --trace-frames)
-    if (const char *frames = std::getenv("XF_TRACE_FRAMES")) {
+    // way to them; boot has --trace-frames); XF_TRACE_DIR alone, none until
+    // the player's F4 asks for the next
+    const char *frames = std::getenv("XF_TRACE_FRAMES"), *dir = std::getenv("XF_TRACE_DIR");
+    if (frames || dir) {
         std::set<uint64_t> numbers;
-        if (!parse_numbers(frames, numbers)) return error = "XF_TRACE_FRAMES: not a list of frames", false;
-        const char *dir = std::getenv("XF_TRACE_DIR");
+        if (frames && !parse_numbers(frames, numbers)) return error = "XF_TRACE_FRAMES: not a list of frames", false;
         if (!start_trace(g, numbers, dir ? dir : "traces", error)) return false;
     }
     return true;
