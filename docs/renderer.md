@@ -2025,6 +2025,41 @@ clean. Xenia's "base and mips loaded apart" was measured first: every
 texture the race loads after a resolve is one level, so it would gain
 nothing there and is left.
 
+**Resolve targets beyond the table, and depth (2026-11-09).** In game D's
+played drive the texture loads on the GPU were 14.5% of its time
+(`XF_GPU_TIME=1`, 200 s): 128,000 loads after resolves against 1,400 new
+ones. Counted by reason (`texture loads after a resolve: ...` in the
+report's "uses"; `XF_RESOLVE_TARGET_DETAIL=1` adds each reloaded target's
+base and pitch and the resolve that made it stale, and each refused
+target's format, size and pitch beside the resolve's):
+- *The table was full.* The game keeps dozens of render-to-texture
+  surfaces, many over the same memory (a downsampling chain from 320x192
+  to 2x2, 64x64 probes, 32x32 and 1280x720 surfaces), and the 64 places a
+  texel size were all taken: the surfaces made last were never targets,
+  loaded again after every resolve. The table now holds 127 (all that a
+  place's 7 bits in the push constants name), and a full one gives the
+  place of the least recently used target no recorded or pending work
+  uses (`take_target`; that texture is a plain one from then on). The run
+  needed none taken back.
+- *Made before a resolve wrote there.* A texture first loaded from the
+  CPU's memory is no target (its image has no storage view) and its later
+  loads kept that image; one now over what a resolve wrote is made again
+  as a target while the table has a place.
+- *Depth.* Resolves of depth fed nothing, and depth textures (24_8,
+  24_8_FLOAT) are converted as they load. Depth resolves copy the guest's
+  depth words as they are, so they now feed targets as color ones do: a
+  texture reading the bits takes them, and a depth texture is a target too,
+  taking the float its load makes from them (XeUNorm24To32 or
+  XeFloat20e4To32 of the high 24 bits, `resolve.comp`'s write_targets, the
+  kind in `flags` bits 24-27; never at the resolution scale, whose images
+  hold guest bits).
+Game D's drive after the three: 13,800 loads after resolves (324,000
+resolves wrote the texture they feed), the loads 5.6 -> 1.5 s of the run's
+GPU time (14.5% -> 4.6%). Its two recorded frames replay identically with
+resolve targets on and off (0.000 of 255); replay_test 29/29 on both paths
+and at 200%. Left: mipmapped and stacked textures, aliases over memory
+another surface wrote since (needed), 24_8 1024x1024 half fed.
+
 **Vertex data and the CPU's decodes.** Two costs of the renderer's thread:
 - *Every texture loaded on the GPU* (`XF_TEXTURE_LOADS=cpu` for the CPU's
   decode of memory the GPU did not write, as before): guest memory's pages

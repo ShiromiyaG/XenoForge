@@ -241,7 +241,9 @@ constexpr uint32_t IMAGES[3] = {16384, 4096, 4096};
 constexpr uint32_t SAMPLERS = 1024;
 // the textures resolves write as well, of 32- and of 64-bit texels each
 // (Impl::resolve_target)
-constexpr uint32_t RESOLVE_TARGETS = 64;
+// a texel size's places in the resolves' table (resolve.comp's targets32 and
+// targets64): 127, all that a place's 7 bits in ResolveConstants::target name
+constexpr uint32_t RESOLVE_TARGETS = 127;
 
 float as_float(uint32_t bits) {
     float f;
@@ -651,10 +653,19 @@ struct Texture {
     uint32_t target = 0;
     VkImageView target_view = VK_NULL_HANDLE;
     uint32_t target_base = 0, target_pitch = 0, target_endian = 0;
+    // what the resolves feeding it write: 0 the guest's bits, 1 and 2 a
+    // depth texture's float from them (its load's DepthUnormToFloat and
+    // DepthFloatToFloat; resolve.comp's write_targets)
+    uint32_t target_convert = 0;
     // its image at the resolution scale (Impl::scale_texture), the resolves
     // feeding it writing its scaled texels; a load makes it the console's
     // size again
     bool scaled = false;
+    // XF_RESOLVE_TARGET_DETAIL: the resolve that last made it stale (its
+    // destination's format, size, pitch, base and corner), for the reload's count
+    struct StaleBy {
+        uint32_t format = 0, width = 0, height = 0, pitch = 0, base = 0, x = 0, y = 0;
+    } stale_by;
 };
 
 // the translated shaders' and the geometry shaders' system constants
@@ -1348,6 +1359,13 @@ private:
     // allocations with it in a heavy scene), folded into the report's maps
     // as it is taken (with_processor_counts).
     std::unordered_map<const char *, uint64_t> used_by_literal_, approximate_by_literal_;
+    // XF_RESOLVE_TARGET_DETAIL=1: each refused resolve target counted with
+    // its format, size and pitch beside the resolve's (resolve_targets)
+    bool refusal_detail_ = [] {
+        const char *v = std::getenv("XF_RESOLVE_TARGET_DETAIL");
+        return v && v[0] == '1';
+    }();
+    Texture::StaleBy stale_by_; // the resolve under way, for textures_written_by_gpu
     void approximate(const char *what) { approximate_by_literal_[what]++; }
     void use(const char *what) { used_by_literal_[what]++; }
     // the report with what the processor counted of the packets the renderer
@@ -1420,6 +1438,29 @@ private:
     bool make_room(uint32_t kind, uint32_t needed);
     void destroy_texture(Texture *t);
     void release_index(uint32_t kind, uint32_t index);
+    // A new place in the resolves' table for a texel size (none given back
+    // to take): a place never taken, else the place of the least recently
+    // used texture holding one that nothing recorded or in flight uses (it
+    // is then no resolve target: a resolve over it makes it stale, and its
+    // next use loads it as any texture), else none (UINT32_MAX). A game
+    // with many render-to-texture surfaces had more than the table holds,
+    // and the ones made last were never fed, loaded again after each
+    // resolve instead (renderer.md, "Resolve targets beyond the table").
+    uint32_t take_target(uint32_t wide) {
+        if (next_target_[wide] < RESOLVE_TARGETS) return next_target_[wide]++;
+        for (Texture *t = lru_oldest_; t; t = t->newer) {
+            // (the list runs oldest use first: past one in use, all are)
+            if (t->used_serial > done_serial_) break;
+            if (!(t->target & 0x7F) || ((t->target >> 7) & 1) != wide) continue;
+            const uint32_t slot = (t->target & 0x7F) - 1;
+            if (t->target_view) vkDestroyImageView(dev_, t->target_view, nullptr);
+            t->target = 0, t->target_view = VK_NULL_HANDLE;
+            report_.resolve_targets_reclaimed++;
+            return slot;
+        }
+        use("resolve targets without a place in the resolves' table (all in use)");
+        return UINT32_MAX;
+    }
     // a resolve target's slot given back and its view destroyed (the GPU done with them)
     void release_target(uint32_t target, VkImageView view) {
         if (view) vkDestroyImageView(dev_, view, nullptr);
@@ -3735,7 +3776,10 @@ void Impl::textures_written_by_gpu(const std::vector<Range> &written, Texture *c
                     }
                 if (hit) break;
             }
-            if (hit) t->stale = true, t->load_why = LoadWhy::GpuWritten;
+            if (hit) {
+                t->stale = true, t->load_why = LoadWhy::GpuWritten;
+                if (refusal_detail_) t->stale_by = stale_by_;
+            }
         }
 }
 
@@ -5010,13 +5054,51 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     // scaled resolve kept the scaled texels of: made at the resolution scale,
     // those copied in rather than loaded (docs/renderer.md, "Resolution scale")
     const uint32_t texel_bytes = texture::format_block(info.format).bytes;
+    // (a depth texture's float made from the depth bits by the resolve as its
+    // load makes it: beyond the copies, 32-bit texels)
+    const uint32_t convert = plan.load == texture::Load::DepthUnormToFloat   ? 1u
+                             : plan.load == texture::Load::DepthFloatToFloat ? 2u
+                                                                             : 0u;
     const bool target = resolve_targets_ && mirror && !separate && !three && !cube && layers == 1 &&
                         level_count == 1 && plan.slices.size() == 1 && plan.slices[0].level == 0 &&
-                        plan.slices[0].tiled && plan.load == texture::Load::Copy &&
+                        plan.slices[0].tiled && (plan.load == texture::Load::Copy || (convert && texel_bytes == 4)) &&
                         plan.half == texture::Half::None && plan.block_width == 1 && plan.block_height == 1 &&
                         (texel_bytes == 4 || texel_bytes == 8) && plan.bytes_per_block == texel_bytes;
+    // A load over what a resolve wrote, counted by format and size with the
+    // first reason it is no resolve target (the loads a resolve's own write
+    // into the texture could spare; "uses" in the report)
+    if (t && t->load_why == LoadWhy::GpuWritten) {
+        const char *reason = !resolve_targets_                                        ? "resolve targets off"
+                             : !mirror                                                ? "not over the GPU's pages"
+                             : separate                                               ? "a separate signed image"
+                             : three || cube || layers != 1                           ? "not one 2D layer"
+                             : level_count != 1                                       ? "mipmapped"
+                             : plan.slices.size() != 1 || plan.slices[0].level != 0   ? "more than one slice"
+                             : !plan.slices[0].tiled                                  ? "linear"
+                             : plan.load != texture::Load::Copy && !convert           ? "converted as it loads"
+                             : plan.half != texture::Half::None                       ? "half-size texels"
+                             : plan.block_width != 1 || plan.block_height != 1        ? "block-compressed"
+                             : texel_bytes != 4 && texel_bytes != 8                   ? "texels neither 32 nor 64 bits"
+                             : plan.bytes_per_block != texel_bytes                    ? "host texels of another size"
+                             : !t->target ? "a target with no place in the resolves' table"
+                                          : "a target the resolve did not feed";
+        char line[320];
+        std::snprintf(line, sizeof(line), "texture loads after a resolve: %s %ux%u%s, %s", format_name(info.format),
+                      plan.width, plan.height, level_count > 1 ? " mipmapped" : "", reason);
+        if (refusal_detail_ && target) {
+            // its own base and pitch, and the resolve that made it stale
+            const Texture::StaleBy &s = t->stale_by;
+            char more[160];
+            std::snprintf(more, sizeof(more), " (texture at %08X pitch %u; stale by %s %ux%u pitch %u at %08X +%u,%u)",
+                          plan.slices[0].base & 0x1FFFFFFF, plan.slices[0].pitch_blocks,
+                          s.width ? format_name(s.format) : "a memory export", s.width, s.height, s.pitch, s.base, s.x,
+                          s.y);
+            std::strncat(line, more, sizeof(line) - std::strlen(line) - 1);
+        }
+        use(std::string(line));
+    }
     ScaledResolve *kept = nullptr;
-    if (target && !scale_.one() && scalable(plan.width, plan.height, min_scalable_) && texel_bytes == 4) {
+    if (target && !convert && !scale_.one() && scalable(plan.width, plan.height, min_scalable_) && texel_bytes == 4) {
         auto found = scaled_resolves_.find(plan.slices[0].base & 0x1FFFFFFF);
         if (found != scaled_resolves_.end() && found->second.pitch == plan.slices[0].pitch_blocks &&
             found->second.endian == info.endian && ((found->second.target >> 7) & 1) == (texel_bytes == 8 ? 1u : 0u) &&
@@ -5029,6 +5111,14 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
                  t->image.extent.height != extent.height || t->image.extent.depth != extent.depth ||
                  t->image.levels != level_count || t->image.layers != layers ||
                  separate != (t->signed_image.image != VK_NULL_HANDLE) || signed_format != t->signed_format;
+    // One made before a resolve wrote its memory (no resolve target then:
+    // its image has no storage view) and now over what one wrote, made again
+    // as one while the table has a place for it: else the loads after every
+    // resolve go on (game D's 320x192 and 32x32 surfaces, 16,000 loads a run)
+    if (!fresh && target && !t->target) {
+        const uint32_t wide = texel_bytes == 8 ? 1 : 0;
+        fresh = next_target_[wide] < RESOLVE_TARGETS || !free_targets_[wide].empty();
+    }
     if (fresh) {
         uint32_t kind = three ? 1 : cube ? 2 : 0;
         if (t) {
@@ -5089,8 +5179,8 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             if (!free_targets_[wide].empty()) {
                 slot = free_targets_[wide].back();
                 free_targets_[wide].pop_back();
-            } else if (next_target_[wide] < RESOLVE_TARGETS) {
-                slot = next_target_[wide]++;
+            } else {
+                slot = take_target(wide);
             }
             VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             view.image = t->image.image;
@@ -5113,6 +5203,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
                 t->target = (slot + 1) | wide << 7;
                 t->target_base = plan.slices[0].base & 0x1FFFFFFF, t->target_pitch = plan.slices[0].pitch_blocks;
                 t->target_endian = info.endian;
+                t->target_convert = convert;
             } else if (slot != UINT32_MAX) {
                 free_targets_[wide].push_back(slot);
             }
@@ -8206,7 +8297,10 @@ void Impl::resolve() {
 uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2], uint32_t &extra_rows) {
     targets[0] = targets[1] = nullptr;
     extra_rows = 0;
-    if (!resolve_targets_ || info.depth || info.dest_array || !info.texture_base) return 0;
+    // (depth resolves too: they copy the guest's depth words as they are,
+    // which a texture reading the bits takes, and a depth texture takes as
+    // the float its load would make; Texture::target_convert)
+    if (!resolve_targets_ || info.dest_array || !info.texture_base) return 0;
     const uint32_t bytes = texture::format_block(info.dest_format).bytes;
     if (bytes != 4 && bytes != 8) return 0;
     if ((info.texel_x0 >> 5) > 0xFF || (info.texel_y0 >> 5) > 0xFF) return 0;
@@ -8228,17 +8322,48 @@ uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2], u
     // (x, y + rows).
     uint32_t count = 0;
     for (Texture *t : texture_buckets_[bucket]) {
-        if (!t->target || ((t->target >> 7) & 1) != wide || t->target_pitch != info.dest_pitch ||
-            t->target_endian != info.dest_endian || base < t->target_base)
+        // (each target over the destination's base refused, counted by why:
+        // "uses" in the report)
+        if (!t->target) continue;
+        if (base < t->target_base || base >= t->high) continue;
+        if (((t->target >> 7) & 1) != wide || t->target_pitch != info.dest_pitch) {
+            if (refusal_detail_) {
+                char line[200];
+                std::snprintf(line, sizeof(line),
+                              "a resolve target refused: texture %s %ux%u pitch %u, resolve %s %ux%u pitch %u",
+                              format_name(t->key[1] & 0x3F), (t->key[2] & 0x1FFF) + 1, ((t->key[2] >> 13) & 0x1FFF) + 1,
+                              t->target_pitch, format_name(info.dest_format), info.width, info.height, info.dest_pitch);
+                use(std::string(line));
+            } else {
+                use(((t->target >> 7) & 1) != wide ? "a resolve target refused: another texel size"
+                                                     : "a resolve target refused: another pitch");
+            }
             continue;
+        }
+        if (t->target_endian != info.dest_endian) {
+            use("a resolve target refused: another endianness");
+            continue;
+        }
         const uint32_t offset = base - t->target_base, macro_row = t->target_pitch * bytes * 32;
-        if (!macro_row || offset % macro_row) continue;
+        if (!macro_row || offset % macro_row) {
+            use("a resolve target refused: not a whole number of macro tile rows in");
+            continue;
+        }
         const uint32_t rows = offset / macro_row * 32;
-        if ((info.texel_y0 + rows) >> 5 > 0xFF || (count && rows != extra_rows)) continue;
-        if (t->stale && (rows || !covers(*t))) continue;
+        if ((info.texel_y0 + rows) >> 5 > 0xFF || (count && rows != extra_rows)) {
+            use("a resolve target refused: rows the push constants cannot hold");
+            continue;
+        }
+        if (t->stale && (rows || !covers(*t))) {
+            use("a resolve target refused: stale, and the resolve does not write all of it");
+            continue;
+        }
+        if (count == 2) {
+            use("a resolve target refused: a third over the destination");
+            continue;
+        }
         extra_rows = rows;
         targets[count++] = t;
-        if (count == 2) break;
     }
     return count;
 }
@@ -8264,8 +8389,8 @@ Impl::ScaledResolve *Impl::scaled_resolve(const resolve::Info &info, const std::
     if (!free_targets_[wide].empty()) {
         slot = free_targets_[wide].back();
         free_targets_[wide].pop_back();
-    } else if (next_target_[wide] < RESOLVE_TARGETS) {
-        slot = next_target_[wide]++;
+    } else {
+        slot = take_target(wide);
     }
     kept.view = slot == UINT32_MAX ? VK_NULL_HANDLE
                                    : make_view(kept.image.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, {}, 1, 1, false);
@@ -8332,8 +8457,8 @@ void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
     if (!free_targets_[wide].empty()) {
         slot = free_targets_[wide].back();
         free_targets_[wide].pop_back();
-    } else if (next_target_[wide] < RESOLVE_TARGETS) {
-        slot = next_target_[wide]++;
+    } else {
+        slot = take_target(wide);
     }
     VkImageView target_view = VK_NULL_HANDLE;
     if (slot != UINT32_MAX) {
@@ -8507,13 +8632,15 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     uint32_t extra_rows = 0;
     // the textures fed at the console's size (written by the pass over its
     // pixels) and at the resolution scale (by a pass of their own after it)
-    uint32_t target_1x = 0, target_scaled = 0;
+    uint32_t target_1x = 0, target_scaled = 0, convert_1x = 0;
     if (uint32_t count = resolve_targets(info, targets, extra_rows)) {
         const uint32_t corner = (info.texel_x0 >> 5) << 16 | ((info.texel_y0 + extra_rows) >> 5) << 24;
         uint32_t places[2] = {0, 0};
+        // both in use before either is made the resolution scale's (whose new
+        // place in the table could otherwise be the other one's: take_target)
+        for (uint32_t k = 0; k < count; k++) use(*targets[k], submission_serial() + 1);
         for (uint32_t k = 0; k < count; k++) {
             Texture &t = *targets[k];
-            use(t, submission_serial() + 1);
             // Made the resolution scale's when this resolve writes all of it
             // and both are no smaller than the minimum scalable dimension
             // (RPCS3's rule): the resolve then writes every scaled texel. Only
@@ -8521,13 +8648,17 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
             // game F's bloom against Xenia's scaled picture (open; renderer.md,
             // "Resolution scale"), so those stay the console's size.
             const uint32_t tw = (t.key[2] & 0x1FFF) + 1, th = ((t.key[2] >> 13) & 0x1FFF) + 1;
-            if (!scale_.one() && !t.scaled && !extra_rows && info.texel_x0 + info.dest_x == 0 &&
+            // (a depth texture's floats are no guest bits a scaled image could hold)
+            if (!scale_.one() && !t.scaled && !t.target_convert && !extra_rows && info.texel_x0 + info.dest_x == 0 &&
                 info.texel_y0 + info.dest_y == 0 && info.width >= tw && info.height >= th &&
                 scalable(tw, th, min_scalable_) && scalable(info.width, info.height, min_scalable_) && !(t.target & 0x80))
                 scale_texture(t, tw, th);
             // current again if it was stale: the resolve wrote all of it
             if (t.stale) t.stale = false, t.load_why = LoadWhy::CpuWritten;
             uint32_t &into = t.scaled ? target_scaled : target_1x;
+            // what each place at the console's size takes (flags bits 24-25
+            // and 26-27: resolve.comp's write_targets)
+            if (!t.scaled) convert_1x |= t.target_convert << (24 + 2 * places[0]);
             into |= (t.target & (places[t.scaled] ? 0x7Fu : 0xFFu)) << (8 * places[t.scaled]++);
         }
         if (target_1x) target_1x |= corner;
@@ -8541,6 +8672,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         if (ScaledResolve *kept = scaled_resolve(info, written))
             target_scaled = (kept->target & 0xFFu) | (info.texel_x0 >> 5) << 16 | (info.texel_y0 >> 5) << 24;
     p.target = target_1x;
+    p.flags |= convert_1x;
     if (from_edram) {
         p.edram = 1;
         p.edram_base = source.base, p.edram_pitch = source.pitch_tiles, p.msaa = source.msaa;
@@ -8566,7 +8698,11 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     full_barrier(c);
 
     gpu_written(written);
+    if (refusal_detail_)
+        stale_by_ = {info.dest_format, info.width,           info.height, info.dest_pitch, info.texture_base & 0x1FFFFFFF,
+                     info.texel_x0 + info.dest_x, info.texel_y0 + info.dest_y};
     textures_written_by_gpu(written, targets);
+    if (refusal_detail_) stale_by_ = {};
     if (options_.readback_resolve != ReadbackResolve::none) read_back_resolve(written);
 }
 
