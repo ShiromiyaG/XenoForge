@@ -92,6 +92,12 @@ int main() {
         std::printf("XF_TRACES and XF_DUMPS not set: nothing to draw\n");
         return 0;
     }
+    // (a relative path is the working directory's: ctest runs in the build directory)
+    if (!std::filesystem::is_directory(traces)) {
+        std::printf("XF_TRACES (%s) is not a directory from %s\n", traces,
+                    std::filesystem::current_path().string().c_str());
+        return 1;
+    }
     const char *filter = std::getenv("XF_REFERENCE_FILTER"), *out = std::getenv("XF_REFERENCE_OUT");
     std::string error;
     std::unique_ptr<xf::vk::Device> device = xf::vk::Device::open(error);
