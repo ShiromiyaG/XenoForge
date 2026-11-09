@@ -8,7 +8,11 @@
 #   tools/bench/bench_vs_xenia.ps1 -Disc <iso> -Ours <exe> [-OursArgs ...]
 #       [-Xenia <xenia_canary.exe>] [-Seconds 150] [-Warmup 90] [-Runs 3]
 #       [-Configs ours,ours-host,ours-base,ours-host-base,xenia-d3d12,xenia-d3d12-rov] [-Out <file>]
-#       [-Timeline] [-Scale <percent>] [-BaseEnv <variables>]
+#       [-Timeline] [-Scale <percent>] [-BaseEnv <variables>] [-Press <buttons@seconds[:hold]>,...]
+#
+# -Press plays the same pad script in both (ours: --press; Xenia: keys posted
+# to its window), so the window can be a played scene: say, A every 4 s
+# through the menus, then rt held, measured over the drive that follows.
 #
 # -Scale draws both at a resolution scale: ours through XF_RESOLUTION_SCALE
 # (any 25% step), Xenia through draw_resolution_scale_x/y (whole multiples:
@@ -32,25 +36,81 @@ param(
     [switch]$Timeline,
     [int]$Scale = 100,
     # what the -base configurations turn off (each set to 1)
-    [string[]]$BaseEnv = @('XF_VK_NO_DEVICE_LOCAL_DRAW_DATA', 'XF_VK_DRAW_STATE_ALWAYS')
+    [string[]]$BaseEnv = @('XF_VK_NO_DEVICE_LOCAL_DRAW_DATA', 'XF_VK_DRAW_STATE_ALWAYS'),
+    # pad presses from the program's start, the player's --press syntax
+    # (buttons joined by +, @seconds, :hold seconds): a, b, x, y, start, back,
+    # lb, rb, lt, rt. Ours gets them as --press; Xenia as keys posted to its
+    # window (--hid=keyboard --keyboard_mode=1, its default bindings), which
+    # need no focus, so nothing else on the desktop gets them. The scene a
+    # benchmark measures can then be one that is played, not a title screen.
+    [string[]]$Press = @()
 )
 
 $extra = @()
 if ($Timeline) { $extra += '--timeline' }
+# (whole paths: xfbench starts the program from the process's directory,
+# which is not PowerShell's location)
+$Ours = (Resolve-Path $Ours).Path
+$Bench = (Resolve-Path $Bench).Path
+if (Test-Path $Xenia) { $Xenia = (Resolve-Path $Xenia).Path }
+if (-not [System.IO.Path]::IsPathRooted($Out)) { $Out = Join-Path (Get-Location).Path $Out }
+
+# The presses as key events for Xenia's keyboard driver: (seconds, key, down)
+$xeniaKeys = @{ a = 0xBA; b = 0xDE; x = 0x4C; y = 0x50; start = 0x58; back = 0x5A; lb = 0x31; rb = 0x33; lt = 0x51; rt = 0x45 }
+$keyEvents = @()
+$pressArgs = @()
+foreach ($p in $Press) {
+    if ($p -notmatch '^([a-z+]+)@([0-9.]+)s?(?::([0-9.]+)s?)?$') { throw "-Press ${p}: not buttons@seconds[:hold]" }
+    $at = [double]$Matches[2]; $hold = if ($Matches[3]) { [double]$Matches[3] } else { 0.3 }
+    foreach ($name in $Matches[1] -split '\+') {
+        if (-not $xeniaKeys.ContainsKey($name)) { throw "-Press ${p}: no key for $name in Xenia's keyboard bindings" }
+        $keyEvents += [pscustomobject]@{ t = $at; vk = $xeniaKeys[$name]; down = $true }
+        $keyEvents += [pscustomobject]@{ t = $at + $hold; vk = $xeniaKeys[$name]; down = $false }
+    }
+    $pressArgs += @('--press', $p)
+}
+$keyEvents = @($keyEvents | Sort-Object t)
+if ($keyEvents.Count) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class XfBenchKeys {
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+    public static void Post(IntPtr h, int vk, bool down) {
+        if (down) PostMessage(h, 0x0100, (IntPtr)vk, (IntPtr)1);
+        else PostMessage(h, 0x0101, (IntPtr)vk, unchecked((IntPtr)(int)0xC0000001));
+    }
+}
+"@
+}
+
+# Xenia under xfbench with the presses sent at their times; xfbench's lines
+function Invoke-XeniaPressed([string[]]$benchArgs) {
+    $tmp = [System.IO.Path]::GetTempFileName()
+    $quoted = $benchArgs | ForEach-Object { '"' + $_ + '"' }
+    $proc = Start-Process -FilePath $Bench -ArgumentList $quoted -RedirectStandardOutput $tmp -PassThru -NoNewWindow
+    $start = Get-Date
+    foreach ($e in $keyEvents) {
+        while (((Get-Date) - $start).TotalSeconds -lt $e.t -and -not $proc.HasExited) { Start-Sleep -Milliseconds 20 }
+        $x = Get-Process xenia_canary -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($x -and $x.MainWindowHandle -ne [IntPtr]::Zero) { [XfBenchKeys]::Post($x.MainWindowHandle, $e.vk, $e.down) }
+    }
+    $proc.WaitForExit()
+    $lines = Get-Content $tmp
+    Remove-Item $tmp -ErrorAction SilentlyContinue
+    return $lines
+}
 
 # Ours runs with a config of its own unless -OursArgs names one: the user's
 # config.toml may ask for a resolution scale or picture effects (a 200% scale
 # with FXAA quadrupled the GPU time a frame), and the bar is Xenia at its
-# defaults. The video settings are the defaults; the saves stay where the
-# user's config keeps them (the shared storage beside it), so the game sees
-# the same profile and saves.
+# defaults. The video settings are the defaults, and the saves a storage of
+# the benchmark's own beside the output (never the user's: a played script
+# would write into the user's saves, and a game with the user's progress may
+# go to another scene than the script expects), made fresh for each run.
+$storage = $null
 if ($OursArgs -notcontains '--config') {
-    $userConfig = Join-Path $env:APPDATA 'xenoforge\config.toml'
-    $storage = Join-Path $env:APPDATA 'xenoforge\storage'
-    if (Test-Path $userConfig) {
-        $root = Select-String -Path $userConfig -Pattern "^\s*root\s*=\s*'(.+)'" | Select-Object -First 1
-        if ($root) { $storage = $root.Matches[0].Groups[1].Value }
-    }
+    $storage = [System.IO.Path]::GetFullPath("$Out.storage")
     $benchConfig = "$Out.config.toml"
     @(
         '# written by bench_vs_xenia.ps1: the defaults, as Xenia runs',
@@ -89,15 +149,20 @@ for ($run = 1; $run -le $Runs; $run++) {
                 Set-Item "Env:$($pair[0])" $(if ($pair.Count -eq 2) { $pair[1] } else { '1' })
             }
         }
+        if ($storage) { Remove-Item -Recurse -Force $storage -ErrorAction SilentlyContinue }
         switch ($kind) {
             { $_ -in 'ours', 'ours-host' } {
-                $line = & $Bench --seconds $Seconds --warmup $Warmup --self @extra --stdout "$Out.$config.$run.log" --label $label -- $Ours $Disc @OursArgs
+                $line = & $Bench --seconds $Seconds --warmup $Warmup --self @extra --stdout "$Out.$config.$run.log" --label $label -- $Ours $Disc @OursArgs @pressArgs
             }
-            'xenia-d3d12' {
-                $line = & $Bench --seconds $Seconds --warmup $Warmup --dxgi @extra --label $label -- $Xenia --gpu=d3d12 @xeniaScale $Disc
-            }
-            'xenia-d3d12-rov' {
-                $line = & $Bench --seconds $Seconds --warmup $Warmup --dxgi @extra --label $label -- $Xenia --gpu=d3d12 --render_target_path_d3d12=rov @xeniaScale $Disc
+            { $_ -in 'xenia-d3d12', 'xenia-d3d12-rov' } {
+                $xeniaArgs = @('--gpu=d3d12') + $xeniaScale
+                if ($kind -eq 'xenia-d3d12-rov') { $xeniaArgs += '--render_target_path_d3d12=rov' }
+                $benchArgs = @('--seconds', "$Seconds", '--warmup', "$Warmup", '--dxgi') + $extra + @('--label', $label, '--', $Xenia)
+                if ($keyEvents.Count) {
+                    $line = Invoke-XeniaPressed ($benchArgs + $xeniaArgs + @('--hid=keyboard', '--keyboard_mode=1', $Disc))
+                } else {
+                    $line = & $Bench @benchArgs @xeniaArgs $Disc
+                }
             }
         }
         Remove-Item Env:XF_RENDER_TARGET_PATH -ErrorAction SilentlyContinue
