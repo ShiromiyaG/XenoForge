@@ -2473,6 +2473,10 @@ private:
     // host render targets rasterized at the Xenos's sample positions
     // (Options::xenos_sample_positions, XF_XENOS_SAMPLE_POSITIONS)
     bool xenos_positions_ = false;
+    // (4x targets alone, msaa 2: with 2x ones at the Xenos's positions a
+    // game's frame drew stray colors over its alpha to coverage surfaces,
+    // not understood yet; docs/renderer.md, "The host path against the exact one")
+    bool xenos_at(uint32_t msaa) const { return xenos_positions_ && msaa == 2; }
     // polygon offsets on float depth in the format's own units even with
     // VK_EXT_depth_bias_control (XF_DEPTH_BIAS_FLOAT_UNITS=1)
     bool depth_bias_float_units_ = false;
@@ -2773,7 +2777,7 @@ bool Impl::init(std::string &error) {
         const VkSampleCountFlags both = VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
         xenos_positions_ = wanted && !fsi_ && (d_.sample_locations() & both) == both;
         if (wanted && !fsi_)
-            std::fprintf(stderr, "renderer: host render targets at %s sample positions\n",
+            std::fprintf(stderr, "renderer: 4x host render targets at %s sample positions\n",
                          xenos_positions_ ? "the Xenos's" : "the host's (no VK_EXT_sample_locations for 2x and 4x)");
     }
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm, blended in linear
@@ -4296,7 +4300,7 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     }
     // (a multisampled depth target drawn at sample positions of our own must say so)
     VkImageCreateFlags image_flags = raw_format != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
-    if (depth && msaa && xenos_positions_) image_flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+    if (depth && xenos_at(msaa)) image_flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
     t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->host_width, t->host_height, 1}, 1, 1, samples, usage,
                                image_flags);
     if (!t->image.image) {
@@ -4653,7 +4657,7 @@ VkPipeline Impl::edram_pipeline(const RenderTarget &t, VkShaderModule fs, VkPipe
     VkSampleLocationEXT sample_positions[4];
     VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
         VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
-    if (xenos_positions_ && t.msaa) {
+    if (xenos_at(t.msaa)) {
         xenos_sample_locations(t.msaa, t.image.samples, false, sample_positions, sample_locations);
         multisample.pNext = &sample_locations;
     }
@@ -8075,7 +8079,7 @@ void Impl::draw(const gpu::Draw &d) {
     VkSampleLocationEXT sample_positions[4];
     VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
         VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
-    if (msaa && (fsi_ ? (d_.sample_locations() & multisample.rasterizationSamples) != 0 : xenos_positions_)) {
+    if (msaa && (fsi_ ? (d_.sample_locations() & multisample.rasterizationSamples) != 0 : xenos_at(msaa))) {
         xenos_sample_locations(msaa, multisample.rasterizationSamples, fsi_, sample_positions, sample_locations);
         multisample.pNext = &sample_locations;
     }
