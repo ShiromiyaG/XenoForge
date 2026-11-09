@@ -645,6 +645,10 @@ struct RenderTarget {
     // drawn_epoch.
     uint64_t owned_epoch = 0, drawn_epoch = 0;
     TileRect owned, drawn;
+    // (and none of the tiles of stencil_written had a known stencil as of
+    // stencil_epoch_ == stencil_epoch: Impl::tile_stencil_)
+    uint64_t stencil_epoch = 0;
+    TileRect stencil_written;
     // its image's size: width and height at the resolution scale (Impl::scale_)
     uint32_t host_width = 0, host_height = 0;
     // in EDRAM: tiles per row (at its bits per sample), a tile's size in pixels
@@ -1467,8 +1471,12 @@ private:
     // held (Impl::depth_overwrite): every sample of the console's pixels
     // [x0, x1) x [y0, y1), and whether with one known word (the guest's
     // depth and stencil, D24S8 or D24FS8 as the target's format).
+    // whole: the depth and the stencil; depth_whole: the depth, the stencil
+    // replaced (whole) or kept as it was; known_depth: the depth written is
+    // the word's (and the stencil, when whole); constant: whole with a known
+    // depth.
     struct DepthOverwrite {
-        bool whole = false;
+        bool whole = false, depth_whole = false, known_depth = false;
         uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
         bool constant = false;
         uint32_t word = 0;
@@ -2488,6 +2496,8 @@ private:
     void acquire(RenderTarget *t, uint32_t rows, const DepthOverwrite *overwritten = nullptr);
     void acquire(RenderTarget *t, std::span<const TileRect> rects, const DepthOverwrite *overwritten = nullptr);
     std::vector<uint32_t> acquire_tiles_; // (acquire's own, kept for its room)
+    bool transfer_cleared_only_ = false;  // the last edram_transfer drew nothing: clears alone (the verbose line)
+    bool resolve_stored_ = false;         // the resolve being made reads tiles their holders stored into EDRAM
     bool edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles);
     bool edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows);
     // tiles drawn straight from their holders into the target, one pass
@@ -2571,7 +2581,29 @@ private:
         const uint32_t k = (tile + EDRAM_TILES - t.base % EDRAM_TILES) % EDRAM_TILES;
         const uint32_t x = (k % t.pitch_tiles) * t.tile_width, y = (k / t.pitch_tiles) * t.tile_height;
         const uint32_t x1 = x + t.tile_width, y1 = y + t.tile_height;
-        return o.whole && x1 <= t.width && y1 <= t.height && x >= o.x0 && y >= o.y0 && x1 <= o.x1 && y1 <= o.y1;
+        return o.depth_whole && x1 <= t.width && y1 <= t.height && x >= o.x0 && y >= o.y0 && x1 <= o.x1 && y1 <= o.y1;
+    }
+    // A depth target's tile whose samples all have one stencil (-1: not
+    // known to): set by what makes a tile a clear's and by a draw that
+    // replaces the stencil of all of it, kept by draws with the stencil test
+    // off and by transfers between depth targets (the guest word's low
+    // byte whatever the depth format and the sample count), dropped by
+    // anything else that writes the tile. With it a clear of the depth alone
+    // (the stencil test off: the console's depth-only clears) makes a tile a
+    // clear's again: the depth's word with the stencil it has. Part of
+    // XF_DRAW_CLEARS.
+    std::vector<int16_t> tile_stencil_ = std::vector<int16_t>(EDRAM_TILES, -1);
+    uint64_t stencil_epoch_ = 1; // counted up as a tile's stencil becomes known (RenderTarget::stencil_written's memo)
+    // a draw with the stencil test on reached these tiles of t
+    void tiles_stencil_written(RenderTarget &t, const TileRect &tiles) {
+        if (tiles.empty()) return;
+        const bool known = t.stencil_epoch == stencil_epoch_;
+        if (known && tiles.within(t.stencil_written)) return;
+        for (uint32_t row = tiles.r0; row < tiles.r1; row++)
+            for (uint32_t column = tiles.c0; column < tiles.c1; column++)
+                tile_stencil_[(t.base + row * t.pitch_tiles + column) % EDRAM_TILES] = -1;
+        if (!known) t.stencil_epoch = stencil_epoch_, t.stencil_written = {};
+        t.stencil_written.remember(tiles);
     }
     // the tiles of t in its pixel rows [top, bottom), every column: a draw
     // may have written them, so they no longer hold a clear's value
@@ -4604,9 +4636,21 @@ void Impl::acquire(RenderTarget *t, std::span<const TileRect> rects, const Depth
         // (the draw this is for writes every sample of the tile whatever it
         // holds: taken as it is, nothing read from its holder or from EDRAM)
         if (overwritten && tile_within(*t, tile, *overwritten)) {
-            tile_cleared_[tile] = 0;
-            taken_unread++;
-            continue;
+            if (overwritten->whole && overwrite_transfers_) {
+                tile_cleared_[tile] = 0, tile_stencil_[tile] = -1;
+                taken_unread++;
+                continue;
+            }
+            // (the draw writes the depth of every sample of the tile, and
+            // all of them have one stencil: any depth with that stencil
+            // will do, so the tile is taken as a clear to the draw's own)
+            if (!overwritten->whole && overwritten->known_depth && draw_clears_ && transfer_clears_ &&
+                direct_transfers_ && owners_[tile] && owners_[tile]->depth && tile_stencil_[tile] >= 0) {
+                const uint32_t word = (overwritten->word & ~0xFFu) | uint32_t(tile_stencil_[tile]);
+                tile_cleared_[tile] = 1, tile_clear_word_[tile] = word;
+                tile_clear_value_[tile] = depth_clear_value(t->format, word);
+                cleared_epoch_++;
+            }
         }
         if (owners_[tile])
             held[owners_[tile]].push_back(tile);
@@ -4629,10 +4673,10 @@ void Impl::acquire(RenderTarget *t, std::span<const TileRect> rects, const Depth
     if (direct_transfers_) {
         // (edram_transfer keeps the clears it moves as clears, and drops the rest)
         if (!held.empty() && !edram_transfer(t, held)) return;
-        for (uint32_t tile : unheld) tile_cleared_[tile] = 0;
+        for (uint32_t tile : unheld) tile_cleared_[tile] = 0, tile_stencil_[tile] = -1;
         if (!unheld.empty() && !edram_load(t, unheld, tile_rows * t->tile_height)) return;
     } else {
-        for (uint32_t tile : needed) tile_cleared_[tile] = 0;
+        for (uint32_t tile : needed) tile_cleared_[tile] = 0, tile_stencil_[tile] = -1;
         for (auto &[holder, tiles] : held)
             if (!edram_store(holder, tiles)) return;
         std::vector<uint32_t> loaded; // (needed, without the tiles taken unread)
@@ -4641,13 +4685,17 @@ void Impl::acquire(RenderTarget *t, std::span<const TileRect> rects, const Depth
         if (!loaded.empty() && !edram_load(t, loaded, tile_rows * t->tile_height)) return;
     }
     for (uint32_t tile : needed) owners_[tile] = t;
+    if (!t->depth)
+        for (uint32_t tile : needed) tile_stencil_[tile] = -1;
     t->owned_epoch = ++owners_epoch_;
     remember(known); // (it lost none of what it was known to hold)
     if (options_.verbose) {
         std::string from;
         for (auto &[holder, tiles] : held) from += " [" + std::to_string(tiles.size()) + " of " + target_name(*holder) + "]";
-        std::fprintf(stderr, "  EDRAM: %zu tiles to %s (from %zu targets, %u taken unread)%s\n", needed.size(),
-                     target_name(*t).c_str(), held.size(), taken_unread, from.c_str());
+        std::fprintf(stderr, "  EDRAM: %zu tiles to %s (from %zu targets%s, %u taken unread)%s\n", needed.size(),
+                     target_name(*t).c_str(), held.size(),
+                     direct_transfers_ && !held.empty() && transfer_cleared_only_ ? " as clears" : "", taken_unread,
+                     from.c_str());
     }
 }
 
@@ -5071,8 +5119,11 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         for (uint32_t tile : tiles) {
             tile_cleared_[tile] = g.clear;
             if (g.clear) tile_clear_value_[tile] = g.value; // (as the target keeps it)
+            // (the stencil: the clear's; kept from one depth target to another; else not known)
+            if (g.clear && t->depth) tile_stencil_[tile] = int16_t(g.value.depthStencil.stencil & 0xFF);
+            else if (!holder->depth || !t->depth) tile_stencil_[tile] = -1;
         }
-        if (g.clear) cleared_epoch_++;
+        if (g.clear) cleared_epoch_++, stencil_epoch_++;
         if (!g.clear && !transfer_pipeline(*t, holder->msaa != 0))
             return fatal_ = "could not make an EDRAM transfer pipeline", false;
         Draw d{holder, {}, g.clear, g.value};
@@ -5123,8 +5174,26 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         for (const Open &o : open) rect(o.row, o.first, o.columns, o.rows);
         if (!d.rects.empty()) draws.push_back(std::move(d));
     }
+    transfer_cleared_only_ = false;
     if (draws.empty()) return true;
-    bool stencil_copy = t->depth && stencil_copies_, fresh = false;
+    // (the stencil's copy is for the tiles drawn: a clear writes the
+    // stencil aspect itself)
+    const bool any_drawn = std::any_of(draws.begin(), draws.end(), [](const Draw &d) { return !d.clear; });
+    transfer_cleared_only_ = !any_drawn;
+    if (!any_drawn && defer_clears_ && !t->raw) {
+        // clears alone: kept for the target's next pass, as a resolve's
+        // (flush_clears), with no pass of their own (a pass open on the
+        // target ends here: the clears are drawn as the next begins)
+        outside();
+        for (const Draw &d : draws) {
+            VkClearAttachment clear{};
+            clear.aspectMask = t->depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            clear.clearValue = d.value;
+            for (const VkRect2D &r : d.rects) t->pending_clears.push_back({clear, {r, 0, 1}});
+        }
+        return true;
+    }
+    bool stencil_copy = t->depth && stencil_copies_ && any_drawn, fresh = false;
     if (stencil_copy && !t->stencil_copy.image) {
         t->stencil_copy = d_.create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UINT, {t->host_width, t->host_height, 1}, 1, 1,
                                           t->image.samples,
@@ -5168,21 +5237,15 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
     VkPipeline bound = VK_NULL_HANDLE;
     for (const Draw &d : draws) {
         if (d.clear) {
-            // the clear's value over the rectangles (and the stencil into
-            // the R8_UINT image the copy after the pass reads)
+            // the clear's value over the rectangles (depth and stencil
+            // both; the copy after the pass leaves these rectangles out)
             std::vector<VkClearRect> rects;
             for (const VkRect2D &r : d.rects) rects.push_back({r, 0, 1});
-            VkClearAttachment clears[2] = {};
+            VkClearAttachment clears[1] = {};
             uint32_t count = 1;
             if (t->depth) {
                 clears[0].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
                 clears[0].clearValue = d.value;
-                if (stencil_copy) {
-                    clears[1].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                    clears[1].colorAttachment = 0;
-                    clears[1].clearValue.color.uint32[0] = d.value.depthStencil.stencil;
-                    count = 2;
-                }
             } else {
                 clears[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 clears[0].colorAttachment = 0;
@@ -5235,6 +5298,7 @@ bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::v
         std::vector<VkImageCopy> copies;
         for (const Draw &d : draws)
             for (const VkRect2D &r : d.rects) {
+                if (d.clear) continue;
                 VkImageCopy copy{};
                 copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 copy.dstSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
@@ -7406,14 +7470,17 @@ Impl::DepthOverwrite Impl::depth_overwrite(const gpu::Draw &d, const Shader &vs,
     // stencil: on, always, the pass operation replace (2) or zero (1), every bit written
     const uint32_t stencil_state = regs_[r::RB_STENCILREFMASK];
     const uint32_t pass = (depth_control >> 14) & 7;
-    if (!(depth_control & 1)) return no("stencil kept");
-    if (((depth_control >> 8) & 7) != 7 || (pass != 1 && pass != 2) || ((stencil_state >> 16) & 0xFF) != 0xFF)
-        return no("stencil not replaced");
-    // (the back face's own state, which the rectangle's triangles may take: the same)
-    if (((depth_control >> 7) & 1) && (((depth_control >> 20) & 0xFFF) != ((depth_control >> 8) & 0xFFF) ||
-                                       ((regs_[r::RB_STENCILREFMASK_BF] ^ stencil_state) & 0xFFFFFF)))
-        return no("stencil not replaced");
-    const uint32_t stencil = pass == 2 ? stencil_state & 0xFF : 0;
+    // (the stencil test off: the stencil is kept, the depth alone overwritten)
+    const bool stencil_kept = !(depth_control & 1);
+    if (!stencil_kept) {
+        if (((depth_control >> 8) & 7) != 7 || (pass != 1 && pass != 2) || ((stencil_state >> 16) & 0xFF) != 0xFF)
+            return no("stencil not replaced");
+        // (the back face's own state, which the rectangle's triangles may take: the same)
+        if (((depth_control >> 7) & 1) && (((depth_control >> 20) & 0xFFF) != ((depth_control >> 8) & 0xFFF) ||
+                                           ((regs_[r::RB_STENCILREFMASK_BF] ^ stencil_state) & 0xFFFFFF)))
+            return no("stencil not replaced");
+    }
+    const uint32_t stencil = !stencil_kept && pass == 2 ? stencil_state & 0xFF : 0;
     if (ps) {
         const uint32_t color_control = regs_[r::RB_COLORCONTROL];
         if (ps->summary.kills || ps->writes_depth) return no("the pixel shader kills or writes depth");
@@ -7483,7 +7550,8 @@ Impl::DepthOverwrite Impl::depth_overwrite(const gpu::Draw &d, const Shader &vs,
     } else {
         host = std::min(std::max(host, low), high); // (the depth clamp)
     }
-    o.whole = true;
+    o.depth_whole = true, o.whole = !stencil_kept;
+    o.word = stencil; // (the stencil written, when whole; the depth's bits below, once known)
     o.x0 = uint32_t(left), o.y0 = uint32_t(top), o.x1 = uint32_t(right), o.y1 = uint32_t(bottom);
     why = "the depth is not one known word";
     if (!known || !(host >= 0.0 && host <= 1.0)) return o;
@@ -7505,8 +7573,8 @@ Impl::DepthOverwrite Impl::depth_overwrite(const gpu::Draw &d, const Shader &vs,
     // (a float host depth holds the draw's value itself, which transfers keep)
     if (depth.image.format != VK_FORMAT_D24_UNORM_S8_UINT && double(depth_clear_value(depth.format, word).depthStencil.depth) != host)
         return o;
-    o.constant = true, o.word = word;
-    why = nullptr;
+    o.known_depth = true, o.constant = o.whole, o.word = word;
+    why = stencil_kept ? "the stencil kept" : nullptr;
     return o;
 }
 
@@ -8224,18 +8292,28 @@ void Impl::draw(const gpu::Draw &d) {
                                  (unsigned long long)report_.draws, over.whole ? "overwrites" : "not an overwrite: ",
                                  why ? why : "", over.x0, over.y0, over.x1, over.y1, over.word);
             }
-            take(depth, overwrite_transfers_ && over.whole ? &over : nullptr);
-            if (draw_clears_ && over.constant && fatal_.empty()) {
-                const VkClearValue value = depth_clear_value(depth->format, over.word);
+            take(depth, over.depth_whole ? &over : nullptr);
+            // the stencil of the tiles reached: not known any more with the
+            // stencil test on, but the one written where the draw replaces
+            // all of a tile's (tile_stencil_)
+            if (depth_control & 1)
+                for (const TileRect &tiles : reach_rects_) tiles_stencil_written(*depth, tiles);
+            if (over.depth_whole && fatal_.empty()) {
                 const uint32_t tiles = std::min(depth->height / depth->tile_height * depth->pitch_tiles, EDRAM_TILES);
-                bool any = false;
+                bool cleared = false, stencil = false;
                 for (uint32_t k = 0; k < tiles; k++) {
                     const uint32_t tile = (depth->base + k) % EDRAM_TILES;
                     if (owners_[tile] != depth || !tile_within(*depth, tile, over)) continue;
-                    tile_cleared_[tile] = 1, tile_clear_value_[tile] = value, tile_clear_word_[tile] = over.word;
-                    any = true;
+                    if (over.whole) tile_stencil_[tile] = int16_t(over.word & 0xFF), stencil = true;
+                    // (one depth and one stencil: a clear's, as after a resolve's clear)
+                    if (!draw_clears_ || !over.known_depth || tile_stencil_[tile] < 0) continue;
+                    const uint32_t word = (over.word & ~0xFFu) | uint32_t(tile_stencil_[tile]);
+                    tile_cleared_[tile] = 1, tile_clear_word_[tile] = word;
+                    tile_clear_value_[tile] = depth_clear_value(depth->format, word);
+                    cleared = true;
                 }
-                if (any) cleared_epoch_++;
+                if (cleared) cleared_epoch_++;
+                if (stencil) stencil_epoch_++;
             }
         }
         if (!fatal_.empty()) return;
@@ -9215,7 +9293,44 @@ void Impl::resolve() {
     if (!source) return fatal_.empty() ? skip("resolve: source format") : void();
     uint32_t x = std::min(info.x, source->width), y = std::min(info.y, source->height);
     uint32_t w = std::min(info.width, source->width - x), h = std::min(info.height, source->height - y);
-    if (!fsi_) acquire(source, y + h);
+    // (the tiles under the rectangle: with XF_DRAW_REACH=rows, every tile of
+    // the rows down to its last, as Xenia takes them)
+    auto take = [&](RenderTarget *t) {
+        if (!reach_tiles_ || !w || !h) return acquire(t, y + h);
+        const TileRect tiles = tiles_of(*t, x, y, x + w, y + h);
+        acquire(t, std::span<const TileRect>(&tiles, 1));
+    };
+    // Beyond Xenia: a copy alone from a source that does not hold every tile
+    // of the rectangle (a view of tiles another target draws to: a 4x
+    // shadow atlas resolved as a single-sampled surface twice as wide and
+    // tall) leaves the tiles with their holders, which store them into
+    // EDRAM, and reads them there: a store, where taking them was a transfer
+    // into the view and another back at the holder's next draw.
+    // XF_RESOLVE_FROM_HOLDERS=0: the source takes them, as Xenia's.
+    static const bool from_holders = [] {
+        const char *v = std::getenv("XF_RESOLVE_FROM_HOLDERS"), *image = std::getenv("XF_RESOLVE_FROM_IMAGE");
+        return !(v && v[0] == '0') && !(image && std::string(image) == "1");
+    }();
+    resolve_stored_ = false;
+    if (!fsi_ && from_holders && reach_tiles_ && info.copy && !info.clear_color && !info.clear_depth && w && h) {
+        const TileRect rect = tiles_of(*source, x, y, x + w, y + h);
+        std::map<RenderTarget *, std::vector<uint32_t>> held;
+        bool others = false;
+        for (uint32_t row = rect.r0; row < rect.r1; row++)
+            for (uint32_t column = rect.c0; column < rect.c1; column++) {
+                if (row * source->pitch_tiles + column >= EDRAM_TILES) continue;
+                const uint32_t tile = (source->base + row * source->pitch_tiles + column) % EDRAM_TILES;
+                if (!owners_[tile]) continue; // (EDRAM has it)
+                held[owners_[tile]].push_back(tile);
+                others |= owners_[tile] != source;
+            }
+        if (others) {
+            for (auto &[holder, tiles] : held)
+                if (!edram_store(holder, tiles)) return;
+            resolve_stored_ = true;
+        }
+    }
+    if (!fsi_ && !resolve_stored_) take(source);
     if (!fatal_.empty()) return;
     if (options_.verbose)
         std::fprintf(stderr,
@@ -9264,7 +9379,7 @@ void Impl::resolve() {
         }
         for (RenderTarget *t : {depth_target, color_target}) {
             if (!t) continue;
-            acquire(t, y + h);
+            take(t);
             if (!fatal_.empty()) return;
             VkClearAttachment clear{};
             if (t->depth) {
@@ -9342,6 +9457,10 @@ void Impl::resolve() {
                         tile_cleared_[tile] = whole;
                         if (whole) tile_clear_value_[tile] = clear.clearValue, cleared_epoch_++;
                         if (whole && t->depth) tile_clear_word_[tile] = regs_[r::RB_DEPTH_CLEAR];
+                        if (t->depth) {
+                            tile_stencil_[tile] = whole ? int16_t(regs_[r::RB_DEPTH_CLEAR] & 0xFF) : int16_t(-1);
+                            if (whole) stencil_epoch_++;
+                        }
                     }
             }
             // kept for the target's next render pass, whose draws need it
@@ -9689,7 +9808,9 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // store and no barrier between the two: the source holds every tile of
     // the rectangle (acquire), and keeps holding them, so EDRAM's copy of
     // them is read by nothing (XF_RESOLVE_THROUGH_EDRAM=1: as before).
-    const bool from_target_image = from_edram && !fsi_ && !resolve_through_edram_;
+    // (Not where the source does not hold them: their holders have stored
+    // them into EDRAM, Impl::resolve.)
+    const bool from_target_image = from_edram && !fsi_ && !resolve_through_edram_ && !resolve_stored_;
     if (from_target_image) {
         c = outside();
         if (options_.gpu_timing) gpu_mark("resolves: copies from the target: " + target_name(source));
@@ -9698,7 +9819,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         for (uint32_t row = info.y / source.tile_height; row <= (info.y + h - 1) / source.tile_height; row++)
             for (uint32_t column = info.x / source.tile_width; column <= (info.x + w - 1) / source.tile_width; column++)
                 tiles.push_back((source.base + row * source.pitch_tiles + column) % EDRAM_TILES);
-        if (!fsi_ && !edram_store(&source, tiles)) return;
+        if (!fsi_ && !resolve_stored_ && !edram_store(&source, tiles)) return;
         c = outside();
         if (options_.gpu_timing) gpu_mark("resolves: copies from EDRAM: " + target_name(source));
     } else {
