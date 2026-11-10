@@ -1705,6 +1705,40 @@ pipelines 0.07 s (1.2 s), 178 draws by the generic shaders in the plays
 after the first, the last play's picture identical to the translated
 shaders'.
 
+## Game G's command thread (2026-11-10)
+
+Game G in play (Armadillo, `boot --render`, its library) ran at 14.7 swaps a
+second of its 30, about 8,500 draws and 65 resolves a frame. Not the GPU (20
+ms of it a frame) nor pipelines (the same with library stand-ins): the GPU
+commands thread, 88% busy, which the game waits for in a spin of its D3D's
+(the hottest guest function, 13.6% of all the CPU, polls the ring buffer's
+read pointer with `or r31,r31,r31`). The thread by function then:
+`Impl::draw` itself 22%, the driver's recording 11%, memcpy 8%, the texture
+checks (`unwritten`) 7% plus 6% in their atomic loads, `texture` 4%, the
+register writes 3%. A benchmark that changes by the code alone: the frame
+850 trace replayed 30 times, the command thread's time a play (xfreplay's
+`commands a play`, the median).
+
+| change | the replay's play | live, in play |
+| --- | --- | --- |
+| before | 22.0 ms | 14.7 swaps a second |
+| write stamps per block of 64 watch pages (memory.h's `write_block_stamps`): a texture's pages checked by blocks first | | 16.8 |
+| indices converted in one pass, eight at a time with AVX2, read where guest memory holds them (`index_convert.h`) | 20.1 ms | |
+| texture slots memoized by the constant's content, not the slot | 20.1 ms | 19.0 |
+
+Tried and left out: the float constants uploaded only up to the last a
+shader reads (the game's shaders read most of them: no change), the
+register file's constants checked a 1024-register group at a time (its
+vertex constants change at every draw: no change). Timed by section within
+the draw (rdtsc marks, the first play left out): the recording (pass,
+binds, dynamic state, the draw: the driver) about 30%, the textures 14%, the
+indices' conversion 11% and their copy into the arena 9%, the vertex data's
+request 9%, the pipeline's key and lookup 7%. Next, by size: a cache of
+converted index buffers (static geometry's indices do not change, as
+Xenia's primitive processor caches them), fewer calls into the driver (the
+descriptor sets bound again at every draw), and the recording on a thread
+of its own.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches
