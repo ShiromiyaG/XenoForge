@@ -17,11 +17,12 @@
 // the texture cache's memory limits (Xenia's texture_cache_memory_limit_*; renderer.h).
 // --async-pipelines makes pipelines on worker threads as the player does, --stand-in says what
 // draws meanwhile (renderer.h's PipelineStandIn), --linked-pipelines links every pipeline from
-// libraries and never makes one whole.
+// libraries and never makes one whole; --generic draws every draw it can with the generic shaders
+// (an interpreter of the microcode), whole pipelines made at once.
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
 //            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--profile N] [--async-pipelines]
-//            [--stand-in skip|placeholder|library] [--linked-pipelines]
+//            [--stand-in skip|placeholder|library] [--linked-pipelines] [--generic]
 //            [--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] [--depth-float24-round]
 //            [--depth-float24-convert] [--no-gamma-unorm16] [--xenos-sample-positions]
 //            [--texture-memory soft,hard[,lifetime]] [-v]
@@ -49,7 +50,7 @@ namespace {
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
                          "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--pipeline-cache file] [--async-pipelines] "
-                         "[--stand-in skip|placeholder|library] [--linked-pipelines] "
+                         "[--stand-in skip|placeholder|library] [--linked-pipelines] [--generic] "
                          "[--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] "
                          "[--depth-float24-round] "
                          "[--depth-float24-convert] [--no-gamma-unorm16] [--xenos-sample-positions] "
@@ -105,6 +106,9 @@ int main(int argc, char **argv) {
         // every pipeline linked from libraries, never made whole
         else if (a == "--linked-pipelines")
             options.linked_pipelines_only = true;
+        // every draw the generic shaders can draw drawn by them (renderer.h)
+        else if (a == "--generic")
+            options.generic_only = true;
         // occlusion query reports with the GPU's counts (else the fake ones)
         else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
         // screen extent reports as Xenia answers them, the whole screen
@@ -193,6 +197,11 @@ int main(int argc, char **argv) {
                 report.pipeline_seconds, (unsigned long long)report.pipeline_libraries,
                 (unsigned long long)report.pipelines_linked, (unsigned long long)report.pipeline_placeholders,
                 (unsigned long long)report.stand_in_draws);
+    std::printf("  generic shaders: %llu programs, %llu stand-ins linked, %llu draws drawn by them\n",
+                (unsigned long long)report.generic_programs, (unsigned long long)report.generic_pipelines,
+                (unsigned long long)report.generic_draws);
+    for (const auto &[why, n] : report.generic_refused)
+        std::printf("    %llu draws not drawn by them: %s\n", (unsigned long long)n, why.c_str());
     std::printf("  shaders: %.3f s translating %llu forms (%.2f ms each, at most %.2f ms)\n", report.translate_seconds,
                 (unsigned long long)report.translations,
                 report.translations ? report.translate_seconds * 1000.0 / double(report.translations) : 0.0,

@@ -53,6 +53,7 @@
 #include "xenoforge/shader_harness.h"
 #include "xenoforge/shader_interpreter.h"
 #include "xenoforge/shader_storage.h"
+#include "xenoforge/shader_program.h"
 #include "xenoforge/shader_translator.h"
 #include "xenoforge/texture.h"
 #include "xenoforge/ucode.h"
@@ -189,6 +190,66 @@ const uint32_t TEXTURE_LOAD[] = {
 const uint32_t EDRAM_FSI_LIBRARY[] = {
 #include "edram_fsi_library.frag.inc"
 };
+// the generic shaders (generic.glsl): the vertex shader, and the pixel
+// shader on host render targets and on the interlock path (pixel and sample
+// interlock), each with point coordinates or not and writing depth or not
+const uint32_t GENERIC_VS[] = {
+#include "generic.vert.inc"
+};
+const uint32_t GENERIC_CLIP_VS[] = {
+#include "generic_clip.vert.inc"
+};
+const uint32_t GENERIC_CULL_VS[] = {
+#include "generic_cull.vert.inc"
+};
+const uint32_t GENERIC_EXTENTS_VS[] = {
+#include "generic_extents.vert.inc"
+};
+const uint32_t GENERIC_EXTENTS_CLIP_VS[] = {
+#include "generic_extents_clip.vert.inc"
+};
+const uint32_t GENERIC_EXTENTS_CULL_VS[] = {
+#include "generic_extents_cull.vert.inc"
+};
+const uint32_t GENERIC_FS[] = {
+#include "generic.frag.inc"
+};
+const uint32_t GENERIC_DEPTH_FS[] = {
+#include "generic_depth.frag.inc"
+};
+const uint32_t GENERIC_POINTS_FS[] = {
+#include "generic_points.frag.inc"
+};
+const uint32_t GENERIC_POINTS_DEPTH_FS[] = {
+#include "generic_points_depth.frag.inc"
+};
+const uint32_t GENERIC_FSI_FS[] = {
+#include "generic_fsi.frag.inc"
+};
+const uint32_t GENERIC_FSI_DEPTH_FS[] = {
+#include "generic_fsi_depth.frag.inc"
+};
+const uint32_t GENERIC_FSI_POINTS_FS[] = {
+#include "generic_fsi_points.frag.inc"
+};
+const uint32_t GENERIC_FSI_POINTS_DEPTH_FS[] = {
+#include "generic_fsi_points_depth.frag.inc"
+};
+const uint32_t GENERIC_FSI_SAMPLE_FS[] = {
+#include "generic_fsi_sample.frag.inc"
+};
+const uint32_t GENERIC_FSI_SAMPLE_DEPTH_FS[] = {
+#include "generic_fsi_sample_depth.frag.inc"
+};
+const uint32_t GENERIC_FSI_SAMPLE_POINTS_FS[] = {
+#include "generic_fsi_sample_points.frag.inc"
+};
+const uint32_t GENERIC_FSI_SAMPLE_POINTS_DEPTH_FS[] = {
+#include "generic_fsi_sample_points_depth.frag.inc"
+};
+// the program buffer's size: a program is 16 bytes per control flow
+// instruction and 64 per ALU or fetch one, a few KB a shader
+constexpr VkDeviceSize PROGRAM_BUFFER_BYTES = 32ull << 20;
 const uint32_t EDRAM_FSI_DEPTH_PIXEL[] = {
 #include "edram_fsi_depth_pixel.frag.inc"
 };
@@ -600,6 +661,12 @@ struct Shader {
     uint64_t texture_mask = 0, vertex_mask[2] = {};
     uint32_t fetch_blocks = 0;
     uint32_t filter_mask = 0; // the slots (below 32) filters has
+    // its program for the generic shaders (Impl::program): encoded once, at
+    // `program` in the program buffer (16-byte units; UINT32_MAX: not there,
+    // with why in program_unsupported), its flags (shader::PROGRAM_*)
+    bool encoded = false;
+    uint32_t program = UINT32_MAX, program_flags = 0;
+    std::string program_unsupported;
 };
 
 // A rectangle of a render target's EDRAM tiles: columns [c0, c1) of its tile
@@ -837,8 +904,11 @@ struct System {
     // shader::PixelOptions::blend_premultiply), and the blend constant for them
     uint32_t blend_premultiply[4];
     float blend_constant[4];
+    // the generic shaders' programs (generic.glsl): the vertex shader's and
+    // the pixel shader's, in 16-byte units into the program buffer (binding 8)
+    uint32_t generic[4];
 };
-static_assert(sizeof(System) == 768);
+static_assert(sizeof(System) == 784);
 
 // The snorm format of a unorm one's bits, where the host has one (a signed
 // view of the same image); undefined for the rest.
@@ -1109,6 +1179,13 @@ struct PipelineEntry {
     // fragment shader, fragment output; the last two null when rasterization
     // is discarded), once asked for
     PipelineEntry *libraries[4] = {};
+    // the generic stand-in (docs/renderer.md, "The generic shaders"): linked
+    // from the vertex input and fragment output libraries and the generic
+    // shaders' pre-rasterization and fragment shader libraries, drawing
+    // until the pipeline or its exact linked stand-in is made
+    VkPipeline generic = VK_NULL_HANDLE;
+    PipelineEntry *generic_libraries[4] = {};
+    bool generic_failed = false;
 };
 
 // What a pipeline made on the workers is to the draws waiting for it.
@@ -1601,6 +1678,31 @@ private:
     VkShaderModule depth_float24_fs_[2] = {};
     // the pixel shader of the placeholder pipelines (Options::pipeline_stand_in)
     VkShaderModule placeholder_fs_ = VK_NULL_HANDLE;
+    // the generic shaders (init_generic): on (Options::generic_shaders, not
+    // XF_GENERIC_SHADERS=0), the program buffer and what of it is written
+    // (16-byte units), the modules ([point coordinates][writes depth])
+    bool generic_on_ = false;
+    vk::Buffer programs_;
+    uint32_t programs_used_ = 0;
+    // (the vertex shader's: [screen extents][none, clip, cull distances])
+    VkShaderModule generic_vs_[2][3] = {}, generic_fs_[2][2] = {};
+    bool init_generic(std::string &error);
+    bool program(Shader &s, std::string &why);
+    // a draw's generic pipeline: its info with the generic shaders in place
+    // of the guest's (false, with why, where they cannot draw it), and the
+    // stand-in linked from its libraries (made on the workers the first time)
+    // (the specialization: generic.glsl's POINT_SNAP, generic.vert's CLIP_PLANES)
+    struct GenericStages {
+        VkPipelineShaderStageCreateInfo stages[5];
+        VkSpecializationMapEntry entries[2] = {{21, 0, 4}, {22, 4, 4}};
+        uint32_t vertex_data[2] = {0, 0}, pixel_data = 1;
+        VkSpecializationInfo vertex_spec{2, entries, 8, vertex_data}, pixel_spec{1, entries, 4, &pixel_data};
+        VkGraphicsPipelineCreateInfo info{};
+    };
+    bool generic_info(const VkGraphicsPipelineCreateInfo &info, Shader &vs, Shader *ps, bool points, GenericStages &out,
+                      std::string &why);
+    VkPipeline generic_stand_in(PipelineEntry &e, const VkGraphicsPipelineCreateInfo &generic, bool async);
+    void retire_generic(PipelineEntry &e);
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
     VkFormat depth_vk_format(uint32_t format) const;
     Texture *texture(const uint32_t fetch[6], std::string &why);
@@ -2776,8 +2878,15 @@ Impl::~Impl() {
     }
     for (auto *table : {&pipelines_, &libraries_})
         for (auto &[k, p] : *table)
-            for (VkPipeline pipe : {p->pipeline, p->stand_in})
+            for (VkPipeline pipe : {p->pipeline, p->stand_in, p->generic})
                 if (pipe) vkDestroyPipeline(dev_, pipe, nullptr);
+    for (auto &modules : generic_vs_)
+        for (VkShaderModule m : modules)
+            if (m) vkDestroyShaderModule(dev_, m, nullptr);
+    for (auto &modules : generic_fs_)
+        for (VkShaderModule m : modules)
+            if (m) vkDestroyShaderModule(dev_, m, nullptr);
+    if (programs_.buffer) d_.destroy(programs_);
     for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.sampler, nullptr);
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
     for (auto &[k, t] : targets_) {
@@ -3079,7 +3188,7 @@ bool Impl::init(std::string &error) {
     // screen extents, written by the vertex shaders that bound them)
     const VkShaderStageFlags vertex_stages =
         stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT);
-    VkDescriptorSetLayoutBinding b0[8] = {
+    VkDescriptorSetLayoutBinding b0[9] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr},
         {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
@@ -3088,6 +3197,8 @@ bool Impl::init(std::string &error) {
         {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vertex_stages, nullptr},
+        // 8 the generic shaders' programs (init_generic)
+        {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr},
     };
     VkDescriptorSetLayoutBinding b1[4] = {
         {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacity_[0], stages, nullptr},
@@ -3103,7 +3214,7 @@ bool Impl::init(std::string &error) {
     flags.bindingCount = 4;
     flags.pBindingFlags = partly;
     VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    set_info.bindingCount = 8;
+    set_info.bindingCount = 9;
     set_info.pBindings = b0;
     if (vkCreateDescriptorSetLayout(dev_, &set_info, nullptr, &set_layouts_[0]) != VK_SUCCESS)
         return error = "vkCreateDescriptorSetLayout failed", false;
@@ -3120,7 +3231,7 @@ bool Impl::init(std::string &error) {
         return error = "vkCreatePipelineLayout failed", false;
     {
         VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8},
-                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8}};
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool.maxSets = 2;
         pool.poolSizeCount = 2;
@@ -3599,8 +3710,95 @@ bool Impl::init(std::string &error) {
                                   fsi_depth_fs_,       depth_float24_fs_[0], depth_float24_fs_[1], placeholder_fs_};
     for (uint32_t k = 0; k < std::size(own); k++)
         if (own[k]) module_names_[own[k]] = {2, own[k] == fsi_depth_fs_ ? fsi_ : 0u, k + 1};
+    if (!init_generic(error)) return false;
     open_storage();
     return true;
+}
+
+// The generic shaders (docs/renderer.md, "The generic shaders"): the program
+// buffer (set 0, binding 8; host-visible, written once per shader and never
+// again, so nothing on the GPU races the writes), the vertex shader and the
+// pixel shader's four forms for this renderer's render target path, named
+// as the renderer's own modules (kind 2, from 100) with their code's hash.
+bool Impl::init_generic(std::string &error) {
+    static const bool off = [] {
+        const char *v = std::getenv("XF_GENERIC_SHADERS");
+        return v && v[0] == '0';
+    }();
+    generic_on_ = (options_.generic_shaders || options_.generic_only) && !off;
+    // (in video memory where the host can write it, as the interpreter reads
+    // it at every instruction; else host memory)
+    programs_ = d_.create_device_local_mapped_buffer(PROGRAM_BUFFER_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                     16 * PROGRAM_BUFFER_BYTES);
+    if (!programs_.buffer) programs_ = d_.create_buffer(PROGRAM_BUFFER_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    if (!programs_.buffer || !programs_.mapped) return error = "could not make the generic shaders' program buffer", false;
+    // (offset 0: an empty program, what the draws that run no generic shader point at)
+    const uint32_t empty[4] = {0, 1, 0, 0};
+    std::memcpy(programs_.mapped, empty, sizeof(empty));
+    programs_used_ = 1;
+    for (VkDescriptorSet set : draw_sets_) {
+        VkDescriptorBufferInfo buffer{programs_.buffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = set;
+        write.dstBinding = 8;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &buffer;
+        vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+    }
+    if (!generic_on_) return true;
+    auto make = [&](std::span<const uint32_t> words, uint32_t id) {
+        VkShaderModule m = module(words.data(), words.size_bytes());
+        if (m) {
+            module_names_[m] = {2, fsi_, id};
+            module_content_[m] = ShaderStorage::hash(0, std::vector<uint32_t>(words.begin(), words.end()));
+        }
+        return m;
+    };
+    const std::span<const uint32_t> vertex[2][3] = {{GENERIC_VS, GENERIC_CLIP_VS, GENERIC_CULL_VS},
+                                                     {GENERIC_EXTENTS_VS, GENERIC_EXTENTS_CLIP_VS, GENERIC_EXTENTS_CULL_VS}};
+    for (uint32_t e = 0; e < 2; e++)
+        for (uint32_t c = 0; c < 3; c++) {
+            generic_vs_[e][c] = make(vertex[e][c], e || c ? 110 + e * 3 + c : 100);
+            if (!generic_vs_[e][c]) return error = "could not make the generic shaders", false;
+        }
+    // [point coordinates][writes depth]
+    const std::span<const uint32_t> host[2][2] = {{GENERIC_FS, GENERIC_DEPTH_FS},
+                                                  {GENERIC_POINTS_FS, GENERIC_POINTS_DEPTH_FS}};
+    const std::span<const uint32_t> pixel[2][2] = {{GENERIC_FSI_FS, GENERIC_FSI_DEPTH_FS},
+                                                   {GENERIC_FSI_POINTS_FS, GENERIC_FSI_POINTS_DEPTH_FS}};
+    const std::span<const uint32_t> sample[2][2] = {{GENERIC_FSI_SAMPLE_FS, GENERIC_FSI_SAMPLE_DEPTH_FS},
+                                                    {GENERIC_FSI_SAMPLE_POINTS_FS, GENERIC_FSI_SAMPLE_POINTS_DEPTH_FS}};
+    for (uint32_t p = 0; p < 2; p++)
+        for (uint32_t d = 0; d < 2; d++)
+            generic_fs_[p][d] = make(fsi_ == 2 ? sample[p][d] : fsi_ ? pixel[p][d] : host[p][d], 101 + p * 2 + d);
+    if (!generic_fs_[0][0] || !generic_fs_[0][1] || !generic_fs_[1][0] || !generic_fs_[1][1])
+        return error = "could not make the generic shaders", false;
+    return true;
+}
+
+// A shader's program in the program buffer, encoded and written the first
+// time (Shader::program); false with why when the generic shaders cannot run it.
+bool Impl::program(Shader &s, std::string &why) {
+    if (!s.encoded) {
+        s.encoded = true;
+        shader::Program p = shader::encode_program(s.parsed);
+        s.program_flags = p.flags;
+        const uint32_t units = uint32_t(p.words.size() / 4);
+        if (!p.ok()) {
+            s.program_unsupported = p.unsupported;
+        } else if (VkDeviceSize(programs_used_ + units) * 16 > programs_.size) {
+            s.program_unsupported = "the program buffer is full";
+        } else {
+            std::memcpy(static_cast<uint8_t *>(programs_.mapped) + VkDeviceSize(programs_used_) * 16, p.words.data(),
+                        p.words.size() * 4);
+            s.program = programs_used_;
+            programs_used_ += units;
+            report_.generic_programs++;
+        }
+    }
+    if (s.program == UINT32_MAX) why = s.program_unsupported;
+    return s.program != UINT32_MAX;
 }
 
 // ---- submissions ----
@@ -6107,7 +6305,8 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
     // The last draw's pipeline again (most draws follow one of the same state): one comparison of
     // the key instead of the map's search, a compare of two keys at each of its levels. Entries
     // are never dropped.
-    if (last_pipeline_ && last_pipeline_->pipeline && !last_pipeline_->stand_in && key == last_pipeline_key_ &&
+    if (last_pipeline_ && last_pipeline_->pipeline && !last_pipeline_->stand_in && !last_pipeline_->generic &&
+        key == last_pipeline_key_ &&
         last_pipeline_->asked == std::chrono::steady_clock::time_point{} &&
         last_pipeline_->state.load(std::memory_order_acquire))
         return last_pipeline_->pipeline;
@@ -6118,6 +6317,7 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
         last_pipeline_ = e, last_pipeline_key_ = key;
         if (e->state.load(std::memory_order_acquire)) {
             if (e->stand_in) retire_stand_in(*e);
+            if (e->generic) retire_generic(*e);
             if (e->pipeline) drawn_with(*e);
             return e->pipeline;
         }
@@ -6130,6 +6330,7 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             }
             pipeline_workers_->wait(e);
             if (e->stand_in) retire_stand_in(*e);
+            if (e->generic) retire_generic(*e);
             return e->pipeline;
         }
     } else {
@@ -6213,6 +6414,7 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
         e->queued = true;
     }
     if (e->stand_in) {
+        if (e->generic) retire_generic(*e);
         drawn_with(*e);
         return stand_in = true, e->stand_in;
     }
@@ -6389,6 +6591,111 @@ VkPipeline Impl::link(PipelineEntry &e) {
         e.stand_in_failed = true;
     }
     return p;
+}
+
+// The draw's pipeline with the generic shaders in place of the guest's: the
+// vertex shader in its plain host form (no expansion in the vertex shader,
+// no user clip planes, no screen extents; not tessellated), the pixel
+// shader's form without the float24 conversion (its centroids read at the
+// center, counted), the interlock path's state from the draw's uniform block
+// rather than specialized. The geometry shaders and everything else as the
+// draw's.
+bool Impl::generic_info(const VkGraphicsPipelineCreateInfo &info, Shader &vs, Shader *ps, bool points,
+                        GenericStages &out, std::string &why) {
+    if (!generic_on_) return why = "off", false;
+    if (!options_.generic_only && !use_libraries_) return why = "no pipeline libraries on the device", false;
+    if (info.stageCount > 5) return why = "more stages than the renderer makes", false;
+    std::string reason;
+    if (!program(vs, reason)) return why = "vertex shader: " + reason, false;
+    if (ps && !program(*ps, reason)) return why = "pixel shader: " + reason, false;
+    out.info = info;
+    out.info.pStages = out.stages;
+    out.vertex_data[0] = out.pixel_data = 1;
+    for (uint32_t i = 0; i < info.stageCount; i++) {
+        VkPipelineShaderStageCreateInfo &st = out.stages[i];
+        st = info.pStages[i];
+        switch (st.stage) {
+        case VK_SHADER_STAGE_VERTEX_BIT: {
+            // the guest's in the vertex host form (shader::VertexOptions::key's
+            // host 0; ps_ucp_mode applies to points alone), with its screen
+            // extents and user clip planes
+            auto name = module_names_.find(st.module);
+            const bool guest = name != module_names_.end() && name->second.kind == 1 && name->second.id == vs.hash;
+            const uint32_t form = guest ? name->second.form : 0;
+            if (!guest || (form & 0xFF))
+                return why = guest ? "the vertex shader expanding points or rectangles" : "not the guest's vertex shader",
+                       false;
+            const uint32_t planes = std::min<uint32_t>((form >> 9) & 7, 6), cull = (form >> 12) & 1,
+                           extents = (form >> 15) & 1;
+            st.module = generic_vs_[extents][planes ? 1 + cull : 0];
+            out.vertex_data[0] = point_snap_ ? 1 : 0;
+            out.vertex_data[1] = planes;
+            st.pSpecializationInfo = point_snap_ || planes ? &out.vertex_spec : nullptr;
+            break;
+        }
+        case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+        case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: return why = "a tessellated draw", false;
+        case VK_SHADER_STAGE_FRAGMENT_BIT: {
+            if (!ps) break; // the renderer's own (depth alone)
+            auto name = module_names_.find(st.module);
+            const uint32_t form = name == module_names_.end() ? 0 : name->second.form;
+            if (form & 3) return why = "the pixel shader's float24 depth form", false;
+            if ((form >> 8) & 0xFFFF) approximate("generic shaders: interpolators at the pixel's center, not its centroid");
+            st.module = generic_fs_[points ? 1 : 0][ps->writes_depth ? 1 : 0];
+            st.pSpecializationInfo = point_snap_ ? &out.pixel_spec : nullptr;
+            break;
+        }
+        default: break; // the geometry shaders
+        }
+    }
+    return true;
+}
+
+VkPipeline Impl::generic_stand_in(PipelineEntry &e, const VkGraphicsPipelineCreateInfo &generic, bool async) {
+    if (e.generic || e.generic_failed) return e.generic;
+    if (!e.generic_libraries[0] && !e.generic_libraries[1]) {
+        PipelineParts parts;
+        library_keys(generic, parts);
+        for (uint32_t part = 0; part < 4; part++) e.generic_libraries[part] = library(part, parts.keys[part], generic, async);
+    }
+    VkPipeline libraries[4];
+    uint32_t count = 0;
+    for (PipelineEntry *l : e.generic_libraries) {
+        if (!l) continue;
+        if (!l->state.load(std::memory_order_acquire)) return VK_NULL_HANDLE;
+        if (!l->pipeline) {
+            approximate("generic shaders: a library the driver failed");
+            e.generic_failed = true;
+            return VK_NULL_HANDLE;
+        }
+        libraries[count++] = l->pipeline;
+    }
+    VkPipelineLibraryCreateInfoKHR list{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
+    list.libraryCount = count;
+    list.pLibraries = libraries;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &list;
+    info.layout = layout_;
+    {
+        Timer timer(report_.pipeline_seconds);
+        if (vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &info, nullptr, &e.generic) != VK_SUCCESS)
+            e.generic = VK_NULL_HANDLE;
+    }
+    if (e.generic) {
+        report_.generic_pipelines++;
+    } else {
+        approximate("generic shaders: linking failed");
+        e.generic_failed = true;
+    }
+    return e.generic;
+}
+
+void Impl::retire_generic(PipelineEntry &e) {
+    VkPipeline old = e.generic;
+    e.generic = VK_NULL_HANDLE;
+    if (!old) return;
+    cmd();
+    slots_[current_].after.push_back([this, old] { vkDestroyPipeline(dev_, old, nullptr); });
 }
 
 VkPipeline Impl::placeholder(const VkGraphicsPipelineCreateInfo &info) {
@@ -8970,11 +9277,39 @@ void Impl::draw(const gpu::Draw &d) {
     // made on a worker while the draw goes without it, or with a stand-in,
     // when there is a pixel shader (Xenia's D3D12 pipeline cache: draws
     // without one get theirs at once)
-    bool pending = false, stand_in = false;
-    VkPipeline pipe = pipeline(key, info, options_.async_pipelines && ps, pending, stand_in);
+    bool pending = false, stand_in = false, generic = false;
+    GenericStages generic_stages;
+    std::string generic_why;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    const bool generic_wanted = options_.generic_only && ps; // (draws without a pixel shader are made at once anyway)
+    if (generic_wanted && !generic_info(info, *vs, ps, point_coordinates, generic_stages, generic_why))
+        report_.generic_refused[generic_why]++;
+    if (generic_wanted && generic_why.empty()) {
+        // (Options::generic_only: whole pipelines of the generic shaders, made at once)
+        key.push_back(0x6E0E0000u);
+        pipe = pipeline(key, generic_stages.info, false, pending, stand_in);
+        generic = true;
+    } else {
+        pipe = pipeline(key, info, options_.async_pipelines && ps, pending, stand_in);
+        // waiting for the pipeline and its exact stand-in: the generic one
+        if (pending && generic_on_ && !options_.generic_only) {
+            if (generic_info(info, *vs, ps, point_coordinates, generic_stages, generic_why)) {
+                auto entry = pipelines_.find(key);
+                if (entry != pipelines_.end()) pipe = generic_stand_in(*entry->second, generic_stages.info, true);
+                if (pipe) pending = false, generic = true;
+            } else {
+                report_.generic_refused[generic_why]++;
+            }
+        }
+    }
     if (pending) return skip("pipeline not ready (being made)");
     if (!pipe) return skip("vkCreateGraphicsPipelines failed");
     if (stand_in) report_.stand_in_draws++;
+    if (generic) {
+        report_.generic_draws++;
+        sys.generic[0] = vs->program;
+        sys.generic[1] = ps ? ps->program : 0;
+    }
 
     // the vertex data: the ranges of the vertex fetch constants the shaders
     // use (address and size, as Xenia's IssueDraw requests them), merged,

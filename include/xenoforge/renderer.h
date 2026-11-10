@@ -102,6 +102,12 @@ struct Report {
     // stand-in (a placeholder or a linked pipeline) while their own pipeline
     // was made
     uint64_t pipeline_libraries = 0, pipelines_linked = 0, pipeline_placeholders = 0, stand_in_draws = 0;
+    // The generic shaders (Options::generic_shaders): the shaders' programs
+    // written to their buffer, the generic stand-ins linked, the draws they
+    // drew; and why a draw waiting for its pipeline could not be drawn by
+    // them, by reason
+    uint64_t generic_programs = 0, generic_pipelines = 0, generic_draws = 0;
+    std::map<std::string, uint64_t> generic_refused;
     // The shader and pipeline storage (Options::shader_storage): the shaders
     // and pipeline descriptions this run added to it; the pipelines and
     // libraries the launcher's build step had made into the pipeline cache
@@ -261,6 +267,18 @@ struct Options {
         library,
     };
     PipelineStandIn pipeline_stand_in = PipelineStandIn::library;
+    // The generic shaders (docs/renderer.md, "The generic shaders"): with
+    // library stand-ins, a draw whose pipeline and exact stand-in are not
+    // made yet is drawn by a pipeline linked from the libraries of an
+    // interpreter of the microcode (generic.glsl) that runs its shaders from
+    // a buffer; those libraries are few (by state, not by shader), made once
+    // on the workers and kept in the pipeline cache. XF_GENERIC_SHADERS=0
+    // turns it off.
+    bool generic_shaders = true;
+    // Every draw the generic shaders can draw drawn by them, as whole
+    // pipelines made at once (xfreplay --generic): to check what they draw
+    // against the translated shaders' pictures
+    bool generic_only = false;
     // Every draw drawn by a pipeline linked from libraries, made at once,
     // never by the whole pipeline: to check that linked pipelines draw what
     // whole ones do (xfreplay --linked-pipelines); needs the device's

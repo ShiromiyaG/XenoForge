@@ -57,6 +57,7 @@ add_library(xenoforge STATIC
     src/xenos.cpp
     src/spirv.cpp
     src/shader_translator.cpp
+    src/shader_program.cpp
     src/shader_interpreter.cpp
     src/shader_container.cpp
     src/texture.cpp
@@ -176,6 +177,26 @@ xf_shader(resolve_image.comp resolve.comp -DIMAGE)
 xf_shader(resolve_image_ms.comp resolve.comp -DIMAGE -DMS)
 xf_shader(texture_load.comp texture_load.comp)
 xf_shader(texture_load_test.comp texture_load.comp -DPARAMS_BUFFER) # texture_gpu_test's
+# the generic shaders (docs/renderer.md, "The generic shaders"): the interpreter's stages and forms
+xf_shader(generic.vert generic.vert)
+xf_shader(generic_clip.vert generic.vert -DCLIP)
+xf_shader(generic_cull.vert generic.vert -DCULL)
+xf_shader(generic_extents.vert generic.vert -DEXTENTS)
+xf_shader(generic_extents_clip.vert generic.vert -DEXTENTS -DCLIP)
+xf_shader(generic_extents_cull.vert generic.vert -DEXTENTS -DCULL)
+xf_shader(generic.frag generic.frag)
+xf_shader(generic_depth.frag generic.frag -DWRITES_DEPTH)
+xf_shader(generic_points.frag generic.frag -DPOINT_COORDINATES)
+xf_shader(generic_points_depth.frag generic.frag -DPOINT_COORDINATES -DWRITES_DEPTH)
+xf_shader(generic_fsi.frag generic.frag -DFSI=1)
+xf_shader(generic_fsi_depth.frag generic.frag -DFSI=1 -DWRITES_DEPTH)
+xf_shader(generic_fsi_points.frag generic.frag -DFSI=1 -DPOINT_COORDINATES)
+xf_shader(generic_fsi_points_depth.frag generic.frag -DFSI=1 -DPOINT_COORDINATES -DWRITES_DEPTH)
+xf_shader(generic_fsi_sample.frag generic.frag -DFSI=2)
+xf_shader(generic_fsi_sample_depth.frag generic.frag -DFSI=2 -DWRITES_DEPTH)
+xf_shader(generic_fsi_sample_points.frag generic.frag -DFSI=2 -DPOINT_COORDINATES)
+xf_shader(generic_fsi_sample_points_depth.frag generic.frag -DFSI=2 -DPOINT_COORDINATES -DWRITES_DEPTH)
+xf_shader(generic.comp generic.comp) # shader_compare_test's
 add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/native_render.cpp src/replay.cpp src/shader_step.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SPIRV_DIR})
 target_link_libraries(xenoforge_vk PUBLIC xenoforge xf_volk)
@@ -761,6 +782,8 @@ target_compile_definitions(ppc_fuzz_test PRIVATE XF_FUZZ_CASES="${XF_FUZZ_OUT}/c
 target_link_libraries(ppc_fuzz_test PRIVATE xenoforge)
 add_test(NAME ppc_fuzz COMMAND ppc_fuzz_test)
 add_executable(shader_compare_test tests/shader_compare_test.cpp)
+target_include_directories(shader_compare_test PRIVATE ${XF_SPIRV_DIR})
+target_sources(shader_compare_test PRIVATE ${XF_SPIRV_DIR}/generic.comp.inc)
 target_link_libraries(shader_compare_test PRIVATE xenoforge_vk)
 add_test(NAME shader_compare COMMAND shader_compare_test)
 # the renderer against Xenia's pictures, where XF_TRACES and XF_DUMPS say
