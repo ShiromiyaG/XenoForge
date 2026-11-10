@@ -53,6 +53,7 @@
 #include "xenoforge/shader_harness.h"
 #include "xenoforge/shader_interpreter.h"
 #include "xenoforge/shader_storage.h"
+#include "xenoforge/index_convert.h"
 #include "xenoforge/shader_program.h"
 #include "xenoforge/shader_translator.h"
 #include "xenoforge/texture.h"
@@ -8689,42 +8690,26 @@ void Impl::draw(const gpu::Draw &d) {
         // of the command thread, a push_back and every branch per index):
         // the guest's words in host order as the fetch's endianness says,
         // then the reset indices kept and the rest offset and clamped.
+        // (one pass, index_convert.h; read where guest memory holds them,
+        // copied first only when they wrap past its end)
         indices.resize(count);
-        uint32_t *out = indices.data();
-        if (index32) {
-            memory_.read(d.index_base, std::span<uint8_t>(reinterpret_cast<uint8_t *>(out), size_t(count) * 4));
-            switch (endian) {
-            case gpu::Endian::In16:
-                for (uint32_t i = 0; i < count; i++) out[i] = (out[i] << 8 & 0xFF00FF00) | (out[i] >> 8 & 0x00FF00FF);
-                break;
-            case gpu::Endian::In32:
-                for (uint32_t i = 0; i < count; i++) out[i] = __builtin_bswap32(out[i]);
-                break;
-            case gpu::Endian::Half:
-                for (uint32_t i = 0; i < count; i++) out[i] = out[i] >> 16 | out[i] << 16;
-                break;
-            default: break;
-            }
-        } else {
+        IndexConversion conversion;
+        conversion.index32 = index32;
+        conversion.endian = uint32_t(endian);
+        conversion.restart = restart;
+        conversion.reset = index32 ? reset_index : reset_index & 0xFFFF;
+        conversion.remap = !factors;
+        conversion.offset = offset, conversion.min = min_index, conversion.max = max_index;
+        const size_t bytes = size_t(count) * size;
+        const uint32_t base = d.index_base & GuestMemory::PHYSICAL_MASK;
+        const uint8_t *in = memory_.data() + base;
+        if (base + bytes > GuestMemory::SIZE) {
             std::vector<uint8_t> &raw_indices = draw_lists_.raw_indices;
-            raw_indices.resize(size_t(count) * 2);
+            raw_indices.resize(bytes);
             memory_.read(d.index_base, raw_indices);
-            const uint8_t *in = raw_indices.data();
-            if (endian == gpu::Endian::In16)
-                for (uint32_t i = 0; i < count; i++) out[i] = uint32_t(in[2 * i]) << 8 | in[2 * i + 1];
-            else
-                for (uint32_t i = 0; i < count; i++) out[i] = uint32_t(in[2 * i]) | uint32_t(in[2 * i + 1]) << 8;
+            in = raw_indices.data();
         }
-        const uint32_t reset = index32 ? reset_index : reset_index & 0xFFFF;
-        if (factors) {
-            if (restart)
-                for (uint32_t i = 0; i < count; i++)
-                    if (out[i] == reset) out[i] = UINT32_MAX;
-        } else if (restart) {
-            for (uint32_t i = 0; i < count; i++) out[i] = out[i] == reset ? UINT32_MAX : remap(out[i]);
-        } else {
-            for (uint32_t i = 0; i < count; i++) out[i] = remap(out[i]);
-        }
+        convert_indices(in, indices.data(), count, conversion);
     } else {
         indices.resize(count);
         uint32_t *out = indices.data();
