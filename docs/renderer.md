@@ -3765,6 +3765,20 @@ corpus do; our two paths agree there (103 pixels).
 paths; 5600 and 6400 on the exact path alone (their pictures are in
 `dumps/rov/d3d12` only: Xenia's host picture has the opaque overlay).
 
+**On by default (2026-11-09, the owner's call: on if the cost is small).**
+`Options::xenos_sample_positions` is now on where the device places 2x and
+4x samples. Its cost on game D's drive frame, host path, five replays of
+each interleaved: 5.25-5.28 ms of GPU a play off, 5.36-5.39 on (a fiftieth
+more: the depth settled before it is read); the command processor's time
+a play the same within the runs' spread (18.2-19.0 ms fastest either way).
+Live, the drive's GPU time was 5.75-5.76 ms a frame off and 5.80-5.94 on;
+those runs' frames and CPU are not to be read (the machine was in use).
+Xenia's host picture of the drive frame in the corpus is now its dump with
+`--xenos_sample_positions=true` (ours 0.092, 0.000% off it; the dump at
+its default is kept in `dumps/d3d12_standard_positions`); the other 30
+host frames compare as before. `XF_XENOS_SAMPLE_POSITIONS=0` and
+`xfreplay --no-xenos-sample-positions` give the host's standard positions.
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that

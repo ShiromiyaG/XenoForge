@@ -118,6 +118,9 @@ int main(int argc, char **argv) {
         // Xenia's xenos_sample_positions
         else if (a == "--xenos-sample-positions")
             options.xenos_sample_positions = true;
+        // (the default; this turns it off: the host's standard positions)
+        else if (a == "--no-xenos-sample-positions")
+            options.xenos_sample_positions = false;
         // Xenia's gamma_render_target_as_unorm16 off
         else if (a == "--no-gamma-unorm16")
             options.gamma_render_target_as_unorm16 = false;

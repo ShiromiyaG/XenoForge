@@ -2995,7 +2995,7 @@ bool Impl::init(std::string &error) {
         d24s8_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
     if (const char *e = std::getenv("XF_DEPTH_BIAS_FLOAT_UNITS")) depth_bias_float_units_ = e[0] && e[0] != '0';
     // Host render targets at the Xenos's sample positions (Xenia's
-    // xenos_sample_positions, off by default there and here): needs
+    // xenos_sample_positions, off by default there, on here): needs
     // VK_EXT_sample_locations for both 2x and 4x
     {
         const char *e = std::getenv("XF_XENOS_SAMPLE_POSITIONS");
@@ -8755,7 +8755,7 @@ void Impl::draw(const gpu::Draw &d) {
     // device places samples (VK_EXT_sample_locations), as Xenia's interlock
     // paths always do; host render targets do with
     // Options::xenos_sample_positions (Xenia's option of that name, off by
-    // default there and here): xenos_sample_locations.
+    // default there, on here): xenos_sample_locations.
     VkSampleLocationEXT sample_positions[4];
     VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
         VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};

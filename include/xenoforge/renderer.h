@@ -300,9 +300,11 @@ struct Options {
     // (VK_EXT_sample_locations): edges, alpha to coverage and
     // the depth a resolve takes from a sample then lie where the console's
     // do, as on the interlock path, which always takes them (Xenia's
-    // xenos_sample_positions, off by default as there; XF_XENOS_SAMPLE_POSITIONS=1
-    // or 0 overrides)
-    bool xenos_sample_positions = false;
+    // xenos_sample_positions, off by default there; on here since 2026-11-09:
+    // the host path's edges come within a few pixels of the exact path's
+    // for a fiftieth more GPU time; XF_XENOS_SAMPLE_POSITIONS=1 or 0
+    // overrides)
+    bool xenos_sample_positions = true;
     // The depth of draws into a D24FS8 target with the depth test on written
     // by the pixel shader rounded to 20e4 (towards zero, or to the nearest
     // even with depth_float24_round), so the host's depth holds only what
