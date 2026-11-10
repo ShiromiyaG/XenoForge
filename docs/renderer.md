@@ -3524,12 +3524,36 @@ destination", which the host turned into the source's alpha: the route drawn
 on the map came out opaque white, in Xenia's host picture too. With factors
 of zero and one on targets that hold no negative values (unorm and 7e3) the
 console's result is a copy of one side or zero, which `host_blend_control`
-gives the host as an addition. Other factors would have to be multiplied in
-by the pixel shader (Xenia's Direct3D 12 pipelines do that for the source's
-alpha against a destination factor of one; not done here): they stay the
-host's, counted ("minimum and maximum blending with factors"). Swap 5600
-against our exact picture: 3,105 pixels off before, 1,749 after; it now
-differs from Xenia's host picture there (0.004% to 0.151%).
+gives the host as an addition. Swap 5600 against our exact picture: 3,105
+pixels off before, 1,749 after; it now differs from Xenia's host picture
+there (0.004% to 0.151%).
+
+Other source factors are multiplied in by the pixel shader where they depend
+on the source and the blend constant alone (zero, one, the source's color
+and alpha, the constant's, and one minus those), against a destination
+factor of zero or one: `shader::PixelOptions::blend_premultiply`, a form of
+the pixel shader keyed in the pipeline (bit 3 of its key), which reads per
+color target a word of the system constants (the color's and the alpha's
+factor, whether each is fixed-point) and the blend constant, and writes the
+source times its factor with the interlock path's arithmetic (edram_fsi.frag:
+the source and the constant clamped for a fixed-point target, zero without a
+product, the product clamped again). The host then blends with factors of
+one; against a destination factor of zero the shader takes the minimum or
+maximum with zero itself and the host adds nothing, which holds for targets
+with negative values too. Xenia's Direct3D 12 pipelines do this for the
+source's alpha against a destination factor of one alone. Still the host's,
+counted ("minimum and maximum blending with factors (the host ignores
+them)"): a factor that needs the destination on either side (the
+destination's color or alpha, the saturated source alpha), a destination
+factor other than zero and one, 16_16 and 16_16_16_16 targets (kept scaled
+on the host), a draw without a pixel shader, and an alpha multiplied in
+while the color's own blend reads the source's alpha (the shader writes one
+alpha). No frame of the corpus has such factors (the drive's overlay has
+zero and one alone), so `blend_minmax_test` draws them from packets: 16
+blend controls over an 8_8_8_8 target, each cell's color and alpha checked
+against the console's arithmetic on both paths, and the host's picture
+against the interlock path's (within 1 of 255; without the shader's form the
+same test is off by up to 204).
 
 **The Xenos's sample positions on host targets** (both hosts differ from the
 exact paths). What was left of the drive's differences lay along edges: the
@@ -3551,20 +3575,63 @@ drive's frames are the exact path's:
 | 6400 (driving, with the map) | 0.214, 2,281 | 0.113, 889 | 0.043, 9 |
 
 (mean difference of 255 and pixels off by more than 16; 5600 and 6400 were
-first drawn with the polygon offsets already fixed). 2x targets are left at
-the host's positions: with the console's, game G's title drew stray colors
-over its alpha to coverage surfaces (70,000 pixels off), not understood yet,
-which is also why the option stays off. Not done with it: the viewport's
-sample offset at a resolution scale above one (draw_util.cc's
+first drawn with the polygon offsets already fixed). Not done with it: the
+viewport's sample offset at a resolution scale above one (draw_util.cc's
 `GetHostViewportInfo`).
 
+**2x targets, and depth read at the wrong positions.** The option first
+covered 4x targets alone: with 2x ones at the console's positions game G's
+title drew stray colors over whole surfaces (51,000 to 70,000 pixels off).
+The mapping was right all along (native 2x: host samples 1 and 0 for the
+guest's 0 and 1, in the pipelines, the alpha to coverage mask, the resolves
+and the transfers alike). The cause is how the device keeps multisampled
+depth: as planes per block of pixels, the samples worked out when the image
+is read, and a shader reading the image as a texture gets them worked out at
+the device's standard positions unless the image went through a layout
+transition that names its sample locations (what
+`VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT` asks for; our
+images stay in the general layout, so no transition ever said). That frame
+draws its scene into a 2x D24FS8 target, clears the stencil with a rectangle
+over the same EDRAM as a 4x target of half the width, and draws the scene
+again testing for equal depth: the depth goes out to the 4x image and back
+through two EDRAM transfers, which read it as a texture, a part of a pixel
+off wherever a surface slopes, and the equal test then failed there, leaving
+the first pass's colors under another format. (It did not show at the
+standard positions, where both readings agree, nor with
+`depth_float24_convert_in_pixel_shader`, where the shader writes every
+sample's depth and nothing is kept as planes; 4x targets have the same
+fault, unseen in the drive, which has no such pass.) Fixed in
+`Impl::settle_depth_samples`: before an EDRAM store, a transfer or a resolve
+reads a multisampled depth image rasterized at the console's positions, the
+image goes to the depth attachment layout and back with
+`VkSampleLocationsInfoEXT` on both barriers, once after it was last an
+attachment. Game G's title, host against exact: 18,009 pixels at the host's
+positions, 51,700 at the console's before the fix, 167 after (against
+Xenia's ROV picture: 19,307, then 1,541; our exact path is 1,377 from it).
+The drive: 1, 37 and 9 pixels (5000, 5600, 6400).
+
+**Whether it should be on.** It is still off by default, as Xenia's: the
+pictures `replay_test` compares the host path with are Xenia's host ones,
+made at Direct3D's positions. With it on (`XF_XENOS_SAMPLE_POSITIONS=1`),
+30 of `replay_test`'s 31 host frames compare exactly as before (most have no
+multisampled edge in the picture) and one fails: the drive's swap 5000 goes
+from 0.092 and no pixel off by more than 16 to 0.219 and 0.194% (about
+1,790 pixels) against Xenia's host picture, while against the exact pictures it
+goes the other way (ours: 1,792 pixels to 1; Xenia's ROV: 0.261 and 0.195%
+to 0.148 and none). Game G's title over its scene, which is not in the
+corpus, moves the same way: 1,411 pixels from Xenia's host picture without
+it and 19,240 with it, 19,307 from Xenia's ROV picture without it and 1,541
+with it. So turning it on by default means comparing the host path's
+multisampled frames with Xenia's exact pictures, or with host pictures made
+with Xenia's own option on.
+
 **Left as they are**, both hosts alike, the exact path right:
-- 2x MSAA edges (game G's title: 18,009 pixels against our exact picture),
-  the 2x sample positions above;
+- MSAA edges without `xenos_sample_positions` (game G's title: 18,009
+  pixels against our exact picture; 167 with it);
 - colors above 31.875 and alpha of more than 2 bits in 2_10_10_10_FLOAT
   targets kept as RGBA16F (not seen to matter in these frames);
 - D24FS8 depth as a 32-bit float (resolved depth differs in its low bits);
-- minimum and maximum blending with other factors.
+- minimum and maximum blending with factors that need the destination.
 Game A's race differs from Xenia's Direct3D 12 picture (0.133, 0.207%: a
 poster on a wall) on both of our paths alike, as its older frames in the
 corpus do; our two paths agree there (103 pixels).

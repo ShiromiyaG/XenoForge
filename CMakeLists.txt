@@ -781,6 +781,10 @@ add_test(NAME reference_units COMMAND reference_units_test)
 add_executable(primitives_test tests/primitives_test.cpp)
 target_link_libraries(primitives_test PRIVATE xenoforge_vk stb)
 add_test(NAME primitives COMMAND primitives_test)
+# minimum and maximum blending with factors, on host render targets and the interlock path
+add_executable(blend_minmax_test tests/blend_minmax_test.cpp)
+target_link_libraries(blend_minmax_test PRIVATE xenoforge_vk)
+add_test(NAME blend_minmax COMMAND blend_minmax_test)
 
 # the SDK package without a game: installed to a temporary prefix, the example port configured and built against it
 # (tests/sdk_test.cmake)

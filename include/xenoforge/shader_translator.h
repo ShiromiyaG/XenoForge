@@ -156,11 +156,18 @@ struct PixelOptions {
     // and the coverage output are left out. Ignored for a shader that does any
     // of those, with a float24 conversion and on the interlock path.
     bool early_depth_stencil = false;
+    // Host render targets: the source of a minimum or maximum blend times its
+    // blend factor, which the console applies and the host's blending
+    // ignores, where the factor depends on the source and the blend constant
+    // alone; per color target as the system constants say (the renderer's
+    // host_blend_control). Not on the interlock path, which blends itself.
+    bool blend_premultiply = false;
     bool texture_point_snap = false; // VertexOptions::texture_point_snap's; not part of the key
     std::span<const uint32_t> edram_library; // with fsi; not part of the key
     uint32_t key() const {
-        // (depth_float24 is 0-2: bit 2 is free)
-        return depth_float24 | uint32_t(early_depth_stencil) << 2 | uint32_t(centroid) << 8 | uint32_t(fsi) << 24 |
+        // (depth_float24 is 0-2; bits 4-7 are free)
+        return depth_float24 | uint32_t(early_depth_stencil) << 2 | uint32_t(blend_premultiply) << 3 |
+               uint32_t(centroid) << 8 | uint32_t(fsi) << 24 |
                uint32_t(point_coordinates) << 30;
     }
 };

@@ -378,11 +378,14 @@ void Translator::declare() {
         // screen extents' map from the host's NDC to console pixels (x scale
         // and offset, y scale and offset) and the report's first word
         // (VertexOptions::extents), then per fetch slot its texture's integer
-        // scale word (texture::integer_scale_bits, Xenia's GetIntegerScaleBits)
+        // scale word (texture::integer_scale_bits, Xenia's GetIntegerScaleBits),
+        // then per color target the factors a minimum or maximum blend's
+        // source is multiplied by here (PixelOptions::blend_premultiply) and
+        // the blend constant
         Id slot_table = m_.type_array(uvec4_, 8, 16);
         const Id system_members[] = {vec4_, vec4_, slot_table, uvec4_,     vec4_,
                                      vec4_, vec4_, slot_table, slot_table, m_.type_array(vec4_, 6, 16),
-                                     vec4_, uvec4_, slot_table};
+                                     vec4_, uvec4_, slot_table, uvec4_, vec4_};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
@@ -398,6 +401,8 @@ void Translator::declare() {
         m_.member_decorate(system_block, 10, spv::Decoration::Offset, {576});
         m_.member_decorate(system_block, 11, spv::Decoration::Offset, {592});
         m_.member_decorate(system_block, 12, spv::Decoration::Offset, {608});
+        m_.member_decorate(system_block, 13, spv::Decoration::Offset, {736});
+        m_.member_decorate(system_block, 14, spv::Decoration::Offset, {752});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -2916,6 +2921,66 @@ void Translator::main_pixel() {
                     if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
                         for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
                             if (r->target == StorageTarget::Color) written |= 1u << (r->index & 3);
+        // PixelOptions::blend_premultiply: the console applies the blend
+        // factors before a minimum or maximum, the host's blending does not,
+        // so a source factor that depends on the source and the blend
+        // constant alone is multiplied in here, with the interlock path's
+        // arithmetic (edram_fsi.frag's color_factor and alpha_factor: the
+        // source and the constant clamped to 0-1 and NaN to 0 for a fixed-point
+        // target, a factor of zero giving zero without a product, the product
+        // clamped again), and against a destination factor of zero the
+        // minimum or maximum with zero is taken here too. System member 13,
+        // per target: the color's factor in bits 0-4 (RB_BLENDCONTROL's
+        // numbers), then in 5-6 the minimum (1) or maximum (2) with zero, 7
+        // the color is done here; the alpha's the same in bits 8-15; bit 16
+        // the color is fixed-point, 17 the alpha. Member 14: the blend constant.
+        Id premultiply_words = 0, premultiply_constant = 0;
+        if (pixel_.blend_premultiply) {
+            Id ptr_u_uvec4 = m_.type_pointer(spv::StorageClass::Uniform, uvec4_);
+            premultiply_words = load(uvec4_, m_.op(Op::OpAccessChain, ptr_u_uvec4, {system_, u(13)}));
+            premultiply_constant = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(14)}));
+        }
+        auto premultiplied = [&](Id color, uint32_t k) {
+            Id word = m_.op(Op::OpCompositeExtract, uint_, {premultiply_words, k});
+            auto bit = [&](uint32_t n) {
+                return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {word, u(1u << n)}), u(0)});
+            };
+            auto fixed = [&](Id v, Id is_fixed) {
+                Id flushed = select(float_, m_.op(Op::OpIsNan, bool_, {v}), f(0), v);
+                Id clamped = glsl(GLSLstd450FClamp, float_, {flushed, f(0), f(1)});
+                return select(float_, is_fixed, clamped, v);
+            };
+            Id fixed_color = bit(16), fixed_alpha = bit(17);
+            Id source[4], constant[4];
+            for (uint32_t j = 0; j < 4; j++) {
+                source[j] = fixed(comp(color, j), j < 3 ? fixed_color : fixed_alpha);
+                constant[j] = fixed(comp(premultiply_constant, j), j < 3 ? fixed_color : fixed_alpha);
+            }
+            auto half = [&](uint32_t j, uint32_t shift) {
+                Id factor = m_.op(Op::OpBitFieldUExtract, uint_, {word, u(shift), u(5)});
+                Id zero_op = m_.op(Op::OpBitFieldUExtract, uint_, {word, u(shift + 5), u(2)});
+                auto is = [&](uint32_t n) { return m_.op(Op::OpIEqual, bool_, {factor, u(n)}); };
+                auto one_minus = [&](Id v) { return exact(Op::OpFSub, float_, {f(1), v}); };
+                // (the alpha's color factors are its alpha ones: source[3] and constant[3] are its own)
+                Id by = f(1);
+                by = select(float_, is(4), source[j], by);
+                by = select(float_, is(5), one_minus(source[j]), by);
+                by = select(float_, is(6), source[3], by);
+                by = select(float_, is(7), one_minus(source[3]), by);
+                by = select(float_, is(12), constant[j], by);
+                by = select(float_, is(13), one_minus(constant[j]), by);
+                by = select(float_, is(14), constant[3], by);
+                by = select(float_, is(15), one_minus(constant[3]), by);
+                Id r = fixed(exact(Op::OpFMul, float_, {source[j], by}), j < 3 ? fixed_color : fixed_alpha);
+                r = select(float_, is(0), f(0), r);
+                r = select(float_, m_.op(Op::OpIEqual, bool_, {zero_op, u(1)}), glsl(GLSLstd450FMin, float_, {r, f(0)}),
+                           select(float_, m_.op(Op::OpIEqual, bool_, {zero_op, u(2)}),
+                                  glsl(GLSLstd450FMax, float_, {r, f(0)}), r));
+                return select(float_, bit(shift + 7), r, comp(color, j));
+            };
+            Id red = half(0, 0), green = half(1, 0), blue = half(2, 0);
+            return vec4_of(red, green, blue, half(3, 8));
+        };
         for (uint32_t k = 0; k < 4; k++) {
             Id out = m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))});
             if (lean && !(written & (1u << k))) {
@@ -2924,6 +2989,7 @@ void Translator::main_pixel() {
             }
             Id color = load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))}));
             color = exact(Op::OpVectorTimesScalar, vec4_, {color, comp(scales, k)});
+            if (pixel_.blend_premultiply) color = premultiplied(color, k);
             Id gamma = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {gamma_flags, u(1u << k)}), u(0)});
             if (lean) {
                 store(out, color);

@@ -504,29 +504,69 @@ VkBlendOp blend_op(uint32_t o) {
 // before a minimum or maximum (Xenia's interlock paths do: "unlike Vulkan/D3D12
 // fixed-function blend which ignores factors for MIN/MAX, the Xbox 360 applies
 // blend factors before min/max", dxbc_shader_translator_om.cc); the host takes
-// the minimum or maximum of the source and the destination as they are. With
-// factors of zero and one the console's result is a plain copy, where values
-// are never negative (non_negative: the target's format): max(0, d) is d,
-// max(s, 0) is s, a minimum with zero is zero; those become additions the
-// host does. Both factors one need nothing. Any other factor would have to be
-// multiplied in by the pixel shader (Xenia's Direct3D 12 pipelines do it for
-// the source's alpha with a destination factor of one): left as the host
-// blends, and `ignored` set for the count.
-uint32_t host_blend_control(uint32_t blend, bool non_negative, bool &ignored) {
+// the minimum or maximum of the source and the destination as they are. Both
+// factors one need nothing. With factors of zero and one the console's result
+// is a plain copy, where values are never negative (the target's format):
+// max(0, d) is d, max(s, 0) is s, a minimum with zero is zero; those become
+// additions the host does. A source factor that depends on the source and the
+// blend constant alone, against a destination factor of zero or one, is
+// multiplied in by the pixel shader (shader::PixelOptions::blend_premultiply,
+// with `shader` set: the draw has a pixel shader on host render targets), which
+// also takes the minimum or maximum with zero for a destination factor of
+// zero; `premultiply` gets the target's word of the system constants then
+// (shader_translator.cpp), and the host blends the product with factors of
+// one. Xenia's Direct3D 12 pipelines do that for the source's alpha against a
+// destination factor of one alone. What is left as the host blends, `ignored`
+// set for the count: a factor that needs the destination (either side), a
+// destination factor other than zero and one, a 16-bit fixed-point target
+// (kept scaled on the host), and an alpha multiplied here while the color's
+// blend reads the source's alpha.
+uint32_t host_blend_control(uint32_t blend, uint32_t format, bool shader, uint32_t &premultiply, bool &ignored) {
+    const bool non_negative = format <= 3 || format == 10 || format == 12; // unorm and 7e3 targets
+    const bool scaled = format == 4 || format == 5;                        // 16_16 and 16_16_16_16
+    // (edram_fsi.frag's fixed_color and fixed_alpha)
+    const bool fixed_color = format <= 2 || format == 10, fixed_alpha = fixed_color || format == 3 || format == 12;
+    const uint32_t guest = blend;
+    premultiply = 0;
     for (uint32_t shift : {0u, 16u}) { // color, alpha
-        const uint32_t half = (blend >> shift) & 0x1FFF;
+        const uint32_t half = (guest >> shift) & 0x1FFF;
         const uint32_t source = half & 0x1F, op = (half >> 5) & 7, destination = (half >> 8) & 0x1F;
-        if (op != 2 && op != 3) continue;                // not MIN, MAX
+        if (op != 2 && op != 3) continue;              // not MIN, MAX
         if (source == 1 && destination == 1) continue; // the host's own
-        if (source > 1 || destination > 1 || !non_negative) {
-            ignored = true;
-            continue;
+        uint32_t replaced = 0;
+        if (source <= 1 && destination <= 1 && non_negative) {
+            // (ADD, with the factors that leave the console's result: ZERO, ADD, ZERO for a minimum)
+            if (op == 3) replaced = source | destination << 8;
+        } else {
+            // ZERO, ONE, the source's color and alpha, the constant's, and one minus those
+            const bool source_only = source <= 1 || (source >= 4 && source <= 7) || (source >= 12 && source <= 15);
+            if (!shader || scaled || !source_only || destination > 1) {
+                ignored = true;
+                continue;
+            }
+            uint32_t word = source | 0x80;
+            if (destination == 1) {
+                replaced = 1 | op << 5 | 1 << 8; // ONE, the minimum or maximum, ONE
+            } else {
+                word |= (op == 2 ? 1u : 2u) << 5; // with zero, in the shader
+                replaced = 1;                     // ONE, ADD, ZERO
+            }
+            premultiply |= word << (shift / 2);
         }
-        // (ADD, with the factors that leave the console's result)
-        uint32_t replaced = 0; // ZERO, ADD, ZERO
-        if (op == 3) replaced = source | destination << 8;
         blend = (blend & ~(0x1FFFu << shift)) | replaced << shift;
     }
+    if (premultiply & 0x8000) {
+        // the alpha the shader writes is no longer the source's: a color
+        // blend that reads it (SRC_ALPHA, ONE_MINUS_SRC_ALPHA, SRC_ALPHA_SATURATE) keeps the guest's alpha blend
+        const uint32_t color_source = blend & 0x1F, color_destination = (blend >> 8) & 0x1F;
+        auto reads_alpha = [](uint32_t factor) { return factor == 6 || factor == 7 || factor == 16; };
+        if (reads_alpha(color_source) || reads_alpha(color_destination)) {
+            blend = (blend & 0x0000FFFF) | (guest & 0xFFFF0000);
+            premultiply &= 0xFF;
+            ignored = true;
+        }
+    }
+    if (premultiply) premultiply |= (fixed_color ? 1u << 16 : 0u) | (fixed_alpha ? 1u << 17 : 0u);
     return blend;
 }
 
@@ -764,8 +804,13 @@ struct System {
     // per slot, how its result goes through the constant's number format
     // (texture::integer_scale_bits, Xenia's GetIntegerScaleBits)
     uint32_t integer_scale[32];
+    // per color target, the factors of a minimum or maximum blend the pixel
+    // shader multiplies its color by (host_blend_control,
+    // shader::PixelOptions::blend_premultiply), and the blend constant for them
+    uint32_t blend_premultiply[4];
+    float blend_constant[4];
 };
-static_assert(sizeof(System) == 736);
+static_assert(sizeof(System) == 768);
 
 // The snorm format of a unorm one's bits, where the host has one (a signed
 // view of the same image); undefined for the rest.
@@ -6406,6 +6451,7 @@ std::unique_ptr<PipelineDesc> Impl::undescribe(std::span<const uint32_t> words, 
                 shader::PixelOptions o;
                 o.depth_float24 = uint8_t(form & 3);
                 o.early_depth_stencil = (form >> 2) & 1;
+                o.blend_premultiply = (form >> 3) & 1;
                 o.centroid = uint16_t(form >> 8);
                 o.fsi = uint8_t((form >> 24) & 0x3F);
                 o.point_coordinates = (form >> 30) & 1;
@@ -7932,17 +7978,21 @@ void Impl::draw(const gpu::Draw &d) {
                 depth ? uint32_t(depth->image.format) : 0u, regs_[r::PA_CL_CLIP_CNTL] & (1u << 16), host_key});
     std::vector<uint32_t> &color_key = draw_lists_.color_key; // the targets' part of the key
     color_key.clear();
+    // (the factors of a minimum or maximum the pixel shader multiplies in: host_blend_control)
+    uint32_t premultiply[4] = {};
+    bool premultiplied = false;
     for (uint32_t i = 0; i < 4; i++) {
         if (!colors[i]) continue;
         color_formats[i] = colors[i]->image.format;
         // (the factors of a minimum or maximum, where the host can: host_blend_control)
         bool factors_ignored = false;
-        const uint32_t guest_format = colors[i]->format;
-        uint32_t blend = host_blend_control(
-            regs_[r::RB_BLENDCONTROL[i]],
-            guest_format <= 3 || guest_format == 10 || guest_format == 12, // unorm and 7e3 targets: never negative
-            factors_ignored);
+        uint32_t blend = host_blend_control(regs_[r::RB_BLENDCONTROL[i]], colors[i]->format,
+                                            ps && !fsi_ && !export_only, premultiply[i], factors_ignored);
         if (factors_ignored) approximate("minimum and maximum blending with factors (the host ignores them)");
+        if (premultiply[i]) {
+            premultiplied = true;
+            use("minimum and maximum blending with factors multiplied in by the pixel shader");
+        }
         VkPipelineColorBlendAttachmentState &b = blends[i];
         b.colorWriteMask = color_masks[i];
         b.srcColorBlendFactor = blend_factor(blend & 0x1F);
@@ -7960,6 +8010,10 @@ void Impl::draw(const gpu::Draw &d) {
             color_key.insert(color_key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
     }
     key.insert(key.end(), color_key.begin(), color_key.end());
+    if (premultiplied) {
+        std::copy(premultiply, premultiply + 4, sys.blend_premultiply);
+        std::memcpy(sys.blend_constant, &regs_[r::RB_BLEND_RED], 16);
+    }
     VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why);
     if (!guest_vs) return skip("vertex shader: " + why);
     // The pixel shader: the guest's, its float24 depth conversion form with
@@ -8024,10 +8078,11 @@ void Impl::draw(const gpu::Draw &d) {
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
             return;
         }
-    } else if (ps && (float24_convert || centroid || point_coordinates || early)) {
+    } else if (ps && (float24_convert || centroid || point_coordinates || early || premultiplied)) {
         shader::PixelOptions options;
         options.depth_float24 = uint8_t(float24_mode);
         options.early_depth_stencil = early;
+        options.blend_premultiply = premultiplied;
         options.centroid = uint16_t(centroid);
         options.point_coordinates = point_coordinates;
         fragment = pixel_module(*ps, options, why);
@@ -8056,7 +8111,7 @@ void Impl::draw(const gpu::Draw &d) {
         sample_shading = msaa && fragment && !ps;
     }
     key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) |
-                  (point_coordinates ? 16u : 0u) | (early ? 32u : 0u) | centroid << 16);
+                  (point_coordinates ? 16u : 0u) | (early ? 32u : 0u) | (premultiplied ? 64u : 0u) | centroid << 16);
     VkPipelineShaderStageCreateInfo stages[4] = {};
     uint32_t stage_count = 0;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
