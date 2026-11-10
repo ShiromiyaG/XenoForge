@@ -827,6 +827,9 @@ public:
         pages_ = 0x20000000u >> shift_;
         stamps_ = std::make_unique<std::atomic<uint32_t>[]>(pages_);
         for (uint32_t p = 0; p < pages_; p++) stamps_[p].store(0, std::memory_order_relaxed);
+        const uint32_t blocks = (pages_ + (1u << Memory::WRITE_BLOCK_SHIFT) - 1) >> Memory::WRITE_BLOCK_SHIFT;
+        block_stamps_ = std::make_unique<std::atomic<uint32_t>[]>(blocks);
+        for (uint32_t b = 0; b < blocks; b++) block_stamps_[b].store(0, std::memory_order_relaxed);
         uint32_t words = (pages_ + 63) / 64;
         watched_.assign(words, 0);
         for (auto &bits : protected_) bits.assign(words, 0);
@@ -835,6 +838,7 @@ public:
     uint32_t shift() const { return shift_; }
     uint32_t count() const { return count_.load(std::memory_order_acquire); }
     const std::atomic<uint32_t> *stamps() const { return stamps_.get(); }
+    const std::atomic<uint32_t> *block_stamps() const { return block_stamps_.get(); }
 
     // EnableAccessCallbacks for invalidation notifications: each page not
     // watched yet made read-only in the windows where the guest may write it
@@ -904,6 +908,10 @@ public:
         }
         uint32_t stamp = count_.load(std::memory_order_relaxed) + 1;
         for (uint32_t p = first; p <= last; p++) stamps_[p].store(stamp, std::memory_order_release);
+        // (the blocks' after their pages', so a block at or below a count has
+        // every page of it at or below it)
+        for (uint32_t b = first >> Memory::WRITE_BLOCK_SHIFT; b <= last >> Memory::WRITE_BLOCK_SHIFT; b++)
+            block_stamps_[b].store(stamp, std::memory_order_release);
         count_.store(stamp, std::memory_order_release);
         counts_.written += last - first + 1;
         for (size_t w = 0; w < windows_.size(); w++) {
@@ -999,6 +1007,7 @@ private:
     std::array<PhysicalHeap *, 4> windows_{};
     uint32_t shift_ = 12, pages_ = 0;
     std::unique_ptr<std::atomic<uint32_t>[]> stamps_;
+    std::unique_ptr<std::atomic<uint32_t>[]> block_stamps_; // the largest of each block's pages'
     std::atomic<uint32_t> count_{1};
     std::vector<uint64_t> watched_;                 // by physical page: protected in some window
     std::array<std::vector<uint64_t>, 4> protected_; // by window and physical page: made read-only here
@@ -1214,6 +1223,7 @@ public:
     uint32_t watch_page_shift() const override { return watches_.shift(); }
     uint32_t write_count() const override { return watches_.count(); }
     const std::atomic<uint32_t> *write_stamps() const override { return watches_.stamps(); }
+    const std::atomic<uint32_t> *write_block_stamps() const override { return watches_.block_stamps(); }
     void watch(uint32_t physical, uint32_t length) override {
         // the fault handler, the first time anything is watched: added then,
         // it comes before the handlers added at the game's launch

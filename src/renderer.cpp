@@ -1369,7 +1369,7 @@ public:
     Impl(vk::Device &device, gpu::CommandProcessor &processor, const Options &options)
         : d_(device), dev_(device.device()), processor_(processor), options_(options),
           memory_(processor.memory().translate_physical(0)), mem_(processor.memory()),
-          stamps_(mem_.write_stamps()), page_shift_(mem_.watch_page_shift()),
+          stamps_(mem_.write_stamps()), block_stamps_(mem_.write_block_stamps()), page_shift_(mem_.watch_page_shift()),
           mirror_at_(GuestMemory::SIZE >> page_shift_, 0),
           gpu_pages_(std::make_unique<std::atomic<uint64_t>[]>(((GuestMemory::SIZE >> page_shift_) + 63) / 64)) {
         for (size_t i = 0; i < ((GuestMemory::SIZE >> page_shift_) + 63) / 64; i++) gpu_pages_[i].store(0);
@@ -1412,10 +1412,8 @@ public:
         if (it != shaders_at_.end()) {
             bool same = it->second.checked == count;
             if (!same) {
-                same = true;
-                for (uint32_t p = address >> page_shift_, last = (address + dwords * 4 - 1) >> page_shift_; p <= last;
-                     p++)
-                    if (stamps_[p].load(std::memory_order_acquire) > it->second.checked) same = false;
+                same = pages_unwritten(address >> page_shift_, (address + dwords * 4 - 1) >> page_shift_,
+                                       it->second.checked);
             }
             if (same && it->second.shader) {
                 it->second.checked = count;
@@ -2520,7 +2518,21 @@ private:
     const gpu::RegisterFile *file_ = nullptr; // the same, for what changed in it (RegisterFile's stamps)
     GuestMemory memory_;             // the processor's physical memory
     Memory &mem_;                    // the same memory, with its write watches
-    const std::atomic<uint32_t> *stamps_ = nullptr;
+    const std::atomic<uint32_t> *stamps_ = nullptr, *block_stamps_ = nullptr;
+    // whether no page of [first, last] was written above since: by blocks
+    // of pages first (memory.h's write_block_stamps), the pages of a block only
+    // where the block was
+    bool pages_unwritten(uint32_t first, uint32_t last, uint32_t since) const {
+        constexpr uint32_t shift = Memory::WRITE_BLOCK_SHIFT;
+        for (uint32_t p = first; p <= last;) {
+            const uint32_t block = p >> shift, block_end = std::min(last, ((block + 1) << shift) - 1);
+            if (block_stamps_[block].load(std::memory_order_acquire) > since)
+                for (uint32_t q = p; q <= block_end; q++)
+                    if (stamps_[q].load(std::memory_order_acquire) > since) return false;
+            p = block_end + 1;
+        }
+        return true;
+    }
     uint32_t page_shift_ = 12; // the watch pages'
     std::vector<uint32_t> mirror_at_;
     std::unique_ptr<std::atomic<uint64_t>[]> gpu_pages_;
@@ -4450,8 +4462,7 @@ bool Impl::unwritten(Texture &t) {
     if (count == t.checked) return true;
     for (const Range &r : t.ranges) {
         if (r.second <= r.first) continue;
-        for (uint32_t p = first_page(r); p <= last_page(r); p++)
-            if (stamps_[p].load(std::memory_order_acquire) > t.checked) return false;
+        if (!pages_unwritten(first_page(r), last_page(r), t.checked)) return false;
     }
     t.checked = count;
     return true;

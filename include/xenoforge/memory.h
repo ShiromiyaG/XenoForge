@@ -129,6 +129,11 @@ public:
     // each watch page's: the number of the last write seen to it (0: none
     // since the start); 0x20000000 >> watch_page_shift() of them
     virtual const std::atomic<uint32_t> *write_stamps() const = 0;
+    // and per block of 1 << WRITE_BLOCK_SHIFT watch pages, the largest of
+    // its pages' (stored after them): a block at or below a count has no page
+    // above it, so a check of a range skips the blocks nothing wrote
+    static constexpr uint32_t WRITE_BLOCK_SHIFT = 6;
+    virtual const std::atomic<uint32_t> *write_block_stamps() const = 0;
     // Watches the pages of [physical, physical + length). Pages the guest
     // cannot write anywhere stay unwatched: making them writable (the heaps'
     // protect, alloc, decommit and release) numbers them as written.
