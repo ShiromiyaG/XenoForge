@@ -85,6 +85,11 @@ struct Report {
     double resolve_seconds = 0;                  //   recording resolves (their waits counted in submit_seconds too)
     double writeback_seconds = 0;                //   copying what resolves wrote into guest memory, once done
     double pipeline_seconds = 0;                 //   making pipelines (the driver compiling the shaders)
+    // translating shaders to SPIR-V and making their modules on the
+    // renderer's thread (a shader's first form and its other forms), the
+    // modules so made, the longest one, and the most in one frame
+    double translate_seconds = 0, translate_max = 0, translate_frame_max = 0;
+    uint64_t translations = 0;
     uint64_t pipeline_cache_read = 0;            // bytes of pipeline cache read from disk at the start
     uint64_t pipeline_cache_written = 0;         // bytes of it written back, the last time
     uint64_t vertex_bytes = 0;                   // the vertex data uploaded (the pages that differed)
@@ -425,6 +430,13 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
 struct PrecompileOptions {
     bool whole_pipelines = true;                 // besides the libraries
     std::vector<std::pair<uint32_t, std::vector<uint32_t>>> extra_shaders; // type (0 vertex, 1 pixel), microcode
+    // The extra shaders that no run met have no pipeline's description, so
+    // no state of their own: each is made into the library of its shader's
+    // part (the pre-rasterization shaders' for a vertex shader, the fragment
+    // shader's for a pixel shader) in the states the storage's descriptions
+    // give that part most often, this many of them, its form and fixed state
+    // as theirs with the shader replaced. 0: none.
+    uint32_t extra_variants = 4;
     std::function<void(uint64_t done, uint64_t total)> progress;
     const std::atomic<bool> *cancel = nullptr;
 };
@@ -441,6 +453,19 @@ struct PrecompileReport {
     uint64_t extra_undeclared = 0;
     uint64_t descriptions = 0, descriptions_failed = 0, descriptions_done_before = 0;
     uint64_t libraries = 0, libraries_failed = 0, pipelines = 0, pipelines_failed = 0;
+    // PrecompileOptions::extra_variants: the states taken for them (of the
+    // distinct ones the descriptions give the vertex and the pixel shaders'
+    // parts), and of the libraries counted above those of extra shaders, made
+    // and failed; variants not made here (the form cannot be made for that
+    // shader) and those made before
+    uint64_t variant_states = 0, variant_states_seen = 0;
+    // the check of those states: of the libraries runs made of the extra
+    // shaders they did meet, how many lie in the states taken (a guess of how
+    // many of an unmet shader's the step makes ahead; those shaders weigh in
+    // the choice of the states too)
+    uint64_t variant_check_libraries = 0, variant_check_covered = 0;
+    uint64_t extra_libraries = 0, extra_libraries_failed = 0, extra_libraries_unmade = 0,
+             extra_libraries_done_before = 0;
     double seconds = 0, driver_seconds = 0; // in all; the workers' time making them
 };
 bool precompile(vk::Device &device, const Options &options, const PrecompileOptions &precompile,

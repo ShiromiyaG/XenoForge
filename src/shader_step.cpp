@@ -63,7 +63,7 @@ std::string step_key(const build::ShaderStep &step, const fs::path &storage, con
                      const vk::Device &device) {
     const std::string program = program_stamp(), stored = file_stamp(storage);
     if (program.empty() || stored.empty()) return {};
-    uint64_t key = mix(0xCBF29CE484222325ull, "xf shader step 1");
+    uint64_t key = mix(0xCBF29CE484222325ull, "xf shader step 2");
     key = mix(key, program);
     key = mix(key, stored);
     key = mix(key, file_stamp(cache));
@@ -72,6 +72,7 @@ std::string step_key(const build::ShaderStep &step, const fs::path &storage, con
     key = mix(key, std::to_string(p.vendorID) + ":" + std::to_string(p.deviceID) + ":" +
                        std::to_string(p.driverVersion));
     key = mix(key, std::string_view(reinterpret_cast<const char *>(p.pipelineCacheUUID), VK_UUID_SIZE));
+    key = mix(key, std::to_string(step.disc_variants));
     key = mix(key, std::to_string(step.disc_shaders.size()));
     for (const auto &[type, code] : step.disc_shaders) {
         const uint64_t h = ShaderStorage::hash(type, code);
@@ -132,6 +133,7 @@ std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
     PrecompileOptions precompile_options;
     precompile_options.extra_shaders = step.disc_shaders;
     precompile_options.cancel = step.cancel;
+    precompile_options.extra_variants = step.disc_variants;
     PrecompileReport r;
     const bool ok = precompile(*device, options, precompile_options, r, error);
     std::snprintf(line, sizeof(line), "device: %s; pipeline cache %s (%.1f KB read, %.1f KB written)",
@@ -155,6 +157,21 @@ std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
                   (unsigned long long)r.libraries_failed, (unsigned long long)r.pipelines,
                   (unsigned long long)r.pipelines_failed, r.seconds, r.driver_seconds);
     lines.push_back(line);
+    if (r.variant_states_seen) {
+        std::snprintf(line, sizeof(line),
+                      "the disc's shaders not met in runs: in the %llu commonest of %llu states their parts take, "
+                      "%llu libraries made (%llu failed, %llu made before, %llu forms not made for the shader)",
+                      (unsigned long long)r.variant_states, (unsigned long long)r.variant_states_seen,
+                      (unsigned long long)r.extra_libraries, (unsigned long long)r.extra_libraries_failed,
+                      (unsigned long long)r.extra_libraries_done_before, (unsigned long long)r.extra_libraries_unmade);
+        lines.push_back(line);
+        if (r.variant_check_libraries) {
+            std::snprintf(line, sizeof(line),
+                          "  checked on the disc's shaders runs met: %llu of their %llu libraries in those states",
+                          (unsigned long long)r.variant_check_covered, (unsigned long long)r.variant_check_libraries);
+            lines.push_back(line);
+        }
+    }
     if (!ok) {
         lines.push_back("stopped: " + error);
     } else {

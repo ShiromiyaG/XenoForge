@@ -968,6 +968,7 @@ void Build::shaders(const fs::path &disc, const fs::path &cache, const Xex &xex,
     step.title_id = xex.execution.title_id;
     step.digest = digest;
     step.cancel = progress_.cancel;
+    step.disc_variants = options_.disc_variants;
     if (options_.disc_shaders) {
         // what an earlier step found on this image, or a search of it
         const fs::path kept = disc_shaders_path(cache, digest);

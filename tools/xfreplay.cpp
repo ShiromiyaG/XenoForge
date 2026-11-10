@@ -193,6 +193,10 @@ int main(int argc, char **argv) {
                 report.pipeline_seconds, (unsigned long long)report.pipeline_libraries,
                 (unsigned long long)report.pipelines_linked, (unsigned long long)report.pipeline_placeholders,
                 (unsigned long long)report.stand_in_draws);
+    std::printf("  shaders: %.3f s translating %llu forms (%.2f ms each, at most %.2f ms)\n", report.translate_seconds,
+                (unsigned long long)report.translations,
+                report.translations ? report.translate_seconds * 1000.0 / double(report.translations) : 0.0,
+                report.translate_max * 1000.0);
     if (report.pipeline_waits)
         std::printf("  %llu pipelines made on the workers, their draws without one for %.1f ms on average, %.1f ms "
                     "at most\n",

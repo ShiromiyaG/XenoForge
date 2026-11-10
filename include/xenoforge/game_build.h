@@ -152,6 +152,9 @@ struct ShaderStep {
     size_t disc_files = 0;
     double disc_seconds = 0;
     bool disc_from_earlier = false; // what an earlier step's search found (<digest>.discshaders), not read again
+    // the disc's shaders no run met made into libraries in this many of the
+    // states runs gave their parts most (render::PrecompileOptions::extra_variants)
+    uint32_t disc_variants = 4;
     const std::atomic<bool> *cancel = nullptr;
 };
 
@@ -175,6 +178,7 @@ struct BuildOptions {
     // media left out)
     std::function<std::vector<std::string>(const ShaderStep &step)> shader_step;
     bool disc_shaders = true;
+    uint32_t disc_variants = 4; // ShaderStep::disc_variants
     // the shader step alone, the library neither built nor needed (its
     // report updated when there is one)
     bool shaders_only = false;

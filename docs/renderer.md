@@ -1467,6 +1467,40 @@ shaders, taken after the step wrote what it made. A run of the game since,
 another XenoForge, another driver or a new disc search makes the step run
 again, where the records still keep it from making what it made.
 
+**The disc's shaders no run met** (2026-11-10;
+`PrecompileOptions::extra_variants`, `xfbuild --disc-variants N`, 4 by
+default, 0 for none). A library of a shader's part depends on little of
+the pipeline's state: the pre-rasterization part on the vertex shader's
+form, the patch size and the fixed rasterization state; the fragment
+shader's on the pixel shader's form, the samples and (on the interlock
+path) the render targets' specialization. So a shader with no description
+of its own is made into the library of its part in the states the
+storage's descriptions give that part most, counted by the shaders runs
+met in each (a library each): each state's description with the shader's
+name put in place of its own, made back (`undescribe`, which translates
+the form it names), the part's library made and recorded as any other, so
+a run that meets the shader in one of those states links it at once. The
+check: of the libraries runs made of the disc's shaders they did meet
+(those weigh in the choice too), the share in the states taken. Game D (586
+shaders from runs, 1,801 descriptions; the disc's 2,921, 2,802 not met,
+1,511 of those vertex shaders awaiting a vertex declaration, so pixel
+shaders mostly; 201 distinct states):
+
+| states taken (each type) | libraries made | of the met shaders' 436 libraries, in them | the driver's time |
+| --- | --- | --- | --- |
+| 4 | 5,164 | 259 (59%) | |
+| 8 | 10,328 | 293 (67%) | 318 s more (38 s on 9 workers) |
+| 16 | 20,644 | 330 (76%) | 939 s more (108 s) |
+
+**The translation on the renderer's thread** (`Report::translate_seconds`,
+`translations`, `translate_max`, `translate_frame_max`; the `renderer:`
+lines of boot and the player, xfreplay's `shaders:` line). Measured cold on
+two traces: game D's 266 shaders in 486 forms 0.425 s (0.87 ms each, at
+most 2.20 ms) against 43.9 s making the pipelines; game A's race 136 in 206
+forms 0.154 s (0.75 ms, at most 1.74 ms) against 18.7 s. A hundredth of
+the pipelines' time: moving it to the workers only pays where a draw no
+longer waits for the driver.
+
 **The run** reads the records that match its device and driver, while the
 pipeline cache file's header is still theirs: a library the build step
 made is made at once on the renderer's thread (a lookup in the cache)

@@ -1418,6 +1418,22 @@ private:
         bool on_;
         std::chrono::steady_clock::time_point start_;
     };
+    // a translation and its module's making, timed into the report
+    // (Report::translate_seconds)
+    class TranslateTimer {
+    public:
+        explicit TranslateTimer(Report &report) : report_(report), start_(std::chrono::steady_clock::now()) {}
+        ~TranslateTimer() {
+            const double spent = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+            report_.translate_seconds += spent;
+            report_.translate_max = std::max(report_.translate_max, spent);
+            report_.translations++;
+        }
+
+    private:
+        Report &report_;
+        std::chrono::steady_clock::time_point start_;
+    };
     // Options::cpu_times (or XF_RENDERER_CPU_TIMES=1): the clock read around the work done at
     // every draw, texture and shader load too. Off, Report::check_seconds and vertex_seconds stay
     // 0 and Report::seconds leaves out the calls that neither draw, resolve nor swap: two clock
@@ -1765,7 +1781,7 @@ private:
     PFN_vkCmdSetColorWriteMaskEXT set_write_mask_ = nullptr;
     // hitches (Report::pipeline_hitches, swap_gaps_*): the pipeline time at
     // the last swap, and when it came
-    double pipeline_seconds_at_swap_ = 0;
+    double pipeline_seconds_at_swap_ = 0, translate_seconds_at_swap_ = 0;
     std::chrono::steady_clock::time_point last_swap_time_{};
     std::chrono::steady_clock::time_point first_swap_time_{}; // XF_GPU_TIME_LOG's
     std::map<std::string, double> gpu_time_logged_;            // its totals at the last line
@@ -4359,6 +4375,7 @@ bool Impl::translate(Shader &s, std::string &why) {
         shader::VertexOptions vertex;
         shader::PixelOptions pixel_options;
         vertex.texture_point_snap = pixel_options.texture_point_snap = point_snap_;
+        TranslateTimer timer(report_);
         shader::Translation t = shader::translate(s.parsed, pixel ? shader::Stage::Pixel : shader::Stage::Vertex,
                                                   vertex, pixel_options);
         s.approximate = t.approximate;
@@ -4389,6 +4406,7 @@ VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options
         VkShaderModule m = VK_NULL_HANDLE;
         shader::PixelOptions o = options;
         o.texture_point_snap = point_snap_;
+        TranslateTimer timer(report_);
         shader::Translation t = shader::translate(s.parsed, shader::Stage::Pixel, {}, o);
         if (t.ok()) {
             VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -4411,6 +4429,7 @@ VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &optio
         VkShaderModule m = VK_NULL_HANDLE;
         shader::VertexOptions o = options;
         o.texture_point_snap = point_snap_;
+        TranslateTimer timer(report_);
         shader::Translation t = shader::translate(s.parsed, shader::Stage::Vertex, o);
         if (t.ok()) {
             VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -6968,11 +6987,16 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
         out.shaders++;
         if (!sh || !translate(*sh, why)) out.shaders_failed++;
     }
+    // the extra shaders no run met, translated: made into libraries in the
+    // descriptions' commonest states below
+    std::vector<std::pair<uint32_t, uint64_t>> unmet;
+    std::unordered_set<uint64_t> unmet_seen, met_extra;
     for (const auto &[type, code] : o.extra_shaders) {
         if (type > 1) continue;
         const uint64_t hash = hash_words(type, code);
         out.extra_shaders++;
-        if (!storage.has_shader(hash)) out.extra_new++;
+        const bool met = storage.has_shader(hash);
+        if (!met) out.extra_new++;
         load_shader(type, code);
         Shader *sh = shader(hash);
         // a vertex shader whose fetches Direct3D fills in from the vertex
@@ -6981,19 +7005,64 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
             out.extra_undeclared++;
             continue;
         }
-        if (!sh || !translate(*sh, why)) out.extra_failed++;
+        if (!sh || !translate(*sh, why))
+            out.extra_failed++;
+        else if (met)
+            met_extra.insert(hash);
+        else if (unmet_seen.insert(hash).second)
+            unmet.emplace_back(type, hash);
     }
     if (cancelled()) return error = "cancelled", false;
 
     // the descriptions' libraries and whole pipelines, queued for the
     // workers, each library once
+    struct VariantState {
+        uint64_t uses = 0;
+        std::vector<uint32_t> words; // a description in that state
+        size_t at = 0;               // where its guest shader's id lies in it
+    };
+    // a description's guest vertex and pixel shaders: the state of each one's
+    // part (its key with the shader's id left out, its form kept), counted
+    // (and each shader's part, by the shader and that key, in `parts_seen`)
+    std::set<std::tuple<uint32_t, uint64_t, std::vector<uint32_t>>> parts_seen;
+    auto note_variant_state = [&parts_seen](std::span<const uint32_t> words, const PipelineParts &parts,
+                                            std::map<std::vector<uint32_t>, VariantState> (&states)[2]) {
+        if (words.size() < 3) return;
+        size_t at = 3; // (describe: per stage, the stage, the module's kind, form and id, the specialization)
+        for (uint32_t i = 0; i < words[2]; i++) {
+            if (at + 6 > words.size()) return;
+            const uint32_t stage = words[at], kind = words[at + 1];
+            const size_t id_at = at + 3;
+            at += 5;
+            if (const uint32_t entries = words[at++]; entries != UINT32_MAX) {
+                at += size_t(entries) * 3;
+                if (at >= words.size()) return;
+                at += (size_t(words[at]) + 3) / 4 + 1;
+            }
+            if (kind != 1 || (stage != VK_SHADER_STAGE_VERTEX_BIT && stage != VK_SHADER_STAGE_FRAGMENT_BIT)) continue;
+            const uint32_t type = stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+            std::vector<uint32_t> key = parts.keys[type ? 2 : 1];
+            if (key.empty()) continue;
+            const uint32_t lo = words[id_at], hi = words[id_at + 1];
+            for (size_t k = 3; k + 1 < key.size(); k++)
+                if (key[k - 2] == 1 && key[k] == lo && key[k + 1] == hi) key[k] = key[k + 1] = 0;
+            VariantState &s = states[type][key];
+            if (!s.uses) s.words.assign(words.begin(), words.end()), s.at = id_at;
+            s.uses++;
+            parts_seen.emplace(type, lo | uint64_t(hi) << 32, std::move(key));
+        }
+    };
     struct Made {
         uint64_t hash = 0;
         bool library = false;
         std::unique_ptr<PipelineEntry> entry;
+        bool extra = false; // an unmet shader's library
     };
     std::vector<Made> made;
     std::unordered_set<uint64_t> queued_libraries;
+    // the states the descriptions give the vertex (0) and pixel (1) shaders'
+    // parts, by the part's key without the shader
+    std::map<std::vector<uint32_t>, VariantState> variant_states[2];
     ShaderStorage::Built record = ids;
     const bool libraries = d_.pipeline_library();
     for (const std::vector<uint32_t> &words : storage.pipelines()) {
@@ -7010,13 +7079,16 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
             continue;
         }
         const uint64_t hash = built_key(0, words, desc->info, 4);
+        PipelineParts parts;
+        if (libraries) {
+            library_keys(desc->info, parts);
+            if (!unmet.empty()) note_variant_state(words, parts, variant_states);
+        }
         if (made_pipelines.count(hash)) {
             out.descriptions_done_before++;
             continue;
         }
         if (libraries) {
-            PipelineParts parts;
-            library_keys(desc->info, parts);
             for (uint32_t part = 0; part < 4; part++) {
                 if (parts.keys[part].empty()) continue;
                 LibraryDesc ld(desc->info, part);
@@ -7034,6 +7106,62 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
             made.push_back(std::move(m));
         }
     }
+    // the unmet shaders' libraries, in the commonest states of their part
+    if (libraries && o.extra_variants && !unmet.empty()) {
+        out.variant_states_seen = variant_states[0].size() + variant_states[1].size();
+        // a state's uses: the shaders runs met in it (a library each)
+        for (auto &states : variant_states)
+            for (auto &[key, state] : states) state.uses = 0;
+        for (const auto &[type, id, key] : parts_seen) variant_states[type][key].uses++;
+        for (uint32_t type = 0; type < 2; type++) {
+            std::vector<std::pair<const std::vector<uint32_t> *, const VariantState *>> states;
+            for (const auto &[key, state] : variant_states[type]) states.emplace_back(&key, &state);
+            // the commonest first; ties by the key, so a step chooses the same
+            std::sort(states.begin(), states.end(), [](const auto &a, const auto &b) {
+                return a.second->uses != b.second->uses ? a.second->uses > b.second->uses : *a.first < *b.first;
+            });
+            if (states.size() > o.extra_variants) states.resize(o.extra_variants);
+            out.variant_states += states.size();
+            // how well those states cover the libraries runs made of the
+            // disc's shaders they met (a library of each in each state taken)
+            for (const auto &[seen_type, id, key] : parts_seen) {
+                if (seen_type != type || !met_extra.count(id)) continue;
+                out.variant_check_libraries++;
+                for (const auto &[state_key, state] : states)
+                    if (*state_key == key) {
+                        out.variant_check_covered++;
+                        break;
+                    }
+            }
+            for (const auto &[shader_type, shader_hash] : unmet) {
+                if (shader_type != type) continue;
+                for (const auto &[state_key, state] : states) {
+                    std::vector<uint32_t> words = state->words;
+                    words[state->at] = uint32_t(shader_hash), words[state->at + 1] = uint32_t(shader_hash >> 32);
+                    std::unique_ptr<PipelineDesc> desc = undescribe(words, why);
+                    if (!desc) {
+                        out.extra_libraries_unmade++;
+                        continue;
+                    }
+                    PipelineParts parts;
+                    library_keys(desc->info, parts);
+                    const uint32_t part = type == 0 ? 1 : 2;
+                    if (parts.keys[part].empty()) continue;
+                    LibraryDesc ld(desc->info, part);
+                    const uint64_t lh = built_key(part, parts.keys[part], ld.info, part);
+                    if (made_libraries.count(lh)) {
+                        out.extra_libraries_done_before++;
+                        continue;
+                    }
+                    if (!queued_libraries.insert(lh).second) continue;
+                    Made m{lh, true, std::make_unique<PipelineEntry>(), true};
+                    pipeline_workers_->queue(m.entry.get(), std::make_unique<PipelineDesc>(ld.info),
+                                             PipelinePriority::normal);
+                    made.push_back(std::move(m));
+                }
+            }
+        }
+    }
     // waited for in order, with the progress
     for (size_t i = 0; i < made.size(); i++) {
         if (cancelled()) {
@@ -7047,6 +7175,7 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
     for (Made &m : made) {
         if (!m.entry->state.load(std::memory_order_acquire)) continue;
         const bool ok = m.entry->pipeline != VK_NULL_HANDLE;
+        if (m.extra) (ok ? out.extra_libraries : out.extra_libraries_failed)++;
         if (m.library)
             (ok ? out.libraries : out.libraries_failed)++;
         else
@@ -10234,6 +10363,9 @@ void Impl::swap() {
         pipeline_seconds_at_swap_ = report_.pipeline_seconds;
         if (spent > 0.004) report_.pipeline_hitches++;
         report_.pipeline_frame_max = std::max(report_.pipeline_frame_max, spent);
+        report_.translate_frame_max =
+            std::max(report_.translate_frame_max, report_.translate_seconds - translate_seconds_at_swap_);
+        translate_seconds_at_swap_ = report_.translate_seconds;
         auto now = std::chrono::steady_clock::now();
         if (number) {
             double gap = std::chrono::duration<double>(now - last_swap_time_).count();
