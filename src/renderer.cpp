@@ -662,6 +662,7 @@ struct Shader {
     uint64_t texture_mask = 0, vertex_mask[2] = {};
     uint32_t fetch_blocks = 0;
     uint32_t filter_mask = 0; // the slots (below 32) filters has
+    std::array<uint32_t, 4> slot_filters[32] = {}; // filters' for those slots, without the map's search
     // its program for the generic shaders (Impl::program): encoded once, at
     // `program` in the program buffer (16-byte units; UINT32_MAX: not there,
     // with why in program_unsupported), its flags (shader::PROGRAM_*)
@@ -2596,7 +2597,17 @@ private:
         uint32_t slot_word = 0, signs = 0, integer_scale = 0, signed_word = 0;
         uint32_t uses = 0; // the Report::used counts a draw adds for it (bit 0, bit 1)
     };
-    SlotMemo slot_memos_[32];
+    // by the constant's content rather than the slot: a direct-mapped table any slot finds what
+    // any slot made of the same constant and filters in (a game binding other textures at every
+    // draw rarely gives a slot the same constant twice running)
+    static constexpr uint32_t FETCH_MEMOS = 4096;
+    std::unique_ptr<SlotMemo[]> fetch_memos_ = std::make_unique<SlotMemo[]>(FETCH_MEMOS);
+    static uint32_t fetch_memo_index(const uint32_t *fetch, const std::array<uint32_t, 4> &overrides) {
+        uint64_t h = 0x9E3779B97F4A7C15ull;
+        for (uint32_t k = 0; k < 6; k++) h = (h ^ fetch[k]) * 0x100000001B3ull;
+        for (uint32_t o : overrides) h = (h ^ o) * 0x100000001B3ull;
+        return uint32_t(h >> 40) & (FETCH_MEMOS - 1);
+    }
     uint64_t texture_epoch_ = 1;
     uint64_t approximations_ = 0; // approximate()'s calls
     bool slot_memos_on_ = [] {
@@ -4684,7 +4695,10 @@ void Impl::analyze(Shader &s) {
                     if (t->opcode == xf::ucode::FetchOpcode::TextureFetch && !s.filters.count(t->operands[1].index)) {
                         s.filters[t->operands[1].index] = {uint32_t(t->mag_filter), uint32_t(t->min_filter),
                                                            uint32_t(t->mip_filter), uint32_t(t->aniso_filter)};
-                        if (t->operands[1].index < 32) s.filter_mask |= 1u << t->operands[1].index;
+                        if (t->operands[1].index < 32) {
+                            s.filter_mask |= 1u << t->operands[1].index;
+                            s.slot_filters[t->operands[1].index] = s.filters[t->operands[1].index];
+                        }
                     }
                 }
             }
@@ -9009,7 +9023,7 @@ void Impl::draw(const gpu::Draw &d) {
         std::array<uint32_t, 4> overrides = {3, 3, 3, 7};
         for (Shader *s : {vs, ps})
             if (s && slot < 32 && (s->filter_mask & (1u << slot))) {
-                overrides = s->filters[slot];
+                overrides = s->slot_filters[slot];
                 break;
             }
         // What the slot gave the last draw that read it, again: the same constant's words and
@@ -9018,7 +9032,7 @@ void Impl::draw(const gpu::Draw &d) {
         // and its sampler looked up (three maps, 7% of the command thread).
         const uint32_t forced_filter = texture_filter_.load(std::memory_order_relaxed);
         const uint32_t forced_aniso = anisotropy_.load(std::memory_order_relaxed);
-        SlotMemo *memo = slot_memos_on_ && slot < 32 && !trace_ ? &slot_memos_[slot] : nullptr;
+        SlotMemo *memo = slot_memos_on_ && !trace_ ? &fetch_memos_[fetch_memo_index(fetch, overrides)] : nullptr;
         if (memo) {
             if (done_serial_ != limits_applied_at_) apply_texture_limits(); // (as texture() begins)
             SlotMemo &m = *memo;
