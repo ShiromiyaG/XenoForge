@@ -8405,9 +8405,11 @@ void Impl::draw(const gpu::Draw &d) {
     // a shader's forms the generic shaders draw may be translated on the
     // workers, the draw drawn by them meanwhile (translating)
     collect_translations();
-    bool translating = false;
-    if (!translate(*vs, why, &translating)) return skip("vertex shader: " + why);
-    if (ps && !translate(*ps, why, &translating)) return skip("pixel shader: " + why);
+    // (translating: a form the draw uses is; the first forms may be
+    // translating for another draw's sake)
+    bool translating = false, first_forms_translating = false;
+    if (!translate(*vs, why, &first_forms_translating)) return skip("vertex shader: " + why);
+    if (ps && !translate(*ps, why, &first_forms_translating)) return skip("pixel shader: " + why);
     for (const Shader *s : {vs, ps})
         if (s)
             for (const std::string &a : s->approximate) approximate(a);
@@ -9218,6 +9220,7 @@ void Impl::draw(const gpu::Draw &d) {
     // _round fragment shaders). The conversion runs per sample under MSAA, as
     // Xenia's (unless the shader writes oDepth, which is per pixel).
     VkShaderModule fragment = ps ? (ps->translated ? ps->module : generic_fs_[0][0]) : VK_NULL_HANDLE;
+    bool fragment_pending = ps && !ps->translated; // its first form, unless another is taken below
     uint32_t pixel_form = 0; // its form's key (shader::PixelOptions), for the generic shaders
     uint32_t float24_mode = float24_convert ? (options_.depth_float24_round ? 2u : 1u) : 0u;
     // The interpolators read at the centroid under MSAA, as xenos.h's
@@ -9266,6 +9269,7 @@ void Impl::draw(const gpu::Draw &d) {
             options.point_coordinates = point_coordinates;
             options.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
             pixel_form = options.key();
+            fragment_pending = false;
             fragment = pixel_module(*ps, options, why, &translating);
             if (!fragment && translating) fragment = generic_fs_[0][0];
             if (!fragment) return skip("pixel shader: " + why);
@@ -9285,10 +9289,12 @@ void Impl::draw(const gpu::Draw &d) {
         options.centroid = uint16_t(centroid);
         options.point_coordinates = point_coordinates;
         pixel_form = options.key();
+        fragment_pending = false;
         fragment = pixel_module(*ps, options, why, &translating);
         if (!fragment && translating) fragment = generic_fs_[0][0];
         if (!fragment) return skip("pixel shader: " + why);
     }
+    if (fragment_pending) translating = true;
     // the interlock path's state as the pipeline's specialization
     // (Options::fsi_specialized; edram_fsi.frag's constant_id 0-9)
     uint32_t spec_data[10] = {};

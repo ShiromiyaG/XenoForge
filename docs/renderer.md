@@ -77,8 +77,9 @@ interlock" below; host render targets elsewhere, as Xenia's default).
   microcode written as a SPIR-V vertex and pixel shader, reading the program
   from a buffer (the 3DS runtime does the same with its specialized
   pipelines, Dolphin with its ubershaders). It is slow and only draws until
-  the translated pipeline is ready. It comes after the translator (step B5),
-  if hitches still show.
+  the translated pipeline is ready. Built 2026-11-10 ("The generic
+  shaders" below), with the translation moved off the renderer's thread
+  while it draws.
 
 **Vertex fetch in the shader.** Vertices are read from guest memory (one
 buffer, by device address) with the format and endianness of the fetch
@@ -1579,6 +1580,130 @@ named only the description. Two changes:
   driver's own cache cleared. Pipelines of draws without a pixel shader
   are still made at once whatever the cache holds, as Xenia's D3D12
   backend makes them.
+
+## The generic shaders (2026-11-10)
+
+The rest of B5: a draw whose shader is new is no longer skipped while its
+pipeline is made. With library stand-ins a new combination of known
+shaders already drew at once; a new shader's draws waited for its library
+(the cold run above: 2,852 draws skipped). Now they are drawn by **an
+interpreter of Xenos microcode written as SPIR-V shaders** that runs any
+shader from a buffer, as Dolphin's ubershaders and the 3DS runtime's
+specialized pipelines do; the interpreter's libraries depend on the
+pipeline's state alone, not on the shader, so they are few and made once.
+
+**The program** (`shader_program.h`, `shader::encode_program`): the parse
+(`ucode_parse.h`) laid out in words, so the GPU decodes nothing the parser
+resolved: a header (the control flow's length, where the instructions
+start, flags the stages' mains need: oDepth written, oC0 written, the color
+targets written, oPts.x written, a kill), an entry per control flow
+instruction, and 64 bytes per ALU or fetch instruction (the opcodes, the
+results and operands a word each with their swizzles past the component
+count already repeated, the vertex fetch's format and constant, the texture
+fetch's opcode, dimension, filters, offsets, LOD bias). Refused: memory
+exports, scalar opcode 41, vertex formats and texture operations the
+translator does not do. The renderer writes each shader's program once
+into a 32 MB buffer (set 0, binding 8; video memory the host maps where
+there is some), never overwritten, so nothing races the GPU's reads; the
+system constants' last vec4 (`System::generic`) points the draw's two
+shaders at theirs.
+
+**The interpreter** (`src/shaders/generic.glsl`, with `generic.vert`,
+`generic.frag` and `generic.comp`): the translator's semantics written again
+instruction by instruction, not a new reading of Xenia: the legacy multiply,
+operations without contraction (`precise`), the ordered and unordered
+comparisons, the 21-bit exp, log, rcp, rsq and sqrt and their clamps,
+maxa's and the predicate's side effects seen by the scalar half, the
+vertex formats with the normalization scales the translator's CPU computes
+(as bits, so the GPU's division does not round differently), the texture
+fetch's sizes, offsets, epsilon, LOD and gradients, the stacked volumes and
+their layer filter, the signs, gamma and number format; the control flow as
+the translator's dispatch loop (four-deep loop and call stacks, the step
+limit). The stages' mains are the translator's: the vertex shader in the
+vertex host form, with screen extents (`EXTENTS`) and user clip planes
+(`CLIP`, `CULL`; six distances declared, those past the count at 1, the
+count a specialization constant); the pixel shader with the pixel
+parameters, the alpha test, alpha to coverage, the color scales, the
+minimum and maximum blends' factors (from the system constants, which are
+zeros, so nothing, where the draw takes none) and the gamma curve, or on
+the interlock path the output merger of `edram_fsi.glsl` (`edram_fsi.frag`'s
+body, moved so both take it in; its SPIR-V unchanged) with the render
+targets' state from the draw's uniform block rather than specialized, so one
+library serves every target state. Variants: oDepth written, point
+coordinates; 6 vertex and 12 pixel modules in all (4 per render target
+path). Not taken, so refused: expansion of points and rectangles in the
+vertex shader, tessellation, the float24 depth conversion. Taken
+approximately (counted): interpolators read at the centroid under MSAA are
+read at the pixel's center (an array's elements cannot be decorated apart);
+and the early depth hint, which only orders the tests (a draw gets it when
+it has neither an alpha test nor alpha to coverage, so the same pixels
+pass).
+
+**Checked.** `shader_compare_test` runs every case on the interpreter's
+compute form (`generic.comp`, the harness's layout with the program at
+binding 4) beside the translation, against the CPU interpreter: all vector
+and scalar operations on edge inputs, operands and results, predicates and
+a0, every vertex format with each endianness, the texture fetch's stand-in,
+and the corpora on random registers with three settings of the bool and
+loop constants: 245 runs (13 trace shaders), 560 (118 UE3 global shaders),
+236 (10 XNA shaders), no case off. Whole frames with every draw the generic
+shaders can draw drawn by them (`xfreplay --generic`, whole pipelines made
+at once) against the translated shaders' picture:
+
+| frame | draws by the generic shaders | against the translated picture |
+| --- | --- | --- |
+| game A, race | 810 of 810 | 0.000, 0.000% of pixels off by more than 16 |
+| game B, 1800 and 1801 | 54 (all with a pixel shader) | 0.000, 0% |
+| game C, 1200 and 2400 | 3, 1 | 0.000, 0% |
+| game D, 1500 and 3000 | 51, 55 | 0.000, 0% |
+| game E, 1200 and 2400 | 154, 154 | 0.000, 0% |
+| game F, 1200 and 2400 | 3, 3 | 0.000, 0% |
+| game G, 600 | 3 | 0.000, 0% |
+| game G, 850 | 3,323 of 3,325 (2 expand rectangles) | 0.186, 0.334%: the centroids, at geometry edges only |
+| game H, 300 and 450 | 5, 127 | 0.000, 0% |
+
+**As a stand-in** (`Options::generic_shaders`, on; `XF_GENERIC_SHADERS=0`
+turns it off; it needs pipeline libraries). A draw whose pipeline and exact
+linked stand-in are not made gets `generic_info` (the draw's state with the
+generic modules in place of the guest's, chosen by the shaders' forms) and a
+pipeline linked from the vertex input and fragment output libraries, which
+it shares with the exact pipeline, and the generic pre-rasterization and
+fragment shader libraries, made on the workers ahead of everything the
+first time a state asks (by the driver: about 2.4 s each, the interpreter
+being one large shader) and kept in the pipeline cache. The generic
+pipeline is retired as the exact stand-in or the pipeline arrives. The
+report counts the programs, the generic pipelines linked, the draws they
+drew, and the draws they could not draw by reason (`generic_refused`).
+
+**At the launcher's build step**: the generic libraries in each
+description's state are made too and recorded, so a run on a later day
+links a never-met shader's generic pipeline at once. Game D: its 1,380
+descriptions' states took 18 generic libraries (42.8 s of the driver's on
+the workers, 7.7 s of the step).
+
+## The translation off the renderer's thread (2026-11-10)
+
+Measured first (`Report::translate_seconds`, `translations`,
+`translate_max`, `translate_frame_max`): a form's translation and module
+cost 0.75-0.87 ms on the renderer's thread, at most 2.2 ms; game D's trace
+frame 486 forms in 0.425 s, game A's race 206 in 0.154 s, a hundredth of
+the pipelines' time while draws waited for the driver. Once the generic
+shaders draw at once, it is the hitch left in a cold frame. So, with async
+pipelines, the generic shaders and pipeline libraries, a shader form the
+generic shaders draw (the vertex shader's plain host form, any pixel form
+without the float24 conversion, of a shader they run) is translated on two
+translation workers (`TranslationWorkers`: they read only the shader's
+parse, fixed once loaded; the renderer's thread makes the modules from what
+they finished, at the next draw). Its draws are drawn by the generic
+pipeline meanwhile (kept by the pipeline's key in `translating_pipelines_`,
+retired when the draw next goes the usual way); the forms the generic
+shaders do not draw are translated at once as before.
+`XF_TRANSLATE_ASYNC=0` keeps the translation on the renderer's thread.
+Game A's race replayed three times with async pipelines from empty caches:
+no form translated on the renderer's thread (206 before), its time making
+pipelines 0.07 s (1.2 s), 178 draws by the generic shaders in the plays
+after the first, the last play's picture identical to the translated
+shaders'.
 
 ## Texture formats (2026-11-06)
 
