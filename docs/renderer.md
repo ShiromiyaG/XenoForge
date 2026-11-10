@@ -3105,6 +3105,131 @@ transferred alone), and the way back done as a clear where the rectangle's
 depth is one value (`tile_cleared_` set by such a draw as it is by a
 resolve's clear); neither is in Xenia.
 
+## The host path's ownership transfers: a draw's reach and the console's clears (2026-11-09)
+
+The lead above, followed, with what the frame really does. The game's clears
+are not whole surfaces. The console's clear of a region of a 4x target is
+three draws of depth-only rectangle lists: the part of the region that is
+whole tiles drawn in the 4x target itself, the strips left over drawn through
+a single-sampled view of the same tiles twice as wide and tall; a shadow
+atlas is cleared and rendered a cascade at a time this way (the cascades
+themselves drawn in the single-sampled view), each cascade resolved from the
+view. None of those rectangles covers the 416 or 832 tiles that changed hands
+at each of them, so skipping the transfer of covered tiles alone gains
+little. What made the transfers large was that a target took every tile of
+the rows from its first down to the draw's lowest (Xenia's estimate is the
+lowest row alone). Four changes, all beyond Xenia, each with a switch; the
+pictures are the same bits with each on or off.
+
+**A draw's reach** (`Impl::draw_reach`, `XF_DRAW_REACH=rows` for whole rows as
+before). A draw's targets take the tiles under the pixels the draw can reach
+and no others: the scissor down to `draw_max_y`'s row always; with clipping
+on, the host viewport's rectangle (polygons are clipped to it); with clipping
+off, the box of the vertices where the vertex shader runs on the CPU (the run
+`draw_max_y` already makes when there is no scissor, else for draws of at
+most twelve vertices), none of them behind the eye, and for a rectangle list
+of up to four rectangles a box each with the corner the rasterizer adds.
+Points, lines and tessellated draws keep the scissor's rectangle. The box is
+turned into pixels by where samples are: a host pixel's samples are at least
+a sixteenth of it from its edges, so an edge on a pixel boundary (a clear's,
+a viewport's) takes no pixel beyond it. A resolve takes the tiles under its
+rectangle likewise. The memos of `acquire` and `tiles_drawn` are rectangles
+of tiles (`TileRect`) instead of counts of rows, and `edram_transfer` joins
+the runs of tiles of consecutive rows into one rectangle, so a column of
+tiles is one draw.
+
+**Tiles a draw overwrites, taken unread** (`Impl::depth_overwrite`,
+`XF_OVERWRITE_TRANSFERS=0`). A depth target taking tiles for a draw that
+provably writes the depth and the stencil of every sample of them takes them
+without the transfer from their holder or the load from EDRAM. Proven only
+for one rectangle (a rectangle list of three vertices) that is not
+tessellated, not predicated on a VIZ query nor a survey draw, with no user
+clip planes and no vertex kill; the depth test on, always passing and
+written; the stencil test on, always passing, replacing or zeroing with the
+whole write mask (the back face's state the same when it is on); no kill, no
+oDepth, no alpha test other than always and no alpha to coverage in the pixel
+shader; and the vertex shader run on the CPU giving three corners of an
+axis-aligned rectangle with W 1 and one Z, inside the clip volume when
+clipping is on. The tiles are those wholly inside the rectangle, the scissor
+and the viewport, and wholly inside the target's image. Anything else is
+transferred as always.
+
+**A draw's clear is a clear** (`XF_DRAW_CLEARS=0`). Where such a draw writes
+one known depth, the tiles it covers whole hold a clear's value as after a
+resolve's clear (`tile_cleared_`, `tile_clear_value_`, and now the guest's
+word in `tile_clear_word_`), so the target that takes them next is cleared
+rather than drawn from the holder. The depth is known only where it is the
+same value however the host computes it: every step of `z * scale + offset`
+and of the viewport's range exact as a float (the clears' 0 and 1 are), no
+polygon offset, and the result the target's own encoding of a guest word (a
+24-bit unorm host depth must round without doubt, a float one be exactly the
+word's value). Two things widen it:
+- a depth target of the *other* depth format taking a cleared tile is
+  cleared to the same guest word in its own format, which is what the
+  transfer draws (the 24 bits reinterpreted);
+- a depth tile's stencil is tracked on its own (`tile_stencil_`): known after
+  anything that makes the tile a clear's and after a draw that replaces all of
+  it, kept by draws with the stencil test off and by transfers between depth
+  targets, dropped by anything else that writes the tile. The console's
+  depth-only clears leave the stencil test off, so they make a tile a clear's
+  only with it: the draw's depth with the stencil the tile has. A target
+  taking such a tile for a depth-only clear takes it as a clear too (any depth
+  will do, the draw writes it).
+A transfer that is clears alone is no longer a pass of its own: its clears
+are kept for the target's next pass as a resolve's are (`pending_clears`),
+and the stencil's copy (`VK_KHR_maintenance8`) leaves out the rectangles a
+clear wrote.
+
+**Resolves from the tiles' holders** (`XF_RESOLVE_FROM_HOLDERS=1`, off by
+default). A copy from a source that does not hold every tile of its
+rectangle leaves the tiles with their holders, which store them into EDRAM
+for the resolve to read there. It did not pay in this frame (below) and is
+left as an option.
+
+Game D's drive frame, `XF_RENDER_TARGET_PATH=host xfreplay --gpu-time
+--repeat 12 --pipeline-cache <file>`, five runs of each form interleaved, no
+other replay or boot running during any of them, the fastest play of the
+fastest run (and the median run), ms:
+
+| ms a play | total | transfers and stores | their count |
+| --- | --- | --- | --- |
+| all off | 5.964 (5.970) | 1.166 | 44 |
+| the draw's reach | 5.710 (5.784) | 0.949 | 44 |
+| and overwrites and draws' clears | 5.239 (5.263) | 0.429 | 23 |
+| and resolves from holders | 5.269 (5.281) | 0.452 | 25 |
+
+The draws stay at 3.51 to 3.56 ms in all four. The shadow atlas's twelve
+depth transfers (7 into the view, 5 back) are gone: every one of them is a
+clear now. Checked: one
+play and three plays with the switches on and off are the same bytes on the
+drive frame and on the game's frames 5600 and 6400 of the sweep;
+`replay_test` on both paths (31 and 33 frames, the host path's numbers
+unchanged); validation clean.
+
+What it rests on, beyond what Xenia's `draw_max_y` already does: the vertex
+shader run on the CPU places a vertex within a 1024th of a pixel of where the
+host's shader does (the reach), and gives the same Z bits for a clear's
+vertices (the clear's value; a shader that computes its Z rather than passing
+it through could differ by a rounding, which the exactness test of the
+viewport's steps does not see).
+
+One place where the host's bits may differ from the transfers', the guest's
+being the same: a D24FS8 target (or D24S8 on a device without 24-bit unorm
+depth) keeps its 32-bit host depth beside EDRAM, and a transfer into it takes
+a float left there that still rounds to the guest's 24 bits. Cleared instead,
+it gets the word's own value; and a tile taken unread from such a holder
+leaves the holder's floats out of that buffer. Either is a float of the same
+20e4 value.
+
+**What is left of the transfers** (0.43 ms in 23): the scene's depth moving
+between its 4x target and the single-sampled view of it twice as wide, four
+times of 720 tiles (0.20 ms: the depth prepass is drawn in the view, then
+rectangles and quads in the 4x target, real content each way), the colors'
+transfers between formats and sample counts (0.19 ms), and the small ones. A
+depth transfer that carried the stencil alone, for depth-only overwrites of
+tiles whose stencil is not known, was not built: with the stencil tracked the
+frame has none left.
+
 ## Resolution scale (2026-11-08)
 
 The console's pixels drawn as more (or fewer) host pixels: 50% to 800% in

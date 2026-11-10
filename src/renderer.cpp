@@ -4605,6 +4605,10 @@ void Impl::acquire(RenderTarget *t, uint32_t rows, const DepthOverwrite *overwri
     acquire(t, std::span<const TileRect>(&whole_rows, 1), overwritten);
 }
 
+// The same for the tiles of these rectangles of the target's tiles (a draw's
+// reach, a resolve's rectangle). `overwritten`: the draw this is for writes
+// the depth of every sample of the pixels it names (Impl::depth_overwrite),
+// so the tiles wholly inside them need not be read from their holders.
 void Impl::acquire(RenderTarget *t, std::span<const TileRect> rects, const DepthOverwrite *overwritten) {
     // (it held them at its last draw and no tile changed hands since)
     const bool known = t->owned_epoch == owners_epoch_;
@@ -9305,11 +9309,13 @@ void Impl::resolve() {
     // shadow atlas resolved as a single-sampled surface twice as wide and
     // tall) leaves the tiles with their holders, which store them into
     // EDRAM, and reads them there: a store, where taking them was a transfer
-    // into the view and another back at the holder's next draw.
-    // XF_RESOLVE_FROM_HOLDERS=0: the source takes them, as Xenia's.
+    // into the view and another back at the holder's next draw. Off unless
+    // XF_RESOLVE_FROM_HOLDERS=1 (the source takes them, as Xenia's): in the
+    // one frame measured the transfers it replaces were clears already, and
+    // its two stores cost 0.02 ms more (docs/renderer.md).
     static const bool from_holders = [] {
         const char *v = std::getenv("XF_RESOLVE_FROM_HOLDERS"), *image = std::getenv("XF_RESOLVE_FROM_IMAGE");
-        return !(v && v[0] == '0') && !(image && std::string(image) == "1");
+        return v && v[0] == '1' && !(image && std::string(image) == "1");
     }();
     resolve_stored_ = false;
     if (!fsi_ && from_holders && reach_tiles_ && info.copy && !info.clear_color && !info.clear_depth && w && h) {
