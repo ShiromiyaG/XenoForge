@@ -109,6 +109,12 @@ void print_renderer_report(const render::Report &r) {
         (unsigned long long)r.textures_evicted_for_room, (unsigned long long)r.textures_refused);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
                 r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
+    std::printf("renderer: generic shaders: %llu programs, %llu stand-ins linked, %llu draws drawn by them; %llu shader "
+                "forms translated on the workers (%.2f s there)\n",
+                (unsigned long long)r.generic_programs, (unsigned long long)r.generic_pipelines,
+                (unsigned long long)r.generic_draws, (unsigned long long)r.translations_async, r.translate_async_seconds);
+    for (const auto &[why, n] : r.generic_refused)
+        std::printf("renderer:   %llu draws waiting not drawn by them: %s\n", (unsigned long long)n, why.c_str());
     std::printf("renderer: %.3f s translating %llu shader forms on its thread (%.2f ms each, at most %.2f ms; at most "
                 "%.1f ms in one frame)\n",
                 r.translate_seconds, (unsigned long long)r.translations,

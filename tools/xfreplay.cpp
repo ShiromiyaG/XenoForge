@@ -202,6 +202,7 @@ int main(int argc, char **argv) {
                 (unsigned long long)report.generic_draws);
     for (const auto &[why, n] : report.generic_refused)
         std::printf("    %llu draws not drawn by them: %s\n", (unsigned long long)n, why.c_str());
+    std::printf("  shaders: %llu forms translated on the workers (%.3f s there)\n", (unsigned long long)report.translations_async, report.translate_async_seconds);
     std::printf("  shaders: %.3f s translating %llu forms (%.2f ms each, at most %.2f ms)\n", report.translate_seconds,
                 (unsigned long long)report.translations,
                 report.translations ? report.translate_seconds * 1000.0 / double(report.translations) : 0.0,

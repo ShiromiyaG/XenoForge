@@ -90,6 +90,10 @@ struct Report {
     // modules so made, the longest one, and the most in one frame
     double translate_seconds = 0, translate_max = 0, translate_frame_max = 0;
     uint64_t translations = 0;
+    // and those made on the translation workers instead, with their time
+    // there (the renderer's thread drawing with the generic shaders meanwhile)
+    uint64_t translations_async = 0;
+    double translate_async_seconds = 0;
     uint64_t pipeline_cache_read = 0;            // bytes of pipeline cache read from disk at the start
     uint64_t pipeline_cache_written = 0;         // bytes of it written back, the last time
     uint64_t vertex_bytes = 0;                   // the vertex data uploaded (the pages that differed)
@@ -482,6 +486,9 @@ struct PrecompileReport {
     // many of an unmet shader's the step makes ahead; those shaders weigh in
     // the choice of the states too)
     uint64_t variant_check_libraries = 0, variant_check_covered = 0;
+    // of the libraries above, the generic shaders' (Options::generic_shaders)
+    // in the descriptions' states, made and failed
+    uint64_t generic_libraries = 0, generic_libraries_failed = 0;
     uint64_t extra_libraries = 0, extra_libraries_failed = 0, extra_libraries_unmade = 0,
              extra_libraries_done_before = 0;
     double seconds = 0, driver_seconds = 0; // in all; the workers' time making them

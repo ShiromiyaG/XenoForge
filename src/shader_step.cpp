@@ -157,6 +157,13 @@ std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
                   (unsigned long long)r.libraries_failed, (unsigned long long)r.pipelines,
                   (unsigned long long)r.pipelines_failed, r.seconds, r.driver_seconds);
     lines.push_back(line);
+    if (r.generic_libraries || r.generic_libraries_failed) {
+        std::snprintf(line, sizeof(line),
+                      "the generic shaders: %llu libraries in the descriptions' states (%llu failed), so a shader no "
+                      "run met draws at once in them",
+                      (unsigned long long)r.generic_libraries, (unsigned long long)r.generic_libraries_failed);
+        lines.push_back(line);
+    }
     if (r.variant_states_seen) {
         std::snprintf(line, sizeof(line),
                       "the disc's shaders not met in runs: in the %llu commonest of %llu states their parts take, "

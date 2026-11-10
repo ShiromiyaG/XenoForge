@@ -667,6 +667,8 @@ struct Shader {
     bool encoded = false;
     uint32_t program = UINT32_MAX, program_flags = 0;
     std::string program_unsupported;
+    bool analyzed = false;            // Impl::analyze
+    std::set<uint32_t> translating; // forms on the translation workers (Impl::form_module)
 };
 
 // A rectangle of a render target's EDRAM tiles: columns [c0, c1) of its tile
@@ -1188,6 +1190,84 @@ struct PipelineEntry {
     bool generic_failed = false;
 };
 
+// Shaders translated off the renderer's thread (docs/renderer.md, "The
+// translation off the renderer's thread"): a form's translation to SPIR-V,
+// which reads only the shader's parse (fixed once loaded; shaders are never
+// dropped), done by a few threads; the renderer's thread takes what they
+// finished (take) and makes the modules. Stopping waits for the one under
+// way and leaves the queue.
+class TranslationWorkers {
+public:
+    struct Job {
+        Shader *shader;
+        uint32_t key; // Impl::form_module's
+        bool pixel;
+        shader::VertexOptions vertex;
+        shader::PixelOptions pixel_options;
+    };
+    struct Done {
+        Shader *shader;
+        uint32_t key;
+        shader::Translation translation;
+        double seconds;
+    };
+    explicit TranslationWorkers(uint32_t threads) {
+        for (uint32_t i = 0; i < threads; i++) threads_.emplace_back([this] { run(); });
+    }
+    ~TranslationWorkers() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        for (std::thread &t : threads_) t.join();
+    }
+    void queue(Job job) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            jobs_.push_back(std::move(job));
+        }
+        wake_.notify_one();
+    }
+    // what is finished, into done (a check of an atomic when nothing is)
+    void take(std::vector<Done> &done) {
+        if (!finished_.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        done.swap(done_);
+        finished_.store(0, std::memory_order_release);
+    }
+
+private:
+    void run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
+                if (stop_) return;
+                job = std::move(jobs_.front());
+                jobs_.pop_front();
+            }
+            const auto start = std::chrono::steady_clock::now();
+            Done d{job.shader, job.key,
+                   shader::translate(job.shader->parsed, job.pixel ? shader::Stage::Pixel : shader::Stage::Vertex,
+                                     job.vertex, job.pixel_options),
+                   0.0};
+            d.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_.push_back(std::move(d));
+            finished_.store(1, std::memory_order_release);
+        }
+    }
+    std::vector<std::thread> threads_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<Job> jobs_;
+    std::vector<Done> done_;
+    std::atomic<int> finished_{0};
+    bool stop_ = false;
+};
+
 // What a pipeline made on the workers is to the draws waiting for it.
 enum class PipelinePriority {
     first,  // a library a stand-in waits for: ahead of everything queued
@@ -1668,11 +1748,25 @@ private:
 
     // resources
     Shader *shader(uint64_t hash);
-    bool translate(Shader &s, std::string &why);
+    // whether the shader can be drawn (its first form translated); with
+    // `pending`, the translation may go to the workers, pending set meanwhile
+    bool translate(Shader &s, std::string &why, bool *pending = nullptr);
     // a translated vertex shader's module in a host form; null when the
-    // translator cannot make it
-    VkShaderModule vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why);
-    VkShaderModule pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why);
+    // translator cannot make it, or (pending set) while the workers do
+    VkShaderModule vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why,
+                                 bool *pending = nullptr);
+    VkShaderModule pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why,
+                                bool *pending = nullptr);
+    void analyze(Shader &s);
+    VkShaderModule form_module(Shader &s, uint32_t key, const shader::VertexOptions &vertex,
+                               const shader::PixelOptions &pixel, bool *pending);
+    VkShaderModule finish_form(Shader &s, uint32_t key, const shader::Translation &t);
+    bool translate_later(Shader &s, uint32_t key);
+    void collect_translations();
+    // the translation workers (docs/renderer.md, "The translation off the
+    // renderer's thread"): with async pipelines, the generic shaders and
+    // pipeline libraries
+    std::unique_ptr<TranslationWorkers> translation_workers_;
     // the depth-only draws' pixel shaders that convert D24FS8 depth
     // (Options::depth_float24_convert_in_pixel_shader): towards zero, nearest even
     VkShaderModule depth_float24_fs_[2] = {};
@@ -1699,8 +1793,8 @@ private:
         VkSpecializationInfo vertex_spec{2, entries, 8, vertex_data}, pixel_spec{1, entries, 4, &pixel_data};
         VkGraphicsPipelineCreateInfo info{};
     };
-    bool generic_info(const VkGraphicsPipelineCreateInfo &info, Shader &vs, Shader *ps, bool points, GenericStages &out,
-                      std::string &why);
+    bool generic_info(const VkGraphicsPipelineCreateInfo &info, Shader &vs, Shader *ps, bool points, uint32_t vertex_form,
+                      uint32_t pixel_form, GenericStages &out, std::string &why);
     VkPipeline generic_stand_in(PipelineEntry &e, const VkGraphicsPipelineCreateInfo &generic, bool async);
     void retire_generic(PipelineEntry &e);
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
@@ -2498,6 +2592,9 @@ private:
     }();
     std::vector<uint32_t> free_samplers_; // slots of samplers destroyed, to reuse
     std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> pipelines_;
+    // the generic pipelines of draws whose shaders are being translated, by
+    // the pipeline's key (dropped when the draw next goes the usual way)
+    std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> translating_pipelines_;
     PipelineEntry *last_pipeline_ = nullptr; // the entry pipeline() found last, and its key
     std::vector<uint32_t> last_pipeline_key_;
 
@@ -2856,6 +2953,7 @@ private:
 };
 
 Impl::~Impl() {
+    translation_workers_.reset(); // before the shaders they read
     mem_.remove_watcher(watcher_);
     vkDeviceWaitIdle(dev_);
     pipeline_workers_.reset(); // before the shader modules and the cache they use
@@ -2876,7 +2974,7 @@ Impl::~Impl() {
         for (auto &[v, m] : s->variants)
             if (m) vkDestroyShaderModule(dev_, m, nullptr);
     }
-    for (auto *table : {&pipelines_, &libraries_})
+    for (auto *table : {&pipelines_, &libraries_, &translating_pipelines_})
         for (auto &[k, p] : *table)
             for (VkPipeline pipe : {p->pipeline, p->stand_in, p->generic})
                 if (pipe) vkDestroyPipeline(dev_, pipe, nullptr);
@@ -3774,6 +3872,15 @@ bool Impl::init_generic(std::string &error) {
             generic_fs_[p][d] = make(fsi_ == 2 ? sample[p][d] : fsi_ ? pixel[p][d] : host[p][d], 101 + p * 2 + d);
     if (!generic_fs_[0][0] || !generic_fs_[0][1] || !generic_fs_[1][0] || !generic_fs_[1][1])
         return error = "could not make the generic shaders", false;
+    // the translation off the renderer's thread, where the generic shaders
+    // draw meanwhile (XF_TRANSLATE_ASYNC=0 keeps it here)
+    static const bool translate_here = [] {
+        const char *v = std::getenv("XF_TRANSLATE_ASYNC");
+        return v && v[0] == '0';
+    }();
+    if (options_.async_pipelines && pipeline_workers_ && use_libraries_ && !options_.generic_only &&
+        !options_.linked_pipelines_only && stand_in_ == Options::PipelineStandIn::library && !translate_here)
+        translation_workers_ = std::make_unique<TranslationWorkers>(2);
     return true;
 }
 
@@ -4534,10 +4641,10 @@ Shader *Impl::shader(uint64_t hash) {
     return it == shaders_.end() ? nullptr : it->second.get();
 }
 
-bool Impl::translate(Shader &s, std::string &why) {
-    if (!s.translated) {
-        s.translated = true;
-        bool pixel = s.parsed.type == xf::ucode::ShaderType::Pixel;
+// what the draws read of a shader's microcode, once
+void Impl::analyze(Shader &s) {
+    if (!s.analyzed) {
+        s.analyzed = true;
         for (const xf::ucode::ControlFlow &cf : s.parsed.control_flow) {
             const auto *e = std::get_if<xf::ucode::Exec>(&cf.instruction);
             if (!e) continue;
@@ -4570,76 +4677,114 @@ bool Impl::translate(Shader &s, std::string &why) {
                 }
             }
         }
-        shader::VertexOptions vertex;
-        shader::PixelOptions pixel_options;
-        vertex.texture_point_snap = pixel_options.texture_point_snap = point_snap_;
-        TranslateTimer timer(report_);
-        shader::Translation t = shader::translate(s.parsed, pixel ? shader::Stage::Pixel : shader::Stage::Vertex,
-                                                  vertex, pixel_options);
-        s.approximate = t.approximate;
-        if (!t.ok()) {
-            s.unsupported = t.unsupported.empty() ? "the translator wrote nothing" : t.unsupported.front();
-        } else {
-            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            info.codeSize = t.spirv.size() * 4;
-            info.pCode = t.spirv.data();
-            if (vkCreateShaderModule(dev_, &info, nullptr, &s.module) != VK_SUCCESS)
-                s.unsupported = "vkCreateShaderModule failed";
-            else
-                module_names_[s.module] = {1, 0, s.hash}, module_content_[s.module] = ShaderStorage::hash(0, t.spirv);
-        }
     }
+}
+
+// A shader's form (0 its first; a vertex form's key, or a pixel form's key
+// with bit 31), translated here, or with `pending` given and a form the
+// generic shaders draw (Impl::translate_later) on the translation workers,
+// pending set while it is (docs/renderer.md, "The translation off the
+// renderer's thread"). Null when it cannot be made (or is pending).
+VkShaderModule Impl::form_module(Shader &s, uint32_t key, const shader::VertexOptions &vertex,
+                                 const shader::PixelOptions &pixel, bool *pending) {
+    if (!key && s.translated) return s.module;
+    if (key) {
+        auto it = s.variants.find(key);
+        if (it != s.variants.end()) return it->second;
+    }
+    const bool is_pixel = s.parsed.type == xf::ucode::ShaderType::Pixel;
+    shader::VertexOptions v = vertex;
+    shader::PixelOptions p = pixel;
+    v.texture_point_snap = p.texture_point_snap = point_snap_;
+    if (pending && translate_later(s, key)) {
+        if (s.translating.insert(key).second)
+            translation_workers_->queue({&s, key, is_pixel, v, p});
+        *pending = true;
+        return VK_NULL_HANDLE;
+    }
+    shader::Translation t;
+    {
+        TranslateTimer timer(report_);
+        t = shader::translate(s.parsed, is_pixel ? shader::Stage::Pixel : shader::Stage::Vertex, v, p);
+    }
+    return finish_form(s, key, t);
+}
+
+// A form's translation made into its module and kept (here or from the
+// translation workers)
+VkShaderModule Impl::finish_form(Shader &s, uint32_t key, const shader::Translation &t) {
+    s.translating.erase(key);
+    VkShaderModule m = VK_NULL_HANDLE;
+    std::string failure = t.unsupported.empty() ? "the translator wrote nothing" : t.unsupported.front();
+    if (t.ok()) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = t.spirv.size() * 4;
+        info.pCode = t.spirv.data();
+        if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) {
+            m = VK_NULL_HANDLE;
+            failure = "vkCreateShaderModule failed";
+        }
+        if (m) module_names_[m] = {1, key, s.hash}, module_content_[m] = ShaderStorage::hash(0, t.spirv);
+    }
+    if (!key) {
+        s.translated = true;
+        s.module = m;
+        s.approximate = t.approximate;
+        if (!m) s.unsupported = failure;
+    } else {
+        s.variants[key] = m;
+    }
+    return m;
+}
+
+// whether a form is translated on the workers: with them (async pipelines
+// with the generic shaders and pipeline libraries), for a form the generic
+// shaders draw (a vertex shader's plain host form; a pixel shader's form
+// without the float24 conversion), of a shader they run
+bool Impl::translate_later(Shader &s, uint32_t key) {
+    if (!translation_workers_) return false;
+    if (s.parsed.type == xf::ucode::ShaderType::Pixel ? (key & 3) != 0 : (key & 0xFF) != 0) return false;
+    std::string why;
+    return program(s, why);
+}
+
+// the translations the workers finished, kept
+void Impl::collect_translations() {
+    if (!translation_workers_) return;
+    std::vector<TranslationWorkers::Done> done;
+    translation_workers_->take(done);
+    for (TranslationWorkers::Done &d : done) {
+        report_.translations_async++;
+        report_.translate_async_seconds += d.seconds;
+        // (made meanwhile here: kept as it is)
+        if (d.key ? d.shader->variants.count(d.key) != 0 : d.shader->translated) {
+            d.shader->translating.erase(d.key);
+            continue;
+        }
+        finish_form(*d.shader, d.key, d.translation);
+    }
+}
+
+bool Impl::translate(Shader &s, std::string &why, bool *pending) {
+    analyze(s);
+    if (!s.translated) form_module(s, 0, {}, {}, pending);
     if (!s.unsupported.empty()) why = s.unsupported;
     return s.unsupported.empty();
 }
 
 // a pixel shader's other forms (shader::PixelOptions), made as draws ask for
 // them, kept among its variants above the vertex forms' keys
-VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why) {
-    uint32_t key = options.key();
-    if (!key) return s.module;
-    key |= 1u << 31;
-    auto it = s.variants.find(key);
-    if (it == s.variants.end()) {
-        VkShaderModule m = VK_NULL_HANDLE;
-        shader::PixelOptions o = options;
-        o.texture_point_snap = point_snap_;
-        TranslateTimer timer(report_);
-        shader::Translation t = shader::translate(s.parsed, shader::Stage::Pixel, {}, o);
-        if (t.ok()) {
-            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            info.codeSize = t.spirv.size() * 4;
-            info.pCode = t.spirv.data();
-            if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
-            if (m) module_names_[m] = {1, key, s.hash}, module_content_[m] = ShaderStorage::hash(0, t.spirv);
-        }
-        it = s.variants.emplace(key, m).first;
-    }
-    if (!it->second) why = "its float24 depth, centroid or interlock form could not be made";
-    return it->second;
+VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why, bool *pending) {
+    const uint32_t key = options.key() ? options.key() | 1u << 31 : 0;
+    VkShaderModule m = form_module(s, key, {}, options, pending);
+    if (!m && !(pending && *pending)) why = "its float24 depth, centroid or interlock form could not be made";
+    return m;
 }
 
-VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why) {
-    uint32_t key = options.key();
-    if (!key) return s.module; // HostVertex::Vertex without clip planes
-    auto it = s.variants.find(key);
-    if (it == s.variants.end()) {
-        VkShaderModule m = VK_NULL_HANDLE;
-        shader::VertexOptions o = options;
-        o.texture_point_snap = point_snap_;
-        TranslateTimer timer(report_);
-        shader::Translation t = shader::translate(s.parsed, shader::Stage::Vertex, o);
-        if (t.ok()) {
-            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            info.codeSize = t.spirv.size() * 4;
-            info.pCode = t.spirv.data();
-            if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
-            if (m) module_names_[m] = {1, key, s.hash}, module_content_[m] = ShaderStorage::hash(0, t.spirv);
-        }
-        it = s.variants.emplace(key, m).first;
-    }
-    if (!it->second) why = "its host form could not be made";
-    return it->second;
+VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why, bool *pending) {
+    VkShaderModule m = form_module(s, options.key(), options, {}, pending);
+    if (!m && !(pending && *pending)) why = "its host form could not be made";
+    return m;
 }
 
 // ---- render targets: EDRAM as host images, one per base, pitch, samples and format ----
@@ -6601,50 +6746,42 @@ VkPipeline Impl::link(PipelineEntry &e) {
 // rather than specialized. The geometry shaders and everything else as the
 // draw's.
 bool Impl::generic_info(const VkGraphicsPipelineCreateInfo &info, Shader &vs, Shader *ps, bool points,
-                        GenericStages &out, std::string &why) {
+                        uint32_t vertex_form, uint32_t pixel_form, GenericStages &out, std::string &why) {
     if (!generic_on_) return why = "off", false;
     if (!options_.generic_only && !use_libraries_) return why = "no pipeline libraries on the device", false;
     if (info.stageCount > 5) return why = "more stages than the renderer makes", false;
+    // the vertex host form (shader::VertexOptions::key's host 0; ps_ucp_mode
+    // applies to points alone), with its screen extents and user clip planes
+    if (vertex_form & 0xFF) return why = "the vertex shader expanding points or rectangles", false;
+    if (pixel_form & 3) return why = "the pixel shader's float24 depth form", false;
     std::string reason;
     if (!program(vs, reason)) return why = "vertex shader: " + reason, false;
     if (ps && !program(*ps, reason)) return why = "pixel shader: " + reason, false;
     out.info = info;
     out.info.pStages = out.stages;
     out.vertex_data[0] = out.pixel_data = 1;
+    const uint32_t planes = std::min<uint32_t>((vertex_form >> 9) & 7, 6), cull = (vertex_form >> 12) & 1,
+                   extents = (vertex_form >> 15) & 1;
     for (uint32_t i = 0; i < info.stageCount; i++) {
         VkPipelineShaderStageCreateInfo &st = out.stages[i];
         st = info.pStages[i];
         switch (st.stage) {
-        case VK_SHADER_STAGE_VERTEX_BIT: {
-            // the guest's in the vertex host form (shader::VertexOptions::key's
-            // host 0; ps_ucp_mode applies to points alone), with its screen
-            // extents and user clip planes
-            auto name = module_names_.find(st.module);
-            const bool guest = name != module_names_.end() && name->second.kind == 1 && name->second.id == vs.hash;
-            const uint32_t form = guest ? name->second.form : 0;
-            if (!guest || (form & 0xFF))
-                return why = guest ? "the vertex shader expanding points or rectangles" : "not the guest's vertex shader",
-                       false;
-            const uint32_t planes = std::min<uint32_t>((form >> 9) & 7, 6), cull = (form >> 12) & 1,
-                           extents = (form >> 15) & 1;
+        case VK_SHADER_STAGE_VERTEX_BIT:
             st.module = generic_vs_[extents][planes ? 1 + cull : 0];
             out.vertex_data[0] = point_snap_ ? 1 : 0;
             out.vertex_data[1] = planes;
             st.pSpecializationInfo = point_snap_ || planes ? &out.vertex_spec : nullptr;
             break;
-        }
         case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
         case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: return why = "a tessellated draw", false;
-        case VK_SHADER_STAGE_FRAGMENT_BIT: {
+        case VK_SHADER_STAGE_FRAGMENT_BIT:
             if (!ps) break; // the renderer's own (depth alone)
-            auto name = module_names_.find(st.module);
-            const uint32_t form = name == module_names_.end() ? 0 : name->second.form;
-            if (form & 3) return why = "the pixel shader's float24 depth form", false;
-            if ((form >> 8) & 0xFFFF) approximate("generic shaders: interpolators at the pixel's center, not its centroid");
-            st.module = generic_fs_[points ? 1 : 0][ps->writes_depth ? 1 : 0];
+            if ((pixel_form >> 8) & 0xFFFF)
+                approximate("generic shaders: interpolators at the pixel's center, not its centroid");
+            // (oDepth as the translator takes it: any result to it)
+            st.module = generic_fs_[points ? 1 : 0][ps->program_flags & shader::PROGRAM_WRITES_DEPTH ? 1 : 0];
             st.pSpecializationInfo = point_snap_ ? &out.pixel_spec : nullptr;
             break;
-        }
         default: break; // the geometry shaders
         }
     }
@@ -7364,6 +7501,7 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
         bool library = false;
         std::unique_ptr<PipelineEntry> entry;
         bool extra = false; // an unmet shader's library
+        bool generic = false; // a generic shaders' library
     };
     std::vector<Made> made;
     std::unordered_set<uint64_t> queued_libraries;
@@ -7390,6 +7528,37 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
         if (libraries) {
             library_keys(desc->info, parts);
             if (!unmet.empty()) note_variant_state(words, parts, variant_states);
+            // the generic shaders' libraries in this description's state, so
+            // that a run draws a shader it never met in it at once
+            // (Options::generic_shaders), each once
+            Shader *vs = nullptr, *ps = nullptr;
+            bool points = false;
+            uint32_t vertex_form = 0, pixel_form = 0;
+            for (uint32_t i = 0; i < desc->info.stageCount; i++) {
+                auto name = module_names_.find(desc->info.pStages[i].module);
+                if (name == module_names_.end() || name->second.kind != 1) continue;
+                if (desc->info.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    ps = shader(name->second.id), points = (name->second.form >> 30) & 1,
+                    pixel_form = name->second.form & ~(1u << 31);
+                else
+                    vs = shader(name->second.id), vertex_form = name->second.form;
+            }
+            GenericStages generic;
+            if (generic_on_ && vs && ps && generic_info(desc->info, *vs, ps, points, vertex_form, pixel_form, generic, why)) {
+                PipelineParts generic_parts;
+                library_keys(generic.info, generic_parts);
+                for (uint32_t part : {1u, 2u}) {
+                    if (generic_parts.keys[part].empty()) continue;
+                    LibraryDesc ld(generic.info, part);
+                    const uint64_t lh = built_key(part, generic_parts.keys[part], ld.info, part);
+                    if (made_libraries.count(lh) || !queued_libraries.insert(lh).second) continue;
+                    Made m{lh, true, std::make_unique<PipelineEntry>()};
+                    m.generic = true;
+                    pipeline_workers_->queue(m.entry.get(), std::make_unique<PipelineDesc>(ld.info),
+                                             PipelinePriority::normal);
+                    made.push_back(std::move(m));
+                }
+            }
         }
         if (made_pipelines.count(hash)) {
             out.descriptions_done_before++;
@@ -7483,6 +7652,7 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
         if (!m.entry->state.load(std::memory_order_acquire)) continue;
         const bool ok = m.entry->pipeline != VK_NULL_HANDLE;
         if (m.extra) (ok ? out.extra_libraries : out.extra_libraries_failed)++;
+        if (m.generic) (ok ? out.generic_libraries : out.generic_libraries_failed)++;
         if (m.library)
             (ok ? out.libraries : out.libraries_failed)++;
         else
@@ -8232,8 +8402,12 @@ void Impl::draw(const gpu::Draw &d) {
     if (!vs) return skip("no vertex shader");
     Shader *ps = color && have_pixel_ ? pixel_shader_ : nullptr;
     std::string why;
-    if (!translate(*vs, why)) return skip("vertex shader: " + why);
-    if (ps && !translate(*ps, why)) return skip("pixel shader: " + why);
+    // a shader's forms the generic shaders draw may be translated on the
+    // workers, the draw drawn by them meanwhile (translating)
+    collect_translations();
+    bool translating = false;
+    if (!translate(*vs, why, &translating)) return skip("vertex shader: " + why);
+    if (ps && !translate(*ps, why, &translating)) return skip("pixel shader: " + why);
     for (const Shader *s : {vs, ps})
         if (s)
             for (const std::string &a : s->approximate) approximate(a);
@@ -9033,14 +9207,18 @@ void Impl::draw(const gpu::Draw &d) {
         std::copy(premultiply, premultiply + 4, sys.blend_premultiply);
         std::memcpy(sys.blend_constant, &regs_[r::RB_BLEND_RED], 16);
     }
-    VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why);
+    // (a form being translated on the workers stands as the generic shader's
+    // module until the pipeline, which the generic shaders' then is)
+    VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why, &translating);
+    if (!guest_vs && translating) guest_vs = generic_vs_[0][0];
     if (!guest_vs) return skip("vertex shader: " + why);
     // The pixel shader: the guest's, its float24 depth conversion form with
     // float24_convert; a depth-only draw that tests or writes depth then gets
     // one that converts the rasterized depth (Xenia's float24_truncate and
     // _round fragment shaders). The conversion runs per sample under MSAA, as
     // Xenia's (unless the shader writes oDepth, which is per pixel).
-    VkShaderModule fragment = ps ? ps->module : VK_NULL_HANDLE;
+    VkShaderModule fragment = ps ? (ps->translated ? ps->module : generic_fs_[0][0]) : VK_NULL_HANDLE;
+    uint32_t pixel_form = 0; // its form's key (shader::PixelOptions), for the generic shaders
     uint32_t float24_mode = float24_convert ? (options_.depth_float24_round ? 2u : 1u) : 0u;
     // The interpolators read at the centroid under MSAA, as xenos.h's
     // GetInterpolatorSamplingPattern takes SQ_CONTEXT_MISC's sc_sample_cntl (bits 2-3:
@@ -9087,7 +9265,9 @@ void Impl::draw(const gpu::Draw &d) {
             options.fsi = uint8_t(fsi_);
             options.point_coordinates = point_coordinates;
             options.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
-            fragment = pixel_module(*ps, options, why);
+            pixel_form = options.key();
+            fragment = pixel_module(*ps, options, why, &translating);
+            if (!fragment && translating) fragment = generic_fs_[0][0];
             if (!fragment) return skip("pixel shader: " + why);
         } else {
             fragment = fsi_constants.flags & FSI_DEPTH_STENCIL ? fsi_depth_fs_ : VK_NULL_HANDLE;
@@ -9104,7 +9284,9 @@ void Impl::draw(const gpu::Draw &d) {
         options.blend_premultiply = premultiplied;
         options.centroid = uint16_t(centroid);
         options.point_coordinates = point_coordinates;
-        fragment = pixel_module(*ps, options, why);
+        pixel_form = options.key();
+        fragment = pixel_module(*ps, options, why, &translating);
+        if (!fragment && translating) fragment = generic_fs_[0][0];
         if (!fragment) return skip("pixel shader: " + why);
     }
     // the interlock path's state as the pipeline's specialization
@@ -9282,18 +9464,40 @@ void Impl::draw(const gpu::Draw &d) {
     std::string generic_why;
     VkPipeline pipe = VK_NULL_HANDLE;
     const bool generic_wanted = options_.generic_only && ps; // (draws without a pixel shader are made at once anyway)
-    if (generic_wanted && !generic_info(info, *vs, ps, point_coordinates, generic_stages, generic_why))
+    if (generic_wanted &&
+        !generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages, generic_why))
         report_.generic_refused[generic_why]++;
     if (generic_wanted && generic_why.empty()) {
         // (Options::generic_only: whole pipelines of the generic shaders, made at once)
         key.push_back(0x6E0E0000u);
         pipe = pipeline(key, generic_stages.info, false, pending, stand_in);
         generic = true;
+    } else if (translating) {
+        // a shader's form on the translation workers: the generic shaders'
+        // pipeline alone, linked once their libraries are made
+        if (generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages, generic_why)) {
+            std::unique_ptr<PipelineEntry> &slot = translating_pipelines_[key];
+            if (!slot) slot = std::make_unique<PipelineEntry>();
+            pipe = generic_stand_in(*slot, generic_stages.info, true);
+            generic = pipe != VK_NULL_HANDLE;
+        } else {
+            report_.generic_refused[generic_why]++;
+        }
+        if (!pipe) return skip("pipeline not ready (shaders being translated)");
     } else {
+        // the generic pipeline drawn while its shaders were translated
+        if (!translating_pipelines_.empty()) {
+            auto it = translating_pipelines_.find(key);
+            if (it != translating_pipelines_.end()) {
+                retire_generic(*it->second);
+                translating_pipelines_.erase(it);
+            }
+        }
         pipe = pipeline(key, info, options_.async_pipelines && ps, pending, stand_in);
         // waiting for the pipeline and its exact stand-in: the generic one
         if (pending && generic_on_ && !options_.generic_only) {
-            if (generic_info(info, *vs, ps, point_coordinates, generic_stages, generic_why)) {
+            if (generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages,
+                             generic_why)) {
                 auto entry = pipelines_.find(key);
                 if (entry != pipelines_.end()) pipe = generic_stand_in(*entry->second, generic_stages.info, true);
                 if (pipe) pending = false, generic = true;
