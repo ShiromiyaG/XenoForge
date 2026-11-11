@@ -4189,3 +4189,25 @@ formats, signed versions and fallbacks), `shaders/pixel_formats.xesli` and
 `shaders/texture_load_*` (the loads), `draw_util.h`, `primitive_processor.h`,
 `spirv_shader_translator*.cc`, `shader_interpreter.h`, `trace_protocol.h`,
 `trace_reader.h`, `trace_dump.h`; `vulkan/` for how Xenia drives Vulkan.
+
+## The back face's stencil and a game's grey glass (2026-11-11)
+
+A racing game's view from inside the car showed grey where the windows
+are, on the host render target path only. Traced where it was seen (the
+player's F4) and replayed: 11.6 of 255 off Xenia's Direct3D 12 picture, the
+interlock path 0.4. Found by leaving draws out (`XF_DRAW_LIMIT`,
+`XF_DRAW_SKIP`): one rectangle list of eight strips over the screen, depth
+only, the depth test always and written, the stencil test not equal to 0
+with the back face's own test enabled (always). The game clears the depth
+where the stencil marks the car's inside, to draw it over the world. A
+rectangle, a point or a line has no facing on the console and takes the
+front face's stencil state (Xenia: the back face's only for polygonal
+primitives); the host path gave the pipeline and the dynamic state the back
+face's whenever the guest enabled it, the host's triangles of the
+rectangles faced back, and the depth was cleared behind the windows too,
+which the frame's fog pass then covered. With the front face's for what is
+no polygon: 0.39 of 255, as the interlock path.
+
+The frame is kept (`../traces/cockpit/4D5309C9_3347.xtr`, Xenia's picture in
+`../traces/dumps/pending`) but not in `replay_test` yet: 0.44% of its pixels
+are still off on both paths, the route drawn on the minimap most of them.
