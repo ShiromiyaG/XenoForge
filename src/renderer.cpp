@@ -2856,6 +2856,17 @@ private:
     void index_cache_drop();
     // the index buffer the recording command buffer has bound at offset 0
     VkBuffer bound_index_buffer_ = VK_NULL_HANDLE;
+    uint64_t draw_skip_[2] = {UINT64_MAX, 0};
+    bool draw_skip_read_ = [this] {
+        const char *v = std::getenv("XF_DRAW_SKIP");
+        unsigned long long first = 0, last = 0;
+        if (v && std::sscanf(v, "%llu-%llu", &first, &last) == 2) draw_skip_[0] = first, draw_skip_[1] = last;
+        return true;
+    }();
+    uint64_t draw_limit_ = [] {
+        const char *v = std::getenv("XF_DRAW_LIMIT");
+        return v ? uint64_t(std::strtoull(v, nullptr, 10)) : uint64_t(0);
+    }();
     float rounded_scale_in_ = 0.0f, rounded_scale_out_ = 0.0f; // the polygon offset scale last rounded
     // whether it has the draws' two sets bound, and the first's dynamic
     // offsets (XF_SET_ELISION=0: both bound at every draw, as before)
@@ -9201,6 +9212,10 @@ bool Impl::draw_front(const gpu::Draw &d, DrawFront &f) {
 
 void Impl::draw(const gpu::Draw &d) {
     report_.draws++;
+    // (XF_DRAW_LIMIT=N: the draws after the Nth left out; XF_DRAW_SKIP=A-B: the draws from the Ath to
+    // the Bth left out: for finding the one a wrong picture comes from)
+    if (draw_limit_ && report_.draws > draw_limit_) return;
+    if (report_.draws >= draw_skip_[0] && report_.draws <= draw_skip_[1]) return;
     // VIZ queries ("VIZ queries" above), counted: draws predicated on one
     // (DRAW_INDX's VIZ token, bit 8), and survey draws (PA_SC_VIZ_QUERY's
     // viz_query_ena with kill_pix_post_hi_z), drawn as they are; without
@@ -10173,7 +10188,11 @@ void Impl::draw(const gpu::Draw &d) {
             return s;
         };
         depth_state.front = face(8);
-        depth_state.back = (depth_control >> 7) & 1 ? face(20) : depth_state.front;
+        // (the back face's own only for polygons, as Xenia's: a point, line or rectangle has no
+        // facing on the console and takes the front's, whichever way the host's triangles of it
+        // face: a rectangle list clearing depth where the stencil says so otherwise passed
+        // everywhere by the back face's test)
+        depth_state.back = polygonal && ((depth_control >> 7) & 1) ? face(20) : depth_state.front;
     }
     VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blend_state.attachmentCount = 4;
@@ -10536,7 +10555,7 @@ void Impl::draw(const gpu::Draw &d) {
         return;
     }
     uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
-    if (!((depth_control >> 7) & 1)) stencil_bf = stencil;
+    if (!polygonal || !((depth_control >> 7) & 1)) stencil_bf = stencil;
     const float *blend_constants = reinterpret_cast<const float *>(&regs_[r::RB_BLEND_RED]);
     // at the resolution scale (Xenia's GetHostViewportInfo and GetScissor
     // with draw_resolution_scale): the viewport's bounds and the scissor's
