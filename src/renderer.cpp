@@ -2189,11 +2189,16 @@ private:
     uint32_t viz_survey_begin() {
         viz_survey_ = viz_predicate_ = UINT32_MAX, viz_measured_ = false;
         uint32_t viz = regs_[reg::PA_SC_VIZ_QUERY];
-        if (!viz_predicates_.buffer || (viz & 0x81) != 0x81) return UINT32_MAX;
+        if (!viz_predicates_.buffer || !(viz & 1)) return UINT32_MAX;
         uint32_t id = (viz >> 1) & 63;
         VizQuery &q = viz_[id];
         if (!q.active) return UINT32_MAX;
+        // Xenia's OnVIZSurveyDraw: any draw with viz_query_ena counts for its
+        // active query, a survey (kill_pix_post_hi_z: counted and killed after
+        // hi-Z) or a draw as any other, which is drawn under its own state and
+        // not measured here: its query stays visible (the caller's fallback)
         q.surveyed = true;
+        if (!(viz & 0x80)) return id;
         uint32_t mode = regs_[reg::RB_MODECONTROL] & 7, depth = regs_[reg::RB_DEPTHCONTROL];
         bool color = EdramMode(mode) == EdramMode::ColorDepth && (regs_[reg::RB_COLOR_MASK] & 0xFFFF);
         bool hiz = (regs_[r::RB_HIZCONTROL] >> 1) & 1;

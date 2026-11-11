@@ -2938,8 +2938,8 @@ a host occlusion query of their own (host path) or a counter of the
 interlock path, never for an occlusion report (Xenia: "surveys never count
 for a report"); at the query's end the count is copied to the ID's word,
 and the draws whose DRAW_INDX token names the ID (bit 8) run under
-conditional rendering on it. As Xenia's: a query with no survey draw drops
-its draws; one whose surveys were not all measured in one count is visible
+conditional rendering on it. As Xenia's: a query with no draw of its own
+(a survey or a draw counted for it, below) drops its draws; one whose surveys were not all measured in one count is visible
 (drawn); draws exporting memory are never predicated. Unlike Xenia, a
 survey is not normalized (its writes turned off): one that writes color,
 depth or stencil, or runs with hi-Z off (Xenia then drops the depth test;
@@ -2949,6 +2949,26 @@ measured, 422 predicated draws of which the GPU skipped 216 (28 queries
 with no sample; counted with a throwaway read-back), the picture unchanged
 (FSI 0.112/0.118; host 0.167/0.175, 850 checked against the host path without
 conditional rendering).
+
+**A draw that is counted and drawn (2026-11-11).** A query's draws need
+not be surveys: with `viz_query_ena` and no `kill_pix_post_hi_z` a draw
+counts for its query and draws as any other (Xenia's `OnVIZSurveyDraw`
+takes every draw with the enable bit). Only surveys were taken here, so
+such a query looked as one with no survey and its draws were dropped. A
+game's opening scene (game F, a played frame): six quads drawn into a
+16_16 target under a query, then a rectangle list predicated on it that
+adds the glare over the terrain, which was missing: 1.190 of 255 off
+Xenia's exact picture (0.77% of the pixels by more than 16), 0.016 with
+the draws counted. They are not measured (they draw under their own state),
+so their query stays visible, as Xenia's fallback.
+
+That frame on the host's render targets stays 1.200 off Xenia's exact
+picture, and is Xenia's own host picture to the last bit (0.000): there
+the six quads write nothing into the 16_16 target (leaving the predicated
+draw or the quads out changes nothing), with or without the float24 depth
+conversion and whichever transfer switch is set. What the quads' test
+reads on that path (the scene's depth, 1x, taken as 4x at half the pitch)
+is where to look: open, and beyond Xenia's host path.
 
 **Game G's frames 850 and 950, what is left** (0.149% and 0.150% of pixels
 off Xenia's ROV picture; Xenia's ROV and FSI pictures are 0.083% apart).
