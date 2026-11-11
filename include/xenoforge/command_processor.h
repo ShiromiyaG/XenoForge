@@ -504,10 +504,11 @@ private:
     bool extents_by_gain_ = false;
     uint32_t extents_window_ = EXTENTS_TRIAL, extents_swaps_ = 0;
     uint64_t extents_draws_ = 0, extents_skipped_ = 0; // draw packets run and skipped by their bins, this window
-    std::unordered_map<uint64_t, uint32_t> extent_reports_; // handle to address
-    std::unordered_map<uint32_t, uint64_t> extent_latest_;  // address to handle
+    std::vector<std::pair<uint64_t, uint32_t>> extent_pending_; // handle (0: answered) and address, in order
+    size_t extent_first_ = 0;                                   // the first of them still waiting
+    std::unordered_map<uint32_t, uint64_t> extent_latest_;      // address to handle (0: none)
     std::vector<Extent> extent_resolved_;
-    void write_extent(uint32_t address, const uint16_t (&extents)[6]);
+    void write_extent(uint32_t address, const uint16_t (&extents)[6], bool told = true);
     void poll_extents(bool wait);
     OcclusionQueries occlusion_ = OcclusionQueries::Fake;
     std::deque<ZpdReport> zpd_reports_;

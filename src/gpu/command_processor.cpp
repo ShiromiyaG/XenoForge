@@ -649,22 +649,27 @@ bool CommandProcessor::event_write_ext() {
     uint32_t initiator = reader_.next(), address = reader_.next() & ~3u;
     regs_.write(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
     const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
-    write_extent(address, extents);
+    uint64_t handle = 0;
     if (extents_ == ScreenExtents::Measured && sink_ && sink_->measures_extents()) {
-        uint64_t handle = sink_->extent_report();
-        if (handle) {
-            extent_reports_[handle] = address;
-            extent_latest_[address] = handle;
-        } else {
-            extent_latest_.erase(address);
-        }
+        handle = sink_->extent_report();
+        if (handle) extent_pending_.push_back({handle, address});
+        // (the latest report at the address, or none: kept, not erased, a
+        // frame's reports being at the addresses of the frame before's)
+        extent_latest_[address] = handle;
     }
+    // (a report the sink measures is written again with its bounds before the
+    // CPU may read it: nothing polling the write-backs is woken for this
+    // one, and the sink is told of the bytes once, with the bounds)
+    write_extent(address, extents, handle == 0);
     return true;
 }
 
-void CommandProcessor::write_extent(uint32_t address, const uint16_t (&extents)[6]) {
+// (told: the sink told of the bytes and what polls the write-backs woken;
+// else the caller does both, for many reports at once)
+void CommandProcessor::write_extent(uint32_t address, const uint16_t (&extents)[6], bool told) {
     uint8_t *p = physical(address);
     for (int i = 0; i < 6; i++) p[2 * i] = uint8_t(extents[i] >> 8), p[2 * i + 1] = uint8_t(extents[i]);
+    if (!told) return;
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, sizeof(extents));
     host_.wrote_back();
 }
@@ -672,26 +677,48 @@ void CommandProcessor::write_extent(uint32_t address, const uint16_t (&extents)[
 // The sink's answers to the screen extent reports in (all of them, waited
 // for, with wait), each written where no later report has been since.
 void CommandProcessor::poll_extents(bool wait) {
-    if (extent_reports_.empty() || !sink_) return;
+    if (extent_first_ == extent_pending_.size() || !sink_) return;
     if (wait) sink_->extent_wait();
     extent_resolved_.clear();
     sink_->extent_poll(extent_resolved_);
+    // (the reports' records are an array in guest memory: the sink told of
+    // each run of neighbours once, not of every record)
+    bool written = false;
+    uint32_t run_start = 0, run_end = 0;
+    auto tell = [&] {
+        if (run_end > run_start) sink_->memory_written(run_start, run_end - run_start);
+        run_start = run_end = 0;
+    };
     for (const Extent &e : extent_resolved_) {
-        auto report = extent_reports_.find(e.handle);
-        if (report == extent_reports_.end()) continue;
-        uint32_t address = report->second;
-        extent_reports_.erase(report);
+        // (the answers come in the reports' order: found at the first one waiting, or near it)
+        size_t at = extent_first_;
+        while (at < extent_pending_.size() && extent_pending_[at].first != e.handle) at++;
+        if (at == extent_pending_.size()) continue;
+        const uint32_t address = extent_pending_[at].second;
+        extent_pending_[at].first = 0;
+        while (extent_first_ < extent_pending_.size() && !extent_pending_[extent_first_].first) extent_first_++;
         auto latest = extent_latest_.find(address);
         if (latest == extent_latest_.end() || latest->second != e.handle) continue;
-        extent_latest_.erase(latest);
+        latest->second = 0;
+        // (the whole screen is there already, written with the report: the sink told of it now)
+        const uint32_t physical_address = address & PHYSICAL_MASK;
+        // (a record is 16 bytes, 12 of them written: the 4 between two neighbours go with them)
+        if (run_end == run_start || physical_address < run_start || physical_address > run_end + 4)
+            tell(), run_start = run_end = physical_address;
+        run_end = std::max(run_end, physical_address + 12);
         if (e.whole) continue;
         // in 8-pixel units, outwards: the left and top down, the right and
         // bottom (exclusive) up
         uint32_t right = std::min<uint32_t>(e.right, 8192), bottom = std::min<uint32_t>(e.bottom, 8192);
         const uint16_t extents[6] = {uint16_t(std::min(e.left, right) >> 3), uint16_t((right + 7) >> 3),
                                      uint16_t(std::min(e.top, bottom) >> 3), uint16_t((bottom + 7) >> 3), 0, 1};
-        write_extent(address, extents);
+        write_extent(address, extents, false);
+        written = true;
     }
+    tell();
+    if (extent_first_ == extent_pending_.size()) extent_pending_.clear(), extent_first_ = 0;
+    // (what polls the write-backs woken once for all of them)
+    if (written) host_.wrote_back();
 }
 
 // a z-pass done event: an occlusion query's report (xe_gpu_depth_sample_

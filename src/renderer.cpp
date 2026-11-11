@@ -1478,6 +1478,15 @@ public:
     bool measures_extents() override { return extents_.buffer != VK_NULL_HANDLE; }
     void extent_init() override {
         Call call(*this, nullptr);
+        // Between two reports, the draws recorded so far handed to the GPU
+        // once there are enough of them: the processor waits for the GPU
+        // where the guest may read the extents (extent_wait), and a pass of
+        // thousands of draws submitted only then left the GPU idle while it
+        // was recorded and the processor idle while it was drawn. (Not
+        // inside a report: one a submission begins in is the whole screen.)
+        if (call && extent_flush_draws_ && slots_[current_].recording &&
+            report_.drawn - drawn_at_submission_ >= extent_flush_draws_)
+            flush();
         extent_open_ = true, extent_whole_ = false, extent_index_ = UINT32_MAX, extent_margin_ = 0;
     }
     uint64_t extent_report() override {
@@ -2291,6 +2300,13 @@ private:
     uint64_t extent_next_ = 1;                 // the next report's handle
     bool extent_drawn_ = false;                // the draw being made bounded its report
     std::vector<gpu::Extent> extent_resolved_; // for extent_poll
+    // extent_init's submissions: after this many draws (XF_EXTENT_FLUSH_DRAWS, 0 for none), and the
+    // draws drawn when the submission being recorded began
+    uint64_t extent_flush_draws_ = [] {
+        const char *v = std::getenv("XF_EXTENT_FLUSH_DRAWS");
+        return v ? uint64_t(std::strtoull(v, nullptr, 10)) : uint64_t(512);
+    }();
+    uint64_t drawn_at_submission_ = 0;
     // the draw being made bounds the open report (the index of its words in
     // extents_), or UINT32_MAX: it cannot, and the report is the whole screen
     uint32_t extent_draw_words() {
@@ -4454,6 +4470,7 @@ void Impl::begin_recording() {
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(s.cmd, &begin);
         s.recording = true;
+        drawn_at_submission_ = report_.drawn;
         s.serial = next_serial_++;
         s.used = 0, s.draw_used = 0;
         s.readback = 0, s.readback_used = 0;
@@ -10573,7 +10590,13 @@ void Impl::draw(const gpu::Draw &d) {
         }
     const bool all = !draw_state_valid_ || !draw_state_elision_;
     const DrawState &o = draw_state_;
-    auto differs = [all](const auto &a, const auto &b) { return all || std::memcmp(&a, &b, sizeof(a)) != 0; };
+    // (whether any of it did: the kept copy is written again only then)
+    bool state_changed = all;
+    auto differs = [all, &state_changed](const auto &a, const auto &b) {
+        if (!all && std::memcmp(&a, &b, sizeof(a)) == 0) return false;
+        state_changed = true;
+        return true;
+    };
     if (differs(n.viewport, o.viewport)) record_value(c, Recorded::Viewport, n.viewport);
     if (differs(n.scissor, o.scissor)) record_value(c, Recorded::Scissor, n.scissor);
     if (differs(n.blend_constants, o.blend_constants)) record_value(c, Recorded::BlendConstants, n.blend_constants);
@@ -10689,7 +10712,7 @@ void Impl::draw(const gpu::Draw &d) {
                          Recorded::Bias{host_float, n.depth_bias[0], n.depth_bias[1]});
         }
     }
-    draw_state_ = n;
+    if (state_changed) draw_state_ = n;
     draw_state_valid_ = true;
     if (options_.gpu_timing_draws) {
         // each draw timed on its own, counted to its shaders

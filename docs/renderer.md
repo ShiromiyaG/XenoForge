@@ -2712,6 +2712,19 @@ them always): measured for 120 swaps, kept while the bins skip at least a
 seventh of the draw packets, else the whole screen for 600 swaps and tried
 again. The picture is the same either way.
 
+What measuring itself cost was then cut (game G in play, the default
+choice):
+
+| change | commands a swap | frames a second | CPU a swap, all threads |
+| --- | --- | --- | --- |
+| measured by its gain | 31.3 ms | 28.2 | 151 ms |
+| a report's record written once where the sink measures it, without waking what polls the write-backs (1,200 wakes a frame: once for all of them as the bounds come in), the reports waiting in a list, not two maps; the kept dynamic state written again only where a draw changed it | 31.1 ms | 28.3 | 136 ms |
+| the draws recorded so far submitted between two reports once there are 512 of them (`XF_EXTENT_FLUSH_DRAWS`, 0 for none): the GPU draws the pass while it is recorded, where the processor waited for all of it at the interrupt | 29.9 ms | 28.8 | 138 ms |
+| the sink told of the records' bytes a run of neighbours at a time | 29.3 ms | 29.2 | 134 ms |
+
+A frame is still missed now and then (27 to 31 swaps in a second): the
+work a swap is 29 ms of the 33.
+
 ## The command thread's costs (2026-11-09)
 
 The thread that runs the command processor and the renderer ("GPU
