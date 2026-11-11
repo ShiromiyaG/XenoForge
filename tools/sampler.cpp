@@ -93,12 +93,44 @@ bool generated_at(uint64_t address, std::string &name, uint64_t &displacement) {
 // pointer lies in the thread's stack (low to high): a frame taken for a leaf
 // that is none (code without unwind data that moved the stack pointer)
 // leaves it anywhere, and reading there faulted the whole run.
+//
+// The unwind itself may still read anywhere: a function that keeps a frame
+// register is unwound through it, and where the frames before were taken
+// wrongly it holds anything. So the walk is guarded: a handler put before
+// the process's own (which reports any fault as the run's crash) takes an
+// access violation of the walking thread back to where the walk began,
+// which then ends with the frames it had.
 constexpr int FRAMES = 48;
+thread_local volatile int walk_state = 0; // 1: walking; 2: a fault took it back
+thread_local volatile int walk_depth = 0;
+thread_local CONTEXT walk_resume;
+
+LONG CALLBACK walk_guard(EXCEPTION_POINTERS *e) {
+    if (walk_state != 1 || e->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    walk_state = 2;
+    *e->ContextRecord = walk_resume;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 int walk(CONTEXT ctx, uint64_t out[FRAMES], uint64_t low, uint64_t high) {
+    static const bool guarded = AddVectoredExceptionHandler(1, walk_guard) != nullptr;
+    (void)guarded;
+    walk_state = 0, walk_depth = 0;
+    RtlCaptureContext(&walk_resume);
+    if (walk_state == 2) { // (here again after a fault)
+        walk_state = 0;
+        return walk_depth;
+    }
+    walk_state = 1;
     int depth = 0;
     for (; depth < FRAMES && ctx.Rip; depth++) {
         out[depth] = ctx.Rip;
-        if (ctx.Rsp < low || ctx.Rsp + 256 > high || (ctx.Rsp & 7)) return depth + 1;
+        walk_depth = depth + 1;
+        if (ctx.Rsp < low || ctx.Rsp + 256 > high || (ctx.Rsp & 7)) {
+            walk_state = 0;
+            return depth + 1;
+        }
         DWORD64 image = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
         if (!fn) {
@@ -111,6 +143,7 @@ int walk(CONTEXT ctx, uint64_t out[FRAMES], uint64_t low, uint64_t high) {
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
         }
     }
+    walk_state = 0;
     return depth;
 }
 
@@ -200,8 +233,21 @@ bool generated_name(std::string n) {
     return true;
 }
 
+// A sample weighs the cycles its thread ran since the sample before, and they
+// go to where the thread is when sampled. A thread that works in short
+// bursts between waits is found waiting nearly every time, so its bursts'
+// cycles would all be read as the wait's own cost: a thread sampled in one of
+// the system's waits (the syscall's return) has them counted apart instead,
+// as work the samples did not see.
+bool waiting_name(const std::string &n) {
+    if (n.size() < 3 || (n.compare(0, 2, "Nt") != 0 && n.compare(0, 2, "Zw") != 0)) return false;
+    return n.find("Wait") != std::string::npos || n.find("DelayExecution") != std::string::npos ||
+           n.find("RemoveIoCompletion") != std::string::npos;
+}
+
 std::string category(const std::string &name, const std::string &module) {
     if (generated_name(name)) return "generated code";
+    if (waiting_name(name)) return "unseen: bursts of threads found waiting when sampled";
     if (name.find("ppc::ops::") != std::string::npos) return "instructions' cold paths";
     if (name.find("ppc::interpret") != std::string::npos || name.find("ppc_interp") != std::string::npos ||
         name.find("ppc::Interpreter") != std::string::npos)
