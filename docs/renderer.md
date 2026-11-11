@@ -2727,8 +2727,14 @@ choice):
 | the draws recorded so far submitted between two reports once there are 512 of them (`XF_EXTENT_FLUSH_DRAWS`, 0 for none): the GPU draws the pass while it is recorded, where the processor waited for all of it at the interrupt | 29.9 ms | 28.8 | 138 ms |
 | the sink told of the records' bytes a run of neighbours at a time | 29.3 ms | 29.2 | 134 ms |
 
-A frame is still missed now and then (27 to 31 swaps in a second): the
-work a swap is 29 ms of the 33.
+| a stage's float constants uploaded by the blocks of 8 its shader reads (`Shader::float_blocks`, from the microcode's ALU operands; all of them when one is read relative to a0 or aL, and for the generic shaders; `XF_CONSTANT_BLOCKS=0`): the game's shaders read a few low constants and c254, c255, so "up to the last one read" spared nothing; with the game's library rebuilt for the vector unit's whole-vector arithmetic (docs/recompiler.md) | 27.4 ms | 29.5 | 115 ms |
+
+A frame is still missed now and then (27 to 31 swaps in a second, 80 of 87
+at 29 or 30): the work a swap is 27 ms of the 33. What the uploads into the
+draw data still cost, by the profile: the system constants 3.6% of the
+command thread (784 bytes at nearly every draw: a screen extent report's
+word and the textures' slots change them), the constants' fetch and boolean
+part 1.4%, the float blocks 1.3%.
 
 ## The command thread's costs (2026-11-09)
 

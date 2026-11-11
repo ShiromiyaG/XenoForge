@@ -661,6 +661,9 @@ struct Shader {
     // vertex fetch slots as masks, and the blocks of 32 fetch constant words they lie in
     uint64_t texture_mask = 0, vertex_mask[2] = {};
     uint32_t fetch_blocks = 0;
+    // the float constants its instructions read, a bit per block of 8 (c0-c7, c8-c15, ...): all
+    // of them when one is read relative to a0 or aL. A draw uploads those blocks alone.
+    uint32_t float_blocks = 0xFFFFFFFFu;
     uint32_t filter_mask = 0; // the slots (below 32) filters has
     std::array<uint32_t, 4> slot_filters[32] = {}; // filters' for those slots, without the map's search
     // its program for the generic shaders (Impl::program): encoded once, at
@@ -2729,6 +2732,11 @@ private:
     }();
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
+    uint32_t last_constants_blocks_[2] = {}; // the blocks of float constants uploaded there (Shader::float_blocks)
+    bool constant_blocks_ = [] {
+        const char *v = std::getenv("XF_CONSTANT_BLOCKS");
+        return !(v && v[0] == '0');
+    }();
 
     // ---- a draw's front part ----
     // What a draw works out from the registers of the draws' state alone
@@ -5207,6 +5215,25 @@ void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
                 s->vertex_mask[slot >> 6] |= 1ull << (slot & 63);
                 if (slot < 96) s->fetch_blocks |= 1u << (slot * 2 / 32);
             }
+        // the float constants read (every ALU operand of every exec, reached or not)
+        s->float_blocks = 0;
+        for (const xf::ucode::ControlFlow &cf : s->parsed.control_flow) {
+            const auto *exec = std::get_if<xf::ucode::Exec>(&cf.instruction);
+            if (!exec) continue;
+            for (const xf::ucode::ExecSlot &slot : exec->slots) {
+                const auto *alu = std::get_if<xf::ucode::AluInstruction>(&slot.instruction);
+                if (!alu) continue;
+                auto read = [&](const xf::ucode::Operand &o) {
+                    if (o.source != xf::ucode::StorageSource::ConstantFloat) return;
+                    if (o.addressing != xf::ucode::StorageAddressing::Absolute)
+                        s->float_blocks = 0xFFFFFFFFu;
+                    else if (o.index < 256)
+                        s->float_blocks |= 1u << (o.index / 8);
+                };
+                for (uint32_t k = 0; k < alu->vector_operand_count && k < 3; k++) read(alu->vector_operands[k]);
+                for (uint32_t k = 0; k < alu->scalar_operand_count && k < 2; k++) read(alu->scalar_operands[k]);
+            }
+        }
         s->hash = hash;
         report_.shaders++;
         if (storage_ && storage_->add_shader(type, hash, code)) report_.shaders_stored++;
@@ -10442,10 +10469,30 @@ void Impl::draw(const gpu::Draw &d) {
     }
     uint32_t dynamic_offsets[4] = {0, 0, 0, last_fsi_at_ == NONE ? 0u : uint32_t(last_fsi_at_)};
     for (int stage = 0; stage < 2; stage++) {
-        // (uploaded again when a draw found them changed, and in each new submission)
-        if (last_constants_at_[stage] == NONE) {
+        // The float constants the stage's shader reads, by blocks of 8 (Shader::float_blocks; Cemu
+        // and RPCS3 upload a shader's own constants too): 4 KB of them went up at nearly every
+        // draw for the few a shader reads. All of them for the generic shaders, which read by
+        // the microcode's index. XF_CONSTANT_BLOCKS=0: all, always.
+        const Shader *reader = stage == 0 ? vs : ps;
+        const uint32_t blocks = !constant_blocks_ || generic ? 0xFFFFFFFFu : reader ? reader->float_blocks : 0u;
+        // (uploaded again when a draw found them changed, in each new submission, and where the
+        // blocks there are not all this draw's)
+        if (last_constants_at_[stage] == NONE || (blocks & ~last_constants_blocks_[stage])) {
             last_constants_at_[stage] = draw_data_take(sizeof(harness::Constants), ubo_align_);
-            upload(draw_data(last_constants_at_[stage]), &last_constants_[stage], sizeof(harness::Constants));
+            uint8_t *to = draw_data(last_constants_at_[stage]);
+            const harness::Constants &from = last_constants_[stage];
+            if (blocks == 0xFFFFFFFFu) {
+                upload(to, &from, sizeof(harness::Constants));
+            } else {
+                constexpr size_t BLOCK = 8 * 16, FLOATS = sizeof(from.float_constants);
+                static_assert(FLOATS == 32 * BLOCK && offsetof(harness::Constants, float_constants) == 0);
+                for (uint32_t left = blocks; left; left &= left - 1) {
+                    const size_t at = size_t(std::countr_zero(left)) * BLOCK;
+                    upload(to + at, reinterpret_cast<const uint8_t *>(&from) + at, BLOCK);
+                }
+                upload(to + FLOATS, reinterpret_cast<const uint8_t *>(&from) + FLOATS, sizeof(harness::Constants) - FLOATS);
+            }
+            last_constants_blocks_[stage] = blocks;
         }
     }
     if (last_system_at_ == NONE || std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
