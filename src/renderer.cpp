@@ -2733,6 +2733,7 @@ private:
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
     uint32_t last_constants_blocks_[2] = {}; // the blocks of float constants uploaded there (Shader::float_blocks)
+    uint32_t last_system_slots_ = 0;         // how many slots of the system constants' tables are uploaded there
     bool constant_blocks_ = [] {
         const char *v = std::getenv("XF_CONSTANT_BLOCKS");
         return !(v && v[0] == '0');
@@ -10495,10 +10496,37 @@ void Impl::draw(const gpu::Draw &d) {
             last_constants_blocks_[stage] = blocks;
         }
     }
-    if (last_system_at_ == NONE || std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
+    // (all of the tables for the generic shaders, and with XF_CONSTANT_BLOCKS=0)
+    const uint32_t system_slots = !constant_blocks_ || generic
+                                      ? 32u
+                                      : uint32_t(std::min(64 - std::countl_zero(texture_slots | 1), 32));
+    if (last_system_at_ == NONE || system_slots > last_system_slots_ ||
+        std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
         last_system_at_ = draw_data_take(sizeof(System), ubo_align_);
         last_system_ = sys;
-        upload(draw_data(last_system_at_), &last_system_, sizeof(System));
+        last_system_slots_ = system_slots;
+        // Two draws in three upload them, most for the textures of their slots, and 512 of
+        // the 784 bytes are the four tables of 32 slots, of which a draw's shaders read the
+        // first few: each table goes up to the last slot the shaders fetch from, with what
+        // lies before it (those there are a draw's whose shaders fetch no further).
+        const uint32_t slots = system_slots;
+        uint8_t *to = draw_data(last_system_at_);
+        const uint8_t *from = reinterpret_cast<const uint8_t *>(&last_system_);
+        if (slots == 32) {
+            upload(to, from, sizeof(System));
+        } else {
+            auto piece = [&](size_t first, size_t end) { upload(to + first, from + first, end - first); };
+            constexpr size_t SLOTS = offsetof(System, slots), FLAGS = offsetof(System, flags);
+            constexpr size_t SIGNS = offsetof(System, signs), SIGNED = offsetof(System, signed_slots);
+            constexpr size_t CLIP = offsetof(System, clip_planes), SCALE = offsetof(System, integer_scale);
+            constexpr size_t REST = offsetof(System, blend_premultiply);
+            static_assert(SLOTS < FLAGS && FLAGS < SIGNS && SIGNS < SIGNED && SIGNED < CLIP && CLIP < SCALE && SCALE < REST);
+            piece(0, SLOTS + 4 * slots);          // the NDC transform, the slots
+            piece(FLAGS, SIGNS + 4 * slots);      // flags, values, scales, the point, the signs
+            piece(SIGNED, SIGNED + 4 * slots);    // the signed views
+            piece(CLIP, SCALE + 4 * slots);       // clip planes, the extent's, the integer scales
+            piece(REST, sizeof(System));          // the blend's, the generic shaders'
+        }
     }
     // Every block the draw reads lies in its own submission's share: one in
     // another's is the host's to write again while this one runs (the lost
