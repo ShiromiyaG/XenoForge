@@ -396,9 +396,6 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                 settings.game.empty() ? "" : (std::string(" (the game's own, ") + title_id + ")").c_str());
     std::filesystem::path key_shots =
         settings.screenshots.empty() ? config_file.parent_path() / "screenshots" : settings.screenshots;
-    // F4's traces go beside F12's screenshots unless XF_TRACE_DIR named a folder (game.cpp): the
-    // writer stands by, telling the renderer of nothing until a frame is asked for
-    if (!g.trace && g.renderer && !game::start_trace(g, {}, key_shots, error)) return fail(error);
 
     // the window: the game's name and image (its executable's XDBF), else the port's name or the title ID and
     // XenoForge's mark
@@ -567,6 +564,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         mailbox.shots.push_back({swap, k.uptime_ms(), frame});
     };
     if (!game::start_renderer(g, options, error)) return fail(error);
+    // F4's traces go beside F12's screenshots unless XF_TRACE_DIR named a folder (game.cpp): the
+    // writer stands by, telling the renderer of nothing until a frame is asked for
+    if (!g.trace && !game::start_trace(g, {}, key_shots, error)) return fail(error);
     const std::string scale_notice = g.renderer->scale_notice();
     if (g.renderer->resolution_scale() != 4 || !scale_notice.empty())
         std::printf("drawing at %u%% of the console's resolution%s%s\n", g.renderer->resolution_scale() * 25,
