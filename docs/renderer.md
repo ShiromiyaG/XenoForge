@@ -1797,6 +1797,11 @@ found.
 | vertex ranges kept as last found in the mirror (`XF_VERTEX_RANGE_MEMO=0`: unwritten since by blocks of pages); pipelines found through a table by the key's hash | (see below) |
 | uploads into the draw data through a copy the compiler cannot fold: one build read the system constants back from that write-combined memory, 10% of the thread | 38.5 ms |
 
+Tried and left out: the pipeline's key, description and lookup and the
+dynamic state's block skipped for a draw whose front part is the draw
+before's (the pipeline and what the state takes of its description kept):
+38.8 ms live against 38.5, no gain for two more things to keep in step.
+
 Still three vblanks a frame: 38.5 ms against the 32 needed. What is left by
 size, live: the driver in the draws' own commands 10.8%, the constants'
 upload 3.6% (5 KB a stage at nearly every draw: only what the shader reads,

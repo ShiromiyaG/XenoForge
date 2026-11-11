@@ -11690,6 +11690,9 @@ bool Impl::native_keep(native::PassInfo &pass) {
 // the hook submits on the device's queue after the flush comes after them,
 // and before the renderer's next work.
 void Impl::swap() {
+    // (what the draws keep of one another is a frame's: a setting changed between two, as the
+    // resolution scale, is in none of their keys)
+    front_valid_ = false;
     // the draws after a swap count for no report until the next one
     // (Xenia's EndZPDFrame)
     end_query();
