@@ -7,6 +7,7 @@
 #include "xenoforge/disc.h"
 #include "xenoforge/exports.h"
 #include "xenoforge/package.h"
+#include "xenoforge/title_update.h"
 #include "xenoforge/xex.h"
 
 #include <cctype>
@@ -30,6 +31,7 @@ void usage() {
                 "  --list               its files\n"
                 "  --extract <dir>      write its files under <dir>\n"
                 "  --xex <path>         the executable on the disc (default.xex)\n"
+                "  --update <file>      a title update's package: its patch applied to the executable's image\n"
                 "  --files              list the disc's files\n"
                 "  --exports            each export of the module itself (ordinal, name when ours knows it, address)\n"
                 "  --imports            each import: library, ordinal, name, kind (tab separated)\n"
@@ -217,7 +219,7 @@ int inspect_package(const std::filesystem::path &path, bool list, const std::str
 } // namespace
 
 int main(int argc, char **argv) {
-    std::filesystem::path input, package_input;
+    std::filesystem::path input, package_input, update_input;
     std::string xex_path = "default.xex", dump_path, dump_xex_path, extract_path;
     bool files = false, imports = false, list = false, exports = false;
     std::string table_library; // the export table of ours that names this module's ordinals
@@ -225,6 +227,7 @@ int main(int argc, char **argv) {
         std::string a = argv[i];
         if (a == "--xex" && i + 1 < argc) xex_path = argv[++i];
         else if (a == "--package" && i + 1 < argc) package_input = std::filesystem::path(argv[++i]);
+        else if (a == "--update" && i + 1 < argc) update_input = std::filesystem::path(argv[++i]);
         else if (a == "--list") list = true;
         else if (a == "--extract" && i + 1 < argc) extract_path = argv[++i];
         else if (a == "--files") files = true;
@@ -341,6 +344,30 @@ int main(int argc, char **argv) {
     if (!have_image) std::printf("image         not loaded: %s\n", error.c_str());
     else if (xex.encryption == XexEncryption::None) std::printf("image         loaded (not encrypted)\n");
     else std::printf("image         decrypted with the %s key\n", xex.devkit ? "devkit" : "retail");
+    // a title update's patch of this executable, applied
+    if (have_image && !update_input.empty()) {
+        std::unique_ptr<TitleUpdate> update = TitleUpdate::open(update_input, error);
+        if (!update) {
+            std::fprintf(stderr, "%s: %s\n", update_input.string().c_str(), error.c_str());
+            return 1;
+        }
+        const std::vector<uint8_t> patch = update->patch(looks_like_xex(input) ? input.filename().string() : xex_path);
+        const uint64_t before = image_digest(xex.image);
+        const size_t size_before = xex.image.size();
+        if (patch.empty()) {
+            std::printf("update        no patch for this executable in the package\n");
+        } else if (!apply_xex_patch(xex, patch, error)) {
+            std::printf("update        not applied: %s\n", error.c_str());
+            have_image = !xex.image.empty();
+        } else {
+            std::printf("update        applied (%zu bytes of patch): version %u.%u.%u.%u, image %zu -> %zu bytes, "
+                        "digest %016llx -> %016llx, entry 0x%08X\n",
+                        patch.size(), xex.execution.version >> 28, (xex.execution.version >> 24) & 0xF,
+                        (xex.execution.version >> 8) & 0xFFFF, xex.execution.version & 0xFF, size_before,
+                        xex.image.size(), (unsigned long long)before, (unsigned long long)image_digest(xex.image),
+                        xex.entry_point);
+        }
+    }
 
     // the module's own exports: the table in the image, at the address the
     // security info gives (xex2_export_table: count and base at 0x24 and 0x28,

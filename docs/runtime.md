@@ -1089,6 +1089,31 @@ functions has a frame above a page, for which the compiler on Windows
 calls the runtime's stack probe (`__chkstk`): the library's entry file now
 defines it (`game_build.cpp`, `STACK_PROBE`), where the link failed.
 
+### A title update's patch (2026-11-11, not yet wired in)
+
+A title update is a content package of type 0x000B0000 whose files replace
+or patch the game's; an executable's patch is the file of its own path with
+a `p` added (`default.xexp`). `TitleUpdate` (`title_update.h`) opens one,
+finds a title's among content folders (`<root>\<title id> B0000\<file>`,
+the highest version) and gives an executable's patch; `apply_xex_patch`
+(`xex.h`, Xenia's `XexModule::ApplyPatch` with
+`KernelState::IsPatchSignatureProper`'s check first) applies it to the
+executable loaded by `load_xex_image`: the headers' delta, the headers read
+again, the keys (the base's new one opens the patch's and, as a check, the
+base's old one kept in the patch), then each block's chunks over the image
+(`lzx_decompress_delta`, zero fills and copies), every offset checked.
+`xfinspect <disc> --update <package>` applies one and prints the version,
+size and digest it gives.
+
+State: the one update at hand is for another pressing of its game (it
+takes version 0.0.0.12 to 0.0.4.12; the disc here is 0.0.0.10, another
+media id), so the patch is refused by the signature check, as it should
+be, and the application itself has not run on real data yet. For that
+reason nothing uses it yet: left are the recompiler's modules taking their
+patches (`recomp::ModuleFile`), boot and the player applying them and
+mounting the package as `UPDATE:`, the kernel's module loads, and the
+launcher finding the update beside the game or in the content folders.
+
 ## XAM
 
 As built (`src/kernel/xam.h`; xam.cpp, xam_content.cpp, xam_user.cpp,

@@ -363,6 +363,161 @@ bool load_xex_image(std::span<const uint8_t> file, Xex &xex, std::string &error)
     return false;
 }
 
+namespace {
+
+// lzxdelta_apply_patch: the chunks of a delta (each: where its reference
+// lies and where it goes in `dest`, its length there, the compressed
+// length, the LZX data), until one of zeros or the end. A compressed length
+// of 0 fills with zeros, of 1 copies the reference.
+bool apply_delta(std::span<const uint8_t> chunks, uint32_t window, std::span<uint8_t> dest, std::string &error) {
+    std::vector<uint8_t> reference;
+    for (size_t at = 0; at + 12 <= chunks.size();) {
+        const uint8_t *c = chunks.data() + at;
+        const uint32_t old_at = be32(c), new_at = be32(c + 4), length = be16(c + 8), compressed = be16(c + 10);
+        if (!old_at && !new_at && !length && !compressed) break;
+        if (!fits(dest, new_at, length)) return error = "a chunk writes past its target", false;
+        at += 12;
+        if (compressed == 0) {
+            std::memset(dest.data() + new_at, 0, length);
+        } else if (!fits(dest, old_at, length)) {
+            return error = "a chunk reads past its source", false;
+        } else if (compressed == 1) {
+            std::memmove(dest.data() + new_at, dest.data() + old_at, length);
+        } else {
+            if (compressed > chunks.size() - at) return error = "a chunk runs past the patch", false;
+            // (the reference kept apart: the chunk may write over it)
+            reference.assign(dest.begin() + old_at, dest.begin() + old_at + length);
+            if (!lzx_decompress_delta(chunks.subspan(at, compressed), reference, dest.subspan(new_at, length), window,
+                                      error))
+                return false;
+            at += compressed;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+// XexModule::ApplyPatch, with KernelState::IsPatchSignatureProper's check
+// first (Xenia skips an update whose check fails unless told otherwise).
+bool apply_xex_patch(Xex &xex, std::span<const uint8_t> patch_file, std::string &error) {
+    Xex patch;
+    if (!parse_xex(patch_file, patch, error)) return error = "the patch: " + error, false;
+    if (!patch.is_patch()) return error = "not a patch (.xexp)", false;
+    const uint8_t *d = header_data(patch_file, patch, xex_key::DELTA_PATCH_DESCRIPTOR, 0x4C);
+    if (!d) return error = "the patch has no delta patch descriptor", false;
+    const uint32_t descriptor_size = be32(d);
+    if (descriptor_size < 0x4C ||
+        !fits(patch_file, find_header(patch, xex_key::DELTA_PATCH_DESCRIPTOR)->second, descriptor_size))
+        return error = "the patch's descriptor runs past the file", false;
+    const uint8_t *format = header_data(patch_file, patch, xex_key::FILE_FORMAT_INFO, 36);
+    if (!format || be32(format) < 36) return error = "the patch has no compressed blocks", false;
+    const uint32_t window = be32(format + 8);
+
+    // the base executable the patch was made for: its signature's SHA-1
+    if (!fits(xex.header, xex.security_offset, 0x184)) return error = "the base executable's headers are short", false;
+    uint8_t digest[20];
+    sha1({xex.header.data() + xex.security_offset + 8, 0x100}, digest);
+    if (std::memcmp(digest, d + 0xC, 20) != 0) {
+        auto version = [](uint32_t v) {
+            return std::to_string(v >> 28) + "." + std::to_string((v >> 24) & 0xF) + "." +
+                   std::to_string((v >> 8) & 0xFFFF) + "." + std::to_string(v & 0xFF);
+        };
+        return error = "the patch is for another executable (it takes version " + version(be32(d + 8)) + " to " +
+                       version(be32(d + 4)) + "; this one is " + version(xex.execution.version) + ")",
+               false;
+    }
+
+    const uint32_t target_headers = be32(d + 0x30), headers_source = be32(d + 0x34), headers_size = be32(d + 0x38),
+                   headers_target = be32(d + 0x3C), image_source = be32(d + 0x40), image_size = be32(d + 0x44),
+                   image_target = be32(d + 0x48);
+    const uint32_t header_size = uint32_t(xex.header.size());
+    if (headers_source > header_size) return error = "the header patch's source is outside the base's headers", false;
+    if (headers_size > header_size - headers_source) return error = "the header patch's source is too large", false;
+    if (headers_target > target_headers) return error = "the header patch's target is outside the headers", false;
+    if (headers_size > target_headers - headers_target)
+        return error = "the header patch's source exceeds its target", false;
+
+    // the headers
+    const uint64_t original_image_size = xex.image.size();
+    const uint32_t header_target_size = target_headers ? target_headers : headers_target + headers_size;
+    std::vector<uint8_t> header = xex.header;
+    if (header_target_size > header.size()) header.resize(header_target_size);
+    if (headers_source) std::memmove(header.data() + headers_target, header.data() + headers_source, headers_size);
+    if (header_target_size < header.size())
+        std::memset(header.data() + header_target_size, 0, header.size() - header_target_size);
+    if (!apply_delta({d + 0x4C, descriptor_size - 0x4C}, window, header, error))
+        return error = "the header patch: " + error, false;
+    header.resize(header_target_size);
+
+    // the executable as its patched headers describe it
+    Xex patched;
+    if (!parse_xex(header, patched, error)) return error = "the patched headers: " + error, false;
+    if (patched.is_patch()) return error = "the patched headers are a patch's", false;
+    const uint64_t new_image_size = std::max<uint64_t>(patched.image_size, pages_size(patched));
+    if (new_image_size > (512u << 20)) return error = "the patched image is implausibly large", false;
+
+    // the keys: the base's old and new ones by the console's, the patch's by
+    // the base's new one, which also opens the old one kept in the patch
+    const aes::Key console = aes::expand(xex.devkit ? DEVKIT_KEY : RETAIL_KEY);
+    uint8_t old_session[16], session[16], patch_session[16], test[16];
+    std::memcpy(old_session, xex.file_key, 16);
+    aes::decrypt_ecb(console, old_session, 16);
+    std::memcpy(session, patched.file_key, 16);
+    aes::decrypt_ecb(console, session, 16);
+    const aes::Key base_key = aes::expand(session);
+    std::memcpy(patch_session, patch.file_key, 16);
+    aes::decrypt_ecb(base_key, patch_session, 16);
+    std::memcpy(test, d + 0x20, 16);
+    aes::decrypt_ecb(base_key, test, 16);
+    if (std::memcmp(test, old_session, 16) != 0)
+        return error = "the patch's image key is not the base executable's", false;
+
+    std::vector<uint8_t> data(patch_file.begin() + patch.header_size, patch_file.end());
+    if (patch.encryption == XexEncryption::Normal) {
+        const uint8_t iv[16] = {};
+        aes::decrypt_cbc(aes::expand(patch_session), iv, data.data(), data.size() & ~size_t(15));
+    } else if (patch.encryption != XexEncryption::None) {
+        return error = "the patch's encryption is unknown", false;
+    }
+
+    // the image (from here on the base's is gone): its source moved to its
+    // target, then each block's chunks
+    patched.devkit = xex.devkit;
+    patched.image = std::move(xex.image);
+    xex.image.clear();
+    std::vector<uint8_t> &image = patched.image;
+    if (new_image_size > image.size()) image.resize(size_t(new_image_size));
+    if (image_source) {
+        if (!fits(image, image_source, image_size) || !fits(image, image_target, image_size))
+            return error = "the image patch's source or target is outside the image", false;
+        std::memmove(image.data() + image_target, image.data() + image_source, image_size);
+    }
+    if (const uint64_t target_size = uint64_t(image_target) + image_size; target_size < original_image_size)
+        std::memset(image.data() + target_size, 0, size_t(original_image_size - target_size));
+    uint32_t block_size = be32(format + 12);
+    const uint8_t *block_hash = format + 16;
+    for (size_t at = 0; block_size;) {
+        if (block_size < 24 || block_size > data.size() - at) return error = "a patch block runs past the file", false;
+        const uint8_t *block = data.data() + at;
+        sha1({block, block_size}, digest);
+        if (std::memcmp(digest, block_hash, 20) != 0) return error = "a patch block's SHA-1 differs", false;
+        if (!apply_delta({block + 24, block_size - 24}, window, image, error))
+            return error = "the image patch: " + error, false;
+        at += block_size;
+        block_size = be32(block);
+        block_hash = block + 4;
+    }
+    image.resize(size_t(new_image_size));
+    xex = std::move(patched);
+    return true;
+}
+
+bool load_xex(std::span<const uint8_t> file, std::span<const uint8_t> patch, Xex &xex, std::string &error) {
+    if (!parse_xex(file, xex, error) || !load_xex_image(file, xex, error)) return false;
+    return patch.empty() || apply_xex_patch(xex, patch, error);
+}
+
 std::vector<XexImport> list_imports(const Xex &xex) {
     std::vector<XexImport> imports;
     for (size_t li = 0; li < xex.import_libraries.size(); li++) {
