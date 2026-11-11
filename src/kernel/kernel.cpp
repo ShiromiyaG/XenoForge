@@ -247,12 +247,12 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         static constexpr uint64_t SPIN_IDLE_AFTER = 20'000;
         static const bool idle_waits = [] {
             const char *v = std::getenv("XF_SPIN_IDLE");
-            return !(v && v[0] == '0');
+            return v && v[0] == '1';
         }();
         static constexpr uint32_t SPIN_WAIT_US = 1'000;
         static const bool waiting = [] {
             const char *v = std::getenv("XF_SPIN_WAIT");
-            return v && v[0] == '1';
+            return !(v && v[0] == '0');
         }();
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
         // handing over is a safe point: the thread waiting there is parked
