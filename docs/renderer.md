@@ -1727,7 +1727,7 @@ shaders'.
 
 ## Game G's command thread (2026-11-10)
 
-Game G in play (Armadillo, `boot --render`, its library) ran at 14.7 swaps a
+Game G in play (its first town, `boot --render`, its library) ran at 14.7 swaps a
 second of its 30, about 8,500 draws and 65 resolves a frame. Not the GPU (20
 ms of it a frame) nor pipelines (the same with library stand-ins): the GPU
 commands thread, 88% busy, which the game waits for in a spin of its D3D's
