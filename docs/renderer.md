@@ -2730,7 +2730,18 @@ choice):
 | a stage's float constants uploaded by the blocks of 8 its shader reads (`Shader::float_blocks`, from the microcode's ALU operands; all of them when one is read relative to a0 or aL, and for the generic shaders; `XF_CONSTANT_BLOCKS=0`): the game's shaders read a few low constants and c254, c255, so "up to the last one read" spared nothing; with the game's library rebuilt for the vector unit's whole-vector arithmetic (docs/recompiler.md) | 27.4 ms | 29.5 | 115 ms |
 
 A frame is still missed now and then (27 to 31 swaps in a second, 80 of 87
-at 29 or 30): the work a swap is 27 ms of the 33. What the uploads into the
+at 29 or 30): the work a swap is 27 ms of the 33. `XF_SLOW_FRAMES=<ms>`
+prints each frame longer than that from swap to swap with what the
+processor did in it (`,all`: every frame): its waits, the sink's waits for
+the GPU, its draws, resolves, extent reports, texture loads, submissions
+and pipelines. In play, 2,600 frames: the 232 that took three vblanks are
+the others' twins (5,634 draws against 5,630, 67 resolves against 66, 64
+texture loads against 63, 9 submissions, no pipeline, 0.4 ms of waits for
+the GPU in both); their work was 36.0 ms where the others' was 29.1. No
+event makes them: the work a frame runs from 26.6 ms (a tenth of the frames
+below) to 33.0 (a tenth above) and 38.5 (one in a hundred), around a
+vblank's 33.3. Holding the rate takes the mean down to about 24 ms, not
+the peaks. What the uploads into the
 draw data still cost, by the profile: the system constants 3.6% of the
 command thread (784 bytes at nearly every draw: a screen extent report's
 word and the textures' slots change them), the constants' fetch and boolean

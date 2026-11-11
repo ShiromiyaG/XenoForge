@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -930,6 +931,44 @@ bool CommandProcessor::xe_swap(uint32_t count) {
     Swap s{words[1], words[2], words[3]};
     bump(counts_.swaps);
     if (sink_) sink_->swap(regs_, s);
+    // XF_SLOW_FRAMES=<ms>: each frame that took longer from swap to swap is
+    // printed with what the processor did in it: how long it waited
+    // (WAIT_REG_MEM), its draws, resolves and extent reports, and whether the
+    // extents were measured. For finding what a frame that misses its vblank
+    // is made of.
+    {
+        static const double limit = [] {
+            const char *v = std::getenv("XF_SLOW_FRAMES");
+            return v ? std::strtod(v, nullptr) : 0.0;
+        }();
+        if (limit > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t waited = counts_.wait_ns.load(), draws = counts_.draws.load();
+            const uint64_t resolves = counts_.resolves.load(), reports = counts_.opcodes[pm4::EVENT_WRITE_EXT].load();
+            const double ms = std::chrono::duration<double, std::milli>(now - slow_at_).count();
+            const Sink::Work work = sink_ ? sink_->work() : Sink::Work{};
+            // (XF_SLOW_FRAMES=<ms>,all: every frame, for setting the slow ones beside the others)
+            static const bool all = [] {
+                const char *v = std::getenv("XF_SLOW_FRAMES");
+                return v && std::strstr(v, ",all") != nullptr;
+            }();
+            if (slow_swaps_ && (ms > limit || all))
+                std::printf("%s frame: swap %llu, %.1f ms (%.1f ms in waits, %.1f ms waiting for the GPU), %llu draws, "
+                            "%llu resolves, %llu extent reports, %llu texture loads, %llu submissions, %llu pipelines%s\n",
+                            ms > limit ? "slow" : "a", (unsigned long long)counts_.swaps.load(), ms,
+                            double(waited - slow_waited_) / 1e6,
+                            (work.gpu_wait_seconds - slow_work_.gpu_wait_seconds) * 1000.0,
+                            (unsigned long long)(draws - slow_draws_), (unsigned long long)(resolves - slow_resolves_),
+                            (unsigned long long)(reports - slow_reports_),
+                            (unsigned long long)(work.texture_loads - slow_work_.texture_loads),
+                            (unsigned long long)(work.submissions - slow_work_.submissions),
+                            (unsigned long long)(work.pipelines - slow_work_.pipelines),
+                            extents_ == ScreenExtents::Measured ? ", extents measured" : "");
+            slow_work_ = work;
+            slow_at_ = now, slow_waited_ = waited, slow_draws_ = draws, slow_resolves_ = resolves, slow_reports_ = reports;
+            slow_swaps_++;
+        }
+    }
     // the screen extents by their gain: a trial of measuring judged, or a
     // stay with the whole screen over
     if (extents_by_gain_ && ++extents_swaps_ >= extents_window_) {

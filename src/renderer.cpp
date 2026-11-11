@@ -1479,6 +1479,10 @@ public:
     }
     // screen extents (gpu::ScreenExtents::Measured; "screen extents" below)
     bool measures_extents() override { return extents_.buffer != VK_NULL_HANDLE; }
+    Work work() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {report_.wait_seconds, report_.textures, report_.submissions, report_.pipelines};
+    }
     void extent_init() override {
         Call call(*this, nullptr);
         // Between two reports, the draws recorded so far handed to the GPU

@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -248,6 +249,14 @@ public:
     // The reports so far answered, waiting for the GPU if it must (before an
     // interrupt or a wait, after which the CPU may read them).
     virtual void extent_wait() {}
+    // What the sink has done so far, for XF_SLOW_FRAMES: the seconds it
+    // waited for the GPU, its texture loads, its submissions, the pipelines
+    // it has made. Called on the processor's thread.
+    struct Work {
+        double gpu_wait_seconds = 0;
+        uint64_t texture_loads = 0, submissions = 0, pipelines = 0;
+    };
+    virtual Work work() { return {}; }
     virtual void extent_poll(std::vector<Extent> & /*resolved*/) {}
     // VIZ_QUERY: query id (0-63) begins, or ends
     virtual void viz_query(uint32_t /*id*/, bool /*end*/) {}
@@ -504,6 +513,10 @@ private:
     bool extents_by_gain_ = false;
     uint32_t extents_window_ = EXTENTS_TRIAL, extents_swaps_ = 0;
     uint64_t extents_draws_ = 0, extents_skipped_ = 0; // draw packets run and skipped by their bins, this window
+    // XF_SLOW_FRAMES: the last swap's time and the counts as of it
+    std::chrono::steady_clock::time_point slow_at_{};
+    uint64_t slow_swaps_ = 0, slow_waited_ = 0, slow_draws_ = 0, slow_resolves_ = 0, slow_reports_ = 0;
+    Sink::Work slow_work_{};
     std::vector<std::pair<uint64_t, uint32_t>> extent_pending_; // handle (0: answered) and address, in order
     size_t extent_first_ = 0;                                   // the first of them still waiting
     std::unordered_map<uint32_t, uint64_t> extent_latest_;      // address to handle (0: none)
