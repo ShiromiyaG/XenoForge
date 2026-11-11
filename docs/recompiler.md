@@ -1115,3 +1115,38 @@ kept big-endian in guest memory where they are read; sparing the second a
 mapping of that view without its offset, which Windows' 64 KB mapping
 granularity does not give. Neither's gain was measured: the checks cannot
 be removed to time what they cost.
+
+## The calls' cost, measured before a new emitter (2026-11-11)
+
+Asked: whether to emit LLVM IR instead of C++, for a calling convention of
+the generated code's own (RPCS3's translator does: IR by hand, the GHC
+convention, every guest call a tail call, r0, r1 and r2 the only guest
+registers passed in host registers, the rest in the thread's structure,
+`refs/rpcs3/rpcs3/Emu/Cell/PPUTranslator.cpp`). Within a function the C++
+already keeps the guest's registers in host registers between calls
+(`__builtin_assume_separate_storage`), so what a new emitter could gain is
+at the calls. Two experiments on the emitter as it is, timed on a game run
+deterministically to the same swap (the run's whole host time, the three
+builds in turn, eight rounds, medians; other measures of it were too
+noisy to use, and a first reading of 13% was the measure's, not the code's):
+
+| build | median | fastest |
+| --- | --- | --- |
+| as it is | 16.33 s | 16.15 s |
+| the register save and restore helpers (`__savegprlr_N`, `__restgprlr_N` and the others) emitted in place of the call to them | 16.37 s | 15.96 s |
+| and each direct call told to leave the non-volatile registers the function names as they were (their values before it, `__builtin_assume` of the same after) | 16.19 s | 15.92 s |
+
+Neither is worth 1.5% of the run, of which the generated code that is not
+the game's spin wait is about half: the calls are not where the time is,
+and a new emitter for their sake would not pay. Both were taken out again.
+
+What the code is made of, counted over one game (69,231 functions): 63.5% of
+its instructions are in functions with the helpers' prologue and epilogue,
+23.6% in functions that save registers with their own stores, 12.8% in
+functions that name no non-volatile register, and 12 functions use them
+another way: the calling convention holds nearly everywhere, should
+something later need to rely on it.
+
+A benchmark of the generated code is still missing: this run is two fifths
+the game's wait for the GPU thread (a spin in its Direct3D) and the
+scheduler, and the machine's other work moved single runs by a tenth.
