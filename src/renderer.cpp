@@ -9591,7 +9591,9 @@ void Impl::draw(const gpu::Draw &d) {
         const uint64_t since = constants_serial_[stage], serial = file.serial();
         bool changed = false;
         const uint32_t alu = reg::ALU_CONSTANTS + stage * 1024;
-        for (uint32_t first = 0; first < 1024; first += File::BLOCK)
+        // (a stage none of whose float constants was written since: one comparison, not its 32 blocks')
+        const bool floats_written = !kept || file.float_constants_serial(stage) > since;
+        for (uint32_t first = 0; floats_written && first < 1024; first += File::BLOCK)
             if (!kept || file.changed_since(alu + first, File::BLOCK, since)) {
                 std::memcpy(&c.float_constants[first / 4], &regs_[alu + first], File::BLOCK * 4);
                 changed = true;
@@ -10289,18 +10291,20 @@ void Impl::draw(const gpu::Draw &d) {
         sorted.clear();
         const uint64_t fetch_slots[2] = {vs->vertex_mask[0] | (ps ? ps->vertex_mask[0] : 0),
                                          vs->vertex_mask[1] | (ps ? ps->vertex_mask[1] : 0)};
-        for (uint32_t slot = 0; slot < 128; slot++) {
-            if (!(fetch_slots[slot >> 6] >> (slot & 63) & 1)) continue;
-            const uint32_t *f = &regs_[reg::FETCH_CONSTANTS + slot * 2];
-            // Xenia draws with any type here (its gpu_allow_invalid_fetch_constants
-            // is on by default), warning about texture constants
-            FetchConstantType type = FetchConstantType(f[0] & 3);
-            if (type == FetchConstantType::Texture || type == FetchConstantType::InvalidTexture)
-                approximate("a vertex fetch from a texture fetch constant");
-            uint32_t start = f[0] & 0x1FFFFFFC, words = (f[1] >> 2) & 0xFFFFFF;
-            uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(start) + uint64_t(words) * 4, GuestMemory::SIZE));
-            if (end > start) sorted.push_back({start, end});
-        }
+        // (the slots fetched, by their bits: a loop over all 128 was 1.6% of the command thread)
+        for (uint32_t half = 0; half < 2; half++)
+            for (uint64_t left = fetch_slots[half]; left; left &= left - 1) {
+                const uint32_t slot = half * 64 + uint32_t(std::countr_zero(left));
+                const uint32_t *f = &regs_[reg::FETCH_CONSTANTS + slot * 2];
+                // Xenia draws with any type here (its gpu_allow_invalid_fetch_constants
+                // is on by default), warning about texture constants
+                FetchConstantType type = FetchConstantType(f[0] & 3);
+                if (type == FetchConstantType::Texture || type == FetchConstantType::InvalidTexture)
+                    approximate("a vertex fetch from a texture fetch constant");
+                uint32_t start = f[0] & 0x1FFFFFFC, words = (f[1] >> 2) & 0xFFFFFF;
+                uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(start) + uint64_t(words) * 4, GuestMemory::SIZE));
+                if (end > start) sorted.push_back({start, end});
+            }
         std::sort(sorted.begin(), sorted.end());
         for (const Range &r : sorted) {
             if (!vertex_ranges.empty() && r.first <= vertex_ranges.back().second)

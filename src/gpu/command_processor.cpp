@@ -303,10 +303,12 @@ bool CommandProcessor::type3(uint32_t address, uint32_t packet) {
     // predicated (bit 0): only for the selected bins of predicated tiling; a
     // predicated swap never runs
     if ((packet & 1) && (!(bin_select_ & bin_mask_) || opcode == pm4::XE_SWAP)) {
+        if (opcode == pm4::DRAW_INDX || opcode == pm4::DRAW_INDX_2) extents_skipped_++;
         reader_.skip(count * 4);
         end_packet();
         return true;
     }
+    if (opcode == pm4::DRAW_INDX || opcode == pm4::DRAW_INDX_2) extents_draws_++;
     bool ok = type3_opcode(opcode, count);
     reader_.read = uint32_t((uint64_t(data) + count * 4) % reader_.capacity);
     end_packet();
@@ -901,6 +903,16 @@ bool CommandProcessor::xe_swap(uint32_t count) {
     Swap s{words[1], words[2], words[3]};
     bump(counts_.swaps);
     if (sink_) sink_->swap(regs_, s);
+    // the screen extents by their gain: a trial of measuring judged, or a
+    // stay with the whole screen over
+    if (extents_by_gain_ && ++extents_swaps_ >= extents_window_) {
+        if (extents_ == ScreenExtents::Measured &&
+            extents_skipped_ * EXTENTS_GAIN < extents_draws_ + extents_skipped_)
+            extents_ = ScreenExtents::Whole, extents_window_ = EXTENTS_STAY;
+        else
+            extents_ = ScreenExtents::Measured, extents_window_ = EXTENTS_TRIAL;
+        extents_swaps_ = 0, extents_draws_ = extents_skipped_ = 0;
+    }
     // the counts of the frame's reports, as they come in, and the extents
     poll_zpd();
     poll_extents(false);

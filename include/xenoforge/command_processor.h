@@ -83,6 +83,7 @@ public:
         std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
         stamps_[index >> BLOCK_SHIFT] = ++serial_;
         if (draw_state(index)) state_serial_ = serial_;
+        if (index >= 0x4000 && index < 0x4800) float_serial_[(index - 0x4000) >> 10] = serial_;
     }
     // count registers from first, from big-endian words (a packet's, guest
     // memory's); first + count within COUNT. On the command processor's thread.
@@ -111,6 +112,7 @@ public:
                 }
                 stamps_[first >> BLOCK_SHIFT] = ++serial_;
                 if (state) state_serial_ = serial_;
+                if (first >= 0x4000 && first < 0x4800) float_serial_[(first - 0x4000) >> 10] = serial_;
             }
             first += n, words += 4 * n, count -= n;
         }
@@ -127,6 +129,8 @@ public:
     // A draw made after another with this unchanged draws with the same
     // pipeline, targets, viewport and dynamic state.
     uint64_t state_serial() const { return state_serial_; }
+    // and to a float constant of a stage's (0 the vertex shader's, 1 the pixel shader's)
+    uint64_t float_constants_serial(int stage) const { return float_serial_[stage]; }
     static bool draw_state(uint32_t index) {
         if (index < 0x2000) return false;
         if (index >= 0x4000 && index < 0x4910) return false; // ALU, fetch, boolean and loop constants
@@ -147,7 +151,7 @@ public:
 private:
     std::vector<uint32_t> values_;
     std::vector<uint64_t> stamps_; // per block, the serial of the last write that changed a value there
-    uint64_t serial_ = 0, state_serial_ = 0;
+    uint64_t serial_ = 0, state_serial_ = 0, float_serial_[2] = {};
     std::atomic<uint64_t> foreign_writes_{0};
 };
 
@@ -384,7 +388,19 @@ public:
     void set_occlusion_queries(OcclusionQueries mode) { occlusion_ = mode; }
     OcclusionQueries occlusion_queries() const { return occlusion_; }
     // What screen extent reports hold; set before the processor runs.
-    void set_screen_extents(ScreenExtents mode) { extents_ = mode; }
+    void set_screen_extents(ScreenExtents mode) { extents_ = mode, extents_by_gain_ = false; }
+    // Measured or whole by what measuring gains: measured for a while, then
+    // kept only where predicated tiling skipped enough of the draws for it
+    // (the bins the guest narrowed), else the whole screen for a longer
+    // while before it is tried again. Measuring makes the processor wait
+    // for the GPU where the guest may read the extents; it pays in a scene
+    // whose second tile then leaves out a good part of its draws, and costs
+    // where the draws cover both tiles anyway (docs/renderer.md, "Screen
+    // extents by their gain").
+    void set_screen_extents_by_gain() {
+        extents_ = ScreenExtents::Measured, extents_by_gain_ = true;
+        extents_window_ = EXTENTS_TRIAL, extents_swaps_ = 0, extents_draws_ = extents_skipped_ = 0;
+    }
     ScreenExtents screen_extents() const { return extents_; }
 
 private:
@@ -481,6 +497,13 @@ private:
     // waiting for the sink's answer, and the latest report at each address
     // (an answer only lands where no later report has written since)
     ScreenExtents extents_ = ScreenExtents::Measured;
+    // set_screen_extents_by_gain: the swaps of a trial of measuring and of
+    // a stay with the whole screen, and the share of the draw packets the
+    // bins must skip for measuring to stay (1 in EXTENTS_GAIN)
+    static constexpr uint32_t EXTENTS_TRIAL = 120, EXTENTS_STAY = 600, EXTENTS_GAIN = 7;
+    bool extents_by_gain_ = false;
+    uint32_t extents_window_ = EXTENTS_TRIAL, extents_swaps_ = 0;
+    uint64_t extents_draws_ = 0, extents_skipped_ = 0; // draw packets run and skipped by their bins, this window
     std::unordered_map<uint64_t, uint32_t> extent_reports_; // handle to address
     std::unordered_map<uint32_t, uint64_t> extent_latest_;  // address to handle
     std::vector<Extent> extent_resolved_;

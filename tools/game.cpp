@@ -344,17 +344,24 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     const char *queries = std::getenv("XF_OCCLUSION_QUERIES");
     processor.set_occlusion_queries(queries && std::string(queries) == "fake" ? gpu::OcclusionQueries::Fake
                                                                               : gpu::OcclusionQueries::Fast);
-    // screen extents: the whole screen, as Xenia answers (the default);
-    // XF_SCREEN_EXTENTS=measured, the bounds of what the draws rasterized
-    // (beyond Xenia). The answer changes no picture, only how many of
-    // predicated tiling's tiles a draw runs in, and measured bounds have the
-    // command processor wait for the GPU at each interrupt or wait the
-    // guest's extents may be read at: a game with ~120 reports a frame fell
-    // from 30 to 20 frames a second (docs/renderer.md, "Screen extents
-    // live").
+    // screen extents: the bounds of what the draws rasterized (beyond Xenia)
+    // where measuring them gains, the whole screen, as Xenia answers,
+    // where it does not (the default: CommandProcessor::set_screen_extents_by_gain);
+    // XF_SCREEN_EXTENTS=measured or =whole for one of them always. The
+    // answer changes no picture, only how many of predicated tiling's tiles
+    // a draw runs in: a scene drawn twice a frame, a tile each, went from 20
+    // to 28 frames a second measured, its second tile leaving out a third of
+    // the draws, while measured bounds have the command processor wait for
+    // the GPU at each interrupt or wait the guest's extents may be read at,
+    // which gained another game nothing (docs/renderer.md, "Screen extents
+    // live" and "Screen extents by their gain").
     const char *extents = std::getenv("XF_SCREEN_EXTENTS");
-    processor.set_screen_extents(extents && std::string(extents) == "measured" ? gpu::ScreenExtents::Measured
-                                                                               : gpu::ScreenExtents::Whole);
+    if (extents && std::string(extents) == "measured")
+        processor.set_screen_extents(gpu::ScreenExtents::Measured);
+    else if (extents && std::string(extents) == "whole")
+        processor.set_screen_extents(gpu::ScreenExtents::Whole);
+    else
+        processor.set_screen_extents_by_gain();
     // when the CPU sees what resolves wrote (Xenia's readback_resolve):
     // XF_READBACK_RESOLVE=none (the default, as Xenia's), fast or full
     if (const char *mode = std::getenv("XF_READBACK_RESOLVE")) {

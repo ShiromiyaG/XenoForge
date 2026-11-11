@@ -66,11 +66,14 @@ bool generated_at(uint64_t address, std::string &name, uint64_t &displacement) {
 
 // The suspended thread's stack by x64 unwind data (RtlVirtualUnwind), at
 // most 48 frames; a frame without unwind data is a leaf (its return address
-// at rsp)
-void walk(CONTEXT ctx, std::vector<uint64_t> &out) {
-    out.clear();
-    for (int depth = 0; depth < 48 && ctx.Rip; depth++) {
-        out.push_back(ctx.Rip);
+// at rsp). Into an array of the caller's, no memory taken: the thread may
+// have been suspended inside the heap, holding its lock, and whoever
+// allocates before it is resumed waits for it for ever.
+constexpr int FRAMES = 48;
+int walk(CONTEXT ctx, uint64_t out[FRAMES]) {
+    int depth = 0;
+    for (; depth < FRAMES && ctx.Rip; depth++) {
+        out[depth] = ctx.Rip;
         DWORD64 image = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
         if (!fn) {
@@ -83,6 +86,7 @@ void walk(CONTEXT ctx, std::vector<uint64_t> &out) {
             RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, fn, &ctx, &handler_data, &frame, nullptr);
         }
     }
+    return depth;
 }
 
 void sample_loop(unsigned interval_us, DWORD only) {
@@ -125,16 +129,21 @@ void sample_loop(unsigned interval_us, DWORD only) {
             s.cycles = cycles;
             // a thread that ran: where it is now stands for the interval's cycles
             if (spent > 0 && SuspendThread(s.handle) != DWORD(-1)) {
+                // (nothing allocated until the thread runs again: walk's note)
                 CONTEXT ctx{};
                 ctx.ContextFlags = only ? CONTEXT_FULL : CONTEXT_CONTROL;
-                if (GetThreadContext(s.handle, &ctx)) {
+                uint64_t frames[FRAMES];
+                int depth = 0;
+                const bool got = GetThreadContext(s.handle, &ctx);
+                if (got && only) depth = walk(ctx, frames);
+                ResumeThread(s.handle);
+                if (got) {
                     local[ctx.Rip] += spent, local_total += spent;
                     if (only) {
-                        walk(ctx, stack);
+                        stack.assign(frames, frames + depth);
                         local_stacks.emplace_back(stack, spent);
                     }
                 }
-                ResumeThread(s.handle);
             }
             ++it;
         }

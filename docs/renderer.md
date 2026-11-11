@@ -2699,6 +2699,19 @@ waits, so live play answers the whole screen, as Xenia; measuring stays a
 choice (`XF_SCREEN_EXTENTS=measured`) and the replays' default (no live
 CPU waits for them).
 
+**Screen extents by their gain (2026-11-11).** Game G in play draws its
+scene twice a frame, a tile each, about 8,500 draws, and its command thread
+was the frame's limit at 20 frames a second (38.5 ms of work a swap, "Game
+G's command thread"). Measured there, the extents let the guest leave a
+third of the draws out of the second tile: 5,600 draws a frame, 30.7 ms of
+commands a swap, 28.5 frames a second, the waits for the GPU at its one
+interrupt a frame costing far less than the draws they spare. So live play
+now chooses (`CommandProcessor::set_screen_extents_by_gain`, the default of
+boot and the player; `XF_SCREEN_EXTENTS=measured` or `=whole` for one of
+them always): measured for 120 swaps, kept while the bins skip at least a
+seventh of the draw packets, else the whole screen for 600 swaps and tried
+again. The picture is the same either way.
+
 ## The command thread's costs (2026-11-09)
 
 The thread that runs the command processor and the renderer ("GPU
