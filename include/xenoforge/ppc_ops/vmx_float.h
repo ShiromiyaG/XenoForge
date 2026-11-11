@@ -185,6 +185,24 @@ template <bool J = false> inline Vec128 nmsub4(const Vec128 &a, const Vec128 &b,
     return store4(result4(-__builtin_elementwise_fma(F4(x), F4(z), -F4(y))));
 }
 
+// the greater, +0 above -0 (max above); the lesser, -0 below +0 (min above)
+template <bool J = false> inline Vec128 max4(const Vec128 &a, const Vec128 &b) {
+    if constexpr (J) return lanes(a, b, max<true>);
+    const U4 x = flush4(load4(a)), y = flush4(load4(b));
+    if (any_nan4(x) || any_nan4(y)) [[unlikely]]
+        return lanes(a, b, max<false>);
+    const U4 greater = U4(F4(x) > F4(y)), less = U4(F4(y) > F4(x));
+    return store4((x & greater) | (y & less) | (x & y & ~(greater | less)));
+}
+template <bool J = false> inline Vec128 min4(const Vec128 &a, const Vec128 &b) {
+    if constexpr (J) return lanes(a, b, min<true>);
+    const U4 x = flush4(load4(a)), y = flush4(load4(b));
+    if (any_nan4(x) || any_nan4(y)) [[unlikely]]
+        return lanes(a, b, min<false>);
+    const U4 less = U4(F4(x) < F4(y)), greater = U4(F4(y) < F4(x));
+    return store4((x & less) | (y & greater) | ((x | y) & ~(greater | less)));
+}
+
 // ---- estimates ----
 
 // vrefp: the console's estimate, built as vrsqrtefp's: 32 segments by the
@@ -286,8 +304,8 @@ template <Round mode, bool J = false> inline uint32_t round(uint32_t v) {
 
 // float(word) * 2^-uimm: rounded once by the conversion, the scaling exact
 inline Vec128 from_signed(const Vec128 &a, uint32_t uimm) {
-    float scale = flt((127 - uimm) << 23);
-    return lanes(a, [scale](uint32_t v) { return bits(float(int32_t(v)) * scale); });
+    const float scale = flt((127 - uimm) << 23);
+    return store4(U4(__builtin_convertvector(I4(load4(a)), F4) * scale));
 }
 inline Vec128 from_unsigned(const Vec128 &a, uint32_t uimm) {
     float scale = flt((127 - uimm) << 23);
@@ -327,14 +345,18 @@ template <bool J = false> inline Vec128 to_unsigned(const Vec128 &a, uint32_t ui
 
 // ---- compares ----
 
+// (whole vectors: a NaN compares false either way; Java mode compares the operands as they are)
 template <bool J = false> inline Vec128 cmp_eq(const Vec128 &a, const Vec128 &b) {
-    return lanes(a, b, [](uint32_t x, uint32_t y) { return mask(flt(flush_j<J>(x)) == flt(flush_j<J>(y))); });
+    const U4 x = J ? load4(a) : flush4(load4(a)), y = J ? load4(b) : flush4(load4(b));
+    return store4(U4(F4(x) == F4(y)));
 }
 template <bool J = false> inline Vec128 cmp_ge(const Vec128 &a, const Vec128 &b) {
-    return lanes(a, b, [](uint32_t x, uint32_t y) { return mask(flt(flush_j<J>(x)) >= flt(flush_j<J>(y))); });
+    const U4 x = J ? load4(a) : flush4(load4(a)), y = J ? load4(b) : flush4(load4(b));
+    return store4(U4(F4(x) >= F4(y)));
 }
 template <bool J = false> inline Vec128 cmp_gt(const Vec128 &a, const Vec128 &b) {
-    return lanes(a, b, [](uint32_t x, uint32_t y) { return mask(flt(flush_j<J>(x)) > flt(flush_j<J>(y))); });
+    const U4 x = J ? load4(a) : flush4(load4(a)), y = J ? load4(b) : flush4(load4(b));
+    return store4(U4(F4(x) > F4(y)));
 }
 // vcmpbfp: bit 0 set when not a <= b, bit 1 when not a >= -b, so both for a
 // NaN (Xenia's a > b leaves bit 0 clear; the console tests set it)
@@ -590,10 +612,10 @@ XF_OP(vmaddcfp128) { XF_VFP(c.v[VX128_VD128] = vfp::madd4<J>(c.v[VX128_VA128], c
 XF_OP(vnmsubfp) { XF_VFP(c.v[i.VXA.VD] = vfp::nmsub4<J>(c.v[i.VXA.VA], c.v[i.VXA.VB], c.v[i.VXA.VC])); }
 // (VD) <- -((VA) * (VB) - (VD))
 XF_OP(vnmsubfp128) { XF_VFP(c.v[VX128_VD128] = vfp::nmsub4<J>(c.v[VX128_VA128], c.v[VX128_VD128], c.v[VX128_VB128])); }
-XF_OP(vmaxfp) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VA], c.v[i.VX.VB], vfp::max<J>)); }
-XF_OP(vmaxfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VB128], vfp::max<J>)); }
-XF_OP(vminfp) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VA], c.v[i.VX.VB], vfp::min<J>)); }
-XF_OP(vminfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VB128], vfp::min<J>)); }
+XF_OP(vmaxfp) { XF_VFP(c.v[i.VX.VD] = vfp::max4<J>(c.v[i.VX.VA], c.v[i.VX.VB])); }
+XF_OP(vmaxfp128) { XF_VFP(c.v[VX128_VD128] = vfp::max4<J>(c.v[VX128_VA128], c.v[VX128_VB128])); }
+XF_OP(vminfp) { XF_VFP(c.v[i.VX.VD] = vfp::min4<J>(c.v[i.VX.VA], c.v[i.VX.VB])); }
+XF_OP(vminfp128) { XF_VFP(c.v[VX128_VD128] = vfp::min4<J>(c.v[VX128_VA128], c.v[VX128_VB128])); }
 
 // ---- estimates ----
 

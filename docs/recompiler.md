@@ -1096,5 +1096,22 @@ each over random and special values, the same bits both ways): an add 6.1
 to 1.6 ns, a multiply-add 8.2 to 2.1 ns. The instruction tests pass as
 before, interpreted and recompiled (141,705 cases). In play: the mixer's
 thread 63% to 47% of a core, its hot function 4.7% to 1.5% of the process.
-Not done yet the same way: the compares, minimum and maximum, the
-estimates, the conversions and the dot products.
+Then the same way: minimum and maximum (`max4`, `min4`), the compares
+(`cmp_eq`, `cmp_ge`, `cmp_gt`) and the conversion from signed words
+(`from_signed`). Left lane by lane: the estimates (tables read by the bits),
+the conversions to integers (in double, saturating), the conversion from
+unsigned words and the dot products (four products and their sums in
+double already). Counted over one game's code, the forms done are the ones
+it is made of: multiply 11,135 instructions, multiply-add 7,920, subtract
+6,227, negative multiply-subtract 2,809, add 2,786, against 800 minimum and
+maximum, 1,150 compares, 1,140 conversions from words.
+
+**A 32-bit access's two checks** (`ppc_ops.h`: the devices' registers at
+0x7FC80000, the 4 KB offset of the 0xE0000000 view) were looked at for
+leaving out and stay: a game run without the first on loads faulted reading
+a GPU register with `lwz`, and without the second ran another course (it
+uses that memory). Sparing loads the first would take the GPU's registers
+kept big-endian in guest memory where they are read; sparing the second a
+mapping of that view without its offset, which Windows' 64 KB mapping
+granularity does not give. Neither's gain was measured: the checks cannot
+be removed to time what they cost.
