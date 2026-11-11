@@ -114,6 +114,77 @@ template <bool J = false> inline uint32_t min(uint32_t a, uint32_t b) {
     return x < y ? a : y < x ? b : a | b;
 }
 
+// ---- the arithmetic on whole vectors ----
+//
+// The lane-by-lane forms above are a dozen operations and three branches a
+// lane; a game's sound mixer and its vector math are little else (one
+// title's mixer thread took two thirds of a host core). These give the same
+// bits from the whole vector at once, by the compiler's vector types (SSE or
+// NEON, as the host has): the operands flushed, the operation, the result's
+// NaN made the invalid operation's and its denormal flushed. A NaN among the
+// operands, whose quieting and order are the lanes' business, sends the
+// vector the lane-by-lane way; Java mode always goes that way.
+typedef uint32_t U4 __attribute__((vector_size(16)));
+typedef int32_t I4 __attribute__((vector_size(16)));
+typedef float F4 __attribute__((vector_size(16)));
+inline U4 load4(const Vec128 &v) {
+    U4 r;
+    lib::memcpy(&r, &v, 16);
+    return r;
+}
+inline Vec128 store4(U4 v) {
+    Vec128 r;
+    lib::memcpy(&r, &v, 16);
+    return r;
+}
+inline U4 flush4(U4 v) {
+    const U4 zero = U4((v & 0x7F800000u) == 0u);
+    return v & ~(zero & 0x7FFFFFFFu);
+}
+inline U4 result4(F4 r) {
+    const U4 nan = U4(r != r);
+    return (flush4(U4(r)) & ~nan) | (nan & QNAN);
+}
+inline bool any_nan4(U4 v) { return __builtin_reduce_or(I4(v & 0x7FFFFFFFu) > I4{0x7F800000, 0x7F800000, 0x7F800000, 0x7F800000}) != 0; }
+
+template <bool J = false> inline Vec128 add4(const Vec128 &a, const Vec128 &b) {
+    if constexpr (J) return lanes(a, b, add<true>);
+    const U4 x = flush4(load4(a)), y = flush4(load4(b));
+    if (any_nan4(x) || any_nan4(y)) [[unlikely]]
+        return lanes(a, b, add<false>);
+    return store4(result4(F4(x) + F4(y)));
+}
+template <bool J = false> inline Vec128 sub4(const Vec128 &a, const Vec128 &b) {
+    if constexpr (J) return lanes(a, b, sub<true>);
+    const U4 x = flush4(load4(a)), y = flush4(load4(b));
+    if (any_nan4(x) || any_nan4(y)) [[unlikely]]
+        return lanes(a, b, sub<false>);
+    return store4(result4(F4(x) - F4(y)));
+}
+template <bool J = false> inline Vec128 mul4(const Vec128 &a, const Vec128 &b) {
+    if constexpr (J) return lanes(a, b, mul<true>);
+    const U4 x = flush4(load4(a)), y = flush4(load4(b));
+    if (any_nan4(x) || any_nan4(y)) [[unlikely]]
+        return lanes(a, b, mul<false>);
+    return store4(result4(F4(x) * F4(y)));
+}
+// a * c + b, rounded once (madd above)
+template <bool J = false> inline Vec128 madd4(const Vec128 &a, const Vec128 &b, const Vec128 &c) {
+    if constexpr (J) return lanes(a, b, c, madd<true>);
+    const U4 x = flush4(load4(a)), y = flush4(load4(b)), z = flush4(load4(c));
+    if (any_nan4(x) || any_nan4(y) || any_nan4(z)) [[unlikely]]
+        return lanes(a, b, c, madd<false>);
+    return store4(result4(__builtin_elementwise_fma(F4(x), F4(z), F4(y))));
+}
+// -(a * c - b), rounded once (nmsub above: the sign of a zero result is the negation's)
+template <bool J = false> inline Vec128 nmsub4(const Vec128 &a, const Vec128 &b, const Vec128 &c) {
+    if constexpr (J) return lanes(a, b, c, nmsub<true>);
+    const U4 x = flush4(load4(a)), y = flush4(load4(b)), z = flush4(load4(c));
+    if (any_nan4(x) || any_nan4(y) || any_nan4(z)) [[unlikely]]
+        return lanes(a, b, c, nmsub<false>);
+    return store4(result4(-__builtin_elementwise_fma(F4(x), F4(z), -F4(y))));
+}
+
 // ---- estimates ----
 
 // vrefp: the console's estimate, built as vrsqrtefp's: 32 segments by the
@@ -504,21 +575,21 @@ template <typename F> [[gnu::cold, gnu::noinline]] void java_mode(F f) { f(); }
 
 // ---- arithmetic ----
 
-XF_OP(vaddfp) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VA], c.v[i.VX.VB], vfp::add<J>)); }
-XF_OP(vaddfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VB128], vfp::add<J>)); }
-XF_OP(vsubfp) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VA], c.v[i.VX.VB], vfp::sub<J>)); }
-XF_OP(vsubfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VB128], vfp::sub<J>)); }
-XF_OP(vmulfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VB128], vfp::mul<J>)); }
+XF_OP(vaddfp) { XF_VFP(c.v[i.VX.VD] = vfp::add4<J>(c.v[i.VX.VA], c.v[i.VX.VB])); }
+XF_OP(vaddfp128) { XF_VFP(c.v[VX128_VD128] = vfp::add4<J>(c.v[VX128_VA128], c.v[VX128_VB128])); }
+XF_OP(vsubfp) { XF_VFP(c.v[i.VX.VD] = vfp::sub4<J>(c.v[i.VX.VA], c.v[i.VX.VB])); }
+XF_OP(vsubfp128) { XF_VFP(c.v[VX128_VD128] = vfp::sub4<J>(c.v[VX128_VA128], c.v[VX128_VB128])); }
+XF_OP(vmulfp128) { XF_VFP(c.v[VX128_VD128] = vfp::mul4<J>(c.v[VX128_VA128], c.v[VX128_VB128])); }
 // (VD) <- (VA) * (VC) + (VB)
-XF_OP(vmaddfp) { XF_VFP(c.v[i.VXA.VD] = vfp::lanes(c.v[i.VXA.VA], c.v[i.VXA.VB], c.v[i.VXA.VC], vfp::madd<J>)); }
+XF_OP(vmaddfp) { XF_VFP(c.v[i.VXA.VD] = vfp::madd4<J>(c.v[i.VXA.VA], c.v[i.VXA.VB], c.v[i.VXA.VC])); }
 // (VD) <- (VA) * (VB) + (VD)
-XF_OP(vmaddfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VD128], c.v[VX128_VB128], vfp::madd<J>)); }
+XF_OP(vmaddfp128) { XF_VFP(c.v[VX128_VD128] = vfp::madd4<J>(c.v[VX128_VA128], c.v[VX128_VD128], c.v[VX128_VB128])); }
 // (VD) <- (VA) * (VD) + (VB)
-XF_OP(vmaddcfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VB128], c.v[VX128_VD128], vfp::madd<J>)); }
+XF_OP(vmaddcfp128) { XF_VFP(c.v[VX128_VD128] = vfp::madd4<J>(c.v[VX128_VA128], c.v[VX128_VB128], c.v[VX128_VD128])); }
 // (VD) <- -((VA) * (VC) - (VB))
-XF_OP(vnmsubfp) { XF_VFP(c.v[i.VXA.VD] = vfp::lanes(c.v[i.VXA.VA], c.v[i.VXA.VB], c.v[i.VXA.VC], vfp::nmsub<J>)); }
+XF_OP(vnmsubfp) { XF_VFP(c.v[i.VXA.VD] = vfp::nmsub4<J>(c.v[i.VXA.VA], c.v[i.VXA.VB], c.v[i.VXA.VC])); }
 // (VD) <- -((VA) * (VB) - (VD))
-XF_OP(vnmsubfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VD128], c.v[VX128_VB128], vfp::nmsub<J>)); }
+XF_OP(vnmsubfp128) { XF_VFP(c.v[VX128_VD128] = vfp::nmsub4<J>(c.v[VX128_VA128], c.v[VX128_VD128], c.v[VX128_VB128])); }
 XF_OP(vmaxfp) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VA], c.v[i.VX.VB], vfp::max<J>)); }
 XF_OP(vmaxfp128) { XF_VFP(c.v[VX128_VD128] = vfp::lanes(c.v[VX128_VA128], c.v[VX128_VB128], vfp::max<J>)); }
 XF_OP(vminfp) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VA], c.v[i.VX.VB], vfp::min<J>)); }

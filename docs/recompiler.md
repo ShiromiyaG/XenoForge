@@ -1076,3 +1076,25 @@ two calls (`Runtime::hooked`, `mid_hook`), so its version changed.
 4. Emission: C++ per function, the dispatch table, the listing; the
    instruction tests recompiled; both games compiled, then every module
    of the eight games, a table each.
+
+## Vector float arithmetic on whole vectors (2026-11-11)
+
+A game in play had a thread of its own at two thirds of a host core: its
+sound mixer, VMX128 float code (`vaddfp128`, `vmulfp128`, `vmaddfp`, unaligned
+loads and stores), one function of it 4.7% of the whole process. The vector
+unit's arithmetic was done lane by lane on the bits (`vfp::lanes`: the
+operands' denormals flushed, the NaNs quieted in operand order, the result's
+NaN and denormal handled), a dozen operations and three branches a lane.
+
+`vfp::add4`, `sub4`, `mul4`, `madd4` and `nmsub4` (ppc_ops/vmx_float.h) give
+the same bits from the whole vector, by the compiler's vector types (SSE or
+NEON as the host has, no intrinsics: the game library is built without the
+standard headers): the operands flushed, the operation, the result's NaN
+made the invalid operation's and its denormal flushed. A NaN among the
+operands goes the lane-by-lane way, as does Java mode. Alone (a loop of
+each over random and special values, the same bits both ways): an add 6.1
+to 1.6 ns, a multiply-add 8.2 to 2.1 ns. The instruction tests pass as
+before, interpreted and recompiled (141,705 cases). In play: the mixer's
+thread 63% to 47% of a core, its hot function 4.7% to 1.5% of the process.
+Not done yet the same way: the compares, minimum and maximum, the
+estimates, the conversions and the dot products.

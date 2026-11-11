@@ -36,7 +36,28 @@ namespace {
 struct Sampled {
     HANDLE handle = nullptr;
     uint64_t cycles = 0; // the thread's cycle count at the last sample
+    uint64_t stack_low = 0, stack_high = 0; // its stack's bounds (0: not known, its stack is not walked)
 };
+
+// (ntdll's NtQueryInformationThread, for a thread's environment block: its
+// stack's bounds are there; found at run time, ntdll not being linked)
+void stack_bounds(Sampled &s) {
+    using Query = long(__stdcall *)(HANDLE, int, void *, unsigned long, unsigned long *);
+    static const Query NtQueryInformationThread =
+        reinterpret_cast<Query>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread"));
+    if (!NtQueryInformationThread) return;
+    struct {
+        long exit_status;
+        void *teb;
+        void *process, *thread;
+        uintptr_t affinity;
+        long priority, base_priority;
+    } basic{};
+    if (NtQueryInformationThread(s.handle, 0, &basic, sizeof(basic), nullptr) < 0 || !basic.teb) return;
+    const NT_TIB *tib = static_cast<const NT_TIB *>(basic.teb);
+    s.stack_low = uint64_t(reinterpret_cast<uintptr_t>(tib->StackLimit));
+    s.stack_high = uint64_t(reinterpret_cast<uintptr_t>(tib->StackBase));
+}
 
 std::atomic<bool> running{false};
 std::thread worker;
@@ -68,12 +89,16 @@ bool generated_at(uint64_t address, std::string &name, uint64_t &displacement) {
 // most 48 frames; a frame without unwind data is a leaf (its return address
 // at rsp). Into an array of the caller's, no memory taken: the thread may
 // have been suspended inside the heap, holding its lock, and whoever
-// allocates before it is resumed waits for it for ever.
+// allocates before it is resumed waits for it for ever. Only while the stack
+// pointer lies in the thread's stack (low to high): a frame taken for a leaf
+// that is none (code without unwind data that moved the stack pointer)
+// leaves it anywhere, and reading there faulted the whole run.
 constexpr int FRAMES = 48;
-int walk(CONTEXT ctx, uint64_t out[FRAMES]) {
+int walk(CONTEXT ctx, uint64_t out[FRAMES], uint64_t low, uint64_t high) {
     int depth = 0;
     for (; depth < FRAMES && ctx.Rip; depth++) {
         out[depth] = ctx.Rip;
+        if (ctx.Rsp < low || ctx.Rsp + 256 > high || (ctx.Rsp & 7)) return depth + 1;
         DWORD64 image = 0;
         PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
         if (!fn) {
@@ -107,6 +132,7 @@ void sample_loop(unsigned interval_us, DWORD only) {
             if (!h) continue;
             Sampled s{h, 0};
             QueryThreadCycleTime(h, &s.cycles);
+            if (only) stack_bounds(s);
             threads[e.th32ThreadID] = s;
         }
         CloseHandle(snap);
@@ -135,7 +161,7 @@ void sample_loop(unsigned interval_us, DWORD only) {
                 uint64_t frames[FRAMES];
                 int depth = 0;
                 const bool got = GetThreadContext(s.handle, &ctx);
-                if (got && only) depth = walk(ctx, frames);
+                if (got && only) depth = walk(ctx, frames, s.stack_low, s.stack_high);
                 ResumeThread(s.handle);
                 if (got) {
                     local[ctx.Rip] += spent, local_total += spent;
