@@ -135,7 +135,27 @@ std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
     precompile_options.cancel = step.cancel;
     precompile_options.extra_variants = step.disc_variants;
     PrecompileReport r;
-    const bool ok = precompile(*device, options, precompile_options, r, error);
+    bool ok = precompile(*device, options, precompile_options, r, error);
+    // runs on the other render target path (the player's setting) described
+    // pipelines too: the generic shaders' libraries in their states are made
+    // by a renderer on that path, what the first made known from its record
+    if (ok && r.descriptions_other_path) {
+        Options other = options;
+        other.render_target_path = render_target_path(*device, options) == Options::RenderTargetPath::fsi
+                                       ? Options::RenderTargetPath::host
+                                       : Options::RenderTargetPath::fsi;
+        if (render_target_path(*device, other) == other.render_target_path) {
+            PrecompileOptions again = precompile_options;
+            again.extra_shaders.clear(); // (their libraries: made above)
+            PrecompileReport r2;
+            ok = precompile(*device, other, again, r2, error);
+            r.libraries += r2.libraries, r.libraries_failed += r2.libraries_failed;
+            r.pipelines += r2.pipelines, r.pipelines_failed += r2.pipelines_failed;
+            r.generic_libraries += r2.generic_libraries, r.generic_libraries_failed += r2.generic_libraries_failed;
+            r.seconds += r2.seconds, r.driver_seconds += r2.driver_seconds;
+            r.cache_written = r2.cache_written ? r2.cache_written : r.cache_written;
+        }
+    }
     std::snprintf(line, sizeof(line), "device: %s; pipeline cache %s (%.1f KB read, %.1f KB written)",
                   device->name().c_str(),
                   r.cache_matched ? "this device's and driver's" : r.cache_read ? "another's, made again" : "new",
@@ -157,6 +177,10 @@ std::vector<std::string> run_shader_step(const build::ShaderStep &step) {
                   (unsigned long long)r.libraries_failed, (unsigned long long)r.pipelines,
                   (unsigned long long)r.pipelines_failed, r.seconds, r.driver_seconds);
     lines.push_back(line);
+    for (const auto &[why, count] : r.descriptions_failed_why) {
+        std::snprintf(line, sizeof(line), "  not made here: %llu, %s", (unsigned long long)count, why.c_str());
+        lines.push_back(line);
+    }
     if (r.generic_libraries || r.generic_libraries_failed) {
         std::snprintf(line, sizeof(line),
                       "the generic shaders: %llu libraries in the descriptions' states (%llu failed), so a shader no "

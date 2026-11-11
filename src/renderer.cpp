@@ -7806,6 +7806,7 @@ std::unique_ptr<PipelineDesc> Impl::undescribe(std::span<const uint32_t> words, 
                 o.clip_planes = uint8_t((form >> 9) & 7);
                 o.clip_planes_cull = (form >> 12) & 1;
                 o.point_ucp_mode = uint8_t((form >> 13) & 3);
+                o.extents = (form >> 15) & 1;
                 if (o.key() != form) return fail("a vertex shader's form unknown here");
                 st.module = vertex_module(*s, o, reason);
             }
@@ -8147,6 +8148,7 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
         std::unique_ptr<PipelineDesc> desc = undescribe(words, why);
         if (!desc) {
             out.descriptions_failed++;
+            out.descriptions_failed_why[why]++;
             if (options_.verbose)
                 std::fprintf(stderr, "  description %016llX: %s\n", (unsigned long long)ShaderStorage::hash(0, words),
                              why.c_str());
@@ -8172,8 +8174,15 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
                 else
                     vs = shader(name->second.id), vertex_form = name->second.form;
             }
+            // (the exact EDRAM's pipelines have no attachments)
+            const auto *rendering = static_cast<const VkPipelineRenderingCreateInfo *>(desc->info.pNext);
+            const bool attachments = rendering && (rendering->colorAttachmentCount ||
+                                                   rendering->depthAttachmentFormat != VK_FORMAT_UNDEFINED ||
+                                                   rendering->stencilAttachmentFormat != VK_FORMAT_UNDEFINED);
+            const bool this_path = attachments == !fsi_;
+            if (!this_path) out.descriptions_other_path++;
             GenericStages generic;
-            if (generic_on_ && vs && ps && generic_info(desc->info, *vs, ps, points, vertex_form, pixel_form, generic, why)) {
+            if (generic_on_ && this_path && vs && ps && generic_info(desc->info, *vs, ps, points, vertex_form, pixel_form, generic, why)) {
                 PipelineParts generic_parts;
                 library_keys(generic.info, generic_parts);
                 for (uint32_t part : {1u, 2u}) {

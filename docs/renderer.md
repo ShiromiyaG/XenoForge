@@ -1498,6 +1498,21 @@ shaders mostly; 201 distinct states):
 | 8 | 10,328 | 293 (67%) | 318 s more (38 s on 9 workers) |
 | 16 | 20,644 | 330 (76%) | 939 s more (108 s) |
 
+**The player's path at the step** (2026-11-11). Two gaps left the pipelines
+of runs on the host's render targets (the player's default) out of the
+step. A vertex shader's form with the screen extents (the draws inside a
+tiled pass, "Screen extents") was not made back from its description, so
+every such pipeline was counted "not made here" and compiled in the run
+that met it again after a new driver or cache: 222 of game G's 1,103
+descriptions, 599 of game D's 1,989. The report now gives the reasons
+(`not made here: N, <why>`), and none is left in either. And the generic
+shaders' libraries are a path's own (their pixel shader is the host's or
+the interlock's), while the step's renderer takes the automatic path, the
+exact EDRAM: a description of the other path (told by its attachments: the
+exact path's pipelines have none) now makes no generic library there, and
+the step runs a second renderer on that path for them (9 libraries for
+game G, 12 for game D).
+
 **The translation on the renderer's thread** (`Report::translate_seconds`,
 `translations`, `translate_max`, `translate_frame_max`; the `renderer:`
 lines of boot and the player, xfreplay's `shaders:` line). Measured cold on

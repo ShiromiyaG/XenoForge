@@ -477,6 +477,8 @@ struct PrecompileReport {
     // (ucode::awaits_vertex_declaration): not translated, not failures
     uint64_t extra_undeclared = 0;
     uint64_t descriptions = 0, descriptions_failed = 0, descriptions_done_before = 0;
+    // why the failed ones could not be made back, each reason's count
+    std::map<std::string, uint64_t> descriptions_failed_why;
     uint64_t libraries = 0, libraries_failed = 0, pipelines = 0, pipelines_failed = 0;
     // PrecompileOptions::extra_variants: the states taken for them (of the
     // distinct ones the descriptions give the vertex and the pixel shaders'
@@ -492,6 +494,11 @@ struct PrecompileReport {
     // of the libraries above, the generic shaders' (Options::generic_shaders)
     // in the descriptions' states, made and failed
     uint64_t generic_libraries = 0, generic_libraries_failed = 0;
+    // descriptions of the other render target path than this renderer's (a
+    // run on the host's render targets, a step on the exact EDRAM, or the
+    // reverse): made as any other, but the generic shaders' libraries in
+    // their states are that path's (a step on that path makes them)
+    uint64_t descriptions_other_path = 0;
     uint64_t extra_libraries = 0, extra_libraries_failed = 0, extra_libraries_unmade = 0,
              extra_libraries_done_before = 0;
     double seconds = 0, driver_seconds = 0; // in all; the workers' time making them
