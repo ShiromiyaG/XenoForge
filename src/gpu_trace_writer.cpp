@@ -68,7 +68,10 @@ void set_u32(uint8_t *p, uint32_t v) { std::memcpy(p, &v, 4); }
 TraceWriter::TraceWriter(CommandProcessor &processor, Sink *next, TraceSource *source, TraceOptions options)
     : processor_(processor), next_(next), source_(source), options_(std::move(options)),
       memory_(processor.memory().translate_physical(0)) {
-    if (source_) source_->set_memory_trace(this);
+    // (the backend is told of the writer only while a frame is traced: open
+    // and packet_end. With a writer standing by for the player's F4 it
+    // otherwise reported every read of every frame, and kept none of what it
+    // keeps from draw to draw.)
 }
 
 TraceWriter::~TraceWriter() {
@@ -134,6 +137,7 @@ void TraceWriter::open(uint64_t frame) {
     std::vector<std::pair<uint32_t, std::vector<uint8_t>>> gpu_memory;
     bool have_edram = false;
     if (source_) {
+        source_->set_memory_trace(this);
         source_->settle();
         have_edram = source_->snapshot_edram(edram);
         source_->gpu_memory(gpu_memory);
@@ -326,7 +330,7 @@ void TraceWriter::packet(uint32_t address, std::span<const uint32_t> words) {
 
 void TraceWriter::packet_end() {
     if (next_) next_->packet_end();
-    bool wanted = false;
+    bool wanted = false, closed = false;
     uint64_t frame = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -338,12 +342,18 @@ void TraceWriter::packet_end() {
             const uint32_t event[2] = {EVENT, 0}; // kSwap
             put(event, sizeof(event));
             close();
+            closed = true;
         }
         frame = ++swaps_;
         wanted = options_.frames.count(frame) != 0;
     }
-    // the next frame, from here, when asked for
-    if (wanted) open(frame);
+    // the next frame, from here, when asked for; else the backend reports
+    // its reads no longer (told without the writer's lock: it takes its own,
+    // which it holds when it calls read)
+    if (wanted)
+        open(frame);
+    else if (closed && source_)
+        source_->set_memory_trace(nullptr);
 }
 
 void TraceWriter::memory_read(uint32_t address, uint32_t bytes) {

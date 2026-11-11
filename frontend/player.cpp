@@ -396,6 +396,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                 settings.game.empty() ? "" : (std::string(" (the game's own, ") + title_id + ")").c_str());
     std::filesystem::path key_shots =
         settings.screenshots.empty() ? config_file.parent_path() / "screenshots" : settings.screenshots;
+    // F4's traces go beside F12's screenshots unless XF_TRACE_DIR named a folder (game.cpp): the
+    // writer stands by, telling the renderer of nothing until a frame is asked for
+    if (!g.trace && g.renderer && !game::start_trace(g, {}, key_shots, error)) return fail(error);
 
     // the window: the game's name and image (its executable's XDBF), else the port's name or the title ID and
     // XenoForge's mark
@@ -666,16 +669,16 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                     settings.video.performance = !settings.video.performance;
                     changed = redraw = true;
                 }
-                // F4: the next frame traced (with XF_TRACE_DIR set), and a
-                // screenshot of this one beside it, as Xenia's F4
-                if (e.key.scancode == SDL_SCANCODE_F4) {
-                    if (g.trace) {
-                        g.trace->trace_next();
-                        key_screenshot();
-                        std::printf("tracing the next frame (F4)\n");
-                    } else {
-                        std::printf("F4: no trace writer; set XF_TRACE_DIR to a folder to trace frames\n");
-                    }
+                // F4: the next frame traced into the screenshots' folder (or
+                // XF_TRACE_DIR's), and a screenshot of this one beside it, as
+                // Xenia's F4: what a picture that is wrong is reported with
+                if (e.key.scancode == SDL_SCANCODE_F4 && g.trace) {
+                    g.trace->trace_next();
+                    key_screenshot();
+                    kernel::Toast notice;
+                    notice.text = u"Frame captured (F4): a trace and a screenshot in " + key_shots.u16string();
+                    sysui.toast(notice);
+                    std::printf("tracing the next frame (F4) into %s\n", key_shots.string().c_str());
                 }
                 if (e.key.scancode == SDL_SCANCODE_F2 && !sysui.active()) {
                     if (guide_open) close_guide();
