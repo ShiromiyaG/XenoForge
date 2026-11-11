@@ -58,6 +58,9 @@ struct UiState {
     std::mutex mutex;
     UiHandler handler;
     std::atomic<int> active{0}; // dialogs a host has taken and not yet answered
+    // the last message box answered with no host, and how many times in a row (message_box)
+    std::u16string last_box;
+    uint32_t last_box_repeats = 0;
 };
 UiState &ui(Kernel &k) { return k.state<UiState>(); }
 
@@ -170,6 +173,24 @@ uint32_t message_box(Kernel &k, uint32_t user, uint32_t title, uint32_t text, ui
     request.flags = flags;
     UiResult defaults;
     defaults.button = active_button;
+    // With no host the focused button answers at once (Xenia's headless
+    // answer). A title that shows the same box again right after that answer
+    // ("no save on this device: choose another?") would ask forever, and no
+    // run without a window would get past it: from the third time in a row
+    // the same box takes the next button each time.
+    {
+        UiState &s = ui(k);
+        std::lock_guard<std::mutex> l(s.mutex);
+        std::u16string box = request.title + u'\n' + request.text;
+        for (const std::u16string &b : request.buttons) box += u'\n' + b;
+        if (box == s.last_box) {
+            s.last_box_repeats++;
+        } else {
+            s.last_box = std::move(box);
+            s.last_box_repeats = 0;
+        }
+        if (s.last_box_repeats >= 2) defaults.button = (active_button + s.last_box_repeats - 1) % button_count;
+    }
     return present(k, ov, request, defaults, [&k, result_ptr](const UiResult &r) {
         k.store32(result_ptr, r.button); // MESSAGEBOX_RESULT::ButtonPressed
         return X_ERROR_SUCCESS;
