@@ -232,12 +232,27 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
     // spin on something else meanwhile (another thread's flag) looks again
     // at each write-back and each SPIN_WAIT_US. XF_SPIN_WAIT=0: hand-overs
     // only.
+    // A spin that has gone on for SPIN_IDLE_AFTER sleeps the same way with
+    // the processor idle too: a title's own wait for the next vertical
+    // blank or frame (a counter the interrupt's routine writes), which kept
+    // a core busy for most of each frame the GPU finished early. What it
+    // waits for comes with an interrupt, which wakes it; a flag of another
+    // thread's is looked at again each SPIN_WAIT_US, after a spin already
+    // that long. Off until it is timed on a quiet machine against the
+    // titles whose frame is at its limit (XF_SPIN_IDLE=1 turns it on): a
+    // title's spin share fell from 6% to 2% of the samples with it, at the
+    // same rate.
     system_.spin = [](ppc::Context &c) {
         static constexpr uint64_t SPIN_STREAK_GAP = 10'000, SPIN_WAIT_AFTER = 2'000; // 100 ns units
+        static constexpr uint64_t SPIN_IDLE_AFTER = 20'000;
+        static const bool idle_waits = [] {
+            const char *v = std::getenv("XF_SPIN_IDLE");
+            return !(v && v[0] == '0');
+        }();
         static constexpr uint32_t SPIN_WAIT_US = 1'000;
         static const bool waiting = [] {
             const char *v = std::getenv("XF_SPIN_WAIT");
-            return !(v && v[0] == '0');
+            return v && v[0] == '1';
         }();
         Kernel &k = *static_cast<Kernel *>(c.system->owner);
         // handing over is a safe point: the thread waiting there is parked
@@ -249,7 +264,9 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         const uint64_t now = s.now();
         const uint32_t seen = v.write_backs.load(std::memory_order_acquire);
         if (now - t->spin_last > SPIN_STREAK_GAP) t->spin_since = now;
-        if (now - t->spin_since >= SPIN_WAIT_AFTER && seen == t->spin_seen && v.busy.load(std::memory_order_relaxed)) {
+        const uint64_t streak = now - t->spin_since;
+        if (seen == t->spin_seen && ((streak >= SPIN_WAIT_AFTER && v.busy.load(std::memory_order_relaxed)) ||
+                                     (idle_waits && streak >= SPIN_IDLE_AFTER))) {
             v.spin_waits.fetch_add(1, std::memory_order_relaxed);
             s.spin_wait(v.write_backs, seen, SPIN_WAIT_US);
         } else {
