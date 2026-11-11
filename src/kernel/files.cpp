@@ -557,6 +557,19 @@ bool mount_disc(Kernel &k, const std::filesystem::path &iso, std::string &error)
     return true;
 }
 
+// (Xenia's Emulator::LaunchStfsContainer: the same mount path as a disc's,
+// XDeploymentType::kDownload)
+bool mount_package(Kernel &k, const std::filesystem::path &package, std::string &error) {
+    auto device = vfs::make_package_device("\\Device\\Cdrom0", package, error);
+    if (!device) return false;
+    vfs::FileSystem &fs = file_system(k);
+    fs.add_device(device);
+    link_game(fs, "\\Device\\Cdrom0");
+    mount_null_partitions(fs);
+    fs.deployment = 2; // downloaded
+    return true;
+}
+
 bool mount_directory(Kernel &k, const std::filesystem::path &dir, std::string &error) {
     // read-only, as Xenia's default (allow_game_relative_writes off)
     auto device = vfs::make_host_device("\\Device\\Harddisk0\\Partition1", dir, true);

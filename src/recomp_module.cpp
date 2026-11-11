@@ -1,7 +1,7 @@
 // A disc's modules discovered and emitted (recomp.h, "Modules"): what
 // xfrecomp emit writes, and the recompile step (game_build.cpp) in process.
 
-#include "xenoforge/disc.h"
+#include "xenoforge/game_source.h"
 #include "xenoforge/recomp.h"
 #include "xenoforge/xex.h"
 
@@ -21,19 +21,14 @@ bool is_xex_file(const std::vector<uint8_t> &file) {
 }
 
 // every XEX2 executable under dir, but the system update's
-void find_executables(const Disc &disc, const DiscEntry &dir, const std::string &prefix, std::vector<ModuleFile> &out) {
-    for (const DiscEntry &e : dir.children) {
-        std::string path = prefix.empty() ? e.name : prefix + "\\" + e.name;
-        if (e.directory) {
-            std::string lower = e.name;
-            for (char &ch : lower) ch = char(std::tolower(uint8_t(ch)));
-            if (prefix.empty() && lower == "$systemupdate") continue;
-            find_executables(disc, e, path, out);
-            continue;
-        }
+void find_executables(const GameSource &source, std::vector<ModuleFile> &out) {
+    for (const GameSource::File &e : source.files()) {
+        std::string lower = e.path.substr(0, 14);
+        for (char &ch : lower) ch = char(std::tolower(uint8_t(ch)));
+        if (lower == "$systemupdate\\") continue;
         char magic[4] = {};
-        if (e.size < 0x18 || !disc.read(e, 0, magic, 4) || std::memcmp(magic, "XEX2", 4) != 0) continue;
-        out.push_back({path, disc.read_all(e)});
+        if (e.size < 0x18 || source.read(e, 0, magic, 4) != 4 || std::memcmp(magic, "XEX2", 4) != 0) continue;
+        out.push_back({e.path, source.read_all(e)});
     }
 }
 
@@ -395,13 +390,13 @@ bool find_modules(const std::filesystem::path &input, const std::vector<std::str
         }
     }
     if (out.empty()) {
-        auto disc = Disc::open(input, error);
-        if (!disc) return false;
-        if (only.empty()) find_executables(*disc, disc->root(), "", out);
+        auto source = GameSource::open(input, error);
+        if (!source) return false;
+        if (only.empty()) find_executables(*source, out);
         for (const std::string &path : only) {
-            const DiscEntry *entry = disc->find(path);
-            if (!entry || entry->directory) return error = "no " + path + " on the disc", false;
-            out.push_back({path, disc->read_all(*entry)});
+            const GameSource::File *entry = source->find(path);
+            if (!entry) return error = "no " + path + (source->package() ? " in the package" : " on the disc"), false;
+            out.push_back({path, source->read_all(*entry)});
         }
     }
     // title updates are patches to apply, not modules

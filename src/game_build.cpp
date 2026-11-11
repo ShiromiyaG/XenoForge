@@ -22,6 +22,7 @@
 
 #include "xenoforge/game_interface.h" // XF_GAME_INTERFACE_VERSION, made by the build
 #include "xenoforge/disc.h"
+#include "xenoforge/game_source.h"
 #include "xenoforge/recomp.h"
 #include "xenoforge/shader_container.h"
 #include "xenoforge/shader_storage.h"
@@ -61,6 +62,29 @@ namespace xf::build {
 namespace {
 
 namespace fs = std::filesystem;
+
+// The library has no C runtime, and on Windows the compiler calls the
+// runtime's stack probe in a function whose frame is above a page (a guest
+// function with a large frame of locals, seldom): the frame's size in rax,
+// each page down to the new stack pointer touched so the guard page moves,
+// every register but r10 and r11 kept. Defined in the entry's file.
+const std::string STACK_PROBE = R"xf(
+#if defined(_WIN32) && defined(__x86_64__)
+__asm__(".globl __chkstk\n"
+        "__chkstk:\n"
+        "    movq %rsp, %r10\n"
+        "    movq %rax, %r11\n"
+        "1:  cmpq $0x1000, %r11\n"
+        "    jbe 2f\n"
+        "    subq $0x1000, %r10\n"
+        "    testq %r10, (%r10)\n"
+        "    subq $0x1000, %r11\n"
+        "    jmp 1b\n"
+        "2:  subq %r11, %r10\n"
+        "    testq %r10, (%r10)\n"
+        "    ret\n");
+#endif
+)xf";
 
 // the headers the generated code compiles against, as this build has them
 // (cmake/game_interface.cmake)
@@ -577,20 +601,9 @@ void find_disc_shaders(const fs::path &disc, ShaderStep &step, const std::atomic
         }
     } else {
         std::string why;
-        std::unique_ptr<Disc> image = Disc::open(disc, why);
-        if (image) {
-            std::vector<const DiscEntry *> pending{&image->root()};
-            while (!pending.empty()) {
-                const DiscEntry *e = pending.back();
-                pending.pop_back();
-                for (const DiscEntry &child : e->children) {
-                    if (child.directory)
-                        pending.push_back(&child);
-                    else if (wanted(child.name, child.size))
-                        take(image->read_all(child));
-                }
-            }
-        }
+        if (std::unique_ptr<GameSource> image = GameSource::open(disc, why))
+            for (const GameSource::File &file : image->files())
+                if (wanted(file.path, file.size)) take(image->read_all(file));
     }
     step.disc_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 }
@@ -774,7 +787,8 @@ bool Build::compile_and_link(const fs::path &src_root, const std::vector<std::st
     if (!write_if_changed(entry, "// Written by the recompile step: the game library's entry (game_library.h), for "
                                  "interface version " +
                                      hex_version() +
-                                     ".\n#define XF_GAME_LIBRARY_ENTRY\n#include \"xenoforge/game_library.h\"\n"))
+                                     ".\n#define XF_GAME_LIBRARY_ENTRY\n#include \"xenoforge/game_library.h\"\n" +
+                                     STACK_PROBE))
         return fail(error, "cannot write " + utf8(entry));
     std::vector<Job> jobs;
     auto add = [&](const fs::path &source, const fs::path &relative) {

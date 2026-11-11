@@ -8,10 +8,12 @@
 
 #include "xenoforge/bytes.h"
 #include "xenoforge/disc.h"
+#include "xenoforge/game_source.h"
 
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -192,11 +194,11 @@ GameEntry read_game(const std::filesystem::path &path) {
         if (!f) return game.error = "cannot be read", game;
         file.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     } else {
-        auto disc = Disc::open(path, game.error);
-        if (!disc) return game;
-        const DiscEntry *entry = disc->find("default.xex");
-        if (!entry) return game.error = "no default.xex on the disc", game;
-        file = disc->read_all(*entry);
+        auto source = GameSource::open(path, game.error);
+        if (!source) return game;
+        const GameSource::File *entry = source->find("default.xex");
+        if (!entry) return game.error = source->package() ? "no game in the package" : "no default.xex on the disc", game;
+        file = source->read_all(*entry);
     }
     Xex xex;
     if (!parse_xex(file, xex, game.error) || !load_xex_image(file, xex, game.error)) return game;
@@ -216,11 +218,27 @@ std::vector<std::filesystem::path> find_games(const std::filesystem::path &folde
     auto options = std::filesystem::directory_options::skip_permission_denied;
     for (auto it = std::filesystem::recursive_directory_iterator(folder, options, ec);
          !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-        if (it.depth() >= 1) it.disable_recursion_pending(); // the folder and its subfolders, no deeper
+        // the folder and its subfolders, no deeper, but for a content
+        // package's own folders (<title id>\<content type>, eight hex digits each)
+        if (it.depth() >= 1 && it->is_directory(ec)) {
+            const std::string dir = it->path().filename().string();
+            const bool content = dir.size() == 8 && std::all_of(dir.begin(), dir.end(), [](char ch) {
+                return std::isxdigit(uint8_t(ch)) != 0;
+            });
+            if (!content || it.depth() >= 3) it.disable_recursion_pending();
+        }
         if (!it->is_regular_file(ec)) continue;
         std::string name = it->path().filename().string();
         std::transform(name.begin(), name.end(), name.begin(), ::tolower);
-        if (name.ends_with(".iso") || name == "default.xex") found.push_back(it->path());
+        if (name.ends_with(".iso") || name == "default.xex")
+            found.push_back(it->path());
+        // a package holding a game (an arcade game, a game on demand): no
+        // extension, and a default.xex inside (an update or an add-on has none)
+        else if (!it->path().has_extension() && GameSource::is_package(it->path())) {
+            std::string why;
+            if (auto source = GameSource::open(it->path(), why); source && source->find("default.xex"))
+                found.push_back(it->path());
+        }
     }
     std::sort(found.begin(), found.end());
     return found;

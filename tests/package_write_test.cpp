@@ -6,9 +6,12 @@
 #include "check.h"
 
 #include "xenoforge/bytes.h"
+#include "xenoforge/game_source.h"
 #include "xenoforge/package.h"
 #include "xenoforge/sha1.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -159,6 +162,27 @@ void round_trip(const Tree &t, uint32_t expect_blocks_at_least, bool raw) {
         CHECK(!p->read_only());
         check_package_matches(*p, t);
         if (raw) check_raw(out, p->info().stfs.total_block_count);
+        // the same files through a game's source, which takes a package as it
+        // takes a disc (game_source.h)
+        CHECK(GameSource::is_package(out));
+        std::unique_ptr<GameSource> source = GameSource::open(out, error);
+        CHECK(source && source->package());
+        if (source) {
+            CHECK(source->files().size() == t.files.size());
+            for (const auto &[name, data] : t.files) {
+                std::string upper = name;
+                for (char &ch : upper) ch = ch == '/' ? '\\' : char(std::toupper(uint8_t(ch)));
+                const GameSource::File *f = source->find(upper);
+                CHECK(f && f->size == data.size());
+                if (!f) continue;
+                CHECK(source->read_all(*f) == data);
+                uint8_t head[4] = {};
+                const size_t n = source->read(*f, data.size() / 2, head, sizeof(head));
+                CHECK(n == std::min<size_t>(sizeof(head), data.size() - data.size() / 2));
+                CHECK(std::memcmp(head, data.data() + data.size() / 2, n) == 0);
+            }
+            CHECK(!source->find("no such file"));
+        }
         // and back to a directory
         CHECK(extract_package(*p, back, error));
         for (const auto &[name, data] : t.files) CHECK(read_file(back / name) == data);

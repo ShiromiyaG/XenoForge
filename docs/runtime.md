@@ -1065,6 +1065,30 @@ entries, names any case.
   in-place transactions (the package is rewritten whole at each flush).
 - `XF_LOG_FILES=1` logs each open and attribute query with its answer.
 
+### A game in a content package (2026-11-11)
+
+An arcade game or a game on demand is a content package (STFS or SVOD,
+`package.h`) with its `default.xex` inside, not a disc. `GameSource`
+(`game_source.h`) is a game's files wherever they are: a package where the
+file begins as one (`CON `, `LIVE`, `PIRS`), a disc image otherwise, with
+the files listed, found by path and read the same way. What looked for
+files on the disc takes it: boot's and the player's loading of the
+executable, the recompiler's search for executables (`xfrecomp`, `xfbuild`,
+the launcher's prepare job), the build step's search for shaders, and the
+launcher's scan, which lists a file without an extension that is a package
+with a `default.xex` (an update or an add-on has none) and looks for them
+in the content folders' layout too (`<title id>\<content type>\<file>`
+under a games folder). The kernel mounts the package as the game's device
+(`kernel::mount_package`), as Xenia's `LaunchStfsContainer`: the disc's
+mount path, `GAME:` and `D:` linked to it, the deployment type "download".
+Checked on an arcade game's package: its library built (7,675 functions,
+none left out), the title screen drawn at 60 swaps a second.
+
+The recompile step's library has no C runtime, and one of that game's
+functions has a frame above a page, for which the compiler on Windows
+calls the runtime's stack probe (`__chkstk`): the library's entry file now
+defines it (`game_build.cpp`, `STACK_PROBE`), where the link failed.
+
 ## XAM
 
 As built (`src/kernel/xam.h`; xam.cpp, xam_content.cpp, xam_user.cpp,

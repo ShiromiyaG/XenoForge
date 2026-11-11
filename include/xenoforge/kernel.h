@@ -164,6 +164,9 @@ std::string stacks_report(Kernel &k);
 // saves go, interchangeable with Xenia's).
 bool mount_disc(Kernel &k, const std::filesystem::path &iso, std::string &error);
 bool mount_directory(Kernel &k, const std::filesystem::path &dir, std::string &error);
+// a content package holding a game (an arcade game, a game on demand), as the
+// console starts one: the game's device, deployed as a download
+bool mount_package(Kernel &k, const std::filesystem::path &package, std::string &error);
 bool mount_storage(Kernel &k, const std::filesystem::path &root, std::string &error);
 
 // How content a title creates (saves, caches) is kept under the content root: as STFS packages, files the console

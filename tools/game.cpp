@@ -5,6 +5,7 @@
 #include "xenoforge/command_processor.h"
 #include "xenoforge/crash.h"
 #include "xenoforge/disc.h"
+#include "xenoforge/game_source.h"
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
 #include "xenoforge/hooks.h"
@@ -45,11 +46,11 @@ bool load(const std::string &input, const std::string &xex_path, Xex &xex, std::
         if (!f) return error = "cannot read " + input, false;
         file.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     } else {
-        auto disc = Disc::open(input, error);
-        if (!disc) return false;
-        const DiscEntry *entry = disc->find(xex_path);
-        if (!entry) return error = "no " + xex_path + " on the disc", false;
-        file = disc->read_all(*entry);
+        auto source = GameSource::open(input, error);
+        if (!source) return false;
+        const GameSource::File *entry = source->find(xex_path);
+        if (!entry) return error = "no " + xex_path + (source->package() ? " in the package" : " on the disc"), false;
+        file = source->read_all(*entry);
     }
     return parse_xex(file, xex, error) && load_xex_image(file, xex, error);
 }
@@ -241,7 +242,8 @@ bool open(const Options &options, Game &g, std::string &error) {
     if (!record.empty() && !kernel::record_input(k, record, error)) return error = "input: " + error, false;
     bool bare = input.ends_with(".xex") || input.ends_with(".XEX");
     bool mounted = bare ? kernel::mount_directory(k, std::filesystem::path(input).parent_path(), error)
-                        : kernel::mount_disc(k, input, error);
+                   : GameSource::is_package(input) ? kernel::mount_package(k, input, error)
+                                                   : kernel::mount_disc(k, input, error);
     if (!mounted || !kernel::mount_storage(k, options.storage, error)) return error = "mount: " + error, false;
     std::printf("storage: %s\n", options.storage.string().c_str());
     kernel::set_content_format(k, options.content_format);

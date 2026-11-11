@@ -36,6 +36,7 @@ add_library(xenoforge STATIC
     src/des.cpp
     src/disc.cpp
     src/package.cpp
+    src/game_source.cpp
     src/package_write.cpp
     src/kernel/gpd.cpp
     src/profile_gpd.cpp
