@@ -4208,6 +4208,13 @@ rectangles faced back, and the depth was cleared behind the windows too,
 which the frame's fog pass then covered. With the front face's for what is
 no polygon: 0.39 of 255, as the interlock path.
 
-The frame is kept (`../traces/cockpit/4D5309C9_3347.xtr`, Xenia's picture in
-`../traces/dumps/pending`) but not in `replay_test` yet: 0.44% of its pixels
-are still off on both paths, the route drawn on the minimap most of them.
+The frame is in `replay_test` on both paths (`../traces/cockpit/4D5309C9_3347.xtr`),
+against Xenia's exact picture (`--render_target_path_d3d12=rov`), which the
+host path is 0.009% of pixels off and the interlock path 0.003%. Not against
+Xenia's host picture (kept in `../traces/dumps/d3d12_host_wrong`): 0.44% of
+the pixels differ from it on both of our paths, the route on the minimap,
+drawn with a maximum blend whose factors the console applies and Xenia's
+host path ignores ("The factors of minimum and maximum blending"). The
+software reference renderer and Xenia's own exact path give our values
+there. `replay_test`'s corpus: 34 frames on the interlock path, 32 on the
+host path.
