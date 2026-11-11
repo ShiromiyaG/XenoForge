@@ -2093,7 +2093,10 @@ private:
     // the render pass ended, if one is under way
     void end_pass() {
         end_query(); // a query does not outlive its render pass
-        if (in_pass_) vkCmdEndRendering(slots_[current_].cmd);
+        if (in_pass_) {
+            record_sync();
+            vkCmdEndRendering(slots_[current_].cmd);
+        }
         in_pass_ = false;
     }
     // ---- occlusion queries ----
@@ -2163,6 +2166,7 @@ private:
     }
     void viz_end_host() {
         if (viz_open_ == UINT32_MAX) return;
+        record_sync();
         vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, viz_[viz_open_].index);
         viz_open_ = UINT32_MAX;
     }
@@ -2185,6 +2189,7 @@ private:
         if (viz_open_ != viz_survey_) {
             end_query(); // the report's and another ID's: one occlusion query at a time
             if (!viz_count(q)) return;
+            record_sync();
             vkCmdBeginQuery(c, slots_[current_].occlusion, q.index, 0);
             viz_open_ = viz_survey_;
         }
@@ -2270,7 +2275,7 @@ private:
     // extents_), or UINT32_MAX: it cannot, and the report is the whole screen
     uint32_t extent_draw_words() {
         if (!extent_open_ || extent_whole_) return UINT32_MAX;
-        cmd();
+        begin_recording();
         Slot &s = slots_[current_];
         if (extent_index_ == UINT32_MAX) {
             if (s.extent_reports.size() >= EXTENT_REPORTS) {
@@ -2342,7 +2347,10 @@ private:
         viz_end_host();
         if (zpd_active_ == UINT32_MAX) return;
         // (the interlock path's counters are no host queries)
-        if (!fsi_) vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
+        if (!fsi_) {
+            record_sync();
+            vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
+        }
         zpd_active_ = UINT32_MAX;
     }
     void zpd_report_ended(uint64_t ended, uint64_t next) {
@@ -2368,6 +2376,7 @@ private:
         s.occlusion_used = uint32_t(s.occlusion_reports.size());
         zpd_counts_[zpd_current_].open++;
         report_.occlusion_queries++;
+        record_sync();
         vkCmdBeginQuery(c, s.occlusion, zpd_active_, d_.precise_occlusion() ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
     // the slot's submission is done: its queries' samples to their reports
@@ -2652,6 +2661,204 @@ private:
     }();
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
+
+    // ---- the index cache ----
+    // A draw's converted indices kept by where the guest's are and how they
+    // were converted (Xenia's primitive processor keeps its converted index
+    // buffers the same way), in buffers of their own: static geometry's are
+    // converted and uploaded once, not at every draw. The guest's pages are
+    // watched as a texture's are; pages written since make the draw convert
+    // again, and the entry stays where the words came out the same (a write
+    // elsewhere in its pages). Indices written again and again (dynamic
+    // geometry) leave the cache for a while, and are converted into the
+    // arena as before. XF_INDEX_CACHE=0: every draw's converted, as before.
+    struct IndexKey {
+        uint32_t base = 0, count = 0, form = 0, reset = 0, offset = 0, min = 0, max = 0;
+        bool operator==(const IndexKey &) const = default;
+    };
+    struct IndexKeyHash {
+        size_t operator()(const IndexKey &k) const {
+            uint64_t h = 0x9E3779B97F4A7C15ull;
+            for (uint32_t w : {k.base, k.count, k.form, k.reset, k.offset, k.min, k.max}) h = (h ^ w) * 0x100000001B3ull;
+            return size_t(h ^ (h >> 29));
+        }
+    };
+    struct IndexEntry {
+        std::vector<uint32_t> words; // as the draw binds them (after the primitive's conversion)
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize at = 0;
+        uint32_t checked = 0;       // the write count the guest's pages were last known unwritten at
+        uint32_t first = 0, last = 0; // its watch pages
+        uint64_t seen_swap = 0;     // the swap it was last drawn in, plus 1
+        uint64_t written_swap = 0;  // the swap its pages were last found written in
+        uint32_t streak = 0;        // how many times in a row within a few swaps
+        uint64_t dynamic_until = 0; // not kept before this swap
+    };
+    struct IndexChunk {
+        vk::Buffer buffer;
+        VkDeviceSize used = 0;
+    };
+    static constexpr VkDeviceSize INDEX_CHUNK = 8u << 20, INDEX_CACHE_BUDGET = 128u << 20;
+    static constexpr size_t INDEX_CACHE_ENTRIES = 1u << 17;
+    std::unordered_map<IndexKey, IndexEntry, IndexKeyHash> index_cache_;
+    std::vector<IndexChunk> index_chunks_;
+    VkDeviceSize index_cache_words_ = 0; // the entries' host copies, in bytes
+    bool index_cache_on_ = [] {
+        const char *v = std::getenv("XF_INDEX_CACHE");
+        return !(v && v[0] == '0');
+    }();
+    // room for an entry's words in the cache's buffers; false when none can be made
+    bool index_cache_place(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &at);
+    // everything dropped: the buffers go once the submission being recorded is done
+    void index_cache_drop();
+    // the index buffer the recording command buffer has bound at offset 0
+    VkBuffer bound_index_buffer_ = VK_NULL_HANDLE;
+    // whether it has the draws' two sets bound, and the first's dynamic
+    // offsets (XF_SET_ELISION=0: both bound at every draw, as before)
+    bool sets_bound_ = false;
+    uint32_t bound_offsets_[4] = {};
+    bool set_elision_ = [] {
+        const char *v = std::getenv("XF_SET_ELISION");
+        return !(v && v[0] == '0');
+    }();
+
+    // ---- the recording thread ----
+    // A draw's commands (its binds, the dynamic state it changes, the draw)
+    // are not recorded into the command buffer by the thread that makes them:
+    // they go into a ring another thread records from, so the driver's time
+    // in them is off the command thread. A command buffer is recorded by one
+    // thread at a time: everything else that records (cmd()'s callers, the
+    // render pass's and the queries' ends, the submission) first waits for
+    // the ring to empty (record_sync). Off unless XF_RECORD_THREAD=1: it
+    // gained nothing on a replayed frame and lost in play (docs/renderer.md,
+    // "Game G's command thread"), the passes being short and the command
+    // buffer's memory going from one thread's cache to the other's at each.
+    // The ring holds words: a command's number, then what it takes (a few
+    // words each: the ring's lines go from one thread's cache to the other's
+    // and back, so its size is what the hand-over costs).
+    struct Recorded {
+        enum Op : uint32_t {
+            CommandBuffer, BindPipeline, BindSets, BindIndexBuffer, BindVertexBuffer, Viewport, Scissor,
+            BlendConstants, StencilReference, StencilCompareMask, StencilWriteMask, Topology, RestartEnable, CullMode,
+            FrontFace, DepthTest, DepthWrite, DepthCompare, StencilTest, StencilOp, DepthBiasEnable, BlendEnables,
+            BlendEquations, WriteMasks, LineWidth, DepthBias, DepthBiasExact, BeginConditional, EndConditional, Draw,
+            DrawIndexed, Wrap, Quit,
+        };
+        struct Sets {
+            uint32_t count;
+            uint32_t offsets[4];
+            VkDescriptorSet sets[2];
+        };
+        struct Bias {
+            uint32_t host_float;
+            float constant, slope;
+        };
+        struct Place {
+            VkBuffer buffer;
+            VkDeviceSize at;
+        };
+    };
+    static constexpr uint32_t RECORDED = 1u << 16, RECORDED_MOST = 32; // words; a command's most, with its number
+    std::unique_ptr<uint32_t[]> recorded_;
+    alignas(64) std::atomic<uint32_t> recorded_head_{0}; // words put in (the command thread's)
+    alignas(64) std::atomic<uint32_t> recorded_tail_{0}; // words recorded (the recording thread's)
+    alignas(64) std::atomic<bool> recorder_asleep_{false};
+    std::thread recorder_;
+    uint32_t recorded_direct_[RECORDED_MOST] = {};
+    VkCommandBuffer record_direct_cmd_ = VK_NULL_HANDLE;
+    bool record_thread_ = [] {
+        const char *v = std::getenv("XF_RECORD_THREAD");
+        return v && v[0] == '1';
+    }();
+    static void spin_pause() {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+    uint32_t record_head_ = 0, record_published_ = 0, record_tail_seen_ = 0;
+    uint32_t record_words_ = 0;                    // of the command being filled, with its number
+    VkCommandBuffer record_cmd_ = VK_NULL_HANDLE;  // the command buffer the ring's commands after this go into
+    // room for a command of that many words after its number, contiguous
+    uint32_t *record_room(uint32_t op, uint32_t words) {
+        const uint32_t total = words + 1;
+        uint32_t at = record_head_ & (RECORDED - 1);
+        // (never across the ring's end: the rest of it skipped)
+        const uint32_t skipped = at + total > RECORDED ? RECORDED - at : 0;
+        // (the other thread's count read again only when the ring looks full:
+        // its cache line is that thread's to write)
+        if (record_head_ + skipped + total - record_tail_seen_ > RECORDED) {
+            record_publish();
+            while (record_head_ + skipped + total -
+                       (record_tail_seen_ = recorded_tail_.load(std::memory_order_acquire)) >
+                   RECORDED)
+                spin_pause();
+        }
+        if (skipped) {
+            recorded_[at] = Recorded::Wrap;
+            record_head_ += skipped;
+            at = 0;
+        }
+        recorded_[at] = op;
+        record_words_ = total;
+        return &recorded_[at + 1];
+    }
+    // the next command's words to fill, then recorded(): into the ring, or recorded at once
+    uint32_t *record(VkCommandBuffer c, Recorded::Op op, uint32_t words) {
+        if (!record_thread_) {
+            recorded_direct_[0] = op;
+            record_direct_cmd_ = c;
+            return &recorded_direct_[1];
+        }
+        if (!recorder_.joinable()) {
+            recorded_ = std::make_unique<uint32_t[]>(RECORDED);
+            recorder_ = std::thread([this] { recorder_loop(); });
+        }
+        if (c != record_cmd_) {
+            std::memcpy(record_room(Recorded::CommandBuffer, 2), &c, sizeof(c));
+            record_head_ += record_words_;
+            record_cmd_ = c;
+        }
+        return record_room(op, words);
+    }
+    void recorded() {
+        if (!record_thread_) {
+            run_recorded(record_direct_cmd_, recorded_direct_);
+            return;
+        }
+        record_head_ += record_words_;
+    }
+    // the commands put in since the last time handed to the recording thread:
+    // once a draw, not once a command (the count's cache line goes back and
+    // forth between the two threads at every store)
+    void record_publish() {
+        if (record_head_ == record_published_) return;
+        recorded_head_.store(record_published_ = record_head_);
+        if (recorder_asleep_.load()) recorded_head_.notify_one();
+    }
+    template <class T> void record_value(VkCommandBuffer c, Recorded::Op op, const T &value) {
+        static_assert(sizeof(T) / 4 + 2 <= RECORDED_MOST);
+        std::memcpy(record(c, op, uint32_t(sizeof(T) + 3) / 4), &value, sizeof(T));
+        recorded();
+    }
+    template <class... A> void record_words(VkCommandBuffer c, Recorded::Op op, A... a) {
+        const uint32_t words[sizeof...(a) + 1] = {uint32_t(a)..., 0u};
+        std::memcpy(record(c, op, uint32_t(sizeof...(a))), words, sizeof...(a) * 4);
+        recorded();
+    }
+    // everything put in the ring is in the command buffer
+    void record_sync() {
+        if (!recorder_.joinable()) return;
+        record_publish();
+        const uint32_t head = record_head_;
+        while (recorded_tail_.load(std::memory_order_acquire) != head) spin_pause();
+    }
+    // a command's words (after its number) into the command buffer; how many it took
+    uint32_t run_recorded(VkCommandBuffer c, const uint32_t *r);
+    void recorder_loop();
+    // a command buffer being recorded, begun if none is, without waiting for the ring
+    void begin_recording();
 
     vk::Buffer mirror_, arena_, scratch_, load_scratch_;
     // the draw-data arena (draw_data_take): a share a slot, in device-local
@@ -2977,6 +3184,12 @@ private:
 };
 
 Impl::~Impl() {
+    if (recorder_.joinable()) {
+        record(record_cmd_, Recorded::Quit, 0);
+        recorded();
+        record_publish();
+        recorder_.join();
+    }
     translation_workers_.reset(); // before the shaders they read
     mem_.remove_watcher(watcher_);
     vkDeviceWaitIdle(dev_);
@@ -3057,6 +3270,7 @@ Impl::~Impl() {
     for (vk::Buffer *b : {&edram_, &edram_1x_, &host_depth_, &mirror_, &arena_, &draw_data_, &scratch_, &load_scratch_,
                           &zpd_counters_, &zpd_readback_, &extents_, &extents_readback_, &viz_predicates_})
         d_.destroy(*b);
+    for (IndexChunk &chunk : index_chunks_) d_.destroy(chunk.buffer);
 }
 
 // keep: destroyed with the renderer, else by the caller
@@ -3935,6 +4149,177 @@ bool Impl::program(Shader &s, std::string &why) {
 // ---- submissions ----
 
 VkCommandBuffer Impl::cmd() {
+    begin_recording();
+    record_sync();
+    return slots_[current_].cmd;
+}
+
+uint32_t Impl::run_recorded(VkCommandBuffer c, const uint32_t *r) {
+    const uint32_t *a = r + 1;
+    auto value = [a]<class T>(T &out) {
+        std::memcpy(&out, a, sizeof(T));
+        return uint32_t(sizeof(T) + 3) / 4;
+    };
+    switch (Recorded::Op(r[0])) {
+    case Recorded::BindPipeline: {
+        VkPipeline pipeline;
+        const uint32_t words = value(pipeline);
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        return words;
+    }
+    case Recorded::BindSets: {
+        Recorded::Sets sets;
+        const uint32_t words = value(sets);
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, sets.count, sets.sets, 4, sets.offsets);
+        return words;
+    }
+    case Recorded::BindIndexBuffer: {
+        VkBuffer buffer;
+        const uint32_t words = value(buffer);
+        vkCmdBindIndexBuffer(c, buffer, 0, VK_INDEX_TYPE_UINT32);
+        return words;
+    }
+    case Recorded::BindVertexBuffer: {
+        Recorded::Place place;
+        const uint32_t words = value(place);
+        vkCmdBindVertexBuffers(c, 0, 1, &place.buffer, &place.at);
+        return words;
+    }
+    case Recorded::Viewport: {
+        VkViewport viewport;
+        const uint32_t words = value(viewport);
+        vkCmdSetViewport(c, 0, 1, &viewport);
+        return words;
+    }
+    case Recorded::Scissor: {
+        VkRect2D scissor;
+        const uint32_t words = value(scissor);
+        vkCmdSetScissor(c, 0, 1, &scissor);
+        return words;
+    }
+    case Recorded::BlendConstants: {
+        float constants[4];
+        const uint32_t words = value(constants);
+        vkCmdSetBlendConstants(c, constants);
+        return words;
+    }
+    case Recorded::StencilReference: vkCmdSetStencilReference(c, a[0], a[1]); return 2;
+    case Recorded::StencilCompareMask: vkCmdSetStencilCompareMask(c, a[0], a[1]); return 2;
+    case Recorded::StencilWriteMask: vkCmdSetStencilWriteMask(c, a[0], a[1]); return 2;
+    case Recorded::Topology: vkCmdSetPrimitiveTopology(c, VkPrimitiveTopology(a[0])); return 1;
+    case Recorded::RestartEnable: vkCmdSetPrimitiveRestartEnable(c, a[0]); return 1;
+    case Recorded::CullMode: vkCmdSetCullMode(c, a[0]); return 1;
+    case Recorded::FrontFace: vkCmdSetFrontFace(c, VkFrontFace(a[0])); return 1;
+    case Recorded::DepthTest: vkCmdSetDepthTestEnable(c, a[0]); return 1;
+    case Recorded::DepthWrite: vkCmdSetDepthWriteEnable(c, a[0]); return 1;
+    case Recorded::DepthCompare: vkCmdSetDepthCompareOp(c, VkCompareOp(a[0])); return 1;
+    case Recorded::StencilTest: vkCmdSetStencilTestEnable(c, a[0]); return 1;
+    case Recorded::StencilOp:
+        vkCmdSetStencilOp(c, a[0], VkStencilOp(a[1]), VkStencilOp(a[2]), VkStencilOp(a[3]), VkCompareOp(a[4]));
+        return 5;
+    case Recorded::DepthBiasEnable: vkCmdSetDepthBiasEnable(c, a[0]); return 1;
+    case Recorded::BlendEnables: {
+        VkBool32 enables[4];
+        const uint32_t words = value(enables);
+        set_blend_enable_(c, 0, 4, enables);
+        return words;
+    }
+    case Recorded::BlendEquations: {
+        VkColorBlendEquationEXT equations[4];
+        const uint32_t words = value(equations);
+        set_blend_equation_(c, 0, 4, equations);
+        return words;
+    }
+    case Recorded::WriteMasks: {
+        VkColorComponentFlags masks[4];
+        const uint32_t words = value(masks);
+        set_write_mask_(c, 0, 4, masks);
+        return words;
+    }
+    case Recorded::LineWidth: {
+        float width;
+        const uint32_t words = value(width);
+        vkCmdSetLineWidth(c, width);
+        return words;
+    }
+    case Recorded::DepthBias: {
+        Recorded::Bias bias;
+        const uint32_t words = value(bias);
+        vkCmdSetDepthBias(c, bias.constant, 0.0f, bias.slope);
+        return words;
+    }
+    case Recorded::DepthBiasExact: {
+        // (a float depth format's unit is forced to a 24-bit unorm one's)
+        Recorded::Bias from;
+        const uint32_t words = value(from);
+        VkDepthBiasRepresentationInfoEXT representation{VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT};
+        representation.depthBiasRepresentation =
+            from.host_float ? VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT
+                            : VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
+        representation.depthBiasExact = VK_TRUE;
+        VkDepthBiasInfoEXT bias{VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, &representation};
+        bias.depthBiasConstantFactor = from.constant;
+        bias.depthBiasSlopeFactor = from.slope;
+        vkCmdSetDepthBias2EXT(c, &bias);
+        return words;
+    }
+    case Recorded::BeginConditional: {
+        Recorded::Place place;
+        const uint32_t words = value(place);
+        VkConditionalRenderingBeginInfoEXT conditional{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+        conditional.buffer = place.buffer;
+        conditional.offset = place.at;
+        vkCmdBeginConditionalRenderingEXT(c, &conditional);
+        return words;
+    }
+    case Recorded::EndConditional: vkCmdEndConditionalRenderingEXT(c); return 0;
+    case Recorded::Draw: vkCmdDraw(c, a[0], 1, 0, 0); return 1;
+    case Recorded::DrawIndexed: vkCmdDrawIndexed(c, a[0], 1, a[1], 0, 0); return 2;
+    case Recorded::CommandBuffer:
+    case Recorded::Wrap:
+    case Recorded::Quit: break; // (the recording thread's own)
+    }
+    return 0;
+}
+
+// The recording thread: the ring's commands into their command buffer as
+// they come; it spins a little while none do (a frame's draws come a few
+// microseconds apart), then sleeps until the next.
+void Impl::recorder_loop() {
+    uint32_t tail = 0;
+    VkCommandBuffer c = VK_NULL_HANDLE;
+    for (;;) {
+        uint32_t head = recorded_head_.load(std::memory_order_acquire);
+        if (head == tail) {
+            for (uint32_t spins = 0; spins < 2000 && head == tail; spins++) {
+                spin_pause();
+                head = recorded_head_.load(std::memory_order_acquire);
+            }
+            if (head == tail) {
+                recorder_asleep_.store(true);
+                recorded_head_.wait(tail);
+                recorder_asleep_.store(false);
+                continue;
+            }
+        }
+        while (tail != head) {
+            const uint32_t at = tail & (RECORDED - 1);
+            const uint32_t *r = &recorded_[at];
+            if (r[0] == Recorded::Quit) return;
+            if (r[0] == Recorded::Wrap) {
+                tail += RECORDED - at;
+            } else if (r[0] == Recorded::CommandBuffer) {
+                std::memcpy(&c, r + 1, sizeof(c));
+                tail += 3;
+            } else {
+                tail += 1 + run_recorded(c, r);
+            }
+        }
+        recorded_tail_.store(tail, std::memory_order_release);
+    }
+}
+
+void Impl::begin_recording() {
     Slot &s = slots_[current_];
     if (!s.recording) {
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -3978,7 +4363,6 @@ VkCommandBuffer Impl::cmd() {
         s.extents_used = 0;
         s.extent_reports.clear();
     }
-    return s.cmd;
 }
 
 void Impl::gpu_mark(uint32_t kind) {
@@ -4021,6 +4405,7 @@ std::string Impl::target_name(const RenderTarget &t) const {
 void Impl::flush() {
     Slot &s = slots_[current_];
     if (!s.recording) return;
+    record_sync();
     end_pass();
     if (fsi_ && !s.occlusion_reports.empty()) {
         // the interlock path's occlusion counts, for zpd_collect
@@ -4142,8 +4527,9 @@ void Impl::wait_serial(uint64_t serial) {
 }
 
 VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4], RenderTarget *depth) {
+    // (the pass under way: the draw's commands go to the recording thread, nothing waited for)
+    if (in_pass_ && pass_ == pass) return slots_[current_].cmd;
     VkCommandBuffer c = cmd();
-    if (in_pass_ && pass_ == pass) return c;
     end_pass();
     // a target's kept clears (pending_clears) beyond this pass's area drawn
     // before it, the rest in it once it begins
@@ -4230,7 +4616,7 @@ VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4]
 // ---- the arena ----
 
 VkDeviceSize Impl::arena_take(VkDeviceSize bytes, VkDeviceSize align) {
-    cmd();
+    begin_recording();
     Slot &s = slots_[current_];
     VkDeviceSize at = (s.used + align - 1) / align * align;
     if (at + bytes > ARENA_SLOT) return NONE;
@@ -4238,9 +4624,32 @@ VkDeviceSize Impl::arena_take(VkDeviceSize bytes, VkDeviceSize align) {
     return VkDeviceSize(current_) * ARENA_SLOT + at;
 }
 
+bool Impl::index_cache_place(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &at) {
+    if (index_chunks_.empty() || index_chunks_.back().used + bytes > INDEX_CHUNK) {
+        IndexChunk chunk;
+        chunk.buffer = d_.create_buffer(INDEX_CHUNK, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true);
+        if (!chunk.buffer.buffer) return false;
+        index_chunks_.push_back(chunk);
+    }
+    IndexChunk &chunk = index_chunks_.back();
+    buffer = chunk.buffer.buffer, at = chunk.used;
+    chunk.used += (bytes + 3) & ~VkDeviceSize(3);
+    return true;
+}
+
+void Impl::index_cache_drop() {
+    // (draws recorded so far read the buffers: they outlive the submission)
+    begin_recording();
+    for (IndexChunk &chunk : index_chunks_)
+        slots_[current_].after.push_back([this, buffer = chunk.buffer]() mutable { d_.destroy(buffer); });
+    index_chunks_.clear();
+    index_cache_.clear();
+    index_cache_words_ = 0;
+}
+
 VkDeviceSize Impl::draw_data_take(VkDeviceSize bytes, VkDeviceSize align) {
     if (!draw_data_.buffer) return arena_take(bytes, align);
-    cmd();
+    begin_recording();
     Slot &s = slots_[current_];
     VkDeviceSize at = (s.draw_used + align - 1) / align * align;
     if (at + bytes > DRAW_DATA_SLOT) return NONE;
@@ -4259,14 +4668,14 @@ uint8_t *Impl::staging(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &offse
         fatal_ = "could not make a staging buffer";
         return nullptr;
     }
-    cmd();
+    begin_recording();
     slots_[current_].after.push_back([this, own]() mutable { d_.destroy(own); });
     buffer = own.buffer, offset = 0;
     return static_cast<uint8_t *>(own.mapped);
 }
 
 uint8_t *Impl::readback(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &offset) {
-    cmd();
+    begin_recording();
     Slot &s = slots_[current_];
     bytes = (bytes + 15) & ~VkDeviceSize(15);
     for (; s.readback < s.readbacks.size(); s.readback++, s.readback_used = 0) {
@@ -4430,7 +4839,7 @@ void Impl::mark_used(const std::vector<Range> &ranges) {
 // barrier after everything submitted before (whose draws may still read
 // what it overwrites)
 VkCommandBuffer Impl::pre_cmd() {
-    cmd();
+    cmd(); // (the same pool as the command buffer the recording thread records: waited for)
     Slot &s = slots_[current_];
     if (!s.pre_recording) {
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -5208,7 +5617,7 @@ void Impl::rescale_edram(bool to_scaled) {
 // a host query; ~0 when none counts)
 uint32_t Impl::fsi_zpd_index() {
     if (!zpd_current_) return UINT32_MAX;
-    cmd();
+    begin_recording();
     Slot &s = slots_[current_];
     if (zpd_active_ == UINT32_MAX) {
         if (s.occlusion_reports.size() >= OCCLUSION_QUERIES) {
@@ -6174,7 +6583,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             VkImageView old_target_view = t->target_view;
             t->target = 0, t->target_view = VK_NULL_HANDLE;
             report_.texture_views -= old_views.size();
-            cmd();
+            begin_recording();
             slots_[current_].after.push_back([this, old, old_signed_image, old_views, old_kind, old_target,
                                               old_target_view]() mutable {
                 for (const TextureView &v : old_views) {
@@ -6857,7 +7266,7 @@ void Impl::retire_generic(PipelineEntry &e) {
     VkPipeline old = e.generic;
     e.generic = VK_NULL_HANDLE;
     if (!old) return;
-    cmd();
+    begin_recording();
     slots_[current_].after.push_back([this, old] { vkDestroyPipeline(dev_, old, nullptr); });
 }
 
@@ -6882,7 +7291,7 @@ VkPipeline Impl::placeholder(const VkGraphicsPipelineCreateInfo &info) {
 void Impl::retire_stand_in(PipelineEntry &e) {
     VkPipeline old = e.stand_in;
     e.stand_in = VK_NULL_HANDLE;
-    cmd();
+    begin_recording();
     slots_[current_].after.push_back([this, old] { vkDestroyPipeline(dev_, old, nullptr); });
 }
 
@@ -8671,9 +9080,6 @@ void Impl::draw(const gpu::Draw &d) {
     // and clamped to VGT_MIN_VTX_INDX and VGT_MAX_VTX_INDX (as Xenia's vertex
     // shaders do it: RemapAndConvertVertexIndices), reset indices kept as the
     // host's restart index; adaptive tessellation's edge factors only swapped
-    std::vector<uint32_t> &indices = draw_lists_.indices;
-    indices.clear();
-    indices.reserve(count);
     uint32_t offset = regs_[r::VGT_INDX_OFFSET];
     bool restart = strip && (regs_[r::PA_SU_SC_MODE_CNTL] >> 21) & 1;
     uint32_t reset_index = regs_[r::VGT_MULTI_PRIM_IB_RESET_INDX];
@@ -8681,7 +9087,67 @@ void Impl::draw(const gpu::Draw &d) {
     auto remap = [&](uint32_t index) { return std::min(max_index, std::max(min_index, (index + offset) & 0xFFFFFF)); };
     const bool factors = tessellated && tess_mode == 2;
     auto vertex = [&](uint32_t index) { return factors ? index : remap(index); };
-    if (d.indexed && !d.immediate.empty()) {
+    // An index buffer's converted before and unwritten since (the index
+    // cache): its words as they are, in the cache's buffer. Not a draw whose
+    // list is made here (exports alone, patches, expanded points and
+    // rectangles) nor indices that wrap past the end of memory.
+    IndexEntry *index_entry = nullptr;
+    bool index_hit = false, index_keep = false;
+    uint32_t index_checked = 0;
+    {
+        const uint32_t base = d.index_base & GuestMemory::PHYSICAL_MASK;
+        const uint64_t bytes = uint64_t(count) * (index32 ? 4 : 2);
+        if (index_cache_on_ && d.indexed && d.immediate.empty() && !export_only && !tessellated && !expanded &&
+            base + bytes <= GuestMemory::SIZE && uint64_t(count) * 6 <= INDEX_CHUNK / 4) {
+            IndexKey key;
+            key.base = base, key.count = count;
+            const uint32_t converted = primitive >= 12 && primitive <= 15 ? primitive : 0;
+            key.form = uint32_t(index32) | uint32_t(d.index_endian) << 1 | uint32_t(restart) << 4 | converted << 8;
+            key.reset = restart ? reset_index : 0, key.offset = offset, key.min = min_index, key.max = max_index;
+            // (over its budget: everything dropped, to be kept again as it is drawn)
+            if (index_chunks_.size() * INDEX_CHUNK + index_cache_words_ > INDEX_CACHE_BUDGET ||
+                index_cache_.size() > INDEX_CACHE_ENTRIES)
+                index_cache_drop();
+            index_entry = &index_cache_[key];
+            IndexEntry &e = *index_entry;
+            const uint64_t swap = report_.swaps;
+            if (e.buffer) {
+                const uint32_t now = mem_.write_count();
+                if (now == e.checked || pages_unwritten(e.first, e.last, e.checked)) {
+                    e.checked = now;
+                    index_hit = true;
+                } else {
+                    e.streak = swap - e.written_swap <= 4 ? e.streak + 1 : 1;
+                    e.written_swap = swap;
+                    if (e.streak >= 3) {
+                        // written again and again: not kept for a while
+                        index_cache_words_ -= e.words.size() * 4;
+                        e.words = {};
+                        e.buffer = VK_NULL_HANDLE;
+                        e.dynamic_until = swap + 300;
+                        e.streak = 0;
+                    }
+                }
+            }
+            // kept from the second swap it is drawn in: indices made anew
+            // each frame somewhere else (a ring of dynamic geometry) are
+            // never watched, a watch costing the game a fault at its next write
+            const bool seen_before = e.seen_swap && e.seen_swap != swap + 1;
+            e.seen_swap = swap + 1;
+            if (!index_hit && seen_before && swap >= e.dynamic_until) {
+                // watched, then the count, then the words read (memory.h)
+                e.first = base >> page_shift_, e.last = uint32_t((base + bytes - 1) >> page_shift_);
+                mem_.watch(base, uint32_t(bytes));
+                index_checked = mem_.write_count();
+                index_keep = true;
+            }
+        }
+    }
+    std::vector<uint32_t> &indices = index_hit ? index_entry->words : draw_lists_.indices;
+    if (index_hit) {
+        traced(d.index_base, count * (index32 ? 4 : 2));
+    } else if (d.indexed && !d.immediate.empty()) {
+        indices.clear();
         // immediate indices, from the packet (gpu::Draw::immediate): no
         // swap, 16-bit ones two a word, the first in the low half (AMD's
         // DRAW_INDEX_IMMD); then as an index buffer's
@@ -8732,7 +9198,9 @@ void Impl::draw(const gpu::Draw &d) {
         else
             for (uint32_t i = 0; i < count; i++) out[i] = remap(i);
     }
-    if (export_only) {
+    if (index_hit) {
+        // (converted when the entry was made)
+    } else if (export_only) {
         // each index a point, the reset indices left out
         std::erase(indices, UINT32_MAX);
         if (indices.empty()) return;
@@ -8779,6 +9247,25 @@ void Impl::draw(const gpu::Draw &d) {
         }
         indices.swap(converted);
         if (indices.empty()) return;
+    }
+    if (index_keep) {
+        // into the cache: the words and their place in its buffers, or the
+        // entry's as they were where they came out the same
+        IndexEntry &e = *index_entry;
+        if (!e.buffer || e.words != indices) {
+            index_cache_words_ += indices.size() * 4;
+            index_cache_words_ -= e.words.size() * 4;
+            e.words = indices;
+            if (index_cache_place(indices.size() * 4, e.buffer, e.at))
+                std::memcpy(static_cast<uint8_t *>(index_chunks_.back().buffer.mapped) + e.at, indices.data(),
+                            indices.size() * 4);
+            else
+                e.buffer = VK_NULL_HANDLE;
+        }
+        e.checked = index_checked;
+        if (!e.buffer) index_entry = nullptr;
+    } else if (!index_hit) {
+        index_entry = nullptr;
     }
 
     // A tessellated draw's control points: two floats each, the index for the
@@ -9586,11 +10073,13 @@ void Impl::draw(const gpu::Draw &d) {
     VkDeviceSize attribute_bytes = (tessellated ? control_points.size() : guest_indices.size()) * 4;
     VkDeviceSize constants_size = (sizeof(harness::Constants) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     VkDeviceSize system_size = (sizeof(System) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
+    // (the index cache's are in its buffers already)
+    const bool cached_indices = index_entry && !tessellated;
     bool own_indices = index_bytes > ARENA_SLOT / 4, own_attributes = attribute_bytes > ARENA_SLOT / 4;
     // (the constants in the draw-data arena where there is one, the streams
     // in the arena)
     VkDeviceSize draw_need = 2 * constants_size + system_size + 2 * sizeof(FsiConstants) + 6 * ubo_align_;
-    VkDeviceSize need = (draw_data_.buffer ? 0 : draw_need) + (own_indices ? 0 : index_bytes + 4) +
+    VkDeviceSize need = (draw_data_.buffer ? 0 : draw_need) + (own_indices || cached_indices ? 0 : index_bytes + 4) +
                         (own_attributes ? 0 : attribute_bytes + 4);
     bool fits = arena_take(need, 1) != NONE;
     if (fits) slots_[current_].used -= need; // only a check that the draw fits
@@ -9612,7 +10101,7 @@ void Impl::draw(const gpu::Draw &d) {
     // the host writes again as soon as the slot records again, while this
     // submission may still be on the GPU: garbage constants (a lost device
     // with the constants in their own buffer, which fills a slot mid-frame).
-    cmd();
+    begin_recording();
 
     // the interlock path's constants, with the occlusion counter the draw
     // counts in (the slot's, so once the flush above is past)
@@ -9674,8 +10163,10 @@ void Impl::draw(const gpu::Draw &d) {
     };
     VkBuffer index_buffer = VK_NULL_HANDLE, attribute_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_at = 0, attribute_at = 0;
-    if (index_bytes &&
-        !put_words(indices.data(), index_bytes, own_indices, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer, index_at))
+    if (cached_indices)
+        index_buffer = index_entry->buffer, index_at = index_entry->at;
+    else if (index_bytes && !put_words(indices.data(), index_bytes, own_indices, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                       index_buffer, index_at))
         return;
     if (attribute_bytes && !put_words(attributes, attribute_bytes, own_attributes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                                       attribute_buffer, attribute_at))
@@ -9696,19 +10187,35 @@ void Impl::draw(const gpu::Draw &d) {
     if (pipe != bound_pipeline_) {
         // (after another pipeline of the renderer's own, a transfer's or a
         // port's, whose state is not the draws': every state set again)
-        if (!bound_pipeline_) draw_state_valid_ = false;
-        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        if (!bound_pipeline_) draw_state_valid_ = false, bound_index_buffer_ = VK_NULL_HANDLE, sets_bound_ = false;
+        record_value(c, Recorded::BindPipeline, pipe);
         bound_pipeline_ = pipe;
     }
     // an export's pipeline has no dynamic state, so binding it leaves the
     // draws' undefined
     if (export_only) draw_state_valid_ = false;
-    VkDescriptorSet sets[2] = {draw_sets_[1], bindless_};
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 4, dynamic_offsets);
-    if (index_buffer) vkCmdBindIndexBuffer(c, index_buffer, index_at, VK_INDEX_TYPE_UINT32);
-    if (attribute_buffer) vkCmdBindVertexBuffers(c, 0, 1, &attribute_buffer, &attribute_at);
+    // The draws' sets: both after anything else's, then the first alone (the
+    // constants', whose offsets are the only thing a draw changes) and only
+    // where an offset moved; the textures' set stays bound.
+    const bool both_sets = !sets_bound_ || !set_elision_;
+    if (both_sets || std::memcmp(bound_offsets_, dynamic_offsets, sizeof(bound_offsets_)) != 0) {
+        Recorded::Sets sets;
+        sets.count = both_sets ? 2 : 1;
+        sets.sets[0] = draw_sets_[1], sets.sets[1] = bindless_;
+        std::memcpy(sets.offsets, dynamic_offsets, sizeof(sets.offsets));
+        record_value(c, Recorded::BindSets, sets);
+        sets_bound_ = true;
+    }
+    std::memcpy(bound_offsets_, dynamic_offsets, sizeof(bound_offsets_));
+    // the index buffer bound whole, once: the draw's first index is where its words are
+    if (index_buffer && index_buffer != bound_index_buffer_) {
+        record_value(c, Recorded::BindIndexBuffer, bound_index_buffer_ = index_buffer);
+    }
+    const uint32_t first_index = uint32_t(index_at / 4);
+    if (attribute_buffer) record_value(c, Recorded::BindVertexBuffer, Recorded::Place{attribute_buffer, attribute_at});
     if (export_only) {
-        vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
+        record_words(c, Recorded::DrawIndexed, uint32_t(indices.size()), first_index);
+        record_publish();
         report_.drawn++;
         end_export(exported);
         if (options_.verbose) {
@@ -9776,38 +10283,39 @@ void Impl::draw(const gpu::Draw &d) {
     const bool all = !draw_state_valid_ || !draw_state_elision_;
     const DrawState &o = draw_state_;
     auto differs = [all](const auto &a, const auto &b) { return all || std::memcmp(&a, &b, sizeof(a)) != 0; };
-    if (differs(n.viewport, o.viewport)) vkCmdSetViewport(c, 0, 1, &n.viewport);
-    if (differs(n.scissor, o.scissor)) vkCmdSetScissor(c, 0, 1, &n.scissor);
-    if (differs(n.blend_constants, o.blend_constants)) vkCmdSetBlendConstants(c, n.blend_constants);
+    if (differs(n.viewport, o.viewport)) record_value(c, Recorded::Viewport, n.viewport);
+    if (differs(n.scissor, o.scissor)) record_value(c, Recorded::Scissor, n.scissor);
+    if (differs(n.blend_constants, o.blend_constants)) record_value(c, Recorded::BlendConstants, n.blend_constants);
     static constexpr VkStencilFaceFlags FACES[2] = {VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_FACE_BACK_BIT};
     for (uint32_t face = 0; face < 2; face++) {
         if (differs(n.stencil_reference[face], o.stencil_reference[face]))
-            vkCmdSetStencilReference(c, FACES[face], n.stencil_reference[face]);
+            record_words(c, Recorded::StencilReference, FACES[face], n.stencil_reference[face]);
         if (differs(n.stencil_compare_mask[face], o.stencil_compare_mask[face]))
-            vkCmdSetStencilCompareMask(c, FACES[face], n.stencil_compare_mask[face]);
+            record_words(c, Recorded::StencilCompareMask, FACES[face], n.stencil_compare_mask[face]);
         if (differs(n.stencil_write_mask[face], o.stencil_write_mask[face]))
-            vkCmdSetStencilWriteMask(c, FACES[face], n.stencil_write_mask[face]);
+            record_words(c, Recorded::StencilWriteMask, FACES[face], n.stencil_write_mask[face]);
     }
     // the extended dynamic state, as the pipeline's description has it
-    if (differs(n.topology, o.topology)) vkCmdSetPrimitiveTopology(c, n.topology);
-    if (differs(n.restart, o.restart)) vkCmdSetPrimitiveRestartEnable(c, n.restart);
-    if (differs(n.cull_mode, o.cull_mode)) vkCmdSetCullMode(c, n.cull_mode);
-    if (differs(n.front_face, o.front_face)) vkCmdSetFrontFace(c, n.front_face);
-    if (differs(n.depth_test, o.depth_test)) vkCmdSetDepthTestEnable(c, n.depth_test);
-    if (differs(n.depth_write, o.depth_write)) vkCmdSetDepthWriteEnable(c, n.depth_write);
-    if (differs(n.depth_compare, o.depth_compare)) vkCmdSetDepthCompareOp(c, n.depth_compare);
-    if (differs(n.stencil_test, o.stencil_test)) vkCmdSetStencilTestEnable(c, n.stencil_test);
+    if (differs(n.topology, o.topology)) record_words(c, Recorded::Topology, uint32_t(n.topology));
+    if (differs(n.restart, o.restart)) record_words(c, Recorded::RestartEnable, uint32_t(n.restart));
+    if (differs(n.cull_mode, o.cull_mode)) record_words(c, Recorded::CullMode, uint32_t(n.cull_mode));
+    if (differs(n.front_face, o.front_face)) record_words(c, Recorded::FrontFace, uint32_t(n.front_face));
+    if (differs(n.depth_test, o.depth_test)) record_words(c, Recorded::DepthTest, uint32_t(n.depth_test));
+    if (differs(n.depth_write, o.depth_write)) record_words(c, Recorded::DepthWrite, uint32_t(n.depth_write));
+    if (differs(n.depth_compare, o.depth_compare)) record_words(c, Recorded::DepthCompare, uint32_t(n.depth_compare));
+    if (differs(n.stencil_test, o.stencil_test)) record_words(c, Recorded::StencilTest, uint32_t(n.stencil_test));
     for (uint32_t face = 0; face < 2; face++)
         if (differs(n.stencil_op[face], o.stencil_op[face]))
-            vkCmdSetStencilOp(c, FACES[face], n.stencil_op[face][0], n.stencil_op[face][1], n.stencil_op[face][2],
-                              VkCompareOp(n.stencil_op[face][3]));
-    if (differs(n.depth_bias_enable, o.depth_bias_enable)) vkCmdSetDepthBiasEnable(c, n.depth_bias_enable);
+            record_words(c, Recorded::StencilOp, FACES[face], uint32_t(n.stencil_op[face][0]),
+                         uint32_t(n.stencil_op[face][1]), uint32_t(n.stencil_op[face][2]),
+                         uint32_t(n.stencil_op[face][3]));
+    if (differs(n.depth_bias_enable, o.depth_bias_enable)) record_words(c, Recorded::DepthBiasEnable, uint32_t(n.depth_bias_enable));
     if (blend_dynamic) {
         // extended dynamic state 3: the blend and write masks of the four
         // attachments the pipelines have (those without a target unused)
-        if (differs(n.blend_enables, o.blend_enables)) set_blend_enable_(c, 0, 4, n.blend_enables);
-        if (differs(n.blend_equations, o.blend_equations)) set_blend_equation_(c, 0, 4, n.blend_equations);
-        if (differs(n.write_masks, o.write_masks)) set_write_mask_(c, 0, 4, n.write_masks);
+        if (differs(n.blend_enables, o.blend_enables)) record_value(c, Recorded::BlendEnables, n.blend_enables);
+        if (differs(n.blend_equations, o.blend_equations)) record_value(c, Recorded::BlendEquations, n.blend_equations);
+        if (differs(n.write_masks, o.write_masks)) record_value(c, Recorded::WriteMasks, n.write_masks);
     }
     {
         // Lines as wide as PA_SU_LINE_CNTL's WIDTH says (half the width in
@@ -9823,7 +10331,7 @@ void Impl::draw(const gpu::Draw &d) {
                                             : "wide lines drawn one pixel wide (no wide lines on the device)");
         }
         n.line_width = width;
-        if (differs(n.line_width, o.line_width)) vkCmdSetLineWidth(c, width);
+        if (differs(n.line_width, o.line_width)) record_value(c, Recorded::LineWidth, width);
     }
     {
         // the polygon offset as Xenia's Vulkan backend sets it
@@ -9881,19 +10389,8 @@ void Impl::draw(const gpu::Draw &d) {
         n.depth_bias[0] = constant, n.depth_bias[1] = scale * (scale_.factor() / 16.0f);
         n.depth_bias[2] = !exact_units ? 0.0f : host_float ? 2.0f : 1.0f;
         if (differs(n.depth_bias, o.depth_bias)) {
-            if (exact_units) {
-                VkDepthBiasRepresentationInfoEXT representation{VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT};
-                representation.depthBiasRepresentation =
-                    host_float ? VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT
-                               : VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
-                representation.depthBiasExact = VK_TRUE;
-                VkDepthBiasInfoEXT bias{VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, &representation};
-                bias.depthBiasConstantFactor = n.depth_bias[0];
-                bias.depthBiasSlopeFactor = n.depth_bias[1];
-                vkCmdSetDepthBias2EXT(c, &bias);
-            } else {
-                vkCmdSetDepthBias(c, n.depth_bias[0], 0.0f, n.depth_bias[1]);
-            }
+            record_value(c, exact_units ? Recorded::DepthBiasExact : Recorded::DepthBias,
+                         Recorded::Bias{host_float, n.depth_bias[0], n.depth_bias[1]});
         }
     }
     draw_state_ = n;
@@ -9911,10 +10408,8 @@ void Impl::draw(const gpu::Draw &d) {
         viz_draw(c);
     if (viz_predicate_ != UINT32_MAX) {
         // drawn where the query's survey passed samples
-        VkConditionalRenderingBeginInfoEXT conditional{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
-        conditional.buffer = viz_predicates_.buffer;
-        conditional.offset = VkDeviceSize(viz_predicate_) * 4;
-        vkCmdBeginConditionalRenderingEXT(c, &conditional);
+        record_value(c, Recorded::BeginConditional,
+                     Recorded::Place{viz_predicates_.buffer, VkDeviceSize(viz_predicate_) * 4});
         report_.viz_predicated++;
     }
     if (host_vertex.extents && extent_serial_ == slots_[current_].serial) {
@@ -9925,10 +10420,11 @@ void Impl::draw(const gpu::Draw &d) {
             extent_margin_ = std::max(extent_margin_, ((regs_[r::PA_SU_LINE_CNTL] & 0xFFFF) + 15) / 16);
     }
     if (tessellated)
-        vkCmdDraw(c, uint32_t(control_points.size() / 2), 1, 0, 0);
+        record_words(c, Recorded::Draw, uint32_t(control_points.size() / 2));
     else
-        vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
-    if (viz_predicate_ != UINT32_MAX) vkCmdEndConditionalRenderingEXT(c);
+        record_words(c, Recorded::DrawIndexed, uint32_t(indices.size()), first_index);
+    if (viz_predicate_ != UINT32_MAX) record_words(c, Recorded::EndConditional);
+    record_publish();
     if (options_.gpu_timing_draws) gpu_mark("draws: between draws");
     report_.drawn++;
     end_export(exported);
@@ -10342,7 +10838,7 @@ void Impl::drop_scaled_resolves(const std::vector<Range> &written, bool all) {
         }
         ScaledResolve old = it->second;
         it = scaled_resolves_.erase(it);
-        cmd();
+        begin_recording();
         slots_[current_].after.push_back([this, old]() mutable {
             release_target(old.target, old.view);
             d_.destroy(old.image);
@@ -10404,7 +10900,7 @@ void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
     const uint32_t old_kind = t.kind, old_target = t.target;
     const VkImageView old_target_view = t.target_view;
     report_.texture_views -= old_views.size();
-    cmd();
+    begin_recording();
     slots_[current_].after.push_back([this, old, old_views, old_kind, old_target, old_target_view]() mutable {
         for (const TextureView &v : old_views) {
             release_index(old_kind, v.index);
@@ -10670,7 +11166,7 @@ void Impl::read_back_resolve(const std::vector<Range> &written) {
         if (b.size < extent) {
             if (b.buffer) {
                 vk::Buffer old = b;
-                cmd();
+                begin_recording();
                 slots_[current_].after.push_back([this, old]() mutable { d_.destroy(old); });
             }
             b = d_.create_buffer(std::max<VkDeviceSize>(extent, 4096), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
@@ -10719,7 +11215,7 @@ void Impl::next_readback_frame() {
     for (auto it = resolve_readbacks_.begin(); it != resolve_readbacks_.end();) {
         if (report_.swaps > 60 && it->second.last_used < report_.swaps - 60) {
             ResolveReadback old = it->second;
-            cmd();
+            begin_recording();
             slots_[current_].after.push_back([this, old]() mutable {
                 for (vk::Buffer &b : old.buffers) d_.destroy(b);
             });
@@ -10783,7 +11279,7 @@ bool Impl::native_output(uint32_t width, uint32_t height) {
     if (native_output_.image) {
         vk::Image old = native_output_;
         VkImageView old_view = native_output_view_;
-        cmd();
+        begin_recording();
         slots_[current_].after.push_back([this, old, old_view]() mutable {
             vkDestroyImageView(dev_, old_view, nullptr);
             d_.destroy(old);

@@ -1739,6 +1739,42 @@ Xenia's primitive processor caches them), fewer calls into the driver (the
 descriptor sets bound again at every draw), and the recording on a thread
 of its own.
 
+**Those three, done (2026-11-11).** Measured first, in play, the whole
+process: 19.4 swaps a second, the GPU 27% busy, the command thread 71% busy
+(about 35 ms of commands a frame), no thread of the game's at a whole core.
+The rates stay between 19 and 20, a frame every three vblanks, so the frame
+misses the second vblank by little (an inference from the rates: no frame
+was timed).
+
+| change | the replay's play | live, in play |
+| --- | --- | --- |
+| before | 19.8 ms | 19.4 swaps a second |
+| the index cache (`XF_INDEX_CACHE=0` turns it off): converted indices kept by where the guest's are and how they were converted, in buffers of their own, their pages watched as a texture's; 3,183 of a play's 3,325 draws found theirs | 19.1 ms | |
+| the index buffer bound whole once (a draw's first index is where its words are) and the draws' first descriptor set alone bound where an offset moved (`XF_SET_ELISION=0`) | 18.1 ms | 19.0 (both; the machine in use) |
+| the draws' commands recorded by another thread (`XF_RECORD_THREAD=1`; off by default) | 18.2 ms | 16.4 |
+
+The index cache keeps an entry from the second swap it is drawn in (a ring
+of dynamic geometry is never watched: a watch costs the game a fault at its
+next write), converts again where its pages were written and keeps the
+entry where the words came out the same; indices written three times within
+a few swaps leave it for 300. 128 MB at most, everything dropped past that.
+
+The recording thread gains nothing: the driver's time in a draw's own
+commands is 2.4 of a play's 19 ms, but a play waits for the ring about 100
+times (a render pass's end, a query, an upload: whatever else records) and
+the command buffer's memory goes from one thread's cache to the other's at
+each. Live, with the machine in use, it lost (16.4 against 19.0 swaps a
+second). What would gain is every command of the renderer's through the
+ring, the command thread never touching the command buffer.
+
+Live the two that are on did not move the rate: the command thread is 68%
+busy at 19 swaps a second, 34 ms a frame, still over the 33.3 of two
+vblanks. Measured with the owner at the machine (another program at half a
+core): to be measured again alone. Next: the frame timed stage by stage live
+(the guest's render thread, the command thread, the wait for the vblank),
+then the constants' upload (5 KB a stage at nearly every draw) and the
+textures' checks.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches
