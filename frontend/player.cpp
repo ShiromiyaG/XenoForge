@@ -130,6 +130,9 @@ const char *button_names(uint16_t b, std::string &out) {
 // what the overlay shows of the last second
 struct Rates {
     double swaps = 0, presented = 0, refreshes = 0, sound = 0, states = 0;
+    // the command processor's thread over that second: its work a swap without its waits, in milliseconds,
+    // and the draws a swap
+    double commands_ms = 0, draws = 0;
 };
 
 // A sample of each dialog a title can open, for --ui-demo (what a check can see without the title's help)
@@ -601,6 +604,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     uint64_t presented = 0, refreshes = 0, key_screenshots = 0, shots_written = 0;
     std::string ended;
     Rates rates;
+    uint64_t run_before = 0, waited_before = 0, draws_before = 0; // the command processor's counts a second ago
     Clock::time_point second = started;
     // The window presents a fresh picture, the overlay or a dialog of the system, and otherwise only when it must be
     // drawn again: shown, uncovered, resized, moved to another display (redraw), or the overlay or dialog it showed
@@ -657,6 +661,11 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                     changed = true;
                 }
                 if (e.key.scancode == SDL_SCANCODE_F12) key_screenshot();
+                // F3: the performance display over the picture
+                if (e.key.scancode == SDL_SCANCODE_F3) {
+                    settings.video.performance = !settings.video.performance;
+                    changed = redraw = true;
+                }
                 // F4: the next frame traced (with XF_TRACE_DIR set), and a
                 // screenshot of this one beside it, as Xenia's F4
                 if (e.key.scancode == SDL_SCANCODE_F4) {
@@ -790,6 +799,16 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             rates.refreshes = (refreshes - refreshes_before) / dt;
             rates.sound = (sound.sent - sound_before) / dt;
             rates.states = (states - states_before) / dt;
+            {
+                const gpu::Counts &counts = kernel::gpu_command_processor(k).counts();
+                const uint64_t run = counts.run_ns.load(), waited = counts.wait_ns.load(), draws = counts.draws.load();
+                const double frames = double(std::max<uint64_t>(swapped - swaps_before, 1));
+                rates.commands_ms = (double(run - run_before) - double(waited - waited_before)) / 1e6 / frames;
+                rates.draws = double(draws - draws_before) / frames;
+                run_before = run, waited_before = waited, draws_before = draws;
+            }
+            // (the performance display's numbers changed: drawn again even with no new picture)
+            if (settings.video.performance) redraw = true;
             if (print_rates) {
                 static double fence = 0, acquire = 0, present = 0;
                 char extra[256];
@@ -945,6 +964,38 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             bool keep = true;
             if (pages.draw_guide(host, seconds, keep)) changed = true;
             if (!keep) close_guide();
+        }
+        if (settings.video.performance && !guide_open) {
+            // The performance display (video.performance, F3), as other emulators have it: the game's
+            // frames a second (its swaps), the time between the frames the window showed with its graph,
+            // and what the emulator did for a frame.
+            float values[FRAME_TIMES];
+            float worst = 0, sum = 0;
+            for (uint32_t i = 0; i < FRAME_TIMES; i++) {
+                values[i] = frame_times[(frame_time_at + i) % FRAME_TIMES];
+                worst = std::max(worst, values[i]), sum += values[i];
+            }
+            const float scale = ImGui::GetIO().DisplaySize.y / 720.0f;
+            ImGui::SetNextWindowPos(ImVec2(12 * scale, 12 * scale), ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.55f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10 * scale, 8 * scale));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            if (ImGui::Begin("##performance", nullptr,
+                             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                 ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoMove)) {
+                ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(frontend::guide::col::green_hi), "%.1f fps", rates.swaps);
+                ImGui::Text("frame %.1f ms, worst %.1f ms", sum / FRAME_TIMES, worst);
+                ImGui::PushStyleColor(ImGuiCol_PlotLines, frontend::guide::col::green_hi);
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(12, 15, 13, 160));
+                ImGui::PlotLines("##performance frames", values, int(FRAME_TIMES), 0, nullptr, 0.0f,
+                                 std::max(50.0f, worst * 1.1f), ImVec2(220 * scale, 44 * scale));
+                ImGui::PopStyleColor(2);
+                ImGui::TextDisabled("shown %.1f/s, GPU commands %.1f ms, %.0f draws a frame", rates.presented,
+                                    rates.commands_ms, rates.draws);
+            }
+            ImGui::End();
+            ImGui::PopStyleVar(2);
         }
         frontend::draw_system_ui(sysui, icons, seconds);
         ImGui::Render();

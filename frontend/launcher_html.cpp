@@ -413,7 +413,11 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
                             "Fast draws into the host's own render targets. Exact draws as the console does (blending, float formats, depth and stencil bit for bit) at more GPU time a frame, where the graphics card allows it. Takes effect when the game starts.",
                             label_of(video_choice_list("video.edram"), st.video.edram));
         s += group("Rendering", inner, "Beyond the console: none of these change what the game computes.");
-        s += group("Overlay", check_row("video.frame_graph", "Frame-time graph", "In the F1 overlay.", st.video.frame_graph));
+        s += group("Overlay",
+                   check_row("video.performance", "Performance display",
+                             "Frames a second, frame times and the emulator's work a frame over the picture. F3 switches it while playing.",
+                             st.video.performance) +
+                       check_row("video.frame_graph", "Frame-time graph", "In the F1 overlay.", st.video.frame_graph));
         s += group("Timing", check_row("video.vsync", "Vertical sync", "The window waits for the display; the game keeps its own pace.", st.video.vsync));
         break;
     }

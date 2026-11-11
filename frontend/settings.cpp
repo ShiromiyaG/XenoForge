@@ -179,6 +179,7 @@ void read_sections(const toml::table &t, Settings &s) {
     get(t, "video", "texture_filter", s.video.texture_filter);
     get(t, "video", "edram", s.video.edram);
     get(t, "video", "frame_graph", s.video.frame_graph);
+    get(t, "video", "performance", s.video.performance);
     clamp_video(s);
     int64_t volume = s.audio.volume;
     get(t, "audio", "volume", volume);
@@ -252,7 +253,8 @@ void write_sections(toml::table &t, const Settings &s) {
                                             {"anisotropy", s.video.anisotropy},
                                             {"texture_filter", s.video.texture_filter},
                                             {"edram", s.video.edram},
-                                            {"frame_graph", s.video.frame_graph}});
+                                            {"frame_graph", s.video.frame_graph},
+                                            {"performance", s.video.performance}});
     t.insert_or_assign("audio", toml::table{{"volume", s.audio.volume}, {"mute", s.audio.mute}});
     t.insert_or_assign("input", toml::table{{"keyboard", s.input.keyboard},
                                             {"keyboard_user", s.input.keyboard_user},

@@ -299,6 +299,7 @@ bool *SettingsView::bool_field(const std::string &key) {
     if (key == "video.vsync") return &edit_.video.vsync;
     if (key == "video.smooth") return &edit_.video.smooth;
     if (key == "video.frame_graph") return &edit_.video.frame_graph;
+    if (key == "video.performance") return &edit_.video.performance;
     if (key == "audio.mute") return &edit_.audio.mute;
     if (key == "input.vibration") return &edit_.input.vibration;
     if (key == "input.keyboard") return &edit_.input.keyboard;

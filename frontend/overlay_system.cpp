@@ -128,8 +128,10 @@ bool ConsolePages::picture_page(Host &h) {
     combo("Texture filtering", "video.texture_filter");
     combo("Render targets", "video.edram");
     if (g_label_w > 0) {
+        changed |= ImGui::Checkbox(labelled("Performance display (F3)").c_str(), &s.video.performance);
         changed |= ImGui::Checkbox(labelled("Frame-time graph (F1)").c_str(), &s.video.frame_graph);
     } else {
+        changed |= ImGui::Checkbox("Performance display (F3)", &s.video.performance);
         changed |= ImGui::Checkbox("Frame-time graph", &s.video.frame_graph);
     }
     if (live) {

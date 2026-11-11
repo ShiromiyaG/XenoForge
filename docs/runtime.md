@@ -1881,7 +1881,8 @@ code. As built (`frontend/`):
   [video]    # fullscreen, vsync (true), smooth (true), aspect ("auto", "integer" or "stretch"), and the
              # picture options below: resolution_scale (100), min_scalable (16), upscaler ("none"),
              # fsr_sharpness (0.2), cas_sharpness (0), antialiasing ("none"), anisotropy (0),
-             # texture_filter ("game"), edram ("fast" or "exact"), frame_graph (false)
+             # texture_filter ("game"), edram ("fast" or "exact"), frame_graph (false),
+             # performance (false)
   [audio]    # volume (0-100), mute
   [input]    # keyboard (true), keyboard_user (0), left_deadzone, right_deadzone (0-1), vibration (true)
   [keyboard] # each pad control's keys (input.md)
@@ -1936,6 +1937,14 @@ from one table of choices (`settings.h`'s `video_choices`):
   anisotropy and trilinear apply where Xenia's `anisotropic_override` does:
   mipmapped textures (not a base map alone) the game filters linearly;
   nearest is everywhere (a look, not a fix).
+- **Performance display** (`performance`, off; F3 switches it while
+  playing, and the launcher's and the guide's Picture settings): over the
+  picture's top left corner, the game's frames a second (its swaps), the
+  average and worst time between the frames the window showed with their
+  graph (the last 240), the frames shown a second, the command processor's
+  work a frame without its waits (`gpu::Counts::run_ns`) and the draws a
+  frame. Drawn with the window's pictures, and once a second when none is
+  new.
 - **Frame-time graph** (`frame_graph`): the Debug page plots the intervals
   between the frames the window showed (the last 240), with the average and
   the worst.

@@ -68,6 +68,9 @@ struct Settings {
         // shader interlock; host render targets where it has not)
         std::string edram = "fast";
         bool frame_graph = false; // the frame-time graph in the F1 overlay
+        // the performance display over the picture (F3 switches it): the game's frames a second, the frame
+        // times with their graph, the command processor's work a frame and the draws
+        bool performance = false;
     } video;
     struct {
         int volume = 100; // percent
