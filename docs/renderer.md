@@ -4135,6 +4135,34 @@ its default is kept in `dumps/d3d12_standard_positions`); the other 30
 host frames compare as before. `XF_XENOS_SAMPLE_POSITIONS=0` and
 `xfreplay --no-xenos-sample-positions` give the host's standard positions.
 
+## Played frames of four more games (2026-11-11)
+
+Games C, E, F and H, built by the recompile step and driven by `boot`
+(`--press` scripts) into their campaigns: C's first mission (30 swaps a
+second, 40,000 draws a second), E's first cutscene in the engine (30), F's
+opening scenes in the engine (25 to 30), H's first scene after its film
+(30). `boot` makes pipelines on the renderer's thread, so a cold run stops
+for seconds where a level starts (72 s in one frame of game C, 16 s in
+game F); the next run does not. A frame or two of each recorded
+(`--trace-frames`) and replayed against Xenia's exact picture (D3D12, ROV),
+the mean difference of 255 and the pixels off by more than 16:
+
+| frame | exact path | host's render targets | Xenia's host picture against its exact one |
+| --- | --- | --- | --- |
+| C, the mission's night | 0.001, 0.000% | 0.009, 0.000% | |
+| E, a cutscene's light shafts | 0.198, 0.046% | 3.041, 9.947% | 2.898 (ours is 0.250 off Xenia's host picture) |
+| E, the same scene later | 0.082, 0.029% | 0.483, 0.171% | |
+| F, the terrain under a glare | 0.016, 0.011% (1.190 before "A draw that is counted and drawn") | 1.200, 0.772% | 1.200 (ours is that picture, 0.000) |
+| F, the flight | 0.008, 0.000% | 0.209, 0.000% | |
+| H, two frames of the scene | 0.000, 0.000% | 0.163 and 0.272, 0.000% | |
+
+The exact path draws Xenia's exact picture in all of them. The host's
+render targets, the player's default, draw Xenia's host picture, and with
+it its two errors here: game F's glare (above) and game E's light shafts,
+a smooth tint over the lit part of the frame. Both are where to go beyond
+Xenia on that path, or the reason to take the exact path where the GPU
+affords it.
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that
