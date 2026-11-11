@@ -82,21 +82,36 @@ public:
         if (get(index) == value) return;
         std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
         stamps_[index >> BLOCK_SHIFT] = ++serial_;
+        if (draw_state(index)) state_serial_ = serial_;
     }
     // count registers from first, from big-endian words (a packet's, guest
     // memory's); first + count within COUNT. On the command processor's thread.
     void write_big_endian(uint32_t first, const uint8_t *words, uint32_t count) {
         while (count) {
             const uint32_t n = std::min(count, BLOCK - (first & (BLOCK - 1)));
+            // The block's words in host order, compared with those held in
+            // one pass (both loops without a branch, for the compiler's
+            // vectors: a scene's constants are most of what a frame's
+            // commands write), and stored only where they differ.
+            uint32_t host[BLOCK];
+            std::memcpy(host, words, 4 * n);
             uint32_t differs = 0;
             for (uint32_t k = 0; k < n; k++) {
-                uint32_t value;
-                std::memcpy(&value, words + 4 * k, 4);
-                value = __builtin_bswap32(value);
-                differs |= get(first + k) ^ value;
-                std::atomic_ref<uint32_t>(values_[first + k]).store(value, std::memory_order_relaxed);
+                host[k] = __builtin_bswap32(host[k]);
+                differs |= values_[first + k] ^ host[k];
             }
-            if (differs) stamps_[first >> BLOCK_SHIFT] = ++serial_;
+            if (differs) {
+                // (the shader constants' blocks hold no register of the draws' state)
+                bool state = false;
+                const bool constants = first >= 0x4000 && first + n <= 0x4910;
+                for (uint32_t k = 0; k < n; k++) {
+                    if (values_[first + k] == host[k]) continue;
+                    if (!constants && draw_state(first + k)) state = true;
+                    std::atomic_ref<uint32_t>(values_[first + k]).store(host[k], std::memory_order_relaxed);
+                }
+                stamps_[first >> BLOCK_SHIFT] = ++serial_;
+                if (state) state_serial_ = serial_;
+            }
             first += n, words += 4 * n, count -= n;
         }
     }
@@ -104,6 +119,21 @@ public:
     // any of count registers from first changed after a serial (by blocks: a
     // neighbour in the same block counts); the writes from other threads.
     uint64_t serial() const { return serial_; }
+    // The serial of the last such write to a register of the draws' state:
+    // one that is neither a shader constant (float, fetch, boolean or loop:
+    // a draw takes those as they stand) nor what a draw packet itself sets
+    // (the index buffer's place, the draw initiator, the index offset and
+    // bounds, the event initiator), nor below the registers a draw reads.
+    // A draw made after another with this unchanged draws with the same
+    // pipeline, targets, viewport and dynamic state.
+    uint64_t state_serial() const { return state_serial_; }
+    static bool draw_state(uint32_t index) {
+        if (index < 0x2000) return false;
+        if (index >= 0x4000 && index < 0x4910) return false; // ALU, fetch, boolean and loop constants
+        if (index >= 0x2100 && index <= 0x2103) return false; // VGT_MAX_VTX_INDX to VGT_MULTI_PRIM_IB_RESET_INDX
+        if (index >= 0x21F9 && index <= 0x21FC) return false; // VGT_EVENT_INITIATOR to VGT_DRAW_INITIATOR
+        return true;
+    }
     bool changed_since(uint32_t first, uint32_t count, uint64_t serial) const {
         for (uint32_t b = first >> BLOCK_SHIFT, last = (first + count - 1) >> BLOCK_SHIFT; b <= last; b++)
             if (stamps_[b] > serial) return true;
@@ -117,7 +147,7 @@ public:
 private:
     std::vector<uint32_t> values_;
     std::vector<uint64_t> stamps_; // per block, the serial of the last write that changed a value there
-    uint64_t serial_ = 0;
+    uint64_t serial_ = 0, state_serial_ = 0;
     std::atomic<uint64_t> foreign_writes_{0};
 };
 
@@ -247,6 +277,9 @@ struct Counts {
     std::atomic<uint64_t> primary_buffers{0}; // primary buffer runs
     std::atomic<uint64_t> indirect_buffers{0};
     std::atomic<uint64_t> draws{0}, resolves{0}, swaps{0};
+    // the host's time, in nanoseconds, the processor's thread spent running packets (live: the
+    // kernel's video thread adds it) and, of that, in WAIT_REG_MEM's waits
+    mutable std::atomic<uint64_t> run_ns{0}, wait_ns{0};
     std::atomic<uint64_t> failed_draws{0};                    // no valid index source (or a packet too short)
     std::atomic<uint64_t> immediate_draws{0};                 // with immediate indices (Xenia fails them)
     std::atomic<uint64_t> interrupts{0};                      // INTERRUPT's, one per CPU in its mask

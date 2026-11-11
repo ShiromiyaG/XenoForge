@@ -151,6 +151,7 @@ struct Rates {
     double last_wall = 0, last_busy = 0, last_busy_wall = 0;
     uint64_t last_swaps = 0, last_draws = 0, last_resolves = 0;
     uint64_t last_texture_loads = 0; // the renderer's, at its last report
+    uint64_t last_run_ns = 0, last_wait_ns = 0; // the command processor's thread
 };
 void print_rates(Game &game, Rates &rates, double wall_seconds, const std::string &extra = {});
 

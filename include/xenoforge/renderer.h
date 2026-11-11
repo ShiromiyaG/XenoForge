@@ -50,6 +50,9 @@ struct Report {
     // and what it calls (the renderer's CPU side), without the trace's walk and the memory it
     // restores: the work of a game's command thread for the frame
     std::vector<double> command_seconds;
+    // and the thread's processor time in it a play, the mean of those plays: what the commands
+    // cost the thread without what it waited for (the GPU, a pipeline)
+    double command_cpu_seconds = 0;
     uint64_t draws = 0, drawn = 0;    // outside copy mode; of them, done
     uint64_t resolves = 0, swaps = 0; // draws in copy mode; XE_SWAP packets
     uint64_t frames = 0;              // front buffers read back (the swaps asked for)

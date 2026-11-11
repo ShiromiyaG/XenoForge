@@ -1767,6 +1767,45 @@ each. Live, with the machine in use, it lost (16.4 against 19.0 swaps a
 second). What would gain is every command of the renderer's through the
 ring, the command thread never touching the command buffer.
 
+**The frame timed, and what the other emulators do (2026-11-11, later).**
+`--rates` now prints the command thread's work a swap beside each line
+(`commands: N ms a swap (M ms in waits)`: the time in the processor's runs,
+without WAIT_REG_MEM's waits). In play: 44.3 ms of work and 6.7 of waits, 51
+together, the whole frame: the game's vblank wait is a packet of the command
+stream, so the frame is the commands' work rounded up to a vblank, and two
+vblanks need the work under about 32 ms. `xfreplay --repeat` prints the
+thread's processor time in the commands as well (the wall time waits for the
+GPU: the same build gave 38 and 148 ms a play of one frame); the in-play
+frame is `../traces/xf_<G>_play`, swap 3700, 8,245 draws.
+
+Read for how they keep a draw cheap (never copied: GPL and MPL), Cemu's
+Latte, Dolphin's video and RPCS3's RSX agree on three things: work is done
+when a register is written to another value, not at the draw (Cemu's
+continued draws after `LatteCP_processCommandBuffer_continuousDrawPass`,
+RPCS3's `state_signals`, Dolphin's `BPWritten`); only the constants a shader
+reads are uploaded, and only when they changed (Cemu's remapped uniforms,
+RPCS3's `constant_ids`); and the command buffer is recorded by one thread,
+only copies and the queue's submits going to others (RPCS3's `dma_manager`,
+Dolphin's `CommandBufferManager`), which is what the recording thread above
+found.
+
+| change | live, the commands' work a swap |
+| --- | --- |
+| before | 44.3 ms |
+| a draw's front part kept (`DrawFront`, `XF_DRAW_FRONT_MEMO=0`: the targets, viewport, scissor and the rest worked out from the draws' state, taken from the draw before when `RegisterFile::state_serial`, the shaders and the primitive are the same: 57% of the frame's draws); register runs compared a block at a time; the index cache found through a table by hash | 39.7 ms |
+| a texture's load drops what the draws kept of its own slots, not of every texture's (fifty loads a frame after the resolves sent every slot the long way: `Texture::loads`) | 39.7 ms (the textures' share 6.0 to 3.5%) |
+| vertex ranges kept as last found in the mirror (`XF_VERTEX_RANGE_MEMO=0`: unwritten since by blocks of pages); pipelines found through a table by the key's hash | (see below) |
+| uploads into the draw data through a copy the compiler cannot fold: one build read the system constants back from that write-combined memory, 10% of the thread | 38.5 ms |
+
+Still three vblanks a frame: 38.5 ms against the 32 needed. What is left by
+size, live: the driver in the draws' own commands 10.8%, the constants'
+upload 3.6% (5 KB a stage at nearly every draw: only what the shader reads,
+as Cemu and RPCS3), `request` 4.6%, register writes 4.2%, `begin_pass` 4.1%,
+`acquire` 3.6%, the textures 3.6%, `watch` 2.5% (a system call a page
+protected again), and the draw's own body, where the pipeline's key and the
+dynamic state are still worked out at every draw (to be kept as the front
+part is).
+
 Live the two that are on did not move the rate: the command thread is 68%
 busy at 19 swaps a second, 34 ms a frame, still over the 33.3 of two
 vblanks. Measured with the owner at the machine (another program at half a

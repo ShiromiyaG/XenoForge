@@ -37,6 +37,7 @@
 
 #include "xenoforge/xenos.h"
 
+#include <chrono>
 #include <algorithm>
 #include <bit>
 #include <cstdio>
@@ -236,7 +237,11 @@ void Video::commands_loop(Thread &self) {
             continue;
         }
         busy.store(true, std::memory_order_relaxed);
+        const auto began = std::chrono::steady_clock::now();
         cp->run(write);
+        cp->counts().run_ns.fetch_add(
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()),
+            std::memory_order_relaxed);
         busy.store(write_pointer.load() != cp->read_pointer(), std::memory_order_relaxed);
         wrote_back(); // (the last of the run: the spins see the processor idle)
     }
@@ -255,12 +260,16 @@ void Video::interrupt(uint32_t cpu) {
 bool Video::wait(uint32_t wait) {
     Thread *self = current_thread();
     Objects &o = objects(*k);
+    const auto began = std::chrono::steady_clock::now();
     if (wait >= 0x100 && self) {
         Dispatcher *const stop[] = {stop_.get()};
         o.wait(*self, stop, false, false, o.now() + uint64_t(wait / 0x100) * (SECOND / 1000));
     } else {
         o.scheduler->yield();
     }
+    cp->counts().wait_ns.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()),
+        std::memory_order_relaxed);
     return running.load();
 }
 

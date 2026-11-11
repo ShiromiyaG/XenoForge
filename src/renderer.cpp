@@ -755,6 +755,13 @@ static_assert(sizeof(EdramTransfer) <= 128);
 
 // edram_fsi.frag's uniform block (set 0 binding 4): the interlock path's
 // render target state
+// a draw's viewport on the host (host_viewport)
+struct Viewport {
+    VkViewport viewport{};
+    float ndc_scale[3] = {1, 1, 1}, ndc_offset[3] = {};
+    bool empty = false;
+};
+
 struct FsiConstants {
     uint32_t flags, depth_base, pitch, zpd_index;
     uint32_t rt[4], blend[4], rt_base[4], stencil[4];
@@ -844,6 +851,7 @@ struct Texture {
     uint32_t checked = 0;       // the write count its memory was last known unwritten at (Memory's)
     uint32_t low = 0, high = 0; // the ranges' bounds
     bool stale = false;         // a resolve or a memory export wrote memory under it
+    uint64_t loads = 0;         // how many times it was loaded (what a draw kept of it is as of one: SlotMemo)
     bool gpu = false;           // loaded from what the GPU wrote (the mirror's, or read back from it)
     // why its next load comes (Report's texture_loads_*)
     LoadWhy load_why = LoadWhy::New;
@@ -1684,8 +1692,14 @@ private:
             std::fprintf(stderr, "  draw %llu skipped: %s (shaders %016llX %016llX)\n", (unsigned long long)report_.draws,
                          reason.c_str(), (unsigned long long)vertex_hash_, (unsigned long long)pixel_hash_);
     }
-    void approximate(const std::string &what) { report_.approximate[what]++, approximations_++; }
-    void use(const std::string &what) { report_.used[what]++; }
+    void approximate(const std::string &what) {
+        report_.approximate[what]++, approximations_++;
+        front_keepable_ = false; // (a count by a made string is not kept: draw_front)
+    }
+    void use(const std::string &what) {
+        report_.used[what]++;
+        front_keepable_ = false;
+    }
     // A literal's counts by its address: no string made and no map of
     // strings searched at each draw (1.8% of the command thread and the
     // allocations with it in a heavy scene), folded into the report's maps
@@ -1704,8 +1718,14 @@ private:
         const char *v = std::getenv("XF_RESOLVE_TARGETS_DEPTH");
         return !(v && v[0] == '0');
     }();
-    void approximate(const char *what) { approximate_by_literal_[what]++, approximations_++; }
-    void use(const char *what) { used_by_literal_[what]++; }
+    void approximate(const char *what) {
+        approximate_by_literal_[what]++, approximations_++;
+        if (front_recording_) front_counts_.push_back({what, true});
+    }
+    void use(const char *what) {
+        used_by_literal_[what]++;
+        if (front_recording_) front_counts_.push_back({what, false});
+    }
     // the report with what the processor counted of the packets the renderer
     // does not see (Report::used)
     Report with_processor_counts(Report r) const {
@@ -2425,6 +2445,10 @@ private:
     // the draw-data arena in video memory where there is one, the arena
     // otherwise. Offsets are into draw_buffer().
     VkDeviceSize draw_data_take(VkDeviceSize bytes, VkDeviceSize align);
+    // bytes into the draw data or the arena: a copy the compiler cannot fold
+    // with one around it (the destination may be write-combined device
+    // memory, hundreds of times slower to read than to write)
+    [[gnu::noinline]] static void upload(void *to, const void *from, size_t bytes) { std::memcpy(to, from, bytes); }
     uint8_t *draw_data(VkDeviceSize at) {
         return static_cast<uint8_t *>((draw_data_.buffer ? draw_data_ : arena_).mapped) + at;
     }
@@ -2474,6 +2498,28 @@ private:
     };
     VkDeviceSize request(const std::vector<Range> &ranges, RequestMemo *memo = nullptr);
     RequestMemo vertex_memo_;
+    // A draw's vertex ranges, each as it was last found in the mirror: the
+    // write count before that look. A range no page of which was written
+    // since (by blocks of pages: pages_unwritten) and under which the mirror
+    // lost nothing (mirror_epoch_) is in the mirror still, so a draw asks
+    // only for the others: a scene's draws read whole vertex buffers of
+    // hundreds of pages, each page looked at twice a draw otherwise.
+    // XF_VERTEX_RANGE_MEMO=0: every range asked for at every draw, as before.
+    struct RangeMemo {
+        Range range{0, 0};
+        uint32_t count = 0;
+        uint64_t epoch = 0, used_serial = 0;
+    };
+    static constexpr size_t RANGE_MEMOS = 1u << 12;
+    std::vector<RangeMemo> range_memos_ = std::vector<RangeMemo>(RANGE_MEMOS);
+    static size_t range_memo_index(const Range &r) {
+        const uint64_t h = (uint64_t(r.first) << 32 | r.second) * 0x9E3779B97F4A7C15ull;
+        return size_t(h >> 52) & (RANGE_MEMOS - 1);
+    }
+    bool range_memos_on_ = [] {
+        const char *v = std::getenv("XF_VERTEX_RANGE_MEMO");
+        return !(v && v[0] == '0');
+    }();
     uint64_t mirror_epoch_ = 1; // advanced where pages of the mirror stop being current but for a write
     void gpu_written(const std::vector<Range> &ranges);
     // The submission that last used each page of the mirror (read or wrote
@@ -2602,6 +2648,7 @@ private:
         std::array<uint32_t, 4> overrides = {};
         uint32_t forced_filter = 0, forced_aniso = 0;
         Texture *texture = nullptr;
+        uint64_t loads = 0; // the texture's, when this was kept
         SamplerEntry *sampler = nullptr;
         uint32_t slot_word = 0, signs = 0, integer_scale = 0, signed_word = 0;
         uint32_t uses = 0; // the Report::used counts a draw adds for it (bit 0, bit 1)
@@ -2628,8 +2675,13 @@ private:
     // the generic pipelines of draws whose shaders are being translated, by
     // the pipeline's key (dropped when the draw next goes the usual way)
     std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> translating_pipelines_;
-    PipelineEntry *last_pipeline_ = nullptr; // the entry pipeline() found last, and its key
-    std::vector<uint32_t> last_pipeline_key_;
+    // the entries pipeline() found last, by their keys' hashes, each with its key
+    struct PipelineFront {
+        std::vector<uint32_t> key;
+        PipelineEntry *entry = nullptr;
+    };
+    static constexpr size_t PIPELINE_FRONT = 1u << 10;
+    std::vector<PipelineFront> pipeline_front_ = std::vector<PipelineFront>(PIPELINE_FRONT);
 
     // submissions
     VkCommandPool pool_ = VK_NULL_HANDLE;
@@ -2662,6 +2714,76 @@ private:
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
 
+    // ---- a draw's front part ----
+    // What a draw works out from the registers of the draws' state alone
+    // (RegisterFile::state_serial), its shaders and its kind of primitive:
+    // the targets, the viewport and scissor, how the primitive is drawn, the
+    // interlock path's constants. A draw that comes with all of those as the
+    // draw before had them takes that draw's (Cemu's continued draws, RPCS3's
+    // and Dolphin's dirty state: a scene's draws mostly change constants,
+    // buffers and textures between them). XF_DRAW_FRONT_MEMO=0: worked out at
+    // every draw, as before.
+    struct DrawFront {
+        // what it is worked out from, beside the registers
+        uint32_t primitive = 0, count = 0, extent_words = UINT32_MAX;
+        bool index32 = false, color = false, writes_targets = false;
+        // what the draw takes from it
+        bool tessellated{};
+        uint32_t tess_mode{};
+        shader::VertexOptions host_vertex{};
+        uint32_t patch_points{};
+        uint32_t hull{};
+        std::string draw_name{};
+        bool rectangles{};
+        bool points{};
+        uint32_t ucp{};
+        bool expanded{};
+        bool polygonal{};
+        VkPrimitiveTopology topology{};
+        bool strip{};
+        Shader *vs = nullptr;
+        Shader *ps = nullptr;
+        std::string why{};
+        bool translating{};
+        bool first_forms_translating{};
+        uint32_t pitch{};
+        uint32_t msaa{};
+        bool export_only{};
+        uint32_t gamma_targets{};
+        uint32_t depth_control{};
+        RenderTarget *depth = nullptr;
+        uint32_t width{};
+        uint32_t height{};
+        uint32_t host_width{};
+        uint32_t host_height{};
+        bool depth_float24{};
+        bool float24_convert{};
+        Viewport viewport{};
+        VkRect2D scissor{};
+        FsiConstants fsi_constants{};
+        RenderTarget *colors[4] = {};
+        uint32_t color_masks[4] = {};
+        float color_scales[4] = {};
+    };
+    DrawFront front_;
+    // the draw the kept one was worked out for
+    struct DrawFrontKey {
+        uint64_t state_serial = 0, foreign_writes = 0;
+        const Shader *vertex = nullptr, *pixel = nullptr;
+        uint32_t primitive = 0, flags = 0;
+        bool operator==(const DrawFrontKey &) const = default;
+    } front_key_;
+    bool front_valid_ = false;
+    // what the front part counted (use, approximate): counted again by a draw that takes it
+    std::vector<std::pair<const char *, bool>> front_counts_;
+    bool front_recording_ = false, front_keepable_ = false;
+    bool front_memo_ = [] {
+        const char *v = std::getenv("XF_DRAW_FRONT_MEMO");
+        return !(v && v[0] == '0');
+    }();
+    // false: the draw ends there (skipped, or it writes nothing)
+    bool draw_front(const gpu::Draw &d, DrawFront &f);
+
     // ---- the index cache ----
     // A draw's converted indices kept by where the guest's are and how they
     // were converted (Xenia's primitive processor keeps its converted index
@@ -2693,7 +2815,12 @@ private:
         uint64_t written_swap = 0;  // the swap its pages were last found written in
         uint32_t streak = 0;        // how many times in a row within a few swaps
         uint64_t dynamic_until = 0; // not kept before this swap
+        IndexKey key;
     };
+    // the entries looked up last, by their keys' hashes: a draw finds its
+    // own without walking the map (a node of it in memory the cache has not)
+    static constexpr size_t INDEX_FRONT = 1u << 12;
+    std::vector<IndexEntry *> index_front_ = std::vector<IndexEntry *>(INDEX_FRONT, nullptr);
     struct IndexChunk {
         vk::Buffer buffer;
         VkDeviceSize used = 0;
@@ -2713,6 +2840,7 @@ private:
     void index_cache_drop();
     // the index buffer the recording command buffer has bound at offset 0
     VkBuffer bound_index_buffer_ = VK_NULL_HANDLE;
+    float rounded_scale_in_ = 0.0f, rounded_scale_out_ = 0.0f; // the polygon offset scale last rounded
     // whether it has the draws' two sets bound, and the first's dynamic
     // offsets (XF_SET_ELISION=0: both bound at every draw, as before)
     bool sets_bound_ = false;
@@ -4644,6 +4772,7 @@ void Impl::index_cache_drop() {
         slots_[current_].after.push_back([this, buffer = chunk.buffer]() mutable { d_.destroy(buffer); });
     index_chunks_.clear();
     index_cache_.clear();
+    std::fill(index_front_.begin(), index_front_.end(), nullptr);
     index_cache_words_ = 0;
 }
 
@@ -6450,7 +6579,10 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         t->load_why = LoadWhy::CpuWritten;
     }
     if (t) t->stale = true; // until it is loaded again
-    texture_epoch_++;       // a load: what the draws kept of their texture slots goes (SlotMemo)
+    // a load: what the draws kept of this texture's slots goes (SlotMemo), not
+    // of every texture's (a scene reloading fifty textures a frame after its
+    // resolves otherwise took every slot of every draw the long way again)
+    if (t) t->loads++;
 
     texture::Plan plan, signed_plan;
     if (!texture::plan(info, plan, why, support_)) return nullptr;
@@ -6882,19 +7014,21 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
         report_.pipeline_wait_seconds += waited;
         report_.pipeline_wait_max = std::max(report_.pipeline_wait_max, waited);
     };
-    // The last draw's pipeline again (most draws follow one of the same state): one comparison of
-    // the key instead of the map's search, a compare of two keys at each of its levels. Entries
-    // are never dropped.
-    if (last_pipeline_ && last_pipeline_->pipeline && !last_pipeline_->stand_in && !last_pipeline_->generic &&
-        key == last_pipeline_key_ &&
-        last_pipeline_->asked == std::chrono::steady_clock::time_point{} &&
-        last_pipeline_->state.load(std::memory_order_acquire))
-        return last_pipeline_->pipeline;
+    // A pipeline found before again, by its key's hash (a scene's draws go back and forth
+    // between a few hundred): one comparison of the key instead of the map's search, a compare
+    // of two keys at each of its levels. Entries are never dropped.
+    uint64_t hash = 0x9E3779B97F4A7C15ull;
+    for (uint32_t word : key) hash = (hash ^ word) * 0x100000001B3ull;
+    PipelineFront &front = pipeline_front_[size_t(hash >> 32) & (PIPELINE_FRONT - 1)];
+    if (front.entry && front.entry->pipeline && !front.entry->stand_in && !front.entry->generic && key == front.key &&
+        front.entry->asked == std::chrono::steady_clock::time_point{} &&
+        front.entry->state.load(std::memory_order_acquire))
+        return front.entry->pipeline;
     PipelineEntry *e = nullptr;
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) {
         e = it->second.get();
-        last_pipeline_ = e, last_pipeline_key_ = key;
+        front.entry = e, front.key = key;
         if (e->state.load(std::memory_order_acquire)) {
             if (e->stand_in) retire_stand_in(*e);
             if (e->generic) retire_generic(*e);
@@ -8111,12 +8245,6 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
 
 // ---- a draw ----
 
-struct Viewport {
-    VkViewport viewport{};
-    float ndc_scale[3] = {1, 1, 1}, ndc_offset[3] = {};
-    bool empty = false;
-};
-
 // draw_util.cc's GetHostViewportInfo, at resolution scale 1, for Vulkan
 // (origin at the top left, reverse Z allowed, float24 depth halved);
 // depth_float24: a D24FS8 target with the depth test on
@@ -8625,67 +8753,11 @@ Impl::DepthOverwrite Impl::depth_overwrite(const gpu::Draw &d, const Shader &vs,
 
 // A draw outside copy mode, as the processor gives it (immediate indices in
 // the draw, which Xenia does not draw).
-void Impl::draw(const gpu::Draw &d) {
-    report_.draws++;
-    // VIZ queries ("VIZ queries" above), counted: draws predicated on one
-    // (DRAW_INDX's VIZ token, bit 8), and survey draws (PA_SC_VIZ_QUERY's
-    // viz_query_ena with kill_pix_post_hi_z), drawn as they are; without
-    // conditional rendering, every predicated draw is drawn (Xenia's default)
-    if (d.viz_query & 0x100)
-        use(viz_predicates_.buffer ? "draws predicated on a VIZ query"
-                                   : "draws predicated on a VIZ query (drawn, as Xenia's default)");
-    if ((regs_[reg::PA_SC_VIZ_QUERY] & 0x81) == 0x81) use("VIZ survey draws");
-    uint32_t mode = regs_[reg::RB_MODECONTROL] & 7;
-    if (EdramMode(mode) != EdramMode::ColorDepth && EdramMode(mode) != EdramMode::DepthOnly) return skip("EDRAM mode " + std::to_string(mode));
-
-    uint32_t primitive = d.primitive, count = d.count;
-    bool index32 = d.index32;
-    if (count == 0) return;
-    bool color = EdramMode(mode) == EdramMode::ColorDepth;
-    // whether the draw can write any target (a color channel enabled, or depth or stencil on)
-    bool writes_targets = (color && (regs_[reg::RB_COLOR_MASK] & 0xFFFF) != 0) || (regs_[reg::RB_DEPTHCONTROL] & 3) != 0;
-    {
-        // A draw that can write nothing (no color channel enabled, depth and
-        // stencil off, no memory export) leaves EDRAM and memory as they
-        // were, and the occlusion queries' counts are the processor's fake
-        // ones (EVENT_WRITE_ZPD, as Xenia's): nothing to draw, whatever its
-        // primitive. A UE3 game issues hundreds of such point lists a
-        // frame.
-        const Shader *v = have_vertex_ ? vertex_shader_ : nullptr;
-        const Shader *p = have_pixel_ ? pixel_shader_ : nullptr;
-        bool exports = (v && v->summary.memexport) || (color && p && p->summary.memexport);
-        if (!writes_targets && !exports) {
-            if (options_.verbose)
-                std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
-            return;
-        }
-        // predicated on a VIZ query that ended: dropped when it had no
-        // survey, else on the GPU by its word when that holds its count
-        if ((d.viz_query & 0x100) && viz_predicates_.buffer && !exports) {
-            const VizQuery &q = viz_[d.viz_query & 63];
-            if (q.ended && !q.surveyed) {
-                use("draws predicated on a VIZ query without survey draws (dropped)");
-                return;
-            }
-            if (q.ended && q.armed) viz_predicate_ = d.viz_query & 63;
-        }
-        // the port draws this frame (native_render.h): the draws its filter
-        // selects skipped, never one exporting memory (the CPU may read it)
-        if (native_suppress_) {
-            if (exports) {
-                native::detail::bump(native::detail::atomic_counters().memexport_kept);
-            } else {
-                native::PassInfo pass;
-                pass.color = color, pass.has_pixel_shader = p != nullptr;
-                pass.primitive = primitive, pass.count = count;
-                pass.vertex_shader = have_vertex_ ? vertex_hash_ : 0, pass.pixel_shader = have_pixel_ ? pixel_hash_ : 0;
-                if (!native_keep(pass)) {
-                    if (zpd_current_) zpd_counts_[zpd_current_].suppressed = true;
-                    return;
-                }
-            }
-        }
-    }
+// A draw's front part (DrawFront): false when the draw ends there.
+bool Impl::draw_front(const gpu::Draw &d, DrawFront &f) {
+    const uint32_t primitive = f.primitive, count = f.count;
+    const bool index32 = f.index32, color = f.color, writes_targets = f.writes_targets;
+    (void)count, (void)index32;
     // What the draw asks for, counted whether it is drawn or not
     // (Report::used): user clip planes (PA_CL_CLIP_CNTL's ucp_ena_0-5 while
     // clipping is on; on points with ps_ucp_mode), and lines of another width
@@ -8751,14 +8823,14 @@ void Impl::draw(const gpu::Draw &d) {
                 hull = tess_mode == 2 ? 4 : 0;
             break;
         }
-        if (host_vertex.host == HV::Vertex) return skip("tessellation: " + what);
+        if (host_vertex.host == HV::Vertex) return skip("tessellation: " + what), false;
         // the device's tessellation shaders are optional (most mobile GPUs
         // lack them)
-        if (!d_.tessellation_shader()) return skip("tessellation without tessellation shaders: " + what);
+        if (!d_.tessellation_shader()) return skip("tessellation without tessellation shaders: " + what), false;
         // adaptive tessellation's edge factors are 32-bit floats in an index
         // buffer (Xenia fails the draw otherwise)
         if (tess_mode == 2 && !(d.indexed && d.index32))
-            return skip("adaptive tessellation without 32-bit edge factors");
+            return skip("adaptive tessellation without 32-bit edge factors"), false;
         host_vertex.equal_spacing = tess_mode == 0;
     }
     bool rectangles = !tessellated && primitive == 8, points = !tessellated && primitive == 1;
@@ -8783,7 +8855,7 @@ void Impl::draw(const gpu::Draw &d) {
         bool cull = host_vertex.clip_planes_cull || (points && host_vertex.point_ucp_mode == 2);
         bool clip = !host_vertex.clip_planes_cull;
         if ((cull && !d_.cull_distance()) || (clip && !d_.clip_distance()))
-            return skip("user clip planes without clip or cull distances on the device");
+            return skip("user clip planes without clip or cull distances on the device"), false;
         if (points && host_vertex.point_ucp_mode == 2 && !host_vertex.clip_planes_cull && host_vertex.clip_planes > 4)
             approximate("points with ps_ucp_mode 2 and more than 4 user clip planes (clipped by the corners only)");
     }
@@ -8823,7 +8895,7 @@ void Impl::draw(const gpu::Draw &d) {
     // Not drawn, as Xenia's primitive processor does not: the triangle list
     // with wireframe flags (7), whose flags' place no reference gives, and
     // the 2D engine's copy and fill rectangles and strips (16 to 22).
-    default: return skip(std::string("primitive ") + primitive_name(primitive));
+    default: return skip(std::string("primitive ") + primitive_name(primitive)), false;
     }
     // the types the reset index cuts (Xenia's ProcessIndexBuffer list, by the
     // guest's type: tessellated strips and fans too, patches not, adaptive
@@ -8834,25 +8906,24 @@ void Impl::draw(const gpu::Draw &d) {
 
     // shaders
     Shader *vs = have_vertex_ ? vertex_shader_ : nullptr;
-    if (!vs) return skip("no vertex shader");
+    if (!vs) return skip("no vertex shader"), false;
     Shader *ps = color && have_pixel_ ? pixel_shader_ : nullptr;
     std::string why;
     // a shader's forms the generic shaders draw may be translated on the
     // workers, the draw drawn by them meanwhile (translating)
-    collect_translations();
     // (translating: a form the draw uses is; the first forms may be
     // translating for another draw's sake)
     bool translating = false, first_forms_translating = false;
-    if (!translate(*vs, why, &first_forms_translating)) return skip("vertex shader: " + why);
-    if (ps && !translate(*ps, why, &first_forms_translating)) return skip("pixel shader: " + why);
+    if (!translate(*vs, why, &first_forms_translating)) return skip("vertex shader: " + why), false;
+    if (ps && !translate(*ps, why, &first_forms_translating)) return skip("pixel shader: " + why), false;
     for (const Shader *s : {vs, ps})
         if (s)
-            for (const std::string &a : s->approximate) approximate(a);
+            for (const std::string &a : s->approximate) report_.approximate[a]++, approximations_++;
 
     // render targets
     uint32_t surface = regs_[reg::RB_SURFACE_INFO], pitch = surface & 0x3FFF, msaa = (surface >> 16) & 3;
-    if (!pitch) return skip("surface pitch 0"); // Xenia draws nothing then, exports neither
-    if (msaa == 3) return skip("MSAA mode 3");
+    if (!pitch) return skip("surface pitch 0"), false; // Xenia draws nothing then, exports neither
+    if (msaa == 3) return skip("MSAA mode 3"), false;
     // Memory exports. A draw that rasterizes nothing (it writes no target,
     // or the vertex shader only exports: SQ_PROGRAM_CNTL's vs_export_mode
     // multipass; or no target, viewport or scissor is left) still runs its
@@ -8876,7 +8947,7 @@ void Impl::draw(const gpu::Draw &d) {
         if (!rasterizes_nothing()) {
             if (options_.verbose)
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
-            return;
+            return false;
         }
     }
     RenderTarget *colors[4] = {};
@@ -8908,7 +8979,7 @@ void Impl::draw(const gpu::Draw &d) {
         if (format == 1) any_gamma = true;
         if (fsi_) {
             if (format == 8 || format == 9 || format == 11 || format == 13)
-                return skip(std::string("color target format ") + color_target_format_name(format));
+                return skip(std::string("color target format ") + color_target_format_name(format)), false;
             views[i] = view_of(false, info & 0xFFF, format);
             viewed[i] = true;
             continue;
@@ -8917,7 +8988,10 @@ void Impl::draw(const gpu::Draw &d) {
         color_scales[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
         if (format == 4 || format == 5) color_scales[i] *= 1024.0f / 32767.0f;
         colors[i] = render_target(false, info & 0xFFF, pitch, msaa, format);
-        if (!colors[i]) return fatal_.empty() ? skip(std::string("color target format ") + color_target_format_name(format)) : void();
+        if (!colors[i]) {
+            if (fatal_.empty()) skip(std::string("color target format ") + color_target_format_name(format));
+            return false;
+        }
         // 8_8_8_8_GAMMA: the shader writes linear into a target kept linear,
         // else the gamma curve (blended in gamma then, unlike the console)
         if (format == 1 && !colors[i]->gamma_linear) gamma_targets |= 1u << i;
@@ -8939,7 +9013,7 @@ void Impl::draw(const gpu::Draw &d) {
             if (format == 1 && !options_.depth_float24_convert_in_pixel_shader)
                 approximate("D24FS8 depth as 32-bit float");
             depth = render_target(true, info & 0xFFF, pitch, msaa, format);
-            if (!depth) return;
+            if (!depth) return false;
         }
     } else {
         depth_control = 0;
@@ -8962,7 +9036,7 @@ void Impl::draw(const gpu::Draw &d) {
         // no target the pixel shader writes and no depth: nothing it could change
         if (options_.verbose)
             std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
-        return;
+        return false;
     }
 
     // viewport and scissor
@@ -8975,7 +9049,7 @@ void Impl::draw(const gpu::Draw &d) {
     VkRect2D scissor = host_scissor(regs_, pitch);
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
     scissor.extent.height = std::min<uint32_t>(scissor.extent.height, height - std::min<uint32_t>(scissor.offset.y, height));
-    if (!export_only && (viewport.empty || !scissor.extent.width || !scissor.extent.height) && !rasterizes_nothing()) return;
+    if (!export_only && (viewport.empty || !scissor.extent.width || !scissor.extent.height) && !rasterizes_nothing()) return false;
     if (export_only) {
         std::fill(std::begin(colors), std::end(colors), nullptr);
         std::fill(std::begin(viewed), std::end(viewed), false);
@@ -9068,6 +9142,180 @@ void Impl::draw(const gpu::Draw &d) {
     // (the targets take over their EDRAM tiles below, once the draw's lowest
     // row is known: draw_max_y)
 
+    f.tessellated = tessellated;
+    f.tess_mode = tess_mode;
+    f.host_vertex = host_vertex;
+    f.patch_points = patch_points;
+    f.hull = hull;
+    f.draw_name = draw_name;
+    f.rectangles = rectangles;
+    f.points = points;
+    f.ucp = ucp;
+    f.expanded = expanded;
+    f.polygonal = polygonal;
+    f.topology = topology;
+    f.strip = strip;
+    f.vs = vs;
+    f.ps = ps;
+    f.why = why;
+    f.translating = translating;
+    f.first_forms_translating = first_forms_translating;
+    f.pitch = pitch;
+    f.msaa = msaa;
+    f.export_only = export_only;
+    f.gamma_targets = gamma_targets;
+    f.depth_control = depth_control;
+    f.depth = depth;
+    f.width = width;
+    f.height = height;
+    f.host_width = host_width;
+    f.host_height = host_height;
+    f.depth_float24 = depth_float24;
+    f.float24_convert = float24_convert;
+    f.viewport = viewport;
+    f.scissor = scissor;
+    f.fsi_constants = fsi_constants;
+    std::copy(colors, colors + 4, f.colors);
+    std::copy(color_masks, color_masks + 4, f.color_masks);
+    std::copy(color_scales, color_scales + 4, f.color_scales);
+    f.extent_words = extent_words;
+    return true;
+}
+
+void Impl::draw(const gpu::Draw &d) {
+    report_.draws++;
+    // VIZ queries ("VIZ queries" above), counted: draws predicated on one
+    // (DRAW_INDX's VIZ token, bit 8), and survey draws (PA_SC_VIZ_QUERY's
+    // viz_query_ena with kill_pix_post_hi_z), drawn as they are; without
+    // conditional rendering, every predicated draw is drawn (Xenia's default)
+    if (d.viz_query & 0x100)
+        use(viz_predicates_.buffer ? "draws predicated on a VIZ query"
+                                   : "draws predicated on a VIZ query (drawn, as Xenia's default)");
+    if ((regs_[reg::PA_SC_VIZ_QUERY] & 0x81) == 0x81) use("VIZ survey draws");
+    uint32_t mode = regs_[reg::RB_MODECONTROL] & 7;
+    if (EdramMode(mode) != EdramMode::ColorDepth && EdramMode(mode) != EdramMode::DepthOnly) return skip("EDRAM mode " + std::to_string(mode));
+
+    uint32_t primitive = d.primitive, count = d.count;
+    bool index32 = d.index32;
+    if (count == 0) return;
+    bool color = EdramMode(mode) == EdramMode::ColorDepth;
+    // whether the draw can write any target (a color channel enabled, or depth or stencil on)
+    bool writes_targets = (color && (regs_[reg::RB_COLOR_MASK] & 0xFFFF) != 0) || (regs_[reg::RB_DEPTHCONTROL] & 3) != 0;
+    {
+        // A draw that can write nothing (no color channel enabled, depth and
+        // stencil off, no memory export) leaves EDRAM and memory as they
+        // were, and the occlusion queries' counts are the processor's fake
+        // ones (EVENT_WRITE_ZPD, as Xenia's): nothing to draw, whatever its
+        // primitive. A UE3 game issues hundreds of such point lists a
+        // frame.
+        const Shader *v = have_vertex_ ? vertex_shader_ : nullptr;
+        const Shader *p = have_pixel_ ? pixel_shader_ : nullptr;
+        bool exports = (v && v->summary.memexport) || (color && p && p->summary.memexport);
+        if (!writes_targets && !exports) {
+            if (options_.verbose)
+                std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
+            return;
+        }
+        // predicated on a VIZ query that ended: dropped when it had no
+        // survey, else on the GPU by its word when that holds its count
+        if ((d.viz_query & 0x100) && viz_predicates_.buffer && !exports) {
+            const VizQuery &q = viz_[d.viz_query & 63];
+            if (q.ended && !q.surveyed) {
+                use("draws predicated on a VIZ query without survey draws (dropped)");
+                return;
+            }
+            if (q.ended && q.armed) viz_predicate_ = d.viz_query & 63;
+        }
+        // the port draws this frame (native_render.h): the draws its filter
+        // selects skipped, never one exporting memory (the CPU may read it)
+        if (native_suppress_) {
+            if (exports) {
+                native::detail::bump(native::detail::atomic_counters().memexport_kept);
+            } else {
+                native::PassInfo pass;
+                pass.color = color, pass.has_pixel_shader = p != nullptr;
+                pass.primitive = primitive, pass.count = count;
+                pass.vertex_shader = have_vertex_ ? vertex_hash_ : 0, pass.pixel_shader = have_pixel_ ? pixel_hash_ : 0;
+                if (!native_keep(pass)) {
+                    if (zpd_current_) zpd_counts_[zpd_current_].suppressed = true;
+                    return;
+                }
+            }
+        }
+    }
+    // the front part: the draw before's where this one comes with the same
+    // state, shaders and kind of primitive, else worked out
+    collect_translations();
+    DrawFront &f = front_;
+    {
+        DrawFrontKey key;
+        key.state_serial = file_ ? file_->state_serial() : 0, key.foreign_writes = file_ ? file_->foreign_writes() : 0;
+        key.vertex = have_vertex_ ? vertex_shader_ : nullptr, key.pixel = have_pixel_ ? pixel_shader_ : nullptr;
+        key.primitive = primitive;
+        key.flags = uint32_t(d.major_mode_explicit) | uint32_t(d.indexed) << 1 | uint32_t(index32) << 2 |
+                    uint32_t(color) << 3 | uint32_t(writes_targets) << 4;
+        // (the screen extent report the draw bounds is the draw's own)
+        const bool was_bounded = f.host_vertex.extents;
+        bool hit = front_memo_ && front_valid_ && file_ && key == front_key_ && !native_suppress_ && !options_.verbose;
+        if (hit) {
+            f.extent_words = (!f.points && !f.rectangles) || f.expanded ? extent_draw_words() : UINT32_MAX;
+            if ((f.extent_words != UINT32_MAX) != was_bounded) hit = false;
+        }
+        if (hit) {
+            for (const auto &[what, approximation] : front_counts_) approximation ? approximate(what) : use(what);
+            for (const Shader *s : {front_key_.vertex, f.color ? front_key_.pixel : nullptr})
+                if (s)
+                    for (const std::string &a : s->approximate) report_.approximate[a]++, approximations_++;
+        } else {
+            front_valid_ = false;
+            front_counts_.clear();
+            front_recording_ = front_keepable_ = true;
+            f.primitive = primitive, f.count = count, f.index32 = index32, f.color = color;
+            f.writes_targets = writes_targets;
+            const bool goes_on = draw_front(d, f);
+            front_recording_ = false;
+            if (!goes_on) return;
+            // kept for the next draw: not one whose shaders are still being
+            // translated, nor one that exports alone
+            front_valid_ = front_memo_ && front_keepable_ && file_ && !f.translating && !f.first_forms_translating &&
+                           !f.export_only && !native_suppress_ && !options_.verbose;
+            front_key_ = key;
+        }
+    }
+    bool tessellated = f.tessellated;
+    uint32_t tess_mode = f.tess_mode;
+    shader::VertexOptions host_vertex = f.host_vertex;
+    uint32_t patch_points = f.patch_points;
+    uint32_t hull = f.hull;
+    std::string draw_name = f.draw_name;
+    bool rectangles = f.rectangles;
+    bool points = f.points;
+    uint32_t ucp = f.ucp;
+    bool expanded = f.expanded;
+    bool polygonal = f.polygonal;
+    VkPrimitiveTopology topology = f.topology;
+    bool strip = f.strip;
+    Shader *vs = f.vs;
+    Shader *ps = f.ps;
+    std::string why = f.why;
+    bool translating = f.translating;
+    uint32_t msaa = f.msaa;
+    bool export_only = f.export_only;
+    uint32_t gamma_targets = f.gamma_targets;
+    uint32_t depth_control = f.depth_control;
+    RenderTarget *depth = f.depth;
+    uint32_t host_width = f.host_width;
+    uint32_t host_height = f.host_height;
+    bool depth_float24 = f.depth_float24;
+    bool float24_convert = f.float24_convert;
+    const Viewport &viewport = f.viewport;
+    VkRect2D scissor = f.scissor;
+    FsiConstants fsi_constants = f.fsi_constants;
+    const auto &colors = f.colors;
+    const auto &color_masks = f.color_masks;
+    const auto &color_scales = f.color_scales;
+    const uint32_t extent_words = f.host_vertex.extents ? f.extent_words : UINT32_MAX;
+    host_vertex.extents = extent_words != UINT32_MAX;
     // the pages of the streams the shaders export to (the pixel shader's only
     // when it runs)
     std::vector<Range> &exported = draw_lists_.exported;
@@ -9108,7 +9356,13 @@ void Impl::draw(const gpu::Draw &d) {
             if (index_chunks_.size() * INDEX_CHUNK + index_cache_words_ > INDEX_CACHE_BUDGET ||
                 index_cache_.size() > INDEX_CACHE_ENTRIES)
                 index_cache_drop();
-            index_entry = &index_cache_[key];
+            IndexEntry *&front = index_front_[IndexKeyHash()(key) & (INDEX_FRONT - 1)];
+            if (!front || !(front->key == key)) {
+                auto found = index_cache_.find(key);
+                if (found == index_cache_.end()) found = index_cache_.emplace(key, IndexEntry{}).first, found->second.key = key;
+                front = &found->second;
+            }
+            index_entry = front;
             IndexEntry &e = *index_entry;
             const uint64_t swap = report_.swaps;
             if (e.buffer) {
@@ -9525,7 +9779,7 @@ void Impl::draw(const gpu::Draw &d) {
             SlotMemo &m = *memo;
             if (m.epoch == texture_epoch_ && std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0 &&
                 m.overrides == overrides && m.forced_filter == forced_filter && m.forced_aniso == forced_aniso &&
-                !m.texture->stale && unwritten(*m.texture)) {
+                m.loads == m.texture->loads && !m.texture->stale && unwritten(*m.texture)) {
                 use(*m.texture, submission_serial() + 1);
                 m.sampler->used_serial = submission_serial();
                 sys.slots[slot] = m.slot_word, sys.signs[slot] = m.signs;
@@ -9592,7 +9846,7 @@ void Impl::draw(const gpu::Draw &d) {
             m.epoch = texture_epoch_;
             std::memcpy(m.fetch, fetch, sizeof(m.fetch));
             m.overrides = overrides, m.forced_filter = forced_filter, m.forced_aniso = forced_aniso;
-            m.texture = t, m.sampler = sampler_entry;
+            m.texture = t, m.loads = t->loads, m.sampler = sampler_entry;
             m.slot_word = sys.slots[slot], m.signs = sys.signs[slot];
             m.integer_scale = sys.integer_scale[slot], m.signed_word = sys.signed_slots[slot];
             m.uses = uses;
@@ -10057,7 +10311,37 @@ void Impl::draw(const gpu::Draw &d) {
     }
     {
         Timer timer(report_.vertex_seconds, cpu_times_);
-        report_.vertex_bytes += request(vertex_ranges, &vertex_memo_);
+        if (range_memos_on_ && !trace_) {
+            // the ranges found in the mirror before and unwritten since left out
+            const uint32_t count = mem_.write_count();
+            const uint64_t serial = submission_serial();
+            std::vector<Range> &asked = draw_lists_.sorted; // (free again: the merge above is done)
+            asked.clear();
+            for (const Range &r : vertex_ranges) {
+                RangeMemo &m = range_memos_[range_memo_index(r)];
+                if (m.range == r && m.epoch == mirror_epoch_ &&
+                    (m.count == count || pages_unwritten(first_page(r), last_page(r), m.count))) {
+                    m.count = count;
+                    if (hoisted_uploads_ && m.used_serial != serial) {
+                        std::vector<Range> &one = draw_lists_.written;
+                        one.assign(1, r);
+                        mark_used(one);
+                        m.used_serial = serial;
+                    }
+                    continue;
+                }
+                asked.push_back(r);
+            }
+            if (!asked.empty()) {
+                const uint64_t epoch = mirror_epoch_;
+                report_.vertex_bytes += request(asked);
+                // (as of the count read before the look: a write since numbers a page above it;
+                // not when the mirror could not take them)
+                if (fatal_.empty() && epoch == mirror_epoch_)
+                    for (const Range &r : asked) range_memos_[range_memo_index(r)] = {r, count, mirror_epoch_, submission_serial()};
+            }
+        } else
+            report_.vertex_bytes += request(vertex_ranges, &vertex_memo_);
         // guest memory's bytes under the streams' pages, where the mirror has
         // nothing newer (Xenia's RequestRange of each stream)
         report_.vertex_bytes += request(exported);
@@ -10109,8 +10393,11 @@ void Impl::draw(const gpu::Draw &d) {
         fsi_constants.zpd_index = viz_survey_ != UINT32_MAX ? viz_fsi_index() : fsi_zpd_index();
         if (last_fsi_at_ == NONE || std::memcmp(&last_fsi_, &fsi_constants, sizeof(FsiConstants)) != 0) {
             last_fsi_at_ = draw_data_take(sizeof(FsiConstants), ubo_align_);
-            std::memcpy(draw_data(last_fsi_at_), &fsi_constants, sizeof(FsiConstants));
+            // (the kept copy first, the upload from it: the draw data is in
+            // write-combined memory, which nothing must read back, and a
+            // compiler free to copy the kept one from either did)
             last_fsi_ = fsi_constants;
+            upload(draw_data(last_fsi_at_), &last_fsi_, sizeof(FsiConstants));
         }
     }
     uint32_t dynamic_offsets[4] = {0, 0, 0, last_fsi_at_ == NONE ? 0u : uint32_t(last_fsi_at_)};
@@ -10118,13 +10405,13 @@ void Impl::draw(const gpu::Draw &d) {
         // (uploaded again when a draw found them changed, and in each new submission)
         if (last_constants_at_[stage] == NONE) {
             last_constants_at_[stage] = draw_data_take(sizeof(harness::Constants), ubo_align_);
-            std::memcpy(draw_data(last_constants_at_[stage]), &last_constants_[stage], sizeof(harness::Constants));
+            upload(draw_data(last_constants_at_[stage]), &last_constants_[stage], sizeof(harness::Constants));
         }
     }
     if (last_system_at_ == NONE || std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
         last_system_at_ = draw_data_take(sizeof(System), ubo_align_);
-        std::memcpy(draw_data(last_system_at_), &sys, sizeof(System));
         last_system_ = sys;
+        upload(draw_data(last_system_at_), &last_system_, sizeof(System));
     }
     // Every block the draw reads lies in its own submission's share: one in
     // another's is the host's to write again while this one runs (the lost
@@ -10344,9 +10631,14 @@ void Impl::draw(const gpu::Draw &d) {
             if ((sc_mode >> 11) & 1 && !(sc_mode & 1)) {
                 scale = offsets[0], offset = offsets[1];
                 // base/math.h's roundToNearestOrderOfMagnitude
-                if (scale != 0.0f) {
+                // (the last scale's kept: a scene draws with a few, and the
+                // logarithm and power at every draw were 4% of the command thread)
+                if (scale != 0.0f && scale == rounded_scale_in_) {
+                    scale = rounded_scale_out_;
+                } else if (scale != 0.0f) {
+                    rounded_scale_in_ = scale;
                     double order = std::pow(10.0, std::floor(std::log10(std::fabs(double(scale)))));
-                    scale = float(std::round(double(scale) / order) * order);
+                    scale = rounded_scale_out_ = float(std::round(double(scale) / order) * order);
                 }
             }
             if ((sc_mode >> 12) & 1 && !(sc_mode & 2) && scale == 0.0f && offset == 0.0f)
@@ -10910,6 +11202,7 @@ void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
         d_.destroy(old);
     });
     t.views.clear();
+    t.loads++; // (what the draws kept of its slots: SlotMemo)
     const VkDeviceSize bytes = image_bytes(image);
     count_texture_bytes(bytes, t.bytes);
     t.bytes = bytes;

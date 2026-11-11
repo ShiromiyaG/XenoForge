@@ -661,6 +661,15 @@ void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
     std::printf("rates: %6.1f s (guest %6.1f s): %6llu swaps, %5.1f/s, %6.0f draws/s, %4.0f resolves/s%s%s%s\n", wall,
                 g.kernel->uptime_ms() / 1000.0, (unsigned long long)swaps, (swaps - r.last_swaps) / dt,
                 (draws - r.last_draws) / dt, (resolves - r.last_resolves) / dt, renderer, resident, extra.c_str());
+    // the command processor's thread: its time running packets without its
+    // waits (WAIT_REG_MEM), a swap; what a frame's commands cost the host
+    const uint64_t run_ns = counts.run_ns.load(), wait_ns = counts.wait_ns.load();
+    if (swaps > r.last_swaps)
+        std::printf("commands: %.1f ms a swap (%.1f ms in waits)\n",
+                    (double(run_ns - r.last_run_ns) - double(wait_ns - r.last_wait_ns)) / 1e6 /
+                        double(swaps - r.last_swaps),
+                    double(wait_ns - r.last_wait_ns) / 1e6 / double(swaps - r.last_swaps));
+    r.last_run_ns = run_ns, r.last_wait_ns = wait_ns;
     std::fflush(stdout);
     r.last_wall = wall, r.last_swaps = swaps, r.last_draws = draws, r.last_resolves = resolves;
 }

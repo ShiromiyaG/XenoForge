@@ -36,8 +36,47 @@
 #include <cstdlib>
 #include <cstring>
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread();
+extern "C" __declspec(dllimport) int __stdcall QueryThreadCycleTime(void *, unsigned long long *);
+#else
+#include <time.h>
+#endif
+
 namespace xf::render {
 namespace {
+
+// The calling thread's processor time so far: what a repeated play's
+// commands cost the thread, without what it waits for (the GPU, a
+// pipeline). In ticks: the processor's cycles on Windows (the time stamp
+// counter's, counted while the thread runs), nanoseconds elsewhere;
+// cpu_ticks_a_second says how many make a second.
+uint64_t thread_cpu_ticks() {
+#ifdef _WIN32
+    unsigned long long cycles = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles);
+    return cycles;
+#else
+    timespec t{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return uint64_t(t.tv_sec) * 1000000000ull + uint64_t(t.tv_nsec);
+#endif
+}
+double cpu_ticks_a_second() {
+#ifdef _WIN32
+    // (the counter's rate against the clock, over a busy twentieth of a second)
+    static const double rate = [] {
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t c0 = thread_cpu_ticks();
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50)) {}
+        const uint64_t c1 = thread_cpu_ticks();
+        return double(c1 - c0) / std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }();
+    return rate;
+#else
+    return 1e9;
+#endif
+}
 
 // What the processor asks of the system, during a replay: nothing happens
 // between two polls, so a wait that does not match never will.
@@ -61,7 +100,9 @@ public:
             return;
         }
         auto start = std::chrono::steady_clock::now();
+        const uint64_t ticks = thread_cpu_ticks();
         processor_.execute_packets(address, count);
+        command_ticks_ += thread_cpu_ticks() - ticks;
         command_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     }
     void memory_read(uint32_t address, std::span<const uint8_t> bytes) override {
@@ -85,6 +126,7 @@ public:
 
     bool repeating_ = false;
     double command_seconds_ = 0; // in the processor, over the repeated plays
+    uint64_t command_ticks_ = 0; // the thread's processor time in it (thread_cpu_ticks)
 
 private:
     bool unchanged(uint32_t address, std::span<const uint8_t> bytes) const {
@@ -140,14 +182,18 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     std::map<std::string, Report::GpuTime> fastest_gpu_time;
     double fastest_gpu_seconds = -1;
     std::vector<double> command_seconds;
+    double command_cpu_seconds = 0;
     if (walked && repeat > 1) {
         renderer->drain();
         Report before = renderer->report();
         player.repeating_ = true;
+        uint64_t ticks = 0;
         for (uint32_t k = 1; k < repeat && walked; k++) {
             player.command_seconds_ = 0;
             walked = walk_gpu_trace(trace, player, error);
             command_seconds.push_back(player.command_seconds_);
+            ticks += player.command_ticks_, player.command_ticks_ = 0;
+            command_cpu_seconds = double(ticks) / cpu_ticks_a_second() / double(k);
             renderer->drain();
             Report after = renderer->report();
             double seconds = after.gpu_seconds - before.gpu_seconds;
@@ -173,6 +219,7 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     }
     report.packets = processor.counts().packets.load();
     report.command_seconds = std::move(command_seconds);
+    report.command_cpu_seconds = command_cpu_seconds;
     // XF_REPLAY_DUMP_MEMORY=<hex address>:<hex size>:<file>: that physical
     // memory after the trace, to set beside Xenia's and the reference's
     // (XF_REF_DUMP_MEMORY). What resolves wrote is in it with

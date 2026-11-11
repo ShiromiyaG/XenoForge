@@ -250,6 +250,7 @@ int main(int argc, char **argv) {
         std::sort(plays.begin(), plays.end());
         std::printf("  commands a play: %.3f ms median, %.3f ms fastest, of %zu plays\n",
                     plays[plays.size() / 2] * 1000, plays.front() * 1000, plays.size());
+        std::printf("  the thread's processor time a play: %.2f ms\n", report.command_cpu_seconds * 1000);
     }
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)
