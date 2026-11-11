@@ -1094,7 +1094,7 @@ defines it (`game_build.cpp`, `STACK_PROBE`), where the link failed.
 A title update is a content package of type 0x000B0000 whose files replace
 or patch the game's; an executable's patch is the file of its own path with
 a `p` added (`default.xexp`). `TitleUpdate` (`title_update.h`) opens one,
-finds a title's among content folders (`<root>\<title id> B0000\<file>`,
+finds a title's among content folders (`<root>\<title id>\000B0000\<file>`,
 the highest version) and gives an executable's patch; `apply_xex_patch`
 (`xex.h`, Xenia's `XexModule::ApplyPatch` with
 `KernelState::IsPatchSignatureProper`'s check first) applies it to the

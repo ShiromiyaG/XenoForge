@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <thread>
 
 namespace xf::sampler {
@@ -62,8 +63,9 @@ void stack_bounds(Sampled &s) {
 std::atomic<bool> running{false};
 std::thread worker;
 std::mutex mutex;
-std::map<uint64_t, uint64_t> weights; // rip -> cycles spent there (the interval's)
+std::map<uint64_t, uint64_t> weights; // rip -> samples of a thread there
 uint64_t total = 0;
+uint64_t cycles_spent = 0; // by the sampled threads, in all
 // with one thread sampled: each sample's stack (return addresses, the
 // interrupted rip first) and its cycles
 std::vector<std::pair<std::vector<uint64_t>, uint64_t>> stacks;
@@ -173,7 +175,7 @@ void sample_loop(unsigned interval_us, DWORD only) {
     refresh();
     auto last_refresh = std::chrono::steady_clock::now();
     std::map<uint64_t, uint64_t> local;
-    uint64_t local_total = 0;
+    uint64_t local_total = 0, local_cycles = 0;
     while (running.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
         for (auto it = threads.begin(); it != threads.end();) {
@@ -186,7 +188,11 @@ void sample_loop(unsigned interval_us, DWORD only) {
             }
             uint64_t spent = cycles - s.cycles;
             s.cycles = cycles;
-            // a thread that ran: where it is now stands for the interval's cycles
+            local_cycles += spent;
+            // a thread that ran since the last sample: where it is now, one
+            // sample (those found in a wait are left out of the report: a
+            // thread on a processor at the sample's instant is found there
+            // as often as it runs, however short its bursts)
             if (spent > 0 && SuspendThread(s.handle) != DWORD(-1)) {
                 // (nothing allocated until the thread runs again: walk's note)
                 CONTEXT ctx{};
@@ -197,10 +203,10 @@ void sample_loop(unsigned interval_us, DWORD only) {
                 if (got && only) depth = walk(ctx, frames, s.stack_low, s.stack_high);
                 ResumeThread(s.handle);
                 if (got) {
-                    local[ctx.Rip] += spent, local_total += spent;
+                    local[ctx.Rip] += 1, local_total += 1;
                     if (only) {
                         stack.assign(frames, frames + depth);
-                        local_stacks.emplace_back(stack, spent);
+                        local_stacks.emplace_back(stack, 1);
                     }
                 }
             }
@@ -216,6 +222,7 @@ void sample_loop(unsigned interval_us, DWORD only) {
     std::lock_guard lock(mutex);
     weights = std::move(local);
     total = local_total;
+    cycles_spent = local_cycles;
     stacks = std::move(local_stacks);
 }
 
@@ -233,12 +240,12 @@ bool generated_name(std::string n) {
     return true;
 }
 
-// A sample weighs the cycles its thread ran since the sample before, and they
-// go to where the thread is when sampled. A thread that works in short
-// bursts between waits is found waiting nearly every time, so its bursts'
-// cycles would all be read as the wait's own cost: a thread sampled in one of
-// the system's waits (the syscall's return) has them counted apart instead,
-// as work the samples did not see.
+// A thread that ran since the last sample is sampled where it is, and may by
+// then be waiting again (the syscall's return): one that works in short
+// bursts between waits is found so nearly every time. Those samples say
+// nothing of where its time went and are left out; the ones that find it
+// in a burst come as often as it runs, each counting the same.
+const char *const WAITING = "found waiting";
 bool waiting_name(const std::string &n) {
     if (n.size() < 3 || (n.compare(0, 2, "Nt") != 0 && n.compare(0, 2, "Zw") != 0)) return false;
     return n.find("Wait") != std::string::npos || n.find("DelayExecution") != std::string::npos ||
@@ -247,7 +254,7 @@ bool waiting_name(const std::string &n) {
 
 std::string category(const std::string &name, const std::string &module) {
     if (generated_name(name)) return "generated code";
-    if (waiting_name(name)) return "unseen: bursts of threads found waiting when sampled";
+    if (waiting_name(name)) return WAITING;
     if (name.find("ppc::ops::") != std::string::npos) return "instructions' cold paths";
     if (name.find("ppc::interpret") != std::string::npos || name.find("ppc_interp") != std::string::npos ||
         name.find("ppc::Interpreter") != std::string::npos)
@@ -344,6 +351,7 @@ void stop_and_report(size_t top) {
                     100.0 * double(total) / double(all));
         if (!total) return SymCleanup(process), void();
     }
+    std::set<uint64_t> waiting_at;
     for (auto &[rip, w] : weights) {
         auto *sym = reinterpret_cast<SYMBOL_INFO *>(buffer);
         std::memset(buffer, 0, sizeof(buffer));
@@ -362,8 +370,18 @@ void stop_and_report(size_t top) {
         f.offsets[displacement] += w;
         f.addresses[rip] += w;
         cats[f.cat] += w;
+        if (f.cat == WAITING) waiting_at.insert(rip);
     }
-    std::printf("profile: where the CPU time went (%llu Mcycles sampled)\n", (unsigned long long)(total / 1000000));
+    // the samples of threads found waiting, left out
+    const uint64_t waiting = cats.count(WAITING) ? cats[WAITING] : 0;
+    cats.erase(WAITING);
+    std::erase_if(fns, [](const auto &f) { return f.second.cat == WAITING; });
+    std::erase_if(stacks, [&](const auto &st) { return !st.first.empty() && waiting_at.count(st.first[0]); });
+    total -= waiting;
+    std::printf("profile: where the CPU time went (%llu Mcycles spent; %llu samples of threads running, %llu more "
+                "found waiting)\n",
+                (unsigned long long)(cycles_spent / 1000000), (unsigned long long)total, (unsigned long long)waiting);
+    if (!total) return SymCleanup(process), void();
     std::vector<std::pair<uint64_t, std::string>> by_cat;
     for (auto &[c, w] : cats) by_cat.push_back({w, c});
     std::sort(by_cat.rbegin(), by_cat.rend());
