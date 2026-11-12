@@ -198,9 +198,12 @@ std::string table_row_html(const RowInfo &r, bool selected) {
     return s + "</div></div>";
 }
 
-std::string empty_html(bool no_folder, bool filtered, const std::string &folder) {
+std::string empty_html(bool no_folder, bool filtered, bool loading, const std::string &folder) {
     std::string s = "<div class=\"empty\">";
-    if (filtered) {
+    if (loading) {
+        s += icon_html("loader-circle", "loading-ic spin") + "<div class=\"empty-title\">Reading your games...</div>";
+        if (!folder.empty()) s += "<div class=\"empty-text\">Looking through <b>" + e(folder) + "</b></div>";
+    } else if (filtered) {
         s += icon_html("search", "big-ic") + "<div class=\"empty-title\">No game matches the search</div>";
         s += "<div class=\"empty-text\">The title, the title ID and the disc's file name are searched.</div>";
         s += "<div class=\"empty-buttons\">" + button_html("clear-search", "Clear the search") + "</div>";

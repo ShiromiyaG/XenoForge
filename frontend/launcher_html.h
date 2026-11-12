@@ -56,7 +56,7 @@ std::string table_head_html(Column sort, bool ascending);
 std::string table_row_html(const RowInfo &row, bool selected);
 // what the table area says with nothing to list: no folder chosen, a folder
 // without games, or a filter that hides them all
-std::string empty_html(bool no_folder, bool filtered, const std::string &folder);
+std::string empty_html(bool no_folder, bool filtered, bool loading, const std::string &folder);
 
 // A dialog over the window: a title bar (with a close button), a body and a
 // row of buttons at the bottom.
