@@ -13,11 +13,17 @@ namespace xf::build {
 // The instruction set a CPU level allows (cpu_level.h). The statically
 // linked games and the tests take the same from XF_GAME_CPU_LEVEL
 // (cmake/xenoforge_port.cmake's xenoforge_cpu_level_flags).
-inline const char *cpu_level_flag(CpuLevel level) {
+//
+// At v3 the vectorizer is told to prefer 128-bit vectors: the guest's own
+// are 128-bit (VMX128), and widening its loops to 256 bits made the code
+// slower. Game B's deterministic benchmark (docs/runtime.md, "The CPU
+// level"; a Zen 3 processor): v3 11.16 s, v2 10.67, v3 with 128-bit vectors
+// preferred 10.08, v3 without MOVBE 11.17, v3 with no vectorizing 14.75.
+inline std::vector<const char *> cpu_level_flags(CpuLevel level) {
     switch (level) {
-    case CpuLevel::X86_64_V2: return "-march=x86-64-v2";
-    case CpuLevel::X86_64_V3: return "-march=x86-64-v3";
-    default: return nullptr; // ARM64: its baseline
+    case CpuLevel::X86_64_V2: return {"-march=x86-64-v2"};
+    case CpuLevel::X86_64_V3: return {"-march=x86-64-v3", "-mprefer-vector-width=128"};
+    default: return {}; // ARM64: its baseline
     }
 }
 
@@ -29,7 +35,7 @@ inline const char *cpu_level_flag(CpuLevel level) {
 inline std::vector<const char *> base_compile_flags(CpuLevel level) {
     std::vector<const char *> flags = {"-std=c++20",      "-O2",       "-g0",         "-w",
                                        "-fno-math-errno", "-nostdinc", "-nostdinc++", "-DXF_GAME_LIBRARY"};
-    if (const char *f = cpu_level_flag(level)) flags.push_back(f);
+    for (const char *f : cpu_level_flags(level)) flags.push_back(f);
 #ifndef _WIN32
     // position independent, only the entry exported, and no stack
     // protector (some distributions' clang turns it on; it needs the C

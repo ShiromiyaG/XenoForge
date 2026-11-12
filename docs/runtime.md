@@ -2872,10 +2872,23 @@ Measured (2026-11-12, a Zen 3 desktop processor, quiet machine): game B's
 deterministic benchmark (`--deterministic --spin-idle --until-swap 6000`,
 the scheduler's thread's processor time; the same guest work and memory
 hash at both levels), three rounds interleaved: v3 11.19, 11.09, 11.42 s;
-v2 10.67, 10.69, 10.70 s. The v2 library is about 4.5% faster here, with
-less spread. Not explained yet: which of v3's features costs (256-bit
-vectorization, MOVBE, the VEX encodings) is the next measurement; until
-then the level's default is still v3.
+v2 10.67, 10.69, 10.70 s: the v2 library about 4.5% faster. Then each of
+v3's suspects alone (statically linked game B built five ways, three rounds
+interleaved, the same hash in all; seconds):
+
+| flags | rounds | median |
+| --- | --- | --- |
+| v3 | 11.25, 11.16, 11.14 | 11.16 |
+| v2 | 10.67, 10.69, 10.64 | 10.67 |
+| v3, no MOVBE | 11.19, 11.17, 11.17 | 11.17 |
+| v3, 128-bit vectors preferred (`-mprefer-vector-width=128`) | 10.05, 10.08, 10.11 | 10.08 |
+| v3, no vectorizing (`-fno-vectorize -fno-slp-vectorize`) | 14.75, 14.78, 14.70 | 14.75 |
+
+The cost was the vectorizer widening loops to 256 bits (the guest's own
+vectors are 128-bit VMX128); vectorizing as such is worth a third. v3 now
+prefers 128-bit vectors (`game_build_flags.h`, `xenoforge_port.cmake`):
+9.7% faster than v3 was, 5.5% faster than v2. One processor measured; the
+choice follows the code's shape, not this processor's.
 
 **A build that never fails whole** (D2, 2026-11-07). Only a disc that
 cannot be read, one without `default.xex` (or whose `default.xex` has no PE
