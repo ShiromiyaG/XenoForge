@@ -67,6 +67,14 @@ void report(const TraceStats &s) {
     print_counts("color targets", s.color_formats, xenos::color_target_format_name);
     print_counts("depth", s.depth_formats, xenos::depth_target_format_name);
     print_counts("MSAA", s.msaa, msaa_name);
+    // the blends the host's fixed function differs on (TraceStats::min_max_blends)
+    for (const auto &[key, count] : s.min_max_blends)
+        std::printf("  %-18s%s target, factors %u and %u: %llu\n", "min/max blend",
+                    xenos::color_target_format_name(key >> 16), (key >> 8) & 0x1F, key & 0x1F,
+                    static_cast<unsigned long long>(count));
+    if (s.alpha_blends_16_16_16_16)
+        std::printf("  %-18s%llu targets blended by the source's alpha\n", "16_16_16_16",
+                    static_cast<unsigned long long>(s.alpha_blends_16_16_16_16));
     print_counts("resolves to", s.resolve_color_formats, xenos::format_name);
     if (s.resolves)
         std::printf("  %-18sdepth %llu, with a clear %llu\n", "resolves", static_cast<unsigned long long>(s.resolve_depth),

@@ -18,7 +18,10 @@
 // one): on the interlock path Xenia's own exact ones, XF_DUMPS/rov (its
 // Direct3D 12 ROV dump in rov/d3d12, its Vulkan FSI dump in rov itself:
 // `--render_target_path_d3d12=rov`, `--render_target_path_vulkan=fsi`), where
-// they are; on host render targets Xenia's default ones, as above.
+// they are; on host render targets Xenia's default ones, as above, and its
+// ROV one where those differ (host render targets at the Xenos's sample
+// positions, Options::xenos_sample_positions, draw antialiased edges as
+// Xenia's exact paths do, not as its host paths by default).
 //
 // With XF_REPLAY_SCALES=<percent>,<percent>... each trace is replayed again at
 // those resolution scales (docs/renderer.md, "Resolution scale"). Where
@@ -133,7 +136,7 @@ int main() {
         pictures /= "rov";
         std::printf("the interlock render target path: Xenia's ROV and FSI pictures (%s)\n", pictures.string().c_str());
     }
-    int compared = 0, vulkan_only = 0;
+    int compared = 0, vulkan_only = 0, rov_only = 0;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(traces)) {
         if (entry.path().extension() != ".xtr") continue;
         std::string name = entry.path().stem().string() + ".png";
@@ -170,6 +173,23 @@ int main() {
             }
         } else {
             passes = to_vulkan->passes();
+        }
+        if (!passes && pictures == dumps) {
+            // Host render targets take the Xenos's sample positions where
+            // the device places samples (Options::xenos_sample_positions),
+            // as Xenia's exact paths always do and its host paths do not by
+            // default: an antialiased frame's edges then match Xenia's ROV
+            // picture rather than its default one.
+            std::optional<Picture> rov = load(pictures / "rov" / "d3d12" / name);
+            if (rov) {
+                Difference to_rov = compare(frame.rgba.data(), frame.width, frame.height, *rov);
+                std::printf("; ROV mean %.3f, %.3f%% off", to_rov.mean, to_rov.share);
+                if (to_rov.passes()) {
+                    std::printf(" (matches Xenia's picture at the Xenos's sample positions)");
+                    passes = true;
+                    rov_only++;
+                }
+            }
         }
         std::printf("\n");
         CHECK(passes);
@@ -212,6 +232,7 @@ int main() {
     }
     std::printf("%d frames compared", compared);
     if (vulkan_only) std::printf(", %d matching Vulkan's picture only", vulkan_only);
+    if (rov_only) std::printf(", %d matching the ROV picture only", rov_only);
     std::printf("\n");
     return finish("replay");
 }

@@ -9623,14 +9623,21 @@ void Impl::draw(const gpu::Draw &d) {
         // index for the domain shader and the edge factor
         restart = false;
     } else if (primitive == 13) {
-        // quads to triangle pairs
+        // Quads to triangle pairs split along the 1-3 diagonal, as Xenia's
+        // geometry shaders make them (both backends' kQuadList: a strip of
+        // vertices 0, 1, 3, 2, as GL_QUAD_STRIP; the console's own split is
+        // not known): (0, 1, 3) and (1, 2, 3), each in the quad's winding,
+        // their first vertices the strip's provoking ones. A quad whose
+        // attributes are not affine over it (a billboard in perspective)
+        // interpolates differently on either side of the diagonal, so the
+        // other split moves alpha tested and alpha to coverage edges.
         std::vector<uint32_t> &triangles = draw_lists_.triangles;
         triangles.resize(indices.size() / 4 * 6);
         const uint32_t *quad = indices.data();
         uint32_t *triangle = triangles.data();
         for (size_t q = 0; q + 3 < indices.size(); q += 4, quad += 4, triangle += 6) {
-            triangle[0] = quad[0], triangle[1] = quad[1], triangle[2] = quad[2];
-            triangle[3] = quad[0], triangle[4] = quad[2], triangle[5] = quad[3];
+            triangle[0] = quad[0], triangle[1] = quad[1], triangle[2] = quad[3];
+            triangle[3] = quad[1], triangle[4] = quad[2], triangle[5] = quad[3];
         }
         indices.swap(triangles);
         if (indices.empty()) return;

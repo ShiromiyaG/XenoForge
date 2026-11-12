@@ -286,7 +286,8 @@ waited for only when the CPU needs what the GPU wrote (Decisions).
   -32..32, gamma targets written through the piecewise linear curve);
   the vertex fetches reading the copies of their ranges in the upload
   arena; indices swapped, offset, cut to 24 bits and clamped on the CPU
-  (quad lists split, strips restarted at the reset index); rectangle lists
+  (quad lists split along the 1-3 diagonal, as Xenia's geometry shaders,
+  strips restarted at the reset index); rectangle lists
   and point lists through geometry shaders, or expanded in the vertex
   shader without them (points as sprites of the vertex shader's clamped
   oPts.x or PA_SU_POINT_SIZE, as Xenia's); tessellated draws through hull
@@ -1402,6 +1403,48 @@ interpolators through InterpolateAtCentroid instead of the decoration
 (identical), an invariant position (identical; kept, as Xenia's outputs
 are invariant), and the samplers, made as Xenia's Vulkan backend makes
 them. The 29 frames of `replay_test` are unchanged.
+
+**Game G's vegetation: the quads' diagonal (2026-11-12).** What was left
+was not alpha to coverage itself: forcing its dither off (offsets all 2)
+moved the frame from 0.149% to 0.140% off Xenia's ROV picture, so the
+coverage's thresholds and dither were already Xenia's. Skipping ranges of
+draws and keeping, for each pixel off, the last range whose skipping
+changes it put most of them under the terrain drawn after the grass: the
+grass, quad lists of billboards whose pixel shader sets oC0's alpha to 0
+or 1 by a texture's alpha against a constant (`sge`), with alpha to
+coverage, let the terrain through in other pixels than Xenia's. Xenia's
+geometry shaders (both backends' `PipelineGeometryShader::kQuadList`)
+draw a quad as the strip of its vertices 0, 1, 3, 2, split along the 1-3
+diagonal; ours split along 0-2. A billboard in perspective whose texture
+coordinates are not affine over the quad interpolates differently on
+either side of the diagonal, so the alpha test moved. Now quads are
+(0, 1, 3) and (1, 2, 3), each in the quad's winding (the reference
+renderer too). The console's own split is not known (Xenia's TODO); the
+picture to match is Xenia's. Frames 850 and 950 (mean of 255, share off by
+more than 16): on the interlock path, against Xenia's ROV picture, 0.247
+and 0.247, 0.149% and 0.149% to 0.168 and 0.169, 0.033% and 0.032%; on
+host render targets (at the Xenos's sample positions, the default since
+2026-11-09), against the same ROV picture, 0.280, 0.162% (frame 850) to
+0.205 and 0.208, 0.047% and 0.050%, and with `XF_XENOS_SAMPLE_POSITIONS=0`
+against Xenia's default D3D12 picture 0.248, 0.153% (both frames) to 0.167
+and 0.168, 0.032% and 0.031%. The cactus's ribs went with them. The frames (and frame 600, a
+loading screen, 0.000) are in `replay_test`'s corpus; on host render
+targets the test now also takes Xenia's ROV picture where the default one
+is past the bound, as the host path's samples are where the ROV path's are
+(the default D3D12 picture is 1.95% off there, Xenia's two differing by
+1.93%).
+
+Tried and left out: anisotropic samplers filtered linearly everywhere, as
+Xenia's Direct3D 12 texture cache makes them (its `GetSamplerParameters`
+sets `mag_linear`, `min_linear` and `mip_linear` with any anisotropy, and
+`D3D12_FILTER_ANISOTROPIC` has no point modes; its Vulkan cache keeps the
+fetch constant's filters, as ours does). It took game G's frames from
+0.033% to 0.023% off, but game A's park and race frames, where Xenia's two
+backends already differ by 3.1 and which match Xenia's Vulkan FSI picture
+exactly (0.000), went to 5.04% off that one while staying 7.37% off the
+D3D12 one (6.78% before): Direct3D 12's anisotropic filter is not all
+that parts Xenia's two pictures there. Open until that difference is
+found.
 
 ## Shaders and pipelines at the launcher's build step (2026-11-07)
 
@@ -4141,6 +4184,14 @@ blend controls over an 8_8_8_8 target, each cell's color and alpha checked
 against the console's arithmetic on both paths, and the host's picture
 against the interlock path's (within 1 of 255; without the shader's form the
 same test is off by up to 204).
+
+`xftrace` counts these blends per target a draw writes (`TraceStats`'
+`min_max_blends`, by format and factors, and `alpha_blends_16_16_16_16`).
+Over all 132 recorded traces (2026-11-12) the only minimum or maximum with
+factors other than one is one of zero and one on 8_8_8_8 targets (23 to 35
+a frame in three of game D's), which the host already draws
+exactly; no trace blends a 16-bit target by a minimum or maximum with
+factors, nor a 16_16_16_16 target by the source's alpha. Both stay counted.
 
 **The Xenos's sample positions on host targets** (both hosts differ from the
 exact paths). What was left of the drive's differences lay along edges: the

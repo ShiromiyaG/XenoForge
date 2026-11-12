@@ -28,6 +28,13 @@ struct TraceStats {
     uint64_t draws = 0;
     Counts primitives, sources, edram_modes;
     Counts color_formats, depth_formats, msaa; // per draw that writes them
+    // Blends the host's fixed function cannot do as the console does, per
+    // target a draw writes: a minimum or maximum with factors other than one
+    // (the host ignores them), by the target's format << 16 | the source
+    // factor << 8 | the destination factor, for the color and the alpha
+    // halves alike; and a 16_16_16_16 target blended by the source's alpha.
+    Counts min_max_blends;
+    uint64_t alpha_blends_16_16_16_16 = 0;
     uint64_t resolves = 0, resolve_clears = 0;
     Counts resolve_color_formats; // destination format of color resolves
     uint64_t resolve_depth = 0;

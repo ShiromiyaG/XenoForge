@@ -17,7 +17,7 @@
 //   line strips and loops, quad strips and polygons (R6xx's VGT_* registers;
 //   Xenia's RemapAndConvertVertexIndices and its primitive processor's list).
 // - Primitives: lists, strips, fans, line loops closed by their first index,
-//   quads as two triangles, quad strips and polygons as OpenGL's (the
+//   quads as two triangles split along their 1-3 diagonal, quad strips and polygons as OpenGL's (the
 //   triangle strip and fan of their vertices: Mesa's a2xx and r600 give these
 //   types to GL_QUAD_STRIP and GL_POLYGON), rectangle lists with the fourth
 //   vertex mirrored across the longest edge (Xenia's geometry shader, the
@@ -755,9 +755,11 @@ void Renderer::Impl::draw(const uint32_t *regs, const gpu::Draw &d) {
                 break;
             }
             case 13:
+                // split along the 1-3 diagonal, as Xenia's quad list
+                // geometry shaders (a strip of vertices 0, 1, 3, 2)
                 for (size_t i = 0; i + 3 < n; i += 4) {
-                    prims.push_back({{run[i], run[i + 1], run[i + 2]}, 3});
-                    prims.push_back({{run[i], run[i + 2], run[i + 3]}, 3});
+                    prims.push_back({{run[i], run[i + 1], run[i + 3]}, 3});
+                    prims.push_back({{run[i + 1], run[i + 2], run[i + 3]}, 3});
                 }
                 break;
             }

@@ -185,8 +185,24 @@ private:
         if (color) {
             static const uint32_t infos[] = {reg::RB_COLOR_INFO, reg::RB_COLOR1_INFO, reg::RB_COLOR2_INFO,
                                              reg::RB_COLOR3_INFO};
-            for (int rt = 0; rt < 4; rt++)
-                if ((regs_[reg::RB_COLOR_MASK] >> (4 * rt)) & 0xF) s_.color_formats[(regs_[infos[rt]] >> 16) & 0xF]++;
+            static const uint32_t blends[] = {0x2201, 0x2209, 0x220A, 0x220B}; // RB_BLENDCONTROL0-3
+            for (int rt = 0; rt < 4; rt++) {
+                if (!((regs_[reg::RB_COLOR_MASK] >> (4 * rt)) & 0xF)) continue;
+                const uint32_t format = (regs_[infos[rt]] >> 16) & 0xF;
+                s_.color_formats[format]++;
+                const uint32_t blend = regs_[blends[rt]];
+                if ((blend & 0x1FFF1FFF) == 0x00010001) continue; // ONE, ADD, ZERO: no blending
+                bool by_source_alpha = false;
+                for (uint32_t shift : {0u, 16u}) {
+                    const uint32_t source = (blend >> shift) & 0x1F, op = (blend >> (shift + 5)) & 7,
+                                   destination = (blend >> (shift + 8)) & 0x1F;
+                    if ((op == 2 || op == 3) && !(source == 1 && destination == 1))
+                        s_.min_max_blends[format << 16 | source << 8 | destination]++;
+                    // SRC_ALPHA, ONE_MINUS_SRC_ALPHA
+                    by_source_alpha |= source == 4 || source == 5 || destination == 4 || destination == 5;
+                }
+                if (format == 5 && by_source_alpha) s_.alpha_blends_16_16_16_16++;
+            }
         }
 
         if (!have_vertex_ || (color && !have_pixel_)) s_.draws_without_shader++;
@@ -246,6 +262,8 @@ void TraceStats::merge(const TraceStats &o) {
     draws += o.draws;
     add(primitives, o.primitives), add(sources, o.sources), add(edram_modes, o.edram_modes);
     add(color_formats, o.color_formats), add(depth_formats, o.depth_formats), add(msaa, o.msaa);
+    add(min_max_blends, o.min_max_blends);
+    alpha_blends_16_16_16_16 += o.alpha_blends_16_16_16_16;
     resolves += o.resolves, resolve_clears += o.resolve_clears, resolve_depth += o.resolve_depth;
     add(resolve_color_formats, o.resolve_color_formats);
     shaders.insert(o.shaders.begin(), o.shaders.end());
