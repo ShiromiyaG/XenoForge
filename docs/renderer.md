@@ -2983,7 +2983,34 @@ size and the alpha by the exponent bias alone: 1.200 to 0.116 of 255 off
 Xenia's exact picture (0.772% of the pixels to 0.011%). A 16_16_16_16
 target stores its alpha, so it must be scaled there and a blend by the
 source's alpha is still off: it takes a second source for the blend
-(dual-source blending), not done.
+(dual-source blending), not done, and counted ("a 16_16_16_16 target
+blended by the source's alpha"); no frame at hand has one.
+
+**A float target's fixed alpha (2026-11-11, beyond Xenia's host path).**
+2_10_10_10_FLOAT keeps its alpha in two fixed bits, so the console takes
+the source's alpha to 0..1 before it blends by it (Xenia's exact paths:
+the format's fixed point alpha flag). The host keeps the target as
+RGBA16F, whose blend takes whatever alpha the shader gives. A game's
+scene is such a target, and the passes that lay its light shafts over it
+(the source plus the scene times the source's alpha) gave an alpha past 1:
+the lit part of the frame came out tinted, 3.041 of 255 off Xenia's exact
+picture with a tenth of the pixels off by more than 16, as Xenia's host
+picture (2.898). The shader now clamps the alpha it writes to such a
+target (the system flags' third word, bits 4-7, a bit a target, beside
+the gamma targets' bits 0-3): 0.296 of 255, 0.046% of the pixels; the
+scene later, 0.483 to 0.299.
+
+**Finding where two runs of a frame part: `XF_DUMP_RESOLVES=<directory>`**
+(with the full read-back, `xfreplay --readback-resolve full`) writes what
+each resolve put in guest memory, a file each
+(`<resolve's number>_<address>.bin`). The same frame replayed on the two
+render target paths (or by two builds) is then compared resolve by
+resolve, format by format (a 2_10_10_10 word's channels, a 16_16's): the
+first that differs by more than rounding names the pass a wrong picture
+begins in. Both errors above were found so: the first frame's texture
+turned out to be the scene's depth taken as a 16_16 color and blended
+into, not a mask; the second's first large difference was the scene
+itself, read as 2_10_10_10 a few passes after the blends.
 
 **Game G's frames 850 and 950, what is left** (0.149% and 0.150% of pixels
 off Xenia's ROV picture; Xenia's ROV and FSI pictures are 0.083% apart).
@@ -4165,17 +4192,19 @@ the mean difference of 255 and the pixels off by more than 16:
 | frame | exact path | host's render targets | Xenia's host picture against its exact one |
 | --- | --- | --- | --- |
 | C, the mission's night | 0.001, 0.000% | 0.009, 0.000% | |
-| E, a cutscene's light shafts | 0.198, 0.046% | 3.041, 9.947% | 2.898 (ours is 0.250 off Xenia's host picture) |
-| E, the same scene later | 0.082, 0.029% | 0.483, 0.171% | |
+| E, a cutscene's light shafts | 0.198, 0.046% | 0.296, 0.046% (3.041, 9.947% before "A float target's fixed alpha") | 2.898 |
+| E, the same scene later | 0.082, 0.029% | 0.299, 0.159% (0.483 before) | |
 | F, the terrain under a glare | 0.016, 0.011% (1.190 before "A draw that is counted and drawn") | 0.116, 0.011% (1.200 before "A 16_16 target's alpha") | 1.200 |
 | F, the flight | 0.008, 0.000% | 0.209, 0.000% | |
 | H, two frames of the scene | 0.000, 0.000% | 0.163 and 0.272, 0.000% | |
 
 The exact path draws Xenia's exact picture in all of them. The host's
 render targets, the player's default, drew Xenia's host picture, and with
-it its two errors here: game F's glare (fixed since, above) and game E's
-light shafts, a smooth tint over the lit part of the frame, which is still
-there and is where to go beyond Xenia on that path next.
+it its two errors here: game F's glare and game E's light shafts, a smooth
+tint over the lit part of the frame. Both are fixed since ("A 16_16
+target's alpha" and "A float target's fixed alpha"): the host path is
+within 0.3 of 255 of Xenia's exact picture in every frame of the table,
+where Xenia's own host path is 1.2 and 2.9 off in two of them.
 
 ## What is asked and not done is counted
 

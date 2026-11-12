@@ -9083,13 +9083,19 @@ bool Impl::draw_front(const gpu::Draw &d, DrawFront &f) {
         // 8_8_8_8_GAMMA: the shader writes linear into a target kept linear,
         // else the gamma curve (blended in gamma then, unlike the console)
         if (format == 1 && !colors[i]->gamma_linear) gamma_targets |= 1u << i;
+        // 2_10_10_10_FLOAT: its alpha is two fixed bits, so the console takes
+        // the source's alpha to 0..1 before it blends by it and stores it; the
+        // host keeps the target as float, whose blend takes any alpha (as
+        // Xenia's host path): the shader clamps it (the word's bits 4-7)
+        if (format == 3 || format == 12) gamma_targets |= 16u << i;
     }
     if (any_gamma) use("draws into 8_8_8_8_GAMMA color targets");
     // (a pixel shader's export runs for each host pixel: as many times more
     // as the scale's area, to the same addresses; Xenia's the same)
     if (!scale_.one() && ps && ps->exports)
         approximate("pixel shader memory export at a resolution scale (run once a host pixel)");
-    if (gamma_targets) approximate("8_8_8_8_GAMMA color targets blended in gamma (no RGBA16 unorm attachments)");
+    if (gamma_targets & 0xF)
+        approximate("8_8_8_8_GAMMA color targets blended in gamma (no RGBA16 unorm attachments)");
     uint32_t depth_control = export_only ? 0 : regs_[reg::RB_DEPTHCONTROL];
     RenderTarget *depth = nullptr;
     if (depth_control & 3) {
@@ -10048,6 +10054,20 @@ void Impl::draw(const gpu::Draw &d) {
             color_key.insert(color_key.end(), {i, uint32_t(color_formats[i])});
         else
             color_key.insert(color_key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
+    }
+    // A 16_16_16_16 target blended by the source's alpha ("A 16_16 target's
+    // alpha", renderer.md): its alpha is stored, so it is scaled by the fixed
+    // range, and so is the blend's factor, which should not be: counted (a
+    // second source for the blend would carry the alpha unscaled)
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!colors[i] || colors[i]->format != 5 || !blends[i].blendEnable) continue;
+        auto by_alpha = [](VkBlendFactor f) {
+            return f == VK_BLEND_FACTOR_SRC_ALPHA || f == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        };
+        const VkPipelineColorBlendAttachmentState &b = blends[i];
+        if (by_alpha(b.srcColorBlendFactor) || by_alpha(b.dstColorBlendFactor) || by_alpha(b.srcAlphaBlendFactor) ||
+            by_alpha(b.dstAlphaBlendFactor))
+            approximate("a 16_16_16_16 target blended by the source's alpha (scaled with the target's range)");
     }
     key.insert(key.end(), color_key.begin(), color_key.end());
     if (premultiplied) {
@@ -11648,6 +11668,19 @@ void Impl::read_back_resolve(const std::vector<Range> &written) {
         std::memcpy(memory_.data() + start, data + (start - first), end - start);
         report_.writeback_bytes += end - start;
         if (trace_) trace_->gpu_wrote(start, end - start);
+    }
+    // XF_DUMP_RESOLVES=<directory> (with the full read-back, Options::readback_resolve): what each
+    // resolve wrote, a file each (<resolve's number>_<address>.bin, the ranges one after the other),
+    // so that two runs of a frame (the two render target paths, two builds) are compared resolve by
+    // resolve and the first that differs names where a wrong picture begins
+    static const char *const dump = std::getenv("XF_DUMP_RESOLVES");
+    if (dump && *dump && !written.empty()) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "%05llu_%08X.bin", (unsigned long long)report_.resolves, written.front().first);
+        if (std::FILE *f = std::fopen((std::filesystem::path(dump) / name).string().c_str(), "wb")) {
+            for (auto [start, end] : written) std::fwrite(memory_.data() + start, 1, end - start, f);
+            std::fclose(f);
+        }
     }
 }
 

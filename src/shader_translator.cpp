@@ -2999,6 +2999,13 @@ void Translator::main_pixel() {
                                    {unscaled_alpha, exact(Op::OpFMul, float_, {size, f(32767.0f / 1024.0f)})});
             color = vec4_of(comp(color, 0), comp(color, 1), comp(color, 2),
                             select(float_, m_.op(Op::OpFOrdLessThan, bool_, {scale, f(0)}), blend_alpha, comp(color, 3)));
+            // (the flags' bits 4-7: a target whose alpha is fixed point in a float
+            // format, 2_10_10_10_FLOAT's two bits: clamped to 0..1 as the console
+            // clamps it before the blend, which the host's float target does not)
+            Id fixed_alpha = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {gamma_flags, u(16u << k)}), u(0)});
+            color = vec4_of(comp(color, 0), comp(color, 1), comp(color, 2),
+                            select(float_, fixed_alpha, glsl(GLSLstd450FClamp, float_, {comp(color, 3), f(0), f(1)}),
+                                   comp(color, 3)));
             if (pixel_.blend_premultiply) color = premultiplied(color, k);
             Id gamma = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {gamma_flags, u(1u << k)}), u(0)});
             if (lean) {
