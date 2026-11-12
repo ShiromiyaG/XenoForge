@@ -1857,8 +1857,14 @@ Four games in their campaigns, all threads: game C 74.9 ms of CPU a swap
 39 to 53 ms (a critical section entered, tried or left 120,000 times a
 second; one thread spends a seventh of its time in the floating point
 slow path's `fesetround`, `feclearexcept` and `fetestexcept`: the C
-library's, where the control register alone would do; to change with the
-generated code's headers next), game H 34 ms (two threads of vector code;
+library's, where the control register alone would do. Changed 2026-11-12:
+the control register is read and written inline (`lib::FpEnv`), and what
+sent that thread there, fmadds results on a tie between two singles (in
+an interpreted run of the game's start, 9 million in 150 s, nearly all of
+the slow path's entries; the thread itself not identified),
+now stays on the fast path when FRA and FRC are singles
+(`fp_single_untie`: under 65,536 slow path entries in the same run;
+docs/recompiler.md, "Floating point"), game H 34 ms (two threads of vector code;
 its render thread's wait for the vertical blank spins with the command
 processor idle: `XF_SPIN_IDLE=1`, kernel.cpp).
 
@@ -2675,10 +2681,14 @@ table holds the five calls the generated code makes (`dispatch`, `invalid`,
 with resume sites: docs/recompiler.md, "Stack switches") and the C library's
 pieces the instructions' semantics use: `memcpy`, `memmove` and `memset`
 (the compiler calls them on its own), `llrint` (fctiw and fctid's fast
-path), `exp2f` and `log2f` (vexptefp, vlogefp), `fmod`, and `fesetround`,
-`feclearexcept` and `fetestexcept` (the slow path of the FPU's arithmetic),
-with the rounding modes and flags in XenoForge's own numbering, translated
-by the runtime. Everything else the generated code needs comes in the
+path), `exp2f` and `log2f` (vexptefp, vlogefp), `fmod`, `fma` and `fmaf`
+(the fused multiply-adds of a library built for a CPU level without FMA),
+and `fesetround`, `feclearexcept` and `fetestexcept`, with the rounding
+modes and flags in XenoForge's own numbering, translated by the runtime:
+the slow path of the FPU's arithmetic uses them only on a host whose
+control register `lib::FpEnv` does not know (on x86-64 it reads and writes
+MXCSR inline, on ARM64 FPCR and FPSR: docs/recompiler.md, "Floating
+point"). Everything else the generated code needs comes in the
 `Context` each call is given: the registers, the guest memory's base, and
 the system's callbacks (`sc`, traps, `mftb`, MMIO). The rest of the
 standard library the ops used (`bit_cast`, `rotl`, `countl_zero`, `fma`,
@@ -2741,16 +2751,16 @@ but title updates and the system update's), `default.xex`'s image digest
 taken; discovery and emission in process (`recomp::emit_modules`, what
 `xfrecomp emit` writes) into `<cache>/work/<digest>/src`, the
 headers and the library's entry (`xf_library_entry.cpp`) beside them; each
-file compiled by its own clang process (`-std=c++20 -O2 -g0 -w -mfma
--mavx2 -fno-math-errno -nostdinc -nostdinc++ -DXF_GAME_LIBRARY`, the
-statically linked games' flags; never `-ffast-math`; on Linux also
+file compiled by its own clang process (`-std=c++20 -O2 -g0 -w
+-fno-math-errno -nostdinc -nostdinc++ -DXF_GAME_LIBRARY` and the CPU
+level's `-march`, the statically linked games' flags; never `-ffast-math`; on Linux also
 `-fPIC -fvisibility=hidden -fno-stack-protector`), 4 at once by default
 (`BuildOptions::jobs`: more ran out of memory on 16 GB), the largest files
 first, at below-normal priority with only its log inherited; then
 `lld-link /dll /noentry /nodefaultlib /opt:ref /Brepro` through a response
 file (`ld.lld -shared --eh-frame-hdr --gc-sections` on Linux).
-The library goes to `<cache>/<digest>-<version>.dll`, replacing any other
-version's for that digest. Progress is reported per module (discovery), per
+The library goes to `<cache>/<digest>-<version>-<level>.dll`, replacing any
+other version's or level's for that digest. Progress is reported per module (discovery), per
 file (emission and compiling) and for the link, always from the caller's
 thread; the cancel flag ends the compilers under way.
 
@@ -2773,8 +2783,31 @@ the version moved (a recompiler change that leaves the headers' code
 alone, or a comment edited). A change to the generated code's own
 semantics (an inline header's code) still recompiles everything, as it
 must: every function's code changes.
-The CPU must have AVX2 and FMA (checked first, `cpu_supported`).
-`find_cached(cache, digest)` finds `<digest>-<this version>.dll`.
+`find_cached(cache, digest)` finds `<digest>-<this version>-<level>.dll`
+at `game_cpu_level()`.
+
+**The CPU level** (2026-11-12, `cpu_level.h`). The library is built for the
+best level the player's CPU has, found by CPUID at build time
+(`host_cpu_level`): `v3` (x86-64-v3: AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C,
+with the OS saving the YMM state), else `v2` (x86-64-v2: SSE4.2, POPCNT,
+CMPXCHG16B, the floor), and `arm64` (its baseline) on ARM64; the build
+passes `-march=x86-64-v3` or `-march=x86-64-v2`. The plain x86-64 baseline
+is not a level: the generated code needs SSE4.1's rounding (`trunc`, which
+would be a C library call the library cannot make), and the CPUs it would
+add (before 2009) are too slow to run a game. The level is in the
+library's name, so a library built for another level is not found (and
+the launcher builds it again, as for a stale version), and the library
+exports it (`xf_game_library_cpu_level`, taken from the compiler's own
+macros): `load_game_library` reads it before any of the library's code
+runs and refuses a level this CPU lacks. `XF_GAME_CPU_LEVEL=v2` (or `v3`)
+forces the level the build makes and the cache is searched for;
+`xfbuild --cpu-level v2` builds one level (for tests: the runtime then
+finds it with the same `XF_GAME_CPU_LEVEL`, or by `--game-library`). The
+results are the same at every level: without FMA, `lib::fma` (the PPC's
+fused forms, the slow path's, and VMX's vmaddfp and vnmsubfp a lane at a
+time) is the C library's through the runtime's table: exact, slow. The
+statically linked games and the tests take `-DXF_GAME_CPU_LEVEL=v3|v2`
+(CMake cache, v3 by default; `cmake/xenoforge_port.cmake`).
 
 **A build that never fails whole** (D2, 2026-11-07). Only a disc that
 cannot be read, one without `default.xex` (or whose `default.xex` has no PE

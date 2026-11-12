@@ -29,8 +29,8 @@ void resumable(Context &c, ResumableBody body, uint32_t lr, uint32_t sp, const u
 
 namespace {
 
-// A game library's rounding modes and exception flags (ppc_runtime.h's
-// lib::, numbered its own way) as the host's <cfenv> numbers them
+// A game library's rounding modes and exception flags (numbered as
+// ppc_runtime.h's Runtime says) as the host's <cfenv> numbers them
 constexpr int HOST_ROUND[4] = {FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD};
 constexpr int HOST_EXCEPT[5] = {FE_INEXACT, FE_UNDERFLOW, FE_OVERFLOW, FE_DIVBYZERO, FE_INVALID};
 
@@ -65,6 +65,10 @@ Runtime core_runtime() {
     r.fesetround = [](int mode) { return std::fesetround(HOST_ROUND[mode & 3]); };
     r.feclearexcept = [](int flags) { return std::feclearexcept(to_host_flags(flags)); };
     r.fetestexcept = [](int flags) { return from_host_flags(std::fetestexcept(to_host_flags(flags))); };
+    // the C library's: the hardware's where the CPU has FMA, exact in
+    // software where it does not (the core is built for the baseline)
+    r.fma = [](double a, double b, double c) { return std::fma(a, b, c); };
+    r.fmaf = [](float a, float b, float c) { return std::fma(a, b, c); };
     return r;
 }
 

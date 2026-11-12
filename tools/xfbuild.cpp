@@ -7,7 +7,7 @@
 //
 //   xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
 //           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only]
-//           [--project <file.toml>]
+//           [--project <file.toml>] [--cpu-level v2|v3|arm64]
 //
 // The cache is game_build.h's default_cache_dir() unless named. --keep keeps
 // the work directory (the emitted code and the objects), --force builds even
@@ -23,6 +23,10 @@
 // step alone (no library built). --project emits with a port's project file
 // (docs/recompiler.md, "The project file": hook slots, names, starts); the
 // cached library is built again when it was made with another one or none.
+// --cpu-level builds for that CPU level (xenoforge/cpu_level.h) instead of the
+// best this CPU has (or XF_GAME_CPU_LEVEL's): for tests; the runtime finds
+// the library in the cache only at its own level (XF_GAME_CPU_LEVEL set the
+// same, or --game-library naming it).
 
 #include "xenoforge/game_build.h"
 #include "xenoforge/shader_step.h"
@@ -60,7 +64,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "usage: xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] "
                              "[--keep] [--force] [--cancel-after S] [--quiet] [--entry <hex>]... "
                              "[--no-entry-log] [--no-shaders] [--no-disc-shaders] [--disc-variants N] [--shaders-only] "
-                             "[--project <file.toml>]\n");
+                             "[--project <file.toml>] [--cpu-level v2|v3|arm64]\n");
         return 2;
     }
     std::filesystem::path disc = argv[1], cache = build::default_cache_dir();
@@ -96,7 +100,11 @@ int main(int argc, char **argv) {
             options.disc_variants = uint32_t(std::max(0, std::atoi(argv[++k])));
         else if (a == "--project" && k + 1 < argc)
             options.project = argv[++k];
-        else if (a == "--entry" && k + 1 < argc)
+        else if (a == "--cpu-level" && k + 1 < argc) {
+            std::optional<CpuLevel> level = parse_cpu_level(argv[++k]);
+            if (!level) return std::fprintf(stderr, "xfbuild: %s: not a CPU level (v2, v3, arm64)\n", argv[k]), 2;
+            options.cpu_level = *level;
+        } else if (a == "--entry" && k + 1 < argc)
             options.entries.push_back(uint32_t(std::strtoul(argv[++k], nullptr, 16)));
         else if (!a.starts_with("--") && k == 2)
             cache = a;
@@ -104,8 +112,10 @@ int main(int argc, char **argv) {
             return std::fprintf(stderr, "xfbuild: %s?\n", a.c_str()), 2;
     }
     auto toolchain = build::find_toolchain(options.toolchain);
-    std::printf("disc %s\ncache %s\ntoolchain %s, %u jobs\n", disc.string().c_str(), cache.string().c_str(),
-                toolchain ? toolchain->string().c_str() : "(none found)", options.jobs);
+    const CpuLevel level = options.cpu_level != CpuLevel::None ? options.cpu_level : game_cpu_level();
+    std::printf("disc %s\ncache %s\ntoolchain %s, %u jobs\nCPU level %s (this CPU: %s)\n", disc.string().c_str(),
+                cache.string().c_str(), toolchain ? toolchain->string().c_str() : "(none found)", options.jobs,
+                cpu_level_name(level), cpu_level_name(host_cpu_level()));
 
     std::atomic<bool> cancel{false};
     build::Progress progress;

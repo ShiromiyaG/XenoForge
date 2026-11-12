@@ -51,6 +51,7 @@ add_library(xenoforge STATIC
     src/gpu_trace.cpp
     src/game_build.cpp
     src/game_library.cpp
+    src/cpu_level.cpp
     src/shader_storage.cpp
     src/trace_stats.cpp
     src/ucode.cpp
@@ -600,7 +601,7 @@ add_executable(game_library_test tests/game_library_test.cpp tests/game_library/
 target_link_libraries(game_library_test PRIVATE xenoforge)
 target_compile_definitions(game_library_test PRIVATE
                            XF_GAME_LIBRARY_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/game_library")
-set_source_files_properties(tests/game_library/code.cpp PROPERTIES COMPILE_OPTIONS "-O2;-g0;-w;-mfma;-mavx2")
+set_source_files_properties(tests/game_library/code.cpp PROPERTIES COMPILE_OPTIONS "-O2;-g0;-w;${XF_GAME_CPU_FLAGS}")
 add_test(NAME game_library COMMAND game_library_test)
 set_tests_properties(game_library PROPERTIES TIMEOUT 300)
 # the recompile step on an executable the test makes: functions failing the
@@ -755,7 +756,7 @@ if(XF_PPC_TESTS_DIR)
         DEPENDS xfrecomp
         COMMENT "xfrecomp tests")
     # generated code: optimized, without debug information (it is large)
-    set_source_files_properties(${XF_PPC_TESTS_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-g0")
+    set_source_files_properties(${XF_PPC_TESTS_SOURCES} PROPERTIES COMPILE_OPTIONS "-O1;-g0;${XF_GAME_CPU_FLAGS}")
     add_executable(ppc_recompiled_test tests/ppc_test.cpp ${XF_PPC_TESTS_SOURCES})
     target_compile_definitions(ppc_recompiled_test PRIVATE XF_PPC_RECOMPILED)
     target_link_libraries(ppc_recompiled_test PRIVATE xenoforge)
@@ -778,7 +779,7 @@ add_custom_command(
     COMMAND xffuzz emit ${XF_FUZZ_OUT}/cases.xfz ${XF_FUZZ_OUT} --files 8
     DEPENDS xffuzz
     COMMENT "xffuzz gen and emit")
-set_source_files_properties(${XF_FUZZ_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-g0;-w;-mfma;-mavx2")
+set_source_files_properties(${XF_FUZZ_SOURCES} PROPERTIES COMPILE_OPTIONS "-O2;-g0;-w;${XF_GAME_CPU_FLAGS}")
 add_executable(ppc_fuzz_test tests/ppc_fuzz_test.cpp ${XF_FUZZ_SOURCES})
 target_compile_definitions(ppc_fuzz_test PRIVATE XF_FUZZ_CASES="${XF_FUZZ_OUT}/cases.xfz")
 target_link_libraries(ppc_fuzz_test PRIVATE xenoforge)

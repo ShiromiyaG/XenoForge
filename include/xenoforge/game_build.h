@@ -8,8 +8,11 @@
 // discovery and emission in process into a work directory under the cache,
 // then clang and lld (the toolchain beside the launcher, else an installed
 // LLVM) compiling the files in parallel and linking the library, which is
-// kept as <cache>/<digest>-<interface version>.dll (.so).
+// kept as <cache>/<digest>-<interface version>-<CPU level>.dll (.so; the
+// level as cpu_level.h names it: v3, v2, arm64).
 #pragma once
+
+#include "xenoforge/cpu_level.h"
 
 #include <atomic>
 #include <cstdint>
@@ -41,6 +44,7 @@ struct CachedGame {
     std::filesystem::path library; // the DLL (.so) to load
     std::string digest;            // the executable's image digest, as the launcher's library shows it
     uint32_t interface_version = 0;
+    CpuLevel cpu_level = CpuLevel::None; // what it was built for
 };
 
 // where the cache lives by default (%LOCALAPPDATA%\xenoforge\cache, or
@@ -64,7 +68,7 @@ bool prepare_game(const std::filesystem::path &disc, const std::filesystem::path
 // that cannot be read, a disc without default.xex, a missing toolchain or a
 // fault in XenoForge's own files fails. What was left out, and how many of
 // the entry log's lines the build took in, are kept beside the library:
-// <cache>/<digest>-<interface version>.build.txt.
+// <cache>/<digest>-<interface version>-<CPU level>.build.txt.
 //
 // The runtime logs each address it enters the interpreter at as a function
 // (D3) in <cache>/<digest>.entries.txt (EntryLog: one address in hex per
@@ -191,6 +195,11 @@ struct BuildOptions {
     // library cached for the executable is built again when it was made
     // with another project file, or none (BuildReport::project).
     std::filesystem::path project;
+    // The CPU level to build for (cpu_level.h); None: game_cpu_level(), the
+    // best this CPU has unless XF_GAME_CPU_LEVEL says. A level this CPU lacks
+    // fails the build. The library is kept under its level's name, which
+    // find_cached looks for at game_cpu_level() alone.
+    CpuLevel cpu_level = CpuLevel::None;
 };
 bool prepare_game(const std::filesystem::path &disc, const std::filesystem::path &cache_dir, Progress &progress,
                   std::string &error, const BuildOptions &options);
@@ -210,8 +219,8 @@ bool build_library(const std::filesystem::path &src_root, const std::vector<std:
 // ships), then an installed LLVM (%ProgramFiles%\LLVM\bin) and the PATH.
 std::optional<std::filesystem::path> find_toolchain(const std::filesystem::path &hint = {});
 
-// whether this CPU runs what the build makes (AVX2 and FMA, as the
-// statically linked games are built); why not when it does not
+// whether this CPU runs what the build makes for game_cpu_level() (at least
+// x86-64-v2, cpu_level.h); why not when it does not
 bool cpu_supported(std::string &why);
 
 } // namespace xf::build

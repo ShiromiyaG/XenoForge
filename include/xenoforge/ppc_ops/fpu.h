@@ -7,8 +7,9 @@
 // FPSCR[RN] is not round to nearest, when the result is not ordinary (a NaN,
 // or a denormal in its format, which FPSCR[NI] would flush), and in the
 // fused single forms when the double result sits on a tie between two
-// singles. fp_arith does what the console does: the rounding mode (the
-// host's <cfenv> around the operation), non-IEEE mode flushing denormal
+// singles and FRA or FRC is not a single (fp_single_untie). fp_arith does
+// what the console does: the rounding mode (the host's control register
+// around the operation, lib::FpEnv), non-IEEE mode flushing denormal
 // results to zero (Xenia's FTZ), NaN operands looked for in A, B, C order
 // and quieted, the positive default NaN (the host's is negative), one
 // rounding to single (round to odd in double first), and in the Rc forms the
@@ -122,21 +123,31 @@ enum : uint32_t {
 };
 
 // The operation in the host's current rounding mode (the negated forms are
-// negated after rounding, by the caller)
+// negated after rounding, by the caller). Strict floating point, with the
+// builtins called here rather than through lib:: (whose bodies are not
+// strict: inlined, their operations could move across lib::FpEnv's writes);
+// a game library without hardware FMA calls the C library's through the
+// runtime's table, a call nothing moves across either.
 inline double fp_compute(uint32_t kind, double a, double b, double c) {
 #ifdef __clang__
 #pragma STDC FENV_ACCESS ON
+#endif
+#if XF_HARDWARE_FMA || !defined(XF_GAME_LIBRARY)
+#define XF_FP_FMA __builtin_fma
+#else
+#define XF_FP_FMA lib::fma
 #endif
     switch (kind) {
     case FP_ADD: return a + b;
     case FP_SUB: return a - b;
     case FP_MUL: return a * c;
     case FP_DIV: return a / b;
-    case FP_SQRT: return lib::sqrt(b);
+    case FP_SQRT: return __builtin_sqrt(b);
     case FP_MADD:
-    case FP_NMADD: return lib::fma(a, c, b);
+    case FP_NMADD: return XF_FP_FMA(a, c, b);
     case FP_MSUB:
-    case FP_NMSUB: return lib::fma(a, c, -b);
+    case FP_NMSUB: return XF_FP_FMA(a, c, -b);
+#undef XF_FP_FMA
     case FP_RSP: return b;
     case FP_RES: return 1.0 / b;
     default: return double(lib::bit_cast<int64_t>(b)); // FP_CFID
@@ -225,33 +236,39 @@ inline double fp_arith_core(uint32_t fpscr, uint32_t op, bool rc, double a, doub
         if (rc) recorded = fp_recorded(fpscr, exceptions, 0x11u << 12, FPSCR_FR | FPSCR_FI | FPSCR_FPRF);
         return fp_double(FP_DEFAULT_NAN);
     }
-    static constexpr int MODES[4] = {lib::ROUND_NEAREST, lib::ROUND_ZERO, lib::ROUND_UP, lib::ROUND_DOWN};
-    const int mode = MODES[fpscr & FPSCR_RN];
+    // the host's environment (lib::FpEnv: its control register, read once
+    // and written when the value changes)
+    static constexpr decltype(lib::ROUND_NEAREST) MODES[4] = {lib::ROUND_NEAREST, lib::ROUND_ZERO, lib::ROUND_UP,
+                                                              lib::ROUND_DOWN};
+    const auto mode = MODES[fpscr & FPSCR_RN];
+    lib::FpEnv env;
     double r, rz = 0; // rz: toward zero, for FR
-    int flags;
+    uint32_t flags = 0;
     if (!single) {
-        lib::fesetround(mode);
-        lib::feclearexcept(lib::EXCEPT_ALL);
+        // without Rc the flags are not needed (the NI flush below adds its own)
+        if (rc)
+            env.start(mode);
+        else
+            env.round(mode);
         r = fp_compute(kind, a, b, cc);
-        flags = lib::fetestexcept(lib::EXCEPT_ALL);
-        if (rc) lib::fesetround(lib::ROUND_ZERO), rz = fp_compute(kind, a, b, cc);
+        if (rc) flags = env.flags(), env.round(lib::ROUND_ZERO), rz = fp_compute(kind, a, b, cc);
     } else {
         // toward zero and odd if inexact: one rounding to single below
-        lib::fesetround(lib::ROUND_ZERO);
-        lib::feclearexcept(lib::EXCEPT_ALL);
+        env.start(lib::ROUND_ZERO);
         double d = fp_compute(kind, a, b, cc);
-        flags = lib::fetestexcept(lib::EXCEPT_ALL);
-        lib::fesetround(mode);
+        flags = env.flags();
+        // the guest's mode, and the flags of the rounding to single alone (an
+        // exact zero computed again raises none)
+        env.start(mode);
         if (flags & lib::EXCEPT_INEXACT)
             d = fp_double(fp_bits(d) | 1);
         else if (d == 0)
             d = fp_compute(kind, a, b, cc); // an exact zero's sign is the mode's
-        lib::feclearexcept(lib::EXCEPT_ALL);
         r = double(float(d));
-        flags |= lib::fetestexcept(lib::EXCEPT_ALL);
-        if (rc) lib::fesetround(lib::ROUND_ZERO), rz = double(float(d));
+        flags |= env.flags();
+        if (rc) env.round(lib::ROUND_ZERO), rz = double(float(d));
     }
-    lib::fesetround(lib::ROUND_NEAREST);
+    env.end();
     if (kind == FP_NMADD || kind == FP_NMSUB) r = -r, rz = -rz;
     if ((fpscr & FPSCR_NI) && r != 0 && lib::fabs(r) < (single ? 0x1p-126 : 0x1p-1022)) {
         r = rz = lib::copysign(0.0, r);
@@ -297,6 +314,23 @@ XF_INLINE bool fp_plain(Context &c, bool rc, uint32_t kind, double r) {
 // a double exactly halfway between two singles (normal ones): rounding the
 // fused result again could round the wrong way
 XF_INLINE bool fp_single_tie(double d) { return (uint32_t(fp_bits(d)) & 0x1FFFFFFF) == 0x10000000; }
+// A fused single form's double result d = fma(a, c, addend) on such a tie,
+// moved off it toward the exact result, so that rounding it to single
+// rounds as the exact result does; false when that cannot be told here
+// (then the slow path). It can when FRA and FRC are singles, as lfs and the
+// single forms leave them: their product is then exact in double (48
+// significant bits, the exponent far inside double's range), so d is the
+// rounded sum of two doubles, whose error TwoSum gives exactly. An exact tie
+// stays (the conversion's ties-to-even is the console's); otherwise d moves
+// one double ulp toward the error, off the tie and nowhere near the next one.
+// (A game's start sent 9 million fmadds a run to the slow path on ties.)
+XF_INLINE bool fp_single_untie(double a, double c, double addend, double &d) {
+    if ((fp_bits(a) | fp_bits(c)) & 0x1FFFFFFF) return false;
+    const double p = a * c; // exact
+    const double t = d - p, e = (p - (d - t)) + (addend - t);
+    if (e != 0) d = fp_double(fp_bits(d) + ((e > 0) == (d > 0) ? 1 : uint64_t(-1)));
+    return true;
+}
 // No double-denormal operand in a single form (fp_arith has the console's
 // rule for them); a double form asks nothing (kind without FP_SINGLE). The
 // smallest magnitude is compared once; only when it is that small (a zero
@@ -333,9 +367,11 @@ XF_FP_BINARY(fdivsx, FP_DIV | FP_SINGLE, double(float(a / b)), FRB)
 #define XF_FP_FUSED(name, kind, sign, addend)                                                                          \
     XF_OP(name) {                                                                                                      \
         double a = c.f[i.A.FRA], b = c.f[i.A.FRB], cc = c.f[i.A.FRC], d = lib::fma(a, cc, addend);                     \
+        bool tie = (kind) & FP_SINGLE && fp_single_tie(d);                                                             \
+        if (tie) [[unlikely]]                                                                                          \
+            tie = !fp_single_untie(a, cc, addend, d);                                                                  \
         double r = sign((kind) & FP_SINGLE ? double(float(d)) : d);                                                    \
-        if (fp_plain(c, i.A.Rc, kind, r) && !((kind) & FP_SINGLE && fp_single_tie(d)) &&                               \
-            fp_ordinary_operands(kind, a, b, cc)) [[likely]]                                                           \
+        if (fp_plain(c, i.A.Rc, kind, r) && !tie && fp_ordinary_operands(kind, a, b, cc)) [[likely]]                   \
             c.f[i.A.FRT] = r;                                                                                          \
         else                                                                                                           \
             c.f[i.A.FRT] = fp_slow(c, kind, i.A.Rc, a, b, cc);                                                         \

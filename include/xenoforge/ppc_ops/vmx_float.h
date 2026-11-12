@@ -87,7 +87,7 @@ template <bool J = false> inline uint32_t mul(uint32_t a, uint32_t b) {
 }
 // vmaddfp: a * c + b rounded once, as Xenia's MUL_ADD (vfmadd213ps); the
 // console fuses too (rounding the product first fails 588 of the 15600 tests).
-// lib::fma is one instruction where the build has FMA, a libm call otherwise.
+// lib::fma is one instruction where the build has FMA, the C library's otherwise.
 template <bool J = false> inline uint32_t madd(uint32_t a, uint32_t b, uint32_t c) {
     a = flush_j<J>(a), b = flush_j<J>(b), c = flush_j<J>(c);
     if (is_nan(a) || is_nan(b) || is_nan(c)) return quiet(is_nan(a) ? a : is_nan(b) ? b : c);
@@ -168,13 +168,24 @@ template <bool J = false> inline Vec128 mul4(const Vec128 &a, const Vec128 &b) {
         return lanes(a, b, mul<false>);
     return store4(result4(F4(x) * F4(y)));
 }
+// a * c + b in each lane, rounded once: one instruction where the build has
+// FMA; else lib::fma a lane at a time (the vector builtin would call the C
+// library's fmaf, which a game library does not have)
+inline F4 fma4(F4 a, F4 b, F4 c) {
+#if XF_HARDWARE_FMA
+    return __builtin_elementwise_fma(a, b, c);
+#else
+    return F4{lib::fma(a[0], b[0], c[0]), lib::fma(a[1], b[1], c[1]), lib::fma(a[2], b[2], c[2]),
+              lib::fma(a[3], b[3], c[3])};
+#endif
+}
 // a * c + b, rounded once (madd above)
 template <bool J = false> inline Vec128 madd4(const Vec128 &a, const Vec128 &b, const Vec128 &c) {
     if constexpr (J) return lanes(a, b, c, madd<true>);
     const U4 x = flush4(load4(a)), y = flush4(load4(b)), z = flush4(load4(c));
     if (any_nan4(x) || any_nan4(y) || any_nan4(z)) [[unlikely]]
         return lanes(a, b, c, madd<false>);
-    return store4(result4(__builtin_elementwise_fma(F4(x), F4(z), F4(y))));
+    return store4(result4(fma4(F4(x), F4(z), F4(y))));
 }
 // -(a * c - b), rounded once (nmsub above: the sign of a zero result is the negation's)
 template <bool J = false> inline Vec128 nmsub4(const Vec128 &a, const Vec128 &b, const Vec128 &c) {
@@ -182,7 +193,7 @@ template <bool J = false> inline Vec128 nmsub4(const Vec128 &a, const Vec128 &b,
     const U4 x = flush4(load4(a)), y = flush4(load4(b)), z = flush4(load4(c));
     if (any_nan4(x) || any_nan4(y) || any_nan4(z)) [[unlikely]]
         return lanes(a, b, c, nmsub<false>);
-    return store4(result4(-__builtin_elementwise_fma(F4(x), F4(z), -F4(y))));
+    return store4(result4(-fma4(F4(x), F4(z), -F4(y))));
 }
 
 // the greater, +0 above -0 (max above); the lesser, -0 below +0 (min above)

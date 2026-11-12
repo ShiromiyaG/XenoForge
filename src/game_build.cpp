@@ -46,10 +46,8 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <intrin.h>
 #include <windows.h>
 #else
-#include <cpuid.h>
 #include <csignal>
 #include <fcntl.h>
 #include <spawn.h>
@@ -104,11 +102,11 @@ constexpr const char *LIBRARY_EXTENSION = ".so", *OBJECT_EXTENSION = ".o", *EXE 
 
 // What each file is compiled with (game_build_flags.h) and the interface
 // version
-std::vector<std::string> compile_flags() {
+std::vector<std::string> compile_flags(CpuLevel level) {
     char version[64];
     std::snprintf(version, sizeof(version), "-DXF_GAME_INTERFACE_VERSION=0x%08Xu", XF_GAME_INTERFACE_VERSION);
     std::vector<std::string> flags;
-    for (const char *f : base_compile_flags()) flags.push_back(f);
+    for (const char *f : base_compile_flags(level)) flags.push_back(f);
     flags.push_back(version);
     return flags;
 }
@@ -129,12 +127,31 @@ std::string hex_version() {
     return b;
 }
 
-fs::path library_path(const fs::path &cache, const std::string &digest) {
-    return cache / (digest + "-" + hex_version() + LIBRARY_EXTENSION);
+// <digest>-<interface version>-<CPU level>: a library is found only by a
+// XenoForge of its interface, on a CPU of its level (cpu_level.h)
+std::string library_stem(const std::string &digest, CpuLevel level) {
+    return digest + "-" + hex_version() + "-" + cpu_level_name(level);
+}
+fs::path library_path(const fs::path &cache, const std::string &digest, CpuLevel level) {
+    return cache / (library_stem(digest, level) + LIBRARY_EXTENSION);
 }
 // what the build left out and took in, beside the library
-fs::path report_path(const fs::path &cache, const std::string &digest) {
-    return cache / (digest + "-" + hex_version() + ".build.txt");
+fs::path report_path(const fs::path &cache, const std::string &digest, CpuLevel level) {
+    return cache / (library_stem(digest, level) + ".build.txt");
+}
+// a build report file (read_build_report)
+std::optional<BuildReport> read_report(const fs::path &file);
+// the level a build is for: the one asked for, else game_cpu_level()
+CpuLevel build_level(const BuildOptions &options) {
+    return options.cpu_level != CpuLevel::None ? options.cpu_level : game_cpu_level();
+}
+// why a build for `level` cannot be used here (empty when it can)
+std::string level_refused(CpuLevel level) {
+    if (cpu_has_level(level)) return "";
+    if (host_cpu_level() == CpuLevel::None)
+        return "this CPU lacks x86-64-v2 (SSE4.2, POPCNT), the oldest level the generated code is built for";
+    return std::string("this CPU lacks the CPU level ") + cpu_level_name(level) + " asked for (it has " +
+           cpu_level_name(host_cpu_level()) + ")";
 }
 constexpr const char *REPORT_EXTENSION = ".build.txt";
 
@@ -695,7 +712,8 @@ void write_disc_shaders(const fs::path &path, const std::string &stamp, const Sh
 
 class Build {
   public:
-    Build(Progress &progress, const BuildOptions &options) : progress_(progress), options_(options) {}
+    Build(Progress &progress, const BuildOptions &options)
+        : progress_(progress), options_(options), level_(build_level(options)) {}
 
     bool cancelled() const { return progress_.cancel && progress_.cancel->load(); }
     void report(Stage stage, uint64_t done, uint64_t total, std::string_view detail) {
@@ -742,13 +760,14 @@ class Build {
 
     Progress &progress_;
     const BuildOptions &options_;
+    const CpuLevel level_; // what the library is built for
     std::map<std::string, std::string> module_paths_;
 };
 
 bool Build::compile_and_link(const fs::path &src_root, const std::vector<std::string> &sources, const fs::path &work,
                              const fs::path &out, std::string &error) {
     std::string why;
-    if (!cpu_supported(why)) return fail(error, why);
+    if (std::string refused = level_refused(level_); !refused.empty()) return fail(error, refused);
     std::optional<fs::path> bin = find_toolchain(options_.toolchain);
     if (!bin)
         return fail(error, "no clang and lld found (toolchain/bin beside the launcher, XF_TOOLCHAIN, an installed "
@@ -769,7 +788,7 @@ bool Build::compile_and_link(const fs::path &src_root, const std::vector<std::st
         uint64_t key = 0xCBF29CE484222325ull;
         auto mix = [&key](std::string_view s) { key = text_key(s, key); };
         for (const Header &h : HEADERS) mix(h.name), mix(code_of(h.text));
-        for (const std::string &f : compile_flags())
+        for (const std::string &f : compile_flags(level_))
             if (!f.starts_with("-DXF_GAME_INTERFACE_VERSION=")) mix(f);
         // the compiler, by its size and time: another clang makes another
         // object of the same text
@@ -838,7 +857,7 @@ void Build::force_failures(const std::vector<Job> &jobs) {
 
 bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error) {
     std::string why;
-    if (!cpu_supported(why)) return fail(error, why);
+    if (std::string refused = level_refused(level_); !refused.empty()) return fail(error, refused);
     report(Stage::Reading, 0, 0, utf8(disc.filename()));
     if (!options_.shaders_only && !find_toolchain(options_.toolchain))
         return fail(error, "no clang and lld found (toolchain/bin beside the launcher, XF_TOOLCHAIN, an installed "
@@ -858,7 +877,7 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     if (!parse_xex(executable->file, xex, why) || !load_xex_image(executable->file, xex, why))
         return fail(error, executable->path + ": " + why);
     const std::string digest = hex_digest(image_digest(xex.image));
-    const fs::path library = library_path(cache, digest);
+    const fs::path library = library_path(cache, digest, level_);
     std::error_code ec;
     // the port's project file, read first: what it says is part of what the
     // cached library must have been made with
@@ -876,12 +895,12 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
         report(Stage::Done, 1, 1, "");
         return true;
     }
-    const bool same_project = read_build_report(cache, digest).value_or(BuildReport{}).project == project_digest;
+    const bool same_project = read_report(report_path(cache, digest, level_)).value_or(BuildReport{}).project == project_digest;
     if ((options_.shaders_only || (!options_.force && same_project)) && fs::exists(library, ec)) {
-        BuildReport found = read_build_report(cache, digest).value_or(BuildReport{});
+        BuildReport found = read_report(report_path(cache, digest, level_)).value_or(BuildReport{});
         if (options_.shader_step) {
             shaders(disc, cache, xex, digest, found);
-            write_report(report_path(cache, digest), library, found);
+            write_report(report_path(cache, digest, level_), library, found);
         }
         if (options_.report) *options_.report = found;
         report(Stage::Done, 1, 1, utf8(library));
@@ -948,12 +967,12 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     if (ec) return fail(error, "cannot move the library into " + utf8(library) + ": " + ec.message());
     result.left_out = left_;
     if (options_.shader_step) shaders(disc, cache, xex, digest, result);
-    if (!write_report(report_path(cache, digest), library, result))
-        return fail(error, "cannot write " + utf8(report_path(cache, digest)));
+    if (!write_report(report_path(cache, digest, level_), library, result))
+        return fail(error, "cannot write " + utf8(report_path(cache, digest, level_)));
     if (options_.report) *options_.report = result;
     for (const auto &entry : fs::directory_iterator(cache, ec)) {
         const std::string name = utf8(entry.path().filename());
-        if (name.starts_with(digest + "-") && entry.path() != library && entry.path() != report_path(cache, digest) &&
+        if (name.starts_with(digest + "-") && entry.path() != library && entry.path() != report_path(cache, digest, level_) &&
             (name.ends_with(LIBRARY_EXTENSION) || name.ends_with(REPORT_EXTENSION)))
             fs::remove(entry.path(), ec);
     }
@@ -1021,7 +1040,7 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
     }
     const uint64_t total = batch.size();
     report(Stage::Compiling, done, total, done ? std::to_string(done) + " compiled before" : "");
-    const std::vector<std::string> flags = compile_flags();
+    const std::vector<std::string> flags = compile_flags(level_);
     const std::string include = "-I" + utf8(work / "include");
     // The generated code's header precompiled once for the functions files
     // (each parsed it again: 0.55 s of clang a file, a tenth of an ordinary
@@ -1324,16 +1343,23 @@ fs::path default_cache_dir() {
 std::optional<CachedGame> find_cached(const fs::path &cache_dir, std::string_view digest) {
     const std::string normal = normal_digest(digest);
     if (normal.empty()) return std::nullopt;
-    const fs::path library = library_path(cache_dir, normal);
+    const CpuLevel level = game_cpu_level();
+    const fs::path library = library_path(cache_dir, normal, level);
     std::error_code ec;
     if (!fs::is_regular_file(library, ec)) return std::nullopt;
-    return CachedGame{library, normal, XF_GAME_INTERFACE_VERSION};
+    return CachedGame{library, normal, XF_GAME_INTERFACE_VERSION, level};
 }
 
 std::optional<BuildReport> read_build_report(const fs::path &cache_dir, std::string_view digest) {
     const std::string normal = normal_digest(digest);
     if (normal.empty()) return std::nullopt;
-    std::ifstream f(report_path(cache_dir, normal), std::ios::binary);
+    return read_report(report_path(cache_dir, normal, game_cpu_level()));
+}
+
+namespace {
+
+std::optional<BuildReport> read_report(const fs::path &file) {
+    std::ifstream f(file, std::ios::binary);
     if (!f) return std::nullopt;
     BuildReport r;
     std::string line;
@@ -1358,6 +1384,8 @@ std::optional<BuildReport> read_build_report(const fs::path &cache_dir, std::str
     }
     return r;
 }
+
+} // namespace
 
 fs::path entry_log_path(const fs::path &cache_dir, std::string_view digest) {
     std::string normal = normal_digest(digest);
@@ -1490,33 +1518,8 @@ std::optional<fs::path> find_toolchain(const fs::path &hint) {
 }
 
 bool cpu_supported(std::string &why) {
-    // FMA (CPUID 1, ECX bit 12) and AVX2 (CPUID 7, EBX bit 5), with the OS
-    // saving the YMM registers (OSXSAVE, then XCR0's bits 1 and 2)
-    unsigned regs[4] = {};
-#ifdef _WIN32
-    int r[4];
-    __cpuid(r, 1);
-    std::memcpy(regs, r, sizeof(r));
-#else
-    __get_cpuid(1, &regs[0], &regs[1], &regs[2], &regs[3]);
-#endif
-    const bool fma = regs[2] & (1u << 12), osxsave = regs[2] & (1u << 27);
-#ifdef _WIN32
-    __cpuidex(r, 7, 0);
-    std::memcpy(regs, r, sizeof(r));
-#else
-    __get_cpuid_count(7, 0, &regs[0], &regs[1], &regs[2], &regs[3]);
-#endif
-    const bool avx2 = regs[1] & (1u << 5);
-    bool ymm = false;
-    if (osxsave) {
-        unsigned lo, hi;
-        __asm__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-        ymm = (lo & 6) == 6;
-    }
-    if (fma && avx2 && ymm) return true;
-    why = "this CPU lacks AVX2 or FMA, which the generated code is built for";
-    return false;
+    why = level_refused(game_cpu_level());
+    return why.empty();
 }
 
 } // namespace xf::build

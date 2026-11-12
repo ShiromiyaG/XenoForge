@@ -42,6 +42,9 @@ using GameLibraryEntry = const GameLibrary *(*)(const Runtime *runtime);
 
 // the library's one export
 #define XF_GAME_LIBRARY_ENTRY_NAME "xf_game_library"
+// and the CPU level it was built for (a uint32_t: cpu_level.h's CpuLevel),
+// which the loader reads before it runs any of the library's code
+#define XF_GAME_LIBRARY_CPU_LEVEL_NAME "xf_game_library_cpu_level"
 
 #ifdef XF_GAME_LIBRARY_ENTRY
 // The library's entry and the C library's symbols the compiler may call on
@@ -64,6 +67,19 @@ namespace xf::ppc {
 Runtime runtime;
 GameLibrary game_library;
 } // namespace xf::ppc
+
+// the CPU level, from what the compiler was told it may use (the build's
+// -march: game_build_flags.h), numbered as cpu_level.h's CpuLevel
+extern "C" XF_GAME_LIBRARY_EXPORT const uint32_t xf_game_library_cpu_level =
+#if defined(__aarch64__)
+    0x100;
+#elif defined(__AVX2__) && defined(__FMA__) && defined(__BMI2__) && defined(__LZCNT__) && defined(__MOVBE__)
+    3;
+#elif defined(__SSE4_2__) && defined(__POPCNT__)
+    2;
+#else
+    0;
+#endif
 
 extern "C" XF_GAME_LIBRARY_EXPORT const ::xf::ppc::GameLibrary *xf_game_library(const ::xf::ppc::Runtime *runtime) {
     if (!runtime || runtime->version != XF_GAME_INTERFACE_VERSION || runtime->size != sizeof(::xf::ppc::Runtime))

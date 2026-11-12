@@ -4,19 +4,32 @@
 // stale, where a change to the rest of the recompile step does not.
 #pragma once
 
+#include "xenoforge/cpu_level.h"
+
 #include <vector>
 
 namespace xf::build {
 
+// The instruction set a CPU level allows (cpu_level.h). The statically
+// linked games and the tests take the same from XF_GAME_CPU_LEVEL
+// (cmake/xenoforge_port.cmake's xenoforge_cpu_level_flags).
+inline const char *cpu_level_flag(CpuLevel level) {
+    switch (level) {
+    case CpuLevel::X86_64_V2: return "-march=x86-64-v2";
+    case CpuLevel::X86_64_V3: return "-march=x86-64-v3";
+    default: return nullptr; // ARM64: its baseline
+    }
+}
+
 // Each file: the statically linked games' flags (CMakeLists.txt: -O2 -g0 -w
-// -mfma -mavx2; never -ffast-math), freestanding (no header but the ones
+// and the level's; never -ffast-math), freestanding (no header but the ones
 // written beside the code, no C library: math without errno), and the game
 // library's side of ppc_runtime.h. The interface version is added by the
 // caller.
-inline std::vector<const char *> base_compile_flags() {
-    std::vector<const char *> flags = {"-std=c++20", "-O2",         "-g0",         "-w",
-                                       "-mfma",      "-mavx2",      "-fno-math-errno",
-                                       "-nostdinc",  "-nostdinc++", "-DXF_GAME_LIBRARY"};
+inline std::vector<const char *> base_compile_flags(CpuLevel level) {
+    std::vector<const char *> flags = {"-std=c++20",      "-O2",       "-g0",         "-w",
+                                       "-fno-math-errno", "-nostdinc", "-nostdinc++", "-DXF_GAME_LIBRARY"};
+    if (const char *f = cpu_level_flag(level)) flags.push_back(f);
 #ifndef _WIN32
     // position independent, only the entry exported, and no stack
     // protector (some distributions' clang turns it on; it needs the C

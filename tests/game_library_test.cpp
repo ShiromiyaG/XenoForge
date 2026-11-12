@@ -202,6 +202,27 @@ int main() {
         std::printf("an Unwind through %2u frames: %6.0f ns linked, %6.0f ns in the library\n", depth + 1, s, d);
     }
     CHECK(thrown == before + 4 * (200 + 5000));
+
+    // The same code built for x86-64-v2 where this CPU has v3 (no FMA: the
+    // fused forms through the runtime's table), the same context out of it
+    CHECK(cpu_has_level(host_cpu_level()) && parse_cpu_level(cpu_level_name(game_cpu_level())) == game_cpu_level());
+    if (game_cpu_level() == CpuLevel::X86_64_V3) {
+        build::BuildOptions options;
+        options.cpu_level = CpuLevel::X86_64_V2;
+        const std::filesystem::path dll2 = work / "test_v2.dll";
+        CHECK(build::build_library(XF_GAME_LIBRARY_TEST_DIR, {"code.cpp"}, work / "work_v2", dll2, progress, error,
+                                   options));
+        const ppc::GameLibrary *v2 = ppc::load_game_library(dll2, runtime, error);
+        CHECK(v2 && v2->count == 1);
+        if (v2) {
+            Guest c;
+            setup_arith(c);
+            run(v2->modules[0], *c.c, 0x1000);
+            run(v2->modules[0], *c.c, 0x1200);
+            CHECK(std::memcmp(a.c.get(), c.c.get(), offsetof(ppc::Context, base)) == 0);
+            CHECK(a.memory == c.memory);
+        }
+    }
     std::filesystem::remove_all(work, ec);
     return finish("game_library");
 }

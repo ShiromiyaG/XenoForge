@@ -128,11 +128,39 @@ added to its base; loads and stores swap bytes.
   nearest.
 - Floating point: FPSCR[RN] and NI are honored; the common case (round to
   nearest, no Rc, an ordinary result) costs one compare, the rest goes to a
-  cold path that sets the host's rounding (`<cfenv>`) and puts it back. The
-  host must stay at its default environment (round to nearest, no FTZ or
-  DAZ), and the generated code must not be built with `-ffast-math` or
-  `-ffp-contract=fast`; with `-mfma` (x86-64-v3) `std::fma` is one
-  instruction instead of a call. Rc forms keep FPSCR's exception and status
+  cold path that sets the host's rounding and puts it back. The host must
+  stay at its default environment (round to nearest, no FTZ or DAZ), and
+  the generated code must not be built with `-ffast-math` or
+  `-ffp-contract=fast`; at x86-64-v3 (and on ARM64) `lib::fma` is one
+  instruction, at x86-64-v2 the C library's (docs/runtime.md, "The CPU
+  level"). The cold path (`fp_arith_core`) reaches the rounding mode and
+  the exception flags through `lib::FpEnv` (`ppc_runtime.h`, 2026-11-12):
+  the control register itself on x86-64 (MXCSR: `stmxcsr`/`ldmxcsr`
+  builtins) and ARM64 (FPCR for the mode, FPSR for the flags), read once,
+  written only when the value changes, with `ROUND_*` and `EXCEPT_*` the
+  register's own bits (MXCSR's flags in bits 0-5, its rounding in 13-14;
+  FPSR's flags in 0-4, FPCR's RMode in 22-23), DAZ/FTZ and the masks left
+  alone; the C library's `<cfenv>` (through the runtime's table in a game
+  library) on any other host. Before, it made up to eight calls to the C
+  library's `fesetround`, `feclearexcept` and `fetestexcept` per
+  instruction (in a game library, each through the table). What keeps the
+  operations between the register's writes: the cold path is compiled
+  with `#pragma STDC FENV_ACCESS ON` (strict floating point), and its
+  operations call the builtins themselves (`__builtin_fma`,
+  `__builtin_sqrt`), not `lib::`'s non-strict wrappers; `ldmxcsr` and the
+  system register writes are intrinsics with side effects the optimizer
+  does not move strict operations across (checked in the assembly of the
+  cold path at v3, v2 and ARM64). Without Rc in double precision the flags
+  are not read at all; in the single forms (round toward zero and odd,
+  then once to single) the second rounding mode is set with the flags
+  cleared in the same write. A fused single form whose double result sits
+  on a tie between two singles stays on the fast path when FRA and FRC are
+  singles (`fp_single_untie`): their product is exact in double, so the
+  fused result is a rounded sum whose error TwoSum gives exactly, and the
+  result moves one double ulp toward it before the rounding to single (an
+  exact tie stays: ties to even). Checked against the slow path on 8.5
+  million ties (4 million exact) at v3 and v2, all equal; a game's start
+  sent 9 million fmadds a run to the slow path on ties before. Rc forms keep FPSCR's exception and status
   bits and copy them to CR1; compares set FPCC. The console wins over Xenia:
   the default NaN 0x7FF8000000000000, NaNs in A, B, C order, quieted, not
   negated by `fnm*`; fused single forms round once; `fctiw` of a NaN gives
@@ -653,7 +681,7 @@ state after compared (2026-11-08; `xenoforge/fuzz.h`, `fuzz_format.h`,
   applies FPSCR[RN] only when mtfsf/mtfsfi/mtfsb set it, so the sequences
   set it themselves.
 - **The runners**: the interpreter (`xffuzz run`); the generated code
-  (`xffuzz emit` recompiles the cases, built at `-O2 -mfma -mavx2` as the
+  (`xffuzz emit` recompiles the cases, built at `-O2` and the CPU level as the
   games are; `ppc_fuzz_test`, in ctest, runs a fixed seed's 5,308 cases
   both ways); Xenia's x64 JIT (`tools/xenia_oracle/ppc_exec_oracle.cc`,
   its test runner's setup: `build.bat exec`).

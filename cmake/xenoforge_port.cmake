@@ -34,6 +34,23 @@
 
 set(_XF_PORT_DIR "${CMAKE_CURRENT_LIST_DIR}")
 
+# The CPU level the statically linked generated code is compiled for
+# (xenoforge/cpu_level.h; a game library built by the recompile step takes
+# the player's CPU's instead): v3 (x86-64-v3: AVX2, FMA, BMI2...) or v2
+# (x86-64-v2: SSE4.2, POPCNT); ARM64's baseline on ARM64. The results are the
+# same at every level. XF_GAME_CPU_FLAGS: the compiler's flags for it.
+set(XF_GAME_CPU_LEVEL "v3" CACHE STRING "CPU level of the statically linked generated code: v3 or v2 (x86-64)")
+set_property(CACHE XF_GAME_CPU_LEVEL PROPERTY STRINGS v3 v2)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(XF_GAME_CPU_FLAGS)
+elseif(XF_GAME_CPU_LEVEL STREQUAL "v3")
+    set(XF_GAME_CPU_FLAGS -march=x86-64-v3)
+elseif(XF_GAME_CPU_LEVEL STREQUAL "v2")
+    set(XF_GAME_CPU_FLAGS -march=x86-64-v2)
+else()
+    message(FATAL_ERROR "XF_GAME_CPU_LEVEL=${XF_GAME_CPU_LEVEL}: v3 or v2")
+endif()
+
 function(xenoforge_add_port name)
     cmake_parse_arguments(P "NO_PLAYER;NO_BOOT;HOT_RELOAD" "ISO;XEX;PROJECT;OPT;GENERATED_DIR;PREBUILT"
                           "SOURCES;HOOK_SOURCES;DEFINITIONS;INCLUDES;LIBRARIES" ${ARGN})
@@ -72,7 +89,7 @@ function(xenoforge_add_port name)
         target_include_directories(game_${name} PRIVATE ${XENOFORGE_INCLUDE_DIR})
         # optimized, without debug information (it is large) or warnings; never
         # -ffast-math (docs/recompiler.md)
-        target_compile_options(game_${name} PRIVATE ${opt} -g0 -w -mfma -mavx2)
+        target_compile_options(game_${name} PRIVATE ${opt} -g0 -w ${XF_GAME_CPU_FLAGS})
     elseif(P_ISO)
         # The generated files are not known until xfrecomp has run, so the
         # emission and the compile are one step: a small project (game_library/)
@@ -98,7 +115,7 @@ function(xenoforge_add_port name)
             -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
             -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM} -DXF_GAME_NAME=${name}
             -DXF_GAME_CODE=${gen}/code -DXF_GAME_OUT=${gen}/lib -DXF_INCLUDE_DIR=${XENOFORGE_INCLUDE_DIR}
-            "-DXF_GAME_OPT=${opt}")
+            "-DXF_GAME_OPT=${opt}" "-DXF_GAME_CPU_FLAGS=${XF_GAME_CPU_FLAGS}")
         add_custom_command(
             OUTPUT ${lib}
             COMMAND $<TARGET_FILE:XenoForge::xfrecomp> ${emit_args}
