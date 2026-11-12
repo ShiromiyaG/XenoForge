@@ -112,13 +112,14 @@ std::unique_ptr<Compute> Compute::open(std::string &error) {
         error = failed("vkCreateDevice", r);
         return nullptr;
     }
+    device_created(s.device);
     vkGetDeviceQueue(s.device, s.family, 0, &s.queue);
     return c;
 }
 
 Compute::~Compute() {
     if (!s_) return;
-    if (s_->device) vkDestroyDevice(s_->device, nullptr);
+    if (s_->device) vkDestroyDevice(s_->device, nullptr), device_destroyed(s_->device);
     if (s_->instance) vkDestroyInstance(s_->instance, nullptr);
 }
 

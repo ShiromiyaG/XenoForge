@@ -250,7 +250,42 @@ int main(int argc, char **argv) {
         std::sort(plays.begin(), plays.end());
         std::printf("  commands a play: %.3f ms median, %.3f ms fastest, of %zu plays\n",
                     plays[plays.size() / 2] * 1000, plays.front() * 1000, plays.size());
-        std::printf("  the thread's processor time a play: %.2f ms\n", report.command_cpu_seconds * 1000);
+        // and without the waits for the GPU: the thread's work, what to compare two builds by
+        std::vector<double> work;
+        for (size_t k = 0; k < report.command_seconds.size() && k < report.command_wait_seconds.size(); k++)
+            work.push_back(report.command_seconds[k] - report.command_wait_seconds[k]);
+        std::sort(work.begin(), work.end());
+        if (!work.empty())
+            std::printf("  commands a play without the waits for the GPU: %.3f ms median, %.3f ms fastest\n",
+                        work[work.size() / 2] * 1000, work.front() * 1000);
+        // The commands' share of the thread's processor time a play: the play's processor time
+        // times the commands' share of its wall time, the waits for the GPU left out of both. Time
+        // the thread lost to other programs falls on the commands and the walk alike, so this
+        // holds on a busy machine where the wall times do not (two system calls around each
+        // packet, the direct measure, cost more than the commands).
+        std::vector<double> share;
+        for (size_t k = 0; k < report.command_cpu_plays.size() && k < report.play_seconds.size() &&
+                           k < report.command_wait_seconds.size();
+             k++) {
+            const double waits = report.command_wait_seconds[k];
+            const double play = report.play_seconds[k] - waits, commands = report.command_seconds[k] - waits;
+            if (play > 0) share.push_back(report.command_cpu_plays[k] * commands / play);
+        }
+        std::sort(share.begin(), share.end());
+        if (!share.empty())
+            std::printf("  the commands' processor time a play: %.3f ms median, %.3f ms fastest\n",
+                        share[share.size() / 2] * 1000, share.front() * 1000);
+        // the thread's processor time a play, the trace's walk included, and that walk's share of
+        // the play's wall time (what lies outside the commands)
+        std::vector<double> cpu = report.command_cpu_plays, walk;
+        for (size_t k = 0; k < report.play_seconds.size() && k < report.command_seconds.size(); k++)
+            walk.push_back(report.play_seconds[k] - report.command_seconds[k]);
+        std::sort(cpu.begin(), cpu.end());
+        std::sort(walk.begin(), walk.end());
+        std::printf("  the thread's processor time a play, the walk included: %.2f ms median, %.2f fastest, %.2f mean; "
+                    "the walk outside the commands %.2f ms\n",
+                    cpu.empty() ? 0.0 : cpu[cpu.size() / 2] * 1000, cpu.empty() ? 0.0 : cpu.front() * 1000,
+                    report.command_cpu_seconds * 1000, walk.empty() ? 0.0 : walk[walk.size() / 2] * 1000);
     }
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)

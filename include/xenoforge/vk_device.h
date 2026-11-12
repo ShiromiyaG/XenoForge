@@ -27,6 +27,13 @@ bool load_vulkan(std::string &error);
 // Loads the instance's and its devices' functions (volkLoadInstance: the
 // loader's trampolines, valid for every instance and device of the process).
 void load_instance(VkInstance instance);
+// A device made and one about to be destroyed. While a single device lives,
+// its functions are called straight in the driver (volkLoadDevice), not
+// through the loader's trampolines, which look the device's dispatch table
+// up at every call, a command buffer's commands included; with a second one
+// the trampolines again (XF_VK_DIRECT_DISPATCH=0: always the trampolines).
+void device_created(VkDevice device);
+void device_destroyed(VkDevice device);
 
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;

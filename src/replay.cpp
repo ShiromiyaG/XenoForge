@@ -30,6 +30,8 @@
 
 #include "xenoforge/memory.h"
 
+#include "fast_clock.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -99,11 +101,11 @@ public:
             processor_.execute_packets(address, count);
             return;
         }
-        auto start = std::chrono::steady_clock::now();
-        const uint64_t ticks = thread_cpu_ticks();
+        // (the cheap clock: a play is some 100,000 packets, each executed on its own, and the
+        // thread's processor time, a system call, read around each was most of what was timed)
+        const uint64_t start = FastClock::now();
         processor_.execute_packets(address, count);
-        command_ticks_ += thread_cpu_ticks() - ticks;
-        command_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        command_clock_ += FastClock::now() - start;
     }
     void memory_read(uint32_t address, std::span<const uint8_t> bytes) override {
         // a repeated play: what memory holds already is not written again
@@ -125,8 +127,7 @@ public:
     }
 
     bool repeating_ = false;
-    double command_seconds_ = 0; // in the processor, over the repeated plays
-    uint64_t command_ticks_ = 0; // the thread's processor time in it (thread_cpu_ticks)
+    uint64_t command_clock_ = 0; // in the processor, over the repeated plays (FastClock)
 
 private:
     bool unchanged(uint32_t address, std::span<const uint8_t> bytes) const {
@@ -183,19 +184,27 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     double fastest_gpu_seconds = -1;
     std::vector<double> command_seconds;
     double command_cpu_seconds = 0;
+    std::vector<double> command_cpu_plays, play_seconds, command_waits;
     if (walked && repeat > 1) {
         renderer->drain();
         Report before = renderer->report();
         player.repeating_ = true;
         uint64_t ticks = 0;
         for (uint32_t k = 1; k < repeat && walked; k++) {
-            player.command_seconds_ = 0;
+            // the thread's processor time over the whole play, the trace's walk included (read
+            // once a play: it is a system call), and the wall time of the play and of its commands
+            player.command_clock_ = 0;
+            const uint64_t cpu_start = thread_cpu_ticks(), play_start = FastClock::now();
             walked = walk_gpu_trace(trace, player, error);
-            command_seconds.push_back(player.command_seconds_);
-            ticks += player.command_ticks_, player.command_ticks_ = 0;
+            const uint64_t play_ticks = thread_cpu_ticks() - cpu_start;
+            play_seconds.push_back(FastClock::seconds(FastClock::now() - play_start));
+            command_seconds.push_back(FastClock::seconds(player.command_clock_));
+            command_cpu_plays.push_back(double(play_ticks) / cpu_ticks_a_second());
+            ticks += play_ticks;
             command_cpu_seconds = double(ticks) / cpu_ticks_a_second() / double(k);
             renderer->drain();
             Report after = renderer->report();
+            command_waits.push_back(after.wait_seconds - before.wait_seconds);
             double seconds = after.gpu_seconds - before.gpu_seconds;
             if (fastest_gpu_seconds < 0 || seconds < fastest_gpu_seconds) {
                 fastest_gpu_seconds = seconds;
@@ -220,6 +229,9 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     report.packets = processor.counts().packets.load();
     report.command_seconds = std::move(command_seconds);
     report.command_cpu_seconds = command_cpu_seconds;
+    report.command_cpu_plays = std::move(command_cpu_plays);
+    report.play_seconds = std::move(play_seconds);
+    report.command_wait_seconds = std::move(command_waits);
     // XF_REPLAY_DUMP_MEMORY=<hex address>:<hex size>:<file>: that physical
     // memory after the trace, to set beside Xenia's and the reference's
     // (XF_REF_DUMP_MEMORY). What resolves wrote is in it with

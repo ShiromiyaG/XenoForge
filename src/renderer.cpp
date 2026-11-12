@@ -44,6 +44,7 @@
 
 #include "xenoforge/renderer.h"
 
+#include "fast_clock.h"
 #include "native_internal.h"
 
 #include "xenoforge/guest_memory.h"
@@ -1377,6 +1378,39 @@ private:
     std::vector<std::thread> threads_;
 };
 
+// The renderer's own lock, held through each of the processor's calls: a word taken by one
+// compare-and-swap and given back by one exchange where no other thread wants it (nearly
+// always: the others only read the report now and then), waiting on the word otherwise (0 free,
+// 1 held, 2 held and wanted). std::mutex's lock and unlock (with the thread's id taken and an
+// SRW lock behind them on Windows) were 2% of the command thread at several calls a draw.
+// XF_RENDERER_STD_MUTEX=1: std::mutex, as before.
+class CallLock {
+public:
+    void lock() {
+        if (std_) return std_mutex_.lock();
+        uint32_t free = 0;
+        if (word_.compare_exchange_strong(free, 1, std::memory_order_acquire, std::memory_order_relaxed)) return;
+        while (word_.exchange(2, std::memory_order_acquire) != 0) word_.wait(2, std::memory_order_relaxed);
+    }
+    bool try_lock() {
+        if (std_) return std_mutex_.try_lock();
+        uint32_t free = 0;
+        return word_.compare_exchange_strong(free, 1, std::memory_order_acquire, std::memory_order_relaxed);
+    }
+    void unlock() {
+        if (std_) return std_mutex_.unlock();
+        if (word_.exchange(0, std::memory_order_release) == 2) word_.notify_one();
+    }
+
+private:
+    std::atomic<uint32_t> word_{0};
+    std::mutex std_mutex_;
+    const bool std_ = [] {
+        const char *v = std::getenv("XF_RENDERER_STD_MUTEX");
+        return v && v[0] == '1';
+    }();
+};
+
 class Impl final : public Renderer {
 public:
     Impl(vk::Device &device, gpu::CommandProcessor &processor, const Options &options)
@@ -1473,14 +1507,14 @@ public:
         if (call) zpd_report_ended(ended, next);
     }
     void zpd_poll(std::vector<std::pair<uint64_t, uint64_t>> &resolved) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<CallLock> lock(mutex_);
         resolved.insert(resolved.end(), zpd_resolved_.begin(), zpd_resolved_.end());
         zpd_resolved_.clear();
     }
     // screen extents (gpu::ScreenExtents::Measured; "screen extents" below)
     bool measures_extents() override { return extents_.buffer != VK_NULL_HANDLE; }
     Work work() override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<CallLock> lock(mutex_);
         return {report_.wait_seconds, report_.textures, report_.submissions, report_.pipelines};
     }
     void extent_init() override {
@@ -1510,7 +1544,7 @@ public:
         if (serial) wait_serial(serial);
     }
     void extent_poll(std::vector<gpu::Extent> &resolved) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<CallLock> lock(mutex_);
         resolved.insert(resolved.end(), extent_resolved_.begin(), extent_resolved_.end());
         extent_resolved_.clear();
     }
@@ -1545,17 +1579,17 @@ public:
         if (!scale_.one()) rescale_edram(true);
     }
     Report report() const override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<CallLock> lock(mutex_);
         return with_processor_counts(report_);
     }
     bool try_report(Report &out) const override {
-        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        std::unique_lock<CallLock> lock(mutex_, std::try_to_lock);
         if (!lock) return false;
         out = with_processor_counts(report_);
         return true;
     }
     bool failed(std::string &error) const override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<CallLock> lock(mutex_);
         if (fatal_.empty()) return false;
         error = fatal_;
         return true;
@@ -1569,7 +1603,7 @@ public:
 
     // ---- TraceSource: what a trace writer asks ----
     void set_memory_trace(gpu::MemoryTrace *trace) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<CallLock> lock(mutex_);
         trace_ = trace;
     }
     void settle() override { drain(); }
@@ -1588,16 +1622,30 @@ private:
     public:
         // (on false: nothing timed, no clock read)
         explicit Timer(double &into, bool on = true) : into_(into), on_(on) {
-            if (on_) start_ = std::chrono::steady_clock::now();
+            if (on_) start_ = now();
         }
         ~Timer() {
-            if (on_) into_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+            if (on_) into_ += steady() ? double(now() - start_) * STEADY_TICK : FastClock::seconds(now() - start_);
         }
 
     private:
+        // the cheap clock (fast_clock.h), or steady_clock with XF_RENDERER_STEADY_CLOCK=1 (as
+        // before; the replay's own timing keeps the cheap one)
+        static bool steady() {
+            static const bool on = [] {
+                const char *v = std::getenv("XF_RENDERER_STEADY_CLOCK");
+                return v && v[0] == '1';
+            }();
+            return on;
+        }
+        static constexpr double STEADY_TICK =
+            double(std::chrono::steady_clock::period::num) / std::chrono::steady_clock::period::den;
+        static uint64_t now() {
+            return steady() ? uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) : FastClock::now();
+        }
         double &into_;
         bool on_;
-        std::chrono::steady_clock::time_point start_;
+        uint64_t start_ = 0;
     };
     // a translation and its module's making, timed into the report
     // (Report::translate_seconds)
@@ -1635,7 +1683,7 @@ private:
 
     private:
         Impl &r_;
-        std::lock_guard<std::mutex> lock_;
+        std::lock_guard<CallLock> lock_;
         Timer timer_;
     };
 
@@ -2596,7 +2644,7 @@ private:
     uint32_t tile_dwords_ = 1280;
     uint32_t max_image_ = 16384; // the device's largest 2D image
     VkDeviceSize edram_bytes_ = 0;
-    mutable std::mutex mutex_; // held through each of the processor's calls
+    mutable CallLock mutex_; // held through each of the processor's calls
     Report report_;
     std::string fatal_;
     const uint32_t *regs_ = nullptr; // the processor's register file, during a call
@@ -2741,10 +2789,19 @@ private:
     }();
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
-    uint32_t last_constants_blocks_[2] = {}; // the blocks of float constants uploaded there (Shader::float_blocks)
+    // the blocks uploaded there: the float constants' in bits 0-31 (Shader::float_blocks), the
+    // fetch constants' in bits 32-37 (Shader::fetch_blocks)
+    uint64_t last_constants_blocks_[2] = {};
     uint32_t last_system_slots_ = 0;         // how many slots of the system constants' tables are uploaded there
     bool constant_blocks_ = [] {
         const char *v = std::getenv("XF_CONSTANT_BLOCKS");
+        return !(v && v[0] == '0');
+    }();
+    // and of the fetch constants only the blocks the stage's shader fetches from: 768 of a
+    // stage's 928 bytes past the float constants went up at every upload for the one or two
+    // blocks a shader reads (XF_FETCH_BLOCKS=0: all six)
+    bool fetch_blocks_ = [] {
+        const char *v = std::getenv("XF_FETCH_BLOCKS");
         return !(v && v[0] == '0');
     }();
 
@@ -3530,8 +3587,10 @@ void Impl::save_pipeline_cache() {
 }
 
 bool Impl::init(std::string &error) {
-    if (const char *v = std::getenv("XF_RENDERER_CPU_TIMES")) cpu_times_ = v[0] == '1';
-    cpu_times_ = cpu_times_ || options_.cpu_times;
+    // (XF_RENDERER_CPU_TIMES=1 turns them on, =0 off even where the options ask: a replay timed
+    // as live play runs)
+    cpu_times_ = options_.cpu_times;
+    if (const char *v = std::getenv("XF_RENDERER_CPU_TIMES"); v && *v) cpu_times_ = v[0] == '1';
     open_pipeline_cache();
     support_ = texture_support(d_);
     if (options_.async_pipelines) {
@@ -10526,24 +10585,44 @@ void Impl::draw(const gpu::Draw &d) {
         // and RPCS3 upload a shader's own constants too): 4 KB of them went up at nearly every
         // draw for the few a shader reads. All of them for the generic shaders, which read by
         // the microcode's index. XF_CONSTANT_BLOCKS=0: all, always.
+        // The fetch constants likewise, the blocks of 32 words its fetches' slots lie in
+        // (Shader::fetch_blocks; the others are not kept current for it either).
         const Shader *reader = stage == 0 ? vs : ps;
-        const uint32_t blocks = !constant_blocks_ || generic ? 0xFFFFFFFFu : reader ? reader->float_blocks : 0u;
+        constexpr uint64_t ALL_FLOATS = 0xFFFFFFFFull, ALL_FETCH = 0x3Full << 32, ALL = ALL_FLOATS | ALL_FETCH;
+        const uint64_t fetch = !fetch_blocks_ ? ALL_FETCH : reader ? uint64_t(reader->fetch_blocks) << 32 : 0;
+        const uint64_t blocks = !constant_blocks_ || generic ? ALL : (reader ? reader->float_blocks : 0) | fetch;
         // (uploaded again when a draw found them changed, in each new submission, and where the
         // blocks there are not all this draw's)
         if (last_constants_at_[stage] == NONE || (blocks & ~last_constants_blocks_[stage])) {
             last_constants_at_[stage] = draw_data_take(sizeof(harness::Constants), ubo_align_);
             uint8_t *to = draw_data(last_constants_at_[stage]);
-            const harness::Constants &from = last_constants_[stage];
-            if (blocks == 0xFFFFFFFFu) {
-                upload(to, &from, sizeof(harness::Constants));
+            const uint8_t *from = reinterpret_cast<const uint8_t *>(&last_constants_[stage]);
+            if (blocks == ALL) {
+                upload(to, from, sizeof(harness::Constants));
             } else {
-                constexpr size_t BLOCK = 8 * 16, FLOATS = sizeof(from.float_constants);
+                // each run of neighboring blocks in one copy
+                constexpr size_t BLOCK = 8 * 16, FLOATS = sizeof(harness::Constants::float_constants);
+                constexpr size_t FETCH = offsetof(harness::Constants, fetch_constants);
                 static_assert(FLOATS == 32 * BLOCK && offsetof(harness::Constants, float_constants) == 0);
-                for (uint32_t left = blocks; left; left &= left - 1) {
-                    const size_t at = size_t(std::countr_zero(left)) * BLOCK;
-                    upload(to + at, reinterpret_cast<const uint8_t *>(&from) + at, BLOCK);
-                }
-                upload(to + FLOATS, reinterpret_cast<const uint8_t *>(&from) + FLOATS, sizeof(harness::Constants) - FLOATS);
+                static_assert(offsetof(harness::Constants, bool_constants) == FLOATS &&
+                              sizeof(harness::Constants) == FETCH + 6 * BLOCK);
+                auto runs = [](uint32_t mask, auto copy) {
+                    while (mask) {
+                        const uint32_t first = uint32_t(std::countr_zero(mask));
+                        const uint32_t count = uint32_t(std::countr_one(mask >> first));
+                        copy(first, count);
+                        mask = count + first >= 32 ? 0u : mask & ~(((1u << count) - 1) << first);
+                    }
+                };
+                runs(uint32_t(blocks), [&](uint32_t first, uint32_t count) {
+                    upload(to + first * BLOCK, from + first * BLOCK, count * BLOCK);
+                });
+                // the bools and loops (unit 0), then the fetch blocks (units 1-6)
+                runs(1u | uint32_t(blocks >> 32) << 1, [&](uint32_t first, uint32_t count) {
+                    const size_t start = first ? FETCH + (first - 1) * BLOCK : FLOATS;
+                    const size_t end = FETCH + (first + count - 1) * BLOCK;
+                    upload(to + start, from + start, end - start);
+                });
             }
             last_constants_blocks_[stage] = blocks;
         }

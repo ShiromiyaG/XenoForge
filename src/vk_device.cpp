@@ -25,10 +25,39 @@ bool load_vulkan(std::string &error) {
     return true;
 }
 
+namespace {
+std::mutex dispatch_mutex;
+VkInstance last_instance = VK_NULL_HANDLE;
+uint32_t live_devices = 0;
+} // namespace
+
 void load_instance(VkInstance instance) {
-    static std::mutex m;
-    std::lock_guard lock(m);
+    std::lock_guard lock(dispatch_mutex);
     volkLoadInstance(instance);
+    last_instance = instance;
+}
+
+// volk keeps one set of function pointers for the process. The loader's
+// trampolines (what volkLoadInstance gives) serve every device; a device's
+// own entry points (volkLoadDevice) serve that device alone, so they are taken
+// only while it is the one device, and a second device puts the trampolines
+// back before it is used. (Pointer-sized stores: a thread calling into the
+// first device meanwhile finds one valid entry or the other.)
+void device_created(VkDevice device) {
+    static const bool off = [] {
+        const char *v = std::getenv("XF_VK_DIRECT_DISPATCH");
+        return v && v[0] == '0';
+    }();
+    std::lock_guard lock(dispatch_mutex);
+    if (++live_devices == 1 && !off)
+        volkLoadDevice(device);
+    else if (last_instance)
+        volkLoadInstance(last_instance);
+}
+
+void device_destroyed(VkDevice) {
+    std::lock_guard lock(dispatch_mutex);
+    if (live_devices) live_devices--;
 }
 
 // A block of the image pool: device memory of one type, its free ranges by
@@ -476,6 +505,7 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         error = failed("vkCreateDevice", r);
         return nullptr;
     }
+    device_created(d->device_);
     vkGetDeviceQueue(d->device_, d->family_, 0, &d->queue_);
     d->present_queue_ = d->queue_;
     if (queue_info.queueCount == 2) vkGetDeviceQueue(d->device_, d->family_, 1, &d->present_queue_);
@@ -497,6 +527,7 @@ Device::~Device() {
         vkDestroyFence(device_, fence_, nullptr);
         vkDestroyCommandPool(device_, pool_, nullptr);
         vkDestroyDevice(device_, nullptr);
+        device_destroyed(device_);
     }
     if (surface_) vkDestroySurfaceKHR(instance_, surface_, nullptr);
     if (instance_) vkDestroyInstance(instance_, nullptr);

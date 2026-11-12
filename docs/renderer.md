@@ -1839,6 +1839,70 @@ core): to be measured again alone. Next: the frame timed stage by stage live
 then the constants' upload (5 KB a stage at nearly every draw) and the
 textures' checks.
 
+**The replay's measure, mended, and where a draw's time goes (2026-11-12).**
+`xfreplay --repeat` read the thread's processor time (`QueryThreadCycleTime`,
+a system call) and `steady_clock` (`QueryPerformanceCounter`, about 100 ns
+here) around each packet, and a play executes each of its 135,000 packets
+on its own: the reads were most of what they measured (game G's in-play
+frame gave 69-77 ms of "processor time" a play and 124 ms of commands for
+about 25 ms of work). The packets are now timed by the time stamp counter
+(`src/fast_clock.h`: an invariant TSC, its rate taken against
+`steady_clock` over 2 ms; `steady_clock` elsewhere), the thread's processor
+time read once a play (the trace's walk included: about 220 ms of the
+play's 250, the memory it compares), and xfreplay prints the commands a
+play without the waits for the GPU and **the commands' processor time a
+play** (the play's processor time times the commands' share of its wall
+time, the waits left out of both: what to compare builds by). The renderer's
+clock reads (`Report`'s seconds, two a draw) take the same clock
+(`XF_RENDERER_STEADY_CLOCK=1`: `steady_clock`), and `XF_RENDERER_CPU_TIMES=0`
+now turns the per-call timing off where the options turn it on (xfreplay
+does: a replay timed as live play runs).
+
+Measured so, the frame is about 25 ms of commands a play (8,245 draws; the
+fastest play 22-24 ms), 90% of it in the draws: 10,800 cycles a draw from
+the sink's entry, by section (rdtsc marks, the first play left out): the
+recording 30% (the binds, dynamic state and draw: the driver), the textures
+12%, the uploads 11% (the draw data's constants, the indices' and
+attributes' words), the pipeline's key and lookup 9.5%, the vertex data's
+request 9%, the front part 8%, the indices 7.5%, the rest below 5% each.
+Of the recording, the pipeline binds alone are about 12% of the commands:
+`vkCmdBindPipeline` takes 4,000-6,500 cycles on this driver (1-1.7 us;
+already bound in the command buffer or not, interlock or host path alike),
+and a third of the draws bind one (2,668 a play, each with other shaders
+than the last: no redundant bind, no two pipelines of one shader pair in a
+row). The descriptor sets' bind with its four dynamic offsets is about 790
+cycles and the draw 870.
+
+Four changes, each with a switch, none of which moves the replay beyond
+its noise on this machine (other agents' builds at 50-97% of the processor
+throughout; five rounds A B A B of 15 plays, the commands' processor time
+a play, median of the rounds' medians): game G 25.7 ms with all four off,
+26.1 with all on (25.2-27.2 against 25.5-29.1); game D's drive about 10 ms
+either way. They are kept behind their switches for the live timing:
+- **Direct dispatch** (`XF_VK_DIRECT_DISPATCH=0` off): while one device
+  lives, its functions are taken from the driver (`volkLoadDevice`), not the
+  loader's trampolines, which look the dispatch table up at every command;
+  a second device puts the trampolines back (`vk::device_created`).
+- **Fetch constant blocks** (`XF_FETCH_BLOCKS=0` off): a stage's upload
+  carries only the blocks of 32 fetch constant words its shader fetches
+  from (`Shader::fetch_blocks`), not all 768 bytes, and each run of
+  neighboring blocks in one copy: 20.4 to 12.9 MB of constants a play
+  (-37%), the pictures identical.
+- **The call lock** (`XF_RENDERER_STD_MUTEX=1` off): a word taken by one
+  compare-and-swap instead of `std::mutex` (thread id and an SRW lock).
+- **The clock** above.
+
+Tried and dropped: streaming stores (`_mm_stream_si128`) for the uploads
+into the write-combined draw data. With a store fence after each copy the
+commands took 18% more (each fence waits for the bus); with one fence at
+the submission, no difference. Not tried: push descriptors in place of the
+dynamic offsets (the bind they would replace is 7% of a draw, and a push of
+three buffer descriptors is not known to cost less on this driver: to be
+measured by itself first). The binds are the largest single item left, and
+only a cheaper way to change shaders would cut them (shader objects,
+`VK_EXT_shader_object`, where the driver has them: a stage bound alone, no
+pipeline), to be measured by a bind's cost first.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches
