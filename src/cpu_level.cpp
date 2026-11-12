@@ -1,6 +1,7 @@
 // The CPU levels game libraries are built for (xenoforge/cpu_level.h).
 
 #include "xenoforge/cpu_level.h"
+#include "xenoforge/cpu_level_check.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -78,7 +79,22 @@ std::optional<CpuLevel> parse_cpu_level(std::string_view name) {
 }
 
 CpuLevel host_cpu_level() {
-    static const CpuLevel level = detect();
+    // XF_HOST_CPU_LEVEL pretends this CPU has a lower level than it has (a
+    // test of what a CPU without it is told; a higher one is not taken)
+    static const CpuLevel level = [] {
+        const CpuLevel detected = detect();
+        const char *env = std::getenv("XF_HOST_CPU_LEVEL");
+        if (!env || !*env) return detected;
+        if (std::string_view(env) == "none") return CpuLevel::None;
+        const std::optional<CpuLevel> pretend = parse_cpu_level(env);
+        const bool lower = pretend && detected != CpuLevel::None &&
+                           (*pretend == detected || (*pretend != CpuLevel::Arm64 && detected != CpuLevel::Arm64 &&
+                                                     uint32_t(*pretend) < uint32_t(detected)));
+        if (lower) return *pretend;
+        std::fprintf(stderr, "XF_HOST_CPU_LEVEL=%s: not a level below this CPU's (%s, or none); not taken\n", env,
+                     cpu_level_name(detected));
+        return detected;
+    }();
     return level;
 }
 
@@ -99,6 +115,30 @@ CpuLevel game_cpu_level() {
         return host_cpu_level();
     }();
     return level;
+}
+
+void check_static_cpu_level(const char *built) {
+    const std::optional<CpuLevel> level = parse_cpu_level(built ? built : "");
+    if (level && cpu_has_level(*level)) return;
+    const CpuLevel host = host_cpu_level();
+    if (!level) {
+        std::fprintf(stderr, "XenoForge: this program's generated code was built for an unknown CPU level (%s)\n",
+                     built ? built : "none");
+    } else {
+        const char *what = *level == CpuLevel::X86_64_V3   ? "x86-64-v3: AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C"
+                           : *level == CpuLevel::X86_64_V2 ? "x86-64-v2: SSE4.2, POPCNT, CMPXCHG16B"
+                                                           : "the ARM64 baseline";
+        std::fprintf(stderr,
+                     "XenoForge: this program's generated code is built for the CPU level %s (%s), and this CPU "
+                     "has %s.\nIt cannot run here: build the port with -DXF_GAME_CPU_LEVEL=v2 (docs/runtime.md, "
+                     "\"The CPU level\"), or run the game in the player with a game library, which is built for "
+                     "the CPU it runs on.\n",
+                     cpu_level_name(*level), what,
+                     host == CpuLevel::None ? "none of the levels (below x86-64-v2)" : cpu_level_name(host));
+    }
+    std::fflush(stderr);
+    // before main and every other static initializer: nothing to tear down
+    std::_Exit(kCpuLevelExitCode);
 }
 
 } // namespace xf

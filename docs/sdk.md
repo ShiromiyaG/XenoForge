@@ -60,7 +60,9 @@ them, so emission and compilation are one build step: `xfrecomp emit <iso>
 <build>/xenoforge/mygame/code [--project <toml>]`, then a small project
 (`game_library/CMakeLists.txt`) is configured over what was written and built
 with `-O2 -g0` and the CPU level's `-march` (`-DXF_GAME_CPU_LEVEL=v3`, the
-default, or `v2`: docs/runtime.md, "The CPU level"). The step runs only
+default, or `v2`: docs/runtime.md, "The CPU level"; both executables check
+at start, before any static initializer of the generated code, that the CPU
+has that level, and say so and exit when it lacks it). The step runs only
 when the ISO, the project file, `xfrecomp` or the generated code's headers
 changed; `xfrecomp` writes only the files whose text changed, so after a
 change to the project file or a recompiler fix only those files recompile.

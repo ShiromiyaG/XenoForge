@@ -796,6 +796,61 @@ scheduler; `kernel_deterministic_test` checks a mixed workload (sleeps,
 ping-pong, slices, a spin on a flag with the watchdog off, handed over by
 its yield points alone) and a recording and its replay, run after run.
 
+### The deterministic regression check (2026-11-12)
+
+Since interpreted and generated runs leave the same memory in this mode, a
+disc's deterministic boot to a halt is a regression check of the CPU (the
+recompiler, the interpreter, `ppc_ops.h`) and of the kernel together:
+anything that changes what the guest does changes the guest memory hash, the
+clock or the scheduler's counts. `deterministic_regression_test` (ctest
+`deterministic_regression`, skipped without `XF_DETERMINISTIC_EXPECTED`)
+runs the boots a TOML file outside the repository lists and compares what
+each left with the values written there. The file holds the discs' paths
+and the expected values (game data: never in the repository):
+
+    logs = "<dir>"                 # each run's output; default logs/ beside the file
+    [[run]]
+    name = "b-6000"
+    args = ["<iso>", "--cache", "<library cache>", "--deterministic", "--until-swap", "6000"]
+    hash = "..."                   # written by --update
+    runs = 0
+    clock = "..."
+    counts = "..."                 # the scheduler's counts: threads, runs, slices, yields, waits...
+
+    [[run]]
+    name = "b-1200-agree"
+    exe = "<a static boot_<game>>" # optional; else the generic boot of this build
+    args = ["<iso>", "--cache", "<library cache>", "--deterministic", "--until-swap", "1200"]
+    interpret = true               # also run with --interpret: the two must agree
+
+- Every run gets `--steps 18446744073709551615 --seconds 100000` ahead of
+  its own arguments, so it ends at its halt and not at boot's limits.
+- A run fails when it does not halt, leaves no hash, has a forced hand-over
+  (the run is then not exact; the check sets `XF_DETERMINISTIC_FORCE_MS` to
+  10,000 unless the environment does, as on a loaded machine the host can
+  stop the guest's thread past the watchdog's 100 ms: game B to swap 6,000
+  beside a `-j 4` build had 9 forced hand-overs and another hash), or, not
+  interpreted, ran no generated code
+  (boot quietly interprets when the cache has no library for the disc at
+  this interface version and CPU level: rebuild the cache with `xfbuild
+  <iso> <cache>`, which the check does not do, as it takes minutes a disc).
+- A run with `interpret = true` runs again with `--interpret`; hash, runs,
+  clock and counts must be equal. That is the shorter agreement check of the
+  recompiler against the interpreter (the interpreter is about ten times
+  slower, so such a run stops early: game B's swap 1,200 is 8 s generated,
+  about 100 s interpreted).
+- **Refreshing**: a change meant to alter the runs (a kernel fix, a new
+  clock cost) is followed by `deterministic_regression_test --update
+  [name...]`, which runs them and writes what they left into the file as
+  the new expected values, the rest of the file kept; only runs that ended
+  cleanly (and agreed, interpreted too) are written. `--list` lists the
+  runs, names alone run those.
+
+The runs on this machine's file (`F:/RECOMPs/external/deterministic`, with
+the libraries in its `cache`), on 2026-11-12: game B to swap 6,000, game B
+with `--spin-idle` to 6,000, game A to 3,000 (generated) and game B to
+1,200 both ways, about four minutes together.
+
 ## The GPU
 
 The video driver's side of the GPU, live and headless (plan step A4, "GPU
@@ -2867,6 +2922,25 @@ fused forms, the slow path's, and VMX's vmaddfp and vnmsubfp a lane at a
 time) is the C library's through the runtime's table: exact, slow. The
 statically linked games and the tests take `-DXF_GAME_CPU_LEVEL=v3|v2`
 (CMake cache, v3 by default; `cmake/xenoforge_port.cmake`).
+
+Such an executable (boot_<game>, player_<game>, an SDK port, the tests with
+generated code) checks the level before any of that code runs
+(2026-11-12, `xenoforge/cpu_level_check.h`): on a CPU without it the first
+AVX2 instruction would end it on an illegal instruction, unexplained. The
+generated files may have static initializers, so the check is one more
+file, compiled at the baseline, that `xenoforge_add_port` writes
+(`xenoforge_cpu_level_check(<target>)`) with an initializer that runs
+before every ordinary one: its pointer in the MSVC runtime's `.CRT$XCB`
+section on Windows (after the runtime's `.CRT$XCA`, before the compiler's
+`.CRT$XCU`), a constructor of priority 101 on POSIX. Without the level it
+prints which level the code was built for, what this CPU has, and the way
+out (`-DXF_GAME_CPU_LEVEL=v2`, or the player with a game library, built
+for the CPU it runs on), and exits with code 86. `XF_HOST_CPU_LEVEL=v2`
+(or `none`) makes `host_cpu_level` pretend a lower level than the CPU's (a
+higher one is refused), for the loader and the build as well: the tests
+`cpu_level_check` (it runs) and `cpu_level_check_lacking` (with `none`:
+the message, code 86, neither the stand-in game file's initializer nor main
+ran).
 
 Measured (2026-11-12, a Zen 3 desktop processor, quiet machine): game B's
 deterministic benchmark (`--deterministic --spin-idle --until-swap 6000`,

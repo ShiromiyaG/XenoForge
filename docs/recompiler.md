@@ -177,6 +177,38 @@ added to its base; loads and stores swap bytes.
   console's value for 1.0 alone), and one `fctiwz.` case whose vector
   contradicts the same input's `fctiwz` and `fctiw.` (a NaN in, 0 and no
   exception out).
+- **Who reads the FPSCR (2026-11-12).** The operations without Rc leave the
+  sticky bits (FX, OX, UX, ZX, XX, the VX causes) and FI/FR alone; making
+  them exact would cost every floating point instruction a look at the
+  host's flags. Before that, who reads them: over the eight test discs'
+  generated code, 72 `mffs` (no `mcrfs`, no `mffs.`) in the same five
+  functions of the XDK's C library, once a module (two modules of game C,
+  three of game D, four of game F), and one more in games D and F:
+  1. `_ctrlfp` (`mffs`; new control bits under a mask; `mtfsf 255`): the
+     control word (RN, NI, the enables), the other bits written back as
+     they were read;
+  2. `_clrfp` (`mffs`, `and` with NI alone, `mtfsf 255`): clears them;
+  3. `_set_statfp` (`mffs`, `or` in bits, `mtfsf 255`): sets the sticky
+     bits a math function's error stands for (`_handle_exc`);
+  4. `_statfp` and a twin (`mffs`, the word returned): the one reader of
+     the exception bits, called by `_raise_exc` alone, which tests VX, OX,
+     ZX, UX, XX into an exception record and raises it; it is reached from
+     `_except1` only when `_handle_exc` finds the error's exception
+     unmasked;
+  5. (games D and F) a context save beside fr14-fr31, restored whole.
+  The math functions (`pow`, `exp` and the like) bracket their work with
+  `_ctrlfp` (all exceptions masked, the old control word put back) and
+  look at the control bits only. Run (the interpreter counting each
+  `mffs`/`mtfs*` by address and caller, deterministic, interpreted): game
+  B to swap 1,200 read the FPSCR 960 to 1,900 times, game A to swap 1,000
+  52 to 103 times, all in `_ctrlfp` (game B's control word wrappers and
+  one math function; game A's math functions); `_statfp`, `_clrfp`,
+  `_set_statfp` and `_raise_exc` never ran. Game B sets round toward zero
+  for a while (RN = 1 in what it read), which the cold path honors. So
+  exact sticky bits are not worth their cost: nothing reads them but an
+  error path that runs only with an FP exception unmasked, which no game
+  here does. What matters stays as it is: RN and NI honored, the Rc forms'
+  bits, FPCC from the compares, and `mtfsf` keeping what it is given.
 - For step A4: Xenia adds 0x1000 to addresses at 0xE0000000 and above (the
   4 KB offset of that physical view); `ops::host` is the one place to do it.
 

@@ -43,6 +43,7 @@ set(XF_GAME_CPU_LEVEL "v3" CACHE STRING "CPU level of the statically linked gene
 set_property(CACHE XF_GAME_CPU_LEVEL PROPERTY STRINGS v3 v2)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     set(XF_GAME_CPU_FLAGS)
+    set(_XF_GAME_CPU_LEVEL_NAME arm64)
 elseif(XF_GAME_CPU_LEVEL STREQUAL "v3")
     # 128-bit vectors preferred (game_build_flags.h: 256-bit ones cost 10%)
     set(XF_GAME_CPU_FLAGS -march=x86-64-v3 -mprefer-vector-width=128)
@@ -51,6 +52,23 @@ elseif(XF_GAME_CPU_LEVEL STREQUAL "v2")
 else()
     message(FATAL_ERROR "XF_GAME_CPU_LEVEL=${XF_GAME_CPU_LEVEL}: v3 or v2")
 endif()
+if(NOT _XF_GAME_CPU_LEVEL_NAME)
+    set(_XF_GAME_CPU_LEVEL_NAME ${XF_GAME_CPU_LEVEL})
+endif()
+
+# xenoforge_cpu_level_check(<target>): the CPU level check of an executable
+# with statically linked generated code (xenoforge/cpu_level_check.h): a
+# baseline-compiled file whose initializer runs before every other one and
+# stops the program with a message on a CPU without the level the generated
+# code was compiled for. A PREBUILT library is taken to be at XF_GAME_CPU_LEVEL.
+function(xenoforge_cpu_level_check target)
+    set(file ${CMAKE_CURRENT_BINARY_DIR}/xenoforge/cpu_level_check_${_XF_GAME_CPU_LEVEL_NAME}.cpp)
+    file(WRITE ${file}.tmp "// written by xenoforge_add_port: the CPU level check (xenoforge/cpu_level_check.h)\n"
+                           "#define XF_CPU_LEVEL_CHECK \"${_XF_GAME_CPU_LEVEL_NAME}\"\n"
+                           "#include <xenoforge/cpu_level_check.h>\n")
+    file(COPY_FILE ${file}.tmp ${file} ONLY_IF_DIFFERENT)
+    target_sources(${target} PRIVATE ${file})
+endfunction()
 
 function(xenoforge_add_port name)
     cmake_parse_arguments(P "NO_PLAYER;NO_BOOT;HOT_RELOAD" "ISO;XEX;PROJECT;OPT;GENERATED_DIR;PREBUILT"
@@ -168,6 +186,7 @@ function(xenoforge_add_port name)
             list(APPEND sources ${P_HOOK_SOURCES})
         endif()
         add_executable(${kind}_${name} ${sources})
+        xenoforge_cpu_level_check(${kind}_${name})
         target_compile_definitions(${kind}_${name} PRIVATE XF_PORT_LINKED ${P_DEFINITIONS})
         if(P_HOT_RELOAD)
             target_compile_definitions(${kind}_${name} PRIVATE "XF_PORT_HOOK_MODULE=\"$<TARGET_FILE_NAME:${name}_hooks>\"")
