@@ -71,6 +71,10 @@ set(_avcodec_sources
 list(REMOVE_DUPLICATES _avutil_sources)
 list(TRANSFORM _avutil_sources PREPEND "${_f}/libavutil/")
 list(TRANSFORM _avcodec_sources PREPEND "${_f}/libavcodec/")
+# wmaprodec.c is compiled through the overlay's libavcodec/xf_wmaprodec.c,
+# which includes it unchanged and adds xf_xmaframes_state_size
+list(REMOVE_ITEM _avcodec_sources "${_f}/libavcodec/wmaprodec.c")
+list(APPEND _avcodec_sources "${_ffmpeg_overlay}/libavcodec/xf_wmaprodec.c")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64")
     # (tx_float_init.c only lists the assembly codelets, not built: no x86asm)
     foreach(s cpu.c fixed_dsp_init.c float_dsp_init.c imgutils_init.c)

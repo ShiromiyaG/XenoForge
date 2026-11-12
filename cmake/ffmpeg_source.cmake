@@ -38,8 +38,10 @@ Its complete source is:
    XenoForge's source as third_party/ffmpeg (commit ${_commit}):
    the configuration headers (config.h, config_components.h,
    libavutil/avconfig.h, libavutil/ffversion.h, the codec, parser and
-   bitstream filter lists) and ffmpeg.cmake, the build script, which names
-   every FFmpeg source file compiled into the library.
+   bitstream filter lists), libavcodec/xf_wmaprodec.c (compiled in
+   wmaprodec.c's place: it includes wmaprodec.c unchanged and adds one
+   function, xf_xmaframes_state_size) and ffmpeg.cmake, the build script,
+   which names every FFmpeg source file compiled into the library.
 
 Built with ${XF_COMPILER}, by CMake, as XenoForge's CMakeLists.txt builds it
 (XF_XMA on; XF_FFMPEG_DIR may name a checkout of the fork at that commit).

@@ -949,7 +949,7 @@ void Xma::write_register(uint32_t address, uint32_t value) {
                 std::lock_guard<std::mutex> l(o.lock);
                 if (x.enabled) {
                     // a kick the decoder has not taken yet is complete, unwalked
-                    x.enabled = false;
+                    set_enabled(x, false);
                     if (x.walking)
                         x.cancelled = x.generation;
                     else
@@ -1003,7 +1003,7 @@ void Xma::kick(uint32_t first, uint32_t mask) {
         for (uint32_t v = mask; v; v &= v - 1) {
             uint32_t bit = std::countr_zero(v);
             Context &x = contexts_[first + bit];
-            x.enabled = true;
+            set_enabled(x, true);
             targets[bit] = ++x.generation;
             if (!x.kicked.exchange(true)) contexts_kicked++;
             if (x.done) x.done->set_signal_state(0);
@@ -1041,7 +1041,7 @@ bool Xma::work(Context &x) {
     {
         std::lock_guard<std::mutex> l(o.lock);
         if (!x.enabled) return false;
-        x.enabled = false;
+        set_enabled(x, false);
         x.walking = generation = x.generation;
     }
     if (x.allocated.load()) {
@@ -1058,12 +1058,34 @@ bool Xma::work(Context &x) {
     return true;
 }
 
+void Xma::set_enabled(Context &x, bool enabled) {
+    x.enabled = enabled;
+    const uint32_t bit = 1u << (x.id % 32);
+    if (enabled)
+        pending_[x.id / 32].fetch_or(bit, std::memory_order_release);
+    else
+        pending_[x.id / 32].fetch_and(~bit, std::memory_order_relaxed);
+}
+
 void Xma::worker(Thread &self) {
     Objects &o = objects(*k);
     Dispatcher *const work_event[] = {work_.get()};
     while (running_.load()) {
+        // the contexts in order, as a pass over all 320 took them, each
+        // word read again after a run so a kick behind the pass is seen in
+        // it; the dispatcher lock (the kernel's, every guest wait's) only
+        // for a context with a kick: taking it 320 times a pass made the
+        // decoder's thread half lock traffic, and the guest's threads wait
+        // behind it
         bool did_work = false;
-        for (uint32_t n = 0; n < CONTEXT_COUNT; n++) did_work = work(contexts_[n]) || did_work;
+        for (uint32_t w = 0; w < pending_.size(); w++) {
+            uint32_t past = 0; // the bits at or below the last context run
+            for (uint32_t v; (v = pending_[w].load(std::memory_order_acquire) & ~past) != 0;) {
+                const uint32_t bit = uint32_t(std::countr_zero(v));
+                past = bit == 31 ? ~0u : (2u << bit) - 1;
+                did_work = work(contexts_[w * 32 + bit]) || did_work;
+            }
+        }
         if (did_work) continue;
         o.wait(self, work_event, false, false, Scheduler::NEVER);
     }

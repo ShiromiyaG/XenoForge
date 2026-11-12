@@ -898,6 +898,33 @@ As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
   (times 32767, rounded to nearest even, saturated). FFmpeg's first errors
   are printed and all counted. `XF_XMA_SILENT=1` puts the silent decoder
   in its place, to measure what decoding costs.
+- **The decoder's thread, measured in play (2026-11-12).** One game's XMA
+  thread took 17% of a core, and its profile was not decoding: 56% was the
+  kernel's dispatcher lock (every guest wait's), which the worker took for
+  each of the 320 contexts on every pass to look at a kick flag, the
+  guest's threads queueing behind it; 9% was FFmpeg opening decoders again
+  (the transforms' tables made at every open, a quarter of a millisecond:
+  the game allocated 57 contexts a second, a slot often taking another rate
+  or channel count than its last); the transforms themselves were about
+  2.5%, so FFmpeg's assembly (not built: no nasm here) would not pay. Now:
+  - the kicked contexts are a bitmap beside their flags (`Xma::pending_`,
+    set and cleared with them under the lock); the worker walks the set
+    bits in the same order a pass over all 320 took them and takes the lock
+    only for those;
+  - an opened decoder whose slot changes rate or channels is kept (64 at
+    most) for the next context with its rate and channels, its private
+    state written back as avcodec_open2 left it: the non-zero 64-byte
+    blocks of it saved at the open (a few KB of its 250 KB), the rest zeros,
+    and the codec context's own queues flushed. Everything the decoding
+    changes is inside that structure (the overlap buffers, the bit
+    reservoir), so it is the state of a new decoder. The structure's size
+    comes from `xf_xmaframes_state_size`, the one function XenoForge's build
+    adds (`third_party/ffmpeg/libavcodec/xf_wmaprodec.c` includes
+    wmaprodec.c unchanged and adds it); a build of the library without it
+    gets a new decoder at every change, as Xenia. `XF_XMA_KEEP_DECODERS=0`
+    turns it off. The five recordings replay byte for byte as before and as
+    Xenia's (`xma_replay_test`; two of them put kept decoders back, 23 and
+    14 times).
 - **FFmpeg, built** (`third_party/ffmpeg/ffmpeg.cmake`): CMake's `XF_XMA`
   (on by default) fetches the fork's archive at that commit, or builds from
   `XF_FFMPEG_DIR` (a checkout of it; xenia-canary's
@@ -911,7 +938,9 @@ As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
   FFmpeg's headers and never linked to the library. The first decoder made
   loads `ffmpeg-xma` (LoadLibrary, dlopen) from the executable's folder,
   else wherever the system finds libraries, and looks up the thirteen
-  functions it calls by name. Without it, or with one that lacks a
+  functions it calls by name (and two it can do without:
+  `avcodec_flush_buffers` and XenoForge's `xf_xmaframes_state_size`, for
+  the kept decoders). Without it, or with one that lacks a
   function, one line on stderr says so and every XMA frame decodes to
   silence, as with `XF_XMA` off; the program starts and runs either way
   (before, linked through the import library, it would not start). Xenia

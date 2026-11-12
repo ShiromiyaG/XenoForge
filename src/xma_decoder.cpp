@@ -47,8 +47,14 @@ extern "C" {
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
+#include <cstdlib>
 #include <filesystem>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -95,6 +101,11 @@ struct Ffmpeg {
 #define XF_FFMPEG_POINTER(name) decltype(&::name) name = nullptr;
     XF_FFMPEG_FUNCTIONS(XF_FFMPEG_POINTER)
 #undef XF_FFMPEG_POINTER
+    // looked up too, not needed: a decoder kept and put back as opened
+    // (FfmpegDecoder::keep) needs both; xf_xmaframes_state_size is only in
+    // XenoForge's build of the library (third_party/ffmpeg/libavcodec/xf_wmaprodec.c)
+    decltype(&::avcodec_flush_buffers) avcodec_flush_buffers = nullptr;
+    int (*xf_xmaframes_state_size)() = nullptr;
 };
 
 #ifdef _WIN32
@@ -152,6 +163,9 @@ const Ffmpeg *load_ffmpeg() {
             std::fprintf(stderr, "xma: %s has no %s: XMA decodes to silence\n", where.c_str(), missing);
             return nullptr;
         }
+        f.avcodec_flush_buffers = reinterpret_cast<decltype(f.avcodec_flush_buffers)>(symbol("avcodec_flush_buffers"));
+        f.xf_xmaframes_state_size =
+            reinterpret_cast<decltype(f.xf_xmaframes_state_size)>(symbol("xf_xmaframes_state_size"));
         return &f;
     }();
     return loaded;
@@ -206,6 +220,11 @@ public:
         f_.av_log_set_callback(ffmpeg_log);
         codec_ = f_.avcodec_find_decoder(AV_CODEC_ID_XMAFRAMES);
         if (!codec_) std::fprintf(stderr, "xma: FFmpeg has no xmaframes decoder; frames decode to nothing\n");
+        // XF_XMA_KEEP_DECODERS=0: every change of rate or channels opens a
+        // new decoder, as Xenia does
+        const char *keep = std::getenv("XF_XMA_KEEP_DECODERS");
+        if (f_.avcodec_flush_buffers && f_.xf_xmaframes_state_size && !(keep && std::strcmp(keep, "0") == 0))
+            state_size_ = size_t(std::max(0, f_.xf_xmaframes_state_size()));
     }
     ~FfmpegDecoder() override {
         for (State &s : states_) {
@@ -213,6 +232,10 @@ public:
             if (s.frame) f_.av_frame_free(&s.frame);
             if (s.packet) f_.av_packet_free(&s.packet);
         }
+        for (auto &[key, kept] : kept_)
+            for (Kept &k : kept) f_.avcodec_free_context(&k.context);
+        if (opens_ || reuses_)
+            std::fprintf(stderr, "xma: %u decoders opened, %u kept ones put back\n", opens_.load(), reuses_.load());
     }
 
     bool decode(uint32_t context, const uint8_t *data, uint32_t size, uint32_t sample_rate, uint32_t channels,
@@ -238,10 +261,22 @@ public:
     }
 
 private:
+    // A decoder's private state as avcodec_open2 left it, to put back: the
+    // non-zero 64-byte blocks of it (the output and overlap buffers, most of
+    // its 250 KB, are zero then), the rest written as zeros
+    struct Opened {
+        std::vector<std::pair<uint32_t, uint32_t>> blocks; // offset, length
+        std::vector<uint8_t> bytes;
+    };
     struct State {
         AVCodecContext *context = nullptr;
+        std::unique_ptr<Opened> opened; // the context's state when opened, when kept (state_size_)
         AVFrame *frame = nullptr;
         AVPacket *packet = nullptr;
+    };
+    struct Kept {
+        AVCodecContext *context = nullptr;
+        std::unique_ptr<Opened> opened;
     };
 
     // Setup: the codec context made, not opened (PrepareDecoder opens it)
@@ -255,10 +290,19 @@ private:
         return true;
     }
 
-    // PrepareDecoder: a new codec context when the rate or the channels change
+    // PrepareDecoder: a new codec context when the rate or the channels
+    // change. Where Xenia opens one each time (the transforms' tables made
+    // again: a quarter of a millisecond, at every context a game allocates
+    // with another rate or channels than the one before in its slot), an
+    // opened decoder is kept for the next context with its rate and
+    // channels, its state put back as it was opened: the same as a new one
     int prepare(State &s, int sample_rate, int channels) {
         if (s.context->sample_rate == sample_rate && s.context->ch_layout.nb_channels == channels) return 0;
-        f_.avcodec_free_context(&s.context);
+        if (s.opened)
+            keep(s);
+        else
+            f_.avcodec_free_context(&s.context);
+        if (take(s, sample_rate, channels)) return 1;
         s.context = f_.avcodec_alloc_context3(codec_);
         if (!s.context) return -1;
         s.context->sample_rate = sample_rate;
@@ -271,12 +315,74 @@ private:
             s.context->sample_rate = 0;
             return -1;
         }
+        if (state_size_ && s.context->priv_data) s.opened = save(s.context->priv_data);
+        opens_++;
         return 1;
     }
 
+    std::unique_ptr<Opened> save(const void *state) const {
+        auto opened = std::make_unique<Opened>();
+        const auto *bytes = static_cast<const uint8_t *>(state);
+        constexpr uint32_t BLOCK = 64;
+        for (uint32_t at = 0; at < state_size_; at += BLOCK) {
+            const uint32_t n = uint32_t(std::min<size_t>(BLOCK, state_size_ - at));
+            if (std::all_of(bytes + at, bytes + at + n, [](uint8_t b) { return b == 0; })) continue;
+            if (!opened->blocks.empty() && opened->blocks.back().first + opened->blocks.back().second == at)
+                opened->blocks.back().second += n;
+            else
+                opened->blocks.emplace_back(at, n);
+            opened->bytes.insert(opened->bytes.end(), bytes + at, bytes + at + n);
+        }
+        return opened;
+    }
+
+    // the slot's decoder kept for another context, up to KEPT of them in all
+    void keep(State &s) {
+        const std::pair<int, int> key{s.context->sample_rate, s.context->ch_layout.nb_channels};
+        {
+            std::lock_guard<std::mutex> l(kept_mutex_);
+            if (kept_count_ < KEPT) {
+                kept_[key].push_back(Kept{s.context, std::move(s.opened)});
+                kept_count_++;
+                s.context = nullptr;
+                return;
+            }
+        }
+        f_.avcodec_free_context(&s.context);
+        s.opened.reset();
+    }
+
+    // a kept decoder of this rate and channels, its state as when opened
+    bool take(State &s, int sample_rate, int channels) {
+        Kept k;
+        {
+            std::lock_guard<std::mutex> l(kept_mutex_);
+            auto it = kept_.find({sample_rate, channels});
+            if (it == kept_.end() || it->second.empty()) return false;
+            k = std::move(it->second.back());
+            it->second.pop_back();
+            kept_count_--;
+        }
+        auto *state = static_cast<uint8_t *>(k.context->priv_data);
+        std::memset(state, 0, state_size_);
+        const uint8_t *from = k.opened->bytes.data();
+        for (auto [at, n] : k.opened->blocks) std::memcpy(state + at, from, n), from += n;
+        f_.avcodec_flush_buffers(k.context); // the codec context's own queues (the decoder has no flush)
+        s.context = k.context;
+        s.opened = std::move(k.opened);
+        reuses_++;
+        return true;
+    }
+
+    static constexpr uint32_t KEPT = 64;
     const Ffmpeg &f_;
     const AVCodec *codec_ = nullptr;
     std::array<State, CONTEXTS> states_;
+    size_t state_size_ = 0; // 0: decoders not kept
+    std::mutex kept_mutex_;
+    std::map<std::pair<int, int>, std::vector<Kept>> kept_;
+    uint32_t kept_count_ = 0;
+    std::atomic<uint32_t> opens_{0}, reuses_{0};
 };
 
 #endif

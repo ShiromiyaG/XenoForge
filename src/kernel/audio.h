@@ -228,9 +228,14 @@ private:
     bool work(Context &x);
     void kick(uint32_t first, uint32_t mask);
     void complete(Context &x, uint64_t generation); // lock held
+    void set_enabled(Context &x, bool enabled);     // lock held
     int32_t context_id(uint32_t guest) const;
 
     std::unique_ptr<Context[]> contexts_;
+    // the contexts kicked and not yet taken, a bit each (x.enabled's copy,
+    // written under the dispatcher lock): the worker looks here and takes
+    // the lock only for a context that has a kick, not for all 320
+    std::array<std::atomic<uint32_t>, CONTEXT_COUNT / 32> pending_{};
     std::mutex registers_mutex_;
     std::array<uint32_t, REGISTERS> registers_{};
     std::vector<bool> logged_; // unhandled registers logged once
