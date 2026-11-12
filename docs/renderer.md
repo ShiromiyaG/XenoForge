@@ -1946,6 +1946,76 @@ only a cheaper way to change shaders would cut them (shader objects,
 `VK_EXT_shader_object`, where the driver has them: a stage bound alone, no
 pipeline), to be measured by a bind's cost first.
 
+**Shader objects measured (2026-11-12).** On the RTX 5060 (driver 621.01,
+`shaderObject` native) switching shaders by shader objects is cheaper than
+by pipelines alone in a loop, and not in the renderer's command stream. The
+prototype and its two tools (about 650 lines of renderer.cpp) were built,
+measured and left out of the renderer; they are described here as they were
+(a local branch, `experiment-shader-objects`, keeps them). The tools:
+
+- `XF_BIND_BENCH=<rounds>`: the renderer keeps the draws' pipeline binds of
+  the first swap in order, with each pipeline's description and its
+  modules' SPIR-V, and at its end records that sequence again into a
+  command buffer of its own (never submitted), a three-vertex draw after
+  each switch, in seven ways, interleaved round by round. Game G's in-play
+  frame: 2,668 binds, 2,140 of pipelines of a vertex and a pixel shader
+  alone (287 pipelines), the state a pipeline bakes (vertex input, samples,
+  sample mask, alpha to coverage, polygon mode, depth clamp, sample
+  locations) changing at 7 of them. Beyond the draw, a switch costs: a
+  pipeline 466 ns (849 with the machine busier), the same pipeline bound
+  again 182 (327), unlinked shader objects 254 (382), with their baked
+  state where it changed 244 (377), with all of it at every switch 452
+  (767), linked pairs (`VK_SHADER_CREATE_LINK_STAGE_BIT_EXT`) 277 (408).
+- `XF_RECORD_PROFILE=1`: the time in the driver's commands by kind, timed
+  where the command thread records them, printed at the end.
+
+The prototype, `XF_SHADER_OBJECTS=1` (a shader object a module and
+specialization) or `=2` (a linked pair a pipeline), off by default: where
+the device has `VK_EXT_shader_object` (enabled only when asked for;
+`XF_VK_NO_SHADER_OBJECT=1` turns it off), a draw whose pipeline would hold a
+vertex and a pixel shader alone, without sample shading, alpha to one, a
+logic op, the depth bounds test or baked blending, binds shader objects and
+sets what the pipeline would have baked where it changed (`ShaderObjects`,
+`Impl::shader_objects`, `bind_objects`); after a pipeline (the draws' or the
+renderer's own) the stages without shaders are bound to none and every
+state is set again, the viewport and scissor with their count. The rest
+(528 binds a play of game G's frame, 119 of game D's drive) keep their
+pipelines. The pictures are the same (game G's frame identical to the
+pipelines' picture, the regression unchanged both ways), validation clean.
+
+In the stream the gain is gone: a pipeline bind took 863-1,322 ns, a
+shader object bind 1,262-1,510 ns unlinked and 924-988 linked (the binds'
+cost is cold caches and the driver's work at the next draw, not the call's
+own: the draws took 84-134 ns after pipelines, 124-196 after shader
+objects), and the pipelines left cost more after shader objects (1,224-
+1,811 ns: every state set again). Per play (15 plays, the commands'
+processor time, A B interleaved, other agents' builds at 34-76% of the
+processor): game G 30.3/33.8/27.3 ms with pipelines, 31.9/25.5/24.1 linked,
+32.8/27.7/28.9 unlinked, all within the noise; the driver's commands
+alone, 15 plays, 69.9/78.4/64.7 against 83.2/66.6/62.7 and 77.0/65.0/71.0
+ms. Game D's drive, driver's commands for 15 plays: 23.8/25.9/23.5 with
+pipelines, 25.0/26.7/25.9 linked, 29.4/26.2/24.6 unlinked: shader objects
+lose. GPU time a play: game G 15.1-15.6 ms with pipelines, 15.6-15.7 with
+linked shader objects; game D 9.51-9.56 against 9.56-9.80 (linked) and
+9.56-9.60 (unlinked): no gain, a little lost.
+
+Making them: the driver's caches keep pipelines (game G's 287 made again
+in the same process in 1.5 ms; the renderer's first play makes them in
+1.2 s with the disk cache turned off by `__GL_SHADER_DISK_CACHE=0`) but not
+shader objects, made again at every run: game G's 398 unlinked in 2.4-5.7 s (6-14 ms each), its 574 linked in
+3.1 s; game D's 199 in 1.1 s. The bench once took 148 ms each for the
+unlinked ones with the disk cache on and 4.7 ms with it off (not explained).
+A cache of the renderer's own would take `vkGetShaderBinaryDataEXT`, and the
+build step, which prepares pipelines today, would have to prepare the
+shader objects' binaries the same way.
+
+So shader objects were left out: on this driver they do not make a switch
+cheaper where the renderer switches, and they cost GPU time and hitches;
+where `shaderObject` is layered over pipelines (drivers without native
+support) they can only be slower. What would cut the binds is fewer of them:
+the draws' order is the guest's, and each of game G's binds already
+changes shaders.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches
