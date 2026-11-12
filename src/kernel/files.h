@@ -197,6 +197,8 @@ class FileSystem {
 
     void add_device(std::shared_ptr<Device> device);
     bool remove_device(std::string_view mount_path);
+    // whether a mount's path is the path or starts it (at a backslash)
+    bool has_device(std::string_view resolved);
     // A symbolic link of the system's (game:, cache:, a content root), in
     // the object manager's list where ObCreateSymbolicLink puts the game's.
     bool add_link(const std::string &path, const std::string &target);

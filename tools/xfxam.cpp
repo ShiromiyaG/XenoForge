@@ -640,8 +640,8 @@ std::string run_prepare(Side &s, const std::vector<std::string> &calls, double s
 //   0x816E5118  makes the title's heap (heap 0 of its table: the one XamAlloc
 //               and every call that allocates on a title's thread use; the
 //               launch's state machine makes it as it reaches "title started");
-//   0x816DF2F8  stores the current title's ID (what XamGetCurrentTitleId and
-//               XNetLogonGetTitleID answer; its start stores 0). The title's
+//   0x816DF2F8  stores the current title's ID (what XamGetCurrentTitleId
+//               answers; its start stores 0). The title's
 //               execution info XAM reads live from the kernel's executable
 //               module (RtlImageXexHeaderField), which the kernel holds already.
 // {title} stands for the synthetic title's ID.

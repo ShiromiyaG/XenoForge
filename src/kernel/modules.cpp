@@ -274,7 +274,7 @@ struct Modules {
     std::vector<Module *> loaded;
     std::vector<std::string> unloaded; // their paths, for the report
     uint32_t globals = 0;
-    std::vector<std::pair<uint32_t, uint32_t>> terminate_notifications; // routine, priority
+    std::vector<std::pair<uint32_t, uint32_t>> terminate_notifications; // registration, priority
 };
 
 bool equal_case(std::string_view a, std::string_view b) {
@@ -746,10 +746,13 @@ uint32_t system_process(Kernel &k) { return k.state<Modules>().globals + SYSTEM_
 
 // The routines ExRegisterTitleTerminateNotification registered, run as the
 // title ends (XamLoaderTerminateTitle, ExTerminateTitleProcess, a launch),
-// the highest priority first, each once, with r3 = 0, on the thread that ends
-// the title. Xenia never runs them. NT's own order and arguments are not
-// known (docs/xenia-todos-kernel.md, the hardware list); this is the
-// natural reading of a priority.
+// the highest priority first (ties in registration order), each once, with r3
+// the registration structure (the console's kernel calls the routine its first
+// word names with that pointer: XAM's routines take the structure XAM embeds it
+// in from it), on the thread that ends the title. Xenia never runs them. The
+// console keeps the registrations in its list and runs them at every
+// termination, and removes one only when asked; here each runs once, the one
+// title a kernel here holds ending once.
 void run_title_terminate_notifications(Kernel &k, ppc::Context &c) {
     std::vector<std::pair<uint32_t, uint32_t>> routines;
     {
@@ -758,10 +761,11 @@ void run_title_terminate_notifications(Kernel &k, ppc::Context &c) {
         routines.swap(s.terminate_notifications);
     }
     std::stable_sort(routines.begin(), routines.end(),
-                     [](const auto &x, const auto &y) { return x.second > y.second; });
-    for (const auto &[routine, priority] : routines) {
+                     [](const auto &x, const auto &y) { return int32_t(x.second) > int32_t(y.second); });
+    for (const auto &[reg, priority] : routines) {
+        uint32_t routine = k.load32(reg);
         std::fprintf(stderr, "kernel: title terminate notification 0x%08X (priority %u)\n", routine, priority);
-        c.r[3] = 0;
+        c.r[3] = reg;
         k.call(c, routine);
     }
 }
@@ -1147,12 +1151,11 @@ XF_EXPORT(xboxkrnl, ExRegisterTitleTerminateNotification) {
     uint32_t reg = arg(k, c, 0), create = arg(k, c, 1);
     Modules &s = k.state<Modules>();
     std::lock_guard lock(s.mutex);
-    uint32_t routine = k.load32(reg);
     if (create) {
-        s.terminate_notifications.emplace_back(routine, k.load32(reg + 4));
+        s.terminate_notifications.emplace_back(reg, k.load32(reg + 4));
     } else {
         auto it = std::find_if(s.terminate_notifications.begin(), s.terminate_notifications.end(),
-                               [&](const auto &n) { return n.first == routine; });
+                               [&](const auto &n) { return n.first == reg; });
         if (it != s.terminate_notifications.end()) s.terminate_notifications.erase(it);
     }
 }

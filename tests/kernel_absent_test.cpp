@@ -9,6 +9,8 @@
 
 #include "kernel_harness.h"
 
+#include "files.h"
+
 #include <cstring>
 
 using namespace xf;
@@ -36,11 +38,11 @@ void camera() {
     CHECK(cam(29, &second) == 0 && second == DEVICE_NOT_CONNECTED);
     for (uint32_t t : {10u, 38u, 45u}) CHECK(cam(t) == 0);
     CHECK(cam(13) == DEVICE_NOT_READY);
-    for (uint32_t t : {1u, 2u, 3u, 5u, 8u, 14u, 15u, 18u, 19u, 20u, 21u, 24u, 25u, 27u, 30u, 33u, 34u, 35u, 36u, 37u,
-                       40u, 41u, 43u, 44u, 46u, 47u})
+    for (uint32_t t : {1u,  2u,  3u,  5u,  8u,  14u, 15u, 18u, 19u, 20u, 21u, 24u, 25u,
+                       27u, 30u, 33u, 34u, 35u, 36u, 37u, 40u, 41u, 43u, 44u, 46u, 47u})
         CHECK(cam(t) == DEVICE_NOT_CONNECTED);
-    for (uint32_t t : {4u, 6u, 7u, 9u, 11u, 12u, 16u, 17u, 22u, 23u, 26u, 28u, 31u, 32u, 39u, 42u, 48u, 105u, 106u,
-                       1000u})
+    for (uint32_t t :
+         {4u, 6u, 7u, 9u, 11u, 12u, 16u, 17u, 22u, 23u, 26u, 28u, 31u, 32u, 39u, 42u, 48u, 105u, 106u, 1000u})
         CHECK(cam(t) == INVALID_DEVICE_REQUEST);
 }
 
@@ -61,19 +63,21 @@ void receiver() {
 }
 
 void force_feedback() {
-    const char *names[] = {"XInputdFFGetDeviceInfo", "XInputdFFSetEffect",     "XInputdFFUpdateEffect",
+    const char *names[] = {"XInputdFFGetDeviceInfo",   "XInputdFFSetEffect",     "XInputdFFUpdateEffect",
                            "XInputdFFEffectOperation", "XInputdFFDeviceControl", "XInputdFFSetDeviceGain",
                            "XInputdFFSetRumble"};
     uint32_t buffer = h.alloc(64);
     for (const char *name : names) {
-        for (uint32_t port = 0; port < 4; port++) CHECK(h.krnl(name, {0x10000000 | port, buffer, 0, 0}) == INVALID_DEVICE_REQUEST);
+        for (uint32_t port = 0; port < 4; port++)
+            CHECK(h.krnl(name, {0x10000000 | port, buffer, 0, 0}) == INVALID_DEVICE_REQUEST);
         CHECK(h.krnl(name, {0x10000004, buffer, 0, 0}) == DEVICE_NOT_CONNECTED);
         CHECK(h.krnl(name, {0x1000000F, buffer, 0, 0}) == DEVICE_NOT_CONNECTED);
         CHECK(h.krnl(name, {0x20000000, buffer, 0, 0}) == UNSUCCESSFUL);
         CHECK(h.krnl(name, {0, buffer, 0, 0}) == UNSUCCESSFUL);
     }
     // the cancel of I/O does not tell the ports apart
-    for (uint32_t port : {0u, 3u, 4u, 15u}) CHECK(h.krnl("XInputdFFCancelIo", {0x10000000 | port, 0, 0, 0}) == INVALID_DEVICE_REQUEST);
+    for (uint32_t port : {0u, 3u, 4u, 15u})
+        CHECK(h.krnl("XInputdFFCancelIo", {0x10000000 | port, 0, 0, 0}) == INVALID_DEVICE_REQUEST);
     CHECK(h.krnl("XInputdFFCancelIo", {0x30000000, 0, 0, 0}) == UNSUCCESSFUL);
 }
 
@@ -107,7 +111,8 @@ void event_trace() {
     CHECK(h.krnl("EtxProducerUnregister", {block}) == INVALID_PARAMETER);
     CHECK(h.krnl("EtxProducerLog", {block, 0, 0, 0, 0, 0}) == INVALID_PARAMETER);
     uint32_t block3 = h.alloc(BLOCK);
-    CHECK(h.krnl("EtxProducerRegister", {id, events, 3, 0, 0x80, block3}) == 0 && h.k->load32(block3 + 0x18) >> 22 == 2); // the search goes on from the last slot given
+    CHECK(h.krnl("EtxProducerRegister", {id, events, 3, 0, 0x80, block3}) == 0 &&
+          h.k->load32(block3 + 0x18) >> 22 == 2); // the search goes on from the last slot given
     // the table holds 128 producers
     uint32_t blocks[130];
     uint32_t ok = 0, full = 0;
@@ -207,9 +212,11 @@ void xam_absent() {
     std::memset(h.k->host(xuid), 0xAA, 8);
     CHECK(x("XCustomGetCurrentGamercard", {user, xuid}) == 0 && h.k->load64(xuid) == 0);
     CHECK(x("XCustomGetCurrentGamercard", {0, xuid}) == 0);
-    CHECK(x("XCustomSetDynamicActions", {0, 1, buffer, 1}) == 5 && x("XCustomSetDynamicActions", {0, 1, buffer, 3}) == 5);
+    CHECK(x("XCustomSetDynamicActions", {0, 1, buffer, 1}) == 5 &&
+          x("XCustomSetDynamicActions", {0, 1, buffer, 3}) == 5);
     CHECK(x("XCustomSetDynamicActions", {0, 1, buffer, 4}) == 0x57);
-    CHECK(x("XCustomSetDynamicActions", {0xFE, 1, buffer, 1}) == 0 && x("XCustomSetDynamicActions", {0, 0, buffer, 1}) == 0);
+    CHECK(x("XCustomSetDynamicActions", {0xFE, 1, buffer, 1}) == 0 &&
+          x("XCustomSetDynamicActions", {0, 0, buffer, 1}) == 0);
     CHECK(x("XCustomSetDynamicActions", {0, 1, 0, 1}) == 0 && x("XCustomSetDynamicActions", {0, 1, buffer, 0}) == 0);
     x("XCustomUnregisterDynamicActions", {});
     // a pad's vibration setting and raw state
@@ -218,7 +225,8 @@ void xam_absent() {
     h.k->store32(level, 0xAAAAAAAA);
     uint32_t r = x("XamInputGetUserVibrationLevel", {0, level});
     CHECK((r == 0 && h.k->load32(level) == 3) || (r == 0x48F && h.k->load32(level) == 0xAAAAAAAA));
-    CHECK(x("XamInputGetUserVibrationLevel", {4, level}) == 0x48F && x("XamInputGetUserVibrationLevel", {0xFF, level}) == 0x48F);
+    CHECK(x("XamInputGetUserVibrationLevel", {4, level}) == 0x48F &&
+          x("XamInputGetUserVibrationLevel", {0xFF, level}) == 0x48F);
 }
 
 void xnet_absent() {
@@ -234,7 +242,8 @@ void xnet_absent() {
     // none contacted
     uint32_t qos_ptr = h.alloc(4), ina = h.alloc(8), service = h.alloc(8), event = 0;
     std::memset(h.k->host(qos_ptr), 0xAA, 4);
-    CHECK(x("NetDll_XNetQosLookup", {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, qos_ptr}) == 0 && h.k->load32(qos_ptr) == 0xAAAAAAAA);
+    CHECK(x("NetDll_XNetQosLookup", {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, qos_ptr}) == 0 &&
+          h.k->load32(qos_ptr) == 0xAAAAAAAA);
     CHECK(x("NetDll_XNetQosLookup", {1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, qos_ptr}) == 10022);
     h.k->store32(ina, 0x0A000001), h.k->store32(ina + 4, 0x0A000002);
     CHECK(x("NetDll_XNetQosLookup", {1, 0, 0, 0, 0, 2, ina, service, 5, 0, 0, event, qos_ptr}) == 0);
@@ -249,7 +258,8 @@ void xnet_absent() {
     CHECK(x("NetDll_getpeername", {1, 0x1234, name, length}) == 0xFFFFFFFF);
     uint32_t socket = x("NetDll_socket", {1, 2, 2, 17});
     CHECK(socket != 0xFFFFFFFF);
-    CHECK(x("NetDll_getpeername", {1, socket, name, length}) == 0xFFFFFFFF); // (the errors are the net test's, on guest threads)
+    CHECK(x("NetDll_getpeername", {1, socket, name, length}) ==
+          0xFFFFFFFF); // (the errors are the net test's, on guest threads)
     CHECK(x("NetDll_closesocket", {1, socket}) == 0);
 }
 
@@ -273,10 +283,109 @@ void console_answers() {
     CHECK(h.krnl("StfsCreateDevice", {parameters, 0x58, 0}) == 0);
 }
 
+// The voice objects the console's XAM makes (no headset, no driver device) and
+// the voice driver's answers; the four calls its launch reaches.
+void voice_and_launch() {
+    uint32_t out = h.alloc(16);
+    auto x = [&](const char *name, std::initializer_list<uint64_t> a) { return h.call32("xam", name, a); };
+    // the voice: a slot of the table, its packets in a free list
+    h.k->store32(out, 0xAAAAAAAA);
+    CHECK(x("XamVoiceCreate", {0, 15, out}) == 0);
+    uint32_t voice = h.k->load32(out), buffer = h.k->load32(voice + 8);
+    CHECK(voice != 0 && buffer != 0 && h.k->load32(voice + 4) == 15 && h.k->host(voice)[0x14] == 1);
+    CHECK(h.k->load32(voice + 0xC) == buffer + 14 * 16 && h.k->load32(voice + 0x10) == buffer);
+    CHECK(h.k->load32(buffer + 8) == voice && h.k->load32(buffer + 14 * 16 + 12) == buffer + 13 * 16);
+    CHECK(h.k->load32(buffer + 12) == 0 && h.k->load32(voice + 0x1C) == voice + 0x1C);
+    CHECK(h.k->load64(voice + 0x28) != 0 && h.k->load64(voice + 0x30) == 0);
+    // the slot is the user's (four to a side); a second make takes the same one
+    CHECK(x("XamVoiceCreate", {0, 15, out}) == 0 && h.k->load32(out) == voice);
+    CHECK(x("XamVoiceCreate", {1, 4, out}) == 0 && h.k->load32(out) == voice + 0x38);
+    CHECK(x("XamVoiceCreate", {5, 4, out}) == 0 && h.k->load32(out) == voice + 5 * 0x38);
+    CHECK(x("XamVoiceCreate", {8, 4, out}) == 0x80070057);
+    // a buffer that cannot be had: nothing, and a null pointer written
+    h.k->store32(out, 0xAAAAAAAA);
+    CHECK(x("XamVoiceCreate", {2, 0x10000000, out}) == 0x8007000E && h.k->load32(out) == 0);
+    CHECK(x("XamVoiceCreate", {2, 0, out}) == 0 && h.k->load32(out) == voice + 2 * 0x38 &&
+          h.k->load32(voice + 2 * 0x38 + 0xC) == 0);
+    // with no device: no headset, nothing to submit to; the title's process is the active one
+    CHECK(x("XamVoiceHeadsetPresent", {voice}) == 0);
+    CHECK(x("XamVoiceSubmitPacket", {voice, 0, out}) == 0xD000009D);
+    CHECK(x("XamVoiceIsActiveProcess", {}) == 1);
+    h.krnl("XVoicedActivate", {1});
+    CHECK(x("XamVoiceIsActiveProcess", {}) == 0 && h.krnl("XVoicedIsActiveProcess") == 0);
+    h.krnl("XVoicedActivate", {0});
+    CHECK(h.krnl("XVoicedIsActiveProcess") == 1);
+    CHECK(h.krnl("XVoicedGetDirectionalData", {voice, out}) == 0x10DF &&
+          h.krnl("XVoicedGetBatteryStatus", {0, out}) == 0x10DF);
+    CHECK(h.krnl("XVoicedSendVPort", {0x1234, 0}) == 0x1234 && h.krnl("XVoicedClose", {voice}) == 0);
+    // closing frees the buffer and answers TRUE
+    CHECK(x("XamVoiceClose", {voice}) == 1);
+    CHECK(h.k->load32(voice + 8) == 0 && h.k->load32(voice + 4) == 0 && h.k->load64(voice + 0x28) == 0);
+    CHECK(x("XamVoiceClose", {voice}) == 1);
+
+    // XNetLogonGetTitleID: the logon service's own ID, as in kernel_net_test
+
+    // KeSetPriorityClassThread: the class change moves the bases
+    uint32_t process = h.alloc(0x60), thread = h.alloc(0x400);
+    std::memset(h.k->host(process), 0, 0x60);
+    std::memset(h.k->host(thread), 0, 0x400);
+    h.k->store32(process + 0xC, 0x77);
+    h.k->store32(thread + 0x84, process);
+    uint8_t *g = h.k->host(thread);
+    g[0xC9] = 5, g[0xB9] = 9, g[0x70] = 9, g[0xC8] = 5, g[0xCA] = 11;
+    h.krnl("KeSetPriorityClassThread", {thread, 1});
+    CHECK(g[0xC9] == 13 && g[0xB9] == 17 && g[0x70] == 17 && g[0xC8] == 13 && g[0xCA] == 19);
+    CHECK(h.k->load32(thread + 0xB4) == 0x77);
+    h.krnl("KeSetPriorityClassThread", {thread, 1}); // the same class: nothing
+    CHECK(g[0xB9] == 17);
+    h.krnl("KeSetPriorityClassThread", {thread, 0});
+    CHECK(g[0xC9] == 5 && g[0xB9] == 9 && g[0x70] == 9);
+    g[0x70] = 0x12; // a real-time thread keeps its priority
+    h.krnl("KeSetPriorityClassThread", {thread, 1});
+    CHECK(g[0xB9] == 17 && g[0x70] == 0x12);
+
+    CHECK(h.krnl("XexShimLock") == 0);
+
+    // IoSynchronousDeviceIoControlRequest: a device with no driver
+    uint32_t device = h.alloc(0x50), returned = h.alloc(4);
+    std::memset(h.k->host(device), 0, 0x50);
+    h.k->store16(device, 3);
+    h.k->store32(returned, 0x55);
+    CHECK(h.krnl("IoSynchronousDeviceIoControlRequest", {0x4D014, device, 0, 0, 0, 0, returned}) ==
+          INVALID_DEVICE_REQUEST);
+    CHECK(h.k->load32(returned) == 0);
+    CHECK(h.krnl("IoSynchronousDeviceIoControlRequest", {0x4D014, 0, 0, 0, 0, 0, returned}) == INVALID_PARAMETER);
+
+    // ObTranslateSymbolicLink: links followed, devices found, the rest appended
+    xf::kernel::file_system(*h.k).add_link("\\TestLink", "\\Device\\Cdrom0");
+    uint32_t attributes = h.alloc(12), name = h.alloc(8), text = h.alloc(64), result = h.alloc(8), buf = h.alloc(64);
+    h.k->store32(name + 4, text);
+    h.k->store32(attributes + 4, name);
+    h.k->store16(result + 2, 64);
+    h.k->store32(result + 4, buf);
+    auto translate = [&](const char *path, uint32_t root = 0) {
+        std::memcpy(h.k->host(text), path, std::strlen(path) + 1);
+        h.k->store16(name, uint16_t(std::strlen(path)));
+        h.k->store16(name + 2, 64);
+        h.k->store32(attributes, root);
+        h.k->store16(result, 0xFFFF);
+        return h.krnl("ObTranslateSymbolicLink", {attributes, result});
+    };
+    auto translated = [&] { return std::string(reinterpret_cast<const char *>(h.k->host(buf)), h.k->load16(result)); };
+    CHECK(translate("\\TestLink\\x\\y") == 0 && translated() == "\\Device\\Cdrom0\\x\\y");
+    CHECK(translate("\\Device\\Harddisk0\\Partition1\\a") == 0 && translated() == "\\Device\\Harddisk0\\Partition1\\a");
+    CHECK(translate("\\Nowhere\\x") == 0xC0000034 && h.k->load16(result) == 0);
+    CHECK(translate("relative") == INVALID_PARAMETER && translate("") == INVALID_PARAMETER);
+    CHECK(translate("\\TestLink", 5) == INVALID_PARAMETER);
+    h.k->store16(result + 2, 4);
+    CHECK(translate("\\TestLink\\x") == 0xC0000023);
+}
+
 } // namespace
 
 int main() {
     if (!h.init()) return 1;
+    voice_and_launch();
     console_answers();
     camera();
     receiver();

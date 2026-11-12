@@ -444,7 +444,11 @@ void events_and_lookups(ppc::Context &c) {
 
     // the guide's custom actions: accepted, r3 left as it was
     CHECK(xam(c, "XCustomRegisterDynamicActions", {0x1234}) == 0x1234);
-    CHECK(xam(c, "XNetLogonGetTitleID", {9}) == xam(c, "XamGetCurrentTitleId", {}));
+    // the logon service's own title ID (the console's XAM): 0 until set, whatever title runs
+    CHECK(xam(c, "XNetLogonGetTitleID", {9}) == 0);
+    CHECK(xam(c, "XNetLogonSetTitleID", {0xFFFE07D1}) == 0xFFFE07D1);
+    CHECK(xam(c, "XNetLogonGetTitleID", {0}) == 0xFFFE07D1 && xam(c, "XNetLogonGetTitleID", {9}) == 0xFFFE07D1);
+    xam(c, "XNetLogonSetTitleID", {0});
 }
 
 void media_verification(ppc::Context &c) {

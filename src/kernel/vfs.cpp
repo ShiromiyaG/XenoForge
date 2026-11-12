@@ -722,6 +722,14 @@ bool FileSystem::remove_device(std::string_view mount_path) {
     return std::erase_if(devices_, [&](const auto &d) { return d->mount_path == mount_path; }) != 0;
 }
 
+bool FileSystem::has_device(std::string_view resolved) {
+    std::lock_guard<std::recursive_mutex> l(mutex);
+    return std::any_of(devices_.begin(), devices_.end(), [&](const auto &d) {
+        std::string_view mount = d->mount_path;
+        return starts_with_case(resolved, mount) && (resolved.size() == mount.size() || resolved[mount.size()] == '\\');
+    });
+}
+
 bool FileSystem::add_link(const std::string &path, const std::string &target) {
     Objects &o = objects(k);
     std::lock_guard<std::mutex> l(o.lock);

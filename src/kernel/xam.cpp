@@ -796,16 +796,7 @@ XF_EXPORT(xam, XamTaskCloseHandle) {
 // (): whether the task this worker runs should end
 XF_EXPORT(xam, XamTaskShouldExit) { result(c, k.state<XamTasks>().should_exit() ? 1 : 0); }
 
-// ---- voice (xam_voice.cc): no headset ----
-
-XF_EXPORT(xam, XamVoiceIsActiveProcess) { result(c, 0); }
-XF_EXPORT(xam, XamVoiceCreate) {
-    if (uint32_t out = arg(k, c, 2)) k.store32(out, 0);
-    result(c, X_ERROR_ACCESS_DENIED);
-}
-XF_EXPORT(xam, XamVoiceClose) { result(c, 0); }
-XF_EXPORT(xam, XamVoiceHeadsetPresent) { result(c, 0); }
-XF_EXPORT(xam, XamVoiceSubmitPacket) { result(c, 0x800700AA); }
+// (the voice calls are in xam_voice.cpp)
 
 // ---- sessions (xam_user.cc): one stand-in, as Xenia's ----
 

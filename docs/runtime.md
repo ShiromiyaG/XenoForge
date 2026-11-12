@@ -1307,7 +1307,7 @@ imports it calls, 16 are not implemented (each answers 0; it called 17
 before KeSetTimerEx, below): EtxProducerRegister,
 the Drv*Callback setters (user binding, device configuration, mic array,
 audio latency, content storage), XInputdSetFailedConnectionOrBindCallback,
-HalRegisterHdDvdRomNotification, KeSetPriorityClassThread, XeKeysGetStatus,
+HalRegisterHdDvdRomNotification, KeSetPriorityClassThread (now answered), XeKeysGetStatus,
 DumpRegisterDedicatedDataBlock, DumpGetRawDumpInfo, IoDismountVolumeByName,
 HalGetPowerUpCause, XexShimLock,
 HalGetNotedArgonErrors. DrvGetContentStorageNotification is answered
@@ -1343,7 +1343,8 @@ returns, a made-up title ID 0x58450001; no game's data):
   point; a build it does not know gets none): 0x816E5118 makes the title's
   heap (heap 0 of XAM's table of nine; a call on a title's thread picks it
   by its class, 0x19... from KeGetCurrentProcessType), and 0x816DF2F8 stores
-  the current title ID (XamGetCurrentTitleId, XNetLogonGetTitleID's source);
+  the current title ID (XamGetCurrentTitleId's source; XNetLogonGetTitleID's is not this one,
+  see "Console differences answered" below);
 - ours is signed out (`set_signed_in`): a profile is a package on a content
   device the oracle has not been given, so the console's XAM has no user, and
   the user calls are compared as they answer with none (`--user` keeps
@@ -1620,15 +1621,67 @@ Left, and why:
   State answer 0x57 for device 1 on the console, a device ours has; Create
   answers 0x57 before it looks for a user, ours 0x525) are the oracle's
   lack of a device, not ours.
-- **The console's own launch** (above): past the device objects now; it ends
-  at ExTerminateTitleProcess (a process per title) and the launch's fatal
-  error 0x12247.
-- The UI calls (0x65B against our headless answers), XamVoiceCreate (the
-  console makes a voice object with no microphone, ours is Xenia's stub,
-  ERROR_ACCESS_DENIED), XNetGetTitleXnAddr's MAC (XAM's own, different on
-  each run), XNetLogonGetTitleID (the console's XAM answers 0 with the title
-  running; ours the title's: the reason was not read): left as Xenia's
-  design, noise or open.
+- **The console's own launch** (above): past the device objects, the four
+  kernel calls it reached (below) and the terminate notifications; it ends at
+  ExTerminateTitleProcess, which here ends the run (a process per title is
+  what is missing).
+- The UI calls (0x65B against our headless answers), XNetGetTitleXnAddr's MAC
+  (XAM's own, different on each run): left as Xenia's design, noise or open.
+
+**Console differences answered** (2026-11-12; the console's XAM and kernel
+read with xfxam and xfkrnl's image):
+- *XamVoice\**. The console's XamVoiceCreate makes a voice object with no
+  headset and no driver device: a slot of a table of eight 0x38-byte slots in
+  XAM's data (index = the user, plus four on a system thread's), whose pointer
+  it writes; it clears the slot, stores the packet count, allocates 16 bytes a
+  packet from XAM's heap, links the packets into a free list, stamps the time,
+  and answers 0. It checks nothing (a user past 3 takes the other side's slot);
+  a buffer that does not allocate answers E_OUTOFMEMORY and writes a null
+  pointer; a null out pointer faults. XamVoiceClose hands the voice to
+  XVoicedClose, frees the buffer and answers 1. HeadsetPresent, SubmitPacket and
+  IsActiveProcess are the kernel's XVoiced* driver calls behind a process-type
+  lookup; with no device (the voice's first word, the device tag, is 0) the
+  driver answers 0, 0xD000009D and (process is the one Activate named) 1, and
+  GetDirectionalData and GetBatteryStatus 0x10DF. All eight XVoiced* are in
+  src/kernel/xam_voice.cpp now; the tag kinds a device would set are not
+  modelled. Six of the eight discs import XamVoiceCreate, Close, HeadsetPresent and
+  SubmitPacket (three also XamVoiceIsActiveProcess); the other two none.
+- *XNetLogonGetTitleID(service)*. Not the running title's ID (xfxam: 0 with a
+  title running, ours had answered the title's): it makes the logon service's
+  state on first use and returns the ID XNetLogonSetTitleID stored there (XAM's
+  own sets 0xFFFE07D1 once, in its Live setup; a title does not change it), 0
+  until then, for any argument while the logon is not active. Ours keeps that
+  field (NetState) and implements XNetLogonSetTitleID (answers its argument).
+- *The four calls XAM's launch reaches* (src/kernel/launch.cpp):
+  KeSetPriorityClassThread (class 5, or 13 boosted; the difference moves the
+  thread's base priorities, and below the real-time priorities its priority
+  and quantum), XexShimLock (a hypervisor call, selector 1 of 0x6F; its status
+  mapped; answers success, the hypervisor's own answer is not known),
+  ObTranslateSymbolicLink (the object manager's walk of a name through links,
+  here over the VFS's links and mounts and the namespace's named objects),
+  IoSynchronousDeviceIoControlRequest (an IRP to the device's driver; the
+  devices here have none, so NT's default, STATUS_INVALID_DEVICE_REQUEST; what
+  a real drive answers to 0x4D014 is the driver's, not established).
+- *Title terminate notifications* (modules.cpp) were run with r3 = 0; the
+  console's kernel calls each routine with the registration structure's pointer
+  (XAM's routines take the structure they embed it in from it, at -0xB0: the
+  launch faulted there). Fixed; the order is the console's (priority, signed,
+  highest first, a tie in registration order). The console keeps the list and
+  runs it at every termination; here each runs once.
+- *The launch now*: the workers' dismount loop, the drive request, the load
+  of the executable (XexLoadExecutable) and the title's end all run; the
+  launch stops where the kernel's ExTerminateTitleProcess ends the run
+  (xfxam: "the launch: not started (no XexStartExecutable)"); the
+  VdDisplayFatalError 0x12247 of the earlier notes is not reached. What a process
+  per title takes: ExTerminateTitleProcess ending only the title process's
+  threads (their waits and APCs), unloading its modules and heap while the
+  system process goes on; the title process as a kernel object of its own (the
+  singleton in modules.cpp's globals, the per-process handle tables, the
+  mounts, the title's heap), XexStartExecutable creating a new one; the run's
+  stop (end_title, the host's title_exit) moving to the last title; about
+  600-900 lines across threads.cpp, modules.cpp, misc.cpp and xam.cpp and
+  their tests, and the risk of threads ending in waits and of the host's
+  frontends (boot's --follow-launches, the player) that expect one title a run.
 - XamTaskSchedule and CreateThread with the generic arguments run garbage as
   a callback on our side; whether the interpreter stops before the call
   returns varies (one "faults (ours)" in the last run was CreateThread).

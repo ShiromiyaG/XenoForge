@@ -186,6 +186,8 @@ struct NetState {
     uint16_t next_ephemeral = EPHEMERAL_FIRST;
     // the starts not yet cleaned up, by caller (XNCALLER_TITLE, XNCALLER_SYSAPP)
     uint32_t wsa_started[3] = {}, xnet_started[3] = {};
+    // the title ID the logon service holds (XNetLogonSetTitleID's), 0 until set
+    std::atomic<uint32_t> logon_title_id{0};
 };
 
 // The callers the console's XAM takes in the first argument of the startup
@@ -546,11 +548,19 @@ XF_EXPORT(xam, XNetLogonGetMachineID) {
     result(c, 0x80151802);
 }
 
-// (index): the running title's ID. Xenia has no implementation (its
-// undefined import leaves r3, the argument, as it is); the title's own ID
-// is what the name asks for, and the one caller seen (a UE3 game) only
-// puts it in a Live request that fails earlier (no user signed in to Live).
-XF_EXPORT(xam, XNetLogonGetTitleID) { result(c, title_id(k)); }
+// (service_id): the title ID the logon service holds. Xenia has no
+// implementation (its undefined import leaves r3, the argument, as it is).
+// The console's XAM (xfxam) does not answer the running title's ID: it makes
+// the logon service's state on first use and returns the ID the service was
+// given by XNetLogonSetTitleID (XAM's own sets 0xFFFE07D1 once, at its Live
+// setup), 0 until then, whatever title is running and whatever the argument:
+// the argument picks a service's own ID only once the logon is active
+// (connected to Live, which never happens here).
+XF_EXPORT(xam, XNetLogonGetTitleID) { result(c, k.state<NetState>().logon_title_id.load()); }
+
+// (title_id): stores the ID (and the console tells the service's clients, not
+// modelled); r3 is left as the argument, as the console's
+XF_EXPORT(xam, XNetLogonSetTitleID) { k.state<NetState>().logon_title_id = arg(k, c, 0); }
 
 // (one, option, buffer, size_ptr): option 1, the startup parameters
 XF_EXPORT(xam, NetDll_XNetGetOpt) {
