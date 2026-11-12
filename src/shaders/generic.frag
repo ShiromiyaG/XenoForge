@@ -218,7 +218,11 @@ void main() {
             colors[k] = vec4(0.0);
             continue;
         }
-        precise vec4 color = oC[k] * sys.color_scales[k];
+        // (a negative scale: a 16_16 target's, whose alpha is the blend's factor alone and takes the
+        // exponent bias without the fixed range, as the translated shaders')
+        precise float size = abs(sys.color_scales[k]);
+        precise vec4 color = oC[k] * size;
+        if (sys.color_scales[k] < 0.0) color.a = oC[k].a * (size * (32767.0 / 1024.0));
         color = premultiplied(color, k);
         if ((sys.flags.z & (1u << k)) != 0u)
             color = vec4(linear_to_pwl(color.r), linear_to_pwl(color.g), linear_to_pwl(color.b), color.a);

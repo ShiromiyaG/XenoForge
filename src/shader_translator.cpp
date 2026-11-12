@@ -2988,7 +2988,17 @@ void Translator::main_pixel() {
                 continue;
             }
             Id color = load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))}));
-            color = exact(Op::OpVectorTimesScalar, vec4_, {color, comp(scales, k)});
+            // (a negative scale: a 16_16 target's, which keeps no alpha. Its
+            // fixed range's share of the scale is the stored channels' alone:
+            // the alpha is only the blend's factor, and takes the exponent
+            // bias as the console's does, not the range)
+            Id scale = comp(scales, k), size = glsl(GLSLstd450FAbs, float_, {scale});
+            Id unscaled_alpha = comp(color, 3);
+            color = exact(Op::OpVectorTimesScalar, vec4_, {color, size});
+            Id blend_alpha = exact(Op::OpFMul, float_,
+                                   {unscaled_alpha, exact(Op::OpFMul, float_, {size, f(32767.0f / 1024.0f)})});
+            color = vec4_of(comp(color, 0), comp(color, 1), comp(color, 2),
+                            select(float_, m_.op(Op::OpFOrdLessThan, bool_, {scale, f(0)}), blend_alpha, comp(color, 3)));
             if (pixel_.blend_premultiply) color = premultiplied(color, k);
             Id gamma = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {gamma_flags, u(1u << k)}), u(0)});
             if (lean) {

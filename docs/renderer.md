@@ -2962,13 +2962,28 @@ Xenia's exact picture (0.77% of the pixels by more than 16), 0.016 with
 the draws counted. They are not measured (they draw under their own state),
 so their query stays visible, as Xenia's fallback.
 
-That frame on the host's render targets stays 1.200 off Xenia's exact
-picture, and is Xenia's own host picture to the last bit (0.000): there
-the six quads write nothing into the 16_16 target (leaving the predicated
-draw or the quads out changes nothing), with or without the float24 depth
-conversion and whichever transfer switch is set. What the quads' test
-reads on that path (the scene's depth, 1x, taken as 4x at half the pitch)
-is where to look: open, and beyond Xenia's host path.
+That frame on the host's render targets was still 1.200 off Xenia's
+exact picture, and Xenia's own host picture to the last bit (0.000), with
+or without the float24 depth conversion and whichever transfer switch was
+set. The cause is the next paragraph's.
+
+**A 16_16 target's alpha (2026-11-11, beyond Xenia's host path).** The
+host keeps a 16-bit fixed target (-32 to 32, ten fraction bits) as a
+signed normalized one, so the shader's output is scaled by 1024/32767
+(with the exponent bias: `color_scales`, Xenia's `color_exp_bias`), all
+four components of it. In a 16_16 target the alpha is not stored: it is
+only the blend's factor, and scaled it makes a blend by the source's alpha
+32 times too weak. That frame's six quads add into a 16_16 target by their
+alpha (what the target holds was read back on both paths before the draw
+that samples it: 150,281 distinct words on the exact path, 3,511 on the
+host's, most of them a channel left at its cleared value). A 16_16
+target's scale now goes to the shader negative, and the shader (the
+translated ones and the generic one) scales the stored channels by its
+size and the alpha by the exponent bias alone: 1.200 to 0.116 of 255 off
+Xenia's exact picture (0.772% of the pixels to 0.011%). A 16_16_16_16
+target stores its alpha, so it must be scaled there and a blend by the
+source's alpha is still off: it takes a second source for the blend
+(dual-source blending), not done.
 
 **Game G's frames 850 and 950, what is left** (0.149% and 0.150% of pixels
 off Xenia's ROV picture; Xenia's ROV and FSI pictures are 0.083% apart).
@@ -4152,16 +4167,15 @@ the mean difference of 255 and the pixels off by more than 16:
 | C, the mission's night | 0.001, 0.000% | 0.009, 0.000% | |
 | E, a cutscene's light shafts | 0.198, 0.046% | 3.041, 9.947% | 2.898 (ours is 0.250 off Xenia's host picture) |
 | E, the same scene later | 0.082, 0.029% | 0.483, 0.171% | |
-| F, the terrain under a glare | 0.016, 0.011% (1.190 before "A draw that is counted and drawn") | 1.200, 0.772% | 1.200 (ours is that picture, 0.000) |
+| F, the terrain under a glare | 0.016, 0.011% (1.190 before "A draw that is counted and drawn") | 0.116, 0.011% (1.200 before "A 16_16 target's alpha") | 1.200 |
 | F, the flight | 0.008, 0.000% | 0.209, 0.000% | |
 | H, two frames of the scene | 0.000, 0.000% | 0.163 and 0.272, 0.000% | |
 
 The exact path draws Xenia's exact picture in all of them. The host's
-render targets, the player's default, draw Xenia's host picture, and with
-it its two errors here: game F's glare (above) and game E's light shafts,
-a smooth tint over the lit part of the frame. Both are where to go beyond
-Xenia on that path, or the reason to take the exact path where the GPU
-affords it.
+render targets, the player's default, drew Xenia's host picture, and with
+it its two errors here: game F's glare (fixed since, above) and game E's
+light shafts, a smooth tint over the lit part of the frame, which is still
+there and is where to go beyond Xenia on that path next.
 
 ## What is asked and not done is counted
 

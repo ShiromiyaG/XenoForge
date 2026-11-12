@@ -9069,6 +9069,12 @@ bool Impl::draw_front(const gpu::Draw &d, DrawFront &f) {
         // the exponent bias, and 16-bit fixed (-32..32, 10 fraction bits) kept as snorm
         color_scales[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
         if (format == 4 || format == 5) color_scales[i] *= 1024.0f / 32767.0f;
+        // (16_16 keeps no alpha: the shader's is the blend's factor only, and
+        // the range's scale would make a blend by it 32 times too weak, as
+        // Xenia's host path does; a negative scale tells the shader to leave
+        // the alpha out of it. 16_16_16_16 stores its alpha, scaled: a blend
+        // by the source's alpha there is still off, and counted)
+        if (format == 4) color_scales[i] = -color_scales[i];
         colors[i] = render_target(false, info & 0xFFF, pitch, msaa, format);
         if (!colors[i]) {
             if (fatal_.empty()) skip(std::string("color target format ") + color_target_format_name(format));
