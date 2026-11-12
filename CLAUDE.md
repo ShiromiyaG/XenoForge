@@ -44,7 +44,7 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
   `../external/xna/work/shaders` (10, de `tests/hlsl/`). Rodar: `XF_SHADERS=<pasta> build/shader_compare_test`.
   O `.defs` ao lado de cada shader traz as constantes literais do contêiner (o D3D as carrega com o shader).
 - **Renderizador (B3)**: `build/xfreplay <xtr> -o frame.png --compare <png do trace-dump> [--diff d.png] [-v]`;
-  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 31 frames do caminho host e os 33 do exato batem com o Xenia; a referência é o
+  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 35 frames do caminho host e os 37 do exato batem com o Xenia; no host, um frame que passa do limite contra a imagem padrão do Xenia é conferido também contra a ROV, porque o caminho host usa as posições de amostra do Xenos; a referência é o
   dump D3D12 do Xenia, `xenia-gpu-d3d12-trace-dump.exe`, em `../traces/dumps/d3d12`, com o Vulkan onde não há
   D3D12 ou os dois discordam: 2 frames do jogo A). Desde 2026-11-06 o padrão é a EDRAM exata via
   fragment shader interlock (FSI) onde o device tem: aí o `replay_test` compara sozinho com os dumps exatos do
