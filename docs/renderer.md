@@ -1921,7 +1921,12 @@ its noise on this machine (other agents' builds at 50-97% of the processor
 throughout; five rounds A B A B of 15 plays, the commands' processor time
 a play, median of the rounds' medians): game G 25.7 ms with all four off,
 26.1 with all on (25.2-27.2 against 25.5-29.1); game D's drive about 10 ms
-either way. They are kept behind their switches for the live timing:
+either way. They are kept behind their switches for the live timing. Live
+(game G in play, quiet machine, one run each, 260 s): the command thread's
+work a swap over the second half 22.40 ms before them (5,210 draws a frame),
+22.58 with all four on (5,380 draws), 21.66 with all four off (4,991
+draws): 4.30, 4.20 and 4.34 us a draw. Within a few percent, as in the
+replay; kept on.
 - **Direct dispatch** (`XF_VK_DIRECT_DISPATCH=0` off): while one device
   lives, its functions are taken from the driver (`volkLoadDevice`), not the
   loader's trampolines, which look the dispatch table up at every command;

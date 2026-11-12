@@ -941,6 +941,10 @@ As built (`src/kernel/audio.h`; audio.cpp, xma.cpp; the seams in
     turns it off. The five recordings replay byte for byte as before and as
     Xenia's (`xma_replay_test`; two of them put kept decoders back, 23 and
     14 times).
+  - Live, the same game in play on a quiet machine, 260 s: the XMA thread
+    44.4 s of host CPU before, 22.6 and 22.8 s after (17% of a core to 9%);
+    every thread together 109.1 ms of CPU a swap before, 104.6 and 97.5
+    after (two runs, the scene's draws not the same in each).
 - **FFmpeg, built** (`third_party/ffmpeg/ffmpeg.cmake`): CMake's `XF_XMA`
   (on by default) fetches the fork's archive at that commit, or builds from
   `XF_FFMPEG_DIR` (a checkout of it; xenia-canary's
@@ -2863,6 +2867,15 @@ fused forms, the slow path's, and VMX's vmaddfp and vnmsubfp a lane at a
 time) is the C library's through the runtime's table: exact, slow. The
 statically linked games and the tests take `-DXF_GAME_CPU_LEVEL=v3|v2`
 (CMake cache, v3 by default; `cmake/xenoforge_port.cmake`).
+
+Measured (2026-11-12, a Zen 3 desktop processor, quiet machine): game B's
+deterministic benchmark (`--deterministic --spin-idle --until-swap 6000`,
+the scheduler's thread's processor time; the same guest work and memory
+hash at both levels), three rounds interleaved: v3 11.19, 11.09, 11.42 s;
+v2 10.67, 10.69, 10.70 s. The v2 library is about 4.5% faster here, with
+less spread. Not explained yet: which of v3's features costs (256-bit
+vectorization, MOVBE, the VEX encodings) is the next measurement; until
+then the level's default is still v3.
 
 **A build that never fails whole** (D2, 2026-11-07). Only a disc that
 cannot be read, one without `default.xex` (or whose `default.xex` has no PE
