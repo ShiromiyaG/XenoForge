@@ -60,6 +60,10 @@ struct Options {
     // XF_DETERMINISTIC says (1, or "paced"). It halts at the first hand-over
     // after swap halt_swap, or after halt_seconds of its clock (0: never).
     int deterministic = 0;
+    // Deterministic::spin_idle (boot --spin-idle): a long spin with nothing
+    // else ready waits as an idle thread does, for the generated code's
+    // benchmark
+    bool spin_idle = false;
     uint64_t halt_swap = 0;
     double halt_seconds = 0;
     // Input recordings (xenoforge/input.h; docs/input.md): the answers written

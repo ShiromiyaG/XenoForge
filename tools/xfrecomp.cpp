@@ -3,7 +3,7 @@
 //   xfrecomp analyze <game.iso | default.xex> [--xex <path on the disc>]
 //            [--compare <rexglue's *_init.cpp>] [--functions <out.tsv>]
 //            [--tables <out.tsv>] [--unresolved <out.tsv>] [--no-pointers]
-//            [--project <file.toml>] [--check-functions <file.toml>]
+//            [--project <file.toml>] [--check-functions <file.toml>] [--calls [<counts>]]
 //
 // prints what discovery found by kind; --compare sets the function starts
 // against rexglue's PPCFuncMappings for the same executable; --functions
@@ -14,7 +14,9 @@
 // --project discovers with a project file's starts and jump tables for the
 // executable (docs/recompiler.md, "The project file"); --check-functions
 // says how many of a project file's starts (ours, or rexglue's function list)
-// discovery finds without them, and where the others fall.
+// discovery finds without them, and where the others fall. --calls counts the
+// functions by how they keep the calling convention and what their calls cost
+// in the context (report_calls), weighted by a file of counted calls if given.
 //
 //   xfrecomp tests <assembled tests dir> <out dir> [--files N]
 //
@@ -44,7 +46,9 @@
 // interpreter, and the hook slots of what the port hooks; without one (or
 // with an empty one) the emission is the same as ever.
 
+#include "calling_convention.h"
 #include "xenoforge/disc.h"
+#include "xenoforge/ppc.h"
 #include "xenoforge/recomp.h"
 #include "xenoforge/xex.h"
 
@@ -70,12 +74,13 @@ using namespace xf;
 namespace {
 
 int usage() {
-    std::fprintf(stderr, "usage: xfrecomp analyze <game.iso | default.xex> [--xex <path>] [--compare <init.cpp>] "
-                         "[--functions <out.tsv>] [--tables <out.tsv>] [--unresolved <out.tsv>] [--no-pointers]\n"
-                         "                [--project <file.toml>] [--check-functions <file.toml>]\n"
-                         "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n"
-                         "       xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] "
-                         "[--no-pointers] [--listing] [--project <file.toml>]\n");
+    std::fprintf(stderr,
+                 "usage: xfrecomp analyze <game.iso | default.xex> [--xex <path>] [--compare <init.cpp>] "
+                 "[--functions <out.tsv>] [--tables <out.tsv>] [--unresolved <out.tsv>] [--no-pointers]\n"
+                 "                [--project <file.toml>] [--check-functions <file.toml>] [--calls [<counts>]]\n"
+                 "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n"
+                 "       xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] "
+                 "[--no-pointers] [--listing] [--project <file.toml>]\n");
     return 2;
 }
 
@@ -278,6 +283,147 @@ std::unique_ptr<recomp::Project> load_project(const char *path) {
     return p;
 }
 
+// --calls: the functions by how they keep the calling convention, and what
+// trusting it could save at their calls (docs/recompiler.md, "Trusting the
+// calling convention, weighed"). With a file of counted calls (lines "site target
+// count", hex addresses), each call site weighted by how often it ran.
+void report_calls(const recomp::Image &image, const recomp::Discovery &d, const std::string &counts_file) {
+    using recomp::Convention;
+    const auto conv = recomp::analyze_calling_convention(image, d);
+    std::map<Convention, std::pair<uint64_t, uint64_t>> by_kind; // functions, instructions
+    for (const auto &[a, cc] : conv) {
+        by_kind[cc.kind].first++;
+        by_kind[cc.kind].second += cc.instructions;
+    }
+    std::printf("functions by the calling convention:\n");
+    for (const auto &[k, n] : by_kind) {
+        std::printf("  %-60s %7llu functions %9llu instructions", recomp::convention_name(k),
+                    (unsigned long long)n.first, (unsigned long long)n.second);
+        // a few of those that do not keep it, for a look
+        int shown = 0;
+        if (k != Convention::Keeps && k != Convention::NoNonVolatile && k != Convention::Skipped)
+            for (const auto &[a, cc] : conv)
+                if (cc.kind == k && shown++ < 6) std::printf(" %08X", a);
+        std::printf("\n");
+    }
+
+    // counted calls: by site, and by target
+    std::map<uint32_t, uint64_t> site_count, target_count;
+    uint64_t counted = 0;
+    if (!counts_file.empty()) {
+        std::ifstream f(counts_file);
+        uint32_t site, target;
+        unsigned long long n;
+        std::string a, b;
+        while (f >> a >> b >> n) {
+            site = uint32_t(std::stoul(a, nullptr, 16)), target = uint32_t(std::stoul(b, nullptr, 16));
+            site_count[site] += n, target_count[target] += n, counted += n;
+        }
+        std::printf("counted calls: %llu at %zu sites\n", (unsigned long long)counted, site_count.size());
+    }
+    auto keeps = [&](uint32_t a) {
+        auto it = conv.find(a);
+        return it != conv.end() &&
+               (it->second.kind == Convention::Keeps || it->second.kind == Convention::NoNonVolatile);
+    };
+    auto helper = [&](uint32_t a) {
+        auto it = d.functions.find(a);
+        return it != d.functions.end() && it->second.source == recomp::Source::Helper;
+    };
+    // Per call site in a function that keeps it: the non-volatile registers
+    // named since the call before it (in address order; what the code may
+    // store to the context before it today) and until the next (what it may
+    // load again after it): an upper bound on the context's loads and stores
+    // locals would save there. By what the call reaches.
+    enum Reach { ToKeeping, ToOther, Dispatch, Reaches };
+    const char *reach_names[] = {"to a function that keeps it", "to another function (synced)",
+                                 "through dispatch (synced)"};
+    uint64_t sites[Reaches] = {}, ops[Reaches] = {}, dyn_sites[Reaches] = {}, dyn_ops[Reaches] = {};
+    // per entry: the restores that would go (helpers' loads and stores, the
+    // inline restores' stores), when nothing in it syncs
+    uint64_t entries = 0, synced_entries = 0, restore_ops = 0, helper_restores = 0, functions_unsynced = 0;
+    for (const auto &[address, cc] : conv) {
+        if (cc.kind != Convention::Keeps) continue;
+        const recomp::Function &f = d.functions.at(address);
+        const std::set<uint32_t> code = recomp::function_instructions(image, d, f);
+        const std::vector<uint32_t> pcs(code.begin(), code.end());
+        const std::vector<recomp::NonVolatileSet> named = recomp::named_non_volatile(image, pcs);
+        struct Site {
+            size_t index;
+            Reach reach;
+        };
+        std::vector<Site> calls;
+        uint64_t restored_by_helper = 0;
+        for (size_t k = 0; k < pcs.size(); k++) {
+            ppc::Instr i{image.word(pcs[k])};
+            ppc::Opcode op = ppc::decode(i.code);
+            bool lk = false, direct = false;
+            uint32_t t = 0;
+            if (op == ppc::Opcode::bx) {
+                lk = i.I.LK, direct = true;
+                t = uint32_t(int32_t(i.I.LI << 8) >> 6) + (i.I.AA ? 0 : pcs[k]);
+            } else if (op == ppc::Opcode::bcx) {
+                lk = i.B.LK, direct = true;
+                t = uint32_t(int32_t(int16_t(i.B.BD << 2))) + (i.B.AA ? 0 : pcs[k]);
+            } else if (op == ppc::Opcode::bclrx || op == ppc::Opcode::bcctrx) {
+                lk = i.XL.LK;
+            }
+            if (direct && helper(t)) {
+                const std::string &name = d.functions.at(t).name;
+                if (name.rfind("__rest", 0) == 0) {
+                    bool g = name.rfind("__restgprlr_", 0) == 0;
+                    uint32_t first = uint32_t(std::stoul(name.substr(name.rfind('_') + 1)));
+                    restored_by_helper += (first >= 64 ? 128 : 32) - first;
+                    (void)g;
+                }
+                continue;
+            }
+            if (!lk) continue;
+            Reach r = !direct ? Dispatch : keeps(t) ? ToKeeping : d.functions.count(t) ? ToOther : Dispatch;
+            auto it = d.functions.find(t);
+            if (direct && it != d.functions.end() && it->second.source == recomp::Source::Import) r = Dispatch;
+            calls.push_back({k, r});
+        }
+        bool syncs = false;
+        for (size_t c = 0; c < calls.size(); c++) {
+            const size_t from = c ? calls[c - 1].index + 1 : 0;
+            const size_t to = c + 1 < calls.size() ? calls[c + 1].index : pcs.size();
+            recomp::NonVolatileSet before, after;
+            for (size_t k = from; k < calls[c].index; k++) before.add(named[k]);
+            for (size_t k = calls[c].index + 1; k < to; k++) after.add(named[k]);
+            const uint64_t n = before.count() + after.count();
+            const Reach r = calls[c].reach;
+            syncs |= r != ToKeeping;
+            sites[r]++, ops[r] += n;
+            auto sc = site_count.find(pcs[calls[c].index]);
+            if (sc != site_count.end()) dyn_sites[r] += sc->second, dyn_ops[r] += sc->second * n;
+        }
+        // the inline restores' stores to the context, the helpers' loads and stores
+        const uint64_t restored = cc.restored.count();
+        const uint64_t per_entry =
+            (restored > restored_by_helper ? restored - restored_by_helper : 0) + 2 * restored_by_helper;
+        const uint64_t e = target_count.count(address) ? target_count.at(address) : 0;
+        entries += e;
+        if (syncs)
+            synced_entries += e;
+        else {
+            functions_unsynced++;
+            restore_ops += e * per_entry;
+            if (restored_by_helper) helper_restores += e;
+        }
+    }
+    std::printf("call sites in the functions that keep it (registers named around each: an upper bound on the "
+                "context's loads and stores saved):\n");
+    for (int r = 0; r < Reaches; r++)
+        std::printf("  %-34s %8llu sites, %9llu loads and stores; counted %12llu calls, %14llu loads and stores\n",
+                    reach_names[r], (unsigned long long)sites[r], (unsigned long long)ops[r],
+                    (unsigned long long)dyn_sites[r], (unsigned long long)dyn_ops[r]);
+    std::printf("entries of functions that keep it: %llu counted, %llu of them in functions that sync (%llu functions "
+                "never sync); restores that would go in the others: %llu loads and stores, %llu helper calls\n",
+                (unsigned long long)entries, (unsigned long long)synced_entries, (unsigned long long)functions_unsynced,
+                (unsigned long long)restore_ops, (unsigned long long)helper_restores);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 4 && std::string(argv[1]) == "emit") {
         std::vector<std::string> only;
@@ -305,6 +451,8 @@ int main(int argc, char **argv) {
     }
     if (argc < 3 || std::string(argv[1]) != "analyze") return usage();
     std::string input = argv[2], xex_path = "default.xex", compare, functions_out, tables_out, unresolved_out;
+    std::string call_counts;
+    bool calls = false;
     recomp::DiscoverOptions options;
     std::unique_ptr<recomp::Project> project, checked;
     for (int k = 3; k < argc; k++) {
@@ -315,11 +463,15 @@ int main(int argc, char **argv) {
         else if (a == "--tables" && k + 1 < argc) tables_out = argv[++k];
         else if (a == "--unresolved" && k + 1 < argc) unresolved_out = argv[++k];
         else if (a == "--no-pointers") options.scan_pointers = false;
-        else if (a == "--project" && k + 1 < argc) {
+        else if (a == "--calls") {
+            calls = true;
+            if (k + 1 < argc && argv[k + 1][0] != '-') call_counts = argv[++k];
+        } else if (a == "--project" && k + 1 < argc) {
             if (!(project = load_project(argv[++k]))) return 1;
         } else if (a == "--check-functions" && k + 1 < argc) {
             if (!(checked = load_project(argv[++k]))) return 1;
-        } else return usage();
+        } else
+            return usage();
     }
     std::string error;
     Xex xex;
@@ -404,6 +556,8 @@ int main(int argc, char **argv) {
             std::printf("\n");
         }
     }
+
+    if (calls) report_calls(image, d, call_counts);
 
     if (!compare.empty()) {
         std::ifstream f(compare);

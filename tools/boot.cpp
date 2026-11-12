@@ -40,6 +40,9 @@
 // --paced keeps that clock behind the host's): the same disc and input give
 // the same run. --until-swap N or --until S (seconds of its clock) halts it
 // there, every thread parked, and the report adds a hash of guest memory.
+// --spin-idle takes a long spin with nothing else ready for an idle wait (the
+// clock jumps to the next deadline): the generated code's benchmark, whose
+// report gives the scheduler's thread's processor time to the halt.
 // --record-input <file> writes what XAM's input answered, --replay-input
 // <file> answers from such a recording (docs/input.md, "Recordings").
 // The last line is "xf-summary {json}" (game.h, print_summary), what xfcompat
@@ -104,8 +107,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
                         "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
                         "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
-                        "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
-                        "[--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
+                        "[--deterministic [--paced] [--spin-idle] [--until-swap N] [--until S]] "
+                        "[--record-input <file>] [--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
                         "[--language N] [--country N] [--resolution WxH] [--widescreen 0|1] [--refresh 50|60] "
                         "[--follow-launches] [--launch-data <file>] [--option <key>=<value>]... [--directory-saves] "
                         "[--profile N [--profile-from S] [--profile-thread <name>]]\n";
@@ -185,6 +188,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             o.deterministic = std::max(o.deterministic, 1);
         else if (a == "--paced")
             o.deterministic = 2;
+        else if (a == "--spin-idle")
+            o.spin_idle = true;
         else if (a == "--until-swap" && k + 1 < argc)
             o.halt_swap = std::strtoull(argv[++k], nullptr, 10);
         else if (a == "--until" && k + 1 < argc)

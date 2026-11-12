@@ -217,7 +217,7 @@ add_executable(xfeffect tools/xfeffect.cpp)
 target_link_libraries(xfeffect PRIVATE xenoforge)
 add_executable(xfppc tools/xfppc.cpp)
 target_link_libraries(xfppc PRIVATE xenoforge)
-add_executable(xfrecomp tools/xfrecomp.cpp)
+add_executable(xfrecomp tools/xfrecomp.cpp tools/calling_convention.cpp)
 target_link_libraries(xfrecomp PRIVATE xenoforge)
 # the recompile step from the command line (game_build.h): a disc into the cache, timed
 add_executable(xfbuild tools/xfbuild.cpp)

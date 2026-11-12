@@ -335,6 +335,15 @@ struct Deterministic {
     // Paced: the clock never runs ahead of the host's (the player's, so the
     // game plays at its speed); else it runs as fast as the host can (boot).
     bool paced = false;
+    // A spin on the priority hints (the XDK's waits: db16cyc and the like,
+    // eight yield points in a row whose budget ran out on a hint) with no
+    // other thread ready is taken for an idle wait: the clock jumps to the
+    // earliest deadline, as when every thread waits. The run stays exact (the
+    // same steps every time) but is another run than without it: the
+    // generated code's benchmark (boot --spin-idle; docs/runtime.md, "The
+    // deterministic mode"), where the spin's host time would measure only
+    // the wait.
+    bool spin_idle = false;
     // Asked as each thread is handed over (on the scheduler's thread, the
     // kernel's lock held): true stops the run there for good, every guest
     // thread parked where it handed over (boot's --until-swap, --until).
@@ -606,6 +615,7 @@ private:
     uint64_t deterministic_call_cost_ = 0, deterministic_time_base_cost_ = 0, deterministic_dispatch_cost_ = 0;
     // the yield points' units in 100 ns (0: not counted; attach)
     uint32_t deterministic_yield_units_ = 0;
+    bool deterministic_spin_idle_ = false; // Deterministic::spin_idle
     const Xex *xex_ = nullptr;
     uint32_t entry_ = 0;
     ppc::System system_;

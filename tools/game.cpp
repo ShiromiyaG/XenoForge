@@ -222,6 +222,7 @@ bool open(const Options &options, Game &g, std::string &error) {
     if (deterministic) {
         kernel::Deterministic d;
         d.paced = deterministic == 2;
+        d.spin_idle = options.spin_idle;
         if (const char *ms = std::getenv("XF_DETERMINISTIC_FORCE_MS"); ms && *ms)
             d.force_after_ms = uint32_t(std::strtoul(ms, nullptr, 10));
         if (options.halt_swap || options.halt_seconds > 0) {

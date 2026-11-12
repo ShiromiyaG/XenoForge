@@ -43,6 +43,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <time.h>
 #endif
 
 namespace xf::kernel {
@@ -52,6 +54,20 @@ constexpr uint64_t MILLISECOND = 10'000; // in the clock's 100 ns
 
 // the scheduler's host thread (and every fiber on it)
 thread_local bool on_runner = false;
+
+// the calling thread's processor time (user and kernel), in seconds
+double thread_cpu_seconds() {
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
+    auto ticks = [](const FILETIME &f) { return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    return double(ticks(kernel) + ticks(user)) / 1e7;
+#else
+    timespec t{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return double(t.tv_sec) + double(t.tv_nsec) / 1e9;
+#endif
+}
 
 class DeterministicScheduler;
 
@@ -165,6 +181,25 @@ public:
         hand_over(*running_);
     }
 
+    // A spin (kernel.cpp's system_.yield, a run of yield points that ran out
+    // on priority hints): with spin_idle and no other thread ready, what it
+    // waits for can only come with a deadline, so the clock jumps there as
+    // when every thread waits (run()); then it hands over as a yield does.
+    void spin() override {
+        if (!on_runner || !running_) return std::this_thread::yield();
+        if (d_.spin_idle) {
+            std::lock_guard<std::mutex> l(o_.lock);
+            const uint64_t now = now_.load(), next = ready_.empty() ? next_event() : NEVER;
+            if (next != NEVER && next > now) {
+                spin_jumps_++;
+                spin_clock_ += next - now;
+                now_.store(next);
+            }
+        }
+        yields_++;
+        hand_over(*running_);
+    }
+
     uint64_t now() override { return now_.load(std::memory_order_relaxed); }
 
     void timers_changed() override {
@@ -207,6 +242,15 @@ public:
                       (unsigned long long)stuck_, (unsigned long long)forced_.load(),
                       forced_ ? " (the run is not exact)" : "", halted_ ? "; halted" : "");
         std::string out = line;
+        // the scheduler's host thread's processor time to the halt (every
+        // guest thread's code, the kernel's calls, the command processor's
+        // fiber), and the spins taken for idle waits (spin_idle)
+        std::snprintf(line, sizeof(line),
+                      "deterministic: the scheduler's thread used %.3f s of processor time%s; %llu spins taken for "
+                      "idle waits (%.3f s of the clock)\n",
+                      runner_cpu_.load(), halted_ ? " to the halt" : " so far", (unsigned long long)spin_jumps_,
+                      double(spin_clock_) / 1e7);
+        out += line;
         // a thread that has not handed over for a second of the host's: guest
         // code waiting without a kernel call (the header's last point)
         uint32_t id = running_id_.load();
@@ -352,6 +396,7 @@ private:
 #endif
         started_ = Clock::now().time_since_epoch().count();
         wall_start_ = Clock::now();
+        const double cpu_start = thread_cpu_seconds();
         std::unique_lock<std::mutex> l(o_.lock);
         clock_start_ = now_.load();
         uint64_t next_clock = clock_start_;
@@ -370,7 +415,10 @@ private:
                 ready_.push_back(e.get());
                 timeouts_++;
             }
+            // (read now and then: the report's, from another thread)
+            if ((switches_ & 4095) == 0) runner_cpu_ = thread_cpu_seconds() - cpu_start;
             if (!halted_ && d_.halt && d_.halt()) {
+                runner_cpu_ = thread_cpu_seconds() - cpu_start;
                 halted_ = true;
                 std::fprintf(stderr, "deterministic: halted at %.4f s of the clock, %llu runs\n", double(now) / 1e7,
                              (unsigned long long)switches_);
@@ -459,6 +507,8 @@ private:
     std::atomic<uint32_t> running_id_{0};
     uint64_t made_ = 0, switches_ = 0, slices_ = 0, yields_ = 0, blocks_ = 0, timeouts_ = 0, foreign_wakes_ = 0;
     uint64_t jumps_ = 0, idle_clock_ = 0, stuck_ = 0;
+    uint64_t spin_jumps_ = 0, spin_clock_ = 0; // spins taken for idle waits (spin_idle)
+    std::atomic<double> runner_cpu_{0};        // the scheduler's thread's processor time
     std::atomic<uint64_t> deferred_{0}; // hand-overs put off at DISPATCH_LEVEL
     // the forced hand-overs' (watchdog)
     std::thread watchdog_;
@@ -501,6 +551,7 @@ bool Kernel::make_deterministic(const Deterministic &options) {
     deterministic_time_base_cost_ = options.time_base_cost;
     deterministic_dispatch_cost_ = options.dispatch_cost;
     deterministic_yield_units_ = options.yield_units;
+    deterministic_spin_idle_ = options.spin_idle;
     return true;
 }
 

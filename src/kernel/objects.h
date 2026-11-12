@@ -456,6 +456,10 @@ public:
     // returned, and the GPU's write-backs counted then
     uint64_t spin_since = 0, spin_last = 0;
     uint32_t spin_seen = 0;
+    // the deterministic mode's yield points that ran out on a priority hint
+    // in a row, and the others since (kernel.cpp's system_.yield,
+    // Deterministic::spin_idle)
+    uint32_t hint_yields = 0, hint_misses = 0;
 };
 
 // The thread running on this host thread (nullptr off guest threads).

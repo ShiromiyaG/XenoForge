@@ -1147,9 +1147,107 @@ functions that name no non-volatile register, and 12 functions use them
 another way: the calling convention holds nearly everywhere, should
 something later need to rely on it.
 
-A benchmark of the generated code is still missing: this run is two fifths
-the game's wait for the GPU thread (a spin in its Direct3D) and the
-scheduler, and the machine's other work moved single runs by a tenth.
+A benchmark of the generated code was still missing then: this run is two
+fifths the game's wait for the GPU thread (a spin in its Direct3D) and the
+scheduler, and the machine's other work moved single runs by a tenth. It
+exists since (below).
+
+## Trusting the calling convention, weighed (2026-11-12)
+
+Asked: whether the generated code would gain from trusting the guest's
+calling convention across calls, the non-volatile registers (r14-r31,
+f14-f31, v14-v31, v64-v127) held as C locals of the function that saves
+them (XenonRecomp's `non_volatile_registers_as_local_variables`), with no
+round trip through the context at its calls. Weighed in three steps before
+any emitter was built; it does not pay, so none was.
+
+**The benchmark of the generated code.** `boot <disc> --game-library <dll>
+--deterministic --spin-idle --until-swap 6000` on game B: the deterministic
+mode with its Direct3D waits taken for idle waits (`Deterministic::
+spin_idle`, docs/runtime.md, "The deterministic mode"), so the host time is
+the guest's work, not the spin. The report's line `deterministic: the
+scheduler's thread used X s of processor time to the halt` is the measure:
+the one host thread every guest thread runs on, which neither the host
+threads nor the waits count in. Twice to swap 3,000: 9.09 and 9.38 s, twice
+to swap 6,000: 11.77 and 11.98 s, the same guest memory hash and report
+each time (this machine, other agents building beside it). Its profile
+(`--profile`): the generated code 78% of the samples (84% to swap 3,000),
+the kernel 7%. Without `--spin-idle` the same run to swap 3,000 takes 15.7
+to 16.2 s, of which the spinning function 15% and the yield points' calls
+into the kernel that move the clock through it another fifth.
+
+**The functions that keep the convention** (`xfrecomp analyze <disc>
+--calls`, tools/calling_convention.cpp): one that saves and restores every
+non-volatile register it names, by the helpers or by its own stores to and
+loads from its frame, and that has no resume site, no stack switch, no
+setjmp, no exception data (its funclets read the registers the unwinder
+restores) and no lmw/stmw. Game B (21,720 functions):
+
+| kind | functions | instructions |
+| --- | --- | --- |
+| keeps it | 12,229 | 1,374,399 |
+| names no non-volatile register | 8,043 | 148,486 |
+| names one it does not save and restore (no epilogue: it never returns; or saves the pattern misses) | 810 | 138,201 |
+| exception data | 356 | 21,598 |
+| resume sites, stack switches, setjmp | 46 | 5,998 |
+
+Their calls: 65,343 sites call a function that keeps it, 1,197 another
+function, 7,982 go through dispatch (indirect calls, imports), where the
+locals would have to be written to the context first. Weighted by a count
+of the calls of an interpreted deterministic run to the same swap (151
+million calls, a temporary counter in `System::call`; `--calls <file>`
+takes "site target count" lines): 80 million calls between functions that
+keep it, 8.7 million to others, 14.6 million through dispatch; 43 million
+entries of functions that keep it, 11.6 million of them into functions that
+reach a dispatch.
+
+**The bound.** What locals would remove: the context's loads and stores of
+those registers around the calls, and the epilogue's restores where nothing
+was written to the context (a function that synced its locals before a
+dispatch must restore them). Counted as the non-volatile registers named
+between each call and its neighbours (more than the compiler keeps in
+memory), 586 million loads and stores at the calls between functions that
+keep it, and 320 million loads and stores and 16 million helper calls in
+the restores: under a billion memory operations in a run of about 54
+billion cycles, at most 1.8% of its time at a cycle each, before the
+host's own convention takes its share (Windows x64 keeps seven general
+registers across a call besides the context's; a function holding more
+live across a call spills them to the host stack, and pushes and pops what
+it uses). The host code agrees: in the objects, memory operands on the
+context's non-volatile general registers are 3.3% of the 13.9 million host
+instructions, about 2% of those executed (weighted by the profile), the
+floating point ones 0.1%; the vector ones, 3.6%, are mostly a vector leaf
+with no calls at all (register pressure, which locals would make host
+spills), and the save and restore helpers 2% of the samples. Under 3%,
+so no emitter was made, as the two experiments above already suggested.
+
+What a prototype would have had to get right, kept for whoever tries again:
+
+- The ops take `Context&`: locals need every op and helper templated on the
+  register file (a type whose `r`, `f` and `v` hand out the locals for the
+  function's saved registers and the context's otherwise, with the slow
+  paths, mmio, the yield hook and the system's callbacks given the real
+  context), or every instruction described twice.
+- Correct without writing the locals back at ordinary calls: a callee that
+  keeps the convention saves the context's values (the nearest
+  non-keeping caller's), restores them, and leaves the context as it found
+  it; an unwind to a catch (whose function never keeps it: exception data)
+  takes each register from the outermost frame below it that saved it,
+  which saved the catcher's own value. Writing them back is needed before a
+  dispatch (the interpreter, an import, a callee that reads a non-volatile
+  register as an input) and then at every exit.
+- The lockstep check compares registers at imports inside a tree: with
+  locals in the frames above, the context holds the outer frames' entry
+  values there, and the comparison (and the next segment's interpreter)
+  would differ. It would have to give up such calls.
+- A finding beside it: the volatile condition register fields cost as much.
+  A compare stores three bytes and copies SO into the context (`setl`,
+  `setg`, `sete` to memory, a load and a store), kept because a later call
+  or return might read them; those are 2.5% of the executed instructions,
+  and trusting that volatile registers are dead at calls and returns would
+  remove most of them. It needs the same templated ops, so it is the
+  registers-in-locals emitter ("Registers in locals, weighed and not done"
+  above), not a change to this one.
 
 ## The compile time by optimization level, measured before two tiers (2026-11-11)
 

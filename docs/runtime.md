@@ -752,6 +752,20 @@ stack's generated frames wait where they are:
   FNV-1a over every committed readable region). The thread report ends with
   the scheduler's counts (runs, slices, yields, waits, idle jumps, forced
   hand-overs) and names a thread that has run a second without handing over.
+- **The generated code's benchmark (2026-11-12).** The XDK's waits spin on
+  priority hints (`or r31,r31,r31` and the like) with no kernel call, so in
+  this mode a wait costs host time for every 100 ns of the clock it waits:
+  game B's Direct3D wait for the GPU was 15% of a run's samples and the
+  yield points' calls into the kernel that moved the clock through it
+  another fifth. `Deterministic::spin_idle` (`boot --spin-idle`) takes a
+  spin for an idle wait: when eight yield points in a row ran out on a hint
+  (`system_.yield`; a back edge leaves the budget at -1, a hint below it)
+  and no other thread is ready, the clock jumps to the earliest deadline
+  (`DeterministicScheduler::spin`), as when every thread waits. The run is
+  still exact, but another one than without it. The report adds the
+  scheduler's thread's processor time to the halt and the spins taken: game
+  B to swap 6,000 in about 12 s of it, 78% of the samples in the generated
+  code (docs/recompiler.md, "Trusting the calling convention, weighed").
 - **Input**: recorded and replayed (docs/input.md, "Recordings"); in this
   mode a replay repeats the recorded run.
 

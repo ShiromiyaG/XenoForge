@@ -293,11 +293,29 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
             k.objects_->scheduler->preempt_point();
             return;
         }
+        // Run out on a priority hint (weight YIELD_PRIORITY_HINT; a back edge
+        // leaves the budget at -1): with spin_idle, a run of those is a spin
+        // on the hints (the XDK's waits), which the scheduler takes for an
+        // idle wait when no other thread is ready (Deterministic::spin_idle).
+        const bool hint = c.yield_budget < -1; // (ppc_ops.h: YIELD_BACK_EDGE 1, YIELD_PRIORITY_HINT 8)
         const int64_t ticks = 1 + (-(c.yield_budget + 1)) / units;
         c.yield_budget += ticks * units;
         // handing over is a safe point: the thread waiting there is parked
         GuestCodeScope parked(k, false);
         k.objects_->scheduler->advance(uint64_t(ticks));
+        if (k.deterministic_spin_idle_) {
+            static constexpr uint32_t HINT_YIELDS_SPIN = 8;
+            Thread *t = current_thread();
+            if (!t) return;
+            // (a back edge's now and then does not end the run: the hints' own
+            // budget may run out at exactly -1; two in a row do)
+            if (!hint) {
+                if (t->hint_misses < 2 && ++t->hint_misses == 2) t->hint_yields = 0;
+            } else if (t->hint_misses = 0; ++t->hint_yields >= HINT_YIELDS_SPIN) {
+                t->hint_yields = 0;
+                k.objects_->scheduler->spin();
+            }
+        }
     };
     // the globals first: the objects and threads use their processes,
     // object types and KeTimeStampBundle
