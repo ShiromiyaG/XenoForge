@@ -45,9 +45,10 @@ struct System {
     void (*mmio_write)(Context &c, uint32_t address, uint32_t value) = nullptr;
     // A yield point whose budget ran out (Context::yield_budget; ppc_ops.h's
     // yield_point): charges the time those points stood for and may hand the
-    // processor over (the kernel's deterministic mode). Unset: the budget is
-    // refilled and the code goes on.
-    void (*yield)(Context &c) = nullptr;
+    // processor over (the kernel's deterministic mode). `weight` is the point
+    // that ran it out (ppc_ops.h's YIELD_*: a back edge, a priority hint, an
+    // indirect call). Unset: the budget is refilled and the code goes on.
+    void (*yield)(Context &c, int64_t weight) = nullptr;
     // A long spin (ppc_ops.h's spin_hint: SPIN_HINTS_BEFORE_YIELD db16cyc
     // hints in a row): the host processor given to whatever else is ready on
     // it (the kernel's: SwitchToThread, sched_yield), back at once when

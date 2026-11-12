@@ -549,7 +549,7 @@ bool Kernel::make_deterministic(const Deterministic &options) {
     o.system_time_base = options.system_time;
     deterministic_call_cost_ = options.call_cost;
     deterministic_time_base_cost_ = options.time_base_cost;
-    deterministic_dispatch_cost_ = options.dispatch_cost;
+    deterministic_entry_cost_ = options.entry_cost;
     deterministic_yield_units_ = options.yield_units;
     deterministic_spin_idle_ = options.spin_idle;
     return true;

@@ -23,6 +23,8 @@
 // a taken branch backward (to its own address or before it, no LK): a yield
 // point (ppc_ops.h), as the interpreter's
 #define XF_YIELD() ::xf::ppc::ops::yield_point(c, ::xf::ppc::ops::YIELD_BACK_EDGE)
+// a taken indirect call (bcctrl, bclrl): a yield point too, before the call
+#define XF_INDIRECT() ::xf::ppc::ops::yield_point(c, ::xf::ppc::ops::YIELD_INDIRECT_CALL)
 #if defined(__clang__)
 #define XF_TAIL(f) [[clang::musttail]] return f(c)
 #else

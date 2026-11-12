@@ -181,14 +181,19 @@ XF_INLINE void set_ov(Context &c, bool overflow) {
 // A yield point's weight, in the budget's units (a 32nd of the deterministic
 // clock's 100 ns, about ten Xenon cycles): a loop's back edge one, a priority
 // hint (or rx,rx,rx, which the XDK's spin loops run) eight, so a spin reaches
-// the end of its slice sooner than a loop doing work.
+// the end of its slice sooner than a loop doing work; an indirect call (a
+// taken bcctrl or bclrl) 32, 100 ns of the clock. The indirect call is
+// counted here, at the guest's instruction, in the generated code and the
+// interpreter alike, not where the runtime's dispatch is entered: which calls
+// reach dispatch depends on what discovery found, and the clock must not.
 constexpr int64_t YIELD_BACK_EDGE = 1;
 constexpr int64_t YIELD_PRIORITY_HINT = 8;
+constexpr int64_t YIELD_INDIRECT_CALL = 32;
 
 // the budget ran out: the system's hook, or a fresh budget when there is none
-[[gnu::cold]] [[gnu::noinline]] inline void yield_hook(Context &c) {
+[[gnu::cold]] [[gnu::noinline]] inline void yield_hook(Context &c, int64_t weight) {
     if (c.system && c.system->yield)
-        c.system->yield(c);
+        c.system->yield(c, weight);
     else
         c.yield_budget = INT64_MAX;
 }
@@ -201,7 +206,7 @@ XF_INLINE bool yield_counting(const Context &c) { return __atomic_load_n(&c.yiel
 XF_INLINE void yield_point(Context &c, int64_t weight) {
     if (yield_counting(c)) [[unlikely]] {
         c.yield_budget -= weight;
-        if (c.yield_budget < 0) yield_hook(c);
+        if (c.yield_budget < 0) yield_hook(c, weight);
     }
 }
 

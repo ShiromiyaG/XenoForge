@@ -32,6 +32,7 @@
 #include "xenoforge/exports.h"
 #include "xenoforge/hooks.h"
 #include "xenoforge/ppc_interp.h"
+#include "xenoforge/ppc_ops.h" // the yield points' weights
 
 #include <algorithm>
 #include <chrono>
@@ -275,7 +276,7 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         t->spin_seen = seen;
         t->spin_last = s.now();
     };
-    system_.yield = [](ppc::Context &c) {
+    system_.yield = [](ppc::Context &c, int64_t weight) {
         // the yield points' budget ran out (ppc_ops.h): the clock moves by
         // the whole ticks spent, and another thread may run (a spin on a flag
         // with no kernel call reaches its slice's end here)
@@ -293,11 +294,12 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
             k.objects_->scheduler->preempt_point();
             return;
         }
-        // Run out on a priority hint (weight YIELD_PRIORITY_HINT; a back edge
-        // leaves the budget at -1): with spin_idle, a run of those is a spin
+        // Run out on a priority hint: with spin_idle, a run of those is a spin
         // on the hints (the XDK's waits), which the scheduler takes for an
         // idle wait when no other thread is ready (Deterministic::spin_idle).
-        const bool hint = c.yield_budget < -1; // (ppc_ops.h: YIELD_BACK_EDGE 1, YIELD_PRIORITY_HINT 8)
+        // An indirect call's leaves the run as it was.
+        const bool hint = weight == ppc::ops::YIELD_PRIORITY_HINT;
+        const bool back_edge = weight == ppc::ops::YIELD_BACK_EDGE;
         const int64_t ticks = 1 + (-(c.yield_budget + 1)) / units;
         c.yield_budget += ticks * units;
         // handing over is a safe point: the thread waiting there is parked
@@ -307,13 +309,16 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
             static constexpr uint32_t HINT_YIELDS_SPIN = 8;
             Thread *t = current_thread();
             if (!t) return;
-            // (a back edge's now and then does not end the run: the hints' own
-            // budget may run out at exactly -1; two in a row do)
-            if (!hint) {
+            // (a back edge's now and then does not end the run: the spin's own
+            // loop turns back after its hints; two in a row do)
+            if (back_edge) {
                 if (t->hint_misses < 2 && ++t->hint_misses == 2) t->hint_yields = 0;
-            } else if (t->hint_misses = 0; ++t->hint_yields >= HINT_YIELDS_SPIN) {
-                t->hint_yields = 0;
-                k.objects_->scheduler->spin();
+            } else if (hint) {
+                t->hint_misses = 0;
+                if (++t->hint_yields >= HINT_YIELDS_SPIN) {
+                    t->hint_yields = 0;
+                    k.objects_->scheduler->spin();
+                }
             }
         }
     };
@@ -821,9 +826,10 @@ std::string Kernel::lockstep_report() const { return lockstep_ ? lockstep_->repo
 // caller's frame when that frame's generated code takes it.
 void Kernel::dispatch(ppc::Context &c, uint32_t target) {
     if (stopped) return;
-    // an indirect call moves the deterministic mode's clock and may hand over
-    // (a loop that waits on another thread through virtual calls gets there)
-    if (deterministic_dispatch_cost_) objects_->scheduler->advance(deterministic_dispatch_cost_);
+    // (no charge on the deterministic mode's clock here: the guest's indirect
+    // calls are yield points, ppc_ops.h's YIELD_INDIRECT_CALL, counted at the
+    // instruction in the generated code and the interpreter alike; which
+    // calls come through here depends on what discovery found)
     // what a return from this call comes back to
     const uint32_t until = uint32_t(c.lr), stack_top = uint32_t(c.r[1]);
     uint32_t pc = target;
@@ -900,6 +906,8 @@ void Kernel::call(ppc::Context &c, uint32_t address) {
     // guest code from here (a thread's start, a callback the kernel makes)
     GuestCodeScope running(*this, true);
     c.lr = SENTINEL;
+    // an entry the kernel makes moves the deterministic mode's clock and may hand over
+    if (deterministic_entry_cost_) objects_->scheduler->advance(deterministic_entry_cost_);
     uint32_t target;
     try {
         dispatch(c, address);

@@ -100,6 +100,7 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
             uint32_t target = uint32_t(c.lr) & ~3u;
             if (i.XL.LK) {
                 c.lr = next;
+                if (taken) ops::yield_point(c, ops::YIELD_INDIRECT_CALL); // an indirect call, as the generated code's
                 if (taken && c.system && c.system->call && c.system->call(c, target)) break;
             } else if (taken && stack_top && target != until && uint32_t(c.r[1]) > stack_top) {
                 c.pc = pc;
@@ -113,6 +114,7 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
             uint32_t target = uint32_t(c.ctr) & ~3u;
             if (i.XL.LK) {
                 c.lr = next;
+                if (taken) ops::yield_point(c, ops::YIELD_INDIRECT_CALL);
                 if (taken && c.system && c.system->call && c.system->call(c, target)) break;
             } else if (taken && entered(target, pc)) [[unlikely]] {
                 next = uint32_t(c.lr) & ~3u;

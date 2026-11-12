@@ -678,17 +678,18 @@ stack's generated frames wait where they are:
   (NtYieldExecution, a spin lock's spins, the loader lock's waiters), and the
   end of its slice or a deadline come due, checked at each kernel call
   (`Kernel::run_import`), time base read (the `time_base` callback),
-  indirect call (`Kernel::dispatch`, which the generated code's `bctrl`s
-  reach) and the recompiler's yield points (a loop's back edge, a priority
-  hint `or rx,rx,rx`; the `System::yield` callback, docs/recompiler.md,
-  "Yield points"). The thread that ran goes to the tail of the ready queue, woken
+  entry into guest code the kernel makes (`Kernel::call`: a thread's start,
+  a callback) and the recompiler's yield points (a loop's back edge, a
+  priority hint `or rx,rx,rx`, an indirect call `bcctrl`/`bclrl`; the
+  `System::yield` callback, docs/recompiler.md, "Yield points"). The thread that ran goes to the tail of the ready queue, woken
   threads join it in the order they were woken, timed-out waits end in the
   order the threads were made. Nothing is handed over at DISPATCH_LEVEL or
   above (NT does not preempt there; the video family holds a host mutex per
   CPU around an interrupt's callback).
-- **A virtual clock.** A kernel call costs 1 us of it, a time base read and
-  an indirect call 100 ns, a loop's back edge 1/32 of 100 ns (about ten
-  Xenon cycles) and a priority hint 8/32, a slice is 1 ms (all
+- **A virtual clock.** A kernel call costs 1 us of it, a time base read,
+  an entry the kernel makes and an indirect call 100 ns (the last 32/32 of
+  a yield point), a loop's back edge 1/32 of 100 ns (about ten Xenon
+  cycles) and a priority hint 8/32, a slice is 1 ms (all
   `Deterministic` fields; `yield_units` 0 stops counting the yield points);
   when
   every thread waits, it jumps to the earliest deadline (a timeout, a timer).
@@ -759,7 +760,8 @@ stack's generated frames wait where they are:
   yield points' calls into the kernel that moved the clock through it
   another fifth. `Deterministic::spin_idle` (`boot --spin-idle`) takes a
   spin for an idle wait: when eight yield points in a row ran out on a hint
-  (`system_.yield`; a back edge leaves the budget at -1, a hint below it)
+  (`system_.yield`, told the weight of the point that ran it out; one back
+  edge between them is the spin's own loop, an indirect call is passed over)
   and no other thread is ready, the clock jumps to the earliest deadline
   (`DeterministicScheduler::spin`), as when every thread waits. The run is
   still exact, but another one than without it. The report adds the

@@ -201,14 +201,26 @@ mode (docs/runtime.md, "The deterministic mode"):
   `{ XF_YIELD(); goto L_...; }`, and the same for a backward tail branch to
   another function), and every priority hint, `or rx,rx,rx` with Rc 0
   (`or r1,r1,r1`, `or 31,31,31`; in `orx`'s semantics in ppc_ops, where the
-  constant word folds the test away). The interpreter counts the same
-  points, so a function counts alike run either way.
+  constant word folds the test away), and every taken indirect call
+  (`bcctrl`, `bclrl`: `XF_INDIRECT()` before the dispatch). The
+  interpreter counts the same points, so a function counts alike run either
+  way.
+- **Only the guest's instructions count** (2026-11-12). Until then an
+  indirect call moved the clock in `Kernel::dispatch`, which the generated
+  code also enters for a direct call to code with no generated function, a
+  branch out of one, a jump table's unknown case and an import's thunk,
+  while the interpreter's `bctrl` entered none: the clock, and so the
+  hand-overs, depended on what discovery found, and game B's interpreted
+  and generated deterministic runs parted. Now the charge is a yield point
+  at the instruction (weight 32, 100 ns) and dispatch charges nothing.
 - **Cost when playing**: `Context::yield_counting` is false, so a yield
   point is a load and a branch not taken (no store, no call).
 - **Counting** (set by `Kernel::attach` in the deterministic mode): each
   point takes its weight off `Context::yield_budget` (a back edge 1, a hint
-  8; units of 1/32 of the clock's 100 ns, `Deterministic::yield_units`, so
-  about ten Xenon cycles); below 0, `System::yield` moves the clock by the
+  8, an indirect call 32; units of 1/32 of the clock's 100 ns,
+  `Deterministic::yield_units`, so about ten Xenon cycles); below 0,
+  `System::yield` (told the weight of the point that ran the budget out,
+  which `spin_idle` reads to tell a spin on the hints) moves the clock by the
   whole ticks spent, refills the budget and may hand over at the slice's
   end, as a kernel call does. The hook is a cold out-of-line function in
   the header, so a game library needs no new runtime call.

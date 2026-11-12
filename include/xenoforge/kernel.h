@@ -322,10 +322,11 @@ struct Deterministic {
     uint64_t system_time = 133'801'632'000'000'000ull; // the guest's system time at the start: 2025-01-01 00:00 UTC
     uint64_t call_cost = 10;      // a kernel call: 1 us
     uint64_t time_base_cost = 1;  // a time base read (mftb): 100 ns
-    uint64_t dispatch_cost = 1;   // an indirect call (Kernel::dispatch): 100 ns
-    // The recompiler's yield points (a loop's back edge, a priority hint;
-    // ppc_ops.h) are counted in units of 1/yield_units of 100 ns: a back edge
-    // one (about 3 ns), a priority hint eight. 0: not counted.
+    uint64_t entry_cost = 1;      // a call into guest code the kernel makes (a thread's start, a callback): 100 ns
+    // The recompiler's yield points (a loop's back edge, a priority hint, an
+    // indirect call; ppc_ops.h) are counted in units of 1/yield_units of
+    // 100 ns: a back edge one (about 3 ns), a priority hint eight, an indirect
+    // call 32. 0: not counted.
     uint32_t yield_units = 32;
     uint64_t slice = 10'000;      // a thread runs 1 ms of the clock before the next ready one does
     // Guest code that runs this long on the host without handing over (a spin
@@ -612,7 +613,7 @@ private:
     Memory &memory_;
     // what a kernel call and a time base read cost the deterministic mode's
     // clock (0 when playing)
-    uint64_t deterministic_call_cost_ = 0, deterministic_time_base_cost_ = 0, deterministic_dispatch_cost_ = 0;
+    uint64_t deterministic_call_cost_ = 0, deterministic_time_base_cost_ = 0, deterministic_entry_cost_ = 0;
     // the yield points' units in 100 ns (0: not counted; attach)
     uint32_t deterministic_yield_units_ = 0;
     bool deterministic_spin_idle_ = false; // Deterministic::spin_idle

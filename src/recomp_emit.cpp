@@ -334,7 +334,7 @@ private:
             bool always = (i.XL.BO & 0x14) == 0x14;
             if (i.XL.LK) {
                 line("{ uint32_t target = uint32_t(c.lr) & ~3u; bool taken = " + bc(i.XL.BO, i.XL.BI, false) +
-                     "; c.lr = " + next + "; if (taken) ::xf::ppc::dispatch(c, target); }");
+                     "; c.lr = " + next + "; if (taken) { XF_INDIRECT(); ::xf::ppc::dispatch(c, target); } }");
                 fall_through(pc);
             } else if (always) {
                 line(ret());
@@ -361,7 +361,7 @@ private:
             if (first) return;
             if (i.XL.LK) {
                 line("{ uint32_t target = uint32_t(c.ctr) & ~3u; bool taken = " + bc(i.XL.BO, i.XL.BI, true) +
-                     "; c.lr = " + next + "; if (taken) ::xf::ppc::dispatch(c, target); }");
+                     "; c.lr = " + next + "; if (taken) { XF_INDIRECT(); ::xf::ppc::dispatch(c, target); } }");
                 fall_through(pc);
             } else if (always) {
                 line("::xf::ppc::dispatch(c, uint32_t(c.ctr) & ~3u); " + ret());
