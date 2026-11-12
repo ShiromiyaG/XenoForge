@@ -1150,3 +1150,35 @@ something later need to rely on it.
 A benchmark of the generated code is still missing: this run is two fifths
 the game's wait for the GPU thread (a spin in its Direct3D) and the
 scheduler, and the machine's other work moved single runs by a tenth.
+
+## The compile time by optimization level, measured before two tiers (2026-11-11)
+
+The plan was two tiers: a library built quickly without optimization so a
+game starts sooner, and the optimized one built behind it. Measured first,
+on four files of a game's generated code (about a megabyte and 35,000
+lines each; clang 23, the recompile step's flags, one compiler at a time,
+twice):
+
+| flags | the four files | an object |
+| --- | --- | --- |
+| `-O2` (the recompile step's) | 17.6 to 18.0 s | 565 KB |
+| `-O2 -fno-slp-vectorize -fno-vectorize` | 15.8 to 17.3 s | 558 KB |
+| `-O1` | 14.0 to 15.4 s | 557 KB |
+| `-O0` | 13.6 s | 6,536 KB |
+
+Without optimization the compiler takes a quarter less time and makes
+objects eleven times larger (the instructions' helpers are always inlined,
+and what is inlined is then emitted as written), which the linker and the
+game then pay for. `-ftime-trace` on one file at `-O2` (4.1 s): the front
+end 0.6 s, the optimizer 2.2 s (1.3 s of it inlining), the code generator
+1.3 s. So the time follows the size of the code a guest instruction
+becomes, not the level: a first tier at `-O0` or `-O1` gains too little
+to be worth a second build of everything, and was not made.
+
+What does shorten the wait, in the order it would pay: more compilers at
+once where the memory allows (four is the limit set for 16 GB; the step
+takes about eight minutes a game with them), a smaller expansion of the
+commonest instructions (each inlined helper is compiled once a use), and
+starting the game on the interpreter while the library is built (the
+runtime falls back to it for code without a function already), which is
+the owner's to decide: it is slow while it lasts.
