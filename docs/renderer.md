@@ -1828,7 +1828,8 @@ times (a render pass's end, a query, an upload: whatever else records) and
 the command buffer's memory goes from one thread's cache to the other's at
 each. Live, with the machine in use, it lost (16.4 against 19.0 swaps a
 second). What would gain is every command of the renderer's through the
-ring, the command thread never touching the command buffer.
+ring, the command thread never touching the command buffer. (Done, and
+`XF_RECORD_THREAD` removed with it: `XF_RECORD_RING`, below.)
 
 **The frame timed, and what the other emulators do (2026-11-11, later).**
 `--rates` now prints the command thread's work a swap beside each line
@@ -2020,6 +2021,117 @@ where `shaderObject` is layered over pipelines (drivers without native
 support) they can only be slower. What would cut the binds is fewer of them:
 the draws' order is the guest's, and each of game G's binds already
 changes shaders.
+
+**The textures' slots, the uploads, and the recording on a thread of its
+own (2026-11-12).** The tool first: `XF_DRAW_SECTIONS=1` times the draw by
+section (`src/draw_sections.h`: a time stamp at each section's end, the
+cycles a draw over the plays after the first, printed at the end) and counts
+what the sections do (the slot memo's hits and misses by reason, the
+`unwritten` scans, the constants' uploads). Within one run a section against
+another is far steadier than a run's total against another run's on a busy
+machine. Game G's in-play frame, a draw by section in time stamp ticks
+(machine busy, one run each):
+
+| section | before | with both below |
+| --- | --- | --- |
+| front part | 561-771 | |
+| indices | 880-1,151 | |
+| constants (the blocks brought up to date) | 354-410 | |
+| targets and system constants | 289-372 | |
+| textures | 1,196-2,447 | 802 |
+| pipeline key and lookup | 783-990 | |
+| vertex request | 550-704 | |
+| uploads (constants 1.48 a draw, system constants 0.64, words) | 1,280-1,640 | |
+| the pass, binds, dynamic state and draw | 2,900-3,250 | 900 |
+
+- **Textures: the slot memo's misses.** A slot the memo misses goes the long
+  way (`texture`, its view and sampler looked up, the memo kept again):
+  13,000-20,000 ticks each, so 0.06 misses a draw cost more than the 2.2
+  hits. Two causes. The direct-mapped table of 4,096 entries collided (one
+  slot in fifty), and each texture made again at another size (once a
+  frame here) gave its views' places in the bindless table back, which
+  moved `texture_epoch_` and so dropped every slot of every draw: about 360
+  misses a play, every key once. Now the table has 16,384 entries in sets of
+  two ways, the hash's bits mixed (`XF_SLOT_MEMO_WAYS=1`: direct-mapped and
+  4,096 as before), and a place given back by a texture whose own loads
+  moved (it was made again: `Texture::loads`, which already drops what was
+  kept of its own slots, and only its slots name its views) leaves the
+  others' kept (`XF_SLOT_MEMO_KEEP=0`: every place given back drops them
+  all). Misses 0.08 to 0.003 a draw; the rest are real loads (a texture a
+  resolve wrote, loaded again).
+- **The `unwritten` checks** scan pages at 0.28 a draw (the memory's write
+  count moved): by blocks of 64 pages, a few hundred ticks a draw at most,
+  left as they are.
+- **The uploads.** Tried and left out: uploading a stage's constants again
+  only where the blocks its shader reads were written (a stale mask in
+  place of any write): 1.48 to 1.44 uploads a draw on game G, 1.46 to 1.39 on
+  game D, below the noise; the draw data in host memory rather than
+  device-local (`XF_VK_NO_DEVICE_LOCAL_DRAW_DATA=1`): the copies' time about
+  the same, the GPU 3 ms a play slower. A constants upload is 1.5 KB in ten
+  copies a draw; what it costs is the copy itself (about 450 ticks a draw)
+  and the bookkeeping around it, no single thing to cut.
+
+**The recording thread** (`XF_RECORD_RING=1`, off by default until timed
+live; `src/record_ring.h`). The slots' command buffers are named, in the
+renderer, by handles of the ring's (`rec::Fake`: an entry of a process-wide
+table, told from a driver's handle by its address). Every `vkCmd*` the
+renderer calls is, in `renderer.cpp` alone, a function of the same
+signature (the header's macros): with a driver's handle it calls the driver;
+with the ring's it copies the arguments, and the arrays and chains they
+point to (barriers, attachments, regions, an image barrier's sample
+locations; any other chained structure stops the process), into a ring of
+16 MB, which one thread records from in order into the real command
+buffers. The command buffers' begins and ends go the same way, and so does
+the submission: the fence is reset by the command thread, the recording
+thread submits once it has recorded the slot and stores the submission's
+serial. The draws' own commands go in as their words, one entry each
+(`run_recorded` on the recording thread), not through the wrappers. The
+command thread then never calls the driver to record; it hands the ring
+over by batches of 16 KB (`XF_RECORD_RING_BATCH`; at every draw, the
+thread's wake-ups, a system call each, cost more than the driver's time
+saved: 1,166 ticks a draw in the draw's last section against 312 batched),
+and waits for the recording thread only where it must:
+
+- a fence wait on a submission the thread has not made yet (`finish_oldest`:
+  it waits for the serial, then for the fence as before);
+- the presenter (`on_swap`): what it submits after the frame must follow the
+  frame's submission, so the swap waits for that serial first;
+- a port's frame (`NativeFrame::commands`): the port records into the real
+  command buffer itself, so the ring is recorded first and the renderer's
+  own commands are recorded at once until the frame ends (`Ring::direct`);
+- the ring full (16 MB: never seen).
+
+The ring prints its counts at the end (`record ring: ... waits: ...`).
+Pictures identical to the renderer's own on game G's frame and on the frame
+whose barriers carry sample locations; the regression passes with it on,
+on both paths.
+
+Measured (xfreplay `--repeat 15`, three rounds A B interleaved, the
+commands' processor time a play, the median of each round; other agents'
+builds running, the processor 70-100% busy):
+
+| | off | `XF_RECORD_RING=1` |
+| --- | --- | --- |
+| game G's in-play frame | 26.7 / 24.9 / 25.6 ms | 20.1 / 20.4 / 21.0 ms (-20%) |
+| its fastest play | 21.4-21.7 ms | 16.8-17.4 ms |
+| all threads' processor time a play (the trace's walk included) | 369-375 ms | 365-383 ms |
+| waits for the ring a play | | 0.13-0.2 (fences; about 0.1 ms each) |
+| game D's drive frame | 10.0 / 10.0 / 9.5 ms | 8.3 / 8.0 / 7.9 ms (-20%) |
+| its fastest play | 8.1-8.3 ms | 6.1-7.2 ms |
+| all threads' processor time a play | 206-208 ms | 203-215 ms |
+| waits for the ring a play | | 1.1 (fences; 0.15 ms each, 0.16 ms a play; once 1.1 ms a play) |
+
+By section (game G, one run each): a draw 8,685 ticks to 6,465; the pass,
+binds, dynamic state and draw 2,840 to 900; the rest the same. The
+recording thread's own time is about what the command thread no longer
+spends (the processor's total within its noise). The slot memo's two
+changes: within the noise on both frames (game G 24.0 against 27.4 ms
+median of medians, game D 9.8 against 9.9), the textures' section 1,992
+to 1,734 ticks a draw by sections.
+
+Live, the presenter adds one wait a swap (the frame's last submission made
+before `on_swap`), what the ring holds then: at most a batch and the frame's
+end. To be timed live with the machine quiet.
 
 ## Texture formats (2026-11-06)
 

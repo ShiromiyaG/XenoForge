@@ -44,6 +44,7 @@
 
 #include "xenoforge/renderer.h"
 
+#include "draw_sections.h"
 #include "fast_clock.h"
 #include "native_internal.h"
 
@@ -77,10 +78,14 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+
+// (last: its macros stand for the driver's vkCmd* functions in what follows)
+#include "record_ring.h"
 
 namespace xf::render {
 namespace {
@@ -1898,7 +1903,7 @@ private:
     void apply_texture_limits();
     bool make_room(uint32_t kind, uint32_t needed);
     void destroy_texture(Texture *t);
-    void release_index(uint32_t kind, uint32_t index);
+    void release_index(uint32_t kind, uint32_t index, bool owner_reloaded = false);
     // A new place in the resolves' table for a texel size (none given back
     // to take): a place never taken, else the place of the least recently
     // used texture holding one that nothing recorded or in flight uses (it
@@ -2178,7 +2183,6 @@ private:
     void end_pass() {
         end_query(); // a query does not outlive its render pass
         if (in_pass_) {
-            record_sync();
             vkCmdEndRendering(slots_[current_].cmd);
         }
         in_pass_ = false;
@@ -2255,7 +2259,6 @@ private:
     }
     void viz_end_host() {
         if (viz_open_ == UINT32_MAX) return;
-        record_sync();
         vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, viz_[viz_open_].index);
         viz_open_ = UINT32_MAX;
     }
@@ -2278,7 +2281,6 @@ private:
         if (viz_open_ != viz_survey_) {
             end_query(); // the report's and another ID's: one occlusion query at a time
             if (!viz_count(q)) return;
-            record_sync();
             vkCmdBeginQuery(c, slots_[current_].occlusion, q.index, 0);
             viz_open_ = viz_survey_;
         }
@@ -2444,7 +2446,6 @@ private:
         if (zpd_active_ == UINT32_MAX) return;
         // (the interlock path's counters are no host queries)
         if (!fsi_) {
-            record_sync();
             vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
         }
         zpd_active_ = UINT32_MAX;
@@ -2472,7 +2473,6 @@ private:
         s.occlusion_used = uint32_t(s.occlusion_reports.size());
         zpd_counts_[zpd_current_].open++;
         report_.occlusion_queries++;
-        record_sync();
         vkCmdBeginQuery(c, s.occlusion, zpd_active_, d_.precise_occlusion() ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
     // the slot's submission is done: its queries' samples to their reports
@@ -2728,17 +2728,45 @@ private:
         SamplerEntry *sampler = nullptr;
         uint32_t slot_word = 0, signs = 0, integer_scale = 0, signed_word = 0;
         uint32_t uses = 0; // the Report::used counts a draw adds for it (bit 0, bit 1)
+        uint64_t used = 0; // the draw that last found it (the two ways' replacement)
     };
-    // by the constant's content rather than the slot: a direct-mapped table any slot finds what
-    // any slot made of the same constant and filters in (a game binding other textures at every
-    // draw rarely gives a slot the same constant twice running)
-    static constexpr uint32_t FETCH_MEMOS = 4096;
+    // by the constant's content rather than the slot: a table any slot finds what any slot made
+    // of the same constant and filters in (a game binding other textures at every draw rarely
+    // gives a slot the same constant twice running). 16,384 entries, two ways a set, the one a
+    // draw found less lately replaced, the hash's bits mixed: direct-mapped, a scene's thousand
+    // constants in 4,096 entries collided often enough that one slot in fifty was looked up the
+    // long way, each a few microseconds (XF_SLOT_MEMO_WAYS=1: 4,096 direct-mapped, the hash as
+    // before).
+    static constexpr uint32_t FETCH_MEMOS = 16384;
     std::unique_ptr<SlotMemo[]> fetch_memos_ = std::make_unique<SlotMemo[]>(FETCH_MEMOS);
-    static uint32_t fetch_memo_index(const uint32_t *fetch, const std::array<uint32_t, 4> &overrides) {
+    bool slot_memo_two_ways_ = [] {
+        const char *v = std::getenv("XF_SLOT_MEMO_WAYS");
+        return !(v && v[0] == '1');
+    }();
+    uint32_t fetch_memo_index(const uint32_t *fetch, const std::array<uint32_t, 4> &overrides) const {
         uint64_t h = 0x9E3779B97F4A7C15ull;
         for (uint32_t k = 0; k < 6; k++) h = (h ^ fetch[k]) * 0x100000001B3ull;
         for (uint32_t o : overrides) h = (h ^ o) * 0x100000001B3ull;
-        return uint32_t(h >> 40) & (FETCH_MEMOS - 1);
+        if (!slot_memo_two_ways_) return uint32_t(h >> 40) & 4095; // (the table as it was: 4,096 entries)
+        h ^= h >> 31, h *= 0xBF58476D1CE4E5B9ull, h ^= h >> 29;
+        return uint32_t(h >> 32) & (FETCH_MEMOS - 1);
+    }
+    // the entry of a slot's constant and filters: the way that holds them, else the one to
+    // replace (one kept by an older epoch, else the one found less lately)
+    SlotMemo *fetch_memo(const uint32_t *fetch, const std::array<uint32_t, 4> &overrides) {
+        const uint32_t index = fetch_memo_index(fetch, overrides);
+        SlotMemo *a = &fetch_memos_[index];
+        if (!slot_memo_two_ways_) return a;
+        SlotMemo *b = &fetch_memos_[index ^ 1];
+        auto holds = [&](const SlotMemo &m) {
+            return m.epoch == texture_epoch_ && std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0 &&
+                   m.overrides == overrides;
+        };
+        if (holds(*a)) return a;
+        if (holds(*b)) return b;
+        if (a->epoch != texture_epoch_) return a;
+        if (b->epoch != texture_epoch_) return b;
+        return a->used <= b->used ? a : b;
     }
     uint64_t texture_epoch_ = 1;
     uint64_t approximations_ = 0; // approximate()'s calls
@@ -2952,27 +2980,23 @@ private:
         return !(v && v[0] == '0');
     }();
 
-    // ---- the recording thread ----
+    // ---- the draws' commands, and the recording thread ----
     // A draw's commands (its binds, the dynamic state it changes, the draw)
-    // are not recorded into the command buffer by the thread that makes them:
-    // they go into a ring another thread records from, so the driver's time
-    // in them is off the command thread. A command buffer is recorded by one
-    // thread at a time: everything else that records (cmd()'s callers, the
-    // render pass's and the queries' ends, the submission) first waits for
-    // the ring to empty (record_sync). Off unless XF_RECORD_THREAD=1: it
-    // gained nothing on a replayed frame and lost in play (docs/renderer.md,
-    // "Game G's command thread"), the passes being short and the command
-    // buffer's memory going from one thread's cache to the other's at each.
-    // The ring holds words: a command's number, then what it takes (a few
-    // words each: the ring's lines go from one thread's cache to the other's
-    // and back, so its size is what the hand-over costs).
+    // are put as words: a command's number, then what it takes (run_recorded
+    // records them). Recorded at once, or, with the recording thread
+    // (XF_RECORD_RING=1, record_ring.h), put whole into its ring, where
+    // everything else the renderer records goes too: the command buffers the
+    // renderer records through are then the ring's handles (rec::Fake), and
+    // the thread that makes the commands never calls the driver to record.
+    // (XF_RECORD_THREAD, a thread for the draws' commands alone, waited for
+    // the ring to empty at every other command: about 100 waits a frame, and
+    // it lost; docs/renderer.md, "Game G's command thread".)
     struct Recorded {
         enum Op : uint32_t {
-            CommandBuffer, BindPipeline, BindSets, BindIndexBuffer, BindVertexBuffer, Viewport, Scissor,
-            BlendConstants, StencilReference, StencilCompareMask, StencilWriteMask, Topology, RestartEnable, CullMode,
-            FrontFace, DepthTest, DepthWrite, DepthCompare, StencilTest, StencilOp, DepthBiasEnable, BlendEnables,
-            BlendEquations, WriteMasks, LineWidth, DepthBias, DepthBiasExact, BeginConditional, EndConditional, Draw,
-            DrawIndexed, Wrap, Quit,
+            BindPipeline, BindSets, BindIndexBuffer, BindVertexBuffer, Viewport, Scissor, BlendConstants,
+            StencilReference, StencilCompareMask, StencilWriteMask, Topology, RestartEnable, CullMode, FrontFace,
+            DepthTest, DepthWrite, DepthCompare, StencilTest, StencilOp, DepthBiasEnable, BlendEnables, BlendEquations,
+            WriteMasks, LineWidth, DepthBias, DepthBiasExact, BeginConditional, EndConditional, Draw, DrawIndexed,
         };
         struct Sets {
             uint32_t count;
@@ -2988,84 +3012,51 @@ private:
             VkDeviceSize at;
         };
     };
-    static constexpr uint32_t RECORDED = 1u << 16, RECORDED_MOST = 32; // words; a command's most, with its number
-    std::unique_ptr<uint32_t[]> recorded_;
-    alignas(64) std::atomic<uint32_t> recorded_head_{0}; // words put in (the command thread's)
-    alignas(64) std::atomic<uint32_t> recorded_tail_{0}; // words recorded (the recording thread's)
-    alignas(64) std::atomic<bool> recorder_asleep_{false};
-    std::thread recorder_;
+    static constexpr uint32_t RECORDED_MOST = 32; // words of a command, with its number
     uint32_t recorded_direct_[RECORDED_MOST] = {};
     VkCommandBuffer record_direct_cmd_ = VK_NULL_HANDLE;
-    bool record_thread_ = [] {
-        const char *v = std::getenv("XF_RECORD_THREAD");
+    std::unique_ptr<rec::Ring> ring_; // the recording thread's ring (XF_RECORD_RING=1)
+    bool ring_on_ = [] {
+        const char *v = std::getenv("XF_RECORD_RING");
         return v && v[0] == '1';
     }();
-    static void spin_pause() {
-#if defined(__x86_64__) || defined(_M_X64)
-        _mm_pause();
-#else
-        std::this_thread::yield();
-#endif
-    }
-    uint32_t record_head_ = 0, record_published_ = 0, record_tail_seen_ = 0;
-    uint32_t record_words_ = 0;                    // of the command being filled, with its number
-    VkCommandBuffer record_cmd_ = VK_NULL_HANDLE;  // the command buffer the ring's commands after this go into
-    // room for a command of that many words after its number, contiguous
-    uint32_t *record_room(uint32_t op, uint32_t words) {
-        const uint32_t total = words + 1;
-        uint32_t at = record_head_ & (RECORDED - 1);
-        // (never across the ring's end: the rest of it skipped)
-        const uint32_t skipped = at + total > RECORDED ? RECORDED - at : 0;
-        // (the other thread's count read again only when the ring looks full:
-        // its cache line is that thread's to write)
-        if (record_head_ + skipped + total - record_tail_seen_ > RECORDED) {
-            record_publish();
-            while (record_head_ + skipped + total -
-                       (record_tail_seen_ = recorded_tail_.load(std::memory_order_acquire)) >
-                   RECORDED)
-                spin_pause();
-        }
-        if (skipped) {
-            recorded_[at] = Recorded::Wrap;
-            record_head_ += skipped;
-            at = 0;
-        }
-        recorded_[at] = op;
-        record_words_ = total;
-        return &recorded_[at + 1];
+    // the serial of the last submission the recording thread made, and its error
+    std::atomic<uint64_t> ring_submitted_{0};
+    std::atomic<int32_t> ring_submit_error_{VK_SUCCESS};
+    uint64_t flushed_serial_ = 0; // the last submission's serial
+    // a command put in the ring: the renderer and the command's words
+    static void run_recorded_entry(const void *payload, VkCommandBuffer real) {
+        Impl *self;
+        std::memcpy(&self, payload, sizeof(self));
+        self->run_recorded(real, reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(payload) + 8));
     }
     // the next command's words to fill, then recorded(): into the ring, or recorded at once
     uint32_t *record(VkCommandBuffer c, Recorded::Op op, uint32_t words) {
-        if (!record_thread_) {
-            recorded_direct_[0] = op;
-            record_direct_cmd_ = c;
-            return &recorded_direct_[1];
+        if (rec::Fake *f = rec::fake_of(c); f && !f->ring->direct()) {
+            uint8_t *p = static_cast<uint8_t *>(f->ring->reserve(f->target, 8 + 4 * (words + 1), &run_recorded_entry));
+            Impl *self = this;
+            std::memcpy(p, &self, sizeof(self));
+            uint32_t *r = reinterpret_cast<uint32_t *>(p + 8);
+            r[0] = op;
+            record_direct_cmd_ = VK_NULL_HANDLE;
+            return r + 1;
+        } else if (f) {
+            c = f->ring->real(f->target);
         }
-        if (!recorder_.joinable()) {
-            recorded_ = std::make_unique<uint32_t[]>(RECORDED);
-            recorder_ = std::thread([this] { recorder_loop(); });
-        }
-        if (c != record_cmd_) {
-            std::memcpy(record_room(Recorded::CommandBuffer, 2), &c, sizeof(c));
-            record_head_ += record_words_;
-            record_cmd_ = c;
-        }
-        return record_room(op, words);
+        recorded_direct_[0] = op;
+        record_direct_cmd_ = c;
+        return &recorded_direct_[1];
     }
     void recorded() {
-        if (!record_thread_) {
-            run_recorded(record_direct_cmd_, recorded_direct_);
+        if (!record_direct_cmd_) {
+            ring_->commit();
             return;
         }
-        record_head_ += record_words_;
+        run_recorded(record_direct_cmd_, recorded_direct_);
     }
-    // the commands put in since the last time handed to the recording thread:
-    // once a draw, not once a command (the count's cache line goes back and
-    // forth between the two threads at every store)
+    // the commands put so far handed to the recording thread, by batches (Ring::publish_some)
     void record_publish() {
-        if (record_head_ == record_published_) return;
-        recorded_head_.store(record_published_ = record_head_);
-        if (recorder_asleep_.load()) recorded_head_.notify_one();
+        if (ring_) ring_->publish_some();
     }
     template <class T> void record_value(VkCommandBuffer c, Recorded::Op op, const T &value) {
         static_assert(sizeof(T) / 4 + 2 <= RECORDED_MOST);
@@ -3077,17 +3068,9 @@ private:
         std::memcpy(record(c, op, uint32_t(sizeof...(a))), words, sizeof...(a) * 4);
         recorded();
     }
-    // everything put in the ring is in the command buffer
-    void record_sync() {
-        if (!recorder_.joinable()) return;
-        record_publish();
-        const uint32_t head = record_head_;
-        while (recorded_tail_.load(std::memory_order_acquire) != head) spin_pause();
-    }
     // a command's words (after its number) into the command buffer; how many it took
     uint32_t run_recorded(VkCommandBuffer c, const uint32_t *r);
-    void recorder_loop();
-    // a command buffer being recorded, begun if none is, without waiting for the ring
+    // a command buffer being recorded, begun if none is
     void begin_recording();
 
     vk::Buffer mirror_, arena_, scratch_, load_scratch_;
@@ -3418,11 +3401,10 @@ private:
 };
 
 Impl::~Impl() {
-    if (recorder_.joinable()) {
-        record(record_cmd_, Recorded::Quit, 0);
-        recorded();
-        record_publish();
-        recorder_.join();
+    if (ring_) {
+        // (what the thread has yet to record recorded, the thread stopped)
+        ring_->stop();
+        ring_->print("record ring");
     }
     translation_workers_.reset(); // before the shaders they read
     mem_.remove_watcher(watcher_);
@@ -3732,6 +3714,15 @@ bool Impl::init(std::string &error) {
             vkAllocateCommandBuffers(dev_, &alloc, &s.pre) != VK_SUCCESS ||
             vkCreateFence(dev_, &fence, nullptr, &s.fence) != VK_SUCCESS)
             return error = "could not make the submission slots", false;
+    }
+    if (ring_on_) {
+        // the recording thread's: the slots' command buffers named by the ring's handles
+        ring_ = std::make_unique<rec::Ring>();
+        for (uint32_t i = 0; i < SLOTS; i++) {
+            Slot &s = slots_[i];
+            s.cmd = ring_->fake(2 * i, s.cmd), s.pre = ring_->fake(2 * i + 1, s.pre);
+            if (!s.cmd || !s.pre) return error = "no room for the recording ring's handles", false;
+        }
     }
     if (options_.gpu_timing) {
         // timestamps where the queue has them (none: no timing)
@@ -4386,7 +4377,6 @@ bool Impl::program(Shader &s, std::string &why) {
 
 VkCommandBuffer Impl::cmd() {
     begin_recording();
-    record_sync();
     return slots_[current_].cmd;
 }
 
@@ -4511,48 +4501,8 @@ uint32_t Impl::run_recorded(VkCommandBuffer c, const uint32_t *r) {
     case Recorded::EndConditional: vkCmdEndConditionalRenderingEXT(c); return 0;
     case Recorded::Draw: vkCmdDraw(c, a[0], 1, 0, 0); return 1;
     case Recorded::DrawIndexed: vkCmdDrawIndexed(c, a[0], 1, a[1], 0, 0); return 2;
-    case Recorded::CommandBuffer:
-    case Recorded::Wrap:
-    case Recorded::Quit: break; // (the recording thread's own)
     }
     return 0;
-}
-
-// The recording thread: the ring's commands into their command buffer as
-// they come; it spins a little while none do (a frame's draws come a few
-// microseconds apart), then sleeps until the next.
-void Impl::recorder_loop() {
-    uint32_t tail = 0;
-    VkCommandBuffer c = VK_NULL_HANDLE;
-    for (;;) {
-        uint32_t head = recorded_head_.load(std::memory_order_acquire);
-        if (head == tail) {
-            for (uint32_t spins = 0; spins < 2000 && head == tail; spins++) {
-                spin_pause();
-                head = recorded_head_.load(std::memory_order_acquire);
-            }
-            if (head == tail) {
-                recorder_asleep_.store(true);
-                recorded_head_.wait(tail);
-                recorder_asleep_.store(false);
-                continue;
-            }
-        }
-        while (tail != head) {
-            const uint32_t at = tail & (RECORDED - 1);
-            const uint32_t *r = &recorded_[at];
-            if (r[0] == Recorded::Quit) return;
-            if (r[0] == Recorded::Wrap) {
-                tail += RECORDED - at;
-            } else if (r[0] == Recorded::CommandBuffer) {
-                std::memcpy(&c, r + 1, sizeof(c));
-                tail += 3;
-            } else {
-                tail += 1 + run_recorded(c, r);
-            }
-        }
-        recorded_tail_.store(tail, std::memory_order_release);
-    }
 }
 
 void Impl::begin_recording() {
@@ -4642,7 +4592,6 @@ std::string Impl::target_name(const RenderTarget &t) const {
 void Impl::flush() {
     Slot &s = slots_[current_];
     if (!s.recording) return;
-    record_sync();
     end_pass();
     if (fsi_ && !s.occlusion_reports.empty()) {
         // the interlock path's occlusion counts, for zpd_collect
@@ -4704,16 +4653,47 @@ void Impl::flush() {
         s.pre_recording = false;
         buffers[0] = s.pre, buffers[1] = s.cmd, buffer_count = 2;
     }
-    {
+    if (ring_ && !ring_->direct()) {
+        // submitted by the recording thread once it has recorded the slot's
+        // command buffers, the fence reset here first (its last submission
+        // is done: finish_oldest saw it signaled): a wait for it before the
+        // thread submits is a wait for the GPU still (finish_oldest)
+        vkResetFences(dev_, 1, &s.fence);
+        struct Submit {
+            Impl *self;
+            uint32_t count, targets[2];
+            VkFence fence;
+            uint64_t serial;
+            void operator()(VkCommandBuffer) const {
+                VkCommandBuffer real[2] = {self->ring_->real(targets[0]), self->ring_->real(targets[1])};
+                VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                submit.commandBufferCount = count;
+                submit.pCommandBuffers = real;
+                if (VkResult r = self->d_.submit(1, &submit, fence); r != VK_SUCCESS)
+                    self->ring_submit_error_.store(int32_t(r), std::memory_order_relaxed);
+                self->ring_submitted_.store(serial, std::memory_order_release);
+            }
+        };
+        const uint32_t pre = rec::fake_of(s.pre)->target, main = rec::fake_of(s.cmd)->target;
+        Submit submit{this, buffer_count, {buffer_count == 2 ? pre : main, main}, s.fence, s.serial};
+        ring_->put(rec::Ring::NONE, submit);
+        ring_->publish();
+    } else {
         Timer timer(report_.submit_seconds);
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = buffer_count;
         submit.pCommandBuffers = buffers;
+        if (ring_) {
+            // (a port's frame: the ring's handles stand for the real ones, the ring recorded)
+            for (uint32_t i = 0; i < buffer_count; i++) buffers[i] = ring_->real(rec::fake_of(buffers[i])->target);
+            ring_submitted_.store(s.serial, std::memory_order_release);
+        }
         vkResetFences(dev_, 1, &s.fence);
         if (VkResult r = d_.submit(1, &submit, s.fence); r != VK_SUCCESS)
             fatal_ = "a submission failed (" + std::to_string(r) + ")" + lost_device_report(r);
     }
     report_.submissions++;
+    flushed_serial_ = s.serial;
     current_ = (current_ + 1) % SLOTS;
     // the next slot's last submission done before it records again
     Slot &next = slots_[current_];
@@ -4725,6 +4705,17 @@ bool Impl::finish_oldest(bool wait) {
     for (Slot &s : slots_)
         if (s.serial && !s.recording && (!oldest || s.serial < oldest->serial)) oldest = &s;
     if (!oldest) return false;
+    if (ring_) {
+        // the recording thread's submission of it made first (a wait counted by the ring)
+        if (ring_submitted_.load(std::memory_order_acquire) < oldest->serial) {
+            if (!wait) return false;
+            ring_->wait_for(ring_submitted_, oldest->serial, rec::Ring::Fence);
+        }
+        if (const int32_t r = ring_submit_error_.load(std::memory_order_relaxed); r != VK_SUCCESS) {
+            fatal_ = "a submission failed (" + std::to_string(r) + ")" + lost_device_report(VkResult(r));
+            return false;
+        }
+    }
     VkResult status = vkGetFenceStatus(dev_, oldest->fence);
     if (status == VK_NOT_READY) {
         if (!wait) return false;
@@ -5121,6 +5112,7 @@ void Impl::gpu_written(const std::vector<Range> &ranges) {
 bool Impl::unwritten(Texture &t) {
     uint32_t count = mem_.write_count();
     if (count == t.checked) return true;
+    XF_DRAW_TALLY(UnwrittenScans);
     for (const Range &r : t.ranges) {
         if (r.second <= r.first) continue;
         if (!pages_unwritten(first_page(r), last_page(r), t.checked)) return false;
@@ -6644,8 +6636,14 @@ void Impl::destroy_texture(Texture *t) {
 }
 
 // A place in a table the GPU no longer reads: pointed at the stand-in (no
-// descriptor ever names a destroyed view) and free to take again.
-void Impl::release_index(uint32_t kind, uint32_t index) {
+// descriptor ever names a destroyed view) and free to take again. What the
+// draws kept of the slots that read through it goes (SlotMemo): all of it,
+// unless the caller says the view's texture was loaded again since (its
+// loads moved: what was kept of its own slots alone is gone, and only those
+// name its views). A texture made again at another size once a frame
+// otherwise sent every slot of every draw the long way once a frame
+// (XF_SLOT_MEMO_KEEP=0: all of it, always).
+void Impl::release_index(uint32_t kind, uint32_t index, bool owner_reloaded) {
     VkDescriptorImageInfo image{VK_NULL_HANDLE, dummy_views_[kind], VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = bindless_;
@@ -6656,7 +6654,11 @@ void Impl::release_index(uint32_t kind, uint32_t index) {
     write.pImageInfo = &image;
     vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
     free_indices_[kind].push_back(index);
-    texture_epoch_++; // (what read through it: SlotMemo)
+    static const bool keep = [] {
+        const char *v = std::getenv("XF_SLOT_MEMO_KEEP");
+        return !(v && v[0] == '0');
+    }();
+    if (!owner_reloaded || !keep) texture_epoch_++; // (what read through it: SlotMemo)
 }
 
 // A place in a table with room: one given back, else a new one.
@@ -6851,7 +6853,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             slots_[current_].after.push_back([this, old, old_signed_image, old_views, old_kind, old_target,
                                               old_target_view]() mutable {
                 for (const TextureView &v : old_views) {
-                    release_index(old_kind, v.index);
+                    release_index(old_kind, v.index, true); // (t->loads moved above)
                     vkDestroyImageView(dev_, v.view, nullptr);
                 }
                 release_target(old_target, old_target_view);
@@ -9337,6 +9339,12 @@ bool Impl::draw_front(const gpu::Draw &d, DrawFront &f) {
 
 void Impl::draw(const gpu::Draw &d) {
     report_.draws++;
+    // (XF_DRAW_SECTIONS=1: the draw's time by section, draw_sections.h; the last closed on the way out)
+    struct SectionsEnd {
+        ~SectionsEnd() { XF_DRAW_SECTION(Record); }
+    };
+    std::optional<SectionsEnd> sections_end;
+    if (DrawSections::on()) DrawSections::get().begin(), DrawSections::get().draw(), sections_end.emplace();
     // (XF_DRAW_LIMIT=N: the draws after the Nth left out; XF_DRAW_SKIP=A-B: the draws from the Ath to
     // the Bth left out: for finding the one a wrong picture comes from)
     if (draw_limit_ && report_.draws > draw_limit_) return;
@@ -9439,6 +9447,7 @@ void Impl::draw(const gpu::Draw &d) {
             front_key_ = key;
         }
     }
+    XF_DRAW_SECTION(Front);
     bool tessellated = f.tessellated;
     uint32_t tess_mode = f.tess_mode;
     shader::VertexOptions host_vertex = f.host_vertex;
@@ -9730,6 +9739,7 @@ void Impl::draw(const gpu::Draw &d) {
         if (control_points.empty()) return;
     }
 
+    XF_DRAW_SECTION(Indices);
     // constants
     for (int stage = 0; stage < 2; stage++) {
         harness::Constants &c = last_constants_[stage];
@@ -9787,6 +9797,7 @@ void Impl::draw(const gpu::Draw &d) {
         constants_serial_[stage] = serial, constants_fetch_blocks_[stage] = current;
     }
 
+    XF_DRAW_SECTION(Constants);
     // the targets take over the EDRAM tiles down to the lowest row the draw
     // can reach (draw_max_y), within the scissor
     {
@@ -9915,6 +9926,7 @@ void Impl::draw(const gpu::Draw &d) {
         sys.point[3] = 1.0f / float(std::max(uint32_t(viewport.viewport.height), 1u));
     }
 
+    XF_DRAW_SECTION(Targets);
     // textures: per slot the shaders read, an image's index in the table of
     // its dimension and a sampler's
     // (a mask of the 32 texture fetch constants, in order)
@@ -9922,6 +9934,7 @@ void Impl::draw(const gpu::Draw &d) {
     for (uint64_t left = texture_slots; left; left &= left - 1) {
         const uint32_t slot = uint32_t(std::countr_zero(left));
         const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS + slot * 6];
+        uint64_t miss_t0 = 0;
         if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture) {
             approximate("a texture slot without a texture constant");
             continue;
@@ -9939,13 +9952,15 @@ void Impl::draw(const gpu::Draw &d) {
         // and its sampler looked up (three maps, 7% of the command thread).
         const uint32_t forced_filter = texture_filter_.load(std::memory_order_relaxed);
         const uint32_t forced_aniso = anisotropy_.load(std::memory_order_relaxed);
-        SlotMemo *memo = slot_memos_on_ && !trace_ ? &fetch_memos_[fetch_memo_index(fetch, overrides)] : nullptr;
+        SlotMemo *memo = slot_memos_on_ && !trace_ ? fetch_memo(fetch, overrides) : nullptr;
         if (memo) {
             if (done_serial_ != limits_applied_at_) apply_texture_limits(); // (as texture() begins)
             SlotMemo &m = *memo;
             if (m.epoch == texture_epoch_ && std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0 &&
                 m.overrides == overrides && m.forced_filter == forced_filter && m.forced_aniso == forced_aniso &&
                 m.loads == m.texture->loads && !m.texture->stale && unwritten(*m.texture)) {
+                XF_DRAW_TALLY(SlotHits);
+                m.used = report_.draws;
                 use(*m.texture, submission_serial() + 1);
                 m.sampler->used_serial = submission_serial();
                 sys.slots[slot] = m.slot_word, sys.signs[slot] = m.signs;
@@ -9954,6 +9969,18 @@ void Impl::draw(const gpu::Draw &d) {
                 if (m.uses & 2)
                     use("4-6 bit unsigned components of point-filtered textures (rebuilt as the console expands them)");
                 continue;
+            }
+            XF_DRAW_TALLY(SlotMisses);
+            if (DrawSections::on()) {
+                // (why: a new constant or one replaced, another in its entry, its texture loaded again
+                // or stale, its memory written)
+                miss_t0 = FastClock::now();
+                const bool same = std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0 && m.overrides == overrides;
+                DrawSections::get().tally(m.epoch != texture_epoch_       ? DrawSections::MissEpoch
+                                          : !same                         ? DrawSections::MissFetch
+                                          : m.loads != m.texture->loads   ? DrawSections::MissLoads
+                                          : m.texture->stale              ? DrawSections::MissStale
+                                                                          : DrawSections::MissWritten);
             }
             m.epoch = 0; // (kept again below, when the slot comes out whole)
         }
@@ -10005,6 +10032,7 @@ void Impl::draw(const gpu::Draw &d) {
                     approximate("signed texture components read as unsigned: " + reason);
             }
         }
+        if (miss_t0) DrawSections::get().tally(DrawSections::MissTicks, FastClock::now() - miss_t0);
         // kept for the next draw, when nothing about it was counted as approximate (those counts
         // are per draw) and its sampler is one of the table's
         if (memo && approximations == approximations_ && sampler_entry && !t->stale) {
@@ -10015,7 +10043,7 @@ void Impl::draw(const gpu::Draw &d) {
             m.texture = t, m.loads = t->loads, m.sampler = sampler_entry;
             m.slot_word = sys.slots[slot], m.signs = sys.signs[slot];
             m.integer_scale = sys.integer_scale[slot], m.signed_word = sys.signed_slots[slot];
-            m.uses = uses;
+            m.uses = uses, m.used = report_.draws;
         }
     }
 
@@ -10025,6 +10053,7 @@ void Impl::draw(const gpu::Draw &d) {
     // vertices are its index shifted left by 2 plus the corner; a
     // rectangle's are numbered from 4 times its number, each with the
     // rectangle's three guest indices as its attribute (guest_indices).
+    XF_DRAW_SECTION(Textures);
     std::vector<uint32_t> &guest_indices = draw_lists_.guest_indices;
     guest_indices.clear();
     if (expanded) {
@@ -10456,6 +10485,7 @@ void Impl::draw(const gpu::Draw &d) {
         sys.generic[1] = ps ? ps->program : 0;
     }
 
+    XF_DRAW_SECTION(Pipeline);
     // the vertex data: the ranges of the vertex fetch constants the shaders
     // use (address and size, as Xenia's IssueDraw requests them), merged,
     // read from the mirror in device memory as Xenia's shaders read its
@@ -10534,6 +10564,7 @@ void Impl::draw(const gpu::Draw &d) {
     }
     if (!fatal_.empty()) return;
 
+    XF_DRAW_SECTION(Vertex);
     // everything else the draw takes from the arena, in one submission: the
     // indices (none for a tessellated draw), the vertex attributes (its
     // control points, or an expanded rectangle's guest indices)
@@ -10572,6 +10603,7 @@ void Impl::draw(const gpu::Draw &d) {
     // submission may still be on the GPU: garbage constants (a lost device
     // with the constants in their own buffer, which fills a slot mid-frame).
     begin_recording();
+    XF_DRAW_SECTION(Fit);
 
     // the interlock path's constants, with the occlusion counter the draw
     // counts in (the slot's, so once the flush above is past)
@@ -10601,6 +10633,7 @@ void Impl::draw(const gpu::Draw &d) {
         // (uploaded again when a draw found them changed, in each new submission, and where the
         // blocks there are not all this draw's)
         if (last_constants_at_[stage] == NONE || (blocks & ~last_constants_blocks_[stage])) {
+            XF_DRAW_TALLY(ConstantUploadCount);
             last_constants_at_[stage] = draw_data_take(sizeof(harness::Constants), ubo_align_);
             uint8_t *to = draw_data(last_constants_at_[stage]);
             const uint8_t *from = reinterpret_cast<const uint8_t *>(&last_constants_[stage]);
@@ -10634,12 +10667,14 @@ void Impl::draw(const gpu::Draw &d) {
             last_constants_blocks_[stage] = blocks;
         }
     }
+    XF_DRAW_SECTION(ConstantUploads);
     // (all of the tables for the generic shaders, and with XF_CONSTANT_BLOCKS=0)
     const uint32_t system_slots = !constant_blocks_ || generic
                                       ? 32u
                                       : uint32_t(std::min(64 - std::countl_zero(texture_slots | 1), 32));
     if (last_system_at_ == NONE || system_slots > last_system_slots_ ||
         std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
+        XF_DRAW_TALLY(SystemUploadCount);
         last_system_at_ = draw_data_take(sizeof(System), ubo_align_);
         last_system_ = sys;
         last_system_slots_ = system_slots;
@@ -10678,6 +10713,7 @@ void Impl::draw(const gpu::Draw &d) {
                 return;
             }
     }
+    XF_DRAW_SECTION(SystemUploads);
     dynamic_offsets[0] = uint32_t(last_constants_at_[0]);
     dynamic_offsets[1] = uint32_t(last_system_at_);
     dynamic_offsets[2] = uint32_t(last_constants_at_[1]);
@@ -10712,6 +10748,7 @@ void Impl::draw(const gpu::Draw &d) {
                                       attribute_buffer, attribute_at))
         return;
 
+    XF_DRAW_SECTION(Uploads);
     // record, in the render pass of these targets (none for exports alone);
     // a draw that exports begins its own, after a barrier, as what came
     // before in the pass may read the mirror where it writes
@@ -10724,6 +10761,7 @@ void Impl::draw(const gpu::Draw &d) {
         pass.width = pass.height = std::min(scale_.up(8192), max_image_),
         pass.samples = uint32_t(multisample.rasterizationSamples);
     VkCommandBuffer c = begin_pass(pass, colors, depth);
+    XF_DRAW_SECTION(Pass);
     if (pipe != bound_pipeline_) {
         // (after another pipeline of the renderer's own, a transfer's or a
         // port's, whose state is not the draws': every state set again)
@@ -10944,6 +10982,7 @@ void Impl::draw(const gpu::Draw &d) {
                          Recorded::Bias{host_float, n.depth_bias[0], n.depth_bias[1]});
         }
     }
+    XF_DRAW_SECTION(State);
     if (state_changed) draw_state_ = n;
     draw_state_valid_ = true;
     if (options_.gpu_timing_draws) {
@@ -11454,7 +11493,7 @@ void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
     begin_recording();
     slots_[current_].after.push_back([this, old, old_views, old_kind, old_target, old_target_view]() mutable {
         for (const TextureView &v : old_views) {
-            release_index(old_kind, v.index);
+            release_index(old_kind, v.index, true); // (t.loads moved below)
             vkDestroyImageView(dev_, v.view, nullptr);
         }
         release_target(old_target, old_target_view);
@@ -11802,7 +11841,15 @@ public:
     VkCommandBuffer commands() override {
         // the port's bindings are its own: the draws bind theirs again
         r_.bound_pipeline_ = VK_NULL_HANDLE;
-        return r_.outside();
+        VkCommandBuffer c = r_.outside();
+        // With the recording thread, the port records into the real command buffer itself: the
+        // ring recorded first, and the renderer's own commands recorded at once until the frame
+        // ends (Ring::direct; native_frame), so the two keep their order.
+        if (r_.ring_) {
+            if (!r_.ring_->direct()) r_.ring_->set_direct(true);
+            c = r_.ring_->real(rec::fake_of(c)->target);
+        }
+        return c;
     }
     bool texture(const uint32_t fetch[6], native::TextureImage &out, std::string &why) override {
         const texture::Info info = texture::parse_fetch_constant(fetch);
@@ -11919,6 +11966,8 @@ bool Impl::native_frame(uint64_t number, bool &held) {
             drew = native_settings_.renderer(ctx);
             // whatever the port bound is not the draws'
             bound_pipeline_ = VK_NULL_HANDLE;
+            // (the recording thread's ring again, where the port recorded itself: NativeFrame::commands)
+            if (ring_ && ring_->direct()) ring_->set_direct(false);
         } else {
             approximate("the port's output image could not be made");
         }
@@ -11970,6 +12019,7 @@ void Impl::swap() {
     end_query();
     zpd_current_ = 0;
     uint64_t number = report_.swaps++;
+    if (number == 0 && DrawSections::on()) DrawSections::get().reset(); // (the first play left out)
     // the scaled resolves no texture took within two swaps go
     std::vector<Range> unused;
     for (const auto &[base, kept] : scaled_resolves_)
@@ -12063,7 +12113,11 @@ void Impl::swap() {
         front.pwl = processor_.gamma_ramp_pwl();
     }
     flush();
-    if (front.image && fatal_.empty()) options_.on_swap(front);
+    if (front.image && fatal_.empty()) {
+        // (what the hook submits after the frame's submission: that made by the recording thread first)
+        if (ring_) ring_->wait_for(ring_submitted_, flushed_serial_, rec::Ring::Present);
+        options_.on_swap(front);
+    }
     poll();
     next_readback_frame();
     // the pipeline cache written once new pipelines have settled
