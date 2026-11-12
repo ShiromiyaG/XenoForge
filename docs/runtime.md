@@ -1781,6 +1781,44 @@ run 30 times beside other load (16 beside 12 busy processes, 8 beside two
 writers flushing to the hard disk the disc image is on, 6 under a game
 library's build): the first swap came at 2 to 11 s every time.
 
+### The profile (2026-11-11)
+
+`boot --profile N [--profile-from S] [--profile-thread <name | 0xstart>]`
+(`tools/sampler.cpp`, Windows) samples the process's threads and prints the
+shares by category, the N most sampled functions with their hottest
+offsets, and for one thread its callers and inclusive shares.
+
+- **What a sample is.** A thread that ran since the last sample is
+  suspended and counted once where it is, unless that is one of the
+  system's waits: a thread working in bursts between waits is found
+  waiting at nearly every sample, and (when samples weighed the cycles run
+  since the one before, as they did) its bursts' cycles read as the wait's
+  own cost, half of one game's CPU time. A thread on a processor at the
+  sample's instant is found as often as it runs, however short its bursts,
+  so the shares are of the samples of threads found running; the heading
+  gives the cycles spent in all and how many samples found a thread
+  waiting.
+- **The walk is guarded.** One thread's stacks are walked by the unwind
+  data, which reads through a frame register that holds anything after a
+  frame taken wrongly, and the fault ended the run as a crash: a handler
+  put before the process's own takes the walking thread back to where the
+  walk began.
+- **`XF_PROFILE_CHAINS=<name>[,<name>...]`** (with one thread): for each
+  function whose name holds one of them, the chains of six callers above
+  it by their samples. A flat profile's small system costs (a page's
+  protection, an allocation, a clock read) are found by who asks for them.
+  `XF_PROFILE_LINES=N` gives each function's N hottest source lines.
+
+Four games in their campaigns, all threads: game C 74.9 ms of CPU a swap
+(its own job scheduler's scan is the hottest generated function), game E
+39 to 53 ms (a critical section entered, tried or left 120,000 times a
+second; one thread spends a seventh of its time in the floating point
+slow path's `fesetround`, `feclearexcept` and `fetestexcept`: the C
+library's, where the control register alone would do; to change with the
+generated code's headers next), game H 34 ms (two threads of vector code;
+its render thread's wait for the vertical blank spins with the command
+processor idle: `XF_SPIN_IDLE=1`, kernel.cpp).
+
 ### Crash and stop reports
 
 `include/xenoforge/crash.h`, `src/kernel/crash.cpp`; test

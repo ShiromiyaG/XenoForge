@@ -656,7 +656,7 @@ bool CommandProcessor::event_write_ext() {
         if (handle) extent_pending_.push_back({handle, address});
         // (the latest report at the address, or none: kept, not erased, a
         // frame's reports being at the addresses of the frame before's)
-        extent_latest_[address] = handle;
+        extent_latest_.at(address) = handle;
     }
     // (a report the sink measures is written again with its bounds before the
     // CPU may read it: nothing polling the write-backs is woken for this
@@ -698,9 +698,9 @@ void CommandProcessor::poll_extents(bool wait) {
         const uint32_t address = extent_pending_[at].second;
         extent_pending_[at].first = 0;
         while (extent_first_ < extent_pending_.size() && !extent_pending_[extent_first_].first) extent_first_++;
-        auto latest = extent_latest_.find(address);
-        if (latest == extent_latest_.end() || latest->second != e.handle) continue;
-        latest->second = 0;
+        uint64_t *latest = extent_latest_.find(address);
+        if (!latest || *latest != e.handle) continue;
+        *latest = 0;
         // (the whole screen is there already, written with the report: the sink told of it now)
         const uint32_t physical_address = address & PHYSICAL_MASK;
         // (a record is 16 bytes, 12 of them written: the 4 between two neighbours go with them)

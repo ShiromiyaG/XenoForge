@@ -1484,7 +1484,7 @@ public:
         return {report_.wait_seconds, report_.textures, report_.submissions, report_.pipelines};
     }
     void extent_init() override {
-        Call call(*this, nullptr);
+        Call call(*this, nullptr, true);
         // Between two reports, the draws recorded so far handed to the GPU
         // once there are enough of them: the processor waits for the GPU
         // where the guest may read the extents (extent_wait), and a pass of
@@ -1497,7 +1497,7 @@ public:
         extent_open_ = true, extent_whole_ = false, extent_index_ = UINT32_MAX, extent_margin_ = 0;
     }
     uint64_t extent_report() override {
-        Call call(*this, nullptr);
+        Call call(*this, nullptr, true);
         return extent_reported();
     }
     void extent_wait() override {
@@ -3115,6 +3115,10 @@ private:
     void acquire(RenderTarget *t, uint32_t rows, const DepthOverwrite *overwritten = nullptr);
     void acquire(RenderTarget *t, std::span<const TileRect> rects, const DepthOverwrite *overwritten = nullptr);
     std::vector<uint32_t> acquire_tiles_; // (acquire's own, kept for its room)
+    std::vector<uint32_t> acquire_needed_, acquire_unheld_;
+    // (request's own, kept for their room)
+    std::vector<std::pair<uint32_t, uint32_t>> request_runs_;
+    std::vector<VkBufferCopy> request_copies_, request_ahead_;
     bool transfer_cleared_only_ = false;  // the last edram_transfer drew nothing: clears alone (the verbose line)
     bool resolve_stored_ = false;         // the resolve being made reads tiles their holders stored into EDRAM
     bool edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles);
@@ -4940,7 +4944,8 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) 
     }
     // runs of pages to give, [first, end); a page taken is marked current
     // (UINT32_MAX) until the count is known, so ranges sharing it give it once
-    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    std::vector<std::pair<uint32_t, uint32_t>> &runs = request_runs_; // (kept for its room)
+    runs.clear();
     for (const Range &r : ranges) {
         if (r.second <= r.first) continue;
         for (uint32_t p = first_page(r); p <= last_page(r); p++) {
@@ -4970,7 +4975,8 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) 
         return 0;
     }
     // runs of pages the submission has not used go ahead of it (pre_cmd)
-    std::vector<VkBufferCopy> copies, ahead;
+    std::vector<VkBufferCopy> &copies = request_copies_, &ahead = request_ahead_;
+    copies.clear(), ahead.clear();
     const uint64_t serial = submission_serial();
     VkDeviceSize offset = 0;
     for (auto [first, end] : runs) {
@@ -5621,7 +5627,9 @@ void Impl::acquire(RenderTarget *t, std::span<const TileRect> rects, const Depth
         std::sort(wanted.begin(), wanted.end());
         wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
     }
-    std::vector<uint32_t> needed, unheld;
+    // (kept for their room: thousands of calls a frame)
+    std::vector<uint32_t> &needed = acquire_needed_, &unheld = acquire_unheld_;
+    needed.clear(), unheld.clear();
     std::map<RenderTarget *, std::vector<uint32_t>> held;
     uint32_t taken_unread = 0;
     for (uint32_t k : wanted) {

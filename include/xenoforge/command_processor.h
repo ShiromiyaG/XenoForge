@@ -519,7 +519,44 @@ private:
     Sink::Work slow_work_{};
     std::vector<std::pair<uint64_t, uint32_t>> extent_pending_; // handle (0: answered) and address, in order
     size_t extent_first_ = 0;                                   // the first of them still waiting
-    std::unordered_map<uint32_t, uint64_t> extent_latest_;      // address to handle (0: none)
+    // The latest report at each address, by address: its handle (0: none).
+    // Thousands of reports a frame at the addresses of the frame before's,
+    // none ever taken out: an open table (a multiplicative hash, the next
+    // slot on a clash, doubled at half full), a tenth of a hash map's cost.
+    class ExtentLatest {
+    public:
+        uint64_t &at(uint32_t address) { // made, with no handle, where there is none
+            if (used_ * 2 >= slots_.size()) grow();
+            return slot(address).second;
+        }
+        uint64_t *find(uint32_t address) {
+            if (slots_.empty()) return nullptr;
+            std::pair<uint32_t, uint64_t> &s = probe(address);
+            return s.first == address ? &s.second : nullptr;
+        }
+
+    private:
+        static constexpr uint32_t EMPTY = UINT32_MAX; // (an address is a multiple of 4)
+        std::pair<uint32_t, uint64_t> &probe(uint32_t address) {
+            size_t i = size_t((address >> 2) * 0x9E3779B1u) & (slots_.size() - 1);
+            while (slots_[i].first != address && slots_[i].first != EMPTY) i = (i + 1) & (slots_.size() - 1);
+            return slots_[i];
+        }
+        std::pair<uint32_t, uint64_t> &slot(uint32_t address) {
+            std::pair<uint32_t, uint64_t> &s = probe(address);
+            if (s.first == EMPTY) s = {address, 0}, used_++;
+            return s;
+        }
+        void grow() {
+            std::vector<std::pair<uint32_t, uint64_t>> old = std::move(slots_);
+            slots_.assign(old.empty() ? 1024 : old.size() * 2, {EMPTY, 0});
+            used_ = 0;
+            for (const auto &[address, handle] : old)
+                if (address != EMPTY) slot(address).second = handle;
+        }
+        std::vector<std::pair<uint32_t, uint64_t>> slots_;
+        size_t used_ = 0;
+    } extent_latest_;
     std::vector<Extent> extent_resolved_;
     void write_extent(uint32_t address, const uint16_t (&extents)[6], bool told = true);
     void poll_extents(bool wait);

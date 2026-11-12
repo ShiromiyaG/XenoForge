@@ -496,6 +496,40 @@ void stop_and_report(size_t top) {
     std::printf("profile: callers (the function sampled and what called it)\n");
     for (size_t k = 0; k < by_caller.size() && k < 2 * top; k++)
         std::printf("  %5.2f%%  %s\n", 100.0 * double(by_caller[k].first) / double(total), by_caller[k].second.c_str());
+    // XF_PROFILE_CHAINS=<name>[,<name>...]: for each function whose name holds one of them, the
+    // chains of callers above it (six frames from the first such frame of a stack), by their samples
+    if (const char *wanted = std::getenv("XF_PROFILE_CHAINS"); wanted && *wanted) {
+        std::vector<std::string> patterns;
+        for (std::string rest = wanted; !rest.empty();) {
+            const size_t comma = rest.find(',');
+            patterns.push_back(rest.substr(0, comma));
+            rest = comma == std::string::npos ? "" : rest.substr(comma + 1);
+        }
+        for (const std::string &pattern : patterns) {
+            std::map<std::string, uint64_t> chains;
+            uint64_t all = 0;
+            for (auto &[frames, w] : stacks) {
+                for (size_t k = 0; k < frames.size(); k++) {
+                    if (name_of(k ? frames[k] : frames[k] + 1).find(pattern) == std::string::npos) continue;
+                    std::string chain;
+                    for (size_t j = k; j < frames.size() && j < k + 6; j++) {
+                        std::string frame = name_of(j ? frames[j] : frames[j] + 1);
+                        if (frame.size() > 60) frame.resize(60);
+                        chain += (j > k ? " <- " : "") + frame;
+                    }
+                    chains[chain] += w, all += w;
+                    break;
+                }
+            }
+            std::vector<std::pair<uint64_t, std::string>> sorted;
+            for (auto &[c, w] : chains) sorted.push_back({w, c});
+            std::sort(sorted.rbegin(), sorted.rend());
+            std::printf("profile: chains of %s (%.2f%% of the samples)\n", pattern.c_str(),
+                        100.0 * double(all) / double(total));
+            for (size_t k = 0; k < sorted.size() && k < 8; k++)
+                std::printf("  %5.2f%%  %s\n", 100.0 * double(sorted[k].first) / double(total), sorted[k].second.c_str());
+        }
+    }
     std::vector<std::pair<uint64_t, std::string>> by_inclusive;
     for (auto &[n, w] : inclusive) by_inclusive.push_back({w, n});
     std::sort(by_inclusive.rbegin(), by_inclusive.rend());
