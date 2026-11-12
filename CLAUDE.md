@@ -60,7 +60,9 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
 - **Jogos com código gerado**: `-DXF_GAMES="<nome>;<nome>"` (nomes das pastas em `gen-modules`) gera `boot_<jogo>` e `player_<jogo>` (janela SDL3,
   controle, som), com o código de `../external/gen-modules` (padrão do `XF_GEN_DIR`; `xfrecomp emit` grava lá).
 - **Biblioteca do jogo (D1/D2)**: `build/xfbuild <iso> [cache]` recompila o disco numa DLL em cache
-  (`<cache>/<digest>-<versão da interface>.dll`; padrão `%LOCALAPPDATA%\xenoforge\cache`; clang e lld, 4 jobs); o
+  (`<cache>/<digest>-<versão da interface>-<nível da CPU>.dll`, nível `v3` ou `v2` escolhido pela CPU de quem
+  compila, forçado com `XF_GAME_CPU_LEVEL`/`xfbuild --cpu-level`; padrão `%LOCALAPPDATA%\xenoforge\cache`; clang e
+  lld, 4 jobs); o
   `boot` e o `player` genéricos a carregam (`--cache <pasta>`, `--game-library <dll>`), os `boot_<jogo>` seguem
   estáticos. Interface: `game_library.h` e `ppc_runtime.h` (código gerado freestanding, sem CRT; docs/runtime.md,
   "The game library"). Mudar os headers do código gerado ou o recompilador muda a versão e invalida o cache.
