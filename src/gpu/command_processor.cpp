@@ -22,8 +22,14 @@
 //   follow command_processor.cc's "fast" mode (QueueZPDReport,
 //   PumpPendingRetire; 2026), with the ZPass counts of host occlusion
 //   queries and without its VIZ queries, hybrid totals or the deadline for
-//   reports that never resolve (the sink answers each). VIZ_QUERY only marks
-//   VGT_EVENT_INITIATOR (Xenia's default, occlusion_query_viz off).
+//   reports that never resolve (the sink answers each). VIZ_QUERY marks
+//   VGT_EVENT_INITIATOR and tells the sink, which measures the query's
+//   survey draws and predicates its draws itself (Xenia's
+//   occlusion_query_viz, there off by default; the renderer's "VIZ
+//   queries").
+// - EVENT_WRITE_EXT's screen extents are, with ScreenExtents::Measured and a
+//   sink that measures, the bounds of what the report's draws rasterized
+//   (beyond Xenia, which writes the whole screen; event_write_ext).
 // - A type-3 packet ends where its header's count says, even when a handler
 //   read less (IM_LOAD_IMMEDIATE's padding) or more; Xenia asserts the two
 //   agree. Type 1 and XE_SWAP do not read past their buffer.
@@ -37,6 +43,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 
 namespace xf::gpu {
@@ -113,11 +121,13 @@ uint32_t CommandProcessor::load_swapped(uint32_t address, Endian e) const {
 void CommandProcessor::store_swapped(uint32_t address, uint32_t value, Endian e) {
     put_le32(physical(address), gpu_swap(value, e));
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, 4);
+    host_.wrote_back();
 }
 
 void CommandProcessor::store_be32(uint32_t address, uint32_t value) {
     put_be32(physical(address), value);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, 4);
+    host_.wrote_back();
 }
 
 // ---- the ring buffer ----
@@ -214,7 +224,7 @@ void CommandProcessor::execute_straight(uint32_t start, uint32_t count) {
 
 void CommandProcessor::restore_registers(uint32_t first, std::span<const uint32_t> values) {
     for (size_t i = 0; i < values.size() && first + i < RegisterFile::COUNT; i++)
-        regs_.set(uint32_t(first + i), values[i]);
+        regs_.write(uint32_t(first + i), values[i]);
 }
 
 void CommandProcessor::restore_gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t> pwl) {
@@ -226,8 +236,7 @@ void CommandProcessor::restore_gamma_ramp(std::span<const uint32_t> table, std::
 
 // ---- packets ----
 
-void CommandProcessor::report_packet(uint32_t address, uint32_t packet, uint32_t count) {
-    if (!sink_) return;
+void CommandProcessor::report_packet_words(uint32_t address, uint32_t packet, uint32_t count) {
     words_.resize(1 + count);
     words_[0] = packet;
     for (uint32_t i = 0; i < count; i++) words_[1 + i] = reader_.peek(i);
@@ -260,7 +269,13 @@ bool CommandProcessor::type0(uint32_t address, uint32_t packet) {
     report_packet(address, packet, count);
     uint32_t base = packet & 0x7FFF;
     bool one_register = (packet >> 15) & 1;
-    for (uint32_t i = 0; i < count; i++) write_register(one_register ? base : base + i, reader_.next());
+    if (!one_register && reader_.read + count * 4 <= reader_.capacity) {
+        // the words lie in a row in the buffer: written as a run
+        write_register_run(base, reader_.base + reader_.read, count);
+        reader_.skip(count * 4);
+    } else {
+        for (uint32_t i = 0; i < count; i++) write_register(one_register ? base : base + i, reader_.next());
+    }
     end_packet();
     return true;
 }
@@ -289,10 +304,12 @@ bool CommandProcessor::type3(uint32_t address, uint32_t packet) {
     // predicated (bit 0): only for the selected bins of predicated tiling; a
     // predicated swap never runs
     if ((packet & 1) && (!(bin_select_ & bin_mask_) || opcode == pm4::XE_SWAP)) {
+        if (opcode == pm4::DRAW_INDX || opcode == pm4::DRAW_INDX_2) extents_skipped_++;
         reader_.skip(count * 4);
         end_packet();
         return true;
     }
+    if (opcode == pm4::DRAW_INDX || opcode == pm4::DRAW_INDX_2) extents_draws_++;
     bool ok = type3_opcode(opcode, count);
     reader_.read = uint32_t((uint64_t(data) + count * 4) % reader_.capacity);
     end_packet();
@@ -309,6 +326,8 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::NOP: reader_.skip(count * 4); return true;
     case pm4::INTERRUPT: {
         uint32_t cpu_mask = reader_.next();
+        // the CPU may read the screen extents in its interrupt
+        poll_extents(true);
         for (uint32_t n = 0; n < 6; n++)
             if (cpu_mask & (1u << n)) {
                 bump(counts_.interrupts);
@@ -347,7 +366,11 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::COND_WRITE: return cond_write();
     case pm4::EVENT_WRITE: {
         // an event flag; a write to an address (count > 1) is not known
-        regs_.set(reg::VGT_EVENT_INITIATOR, reader_.next() & 0x3F);
+        uint32_t initiator = reader_.next() & 0x3F;
+        regs_.write(reg::VGT_EVENT_INITIATOR, initiator);
+        if (initiator == EVENT_SCREEN_EXT_INIT && extents_ == ScreenExtents::Measured && sink_ &&
+            sink_->measures_extents())
+            sink_->extent_init();
         if (count > 1) reader_.skip((count - 1) * 4);
         return true;
     }
@@ -389,7 +412,8 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::INVALIDATE_STATE: reader_.next(); return true; // a mask of state pointers to drop
     case pm4::VIZ_QUERY: {
         uint32_t dword0 = reader_.next();
-        regs_.set(reg::VGT_EVENT_INITIATOR, dword0 & 0x100 ? EVENT_VIZQUERY_END : EVENT_VIZQUERY_START);
+        regs_.write(reg::VGT_EVENT_INITIATOR, dword0 & 0x100 ? EVENT_VIZQUERY_END : EVENT_VIZQUERY_START);
+        if (sink_) sink_->viz_query(dword0 & 0x3F, dword0 & 0x100);
         return true;
     }
     case pm4::SET_BIN_MASK_LO: bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | reader_.next(); return true;
@@ -428,18 +452,45 @@ void CommandProcessor::write_register(uint32_t index, uint32_t value) {
         std::fprintf(stderr, "gpu: a register write past the register file (0x%X)\n", index);
         return;
     }
-    regs_.set(index, value);
+    regs_.write(index, value);
     if (index - reg::SCRATCH_REG0 < 8 || index == reg::COHER_STATUS_HOST ||
         index - reg::DC_LUT_RW_INDEX <= reg::DC_LUT_30_COLOR - reg::DC_LUT_RW_INDEX)
         special_register_write(index, value);
 }
 
+// A run of registers: one loop over the words where no register in it has a
+// side effect and all are in the file (a type-0 packet's state, SET_CONSTANT's
+// and LOAD_ALU_CONSTANT's constants: a seventh of the command thread went to
+// writing them one by one through write_register, each with its checks);
+// XF_GPU_REGISTER_RUNS=0 writes them one by one again.
+void CommandProcessor::write_register_run(uint32_t base, const uint8_t *words, uint32_t count) {
+    static const bool runs = [] {
+        const char *v = std::getenv("XF_GPU_REGISTER_RUNS");
+        return !(v && v[0] == '0');
+    }();
+    if (runs && base >= PLAIN_REGISTERS && uint64_t(base) + count <= RegisterFile::COUNT) {
+        regs_.write_big_endian(base, words, count);
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++) write_register(base + i, be32(words + 4 * i));
+}
+
 void CommandProcessor::write_registers_from_ring(uint32_t base, uint32_t count) {
+    if (reader_.read + uint64_t(count) * 4 <= reader_.capacity) {
+        write_register_run(base, reader_.base + reader_.read, count);
+        reader_.skip(count * 4);
+        return;
+    }
     for (uint32_t i = 0; i < count; i++) write_register(base + i, reader_.next());
 }
 
 void CommandProcessor::write_registers_from_memory(uint32_t base, uint32_t address, uint32_t count) {
     if (sink_) sink_->memory_read(address & PHYSICAL_MASK, count * 4);
+    // (in a row in physical memory, short of its end)
+    if (uint64_t(address & PHYSICAL_MASK) + uint64_t(count) * 4 <= PHYSICAL_SIZE) {
+        if (count) write_register_run(base, physical(address), count);
+        return;
+    }
     for (uint32_t i = 0; i < count; i++) write_register(base + i, be32(physical(address + 4 * i)));
 }
 
@@ -457,7 +508,7 @@ void CommandProcessor::special_register_write(uint32_t index, uint32_t value) {
     switch (index) {
     case reg::COHER_STATUS_HOST:
         // marked pending: the next WAIT_REG_MEM on it makes memory coherent
-        regs_.set(index, regs_.get(index) | 0x80000000u);
+        regs_.write(index, regs_.get(index) | 0x80000000u);
         break;
     case reg::DC_LUT_RW_INDEX: gamma_component_ = 0; break;
     case reg::DC_LUT_SEQ_COLOR: {
@@ -509,7 +560,7 @@ void CommandProcessor::special_register_write(uint32_t index, uint32_t value) {
 // COHER_STATUS_HOST's pending bit cleared: memory is coherent (there are no
 // caches to flush here)
 void CommandProcessor::make_coherent() {
-    if (regs_.get(reg::COHER_STATUS_HOST) & 0x80000000u) regs_.set(reg::COHER_STATUS_HOST, 0);
+    if (regs_.get(reg::COHER_STATUS_HOST) & 0x80000000u) regs_.write(reg::COHER_STATUS_HOST, 0);
 }
 
 // ---- waits, conditional writes, events ----
@@ -518,7 +569,7 @@ bool CommandProcessor::wait_reg_mem() {
     uint32_t wait_info = reader_.next(), poll = reader_.next(), ref = reader_.next(), mask = reader_.next();
     uint32_t wait = reader_.next();
     bool is_memory = wait_info & 0x10;
-    for (;;) {
+    for (bool first = true;; first = false) {
         uint32_t value;
         if (is_memory) {
             if (sink_) sink_->memory_read(poll & ~3u & PHYSICAL_MASK, 4);
@@ -529,6 +580,18 @@ bool CommandProcessor::wait_reg_mem() {
         }
         if (match(value & mask, ref, wait_info)) return true;
         bump(counts_.waits);
+        // what was waited for, for the report (the kernel's video line)
+        if (is_memory) bump(counts_.waits_on_memory);
+        if (wait >= 0x100) bump(counts_.waits_asleep);
+        if (first) {
+            bump(counts_.waiting_packets);
+            counts_.last_wait_poll.store((poll & 0x7FFFFFFF) | (is_memory ? 0x80000000u : 0u), std::memory_order_relaxed);
+            counts_.last_wait_ref.store(ref, std::memory_order_relaxed);
+            counts_.last_wait_mask.store(mask, std::memory_order_relaxed);
+            counts_.last_wait_field.store(wait, std::memory_order_relaxed);
+        }
+        // the CPU may read the screen extents before it lets the wait end
+        poll_extents(true);
         if (!host_.wait(wait)) return false;
     }
 }
@@ -555,7 +618,7 @@ bool CommandProcessor::cond_write() {
 // memory; how the CPU learns a fence has passed
 bool CommandProcessor::event_write_shd() {
     uint32_t initiator = reader_.next(), address = reader_.next(), value = reader_.next();
-    regs_.set(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
+    regs_.write(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
     uint32_t data = (initiator >> 31) & 1 ? counter() : value;
     data = gpu_swap(data, Endian(address & 3));
     address &= ~3u;
@@ -567,26 +630,103 @@ bool CommandProcessor::event_write_shd() {
     }
     put_le32(destination, data);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, 4);
+    host_.wrote_back();
     return true;
 }
 
-// a screen extent event: the area a draw touched, which nothing measures
-// here; the whole of the largest texture, as Xenia writes
+// A screen extent event (SCREEN_EXT_RPT): the area the draws since the last
+// SCREEN_EXT_INIT touched, six 16-bit words (x, y and z, min and max; x and
+// y in 8-pixel units, as Xenia's >> 3 writes them) byte-swapped in 16 bits
+// (Xenia asserts that endianness and writes it so). Written at once as Xenia
+// writes it, the whole of the largest texture; with ScreenExtents::Measured
+// and a sink that measures, written again with the sink's bounds when they
+// are in (poll_extents), and those are in before the next interrupt or wait,
+// after which the CPU may read them. Direct3D's predicated tiling reads them
+// to choose the tiles a draw runs in: a bound too small would drop the
+// draw's pixels in a tile, one too large only runs it in more tiles, so the
+// bounds are rounded outwards. The z range stays 0-1 (a hardware question,
+// as is the rounding the console does).
 bool CommandProcessor::event_write_ext() {
     uint32_t initiator = reader_.next(), address = reader_.next() & ~3u;
-    regs_.set(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
-    const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1}; // x, y and z, min and max
+    regs_.write(reg::VGT_EVENT_INITIATOR, initiator & 0x3F);
+    const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
+    uint64_t handle = 0;
+    if (extents_ == ScreenExtents::Measured && sink_ && sink_->measures_extents()) {
+        handle = sink_->extent_report();
+        if (handle) extent_pending_.push_back({handle, address});
+        // (the latest report at the address, or none: kept, not erased, a
+        // frame's reports being at the addresses of the frame before's)
+        extent_latest_.at(address) = handle;
+    }
+    // (a report the sink measures is written again with its bounds before the
+    // CPU may read it: nothing polling the write-backs is woken for this
+    // one, and the sink is told of the bytes once, with the bounds)
+    write_extent(address, extents, handle == 0);
+    return true;
+}
+
+// (told: the sink told of the bytes and what polls the write-backs woken;
+// else the caller does both, for many reports at once)
+void CommandProcessor::write_extent(uint32_t address, const uint16_t (&extents)[6], bool told) {
     uint8_t *p = physical(address);
     for (int i = 0; i < 6; i++) p[2 * i] = uint8_t(extents[i] >> 8), p[2 * i + 1] = uint8_t(extents[i]);
+    if (!told) return;
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, sizeof(extents));
-    return true;
+    host_.wrote_back();
+}
+
+// The sink's answers to the screen extent reports in (all of them, waited
+// for, with wait), each written where no later report has been since.
+void CommandProcessor::poll_extents(bool wait) {
+    if (extent_first_ == extent_pending_.size() || !sink_) return;
+    if (wait) sink_->extent_wait();
+    extent_resolved_.clear();
+    sink_->extent_poll(extent_resolved_);
+    // (the reports' records are an array in guest memory: the sink told of
+    // each run of neighbours once, not of every record)
+    bool written = false;
+    uint32_t run_start = 0, run_end = 0;
+    auto tell = [&] {
+        if (run_end > run_start) sink_->memory_written(run_start, run_end - run_start);
+        run_start = run_end = 0;
+    };
+    for (const Extent &e : extent_resolved_) {
+        // (the answers come in the reports' order: found at the first one waiting, or near it)
+        size_t at = extent_first_;
+        while (at < extent_pending_.size() && extent_pending_[at].first != e.handle) at++;
+        if (at == extent_pending_.size()) continue;
+        const uint32_t address = extent_pending_[at].second;
+        extent_pending_[at].first = 0;
+        while (extent_first_ < extent_pending_.size() && !extent_pending_[extent_first_].first) extent_first_++;
+        uint64_t *latest = extent_latest_.find(address);
+        if (!latest || *latest != e.handle) continue;
+        *latest = 0;
+        // (the whole screen is there already, written with the report: the sink told of it now)
+        const uint32_t physical_address = address & PHYSICAL_MASK;
+        // (a record is 16 bytes, 12 of them written: the 4 between two neighbours go with them)
+        if (run_end == run_start || physical_address < run_start || physical_address > run_end + 4)
+            tell(), run_start = run_end = physical_address;
+        run_end = std::max(run_end, physical_address + 12);
+        if (e.whole) continue;
+        // in 8-pixel units, outwards: the left and top down, the right and
+        // bottom (exclusive) up
+        uint32_t right = std::min<uint32_t>(e.right, 8192), bottom = std::min<uint32_t>(e.bottom, 8192);
+        const uint16_t extents[6] = {uint16_t(std::min(e.left, right) >> 3), uint16_t((right + 7) >> 3),
+                                     uint16_t(std::min(e.top, bottom) >> 3), uint16_t((bottom + 7) >> 3), 0, 1};
+        write_extent(address, extents, false);
+        written = true;
+    }
+    tell();
+    if (extent_first_ == extent_pending_.size()) extent_pending_.clear(), extent_first_ = 0;
+    // (what polls the write-backs woken once for all of them)
+    if (written) host_.wrote_back();
 }
 
 // a z-pass done event: an occlusion query's report (xe_gpu_depth_sample_
 // counts, little-endian, each counter split in two lanes) at
 // RB_SAMPLE_COUNT_ADDR
 bool CommandProcessor::event_write_zpd() {
-    regs_.set(reg::VGT_EVENT_INITIATOR, reader_.next() & 0x3F);
+    regs_.write(reg::VGT_EVENT_INITIATOR, reader_.next() & 0x3F);
     uint32_t report = regs_.get(reg::RB_SAMPLE_COUNT_ADDR);
     if (!report) return true;
     if (occlusion_ == OcclusionQueries::Fast && sink_ && sink_->counts_samples()) {
@@ -610,6 +750,7 @@ void CommandProcessor::write_zpd(uint32_t address, uint64_t z_pass) {
     uint8_t *p = physical(address);
     for (int i = 0; i < 8; i++) put_le32(p + 4 * i, values[i]);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, sizeof(values));
+    host_.wrote_back();
 }
 
 // QueueZPDReport: the report of the draws since the last event (the current
@@ -685,7 +826,7 @@ bool CommandProcessor::draw(uint32_t viz_query, uint32_t remaining) {
     d.viz_query = viz_query;
     d.initiator = reader_.next();
     remaining--;
-    regs_.set(reg::VGT_DRAW_INITIATOR, d.initiator);
+    regs_.write(reg::VGT_DRAW_INITIATOR, d.initiator);
     d.primitive = d.initiator & 0x3F;
     d.source = (d.initiator >> 6) & 3;
     uint32_t major_mode = (d.initiator >> 8) & 3;
@@ -699,11 +840,11 @@ bool CommandProcessor::draw(uint32_t viz_query, uint32_t remaining) {
         if (!remaining) return false;
         uint32_t base = reader_.next() & PHYSICAL_MASK;
         remaining--;
-        regs_.set(reg::VGT_DMA_BASE, base);
+        regs_.write(reg::VGT_DMA_BASE, base);
         if (!remaining) return false;
         uint32_t size = reader_.next();
         remaining--;
-        regs_.set(reg::VGT_DMA_SIZE, size);
+        regs_.write(reg::VGT_DMA_SIZE, size);
         uint32_t index_size = d.index32 ? 4 : 2;
         d.indexed = true;
         d.index_base = base & ~(index_size - 1);
@@ -759,6 +900,8 @@ bool CommandProcessor::im_load() {
     if (type > 1) return false;
     if (sink_) {
         sink_->memory_read(address & PHYSICAL_MASK, size * 4);
+        // the same shader from unwritten memory: nothing to copy
+        if (sink_->shader_again(type, address & PHYSICAL_MASK, size)) return true;
         words_.resize(size);
         for (uint32_t i = 0; i < size; i++) words_[i] = be32(physical(address + 4 * i));
         sink_->shader(type, address & PHYSICAL_MASK, words_);
@@ -788,8 +931,57 @@ bool CommandProcessor::xe_swap(uint32_t count) {
     Swap s{words[1], words[2], words[3]};
     bump(counts_.swaps);
     if (sink_) sink_->swap(regs_, s);
-    // the counts of the frame's reports, as they come in
+    // XF_SLOW_FRAMES=<ms>: each frame that took longer from swap to swap is
+    // printed with what the processor did in it: how long it waited
+    // (WAIT_REG_MEM), its draws, resolves and extent reports, and whether the
+    // extents were measured. For finding what a frame that misses its vblank
+    // is made of.
+    {
+        static const double limit = [] {
+            const char *v = std::getenv("XF_SLOW_FRAMES");
+            return v ? std::strtod(v, nullptr) : 0.0;
+        }();
+        if (limit > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t waited = counts_.wait_ns.load(), draws = counts_.draws.load();
+            const uint64_t resolves = counts_.resolves.load(), reports = counts_.opcodes[pm4::EVENT_WRITE_EXT].load();
+            const double ms = std::chrono::duration<double, std::milli>(now - slow_at_).count();
+            const Sink::Work work = sink_ ? sink_->work() : Sink::Work{};
+            // (XF_SLOW_FRAMES=<ms>,all: every frame, for setting the slow ones beside the others)
+            static const bool all = [] {
+                const char *v = std::getenv("XF_SLOW_FRAMES");
+                return v && std::strstr(v, ",all") != nullptr;
+            }();
+            if (slow_swaps_ && (ms > limit || all))
+                std::printf("%s frame: swap %llu, %.1f ms (%.1f ms in waits, %.1f ms waiting for the GPU), %llu draws, "
+                            "%llu resolves, %llu extent reports, %llu texture loads, %llu submissions, %llu pipelines%s\n",
+                            ms > limit ? "slow" : "a", (unsigned long long)counts_.swaps.load(), ms,
+                            double(waited - slow_waited_) / 1e6,
+                            (work.gpu_wait_seconds - slow_work_.gpu_wait_seconds) * 1000.0,
+                            (unsigned long long)(draws - slow_draws_), (unsigned long long)(resolves - slow_resolves_),
+                            (unsigned long long)(reports - slow_reports_),
+                            (unsigned long long)(work.texture_loads - slow_work_.texture_loads),
+                            (unsigned long long)(work.submissions - slow_work_.submissions),
+                            (unsigned long long)(work.pipelines - slow_work_.pipelines),
+                            extents_ == ScreenExtents::Measured ? ", extents measured" : "");
+            slow_work_ = work;
+            slow_at_ = now, slow_waited_ = waited, slow_draws_ = draws, slow_resolves_ = resolves, slow_reports_ = reports;
+            slow_swaps_++;
+        }
+    }
+    // the screen extents by their gain: a trial of measuring judged, or a
+    // stay with the whole screen over
+    if (extents_by_gain_ && ++extents_swaps_ >= extents_window_) {
+        if (extents_ == ScreenExtents::Measured &&
+            extents_skipped_ * EXTENTS_GAIN < extents_draws_ + extents_skipped_)
+            extents_ = ScreenExtents::Whole, extents_window_ = EXTENTS_STAY;
+        else
+            extents_ = ScreenExtents::Measured, extents_window_ = EXTENTS_TRIAL;
+        extents_swaps_ = 0, extents_draws_ = extents_skipped_ = 0;
+    }
+    // the counts of the frame's reports, as they come in, and the extents
     poll_zpd();
+    poll_extents(false);
     counter_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }

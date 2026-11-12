@@ -32,7 +32,12 @@
 //   - XamUserIsParentalControlled tests the account's parental control bit
 //     (Xenia tests the language's bits; an offline account has neither).
 
+#include "gpd.h"
 #include "xam.h"
+
+#include <fstream>
+#include <iterator>
+#include <set>
 
 #include <algorithm>
 #include <cctype>
@@ -113,9 +118,72 @@ Setting default_setting(uint32_t setting) {
 struct UserState {
     std::mutex mutex;
     std::map<std::pair<uint32_t, uint32_t>, Setting> written; // (title, setting)
+    // the user's GPDs by title ID (the dashboard's FFFE07D1 among them), as
+    // read from the profile's package when first used, and written back
+    std::map<uint32_t, Gpd> gpds;
+    std::set<uint32_t> loaded;
+    // the running title's SPA (its resource named by the title ID), read once
+    bool spa_read = false;
+    Gpd spa;
 };
 
 UserState &users(Kernel &k) { return k.state<UserState>(); }
+
+std::filesystem::path profile_path(Kernel &k, uint64_t xuid);
+
+// the title's GPD file in the profile's package: Xenia's User_<XUID>:\<title>.gpd
+std::filesystem::path gpd_path(Kernel &k, uint32_t title) {
+    char name[16];
+    std::snprintf(name, sizeof(name), "%08X.gpd", title);
+    return profile_path(k, user_profile(k).xuid) / name;
+}
+
+// The user's GPD of a title, read once from the profile's package (nothing
+// is read where there is no content root or no file): its settings become
+// the written ones (lock held). Xenia reads them when the profile signs in.
+Gpd &load_gpd(Kernel &k, UserState &s, uint32_t title) {
+    Gpd &g = s.gpds[title];
+    // (the deterministic mode starts from nothing and writes nothing: a run must not depend on files)
+    if (!s.loaded.insert(title).second || content_root(k).empty() || k.deterministic()) return g;
+    std::ifstream in(gpd_path(k, title), std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (!g.parse(bytes.data(), bytes.size())) return g;
+    for (const auto &[key, entry] : g.entries) {
+        uint32_t id;
+        uint8_t type;
+        Setting v;
+        if (key.first != gpd_section::SETTING || !decode_setting(entry, id, type, v.value, v.data)) continue;
+        v.source = 2;
+        s.written.emplace(std::make_pair(title, id), std::move(v)); // what the title wrote this run stays
+    }
+    return g;
+}
+
+// The title's GPD written to the profile's package, with the settings written
+// (lock held). Nothing is written without a content root.
+void save_gpd(Kernel &k, UserState &s, uint32_t title) {
+    if (content_root(k).empty() || k.deterministic()) return;
+    Gpd &g = load_gpd(k, s, title);
+    for (const auto &[key, v] : s.written) {
+        if (key.first != title || v.source != 2) continue;
+        g.entries[{gpd_section::SETTING, key.second}] =
+            encode_setting(key.second, uint8_t(key.second >> 28), v.value, v.data);
+    }
+    std::filesystem::path path = gpd_path(k, title);
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::vector<uint8_t> bytes = g.serialize();
+    // written aside and renamed, so a run that ends in the middle leaves the old file whole
+    std::filesystem::path temp = path;
+    temp += ".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char *>(bytes.data()), std::streamsize(bytes.size()));
+        if (!out) return;
+    }
+    std::filesystem::rename(temp, path, ec);
+    if (ec) std::fprintf(stderr, "xam: the profile's %08X.gpd could not be written: %s\n", title, ec.message().c_str());
+}
 
 // the dashboard's settings in the profile (Xenia's dashboard GPD)
 constexpr uint32_t DASHBOARD_ID = 0xFFFE07D1;
@@ -131,6 +199,7 @@ uint32_t be32_at(const uint8_t *p) { return uint32_t(p[0]) << 24 | p[1] << 16 | 
 uint64_t dashboard_value(Kernel &k, uint32_t id) {
     UserState &s = users(k);
     std::lock_guard<std::mutex> l(s.mutex);
+    load_gpd(k, s, DASHBOARD_ID);
     auto it = s.written.find({DASHBOARD_ID, id});
     Setting v = it != s.written.end() ? it->second : default_setting(id);
     if (type_of(id) == DataType::Int64 || type_of(id) == DataType::DateTime || type_of(id) == DataType::Double)
@@ -317,6 +386,7 @@ uint32_t read_profile_settings(Kernel &k, uint32_t title, uint32_t index, uint32
         std::memset(k.host(settings), 0, 40 * count);
         UserState &s = users(k);
         std::lock_guard<std::mutex> l(s.mutex);
+        load_gpd(k, s, title ? title : title_id(k));
         for (uint32_t i = 0; i < count; i++) {
             uint32_t id = k.load32(ids + 4 * i);
             if (!valid_setting(id)) {
@@ -374,6 +444,8 @@ XF_EXPORT(xam, XamUserWriteProfileSettings) {
         {
             UserState &s = users(k);
             std::lock_guard<std::mutex> l(s.mutex);
+            const uint32_t owner = title ? title : title_id(k);
+            load_gpd(k, s, owner);
             for (uint32_t i = 0; i < count; i++) {
                 uint32_t at = settings + 40 * i, id = k.load32(at + 0x10);
                 Setting v;
@@ -385,8 +457,9 @@ XF_EXPORT(xam, XamUserWriteProfileSettings) {
                     put_be32(v.value, uint32_t(v.data.size()));
                     put_be32(v.value + 4, 0);
                 }
-                s.written[{title ? title : title_id(k), id}] = std::move(v);
+                s.written[{owner, id}] = std::move(v);
             }
+            save_gpd(k, s, owner);
         }
         broadcast(k, XN_SYS_PROFILESETTINGCHANGED, (1u << index) & 0xF);
         extended_error = 0;
@@ -395,17 +468,190 @@ XF_EXPORT(xam, XamUserWriteProfileSettings) {
     result(c, run_or_defer(k, ov, run));
 }
 
+// ---- achievements (achievement_manager.cc, user_tracker.cc, gpd_info_title.cc) ----
+
+namespace {
+// The running title's SPA, read once from its executable's resources (lock held)
+const Gpd &title_spa(Kernel &k, UserState &s) {
+    if (s.spa_read) return s.spa;
+    ppc::Context *c = Kernel::current_context();
+    uint32_t module = k.load32(k.variable("XexExecutableModuleHandle"));
+    if (!c && module && k.xex()) {
+        // a host's thread has no guest context to call the export with: it reads the executable's resource table
+        // (its header's RESOURCE_INFO: a size, then 16-byte entries of name, address, size) itself
+        const Xex &x = *k.xex();
+        auto be32 = [&](size_t at) {
+            return at + 4 <= x.header.size() ? uint32_t(x.header[at]) << 24 | uint32_t(x.header[at + 1]) << 16 |
+                                                   uint32_t(x.header[at + 2]) << 8 | x.header[at + 3]
+                                             : 0u;
+        };
+        char want[9];
+        std::snprintf(want, sizeof(want), "%08X", title_id(k));
+        for (const auto &[key, offset] : x.opt_headers) {
+            if (key != xex_key::RESOURCE_INFO) continue;
+            for (uint32_t i = 0, count = (be32(offset) - 4) / 16; i < count && i < 64; i++) {
+                size_t entry = offset + 4 + 16 * size_t(i);
+                if (entry + 16 > x.header.size() || std::memcmp(&x.header[entry], want, 8) != 0) continue;
+                uint32_t base = be32(entry + 8), size = be32(entry + 12);
+                if (base && size) {
+                    s.spa_read = true;
+                    s.spa.parse(k.host(base), size);
+                }
+                return s.spa;
+            }
+        }
+        return s.spa;
+    }
+    // (with no guest context and no module yet it asks again later)
+    if (!c || !module) return s.spa;
+    s.spa_read = true;
+    uint32_t name = export_scratch(*c), data_ptr = name + 16, size_ptr = name + 20;
+    std::snprintf(reinterpret_cast<char *>(k.host(name)), 16, "%08X", title_id(k));
+    k.store32(data_ptr, 0), k.store32(size_ptr, 0);
+    if (call_export(k, *c, "xboxkrnl", "XexGetModuleSection", {module, name, data_ptr, size_ptr}) != X_STATUS_SUCCESS)
+        return s.spa;
+    uint32_t base = k.load32(data_ptr), size = k.load32(size_ptr);
+    if (base && size) s.spa.parse(k.host(base), size);
+    return s.spa;
+}
+
+// The title's GPD with every achievement its SPA lists (a locked one where the
+// profile has none yet), as UserTracker::UpdateTitleGpdFile does (lock held)
+Gpd &title_gpd(Kernel &k, UserState &s, uint32_t title) {
+    Gpd &g = load_gpd(k, s, title);
+    if (title != title_id(k)) return g;
+    bool added = false;
+    for (Achievement &a : spa_achievements(title_spa(k, s), config_language(k))) {
+        if (g.find(gpd_section::ACHIEVEMENT, a.id)) continue;
+        g.entries[{gpd_section::ACHIEVEMENT, a.id}] = a.encode();
+        added = true;
+    }
+    if (added) save_gpd(k, s, title);
+    return g;
+}
+
+std::vector<Achievement> achievements_of(Gpd &g) {
+    std::vector<Achievement> out;
+    for (const auto &[key, bytes] : g.entries) {
+        Achievement a;
+        if (key.first == gpd_section::ACHIEVEMENT && a.decode(bytes)) out.push_back(std::move(a));
+    }
+    return out;
+}
+
+std::string utf8_of(std::u16string_view s) {
+    std::string out;
+    for (char16_t ch : s) out += ch < 0x80 ? char(ch) : '?';
+    return out;
+}
+} // namespace
+
+namespace {
+// the SPA's image of an id, as PNG bytes (lock held); none when it has no such image
+std::vector<uint8_t> spa_icon(Kernel &k, UserState &s, uint32_t image_id) {
+    const std::vector<uint8_t> *png = title_spa(k, s).find(gpd_section::IMAGE, image_id);
+    return png ? *png : std::vector<uint8_t>{};
+}
+} // namespace
+
+bool earn_achievement(Kernel &k, uint32_t user_index, uint32_t achievement_id) {
+    if (!user_at(k, user_index)) return false;
+    UserState &s = users(k);
+    Toast t;
+    {
+        std::lock_guard<std::mutex> l(s.mutex);
+        uint32_t title = title_id(k);
+        Gpd &g = title_gpd(k, s, title);
+        auto it = g.entries.find({gpd_section::ACHIEVEMENT, achievement_id});
+        Achievement a;
+        if (it == g.entries.end() || !a.decode(it->second)) {
+            std::fprintf(stderr, "xam: achievement %u does not exist in the title's SPA\n", achievement_id);
+            return false;
+        }
+        if (a.unlocked()) return true;
+        a.flags |= ACHIEVEMENT_ACHIEVED;
+        a.unlock_time = k.system_time();
+        it->second = a.encode();
+        save_gpd(k, s, title);
+        std::fprintf(stderr, "xam: achievement unlocked: \"%s\" (%u G, id %u)\n", utf8_of(a.label).c_str(),
+                     a.gamerscore, a.id);
+        t.kind = Toast::Kind::Achievement;
+        t.title = a.label, t.text = a.description, t.gamerscore = a.gamerscore;
+        t.icon = spa_icon(k, s, a.image_id);
+    }
+    toast(k, t); // with the lock released: the host's handler is not ours to hold it for
+    return true;
+}
+
+ProfileSummary profile_summary(Kernel &k) {
+    ProfileSummary out;
+    const User &u = user_profile(k);
+    out.gamertag = u.name, out.xuid = u.xuid, out.signed_in = user_at(k, 0) != nullptr;
+    out.title_id = title_id(k);
+    UserState &s = users(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    for (const Achievement &a : achievements_of(title_gpd(k, s, out.title_id))) {
+        ProfileAchievement p;
+        p.id = a.id, p.gamerscore = a.gamerscore, p.image_id = a.image_id, p.unlocked = a.unlocked();
+        p.unlock_time = p.unlocked ? a.unlock_time : 0;
+        p.label = a.label, p.description = a.description, p.unachieved = a.unachieved;
+        p.icon = spa_icon(k, s, a.image_id);
+        out.gamerscore_total += a.gamerscore;
+        if (p.unlocked) out.gamerscore += a.gamerscore;
+        out.achievements.push_back(std::move(p));
+    }
+    return out;
+}
+
 // (title_id, user_index, xuid, flags, offset, count, buffer_size_ptr,
-// handle_ptr): the title's achievements (none known here)
+// handle_ptr): the title's achievements from the user's GPD, locked and
+// unlocked, from item `offset`; flags 1, 2 and 4 ask for the label, the
+// description and the unachieved description
 XF_EXPORT(xam, XamUserCreateAchievementEnumerator) {
-    uint32_t index = arg(k, c, 1), flags = arg(k, c, 3), count = arg(k, c, 5), size_ptr = arg(k, c, 6);
-    uint32_t handle_ptr = arg(k, c, 7);
+    uint32_t title = arg(k, c, 0), index = arg(k, c, 1), flags = arg(k, c, 3), offset = arg(k, c, 4);
+    uint32_t count = arg(k, c, 5), size_ptr = arg(k, c, 6), handle_ptr = arg(k, c, 7);
     if (!count || !size_ptr || !handle_ptr || index >= 4) return result(c, X_ERROR_INVALID_PARAMETER);
-    uint32_t entry = 36 + ((flags & 7) ? 464 : 0); // X_ACHIEVEMENT_DETAILS and its strings
-    k.store32(size_ptr, entry * count);
+    constexpr uint32_t DETAILS = 36, STRINGS = 464; // X_ACHIEVEMENT_DETAILS and the string area
+    k.store32(size_ptr, ((flags & 7) ? DETAILS + STRINGS : DETAILS) * count);
     if (!user_at(k, index)) return result(c, X_ERROR_INVALID_PARAMETER);
-    Ref<Enumerator> e = make_enumerator(k, index, 0xFB, 0xB000A, 0xB000B, 0, count, 36, 0);
+    Ref<Enumerator> e = make_enumerator(k, index, 0xFB, 0xB000A, 0xB000B, 0, count, DETAILS, 0);
     if (!e) return result(c, X_STATUS_NO_MEMORY);
+    std::vector<Achievement> items;
+    {
+        UserState &s = users(k);
+        std::lock_guard<std::mutex> l(s.mutex);
+        items = achievements_of(title_gpd(k, s, title ? title : title_id(k)));
+    }
+    e->current = offset;
+    // XAchievementEnumerator::WriteItems: the records, then the strings behind them
+    e->writer = [items = std::move(items), flags, e = e.get()](Kernel &k, uint32_t buffer, uint32_t,
+                                                               uint32_t &written) {
+        size_t n = e->current < items.size() ? std::min<size_t>(items.size() - e->current, e->items_per_enumerate) : 0;
+        if (!n) return uint32_t(X_ERROR_NO_MORE_FILES);
+        uint32_t strings = buffer + e->items_per_enumerate * DETAILS, room = uint32_t(n * STRINGS);
+        auto put = [&](const std::u16string &text) {
+            uint32_t size = uint32_t(text.size() + 1) * 2;
+            if (size > room) return uint32_t(0);
+            uint32_t at = strings;
+            put_u16(k, at, text, text.size() + 1);
+            strings += size, room -= size;
+            return at;
+        };
+        for (size_t i = 0; i < n; i++, e->current++) {
+            const Achievement &a = items[e->current];
+            uint32_t at = buffer + uint32_t(i) * DETAILS;
+            k.store32(at + 0, a.id);
+            k.store32(at + 4, (flags & 1) ? put(a.label) : 0);
+            k.store32(at + 8, (flags & 2) ? put(a.description) : 0);
+            k.store32(at + 12, (flags & 4) ? put(a.unachieved) : 0);
+            k.store32(at + 16, a.image_id);
+            k.store32(at + 20, a.gamerscore);
+            k.store64(at + 24, a.unlocked() ? a.unlock_time : 0);
+            k.store32(at + 32, a.flags);
+        }
+        written = uint32_t(n);
+        return uint32_t(X_ERROR_SUCCESS);
+    };
     k.store32(handle_ptr, e->handle());
     result(c, X_ERROR_SUCCESS);
 }
@@ -650,6 +896,7 @@ XF_EXPORT(xam, XamUserWriteUserPreference) {
                    UserState &s = users(k);
                    std::lock_guard<std::mutex> l(s.mutex);
                    s.written[{DASHBOARD_ID, XPROFILE_USER_PREFERENCES}] = v;
+                   save_gpd(k, s, DASHBOARD_ID);
                }
                broadcast(k, XN_SYS_PROFILESETTINGCHANGED, 1u << index);
                extended_error = X_E_SUCCESS;

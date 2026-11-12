@@ -26,6 +26,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -77,8 +78,21 @@ constexpr uint32_t X_STATUS_NOT_IMPLEMENTED = 0xC0000002;
 constexpr uint32_t X_STATUS_INVALID_PARAMETER = 0xC000000D;
 constexpr uint32_t X_STATUS_NO_MEMORY = 0xC0000017;
 
+// A call count a call bumps with one relaxed atomic add (no lock, no string),
+// copyable so an Import is.
+struct CallCount {
+    mutable std::atomic<uint64_t> n{0};
+    CallCount() = default;
+    CallCount(const CallCount &o) : n(o.n.load(std::memory_order_relaxed)) {}
+    CallCount &operator=(const CallCount &o) {
+        n.store(o.n.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        return *this;
+    }
+};
+
 struct Import {
     std::string library, name; // name: the export's, or library_ordinal
+    CallCount calls;           // the calls made (Kernel::calls sums them by export)
     uint16_t ordinal = 0;
     uint32_t thunk = 0;
     ExportFn fn = nullptr;     // nullptr: not implemented yet
@@ -150,7 +164,17 @@ std::string stacks_report(Kernel &k);
 // saves go, interchangeable with Xenia's).
 bool mount_disc(Kernel &k, const std::filesystem::path &iso, std::string &error);
 bool mount_directory(Kernel &k, const std::filesystem::path &dir, std::string &error);
+// a content package holding a game (an arcade game, a game on demand), as the
+// console starts one: the game's device, deployed as a download
+bool mount_package(Kernel &k, const std::filesystem::path &package, std::string &error);
 bool mount_storage(Kernel &k, const std::filesystem::path &root, std::string &error);
+
+// How content a title creates (saves, caches) is kept under the content root: as STFS packages, files the console
+// and Xenia's reader take (the default; a package is a working directory while a title has it open and is written
+// as a package file when it closes it, xam_content.cpp), or as Xenia's directory packages. Existing content keeps
+// the form it has. Set before the title runs.
+enum class ContentFormat { Stfs, Directory };
+void set_content_format(Kernel &k, ContentFormat format);
 
 // The DVD tray's state as the system management controller has it
 // (misc.cpp; Xenia's X_DVD_TRAY_STATE: 0 open, 2 closed), for
@@ -183,6 +207,100 @@ std::string video_report(Kernel &k);
 // before the game starts; the Sink's calls then come on the "GPU commands"
 // thread.
 gpu::CommandProcessor &gpu_command_processor(Kernel &k);
+
+// What the player chooses of the console's settings (config.toml's [system];
+// boot's --language, --resolution, --widescreen, --refresh), written into the
+// console's own settings before the title runs (apply_system_settings, misc.cpp).
+// Zero or -1 leaves a setting as it is.
+struct SystemSettings {
+    std::filesystem::path file; // where the settings a title writes are kept between runs ("": this run only)
+    uint32_t language = 0;      // XLanguage: 1 English, 2 Japanese, 3 German, 4 French, 5 Spanish, 6 Italian, ...
+    int country = -1;           // the console's country code (103: United States)
+    uint32_t width = 0, height = 0; // the screen size: 640x480, 1280x720, 1920x1080
+    int widescreen = -1;        // 1 or 0: the 16:9 video flag
+    int refresh = 0;            // 50 or 60 Hz
+};
+void apply_system_settings(Kernel &k, const SystemSettings &settings);
+
+// The system's dialogs (the guide: message boxes, the keyboard, the device selector, sign-in, the friends, messages,
+// gamer card and other pages; xam_ui.cpp). With no handler each answers as a headless system does: the dialog's
+// default (the focused button, the default text, the hard drive, the user already signed in), at once. A host that
+// draws an overlay sets a handler: it is given each request and, when it takes it (returns true), calls `done`
+// with the user's answer, now or later and from any thread; until then the title's overlapped stays pending, the
+// guide counts as up (XamIsUIActive) and XN_SYS_UI is "on". A cancelled dialog completes its overlapped with
+// ERROR_CANCELLED, as the console's does when the user backs out. A handler that returns false leaves the request
+// to the default.
+enum class UiKind : uint32_t {
+    MessageBox, Keyboard, DeviceSelector, SignIn, Marketplace, Achievements, GamerCard, EditProfile, Friends,
+    Messages, Players, QuickChat, GameInvite, FriendRequest, PlayerReview, MessageCompose, CustomMessageCompose,
+    CustomPlayerList, Other,
+};
+struct UiRequest {
+    UiKind kind = UiKind::Other;
+    uint32_t user = 0xFF;                // the user index the title asked for (0xFF: any)
+    uint64_t xuid = 0;                   // the other player: gamer card, friend request, review
+    std::vector<uint64_t> xuids;         // recipients, players
+    std::u16string title, text;          // a message box's, a keyboard's title and description, a message's text
+    std::vector<std::u16string> buttons; // a message box's, in order
+    uint32_t default_button = 0;         // the focused one
+    uint32_t flags = 0;                  // the message box's icon and style, the device selector's, the keyboard's
+    std::u16string default_text;         // the keyboard's
+    uint32_t max_length = 0;             // the keyboard's, in characters
+    uint32_t content_type = 0;           // the device selector's
+    uint64_t bytes_required = 0;         // the device selector's
+    uint32_t users_needed = 0;           // sign-in's
+};
+struct UiResult {
+    bool cancelled = false;
+    uint32_t button = 0;     // the message box's button pressed
+    std::u16string text;     // the keyboard's text
+    uint32_t device_id = 1;  // the device selector's (1: the hard drive)
+};
+using UiDone = std::function<void(const UiResult &)>;
+using UiHandler = std::function<bool(const UiRequest &, UiDone done)>;
+void set_ui_handler(Kernel &k, UiHandler handler);
+
+// What a host that draws notifications shows: an achievement the title unlocked (its name, its gamerscore, the icon
+// as the SPA's PNG when it has one) and the text of XNotifyQueueUI. Called from the guest's threads with no kernel
+// lock held; it must not block. With no handler they are only logged.
+struct Toast {
+    enum class Kind { Achievement, Notice } kind = Kind::Notice;
+    std::u16string title, text; // an achievement's name and description; a notice's text (title empty)
+    uint32_t gamerscore = 0;    // an achievement's
+    std::vector<uint8_t> icon;  // an achievement's icon, PNG bytes (none when the SPA has no such image)
+};
+using ToastHandler = std::function<void(const Toast &)>;
+void set_toast_handler(Kernel &k, ToastHandler handler);
+
+// The profile a host shows (its gamer card, its achievements page): the user, and the running title's achievements
+// as the user's GPD for it holds them (a locked one for each the SPA lists), with their icons as PNG bytes.
+struct ProfileAchievement {
+    uint32_t id = 0, gamerscore = 0, image_id = 0;
+    bool unlocked = false;
+    uint64_t unlock_time = 0; // FILETIME
+    std::u16string label, description, unachieved;
+    std::vector<uint8_t> icon;
+};
+struct ProfileSummary {
+    std::string gamertag;
+    uint64_t xuid = 0;
+    bool signed_in = false;
+    uint32_t title_id = 0;
+    std::vector<ProfileAchievement> achievements;
+    uint32_t gamerscore = 0;       // the earned ones' sum, in this title
+    uint32_t gamerscore_total = 0; // all the title's
+};
+ProfileSummary profile_summary(Kernel &k);
+// The user's gamertag (config.toml's), before the title runs
+void set_gamertag(Kernel &k, const std::string &name);
+// The user a profile is: its XUID (the directory its saves and GPDs are under) and gamertag, set before the title runs;
+// a zero XUID leaves the one the storage root has (the first profile found, else the default).
+void set_user(Kernel &k, uint64_t xuid, const std::string &name);
+
+// The launch data the next title finds through XamLoaderGetLaunchData (what
+// the title before it set with XamLoaderSetLaunchData; Kernel::title_exit),
+// set before the title runs.
+void set_launch_data(Kernel &k, const std::vector<uint8_t> &data);
 
 // The sound family's parts (audio.cpp, xma.cpp; its seams in
 // xenoforge/audio.h). setup_audio, as the kernel starts: the XMA decoder's
@@ -284,6 +402,10 @@ public:
     bool wait_main(uint32_t timeout_ms, uint32_t *exit_code = nullptr);
     // the guest threads alive: each one's state and where it was
     std::string thread_report();
+    // the host id of the first running guest thread whose name (the
+    // kernel's own, or the guest's SetThreadName) contains `name`; 0 none
+    // (or the deterministic mode, whose threads are fibers)
+    uint32_t host_thread_id(const std::string &name);
     // The deterministic mode (Deterministic), chosen before launch: false
     // when a guest thread has started already. halted: its halt said stop,
     // and every guest thread is parked.
@@ -406,6 +528,20 @@ public:
     void stop(const std::string &reason);
     std::string stop_report, stop_stack; // the report's text, and its one-line stack
 
+    // What the title asked when it ended the run by launching another title
+    // (XamLoaderLaunchTitle and its variants) or by terminating itself
+    // (XamLoaderTerminateTitle, ExTerminateTitleProcess): the host starts the
+    // next title as a process of its own (boot's --follow-launches). Set under
+    // the stop's first reason, before the run stops; read after it.
+    struct TitleExit {
+        bool launch = false;             // another title follows (an empty path: the dashboard)
+        std::string path;                // the executable as the guest named it ("game:\Game.xex")
+        uint32_t flags = 0;              // the launch flags
+        uint32_t exit_code = 0;          // ExTerminateTitleProcess's code
+        std::vector<uint8_t> launch_data; // XamLoaderSetLaunchData's, for the next title
+    };
+    TitleExit title_exit;
+
     // Where a guest address is in the generated code's tables, for the
     // reports: its module's file name and the function it falls in (the last
     // one starting at or before it, within 64 KB). Locks nothing (the crash
@@ -490,6 +626,8 @@ private:
     std::map<std::string, uint32_t> variables_;
     mutable std::mutex counts_mutex_;
     std::map<std::string, uint64_t> calls_, unimplemented_;
+    std::set<std::string> unimplemented_logged_; // under counts_mutex_
+    void each_import(const std::function<void(const Import &)> &visit) const;
     std::atomic<uint64_t> interpreted_{0};
     std::unordered_map<uint32_t, uint64_t> interpreted_targets_; // under counts_mutex_
     EntryHook entry_hook_ = nullptr;

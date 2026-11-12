@@ -15,6 +15,7 @@
 #include "shader_builders.h"
 #include "xenoforge/shader_harness.h"
 #include "xenoforge/shader_interpreter.h"
+#include "xenoforge/shader_program.h"
 #include "xenoforge/shader_translator.h"
 #include "xenoforge/vk_compute.h"
 
@@ -41,6 +42,13 @@ using harness::Constants;
 namespace {
 
 std::unique_ptr<vk::Compute> gpu;
+
+// the generic shaders' interpreter as the harness runs it (generic.comp):
+// every case below runs on it too, against the same CPU answers
+const uint32_t GENERIC_HARNESS[] = {
+#include "generic.comp.inc"
+};
+int generic_runs = 0, generic_refused = 0, generic_failures = 0;
 
 // --- running ----------------------------------------------------------------
 
@@ -90,34 +98,59 @@ bool compare(const char *what, const ParsedShader &shader, Run &run, float toler
         failures++;
         return false;
     }
+    // the generic shaders' interpreter (generic.comp) on the same cases, its
+    // program at binding 4
+    const shader::Program program = shader::encode_program(shader);
+    std::vector<uint8_t> generic_out(out.size());
+    bool generic = program.ok();
+    if (generic) {
+        std::vector<uint8_t> generic_in(in), generic_consts(consts), generic_memory = run.memory;
+        std::vector<uint8_t> programs(program.words.size() * 4);
+        std::memcpy(programs.data(), program.words.data(), programs.size());
+        std::vector<uint8_t> *generic_buffers[] = {&generic_in, &generic_consts, &generic_memory, &generic_out, &programs};
+        if (!gpu->run(GENERIC_HARNESS, generic_buffers, uint32_t(padded / harness::LOCAL_SIZE), error)) {
+            std::printf("  %s: the generic shader's GPU run failed: %s\n", what, error.c_str());
+            failures++;
+            generic = false;
+        } else {
+            generic_runs++;
+        }
+    } else {
+        generic_refused++;
+    }
     int reported = 0;
     for (size_t c = 0; c < cases; c++) {
-        CaseOutput expected{}, got;
-        std::memcpy(&got, out.data() + c * sizeof(CaseOutput), sizeof(CaseOutput));
+        CaseOutput expected{};
         std::string unsupported;
         if (!shader::interpret(shader, run.inputs[c], run.constants, run.memory, expected, unsupported)) {
             std::printf("  %s: the interpreter refused: %s\n", what, unsupported.c_str());
             failures++;
             return false;
         }
-        const float *g = &got.registers[0][0], *e = &expected.registers[0][0];
-        size_t floats = (offsetof(CaseOutput, killed)) / 4;
-        bool same = got.killed == expected.killed && got.predicate == expected.predicate &&
-                    got.address_register == expected.address_register;
-        size_t bad = SIZE_MAX;
-        for (size_t k = 0; k < floats && same; k++)
-            if (!same_float(g[k], e[k], tolerance)) same = false, bad = k;
-        if (same) continue;
-        failures++;
-        if (reported++ < 4) {
-            std::printf("  %s, case %zu:", what, c);
-            if (bad != SIZE_MAX)
-                std::printf(" output float %zu (vec4 %zu.%zu) GPU %.9g CPU %.9g;", bad, bad / 4, bad % 4, g[bad], e[bad]);
-            std::printf(" killed %u/%u predicate %u/%u a0 %d/%d\n", got.killed, expected.killed, got.predicate,
-                        expected.predicate, got.address_register, expected.address_register);
-            const float *r = &run.inputs[c].registers[0][0];
-            std::printf("    inputs r0 (%g %g %g %g) r1 (%g %g %g %g) r2 (%g %g %g %g)\n", r[0], r[1], r[2], r[3], r[4],
-                        r[5], r[6], r[7], r[8], r[9], r[10], r[11]);
+        for (int side = 0; side < (generic ? 2 : 1); side++) {
+            CaseOutput got;
+            std::memcpy(&got, (side ? generic_out : out).data() + c * sizeof(CaseOutput), sizeof(CaseOutput));
+            const float *g = &got.registers[0][0], *e = &expected.registers[0][0];
+            size_t floats = (offsetof(CaseOutput, killed)) / 4;
+            bool same = got.killed == expected.killed && got.predicate == expected.predicate &&
+                        got.address_register == expected.address_register;
+            size_t bad = SIZE_MAX;
+            for (size_t k = 0; k < floats && same; k++)
+                if (!same_float(g[k], e[k], tolerance)) same = false, bad = k;
+            if (same) continue;
+            failures++;
+            if (side) generic_failures++;
+            if (reported++ < 4) {
+                std::printf("  %s%s, case %zu:", what, side ? " (generic)" : "", c);
+                if (bad != SIZE_MAX)
+                    std::printf(" output float %zu (vec4 %zu.%zu) GPU %.9g CPU %.9g;", bad, bad / 4, bad % 4, g[bad],
+                                e[bad]);
+                std::printf(" killed %u/%u predicate %u/%u a0 %d/%d\n", got.killed, expected.killed, got.predicate,
+                            expected.predicate, got.address_register, expected.address_register);
+                const float *r = &run.inputs[c].registers[0][0];
+                std::printf("    inputs r0 (%g %g %g %g) r1 (%g %g %g %g) r2 (%g %g %g %g)\n", r[0], r[1], r[2], r[3],
+                            r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11]);
+            }
         }
     }
     return true;
@@ -580,5 +613,7 @@ int main() {
     fetches();
     memory_exports();
     corpus();
+    std::printf("  the generic shader: %d runs, %d cases off the CPU's, %d shaders it does not run (memory exports)\n",
+                generic_runs, generic_failures, generic_refused);
     return finish("shader_compare");
 }

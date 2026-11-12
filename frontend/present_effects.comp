@@ -1,0 +1,120 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// The window's picture effects (presenter.cpp), as Xenia's presenter offers
+// them (src/xenia/ui/shaders/guest_output_ffx_fsr_easu.ps.xesl,
+// guest_output_ffx_fsr_rcas.xesli, guest_output_ffx_cas_resample.xesli and
+// guest_output_ffx_cas_sharpen.xesli; src/xenia/gpu/shaders/fxaa.hlsli), as
+// compute shaders writing an RGBA8 image. BSD; see LICENSE-xenia. The
+// effects themselves are AMD's FidelityFX FSR 1 and CAS (MIT, their notices in
+// third_party/FidelityFX-*) and NVIDIA's FXAA 3.11 (BSD, third_party/fxaa).
+//
+// One of, by define: EASU (FSR's upscale), RCAS (FSR's sharpening, at the
+// same size), CAS (sharpening, resampling when the sizes differ), FXAA or
+// FXAA_EXTREME (Xenia's two presets).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D source; // linear, clamped
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dest;
+
+layout(push_constant) uniform Push {
+    uvec2 dest_size;
+    vec2 source_size;
+    vec2 dest_size_f;
+    float sharpness; // RCAS: exp2(-reduction); CAS: CasSetup's -1/lerp(8, 5, sharpness)
+    uint scaling;    // CAS: the sizes differ
+} pc;
+
+#define A_GPU 1
+#define A_GLSL 1
+
+#ifdef EASU
+#include "../third_party/FidelityFX-FSR/ffx_a.h"
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return textureGather(source, p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(source, p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(source, p, 2); }
+#include "../third_party/FidelityFX-FSR/ffx_fsr1.h"
+void main() {
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(at, pc.dest_size))) return;
+    // FsrEasuCon, as Xenia's shader makes it from the size ratio
+    vec2 ratio = pc.source_size / pc.dest_size_f, inv = 1.0 / pc.source_size;
+    uvec4 c0 = uvec4(floatBitsToUint(ratio), floatBitsToUint(0.5 * ratio - 0.5));
+    uvec4 c1 = floatBitsToUint(vec4(1.0, 1.0, 1.0, -1.0) * inv.xyxy);
+    uvec4 c2 = floatBitsToUint(vec4(-1.0, 2.0, 1.0, 2.0) * inv.xyxy);
+    uvec4 c3 = uvec4(floatBitsToUint(0.0), floatBitsToUint(4.0 * inv.y), 0u, 0u);
+    vec3 color;
+    FsrEasuF(color, at, c0, c1, c2, c3);
+    imageStore(dest, ivec2(at), vec4(color, 1.0));
+}
+#endif
+
+#ifdef RCAS
+#include "../third_party/FidelityFX-FSR/ffx_a.h"
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return AF4(texelFetch(source, p, 0).rgb, 1.0); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "../third_party/FidelityFX-FSR/ffx_fsr1.h"
+void main() {
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(at, pc.dest_size))) return;
+    uvec4 con = uvec4(floatBitsToUint(pc.sharpness), packHalf2x16(vec2(pc.sharpness)), 0u, 0u);
+    vec3 color;
+    FsrRcasF(color.r, color.g, color.b, at, con);
+    imageStore(dest, ivec2(at), vec4(color, 1.0));
+}
+#endif
+
+#ifdef CAS
+#include "../third_party/FidelityFX-CAS/ffx_a.h"
+AF3 CasLoad(ASU2 p) { return texelFetch(source, p, 0).rgb; }
+// the linear conversion approximation the CAS presentation recommends (Xenia's)
+void CasInput(inout AF1 r, inout AF1 g, inout AF1 b) { r *= r, g *= g, b *= b; }
+#include "../third_party/FidelityFX-CAS/ffx_cas.h"
+void main() {
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(at, pc.dest_size))) return;
+    vec2 ratio = pc.source_size / pc.dest_size_f;
+    uvec4 c0 = uvec4(floatBitsToUint(ratio), floatBitsToUint(0.5 * ratio - 0.5));
+    uvec4 c1 = uvec4(floatBitsToUint(pc.sharpness), packHalf2x16(vec2(pc.sharpness, 0.0)),
+                     floatBitsToUint(8.0 * ratio.x), 0u);
+    vec3 color;
+    if (pc.scaling != 0u)
+        CasFilter(color.r, color.g, color.b, at, c0, c1, false);
+    else
+        CasFilter(color.r, color.g, color.b, at, c0, c1, true);
+    imageStore(dest, ivec2(at), vec4(sqrt(color), 1.0));
+}
+#endif
+
+#if defined(FXAA) || defined(FXAA_EXTREME)
+#ifdef FXAA_EXTREME
+#define FXAA_QUALITY__PRESET 39
+#define SUBPIX 1.0
+#define EDGE_THRESHOLD 0.063
+#define EDGE_THRESHOLD_MIN 0.0312
+#else
+#define FXAA_QUALITY__PRESET 12
+#define SUBPIX 0.75
+#define EDGE_THRESHOLD 0.166
+#define EDGE_THRESHOLD_MIN 0.0833
+#endif
+#define FXAA_PC 1
+#define FXAA_GLSL_130 1
+// the picture's alpha is opaque, not luma: green stands for it (Xenia writes
+// luma into alpha in its gamma pass instead)
+#define FXAA_GREEN_AS_LUMA 1
+#include "../third_party/fxaa/FXAA3_11.h"
+void main() {
+    uvec2 at = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(at, pc.dest_size))) return;
+    vec2 inv = 1.0 / pc.source_size;
+    vec2 p = (vec2(at) + 0.5) * inv;
+    vec4 color = FxaaPixelShader(p, vec4(vec2(at), vec2(at) + 1.0) * inv.xyxy, source, source, source, inv,
+                                 vec4(-0.5, -0.5, 0.5, 0.5) * inv.xyxy, vec4(-2.0, -2.0, 2.0, 2.0) * inv.xyxy,
+                                 vec4(8.0, 8.0, -4.0, -4.0) * inv.xyxy, SUBPIX, EDGE_THRESHOLD, EDGE_THRESHOLD_MIN,
+                                 8.0, 0.125, 0.05, vec4(1.0, -1.0, 0.25, -0.25));
+    imageStore(dest, ivec2(at), vec4(color.rgb, 1.0));
+}
+#endif

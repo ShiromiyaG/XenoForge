@@ -2,10 +2,14 @@
 # build time: cmake -DROOT=<source dir> -DOUT=<dir> -P game_interface.cmake
 #
 # - OUT/xenoforge/game_interface.h: XF_GAME_INTERFACE_VERSION, the first 32
-#   bits of a SHA-256 of what makes a game library: the headers the generated
-#   code compiles against, the recompiler's sources (discovery and emission)
-#   and src/game_build.cpp (the compiler's flags). A change to any of them
-#   makes every cached library stale, so the launcher builds it again.
+#   bits of a SHA-256 of what makes a game library: the code of the headers
+#   the generated code compiles against (their comments, blank lines and the
+#   spaces around lines left out: editing a comment changes no library), the
+#   recompiler's sources (discovery and emission) and src/game_build_flags.h
+#   (the compiler's and linker's flags; not the rest of the recompile step,
+#   game_build.cpp, which makes the same library however it is written). A
+#   change to any of them makes every cached library stale, so the launcher
+#   builds it again (reusing the objects whose text is the same).
 # - OUT/game_headers.inc: those headers' text, which the recompile step writes
 #   beside the code it compiles (game_build.cpp), so the code is always built
 #   against the headers of the XenoForge that loads it.
@@ -27,15 +31,20 @@ set(headers
     ppc_ops/vmx_float.h)
 file(GLOB recipe RELATIVE ${ROOT} ${ROOT}/src/recomp_*.cpp)
 list(SORT recipe)
-list(APPEND recipe include/xenoforge/recomp.h src/game_build.cpp)
+list(APPEND recipe include/xenoforge/recomp.h src/game_build_flags.h)
 
 set(digest_input "")
 set(inc "// Written by cmake/game_interface.cmake: the headers a game library compiles against.\n")
 foreach(h ${headers})
     file(READ ${ROOT}/include/xenoforge/${h} text)
     string(REPLACE "\r\n" "\n" text "${text}")
-    string(APPEND digest_input "xenoforge/${h}\n${text}\n")
     string(APPEND inc "{\"xenoforge/${h}\", R\"xf_header(${text})xf_header\"},\n")
+    # its code alone (no header holds a block comment or a // in a string)
+    string(REGEX REPLACE "//[^\n]*" "" code "${text}")
+    string(REGEX REPLACE "[ \t]+\n" "\n" code "${code}")
+    string(REGEX REPLACE "\n[ \t]+" "\n" code "${code}")
+    string(REGEX REPLACE "\n\n+" "\n" code "${code}")
+    string(APPEND digest_input "xenoforge/${h}\n${code}\n")
 endforeach()
 foreach(f ${recipe})
     file(READ ${ROOT}/${f} text)

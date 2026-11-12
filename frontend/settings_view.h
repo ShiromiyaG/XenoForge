@@ -105,6 +105,9 @@ class SettingsView final : public Rml::EventListener {
     void close_popup();
     void choose_option(const std::string &key, const std::string &value, Rml::Element *row);
     void end_capture();
+    // the Profile tab: the profile actions (rename, create, use, delete), each checked by profiles.h's rules
+    void profile_action(const std::string &name, const std::string &arg);
+    std::string input_value(const char *id) const;
 
     void navigate(NavDir dir);
     void activate();
@@ -129,6 +132,7 @@ class SettingsView final : public Rml::EventListener {
     Settings edit_;
     bool edit_valid_ = false;
     std::string capturing_;
+    std::string profile_message_, confirm_delete_; // the Profile tab's last message; the profile asked to be deleted
     std::string popup_key_;
     Rml::Element *popup_row_ = nullptr;
     Rml::Element *drag_row_ = nullptr;

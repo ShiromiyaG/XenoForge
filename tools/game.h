@@ -35,6 +35,8 @@ struct Options {
     std::string input;                    // a disc image, or a bare default.xex
     std::string xex_path = "default.xex"; // the executable on the disc
     std::filesystem::path storage;        // the storage root (content/, cache*/)
+    kernel::SystemSettings system;        // the console's language, country and video the player chose
+    kernel::ContentFormat content_format = kernel::ContentFormat::Stfs; // how new saves are kept
     uint64_t steps = 2'000'000'000ull;    // the interpreter's instructions per entry
     bool interpret = false;               // the generated code left out (linked, or a game library)
     // Generated code linked into the executable (xfrecomp emit's modules.cpp: a
@@ -77,6 +79,7 @@ struct Game {
     std::unique_ptr<render::Renderer> renderer;
     std::unique_ptr<gpu::TraceWriter> trace; // in front of the renderer, when frames are traced
     size_t generated_modules = 0, generated_functions = 0; // the generated code installed (none: interpreted)
+    const ppc::GeneratedModule *const *installed_modules = nullptr; // its tables (linked, or the game library's)
     // the cache (Options::cache, else default_cache_dir()): the title's
     // pipeline cache and shader storage are kept there by default
     std::filesystem::path cache;
@@ -148,8 +151,19 @@ struct Rates {
     double last_wall = 0, last_busy = 0, last_busy_wall = 0;
     uint64_t last_swaps = 0, last_draws = 0, last_resolves = 0;
     uint64_t last_texture_loads = 0; // the renderer's, at its last report
+    uint64_t last_run_ns = 0, last_wait_ns = 0; // the command processor's thread
 };
 void print_rates(Game &game, Rates &rates, double wall_seconds, const std::string &extra = {});
+
+// A path the guest launches (kernel::Kernel::title_exit.path) as the path on the disc --xex takes: the device
+// prefix (game:, d:, \Device\Cdrom0) dropped, slashes forward; "" for the dashboard or a path that is not on the disc.
+std::string disc_path(std::string path);
+// The command line of the process that runs the title this one launched (boot --follow-launches, the player's
+// follow_launches): `args` as this process got them (argv[0] first) without the options named in `replace` (each
+// with its value), then those with a value appended with it (an empty value only drops the option). What decides which title follows is
+// disc_path; how it is started (a process here, in the launcher's process on Android) is the caller's.
+std::vector<std::string> relaunch_args(const std::vector<std::string> &args,
+                                       const std::vector<std::pair<std::string, std::string>> &replace);
 
 // "300,301,890-910": numbers and ranges of them
 bool parse_numbers(const std::string &list, std::set<uint64_t> &out);

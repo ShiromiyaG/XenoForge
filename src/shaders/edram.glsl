@@ -9,9 +9,19 @@
 // BSD; see LICENSE-xenia.
 //
 // With EDRAM_NO_TARGET defined (edram_fsi.frag, the pixel shader writing
-// EDRAM itself), only the conversions that need no push constants.
+// EDRAM itself), only the conversions that need no push constants. With
+// EDRAM_TWO_TARGETS (edram_transfer.frag, a target's samples drawn straight
+// into another), `target` is a variable the shader sets to the side it works
+// on, from push constants of its own. EDRAM_NO_ADDRESSING (resolve.comp
+// reading a target's image) leaves out where samples live in EDRAM.
 
-#ifndef EDRAM_NO_TARGET
+#if defined(EDRAM_TWO_TARGETS)
+struct EdramParams {
+    uint base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, flags;
+    uint scale; // the resolution scale in quarters, as the push constants' below
+};
+EdramParams target;
+#elif !defined(EDRAM_NO_TARGET)
 layout(push_constant) uniform Target {
     uint base_tiles;
     uint pitch_tiles; // at the target's bits per sample
@@ -33,14 +43,23 @@ layout(push_constant) uniform Target {
     uint flags;
     // edram_clear.comp: the rectangle's corner and the clear's words
     uint x, y, clear_lo, clear_hi;
+    // the resolution scale EDRAM is drawn at, in quarters (render_scale.h):
+    // its tiles 80x16 samples of 32 bits that many quarters across and down;
+    // width, height, x and y above are in its pixels
+    uint scale;
 } target;
 #endif
 
+#if !defined(EDRAM_NO_TARGET) && !defined(EDRAM_NO_ADDRESSING)
 const uint TILE_DWORDS = 80u * 16u;
 const uint EDRAM_DWORDS = TILE_DWORDS * 2048u;
 
-#ifndef EDRAM_NO_TARGET
-// The dword of a pixel's guest sample. 4x: bit 0 of the sample horizontal,
+// a tile's dwords, and EDRAM's, at the target's scale
+uint tile_dwords() { return 80u * target.scale * target.scale; }
+uint edram_dwords() { return tile_dwords() * 2048u; }
+
+// The dword of a pixel's guest sample (a pixel of the scaled grid; Xenia's
+// XeEdramOffsetBytes with its resolution scale). 4x: bit 0 of the sample horizontal,
 // bit 1 vertical; 2x: sample 0 the top one.
 uint edram_offset(uvec2 pixel, uint sample_index) {
     uvec2 s;
@@ -53,7 +72,7 @@ uint edram_offset(uvec2 pixel, uint sample_index) {
     } else {
         s = pixel;
     }
-    uvec2 tile_size = uvec2(80u >> target.ints_log2, 16u);
+    uvec2 tile_size = uvec2((20u * target.scale) >> target.ints_log2, 4u * target.scale);
     uvec2 tile_xy = s / tile_size;
     uint tile = target.base_tiles + tile_xy.y * target.pitch_tiles + tile_xy.x;
     s -= tile_xy * tile_size;
@@ -62,7 +81,7 @@ uint edram_offset(uvec2 pixel, uint sample_index) {
         uint half_width = tile_size.x >> 1u;
         s.x = s.x >= half_width ? s.x - half_width : s.x + half_width;
     }
-    return (tile * TILE_DWORDS + ((s.y * tile_size.x + s.x) << target.ints_log2)) % EDRAM_DWORDS;
+    return (tile * tile_dwords() + ((s.y * tile_size.x + s.x) << target.ints_log2)) % edram_dwords();
 }
 
 // The host's sample index to the guest's: Vulkan's standard 2x locations put
@@ -130,7 +149,9 @@ uint pack_depth(float depth, uint stencil) { return (depth_to_guest(depth) << 8u
 // D24FS8's in the first half, D24S8's in the second (Xenia's
 // OwnershipRange::host_depth_render_target_float24 and _unorm24, tracked
 // apart so that clearing through the other format does not drop it).
-uint host_depth_offset(uint at) { return at + (target.format == 0u ? EDRAM_DWORDS : 0u); }
+#ifndef EDRAM_NO_ADDRESSING
+uint host_depth_offset(uint at) { return at + (target.format == 0u ? edram_dwords() : 0u); }
+#endif
 float unpack_depth(uint word) {
     uint d24 = word >> 8u;
     // xenos::UNorm24To32: exact, 0xFFFFFF to 1

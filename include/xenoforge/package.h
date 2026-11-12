@@ -174,6 +174,23 @@ private:
     std::map<uint64_t, std::vector<uint8_t>> hash_tables_; // by the table's offset in the volume
 };
 
+// ---- writing (src/package_write.cpp) ----
+
+// Writes the files of a host directory as an STFS package, the console's own writable format ("CON " magic,
+// read-write hash tables: a primary and a secondary table at every level, the primary active). `header` is the
+// package's XContentHeader and XContentMetadata (0x344 + 0x93D6 bytes at least, as Package::open reads them: the
+// caller sets the content type, title, profile, display name and thumbnails); the volume descriptor, the content
+// size, the data file size and the header's SHA-1 (the content ID) are filled in here. The file is written to
+// "<out>.tmp" and renamed over `out`, so a package is never seen half written. The package is not signed: the
+// RSA signature of a console's CON needs that console's private key, which a player's machine has not (the
+// signature field stays zero, as Xenia's reader and ours both accept). On failure: false and the reason.
+bool write_stfs_package(const std::filesystem::path &out, const std::vector<uint8_t> &header,
+                        const std::filesystem::path &directory, std::string &error);
+
+// Extracts the files of an STFS package into a host directory (made if need be): the way back from
+// write_stfs_package, and how a title's package is opened for writing. Names are converted to UTF-8.
+bool extract_package(const Package &package, const std::filesystem::path &directory, std::string &error);
+
 // A Windows-1252 name (a package's file names) as UTF-8
 std::string package_name_to_utf8(std::string_view ansi);
 // A FAT date and time (the STFS entries') as a FILETIME; 0 when the date is not one

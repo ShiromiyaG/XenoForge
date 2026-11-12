@@ -31,7 +31,7 @@
 //   - XamNetworkStorageHasUserEnabledStorage reads no user preference (the
 //     kernel keeps none), which leaves the privilege check, always denied
 //     offline: never enabled, as Xenia answers for a profile that never set it;
-//   - XNotifyQueueUI logs the text (there is no notification UI to show it).
+//   - XNotifyQueueUI logs the text, and hands it to the host's toast handler when there is one.
 
 #include "xam.h"
 
@@ -370,9 +370,39 @@ XF_EXPORT(xam, XNotifyBroadcast) {
     result(c, X_ERROR_SUCCESS);
 }
 
-// (type, user_index, areas (64 bits), text, context): logged, no UI to show
+namespace {
+struct ToastState {
+    std::mutex mutex;
+    ToastHandler handler;
+};
+} // namespace
+
+void set_toast_handler(Kernel &k, ToastHandler handler) {
+    ToastState &s = k.state<ToastState>();
+    std::lock_guard<std::mutex> l(s.mutex);
+    s.handler = std::move(handler);
+}
+
+bool toast(Kernel &k, const Toast &t) {
+    ToastState &s = k.state<ToastState>();
+    ToastHandler handler;
+    {
+        std::lock_guard<std::mutex> l(s.mutex);
+        handler = s.handler;
+    }
+    if (!handler) return false;
+    handler(t);
+    return true;
+}
+
+// (type, user_index, areas (64 bits), text, context): logged, and shown by a host's toast handler
 XF_EXPORT(xam, XNotifyQueueUI) {
     std::u16string text = guest_u16(k, arg(k, c, 3), 0x400);
+    {
+        Toast t;
+        t.text = text;
+        toast(k, t);
+    }
     std::string utf8;
     for (char16_t ch : text) utf8 += ch < 0x80 ? char(ch) : '?';
     std::fprintf(stderr, "xam: XNotifyQueueUI: %s\n", utf8.c_str());

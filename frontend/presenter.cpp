@@ -8,14 +8,70 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 namespace xf::frontend {
 
 namespace {
 
+// xfbench --self (tools/bench/xfbench.cpp): the time of each present, as its
+// Vulkan layer would record it (a QueryPerformanceCounter value, 8 bytes,
+// appended to XF_BENCH_LOG), written by the player itself so that no layer
+// sits between it and the driver while it is measured
+void bench_present() {
+#ifdef _WIN32
+    static std::once_flag once;
+    static FILE *log = nullptr;
+    std::call_once(once, [] {
+        const char *self = std::getenv("XF_BENCH_SELF"), *path = std::getenv("XF_BENCH_LOG");
+        if (self && std::string(self) == "1" && path) log = std::fopen(path, "ab");
+    });
+    if (!log) return;
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    std::fwrite(&t.QuadPart, sizeof(t.QuadPart), 1, log);
+    std::fflush(log);
+#endif
+}
+
 const uint32_t FRONT_BUFFER[] = {
 #include "front_buffer.comp.inc"
+};
+
+// present_effects.comp's variants, in Presenter::Effect's order
+const uint32_t EFFECT_EASU[] = {
+#include "present_EASU.comp.inc"
+};
+const uint32_t EFFECT_RCAS[] = {
+#include "present_RCAS.comp.inc"
+};
+const uint32_t EFFECT_CAS[] = {
+#include "present_CAS.comp.inc"
+};
+const uint32_t EFFECT_FXAA[] = {
+#include "present_FXAA.comp.inc"
+};
+const uint32_t EFFECT_FXAA_EXTREME[] = {
+#include "present_FXAA_EXTREME.comp.inc"
+};
+
+// present_effects.comp's push constants
+struct EffectPush {
+    uint32_t dest_width, dest_height;
+    float source_width, source_height, dest_width_f, dest_height_f;
+    float sharpness;
+    uint32_t scaling;
 };
 
 // front_buffer.comp's push constants
@@ -65,6 +121,41 @@ VkSemaphore timeline(VkDevice dev) {
 
 } // namespace
 
+Rect fit_picture(uint32_t window_width, uint32_t window_height, uint32_t width, uint32_t height, Fit fit) {
+    Rect r{0, 0, window_width, window_height};
+    if (fit == Fit::stretch || !width || !height || !window_width || !window_height) return r;
+    double scale = std::min(double(window_width) / width, double(window_height) / height);
+    if (fit == Fit::integer && scale >= 1.0) scale = std::floor(scale);
+    r.width = std::min(window_width, uint32_t(width * scale + 0.5));
+    r.height = std::min(window_height, uint32_t(height * scale + 0.5));
+    r.x = int32_t(window_width - r.width) / 2, r.y = int32_t(window_height - r.height) / 2;
+    return r;
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> easu_passes(uint32_t source_width, uint32_t source_height,
+                                                      uint32_t dest_width, uint32_t dest_height, uint32_t max_passes) {
+    std::vector<std::pair<uint32_t, uint32_t>> out;
+    if (dest_width <= source_width && dest_height <= source_height) return out;
+    uint32_t w = source_width, h = source_height;
+    while ((w < dest_width || h < dest_height) && out.size() < std::max(max_passes, 1u)) {
+        if (out.size() + 1 == std::max(max_passes, 1u)) {
+            w = dest_width, h = dest_height;
+        } else {
+            w = std::min(dest_width, std::max(w, std::min(w * 2, dest_width)));
+            h = std::min(dest_height, std::max(h, std::min(h * 2, dest_height)));
+        }
+        out.push_back({w, h});
+    }
+    // (a destination smaller along one axis: the last pass makes the destination's size)
+    if (!out.empty()) out.back() = {dest_width, dest_height};
+    return out;
+}
+
+float cas_sharpness_constant(float sharpness) {
+    const float s = std::clamp(sharpness, 0.0f, 1.0f);
+    return -1.0f / (8.0f + (5.0f - 8.0f) * s);
+}
+
 bool Presenter::open(vk::Device &device, std::string &error) {
     device_ = &device;
     dev_ = device.device();
@@ -110,11 +201,11 @@ bool Presenter::open(vk::Device &device, std::string &error) {
         vkCreateFence(dev_, &fci, nullptr, &f.fence);
         vkCreateSemaphore(dev_, &sci, nullptr, &f.acquired);
     }
-    // the overlay's textures (Dear ImGui's font)
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16};
+    // the overlay's textures: Dear ImGui's font and the achievements' icons
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpi.maxSets = 16;
+    dpi.maxSets = 64;
     dpi.poolSizeCount = 1;
     dpi.pPoolSizes = &size;
     vkCreateDescriptorPool(dev_, &dpi, nullptr, &overlay_pool_);
@@ -203,6 +294,15 @@ Presenter::~Presenter() {
         device_->destroy(p.ramp);
         device_->destroy(p.copy);
     }
+    for (EffectImage &e : effect_images_) {
+        if (e.view) vkDestroyImageView(dev_, e.view, nullptr);
+        device_->destroy(e.image);
+    }
+    for (VkPipeline p : effect_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
+    vkDestroyPipelineLayout(dev_, effect_layout_, nullptr);
+    vkDestroyDescriptorSetLayout(dev_, effect_set_layout_, nullptr);
+    vkDestroyDescriptorPool(dev_, effect_pool_, nullptr);
+    vkDestroySampler(dev_, linear_, nullptr);
     vkDestroySemaphore(dev_, converted_, nullptr);
     vkDestroySemaphore(dev_, shown_, nullptr);
     vkDestroySampler(dev_, sampler_, nullptr);
@@ -255,7 +355,8 @@ bool Presenter::take(const render::FrontBuffer &front) {
         device_->destroy(p.image);
         p.image =
             device_->create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {front.width, front.height, 1}, 1, 1,
-                                  VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                                  VK_SAMPLE_COUNT_1_BIT,
+                                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
         if (!p.image.image) return skipped++, false;
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         vi.image = p.image.image;
@@ -360,7 +461,160 @@ bool Presenter::captured(render::Image &picture, uint64_t &swap) {
     return false;
 }
 
+bool Presenter::window_captured(render::Image &out) {
+    if (!window_ready_) return false;
+    window_ready_ = false;
+    out.width = window_w_, out.height = window_h_;
+    const uint8_t *bytes = static_cast<const uint8_t *>(window_copy_.mapped);
+    out.rgba.assign(bytes, bytes + size_t(out.width) * out.height * 4);
+    if (format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_B8G8R8A8_SRGB)
+        for (size_t i = 0; i + 3 < out.rgba.size(); i += 4) std::swap(out.rgba[i], out.rgba[i + 2]);
+    for (size_t i = 3; i < out.rgba.size(); i += 4) out.rgba[i] = 255;
+    return true;
+}
+
 // ---- the window's thread ----
+
+bool Presenter::make_effects() {
+    if (effects_tried_) return effects_ok_;
+    effects_tried_ = true;
+    VkDescriptorSetLayoutBinding bindings[2] = {};
+    bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sli.bindingCount = 2;
+    sli.pBindings = bindings;
+    if (vkCreateDescriptorSetLayout(dev_, &sli, nullptr, &effect_set_layout_) != VK_SUCCESS) return false;
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(EffectPush)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &effect_set_layout_;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(dev_, &pli, nullptr, &effect_layout_) != VK_SUCCESS) return false;
+    const std::pair<const uint32_t *, size_t> code[EFFECTS] = {
+        {EFFECT_EASU, sizeof(EFFECT_EASU)}, {EFFECT_RCAS, sizeof(EFFECT_RCAS)}, {EFFECT_CAS, sizeof(EFFECT_CAS)},
+        {EFFECT_FXAA, sizeof(EFFECT_FXAA)}, {EFFECT_FXAA_EXTREME, sizeof(EFFECT_FXAA_EXTREME)}};
+    for (uint32_t e = 0; e < EFFECTS; e++) {
+        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smi.codeSize = code[e].second;
+        smi.pCode = code[e].first;
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(dev_, &smi, nullptr, &module) != VK_SUCCESS) return false;
+        VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpi.stage.module = module;
+        cpi.stage.pName = "main";
+        cpi.layout = effect_layout_;
+        VkResult made = vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpi, nullptr, &effect_pipelines_[e]);
+        vkDestroyShaderModule(dev_, module, nullptr);
+        if (made != VK_SUCCESS) return false;
+    }
+    VkSamplerCreateInfo smp{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    smp.magFilter = smp.minFilter = VK_FILTER_LINEAR;
+    smp.addressModeU = smp.addressModeV = smp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(dev_, &smp, nullptr, &linear_) != VK_SUCCESS) return false;
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * EFFECT_PASSES},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * EFFECT_PASSES}};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 2 * EFFECT_PASSES;
+    dpi.poolSizeCount = 2;
+    dpi.pPoolSizes = sizes;
+    if (vkCreateDescriptorPool(dev_, &dpi, nullptr, &effect_pool_) != VK_SUCCESS) return false;
+    for (auto &sets : effect_sets_)
+        for (VkDescriptorSet &set : sets) {
+            VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            dai.descriptorPool = effect_pool_;
+            dai.descriptorSetCount = 1;
+            dai.pSetLayouts = &effect_set_layout_;
+            if (vkAllocateDescriptorSets(dev_, &dai, &set) != VK_SUCCESS) return false;
+        }
+    return effects_ok_ = true;
+}
+
+// A pass's output image, made again when its size changes (after the
+// window's queue is idle: an earlier frame may still read the old one)
+Presenter::EffectImage *Presenter::effect_image(uint32_t slot, uint32_t width, uint32_t height) {
+    EffectImage &e = effect_images_[slot];
+    if (e.image.image && e.image.extent.width == width && e.image.extent.height == height) return &e;
+    if (e.image.image) {
+        idle();
+        vkDestroyImageView(dev_, e.view, nullptr);
+        device_->destroy(e.image);
+        e = {};
+    }
+    e.image = device_->create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {width, height, 1}, 1, 1,
+                                    VK_SAMPLE_COUNT_1_BIT,
+                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (!e.image.image) return nullptr;
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = e.image.image;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(dev_, &vi, nullptr, &e.view) != VK_SUCCESS) return nullptr;
+    return &e;
+}
+
+// Xenia's presenter's chain (presenter.cc's PaintAndPresentImpl): FXAA at the
+// picture's size; then FSR 1 when upscaling (EASU in passes of at most 2x,
+// RCAS with the sharpness reduction in stops at the end) or CAS (sharpening,
+// resampling when the sizes differ; FSR asked for without an upscale takes
+// CAS too, with no additional sharpness, as Xenia's does).
+Presenter::EffectImage *Presenter::run_effects(VkCommandBuffer cmd, const View &view, VkImageView picture_view,
+                                               uint32_t width, uint32_t height, uint32_t dest_width,
+                                               uint32_t dest_height, uint32_t &out_width, uint32_t &out_height) {
+    if (!picture_view || !make_effects()) return nullptr;
+    VkImageView source = picture_view;
+    uint32_t sw = width, sh = height, slot = 0;
+    EffectImage *last = nullptr;
+    auto pass = [&](Effect effect, uint32_t w, uint32_t h, float sharpness, uint32_t scaling) {
+        if (slot >= EFFECT_PASSES) return false;
+        EffectImage *image = effect_image(slot, w, h);
+        if (!image) return false;
+        VkDescriptorSet set = effect_sets_[at_][slot++];
+        VkDescriptorImageInfo in{linear_, source, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo out{VK_NULL_HANDLE, image->view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        writes[0].dstSet = writes[1].dstSet = set;
+        writes[0].dstBinding = 0, writes[1].dstBinding = 1;
+        writes[0].descriptorCount = writes[1].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, writes[0].pImageInfo = &in;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, writes[1].pImageInfo = &out;
+        vkUpdateDescriptorSets(dev_, 2, writes, 0, nullptr);
+        // what came before (the picture's conversion, the pass before, an
+        // earlier frame reading this image) done first
+        full_barrier(cmd);
+        barrier(cmd, image->image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, effect_pipelines_[effect]);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, effect_layout_, 0, 1, &set, 0, nullptr);
+        EffectPush p{w, h, float(sw), float(sh), float(w), float(h), sharpness, scaling};
+        vkCmdPushConstants(cmd, effect_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+        vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+        source = image->view, sw = w, sh = h, last = image;
+        return true;
+    };
+    bool ok = true;
+    if (view.antialiasing) ok = pass(view.antialiasing == 2 ? FXAA_EXTREME : FXAA, sw, sh, 0.0f, 0);
+    if (ok && view.upscaler == 1) {
+        const auto steps = easu_passes(sw, sh, dest_width, dest_height);
+        if (!steps.empty()) {
+            for (auto [w, h] : steps) ok = ok && pass(EASU, w, h, 0.0f, 0);
+            ok = ok && pass(RCAS, dest_width, dest_height, std::exp2(-view.fsr_sharpness_reduction), 0);
+        } else {
+            ok = pass(CAS, dest_width, dest_height, cas_sharpness_constant(0.0f), sw != dest_width || sh != dest_height);
+        }
+    } else if (ok && view.upscaler == 2) {
+        ok = pass(CAS, dest_width, dest_height, cas_sharpness_constant(view.cas_sharpness),
+                  sw != dest_width || sh != dest_height);
+    }
+    if (!ok || !last) return nullptr;
+    full_barrier(cmd); // the last pass's writes before the blit
+    out_width = sw, out_height = sh;
+    return last;
+}
 
 void Presenter::drop_swapchain() {
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
@@ -403,7 +657,7 @@ bool Presenter::make_swapchain(const View &view) {
     ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     ci.imageExtent = extent;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     ci.presentMode = mode;
@@ -459,6 +713,7 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
     uint64_t converted = 0, shown_swap = 0;
     uint32_t width = 0, height = 0;
     VkImage picture = VK_NULL_HANDLE;
+    VkImageView picture_view = VK_NULL_HANDLE;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (latest_ >= 0) showing_ = latest_, latest_ = -1, fresh = true;
@@ -467,6 +722,7 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
             const Picture &p = pictures_[shown];
             converted = p.converted, shown_swap = p.swap;
             picture = p.image.image, width = p.image.extent.width, height = p.image.extent.height;
+            picture_view = p.storage;
         }
     }
     vkResetFences(dev_, 1, &f.fence);
@@ -478,26 +734,40 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
     vkBeginCommandBuffer(cmd, &begin);
     VkImage target = images_[index];
     barrier(cmd, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    VkClearColorValue black{{0, 0, 0, 1}};
-    VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    // the front buffer's shape kept (letterboxed or pillarboxed), in whole
+    // multiples, or stretched over the window; the bars black (the whole
+    // window cleared only where the picture leaves some of it)
+    const Rect place = picture ? fit_picture(extent_.width, extent_.height, width, height, view.fit) : Rect{};
+    const bool covered = picture && place.x == 0 && place.y == 0 && place.width == extent_.width &&
+                         place.height == extent_.height;
+    if (!covered) {
+        VkClearColorValue black{{0, 0, 0, 1}};
+        VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    }
     if (picture) {
-        // the front buffer's shape kept (letterboxed or pillarboxed), or
-        // stretched over the window
-        int32_t x0 = 0, y0 = 0, x1 = int32_t(extent_.width), y1 = int32_t(extent_.height);
-        if (!view.stretch) {
-            double scale = std::min(double(extent_.width) / width, double(extent_.height) / height);
-            int32_t w = int32_t(width * scale + 0.5), h = int32_t(height * scale + 0.5);
-            x0 = (int32_t(extent_.width) - w) / 2, y0 = (int32_t(extent_.height) - h) / 2;
-            x1 = x0 + w, y1 = y0 + h;
+        // the effects first, into an image of the rectangle's size (or the
+        // picture's, antialiased alone), then blitted
+        uint32_t from_w = width, from_h = height;
+        VkImage from = picture;
+        if (place.width && place.height && (view.upscaler || view.antialiasing)) {
+            EffectImage *out = run_effects(cmd, view, picture_view, width, height, place.width, place.height, from_w, from_h);
+            if (out) from = out->image.image;
+            // once, why the chosen effects are not on the screen
+            if (!out && !effects_failure_told_) {
+                effects_failure_told_ = true;
+                std::fprintf(stderr, "presenter: the picture effects could not run (%s)\n",
+                             effects_tried_ && !effects_ok_ ? "their pipelines could not be made" : "no picture view");
+            }
         }
         VkImageBlit blit{};
         blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
-        blit.dstOffsets[0] = {x0, y0, 0};
-        blit.dstOffsets[1] = {x1, y1, 1};
-        vkCmdBlitImage(cmd, picture, VK_IMAGE_LAYOUT_GENERAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                       view.smooth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        blit.srcOffsets[1] = {int32_t(from_w), int32_t(from_h), 1};
+        blit.dstOffsets[0] = {place.x, place.y, 0};
+        blit.dstOffsets[1] = {place.x + int32_t(place.width), place.y + int32_t(place.height), 1};
+        const bool same = from_w == place.width && from_h == place.height;
+        vkCmdBlitImage(cmd, from, VK_IMAGE_LAYOUT_GENERAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                       view.smooth && !same ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     barrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -513,7 +783,26 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
     vkCmdBeginRendering(cmd, &ri);
     if (overlay) overlay(cmd);
     vkCmdEndRendering(cmd);
-    barrier(cmd, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    // a screenshot of the window itself: the finished image copied back (the overlay on it)
+    bool grab = window_capture_.exchange(false);
+    if (grab) {
+        const VkDeviceSize need = VkDeviceSize(extent_.width) * extent_.height * 4;
+        if (window_copy_.size < need) {
+            device_->destroy(window_copy_);
+            window_copy_ = device_->create_buffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
+        }
+        grab = window_copy_.mapped != nullptr;
+    }
+    if (grab) {
+        barrier(cmd, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {extent_.width, extent_.height, 1};
+        vkCmdCopyImageToBuffer(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, window_copy_.buffer, 1, &region);
+        barrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    } else {
+        barrier(cmd, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    }
     vkEndCommandBuffer(cmd);
 
     // after the swapchain's image is free and the picture's conversion done;
@@ -560,8 +849,13 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
             return false;
         }
         r = vkQueuePresentKHR(queue(), &pi);
+        bench_present();
     }
     present_seconds += std::chrono::duration<double>(Clock::now() - t2).count();
+    if (grab) {
+        vkWaitForFences(dev_, 1, &f.fence, VK_TRUE, UINT64_MAX); // (a check's screenshot: this one present is waited for)
+        window_w_ = extent_.width, window_h_ = extent_.height, window_ready_ = true;
+    }
     if (shown >= 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         pictures_[shown].read = done;

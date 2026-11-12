@@ -89,6 +89,36 @@ void translates(const ParsedShader &shader, const std::string &name) {
             CHECK(t.ok());
             if (t.ok()) CHECK(validates(t.spirv, name + "_float24_" + std::to_string(mode)));
         }
+    // a point list's: the pixel parameters' sprite coordinates read from
+    // the point expansion (shader::PixelOptions::point_coordinates)
+    if (shader.type == ShaderType::Pixel) {
+        shader::PixelOptions options;
+        options.point_coordinates = true;
+        auto t = shader::translate(shader, shader::Stage::Pixel, {}, options);
+        CHECK(t.ok());
+        if (t.ok()) CHECK(validates(t.spirv, name + "_point_coordinates"));
+    }
+    // the early depth and stencil form (shader::PixelOptions::early_depth_stencil):
+    // valid, and where the shader takes it (EarlyFragmentTests) it has no
+    // coverage output
+    if (shader.type == ShaderType::Pixel) {
+        shader::PixelOptions options;
+        options.early_depth_stencil = true;
+        auto t = shader::translate(shader, shader::Stage::Pixel, {}, options);
+        CHECK(t.ok());
+        if (t.ok()) {
+            CHECK(validates(t.spirv, name + "_early"));
+            bool early = false, sample_mask = false;
+            for (size_t at = 5; at < t.spirv.size() && (t.spirv[at] >> 16);) {
+                const uint32_t opcode = t.spirv[at] & 0xFFFF, words = t.spirv[at] >> 16;
+                if (opcode == 16 && words >= 3 && t.spirv[at + 2] == 9) early = true; // OpExecutionMode EarlyFragmentTests
+                if (opcode == 71 && words >= 4 && t.spirv[at + 2] == 11 && t.spirv[at + 3] == 20) // BuiltIn SampleMask
+                    sample_mask = true;
+                at += words;
+            }
+            CHECK(!early || !sample_mask);
+        }
+    }
 #ifdef XF_EDRAM_FSI_LIBRARY
     // the interlock path: the output merger taken in (edram_fsi.frag's
     // library), under pixel and sample interlock, with centroids

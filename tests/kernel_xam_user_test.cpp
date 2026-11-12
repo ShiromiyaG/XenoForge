@@ -505,7 +505,14 @@ void profiles(ppc::Context &c) {
     CHECK(read_wide(account + 8) == u"User");
     CHECK(xam(c, "XamProfileLoadAccountInfo", {1, 0, account}) == X_ERROR_INVALID_PARAMETER);
     CHECK(xam(c, "XamProfileLoadAccountInfo", {1, OTHER_XUID, account}) == X_ERROR_INVALID_PARAMETER);
-    // the user has no profile package here to open
+    // the user has no profile package here to open (the package a setting written earlier made, with its
+    // GPD, is taken away: the GPDs live in it, system test)
+    {
+        char xuid[17];
+        std::snprintf(xuid, sizeof(xuid), "%016llX", (unsigned long long)DEFAULT_XUID);
+        std::error_code ec;
+        std::filesystem::remove_all(content_root(*K) / xuid, ec);
+    }
     CHECK(xam(c, "XamProfileOpen", {DEFAULT_XUID, 0, 0, 0}) == X_ERROR_INVALID_PARAMETER);
 
     // a new profile: its creation info, directory and account

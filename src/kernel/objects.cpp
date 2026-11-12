@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace xf::kernel {
 namespace {
@@ -124,7 +126,9 @@ void Mutant::set_owner(Thread *t) {
 // ---- the kernel's state ----
 
 Objects::Objects(Kernel &kernel) : k(kernel) {
-    scheduler = make_host_scheduler(*this);
+    // XF_SCHEDULER=console: the console scheduler (console_scheduler.cpp)
+    const char *which = std::getenv("XF_SCHEDULER");
+    scheduler = which && std::string(which) == "console" ? make_console_scheduler(*this) : make_host_scheduler(*this);
     // the guest's system time: the host's now, as a FILETIME (100 ns since 1601)
     auto unix_time = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -429,10 +433,10 @@ uint32_t Objects::wait(Thread &self, std::span<Dispatcher *const> objects, bool 
         self.wait_all = all, self.alertable = alertable;
         self.wait_status = X_STATUS_PENDING;
         for (uint32_t i = 0; i < objects.size(); i++) objects[i]->waiters.push_back({&self, i});
-        self.blocked = Thread::Blocked::Wait;
+        self.set_blocked(Thread::Blocked::Wait);
         k.host(self.kthread())[kthread::STATE] = kthread::WAITING;
         scheduler->block(self, l, deadline);
-        self.blocked = Thread::Blocked::No;
+        self.set_blocked(Thread::Blocked::No);
         k.host(self.kthread())[kthread::STATE] = kthread::RUNNING;
         status = self.wait_status;
         if (status == X_STATUS_PENDING) { // the deadline (or a spurious wake): look again

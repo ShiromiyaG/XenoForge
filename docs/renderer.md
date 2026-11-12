@@ -77,8 +77,9 @@ interlock" below; host render targets elsewhere, as Xenia's default).
   microcode written as a SPIR-V vertex and pixel shader, reading the program
   from a buffer (the 3DS runtime does the same with its specialized
   pipelines, Dolphin with its ubershaders). It is slow and only draws until
-  the translated pipeline is ready. It comes after the translator (step B5),
-  if hitches still show.
+  the translated pipeline is ready. Built 2026-11-10 ("The generic
+  shaders" below), with the translation moved off the renderer's thread
+  while it draws.
 
 **Vertex fetch in the shader.** Vertices are read from guest memory (one
 buffer, by device address) with the format and endianness of the fetch
@@ -936,7 +937,15 @@ playing it in Xenia.
   `--trace_gpu_frames`: frame N is what the swap after the first N shows,
   `<title id>_<N>.xtr`. `boot --trace-frames 4500,4800 --trace-dir <dir>`
   (it renders), or `XF_TRACE_FRAMES` and `XF_TRACE_DIR` for anything that
-  starts the renderer through `game::start_renderer` (the player).
+  starts the renderer through `game::start_renderer` (the player). The
+  player's F4 traces the next frame and takes a screenshot of the one on
+  screen, as Xenia's F4 (`TraceWriter::trace_next`), into the folder of
+  F12's screenshots (`XF_TRACE_DIR`'s when set), with a notice on the
+  window: a scene reached by playing, traced where it is seen, and what a
+  wrong picture is reported with. The player always has a writer standing
+  by for it; the writer tells the renderer of itself only while a frame is
+  traced, so a run with none traced reports no read and keeps what the
+  renderer keeps from draw to draw.
 - **Checked**: `gpu_trace_writer_test` (a processor's packets written and
   read back: the commands in order, the indirect buffer's packet giving way,
   memory recorded once and again where it changed, not where the GPU wrote,
@@ -992,10 +1001,37 @@ adjust), and what else differed from Xenia without being counted:
   else 2u - 1.
 - **The exponent adjust** (fetch constant word 3): the result times its
   power of two.
+- **The number format** (since 2026-11-09; Xenia's d11950528, 0c843efb3,
+  052cb95f2, c3cd8617b): after the signs and before the exponent adjust,
+  by the slot's integer scale word (system member 12,
+  `texture::integer_scale_bits`, Xenia's GetIntegerScaleBits ported as it
+  is: six bits a component, its width less one and its sign; bit 24 a
+  fixed-point format read as fractions; bit 26 the constant filtering by
+  point), each part behind a uniform branch so that a fetch runs only its
+  own (computed for every fetch and selected, the parts cost game D's frame
+  0.3 ms of draws; branched, nothing measurable). Read as fractions: the
+  unsigned components rounded to 16 fractional bits, half to even (the
+  console filters in Q16, so a byte of 128 reads 32897/65536, not 128/255,
+  and games compare samples against that constant: "Motion blur near the
+  car"); point-sampled 4-6 bit unsigned components rebuilt as the console
+  expands them, n (2^w + 1) / 2^2w; biased ones no lower than -1 (decoded
+  unclamped before). Read as integers (num_format 1): scaled back to the
+  guest's integers, times 2^w - 1 unsigned or 2^(w-1) - 1 signed and
+  biased (a 1-bit biased one times a half less a half), rounded when both
+  the fetch and the constant sample by point. Xenia's `texture_point_snap`
+  (off there and here, `XF_TEXTURE_POINT_SNAP=1`): point-sampled 2D fetches
+  with normalized coordinates sample at their texel's center where the
+  constant filters by point too, instead of adding the rounding epsilon.
+  The reference renderer's sampler does the same after filtering.
+  `XF_TEXTURE_NUMBER_FORMAT=0` leaves it all out (to measure its cost). No
+  frame of the corpus (121 traces) has an integer-format fixed-point
+  texture or a point-filtered 4-6 bit one; `texture_test` checks the word
+  against Xenia's rules by hand.
 - **Pixel parameters** (SQ_PROGRAM_CNTL's param_gen): the pixel's
   position, its facing and the kind of primitive in the interpolator
   SQ_CONTEXT_MISC names, as Xenia writes them (VPOS for screen-space
-  passes); point sprite coordinates are still 0 there.
+  passes); point sprite coordinates there since 2026-11-08 ("Resolve
+  targets, and Xenia's approximations closed").
 - **The LOD**: the fetch constant's bias (word 4) and per-axis gradient
   exponents on every fetch, computed LOD as explicit gradients from coarse
   derivatives (cube maps: the implicit LOD with a bias), as Xenia samples.
@@ -1220,8 +1256,8 @@ submission is done; draws after a swap count for no report until the next
 event, as Xenia's EndZPDFrame; a draw that finds no free query makes its
 report at least one sample. The race frame: 315 reports, 235 queries,
 validation clean, the picture unchanged. Not done: Xenia's "strict" mode
-(the guest waiting on the real count), VIZ queries, the hybrid ZFail and
-Total counts.
+(the guest waiting on the real count), the hybrid ZFail and Total counts.
+VIZ queries: "Screen extents and VIZ queries (2026-11-08)" below.
 
 **Shaders**: unnormalized cube map coordinates are translated as Xenia's
 `ProcessTextureFetchInstruction` takes them (the face's xy divided by its
@@ -1424,6 +1460,68 @@ without a pipeline state no library is made of them (a pipeline's fixed
 state, its targets' formats and the pixel shader's form all come from the
 draw).
 
+**Nothing redone** (2026-11-09). The search's result is kept beside the
+library, `<cache>/<digest>.discshaders` (the shaders' microcode, the image's
+size and time, the files and seconds it took): a later step on the same
+image reads it instead of the disc (game D: 2,921 shaders in 2,371 files,
+35 s). And a step whose inputs are those it finished with last time is
+skipped whole, translation included: `<title id>.shaderstep` keeps a key of
+this XenoForge (the program's file, by size and time: its translator makes
+the modules), the storage and the pipeline cache (each by size and time;
+runs and the step write both), the device and driver, and the disc's
+shaders, taken after the step wrote what it made. A run of the game since,
+another XenoForge, another driver or a new disc search makes the step run
+again, where the records still keep it from making what it made.
+
+**The disc's shaders no run met** (2026-11-10;
+`PrecompileOptions::extra_variants`, `xfbuild --disc-variants N`, 4 by
+default, 0 for none). A library of a shader's part depends on little of
+the pipeline's state: the pre-rasterization part on the vertex shader's
+form, the patch size and the fixed rasterization state; the fragment
+shader's on the pixel shader's form, the samples and (on the interlock
+path) the render targets' specialization. So a shader with no description
+of its own is made into the library of its part in the states the
+storage's descriptions give that part most, counted by the shaders runs
+met in each (a library each): each state's description with the shader's
+name put in place of its own, made back (`undescribe`, which translates
+the form it names), the part's library made and recorded as any other, so
+a run that meets the shader in one of those states links it at once. The
+check: of the libraries runs made of the disc's shaders they did meet
+(those weigh in the choice too), the share in the states taken. Game D (586
+shaders from runs, 1,801 descriptions; the disc's 2,921, 2,802 not met,
+1,511 of those vertex shaders awaiting a vertex declaration, so pixel
+shaders mostly; 201 distinct states):
+
+| states taken (each type) | libraries made | of the met shaders' 436 libraries, in them | the driver's time |
+| --- | --- | --- | --- |
+| 4 | 5,164 | 259 (59%) | |
+| 8 | 10,328 | 293 (67%) | 318 s more (38 s on 9 workers) |
+| 16 | 20,644 | 330 (76%) | 939 s more (108 s) |
+
+**The player's path at the step** (2026-11-11). Two gaps left the pipelines
+of runs on the host's render targets (the player's default) out of the
+step. A vertex shader's form with the screen extents (the draws inside a
+tiled pass, "Screen extents") was not made back from its description, so
+every such pipeline was counted "not made here" and compiled in the run
+that met it again after a new driver or cache: 222 of game G's 1,103
+descriptions, 599 of game D's 1,989. The report now gives the reasons
+(`not made here: N, <why>`), and none is left in either. And the generic
+shaders' libraries are a path's own (their pixel shader is the host's or
+the interlock's), while the step's renderer takes the automatic path, the
+exact EDRAM: a description of the other path (told by its attachments: the
+exact path's pipelines have none) now makes no generic library there, and
+the step runs a second renderer on that path for them (9 libraries for
+game G, 12 for game D).
+
+**The translation on the renderer's thread** (`Report::translate_seconds`,
+`translations`, `translate_max`, `translate_frame_max`; the `renderer:`
+lines of boot and the player, xfreplay's `shaders:` line). Measured cold on
+two traces: game D's 266 shaders in 486 forms 0.425 s (0.87 ms each, at
+most 2.20 ms) against 43.9 s making the pipelines; game A's race 136 in 206
+forms 0.154 s (0.75 ms, at most 1.74 ms) against 18.7 s. A hundredth of
+the pipelines' time: moving it to the workers only pays where a draw no
+longer waits for the driver.
+
 **The run** reads the records that match its device and driver, while the
 pipeline cache file's header is still theirs: a library the build step
 made is made at once on the renderer's thread (a lookup in the cache)
@@ -1461,12 +1559,285 @@ skipped are those of the 4 pipelines the cold run had not met. The second
 run without the build step already had both caches warm: its libraries
 cost the workers little, but every new pipeline's draws still went
 without one until a worker had looked its libraries up (246 skipped, 972
-ms on average, the longest 62 s, not looked into); with the build step's
+ms on average, the longest 62 s: measured until a draw next asked for
+the pipeline, so a scene shown again a minute later counted the minute; since
+2026-11-08 the wait ends when the worker made the pipeline, or a linked
+stand-in's last library); with the build step's
 record they are made on the renderer's thread in 0.06 s for the whole run.
 The swaps' long gaps (33-36 above 100 ms) are the loading screens in all
 three runs. The race frame's replay is unchanged by the descriptions'
 dynamic states set to one each (0.008 of 255, 0.014% of pixels off, whole
 and linked).
+
+**A record that outlived its code (2026-11-08).** Game D, played from the
+launcher, froze for seconds at a time: 61.9 s of a 158 s run on the
+renderer's thread making pipelines, one frame 14.2 s long, 43 swaps more
+than 100 ms apart. The build step had recorded its 387 libraries as made,
+and the run made each "at once from the cache" on the renderer's thread;
+but the translator had changed since (the resolution scale), so every
+module's SPIR-V differed from what the cache held, and each lookup was a
+full compile by the driver. A description names its modules by the guest
+shader and form, which a translator change leaves alone, and the record
+named only the description. Two changes:
+- **The record keys the code** (`built_key`): a description's or library
+  key's hash takes the hash of each of its modules' SPIR-V
+  (`module_content_`, kept as modules are made), so a run after a
+  translator or own-shader change finds nothing made, and the next build
+  step makes it again. The storage's descriptions are unchanged; records
+  of older builds simply stop matching (the vertex input and fragment
+  output libraries, which hold no shader, still do).
+- **The renderer's thread never compiles what it took for made**
+  (`from_cache`): a library or whole pipeline the record names is asked of
+  the pipeline cache alone, with
+  `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`
+  (`pipelineCreationCacheControl`, core in Vulkan 1.3, queried:
+  `vk::Device::cache_control`, `XF_VK_NO_CACHE_CONTROL=1` turns it off and
+  trusts the record as before). `VK_PIPELINE_COMPILE_REQUIRED` sends it to
+  the workers as if it had never been made, its draws meanwhile drawn by a
+  linked stand-in or skipped. The report counts them ("not in the pipeline
+  cache, left to the workers"). Any stale cache is covered this way: another
+  driver build with the same cache UUID, a cache file replaced, the
+  driver's own cache cleared. Pipelines of draws without a pixel shader
+  are still made at once whatever the cache holds, as Xenia's D3D12
+  backend makes them.
+
+## The generic shaders (2026-11-10)
+
+The rest of B5: a draw whose shader is new is no longer skipped while its
+pipeline is made. With library stand-ins a new combination of known
+shaders already drew at once; a new shader's draws waited for its library
+(the cold run above: 2,852 draws skipped). Now they are drawn by **an
+interpreter of Xenos microcode written as SPIR-V shaders** that runs any
+shader from a buffer, as Dolphin's ubershaders and the 3DS runtime's
+specialized pipelines do; the interpreter's libraries depend on the
+pipeline's state alone, not on the shader, so they are few and made once.
+
+**The program** (`shader_program.h`, `shader::encode_program`): the parse
+(`ucode_parse.h`) laid out in words, so the GPU decodes nothing the parser
+resolved: a header (the control flow's length, where the instructions
+start, flags the stages' mains need: oDepth written, oC0 written, the color
+targets written, oPts.x written, a kill), an entry per control flow
+instruction, and 64 bytes per ALU or fetch instruction (the opcodes, the
+results and operands a word each with their swizzles past the component
+count already repeated, the vertex fetch's format and constant, the texture
+fetch's opcode, dimension, filters, offsets, LOD bias). Refused: memory
+exports, scalar opcode 41, vertex formats and texture operations the
+translator does not do. The renderer writes each shader's program once
+into a 32 MB buffer (set 0, binding 8; video memory the host maps where
+there is some), never overwritten, so nothing races the GPU's reads; the
+system constants' last vec4 (`System::generic`) points the draw's two
+shaders at theirs.
+
+**The interpreter** (`src/shaders/generic.glsl`, with `generic.vert`,
+`generic.frag` and `generic.comp`): the translator's semantics written again
+instruction by instruction, not a new reading of Xenia: the legacy multiply,
+operations without contraction (`precise`), the ordered and unordered
+comparisons, the 21-bit exp, log, rcp, rsq and sqrt and their clamps,
+maxa's and the predicate's side effects seen by the scalar half, the
+vertex formats with the normalization scales the translator's CPU computes
+(as bits, so the GPU's division does not round differently), the texture
+fetch's sizes, offsets, epsilon, LOD and gradients, the stacked volumes and
+their layer filter, the signs, gamma and number format; the control flow as
+the translator's dispatch loop (four-deep loop and call stacks, the step
+limit). The stages' mains are the translator's: the vertex shader in the
+vertex host form, with screen extents (`EXTENTS`) and user clip planes
+(`CLIP`, `CULL`; six distances declared, those past the count at 1, the
+count a specialization constant); the pixel shader with the pixel
+parameters, the alpha test, alpha to coverage, the color scales, the
+minimum and maximum blends' factors (from the system constants, which are
+zeros, so nothing, where the draw takes none) and the gamma curve, or on
+the interlock path the output merger of `edram_fsi.glsl` (`edram_fsi.frag`'s
+body, moved so both take it in; its SPIR-V unchanged) with the render
+targets' state from the draw's uniform block rather than specialized, so one
+library serves every target state. Variants: oDepth written, point
+coordinates; 6 vertex and 12 pixel modules in all (4 per render target
+path). Not taken, so refused: expansion of points and rectangles in the
+vertex shader, tessellation, the float24 depth conversion. Taken
+approximately (counted): interpolators read at the centroid under MSAA are
+read at the pixel's center (an array's elements cannot be decorated apart);
+and the early depth hint, which only orders the tests (a draw gets it when
+it has neither an alpha test nor alpha to coverage, so the same pixels
+pass).
+
+**Checked.** `shader_compare_test` runs every case on the interpreter's
+compute form (`generic.comp`, the harness's layout with the program at
+binding 4) beside the translation, against the CPU interpreter: all vector
+and scalar operations on edge inputs, operands and results, predicates and
+a0, every vertex format with each endianness, the texture fetch's stand-in,
+and the corpora on random registers with three settings of the bool and
+loop constants: 245 runs (13 trace shaders), 560 (118 UE3 global shaders),
+236 (10 XNA shaders), no case off. Whole frames with every draw the generic
+shaders can draw drawn by them (`xfreplay --generic`, whole pipelines made
+at once) against the translated shaders' picture:
+
+| frame | draws by the generic shaders | against the translated picture |
+| --- | --- | --- |
+| game A, race | 810 of 810 | 0.000, 0.000% of pixels off by more than 16 |
+| game B, 1800 and 1801 | 54 (all with a pixel shader) | 0.000, 0% |
+| game C, 1200 and 2400 | 3, 1 | 0.000, 0% |
+| game D, 1500 and 3000 | 51, 55 | 0.000, 0% |
+| game E, 1200 and 2400 | 154, 154 | 0.000, 0% |
+| game F, 1200 and 2400 | 3, 3 | 0.000, 0% |
+| game G, 600 | 3 | 0.000, 0% |
+| game G, 850 | 3,323 of 3,325 (2 expand rectangles) | 0.186, 0.334%: the centroids, at geometry edges only |
+| game H, 300 and 450 | 5, 127 | 0.000, 0% |
+
+**As a stand-in** (`Options::generic_shaders`, on; `XF_GENERIC_SHADERS=0`
+turns it off; it needs pipeline libraries). A draw whose pipeline and exact
+linked stand-in are not made gets `generic_info` (the draw's state with the
+generic modules in place of the guest's, chosen by the shaders' forms) and a
+pipeline linked from the vertex input and fragment output libraries, which
+it shares with the exact pipeline, and the generic pre-rasterization and
+fragment shader libraries, made on the workers ahead of everything the
+first time a state asks (by the driver: about 2.4 s each, the interpreter
+being one large shader) and kept in the pipeline cache. The generic
+pipeline is retired as the exact stand-in or the pipeline arrives. The
+report counts the programs, the generic pipelines linked, the draws they
+drew, and the draws they could not draw by reason (`generic_refused`).
+
+**At the launcher's build step**: the generic libraries in each
+description's state are made too and recorded, so a run on a later day
+links a never-met shader's generic pipeline at once. Game D: its 1,380
+descriptions' states took 18 generic libraries (42.8 s of the driver's on
+the workers, 7.7 s of the step).
+
+## The translation off the renderer's thread (2026-11-10)
+
+Measured first (`Report::translate_seconds`, `translations`,
+`translate_max`, `translate_frame_max`): a form's translation and module
+cost 0.75-0.87 ms on the renderer's thread, at most 2.2 ms; game D's trace
+frame 486 forms in 0.425 s, game A's race 206 in 0.154 s, a hundredth of
+the pipelines' time while draws waited for the driver. Once the generic
+shaders draw at once, it is the hitch left in a cold frame. So, with async
+pipelines, the generic shaders and pipeline libraries, a shader form the
+generic shaders draw (the vertex shader's plain host form, any pixel form
+without the float24 conversion, of a shader they run) is translated on two
+translation workers (`TranslationWorkers`: they read only the shader's
+parse, fixed once loaded; the renderer's thread makes the modules from what
+they finished, at the next draw). Its draws are drawn by the generic
+pipeline meanwhile (kept by the pipeline's key in `translating_pipelines_`,
+retired when the draw next goes the usual way); the forms the generic
+shaders do not draw are translated at once as before.
+`XF_TRANSLATE_ASYNC=0` keeps the translation on the renderer's thread.
+Game A's race replayed three times with async pipelines from empty caches:
+no form translated on the renderer's thread (206 before), its time making
+pipelines 0.07 s (1.2 s), 178 draws by the generic shaders in the plays
+after the first, the last play's picture identical to the translated
+shaders'.
+
+## Game G's command thread (2026-11-10)
+
+Game G in play (its first town, `boot --render`, its library) ran at 14.7 swaps a
+second of its 30, about 8,500 draws and 65 resolves a frame. Not the GPU (20
+ms of it a frame) nor pipelines (the same with library stand-ins): the GPU
+commands thread, 88% busy, which the game waits for in a spin of its D3D's
+(the hottest guest function, 13.6% of all the CPU, polls the ring buffer's
+read pointer with `or r31,r31,r31`). The thread by function then:
+`Impl::draw` itself 22%, the driver's recording 11%, memcpy 8%, the texture
+checks (`unwritten`) 7% plus 6% in their atomic loads, `texture` 4%, the
+register writes 3%. A benchmark that changes by the code alone: the frame
+850 trace replayed 30 times, the command thread's time a play (xfreplay's
+`commands a play`, the median).
+
+| change | the replay's play | live, in play |
+| --- | --- | --- |
+| before | 22.0 ms | 14.7 swaps a second |
+| write stamps per block of 64 watch pages (memory.h's `write_block_stamps`): a texture's pages checked by blocks first | | 16.8 |
+| indices converted in one pass, eight at a time with AVX2, read where guest memory holds them (`index_convert.h`) | 20.1 ms | |
+| texture slots memoized by the constant's content, not the slot | 20.1 ms | 19.0 |
+
+Tried and left out: the float constants uploaded only up to the last a
+shader reads (the game's shaders read most of them: no change), the
+register file's constants checked a 1024-register group at a time (its
+vertex constants change at every draw: no change). Timed by section within
+the draw (rdtsc marks, the first play left out): the recording (pass,
+binds, dynamic state, the draw: the driver) about 30%, the textures 14%, the
+indices' conversion 11% and their copy into the arena 9%, the vertex data's
+request 9%, the pipeline's key and lookup 7%. Next, by size: a cache of
+converted index buffers (static geometry's indices do not change, as
+Xenia's primitive processor caches them), fewer calls into the driver (the
+descriptor sets bound again at every draw), and the recording on a thread
+of its own.
+
+**Those three, done (2026-11-11).** Measured first, in play, the whole
+process: 19.4 swaps a second, the GPU 27% busy, the command thread 71% busy
+(about 35 ms of commands a frame), no thread of the game's at a whole core.
+The rates stay between 19 and 20, a frame every three vblanks, so the frame
+misses the second vblank by little (an inference from the rates: no frame
+was timed).
+
+| change | the replay's play | live, in play |
+| --- | --- | --- |
+| before | 19.8 ms | 19.4 swaps a second |
+| the index cache (`XF_INDEX_CACHE=0` turns it off): converted indices kept by where the guest's are and how they were converted, in buffers of their own, their pages watched as a texture's; 3,183 of a play's 3,325 draws found theirs | 19.1 ms | |
+| the index buffer bound whole once (a draw's first index is where its words are) and the draws' first descriptor set alone bound where an offset moved (`XF_SET_ELISION=0`) | 18.1 ms | 19.0 (both; the machine in use) |
+| the draws' commands recorded by another thread (`XF_RECORD_THREAD=1`; off by default) | 18.2 ms | 16.4 |
+
+The index cache keeps an entry from the second swap it is drawn in (a ring
+of dynamic geometry is never watched: a watch costs the game a fault at its
+next write), converts again where its pages were written and keeps the
+entry where the words came out the same; indices written three times within
+a few swaps leave it for 300. 128 MB at most, everything dropped past that.
+
+The recording thread gains nothing: the driver's time in a draw's own
+commands is 2.4 of a play's 19 ms, but a play waits for the ring about 100
+times (a render pass's end, a query, an upload: whatever else records) and
+the command buffer's memory goes from one thread's cache to the other's at
+each. Live, with the machine in use, it lost (16.4 against 19.0 swaps a
+second). What would gain is every command of the renderer's through the
+ring, the command thread never touching the command buffer.
+
+**The frame timed, and what the other emulators do (2026-11-11, later).**
+`--rates` now prints the command thread's work a swap beside each line
+(`commands: N ms a swap (M ms in waits)`: the time in the processor's runs,
+without WAIT_REG_MEM's waits). In play: 44.3 ms of work and 6.7 of waits, 51
+together, the whole frame: the game's vblank wait is a packet of the command
+stream, so the frame is the commands' work rounded up to a vblank, and two
+vblanks need the work under about 32 ms. `xfreplay --repeat` prints the
+thread's processor time in the commands as well (the wall time waits for the
+GPU: the same build gave 38 and 148 ms a play of one frame); the in-play
+frame is `../traces/xf_<G>_play`, swap 3700, 8,245 draws.
+
+Read for how they keep a draw cheap (never copied: GPL and MPL), Cemu's
+Latte, Dolphin's video and RPCS3's RSX agree on three things: work is done
+when a register is written to another value, not at the draw (Cemu's
+continued draws after `LatteCP_processCommandBuffer_continuousDrawPass`,
+RPCS3's `state_signals`, Dolphin's `BPWritten`); only the constants a shader
+reads are uploaded, and only when they changed (Cemu's remapped uniforms,
+RPCS3's `constant_ids`); and the command buffer is recorded by one thread,
+only copies and the queue's submits going to others (RPCS3's `dma_manager`,
+Dolphin's `CommandBufferManager`), which is what the recording thread above
+found.
+
+| change | live, the commands' work a swap |
+| --- | --- |
+| before | 44.3 ms |
+| a draw's front part kept (`DrawFront`, `XF_DRAW_FRONT_MEMO=0`: the targets, viewport, scissor and the rest worked out from the draws' state, taken from the draw before when `RegisterFile::state_serial`, the shaders and the primitive are the same: 57% of the frame's draws); register runs compared a block at a time; the index cache found through a table by hash | 39.7 ms |
+| a texture's load drops what the draws kept of its own slots, not of every texture's (fifty loads a frame after the resolves sent every slot the long way: `Texture::loads`) | 39.7 ms (the textures' share 6.0 to 3.5%) |
+| vertex ranges kept as last found in the mirror (`XF_VERTEX_RANGE_MEMO=0`: unwritten since by blocks of pages); pipelines found through a table by the key's hash | (see below) |
+| uploads into the draw data through a copy the compiler cannot fold: one build read the system constants back from that write-combined memory, 10% of the thread | 38.5 ms |
+
+Tried and left out: the pipeline's key, description and lookup and the
+dynamic state's block skipped for a draw whose front part is the draw
+before's (the pipeline and what the state takes of its description kept):
+38.8 ms live against 38.5, no gain for two more things to keep in step.
+
+Still three vblanks a frame: 38.5 ms against the 32 needed. What is left by
+size, live: the driver in the draws' own commands 10.8%, the constants'
+upload 3.6% (5 KB a stage at nearly every draw: only what the shader reads,
+as Cemu and RPCS3), `request` 4.6%, register writes 4.2%, `begin_pass` 4.1%,
+`acquire` 3.6%, the textures 3.6%, `watch` 2.5% (a system call a page
+protected again), and the draw's own body, where the pipeline's key and the
+dynamic state are still worked out at every draw (to be kept as the front
+part is).
+
+Live the two that are on did not move the rate: the command thread is 68%
+busy at 19 swaps a second, 34 ms a frame, still over the 33.3 of two
+vblanks. Measured with the owner at the machine (another program at half a
+core): to be measured again alone. Next: the frame timed stage by stage live
+(the guest's render thread, the command thread, the wait for the vblank),
+then the constants' upload (5 KB a stage at nearly every draw) and the
+textures' checks.
 
 ## Texture formats (2026-11-06)
 
@@ -1797,14 +2168,10 @@ nothing else.
   from the register where the device has wide lines
   (`XF_VK_NO_WIDE_LINES=1` turns them off), clamped to its range; without
   them one pixel, as Xenia draws every line (a TODO there), counted.
-- **Screen extents and VIZ queries** stay as Xenia's defaults: every
-  EVENT_WRITE_EXT is answered with the whole screen, draws predicated on a
-  VIZ query and VIZ survey draws are drawn (counted: "draws predicated on a
-  VIZ query", "VIZ survey draws"). Xenia's `occlusion_query_viz` (off by
-  default: coarse occlusion queries feeding VIZ predicates, survey draws
-  skipped in copy mode) is not done; real extents (the pixels and depths
-  the draws between two events cover) would be a pass over the occlusion
-  queries' draw ranges, and how hi-Z interplays with them wants a console.
+- **Screen extents and VIZ queries**: measured and predicated on the GPU
+  since 2026-11-08 ("Screen extents and VIZ queries (2026-11-08)" below);
+  `XF_SCREEN_EXTENTS=whole` (xfreplay `--whole-extents`) and
+  `XF_VK_NO_CONDITIONAL_RENDERING=1` go back to Xenia's defaults.
 
 ## Exact EDRAM through fragment shader interlock (2026-11-06)
 
@@ -1955,6 +2322,1890 @@ the 32-bit one, rounded at 32 bits (xenos.h's GetSurfacePitchTiles); it was
 rounded at 64 bits, which differs for pitches whose samples are not a
 multiple of 80. No traced frame has such a pitch.
 
+## Resolve targets, and Xenia's approximations closed (2026-11-08)
+
+**Resolve targets** (beyond Xenia; `Options::no_resolve_targets`,
+`XF_RESOLVE_TARGETS=0`, `XF_VK_NO_RESOLVE_TARGETS=1`). Xenia's resolves
+write memory, and every texture over what they wrote is loaded again from
+it at its next use; in game A's race those loads were about 14% of the
+GPU's frame. Here a resolve also writes the texture a later draw reads over
+its destination, and that texture is not loaded again. A texture is made a
+resolve target when it is loaded from memory the GPU wrote and is one tiled
+2D level of 32- or 64-bit texels whose image holds the guest's bits as they
+are (a plain copy load, no 16-bit fallback): its image is then storable
+through an `R32_UINT` or `R32G32_UINT` view (mutable, extended usage), in
+one of 64 places per size of the resolves' set 1 (partially bound, updated
+after binding). A resolve feeds up to two of them (the push constants'
+room) that are current (not stale), with the destination's base (the
+`RB_COPY_DEST_BASE` address less the x offset Direct3D carries in it), pitch,
+texel size and endianness, whatever their format: a 16_16_FLOAT target read
+back as 16_16_EXPAND is the same bits. `resolve.comp` stores each pixel's
+words before the destination's byte swap at texel `texel_x0 + dest_x + x`
+(`resolve::Info::texture_base`, `texel_x0`, `texel_y0`), bounds checked;
+the rest of the texture is memory the resolve left as it was. Textures over
+the same memory with another pitch or texel size, depth (24_8, not a
+copy), and a third alias are loaded again as before. Needs
+`descriptorBindingStorageImageUpdateAfterBind` and storage image array
+indexing (the RTX 5060 has both); without them the resolves write memory
+alone.
+
+Game A's race trace (`xfreplay --gpu-time --repeat 10`, the fastest play
+of each run; three runs each way, interleaved, the machine otherwise idle
+but for another agent's boot): 4.620 ms of GPU a play without (4.540-4.644),
+4.198 with (4.198-4.200), -9% (the trace's front buffer read-back, 0.50 ms,
+is the trace's own); its texture loads after resolves from 13 (0.62-0.64 ms)
+to 5 (0.23 ms) a play, the resolves' own cost 0.273 to 0.292 ms; the
+picture unchanged (0.008 off Xenia's Vulkan FSI picture), validation
+clean. Xenia's "base and mips loaded apart" was measured first: every
+texture the race loads after a resolve is one level, so it would gain
+nothing there and is left.
+
+**Resolve targets beyond the table, and depth (2026-11-09).** In game D's
+played drive the texture loads on the GPU were 14.5% of its time
+(`XF_GPU_TIME=1`, 200 s): 128,000 loads after resolves against 1,400 new
+ones. Counted by reason (`texture loads after a resolve: ...` in the
+report's "uses"; `XF_RESOLVE_TARGET_DETAIL=1` adds each reloaded target's
+base and pitch and the resolve that made it stale, and each refused
+target's format, size and pitch beside the resolve's):
+- *The table was full.* The game keeps dozens of render-to-texture
+  surfaces, many over the same memory (a downsampling chain from 320x192
+  to 2x2, 64x64 probes, 32x32 and 1280x720 surfaces), and the 64 places a
+  texel size were all taken: the surfaces made last were never targets,
+  loaded again after every resolve. The table now holds 127 (all that a
+  place's 7 bits in the push constants name), and a full one gives the
+  place of the least recently used target no recorded or pending work
+  uses (`take_target`; that texture is a plain one from then on). The run
+  needed none taken back.
+- *Made before a resolve wrote there.* A texture first loaded from the
+  CPU's memory is no target (its image has no storage view) and its later
+  loads kept that image; one now over what a resolve wrote is made again
+  as a target while the table has a place.
+- *Depth.* Resolves of depth fed nothing, and depth textures (24_8,
+  24_8_FLOAT) are converted as they load. Depth resolves copy the guest's
+  depth words as they are, so they now feed targets as color ones do: a
+  texture reading the bits takes them, and a depth texture is a target too,
+  taking the float its load makes from them (XeUNorm24To32 or
+  XeFloat20e4To32 of the high 24 bits, `resolve.comp`'s write_targets, the
+  kind in `flags` bits 24-27; never at the resolution scale, whose images
+  hold guest bits). `XF_RESOLVE_TARGETS_DEPTH=0` turns this part off
+  alone, to tell it apart when a picture differs.
+Game D's drive after the three: 13,800 loads after resolves (324,000
+resolves wrote the texture they feed), the loads 5.6 -> 1.5 s of the run's
+GPU time (14.5% -> 4.6%). Its two recorded frames replay identically with
+resolve targets on and off (0.000 of 255); replay_test 29/29 on both paths
+and at 200%. Left: mipmapped and stacked textures, aliases over memory
+another surface wrote since (needed), 24_8 1024x1024 half fed.
+
+**Vertex data and the CPU's decodes.** Two costs of the renderer's thread:
+- *Every texture loaded on the GPU* (`XF_TEXTURE_LOADS=cpu` for the CPU's
+  decode of memory the GPU did not write, as before): guest memory's pages
+  go into the mirror as for a vertex stream, and `texture_load.comp` makes
+  the texture, as it already did over a resolve's memory and for the DXT
+  fallbacks (the same loads, byte for byte: `texture_gpu_test`). The race
+  trace's first play (282 new textures; three runs each way, interleaved):
+  the renderer's thread 0.866 s (0.771-0.868) with the CPU's decodes, 0.760 s
+  (0.740-0.785) without, its 0.061 s of decoding gone; the GPU's first play
+  32.3 ms (31.3-32.6) against 36.2 ms (35.2-36.7), the raw pages uploaded and
+  converted on the GPU rather than the decoded texels uploaded. The GPU being
+  idle most of a frame and the renderer's thread the one hitches come from,
+  the GPU's way is the default.
+- *A vertex stream's pages checked once* (`Impl::RequestMemo`): a draw
+  requests its streams' pages from the mirror, which looked at every page of
+  them (an atomic load each) at every draw, and built the list of their CPU
+  parts for a trace writer whether or not one was there. Now the ranges last
+  found current are remembered with the write count and a mirror epoch: while
+  nothing was written since, a draw with the same streams checks no page.
+
+Game A live (`boot_<A> --render --rates --seconds 480`, the press script to
+the race above, `XF_GPU_TIME=1`; one run each, so these are rough: other
+agents' builds and a boot shared the machine): without resolve targets, the
+GPU decodes and the memo, then with all three:
+
+| | before | after |
+| --- | --- | --- |
+| swaps, draws | 14,342, 8.19 M | 14,180, 8.10 M |
+| GPU time | 68.97 s (4.81 ms a swap) | 66.07 s (4.66 ms a swap) |
+| of it texture loads / CPU decodes' uploads / mirror uploads | 6.78 / 1.22 / 1.11 s | 2.85 / 0 / 1.88 s |
+| texture loads after resolves | 165,693 (424 a second in the race) | 53,080 (150-165 a second) |
+| the renderer's thread | 97.8 s: 5.2 vertex data, 2.1 decoding, 3.7 resolves | 74.7 s: 3.2, 0, 2.9 |
+
+**Xenia's approximations, closed or explained** (the "Approximated" list):
+- **Polygon modes** (`PA_SU_SC_MODE_CNTL` poly_mode, front and back types):
+  as Xenia's Vulkan pipeline cache, one mode for both faces, the lowest type
+  of the faces not culled; points and lines through `fillModeNonSolid`
+  (optional, `XF_VK_NO_FILL_MODES=1`; without it filled and counted). The
+  mode is in the pipeline key.
+- **Point sprite coordinates** in the pixel parameters: the point
+  expansion (point_list.geom, or the vertex shader's) writes the corner's
+  coordinates at location 17 and a point list's pixel shader
+  (`PixelOptions::point_coordinates`, Xenia's `param_gen_point`) puts them,
+  clamped to 0-1, in the parameters' z and w. The hardware's order and
+  sampling point stay a hardware question (Xenia's TODO C19).
+- **YCbCr border colors**: (Cr, Y, Cb) and (Y, Cr, Cb) black, through
+  `VK_EXT_custom_border_color` without a format, as Xenia's Vulkan cache
+  (`XF_VK_NO_CUSTOM_BORDER=1`: black, counted); `force_bc_w_to_max` (dword
+  5 bit 2) gives the border an alpha of 1, as Xenia's both caches.
+- **Samplers past the bindless table**: a full table (1,024) destroys the
+  sampler least recently used by a finished submission and takes its place,
+  as Xenia keeps its samplers within the device's limit; only with all in
+  use by running work is the stand-in taken, counted.
+- **An ALU operand from a fetch constant**: not something the microcode
+  can say. An ALU operand is a register or a float constant by its source
+  select bit, all the parser makes of it (as Xenia's); the translator's
+  check stays as an internal one.
+- **Vertex fetches from a texture fetch constant**: drawn with the
+  constant's bits read as a vertex constant, as Xenia (its
+  `gpu_allow_invalid_fetch_constants`, on by default); what the fetch unit
+  does with the type bits only hardware can say. Counted.
+
+**The disc's shaders the build step rejected** (29 of game A's 88): all are
+vertex shaders as Direct3D keeps them in a shader container, before binding:
+their full vertex fetches have no format (0) and no stride, because Direct3D
+writes each fetch's format, stride and offset into the microcode from the
+vertex declaration when it binds the shader (the container lists the
+fetches by usage; XenosRecomp maps them to host vertex inputs for the same
+reason). The copy a draw runs is that patched one, under another hash,
+which the runs record. `ucode::awaits_vertex_declaration` tells them; the
+build step counts them apart ("vertex shaders awaiting a vertex
+declaration") and translates the 59 pixel shaders, all of which translate.
+
+## The standing benchmark against Xenia (2026-11-08)
+
+The bar is Xenia, beaten on the same scene: frame time and GPU time a frame,
+ours against xenia_canary's Direct3D 12 backend, live, on scenes both reach
+without input (title screens, attract loops, the first seconds). Direct3D 12
+is Xenia's best renderer, so it is the bar (the owner, 2026-11-08); its
+Vulkan backend stays only where it is a trace's accuracy reference.
+
+**The method** (`tools/bench/`, Windows only, as Xenia is). PresentMon and
+any ETW tracing need an administrator or the Performance Log Users group,
+which the machine's account is not; GPU timestamps are not something Xenia
+gives. So both programs are timed from outside by the same code:
+- `xfbench [--seconds N] [--warmup S] [--step S] [--timeline] [--vk | --dxgi]
+  -- <program> [args]` starts the program (in a job object, killed at the
+  end) and times the window from `--warmup` to `--seconds`.
+- **Frames**: `xfbench_hook.dll` records the time of every present.
+  `--vk` loads it as a Vulkan layer (`VK_LAYER_XF_bench`, its manifest
+  beside it, through `VK_ADD_LAYER_PATH`) wrapping `vkQueuePresentKHR`;
+  `--dxgi` injects it into a Direct3D 12 program before its main thread runs
+  (a remote `LoadLibraryW`, then its `xfbench_hook_dxgi`), which patches the
+  DXGI factory class's `CreateSwapChainForHwnd` so that every swap chain's
+  `Present` and `Present1` are wrapped. Both programs present once a new
+  frame (ours: the player's window shows only fresh pictures, Xenia's
+  presenter paints on a guest output refresh), so presents are frames.
+- **GPU time**: the process's running time on each engine as Windows'
+  scheduler counts it, the "GPU Engine(pid_*)\Running Time" performance
+  counter (100 ns units; checked against a replay's own utilization), the
+  same accounting for our Vulkan and Xenia's Direct3D 12. Reported as ms a frame and a
+  second, the 3D and compute engines summed, copy apart. It includes all the
+  process's GPU work: the presenter's, the transfers, the idle gaps the
+  driver bills.
+- **CPU time**: the process's user and kernel time a second.
+- `--timeline` prints each `--step`'s frames a second and GPU time a frame,
+  to find a run's phases and pick a window both programs spend in the same
+  scene.
+- `--gaps` lists every gap between presents over 100 ms with when it
+  ended (on stderr); the summary line counts them (`gaps_over_100ms`) and
+  gives the longest. A gap is a stall of the guest's swaps in both
+  programs: neither presents without a new frame (the player's window
+  until 2026-11-08 did, every 100 ms; "Game D's gaps" below).
+
+`tools/bench/bench_vs_xenia.ps1 -Disc <iso> -Ours <player> -Xenia <exe>
+-Seconds S -Warmup W -Runs 3 -Configs ours,xenia-d3d12 [-Timeline]` runs the
+configurations in turn (A B A B ...), appends one line a run and prints the
+median and the spread of each. `ours-host` forces our host render targets;
+`xenia-d3d12-rov` is Xenia's exact EDRAM path (its default is host render
+targets). Xenia's defaults
+otherwise (vsync on, no resolution scale, its shader storage warm). The load
+is read before each set (`Get-Process clang*,ninja*,...`); another agent's
+builds or games on the machine are named with the numbers.
+
+**Results** (RTX 5060, Ryzen 5 5600G; median of 3 runs, spread in
+brackets; GPU ms a frame by the counter):
+
+| scene (window) | ours (interlock, the default) | ours, host targets | Xenia D3D12 (host targets, its default) |
+| --- | --- | --- | --- |
+| Game B, 3D title scene (90-130 s, 60 fps cap) | 1.39 (1.38-1.39) | 1.53 (1.52-1.56) | 0.83 (0.83-0.85) |
+| the same, after "Direct ownership transfers" below | 1.29 (1.28-1.32) | 1.21 (1.19-2.61) | 0.78 (0.75-0.80) |
+| Game A, attract loop (120-160 s, 30 fps cap) | 4.90 (2.16-5.04) | not run | 5.64 (1.99-6.17) |
+
+Game B: Xenia's exact path (ROV) 1.26, one run, against our 1.39 on ours.
+Every configuration holds the cap (frame time medians 16.6-17.0 ms); CPU
+1.33 (1.33-1.49) s a second ours, 1.24 (1.20-1.29) Xenia's. Load: an xfbuild
+of another disc (2 jobs, below-normal priority) during the first runs, an
+idle machine otherwise. Before the resolve fix below, one run: 1.46.
+
+Game A: its attract loop alternates a 3D scene and lighter ones, at times
+that differ run to run, so the window is not always the same scene (the
+low ends of both spreads are runs that were in the lighter one). Where the
+timelines show both in the 3D scene (one run each with `--timeline`,
+120-180 s): ours 4.80 ms a frame, Xenia's 5.94 (19% less); 30 fps both,
+frame time median 33.3 ms both, CPU 1.33 against 1.30 s a second. A
+standing scene for game A needs input (the race) or a fixed point of the
+loop; until then its numbers are rough.
+
+Not measured: game H (its library was rebuilt for the interface of the
+time, stale after the merge that changed it); game G (no library). Game D
+below.
+
+**Game D's gaps, its first frame and its yields (2026-11-08).** An earlier
+set on game D's intro (window 10-50 s, the generic player with the cache)
+had ours at 33-179 gaps over 100 ms, all of 101-102 ms, against Xenia's
+3-6, and our first present at 1.37-10.5 s. What that was:
+- **The 102 ms were the player's, not a wait.** The window presented its
+  last picture again whenever 100 ms passed without a new one, so a guest
+  that stopped swapping for a second showed as ten 101-102 ms gaps, where
+  Xenia (whose presenter paints on a guest output refresh or a paint
+  request) shows one long one. No wait times out at 100 ms: every kernel
+  call over 15 ms was logged through such stalls, and none ended near
+  100 ms. The window now presents only something new (runtime.md, "The
+  window"), so `xfbench` counts the same thing in both programs.
+- **The long stalls of that set were the pipeline record** ("A record that
+  outlived its code" above: swaps up to 7.6 s apart in those runs' logs),
+  fixed since. What is left are the game's own loads where a movie starts
+  or stops: the main thread waits on a semaphore while its workers load and
+  the movie's threads are made; 6-9 stalls of 85-230 ms in 100 s, as Xenia
+  has 4-5 of 100-266 ms at the same points. They do not grow with load
+  (8 or 12 busy host threads beside it: 5-8 stalls, the same lengths).
+- **The first frame** was not reproduced: 1.26-2.80 s to the first present
+  in 21 runs, 1.26-1.54 in the last 12 (the first picture of the game
+  about 0.2 s later), Xenia 1.28-1.78 s with its first game picture
+  0.8-1.9 s after that. The
+  start, on this machine: SDL 0.28 s, the disc and executable 0.3 s, the
+  library 4-75 ms (a new copy of it included), the device 0.15 s, the
+  renderer 0.28-0.31 s (most of it the 99 MB pipeline cache), the first
+  swap 0.5 s after the launch. The 10.5 s run was the first after the
+  build step had rewritten the library's cache, while the pipeline record
+  was being fixed; what took the time then is not known.
+- **The yields.** The owner's play log has 193 M `NtYieldExecution` in
+  70 s. On the title screen two of the game's threads spin: one sets an
+  event in a loop with no wait, about 145,000 times a second; the other
+  asks XMP for its playback controller, polls an event with no wait and
+  yields as often. The console runs the same loops; Xenia makes the same
+  calls (its `MaybeYield` is a `Sleep(0)`; ours is `SwitchToThread`
+  through `std::this_thread::yield`). Ours as `Sleep(0)`, 3 runs each
+  interleaved on the 3D title (45-85 s): CPU 2.59 (2.58-2.61) against
+  2.61 (2.61-2.63) s a second, 30 fps both. Nothing to gain while the
+  guest spins; CPU could only be saved by changing how it spins.
+
+Game D against Xenia D3D12 (window 10-50 s: the 60 fps intro, then the 3D
+title at 30 from about 35 s; 3 runs each, the old player, the new and
+Xenia in turn; nothing else running but an idle clangd):
+
+| | ours, before | ours, now | Xenia D3D12 |
+| --- | --- | --- | --- |
+| presents a second | 47.65 (47.61-47.67) | 47.59 (47.54-47.64) | 48.47 (48.25-49.41) |
+| gaps over 100 ms (longest) | 3 (3-4), 101-102 ms | 4 (3-4), 228 (211-237) ms | 3, 771 (762-1854) ms |
+| first present | 1.30 (1.26-1.34) s | 1.26 (1.26-1.28) s | 1.55 (1.28-1.56) s |
+| GPU ms a frame | 1.58 (1.58-1.61) | 1.59 (1.56-1.60) | 2.90 (2.39-3.32) |
+| CPU s a second | 1.85 (1.84-1.86) | 1.87 (1.85-1.88) | 1.75 (1.73-1.76) |
+
+The frame rates differ by where the window cuts the change to 30 fps,
+which Xenia reaches about a second later; frame time medians 17.0 both.
+Our longest gap is the one before the first picture of the game; Xenia's
+the same, three to eight times as long. We use 45% less GPU time a frame
+and 6% more CPU. Game B, the same check (the old player and the new, its
+3D title, 90-130 s): the old one's 3 gaps were its heartbeat before the
+first frame; the new one has one, 489 ms, the same wait.
+
+Where we lose and why, for game B:
+- Our default is the exact EDRAM (interlock), Xenia's is host render
+  targets. Exact against exact we lose by 10% (ROV 1.26); the interlock's
+  draws cost about twice the host's (the scene's
+  32 2x-MSAA draws: 0.55 against 0.25 ms in the 3600 trace's replay), the
+  price of exactness.
+- Our host path lost to Xenia's host path because its ownership transfers
+  went through the EDRAM buffer, a store by the holder and a load by the new
+  target (0.50 ms of the replay's frame, eight passes), where Xenia's
+  render target cache draws the holder's image straight into the new target
+  (one pass, no EDRAM buffer). Ported, with the rest of "Direct ownership
+  transfers, and the frame's fixed costs" below; the second row of the
+  table is after it (3 runs each, A B A B; Xenia's ROV then 1.23
+  (1.22-1.33); the host path's 2.61 is a run during which another agent's
+  player of the same disc ran beside it, as it did for one Xenia ROV run;
+  an earlier set, two runs: ours 1.31-1.32, host 1.25, Xenia 0.82, ROV
+  1.24). We still lose: the interlock path by 5% to Xenia's ROV, the host
+  path by about half to Xenia's host path. The replay of the 3600 trace
+  puts the host path's frame at 0.81 ms without the trace's read-back
+  (scene draws 0.27, the final composite 0.12, resolves 0.13, transfers
+  0.20, resolves' EDRAM stores 0.08); where Xenia spends less is not known
+  without a GPU profile of Xenia (Nsight Systems times D3D12 command lists
+  as a whole; Xenia submits a frame as one).
+- Fixed here: a texture the game renders to every frame was loaded again
+  every frame (0.15 ms of the live frame): a second, smaller surface is
+  placed inside the first one's memory, 384 rows down, and its resolve made
+  the first texture stale. A resolve now feeds a target texture whose memory
+  holds the destination a whole number of 32-row macro tile rows in (the
+  texel rows offset by as many), and a stale target the resolve covers
+  whole is current again. Game B's 3600 trace: 29 loads after resolves a
+  run to 0, 87 resolves writing the texture they feed instead of 58, GPU
+  1.483 to 1.426 ms a play, the picture unchanged (0.000 off Xenia's ROV).
+
+**Screen extents: what the guest does with them** (game G's 850 trace,
+read packet by packet). Direct3D's predicated tiling draws the scene twice,
+once a tile (`SET_BIN_SELECT` 0x80000003, then 0xC). In the first pass every
+draw is followed by an `EVENT_WRITE_EXT` (`SCREEN_EXT_RPT`, 26) and an
+`EVENT_WRITE` (the next `SCREEN_EXT_INIT`), both predicated on bin 31, so
+they run in the first pass alone: 1,219 extent reports into an array of
+16-byte records. The pass ends with an `INTERRUPT` and `WAIT_REG_MEM`s (also
+bin 31): the CPU reads the extents and patches the `SET_BIN_MASK_LO`
+payload in front of each draw in the command buffer, which the second pass
+then runs. With Xenia's whole-screen answer every mask is 0x8000000F (all
+four bins), so every draw runs in both passes; with real extents a draw
+inside the top tile would get 0x80000003 and be skipped in the second.
+So exact extents change no picture (the CPU only narrows the bins a draw
+runs in), only how many draws the second pass makes: up to half of game G's
+3D draws. What it would take: the extent of each draw between an INIT and
+a RPT (its clipped primitives' bounding box, in 8-pixel units as Xenia's
+`>> 3` reads them), in guest memory before the CPU reads it after the
+interrupt: the vertex shader's positions bounded on the GPU (an atomic min
+and max a report, as a pipeline variant) and the interrupt held until that
+submission is done, or the positions bounded on the CPU (the shader
+interpreter Xenia's draw extent estimator uses, too slow for 1,219 draws of
+hundreds of vertices). The rounding of the 8-pixel units and the z range
+(Xenia writes 0 and 1) are hardware questions; a bounding box rounded
+outwards is safe, since a wider extent only keeps a draw in more bins.
+Done 2026-11-08 on the GPU (next section).
+
+## Screen extents and VIZ queries (2026-11-08)
+
+**Screen extents** (`gpu::ScreenExtents::Measured`, the replays' default and
+`XF_SCREEN_EXTENTS=measured` live; live play answers Xenia's whole screen
+since 2026-11-09, "Screen extents live" below; `xfreplay --whole-extents`).
+Beyond Xenia, which answers every `EVENT_WRITE_EXT` with the
+whole 8192-pixel square. The processor still writes that at once; the draws
+between a `SCREEN_EXT_INIT` and its `SCREEN_EXT_RPT` run a vertex shader
+variant (`VertexOptions::extents`) whose every final host position takes the
+report's rectangle out to it: xy over w, clamped to the viewport's NDC
+square, through the viewport (system constants 10 and 11) to console pixels,
+floor and ceiling, into four atomic maxima a report in a device-local buffer
+(set 0, binding 7; in host-visible memory the atomics cost game G's frame
+ten times its GPU time). A position with w not above 0 or not a number takes
+the whole viewport (its primitive's clipped part can reach any edge). The
+buffer is copied back as the submission ends; the processor writes the
+bounds (8-pixel units, outwards, plus a pixel and half a wide line's width)
+where no later report has written since, and before the next `INTERRUPT` or
+unmatched `WAIT_REG_MEM` it waits for the GPU (`Sink::extent_wait`): the
+CPU reads them in its interrupt. A report is the whole screen when a draw in
+it was not bounded (skipped, written nothing, points or rectangles a
+geometry shader expands, a submission begun inside it). Not clipped by the
+scissor: game G's first pass runs with tile 0's window scissor (rows
+0-511) while its extents must cover the whole screen. Extents are in the
+render target's pixels (the window offset applied); with game G's first pass
+at offset 0 the two agree; which one the console reports, the rounding and
+the z range (0-1, as Xenia) are hardware questions.
+
+Game G's frames 850/950: 1,219/1,220 reports a frame, 1,212/1,213 bounded;
+of those 1,022 lie in tile 0 alone, 110 in tile 1 alone, 80 in both. The
+CPU's patch of `SET_BIN_MASK_LO` cannot run in a replay, so it was
+simulated by a throwaway change (a second-pass draw skipped where its
+first-pass report misses the second tile's scissor rows): 650 of the 1,438
+predicated second-pass draws skipped, the picture unchanged (0.112/0.118
+of 255 off Xenia's ROV picture, as before). Game B's menus: 16 reports a
+frame, nearly all full-screen quads. What the waits at the interrupts cost
+live is to be measured (game G's library is not built for this interface).
+
+**Screen extents live (2026-11-09).** Game D's played drive (about 120
+reports and several interrupts and waits a frame) measured what the waits
+cost: the command thread stopped for the GPU 2,200-2,800 times in a 200 s
+run (2 with Xenia's answer), so the CPU's and the GPU's work a frame added
+up instead of overlapping, and the drive held 20 frames a second from
+about 140 s on (21.2-22.0 over the 125-200 s window, 2 runs) against 25.2-25.5
+with the whole screen. After the command thread's own costs came down
+("The command thread's costs" below), 2 runs each: measured 29.67-29.73
+fps, p99 49 ms, 12.0-12.2 ms of GPU a frame; whole 29.75-29.86 fps, p99
+36-38 ms, 11.6-11.7 ms. The bins the measurement saves did not pay for the
+waits, so live play answers the whole screen, as Xenia; measuring stays a
+choice (`XF_SCREEN_EXTENTS=measured`) and the replays' default (no live
+CPU waits for them).
+
+**Screen extents by their gain (2026-11-11).** Game G in play draws its
+scene twice a frame, a tile each, about 8,500 draws, and its command thread
+was the frame's limit at 20 frames a second (38.5 ms of work a swap, "Game
+G's command thread"). Measured there, the extents let the guest leave a
+third of the draws out of the second tile: 5,600 draws a frame, 30.7 ms of
+commands a swap, 28.5 frames a second, the waits for the GPU at its one
+interrupt a frame costing far less than the draws they spare. So live play
+now chooses (`CommandProcessor::set_screen_extents_by_gain`, the default of
+boot and the player; `XF_SCREEN_EXTENTS=measured` or `=whole` for one of
+them always): measured for 120 swaps, kept while the bins skip at least a
+seventh of the draw packets, else the whole screen for 600 swaps and tried
+again. The picture is the same either way.
+
+What measuring itself cost was then cut (game G in play, the default
+choice):
+
+| change | commands a swap | frames a second | CPU a swap, all threads |
+| --- | --- | --- | --- |
+| measured by its gain | 31.3 ms | 28.2 | 151 ms |
+| a report's record written once where the sink measures it, without waking what polls the write-backs (1,200 wakes a frame: once for all of them as the bounds come in), the reports waiting in a list, not two maps; the kept dynamic state written again only where a draw changed it | 31.1 ms | 28.3 | 136 ms |
+| the draws recorded so far submitted between two reports once there are 512 of them (`XF_EXTENT_FLUSH_DRAWS`, 0 for none): the GPU draws the pass while it is recorded, where the processor waited for all of it at the interrupt | 29.9 ms | 28.8 | 138 ms |
+| the sink told of the records' bytes a run of neighbours at a time | 29.3 ms | 29.2 | 134 ms |
+
+| a stage's float constants uploaded by the blocks of 8 its shader reads (`Shader::float_blocks`, from the microcode's ALU operands; all of them when one is read relative to a0 or aL, and for the generic shaders; `XF_CONSTANT_BLOCKS=0`): the game's shaders read a few low constants and c254, c255, so "up to the last one read" spared nothing; with the game's library rebuilt for the vector unit's whole-vector arithmetic (docs/recompiler.md) | 27.4 ms | 29.5 | 115 ms |
+
+A frame is still missed now and then (27 to 31 swaps in a second, 80 of 87
+at 29 or 30): the work a swap is 27 ms of the 33. `XF_SLOW_FRAMES=<ms>`
+prints each frame longer than that from swap to swap with what the
+processor did in it (`,all`: every frame): its waits, the sink's waits for
+the GPU, its draws, resolves, extent reports, texture loads, submissions
+and pipelines. In play, 2,600 frames: the 232 that took three vblanks are
+the others' twins (5,634 draws against 5,630, 67 resolves against 66, 64
+texture loads against 63, 9 submissions, no pipeline, 0.4 ms of waits for
+the GPU in both); their work was 36.0 ms where the others' was 29.1. No
+event makes them: the work a frame runs from 26.6 ms (a tenth of the frames
+below) to 33.0 (a tenth above) and 38.5 (one in a hundred), around a
+vblank's 33.3. Holding the rate takes the mean down to about 24 ms, not
+the peaks. What the uploads into the
+draw data still cost, by the profile: the system constants 3.6% of the
+command thread (784 bytes at nearly every draw: a screen extent report's
+word and the textures' slots change them), the constants' fetch and boolean
+part 1.4%, the float blocks 1.3%.
+
+## The command thread's costs (2026-11-09)
+
+The thread that runs the command processor and the renderer ("GPU
+commands") was the frame's limit in game D's drive: 84% of a core at 21
+frames a second while the GPU stood idle three quarters of the time.
+Sampled alone with its stacks (`boot --profile N --profile-thread "GPU
+commands"`: tools/sampler.cpp walks the sampled thread's stack by x64
+unwind data and lists each function's inclusive share; the thread report
+now gives each guest thread's host CPU time and host thread id, and host
+threads are named after their guest thread), its time went to:
+- **a trace's bookkeeping with no trace recorded** (13%): each draw's
+  textures found in the cache built `cpu_parts` (a list of ranges less the
+  GPU's pages, every page walked) for `traced()`, which drops it unless a
+  trace is open. Now built only while one is.
+- **shaders copied and hashed at every load** (15%: `im_load`, `shader`,
+  `load_shader`). The game loads its shaders with an `IM_LOAD` before each
+  draw (8.3 million in 200 s); the processor copied and byte-swapped the
+  words and the renderer hashed them all and looked the hash up, as Xenia
+  does. Now the renderer keeps each load's hash by type, size and address
+  (`Sink::shader_again`): while the words' pages are unwritten (memory.h's
+  watches: watched and the write count taken before the copy, a later
+  write stamps the page higher), the load takes the kept shader and the
+  processor copies nothing. 5,084,672 of the run's loads took a kept one.
+  Never while a trace is recorded.
+- **each packet's words copied for a sink that drops them** (5%):
+  `Sink::wants_packets()` (asked once as the sink is set; the trace writer
+  wants them, the renderer not).
+- **the draw's own lists made and freed at each draw** (~10% in the heap):
+  the indices, the pipeline key, the streams' ranges and two `std::set`s of
+  slots. The lists are kept between draws (`draw_lists_`, cleared where a
+  draw starts filling each, swapped rather than moved), the sets are bit
+  masks; usage counted by a literal's address, not by a string made and
+  looked up at each draw (`use` and `approximate` with a `const char *`,
+  folded into the report's maps as it is taken).
+- **the guest's indices converted one by one** (a fifth of `draw`): a
+  `push_back` and every choice (index size, endianness, reset index,
+  offset and clamps) per index. Now a loop over the whole list per step,
+  the choices made outside it, 32-bit indices read straight into the list.
+  Xenia reads indices on the GPU from its shared memory (primitive
+  processor); doing so here is the next step for this thread.
+
+Result in the same played window (2 runs each, alone on the machine, the
+screen extents as Xenia): 25.2-25.5 -> 29.75-29.86 frames a second (Xenia
+D3D12: 29.92-29.98), median frame 34.0 -> 33.4 ms, CPU 3.1-3.3 -> 2.9 s/s
+(Xenia 2.0). The swaps a second of the slowest span in `boot` (140-170 s):
+24.5 -> 29.3. Pictures: replay_test 29/29 on both paths. Left on the thread
+(inclusive): the driver's recording (~11%), register writes (`type0`,
+14%), texture checks (9%), per-draw state compares.
+
+**The host path's tiles, walked once (2026-11-09, later).** The played
+drive's 27-28 frames a second were the host render target path's alone
+(`ours-host`, the benchmark's configuration against Xenia's host path):
+the same window on the default path (exact EDRAM) ran at 29.8, frame p95
+35 ms against 50. On the host path each draw walked every EDRAM tile of
+each of its targets twice, to see that the target still held them
+(`acquire`) and to drop their clears' values (`tiles_drawn`): 720 tiles a
+1280x720 target, a hundred thousand draws a second, a fifth of the
+command thread (`boot --profile --profile-thread "GPU commands"` with
+`XF_RENDER_TARGET_PATH=host`), so a frame in five missed its vblank. Each
+target now remembers what the last walk found (the tiles it held as of the
+last change of hands, the rows without a clear's value as of the last
+tile cleared: `owners_epoch_`, `cleared_epoch_`) and a draw with nothing
+new walks nothing. The pictures are the same (`replay_test`, both paths).
+The drive, one run each: host path 27.24-27.83 -> 29.83 frames a second,
+p95 50.3 -> 35.0 ms, GPU 8.08 ms a frame, CPU 2.03 s a second; default
+path 29.83, 35.0, 10.63, 1.90 (Xenia D3D12: 29.9, 6.24 ms, 2.0). What is
+left against Xenia is GPU time a frame: the draws on the host path, and
+the interlock's cost on the default one (2.5 ms a frame more than the
+host path's).
+
+**What stands still costs nothing (2026-11-09, night).** The thread's work
+alone is measured without a game: `xfreplay <xtr> --repeat N` prints the
+time each play after the first spent in the command processor and what it
+calls ("commands a play", the median and the fastest; the trace's walk and
+the memory it restores left out), and `--profile N` samples that thread
+over the plays (tools/sampler.cpp, now with a scope: only the samples under
+`CommandProcessor::execute_packets`; a table of each sampled function with
+its caller and the caller's line; `XF_PROFILE_LINES=N` lists a function's
+hottest source lines). `--whole-extents` plays as live play does. The drive
+frame's baseline (2,735 draws, 111,000 packets a play; 100 plays, other
+agents building and running on the machine): 22.4 ms median and 20.1 ms
+fastest a play on the default path, 23.2 and 20.6 on the host path. Its
+profile, as shares of the processor's work: `Impl::draw` itself 16-23%
+(5.6% in its locals' destructors and 2.2% in making them: five
+`RenderTarget`s a draw for the interlock path's views; 4.3% in hash map
+lookups of the two shaders, four a draw; 2% turning quads into triangles
+with `push_back`), the C runtime's block copy 14% plus `memmove` 3.5%
+(the sampler names it `_NLG_Return2`, the nearest export below the copy's
+code in VCRUNTIME140: no unwinding anywhere; its callers are the two 5 KB
+constant blocks copied from the registers, compared with the last upload and
+copied twice more at every draw), the driver 12.7%, register writes 15%
+(`write_register` per word with its checks, `type0`, `report_packet` and
+`packet_end` called for a sink that takes neither), the clock 4.5% (two
+reads around every sink call, texture check and vertex request), textures
+and samplers 7% (the constant parsed twice, three maps searched per slot),
+the heap 4%. The changes, one commit each, none timed after the baseline
+(the machine was given to another agent's GPU timings; to be timed alone):
+- **Registers as runs, stamped.** A type-0 packet, `SET_CONSTANT`,
+  `SET_CONSTANT2`, `SET_SHADER_CONSTANTS` and `LOAD_ALU_CONSTANT` store
+  their words in one loop when they lie in a row in the buffer and none of
+  the registers has a side effect (those all lie below 0x2000:
+  `CommandProcessor::write_register_run`; `XF_GPU_REGISTER_RUNS=0` writes
+  them one by one). The register file stamps each block of 32 registers
+  with a serial when a write changes a value there
+  (`RegisterFile::write`, `write_big_endian`, `changed_since`); writes from
+  other threads (`set`: the CPU's MMIO) count in `foreign_writes` instead.
+  Xenia compares values at the draw.
+- **Constants by the stamps** (`XF_CONSTANT_STAMPS=0` off). The renderer's
+  copy of each stage's constants is brought up to date block by block where
+  the stamps say a value changed, and uploaded again only then (and in each
+  new submission). The fetch constants count for a stage only in the blocks
+  its shader's texture and vertex fetch slots lie in, so the vertex buffers
+  a draw sets leave the pixel stage's upload alone.
+- **A draw's own locals**: the interlock path's views keep three numbers,
+  not a `RenderTarget`; the loaded shaders are kept by pointer (`shaders_`
+  never drops one), also by `shader_again`; the shaders' slots are masks
+  made once at load, not sets walked at each draw; quads become triangles
+  through a sized list; the vertex ranges skip a list of their own.
+- **Texture slots kept** (`XF_TEXTURE_SLOT_MEMO=0` off). A slot whose six
+  fetch words, filters and forced filtering are the last draw's, with no
+  texture loaded or loaded again, no place in the bindless tables given back
+  and no sampler destroyed since (`texture_epoch_`), takes the slot's words
+  of the system constants again after the texture's own check
+  (`unwritten`) and its uses' marks. Never while a trace is recorded, and
+  only for slots that came out with nothing counted as approximate.
+- **The clock** only around draws, resolves and swaps:
+  `Report::check_seconds` and `vertex_seconds` and the short calls' share of
+  `Report::seconds` are timed with `Options::cpu_times` (xfreplay sets it)
+  or `XF_RENDERER_CPU_TIMES=1`.
+- **The last pipeline again** by one compare of the key before the map.
+- `report_packet` and `packet_end` only for a sink that wants packets.
+
+`WAIT_REG_MEM` is as Xenia's where it sleeps (a wait field of 0x100 or
+more: `wait / 0x100` ms; Xenia spins below that, ours yields to the
+scheduler). What a game polls is now counted: the video report's line gives
+the packets that did not match at once, the polls on memory and with a
+sleep, and the last such packet's address, reference, mask and wait field.
+Left on the thread: the driver's recording; the rest of `Impl::draw` (the
+pipeline's description built before the key is looked up; the viewport and
+scissor and the system constants made again at each draw: the stamps would
+tell when the state registers stood still); index conversion (3%; Xenia
+reads indices on the GPU from shared memory); each write-back's
+`memory_written` and `wrote_back`; on the host path `render_target`'s map
+lookup per target.
+
+**The drive live after the three tracks (2026-11-09, night).** With the
+barriers' accesses, the early depth-stencil form and the lean outputs
+("The host path's GPU time"), the command thread's stamps, register runs
+and slot memo ("What stands still costs nothing") and the host path's
+fixes ("The host path against the exact one") together, the played drive,
+alone on the machine, one run each (the host path twice: its first run
+made the pipelines of the new pixel shader forms, 2.46 s of CPU a second):
+
+| | fps | frame p95 | GPU ms a frame | CPU s a second |
+| --- | --- | --- | --- | --- |
+| host path, before | 29.83 | 35.0 | 8.08 | 2.03 |
+| host path, now | 29.62, 29.73 | 35.0, 34.9 | 6.05, 6.13 | 2.03 (warm) |
+| exact path, before | 29.83 | 35.0 | 10.63 | 1.90 |
+| exact path, now | 29.49 | 34.6 | 8.53 | 1.70 |
+| Xenia D3D12 (host render targets) | 29.9 | | 6.24 | 2.0 |
+
+The command processor's time a play of the drive frame (`xfreplay --repeat
+100 --whole-extents`, host path, three runs each, fastest play and
+median): all three switches on 17.4-18.0 ms (19.3-20.2), all off
+20.3-21.1 (21.9-23.4); one off at a time 18.1-19.5 fastest, so each pays.
+The changes without a switch (the draw's locals, the clock reads) do not
+show beside the agent's baseline (20.6 fastest).
+
+**VIZ queries** (Xenia's `occlusion_query_viz`, off by default there; here
+where the device has `VK_EXT_conditional_rendering`,
+`XF_VK_NO_CONDITIONAL_RENDERING=1` off). A query's survey draws
+(`PA_SC_VIZ_QUERY` viz_query_ena with kill_pix_post_hi_z) count samples in
+a host occlusion query of their own (host path) or a counter of the
+interlock path, never for an occlusion report (Xenia: "surveys never count
+for a report"); at the query's end the count is copied to the ID's word,
+and the draws whose DRAW_INDX token names the ID (bit 8) run under
+conditional rendering on it. As Xenia's: a query with no draw of its own
+(a survey or a draw counted for it, below) drops its draws; one whose surveys were not all measured in one count is visible
+(drawn); draws exporting memory are never predicated. Unlike Xenia, a
+survey is not normalized (its writes turned off): one that writes color,
+depth or stencil, or runs with hi-Z off (Xenia then drops the depth test;
+ours would keep it and could undercount), is not measured, so its query
+stays visible. Game G's 850/950: 58 queries a frame (29 a tile pass), all
+measured, 422 predicated draws of which the GPU skipped 216 (28 queries
+with no sample; counted with a throwaway read-back), the picture unchanged
+(FSI 0.112/0.118; host 0.167/0.175, 850 checked against the host path without
+conditional rendering).
+
+**A draw that is counted and drawn (2026-11-11).** A query's draws need
+not be surveys: with `viz_query_ena` and no `kill_pix_post_hi_z` a draw
+counts for its query and draws as any other (Xenia's `OnVIZSurveyDraw`
+takes every draw with the enable bit). Only surveys were taken here, so
+such a query looked as one with no survey and its draws were dropped. A
+game's opening scene (game F, a played frame): six quads drawn into a
+16_16 target under a query, then a rectangle list predicated on it that
+adds the glare over the terrain, which was missing: 1.190 of 255 off
+Xenia's exact picture (0.77% of the pixels by more than 16), 0.016 with
+the draws counted. They are not measured (they draw under their own state),
+so their query stays visible, as Xenia's fallback.
+
+That frame on the host's render targets was still 1.200 off Xenia's
+exact picture, and Xenia's own host picture to the last bit (0.000), with
+or without the float24 depth conversion and whichever transfer switch was
+set. The cause is the next paragraph's.
+
+**A 16_16 target's alpha (2026-11-11, beyond Xenia's host path).** The
+host keeps a 16-bit fixed target (-32 to 32, ten fraction bits) as a
+signed normalized one, so the shader's output is scaled by 1024/32767
+(with the exponent bias: `color_scales`, Xenia's `color_exp_bias`), all
+four components of it. In a 16_16 target the alpha is not stored: it is
+only the blend's factor, and scaled it makes a blend by the source's alpha
+32 times too weak. That frame's six quads add into a 16_16 target by their
+alpha (what the target holds was read back on both paths before the draw
+that samples it: 150,281 distinct words on the exact path, 3,511 on the
+host's, most of them a channel left at its cleared value). A 16_16
+target's scale now goes to the shader negative, and the shader (the
+translated ones and the generic one) scales the stored channels by its
+size and the alpha by the exponent bias alone: 1.200 to 0.116 of 255 off
+Xenia's exact picture (0.772% of the pixels to 0.011%). A 16_16_16_16
+target stores its alpha, so it must be scaled there and a blend by the
+source's alpha is still off: it takes a second source for the blend
+(dual-source blending), not done, and counted ("a 16_16_16_16 target
+blended by the source's alpha"); no frame at hand has one.
+
+**A float target's fixed alpha (2026-11-11, beyond Xenia's host path).**
+2_10_10_10_FLOAT keeps its alpha in two fixed bits, so the console takes
+the source's alpha to 0..1 before it blends by it (Xenia's exact paths:
+the format's fixed point alpha flag). The host keeps the target as
+RGBA16F, whose blend takes whatever alpha the shader gives. A game's
+scene is such a target, and the passes that lay its light shafts over it
+(the source plus the scene times the source's alpha) gave an alpha past 1:
+the lit part of the frame came out tinted, 3.041 of 255 off Xenia's exact
+picture with a tenth of the pixels off by more than 16, as Xenia's host
+picture (2.898). The shader now clamps the alpha it writes to such a
+target (the system flags' third word, bits 4-7, a bit a target, beside
+the gamma targets' bits 0-3): 0.296 of 255, 0.046% of the pixels; the
+scene later, 0.483 to 0.299.
+
+**Finding where two runs of a frame part: `XF_DUMP_RESOLVES=<directory>`**
+(with the full read-back, `xfreplay --readback-resolve full`) writes what
+each resolve put in guest memory, a file each
+(`<resolve's number>_<address>.bin`). The same frame replayed on the two
+render target paths (or by two builds) is then compared resolve by
+resolve, format by format (a 2_10_10_10 word's channels, a 16_16's): the
+first that differs by more than rounding names the pass a wrong picture
+begins in. Both errors above were found so: the first frame's texture
+turned out to be the scene's depth taken as a 16_16 color and blended
+into, not a mask; the second's first large difference was the scene
+itself, read as 2_10_10_10 a few passes after the blends.
+
+**Game G's frames 850 and 950, what is left** (0.149% and 0.150% of pixels
+off Xenia's ROV picture; Xenia's ROV and FSI pictures are 0.083% apart).
+Of the 1,374 pixels off ROV's, 1,070 are off Xenia's FSI picture too where
+Xenia's two agree; 895 of those are in the ground's band (rows 520-600:
+small foliage drawn with alpha to coverage), 175 elsewhere. Above the band
+ours is nearer Xenia's FSI picture (0.17 of 255 mean, no bias: +0.07,
++0.07, +0.06 signed) than Xenia's two pictures are to each other (0.54). In
+the band the foliage's covered pixels differ in shape, about as many
+brighter as darker (497, 573): coverage, not color. Alpha to coverage
+itself is Xenia's code; what feeds it (the alpha of DXT5 foliage
+textures at a distance: the filtering, the mip chosen, the packed mip
+tail) is where to look next, draw by draw, which needs a replay that stops
+after a given draw against a reference that can too (Xenia's trace viewer).
+
+## Direct ownership transfers, and the frame's fixed costs (2026-11-08)
+
+**Ownership transfers straight from the holder** (host render targets;
+Xenia's render target cache, `GetTransferShader` and the D3D12 transfer
+pixel shaders). A target taking over EDRAM tiles another target holds now
+draws them from the holder's image in one pass (`edram_transfer.frag`,
+`Impl::edram_transfer`), instead of a compute store of the holder into the
+EDRAM buffer and a load from there. Each destination sample finds its
+EDRAM dword by the destination's layout (`edram_offset`), the source pixel
+and sample holding that dword by the inverse of the source's, and goes
+through the guest's bits: the shader is the store's packing followed by the
+load's unpacking (`edram.glsl` with `EDRAM_TWO_TARGETS`: `target` is a
+variable set to either side's push constants), so the pictures are the
+same bit for bit. A 64-bit destination over a 32-bit source takes its two
+dwords from two source samples, a 32-bit one over a 64-bit source the
+half of the sample. The source's own store set is the transfer's
+descriptor set (its views and the host depth buffer, now visible to the
+fragment stage too). Draws are rectangles of tiles (Xenia's
+`GetRangeRectangles`: a run of tiles is at most a part of a row, whole rows
+and a part of a row), one render pass a destination, every holder in it.
+The host's 32-bit depth beside EDRAM is kept as before: a depth source of a
+format the host encodes differently writes its depth into `host_depth_`
+from the transfer's fragment shader, a destination of such a format takes
+it back where it still rounds to the guest's bits (the source's own value
+when they share the format). Tiles no target holds (a trace's start) are
+still loaded from EDRAM. `XF_EDRAM_TRANSFERS=store` keeps the two passes.
+
+**Stencil by copy** (beyond Xenia). Without stencil export (the RTX 5060)
+the stencil was written a pass a bit, eight more passes over every
+transferred depth sample: the depth transfers cost 0.13 ms each in game B's
+3600 trace, 0.21 as single-pass transfers with the bit passes. With
+`VK_KHR_maintenance8` (a query; `XF_VK_NO_MAINTENANCE8=1` turns it off)
+copies between a depth/stencil aspect and a color image of the same texel
+size are allowed: the transfer's one pass writes depth and, into an
+`R8_UINT` color attachment the size of the target (`RenderTarget::
+stencil_copy`, made at the first transfer), the stencil; `vkCmdCopyImage`
+then copies its rectangles into the stencil aspect. 0.05 ms a depth
+transfer. Devices with stencil export export it; devices with neither keep
+the bit passes.
+
+**Uploads ahead of the submission** (beyond Xenia; both paths). A draw
+whose vertex pages the CPU wrote copied them into the mirror between its
+draws: the render pass ended, a full barrier drained the GPU, the copy ran,
+the next draw began a new pass. Game B's title scene does it 4.7 times a
+frame (2.4 of them inside a pass). Now the pages of a run nothing in the
+recording submission has used yet (read by a draw or a texture load,
+written by a resolve or an export: `page_used_`, the submission's serial a
+page) are copied in the slot's `pre` command buffer, submitted ahead of the
+main one with a barrier on each side; the others are copied in between as
+before. A draw that flushes the submission for room after requesting its
+pages marks them in the new one. `XF_HOISTED_UPLOADS=0` turns it off. Game
+B live (interlock, `boot --render`, 130 s): the GPU time marked "other"
+(barriers and uploads) from 0.812 s to 0.108 s, the run's GPU time from
+9.33 s to 8.59 s.
+
+**Interlock clears by fill.** A resolve's clear into EDRAM wrote each
+sample from `edram_clear.comp`, scattered across tiles. Whole rows of tiles
+the rectangle covers (the pitch a whole number of tiles; a 64-bit clear's
+two words equal) are now one `vkCmdFillBuffer` of the run of tiles, the
+rows above and below through the shader. Game B's three clears a frame:
+0.079 to 0.040 ms in the replay.
+
+**Host resolves from EDRAM always.** A single-sampled target's resolve
+copied its image into a buffer and converted that; now its tiles are stored
+into EDRAM and the resolve reads them there, as multisampled ones (and
+Xenia's resolve shaders, always) do. Game B's final 1280x720 resolve: 0.099
+ms against 0.030 + 0.034; live (`boot --render`, `XF_GPU_TIME=1`, the marks
+now name the resolve's source) that resolve took 0.27 ms a frame. Game E's
+frames come nearer Xenia's picture with it (0.040 to 0.006 of 255).
+`XF_RESOLVE_FROM_IMAGE=1` keeps the copy.
+
+Game B's 3600 trace, `xfreplay --gpu-time --repeat 30` (the fastest play;
+0.50 ms of it is the trace's front buffer read-back): host render targets
+1.639 ms, with direct transfers 1.642 (the bit passes made the depth
+transfers dearer than the loads), with the stencil copied 1.31-1.38;
+interlock 1.452, with clears by fill 1.441. Pictures unchanged
+(`replay_test` 29/29 both paths, also with `XF_VK_NO_MAINTENANCE8=1`;
+validation clean) but game E's three frames, nearer Xenia's with the
+resolves above. Game A's race trace (`--repeat 10`): host render targets
+4.27-4.37 ms a play, 5.49 with the old ways (`XF_EDRAM_TRANSFERS=store
+XF_VK_NO_MAINTENANCE8=1 XF_RESOLVE_FROM_IMAGE=1`); interlock 4.19-4.23.
+
+**The default stays the interlock path.** Live in game B the host path is
+now 6% faster (1.21 against 1.29 ms a frame), in game A's race replay 3%
+slower; the interlock path is exact, matches Xenia's exact pictures, and
+needs none of the host path's approximations. Both are within a few
+percent of each other, so exactness decides.
+
+**Tried and left** (interlock draws; game B's 32 scene draws, 0.533 ms in
+the replay against the host path's 0.269): reading every covered sample's
+depth before writing any, and the blended target's destinations before the
+depth test (one wait for EDRAM rather than two), changed nothing; pixel
+against sample interlock, nothing; without `Coherent` on EDRAM 0.454 (not
+kept: the interlock orders the critical sections, coherence makes their
+writes visible, Xenia keeps it too). Without the depth test's work the
+draws take 0.388, so about 0.15 ms is the depth's read-modify-write and
+the rest the colors' and the guest shader's own; the host path's early
+depth and the ROPs' compression have no counterpart without host
+attachments.
+
+**A lead: the arena in video memory.** The arena (constants, indices,
+attributes, uploads' staging) is the first host-visible type, system memory
+on the RTX 5060, so every draw's constants cross PCIe. Put in the
+device-local host-visible type instead (an experiment), game B's host-path
+replay went from 1.36-1.38 to 1.29-1.35 ms a play, its scene draws 0.25 to
+0.23. That type is a 214 MB heap here (no resizable BAR), against the
+arena's 192 MB, so it is not taken: it wants a heap at least twice the
+arena (resizable BAR) or a smaller arena of its own for the draws' data.
+Done since (below, "The draws' constants in video memory").
+
+## Game B's frame against Xenia's, call by call (2026-11-08)
+
+**A "regression" that was a setting.** A run had game B at 2.69 ms of GPU
+time a frame against the table's 1.29; the same build measured 4.95 again,
+1.36 with the same settings as the table. The player read the user's
+config.toml, which by then asked for a 200% resolution scale and FXAA (the
+output-scaling options of ecd0997). Nothing in the renderer had slowed: the
+3600 trace's replay is 1.48 ms a play on the interlock path, 1.44 before.
+`bench_vs_xenia.ps1` now gives ours a config of its own (the video defaults,
+as Xenia runs; the saves where the user's config keeps them) unless
+`-OursArgs` names one, and its `-base` configurations (`ours-base`,
+`ours-host-base`) are the same build with the speedups below turned off.
+
+**What each frame is made of** (RenderDoc 1.46 captures of the title scene,
+`qrenderdoc --python`: one frame of each, listed with its targets; RenderDoc
+gives no event timings for Direct3D 12 here). The two do the same work in
+the same order: the 4x MSAA pass at pitch 640 (its color and depth taken
+over from the 2x targets), the scene twice at 2x MSAA (16 draws each), each
+followed by a resolve (a store of the target into EDRAM and the copy) and
+its clears, a color transfer into the 1x target, 20 2D draws, the last
+resolve, and the presenter's conversion and blit. Differences:
+- Xenia's targets are as tall as the draws use (`EstimateMaxY`): 640x384,
+  1280x384 and 1280x720; ours as tall as EDRAM holds from the base (640x1024,
+  1280x1024, 1280x2048). Transfers, stores and resolves cover only the rows
+  used in both, so this is memory, not work.
+- Xenia's depth transfers are a depth draw and 8 stencil-bit draws each
+  (no stencil export on this GPU); ours one draw and a copy
+  (`VK_KHR_maintenance8`, "Stencil by copy" above).
+- Xenia's resolves are 2 dispatches of 32x48 and 40x48 groups (several
+  pixels a thread), ours 2 of 160x48 (a pixel a thread); the bytes moved
+  are the same.
+- Xenia sets a pipeline state object a draw (54) and 221 root constant
+  buffer views; we bound 21 pipelines and set all 25 dynamic states at every
+  draw: 1,369 `vkCmdSet*` calls a frame, against Xenia's 13 viewports, 13
+  scissors, 8 stencil references and 3 blend factors.
+- 35 barriers a frame in both.
+Where the host path's remaining GPU time goes is still not known: the work
+is the same, call for call, and only timing either program's passes can
+tell (the machine was shared, so none was taken).
+
+**The draws' constants in video memory** (beyond Xenia, whose upload
+buffers are system memory). Both stages' constants, the system constants
+and the interlock path's constants now come from an arena of their own,
+16 MB a slot (48 MB), in device-local host-visible memory: the shaders read
+them from video memory, not across the bus. Without resizable BAR that
+memory is a 256 MB window (214 MB on the RTX 5060), so it is taken only
+where its heap is at least four times the 48 MB, and only where it is not
+the first host-visible type already; the arena otherwise. A draw whose
+constants do not fit flushes the submission as the arena does (game A's
+race trace: 3 submissions with and without). `XF_VK_NO_DEVICE_LOCAL_DRAW_DATA=1`
+keeps them in the arena; `-v` says where they are. The experiment above
+(the whole arena moved) took game B's host-path replay from 1.36-1.38 to
+1.29-1.35 ms a play.
+
+**The lost device it exposed (fixed 2026-11-09).** Game D's played drive
+lost the device in every run (5 of 5, between swaps 4,468 and 5,543, some
+160 s in): `VK_ERROR_DEVICE_LOST`, the driver's fault report an invalid
+write at 0x0-0xFFF. Turning the four speedups of the round off one half at
+a time left this one: without it no run lost the device (2 runs of 200 s).
+The cause was older than it. A draw whose blocks did not fit flushed the
+submission, and nothing began the next one before the constants' cache
+(`last_*_at_`, cleared as a submission begins) was consulted, so a draw
+whose constants had not changed reused the flushed submission's offsets: it
+read that slot's share, which the host writes again as soon as the slot
+records again, while this submission may still be on the GPU. A slot's
+share of the constants' buffer is 16 MB against the arena's 64 MB, and a
+heavy scene's constants (about 3,000 draws a frame) fill it mid-frame: a
+flush every frame, where the arena's came rarely. The draw now begins its
+submission before the cache is consulted, and every block it reads is
+checked to lie in its own submission's share (a renderer bug stopped there,
+with a message, not on the GPU). Game D's drive since: 230 s, 6,858 swaps,
+no lost device.
+
+**What a lost device reports.** The renderer's failure line names the
+swaps and draws so far, the driver's fault report where the device has
+`VK_EXT_device_fault` (each faulting address with its kind: read, write,
+execute; the vendor's codes) and each memory heap's use against its budget
+(`VK_EXT_memory_budget`). `XF_VK_NO_DEVICE_FAULT=1` leaves the fault report
+out. Game D's line before the fix: "the device lost after 5543 swaps and
+3145200 draws: a fault; an invalid write at 0000000000000000-0000000000000FFF;
+... heap 2 (device-local, host-visible, 214 MB): 49 MB used of a 164 MB
+budget" (the window was not the cause).
+
+**Dynamic state only where it changes.** A draw sets each of its 25 dynamic
+states only where it differs from what the command buffer holds
+(`DrawState`, compared bytewise); a new command buffer, another of the
+renderer's pipelines (a transfer's, a port's: `bound_pipeline_` cleared)
+or a memory export's pipeline (no dynamic state) makes all of it set
+again. Game B's title frame: 1,369 `vkCmdSet*` calls to 149, 1,698 calls in
+all to 480. `XF_VK_DRAW_STATE_ALWAYS=1` sets everything at every draw.
+
+**Checked:** `replay_test` 29/29 on both paths and at 200%
+(`XF_REPLAY_SCALES=200`), game B's 3600 with validation on both paths
+(0.000 off Xenia's D3D12 and ROV pictures, no messages), game A's race
+trace the same picture byte for byte with both turned off. **Not measured**
+(the machine was shared by three agents). To measure, alone on the machine:
+`bench_vs_xenia.ps1 -Disc <B> -Ours build/player_<B>.exe -Xenia <xenia_canary.exe>
+-Seconds 130 -Warmup 90 -Runs 3 -Configs ours-base,ours,ours-host-base,ours-host,xenia-d3d12,xenia-d3d12-rov`;
+the bar is Xenia D3D12's 0.78 ms (host) and 1.23 ms (ROV).
+
+The presenter clears the window only where the picture leaves bars (a
+picture covering the window was cleared and then blitted over).
+
+**Measured afterwards, alone on the machine** (3D title window 90-130 s, 2
+runs each, A B A B): interlock 1.38 -> 1.32 ms a frame (both speedups) against
+Xenia ROV 1.29; CPU 1.13 s/s against 1.19.
+
+**Transfers of cleared tiles as clears** (beyond Xenia). The host path's
+frame (traces of the window, 4000/5000/6000) moved 5 transfers, and 3 of them
+read tiles a resolve had just cleared: the next frame's 4x color and depth
+take over what the last resolves cleared, and the 1x target what the scene's
+second resolve cleared. A tile now remembers that its holder's pixels there
+are one clear's value (`tile_cleared_`: set where a resolve's clear covers
+the whole tile, dropped where a draw's scissor rows reach it, a transfer
+draws into it or EDRAM is loaded into it); a target of the same format
+(format, host format, gamma kept linear, UINT view) taking it over is
+cleared to that value over those rectangles instead (`vkCmdClearAttachments`,
+the stencil into the R8_UINT image too where the stencil is copied), and the
+tile keeps the value. The same pixels: the source's samples were all the
+value, and the same format holds it in every sample count. Game B's 3600
+replay on the host path: 1.416 -> 1.288 ms a play (the transfers 0.233 ->
+0.120 ms); live, 2 runs each: 1.28 -> 1.18 ms a frame against Xenia D3D12's
+host path 0.83. Pictures: replay_test 29/29 on both paths, at 200% and with
+validation; deterministic runs of games A and B on the host path
+(`--deterministic --shots`, swaps 300 to 4500) byte-identical with and
+without. `XF_TRANSFER_CLEARS=0` draws every transfer, as before.
+
+**What is left of the host path's gap.** The window's frames replay at
+about 0.80 ms of passes (draws 0.41, resolves 0.14, transfers 0.12, stores
+0.08) but take 1.18 live: one submission a frame, 11 waits for the GPU in
+6,700 swaps, no presenter in that number (boot alone, without the player,
+measures the same), so the live passes themselves run slower (a GPU at a
+fraction of its load runs at lower clocks; Xenia's live number has the same
+handicap). The rest is per-pass cost, which only Xenia's own pass timings
+can locate: its D3D12 backend has no GPU timestamps a pass and RenderDoc
+gives none on D3D12 here, so the next step is timestamp queries around its
+render target cache's transfers, dumps, resolves and draws in a local build.
+
+**Xenia's passes timed (2026-11-09).** A local measuring build of Xenia's
+D3D12 backend (not upstream, kept out of both repositories): a timestamp
+query at each change of the kind of work (`--d3d12_gpu_timing`: draws, the
+render target cache's transfers, EDRAM dumps, resolve copies and clears,
+texture loads, uploads and barriers before a draw; each submission waited
+for and read as it is submitted) and `--trace_dump_repeat N` in its trace
+dump (the frame played again with the caches kept, the fastest play after
+the first printed by kind, as `xfreplay --repeat` does). Game D's drive
+frame (swap 5000 of a played run, recorded by `boot --trace-frames`), host
+render targets on both, ms a play (ours without the trace's front buffer
+read-back, which Xenia's dump does not time):
+
+| | ours | Xenia D3D12 |
+| --- | --- | --- |
+| draws | 4.03 | 3.58 |
+| render target transfers | 1.66 | 2.42 |
+| resolves: copies | 1.25 | 0.67 |
+| EDRAM stores (Xenia's dumps) | 1.01 | 0.44 |
+| resolves: clears | 0.35 | 0.12 |
+| texture loads | 0.27 | 2.22 |
+| uploads and barriers | (in the above) | 0.54 |
+| total | 8.57 | 9.98 |
+
+On the frame itself ours is ahead (the resolve targets spare most of
+Xenia's texture loads, the transfers cost less), and behind in the EDRAM
+compute passes: stores, resolve copies and clears at about twice Xenia's.
+The frame has a chain of 48 small ones (pitch 160, 1x); ours run a pixel a
+thread with a full barrier after each pass, Xenia's several pixels a thread
+with narrower barriers: the next target here. Live the order is the other
+way (ours 9.2-9.4 ms of GPU a frame in the drive's window against Xenia's
+6.2, 2 and 1 runs), so something only a live run does costs ours more or
+spares Xenia's; finding it needs the same timing in Xenia's live executable
+(the whole xenia_canary built with it) beside `XF_GPU_TIME=1`.
+
+**Resolves straight from the target's image (2026-11-09).** On the host
+path every resolve stored its rectangle's tiles into EDRAM (a pass and a
+barrier) only for the copy to read them back from there at once. The copy
+now reads the source target's image itself (`resolve.comp` with `IMAGE`,
+`resolve_image*.comp.inc`, the target's store set as its set 2): each guest
+sample's words made from the host sample at the same pixel by edram.glsl's
+packing, as the store makes them (the target's format and the store's
+flags in the push constants' flags, bits 28-31 and 4-7). Nothing else read
+those words: the source holds every tile of the rectangle (`acquire`) and
+keeps them. The pictures are the same bits as before (game D's drive frame
+at 100% and 200%, game A's race at 150%, `replay_test` on both paths);
+`XF_RESOLVE_THROUGH_EDRAM=1` goes back to the store. The same frame, timed
+the same way after a warm-up run (a first run after a pause finds the GPU's
+clocks down and takes twice as long): 9.18-9.32 to 8.17-8.21 ms a play, the
+stores' 1.02 ms gone and the copies 1.32 to 1.23 ms; Xenia D3D12 10.0 ms.
+Still behind Xenia there: copies (1.23 against 0.67, mostly the chain's 48
+small ones at 7 us each) and clears (0.35 against 0.12: each a full barrier
+and a rendering pass of its own; candidates: a clear kept for the target's
+next render pass, narrower barriers).
+
+**Clears kept for the target's next render pass (2026-11-09).** A
+resolve's clear on the host path was a full barrier and a rendering pass
+of its own with `vkCmdClearAttachments` (84 in the drive frame, 0.35 ms).
+Now it is kept with the target (`RenderTarget::pending_clears`) and drawn
+by its next render pass (`begin_pass`): as the attachment's load operation
+when it covers the pass's whole area (the driver's fast clear, as Xenia's
+`ClearRenderTargetView` gets), else inside the pass; anything else that
+takes the image first (an EDRAM store, load or transfer, a resolve from
+it) draws it before, in a pass of its own as before (`flush_clears`), and
+so do targets cleared through their UINT view. The same picture bit for
+bit; the frame, fastest of four runs interleaved: 8.40-8.55 ms clearing at
+once, 8.21-8.26 kept (`XF_DEFER_CLEARS=0` and `XF_CLEAR_LOAD_OP=0` turn the
+two parts off), the clears left 0.06 ms (Xenia 0.12). The small resolve
+chain's copies stay: about 8 us each, the dispatch's and the barrier's
+latency rather than its work, as Xenia's own (5.5-7 us).
+
+**The fetches' own cost (2026-11-09).** A fetch's signs and number format
+ran every alternative for all four components and picked by selects (the
+gamma curve, the biased decode, the number format's parts). Now, as
+Xenia's: only the components the instruction keeps (its
+GetNonZeroResultComponents), each sign's work behind a uniform branch, the
+number format's parts nested the same way, all in one function of the
+module per set of components (`fetch_post`, called by each fetch). The same
+pictures; the drive frame's draws 4.53 to 4.22 ms (fastest runs), the frame
+7.78 ms against Xenia's 10.0. Counted alike (ours times barriers and the
+kept clears with the draws, Xenia apart), the draws are even: ours 4.22 +
+0.06, Xenia 3.58 + 0.54 + 0.12. The pipelines' compile time is another
+matter: the frame's 148 pipelines take 18.7 s to make, 12.0 s without any
+of this post-processing (a measurement only); in one function rather than
+inline it is the same (the driver inlines it), so what would shrink it is
+less code per fetch for the driver to see (open).
+
+**Timing these replays.** The GPU's clock is chosen per process: a run is
+either fast (8.0-8.5 ms a play here) or about twice as slow for its whole
+life, warm-up or not, 30 or 150 plays (nvidia-smi shows the clock low
+throughout; the constants were in video memory in both). Comparisons take
+the fastest of several runs of each, interleaved.
+
+**The drive timed live (2026-11-09).** The same timing in Xenia's whole
+executable (the local measuring build logs `xf-gpu-timing swap N at T s
+total X ms/frame; kind ms ...` every 300 swaps with `--d3d12_gpu_timing`;
+ours the same line with `XF_GPU_TIME=1 XF_GPU_TIME_LOG=1`), the played
+drive, host render targets, the 125-200 s window, one run each
+(`bench_vs_xenia.ps1 -XeniaArgs ... -Clocks`):
+
+| ms a frame | ours (host) | Xenia D3D12 (timed) |
+| --- | --- | --- |
+| draws (Xenia: and its uploads and barriers) | 4.35 | 2.75 + 0.77 |
+| render target transfers | 1.52 | 2.52 |
+| resolve copies | 1.19 | 0.52 |
+| EDRAM stores (Xenia's dumps) | - | 0.46 |
+| texture loads | 0.47 | 0.83 |
+| clears | 0.35 | 0.15 |
+| total | 7.88 | 8.00 |
+
+Untimed, by the system's GPU counters (xfbench): ours 8.33 ms a frame
+(9.2-9.4 before the resolves above), Xenia 6.24. Xenia's timing costs
+Xenia itself: 6.24 untimed against 8.39 timed (it waits for every
+submission), so its column is a fair split but not its untimed total. The
+GPU clock (nvidia-smi every 250 ms) does not normalize the two: its median
+is mostly the idle GPU's (Xenia's 1312 MHz untimed against ours 1710),
+not the clock its work ran at. What stands: live as on the replayed frame,
+the draws are where ours spends more (about a quarter more than Xenia's,
+the replay's 4.22 against 3.58 too), then the copies and the clears; the
+transfers, the stores and the texture loads are where ours spends less.
+Ours outside the renderer's timing (the player's presentation): about 0.45
+ms a frame (8.33 counted against 7.88 timed). Next: the translated
+shaders' cost against Xenia's on the same draws.
+
+## The host path's GPU time: barriers, early depth and stencil (2026-11-09)
+
+Game D's drive frame again (a new recording of swap 5000,
+`XF_RENDER_TARGET_PATH=host xfreplay --gpu-time --repeat 12`, with
+`--pipeline-cache <file>` so a timing run does not spend 30 s making the
+frame's pipelines), ms a play without the trace's front buffer read-back.
+Three changes, each with a switch that turns it off; the pictures are the
+same bits with each on or off (the frame, and `replay_test` on both paths).
+
+**The barriers' accesses.** Every pass here is separated from the next by
+one global memory barrier (`full_barrier`), which named the generic
+`MEMORY_WRITE` to `MEMORY_READ | MEMORY_WRITE`. Timed by its masks (the
+barrier taken out altogether, as a measurement only: 5.91 ms; generic: 7.37):
+the stage masks cost nothing, and neither do the accesses of shaders,
+attachments and transfers; what costs is a destination that includes
+`INDIRECT_COMMAND_READ` or `CONDITIONAL_RENDERING_READ`, either alone
+(7.03-7.29 and 7.20-7.40 against 6.26-6.27 without them). The generic
+`MEMORY_READ` includes both, and for them the NVIDIA driver stalls the GPU
+until the work before the barrier is done, since the next command's front
+end may read what it wrote: about 2 us a barrier, 7 us after a small compute
+dispatch (the chain of 48 small resolves: 0.39 ms of copies became 0.044).
+The barrier now names what the renderer's commands do (shader, color and
+depth attachment and transfer writes; those reads and uniform, index and
+vertex reads). Nothing here draws or dispatches indirectly. The one
+predicate buffer of conditional rendering is written in one place (a VIZ
+query's end), which now has its own barrier to the conditional rendering
+stage; and what the host reads after a submission (read-back buffers) has
+one barrier to the host stage at the submission's end. Xenia's D3D12
+transitions name resources and states, so it never paid this; its Vulkan
+backend names stages and accesses per resource too.
+`XF_BARRIER_ACCESSES=generic`: as before. (The presenter's and the UI's own
+barriers, a few a frame, still name the generic accesses.) A barrier removed
+where the next pass begins with one (the resolve's trailing one) changed
+nothing measurable (3 pairs, 0.01 ms), and was left.
+
+**The early depth and stencil form** (Xenia's
+`DepthStencilMode::kEarlyHint`, pipeline_cache.cc and
+`IsForceEarlyDepthStencilGlobalFlagEnabled`). Every translated pixel shader
+ended with the alpha test and the alpha to coverage read from the system
+constants, a demotion and a coverage output behind them: the driver cannot
+test and write depth before a shader that may discard, so every hidden
+pixel was shaded. Xenia picks a form of the shader by the draw's state, and
+so does this now (`PixelOptions::early_depth_stencil`, part of the pipeline's
+key): on the host path, with no float24 conversion in the shader, a shader
+that neither kills, writes oDepth nor exports memory
+(`implicit_early_z_write_allowed`), drawn with no alpha test other than
+always and no alpha to coverage (`DoesCoverageDependOnAlpha`) or not writing
+oC0, is translated without the alpha test, the alpha to coverage and the
+coverage output, with `EarlyFragmentTests`. `XF_EARLY_DEPTH_STENCIL=0`: never.
+
+**Lean color outputs.** The four color outputs were each scaled, run
+through the gamma curve and then selected by the target's gamma flag, for
+every pixel of every shader. Now a target the shader never writes is given
+zeros (what its register holds), and the curve runs behind a branch on the
+flag, as Xenia's (which declares only the written targets).
+`XF_PIXEL_OUTPUTS=full`: as before.
+
+The frame, six runs of each form interleaved, the runs during which
+another replay was on the GPU left out (3 to 4 clean runs each; the others
+agree within 0.2 ms), fastest and median play:
+
+| ms a play | total | draws | resolve copies | transfers |
+| --- | --- | --- | --- | --- |
+| all three off | 7.32 (7.46) | 4.35 | 1.11 | 1.53 |
+| the barriers' accesses | 6.25 (6.27) | 4.29 | 0.47 | 1.19 |
+| and the early form | 5.54 (5.56) | 3.59 | 0.47 | 1.19 |
+| and lean outputs | 5.50 (5.51) | 3.56 | 0.46 | 1.17 |
+
+Xenia D3D12 on the earlier recording of the frame: draws 3.58 and 0.54 of
+uploads and barriers, transfers 2.42, copies 0.67. The lean outputs' 0.04
+ms is at the edge of what these runs resolve. Live numbers are the main
+session's to take.
+
+Measured and not taken further:
+- The translated arithmetic is not where the draws' time is. With every
+  multiply's zero check left out (a measurement only: wrong pictures are
+  possible) the frame's draws went from 4.32 to 4.16-4.35 ms, with the 21-bit
+  precision of exp, log, rcp, rsq and sqrt left out 4.24-4.45, with both
+  4.09-4.28 (two pairs, another agent's replays on the GPU at times: an upper
+  bound of about 0.2 ms, not a result). Xenia does both too; what it has
+  and this lacks is the zero check skipped where the two operands are the
+  same (open, small).
+- A resolve's copy as a draw instead of a compute dispatch was not built:
+  with the chain's 48 dispatches left out (a measurement only) the frame
+  loses 0.31 ms, 6.4 us a dispatch, but a pass of one small draw costs about
+  as much here (the chain's own draws: 5.8 us each with no dispatch
+  between), so a pass in place of a dispatch gains little. What would is the
+  copy inside the target's own pass (reading an attachment being drawn to:
+  VK_EXT_attachment_feedback_loop_layout), open.
+- The top draws left (35 triangle strips of one alpha-tested, blended
+  shader pair, 0.60 ms) cannot take the early form, in Xenia either.
+
+**What is left of the frame**: draws about 3.6 ms, transfers 1.19, resolve
+copies 0.47, texture loads 0.22, clears 0.08. The depth transfers are the
+next target (0.9 ms in about 20): the game clears a 4x depth target through
+a single-sampled view of the same EDRAM twice as wide and tall (depth-only
+rectangle lists: the console's own clear), so each clear first transfers
+the 4x target's 416 tiles into that view (7 transfers, 0.25 ms) only to
+overwrite them, and then transfers the cleared view back (5, 0.18 ms). A
+transfer could be skipped where the draw that asks for it provably writes
+every sample of the tiles whatever they held (one rectangle over them,
+depth always and written, stencil replaced or untouched and then
+transferred alone), and the way back done as a clear where the rectangle's
+depth is one value (`tile_cleared_` set by such a draw as it is by a
+resolve's clear); neither is in Xenia.
+
+## The host path's ownership transfers: a draw's reach and the console's clears (2026-11-09)
+
+The lead above, followed, with what the frame really does. The game's clears
+are not whole surfaces. The console's clear of a region of a 4x target is
+three draws of depth-only rectangle lists: the part of the region that is
+whole tiles drawn in the 4x target itself, the strips left over drawn through
+a single-sampled view of the same tiles twice as wide and tall; a shadow
+atlas is cleared and rendered a cascade at a time this way (the cascades
+themselves drawn in the single-sampled view), each cascade resolved from the
+view. None of those rectangles covers the 416 or 832 tiles that changed hands
+at each of them, so skipping the transfer of covered tiles alone gains
+little. What made the transfers large was that a target took every tile of
+the rows from its first down to the draw's lowest (Xenia's estimate is the
+lowest row alone). Four changes, all beyond Xenia, each with a switch; the
+pictures are the same bits with each on or off.
+
+**A draw's reach** (`Impl::draw_reach`, `XF_DRAW_REACH=rows` for whole rows as
+before). A draw's targets take the tiles under the pixels the draw can reach
+and no others: the scissor down to `draw_max_y`'s row always; with clipping
+on, the host viewport's rectangle (polygons are clipped to it); with clipping
+off, the box of the vertices where the vertex shader runs on the CPU (the run
+`draw_max_y` already makes when there is no scissor, else for draws of at
+most twelve vertices), none of them behind the eye, and for a rectangle list
+of up to four rectangles a box each with the corner the rasterizer adds.
+Points, lines and tessellated draws keep the scissor's rectangle. The box is
+turned into pixels by where samples are: a host pixel's samples are at least
+a sixteenth of it from its edges, so an edge on a pixel boundary (a clear's,
+a viewport's) takes no pixel beyond it. A resolve takes the tiles under its
+rectangle likewise. The memos of `acquire` and `tiles_drawn` are rectangles
+of tiles (`TileRect`) instead of counts of rows, and `edram_transfer` joins
+the runs of tiles of consecutive rows into one rectangle, so a column of
+tiles is one draw.
+
+**Tiles a draw overwrites, taken unread** (`Impl::depth_overwrite`,
+`XF_OVERWRITE_TRANSFERS=0`). A depth target taking tiles for a draw that
+provably writes the depth and the stencil of every sample of them takes them
+without the transfer from their holder or the load from EDRAM. Proven only
+for one rectangle (a rectangle list of three vertices) that is not
+tessellated, not predicated on a VIZ query nor a survey draw, with no user
+clip planes and no vertex kill; the depth test on, always passing and
+written; the stencil test on, always passing, replacing or zeroing with the
+whole write mask (the back face's state the same when it is on); no kill, no
+oDepth, no alpha test other than always and no alpha to coverage in the pixel
+shader; and the vertex shader run on the CPU giving three corners of an
+axis-aligned rectangle with W 1 and one Z, inside the clip volume when
+clipping is on. The tiles are those wholly inside the rectangle, the scissor
+and the viewport, and wholly inside the target's image. Anything else is
+transferred as always.
+
+**A draw's clear is a clear** (`XF_DRAW_CLEARS=0`). Where such a draw writes
+one known depth, the tiles it covers whole hold a clear's value as after a
+resolve's clear (`tile_cleared_`, `tile_clear_value_`, and now the guest's
+word in `tile_clear_word_`), so the target that takes them next is cleared
+rather than drawn from the holder. The depth is known only where it is the
+same value however the host computes it: every step of `z * scale + offset`
+and of the viewport's range exact as a float (the clears' 0 and 1 are), no
+polygon offset, and the result the target's own encoding of a guest word (a
+24-bit unorm host depth must round without doubt, a float one be exactly the
+word's value). Two things widen it:
+- a depth target of the *other* depth format taking a cleared tile is
+  cleared to the same guest word in its own format, which is what the
+  transfer draws (the 24 bits reinterpreted);
+- a depth tile's stencil is tracked on its own (`tile_stencil_`): known after
+  anything that makes the tile a clear's and after a draw that replaces all of
+  it, kept by draws with the stencil test off and by transfers between depth
+  targets, dropped by anything else that writes the tile. The console's
+  depth-only clears leave the stencil test off, so they make a tile a clear's
+  only with it: the draw's depth with the stencil the tile has. A target
+  taking such a tile for a depth-only clear takes it as a clear too (any depth
+  will do, the draw writes it).
+A transfer that is clears alone is no longer a pass of its own: its clears
+are kept for the target's next pass as a resolve's are (`pending_clears`),
+and the stencil's copy (`VK_KHR_maintenance8`) leaves out the rectangles a
+clear wrote.
+
+**Resolves from the tiles' holders** (`XF_RESOLVE_FROM_HOLDERS=1`, off by
+default). A copy from a source that does not hold every tile of its
+rectangle leaves the tiles with their holders, which store them into EDRAM
+for the resolve to read there. It did not pay in this frame (below) and is
+left as an option.
+
+Game D's drive frame, `XF_RENDER_TARGET_PATH=host xfreplay --gpu-time
+--repeat 12 --pipeline-cache <file>`, five runs of each form interleaved, no
+other replay or boot running during any of them, the fastest play of the
+fastest run (and the median run), ms:
+
+| ms a play | total | transfers and stores | their count |
+| --- | --- | --- | --- |
+| all off | 5.964 (5.970) | 1.166 | 44 |
+| the draw's reach | 5.710 (5.784) | 0.949 | 44 |
+| and overwrites and draws' clears | 5.239 (5.263) | 0.429 | 23 |
+| and resolves from holders | 5.269 (5.281) | 0.452 | 25 |
+
+The draws stay at 3.51 to 3.56 ms in all four. The shadow atlas's twelve
+depth transfers (7 into the view, 5 back) are gone: every one of them is a
+clear now. Checked: one
+play and three plays with the switches on and off are the same bytes on the
+drive frame and on the game's frames 5600 and 6400 of the sweep;
+`replay_test` on both paths (31 and 33 frames, the host path's numbers
+unchanged); validation clean.
+
+What it rests on, beyond what Xenia's `draw_max_y` already does: the vertex
+shader run on the CPU places a vertex within a 1024th of a pixel of where the
+host's shader does (the reach), and gives the same Z bits for a clear's
+vertices (the clear's value; a shader that computes its Z rather than passing
+it through could differ by a rounding, which the exactness test of the
+viewport's steps does not see).
+
+One place where the host's bits may differ from the transfers', the guest's
+being the same: a D24FS8 target (or D24S8 on a device without 24-bit unorm
+depth) keeps its 32-bit host depth beside EDRAM, and a transfer into it takes
+a float left there that still rounds to the guest's 24 bits. Cleared instead,
+it gets the word's own value; and a tile taken unread from such a holder
+leaves the holder's floats out of that buffer. Either is a float of the same
+20e4 value.
+
+**What is left of the transfers** (0.43 ms in 23): the scene's depth moving
+between its 4x target and the single-sampled view of it twice as wide, four
+times of 720 tiles (0.20 ms: the depth prepass is drawn in the view, then
+rectangles and quads in the 4x target, real content each way), the colors'
+transfers between formats and sample counts (0.19 ms), and the small ones. A
+depth transfer that carried the stencil alone, for depth-only overwrites of
+tiles whose stencil is not known, was not built: with the stencil tracked the
+frame has none left.
+
+## Resolution scale (2026-11-08)
+
+The console's pixels drawn as more (or fewer) host pixels: 50% to 800% in
+steps of 25%, one value, as RPCS3's resolution scale (the model the player
+shows), laid out as Xenia's `draw_resolution_scale_x/y` lays EDRAM and the
+resolves out (d3d12_render_target_cache.cc, resolve.xesli,
+edram.xesli's XeEdramOffsetBytes with a resolution scale), beyond it in the
+steps it takes (Xenia: whole multiples). `Options::resolution_scale` (in
+quarters), `XF_RESOLUTION_SCALE=<percent>`, `xfreplay --scale <percent>`,
+config.toml's `video.resolution_scale` (docs/runtime.md, "Picture
+options"). The arithmetic is `render_scale.h`'s, checked by
+frontend_test.
+
+**Why every quarter is exact.** An EDRAM tile is 80x16 samples of 32 bits;
+at a scale s it is 80s x 16s, whole for every quarter (20 and 4 samples a
+quarter), and so is every resolve rectangle and destination offset (multiples
+of 8 console pixels) and every texel offset a resolve writes a texture at
+(multiples of 8 and 32). A host pixel maps to the console pixel it lies in,
+and a console pixel to the host pixel at its center (render_scale.h's
+`Scale::map`), with no rounding left over.
+
+**What is drawn at the scale:**
+- EDRAM: the buffer 2048 tiles of 80s x 16s (and the host depth beside it),
+  every render target's image `Scale::up` its console size (both clamped to
+  the device's largest image), the EDRAM stores, loads and clears of the
+  host render target path in the scaled grid (edram.glsl's `edram_offset`
+  with the scale in its push constants), the interlock path's addressing
+  scaled (edram_fsi.frag's `fsi_offsets`, `sample_offset`; the Fsi block's
+  `scale`). A trace's EDRAM snapshot goes in and out through EDRAM at the
+  console's size, each tile resampled (`edram_rescale.comp`).
+- Draws: the viewport's bounds and the scissor's edges in host pixels, the
+  NDC transform unchanged (so points' and rectangles' sizes stay the
+  guest's); the polygon offset's slope term times the scale (Xenia's
+  poly_offset_scale_factor); the pixel parameters' position and alpha to
+  coverage's dither the console pixel's (the system values' w, 1/s);
+  occlusion counts divided by the scale's area (Xenia's
+  UpdateQuerySegment).
+- Resolves read EDRAM's scaled samples (the host path stores the source's
+  tiles first, as for MSAA). They write **guest memory at the console's
+  size**, each console pixel from the host pixel at its center: guest
+  memory is the CPU's, so read-backs (`readback_resolve`), memory exports
+  and the front buffer a game copies all see the console's size, as RPCS3
+  keeps CPU-visible data native and as Xenia's resolve downscale does for
+  its read-backs. The textures a resolve feeds (the resolve targets,
+  "Resolve targets" above) are written at their own scale by a second pass
+  over their texels.
+- Textures: a resolve target of 32-bit texels the resolve writes whole, no
+  smaller than the minimum scalable dimension, is made the scale's (`scale_texture`: an image
+  of the same format, its old one gone with the submission). A resolve no
+  texture is over yet keeps its scaled texels in an image of its own
+  (`ScaledResolve`, dropped when anything else writes there or two swaps
+  on); the texture a later draw makes over the destination copies them in
+  and is the scale's from its first use, so a one-frame trace and a game's
+  first frame show the scaled picture too. Every other texture is the
+  console's size: loaded from guest memory, a resolve's included. The
+  shaders' texture coordinates are scale-free: sizes and offsets come from
+  the fetch constants (shader_translator.cpp), so a scaled image needs no
+  shader change (Xenia scales unnormalized coordinates for its scaled
+  textures, `textures_resolution_scaled`; the translator divides them by
+  the fetch constant's size first, which the scale leaves alone).
+- The front buffer is a texture: scaled when its resolve is, so the window
+  gets the scaled picture (`FrontBuffer` carries the image's size).
+
+**The minimum scalable dimension** (RPCS3's, `Options::min_scalable`, 16
+console pixels by default): a resolve narrower or shorter than it does not
+make a texture the scale's, and a texture smaller than it is never one.
+Small buffers (look-up tables, 1x1 reductions, atlases' tiles, render to
+texture tricks) leave EDRAM at the console's size, so a shader that steps
+through them in console texels reads what it wrote. Render targets
+themselves are all drawn at the scale: they share EDRAM's tiles whatever
+their sizes (a small target aliases a large one's tiles, as on the
+console), so a per-target scale would need tiles converted between scales
+at every change of hands; the rule acts where a surface leaves EDRAM, which
+is where a small buffer is read back. (Open: per-target scales with tiles
+tagged by scale and converted by `edram_rescale.comp` where they change
+hands.)
+
+**The interlock path takes multiples of 50%.** It addresses a pixel's MSAA
+samples from its first sample's dword (Xenia's ROV layout), which keeps
+them in one half of a tile only where the half (10 samples a quarter) is a
+whole number of 4-sample groups: even quarters. An odd quarter (75%, 125%,
+175%, ...) is drawn at the even one below it, and the renderer's notice
+says so (the player prints it and shows it on the System page). The host
+render target path takes every quarter. A GPU without room for EDRAM at the
+scale (800%: 640 MB of EDRAM, 1.3 GB of host depth) gets the largest that
+fits, with a notice.
+
+**Checked** against Xenia's own scaled pictures: its Direct3D 12 trace dump
+takes `--draw_resolution_scale_x/y` (with `--render_target_path_d3d12=rov`
+for our default path), so every trace has Xenia's picture at 200% and 300%
+(`../traces/dumps_scale/rov2x`, `rov3x`; game data, outside the
+repository). `XF_REPLAY_SCALES=200,300 XF_SCALED_DUMPS=../traces/dumps_scale
+build/replay_test` compares each scaled frame with Xenia's at its size and
+holds the frames whose 100% picture is Xenia's within a mean difference of 4
+(of 255) and 5% of pixels off by more than 16; it also prints each one
+against our 100% frame, box filtered (`render_scale.h`'s `resample_box`),
+which is no bound: a scaled picture is not the console's (blurs made of
+bilinear taps between texels blur less over finer texels, in Xenia's
+scaled pictures as in ours). Results (2026-11-08, interlock path):
+- 23 of the 29 frames within 0.7 of Xenia's at both scales, 0-1% of pixels
+  (game B's 1800-3601: 0.67-0.69 at 200%, 0.29-0.30 at 300%; game A's
+  title and menu 0.02-0.17; games C, D, H and F's 600-2400 0.00-0.04).
+- Game E's 1200-3600: 2.8-2.9 at 200% (no pixel off by 16), 1.2-1.4 at 300%
+  (3-4% of pixels): its blurred background is drawn through textures over
+  resolved memory that no resolve feeds whole, which Xenia scales and we
+  keep at the console's size.
+- Game F's 3600: 1.65 at 200% (0.5%). With 64-bit resolve targets scaled
+  as well its bloom showed magenta strips Xenia's does not have (9.4), so
+  64-bit textures stay at the console's size (open: the 64-bit texels'
+  scaled feed; the same resolves at 100% go through guest memory).
+- Game A's park and race (frames whose 100% picture is off Xenia's by 1.8
+  and 3.1 already, from what the trace does not hold): 4.0-4.4 at 200%,
+  1.6-1.7 at 300%.
+Against our own 100% frames, box filtered: game B 0.8 (200%) and 0.4
+(300%), game A's title 0.15-0.45.
+
+**Cost against Xenia** (game B's 3D title scene, `bench_vs_xenia.ps1 -Scale`,
+GPU ms a frame by the counter, median and spread; ours on its default
+interlock path, Xenia's Direct3D 12 on its default host render targets;
+both hold 60 fps at every scale):
+
+| scale | ours | Xenia D3D12 |
+| --- | --- | --- |
+| 100% | 1.39 (1.38-1.39) | 0.83 (0.83-0.85) |
+| 200% | 5.18 (5.11-5.21), 3 runs | 2.92 (2.92-2.99), 2 runs |
+| 300% | 11.81 (11.81-12.03), 2 runs | 6.22 (6.22-6.28), 2 runs |
+
+The 100% row is the standing benchmark's above; ours at 200% and 300% ran
+before the direct ownership transfers above were merged. Not interleaved (ours'
+runs, then Xenia's, minutes apart); another agent's player and a Xenia ran
+on the machine during parts of both. Both grow about as the pixels do
+(ours 3.7x and 8.5x of its 100%, Xenia's 3.5x and 7.5x): we lose by the
+same factor as at 100%, the interlock path's draws costing about twice
+Xenia's host render targets' (the standing benchmark's analysis), which the
+interlock work aims at. What the scale adds besides the pixels (the
+resolves' second pass over scaled texels, the host path's EDRAM stores
+before every resolve) is not measured apart.
+
+**Where it differs from Xenia:** Xenia keeps a scaled copy of guest memory
+for resolves (its scaled resolve buffer, in 2 GB ranges on tiled resources)
+and loads textures from it with scaled addressing; here a resolve writes
+guest memory at the console's size and its scaled texels into the textures
+it feeds (or keeps them for the next texture), so no scaled memory exists
+and the CPU's view needs no downscale pass. A texture made over resolved
+memory that no resolve fed whole (a part of a resolve, another format's
+view of it, a 3D or cube texture) is the console's size where Xenia's would
+be scaled. Not done: a pixel shader's memory export runs once a host pixel
+(as Xenia's), counted.
+
+## The software reference renderer (2026-11-09)
+
+A third witness beside the Vulkan renderer and Xenia: the Xenos drawn on the
+CPU alone, deterministic, independent of host GPUs and drivers, built from the
+documents first (`include/xenoforge/reference.h`, `src/reference/`). Where the
+Vulkan renderer and Xenia agree with each other and not with it, or the three
+disagree, the spec says which is right; the reference is the base to argue
+from without a console.
+
+**Running it.** `build/xfref <xtr> -o frame.png [--compare <png>] [--diff
+d.png] [--threads N] [-v]`; `XF_REF_TRACE_PIXEL=x,y` prints that pixel's
+quad's shader inputs and texture fetches, and every depth test and color
+write at the pixel, draw by draw, with the face and the draw's depth control,
+stencil words, mode and clip registers; `XF_REF_TRACE_DRAW=n` prints draw n's
+shaders (disassembled), texture fetch constants, nonzero float constants,
+indices and clip-space vertices; `XF_REF_DUMP_MEMORY=<hex address>:<hex
+size>:<file>` writes that physical memory after the trace (resolves
+included), to compare with Xenia's (a local `--trace_dump_memory` in its
+trace dump, with `--readback_resolve=full`). The three-way regression:
+`XF_TRACES=../traces XF_DUMPS=../traces/dumps build/reference_test`
+(`XF_REFERENCE_FILTER=<name>`, `XF_REFERENCE_OUT=<dir>` for its frames); it
+fails on crashes and failed replays, not yet on differences.
+`reference_units_test` checks the pieces against the documents' values.
+
+**Design.** `reference::Renderer` is a `gpu::Sink` played by the same trace
+player as `render::replay` (src/replay.cpp, Xenia's trace_player.cc). EDRAM is
+the hardware's: 2048 tiles of 80x16 samples of 32 bits, in the guest's bits,
+addressed per sample as Xenia's ROV and FSI paths address it (64-bit formats
+as two dwords, 2x and 4x layouts, depth tiles' halves swapped; reference
+`edram_address`). Draws run in `src/reference/draw.cpp`: indices, primitives,
+the vertex shader (shader_interpreter.h's machine, each vertex once, in chunks
+across the workers), clipping in homogeneous space, the viewport, setup, then
+rasterization by bands of 32 rows, each band drawing every primitive in order
+so every sample sees the draw's order; pixel shaders run in 2x2 quads with
+helpers, in lockstep at each fetch that takes implicit derivatives (the
+interpreter's `Invocation` stops there, `Waiting`, and the quad's lanes'
+coordinates resume it: the translator's coarse derivatives). Textures
+(`sampler.cpp`) are texture.h's decode (Xenia's untiling and loads, the DXT
+formats decompressed) turned into floats per texel through the fetch
+constant's signs, filtered on the CPU. Resolves read EDRAM's bits as Xenia's
+resolve shaders load them (resolve.comp's load_colors) and write memory
+through resolve.h's conversion (`resolve::write_loaded`, new). The 29 frames
+take 62 s together on 12 threads (game A's race 9.6 s, the longest).
+
+**Sources, stage by stage** (the spec where it speaks; Xenia's file and
+function where it is silent):
+
+| stage | source |
+| --- | --- |
+| indices: endianness, VGT_INDX_OFFSET, min/max clamp, reset index | R6xx 3D register reference (VGT_*); Xenia's RemapAndConvertVertexIndices and primitive processor (which types the reset index cuts) |
+| primitive types | lists, strips, fans as Direct3D; line loops closed; quads as two triangles; quad strips and polygons as Mesa's r600 and a2xx give GL_QUAD_STRIP and GL_POLYGON; rectangle lists: Xenia's geometry shader (the fourth vertex mirrored across the longest edge; spec silent); points: PA_SU_POINT_SIZE / oPts.x clamped by PA_SU_POINT_MINMAX |
+| vertex position formats | PA_CL_VTE_CNTL (vtx_w0_fmt, vtx_xy_fmt, vtx_z_fmt) as Xenia's CompleteVertexOrTessEvalShaderInMain |
+| clipping | PA_CL_CLIP_CNTL: dx_clip_space_def's near and far, the guard band PA_CL_GB_*_CLIP_ADJ (x, y clipped at that many w; 1 is the viewport, R6xx register reference), user clip planes (clip or cull only), clip_disable |
+| viewport, half pixel, window offset | PA_CL_VPORT_*, PA_SU_VTX_CNTL's pix_center, PA_SU_SC_MODE_CNTL's vtx_window_offset_enable (draw_util.cc's GetHostViewportInfo for the offsets' arithmetic) |
+| vertex snapping | PA_SU_VTX_CNTL's quant_mode (1/16 to 1 pixel) and round_mode (a2xx register database: truncate, round, to even, to odd) |
+| faces, culling, polygon offset | PA_SU_SC_MODE_CNTL (face, cull_front, cull_back, poly_offset_*_enable), the offsets as Direct3D 9's absolute ones (Xenia's draw_util.h on POLY_OFFSET_DB_IS_FLOAT_FMT); polygonal types as Xenia's IsPrimitivePolygonal (rectangles not) |
+| sample positions | R6xx/R7xx PA_SC_AA_SAMPLE_LOCS (2x: (-4,4), (4,-4); 4x: (-2,-2), (2,2), (-6,6), (6,-6) in 1/16), Xenia's kXenosSamplePositions |
+| fill rule | the top-left rule of Direct3D-class rasterizers, on 1/256 pixel fixed point |
+| scissor | PA_SC_WINDOW_SCISSOR_* plus the window offset unless window_offset_disable, PA_SC_SCREEN_SCISSOR_*, the surface (draw_util.cc's GetScissor) |
+| interpolation | perspective-correct (PERSP_CORR_DIS: linear), centroid by SQ_CONTEXT_MISC's sc_sample_cntl and SQ_INTERPOLATOR_CNTL's sampling_pattern (the first covered sample of a partly covered pixel); param_gen as Xenia's StartFragmentShaderInMain |
+| shaders | shader_interpreter.cpp (Xenia's interpreter, its SPIR-V translator where they differ), extended for whole draws: an Environment for texture operations and memory exports, quads |
+| texture fetch | the translator's sample_texture (Xenia's ProcessTextureFetchInstruction): sizes, offsets plus Xenia's kTextureCoordEpsilon, LOD from the constant's bias, the register's and the instruction's, per-axis exponents, cube faces, stacked layers; filters and clamps from the fetch constant and the instruction (Xenia's GetSamplerParameters), border colors |
+| filtering | point, bilinear, trilinear, anisotropic as Vulkan's and Direct3D 10's reference footprint (up to AnisoFilter's 16 taps), exact weights; signs applied per texel before filtering |
+| alpha test, alpha to coverage | RB_COLORCONTROL; Xenia's FSI (test only where oC0 is written; FSI_AlphaToMask's thresholds and dither) |
+| depth, stencil | Xenia's FSI_DepthStencilTest (GetNormalizedDepthControl, ColorOverlapsDepthStencil, both faces), the depth from the primitive's plane at each sample (exact; Xenia extrapolates the center's by derivatives), D24S8 rounded to the nearest even, D24FS8 by xenos.cc's Float32To20e4 rounded to the nearest even |
+| color formats, blending, write masks | Xenia's FSI_ClampAndPackColor, FSI_UnpackColor, the blend factor and equation functions (factors before min and max, as the Xenos), GetPSIColorFormatInfo's keep masks; 7e3, PWL gamma, extended float16 as xenos.cc |
+| resolves | resolve.h's get_info (Xenia's GetResolveInfo), the samples loaded as resolve.xesli's XeResolveLoad*, resolve.cpp's conversion, endianness and tiling; clears into EDRAM after the copy |
+| memory exports | the translator's export_to_memory (Xenia's ExportToMemory, the D3D12 translator's integer clamps) |
+| the front buffer | fetch constant 0's texture, opaque, the display's gamma ramp (renderer.cpp's deliver and display_gamma) |
+
+**Where it differs from Xenia, on purpose.** Texel signs (signed, biased,
+gamma) before filtering: Xenia applies them after the host filters and says
+it "likely should be before" (dxbc_shader_translator_fetch.cc); R6xx and
+Direct3D 10 convert texels before filtering. Exact bilinear weights and LOD:
+hosts use 8 bits of weight; this is what gives the reference's 0.1 of 255 on
+game B's 1800 and 3600 (edges of filtered text only, no pixel over 16). The
+guard band from the registers (Xenia's host viewport clips at the viewport).
+Vertices snapped by PA_SU_VTX_CNTL (hosts snap to 1/256). Per-sample depth
+from the plane, not extrapolated. SQ_INTERPOLATOR_CNTL's param_shade: every
+interpolator smooth, as Xenia's (the traces set it to the mask of the
+interpolators used, so it is not a flat-shading mask; counted).
+
+**The three-way results** (mean difference of 255, share of pixels off by
+more than 16; Xenia's exact pictures: Direct3D 12 ROV `rov/d3d12`, Vulkan FSI
+`rov`; "ours" the Vulkan renderer on its default interlock path):
+
+| frame | reference : Xenia ROV | reference : Xenia FSI | reference : ours | ours : Xenia ROV |
+| --- | --- | --- | --- | --- |
+| Game B 1800 | 0.100, 0.00% | 0.100, 0.00% | 0.100, 0.00% | 0.000, 0.00% |
+| Game B 1801 | 0.089, 0.00% | 0.089, 0.00% | 0.089, 0.00% | 0.000, 0.00% |
+| Game B 3600 | 0.100, 0.00% | 0.100, 0.00% | 0.100, 0.00% | 0.000, 0.00% |
+| Game B 3601 | 0.092, 0.00% | 0.092, 0.00% | 0.092, 0.00% | 0.000, 0.00% |
+| Game B 600 | 0.001, 0.00% | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% |
+| Game B 601 | 0.001, 0.00% | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% |
+| Game A 1800 | 0.010, 0.00% | 0.010, 0.00% | 0.008, 0.00% | 0.003, 0.00% |
+| Game A 2400 | 0.197, 0.01% | 0.197, 0.01% | 0.197, 0.01% | 0.000, 0.00% |
+| Game A 300 | 0.004, 0.00% | 0.004, 0.00% | 0.004, 0.00% | 0.001, 0.00% |
+| Game A 301 | 0.005, 0.00% | 0.005, 0.00% | 0.004, 0.00% | 0.002, 0.00% |
+| Game A 900 | 0.009, 0.00% | 0.009, 0.00% | 0.008, 0.00% | 0.003, 0.00% |
+| Game A loading | 0.013, 0.04% | 0.013, 0.04% | 0.013, 0.04% | 0.000, 0.00% |
+| Game A menu | 0.320, 0.21% | 0.320, 0.21% | 0.320, 0.21% | 0.001, 0.00% |
+| Game A park | 3.643, 7.91% | 5.589, 9.93% | 5.589, 9.93% | 3.086, 6.78% |
+| Game A race | 3.802, 7.39% | 4.887, 8.00% | 4.888, 8.00% | 1.751, 4.35% |
+| Game D intro | 0.056, 0.00% | 0.056, 0.00% | 0.045, 0.00% | 0.013, 0.00% |
+| Game H title | 0.022, 0.00% | 0.022, 0.00% | 0.022, 0.00% | 0.000, 0.00% |
+| Game C 1200 | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% |
+| Game C 2400 | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% | 0.001, 0.00% |
+| Game C 3600 | 0.002, 0.00% | 0.002, 0.00% | 0.000, 0.00% | 0.002, 0.00% |
+| Game C 600 | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% | 0.001, 0.00% |
+| Game E 1200 | 0.301, 0.00% | 0.301, 0.00% | 0.299, 0.00% | 0.005, 0.00% |
+| Game E 2400 | 0.296, 0.00% | 0.296, 0.00% | 0.294, 0.00% | 0.005, 0.00% |
+| Game E 3600 | 0.268, 0.00% | 0.268, 0.00% | 0.267, 0.00% | 0.003, 0.00% |
+| Game E 600 | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% |
+| Game F 1200 | 0.001, 0.00% | 0.001, 0.00% | 0.000, 0.00% | 0.000, 0.00% |
+| Game F 2400 | 0.008, 0.00% | 0.008, 0.00% | 0.003, 0.00% | 0.006, 0.00% |
+| Game F 3600 | 0.231, 0.02% | 0.231, 0.02% | 0.199, 0.02% | 0.083, 0.00% |
+| Game F 600 | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% |
+
+Nothing is skipped in any of the 29; the only count is textures with the
+integer number format read as fractions (game A, E, F, D, H).
+
+**Where the three disagree, and what the spec supports.**
+- Game B 1800-3601, game E, game A's menu and 2400, game F's 3600: the
+  reference is 0.1-0.3 off both Xenia and ours, which agree; no pixel or a
+  few over 16. The differences sit on filtered edges and in blurred
+  backgrounds made by chains of downsampling passes: the hosts' bilinear
+  weights (8 bits) against the reference's exact ones. The spec gives no
+  weight precision; open (the hardware's would settle it).
+- Game A's race: the player's vehicle is black in Xenia's pictures and
+  ours, textured in the reference. Its color pass tests depth with
+  greater-or-equal (reverse Z) against its own depth prepass, an equality in
+  effect: in the reference the two passes' depths are the same bits (the
+  same vertices through the interpreter's exact arithmetic, the same plane
+  at the same sample: `XF_REF_TRACE_PIXEL=640,600` shows the prepass's
+  0x912899 met by the color pass's 0x912899), so the color pass draws.
+  Why Xenia's and ours leave it as cleared is not settled: the depth test
+  failing on the host (the two passes' depths an ulp apart) is the
+  candidate; the trace was recorded while our runs skipped memory exports
+  ("The race's kart was drawn black" above: the color it reads comes from
+  exported pages), which may also be involved. The invariance a rasterizer
+  gives (the same vertices make the same depths) supports the reference
+  where the depth test is the cause.
+- Game A's race and park: distant road and foliage. The textures there are
+  512x512 and 1024x1024 DXT1 with full mip chains whose levels 0-2 agree with
+  one another (mean colors within a few codes) and whose levels 3 and up do
+  not (magenta, yellow, near black): texture.h's layout, which is Xenia's
+  TextureGuestLayout, reads them at offsets that hold other data, or the
+  game had not streamed them. Xenia shows that magenta too (the park's
+  foliage); which mips each picture reaches depends on the anisotropic LOD,
+  which differs between Xenia's ROV and FSI pictures themselves by 1.75 and
+  3.09 of 255. Open: the mip addresses past level 2 are a candidate bug in
+  texture.cpp and Xenia's texture_util alike, to be settled from the guest's
+  own mip offsets (XGraphics' GetMipLevelOffset in a game's code, or the
+  XDK's documentation of the packed layout).
+
+**Both settled (2026-11-09): the traces, not the renderers.** The race
+vehicle's color pass reads a 1024x1024 DXT1 texture with 11 levels
+(1E31E000, its mips at 1E39E000 right after level 0's 512 KB): in the race
+trace every level from 1 down is zero (`xftexture --levels`, the levels'
+mean colors 53/49/46 for level 0 and 0 for each of the others), and with
+the depth test forced to always for the color pass (a throwaway knob) the
+vehicle stays black on the host path too: the color pass draws, and the
+mip it samples is black. The reference's LOD (the anisotropic footprint's
+minor axis) stays on level 0 there; the hosts' reach level 1. The game makes
+these mips on the GPU with its memory-export copies ("The race's kart was
+drawn black" above), and the race and park traces in `replay_test` were
+recorded on 2026-11-05, while those draws were skipped: their mips are
+never written (zero, or what the pages held before: the magenta and
+yellow). A race frame recorded since (`xf_chaves/memexport4`, frame 11200,
+2026-11-06) has the same textures' mips filled, each level the atlas of
+the one above at half the size. Neither is a renderer bug; game A's park
+and race traces in the regression set are to be recorded again with memory
+exports live (and Xenia's dumps of them made again) before their numbers
+mean anything.
+
+**Not done yet (counted where a draw asks):** tessellation; the 2D
+engine's primitive types and triangles with wireframe flags; polygon fill
+modes other than solid (filled); lines are parallelograms (Vulkan's
+non-strict lines), with no stipple; seamless cube filtering; clamp to
+halfway (as to the edge); signed versions of the widened formats
+(10_11_11, 11_11_10 read unsigned when signed); occlusion query counts and screen
+extents (the processor's fake reports); getBCF (0, as Xenia). Performance:
+one interpreter invocation per vertex and per pixel lane, heap-allocated;
+the 29 frames take a minute, the work is bound by the interpreter.
+
+## Motion blur near the car: fetches in Q16 (2026-11-09)
+
+Game D, driving: the ground around the player's car came out sharp and
+grainy in ours and in the reference, motion-blurred in every Xenia backend.
+The frame's motion blur reads a half-size velocity buffer made by a pass that
+reads the frame's depth and stencil, resolved as 24_8_FLOAT and fetched as
+8_8_8_8 (with the constant's ZYXW swizzle: depth's three bytes and the
+stencil). Its pixel shader picks a reprojection matrix per pixel by the
+stencil: a stencil from a threshold constant up is the static world (the
+camera's matrix), else the stencil times 85 (rounded) times 4 indexes the
+per-object matrices. The threshold is 0x3F008100, 32897/65536. A box drawn
+around the car before (depth only, inverting stencil bit 7 where its faces
+lie in front of the scene, for the car's ground shadow) leaves 0x80 on the
+ground near the car, in Xenia's frame as in ours (their resolved stencils
+differ at 1891 pixels, on edges). Read as 128/255 (0x3F008081),
+0x80 is below the threshold: index 43, an identity matrix, zero velocity,
+no blur. The console filters in Q16, where 128 is 32897/65536: the
+comparison passes and the ground takes the camera's motion.
+
+Xenia rounds normalized unsigned components of fixed-point formats to 16
+fractional bits since its commit 0c843efb3 (2026-08-25, per component since
+c3cd8617b; texture_cache.h's GetIntegerScaleBits documents it, a game's SSAO
+masks among the reasons). Done the same way in the translator
+(`texture_signs`, after the signs, before the exponent adjust, half to even)
+and the reference's sampler. Frame 5400 of a drive against Xenia's picture:
+mean difference 0.658 to 0.450 of 255, pixels off by more than 16 from
+0.856% to 0.369%. In `replay_test` game A's park and race come closer to
+Xenia's FSI pictures (0.007 and 0.008 to 0.001 and 0.003) and game D's
+intro too (0.013 to 0.011); the rest unchanged.
+
+How it was found, for the next one: the reference's pixel trace
+(`XF_REF_TRACE_PIXEL`, the stencil's history and the face), its draw trace
+(`XF_REF_TRACE_DRAW`: the velocity pass's shader and constants), Xenia's
+resolved memory from its trace dump (a local `--trace_dump_memory` with
+`--readback_resolve=full`) beside the reference's (`XF_REF_DUMP_MEMORY`):
+same stencil, a different velocity buffer (37658 of 230400 pixels), and the
+shader run by hand on Xenia's bytes giving Xenia's output only with the Q16
+value.
+
+The rest of the same family of Xenia's commits followed the same day: the
+integer number format's scaling back to the guest's integers (d11950528)
+and the point-sampled parts (c3cd8617b), above in "The number format".
+
+## The host path against the exact one (2026-11-09)
+
+The player draws on host render targets by default since the same day, so
+played frames were set beside three pictures each: Xenia's Direct3D 12 host
+render targets (its default), our interlock path, and Xenia's ROV. Frames: a
+drive of game D at swaps 4300 (the loading screen before it), 5000, 5600 and
+6400, a race of game A (recorded earlier, with memory exports) and game G's
+title over its 3D scene. Differences are of three kinds: ours wrong where
+Xenia's host path is right; both host paths wrong where the exact ones are
+right; noise.
+
+**Polygon offsets in exact depth units** (ours wrong). A drive's shadow maps
+(24-bit unorm depth, a constant offset of 0.0002 and 0.00005) came out deeper
+than Xenia's by exactly that offset again, and the car's self shadows were
+lost (a lighter air intake). Vulkan lets a device take up to twice 2^-24 as
+a 24-bit fixed-point format's bias unit ("minimum resolvable difference"),
+and NVIDIA takes twice: every constant offset was doubled. With
+`VK_EXT_depth_bias_control` (`depthBiasExact`, `vkCmdSetDepthBias2EXT`) the
+unit is exactly 2^-24. Float depth (D24FS8, and D24S8 where the device has no
+24-bit unorm) takes the forced unorm representation with it, as Xenia's
+Vulkan backend (`vulkan_depth_bias_force_unorm`): the guest's offset as it is
+(halved with D24FS8's halved range), where a float format's own unit shrinks
+with the depth and loses small offsets far from 1. The constant is a whole
+number of units rounded up, as Xenia's Direct3D 12 pipelines take it
+(`GetD3D10IntegerPolygonOffset`). Without the extension, or with
+`XF_VK_NO_DEPTH_BIAS_CONTROL=1`, the device's units as before, counted
+("polygon offsets in the device's depth units"); `XF_DEPTH_BIAS_FLOAT_UNITS=1`
+keeps a float format's own units (Xenia's Direct3D 12 behavior). Found with
+`XF_REPLAY_DUMP_MEMORY=<hex address>:<hex size>:<file>` (guest memory after a
+replay; `xfreplay --readback-resolve full` puts the resolves in it) beside
+Xenia's trace dump of the same memory: the shadow maps then agree within one
+unit. Swap 5000 against Xenia's host picture: 0.126 of 255 and 592 pixels off
+by more than 16 before, 0.092 and none after.
+
+**The factors of minimum and maximum blending** (both hosts wrong). The
+console applies the blend factors before a minimum or maximum; fixed-function
+blending ignores them. A map overlay drawn into an 8_8_8_8 target keeps the
+target's alpha with "maximum of zero times the source and one times the
+destination", which the host turned into the source's alpha: the route drawn
+on the map came out opaque white, in Xenia's host picture too. With factors
+of zero and one on targets that hold no negative values (unorm and 7e3) the
+console's result is a copy of one side or zero, which `host_blend_control`
+gives the host as an addition. Swap 5600 against our exact picture: 3,105
+pixels off before, 1,749 after; it now differs from Xenia's host picture
+there (0.004% to 0.151%).
+
+Other source factors are multiplied in by the pixel shader where they depend
+on the source and the blend constant alone (zero, one, the source's color
+and alpha, the constant's, and one minus those), against a destination
+factor of zero or one: `shader::PixelOptions::blend_premultiply`, a form of
+the pixel shader keyed in the pipeline (bit 3 of its key), which reads per
+color target a word of the system constants (the color's and the alpha's
+factor, whether each is fixed-point) and the blend constant, and writes the
+source times its factor with the interlock path's arithmetic (edram_fsi.frag:
+the source and the constant clamped for a fixed-point target, zero without a
+product, the product clamped again). The host then blends with factors of
+one; against a destination factor of zero the shader takes the minimum or
+maximum with zero itself and the host adds nothing, which holds for targets
+with negative values too. Xenia's Direct3D 12 pipelines do this for the
+source's alpha against a destination factor of one alone. Still the host's,
+counted ("minimum and maximum blending with factors (the host ignores
+them)"): a factor that needs the destination on either side (the
+destination's color or alpha, the saturated source alpha), a destination
+factor other than zero and one, 16_16 and 16_16_16_16 targets (kept scaled
+on the host), a draw without a pixel shader, and an alpha multiplied in
+while the color's own blend reads the source's alpha (the shader writes one
+alpha). No frame of the corpus has such factors (the drive's overlay has
+zero and one alone), so `blend_minmax_test` draws them from packets: 16
+blend controls over an 8_8_8_8 target, each cell's color and alpha checked
+against the console's arithmetic on both paths, and the host's picture
+against the interlock path's (within 1 of 255; without the shader's form the
+same test is off by up to 204).
+
+**The Xenos's sample positions on host targets** (both hosts differ from the
+exact paths). What was left of the drive's differences lay along edges: the
+host rasterizes 4x at Direct3D's standard positions, the console and the
+interlock paths at its own, so the sample a depth resolve takes sits a
+quarter of a pixel away and everything computed from it (the shadow mask,
+motion blur) moves with it. `Options::xenos_sample_positions`
+(`XF_XENOS_SAMPLE_POSITIONS=1`, `xfreplay --xenos-sample-positions`) is
+Xenia's option of that name, off by default as there: 4x host targets
+rasterize at the console's positions through `VK_EXT_sample_locations`
+(draws and EDRAM transfers; multisampled depth images are made with
+`VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT`). With it the
+drive's frames are the exact path's:
+
+| swap | host against exact, at first | with the two fixes above | and the sample positions |
+| --- | --- | --- | --- |
+| 5000 (the cars, no overlay) | 0.216, 2,380 pixels | 0.184, 1,792 | 0.066, 1 |
+| 5600 (driving, with the map) | 0.304, 3,105 | 0.210, 1,749 | 0.070, 40 |
+| 6400 (driving, with the map) | 0.214, 2,281 | 0.113, 889 | 0.043, 9 |
+
+(mean difference of 255 and pixels off by more than 16; 5600 and 6400 were
+first drawn with the polygon offsets already fixed). Not done with it: the
+viewport's sample offset at a resolution scale above one (draw_util.cc's
+`GetHostViewportInfo`).
+
+**2x targets, and depth read at the wrong positions.** The option first
+covered 4x targets alone: with 2x ones at the console's positions game G's
+title drew stray colors over whole surfaces (51,000 to 70,000 pixels off).
+The mapping was right all along (native 2x: host samples 1 and 0 for the
+guest's 0 and 1, in the pipelines, the alpha to coverage mask, the resolves
+and the transfers alike). The cause is how the device keeps multisampled
+depth: as planes per block of pixels, the samples worked out when the image
+is read, and a shader reading the image as a texture gets them worked out at
+the device's standard positions unless the image went through a layout
+transition that names its sample locations (what
+`VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT` asks for; our
+images stay in the general layout, so no transition ever said). That frame
+draws its scene into a 2x D24FS8 target, clears the stencil with a rectangle
+over the same EDRAM as a 4x target of half the width, and draws the scene
+again testing for equal depth: the depth goes out to the 4x image and back
+through two EDRAM transfers, which read it as a texture, a part of a pixel
+off wherever a surface slopes, and the equal test then failed there, leaving
+the first pass's colors under another format. (It did not show at the
+standard positions, where both readings agree, nor with
+`depth_float24_convert_in_pixel_shader`, where the shader writes every
+sample's depth and nothing is kept as planes; 4x targets have the same
+fault, unseen in the drive, which has no such pass.) Fixed in
+`Impl::settle_depth_samples`: before an EDRAM store, a transfer or a resolve
+reads a multisampled depth image rasterized at the console's positions, the
+image goes to the depth attachment layout and back with
+`VkSampleLocationsInfoEXT` on both barriers, once after it was last an
+attachment. Game G's title, host against exact: 18,009 pixels at the host's
+positions, 51,700 at the console's before the fix, 167 after (against
+Xenia's ROV picture: 19,307, then 1,541; our exact path is 1,377 from it).
+The drive: 1, 37 and 9 pixels (5000, 5600, 6400).
+
+**Whether it should be on.** It is still off by default, as Xenia's: the
+pictures `replay_test` compares the host path with are Xenia's host ones,
+made at Direct3D's positions. With it on (`XF_XENOS_SAMPLE_POSITIONS=1`),
+30 of `replay_test`'s 31 host frames compare exactly as before (most have no
+multisampled edge in the picture) and one fails: the drive's swap 5000 goes
+from 0.092 and no pixel off by more than 16 to 0.219 and 0.194% (about
+1,790 pixels) against Xenia's host picture, while against the exact pictures it
+goes the other way (ours: 1,792 pixels to 1; Xenia's ROV: 0.261 and 0.195%
+to 0.148 and none). Game G's title over its scene, which is not in the
+corpus, moves the same way: 1,411 pixels from Xenia's host picture without
+it and 19,240 with it, 19,307 from Xenia's ROV picture without it and 1,541
+with it. So turning it on by default means comparing the host path's
+multisampled frames with Xenia's exact pictures, or with host pictures made
+with Xenia's own option on.
+
+**Left as they are**, both hosts alike, the exact path right:
+- MSAA edges without `xenos_sample_positions` (game G's title: 18,009
+  pixels against our exact picture; 167 with it);
+- colors above 31.875 and alpha of more than 2 bits in 2_10_10_10_FLOAT
+  targets kept as RGBA16F (not seen to matter in these frames);
+- D24FS8 depth as a 32-bit float (resolved depth differs in its low bits);
+- minimum and maximum blending with factors that need the destination.
+Game A's race differs from Xenia's Direct3D 12 picture (0.133, 0.207%: a
+poster on a wall) on both of our paths alike, as its older frames in the
+corpus do; our two paths agree there (103 pixels).
+
+**The corpus.** Swaps 4300 and 5000 of the drive are in `replay_test` on both
+paths; 5600 and 6400 on the exact path alone (their pictures are in
+`dumps/rov/d3d12` only: Xenia's host picture has the opaque overlay).
+
+**On by default (2026-11-09, the owner's call: on if the cost is small).**
+`Options::xenos_sample_positions` is now on where the device places 2x and
+4x samples. Its cost on game D's drive frame, host path, five replays of
+each interleaved: 5.25-5.28 ms of GPU a play off, 5.36-5.39 on (a fiftieth
+more: the depth settled before it is read); the command processor's time
+a play the same within the runs' spread (18.2-19.0 ms fastest either way).
+Live, the drive's GPU time was 5.75-5.76 ms a frame off and 5.80-5.94 on;
+those runs' frames and CPU are not to be read (the machine was in use).
+Xenia's host picture of the drive frame in the corpus is now its dump with
+`--xenos_sample_positions=true` (ours 0.092, 0.000% off it; the dump at
+its default is kept in `dumps/d3d12_standard_positions`); the other 30
+host frames compare as before. `XF_XENOS_SAMPLE_POSITIONS=0` and
+`xfreplay --no-xenos-sample-positions` give the host's standard positions.
+
+## Played frames of four more games (2026-11-11)
+
+Games C, E, F and H, built by the recompile step and driven by `boot`
+(`--press` scripts) into their campaigns: C's first mission (30 swaps a
+second, 40,000 draws a second), E's first cutscene in the engine (30), F's
+opening scenes in the engine (25 to 30), H's first scene after its film
+(30). `boot` makes pipelines on the renderer's thread, so a cold run stops
+for seconds where a level starts (72 s in one frame of game C, 16 s in
+game F); the next run does not. A frame or two of each recorded
+(`--trace-frames`) and replayed against Xenia's exact picture (D3D12, ROV),
+the mean difference of 255 and the pixels off by more than 16:
+
+| frame | exact path | host's render targets | Xenia's host picture against its exact one |
+| --- | --- | --- | --- |
+| C, the mission's night | 0.001, 0.000% | 0.009, 0.000% | |
+| E, a cutscene's light shafts | 0.198, 0.046% | 0.296, 0.046% (3.041, 9.947% before "A float target's fixed alpha") | 2.898 |
+| E, the same scene later | 0.082, 0.029% | 0.299, 0.159% (0.483 before) | |
+| F, the terrain under a glare | 0.016, 0.011% (1.190 before "A draw that is counted and drawn") | 0.116, 0.011% (1.200 before "A 16_16 target's alpha") | 1.200 |
+| F, the flight | 0.008, 0.000% | 0.209, 0.000% | |
+| H, two frames of the scene | 0.000, 0.000% | 0.163 and 0.272, 0.000% | |
+
+The exact path draws Xenia's exact picture in all of them. The host's
+render targets, the player's default, drew Xenia's host picture, and with
+it its two errors here: game F's glare and game E's light shafts, a smooth
+tint over the lit part of the frame. Both are fixed since ("A 16_16
+target's alpha" and "A float target's fixed alpha"): the host path is
+within 0.3 of 255 of Xenia's exact picture in every frame of the table,
+where Xenia's own host path is 1.2 and 2.9 off in two of them.
+
 ## What is asked and not done is counted
 
 For every run and every trace: packets not handled, registers written that
@@ -2061,3 +4312,32 @@ formats, signed versions and fallbacks), `shaders/pixel_formats.xesli` and
 `shaders/texture_load_*` (the loads), `draw_util.h`, `primitive_processor.h`,
 `spirv_shader_translator*.cc`, `shader_interpreter.h`, `trace_protocol.h`,
 `trace_reader.h`, `trace_dump.h`; `vulkan/` for how Xenia drives Vulkan.
+
+## The back face's stencil and a game's grey glass (2026-11-11)
+
+A racing game's view from inside the car showed grey where the windows
+are, on the host render target path only. Traced where it was seen (the
+player's F4) and replayed: 11.6 of 255 off Xenia's Direct3D 12 picture, the
+interlock path 0.4. Found by leaving draws out (`XF_DRAW_LIMIT`,
+`XF_DRAW_SKIP`): one rectangle list of eight strips over the screen, depth
+only, the depth test always and written, the stencil test not equal to 0
+with the back face's own test enabled (always). The game clears the depth
+where the stencil marks the car's inside, to draw it over the world. A
+rectangle, a point or a line has no facing on the console and takes the
+front face's stencil state (Xenia: the back face's only for polygonal
+primitives); the host path gave the pipeline and the dynamic state the back
+face's whenever the guest enabled it, the host's triangles of the
+rectangles faced back, and the depth was cleared behind the windows too,
+which the frame's fog pass then covered. With the front face's for what is
+no polygon: 0.39 of 255, as the interlock path.
+
+The frame is in `replay_test` on both paths (`../traces/cockpit/4D5309C9_3347.xtr`),
+against Xenia's exact picture (`--render_target_path_d3d12=rov`), which the
+host path is 0.009% of pixels off and the interlock path 0.003%. Not against
+Xenia's host picture (kept in `../traces/dumps/d3d12_host_wrong`): 0.44% of
+the pixels differ from it on both of our paths, the route on the minimap,
+drawn with a maximum blend whose factors the console applies and Xenia's
+host path ignores ("The factors of minimum and maximum blending"). The
+software reference renderer and Xenia's own exact path give our values
+there. `replay_test`'s corpus: 34 frames on the interlock path, 32 on the
+host path.

@@ -6,23 +6,31 @@
 // --gpu-time prints the GPU's time by kind of work (timestamps), and
 // --gpu-time-draws each draw's too, by its shaders; --repeat N
 // plays the trace N times through the same renderer, as a game draws a frame
-// again, the GPU time then being the fastest of the plays after the first.
+// again, the GPU time then being the fastest of the plays after the first, and
+// prints the time a play spent in the command processor and the renderer's
+// CPU side (the command thread's work). --profile N samples this thread over
+// the repeated plays and prints the N most sampled functions (sampler.h).
 // --readback-resolve none|fast|full is Xenia's readback_resolve, --depth-float24-round its
 // depth_float24_round, --depth-float24-convert its depth_float24_convert_in_pixel_shader,
-// --no-gamma-unorm16 its gamma_render_target_as_unorm16 off (renderer.h). --texture-memory soft,hard[,lifetime] sets
+// --no-gamma-unorm16 its gamma_render_target_as_unorm16 off, --xenos-sample-positions its xenos_sample_positions
+// (renderer.h). --texture-memory soft,hard[,lifetime] sets
 // the texture cache's memory limits (Xenia's texture_cache_memory_limit_*; renderer.h).
 // --async-pipelines makes pipelines on worker threads as the player does, --stand-in says what
 // draws meanwhile (renderer.h's PipelineStandIn), --linked-pipelines links every pipeline from
-// libraries and never makes one whole.
+// libraries and never makes one whole; --generic draws every draw it can with the generic shaders
+// (an interpreter of the microcode), whole pipelines made at once.
 //
 //   xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] [--no-edram]
-//            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines]
-//            [--stand-in skip|placeholder|library] [--linked-pipelines]
-//            [--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round]
-//            [--depth-float24-convert] [--no-gamma-unorm16]
+//            [--dump-shaders <dir>] [--gpu-time] [--gpu-time-draws] [--repeat N] [--profile N] [--async-pipelines]
+//            [--stand-in skip|placeholder|library] [--linked-pipelines] [--generic]
+//            [--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] [--depth-float24-round]
+//            [--depth-float24-convert] [--no-gamma-unorm16] [--xenos-sample-positions]
 //            [--texture-memory soft,hard[,lifetime]] [-v]
 
+#include "xenoforge/render_scale.h"
 #include "xenoforge/renderer.h"
+
+#include "sampler.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -41,11 +49,12 @@ namespace {
 
 int usage() {
     std::fprintf(stderr, "usage: xfreplay <trace.xtr> [-o frame.png] [--compare xenia.png] [--diff diff.png] "
-                         "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--async-pipelines] "
-                         "[--stand-in skip|placeholder|library] [--linked-pipelines] "
-                         "[--occlusion-queries] [--readback-resolve none|fast|full] [--depth-float24-round] "
-                         "[--depth-float24-convert] [--no-gamma-unorm16] "
-                         "[--texture-memory soft,hard[,lifetime]] [-v]\n");
+                         "[--no-edram] [--gpu-time] [--gpu-time-draws] [--repeat N] [--pipeline-cache file] [--async-pipelines] "
+                         "[--stand-in skip|placeholder|library] [--linked-pipelines] [--generic] "
+                         "[--occlusion-queries] [--whole-extents] [--readback-resolve none|fast|full] "
+                         "[--depth-float24-round] "
+                         "[--depth-float24-convert] [--no-gamma-unorm16] [--xenos-sample-positions] "
+                         "[--texture-memory soft,hard[,lifetime]] [--scale percent] [--min-scalable pixels] [-v]\n");
     return 2;
 }
 
@@ -54,8 +63,10 @@ int usage() {
 int main(int argc, char **argv) {
     std::string trace_path, out_path, compare_path, diff_path;
     xf::render::Options options;
+    options.cpu_times = true; // the report's times are printed whole
     bool restore_edram = true;
     uint32_t repeat = 1;
+    size_t profile_top = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) out_path = argv[++i];
@@ -67,9 +78,18 @@ int main(int argc, char **argv) {
         else if (a == "--gpu-time") options.gpu_timing = true;
         else if (a == "--gpu-time-draws") options.gpu_timing = options.gpu_timing_draws = true;
         else if (a == "--repeat" && i + 1 < argc) repeat = uint32_t(std::max(1, std::atoi(argv[++i])));
+        // the driver's pipeline cache kept in a file between runs (timing runs
+        // otherwise spend most of their time making the frame's pipelines)
+        else if (a == "--pipeline-cache" && i + 1 < argc) options.pipeline_cache = argv[++i];
+        else if (a == "--profile" && i + 1 < argc) profile_top = size_t(std::max(1, std::atoi(argv[++i])));
         // pipelines made on worker threads, their draws skipped meanwhile (as
         // the player plays; a replay otherwise waits for each)
         else if (a == "--async-pipelines") options.async_pipelines = true;
+        // the resolution scale in percent (50-800 in steps of 25) and the
+        // minimum scalable dimension (docs/renderer.md, "Resolution scale")
+        else if (a == "--scale" && i + 1 < argc)
+            options.resolution_scale = xf::render::Scale::from_percent(std::atoi(argv[++i])).q4;
+        else if (a == "--min-scalable" && i + 1 < argc) options.min_scalable = uint32_t(std::atoi(argv[++i]));
         // what draws while they are made: skip, placeholder or library
         else if (a == "--stand-in" && i + 1 < argc) {
             std::string m = argv[++i];
@@ -86,13 +106,25 @@ int main(int argc, char **argv) {
         // every pipeline linked from libraries, never made whole
         else if (a == "--linked-pipelines")
             options.linked_pipelines_only = true;
+        // every draw the generic shaders can draw drawn by them (renderer.h)
+        else if (a == "--generic")
+            options.generic_only = true;
         // occlusion query reports with the GPU's counts (else the fake ones)
         else if (a == "--occlusion-queries") options.occlusion_queries = xf::gpu::OcclusionQueries::Fast;
+        // screen extent reports as Xenia answers them, the whole screen
+        else if (a == "--whole-extents")
+            options.screen_extents = xf::gpu::ScreenExtents::Whole;
         // Xenia's depth_float24_round
         else if (a == "--depth-float24-round") options.depth_float24_round = true;
         // Xenia's depth_float24_convert_in_pixel_shader
         else if (a == "--depth-float24-convert")
             options.depth_float24_convert_in_pixel_shader = true;
+        // Xenia's xenos_sample_positions
+        else if (a == "--xenos-sample-positions")
+            options.xenos_sample_positions = true;
+        // (the default; this turns it off: the host's standard positions)
+        else if (a == "--no-xenos-sample-positions")
+            options.xenos_sample_positions = false;
         // Xenia's gamma_render_target_as_unorm16 off
         else if (a == "--no-gamma-unorm16")
             options.gamma_render_target_as_unorm16 = false;
@@ -129,23 +161,52 @@ int main(int argc, char **argv) {
     }
     xf::render::Image frame;
     xf::render::Report report;
-    if (!xf::render::replay(trace, *device, options, frame, report, error, restore_edram, repeat)) {
+    // sampled from the first frame shown on: the plays after the first, with everything made
+    bool profiling = false;
+    if (profile_top) {
+        unsigned long thread = xf::sampler::current_thread();
+        // the command processor's work alone, not the trace's walk
+        xf::sampler::scope("CommandProcessor::execute_packets");
+        options.on_frame = [&profiling, thread](uint64_t, const xf::render::Image &) {
+            if (!profiling) profiling = xf::sampler::start(1000, thread);
+        };
+    }
+    double cpu_before = xf::sampler::process_cpu_seconds();
+    bool replayed = xf::render::replay(trace, *device, options, frame, report, error, restore_edram, repeat);
+    double cpu = xf::sampler::process_cpu_seconds() - cpu_before;
+    if (profiling) xf::sampler::stop_and_report(profile_top);
+    if (!replayed) {
         std::fprintf(stderr, "replay: %s\n", error.c_str());
         return 1;
     }
+    if (repeat > 1 && cpu_before >= 0)
+        std::printf("  %.3f ms of CPU (all threads) a play, the trace's walk and the first play included\n",
+                    cpu * 1000 / repeat);
 
     std::printf("%s (title %08X) on %s\n", trace_path.c_str(), trace.title_id, device->name().c_str());
     std::printf("  packets %llu, draws %llu: drawn %llu, resolves %llu, swaps %llu\n", (unsigned long long)report.packets,
                 (unsigned long long)report.draws, (unsigned long long)report.drawn, (unsigned long long)report.resolves,
                 (unsigned long long)report.swaps);
-    std::printf("  made: %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
+    std::printf("  made: %llu render targets, %llu textures, %llu pipelines, %llu shaders (%llu samplers' slots "
+                "reused)\n",
                 (unsigned long long)report.render_targets, (unsigned long long)report.textures,
-                (unsigned long long)report.pipelines, (unsigned long long)report.shaders);
+                (unsigned long long)report.pipelines, (unsigned long long)report.shaders,
+                (unsigned long long)report.samplers_reused);
     std::printf("  pipelines: %.3f s making them, %llu libraries, %llu linked, %llu placeholders, %llu draws by a "
                 "stand-in\n",
                 report.pipeline_seconds, (unsigned long long)report.pipeline_libraries,
                 (unsigned long long)report.pipelines_linked, (unsigned long long)report.pipeline_placeholders,
                 (unsigned long long)report.stand_in_draws);
+    std::printf("  generic shaders: %llu programs, %llu stand-ins linked, %llu draws drawn by them\n",
+                (unsigned long long)report.generic_programs, (unsigned long long)report.generic_pipelines,
+                (unsigned long long)report.generic_draws);
+    for (const auto &[why, n] : report.generic_refused)
+        std::printf("    %llu draws not drawn by them: %s\n", (unsigned long long)n, why.c_str());
+    std::printf("  shaders: %llu forms translated on the workers (%.3f s there)\n", (unsigned long long)report.translations_async, report.translate_async_seconds);
+    std::printf("  shaders: %.3f s translating %llu forms (%.2f ms each, at most %.2f ms)\n", report.translate_seconds,
+                (unsigned long long)report.translations,
+                report.translations ? report.translate_seconds * 1000.0 / double(report.translations) : 0.0,
+                report.translate_max * 1000.0);
     if (report.pipeline_waits)
         std::printf("  %llu pipelines made on the workers, their draws without one for %.1f ms on average, %.1f ms "
                     "at most\n",
@@ -166,12 +227,31 @@ int main(int argc, char **argv) {
                 double(report.texture_bytes) / (1 << 20),
                 double(report.texture_bytes_peak) / (1 << 20), (unsigned long long)report.textures_evicted,
                 (unsigned long long)report.textures_evicted_for_room, (unsigned long long)report.textures_refused);
-    std::printf("  texture loads: %llu new, %llu after the CPU wrote their memory, %llu after a resolve or an export\n",
+    std::printf("  texture loads: %llu new, %llu after the CPU wrote their memory, %llu after a resolve or an export; "
+                "%llu resolves wrote the texture they feed\n",
                 (unsigned long long)report.texture_loads_new, (unsigned long long)report.texture_loads_cpu_written,
-                (unsigned long long)report.texture_loads_gpu_written);
+                (unsigned long long)report.texture_loads_gpu_written,
+                (unsigned long long)report.resolve_targets_written);
+    if (report.textures_scaled)
+        std::printf("  %llu textures made the resolution scale's\n", (unsigned long long)report.textures_scaled);
     if (report.zpd_reports)
         std::printf("  occlusion: %llu queries for %llu reports\n", (unsigned long long)report.occlusion_queries,
                     (unsigned long long)report.zpd_reports);
+    if (report.viz_queries)
+        std::printf("  VIZ queries: %llu, %llu predicating %llu draws on the GPU\n",
+                    (unsigned long long)report.viz_queries, (unsigned long long)report.viz_armed,
+                    (unsigned long long)report.viz_predicated);
+    if (report.extent_reports)
+        std::printf("  screen extents: %llu reports, %llu bounded\n", (unsigned long long)report.extent_reports,
+                    (unsigned long long)report.extent_bounded);
+    if (!report.command_seconds.empty()) {
+        // the command thread's work a play: the median and the fastest of the plays after the first
+        std::vector<double> plays = report.command_seconds;
+        std::sort(plays.begin(), plays.end());
+        std::printf("  commands a play: %.3f ms median, %.3f ms fastest, of %zu plays\n",
+                    plays[plays.size() / 2] * 1000, plays.front() * 1000, plays.size());
+        std::printf("  the thread's processor time a play: %.2f ms\n", report.command_cpu_seconds * 1000);
+    }
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)
         std::printf("  approx  %6llu  %s\n", (unsigned long long)n, what.c_str());
@@ -208,9 +288,16 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (uint32_t(w) != frame.width || uint32_t(h) != frame.height) {
-        std::printf("  compare: Xenia's frame is %dx%d, ours %ux%u\n", w, h, frame.width, frame.height);
-        stbi_image_free(ref);
-        return 1;
+        // a frame drawn at a resolution scale: compared at the console's size,
+        // box filtered down (or nearest up) to the reference's
+        if (options.resolution_scale == 4) {
+            std::printf("  compare: Xenia's frame is %dx%d, ours %ux%u\n", w, h, frame.width, frame.height);
+            stbi_image_free(ref);
+            return 1;
+        }
+        std::printf("  compared at %dx%d, resampled from %ux%u\n", w, h, frame.width, frame.height);
+        frame.rgba = xf::render::resample_box(frame.rgba, frame.width, frame.height, uint32_t(w), uint32_t(h));
+        frame.width = uint32_t(w), frame.height = uint32_t(h);
     }
     // the color only: both are shown opaque
     uint64_t sum = 0, off = 0;

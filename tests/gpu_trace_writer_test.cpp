@@ -115,7 +115,8 @@ void frames(bool compress) {
     options.compress = compress;
     TraceWriter writer(cp, &backend, &backend, options);
     cp.set_sink(&writer);
-    CHECK(backend.trace == &writer);
+    // (the backend is told of the writer while a frame is traced, not before)
+    CHECK(backend.trace == nullptr);
     for (size_t i = 0; i < backend.edram.size(); i++) backend.edram[i] = uint8_t(i * 7 / 4096);
 
     uint32_t ring = physical_alloc(0x10000), data = physical_alloc(0x10000), ib = physical_alloc(0x1000);
@@ -133,6 +134,7 @@ void frames(bool compress) {
     cp.run(w.n);
     CHECK(!std::filesystem::exists(dir / "58460001_0.xtr"));
     CHECK(backend.settled == 1);
+    CHECK(backend.trace == &writer);
 
     // frame 1: a register write, constants from memory, a fence, an
     // indirect buffer with a register write inside, draws reading memory

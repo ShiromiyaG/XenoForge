@@ -1,0 +1,30 @@
+// EDRAM's tiles from one resolution scale's layout to another's (docs/
+// renderer.md, "Resolution scale"): a trace's EDRAM snapshot, at the
+// console's size, into EDRAM drawn at a scale, and EDRAM back to the
+// console's size for a trace being written. Each tile is resampled on its
+// own, nearest: a destination dword takes the source dword whose position in
+// its tile is nearest (columns taken in pairs, so the two dwords of a 64-bit
+// sample stay together; with MSAA the samples are resampled as the grid they
+// are laid out in, which is approximate, as a snapshot between scales must be).
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer Source { uint words[]; } src;
+layout(set = 0, binding = 1) writeonly buffer Dest { uint words[]; } dst;
+
+layout(push_constant) uniform Rescale {
+    uint from_q4, to_q4; // the scales in quarters (render_scale.h)
+} p;
+
+void main() {
+    uint to_width = 20u * p.to_q4, to_dwords = 80u * p.to_q4 * p.to_q4;
+    uint from_width = 20u * p.from_q4, from_dwords = 80u * p.from_q4 * p.from_q4;
+    uint local = gl_GlobalInvocationID.x, tile = gl_GlobalInvocationID.y;
+    if (local >= to_dwords) return;
+    uint x = local % to_width, y = local / to_width;
+    // render_scale.h's Scale::map: floor((i + 0.5) * from / to)
+    uint pair = (((x >> 1u) * 2u + 1u) * p.from_q4) / (2u * p.to_q4);
+    uint sx = pair * 2u + (x & 1u), sy = ((y * 2u + 1u) * p.from_q4) / (2u * p.to_q4);
+    dst.words[tile * to_dwords + local] = src.words[tile * from_dwords + sy * from_width + sx];
+}

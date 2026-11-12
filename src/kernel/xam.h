@@ -82,6 +82,9 @@ void complete_overlapped(Kernel &k, uint32_t overlapped, uint32_t result, uint32
 void complete_overlapped_immediate(Kernel &k, uint32_t overlapped, uint32_t result);
 void complete_overlapped_immediate_ex(Kernel &k, uint32_t overlapped, uint32_t result, uint32_t extended_error,
                                       uint32_t length);
+// The first half of a deferred completion: the request pending (result X_ERROR_IO_PENDING, the calling thread in
+// the context, the event cleared). complete_overlapped finishes it, from any thread, whenever the work is done.
+void begin_overlapped(Kernel &k, uint32_t overlapped);
 // CompleteOverlappedDeferredEx, run at once here (Xenia runs it 25 ms later
 // on its dispatch thread): returns X_ERROR_IO_PENDING
 using OverlappedRun = std::function<uint32_t(uint32_t &extended_error, uint32_t &length)>;
@@ -165,6 +168,15 @@ uint32_t config_language(Kernel &k);
 // default language (XSTC, else English), by string id (xam_locale.cpp)
 std::map<uint16_t, std::u16string> spa_strings(Kernel &k, uint32_t base, uint32_t size);
 
+// The running title's achievement the user earns (XGIUserWriteAchievements):
+// recorded in the user's GPD for the title, with the SPA's name and score, and
+// logged. False when the title has no such achievement; true too when it was
+// earned already (xam_user.cpp).
+bool earn_achievement(Kernel &k, uint32_t user_index, uint32_t achievement_id);
+
+// A toast for the host's handler (kernel.h, set_toast_handler); false, and nothing done, when there is none
+bool toast(Kernel &k, const Toast &t);
+
 // the running title's ID (its execution info)
 uint32_t title_id(Kernel &k);
 
@@ -188,6 +200,10 @@ class Enumerator : public Object {
     std::vector<uint8_t> items; // item_size each
     size_t current = 0;
     // XStaticUntypedEnumerator::WriteItems
+    // an enumerator whose items are more than fixed-size records (strings
+    // behind pointers) writes them itself: from the item at `current`,
+    // advancing it; the status, the count written
+    std::function<uint32_t(Kernel &, uint32_t buffer, uint32_t buffer_size, uint32_t &count)> writer;
     uint32_t write_items(Kernel &k, uint32_t buffer, uint32_t buffer_size, uint32_t &count);
     size_t count() const { return item_size ? items.size() / item_size : 0; }
     uint8_t *append() {
@@ -210,6 +226,14 @@ void put_u16(Kernel &k, uint32_t address, std::u16string_view s, size_t count);
 // The run ends with the reason (the title exits, launches another, asks
 // for another disc), from the calling thread (xam.cpp).
 [[noreturn]] void end_title(Kernel &k, const std::string &why);
+// The title ends: the terminate notifications run (modules.cpp), the exit
+// recorded in Kernel::title_exit (a launch of `path`, "" for the dashboard,
+// or a plain end), then end_title.
+[[noreturn]] void exit_title(Kernel &k, bool launch, const std::string &path, uint32_t flags, uint32_t exit_code,
+                             const std::string &why);
+void run_title_terminate_notifications(Kernel &k, ppc::Context &c);
+// The launch data XamLoaderSetLaunchData kept (xam.cpp)
+std::vector<uint8_t> launch_data(Kernel &k);
 
 // A console setting (ExGetXConfigSetting's, by category and id): its bytes,
 // empty when there is none; a 32-bit one, or the fallback (xam_info.cpp).

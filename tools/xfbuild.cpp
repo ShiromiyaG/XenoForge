@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] "
                              "[--keep] [--force] [--cancel-after S] [--quiet] [--entry <hex>]... "
-                             "[--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only] "
+                             "[--no-entry-log] [--no-shaders] [--no-disc-shaders] [--disc-variants N] [--shaders-only] "
                              "[--project <file.toml>]\n");
         return 2;
     }
@@ -92,6 +92,8 @@ int main(int argc, char **argv) {
             options.shaders_only = true;
         else if (a == "--no-disc-shaders")
             options.disc_shaders = false;
+        else if (a == "--disc-variants" && k + 1 < argc)
+            options.disc_variants = uint32_t(std::max(0, std::atoi(argv[++k])));
         else if (a == "--project" && k + 1 < argc)
             options.project = argv[++k];
         else if (a == "--entry" && k + 1 < argc)

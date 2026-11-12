@@ -130,6 +130,18 @@ bool parse_xex(std::span<const uint8_t> file, Xex &out, std::string &error);
 // Decrypts (retail key, else devkit) and unpacks the image into xex.image.
 bool load_xex_image(std::span<const uint8_t> file, Xex &xex, std::string &error);
 
+// A title update's patch (a .xexp, Xex::is_patch) applied to its base
+// executable, loaded by load_xex_image: the headers and the image as the
+// update makes them (xex.header, the fields read from it, xex.image). The
+// patch names the executable it was made for (the SHA-1 of its signature):
+// another one is refused, and xex is left as it was, as after a patch whose
+// headers or keys are wrong. Once the image is being patched a failure
+// leaves xex without one.
+bool apply_xex_patch(Xex &xex, std::span<const uint8_t> patch_file, std::string &error);
+
+// parse_xex, load_xex_image and, with a patch, apply_xex_patch
+bool load_xex(std::span<const uint8_t> file, std::span<const uint8_t> patch, Xex &xex, std::string &error);
+
 // One import: a function's thunk or a variable, from the records in the image.
 struct XexImport {
     size_t library; // index in import_libraries

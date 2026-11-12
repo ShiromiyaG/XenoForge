@@ -345,6 +345,17 @@ static void watches(Memory &mem) {
     // the other watched pages still fault
     mem.translate(guest + 3 * page)[0] = 4;
     CHECK(stamp(3 * page) > after);
+    // the pages' blocks: each the largest of its pages' stamps
+    {
+        const std::atomic<uint32_t> *blocks = mem.write_block_stamps();
+        const uint32_t first = physical >> shift, last = (physical + 0x100000 - 1) >> shift;
+        for (uint32_t b = first >> Memory::WRITE_BLOCK_SHIFT; b <= last >> Memory::WRITE_BLOCK_SHIFT; b++) {
+            uint32_t largest = 0;
+            for (uint32_t p = b << Memory::WRITE_BLOCK_SHIFT; p < (b + 1) << Memory::WRITE_BLOCK_SHIFT; p++)
+                largest = std::max(largest, stamps[p].load());
+            CHECK(blocks[b].load() == largest);
+        }
+    }
 
     // threads writing their own watched pages at once
     mem.watch(physical, 0x100000);

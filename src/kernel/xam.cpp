@@ -108,7 +108,7 @@ void complete_overlapped_immediate(Kernel &k, uint32_t ov, uint32_t result) {
     complete_overlapped_immediate_ex(k, ov, result, result, result ? 0xFFFFFFFF : 0);
 }
 
-uint32_t complete_overlapped_deferred(Kernel &k, uint32_t ov, const OverlappedRun &run) {
+void begin_overlapped(Kernel &k, uint32_t ov) {
     k.store32(ov + xoverlapped::RESULT, X_ERROR_IO_PENDING);
     k.store32(ov + xoverlapped::CONTEXT, current_thread_handle());
     Objects &o = objects(k);
@@ -118,6 +118,10 @@ uint32_t complete_overlapped_deferred(Kernel &k, uint32_t ov, const OverlappedRu
             e->set_signal_state(0);
         }
     }
+}
+
+uint32_t complete_overlapped_deferred(Kernel &k, uint32_t ov, const OverlappedRun &run) {
+    begin_overlapped(k, ov);
     uint32_t extended_error = 0, length = 0;
     uint32_t result = run(extended_error, length);
     complete_overlapped(k, ov, result, extended_error, length);
@@ -278,6 +282,16 @@ const User *user_by_xuid(Kernel &k, uint64_t xuid) {
 
 const User &user_profile(Kernel &k) { return xam(k).user; }
 
+// (a gamertag: 15 characters at most, as the console's accounts have)
+void set_gamertag(Kernel &k, const std::string &name) {
+    if (!name.empty()) xam(k).user.name = name.substr(0, 15);
+}
+
+void set_user(Kernel &k, uint64_t xuid, const std::string &name) {
+    if (xuid) xam(k).user.xuid = xuid;
+    set_gamertag(k, name);
+}
+
 bool set_signed_in(Kernel &k, bool signed_in) { return xam(k).signed_out.exchange(!signed_in) == signed_in; }
 
 uint32_t title_id(Kernel &k) { return k.xex() ? k.xex()->execution.title_id : 0; }
@@ -351,15 +365,42 @@ XF_EXPORT(xam, XamLoaderSetLaunchData) {
     result(c, 0);
 }
 
-// (name, flags): another executable, or the dashboard with no name
-XF_EXPORT(xam, XamLoaderLaunchTitle) {
-    uint32_t name = arg(k, c, 0);
-    std::string path = name ? reinterpret_cast<const char *>(k.host(name)) : "";
-    end_title(k, path.empty() ? "the title exits to the dashboard (XamLoaderLaunchTitle)"
-                              : "the title launches " + path + " (XamLoaderLaunchTitle)");
+void set_launch_data(Kernel &k, const std::vector<uint8_t> &data) {
+    XamState &s = xam(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    s.launch_data = data;
+    if (s.launch_data.size() > MAX_LAUNCH_DATA_SIZE) s.launch_data.resize(MAX_LAUNCH_DATA_SIZE);
 }
 
-XF_EXPORT(xam, XamLoaderTerminateTitle) { end_title(k, "the title exits to the dashboard (XamLoaderTerminateTitle)"); }
+std::vector<uint8_t> launch_data(Kernel &k) {
+    XamState &s = xam(k);
+    std::lock_guard<std::mutex> l(s.mutex);
+    return s.launch_data;
+}
+
+// The title ends: the terminate notifications run, then the exit is
+// recorded (Kernel::title_exit) and the run stops. Xenia asks the user to
+// restart with the launch data; here the host starts the next title.
+void exit_title(Kernel &k, bool launch, const std::string &path, uint32_t flags, uint32_t exit_code,
+                const std::string &why) {
+    if (ppc::Context *c = Kernel::current_context()) run_title_terminate_notifications(k, *c);
+    Kernel::TitleExit &e = k.title_exit;
+    e.launch = launch, e.path = path, e.flags = flags, e.exit_code = exit_code, e.launch_data = launch_data(k);
+    end_title(k, why);
+}
+
+// (name, flags): another executable, or the dashboard with no name
+XF_EXPORT(xam, XamLoaderLaunchTitle) {
+    uint32_t name = arg(k, c, 0), flags = arg(k, c, 1);
+    std::string path = name ? reinterpret_cast<const char *>(k.host(name)) : "";
+    exit_title(k, true, path, flags, 0,
+               path.empty() ? "the title exits to the dashboard (XamLoaderLaunchTitle)"
+                            : "the title launches " + path + " (XamLoaderLaunchTitle)");
+}
+
+XF_EXPORT(xam, XamLoaderTerminateTitle) {
+    exit_title(k, false, "", 0, 0, "the title exits to the dashboard (XamLoaderTerminateTitle)");
+}
 
 // ---- the title's information (xam_info.cc) ----
 
@@ -439,6 +480,7 @@ XF_EXPORT(xam, XamFree) {
 Enumerator::~Enumerator() = default;
 
 uint32_t Enumerator::write_items(Kernel &k, uint32_t buffer, uint32_t buffer_size, uint32_t &written) {
+    if (writer) return writer(k, buffer, buffer_size, written);
     size_t n = std::min<size_t>(count() - current, items_per_enumerate);
     if (!n) return X_ERROR_NO_MORE_FILES;
     if (n * item_size > buffer_size)

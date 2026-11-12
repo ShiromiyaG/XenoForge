@@ -5,6 +5,7 @@
 #include "xenoforge/command_processor.h"
 #include "xenoforge/crash.h"
 #include "xenoforge/disc.h"
+#include "xenoforge/game_source.h"
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
 #include "xenoforge/hooks.h"
@@ -45,11 +46,11 @@ bool load(const std::string &input, const std::string &xex_path, Xex &xex, std::
         if (!f) return error = "cannot read " + input, false;
         file.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     } else {
-        auto disc = Disc::open(input, error);
-        if (!disc) return false;
-        const DiscEntry *entry = disc->find(xex_path);
-        if (!entry) return error = "no " + xex_path + " on the disc", false;
-        file = disc->read_all(*entry);
+        auto source = GameSource::open(input, error);
+        if (!source) return false;
+        const GameSource::File *entry = source->find(xex_path);
+        if (!entry) return error = "no " + xex_path + (source->package() ? " in the package" : " on the disc"), false;
+        file = source->read_all(*entry);
     }
     return parse_xex(file, xex, error) && load_xex_image(file, xex, error);
 }
@@ -92,13 +93,15 @@ void print_renderer_report(const render::Report &r) {
                 double(r.writeback_bytes) / (1 << 20));
     std::printf("renderer: %llu submissions, %llu waits for the GPU\n", (unsigned long long)r.submissions,
                 (unsigned long long)r.waits);
-    std::printf("renderer: made %llu render targets, %llu textures, %llu pipelines, %llu shaders\n",
+    std::printf("renderer: made %llu render targets, %llu textures, %llu pipelines, %llu shaders (%llu shader loads "
+                "from unwritten words, nothing copied)\n",
                 (unsigned long long)r.render_targets, (unsigned long long)r.textures, (unsigned long long)r.pipelines,
-                (unsigned long long)r.shaders);
+                (unsigned long long)r.shaders, (unsigned long long)r.shader_loads_again);
     std::printf("renderer: texture loads: %llu new, %llu again after the CPU wrote their memory, %llu after a resolve "
-                "or a memory export did\n",
+                "or a memory export did; %llu resolves wrote the texture they feed (%llu table places taken back)\n",
                 (unsigned long long)r.texture_loads_new, (unsigned long long)r.texture_loads_cpu_written,
-                (unsigned long long)r.texture_loads_gpu_written);
+                (unsigned long long)r.texture_loads_gpu_written, (unsigned long long)r.resolve_targets_written,
+                (unsigned long long)r.resolve_targets_reclaimed);
     std::printf(
         "renderer: texture cache: %llu textures (%llu views) held in %.1f MB (at most %.1f MB), %llu destroyed by the "
         "memory limits, %llu to make room in a bindless table, %llu loads refused for want of it\n",
@@ -107,10 +110,23 @@ void print_renderer_report(const render::Report &r) {
         (unsigned long long)r.textures_evicted_for_room, (unsigned long long)r.textures_refused);
     std::printf("renderer: %.2f s making pipelines; the pipeline cache: %.1f KB read at the start, %.1f KB written\n",
                 r.pipeline_seconds, r.pipeline_cache_read / 1024.0, r.pipeline_cache_written / 1024.0);
+    std::printf("renderer: generic shaders: %llu programs, %llu stand-ins linked, %llu draws drawn by them; %llu shader "
+                "forms translated on the workers (%.2f s there)\n",
+                (unsigned long long)r.generic_programs, (unsigned long long)r.generic_pipelines,
+                (unsigned long long)r.generic_draws, (unsigned long long)r.translations_async, r.translate_async_seconds);
+    for (const auto &[why, n] : r.generic_refused)
+        std::printf("renderer:   %llu draws waiting not drawn by them: %s\n", (unsigned long long)n, why.c_str());
+    std::printf("renderer: %.3f s translating %llu shader forms on its thread (%.2f ms each, at most %.2f ms; at most "
+                "%.1f ms in one frame)\n",
+                r.translate_seconds, (unsigned long long)r.translations,
+                r.translations ? r.translate_seconds * 1000.0 / double(r.translations) : 0.0, r.translate_max * 1000.0,
+                r.translate_frame_max * 1000.0);
     std::printf("renderer: shader storage: %llu shaders and %llu pipelines added; made at once as the build step made "
-                "them: %llu pipelines, %llu libraries\n",
+                "them: %llu pipelines, %llu libraries (%llu and %llu of them not in the pipeline cache, left to the "
+                "workers)\n",
                 (unsigned long long)r.shaders_stored, (unsigned long long)r.pipelines_stored,
-                (unsigned long long)r.pipelines_prebuilt, (unsigned long long)r.pipeline_libraries_prebuilt);
+                (unsigned long long)r.pipelines_prebuilt, (unsigned long long)r.pipeline_libraries_prebuilt,
+                (unsigned long long)r.pipelines_prebuilt_missed, (unsigned long long)r.pipeline_libraries_prebuilt_missed);
     std::printf(
         "renderer: %llu pipeline libraries, %llu pipelines linked, %llu placeholders, %llu draws by a stand-in; "
         "hitches: %llu frames with more than 4 ms making pipelines (at most %.1f ms), %llu swaps more than 50 ms "
@@ -177,7 +193,7 @@ void load_game_library(const Options &options, Game &g) {
     size_t functions = 0;
     for (size_t i = 0; i < loaded->count; i++) functions += loaded->modules[i]->count;
     g.kernel->set_generated_modules(loaded->modules, loaded->count);
-    g.generated_modules = loaded->count, g.generated_functions = functions;
+    g.generated_modules = loaded->count, g.generated_functions = functions, g.installed_modules = loaded->modules;
     std::printf("generated code: %zu modules, %zu functions (the game library %s)\n", loaded->count, functions,
                 library.string().c_str());
     // what discovery missed, logged beside the library for its next build
@@ -226,9 +242,19 @@ bool open(const Options &options, Game &g, std::string &error) {
     if (!record.empty() && !kernel::record_input(k, record, error)) return error = "input: " + error, false;
     bool bare = input.ends_with(".xex") || input.ends_with(".XEX");
     bool mounted = bare ? kernel::mount_directory(k, std::filesystem::path(input).parent_path(), error)
-                        : kernel::mount_disc(k, input, error);
+                   : GameSource::is_package(input) ? kernel::mount_package(k, input, error)
+                                                   : kernel::mount_disc(k, input, error);
     if (!mounted || !kernel::mount_storage(k, options.storage, error)) return error = "mount: " + error, false;
     std::printf("storage: %s\n", options.storage.string().c_str());
+    kernel::set_content_format(k, options.content_format);
+    // the console's settings: what the player chose, and the settings titles wrote in earlier runs
+    // (kept in the storage root, except in the deterministic mode, which starts from the defaults)
+    {
+        kernel::SystemSettings system = options.system;
+        if (system.file.empty() && !options.deterministic && !options.storage.empty())
+            system.file = options.storage / "xconfig.bin";
+        kernel::apply_system_settings(k, system);
+    }
     // its module's path, which the DLLs it loads by a bare name are next to
     kernel::set_executable_path(k, "game:\\" +
                                        (bare ? std::filesystem::path(input).filename().string() : options.xex_path));
@@ -238,7 +264,9 @@ bool open(const Options &options, Game &g, std::string &error) {
         size_t functions = 0;
         for (size_t i = 0; i < options.module_count; i++) functions += options.modules[i]->count;
         if (!options.interpret) k.set_generated_modules(options.modules, options.module_count);
-        if (!options.interpret) g.generated_modules = options.module_count, g.generated_functions = functions;
+        if (!options.interpret)
+            g.generated_modules = options.module_count, g.generated_functions = functions,
+            g.installed_modules = options.modules;
         std::printf("generated code: %zu modules, %zu functions%s\n", options.module_count, functions,
                     options.interpret ? " (left out: --interpret)" : "");
     } else if (!options.interpret) {
@@ -318,6 +346,24 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     const char *queries = std::getenv("XF_OCCLUSION_QUERIES");
     processor.set_occlusion_queries(queries && std::string(queries) == "fake" ? gpu::OcclusionQueries::Fake
                                                                               : gpu::OcclusionQueries::Fast);
+    // screen extents: the bounds of what the draws rasterized (beyond Xenia)
+    // where measuring them gains, the whole screen, as Xenia answers,
+    // where it does not (the default: CommandProcessor::set_screen_extents_by_gain);
+    // XF_SCREEN_EXTENTS=measured or =whole for one of them always. The
+    // answer changes no picture, only how many of predicated tiling's tiles
+    // a draw runs in: a scene drawn twice a frame, a tile each, went from 20
+    // to 28 frames a second measured, its second tile leaving out a third of
+    // the draws, while measured bounds have the command processor wait for
+    // the GPU at each interrupt or wait the guest's extents may be read at,
+    // which gained another game nothing (docs/renderer.md, "Screen extents
+    // live" and "Screen extents by their gain").
+    const char *extents = std::getenv("XF_SCREEN_EXTENTS");
+    if (extents && std::string(extents) == "measured")
+        processor.set_screen_extents(gpu::ScreenExtents::Measured);
+    else if (extents && std::string(extents) == "whole")
+        processor.set_screen_extents(gpu::ScreenExtents::Whole);
+    else
+        processor.set_screen_extents_by_gain();
     // when the CPU sees what resolves wrote (Xenia's readback_resolve):
     // XF_READBACK_RESOLVE=none (the default, as Xenia's), fast or full
     if (const char *mode = std::getenv("XF_READBACK_RESOLVE")) {
@@ -341,11 +387,12 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
     if (!g.renderer) return error = "renderer: " + error, false;
     processor.set_sink(g.renderer.get());
     // frames traced as XF_TRACE_FRAMES and XF_TRACE_DIR say (the player's
-    // way to them; boot has --trace-frames)
-    if (const char *frames = std::getenv("XF_TRACE_FRAMES")) {
+    // way to them; boot has --trace-frames); XF_TRACE_DIR alone, none until
+    // the player's F4 asks for the next
+    const char *frames = std::getenv("XF_TRACE_FRAMES"), *dir = std::getenv("XF_TRACE_DIR");
+    if (frames || dir) {
         std::set<uint64_t> numbers;
-        if (!parse_numbers(frames, numbers)) return error = "XF_TRACE_FRAMES: not a list of frames", false;
-        const char *dir = std::getenv("XF_TRACE_DIR");
+        if (frames && !parse_numbers(frames, numbers)) return error = "XF_TRACE_FRAMES: not a list of frames", false;
         if (!start_trace(g, numbers, dir ? dir : "traces", error)) return false;
     }
     return true;
@@ -623,6 +670,15 @@ void print_rates(Game &g, Rates &r, double wall, const std::string &extra) {
     std::printf("rates: %6.1f s (guest %6.1f s): %6llu swaps, %5.1f/s, %6.0f draws/s, %4.0f resolves/s%s%s%s\n", wall,
                 g.kernel->uptime_ms() / 1000.0, (unsigned long long)swaps, (swaps - r.last_swaps) / dt,
                 (draws - r.last_draws) / dt, (resolves - r.last_resolves) / dt, renderer, resident, extra.c_str());
+    // the command processor's thread: its time running packets without its
+    // waits (WAIT_REG_MEM), a swap; what a frame's commands cost the host
+    const uint64_t run_ns = counts.run_ns.load(), wait_ns = counts.wait_ns.load();
+    if (swaps > r.last_swaps)
+        std::printf("commands: %.1f ms a swap (%.1f ms in waits)\n",
+                    (double(run_ns - r.last_run_ns) - double(wait_ns - r.last_wait_ns)) / 1e6 /
+                        double(swaps - r.last_swaps),
+                    double(wait_ns - r.last_wait_ns) / 1e6 / double(swaps - r.last_swaps));
+    r.last_run_ns = run_ns, r.last_wait_ns = wait_ns;
     std::fflush(stdout);
     r.last_wall = wall, r.last_swaps = swaps, r.last_draws = draws, r.last_resolves = resolves;
 }
@@ -641,6 +697,39 @@ bool parse_numbers(const std::string &list, std::set<uint64_t> &out) {
         for (uint64_t n = first; n <= last; n++) out.insert(n);
     }
     return true;
+}
+
+std::string disc_path(std::string path) {
+    std::string lower = path;
+    for (char &ch : lower) ch = char(std::tolower((unsigned char)ch));
+    for (const char *prefix : {"game:", "d:", "\\device\\cdrom0", "\\device\\harddisk0\\cdrom0"}) {
+        size_t n = std::strlen(prefix);
+        if (lower.compare(0, n, prefix) != 0) continue;
+        path = path.substr(n);
+        while (!path.empty() && (path[0] == '\\' || path[0] == '/')) path.erase(0, 1);
+        for (char &ch : path)
+            if (ch == '\\') ch = '/';
+        return path;
+    }
+    return {};
+}
+
+std::vector<std::string> relaunch_args(const std::vector<std::string> &args,
+                                       const std::vector<std::pair<std::string, std::string>> &replace) {
+    std::vector<std::string> out;
+    for (size_t i = 0; i < args.size(); i++) {
+        bool dropped = false;
+        for (const auto &r : replace)
+            if (i > 0 && args[i] == r.first) {
+                dropped = true;
+                if (i + 1 < args.size()) i++;
+                break;
+            }
+        if (!dropped) out.push_back(args[i]);
+    }
+    for (const auto &r : replace)
+        if (!r.second.empty()) out.insert(out.end(), {r.first, r.second});
+    return out;
 }
 
 bool parse_press(const std::string &text, Press &out, std::string &error) {

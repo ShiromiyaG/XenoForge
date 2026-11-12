@@ -1,0 +1,11 @@
+{
+    "file_format_version": "1.1.2",
+    "layer": {
+        "name": "VK_LAYER_XF_bench",
+        "type": "GLOBAL",
+        "library_path": ".\\xfbench_hook.dll",
+        "api_version": "1.3.0",
+        "implementation_version": "1",
+        "description": "xfbench: the time of every present (docs/renderer.md, the standing benchmark)"
+    }
+}

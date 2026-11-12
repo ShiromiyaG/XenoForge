@@ -19,13 +19,27 @@
 // Direct3D 12 ROV dump in rov/d3d12, its Vulkan FSI dump in rov itself:
 // `--render_target_path_d3d12=rov`, `--render_target_path_vulkan=fsi`), where
 // they are; on host render targets Xenia's default ones, as above.
+//
+// With XF_REPLAY_SCALES=<percent>,<percent>... each trace is replayed again at
+// those resolution scales (docs/renderer.md, "Resolution scale"). Where
+// XF_SCALED_DUMPS holds Xenia's Direct3D 12 dump at that scale
+// (<dir>/rov<n>x on the interlock path, <dir>/<n>x on host render targets,
+// made with --draw_resolution_scale_x/y=<n>), the frame is compared with it
+// at its size, and one whose 100% picture matches Xenia's passes within the
+// SCALED bound below. Otherwise (and for the scales Xenia has not, such as
+// 150%) it is box filtered to the console's size and compared with our own
+// 100% frame, printed only: a scaled frame is not the console's picture
+// (blurs made by bilinear taps between texels blur less over finer
+// texels, as in Xenia's scaled pictures), so no bound holds it there.
 
 #include "check.h"
+#include "xenoforge/render_scale.h"
 #include "xenoforge/renderer.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -55,6 +69,10 @@ std::optional<Picture> load(const std::filesystem::path &png) {
 
 // the mean difference over RGB (of 255) and the share of pixels with a
 // component off by more than 16, in percent; false when the sizes differ
+// a scaled frame against Xenia's at the same scale: the mean difference (of
+// 255) and the share of pixels off by more than 16 (percent)
+constexpr double SCALED_MEAN = 4.0, SCALED_SHARE = 5.0;
+
 struct Difference {
     bool same_size = false;
     double mean = 0, share = 0;
@@ -87,6 +105,12 @@ int main() {
     if (!traces || !dumps) {
         std::printf("XF_TRACES and XF_DUMPS not set: nothing to replay\n");
         return 0;
+    }
+    // (a relative path is the working directory's: ctest runs in the build directory)
+    if (!std::filesystem::is_directory(traces)) {
+        std::printf("XF_TRACES (%s) is not a directory from %s\n", traces,
+                    std::filesystem::current_path().string().c_str());
+        return 1;
     }
     std::string error;
     auto device = xf::vk::Device::open(error);
@@ -150,6 +174,41 @@ int main() {
         std::printf("\n");
         CHECK(passes);
         compared++;
+        // the resolution scales asked for, against this 100% frame
+        const bool exact = to_d3d12 && to_d3d12->passes();
+        const char *scales = std::getenv("XF_REPLAY_SCALES");
+        for (const char *at = scales; at && *at;) {
+            const int percent = std::atoi(at);
+            at = std::strchr(at, ',');
+            if (at) at++;
+            if (percent == 100 || percent <= 0) continue;
+            xf::render::Options scaled_options = options;
+            scaled_options.resolution_scale = xf::render::Scale::from_percent(percent).q4;
+            xf::render::Image scaled;
+            xf::render::Report scaled_report;
+            CHECK(xf::render::replay(trace, *device, scaled_options, scaled, scaled_report, error));
+            if (scaled.rgba.empty()) continue;
+            Picture ours{int(frame.width), int(frame.height), frame.rgba};
+            std::vector<uint8_t> down =
+                xf::render::resample_box(scaled.rgba, scaled.width, scaled.height, frame.width, frame.height);
+            Difference d = compare(down.data(), frame.width, frame.height, ours);
+            std::printf("%-20s at %d%% (%ux%u, %llu textures scaled): mean %.3f, %.3f%% off its 100%% frame",
+                        entry.path().stem().string().c_str(), percent, scaled.width, scaled.height,
+                        (unsigned long long)scaled_report.textures_scaled, d.mean, d.share);
+            const char *scaled_dumps = std::getenv("XF_SCALED_DUMPS");
+            std::optional<Picture> xenia_scaled;
+            if (scaled_dumps && percent % 100 == 0)
+                xenia_scaled = load(std::filesystem::path(scaled_dumps) /
+                                    ((pictures != dumps ? "rov" : "") + std::to_string(percent / 100) + "x") / name);
+            if (xenia_scaled) {
+                Difference x = compare(scaled.rgba.data(), scaled.width, scaled.height, *xenia_scaled);
+                const bool close = x.same_size && x.mean <= SCALED_MEAN && x.share <= SCALED_SHARE;
+                std::printf("; Xenia's at %d%%: mean %.3f, %.3f%% off%s", percent, x.mean, x.share,
+                            close ? "" : exact ? " (past the bound)" : " (past the bound; its 100% frame is not Xenia's)");
+                if (exact) CHECK(close);
+            }
+            std::printf("\n");
+        }
     }
     std::printf("%d frames compared", compared);
     if (vulkan_only) std::printf(", %d matching Vulkan's picture only", vulkan_only);

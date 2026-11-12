@@ -18,6 +18,7 @@
 // where Xenia knowingly approximates (priorities, suspension, a DPC left
 // queued after it ran), the NT kernel's behavior, as noted.
 
+#include "host_clock.h"
 #include "objects.h"
 #include "stacks.h"
 
@@ -25,6 +26,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -62,9 +64,31 @@ void fine_host_timer() {
 #endif
 }
 
+// The host's shortest sleep: Xenia's NanoSleep(100) (NtDelayExecution for one
+// 100 ns unit), which ends at the timer's next tick, 0.5-0.6 ms with the
+// timer at its finest; 50 us on POSIX, whose sleeps are as fine as asked.
+void nap() {
+#ifdef _WIN32
+    using Delay = LONG(NTAPI *)(BOOLEAN, PLARGE_INTEGER);
+    static const Delay delay = [] {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        return ntdll ? reinterpret_cast<Delay>(reinterpret_cast<void *>(GetProcAddress(ntdll, "NtDelayExecution")))
+                     : nullptr;
+    }();
+    LARGE_INTEGER interval;
+    interval.QuadPart = -1;
+    if (delay)
+        delay(FALSE, &interval);
+    else
+        Sleep(1);
+#else
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+#endif
+}
+
 class HostScheduler final : public Scheduler {
 public:
-    explicit HostScheduler(Objects &o) : o_(o), epoch_(std::chrono::steady_clock::now()) {}
+    explicit HostScheduler(Objects &o) : o_(o), epoch_(host_clock::now()) {}
     ~HostScheduler() override {
         {
             std::lock_guard<std::mutex> l(o_.lock);
@@ -131,18 +155,76 @@ public:
 
     void yield() override { std::this_thread::yield(); }
 
+    // A zero-interval delay or NtYieldExecution. Xenia answers both with
+    // Sleep(0), which, like std::this_thread::yield, returns at once when the
+    // host has nothing else to run: a guest thread polling a flag that way
+    // keeps a host core busy for as long as it waits (a game's 1.3 M zero
+    // delays a second). A thread that has done nothing but yield, with at
+    // most SPIN_GAP of guest work between the yields, for SPIN_RUN, is
+    // polling: from then on its yields nap (the host's shortest sleep, as
+    // Xenia does for threads below normal priority) until it does some work.
+    // What the guest sees is unchanged (the answers, which threads are
+    // ready); the poll only notices its flag up to a nap later.
+    // XF_SPIN_NAP=0 keeps every yield a yield.
+    void give_up_slice() override {
+        static const bool napping = [] {
+            const char *v = std::getenv("XF_SPIN_NAP");
+            return !(v && v[0] == '0');
+        }();
+        if (!napping) return yield();
+        thread_local uint64_t returned = 0, polling_since = 0;
+        uint64_t t = now();
+        if (t - returned > SPIN_GAP) polling_since = t;
+        if (t - polling_since >= SPIN_RUN) {
+            naps_.fetch_add(1, std::memory_order_relaxed);
+            nap();
+        } else {
+            yield();
+        }
+        returned = now();
+    }
+
+    // A spin that waits for the GPU sleeps on a condition variable of its
+    // own, which spin_wake() notifies only with a sleeper there.
+    void spin_wait(const std::atomic<uint32_t> &word, uint32_t seen, uint32_t us) override {
+        std::unique_lock<std::mutex> l(spin_lock_);
+        spin_sleepers_.fetch_add(1);
+        spin_cv_.wait_for(l, std::chrono::microseconds(us), [&] { return word.load() != seen; });
+        spin_sleepers_.fetch_sub(1);
+    }
+    void spin_wake() override {
+        if (!spin_sleepers_.load()) return;
+        { std::lock_guard<std::mutex> l(spin_lock_); }
+        spin_cv_.notify_all();
+    }
+
+    std::string report() override {
+        uint64_t n = naps_.load(std::memory_order_relaxed);
+        if (!n) return {};
+        char line[96];
+        std::snprintf(line, sizeof(line), "host scheduler: %llu naps of polling threads\n", (unsigned long long)n);
+        return line;
+    }
+
+    // the host clock (host_clock.h: the CPU's counter, scaled), read by
+    // every mftb: millions of times a second in some games
     uint64_t now() override {
-        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - epoch_)
-                            .count()) /
-               100;
+        uint64_t t = host_clock::now();
+        return t > epoch_ ? t - epoch_ : 0;
     }
 
     void timers_changed() override { clock_cv_.notify_one(); }
 
 private:
-    std::chrono::steady_clock::time_point time_point(uint64_t t) const {
+    // a deadline on now()'s clock as one on steady_clock's, which the host's
+    // waits take: by the time left, so that the two clocks' rates may differ
+    // a little (the counter's frequency is measured) without a wait ending
+    // early or late by the difference accumulated since the start
+    std::chrono::steady_clock::time_point time_point(uint64_t t) {
         constexpr uint64_t CENTURY = 100ull * 365 * 24 * 3600 * 10'000'000;
-        return epoch_ + std::chrono::nanoseconds(std::min(t, CENTURY) * 100);
+        uint64_t current = now();
+        uint64_t left = t > current ? std::min(t - current, CENTURY) : 0;
+        return std::chrono::steady_clock::now() + std::chrono::nanoseconds(left * 100);
     }
 
     // timers and KeTimeStampBundle, every millisecond (Xenia's 1 ms timer)
@@ -155,8 +237,16 @@ private:
         }
     }
 
+    // (100 ns units) the guest work between yields that still counts as
+    // polling, and how long a thread polls before its yields nap
+    static constexpr uint64_t SPIN_GAP = 200, SPIN_RUN = 2'000;
+
     Objects &o_;
-    std::chrono::steady_clock::time_point epoch_;
+    uint64_t epoch_; // host_clock::now() when the scheduler was made
+    std::atomic<uint64_t> naps_{0};
+    std::mutex spin_lock_; // spin_wait's sleepers
+    std::condition_variable spin_cv_;
+    std::atomic<uint32_t> spin_sleepers_{0};
     std::once_flag clock_started_;
     std::thread clock_;
     std::condition_variable clock_cv_;
@@ -202,6 +292,8 @@ void set_cpu(Kernel &k, Thread &t, uint8_t cpu) {
 
 Thread *current_thread() { return current_; }
 void set_current_thread(Thread *t) { current_ = t; }
+void host_fine_timer() { fine_host_timer(); }
+void host_nap() { nap(); }
 
 std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects) { return std::make_unique<HostScheduler>(objects); }
 
@@ -210,6 +302,9 @@ std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects) { return std::m
 Thread::Thread(Objects &owner) : Dispatcher(owner, Type::Thread) {}
 
 Thread::~Thread() {
+#ifdef _WIN32
+    if (host_thread) CloseHandle(host_thread);
+#endif
     Memory &memory = owner.k.memory();
     memory.system_free(tls_static);
     memory.system_free(pcr);
@@ -317,17 +412,62 @@ uint32_t Thread::create(const Params &p) {
     return X_STATUS_SUCCESS;
 }
 
+void Thread::refresh_ready() {
+    bool now = started && !terminated && blocked == Blocked::No;
+    if (now == ready) return;
+    ready = now;
+    owner.ready_threads.fetch_add(now ? 1 : -1, std::memory_order_relaxed);
+}
+
+double Thread::host_cpu_seconds() const {
+#ifdef _WIN32
+    FILETIME created, exited, kernel_time, user_time;
+    if (!host_thread || !GetThreadTimes(host_thread, &created, &exited, &kernel_time, &user_time)) return -1;
+    auto ticks = [](const FILETIME &f) { return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    return double(ticks(kernel_time) + ticks(user_time)) * 1e-7;
+#else
+    timespec ts;
+    if (host_cpu_clock < 0 || clock_gettime(clockid_t(host_cpu_clock), &ts) != 0) return -1;
+    return double(ts.tv_sec) + double(ts.tv_nsec) * 1e-9;
+#endif
+}
+
 void Thread::body() {
     Objects &o = owner;
     Kernel &k = o.k;
     current_ = this;
+    if (!scheduled) {
+        // the host thread named after the guest's (for debuggers and
+        // profilers), and kept for its CPU time in the thread report (a
+        // fiber of the deterministic or the console scheduler has none of its
+        // own: the scheduler reports its processors)
+        char name[48];
+        std::snprintf(name, sizeof(name), "xf guest %u%s%s", id, params.name ? " " : "",
+                      params.name ? params.name : "");
+#ifdef _WIN32
+        host_thread_id = GetCurrentThreadId();
+        host_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, host_thread_id);
+        wchar_t wide[48];
+        for (size_t i = 0; i < sizeof(name); i++)
+            if (!(wide[i] = wchar_t(static_cast<unsigned char>(name[i])))) break;
+        SetThreadDescription(GetCurrentThread(), wide);
+#else
+        clockid_t clock;
+        if (pthread_getcpuclockid(pthread_self(), &clock) == 0) host_cpu_clock = int(clock);
+#if defined(__linux__) || defined(__ANDROID__)
+        name[15] = 0; // the 16 bytes Linux keeps
+        pthread_setname_np(pthread_self(), name);
+#endif
+#endif
+    }
     {
         std::unique_lock<std::mutex> l(o.lock);
         started = true;
+        refresh_ready();
         while (suspend_count > 0) {
-            blocked = Blocked::Suspended;
+            set_blocked(Blocked::Suspended);
             o.scheduler->block(*this, l, Scheduler::NEVER);
-            blocked = Blocked::No;
+            set_blocked(Blocked::No);
         }
         pending.fetch_and(~uint32_t(PENDING_SUSPEND));
         k.host(guest)[kthread::STATE] = kthread::RUNNING;
@@ -383,6 +523,7 @@ void Thread::body() {
     list_remove(k, t + kthread::PROCESS_THREADS);
     k.store32(process + kprocess::THREAD_COUNT, k.load32(process + kprocess::THREAD_COUNT) - 1);
     terminated = true;
+    refresh_ready();
     set_signal_state(1);
     o.signaled(*this);
     std::erase(o.threads, this);
@@ -428,9 +569,9 @@ void Objects::safe_point(Thread &t) {
     if (p & Thread::PENDING_SUSPEND) {
         std::unique_lock<std::mutex> l(lock);
         while (t.suspend_count > 0) {
-            t.blocked = Thread::Blocked::Suspended;
+            t.set_blocked(Thread::Blocked::Suspended);
             scheduler->block(t, l, Scheduler::NEVER);
-            t.blocked = Thread::Blocked::No;
+            t.set_blocked(Thread::Blocked::No);
         }
         t.pending.fetch_and(~uint32_t(Thread::PENDING_SUSPEND));
     }
@@ -482,6 +623,20 @@ ppc::Context *Kernel::current_context() {
     return t ? t->context.get() : nullptr;
 }
 
+uint32_t Kernel::host_thread_id(const std::string &name) {
+    Objects &o = *objects_;
+    std::lock_guard<std::mutex> l(o.lock);
+    // (0x... names the thread by its start address, for those without a name)
+    const bool by_start = name.size() > 2 && name[0] == '0' && (name[1] == 'x' || name[1] == 'X');
+    const uint32_t start = by_start ? uint32_t(std::strtoul(name.c_str() + 2, nullptr, 16)) : 0;
+    for (Thread *t : o.threads) {
+        if (!t->host_thread_id || t->finished) continue;
+        const std::string own = t->params.name ? t->params.name : t->guest_name;
+        if (by_start ? t->params.start_address == start : own.find(name) != std::string::npos) return t->host_thread_id;
+    }
+    return 0;
+}
+
 std::string Kernel::thread_report() {
     Objects &o = *objects_;
     std::lock_guard<std::mutex> l(o.lock);
@@ -492,10 +647,20 @@ std::string Kernel::thread_report() {
                                                                        : "running";
         char line[320];
         const char *name = t->params.name ? t->params.name : t->guest_name.c_str();
-        std::snprintf(line, sizeof(line), "  thread %u%s%s%s (handle 0x%08X, start 0x%08X): %s, pc 0x%08X, lr 0x%08X\n",
+        std::snprintf(line, sizeof(line), "  thread %u%s%s%s (handle 0x%08X, start 0x%08X): %s, pc 0x%08X, lr 0x%08X",
                       t->id, t->main ? " (main)" : "", name[0] ? ", " : "", name, t->self_handle,
                       t->params.start_address, state, t->context->pc, uint32_t(t->context->lr));
         out += line;
+        // the host CPU time it has used (its host thread's; none in the deterministic mode)
+        if (double cpu = t->host_cpu_seconds(); cpu >= 0) {
+            std::snprintf(line, sizeof(line), ", %.1f s of host CPU", cpu);
+            out += line;
+        }
+        if (t->host_thread_id) {
+            std::snprintf(line, sizeof(line), " (host thread %u)", t->host_thread_id);
+            out += line;
+        }
+        out += "\n";
         // what a waiting thread waits on: each object's kind, handle, body
         // and signal state
         if (t->blocked == Thread::Blocked::Wait && !t->waiting_on.empty()) {
@@ -519,7 +684,7 @@ std::string Kernel::thread_report() {
         }
         if (!frames.empty()) out += "    stack:" + frames + "\n";
     }
-    out += o.scheduler->report(); // the deterministic mode's counts
+    out += o.scheduler->report(); // the deterministic mode's counts, the host's naps
     return out;
 }
 
@@ -781,9 +946,9 @@ uint32_t suspend(Objects &o, Thread &t, std::unique_lock<std::mutex> &l) {
     o.k.host(t.kthread())[kthread::SUSPEND_COUNT] = uint8_t(t.suspend_count);
     if (&t == current_thread()) {
         while (t.suspend_count > 0) {
-            t.blocked = Thread::Blocked::Suspended;
+            t.set_blocked(Thread::Blocked::Suspended);
             o.scheduler->block(t, l, Scheduler::NEVER);
-            t.blocked = Thread::Blocked::No;
+            t.set_blocked(Thread::Blocked::No);
         }
     } else {
         t.pending.fetch_or(Thread::PENDING_SUSPEND);
@@ -825,6 +990,7 @@ XF_EXPORT(xboxkrnl, KeSetAffinityThread) {
     // the previous affinity through the pointer, the status returned
     if (previous_ptr) k.store32(previous_ptr, 1u << k.host(t->pcr)[kpcr::CURRENT_CPU]);
     set_cpu(k, *t, fake_cpu(objects(k), uint8_t(affinity)));
+    objects(k).scheduler->affinity_changed(*t);
     result(c, X_STATUS_SUCCESS);
 }
 
@@ -972,12 +1138,11 @@ XF_EXPORT(xboxkrnl, KeEnableFpuExceptions) {
 // is STATUS_NO_YIELD_PERFORMED (0x40000024) when no other thread is ready on the processor, success when one ran
 // (the oracle: with only the caller running it answers 0x40000024; Xenia answers 0 always). Ready here: another
 // guest thread that has started, has not finished, and is not blocked.
+// The count behind it is kept by Thread::refresh_ready, so the answer is one atomic read: the yield path ran
+// 3.6 M times a second in a game and used to walk the thread list under the dispatcher lock each time.
 static uint32_t yield_status(Objects &o, Thread *self) {
-    std::lock_guard<std::mutex> l(o.lock);
-    for (Thread *t : o.threads)
-        if (t != self && t->started && !t->finished && !t->terminated && t->blocked == Thread::Blocked::No)
-            return X_STATUS_SUCCESS;
-    return X_STATUS_NO_YIELD_PERFORMED;
+    int others = o.ready_threads.load(std::memory_order_relaxed) - (self && self->ready ? 1 : 0);
+    return others > 0 ? X_STATUS_SUCCESS : X_STATUS_NO_YIELD_PERFORMED;
 }
 
 // (mode, alertable, interval *): a null interval is not a zero wait. The
@@ -1001,7 +1166,7 @@ XF_EXPORT(xboxkrnl, KeDelayExecutionThread) {
     int64_t interval = int64_t(k.load64(interval_ptr));
     if (!t) return result(c, X_STATUS_SUCCESS);
     if (!interval && !(alertable && o.user_apc_pending(*t))) {
-        o.scheduler->yield();
+        o.scheduler->give_up_slice();
         return result(c, yield_status(o, t));
     }
     uint32_t status = o.wait(*t, {}, false, alertable != 0, o.deadline(interval_ptr));
@@ -1014,7 +1179,7 @@ XF_EXPORT(xboxkrnl, KeDelayExecutionThread) {
 
 XF_EXPORT(xboxkrnl, NtYieldExecution) {
     Objects &o = objects(k);
-    o.scheduler->yield();
+    o.scheduler->give_up_slice();
     result(c, yield_status(o, current_thread()));
 }
 

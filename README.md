@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/branding/xenoforge-wordmark-dark.png">
+    <img alt="XenoForge" src="assets/branding/xenoforge-wordmark-light.png" width="420">
+  </picture>
+</p>
+
 # XenoForge
 
 An ahead-of-time Xbox 360 emulator, and an SDK for ports of specific games.
@@ -31,7 +38,13 @@ build it; to run anything you need your own copy of a game.
 
 ## Building
 
-Needs CMake 3.25+, Ninja, clang and the Vulkan SDK.
+Needs CMake 3.25+, Ninja and clang; no Vulkan SDK. The configure step fetches
+Khronos's Vulkan and SPIR-V headers and volk (cmake/vulkan.cmake); the
+programs load the GPU driver's Vulkan loader at run time. The internal
+shaders are committed as SPIR-V (`src/shaders/spirv`). Where glslc is found
+(the Vulkan SDK's), the build compiles a changed shader into that directory
+again (`XF_SHADERS_REGENERATE`), and the tests check the translator's output
+with spirv-val; commit the `.inc` with the shader.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
@@ -103,6 +116,12 @@ The rest is under its own license:
 - **FFmpeg (LGPL 2.1 or later, `LICENSE-ffmpeg`):** XMA is decoded by FFmpeg,
   built as a separate library (`ffmpeg-xma`) that the programs load at run
   time. Without it, they run with XMA silent.
+- **AMD FidelityFX FSR 1 and CAS (MIT, `third_party/FidelityFX-FSR`,
+  `third_party/FidelityFX-CAS`) and NVIDIA FXAA 3.11 (BSD 3-clause,
+  `third_party/fxaa`):** their headers, unchanged, compiled into the
+  player's output scaling shaders; each folder holds its license.
+- **volk (MIT) and Khronos's Vulkan-Headers (Apache 2.0) and SPIRV-Headers
+  (MIT):** fetched at configure time, unchanged; volk is compiled in.
 - **The player's package:** `cmake --install build --prefix <folder>` makes
   it, with the notices of everything linked in. A game's own player, which
   holds that game's recompiled code, is never part of the package.

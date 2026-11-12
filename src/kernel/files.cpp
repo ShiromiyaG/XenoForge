@@ -557,6 +557,19 @@ bool mount_disc(Kernel &k, const std::filesystem::path &iso, std::string &error)
     return true;
 }
 
+// (Xenia's Emulator::LaunchStfsContainer: the same mount path as a disc's,
+// XDeploymentType::kDownload)
+bool mount_package(Kernel &k, const std::filesystem::path &package, std::string &error) {
+    auto device = vfs::make_package_device("\\Device\\Cdrom0", package, error);
+    if (!device) return false;
+    vfs::FileSystem &fs = file_system(k);
+    fs.add_device(device);
+    link_game(fs, "\\Device\\Cdrom0");
+    mount_null_partitions(fs);
+    fs.deployment = 2; // downloaded
+    return true;
+}
+
 bool mount_directory(Kernel &k, const std::filesystem::path &dir, std::string &error) {
     // read-only, as Xenia's default (allow_game_relative_writes off)
     auto device = vfs::make_host_device("\\Device\\Harddisk0\\Partition1", dir, true);
@@ -1060,6 +1073,30 @@ XF_EXPORT(xboxkrnl, NtQueryFullAttributesFile) {
     result(c, X_STATUS_SUCCESS);
 }
 
+// (object_attributes): NT's NtDeleteFile (Xenia has none; the console's XAM
+// imports it): the file or empty directory at the path is removed; a name
+// that is not there is OBJECT_NAME_NOT_FOUND, a read-only device ACCESS_DENIED,
+// a directory with children DIRECTORY_NOT_EMPTY
+XF_EXPORT(xboxkrnl, NtDeleteFile) {
+    uint32_t attributes = arg(k, c, 0);
+    std::string path = guest_path(k, k.load32(attributes + object_attributes::NAME));
+    if (!valid_path(path, false)) return result(c, X_STATUS_OBJECT_NAME_INVALID);
+    vfs::FileSystem &fs = file_system(k);
+    std::string resolved = fs.resolve_links(path);
+    std::lock_guard<std::recursive_mutex> l(fs.mutex);
+    vfs::Entry *e = fs.find(resolved);
+    std::error_code ec;
+    bool occupied = e && e->directory() && !e->host_path.empty() &&
+                    std::filesystem::directory_iterator(e->host_path, ec) != std::filesystem::directory_iterator();
+    uint32_t status = !e ? X_STATUS_OBJECT_NAME_NOT_FOUND
+                      : e->device->read_only ? X_STATUS_ACCESS_DENIED
+                      : occupied             ? 0xC0000101 /* STATUS_DIRECTORY_NOT_EMPTY */
+                      : !fs.remove(*e)       ? X_STATUS_ACCESS_DENIED
+                                             : X_STATUS_SUCCESS;
+    if (log_files()) std::fprintf(stderr, "files: delete %s: 0x%08X\n", path.c_str(), status);
+    result(c, status);
+}
+
 // (file, event, apc_routine, apc_context, io_status_block, info, length,
 // file_name, restart_scan): one entry a call (XFile::QueryDirectory)
 XF_EXPORT(xboxkrnl, NtQueryDirectoryFile) {
@@ -1303,8 +1340,11 @@ XF_EXPORT(xboxkrnl, IoDismountVolumeByFileHandle) {
     result(c, file_by_handle(objects(k), arg(k, c, 0)) ? X_STATUS_SUCCESS : not_a_file(objects(k), arg(k, c, 0)));
 }
 
-// the file system cache's size: nothing is cached here
-XF_EXPORT(xboxkrnl, FscSetCacheElementCount) { result(c, X_STATUS_SUCCESS); }
+// the file system cache's size: nothing is cached here. (cache, count): the
+// console refuses a count past 0x400 as an invalid parameter.
+XF_EXPORT(xboxkrnl, FscSetCacheElementCount) {
+    result(c, arg(k, c, 1) > 0x400 ? X_STATUS_INVALID_PARAMETER : X_STATUS_SUCCESS);
+}
 XF_EXPORT(xboxkrnl, FscGetCacheElementCount) { result(c, 0); }
 
 // ---- symbolic link objects (Xenia's XSymbolicLink) ----
@@ -1360,6 +1400,11 @@ XF_EXPORT(xboxkrnl, NtQuerySymbolicLinkObject) {
 // An STFS package mounted by the title's own code: no device is made (the
 // content family mounts packages as directories, as Xenia does)
 XF_EXPORT(xboxkrnl, StfsCreateDevice) {
+    // (parameters, size): the console wants the 0x58-byte structure, whose
+    // version byte at +0x50 is 5 or more, before it looks at the package
+    uint32_t parameters = arg(k, c, 0);
+    if (arg(k, c, 1) != 0x58 || !parameters || k.host(parameters)[0x50] < 5)
+        return result(c, X_STATUS_INVALID_PARAMETER);
     static std::once_flag once;
     std::call_once(once, [&] {
         std::fprintf(stderr, "files: StfsCreateDevice (r3 0x%08X, from 0x%08X) makes no device\n", uint32_t(c.r[3]),

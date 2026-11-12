@@ -27,6 +27,7 @@
 
 #include "lockstep_check.h"
 #include "objects.h"
+#include "video.h"
 #include "xenoforge/crash.h"
 #include "xenoforge/exports.h"
 #include "xenoforge/hooks.h"
@@ -171,6 +172,10 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         std::snprintf(reason, sizeof(reason), "%s (0x%08X) at 0x%08X has no semantics", ppc::info(op).name, code, c.pc);
         k.stop(reason);
     };
+    // a trap that fired: a debug print, or a breakpoint through the title's handlers (exceptions.cpp)
+    system_.trap = [](ppc::Context &c, uint32_t address) {
+        trap(*static_cast<Kernel *>(c.system->owner), c, address);
+    };
     system_.time_base = [](ppc::Context &c) {
         // the Xenon's time base runs at 50 MHz: 5 ticks in the scheduler's
         // clock's 100 ns
@@ -213,6 +218,63 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
         if (!after) k.lockstep_->before_import(c, *k.hook_marker(address));
         else k.lockstep_->after_import(c, resume, resume == address);
     };
+    // a long spin on db16cyc hints (ppc_ops.h's spin_hint): the processor to
+    // whatever else is ready on it (the host scheduler's: SwitchToThread,
+    // sched_yield; the console scheduler's: its next ready fiber)
+    // A spin that goes on (hand-overs less than SPIN_STREAK_GAP apart for
+    // SPIN_WAIT_AFTER) while the command processor has commands to run is,
+    // most likely, Direct3D's wait for the GPU: a loop of hints around a
+    // read of what the processor writes back (the read pointer's copy, a
+    // fence's value), which kept a host core busy for as long as the GPU
+    // took. Such a thread sleeps until the next write-back or interrupt
+    // (video.h's write_backs), SPIN_WAIT_US at most, and not at all when
+    // one came since its last hand-over (its loop has yet to see it). A
+    // spin on something else meanwhile (another thread's flag) looks again
+    // at each write-back and each SPIN_WAIT_US. XF_SPIN_WAIT=0: hand-overs
+    // only.
+    // A spin that has gone on for SPIN_IDLE_AFTER sleeps the same way with
+    // the processor idle too: a title's own wait for the next vertical
+    // blank or frame (a counter the interrupt's routine writes), which kept
+    // a core busy for most of each frame the GPU finished early. What it
+    // waits for comes with an interrupt, which wakes it; a flag of another
+    // thread's is looked at again each SPIN_WAIT_US, after a spin already
+    // that long. Off until it is timed on a quiet machine against the
+    // titles whose frame is at its limit (XF_SPIN_IDLE=1 turns it on): a
+    // title's spin share fell from 6% to 2% of the samples with it, at the
+    // same rate.
+    system_.spin = [](ppc::Context &c) {
+        static constexpr uint64_t SPIN_STREAK_GAP = 10'000, SPIN_WAIT_AFTER = 2'000; // 100 ns units
+        static constexpr uint64_t SPIN_IDLE_AFTER = 20'000;
+        static const bool idle_waits = [] {
+            const char *v = std::getenv("XF_SPIN_IDLE");
+            return v && v[0] == '1';
+        }();
+        static constexpr uint32_t SPIN_WAIT_US = 1'000;
+        static const bool waiting = [] {
+            const char *v = std::getenv("XF_SPIN_WAIT");
+            return !(v && v[0] == '0');
+        }();
+        Kernel &k = *static_cast<Kernel *>(c.system->owner);
+        // handing over is a safe point: the thread waiting there is parked
+        GuestCodeScope parked(k, false);
+        Scheduler &s = *k.objects_->scheduler;
+        Thread *t = waiting ? current_thread() : nullptr;
+        if (!t) return s.spin();
+        Video &v = video_state(k);
+        const uint64_t now = s.now();
+        const uint32_t seen = v.write_backs.load(std::memory_order_acquire);
+        if (now - t->spin_last > SPIN_STREAK_GAP) t->spin_since = now;
+        const uint64_t streak = now - t->spin_since;
+        if (seen == t->spin_seen && ((streak >= SPIN_WAIT_AFTER && v.busy.load(std::memory_order_relaxed)) ||
+                                     (idle_waits && streak >= SPIN_IDLE_AFTER))) {
+            v.spin_waits.fetch_add(1, std::memory_order_relaxed);
+            s.spin_wait(v.write_backs, seen, SPIN_WAIT_US);
+        } else {
+            s.spin();
+        }
+        t->spin_seen = seen;
+        t->spin_last = s.now();
+    };
     system_.yield = [](ppc::Context &c) {
         // the yield points' budget ran out (ppc_ops.h): the clock moves by
         // the whole ticks spent, and another thread may run (a spin on a flag
@@ -223,9 +285,12 @@ Kernel::Kernel(Memory &memory) : memory_(memory), code_(std::make_unique<Code>()
             k.park();
         const int64_t units = k.deterministic_yield_units_;
         if (!units) {
-            // (counting was turned on for a pause: off again)
+            // (counting was turned on for a pause or a preemption: off again,
+            // and the processor handed over if the scheduler asked for it)
             c.yield_budget = INT64_MAX;
-            c.yield_counting = false;
+            __atomic_store_n(&c.yield_counting, false, __ATOMIC_RELAXED);
+            GuestCodeScope parked(k, false);
+            k.objects_->scheduler->preempt_point();
             return;
         }
         const int64_t ticks = 1 + (-(c.yield_budget + 1)) / units;
@@ -529,6 +594,7 @@ void Kernel::attach(ppc::Context &c) {
     // the deterministic mode counts the yield points (system_.yield)
     c.yield_counting = deterministic_yield_units_ != 0;
     c.yield_budget = 0;
+    c.spin_hints = 0;
 }
 
 void Kernel::park() {
@@ -561,8 +627,8 @@ bool Kernel::pause(uint32_t timeout_ms) {
                 // parks it. (Written from here as it runs, as the deterministic
                 // mode's watchdog does: a store it misses is made again.)
                 if (!exact && t->context) {
-                    t->context->yield_budget = -1;
-                    t->context->yield_counting = true;
+                    __atomic_store_n(&t->context->yield_budget, int64_t(-1), __ATOMIC_RELAXED);
+                    __atomic_store_n(&t->context->yield_counting, true, __ATOMIC_RELEASE);
                 }
             }
         }
@@ -587,13 +653,15 @@ void Kernel::run_import(ppc::Context &c, const Import &import) {
     GuestCodeScope in_kernel(*this, false);
     // (nothing of this frame outlives the count: a host stack may be dropped
     // while it waits in the export, KeSetCurrentStackPointers's switch)
-    {
-        std::string key = import.library + "!" + import.name;
+    // (counted on the import itself: no string made, no lock taken, per call)
+    if (import.calls.n.fetch_add(1, std::memory_order_relaxed) == 0 && !import.fn) {
+        // the first call of an import with no implementation is logged (once per
+        // import: a name bound twice, by ordinal and by name, logs for each)
         std::lock_guard<std::mutex> lock(counts_mutex_);
-        calls_[key]++;
-        if (!import.fn && unimplemented_[key]++ == 0)
-            std::fprintf(stderr, "kernel: %s is not implemented (r3 0x%08X, r4 0x%08X, from 0x%08X)\n", key.c_str(),
-                         uint32_t(c.r[3]), uint32_t(c.r[4]), uint32_t(c.lr));
+        if (unimplemented_logged_.insert(import.library + "!" + import.name).second)
+            std::fprintf(stderr, "kernel: %s!%s is not implemented (r3 0x%08X, r4 0x%08X, from 0x%08X)\n",
+                         import.library.c_str(), import.name.c_str(), uint32_t(c.r[3]), uint32_t(c.r[4]),
+                         uint32_t(c.lr));
     }
     note_kernel_call(import, uint32_t(c.lr));
     // the deterministic mode's clock moves, and another thread may run
@@ -894,13 +962,31 @@ bool Kernel::guest_function_of_host(const void *host, uint32_t &start) const {
     return start = found, true;
 }
 
+// every import's count, summed by export name (the executable's imports, the
+// modules' thunks, and those of modules unloaded since)
+void Kernel::each_import(const std::function<void(const Import &)> &visit) const {
+    for (const Import &im : imports_) visit(im);
+    std::shared_lock lock(thunks_mutex_);
+    for (const auto &[address, im] : thunks_) visit(im);
+    for (const auto &node : retired_thunks_) visit(node.mapped());
+}
 std::map<std::string, uint64_t> Kernel::calls() const {
+    std::map<std::string, uint64_t> out;
+    each_import([&](const Import &im) {
+        if (uint64_t n = im.calls.n.load(std::memory_order_relaxed)) out[im.library + "!" + im.name] += n;
+    });
     std::lock_guard<std::mutex> lock(counts_mutex_);
-    return calls_;
+    for (const auto &[key, n] : calls_) out[key] += n; // what else counted by name (the devices)
+    return out;
 }
 std::map<std::string, uint64_t> Kernel::unimplemented() const {
+    std::map<std::string, uint64_t> out;
+    each_import([&](const Import &im) {
+        if (uint64_t n = im.calls.n.load(std::memory_order_relaxed); n && !im.fn) out[im.library + "!" + im.name] += n;
+    });
     std::lock_guard<std::mutex> lock(counts_mutex_);
-    return unimplemented_;
+    for (const auto &[key, n] : unimplemented_) out[key] += n; // the devices' (mmio)
+    return out;
 }
 void Kernel::entered(uint32_t address) {
     {

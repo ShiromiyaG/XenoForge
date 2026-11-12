@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include <vulkan/vulkan.h>
+#include <volk.h> // Vulkan without prototypes, its functions loaded at run time (cmake/vulkan.cmake)
 
 #include <cstdint>
 #include <functional>
@@ -19,6 +19,14 @@
 #include <vector>
 
 namespace xf::vk {
+
+// Finds the system's Vulkan loader (vulkan-1.dll, libvulkan.so.1) and loads
+// the global functions through volk, once per process; false with the reason
+// where there is none. Device::open and Compute::open call it first.
+bool load_vulkan(std::string &error);
+// Loads the instance's and its devices' functions (volkLoadInstance: the
+// loader's trampolines, valid for every instance and device of the process).
+void load_instance(VkInstance instance);
 
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -94,12 +102,33 @@ public:
     bool wide_lines() const { return wide_lines_; }
     float min_line_width() const { return wide_lines_ ? line_width_range_[0] : 1.0f; }
     float max_line_width() const { return wide_lines_ ? line_width_range_[1] : 1.0f; }
+    // polygons drawn as lines or points (the guest's polygon modes)
+    bool fill_mode_non_solid() const { return fill_mode_non_solid_; }
+    // samplers with a border color of their own (VK_EXT_custom_border_color
+    // without a format), for the textures' YCbCr border colors
+    bool custom_border_color() const { return custom_border_color_; }
+    // the depth bias in exact units of 2^-24, on float depth too
+    // (VK_EXT_depth_bias_control: depthBiasExact and the forced unorm
+    // representation, through vkCmdSetDepthBias2EXT)
+    bool depth_bias_control() const { return depth_bias_control_; }
+    // copies between a depth/stencil aspect and a color image of the same
+    // texel size (VK_KHR_maintenance8): the stencil of an EDRAM transfer
+    // copied from an R8_UINT image where the device has no stencil export
+    bool depth_stencil_color_copies() const { return maintenance8_; }
+    // draws run only where a buffer's word is not zero
+    // (VK_EXT_conditional_rendering): the VIZ queries' predicated draws
+    bool conditional_rendering() const { return conditional_rendering_; }
+    // storage image descriptors updated after binding (the resolve targets)
+    bool storage_image_update_after_bind() const { return storage_image_update_after_bind_; }
     // VK_EXT_extended_dynamic_state3's blend enables, blend equations and
     // color write masks set at the draw (all three, or none of them)
     bool dynamic_blend() const { return dynamic_blend_; }
     // VK_EXT_graphics_pipeline_library with fast linking: pipelines linked
     // from libraries of their four parts in a fraction of a millisecond
     bool pipeline_library() const { return pipeline_library_; }
+    // pipelineCreationCacheControl: a pipeline asked for from the pipeline
+    // cache alone, VK_PIPELINE_COMPILE_REQUIRED when the driver would compile
+    bool cache_control() const { return cache_control_; }
     // VK_EXT_fragment_shader_interlock (0 none, 1 pixel interlock, 2 pixel
     // and sample interlock), and the sample counts a render pass without
     // attachments takes (framebufferNoAttachmentsSampleCounts)
@@ -112,12 +141,18 @@ public:
     // host-visible and coherent (mapped), or device-local; host_reads: the
     // host reads it back, so cached memory where the device has it
     Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible, bool host_reads = false);
+    // video memory the host writes through a mapping (a device-local,
+    // host-visible and coherent type that is not also the first host-visible
+    // one): none where the device has no such type, or where its heap is
+    // smaller than `heap_at_least` (without resizable BAR it is a 256 MB
+    // window, shared with the driver)
+    Buffer create_device_local_mapped_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkDeviceSize heap_at_least);
     void destroy(Buffer &buffer);
     // view_format: a second format views of it read it as (a mutable format
     // with the two listed, as Xenia's textures with a signed view)
     Image create_image(VkImageType type, VkFormat format, VkExtent3D extent, uint32_t levels, uint32_t layers,
                        VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags = 0,
-                       VkFormat view_format = VK_FORMAT_UNDEFINED);
+                       VkFormat view_format = VK_FORMAT_UNDEFINED, VkFormat view_format2 = VK_FORMAT_UNDEFINED);
     void destroy(Image &image);
     // The image pool (Xenia's Vulkan backend has VMA place its images in
     // larger blocks of memory): images lie in blocks of device memory shared
@@ -136,6 +171,13 @@ public:
     // submissions made one at a time.
     VkResult submit(uint32_t count, const VkSubmitInfo *submits, VkFence fence);
     std::mutex &queue_mutex() { return queue_mutex_; }
+    // After VK_ERROR_DEVICE_LOST: what the driver says went wrong
+    // (VK_EXT_device_fault: each faulting address with its kind, and the
+    // vendor's codes), one line; empty where the device has no fault report
+    std::string fault_report();
+    // each memory heap: its kind and size, and with VK_EXT_memory_budget what
+    // this process uses of it and may have; one line
+    std::string heap_report();
 
 private:
     Device() = default;
@@ -171,9 +213,14 @@ private:
     bool precise_occlusion_ = false;
     bool geometry_shader_ = false;
     bool tessellation_shader_ = false;
-    bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false;
+    bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false, fill_mode_non_solid_ = false;
+    bool maintenance8_ = false;
+    bool conditional_rendering_ = false;
+    bool device_fault_ = false, device_fault_vendor_binary_ = false, memory_budget_ = false;
+    bool custom_border_color_ = false, storage_image_update_after_bind_ = false;
+    bool depth_bias_control_ = false;
     float line_width_range_[2] = {1.0f, 1.0f};
-    bool dynamic_blend_ = false, pipeline_library_ = false;
+    bool dynamic_blend_ = false, pipeline_library_ = false, cache_control_ = false;
     uint32_t fragment_shader_interlock_ = 0;
     VkSampleCountFlags no_attachments_samples_ = 0, sample_locations_ = 0;
     std::mutex queue_mutex_;

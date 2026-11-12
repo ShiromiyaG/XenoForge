@@ -151,6 +151,10 @@ struct ShaderStep {
     std::vector<std::pair<uint32_t, std::vector<uint32_t>>> disc_shaders;
     size_t disc_files = 0;
     double disc_seconds = 0;
+    bool disc_from_earlier = false; // what an earlier step's search found (<digest>.discshaders), not read again
+    // the disc's shaders no run met made into libraries in this many of the
+    // states runs gave their parts most (render::PrecompileOptions::extra_variants)
+    uint32_t disc_variants = 4;
     const std::atomic<bool> *cancel = nullptr;
 };
 
@@ -158,6 +162,11 @@ struct BuildOptions {
     unsigned jobs = 4;               // compilers at once (more ran out of memory on 16 GB)
     std::filesystem::path toolchain; // where clang and lld are; empty: find_toolchain's search
     bool keep_work = false;          // keep the emitted code and objects (they are hundreds of MB)
+    // keep the objects (<cache>/work/<digest>/obj, about 0.7 MB a file of
+    // generated code), each beside its source's key: the next build of the
+    // disc (another XenoForge's, the entry log's) compiles again only the
+    // files whose text, the headers' code, the flags or the compiler changed
+    bool keep_objects = true;
     bool force = false;              // build even when the cache has the library
     std::vector<uint32_t> entries;   // extra function entries, beside the entry log's
     bool use_entry_log = true;       // take the entry log's addresses in
@@ -169,6 +178,7 @@ struct BuildOptions {
     // media left out)
     std::function<std::vector<std::string>(const ShaderStep &step)> shader_step;
     bool disc_shaders = true;
+    uint32_t disc_variants = 4; // ShaderStep::disc_variants
     // the shader step alone, the library neither built nor needed (its
     // report updated when there is one)
     bool shaders_only = false;

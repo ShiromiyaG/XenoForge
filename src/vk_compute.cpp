@@ -3,8 +3,9 @@
 // shaders, it does not draw frames.
 
 #include "xenoforge/vk_compute.h"
+#include "xenoforge/vk_device.h"
 
-#include <vulkan/vulkan.h>
+#include <volk.h> // Vulkan without prototypes, its functions loaded at run time (cmake/vulkan.cmake)
 
 #include <algorithm>
 #include <cstring>
@@ -52,6 +53,7 @@ struct Run {
 } // namespace
 
 std::unique_ptr<Compute> Compute::open(std::string &error) {
+    if (!load_vulkan(error)) return nullptr;
     std::unique_ptr<Compute> c(new Compute());
     c->s_ = std::make_unique<State>();
     State &s = *c->s_;
@@ -65,6 +67,7 @@ std::unique_ptr<Compute> Compute::open(std::string &error) {
         error = failed("vkCreateInstance", r);
         return nullptr;
     }
+    load_instance(s.instance);
 
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(s.instance, &count, nullptr);

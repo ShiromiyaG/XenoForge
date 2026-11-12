@@ -514,13 +514,23 @@ void bignum(KernelHarness &h) {
     k.store32(rsa1024 + 4, 0);
     CHECK(h.krnl("XeCryptBnQwNeRsaPubCrypt", {x, y, rsa1024}) == 1);
     CHECK(k.load64(y) == 1 && all(h, y + 8, 120, 0));
-    // keys under 512 bits and even moduli fail, the output untouched
+    // a key of no words and even moduli fail, the output untouched
     std::memset(k.host(y), 0x5A, 128);
-    k.store32(rsa1024, 7);
+    k.store32(rsa1024, 0);
     CHECK(h.krnl("XeCryptBnQwNeRsaPubCrypt", {x, y, rsa1024}) == 0);
     k.store32(rsa1024, 16);
     k.host(rsa1024 + 0x10 + 7)[0] &= 0xFE;
     CHECK(h.krnl("XeCryptBnQwNeRsaPubCrypt", {x, y, rsa1024}) == 0 && all(h, y, 128, 0x5A));
+    // a key of one word, as the console computes it (Xenia refuses keys under
+    // 512 bits): 0x0123456789ABCDEF ^ 0x10001 mod 2^64 - 1
+    uint32_t small_in = h.alloc(8), small_out = h.alloc(8), small_key = h.alloc(0x18);
+    k.store64(small_in, 0x0123456789ABCDEFull);
+    k.store32(small_key, 1);
+    k.store32(small_key + 4, 0x10001);
+    k.store64(small_key + 8, 0);
+    k.store64(small_key + 0x10, 0xFFFFFFFFFFFFFFFFull);
+    CHECK(h.krnl("XeCryptBnQwNeRsaPubCrypt", {small_in, small_out, small_key}) == 1);
+    CHECK(k.load64(small_out) == 0x597A68533154AB03ull);
 
     // Montgomery's multiplication with the inverse XeCryptBnQwNeModInv
     // gives: a * b / 2^256 mod n

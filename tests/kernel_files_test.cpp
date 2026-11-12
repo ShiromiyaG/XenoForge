@@ -369,6 +369,23 @@ void cache_files(ppc::Context &c) {
     CHECK(o.status == X_STATUS_SUCCESS && o.action == 3 && size_of(c, o.handle) == 0);
     close(c, o.handle);
     CHECK(std::filesystem::exists(storage / "cache0" / "z.bin"));
+    // NtDeleteFile: a file goes, a directory with a file in it stays, a name that is not there is not found
+    Opened gone = create(c, "cache0:\\w.bin", GENERIC_WRITE, OPEN_IF, 0);
+    close(c, gone.handle);
+    CHECK(std::filesystem::exists(storage / "cache0" / "w.bin"));
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\w.bin")}) == X_STATUS_SUCCESS);
+    CHECK(!std::filesystem::exists(storage / "cache0" / "w.bin"));
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\w.bin")}) == X_STATUS_OBJECT_NAME_NOT_FOUND);
+    Opened keep = create(c, "cache0:\\keep", GENERIC_READ, OPEN_IF, DIRECTORY_FILE);
+    close(c, keep.handle);
+    Opened inner = create(c, "cache0:\\keep\\a.bin", GENERIC_WRITE, CREATE, 0);
+    close(c, inner.handle);
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\keep")}) == 0xC0000101);
+    CHECK(std::filesystem::exists(storage / "cache0" / "keep" / "a.bin"));
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\keep\\a.bin")}) == X_STATUS_SUCCESS);
+    CHECK(krnl(c, "NtDeleteFile", {attributes("cache0:\\keep")}) == X_STATUS_SUCCESS);
+    CHECK(!std::filesystem::exists(storage / "cache0" / "keep"));
+    CHECK(krnl(c, "NtDeleteFile", {attributes("\\Device\\Cdrom0\\media\\c.txt")}) == X_STATUS_ACCESS_DENIED);
     // FATX's limits: a name of 42 characters, a path of 240 (Free60's FATX page)
     std::string name42(42, 'n'), name43(43, 'n');
     o = create(c, "cache:\\" + name42, GENERIC_WRITE, CREATE, 0);
@@ -593,6 +610,7 @@ uint32_t content_data(uint32_t type, const char16_t *display, const char *file) 
 
 void content(ppc::Context &c) {
     scratch_next = 0;
+    set_content_format(*K, ContentFormat::Directory); // Xenia's directory packages (content_stfs: the STFS ones)
     uint32_t data = content_data(1, u"Slot 1", "slot1"), disposition = alloc(4), license = alloc(4);
     CHECK(xam(c, "XamContentCreateEx", {0, 0, data, 1, disposition, license, 0, 0, 0}) == X_ERROR_INVALID_NAME);
     uint32_t root = alloc(8);
@@ -747,6 +765,105 @@ void content(ppc::Context &c) {
         CHECK(xam(c, "XamContentClose", {proot, 0}) == X_ERROR_SUCCESS);
         CHECK(create(c, "dlc:\\pack.txt", GENERIC_READ, OPEN, 0).status == X_STATUS_OBJECT_PATH_NOT_FOUND);
     }
+}
+
+// New content as an STFS package: a working directory while it is open, the package file written at the close and
+// at a flush, readable by xf::Package; a working directory left by a run that did not close is used; deleting
+// takes both away.
+void content_stfs(ppc::Context &c) {
+    scratch_next = 0;
+    set_content_format(*K, ContentFormat::Stfs);
+    uint32_t data = content_data(1, u"Slot 2", "slot2"), disposition = alloc(4), license = alloc(4);
+    uint32_t root = alloc(8);
+    std::memcpy(K->host(root), "save", 5);
+    auto type_dir = storage / "content" / "B13EBABEBABEBABE" / "00000000" / "00000001";
+    auto package_file = type_dir / "slot2";
+    auto work = storage / "content-work" / "B13EBABEBABEBABE" / "00000000" / "00000001" / "slot2";
+    auto text = [](xf::Package &p, const char *path) {
+        const xf::PackageNode *n = p.find(path);
+        std::vector<uint8_t> bytes = n ? p.read_all(*n) : std::vector<uint8_t>();
+        return std::string(bytes.begin(), bytes.end());
+    };
+
+    CHECK(xam(c, "XamContentCreateEx", {0, root, data, 1, disposition, license, 0, 0, 0}) == X_ERROR_SUCCESS);
+    CHECK(K->load32(disposition) == 1);
+    // the package is there as soon as it is made
+    CHECK(std::filesystem::is_regular_file(package_file) && std::filesystem::is_directory(work));
+    Opened f = create(c, "save:\\data.bin", GENERIC_WRITE, CREATE, 0);
+    CHECK(f.status == X_STATUS_SUCCESS && write_file(c, f.handle, "stfs-saved", 0) == 0);
+    close(c, f.handle);
+    Opened d = create(c, "save:\\sub", GENERIC_READ, CREATE, DIRECTORY_FILE);
+    CHECK(d.status == X_STATUS_SUCCESS);
+    close(c, d.handle);
+    f = create(c, "save:\\sub\\deep.bin", GENERIC_WRITE, CREATE, 0);
+    CHECK(f.status == X_STATUS_SUCCESS && write_file(c, f.handle, "deep", 0) == 0);
+    close(c, f.handle);
+    // a flush writes what is there now
+    CHECK(xam(c, "XamContentFlush", {root, 0}) == X_ERROR_SUCCESS);
+    {
+        std::string error;
+        auto p = xf::Package::open(package_file, error);
+        CHECK(p && p->is_stfs() && p->info().magic == xf::PACKAGE_MAGIC_CON);
+        CHECK(p && text(*p, "data.bin") == "stfs-saved" && p->find("sub/deep.bin"));
+    }
+    CHECK(xam(c, "XamContentClose", {root, 0}) == X_ERROR_SUCCESS);
+    CHECK(!std::filesystem::exists(work));
+    {
+        std::string error;
+        auto p = xf::Package::open(package_file, error);
+        CHECK(p != nullptr);
+        if (p) {
+            CHECK(text(*p, "data.bin") == "stfs-saved" && text(*p, "sub/deep.bin") == "deep");
+            CHECK(p->info().display_name[0] == u"Slot 2" && p->warnings().empty());
+            CHECK(p->info().title_id == xam(c, "XamGetCurrentTitleId", {}));
+        }
+    }
+
+    // opened again: read back, written, closed
+    CHECK(xam(c, "XamContentCreateEx", {0, root, data, 3, disposition, license, 0, 0, 0}) == X_ERROR_SUCCESS);
+    CHECK(K->load32(disposition) == 2);
+    f = create(c, "save:\\data.bin", GENERIC_READ, OPEN, 0);
+    CHECK(f.status == X_STATUS_SUCCESS && read_file(c, f.handle, 64, 0) == "stfs-saved");
+    close(c, f.handle);
+    f = create(c, "save:\\more.bin", GENERIC_WRITE, CREATE, 0);
+    CHECK(f.status == X_STATUS_SUCCESS && write_file(c, f.handle, "more", 0) == 0);
+    close(c, f.handle);
+    CHECK(xam(c, "XamContentClose", {root, 0}) == X_ERROR_SUCCESS);
+    {
+        std::string error;
+        auto p = xf::Package::open(package_file, error);
+        CHECK(p && text(*p, "more.bin") == "more" && text(*p, "data.bin") == "stfs-saved" && p->find("sub/deep.bin"));
+    }
+
+    // enumerated like any package
+    uint32_t size = alloc(4), handle = alloc(4), items = alloc(4 * 0x134), returned = alloc(4);
+    CHECK(xam(c, "XamContentCreateEnumerator", {0, 1, 1, 0, 4, size, handle}) == X_ERROR_SUCCESS);
+    CHECK(xam(c, "XamEnumerate", {K->load32(handle), 0, items, 4 * 0x134, returned, 0}) == X_ERROR_SUCCESS);
+    CHECK(K->load32(returned) == 1 && std::string(reinterpret_cast<const char *>(K->host(items + 0x108))) == "slot2");
+    close(c, K->load32(handle));
+
+    // a working directory a run left (it did not close the package) is what the next open finds
+    std::filesystem::create_directories(work);
+    {
+        std::ofstream left(work / "recovered.bin", std::ios::binary);
+        left << "left";
+    }
+    CHECK(xam(c, "XamContentCreateEx", {0, root, data, 3, disposition, license, 0, 0, 0}) == X_ERROR_SUCCESS);
+    f = create(c, "save:\\recovered.bin", GENERIC_READ, OPEN, 0);
+    CHECK(f.status == X_STATUS_SUCCESS && read_file(c, f.handle, 64, 0) == "left");
+    close(c, f.handle);
+    CHECK(xam(c, "XamContentClose", {root, 0}) == X_ERROR_SUCCESS);
+    CHECK(!std::filesystem::exists(work));
+    {
+        std::string error;
+        auto p = xf::Package::open(package_file, error);
+        CHECK(p && p->find("recovered.bin") && !p->find("more.bin"));
+    }
+
+    // deleted: the package file gone
+    CHECK(xam(c, "XamContentDelete", {0, data, 0}) == X_ERROR_SUCCESS);
+    CHECK(!std::filesystem::exists(package_file));
+    CHECK(xam(c, "XamContentDelete", {0, data, 0}) == X_ERROR_FILE_NOT_FOUND);
 }
 
 // The input exports with boot's idle pad, START pressed by its overlay when
@@ -906,6 +1023,7 @@ void main_thread(ppc::Context &c) {
     cache_files(c);
     async_files(c);
     content(c);
+    content_stfs(c);
     notifications_and_users(c);
     c.r[3] = 0x600D;
 }

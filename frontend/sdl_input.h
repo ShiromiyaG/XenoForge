@@ -30,6 +30,9 @@ class Controllers {
     // the window has it; taken: the overlay takes it, so the game gets none)
     void event(const SDL_Event &event);
     void read_keyboard(bool focused, bool taken);
+    // a dialog of the system is up: the gamepads answer the game with neutral states (the dialog has the buttons;
+    // view() still shows them), as the console's guide takes the controller from the title
+    void set_taken(bool taken) { pads_taken_ = taken; }
     // the settings changed (the bindings, the keyboard's user, vibration)
     void apply(const Settings &settings);
 
@@ -74,7 +77,7 @@ class Controllers {
     input::Overlay presses_;
     // the keyboard: its bindings, its state as the last read left it
     std::vector<Key> keys_;
-    std::atomic<bool> keyboard_on_{true}, vibration_{true};
+    std::atomic<bool> keyboard_on_{true}, vibration_{true}, pads_taken_{false};
     std::atomic<uint32_t> keyboard_user_{0};
     input::Gamepad keyboard_state_;
     uint32_t keyboard_packet_ = 0;

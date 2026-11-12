@@ -26,9 +26,12 @@
 #include "xenoforge/memory.h"
 #include "xenoforge/xenos.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <span>
 #include <unordered_map>
@@ -52,23 +55,105 @@ constexpr uint32_t gpu_swap(uint32_t v, Endian e) {
 // The GPU's registers (Xenia's RegisterFile), by index (xenos.h's reg). Each
 // access is a relaxed atomic one: the CPU reads and writes some of them
 // through MMIO while the command processor runs.
+//
+// What changed, for a Sink that keeps what it made of the registers (beyond
+// Xenia, whose backends compare the values again at each draw): the
+// processor's own writes go through write and write_big_endian, which stamp
+// the register's block of BLOCK registers with a serial when the value
+// differs from the one held; a sink that remembers the serial as of its last
+// look finds with changed_since whether a range was written to another value
+// since. Writes from other threads (set: the CPU's MMIO) stamp nothing and
+// count in foreign_writes instead, which the sink compares too.
 class RegisterFile {
 public:
     static constexpr uint32_t COUNT = xenos::REGISTER_COUNT;
-    RegisterFile() : values_(COUNT, 0) {}
+    static constexpr uint32_t BLOCK_SHIFT = 5, BLOCK = 1u << BLOCK_SHIFT;
+    RegisterFile() : values_(COUNT, 0), stamps_((COUNT + BLOCK - 1) >> BLOCK_SHIFT, 0) {}
     uint32_t operator[](uint32_t index) const { return index < COUNT ? get(index) : 0; }
     uint32_t get(uint32_t index) const {
         return std::atomic_ref<uint32_t>(const_cast<uint32_t &>(values_[index])).load(std::memory_order_relaxed);
     }
+    // from any thread
     void set(uint32_t index, uint32_t value) {
         std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
+        foreign_writes_.fetch_add(1, std::memory_order_relaxed);
     }
+    // on the command processor's thread
+    void write(uint32_t index, uint32_t value) {
+        if (get(index) == value) return;
+        std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
+        stamps_[index >> BLOCK_SHIFT] = ++serial_;
+        if (draw_state(index)) state_serial_ = serial_;
+        if (index >= 0x4000 && index < 0x4800) float_serial_[(index - 0x4000) >> 10] = serial_;
+    }
+    // count registers from first, from big-endian words (a packet's, guest
+    // memory's); first + count within COUNT. On the command processor's thread.
+    void write_big_endian(uint32_t first, const uint8_t *words, uint32_t count) {
+        while (count) {
+            const uint32_t n = std::min(count, BLOCK - (first & (BLOCK - 1)));
+            // The block's words in host order, compared with those held in
+            // one pass (both loops without a branch, for the compiler's
+            // vectors: a scene's constants are most of what a frame's
+            // commands write), and stored only where they differ.
+            uint32_t host[BLOCK];
+            std::memcpy(host, words, 4 * n);
+            uint32_t differs = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                host[k] = __builtin_bswap32(host[k]);
+                differs |= values_[first + k] ^ host[k];
+            }
+            if (differs) {
+                // (the shader constants' blocks hold no register of the draws' state)
+                bool state = false;
+                const bool constants = first >= 0x4000 && first + n <= 0x4910;
+                for (uint32_t k = 0; k < n; k++) {
+                    if (values_[first + k] == host[k]) continue;
+                    if (!constants && draw_state(first + k)) state = true;
+                    std::atomic_ref<uint32_t>(values_[first + k]).store(host[k], std::memory_order_relaxed);
+                }
+                stamps_[first >> BLOCK_SHIFT] = ++serial_;
+                if (state) state_serial_ = serial_;
+                if (first >= 0x4000 && first < 0x4800) float_serial_[(first - 0x4000) >> 10] = serial_;
+            }
+            first += n, words += 4 * n, count -= n;
+        }
+    }
+    // The serial of the processor's last write that changed a value; whether
+    // any of count registers from first changed after a serial (by blocks: a
+    // neighbour in the same block counts); the writes from other threads.
+    uint64_t serial() const { return serial_; }
+    // The serial of the last such write to a register of the draws' state:
+    // one that is neither a shader constant (float, fetch, boolean or loop:
+    // a draw takes those as they stand) nor what a draw packet itself sets
+    // (the index buffer's place, the draw initiator, the index offset and
+    // bounds, the event initiator), nor below the registers a draw reads.
+    // A draw made after another with this unchanged draws with the same
+    // pipeline, targets, viewport and dynamic state.
+    uint64_t state_serial() const { return state_serial_; }
+    // and to a float constant of a stage's (0 the vertex shader's, 1 the pixel shader's)
+    uint64_t float_constants_serial(int stage) const { return float_serial_[stage]; }
+    static bool draw_state(uint32_t index) {
+        if (index < 0x2000) return false;
+        if (index >= 0x4000 && index < 0x4910) return false; // ALU, fetch, boolean and loop constants
+        if (index >= 0x2100 && index <= 0x2103) return false; // VGT_MAX_VTX_INDX to VGT_MULTI_PRIM_IB_RESET_INDX
+        if (index >= 0x21F9 && index <= 0x21FC) return false; // VGT_EVENT_INITIATOR to VGT_DRAW_INITIATOR
+        return true;
+    }
+    bool changed_since(uint32_t first, uint32_t count, uint64_t serial) const {
+        for (uint32_t b = first >> BLOCK_SHIFT, last = (first + count - 1) >> BLOCK_SHIFT; b <= last; b++)
+            if (stamps_[b] > serial) return true;
+        return false;
+    }
+    uint64_t foreign_writes() const { return foreign_writes_.load(std::memory_order_relaxed); }
     // all of them, for whoever runs on the command processor's thread (a
     // Sink's callbacks): constants copied in bulk
     const uint32_t *data() const { return values_.data(); }
 
 private:
     std::vector<uint32_t> values_;
+    std::vector<uint64_t> stamps_; // per block, the serial of the last write that changed a value there
+    uint64_t serial_ = 0, state_serial_ = 0, float_serial_[2] = {};
+    std::atomic<uint64_t> foreign_writes_{0};
 };
 
 // A draw as DRAW_INDX and DRAW_INDX_2 give it (VGT_DRAW_INITIATOR's fields);
@@ -101,6 +186,15 @@ struct Swap {
 // do nothing. Xenia's backend calls (IssueDraw, IssueCopy, IssueSwap,
 // LoadShader) and its trace writer's (packets, buffers, memory read and
 // written), so a renderer or a trace writer can stand behind it.
+// A screen extent report's answer (Sink::extent_poll): the console pixels
+// its draws can have rasterized, left and top inclusive, right and bottom
+// exclusive; whole when the sink cannot tell (the whole screen).
+struct Extent {
+    uint64_t handle = 0;
+    bool whole = true;
+    uint32_t left = 0, top = 0, right = 0, bottom = 0;
+};
+
 class Sink {
 public:
     virtual ~Sink() = default;
@@ -113,12 +207,21 @@ public:
     // one longer than what is left of its buffer is not.
     virtual void packet(uint32_t /*address*/, std::span<const uint32_t> /*words*/) {}
     virtual void packet_end() {}
+    // whether packet() is wanted: a sink that does not take the packets
+    // (the renderer) spares the processor copying each one's words (asked
+    // once, as the sink is set)
+    virtual bool wants_packets() { return false; }
     // memory the processor read (constants, shaders, polled words) or wrote
     // (fences, write-backs, reports), physical
     virtual void memory_read(uint32_t /*address*/, uint32_t /*bytes*/) {}
     virtual void memory_written(uint32_t /*address*/, uint32_t /*bytes*/) {}
     // a shader loaded (IM_LOAD, IM_LOAD_IMMEDIATE): 0 vertex, 1 pixel
     virtual void shader(uint32_t /*type*/, uint32_t /*address*/, std::span<const uint32_t> /*code*/) {}
+    // IM_LOAD of `dwords` words at a physical address: true when the sink
+    // has the shader it last loaded from there, that memory unwritten since,
+    // and takes it again (the processor copies nothing and calls no
+    // shader()); false, the processor copies the words and calls shader()
+    virtual bool shader_again(uint32_t /*type*/, uint32_t /*address*/, uint32_t /*dwords*/) { return false; }
     // a draw outside copy mode, and a resolve (a draw with RB_MODECONTROL in
     // copy mode: EDRAM to memory, RB_COPY_*)
     virtual void draw(const RegisterFile &, const Draw &) {}
@@ -134,6 +237,29 @@ public:
     virtual void zpd_report(uint64_t /*ended*/, uint64_t /*next*/) {}
     // The samples of the reports whose counts are in since the last poll.
     virtual void zpd_poll(std::vector<std::pair<uint64_t, uint64_t>> & /*resolved*/) {}
+    // Screen extents (EVENT_WRITE_EXT; ScreenExtents::Measured). Whether the
+    // sink bounds what its draws rasterize; if not, every report is the
+    // whole screen, as Xenia writes.
+    virtual bool measures_extents() { return false; }
+    // SCREEN_EXT_INIT: the draws from here count for the next report.
+    virtual void extent_init() {}
+    // SCREEN_EXT_RPT: the draws since the last init end a report, answered
+    // once through extent_poll; 0: none (the whole screen).
+    virtual uint64_t extent_report() { return 0; }
+    // The reports so far answered, waiting for the GPU if it must (before an
+    // interrupt or a wait, after which the CPU may read them).
+    virtual void extent_wait() {}
+    // What the sink has done so far, for XF_SLOW_FRAMES: the seconds it
+    // waited for the GPU, its texture loads, its submissions, the pipelines
+    // it has made. Called on the processor's thread.
+    struct Work {
+        double gpu_wait_seconds = 0;
+        uint64_t texture_loads = 0, submissions = 0, pipelines = 0;
+    };
+    virtual Work work() { return {}; }
+    virtual void extent_poll(std::vector<Extent> & /*resolved*/) {}
+    // VIZ_QUERY: query id (0-63) begins, or ends
+    virtual void viz_query(uint32_t /*id*/, bool /*end*/) {}
 };
 
 // What EVENT_WRITE_ZPD's occlusion query reports hold (Xenia's
@@ -148,16 +274,34 @@ enum class OcclusionQueries {
     Fast,
 };
 
+// What EVENT_WRITE_EXT's screen extent reports hold.
+enum class ScreenExtents {
+    // the whole of the largest texture, 8192 pixels square (Xenia's answer)
+    Whole,
+    // that at once, then the bounds of what the report's draws rasterized
+    // once the sink has measured them, where it measures (beyond Xenia):
+    // ready before the next interrupt or wait the CPU could read them after
+    Measured,
+};
+
 // What the command processor counts, read from any thread.
 struct Counts {
     std::atomic<uint64_t> packets{0};         // of every type, executed or skipped
     std::atomic<uint64_t> primary_buffers{0}; // primary buffer runs
     std::atomic<uint64_t> indirect_buffers{0};
     std::atomic<uint64_t> draws{0}, resolves{0}, swaps{0};
+    // the host's time, in nanoseconds, the processor's thread spent running packets (live: the
+    // kernel's video thread adds it) and, of that, in WAIT_REG_MEM's waits
+    mutable std::atomic<uint64_t> run_ns{0}, wait_ns{0};
     std::atomic<uint64_t> failed_draws{0};                    // no valid index source (or a packet too short)
     std::atomic<uint64_t> immediate_draws{0};                 // with immediate indices (Xenia fails them)
     std::atomic<uint64_t> interrupts{0};                      // INTERRUPT's, one per CPU in its mask
     std::atomic<uint64_t> waits{0};                           // WAIT_REG_MEM polls that did not match
+    // of them: on memory (the rest on a register), and with a sleep (a wait field of 0x100 or
+    // more: the rest yield); the WAIT_REG_MEM packets that did not match at once, and the last
+    // such packet's poll address (bit 31: memory), reference, mask and wait field
+    std::atomic<uint64_t> waits_on_memory{0}, waits_asleep{0}, waiting_packets{0};
+    std::atomic<uint32_t> last_wait_poll{0}, last_wait_ref{0}, last_wait_mask{0}, last_wait_field{0};
     std::atomic<uint64_t> bad_packets{0};                     // ones that stopped their buffer
     std::array<std::atomic<uint64_t>, 128> opcodes{};         // type-3 packets by opcode
     std::array<std::atomic<uint64_t>, 128> unknown_opcodes{}; // the ones it has no handler for
@@ -177,12 +321,20 @@ public:
         // packet's wait field: wait / 0x100 ms from 0x100 up, else no more
         // than a yield). False: stop executing (the GPU is shutting down).
         virtual bool wait(uint32_t wait) = 0;
+        // The processor wrote something the CPU reads back to guest memory
+        // (the read pointer's copy, a scratch register's, an event's value,
+        // screen extents, a query's report): what the CPU's code polls for
+        // while it waits for the GPU.
+        virtual void wrote_back() {}
     };
 
     CommandProcessor(Memory &memory, Host &host);
 
     // Set before the processor's thread runs, or on it.
-    void set_sink(Sink *sink) { sink_ = sink; }
+    void set_sink(Sink *sink) {
+        sink_ = sink;
+        packets_wanted_ = sink && sink->wants_packets();
+    }
     Memory &memory() const { return memory_; }
     RegisterFile &registers() { return regs_; }
     const Counts &counts() const { return counts_; }
@@ -244,6 +396,21 @@ public:
     // What occlusion query reports hold; set before the processor runs.
     void set_occlusion_queries(OcclusionQueries mode) { occlusion_ = mode; }
     OcclusionQueries occlusion_queries() const { return occlusion_; }
+    // What screen extent reports hold; set before the processor runs.
+    void set_screen_extents(ScreenExtents mode) { extents_ = mode, extents_by_gain_ = false; }
+    // Measured or whole by what measuring gains: measured for a while, then
+    // kept only where predicated tiling skipped enough of the draws for it
+    // (the bins the guest narrowed), else the whole screen for a longer
+    // while before it is tried again. Measuring makes the processor wait
+    // for the GPU where the guest may read the extents; it pays in a scene
+    // whose second tile then leaves out a good part of its draws, and costs
+    // where the draws cover both tiles anyway (docs/renderer.md, "Screen
+    // extents by their gain").
+    void set_screen_extents_by_gain() {
+        extents_ = ScreenExtents::Measured, extents_by_gain_ = true;
+        extents_window_ = EXTENTS_TRIAL, extents_swaps_ = 0, extents_draws_ = extents_skipped_ = 0;
+    }
+    ScreenExtents screen_extents() const { return extents_; }
 
 private:
     // a buffer being read: a ring (the primary buffer) or a straight run (an
@@ -267,10 +434,20 @@ private:
     bool type3(uint32_t address, uint32_t packet);
     bool type3_opcode(uint32_t opcode, uint32_t count);
     // a packet that runs, to the sink: its header and the count words after it
-    void report_packet(uint32_t address, uint32_t packet, uint32_t count);
-    void end_packet() {
-        if (sink_) sink_->packet_end();
+    // (nothing called for a sink that wants no packets)
+    void report_packet(uint32_t address, uint32_t packet, uint32_t count) {
+        if (packets_wanted_) report_packet_words(address, packet, count);
     }
+    void report_packet_words(uint32_t address, uint32_t packet, uint32_t count);
+    // (to the sink that was given the packet: one that wants none gets no end either)
+    void end_packet() {
+        if (packets_wanted_) sink_->packet_end();
+    }
+    // Registers written as a run: count big-endian words to the registers from base. Where none of
+    // them has a side effect (special_register_write's all lie below PLAIN_REGISTERS) they are
+    // stored in one loop (RegisterFile::write_big_endian); else one by one through write_register.
+    static constexpr uint32_t PLAIN_REGISTERS = 0x2000;
+    void write_register_run(uint32_t base, const uint8_t *words, uint32_t count);
     void special_register_write(uint32_t index, uint32_t value);
     void write_registers_from_ring(uint32_t base, uint32_t count);
     void write_registers_from_memory(uint32_t base, uint32_t physical, uint32_t count);
@@ -295,6 +472,7 @@ private:
     Memory &memory_;
     Host &host_;
     Sink *sink_ = nullptr;
+    bool packets_wanted_ = false; // sink_->wants_packets(), asked as it was set
     RegisterFile regs_;
     Counts counts_;
     Reader reader_;
@@ -324,6 +502,64 @@ private:
         uint64_t speculative_value = 0; // the counter the guess wrote
         uint64_t speculative_delta = 0;
     };
+    // Screen extents measured (ScreenExtents::Measured): the reports
+    // waiting for the sink's answer, and the latest report at each address
+    // (an answer only lands where no later report has written since)
+    ScreenExtents extents_ = ScreenExtents::Measured;
+    // set_screen_extents_by_gain: the swaps of a trial of measuring and of
+    // a stay with the whole screen, and the share of the draw packets the
+    // bins must skip for measuring to stay (1 in EXTENTS_GAIN)
+    static constexpr uint32_t EXTENTS_TRIAL = 120, EXTENTS_STAY = 600, EXTENTS_GAIN = 7;
+    bool extents_by_gain_ = false;
+    uint32_t extents_window_ = EXTENTS_TRIAL, extents_swaps_ = 0;
+    uint64_t extents_draws_ = 0, extents_skipped_ = 0; // draw packets run and skipped by their bins, this window
+    // XF_SLOW_FRAMES: the last swap's time and the counts as of it
+    std::chrono::steady_clock::time_point slow_at_{};
+    uint64_t slow_swaps_ = 0, slow_waited_ = 0, slow_draws_ = 0, slow_resolves_ = 0, slow_reports_ = 0;
+    Sink::Work slow_work_{};
+    std::vector<std::pair<uint64_t, uint32_t>> extent_pending_; // handle (0: answered) and address, in order
+    size_t extent_first_ = 0;                                   // the first of them still waiting
+    // The latest report at each address, by address: its handle (0: none).
+    // Thousands of reports a frame at the addresses of the frame before's,
+    // none ever taken out: an open table (a multiplicative hash, the next
+    // slot on a clash, doubled at half full), a tenth of a hash map's cost.
+    class ExtentLatest {
+    public:
+        uint64_t &at(uint32_t address) { // made, with no handle, where there is none
+            if (used_ * 2 >= slots_.size()) grow();
+            return slot(address).second;
+        }
+        uint64_t *find(uint32_t address) {
+            if (slots_.empty()) return nullptr;
+            std::pair<uint32_t, uint64_t> &s = probe(address);
+            return s.first == address ? &s.second : nullptr;
+        }
+
+    private:
+        static constexpr uint32_t EMPTY = UINT32_MAX; // (an address is a multiple of 4)
+        std::pair<uint32_t, uint64_t> &probe(uint32_t address) {
+            size_t i = size_t((address >> 2) * 0x9E3779B1u) & (slots_.size() - 1);
+            while (slots_[i].first != address && slots_[i].first != EMPTY) i = (i + 1) & (slots_.size() - 1);
+            return slots_[i];
+        }
+        std::pair<uint32_t, uint64_t> &slot(uint32_t address) {
+            std::pair<uint32_t, uint64_t> &s = probe(address);
+            if (s.first == EMPTY) s = {address, 0}, used_++;
+            return s;
+        }
+        void grow() {
+            std::vector<std::pair<uint32_t, uint64_t>> old = std::move(slots_);
+            slots_.assign(old.empty() ? 1024 : old.size() * 2, {EMPTY, 0});
+            used_ = 0;
+            for (const auto &[address, handle] : old)
+                if (address != EMPTY) slot(address).second = handle;
+        }
+        std::vector<std::pair<uint32_t, uint64_t>> slots_;
+        size_t used_ = 0;
+    } extent_latest_;
+    std::vector<Extent> extent_resolved_;
+    void write_extent(uint32_t address, const uint16_t (&extents)[6], bool told = true);
+    void poll_extents(bool wait);
     OcclusionQueries occlusion_ = OcclusionQueries::Fake;
     std::deque<ZpdReport> zpd_reports_;
     uint64_t zpd_current_ = 0, zpd_next_ = 1;

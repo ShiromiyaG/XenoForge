@@ -405,6 +405,13 @@ public:
     uint32_t self_handle = 0; // the handle its hold on itself is on
     bool main = false;
     std::string guest_name; // what the guest named it (SetThreadName), for the thread report
+    // the host thread it runs on, for the report's CPU time (a Windows
+    // handle, or a POSIX thread's CPU clock id); none in the deterministic
+    // mode, whose threads are fibers on one host thread
+    void *host_thread = nullptr;
+    int host_cpu_clock = -1;
+    uint32_t host_thread_id = 0; // the host's id of it (Windows), for matching outside tools' samples
+    double host_cpu_seconds() const; // -1: not known
 
     // what makes the thread stop at its next kernel call (a safe point)
     enum : uint32_t { PENDING_SUSPEND = 1, PENDING_KERNEL_APC = 2 };
@@ -424,6 +431,14 @@ public:
     enum class Blocked : uint8_t { No, Wait, Suspended };
     Blocked blocked = Blocked::No;
     bool started = false, terminated = false, finished = false; // finished: body() is done
+    // started, not terminated and not blocked: counted in Objects::ready_threads, which NtYieldExecution reads
+    // without the lock. Every change to the three fields goes through refresh_ready (lock held).
+    bool ready = false;
+    void set_blocked(Blocked b) {
+        blocked = b;
+        refresh_ready();
+    }
+    void refresh_ready();
     uint32_t suspend_count = 0;
     // the wait in progress
     std::vector<Dispatcher *> waiting_on;
@@ -436,6 +451,11 @@ public:
     bool woken = false;
     std::condition_variable cv;
     void *scheduled = nullptr; // the deterministic scheduler's record of it
+    // its spin on the spin-wait hint (kernel.cpp's system_.spin; its own
+    // thread's only): when the run of hand-overs began, when the last one
+    // returned, and the GPU's write-backs counted then
+    uint64_t spin_since = 0, spin_last = 0;
+    uint32_t spin_seen = 0;
 };
 
 // The thread running on this host thread (nullptr off guest threads).
@@ -462,6 +482,10 @@ public:
     virtual void wake(Thread &t) = 0;
     // another thread may run (spin locks, NtYieldExecution)
     virtual void yield() = 0;
+    // a guest thread gives up its time slice (a zero-interval
+    // KeDelayExecutionThread, NtYieldExecution): yield(), unless the host
+    // scheduler sees it polling (threads.cpp)
+    virtual void give_up_slice() { yield(); }
     // the clock: 100 ns units since the kernel started
     virtual uint64_t now() = 0;
     // the earliest timer (Objects::next_due) changed
@@ -473,9 +497,36 @@ public:
     virtual bool deterministic() const { return false; }
     // its counts, for the thread report (empty when playing)
     virtual std::string report() { return {}; }
+    // A long spin on the XDK's spin-wait hint (ppc_ops.h's spin_hint, from
+    // guest code, no lock): the host's processor to another thread
+    virtual void spin() { yield(); }
+    // The same spin, gone on while the GPU works (kernel.cpp's system_.spin:
+    // the thread most likely polls what the GPU writes back): the calling
+    // thread sleeps until `word` is no longer `seen` (spin_wake() after a
+    // change to it), another thread needs its processor, or `us` have
+    // passed (no lock)
+    virtual void spin_wait(const std::atomic<uint32_t> &word, uint32_t seen, uint32_t us) {
+        (void)word, (void)seen, (void)us;
+        spin();
+    }
+    // `word` changed (any thread, no lock): spin_wait's sleepers go on
+    virtual void spin_wake() {}
+    // A yield point reached after preempt-at-yield-points was asked for the
+    // calling thread (the console scheduler's quantum; no lock)
+    virtual void preempt_point() {}
+    // t's processor (KPCR CURRENT_CPU) changed (KeSetAffinityThread; lock held)
+    virtual void affinity_changed(Thread &t) { (void)t; }
 };
 
 std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects);
+// console_scheduler.cpp: the console's way (docs/runtime.md, "The console
+// scheduler"): six host threads for the Xenon's six hardware threads, each
+// guest thread a fiber on its processor, waits switching fibers there; the
+// kernel's host-code threads host threads of their own (XF_SCHEDULER=console)
+std::unique_ptr<Scheduler> make_console_scheduler(Objects &objects);
+// threads.cpp's: the host timer at its finest, and the host's shortest sleep
+void host_fine_timer();
+void host_nap();
 // deterministic.cpp: every guest thread a fiber on one host thread, in a fixed
 // order, on a virtual clock (xenoforge/kernel.h, Deterministic)
 std::unique_ptr<Scheduler> make_deterministic_scheduler(Objects &objects, const Deterministic &options);
@@ -486,6 +537,9 @@ std::unique_ptr<Scheduler> make_deterministic_scheduler(Objects &objects, const 
 // way (exceptions.cpp).
 void set_current_thread(Thread *t);
 void *exchange_exception_walks(void *walks);
+// A trap instruction that fired at `at` (exceptions.cpp): a debug print, or a
+// breakpoint raised through the title's handlers.
+void trap(Kernel &k, ppc::Context &c, uint32_t at);
 
 // ---- the kernel's state for its objects ----
 
@@ -591,6 +645,7 @@ public:
     Ref<Thread> create_thread(const Thread::Params &params, uint32_t &status);
     Ref<Thread> main_thread;
     std::vector<Thread *> threads; // under the lock, live
+    std::atomic<int> ready_threads{0}; // threads with Thread::ready: written under the lock, read without it
     uint32_t next_thread_id = 0;
     uint8_t next_cpu = 0;
     std::condition_variable thread_exited; // the host side's joins

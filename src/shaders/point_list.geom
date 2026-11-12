@@ -5,7 +5,9 @@
 // writes none (-1), PA_SU_POINT_SIZE's; points with a position that is NaN
 // or a diameter that is not positive are dropped. The interpolators are the
 // point's on all four corners: top-left, bottom-left, top-right,
-// bottom-right.
+// bottom-right; the sprite's coordinates (location 17, for the pixel
+// parameters of a point list) 0 to 1 from the left and the top, as Xenia's
+// xe_out_point_coordinates.
 #version 450
 
 layout(points) in;
@@ -14,6 +16,7 @@ layout(triangle_strip, max_vertices = 4) out;
 layout(location = 0) in vec4 in_interpolators[][16];
 layout(location = 16) in float in_point_size[];
 layout(location = 0) out vec4 out_interpolators[16];
+layout(location = 17) invariant out vec2 out_point_coordinates;
 
 // renderer.cpp's System, up to the point constants: the constant diameter
 // in guest pixels (xy), the guest pixel diameter to NDC radius (zw)
@@ -39,6 +42,7 @@ void main() {
     for (int i = 0; i < 4; i++) {
         gl_Position = vec4((i >> 1) != 0 ? high.x : low.x, (i & 1) != 0 ? high.y : low.y, position.zw);
         for (int k = 0; k < 16; k++) out_interpolators[k] = in_interpolators[0][k];
+        out_point_coordinates = vec2(float(i >> 1), float(i & 1));
         EmitVertex();
     }
     EndPrimitive();

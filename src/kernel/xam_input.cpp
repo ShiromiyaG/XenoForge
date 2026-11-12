@@ -685,6 +685,30 @@ XF_EXPORT(xam, XamInputSetState) {
     result(c, r == SUCCESS && !at ? X_ERROR_BAD_ARGUMENTS : r);
 }
 
+// (user_index, DWORD *level): the console's XAM asks its HID layer for the
+// user's pad (a pad that is not there is ERROR_DEVICE_NOT_CONNECTED, the level
+// untouched) and reads the user's vibration setting: a level of 0 is the
+// default, 3. Xenia has no such export. The setting is not kept here, so a pad
+// that is there answers the default.
+XF_EXPORT(xam, XamInputGetUserVibrationLevel) {
+    uint32_t user = arg(k, c, 0), level = arg(k, c, 1);
+    Capabilities out;
+    bool there;
+    {
+        InputSystem &s = inputs(k);
+        std::lock_guard<std::mutex> lock(s.mutex);
+        there = user < USERS && s.capabilities(user, FLAG_GAMEPAD, out) == SUCCESS;
+    }
+    if (!there) return result(c, X_ERROR_DEVICE_NOT_CONNECTED);
+    if (level) k.store32(level, 3);
+    result(c, X_ERROR_SUCCESS);
+}
+
+// (user_index, ...): the console's XAM answers ERROR_DEVICE_NOT_CONNECTED for
+// every user and argument tried (xfxam): the raw reports belong to the
+// non-controller devices, and none is attached.
+XF_EXPORT(xam, XamInputRawState) { result(c, X_ERROR_DEVICE_NOT_CONNECTED); }
+
 // (user_index_ptr, flags, X_INPUT_KEYSTROKE *)
 XF_EXPORT(xam, XamInputGetKeystrokeEx) {
     uint32_t user_ptr = arg(k, c, 0), flags = arg(k, c, 1), at = arg(k, c, 2);

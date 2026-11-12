@@ -1,0 +1,32 @@
+// The generic shaders' interpreter (generic.glsl) as the harness runs a
+// translated shader (shader_harness.h; the translator's main_harness): a case
+// per invocation, its registers in, the shader run, the registers and the
+// exports out; the program at binding 4. shader_compare_test runs it beside
+// the translation and the CPU interpreter.
+
+#version 460
+#define GENERIC_HARNESS
+#include "generic.glsl"
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer CasesIn { vec4 v[]; } cases_in;
+layout(set = 0, binding = 3, std430) buffer CasesOut { vec4 v[]; } cases_out;
+
+void main() {
+    uint the_case = gl_GlobalInvocationID.x;
+    uint in_base = the_case * 128u;
+    for (uint k = 0u; k < 128u; k++) r[k] = cases_in.v[in_base + k];
+    reset_state();
+    run_program();
+    // (CaseOutput: the registers, o0-o15, oPos, oPts, oC0-oC3, oDepth, then
+    // killed, the predicate and a0)
+    uint out_base = the_case * 152u;
+    for (uint k = 0u; k < 128u; k++) cases_out.v[out_base + k] = r[k];
+    for (uint k = 0u; k < 16u; k++) cases_out.v[out_base + 128u + k] = o[k];
+    cases_out.v[out_base + 144u] = oPos;
+    cases_out.v[out_base + 145u] = oPts;
+    for (uint k = 0u; k < 4u; k++) cases_out.v[out_base + 146u + k] = oC[k];
+    cases_out.v[out_base + 150u] = oDepth;
+    cases_out.v[out_base + 151u] = vec4(uintBitsToFloat(killed ? 1u : 0u), uintBitsToFloat(p0 ? 1u : 0u),
+                                        intBitsToFloat(a0), 0.0);
+}

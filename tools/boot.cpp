@@ -54,21 +54,38 @@
 // of their own (PortInfo::hook_module) loads it before the game runs and
 // loads it again when the file changes, or every S seconds with
 // --reload-hooks-every S (docs/sdk.md, "Reloading the hooks").
+// --profile N samples where the CPU time goes (sampler.h; from S seconds on
+// with --profile-from S) and prints the swaps a second over that span, the
+// shares and the N most sampled functions at the end. --profile-thread
+// <name> samples the one guest thread so named (the kernel's own, as
+// "GPU commands", or the guest's SetThreadName) with its stacks walked,
+// and adds each function's inclusive share.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 //        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
-//        [--hook-stats] [--reload-hooks-every S]
+//        [--hook-stats] [--reload-hooks-every S] [--profile N [--profile-from S] [--profile-thread <name>]]
 
 #include "game.h"
+#include "sampler.h"
 #include "xenoforge/hooks.h"
 #include "xenoforge/lockstep.h"
 #include "xenoforge/run.h"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 #include <cstdlib>
 #include <filesystem>
 #include <set>
@@ -89,7 +106,9 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                         "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
                         "[--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] "
                         "[--replay-input <file>] [--hook-stats] [--reload-hooks-every S] "
-                        "[--option <key>=<value>]...\n";
+                        "[--language N] [--country N] [--resolution WxH] [--widescreen 0|1] [--refresh 50|60] "
+                        "[--follow-launches] [--launch-data <file>] [--option <key>=<value>]... [--directory-saves] "
+                        "[--profile N [--profile-from S] [--profile-thread <name>]]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
     o.input = argv[1];
@@ -105,6 +124,11 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     uint64_t shot_every = 0;
     std::filesystem::path trace_dir = "traces";
     double reload_every = 0;
+    bool follow_launches = false;
+    std::filesystem::path launch_data_file;
+    size_t profile_top = 0;
+    double profile_from = 0;
+    std::string profile_thread; // --profile-thread: one guest thread by name, with its stacks
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--xex" && k + 1 < argc)
@@ -115,6 +139,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             seconds = uint32_t(std::strtoul(argv[++k], nullptr, 10));
         else if (a == "--content" && k + 1 < argc)
             o.storage = argv[++k];
+        else if (a == "--directory-saves")
+            o.content_format = kernel::ContentFormat::Directory;
         else if (a == "--interpret")
             o.interpret = true;
         else if (a == "--cache" && k + 1 < argc)
@@ -142,6 +168,12 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             rates = true;
         else if (a == "--crash-dir" && k + 1 < argc)
             game::set_crash_directory(argv[++k]);
+        else if (a == "--profile" && k + 1 < argc)
+            profile_top = size_t(std::strtoul(argv[++k], nullptr, 10));
+        else if (a == "--profile-from" && k + 1 < argc)
+            profile_from = std::strtod(argv[++k], nullptr);
+        else if (a == "--profile-thread" && k + 1 < argc)
+            profile_thread = argv[++k];
         else if (a == "--stall-report" && k + 1 < argc)
             stall_report = std::strtod(argv[++k], nullptr);
         else if (a == "--lockstep" && k + 1 < argc) {
@@ -161,6 +193,23 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             o.record_input = argv[++k];
         else if (a == "--replay-input" && k + 1 < argc)
             o.replay_input = argv[++k];
+        else if (a == "--language" && k + 1 < argc)
+            o.system.language = uint32_t(std::strtoul(argv[++k], nullptr, 10));
+        else if (a == "--country" && k + 1 < argc)
+            o.system.country = int(std::strtol(argv[++k], nullptr, 10));
+        else if (a == "--resolution" && k + 1 < argc) {
+            unsigned w = 0, h = 0;
+            if (std::sscanf(argv[++k], "%ux%u", &w, &h) != 2)
+                return std::fprintf(stderr, "bad --resolution\n%s", usage), 2;
+            o.system.width = w, o.system.height = h;
+        } else if (a == "--widescreen" && k + 1 < argc)
+            o.system.widescreen = std::atoi(argv[++k]) ? 1 : 0;
+        else if (a == "--refresh" && k + 1 < argc)
+            o.system.refresh = std::atoi(argv[++k]);
+        else if (a == "--follow-launches")
+            follow_launches = true;
+        else if (a == "--launch-data" && k + 1 < argc)
+            launch_data_file = argv[++k];
         else if (a == "--hook-stats")
             hooks::set_stats(true);
         else if (a == "--reload-hooks-every" && k + 1 < argc)
@@ -212,6 +261,11 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                     shots.string().c_str());
     }
 
+    if (!launch_data_file.empty()) {
+        std::ifstream in(launch_data_file, std::ios::binary);
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        kernel::set_launch_data(k, data);
+    }
     if (port.on_init) port.on_init(k);
     if (!port.hook_module.empty() && !game::load_port_module(g, port.hook_module, error))
         return std::fprintf(stderr, "%s\n", error.c_str()), 1;
@@ -231,6 +285,9 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     bool stall_reported = false;
     bool halted = false;
     double next_reload = reload_every;
+    bool profiling = false;
+    uint64_t profile_swaps = 0;
+    double profile_started = 0, profile_cpu = 0;
     for (double elapsed = 0; elapsed < seconds && !k.stopped;) {
         if ((ended = k.wait_main(100, &exit_code))) break;
         if ((halted = k.halted())) break;
@@ -240,6 +297,28 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         if (due) next_reload += reload_every;
         game::poll_port_module(g, due);
         if (rates && elapsed >= next_rates) game::print_rates(g, rate_log, elapsed), next_rates += 1;
+        if (profile_top && !profiling && elapsed >= profile_from) {
+            profiling = true, profile_swaps = swaps(), profile_started = elapsed;
+            profile_cpu = sampler::process_cpu_seconds();
+            uint32_t only = 0;
+            if (!profile_thread.empty()) {
+                only = k.host_thread_id(profile_thread);
+                if (only) std::printf("profile: guest thread \"%s\" alone (host thread %u)\n", profile_thread.c_str(), only);
+                else std::fprintf(stderr, "boot: --profile-thread: no running thread named \"%s\"; all of them\n",
+                                  profile_thread.c_str());
+            }
+            // the generated functions named for the samples a game library's
+            // missing symbols leave unnamed
+            std::vector<const void *> hosts;
+            std::vector<unsigned> guests;
+            for (size_t m = 0; g.installed_modules && m < g.generated_modules; m++)
+                for (size_t f = 0; f < g.installed_modules[m]->count; f++) {
+                    hosts.push_back(reinterpret_cast<const void *>(g.installed_modules[m]->functions[f].fn));
+                    guests.push_back(g.installed_modules[m]->functions[f].address);
+                }
+            sampler::name_generated(hosts.data(), guests.data(), hosts.size());
+            if (!sampler::start(1000, only)) std::fprintf(stderr, "boot: --profile is not supported on this host\n");
+        }
         if (stall_report > 0) {
             uint64_t now_swaps = swaps();
             if (now_swaps != last_swaps) {
@@ -253,6 +332,14 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         }
     }
 
+    if (profiling) {
+        double span = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() - profile_started;
+        uint64_t swapped = swaps() - profile_swaps;
+        double cpu = sampler::process_cpu_seconds() - profile_cpu;
+        std::printf("profile: %.1f s, %.2f swaps a second, %.1f ms of CPU (all threads) a swap\n", span,
+                    double(swapped) / span, swapped ? 1000.0 * cpu / double(swapped) : 0.0);
+        sampler::stop_and_report(profile_top);
+    }
     if (k.stopped)
         std::printf("stopped: %s\n", k.stop_reason.c_str());
     else if (ended)
@@ -278,6 +365,52 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             game::print_summary(g, stall_reported ? "stall" : "ok", halted ? "halted" : "");
     }
     if (port.on_shutdown) port.on_shutdown(k);
+    std::fflush(stdout);
+    if (k.stopped && k.title_exit.launch) {
+        std::string next = game::disc_path(k.title_exit.path);
+        std::printf("the title asks for %s", next.empty() ? "the dashboard" : next.c_str());
+        if (!follow_launches || next.empty()) {
+            std::printf("%s\n", next.empty() ? "" : " (--follow-launches starts it)");
+        } else {
+            // a title is a process: the next one starts as boot again on the same disc, with what
+            // the title left it (the launch data) and the time that remains
+            std::printf("; starting it\n");
+            std::fflush(stdout);
+            std::vector<std::string> args;
+            for (int i = 0; i < argc; i++) {
+                std::string a = argv[i];
+                if ((a == "--xex" || a == "--seconds" || a == "--launch-data") && i + 1 < argc) i++;
+                else args.push_back(a);
+            }
+            double used = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            args.insert(args.end(),
+                        {"--xex", next, "--seconds", std::to_string(uint32_t(std::max(1.0, seconds - used)))});
+            if (!k.title_exit.launch_data.empty()) {
+                std::filesystem::path file = o.storage / "launch-data.bin";
+                std::filesystem::create_directories(o.storage, ec);
+                std::ofstream out(file, std::ios::binary);
+                out.write(reinterpret_cast<const char *>(k.title_exit.launch_data.data()),
+                          std::streamsize(k.title_exit.launch_data.size()));
+                args.insert(args.end(), {"--launch-data", file.string()});
+            }
+            std::vector<char *> v;
+#ifdef _WIN32
+            // _spawnv does not quote: an argument with a space (a disc's path) would split
+            for (std::string &s : args)
+                if (s.find(' ') != std::string::npos) s = "\"" + s + "\"";
+#endif
+            for (std::string &s : args) v.push_back(s.data());
+            v.push_back(nullptr);
+#ifdef _WIN32
+            int code = int(_spawnv(_P_WAIT, argv[0], v.data()));
+            std::fflush(stdout);
+            std::_Exit(code < 0 ? 1 : code);
+#else
+            execv(argv[0], v.data());
+            std::_Exit(1);
+#endif
+        }
+    }
     // other threads may still run: no destructors under them
     std::fflush(stdout);
     std::_Exit(0);

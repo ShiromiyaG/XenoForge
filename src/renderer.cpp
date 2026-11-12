@@ -48,10 +48,13 @@
 
 #include "xenoforge/guest_memory.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/render_scale.h"
 #include "xenoforge/resolve.h"
 #include "xenoforge/shader_harness.h"
 #include "xenoforge/shader_interpreter.h"
 #include "xenoforge/shader_storage.h"
+#include "xenoforge/index_convert.h"
+#include "xenoforge/shader_program.h"
 #include "xenoforge/shader_translator.h"
 #include "xenoforge/texture.h"
 #include "xenoforge/ucode.h"
@@ -130,6 +133,37 @@ const uint32_t EDRAM_LOAD_DEPTH[] = {
 const uint32_t EDRAM_LOAD_STENCIL[] = {
 #include "edram_load_stencil.frag.inc"
 };
+// edram_transfer.frag: [single-sampled source, multisampled][color, UINT color, depth, depth and stencil]
+const uint32_t EDRAM_TRANSFER[] = {
+#include "edram_transfer.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_UINT[] = {
+#include "edram_transfer_uint.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_DEPTH[] = {
+#include "edram_transfer_depth.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_STENCIL[] = {
+#include "edram_transfer_stencil.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_STENCIL_COPY[] = {
+#include "edram_transfer_stencil_copy.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS_STENCIL_COPY[] = {
+#include "edram_transfer_ms_stencil_copy.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS[] = {
+#include "edram_transfer_ms.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS_UINT[] = {
+#include "edram_transfer_ms_uint.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS_DEPTH[] = {
+#include "edram_transfer_ms_depth.frag.inc"
+};
+const uint32_t EDRAM_TRANSFER_MS_STENCIL[] = {
+#include "edram_transfer_ms_stencil.frag.inc"
+};
 const uint32_t DEPTH_FLOAT24[] = {
 #include "depth_float24.frag.inc"
 };
@@ -142,6 +176,13 @@ const uint32_t PLACEHOLDER[] = {
 const uint32_t RESOLVE[] = {
 #include "resolve.comp.inc"
 };
+// (the host render target path's, reading the source target's image)
+const uint32_t RESOLVE_IMAGE[] = {
+#include "resolve_image.comp.inc"
+};
+const uint32_t RESOLVE_IMAGE_MS[] = {
+#include "resolve_image_ms.comp.inc"
+};
 const uint32_t TEXTURE_LOAD[] = {
 #include "texture_load.comp.inc"
 };
@@ -150,6 +191,66 @@ const uint32_t TEXTURE_LOAD[] = {
 const uint32_t EDRAM_FSI_LIBRARY[] = {
 #include "edram_fsi_library.frag.inc"
 };
+// the generic shaders (generic.glsl): the vertex shader, and the pixel
+// shader on host render targets and on the interlock path (pixel and sample
+// interlock), each with point coordinates or not and writing depth or not
+const uint32_t GENERIC_VS[] = {
+#include "generic.vert.inc"
+};
+const uint32_t GENERIC_CLIP_VS[] = {
+#include "generic_clip.vert.inc"
+};
+const uint32_t GENERIC_CULL_VS[] = {
+#include "generic_cull.vert.inc"
+};
+const uint32_t GENERIC_EXTENTS_VS[] = {
+#include "generic_extents.vert.inc"
+};
+const uint32_t GENERIC_EXTENTS_CLIP_VS[] = {
+#include "generic_extents_clip.vert.inc"
+};
+const uint32_t GENERIC_EXTENTS_CULL_VS[] = {
+#include "generic_extents_cull.vert.inc"
+};
+const uint32_t GENERIC_FS[] = {
+#include "generic.frag.inc"
+};
+const uint32_t GENERIC_DEPTH_FS[] = {
+#include "generic_depth.frag.inc"
+};
+const uint32_t GENERIC_POINTS_FS[] = {
+#include "generic_points.frag.inc"
+};
+const uint32_t GENERIC_POINTS_DEPTH_FS[] = {
+#include "generic_points_depth.frag.inc"
+};
+const uint32_t GENERIC_FSI_FS[] = {
+#include "generic_fsi.frag.inc"
+};
+const uint32_t GENERIC_FSI_DEPTH_FS[] = {
+#include "generic_fsi_depth.frag.inc"
+};
+const uint32_t GENERIC_FSI_POINTS_FS[] = {
+#include "generic_fsi_points.frag.inc"
+};
+const uint32_t GENERIC_FSI_POINTS_DEPTH_FS[] = {
+#include "generic_fsi_points_depth.frag.inc"
+};
+const uint32_t GENERIC_FSI_SAMPLE_FS[] = {
+#include "generic_fsi_sample.frag.inc"
+};
+const uint32_t GENERIC_FSI_SAMPLE_DEPTH_FS[] = {
+#include "generic_fsi_sample_depth.frag.inc"
+};
+const uint32_t GENERIC_FSI_SAMPLE_POINTS_FS[] = {
+#include "generic_fsi_sample_points.frag.inc"
+};
+const uint32_t GENERIC_FSI_SAMPLE_POINTS_DEPTH_FS[] = {
+#include "generic_fsi_sample_points_depth.frag.inc"
+};
+// the program buffer's size: a program is 16 bytes per control flow
+// instruction and 64 per ALU or fetch one, a few KB a shader
+constexpr VkDeviceSize PROGRAM_BUFFER_BYTES = 32ull << 20;
 const uint32_t EDRAM_FSI_DEPTH_PIXEL[] = {
 #include "edram_fsi_depth_pixel.frag.inc"
 };
@@ -159,9 +260,13 @@ const uint32_t EDRAM_FSI_DEPTH_SAMPLE[] = {
 const uint32_t EDRAM_CLEAR[] = {
 #include "edram_clear.comp.inc"
 };
+const uint32_t EDRAM_RESCALE[] = {
+#include "edram_rescale.comp.inc"
+};
 
 // registers xenos.h does not name
 namespace r {
+constexpr uint32_t RB_HIZCONTROL = 0x2203;
 constexpr uint32_t PA_SC_SCREEN_SCISSOR_TL = 0x200E, PA_SC_SCREEN_SCISSOR_BR = 0x200F;
 constexpr uint32_t PA_SC_WINDOW_OFFSET = 0x2080, PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082;
 constexpr uint32_t VGT_MAX_VTX_INDX = 0x2100, VGT_MIN_VTX_INDX = 0x2101, VGT_INDX_OFFSET = 0x2102;
@@ -190,6 +295,10 @@ constexpr VkDeviceSize EDRAM_BYTES = VkDeviceSize(EDRAM_TILES) * 80 * 16 * 4;
 // submissions in flight, and each one's share of the upload arena
 constexpr uint32_t SLOTS = 3;
 constexpr VkDeviceSize ARENA_SLOT = 64u << 20;
+// A slot's share of the draw-data arena (the draws' constants in video
+// memory, Impl::draw_data_take): about 1,500 draws that change both stages'
+// constants, after which the submission is flushed as for the arena
+constexpr VkDeviceSize DRAW_DATA_SLOT = 16u << 20;
 constexpr VkDeviceSize READBACK_CHUNK = 32u << 20;
 // GPU timestamps a submission holds at most (Options::gpu_timing)
 constexpr uint32_t TIMESTAMPS = 8192;
@@ -199,6 +308,11 @@ constexpr VkDeviceSize NONE = ~VkDeviceSize(0);
 // holds 14 bits of index) and samplers
 constexpr uint32_t IMAGES[3] = {16384, 4096, 4096};
 constexpr uint32_t SAMPLERS = 1024;
+// the textures resolves write as well, of 32- and of 64-bit texels each
+// (Impl::resolve_target)
+// a texel size's places in the resolves' table (resolve.comp's targets32 and
+// targets64): 127, all that a place's 7 bits in ResolveConstants::target name
+constexpr uint32_t RESOLVE_TARGETS = 127;
 
 float as_float(uint32_t bits) {
     float f;
@@ -281,6 +395,27 @@ float pwl_gamma_to_linear(float gamma) {
     float linear = gamma * ((255.0f * 1024.0f) * scale) + offset;
     linear += std::trunc(linear * scale);
     return linear * (1.0f / 1023.0f);
+}
+
+// Each host sample at the position of the guest sample it stands for
+// (draw_util.cc's GetHostSampleXenosPositions; positions in sixteenths from
+// the pixel's center, draw_util.h's kXenosSamplePositions2x and 4x): 4x in
+// the guest's order on host render targets and 0, 3, 2, 1 on the interlock
+// path, native 2x host samples 1 and 0, the interlock path's 2x as 4x
+// 0, 1, 0, 1. msaa: 1 for the guest's 2x, 2 for its 4x.
+void xenos_sample_locations(uint32_t msaa, VkSampleCountFlagBits samples, bool interlock, VkSampleLocationEXT *positions,
+                            VkPipelineSampleLocationsStateCreateInfoEXT &state) {
+    static const int8_t positions_2x[2][2] = {{-4, 4}, {4, -4}};
+    static const int8_t positions_4x[4][2] = {{-2, -2}, {2, 2}, {-6, 6}, {6, -6}};
+    static const uint32_t remap_4x_interlock[4] = {0, 3, 2, 1};
+    uint32_t count = uint32_t(samples);
+    for (uint32_t k = 0; k < count; k++) {
+        const int8_t *p = msaa == 2 ? positions_4x[interlock ? remap_4x_interlock[k] : k]
+                                    : positions_2x[count == 2 ? k ^ 1 : k & 1];
+        positions[k] = {0.5f + float(p[0]) / 16.0f, 0.5f + float(p[1]) / 16.0f};
+    }
+    state.sampleLocationsEnable = VK_TRUE;
+    state.sampleLocationsInfo = {VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT, nullptr, samples, {1, 1}, count, positions};
 }
 
 // xenos::Float32To20e4: towards zero, or to the nearest even
@@ -427,6 +562,76 @@ VkBlendOp blend_op(uint32_t o) {
     return o < 5 ? ops[o] : VK_BLEND_OP_ADD;
 }
 
+// RB_BLENDCONTROL for the host's blending. The console applies the factors
+// before a minimum or maximum (Xenia's interlock paths do: "unlike Vulkan/D3D12
+// fixed-function blend which ignores factors for MIN/MAX, the Xbox 360 applies
+// blend factors before min/max", dxbc_shader_translator_om.cc); the host takes
+// the minimum or maximum of the source and the destination as they are. Both
+// factors one need nothing. With factors of zero and one the console's result
+// is a plain copy, where values are never negative (the target's format):
+// max(0, d) is d, max(s, 0) is s, a minimum with zero is zero; those become
+// additions the host does. A source factor that depends on the source and the
+// blend constant alone, against a destination factor of zero or one, is
+// multiplied in by the pixel shader (shader::PixelOptions::blend_premultiply,
+// with `shader` set: the draw has a pixel shader on host render targets), which
+// also takes the minimum or maximum with zero for a destination factor of
+// zero; `premultiply` gets the target's word of the system constants then
+// (shader_translator.cpp), and the host blends the product with factors of
+// one. Xenia's Direct3D 12 pipelines do that for the source's alpha against a
+// destination factor of one alone. What is left as the host blends, `ignored`
+// set for the count: a factor that needs the destination (either side), a
+// destination factor other than zero and one, a 16-bit fixed-point target
+// (kept scaled on the host), and an alpha multiplied here while the color's
+// blend reads the source's alpha.
+uint32_t host_blend_control(uint32_t blend, uint32_t format, bool shader, uint32_t &premultiply, bool &ignored) {
+    const bool non_negative = format <= 3 || format == 10 || format == 12; // unorm and 7e3 targets
+    const bool scaled = format == 4 || format == 5;                        // 16_16 and 16_16_16_16
+    // (edram_fsi.frag's fixed_color and fixed_alpha)
+    const bool fixed_color = format <= 2 || format == 10, fixed_alpha = fixed_color || format == 3 || format == 12;
+    const uint32_t guest = blend;
+    premultiply = 0;
+    for (uint32_t shift : {0u, 16u}) { // color, alpha
+        const uint32_t half = (guest >> shift) & 0x1FFF;
+        const uint32_t source = half & 0x1F, op = (half >> 5) & 7, destination = (half >> 8) & 0x1F;
+        if (op != 2 && op != 3) continue;              // not MIN, MAX
+        if (source == 1 && destination == 1) continue; // the host's own
+        uint32_t replaced = 0;
+        if (source <= 1 && destination <= 1 && non_negative) {
+            // (ADD, with the factors that leave the console's result: ZERO, ADD, ZERO for a minimum)
+            if (op == 3) replaced = source | destination << 8;
+        } else {
+            // ZERO, ONE, the source's color and alpha, the constant's, and one minus those
+            const bool source_only = source <= 1 || (source >= 4 && source <= 7) || (source >= 12 && source <= 15);
+            if (!shader || scaled || !source_only || destination > 1) {
+                ignored = true;
+                continue;
+            }
+            uint32_t word = source | 0x80;
+            if (destination == 1) {
+                replaced = 1 | op << 5 | 1 << 8; // ONE, the minimum or maximum, ONE
+            } else {
+                word |= (op == 2 ? 1u : 2u) << 5; // with zero, in the shader
+                replaced = 1;                     // ONE, ADD, ZERO
+            }
+            premultiply |= word << (shift / 2);
+        }
+        blend = (blend & ~(0x1FFFu << shift)) | replaced << shift;
+    }
+    if (premultiply & 0x8000) {
+        // the alpha the shader writes is no longer the source's: a color
+        // blend that reads it (SRC_ALPHA, ONE_MINUS_SRC_ALPHA, SRC_ALPHA_SATURATE) keeps the guest's alpha blend
+        const uint32_t color_source = blend & 0x1F, color_destination = (blend >> 8) & 0x1F;
+        auto reads_alpha = [](uint32_t factor) { return factor == 6 || factor == 7 || factor == 16; };
+        if (reads_alpha(color_source) || reads_alpha(color_destination)) {
+            blend = (blend & 0x0000FFFF) | (guest & 0xFFFF0000);
+            premultiply &= 0xFF;
+            ignored = true;
+        }
+    }
+    if (premultiply) premultiply |= (fixed_color ? 1u << 16 : 0u) | (fixed_alpha ? 1u << 17 : 0u);
+    return blend;
+}
+
 struct Shader {
     uint64_t hash = 0; // hash_words(type, microcode), its name in the shader storage
     xf::ucode::ParsedShader parsed;
@@ -445,12 +650,53 @@ struct Shader {
     // vertex kill it writes
     bool fetches_textures = false;
     bool writes_position_y = false, writes_position_w = false, writes_point_size = false, writes_vertex_kill = false;
+    uint32_t writes_position_xz = 0; // bit 0: x, bit 2: z (Impl::depth_overwrite)
     // memexport: whether it writes any eM#, and the float constants its eA
     // writes take the stream from (Shader::memexport_stream_constants)
     bool exports = false;
     std::set<uint32_t> stream_constants;
     // per texture slot, the first fetch's filter overrides: mag, min, mip, aniso (3: the constant's)
     std::map<uint32_t, std::array<uint32_t, 4>> filters;
+    // what a draw asks of the summary's sets, made once (load_shader): the texture slots and the
+    // vertex fetch slots as masks, and the blocks of 32 fetch constant words they lie in
+    uint64_t texture_mask = 0, vertex_mask[2] = {};
+    uint32_t fetch_blocks = 0;
+    // the float constants its instructions read, a bit per block of 8 (c0-c7, c8-c15, ...): all
+    // of them when one is read relative to a0 or aL. A draw uploads those blocks alone.
+    uint32_t float_blocks = 0xFFFFFFFFu;
+    uint32_t filter_mask = 0; // the slots (below 32) filters has
+    std::array<uint32_t, 4> slot_filters[32] = {}; // filters' for those slots, without the map's search
+    // its program for the generic shaders (Impl::program): encoded once, at
+    // `program` in the program buffer (16-byte units; UINT32_MAX: not there,
+    // with why in program_unsupported), its flags (shader::PROGRAM_*)
+    bool encoded = false;
+    uint32_t program = UINT32_MAX, program_flags = 0;
+    std::string program_unsupported;
+    bool analyzed = false;            // Impl::analyze
+    std::set<uint32_t> translating; // forms on the translation workers (Impl::form_module)
+};
+
+// A rectangle of a render target's EDRAM tiles: columns [c0, c1) of its tile
+// rows [r0, r1), as the target lays its tiles out (pitch_tiles a row).
+struct TileRect {
+    uint32_t c0 = 0, r0 = 0, c1 = 0, r1 = 0;
+    bool empty() const { return c1 <= c0 || r1 <= r0; }
+    bool within(const TileRect &o) const { return c0 >= o.c0 && r0 >= o.r0 && c1 <= o.c1 && r1 <= o.r1; }
+    uint32_t area() const { return empty() ? 0 : (c1 - c0) * (r1 - r0); }
+    // a memo of tiles known to be some way, after `more` are found to be so
+    // too: both when they make one rectangle, else the larger
+    void remember(const TileRect &more) {
+        if (more.within(*this)) return;
+        if (empty() || within(more)) {
+            *this = more;
+        } else if (more.c0 == c0 && more.c1 == c1 && more.r0 <= r1 && more.r1 >= r0) {
+            r0 = std::min(r0, more.r0), r1 = std::max(r1, more.r1);
+        } else if (more.r0 == r0 && more.r1 == r1 && more.c0 <= c1 && more.c1 >= c0) {
+            c0 = std::min(c0, more.c0), c1 = std::max(c1, more.c1);
+        } else if (more.area() > area()) {
+            *this = more;
+        }
+    }
 };
 
 struct RenderTarget {
@@ -461,7 +707,24 @@ struct RenderTarget {
     VkImageView view = VK_NULL_HANDLE;
     VkImageView sampled = VK_NULL_HANDLE, stencil = VK_NULL_HANDLE; // color or depth alone, stencil alone
     VkDescriptorSet store_set = VK_NULL_HANDLE;                     // its EDRAM store's
-    uint32_t width = 0, height = 0;
+    // a depth image drawn into since a shader last read it (Impl::settle_depth_samples)
+    bool samples_unsettled = false;
+    // resolves' clears kept for its next render pass (Impl::flush_clears)
+    std::vector<std::pair<VkClearAttachment, VkClearRect>> pending_clears;
+    uint32_t width = 0, height = 0; // in the console's pixels
+    // What a draw's bookkeeping found last (Impl::acquire, tiles_drawn), so
+    // the next draw into the same target does not walk its tiles again: it
+    // held the tiles of `owned` as of owners_epoch_ == owned_epoch, and none
+    // of the tiles of `drawn` held a clear's value as of cleared_epoch_ ==
+    // drawn_epoch.
+    uint64_t owned_epoch = 0, drawn_epoch = 0;
+    TileRect owned, drawn;
+    // (and none of the tiles of stencil_written had a known stencil as of
+    // stencil_epoch_ == stencil_epoch: Impl::tile_stencil_)
+    uint64_t stencil_epoch = 0;
+    TileRect stencil_written;
+    // its image's size: width and height at the resolution scale (Impl::scale_)
+    uint32_t host_width = 0, host_height = 0;
     // in EDRAM: tiles per row (at its bits per sample), a tile's size in pixels
     uint32_t pitch_tiles = 1, tile_width = 80, tile_height = 16;
     bool wide = false; // 64 bits per sample
@@ -473,23 +736,44 @@ struct RenderTarget {
     // denormals), through a UINT view of its image: the view, its format
     VkImageView raw = VK_NULL_HANDLE;
     VkFormat raw_format = VK_FORMAT_UNDEFINED;
+    // a depth target's stencil as an R8_UINT image of its size, which EDRAM
+    // transfers into it write and copy into its stencil aspect where the
+    // device has no stencil export (Impl::edram_transfer); made at the first
+    vk::Image stencil_copy;
+    VkImageView stencil_copy_view = VK_NULL_HANDLE;
 };
 
-// edram.glsl's push constants
+// edram.glsl's push constants (width, height, x and y in the scaled grid's pixels)
 struct EdramTarget {
     uint32_t base_tiles, pitch_tiles, msaa, format, width, height, is_depth, ints_log2, stencil_bit, flags;
     uint32_t x, y, clear_lo, clear_hi; // edram_clear.comp's
+    uint32_t scale;                    // the resolution scale in quarters
 };
+// edram_transfer.frag's push constants: the destination's and the source's
+// EdramTarget, up to the flags (edram.glsl's EdramParams)
+struct EdramTransfer {
+    uint32_t dest[11], source[11]; // (the 11th: the resolution scale)
+};
+static_assert(sizeof(EdramTransfer) <= 128);
 
 // edram_fsi.frag's uniform block (set 0 binding 4): the interlock path's
 // render target state
+// a draw's viewport on the host (host_viewport)
+struct Viewport {
+    VkViewport viewport{};
+    float ndc_scale[3] = {1, 1, 1}, ndc_offset[3] = {};
+    bool empty = false;
+};
+
 struct FsiConstants {
     uint32_t flags, depth_base, pitch, zpd_index;
     uint32_t rt[4], blend[4], rt_base[4], stencil[4];
     float poly_offset[4], blend_constant[4], exp_bias[4];
+    // the resolution scale in quarters and a tile's dwords at it (render_scale.h)
+    uint32_t scale[4];
     bool operator==(const FsiConstants &) const = default;
 };
-static_assert(sizeof(FsiConstants) == 128);
+static_assert(sizeof(FsiConstants) == 144);
 // its flags (edram_fsi.frag's F_ bits; the MSAA mode in bits 0-1)
 constexpr uint32_t FSI_2X_AS_4X = 4, FSI_DEPTH_STENCIL = 8, FSI_DEPTH_LESS = 16, FSI_DEPTH_WRITE = 128,
                    FSI_STENCIL = 256, FSI_FLOAT24 = 512;
@@ -502,7 +786,10 @@ struct ResolveConstants {
     float exp_factor;
     // a multisampled source read from EDRAM
     uint32_t edram, edram_base, edram_pitch, msaa, ints_log2, src_x, src_y, first_sample, samples;
-    uint32_t depth_round; // D24FS8 from the host's float: 20e4 rounded to the nearest even
+    // bit 0: D24FS8 from the host's float, 20e4 rounded to the nearest even;
+    // the resolution scales (resolve.comp's p.flags)
+    uint32_t flags;
+    uint32_t target; // the texture written too (resolve.comp's p.target), 0 none
 };
 static_assert(sizeof(ResolveConstants) <= 128, "the push constants every device has room for");
 
@@ -567,6 +854,7 @@ struct Texture {
     uint32_t checked = 0;       // the write count its memory was last known unwritten at (Memory's)
     uint32_t low = 0, high = 0; // the ranges' bounds
     bool stale = false;         // a resolve or a memory export wrote memory under it
+    uint64_t loads = 0;         // how many times it was loaded (what a draw kept of it is as of one: SlotMemo)
     bool gpu = false;           // loaded from what the GPU wrote (the mirror's, or read back from it)
     // why its next load comes (Report's texture_loads_*)
     LoadWhy load_why = LoadWhy::New;
@@ -582,6 +870,26 @@ struct Texture {
     VkDeviceSize bytes = 0;
     uint64_t used_serial = 0, used_ms = 0;
     Texture *older = nullptr, *newer = nullptr;
+    // a resolve target (Impl::resolve_target): its slot in the resolves'
+    // target table plus one (0: not one) and bit 7 for a 64-bit texel; its
+    // unsigned view there; and what a resolve must write to feed it (its
+    // base, pitch in texels, guest format and endianness)
+    uint32_t target = 0;
+    VkImageView target_view = VK_NULL_HANDLE;
+    uint32_t target_base = 0, target_pitch = 0, target_endian = 0;
+    // what the resolves feeding it write: 0 the guest's bits, 1 and 2 a
+    // depth texture's float from them (its load's DepthUnormToFloat and
+    // DepthFloatToFloat; resolve.comp's write_targets)
+    uint32_t target_convert = 0;
+    // its image at the resolution scale (Impl::scale_texture), the resolves
+    // feeding it writing its scaled texels; a load makes it the console's
+    // size again
+    bool scaled = false;
+    // XF_RESOLVE_TARGET_DETAIL: the resolve that last made it stale (its
+    // destination's format, size, pitch, base and corner), for the reload's count
+    struct StaleBy {
+        uint32_t format = 0, width = 0, height = 0, pitch = 0, base = 0, x = 0, y = 0;
+    } stale_by;
 };
 
 // the translated shaders' and the geometry shaders' system constants
@@ -593,67 +901,29 @@ struct System {
     float values[4];    // alpha reference, the point diameter's bounds (PA_SU_POINT_MINMAX)
     float color_scales[4];
     float point[4]; // the constant diameter (PA_SU_POINT_SIZE), guest pixel diameter to NDC radius
-    // per slot, its texture's signs on the result components (bits 0-7, two
-    // each: unsigned, signed, biased, gamma; Xenia's SwizzleSigns) and the
-    // width less one of each one's component (bits 8-23, four each; 0
-    // unknown), for biased components
+    // per slot, its texture's signs on the result components (two bits
+    // each: unsigned, signed, biased, gamma; texture::swizzled_signs)
     uint32_t signs[32];
     uint32_t signed_slots[32]; // per slot, its texture's signed view as slots has it; 0 none
     float clip_planes[6][4];   // the user clip planes enabled, packed (shader::VertexOptions)
+    // screen extents (shader::VertexOptions::extents): the host's NDC to
+    // console pixels (x scale, x offset, y scale, y offset), and the
+    // report's first word in the extents buffer
+    float extent_map[4];
+    uint32_t extent_report[4];
+    // per slot, how its result goes through the constant's number format
+    // (texture::integer_scale_bits, Xenia's GetIntegerScaleBits)
+    uint32_t integer_scale[32];
+    // per color target, the factors of a minimum or maximum blend the pixel
+    // shader multiplies its color by (host_blend_control,
+    // shader::PixelOptions::blend_premultiply), and the blend constant for them
+    uint32_t blend_premultiply[4];
+    float blend_constant[4];
+    // the generic shaders' programs (generic.glsl): the vertex shader's and
+    // the pixel shader's, in 16-byte units into the program buffer (binding 8)
+    uint32_t generic[4];
 };
-static_assert(sizeof(System) == 576);
-
-// The bits of each component of a fixed-point guest texture format, in the
-// texel's order (Xenia's texture_info_formats.inl, its fixed formats); zeros
-// for the others.
-std::array<uint32_t, 4> component_bits(uint32_t format) {
-    switch (format) {
-    case 2: case 8: case 9: case 58: case 59: return {8, 0, 0, 0};       // 8, 8_A, 8_B, DXT3A, DXT5A
-    case 3: return {5, 5, 5, 1};                                         // 1_5_5_5
-    case 4: return {5, 6, 5, 0};                                         // 5_6_5
-    case 5: return {5, 5, 6, 0};                                         // 6_5_5
-    case 6: case 14: case 50: case 62: return {8, 8, 8, 8};              // 8_8_8_8 and its kin
-    case 7: case 54: return {10, 10, 10, 2};                             // 2_10_10_10
-    case 10: case 49: case 60: return {8, 8, 0, 0};                      // 8_8, DXN, CTX1
-    case 13: case 25: return {16, 16, 0, 0};                             // 16_16
-    case 15: return {4, 4, 4, 4};                                        // 4_4_4_4
-    case 16: case 55: return {11, 11, 10, 0};                            // 10_11_11
-    case 17: case 56: return {10, 11, 11, 0};                            // 11_11_10
-    case 21: case 26: return {16, 16, 16, 16};                           // 16_16_16_16
-    case 24: return {16, 0, 0, 0};                                       // 16
-    default: return {0, 0, 0, 0};
-    }
-}
-
-// A slot's signs word (System::signs): the fetch constant's signs through its
-// swizzle onto the result components, as Xenia's SwizzleSigns (constant
-// components unsigned, or signed when everything else is), and the biased
-// ones' component widths as its GetIntegerScaleBits gives them.
-uint32_t swizzled_signs(const texture::Info &info) {
-    uint32_t signs = 0, constants = 0;
-    bool any_signed = false, any_not_signed = false;
-    std::array<uint32_t, 4> bits = component_bits(info.format);
-    uint32_t last_stored = 0;
-    for (uint32_t c = 1; c < 4; c++)
-        if (bits[c]) last_stored = c;
-    for (uint32_t k = 0; k < 4; k++) {
-        uint32_t source = (info.swizzle >> (3 * k)) & 7;
-        if (source & 4) {
-            constants |= 1u << (2 * k);
-            continue;
-        }
-        uint32_t sign = info.signs[source];
-        signs |= sign << (2 * k);
-        (sign == 1 ? any_signed : any_not_signed) = true;
-        uint32_t width = bits[std::min(source, last_stored)];
-        if (sign == 2 && width && width <= 16) signs |= (width - 1) << (8 + 4 * k);
-    }
-    bool constants_signed = constants == 0x55 ? info.signs[0] == 1 && info.signs[1] == 1 && info.signs[2] == 1 &&
-                                                    info.signs[3] == 1
-                                              : any_signed && !any_not_signed;
-    if (constants_signed) signs |= constants; // 1 for each constant component
-    return signs;
-}
+static_assert(sizeof(System) == 784);
 
 // The snorm format of a unorm one's bits, where the host has one (a signed
 // view of the same image); undefined for the rest.
@@ -686,10 +956,15 @@ struct ResolveReadback {
 // its read-back buffers, and what waits for the GPU to be done with it.
 struct Slot {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    // uploads into the mirror run ahead of cmd, in the same submission
+    // (Impl::request: pages nothing in the submission has used yet)
+    VkCommandBuffer pre = VK_NULL_HANDLE;
+    bool pre_recording = false;
     VkFence fence = VK_NULL_HANDLE;
     uint64_t serial = 0; // the submission it holds, recording or in flight; 0 when free
     bool recording = false;
     VkDeviceSize used = 0;
+    VkDeviceSize draw_used = 0; // of its share of the draw-data arena
     std::vector<std::function<void()>> after;
     std::vector<vk::Buffer> readbacks;
     size_t readback = 0;
@@ -703,6 +978,15 @@ struct Slot {
     VkQueryPool occlusion = VK_NULL_HANDLE;
     uint32_t occlusion_used = 0; // the queries to reset before the next use
     std::vector<uint64_t> occlusion_reports;
+    // screen extents (Impl's "screen extents"): per report bounded in the
+    // slot's share of the extents buffer, its handle and the pixels added
+    // around its bounds (wide lines)
+    struct ExtentReport {
+        uint64_t handle = 0;
+        uint32_t margin = 0;
+    };
+    std::vector<ExtentReport> extent_reports;
+    uint32_t extents_used = 0; // the reports to zero before the next use
 };
 
 // A swap's front buffer being read back: where its texels wait for the GPU
@@ -720,6 +1004,28 @@ struct FrontRead {
 };
 
 // The attachments of the render pass under way.
+// The dynamic state a draw sets (Impl::draw_state_: what the recording
+// command buffer holds since the last draw), compared bytewise
+struct DrawState {
+    VkViewport viewport;
+    VkRect2D scissor;
+    float blend_constants[4];
+    uint32_t stencil_reference[2], stencil_compare_mask[2], stencil_write_mask[2]; // front, back
+    VkStencilOp stencil_op[2][4];                                                    // fail, pass, depth fail, compare
+    VkPrimitiveTopology topology;
+    VkBool32 restart;
+    VkCullModeFlags cull_mode;
+    VkFrontFace front_face;
+    VkBool32 depth_test, depth_write;
+    VkCompareOp depth_compare;
+    VkBool32 stencil_test, depth_bias_enable;
+    VkBool32 blend_enables[4];
+    VkColorBlendEquationEXT blend_equations[4];
+    VkColorComponentFlags write_masks[4];
+    float line_width;
+    float depth_bias[3]; // the constant factor, the slope factor, the representation (VK_EXT_depth_bias_control)
+};
+
 struct Pass {
     VkImageView colors[4] = {};
     VkImageView depth = VK_NULL_HANDLE;
@@ -882,10 +1188,97 @@ struct PipelineEntry {
     // when a draw first asked for it, until one is first drawn with it or
     // its stand-in (Report::pipeline_wait_*); zero once counted
     std::chrono::steady_clock::time_point asked{};
+    // when a worker finished making it (zero: not made on a worker)
+    std::chrono::steady_clock::time_point made{};
     // the libraries it is linked from (vertex input, pre-rasterization,
     // fragment shader, fragment output; the last two null when rasterization
     // is discarded), once asked for
     PipelineEntry *libraries[4] = {};
+    // the generic stand-in (docs/renderer.md, "The generic shaders"): linked
+    // from the vertex input and fragment output libraries and the generic
+    // shaders' pre-rasterization and fragment shader libraries, drawing
+    // until the pipeline or its exact linked stand-in is made
+    VkPipeline generic = VK_NULL_HANDLE;
+    PipelineEntry *generic_libraries[4] = {};
+    bool generic_failed = false;
+};
+
+// Shaders translated off the renderer's thread (docs/renderer.md, "The
+// translation off the renderer's thread"): a form's translation to SPIR-V,
+// which reads only the shader's parse (fixed once loaded; shaders are never
+// dropped), done by a few threads; the renderer's thread takes what they
+// finished (take) and makes the modules. Stopping waits for the one under
+// way and leaves the queue.
+class TranslationWorkers {
+public:
+    struct Job {
+        Shader *shader;
+        uint32_t key; // Impl::form_module's
+        bool pixel;
+        shader::VertexOptions vertex;
+        shader::PixelOptions pixel_options;
+    };
+    struct Done {
+        Shader *shader;
+        uint32_t key;
+        shader::Translation translation;
+        double seconds;
+    };
+    explicit TranslationWorkers(uint32_t threads) {
+        for (uint32_t i = 0; i < threads; i++) threads_.emplace_back([this] { run(); });
+    }
+    ~TranslationWorkers() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_all();
+        for (std::thread &t : threads_) t.join();
+    }
+    void queue(Job job) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            jobs_.push_back(std::move(job));
+        }
+        wake_.notify_one();
+    }
+    // what is finished, into done (a check of an atomic when nothing is)
+    void take(std::vector<Done> &done) {
+        if (!finished_.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        done.swap(done_);
+        finished_.store(0, std::memory_order_release);
+    }
+
+private:
+    void run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
+                if (stop_) return;
+                job = std::move(jobs_.front());
+                jobs_.pop_front();
+            }
+            const auto start = std::chrono::steady_clock::now();
+            Done d{job.shader, job.key,
+                   shader::translate(job.shader->parsed, job.pixel ? shader::Stage::Pixel : shader::Stage::Vertex,
+                                     job.vertex, job.pixel_options),
+                   0.0};
+            d.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::lock_guard<std::mutex> lock(mutex_);
+            done_.push_back(std::move(d));
+            finished_.store(1, std::memory_order_release);
+        }
+    }
+    std::vector<std::thread> threads_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<Job> jobs_;
+    std::vector<Done> done_;
+    std::atomic<int> finished_{0};
+    bool stop_ = false;
 };
 
 // What a pipeline made on the workers is to the draws waiting for it.
@@ -961,6 +1354,7 @@ private:
             desc.reset();
             lock.lock();
             entry->pipeline = p;
+            entry->made = std::chrono::steady_clock::now();
             entry->state.store(1, std::memory_order_release);
             busy_--;
             if (late) {
@@ -988,7 +1382,7 @@ public:
     Impl(vk::Device &device, gpu::CommandProcessor &processor, const Options &options)
         : d_(device), dev_(device.device()), processor_(processor), options_(options),
           memory_(processor.memory().translate_physical(0)), mem_(processor.memory()),
-          stamps_(mem_.write_stamps()), page_shift_(mem_.watch_page_shift()),
+          stamps_(mem_.write_stamps()), block_stamps_(mem_.write_block_stamps()), page_shift_(mem_.watch_page_shift()),
           mirror_at_(GuestMemory::SIZE >> page_shift_, 0),
           gpu_pages_(std::make_unique<std::atomic<uint64_t>[]>(((GuestMemory::SIZE >> page_shift_) + 63) / 64)) {
         for (size_t i = 0; i < ((GuestMemory::SIZE >> page_shift_) + 63) / 64; i++) gpu_pages_[i].store(0);
@@ -1005,13 +1399,63 @@ public:
     void save_pipeline_cache();
 
     // ---- the Sink: the processor's calls, on its thread ----
-    void shader(uint32_t type, uint32_t, std::span<const uint32_t> code) override {
+    void shader(uint32_t type, uint32_t address, std::span<const uint32_t> code) override {
         Call call(*this, nullptr);
-        if (call) load_shader(type, code);
+        if (!call) return;
+        load_shader(type, code);
+        // the IM_LOAD shader_again just let through: kept by where it came from
+        if (shader_at_open_ && shader_at_key_ == shader_at(type, address, uint32_t(code.size())))
+            shaders_at_[shader_at_key_] = {type == 0 ? vertex_hash_ : pixel_hash_, shader_at_count_,
+                                           type == 0 ? vertex_shader_ : pixel_shader_};
+        shader_at_open_ = false;
+    }
+    // IM_LOAD's shaders by where they were loaded from (beyond Xenia, which
+    // copies and hashes the microcode at every load: a game loading its
+    // shaders at each draw spent 15% of the command thread there): the hash
+    // a load from the same words found, again while their pages are
+    // unwritten (memory.h's watches: watched, the count taken, then the
+    // copy). Never while a trace is recorded (it wants each load's words).
+    bool shader_again(uint32_t type, uint32_t address, uint32_t dwords) override {
+        Call call(*this, nullptr, true);
+        shader_at_open_ = false;
+        if (!call || trace_ || type > 1 || !dwords || address + uint64_t(dwords) * 4 > GuestMemory::SIZE) return false;
+        const uint64_t key = shader_at(type, address, dwords);
+        const uint32_t count = mem_.write_count();
+        auto it = shaders_at_.find(key);
+        if (it != shaders_at_.end()) {
+            bool same = it->second.checked == count;
+            if (!same) {
+                same = pages_unwritten(address >> page_shift_, (address + dwords * 4 - 1) >> page_shift_,
+                                       it->second.checked);
+            }
+            if (same && it->second.shader) {
+                it->second.checked = count;
+                (type == 0 ? vertex_hash_ : pixel_hash_) = it->second.hash;
+                (type == 0 ? have_vertex_ : have_pixel_) = true;
+                (type == 0 ? vertex_shader_ : pixel_shader_) = it->second.shader;
+                report_.shader_loads_again++;
+                return true;
+            }
+        }
+        // the processor copies it next
+        mem_.watch(address, dwords * 4);
+        shader_at_key_ = key, shader_at_count_ = mem_.write_count(), shader_at_open_ = true;
+        return false;
     }
     void draw(const gpu::RegisterFile &registers, const gpu::Draw &d) override {
         Call call(*this, &registers);
+        extent_drawn_ = false;
+        uint32_t survey = viz_survey_begin();
         if (call) draw(d);
+        // a draw in a screen extent report that did not bound it
+        if (extent_open_ && !extent_drawn_) extent_whole_ = true;
+        // a survey draw not measured: its query stays visible
+        if (survey != UINT32_MAX && !viz_measured_) viz_[survey].fallback = true;
+        viz_survey_ = viz_predicate_ = UINT32_MAX;
+    }
+    void viz_query(uint32_t id, bool end) override {
+        Call call(*this, nullptr);
+        if (call) viz_query_event(id & 63, end);
     }
     void resolve(const gpu::RegisterFile &registers, const gpu::Draw &) override {
         Call call(*this, &registers);
@@ -1033,13 +1477,51 @@ public:
         resolved.insert(resolved.end(), zpd_resolved_.begin(), zpd_resolved_.end());
         zpd_resolved_.clear();
     }
+    // screen extents (gpu::ScreenExtents::Measured; "screen extents" below)
+    bool measures_extents() override { return extents_.buffer != VK_NULL_HANDLE; }
+    Work work() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {report_.wait_seconds, report_.textures, report_.submissions, report_.pipelines};
+    }
+    void extent_init() override {
+        Call call(*this, nullptr, true);
+        // Between two reports, the draws recorded so far handed to the GPU
+        // once there are enough of them: the processor waits for the GPU
+        // where the guest may read the extents (extent_wait), and a pass of
+        // thousands of draws submitted only then left the GPU idle while it
+        // was recorded and the processor idle while it was drawn. (Not
+        // inside a report: one a submission begins in is the whole screen.)
+        if (call && extent_flush_draws_ && slots_[current_].recording &&
+            report_.drawn - drawn_at_submission_ >= extent_flush_draws_)
+            flush();
+        extent_open_ = true, extent_whole_ = false, extent_index_ = UINT32_MAX, extent_margin_ = 0;
+    }
+    uint64_t extent_report() override {
+        Call call(*this, nullptr, true);
+        return extent_reported();
+    }
+    void extent_wait() override {
+        Call call(*this, nullptr);
+        if (!call) return;
+        uint64_t serial = 0;
+        for (const Slot &s : slots_)
+            for (const Slot::ExtentReport &e : s.extent_reports)
+                if (e.handle && s.serial) serial = std::max(serial, s.serial);
+        if (serial) wait_serial(serial);
+    }
+    void extent_poll(std::vector<gpu::Extent> &resolved) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        resolved.insert(resolved.end(), extent_resolved_.begin(), extent_resolved_.end());
+        extent_resolved_.clear();
+    }
     // the processor's own writes (fences, reports), and a trace's memory
     // (Xenia's TracePlaybackWroteMemory): written through the physical view,
     // which no watch sees, so the watches are told; the mirror's pages and
     // the textures there are loaded again at their next use
     void memory_written(uint32_t address, uint32_t bytes) override {
-        Call call(*this, nullptr);
-        std::vector<Range> written;
+        Call call(*this, nullptr, true);
+        std::vector<Range> &written = draw_lists_.written; // (kept for its room)
+        written.clear();
         add_span(written, address, bytes);
         for (auto [start, stop] : written) mem_.physical_written(start, stop - start);
     }
@@ -1049,6 +1531,7 @@ public:
         Call call(*this, nullptr);
         if (bytes.size() != EDRAM_BYTES || !call) return;
         std::fill(owners_.begin(), owners_.end(), nullptr);
+        owners_epoch_++;
         VkBuffer from;
         VkDeviceSize at;
         uint8_t *data = staging(EDRAM_BYTES, from, at);
@@ -1057,7 +1540,9 @@ public:
         VkBufferCopy copy{at, 0, EDRAM_BYTES};
         VkCommandBuffer c = outside();
         gpu_mark("EDRAM: a trace's snapshot restored");
-        vkCmdCopyBuffer(c, from, edram_.buffer, 1, &copy);
+        // (at a resolution scale, through EDRAM at the console's size)
+        vkCmdCopyBuffer(c, from, scale_.one() ? edram_.buffer : edram_1x_.buffer, 1, &copy);
+        if (!scale_.one()) rescale_edram(true);
     }
     Report report() const override {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1088,6 +1573,12 @@ public:
         trace_ = trace;
     }
     void settle() override { drain(); }
+    void set_texture_filtering(uint32_t anisotropy, uint32_t filter) override {
+        anisotropy_.store(anisotropy, std::memory_order_relaxed);
+        texture_filter_.store(filter, std::memory_order_relaxed);
+    }
+    uint32_t resolution_scale() const override { return scale_.q4; }
+    std::string scale_notice() const override { return scale_notice_; }
     bool snapshot_edram(std::vector<uint8_t> &out) override;
     void gpu_memory(std::vector<std::pair<uint32_t, std::vector<uint8_t>>> &out) override;
 
@@ -1095,21 +1586,50 @@ private:
     // adds the time from its making to its end to a count of seconds
     class Timer {
     public:
-        explicit Timer(double &into) : into_(into), start_(std::chrono::steady_clock::now()) {}
-        ~Timer() { into_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count(); }
+        // (on false: nothing timed, no clock read)
+        explicit Timer(double &into, bool on = true) : into_(into), on_(on) {
+            if (on_) start_ = std::chrono::steady_clock::now();
+        }
+        ~Timer() {
+            if (on_) into_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+        }
 
     private:
         double &into_;
+        bool on_;
         std::chrono::steady_clock::time_point start_;
     };
+    // a translation and its module's making, timed into the report
+    // (Report::translate_seconds)
+    class TranslateTimer {
+    public:
+        explicit TranslateTimer(Report &report) : report_(report), start_(std::chrono::steady_clock::now()) {}
+        ~TranslateTimer() {
+            const double spent = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+            report_.translate_seconds += spent;
+            report_.translate_max = std::max(report_.translate_max, spent);
+            report_.translations++;
+        }
+
+    private:
+        Report &report_;
+        std::chrono::steady_clock::time_point start_;
+    };
+    // Options::cpu_times (or XF_RENDERER_CPU_TIMES=1): the clock read around the work done at
+    // every draw, texture and shader load too. Off, Report::check_seconds and vertex_seconds stay
+    // 0 and Report::seconds leaves out the calls that neither draw, resolve nor swap: two clock
+    // reads around each were 4% of the command thread in a scene of 3,000 draws.
+    bool cpu_times_ = false; // (set in init)
 
     // One of the processor's calls: the renderer's state is its alone while
     // it runs (report() waits), the registers are the processor's as they
     // stand, and its time is counted. False once the device has failed.
     class Call {
     public:
-        Call(Impl &r, const gpu::RegisterFile *registers) : r_(r), lock_(r.mutex_), timer_(r.report_.seconds) {
-            if (registers) r.regs_ = registers->data();
+        // (small: one of the many short calls, timed only with cpu_times_)
+        Call(Impl &r, const gpu::RegisterFile *registers, bool small = false)
+            : r_(r), lock_(r.mutex_), timer_(r.report_.seconds, !small || r.cpu_times_) {
+            if (registers) r.regs_ = registers->data(), r.file_ = registers;
         }
         explicit operator bool() const { return r_.fatal_.empty(); }
 
@@ -1123,10 +1643,56 @@ private:
 
     // draws
     void draw(const gpu::Draw &d);
+    // a vertex on the screen as the vertex shader run on the CPU places it
+    // (the viewport's scale and offset applied; not the window offset nor
+    // the pixel centers' half)
+    struct ScreenVertex {
+        uint32_t index;
+        float x, y;
+    };
     uint32_t draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                        uint32_t primitive, bool tessellated) const;
+                        uint32_t primitive, bool tessellated, std::vector<ScreenVertex> *screen = nullptr) const;
     uint32_t vertex_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                          uint32_t primitive) const;
+                          uint32_t primitive, std::vector<ScreenVertex> *screen = nullptr) const;
+    // the console's pixels a draw can reach, [x0, x1) x [y0, y1) each
+    struct Reach {
+        uint32_t x0, y0, x1, y1;
+    };
+    void draw_reach(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                    uint32_t primitive, bool tessellated, const VkViewport &viewport, const VkRect2D &scissor,
+                    std::vector<Reach> &reach) const;
+    mutable std::vector<ScreenVertex> reach_vertices_; // (draw_reach's own, kept for its room)
+    std::vector<Reach> reach_;                         // (the draw's)
+    std::vector<TileRect> reach_rects_;
+    // What a draw provably writes into its depth target whatever the target
+    // held (Impl::depth_overwrite): every sample of the console's pixels
+    // [x0, x1) x [y0, y1), and whether with one known word (the guest's
+    // depth and stencil, D24S8 or D24FS8 as the target's format).
+    // whole: the depth and the stencil; depth_whole: the depth, the stencil
+    // replaced (whole) or kept as it was; known_depth: the depth written is
+    // the word's (and the stencil, when whole); constant: whole with a known
+    // depth.
+    struct DepthOverwrite {
+        bool whole = false, depth_whole = false, known_depth = false;
+        uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        bool constant = false;
+        uint32_t word = 0;
+    };
+    DepthOverwrite depth_overwrite(const gpu::Draw &d, const Shader &vs, const Shader *ps,
+                                   const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                                   uint32_t depth_control, const RenderTarget &depth, const VkViewport &viewport,
+                                   const float *ndc_scale, const float *ndc_offset, const VkRect2D &scissor,
+                                   const char *&why) const;
+    // a depth target's clear value of the guest's word, as the target keeps it
+    // (xenos::UNorm24To32, or D24FS8 halved)
+    static VkClearValue depth_clear_value(uint32_t format, uint32_t word) {
+        VkClearValue v{};
+        uint32_t d24 = word >> 8;
+        v.depthStencil.depth =
+            format == 0 ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f) : float24_to_float(d24) * 0.5f;
+        v.depthStencil.stencil = word & 0xFF;
+        return v;
+    }
     void resolve();
     void gpu_resolve(const resolve::Info &info, RenderTarget &source);
     void swap();
@@ -1142,11 +1708,45 @@ private:
             std::fprintf(stderr, "  draw %llu skipped: %s (shaders %016llX %016llX)\n", (unsigned long long)report_.draws,
                          reason.c_str(), (unsigned long long)vertex_hash_, (unsigned long long)pixel_hash_);
     }
-    void approximate(const std::string &what) { report_.approximate[what]++; }
-    void use(const std::string &what) { report_.used[what]++; }
+    void approximate(const std::string &what) {
+        report_.approximate[what]++, approximations_++;
+        front_keepable_ = false; // (a count by a made string is not kept: draw_front)
+    }
+    void use(const std::string &what) {
+        report_.used[what]++;
+        front_keepable_ = false;
+    }
+    // A literal's counts by its address: no string made and no map of
+    // strings searched at each draw (1.8% of the command thread and the
+    // allocations with it in a heavy scene), folded into the report's maps
+    // as it is taken (with_processor_counts).
+    std::unordered_map<const char *, uint64_t> used_by_literal_, approximate_by_literal_;
+    // XF_RESOLVE_TARGET_DETAIL=1: each refused resolve target counted with
+    // its format, size and pitch beside the resolve's (resolve_targets)
+    bool refusal_detail_ = [] {
+        const char *v = std::getenv("XF_RESOLVE_TARGET_DETAIL");
+        return v && v[0] == '1';
+    }();
+    Texture::StaleBy stale_by_; // the resolve under way, for textures_written_by_gpu
+    // depth resolves feeding textures, and depth textures as targets
+    // (resolve_targets; XF_RESOLVE_TARGETS_DEPTH=0 turns both off)
+    bool depth_targets_ = [] {
+        const char *v = std::getenv("XF_RESOLVE_TARGETS_DEPTH");
+        return !(v && v[0] == '0');
+    }();
+    void approximate(const char *what) {
+        approximate_by_literal_[what]++, approximations_++;
+        if (front_recording_) front_counts_.push_back({what, true});
+    }
+    void use(const char *what) {
+        used_by_literal_[what]++;
+        if (front_recording_) front_counts_.push_back({what, false});
+    }
     // the report with what the processor counted of the packets the renderer
     // does not see (Report::used)
     Report with_processor_counts(Report r) const {
+        for (const auto &[what, count] : used_by_literal_) r.used[what] += count;
+        for (const auto &[what, count] : approximate_by_literal_) r.approximate[what] += count;
         const gpu::Counts &n = processor_.counts();
         auto put = [&](const char *what, uint64_t count) {
             if (count) r.used[what] = count;
@@ -1170,21 +1770,69 @@ private:
         gpu_mark(it->second);
     }
     void gpu_mark(uint32_t kind);
+    // after a lost device: when (the swaps and draws so far) and what the
+    // driver says went wrong (vk::Device::fault_report); empty otherwise
+    std::string lost_device_report(VkResult r) {
+        if (r != VK_ERROR_DEVICE_LOST) return {};
+        std::string out = ", the device lost after " + std::to_string(report_.swaps) + " swaps and " +
+                          std::to_string(report_.draws) + " draws";
+        std::string fault = d_.fault_report();
+        return (fault.empty() ? out : out + ": " + fault) + "; " + d_.heap_report();
+    }
     void gpu_collect(Slot &s);
     std::string target_name(const RenderTarget &t) const;
 
     // resources
     Shader *shader(uint64_t hash);
-    bool translate(Shader &s, std::string &why);
+    // whether the shader can be drawn (its first form translated); with
+    // `pending`, the translation may go to the workers, pending set meanwhile
+    bool translate(Shader &s, std::string &why, bool *pending = nullptr);
     // a translated vertex shader's module in a host form; null when the
-    // translator cannot make it
-    VkShaderModule vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why);
-    VkShaderModule pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why);
+    // translator cannot make it, or (pending set) while the workers do
+    VkShaderModule vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why,
+                                 bool *pending = nullptr);
+    VkShaderModule pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why,
+                                bool *pending = nullptr);
+    void analyze(Shader &s);
+    VkShaderModule form_module(Shader &s, uint32_t key, const shader::VertexOptions &vertex,
+                               const shader::PixelOptions &pixel, bool *pending);
+    VkShaderModule finish_form(Shader &s, uint32_t key, const shader::Translation &t);
+    bool translate_later(Shader &s, uint32_t key);
+    void collect_translations();
+    // the translation workers (docs/renderer.md, "The translation off the
+    // renderer's thread"): with async pipelines, the generic shaders and
+    // pipeline libraries
+    std::unique_ptr<TranslationWorkers> translation_workers_;
     // the depth-only draws' pixel shaders that convert D24FS8 depth
     // (Options::depth_float24_convert_in_pixel_shader): towards zero, nearest even
     VkShaderModule depth_float24_fs_[2] = {};
     // the pixel shader of the placeholder pipelines (Options::pipeline_stand_in)
     VkShaderModule placeholder_fs_ = VK_NULL_HANDLE;
+    // the generic shaders (init_generic): on (Options::generic_shaders, not
+    // XF_GENERIC_SHADERS=0), the program buffer and what of it is written
+    // (16-byte units), the modules ([point coordinates][writes depth])
+    bool generic_on_ = false;
+    vk::Buffer programs_;
+    uint32_t programs_used_ = 0;
+    // (the vertex shader's: [screen extents][none, clip, cull distances])
+    VkShaderModule generic_vs_[2][3] = {}, generic_fs_[2][2] = {};
+    bool init_generic(std::string &error);
+    bool program(Shader &s, std::string &why);
+    // a draw's generic pipeline: its info with the generic shaders in place
+    // of the guest's (false, with why, where they cannot draw it), and the
+    // stand-in linked from its libraries (made on the workers the first time)
+    // (the specialization: generic.glsl's POINT_SNAP, generic.vert's CLIP_PLANES)
+    struct GenericStages {
+        VkPipelineShaderStageCreateInfo stages[5];
+        VkSpecializationMapEntry entries[2] = {{21, 0, 4}, {22, 4, 4}};
+        uint32_t vertex_data[2] = {0, 0}, pixel_data = 1;
+        VkSpecializationInfo vertex_spec{2, entries, 8, vertex_data}, pixel_spec{1, entries, 4, &pixel_data};
+        VkGraphicsPipelineCreateInfo info{};
+    };
+    bool generic_info(const VkGraphicsPipelineCreateInfo &info, Shader &vs, Shader *ps, bool points, uint32_t vertex_form,
+                      uint32_t pixel_form, GenericStages &out, std::string &why);
+    VkPipeline generic_stand_in(PipelineEntry &e, const VkGraphicsPipelineCreateInfo &generic, bool async);
+    void retire_generic(PipelineEntry &e);
     RenderTarget *render_target(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format);
     VkFormat depth_vk_format(uint32_t format) const;
     Texture *texture(const uint32_t fetch[6], std::string &why);
@@ -1203,6 +1851,57 @@ private:
     bool make_room(uint32_t kind, uint32_t needed);
     void destroy_texture(Texture *t);
     void release_index(uint32_t kind, uint32_t index);
+    // A new place in the resolves' table for a texel size (none given back
+    // to take): a place never taken, else the place of the least recently
+    // used texture holding one that nothing recorded or in flight uses (it
+    // is then no resolve target: a resolve over it makes it stale, and its
+    // next use loads it as any texture), else none (UINT32_MAX). A game
+    // with many render-to-texture surfaces had more than the table holds,
+    // and the ones made last were never fed, loaded again after each
+    // resolve instead (renderer.md, "Resolve targets beyond the table").
+    uint32_t take_target(uint32_t wide) {
+        if (next_target_[wide] < RESOLVE_TARGETS) return next_target_[wide]++;
+        for (Texture *t = lru_oldest_; t; t = t->newer) {
+            // (the list runs oldest use first: past one in use, all are)
+            if (t->used_serial > done_serial_) break;
+            if (!(t->target & 0x7F) || ((t->target >> 7) & 1) != wide) continue;
+            const uint32_t slot = (t->target & 0x7F) - 1;
+            if (t->target_view) vkDestroyImageView(dev_, t->target_view, nullptr);
+            t->target = 0, t->target_view = VK_NULL_HANDLE;
+            report_.resolve_targets_reclaimed++;
+            return slot;
+        }
+        use("resolve targets without a place in the resolves' table (all in use)");
+        return UINT32_MAX;
+    }
+    // a resolve target's slot given back and its view destroyed (the GPU done with them)
+    void release_target(uint32_t target, VkImageView view) {
+        if (view) vkDestroyImageView(dev_, view, nullptr);
+        if (target & 0x7F) free_targets_[(target >> 7) & 1].push_back((target & 0x7F) - 1);
+    }
+    // the textures (up to two) a resolve to this destination feeds, written
+    // by it as well (resolve targets not loaded again since): how many
+    // (and the rows of texels the destination starts at in them, the same in both)
+    uint32_t resolve_targets(const resolve::Info &info, Texture *targets[2], uint32_t &extra_rows);
+    void scale_texture(Texture &t, uint32_t width, uint32_t height);
+    // A scaled resolve no texture was over yet (docs/renderer.md,
+    // "Resolution scale"): its texels at the resolution scale, kept in an
+    // image of its own for the texture a later draw makes over the
+    // destination (texture() copies it in and makes that texture scaled),
+    // instead of the console's size its memory holds. By the destination's
+    // base; what the resolve wrote, for dropping it when anything else writes
+    // there; the swap it was made at, dropped two swaps on.
+    struct ScaledResolve {
+        vk::Image image;
+        VkImageView view = VK_NULL_HANDLE;
+        uint32_t target = 0; // its place in the resolves' table plus one, bit 7 64-bit
+        uint32_t pitch = 0, endian = 0, width = 0, height = 0;
+        uint32_t low = 0, high = 0;
+        uint64_t swap = 0;
+    };
+    std::map<uint32_t, ScaledResolve> scaled_resolves_;
+    ScaledResolve *scaled_resolve(const resolve::Info &info, const std::vector<Range> &written);
+    void drop_scaled_resolves(const std::vector<Range> &written, bool all = false);
     uint32_t take_index(uint32_t kind);
     uint32_t room(uint32_t kind) const {
         return uint32_t(free_indices_[kind].size()) + (capacity_[kind] - next_index_[kind]);
@@ -1218,8 +1917,9 @@ private:
     void index_texture(Texture &t);
     void unindex_texture(Texture &t);
     // the textures over what the GPU wrote, loaded again (from the mirror) at
-    // their next use (Xenia's FireWatches with invalidated_by_gpu)
-    void textures_written_by_gpu(const std::vector<Range> &written);
+    // their next use (Xenia's FireWatches with invalidated_by_gpu); but for
+    // written_too, resolve targets the GPU wrote as well (null ones none)
+    void textures_written_by_gpu(const std::vector<Range> &written, Texture *const written_too[2] = nullptr);
     Texture *lru_oldest_ = nullptr, *lru_newest_ = nullptr;
     VkDeviceSize texture_bytes_ = 0;
     std::vector<uint32_t> free_indices_[3]; // each table's places given back
@@ -1261,6 +1961,23 @@ private:
     std::vector<uint32_t> describe(const VkGraphicsPipelineCreateInfo &info) const;
     std::unique_ptr<PipelineDesc> undescribe(std::span<const uint32_t> words, std::string &why);
     void module_words(VkShaderModule m, std::vector<uint32_t> &out) const;
+    // Each module's SPIR-V by its hash. A description names its modules (the
+    // guest shader and form), which stay the same when the translator
+    // changes what it writes for them; the build step's record of what it
+    // made keys the modules' code too (built_key), so a run after such a
+    // change does not take a library for made when the pipeline cache holds
+    // only an older code's.
+    std::unordered_map<VkShaderModule, uint64_t> module_content_;
+    // a description's or a library key's hash with the code of its modules
+    // (which: a library's part, or 4 for a whole pipeline's stages)
+    uint64_t built_key(uint32_t seed, const std::vector<uint32_t> &words, const VkGraphicsPipelineCreateInfo &info,
+                       uint32_t which) const;
+    // a pipeline or library the build step made, looked up in the pipeline
+    // cache alone (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT
+    // where the device has it): false when the driver would have to compile
+    // it, which is then left to the workers rather than done on the
+    // renderer's thread
+    bool from_cache(const VkGraphicsPipelineCreateInfo &info, VkPipeline &out);
     // a pipeline's description as it is made: the values of its dynamic
     // states set to one each (canonicalize)
     static std::unique_ptr<PipelineDesc> canonical(const VkGraphicsPipelineCreateInfo &info);
@@ -1296,8 +2013,10 @@ private:
     PFN_vkCmdSetColorWriteMaskEXT set_write_mask_ = nullptr;
     // hitches (Report::pipeline_hitches, swap_gaps_*): the pipeline time at
     // the last swap, and when it came
-    double pipeline_seconds_at_swap_ = 0;
+    double pipeline_seconds_at_swap_ = 0, translate_seconds_at_swap_ = 0;
     std::chrono::steady_clock::time_point last_swap_time_{};
+    std::chrono::steady_clock::time_point first_swap_time_{}; // XF_GPU_TIME_LOG's
+    std::map<std::string, double> gpu_time_logged_;            // its totals at the last line
 
     // ---- the port's frames (native_render.h) ----
     // The port's settings as the last swap took them (copied again when
@@ -1324,6 +2043,7 @@ private:
         m.pCode = words;
         VkShaderModule out = VK_NULL_HANDLE;
         vkCreateShaderModule(dev_, &m, nullptr, &out);
+        if (out) module_content_[out] = ShaderStorage::hash(0, {words, bytes / 4});
         return out;
     }
     VkPipeline compute_pipeline(const uint32_t *words, size_t bytes, VkPipelineLayout layout);
@@ -1335,11 +2055,39 @@ private:
         if (trace_)
             for (auto [start, end] : ranges) trace_->read(start, end - start);
     }
+    // every way the renderer's commands write memory, and read it (full_barrier):
+    // shaders, attachments, transfers, uniform, index and vertex buffers. No
+    // draw or dispatch is indirect; the conditional rendering's predicate
+    // has its own barrier where it is written (viz_end).
+    static constexpr VkAccessFlags2 BARRIER_WRITES =
+        VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    static constexpr VkAccessFlags2 BARRIER_READS =
+        VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
+        VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+    static inline const bool barrier_generic_ = [] {
+        const char *v = std::getenv("XF_BARRIER_ACCESSES");
+        return v && std::string(v) == "generic";
+    }();
     static void full_barrier(VkCommandBuffer cmd) {
+        // Everything the GPU wrote, seen by everything the GPU does next. The
+        // accesses are named one by one: the generic MEMORY_READ covers reads
+        // nothing here makes after most barriers (indirect commands, the
+        // conditional rendering's predicate, the host's), and a barrier whose
+        // destination has the first two makes the NVIDIA driver stall the
+        // GPU: 2 to 7 us each against under 1 us for these (docs/renderer.md,
+        // "The barriers' accesses"). What the host reads is covered once, at
+        // the submission's end (flush). XF_BARRIER_ACCESSES=generic: as before.
         VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-        b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        if (barrier_generic_) {
+            b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        } else {
+            b.srcAccessMask = BARRIER_WRITES;
+            b.dstAccessMask = BARRIER_WRITES | BARRIER_READS;
+        }
         VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         dep.memoryBarrierCount = 1;
         dep.pMemoryBarriers = &b;
@@ -1381,7 +2129,10 @@ private:
     // the render pass ended, if one is under way
     void end_pass() {
         end_query(); // a query does not outlive its render pass
-        if (in_pass_) vkCmdEndRendering(slots_[current_].cmd);
+        if (in_pass_) {
+            record_sync();
+            vkCmdEndRendering(slots_[current_].cmd);
+        }
         in_pass_ = false;
     }
     // ---- occlusion queries ----
@@ -1401,6 +2152,230 @@ private:
         bool ended = false, uncounted = false;
         bool suppressed = false; // a draw the port's frame skipped counted for it (native_render.h)
     };
+    // ---- VIZ queries ----
+    // VIZ_QUERY (Xenia's occlusion_query_viz, off by default there; beyond
+    // its default here, where the device has conditional rendering): the
+    // survey draws of a query (PA_SC_VIZ_QUERY's viz_query_ena with
+    // kill_pix_post_hi_z, killed after hi-Z on the console) counted by a host
+    // occlusion query, or the interlock path's counter, of their own (never
+    // for an occlusion report, as Xenia's); at the query's end that count
+    // copied to the ID's word in viz_predicates_, and the draws predicated
+    // on the ID after it (DRAW_INDX's VIZ token, bit 8) drawn under
+    // conditional rendering on that word, so the GPU skips them where the
+    // survey passed no sample. A query whose survey draws were not all
+    // measured, in one count, is visible (its draws drawn, as Xenia's
+    // fallback); one with no survey draw at all is not (its draws dropped, as
+    // Xenia's). A survey is measured only as the console would see it: no
+    // color, depth or stencil writes, hi-Z on (Xenia tests depth then; with
+    // hi-Z off nothing rejects a survey, and our depth test could). Draws
+    // exporting memory are never predicated or dropped.
+    struct VizQuery {
+        bool active = false, ended = false;
+        bool surveyed = false; // a survey draw came
+        bool fallback = false; // one was not measured: visible
+        bool armed = false;    // its count copied to its word
+        uint32_t segments = 0; // the counts its surveys went into
+        uint64_t serial = 0;   // the submission of its count
+        uint32_t index = 0;    // its query (host) or counter (interlock) in that submission
+    };
+    vk::Buffer viz_predicates_; // a word an ID (the device has conditional rendering)
+    VizQuery viz_[64];
+    uint32_t viz_open_ = UINT32_MAX;      // the ID whose host query is open in the pass
+    uint32_t viz_survey_ = UINT32_MAX;    // the draw being made is a survey measured for this ID
+    uint32_t viz_predicate_ = UINT32_MAX; // the draw being made is predicated on this ID's word
+    bool viz_measured_ = false;           // the survey being made was counted
+    // the draw about to be made: a survey of an active query (its ID), and
+    // whether it can be measured (viz_survey_)
+    uint32_t viz_survey_begin() {
+        viz_survey_ = viz_predicate_ = UINT32_MAX, viz_measured_ = false;
+        uint32_t viz = regs_[reg::PA_SC_VIZ_QUERY];
+        if (!viz_predicates_.buffer || !(viz & 1)) return UINT32_MAX;
+        uint32_t id = (viz >> 1) & 63;
+        VizQuery &q = viz_[id];
+        if (!q.active) return UINT32_MAX;
+        // Xenia's OnVIZSurveyDraw: any draw with viz_query_ena counts for its
+        // active query, a survey (kill_pix_post_hi_z: counted and killed after
+        // hi-Z) or a draw as any other, which is drawn under its own state and
+        // not measured here: its query stays visible (the caller's fallback)
+        q.surveyed = true;
+        if (!(viz & 0x80)) return id;
+        uint32_t mode = regs_[reg::RB_MODECONTROL] & 7, depth = regs_[reg::RB_DEPTHCONTROL];
+        bool color = EdramMode(mode) == EdramMode::ColorDepth && (regs_[reg::RB_COLOR_MASK] & 0xFFFF);
+        bool hiz = (regs_[r::RB_HIZCONTROL] >> 1) & 1;
+        if (!color && !(depth & 5) && hiz) viz_survey_ = id;
+        return id;
+    }
+    void viz_end_host() {
+        if (viz_open_ == UINT32_MAX) return;
+        record_sync();
+        vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, viz_[viz_open_].index);
+        viz_open_ = UINT32_MAX;
+    }
+    // a survey's count in this submission: its own, or the one its query's
+    // earlier surveys opened (a second makes the query visible)
+    bool viz_count(VizQuery &q) {
+        Slot &s = slots_[current_];
+        if (q.segments && q.serial == s.serial && (fsi_ || viz_open_ == viz_survey_)) return true;
+        if (s.occlusion_reports.size() >= OCCLUSION_QUERIES || (!fsi_ && !s.occlusion)) return false;
+        q.index = uint32_t(s.occlusion_reports.size());
+        s.occlusion_reports.push_back(0); // no report's
+        s.occlusion_used = uint32_t(s.occlusion_reports.size());
+        q.serial = s.serial;
+        q.segments++;
+        return true;
+    }
+    // the host path: the survey's draw counted in its query's host query
+    void viz_draw(VkCommandBuffer c) {
+        VizQuery &q = viz_[viz_survey_];
+        if (viz_open_ != viz_survey_) {
+            end_query(); // the report's and another ID's: one occlusion query at a time
+            if (!viz_count(q)) return;
+            record_sync();
+            vkCmdBeginQuery(c, slots_[current_].occlusion, q.index, 0);
+            viz_open_ = viz_survey_;
+        }
+        viz_measured_ = true;
+    }
+    // the interlock path: the survey's counter
+    uint32_t viz_fsi_index() {
+        VizQuery &q = viz_[viz_survey_];
+        if (!viz_count(q)) return UINT32_MAX;
+        viz_measured_ = true;
+        return current_ * OCCLUSION_QUERIES + q.index;
+    }
+    void viz_query_event(uint32_t id, bool end) {
+        if (!viz_predicates_.buffer) return;
+        VizQuery &q = viz_[id];
+        if (viz_open_ == id) viz_end_host();
+        if (!end) {
+            q = {};
+            q.active = true;
+            return;
+        }
+        if (!q.active) return;
+        q.active = false, q.ended = true;
+        report_.viz_queries++;
+        if (!q.surveyed) return;
+        Slot &s = slots_[current_];
+        if (q.fallback || q.segments != 1 || !s.recording || q.serial != s.serial) {
+            q.fallback = true;
+            return;
+        }
+        // the count to the ID's word, outside the render pass
+        end_pass();
+        VkCommandBuffer c = cmd();
+        full_barrier(c);
+        if (fsi_) {
+            VkBufferCopy copy{VkDeviceSize(current_ * OCCLUSION_QUERIES + q.index) * 4, VkDeviceSize(id) * 4, 4};
+            vkCmdCopyBuffer(c, zpd_counters_.buffer, viz_predicates_.buffer, 1, &copy);
+        } else {
+            vkCmdCopyQueryPoolResults(c, s.occlusion, q.index, 1, viz_predicates_.buffer, VkDeviceSize(id) * 4, 4,
+                                      VK_QUERY_RESULT_WAIT_BIT);
+        }
+        full_barrier(c);
+        if (!barrier_generic_) {
+            // the predicate's word for the draws predicated on it: the one
+            // read full_barrier's accesses leave out (a barrier that names it
+            // makes the driver wait for the GPU, so only here, where it is written)
+            VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
+            b.dstAccessMask = VK_ACCESS_2_CONDITIONAL_RENDERING_READ_BIT_EXT;
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(c, &dep);
+        }
+        q.armed = true;
+        report_.viz_armed++;
+    }
+    // ---- screen extents ----
+    // EVENT_WRITE_EXT (gpu::ScreenExtents::Measured, beyond Xenia, which
+    // answers the whole screen): the draws between a SCREEN_EXT_INIT and the
+    // SCREEN_EXT_RPT after it bound their report on the GPU, each final
+    // vertex position taking the report's rectangle out to it
+    // (shader::VertexOptions::extents) in the slot's share of extents_
+    // (device-local: atomics over the bus cost a UE3 game's frame ten times
+    // its GPU time), zeroed as the slot begins recording, copied to
+    // extents_readback_ as it ends and read as its submission is done. A report the renderer cannot bound whole
+    // (a draw there skipped, drawn some other way, or after a submission
+    // began; more reports than a slot holds) is answered as the whole
+    // screen. Wide lines add half their width around.
+    static constexpr uint32_t EXTENT_REPORTS = 4096; // a slot's
+    vk::Buffer extents_, extents_readback_;
+    bool extent_open_ = false;                 // between an init and its report
+    bool extent_whole_ = false;                // a draw there not bounded
+    uint32_t extent_index_ = UINT32_MAX;       // its report in the slot, once a draw bounds it
+    uint64_t extent_serial_ = 0;               // the submission that report is in
+    uint32_t extent_margin_ = 0;               // pixels around the bounds
+    uint64_t extent_next_ = 1;                 // the next report's handle
+    bool extent_drawn_ = false;                // the draw being made bounded its report
+    std::vector<gpu::Extent> extent_resolved_; // for extent_poll
+    // extent_init's submissions: after this many draws (XF_EXTENT_FLUSH_DRAWS, 0 for none), and the
+    // draws drawn when the submission being recorded began
+    uint64_t extent_flush_draws_ = [] {
+        const char *v = std::getenv("XF_EXTENT_FLUSH_DRAWS");
+        return v ? uint64_t(std::strtoull(v, nullptr, 10)) : uint64_t(512);
+    }();
+    uint64_t drawn_at_submission_ = 0;
+    // the draw being made bounds the open report (the index of its words in
+    // extents_), or UINT32_MAX: it cannot, and the report is the whole screen
+    uint32_t extent_draw_words() {
+        if (!extent_open_ || extent_whole_) return UINT32_MAX;
+        begin_recording();
+        Slot &s = slots_[current_];
+        if (extent_index_ == UINT32_MAX) {
+            if (s.extent_reports.size() >= EXTENT_REPORTS) {
+                extent_whole_ = true;
+                return UINT32_MAX;
+            }
+            extent_index_ = uint32_t(s.extent_reports.size());
+            extent_serial_ = s.serial;
+            s.extent_reports.push_back({});
+            s.extents_used = uint32_t(s.extent_reports.size());
+        } else if (extent_serial_ != s.serial) {
+            extent_whole_ = true; // a submission began inside the report
+            return UINT32_MAX;
+        }
+        return (current_ * EXTENT_REPORTS + extent_index_) * 4;
+    }
+    uint64_t extent_reported() {
+        bool bounded = extent_open_ && !extent_whole_ && extent_index_ != UINT32_MAX && slots_[current_].recording &&
+                       extent_serial_ == slots_[current_].serial;
+        extent_open_ = false;
+        report_.extent_reports++;
+        if (!bounded) return 0;
+        report_.extent_bounded++;
+        Slot::ExtentReport &e = slots_[current_].extent_reports[extent_index_];
+        e.handle = extent_next_++, e.margin = extent_margin_;
+        return e.handle;
+    }
+    // the slot's reports bounded, as its submission is done: 8192 less the
+    // left and top edges, the right and bottom ones plus one (0: no position
+    // reached it, the whole screen), widened by the margin and a pixel
+    void extent_collect(Slot &s, uint32_t slot) {
+        if (s.extent_reports.empty()) return;
+        const uint32_t *words =
+            reinterpret_cast<const uint32_t *>(extents_readback_.mapped) + slot * EXTENT_REPORTS * 4;
+        for (size_t i = 0; i < s.extent_reports.size(); i++) {
+            const Slot::ExtentReport &e = s.extent_reports[i];
+            if (!e.handle) continue;
+            const uint32_t *w = words + i * 4;
+            gpu::Extent x;
+            x.handle = e.handle;
+            x.whole = !w[0] || !w[1] || !w[2] || !w[3];
+            if (!x.whole) {
+                int32_t margin = int32_t(e.margin) + 1;
+                x.left = uint32_t(std::max(0, int32_t(8192 - std::min(w[0], 8192u)) - margin));
+                x.top = uint32_t(std::max(0, int32_t(8192 - std::min(w[1], 8192u)) - margin));
+                x.right = std::min(8192u, w[2] - 1 + uint32_t(margin));
+                x.bottom = std::min(8192u, w[3] - 1 + uint32_t(margin));
+            }
+            extent_resolved_.push_back(x);
+        }
+        s.extent_reports.clear();
+    }
     static constexpr uint32_t OCCLUSION_QUERIES = 4096; // a slot's
     uint64_t zpd_current_ = 0;                          // the report draws count for (0: none)
     uint32_t zpd_active_ = UINT32_MAX;                  // the query open in the render pass
@@ -1417,9 +2392,13 @@ private:
         zpd_counts_.erase(handle);
     }
     void end_query() {
+        viz_end_host();
         if (zpd_active_ == UINT32_MAX) return;
         // (the interlock path's counters are no host queries)
-        if (!fsi_) vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
+        if (!fsi_) {
+            record_sync();
+            vkCmdEndQuery(slots_[current_].cmd, slots_[current_].occlusion, zpd_active_);
+        }
         zpd_active_ = UINT32_MAX;
     }
     void zpd_report_ended(uint64_t ended, uint64_t next) {
@@ -1433,6 +2412,7 @@ private:
     }
     // before a draw that rasterizes, in its render pass: the query its report counts it with
     void zpd_draw(VkCommandBuffer c) {
+        viz_end_host(); // a survey's query: one occlusion query at a time
         if (fsi_ || !zpd_current_ || zpd_active_ != UINT32_MAX) return;
         Slot &s = slots_[current_];
         if (!s.occlusion || s.occlusion_reports.size() >= OCCLUSION_QUERIES) {
@@ -1444,6 +2424,7 @@ private:
         s.occlusion_used = uint32_t(s.occlusion_reports.size());
         zpd_counts_[zpd_current_].open++;
         report_.occlusion_queries++;
+        record_sync();
         vkCmdBeginQuery(c, s.occlusion, zpd_active_, d_.precise_occlusion() ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
     // the slot's submission is done: its queries' samples to their reports
@@ -1462,7 +2443,7 @@ private:
         for (size_t i = 0; i < samples.size(); i++) {
             auto it = zpd_counts_.find(s.occlusion_reports[i]);
             if (it == zpd_counts_.end()) continue;
-            it->second.samples += samples[i];
+            it->second.samples += samples[i] * 16 / (scale_.q4 * scale_.q4); // (the console's samples, at a resolution scale)
             if (--it->second.open == 0 && it->second.ended) zpd_answer(it->first, it->second);
         }
         s.occlusion_reports.clear();
@@ -1488,6 +2469,18 @@ private:
         return arena_take(bytes, align);
     }
     uint8_t *arena_data(VkDeviceSize at) { return static_cast<uint8_t *>(arena_.mapped) + at; }
+    // the draws' constants (both stages', the system's, the interlock's):
+    // the draw-data arena in video memory where there is one, the arena
+    // otherwise. Offsets are into draw_buffer().
+    VkDeviceSize draw_data_take(VkDeviceSize bytes, VkDeviceSize align);
+    // bytes into the draw data or the arena: a copy the compiler cannot fold
+    // with one around it (the destination may be write-combined device
+    // memory, hundreds of times slower to read than to write)
+    [[gnu::noinline]] static void upload(void *to, const void *from, size_t bytes) { std::memcpy(to, from, bytes); }
+    uint8_t *draw_data(VkDeviceSize at) {
+        return static_cast<uint8_t *>((draw_data_.buffer ? draw_data_ : arena_).mapped) + at;
+    }
+    VkBuffer draw_buffer() const { return draw_data_.buffer ? draw_data_.buffer : arena_.buffer; }
     // room for bytes to copy from: the arena, or a buffer of their own that
     // goes when the submission is done
     uint8_t *staging(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &offset);
@@ -1521,8 +2514,55 @@ private:
     uint32_t last_page(const Range &r) const { return (r.second - 1) >> page_shift_; }
     bool gpu_held(const std::vector<Range> &ranges) const;
     std::vector<Range> cpu_parts(const std::vector<Range> &ranges) const;
-    VkDeviceSize request(const std::vector<Range> &ranges);
+    // A request's memo (the draws' vertex streams): the ranges last found
+    // current in the mirror, at which write count and mirror epoch. While
+    // nothing was written since, the same ranges are current still, and a
+    // draw with the streams of the draw before it checks no page.
+    struct RequestMemo {
+        std::vector<Range> ranges;
+        uint32_t count = 0;
+        uint64_t epoch = 0;
+        uint64_t used_serial = 0; // the submission its pages were last marked used in
+    };
+    VkDeviceSize request(const std::vector<Range> &ranges, RequestMemo *memo = nullptr);
+    RequestMemo vertex_memo_;
+    // A draw's vertex ranges, each as it was last found in the mirror: the
+    // write count before that look. A range no page of which was written
+    // since (by blocks of pages: pages_unwritten) and under which the mirror
+    // lost nothing (mirror_epoch_) is in the mirror still, so a draw asks
+    // only for the others: a scene's draws read whole vertex buffers of
+    // hundreds of pages, each page looked at twice a draw otherwise.
+    // XF_VERTEX_RANGE_MEMO=0: every range asked for at every draw, as before.
+    struct RangeMemo {
+        Range range{0, 0};
+        uint32_t count = 0;
+        uint64_t epoch = 0, used_serial = 0;
+    };
+    static constexpr size_t RANGE_MEMOS = 1u << 12;
+    std::vector<RangeMemo> range_memos_ = std::vector<RangeMemo>(RANGE_MEMOS);
+    static size_t range_memo_index(const Range &r) {
+        const uint64_t h = (uint64_t(r.first) << 32 | r.second) * 0x9E3779B97F4A7C15ull;
+        return size_t(h >> 52) & (RANGE_MEMOS - 1);
+    }
+    bool range_memos_on_ = [] {
+        const char *v = std::getenv("XF_VERTEX_RANGE_MEMO");
+        return !(v && v[0] == '0');
+    }();
+    uint64_t mirror_epoch_ = 1; // advanced where pages of the mirror stop being current but for a write
     void gpu_written(const std::vector<Range> &ranges);
+    // The submission that last used each page of the mirror (read or wrote
+    // it on the GPU, or uploaded it): an upload of pages the recording
+    // submission has not used yet goes into its slot's pre command buffer,
+    // ahead of everything in the submission, rather than between its draws,
+    // which would end the render pass and drain the GPU (beyond Xenia, whose
+    // uploads go between its draws). XF_HOISTED_UPLOADS=0 turns it off.
+    std::vector<uint64_t> page_used_;
+    bool hoisted_uploads_ = [] {
+        const char *v = std::getenv("XF_HOISTED_UPLOADS");
+        return !(v && std::string(v) == "0");
+    }();
+    void mark_used(const std::vector<Range> &ranges);
+    VkCommandBuffer pre_cmd();
     bool unwritten(Texture &t);
     static std::pair<uint32_t, uint32_t> watch_bounds(void *self, uint32_t first, uint32_t last);
     // guest memory given a resolve's bytes, as readback_resolve says
@@ -1541,13 +2581,43 @@ private:
     VkDevice dev_;
     gpu::CommandProcessor &processor_;
     Options options_;
+    // the texture filtering forced (Options::anisotropy, texture_filter; set_texture_filtering)
+    std::atomic<uint32_t> anisotropy_{0}, texture_filter_{0};
+    // The resolution scale everything drawn into EDRAM is drawn at (docs/
+    // renderer.md, "Resolution scale"), the minimum scalable dimension, and
+    // why the scale is not the one asked for. EDRAM's tiles are scale_'s
+    // size: every render target is drawn at it (they share EDRAM's tiles
+    // whatever their sizes, as the console's do); a resolve or a texture
+    // smaller than min_scalable_ leaves EDRAM at the console's size.
+    Scale scale_{};
+    uint32_t min_scalable_ = 16;
+    std::string scale_notice_;
+    // EDRAM's tiles and dwords at scale_
+    uint32_t tile_dwords_ = 1280;
+    uint32_t max_image_ = 16384; // the device's largest 2D image
+    VkDeviceSize edram_bytes_ = 0;
     mutable std::mutex mutex_; // held through each of the processor's calls
     Report report_;
     std::string fatal_;
     const uint32_t *regs_ = nullptr; // the processor's register file, during a call
+    const gpu::RegisterFile *file_ = nullptr; // the same, for what changed in it (RegisterFile's stamps)
     GuestMemory memory_;             // the processor's physical memory
     Memory &mem_;                    // the same memory, with its write watches
-    const std::atomic<uint32_t> *stamps_ = nullptr;
+    const std::atomic<uint32_t> *stamps_ = nullptr, *block_stamps_ = nullptr;
+    // whether no page of [first, last] was written above since: by blocks
+    // of pages first (memory.h's write_block_stamps), the pages of a block only
+    // where the block was
+    bool pages_unwritten(uint32_t first, uint32_t last, uint32_t since) const {
+        constexpr uint32_t shift = Memory::WRITE_BLOCK_SHIFT;
+        for (uint32_t p = first; p <= last;) {
+            const uint32_t block = p >> shift, block_end = std::min(last, ((block + 1) << shift) - 1);
+            if (block_stamps_[block].load(std::memory_order_acquire) > since)
+                for (uint32_t q = p; q <= block_end; q++)
+                    if (stamps_[q].load(std::memory_order_acquire) > since) return false;
+            p = block_end + 1;
+        }
+        return true;
+    }
     uint32_t page_shift_ = 12; // the watch pages'
     std::vector<uint32_t> mirror_at_;
     std::unique_ptr<std::atomic<uint64_t>[]> gpu_pages_;
@@ -1555,14 +2625,91 @@ private:
     gpu::MemoryTrace *trace_ = nullptr; // a trace writer's, told what is read
     uint64_t vertex_hash_ = 0, pixel_hash_ = 0;
     bool have_vertex_ = false, have_pixel_ = false;
+    // the loaded shaders themselves (shaders_ never drops one), so a draw looks neither up by hash
+    Shader *vertex_shader_ = nullptr, *pixel_shader_ = nullptr;
     float max_viewport_[2] = {};
     VkDeviceSize ubo_align_ = 256, ssbo_align_ = 64;
 
     std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
+    // IM_LOAD's shaders by type, size and address (shader_again): the
+    // shader's hash and the write count its words were last found unwritten at
+    struct ShaderAt {
+        uint64_t hash = 0;
+        uint32_t checked = 0;
+        Shader *shader = nullptr;
+    };
+    std::unordered_map<uint64_t, ShaderAt> shaders_at_;
+    static uint64_t shader_at(uint32_t type, uint32_t address, uint32_t dwords) {
+        return uint64_t(type) << 63 | uint64_t(dwords & 0xFFFF) << 32 | address;
+    }
+    // The draw's lists, kept from draw to draw for their room: a heavy
+    // scene's 3,000 draws a frame made and freed each of them (a tenth of
+    // the command thread in the heap). Each is cleared where draw() starts
+    // filling it; the swaps (not moves) between them keep every buffer.
+    struct DrawScratch {
+        std::vector<Range> exported, vertex_ranges, sorted, written;
+        std::vector<uint32_t> indices, triangles, converted, guest_indices, strips, key, color_key;
+        std::vector<uint8_t> raw_indices;
+    } draw_lists_;
+    uint64_t shader_at_key_ = 0;  // the load shader_again let through, for shader()
+    uint32_t shader_at_count_ = 0; // the write count taken before its copy
+    bool shader_at_open_ = false;
     std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t>, std::unique_ptr<RenderTarget>> targets_;
     std::map<std::array<uint32_t, 6>, std::unique_ptr<Texture>> textures_;
-    std::map<std::array<uint32_t, 8>, std::pair<VkSampler, uint32_t>> samplers_;
+    // the samplers by their parameters: the sampler, its slot in the
+    // bindless table, the last submission that used it
+    struct SamplerEntry {
+        VkSampler sampler = VK_NULL_HANDLE;
+        uint32_t index = 0;
+        uint64_t used_serial = 0;
+    };
+    std::map<std::array<uint32_t, 8>, SamplerEntry> samplers_;
+    SamplerEntry *last_sampler_ = nullptr; // the one sampler() just returned (null: the stand-in's)
+    // What a texture slot gave the last draw that read it (Impl::draw): the fetch constant's
+    // words and the filters it was made from, and the system constants' words made of them. Good
+    // while texture_epoch_ stands: it moves when a texture is loaded or loaded again, a place in
+    // the bindless tables is given back (a view or a texture destroyed) or a sampler is destroyed.
+    // XF_TEXTURE_SLOT_MEMO=0: every slot looked up at every draw, as before.
+    struct SlotMemo {
+        uint64_t epoch = 0; // 0: none
+        uint32_t fetch[6] = {};
+        std::array<uint32_t, 4> overrides = {};
+        uint32_t forced_filter = 0, forced_aniso = 0;
+        Texture *texture = nullptr;
+        uint64_t loads = 0; // the texture's, when this was kept
+        SamplerEntry *sampler = nullptr;
+        uint32_t slot_word = 0, signs = 0, integer_scale = 0, signed_word = 0;
+        uint32_t uses = 0; // the Report::used counts a draw adds for it (bit 0, bit 1)
+    };
+    // by the constant's content rather than the slot: a direct-mapped table any slot finds what
+    // any slot made of the same constant and filters in (a game binding other textures at every
+    // draw rarely gives a slot the same constant twice running)
+    static constexpr uint32_t FETCH_MEMOS = 4096;
+    std::unique_ptr<SlotMemo[]> fetch_memos_ = std::make_unique<SlotMemo[]>(FETCH_MEMOS);
+    static uint32_t fetch_memo_index(const uint32_t *fetch, const std::array<uint32_t, 4> &overrides) {
+        uint64_t h = 0x9E3779B97F4A7C15ull;
+        for (uint32_t k = 0; k < 6; k++) h = (h ^ fetch[k]) * 0x100000001B3ull;
+        for (uint32_t o : overrides) h = (h ^ o) * 0x100000001B3ull;
+        return uint32_t(h >> 40) & (FETCH_MEMOS - 1);
+    }
+    uint64_t texture_epoch_ = 1;
+    uint64_t approximations_ = 0; // approximate()'s calls
+    bool slot_memos_on_ = [] {
+        const char *v = std::getenv("XF_TEXTURE_SLOT_MEMO");
+        return !(v && v[0] == '0');
+    }();
+    std::vector<uint32_t> free_samplers_; // slots of samplers destroyed, to reuse
     std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> pipelines_;
+    // the generic pipelines of draws whose shaders are being translated, by
+    // the pipeline's key (dropped when the draw next goes the usual way)
+    std::map<std::vector<uint32_t>, std::unique_ptr<PipelineEntry>> translating_pipelines_;
+    // the entries pipeline() found last, by their keys' hashes, each with its key
+    struct PipelineFront {
+        std::vector<uint32_t> key;
+        PipelineEntry *entry = nullptr;
+    };
+    static constexpr size_t PIPELINE_FRONT = 1u << 10;
+    std::vector<PipelineFront> pipeline_front_ = std::vector<PipelineFront>(PIPELINE_FRONT);
 
     // submissions
     VkCommandPool pool_ = VK_NULL_HANDLE;
@@ -1572,12 +2719,325 @@ private:
     bool in_pass_ = false;
     Pass pass_;
     VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
+    // the draws' dynamic state the recording command buffer holds (invalid
+    // after a new command buffer or another pipeline of the renderer's;
+    // XF_VK_DRAW_STATE_ALWAYS=1 sets all of it at every draw)
+    DrawState draw_state_{};
+    bool draw_state_valid_ = false, draw_state_elision_ = true;
     // the last constants and system constants put in the arena, and where
     harness::Constants last_constants_[2];
+    // The constants kept from draw to draw: last_constants_ are the registers' as of the register
+    // file's serial constants_serial_ (and its count of other threads' writes), so a draw copies
+    // only the blocks written to another value since, and uploads a stage's again only then. The
+    // fetch constants count for a stage only in the blocks its shader's slots lie in (a draw's new
+    // vertex buffers leave the pixel shader's constants as they were). XF_CONSTANT_STAMPS=0: copied
+    // and compared whole at every draw, as before.
+    const gpu::RegisterFile *constants_file_[2] = {};
+    uint64_t constants_serial_[2] = {}, constants_foreign_[2] = {};
+    uint32_t constants_fetch_blocks_[2] = {}; // the fetch constants' blocks current as of the serial
+    bool constant_stamps_ = [] {
+        const char *v = std::getenv("XF_CONSTANT_STAMPS");
+        return !(v && v[0] == '0');
+    }();
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
+    uint32_t last_constants_blocks_[2] = {}; // the blocks of float constants uploaded there (Shader::float_blocks)
+    uint32_t last_system_slots_ = 0;         // how many slots of the system constants' tables are uploaded there
+    bool constant_blocks_ = [] {
+        const char *v = std::getenv("XF_CONSTANT_BLOCKS");
+        return !(v && v[0] == '0');
+    }();
+
+    // ---- a draw's front part ----
+    // What a draw works out from the registers of the draws' state alone
+    // (RegisterFile::state_serial), its shaders and its kind of primitive:
+    // the targets, the viewport and scissor, how the primitive is drawn, the
+    // interlock path's constants. A draw that comes with all of those as the
+    // draw before had them takes that draw's (Cemu's continued draws, RPCS3's
+    // and Dolphin's dirty state: a scene's draws mostly change constants,
+    // buffers and textures between them). XF_DRAW_FRONT_MEMO=0: worked out at
+    // every draw, as before.
+    struct DrawFront {
+        // what it is worked out from, beside the registers
+        uint32_t primitive = 0, count = 0, extent_words = UINT32_MAX;
+        bool index32 = false, color = false, writes_targets = false;
+        // what the draw takes from it
+        bool tessellated{};
+        uint32_t tess_mode{};
+        shader::VertexOptions host_vertex{};
+        uint32_t patch_points{};
+        uint32_t hull{};
+        std::string draw_name{};
+        bool rectangles{};
+        bool points{};
+        uint32_t ucp{};
+        bool expanded{};
+        bool polygonal{};
+        VkPrimitiveTopology topology{};
+        bool strip{};
+        Shader *vs = nullptr;
+        Shader *ps = nullptr;
+        std::string why{};
+        bool translating{};
+        bool first_forms_translating{};
+        uint32_t pitch{};
+        uint32_t msaa{};
+        bool export_only{};
+        uint32_t gamma_targets{};
+        uint32_t depth_control{};
+        RenderTarget *depth = nullptr;
+        uint32_t width{};
+        uint32_t height{};
+        uint32_t host_width{};
+        uint32_t host_height{};
+        bool depth_float24{};
+        bool float24_convert{};
+        Viewport viewport{};
+        VkRect2D scissor{};
+        FsiConstants fsi_constants{};
+        RenderTarget *colors[4] = {};
+        uint32_t color_masks[4] = {};
+        float color_scales[4] = {};
+    };
+    DrawFront front_;
+    // the draw the kept one was worked out for
+    struct DrawFrontKey {
+        uint64_t state_serial = 0, foreign_writes = 0;
+        const Shader *vertex = nullptr, *pixel = nullptr;
+        uint32_t primitive = 0, flags = 0;
+        bool operator==(const DrawFrontKey &) const = default;
+    } front_key_;
+    bool front_valid_ = false;
+    // what the front part counted (use, approximate): counted again by a draw that takes it
+    std::vector<std::pair<const char *, bool>> front_counts_;
+    bool front_recording_ = false, front_keepable_ = false;
+    bool front_memo_ = [] {
+        const char *v = std::getenv("XF_DRAW_FRONT_MEMO");
+        return !(v && v[0] == '0');
+    }();
+    // false: the draw ends there (skipped, or it writes nothing)
+    bool draw_front(const gpu::Draw &d, DrawFront &f);
+
+    // ---- the index cache ----
+    // A draw's converted indices kept by where the guest's are and how they
+    // were converted (Xenia's primitive processor keeps its converted index
+    // buffers the same way), in buffers of their own: static geometry's are
+    // converted and uploaded once, not at every draw. The guest's pages are
+    // watched as a texture's are; pages written since make the draw convert
+    // again, and the entry stays where the words came out the same (a write
+    // elsewhere in its pages). Indices written again and again (dynamic
+    // geometry) leave the cache for a while, and are converted into the
+    // arena as before. XF_INDEX_CACHE=0: every draw's converted, as before.
+    struct IndexKey {
+        uint32_t base = 0, count = 0, form = 0, reset = 0, offset = 0, min = 0, max = 0;
+        bool operator==(const IndexKey &) const = default;
+    };
+    struct IndexKeyHash {
+        size_t operator()(const IndexKey &k) const {
+            uint64_t h = 0x9E3779B97F4A7C15ull;
+            for (uint32_t w : {k.base, k.count, k.form, k.reset, k.offset, k.min, k.max}) h = (h ^ w) * 0x100000001B3ull;
+            return size_t(h ^ (h >> 29));
+        }
+    };
+    struct IndexEntry {
+        std::vector<uint32_t> words; // as the draw binds them (after the primitive's conversion)
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize at = 0;
+        uint32_t checked = 0;       // the write count the guest's pages were last known unwritten at
+        uint32_t first = 0, last = 0; // its watch pages
+        uint64_t seen_swap = 0;     // the swap it was last drawn in, plus 1
+        uint64_t written_swap = 0;  // the swap its pages were last found written in
+        uint32_t streak = 0;        // how many times in a row within a few swaps
+        uint64_t dynamic_until = 0; // not kept before this swap
+        IndexKey key;
+    };
+    // the entries looked up last, by their keys' hashes: a draw finds its
+    // own without walking the map (a node of it in memory the cache has not)
+    static constexpr size_t INDEX_FRONT = 1u << 12;
+    std::vector<IndexEntry *> index_front_ = std::vector<IndexEntry *>(INDEX_FRONT, nullptr);
+    struct IndexChunk {
+        vk::Buffer buffer;
+        VkDeviceSize used = 0;
+    };
+    static constexpr VkDeviceSize INDEX_CHUNK = 8u << 20, INDEX_CACHE_BUDGET = 128u << 20;
+    static constexpr size_t INDEX_CACHE_ENTRIES = 1u << 17;
+    std::unordered_map<IndexKey, IndexEntry, IndexKeyHash> index_cache_;
+    std::vector<IndexChunk> index_chunks_;
+    VkDeviceSize index_cache_words_ = 0; // the entries' host copies, in bytes
+    bool index_cache_on_ = [] {
+        const char *v = std::getenv("XF_INDEX_CACHE");
+        return !(v && v[0] == '0');
+    }();
+    // room for an entry's words in the cache's buffers; false when none can be made
+    bool index_cache_place(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &at);
+    // everything dropped: the buffers go once the submission being recorded is done
+    void index_cache_drop();
+    // the index buffer the recording command buffer has bound at offset 0
+    VkBuffer bound_index_buffer_ = VK_NULL_HANDLE;
+    uint64_t draw_skip_[2] = {UINT64_MAX, 0};
+    bool draw_skip_read_ = [this] {
+        const char *v = std::getenv("XF_DRAW_SKIP");
+        unsigned long long first = 0, last = 0;
+        if (v && std::sscanf(v, "%llu-%llu", &first, &last) == 2) draw_skip_[0] = first, draw_skip_[1] = last;
+        return true;
+    }();
+    uint64_t draw_limit_ = [] {
+        const char *v = std::getenv("XF_DRAW_LIMIT");
+        return v ? uint64_t(std::strtoull(v, nullptr, 10)) : uint64_t(0);
+    }();
+    float rounded_scale_in_ = 0.0f, rounded_scale_out_ = 0.0f; // the polygon offset scale last rounded
+    // whether it has the draws' two sets bound, and the first's dynamic
+    // offsets (XF_SET_ELISION=0: both bound at every draw, as before)
+    bool sets_bound_ = false;
+    uint32_t bound_offsets_[4] = {};
+    bool set_elision_ = [] {
+        const char *v = std::getenv("XF_SET_ELISION");
+        return !(v && v[0] == '0');
+    }();
+
+    // ---- the recording thread ----
+    // A draw's commands (its binds, the dynamic state it changes, the draw)
+    // are not recorded into the command buffer by the thread that makes them:
+    // they go into a ring another thread records from, so the driver's time
+    // in them is off the command thread. A command buffer is recorded by one
+    // thread at a time: everything else that records (cmd()'s callers, the
+    // render pass's and the queries' ends, the submission) first waits for
+    // the ring to empty (record_sync). Off unless XF_RECORD_THREAD=1: it
+    // gained nothing on a replayed frame and lost in play (docs/renderer.md,
+    // "Game G's command thread"), the passes being short and the command
+    // buffer's memory going from one thread's cache to the other's at each.
+    // The ring holds words: a command's number, then what it takes (a few
+    // words each: the ring's lines go from one thread's cache to the other's
+    // and back, so its size is what the hand-over costs).
+    struct Recorded {
+        enum Op : uint32_t {
+            CommandBuffer, BindPipeline, BindSets, BindIndexBuffer, BindVertexBuffer, Viewport, Scissor,
+            BlendConstants, StencilReference, StencilCompareMask, StencilWriteMask, Topology, RestartEnable, CullMode,
+            FrontFace, DepthTest, DepthWrite, DepthCompare, StencilTest, StencilOp, DepthBiasEnable, BlendEnables,
+            BlendEquations, WriteMasks, LineWidth, DepthBias, DepthBiasExact, BeginConditional, EndConditional, Draw,
+            DrawIndexed, Wrap, Quit,
+        };
+        struct Sets {
+            uint32_t count;
+            uint32_t offsets[4];
+            VkDescriptorSet sets[2];
+        };
+        struct Bias {
+            uint32_t host_float;
+            float constant, slope;
+        };
+        struct Place {
+            VkBuffer buffer;
+            VkDeviceSize at;
+        };
+    };
+    static constexpr uint32_t RECORDED = 1u << 16, RECORDED_MOST = 32; // words; a command's most, with its number
+    std::unique_ptr<uint32_t[]> recorded_;
+    alignas(64) std::atomic<uint32_t> recorded_head_{0}; // words put in (the command thread's)
+    alignas(64) std::atomic<uint32_t> recorded_tail_{0}; // words recorded (the recording thread's)
+    alignas(64) std::atomic<bool> recorder_asleep_{false};
+    std::thread recorder_;
+    uint32_t recorded_direct_[RECORDED_MOST] = {};
+    VkCommandBuffer record_direct_cmd_ = VK_NULL_HANDLE;
+    bool record_thread_ = [] {
+        const char *v = std::getenv("XF_RECORD_THREAD");
+        return v && v[0] == '1';
+    }();
+    static void spin_pause() {
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_pause();
+#else
+        std::this_thread::yield();
+#endif
+    }
+    uint32_t record_head_ = 0, record_published_ = 0, record_tail_seen_ = 0;
+    uint32_t record_words_ = 0;                    // of the command being filled, with its number
+    VkCommandBuffer record_cmd_ = VK_NULL_HANDLE;  // the command buffer the ring's commands after this go into
+    // room for a command of that many words after its number, contiguous
+    uint32_t *record_room(uint32_t op, uint32_t words) {
+        const uint32_t total = words + 1;
+        uint32_t at = record_head_ & (RECORDED - 1);
+        // (never across the ring's end: the rest of it skipped)
+        const uint32_t skipped = at + total > RECORDED ? RECORDED - at : 0;
+        // (the other thread's count read again only when the ring looks full:
+        // its cache line is that thread's to write)
+        if (record_head_ + skipped + total - record_tail_seen_ > RECORDED) {
+            record_publish();
+            while (record_head_ + skipped + total -
+                       (record_tail_seen_ = recorded_tail_.load(std::memory_order_acquire)) >
+                   RECORDED)
+                spin_pause();
+        }
+        if (skipped) {
+            recorded_[at] = Recorded::Wrap;
+            record_head_ += skipped;
+            at = 0;
+        }
+        recorded_[at] = op;
+        record_words_ = total;
+        return &recorded_[at + 1];
+    }
+    // the next command's words to fill, then recorded(): into the ring, or recorded at once
+    uint32_t *record(VkCommandBuffer c, Recorded::Op op, uint32_t words) {
+        if (!record_thread_) {
+            recorded_direct_[0] = op;
+            record_direct_cmd_ = c;
+            return &recorded_direct_[1];
+        }
+        if (!recorder_.joinable()) {
+            recorded_ = std::make_unique<uint32_t[]>(RECORDED);
+            recorder_ = std::thread([this] { recorder_loop(); });
+        }
+        if (c != record_cmd_) {
+            std::memcpy(record_room(Recorded::CommandBuffer, 2), &c, sizeof(c));
+            record_head_ += record_words_;
+            record_cmd_ = c;
+        }
+        return record_room(op, words);
+    }
+    void recorded() {
+        if (!record_thread_) {
+            run_recorded(record_direct_cmd_, recorded_direct_);
+            return;
+        }
+        record_head_ += record_words_;
+    }
+    // the commands put in since the last time handed to the recording thread:
+    // once a draw, not once a command (the count's cache line goes back and
+    // forth between the two threads at every store)
+    void record_publish() {
+        if (record_head_ == record_published_) return;
+        recorded_head_.store(record_published_ = record_head_);
+        if (recorder_asleep_.load()) recorded_head_.notify_one();
+    }
+    template <class T> void record_value(VkCommandBuffer c, Recorded::Op op, const T &value) {
+        static_assert(sizeof(T) / 4 + 2 <= RECORDED_MOST);
+        std::memcpy(record(c, op, uint32_t(sizeof(T) + 3) / 4), &value, sizeof(T));
+        recorded();
+    }
+    template <class... A> void record_words(VkCommandBuffer c, Recorded::Op op, A... a) {
+        const uint32_t words[sizeof...(a) + 1] = {uint32_t(a)..., 0u};
+        std::memcpy(record(c, op, uint32_t(sizeof...(a))), words, sizeof...(a) * 4);
+        recorded();
+    }
+    // everything put in the ring is in the command buffer
+    void record_sync() {
+        if (!recorder_.joinable()) return;
+        record_publish();
+        const uint32_t head = record_head_;
+        while (recorded_tail_.load(std::memory_order_acquire) != head) spin_pause();
+    }
+    // a command's words (after its number) into the command buffer; how many it took
+    uint32_t run_recorded(VkCommandBuffer c, const uint32_t *r);
+    void recorder_loop();
+    // a command buffer being recorded, begun if none is, without waiting for the ring
+    void begin_recording();
 
     vk::Buffer mirror_, arena_, scratch_, load_scratch_;
+    // the draw-data arena (draw_data_take): a share a slot, in device-local
+    // host-visible memory; none without such memory or with
+    // XF_VK_NO_DEVICE_LOCAL_DRAW_DATA=1
+    vk::Buffer draw_data_;
     std::deque<FrontRead> front_reads_; // oldest first
 
     // draws: set 0 (constants, system constants, vertex memory: the mirror),
@@ -1606,15 +3066,81 @@ private:
     VkDescriptorSetLayout compute_set_layout_ = VK_NULL_HANDLE;
     VkPipelineLayout resolve_layout_ = VK_NULL_HANDLE, load_layout_ = VK_NULL_HANDLE;
     VkPipeline resolve_pipeline_ = VK_NULL_HANDLE, load_pipeline_ = VK_NULL_HANDLE;
+    // the host path's resolves from the source target's image (resolve.comp
+    // with IMAGE, the target's store set as set 2), 1x and multisampled;
+    // XF_RESOLVE_THROUGH_EDRAM=1: stored into EDRAM and read from there, as before
+    VkPipelineLayout resolve_image_layout_ = VK_NULL_HANDLE;
+    VkPipeline resolve_image_pipelines_[2] = {};
+    bool resolve_through_edram_ = [] {
+        const char *v = std::getenv("XF_RESOLVE_THROUGH_EDRAM");
+        return v && v[0] == '1';
+    }();
+    // resolves' clears kept for the target's next render pass
+    // (RenderTarget::pending_clears); XF_DEFER_CLEARS=0: drawn at once
+    bool defer_clears_ = [] {
+        const char *v = std::getenv("XF_DEFER_CLEARS");
+        return !(v && v[0] == '0');
+    }();
+    void flush_clears(RenderTarget *t);
+    // Xenia's texture_point_snap, off as there (shader::VertexOptions::
+    // texture_point_snap): XF_TEXTURE_POINT_SNAP=1
+    bool point_snap_ = [] {
+        const char *v = std::getenv("XF_TEXTURE_POINT_SNAP");
+        return v && v[0] == '1';
+    }();
     VkDescriptorPool compute_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet resolve_set_ = VK_NULL_HANDLE, load_set_ = VK_NULL_HANDLE, resolve_edram_set_ = VK_NULL_HANDLE;
+    // the resolves' set 1: the textures they write as well, through 32- and
+    // 64-bit unsigned views (RESOLVE_TARGETS each, updated after binding),
+    // their free slots
+    VkDescriptorSetLayout target_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorPool target_pool_ = VK_NULL_HANDLE;
+    VkDescriptorSet target_set_ = VK_NULL_HANDLE;
+    bool resolve_targets_ = false;
+    // Every texture loaded on the GPU from the mirror (texture_load.comp,
+    // guest memory's pages put there first), none decoded on the CPU: the
+    // renderer's thread spends nothing decoding (docs/renderer.md, "Vertex
+    // data and the CPU's decodes"). XF_TEXTURE_LOADS=cpu decodes on the CPU
+    // what memory the GPU did not write, as before.
+    bool texture_loads_on_gpu_ = [] {
+        const char *v = std::getenv("XF_TEXTURE_LOADS");
+        return !(v && std::string(v) == "cpu");
+    }();
+    uint32_t next_target_[2] = {};
+    std::vector<uint32_t> free_targets_[2];
 
     // EDRAM: the render targets' contents move through it when another
     // target takes over its tiles (Xenia's ownership transfers); it starts
     // as zeros, or as a trace's snapshot
-    void acquire(RenderTarget *t, uint32_t rows);
+    void acquire(RenderTarget *t, uint32_t rows, const DepthOverwrite *overwritten = nullptr);
+    void acquire(RenderTarget *t, std::span<const TileRect> rects, const DepthOverwrite *overwritten = nullptr);
+    std::vector<uint32_t> acquire_tiles_; // (acquire's own, kept for its room)
+    std::vector<uint32_t> acquire_needed_, acquire_unheld_;
+    // (request's own, kept for their room)
+    std::vector<std::pair<uint32_t, uint32_t>> request_runs_;
+    std::vector<VkBufferCopy> request_copies_, request_ahead_;
+    bool transfer_cleared_only_ = false;  // the last edram_transfer drew nothing: clears alone (the verbose line)
+    bool resolve_stored_ = false;         // the resolve being made reads tiles their holders stored into EDRAM
     bool edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles);
     bool edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows);
+    // tiles drawn straight from their holders into the target, one pass
+    // (edram_transfer.frag, Xenia's ownership transfers)
+    bool edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::vector<uint32_t>> &held);
+    VkPipeline transfer_pipeline(const RenderTarget &t, bool source_ms);
+    // Direct transfers, the default; XF_EDRAM_TRANSFERS=store moves the
+    // tiles through the EDRAM buffer, a store by the holder and a load by the
+    // new target, as before
+    bool direct_transfers_ = [] {
+        const char *v = std::getenv("XF_EDRAM_TRANSFERS");
+        return !(v && std::string(v) == "store");
+    }();
+    // [single-sampled source, multisampled][color, UINT color, depth, depth
+    // and stencil exported, depth and the stencil into an R8_UINT image]
+    VkShaderModule transfer_fs_[2][5] = {};
+    // the stencil of transfers into depth targets copied from an R8_UINT
+    // image (no stencil export, VK_KHR_maintenance8)
+    bool stencil_copies_ = false;
+    std::map<std::tuple<VkFormat, uint32_t, bool>, VkPipeline> transfer_pipelines_;
     VkDeviceSize edram_mask(const std::vector<uint32_t> &tiles);
     EdramTarget edram_target(const RenderTarget &t, uint32_t height) const {
         // (20e4 rounded only where the host's depth is not already 20e4, as
@@ -1622,8 +3148,9 @@ private:
         bool round = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader;
         uint32_t flags = t.depth ? (host_depth_kept(t.format) ? 1u : 0u) | (round ? 2u : 0u)
                                  : (t.gamma_linear ? 4u : 0u) | (t.raw ? 8u : 0u);
-        return {t.base, t.pitch_tiles,     t.msaa,           t.format, t.width,
-                height, t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u,       flags};
+        return {t.base,  t.pitch_tiles,     t.msaa,           t.format, t.host_width,
+                height,  t.depth ? 1u : 0u, t.wide ? 1u : 0u, 8u,       flags,
+                0,       0,                 0,                0,        scale_.q4};
     }
     // Whether a depth format is encoded differently on the host, so that its
     // 32-bit depth is kept beside EDRAM across transfers (Xenia's
@@ -1635,14 +3162,116 @@ private:
         return format == 1 ? !options_.depth_float24_convert_in_pixel_shader : d24s8_ != VK_FORMAT_D24_UNORM_S8_UINT;
     }
     VkPipeline load_pipeline(const RenderTarget &t);
+    VkPipeline edram_pipeline(const RenderTarget &t, VkShaderModule fs, VkPipelineLayout layout, bool stencil_copy);
     VkDescriptorSet edram_set(uint32_t which);
     std::vector<RenderTarget *> owners_ = std::vector<RenderTarget *>(EDRAM_TILES, nullptr); // null: EDRAM holds it
+    // Beyond Xenia: a tile whose holder's pixels are all one clear's value
+    // (a resolve's clear covered the whole tile, and no draw has reached it
+    // since). A target of the same format taking it over is cleared to that
+    // value there instead of drawn from the holder (edram_transfer): the same
+    // pixels, without reading the holder. XF_TRANSFER_CLEARS=0: always drawn.
+    std::vector<uint8_t> tile_cleared_ = std::vector<uint8_t>(EDRAM_TILES, 0);
+    std::vector<VkClearValue> tile_clear_value_ = std::vector<VkClearValue>(EDRAM_TILES);
+    bool transfer_clears_ = [] {
+        const char *v = std::getenv("XF_TRANSFER_CLEARS");
+        return !(v && std::string(v) == "0");
+    }();
+    // Beyond Xenia too, for the console's own clears (a rectangle drawn over
+    // a depth target with the depth test always passing and written), which
+    // games also make through another view of the same tiles (a 4x target
+    // cleared as a single-sampled one twice as wide and tall):
+    // - a target taking tiles for a draw that provably writes every sample
+    //   of them whatever they held (depth_overwrite) takes them without the
+    //   transfer from their holder, or the load from EDRAM, the draw would
+    //   only overwrite. XF_OVERWRITE_TRANSFERS=0: transferred, as Xenia does.
+    // - where such a draw writes one known word, the tiles it covers whole
+    //   hold a clear's value as after a resolve's clear, and a depth target of
+    //   the other depth format taking a cleared tile is cleared to the same
+    //   guest word in its own format (tile_clear_word_). XF_DRAW_CLEARS=0:
+    //   a draw never makes a tile a clear's, and the other format is drawn.
+    std::vector<uint32_t> tile_clear_word_ = std::vector<uint32_t>(EDRAM_TILES, 0); // depth tiles: the guest's word
+    bool overwrite_transfers_ = [] {
+        const char *v = std::getenv("XF_OVERWRITE_TRANSFERS");
+        return !(v && std::string(v) == "0");
+    }();
+    bool draw_clears_ = [] {
+        const char *v = std::getenv("XF_DRAW_CLEARS");
+        return !(v && std::string(v) == "0");
+    }();
+    // whether all of a tile's pixels, as the target lays them out, are in
+    // the target's image and among those the draw overwrites
+    static bool tile_within(const RenderTarget &t, uint32_t tile, const DepthOverwrite &o) {
+        const uint32_t k = (tile + EDRAM_TILES - t.base % EDRAM_TILES) % EDRAM_TILES;
+        const uint32_t x = (k % t.pitch_tiles) * t.tile_width, y = (k / t.pitch_tiles) * t.tile_height;
+        const uint32_t x1 = x + t.tile_width, y1 = y + t.tile_height;
+        return o.depth_whole && x1 <= t.width && y1 <= t.height && x >= o.x0 && y >= o.y0 && x1 <= o.x1 && y1 <= o.y1;
+    }
+    // A depth target's tile whose samples all have one stencil (-1: not
+    // known to): set by what makes a tile a clear's and by a draw that
+    // replaces the stencil of all of it, kept by draws with the stencil test
+    // off and by transfers between depth targets (the guest word's low
+    // byte whatever the depth format and the sample count), dropped by
+    // anything else that writes the tile. With it a clear of the depth alone
+    // (the stencil test off: the console's depth-only clears) makes a tile a
+    // clear's again: the depth's word with the stencil it has. Part of
+    // XF_DRAW_CLEARS.
+    std::vector<int16_t> tile_stencil_ = std::vector<int16_t>(EDRAM_TILES, -1);
+    uint64_t stencil_epoch_ = 1; // counted up as a tile's stencil becomes known (RenderTarget::stencil_written's memo)
+    // a draw with the stencil test on reached these tiles of t
+    void tiles_stencil_written(RenderTarget &t, const TileRect &tiles) {
+        if (tiles.empty()) return;
+        const bool known = t.stencil_epoch == stencil_epoch_;
+        if (known && tiles.within(t.stencil_written)) return;
+        for (uint32_t row = tiles.r0; row < tiles.r1; row++)
+            for (uint32_t column = tiles.c0; column < tiles.c1; column++)
+                tile_stencil_[(t.base + row * t.pitch_tiles + column) % EDRAM_TILES] = -1;
+        if (!known) t.stencil_epoch = stencil_epoch_, t.stencil_written = {};
+        t.stencil_written.remember(tiles);
+    }
+    // the tiles of t in its pixel rows [top, bottom), every column: a draw
+    // may have written them, so they no longer hold a clear's value
+    // (A draw after another into the same rows, no tile made a clear's
+    // since, has nothing to do: a game's hundred thousand draws a second
+    // walked 720 tiles each.)
+    void tiles_drawn(RenderTarget &t, const TileRect &tiles) {
+        if (tiles.empty()) return;
+        const bool known = t.drawn_epoch == cleared_epoch_;
+        if (known && tiles.within(t.drawn)) return;
+        for (uint32_t row = tiles.r0; row < tiles.r1; row++)
+            for (uint32_t column = tiles.c0; column < tiles.c1; column++)
+                tile_cleared_[(t.base + row * t.pitch_tiles + column) % EDRAM_TILES] = 0;
+        if (!known) t.drawn_epoch = cleared_epoch_, t.drawn = {};
+        t.drawn.remember(tiles);
+    }
+    // The tiles of a target that hold the console's pixels [x0, x1) x [y0, y1)
+    // (within its pitch and its height).
+    static TileRect tiles_of(const RenderTarget &t, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+        TileRect r;
+        r.c0 = x0 / t.tile_width, r.c1 = std::min((x1 + t.tile_width - 1) / t.tile_width, t.pitch_tiles);
+        r.r0 = y0 / t.tile_height, r.r1 = std::min((y1 + t.tile_height - 1) / t.tile_height, t.height / t.tile_height);
+        return r;
+    }
+    // Beyond Xenia, which takes whole rows of tiles from the first down to
+    // the draw's lowest: a draw's targets take over only the tiles the draw
+    // can reach (Impl::draw_reach: the scissor, and the viewport with
+    // clipping on or the vertices' extent without), so a target drawn to in
+    // part while another holds the rest of the same rows (a shadow atlas
+    // cleared a region at a time, through views of two sample counts) moves
+    // that part alone. XF_DRAW_REACH=rows: whole rows from the first, as
+    // Xenia.
+    bool reach_tiles_ = [] {
+        const char *v = std::getenv("XF_DRAW_REACH");
+        return !(v && std::string(v) == "rows");
+    }();
+    // counted up as a tile changes hands (owners_) and as one is made a
+    // clear's (tile_cleared_ set): what the targets' memos are as of
+    uint64_t owners_epoch_ = 1, cleared_epoch_ = 1;
     // EDRAM, and beside it the host's 32-bit depth of the last D24FS8 target
     // (and D24S8 where the host keeps it as a float) to store each sample,
     // in the same layout (edram.glsl's host_depth_offset)
     vk::Buffer edram_, host_depth_;
-    VkDescriptorSetLayout edram_set_layouts_[2] = {}; // store, load
-    VkPipelineLayout edram_layouts_[2] = {};
+    VkDescriptorSetLayout edram_set_layouts_[2] = {}; // store (and transfer), load
+    VkPipelineLayout edram_layouts_[3] = {};          // store, load, transfer
     std::vector<VkDescriptorPool> edram_pools_;
     VkDescriptorSet edram_load_set_ = VK_NULL_HANDLE;
     VkPipeline store_pipelines_[2] = {}; // 1x, multisampled
@@ -1657,6 +3286,49 @@ private:
     VkFormat d24s8_ = VK_FORMAT_D24_UNORM_S8_UINT;
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm (RenderTarget::gamma_linear)
     bool gamma_unorm16_ = false;
+    // host render targets rasterized at the Xenos's sample positions
+    // (Options::xenos_sample_positions, XF_XENOS_SAMPLE_POSITIONS)
+    bool xenos_positions_ = false;
+    bool xenos_at(uint32_t msaa) const { return xenos_positions_ && msaa != 0; }
+    // A multisampled depth image rasterized at the Xenos's positions, before
+    // a shader reads it as a texture (an EDRAM store, a transfer out of it, a
+    // resolve): taken to the attachment layout and back with its sample
+    // locations named (VkSampleLocationsInfoEXT on the barriers, what
+    // VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT asks for at
+    // each transition). A device that keeps depth as planes per block of
+    // pixels works the samples out when the image is read, and without the
+    // locations it does so at its standard ones: each sample then reads the
+    // surface's depth a part of a pixel away, and a pass testing for equal
+    // depth after a transfer out and back fails over whole surfaces. Only
+    // once after the image was last an attachment (RenderTarget::samples_unsettled).
+    void settle_depth_samples(VkCommandBuffer c, RenderTarget &t) {
+        if (!t.samples_unsettled) return;
+        t.samples_unsettled = false;
+        if (!t.depth || !xenos_at(t.msaa)) return;
+        VkSampleLocationEXT positions[4];
+        VkPipelineSampleLocationsStateCreateInfoEXT state{};
+        xenos_sample_locations(t.msaa, t.image.samples, false, positions, state);
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.pNext = &state.sampleLocationsInfo;
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        b.image = t.image.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(c, &dep);
+        b.srcAccessMask = b.dstAccessMask;
+        b.oldLayout = b.newLayout, b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        vkCmdPipelineBarrier2(c, &dep);
+    }
+    // polygon offsets on float depth in the format's own units even with
+    // VK_EXT_depth_bias_control (XF_DEPTH_BIAS_FLOAT_UNITS=1)
+    bool depth_bias_float_units_ = false;
 
     // ---- the interlock path (Options::render_target_path fsi) ----
     // 0: host render targets; 1 under pixel interlock, 2 under sample
@@ -1669,6 +3341,13 @@ private:
     bool fsi_2x_as_4x_ = false;         // the guest's 2x rasterized as 4x (no 2x without attachments)
     VkShaderModule fsi_depth_fs_ = VK_NULL_HANDLE; // depth and stencil alone (no pixel shader)
     VkPipeline clear_pipeline_ = VK_NULL_HANDLE;
+    // EDRAM between the console's size and scale_'s (edram_rescale.comp), for
+    // traces' snapshots: through edram_1x_, EDRAM at the console's size; the
+    // sets from it into EDRAM and back
+    VkPipeline rescale_pipeline_ = VK_NULL_HANDLE;
+    vk::Buffer edram_1x_;
+    VkDescriptorSet rescale_sets_[2] = {};
+    void rescale_edram(bool to_scaled);
     vk::Buffer zpd_counters_, zpd_readback_;
     FsiConstants last_fsi_{};
     VkDeviceSize last_fsi_at_ = NONE;
@@ -1676,10 +3355,19 @@ private:
     // without an image
     RenderTarget edram_view(bool depth, uint32_t base, uint32_t pitch, uint32_t msaa, uint32_t format) const;
     void fsi_clear(const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t lo, uint32_t hi);
+    void edram_clear_rows(VkCommandBuffer c, const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                          uint32_t lo, uint32_t hi);
     uint32_t fsi_zpd_index(); // the counter the draw counts in, ~0 none
 };
 
 Impl::~Impl() {
+    if (recorder_.joinable()) {
+        record(record_cmd_, Recorded::Quit, 0);
+        recorded();
+        record_publish();
+        recorder_.join();
+    }
+    translation_workers_.reset(); // before the shaders they read
     mem_.remove_watcher(watcher_);
     vkDeviceWaitIdle(dev_);
     pipeline_workers_.reset(); // before the shader modules and the cache they use
@@ -1700,17 +3388,32 @@ Impl::~Impl() {
         for (auto &[v, m] : s->variants)
             if (m) vkDestroyShaderModule(dev_, m, nullptr);
     }
-    for (auto *table : {&pipelines_, &libraries_})
+    for (auto *table : {&pipelines_, &libraries_, &translating_pipelines_})
         for (auto &[k, p] : *table)
-            for (VkPipeline pipe : {p->pipeline, p->stand_in})
+            for (VkPipeline pipe : {p->pipeline, p->stand_in, p->generic})
                 if (pipe) vkDestroyPipeline(dev_, pipe, nullptr);
-    for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.first, nullptr);
+    for (auto &modules : generic_vs_)
+        for (VkShaderModule m : modules)
+            if (m) vkDestroyShaderModule(dev_, m, nullptr);
+    for (auto &modules : generic_fs_)
+        for (VkShaderModule m : modules)
+            if (m) vkDestroyShaderModule(dev_, m, nullptr);
+    if (programs_.buffer) d_.destroy(programs_);
+    for (auto &[k, s] : samplers_) vkDestroySampler(dev_, s.sampler, nullptr);
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
-    for (auto &[k, t] : targets_) d_.destroy(t->image);
+    for (auto &[k, t] : targets_) {
+        d_.destroy(t->image);
+        if (t->stencil_copy.image) d_.destroy(t->stencil_copy);
+    }
     for (auto &[k, t] : textures_) {
         for (const TextureView &v : t->views) vkDestroyImageView(dev_, v.view, nullptr);
+        if (t->target_view) vkDestroyImageView(dev_, t->target_view, nullptr);
         d_.destroy(t->image);
         if (t->signed_image.image) d_.destroy(t->signed_image);
+    }
+    for (auto &[base, kept] : scaled_resolves_) {
+        if (kept.view) vkDestroyImageView(dev_, kept.view, nullptr);
+        d_.destroy(kept.image);
     }
     for (auto &im : dummy_) d_.destroy(im);
     if (native_output_view_) vkDestroyImageView(dev_, native_output_view_, nullptr);
@@ -1721,21 +3424,30 @@ Impl::~Impl() {
     for (VkShaderModule m : tessellation_hs_)
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (auto &[k, p] : load_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
-    for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, load_pipeline_, clear_pipeline_})
+    for (auto &[k, p] : transfer_pipelines_)
+        if (p) vkDestroyPipeline(dev_, p, nullptr);
+    for (auto &modules : transfer_fs_)
+        for (VkShaderModule m : modules)
+            if (m) vkDestroyShaderModule(dev_, m, nullptr);
+    for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, resolve_image_pipelines_[0],
+                         resolve_image_pipelines_[1], load_pipeline_, clear_pipeline_, rescale_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
     for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
                              depth_float24_fs_[1], placeholder_fs_, fsi_depth_fs_})
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (VkDescriptorPool p : edram_pools_) vkDestroyDescriptorPool(dev_, p, nullptr);
-    for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_})
+    for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_, target_pool_})
         if (p) vkDestroyDescriptorPool(dev_, p, nullptr);
-    for (VkPipelineLayout l : {edram_layouts_[0], edram_layouts_[1], layout_, resolve_layout_, load_layout_})
+    for (VkPipelineLayout l : {edram_layouts_[0], edram_layouts_[1], edram_layouts_[2], layout_, resolve_layout_,
+                               resolve_image_layout_, load_layout_})
         if (l) vkDestroyPipelineLayout(dev_, l, nullptr);
     for (VkDescriptorSetLayout l : {edram_set_layouts_[0], edram_set_layouts_[1], set_layouts_[0], set_layouts_[1],
-                                    compute_set_layout_})
+                                    compute_set_layout_, target_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
-    for (vk::Buffer *b : {&edram_, &host_depth_, &mirror_, &arena_, &scratch_, &load_scratch_, &zpd_counters_, &zpd_readback_})
+    for (vk::Buffer *b : {&edram_, &edram_1x_, &host_depth_, &mirror_, &arena_, &draw_data_, &scratch_, &load_scratch_,
+                          &zpd_counters_, &zpd_readback_, &extents_, &extents_readback_, &viz_predicates_})
         d_.destroy(*b);
+    for (IndexChunk &chunk : index_chunks_) d_.destroy(chunk.buffer);
 }
 
 // keep: destroyed with the renderer, else by the caller
@@ -1762,6 +3474,7 @@ VkPipeline Impl::compute_pipeline(const uint32_t *words, size_t bytes, VkPipelin
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(dev_, pipeline_cache_, 1, &c, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
     vkDestroyShaderModule(dev_, m, nullptr);
+    module_content_.erase(m);
     return p;
 }
 
@@ -1817,6 +3530,8 @@ void Impl::save_pipeline_cache() {
 }
 
 bool Impl::init(std::string &error) {
+    if (const char *v = std::getenv("XF_RENDERER_CPU_TIMES")) cpu_times_ = v[0] == '1';
+    cpu_times_ = cpu_times_ || options_.cpu_times;
     open_pipeline_cache();
     support_ = texture_support(d_);
     if (options_.async_pipelines) {
@@ -1882,6 +3597,20 @@ bool Impl::init(std::string &error) {
     load_scratch_ = d_.create_buffer(16u << 20, scratch_usage, false);
     if (!mirror_.buffer || !arena_.buffer || !scratch_.buffer || !load_scratch_.buffer)
         return error = "could not make the renderer's buffers (512 MB of device memory for guest memory's mirror)", false;
+    // The draws' constants in video memory the host writes through its
+    // mapping (beyond Xenia, whose upload buffers are system memory): the
+    // shaders read them without crossing the bus each draw. Without
+    // resizable BAR that memory is a window of about 256 MB, so only where
+    // its heap is at least four times the 48 MB taken; the arena otherwise.
+    if (const char *off = std::getenv("XF_VK_NO_DEVICE_LOCAL_DRAW_DATA"); !off || !off[0] || off[0] == '0')
+        draw_data_ = d_.create_device_local_mapped_buffer(VkDeviceSize(SLOTS) * DRAW_DATA_SLOT,
+                                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                                                          4 * VkDeviceSize(SLOTS) * DRAW_DATA_SLOT);
+    if (const char *always = std::getenv("XF_VK_DRAW_STATE_ALWAYS"); always && always[0] && always[0] != '0')
+        draw_state_elision_ = false;
+    if (options_.verbose)
+        std::fprintf(stderr, "renderer: the draws' constants in %s\n",
+                     draw_data_.buffer ? "video memory (device-local, host-visible)" : "the arena (host memory)");
 
     // The render target path (Options::render_target_path): the interlock
     // one where asked for (XF_RENDER_TARGET_PATH=fsi or host forces either)
@@ -1892,6 +3621,8 @@ bool Impl::init(std::string &error) {
     {
         if (render_target_path(d_, options_) == Options::RenderTargetPath::fsi) fsi_ = d_.fragment_shader_interlock();
         fsi_2x_as_4x_ = fsi_ && !(d_.no_attachments_samples() & VK_SAMPLE_COUNT_2_BIT);
+        std::fprintf(stderr, "renderer: render targets: %s\n",
+                     fsi_ ? "exact EDRAM (fragment shader interlock)" : "the host's");
         if (const char *e = std::getenv("XF_FSI_DYNAMIC"); e && *e && *e != '0') options_.fsi_specialized = false;
     }
     // D24S8 as a 32-bit float depth where the device has no 24-bit unorm
@@ -1900,6 +3631,19 @@ bool Impl::init(std::string &error) {
     if (!d_.format_supported(d24s8_, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
         (depth_fallback && depth_fallback[0] == '1'))
         d24s8_ = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    if (const char *e = std::getenv("XF_DEPTH_BIAS_FLOAT_UNITS")) depth_bias_float_units_ = e[0] && e[0] != '0';
+    // Host render targets at the Xenos's sample positions (Xenia's
+    // xenos_sample_positions, off by default there, on here): needs
+    // VK_EXT_sample_locations for both 2x and 4x
+    {
+        const char *e = std::getenv("XF_XENOS_SAMPLE_POSITIONS");
+        const bool wanted = e && e[0] ? e[0] != '0' : options_.xenos_sample_positions;
+        const VkSampleCountFlags both = VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+        xenos_positions_ = wanted && !fsi_ && (d_.sample_locations() & both) == both;
+        if (wanted && !fsi_)
+            std::fprintf(stderr, "renderer: 2x and 4x host render targets at %s sample positions\n",
+                         xenos_positions_ ? "the Xenos's" : "the host's (no VK_EXT_sample_locations for 2x and 4x)");
+    }
     // 8_8_8_8_GAMMA targets kept linear as RGBA16 unorm, blended in linear
     // (Xenia's gamma_render_target_as_unorm16, on by default), where the
     // device samples, renders to and blends that format; without it, or with
@@ -1926,6 +3670,7 @@ bool Impl::init(std::string &error) {
         alloc.commandBufferCount = 1;
         VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (vkAllocateCommandBuffers(dev_, &alloc, &s.cmd) != VK_SUCCESS ||
+            vkAllocateCommandBuffers(dev_, &alloc, &s.pre) != VK_SUCCESS ||
             vkCreateFence(dev_, &fence, nullptr, &s.fence) != VK_SUCCESS)
             return error = "could not make the submission slots", false;
     }
@@ -1952,8 +3697,11 @@ bool Impl::init(std::string &error) {
     // the guest's vertex shader run as a domain shader reads all of it too
     if (d_.tessellation_shader()) stages |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
     // (4 to 6 the interlock path's: its constants, EDRAM, the occlusion
-    // counters; bound in either path, read only by its pixel shaders)
-    VkDescriptorSetLayoutBinding b0[7] = {
+    // counters; bound in either path, read only by its pixel shaders; 7 the
+    // screen extents, written by the vertex shaders that bound them)
+    const VkShaderStageFlags vertex_stages =
+        stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT);
+    VkDescriptorSetLayoutBinding b0[9] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr},
         {2, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, stages, nullptr},
@@ -1961,6 +3709,9 @@ bool Impl::init(std::string &error) {
         {4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, vertex_stages, nullptr},
+        // 8 the generic shaders' programs (init_generic)
+        {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, stages, nullptr},
     };
     VkDescriptorSetLayoutBinding b1[4] = {
         {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacity_[0], stages, nullptr},
@@ -1976,7 +3727,7 @@ bool Impl::init(std::string &error) {
     flags.bindingCount = 4;
     flags.pBindingFlags = partly;
     VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    set_info.bindingCount = 7;
+    set_info.bindingCount = 9;
     set_info.pBindings = b0;
     if (vkCreateDescriptorSetLayout(dev_, &set_info, nullptr, &set_layouts_[0]) != VK_SUCCESS)
         return error = "vkCreateDescriptorSetLayout failed", false;
@@ -1992,7 +3743,8 @@ bool Impl::init(std::string &error) {
     if (vkCreatePipelineLayout(dev_, &layout_info, nullptr, &layout_) != VK_SUCCESS)
         return error = "vkCreatePipelineLayout failed", false;
     {
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 8},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool.maxSets = 2;
         pool.poolSizeCount = 2;
@@ -2020,10 +3772,11 @@ bool Impl::init(std::string &error) {
         if (vkAllocateDescriptorSets(dev_, &alloc, &bindless_) != VK_SUCCESS)
             return error = "vkAllocateDescriptorSets failed", false;
         for (int k = 0; k < 2; k++) {
-            VkDescriptorBufferInfo buffers[4] = {{arena_.buffer, 0, sizeof(harness::Constants)},
+            // (the constants by dynamic offsets from draw_data_take)
+            VkDescriptorBufferInfo buffers[4] = {{draw_buffer(), 0, sizeof(harness::Constants)},
                                                  {k ? mirror_.buffer : arena_.buffer, 0, VK_WHOLE_SIZE},
-                                                 {arena_.buffer, 0, sizeof(System)},
-                                                 {arena_.buffer, 0, sizeof(harness::Constants)}};
+                                                 {draw_buffer(), 0, sizeof(System)},
+                                                 {draw_buffer(), 0, sizeof(harness::Constants)}};
             VkWriteDescriptorSet writes[4] = {};
             for (uint32_t b = 0; b < 4; b++) {
                 writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2062,16 +3815,54 @@ bool Impl::init(std::string &error) {
 
     // EDRAM: the buffer, store (compute) and load (draw) pipelines; the tile
     // masks come from the arena
-    edram_ = d_.create_buffer(EDRAM_BYTES,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                              false);
-    if (!edram_.buffer) return error = "could not make the EDRAM buffer", false;
-    // the host's depth beside it: D24FS8's, then D24S8's where the host keeps
-    // that as a float too
-    host_depth_ = d_.create_buffer(EDRAM_BYTES * (host_depth_kept(0) ? 2 : 1),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
-    if (!host_depth_.buffer) return error = "could not make the host depth buffer", false;
+    // At the resolution scale (Options::resolution_scale, or XF_RESOLUTION_SCALE
+    // in percent): EDRAM's tiles that many times wider and taller. Where the
+    // device cannot hold it, the next smaller scale that it can, said in the
+    // notice (the player shows it).
+    {
+        Scale wanted{std::clamp(options_.resolution_scale, Scale::MIN_Q4, Scale::MAX_Q4)};
+        if (const char *percent = std::getenv("XF_RESOLUTION_SCALE"); percent && *percent)
+            wanted = Scale::from_percent(std::atoi(percent));
+        // The interlock path addresses a pixel's samples from its first one
+        // (edram_fsi.frag's fsi_offsets and sample_offset), which keeps them
+        // in one half of a tile only where the half (10 samples a quarter of
+        // scale) is a whole number of 4-sample groups: even quarters (50%,
+        // 100%, 150%, ...). An odd quarter is drawn at the even one below it,
+        // said in the notice; the host render target path takes every quarter.
+        Scale asked = wanted;
+        if (fsi_ && (wanted.q4 & 1)) wanted.q4 = std::max(wanted.q4 - 1, Scale::MIN_Q4);
+        min_scalable_ = options_.min_scalable;
+        if (const char *min = std::getenv("XF_MIN_SCALABLE"); min && *min) min_scalable_ = uint32_t(std::atoi(min));
+        for (scale_ = wanted;; scale_.q4 -= fsi_ ? 2 : 1) {
+            tile_dwords_ = scale_.tile_dwords();
+            edram_bytes_ = VkDeviceSize(EDRAM_TILES) * tile_dwords_ * 4;
+            edram_ = d_.create_buffer(edram_bytes_,
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                      false);
+            // the host's depth beside it: D24FS8's, then D24S8's where the
+            // host keeps that as a float too
+            if (edram_.buffer)
+                host_depth_ =
+                    d_.create_buffer(edram_bytes_ * (host_depth_kept(0) ? 2 : 1),
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+            if (edram_.buffer && host_depth_.buffer) break;
+            d_.destroy(edram_), d_.destroy(host_depth_);
+            if (scale_.q4 <= Scale::MIN_Q4 || (scale_.q4 <= 4 && wanted.q4 > 4))
+                return error = "could not make the EDRAM buffer", false;
+        }
+        VkPhysicalDeviceProperties properties;
+        vkGetPhysicalDeviceProperties(d_.physical(), &properties);
+        max_image_ = std::min(properties.limits.maxImageDimension2D,
+                              std::min(properties.limits.maxFramebufferWidth, properties.limits.maxFramebufferHeight));
+        anisotropy_ = options_.anisotropy, texture_filter_ = options_.texture_filter;
+        if (scale_.q4 != wanted.q4)
+            scale_notice_ = "drawn at " + std::to_string(scale_.percent()) + "%: the GPU could not hold EDRAM at " +
+                            std::to_string(wanted.percent()) + "%";
+        else if (scale_.q4 != asked.q4)
+            scale_notice_ = "drawn at " + std::to_string(scale_.percent()) + "%: the exact EDRAM path (interlock) takes " +
+                            "multiples of 50%, not " + std::to_string(asked.percent()) + "%";
+    }
     // the interlock path's occlusion counters: a slot's share each, zeroed as
     // it begins recording, copied for the CPU as it ends
     zpd_counters_ = d_.create_buffer(VkDeviceSize(SLOTS) * OCCLUSION_QUERIES * 4,
@@ -2081,12 +3872,31 @@ bool Impl::init(std::string &error) {
     zpd_readback_ = d_.create_buffer(VkDeviceSize(SLOTS) * OCCLUSION_QUERIES * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                      true, true);
     if (!zpd_counters_.buffer || !zpd_readback_.buffer) return error = "could not make the occlusion counters", false;
+    // the screen extents' reports ("screen extents"), zeroed by the first
+    // command buffer
+    extents_ = d_.create_buffer(VkDeviceSize(SLOTS) * EXTENT_REPORTS * 16,
+                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                false);
+    extents_readback_ =
+        d_.create_buffer(VkDeviceSize(SLOTS) * EXTENT_REPORTS * 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
+    if (!extents_.buffer || !extents_readback_.buffer)
+        return error = "could not make the screen extents' buffers", false;
+    for (Slot &s : slots_) s.extents_used = EXTENT_REPORTS;
+    // the VIZ queries' predicates ("VIZ queries"), where the device has
+    // conditional rendering
+    if (d_.conditional_rendering()) {
+        viz_predicates_ = d_.create_buffer(
+            64 * 4, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+        if (!viz_predicates_.buffer) return error = "could not make the VIZ queries' predicates", false;
+    }
     for (int k = 0; k < 2; k++) {
-        VkDescriptorBufferInfo buffers[3] = {{arena_.buffer, 0, sizeof(FsiConstants)},
+        VkDescriptorBufferInfo buffers[4] = {{draw_buffer(), 0, sizeof(FsiConstants)},
                                              {edram_.buffer, 0, VK_WHOLE_SIZE},
-                                             {zpd_counters_.buffer, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet writes[3] = {};
-        for (uint32_t b = 0; b < 3; b++) {
+                                             {zpd_counters_.buffer, 0, VK_WHOLE_SIZE},
+                                             {extents_.buffer, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[4] = {};
+        for (uint32_t b = 0; b < 4; b++) {
             writes[b] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             writes[b].dstSet = draw_sets_[k];
             writes[b].dstBinding = 4 + b;
@@ -2094,7 +3904,7 @@ bool Impl::init(std::string &error) {
             writes[b].descriptorType = b ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
             writes[b].pBufferInfo = &buffers[b];
         }
-        vkUpdateDescriptorSets(dev_, 3, writes, 0, nullptr);
+        vkUpdateDescriptorSets(dev_, 4, writes, 0, nullptr);
     }
     if (fsi_) {
         fsi_depth_fs_ = fsi_ == 2 ? module(EDRAM_FSI_DEPTH_SAMPLE, sizeof(EDRAM_FSI_DEPTH_SAMPLE))
@@ -2102,12 +3912,14 @@ bool Impl::init(std::string &error) {
         if (!fsi_depth_fs_) return error = "could not make the interlock path's depth shader", false;
     }
     {
+        constexpr VkShaderStageFlags store_stages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutBinding store[5] = {
-            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            // (the fragment stage's too: a transfer from the target reads it, edram_transfer.frag)
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, store_stages, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1, store_stages, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, store_stages, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, store_stages, nullptr},
+            {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, store_stages, nullptr},
         };
         VkDescriptorBindingFlags store_flags[5] = {0, 0, 0, VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, 0};
         VkDescriptorSetLayoutBindingFlagsCreateInfo store_binding_flags{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
@@ -2138,6 +3950,17 @@ bool Impl::init(std::string &error) {
             if (vkCreatePipelineLayout(dev_, &layout, nullptr, &edram_layouts_[k]) != VK_SUCCESS)
                 return error = "could not make the EDRAM pipeline layouts", false;
         }
+        {
+            // transfers: the source's store set, both targets in the push constants
+            VkPushConstantRange range{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(EdramTransfer)};
+            VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layout.setLayoutCount = 1;
+            layout.pSetLayouts = &edram_set_layouts_[0];
+            layout.pushConstantRangeCount = 1;
+            layout.pPushConstantRanges = &range;
+            if (vkCreatePipelineLayout(dev_, &layout, nullptr, &edram_layouts_[2]) != VK_SUCCESS)
+                return error = "could not make the EDRAM pipeline layouts", false;
+        }
         store_pipelines_[0] = compute_pipeline(EDRAM_STORE, sizeof(EDRAM_STORE), edram_layouts_[0]);
         store_pipelines_[1] = compute_pipeline(EDRAM_STORE_MS, sizeof(EDRAM_STORE_MS), edram_layouts_[0]);
         if (!store_pipelines_[0] || !store_pipelines_[1]) return error = "could not make the EDRAM store pipelines", false;
@@ -2147,6 +3970,25 @@ bool Impl::init(std::string &error) {
         if (d_.stencil_export()) load_fs_[2] = module(EDRAM_LOAD_STENCIL, sizeof(EDRAM_LOAD_STENCIL));
         load_uint_fs_ = module(EDRAM_LOAD_UINT, sizeof(EDRAM_LOAD_UINT));
         if (!load_uint_fs_) return error = "could not make the EDRAM load shaders", false;
+        transfer_fs_[0][0] = module(EDRAM_TRANSFER, sizeof(EDRAM_TRANSFER));
+        transfer_fs_[0][1] = module(EDRAM_TRANSFER_UINT, sizeof(EDRAM_TRANSFER_UINT));
+        transfer_fs_[0][2] = module(EDRAM_TRANSFER_DEPTH, sizeof(EDRAM_TRANSFER_DEPTH));
+        transfer_fs_[1][0] = module(EDRAM_TRANSFER_MS, sizeof(EDRAM_TRANSFER_MS));
+        transfer_fs_[1][1] = module(EDRAM_TRANSFER_MS_UINT, sizeof(EDRAM_TRANSFER_MS_UINT));
+        transfer_fs_[1][2] = module(EDRAM_TRANSFER_MS_DEPTH, sizeof(EDRAM_TRANSFER_MS_DEPTH));
+        if (d_.stencil_export()) {
+            transfer_fs_[0][3] = module(EDRAM_TRANSFER_STENCIL, sizeof(EDRAM_TRANSFER_STENCIL));
+            transfer_fs_[1][3] = module(EDRAM_TRANSFER_MS_STENCIL, sizeof(EDRAM_TRANSFER_MS_STENCIL));
+        } else if (d_.depth_stencil_color_copies() &&
+                   d_.format_supported(VK_FORMAT_R8_UINT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+                                                              VK_FORMAT_FEATURE_TRANSFER_SRC_BIT)) {
+            transfer_fs_[0][4] = module(EDRAM_TRANSFER_STENCIL_COPY, sizeof(EDRAM_TRANSFER_STENCIL_COPY));
+            transfer_fs_[1][4] = module(EDRAM_TRANSFER_MS_STENCIL_COPY, sizeof(EDRAM_TRANSFER_MS_STENCIL_COPY));
+            stencil_copies_ = transfer_fs_[0][4] && transfer_fs_[1][4];
+        }
+        for (auto &modules : transfer_fs_)
+            for (int k = 0; k < 3; k++)
+                if (!modules[k]) return error = "could not make the EDRAM transfer shaders", false;
         {
             // integer images at the guest's sample counts: sampled, and
             // rendered to (Vulkan 1.2's framebufferIntegerColorSampleCounts)
@@ -2195,13 +4037,56 @@ bool Impl::init(std::string &error) {
         info.pBindings = bindings;
         if (vkCreateDescriptorSetLayout(dev_, &info, nullptr, &compute_set_layout_) != VK_SUCCESS)
             return error = "vkCreateDescriptorSetLayout failed", false;
+        // the resolves' set 1, the textures they write as well (resolve.comp's
+        // targets32 and targets64): partially bound, updated after binding
+        // where the device can (else never written, the resolves writing
+        // memory alone)
+        const char *targets_env = std::getenv("XF_RESOLVE_TARGETS");
+        resolve_targets_ = d_.storage_image_update_after_bind() && !options_.no_resolve_targets &&
+                           !(targets_env && targets_env[0] == '0');
+        VkDescriptorSetLayoutBinding target_bindings[2] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, RESOLVE_TARGETS, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, RESOLVE_TARGETS, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        };
+        VkDescriptorBindingFlags target_flags[2];
+        for (VkDescriptorBindingFlags &f : target_flags)
+            f = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                (resolve_targets_ ? VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                                        VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT
+                                  : 0);
+        VkDescriptorSetLayoutBindingFlagsCreateInfo target_flag_info{
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+        target_flag_info.bindingCount = 2;
+        target_flag_info.pBindingFlags = target_flags;
+        VkDescriptorSetLayoutCreateInfo target_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        target_info.pNext = &target_flag_info;
+        target_info.flags = resolve_targets_ ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
+        target_info.bindingCount = 2;
+        target_info.pBindings = target_bindings;
+        if (vkCreateDescriptorSetLayout(dev_, &target_info, nullptr, &target_set_layout_) != VK_SUCCESS)
+            return error = "vkCreateDescriptorSetLayout failed", false;
+        VkDescriptorPoolSize target_size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * RESOLVE_TARGETS};
+        VkDescriptorPoolCreateInfo target_pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        target_pool.flags = resolve_targets_ ? VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT : 0;
+        target_pool.maxSets = 1;
+        target_pool.poolSizeCount = 1;
+        target_pool.pPoolSizes = &target_size;
+        if (vkCreateDescriptorPool(dev_, &target_pool, nullptr, &target_pool_) != VK_SUCCESS)
+            return error = "vkCreateDescriptorPool failed", false;
+        VkDescriptorSetAllocateInfo target_alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        target_alloc.descriptorPool = target_pool_;
+        target_alloc.descriptorSetCount = 1;
+        target_alloc.pSetLayouts = &target_set_layout_;
+        if (vkAllocateDescriptorSets(dev_, &target_alloc, &target_set_) != VK_SUCCESS)
+            return error = "vkAllocateDescriptorSets failed", false;
         uint32_t push_sizes[2] = {sizeof(ResolveConstants), sizeof(LoadConstants)};
         VkPipelineLayout *layouts[2] = {&resolve_layout_, &load_layout_};
         for (int k = 0; k < 2; k++) {
             VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_sizes[k]};
             VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-            layout.setLayoutCount = 1;
-            layout.pSetLayouts = &compute_set_layout_;
+            const VkDescriptorSetLayout set_layouts[2] = {compute_set_layout_, target_set_layout_};
+            layout.setLayoutCount = k == 0 ? 2 : 1; // the resolves' with their targets
+            layout.pSetLayouts = set_layouts;
             layout.pushConstantRangeCount = 1;
             layout.pPushConstantRanges = &range;
             if (vkCreatePipelineLayout(dev_, &layout, nullptr, layouts[k]) != VK_SUCCESS)
@@ -2210,14 +4095,29 @@ bool Impl::init(std::string &error) {
         resolve_pipeline_ = compute_pipeline(RESOLVE, sizeof(RESOLVE), resolve_layout_);
         load_pipeline_ = compute_pipeline(TEXTURE_LOAD, sizeof(TEXTURE_LOAD), load_layout_);
         if (!resolve_pipeline_ || !load_pipeline_) return error = "could not make the resolve and load pipelines", false;
+        if (!fsi_) {
+            VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ResolveConstants)};
+            const VkDescriptorSetLayout set_layouts[3] = {compute_set_layout_, target_set_layout_, edram_set_layouts_[0]};
+            VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layout.setLayoutCount = 3;
+            layout.pSetLayouts = set_layouts;
+            layout.pushConstantRangeCount = 1;
+            layout.pPushConstantRanges = &range;
+            if (vkCreatePipelineLayout(dev_, &layout, nullptr, &resolve_image_layout_) != VK_SUCCESS)
+                return error = "vkCreatePipelineLayout failed", false;
+            resolve_image_pipelines_[0] = compute_pipeline(RESOLVE_IMAGE, sizeof(RESOLVE_IMAGE), resolve_image_layout_);
+            resolve_image_pipelines_[1] = compute_pipeline(RESOLVE_IMAGE_MS, sizeof(RESOLVE_IMAGE_MS), resolve_image_layout_);
+            if (!resolve_image_pipelines_[0] || !resolve_image_pipelines_[1])
+                return error = "could not make the image resolve pipelines", false;
+        }
         // the interlock path's clears into EDRAM: the resolves' layout and
         // their EDRAM set (EDRAM at binding 0), edram.glsl's push constants
         static_assert(sizeof(EdramTarget) <= sizeof(ResolveConstants));
         if (fsi_ && !(clear_pipeline_ = compute_pipeline(EDRAM_CLEAR, sizeof(EDRAM_CLEAR), resolve_layout_)))
             return error = "could not make the EDRAM clear pipeline", false;
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pool.maxSets = 3;
+        pool.maxSets = 5;
         pool.poolSizeCount = 1;
         pool.pPoolSizes = sizes;
         if (vkCreateDescriptorPool(dev_, &pool, nullptr, &compute_pool_) != VK_SUCCESS)
@@ -2246,6 +4146,32 @@ bool Impl::init(std::string &error) {
             writes[k].pBufferInfo = &buffers[k];
         }
         vkUpdateDescriptorSets(dev_, 6, writes, 0, nullptr);
+        // at a resolution scale, EDRAM at the console's size beside it, and
+        // the sets that move a snapshot between the two
+        if (!scale_.one()) {
+            edram_1x_ = d_.create_buffer(EDRAM_BYTES,
+                                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                         false);
+            rescale_pipeline_ = compute_pipeline(EDRAM_RESCALE, sizeof(EDRAM_RESCALE), load_layout_);
+            VkDescriptorSetLayout twice[2] = {compute_set_layout_, compute_set_layout_};
+            alloc.descriptorSetCount = 2;
+            alloc.pSetLayouts = twice;
+            if (!edram_1x_.buffer || !rescale_pipeline_ ||
+                vkAllocateDescriptorSets(dev_, &alloc, rescale_sets_) != VK_SUCCESS)
+                return error = "could not make the EDRAM rescale", false;
+            VkDescriptorBufferInfo ends[4] = {{edram_1x_.buffer, 0, VK_WHOLE_SIZE}, {edram_.buffer, 0, VK_WHOLE_SIZE},
+                                              {edram_.buffer, 0, VK_WHOLE_SIZE}, {edram_1x_.buffer, 0, VK_WHOLE_SIZE}};
+            for (uint32_t k = 0; k < 4; k++) {
+                writes[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                writes[k].dstSet = rescale_sets_[k >> 1];
+                writes[k].dstBinding = k & 1;
+                writes[k].descriptorCount = 1;
+                writes[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[k].pBufferInfo = &ends[k];
+            }
+            vkUpdateDescriptorSets(dev_, 4, writes, 0, nullptr);
+        }
     }
 
     // the stand-ins for slots without a texture, index 0 of each table: 1x1
@@ -2297,24 +4223,293 @@ bool Impl::init(std::string &error) {
                                   fsi_depth_fs_,       depth_float24_fs_[0], depth_float24_fs_[1], placeholder_fs_};
     for (uint32_t k = 0; k < std::size(own); k++)
         if (own[k]) module_names_[own[k]] = {2, own[k] == fsi_depth_fs_ ? fsi_ : 0u, k + 1};
+    if (!init_generic(error)) return false;
     open_storage();
     return true;
+}
+
+// The generic shaders (docs/renderer.md, "The generic shaders"): the program
+// buffer (set 0, binding 8; host-visible, written once per shader and never
+// again, so nothing on the GPU races the writes), the vertex shader and the
+// pixel shader's four forms for this renderer's render target path, named
+// as the renderer's own modules (kind 2, from 100) with their code's hash.
+bool Impl::init_generic(std::string &error) {
+    static const bool off = [] {
+        const char *v = std::getenv("XF_GENERIC_SHADERS");
+        return v && v[0] == '0';
+    }();
+    generic_on_ = (options_.generic_shaders || options_.generic_only) && !off;
+    // (in video memory where the host can write it, as the interpreter reads
+    // it at every instruction; else host memory)
+    programs_ = d_.create_device_local_mapped_buffer(PROGRAM_BUFFER_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                                     16 * PROGRAM_BUFFER_BYTES);
+    if (!programs_.buffer) programs_ = d_.create_buffer(PROGRAM_BUFFER_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    if (!programs_.buffer || !programs_.mapped) return error = "could not make the generic shaders' program buffer", false;
+    // (offset 0: an empty program, what the draws that run no generic shader point at)
+    const uint32_t empty[4] = {0, 1, 0, 0};
+    std::memcpy(programs_.mapped, empty, sizeof(empty));
+    programs_used_ = 1;
+    for (VkDescriptorSet set : draw_sets_) {
+        VkDescriptorBufferInfo buffer{programs_.buffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        write.dstSet = set;
+        write.dstBinding = 8;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = &buffer;
+        vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+    }
+    if (!generic_on_) return true;
+    auto make = [&](std::span<const uint32_t> words, uint32_t id) {
+        VkShaderModule m = module(words.data(), words.size_bytes());
+        if (m) {
+            module_names_[m] = {2, fsi_, id};
+            module_content_[m] = ShaderStorage::hash(0, std::vector<uint32_t>(words.begin(), words.end()));
+        }
+        return m;
+    };
+    const std::span<const uint32_t> vertex[2][3] = {{GENERIC_VS, GENERIC_CLIP_VS, GENERIC_CULL_VS},
+                                                     {GENERIC_EXTENTS_VS, GENERIC_EXTENTS_CLIP_VS, GENERIC_EXTENTS_CULL_VS}};
+    for (uint32_t e = 0; e < 2; e++)
+        for (uint32_t c = 0; c < 3; c++) {
+            generic_vs_[e][c] = make(vertex[e][c], e || c ? 110 + e * 3 + c : 100);
+            if (!generic_vs_[e][c]) return error = "could not make the generic shaders", false;
+        }
+    // [point coordinates][writes depth]
+    const std::span<const uint32_t> host[2][2] = {{GENERIC_FS, GENERIC_DEPTH_FS},
+                                                  {GENERIC_POINTS_FS, GENERIC_POINTS_DEPTH_FS}};
+    const std::span<const uint32_t> pixel[2][2] = {{GENERIC_FSI_FS, GENERIC_FSI_DEPTH_FS},
+                                                   {GENERIC_FSI_POINTS_FS, GENERIC_FSI_POINTS_DEPTH_FS}};
+    const std::span<const uint32_t> sample[2][2] = {{GENERIC_FSI_SAMPLE_FS, GENERIC_FSI_SAMPLE_DEPTH_FS},
+                                                    {GENERIC_FSI_SAMPLE_POINTS_FS, GENERIC_FSI_SAMPLE_POINTS_DEPTH_FS}};
+    for (uint32_t p = 0; p < 2; p++)
+        for (uint32_t d = 0; d < 2; d++)
+            generic_fs_[p][d] = make(fsi_ == 2 ? sample[p][d] : fsi_ ? pixel[p][d] : host[p][d], 101 + p * 2 + d);
+    if (!generic_fs_[0][0] || !generic_fs_[0][1] || !generic_fs_[1][0] || !generic_fs_[1][1])
+        return error = "could not make the generic shaders", false;
+    // the translation off the renderer's thread, where the generic shaders
+    // draw meanwhile (XF_TRANSLATE_ASYNC=0 keeps it here)
+    static const bool translate_here = [] {
+        const char *v = std::getenv("XF_TRANSLATE_ASYNC");
+        return v && v[0] == '0';
+    }();
+    if (options_.async_pipelines && pipeline_workers_ && use_libraries_ && !options_.generic_only &&
+        !options_.linked_pipelines_only && stand_in_ == Options::PipelineStandIn::library && !translate_here)
+        translation_workers_ = std::make_unique<TranslationWorkers>(2);
+    return true;
+}
+
+// A shader's program in the program buffer, encoded and written the first
+// time (Shader::program); false with why when the generic shaders cannot run it.
+bool Impl::program(Shader &s, std::string &why) {
+    if (!s.encoded) {
+        s.encoded = true;
+        shader::Program p = shader::encode_program(s.parsed);
+        s.program_flags = p.flags;
+        const uint32_t units = uint32_t(p.words.size() / 4);
+        if (!p.ok()) {
+            s.program_unsupported = p.unsupported;
+        } else if (VkDeviceSize(programs_used_ + units) * 16 > programs_.size) {
+            s.program_unsupported = "the program buffer is full";
+        } else {
+            std::memcpy(static_cast<uint8_t *>(programs_.mapped) + VkDeviceSize(programs_used_) * 16, p.words.data(),
+                        p.words.size() * 4);
+            s.program = programs_used_;
+            programs_used_ += units;
+            report_.generic_programs++;
+        }
+    }
+    if (s.program == UINT32_MAX) why = s.program_unsupported;
+    return s.program != UINT32_MAX;
 }
 
 // ---- submissions ----
 
 VkCommandBuffer Impl::cmd() {
+    begin_recording();
+    record_sync();
+    return slots_[current_].cmd;
+}
+
+uint32_t Impl::run_recorded(VkCommandBuffer c, const uint32_t *r) {
+    const uint32_t *a = r + 1;
+    auto value = [a]<class T>(T &out) {
+        std::memcpy(&out, a, sizeof(T));
+        return uint32_t(sizeof(T) + 3) / 4;
+    };
+    switch (Recorded::Op(r[0])) {
+    case Recorded::BindPipeline: {
+        VkPipeline pipeline;
+        const uint32_t words = value(pipeline);
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        return words;
+    }
+    case Recorded::BindSets: {
+        Recorded::Sets sets;
+        const uint32_t words = value(sets);
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, sets.count, sets.sets, 4, sets.offsets);
+        return words;
+    }
+    case Recorded::BindIndexBuffer: {
+        VkBuffer buffer;
+        const uint32_t words = value(buffer);
+        vkCmdBindIndexBuffer(c, buffer, 0, VK_INDEX_TYPE_UINT32);
+        return words;
+    }
+    case Recorded::BindVertexBuffer: {
+        Recorded::Place place;
+        const uint32_t words = value(place);
+        vkCmdBindVertexBuffers(c, 0, 1, &place.buffer, &place.at);
+        return words;
+    }
+    case Recorded::Viewport: {
+        VkViewport viewport;
+        const uint32_t words = value(viewport);
+        vkCmdSetViewport(c, 0, 1, &viewport);
+        return words;
+    }
+    case Recorded::Scissor: {
+        VkRect2D scissor;
+        const uint32_t words = value(scissor);
+        vkCmdSetScissor(c, 0, 1, &scissor);
+        return words;
+    }
+    case Recorded::BlendConstants: {
+        float constants[4];
+        const uint32_t words = value(constants);
+        vkCmdSetBlendConstants(c, constants);
+        return words;
+    }
+    case Recorded::StencilReference: vkCmdSetStencilReference(c, a[0], a[1]); return 2;
+    case Recorded::StencilCompareMask: vkCmdSetStencilCompareMask(c, a[0], a[1]); return 2;
+    case Recorded::StencilWriteMask: vkCmdSetStencilWriteMask(c, a[0], a[1]); return 2;
+    case Recorded::Topology: vkCmdSetPrimitiveTopology(c, VkPrimitiveTopology(a[0])); return 1;
+    case Recorded::RestartEnable: vkCmdSetPrimitiveRestartEnable(c, a[0]); return 1;
+    case Recorded::CullMode: vkCmdSetCullMode(c, a[0]); return 1;
+    case Recorded::FrontFace: vkCmdSetFrontFace(c, VkFrontFace(a[0])); return 1;
+    case Recorded::DepthTest: vkCmdSetDepthTestEnable(c, a[0]); return 1;
+    case Recorded::DepthWrite: vkCmdSetDepthWriteEnable(c, a[0]); return 1;
+    case Recorded::DepthCompare: vkCmdSetDepthCompareOp(c, VkCompareOp(a[0])); return 1;
+    case Recorded::StencilTest: vkCmdSetStencilTestEnable(c, a[0]); return 1;
+    case Recorded::StencilOp:
+        vkCmdSetStencilOp(c, a[0], VkStencilOp(a[1]), VkStencilOp(a[2]), VkStencilOp(a[3]), VkCompareOp(a[4]));
+        return 5;
+    case Recorded::DepthBiasEnable: vkCmdSetDepthBiasEnable(c, a[0]); return 1;
+    case Recorded::BlendEnables: {
+        VkBool32 enables[4];
+        const uint32_t words = value(enables);
+        set_blend_enable_(c, 0, 4, enables);
+        return words;
+    }
+    case Recorded::BlendEquations: {
+        VkColorBlendEquationEXT equations[4];
+        const uint32_t words = value(equations);
+        set_blend_equation_(c, 0, 4, equations);
+        return words;
+    }
+    case Recorded::WriteMasks: {
+        VkColorComponentFlags masks[4];
+        const uint32_t words = value(masks);
+        set_write_mask_(c, 0, 4, masks);
+        return words;
+    }
+    case Recorded::LineWidth: {
+        float width;
+        const uint32_t words = value(width);
+        vkCmdSetLineWidth(c, width);
+        return words;
+    }
+    case Recorded::DepthBias: {
+        Recorded::Bias bias;
+        const uint32_t words = value(bias);
+        vkCmdSetDepthBias(c, bias.constant, 0.0f, bias.slope);
+        return words;
+    }
+    case Recorded::DepthBiasExact: {
+        // (a float depth format's unit is forced to a 24-bit unorm one's)
+        Recorded::Bias from;
+        const uint32_t words = value(from);
+        VkDepthBiasRepresentationInfoEXT representation{VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT};
+        representation.depthBiasRepresentation =
+            from.host_float ? VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT
+                            : VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
+        representation.depthBiasExact = VK_TRUE;
+        VkDepthBiasInfoEXT bias{VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, &representation};
+        bias.depthBiasConstantFactor = from.constant;
+        bias.depthBiasSlopeFactor = from.slope;
+        vkCmdSetDepthBias2EXT(c, &bias);
+        return words;
+    }
+    case Recorded::BeginConditional: {
+        Recorded::Place place;
+        const uint32_t words = value(place);
+        VkConditionalRenderingBeginInfoEXT conditional{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+        conditional.buffer = place.buffer;
+        conditional.offset = place.at;
+        vkCmdBeginConditionalRenderingEXT(c, &conditional);
+        return words;
+    }
+    case Recorded::EndConditional: vkCmdEndConditionalRenderingEXT(c); return 0;
+    case Recorded::Draw: vkCmdDraw(c, a[0], 1, 0, 0); return 1;
+    case Recorded::DrawIndexed: vkCmdDrawIndexed(c, a[0], 1, a[1], 0, 0); return 2;
+    case Recorded::CommandBuffer:
+    case Recorded::Wrap:
+    case Recorded::Quit: break; // (the recording thread's own)
+    }
+    return 0;
+}
+
+// The recording thread: the ring's commands into their command buffer as
+// they come; it spins a little while none do (a frame's draws come a few
+// microseconds apart), then sleeps until the next.
+void Impl::recorder_loop() {
+    uint32_t tail = 0;
+    VkCommandBuffer c = VK_NULL_HANDLE;
+    for (;;) {
+        uint32_t head = recorded_head_.load(std::memory_order_acquire);
+        if (head == tail) {
+            for (uint32_t spins = 0; spins < 2000 && head == tail; spins++) {
+                spin_pause();
+                head = recorded_head_.load(std::memory_order_acquire);
+            }
+            if (head == tail) {
+                recorder_asleep_.store(true);
+                recorded_head_.wait(tail);
+                recorder_asleep_.store(false);
+                continue;
+            }
+        }
+        while (tail != head) {
+            const uint32_t at = tail & (RECORDED - 1);
+            const uint32_t *r = &recorded_[at];
+            if (r[0] == Recorded::Quit) return;
+            if (r[0] == Recorded::Wrap) {
+                tail += RECORDED - at;
+            } else if (r[0] == Recorded::CommandBuffer) {
+                std::memcpy(&c, r + 1, sizeof(c));
+                tail += 3;
+            } else {
+                tail += 1 + run_recorded(c, r);
+            }
+        }
+        recorded_tail_.store(tail, std::memory_order_release);
+    }
+}
+
+void Impl::begin_recording() {
     Slot &s = slots_[current_];
     if (!s.recording) {
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(s.cmd, &begin);
         s.recording = true;
+        drawn_at_submission_ = report_.drawn;
         s.serial = next_serial_++;
-        s.used = 0;
+        s.used = 0, s.draw_used = 0;
         s.readback = 0, s.readback_used = 0;
         in_pass_ = false;
         bound_pipeline_ = VK_NULL_HANDLE;
+        draw_state_valid_ = false;
         last_constants_at_[0] = last_constants_at_[1] = last_system_at_ = last_fsi_at_ = NONE;
         if (s.queries) {
             vkCmdResetQueryPool(s.cmd, s.queries, 0, TIMESTAMPS);
@@ -2337,8 +4532,15 @@ VkCommandBuffer Impl::cmd() {
             full_barrier(s.cmd);
         }
         s.occlusion_used = 0;
+        // the screen extents' share its last submission used zeroed
+        if (s.extents_used) {
+            vkCmdFillBuffer(s.cmd, extents_.buffer, VkDeviceSize(current_) * EXTENT_REPORTS * 16,
+                            VkDeviceSize(s.extents_used) * 16, 0);
+            full_barrier(s.cmd);
+        }
+        s.extents_used = 0;
+        s.extent_reports.clear();
     }
-    return s.cmd;
 }
 
 void Impl::gpu_mark(uint32_t kind) {
@@ -2381,6 +4583,7 @@ std::string Impl::target_name(const RenderTarget &t) const {
 void Impl::flush() {
     Slot &s = slots_[current_];
     if (!s.recording) return;
+    record_sync();
     end_pass();
     if (fsi_ && !s.occlusion_reports.empty()) {
         // the interlock path's occlusion counts, for zpd_collect
@@ -2398,20 +4601,58 @@ void Impl::flush() {
         dep.pMemoryBarriers = &b;
         vkCmdPipelineBarrier2(s.cmd, &dep);
     }
+    if (!s.extent_reports.empty()) {
+        // the screen extents' atomics, for extent_collect
+        full_barrier(s.cmd);
+        VkDeviceSize at = VkDeviceSize(current_) * EXTENT_REPORTS * 16;
+        VkBufferCopy copy{at, at, VkDeviceSize(s.extent_reports.size()) * 16};
+        vkCmdCopyBuffer(s.cmd, extents_.buffer, extents_readback_.buffer, 1, &copy);
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(s.cmd, &dep);
+    }
     if (s.queries && !s.marks.empty()) {
         vkCmdWriteTimestamp2(s.cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.queries, uint32_t(s.marks.size()));
         s.marks.push_back(GPU_END);
     }
+    if (!barrier_generic_) {
+        // what the submission wrote, for the host's reads once it is done (the
+        // read-backs' buffers): full_barrier's accesses leave the host's out
+        VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = BARRIER_WRITES;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+        b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+        VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dep.memoryBarrierCount = 1;
+        dep.pMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(s.cmd, &dep);
+    }
     vkEndCommandBuffer(s.cmd);
     s.recording = false;
+    VkCommandBuffer buffers[2] = {s.cmd, VK_NULL_HANDLE};
+    uint32_t buffer_count = 1;
+    if (s.pre_recording) {
+        // the uploads seen by everything after them
+        full_barrier(s.pre);
+        vkEndCommandBuffer(s.pre);
+        s.pre_recording = false;
+        buffers[0] = s.pre, buffers[1] = s.cmd, buffer_count = 2;
+    }
     {
         Timer timer(report_.submit_seconds);
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &s.cmd;
+        submit.commandBufferCount = buffer_count;
+        submit.pCommandBuffers = buffers;
         vkResetFences(dev_, 1, &s.fence);
         if (VkResult r = d_.submit(1, &submit, s.fence); r != VK_SUCCESS)
-            fatal_ = "a submission failed (" + std::to_string(r) + ")";
+            fatal_ = "a submission failed (" + std::to_string(r) + ")" + lost_device_report(r);
     }
     report_.submissions++;
     current_ = (current_ + 1) % SLOTS;
@@ -2433,7 +4674,7 @@ bool Impl::finish_oldest(bool wait) {
         status = vkWaitForFences(dev_, 1, &oldest->fence, VK_TRUE, 20'000'000'000ull);
     }
     if (status != VK_SUCCESS) {
-        fatal_ = "waiting for the GPU failed (" + std::to_string(status) + ")";
+        fatal_ = "waiting for the GPU failed (" + std::to_string(status) + ")" + lost_device_report(status);
         return false;
     }
     finish(*oldest);
@@ -2445,6 +4686,7 @@ bool Impl::finish_oldest(bool wait) {
 void Impl::finish(Slot &s) {
     gpu_collect(s);
     zpd_collect(s);
+    extent_collect(s, uint32_t(&s - slots_));
     for (auto &f : s.after) f();
     s.after.clear();
     done_serial_ = s.serial;
@@ -2463,9 +4705,22 @@ void Impl::wait_serial(uint64_t serial) {
 }
 
 VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4], RenderTarget *depth) {
+    // (the pass under way: the draw's commands go to the recording thread, nothing waited for)
+    if (in_pass_ && pass_ == pass) return slots_[current_].cmd;
     VkCommandBuffer c = cmd();
-    if (in_pass_ && pass_ == pass) return c;
     end_pass();
+    // a target's kept clears (pending_clears) beyond this pass's area drawn
+    // before it, the rest in it once it begins
+    for (RenderTarget *t : {colors[0], colors[1], colors[2], colors[3], depth}) {
+        if (!t) continue;
+        for (const auto &[clear, rect] : t->pending_clears)
+            if (rect.rect.offset.x < 0 || rect.rect.offset.y < 0 ||
+                uint64_t(rect.rect.offset.x) + rect.rect.extent.width > pass.width ||
+                uint64_t(rect.rect.offset.y) + rect.rect.extent.height > pass.height) {
+                flush_clears(t);
+                break;
+            }
+    }
     full_barrier(c);
     VkRenderingAttachmentInfo attachments[4] = {};
     for (uint32_t i = 0; i < 4; i++) {
@@ -2496,21 +4751,89 @@ VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4]
         if (depth) kind += " " + target_name(*depth);
         gpu_mark(kind);
     }
+    // a kept clear over the whole render area as the attachment's load
+    // operation (the driver's fast clear, as Xenia's ClearRenderTargetView
+    // gets): the last such one, the kept clears before it dropped (it
+    // covers them), those after drawn in the pass
+    static const bool clear_load_op = [] {
+        const char *v = std::getenv("XF_CLEAR_LOAD_OP");
+        return !(v && v[0] == '0');
+    }();
+    for (uint32_t i = 0; i < 5 && clear_load_op; i++) {
+        RenderTarget *t = i < 4 ? colors[i] : depth;
+        if (!t || t->pending_clears.empty()) continue;
+        for (size_t j = t->pending_clears.size(); j-- > 0;) {
+            const auto &[clear, rect] = t->pending_clears[j];
+            if (rect.rect.offset.x || rect.rect.offset.y || rect.rect.extent.width != pass.width ||
+                rect.rect.extent.height != pass.height)
+                continue;
+            VkRenderingAttachmentInfo &a = i < 4 ? attachments[i] : depth_attachment;
+            a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            a.clearValue = clear.clearValue;
+            t->pending_clears.erase(t->pending_clears.begin(), t->pending_clears.begin() + ptrdiff_t(j) + 1);
+            break;
+        }
+    }
     vkCmdBeginRendering(c, &rendering_info);
+    if (depth) depth->samples_unsettled = true;
     in_pass_ = true;
     pass_ = pass;
+    for (uint32_t i = 0; i < 5; i++) {
+        RenderTarget *t = i < 4 ? colors[i] : depth;
+        if (!t || t->pending_clears.empty()) continue;
+        // (timed with the pass's draws)
+        for (auto [clear, rect] : t->pending_clears) {
+            clear.colorAttachment = i < 4 ? i : 0;
+            vkCmdClearAttachments(c, 1, &clear, 1, &rect);
+        }
+        t->pending_clears.clear();
+    }
     return c;
 }
 
 // ---- the arena ----
 
 VkDeviceSize Impl::arena_take(VkDeviceSize bytes, VkDeviceSize align) {
-    cmd();
+    begin_recording();
     Slot &s = slots_[current_];
     VkDeviceSize at = (s.used + align - 1) / align * align;
     if (at + bytes > ARENA_SLOT) return NONE;
     s.used = at + bytes;
     return VkDeviceSize(current_) * ARENA_SLOT + at;
+}
+
+bool Impl::index_cache_place(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &at) {
+    if (index_chunks_.empty() || index_chunks_.back().used + bytes > INDEX_CHUNK) {
+        IndexChunk chunk;
+        chunk.buffer = d_.create_buffer(INDEX_CHUNK, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, true);
+        if (!chunk.buffer.buffer) return false;
+        index_chunks_.push_back(chunk);
+    }
+    IndexChunk &chunk = index_chunks_.back();
+    buffer = chunk.buffer.buffer, at = chunk.used;
+    chunk.used += (bytes + 3) & ~VkDeviceSize(3);
+    return true;
+}
+
+void Impl::index_cache_drop() {
+    // (draws recorded so far read the buffers: they outlive the submission)
+    begin_recording();
+    for (IndexChunk &chunk : index_chunks_)
+        slots_[current_].after.push_back([this, buffer = chunk.buffer]() mutable { d_.destroy(buffer); });
+    index_chunks_.clear();
+    index_cache_.clear();
+    std::fill(index_front_.begin(), index_front_.end(), nullptr);
+    index_cache_words_ = 0;
+}
+
+VkDeviceSize Impl::draw_data_take(VkDeviceSize bytes, VkDeviceSize align) {
+    if (!draw_data_.buffer) return arena_take(bytes, align);
+    begin_recording();
+    Slot &s = slots_[current_];
+    VkDeviceSize at = (s.draw_used + align - 1) / align * align;
+    if (at + bytes > DRAW_DATA_SLOT) return NONE;
+    s.draw_used = at + bytes;
+    return VkDeviceSize(current_) * DRAW_DATA_SLOT + at;
 }
 
 uint8_t *Impl::staging(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &offset) {
@@ -2524,14 +4847,14 @@ uint8_t *Impl::staging(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &offse
         fatal_ = "could not make a staging buffer";
         return nullptr;
     }
-    cmd();
+    begin_recording();
     slots_[current_].after.push_back([this, own]() mutable { d_.destroy(own); });
     buffer = own.buffer, offset = 0;
     return static_cast<uint8_t *>(own.mapped);
 }
 
 uint8_t *Impl::readback(VkDeviceSize bytes, VkBuffer &buffer, VkDeviceSize &offset) {
-    cmd();
+    begin_recording();
     Slot &s = slots_[current_];
     bytes = (bytes + 15) & ~VkDeviceSize(15);
     for (; s.readback < s.readbacks.size(); s.readback++, s.readback_used = 0) {
@@ -2608,12 +4931,21 @@ std::vector<Range> Impl::cpu_parts(const std::vector<Range> &ranges) const {
 // write after the watch numbers its page above it, so the copy is seen to be
 // old). Pages the GPU holds are current and keep its bytes. The bytes
 // uploaded.
-VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
+VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) {
     if (ranges.empty()) return 0;
-    traced(cpu_parts(ranges));
+    if (trace_) traced(cpu_parts(ranges));
+    const uint32_t count_before = mem_.write_count();
+    if (memo && memo->epoch == mirror_epoch_ && memo->count == count_before && memo->ranges == ranges) {
+        if (hoisted_uploads_ && memo->used_serial != submission_serial()) {
+            mark_used(ranges);
+            memo->used_serial = submission_serial();
+        }
+        return 0;
+    }
     // runs of pages to give, [first, end); a page taken is marked current
     // (UINT32_MAX) until the count is known, so ranges sharing it give it once
-    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    std::vector<std::pair<uint32_t, uint32_t>> &runs = request_runs_; // (kept for its room)
+    runs.clear();
     for (const Range &r : ranges) {
         if (r.second <= r.first) continue;
         for (uint32_t p = first_page(r); p <= last_page(r); p++) {
@@ -2625,7 +4957,11 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
                 runs.push_back({p, p + 1});
         }
     }
-    if (runs.empty()) return 0;
+    if (runs.empty()) {
+        mark_used(ranges);
+        if (memo) *memo = {ranges, count_before, mirror_epoch_, submission_serial()};
+        return 0;
+    }
     for (auto [first, end] : runs) mem_.watch(first << page_shift_, (end - first) << page_shift_);
     uint32_t count = mem_.write_count();
     VkDeviceSize total = 0;
@@ -2635,25 +4971,65 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
     uint8_t *data = staging(total, from, at);
     if (!data) {
         for (auto [first, end] : runs) std::fill(mirror_at_.begin() + first, mirror_at_.begin() + end, 0u);
+        mirror_epoch_++;
         return 0;
     }
-    std::vector<VkBufferCopy> copies;
+    // runs of pages the submission has not used go ahead of it (pre_cmd)
+    std::vector<VkBufferCopy> &copies = request_copies_, &ahead = request_ahead_;
+    copies.clear(), ahead.clear();
+    const uint64_t serial = submission_serial();
     VkDeviceSize offset = 0;
     for (auto [first, end] : runs) {
         uint32_t start = first << page_shift_;
         VkDeviceSize bytes = VkDeviceSize(end - first) << page_shift_;
         std::memcpy(data + offset, memory_.data() + start, bytes);
-        copies.push_back({at + offset, start, bytes});
+        bool unused = hoisted_uploads_;
+        for (uint32_t p = first; p < end && unused; p++) unused = p >= page_used_.size() || page_used_[p] != serial;
+        (unused ? ahead : copies).push_back({at + offset, start, bytes});
         offset += bytes;
         for (uint32_t p = first; p < end; p++) {
             mirror_at_[p] = count;
             set_gpu_page(p, false);
         }
     }
-    VkCommandBuffer c = outside();
-    gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
-    vkCmdCopyBuffer(c, from, mirror_.buffer, uint32_t(copies.size()), copies.data());
+    if (!ahead.empty()) vkCmdCopyBuffer(pre_cmd(), from, mirror_.buffer, uint32_t(ahead.size()), ahead.data());
+    if (!copies.empty()) {
+        VkCommandBuffer c = outside();
+        gpu_mark("other (barriers, uploads into the mirror, clears of new targets)");
+        vkCmdCopyBuffer(c, from, mirror_.buffer, uint32_t(copies.size()), copies.data());
+    }
+    mark_used(ranges);
+    // (every page of the ranges current as of count, while nothing is
+    // written after it: those just given, and the rest found current above
+    // if nothing was written since that check either)
+    if (memo && count == count_before) *memo = {ranges, count, mirror_epoch_, serial};
     return total;
+}
+
+void Impl::mark_used(const std::vector<Range> &ranges) {
+    if (!hoisted_uploads_) return;
+    const uint64_t serial = submission_serial();
+    if (page_used_.size() < mirror_at_.size()) page_used_.resize(mirror_at_.size(), 0);
+    for (const Range &r : ranges) {
+        if (r.second <= r.first) continue;
+        for (uint32_t p = first_page(r); p <= last_page(r) && p < page_used_.size(); p++) page_used_[p] = serial;
+    }
+}
+
+// The slot's command buffer that runs ahead of its submission, begun with a
+// barrier after everything submitted before (whose draws may still read
+// what it overwrites)
+VkCommandBuffer Impl::pre_cmd() {
+    cmd(); // (the same pool as the command buffer the recording thread records: waited for)
+    Slot &s = slots_[current_];
+    if (!s.pre_recording) {
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(s.pre, &begin);
+        s.pre_recording = true;
+        full_barrier(s.pre);
+    }
+    return s.pre;
 }
 
 // The GPU wrote the ranges in the mirror (a resolve, a memory export; Xenia's
@@ -2661,6 +5037,7 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges) {
 // until the CPU writes them, so they are watched. What else those pages hold
 // was made current before (request).
 void Impl::gpu_written(const std::vector<Range> &ranges) {
+    mark_used(ranges);
     std::vector<std::pair<uint32_t, uint32_t>> runs;
     for (const Range &r : ranges) {
         if (r.second <= r.first) continue;
@@ -2687,8 +5064,7 @@ bool Impl::unwritten(Texture &t) {
     if (count == t.checked) return true;
     for (const Range &r : t.ranges) {
         if (r.second <= r.first) continue;
-        for (uint32_t p = first_page(r); p <= last_page(r); p++)
-            if (stamps_[p].load(std::memory_order_acquire) > t.checked) return false;
+        if (!pages_unwritten(first_page(r), last_page(r), t.checked)) return false;
     }
     t.checked = count;
     return true;
@@ -2779,6 +5155,7 @@ void Impl::export_ranges(const Shader &s, uint32_t stage, std::vector<Range> &ra
 void Impl::end_export(const std::vector<Range> &pages) {
     if (pages.empty()) return;
     end_pass();
+    drop_scaled_resolves(pages);
     gpu_written(pages);
     textures_written_by_gpu(pages);
 }
@@ -2805,7 +5182,7 @@ void Impl::unindex_texture(Texture &t) {
     t.bucket_first = 1, t.bucket_last = 0;
 }
 
-void Impl::textures_written_by_gpu(const std::vector<Range> &written) {
+void Impl::textures_written_by_gpu(const std::vector<Range> &written, Texture *const written_too[2]) {
     uint32_t low = UINT32_MAX, high = 0;
     for (const Range &r : written)
         if (r.second > r.first) low = std::min(low, r.first), high = std::max(high, r.second);
@@ -2814,7 +5191,9 @@ void Impl::textures_written_by_gpu(const std::vector<Range> &written) {
     for (uint32_t b = first; b <= last; b++)
         for (Texture *t : texture_buckets_[b]) {
             // each texture once: in the first bucket both it and the write span
-            if (b != std::max(first, t->bucket_first)) continue;
+            if (b != std::max(first, t->bucket_first) ||
+                (written_too && (t == written_too[0] || t == written_too[1])))
+                continue;
             if (t->high <= low || t->low >= high || (t->stale && t->load_why == LoadWhy::GpuWritten)) continue;
             bool hit = false;
             for (const Range &r : written) {
@@ -2825,7 +5204,10 @@ void Impl::textures_written_by_gpu(const std::vector<Range> &written) {
                     }
                 if (hit) break;
             }
-            if (hit) t->stale = true, t->load_why = LoadWhy::GpuWritten;
+            if (hit) {
+                t->stale = true, t->load_why = LoadWhy::GpuWritten;
+                if (refusal_detail_) t->stale_by = stale_by_;
+            }
         }
 }
 
@@ -2839,6 +5221,35 @@ void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
         s = std::make_unique<Shader>();
         s->parsed = xf::ucode::parse_shader(type == 0 ? xf::ucode::ShaderType::Vertex : xf::ucode::ShaderType::Pixel, code);
         s->summary = xf::ucode::analyze(code);
+        for (uint32_t slot : s->summary.texture_slots)
+            if (slot < 64) {
+                s->texture_mask |= 1ull << slot;
+                if (slot < 32) s->fetch_blocks |= 1u << (slot * 6 / 32) | 1u << ((slot * 6 + 5) / 32);
+            }
+        for (uint32_t slot : s->summary.vertex_slots)
+            if (slot < 128) {
+                s->vertex_mask[slot >> 6] |= 1ull << (slot & 63);
+                if (slot < 96) s->fetch_blocks |= 1u << (slot * 2 / 32);
+            }
+        // the float constants read (every ALU operand of every exec, reached or not)
+        s->float_blocks = 0;
+        for (const xf::ucode::ControlFlow &cf : s->parsed.control_flow) {
+            const auto *exec = std::get_if<xf::ucode::Exec>(&cf.instruction);
+            if (!exec) continue;
+            for (const xf::ucode::ExecSlot &slot : exec->slots) {
+                const auto *alu = std::get_if<xf::ucode::AluInstruction>(&slot.instruction);
+                if (!alu) continue;
+                auto read = [&](const xf::ucode::Operand &o) {
+                    if (o.source != xf::ucode::StorageSource::ConstantFloat) return;
+                    if (o.addressing != xf::ucode::StorageAddressing::Absolute)
+                        s->float_blocks = 0xFFFFFFFFu;
+                    else if (o.index < 256)
+                        s->float_blocks |= 1u << (o.index / 8);
+                };
+                for (uint32_t k = 0; k < alu->vector_operand_count && k < 3; k++) read(alu->vector_operands[k]);
+                for (uint32_t k = 0; k < alu->scalar_operand_count && k < 2; k++) read(alu->scalar_operands[k]);
+            }
+        }
         s->hash = hash;
         report_.shaders++;
         if (storage_ && storage_->add_shader(type, hash, code)) report_.shaders_stored++;
@@ -2854,6 +5265,7 @@ void Impl::load_shader(uint32_t type, std::span<const uint32_t> code) {
     }
     (type == 0 ? vertex_hash_ : pixel_hash_) = hash;
     (type == 0 ? have_vertex_ : have_pixel_) = true;
+    (type == 0 ? vertex_shader_ : pixel_shader_) = s.get();
 }
 
 Shader *Impl::shader(uint64_t hash) {
@@ -2861,10 +5273,10 @@ Shader *Impl::shader(uint64_t hash) {
     return it == shaders_.end() ? nullptr : it->second.get();
 }
 
-bool Impl::translate(Shader &s, std::string &why) {
-    if (!s.translated) {
-        s.translated = true;
-        bool pixel = s.parsed.type == xf::ucode::ShaderType::Pixel;
+// what the draws read of a shader's microcode, once
+void Impl::analyze(Shader &s) {
+    if (!s.analyzed) {
+        s.analyzed = true;
         for (const xf::ucode::ControlFlow &cf : s.parsed.control_flow) {
             const auto *e = std::get_if<xf::ucode::Exec>(&cf.instruction);
             if (!e) continue;
@@ -2876,6 +5288,7 @@ bool Impl::translate(Shader &s, std::string &why) {
                             s.colors_written |= 1u << (r->index & 3);
                         if (r->target == xf::ucode::StorageTarget::Depth && mask) s.writes_depth = true;
                         if (r->target == xf::ucode::StorageTarget::Position) {
+                            s.writes_position_xz |= mask & 5;
                             s.writes_position_y |= (mask & 2) != 0;
                             s.writes_position_w |= (mask & 8) != 0;
                         }
@@ -2888,71 +5301,125 @@ bool Impl::translate(Shader &s, std::string &why) {
                     if (uint32_t c = a->memexport_stream_constant(); c != UINT32_MAX) s.stream_constants.insert(c);
                 } else if (const auto *t = std::get_if<xf::ucode::TextureFetchInstruction>(&slot.instruction)) {
                     if (t->has_result()) s.fetches_textures = true;
-                    if (t->opcode == xf::ucode::FetchOpcode::TextureFetch && !s.filters.count(t->operands[1].index))
+                    if (t->opcode == xf::ucode::FetchOpcode::TextureFetch && !s.filters.count(t->operands[1].index)) {
                         s.filters[t->operands[1].index] = {uint32_t(t->mag_filter), uint32_t(t->min_filter),
                                                            uint32_t(t->mip_filter), uint32_t(t->aniso_filter)};
+                        if (t->operands[1].index < 32) {
+                            s.filter_mask |= 1u << t->operands[1].index;
+                            s.slot_filters[t->operands[1].index] = s.filters[t->operands[1].index];
+                        }
+                    }
                 }
             }
         }
-        shader::Translation t = shader::translate(s.parsed, pixel ? shader::Stage::Pixel : shader::Stage::Vertex);
-        s.approximate = t.approximate;
-        if (!t.ok()) {
-            s.unsupported = t.unsupported.empty() ? "the translator wrote nothing" : t.unsupported.front();
-        } else {
-            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            info.codeSize = t.spirv.size() * 4;
-            info.pCode = t.spirv.data();
-            if (vkCreateShaderModule(dev_, &info, nullptr, &s.module) != VK_SUCCESS)
-                s.unsupported = "vkCreateShaderModule failed";
-            else
-                module_names_[s.module] = {1, 0, s.hash};
-        }
     }
+}
+
+// A shader's form (0 its first; a vertex form's key, or a pixel form's key
+// with bit 31), translated here, or with `pending` given and a form the
+// generic shaders draw (Impl::translate_later) on the translation workers,
+// pending set while it is (docs/renderer.md, "The translation off the
+// renderer's thread"). Null when it cannot be made (or is pending).
+VkShaderModule Impl::form_module(Shader &s, uint32_t key, const shader::VertexOptions &vertex,
+                                 const shader::PixelOptions &pixel, bool *pending) {
+    if (!key && s.translated) return s.module;
+    if (key) {
+        auto it = s.variants.find(key);
+        if (it != s.variants.end()) return it->second;
+    }
+    const bool is_pixel = s.parsed.type == xf::ucode::ShaderType::Pixel;
+    shader::VertexOptions v = vertex;
+    shader::PixelOptions p = pixel;
+    v.texture_point_snap = p.texture_point_snap = point_snap_;
+    if (pending && translate_later(s, key)) {
+        if (s.translating.insert(key).second)
+            translation_workers_->queue({&s, key, is_pixel, v, p});
+        *pending = true;
+        return VK_NULL_HANDLE;
+    }
+    shader::Translation t;
+    {
+        TranslateTimer timer(report_);
+        t = shader::translate(s.parsed, is_pixel ? shader::Stage::Pixel : shader::Stage::Vertex, v, p);
+    }
+    return finish_form(s, key, t);
+}
+
+// A form's translation made into its module and kept (here or from the
+// translation workers)
+VkShaderModule Impl::finish_form(Shader &s, uint32_t key, const shader::Translation &t) {
+    s.translating.erase(key);
+    VkShaderModule m = VK_NULL_HANDLE;
+    std::string failure = t.unsupported.empty() ? "the translator wrote nothing" : t.unsupported.front();
+    if (t.ok()) {
+        VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        info.codeSize = t.spirv.size() * 4;
+        info.pCode = t.spirv.data();
+        if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) {
+            m = VK_NULL_HANDLE;
+            failure = "vkCreateShaderModule failed";
+        }
+        if (m) module_names_[m] = {1, key, s.hash}, module_content_[m] = ShaderStorage::hash(0, t.spirv);
+    }
+    if (!key) {
+        s.translated = true;
+        s.module = m;
+        s.approximate = t.approximate;
+        if (!m) s.unsupported = failure;
+    } else {
+        s.variants[key] = m;
+    }
+    return m;
+}
+
+// whether a form is translated on the workers: with them (async pipelines
+// with the generic shaders and pipeline libraries), for a form the generic
+// shaders draw (a vertex shader's plain host form; a pixel shader's form
+// without the float24 conversion), of a shader they run
+bool Impl::translate_later(Shader &s, uint32_t key) {
+    if (!translation_workers_) return false;
+    if (s.parsed.type == xf::ucode::ShaderType::Pixel ? (key & 3) != 0 : (key & 0xFF) != 0) return false;
+    std::string why;
+    return program(s, why);
+}
+
+// the translations the workers finished, kept
+void Impl::collect_translations() {
+    if (!translation_workers_) return;
+    std::vector<TranslationWorkers::Done> done;
+    translation_workers_->take(done);
+    for (TranslationWorkers::Done &d : done) {
+        report_.translations_async++;
+        report_.translate_async_seconds += d.seconds;
+        // (made meanwhile here: kept as it is)
+        if (d.key ? d.shader->variants.count(d.key) != 0 : d.shader->translated) {
+            d.shader->translating.erase(d.key);
+            continue;
+        }
+        finish_form(*d.shader, d.key, d.translation);
+    }
+}
+
+bool Impl::translate(Shader &s, std::string &why, bool *pending) {
+    analyze(s);
+    if (!s.translated) form_module(s, 0, {}, {}, pending);
     if (!s.unsupported.empty()) why = s.unsupported;
     return s.unsupported.empty();
 }
 
 // a pixel shader's other forms (shader::PixelOptions), made as draws ask for
 // them, kept among its variants above the vertex forms' keys
-VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why) {
-    uint32_t key = options.key();
-    if (!key) return s.module;
-    key |= 1u << 31;
-    auto it = s.variants.find(key);
-    if (it == s.variants.end()) {
-        VkShaderModule m = VK_NULL_HANDLE;
-        shader::Translation t = shader::translate(s.parsed, shader::Stage::Pixel, {}, options);
-        if (t.ok()) {
-            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            info.codeSize = t.spirv.size() * 4;
-            info.pCode = t.spirv.data();
-            if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
-            if (m) module_names_[m] = {1, key, s.hash};
-        }
-        it = s.variants.emplace(key, m).first;
-    }
-    if (!it->second) why = "its float24 depth, centroid or interlock form could not be made";
-    return it->second;
+VkShaderModule Impl::pixel_module(Shader &s, const shader::PixelOptions &options, std::string &why, bool *pending) {
+    const uint32_t key = options.key() ? options.key() | 1u << 31 : 0;
+    VkShaderModule m = form_module(s, key, {}, options, pending);
+    if (!m && !(pending && *pending)) why = "its float24 depth, centroid or interlock form could not be made";
+    return m;
 }
 
-VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why) {
-    uint32_t key = options.key();
-    if (!key) return s.module; // HostVertex::Vertex without clip planes
-    auto it = s.variants.find(key);
-    if (it == s.variants.end()) {
-        VkShaderModule m = VK_NULL_HANDLE;
-        shader::Translation t = shader::translate(s.parsed, shader::Stage::Vertex, options);
-        if (t.ok()) {
-            VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            info.codeSize = t.spirv.size() * 4;
-            info.pCode = t.spirv.data();
-            if (vkCreateShaderModule(dev_, &info, nullptr, &m) != VK_SUCCESS) m = VK_NULL_HANDLE;
-            if (m) module_names_[m] = {1, key, s.hash};
-        }
-        it = s.variants.emplace(key, m).first;
-    }
-    if (!it->second) why = "its host form could not be made";
-    return it->second;
+VkShaderModule Impl::vertex_module(Shader &s, const shader::VertexOptions &options, std::string &why, bool *pending) {
+    VkShaderModule m = form_module(s, options.key(), options, {}, pending);
+    if (!m && !(pending && *pending)) why = "its host form could not be made";
+    return m;
 }
 
 // ---- render targets: EDRAM as host images, one per base, pitch, samples and format ----
@@ -3029,6 +5496,8 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     uint32_t rows = std::max(1u, (EDRAM_TILES - std::min(base, EDRAM_TILES - 1)) / pitch_tiles);
     t->width = std::clamp(pitch, 1u, 8192u);
     t->height = std::clamp(rows * tile_height, 1u, 8192u);
+    t->host_width = std::min(scale_.up(t->width), max_image_);
+    t->host_height = std::min(scale_.up(t->height), max_image_);
     t->wide = bytes == 8;
     t->tile_width = tile_width, t->tile_height = tile_height;
     t->pitch_tiles = pitch_tiles;
@@ -3054,8 +5523,11 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
              (msaa && !(integer_samples_ & samples))))
             raw_format = VK_FORMAT_UNDEFINED;
     }
-    t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->width, t->height, 1}, 1, 1, samples, usage,
-                               raw_format != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+    // (a multisampled depth target drawn at sample positions of our own must say so)
+    VkImageCreateFlags image_flags = raw_format != VK_FORMAT_UNDEFINED ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+    if (depth && xenos_at(msaa)) image_flags |= VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+    t->image = d_.create_image(VK_IMAGE_TYPE_2D, vk_format, {t->host_width, t->host_height, 1}, 1, 1, samples, usage,
+                               image_flags);
     if (!t->image.image) {
         fatal_ = "could not make a render target";
         return nullptr;
@@ -3114,34 +5586,120 @@ RenderTarget *Impl::render_target(bool depth, uint32_t base, uint32_t pitch, uin
     report_.render_targets++;
     if (options_.verbose)
         std::fprintf(stderr, "  render target: %s base %u pitch %u msaa %u format %u -> %ux%u\n", depth ? "depth" : "color",
-                     base, pitch, msaa, format, t->width, t->height);
+                     base, pitch, msaa, format, t->host_width, t->host_height);
     return (targets_[key] = std::move(t)).get();
 }
 
 // ---- EDRAM: tiles change hands between render targets ----
 
 // The target takes over the tiles of its first `rows` pixel rows: those
-// another target holds are stored into EDRAM by their holder, then all it
-// did not hold are loaded from EDRAM, as Xenia's ownership transfers do.
-void Impl::acquire(RenderTarget *t, uint32_t rows) {
-    uint32_t tile_rows = std::min((rows + t->tile_height - 1) / t->tile_height, t->height / t->tile_height);
-    uint32_t count = std::min(tile_rows * t->pitch_tiles, EDRAM_TILES);
-    std::vector<uint32_t> needed;
+// another target holds are drawn into it from their holder (edram_transfer),
+// and those no target holds are loaded from EDRAM, as Xenia's ownership
+// transfers do. (XF_EDRAM_TRANSFERS=store: the holders store theirs into
+// EDRAM first, then all are loaded from there.)
+void Impl::acquire(RenderTarget *t, uint32_t rows, const DepthOverwrite *overwritten) {
+    const TileRect whole_rows = tiles_of(*t, 0, 0, t->pitch_tiles * t->tile_width, rows);
+    acquire(t, std::span<const TileRect>(&whole_rows, 1), overwritten);
+}
+
+// The same for the tiles of these rectangles of the target's tiles (a draw's
+// reach, a resolve's rectangle). `overwritten`: the draw this is for writes
+// the depth of every sample of the pixels it names (Impl::depth_overwrite),
+// so the tiles wholly inside them need not be read from their holders.
+void Impl::acquire(RenderTarget *t, std::span<const TileRect> rects, const DepthOverwrite *overwritten) {
+    // (it held them at its last draw and no tile changed hands since)
+    const bool known = t->owned_epoch == owners_epoch_;
+    if (known && std::all_of(rects.begin(), rects.end(), [&](const TileRect &r) { return r.empty() || r.within(t->owned); }))
+        return;
+    // the tiles, as the target numbers them from its base, in order (once
+    // each: a draw's rectangles may share some), within EDRAM's 2048
+    std::vector<uint32_t> &wanted = acquire_tiles_;
+    wanted.clear();
+    uint32_t bottom_row = 0;
+    for (const TileRect &r : rects) {
+        if (r.empty()) continue;
+        bottom_row = std::max(bottom_row, r.r1);
+        for (uint32_t row = r.r0; row < r.r1; row++)
+            for (uint32_t column = r.c0; column < r.c1; column++)
+                if (row * t->pitch_tiles + column < EDRAM_TILES) wanted.push_back(row * t->pitch_tiles + column);
+    }
+    if (rects.size() > 1) {
+        std::sort(wanted.begin(), wanted.end());
+        wanted.erase(std::unique(wanted.begin(), wanted.end()), wanted.end());
+    }
+    // (kept for their room: thousands of calls a frame)
+    std::vector<uint32_t> &needed = acquire_needed_, &unheld = acquire_unheld_;
+    needed.clear(), unheld.clear();
     std::map<RenderTarget *, std::vector<uint32_t>> held;
-    for (uint32_t k = 0; k < count; k++) {
+    uint32_t taken_unread = 0;
+    for (uint32_t k : wanted) {
         uint32_t tile = (t->base + k) % EDRAM_TILES;
         if (owners_[tile] == t) continue;
         needed.push_back(tile);
-        if (owners_[tile]) held[owners_[tile]].push_back(tile);
+        // (the draw this is for writes every sample of the tile whatever it
+        // holds: taken as it is, nothing read from its holder or from EDRAM)
+        if (overwritten && tile_within(*t, tile, *overwritten)) {
+            if (overwritten->whole && overwrite_transfers_) {
+                tile_cleared_[tile] = 0, tile_stencil_[tile] = -1;
+                taken_unread++;
+                continue;
+            }
+            // (the draw writes the depth of every sample of the tile, and
+            // all of them have one stencil: any depth with that stencil
+            // will do, so the tile is taken as a clear to the draw's own)
+            if (!overwritten->whole && overwritten->known_depth && draw_clears_ && transfer_clears_ &&
+                direct_transfers_ && owners_[tile] && owners_[tile]->depth && tile_stencil_[tile] >= 0) {
+                const uint32_t word = (overwritten->word & ~0xFFu) | uint32_t(tile_stencil_[tile]);
+                tile_cleared_[tile] = 1, tile_clear_word_[tile] = word;
+                tile_clear_value_[tile] = depth_clear_value(t->format, word);
+                cleared_epoch_++;
+            }
+        }
+        if (owners_[tile])
+            held[owners_[tile]].push_back(tile);
+        else
+            unheld.push_back(tile);
     }
-    if (needed.empty()) return;
-    for (auto &[holder, tiles] : held)
-        if (!edram_store(holder, tiles)) return;
-    if (!edram_load(t, needed, tile_rows * t->tile_height)) return;
+    // what is known to be the target's now: these rectangles, with what was
+    // known before where no tile changes hands
+    auto remember = [&](bool keep) {
+        if (!keep) t->owned = {};
+        for (const TileRect &r : rects)
+            if (!r.empty()) t->owned.remember(r);
+    };
+    if (needed.empty()) {
+        t->owned_epoch = owners_epoch_;
+        remember(known);
+        return;
+    }
+    const uint32_t tile_rows = bottom_row;
+    if (direct_transfers_) {
+        // (edram_transfer keeps the clears it moves as clears, and drops the rest)
+        if (!held.empty() && !edram_transfer(t, held)) return;
+        for (uint32_t tile : unheld) tile_cleared_[tile] = 0, tile_stencil_[tile] = -1;
+        if (!unheld.empty() && !edram_load(t, unheld, tile_rows * t->tile_height)) return;
+    } else {
+        for (uint32_t tile : needed) tile_cleared_[tile] = 0, tile_stencil_[tile] = -1;
+        for (auto &[holder, tiles] : held)
+            if (!edram_store(holder, tiles)) return;
+        std::vector<uint32_t> loaded; // (needed, without the tiles taken unread)
+        for (uint32_t tile : needed)
+            if (!overwritten || !tile_within(*t, tile, *overwritten)) loaded.push_back(tile);
+        if (!loaded.empty() && !edram_load(t, loaded, tile_rows * t->tile_height)) return;
+    }
     for (uint32_t tile : needed) owners_[tile] = t;
-    if (options_.verbose)
-        std::fprintf(stderr, "  EDRAM: %zu tiles to %s base %u (from %zu targets)\n", needed.size(), t->depth ? "depth" : "color",
-                     t->base, held.size());
+    if (!t->depth)
+        for (uint32_t tile : needed) tile_stencil_[tile] = -1;
+    t->owned_epoch = ++owners_epoch_;
+    remember(known); // (it lost none of what it was known to hold)
+    if (options_.verbose) {
+        std::string from;
+        for (auto &[holder, tiles] : held) from += " [" + std::to_string(tiles.size()) + " of " + target_name(*holder) + "]";
+        std::fprintf(stderr, "  EDRAM: %zu tiles to %s (from %zu targets%s, %u taken unread)%s\n", needed.size(),
+                     target_name(*t).c_str(), held.size(),
+                     direct_transfers_ && !held.empty() && transfer_cleared_only_ ? " as clears" : "", taken_unread,
+                     from.c_str());
+    }
 }
 
 // the tiles a transfer moves, a word each, in the arena
@@ -3158,19 +5716,21 @@ VkDeviceSize Impl::edram_mask(const std::vector<uint32_t> &tiles) {
 }
 
 bool Impl::edram_store(RenderTarget *t, const std::vector<uint32_t> &tiles) {
+    flush_clears(t);
     uint32_t last_row = 0;
     for (uint32_t tile : tiles) last_row = std::max(last_row, ((tile + EDRAM_TILES - t->base) % EDRAM_TILES) / t->pitch_tiles);
-    uint32_t height = std::min((last_row + 1) * t->tile_height, t->height);
+    uint32_t height = std::min(scale_.up((last_row + 1) * t->tile_height), t->host_height);
     VkDeviceSize mask = edram_mask(tiles);
     if (mask == NONE) return false;
     EdramTarget push = edram_target(*t, height);
     uint32_t offset = uint32_t(mask);
     VkCommandBuffer c = outside();
     if (options_.gpu_timing) gpu_mark("EDRAM store: " + target_name(*t));
+    settle_depth_samples(c, *t);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, store_pipelines_[t->msaa ? 1 : 0]);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, edram_layouts_[0], 0, 1, &t->store_set, 1, &offset);
     vkCmdPushConstants(c, edram_layouts_[0], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(c, (t->width + 7) / 8, (height + 7) / 8, 1);
+    vkCmdDispatch(c, (t->host_width + 7) / 8, (height + 7) / 8, 1);
     return true;
 }
 
@@ -3191,22 +5751,67 @@ RenderTarget Impl::edram_view(bool depth, uint32_t base, uint32_t pitch, uint32_
     uint32_t rows = std::max(1u, (EDRAM_TILES - std::min(base, EDRAM_TILES - 1)) / t.pitch_tiles);
     t.width = std::clamp(pitch, 1u, 8192u);
     t.height = std::clamp(rows * t.tile_height, 1u, 8192u);
+    t.host_width = scale_.up(t.width), t.host_height = scale_.up(t.height);
     return t;
 }
 
 // A resolve's clear into EDRAM on the interlock path (edram_clear.comp): the
 // rectangle's samples get the clear's words
 void Impl::fsi_clear(const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t lo, uint32_t hi) {
-    EdramTarget p{};
-    p.base_tiles = t.base, p.pitch_tiles = t.pitch_tiles, p.msaa = t.msaa, p.format = t.format;
-    p.width = w, p.height = h, p.is_depth = t.depth, p.ints_log2 = t.wide ? 1 : 0;
-    p.x = x, p.y = y, p.clear_lo = lo, p.clear_hi = hi;
     VkCommandBuffer c = outside();
     gpu_mark("resolves: clears");
+    // Whole rows of tiles the rectangle covers, all of their samples one
+    // word (where the pitch is a whole number of tiles and a 64-bit clear's
+    // two words are the same), are a run of EDRAM filled as it is, without
+    // the shader's scattered writes; the rows above and below go through it.
+    if ((!t.wide || lo == hi) && x == 0 && w == t.pitch_tiles * t.tile_width) {
+        uint32_t first_row = (y + t.tile_height - 1) / t.tile_height, end_row = (y + h) / t.tile_height;
+        if (end_row > first_row) {
+            uint32_t first = (t.base + first_row * t.pitch_tiles) % EDRAM_TILES;
+            uint32_t count = std::min((end_row - first_row) * t.pitch_tiles, EDRAM_TILES);
+            uint32_t before_wrap = std::min(count, EDRAM_TILES - first);
+            const VkDeviceSize tile_bytes = VkDeviceSize(tile_dwords_) * 4; // (at the resolution scale)
+            vkCmdFillBuffer(c, edram_.buffer, first * tile_bytes, before_wrap * tile_bytes, lo);
+            if (count > before_wrap) vkCmdFillBuffer(c, edram_.buffer, 0, (count - before_wrap) * tile_bytes, lo);
+            // the rows above and below the filled ones
+            uint32_t top = first_row * t.tile_height - y, bottom_y = end_row * t.tile_height;
+            uint32_t bottom = y + h - bottom_y;
+            if (top) edram_clear_rows(c, t, x, y, w, top, lo, hi);
+            if (bottom) edram_clear_rows(c, t, x, bottom_y, w, bottom, lo, hi);
+            return;
+        }
+    }
+    edram_clear_rows(c, t, x, y, w, h, lo, hi);
+}
+
+void Impl::edram_clear_rows(VkCommandBuffer c, const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                            uint32_t lo, uint32_t hi) {
+    EdramTarget p{};
+    p.base_tiles = t.base, p.pitch_tiles = t.pitch_tiles, p.msaa = t.msaa, p.format = t.format;
+    // (the rectangle's pixels at the resolution scale: x, y, w and h are
+    // multiples of 8, whole at every quarter)
+    p.width = scale_.down(w), p.height = scale_.down(h), p.is_depth = t.depth, p.ints_log2 = t.wide ? 1 : 0;
+    p.x = scale_.down(x), p.y = scale_.down(y), p.clear_lo = lo, p.clear_hi = hi;
+    p.scale = scale_.q4;
+    w = p.width, h = p.height;
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, clear_pipeline_);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 1, &resolve_edram_set_, 0, nullptr);
     vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
+}
+
+// EDRAM between the console's size (edram_1x_) and scale_'s, tile by tile
+// (edram_rescale.comp), between full barriers
+void Impl::rescale_edram(bool to_scaled) {
+    VkCommandBuffer c = outside();
+    full_barrier(c);
+    uint32_t push[2] = {to_scaled ? 4u : scale_.q4, to_scaled ? scale_.q4 : 4u};
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, rescale_pipeline_);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1, &rescale_sets_[to_scaled ? 0 : 1], 0,
+                            nullptr);
+    vkCmdPushConstants(c, load_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    vkCmdDispatch(c, (Scale{push[1]}.tile_dwords() + 63) / 64, EDRAM_TILES, 1);
+    full_barrier(c);
 }
 
 // The interlock path's occlusion counter for the draw being recorded (the
@@ -3214,7 +5819,7 @@ void Impl::fsi_clear(const RenderTarget &t, uint32_t x, uint32_t y, uint32_t w, 
 // a host query; ~0 when none counts)
 uint32_t Impl::fsi_zpd_index() {
     if (!zpd_current_) return UINT32_MAX;
-    cmd();
+    begin_recording();
     Slot &s = slots_[current_];
     if (zpd_active_ == UINT32_MAX) {
         if (s.occlusion_reports.size() >= OCCLUSION_QUERIES) {
@@ -3246,7 +5851,9 @@ bool Impl::snapshot_edram(std::vector<uint8_t> &out) {
     uint8_t *data = readback(EDRAM_BYTES, back, at);
     if (!data) return false;
     VkBufferCopy copy{0, at, EDRAM_BYTES};
-    vkCmdCopyBuffer(outside(), edram_.buffer, back, 1, &copy);
+    // (at a resolution scale, EDRAM given back at the console's size)
+    if (!scale_.one()) rescale_edram(false);
+    vkCmdCopyBuffer(outside(), scale_.one() ? edram_.buffer : edram_1x_.buffer, back, 1, &copy);
     sync();
     if (!fatal_.empty()) return false;
     out.assign(data, data + EDRAM_BYTES);
@@ -3304,6 +5911,27 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     auto it = load_pipelines_.find(key);
     if (it != load_pipelines_.end()) return it->second;
     VkShaderModule fs = !t.depth ? (t.raw ? load_uint_fs_ : load_fs_[0]) : load_fs_[2] ? load_fs_[2] : load_fs_[1];
+    return load_pipelines_[key] = edram_pipeline(t, fs, edram_layouts_[1], false);
+}
+
+VkPipeline Impl::transfer_pipeline(const RenderTarget &t, bool source_ms) {
+    VkFormat color_format = t.raw ? t.raw_format : t.image.format;
+    auto key = std::make_tuple(color_format, t.msaa, source_ms);
+    auto it = transfer_pipelines_.find(key);
+    if (it != transfer_pipelines_.end()) return it->second;
+    const VkShaderModule *fs = transfer_fs_[source_ms ? 1 : 0];
+    VkShaderModule module = !t.depth ? fs[t.raw ? 1 : 0] : fs[3] ? fs[3] : stencil_copies_ ? fs[4] : fs[2];
+    return transfer_pipelines_[key] = edram_pipeline(t, module, edram_layouts_[2], t.depth && stencil_copies_);
+}
+
+// A pipeline drawing a whole target's samples from a fragment shader (the
+// fullscreen triangle, the scissor picking the region): EDRAM loads and
+// transfers. Depth targets write depth and stencil always (the stencil a bit
+// per pass without stencil export: its write mask and reference dynamic).
+// With stencil_copy, a depth target's pipeline writes depth alone and the
+// stencil into an R8_UINT color attachment.
+VkPipeline Impl::edram_pipeline(const RenderTarget &t, VkShaderModule fs, VkPipelineLayout layout, bool stencil_copy) {
+    VkFormat color_format = t.raw ? t.raw_format : t.image.format;
     VkPipelineShaderStageCreateInfo stages[2] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, fullscreen_vs_, "main", nullptr},
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main", nullptr}};
@@ -3317,18 +5945,28 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     raster.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = t.image.samples;
+    // (at the positions the target's draws rasterize at: a depth image keeps
+    // one set of sample positions)
+    VkSampleLocationEXT sample_positions[4];
+    VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
+        VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+    if (xenos_at(t.msaa)) {
+        xenos_sample_locations(t.msaa, t.image.samples, false, sample_positions, sample_locations);
+        multisample.pNext = &sample_locations;
+    }
     VkPipelineDepthStencilStateCreateInfo depth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     if (t.depth) {
         depth.depthTestEnable = depth.depthWriteEnable = VK_TRUE;
         depth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
-        depth.stencilTestEnable = VK_TRUE;
+        // (the stencil left alone where it is copied in after the pass)
+        depth.stencilTestEnable = stencil_copy ? VK_FALSE : VK_TRUE;
         depth.front = depth.back = {VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE,
                                     VK_COMPARE_OP_ALWAYS, 0xFF, 0xFF, 0};
     }
     VkPipelineColorBlendAttachmentState blend{};
-    blend.colorWriteMask = 0xF;
+    blend.colorWriteMask = stencil_copy ? VK_COLOR_COMPONENT_R_BIT : 0xF;
     VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend_state.attachmentCount = t.depth ? 0 : 1;
+    blend_state.attachmentCount = t.depth && !stencil_copy ? 0 : 1;
     blend_state.pAttachments = &blend;
     // depth: the stencil a bit per pass without stencil export
     const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
@@ -3340,7 +5978,9 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     if (t.depth) {
         rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat = t.image.format;
-    } else {
+        if (stencil_copy) color_format = VK_FORMAT_R8_UINT;
+    }
+    if (!t.depth || stencil_copy) {
         rendering.colorAttachmentCount = 1;
         rendering.pColorAttachmentFormats = &color_format;
     }
@@ -3356,18 +5996,19 @@ VkPipeline Impl::load_pipeline(const RenderTarget &t) {
     info.pDepthStencilState = &depth;
     info.pColorBlendState = &blend_state;
     info.pDynamicState = &dynamic;
-    info.layout = edram_layouts_[1];
+    info.layout = layout;
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &info, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
-    return load_pipelines_[key] = p;
+    return p;
 }
 
 bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint32_t rows) {
+    flush_clears(t);
     VkPipeline pipeline = load_pipeline(*t);
     if (!pipeline) return fatal_ = "could not make an EDRAM load pipeline", false;
     VkDeviceSize mask = edram_mask(tiles);
     if (mask == NONE) return false;
-    uint32_t height = std::min(rows, t->height), offset = uint32_t(mask);
+    uint32_t height = std::min(scale_.up(rows), t->host_height), offset = uint32_t(mask);
     EdramTarget push = edram_target(*t, height);
     VkCommandBuffer c = outside();
     if (options_.gpu_timing) gpu_mark("EDRAM load: " + target_name(*t));
@@ -3377,7 +6018,7 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    rendering.renderArea = {{0, 0}, {t->width, height}};
+    rendering.renderArea = {{0, 0}, {t->host_width, height}};
     rendering.layerCount = 1;
     if (t->depth) {
         rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
@@ -3386,12 +6027,13 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
         rendering.pColorAttachments = &attachment;
     }
     vkCmdBeginRendering(c, &rendering);
+    t->samples_unsettled = t->depth;
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     bound_pipeline_ = VK_NULL_HANDLE; // the draws' pipeline and sets are bound again after it
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, edram_layouts_[1], 0, 1, &edram_load_set_, 1, &offset);
     vkCmdPushConstants(c, edram_layouts_[1], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
-    VkViewport viewport{0, 0, float(t->width), float(height), 0, 1};
-    VkRect2D scissor{{0, 0}, {t->width, height}};
+    VkViewport viewport{0, 0, float(t->host_width), float(height), 0, 1};
+    VkRect2D scissor{{0, 0}, {t->host_width, height}};
     vkCmdSetViewport(c, 0, 1, &viewport);
     vkCmdSetScissor(c, 0, 1, &scissor);
     if (!t->depth) {
@@ -3419,6 +6061,260 @@ bool Impl::edram_load(RenderTarget *t, const std::vector<uint32_t> &tiles, uint3
     return true;
 }
 
+// The tiles each holder has of what the target takes over, drawn straight
+// from the holder's image into the target (edram_transfer.frag), in one
+// render pass: a draw per rectangle of the target's tiles a holder has
+// (Xenia's Transfer::GetRangeRectangles: a run of tiles is at most a part of
+// a row, whole rows, a part of a row), a pass per stencil bit more for depth
+// without stencil export.
+bool Impl::edram_transfer(RenderTarget *t, const std::map<RenderTarget *, std::vector<uint32_t>> &held) {
+    flush_clears(t);
+    for (const auto &[holder, tiles] : held) flush_clears(holder);
+    struct Draw {
+        RenderTarget *source;
+        std::vector<VkRect2D> rects;
+        bool clear = false; // the tiles hold one clear's value: cleared to it, not drawn
+        VkClearValue value{};
+    };
+    std::vector<Draw> draws;
+    uint32_t height = 0;
+    // the holder's tiles that hold a clear's value, by value, where the
+    // target has the holder's format (the same bits: the same clear value
+    // whatever the sample count); the rest drawn
+    struct Group {
+        RenderTarget *holder;
+        std::vector<uint32_t> tiles;
+        bool clear;
+        VkClearValue value;
+    };
+    std::vector<Group> groups;
+    for (auto &[holder, tiles] : held) {
+        const bool same = transfer_clears_ && holder->depth == t->depth && holder->format == t->format &&
+                          holder->host == t->host && holder->gamma_linear == t->gamma_linear &&
+                          (holder->raw != VK_NULL_HANDLE) == (t->raw != VK_NULL_HANDLE);
+        // (and a depth target of the other depth format: the same guest word
+        // as its own format keeps it, which is what the transfer would draw.
+        // Where the host keeps the target's depth as a float beside EDRAM,
+        // the transfer would rather take a float left there that still
+        // rounds to the word, if one happened to: the same guest bits either
+        // way.)
+        const bool other_depth = transfer_clears_ && draw_clears_ && holder->depth && t->depth && holder->format != t->format;
+        Group drawn{holder, {}, false, {}};
+        std::vector<Group> cleared;
+        for (uint32_t tile : tiles) {
+            if ((!same && !other_depth) || !tile_cleared_[tile]) {
+                drawn.tiles.push_back(tile);
+                continue;
+            }
+            const VkClearValue v = same ? tile_clear_value_[tile] : depth_clear_value(t->format, tile_clear_word_[tile]);
+            auto g = std::find_if(cleared.begin(), cleared.end(),
+                                  [&](const Group &c) { return std::memcmp(&c.value, &v, sizeof(v)) == 0; });
+            if (g == cleared.end()) cleared.push_back({holder, {tile}, true, v});
+            else g->tiles.push_back(tile);
+        }
+        if (!drawn.tiles.empty()) groups.push_back(std::move(drawn));
+        for (Group &g : cleared) groups.push_back(std::move(g));
+    }
+    for (const Group &g : groups) {
+        RenderTarget *holder = g.holder;
+        const std::vector<uint32_t> &tiles = g.tiles;
+        // (the tiles drawn hold what the holder drew; those cleared keep their value)
+        for (uint32_t tile : tiles) {
+            tile_cleared_[tile] = g.clear;
+            if (g.clear) tile_clear_value_[tile] = g.value; // (as the target keeps it)
+            // (the stencil: the clear's; kept from one depth target to another; else not known)
+            if (g.clear && t->depth) tile_stencil_[tile] = int16_t(g.value.depthStencil.stencil & 0xFF);
+            else if (!holder->depth || !t->depth) tile_stencil_[tile] = -1;
+        }
+        if (g.clear) cleared_epoch_++, stencil_epoch_++;
+        if (!g.clear && !transfer_pipeline(*t, holder->msaa != 0))
+            return fatal_ = "could not make an EDRAM transfer pipeline", false;
+        Draw d{holder, {}, g.clear, g.value};
+        // the tiles as the target's, in runs
+        std::vector<uint32_t> at;
+        at.reserve(tiles.size());
+        for (uint32_t tile : tiles) at.push_back((tile + EDRAM_TILES - t->base) % EDRAM_TILES);
+        std::sort(at.begin(), at.end());
+        auto rect = [&](uint32_t row, uint32_t first, uint32_t columns, uint32_t rows) {
+            // (in host pixels at the resolution scale: whole tiles, whole at
+            // every quarter)
+            uint32_t x = scale_.down(first * t->tile_width), y = scale_.down(row * t->tile_height);
+            if (x >= t->host_width || y >= t->host_height) return;
+            VkRect2D r{{int32_t(x), int32_t(y)},
+                       {std::min(scale_.down(columns * t->tile_width), t->host_width - x),
+                        std::min(scale_.down(rows * t->tile_height), t->host_height - y)}};
+            d.rects.push_back(r);
+            height = std::max(height, y + r.extent.height);
+        };
+        // (the runs of each row, a run that is the same columns as one of the
+        // row above joined to it: whole rows are one rectangle, and so is a
+        // column of tiles a draw reached)
+        struct Open {
+            uint32_t row, first, columns, rows;
+        };
+        std::vector<Open> open, next;
+        for (size_t i = 0; i < at.size();) {
+            const uint32_t pitch = t->pitch_tiles, row = at[i] / pitch;
+            next.clear();
+            while (i < at.size() && at[i] / pitch == row) {
+                size_t j = i + 1;
+                while (j < at.size() && at[j] == at[j - 1] + 1 && at[j] / pitch == row) j++;
+                const uint32_t first = at[i] % pitch, columns = uint32_t(j - i);
+                auto above = std::find_if(open.begin(), open.end(), [&](const Open &o) {
+                    return o.row + o.rows == row && o.first == first && o.columns == columns;
+                });
+                if (above != open.end()) {
+                    next.push_back({above->row, first, columns, above->rows + 1});
+                    open.erase(above);
+                } else {
+                    next.push_back({row, first, columns, 1});
+                }
+                i = j;
+            }
+            for (const Open &o : open) rect(o.row, o.first, o.columns, o.rows);
+            open.swap(next);
+        }
+        for (const Open &o : open) rect(o.row, o.first, o.columns, o.rows);
+        if (!d.rects.empty()) draws.push_back(std::move(d));
+    }
+    transfer_cleared_only_ = false;
+    if (draws.empty()) return true;
+    // (the stencil's copy is for the tiles drawn: a clear writes the
+    // stencil aspect itself)
+    const bool any_drawn = std::any_of(draws.begin(), draws.end(), [](const Draw &d) { return !d.clear; });
+    transfer_cleared_only_ = !any_drawn;
+    if (!any_drawn && defer_clears_ && !t->raw) {
+        // clears alone: kept for the target's next pass, as a resolve's
+        // (flush_clears), with no pass of their own (a pass open on the
+        // target ends here: the clears are drawn as the next begins)
+        outside();
+        for (const Draw &d : draws) {
+            VkClearAttachment clear{};
+            clear.aspectMask = t->depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+            clear.clearValue = d.value;
+            for (const VkRect2D &r : d.rects) t->pending_clears.push_back({clear, {r, 0, 1}});
+        }
+        return true;
+    }
+    bool stencil_copy = t->depth && stencil_copies_ && any_drawn, fresh = false;
+    if (stencil_copy && !t->stencil_copy.image) {
+        t->stencil_copy = d_.create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8_UINT, {t->host_width, t->host_height, 1}, 1, 1,
+                                          t->image.samples,
+                                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0);
+        if (!t->stencil_copy.image) return fatal_ = "could not make a depth target's stencil image", false;
+        t->stencil_copy_view = make_view(t->stencil_copy.image, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8_UINT,
+                                         VK_IMAGE_ASPECT_COLOR_BIT);
+        fresh = true;
+    }
+    VkCommandBuffer c = outside();
+    if (fresh) begin_image(c, t->stencil_copy.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    if (options_.gpu_timing) gpu_mark("EDRAM transfer: " + target_name(*t));
+    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    attachment.imageView = t->raw ? t->raw : t->view;
+    attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, {t->host_width, height}};
+    rendering.layerCount = 1;
+    VkRenderingAttachmentInfo stencil_attachment = attachment;
+    stencil_attachment.imageView = t->stencil_copy_view;
+    stencil_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    if (t->depth) {
+        rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
+        if (stencil_copy) rendering.colorAttachmentCount = 1, rendering.pColorAttachments = &stencil_attachment;
+    } else {
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &attachment;
+    }
+    // (the sources' depth at the positions they were rasterized at)
+    for (const Draw &d : draws)
+        if (!d.clear) settle_depth_samples(c, *d.source);
+    vkCmdBeginRendering(c, &rendering);
+    t->samples_unsettled = t->depth;
+    bound_pipeline_ = VK_NULL_HANDLE; // the draws' pipeline and sets are bound again after it
+    VkViewport viewport{0, 0, float(t->host_width), float(t->host_height), 0, 1};
+    vkCmdSetViewport(c, 0, 1, &viewport);
+    EdramTarget dest = edram_target(*t, t->host_height);
+    bool stencil_passes = t->depth && !transfer_fs_[0][3] && !stencil_copy;
+    VkPipeline bound = VK_NULL_HANDLE;
+    for (const Draw &d : draws) {
+        if (d.clear) {
+            // the clear's value over the rectangles (depth and stencil
+            // both; the copy after the pass leaves these rectangles out)
+            std::vector<VkClearRect> rects;
+            for (const VkRect2D &r : d.rects) rects.push_back({r, 0, 1});
+            VkClearAttachment clears[1] = {};
+            uint32_t count = 1;
+            if (t->depth) {
+                clears[0].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                clears[0].clearValue = d.value;
+            } else {
+                clears[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                clears[0].colorAttachment = 0;
+                clears[0].clearValue = d.value;
+            }
+            vkCmdClearAttachments(c, count, clears, uint32_t(rects.size()), rects.data());
+            continue;
+        }
+        VkPipeline pipeline = transfer_pipeline(*t, d.source->msaa != 0);
+        if (pipeline != bound) vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, bound = pipeline);
+        uint32_t offset = 0;
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, edram_layouts_[2], 0, 1, &d.source->store_set, 1,
+                                &offset);
+        EdramTarget source = edram_target(*d.source, d.source->host_height);
+        EdramTransfer push{};
+        std::memcpy(push.dest, &dest, 10 * sizeof(uint32_t));
+        std::memcpy(push.source, &source, 10 * sizeof(uint32_t));
+        push.dest[10] = push.source[10] = scale_.q4;
+        vkCmdPushConstants(c, edram_layouts_[2], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+        if (t->depth) {
+            // the depth and the stencil (exported, or cleared to 0 for the
+            // bit passes that follow)
+            vkCmdSetDepthWriteEnable(c, VK_TRUE);
+            vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+            vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+        }
+        for (const VkRect2D &r : d.rects) {
+            vkCmdSetScissor(c, 0, 1, &r);
+            vkCmdDraw(c, 3, 1, 0, 0);
+        }
+        if (!stencil_passes) continue;
+        vkCmdSetDepthWriteEnable(c, VK_FALSE);
+        vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+        for (uint32_t bit = 0; bit < 8; bit++) {
+            EdramTransfer pass = push;
+            pass.dest[8] = bit; // stencil_bit
+            vkCmdPushConstants(c, edram_layouts_[2], VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pass), &pass);
+            vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_AND_BACK, 1u << bit);
+            for (const VkRect2D &r : d.rects) {
+                vkCmdSetScissor(c, 0, 1, &r);
+                vkCmdDraw(c, 3, 1, 0, 0);
+            }
+        }
+    }
+    vkCmdEndRendering(c);
+    if (stencil_copy) {
+        // the stencil the pass wrote into the R8_UINT image, into the
+        // target's stencil aspect, rectangle by rectangle
+        full_barrier(c);
+        std::vector<VkImageCopy> copies;
+        for (const Draw &d : draws)
+            for (const VkRect2D &r : d.rects) {
+                if (d.clear) continue;
+                VkImageCopy copy{};
+                copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.dstSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
+                copy.srcOffset = copy.dstOffset = {r.offset.x, r.offset.y, 0};
+                copy.extent = {r.extent.width, r.extent.height, 1};
+                copies.push_back(copy);
+            }
+        vkCmdCopyImage(c, t->stencil_copy.image, VK_IMAGE_LAYOUT_GENERAL, t->image.image, VK_IMAGE_LAYOUT_GENERAL,
+                       uint32_t(copies.size()), copies.data());
+    }
+    return true;
+}
+
 // ---- textures ----
 
 // A sampler's place in the bindless table, made once per what it is made
@@ -3437,11 +6333,25 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     if (overrides[2] != 3) mip = overrides[2];
     if (overrides[3] != 7) aniso = overrides[3];
     texture::Info parsed = texture::parse_fetch_constant(fetch);
+    texture::Levels levels = texture::levels(parsed);
+    // The player's filtering beyond the game's (Options::anisotropy and
+    // texture_filter): nearest everywhere; or, on mipmapped textures (not a
+    // base map alone) the game filters linearly, linear between mips and the
+    // anisotropy forced, as Xenia's anisotropic_override picks them
+    // (vulkan_texture_cache.cc's GetSamplerParameters).
+    const uint32_t forced_filter = texture_filter_.load(std::memory_order_relaxed);
+    const uint32_t forced_aniso = anisotropy_.load(std::memory_order_relaxed);
+    if (forced_filter == 2) {
+        mag = min = 0, mip = mip == 2 ? 2 : 0, aniso = 0;
+    } else if (levels.mip_max > levels.mip_min && mip != 2 && mag == 1 && min == 1) {
+        if (forced_filter == 1) mip = 1;
+        // 1x, 2x, 4x, 8x, 16x as Xenos' AnisoFilter 1-5
+        if (forced_aniso) aniso = uint32_t(std::bit_width(std::min(forced_aniso, 16u)));
+    }
     // points where the host does not filter the formats it reads (Xenia's
     // GetSamplerParameters; anisotropy filters linearly too)
     if ((mag == 1 || min == 1 || mip == 1 || (aniso && aniso < 6)) && !texture::filterable(parsed, support_))
         mag = min = 0, mip = mip == 2 ? 2 : 0, aniso = 0;
-    texture::Levels levels = texture::levels(parsed);
     uint32_t mip_min = mip == 2 && levels.base ? 0 : levels.mip_min;
     uint32_t clamp[3];
     bool border = false;
@@ -3451,16 +6361,44 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
         if (clamp[k] == 3 || clamp[k] == 5 || clamp[k] == 7) clamp[k] = d_.mirror_clamp_to_edge() ? 3 : 1;
         border |= clamp[k] == 6;
     }
-    uint32_t border_color = border ? fetch[5] & 3 : 0;
-    if (border_color >= 2) approximate("YCbCr border colors (transparent black)");
+    // the border color (dword 5 bits 0-1: black, white, and the two YCbCr
+    // blacks) and force_bc_w_to_max (bit 2: its alpha 1), where a clamp uses
+    // the border, as Xenia's texture caches take them; the YCbCr ones as a
+    // custom border color where the device has it, as Xenia's Vulkan cache
+    uint32_t border_color = border ? fetch[5] & 3 : 0, border_alpha = border ? (fetch[5] >> 2) & 1 : 0;
+    if (border_color >= 2 && !d_.custom_border_color())
+        approximate("YCbCr border colors (black: no custom border colors on the device)");
     if (d_.max_anisotropy() < 1.0f) aniso = 0;
-    std::array<uint32_t, 8> key = {clamp[0] | clamp[1] << 3 | clamp[2] << 6 | border_color << 9,
+    std::array<uint32_t, 8> key = {clamp[0] | clamp[1] << 3 | clamp[2] << 6 | border_color << 9 | border_alpha << 11,
                                    mag, min, mip, aniso, mip_min, 0, 0};
+    last_sampler_ = nullptr;
     auto it = samplers_.find(key);
-    if (it != samplers_.end()) return it->second.second;
-    if (next_sampler_ >= sampler_capacity_) {
-        approximate("samplers past the bindless table's size (the stand-in's used)");
-        return 0;
+    if (it != samplers_.end()) {
+        it->second.used_serial = submission_serial();
+        last_sampler_ = &it->second;
+        return it->second.index;
+    }
+    // The table full: the sampler least recently used by a submission the
+    // GPU has finished is destroyed and its slot taken, as Xenia's texture
+    // caches keep their samplers within the device's limit (the binding is
+    // updated while unused submissions are pending). Only with every one
+    // used by a submission still running is the stand-in's taken, counted.
+    if (next_sampler_ >= sampler_capacity_ && free_samplers_.empty()) {
+        while (finish_oldest(false)) {}
+        auto oldest = samplers_.end();
+        for (auto s = samplers_.begin(); s != samplers_.end(); ++s)
+            if (s->second.used_serial <= done_serial_ &&
+                (oldest == samplers_.end() || s->second.used_serial < oldest->second.used_serial))
+                oldest = s;
+        if (oldest == samplers_.end()) {
+            approximate("samplers past the bindless table's size, all in use (the stand-in's used)");
+            return 0;
+        }
+        vkDestroySampler(dev_, oldest->second.sampler, nullptr);
+        free_samplers_.push_back(oldest->second.index);
+        samplers_.erase(oldest);
+        texture_epoch_++;
+        report_.samplers_reused++;
     }
     static const VkSamplerAddressMode modes[8] = {
         VK_SAMPLER_ADDRESS_MODE_REPEAT,          VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
@@ -3480,10 +6418,31 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     }
     info.minLod = float(mip_min);
     info.maxLod = mip == 2 ? info.minLod + 0.25f : VK_LOD_CLAMP_NONE; // 2: the base map alone
-    info.borderColor = border_color == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    VkSamplerCustomBorderColorCreateInfoEXT custom{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
+    if (border_color == 1) {
+        info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+    } else if (border_color >= 2 && d_.custom_border_color()) {
+        // (Cr, Y, Cb) and (Y, Cr, Cb) unsigned, Y 0 and the chroma 0.5
+        float *c = custom.customBorderColor.float32;
+        c[0] = border_color == 2 ? 0.5f : 0.0f;
+        c[1] = border_color == 2 ? 0.0f : 0.5f;
+        c[2] = 0.5f;
+        c[3] = border_alpha ? 1.0f : 0.0f;
+        custom.format = VK_FORMAT_UNDEFINED;
+        info.pNext = &custom;
+        info.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+    } else {
+        info.borderColor = border_alpha ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    }
     VkSampler s = VK_NULL_HANDLE;
     vkCreateSampler(dev_, &info, nullptr, &s);
-    uint32_t index = next_sampler_++;
+    uint32_t index;
+    if (!free_samplers_.empty()) {
+        index = free_samplers_.back();
+        free_samplers_.pop_back();
+    } else {
+        index = next_sampler_++;
+    }
     VkDescriptorImageInfo image{s, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = bindless_;
@@ -3493,7 +6452,7 @@ uint32_t Impl::sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &o
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     write.pImageInfo = &image;
     vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
-    samplers_[key] = {s, index};
+    last_sampler_ = &(samplers_[key] = {s, index, submission_serial()});
     return index;
 }
 
@@ -3609,6 +6568,7 @@ bool Impl::make_room(uint32_t kind, uint32_t needed) {
 // A texture the GPU is done with: its places given back, its views and
 // images destroyed, and out of the cache.
 void Impl::destroy_texture(Texture *t) {
+    texture_epoch_++; // (what the draws kept of it: SlotMemo)
     unlink(*t);
     unindex_texture(*t);
     count_texture_bytes(0, t->bytes);
@@ -3617,6 +6577,7 @@ void Impl::destroy_texture(Texture *t) {
         vkDestroyImageView(dev_, v.view, nullptr);
     }
     report_.texture_views -= t->views.size();
+    release_target(t->target, t->target_view);
     if (t->image.image) d_.destroy(t->image);
     if (t->signed_image.image) d_.destroy(t->signed_image);
     textures_.erase(t->key);
@@ -3636,6 +6597,7 @@ void Impl::release_index(uint32_t kind, uint32_t index) {
     write.pImageInfo = &image;
     vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
     free_indices_[kind].push_back(index);
+    texture_epoch_++; // (what read through it: SlotMemo)
 }
 
 // A place in a table with room: one given back, else a new one.
@@ -3676,18 +6638,24 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     if (t && !t->stale) {
         bool same;
         {
-            Timer timer(report_.check_seconds);
+            Timer timer(report_.check_seconds, cpu_times_);
             same = unwritten(*t);
         }
         if (same) {
             // a trace gets what guest memory gave it (a replay makes the
-            // GPU's parts with its own resolves and exports)
-            traced(t->gpu ? cpu_parts(t->ranges) : t->ranges);
+            // GPU's parts with its own resolves and exports); only while one
+            // is recorded (cpu_parts makes a list and walks the pages: 13% of
+            // the command thread in a heavy scene when it ran for every draw)
+            if (trace_) traced(t->gpu ? cpu_parts(t->ranges) : t->ranges);
             return t;
         }
         t->load_why = LoadWhy::CpuWritten;
     }
     if (t) t->stale = true; // until it is loaded again
+    // a load: what the draws kept of this texture's slots goes (SlotMemo), not
+    // of every texture's (a scene reloading fifty textures a frame after its
+    // resolves otherwise took every slot of every draw the long way again)
+    if (t) t->loads++;
 
     texture::Plan plan, signed_plan;
     if (!texture::plan(info, plan, why, support_)) return nullptr;
@@ -3714,7 +6682,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     // decompressed are decompressed on the GPU too, from guest memory put into
     // the mirror
     bool mirror = gpu_held(ranges);
-    bool gpu = mirror || (texture::is_compressed(info.host) && !texture::is_compressed(plan.format));
+    bool gpu = mirror || texture_loads_on_gpu_ || (texture::is_compressed(info.host) && !texture::is_compressed(plan.format));
     // the write count before anything is watched or read: a write after it
     // that the load may have missed numbers a page above it
     uint32_t checked = mem_.write_count();
@@ -3737,10 +6705,76 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     uint32_t layers = three ? 1 : std::max(1u, plan.depth);
     VkExtent3D extent{plan.width, plan.height, three ? plan.depth : 1};
     uint32_t level_count = plan.level_count;
+    // A resolve target (the resolves write it as well: below), and one a
+    // scaled resolve kept the scaled texels of: made at the resolution scale,
+    // those copied in rather than loaded (docs/renderer.md, "Resolution scale")
+    const uint32_t texel_bytes = texture::format_block(info.format).bytes;
+    // (a depth texture's float made from the depth bits by the resolve as its
+    // load makes it: beyond the copies, 32-bit texels)
+    const uint32_t convert = !depth_targets_                                 ? 0u
+                             : plan.load == texture::Load::DepthUnormToFloat ? 1u
+                             : plan.load == texture::Load::DepthFloatToFloat ? 2u
+                                                                             : 0u;
+    const bool target = resolve_targets_ && mirror && !separate && !three && !cube && layers == 1 &&
+                        level_count == 1 && plan.slices.size() == 1 && plan.slices[0].level == 0 &&
+                        plan.slices[0].tiled && (plan.load == texture::Load::Copy || (convert && texel_bytes == 4)) &&
+                        plan.half == texture::Half::None && plan.block_width == 1 && plan.block_height == 1 &&
+                        (texel_bytes == 4 || texel_bytes == 8) && plan.bytes_per_block == texel_bytes;
+    // A load over what a resolve wrote, counted by format and size with the
+    // first reason it is no resolve target (the loads a resolve's own write
+    // into the texture could spare; "uses" in the report)
+    if (t && t->load_why == LoadWhy::GpuWritten) {
+        const char *reason = !resolve_targets_                                        ? "resolve targets off"
+                             : !mirror                                                ? "not over the GPU's pages"
+                             : separate                                               ? "a separate signed image"
+                             : three || cube || layers != 1                           ? "not one 2D layer"
+                             : level_count != 1                                       ? "mipmapped"
+                             : plan.slices.size() != 1 || plan.slices[0].level != 0   ? "more than one slice"
+                             : !plan.slices[0].tiled                                  ? "linear"
+                             : plan.load != texture::Load::Copy && !convert           ? "converted as it loads"
+                             : plan.half != texture::Half::None                       ? "half-size texels"
+                             : plan.block_width != 1 || plan.block_height != 1        ? "block-compressed"
+                             : texel_bytes != 4 && texel_bytes != 8                   ? "texels neither 32 nor 64 bits"
+                             : plan.bytes_per_block != texel_bytes                    ? "host texels of another size"
+                             : !t->target ? "a target with no place in the resolves' table"
+                                          : "a target the resolve did not feed";
+        char line[320];
+        std::snprintf(line, sizeof(line), "texture loads after a resolve: %s %ux%u%s, %s", format_name(info.format),
+                      plan.width, plan.height, level_count > 1 ? " mipmapped" : "", reason);
+        if (refusal_detail_ && target) {
+            // its own base and pitch, and the resolve that made it stale
+            const Texture::StaleBy &s = t->stale_by;
+            char more[160];
+            std::snprintf(more, sizeof(more), " (texture at %08X pitch %u; stale by %s %ux%u pitch %u at %08X +%u,%u)",
+                          plan.slices[0].base & 0x1FFFFFFF, plan.slices[0].pitch_blocks,
+                          s.width ? format_name(s.format) : "a memory export", s.width, s.height, s.pitch, s.base, s.x,
+                          s.y);
+            std::strncat(line, more, sizeof(line) - std::strlen(line) - 1);
+        }
+        use(std::string(line));
+    }
+    ScaledResolve *kept = nullptr;
+    if (target && !convert && !scale_.one() && scalable(plan.width, plan.height, min_scalable_) && texel_bytes == 4) {
+        auto found = scaled_resolves_.find(plan.slices[0].base & 0x1FFFFFFF);
+        if (found != scaled_resolves_.end() && found->second.pitch == plan.slices[0].pitch_blocks &&
+            found->second.endian == info.endian && ((found->second.target >> 7) & 1) == (texel_bytes == 8 ? 1u : 0u) &&
+            found->second.width >= plan.width && found->second.height >= plan.height) {
+            kept = &found->second;
+            extent = {scale_.up(plan.width), scale_.up(plan.height), 1};
+        }
+    }
     bool fresh = !t || t->image.format != format || t->image.extent.width != extent.width ||
                  t->image.extent.height != extent.height || t->image.extent.depth != extent.depth ||
                  t->image.levels != level_count || t->image.layers != layers ||
                  separate != (t->signed_image.image != VK_NULL_HANDLE) || signed_format != t->signed_format;
+    // One made before a resolve wrote its memory (no resolve target then:
+    // its image has no storage view) and now over what one wrote, made again
+    // as one while the table has a place for it: else the loads after every
+    // resolve go on (game D's 320x192 and 32x32 surfaces, 16,000 loads a run)
+    if (!fresh && target && !t->target) {
+        const uint32_t wide = texel_bytes == 8 ? 1 : 0;
+        fresh = next_target_[wide] < RESOLVE_TARGETS || !free_targets_[wide].empty();
+    }
     if (fresh) {
         uint32_t kind = three ? 1 : cube ? 2 : 0;
         if (t) {
@@ -3750,14 +6784,18 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             // with it (work under way may still read them)
             vk::Image old = t->image, old_signed_image = t->signed_image;
             std::vector<TextureView> old_views = std::move(t->views);
-            uint32_t old_kind = t->kind;
+            uint32_t old_kind = t->kind, old_target = t->target;
+            VkImageView old_target_view = t->target_view;
+            t->target = 0, t->target_view = VK_NULL_HANDLE;
             report_.texture_views -= old_views.size();
-            cmd();
-            slots_[current_].after.push_back([this, old, old_signed_image, old_views, old_kind]() mutable {
+            begin_recording();
+            slots_[current_].after.push_back([this, old, old_signed_image, old_views, old_kind, old_target,
+                                              old_target_view]() mutable {
                 for (const TextureView &v : old_views) {
                     release_index(old_kind, v.index);
                     vkDestroyImageView(dev_, v.view, nullptr);
                 }
+                release_target(old_target, old_target_view);
                 if (old.image) d_.destroy(old);
                 if (old_signed_image.image) d_.destroy(old_signed_image);
             });
@@ -3777,13 +6815,55 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         t->host = plan.format, t->host_swizzle = plan.host_swizzle;
         t->signed_read = plan.signed_read, t->signed_format = signed_format;
         // a source of copies too: a front buffer read back, or copied by a presenter
-        const VkImageUsageFlags usage =
+        VkImageUsageFlags usage =
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        const VkImageCreateFlags flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+        VkImageCreateFlags flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+        // A resolve target (resolve_target): a texture over memory a resolve
+        // wrote, one 2D level of 32- or 64-bit texels whose image holds the
+        // guest's bits as they are (a plain copy), tiled, made storable
+        // through an unsigned view of its texel's size, which resolves write.
+        const VkFormat target_format = texel_bytes == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
+        if (target) usage |= VK_IMAGE_USAGE_STORAGE_BIT, flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
         // a signed view of the same bits: the image mutable, with the snorm
         // format listed (Xenia's Vulkan textures with both formats)
         t->image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, format, extent, level_count, layers,
-                                   VK_SAMPLE_COUNT_1_BIT, usage, flags, separate ? VK_FORMAT_UNDEFINED : signed_format);
+                                   VK_SAMPLE_COUNT_1_BIT, usage, flags, separate ? VK_FORMAT_UNDEFINED : signed_format,
+                                   target ? target_format : VK_FORMAT_UNDEFINED);
+        if (target && t->image.image) {
+            const uint32_t wide = texel_bytes == 8 ? 1 : 0;
+            uint32_t slot = UINT32_MAX;
+            if (!free_targets_[wide].empty()) {
+                slot = free_targets_[wide].back();
+                free_targets_[wide].pop_back();
+            } else {
+                slot = take_target(wide);
+            }
+            VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            view.image = t->image.image;
+            view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            view.format = target_format;
+            view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageViewUsageCreateInfo view_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+            view_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+            view.pNext = &view_usage;
+            if (slot != UINT32_MAX && vkCreateImageView(dev_, &view, nullptr, &t->target_view) == VK_SUCCESS) {
+                VkDescriptorImageInfo image{VK_NULL_HANDLE, t->target_view, VK_IMAGE_LAYOUT_GENERAL};
+                VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                write.dstSet = target_set_;
+                write.dstBinding = wide;
+                write.dstArrayElement = slot;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                write.pImageInfo = &image;
+                vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+                t->target = (slot + 1) | wide << 7;
+                t->target_base = plan.slices[0].base & 0x1FFFFFFF, t->target_pitch = plan.slices[0].pitch_blocks;
+                t->target_endian = info.endian;
+                t->target_convert = convert;
+            } else if (slot != UINT32_MAX) {
+                free_targets_[wide].push_back(slot);
+            }
+        }
         if (separate)
             t->signed_image = d_.create_image(three ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, signed_format, extent,
                                               level_count, layers, VK_SAMPLE_COUNT_1_BIT, usage, flags);
@@ -3800,7 +6880,23 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     t->low = UINT32_MAX, t->high = 0;
     for (auto [start, end] : t->ranges) t->low = std::min(t->low, start), t->high = std::max(t->high, end);
     index_texture(*t);
-    if (gpu) {
+    t->scaled = kept != nullptr;
+    if (kept) {
+        // the scaled resolve's texels, of the same size (the texture's format
+        // holds the guest's bits as they are, as the resolve wrote them)
+        VkCommandBuffer c = outside();
+        if (fresh) begin_image(c, t->image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+        full_barrier(c);
+        VkImageCopy copy{};
+        copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.extent = extent;
+        vkCmdCopyImage(c, kept->image.image, VK_IMAGE_LAYOUT_GENERAL, t->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        full_barrier(c);
+        std::vector<Range> its{{kept->low, kept->high}};
+        drop_scaled_resolves(its);
+        report_.textures_scaled++;
+        if (options_.verbose) std::fprintf(stderr, "  texture %08X: a scaled resolve's texels copied in\n", info.base_address);
+    } else if (gpu) {
         if (!gpu_load(*t, t->image, plan, fresh, true)) return nullptr;
         if (separate && !gpu_load(*t, t->signed_image, signed_plan, fresh, false)) return nullptr;
     } else {
@@ -3930,7 +7026,10 @@ bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &pla
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!grow(load_scratch_, std::max<VkDeviceSize>(total, 16), usage, load_set_, 1)) return false;
-    if (upload) request(t.ranges);
+    if (upload)
+        request(t.ranges);
+    else
+        mark_used(t.ranges); // read from the mirror in this submission
     VkCommandBuffer c = outside();
     gpu_mark("textures: loads on the GPU (texture_load)");
     if (fresh) begin_image(c, image.image, VK_IMAGE_ASPECT_COLOR_BIT, image.levels, image.layers);
@@ -3968,20 +7067,44 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
     pending = stand_in = false;
     async = async && pipeline_workers_ && !options_.linked_pipelines_only;
     // how long a pipeline made on the workers left its draws without one
+    // (until it, or for a linked stand-in its last library, was made: a
+    // draw asking again only later, as a scene shown once more a minute
+    // after, waited no longer than that)
     auto drawn_with = [this](PipelineEntry &entry) {
-        if (entry.asked == std::chrono::steady_clock::time_point{}) return;
-        double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - entry.asked).count();
+        using clock = std::chrono::steady_clock;
+        if (entry.asked == clock::time_point{}) return;
+        clock::time_point end = clock::now(), ready{};
+        if (entry.pipeline) {
+            ready = entry.made;
+        } else {
+            for (PipelineEntry *l : entry.libraries)
+                if (l) ready = std::max(ready, l->made);
+        }
+        if (ready != clock::time_point{} && ready < end) end = std::max(ready, entry.asked);
+        double waited = std::chrono::duration<double>(end - entry.asked).count();
         entry.asked = {};
         report_.pipeline_waits++;
         report_.pipeline_wait_seconds += waited;
         report_.pipeline_wait_max = std::max(report_.pipeline_wait_max, waited);
     };
+    // A pipeline found before again, by its key's hash (a scene's draws go back and forth
+    // between a few hundred): one comparison of the key instead of the map's search, a compare
+    // of two keys at each of its levels. Entries are never dropped.
+    uint64_t hash = 0x9E3779B97F4A7C15ull;
+    for (uint32_t word : key) hash = (hash ^ word) * 0x100000001B3ull;
+    PipelineFront &front = pipeline_front_[size_t(hash >> 32) & (PIPELINE_FRONT - 1)];
+    if (front.entry && front.entry->pipeline && !front.entry->stand_in && !front.entry->generic && key == front.key &&
+        front.entry->asked == std::chrono::steady_clock::time_point{} &&
+        front.entry->state.load(std::memory_order_acquire))
+        return front.entry->pipeline;
     PipelineEntry *e = nullptr;
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) {
         e = it->second.get();
+        front.entry = e, front.key = key;
         if (e->state.load(std::memory_order_acquire)) {
             if (e->stand_in) retire_stand_in(*e);
+            if (e->generic) retire_generic(*e);
             if (e->pipeline) drawn_with(*e);
             return e->pipeline;
         }
@@ -3994,6 +7117,7 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             }
             pipeline_workers_->wait(e);
             if (e->stand_in) retire_stand_in(*e);
+            if (e->generic) retire_generic(*e);
             return e->pipeline;
         }
     } else {
@@ -4014,7 +7138,7 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
         if (storage_ || !built_pipelines_.empty()) {
             const std::vector<uint32_t> description = describe(info);
             if (!description.empty()) {
-                built = built_pipelines_.count(ShaderStorage::hash(0, description)) != 0;
+                built = !built_pipelines_.empty() && built_pipelines_.count(built_key(0, description, info, 4)) != 0;
                 if (storage_ && storage_->add_pipeline(description)) report_.pipelines_stored++;
             }
         }
@@ -4029,9 +7153,10 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             return e->pipeline;
         }
         const bool linked = stand_in_ == Options::PipelineStandIn::library && use_libraries_;
-        // made now: waited for, or (built, and not linked from libraries
-        // that are) found in the pipeline cache
-        if (!async || (built && !linked)) {
+        // made now: waited for (a draw without a pixel shader, as Xenia), or
+        // (built, and not linked from libraries that are) found in the
+        // pipeline cache, unless the driver would compile it there
+        if (!async) {
             VkPipeline p = VK_NULL_HANDLE;
             {
                 Timer timer(report_.pipeline_seconds);
@@ -4041,6 +7166,15 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
             e->pipeline = p;
             e->state.store(1, std::memory_order_release);
             return p;
+        }
+        if (built && !linked) {
+            VkPipeline p = VK_NULL_HANDLE;
+            if (from_cache(info, p)) {
+                e->pipeline = p;
+                e->state.store(1, std::memory_order_release);
+                return p;
+            }
+            report_.pipelines_prebuilt_missed++; // made on the workers below, as any other
         }
         // made on the workers: the whole pipeline, or first its libraries
         // (made now, those the build step made)
@@ -4067,6 +7201,7 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
         e->queued = true;
     }
     if (e->stand_in) {
+        if (e->generic) retire_generic(*e);
         drawn_with(*e);
         return stand_in = true, e->stand_in;
     }
@@ -4148,9 +7283,21 @@ PipelineEntry *Impl::library(uint32_t part, const std::vector<uint32_t> &key, co
     // the parts with the guest's shaders are the slow ones: on the workers,
     // ahead of the whole pipelines; the others are made here, and so are
     // those the build step made into the pipeline cache (a lookup there)
-    const bool built = !built_libraries_.empty() && built_libraries_.count(ShaderStorage::hash(part, key)) != 0;
+    const bool built =
+        !built_libraries_.empty() && built_libraries_.count(built_key(part, key, desc.info, part)) != 0;
     if (built) report_.pipeline_libraries_prebuilt++;
-    if (async && !built && (part == 1 || part == 2)) {
+    if (async && (part == 1 || part == 2)) {
+        if (built) {
+            // a lookup in the pipeline cache, unless the driver would have to
+            // compile it after all
+            VkPipeline p = VK_NULL_HANDLE;
+            if (from_cache(desc.info, p)) {
+                slot->pipeline = p;
+                slot->state.store(1, std::memory_order_release);
+                return slot.get();
+            }
+            report_.pipeline_libraries_prebuilt_missed++;
+        }
         pipeline_workers_->queue(slot.get(), std::make_unique<PipelineDesc>(desc.info), PipelinePriority::first);
         return slot.get();
     }
@@ -4163,6 +7310,40 @@ PipelineEntry *Impl::library(uint32_t part, const std::vector<uint32_t> &key, co
     slot->pipeline = p;
     slot->state.store(1, std::memory_order_release);
     return slot.get();
+}
+
+uint64_t Impl::built_key(uint32_t seed, const std::vector<uint32_t> &words, const VkGraphicsPipelineCreateInfo &info,
+                         uint32_t which) const {
+    // the stages a part holds, as LibraryDesc splits them: the pre-
+    // rasterization part all but the fragment shader, the fragment shader's
+    // part that one; the vertex input and fragment output none
+    if (which == 0 || which == 3) return ShaderStorage::hash(seed, words);
+    std::vector<uint32_t> keyed = words;
+    for (uint32_t i = 0; i < info.stageCount; i++) {
+        const bool fragment = info.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+        if ((which == 1 && fragment) || (which == 2 && !fragment)) continue;
+        auto it = module_content_.find(info.pStages[i].module);
+        const uint64_t code = it == module_content_.end() ? 0 : it->second;
+        keyed.insert(keyed.end(), {uint32_t(code), uint32_t(code >> 32)});
+    }
+    return ShaderStorage::hash(seed, keyed);
+}
+
+bool Impl::from_cache(const VkGraphicsPipelineCreateInfo &info, VkPipeline &out) {
+    out = VK_NULL_HANDLE;
+    VkGraphicsPipelineCreateInfo asked = info;
+    // without the device's cache control the record is trusted, as before
+    if (d_.cache_control() && pipeline_cache_) asked.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    VkResult r;
+    {
+        Timer timer(report_.pipeline_seconds);
+        r = vkCreateGraphicsPipelines(dev_, pipeline_cache_, 1, &asked, nullptr, &out);
+    }
+    if (r == VK_SUCCESS) return true;
+    out = VK_NULL_HANDLE;
+    // VK_PIPELINE_COMPILE_REQUIRED: not in the cache; any other result a
+    // failure, which the workers would meet too
+    return r != VK_PIPELINE_COMPILE_REQUIRED;
 }
 
 VkPipeline Impl::link(PipelineEntry &e) {
@@ -4199,6 +7380,103 @@ VkPipeline Impl::link(PipelineEntry &e) {
     return p;
 }
 
+// The draw's pipeline with the generic shaders in place of the guest's: the
+// vertex shader in its plain host form (no expansion in the vertex shader,
+// no user clip planes, no screen extents; not tessellated), the pixel
+// shader's form without the float24 conversion (its centroids read at the
+// center, counted), the interlock path's state from the draw's uniform block
+// rather than specialized. The geometry shaders and everything else as the
+// draw's.
+bool Impl::generic_info(const VkGraphicsPipelineCreateInfo &info, Shader &vs, Shader *ps, bool points,
+                        uint32_t vertex_form, uint32_t pixel_form, GenericStages &out, std::string &why) {
+    if (!generic_on_) return why = "off", false;
+    if (!options_.generic_only && !use_libraries_) return why = "no pipeline libraries on the device", false;
+    if (info.stageCount > 5) return why = "more stages than the renderer makes", false;
+    // the vertex host form (shader::VertexOptions::key's host 0; ps_ucp_mode
+    // applies to points alone), with its screen extents and user clip planes
+    if (vertex_form & 0xFF) return why = "the vertex shader expanding points or rectangles", false;
+    if (pixel_form & 3) return why = "the pixel shader's float24 depth form", false;
+    std::string reason;
+    if (!program(vs, reason)) return why = "vertex shader: " + reason, false;
+    if (ps && !program(*ps, reason)) return why = "pixel shader: " + reason, false;
+    out.info = info;
+    out.info.pStages = out.stages;
+    out.vertex_data[0] = out.pixel_data = 1;
+    const uint32_t planes = std::min<uint32_t>((vertex_form >> 9) & 7, 6), cull = (vertex_form >> 12) & 1,
+                   extents = (vertex_form >> 15) & 1;
+    for (uint32_t i = 0; i < info.stageCount; i++) {
+        VkPipelineShaderStageCreateInfo &st = out.stages[i];
+        st = info.pStages[i];
+        switch (st.stage) {
+        case VK_SHADER_STAGE_VERTEX_BIT:
+            st.module = generic_vs_[extents][planes ? 1 + cull : 0];
+            out.vertex_data[0] = point_snap_ ? 1 : 0;
+            out.vertex_data[1] = planes;
+            st.pSpecializationInfo = point_snap_ || planes ? &out.vertex_spec : nullptr;
+            break;
+        case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+        case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: return why = "a tessellated draw", false;
+        case VK_SHADER_STAGE_FRAGMENT_BIT:
+            if (!ps) break; // the renderer's own (depth alone)
+            if ((pixel_form >> 8) & 0xFFFF)
+                approximate("generic shaders: interpolators at the pixel's center, not its centroid");
+            // (oDepth as the translator takes it: any result to it)
+            st.module = generic_fs_[points ? 1 : 0][ps->program_flags & shader::PROGRAM_WRITES_DEPTH ? 1 : 0];
+            st.pSpecializationInfo = point_snap_ ? &out.pixel_spec : nullptr;
+            break;
+        default: break; // the geometry shaders
+        }
+    }
+    return true;
+}
+
+VkPipeline Impl::generic_stand_in(PipelineEntry &e, const VkGraphicsPipelineCreateInfo &generic, bool async) {
+    if (e.generic || e.generic_failed) return e.generic;
+    if (!e.generic_libraries[0] && !e.generic_libraries[1]) {
+        PipelineParts parts;
+        library_keys(generic, parts);
+        for (uint32_t part = 0; part < 4; part++) e.generic_libraries[part] = library(part, parts.keys[part], generic, async);
+    }
+    VkPipeline libraries[4];
+    uint32_t count = 0;
+    for (PipelineEntry *l : e.generic_libraries) {
+        if (!l) continue;
+        if (!l->state.load(std::memory_order_acquire)) return VK_NULL_HANDLE;
+        if (!l->pipeline) {
+            approximate("generic shaders: a library the driver failed");
+            e.generic_failed = true;
+            return VK_NULL_HANDLE;
+        }
+        libraries[count++] = l->pipeline;
+    }
+    VkPipelineLibraryCreateInfoKHR list{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
+    list.libraryCount = count;
+    list.pLibraries = libraries;
+    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &list;
+    info.layout = layout_;
+    {
+        Timer timer(report_.pipeline_seconds);
+        if (vkCreateGraphicsPipelines(dev_, VK_NULL_HANDLE, 1, &info, nullptr, &e.generic) != VK_SUCCESS)
+            e.generic = VK_NULL_HANDLE;
+    }
+    if (e.generic) {
+        report_.generic_pipelines++;
+    } else {
+        approximate("generic shaders: linking failed");
+        e.generic_failed = true;
+    }
+    return e.generic;
+}
+
+void Impl::retire_generic(PipelineEntry &e) {
+    VkPipeline old = e.generic;
+    e.generic = VK_NULL_HANDLE;
+    if (!old) return;
+    begin_recording();
+    slots_[current_].after.push_back([this, old] { vkDestroyPipeline(dev_, old, nullptr); });
+}
+
 VkPipeline Impl::placeholder(const VkGraphicsPipelineCreateInfo &info) {
     VkPipelineShaderStageCreateInfo stages[5];
     VkGraphicsPipelineCreateInfo p = info;
@@ -4220,7 +7498,7 @@ VkPipeline Impl::placeholder(const VkGraphicsPipelineCreateInfo &info) {
 void Impl::retire_stand_in(PipelineEntry &e) {
     VkPipeline old = e.stand_in;
     e.stand_in = VK_NULL_HANDLE;
-    cmd();
+    begin_recording();
     slots_[current_].after.push_back([this, old] { vkDestroyPipeline(dev_, old, nullptr); });
 }
 
@@ -4525,9 +7803,12 @@ std::unique_ptr<PipelineDesc> Impl::undescribe(std::span<const uint32_t> words, 
                 st.module = s->module;
             } else if (form >> 31) {
                 shader::PixelOptions o;
-                o.depth_float24 = uint8_t(form & 0xFF);
+                o.depth_float24 = uint8_t(form & 3);
+                o.early_depth_stencil = (form >> 2) & 1;
+                o.blend_premultiply = (form >> 3) & 1;
                 o.centroid = uint16_t(form >> 8);
-                o.fsi = uint8_t((form >> 24) & 0x7F);
+                o.fsi = uint8_t((form >> 24) & 0x3F);
+                o.point_coordinates = (form >> 30) & 1;
                 if (o.fsi) o.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
                 if ((o.key() | 1u << 31) != form) return fail("a pixel shader's form unknown here");
                 st.module = pixel_module(*s, o, reason);
@@ -4538,6 +7819,7 @@ std::unique_ptr<PipelineDesc> Impl::undescribe(std::span<const uint32_t> words, 
                 o.clip_planes = uint8_t((form >> 9) & 7);
                 o.clip_planes_cull = (form >> 12) & 1;
                 o.point_ucp_mode = uint8_t((form >> 13) & 3);
+                o.extents = (form >> 15) & 1;
                 if (o.key() != form) return fail("a vertex shader's form unknown here");
                 st.module = vertex_module(*s, o, reason);
             }
@@ -4792,50 +8074,154 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
         out.shaders++;
         if (!sh || !translate(*sh, why)) out.shaders_failed++;
     }
+    // the extra shaders no run met, translated: made into libraries in the
+    // descriptions' commonest states below
+    std::vector<std::pair<uint32_t, uint64_t>> unmet;
+    std::unordered_set<uint64_t> unmet_seen, met_extra;
     for (const auto &[type, code] : o.extra_shaders) {
         if (type > 1) continue;
         const uint64_t hash = hash_words(type, code);
         out.extra_shaders++;
-        if (!storage.has_shader(hash)) out.extra_new++;
+        const bool met = storage.has_shader(hash);
+        if (!met) out.extra_new++;
         load_shader(type, code);
         Shader *sh = shader(hash);
-        if (!sh || !translate(*sh, why)) out.extra_failed++;
+        // a vertex shader whose fetches Direct3D fills in from the vertex
+        // declaration at bind time: the copy a draw runs is another shader
+        if (sh && xf::ucode::awaits_vertex_declaration(sh->parsed)) {
+            out.extra_undeclared++;
+            continue;
+        }
+        if (!sh || !translate(*sh, why))
+            out.extra_failed++;
+        else if (met)
+            met_extra.insert(hash);
+        else if (unmet_seen.insert(hash).second)
+            unmet.emplace_back(type, hash);
     }
     if (cancelled()) return error = "cancelled", false;
 
     // the descriptions' libraries and whole pipelines, queued for the
     // workers, each library once
+    struct VariantState {
+        uint64_t uses = 0;
+        std::vector<uint32_t> words; // a description in that state
+        size_t at = 0;               // where its guest shader's id lies in it
+    };
+    // a description's guest vertex and pixel shaders: the state of each one's
+    // part (its key with the shader's id left out, its form kept), counted
+    // (and each shader's part, by the shader and that key, in `parts_seen`)
+    std::set<std::tuple<uint32_t, uint64_t, std::vector<uint32_t>>> parts_seen;
+    auto note_variant_state = [&parts_seen](std::span<const uint32_t> words, const PipelineParts &parts,
+                                            std::map<std::vector<uint32_t>, VariantState> (&states)[2]) {
+        if (words.size() < 3) return;
+        size_t at = 3; // (describe: per stage, the stage, the module's kind, form and id, the specialization)
+        for (uint32_t i = 0; i < words[2]; i++) {
+            if (at + 6 > words.size()) return;
+            const uint32_t stage = words[at], kind = words[at + 1];
+            const size_t id_at = at + 3;
+            at += 5;
+            if (const uint32_t entries = words[at++]; entries != UINT32_MAX) {
+                at += size_t(entries) * 3;
+                if (at >= words.size()) return;
+                at += (size_t(words[at]) + 3) / 4 + 1;
+            }
+            if (kind != 1 || (stage != VK_SHADER_STAGE_VERTEX_BIT && stage != VK_SHADER_STAGE_FRAGMENT_BIT)) continue;
+            const uint32_t type = stage == VK_SHADER_STAGE_FRAGMENT_BIT;
+            std::vector<uint32_t> key = parts.keys[type ? 2 : 1];
+            if (key.empty()) continue;
+            const uint32_t lo = words[id_at], hi = words[id_at + 1];
+            for (size_t k = 3; k + 1 < key.size(); k++)
+                if (key[k - 2] == 1 && key[k] == lo && key[k + 1] == hi) key[k] = key[k + 1] = 0;
+            VariantState &s = states[type][key];
+            if (!s.uses) s.words.assign(words.begin(), words.end()), s.at = id_at;
+            s.uses++;
+            parts_seen.emplace(type, lo | uint64_t(hi) << 32, std::move(key));
+        }
+    };
     struct Made {
         uint64_t hash = 0;
         bool library = false;
         std::unique_ptr<PipelineEntry> entry;
+        bool extra = false; // an unmet shader's library
+        bool generic = false; // a generic shaders' library
     };
     std::vector<Made> made;
     std::unordered_set<uint64_t> queued_libraries;
+    // the states the descriptions give the vertex (0) and pixel (1) shaders'
+    // parts, by the part's key without the shader
+    std::map<std::vector<uint32_t>, VariantState> variant_states[2];
     ShaderStorage::Built record = ids;
     const bool libraries = d_.pipeline_library();
     for (const std::vector<uint32_t> &words : storage.pipelines()) {
         out.descriptions++;
-        const uint64_t hash = ShaderStorage::hash(0, words);
+        // made back first: what an earlier build step made is known by the
+        // description with its modules' code (built_key), which a newer
+        // translator changes
+        std::unique_ptr<PipelineDesc> desc = undescribe(words, why);
+        if (!desc) {
+            out.descriptions_failed++;
+            out.descriptions_failed_why[why]++;
+            if (options_.verbose)
+                std::fprintf(stderr, "  description %016llX: %s\n", (unsigned long long)ShaderStorage::hash(0, words),
+                             why.c_str());
+            continue;
+        }
+        const uint64_t hash = built_key(0, words, desc->info, 4);
+        PipelineParts parts;
+        if (libraries) {
+            library_keys(desc->info, parts);
+            if (!unmet.empty()) note_variant_state(words, parts, variant_states);
+            // the generic shaders' libraries in this description's state, so
+            // that a run draws a shader it never met in it at once
+            // (Options::generic_shaders), each once
+            Shader *vs = nullptr, *ps = nullptr;
+            bool points = false;
+            uint32_t vertex_form = 0, pixel_form = 0;
+            for (uint32_t i = 0; i < desc->info.stageCount; i++) {
+                auto name = module_names_.find(desc->info.pStages[i].module);
+                if (name == module_names_.end() || name->second.kind != 1) continue;
+                if (desc->info.pStages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+                    ps = shader(name->second.id), points = (name->second.form >> 30) & 1,
+                    pixel_form = name->second.form & ~(1u << 31);
+                else
+                    vs = shader(name->second.id), vertex_form = name->second.form;
+            }
+            // (the exact EDRAM's pipelines have no attachments)
+            const auto *rendering = static_cast<const VkPipelineRenderingCreateInfo *>(desc->info.pNext);
+            const bool attachments = rendering && (rendering->colorAttachmentCount ||
+                                                   rendering->depthAttachmentFormat != VK_FORMAT_UNDEFINED ||
+                                                   rendering->stencilAttachmentFormat != VK_FORMAT_UNDEFINED);
+            const bool this_path = attachments == !fsi_;
+            if (!this_path) out.descriptions_other_path++;
+            GenericStages generic;
+            if (generic_on_ && this_path && vs && ps && generic_info(desc->info, *vs, ps, points, vertex_form, pixel_form, generic, why)) {
+                PipelineParts generic_parts;
+                library_keys(generic.info, generic_parts);
+                for (uint32_t part : {1u, 2u}) {
+                    if (generic_parts.keys[part].empty()) continue;
+                    LibraryDesc ld(generic.info, part);
+                    const uint64_t lh = built_key(part, generic_parts.keys[part], ld.info, part);
+                    if (made_libraries.count(lh) || !queued_libraries.insert(lh).second) continue;
+                    Made m{lh, true, std::make_unique<PipelineEntry>()};
+                    m.generic = true;
+                    pipeline_workers_->queue(m.entry.get(), std::make_unique<PipelineDesc>(ld.info),
+                                             PipelinePriority::normal);
+                    made.push_back(std::move(m));
+                }
+            }
+        }
         if (made_pipelines.count(hash)) {
             out.descriptions_done_before++;
             continue;
         }
-        std::unique_ptr<PipelineDesc> desc = undescribe(words, why);
-        if (!desc) {
-            out.descriptions_failed++;
-            if (options_.verbose) std::fprintf(stderr, "  description %016llX: %s\n", (unsigned long long)hash, why.c_str());
-            continue;
-        }
         if (libraries) {
-            PipelineParts parts;
-            library_keys(desc->info, parts);
             for (uint32_t part = 0; part < 4; part++) {
                 if (parts.keys[part].empty()) continue;
-                const uint64_t lh = ShaderStorage::hash(part, parts.keys[part]);
+                LibraryDesc ld(desc->info, part);
+                const uint64_t lh = built_key(part, parts.keys[part], ld.info, part);
                 if (made_libraries.count(lh) || !queued_libraries.insert(lh).second) continue;
                 Made m{lh, true, std::make_unique<PipelineEntry>()};
-                LibraryDesc ld(desc->info, part);
                 pipeline_workers_->queue(m.entry.get(), std::make_unique<PipelineDesc>(ld.info),
                                          PipelinePriority::normal);
                 made.push_back(std::move(m));
@@ -4845,6 +8231,62 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
             Made m{hash, false, std::make_unique<PipelineEntry>()};
             pipeline_workers_->queue(m.entry.get(), std::move(desc), PipelinePriority::normal);
             made.push_back(std::move(m));
+        }
+    }
+    // the unmet shaders' libraries, in the commonest states of their part
+    if (libraries && o.extra_variants && !unmet.empty()) {
+        out.variant_states_seen = variant_states[0].size() + variant_states[1].size();
+        // a state's uses: the shaders runs met in it (a library each)
+        for (auto &states : variant_states)
+            for (auto &[key, state] : states) state.uses = 0;
+        for (const auto &[type, id, key] : parts_seen) variant_states[type][key].uses++;
+        for (uint32_t type = 0; type < 2; type++) {
+            std::vector<std::pair<const std::vector<uint32_t> *, const VariantState *>> states;
+            for (const auto &[key, state] : variant_states[type]) states.emplace_back(&key, &state);
+            // the commonest first; ties by the key, so a step chooses the same
+            std::sort(states.begin(), states.end(), [](const auto &a, const auto &b) {
+                return a.second->uses != b.second->uses ? a.second->uses > b.second->uses : *a.first < *b.first;
+            });
+            if (states.size() > o.extra_variants) states.resize(o.extra_variants);
+            out.variant_states += states.size();
+            // how well those states cover the libraries runs made of the
+            // disc's shaders they met (a library of each in each state taken)
+            for (const auto &[seen_type, id, key] : parts_seen) {
+                if (seen_type != type || !met_extra.count(id)) continue;
+                out.variant_check_libraries++;
+                for (const auto &[state_key, state] : states)
+                    if (*state_key == key) {
+                        out.variant_check_covered++;
+                        break;
+                    }
+            }
+            for (const auto &[shader_type, shader_hash] : unmet) {
+                if (shader_type != type) continue;
+                for (const auto &[state_key, state] : states) {
+                    std::vector<uint32_t> words = state->words;
+                    words[state->at] = uint32_t(shader_hash), words[state->at + 1] = uint32_t(shader_hash >> 32);
+                    std::unique_ptr<PipelineDesc> desc = undescribe(words, why);
+                    if (!desc) {
+                        out.extra_libraries_unmade++;
+                        continue;
+                    }
+                    PipelineParts parts;
+                    library_keys(desc->info, parts);
+                    const uint32_t part = type == 0 ? 1 : 2;
+                    if (parts.keys[part].empty()) continue;
+                    LibraryDesc ld(desc->info, part);
+                    const uint64_t lh = built_key(part, parts.keys[part], ld.info, part);
+                    if (made_libraries.count(lh)) {
+                        out.extra_libraries_done_before++;
+                        continue;
+                    }
+                    if (!queued_libraries.insert(lh).second) continue;
+                    Made m{lh, true, std::make_unique<PipelineEntry>(), true};
+                    pipeline_workers_->queue(m.entry.get(), std::make_unique<PipelineDesc>(ld.info),
+                                             PipelinePriority::normal);
+                    made.push_back(std::move(m));
+                }
+            }
         }
     }
     // waited for in order, with the progress
@@ -4860,6 +8302,8 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
     for (Made &m : made) {
         if (!m.entry->state.load(std::memory_order_acquire)) continue;
         const bool ok = m.entry->pipeline != VK_NULL_HANDLE;
+        if (m.extra) (ok ? out.extra_libraries : out.extra_libraries_failed)++;
+        if (m.generic) (ok ? out.generic_libraries : out.generic_libraries_failed)++;
         if (m.library)
             (ok ? out.libraries : out.libraries_failed)++;
         else
@@ -4882,12 +8326,6 @@ bool Impl::precompile(const PrecompileOptions &o, PrecompileReport &out, std::st
 }
 
 // ---- a draw ----
-
-struct Viewport {
-    VkViewport viewport{};
-    float ndc_scale[3] = {1, 1, 1}, ndc_offset[3] = {};
-    bool empty = false;
-};
 
 // draw_util.cc's GetHostViewportInfo, at resolution scale 1, for Vulkan
 // (origin at the top left, reverse Z allowed, float24 depth halved);
@@ -5020,7 +8458,8 @@ int32_t float_to_fixed_16p8(float f32) {
 // its depth target took 2048 tiles three times a frame). A tessellated draw's
 // vertices are not run (the estimator's "not reproducing tessellation").
 uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                          uint32_t primitive, bool tessellated) const {
+                          uint32_t primitive, bool tessellated, std::vector<ScreenVertex> *screen) const {
+    if (screen) screen->clear();
     uint32_t window = regs_[r::PA_SC_WINDOW_OFFSET];
     int32_t window_x = sign_extend(window & 0x7FFF, 15), window_y = sign_extend((window >> 16) & 0x7FFF, 15);
     uint32_t tl = regs_[r::PA_SC_WINDOW_SCISSOR_TL], br = regs_[r::PA_SC_WINDOW_SCISSOR_BR];
@@ -5037,7 +8476,7 @@ uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants,
         // the vertices' extent, where there is no scissor (Xenia's
         // execute_unclipped_draw_vs_on_cpu, without _with_scissor)
         if (scissor_bottom >= 8192 && scissor_right >= 8192 && !tessellated)
-            max_y = std::min(max_y, vertex_max_y(vs, constants, indices, primitive));
+            max_y = std::min(max_y, vertex_max_y(vs, constants, indices, primitive, screen));
     } else {
         // the viewport's bottom, truncated
         uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
@@ -5060,7 +8499,10 @@ uint32_t Impl::draw_max_y(const Shader &vs, const harness::Constants &constants,
 // 1024 vertices is not run (8192): the CPU's time, for what a scissor
 // usually bounds anyway.
 uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
-                            uint32_t primitive) const {
+                            uint32_t primitive, std::vector<ScreenVertex> *screen) const {
+    // (screen: where each vertex that is not killed lands, for draw_reach;
+    // left empty when the shader cannot be run for all of them)
+    if (screen) screen->clear();
     if (indices.empty()) return 0;
     if (vs.fetches_textures || !vs.writes_position_y) return 8192;
     uint32_t min_index = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, max_index = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
@@ -5073,6 +8515,8 @@ uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constant
     uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
     const float *vport = reinterpret_cast<const float *>(&regs_[r::PA_CL_VPORT_XSCALE]);
     float y_scale = vte & 4 ? vport[2] : 1.0f, y_offset = vte & 8 ? vport[3] : 0.0f;
+    float x_scale = vte & 1 ? vport[0] : 1.0f, x_offset = vte & 2 ? vport[1] : 0.0f;
+    if (screen && !(vs.writes_position_xz & 1)) screen = nullptr;
     bool divide_by_w = !((vte >> 8) & 1);
     if (divide_by_w && !vs.writes_position_w) return 8192;
     int32_t point_min_diameter = 0, point_max_diameter = 0;
@@ -5091,11 +8535,20 @@ uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constant
     std::string unsupported;
     for (uint32_t vertex : vertices) {
         input.registers[0][0] = float(vertex);
-        if (!shader::interpret(vs.parsed, input, constants, memory, output, unsupported)) return 8192;
+        if (!shader::interpret(vs.parsed, input, constants, memory, output, unsupported)) {
+            if (screen) screen->clear();
+            return 8192;
+        }
         if (vs.writes_vertex_kill && (std::bit_cast<uint32_t>(output.point_size[2]) & ~(1u << 31))) continue;
         float y = output.position[1];
         if (divide_by_w) y /= output.position[3];
         y = y * y_scale + y_offset;
+        if (screen) {
+            float x = output.position[0];
+            // (behind the eye, a polygon is not within its vertices' box)
+            if (divide_by_w) x = output.position[3] > 0.0f ? x / output.position[3] : NAN;
+            screen->push_back({vertex, x * x_scale + x_offset, y});
+        }
         if (points) {
             float radius = point_constant_radius_y;
             if (vs.writes_point_size)
@@ -5115,57 +8568,278 @@ uint32_t Impl::vertex_max_y(const Shader &vs, const harness::Constants &constant
     return (uint32_t(std::max(0, max_y_24p8)) + (msaa == 0 ? 127u : 255u)) >> 8;
 }
 
+// Beyond Xenia (whose estimate is the lowest row alone, draw_max_y): the
+// pixels of its render targets a draw can reach, as rectangles, for the
+// targets to take over the tiles under them and no others (Impl::draw's
+// acquire). Never less than the draw can write:
+// - the scissor, down to draw_max_y's row, always;
+// - with clipping on, polygons are clipped to the host's viewport: its
+//   rectangle;
+// - with clipping off, where the vertex shader runs on the CPU for the
+//   draw's vertices (draw_max_y's own run when there is no scissor, else for
+//   draws of at most twelve vertices: the clears and the screen-space
+//   rectangles), the box of a polygon draw's vertices, none of them behind
+//   the eye; for a rectangle list of up to four rectangles a box each, with
+//   the corner the rasterizer adds, whichever of the three it completes.
+// Points and lines (sprites and widths reach past their vertices) and
+// tessellated draws keep the scissor's rectangle.
+void Impl::draw_reach(const Shader &vs, const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                      uint32_t primitive, bool tessellated, const VkViewport &viewport, const VkRect2D &scissor,
+                      std::vector<Reach> &reach) const {
+    reach.clear();
+    std::vector<ScreenVertex> &screen = reach_vertices_;
+    const uint32_t left = uint32_t(scissor.offset.x), top = uint32_t(scissor.offset.y);
+    const uint32_t right = left + scissor.extent.width;
+    const uint32_t bottom =
+        std::min(top + scissor.extent.height, draw_max_y(vs, constants, indices, primitive, tessellated, &screen));
+    const Reach all{left, top, right, bottom};
+    const bool polygons = (primitive >= 4 && primitive <= 8) || (primitive >= 13 && primitive <= 15);
+    if (!reach_tiles_ || !polygons || bottom <= top || right <= left) return reach.push_back(all);
+    // A box of screen positions (in the console's pixels, the window offset
+    // and the pixel centers' half added) as the pixels with a sample inside
+    // it, within the scissor; nothing when the box is not finite. A host
+    // pixel's samples are at least a sixteenth of it from its edges (the
+    // standard positions and the Xenos's), and the host's own vertices are
+    // taken to be within a 512th of a host pixel (the rasterizer's snapping)
+    // and a 1024th of a console pixel (the arithmetic) of these: so a pixel
+    // the box enters by less than `inside` has no sample in it, and an edge
+    // on a pixel boundary (a clear's, a viewport's) takes no pixel beyond.
+    // Polygons drawn as lines or points (the polygon mode) reach a pixel
+    // past their edges.
+    const double inside = (1.0 / 16.0 - 1.0 / 512.0) / double(scale_.factor()) - 1.0 / 1024.0;
+    const double past = primitive != 8 && ((regs_[r::PA_SU_SC_MODE_CNTL] >> 3) & 3) == 1 ? 1.0 : 0.0;
+    auto add = [&](double x0, double y0, double x1, double y1) {
+        if (!std::isfinite(x0) || !std::isfinite(y0) || !std::isfinite(x1) || !std::isfinite(y1) || !(inside > 0.0))
+            return false;
+        Reach r = all;
+        r.x0 = uint32_t(std::clamp(std::floor(x0 + inside - past), double(left), double(right)));
+        r.y0 = uint32_t(std::clamp(std::floor(y0 + inside - past), double(top), double(bottom)));
+        r.x1 = uint32_t(std::clamp(std::ceil(x1 - inside + past), double(left), double(right)));
+        r.y1 = uint32_t(std::clamp(std::ceil(y1 - inside + past), double(top), double(bottom)));
+        reach.push_back(r);
+        return true;
+    };
+    if (!((regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1)) {
+        if (!add(viewport.x, viewport.y, double(viewport.x) + viewport.width, double(viewport.y) + viewport.height))
+            reach.push_back(all);
+        return;
+    }
+    if (tessellated) return reach.push_back(all);
+    // (draw_max_y ran the shader only where there is no scissor)
+    if (screen.empty() && indices.size() <= 12) vertex_max_y(vs, constants, indices, primitive, &screen);
+    if (screen.empty()) return reach.push_back(all);
+    double add_x = 0.0, add_y = 0.0;
+    if (!(regs_[r::PA_SU_VTX_CNTL] & 1)) add_x += 0.5, add_y += 0.5;
+    if ((regs_[r::PA_SU_SC_MODE_CNTL] >> 16) & 1) {
+        const uint32_t window = regs_[r::PA_SC_WINDOW_OFFSET];
+        add_x += sign_extend(window & 0x7FFF, 15), add_y += sign_extend((window >> 16) & 0x7FFF, 15);
+    }
+    if (primitive == 8 && indices.size() <= 12 && indices.size() % 3 == 0) {
+        // a box a rectangle (vertex_max_y's vertices are the indices
+        // clamped as the draw's, sorted)
+        const uint32_t min_index = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, max_index = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
+        bool each = true;
+        for (size_t k = 0; k < indices.size() && each; k += 3) {
+            double x[3], y[3];
+            for (size_t i = 0; i < 3 && each; i++) {
+                const uint32_t index = std::min(max_index, std::max(min_index, indices[k + i] & 0xFFFFFF));
+                auto at = std::lower_bound(screen.begin(), screen.end(), index,
+                                           [](const ScreenVertex &v, uint32_t value) { return v.index < value; });
+                if (indices[k + i] == UINT32_MAX || at == screen.end() || at->index != index) each = false;
+                else x[i] = at->x + add_x, y[i] = at->y + add_y;
+            }
+            if (!each) break;
+            // The fourth corner mirrors the vertex opposite the longest edge
+            // (rectangle_list.geom). Three corners of an axis-aligned box:
+            // the diagonal is the longest however the axes are scaled, and
+            // the fourth is the box's. Else opposite any of the three.
+            const double bx0 = std::min({x[0], x[1], x[2]}), bx1 = std::max({x[0], x[1], x[2]});
+            const double by0 = std::min({y[0], y[1], y[2]}), by1 = std::max({y[0], y[1], y[2]});
+            uint32_t corners = 0;
+            for (int i = 0; i < 3; i++)
+                if ((x[i] == bx0 || x[i] == bx1) && (y[i] == by0 || y[i] == by1))
+                    corners |= 1u << ((x[i] == bx1 ? 1 : 0) | (y[i] == by1 ? 2 : 0));
+            if (std::popcount(corners) == 3 && bx1 > bx0 && by1 > by0) {
+                each = add(bx0, by0, bx1, by1);
+                continue;
+            }
+            const double fx[3] = {x[1] + x[2] - x[0], x[0] + x[2] - x[1], x[0] + x[1] - x[2]};
+            const double fy[3] = {y[1] + y[2] - y[0], y[0] + y[2] - y[1], y[0] + y[1] - y[2]};
+            each = add(std::min({bx0, fx[0], fx[1], fx[2]}), std::min({by0, fy[0], fy[1], fy[2]}),
+                       std::max({bx1, fx[0], fx[1], fx[2]}), std::max({by1, fy[0], fy[1], fy[2]}));
+        }
+        if (each) return;
+        reach.clear();
+        // (a killed vertex or a position that is not finite: the scissor's)
+        return reach.push_back(all);
+    }
+    if (primitive == 8) return reach.push_back(all);
+    double x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+    for (const ScreenVertex &v : screen) {
+        if (!std::isfinite(v.x) || !std::isfinite(v.y)) return reach.push_back(all);
+        x0 = std::min(x0, double(v.x)), x1 = std::max(x1, double(v.x));
+        y0 = std::min(y0, double(v.y)), y1 = std::max(y1, double(v.y));
+    }
+    if (!add(x0 + add_x, y0 + add_y, x1 + add_x, y1 + add_y)) reach.push_back(all);
+}
+
+// Beyond Xenia: whether a draw is the console's clear of its depth target,
+// one rectangle that writes the depth and the stencil of every sample it
+// covers whatever they held, and which pixels and word then. Only what is
+// certain: anything else answers no (`why`), and the draw's tiles are
+// transferred as always.
+// - one rectangle (a rectangle list of three vertices), not tessellated, not
+//   predicated on a VIZ query nor a survey draw, no user clip planes, no
+//   vertex kill;
+// - the depth test on, always passing and written; the stencil test on,
+//   always passing, replacing (or zeroing) with the whole write mask, so
+//   that no bit of the old word is left;
+// - nothing in the pixel shader that drops a sample: no kill, no oDepth, no
+//   alpha test other than always, no alpha to coverage;
+// - the vertex shader run on the CPU (as draw_max_y's) gives three corners
+//   of an axis-aligned rectangle with W 1 and one Z; the pixels are those
+//   wholly inside it, the scissor and the viewport (a thirty-second of a
+//   pixel of slack: sample positions are no nearer than a sixteenth to a
+//   pixel's edge), so every sample of them at any sample count and
+//   resolution scale;
+// - the word is known where the host's depth is one value whatever the
+//   order and the contraction of the operations that make it (each
+//   intermediate exact as a float: the clears' 0 and 1 are), with no polygon
+//   offset, and it is the target's own encoding of a guest word (a 24-bit
+//   unorm host depth rounds without doubt; a float one is exactly the
+//   word's value).
+Impl::DepthOverwrite Impl::depth_overwrite(const gpu::Draw &d, const Shader &vs, const Shader *ps,
+                                           const harness::Constants &constants, const std::vector<uint32_t> &indices,
+                                           uint32_t depth_control, const RenderTarget &depth, const VkViewport &viewport,
+                                           const float *ndc_scale, const float *ndc_offset, const VkRect2D &scissor,
+                                           const char *&why) const {
+    DepthOverwrite o;
+    auto no = [&](const char *reason) { return why = reason, o; };
+    if (indices.size() != 3) return no("not one rectangle");
+    if ((d.viz_query & 0x100) || viz_predicate_ != UINT32_MAX || (regs_[reg::PA_SC_VIZ_QUERY] & 1))
+        return no("a VIZ query");
+    const uint32_t clip = regs_[r::PA_CL_CLIP_CNTL], vte = regs_[r::PA_CL_VTE_CNTL];
+    const bool clipping = !((clip >> 16) & 1);
+    if (clipping && (clip & 0x3F)) return no("user clip planes");
+    if ((depth_control & 0x76) != 0x76) return no("depth not always written");
+    // stencil: on, always, the pass operation replace (2) or zero (1), every bit written
+    const uint32_t stencil_state = regs_[r::RB_STENCILREFMASK];
+    const uint32_t pass = (depth_control >> 14) & 7;
+    // (the stencil test off: the stencil is kept, the depth alone overwritten)
+    const bool stencil_kept = !(depth_control & 1);
+    if (!stencil_kept) {
+        if (((depth_control >> 8) & 7) != 7 || (pass != 1 && pass != 2) || ((stencil_state >> 16) & 0xFF) != 0xFF)
+            return no("stencil not replaced");
+        // (the back face's own state, which the rectangle's triangles may take: the same)
+        if (((depth_control >> 7) & 1) && (((depth_control >> 20) & 0xFFF) != ((depth_control >> 8) & 0xFFF) ||
+                                           ((regs_[r::RB_STENCILREFMASK_BF] ^ stencil_state) & 0xFFFFFF)))
+            return no("stencil not replaced");
+    }
+    const uint32_t stencil = !stencil_kept && pass == 2 ? stencil_state & 0xFF : 0;
+    if (ps) {
+        const uint32_t color_control = regs_[r::RB_COLORCONTROL];
+        if (ps->summary.kills || ps->writes_depth) return no("the pixel shader kills or writes depth");
+        if (((color_control & 8) && (color_control & 7) != 7) || (color_control & 16)) return no("alpha test or alpha to coverage");
+    }
+    if (depth.format == 1 && options_.depth_float24_convert_in_pixel_shader) return no("depth converted in the pixel shader");
+    if (vs.fetches_textures || vs.writes_vertex_kill || !vs.writes_position_y || !vs.writes_position_w ||
+        vs.writes_position_xz != 5)
+        return no("the vertex shader");
+    // the three corners on the screen, in the console's pixels, as the
+    // host's vertex shader and viewport place them
+    const uint32_t min_index = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, max_index = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
+    std::span<const uint8_t> memory(memory_.data(), GuestMemory::SIZE);
+    harness::CaseInput input{};
+    harness::CaseOutput output;
+    std::string unsupported;
+    double x[3], y[3];
+    float z = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        if (indices[i] == UINT32_MAX) return no("not one rectangle");
+        input.registers[0][0] = float(std::min(max_index, std::max(min_index, indices[i] & 0xFFFFFF)));
+        if (!shader::interpret(vs.parsed, input, constants, memory, output, unsupported)) return no("the vertex shader");
+        // (W 1, given as W or as 1/W: the position's formats change nothing then)
+        if (output.position[3] != 1.0f) return no("W is not 1");
+        if (i && std::bit_cast<uint32_t>(output.position[2]) != std::bit_cast<uint32_t>(z)) return no("Z is not one value");
+        z = output.position[2];
+        const double ndc_x = double(output.position[0]) * ndc_scale[0] + ndc_offset[0];
+        const double ndc_y = double(output.position[1]) * ndc_scale[1] + ndc_offset[1];
+        x[i] = viewport.x + (ndc_x + 1.0) * 0.5 * viewport.width;
+        y[i] = viewport.y + (ndc_y + 1.0) * 0.5 * viewport.height;
+        if (!std::isfinite(x[i]) || !std::isfinite(y[i])) return no("the vertex shader");
+    }
+    (void)vte;
+    double x0 = std::min({x[0], x[1], x[2]}), x1 = std::max({x[0], x[1], x[2]});
+    double y0 = std::min({y[0], y[1], y[2]}), y1 = std::max({y[0], y[1], y[2]});
+    // three different corners of that box: the fourth is the rectangle's
+    uint32_t corners = 0;
+    for (int i = 0; i < 3; i++) {
+        if ((x[i] != x0 && x[i] != x1) || (y[i] != y0 && y[i] != y1)) return no("not axis-aligned");
+        corners |= 1u << ((x[i] == x1 ? 1 : 0) | (y[i] == y1 ? 2 : 0));
+    }
+    if (std::popcount(corners) != 3 || !(x1 > x0) || !(y1 > y0)) return no("not axis-aligned");
+    if (clipping) {
+        // (clipped to the viewport)
+        x0 = std::max(x0, double(viewport.x)), x1 = std::min(x1, double(viewport.x) + viewport.width);
+        y0 = std::max(y0, double(viewport.y)), y1 = std::min(y1, double(viewport.y) + viewport.height);
+    }
+    const double slack = 1.0 / 32.0;
+    const double left = std::max(std::ceil(x0 - slack), double(scissor.offset.x));
+    const double top = std::max(std::ceil(y0 - slack), double(scissor.offset.y));
+    const double right = std::min(std::floor(x1 + slack), double(scissor.offset.x) + scissor.extent.width);
+    const double bottom = std::min(std::floor(y1 + slack), double(scissor.offset.y) + scissor.extent.height);
+    if (!(left >= 0.0 && top >= 0.0 && right > left && bottom > top && right <= 16384.0 && bottom <= 16384.0))
+        return no("covers nothing");
+    // the host's depth: z * scale + offset, then the viewport's range, each
+    // step exact (so the same however it is computed)
+    auto exact = [](double v) { return double(float(v)) == v; };
+    const double z_scaled = double(z) * ndc_scale[2], z_ndc = z_scaled + ndc_offset[2];
+    const double range = double(viewport.maxDepth) - viewport.minDepth, z_ranged = z_ndc * range;
+    double host = z_ranged + viewport.minDepth;
+    const bool known = exact(z_scaled) && exact(z_ndc) && exact(range) && exact(z_ranged) && exact(host);
+    const double low = std::min(viewport.minDepth, viewport.maxDepth), high = std::max(viewport.minDepth, viewport.maxDepth);
+    if (clipping) {
+        // inside the clip volume, or the rectangle is clipped away (or its
+        // depth is not known to be inside)
+        if (!known || !(z_ndc >= 0.0 && z_ndc <= 1.0)) return no("the depth may be clipped");
+    } else {
+        host = std::min(std::max(host, low), high); // (the depth clamp)
+    }
+    o.depth_whole = true, o.whole = !stencil_kept;
+    o.word = stencil; // (the stencil written, when whole; the depth's bits below, once known)
+    o.x0 = uint32_t(left), o.y0 = uint32_t(top), o.x1 = uint32_t(right), o.y1 = uint32_t(bottom);
+    why = "the depth is not one known word";
+    if (!known || !(host >= 0.0 && host <= 1.0)) return o;
+    // no polygon offset (a rectangle's is the front's, with the offset of
+    // points and lines enabled)
+    if ((regs_[r::PA_SU_SC_MODE_CNTL] >> 13) & 1) {
+        const float *offsets = reinterpret_cast<const float *>(&regs_[r::PA_SU_POLY_OFFSET_FRONT_SCALE]);
+        if (offsets[0] != 0.0f || offsets[1] != 0.0f) return o;
+    }
+    uint32_t d24;
+    if (depth.format == 0) {
+        const double scaled = host * 16777215.0;
+        d24 = uint32_t(std::llround(scaled));
+        if (std::fabs(scaled - double(d24)) > 1.0 / 64.0) return o;
+    } else {
+        d24 = float_to_float24(float(host * 2.0), options_.depth_float24_round);
+    }
+    const uint32_t word = d24 << 8 | stencil;
+    // (a float host depth holds the draw's value itself, which transfers keep)
+    if (depth.image.format != VK_FORMAT_D24_UNORM_S8_UINT && double(depth_clear_value(depth.format, word).depthStencil.depth) != host)
+        return o;
+    o.known_depth = true, o.constant = o.whole, o.word = word;
+    why = stencil_kept ? "the stencil kept" : nullptr;
+    return o;
+}
+
 // A draw outside copy mode, as the processor gives it (immediate indices in
 // the draw, which Xenia does not draw).
-void Impl::draw(const gpu::Draw &d) {
-    report_.draws++;
-    // VIZ queries, as Xenia's default (occlusion_query_viz off), counted:
-    // draws predicated on one (DRAW_INDX's VIZ token, bit 8) are drawn, and
-    // survey draws (PA_SC_VIZ_QUERY's viz_query_ena with kill_pix_post_hi_z)
-    // are drawn as they are
-    if (d.viz_query & 0x100) use("draws predicated on a VIZ query (drawn, as Xenia's default)");
-    if ((regs_[reg::PA_SC_VIZ_QUERY] & 0x81) == 0x81) use("VIZ survey draws (drawn, as Xenia's default)");
-    uint32_t mode = regs_[reg::RB_MODECONTROL] & 7;
-    if (EdramMode(mode) != EdramMode::ColorDepth && EdramMode(mode) != EdramMode::DepthOnly) return skip("EDRAM mode " + std::to_string(mode));
-
-    uint32_t primitive = d.primitive, count = d.count;
-    bool index32 = d.index32;
-    if (count == 0) return;
-    bool color = EdramMode(mode) == EdramMode::ColorDepth;
-    // whether the draw can write any target (a color channel enabled, or depth or stencil on)
-    bool writes_targets = (color && (regs_[reg::RB_COLOR_MASK] & 0xFFFF) != 0) || (regs_[reg::RB_DEPTHCONTROL] & 3) != 0;
-    {
-        // A draw that can write nothing (no color channel enabled, depth and
-        // stencil off, no memory export) leaves EDRAM and memory as they
-        // were, and the occlusion queries' counts are the processor's fake
-        // ones (EVENT_WRITE_ZPD, as Xenia's): nothing to draw, whatever its
-        // primitive. A UE3 game issues hundreds of such point lists a
-        // frame.
-        const Shader *v = have_vertex_ ? shader(vertex_hash_) : nullptr;
-        const Shader *p = have_pixel_ ? shader(pixel_hash_) : nullptr;
-        bool exports = (v && v->summary.memexport) || (color && p && p->summary.memexport);
-        if (!writes_targets && !exports) {
-            if (options_.verbose)
-                std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
-            return;
-        }
-        // the port draws this frame (native_render.h): the draws its filter
-        // selects skipped, never one exporting memory (the CPU may read it)
-        if (native_suppress_) {
-            if (exports) {
-                native::detail::bump(native::detail::atomic_counters().memexport_kept);
-            } else {
-                native::PassInfo pass;
-                pass.color = color, pass.has_pixel_shader = p != nullptr;
-                pass.primitive = primitive, pass.count = count;
-                pass.vertex_shader = have_vertex_ ? vertex_hash_ : 0, pass.pixel_shader = have_pixel_ ? pixel_hash_ : 0;
-                if (!native_keep(pass)) {
-                    if (zpd_current_) zpd_counts_[zpd_current_].suppressed = true;
-                    return;
-                }
-            }
-        }
-    }
+// A draw's front part (DrawFront): false when the draw ends there.
+bool Impl::draw_front(const gpu::Draw &d, DrawFront &f) {
+    const uint32_t primitive = f.primitive, count = f.count;
+    const bool index32 = f.index32, color = f.color, writes_targets = f.writes_targets;
+    (void)count, (void)index32;
     // What the draw asks for, counted whether it is drawn or not
     // (Report::used): user clip planes (PA_CL_CLIP_CNTL's ucp_ena_0-5 while
     // clipping is on; on points with ps_ucp_mode), and lines of another width
@@ -5183,7 +8857,8 @@ void Impl::draw(const gpu::Draw &d) {
             if (width != 8) {
                 char what[96];
                 std::snprintf(what, sizeof(what), "line draws %g pixels wide (PA_SU_LINE_CNTL)", double(width) / 8.0);
-                use(what);
+                // (by its text: the literals' count is kept by address, and this one is on the stack)
+                use(std::string(what));
             }
         }
     }
@@ -5230,14 +8905,14 @@ void Impl::draw(const gpu::Draw &d) {
                 hull = tess_mode == 2 ? 4 : 0;
             break;
         }
-        if (host_vertex.host == HV::Vertex) return skip("tessellation: " + what);
+        if (host_vertex.host == HV::Vertex) return skip("tessellation: " + what), false;
         // the device's tessellation shaders are optional (most mobile GPUs
         // lack them)
-        if (!d_.tessellation_shader()) return skip("tessellation without tessellation shaders: " + what);
+        if (!d_.tessellation_shader()) return skip("tessellation without tessellation shaders: " + what), false;
         // adaptive tessellation's edge factors are 32-bit floats in an index
         // buffer (Xenia fails the draw otherwise)
         if (tess_mode == 2 && !(d.indexed && d.index32))
-            return skip("adaptive tessellation without 32-bit edge factors");
+            return skip("adaptive tessellation without 32-bit edge factors"), false;
         host_vertex.equal_spacing = tess_mode == 0;
     }
     bool rectangles = !tessellated && primitive == 8, points = !tessellated && primitive == 1;
@@ -5262,7 +8937,7 @@ void Impl::draw(const gpu::Draw &d) {
         bool cull = host_vertex.clip_planes_cull || (points && host_vertex.point_ucp_mode == 2);
         bool clip = !host_vertex.clip_planes_cull;
         if ((cull && !d_.cull_distance()) || (clip && !d_.clip_distance()))
-            return skip("user clip planes without clip or cull distances on the device");
+            return skip("user clip planes without clip or cull distances on the device"), false;
         if (points && host_vertex.point_ucp_mode == 2 && !host_vertex.clip_planes_cull && host_vertex.clip_planes > 4)
             approximate("points with ps_ucp_mode 2 and more than 4 user clip planes (clipped by the corners only)");
     }
@@ -5271,6 +8946,11 @@ void Impl::draw(const gpu::Draw &d) {
             points ? shader::HostVertex::PointListAsTriangleStrip : shader::HostVertex::RectangleListAsTriangleStrip;
     bool expanded = host_vertex.host == shader::HostVertex::PointListAsTriangleStrip ||
                     host_vertex.host == shader::HostVertex::RectangleListAsTriangleStrip;
+    // in a screen extent report, the vertex shader bounding it where its
+    // positions are the final ones (not points or rectangles a geometry
+    // shader expands: a sprite's corners, a rectangle's fourth corner)
+    const uint32_t extent_words = (!points && !rectangles) || expanded ? extent_draw_words() : UINT32_MAX;
+    host_vertex.extents = extent_words != UINT32_MAX;
     // triangles, quads and polygons (draw_util.h's IsPrimitivePolygonal, the
     // triangle and quad patches with it): faces, culling, the front and back
     // polygon offsets
@@ -5297,7 +8977,7 @@ void Impl::draw(const gpu::Draw &d) {
     // Not drawn, as Xenia's primitive processor does not: the triangle list
     // with wireframe flags (7), whose flags' place no reference gives, and
     // the 2D engine's copy and fill rectangles and strips (16 to 22).
-    default: return skip(std::string("primitive ") + primitive_name(primitive));
+    default: return skip(std::string("primitive ") + primitive_name(primitive)), false;
     }
     // the types the reset index cuts (Xenia's ProcessIndexBuffer list, by the
     // guest's type: tessellated strips and fans too, patches not, adaptive
@@ -5307,20 +8987,25 @@ void Impl::draw(const gpu::Draw &d) {
                  !(tessellated && tess_mode == 2);
 
     // shaders
-    Shader *vs = have_vertex_ ? shader(vertex_hash_) : nullptr;
-    if (!vs) return skip("no vertex shader");
-    Shader *ps = color && have_pixel_ ? shader(pixel_hash_) : nullptr;
+    Shader *vs = have_vertex_ ? vertex_shader_ : nullptr;
+    if (!vs) return skip("no vertex shader"), false;
+    Shader *ps = color && have_pixel_ ? pixel_shader_ : nullptr;
     std::string why;
-    if (!translate(*vs, why)) return skip("vertex shader: " + why);
-    if (ps && !translate(*ps, why)) return skip("pixel shader: " + why);
+    // a shader's forms the generic shaders draw may be translated on the
+    // workers, the draw drawn by them meanwhile (translating)
+    // (translating: a form the draw uses is; the first forms may be
+    // translating for another draw's sake)
+    bool translating = false, first_forms_translating = false;
+    if (!translate(*vs, why, &first_forms_translating)) return skip("vertex shader: " + why), false;
+    if (ps && !translate(*ps, why, &first_forms_translating)) return skip("pixel shader: " + why), false;
     for (const Shader *s : {vs, ps})
         if (s)
-            for (const std::string &a : s->approximate) approximate(a);
+            for (const std::string &a : s->approximate) report_.approximate[a]++, approximations_++;
 
     // render targets
     uint32_t surface = regs_[reg::RB_SURFACE_INFO], pitch = surface & 0x3FFF, msaa = (surface >> 16) & 3;
-    if (!pitch) return skip("surface pitch 0"); // Xenia draws nothing then, exports neither
-    if (msaa == 3) return skip("MSAA mode 3");
+    if (!pitch) return skip("surface pitch 0"), false; // Xenia draws nothing then, exports neither
+    if (msaa == 3) return skip("MSAA mode 3"), false;
     // Memory exports. A draw that rasterizes nothing (it writes no target,
     // or the vertex shader only exports: SQ_PROGRAM_CNTL's vs_export_mode
     // multipass; or no target, viewport or scissor is left) still runs its
@@ -5344,7 +9029,7 @@ void Impl::draw(const gpu::Draw &d) {
         if (!rasterizes_nothing()) {
             if (options_.verbose)
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
-            return;
+            return false;
         }
     }
     RenderTarget *colors[4] = {};
@@ -5354,9 +9039,18 @@ void Impl::draw(const gpu::Draw &d) {
     bool any_gamma = false;
     uint32_t mask = regs_[reg::RB_COLOR_MASK];
     // the interlock path makes no render targets: their places in EDRAM
-    // (edram_view), for the draw's extent
-    RenderTarget views[5];
+    // (edram_view), for the draw's extent; only what the draw reads of each
+    // (a RenderTarget each, made and destroyed at every draw, was a tenth of
+    // the draw's own time)
+    struct View {
+        uint32_t width, height, format;
+    };
+    View views[5];
     bool viewed[5] = {};
+    auto view_of = [&](bool is_depth, uint32_t base, uint32_t format) {
+        const RenderTarget t = edram_view(is_depth, base, pitch, msaa, format);
+        return View{t.width, t.height, t.format};
+    };
     for (uint32_t i = 0; i < 4 && ps; i++) {
         color_masks[i] = (mask >> (4 * i)) & 0xF;
         if (!color_masks[i] || !(ps->colors_written & (1u << i))) {
@@ -5367,49 +9061,76 @@ void Impl::draw(const gpu::Draw &d) {
         if (format == 1) any_gamma = true;
         if (fsi_) {
             if (format == 8 || format == 9 || format == 11 || format == 13)
-                return skip(std::string("color target format ") + color_target_format_name(format));
-            views[i] = edram_view(false, info & 0xFFF, pitch, msaa, format);
+                return skip(std::string("color target format ") + color_target_format_name(format)), false;
+            views[i] = view_of(false, info & 0xFFF, format);
             viewed[i] = true;
             continue;
         }
         // the exponent bias, and 16-bit fixed (-32..32, 10 fraction bits) kept as snorm
         color_scales[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
         if (format == 4 || format == 5) color_scales[i] *= 1024.0f / 32767.0f;
+        // (16_16 keeps no alpha: the shader's is the blend's factor only, and
+        // the range's scale would make a blend by it 32 times too weak, as
+        // Xenia's host path does; a negative scale tells the shader to leave
+        // the alpha out of it. 16_16_16_16 stores its alpha, scaled: a blend
+        // by the source's alpha there is still off, and counted)
+        if (format == 4) color_scales[i] = -color_scales[i];
         colors[i] = render_target(false, info & 0xFFF, pitch, msaa, format);
-        if (!colors[i]) return fatal_.empty() ? skip(std::string("color target format ") + color_target_format_name(format)) : void();
+        if (!colors[i]) {
+            if (fatal_.empty()) skip(std::string("color target format ") + color_target_format_name(format));
+            return false;
+        }
         // 8_8_8_8_GAMMA: the shader writes linear into a target kept linear,
         // else the gamma curve (blended in gamma then, unlike the console)
         if (format == 1 && !colors[i]->gamma_linear) gamma_targets |= 1u << i;
+        // 2_10_10_10_FLOAT: its alpha is two fixed bits, so the console takes
+        // the source's alpha to 0..1 before it blends by it and stores it; the
+        // host keeps the target as float, whose blend takes any alpha (as
+        // Xenia's host path): the shader clamps it (the word's bits 4-7)
+        if (format == 3 || format == 12) gamma_targets |= 16u << i;
     }
     if (any_gamma) use("draws into 8_8_8_8_GAMMA color targets");
-    if (gamma_targets) approximate("8_8_8_8_GAMMA color targets blended in gamma (no RGBA16 unorm attachments)");
+    // (a pixel shader's export runs for each host pixel: as many times more
+    // as the scale's area, to the same addresses; Xenia's the same)
+    if (!scale_.one() && ps && ps->exports)
+        approximate("pixel shader memory export at a resolution scale (run once a host pixel)");
+    if (gamma_targets & 0xF)
+        approximate("8_8_8_8_GAMMA color targets blended in gamma (no RGBA16 unorm attachments)");
     uint32_t depth_control = export_only ? 0 : regs_[reg::RB_DEPTHCONTROL];
     RenderTarget *depth = nullptr;
     if (depth_control & 3) {
         uint32_t info = regs_[reg::RB_DEPTH_INFO], format = (info >> 16) & 1;
         if (fsi_) {
-            views[4] = edram_view(true, info & 0xFFF, pitch, msaa, format);
+            views[4] = view_of(true, info & 0xFFF, format);
             viewed[4] = true;
         } else {
             if (format == 1 && !options_.depth_float24_convert_in_pixel_shader)
                 approximate("D24FS8 depth as 32-bit float");
             depth = render_target(true, info & 0xFFF, pitch, msaa, format);
-            if (!depth) return;
+            if (!depth) return false;
         }
     } else {
         depth_control = 0;
     }
     uint32_t width = 8192, height = 8192;
+    // (and the pass's, at the resolution scale: the targets' images)
+    uint32_t host_width = max_image_, host_height = max_image_;
     for (RenderTarget *t : colors)
-        if (t) width = std::min(width, t->width), height = std::min(height, t->height);
-    if (depth) width = std::min(width, depth->width), height = std::min(height, depth->height);
+        if (t) {
+            width = std::min(width, t->width), height = std::min(height, t->height);
+            host_width = std::min(host_width, t->host_width), host_height = std::min(host_height, t->host_height);
+        }
+    if (depth) {
+        width = std::min(width, depth->width), height = std::min(height, depth->height);
+        host_width = std::min(host_width, depth->host_width), host_height = std::min(host_height, depth->host_height);
+    }
     for (uint32_t i = 0; i < 5; i++)
         if (viewed[i]) width = std::min(width, views[i].width), height = std::min(height, views[i].height);
     if (width == 8192 && height == 8192 && !export_only && !rasterizes_nothing()) {
         // no target the pixel shader writes and no depth: nothing it could change
         if (options_.verbose)
             std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
-        return;
+        return false;
     }
 
     // viewport and scissor
@@ -5417,12 +9138,12 @@ void Impl::draw(const gpu::Draw &d) {
     // D24FS8 depth converted to 20e4 in the pixel shader (Options), for draws
     // with the depth test on, as Xenia's depth_float24_convert_in_pixel_shader
     bool float24_convert = options_.depth_float24_convert_in_pixel_shader && depth_float24 && (depth_control & 2);
-    Viewport viewport = host_viewport(regs_, max_viewport_[0], max_viewport_[1], ps && ps->writes_depth,
+    Viewport viewport = host_viewport(regs_, max_viewport_[0] / scale_.factor(), max_viewport_[1] / scale_.factor(), ps && ps->writes_depth,
                                       depth_float24 && (depth_control & 2), float24_convert);
     VkRect2D scissor = host_scissor(regs_, pitch);
     scissor.extent.width = std::min<uint32_t>(scissor.extent.width, width - std::min<uint32_t>(scissor.offset.x, width));
     scissor.extent.height = std::min<uint32_t>(scissor.extent.height, height - std::min<uint32_t>(scissor.offset.y, height));
-    if (!export_only && (viewport.empty || !scissor.extent.width || !scissor.extent.height) && !rasterizes_nothing()) return;
+    if (!export_only && (viewport.empty || !scissor.extent.width || !scissor.extent.height) && !rasterizes_nothing()) return false;
     if (export_only) {
         std::fill(std::begin(colors), std::end(colors), nullptr);
         std::fill(std::begin(viewed), std::end(viewed), false);
@@ -5450,7 +9171,7 @@ void Impl::draw(const gpu::Draw &d) {
             uint32_t info = regs_[r::COLOR_INFO[i]], format = (info >> 16) & 0xF;
             f.rt[i] = format | color_masks[i] << 4 | 0x100u;
             f.blend[i] = regs_[r::RB_BLENDCONTROL[i]] & 0x1FFF1FFF;
-            f.rt_base[i] = ((info & 0xFFF) % EDRAM_TILES) * 1280;
+            f.rt_base[i] = ((info & 0xFFF) % EDRAM_TILES) * tile_dwords_;
             f.exp_bias[i] = std::ldexp(1.0f, sign_extend((info >> 20) & 0x3F, 6));
             if (depth_stencil && (info & 0xFFF) % EDRAM_TILES == depth_base % EDRAM_TILES) {
                 // the bits the color target writes (render_target_cache.cc's
@@ -5490,8 +9211,9 @@ void Impl::draw(const gpu::Draw &d) {
         }
         if (viewed[4] && views[4].format == 1) flags |= FSI_FLOAT24;
         f.flags = flags;
-        f.depth_base = (depth_base % EDRAM_TILES) * 1280;
-        f.pitch = std::max(1u, (pitch * (msaa >= 2 ? 2 : 1) + 79) / 80) * 1280;
+        f.depth_base = (depth_base % EDRAM_TILES) * tile_dwords_;
+        f.pitch = std::max(1u, (pitch * (msaa >= 2 ? 2 : 1) + 79) / 80) * tile_dwords_;
+        f.scale[0] = scale_.q4, f.scale[1] = tile_dwords_;
         f.zpd_index = UINT32_MAX; // (set as the draw is recorded)
         uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
         f.stencil[0] = f.stencil[2] = stencil & 0xFFFFFF;
@@ -5506,15 +9228,196 @@ void Impl::draw(const gpu::Draw &d) {
             f.poly_offset[0] = f.poly_offset[2] = offsets[0];
             f.poly_offset[1] = f.poly_offset[3] = offsets[1];
         }
-        f.poly_offset[0] *= 1.0f / 16.0f, f.poly_offset[2] *= 1.0f / 16.0f;
+        // (the slope's per host pixel: the depth changes 1/scale as much
+        // from one to the next, Xenia's poly_offset_scale_factor)
+        f.poly_offset[0] *= scale_.factor() / 16.0f, f.poly_offset[2] *= scale_.factor() / 16.0f;
         std::memcpy(f.blend_constant, &regs_[r::RB_BLEND_RED], 16);
     }
     // (the targets take over their EDRAM tiles below, once the draw's lowest
     // row is known: draw_max_y)
 
+    f.tessellated = tessellated;
+    f.tess_mode = tess_mode;
+    f.host_vertex = host_vertex;
+    f.patch_points = patch_points;
+    f.hull = hull;
+    f.draw_name = draw_name;
+    f.rectangles = rectangles;
+    f.points = points;
+    f.ucp = ucp;
+    f.expanded = expanded;
+    f.polygonal = polygonal;
+    f.topology = topology;
+    f.strip = strip;
+    f.vs = vs;
+    f.ps = ps;
+    f.why = why;
+    f.translating = translating;
+    f.first_forms_translating = first_forms_translating;
+    f.pitch = pitch;
+    f.msaa = msaa;
+    f.export_only = export_only;
+    f.gamma_targets = gamma_targets;
+    f.depth_control = depth_control;
+    f.depth = depth;
+    f.width = width;
+    f.height = height;
+    f.host_width = host_width;
+    f.host_height = host_height;
+    f.depth_float24 = depth_float24;
+    f.float24_convert = float24_convert;
+    f.viewport = viewport;
+    f.scissor = scissor;
+    f.fsi_constants = fsi_constants;
+    std::copy(colors, colors + 4, f.colors);
+    std::copy(color_masks, color_masks + 4, f.color_masks);
+    std::copy(color_scales, color_scales + 4, f.color_scales);
+    f.extent_words = extent_words;
+    return true;
+}
+
+void Impl::draw(const gpu::Draw &d) {
+    report_.draws++;
+    // (XF_DRAW_LIMIT=N: the draws after the Nth left out; XF_DRAW_SKIP=A-B: the draws from the Ath to
+    // the Bth left out: for finding the one a wrong picture comes from)
+    if (draw_limit_ && report_.draws > draw_limit_) return;
+    if (report_.draws >= draw_skip_[0] && report_.draws <= draw_skip_[1]) return;
+    // VIZ queries ("VIZ queries" above), counted: draws predicated on one
+    // (DRAW_INDX's VIZ token, bit 8), and survey draws (PA_SC_VIZ_QUERY's
+    // viz_query_ena with kill_pix_post_hi_z), drawn as they are; without
+    // conditional rendering, every predicated draw is drawn (Xenia's default)
+    if (d.viz_query & 0x100)
+        use(viz_predicates_.buffer ? "draws predicated on a VIZ query"
+                                   : "draws predicated on a VIZ query (drawn, as Xenia's default)");
+    if ((regs_[reg::PA_SC_VIZ_QUERY] & 0x81) == 0x81) use("VIZ survey draws");
+    uint32_t mode = regs_[reg::RB_MODECONTROL] & 7;
+    if (EdramMode(mode) != EdramMode::ColorDepth && EdramMode(mode) != EdramMode::DepthOnly) return skip("EDRAM mode " + std::to_string(mode));
+
+    uint32_t primitive = d.primitive, count = d.count;
+    bool index32 = d.index32;
+    if (count == 0) return;
+    bool color = EdramMode(mode) == EdramMode::ColorDepth;
+    // whether the draw can write any target (a color channel enabled, or depth or stencil on)
+    bool writes_targets = (color && (regs_[reg::RB_COLOR_MASK] & 0xFFFF) != 0) || (regs_[reg::RB_DEPTHCONTROL] & 3) != 0;
+    {
+        // A draw that can write nothing (no color channel enabled, depth and
+        // stencil off, no memory export) leaves EDRAM and memory as they
+        // were, and the occlusion queries' counts are the processor's fake
+        // ones (EVENT_WRITE_ZPD, as Xenia's): nothing to draw, whatever its
+        // primitive. A UE3 game issues hundreds of such point lists a
+        // frame.
+        const Shader *v = have_vertex_ ? vertex_shader_ : nullptr;
+        const Shader *p = have_pixel_ ? pixel_shader_ : nullptr;
+        bool exports = (v && v->summary.memexport) || (color && p && p->summary.memexport);
+        if (!writes_targets && !exports) {
+            if (options_.verbose)
+                std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
+            return;
+        }
+        // predicated on a VIZ query that ended: dropped when it had no
+        // survey, else on the GPU by its word when that holds its count
+        if ((d.viz_query & 0x100) && viz_predicates_.buffer && !exports) {
+            const VizQuery &q = viz_[d.viz_query & 63];
+            if (q.ended && !q.surveyed) {
+                use("draws predicated on a VIZ query without survey draws (dropped)");
+                return;
+            }
+            if (q.ended && q.armed) viz_predicate_ = d.viz_query & 63;
+        }
+        // the port draws this frame (native_render.h): the draws its filter
+        // selects skipped, never one exporting memory (the CPU may read it)
+        if (native_suppress_) {
+            if (exports) {
+                native::detail::bump(native::detail::atomic_counters().memexport_kept);
+            } else {
+                native::PassInfo pass;
+                pass.color = color, pass.has_pixel_shader = p != nullptr;
+                pass.primitive = primitive, pass.count = count;
+                pass.vertex_shader = have_vertex_ ? vertex_hash_ : 0, pass.pixel_shader = have_pixel_ ? pixel_hash_ : 0;
+                if (!native_keep(pass)) {
+                    if (zpd_current_) zpd_counts_[zpd_current_].suppressed = true;
+                    return;
+                }
+            }
+        }
+    }
+    // the front part: the draw before's where this one comes with the same
+    // state, shaders and kind of primitive, else worked out
+    collect_translations();
+    DrawFront &f = front_;
+    {
+        DrawFrontKey key;
+        key.state_serial = file_ ? file_->state_serial() : 0, key.foreign_writes = file_ ? file_->foreign_writes() : 0;
+        key.vertex = have_vertex_ ? vertex_shader_ : nullptr, key.pixel = have_pixel_ ? pixel_shader_ : nullptr;
+        key.primitive = primitive;
+        key.flags = uint32_t(d.major_mode_explicit) | uint32_t(d.indexed) << 1 | uint32_t(index32) << 2 |
+                    uint32_t(color) << 3 | uint32_t(writes_targets) << 4;
+        // (the screen extent report the draw bounds is the draw's own)
+        const bool was_bounded = f.host_vertex.extents;
+        bool hit = front_memo_ && front_valid_ && file_ && key == front_key_ && !native_suppress_ && !options_.verbose;
+        if (hit) {
+            f.extent_words = (!f.points && !f.rectangles) || f.expanded ? extent_draw_words() : UINT32_MAX;
+            if ((f.extent_words != UINT32_MAX) != was_bounded) hit = false;
+        }
+        if (hit) {
+            for (const auto &[what, approximation] : front_counts_) approximation ? approximate(what) : use(what);
+            for (const Shader *s : {front_key_.vertex, f.color ? front_key_.pixel : nullptr})
+                if (s)
+                    for (const std::string &a : s->approximate) report_.approximate[a]++, approximations_++;
+        } else {
+            front_valid_ = false;
+            front_counts_.clear();
+            front_recording_ = front_keepable_ = true;
+            f.primitive = primitive, f.count = count, f.index32 = index32, f.color = color;
+            f.writes_targets = writes_targets;
+            const bool goes_on = draw_front(d, f);
+            front_recording_ = false;
+            if (!goes_on) return;
+            // kept for the next draw: not one whose shaders are still being
+            // translated, nor one that exports alone
+            front_valid_ = front_memo_ && front_keepable_ && file_ && !f.translating && !f.first_forms_translating &&
+                           !f.export_only && !native_suppress_ && !options_.verbose;
+            front_key_ = key;
+        }
+    }
+    bool tessellated = f.tessellated;
+    uint32_t tess_mode = f.tess_mode;
+    shader::VertexOptions host_vertex = f.host_vertex;
+    uint32_t patch_points = f.patch_points;
+    uint32_t hull = f.hull;
+    std::string draw_name = f.draw_name;
+    bool rectangles = f.rectangles;
+    bool points = f.points;
+    uint32_t ucp = f.ucp;
+    bool expanded = f.expanded;
+    bool polygonal = f.polygonal;
+    VkPrimitiveTopology topology = f.topology;
+    bool strip = f.strip;
+    Shader *vs = f.vs;
+    Shader *ps = f.ps;
+    std::string why = f.why;
+    bool translating = f.translating;
+    uint32_t msaa = f.msaa;
+    bool export_only = f.export_only;
+    uint32_t gamma_targets = f.gamma_targets;
+    uint32_t depth_control = f.depth_control;
+    RenderTarget *depth = f.depth;
+    uint32_t host_width = f.host_width;
+    uint32_t host_height = f.host_height;
+    bool depth_float24 = f.depth_float24;
+    bool float24_convert = f.float24_convert;
+    const Viewport &viewport = f.viewport;
+    VkRect2D scissor = f.scissor;
+    FsiConstants fsi_constants = f.fsi_constants;
+    const auto &colors = f.colors;
+    const auto &color_masks = f.color_masks;
+    const auto &color_scales = f.color_scales;
+    const uint32_t extent_words = f.host_vertex.extents ? f.extent_words : UINT32_MAX;
+    host_vertex.extents = extent_words != UINT32_MAX;
     // the pages of the streams the shaders export to (the pixel shader's only
     // when it runs)
-    std::vector<Range> exported;
+    std::vector<Range> &exported = draw_lists_.exported;
+    exported.clear();
     export_ranges(*vs, 0, exported);
     if (ps) export_ranges(*ps, 1, exported);
     bool exports = vs->exports || (ps && ps->exports);
@@ -5523,8 +9426,6 @@ void Impl::draw(const gpu::Draw &d) {
     // and clamped to VGT_MIN_VTX_INDX and VGT_MAX_VTX_INDX (as Xenia's vertex
     // shaders do it: RemapAndConvertVertexIndices), reset indices kept as the
     // host's restart index; adaptive tessellation's edge factors only swapped
-    std::vector<uint32_t> indices;
-    indices.reserve(count);
     uint32_t offset = regs_[r::VGT_INDX_OFFSET];
     bool restart = strip && (regs_[r::PA_SU_SC_MODE_CNTL] >> 21) & 1;
     uint32_t reset_index = regs_[r::VGT_MULTI_PRIM_IB_RESET_INDX];
@@ -5532,7 +9433,73 @@ void Impl::draw(const gpu::Draw &d) {
     auto remap = [&](uint32_t index) { return std::min(max_index, std::max(min_index, (index + offset) & 0xFFFFFF)); };
     const bool factors = tessellated && tess_mode == 2;
     auto vertex = [&](uint32_t index) { return factors ? index : remap(index); };
-    if (d.indexed && !d.immediate.empty()) {
+    // An index buffer's converted before and unwritten since (the index
+    // cache): its words as they are, in the cache's buffer. Not a draw whose
+    // list is made here (exports alone, patches, expanded points and
+    // rectangles) nor indices that wrap past the end of memory.
+    IndexEntry *index_entry = nullptr;
+    bool index_hit = false, index_keep = false;
+    uint32_t index_checked = 0;
+    {
+        const uint32_t base = d.index_base & GuestMemory::PHYSICAL_MASK;
+        const uint64_t bytes = uint64_t(count) * (index32 ? 4 : 2);
+        if (index_cache_on_ && d.indexed && d.immediate.empty() && !export_only && !tessellated && !expanded &&
+            base + bytes <= GuestMemory::SIZE && uint64_t(count) * 6 <= INDEX_CHUNK / 4) {
+            IndexKey key;
+            key.base = base, key.count = count;
+            const uint32_t converted = primitive >= 12 && primitive <= 15 ? primitive : 0;
+            key.form = uint32_t(index32) | uint32_t(d.index_endian) << 1 | uint32_t(restart) << 4 | converted << 8;
+            key.reset = restart ? reset_index : 0, key.offset = offset, key.min = min_index, key.max = max_index;
+            // (over its budget: everything dropped, to be kept again as it is drawn)
+            if (index_chunks_.size() * INDEX_CHUNK + index_cache_words_ > INDEX_CACHE_BUDGET ||
+                index_cache_.size() > INDEX_CACHE_ENTRIES)
+                index_cache_drop();
+            IndexEntry *&front = index_front_[IndexKeyHash()(key) & (INDEX_FRONT - 1)];
+            if (!front || !(front->key == key)) {
+                auto found = index_cache_.find(key);
+                if (found == index_cache_.end()) found = index_cache_.emplace(key, IndexEntry{}).first, found->second.key = key;
+                front = &found->second;
+            }
+            index_entry = front;
+            IndexEntry &e = *index_entry;
+            const uint64_t swap = report_.swaps;
+            if (e.buffer) {
+                const uint32_t now = mem_.write_count();
+                if (now == e.checked || pages_unwritten(e.first, e.last, e.checked)) {
+                    e.checked = now;
+                    index_hit = true;
+                } else {
+                    e.streak = swap - e.written_swap <= 4 ? e.streak + 1 : 1;
+                    e.written_swap = swap;
+                    if (e.streak >= 3) {
+                        // written again and again: not kept for a while
+                        index_cache_words_ -= e.words.size() * 4;
+                        e.words = {};
+                        e.buffer = VK_NULL_HANDLE;
+                        e.dynamic_until = swap + 300;
+                        e.streak = 0;
+                    }
+                }
+            }
+            // kept from the second swap it is drawn in: indices made anew
+            // each frame somewhere else (a ring of dynamic geometry) are
+            // never watched, a watch costing the game a fault at its next write
+            const bool seen_before = e.seen_swap && e.seen_swap != swap + 1;
+            e.seen_swap = swap + 1;
+            if (!index_hit && seen_before && swap >= e.dynamic_until) {
+                // watched, then the count, then the words read (memory.h)
+                e.first = base >> page_shift_, e.last = uint32_t((base + bytes - 1) >> page_shift_);
+                mem_.watch(base, uint32_t(bytes));
+                index_checked = mem_.write_count();
+                index_keep = true;
+            }
+        }
+    }
+    std::vector<uint32_t> &indices = index_hit ? index_entry->words : draw_lists_.indices;
+    if (index_hit) {
+        traced(d.index_base, count * (index32 ? 4 : 2));
+    } else if (d.indexed && !d.immediate.empty()) {
+        indices.clear();
         // immediate indices, from the packet (gpu::Draw::immediate): no
         // swap, 16-bit ones two a word, the first in the low half (AMD's
         // DRAW_INDEX_IMMD); then as an index buffer's
@@ -5549,23 +9516,43 @@ void Impl::draw(const gpu::Draw &d) {
     } else if (d.indexed) {
         uint32_t size = index32 ? 4 : 2;
         gpu::Endian endian = d.index_endian;
-        std::vector<uint8_t> raw_indices(size_t(count) * size);
-        traced(d.index_base, uint32_t(raw_indices.size()));
-        memory_.read(d.index_base, raw_indices);
-        for (uint32_t i = 0; i < count; i++) {
-            const uint8_t *b = raw_indices.data() + size_t(i) * size;
-            uint32_t raw = index32 ? uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24
-                                   : uint32_t(b[0]) | uint32_t(b[1]) << 8;
-            uint32_t index = index32 ? gpu::gpu_swap(raw, endian)
-                                     : (endian == gpu::Endian::In16 ? ((raw >> 8) | (raw << 8)) & 0xFFFF : raw);
-            if (!index32) index &= 0xFFFF;
-            if (restart && index == (index32 ? reset_index : reset_index & 0xFFFF)) indices.push_back(UINT32_MAX);
-            else indices.push_back(vertex(index));
+        traced(d.index_base, count * size);
+        // Each step a loop of its own over the whole list, its choices made
+        // outside it (the index buffer of a heavy scene's draws was a fifth
+        // of the command thread, a push_back and every branch per index):
+        // the guest's words in host order as the fetch's endianness says,
+        // then the reset indices kept and the rest offset and clamped.
+        // (one pass, index_convert.h; read where guest memory holds them,
+        // copied first only when they wrap past its end)
+        indices.resize(count);
+        IndexConversion conversion;
+        conversion.index32 = index32;
+        conversion.endian = uint32_t(endian);
+        conversion.restart = restart;
+        conversion.reset = index32 ? reset_index : reset_index & 0xFFFF;
+        conversion.remap = !factors;
+        conversion.offset = offset, conversion.min = min_index, conversion.max = max_index;
+        const size_t bytes = size_t(count) * size;
+        const uint32_t base = d.index_base & GuestMemory::PHYSICAL_MASK;
+        const uint8_t *in = memory_.data() + base;
+        if (base + bytes > GuestMemory::SIZE) {
+            std::vector<uint8_t> &raw_indices = draw_lists_.raw_indices;
+            raw_indices.resize(bytes);
+            memory_.read(d.index_base, raw_indices);
+            in = raw_indices.data();
         }
+        convert_indices(in, indices.data(), count, conversion);
     } else {
-        for (uint32_t i = 0; i < count; i++) indices.push_back(vertex(i));
+        indices.resize(count);
+        uint32_t *out = indices.data();
+        if (factors)
+            for (uint32_t i = 0; i < count; i++) out[i] = i;
+        else
+            for (uint32_t i = 0; i < count; i++) out[i] = remap(i);
     }
-    if (export_only) {
+    if (index_hit) {
+        // (converted when the entry was made)
+    } else if (export_only) {
         // each index a point, the reset indices left out
         std::erase(indices, UINT32_MAX);
         if (indices.empty()) return;
@@ -5578,17 +9565,23 @@ void Impl::draw(const gpu::Draw &d) {
         restart = false;
     } else if (primitive == 13) {
         // quads to triangle pairs
-        std::vector<uint32_t> triangles;
-        for (uint32_t q = 0; q + 3 < indices.size(); q += 4)
-            for (uint32_t k : {0, 1, 2, 0, 2, 3}) triangles.push_back(indices[q + k]);
-        indices = std::move(triangles);
+        std::vector<uint32_t> &triangles = draw_lists_.triangles;
+        triangles.resize(indices.size() / 4 * 6);
+        const uint32_t *quad = indices.data();
+        uint32_t *triangle = triangles.data();
+        for (size_t q = 0; q + 3 < indices.size(); q += 4, quad += 4, triangle += 6) {
+            triangle[0] = quad[0], triangle[1] = quad[1], triangle[2] = quad[2];
+            triangle[3] = quad[0], triangle[4] = quad[2], triangle[5] = quad[3];
+        }
+        indices.swap(triangles);
         if (indices.empty()) return;
     } else if (primitive == 12 || primitive == 14 || primitive == 15) {
         // each primitive between reset indices on its own: a line loop closed
         // by its first index (2 vertices give two lines, 1 nothing: Xenia's
         // GetLineLoopStripIndexCount); a quad strip's whole quads; a polygon
         // of at least a triangle
-        std::vector<uint32_t> converted;
+        std::vector<uint32_t> &converted = draw_lists_.converted;
+        converted.clear();
         converted.reserve(indices.size() + indices.size() / 2 + 1);
         for (size_t first = 0; first < indices.size();) {
             size_t end = first;
@@ -5604,8 +9597,27 @@ void Impl::draw(const gpu::Draw &d) {
             }
             first = end + 1;
         }
-        indices = std::move(converted);
+        indices.swap(converted);
         if (indices.empty()) return;
+    }
+    if (index_keep) {
+        // into the cache: the words and their place in its buffers, or the
+        // entry's as they were where they came out the same
+        IndexEntry &e = *index_entry;
+        if (!e.buffer || e.words != indices) {
+            index_cache_words_ += indices.size() * 4;
+            index_cache_words_ -= e.words.size() * 4;
+            e.words = indices;
+            if (index_cache_place(indices.size() * 4, e.buffer, e.at))
+                std::memcpy(static_cast<uint8_t *>(index_chunks_.back().buffer.mapped) + e.at, indices.data(),
+                            indices.size() * 4);
+            else
+                e.buffer = VK_NULL_HANDLE;
+        }
+        e.checked = index_checked;
+        if (!e.buffer) index_entry = nullptr;
+    } else if (!index_hit) {
+        index_entry = nullptr;
     }
 
     // A tessellated draw's control points: two floats each, the index for the
@@ -5653,31 +9665,142 @@ void Impl::draw(const gpu::Draw &d) {
     }
 
     // constants
-    harness::Constants constants[2];
     for (int stage = 0; stage < 2; stage++) {
-        harness::Constants &c = constants[stage];
-        std::memcpy(c.float_constants, &regs_[reg::ALU_CONSTANTS + stage * 1024], 4096);
-        std::memcpy(c.bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(c.bool_constants));
-        std::memcpy(c.loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(c.loop_constants));
-        std::memcpy(c.fetch_constants, &regs_[reg::FETCH_CONSTANTS], sizeof(c.fetch_constants));
+        harness::Constants &c = last_constants_[stage];
+        const Shader *s = stage == 0 ? vs : ps;
+        if (!constant_stamps_ || !file_) {
+            // copied whole, uploaded again where they differ from the last upload
+            harness::Constants now;
+            std::memcpy(now.float_constants, &regs_[reg::ALU_CONSTANTS + stage * 1024], 4096);
+            std::memcpy(now.bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(now.bool_constants));
+            std::memcpy(now.loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(now.loop_constants));
+            std::memcpy(now.fetch_constants, &regs_[reg::FETCH_CONSTANTS], sizeof(now.fetch_constants));
+            if (std::memcmp(&c, &now, sizeof(now)) != 0) c = now, last_constants_at_[stage] = NONE;
+            constants_file_[stage] = nullptr;
+            continue;
+        }
+        // Only the blocks of registers written to another value since the kept copy was made
+        // (the 5 KB of each stage copied, compared and copied again at every draw were a sixth
+        // of the command thread)
+        using File = gpu::RegisterFile;
+        const File &file = *file_;
+        const uint64_t foreign = file.foreign_writes();
+        const bool kept = constants_file_[stage] == file_ && constants_foreign_[stage] == foreign;
+        const uint64_t since = constants_serial_[stage], serial = file.serial();
+        bool changed = false;
+        const uint32_t alu = reg::ALU_CONSTANTS + stage * 1024;
+        // (a stage none of whose float constants was written since: one comparison, not its 32 blocks')
+        const bool floats_written = !kept || file.float_constants_serial(stage) > since;
+        for (uint32_t first = 0; floats_written && first < 1024; first += File::BLOCK)
+            if (!kept || file.changed_since(alu + first, File::BLOCK, since)) {
+                std::memcpy(&c.float_constants[first / 4], &regs_[alu + first], File::BLOCK * 4);
+                changed = true;
+            }
+        if (!kept || file.changed_since(reg::BOOL_CONSTANTS, 8 + 32, since)) {
+            std::memcpy(c.bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(c.bool_constants));
+            std::memcpy(c.loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(c.loop_constants));
+            changed = true;
+        }
+        // the fetch constants: the blocks the stage's shader reads brought up to date; the others
+        // are no longer current once written
+        static_assert(reg::FETCH_CONSTANTS % File::BLOCK == 0 && (32 * 6) % File::BLOCK == 0);
+        uint32_t current = kept ? constants_fetch_blocks_[stage] : 0u;
+        const uint32_t wanted = s ? s->fetch_blocks : 0u;
+        for (uint32_t b = 0; b < 32 * 6 / File::BLOCK; b++) {
+            const uint32_t first = b * File::BLOCK;
+            if ((current & (1u << b)) && file.changed_since(reg::FETCH_CONSTANTS + first, File::BLOCK, since))
+                current &= ~(1u << b);
+            if ((wanted & (1u << b)) && !(current & (1u << b))) {
+                std::memcpy(&c.fetch_constants[first], &regs_[reg::FETCH_CONSTANTS + first], File::BLOCK * 4);
+                current |= 1u << b;
+                changed = true;
+            }
+        }
+        if (changed) last_constants_at_[stage] = NONE;
+        constants_file_[stage] = file_, constants_foreign_[stage] = foreign;
+        constants_serial_[stage] = serial, constants_fetch_blocks_[stage] = current;
     }
 
     // the targets take over the EDRAM tiles down to the lowest row the draw
     // can reach (draw_max_y), within the scissor
     {
-        uint32_t rows = std::min(scissor.offset.y + scissor.extent.height,
-                                 draw_max_y(*vs, constants[0], indices, primitive, tessellated));
+        // (the tiles under the pixels the draw can reach, draw_reach; with
+        // XF_DRAW_REACH=rows every tile of the rows from the first down to
+        // the lowest, as Xenia takes them)
+        draw_reach(*vs, last_constants_[0], indices, primitive, tessellated, viewport.viewport, scissor, reach_);
+        auto take = [&](RenderTarget *t, const DepthOverwrite *overwritten) {
+            std::vector<TileRect> &rects = reach_rects_;
+            rects.clear();
+            for (const Reach &r : reach_) {
+                TileRect tiles = tiles_of(*t, r.x0, r.y0, r.x1, r.y1);
+                if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
+                if (!reach_tiles_) tiles.c0 = 0, tiles.c1 = t->pitch_tiles, tiles.r0 = 0;
+                rects.push_back(tiles);
+            }
+            acquire(t, std::span<const TileRect>(rects), overwritten);
+            for (TileRect tiles : rects) {
+                if (!reach_tiles_) tiles.r0 = uint32_t(scissor.offset.y) / t->tile_height;
+                tiles_drawn(*t, tiles);
+            }
+        };
         for (RenderTarget *t : colors)
-            if (t) acquire(t, rows);
-        if (depth) acquire(depth, rows);
+            if (t) take(t, nullptr);
+        if (depth) {
+            // the console's clear of the depth target (depth_overwrite): the
+            // tiles it overwrites are taken without their transfer, and hold
+            // a clear's value after it where it writes one word
+            DepthOverwrite over;
+            if (rectangles && !export_only && (overwrite_transfers_ || draw_clears_) && (depth_control & 0x76) == 0x76) {
+                const char *why = nullptr;
+                over = depth_overwrite(d, *vs, ps, last_constants_[0], indices, depth_control, *depth, viewport.viewport,
+                                       viewport.ndc_scale, viewport.ndc_offset, scissor, why);
+                if (options_.verbose)
+                    std::fprintf(stderr, "  draw %llu: a depth rectangle, %s%s (%u, %u)-(%u, %u) word %08X\n",
+                                 (unsigned long long)report_.draws, over.whole ? "overwrites" : "not an overwrite: ",
+                                 why ? why : "", over.x0, over.y0, over.x1, over.y1, over.word);
+            }
+            take(depth, over.depth_whole ? &over : nullptr);
+            // the stencil of the tiles reached: not known any more with the
+            // stencil test on, but the one written where the draw replaces
+            // all of a tile's (tile_stencil_)
+            if (depth_control & 1)
+                for (const TileRect &tiles : reach_rects_) tiles_stencil_written(*depth, tiles);
+            if (over.depth_whole && fatal_.empty()) {
+                const uint32_t tiles = std::min(depth->height / depth->tile_height * depth->pitch_tiles, EDRAM_TILES);
+                bool cleared = false, stencil = false;
+                for (uint32_t k = 0; k < tiles; k++) {
+                    const uint32_t tile = (depth->base + k) % EDRAM_TILES;
+                    if (owners_[tile] != depth || !tile_within(*depth, tile, over)) continue;
+                    if (over.whole) tile_stencil_[tile] = int16_t(over.word & 0xFF), stencil = true;
+                    // (one depth and one stencil: a clear's, as after a resolve's clear)
+                    if (!draw_clears_ || !over.known_depth || tile_stencil_[tile] < 0) continue;
+                    const uint32_t word = (over.word & ~0xFFu) | uint32_t(tile_stencil_[tile]);
+                    tile_cleared_[tile] = 1, tile_clear_word_[tile] = word;
+                    tile_clear_value_[tile] = depth_clear_value(depth->format, word);
+                    cleared = true;
+                }
+                if (cleared) cleared_epoch_++;
+                if (stencil) stencil_epoch_++;
+            }
+        }
         if (!fatal_.empty()) return;
     }
     System sys{};
     for (int i = 0; i < 3; i++) sys.ndc_scale[i] = viewport.ndc_scale[i], sys.ndc_offset[i] = viewport.ndc_offset[i];
     sys.ndc_scale[3] = 1.0f;
+    if (host_vertex.extents) {
+        // the host's NDC to the viewport's console pixels
+        const VkViewport &v = viewport.viewport;
+        sys.extent_map[0] = v.width * 0.5f, sys.extent_map[1] = v.x + v.width * 0.5f;
+        sys.extent_map[2] = v.height * 0.5f, sys.extent_map[3] = v.y + v.height * 0.5f;
+        sys.extent_report[0] = extent_words;
+    }
     uint32_t color_control = regs_[r::RB_COLORCONTROL];
     if (color_control & 8) sys.flags[0] = 8 | (color_control & 7);
     sys.values[0] = as_float(regs_[r::RB_ALPHA_REF]);
+    // the host pixel's size in console pixels: the pixel parameters' position
+    // is the console's pixel (shader_translator.cpp's param_gen)
+    sys.values[3] = 1.0f / scale_.factor();
     uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
     sys.flags[1] = ((vte >> 10) & 1) | ((vte >> 8) & 1) << 1 | ((vte >> 9) & 1) << 2;
     // the pixel parameters (SQ_PROGRAM_CNTL's param_gen) into the
@@ -5689,8 +9812,7 @@ void Impl::draw(const gpu::Draw &d) {
         if (position < 16) {
             sys.flags[1] |= 1u << 8 | position << 9;
             if (points) {
-                sys.flags[1] |= 1u << 13;
-                approximate("point sprite coordinates in the pixel parameters (0)");
+                sys.flags[1] |= 1u << 13; // the sprite's coordinates: PixelOptions::point_coordinates
             } else if (polygonal) {
                 sys.flags[1] |= 1u << 15;
             } else if (primitive == 2 || primitive == 3 || primitive == 12) {
@@ -5729,14 +9851,48 @@ void Impl::draw(const gpu::Draw &d) {
 
     // textures: per slot the shaders read, an image's index in the table of
     // its dimension and a sampler's
-    std::set<uint32_t> slots(vs->summary.texture_slots.begin(), vs->summary.texture_slots.end());
-    if (ps) slots.insert(ps->summary.texture_slots.begin(), ps->summary.texture_slots.end());
-    for (uint32_t slot : slots) {
+    // (a mask of the 32 texture fetch constants, in order)
+    uint64_t texture_slots = vs->texture_mask | (ps ? ps->texture_mask : 0);
+    for (uint64_t left = texture_slots; left; left &= left - 1) {
+        const uint32_t slot = uint32_t(std::countr_zero(left));
         const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS + slot * 6];
         if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture) {
             approximate("a texture slot without a texture constant");
             continue;
         }
+        // the first fetch's filters over the constant's, the vertex shader's first
+        std::array<uint32_t, 4> overrides = {3, 3, 3, 7};
+        for (Shader *s : {vs, ps})
+            if (s && slot < 32 && (s->filter_mask & (1u << slot))) {
+                overrides = s->slot_filters[slot];
+                break;
+            }
+        // What the slot gave the last draw that read it, again: the same constant's words and
+        // filters, no texture, view or sampler destroyed or loaded since (texture_epoch_), and
+        // the texture's memory unwritten. The constant is not parsed, nor the texture, its view
+        // and its sampler looked up (three maps, 7% of the command thread).
+        const uint32_t forced_filter = texture_filter_.load(std::memory_order_relaxed);
+        const uint32_t forced_aniso = anisotropy_.load(std::memory_order_relaxed);
+        SlotMemo *memo = slot_memos_on_ && !trace_ ? &fetch_memos_[fetch_memo_index(fetch, overrides)] : nullptr;
+        if (memo) {
+            if (done_serial_ != limits_applied_at_) apply_texture_limits(); // (as texture() begins)
+            SlotMemo &m = *memo;
+            if (m.epoch == texture_epoch_ && std::memcmp(m.fetch, fetch, sizeof(m.fetch)) == 0 &&
+                m.overrides == overrides && m.forced_filter == forced_filter && m.forced_aniso == forced_aniso &&
+                m.loads == m.texture->loads && !m.texture->stale && unwritten(*m.texture)) {
+                use(*m.texture, submission_serial() + 1);
+                m.sampler->used_serial = submission_serial();
+                sys.slots[slot] = m.slot_word, sys.signs[slot] = m.signs;
+                sys.integer_scale[slot] = m.integer_scale, sys.signed_slots[slot] = m.signed_word;
+                if (m.uses & 1) use("textures read with the integer number format (scaled to the guest's integers)");
+                if (m.uses & 2)
+                    use("4-6 bit unsigned components of point-filtered textures (rebuilt as the console expands them)");
+                continue;
+            }
+            m.epoch = 0; // (kept again below, when the slot comes out whole)
+        }
+        const uint64_t approximations = approximations_;
+        uint32_t uses = 0;
         std::string reason;
         Texture *t = texture(fetch, reason);
         if (!fatal_.empty()) return;
@@ -5748,15 +9904,29 @@ void Impl::draw(const gpu::Draw &d) {
             approximate("texture not decoded: " + reason);
             continue;
         }
-        std::array<uint32_t, 4> overrides = {3, 3, 3, 7};
-        for (Shader *s : {vs, ps})
-            if (s && s->filters.count(slot)) {
-                overrides = s->filters[slot];
-                break;
-            }
         uint32_t sampler_bits = sampler(fetch, overrides) << 16;
+        SamplerEntry *const sampler_entry = last_sampler_;
         sys.slots[slot] = index | t->kind << 14 | sampler_bits;
-        sys.signs[slot] = swizzled_signs(info);
+        sys.signs[slot] = texture::swizzled_signs(info);
+        // (XF_TEXTURE_NUMBER_FORMAT=0: none of it, to measure what it costs)
+        static const bool number_format = [] {
+            const char *v = std::getenv("XF_TEXTURE_NUMBER_FORMAT");
+            return !(v && v[0] == '0');
+        }();
+        sys.integer_scale[slot] = number_format ? texture::integer_scale_bits(info, sys.signs[slot]) : 0u;
+        if (sys.integer_scale[slot] & ((1u << 24) - 1)) {
+            if (!(sys.integer_scale[slot] & (1u << 24))) {
+                use("textures read with the integer number format (scaled to the guest's integers)");
+                uses |= 1;
+            } else {
+                for (uint32_t k = 0; k < 4; k++)
+                    if (((sys.integer_scale[slot] >> (6 * k)) & 0x3F) - 1 < 15) {
+                        use("4-6 bit unsigned components of point-filtered textures (rebuilt as the console expands them)");
+                        uses |= 2;
+                        break;
+                    }
+            }
+        }
         if (info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1) {
             if (t->signed_read == texture::Signed::None) {
                 approximate("signed texture components read as unsigned (no signed version of the format)");
@@ -5769,6 +9939,18 @@ void Impl::draw(const gpu::Draw &d) {
                     approximate("signed texture components read as unsigned: " + reason);
             }
         }
+        // kept for the next draw, when nothing about it was counted as approximate (those counts
+        // are per draw) and its sampler is one of the table's
+        if (memo && approximations == approximations_ && sampler_entry && !t->stale) {
+            SlotMemo &m = *memo;
+            m.epoch = texture_epoch_;
+            std::memcpy(m.fetch, fetch, sizeof(m.fetch));
+            m.overrides = overrides, m.forced_filter = forced_filter, m.forced_aniso = forced_aniso;
+            m.texture = t, m.loads = t->loads, m.sampler = sampler_entry;
+            m.slot_word = sys.slots[slot], m.signs = sys.signs[slot];
+            m.integer_scale = sys.integer_scale[slot], m.signed_word = sys.signed_slots[slot];
+            m.uses = uses;
+        }
     }
 
     // Expanded in the vertex shader (shader::HostVertex): a strip of two
@@ -5777,9 +9959,11 @@ void Impl::draw(const gpu::Draw &d) {
     // vertices are its index shifted left by 2 plus the corner; a
     // rectangle's are numbered from 4 times its number, each with the
     // rectangle's three guest indices as its attribute (guest_indices).
-    std::vector<uint32_t> guest_indices;
+    std::vector<uint32_t> &guest_indices = draw_lists_.guest_indices;
+    guest_indices.clear();
     if (expanded) {
-        std::vector<uint32_t> strips;
+        std::vector<uint32_t> &strips = draw_lists_.strips;
+        strips.clear();
         uint32_t primitives = uint32_t(points ? indices.size() : indices.size() / 3);
         strips.reserve(size_t(primitives) * 5);
         for (uint32_t k = 0; k < primitives; k++) {
@@ -5791,7 +9975,7 @@ void Impl::draw(const gpu::Draw &d) {
                     guest_indices.insert(guest_indices.end(), indices.begin() + k * 3, indices.begin() + k * 3 + 3);
         }
         if (strips.empty()) return;
-        indices = std::move(strips);
+        indices.swap(strips);
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
         restart = true;
     }
@@ -5813,21 +9997,48 @@ void Impl::draw(const gpu::Draw &d) {
     // the vertex shader's host form, with a tessellated draw's hull shader
     // and patch size
     uint32_t host_key = host_vertex.key() | hull << 16 | patch_points << 20;
-    std::vector<uint32_t> key = {uint32_t(vertex_hash_),
-                                 uint32_t(vertex_hash_ >> 32),
-                                 ps ? uint32_t(pixel_hash_) : 0,
-                                 ps ? uint32_t(pixel_hash_ >> 32) : 0,
-                                 topology_class,
-                                 rectangles,
-                                 msaa,
-                                 depth ? depth->image.format : 0u,
-                                 regs_[r::PA_CL_CLIP_CNTL] & (1u << 16),
-                                 host_key};
-    std::vector<uint32_t> color_key; // the targets' part of the key
+    // The polygon modes (PA_SU_SC_MODE_CNTL's poly_mode bits 3-4, dual mode
+    // 1; the front's and back's types in bits 5-7 and 8-10: 0 points, 1
+    // lines, 2 triangles), as Xenia's Vulkan pipeline cache takes them:
+    // Vulkan has one mode for both faces, so the lowest type of the faces
+    // not culled (the most deliberate one: points, then lines, then fill).
+    VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
+    if (primitive >= 4 && !rectangles) {
+        const uint32_t sc_mode = regs_[r::PA_SU_SC_MODE_CNTL];
+        if (((sc_mode >> 3) & 3) == 1) {
+            uint32_t type = 2;
+            if (!(sc_mode & 1)) type = std::min(type, (sc_mode >> 5) & 7);
+            if (!(sc_mode & 2)) type = std::min(type, (sc_mode >> 8) & 7);
+            if (type < 2) {
+                if (d_.fill_mode_non_solid())
+                    polygon_mode = type == 0 ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_LINE;
+                else
+                    approximate("polygon modes other than fill (the device has no fillModeNonSolid)");
+            }
+        }
+    }
+    host_key |= uint32_t(polygon_mode) << 24;
+    std::vector<uint32_t> &key = draw_lists_.key;
+    key.assign({uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), ps ? uint32_t(pixel_hash_) : 0,
+                ps ? uint32_t(pixel_hash_ >> 32) : 0, topology_class, uint32_t(rectangles), uint32_t(msaa),
+                depth ? uint32_t(depth->image.format) : 0u, regs_[r::PA_CL_CLIP_CNTL] & (1u << 16), host_key});
+    std::vector<uint32_t> &color_key = draw_lists_.color_key; // the targets' part of the key
+    color_key.clear();
+    // (the factors of a minimum or maximum the pixel shader multiplies in: host_blend_control)
+    uint32_t premultiply[4] = {};
+    bool premultiplied = false;
     for (uint32_t i = 0; i < 4; i++) {
         if (!colors[i]) continue;
         color_formats[i] = colors[i]->image.format;
-        uint32_t blend = regs_[r::RB_BLENDCONTROL[i]];
+        // (the factors of a minimum or maximum, where the host can: host_blend_control)
+        bool factors_ignored = false;
+        uint32_t blend = host_blend_control(regs_[r::RB_BLENDCONTROL[i]], colors[i]->format,
+                                            ps && !fsi_ && !export_only, premultiply[i], factors_ignored);
+        if (factors_ignored) approximate("minimum and maximum blending with factors (the host ignores them)");
+        if (premultiply[i]) {
+            premultiplied = true;
+            use("minimum and maximum blending with factors multiplied in by the pixel shader");
+        }
         VkPipelineColorBlendAttachmentState &b = blends[i];
         b.colorWriteMask = color_masks[i];
         b.srcColorBlendFactor = blend_factor(blend & 0x1F);
@@ -5844,15 +10055,38 @@ void Impl::draw(const gpu::Draw &d) {
         else
             color_key.insert(color_key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
     }
+    // A 16_16_16_16 target blended by the source's alpha ("A 16_16 target's
+    // alpha", renderer.md): its alpha is stored, so it is scaled by the fixed
+    // range, and so is the blend's factor, which should not be: counted (a
+    // second source for the blend would carry the alpha unscaled)
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!colors[i] || colors[i]->format != 5 || !blends[i].blendEnable) continue;
+        auto by_alpha = [](VkBlendFactor f) {
+            return f == VK_BLEND_FACTOR_SRC_ALPHA || f == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        };
+        const VkPipelineColorBlendAttachmentState &b = blends[i];
+        if (by_alpha(b.srcColorBlendFactor) || by_alpha(b.dstColorBlendFactor) || by_alpha(b.srcAlphaBlendFactor) ||
+            by_alpha(b.dstAlphaBlendFactor))
+            approximate("a 16_16_16_16 target blended by the source's alpha (scaled with the target's range)");
+    }
     key.insert(key.end(), color_key.begin(), color_key.end());
-    VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why);
+    if (premultiplied) {
+        std::copy(premultiply, premultiply + 4, sys.blend_premultiply);
+        std::memcpy(sys.blend_constant, &regs_[r::RB_BLEND_RED], 16);
+    }
+    // (a form being translated on the workers stands as the generic shader's
+    // module until the pipeline, which the generic shaders' then is)
+    VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why, &translating);
+    if (!guest_vs && translating) guest_vs = generic_vs_[0][0];
     if (!guest_vs) return skip("vertex shader: " + why);
     // The pixel shader: the guest's, its float24 depth conversion form with
     // float24_convert; a depth-only draw that tests or writes depth then gets
     // one that converts the rasterized depth (Xenia's float24_truncate and
     // _round fragment shaders). The conversion runs per sample under MSAA, as
     // Xenia's (unless the shader writes oDepth, which is per pixel).
-    VkShaderModule fragment = ps ? ps->module : VK_NULL_HANDLE;
+    VkShaderModule fragment = ps ? (ps->translated ? ps->module : generic_fs_[0][0]) : VK_NULL_HANDLE;
+    bool fragment_pending = ps && !ps->translated; // its first form, unless another is taken below
+    uint32_t pixel_form = 0; // its form's key (shader::PixelOptions), for the generic shaders
     uint32_t float24_mode = float24_convert ? (options_.depth_float24_round ? 2u : 1u) : 0u;
     // The interpolators read at the centroid under MSAA, as xenos.h's
     // GetInterpolatorSamplingPattern takes SQ_CONTEXT_MISC's sc_sample_cntl (bits 2-3:
@@ -5868,6 +10102,27 @@ void Impl::draw(const gpu::Draw &d) {
         else if (sample_control == 2)
             centroid = ~(regs_[r::SQ_INTERPOLATOR_CNTL] >> 16) & 0xFFFF;
     }
+    // a point list's pixel parameters take the sprite's coordinates from the
+    // point expansion (Xenia's param_gen_point)
+    const bool point_coordinates =
+        ps && points && ((regs_[reg::SQ_PROGRAM_CNTL] >> 18) & 1) && ((regs_[r::SQ_CONTEXT_MISC] >> 8) & 0xFF) < 16;
+    // Xenia's DepthStencilMode::kEarlyHint (pipeline_cache.cc): on the host
+    // path, without a float24 conversion, a shader that may write depth early
+    // (Shader::implicit_early_z_write_allowed: no kill, no oDepth, no memory
+    // export) is given its early form (PixelOptions::early_depth_stencil)
+    // where the coverage does not depend on its alpha (draw_util's
+    // DoesCoverageDependOnAlpha: an alpha test other than always, or alpha to
+    // coverage), or it does not write oC0. XF_EARLY_DEPTH_STENCIL=0: never.
+    static const bool early_allowed = [] {
+        const char *v = std::getenv("XF_EARLY_DEPTH_STENCIL");
+        return !(v && v[0] == '0');
+    }();
+    const uint32_t color_control_now = regs_[r::RB_COLORCONTROL];
+    const bool early =
+        early_allowed && ps && !fsi_ && !export_only && !float24_convert && !ps->summary.kills && !ps->writes_depth &&
+        !ps->exports &&
+        (!(ps->colors_written & 1) ||
+         !(((color_control_now & 8) && (color_control_now & 7) != 7) || (color_control_now & 16)));
     bool sample_shading = false;
     if (fsi_ && !export_only) {
         // the interlock path: the guest's shader with the output merger taken
@@ -5876,8 +10131,12 @@ void Impl::draw(const gpu::Draw &d) {
             shader::PixelOptions options;
             options.centroid = uint16_t(centroid);
             options.fsi = uint8_t(fsi_);
+            options.point_coordinates = point_coordinates;
             options.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
-            fragment = pixel_module(*ps, options, why);
+            pixel_form = options.key();
+            fragment_pending = false;
+            fragment = pixel_module(*ps, options, why, &translating);
+            if (!fragment && translating) fragment = generic_fs_[0][0];
             if (!fragment) return skip("pixel shader: " + why);
         } else {
             fragment = fsi_constants.flags & FSI_DEPTH_STENCIL ? fsi_depth_fs_ : VK_NULL_HANDLE;
@@ -5887,10 +10146,20 @@ void Impl::draw(const gpu::Draw &d) {
                 std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
             return;
         }
-    } else if (ps && (float24_convert || centroid)) {
-        fragment = pixel_module(*ps, {uint8_t(float24_mode), uint16_t(centroid)}, why);
+    } else if (ps && (float24_convert || centroid || point_coordinates || early || premultiplied)) {
+        shader::PixelOptions options;
+        options.depth_float24 = uint8_t(float24_mode);
+        options.early_depth_stencil = early;
+        options.blend_premultiply = premultiplied;
+        options.centroid = uint16_t(centroid);
+        options.point_coordinates = point_coordinates;
+        pixel_form = options.key();
+        fragment_pending = false;
+        fragment = pixel_module(*ps, options, why, &translating);
+        if (!fragment && translating) fragment = generic_fs_[0][0];
         if (!fragment) return skip("pixel shader: " + why);
     }
+    if (fragment_pending) translating = true;
     // the interlock path's state as the pipeline's specialization
     // (Options::fsi_specialized; edram_fsi.frag's constant_id 0-9)
     uint32_t spec_data[10] = {};
@@ -5913,7 +10182,8 @@ void Impl::draw(const gpu::Draw &d) {
         // position; the depth-only one by the pipeline's sample shading)
         sample_shading = msaa && fragment && !ps;
     }
-    key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) | centroid << 16);
+    key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) |
+                  (point_coordinates ? 16u : 0u) | (early ? 32u : 0u) | (premultiplied ? 64u : 0u) | centroid << 16);
     VkPipelineShaderStageCreateInfo stages[4] = {};
     uint32_t stage_count = 0;
     auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
@@ -5959,8 +10229,8 @@ void Impl::draw(const gpu::Draw &d) {
     if (triangles) {
         raster.cullMode = (sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0);
         raster.frontFace = sc_mode & 4 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        if ((sc_mode >> 3) & 3) approximate("polygon modes other than fill");
     }
+    raster.polygonMode = polygon_mode; // (above, with the key)
     raster.depthClampEnable = (regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1;
     raster.depthBiasEnable = depth ? VK_TRUE : VK_FALSE; // the polygon offset, set at the draw
     VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -5972,31 +10242,14 @@ void Impl::draw(const gpu::Draw &d) {
     if (fsi_ && msaa == 1 && fsi_2x_as_4x_) multisample.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
     // The interlock path rasterizes at the Xenos's sample positions where the
     // device places samples (VK_EXT_sample_locations), as Xenia's interlock
-    // paths always do (its xenos_sample_positions, for host render targets,
-    // is off by default; so is ours): each host sample at the position of the
-    // guest sample its coverage stands for (draw_util.cc's
-    // GetHostSampleXenosPositions with interlock: native 2x host samples 1
-    // and 0, 2x as 4x 0, 1, 0, 1, 4x 0, 3, 2, 1; positions in sixteenths
-    // from the pixel's center, kXenosSamplePositions2x and 4x).
+    // paths always do; host render targets do with
+    // Options::xenos_sample_positions (Xenia's option of that name, off by
+    // default there, on here): xenos_sample_locations.
     VkSampleLocationEXT sample_positions[4];
     VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
         VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
-    if (fsi_ && msaa && (d_.sample_locations() & multisample.rasterizationSamples)) {
-        static const int8_t positions_2x[2][2] = {{-4, 4}, {4, -4}};
-        static const int8_t positions_4x[4][2] = {{-2, -2}, {2, 2}, {-6, 6}, {6, -6}};
-        static const uint32_t remap_4x[4] = {0, 3, 2, 1};
-        uint32_t count = uint32_t(multisample.rasterizationSamples);
-        for (uint32_t k = 0; k < count; k++) {
-            const int8_t *p = msaa == 2 ? positions_4x[remap_4x[k]] : positions_2x[count == 2 ? k ^ 1 : k & 1];
-            sample_positions[k] = {0.5f + float(p[0]) / 16.0f, 0.5f + float(p[1]) / 16.0f};
-        }
-        sample_locations.sampleLocationsEnable = VK_TRUE;
-        sample_locations.sampleLocationsInfo = {VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT,
-                                                nullptr,
-                                                multisample.rasterizationSamples,
-                                                {1, 1},
-                                                count,
-                                                sample_positions};
+    if (msaa && (fsi_ ? (d_.sample_locations() & multisample.rasterizationSamples) != 0 : xenos_at(msaa))) {
+        xenos_sample_locations(msaa, multisample.rasterizationSamples, fsi_, sample_positions, sample_locations);
         multisample.pNext = &sample_locations;
     }
     if (sample_shading) multisample.sampleShadingEnable = VK_TRUE, multisample.minSampleShading = 1.0f;
@@ -6015,7 +10268,11 @@ void Impl::draw(const gpu::Draw &d) {
             return s;
         };
         depth_state.front = face(8);
-        depth_state.back = (depth_control >> 7) & 1 ? face(20) : depth_state.front;
+        // (the back face's own only for polygons, as Xenia's: a point, line or rectangle has no
+        // facing on the console and takes the front's, whichever way the host's triangles of it
+        // face: a rectangle list clearing depth where the stencil says so otherwise passed
+        // everywhere by the back face's test)
+        depth_state.back = polygonal && ((depth_control >> 7) & 1) ? face(20) : depth_state.front;
     }
     VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blend_state.attachmentCount = 4;
@@ -6077,11 +10334,61 @@ void Impl::draw(const gpu::Draw &d) {
     // made on a worker while the draw goes without it, or with a stand-in,
     // when there is a pixel shader (Xenia's D3D12 pipeline cache: draws
     // without one get theirs at once)
-    bool pending = false, stand_in = false;
-    VkPipeline pipe = pipeline(key, info, options_.async_pipelines && ps, pending, stand_in);
+    bool pending = false, stand_in = false, generic = false;
+    GenericStages generic_stages;
+    std::string generic_why;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    const bool generic_wanted = options_.generic_only && ps; // (draws without a pixel shader are made at once anyway)
+    if (generic_wanted &&
+        !generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages, generic_why))
+        report_.generic_refused[generic_why]++;
+    if (generic_wanted && generic_why.empty()) {
+        // (Options::generic_only: whole pipelines of the generic shaders, made at once)
+        key.push_back(0x6E0E0000u);
+        pipe = pipeline(key, generic_stages.info, false, pending, stand_in);
+        generic = true;
+    } else if (translating) {
+        // a shader's form on the translation workers: the generic shaders'
+        // pipeline alone, linked once their libraries are made
+        if (generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages, generic_why)) {
+            std::unique_ptr<PipelineEntry> &slot = translating_pipelines_[key];
+            if (!slot) slot = std::make_unique<PipelineEntry>();
+            pipe = generic_stand_in(*slot, generic_stages.info, true);
+            generic = pipe != VK_NULL_HANDLE;
+        } else {
+            report_.generic_refused[generic_why]++;
+        }
+        if (!pipe) return skip("pipeline not ready (shaders being translated)");
+    } else {
+        // the generic pipeline drawn while its shaders were translated
+        if (!translating_pipelines_.empty()) {
+            auto it = translating_pipelines_.find(key);
+            if (it != translating_pipelines_.end()) {
+                retire_generic(*it->second);
+                translating_pipelines_.erase(it);
+            }
+        }
+        pipe = pipeline(key, info, options_.async_pipelines && ps, pending, stand_in);
+        // waiting for the pipeline and its exact stand-in: the generic one
+        if (pending && generic_on_ && !options_.generic_only) {
+            if (generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages,
+                             generic_why)) {
+                auto entry = pipelines_.find(key);
+                if (entry != pipelines_.end()) pipe = generic_stand_in(*entry->second, generic_stages.info, true);
+                if (pipe) pending = false, generic = true;
+            } else {
+                report_.generic_refused[generic_why]++;
+            }
+        }
+    }
     if (pending) return skip("pipeline not ready (being made)");
     if (!pipe) return skip("vkCreateGraphicsPipelines failed");
     if (stand_in) report_.stand_in_draws++;
+    if (generic) {
+        report_.generic_draws++;
+        sys.generic[0] = vs->program;
+        sys.generic[1] = ps ? ps->program : 0;
+    }
 
     // the vertex data: the ranges of the vertex fetch constants the shaders
     // use (address and size, as Xenia's IssueDraw requests them), merged,
@@ -6091,28 +10398,29 @@ void Impl::draw(const gpu::Draw &d) {
     // ones. (Read from host memory, the arena's copies, they made the
     // scene's vertex shaders wait on the bus: 6.7 ms of a UE3 game's race
     // frame.)
-    struct VertexSlot {
-        uint32_t slot, start, end;
-    };
-    std::vector<VertexSlot> vertex_slots;
-    std::vector<Range> vertex_ranges;
+    std::vector<Range> &vertex_ranges = draw_lists_.vertex_ranges;
+    vertex_ranges.clear();
     {
-        std::set<uint32_t> fetch_slots;
-        for (const Shader *s : {vs, ps})
-            if (s) fetch_slots.insert(s->summary.vertex_slots.begin(), s->summary.vertex_slots.end());
-        for (uint32_t slot : fetch_slots) {
-            const uint32_t *f = &regs_[reg::FETCH_CONSTANTS + slot * 2];
-            // Xenia draws with any type here (its gpu_allow_invalid_fetch_constants
-            // is on by default), warning about texture constants
-            FetchConstantType type = FetchConstantType(f[0] & 3);
-            if (type == FetchConstantType::Texture || type == FetchConstantType::InvalidTexture)
-                approximate("a vertex fetch from a texture fetch constant");
-            uint32_t start = f[0] & 0x1FFFFFFC, words = (f[1] >> 2) & 0xFFFFFF;
-            uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(start) + uint64_t(words) * 4, GuestMemory::SIZE));
-            if (end > start) vertex_slots.push_back({slot, start, end});
-        }
-        std::vector<Range> sorted;
-        for (const VertexSlot &v : vertex_slots) sorted.push_back({v.start, v.end});
+        // the slots both shaders fetch, in order (a mask: 96 vertex fetch
+        // constants, three to a texture constant's six words)
+        std::vector<Range> &sorted = draw_lists_.sorted;
+        sorted.clear();
+        const uint64_t fetch_slots[2] = {vs->vertex_mask[0] | (ps ? ps->vertex_mask[0] : 0),
+                                         vs->vertex_mask[1] | (ps ? ps->vertex_mask[1] : 0)};
+        // (the slots fetched, by their bits: a loop over all 128 was 1.6% of the command thread)
+        for (uint32_t half = 0; half < 2; half++)
+            for (uint64_t left = fetch_slots[half]; left; left &= left - 1) {
+                const uint32_t slot = half * 64 + uint32_t(std::countr_zero(left));
+                const uint32_t *f = &regs_[reg::FETCH_CONSTANTS + slot * 2];
+                // Xenia draws with any type here (its gpu_allow_invalid_fetch_constants
+                // is on by default), warning about texture constants
+                FetchConstantType type = FetchConstantType(f[0] & 3);
+                if (type == FetchConstantType::Texture || type == FetchConstantType::InvalidTexture)
+                    approximate("a vertex fetch from a texture fetch constant");
+                uint32_t start = f[0] & 0x1FFFFFFC, words = (f[1] >> 2) & 0xFFFFFF;
+                uint32_t end = uint32_t(std::min<uint64_t>(uint64_t(start) + uint64_t(words) * 4, GuestMemory::SIZE));
+                if (end > start) sorted.push_back({start, end});
+            }
         std::sort(sorted.begin(), sorted.end());
         for (const Range &r : sorted) {
             if (!vertex_ranges.empty() && r.first <= vertex_ranges.back().second)
@@ -6122,8 +10430,38 @@ void Impl::draw(const gpu::Draw &d) {
         }
     }
     {
-        Timer timer(report_.vertex_seconds);
-        report_.vertex_bytes += request(vertex_ranges);
+        Timer timer(report_.vertex_seconds, cpu_times_);
+        if (range_memos_on_ && !trace_) {
+            // the ranges found in the mirror before and unwritten since left out
+            const uint32_t count = mem_.write_count();
+            const uint64_t serial = submission_serial();
+            std::vector<Range> &asked = draw_lists_.sorted; // (free again: the merge above is done)
+            asked.clear();
+            for (const Range &r : vertex_ranges) {
+                RangeMemo &m = range_memos_[range_memo_index(r)];
+                if (m.range == r && m.epoch == mirror_epoch_ &&
+                    (m.count == count || pages_unwritten(first_page(r), last_page(r), m.count))) {
+                    m.count = count;
+                    if (hoisted_uploads_ && m.used_serial != serial) {
+                        std::vector<Range> &one = draw_lists_.written;
+                        one.assign(1, r);
+                        mark_used(one);
+                        m.used_serial = serial;
+                    }
+                    continue;
+                }
+                asked.push_back(r);
+            }
+            if (!asked.empty()) {
+                const uint64_t epoch = mirror_epoch_;
+                report_.vertex_bytes += request(asked);
+                // (as of the count read before the look: a write since numbers a page above it;
+                // not when the mirror could not take them)
+                if (fatal_.empty() && epoch == mirror_epoch_)
+                    for (const Range &r : asked) range_memos_[range_memo_index(r)] = {r, count, mirror_epoch_, submission_serial()};
+            }
+        } else
+            report_.vertex_bytes += request(vertex_ranges, &vertex_memo_);
         // guest memory's bytes under the streams' pages, where the mirror has
         // nothing newer (Xenia's RequestRange of each stream)
         report_.vertex_bytes += request(exported);
@@ -6139,36 +10477,120 @@ void Impl::draw(const gpu::Draw &d) {
     VkDeviceSize attribute_bytes = (tessellated ? control_points.size() : guest_indices.size()) * 4;
     VkDeviceSize constants_size = (sizeof(harness::Constants) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
     VkDeviceSize system_size = (sizeof(System) + ubo_align_ - 1) / ubo_align_ * ubo_align_;
+    // (the index cache's are in its buffers already)
+    const bool cached_indices = index_entry && !tessellated;
     bool own_indices = index_bytes > ARENA_SLOT / 4, own_attributes = attribute_bytes > ARENA_SLOT / 4;
-    VkDeviceSize need = 2 * constants_size + system_size + 2 * sizeof(FsiConstants) + 6 * ubo_align_ +
-                        (own_indices ? 0 : index_bytes + 4) + (own_attributes ? 0 : attribute_bytes + 4);
-    if (arena_take(need, 1) == NONE) flush();
-    else slots_[current_].used -= need; // only a check that the draw fits
+    // (the constants in the draw-data arena where there is one, the streams
+    // in the arena)
+    VkDeviceSize draw_need = 2 * constants_size + system_size + 2 * sizeof(FsiConstants) + 6 * ubo_align_;
+    VkDeviceSize need = (draw_data_.buffer ? 0 : draw_need) + (own_indices || cached_indices ? 0 : index_bytes + 4) +
+                        (own_attributes ? 0 : attribute_bytes + 4);
+    bool fits = arena_take(need, 1) != NONE;
+    if (fits) slots_[current_].used -= need; // only a check that the draw fits
+    if (fits && draw_data_.buffer) {
+        fits = draw_data_take(draw_need, 1) != NONE;
+        if (fits) slots_[current_].draw_used -= draw_need;
+    }
+    if (!fits) {
+        flush();
+        // the draw reads its streams in the new submission
+        mark_used(vertex_ranges);
+        mark_used(exported);
+    }
     if (!fatal_.empty()) return;
+    // The submission the draw is in begun now: a flush above leaves the next
+    // one unbegun, and the constants' offsets kept from the last draw
+    // (last_*_at_, cleared as a submission begins) would otherwise still be
+    // the flushed one's. A draw reusing them read that slot's share, which
+    // the host writes again as soon as the slot records again, while this
+    // submission may still be on the GPU: garbage constants (a lost device
+    // with the constants in their own buffer, which fills a slot mid-frame).
+    begin_recording();
 
     // the interlock path's constants, with the occlusion counter the draw
     // counts in (the slot's, so once the flush above is past)
     if (fsi_ && fragment) {
-        fsi_constants.zpd_index = fsi_zpd_index();
+        fsi_constants.zpd_index = viz_survey_ != UINT32_MAX ? viz_fsi_index() : fsi_zpd_index();
         if (last_fsi_at_ == NONE || std::memcmp(&last_fsi_, &fsi_constants, sizeof(FsiConstants)) != 0) {
-            last_fsi_at_ = arena_take(sizeof(FsiConstants), ubo_align_);
-            std::memcpy(arena_data(last_fsi_at_), &fsi_constants, sizeof(FsiConstants));
+            last_fsi_at_ = draw_data_take(sizeof(FsiConstants), ubo_align_);
+            // (the kept copy first, the upload from it: the draw data is in
+            // write-combined memory, which nothing must read back, and a
+            // compiler free to copy the kept one from either did)
             last_fsi_ = fsi_constants;
+            upload(draw_data(last_fsi_at_), &last_fsi_, sizeof(FsiConstants));
         }
     }
     uint32_t dynamic_offsets[4] = {0, 0, 0, last_fsi_at_ == NONE ? 0u : uint32_t(last_fsi_at_)};
     for (int stage = 0; stage < 2; stage++) {
-        if (last_constants_at_[stage] == NONE ||
-            std::memcmp(&last_constants_[stage], &constants[stage], sizeof(harness::Constants)) != 0) {
-            last_constants_at_[stage] = arena_take(sizeof(harness::Constants), ubo_align_);
-            std::memcpy(arena_data(last_constants_at_[stage]), &constants[stage], sizeof(harness::Constants));
-            last_constants_[stage] = constants[stage];
+        // The float constants the stage's shader reads, by blocks of 8 (Shader::float_blocks; Cemu
+        // and RPCS3 upload a shader's own constants too): 4 KB of them went up at nearly every
+        // draw for the few a shader reads. All of them for the generic shaders, which read by
+        // the microcode's index. XF_CONSTANT_BLOCKS=0: all, always.
+        const Shader *reader = stage == 0 ? vs : ps;
+        const uint32_t blocks = !constant_blocks_ || generic ? 0xFFFFFFFFu : reader ? reader->float_blocks : 0u;
+        // (uploaded again when a draw found them changed, in each new submission, and where the
+        // blocks there are not all this draw's)
+        if (last_constants_at_[stage] == NONE || (blocks & ~last_constants_blocks_[stage])) {
+            last_constants_at_[stage] = draw_data_take(sizeof(harness::Constants), ubo_align_);
+            uint8_t *to = draw_data(last_constants_at_[stage]);
+            const harness::Constants &from = last_constants_[stage];
+            if (blocks == 0xFFFFFFFFu) {
+                upload(to, &from, sizeof(harness::Constants));
+            } else {
+                constexpr size_t BLOCK = 8 * 16, FLOATS = sizeof(from.float_constants);
+                static_assert(FLOATS == 32 * BLOCK && offsetof(harness::Constants, float_constants) == 0);
+                for (uint32_t left = blocks; left; left &= left - 1) {
+                    const size_t at = size_t(std::countr_zero(left)) * BLOCK;
+                    upload(to + at, reinterpret_cast<const uint8_t *>(&from) + at, BLOCK);
+                }
+                upload(to + FLOATS, reinterpret_cast<const uint8_t *>(&from) + FLOATS, sizeof(harness::Constants) - FLOATS);
+            }
+            last_constants_blocks_[stage] = blocks;
         }
     }
-    if (last_system_at_ == NONE || std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
-        last_system_at_ = arena_take(sizeof(System), ubo_align_);
-        std::memcpy(arena_data(last_system_at_), &sys, sizeof(System));
+    // (all of the tables for the generic shaders, and with XF_CONSTANT_BLOCKS=0)
+    const uint32_t system_slots = !constant_blocks_ || generic
+                                      ? 32u
+                                      : uint32_t(std::min(64 - std::countl_zero(texture_slots | 1), 32));
+    if (last_system_at_ == NONE || system_slots > last_system_slots_ ||
+        std::memcmp(&last_system_, &sys, sizeof(System)) != 0) {
+        last_system_at_ = draw_data_take(sizeof(System), ubo_align_);
         last_system_ = sys;
+        last_system_slots_ = system_slots;
+        // Two draws in three upload them, most for the textures of their slots, and 512 of
+        // the 784 bytes are the four tables of 32 slots, of which a draw's shaders read the
+        // first few: each table goes up to the last slot the shaders fetch from, with what
+        // lies before it (those there are a draw's whose shaders fetch no further).
+        const uint32_t slots = system_slots;
+        uint8_t *to = draw_data(last_system_at_);
+        const uint8_t *from = reinterpret_cast<const uint8_t *>(&last_system_);
+        if (slots == 32) {
+            upload(to, from, sizeof(System));
+        } else {
+            auto piece = [&](size_t first, size_t end) { upload(to + first, from + first, end - first); };
+            constexpr size_t SLOTS = offsetof(System, slots), FLAGS = offsetof(System, flags);
+            constexpr size_t SIGNS = offsetof(System, signs), SIGNED = offsetof(System, signed_slots);
+            constexpr size_t CLIP = offsetof(System, clip_planes), SCALE = offsetof(System, integer_scale);
+            constexpr size_t REST = offsetof(System, blend_premultiply);
+            static_assert(SLOTS < FLAGS && FLAGS < SIGNS && SIGNS < SIGNED && SIGNED < CLIP && CLIP < SCALE && SCALE < REST);
+            piece(0, SLOTS + 4 * slots);          // the NDC transform, the slots
+            piece(FLAGS, SIGNS + 4 * slots);      // flags, values, scales, the point, the signs
+            piece(SIGNED, SIGNED + 4 * slots);    // the signed views
+            piece(CLIP, SCALE + 4 * slots);       // clip planes, the extent's, the integer scales
+            piece(REST, sizeof(System));          // the blend's, the generic shaders'
+        }
+    }
+    // Every block the draw reads lies in its own submission's share: one in
+    // another's is the host's to write again while this one runs (the lost
+    // device above). A renderer bug, stopped here rather than on the GPU.
+    {
+        const VkDeviceSize share = draw_data_.buffer ? DRAW_DATA_SLOT : ARENA_SLOT;
+        const VkDeviceSize fsi_at = fsi_ && fragment ? last_fsi_at_ : NONE;
+        for (VkDeviceSize at : {last_constants_at_[0], last_constants_at_[1], last_system_at_, fsi_at})
+            if (at != NONE && at / share != current_) {
+                fatal_ = "a draw's constants lie outside its submission's share of the arena";
+                return;
+            }
     }
     dynamic_offsets[0] = uint32_t(last_constants_at_[0]);
     dynamic_offsets[1] = uint32_t(last_system_at_);
@@ -6195,8 +10617,10 @@ void Impl::draw(const gpu::Draw &d) {
     };
     VkBuffer index_buffer = VK_NULL_HANDLE, attribute_buffer = VK_NULL_HANDLE;
     VkDeviceSize index_at = 0, attribute_at = 0;
-    if (index_bytes &&
-        !put_words(indices.data(), index_bytes, own_indices, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer, index_at))
+    if (cached_indices)
+        index_buffer = index_entry->buffer, index_at = index_entry->at;
+    else if (index_bytes && !put_words(indices.data(), index_bytes, own_indices, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                       index_buffer, index_at))
         return;
     if (attribute_bytes && !put_words(attributes, attribute_bytes, own_attributes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                                       attribute_buffer, attribute_at))
@@ -6209,20 +10633,43 @@ void Impl::draw(const gpu::Draw &d) {
     Pass pass;
     for (uint32_t i = 0; i < 4; i++) pass.colors[i] = colors[i] ? colors[i]->view : VK_NULL_HANDLE;
     pass.depth = depth ? depth->view : VK_NULL_HANDLE;
-    pass.width = export_only ? 1 : width, pass.height = export_only ? 1 : height;
+    pass.width = export_only ? 1 : host_width, pass.height = export_only ? 1 : host_height;
     if (fsi_ && !export_only)
-        pass.width = pass.height = 8192, pass.samples = uint32_t(multisample.rasterizationSamples);
+        pass.width = pass.height = std::min(scale_.up(8192), max_image_),
+        pass.samples = uint32_t(multisample.rasterizationSamples);
     VkCommandBuffer c = begin_pass(pass, colors, depth);
     if (pipe != bound_pipeline_) {
-        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        // (after another pipeline of the renderer's own, a transfer's or a
+        // port's, whose state is not the draws': every state set again)
+        if (!bound_pipeline_) draw_state_valid_ = false, bound_index_buffer_ = VK_NULL_HANDLE, sets_bound_ = false;
+        record_value(c, Recorded::BindPipeline, pipe);
         bound_pipeline_ = pipe;
     }
-    VkDescriptorSet sets[2] = {draw_sets_[1], bindless_};
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, sets, 4, dynamic_offsets);
-    if (index_buffer) vkCmdBindIndexBuffer(c, index_buffer, index_at, VK_INDEX_TYPE_UINT32);
-    if (attribute_buffer) vkCmdBindVertexBuffers(c, 0, 1, &attribute_buffer, &attribute_at);
+    // an export's pipeline has no dynamic state, so binding it leaves the
+    // draws' undefined
+    if (export_only) draw_state_valid_ = false;
+    // The draws' sets: both after anything else's, then the first alone (the
+    // constants', whose offsets are the only thing a draw changes) and only
+    // where an offset moved; the textures' set stays bound.
+    const bool both_sets = !sets_bound_ || !set_elision_;
+    if (both_sets || std::memcmp(bound_offsets_, dynamic_offsets, sizeof(bound_offsets_)) != 0) {
+        Recorded::Sets sets;
+        sets.count = both_sets ? 2 : 1;
+        sets.sets[0] = draw_sets_[1], sets.sets[1] = bindless_;
+        std::memcpy(sets.offsets, dynamic_offsets, sizeof(sets.offsets));
+        record_value(c, Recorded::BindSets, sets);
+        sets_bound_ = true;
+    }
+    std::memcpy(bound_offsets_, dynamic_offsets, sizeof(bound_offsets_));
+    // the index buffer bound whole, once: the draw's first index is where its words are
+    if (index_buffer && index_buffer != bound_index_buffer_) {
+        record_value(c, Recorded::BindIndexBuffer, bound_index_buffer_ = index_buffer);
+    }
+    const uint32_t first_index = uint32_t(index_at / 4);
+    if (attribute_buffer) record_value(c, Recorded::BindVertexBuffer, Recorded::Place{attribute_buffer, attribute_at});
     if (export_only) {
-        vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
+        record_words(c, Recorded::DrawIndexed, uint32_t(indices.size()), first_index);
+        record_publish();
         report_.drawn++;
         end_export(exported);
         if (options_.verbose) {
@@ -6235,46 +10682,100 @@ void Impl::draw(const gpu::Draw &d) {
         return;
     }
     uint32_t stencil = regs_[r::RB_STENCILREFMASK], stencil_bf = regs_[r::RB_STENCILREFMASK_BF];
-    if (!((depth_control >> 7) & 1)) stencil_bf = stencil;
+    if (!polygonal || !((depth_control >> 7) & 1)) stencil_bf = stencil;
     const float *blend_constants = reinterpret_cast<const float *>(&regs_[r::RB_BLEND_RED]);
-    vkCmdSetViewport(c, 0, 1, &viewport.viewport);
-    vkCmdSetScissor(c, 0, 1, &scissor);
-    vkCmdSetBlendConstants(c, blend_constants);
-    vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, stencil & 0xFF);
-    vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, stencil_bf & 0xFF);
-    vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, (stencil >> 8) & 0xFF);
-    vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 8) & 0xFF);
-    vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, (stencil >> 16) & 0xFF);
-    vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, (stencil_bf >> 16) & 0xFF);
-    // the extended dynamic state, as the pipeline's description has it
-    vkCmdSetPrimitiveTopology(c, topology);
-    vkCmdSetPrimitiveRestartEnable(c, restart);
-    vkCmdSetCullMode(c, raster.cullMode);
-    vkCmdSetFrontFace(c, raster.frontFace);
-    vkCmdSetDepthTestEnable(c, depth_state.depthTestEnable);
-    vkCmdSetDepthWriteEnable(c, depth_state.depthWriteEnable);
-    vkCmdSetDepthCompareOp(c, depth_state.depthCompareOp);
-    vkCmdSetStencilTestEnable(c, depth_state.stencilTestEnable);
-    const VkStencilOpState &front = depth_state.front, &back = depth_state.back;
-    vkCmdSetStencilOp(c, VK_STENCIL_FACE_FRONT_BIT, front.failOp, front.passOp, front.depthFailOp, front.compareOp);
-    vkCmdSetStencilOp(c, VK_STENCIL_FACE_BACK_BIT, back.failOp, back.passOp, back.depthFailOp, back.compareOp);
-    vkCmdSetDepthBiasEnable(c, raster.depthBiasEnable);
-    if (d_.dynamic_blend() && !fsi_) {
-        // extended dynamic state 3: the blend and write masks of the four
-        // attachments the pipelines have (those without a target unused)
-        VkBool32 enables[4];
-        VkColorBlendEquationEXT equations[4];
-        VkColorComponentFlags masks[4];
+    // at the resolution scale (Xenia's GetHostViewportInfo and GetScissor
+    // with draw_resolution_scale): the viewport's bounds and the scissor's
+    // edges in host pixels, the NDC transform the same
+    VkViewport host_viewport_rect = viewport.viewport;
+    VkRect2D host_scissor_rect = scissor;
+    if (!scale_.one()) {
+        const float f = scale_.factor();
+        host_viewport_rect.x *= f, host_viewport_rect.y *= f;
+        host_viewport_rect.width *= f, host_viewport_rect.height *= f;
+        const uint32_t x0 = scale_.down(uint32_t(scissor.offset.x)), y0 = scale_.down(uint32_t(scissor.offset.y));
+        host_scissor_rect.offset = {int32_t(x0), int32_t(y0)};
+        host_scissor_rect.extent = {scale_.down(uint32_t(scissor.offset.x) + scissor.extent.width) - x0,
+                                    scale_.down(uint32_t(scissor.offset.y) + scissor.extent.height) - y0};
+    }
+    // The draws' dynamic state, each set only where it differs from what the
+    // command buffer holds (draw_state_; Xenia's D3D12 command processor sets
+    // its viewport, scissor, blend factor and stencil reference the same way,
+    // the rest is in its pipelines): most draws change a few of the 25.
+    DrawState n;
+    std::memset(&n, 0, sizeof(n)); // (compared bytewise, padding included)
+    n.viewport = host_viewport_rect;
+    n.scissor = host_scissor_rect;
+    std::memcpy(n.blend_constants, blend_constants, sizeof(n.blend_constants));
+    for (uint32_t face = 0; face < 2; face++) {
+        const uint32_t s = face ? stencil_bf : stencil;
+        n.stencil_reference[face] = s & 0xFF;
+        n.stencil_compare_mask[face] = (s >> 8) & 0xFF;
+        n.stencil_write_mask[face] = (s >> 16) & 0xFF;
+        const VkStencilOpState &op = face ? depth_state.back : depth_state.front;
+        n.stencil_op[face][0] = op.failOp, n.stencil_op[face][1] = op.passOp;
+        n.stencil_op[face][2] = op.depthFailOp, n.stencil_op[face][3] = VkStencilOp(op.compareOp);
+    }
+    n.topology = topology;
+    n.restart = restart;
+    n.cull_mode = raster.cullMode;
+    n.front_face = raster.frontFace;
+    n.depth_test = depth_state.depthTestEnable;
+    n.depth_write = depth_state.depthWriteEnable;
+    n.depth_compare = depth_state.depthCompareOp;
+    n.stencil_test = depth_state.stencilTestEnable;
+    n.depth_bias_enable = raster.depthBiasEnable;
+    const bool blend_dynamic = d_.dynamic_blend() && !fsi_;
+    if (blend_dynamic)
         for (uint32_t i = 0; i < 4; i++) {
             const VkPipelineColorBlendAttachmentState &b = blends[i];
-            enables[i] = b.blendEnable;
-            equations[i] = {b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp,
-                            b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp};
-            masks[i] = b.colorWriteMask;
+            n.blend_enables[i] = b.blendEnable;
+            n.blend_equations[i] = {b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp,
+                                    b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp};
+            n.write_masks[i] = b.colorWriteMask;
         }
-        set_blend_enable_(c, 0, 4, enables);
-        set_blend_equation_(c, 0, 4, equations);
-        set_write_mask_(c, 0, 4, masks);
+    const bool all = !draw_state_valid_ || !draw_state_elision_;
+    const DrawState &o = draw_state_;
+    // (whether any of it did: the kept copy is written again only then)
+    bool state_changed = all;
+    auto differs = [all, &state_changed](const auto &a, const auto &b) {
+        if (!all && std::memcmp(&a, &b, sizeof(a)) == 0) return false;
+        state_changed = true;
+        return true;
+    };
+    if (differs(n.viewport, o.viewport)) record_value(c, Recorded::Viewport, n.viewport);
+    if (differs(n.scissor, o.scissor)) record_value(c, Recorded::Scissor, n.scissor);
+    if (differs(n.blend_constants, o.blend_constants)) record_value(c, Recorded::BlendConstants, n.blend_constants);
+    static constexpr VkStencilFaceFlags FACES[2] = {VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_FACE_BACK_BIT};
+    for (uint32_t face = 0; face < 2; face++) {
+        if (differs(n.stencil_reference[face], o.stencil_reference[face]))
+            record_words(c, Recorded::StencilReference, FACES[face], n.stencil_reference[face]);
+        if (differs(n.stencil_compare_mask[face], o.stencil_compare_mask[face]))
+            record_words(c, Recorded::StencilCompareMask, FACES[face], n.stencil_compare_mask[face]);
+        if (differs(n.stencil_write_mask[face], o.stencil_write_mask[face]))
+            record_words(c, Recorded::StencilWriteMask, FACES[face], n.stencil_write_mask[face]);
+    }
+    // the extended dynamic state, as the pipeline's description has it
+    if (differs(n.topology, o.topology)) record_words(c, Recorded::Topology, uint32_t(n.topology));
+    if (differs(n.restart, o.restart)) record_words(c, Recorded::RestartEnable, uint32_t(n.restart));
+    if (differs(n.cull_mode, o.cull_mode)) record_words(c, Recorded::CullMode, uint32_t(n.cull_mode));
+    if (differs(n.front_face, o.front_face)) record_words(c, Recorded::FrontFace, uint32_t(n.front_face));
+    if (differs(n.depth_test, o.depth_test)) record_words(c, Recorded::DepthTest, uint32_t(n.depth_test));
+    if (differs(n.depth_write, o.depth_write)) record_words(c, Recorded::DepthWrite, uint32_t(n.depth_write));
+    if (differs(n.depth_compare, o.depth_compare)) record_words(c, Recorded::DepthCompare, uint32_t(n.depth_compare));
+    if (differs(n.stencil_test, o.stencil_test)) record_words(c, Recorded::StencilTest, uint32_t(n.stencil_test));
+    for (uint32_t face = 0; face < 2; face++)
+        if (differs(n.stencil_op[face], o.stencil_op[face]))
+            record_words(c, Recorded::StencilOp, FACES[face], uint32_t(n.stencil_op[face][0]),
+                         uint32_t(n.stencil_op[face][1]), uint32_t(n.stencil_op[face][2]),
+                         uint32_t(n.stencil_op[face][3]));
+    if (differs(n.depth_bias_enable, o.depth_bias_enable)) record_words(c, Recorded::DepthBiasEnable, uint32_t(n.depth_bias_enable));
+    if (blend_dynamic) {
+        // extended dynamic state 3: the blend and write masks of the four
+        // attachments the pipelines have (those without a target unused)
+        if (differs(n.blend_enables, o.blend_enables)) record_value(c, Recorded::BlendEnables, n.blend_enables);
+        if (differs(n.blend_equations, o.blend_equations)) record_value(c, Recorded::BlendEquations, n.blend_equations);
+        if (differs(n.write_masks, o.write_masks)) record_value(c, Recorded::WriteMasks, n.write_masks);
     }
     {
         // Lines as wide as PA_SU_LINE_CNTL's WIDTH says (half the width in
@@ -6289,7 +10790,8 @@ void Impl::draw(const gpu::Draw &d) {
                 approximate(d_.wide_lines() ? "line widths outside the device's range (clamped)"
                                             : "wide lines drawn one pixel wide (no wide lines on the device)");
         }
-        vkCmdSetLineWidth(c, width);
+        n.line_width = width;
+        if (differs(n.line_width, o.line_width)) record_value(c, Recorded::LineWidth, width);
     }
     {
         // the polygon offset as Xenia's Vulkan backend sets it
@@ -6302,9 +10804,14 @@ void Impl::draw(const gpu::Draw &d) {
             if ((sc_mode >> 11) & 1 && !(sc_mode & 1)) {
                 scale = offsets[0], offset = offsets[1];
                 // base/math.h's roundToNearestOrderOfMagnitude
-                if (scale != 0.0f) {
+                // (the last scale's kept: a scene draws with a few, and the
+                // logarithm and power at every draw were 4% of the command thread)
+                if (scale != 0.0f && scale == rounded_scale_in_) {
+                    scale = rounded_scale_out_;
+                } else if (scale != 0.0f) {
+                    rounded_scale_in_ = scale;
                     double order = std::pow(10.0, std::floor(std::log10(std::fabs(double(scale)))));
-                    scale = float(std::round(double(scale) / order) * order);
+                    scale = rounded_scale_out_ = float(std::round(double(scale) / order) * order);
                 }
             }
             if ((sc_mode >> 12) & 1 && !(sc_mode & 2) && scale == 0.0f && offset == 0.0f)
@@ -6312,9 +10819,47 @@ void Impl::draw(const gpu::Draw &d) {
         } else if ((sc_mode >> 13) & 1) {
             scale = offsets[0], offset = offsets[1];
         }
-        float constant = offset * (depth && depth->format == 1 ? float(1u << 24) : float((1u << 24) - 1));
-        vkCmdSetDepthBias(c, constant, 0.0f, scale * (1.0f / 16.0f));
+        // The constant, in the host's units (Xenia's draw_util.h). Direct3D's
+        // bias is a whole number of units, rounded up (GetD3D10IntegerPolygonOffset:
+        // more offset is better than none), of 2^-24 on 24-bit unorm depth and of
+        // the primitive's own float unit on float depth, where a D24FS8 unit
+        // is 8 of the host's (and the target's halved range halves the unit
+        // by itself).
+        // With VK_EXT_depth_bias_control the unit is exactly 2^-24 on both:
+        // without it a device may take up to twice that on unorm depth (the
+        // specification's minimum resolvable difference; NVIDIA does, which
+        // doubled every constant offset there), and a float format's unit
+        // shrinks with the depth, losing small offsets far from 1 (decals
+        // with reversed depth). Float depth then takes the guest's offset as
+        // it is, as the console and the exact path do and as Xenia's Vulkan
+        // backend (vulkan_depth_bias_force_unorm), halved with D24FS8's range.
+        // XF_DEPTH_BIAS_FLOAT_UNITS=1 keeps a float format's own units, as
+        // Xenia's Direct3D 12 backend draws.
+        const bool float24 = depth && depth->format == 1;
+        const bool host_float = depth && depth->image.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        const bool exact_units = d_.depth_bias_control() && !(host_float && depth_bias_float_units_);
+        float constant = 0.0f;
+        if (offset != 0.0f) {
+            if (host_float && exact_units)
+                constant = offset * (float24 ? float(1u << 24) * 0.5f : float((1u << 24) - 1));
+            else if (float24)
+                constant = std::copysign(std::ceil(std::fabs(offset) * float(1u << 21)) * 8.0f, offset);
+            else
+                constant = std::copysign(std::ceil(std::fabs(offset) * float((1u << 24) - 1)), offset);
+            if (!exact_units)
+                approximate(host_float ? "polygon offsets in a float depth format's units (no VK_EXT_depth_bias_control)"
+                                       : "polygon offsets in the device's depth units (no VK_EXT_depth_bias_control)");
+        }
+        // (the representation is part of the state: 1 the format's, 2 unorm forced)
+        n.depth_bias[0] = constant, n.depth_bias[1] = scale * (scale_.factor() / 16.0f);
+        n.depth_bias[2] = !exact_units ? 0.0f : host_float ? 2.0f : 1.0f;
+        if (differs(n.depth_bias, o.depth_bias)) {
+            record_value(c, exact_units ? Recorded::DepthBiasExact : Recorded::DepthBias,
+                         Recorded::Bias{host_float, n.depth_bias[0], n.depth_bias[1]});
+        }
     }
+    if (state_changed) draw_state_ = n;
+    draw_state_valid_ = true;
     if (options_.gpu_timing_draws) {
         // each draw timed on its own, counted to its shaders
         char kind[96];
@@ -6322,11 +10867,29 @@ void Impl::draw(const gpu::Draw &d) {
                       (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull);
         gpu_mark(kind);
     }
-    zpd_draw(c);
+    if (viz_survey_ == UINT32_MAX)
+        zpd_draw(c);
+    else if (!fsi_)
+        viz_draw(c);
+    if (viz_predicate_ != UINT32_MAX) {
+        // drawn where the query's survey passed samples
+        record_value(c, Recorded::BeginConditional,
+                     Recorded::Place{viz_predicates_.buffer, VkDeviceSize(viz_predicate_) * 4});
+        report_.viz_predicated++;
+    }
+    if (host_vertex.extents && extent_serial_ == slots_[current_].serial) {
+        // bounded (lines half their width wider: PA_SU_LINE_CNTL's width is
+        // half the width in 12.4 fixed point)
+        extent_drawn_ = true;
+        if (topology_class == 1)
+            extent_margin_ = std::max(extent_margin_, ((regs_[r::PA_SU_LINE_CNTL] & 0xFFFF) + 15) / 16);
+    }
     if (tessellated)
-        vkCmdDraw(c, uint32_t(control_points.size() / 2), 1, 0, 0);
+        record_words(c, Recorded::Draw, uint32_t(control_points.size() / 2));
     else
-        vkCmdDrawIndexed(c, uint32_t(indices.size()), 1, 0, 0, 0);
+        record_words(c, Recorded::DrawIndexed, uint32_t(indices.size()), first_index);
+    if (viz_predicate_ != UINT32_MAX) record_words(c, Recorded::EndConditional);
+    record_publish();
     if (options_.gpu_timing_draws) gpu_mark("draws: between draws");
     report_.drawn++;
     end_export(exported);
@@ -6379,7 +10942,46 @@ void Impl::resolve() {
     if (!source) return fatal_.empty() ? skip("resolve: source format") : void();
     uint32_t x = std::min(info.x, source->width), y = std::min(info.y, source->height);
     uint32_t w = std::min(info.width, source->width - x), h = std::min(info.height, source->height - y);
-    if (!fsi_) acquire(source, y + h);
+    // (the tiles under the rectangle: with XF_DRAW_REACH=rows, every tile of
+    // the rows down to its last, as Xenia takes them)
+    auto take = [&](RenderTarget *t) {
+        if (!reach_tiles_ || !w || !h) return acquire(t, y + h);
+        const TileRect tiles = tiles_of(*t, x, y, x + w, y + h);
+        acquire(t, std::span<const TileRect>(&tiles, 1));
+    };
+    // Beyond Xenia: a copy alone from a source that does not hold every tile
+    // of the rectangle (a view of tiles another target draws to: a 4x
+    // shadow atlas resolved as a single-sampled surface twice as wide and
+    // tall) leaves the tiles with their holders, which store them into
+    // EDRAM, and reads them there: a store, where taking them was a transfer
+    // into the view and another back at the holder's next draw. Off unless
+    // XF_RESOLVE_FROM_HOLDERS=1 (the source takes them, as Xenia's): in the
+    // one frame measured the transfers it replaces were clears already, and
+    // its two stores cost 0.02 ms more (docs/renderer.md).
+    static const bool from_holders = [] {
+        const char *v = std::getenv("XF_RESOLVE_FROM_HOLDERS"), *image = std::getenv("XF_RESOLVE_FROM_IMAGE");
+        return v && v[0] == '1' && !(image && std::string(image) == "1");
+    }();
+    resolve_stored_ = false;
+    if (!fsi_ && from_holders && reach_tiles_ && info.copy && !info.clear_color && !info.clear_depth && w && h) {
+        const TileRect rect = tiles_of(*source, x, y, x + w, y + h);
+        std::map<RenderTarget *, std::vector<uint32_t>> held;
+        bool others = false;
+        for (uint32_t row = rect.r0; row < rect.r1; row++)
+            for (uint32_t column = rect.c0; column < rect.c1; column++) {
+                if (row * source->pitch_tiles + column >= EDRAM_TILES) continue;
+                const uint32_t tile = (source->base + row * source->pitch_tiles + column) % EDRAM_TILES;
+                if (!owners_[tile]) continue; // (EDRAM has it)
+                held[owners_[tile]].push_back(tile);
+                others |= owners_[tile] != source;
+            }
+        if (others) {
+            for (auto &[holder, tiles] : held)
+                if (!edram_store(holder, tiles)) return;
+            resolve_stored_ = true;
+        }
+    }
+    if (!fsi_ && !resolve_stored_) take(source);
     if (!fatal_.empty()) return;
     if (options_.verbose)
         std::fprintf(stderr,
@@ -6428,7 +11030,7 @@ void Impl::resolve() {
         }
         for (RenderTarget *t : {depth_target, color_target}) {
             if (!t) continue;
-            acquire(t, y + h);
+            take(t);
             if (!fatal_.empty()) return;
             VkClearAttachment clear{};
             if (t->depth) {
@@ -6484,29 +11086,306 @@ void Impl::resolve() {
                     break;
                 }
             }
-            VkClearRect rect{{{int32_t(x), int32_t(y)}, {std::min(w, t->width - std::min(x, t->width)), std::min(h, t->height - std::min(y, t->height))}}, 0, 1};
+            // (at the resolution scale: x, y, w and h are multiples of 8)
+            const uint32_t cw = std::min(w, t->width - std::min(x, t->width)), ch = std::min(h, t->height - std::min(y, t->height));
+            VkClearRect rect{{{int32_t(scale_.down(x)), int32_t(scale_.down(y))},
+                              {std::min(scale_.down(cw), t->host_width - std::min(scale_.down(x), t->host_width)),
+                               std::min(scale_.down(ch), t->host_height - std::min(scale_.down(y), t->host_height))}},
+                             0, 1};
             if (!rect.rect.extent.width || !rect.rect.extent.height) continue;
-            VkCommandBuffer c = outside();
-            gpu_mark("resolves: clears");
-            VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            attachment.imageView = t->raw ? t->raw : t->view;
-            attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            rendering.renderArea = {{0, 0}, {t->width, t->height}};
-            rendering.layerCount = 1;
-            if (t->depth) {
-                rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
-            } else {
-                rendering.colorAttachmentCount = 1;
-                rendering.pColorAttachments = &attachment;
+            // the target's tiles the clear covers whole now hold its value;
+            // those it covers in part, not one value any more
+            {
+                const uint32_t x1 = std::min(x, t->width) + cw, y1 = std::min(y, t->height) + ch;
+                const uint32_t rows = t->height / t->tile_height;
+                for (uint32_t row = y / t->tile_height; row < std::min(rows, (y1 + t->tile_height - 1) / t->tile_height); row++)
+                    for (uint32_t column = x / t->tile_width;
+                         column < std::min(t->pitch_tiles, (x1 + t->tile_width - 1) / t->tile_width); column++) {
+                        const uint32_t tile = (t->base + row * t->pitch_tiles + column) % EDRAM_TILES;
+                        if (owners_[tile] != t) continue;
+                        const bool whole = column * t->tile_width >= x && (column + 1) * t->tile_width <= x1 &&
+                                           row * t->tile_height >= y && (row + 1) * t->tile_height <= y1;
+                        tile_cleared_[tile] = whole;
+                        if (whole) tile_clear_value_[tile] = clear.clearValue, cleared_epoch_++;
+                        if (whole && t->depth) tile_clear_word_[tile] = regs_[r::RB_DEPTH_CLEAR];
+                        if (t->depth) {
+                            tile_stencil_[tile] = whole ? int16_t(regs_[r::RB_DEPTH_CLEAR] & 0xFF) : int16_t(-1);
+                            if (whole) stencil_epoch_++;
+                        }
+                    }
             }
-            vkCmdBeginRendering(c, &rendering);
-            vkCmdClearAttachments(c, 1, &clear, 1, &rect);
-            vkCmdEndRendering(c);
+            // kept for the target's next render pass, whose draws need it
+            // first, and drawn there (begin_pass), without a barrier and a
+            // rendering pass of its own; anything else that reads or writes
+            // the image first has it drawn before (flush_clears). Not for a
+            // target cleared through its UINT view (begin_pass draws through
+            // the other), nor with XF_DEFER_CLEARS=0.
+            t->pending_clears.push_back({clear, rect});
+            if (t->raw || !defer_clears_) flush_clears(t);
         }
     }
+}
+
+// A target's kept clears drawn now, in a rendering pass of their own (as
+// Xenia's resolves clear), before something other than its next render pass
+// takes its image
+void Impl::flush_clears(RenderTarget *t) {
+    if (!t || t->pending_clears.empty()) return;
+    VkCommandBuffer c = outside();
+    gpu_mark("resolves: clears");
+    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    attachment.imageView = t->raw ? t->raw : t->view;
+    attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea = {{0, 0}, {t->host_width, t->host_height}};
+    rendering.layerCount = 1;
+    if (t->depth) {
+        rendering.pDepthAttachment = rendering.pStencilAttachment = &attachment;
+    } else {
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &attachment;
+    }
+    vkCmdBeginRendering(c, &rendering);
+    t->samples_unsettled = t->depth;
+    for (const auto &[clear, rect] : t->pending_clears) vkCmdClearAttachments(c, 1, &clear, 1, &rect);
+    vkCmdEndRendering(c);
+    t->pending_clears.clear();
+}
+
+// Beyond Xenia, whose resolves write memory and whose textures over it are
+// loaded from there again: the textures a later draw reads over a resolve's
+// destination are written by the resolve too, their images kept current, not
+// loaded again (renderer.md, "Resolve targets"). Such a texture is one made
+// as a resolve target (one tiled 2D level of 32- or 64-bit texels whose
+// image holds the guest's bits as they are), current before the resolve
+// (not stale), with the destination's base, pitch, texel size and
+// endianness, whatever its format (the same bits under another name, as a
+// 16_16_FLOAT render target read as 16_16_EXPAND): then the rectangle's
+// pixel (x, y) is its texel (texel_x0 + dest_x + x, texel_y0 + dest_y + y),
+// and the resolve leaves the rest of its memory as it was. Up to two (the
+// push constants' room); a third is loaded again as before.
+uint32_t Impl::resolve_targets(const resolve::Info &info, Texture *targets[2], uint32_t &extra_rows) {
+    targets[0] = targets[1] = nullptr;
+    extra_rows = 0;
+    // (depth resolves too: they copy the guest's depth words as they are,
+    // which a texture reading the bits takes, and a depth texture takes as
+    // the float its load would make; Texture::target_convert;
+    // XF_RESOLVE_TARGETS_DEPTH=0 leaves them to memory alone)
+    if (!resolve_targets_ || info.dest_array || !info.texture_base || (info.depth && !depth_targets_)) return 0;
+    const uint32_t bytes = texture::format_block(info.dest_format).bytes;
+    if (bytes != 4 && bytes != 8) return 0;
+    if ((info.texel_x0 >> 5) > 0xFF || (info.texel_y0 >> 5) > 0xFF) return 0;
+    const uint32_t base = info.texture_base & 0x1FFFFFFF, wide = bytes == 8 ? 1 : 0;
+    const uint32_t bucket = base >> TEXTURE_BUCKET_SHIFT;
+    if (bucket >= std::size(texture_buckets_)) return 0;
+    // A stale one (written since its load) is fed too when the resolve
+    // writes every texel it has: its image is then what memory holds again.
+    const uint32_t x0 = info.texel_x0 + info.dest_x, y0 = info.texel_y0 + info.dest_y;
+    auto covers = [&](const Texture &t) {
+        const uint32_t width = (t.key[2] & 0x1FFF) + 1, height = ((t.key[2] >> 13) & 0x1FFF) + 1;
+        return x0 == 0 && y0 == 0 && info.width >= width && info.height >= height;
+    };
+    // A texture whose memory holds the destination further down, a whole
+    // number of 32-row macro tile rows in (a smaller surface placed inside a
+    // larger one), is fed at that many rows more: a tiled 2D texture's row of
+    // macro tiles is its pitch times 32 texels, contiguous (Xenia's
+    // GetTiledOffset2D), so the destination's texel (x, y) is the texture's
+    // (x, y + rows).
+    uint32_t count = 0;
+    for (Texture *t : texture_buckets_[bucket]) {
+        // (each target over the destination's base refused, counted by why:
+        // "uses" in the report)
+        if (!t->target) continue;
+        if (base < t->target_base || base >= t->high) continue;
+        if (((t->target >> 7) & 1) != wide || t->target_pitch != info.dest_pitch) {
+            if (refusal_detail_) {
+                char line[200];
+                std::snprintf(line, sizeof(line),
+                              "a resolve target refused: texture %s %ux%u pitch %u, resolve %s %ux%u pitch %u",
+                              format_name(t->key[1] & 0x3F), (t->key[2] & 0x1FFF) + 1, ((t->key[2] >> 13) & 0x1FFF) + 1,
+                              t->target_pitch, format_name(info.dest_format), info.width, info.height, info.dest_pitch);
+                use(std::string(line));
+            } else {
+                use(((t->target >> 7) & 1) != wide ? "a resolve target refused: another texel size"
+                                                     : "a resolve target refused: another pitch");
+            }
+            continue;
+        }
+        if (t->target_endian != info.dest_endian) {
+            use("a resolve target refused: another endianness");
+            continue;
+        }
+        const uint32_t offset = base - t->target_base, macro_row = t->target_pitch * bytes * 32;
+        if (!macro_row || offset % macro_row) {
+            use("a resolve target refused: not a whole number of macro tile rows in");
+            continue;
+        }
+        const uint32_t rows = offset / macro_row * 32;
+        if ((info.texel_y0 + rows) >> 5 > 0xFF || (count && rows != extra_rows)) {
+            use("a resolve target refused: rows the push constants cannot hold");
+            continue;
+        }
+        if (t->stale && (rows || !covers(*t))) {
+            use("a resolve target refused: stale, and the resolve does not write all of it");
+            continue;
+        }
+        if (count == 2) {
+            use("a resolve target refused: a third over the destination");
+            continue;
+        }
+        extra_rows = rows;
+        targets[count++] = t;
+    }
+    return count;
+}
+
+// The scaled resolve kept for a resolve no scaled texture is over (Impl::
+// ScaledResolve): one of the resolves' targets, 32- or 64-bit texels, from the
+// texture's corner, no smaller than the minimum scalable dimension; at most
+// eight kept. Null when the resolve is not one.
+Impl::ScaledResolve *Impl::scaled_resolve(const resolve::Info &info, const std::vector<Range> &written) {
+    const uint32_t bytes = texture::format_block(info.dest_format).bytes;
+    // (32-bit texels only, as scale_texture's callers)
+    if (info.depth || info.dest_array || !info.texture_base || bytes != 4 ||
+        info.texel_x0 + info.dest_x || info.texel_y0 + info.dest_y || !scalable(info.width, info.height, min_scalable_) ||
+        written.empty() || scaled_resolves_.size() >= 8)
+        return nullptr;
+    const uint32_t wide = bytes == 8 ? 1 : 0;
+    const VkFormat format = wide ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
+    ScaledResolve kept;
+    kept.image = d_.create_image(VK_IMAGE_TYPE_2D, format, {scale_.up(info.width), scale_.up(info.height), 1}, 1, 1,
+                                 VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (!kept.image.image) return nullptr;
+    uint32_t slot = UINT32_MAX;
+    if (!free_targets_[wide].empty()) {
+        slot = free_targets_[wide].back();
+        free_targets_[wide].pop_back();
+    } else {
+        slot = take_target(wide);
+    }
+    kept.view = slot == UINT32_MAX ? VK_NULL_HANDLE
+                                   : make_view(kept.image.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT, {}, 1, 1, false);
+    if (!kept.view) {
+        if (slot != UINT32_MAX) free_targets_[wide].push_back(slot);
+        d_.destroy(kept.image);
+        return nullptr;
+    }
+    VkDescriptorImageInfo descriptor{VK_NULL_HANDLE, kept.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = target_set_;
+    write.dstBinding = wide;
+    write.dstArrayElement = slot;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &descriptor;
+    vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+    begin_image(outside(), kept.image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    kept.target = (slot + 1) | wide << 7;
+    kept.pitch = info.dest_pitch, kept.endian = info.dest_endian;
+    kept.width = info.width, kept.height = info.height;
+    kept.low = UINT32_MAX, kept.high = 0;
+    for (auto [start, end] : written) kept.low = std::min(kept.low, start), kept.high = std::max(kept.high, end);
+    kept.swap = report_.swaps;
+    return &(scaled_resolves_[info.texture_base & 0x1FFFFFFF] = kept);
+}
+
+// The scaled resolves kept over memory something else writes, gone once the
+// work recorded so far is done
+void Impl::drop_scaled_resolves(const std::vector<Range> &written, bool all) {
+    for (auto it = scaled_resolves_.begin(); it != scaled_resolves_.end();) {
+        bool hit = all;
+        for (auto [start, end] : written) hit |= start < it->second.high && it->second.low < end;
+        if (!hit) {
+            ++it;
+            continue;
+        }
+        ScaledResolve old = it->second;
+        it = scaled_resolves_.erase(it);
+        begin_recording();
+        slots_[current_].after.push_back([this, old]() mutable {
+            release_target(old.target, old.view);
+            d_.destroy(old.image);
+        });
+    }
+}
+
+// A resolve target made the resolution scale's (docs/renderer.md,
+// "Resolution scale"): a new image of the same format width x height console
+// texels at the scale, with its own place in the resolves' table; the old
+// one, its views and its place go once the submission being recorded is
+// done, as texture() replaces an image. Its views are made again as draws
+// ask. The resolve that calls it writes every texel.
+void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
+    const uint32_t wide = (t.target >> 7) & 1;
+    const VkFormat target_format = wide ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32_UINT;
+    vk::Image image = d_.create_image(
+        VK_IMAGE_TYPE_2D, t.image.format, {scale_.up(width), scale_.up(height), 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_STORAGE_BIT,
+        VK_IMAGE_CREATE_EXTENDED_USAGE_BIT, t.signed_format, target_format);
+    if (!image.image) return;
+    uint32_t slot = UINT32_MAX;
+    if (!free_targets_[wide].empty()) {
+        slot = free_targets_[wide].back();
+        free_targets_[wide].pop_back();
+    } else {
+        slot = take_target(wide);
+    }
+    VkImageView target_view = VK_NULL_HANDLE;
+    if (slot != UINT32_MAX) {
+        VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        view.image = image.image;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = target_format;
+        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageViewUsageCreateInfo view_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        view_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        view.pNext = &view_usage;
+        if (vkCreateImageView(dev_, &view, nullptr, &target_view) != VK_SUCCESS) target_view = VK_NULL_HANDLE;
+    }
+    if (!target_view) {
+        if (slot != UINT32_MAX) free_targets_[wide].push_back(slot);
+        d_.destroy(image);
+        return;
+    }
+    VkDescriptorImageInfo descriptor{VK_NULL_HANDLE, target_view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = target_set_;
+    write.dstBinding = wide;
+    write.dstArrayElement = slot;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &descriptor;
+    vkUpdateDescriptorSets(dev_, 1, &write, 0, nullptr);
+    // the old image, views and place, once the work recorded so far is done
+    vk::Image old = t.image;
+    std::vector<TextureView> old_views = std::move(t.views);
+    const uint32_t old_kind = t.kind, old_target = t.target;
+    const VkImageView old_target_view = t.target_view;
+    report_.texture_views -= old_views.size();
+    begin_recording();
+    slots_[current_].after.push_back([this, old, old_views, old_kind, old_target, old_target_view]() mutable {
+        for (const TextureView &v : old_views) {
+            release_index(old_kind, v.index);
+            vkDestroyImageView(dev_, v.view, nullptr);
+        }
+        release_target(old_target, old_target_view);
+        d_.destroy(old);
+    });
+    t.views.clear();
+    t.loads++; // (what the draws kept of its slots: SlotMemo)
+    const VkDeviceSize bytes = image_bytes(image);
+    count_texture_bytes(bytes, t.bytes);
+    t.bytes = bytes;
+    t.image = image;
+    t.target = (slot + 1) | wide << 7, t.target_view = target_view;
+    t.scaled = true;
+    begin_image(outside(), image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1);
+    report_.textures_scaled++;
+    if (options_.verbose)
+        std::fprintf(stderr, "  texture %08X made the resolution scale's (%ux%u)\n", t.target_base, width, height);
 }
 
 // The copy on the GPU: the rectangle (resolved to one sample per pixel when
@@ -6517,6 +11396,7 @@ void Impl::resolve() {
 // Its pages are then the GPU's (gpu_written); textures over it are loaded
 // again; guest memory gets the bytes as readback_resolve says.
 void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
+    flush_clears(&source);
     std::vector<Range> written, partial;
     if (!resolve::destination_ranges(info, written, partial)) {
         approximate(std::string("resolve not written: resolve to ") + format_name(info.dest_format));
@@ -6550,31 +11430,53 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     }
     VkDeviceSize pixel_bytes = VkDeviceSize(w) * h * texel;
     VkDeviceSize stencil_bytes = info.depth ? (VkDeviceSize(w) * h + 3) & ~VkDeviceSize(3) : 0;
-    // a multisampled source is read from EDRAM, its samples as the guest
-    // keeps them, as Xenia's resolve shaders read them (the sample or the
-    // average RB_COPY_CONTROL selects; depth one sample): the rectangle's
-    // tiles stored there first by the target, which keeps them
-    // (and an 8_8_8_8_GAMMA target kept linear, its gamma made in EDRAM's
-    // bits, which Xenia's resolves always read)
-    // (the interlock path: always, EDRAM being the targets)
-    const bool from_edram = fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear);
+    // The source is read as EDRAM's samples, as the guest keeps them, as
+    // Xenia's resolve shaders read them (the sample or the average
+    // RB_COPY_CONTROL selects; depth one sample): on the interlock path from
+    // EDRAM, which is the targets; on the host path from the target's image,
+    // each sample packed as the EDRAM store would pack it (from_target_image
+    // below). Single-sampled ones too: that costs less than copying the image
+    // into a buffer first (game B's final 1280x720 resolve, 0.064 against
+    // 0.099 ms with the store; docs/renderer.md, "Direct ownership
+    // transfers"). XF_RESOLVE_FROM_IMAGE=1 copies a
+    // single-sampled target's image, as before (not an 8_8_8_8_GAMMA one
+    // kept linear, whose gamma is made in EDRAM's bits).
+    static const bool from_image = [] {
+        const char *v = std::getenv("XF_RESOLVE_FROM_IMAGE");
+        return v && std::string(v) == "1";
+    }();
+    // (and at a resolution scale, always: the resolve reads EDRAM's scaled
+    // samples)
+    const bool from_edram =
+        !from_image || fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear) || !scale_.one();
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!from_edram && !grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
     request(keep);
 
     VkCommandBuffer c;
-    if (from_edram) {
+    // On the host path the guest samples come from the source's image itself,
+    // packed as the EDRAM store packs them (resolve.comp's IMAGE), with no
+    // store and no barrier between the two: the source holds every tile of
+    // the rectangle (acquire), and keeps holding them, so EDRAM's copy of
+    // them is read by nothing (XF_RESOLVE_THROUGH_EDRAM=1: as before).
+    // (Not where the source does not hold them: their holders have stored
+    // them into EDRAM, Impl::resolve.)
+    const bool from_target_image = from_edram && !fsi_ && !resolve_through_edram_ && !resolve_stored_;
+    if (from_target_image) {
+        c = outside();
+        if (options_.gpu_timing) gpu_mark("resolves: copies from the target: " + target_name(source));
+    } else if (from_edram) {
         std::vector<uint32_t> tiles;
         for (uint32_t row = info.y / source.tile_height; row <= (info.y + h - 1) / source.tile_height; row++)
             for (uint32_t column = info.x / source.tile_width; column <= (info.x + w - 1) / source.tile_width; column++)
                 tiles.push_back((source.base + row * source.pitch_tiles + column) % EDRAM_TILES);
-        if (!fsi_ && !edram_store(&source, tiles)) return;
+        if (!fsi_ && !resolve_stored_ && !edram_store(&source, tiles)) return;
         c = outside();
-        gpu_mark("resolves: copies");
+        if (options_.gpu_timing) gpu_mark("resolves: copies from EDRAM: " + target_name(source));
     } else {
         c = outside();
-        gpu_mark("resolves: copies");
+        if (options_.gpu_timing) gpu_mark("resolves: copies from the image: " + target_name(source));
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VkImageAspectFlags(info.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
                                  0, 0, 1};
@@ -6603,7 +11505,9 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // as EDRAM's bits would be (Xenia resolves from its EDRAM dump, which
     // follows depth_float24_round; a depth converted in the pixel shader is
     // exact either way)
-    p.depth_round = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader;
+    p.flags = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader ? 1u : 0u;
+    // EDRAM read at the resolution scale, over the console's pixels
+    p.flags |= scale_.q4 << 8 | 4u << 16;
     p.raw = resolve::raw_copy(info);
     p.dest_base = info.dest_base, p.dest_pitch = info.dest_pitch, p.dest_height = info.dest_height;
     p.dest_x = info.dest_x, p.dest_y = info.dest_y, p.dest_slice = info.dest_slice, p.dest_array = info.dest_array;
@@ -6611,6 +11515,51 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     p.dest_log2_bytes = uint32_t(std::countr_zero(texture::format_block(info.dest_format).bytes));
     p.dest_endian = info.dest_endian, p.dest_number = info.dest_number, p.dest_swap = info.dest_swap;
     p.exp_factor = std::ldexp(1.0f, info.dest_exp_bias);
+    Texture *targets[2];
+    uint32_t extra_rows = 0;
+    // the textures fed at the console's size (written by the pass over its
+    // pixels) and at the resolution scale (by a pass of their own after it)
+    uint32_t target_1x = 0, target_scaled = 0, convert_1x = 0;
+    if (uint32_t count = resolve_targets(info, targets, extra_rows)) {
+        const uint32_t corner = (info.texel_x0 >> 5) << 16 | ((info.texel_y0 + extra_rows) >> 5) << 24;
+        uint32_t places[2] = {0, 0};
+        // both in use before either is made the resolution scale's (whose new
+        // place in the table could otherwise be the other one's: take_target)
+        for (uint32_t k = 0; k < count; k++) use(*targets[k], submission_serial() + 1);
+        for (uint32_t k = 0; k < count; k++) {
+            Texture &t = *targets[k];
+            // Made the resolution scale's when this resolve writes all of it
+            // and both are no smaller than the minimum scalable dimension
+            // (RPCS3's rule): the resolve then writes every scaled texel. Only
+            // 32-bit texels: a 64-bit one's scaled feed showed wrong colors in
+            // game F's bloom against Xenia's scaled picture (open; renderer.md,
+            // "Resolution scale"), so those stay the console's size.
+            const uint32_t tw = (t.key[2] & 0x1FFF) + 1, th = ((t.key[2] >> 13) & 0x1FFF) + 1;
+            // (a depth texture's floats are no guest bits a scaled image could hold)
+            if (!scale_.one() && !t.scaled && !t.target_convert && !extra_rows && info.texel_x0 + info.dest_x == 0 &&
+                info.texel_y0 + info.dest_y == 0 && info.width >= tw && info.height >= th &&
+                scalable(tw, th, min_scalable_) && scalable(info.width, info.height, min_scalable_) && !(t.target & 0x80))
+                scale_texture(t, tw, th);
+            // current again if it was stale: the resolve wrote all of it
+            if (t.stale) t.stale = false, t.load_why = LoadWhy::CpuWritten;
+            uint32_t &into = t.scaled ? target_scaled : target_1x;
+            // what each place at the console's size takes (flags bits 24-25
+            // and 26-27: resolve.comp's write_targets)
+            if (!t.scaled) convert_1x |= t.target_convert << (24 + 2 * places[0]);
+            into |= (t.target & (places[t.scaled] ? 0x7Fu : 0xFFu)) << (8 * places[t.scaled]++);
+        }
+        if (target_1x) target_1x |= corner;
+        if (target_scaled) target_scaled |= corner | (targets[0]->target & 0x80u);
+        report_.resolve_targets_written += count;
+    }
+    // at a resolution scale, a resolve no scaled texture is over keeps its
+    // scaled texels for the texture a later draw makes there
+    drop_scaled_resolves(written);
+    if (!scale_.one() && !target_scaled && resolve_targets_)
+        if (ScaledResolve *kept = scaled_resolve(info, written))
+            target_scaled = (kept->target & 0xFFu) | (info.texel_x0 >> 5) << 16 | (info.texel_y0 >> 5) << 24;
+    p.target = target_1x;
+    p.flags |= convert_1x;
     if (from_edram) {
         p.edram = 1;
         p.edram_base = source.base, p.edram_pitch = source.pitch_tiles, p.msaa = source.msaa;
@@ -6619,15 +11568,36 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         p.first_sample = resolve::first_sample(info.sample_select);
         p.samples = resolve::sample_count(info.sample_select);
     }
-    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_pipeline_);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, resolve_layout_, 0, 1,
-                            from_edram ? &resolve_edram_set_ : &resolve_set_, 0, nullptr);
-    vkCmdPushConstants(c, resolve_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+    // the store's packing for the target: its flags (bits 4-7) and format (28-31)
+    if (from_target_image) p.flags |= (edram_target(source, 0).flags & 0xFu) << 4 | (source.format & 0xFu) << 28;
+    const VkPipelineLayout layout = from_target_image ? resolve_image_layout_ : resolve_layout_;
+    if (from_target_image) settle_depth_samples(c, source);
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      from_target_image ? resolve_image_pipelines_[source.msaa ? 1 : 0] : resolve_pipeline_);
+    const VkDescriptorSet resolve_sets[3] = {from_edram ? resolve_edram_set_ : resolve_set_, target_set_,
+                                             source.store_set};
+    const uint32_t mask_offset = 0; // (the store set's tile mask, which the resolve does not read)
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, from_target_image ? 3 : 2, resolve_sets,
+                            from_target_image ? 1 : 0, &mask_offset);
+    vkCmdPushConstants(c, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
+    if (target_scaled) {
+        // the scaled textures alone, over their texels at the resolution scale
+        ResolveConstants scaled = p;
+        scaled.target = target_scaled;
+        scaled.flags = (p.flags & (1u | 0xF0u | 0xF0000000u)) | 2u | scale_.q4 << 8 | scale_.q4 << 16;
+        scaled.width = scale_.down(w), scaled.height = scale_.down(h);
+        vkCmdPushConstants(c, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scaled), &scaled);
+        vkCmdDispatch(c, (scaled.width + 7) / 8, (scaled.height + 7) / 8, 1);
+    }
     full_barrier(c);
 
     gpu_written(written);
-    textures_written_by_gpu(written);
+    if (refusal_detail_)
+        stale_by_ = {info.dest_format, info.width,           info.height, info.dest_pitch, info.texture_base & 0x1FFFFFFF,
+                     info.texel_x0 + info.dest_x, info.texel_y0 + info.dest_y};
+    textures_written_by_gpu(written, targets);
+    if (refusal_detail_) stale_by_ = {};
     if (options_.readback_resolve != ReadbackResolve::none) read_back_resolve(written);
 }
 
@@ -6662,7 +11632,7 @@ void Impl::read_back_resolve(const std::vector<Range> &written) {
         if (b.size < extent) {
             if (b.buffer) {
                 vk::Buffer old = b;
-                cmd();
+                begin_recording();
                 slots_[current_].after.push_back([this, old]() mutable { d_.destroy(old); });
             }
             b = d_.create_buffer(std::max<VkDeviceSize>(extent, 4096), VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, true);
@@ -6699,6 +11669,19 @@ void Impl::read_back_resolve(const std::vector<Range> &written) {
         report_.writeback_bytes += end - start;
         if (trace_) trace_->gpu_wrote(start, end - start);
     }
+    // XF_DUMP_RESOLVES=<directory> (with the full read-back, Options::readback_resolve): what each
+    // resolve wrote, a file each (<resolve's number>_<address>.bin, the ranges one after the other),
+    // so that two runs of a frame (the two render target paths, two builds) are compared resolve by
+    // resolve and the first that differs names where a wrong picture begins
+    static const char *const dump = std::getenv("XF_DUMP_RESOLVES");
+    if (dump && *dump && !written.empty()) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "%05llu_%08X.bin", (unsigned long long)report_.resolves, written.front().first);
+        if (std::FILE *f = std::fopen((std::filesystem::path(dump) / name).string().c_str(), "wb")) {
+            for (auto [start, end] : written) std::fwrite(memory_.data() + start, 1, end - start, f);
+            std::fclose(f);
+        }
+    }
 }
 
 // A frame begins (a swap): the fast read-backs' buffers trade places, and
@@ -6711,7 +11694,7 @@ void Impl::next_readback_frame() {
     for (auto it = resolve_readbacks_.begin(); it != resolve_readbacks_.end();) {
         if (report_.swaps > 60 && it->second.last_used < report_.swaps - 60) {
             ResolveReadback old = it->second;
-            cmd();
+            begin_recording();
             slots_[current_].after.push_back([this, old]() mutable {
                 for (vk::Buffer &b : old.buffers) d_.destroy(b);
             });
@@ -6775,7 +11758,7 @@ bool Impl::native_output(uint32_t width, uint32_t height) {
     if (native_output_.image) {
         vk::Image old = native_output_;
         VkImageView old_view = native_output_view_;
-        cmd();
+        begin_recording();
         slots_[current_].after.push_back([this, old, old_view]() mutable {
             vkDestroyImageView(dev_, old_view, nullptr);
             d_.destroy(old);
@@ -6893,11 +11876,19 @@ bool Impl::native_keep(native::PassInfo &pass) {
 // the hook submits on the device's queue after the flush comes after them,
 // and before the renderer's next work.
 void Impl::swap() {
+    // (what the draws keep of one another is a frame's: a setting changed between two, as the
+    // resolution scale, is in none of their keys)
+    front_valid_ = false;
     // the draws after a swap count for no report until the next one
     // (Xenia's EndZPDFrame)
     end_query();
     zpd_current_ = 0;
     uint64_t number = report_.swaps++;
+    // the scaled resolves no texture took within two swaps go
+    std::vector<Range> unused;
+    for (const auto &[base, kept] : scaled_resolves_)
+        if (kept.swap + 2 < report_.swaps) unused.push_back({kept.low, kept.high});
+    if (!unused.empty()) drop_scaled_resolves(unused);
     {
         // hitches: the frame's time making pipelines on this thread, and the
         // time since the last swap
@@ -6905,6 +11896,9 @@ void Impl::swap() {
         pipeline_seconds_at_swap_ = report_.pipeline_seconds;
         if (spent > 0.004) report_.pipeline_hitches++;
         report_.pipeline_frame_max = std::max(report_.pipeline_frame_max, spent);
+        report_.translate_frame_max =
+            std::max(report_.translate_frame_max, report_.translate_seconds - translate_seconds_at_swap_);
+        translate_seconds_at_swap_ = report_.translate_seconds;
         auto now = std::chrono::steady_clock::now();
         if (number) {
             double gap = std::chrono::duration<double>(now - last_swap_time_).count();
@@ -6913,12 +11907,42 @@ void Impl::swap() {
             report_.swap_gap_max = std::max(report_.swap_gap_max, gap);
         }
         last_swap_time_ = now;
+        // XF_GPU_TIME_LOG=1 (with the GPU timing on): the GPU time a frame by
+        // kind of work over every 300 swaps, with the seconds since the
+        // first swap, on stderr (the line Xenia's local measuring build
+        // logs, docs/renderer.md "Xenia's passes timed", for a window of a
+        // played run)
+        static const bool log_gpu_time = [] {
+            const char *v = std::getenv("XF_GPU_TIME_LOG");
+            return v && v[0] == '1';
+        }();
+        if (log_gpu_time && options_.gpu_timing) {
+            if (!number) first_swap_time_ = now;
+            if (report_.swaps % 300 == 0) {
+                std::string line;
+                double total = 0.0;
+                for (const auto &[kind, time] : report_.gpu_time) {
+                    double seconds = time.seconds - gpu_time_logged_[kind];
+                    gpu_time_logged_[kind] = time.seconds;
+                    total += seconds;
+                    char part[256];
+                    // (kinds' names hold "; " themselves)
+                    std::snprintf(part, sizeof(part), " | %s %.3f", kind.c_str(), seconds * 1000.0 / 300.0);
+                    if (seconds > 0.0) line += part;
+                }
+                std::fprintf(stderr, "xf-gpu-timing swap %llu at %.1f s total %.3f ms/frame%s\n",
+                             (unsigned long long)report_.swaps,
+                             std::chrono::duration<double>(now - first_swap_time_).count(), total * 1000.0 / 300.0,
+                             line.c_str());
+            }
+        }
     }
     {
         // the display's look-up table mode (display_gamma), counted
         char what[96];
         std::snprintf(what, sizeof(what), "swaps with DC_LUTA_CONTROL 0x%06X", regs_[r::DC_LUTA_CONTROL]);
-        use(what);
+        // (by its text: the literals' count is kept by address, and this one is on the stack)
+        use(std::string(what));
     }
     const bool read = options_.frame_wanted && options_.frame_wanted(number);
     // the port's frame (native_render.h), shown in the emulated one's place;

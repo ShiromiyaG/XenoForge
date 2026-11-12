@@ -255,7 +255,12 @@ port.options.push_back(xf::PortOption::boolean("native_render", "Native renderer
   structures with `xenoforge/port.h` (`be<T>`, `load<T>`).
 - **Shaders.** SPIR-V the port compiles itself: `examples/native_port`'s
   CMakeLists runs glslc (the Vulkan SDK's) and includes the words with
-  `-mfmt=num`.
+  `-mfmt=num`. XenoForge itself needs no Vulkan SDK (its package carries
+  Vulkan's headers and volk, `XenoForge::volk`: Vulkan's functions are
+  pointers loaded at run time, so a port calls them through `<volk.h>`, which
+  `xenoforge/vk_device.h` and `native_render.h` include); a port without
+  shaders of its own needs no SDK either, and one with them can commit the
+  words as XenoForge does (`cmake/vulkan.cmake`, `xf_spirv`).
 
 `examples/native_port` is the test port: the guest's last front buffer
 (through `Frame::texture`), tinted, with a spinning triangle (through

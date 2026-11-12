@@ -200,9 +200,12 @@ struct Module {
 // The loader lock (NT's LdrpLoaderLock, a critical section): recursive,
 // owned by a host thread (a guest thread's, or a host caller's). Held across
 // guest code (the DllMains), so a guest thread waiting for it waits on the
-// host, outside the guest's waits; the report names its owner. In the
-// deterministic mode every guest thread is a fiber on one host thread: the
-// owner is the guest thread, and a waiter yields to the others instead.
+// host, outside the guest's waits; the report names its owner. A guest
+// thread that is a fiber (the deterministic scheduler's, all on one host
+// thread; the console scheduler's, on six) shares its host thread: the owner
+// is the guest thread, and a waiter gives its processor to the others instead
+// (a yield in the deterministic mode, whose order it keeps; a slice given up
+// on the console scheduler, which naps once the wait goes on).
 class LoaderLock {
   public:
     void lock() {
@@ -214,10 +217,13 @@ class LoaderLock {
             return;
         }
         waiting_++;
-        if (t && t->owner.scheduler->deterministic()) {
+        if (t && t->scheduled) {
+            Scheduler &s = *t->owner.scheduler;
+            const bool exact = s.deterministic();
             while (depth_ != 0) {
                 l.unlock();
-                t->owner.scheduler->yield();
+                if (exact) s.yield();
+                else s.give_up_slice();
                 l.lock();
             }
         } else {
@@ -737,6 +743,28 @@ void set_process_tls(Kernel &k, uint32_t process, uint32_t slots, uint32_t data_
 
 uint32_t title_process(Kernel &k) { return k.state<Modules>().globals + TITLE_PROCESS; }
 uint32_t system_process(Kernel &k) { return k.state<Modules>().globals + SYSTEM_PROCESS; }
+
+// The routines ExRegisterTitleTerminateNotification registered, run as the
+// title ends (XamLoaderTerminateTitle, ExTerminateTitleProcess, a launch),
+// the highest priority first, each once, with r3 = 0, on the thread that ends
+// the title. Xenia never runs them. NT's own order and arguments are not
+// known (docs/xenia-todos-kernel.md, the hardware list); this is the
+// natural reading of a priority.
+void run_title_terminate_notifications(Kernel &k, ppc::Context &c) {
+    std::vector<std::pair<uint32_t, uint32_t>> routines;
+    {
+        Modules &s = k.state<Modules>();
+        std::lock_guard lock(s.mutex);
+        routines.swap(s.terminate_notifications);
+    }
+    std::stable_sort(routines.begin(), routines.end(),
+                     [](const auto &x, const auto &y) { return x.second > y.second; });
+    for (const auto &[routine, priority] : routines) {
+        std::fprintf(stderr, "kernel: title terminate notification 0x%08X (priority %u)\n", routine, priority);
+        c.r[3] = 0;
+        k.call(c, routine);
+    }
+}
 
 void set_executable_path(Kernel &k, const std::string &path) {
     Modules &s = k.state<Modules>();

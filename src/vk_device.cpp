@@ -14,6 +14,23 @@ namespace {
 std::string failed(const char *what, VkResult r) { return std::string(what) + " failed (" + std::to_string(r) + ")"; }
 } // namespace
 
+bool load_vulkan(std::string &error) {
+    static std::once_flag once;
+    static VkResult result = VK_SUCCESS;
+    std::call_once(once, [] { result = volkInitialize(); });
+    if (result != VK_SUCCESS) {
+        error = "no Vulkan loader on this system (vulkan-1.dll / libvulkan.so.1): install a GPU driver with Vulkan";
+        return false;
+    }
+    return true;
+}
+
+void load_instance(VkInstance instance) {
+    static std::mutex m;
+    std::lock_guard lock(m);
+    volkLoadInstance(instance);
+}
+
 // A block of the image pool: device memory of one type, its free ranges by
 // offset (merged with their neighbors as they come back) and by size (for
 // the best fit).
@@ -69,6 +86,7 @@ struct Device::Block {
 };
 
 std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
+    if (!load_vulkan(error)) return nullptr;
     std::unique_ptr<Device> d(new Device());
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "xenoforge";
@@ -89,6 +107,7 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         error = failed("vkCreateInstance", r);
         return nullptr;
     }
+    load_instance(d->instance_);
     if (window) {
         d->surface_ = window->make_surface ? window->make_surface(d->instance_) : VK_NULL_HANDLE;
         if (!d->surface_) {
@@ -135,7 +154,9 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
 
     // the renderer's bindless textures: sampled images and samplers written
     // into a bound set while submissions that do not use them run
+    VkPhysicalDeviceVulkan13Features has13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features has12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    has12.pNext = &has13;
     VkPhysicalDeviceFeatures2 has{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     has.pNext = &has12;
     vkGetPhysicalDeviceFeatures2(d->physical_, &has);
@@ -153,6 +174,16 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     v13.dynamicRendering = VK_TRUE;
     v13.synchronization2 = VK_TRUE;
     v13.shaderDemoteToHelperInvocation = VK_TRUE;
+    // pipelines asked for from the pipeline cache alone
+    // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT): what the
+    // renderer's thread expects to find made is looked up there, and left to
+    // the workers when the driver would have to compile it. Required by
+    // Vulkan 1.3, queried all the same; XF_VK_NO_CACHE_CONTROL=1 turns it off.
+    {
+        const char *v = std::getenv("XF_VK_NO_CACHE_CONTROL");
+        if (has13.pipelineCreationCacheControl && !(v && v[0] && v[0] != '0'))
+            v13.pipelineCreationCacheControl = d->cache_control_ = true;
+    }
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.pNext = &v13;
     v12.descriptorIndexing = VK_TRUE;
@@ -164,6 +195,15 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
     v12.timelineSemaphore = VK_TRUE;
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &v12;
+    // optional: storage images updated after binding, for the textures a
+    // resolve writes as well as memory (the renderer's resolve targets;
+    // XF_VK_NO_RESOLVE_TARGETS=1 turns them off)
+    const char *no_targets = std::getenv("XF_VK_NO_RESOLVE_TARGETS");
+    if (has12.descriptorBindingStorageImageUpdateAfterBind && has.features.shaderStorageImageArrayDynamicIndexing &&
+        !(no_targets && no_targets[0] == '1')) {
+        v12.descriptorBindingStorageImageUpdateAfterBind = d->storage_image_update_after_bind_ = true;
+        features.features.shaderStorageImageArrayDynamicIndexing = VK_TRUE;
+    }
     // optional: geometry shaders (rectangle and point lists; without them
     // those draws are skipped and counted). XF_VK_NO_GEOMETRY_SHADER=1 turns
     // them off where the device has them, to check the path without.
@@ -195,6 +235,10 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         d->line_width_range_[0] = props.limits.lineWidthRange[0];
         d->line_width_range_[1] = props.limits.lineWidthRange[1];
     }
+    // polygons as lines or points (PA_SU_SC_MODE_CNTL's polygon modes;
+    // without it they are filled, counted); XF_VK_NO_FILL_MODES=1 turns it off
+    if (has.features.fillModeNonSolid && !turned_off("XF_VK_NO_FILL_MODES"))
+        features.features.fillModeNonSolid = d->fill_mode_non_solid_ = true;
     features.features.depthClamp = VK_TRUE;
     features.features.sampleRateShading = VK_TRUE;
     features.features.independentBlend = VK_TRUE;
@@ -243,6 +287,14 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fsi{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT custom_border{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+    VkPhysicalDeviceFaultFeaturesEXT fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    VkPhysicalDeviceDepthBiasControlFeaturesEXT bias_control{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
     {
         const bool has_eds3 =
             has_extension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) && !turned_off("XF_VK_NO_EDS3");
@@ -305,6 +357,103 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
             vkGetPhysicalDeviceProperties2(d->physical_, &query_locations);
             d->sample_locations_ = locations.sampleLocationSampleCounts;
             if (d->sample_locations_) enabled.push_back(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME);
+        }
+        // VK_EXT_custom_border_color without a format: the textures' two
+        // YCbCr border colors, as Xenia's Vulkan texture cache takes them
+        // (XF_VK_NO_CUSTOM_BORDER=1 turns it off: transparent black, counted)
+        if (has_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME) && !turned_off("XF_VK_NO_CUSTOM_BORDER")) {
+            VkPhysicalDeviceCustomBorderColorFeaturesEXT has_border{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_border{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_border.pNext = &has_border;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_border);
+            if (has_border.customBorderColors && has_border.customBorderColorWithoutFormat) {
+                custom_border.customBorderColors = VK_TRUE;
+                custom_border.customBorderColorWithoutFormat = VK_TRUE;
+                *tail = &custom_border, tail = &custom_border.pNext;
+                enabled.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+                d->custom_border_color_ = true;
+            }
+        }
+        // VK_EXT_depth_bias_control with an exact bias and the unorm
+        // representation forced on float depth: the polygon offset's constant
+        // in units of 2^-24 whatever the device and the depth format (without
+        // it a device may double a fixed-point format's unit, and a float
+        // format's shrinks with the depth; Xenia's Vulkan backend takes the
+        // same three features for float depth). XF_VK_NO_DEPTH_BIAS_CONTROL=1
+        // turns it off: the device's units, counted.
+        if (has_extension(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) && !turned_off("XF_VK_NO_DEPTH_BIAS_CONTROL")) {
+            VkPhysicalDeviceDepthBiasControlFeaturesEXT has_bias{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_bias{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_bias.pNext = &has_bias;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_bias);
+            if (has_bias.depthBiasControl && has_bias.leastRepresentableValueForceUnormRepresentation &&
+                has_bias.depthBiasExact) {
+                bias_control.depthBiasControl = VK_TRUE;
+                bias_control.leastRepresentableValueForceUnormRepresentation = VK_TRUE;
+                bias_control.depthBiasExact = VK_TRUE;
+                *tail = &bias_control, tail = &bias_control.pNext;
+                enabled.push_back(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
+                d->depth_bias_control_ = true;
+            }
+        }
+        // VK_KHR_maintenance8: depth/stencil aspects copied to and from color
+        // images, so that an EDRAM transfer into a depth target without stencil
+        // export writes its stencil with one copy rather than a pass a bit
+        // (beyond Xenia; XF_VK_NO_MAINTENANCE8=1 turns it off: a pass a bit)
+        if (has_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) && !turned_off("XF_VK_NO_MAINTENANCE8")) {
+            VkPhysicalDeviceMaintenance8FeaturesKHR has_m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+            VkPhysicalDeviceFeatures2 query_m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_m8.pNext = &has_m8;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_m8);
+            if (has_m8.maintenance8) {
+                maintenance8.maintenance8 = VK_TRUE;
+                *tail = &maintenance8, tail = &maintenance8.pNext;
+                enabled.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+                d->maintenance8_ = true;
+            }
+        }
+        // VK_EXT_conditional_rendering: draws predicated on a VIZ query run
+        // only where its survey passed samples (Xenia's occlusion_query_viz,
+        // through D3D12's predication there); XF_VK_NO_CONDITIONAL_RENDERING=1
+        // turns it off: every such draw drawn, as Xenia's default
+        if (has_extension(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) &&
+            !turned_off("XF_VK_NO_CONDITIONAL_RENDERING")) {
+            VkPhysicalDeviceConditionalRenderingFeaturesEXT has_cr{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_cr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_cr.pNext = &has_cr;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_cr);
+            if (has_cr.conditionalRendering) {
+                conditional.conditionalRendering = VK_TRUE;
+                *tail = &conditional, tail = &conditional.pNext;
+                enabled.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+                d->conditional_rendering_ = true;
+            }
+        }
+        // VK_EXT_device_fault: on a lost device, the addresses the GPU faulted
+        // on and the vendor's codes, for the report (nothing is drawn
+        // differently; XF_VK_NO_DEVICE_FAULT=1 turns it off)
+        // VK_EXT_memory_budget: each heap's use and what the system lets this
+        // process have of it, for the reports (heap_report)
+        if (has_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+            enabled.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+            d->memory_budget_ = true;
+        }
+        if (has_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) && !turned_off("XF_VK_NO_DEVICE_FAULT")) {
+            VkPhysicalDeviceFaultFeaturesEXT has_fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 query_fault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query_fault.pNext = &has_fault;
+            vkGetPhysicalDeviceFeatures2(d->physical_, &query_fault);
+            if (has_fault.deviceFault) {
+                fault.deviceFault = VK_TRUE;
+                fault.deviceFaultVendorBinary = has_fault.deviceFaultVendorBinary;
+                *tail = &fault, tail = &fault.pNext;
+                enabled.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+                d->device_fault_ = true;
+                d->device_fault_vendor_binary_ = has_fault.deviceFaultVendorBinary;
+            }
         }
         // (without fast linking a linked pipeline may cost as much as a whole
         // one, so the libraries would gain nothing)
@@ -388,6 +537,41 @@ Buffer Device::create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, bool h
     return b;
 }
 
+Buffer Device::create_device_local_mapped_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                                 VkDeviceSize heap_at_least) {
+    Buffer b;
+    b.size = size;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = size ? size : 4;
+    info.usage = usage;
+    if (vkCreateBuffer(device_, &info, nullptr, &b.buffer) != VK_SUCCESS) return {};
+    VkMemoryRequirements need;
+    vkGetBufferMemoryRequirements(device_, b.buffer, &need);
+    const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const uint32_t plain = memory_type(need.memoryTypeBits, visible);
+    const uint32_t local = memory_type(need.memoryTypeBits, visible | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    // (where the first host-visible type is already video memory, as on a
+    // device with resizable BAR or one memory, create_buffer gives the same)
+    if (local == UINT32_MAX || local == plain ||
+        memory_.memoryHeaps[memory_.memoryTypes[local].heapIndex].size < heap_at_least) {
+        vkDestroyBuffer(device_, b.buffer, nullptr);
+        return {};
+    }
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = need.size;
+    alloc.memoryTypeIndex = local;
+    if (allocate(alloc, b.memory) != VK_SUCCESS) {
+        vkDestroyBuffer(device_, b.buffer, nullptr);
+        return {};
+    }
+    vkBindBufferMemory(device_, b.buffer, b.memory, 0);
+    if (vkMapMemory(device_, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped) != VK_SUCCESS) {
+        destroy(b);
+        return {};
+    }
+    return b;
+}
+
 void Device::destroy(Buffer &b) {
     if (b.buffer) vkDestroyBuffer(device_, b.buffer, nullptr);
     if (b.memory) free_memory(b.memory);
@@ -396,7 +580,7 @@ void Device::destroy(Buffer &b) {
 
 Image Device::create_image(VkImageType type, VkFormat format, VkExtent3D extent, uint32_t levels, uint32_t layers,
                            VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageCreateFlags flags,
-                           VkFormat view_format) {
+                           VkFormat view_format, VkFormat view_format2) {
     Image im;
     im.format = format, im.extent = extent, im.levels = levels, im.layers = layers, im.samples = samples;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -410,14 +594,17 @@ Image Device::create_image(VkImageType type, VkFormat format, VkExtent3D extent,
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    // read through views of a second format too: mutable, the two formats
-    // listed (Vulkan 1.2's image format list, which lets a driver keep the
-    // image's compression where it can), as Xenia's Vulkan textures
-    const VkFormat formats[2] = {format, view_format};
+    // read through views of other formats too (one or two): mutable, the
+    // formats listed (Vulkan 1.2's image format list, which lets a driver
+    // keep the image's compression where it can), as Xenia's Vulkan textures
+    VkFormat formats[3] = {format};
+    uint32_t format_count = 1;
+    for (VkFormat f : {view_format, view_format2})
+        if (f != VK_FORMAT_UNDEFINED && f != format) formats[format_count++] = f;
     VkImageFormatListCreateInfo list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
-    if (view_format != VK_FORMAT_UNDEFINED && view_format != format) {
+    if (format_count > 1) {
         info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        list.viewFormatCount = 2;
+        list.viewFormatCount = format_count;
         list.pViewFormats = formats;
         info.pNext = &list;
     }
@@ -609,6 +796,70 @@ bool Device::run(const std::function<void(VkCommandBuffer)> &record, std::string
 VkResult Device::submit(uint32_t count, const VkSubmitInfo *submits, VkFence fence) {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     return vkQueueSubmit(queue_, count, submits, fence);
+}
+
+std::string Device::heap_report() {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    if (memory_budget_) props.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(physical_, &props);
+    std::string out;
+    for (uint32_t h = 0; h < props.memoryProperties.memoryHeapCount; h++) {
+        const VkMemoryHeap &heap = props.memoryProperties.memoryHeaps[h];
+        // what the heap's types are: device-local, host-visible
+        bool visible = false;
+        for (uint32_t t = 0; t < props.memoryProperties.memoryTypeCount; t++)
+            if (props.memoryProperties.memoryTypes[t].heapIndex == h &&
+                (props.memoryProperties.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+                visible = true;
+        char line[200];
+        if (memory_budget_)
+            std::snprintf(line, sizeof(line), "%sheap %u (%s%s, %llu MB): %llu MB used of a %llu MB budget",
+                          out.empty() ? "" : "; ", h, heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "device-local" : "host",
+                          visible ? ", host-visible" : "", (unsigned long long)(heap.size >> 20),
+                          (unsigned long long)(budget.heapUsage[h] >> 20), (unsigned long long)(budget.heapBudget[h] >> 20));
+        else
+            std::snprintf(line, sizeof(line), "%sheap %u (%s%s, %llu MB)", out.empty() ? "" : "; ", h,
+                          heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? "device-local" : "host",
+                          visible ? ", host-visible" : "", (unsigned long long)(heap.size >> 20));
+        out += line;
+    }
+    return out;
+}
+
+std::string Device::fault_report() {
+    if (!device_fault_ || !vkGetDeviceFaultInfoEXT) return {};
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (vkGetDeviceFaultInfoEXT(device_, &counts, nullptr) != VK_SUCCESS) return "no fault information";
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendor.data();
+    counts.vendorBinarySize = 0; // (the vendor's binary dump is not kept)
+    VkResult r = vkGetDeviceFaultInfoEXT(device_, &counts, &info);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) return "no fault information (" + std::to_string(r) + ")";
+    std::string out = info.description[0] ? info.description : "a fault";
+    static const char *const kinds[] = {"none", "an invalid read", "an invalid write", "an invalid execute",
+                                        "an instruction pointer unknown", "an instruction pointer invalid",
+                                        "an instruction pointer fault"};
+    for (uint32_t i = 0; i < counts.addressInfoCount; i++) {
+        const VkDeviceFaultAddressInfoEXT &a = addresses[i];
+        char line[160];
+        const uint64_t precision = a.addressPrecision ? a.addressPrecision : 1;
+        std::snprintf(line, sizeof(line), "; %s at %016llX-%016llX",
+                      size_t(a.addressType) < std::size(kinds) ? kinds[a.addressType] : "an unknown kind",
+                      (unsigned long long)(a.reportedAddress & ~(precision - 1)),
+                      (unsigned long long)((a.reportedAddress | (precision - 1))));
+        out += line;
+    }
+    for (uint32_t i = 0; i < counts.vendorInfoCount; i++) {
+        char line[320];
+        std::snprintf(line, sizeof(line), "; vendor: %s (code %016llX, data %016llX)", vendor[i].description,
+                      (unsigned long long)vendor[i].vendorFaultCode, (unsigned long long)vendor[i].vendorFaultData);
+        out += line;
+    }
+    return out;
 }
 
 } // namespace xf::vk

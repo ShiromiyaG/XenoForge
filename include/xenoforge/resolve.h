@@ -37,6 +37,12 @@ struct Info {
     uint32_t dest_x = 0, dest_y = 0, dest_slice = 0;
     uint32_t dest_number = 0;    // xenos.h's SurfaceNumberFormat: 0 unsigned fraction, 1 signed, 2/3 integer, 7 float
     bool dest_array = false;     // a 3D (array) destination, slice dest_slice
+    // a 2D destination as a texture over it sees it: the address
+    // RB_COPY_DEST_BASE names (less the x offset Direct3D carries in it),
+    // and the texel there of the rectangle's corner less dest_x and dest_y
+    // (a texture at texture_base with the same pitch holds the rectangle's
+    // pixel (x, y) at texel (texel_x0 + dest_x + x, texel_y0 + dest_y + y))
+    uint32_t texture_base = 0, texel_x0 = 0, texel_y0 = 0;
     bool copy = true;            // false: a clear alone
     // the clears done after the copy
     bool clear_color = false, clear_depth = false;
@@ -74,6 +80,20 @@ texture::HostFormat host_format_of_color_target(uint32_t format);
 // (or D24S8 as 32-bit words, depth in the high 24 bits, for depth); each
 // sample of an MSAA target already resolved to one.
 bool write(const Info &info, std::span<const uint8_t> pixels, GuestMemory &memory, std::string &error);
+
+// A resolve from EDRAM's own bits (the software reference renderer,
+// reference.h): per pixel of the rectangle, row by row, the first selected
+// sample's guest words (what a raw copy and a depth copy take: D24S8 and
+// D24FS8 as EDRAM holds them, depth in the high 24 bits) and its components
+// as Xenia's resolve shaders load them (resolve.comp's load_colors: the
+// selected samples unpacked from the guest's bits, 7e3 included, summed in
+// their order and averaged, 8_8_8_8_GAMMA's through its linear codes, the
+// exponent bias applied), converted for the destination as write() does.
+struct LoadedPixel {
+    uint32_t words[2] = {};
+    float loaded[4] = {};
+};
+bool write_loaded(const Info &info, std::span<const LoadedPixel> pixels, GuestMemory &memory, std::string &error);
 
 // The copy keeps the source's bits (Xenia's fast resolve shaders): depth,
 // or a color format bitwise equal to the destination's, unscaled.

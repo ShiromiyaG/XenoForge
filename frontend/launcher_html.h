@@ -8,7 +8,10 @@
 #pragma once
 
 #include "launcher_model.h"
+#include "profiles.h"
 #include "settings.h"
+
+#include "xenoforge/kernel.h"
 
 #include <string>
 #include <string_view>
@@ -70,8 +73,8 @@ const char *prepare_stage_label(int stage); // 0 to 4
 
 // ----------------------------------------------------------------- the settings window
 
-enum class SettingsTab { Video = 0, Sound, Controllers, Keyboard, Interface };
-constexpr int SETTINGS_TABS = 5;
+enum class SettingsTab { Video = 0, Sound, Controllers, Keyboard, System, Profile, Interface };
+constexpr int SETTINGS_TABS = 7;
 const char *settings_tab_label(SettingsTab tab);
 const char *settings_tab_name(SettingsTab tab); // "video", "sound"...
 
@@ -87,6 +90,12 @@ struct SettingsPage {
     bool smooth_edges = true; // multisampling for the window's drawing
     std::vector<std::string> gamepads;
     std::string capturing;  // the binding waiting for a key
+    // the Profile tab: the storage's profiles, a message for the last action, the profile asked to be deleted (the
+    // second click confirms), and the selected game's achievements from the selected profile's GPD
+    std::vector<ProfileEntry> profiles;
+    std::string profile_message, confirm_delete;
+    std::vector<kernel::ProfileAchievement> achievements;
+    bool achievements_read = false;
 };
 std::string settings_tabs_html(SettingsTab current);
 // the strip above the tabs: whose settings these are, and the switch that
@@ -99,6 +108,8 @@ struct Choice {
     std::string value, label;
 };
 std::vector<Choice> aspect_choices();
+// the video section's choices (settings.h's video_choices) for a dropdown
+std::vector<Choice> video_choice_list(const std::string &key);
 std::vector<Choice> user_choices();
 std::vector<Choice> theme_choices();
 std::vector<Choice> backdrop_choices();

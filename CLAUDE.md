@@ -19,6 +19,10 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
   limite de uso de 5 horas). Novos agentes só quando os anteriores terminarem. Agentes `xf-*`
   (`.claude/agents`), em worktrees; builds com `-j 4`; quem não mexe nos headers do código gerado usa
   `-DXF_GAME_LIBS=F:/RECOMPs/external/game-libs/<commit>`.
+- **Sem Vulkan SDK para compilar** (dono, 2026-11-08, modelo do Xenia): `cmake/vulkan.cmake` baixa Vulkan-Headers,
+  SPIRV-Headers e volk; o loader do Vulkan é carregado em runtime (`vk::load_vulkan`, volk); os shaders internos
+  ficam compilados e commitados em `src/shaders/spirv/*.inc`. Com o glslc presente o build os recompila quando a
+  fonte muda (`XF_SHADERS_REGENERATE`): **commitar o `.inc` junto com o shader**.
 - C++20, CMake + Ninja + clang; namespace `xf`; estilo do `.clang-format` (4 espaços, 120 colunas).
   Build: `cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`,
   `cmake --build build`, `ctest --test-dir build`. Testes em `tests/` com o `CHECK` de `tests/check.h`.
@@ -39,7 +43,7 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
   `../external/xna/work/shaders` (10, de `tests/hlsl/`). Rodar: `XF_SHADERS=<pasta> build/shader_compare_test`.
   O `.defs` ao lado de cada shader traz as constantes literais do contêiner (o D3D as carrega com o shader).
 - **Renderizador (B3)**: `build/xfreplay <xtr> -o frame.png --compare <png do trace-dump> [--diff d.png] [-v]`;
-  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 29 frames batem com o Xenia; a referência é o
+  regressão: `XF_TRACES=../traces XF_DUMPS=../traces/dumps build/replay_test` (os 31 frames do caminho host e os 33 do exato batem com o Xenia; a referência é o
   dump D3D12 do Xenia, `xenia-gpu-d3d12-trace-dump.exe`, em `../traces/dumps/d3d12`, com o Vulkan onde não há
   D3D12 ou os dois discordam: 2 frames do jogo A). Desde 2026-11-06 o padrão é a EDRAM exata via
   fragment shader interlock (FSI) onde o device tem: aí o `replay_test` compara sozinho com os dumps exatos do

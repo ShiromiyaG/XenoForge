@@ -63,6 +63,10 @@ Then:
 - Build: `cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++` (in a
   worktree also `-DSTB_DIR=F:/RECOMPs/xenia-canary/third_party/stb`), then `cmake --build build`, then
   `ctest --test-dir build --timeout 300`. Everything must pass.
+- Internal shaders (src/shaders, frontend/*.comp, frontend/ui/ui.*) are committed compiled as
+  `src/shaders/spirv/<name>.inc` (cmake/vulkan.cmake; no Vulkan SDK needed to build). The build
+  recompiles a changed shader there when glslc is found: commit the `.inc` together with the shader.
+  New shaders go through `xf_spirv`/`xf_shader`. Vulkan functions come from volk (`<volk.h>`).
 - A game with its code generated: `xfrecomp emit <iso> <dir>/<game>` and `-DXF_GAMES=<game>
   -DXF_GEN_DIR=<dir>` (several minutes to build). F:\RECOMPs\external\gen is the main build's; emit into
   a directory of your own unless the brief says otherwise.
@@ -81,6 +85,18 @@ name in code, comments, tests, CMake, scripts, examples, READMEs, docs or
 commit messages. Write "a game", "<game>", "a UE3 game with 4.7M
 instructions", made-up addresses in examples. Running real discs by hand to
 test is fine; say which ones only in the report to the main session.
+
+## Benchmarks on a shared machine (the owner's rule, 2026-11-08)
+
+Other agents build and run games on this machine at the same time, so any
+timing can be skewed by their load. For every speed claim: look at the load
+first (`Get-Process clang*,ninja*,boot*,player*,xenia*` and CPU/GPU use),
+run the baseline and the change back to back and interleaved (A B A B), at
+least 3 runs each, and report the median, the spread and what else was
+running. Prefer CPU time, GPU timestamps and call rates over wall-clock
+rates when the machine is busy. Comparisons with Xenia the same way.
+Benchmarks count as testing for the Test budget: at most 30 minutes of them without
+a new finding, then report with the numbers in hand (the owner, 2026-11-08).
 
 ## Token economy (the owner's rule, 2026-11-06)
 

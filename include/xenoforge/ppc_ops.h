@@ -72,7 +72,18 @@ constexpr uint64_t mask(uint32_t mstart, uint32_t mstop) {
 
 // the 4 KB offset of the 0xE0000000 physical view (memory.h; Xenia's
 // host_address_offset)
-XF_INLINE uint8_t *host(Context &c, uint32_t ea) { return c.base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u); }
+// The guest's memory and the Context are separate allocations (the context
+// lives on the host's heap, never inside the guest's reservation): said to
+// the compiler, a guest store no longer makes it reload the registers it
+// holds from the context, nor the base (game B: about 12% less CPU time
+// running deterministically; docs/recompiler.md, "Where the time goes").
+XF_INLINE uint8_t *host(Context &c, uint32_t ea) {
+    uint8_t *p = c.base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u);
+#if __has_builtin(__builtin_assume_separate_storage)
+    __builtin_assume_separate_storage(p, &c);
+#endif
+    return p;
+}
 XF_INLINE uint8_t load8(Context &c, uint32_t ea) { return *host(c, ea); }
 XF_INLINE uint16_t load16(Context &c, uint32_t ea) {
     uint16_t v;
@@ -182,12 +193,40 @@ constexpr int64_t YIELD_PRIORITY_HINT = 8;
         c.yield_budget = INT64_MAX;
 }
 // Not counting (playing): a load and a branch. Counting: the weight off the
-// budget, and the hook below 0 (it may hand the processor over).
+// budget, and the hook below 0 (it may hand the processor over). The flag is
+// loaded as an atomic (relaxed: a plain load on the hosts) because other
+// threads set it as the thread runs (Kernel::pause, the console scheduler's
+// preemption), and a loop must see it: a plain load could be hoisted out.
+XF_INLINE bool yield_counting(const Context &c) { return __atomic_load_n(&c.yield_counting, __ATOMIC_RELAXED); }
 XF_INLINE void yield_point(Context &c, int64_t weight) {
-    if (c.yield_counting) [[unlikely]] {
+    if (yield_counting(c)) [[unlikely]] {
         c.yield_budget -= weight;
         if (c.yield_budget < 0) yield_hook(c);
     }
+}
+
+// db16cyc (or 31,31,31), the XDK's spin-wait hint: the Xenon gives the
+// core's other hardware thread the pipeline. Here, by how long the spin has
+// gone on: the host's own spin-wait hint each time (x86's pause, ARM's
+// yield, as Xenia's DELAY_EXECUTION: the SMT sibling gets the core), and
+// every SPIN_HINTS_BEFORE_YIELD of them in a row, the processor given to
+// whatever else is ready on it (System::spin), so a spin that lasts frees
+// the core for the host's threads, at no cost when nothing else is ready.
+// (Beyond Xenia, which pauses only.) The deterministic mode counts the hint
+// as a yield point and hands over there instead.
+constexpr uint32_t SPIN_HINTS_BEFORE_YIELD = 2048;
+[[gnu::cold]] [[gnu::noinline]] inline void spin_hook(Context &c) {
+    c.spin_hints = 0;
+    if (c.system && c.system->spin) c.system->spin(c);
+}
+XF_INLINE void spin_hint(Context &c) {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __builtin_arm_yield();
+#endif
+    if (++c.spin_hints >= SPIN_HINTS_BEFORE_YIELD) [[unlikely]]
+        spin_hook(c);
 }
 
 } // namespace xf::ppc::ops

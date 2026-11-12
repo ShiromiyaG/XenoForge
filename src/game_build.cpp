@@ -18,8 +18,11 @@
 
 #include "xenoforge/game_build.h"
 
+#include "game_build_flags.h"
+
 #include "xenoforge/game_interface.h" // XF_GAME_INTERFACE_VERSION, made by the build
 #include "xenoforge/disc.h"
+#include "xenoforge/game_source.h"
 #include "xenoforge/recomp.h"
 #include "xenoforge/shader_container.h"
 #include "xenoforge/shader_storage.h"
@@ -60,6 +63,29 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// The library has no C runtime, and on Windows the compiler calls the
+// runtime's stack probe in a function whose frame is above a page (a guest
+// function with a large frame of locals, seldom): the frame's size in rax,
+// each page down to the new stack pointer touched so the guard page moves,
+// every register but r10 and r11 kept. Defined in the entry's file.
+const std::string STACK_PROBE = R"xf(
+#if defined(_WIN32) && defined(__x86_64__)
+__asm__(".globl __chkstk\n"
+        "__chkstk:\n"
+        "    movq %rsp, %r10\n"
+        "    movq %rax, %r11\n"
+        "1:  cmpq $0x1000, %r11\n"
+        "    jbe 2f\n"
+        "    subq $0x1000, %r10\n"
+        "    testq %r10, (%r10)\n"
+        "    subq $0x1000, %r11\n"
+        "    jmp 1b\n"
+        "2:  subq %r11, %r10\n"
+        "    testq %r10, (%r10)\n"
+        "    ret\n");
+#endif
+)xf";
+
 // the headers the generated code compiles against, as this build has them
 // (cmake/game_interface.cmake)
 struct Header {
@@ -76,22 +102,14 @@ constexpr const char *LIBRARY_EXTENSION = ".dll", *OBJECT_EXTENSION = ".obj", *E
 constexpr const char *LIBRARY_EXTENSION = ".so", *OBJECT_EXTENSION = ".o", *EXE = "";
 #endif
 
-// What each file is compiled with: the statically linked games' flags
-// (CMakeLists.txt: -O2 -g0 -w -mfma -mavx2; never -ffast-math), freestanding
-// (no header but the ones written beside the code, no C library: math
-// without errno), and the game library's side of ppc_runtime.h.
+// What each file is compiled with (game_build_flags.h) and the interface
+// version
 std::vector<std::string> compile_flags() {
     char version[64];
     std::snprintf(version, sizeof(version), "-DXF_GAME_INTERFACE_VERSION=0x%08Xu", XF_GAME_INTERFACE_VERSION);
-    std::vector<std::string> flags = {
-        "-std=c++20",        "-O2",  "-g0", "-w", "-mfma", "-mavx2", "-fno-math-errno", "-nostdinc", "-nostdinc++",
-        "-DXF_GAME_LIBRARY", version};
-#ifndef _WIN32
-    // position independent, only the entry exported, and no stack
-    // protector (some distributions' clang turns it on; it needs the C
-    // library's __stack_chk_fail)
-    for (const char *f : {"-fPIC", "-fvisibility=hidden", "-fno-stack-protector"}) flags.push_back(f);
-#endif
+    std::vector<std::string> flags;
+    for (const char *f : base_compile_flags()) flags.push_back(f);
+    flags.push_back(version);
     return flags;
 }
 
@@ -254,6 +272,10 @@ std::string digest_of(const recomp::Project &p) {
     for (unsigned char ch : t) h = (h ^ ch) * 0x100000001B3ull;
     return hex_digest(h);
 }
+
+// the functions files a build must have left to compile for the generated
+// code's header to be precompiled for them (Build::compile)
+constexpr size_t PCH_MINIMUM_FILES = 4;
 
 bool is_functions_file(const fs::path &source) { return utf8(source.filename()).starts_with("functions_"); }
 
@@ -482,6 +504,58 @@ struct Job {
     bool linked = true;  // its object goes into the library (not a file split, or rejected)
 };
 
+// FNV-1a over some text (the objects' keys; not a defence against anyone)
+uint64_t text_key(std::string_view text, uint64_t key = 0xCBF29CE484222325ull) {
+    for (unsigned char ch : text) key = (key ^ ch) * 0x100000001B3ull;
+    return (key ^ 0xFF) * 0x100000001B3ull;
+}
+
+// A header's code without its comments, blank lines and the spaces around
+// lines, for the objects' key: an edit of the comments alone keeps the
+// objects (no generated-code header uses __LINE__, so the lines it moves
+// change nothing compiled). String and character literals are kept whole.
+std::string code_of(std::string_view text) {
+    std::string out, line;
+    auto end_line = [&] {
+        size_t a = line.find_first_not_of(" \t\r"), b = line.find_last_not_of(" \t\r");
+        if (a != std::string::npos) out.append(line, a, b - a + 1).push_back('\n');
+        line.clear();
+    };
+    for (size_t i = 0; i < text.size(); i++) {
+        const char ch = text[i];
+        if (ch == '/' && i + 1 < text.size() && text[i + 1] == '/') {
+            while (i < text.size() && text[i] != '\n') i++;
+            end_line();
+        } else if (ch == '/' && i + 1 < text.size() && text[i + 1] == '*') {
+            size_t close = text.find("*/", i + 2);
+            i = close == std::string_view::npos ? text.size() : close + 1;
+            line.push_back(' ');
+        } else if (ch == '"' || ch == '\'') {
+            line.push_back(ch);
+            for (i++; i < text.size() && text[i] != ch && text[i] != '\n'; i++) {
+                line.push_back(text[i]);
+                if (text[i] == '\\' && i + 1 < text.size()) line.push_back(text[++i]);
+            }
+            if (i < text.size() && text[i] == ch) line.push_back(ch);
+            else if (i < text.size()) end_line();
+        } else if (ch == '\n') {
+            end_line();
+        } else {
+            line.push_back(ch);
+        }
+    }
+    end_line();
+    return out;
+}
+
+// Beside each object, the key of the source it was compiled from: an object
+// is reused when its source's text is the same (compile), whenever the
+// source was written
+fs::path source_key_path(const Job &j) {
+    fs::path p = j.object;
+    return p.replace_extension(".source");
+}
+
 // a file beside a job's, its object and log beside the job's
 Job beside(const Job &j, const std::string &stem) {
     Job d;
@@ -527,22 +601,96 @@ void find_disc_shaders(const fs::path &disc, ShaderStep &step, const std::atomic
         }
     } else {
         std::string why;
-        std::unique_ptr<Disc> image = Disc::open(disc, why);
-        if (image) {
-            std::vector<const DiscEntry *> pending{&image->root()};
-            while (!pending.empty()) {
-                const DiscEntry *e = pending.back();
-                pending.pop_back();
-                for (const DiscEntry &child : e->children) {
-                    if (child.directory)
-                        pending.push_back(&child);
-                    else if (wanted(child.name, child.size))
-                        take(image->read_all(child));
-                }
-            }
-        }
+        if (std::unique_ptr<GameSource> image = GameSource::open(disc, why))
+            for (const GameSource::File &file : image->files())
+                if (wanted(file.path, file.size)) take(image->read_all(file));
     }
     step.disc_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+}
+
+// What find_disc_shaders found on a disc image, kept beside the library
+// (<cache>/<digest>.discshaders) so a later build step reads it instead of
+// the disc again (tens of seconds): a magic and version, the image's size
+// and time, the files and seconds the search took, then each shader's type,
+// length and microcode. Another image (size or time) searches again; a
+// directory is searched each time.
+constexpr uint32_t DISC_SHADERS_MAGIC = 0x53444658; // "XFDS"
+constexpr uint32_t DISC_SHADERS_VERSION = 1;
+
+fs::path disc_shaders_path(const fs::path &cache, const std::string &digest) {
+    return cache / (digest + ".discshaders");
+}
+
+std::string disc_stamp(const fs::path &disc) {
+    std::error_code ec;
+    if (!fs::is_regular_file(disc, ec)) return {};
+    const auto size = fs::file_size(disc, ec);
+    if (ec) return {};
+    const auto time = fs::last_write_time(disc, ec);
+    if (ec) return {};
+    return std::to_string(size) + ":" + std::to_string(time.time_since_epoch().count());
+}
+
+bool read_disc_shaders(const fs::path &path, const std::string &stamp, ShaderStep &step) {
+    if (stamp.empty()) return false;
+    const std::string bytes = read_file(path);
+    size_t at = 0;
+    auto take = [&](void *out, size_t n) {
+        if (bytes.size() - at < n) return false;
+        std::memcpy(out, bytes.data() + at, n);
+        at += n;
+        return true;
+    };
+    uint32_t magic = 0, version = 0, stamp_size = 0, count = 0;
+    uint64_t files = 0;
+    double seconds = 0;
+    if (!take(&magic, 4) || !take(&version, 4) || magic != DISC_SHADERS_MAGIC || version != DISC_SHADERS_VERSION ||
+        !take(&stamp_size, 4) || bytes.size() - at < stamp_size || bytes.compare(at, stamp_size, stamp) != 0 ||
+        stamp_size != stamp.size())
+        return false;
+    at += stamp_size;
+    if (!take(&files, 8) || !take(&seconds, 8) || !take(&count, 4)) return false;
+    std::vector<std::pair<uint32_t, std::vector<uint32_t>>> shaders;
+    shaders.reserve(count);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t type = 0, words = 0;
+        if (!take(&type, 4) || !take(&words, 4) || (bytes.size() - at) / 4 < words) return false;
+        std::vector<uint32_t> code(words);
+        if (!take(code.data(), size_t(words) * 4)) return false;
+        shaders.emplace_back(type, std::move(code));
+    }
+    if (at != bytes.size()) return false;
+    step.disc_shaders = std::move(shaders);
+    step.disc_files = size_t(files);
+    step.disc_seconds = seconds;
+    step.disc_from_earlier = true;
+    return true;
+}
+
+void write_disc_shaders(const fs::path &path, const std::string &stamp, const ShaderStep &step) {
+    if (stamp.empty()) return;
+    std::string out;
+    auto put = [&](const void *p, size_t n) { out.append(static_cast<const char *>(p), n); };
+    const uint32_t magic = DISC_SHADERS_MAGIC, version = DISC_SHADERS_VERSION, stamp_size = uint32_t(stamp.size()),
+                   count = uint32_t(step.disc_shaders.size());
+    const uint64_t files = step.disc_files;
+    put(&magic, 4), put(&version, 4), put(&stamp_size, 4), put(stamp.data(), stamp.size());
+    put(&files, 8), put(&step.disc_seconds, 8), put(&count, 4);
+    for (const auto &[type, code] : step.disc_shaders) {
+        const uint32_t words = uint32_t(code.size());
+        put(&type, 4), put(&words, 4), put(code.data(), code.size() * 4);
+    }
+    // whole or not at all: written beside, then put in place
+    fs::path part = path;
+    part += ".part";
+    std::error_code ec;
+    bool written;
+    {
+        std::ofstream f(part, std::ios::binary | std::ios::trunc);
+        written = bool(f.write(out.data(), std::streamsize(out.size())));
+    }
+    if (written) fs::rename(part, path, ec);
+    if (!written || ec) fs::remove(part, ec);
 }
 
 class Build {
@@ -608,11 +756,40 @@ bool Build::compile_and_link(const fs::path &src_root, const std::vector<std::st
     // the headers, as this XenoForge has them, and the library's entry
     for (const Header &h : HEADERS)
         if (!write_if_changed(work / "include" / h.name, h.text)) return fail(error, "cannot write the headers");
-    const fs::path entry = work / "xf_library_entry.cpp";
-    if (!write_if_changed(entry, "// Written by the recompile step: the game library's entry (game_library.h).\n"
-                                 "#define XF_GAME_LIBRARY_ENTRY\n#include \"xenoforge/game_library.h\"\n"))
-        return fail(error, "cannot write " + utf8(entry));
+    // The objects a build left (kept with BuildOptions::keep_objects) are
+    // reused when their source's text is the one they were compiled from (a
+    // recompiler change rewrites only the files whose text it changes), by
+    // the same compiler, against the same headers' code and flags: their
+    // key is kept beside them, and another one discards them all. The
+    // interface version is in the entry's text, the one file that uses it,
+    // so that file alone is recompiled when only the version moved (a
+    // header's comments edited, say).
     std::error_code ec;
+    {
+        uint64_t key = 0xCBF29CE484222325ull;
+        auto mix = [&key](std::string_view s) { key = text_key(s, key); };
+        for (const Header &h : HEADERS) mix(h.name), mix(code_of(h.text));
+        for (const std::string &f : compile_flags())
+            if (!f.starts_with("-DXF_GAME_INTERFACE_VERSION=")) mix(f);
+        // the compiler, by its size and time: another clang makes another
+        // object of the same text
+        const fs::path clang = *bin / (std::string("clang") + EXE);
+        mix(std::to_string(fs::file_size(clang, ec)));
+        mix(std::to_string(fs::last_write_time(clang, ec).time_since_epoch().count()));
+        const fs::path stamp = work / "objects.key";
+        const std::string text = hex_digest(key) + "\n";
+        if (read_file(stamp) != text) {
+            fs::remove_all(work / "obj", ec);
+            if (!write_if_changed(stamp, text)) return fail(error, "cannot write " + utf8(stamp));
+        }
+    }
+    const fs::path entry = work / "xf_library_entry.cpp";
+    if (!write_if_changed(entry, "// Written by the recompile step: the game library's entry (game_library.h), for "
+                                 "interface version " +
+                                     hex_version() +
+                                     ".\n#define XF_GAME_LIBRARY_ENTRY\n#include \"xenoforge/game_library.h\"\n" +
+                                     STACK_PROBE))
+        return fail(error, "cannot write " + utf8(entry));
     std::vector<Job> jobs;
     auto add = [&](const fs::path &source, const fs::path &relative) {
         Job j;
@@ -724,8 +901,10 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     result.entries = entries.size();
 
     // the emitted code, in a work directory of its own (a build stopped
-    // before goes on from the objects it left)
-    const fs::path work = cache / "work" / (digest + "-" + hex_version());
+    // before goes on from the objects it left, and with keep_work another
+    // XenoForge's build recompiles only the files whose text or headers
+    // changed: compile_and_link)
+    const fs::path work = cache / "work" / digest;
     const fs::path src = work / "src";
     fs::create_directories(src, ec);
     if (ec) return fail(error, "cannot make " + utf8(src) + ": " + ec.message());
@@ -778,7 +957,17 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
             (name.ends_with(LIBRARY_EXTENSION) || name.ends_with(REPORT_EXTENSION)))
             fs::remove(entry.path(), ec);
     }
-    if (!options_.keep_work) {
+    if (options_.keep_work) {
+        // all of it
+    } else if (options_.keep_objects) {
+        // the objects and their keys, for the next build (compile_and_link);
+        // the emitted code, which the next build writes again, goes
+        std::vector<fs::path> emitted;
+        for (const auto &entry : fs::directory_iterator(work, ec))
+            if (entry.path().filename() != "obj" && entry.path().filename() != "objects.key")
+                emitted.push_back(entry.path());
+        for (const fs::path &p : emitted) fs::remove_all(p, ec);
+    } else {
         fs::remove_all(work, ec);
         if (fs::is_empty(cache / "work", ec)) fs::remove(cache / "work", ec);
     }
@@ -793,9 +982,16 @@ void Build::shaders(const fs::path &disc, const fs::path &cache, const Xex &xex,
     step.title_id = xex.execution.title_id;
     step.digest = digest;
     step.cancel = progress_.cancel;
+    step.disc_variants = options_.disc_variants;
     if (options_.disc_shaders) {
-        report(Stage::Linking, 0, 0, "shaders: the disc's");
-        find_disc_shaders(disc, step, progress_.cancel);
+        // what an earlier step found on this image, or a search of it
+        const fs::path kept = disc_shaders_path(cache, digest);
+        const std::string stamp = disc_stamp(disc);
+        if (!read_disc_shaders(kept, stamp, step)) {
+            report(Stage::Linking, 0, 0, "shaders: the disc's");
+            find_disc_shaders(disc, step, progress_.cancel);
+            if (!cancelled()) write_disc_shaders(kept, stamp, step);
+        }
     }
     report(Stage::Linking, 0, 0, "shaders: their pipelines");
     try {
@@ -810,20 +1006,53 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
     std::error_code ec;
     // the largest first, so the last ones to finish are short
     std::stable_sort(batch.begin(), batch.end(), [&](size_t a, size_t b) { return jobs[a].size > jobs[b].size; });
-    // what a stopped build compiled already
+    // what an earlier build (or a stopped one) compiled from the same text
     std::vector<size_t> todo;
+    std::map<size_t, std::string> source_keys;
     uint64_t done = 0;
     for (size_t k : batch) {
-        auto object = fs::last_write_time(jobs[k].object, ec);
-        if (!ec && object >= fs::last_write_time(jobs[k].source, ec) && !ec)
+        const std::string key = hex_digest(text_key(read_file(jobs[k].source))) + "\n";
+        if (fs::exists(jobs[k].object, ec) && read_file(source_key_path(jobs[k])) == key) {
             done++;
-        else
+        } else {
             todo.push_back(k);
+            source_keys[k] = key;
+        }
     }
     const uint64_t total = batch.size();
     report(Stage::Compiling, done, total, done ? std::to_string(done) + " compiled before" : "");
     const std::vector<std::string> flags = compile_flags();
     const std::string include = "-I" + utf8(work / "include");
+    // The generated code's header precompiled once for the functions files
+    // (each parsed it again: 0.55 s of clang a file, a tenth of an ordinary
+    // file's time; the code comes out the same). Made anew by each build
+    // with enough files left to pay for it (0.7 s), as the headers were
+    // written again; a build that cannot make it goes without.
+    std::string pch;
+    const size_t functions_todo =
+        size_t(std::count_if(todo.begin(), todo.end(), [&](size_t k) { return is_functions_file(jobs[k].source); }));
+    if (functions_todo >= PCH_MINIMUM_FILES && !cancelled()) {
+        const fs::path file = work / "obj" / "ppc_generated.pch";
+        fs::create_directories(file.parent_path(), ec);
+        fs::remove(file, ec);
+        std::vector<std::string> args = flags;
+        args.push_back(include);
+        for (const char *a : {"-x", "c++-header"}) args.push_back(a);
+        args.push_back(utf8(work / "include" / "xenoforge" / "ppc_generated.h"));
+        args.push_back("-o");
+        args.push_back(utf8(file));
+        std::vector<Process> one(1);
+        std::string ignored;
+        fs::path log = file;
+        log.replace_extension(".pch.log");
+        if (start(clang, args, log, one[0], ignored)) {
+            int code = 1;
+            while (!one.empty() && !cancelled())
+                if (wait_any(one, 100, code) == 0) one.clear();
+            for (Process &p : one) end(p), code = 1;
+            if (code == 0 && fs::exists(file, ec)) pch = utf8(file), fs::remove(log, ec);
+        }
+    }
     std::vector<Process> running;
     size_t next = 0;
     std::string failure;
@@ -837,8 +1066,13 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
             const Job &j = jobs[todo[next]];
             fs::create_directories(j.object.parent_path(), ec);
             fs::remove(j.object, ec); // (one clang rejects leaves none behind)
+            fs::remove(source_key_path(j), ec);
             std::vector<std::string> args = flags;
             args.push_back(include);
+            if (!pch.empty() && is_functions_file(j.source)) {
+                args.push_back("-include-pch");
+                args.push_back(pch);
+            }
             args.push_back("-c");
             args.push_back(utf8(j.source));
             args.push_back("-o");
@@ -864,6 +1098,7 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
             continue;
         }
         fs::remove(j.log, ec);
+        write_if_changed(source_key_path(j), source_keys[index]);
         report(Stage::Compiling, ++done, total, name);
     }
     if (cancelled()) return fail(error, "cancelled");
@@ -1038,19 +1273,16 @@ bool Build::link(const fs::path &bin, const fs::path &work, const std::vector<Jo
     if (!write_if_changed(rsp, response)) return fail(error, "cannot write " + utf8(rsp));
     fs::remove(out, ec);
 #ifdef _WIN32
-    // no entry point, no default libraries: the library imports nothing
     fs::path lld = bin / "lld-link.exe";
     std::vector<std::string> args;
     if (!fs::exists(lld, ec)) lld = bin / "lld.exe", args = {"-flavor", "link"};
-    // (/Brepro: no time stamp, the same bytes from the same objects)
-    for (const char *a : {"/dll", "/noentry", "/nodefaultlib", "/machine:x64", "/opt:ref", "/Brepro"})
-        args.push_back(a);
+    for (const char *a : link_flags()) args.push_back(a);
     args.push_back("/implib:" + utf8(work / "game.lib"));
 #else
     fs::path lld = bin / "ld.lld";
     std::vector<std::string> args;
     if (!fs::exists(lld, ec)) lld = bin / "lld", args = {"-flavor", "gnu"};
-    for (const char *a : {"-shared", "--eh-frame-hdr", "-z", "noexecstack", "--gc-sections"}) args.push_back(a);
+    for (const char *a : link_flags()) args.push_back(a);
 #endif
     args.push_back(
 #ifdef _WIN32

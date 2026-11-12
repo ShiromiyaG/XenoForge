@@ -180,6 +180,21 @@ XF_EXPORT(xboxkrnl, RtlCopyString) {
     k.store16(destination, length);
 }
 
+// (destination, source): NT's RtlAppendStringToString (Xenia has none; the
+// console's XAM imports it): the source after the destination's text, or
+// STATUS_BUFFER_TOO_SMALL with nothing written when it does not fit
+XF_EXPORT(xboxkrnl, RtlAppendStringToString) {
+    uint32_t destination = arg(k, c, 0), source = arg(k, c, 1);
+    uint16_t length = source ? k.load16(source) : 0;
+    if (length) {
+        uint16_t used = k.load16(destination), maximum = k.load16(destination + 2);
+        if (uint32_t(maximum) - used < length) return result(c, 0xC0000023 /* STATUS_BUFFER_TOO_SMALL */);
+        std::memmove(k.host(k.load32(destination + 4) + used), k.host(k.load32(source + 4)), length);
+        k.store16(destination, uint16_t(used + length));
+    }
+    result(c, X_STATUS_SUCCESS);
+}
+
 XF_EXPORT(xboxkrnl, RtlCopyUnicodeString) {
     // (destination, source): as NT's and the console's: at most the destination's
     // maximum length in bytes (Xenia copies twice the byte count, past the
@@ -1126,10 +1141,13 @@ XF_EXPORT(xboxkrnl, DbgPrint) {
 XF_EXPORT(xboxkrnl, _snprintf) {
     // (buffer, buffer_count, format, ...)
     uint32_t buffer = arg(k, c, 0), buffer_count = arg(k, c, 1), format = arg(k, c, 2);
-    if (!buffer || !buffer_count || !format) return result(c, uint32_t(-1));
+    if (!format || (buffer && !buffer_count)) return result(c, uint32_t(-1));
     ArgList args(k, c, 3);
     FormatData data(k, format, false);
     int32_t count = format_core(k, data, args, false);
+    // a null buffer formats and answers the length (the console's kernel; its
+    // count is not looked at)
+    if (!buffer) return result(c, uint32_t(count));
     result(c, uint32_t(write_bounded(k, buffer, buffer_count, count, data.str())));
 }
 
@@ -1146,10 +1164,11 @@ XF_EXPORT(xboxkrnl, sprintf) {
 XF_EXPORT(xboxkrnl, _vsnprintf) {
     // (buffer, buffer_count, format, va_list)
     uint32_t buffer = arg(k, c, 0), buffer_count = arg(k, c, 1), format = arg(k, c, 2), arg_ptr = arg(k, c, 3);
-    if (!buffer || !buffer_count || !format) return result(c, uint32_t(-1));
+    if (!format || (buffer && !buffer_count)) return result(c, uint32_t(-1));
     ArgList args(k, c, arg_ptr, true);
     FormatData data(k, format, false);
     int32_t count = format_core(k, data, args, false);
+    if (!buffer) return result(c, uint32_t(count)); // as _snprintf: the length
     result(c, uint32_t(write_bounded(k, buffer, buffer_count, count, data.str())));
 }
 

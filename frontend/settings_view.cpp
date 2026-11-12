@@ -2,6 +2,11 @@
 
 #include "settings_view.h"
 
+#include "console_options.h"
+#include "profiles.h"
+
+#include "xenoforge/profile_gpd.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -165,6 +170,17 @@ SettingsPage SettingsView::page() {
     p.sounds = core_.launcher().sounds;
     p.smooth_edges = core_.launcher().smooth_edges;
     if (tab_ == SettingsTab::Controllers) p.gamepads = LauncherCore::gamepads();
+    if (tab_ == SettingsTab::Profile) {
+        const std::filesystem::path storage = storage_root(edit_, core_.config_file());
+        p.profiles = list_profiles(storage, edit_);
+        p.profile_message = profile_message_;
+        p.confirm_delete = confirm_delete_;
+        // the selected game's achievements, from the selected profile's GPD for it
+        if (has_game_)
+            for (const ProfileEntry &pr : p.profiles)
+                if (pr.selected)
+                    p.achievements_read = read_gpd_achievements(profile_gpd_path(storage, pr.xuid, game_.title_id), p.achievements);
+    }
     p.capturing = capturing_;
     return p;
 }
@@ -225,6 +241,17 @@ void SettingsView::ProcessEvent(Rml::Event &event) {
     } else if (type == "change") {
         if (target->GetId() == "folder-input" && event.GetParameter("linebreak", false))
             host_.set_folder(target->GetAttribute<Rml::String>("value", ""));
+        else if (target->GetId() == "gamertag-input" && event.GetParameter("linebreak", false))
+            profile_action("profile-rename", "");
+        else if (target->GetId() == "new-profile-input" && event.GetParameter("linebreak", false))
+            profile_action("profile-create", "");
+        else if (target->GetId() == "gamertag-input" || target->GetId() == "new-profile-input") {
+            // the rules shown as it is typed
+            std::string why;
+            const std::string text = target->GetAttribute<Rml::String>("value", "");
+            if (Rml::Element *message = by_id("profile-message"))
+                message->SetInnerRML(text.empty() || valid_gamertag(text, why) ? std::string() : html_escape(why));
+        }
     }
 }
 
@@ -259,6 +286,8 @@ void SettingsView::do_action(const std::string &name, const std::string &arg, Rm
         host_.browse_folder();
     } else if (name == "rescan") {
         host_.rescan();
+    } else if (name.rfind("profile-", 0) == 0) {
+        profile_action(name, arg);
     }
 }
 
@@ -269,6 +298,8 @@ bool *SettingsView::bool_field(const std::string &key) {
     if (key == "video.fullscreen") return &edit_.video.fullscreen;
     if (key == "video.vsync") return &edit_.video.vsync;
     if (key == "video.smooth") return &edit_.video.smooth;
+    if (key == "video.frame_graph") return &edit_.video.frame_graph;
+    if (key == "video.performance") return &edit_.video.performance;
     if (key == "audio.mute") return &edit_.audio.mute;
     if (key == "input.vibration") return &edit_.input.vibration;
     if (key == "input.keyboard") return &edit_.input.keyboard;
@@ -276,7 +307,15 @@ bool *SettingsView::bool_field(const std::string &key) {
 }
 
 bool SettingsView::get_slider(const std::string &key, double &fraction, std::string &text) {
+    if (key == "video.fsr_sharpness") {
+        fraction = edit_.video.fsr_sharpness / 2.0;
+        char t[32];
+        std::snprintf(t, sizeof(t), "%.2f stops", edit_.video.fsr_sharpness);
+        text = t;
+        return true;
+    }
     if (key == "audio.volume") fraction = edit_.audio.volume / 100.0;
+    else if (key == "video.cas_sharpness") fraction = edit_.video.cas_sharpness;
     else if (key == "input.left_deadzone") fraction = edit_.input.left_deadzone;
     else if (key == "input.right_deadzone") fraction = edit_.input.right_deadzone;
     else return false;
@@ -287,6 +326,8 @@ bool SettingsView::get_slider(const std::string &key, double &fraction, std::str
 void SettingsView::set_slider(const std::string &key, double fraction) {
     fraction = std::clamp(std::round(fraction * 100.0) / 100.0, 0.0, 1.0);
     if (key == "audio.volume") edit_.audio.volume = int(fraction * 100 + 0.5);
+    else if (key == "video.fsr_sharpness") edit_.video.fsr_sharpness = fraction * 2.0;
+    else if (key == "video.cas_sharpness") edit_.video.cas_sharpness = fraction;
     else if (key == "input.left_deadzone") edit_.input.left_deadzone = fraction;
     else if (key == "input.right_deadzone") edit_.input.right_deadzone = fraction;
 }
@@ -350,18 +391,84 @@ void SettingsView::toggle_setting(Rml::Element *row) {
     save_edit();
 }
 
+namespace {
+// a list of console options as the dropdown's string choices (the value as text)
+std::vector<Choice> as_choices(const std::vector<Option> &options) {
+    std::vector<Choice> out;
+    for (const Option &o : options) out.push_back({std::to_string(o.value), o.name});
+    return out;
+}
+} // namespace
+
 std::vector<Choice> SettingsView::choices_for(const std::string &key) const {
-    if (key == "video.aspect") return aspect_choices();
+    if (key.rfind("video.", 0) == 0) return video_choice_list(key);
     if (key == "theme") return theme_choices();
+    if (key == "system.language") return as_choices(languages());
+    if (key == "system.country") return as_choices(countries());
+    if (key == "system.resolution") return as_choices(resolutions());
+    if (key == "system.widescreen") return as_choices(widescreen_modes());
+    if (key == "system.refresh") return as_choices(refresh_rates());
+    if (key == "saves.format") return {{"stfs", "STFS packages (the console's)"}, {"directory", "Folders (Xenia's)"}};
     if (key == "backdrop") return backdrop_choices();
     return user_choices();
 }
 
 std::string SettingsView::choice_value(const std::string &key) const {
-    if (key == "video.aspect") return edit_.video.aspect;
+    if (key.rfind("video.", 0) == 0) return video_value(edit_, key);
     if (key == "theme") return theme_text(theme_from_text(core_.launcher().theme));
+    if (key == "system.language") return std::to_string(edit_.system.language);
+    if (key == "system.country") return std::to_string(edit_.system.country);
+    if (key == "system.resolution") return std::to_string(resolution_of(edit_.system));
+    if (key == "system.widescreen") return std::to_string(edit_.system.widescreen);
+    if (key == "system.refresh") return std::to_string(edit_.system.refresh);
+    if (key == "saves.format") return edit_.saves.format;
     if (key == "backdrop") return core_.launcher().backdrop;
     return std::to_string(edit_.input.keyboard_user);
+}
+
+std::string SettingsView::input_value(const char *id) const {
+    Rml::Element *e = by_id(id);
+    return e ? e->GetAttribute<Rml::String>("value", "") : std::string();
+}
+
+void SettingsView::profile_action(const std::string &name, const std::string &arg) {
+    const std::filesystem::path storage = storage_root(edit_, core_.config_file());
+    std::string error, xuid;
+    profile_message_.clear();
+    if (name == "profile-delete") {
+        // the first click asks, the second removes the profile with its saves
+        if (confirm_delete_ != arg) {
+            confirm_delete_ = arg;
+        } else {
+            confirm_delete_.clear();
+            if (delete_profile(storage, edit_, arg, error)) save_edit();
+            else profile_message_ = error;
+        }
+    } else {
+        confirm_delete_.clear();
+        if (name == "profile-use") {
+            if (select_profile(edit_, arg, error)) save_edit();
+            else profile_message_ = error;
+        } else if (name == "profile-rename") {
+            const std::string tag = input_value("gamertag-input");
+            std::string selected;
+            for (const ProfileEntry &p : list_profiles(storage, edit_))
+                if (p.selected) selected = p.xuid;
+            if (selected.empty()) {
+                // no profile exists yet: the name is the default profile's, for when the first game makes it
+                if (valid_gamertag(tag, error)) edit_.profile.gamertag = tag, save_edit();
+                else profile_message_ = error;
+            } else if (rename_profile(edit_, selected, tag, error)) {
+                save_edit();
+            } else {
+                profile_message_ = error;
+            }
+        } else if (name == "profile-create") {
+            if (create_profile(storage, edit_, input_value("new-profile-input"), xuid, error)) save_edit();
+            else profile_message_ = error;
+        }
+    }
+    defer([this] { rebuild(); });
 }
 
 void SettingsView::open_popup(Rml::Element *row) {
@@ -429,9 +536,18 @@ void SettingsView::choose_option(const std::string &key, const std::string &valu
         std::string error;
         core_.set_launcher(l, error);
     } else {
-        if (key == "video.aspect") edit_.video.aspect = value;
+        if (key.rfind("video.", 0) == 0) {
+            if (!set_video_value(edit_, key, value)) return;
+        }
         else if (key == "input.keyboard_user") edit_.input.keyboard_user = std::atoi(value.c_str());
+        else if (key == "system.language") edit_.system.language = std::atoi(value.c_str());
+        else if (key == "system.country") edit_.system.country = std::atoi(value.c_str());
+        else if (key == "system.resolution") set_resolution(edit_.system, std::atoi(value.c_str()));
+        else if (key == "system.widescreen") edit_.system.widescreen = std::atoi(value.c_str());
+        else if (key == "system.refresh") edit_.system.refresh = std::atoi(value.c_str());
+        else if (key == "saves.format") edit_.saves.format = value == "directory" ? "directory" : "stfs";
         else return;
+        clamp_system(edit_.system); // only what the kernel's console settings know
         save_edit();
     }
     if (row)

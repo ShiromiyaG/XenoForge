@@ -15,8 +15,11 @@
 #   FFMPEG-SOURCE.txt            where ffmpeg-xma's source is: the fork's commit and the overlay
 #   ffmpeg-source/               the overlay itself (third_party/ffmpeg: configuration and build script)
 #   LICENSE-xenia, LICENSE-rexglue
+#   toolchain/bin/               clang and lld (LLVM, Apache 2.0 with LLVM exceptions; toolchain/LICENSE-llvm.txt),
+#                                which Prepare builds the game's library with (XF_PACKAGE_TOOLCHAIN, on)
 #   ui/                          the launcher's windows (RML, RCSS), its fonts, Inter (SIL OFL) and Roboto Condensed (Apache 2.0), and icons, Lucide (ISC)
-#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Roboto Condensed, Lucide, stb, the cursors (public domain)
+#   THIRD-PARTY-NOTICES.txt      SDL3 (with its HIDAPI), Dear ImGui, toml++, RmlUi, FreeType, Inter, Roboto Condensed, Lucide, stb, the cursors (public domain),
+#                                FidelityFX, FXAA, volk, Vulkan-Headers
 #
 # Included by CMakeLists.txt once the player's targets (XF_PLAYERS) and its
 # fetched dependencies exist.
@@ -37,6 +40,25 @@ install(TARGETS ${_installed} RUNTIME DESTINATION .)
 install(FILES ${CMAKE_SOURCE_DIR}/LICENSE ${CMAKE_SOURCE_DIR}/LICENSE-xenia ${CMAKE_SOURCE_DIR}/LICENSE-rexglue
         DESTINATION .)
 
+# The toolchain the launcher's Prepare builds a game's library with
+# (docs/runtime.md, "The toolchain shipped"): clang and lld from the LLVM that
+# builds XenoForge, into toolchain/bin, where find_toolchain looks first after
+# --toolchain and XF_TOOLCHAIN. Without it a machine with no LLVM installed
+# can only run games interpreted. lld is copied once (run as `lld -flavor link`
+# when there is no lld-link).
+option(XF_PACKAGE_TOOLCHAIN "ship clang and lld in toolchain/bin" ON)
+if(XF_PACKAGE_TOOLCHAIN)
+    get_filename_component(_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    set(_clang "${_llvm_bin}/clang${CMAKE_EXECUTABLE_SUFFIX}")
+    set(_lld "${_llvm_bin}/lld${CMAKE_EXECUTABLE_SUFFIX}")
+    if(NOT EXISTS "${_clang}" OR NOT EXISTS "${_lld}")
+        message(FATAL_ERROR "XF_PACKAGE_TOOLCHAIN: no clang and lld beside ${CMAKE_CXX_COMPILER} "
+                            "(build with LLVM's clang, or -DXF_PACKAGE_TOOLCHAIN=OFF for a package without them)")
+    endif()
+    install(PROGRAMS "${_clang}" "${_lld}" DESTINATION toolchain/bin)
+    install(FILES ${CMAKE_SOURCE_DIR}/third_party/llvm/LICENSE.TXT DESTINATION toolchain RENAME LICENSE-llvm.txt)
+endif()
+
 # The libraries linked into the player, each with its license as fetched
 set(_notices "${CMAKE_BINARY_DIR}/THIRD-PARTY-NOTICES.txt")
 set(_rule "-------------------------------------------------------------------------------")
@@ -48,6 +70,11 @@ file(READ "${rmlui_SOURCE_DIR}/LICENSE.txt" _rmlui)
 file(READ "${freetype_SOURCE_DIR}/docs/FTL.TXT" _freetype)
 file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Inter.txt" _inter)
 file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Lucide.txt" _lucide)
+file(READ "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-FSR/LICENSE.txt" _fsr)
+file(READ "${CMAKE_SOURCE_DIR}/third_party/FidelityFX-CAS/LICENSE.txt" _cas)
+file(READ "${CMAKE_SOURCE_DIR}/third_party/fxaa/LICENSE" _fxaa)
+file(READ "${volk_SOURCE_DIR}/LICENSE.md" _volk)
+file(READ "${vulkanheaders_SOURCE_DIR}/LICENSES/Apache-2.0.txt" _vulkan_headers)
 file(READ "${CMAKE_SOURCE_DIR}/frontend/ui/fonts/LICENSE-Roboto.txt" _roboto)
 file(READ "${STB_DIR}/stb_image_write.h" _stb)
 string(FIND "${_stb}" "This software is available under 2 licenses" _stb_at)
@@ -110,6 +137,30 @@ ${_rule}
 stb_image and stb_image_write, https://github.com/nothings/stb - MIT license or public domain
 ${_rule}
 ${_stb}
+${_rule}
+AMD FidelityFX FSR 1 (ffx_a.h, ffx_fsr1.h), https://github.com/GPUOpen-Effects/FidelityFX-FSR - MIT
+license (the player's FSR output scaling)
+${_rule}
+${_fsr}
+${_rule}
+AMD FidelityFX CAS (ffx_a.h, ffx_cas.h), https://github.com/GPUOpen-Effects/FidelityFX-CAS - MIT
+license (the player's CAS output scaling)
+${_rule}
+${_cas}
+${_rule}
+NVIDIA FXAA 3.11 (FXAA3_11.h) - BSD 3-clause license (the player's FXAA)
+${_rule}
+${_fxaa}
+${_rule}
+volk (vulkan-sdk-${XF_VULKAN_SDK_TAG}.0), https://github.com/zeux/volk - MIT license (Vulkan's
+functions loaded from the system's loader)
+${_rule}
+${_volk}
+${_rule}
+Vulkan-Headers (v${XF_VULKAN_SDK_TAG}), https://github.com/KhronosGroup/Vulkan-Headers - Apache
+License 2.0 (the C headers compiled in; unchanged)
+${_rule}
+${_vulkan_headers}
 ")
 install(FILES "${_notices}" DESTINATION .)
 

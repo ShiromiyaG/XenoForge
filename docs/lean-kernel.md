@@ -88,3 +88,27 @@ slots): `ExEventObjectType`, `ExThreadObjectType`, `ExLoadedCommandLine`,
 - Game A's own extras (device objects, `XexLoadImage`, voice, STFS,
   the guide's UI) are imported; whether anything calls them is the first
   question for the counts of step A4.
+
+## What the eight discs import that nothing implemented (2026-11-09)
+
+`xfinspect <disc> --imports` over the eight test discs, set against the exports
+the kernel implements: 37 functions of xboxkrnl and xam were imported by a
+disc and answered by nothing (Xenia has none of them either), and a run of each
+disc with `boot --render` found ten more asked for through
+`XexGetProcedureAddress` (the XInputdFF* family,
+`XamInputGetUserVibrationLevel`, `XamVoiceSetMicArrayIdleUsers`). Each answers
+now as the console does with the device absent; the answers and the tests are
+in docs/runtime.md, "Exports nothing implemented".
+
+| Export | Discs |
+| --- | --- |
+| `NetDll_XNetConnect`, `_XNetQosLookup`, `_XNetServerToInAddr` | A C D E F G |
+| `NetDll_XNetUnregisterInAddr` | A D E F G |
+| `NetDll_XNetGetConnectStatus` | C D F G |
+| `NetDll_XNetQosGetListenStats` | A E F |
+| `NetDll_getpeername` | C D |
+| `RmcDeviceRequest` | A B |
+| `XCustomGetCurrentGamercard`, `XCustomGetLastActionPressEx`, `XCustomSetDynamicActions`, `XCustomUnregisterDynamicActions` | D F |
+| `EtxProducerRegister`, `EtxProducerLog`, `EtxProducerUnregister`, `PsCamDeviceRequest`, `LDICreateDecompression`, `LDIDecompress`, `LDIDestroyDecompression` | D |
+| `XamCacheOpenFile`, `XamCacheCloseFile`, `XamCacheReset`, `XamInputRawState`, `XamNuiCamera*` (4), `XamReadBiometricData`, `XamWriteBiometricData`, `XamUserGetAgeGroup`, `XamUserNuiGetEnrollmentIndex`, `XamXlfs*` (4) | D |
+| `XamBackgroundDownloadSetMode`, `XamContentInstall` | C, D |

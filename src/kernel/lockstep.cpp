@@ -113,7 +113,8 @@ class Recorder final : public ppc::Observer {
         if (c.xer_ca != p.xer_ca || c.xer_ov != p.xer_ov || c.xer_so != p.xer_so || c.xer_bc != p.xer_bc)
             p.xer_ca = c.xer_ca, p.xer_ov = c.xer_ov, p.xer_so = c.xer_so, p.xer_bc = c.xer_bc, writers.xer = pc;
         if (c.fpscr != p.fpscr) p.fpscr = c.fpscr, writers.fpscr = pc;
-        if (c.vscr_sat != p.vscr_sat) p.vscr_sat = c.vscr_sat, writers.vscr = pc;
+        if (c.vscr_sat != p.vscr_sat || c.vscr_java != p.vscr_java)
+            p.vscr_sat = c.vscr_sat, p.vscr_java = c.vscr_java, writers.vscr = pc;
         if (c.msr != p.msr) p.msr = c.msr, writers.msr = pc;
         if (c.reserved != p.reserved || c.reserve_address != p.reserve_address)
             p.reserved = c.reserved, p.reserve_address = c.reserve_address, writers.reserve = pc;
@@ -497,7 +498,7 @@ void Lockstep::compare(Check &check, ppc::Context &c, const Import *import) {
         uint64_t(ic.xer_so) << 24 | uint64_t(ic.xer_ov) << 16 | uint64_t(ic.xer_ca) << 8 | ic.xer_bc,
         check.writers.xer);
     reg("fpscr", -1, c.fpscr, ic.fpscr, check.writers.fpscr);
-    reg("vscr", -1, c.vscr_sat, ic.vscr_sat, check.writers.vscr);
+    reg("vscr", -1, uint64_t(c.vscr_java) << 8 | c.vscr_sat, uint64_t(ic.vscr_java) << 8 | ic.vscr_sat, check.writers.vscr);
     reg("msr", -1, c.msr, ic.msr, check.writers.msr);
     reg("resv", -1, c.reserved ? 0x100000000ull | c.reserve_address : 0,
         ic.reserved ? 0x100000000ull | ic.reserve_address : 0, check.writers.reserve);

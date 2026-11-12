@@ -5,7 +5,7 @@
 #   bin/                      xfrecomp, xfinspect, ffmpeg-xma (the runtime files a port copies beside its executables)
 #   include/xenoforge/        the public headers, with the generated code's (game_library.h, ppc_runtime.h, ...)
 #   lib/                      the static libraries: core, the kernel (as an archive, linked whole), the renderer
-#                             (Vulkan), boot, and with the player: the player, its frontend, Dear ImGui, SDL3
+#                             (Vulkan, with volk), boot, and with the player: the player, its frontend, Dear ImGui, SDL3
 #   lib/cmake/XenoForge/      XenoForgeConfig.cmake and its version file, xenoforge_port.cmake (xenoforge_add_port)
 #                             and game_library/ (the project that compiles a port's generated code)
 #
@@ -27,7 +27,7 @@ set(XF_SDK_CMAKE_DIR lib/cmake/XenoForge)
 add_library(xenoforge_kernel_archive STATIC $<TARGET_OBJECTS:xenoforge_kernel>)
 set_target_properties(xenoforge_kernel_archive PROPERTIES OUTPUT_NAME xenoforge_kernel LINKER_LANGUAGE CXX)
 
-set(_sdk_libs xenoforge xenoforge_kernel_archive xenoforge_vk xenoforge_boot)
+set(_sdk_libs xenoforge xenoforge_kernel_archive xenoforge_vk xf_volk xenoforge_boot)
 if(TARGET xenoforge_player)
     list(APPEND _sdk_libs xenoforge_player xf_frontend xf_imgui SDL3-static)
     # SDL3's own link line (the system libraries of its video, input and sound), as this build resolved it
@@ -46,6 +46,12 @@ install(FILES ${CMAKE_SOURCE_DIR}/LICENSE ${CMAKE_SOURCE_DIR}/LICENSE-xenia ${CM
 # every public header (xenoforge/port.h and the rest as they land), and the interface version the core was built with
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/xenoforge DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT sdk
         FILES_MATCHING PATTERN "*.h" PATTERN "*.inc" PATTERN "*.hpp")
+# Khronos's headers and volk's (cmake/vulkan.cmake), so a port needs no Vulkan SDK
+install(DIRECTORY ${XF_VULKAN_INCLUDE}/vulkan ${XF_VULKAN_INCLUDE}/vk_video DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        COMPONENT sdk)
+install(FILES ${XF_VOLK_INCLUDE}/volk.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT sdk)
+install(FILES ${XF_SPIRV_INCLUDE}/spirv.hpp11 ${XF_SPIRV_INCLUDE}/GLSL.std.450.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/spirv-headers COMPONENT sdk)
 install(FILES ${CMAKE_BINARY_DIR}/generated/xenoforge/game_interface.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/xenoforge COMPONENT sdk)
 

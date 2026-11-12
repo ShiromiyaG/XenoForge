@@ -35,8 +35,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 namespace xf::kernel {
@@ -70,6 +74,15 @@ XF_EXPORT(xboxkrnl, KeBugCheckEx) {
 XF_EXPORT(xboxkrnl, KeBugCheck) { bug_check(k, arg(k, c, 0), 0, 0, 0, 0); }
 
 // ---- the HAL (xboxkrnl_hal.cc) ----
+
+// (exit_code): the title's process ends. Xenia has no such export; the
+// console's XAM calls it from its launcher with 0. The terminate
+// notifications run, then the run ends with the code (Kernel::title_exit).
+XF_EXPORT(xboxkrnl, ExTerminateTitleProcess) {
+    uint32_t code = arg(k, c, 0);
+    exit_title(k, false, "", 0, code,
+               "the title process ends (ExTerminateTitleProcess, code " + std::to_string(code) + ")");
+}
 
 XF_EXPORT(xboxkrnl, HalReturnToFirmware) {
     static constexpr const char *messages[] = {
@@ -305,6 +318,51 @@ const std::map<uint32_t, std::vector<uint8_t>> &settings() {
 struct XConfig {
     std::mutex mutex;
     std::map<uint32_t, std::vector<uint8_t>> values = settings();
+    // where the settings a title wrote are kept between runs, and which they are
+    // (SystemSettings::file; empty: for the run only)
+    std::filesystem::path file;
+    std::set<uint32_t> written;
+
+    // the settings written, to the file (mutex held): a record is the key (category
+    // << 16 | setting), the size (16 bits) and the bytes, after "XFXC"
+    void save() {
+        if (file.empty()) return;
+        std::vector<uint8_t> out = {'X', 'F', 'X', 'C'};
+        for (uint32_t key : written) {
+            const std::vector<uint8_t> &v = values[key];
+            for (int i = 3; i >= 0; i--) out.push_back(uint8_t(key >> (8 * i)));
+            out.push_back(uint8_t(v.size() >> 8)), out.push_back(uint8_t(v.size()));
+            out.insert(out.end(), v.begin(), v.end());
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(file.parent_path(), ec);
+        std::filesystem::path temp = file;
+        temp += ".tmp";
+        {
+            std::ofstream f(temp, std::ios::binary | std::ios::trunc);
+            f.write(reinterpret_cast<const char *>(out.data()), std::streamsize(out.size()));
+            if (!f) return;
+        }
+        std::filesystem::rename(temp, file, ec);
+    }
+    // what an earlier run wrote (mutex held): a setting of the size it has now
+    void load() {
+        std::ifstream f(file, std::ios::binary);
+        std::vector<uint8_t> in((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (in.size() < 4 || std::memcmp(in.data(), "XFXC", 4) != 0) return;
+        for (size_t p = 4; p + 6 <= in.size();) {
+            uint32_t key = uint32_t(in[p]) << 24 | in[p + 1] << 16 | in[p + 2] << 8 | in[p + 3];
+            size_t size = size_t(in[p + 4]) << 8 | in[p + 5];
+            p += 6;
+            if (p + size > in.size()) break;
+            auto it = values.find(key);
+            if (it != values.end() && it->second.size() == size) {
+                std::copy_n(in.begin() + std::ptrdiff_t(p), size, it->second.begin());
+                written.insert(key);
+            }
+            p += size;
+        }
+    }
 };
 
 XF_EXPORT(xboxkrnl, ExGetXConfigSetting) {
@@ -341,7 +399,11 @@ XF_EXPORT(xboxkrnl, ExSetXConfigSetting) {
     XConfig &x = k.state<XConfig>();
     std::lock_guard<std::mutex> l(x.mutex);
     auto it = x.values.find(uint32_t(category) << 16 | setting);
-    if (it != x.values.end() && buffer) std::memcpy(it->second.data(), k.host(buffer), it->second.size());
+    if (it != x.values.end() && buffer) {
+        std::memcpy(it->second.data(), k.host(buffer), it->second.size());
+        x.written.insert(it->first);
+        x.save();
+    }
     std::fprintf(stderr, "kernel: ExSetXConfigSetting: category 0x%04x, setting 0x%04x\n", category, setting);
     result(c, X_STATUS_SUCCESS);
 }
@@ -360,6 +422,8 @@ XF_EXPORT(xboxkrnl, ExReadModifyWriteXConfigSettingUlong) {
         uint32_t value = v.size() == 4 ? uint32_t(v[0]) << 24 | v[1] << 16 | v[2] << 8 | v[3] : 0;
         std::vector<uint8_t> bytes = be32((value & keep) | set);
         std::copy_n(bytes.begin(), std::min<size_t>(v.size(), 4), v.begin());
+        x.written.insert(it->first);
+        x.save();
     }
     std::fprintf(stderr,
                  "kernel: ExReadModifyWriteXConfigSettingUlong: category 0x%04x, setting 0x%04x, bits kept "
@@ -367,6 +431,48 @@ XF_EXPORT(xboxkrnl, ExReadModifyWriteXConfigSettingUlong) {
                  category, setting, keep, set);
     result(c, X_STATUS_SUCCESS);
 }
+
+} // namespace
+
+// The settings the player chooses (kernel.h, SystemSettings), written into the
+// console's own as its dashboard would: what the title reads through
+// ExGetXConfigSetting (XGetVideoMode, VdQueryVideoMode, the language and country
+// XAM answers) follows. The settings an earlier run's title wrote come first, so
+// what the player chose wins.
+void apply_system_settings(Kernel &k, const SystemSettings &s) {
+    XConfig &x = k.state<XConfig>();
+    std::lock_guard<std::mutex> l(x.mutex);
+    if (!s.file.empty()) x.file = s.file, x.load();
+    auto put = [&](uint16_t category, uint16_t setting, const std::vector<uint8_t> &bytes) {
+        auto it = x.values.find(uint32_t(category) << 16 | setting);
+        if (it != x.values.end() && it->second.size() == bytes.size()) it->second = bytes;
+    };
+    auto get32 = [&](uint16_t category, uint16_t setting) {
+        const std::vector<uint8_t> &v = x.values[uint32_t(category) << 16 | setting];
+        return v.size() == 4 ? uint32_t(v[0]) << 24 | v[1] << 16 | v[2] << 8 | v[3] : 0u;
+    };
+    if (s.language) put(0x03, 0x09, be32(s.language));
+    if (s.country >= 0) put(0x03, 0x0E, {uint8_t(s.country)});
+    if (s.width && s.height) {
+        // the screen size of the HDMI/composite and the component outputs, as the dashboard sets
+        // both for a resolution; 4:3 sizes are widescreen only with the video flag
+        put(0x03, 0x13, be32(s.width << 16 | s.height));
+        put(0x03, 0x14, be32(s.width << 16 | s.height));
+    }
+    if (s.widescreen >= 0) {
+        uint32_t flags = get32(0x03, 0x0A) & ~0x00010000u;
+        put(0x03, 0x0A, be32(flags | (s.widescreen ? 0x00010000u : 0)));
+    }
+    if (s.refresh == 50) {
+        // the AV region of a PAL console: the standard in bits 8-15 (PAL-I, 3) and the 50 Hz bit (23)
+        put(0x02, 0x02, be32((get32(0x02, 0x02) & ~0xFF00u) | 0x00800000u | 0x0300u));
+    } else if (s.refresh == 60) {
+        put(0x02, 0x02, be32(0x00400100));
+    }
+    if (!s.file.empty()) x.save();
+}
+
+namespace {
 
 // ---- xam's queries of the settings (xam_info.cc, xam_locale.cc) ----
 

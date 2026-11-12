@@ -37,6 +37,7 @@
 
 #include "xenoforge/xenos.h"
 
+#include <chrono>
 #include <algorithm>
 #include <bit>
 #include <cstdio>
@@ -235,8 +236,21 @@ void Video::commands_loop(Thread &self) {
             o.wait(self, kick, false, false, Scheduler::NEVER);
             continue;
         }
+        busy.store(true, std::memory_order_relaxed);
+        const auto began = std::chrono::steady_clock::now();
         cp->run(write);
+        cp->counts().run_ns.fetch_add(
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()),
+            std::memory_order_relaxed);
+        busy.store(write_pointer.load() != cp->read_pointer(), std::memory_order_relaxed);
+        wrote_back(); // (the last of the run: the spins see the processor idle)
     }
+}
+
+// what the CPU polls for changed: the threads asleep in a spin look again
+void Video::wrote_back() {
+    write_backs.fetch_add(1, std::memory_order_release);
+    objects(*k).scheduler->spin_wake();
 }
 
 void Video::interrupt(uint32_t cpu) {
@@ -246,12 +260,16 @@ void Video::interrupt(uint32_t cpu) {
 bool Video::wait(uint32_t wait) {
     Thread *self = current_thread();
     Objects &o = objects(*k);
+    const auto began = std::chrono::steady_clock::now();
     if (wait >= 0x100 && self) {
         Dispatcher *const stop[] = {stop_.get()};
         o.wait(*self, stop, false, false, o.now() + uint64_t(wait / 0x100) * (SECOND / 1000));
     } else {
         o.scheduler->yield();
     }
+    cp->counts().wait_ns.fetch_add(
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count()),
+        std::memory_order_relaxed);
     return running.load();
 }
 
@@ -308,6 +326,7 @@ void Video::dispatch_interrupt(Thread &self, uint32_t source, uint32_t cpu) {
     p[kpcr::CURRENT_IRQL] = irql;
     k->store32(pcr + kpcr::DPC_ACTIVE, 0);
     interrupts[source & 1].fetch_add(1);
+    wrote_back(); // (the callback may have set what a spin waits for)
 }
 
 // ---- the report ----
@@ -353,6 +372,24 @@ std::string video_report(Kernel &k) {
                   (unsigned long long)n.waits.load(), (unsigned long long)n.failed_draws.load(),
                   (unsigned long long)n.bad_packets.load());
     out += line;
+    if (uint64_t waits = n.waits.load()) {
+        // what the processor waited for (WAIT_REG_MEM polls that did not match)
+        uint32_t poll = n.last_wait_poll.load();
+        std::snprintf(line, sizeof(line),
+                      "gpu: of %llu WAIT_REG_MEM packets %llu did not match at once: %llu polls, %llu on memory, %llu "
+                      "with a sleep; the last on %s 0x%X, reference 0x%X, mask 0x%X, wait 0x%X\n",
+                      (unsigned long long)n.opcodes[pm4::WAIT_REG_MEM].load(),
+                      (unsigned long long)n.waiting_packets.load(), (unsigned long long)waits,
+                      (unsigned long long)n.waits_on_memory.load(), (unsigned long long)n.waits_asleep.load(),
+                      poll & 0x80000000u ? "memory" : "register", poll & 0x7FFFFFFF, n.last_wait_ref.load(),
+                      n.last_wait_mask.load(), n.last_wait_field.load());
+        out += line;
+    }
+    if (uint64_t waits = v.spin_waits.load()) {
+        std::snprintf(line, sizeof(line), "gpu: %llu sleeps of threads spinning while it worked (%u write-backs)\n",
+                      (unsigned long long)waits, v.write_backs.load());
+        out += line;
+    }
     std::string opcodes, unknown;
     for (uint32_t op = 0; op < 128; op++) {
         if (uint64_t c = n.opcodes[op].load()) {

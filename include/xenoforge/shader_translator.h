@@ -94,10 +94,24 @@ struct VertexOptions {
     uint8_t clip_planes = 0;       // 0-6
     bool clip_planes_cull = false; // ucp_cull_only_ena
     uint8_t point_ucp_mode = 0;    // ps_ucp_mode, for points
+    // Screen extents (EVENT_WRITE_EXT; renderer.cpp, "Screen extents"): each
+    // final position bounds the draw's report, in console pixels through the
+    // system constants' extent map (members 10 and 11), with atomic maxima
+    // into the storage buffer at set 0, binding 7, four words a report at
+    // the report's index: 8192 less the left and top edges, the right and
+    // bottom ones plus one (zero: nothing yet). A position not in front of
+    // the eye (w not above 0, or not a number) takes the whole viewport.
+    bool extents = false;
+    // Xenia's texture_point_snap (off by default there too): point-sampled
+    // 2D fetches with normalized coordinates, where the fetch constant
+    // filters by point too (texture::integer_scale_bits' bit 26), sample at
+    // their texel's center instead of adding the rounding epsilon. One
+    // setting for the whole run (the renderer's), so not part of the key.
+    bool texture_point_snap = false;
     // a word naming the variant (the renderer's key for the module)
     uint32_t key() const {
         return uint32_t(host) | (equal_spacing ? 1u << 8 : 0u) | uint32_t(clip_planes) << 9 |
-               (clip_planes_cull ? 1u << 12 : 0u) | uint32_t(point_ucp_mode & 3) << 13;
+               (clip_planes_cull ? 1u << 12 : 0u) | uint32_t(point_ucp_mode & 3) << 13 | (extents ? 1u << 15 : 0u);
     }
 };
 // How a pixel shader writes depth (Xenia's DepthStencilMode on the host
@@ -130,9 +144,32 @@ struct VertexOptions {
 struct PixelOptions {
     uint8_t depth_float24 = 0;
     uint16_t centroid = 0;
-    uint8_t fsi = 0;
+    uint8_t fsi = 0; // up to 63
+    // a point list's: the pixel parameters' z and w are the sprite's
+    // coordinates, read from location 17 (the point expansion's), as
+    // Xenia's param_gen_point
+    bool point_coordinates = false;
+    // Xenia's DepthStencilMode::kEarlyHint: the draw's state has no alpha test
+    // and no alpha to coverage, so a shader that neither kills, writes depth
+    // nor exports memory has its depth and stencil tested and written before
+    // it runs (EarlyFragmentTests), and the alpha test, the alpha to coverage
+    // and the coverage output are left out. Ignored for a shader that does any
+    // of those, with a float24 conversion and on the interlock path.
+    bool early_depth_stencil = false;
+    // Host render targets: the source of a minimum or maximum blend times its
+    // blend factor, which the console applies and the host's blending
+    // ignores, where the factor depends on the source and the blend constant
+    // alone; per color target as the system constants say (the renderer's
+    // host_blend_control). Not on the interlock path, which blends itself.
+    bool blend_premultiply = false;
+    bool texture_point_snap = false; // VertexOptions::texture_point_snap's; not part of the key
     std::span<const uint32_t> edram_library; // with fsi; not part of the key
-    uint32_t key() const { return depth_float24 | uint32_t(centroid) << 8 | uint32_t(fsi) << 24; }
+    uint32_t key() const {
+        // (depth_float24 is 0-2; bits 4-7 are free)
+        return depth_float24 | uint32_t(early_depth_stencil) << 2 | uint32_t(blend_premultiply) << 3 |
+               uint32_t(centroid) << 8 | uint32_t(fsi) << 24 |
+               uint32_t(point_coordinates) << 30;
+    }
 };
 Translation translate(const ucode::ParsedShader &shader, Stage stage, const VertexOptions &vertex = {},
                       const PixelOptions &pixel = {});

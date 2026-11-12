@@ -20,6 +20,6 @@ void main() {
     for (uint s = 0u; s < samples; s++) {
         uint at = edram_offset(pixel, s);
         edram.words[at] = target.clear_lo;
-        if (target.ints_log2 != 0u) edram.words[(at + 1u) % EDRAM_DWORDS] = target.clear_hi;
+        if (target.ints_log2 != 0u) edram.words[(at + 1u) % edram_dwords()] = target.clear_hi;
     }
 }

@@ -23,6 +23,7 @@
 #include <RmlUi/Core/RenderInterface.h>
 #include <RmlUi/Core/Types.h>
 
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
@@ -34,6 +35,8 @@ class Renderer final : public Rml::RenderInterface {
   public:
     Renderer();
     ~Renderer() override;
+    // A file the pipelines' compiled form is kept in between runs (before open; none: compiled every start)
+    void set_pipeline_cache_file(std::filesystem::path file) { pipeline_cache_file_ = std::move(file); }
     bool open(vk::Device &device, std::string &error);
 
     // A picture the document can name without a file: "mem:<name>" in an
@@ -107,6 +110,7 @@ class Renderer final : public Rml::RenderInterface {
 
   private:
     std::unique_ptr<Impl> impl_;
+    std::filesystem::path pipeline_cache_file_;
     vk::Device *device_ = nullptr;
     uint32_t width_ = 0, height_ = 0, draws_ = 0, passes_ = 0;
 };

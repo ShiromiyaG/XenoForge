@@ -408,6 +408,23 @@ lists: what the game calls is what gets written next.
   moves with it every millisecond once threads run. On Windows the host
   timer is raised to its finest (0.5 ms), as Xenia does, or the clock and
   short waits would step at 15.6 ms.
+- **The host clock** (`src/kernel/host_clock.cpp`) under the scheduler's:
+  the CPU's own counter scaled by a 64-bit fixed-point multiply, no lock and
+  nothing shared written. x86-64 with an invariant TSC: `rdtscp` (lfence +
+  rdtsc without it), the frequency measured against steady_clock over 30 ms
+  at the first read; ARM64 Linux/Android: `cntvct_el0` (CNTFRQ checked by
+  the same measurement); elsewhere, or with `XF_HOST_CLOCK=steady_clock`,
+  steady_clock. Xenia reads QueryPerformanceCounter and takes a mutex per
+  read (its raw TSC mode takes the frequency from CPUID, Intel only).
+  A bare `rdtsc` costs half as much (9 against 18-21 ns here) but runs ahead
+  of a load still missing the cache: a thread that saw another's store and
+  then read it got values up to 500 ns older than the other's read before
+  the store (`host_clock_test`), a negative interval to a guest timing across
+  threads; so the fence stays. On a host whose QueryPerformanceCounter is
+  the TSC (frequency 10 MHz) the read costs about what it did (20.5-21.3
+  against 21.1-23.4 ns); the gain is the ARM64 counter and no system call
+  where the OS clock is not the TSC. Deadlines go to the host's waits as the
+  time left, so the measured frequency's few ppm never end a wait early.
 
 ## Threads and objects
 
@@ -435,11 +452,90 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
   oldest first (KiWaitTest), taking what they acquire (auto-reset events,
   semaphore counts, mutant ownership); wait-any, wait-all, timeouts
   relative and absolute, abandoned mutants, alertable waits.
-- **The scheduler** is an interface of seven calls (start, join, block
-  until woken or a deadline, wake, yield, the clock, timers changed). The
-  host scheduler gives each guest thread a host thread with a 16 MB stack
-  and a clock thread (timers, KeTimeStampBundle, every millisecond); the
-  time base (mftb) is the same clock. The fiber scheduler replaces it.
+- **The scheduler** is an interface (`Scheduler`, objects.h: start, join,
+  block until woken or a deadline, wake, yield, give up a slice, the clock,
+  timers changed; and the spin-wait hint's hand-over, a preemption's yield
+  point and an affinity changed). The host scheduler gives each guest thread
+  a host thread with a 16 MB stack and a clock thread (timers,
+  KeTimeStampBundle, every millisecond); the time base (mftb) is the same
+  clock. The deterministic mode's fiber scheduler replaces it, and so does
+  the console scheduler (below, `XF_SCHEDULER=console`).
+- **The console scheduler** (`console_scheduler.cpp`, 2026-11-09;
+  `XF_SCHEDULER=console`): the guest's threads scheduled as the console's
+  kernel schedules them, on six processors for the Xenon's six hardware
+  threads, rather than each a host thread for the host to schedule (Xenia's
+  way, and the host scheduler's). The model is Cemu's (the Wii U's threads
+  as fibers on a host thread per core), written anew.
+  - A processor is a host thread (started at its first thread) with a fiber
+    per guest thread on it. A thread is on the processor KPCR CURRENT_CPU
+    names when it is made (ExCreateThread's mask, else its parent's, as
+    Xenia's GetFakeCpuNumber), or the one KeSetAffinityThread names before
+    it first runs: a thread made suspended is held until resumed, so the
+    XDK's CreateThread suspended, XSetThreadProcessor, ResumeThread puts it
+    where the game asked. A thread that has run stays on its processor's
+    host thread (the kernel's code reads host thread-locals, whose addresses
+    the compiler may keep across a call that would move it); the moves asked
+    then are counted. The thread-locals the kernel keeps per guest thread
+    (the current thread, the exception walks) are swapped at each switch.
+  - A wait that blocks, a yield, a thread's end: its processor switches to
+    the next ready fiber there in user mode, no host wait or wake; with
+    nothing ready it sleeps on its condition variable until a wait's
+    deadline or a wake from elsewhere. A wake from another processor or a
+    host thread puts the fiber on its processor's queue and wakes the
+    processor if it sleeps.
+  - Each processor runs its ready fibers by their KTHREAD priority, first
+    come first among equals. One made ready above the one running preempts
+    it at its next yield point (a loop's back edge, a priority hint, as
+    `Kernel::pause` stops threads: the yield points' counting turned on for
+    that thread, an atomic flag the generated code loads at each); one that
+    has run 2 ms with another as high ready is preempted there too, as a
+    quantum ends; one that has waited 8 ms runs next whatever its priority
+    (Xenia gives every thread to the host with the priorities ignored: no
+    game is left waiting on a low thread a high one starves). The
+    spin-wait hint (db16cyc, every 2,048 in a row), a yield and a slice given
+    up hand the processor to the others ready there, whatever their
+    priority, and queue behind them.
+  - The kernel's own threads whose body is host code (the GPU's, the
+    sound's, XAM's workers) stay host threads of their own, waiting on
+    their condition variables as the host scheduler's; so does guest code a
+    host thread calls. The loader lock, a host lock held across guest code,
+    gives its processor up while it waits (a fiber must not wait on the
+    host for another fiber of its processor).
+  - The clock is the host's; a clock thread moves the timers every
+    millisecond, makes the waits of busy processors whose deadline passed
+    ready, and asks for the preemptions.
+  - The thread report prints its counts (switches, waits, yields, spins
+    handed over, preemptions, moves) and each processor's host CPU time.
+    `kernel_threads_console` runs the threads' tests on it.
+  - Measured (2026-11-09), game D's played drive (`bench_vs_xenia.ps1
+    -Configs ours-host`, the drive's press script, window 125-200 s), one
+    run at a time: the host scheduler 27.55 fps, frame p95 50.1 ms, CPU
+    2.74 s a second (an earlier run 28.63, 49.3, 2.79); the console
+    scheduler 29.17, 35.6, 2.63 and, again, 27.68, 50.3, 2.82. No gain it
+    keeps, so the host scheduler stays the default. Its 40 s boot of game
+    D: 46 threads, 65,229 switches, 61,916 waits blocked, 2,314
+    preemptions (1,202 for a higher thread made ready), 787 threads run
+    starving; processor 0 (2 threads, one of them the game's render thread
+    polling the GPU) 38.9 s of CPU in 40, the other five 13.4 s together.
+- **Polling threads nap.** A zero-interval KeDelayExecutionThread and
+  NtYieldExecution go through `give_up_slice`. Xenia answers both with
+  `Sleep(0)` (and a 100 ns NtDelayExecution for threads below normal
+  priority, which on Windows its priority mapping never reaches), and so did
+  we with `std::this_thread::yield`: both return at once when the host has
+  nothing else to run, so a guest thread polling a flag between zero delays
+  keeps a host core busy as long as it waits (game A: 1.3 M zero delays a
+  second, one core). The host scheduler now counts a thread as polling once
+  it has done nothing but yield, with at most 20 us of guest work between
+  yields, for 200 us; its yields then nap (NtDelayExecution of one unit:
+  the timer's next tick, 0.5-0.6 ms; 50 us on POSIX) until a gap longer than
+  20 us shows it working. The answers and which threads count as ready are
+  unchanged; the poll notices its flag up to a nap later. The fiber
+  scheduler keeps its yields. `XF_SPIN_NAP=0` turns it off; the thread
+  report prints the naps. Game A (attract, 25 s window, contaminated by
+  other agents' load): CPU 1.24 -> 0.42 s a second (Xenia D3D12 1.33), 30 fps
+  all, frame time p5-p95 no wider; KeDelayExecutionThread 39.0 M -> 0.59 M
+  calls in 30 s. Game D's spin is in guest code (two threads of its media
+  DLL, no kernel calls), which this does not reach: 1,711 naps in 30 s.
 - **Safe points**: a thread suspended by another, or with kernel APCs
   queued, stops at its next kernel call (Xenia suspends the host thread
   wherever it is). User APCs run in alertable waits; DPCs run on the
@@ -614,6 +710,35 @@ stack's generated frames wait where they are:
   each loop's back edge and each hint (docs/recompiler.md, "Yield points"),
   so such a spin runs its slice out on the clock and hands over at the same
   instruction every run. Playing, a yield point is a load and a branch.
+- **Spins, playing (2026-11-09).** `or 31,31,31` ("db16cyc", the XDK's
+  spin-wait hint) is the host's spin-wait hint too (`ppc_ops.h`'s
+  `spin_hint`: x86's pause, ARM's yield, as Xenia's DELAY_EXECUTION, so the
+  SMT sibling gets the core), and every 2048 of them in a row the thread
+  gives the host processor to whatever else is ready on it
+  (`System::spin`, `std::this_thread::yield`; back at once when nothing
+  is), beyond Xenia, which pauses only. Game D's render thread spins in such
+  a loop while it waits for the GPU (a full core before): the played drive
+  went from 27.4 to 28.6 frames a second and 3.25 to 2.79 s of CPU a second
+  (Xenia 30 and 1.96).
+- **Spins on the GPU sleep (2026-11-09).** That loop is Direct3D's wait
+  for the GPU: 32 hints, then a read of what the command processor writes
+  back to guest memory (the read pointer's copy, a fence's value), with no
+  kernel call; the hand-over above returns at once on a host with idle
+  cores, so the thread still kept one busy for as long as the GPU took. A
+  thread whose hand-overs have followed each other (less than 1 ms apart)
+  for 200 us while the command processor has commands to run now sleeps
+  until the processor's next write-back or interrupt
+  (`CommandProcessor::Host::wrote_back`, `Video::write_backs`,
+  `Scheduler::spin_wait`), 1 ms at most, and not at all when one came
+  since its last hand-over. With the processor idle the spin is handed
+  over as before. On the console scheduler the thread's processor runs
+  its other ready fibers first and sleeps with none. `XF_SPIN_WAIT=0`
+  turns it off; the GPU's report counts the sleeps. Game D's played drive,
+  one run each, the same session: off 27.83 frames a second, p95 50.3 ms,
+  2.83 s of CPU a second; on 27.24, 50.5, 2.15; on, with the console
+  scheduler, 27.48, 50.3, 2.12. A quarter less CPU, the frames unchanged
+  (they wait for the GPU either way), and the console scheduler no better
+  than the host's with it.
 - **Forced hand-overs**, a safety net that should no longer fire: a watchdog
   host thread stops a thread that has not handed over for `force_after_ms`
   (100) of the host's time if it is in the generated code at IRQL below 2
@@ -878,10 +1003,8 @@ entries, names any case.
   (`content/<XUID>/<TITLE>/<TYPE>/<name>`) is opened by XamContentCreate
   with disposition open: its first bytes are its header (no header file),
   its license mask the or of the licenses', and it is listed by the
-  enumerators. Left: creating or writing STFS (Xenia's
-  ContentPackageContainer writes it; new content here is a directory
-  package), the hash and signature checks (Xenia does none), and deleting
-  an SVOD's `.data` with it.
+  enumerators. Left: the hash and signature checks (Xenia does none), and
+  deleting an SVOD's `.data` with it. Writing STFS is below, "The storage root".
 - **File objects** are dispatchers (an auto-reset event in guest memory,
   set when a request completes, as Xenia's XFile is waitable). A request
   that fails, or is made on a handle opened with FILE_SYNCHRONOUS_IO_*,
@@ -911,11 +1034,85 @@ entries, names any case.
 - **The storage root** (`boot --content <dir>`, a temporary directory's
   `xenoforge` by default; never in the repository) has Xenia's layout, so
   saves are shared with it: `cache0`, `cache1` and `cache` (`cache0:`...),
-  and `content/<XUID>/<TITLE>/<TYPE>/<name>/` for a package with its header
-  at `content/<XUID>/<TITLE>/Headers/<TYPE>/<name>.header` (Xenia's
+  and `content/<XUID>/<TITLE>/<TYPE>/<name>` for a package: an STFS file
+  (below), or a directory with its header at
+  `content/<XUID>/<TITLE>/Headers/<TYPE>/<name>.header` (Xenia's
   XContentContainerHeader). The user is Xenia's default profile (XUID
   B13EBABEBABEBABE), or the first profile Xenia made there.
+- **STFS writing** (2026-11-08; `src/package_write.cpp`, xam_content.cpp). Saves
+  and other content a title creates are real STFS packages, the files the
+  console keeps (`CON ` magic, read-write hash tables with a primary and a
+  secondary table at each level, the file table first, consecutive file blocks,
+  SHA-1 hashes up to the volume descriptor's top hash, the content ID the SHA-1
+  of the metadata), read by `xf::Package` and by Xenia's reader (whose
+  `stfs_container_device` this follows; Xenia itself writes none: it keeps
+  directory packages). While a title has one open it is a directory device in
+  `<storage>/content-work/...` (extracted from the file, or new); XamContentClose
+  and XamContentFlush write the package file whole (to `<name>.tmp`, then a
+  rename: never half a package), the close removes the working directory, and
+  one found at an open (a run that never closed it) is what the title sees,
+  so a crash loses nothing. A new package is written empty at once, so it exists
+  and lists. A package of another form (LIVE, PIRS, SVOD, a directory) stays as it
+  is, read-only or writable as before. `ContentFormat::Directory`
+  (`set_content_format`, boot's `--directory-saves`) keeps Xenia's directory
+  packages for new content. The CON signature is zero: signing needs the
+  console's private key from its key vault, which a player's machine and this
+  repository do not have (the keys at the player's disposal are the 1BL's, which
+  signs nothing); Xenia's reader and ours do not check it, a console would refuse
+  the package. Names are 1 to 40 Windows-1252 bytes (a longer one fails the write
+  and keeps the working directory, with a message); no blocks are left free. Not
+  done: more than 4.9 M blocks (the format's three hash levels), a console's
+  in-place transactions (the package is rewritten whole at each flush).
 - `XF_LOG_FILES=1` logs each open and attribute query with its answer.
+
+### A game in a content package (2026-11-11)
+
+An arcade game or a game on demand is a content package (STFS or SVOD,
+`package.h`) with its `default.xex` inside, not a disc. `GameSource`
+(`game_source.h`) is a game's files wherever they are: a package where the
+file begins as one (`CON `, `LIVE`, `PIRS`), a disc image otherwise, with
+the files listed, found by path and read the same way. What looked for
+files on the disc takes it: boot's and the player's loading of the
+executable, the recompiler's search for executables (`xfrecomp`, `xfbuild`,
+the launcher's prepare job), the build step's search for shaders, and the
+launcher's scan, which lists a file without an extension that is a package
+with a `default.xex` (an update or an add-on has none) and looks for them
+in the content folders' layout too (`<title id>\<content type>\<file>`
+under a games folder). The kernel mounts the package as the game's device
+(`kernel::mount_package`), as Xenia's `LaunchStfsContainer`: the disc's
+mount path, `GAME:` and `D:` linked to it, the deployment type "download".
+Checked on an arcade game's package: its library built (7,675 functions,
+none left out), the title screen drawn at 60 swaps a second.
+
+The recompile step's library has no C runtime, and one of that game's
+functions has a frame above a page, for which the compiler on Windows
+calls the runtime's stack probe (`__chkstk`): the library's entry file now
+defines it (`game_build.cpp`, `STACK_PROBE`), where the link failed.
+
+### A title update's patch (2026-11-11, not yet wired in)
+
+A title update is a content package of type 0x000B0000 whose files replace
+or patch the game's; an executable's patch is the file of its own path with
+a `p` added (`default.xexp`). `TitleUpdate` (`title_update.h`) opens one,
+finds a title's among content folders (`<root>\<title id>\000B0000\<file>`,
+the highest version) and gives an executable's patch; `apply_xex_patch`
+(`xex.h`, Xenia's `XexModule::ApplyPatch` with
+`KernelState::IsPatchSignatureProper`'s check first) applies it to the
+executable loaded by `load_xex_image`: the headers' delta, the headers read
+again, the keys (the base's new one opens the patch's and, as a check, the
+base's old one kept in the patch), then each block's chunks over the image
+(`lzx_decompress_delta`, zero fills and copies), every offset checked.
+`xfinspect <disc> --update <package>` applies one and prints the version,
+size and digest it gives.
+
+State: the one update at hand is for another pressing of its game (it
+takes version 0.0.0.12 to 0.0.4.12; the disc here is 0.0.0.10, another
+media id), so the patch is refused by the signature check, as it should
+be, and the application itself has not run on real data yet. For that
+reason nothing uses it yet: left are the recompiler's modules taking their
+patches (`recomp::ModuleFile`), boot and the player applying them and
+mounting the package as `UPDATE:`, the kernel's module loads, and the
+launcher finding the update beside the game or in the content folders.
 
 ## XAM
 
@@ -961,18 +1158,39 @@ dialog: each XamShow*UI answers as Xenia does headless, with the dialog's
 default (a message box's focused button, the keyboard's default text, the
 hard drive from the device selector, sign-in with the user already there
 and XN_SYS_SIGNINCHANGED, the marketplace's downloads succeeded), completes
-its overlapped, and sends XN_SYS_UI on and off around the answer (Xenia
-sends "off" 200 ms later). Kinect's UI is refused (no sensor), the party,
-community and Gold upgrade pages fail, XamIsUIActive is always 0. A player
-overlay would plug in at `present` and `present_async` in xam_ui.cpp, the
-one place every dialog goes through: it would send XN_SYS_UI on, show the
-dialog (title, text, buttons, default) on the player's thread, and make the
-answer when the player closes it, completing the overlapped then (the
-export already returns ERROR_IO_PENDING) and sending XN_SYS_UI off;
-XamIsUIActive would answer whether one is up, and XNotifyQueueUI's toasts
-(printed now, by xam_info.cpp) would be drawn by it. The XamShow*UI calls Xenia does not
-implement either (the friends, players, messages, game invites, gamer card
-for a XUID...) stay unimplemented here: counted, answering 0.
+its overlapped, and sends "off" 200 ms later). Kinect's UI is refused (no sensor), the party,
+community and Gold upgrade pages fail.
+
+**A host for the dialogs** (`UiHandler`, kernel.h; 2026-11-08). `set_ui_handler`
+gives the kernel a callback that is handed each request (a `UiRequest`: the kind,
+the user, a message box's title, text, buttons and default, the keyboard's default
+text and room, the device selector's type and size, the other player's XUID and the
+recipients) and an `UiDone` to call with the answer (a `UiResult`: the button, the
+text, the device, or cancelled), now or later, from any thread. It returns false to
+leave a request to the default. While it holds one the title's overlapped stays
+pending (`begin_overlapped`, finished by `complete_overlapped` when `UiDone` runs;
+without an overlapped the call waits for it), XamIsUIActive answers 1, XN_SYS_UI is
+"on" and goes "off" when the answer comes; a cancelled dialog completes its
+overlapped with ERROR_CANCELLED (0x4C7), as the XDK documents for a dialog the user
+backs out of, and a page the title does not wait for (sign-in, achievements, gamer
+card, the friends pages) returns success at once and runs its follow-up (the sign-in
+notification) when it closes, not when it is cancelled. With no handler every dialog
+answers as before. The overlay itself (drawing the requests on the player's
+window) is the player's work; XNotifyQueueUI's toasts (printed now, by
+xam_info.cpp) would be drawn by it too.
+
+The pages Xenia does not implement are in: friends (`XamShowFriendsUI`, `...UIp`),
+players, messages, quick chat (`...UIp`), game invite, friend request, player
+review, message compose, gamer card for an XUID (`...UIp`), custom message compose
+and custom player list. The console's XAM with no user (the oracle) answers
+ERROR_ACCESS_DENIED to the first group, 0x65B (ERROR_FUNCTION_FAILED) to the gamer
+cards and the achievements (Xenia answers the gamer card ACCESS_DENIED and the
+achievements NO_SUCH_USER), and ERROR_INVALID_PARAMETER to the two custom pages
+given null arguments, before it looks for the user; the recipients of an invite or
+a message are read only for a user that is signed in (the console's XAM reads them
+first: a bad pointer faults there). With a user the pages are shown and closed at
+once, headless; what else the console checks (the custom pages' arguments, what a
+non-Live profile is shown) is not known without a signed-in console.
 
 The network is offline, as Xenia's answers make it: no Ethernet link, the
 title's address the loopback, DNS and QoS lookups failed at once. The
@@ -1372,6 +1590,138 @@ Left, and why:
   a callback on our side; whether the interpreter stops before the call
   returns varies (one "faults (ours)" in the last run was CreateThread).
 
+## The title's end, the profile and the console's settings (plan step 7, 2026-11-08)
+
+**A process per title.** A title ends the run through `XamLoaderTerminateTitle`,
+`XamLoaderLaunchTitle`, `XamContentLaunchImage` or `ExTerminateTitleProcess`
+(Xenia has the first two only, and asks the user to restart). Each runs the
+routines registered with `ExRegisterTitleTerminateNotification` (the highest
+priority first, r3 = 0, on the calling thread; Xenia never runs them; the
+console's order and arguments are on the hardware list), records the exit in
+`Kernel::title_exit` (launched path, flags, exit code, the launch data the title
+set with `XamLoaderSetLaunchData`) and stops the run. The host starts the next
+title as a process of its own: `boot --follow-launches` takes a path on the disc
+(`game:\`, `d:\`, `\Device\Cdrom0\`) and runs boot again on the same disc with
+`--xex <path>`, `--launch-data <file>` (what the next title reads through
+`XamLoaderGetLaunchData`, `set_launch_data`) and the time that is left. A launch
+to the dashboard or to a package on a content device ends there with the
+request printed. The player does not follow launches yet. `ExTerminateTitleProcess`
+(the console's XAM calls it from its launcher with 0; the argument is the exit
+code, as far as the oracle shows) is new.
+
+**The profile in its package** (`gpd.h`, `xam_user.cpp`). Profile settings a
+title writes (`XamUserWriteProfileSettings`, the dashboard's user preferences)
+and the achievements it earns are kept in the user's GPD files in the profile's
+package, Xenia's layout: `content/<XUID>/FFFE07D1/00010000/<XUID>/<title>.gpd`
+(`FFFE07D1.gpd` for the dashboard's). A GPD is an XDBF file (header, entry
+table, free table, data; settings in section 3, achievements in section 1),
+read when first used and written aside and renamed at each change, so a run that
+ends in the middle leaves the old file whole. Where Xenia reuses the holes of its
+free list, a file here is laid out afresh at each write. The title's
+achievements come from its SPA (the executable's resource named by the title ID:
+the XACH table and its strings in the console's language, else the SPA's
+default, else English), added locked to the GPD at first use;
+`XGIUserWriteAchievements` earns each one: its unlock time is the guest's system
+time, and the log says `xam: achievement unlocked: "<name>" (<n> G, id <id>)`
+(the overlay's log is the only UI for now). `XamUserCreateAchievementEnumerator`
+lists them from the GPD, locked and unlocked, with the label, description and
+unachieved description as UTF-16 behind the records when its flags ask for them
+(Xenia's layout: 36-byte records, the strings after `items_per_enumerate`
+records). Not done: gamer pictures, the titles-played list in the dashboard's
+GPD, stats, a GPD inside an STFS package (a directory package still).
+
+**The console's settings** (`SystemSettings`, misc.cpp). The player's choice of the
+user's language and country, the screen size (640x480, 1280x720, 1920x1080), the
+widescreen flag and the refresh rate (50 or 60 Hz) are written into the console's
+own XConfig settings before the title runs (config.toml's `[system]`: `language`,
+`country`, `width`, `height`, `widescreen`, `refresh`; boot's `--language`,
+`--country`, `--resolution WxH`, `--widescreen 0|1`, `--refresh 50|60`), so what a
+title reads through XGetVideoMode, VdQueryVideoMode, XamGetLanguage and
+XamGetCountry follows, as it would on a console set up that way. 50 Hz writes the
+PAL AV region (standard 3, bit 23). The settings a title writes with
+`ExSetXConfigSetting` and `ExReadModifyWriteXConfigSettingUlong` are kept in
+`<storage>/xconfig.bin` (the deterministic mode starts from the defaults and writes
+nothing), read at the start; what the player chose wins over them.
+
+**Kernel speed (2026-11-08).** Every import call used to build the export's
+`library!name` string, lock a kernel-wide mutex and bump a map entry; with game
+A's main thread spinning in `KeDelayExecutionThread(0)` at millions of calls a
+second (44.3 M in 20 s) that was the bulk of the call. A count is now one relaxed
+atomic add on the `Import` itself (`CallCount`), summed by name when a report asks
+(`Kernel::calls`, `unimplemented`): the same boot made 72.5 M of those calls in
+20 s (1.6 times the rate, same 30 swaps a second). Game B's kernel calls are
+about 1 M in 20 s; its time is the game's and the disc's. Left: `yield_status`
+(the answer a yield gives) walked the thread list under the dispatcher's lock on
+every yield; it is now one atomic read of a count of ready threads
+(`Thread::refresh_ready`, kept under the lock where a thread starts, ends, blocks or
+wakes). Game A, 25 s, the same machine: 37.1 s of CPU before (6.1 kernel) and 28.6 s
+after (5.3 kernel), Xenia's 30.4 s (7.5 kernel); the swaps are 27-30 a second in
+both. A per-thread look at games A and B in steady state found no other kernel hot
+spot: A's spinning thread costs 0.23 us a call (the import's counters, the
+safe-point checks and `SwitchToThread`, 0.8 s of kernel in 15 s), B spends 99% of
+its CPU in generated code.
+
+**Exports the console's XAM imports and Xenia lacks, as they come:**
+`RtlAppendStringToString` and `NtDeleteFile` (NT's; the second answers
+OBJECT_NAME_NOT_FOUND, ACCESS_DENIED on a read-only device and
+DIRECTORY_NOT_EMPTY). The other 173 the oracle lists (`xfxam <xam.xex> imports`:
+XeKeys*, XInputd*, Hal callbacks, Nic*, Mtpd*, Etx*, Drv*, LDI*...) answer 0 as
+before: their arguments and results are not known without the console, and a
+guess would be a stub with a name.
+
+## Exports nothing implemented (2026-11-09)
+
+Xenia implements 310 of xboxkrnl's exports and 382 of xam's; the console has
+more, and games import or look up some of them. The eight test discs' imports
+and a run of each (docs/lean-kernel.md, the last section) found 47. Each
+answers as the console's own kernel and XAM do with the device absent (XAM's
+answers checked with `xfxam call`); the tests are `tests/kernel_absent_test.cpp`, and the answers of
+the Winsock side stay with `kernel_net_test`'s threads. Files:
+`src/kernel/kernel_absent.cpp` (xboxkrnl), `src/kernel/xam_absent.cpp`, and
+next to their neighbours `xam_net.cpp` and `xam_input.cpp`.
+
+| Export | The console's answer here |
+| --- | --- |
+| `PsCamDeviceRequest(request)` | by the request's type (a word, 0 to 0x69): 0, 10, 29, 38, 45 succeed (0 and 29 write a status in the second word, 0 and not-connected); 13 is `0xC00000A3`; 1-3, 5, 8, 14, 15, 18-21, 24, 25, 27, 30, 33-37, 40, 41, 43, 44, 46, 47 are `0xC000009D`; anything else `0xC0000010` |
+| `RmcDeviceRequest(request)` | a u16 type and a u16 receiver: receiver 4 or more `0xC000000D`; type 0 succeeds and zeroes the second word; any other `0xC000009D` |
+| `XInputdFF*` (8) | the handle's top nibble must be 1 (else `0xC0000001`); ports 0-3 `0xC0000010`, others `0xC000009D`; `XInputdFFCancelIo` the first for every port |
+| `EtxProducerRegister`, `Unregister`, `Log` | the producer registry the console keeps (128 slots, the block's layout: size, flags' high half, events and count, id, the slot in the top ten bits of the word at +0x18); no session is ever open, so `Log` bumps the event's drop count and answers `0xC0000188`; a block under 0x40 bytes `0xC000000D`; a full table `0x8000001A` |
+| `LDICreateDecompression`, `LDIDecompress`, `LDIDestroyDecompression` | the cabinet library's LZX on frames (`LzxStream`, `include/xenoforge/lzx.h`): a context starting `'CIDL'`, the block maximum, the configuration's second word; the first configuration word is the window in bytes (a power of two from 0x8000 to 0x2000000; 0 is taken; a window in bits is "not enough memory", 1); the source buffer's minimum is the block plus 0x1800; a frame past the block maximum is 3, a context that is not one 2, a frame the decoder refuses 4 |
+| `XamInputGetUserVibrationLevel(user, level *)` | the user's pad as the HID layer says (a pad that is not there `0x48F`); the level is the default, 3 |
+| `XamInputRawState` | `0x48F` |
+| `XamVoiceSetMicArrayIdleUsers`, `XamBackgroundDownloadSetMode` | 0 |
+| `XamNuiCameraElevationSetAngle`, `StopMovement`, `RememberFloor` | `0x8007048F`; `TiltReportStatus(s)` returns `s` |
+| `XamReadBiometricData`, `XamWriteBiometricData`, `XamContentInstall` | `0x57` |
+| `XamUserGetAgeGroup(user, out *)` | `0x57` for a null pointer, else `0x65B`, signed in or not |
+| `XamUserNuiGetEnrollmentIndex(user, out *)` | users 0-3: `0x80070525` and -2 written; a null pointer or a user past them `0x80070057` |
+| `XamCacheOpenFile`, `CloseFile`, `Reset` | open: a null structure or a cache id other than 2 (at +4) `0x57`; id 2 is a partition the console has and holds no such file (2, the byte at +2 set to 0x40); close -1; reset of -1 is 0, of any other id 1 |
+| `XamXlfsInitializeUploadQueue`, `Uninitialize`, `MountUploadQueueInstance`, `UnmountUploadQueueInstance` | `0x80070005`, `0x80150005`, `0x80070006`, `0x80070006` (initialize's is read from the code's no-service branch: the console, started beside this one, faulted in its init path) |
+| `XCustomGetCurrentGamercard`, `GetLastActionPressEx`, `SetDynamicActions`, `UnregisterDynamicActions` | no gamercard selected (xuid 0, FALSE); no action pressed (outputs zeroed, `0xE8`); a set of more than three actions `0x57`, a clearing one 0, a real one `5` (no session); unregister returns nothing |
+| `NetDll_XNetConnect`, `XNetServerToInAddr`, `XNetUnregisterInAddr`, `XNetQosGetListenStats` | WSAEINVAL (10022), whatever the caller or address, started or not |
+| `NetDll_XNetGetConnectStatus` | 3 (XNET_CONNECT_STATUS_LOST) |
+| `NetDll_XNetQosLookup` | nothing to look up: 0, no result; secure addresses without their arrays: WSAEINVAL; else an XNQOS (count, none pending, each entry flagged complete) and the event set at once (the console probes; nothing answers offline) |
+| `NetDll_getpeername` | no such socket: SOCKET_ERROR (WSAENOTSOCK); not connected: WSAENOTCONN; else the peer's address, length 0x10 |
+
+Where it is not the console's: `LDICreateDecompression` does not call the
+caller's allocator (the context is in the caller's buffer, or the system heap
+when one was given); the event trace registry is kept host-side; the flag the
+console sets in a producer's block from the processor's mode is not set; the
+vibration level is the default whatever the user's setting; the XNQOS's
+entries say complete where the console's, in a network that answers, would
+say what the probe found; the `getpeername` error codes for a socket that is
+not there are Winsock's (the console's call went on to a routine whose error
+was not read).
+
+Also followed from the console, in the same round (the exports that were
+Xenia's guesses): `_snprintf` and `_vsnprintf` with no buffer format and
+answer the length (the count is not looked at; with a buffer and no room, -1,
+as before); `FscSetCacheElementCount(cache, count)` refuses a count past
+0x400 (invalid parameter); `StfsCreateDevice(parameters, size)` wants the
+0x58-byte structure with its version byte (+0x50) at 5 or more before it looks
+at anything else; `XeCryptBnQwNeRsaPubCrypt` computes with a key of one to five
+words (Xenia refuses under 512 bits; the larger ones follow Xenia, the console's
+own code stopping on state that is not built).
+
 ## `boot`
 
 `boot <game.iso> [--seconds N] [--steps N] [--content <dir>] [--interpret]
@@ -1430,6 +1780,44 @@ then the menu at 30 swaps a second, 6,349 swaps in 180 s. Its start was
 run 30 times beside other load (16 beside 12 busy processes, 8 beside two
 writers flushing to the hard disk the disc image is on, 6 under a game
 library's build): the first swap came at 2 to 11 s every time.
+
+### The profile (2026-11-11)
+
+`boot --profile N [--profile-from S] [--profile-thread <name | 0xstart>]`
+(`tools/sampler.cpp`, Windows) samples the process's threads and prints the
+shares by category, the N most sampled functions with their hottest
+offsets, and for one thread its callers and inclusive shares.
+
+- **What a sample is.** A thread that ran since the last sample is
+  suspended and counted once where it is, unless that is one of the
+  system's waits: a thread working in bursts between waits is found
+  waiting at nearly every sample, and (when samples weighed the cycles run
+  since the one before, as they did) its bursts' cycles read as the wait's
+  own cost, half of one game's CPU time. A thread on a processor at the
+  sample's instant is found as often as it runs, however short its bursts,
+  so the shares are of the samples of threads found running; the heading
+  gives the cycles spent in all and how many samples found a thread
+  waiting.
+- **The walk is guarded.** One thread's stacks are walked by the unwind
+  data, which reads through a frame register that holds anything after a
+  frame taken wrongly, and the fault ended the run as a crash: a handler
+  put before the process's own takes the walking thread back to where the
+  walk began.
+- **`XF_PROFILE_CHAINS=<name>[,<name>...]`** (with one thread): for each
+  function whose name holds one of them, the chains of six callers above
+  it by their samples. A flat profile's small system costs (a page's
+  protection, an allocation, a clock read) are found by who asks for them.
+  `XF_PROFILE_LINES=N` gives each function's N hottest source lines.
+
+Four games in their campaigns, all threads: game C 74.9 ms of CPU a swap
+(its own job scheduler's scan is the hottest generated function), game E
+39 to 53 ms (a critical section entered, tried or left 120,000 times a
+second; one thread spends a seventh of its time in the floating point
+slow path's `fesetround`, `feclearexcept` and `fetestexcept`: the C
+library's, where the control register alone would do; to change with the
+generated code's headers next), game H 34 ms (two threads of vector code;
+its render thread's wait for the vertical blank spins with the command
+processor idle: `XF_SPIN_IDLE=1`, kernel.cpp).
 
 ### Crash and stop reports
 
@@ -1537,6 +1925,15 @@ code. As built (`frontend/`):
   its alone: it presents on its own queue, so even a present that blocks
   for the display holds nothing of the renderer's. (A device whose
   graphics family has one queue shares it, under the queue's lock.)
+  The window presents only when there is something new to show: a fresh
+  picture, the overlay or a dialog of the system (and once more when they
+  close), or a window event that asks for it (shown, uncovered, resized,
+  moved to another display). A guest that stops swapping, as at a loading
+  screen, leaves the last picture on screen with no present, as Xenia's
+  presenter paints only on a guest output refresh or a paint request.
+  (Until 2026-11-08 it also presented the last picture again every 100 ms,
+  which a frame timer such as `xfbench` saw as a run of 101-102 ms gaps
+  where Xenia showed one long one; renderer.md, "Game D's gaps".)
 - **Input** ([input.md](input.md)): SDL3's gamepads (Xenia's SDL driver),
   then the keyboard as a controller (Xenia's keyboard driver, its
   bindings), the deadzones; the scripted presses on user 0.
@@ -1550,11 +1947,13 @@ code. As built (`frontend/`):
   by playing a little faster or slower (half a percent at most), primed
   with silence when it ran dry, and a frame is let go when a quarter second
   is queued. `audio.volume` and `audio.mute` are the device's gain.
-- **The overlay** (F1, Dear ImGui): the guest's swaps per second, the
+- **The F1 pages** (since 2026-11-09 F1 opens the guide, in its look, on its Settings page, with the pad as well
+  as the mouse and keyboard; a second F1 closes it and saves): Settings (volume, mute, vsync, smooth scaling,
+  fullscreen, the picture options, the port's options) and Debug (the guest's swaps per second, the
   frames presented and the window's refreshes per second, the sound frames
   played (and how many had sound), the input states delivered, each user's
-  controller (what drives it, its buttons, triggers and sticks), the
-  volume, mute, vsync, scaling, fullscreen, and a screenshot button. F11
+  controller (what drives it, its buttons, triggers and sticks), the frame-time graph, the native renderer's and
+  the hooks' counters, and a screenshot button). F11
   switches fullscreen; F12 saves the window's next picture (copied back
   from the GPU) as `<title>_<swap>_key<n>.png` in `player.screenshots`
   (default: a `screenshots` folder beside config.toml, never the
@@ -1563,17 +1962,89 @@ code. As built (`frontend/`):
   overlay shows which and what was skipped.
 - **config.toml** (`settings.cpp`; `--config`, else SDL's preference folder,
   `%APPDATA%\xenoforge\config.toml` on Windows), written with the defaults
-  the first time and saved when the overlay closes:
+  the first time and saved when the F1 pages close:
 
   ```toml
-  [video]    # fullscreen, vsync (true), smooth (true), aspect ("auto" or "stretch")
+  [video]    # fullscreen, vsync (true), smooth (true), aspect ("auto", "integer" or "stretch"), and the
+             # picture options below: resolution_scale (100), min_scalable (16), upscaler ("none"),
+             # fsr_sharpness (0.2), cas_sharpness (0), antialiasing ("none"), anisotropy (0),
+             # texture_filter ("game"), edram ("fast" or "exact"), frame_graph (false),
+             # performance (false)
   [audio]    # volume (0-100), mute
   [input]    # keyboard (true), keyboard_user (0), left_deadzone, right_deadzone (0-1), vibration (true)
   [keyboard] # each pad control's keys (input.md)
   [player]   # screenshots: the folder F12 writes to
   [launcher] # games: the folder the launcher lists
-  [games.4D5307E6.video] # a game's own settings (the launcher's), any of the four sections above
+  [games.5846000A.video] # a game's own settings (the launcher's), any of the four sections above
   ```
+
+### Picture options (2026-11-08)
+
+What players expect from modern emulators (RPCS3, Xenia, Dolphin), beyond
+the console and never changing what the game computes: everything the CPU
+reads stays at the console's size. All of them are in config.toml's
+`[video]` (shared and per game), the launcher's Video tab (Display,
+Rendering, Overlay) and the player's System page (the F1 overlay's
+"Picture" section and the guide's System page, in the guide's look),
+from one table of choices (`settings.h`'s `video_choices`):
+- **Resolution scale** (`resolution_scale`, 50-800% in steps of 25, RPCS3's
+  model) and **minimum scalable dimension** (`min_scalable`, console
+  pixels, RPCS3's): the renderer's `Options::resolution_scale` and
+  `min_scalable` (docs/renderer.md, "Resolution scale"). Taken when the
+  title starts: the pages say "restart the title" and offer it. Where the
+  renderer draws at another scale than asked (the interlock path takes
+  multiples of 50%; a GPU without room for EDRAM at the scale), the F1
+  overlay and the guide show its notice and the player prints it.
+- **Output scaling** (`upscaler`, RPCS3's separate "output scaling"): a
+  plain blit (`smooth` picks linear or nearest), AMD FSR 1 (EASU in passes
+  of at most 2x, then RCAS with `fsr_sharpness` stops of sharpness
+  reduction) or AMD CAS (sharpening, resampling to the window's size, with
+  `cas_sharpness`), as Xenia's presenter offers them (its
+  guest_output_ffx_* shaders, ported to compute in
+  `frontend/present_effects.comp`; AMD's FidelityFX headers, MIT, in
+  `third_party/FidelityFX-*`). FSR asked for where the window is no larger
+  than the picture takes CAS, as Xenia's does. **Antialiasing**
+  (`antialiasing`): FXAA 3.11 at Xenia's two presets (NVIDIA's header,
+  BSD, `third_party/fxaa`), with green as luma (Xenia puts luma in the
+  alpha in its gamma pass). The effects run on the window's thread into
+  images of the destination rectangle's size, then a 1:1 blit; live.
+- **Picture shape** (`aspect`): fitted, whole multiples (integer scaling;
+  fitted where not even 1x fits), or stretched; live.
+- **Render targets** (`edram`, as the game starts): `fast`, the default,
+  draws into host render targets (Xenia's default; game D's played drive:
+  8.1 ms of GPU a frame); `exact` has the pixel shaders read and write
+  EDRAM themselves under fragment shader interlock (blending, the float
+  formats, 20e4 depth and the stencil as the console's; 10.6 ms), host
+  render targets where the device lacks it. The player's choice only:
+  boot, the replays and the tests keep the renderer's own default (exact
+  where the device can), and `XF_RENDER_TARGET_PATH` forces either.
+- **Texture filtering** (`anisotropy`: the game's, or 1-16x forced;
+  `texture_filter`: the game's, trilinear, nearest): live, through
+  `Renderer::set_texture_filtering` (the samplers made as draws ask). The
+  anisotropy and trilinear apply where Xenia's `anisotropic_override` does:
+  mipmapped textures (not a base map alone) the game filters linearly;
+  nearest is everywhere (a look, not a fix).
+- **Performance display** (`performance`, off; F3 switches it while
+  playing, and the launcher's and the guide's Picture settings): over the
+  picture's top left corner, the game's frames a second (its swaps), the
+  average and worst time between the frames the window showed with their
+  graph (the last 240), the frames shown a second, the command processor's
+  work a frame without its waits (`gpu::Counts::run_ns`) and the draws a
+  frame. Drawn with the window's pictures, and once a second when none is
+  new.
+- **Frame-time graph** (`frame_graph`): the Debug page plots the intervals
+  between the frames the window showed (the last 240), with the average and
+  the worst.
+
+Considered and left out: a frame-rate unlock or a vblank rate above the
+console's. The guest's frame pacing is its own (its vblank interrupt,
+`VdSwap`, the scheduler's clock): raising the vblank rate makes most games
+run their logic faster (physics and timers counted in vblanks), so it is
+not safe as a general option; a game's port can do it where the game
+measures time (docs/sdk.md). Vsync is the window's only (the guest never
+waits for the display). Not done yet, cheap and asked of emulators:
+a pixel shader of the player's own after the picture (CRT filters), an
+HDR output; and per-game "unlock" presets belong in ports.
 
 For checks without a person at the screen: `--quit-after <seconds>`
 ends the run with a report (the swaps, the front buffers taken on the GPU
@@ -1583,7 +2054,8 @@ with sound, dropped and starved, then boot's report); `--screenshots <dir>`
 writes every `--screenshot-every N` swaps' front buffer (300 by default)
 as `<title>_<swap>.png` (the renderer's read-back, boot's `--shots`
 picture) and the window's picture of the same swap beside it as
-`<title>_<swap>_window.png`, printing the time on the scheduler's clock
+`<title>_<swap>_window.png` (the converted picture, before the output scaling and antialiasing: to see
+those use `--window-shots`, which copies back the swapchain's image), printing the time on the scheduler's clock
 each came at, which is the clock `--press` takes (or `--press
 start@#1100`, at a swap); `--overlay` opens the overlay from the start;
 `--no-sound` keeps the pacing output alone; `--rates` prints a line a
@@ -1648,6 +2120,96 @@ logs in `../traces/player/`):
   are checked here), that the sound is heard and sounds right, how the
   window feels resized, fullscreen and with vsync off.
 
+## The player's system UI
+
+Plan step 7 (2026-11-08), the player's side of the dialogs `xam_ui.cpp` hands to a host (`set_ui_handler`,
+"XAM"). Xenia draws a message box, the keyboard, the device selector and sign-in and cancels or stubs the rest;
+here every page the kernel asks for is shown, driven by the pad and the keyboard, and answered through `UiDone` in the
+kernel's own result shapes. The logic is apart from the view:
+
+- **`frontend/system_ui.*`** (the model, no ImGui, in `xf_frontend`): `SystemUi::handle` is the `UiHandler`. It
+  queues each request (from any guest thread), makes it a `Dialog` (title, paragraphs, choices, selection) and, when
+  the window's thread navigates (`Nav`: up, down, left, right, accept, cancel, page up and down), answers it:
+  message box = the button (B: cancelled, the kernel's ERROR_CANCELLED), keyboard = the text cut to its room in
+  characters (UTF-16 for the guest; the OK/Cancel choices), device selector = the hard drive (device 1) or cancel,
+  sign-in = sign in as the profile or cancel (the title's follow-up runs only on the first), gamer card and
+  achievements from the profile (`kernel::profile_summary`: the user's GPD for the running title, read on the guest's
+  thread that asked), and the pages an offline console shows with nothing to list: friends, players, messages, quick
+  chat, game invite, friend request, player review, message compose (both), the custom player list, the
+  marketplace ("not available"), profile editing. An unknown request (`UiKind::Other`) is declined: the kernel's
+  headless default stands. `PadNavigator` turns the pad's state into navigation (press once; a direction repeats after
+  400 ms, every 100 ms; the left stick counts). `toast()` takes the kernel's toasts (`set_toast_handler`: an
+  unlocked achievement with its icon, and `XNotifyQueueUI`'s text); they live five seconds.
+- **`frontend/system_ui_view.*`** (ImGui draw lists, in the player): the top dialog as a lit panel over the dimmed
+  game, easing in (title under XenoForge's mark or the message's icon, a green rule, the text, the choices stacked as
+  items with the focused one lit green, the controller's A and B in the footer), the toasts as capsules rising at the
+  bottom centre (the mark at the left, the achievement's picture at the right), the achievements as rows
+  (`draw_achievement_row`: picture, name, description, a gamerscore pill). The PNG icons become textures on first use
+  (`IconCache`: stb_image, a staging buffer and one copy on the shared device). A click on a choice accepts it; Enter
+  in the keyboard's text field is the field's own.
+- **The look** (`frontend/guide_theme.*`, 2026-11-08, the owner's request): an original look in the spirit of the
+  console's dashboard of its time, nothing of the console maker's art, fonts or marks. Inter (the launcher's copy in
+  `ui/fonts` beside the executable or above it; ImGui's own font without it) at sizes made for the window's height at
+  start; panels with a soft shadow and a top-lit gradient, items lit green when focused, A/B/X/Y as coloured discs,
+  XenoForge's mark drawn as vectors (the ring of light and the anvil, `assets/branding`). `push_widgets` gives ImGui's
+  own widgets the same look inside the guide.
+- **The windows' icons** (`frontend/window_icon.*`): the launcher's windows carry XenoForge's mark (built in from
+  `assets/branding/xenoforge-256.png` by `cmake/embed_bytes.cmake`); the player's window carries the running game's
+  own image and name from its executable's XDBF (`title_icon`, `title_name`), the mark when it has none. The
+  executables' icon on Windows is `frontend/xenoforge.rc` (`assets/branding/xenoforge.ico`), when CMake finds a
+  resource compiler (llvm-rc beside clang).
+- **The guide** (F2, the controller's Guide button, or Back and Start held together for half a second: Windows' Game
+  Bar often takes the Guide button): the console pages as a panel sliding in from the left, the profile on top (the
+  mark, the gamertag, the title's gamerscore), three pages switched by LB/RB, Page Up/Down or the mouse:
+  Achievements (the rows above), Profile and System (a setting's name at the left, its control at the right, green
+  section captions). While it is open the title gets neutral controller states and no keyboard, as with a dialog;
+  ImGui's own pad and keyboard navigation drives it; B or Escape closes it and saves config.toml if anything changed.
+  A dialog the title opens closes it. `--ui-demo guide`, `guide-profile`, `guide-system`, `guide-settings`, `guide-debug` open it at the start.
+- **The game stays in charge of its own time.** While a dialog is up the player gives the title neutral controller
+  states and no keyboard (`Controllers::set_taken`; the console's guide takes the controller from the title), and
+  `XamIsUIActive` answers 1 until the answer; the guest's threads, the sound and the scheduler's clock keep running
+  (nothing waits for the window; a title that opened a dialog with no overlapped waits on its own thread only).
+- **The guide's console pages** (`frontend/overlay_system.*`; F1 adds Settings and Debug to them, `Host::extra_pages`): System (language, country, resolution,
+  aspect, refresh), Profile (the gamertag with its rules, the profiles with Use and Delete, a new profile, the saves'
+  format) and the title's achievements, read only. The same choices are the launcher's System and Profile tabs
+  (`console_options.*`, `profiles.*`): one list of languages (XLanguage), countries (XOnlineCountry) and video modes
+  and one validation (`valid_gamertag`: 1 to 15 letters, digits and single spaces, starting with a letter, no space at
+  the end; `clamp_system` puts values the kernel would not know back to its default). In the player the system
+  settings go to the kernel at once (`apply_system_settings`: xconfig.bin) but a running title reads them at its start,
+  so the page says so and offers "Restart the title"; the gamertag (`set_gamertag`) and the saves' format
+  (`set_content_format`) apply live; choosing or deleting a profile needs the restart.
+- **Profiles** are directories of the storage root, `content/<XUID>/` with the package
+  `FFFE07D1/00010000/<XUID>` (where the kernel keeps the GPDs); the gamertags are config.toml's `[profile.names]`,
+  the one the games use `[profile] xuid` (else the first the storage has, as the kernel picks) and `gamertag`. Creating
+  one makes a new offline XUID (0xE03...) and its directory; deleting removes the directory with its saves (asked
+  twice, never the only profile). The launcher's Profile tab also lists the selected game's achievements from the
+  profile's GPD file (`read_gpd_achievements`, no kernel running).
+- **config.toml**: `[saves] format` = `"stfs"` (default) or `"directory"` (Xenia's layout; `--directory-saves`),
+  `[saves] root` (the storage root; by default `storage/` beside config.toml, where the player used to use a temporary
+  directory), `[profile]` as above, `[player] follow_launches` (default true). Per-game tables may override `[saves]`,
+  `[profile]` and `[system]` as they do the other sections.
+- **A title that launches another** (`XamLoaderLaunchTitle`; `Kernel::title_exit`): when the executable is on the same
+  disc (`game::disc_path`) and `follow_launches` is on, the player starts a process of its own for it (SDL3's
+  `SDL_CreateProcess`, `game::relaunch_args`: the same command line with `--xex`, `--launch-data` and what is left of
+  `--quit-after`), hides its window and waits for it, then exits with its code, as `boot --follow-launches` does; the
+  launch data the title left goes through a file (`--launch-data`). A launch to the dashboard or to another disc ends
+  the run. What decides the next title is `disc_path` and how it is started is the caller's, so a host that runs the
+  game in the launcher's process (Android) can start it its own way.
+- **For checks without a person**: `--ui-demo message,keyboard,device,signin,achievements,gamercard,friends,
+  messages,players,quickchat,gameinvite,friendrequest,playerreview,compose,customcompose,playerlist,marketplace,
+  editprofile,toast,console` opens a sample of each at the start (`console` opens the overlay's console section;
+  answered by `--press a@5`, `b@5`...; the player prints each answer, `ui-demo: <name> answered: ...`, and every
+  dialog a title opens, `ui: dialog kind N ... opened at S s`). `--window-shots <dir> [--window-shot-every S]` saves
+  the window itself with the dialogs and the overlay over the picture (`--screenshots` saves the picture without
+  them; the presenter's `capture_window_next`). `--restart-after S` presses the overlay's "Restart the title" at S
+  seconds. `--no-system-ui` leaves every dialog to the kernel's default. `tests/system_ui_test.cpp`
+  drives the model, the kernel's exports through the handler, the pad's repeat, the toasts, the profile store and the
+  settings, and the relaunch's arguments.
+- **Left for a person**: the dialogs' look and feel with a real pad and the mouse; the keyboard dialog's text field
+  with a physical keyboard (a pad alone cannot type: it accepts the default text); that a dialog the title raises
+  mid-game takes the pad without a stray press reaching the game on the frame it opens; the launcher's System and
+  Profile tabs with the mouse and the pad; the title restart the overlay offers.
+
 ## The launcher
 
 Plan track C2 (2026-11-05, a first one), after the 3DS runtime's
@@ -1666,6 +2228,18 @@ launcher [--config <file>] [--games <folder>] [--list] [--select N] [--screen <p
     [--demo-speed X] [--show-log] [--capture-binding <name>] [--menu <name>] [--context-menu] [--tab <name>]
     [--render-size WxH] [--scale F] [--assets <dir>]
 ```
+
+### Start-up
+
+The window is created hidden and shown once its first picture has been presented, so it never opens black. What
+runs before that (`launcher --startup-times` prints each step, in milliseconds since the program began): SDL's
+video, the window, the Vulkan device (the interface's 26 pipelines compile against a pipeline cache kept in
+`ui_pipelines.bin` beside config.toml, which took the step from about 600 ms to about 190 ms), the swapchain (the
+slowest single step, about 230 ms, made on another thread while the fonts and the document load) and the first
+frame. The controllers' subsystem (a quarter of a second of drivers) starts after the first picture; the pads
+already connected arrive as events. On the development machine, a warm start reaches its first presented frame
+at about 0.58 s (it was 1.65 s). The library scan was already on its own thread, and the games' pictures are
+read by it, not by the first frame.
 
 ### The launcher's interface (`frontend/ui`, `launcher_view.*`, `settings_view.*`)
 
@@ -1793,7 +2367,8 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   gives it the document each time it is made again; the keys, the pad and
   the mouse reach it as LauncherView's input does, and `LauncherView`'s own
   click handler leaves what is inside `#spage` and `#popup-layer` to it).
-  Tabs Video, Sound, Controllers, Keyboard, Interface, which are the
+  Tabs Video, Sound, Controllers, Keyboard, System, Profile (see "The player's
+  system UI"), Interface, which are the
   toolbar's buttons; under them, whose settings these are and the "Custom
   settings for <game>" check box; rows like the games' (check boxes,
   sliders and dropdowns in groups, the one with focus in the selected row's
@@ -2112,12 +2687,16 @@ Windows' own DLLs (KERNEL32, ADVAPI32, ntdll, ole32, OLEAUT32, SHELL32,
 VERSION): the LLVM release links its C runtime statically. Apache 2.0 with
 LLVM's exception, redistributable. The search (`find_toolchain`):
 `--toolchain`, `XF_TOOLCHAIN`, `toolchain/bin` beside the executable (the
-bundle), an installed LLVM (`%ProgramFiles%\LLVM\bin`), the PATH.
+bundle), an installed LLVM (`%ProgramFiles%\LLVM\bin`), the PATH. The
+package puts them there (`cmake/package.cmake`, `XF_PACKAGE_TOOLCHAIN`, on:
+the clang and lld beside the compiler that built XenoForge, with LLVM's
+license in `toolchain/LICENSE-llvm.txt`); without them a machine with no
+LLVM runs games interpreted only.
 
 **The build** (`prepare_game`): the disc's executables read (all XEX2 files
 but title updates and the system update's), `default.xex`'s image digest
 taken; discovery and emission in process (`recomp::emit_modules`, what
-`xfrecomp emit` writes) into `<cache>/work/<digest>-<version>/src`, the
+`xfrecomp emit` writes) into `<cache>/work/<digest>/src`, the
 headers and the library's entry (`xf_library_entry.cpp`) beside them; each
 file compiled by its own clang process (`-std=c++20 -O2 -g0 -w -mfma
 -mavx2 -fno-math-errno -nostdinc -nostdinc++ -DXF_GAME_LIBRARY`, the
@@ -2128,11 +2707,29 @@ first, at below-normal priority with only its log inherited; then
 `lld-link /dll /noentry /nodefaultlib /opt:ref /Brepro` through a response
 file (`ld.lld -shared --eh-frame-hdr --gc-sections` on Linux).
 The library goes to `<cache>/<digest>-<version>.dll`, replacing any other
-version's for that digest, and the work directory is removed (`keep_work`
-keeps it). Progress is reported per module (discovery), per file (emission
-and compiling) and for the link, always from the caller's thread; the
-cancel flag ends the compilers under way. A stopped build goes on from the
-objects it left (an object newer than its source is not compiled again).
+version's for that digest. Progress is reported per module (discovery), per
+file (emission and compiling) and for the link, always from the caller's
+thread; the cancel flag ends the compilers under way.
+
+**The objects are kept** (`BuildOptions::keep_objects`, on by default,
+2026-11-09): after a build the work directory keeps `obj/` and
+`objects.key` (game D: 284 objects, about 185 MB) and loses the emitted
+code, which the next build writes again (`keep_work` keeps that too,
+`--keep`). Beside each object, `<file>.source` holds a key of the text it
+was compiled from, so an object is reused whenever its source's text is
+the same, however the source was written; a stopped build goes on the same
+way. The work directory is the disc's, not the version's: another
+XenoForge's build of the same disc (or a rebuild for the entry log)
+recompiles only the files whose text changed. `objects.key` is a key of the
+headers' code (`code_of`: comments, blank lines and the spaces around lines
+left out, so editing a header's comments keeps the objects; no
+generated-code header uses `__LINE__`), the flags and the compiler (clang's
+size and time); one that differs discards every object. The interface
+version is in the entry's text, so the entry alone is recompiled when only
+the version moved (a recompiler change that leaves the headers' code
+alone, or a comment edited). A change to the generated code's own
+semantics (an inline header's code) still recompiles everything, as it
+must: every function's code changes.
 The CPU must have AVX2 and FMA (checked first, `cpu_supported`).
 `find_cached(cache, digest)` finds `<digest>-<this version>.dll`.
 

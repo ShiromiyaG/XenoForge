@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <string>
 #include <variant>
 #include <vector>
@@ -38,7 +39,38 @@ struct Settings {
         bool fullscreen = false;
         bool vsync = true;           // the window waits for the display (the guest never does)
         bool smooth = true;          // scaled with linear filtering, else nearest
-        std::string aspect = "auto"; // "auto" (the front buffer's own shape, letterboxed) or "stretch"
+        // "auto" (the front buffer's own shape, letterboxed), "integer" (the largest whole multiple of it that fits,
+        // centered) or "stretch"
+        std::string aspect = "auto";
+        // The picture options beyond the console (docs/renderer.md, "Resolution scale"; docs/runtime.md, "Picture
+        // options"). They never change what the game computes: what the CPU reads back stays at the console's size.
+        // The internal resolution in percent of the console's, 50-800 in steps of 25 (RPCS3's resolution scale);
+        // taken when the title starts.
+        int resolution_scale = 100;
+        // render targets, resolves and textures narrower or shorter than this many console pixels stay at the
+        // console's size (RPCS3's minimum scalable dimension); taken when the title starts
+        int min_scalable = 16;
+        // The window's output scaling, apart from the internal resolution (RPCS3's "output scaling"): "none" (a
+        // blit, linear or nearest by `smooth`), "fsr" (AMD FSR 1: EASU, then RCAS) or "cas" (AMD CAS, sharpening
+        // and resampling), as Xenia's presenter offers them; live.
+        std::string upscaler = "none";
+        double fsr_sharpness = 0.2; // RCAS's sharpness reduction in stops, 0-2 (Xenia's default)
+        double cas_sharpness = 0.0; // CAS's additional sharpness, 0-1 (Xenia's default)
+        std::string antialiasing = "none"; // "none", "fxaa" or "fxaa_extreme", on the picture before scaling; live
+        // Texture filtering, live: anisotropic filtering forced (0 the game's, else 1, 2, 4, 8 or 16) on mipmapped
+        // textures the game filters linearly (Xenia's anisotropic_override rule), and "game", "trilinear" (linear
+        // between mips where the game filters each one linearly) or "nearest" (everything point sampled)
+        int anisotropy = 0;
+        std::string texture_filter = "game";
+        // How the console's render target memory (EDRAM) is drawn into, as the game starts: "fast" (host render
+        // targets, Xenia's default: less GPU time a frame) or "exact" (the pixel shaders read and write EDRAM
+        // themselves: blending, float formats, depth and stencil as the console's, where the device has fragment
+        // shader interlock; host render targets where it has not)
+        std::string edram = "fast";
+        bool frame_graph = false; // the frame-time graph in the F1 overlay
+        // the performance display over the picture (F3 switches it): the game's frames a second, the frame
+        // times with their graph, the command processor's work a frame and the draws
+        bool performance = false;
     } video;
     struct {
         int volume = 100; // percent
@@ -54,6 +86,32 @@ struct Settings {
         double left_deadzone = 0, right_deadzone = 0; // 0-1 of the stick's range (Xenia's *_deadzone_percentage)
         bool vibration = true;
     } input;
+    // the console's own settings the games read, in config.toml's [system]: the
+    // user's language (XLanguage: 1 English, 2 Japanese, 3 German, 4 French,
+    // 5 Spanish, 6 Italian, ...) and country code, the screen size, widescreen
+    // and the refresh rate (50 or 60); 0, -1 and "" leave the console's defaults
+    struct System {
+        int language = 0;
+        int country = -1;
+        int width = 0, height = 0;
+        int widescreen = -1;
+        int refresh = 0;
+    } system;
+    // how new saves are kept, in [saves]: "stfs" (the console's own packages, the default) or "directory" (Xenia's
+    // layout: a folder of files)
+    struct Saves {
+        std::string format = "stfs";
+        std::string root; // the storage root (content/, cache*/): "" for storage/ beside config.toml
+    } saves;
+    // the profiles, in [profile]: the one the games use (its XUID as 16 hex digits, "" for the first the storage has)
+    // and its gamertag ("" for the default), and every profile's gamertag by XUID in [profile.names]
+    struct Profile {
+        std::string gamertag, xuid;
+        std::map<std::string, std::string> names;
+    } profile;
+    // [player]: when a title launches another (XamLoaderLaunchTitle), the player restarts on the executable it
+    // launched, from the same disc, as boot's --follow-launches does
+    bool follow_launches = true;
     // the port's options (run.h's PortOption) by key, in config.toml's [port]
     std::map<std::string, std::variant<bool, int64_t, double>> port;
     // each binding's keys, space-separated (BINDINGS' names)
@@ -74,12 +132,34 @@ struct Settings {
         int x = 0, y = 0, width = 0, height = 0;
         bool maximized = false;
     } launcher;
-    // the title ID ("4D5307E6") whose own settings these are, or "" for the
+    // the title ID ("5846000A") whose own settings these are, or "" for the
     // shared ones: where save() writes them
     std::string game;
+    // The settings as load() read them (or save() last wrote them): save() writes into the file only the fields
+    // that differ from this, over the file as it is then, so what another process (the launcher, a player) saved
+    // meanwhile survives. Null for settings never loaded: all of them are written.
+    mutable std::shared_ptr<const Settings> loaded;
 
     Settings(); // Xenia's default bindings
 };
+
+// A resolution scale in percent made one the renderer draws at: the nearest step of 25 within 50-800.
+int clamp_resolution_scale(int percent);
+// The video section's values made valid (choices not known go back to their defaults, numbers into their ranges).
+void clamp_video(Settings &settings);
+
+// The video section's choices, shared by the launcher's Video tab and the player's overlay and guide: for a key
+// ("video.resolution_scale", "video.min_scalable", "video.upscaler", "video.antialiasing", "video.anisotropy",
+// "video.texture_filter", "video.aspect") its values (as text) and their labels, the current value as text, and a
+// value set (false for a key or value not known). Empty for other keys.
+struct VideoChoice {
+    std::string value, label;
+};
+std::vector<VideoChoice> video_choices(const std::string &key);
+std::string video_value(const Settings &settings, const std::string &key);
+bool set_video_value(Settings &settings, const std::string &key, const std::string &value);
+// the video keys a running title takes only when it starts again
+bool video_needs_restart(const std::string &key);
 
 // SDL's preference folder's xenoforge\config.toml
 std::filesystem::path default_path();

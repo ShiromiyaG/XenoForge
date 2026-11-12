@@ -165,8 +165,11 @@ private:
     }
     Id load_storage(const Operand &o) {
         if (o.source == StorageSource::Register) return load(vec4_, register_pointer(o.index, o.addressing));
+        // (the microcode's ALU operands are registers or float constants by
+        // their source select bit, all ucode_parse makes of them; the fetch
+        // constants are the fetches' operands only, as in Xenia's parser)
         if (o.source != StorageSource::ConstantFloat) {
-            unsupported("an ALU operand from a fetch constant");
+            unsupported("an ALU operand neither a register nor a float constant");
             return zero4_;
         }
         if (o.addressing == StorageAddressing::Absolute) {
@@ -233,6 +236,10 @@ private:
     enum class Query { Sample, Lod, Weights };
     Id sample_texture(const TextureFetchInstruction &t, Id coordinates, uint32_t member = 2, Query query = Query::Sample);
     Id texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample);
+    Id fetch_post(uint32_t used, bool point_allowed, Id sample, Id signed_sample, Id info, Id scale_word);
+    void emit_fetch_posts();
+    std::map<uint32_t, Id> fetch_posts_; // texture_signs' functions by components kept and point sampling
+    static bool allows_point_sampling(const TextureFetchInstruction &t);
     Id pwl_gamma_to_linear(Id gamma);
     Id slot_word(uint32_t member, uint32_t slot);
     Id swap_endian(Id word, Id endian);
@@ -280,6 +287,7 @@ private:
     // the texture LOD and gradients the setters leave for later fetches
     Id tfetch_lod_ = 0, gradient_h_ = 0, gradient_v_ = 0;
     Id signed_sample_ = 0; // a fetch's sample from the texture's signed view
+    Id fetch_scaled_ = 0;  // a fetch's result through its number format (texture_signs)
     Id body_ = 0;
     bool ended_ = false; // the straight control flow has returned
     // memexport: which eM# the shader writes; per control flow instruction,
@@ -366,10 +374,18 @@ void Translator::declare() {
         // diameter's bounds), the color targets' scales and the point
         // constants (renderer.cpp's System, point_list.geom), then per fetch
         // slot its texture's signs and the signed view's image and sampler,
-        // then the user clip planes enabled, packed (VertexOptions)
+        // then the user clip planes enabled, packed (VertexOptions), then the
+        // screen extents' map from the host's NDC to console pixels (x scale
+        // and offset, y scale and offset) and the report's first word
+        // (VertexOptions::extents), then per fetch slot its texture's integer
+        // scale word (texture::integer_scale_bits, Xenia's GetIntegerScaleBits),
+        // then per color target the factors a minimum or maximum blend's
+        // source is multiplied by here (PixelOptions::blend_premultiply) and
+        // the blend constant
         Id slot_table = m_.type_array(uvec4_, 8, 16);
         const Id system_members[] = {vec4_, vec4_, slot_table, uvec4_,     vec4_,
-                                     vec4_, vec4_, slot_table, slot_table, m_.type_array(vec4_, 6, 16)};
+                                     vec4_, vec4_, slot_table, slot_table, m_.type_array(vec4_, 6, 16),
+                                     vec4_, uvec4_, slot_table, uvec4_, vec4_};
         Id system_block = m_.type_struct(system_members);
         m_.decorate(system_block, spv::Decoration::Block);
         m_.member_decorate(system_block, 0, spv::Decoration::Offset, {0});
@@ -382,6 +398,11 @@ void Translator::declare() {
         m_.member_decorate(system_block, 7, spv::Decoration::Offset, {224});
         m_.member_decorate(system_block, 8, spv::Decoration::Offset, {352});
         m_.member_decorate(system_block, 9, spv::Decoration::Offset, {480});
+        m_.member_decorate(system_block, 10, spv::Decoration::Offset, {576});
+        m_.member_decorate(system_block, 11, spv::Decoration::Offset, {592});
+        m_.member_decorate(system_block, 12, spv::Decoration::Offset, {608});
+        m_.member_decorate(system_block, 13, spv::Decoration::Offset, {736});
+        m_.member_decorate(system_block, 14, spv::Decoration::Offset, {752});
         system_ = global(system_block, spv::StorageClass::Uniform, "system");
         m_.decorate(system_, spv::Decoration::DescriptorSet, {0});
         m_.decorate(system_, spv::Decoration::Binding, {2});
@@ -414,6 +435,7 @@ void Translator::declare() {
     gradient_h_ = global(vec4_, spv::StorageClass::Private, "gradient_h");
     gradient_v_ = global(vec4_, spv::StorageClass::Private, "gradient_v");
     signed_sample_ = global(vec4_, spv::StorageClass::Private, "signed_sample");
+    fetch_scaled_ = global(vec4_, spv::StorageClass::Private, "fetch_scaled");
 }
 
 void Translator::reset_state() {
@@ -1343,55 +1365,193 @@ Id Translator::slot_word(uint32_t member, uint32_t slot) {
                   slot & 3});
 }
 
-// The fetch constant's signs on the sampled components, as Xenia's
-// ProcessTextureFetchInstruction applies them (spirv_shader_translator_
-// fetch.cc), by the renderer's per-slot word (system member 7): two bits per
-// result component, already through the constant's swizzle (Xenia's
-// SwizzleSigns), and four bits more for a biased component's width less
-// one. Unsigned as sampled; signed from the texture's signed view (member 8,
-// sampled only when a component asks for it and there is one; else the
-// sample as it is, which float formats already give signed); biased as
-// signed offset binary, (n - 2^(w-1)) / (2^(w-1) - 1) for a width known,
-// else 2u - 1, no lower than -1; gamma back to linear through the piecewise
+// The fetch constant's signs on the sampled components, then its number
+// format, as Xenia's ProcessTextureFetchInstruction applies them
+// (spirv_shader_translator_fetch.cc), by two per-slot words of the
+// renderer's: the signs (system member 7: two bits per result component,
+// already through the constant's swizzle, Xenia's SwizzleSigns) and the
+// integer scale word (member 12: texture::integer_scale_bits, Xenia's
+// GetIntegerScaleBits: per component six bits, the width less one and the
+// sign; bit 24 a fixed-point format read as fractions; bit 26 the constant
+// filters by point).
+// The signs: unsigned as sampled; signed from the texture's signed view
+// (member 8, sampled only when a component asks for it and there is one;
+// else the sample as it is, which float formats already give signed);
+// biased as signed offset binary, (n - 2^(w-1)) / (2^(w-1) - 1) for a width
+// known, else 2u - 1, unclamped; gamma back to linear through the piecewise
 // linear curve.
+// The number format, where the word has more than bit 26 (fixed-point
+// formats; behind a uniform branch, as Xenia's): read as fractions, a
+// point-sampled fetch's 4 to 6 bit unsigned components rebuilt as the
+// console expands them (the texel n as n (2^w + 1) / 2^2w, its bits
+// repeated), the unsigned ones rounded to 16 fractional bits (half to even:
+// the console's filtered values are Q16, and games compare them with Q16
+// constants), the biased ones no lower than -1; read as integers, each
+// component times 2^w - 1 (unsigned) or 2^(w-1) - 1 (signed, biased; a
+// 1-bit biased one times a half less a half), rounded when the fetch and the
+// constant both sample by point.
+//
+// The signs and the number format are one function of the module's for each
+// set of components kept and point sampling allowed, called by each fetch
+// (fetch_post): the drivers compile them once, not once a fetch (inlined at
+// every fetch, they were a third of the pipelines' compile time).
 Id Translator::texture_signs(const TextureFetchInstruction &t, Id coordinates, Id sample) {
     const uint32_t slot = t.operands[1].index;
-    Id info = slot_word(7, slot), signed_entry = slot_word(8, slot);
-    auto field = [&](uint32_t offset, uint32_t count) {
-        return m_.op(Op::OpBitFieldUExtract, uint_, {info, u(offset), u(count)});
-    };
-    Id signs[4], any_signed = m_.const_bool(false);
-    for (uint32_t k = 0; k < 4; k++) {
-        signs[k] = field(2 * k, 2);
-        any_signed = m_.op(Op::OpLogicalOr, bool_, {any_signed, m_.op(Op::OpIEqual, bool_, {signs[k], u(1)})});
-    }
+    Id info = slot_word(7, slot), signed_entry = slot_word(8, slot), scale_word = slot_word(12, slot);
+    // only the components the instruction keeps (Xenia's
+    // GetNonZeroResultComponents); the others go nowhere
+    const uint32_t used = t.non_zero_result_components();
+    if (!used) return sample;
+    Id any_signed = m_.const_bool(false);
+    for (uint32_t k = 0; k < 4; k++)
+        if (used & (1u << k))
+            any_signed = m_.op(Op::OpLogicalOr, bool_,
+                               {any_signed, m_.op(Op::OpIEqual, bool_,
+                                                  {m_.op(Op::OpBitFieldUExtract, uint_, {info, u(2 * k), u(2)}), u(1)})});
     store(signed_sample_, sample);
     when(m_.op(Op::OpLogicalAnd, bool_, {any_signed, m_.op(Op::OpINotEqual, bool_, {signed_entry, u(0)})}), [&] {
         store(signed_sample_, sample_texture(t, coordinates, 8));
         return false;
     });
     Id signed_sample = load(vec4_, signed_sample_);
-    Id out[4];
-    for (uint32_t k = 0; k < 4; k++) {
-        Id value = comp(sample, k);
-        Id width_less_one = field(8 + 4 * k, 4);
-        Id half = m_.op(Op::OpConvertUToF, float_, {m_.op(Op::OpShiftLeftLogical, uint_, {u(1), width_less_one})});
-        Id offset_binary = exact(
-            Op::OpFDiv, float_,
-            {exact(Op::OpFSub, float_,
-                   {exact(Op::OpFMul, float_,
-                          {value, exact(Op::OpFSub, float_, {exact(Op::OpFMul, float_, {half, f(2)}), f(1)})}),
-                    half}),
-             exact(Op::OpFSub, float_, {half, f(1)})});
-        Id twice_less_one = exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {value, f(2)}), f(-1)});
-        Id biased = select(float_, m_.op(Op::OpINotEqual, bool_, {width_less_one, u(0)}), offset_binary, twice_less_one);
-        biased = glsl(GLSLstd450NMax, float_, {biased, f(-1)});
-        auto is = [&](uint32_t sign) { return m_.op(Op::OpIEqual, bool_, {signs[k], u(sign)}); };
-        Id r = select(float_, is(3), pwl_gamma_to_linear(value), value);
-        r = select(float_, is(2), biased, r);
-        out[k] = select(float_, is(1), comp(signed_sample, k), r);
+    const uint32_t key = used | (allows_point_sampling(t) ? 16u : 0u);
+    auto it = fetch_posts_.find(key);
+    if (it == fetch_posts_.end()) it = fetch_posts_.emplace(key, m_.id()).first;
+    return m_.op(Op::OpFunctionCall, vec4_, {it->second, sample, signed_sample, info, scale_word});
+}
+
+// fetch_posts_' functions, after the body that calls them
+void Translator::emit_fetch_posts() {
+    for (const auto &[key, function] : fetch_posts_) {
+        const Id parameters[4] = {vec4_, vec4_, uint_, uint_};
+        m_.begin_function(vec4_, m_.type_function(vec4_, parameters), spv::FunctionControlMask::MaskNone, function);
+        Id sample = m_.function_parameter(vec4_), signed_sample = m_.function_parameter(vec4_);
+        Id info = m_.function_parameter(uint_), scale_word = m_.function_parameter(uint_);
+        m_.label();
+        m_.op_void(Op::OpReturnValue, {fetch_post(key & 15, (key & 16) != 0, sample, signed_sample, info, scale_word)});
+        m_.end_function();
     }
-    return vec4_of(out[0], out[1], out[2], out[3]);
+}
+
+// The signs and the number format on a fetch's sample (texture_signs)
+Id Translator::fetch_post(uint32_t used, bool point_allowed, Id sample, Id signed_sample, Id info, Id scale_word) {
+    auto field = [&](Id word, uint32_t offset, uint32_t count) {
+        return m_.op(Op::OpBitFieldUExtract, uint_, {word, u(offset), u(count)});
+    };
+    auto mul = [&](Id a, Id b) { return exact(Op::OpFMul, float_, {a, b}); };
+    auto add = [&](Id a, Id b) { return exact(Op::OpFAdd, float_, {a, b}); };
+    auto sub = [&](Id a, Id b) { return exact(Op::OpFSub, float_, {a, b}); };
+    auto div = [&](Id a, Id b) { return exact(Op::OpFDiv, float_, {a, b}); };
+    auto ieq = [&](Id a, uint32_t b) { return m_.op(Op::OpIEqual, bool_, {a, u(b)}); };
+    Id signs[4] = {};
+    for (uint32_t k = 0; k < 4; k++)
+        if (used & (1u << k)) signs[k] = field(info, 2 * k, 2);
+    Id out[4];
+    for (uint32_t k = 0; k < 4; k++)
+        out[k] = used & (1u << k) ? select(float_, ieq(signs[k], 1), comp(signed_sample, k), comp(sample, k))
+                                  : comp(sample, k);
+    store(fetch_scaled_, vec4_of(out[0], out[1], out[2], out[3]));
+    // biased and gamma components, each behind a uniform branch of its own
+    // (Xenia's switch on the sign), from the unsigned sample
+    auto set_component = [&](uint32_t k, Id value) {
+        store(fetch_scaled_, m_.op(Op::OpCompositeInsert, vec4_, {value, load(vec4_, fetch_scaled_), k}));
+    };
+    for (uint32_t k = 0; k < 4; k++) {
+        if (!(used & (1u << k))) continue;
+        Id value = comp(sample, k);
+        when(ieq(signs[k], 2), [&] {
+            Id width_less_one = field(scale_word, 6 * k, 4);
+            Id half = m_.op(Op::OpConvertUToF, float_, {m_.op(Op::OpShiftLeftLogical, uint_, {u(1), width_less_one})});
+            Id offset_binary = div(sub(mul(value, sub(mul(half, f(2)), f(1))), half), sub(half, f(1)));
+            Id twice_less_one = add(mul(value, f(2)), f(-1));
+            set_component(k, select(float_, m_.op(Op::OpINotEqual, bool_, {width_less_one, u(0)}), offset_binary,
+                                    twice_less_one));
+            return false;
+        });
+        when(ieq(signs[k], 3), [&] {
+            set_component(k, pwl_gamma_to_linear(value));
+            return false;
+        });
+    }
+
+    // the number format (bit 26 alone: nothing to scale)
+    Id active = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {scale_word, u((1u << 26) - 1)}), u(0)});
+    // (each part behind a uniform branch of its own, as Xenia's: a fetch runs
+    // only the part its constant asks for)
+    auto lane_of = [&](uint32_t k) { return field(scale_word, 6 * k, 6); };
+    auto word_has = [&](uint32_t mask) {
+        return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {scale_word, u(mask)}), u(0)});
+    };
+    when(active, [&] {
+        Id normalized = word_has(1u << 24);
+        // as fractions
+        when(normalized, [&] {
+            if (point_allowed) {
+                when(word_has((1u << 24) - 1), [&] {
+                    Id v4 = load(vec4_, fetch_scaled_), rebuilt[4];
+                    for (uint32_t k = 0; k < 4; k++) {
+                        Id v = comp(v4, k), lane = lane_of(k);
+                        if (!(used & (1u << k))) {
+                            rebuilt[k] = v;
+                            continue;
+                        }
+                        Id pow2 =m_.op(Op::OpConvertUToF, float_,
+                                        {m_.op(Op::OpShiftLeftLogical, uint_, {u(2), m_.op(Op::OpBitwiseAnd, uint_, {lane, u(0xF)})})});
+                        Id texel = glsl(GLSLstd450RoundEven, float_, {mul(v, sub(pow2, f(1)))});
+                        // (where the lane is 1 to 15: unsigned with a width)
+                        Id grid_lane = m_.op(Op::OpULessThan, bool_, {m_.op(Op::OpISub, uint_, {lane, u(1)}), u(15)});
+                        rebuilt[k] = select(float_, grid_lane, div(mul(texel, add(pow2, f(1))), mul(pow2, pow2)), v);
+                    }
+                    store(fetch_scaled_, vec4_of(rebuilt[0], rebuilt[1], rebuilt[2], rebuilt[3]));
+                    return false;
+                });
+            }
+            Id v4 = load(vec4_, fetch_scaled_), n[4];
+            for (uint32_t k = 0; k < 4; k++) {
+                n[k] = comp(v4, k);
+                if (!(used & (1u << k))) continue;
+                Id v = n[k], sign = m_.op(Op::OpShiftRightLogical, uint_, {lane_of(k), u(4)});
+                Id q16 = mul(glsl(GLSLstd450RoundEven, float_, {mul(v, f(65536.0f))}), f(1.0f / 65536.0f));
+                n[k] = select(float_, ieq(sign, 0), q16, v);
+                n[k] = select(float_, ieq(sign, 2), glsl(GLSLstd450FMax, float_, {n[k], f(-1)}), n[k]);
+            }
+            store(fetch_scaled_, vec4_of(n[0], n[1], n[2], n[3]));
+            return false;
+        });
+        // as integers
+        when(m_.op(Op::OpLogicalNot, bool_, {normalized}), [&] {
+            Id point = word_has(1u << 26);
+            Id v4 = load(vec4_, fetch_scaled_), r[4];
+            for (uint32_t k = 0; k < 4; k++) {
+                r[k] = comp(v4, k);
+                if (!(used & (1u << k))) continue;
+                Id v = r[k], lane = lane_of(k);
+                Id width = m_.op(Op::OpBitwiseAnd, uint_, {lane, u(0xF)});
+                Id sign = m_.op(Op::OpShiftRightLogical, uint_, {lane, u(4)});
+                Id halved = m_.op(Op::OpULessThan, bool_, {m_.op(Op::OpISub, uint_, {sign, u(1)}), u(2)});
+                Id shift =
+                    m_.op(Op::OpISub, uint_, {m_.op(Op::OpIAdd, uint_, {width, u(1)}), select(uint_, halved, u(1), u(0))});
+                Id scale = m_.op(Op::OpConvertUToF, float_,
+                                 {m_.op(Op::OpISub, uint_, {m_.op(Op::OpShiftLeftLogical, uint_, {u(1), shift}), u(1)})});
+                Id offset = sub(glsl(GLSLstd450FMin, float_, {scale, f(0.5f)}), f(0.5f));
+                r[k] = add(mul(v, glsl(GLSLstd450FMax, float_, {scale, f(0.5f)})), offset);
+                if (point_allowed) r[k] = select(float_, point, glsl(GLSLstd450RoundEven, float_, {r[k]}), r[k]);
+            }
+            store(fetch_scaled_, vec4_of(r[0], r[1], r[2], r[3]));
+            return false;
+        });
+        return false;
+    });
+    return load(vec4_, fetch_scaled_);
+}
+
+// Xenia's ParsedTextureFetchInstruction::AllowsPointSampling: the fetch can
+// return a single texel, no filter of the instruction's linear (nor
+// anisotropic, with a computed LOD)
+bool Translator::allows_point_sampling(const TextureFetchInstruction &t) {
+    return t.mag_filter != TextureFilter::Linear && t.min_filter != TextureFilter::Linear &&
+           t.mip_filter != TextureFilter::Linear &&
+           (!t.use_computed_lod || t.aniso_filter == AnisoFilter::Disabled || t.aniso_filter == AnisoFilter::UseFetchConst);
 }
 
 // xenos.cc's PWLGammaToLinear as Xenia's translators write it
@@ -1478,10 +1638,17 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates, 
         }
     }
 
-    // the coordinates, offset and normalized
+    // the coordinates, offset and normalized; with the point snap
+    // (VertexOptions::texture_point_snap, Xenia's CanSnapToTexelCenter: a
+    // point-sampled 2D fetch with normalized coordinates) the epsilon comes
+    // at the sample, where the snap does not take its place
+    const bool snap = (stage_ == Stage::Pixel ? pixel_.texture_point_snap : vertex_.texture_point_snap) &&
+                      t.opcode == FetchOpcode::TextureFetch && t.dimension == FetchOpDimension::D2 &&
+                      !t.unnormalized_coordinates && allows_point_sampling(t) && query == Query::Sample;
+    const float rounding = snap ? 0.0f : epsilon;
     Id c[3] = {comp(coordinates, 0), one ? f(0) : comp(coordinates, 1), cube || volume ? comp(coordinates, 2) : f(0)};
-    const float offsets[3] = {t.offset_x + epsilon, one ? 0.0f : t.offset_y + epsilon,
-                              cube ? t.offset_z : volume ? t.offset_z + epsilon : 0.0f};
+    const float offsets[3] = {t.offset_x + rounding, one ? 0.0f : t.offset_y + rounding,
+                              cube ? t.offset_z : volume ? t.offset_z + rounding : 0.0f};
     if (query == Query::Weights) {
         // getWeights as Xenia's (the LOD disregarded, as it does): per axis
         // the bilinear lerp factor, fract of the coordinate in texels plus
@@ -1584,7 +1751,21 @@ Id Translator::sample_texture(const TextureFetchInstruction &t, Id coordinates, 
                            select(vec3, m_.op(Op::OpIEqual, bool_, {axis, u(1)}), on_y, on_z));
         return sample(sampled_image(2), coords, 3, coords);
     }
-    if (!volume) return sample(sampled_image(0), vec3_of(c[0], c[1], f(0)), 2, vec2_of(c[0], c[1]));
+    if (!volume) {
+        Id x = c[0], y = c[1];
+        if (snap) {
+            // the texel's center where the constant filters by point too
+            // (the integer scale word's bit 26), else the epsilon after all
+            Id point = m_.op(Op::OpINotEqual, bool_,
+                             {m_.op(Op::OpBitwiseAnd, uint_, {slot_word(12, slot), u(1u << 26)}), u(0)});
+            Id *axes[2] = {&x, &y};
+            for (uint32_t k = 0; k < 2; k++) {
+                Id snapped = div(add(glsl(GLSLstd450Floor, float_, {mul(c[k], size[k])}), f(0.5f)), size[k]);
+                *axes[k] = select(float_, point, snapped, add(c[k], div(f(epsilon), size[k])));
+            }
+        }
+        return sample(sampled_image(0), vec3_of(x, y, f(0)), 2, vec2_of(c[0], c[1]));
+    }
 
     // 3D, or stacked; both sampled (the right one chosen after, so the
     // implicit LOD's derivatives stay in uniform control flow)
@@ -1895,10 +2076,30 @@ void Translator::main_vertex() {
     m_.decorate(position, spv::Decoration::Invariant);
     Id outputs = global(m_.type_array(vec4_, 16), spv::StorageClass::Output, "interpolators");
     m_.decorate(outputs, spv::Decoration::Location, {0});
+    // the screen extents' reports (VertexOptions::extents), as words
+    Id extents = 0;
+    if (vertex_.extents) {
+        const Id extent_members[] = {m_.type_runtime_array(uint_, 4)};
+        Id extent_block = m_.type_struct(extent_members);
+        m_.decorate(extent_block, spv::Decoration::Block);
+        m_.member_decorate(extent_block, 0, spv::Decoration::Offset, {0});
+        extents = global(extent_block, spv::StorageClass::StorageBuffer, "extents");
+        m_.decorate(extents, spv::Decoration::DescriptorSet, {0});
+        m_.decorate(extents, spv::Decoration::Binding, {7});
+    }
     // the point diameter for point lists' geometry shader (point_list.geom),
     // after the interpolators
     Id point_size = global(float_, spv::StorageClass::Output, "point_size");
     m_.decorate(point_size, spv::Decoration::Location, {16});
+    // an expanded point's sprite coordinates (0 to 1 from the left and top
+    // corners), for the pixel parameters (PixelOptions::point_coordinates),
+    // as Xenia's xe_out_point_coordinates; point_list.geom writes the same
+    Id point_coordinates = 0;
+    if (points) {
+        point_coordinates = global(m_.type_vector(float_, 2), spv::StorageClass::Output, "point_coordinates");
+        m_.decorate(point_coordinates, spv::Decoration::Location, {17});
+        m_.decorate(point_coordinates, spv::Decoration::Invariant);
+    }
     // A shader that exports memory is drawn alone as a point list when the
     // draw rasterizes nothing (renderer.cpp), and Vulkan without
     // maintenance5 wants a point size from it then: 1.
@@ -2020,6 +2221,57 @@ void Translator::main_vertex() {
                   m_.op(Op::OpDot, float_, {xyzw, plane}));
         }
     };
+    // The final host position bounding its report (VertexOptions::extents):
+    // xy over w, clamped to the viewport's NDC square (the host clips there),
+    // mapped to console pixels (system member 10), then the edges as whole
+    // pixels outwards, clamped to 0-8192; the whole viewport for a position
+    // whose w is not above 0 (its primitive's clipped part can reach any
+    // edge) or whose xy are not numbers. Atomic maxima at the report's
+    // words (system member 11's x): 8192 less the left and top edges, the
+    // right and bottom ones plus one.
+    auto bound_extent = [&](Id p) {
+        if (!extents) return;
+        Id w = comp(p, 3);
+        Id ndc =
+            m_.op(Op::OpFDiv, vec2_,
+                  {m_.op(Op::OpVectorShuffle, vec2_, {p, p, 0, 1}), m_.op(Op::OpCompositeConstruct, vec2_, {w, w})});
+        Id in_front = m_.op(Op::OpFOrdGreaterThan, bool_, {w, f(0)});
+        Id bvec2 = m_.type_vector(bool_, 2);
+        Id numbers = m_.op(Op::OpLogicalNot, bool_, {m_.op(Op::OpAny, bool_, {m_.op(Op::OpIsNan, bvec2, {ndc})})});
+        Id valid = m_.op(Op::OpLogicalAnd, bool_, {in_front, numbers});
+        Id ones = m_.op(Op::OpCompositeConstruct, vec2_, {f(1), f(1)});
+        Id minus_ones = m_.op(Op::OpCompositeConstruct, vec2_, {f(-1), f(-1)});
+        Id lo = select(vec2_, valid, glsl(GLSLstd450FClamp, vec2_, {ndc, minus_ones, ones}), minus_ones);
+        Id hi = select(vec2_, valid, glsl(GLSLstd450FClamp, vec2_, {ndc, minus_ones, ones}), ones);
+        Id map = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(10)}));
+        Id scale = m_.op(Op::OpVectorShuffle, vec2_, {map, map, 0, 2});
+        Id offset = m_.op(Op::OpVectorShuffle, vec2_, {map, map, 1, 3});
+        // both ends mapped, as a negative scale swaps them
+        Id a = m_.op(Op::OpFAdd, vec2_, {m_.op(Op::OpFMul, vec2_, {lo, scale}), offset});
+        Id b = m_.op(Op::OpFAdd, vec2_, {m_.op(Op::OpFMul, vec2_, {hi, scale}), offset});
+        Id zeros = m_.op(Op::OpCompositeConstruct, vec2_, {f(0), f(0)});
+        Id limits = m_.op(Op::OpCompositeConstruct, vec2_, {f(8192), f(8192)});
+        Id low = glsl(GLSLstd450FClamp, vec2_,
+                      {glsl(GLSLstd450Floor, vec2_, {glsl(GLSLstd450FMin, vec2_, {a, b})}), zeros, limits});
+        Id high = glsl(GLSLstd450FClamp, vec2_,
+                       {glsl(GLSLstd450Ceil, vec2_, {glsl(GLSLstd450FMax, vec2_, {a, b})}), zeros, limits});
+        Id uvec2 = m_.type_vector(uint_, 2);
+        Id low_u = m_.op(Op::OpConvertFToU, uvec2, {low}), high_u = m_.op(Op::OpConvertFToU, uvec2, {high});
+        Id first = m_.op(Op::OpCompositeExtract, uint_,
+                         {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                             {system_, u(11)})),
+                          0});
+        Id ptr = m_.type_pointer(spv::StorageClass::StorageBuffer, uint_);
+        Id device = u(uint32_t(spv::Scope::Device)), relaxed = u(0);
+        const Id values[4] = {m_.op(Op::OpISub, uint_, {u(8192), m_.op(Op::OpCompositeExtract, uint_, {low_u, 0})}),
+                              m_.op(Op::OpISub, uint_, {u(8192), m_.op(Op::OpCompositeExtract, uint_, {low_u, 1})}),
+                              m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpCompositeExtract, uint_, {high_u, 0}), u(1)}),
+                              m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpCompositeExtract, uint_, {high_u, 1}), u(1)})};
+        for (uint32_t k = 0; k < 4; k++) {
+            Id at = m_.op(Op::OpAccessChain, ptr, {extents, u(0), m_.op(Op::OpIAdd, uint_, {first, u(k)})});
+            m_.op(Op::OpAtomicUMax, uint_, {at, device, relaxed, values[k]});
+        }
+    };
     // oPts.x clamped to PA_SU_POINT_MINMAX (system values' y and z) as Xenia
     // does, like signed integers (-NaN and negatives to the minimum, NaN to
     // the maximum); -1 when the shader does not write it, for the constant
@@ -2086,6 +2338,7 @@ void Translator::main_vertex() {
             return select(vec4_, fourth, mirrored, at(chosen));
         };
         store(position, pick(rectangle_positions, 0));
+        bound_extent(load(vec4_, position));
         if (rectangle_guest_positions) {
             // the corner's guest position, made as its host one: distances
             // mirrored as the position is
@@ -2167,6 +2420,8 @@ void Translator::main_vertex() {
             Id y = exact(Op::OpFAdd, float_,
                          {comp(p, 1), select(float_, side(1), ry, exact(Op::OpFNegate, float_, {ry}))});
             p = vec4_of(x, y, comp(p, 2), w);
+            store(point_coordinates, m_.op(Op::OpCompositeConstruct, m_.type_vector(float_, 2),
+                                           {select(float_, side(2), f(1), f(0)), select(float_, side(1), f(1), f(0))}));
             if (planes) {
                 // the center's distances, and the corner's: its offset from
                 // the center taken back to the guest's clip space through the
@@ -2194,6 +2449,7 @@ void Translator::main_vertex() {
             put_distances(cull_distances, guest);
         }
         store(position, p);
+        bound_extent(p);
         put_interpolators();
         store(point_size, size);
     }
@@ -2240,15 +2496,22 @@ void Translator::main_pixel() {
         outputs = global(m_.type_array(vec4_, 4), spv::StorageClass::Output, "colors");
         m_.decorate(outputs, spv::Decoration::Location, {0});
     }
-    bool writes_depth = false;
+    bool writes_depth = false, kills = false;
     for (const ControlFlow &cf : s_.control_flow)
         if (const auto *e = std::get_if<Exec>(&cf.instruction))
             for (const ExecSlot &slot : e->slots)
-                if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
+                if (const auto *a = std::get_if<AluInstruction>(&slot.instruction)) {
                     writes_depth |= a->vector_and_constant_result.target == StorageTarget::Depth ||
                                     a->scalar_result.target == StorageTarget::Depth;
+                    kills |= (vector_opcode_info(a->vector_opcode).changed_state & CHANGES_PIXEL_KILL) ||
+                             (scalar_opcode_info(a->scalar_opcode).changed_state & CHANGES_PIXEL_KILL);
+                }
     // the depth converted to 20e4 (PixelOptions), oDepth's or the rasterized one
     const uint32_t float24 = fsi ? 0 : pixel_.depth_float24;
+    // Xenia's IsForceEarlyDepthStencilGlobalFlagEnabled: the early hint, for a
+    // shader whose implicit early depth write is allowed (no kill, no oDepth,
+    // no memory export)
+    const bool early = pixel_.early_depth_stencil && !fsi && !float24 && !writes_depth && !kills && !em_written_;
     Id frag_depth = 0;
     if (!fsi && (writes_depth || float24)) {
         frag_depth = global(float_, spv::StorageClass::Output, "depth");
@@ -2258,6 +2521,17 @@ void Translator::main_pixel() {
     // for the pixel parameters
     Id frag_coord = global(vec4_, spv::StorageClass::Input, "frag_coord");
     m_.decorate(frag_coord, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FragCoord)});
+    // A host pixel's position as the console's pixel at a resolution scale:
+    // times the system values' w (1 / the scale; 0 where a caller leaves it,
+    // taken as 1). What the guest sees of the pixel's position (the pixel
+    // parameters, alpha to coverage's dither) is the console pixel's.
+    auto console_position = [&](Id position, uint32_t component) {
+        Id per_pixel = comp(load(vec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, vec4_),
+                                              {system_, u(4)})),
+                            3);
+        per_pixel = select(float_, m_.op(Op::OpFOrdEqual, bool_, {per_pixel, f(0)}), f(1), per_pixel);
+        return exact(Op::OpFMul, float_, {comp(position, component), per_pixel});
+    };
     if (float24 && !writes_depth) {
         // the rasterized depth converted per sample, for the antialiasing of
         // intersections: a Sample-decorated input runs the shader per sample
@@ -2267,6 +2541,11 @@ void Translator::main_pixel() {
     }
     Id front_facing = global(bool_, spv::StorageClass::Input, "front_facing");
     m_.decorate(front_facing, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::FrontFacing)});
+    Id point_coordinates = 0;
+    if (pixel_.point_coordinates) {
+        point_coordinates = global(m_.type_vector(float_, 2), spv::StorageClass::Input, "point_coordinates");
+        m_.decorate(point_coordinates, spv::Decoration::Location, {17});
+    }
     // for alpha to coverage, when the shader writes oC0
     bool writes_color_0 = false;
     for (const ControlFlow &cf : s_.control_flow)
@@ -2276,7 +2555,7 @@ void Translator::main_pixel() {
                     for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
                         writes_color_0 |= r->target == StorageTarget::Color && (r->index & 3) == 0 && r->used_write_mask();
     Id sample_mask = 0;
-    if (writes_color_0 && !fsi) {
+    if (writes_color_0 && !fsi && !early) {
         sample_mask = global(m_.type_array(int_, 1), spv::StorageClass::Output, "sample_mask");
         m_.decorate(sample_mask, spv::Decoration::BuiltIn, {uint32_t(spv::BuiltIn::SampleMask)});
     }
@@ -2306,8 +2585,10 @@ void Translator::main_pixel() {
     // SQ_CONTEXT_MISC names, by the system flags' y (bit 8 on, bits 9-12
     // the interpolator, bit 13 a point, 14 a line, 15 a polygon): x the
     // pixel's column (floored), negative for a polygon's back face; y its
-    // row, negative for a point; z -0 for a line, else 0 (a point's sprite
-    // coordinates are not made: 0), w 0.
+    // row, negative for a point; z -0 for a line, else 0, w 0; for a point
+    // list (PixelOptions::point_coordinates) z and w the sprite's
+    // coordinates, clamped to 0-1 (NClamp: where the pixel's center is not
+    // covered they are extrapolated).
     {
         Id flags = m_.op(Op::OpCompositeExtract, uint_,
                          {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
@@ -2323,19 +2604,28 @@ void Translator::main_pixel() {
                 return m_.op(Op::OpBitcast, float_,
                              {m_.op(Op::OpBitwiseXor, uint_, {m_.op(Op::OpBitcast, uint_, {x}), sign_bit})});
             };
-            Id x = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {comp(position, 0)})});
-            Id y = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {comp(position, 1)})});
+            Id x = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {console_position(position, 0)})});
+            Id y = glsl(GLSLstd450FAbs, float_, {glsl(GLSLstd450Floor, float_, {console_position(position, 1)})});
             Id back = m_.op(Op::OpLogicalAnd, bool_, {flag(15), m_.op(Op::OpLogicalNot, bool_, {load(bool_, front_facing)})});
             x = select(float_, back, negated(x), x);
             y = select(float_, flag(13), negated(y), y);
             Id z = select(float_, flag(14), negated(f(0)), f(0));
+            Id w = f(0);
+            if (point_coordinates) {
+                Id vec2 = m_.type_vector(float_, 2);
+                Id zero2 = m_.op(Op::OpCompositeConstruct, vec2, {f(0), f(0)});
+                Id one2 = m_.op(Op::OpCompositeConstruct, vec2, {f(1), f(1)});
+                Id st = glsl(GLSLstd450NClamp, vec2, {load(vec2, point_coordinates), zero2, one2});
+                z = m_.op(Op::OpCompositeExtract, float_, {st, 0});
+                w = m_.op(Op::OpCompositeExtract, float_, {st, 1});
+            }
             Id index = m_.op(Op::OpBitFieldUExtract, uint_, {flags, u(9), u(4)});
             // into the register the index names, each by a constant index: a
             // variable index into the registers made the host's compiler keep
             // the whole array in memory, every access of every pixel shader a
             // memory access (the post-processing passes of a UE3 game's race
             // took 5 ms of the GPU each at 1280x720, 0.2 ms without)
-            Id value = vec4_of(x, y, z, f(0));
+            Id value = vec4_of(x, y, z, w);
             for (uint32_t k = 0; k < 16; k++) {
                 Id pointer = m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))});
                 Id here = m_.op(Op::OpIEqual, bool_, {index, u(k)});
@@ -2417,8 +2707,9 @@ void Translator::main_pixel() {
         store(frag_depth, select(float_, float24, exact(Op::OpFMul, float_, {depth, f(0.5f)}), depth));
     }
     // the alpha test (state, not microcode): oC0's alpha against the
-    // reference, by the function in the system constants
-    {
+    // reference, by the function in the system constants (the early form is
+    // for draws without one)
+    if (!early) {
         Id flags = m_.op(Op::OpCompositeExtract, uint_, {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_), {system_, u(3)})), 0});
         Id reference = comp(load(vec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, vec4_), {system_, u(4)})), 0);
         Id alpha = comp(load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(0)})), 3);
@@ -2464,8 +2755,8 @@ void Translator::main_pixel() {
         Id enabled = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(1u << 16)}), u(0)});
         when(enabled, [&] {
             Id position = load(vec4_, frag_coord);
-            Id px = m_.op(Op::OpConvertFToU, uint_, {comp(position, 0)});
-            Id py = m_.op(Op::OpConvertFToU, uint_, {comp(position, 1)});
+            Id px = m_.op(Op::OpConvertFToU, uint_, {console_position(position, 0)});
+            Id py = m_.op(Op::OpConvertFToU, uint_, {console_position(position, 1)});
             Id index = m_.op(Op::OpBitwiseOr, uint_,
                              {m_.op(Op::OpBitwiseAnd, uint_, {py, u(1)}),
                               m_.op(Op::OpShiftLeftLogical, uint_, {m_.op(Op::OpBitwiseAnd, uint_, {px, u(1)}), u(1)})});
@@ -2524,8 +2815,8 @@ void Translator::main_pixel() {
                        {m_.op(Op::OpBitwiseAnd, uint_, {load(uint_, colors_written_), u(1)}), u(0)})});
             when(enabled, [&] {
                 Id position = load(vec4_, frag_coord);
-                Id px = m_.op(Op::OpConvertFToU, uint_, {comp(position, 0)});
-                Id py = m_.op(Op::OpConvertFToU, uint_, {comp(position, 1)});
+                Id px = m_.op(Op::OpConvertFToU, uint_, {console_position(position, 0)});
+                Id py = m_.op(Op::OpConvertFToU, uint_, {console_position(position, 1)});
                 Id index = m_.op(
                     Op::OpBitwiseOr, uint_,
                     {m_.op(Op::OpBitwiseAnd, uint_, {py, u(1)}),
@@ -2613,14 +2904,123 @@ void Translator::main_pixel() {
             Id truncated = glsl(GLSLstd450Trunc, float_, {exact(Op::OpFMul, float_, {l, scale})});
             return exact(Op::OpFAdd, float_, {exact(Op::OpFMul, float_, {truncated, f(1.0f / 255.0f)}), offset});
         };
+        // Lean (the default): a target the shader never writes gets the
+        // zeros its register holds, with no arithmetic, and the gamma curve is
+        // computed behind a branch on the target's flag (as Xenia's, which
+        // declares only the written targets and branches on the flag) rather
+        // than for every pixel and then selected. XF_PIXEL_OUTPUTS=full: every
+        // target scaled and curved, then selected, as before.
+        static const bool lean = [] {
+            const char *v = std::getenv("XF_PIXEL_OUTPUTS");
+            return !(v && std::string(v) == "full");
+        }();
+        uint32_t written = 0;
+        for (const ControlFlow &cf : s_.control_flow)
+            if (const auto *e = std::get_if<Exec>(&cf.instruction))
+                for (const ExecSlot &slot : e->slots)
+                    if (const auto *a = std::get_if<AluInstruction>(&slot.instruction))
+                        for (const Result *r : {&a->vector_and_constant_result, &a->scalar_result})
+                            if (r->target == StorageTarget::Color) written |= 1u << (r->index & 3);
+        // PixelOptions::blend_premultiply: the console applies the blend
+        // factors before a minimum or maximum, the host's blending does not,
+        // so a source factor that depends on the source and the blend
+        // constant alone is multiplied in here, with the interlock path's
+        // arithmetic (edram_fsi.frag's color_factor and alpha_factor: the
+        // source and the constant clamped to 0-1 and NaN to 0 for a fixed-point
+        // target, a factor of zero giving zero without a product, the product
+        // clamped again), and against a destination factor of zero the
+        // minimum or maximum with zero is taken here too. System member 13,
+        // per target: the color's factor in bits 0-4 (RB_BLENDCONTROL's
+        // numbers), then in 5-6 the minimum (1) or maximum (2) with zero, 7
+        // the color is done here; the alpha's the same in bits 8-15; bit 16
+        // the color is fixed-point, 17 the alpha. Member 14: the blend constant.
+        Id premultiply_words = 0, premultiply_constant = 0;
+        if (pixel_.blend_premultiply) {
+            Id ptr_u_uvec4 = m_.type_pointer(spv::StorageClass::Uniform, uvec4_);
+            premultiply_words = load(uvec4_, m_.op(Op::OpAccessChain, ptr_u_uvec4, {system_, u(13)}));
+            premultiply_constant = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(14)}));
+        }
+        auto premultiplied = [&](Id color, uint32_t k) {
+            Id word = m_.op(Op::OpCompositeExtract, uint_, {premultiply_words, k});
+            auto bit = [&](uint32_t n) {
+                return m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {word, u(1u << n)}), u(0)});
+            };
+            auto fixed = [&](Id v, Id is_fixed) {
+                Id flushed = select(float_, m_.op(Op::OpIsNan, bool_, {v}), f(0), v);
+                Id clamped = glsl(GLSLstd450FClamp, float_, {flushed, f(0), f(1)});
+                return select(float_, is_fixed, clamped, v);
+            };
+            Id fixed_color = bit(16), fixed_alpha = bit(17);
+            Id source[4], constant[4];
+            for (uint32_t j = 0; j < 4; j++) {
+                source[j] = fixed(comp(color, j), j < 3 ? fixed_color : fixed_alpha);
+                constant[j] = fixed(comp(premultiply_constant, j), j < 3 ? fixed_color : fixed_alpha);
+            }
+            auto half = [&](uint32_t j, uint32_t shift) {
+                Id factor = m_.op(Op::OpBitFieldUExtract, uint_, {word, u(shift), u(5)});
+                Id zero_op = m_.op(Op::OpBitFieldUExtract, uint_, {word, u(shift + 5), u(2)});
+                auto is = [&](uint32_t n) { return m_.op(Op::OpIEqual, bool_, {factor, u(n)}); };
+                auto one_minus = [&](Id v) { return exact(Op::OpFSub, float_, {f(1), v}); };
+                // (the alpha's color factors are its alpha ones: source[3] and constant[3] are its own)
+                Id by = f(1);
+                by = select(float_, is(4), source[j], by);
+                by = select(float_, is(5), one_minus(source[j]), by);
+                by = select(float_, is(6), source[3], by);
+                by = select(float_, is(7), one_minus(source[3]), by);
+                by = select(float_, is(12), constant[j], by);
+                by = select(float_, is(13), one_minus(constant[j]), by);
+                by = select(float_, is(14), constant[3], by);
+                by = select(float_, is(15), one_minus(constant[3]), by);
+                Id r = fixed(exact(Op::OpFMul, float_, {source[j], by}), j < 3 ? fixed_color : fixed_alpha);
+                r = select(float_, is(0), f(0), r);
+                r = select(float_, m_.op(Op::OpIEqual, bool_, {zero_op, u(1)}), glsl(GLSLstd450FMin, float_, {r, f(0)}),
+                           select(float_, m_.op(Op::OpIEqual, bool_, {zero_op, u(2)}),
+                                  glsl(GLSLstd450FMax, float_, {r, f(0)}), r));
+                return select(float_, bit(shift + 7), r, comp(color, j));
+            };
+            Id red = half(0, 0), green = half(1, 0), blue = half(2, 0);
+            return vec4_of(red, green, blue, half(3, 8));
+        };
         for (uint32_t k = 0; k < 4; k++) {
+            Id out = m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))});
+            if (lean && !(written & (1u << k))) {
+                store(out, zero4_);
+                continue;
+            }
             Id color = load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(int32_t(k))}));
-            color = exact(Op::OpVectorTimesScalar, vec4_, {color, comp(scales, k)});
+            // (a negative scale: a 16_16 target's, which keeps no alpha. Its
+            // fixed range's share of the scale is the stored channels' alone:
+            // the alpha is only the blend's factor, and takes the exponent
+            // bias as the console's does, not the range)
+            Id scale = comp(scales, k), size = glsl(GLSLstd450FAbs, float_, {scale});
+            Id unscaled_alpha = comp(color, 3);
+            color = exact(Op::OpVectorTimesScalar, vec4_, {color, size});
+            Id blend_alpha = exact(Op::OpFMul, float_,
+                                   {unscaled_alpha, exact(Op::OpFMul, float_, {size, f(32767.0f / 1024.0f)})});
+            color = vec4_of(comp(color, 0), comp(color, 1), comp(color, 2),
+                            select(float_, m_.op(Op::OpFOrdLessThan, bool_, {scale, f(0)}), blend_alpha, comp(color, 3)));
+            // (the flags' bits 4-7: a target whose alpha is fixed point in a float
+            // format, 2_10_10_10_FLOAT's two bits: clamped to 0..1 as the console
+            // clamps it before the blend, which the host's float target does not)
+            Id fixed_alpha = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {gamma_flags, u(16u << k)}), u(0)});
+            color = vec4_of(comp(color, 0), comp(color, 1), comp(color, 2),
+                            select(float_, fixed_alpha, glsl(GLSLstd450FClamp, float_, {comp(color, 3), f(0), f(1)}),
+                                   comp(color, 3)));
+            if (pixel_.blend_premultiply) color = premultiplied(color, k);
             Id gamma = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {gamma_flags, u(1u << k)}), u(0)});
+            if (lean) {
+                store(out, color);
+                when(gamma, [&] {
+                    Id r = comp(color, 0), g = comp(color, 1), b = comp(color, 2);
+                    store(out, vec4_of(pwl(r), pwl(g), pwl(b), comp(color, 3)));
+                    return false;
+                });
+                continue;
+            }
             Id r = comp(color, 0), g = comp(color, 1), b = comp(color, 2);
             color = vec4_of(select(float_, gamma, pwl(r), r), select(float_, gamma, pwl(g), g),
                             select(float_, gamma, pwl(b), b), comp(color, 3));
-            store(m_.op(Op::OpAccessChain, ptr_out_vec4, {outputs, i(int32_t(k))}), color);
+            store(out, color);
         }
     }
     m_.op_void(Op::OpReturn);
@@ -2631,6 +3031,7 @@ void Translator::main_pixel() {
         m_.execution_mode(main, pixel_.fsi == 2 ? spv::ExecutionMode::SampleInterlockOrderedEXT
                                                 : spv::ExecutionMode::PixelInterlockOrderedEXT);
     if (frag_depth) m_.execution_mode(main, spv::ExecutionMode::DepthReplacing);
+    if (early) m_.execution_mode(main, spv::ExecutionMode::EarlyFragmentTests);
     // truncation never raises the rasterized depth: early depth tests may
     // still reject (Xenia's SV_DepthLessEqual)
     if (float24 == 1 && !writes_depth) m_.execution_mode(main, spv::ExecutionMode::DepthLess);
@@ -2691,6 +3092,7 @@ Translation Translator::run() {
     if (s_.reads_past_end) unsupported("an exec past the end of the microcode");
     if (!ended_) m_.op_void(Op::OpReturn);
     m_.end_function();
+    emit_fetch_posts();
 
     switch (stage_) {
     case Stage::Harness: main_harness(); break;

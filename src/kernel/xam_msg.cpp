@@ -23,6 +23,7 @@
 
 #include "xam.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -113,9 +114,18 @@ uint32_t xlivebase_app(Kernel &k, uint32_t message, uint32_t buffer, uint32_t le
 // XgiApp::DispatchMessageSync
 uint32_t xgi_app(Kernel &k, uint32_t message, uint32_t buffer, uint32_t length) {
     switch (message) {
-    case 0x000B0006: // XGIUserSetContext
-    case 0x000B0007: // XGIUserSetPropertyEx
-    case 0x000B0008: // XGIUserWriteAchievements
+    case 0x000B0006: // XGIUserSetContext (user index, XUID, context id and value): kept nowhere
+    case 0x000B0007: // XGIUserSetPropertyEx (user index, XUID, property): kept nowhere
+        // (each its own case in xgi_app.cc: falling into the achievements
+        // below read a context's user index as a count and its XUID as a
+        // list, and a game faulted there)
+        return X_E_SUCCESS;
+    case 0x000B0008: { // XGIUserWriteAchievements: (count, X_USER_ACHIEVEMENT * (user index, id))
+        uint32_t count = k.load32(buffer), list = k.load32(buffer + 4);
+        for (uint32_t i = 0; list && i < std::min(count, 128u); i++)
+            earn_achievement(k, k.load32(list + 8 * i), k.load32(list + 8 * i + 4));
+        return X_E_SUCCESS;
+    }
     case 0x000B0011: // XGISessionDelete
     case 0x000B0012: // XGISessionJoinLocal
     case 0x000B0014: // XSessionStart

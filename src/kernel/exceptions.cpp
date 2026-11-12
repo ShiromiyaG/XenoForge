@@ -108,7 +108,7 @@ Regs capture(const ppc::Context &c) {
     r.cr = c.cr_word();
     r.xer = uint32_t(c.xer_so) << 31 | uint32_t(c.xer_ov) << 30 | uint32_t(c.xer_ca) << 29 | (c.xer_bc & 0x7F);
     r.fpscr = c.fpscr;
-    r.vscr = 0x00010000u | (c.vscr_sat & 1); // NJ always set (docs/recompiler.md)
+    r.vscr = (c.vscr_java ? 0u : 0x00010000u) | (c.vscr_sat & 1);
     for (int i = 0; i < 128; i++)
         for (int k = 0; k < 4; k++) r.vr[i][k] = c.v[i].u32[k];
     return r;
@@ -124,6 +124,9 @@ void restore(const Regs &r, ppc::Context &c) {
     c.xer_bc = r.xer & 0x7F;
     c.fpscr = uint32_t(r.fpscr);
     c.vscr_sat = r.vscr & 1;
+    // NJ stays as it is: the contexts the dispatch reads are not all captures
+    // (a title's own may leave VSCR 0), and which flags restore VSCR on the
+    // console is not known here
     for (int i = 0; i < 128; i++)
         for (int k = 0; k < 4; k++) c.v[i].u32[k] = r.vr[i][k];
 }
@@ -698,11 +701,14 @@ void log_throw(Kernel &k, uint32_t rec) {
 // RtlRaiseException's work: the exception at rec raised by the call that
 // returns to c.lr, the frames below top free; returns when a handler continues
 // it at its own return address, else goes on elsewhere (ppc::Unwind) or ends
-// the title.
-void raise(Kernel &k, ppc::Context &c, uint32_t rec, uint32_t top) {
-    const uint32_t caller_sp = uint32_t(c.r[1]), caller_return = uint32_t(c.lr);
+// the title. With `at`, an instruction raised it (a trap): the exception's
+// address and the context's IAR are its own, and a handler continues the code
+// after it.
+void raise(Kernel &k, ppc::Context &c, uint32_t rec, uint32_t top, uint32_t at = 0) {
+    const uint32_t caller_sp = uint32_t(c.r[1]), caller_return = at ? at + 4 : uint32_t(c.lr);
     Regs start = capture(c);
-    k.store32(rec + record::ADDRESS, caller_return);
+    if (at) start.iar = at;
+    k.store32(rec + record::ADDRESS, at ? at : caller_return);
     uint32_t code = k.load32(rec + record::CODE);
     static std::atomic<int> logged{0};
     if (code == SET_THREAD_NAME)
@@ -714,7 +720,7 @@ void raise(Kernel &k, ppc::Context &c, uint32_t rec, uint32_t top) {
 
     Scratch s(top);
     Active a;
-    a.c = &c, a.frame = s.frame, a.original = start, a.first_pc = caller_return - 4;
+    a.c = &c, a.frame = s.frame, a.original = start, a.first_pc = at ? at : caller_return - 4;
     ActiveScope scope(a);
     for (int attempt = 0;; attempt++) {
         write_context(k, s.ctx, start);
@@ -922,6 +928,36 @@ XF_EXPORT(xboxkrnl, __C_specific_handler) {
 }
 
 } // namespace
+
+// A trap instruction that fired (ppc::System::trap). twi 31, r0, 20 (and 26)
+// is the XDK's debug print: r3 the text, r4 its length, printed, and the code
+// goes on (Xenia's TrapDebugPrint). 25 Xenia ignores, and so does this. Any
+// other is the console's breakpoint (DbgBreakPoint is twi 31, r0, 22):
+// STATUS_BREAKPOINT through the title's handlers, which on the console with no
+// debugger ends the title when none takes it (Xenia logs "This should be a
+// crash!" and goes on).
+void trap(Kernel &k, ppc::Context &c, uint32_t at) {
+    const uint32_t word = k.load32(at);
+    const bool always = (word & 0xFFFF0000u) == 0x0FE00000u; // twi 31, r0, imm
+    if (always && ((word & 0xFFFF) == 20 || (word & 0xFFFF) == 26)) {
+        uint32_t text = uint32_t(c.r[3]), length = std::min<uint32_t>(uint32_t(c.r[4]), 4096);
+        std::string s;
+        for (uint32_t i = 0; i < length && text && k.host(text + i)[0]; i++) s += char(k.host(text + i)[0]);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+        std::fprintf(stderr, "guest: %s\n", s.c_str());
+        return;
+    }
+    if (always && (word & 0xFFFF) == 25) return;
+    // the record well below the stack pointer: the code may be between a
+    // register save under r1 and its stwu
+    uint32_t rec = (uint32_t(c.r[1]) - 0x400) & ~15u;
+    k.store32(rec + record::CODE, STATUS_BREAKPOINT);
+    k.store32(rec + record::FLAGS, 0);
+    k.store32(rec + record::RECORD, 0);
+    k.store32(rec + record::COUNT, 1);
+    k.store32(rec + record::INFO, 0); // BREAKPOINT_BREAK
+    raise(k, c, rec, rec, at);
+}
 
 void add_function_table(Kernel &k, uint32_t begin, uint32_t end, uint32_t table, uint32_t count) {
     Tables &t = k.state<Tables>();

@@ -127,6 +127,7 @@ constexpr uint32_t SWAP_SIGNATURE = 0x53574150;
 
 // VGT_EVENT_INITIATOR's events that the command processor writes itself
 constexpr uint32_t EVENT_VIZQUERY_START = 7, EVENT_VIZQUERY_END = 8;
+constexpr uint32_t EVENT_SCREEN_EXT_INIT = 25, EVENT_SCREEN_EXT_RPT = 26;
 
 enum class EdramMode : uint32_t { NoOperation = 0, ColorDepth = 4, DepthOnly = 5, Copy = 6 };
 enum class SourceSelect : uint32_t { DMA = 0, Immediate = 1, AutoIndex = 2 };

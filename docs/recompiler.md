@@ -84,8 +84,17 @@ added to its base; loads and stores swap bytes.
   tests: `tests/ppc` has some). `lswx`/`stswx` move the byte count XER
   keeps in bits 57-63, which mtxer sets and mfxer reads back (the context's
   `xer_bc`); with a count of 0 nothing moves.
-- Traps call `system->trap` when they fire (Xenia ignores them by default);
-  `sc` calls `system->syscall`. VSCR is SAT alone, NJ always set.
+- Traps call `system->trap` when they fire (Xenia ignores them by default;
+  the emitter sets `c.pc` before each trap instruction, the interpreter
+  always does); `sc` calls `system->syscall`. The kernel's trap
+  (`exceptions.cpp`): `twi 31, r0, 20` and `26` are the XDK's debug print
+  (r3 the text, r4 its length; printed as `guest: ...` and the code goes on,
+  as Xenia's TrapDebugPrint), `25` is ignored as Xenia does, and any other
+  fired trap is the console's breakpoint (`DbgBreakPoint` is `twi 31, r0,
+  22`): STATUS_BREAKPOINT raised at the instruction through the title's
+  handlers, which end the title when none takes it, as the console does
+  with no debugger (Xenia logs "This should be a crash!" and goes on). A
+  handler that continues goes on after the trap.
 - VMX: VSCR[SAT] is sticky (Xenia's backends always clear it). `vsl`/`vsr`
   shift each byte by its own count with the neighbour's bits, as the
   console does where the counts differ (Xenia uses byte 15's for all and
@@ -93,7 +102,16 @@ added to its base; loads and stores swap bytes.
   (`vmsum*`, `vmul[eo]*`, `vsum*`, `vmhaddshs`, `vmhraddshs`, `vmladduhm`,
   `vupk[hl]px`) follow the AltiVec PEM.
 - VMX floating point runs in non-Java mode: denormals in and out flush to
-  a zero of their sign. `vmaddfp`/`vnmsubfp` round once (`std::fma`; one
+  a zero of their sign. **VSCR** (2026-11-08): SAT, and NJ as `mtvscr`
+  sets it (`Context::vscr_java`, in the context's padding, 0 = NJ set);
+  `mfvscr` and the exception contexts read both. Java mode (NJ clear) keeps
+  denormal operands and results (IEEE 754) in the arithmetic, compares,
+  rounding, conversions and dot products; each instruction runs its
+  non-Java form inline and its Java form out of line (`XF_VFP` in
+  `vmx_float.h`: a load and a branch not taken). The D3D packs and the
+  estimate tables are the same in both modes (unknown on the console; an
+  estimate of a denormal divides). Restoring a CONTEXT leaves NJ alone.
+  Xenia switches its denormal mode on `mtvscr`'s NJ too. `vmaddfp`/`vnmsubfp` round once (`std::fma`; one
   instruction with FMA in the build). Where the console's tests contradict
   Xenia, the console wins: a NaN comes out quieted, the first in operand
   order vA, vB, vC; `vnmsubfp` does not negate a NaN; invalid operations
@@ -611,6 +629,204 @@ segments, 0 mismatches, 20 differences after memory read changed (the
 kernel's time stamp bundle, audio positions), 130 given up at MMIO; one in 5,
 40 s: 396,431 segments, 0 mismatches.
 
+## The differential fuzzer
+
+Random instruction sequences through three runners, every field of the
+state after compared (2026-11-08; `xenoforge/fuzz.h`, `fuzz_format.h`,
+`tools/xffuzz.cpp`):
+
+- **The cases**: for each of the 442 instructions the generator makes (all
+  456 but branches, `sc`, the traps, `mftb` and the MSR writes, which the
+  emitter's and kernel's own tests cover), N cases whose focus it is: alone
+  (60%) or followed by one to three random others, now and then with a
+  forward `bc` over the next one (reading CR or CTR, decrementing CTR). The
+  words are random in every field that still decodes to the instruction;
+  loads and stores are made r1-relative (r1 points into a 2 KB window of
+  random words; r2 is a small index) and nothing writes r1 or r2. Operands
+  come from edge pools: GPRs (0, -1, the 32- and 64-bit extremes, carries'
+  edges, shift counts), doubles (signed zeros, infinities, quiet and
+  signalling NaNs with payloads, double and single denormals, the single
+  range's edges, rounding ties to single, the integer conversions' edges),
+  floats and words for the vectors (the same, plus saturation's edges and
+  the D3D packs' 3.0 + x), random FPSCR status, exception and enable bits,
+  XER, CR, CTR and VSCR[SAT]. The rounding mode starts at nearest: Xenia
+  applies FPSCR[RN] only when mtfsf/mtfsfi/mtfsb set it, so the sequences
+  set it themselves.
+- **The runners**: the interpreter (`xffuzz run`); the generated code
+  (`xffuzz emit` recompiles the cases, built at `-O2 -mfma -mavx2` as the
+  games are; `ppc_fuzz_test`, in ctest, runs a fixed seed's 5,308 cases
+  both ways); Xenia's x64 JIT (`tools/xenia_oracle/ppc_exec_oracle.cc`,
+  its test runner's setup: `build.bat exec`).
+- **The comparison** (`xffuzz compare <cases> <a> <b> [--singles] [--known]
+  [--ignore fields] [--only ops] [--examples N]`): the cases by their focus
+  instruction, the fields that differ counted, examples with the operands
+  the instructions name. `--known` takes out of Xenia's state the
+  departures this document makes on purpose (the list above: OE and
+  CR's SO, CA in the OE forms, SAT, mfxer's and mcrxr's OV and SO,
+  sraw/srad's CA, the FPSCR without Rc, and the instructions Xenia lacks),
+  so what is left is what nothing here explains yet.
+
+Run 2026-11-08 (seed 2, 60 cases per instruction, 26,540 cases):
+
+- interpreter and generated code: 0 differences (and 0 in ctest's 5,303);
+- the interpreter and Xenia: 9,376 of 26,376 differ before `--known`;
+  with it, and singles only, 797 of 14,886 in 53 instructions, every one
+  explained by the departures above, which follow the console's tests or
+  the manuals:
+  - the FP Rc forms' CR1 and FPSCR (ours: the exception and status bits the
+    console-generated tests hold; Xenia clears FEX and VX, keeps few bits);
+  - FP values: the positive default NaN (Xenia's is x86's, negative), NaNs
+    not negated by `fnm*`, `fctiw*` of a NaN, single forms with a
+    double-denormal operand, one rounding in the fused single forms and
+    in `fsubs` and the like with operands that are not singles (Xenia
+    rounds twice: a tie to single rounded to even where the exact result
+    is below it), `frsp` quieting a signalling NaN, `fres`'s estimate
+    (neither side has the console's);
+  - VMX floating point in non-Java mode: denormal operands and results
+    flushed (Xenia's x64 path takes some denormal operands as they are,
+    and rounds results up to the smallest normal where the exact result
+    is denormal), NaNs quieted in `vmaxfp`/`vminfp`, `vnmsubfp` not
+    negating a NaN, `vcmpbfp` on a NaN, the console's `vrefp` estimate,
+    invalid results 0x7FC00000 (`vlogefp` of a negative number);
+  - `mtvscr`'s NJ bit, found here: ignored then, modeled since (VSCR,
+    above; NJ now agrees in all 59 `mtvscr` cases), and its SAT (Xenia's
+    `mtvscr` sets only its copy of VSCR).
+- Xenia ran 1 case into a fault (an `addze` sequence); the interpreter
+  reports 30 `vpkd3d128`/`vupkd3d128` cases with a pack type the console's
+  D3D never uses as unimplemented, where Xenia compiles them as nothing.
+
+Running it again: `xffuzz gen cases.xfz --seed S --per-op N`, `xffuzz run
+cases.xfz ours.xfs`, `ppc_exec_oracle cases.xfz xenia.xfs`, then `xffuzz
+compare cases.xfz ours.xfs xenia.xfs --names xf,xenia --known --ignore
+fpscr --singles`. A case file holds 4.7 KB a case (the vector registers
+and the memory window): 60 per instruction is 125 MB, outside the
+repository (`../external/fuzz`).
+
+## Where the time goes
+
+`boot --profile N [--profile-from S]` (`tools/sampler.cpp`) samples every
+thread of the process about once a millisecond, weighting each sample by
+the cycles the thread spent since the last one (so waiting threads count
+nothing), and prints the swaps a second over the span, the CPU time a swap
+(all threads), the shares by part of the program and the N most sampled
+functions with their hottest offsets (with their source lines where the
+PDB has them; inlined and folded code can be named after a neighbour, and
+`llvm-symbolizer --inlines` on the address gives the inline chain). The
+generated functions' names come from the PDB's public symbols (their code
+is built without debug information); a game library has none, so its
+addresses are named from the modules' function tables (the nearest
+function at or below, `xf_<guest address>`; `sampler::name_generated`).
+`--profile-thread <name>` samples the one guest thread so named (the
+kernel's own, as "GPU commands", or the guest's SetThreadName; `0x...`, the
+one starting at that address, for threads without a name) with its stack
+walked at each sample (x64 unwind data) and adds each function's inclusive
+share. The thread report gives
+each guest thread's host CPU time and host thread id (host threads are
+named "xf guest <id> <name>"), for matching any outside tool's samples.
+Windows only for now.
+
+What it showed (2026-11-08, `--render`, 20 to 60 s):
+- game A, at 30 swaps a second (its cap): 52 ms of CPU a swap, of which
+  the generated code about 23% (much of it the engine's spin waits:
+  `or r31,r31,r31` priority hints in a `bdnz` loop polling a flag), the
+  host's waits and yields about 60% (a guest thread polling
+  `KeDelayExecutionThread(0)`: `SwitchToThread`), the kernel's clock
+  (`QueryPerformanceCounter` behind `mftb` and the scheduler's `now`) 5%,
+  a `std::map<std::string>` count per import call and its allocations 4%;
+- game B, at its cap: 25 ms a swap, the generated code over 60%, half of
+  it the same spin wait (`__savegprlr`/`__restgprlr` 7-10%).
+Since then (docs/runtime.md, "Polling threads nap" and "The host clock"):
+the zero-delay poll naps, which took game A to 27 ms of CPU a swap at 30
+swaps a second; the clock's read was the counter read itself (QPC is the
+TSC with a fence here), which a spin loop only repeats faster.
+So swaps a second do not move with the code's speed in either, and CPU
+time a swap mostly measures the spinning. The measure for the generated
+code's speed is the deterministic mode, which runs every thread on one
+host thread as fast as it can (`--deterministic --until-swap N`): the
+process's CPU time to the same swap with the same guest memory hash.
+
+**Guest memory apart from the context** (`ppc_ops.h`, `host`): the
+compiler did not know a guest store cannot write the `Context`, so after
+every store it reloaded the base and every register it held. Telling it
+(`__builtin_assume_separate_storage`) lets registers stay in host
+registers across stores. Game B, deterministic to swap 3,000, CPU time,
+three runs each interleaved (another agent's clang and Xenia running,
+59-79% load): before 18.80, 19.67, 18.97 s (median 18.97); after 16.66,
+16.44, 18.97 s (median 16.66): 12% less. The same guest memory hash.
+
+**The floating point slow paths take no context** (`ppc_ops/fpu.h`,
+2026-11-09). An arithmetic instruction leaves its fast path for
+`fp_arith`, a conversion to integer for `fp_to_int`, an unordered compare
+for `fp_compare_unordered`. Each took the `Context`, so to the compiler
+each call (one per instruction, though it rarely runs) could write any
+register in it and any memory: every register the code held was reloaded
+after it, and clang's GVN looked for what was stored where through every
+one of those calls. Without Rc they only read the FPSCR, so they now take
+it by value and return their result (`fp_arith_value`,
+`fp_to_int_value`, `[[gnu::const]]`); the Rc forms and the unordered
+compare write the FPSCR and CR1 from what the call returns, in the
+generated code. Game D's longest function (27,500 instructions, almost
+all `lfs`, `stfs` and single-precision arithmetic: about 14 minutes of a
+15-minute build, the other 283 files done in 4) went from 14 minutes of
+clang to 261 s, GVN from most of it to 78 s.
+
+**Very long functions in parts** (`recomp_emit.cpp`, `XF_PART`): clang's
+optimizer still took time growing faster than the function's length (GVN,
+the SLP vectorizer, DSE, the code generator: 9 ms an instruction there
+against about 0.5 in ordinary code). In a function of more than 4,096
+instructions, each stretch of straight-line code (no branch, no label
+inside, no hook) of 256 instructions or more goes, 1,024 at a time, into
+a part: a static member function, never inlined, of a class local to the
+function (`struct xf_parts`, so the file splitting of a rejected file
+keeps it with its function), which the body calls where the stretch was;
+a label at the stretch's start stays before the call. Game D's longest
+in 1,024-instruction parts: 38 s (2,048: 48 s; 512: 33 s). A part costs a
+call and the registers it holds in the context read again, once every
+thousand instructions. Compiler memory barriers every 2,048 instructions
+in the one function instead changed nothing (255 s), nor did GVN's own
+limits (`-memdep-block-number-limit`, `-enable-load-pre=false`); the
+MemorySSA GVN took twice as long. Game D has 11 functions over 4,096
+instructions of its 85,859. The 3DS runtime, whose generated C keeps the
+guest's registers in locals synced with the context around calls, does
+not meet this: its longest function in a game we built (21,742 lines of C)
+compiles in 12 s, GVN 0.5 s.
+
+**Registers in locals, weighed and not done** (2026-11-09). With the long
+functions in parts, clang's time on an ordinary file has no one cost that
+locals would remove (`-ftime-report`, game A, two files of 34,000 lines:
+4.5 and 7.5 s): instruction selection 20-23%, InstCombine 10%, the SLP
+vectorizer 6-10%, the always-inliner 6-8%, GVN 6-9%, EarlyCSE 3-5%, DSE
+3-4%, the front end 6-21%. The passes that follow the context through
+memory (GVN, EarlyCSE, DSE, LICM) are 15-23% together, and locals would
+trade part of that for SROA's work and for the emitter's: which registers
+each instruction reads and writes, and every one written stored back
+before each call, return and yield point (a PPC function calls every ten
+to twenty instructions). A tenth of the time at best, for a second
+description of each instruction.
+
+**The header precompiled** (`game_build.cpp`, `Build::compile`): every
+functions file parsed `ppc_generated.h` again, 0.55-0.6 s of clang each
+(a tenth of an ordinary file's time; 290 files in game A). The recompile
+step precompiles it once a build (0.7 s) for the functions files
+(`-include-pch`); the objects' code is the same, byte for byte.
+
+**VSCR[NJ]'s cost** (the same measure, with and without it, interleaved,
+13-49% load): without 16.78, 16.81, 16.09 s; with 16.56, 17.16, 16.67 s
+(medians 16.78 and 16.67): none measurable, so it is not behind a switch.
+Two of those six runs, both slow on the wall clock (24 and 30 s for 17 s
+of CPU), ended with another guest memory hash than the other four: the
+deterministic mode is not quite deterministic under the host's load
+(open, the kernel's).
+
+**Against Xenia** (game B, `--render` and Xenia's Vulkan window, 20 to
+60 s, interleaved, 18-99% load from other builds): CPU time a frame, ours
+before the change 26.8, 26.3, 23.5 ms against Xenia's 31.2, 29.8, 27.6 ms
+(ratio of medians 0.88); after 32.5, 28.5, 28.9 ms against 31.4, 32.5,
+33.1 ms (0.89). Both run at the game's own pace (ours 30-50 swaps a
+second, Xenia 32-45 frames a second by its title bar, through the Vulkan
+SDK's monitor layer), so these mostly compare the spinning, and the load
+moved them more than the change did.
+
 ## PPC in the host debugger
 
 `xfrecomp emit ... --listing` writes `functions_K.ppc` beside each
@@ -860,3 +1076,109 @@ two calls (`Runtime::hooked`, `mid_hook`), so its version changed.
 4. Emission: C++ per function, the dispatch table, the listing; the
    instruction tests recompiled; both games compiled, then every module
    of the eight games, a table each.
+
+## Vector float arithmetic on whole vectors (2026-11-11)
+
+A game in play had a thread of its own at two thirds of a host core: its
+sound mixer, VMX128 float code (`vaddfp128`, `vmulfp128`, `vmaddfp`, unaligned
+loads and stores), one function of it 4.7% of the whole process. The vector
+unit's arithmetic was done lane by lane on the bits (`vfp::lanes`: the
+operands' denormals flushed, the NaNs quieted in operand order, the result's
+NaN and denormal handled), a dozen operations and three branches a lane.
+
+`vfp::add4`, `sub4`, `mul4`, `madd4` and `nmsub4` (ppc_ops/vmx_float.h) give
+the same bits from the whole vector, by the compiler's vector types (SSE or
+NEON as the host has, no intrinsics: the game library is built without the
+standard headers): the operands flushed, the operation, the result's NaN
+made the invalid operation's and its denormal flushed. A NaN among the
+operands goes the lane-by-lane way, as does Java mode. Alone (a loop of
+each over random and special values, the same bits both ways): an add 6.1
+to 1.6 ns, a multiply-add 8.2 to 2.1 ns. The instruction tests pass as
+before, interpreted and recompiled (141,705 cases). In play: the mixer's
+thread 63% to 47% of a core, its hot function 4.7% to 1.5% of the process.
+Then the same way: minimum and maximum (`max4`, `min4`), the compares
+(`cmp_eq`, `cmp_ge`, `cmp_gt`) and the conversion from signed words
+(`from_signed`). Left lane by lane: the estimates (tables read by the bits),
+the conversions to integers (in double, saturating), the conversion from
+unsigned words and the dot products (four products and their sums in
+double already). Counted over one game's code, the forms done are the ones
+it is made of: multiply 11,135 instructions, multiply-add 7,920, subtract
+6,227, negative multiply-subtract 2,809, add 2,786, against 800 minimum and
+maximum, 1,150 compares, 1,140 conversions from words.
+
+**A 32-bit access's two checks** (`ppc_ops.h`: the devices' registers at
+0x7FC80000, the 4 KB offset of the 0xE0000000 view) were looked at for
+leaving out and stay: a game run without the first on loads faulted reading
+a GPU register with `lwz`, and without the second ran another course (it
+uses that memory). Sparing loads the first would take the GPU's registers
+kept big-endian in guest memory where they are read; sparing the second a
+mapping of that view without its offset, which Windows' 64 KB mapping
+granularity does not give. Neither's gain was measured: the checks cannot
+be removed to time what they cost.
+
+## The calls' cost, measured before a new emitter (2026-11-11)
+
+Asked: whether to emit LLVM IR instead of C++, for a calling convention of
+the generated code's own (RPCS3's translator does: IR by hand, the GHC
+convention, every guest call a tail call, r0, r1 and r2 the only guest
+registers passed in host registers, the rest in the thread's structure,
+`refs/rpcs3/rpcs3/Emu/Cell/PPUTranslator.cpp`). Within a function the C++
+already keeps the guest's registers in host registers between calls
+(`__builtin_assume_separate_storage`), so what a new emitter could gain is
+at the calls. Two experiments on the emitter as it is, timed on a game run
+deterministically to the same swap (the run's whole host time, the three
+builds in turn, eight rounds, medians; other measures of it were too
+noisy to use, and a first reading of 13% was the measure's, not the code's):
+
+| build | median | fastest |
+| --- | --- | --- |
+| as it is | 16.33 s | 16.15 s |
+| the register save and restore helpers (`__savegprlr_N`, `__restgprlr_N` and the others) emitted in place of the call to them | 16.37 s | 15.96 s |
+| and each direct call told to leave the non-volatile registers the function names as they were (their values before it, `__builtin_assume` of the same after) | 16.19 s | 15.92 s |
+
+Neither is worth 1.5% of the run, of which the generated code that is not
+the game's spin wait is about half: the calls are not where the time is,
+and a new emitter for their sake would not pay. Both were taken out again.
+
+What the code is made of, counted over one game (69,231 functions): 63.5% of
+its instructions are in functions with the helpers' prologue and epilogue,
+23.6% in functions that save registers with their own stores, 12.8% in
+functions that name no non-volatile register, and 12 functions use them
+another way: the calling convention holds nearly everywhere, should
+something later need to rely on it.
+
+A benchmark of the generated code is still missing: this run is two fifths
+the game's wait for the GPU thread (a spin in its Direct3D) and the
+scheduler, and the machine's other work moved single runs by a tenth.
+
+## The compile time by optimization level, measured before two tiers (2026-11-11)
+
+The plan was two tiers: a library built quickly without optimization so a
+game starts sooner, and the optimized one built behind it. Measured first,
+on four files of a game's generated code (about a megabyte and 35,000
+lines each; clang 23, the recompile step's flags, one compiler at a time,
+twice):
+
+| flags | the four files | an object |
+| --- | --- | --- |
+| `-O2` (the recompile step's) | 17.6 to 18.0 s | 565 KB |
+| `-O2 -fno-slp-vectorize -fno-vectorize` | 15.8 to 17.3 s | 558 KB |
+| `-O1` | 14.0 to 15.4 s | 557 KB |
+| `-O0` | 13.6 s | 6,536 KB |
+
+Without optimization the compiler takes a quarter less time and makes
+objects eleven times larger (the instructions' helpers are always inlined,
+and what is inlined is then emitted as written), which the linker and the
+game then pay for. `-ftime-trace` on one file at `-O2` (4.1 s): the front
+end 0.6 s, the optimizer 2.2 s (1.3 s of it inlining), the code generator
+1.3 s. So the time follows the size of the code a guest instruction
+becomes, not the level: a first tier at `-O0` or `-O1` gains too little
+to be worth a second build of everything, and was not made.
+
+What does shorten the wait, in the order it would pay: more compilers at
+once where the memory allows (four is the limit set for 16 GB; the step
+takes about eight minutes a game with them), a smaller expansion of the
+commonest instructions (each inlined helper is compiled once a use), and
+starting the game on the interpreter while the library is built (the
+runtime falls back to it for code without a function already), which is
+the owner's to decide: it is slow while it lasts.

@@ -14,3 +14,5 @@ re/
 docs/plan.md
 .vscode/settings.json
 xbox.jpg
+# left by Xenia's tools (the oracle) when one is run from this folder
+xconfig.settings

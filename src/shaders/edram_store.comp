@@ -28,7 +28,7 @@ void main() {
     uint samples = target.msaa == 0u ? 1u : target.msaa == 1u ? 2u : 4u;
     for (uint host = 0u; host < samples; host++) {
         uint at = edram_offset(pixel, guest_sample(host));
-        if (mask.tiles[at / TILE_DWORDS] == 0u) continue;
+        if (mask.tiles[at / tile_dwords()] == 0u) continue;
 #ifdef MS
         vec4 value = texelFetch(source, ivec2(pixel), int(host));
 #else

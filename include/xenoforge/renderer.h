@@ -46,10 +46,18 @@ struct Image {
 
 struct Report {
     uint64_t packets = 0;             // the processor's (replay only)
+    // replay only, with repeat: the time each play after the first spent in the command processor
+    // and what it calls (the renderer's CPU side), without the trace's walk and the memory it
+    // restores: the work of a game's command thread for the frame
+    std::vector<double> command_seconds;
+    // and the thread's processor time in it a play, the mean of those plays: what the commands
+    // cost the thread without what it waited for (the GPU, a pipeline)
+    double command_cpu_seconds = 0;
     uint64_t draws = 0, drawn = 0;    // outside copy mode; of them, done
     uint64_t resolves = 0, swaps = 0; // draws in copy mode; XE_SWAP packets
     uint64_t frames = 0;              // front buffers read back (the swaps asked for)
     uint64_t render_targets = 0, textures = 0, pipelines = 0, shaders = 0; // textures: loads
+    uint64_t samplers_reused = 0; // samplers destroyed to free their slot in the full bindless table
     // The texture cache: the textures it holds now and the GPU memory their
     // images take (the most it took), those destroyed by the memory limits
     // (Options::texture_memory_*) and to make room in a full bindless table,
@@ -60,8 +68,17 @@ struct Report {
     // CPU wrote (its watches), one whose memory a resolve or a memory export
     // wrote (render to texture, loaded again from the mirror on the GPU)
     uint64_t texture_loads_new = 0, texture_loads_cpu_written = 0, texture_loads_gpu_written = 0;
+    uint64_t resolve_targets_written = 0; // resolves that wrote the texture they feed too (not loaded again)
+    uint64_t resolve_targets_reclaimed = 0; // places in the resolves' table taken from a texture unused since
+    uint64_t textures_scaled = 0;         // textures made the resolution scale's (Options::resolution_scale)
     uint64_t textures_evicted = 0, textures_evicted_for_room = 0, textures_refused = 0;
     uint64_t occlusion_queries = 0, zpd_reports = 0; // host queries begun, reports answered with their counts
+    // screen extent reports (EVENT_WRITE_EXT) the sink was asked for, and
+    // those it bounded (the others the whole screen)
+    uint64_t extent_reports = 0, extent_bounded = 0;
+    // VIZ queries ended, those whose count predicates their draws (the
+    // device's conditional rendering), and the draws drawn so predicated
+    uint64_t viz_queries = 0, viz_armed = 0, viz_predicated = 0;
     double seconds = 0;                          // spent in the renderer's calls, of which:
     double submit_seconds = 0;                   //   submitting work and waiting for the GPU, of which:
     double wait_seconds = 0;                     //     waiting for the GPU to finish work
@@ -71,23 +88,43 @@ struct Report {
     double resolve_seconds = 0;                  //   recording resolves (their waits counted in submit_seconds too)
     double writeback_seconds = 0;                //   copying what resolves wrote into guest memory, once done
     double pipeline_seconds = 0;                 //   making pipelines (the driver compiling the shaders)
+    // translating shaders to SPIR-V and making their modules on the
+    // renderer's thread (a shader's first form and its other forms), the
+    // modules so made, the longest one, and the most in one frame
+    double translate_seconds = 0, translate_max = 0, translate_frame_max = 0;
+    uint64_t translations = 0;
+    // and those made on the translation workers instead, with their time
+    // there (the renderer's thread drawing with the generic shaders meanwhile)
+    uint64_t translations_async = 0;
+    double translate_async_seconds = 0;
     uint64_t pipeline_cache_read = 0;            // bytes of pipeline cache read from disk at the start
     uint64_t pipeline_cache_written = 0;         // bytes of it written back, the last time
     uint64_t vertex_bytes = 0;                   // the vertex data uploaded (the pages that differed)
     uint64_t writeback_bytes = 0;                // what resolves wrote, copied into guest memory
     uint64_t submissions = 0, waits = 0;         // command buffers submitted; waits for the GPU
+    uint64_t shader_loads_again = 0;             // IM_LOADs of a shader from its unwritten words (none copied)
     // Pipelines (Options::pipeline_stand_in): besides the whole ones counted
     // in `pipelines` above, the libraries of their parts made, the pipelines
     // linked from them and the placeholders made; the draws drawn by a
     // stand-in (a placeholder or a linked pipeline) while their own pipeline
     // was made
     uint64_t pipeline_libraries = 0, pipelines_linked = 0, pipeline_placeholders = 0, stand_in_draws = 0;
+    // The generic shaders (Options::generic_shaders): the shaders' programs
+    // written to their buffer, the generic stand-ins linked, the draws they
+    // drew; and why a draw waiting for its pipeline could not be drawn by
+    // them, by reason
+    uint64_t generic_programs = 0, generic_pipelines = 0, generic_draws = 0;
+    std::map<std::string, uint64_t> generic_refused;
     // The shader and pipeline storage (Options::shader_storage): the shaders
     // and pipeline descriptions this run added to it; the pipelines and
     // libraries the launcher's build step had made into the pipeline cache
     // for this device and driver, made at once from it (render::precompile)
     uint64_t shaders_stored = 0, pipelines_stored = 0;
     uint64_t pipelines_prebuilt = 0, pipeline_libraries_prebuilt = 0;
+    // of those, the ones the pipeline cache did not hold after all (the
+    // driver would have compiled them: a cache another build of the driver
+    // or of the translator wrote), left to the workers instead
+    uint64_t pipelines_prebuilt_missed = 0, pipeline_libraries_prebuilt_missed = 0;
     // The pipelines made on the workers, and how long their draws went
     // without one (from the first draw asking to the first drawn, by the
     // pipeline or its stand-in): in all and at most
@@ -168,6 +205,10 @@ enum class ReadbackResolve {
 
 struct Options {
     bool verbose = false; // a line per draw and resolve on stderr
+    // The clock read around the work done at every draw, texture and shader load too: without it
+    // Report::check_seconds and vertex_seconds stay 0 and Report::seconds leaves out the calls that
+    // neither draw, resolve nor swap. For the tools that print them (XF_RENDERER_CPU_TIMES=1 anywhere).
+    bool cpu_times = false;
     ReadbackResolve readback_resolve = ReadbackResolve::none;
     // where to write each shader loaded, as Xenia's --dump_shaders writes
     // them (shader_<hash>.ucode.bin.vert or .frag, words in host order; the
@@ -233,14 +274,34 @@ struct Options {
         library,
     };
     PipelineStandIn pipeline_stand_in = PipelineStandIn::library;
+    // The generic shaders (docs/renderer.md, "The generic shaders"): with
+    // library stand-ins, a draw whose pipeline and exact stand-in are not
+    // made yet is drawn by a pipeline linked from the libraries of an
+    // interpreter of the microcode (generic.glsl) that runs its shaders from
+    // a buffer; those libraries are few (by state, not by shader), made once
+    // on the workers and kept in the pipeline cache. XF_GENERIC_SHADERS=0
+    // turns it off.
+    bool generic_shaders = true;
+    // Every draw the generic shaders can draw drawn by them, as whole
+    // pipelines made at once (xfreplay --generic): to check what they draw
+    // against the translated shaders' pictures
+    bool generic_only = false;
     // Every draw drawn by a pipeline linked from libraries, made at once,
     // never by the whole pipeline: to check that linked pipelines draw what
     // whole ones do (xfreplay --linked-pipelines); needs the device's
     // libraries
     bool linked_pipelines_only = false;
+    // Resolves write the texture a later draw reads over their destination
+    // as well as memory, instead of the texture being loaded again from
+    // memory (beyond Xenia; docs/renderer.md, "Resolve targets"). On where
+    // the device updates storage image descriptors after binding;
+    // true (or XF_RESOLVE_TARGETS=0) turns it off: Xenia's reload.
+    bool no_resolve_targets = false;
     // what replay() has its processor write in occlusion query reports
     // (live, the caller sets its processor's: tools/game.cpp)
     gpu::OcclusionQueries occlusion_queries = gpu::OcclusionQueries::Fake;
+    // and in screen extent reports (live, the caller's: XF_SCREEN_EXTENTS)
+    gpu::ScreenExtents screen_extents = gpu::ScreenExtents::Measured;
     // GPU timestamps around each kind of work (draws by render pass, EDRAM
     // loads and stores, resolves, texture loads, the swap's read-back), summed
     // into Report::gpu_time as submissions finish
@@ -264,6 +325,16 @@ struct Options {
     // default as there); off, or on a device that cannot blend that format,
     // the pixel shader writes the gamma curve and the blend works on it
     bool gamma_render_target_as_unorm16 = true;
+    // 2x and 4x host render targets rasterized at the Xenos's sample positions
+    // rather than the host's standard ones, where the device places samples
+    // (VK_EXT_sample_locations): edges, alpha to coverage and
+    // the depth a resolve takes from a sample then lie where the console's
+    // do, as on the interlock path, which always takes them (Xenia's
+    // xenos_sample_positions, off by default there; on here since 2026-11-09:
+    // the host path's edges come within a few pixels of the exact path's
+    // for a fiftieth more GPU time; XF_XENOS_SAMPLE_POSITIONS=1 or 0
+    // overrides)
+    bool xenos_sample_positions = true;
     // The depth of draws into a D24FS8 target with the depth test on written
     // by the pixel shader rounded to 20e4 (towards zero, or to the nearest
     // even with depth_float24_round), so the host's depth holds only what
@@ -300,6 +371,21 @@ struct Options {
     uint32_t texture_memory_hard_mb = 768;
     uint32_t texture_memory_soft_lifetime_s = 30;
     uint32_t texture_memory_render_to_texture_mb = 24;
+    // The resolution scale (docs/renderer.md, "Resolution scale"; render_scale.h), in quarters: 4 draws at the
+    // console's size, 2-32 at 50-800% of it, as RPCS3's resolution scale and Xenia's draw_resolution_scale. Render
+    // targets and EDRAM drawn at it, resolves read it and write the textures they feed at it; guest memory, and so
+    // everything the CPU reads (read-backs, memory exports, the front buffer a game copies) at the console's size.
+    // XF_RESOLUTION_SCALE=<percent> sets it too.
+    uint32_t resolution_scale = 4;
+    // RPCS3's minimum scalable dimension, in console pixels: a resolve or a texture smaller than it along either
+    // axis stays at the console's size
+    uint32_t min_scalable = 16;
+    // Texture filtering beyond the game's (set_texture_filtering changes them live): anisotropy forced (0: the
+    // game's; else 1, 2, 4, 8 or 16) on mipmapped textures the game filters linearly, as Xenia's
+    // anisotropic_override; and the filters: 0 the game's, 1 trilinear (linear between mips where the game filters
+    // each linearly), 2 nearest everywhere
+    uint32_t anisotropy = 0;
+    uint32_t texture_filter = 0;
 };
 
 // The render target path a renderer takes with these options on the device
@@ -334,6 +420,13 @@ public:
     // buffers asked for so far have gone to on_frame (on this thread) and
     // guest memory holds what resolves wrote; from any thread
     virtual void drain() = 0;
+    // Options::anisotropy and texture_filter changed while it runs: the draws after it sample with them (their
+    // samplers made as they are asked for); from any thread
+    virtual void set_texture_filtering(uint32_t anisotropy, uint32_t filter) = 0;
+    // the resolution scale it draws at, in quarters (Options::resolution_scale, or less where the device could not
+    // hold EDRAM at that scale: the notice says so), and why it differs from the one asked for ("" when it does not)
+    virtual uint32_t resolution_scale() const = 0;
+    virtual std::string scale_notice() const = 0;
 };
 
 // Replays the trace through a command processor of its own, as Xenia's trace
@@ -362,6 +455,13 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
 struct PrecompileOptions {
     bool whole_pipelines = true;                 // besides the libraries
     std::vector<std::pair<uint32_t, std::vector<uint32_t>>> extra_shaders; // type (0 vertex, 1 pixel), microcode
+    // The extra shaders that no run met have no pipeline's description, so
+    // no state of their own: each is made into the library of its shader's
+    // part (the pre-rasterization shaders' for a vertex shader, the fragment
+    // shader's for a pixel shader) in the states the storage's descriptions
+    // give that part most often, this many of them, its form and fixed state
+    // as theirs with the shader replaced. 0: none.
+    uint32_t extra_variants = 4;
     std::function<void(uint64_t done, uint64_t total)> progress;
     const std::atomic<bool> *cancel = nullptr;
 };
@@ -372,8 +472,35 @@ struct PrecompileReport {
     uint64_t cache_read = 0, cache_written = 0; // bytes
     uint64_t shaders = 0, shaders_failed = 0;   // from the storage, translated or not
     uint64_t extra_shaders = 0, extra_failed = 0, extra_new = 0; // the extra ones; not in the storage
+    // extra vertex shaders as Direct3D keeps them before binding, their
+    // fetches' formats left for the vertex declaration
+    // (ucode::awaits_vertex_declaration): not translated, not failures
+    uint64_t extra_undeclared = 0;
     uint64_t descriptions = 0, descriptions_failed = 0, descriptions_done_before = 0;
+    // why the failed ones could not be made back, each reason's count
+    std::map<std::string, uint64_t> descriptions_failed_why;
     uint64_t libraries = 0, libraries_failed = 0, pipelines = 0, pipelines_failed = 0;
+    // PrecompileOptions::extra_variants: the states taken for them (of the
+    // distinct ones the descriptions give the vertex and the pixel shaders'
+    // parts), and of the libraries counted above those of extra shaders, made
+    // and failed; variants not made here (the form cannot be made for that
+    // shader) and those made before
+    uint64_t variant_states = 0, variant_states_seen = 0;
+    // the check of those states: of the libraries runs made of the extra
+    // shaders they did meet, how many lie in the states taken (a guess of how
+    // many of an unmet shader's the step makes ahead; those shaders weigh in
+    // the choice of the states too)
+    uint64_t variant_check_libraries = 0, variant_check_covered = 0;
+    // of the libraries above, the generic shaders' (Options::generic_shaders)
+    // in the descriptions' states, made and failed
+    uint64_t generic_libraries = 0, generic_libraries_failed = 0;
+    // descriptions of the other render target path than this renderer's (a
+    // run on the host's render targets, a step on the exact EDRAM, or the
+    // reverse): made as any other, but the generic shaders' libraries in
+    // their states are that path's (a step on that path makes them)
+    uint64_t descriptions_other_path = 0;
+    uint64_t extra_libraries = 0, extra_libraries_failed = 0, extra_libraries_unmade = 0,
+             extra_libraries_done_before = 0;
     double seconds = 0, driver_seconds = 0; // in all; the workers' time making them
 };
 bool precompile(vk::Device &device, const Options &options, const PrecompileOptions &precompile,
