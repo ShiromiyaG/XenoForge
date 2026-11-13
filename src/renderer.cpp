@@ -274,6 +274,9 @@ const uint32_t EDRAM_CLEAR[] = {
 const uint32_t EDRAM_RESCALE[] = {
 #include "edram_rescale.comp.inc"
 };
+const uint32_t SCALED_FILL[] = {
+#include "scaled_fill.comp.inc"
+};
 
 // registers xenos.h does not name
 namespace r {
@@ -1871,6 +1874,30 @@ private:
         const char *v = std::getenv("XF_RESOLVE_TARGET_COVER");
         return !(v && v[0] == '0');
     }();
+    // and a stale one at the resolution scale too, its scaled texels written
+    // by the scaled pass (XF_SCALED_COVER=0: those loaded again; game G's
+    // shadow atlas at 200%, 0.83 ms a play)
+    bool scaled_cover_ = [] {
+        const char *v = std::getenv("XF_SCALED_COVER");
+        return !(v && v[0] == '0');
+    }();
+    // At a resolution scale, a resolve leaves its destination out of resolved
+    // memory at the scale where no texture load looked there since resolves
+    // of two frames wrote it (its pages' tags cleared: the textures it feeds
+    // take what it wrote). A texture loaded there next is the console's size
+    // that once, and its pages are written by every resolve from then on.
+    // XF_SCALED_MEMORY_UNREAD=1: every resolve writes it (Impl::ScaledRegion).
+    bool scaled_skip_unread_ = [] {
+        const char *v = std::getenv("XF_SCALED_MEMORY_UNREAD");
+        return !(v && v[0] == '1');
+    }();
+    // a page's resolved memory at the scale (0: never written): bits 0-4 the
+    // frames whose resolves wrote it since a texture load last looked there,
+    // bit 5 left out since, bit 6 looked at since the last write, bit 7
+    // always written (a load found it left out); and the swap of its last
+    // write counted
+    std::vector<uint8_t> scaled_reads_;
+    std::vector<uint32_t> scaled_write_swaps_;
     void approximate(const char *what) {
         approximate_by_literal_[what]++, approximations_++;
         if (front_recording_) front_counts_.push_back({what, true});
@@ -2055,6 +2082,57 @@ private:
     std::map<uint32_t, ScaledResolve> scaled_resolves_;
     ScaledResolve *scaled_resolve(const resolve::Info &info, const std::vector<Range> &written);
     void drop_scaled_resolves(const std::vector<Range> &written, bool all = false);
+    // Resolved memory at the resolution scale (docs/renderer.md, "Resolution
+    // scale"; Xenia's scaled resolve buffer): what a resolve writes, also kept
+    // at the scale in a heap on the GPU, for every texture over it to load at
+    // the scale (texture_load.comp from it, by tiling.glsl's
+    // scaled_offset_2d), whatever its format, size, layers or offset; guest
+    // memory and the mirror keep the console's size. Regions of guest memory
+    // (64 KB aligned, merged with those within 256 KB) each own a run of the heap, the
+    // region's bytes times the scale's area. A 4 KB page's tag says what its
+    // scaled bytes hold: 0 nothing current, else the bytes per block's log2
+    // plus one and, for 64- and 128-bit blocks (whose tiles span two and four
+    // pages), the page's place in its tile from bit 4. Cleared by what else
+    // writes there: the CPU (request), exports, resolves not kept at the
+    // scale. XF_SCALED_MEMORY=0: none (the textures no resolve feeds whole
+    // stay the console's size, as before).
+    struct ScaledRegion {
+        uint32_t end = 0;
+        VkDeviceSize heap = 0;
+    };
+    bool scaled_memory_ = false;
+    vk::Buffer scaled_heap_;
+    VkDeviceSize scaled_heap_used_ = 0;
+    std::map<uint32_t, ScaledRegion> scaled_regions_;
+    std::vector<uint8_t> scaled_tags_;
+    VkDescriptorSet scaled_resolve_set_ = VK_NULL_HANDLE, scaled_load_set_ = VK_NULL_HANDLE,
+                    scaled_fill_set_ = VK_NULL_HANDLE;
+    VkPipeline scaled_fill_pipeline_ = VK_NULL_HANDLE;
+    const std::pair<const uint32_t, ScaledRegion> *scaled_region(uint32_t low, uint32_t high) const;
+    const std::pair<const uint32_t, ScaledRegion> *make_scaled_region(uint32_t low, uint32_t high);
+    bool repack_scaled_heap(const std::vector<std::pair<uint32_t, ScaledRegion>> &merged, uint32_t start,
+                            ScaledRegion &region);
+    // An address of a region as the shaders take it (tiling.glsl's
+    // scaled_offset_2d): in guest bytes from the heap's start, its region's
+    // run of the heap (a multiple of 4096 times the scale's area: regions
+    // are 64 KB multiples) counted as the guest bytes it holds
+    uint32_t scaled_rel(const std::pair<const uint32_t, ScaledRegion> &region, uint32_t address) const {
+        return address - region.first + uint32_t(region.second.heap / (scale_.q4 * scale_.q4) * 16);
+    }
+    void write_scaled_sets();
+    void clear_scaled_tags(uint32_t start, uint32_t end) {
+        if (scaled_tags_.empty() || end <= start) return;
+        std::fill(scaled_tags_.begin() + (start >> 12), scaled_tags_.begin() + ((end + 4095) >> 12), uint8_t(0));
+    }
+    void clear_scaled_tags(const std::vector<Range> &ranges) {
+        for (auto [start, end] : ranges) clear_scaled_tags(start, end);
+    }
+    // the tag a page holds when a 2D surface at base with blocks of 1 <<
+    // log2_bytes is kept at the scale there
+    static uint8_t scaled_tag(uint32_t page_address, uint32_t base, uint32_t log2_bytes) {
+        const uint32_t pages = log2_bytes >= 3 ? 1u << (log2_bytes - 2) : 1u;
+        return uint8_t((log2_bytes + 1) | ((((page_address - (base & ~4095u)) >> 12) & (pages - 1)) << 4));
+    }
     uint32_t take_index(uint32_t kind);
     uint32_t room(uint32_t kind) const {
         return uint32_t(free_indices_[kind].size()) + (capacity_[kind] - next_index_[kind]);
@@ -2077,7 +2155,8 @@ private:
     VkDeviceSize texture_bytes_ = 0;
     std::vector<uint32_t> free_indices_[3]; // each table's places given back
     uint64_t limits_applied_at_ = 0;        // done_serial_ when the limits were last applied
-    bool gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload);
+    bool gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload,
+                  const std::pair<const uint32_t, ScaledRegion> *scaled_from = nullptr);
     bool cpu_upload(const vk::Image &target, const texture::Image &image, bool fresh);
     texture::Support support_; // what the device samples (texture_support)
     uint32_t sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides);
@@ -2771,6 +2850,12 @@ private:
     // smaller than min_scalable_ leaves EDRAM at the console's size.
     Scale scale_{};
     uint32_t min_scalable_ = 16;
+    // 64-bit resolve targets made the scale's too (XF_SCALE_WIDE=0: those stay
+    // the console's size)
+    bool scale_wide_ = [] {
+        const char *v = std::getenv("XF_SCALE_WIDE");
+        return !(v && v[0] == '0');
+    }();
     std::string scale_notice_;
     // EDRAM's tiles and dwords at scale_
     uint32_t tile_dwords_ = 1280;
@@ -3709,7 +3794,8 @@ Impl::~Impl() {
         for (VkShaderModule m : modules)
             if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (VkPipeline p : {store_pipelines_[0], store_pipelines_[1], resolve_pipeline_, resolve_image_pipelines_[0],
-                         resolve_image_pipelines_[1], load_pipeline_, clear_pipeline_, rescale_pipeline_})
+                         resolve_image_pipelines_[1], load_pipeline_, clear_pipeline_, rescale_pipeline_,
+                         scaled_fill_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
     for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
                              depth_float24_fs_[1], placeholder_fs_, fsi_depth_fs_})
@@ -3724,7 +3810,8 @@ Impl::~Impl() {
                                     compute_set_layout_, target_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(dev_, l, nullptr);
     for (vk::Buffer *b : {&edram_, &edram_1x_, &host_depth_, &mirror_, &arena_, &draw_data_, &scratch_, &load_scratch_,
-                          &zpd_counters_, &zpd_readback_, &extents_, &extents_readback_, &viz_predicates_})
+                          &zpd_counters_, &zpd_readback_, &extents_, &extents_readback_, &viz_predicates_,
+                          &scaled_heap_})
         d_.destroy(*b);
     for (IndexChunk &chunk : index_chunks_) d_.destroy(chunk.buffer);
 }
@@ -4405,9 +4492,9 @@ bool Impl::init(std::string &error) {
         static_assert(sizeof(EdramTarget) <= sizeof(ResolveConstants));
         if (fsi_ && !(clear_pipeline_ = compute_pipeline(EDRAM_CLEAR, sizeof(EDRAM_CLEAR), resolve_layout_)))
             return error = "could not make the EDRAM clear pipeline", false;
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 10}};
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        pool.maxSets = 5;
+        pool.maxSets = 8;
         pool.poolSizeCount = 1;
         pool.pPoolSizes = sizes;
         if (vkCreateDescriptorPool(dev_, &pool, nullptr, &compute_pool_) != VK_SUCCESS)
@@ -4461,6 +4548,31 @@ bool Impl::init(std::string &error) {
                 writes[k].pBufferInfo = &ends[k];
             }
             vkUpdateDescriptorSets(dev_, 4, writes, 0, nullptr);
+            // resolved memory at the scale (Impl::ScaledRegion): its heap, the
+            // sets that write it (a resolve, from EDRAM; a fill, from the
+            // mirror) and read it (a texture load), the fill's pipeline
+            const char *scaled_memory = std::getenv("XF_SCALED_MEMORY");
+            if (!(scaled_memory && scaled_memory[0] == '0')) {
+                VkDescriptorSetLayout sets3[3] = {compute_set_layout_, compute_set_layout_, compute_set_layout_};
+                VkDescriptorSet made[3];
+                alloc.descriptorSetCount = 3;
+                alloc.pSetLayouts = sets3;
+                scaled_heap_ = d_.create_buffer(VkDeviceSize(16) << 20,
+                                                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                                false);
+                scaled_fill_pipeline_ = compute_pipeline(SCALED_FILL, sizeof(SCALED_FILL), load_layout_);
+                if (scaled_heap_.buffer && scaled_fill_pipeline_ &&
+                    vkAllocateDescriptorSets(dev_, &alloc, made) == VK_SUCCESS) {
+                    scaled_resolve_set_ = made[0], scaled_load_set_ = made[1], scaled_fill_set_ = made[2];
+                    write_scaled_sets();
+                    scaled_tags_.assign(GUEST_MEMORY >> 12, 0);
+                    scaled_reads_.assign(GUEST_MEMORY >> 12, 0);
+                    scaled_write_swaps_.assign(GUEST_MEMORY >> 12, UINT32_MAX);
+                    scaled_memory_ = true;
+                    report_.scaled_heap_bytes = scaled_heap_.size;
+                }
+            }
         }
     }
 
@@ -5287,6 +5399,8 @@ VkDeviceSize Impl::request(const std::vector<Range> &ranges, RequestMemo *memo) 
             mirror_at_[p] = count;
             set_gpu_page(p, false);
         }
+        // (newer than what resolves kept at the resolution scale there)
+        clear_scaled_tags(first << page_shift_, end << page_shift_);
     }
     if (!ahead.empty()) vkCmdCopyBuffer(pre_cmd(), from, mirror_.buffer, uint32_t(ahead.size()), ahead.data());
     if (!copies.empty()) {
@@ -5453,6 +5567,7 @@ void Impl::end_export(const std::vector<Range> &pages) {
     if (pages.empty()) return;
     end_pass();
     drop_scaled_resolves(pages);
+    clear_scaled_tags(pages);
     gpu_written(pages);
     exporting_ = true;
     textures_written_by_gpu(pages);
@@ -7071,7 +7186,8 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         use(std::string(line));
     }
     ScaledResolve *kept = nullptr;
-    if (target && !convert && !scale_.one() && scalable(plan.width, plan.height, min_scalable_) && texel_bytes == 4) {
+    if (target && !convert && !scale_.one() && scalable(plan.width, plan.height, min_scalable_) &&
+        (texel_bytes == 4 || scale_wide_)) {
         auto found = scaled_resolves_.find(plan.slices[0].base & 0x1FFFFFFF);
         if (found != scaled_resolves_.end() && found->second.pitch == plan.slices[0].pitch_blocks &&
             found->second.endian == info.endian && ((found->second.target >> 7) & 1) == (texel_bytes == 8 ? 1u : 0u) &&
@@ -7079,6 +7195,48 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
             kept = &found->second;
             extent = {scale_.up(plan.width), scale_.up(plan.height), 1};
         }
+    }
+    // Over resolved memory kept at the resolution scale (Impl::ScaledRegion):
+    // loaded from there at the scale, as Xenia loads its textures from its
+    // scaled resolve buffer: one level of 2D slices (layers, cube faces),
+    // tiled, of blocks of one texel, no smaller than the minimum scalable
+    // dimension, every page of it in one region and holding this layout's
+    // scaled bytes (made current first: what the CPU wrote since clears that).
+    // What is not is counted by why ("uses" in the report).
+    const std::pair<const uint32_t, ScaledRegion> *scaled_from = nullptr;
+    if (scaled_memory_ && mirror && !kept && !ranges.empty()) {
+        const texture::SliceLoad *first = plan.slices.empty() ? nullptr : &plan.slices[0];
+        bool layout = first != nullptr;
+        for (const texture::SliceLoad &s : plan.slices)
+            layout &= s.level == 0 && s.tiled && !s.is_3d && !s.ox && !s.oy && s.pitch_blocks == first->pitch_blocks;
+        const bool small = !scalable(plan.width, plan.height, min_scalable_);
+        const char *reason = three                                             ? "3D"
+                             : level_count != 1                                ? "mipmapped"
+                             : !layout                                         ? "not tiled 2D slices"
+                             : plan.block_width != 1 || plan.block_height != 1 ? "block-compressed"
+                             : small ? "smaller than the minimum scalable dimension"
+                                     : nullptr;
+        if (!reason) {
+            request(ranges);
+            uint32_t low = UINT32_MAX, high = 0;
+            for (auto [start, end] : ranges) low = std::min(low, start), high = std::max(high, end);
+            scaled_from = scaled_region(low & ~4095u, (high + 4095) & ~4095u);
+            const uint32_t base = first->base & 0x1FFFFFFF;
+            bool all = scaled_from != nullptr;
+            for (auto [start, end] : ranges)
+                for (uint32_t page = start & ~4095u; page < end; page += 4096) {
+                    all &= scaled_tags_[page >> 12] == scaled_tag(page, base, first->log2_bytes_per_block);
+                    // (looked at: scaled_skip_unread_; always written if left out)
+                    uint8_t &reads = scaled_reads_[page >> 12];
+                    if (reads) reads |= (reads & 0x20) ? 0xC0 : 0x40;
+                }
+            if (!all) scaled_from = nullptr;
+            if (!scaled_from) reason = "not all of it kept at the scale";
+        }
+        if (scaled_from)
+            extent = {scale_.up(plan.width), scale_.up(plan.height), 1};
+        else
+            use(std::string("textures over resolved memory at the console's size: ") + reason);
     }
     bool fresh = !t || t->image.format != format || t->image.extent.width != extent.width ||
                  t->image.extent.height != extent.height || t->image.extent.depth != extent.depth ||
@@ -7197,7 +7355,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     t->low = UINT32_MAX, t->high = 0;
     for (auto [start, end] : t->ranges) t->low = std::min(t->low, start), t->high = std::max(t->high, end);
     index_texture(*t);
-    t->scaled = kept != nullptr;
+    t->scaled = kept != nullptr || scaled_from != nullptr;
     if (kept) {
         // the scaled resolve's texels, of the same size (the texture's format
         // holds the guest's bits as they are, as the resolve wrote them)
@@ -7214,8 +7372,9 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         report_.textures_scaled++;
         if (options_.verbose) std::fprintf(stderr, "  texture %08X: a scaled resolve's texels copied in\n", info.base_address);
     } else if (gpu) {
-        if (!gpu_load(*t, t->image, plan, fresh, true)) return nullptr;
-        if (separate && !gpu_load(*t, t->signed_image, signed_plan, fresh, false)) return nullptr;
+        if (!gpu_load(*t, t->image, plan, fresh, true, scaled_from)) return nullptr;
+        if (separate && !gpu_load(*t, t->signed_image, signed_plan, fresh, false, scaled_from)) return nullptr;
+        if (scaled_from) report_.textures_scaled++, report_.textures_scaled_loads++;
     } else {
         if (!cpu_upload(t->image, image, fresh)) return nullptr;
         if (separate && !cpu_upload(t->signed_image, signed_image, fresh)) return nullptr;
@@ -7335,16 +7494,32 @@ bool Impl::cpu_upload(const vk::Image &target, const texture::Image &image, bool
 // level by level as the plan lays it out, then copied into the image as
 // cpu_upload copies: what of its memory guest memory holds the newest of goes
 // into the mirror first (upload: once for its versions).
-bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload) {
+bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload,
+                    const std::pair<const uint32_t, ScaledRegion> *scaled_from) {
     std::vector<texture::GpuLevel> loads;
     uint64_t total = 0;
     texture::gpu_levels(plan, loads, total);
+    if (scaled_from) {
+        // from resolved memory at the scale (texture() checked the layout:
+        // one level), the image's texels at the scale
+        texture::GpuLevel &g = loads[0];
+        g.base = scaled_rel(*scaled_from, g.base & 0x1FFFFFFF);
+        g.blocks_x = g.out_width = scale_.up(plan.width), g.blocks_y = g.out_height = scale_.up(plan.height);
+        const uint64_t bytes = uint64_t(g.blocks_x) * g.blocks_y * texture::bytes_per_block(plan.format) * g.slices;
+        g.words = uint32_t((bytes + 3) / 4);
+        const uint32_t groups = (g.words + 63) / 64, across = std::max(std::min(groups, 32768u), 1u);
+        g.row_words = across * 64;
+        g.scale_q4 = scale_.q4;
+        total = (bytes + 15) & ~uint64_t(15);
+    }
     std::vector<uint32_t> level_of; // each load's level
     for (size_t i = 0; i < plan.slices.size(); i++)
         if (!i || plan.slices[i].level != plan.slices[i - 1].level) level_of.push_back(plan.slices[i].level);
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    const VkBuffer scratch_before = load_scratch_.buffer;
     if (!grow(load_scratch_, std::max<VkDeviceSize>(total, 16), usage, load_set_, 1)) return false;
+    if (load_scratch_.buffer != scratch_before && scaled_load_set_) write_scaled_sets();
     if (upload)
         request(t.ranges);
     else
@@ -7364,7 +7539,8 @@ bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &pla
     }
     if (fresh) begin_image(c, image.image, VK_IMAGE_ASPECT_COLOR_BIT, image.levels, image.layers);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1, &load_set_, 0, nullptr);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1,
+                            scaled_from ? &scaled_load_set_ : &load_set_, 0, nullptr);
     std::vector<VkBufferImageCopy> copies;
     for (size_t i = 0; i < loads.size(); i++) {
         const LoadConstants &p = loads[i];
@@ -11787,7 +11963,7 @@ uint32_t Impl::resolve_targets_by_tiles(const resolve::Info &info, Texture *targ
         const uint32_t width = (t->key[2] & 0x1FFF) + 1, height = ((t->key[2] >> 13) & 0x1FFF) + 1;
         const bool whole = !rows && !columns && x0 == 0 && y0 == 0 && info.width >= width && info.height >= height;
         const bool part = t->stale && !whole;
-        if (part && (!target_cover_ || t->scaled)) {
+        if (part && (!target_cover_ || (t->scaled && !scaled_cover_))) {
             use("a resolve target refused: stale, and the resolve does not write all of it");
             continue;
         }
@@ -11832,14 +12008,149 @@ bool Impl::cover(Texture &t, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
     return t.covered_count == across * down;
 }
 
+// ---- resolved memory at the resolution scale (Impl::ScaledRegion) ----
+
+void Impl::write_scaled_sets() {
+    const VkDescriptorBufferInfo infos[6] = {
+        {edram_.buffer, 0, VK_WHOLE_SIZE},       {scaled_heap_.buffer, 0, VK_WHOLE_SIZE},
+        {scaled_heap_.buffer, 0, VK_WHOLE_SIZE}, {load_scratch_.buffer, 0, VK_WHOLE_SIZE},
+        {mirror_.buffer, 0, VK_WHOLE_SIZE},      {scaled_heap_.buffer, 0, VK_WHOLE_SIZE}};
+    const VkDescriptorSet sets[3] = {scaled_resolve_set_, scaled_load_set_, scaled_fill_set_};
+    VkWriteDescriptorSet writes[6];
+    for (uint32_t k = 0; k < 6; k++) {
+        writes[k] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[k].dstSet = sets[k >> 1];
+        writes[k].dstBinding = k & 1;
+        writes[k].descriptorCount = 1;
+        writes[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[k].pBufferInfo = &infos[k];
+    }
+    vkUpdateDescriptorSets(dev_, 6, writes, 0, nullptr);
+}
+
+// The region holding [low, high), or null
+const std::pair<const uint32_t, Impl::ScaledRegion> *Impl::scaled_region(uint32_t low, uint32_t high) const {
+    auto it = scaled_regions_.upper_bound(low);
+    if (it == scaled_regions_.begin()) return nullptr;
+    --it;
+    return high <= it->second.end ? &*it : nullptr;
+}
+
+// A heap a quarter larger than the regions need (the room the merges' moves
+// take until the next repacking), the other regions' scaled bytes moved into
+// it packed, and after them the new region's run with the bytes of those it
+// merged. Waits for the GPU: rare, as a game's resolves settle on their
+// surfaces. False where the heap cannot be so large.
+bool Impl::repack_scaled_heap(const std::vector<std::pair<uint32_t, ScaledRegion>> &merged, uint32_t start,
+                              ScaledRegion &region) {
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(d_.physical(), &properties);
+    const VkDeviceSize q2 = scale_.q4 * scale_.q4;
+    // (within a storage buffer's range, and a 32-bit guest-byte count of it: scaled_rel)
+    const VkDeviceSize most = std::min({VkDeviceSize(properties.limits.maxStorageBufferRange),
+                                        VkDeviceSize(3) << 30, (VkDeviceSize(1) << 28) * q2});
+    const VkDeviceSize length = VkDeviceSize((region.end - start) >> 4) * q2;
+    VkDeviceSize live = length;
+    for (const auto &[first, other] : scaled_regions_) live += VkDeviceSize((other.end - first) >> 4) * q2;
+    VkDeviceSize size = std::max<VkDeviceSize>(live / 4 * 5, VkDeviceSize(16) << 20);
+    size = std::min((size + 0xFFFFF) & ~VkDeviceSize(0xFFFFF), most);
+    if (live > size) return false;
+    sync();
+    vk::Buffer heap = d_.create_buffer(
+        size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        false);
+    if (!heap.buffer) return false;
+    std::vector<VkBufferCopy> copies;
+    VkDeviceSize at = 0;
+    for (auto &[first, other] : scaled_regions_) {
+        const VkDeviceSize bytes = VkDeviceSize((other.end - first) >> 4) * q2;
+        copies.push_back({other.heap, at, bytes});
+        other.heap = at;
+        at += bytes;
+    }
+    region.heap = at;
+    for (const auto &[first, old] : merged)
+        copies.push_back(
+            {old.heap, at + VkDeviceSize((first - start) >> 4) * q2, VkDeviceSize((old.end - first) >> 4) * q2});
+    at += length;
+    if (!copies.empty()) {
+        VkCommandBuffer c = outside();
+        vkCmdCopyBuffer(c, scaled_heap_.buffer, heap.buffer, uint32_t(copies.size()), copies.data());
+        full_barrier(c);
+        sync();
+    }
+    d_.destroy(scaled_heap_);
+    scaled_heap_ = heap;
+    scaled_heap_used_ = at;
+    write_scaled_sets();
+    report_.scaled_heap_bytes = size;
+    report_.scaled_heap_repacks++;
+    if (options_.verbose)
+        std::fprintf(stderr, "  resolved memory at the scale: a heap of %.1f MB for %zu regions (%.1f MB live)\n",
+                     double(size) / 1048576.0, scaled_regions_.size() + 1, double(at) / 1048576.0);
+    return true;
+}
+
+// The region holding [low, high), made (or made larger, merging the regions
+// it meets, their scaled bytes moved into its new run of the heap) where
+// none does. Null where the heap cannot grow to it: then nothing there is
+// kept at the scale.
+const std::pair<const uint32_t, Impl::ScaledRegion> *Impl::make_scaled_region(uint32_t low, uint32_t high) {
+    if (const auto *found = scaled_region(low, high)) return found;
+    constexpr uint32_t ALIGN = 0x10000;
+    uint32_t start = low & ~(ALIGN - 1),
+             end = uint32_t(std::min<uint64_t>((uint64_t(high) + ALIGN - 1) & ~uint64_t(ALIGN - 1), GUEST_MEMORY));
+    // the regions it meets, or that lie within 256 KB of it, are merged into
+    // it (the gaps between a frame's surfaces taken in once, rather than a
+    // region moved again as each surface beside it is resolved)
+    constexpr uint32_t SLACK = 0x40000;
+    std::vector<std::pair<uint32_t, ScaledRegion>> merged;
+    for (auto at = scaled_regions_.begin(); at != scaled_regions_.end();) {
+        if (at->first <= end + SLACK && start <= at->second.end + SLACK) {
+            start = std::min(start, at->first), end = std::max(end, at->second.end);
+            merged.push_back(*at);
+            scaled_regions_.erase(at);
+            at = scaled_regions_.begin(); // (a wider region may meet more)
+            continue;
+        }
+        ++at;
+    }
+    const VkDeviceSize q2 = scale_.q4 * scale_.q4;
+    const VkDeviceSize length = VkDeviceSize((end - start) >> 4) * q2;
+    ScaledRegion region{end, 0};
+    if (scaled_heap_used_ + length <= scaled_heap_.size) {
+        region.heap = scaled_heap_used_;
+        scaled_heap_used_ += length;
+        if (!merged.empty()) {
+            // the merged regions' scaled bytes into the new run (beyond every
+            // live one: the copies do not overlap)
+            VkCommandBuffer c = outside();
+            full_barrier(c);
+            std::vector<VkBufferCopy> copies;
+            for (const auto &[first, old] : merged)
+                copies.push_back({old.heap, region.heap + VkDeviceSize((first - start) >> 4) * q2,
+                                  VkDeviceSize((old.end - first) >> 4) * q2});
+            vkCmdCopyBuffer(c, scaled_heap_.buffer, scaled_heap_.buffer, uint32_t(copies.size()), copies.data());
+            full_barrier(c);
+        }
+    } else if (!repack_scaled_heap(merged, start, region)) {
+        // no room: those it meets are given up, their pages' tags cleared
+        for (const auto &[first, old] : merged) clear_scaled_tags(first, old.end);
+        report_.scaled_heap_full++;
+        return nullptr;
+    }
+    return &*scaled_regions_.emplace(start, region).first;
+}
+
 // The scaled resolve kept for a resolve no scaled texture is over (Impl::
 // ScaledResolve): one of the resolves' targets, 32- or 64-bit texels, from the
 // texture's corner, no smaller than the minimum scalable dimension; at most
 // eight kept. Null when the resolve is not one.
 Impl::ScaledResolve *Impl::scaled_resolve(const resolve::Info &info, const std::vector<Range> &written) {
     const uint32_t bytes = texture::format_block(info.dest_format).bytes;
-    // (32-bit texels only, as scale_texture's callers)
-    if (info.depth || info.dest_array || !info.texture_base || bytes != 4 ||
+    // (64-bit texels with XF_SCALE_WIDE, as scale_texture's callers; never kept where resolved memory is
+    // kept at the scale: its caller)
+    if (info.depth || info.dest_array || !info.texture_base || (bytes != 4 && !(bytes == 8 && scale_wide_)) ||
         info.texel_x0 + info.dest_x || info.texel_y0 + info.dest_y || !scalable(info.width, info.height, min_scalable_) ||
         written.empty() || scaled_resolves_.size() >= 8)
         return nullptr;
@@ -12045,6 +12356,58 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     if (!from_edram && !grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
     request(keep);
 
+    // Resolved memory at the resolution scale (Impl::ScaledRegion), every
+    // resolve's (a texture smaller than the minimum scalable dimension loads
+    // from memory at the console's size whatever is kept): the destination's
+    // units (a 32x32 tile of 32-bit or wider blocks, else the 4
+    // KB page holding two or four tiles) in a region; those the rectangle
+    // writes a part of, made from memory first unless their scaled bytes are
+    // already this layout's; every unit's pages tagged after.
+    struct ScaledFill {
+        uint32_t guest, at, log2_bytes, q, tiles, words;
+    };
+    std::vector<ScaledFill> fills;
+    std::vector<std::pair<uint32_t, uint8_t>> scaled_pages; // a page, the tag the resolve leaves it
+    const std::pair<const uint32_t, ScaledRegion> *region = nullptr;
+    const uint32_t dest_base = info.dest_base & 0x1FFFFFFF;
+    if (scaled_memory_ && from_edram && !info.dest_array && !(info.dest_pitch & 31) && !(dest_base & 1023)) {
+        const uint32_t log2_bytes = uint32_t(std::countr_zero(texture::format_block(info.dest_format).bytes));
+        const uint32_t tile_bytes = 1024u << log2_bytes, unit_bytes = std::max(tile_bytes, 4096u);
+        const uint32_t x0 = info.dest_x, y0 = info.dest_y, x1 = x0 + w, y1 = y0 + h;
+        // the unit's first byte, and its tiles the rectangle writes whole (a
+        // 64- or 128-bit tile is its own unit, wherever it starts; smaller
+        // ones share the 4 KB page they lie in)
+        std::map<uint32_t, uint32_t> units;
+        uint64_t high = 0;
+        for (uint32_t ty = y0 / 32; ty <= (y1 - 1) / 32; ty++)
+            for (uint32_t tx = x0 / 32; tx <= (x1 - 1) / 32; tx++) {
+                uint64_t a = uint64_t(dest_base) + uint64_t(tx + ty * (info.dest_pitch >> 5)) * tile_bytes;
+                if (tile_bytes < 4096) a &= ~uint64_t(4095);
+                const bool whole = x0 <= tx * 32 && x1 >= tx * 32 + 32 && y0 <= ty * 32 && y1 >= ty * 32 + 32;
+                units[uint32_t(a)] += whole ? 1 : 0;
+                high = std::max(high, a + unit_bytes);
+            }
+        if (high <= GUEST_MEMORY) region = make_scaled_region(units.begin()->first, uint32_t(high));
+        if (region) {
+            const uint32_t tiles_per_unit = unit_bytes / tile_bytes, q = scale_.q4;
+            std::vector<Range> fill_ranges;
+            for (auto [unit, whole] : units) {
+                bool current = true;
+                for (uint32_t page = unit; page < unit + unit_bytes; page += 4096) {
+                    const uint8_t tag = scaled_tag(page, dest_base, log2_bytes);
+                    current &= scaled_tags_[page >> 12] == tag;
+                    scaled_pages.push_back({page >> 12, tag});
+                }
+                if (whole == tiles_per_unit || current) continue;
+                const uint32_t at = uint32_t(VkDeviceSize((unit - region->first) >> 4) * q * q);
+                fills.push_back({unit, uint32_t(region->second.heap) + at, log2_bytes, q, tiles_per_unit,
+                                 uint32_t(((unit_bytes >> 4) * q * q) >> 2)});
+                fill_ranges.push_back({unit, unit + unit_bytes});
+            }
+            request(fill_ranges);
+        }
+    }
+
     VkCommandBuffer c;
     // On the host path the guest samples come from the source's image itself,
     // packed as the EDRAM store packs them (resolve.comp's IMAGE), with no
@@ -12099,6 +12462,16 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     p.flags = options_.depth_float24_round && !options_.depth_float24_convert_in_pixel_shader ? 1u : 0u;
     // EDRAM read at the resolution scale, over the console's pixels
     p.flags |= scale_.q4 << 8 | 4u << 16;
+    // Direct3D 9's pixel centers move a draw half a console pixel, which at a
+    // scale leaves the first host pixels on a rectangle's left and top
+    // uncovered: they take the first covered one, as Xenia's
+    // resolve_resolution_scale_fill_half_pixel_offset (resolve.comp's
+    // edram_pixel; XF_RESOLVE_FILL_HALF_PIXEL=0 off)
+    static const bool fill_half_pixel = [] {
+        const char *v = std::getenv("XF_RESOLVE_FILL_HALF_PIXEL");
+        return !(v && v[0] == '0');
+    }();
+    if (fill_half_pixel && !scale_.one() && !(regs_[r::PA_SU_VTX_CNTL] & 1)) p.flags |= 4u;
     p.raw = resolve::raw_copy(info);
     p.dest_base = info.dest_base, p.dest_pitch = info.dest_pitch, p.dest_height = info.dest_height;
     p.dest_x = info.dest_x, p.dest_y = info.dest_y, p.dest_slice = info.dest_slice, p.dest_array = info.dest_array;
@@ -12110,7 +12483,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     uint32_t extra_columns = 0, extra_rows = 0;
     // the textures fed at the console's size (written by the pass over its
     // pixels) and at the resolution scale (by a pass of their own after it)
-    uint32_t target_1x = 0, target_scaled = 0, convert_1x = 0;
+    uint32_t target_1x = 0, target_scaled = 0, convert_1x = 0, convert_scaled = 0;
     if (uint32_t count = resolve_targets(info, targets, extra_columns, extra_rows)) {
         const uint32_t corner =
             ((info.texel_x0 + extra_columns) >> 5) << 16 | ((info.texel_y0 + extra_rows) >> 5) << 24;
@@ -12122,16 +12495,16 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
             Texture &t = *targets[k];
             // Made the resolution scale's when this resolve writes all of it
             // and both are no smaller than the minimum scalable dimension
-            // (RPCS3's rule): the resolve then writes every scaled texel. Only
-            // 32-bit texels: a 64-bit one's scaled feed showed wrong colors in
-            // game F's bloom against Xenia's scaled picture (open; renderer.md,
-            // "Resolution scale"), so those stay the console's size.
+            // (RPCS3's rule): the resolve then writes every scaled texel (a
+            // depth texture's float too, made from them as at the console's
+            // size: convert_scaled). 64-bit texels too (XF_SCALE_WIDE=0: not):
+            // the wrong colors their scaled feed showed in game F's bloom were
+            // the half pixel offset's uncovered host pixels (edram_pixel).
             const uint32_t tw = (t.key[2] & 0x1FFF) + 1, th = ((t.key[2] >> 13) & 0x1FFF) + 1;
-            // (a depth texture's floats are no guest bits a scaled image could hold)
-            if (!scale_.one() && !t.scaled && !t.target_convert && !extra_rows && !extra_columns &&
+            if (!scale_.one() && !t.scaled && !extra_rows && !extra_columns &&
                 info.texel_x0 + info.dest_x == 0 && info.texel_y0 + info.dest_y == 0 && info.width >= tw &&
                 info.height >= th && scalable(tw, th, min_scalable_) &&
-                scalable(info.width, info.height, min_scalable_) && !(t.target & 0x80))
+                scalable(info.width, info.height, min_scalable_) && (scale_wide_ || !(t.target & 0x80)))
                 scale_texture(t, tw, th);
             // current again if it was stale: the resolve wrote all of it, or
             // with the parts the resolves before it wrote since it went stale
@@ -12145,7 +12518,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
             uint32_t &into = t.scaled ? target_scaled : target_1x;
             // what each place at the console's size takes (flags bits 24-25
             // and 26-27: resolve.comp's write_targets)
-            if (!t.scaled) convert_1x |= t.target_convert << (24 + 2 * places[0]);
+            (t.scaled ? convert_scaled : convert_1x) |= t.target_convert << (24 + 2 * places[t.scaled]);
             into |= (t.target & (places[t.scaled] ? 0x7Fu : 0xFFu)) << (8 * places[t.scaled]++);
         }
         if (target_1x) target_1x |= corner;
@@ -12155,9 +12528,21 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // at a resolution scale, a resolve no scaled texture is over keeps its
     // scaled texels for the texture a later draw makes there
     drop_scaled_resolves(written);
-    if (!scale_.one() && !target_scaled && resolve_targets_)
+    if (!scale_.one() && !target_scaled && resolve_targets_ && !region)
         if (ScaledResolve *kept = scaled_resolve(info, written))
             target_scaled = (kept->target & 0xFFu) | (info.texel_x0 >> 5) << 16 | (info.texel_y0 >> 5) << 24;
+    // (left out where nothing read it since the last resolve wrote it:
+    // scaled_skip_unread_)
+    if (region && scaled_skip_unread_) {
+        bool unread = true;
+        for (auto [page, tag] : scaled_pages)
+            unread &= !(scaled_reads_[page] & 0xC0) && (scaled_reads_[page] & 31) >= 2;
+        if (unread) {
+            for (auto [page, tag] : scaled_pages) scaled_reads_[page] |= 0x20;
+            region = nullptr, fills.clear(), scaled_pages.clear();
+            report_.scaled_resolves_unread++;
+        }
+    }
     p.target = target_1x;
     p.flags |= convert_1x;
     if (from_edram) {
@@ -12171,6 +12556,19 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // the store's packing for the target: its flags (bits 4-7) and format (28-31)
     if (from_target_image) p.flags |= (edram_target(source, 0).flags & 0xFu) << 4 | (source.format & 0xFu) << 28;
     const VkPipelineLayout layout = from_target_image ? resolve_image_layout_ : resolve_layout_;
+    if (!fills.empty()) {
+        // what of the scaled units the rectangle leaves, from memory
+        if (options_.gpu_timing) gpu_mark("resolves: scaled memory made from memory");
+        full_barrier(c);
+        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, scaled_fill_pipeline_);
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1, &scaled_fill_set_, 0, nullptr);
+        for (const ScaledFill &f : fills) {
+            vkCmdPushConstants(c, load_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(f), &f);
+            vkCmdDispatch(c, (f.words + 63) / 64, 1, 1);
+        }
+        full_barrier(c);
+        report_.scaled_fills += fills.size();
+    }
     if (from_target_image) settle_depth_samples(c, source);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE,
                       from_target_image ? resolve_image_pipelines_[source.msaa ? 1 : 0] : resolve_pipeline_);
@@ -12181,16 +12579,43 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
                             from_target_image ? 1 : 0, &mask_offset);
     vkCmdPushConstants(c, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
     vkCmdDispatch(c, (w + 7) / 8, (h + 7) / 8, 1);
-    if (target_scaled) {
-        // the scaled textures alone, over their texels at the resolution scale
+    if (target_scaled || region) {
+        // the scaled textures, and resolved memory at the scale, over their
+        // texels at the resolution scale
+        if (options_.gpu_timing)
+            gpu_mark(region ? "resolves: the pass at the scale (textures and memory)"
+                            : "resolves: the pass at the scale (textures)");
         ResolveConstants scaled = p;
         scaled.target = target_scaled;
-        scaled.flags = (p.flags & (1u | 0xF0u | 0xF0000000u)) | 2u | scale_.q4 << 8 | scale_.q4 << 16;
+        scaled.flags = (p.flags & (1u | 4u | 0xF0u | 0xF0000000u)) | 2u | scale_.q4 << 8 | scale_.q4 << 16 |
+                       convert_scaled;
         scaled.width = scale_.down(w), scaled.height = scale_.down(h);
+        if (region) {
+            // (the destination's place in the heap, in guest bytes: scaled_rel)
+            scaled.flags |= 8u;
+            scaled.dest_base = scaled_rel(*region, dest_base);
+            vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &scaled_resolve_set_, 0, nullptr);
+        }
         vkCmdPushConstants(c, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scaled), &scaled);
         vkCmdDispatch(c, (scaled.width + 7) / 8, (scaled.height + 7) / 8, 1);
     }
     full_barrier(c);
+    // the pages' tags: what the scaled bytes now hold, or nothing current
+    if (region) {
+        const uint32_t swap = uint32_t(report_.swaps);
+        for (auto [page, tag] : scaled_pages) {
+            uint8_t &reads = scaled_reads_[page];
+            const uint32_t frames = (reads & 0x40) || !reads                ? 1
+                                    : scaled_write_swaps_[page] == swap ? reads & 31
+                                                                        : std::min((reads & 31) + 1, 31);
+            reads = uint8_t((reads & 0x80) | frames);
+            scaled_write_swaps_[page] = swap;
+            scaled_tags_[page] = tag;
+        }
+    } else if (scaled_memory_) {
+        clear_scaled_tags(written);
+        clear_scaled_tags(partial);
+    }
 
     gpu_written(written);
     if (refusal_detail_)

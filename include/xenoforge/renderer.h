@@ -86,6 +86,12 @@ struct Report {
     uint64_t resolve_targets_covered = 0;
     uint64_t resolve_targets_reclaimed = 0; // places in the resolves' table taken from a texture unused since
     uint64_t textures_scaled = 0;         // textures made the resolution scale's (Options::resolution_scale)
+    uint64_t textures_scaled_loads = 0;   // of those, loaded from resolved memory kept at the scale
+    uint64_t scaled_heap_bytes = 0;       // the heap resolved memory at the scale is kept in
+    uint64_t scaled_heap_full = 0;        // regions of it given up, the heap at its largest
+    uint64_t scaled_heap_repacks = 0;     // times it was made again (each a wait for the GPU)
+    uint64_t scaled_resolves_unread = 0;  // resolves that left it out, unread since the last one wrote it
+    uint64_t scaled_fills = 0;            // units of it made from memory before a resolve wrote a part
     uint64_t textures_evicted = 0, textures_evicted_for_room = 0, textures_refused = 0;
     uint64_t occlusion_queries = 0, zpd_reports = 0; // host queries begun, reports answered with their counts
     // screen extent reports (EVENT_WRITE_EXT) the sink was asked for, and

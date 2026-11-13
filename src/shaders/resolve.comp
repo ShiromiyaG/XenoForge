@@ -67,7 +67,9 @@ layout(push_constant) uniform Resolve {
     // bits 16-23 the grid the invocations run over (0 both: 100%); bit 1, a
     // pass writing the textures alone, over their scaled texels (memory is
     // written by a pass over the console's pixels, each from the host pixel
-    // at its center). IMAGE: bits 4-7 the EDRAM store's flags for the
+    // at its center); bit 2, the half pixel offset's uncovered host pixels
+    // filled (edram_pixel); bit 3, with bit 1, resolved memory at the scale
+    // written as well (main). IMAGE: bits 4-7 the EDRAM store's flags for the
     // target (edram.glsl's), bits 28-31 its format.
     uint flags;
     // the textures the resolve writes too: bits 0-6 the first's slot plus
@@ -115,9 +117,17 @@ uint edram_dword(uvec2 pixel, uint sample_index) {
 // The EDRAM pixel an invocation reads: the rectangle's corner and the
 // invocation in the grid's pixels, to EDRAM's grid by render_scale.h's
 // Scale::map (the pixel at or just past the center; itself at 100%)
+// With flags bit 2 (Direct3D 9's pixel centers, at a resolution scale), the
+// host pixels on the rectangle's left and top that the half pixel offset
+// leaves uncovered (those whose center lies before half a console pixel: the
+// first ceil(s / 2 - 1 / 2), (q + 3) / 8 in quarters) take the first covered
+// one, as Xenia's resolve_resolution_scale_fill_half_pixel_offset stretches
+// it (resolve.xesli's half_pixel_offset_fill_source).
 uvec2 edram_pixel(uvec2 at) {
     uvec2 g = uvec2(p.src_x, p.src_y) * grid_q4() / 4u + at;
-    return ((g * 2u + 1u) * edram_q4()) / (2u * grid_q4());
+    uvec2 e = ((g * 2u + 1u) * edram_q4()) / (2u * grid_q4());
+    if ((p.flags & 4u) != 0u) e = max(e, uvec2(p.src_x, p.src_y) * edram_q4() / 4u + (edram_q4() + 3u) / 8u);
+    return e;
 }
 
 // The guest's words (the second for 64-bit samples) of an EDRAM pixel's
@@ -542,6 +552,7 @@ void main() {
     uint w[4], small = 0u;
     uint words = p.raw != 0u ? copy_raw(w0, w1, w) : convert(load_colors(at, index), w, small);
     uint x = p.dest_x + at.x, y = p.dest_y + at.y;
+    uint address;
     if ((p.flags & 2u) != 0u) {
         // the textures alone, at their scale: the destination's corner in
         // their texels (multiples of 8 console pixels, whole at every
@@ -549,11 +560,18 @@ void main() {
         uvec2 corner = (uvec2(p.dest_x, p.dest_y) + uvec2((p.target >> 16u) & 0xFFu, p.target >> 24u) * 32u) *
                        grid_q4() / 4u;
         write_targets(ivec2(corner + at), w);
-        return;
+        // and with flags bit 3, resolved memory at the scale (memory is its
+        // region's scaled copy, dest_base the destination's place in the
+        // region: tiling.glsl's scaled_offset_2d)
+        if ((p.flags & 8u) == 0u) return;
+        uvec2 host = uvec2(p.dest_x, p.dest_y) * grid_q4() / 4u + at;
+        address = scaled_offset_2d(p.dest_base, host.x, host.y, p.dest_pitch, p.dest_log2_bytes, grid_q4());
+    } else {
+        uint offset = p.dest_array != 0u
+                          ? tiled_offset_3d(x, y, p.dest_slice, p.dest_pitch, p.dest_height, p.dest_log2_bytes)
+                          : tiled_offset_2d(x, y, p.dest_pitch, p.dest_log2_bytes);
+        address = (p.dest_base + offset) & PHYSICAL_MASK;
     }
-    uint offset = p.dest_array != 0u ? tiled_offset_3d(x, y, p.dest_slice, p.dest_pitch, p.dest_height, p.dest_log2_bytes)
-                                     : tiled_offset_2d(x, y, p.dest_pitch, p.dest_log2_bytes);
-    uint address = (p.dest_base + offset) & PHYSICAL_MASK;
     uint dest_bytes = 1u << p.dest_log2_bytes;
     if (dest_bytes <= 2u) {
         // a part of a word other invocations write the rest of
@@ -563,7 +581,7 @@ void main() {
         atomicOr(memory.words[address >> 2u], value << shift);
         return;
     }
-    if ((p.target & 0x7Fu) != 0u)
+    if ((p.target & 0x7Fu) != 0u && (p.flags & 2u) == 0u)
         write_targets(ivec2(x + ((p.target >> 16u) & 0xFFu) * 32u, y + (p.target >> 24u) * 32u), w);
     swap_words(w, words, p.dest_endian);
     for (uint i = 0u; i < dest_bytes / 4u; i++) memory.words[(address >> 2u) + i] = w[i];

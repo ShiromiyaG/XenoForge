@@ -238,7 +238,11 @@ int main(int argc, char **argv) {
                 (unsigned long long)report.texture_loads_gpu_written, (unsigned long long)report.texture_loads_exported,
                 (unsigned long long)report.resolve_targets_written, (unsigned long long)report.resolve_targets_covered);
     if (report.textures_scaled)
-        std::printf("  %llu textures made the resolution scale's\n", (unsigned long long)report.textures_scaled);
+        std::printf("  %llu textures made the resolution scale's (%llu loaded from resolved memory at the scale; "
+                    "its heap %.1f MB, made %llu times, %llu regions given up)\n",
+                    (unsigned long long)report.textures_scaled, (unsigned long long)report.textures_scaled_loads,
+                    double(report.scaled_heap_bytes) / 1048576.0, (unsigned long long)report.scaled_heap_repacks,
+                    (unsigned long long)report.scaled_heap_full);
     if (report.zpd_reports)
         std::printf("  occlusion: %llu queries for %llu reports\n", (unsigned long long)report.occlusion_queries,
                     (unsigned long long)report.zpd_reports);

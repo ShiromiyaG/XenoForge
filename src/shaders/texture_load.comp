@@ -35,7 +35,9 @@ layout(set = 0, binding = 1) writeonly buffer Out { uint words[]; } dst;
     uint load;          /* texture::Load */                                                            \
     uint half_from;     /* texture::Half: 1 16-bit unorm to halves, 2 snorm */                         \
     uint row_words;     /* the dispatch's words per row of workgroups */                               \
-    uint out_width, out_height; /* the level's texels per row and rows */
+    uint out_width, out_height; /* the level's texels per row and rows */                              \
+    uint scale_q4;      /* 0, else memory is resolved memory at this scale in quarters: base is */     \
+                        /* within its region, x and y the host's blocks (scaled_offset_2d) */
 
 #ifdef PARAMS_BUFFER
 layout(set = 0, binding = 2) readonly buffer Level { LEVEL_FIELDS } p;
@@ -63,6 +65,7 @@ uint block_address(uint block) {
     uint x = rest % p.blocks_x + p.ox, y = rest / p.blocks_x + p.oy;
     uint base = p.base + (p.layered != 0u ? slice * p.slice_stride : 0u);
     uint z = (p.layered != 0u ? 0u : slice) + p.oz;
+    if (p.scale_q4 != 0u) return scaled_offset_2d(base, x, y, p.pitch_blocks, p.log2_bytes, p.scale_q4);
     uint offset;
     if (p.tiled == 0u) offset = (x + p.pitch_blocks * (y + p.z_rows * z)) << p.log2_bytes;
     else if (p.is_3d != 0u) offset = tiled_offset_3d(x, y, z, p.pitch_blocks, p.z_rows, p.log2_bytes);
@@ -70,7 +73,7 @@ uint block_address(uint block) {
     return (base + offset) & PHYSICAL_MASK;
 }
 
-uint load_word(uint address) { return memory.words[(address & PHYSICAL_MASK) >> 2u]; }
+uint load_word(uint address) { return memory.words[(p.scale_q4 != 0u ? address : address & PHYSICAL_MASK) >> 2u]; }
 
 // a block of 16 bits, swapped
 uint load_half(uint block) {

@@ -3175,8 +3175,8 @@ target's format, size and pitch beside the resolve's):
   texture reading the bits takes them, and a depth texture is a target too,
   taking the float its load makes from them (XeUNorm24To32 or
   XeFloat20e4To32 of the high 24 bits, `resolve.comp`'s write_targets, the
-  kind in `flags` bits 24-27; never at the resolution scale, whose images
-  hold guest bits). `XF_RESOLVE_TARGETS_DEPTH=0` turns this part off
+  kind in `flags` bits 24-27; at the resolution scale too since 2026-11-13,
+  the scaled pass given the same bits). `XF_RESOLVE_TARGETS_DEPTH=0` turns this part off
   alone, to tell it apart when a picture differs.
 Game D's drive after the three: 13,800 loads after resolves (324,000
 resolves wrote the texture they feed), the loads 5.6 -> 1.5 s of the run's
@@ -4463,17 +4463,83 @@ and a console pixel to the host pixel at its center (render_scale.h's
   and the front buffer a game copies all see the console's size, as RPCS3
   keeps CPU-visible data native and as Xenia's resolve downscale does for
   its read-backs. The textures a resolve feeds (the resolve targets,
-  "Resolve targets" above) are written at their own scale by a second pass
-  over their texels.
-- Textures: a resolve target of 32-bit texels the resolve writes whole, no
-  smaller than the minimum scalable dimension, is made the scale's (`scale_texture`: an image
-  of the same format, its old one gone with the submission). A resolve no
-  texture is over yet keeps its scaled texels in an image of its own
-  (`ScaledResolve`, dropped when anything else writes there or two swaps
-  on); the texture a later draw makes over the destination copies them in
-  and is the scale's from its first use, so a one-frame trace and a game's
-  first frame show the scaled picture too. Every other texture is the
-  console's size: loaded from guest memory, a resolve's included. The
+  "Resolve targets" above) and resolved memory at the scale (below) are
+  written by a second pass over the scaled texels.
+- **The half pixel offset's uncovered pixels** (2026-11-13; Xenia's
+  `resolve_resolution_scale_fill_half_pixel_offset`, on by default there;
+  `XF_RESOLVE_FILL_HALF_PIXEL=0` off). Direct3D 9's pixel centers
+  (`PA_SU_VTX_CNTL` pix_center 0) move a draw half a console pixel right and
+  down, s/2 host pixels at a scale s: a rectangle drawn from the target's
+  corner leaves the host pixels whose centers lie before it, the first
+  ceil(s/2 - 1/2) ((q + 3) / 8 in quarters: 1 at 125-300%, 2 at 400%)
+  columns and rows, undrawn, holding whatever EDRAM held there. A resolve
+  then reads, for those, the first covered one (resolve.comp's
+  `edram_pixel`, from the rectangle's corner as Xenia's
+  `half_pixel_offset_fill_source`). The pass at the console's size reads
+  each pixel's center and missed them at 200% and 300%; the scaled pass reads
+  every host pixel (and at 125-175% the pass at the console's size read them
+  too: console pixel 0's center is host pixel 0), and a blur chain of 64-bit
+  targets at an exponent bias of
+  3 (game F's bloom, 288x184 down to 24x16 and back) spread the garbage of
+  that first column into the magenta strips that kept 64-bit targets at the
+  console's size. Their scaled feed was right all along; they are now scaled
+  (`XF_SCALE_WIDE=0`: not).
+- **Resolved memory at the scale** (2026-11-13; Xenia's scaled resolve
+  buffer, `d3d12_shared_memory`'s and the texture cache's scaled resolve
+  ranges; `XF_SCALED_MEMORY=0` off). Every resolve also writes its
+  destination at the scale into a heap on the GPU (`Impl::ScaledRegion`),
+  and every texture over memory resolves wrote is loaded from there at the
+  scale, through the same `texture_load.comp` with its conversions, whatever
+  its format, size, layers or offset into the resolve: a part of a resolve,
+  another format's view of the same bits, a stacked or cube texture, a depth
+  texture's floats. Guest memory and the mirror keep the console's size for
+  the CPU, read-backs and memory exports, as before.
+  - *Layout.* Xenia's groups (a 128-byte guest group as scale_x x scale_y
+    host groups) need whole scales; ours are tiles, which every quarter
+    keeps whole: a 2D surface's 32x32 tile whose guest bytes start at byte a
+    of a region is kept at (a / 16) * q * q of the region's run of the heap,
+    as its 8q x 8q host blocks row by row (tiling.glsl's
+    `scaled_offset_2d`). The guest's tiles follow one another along a row of
+    macro tiles, so tile t of a surface lies t * 1024 * bytes past its base,
+    and a texture at another base, pitch offset or format of the same block
+    size finds the same tiles. As Xenia's, it is not meant to be read with
+    another block size (another's tiles differ); such a texture loads at the
+    console's size.
+  - *Regions.* Guest ranges, 64 KB aligned, merged with any within 256 KB
+    (a frame's surfaces taken in once rather than a region moved as each
+    neighbour is resolved), each a run of one heap of the region's bytes
+    times the scale's area. A region that does not fit packs the heap again,
+    a quarter larger than the regions need (a wait for the GPU: game G's
+    1485 made it ten times in its first play, none after; 178 MB at 200%,
+    400 MB at 300%, of which 142 and 320 MB live). Past 3 GB (or the
+    device's storage buffer range) a region is given up and counted.
+  - *Pages' tags.* A 4 KB page's tag says what its scaled bytes hold: the
+    block size, and for 64- and 128-bit blocks (whose tiles span two and four
+    pages) the page's place in its tile. A resolve tags every page of its
+    units (a tile of 32-bit or wider blocks, else the 4 KB page holding two
+    or four tiles); a unit it writes only a part of is first made from guest
+    memory's bytes, each host block the guest block it lies in
+    (`scaled_fill.comp`), unless its pages already hold this layout. The
+    CPU's writes (when `request` takes them into the mirror), exports and
+    3D-array resolves clear the tags. A texture loads at the scale when it
+    is one level of tiled 2D slices of single-texel blocks, no smaller than
+    the minimum scalable dimension, and every page of it is in one region
+    with this layout's tag (its pages made current first); else at the
+    console's size, counted by why ("textures over resolved memory at the
+    console's size: ...": 3D, mipmapped, not tiled 2D slices,
+    block-compressed, smaller than the minimum scalable dimension, not all
+    of it kept at the scale).
+- Textures a resolve feeds: a resolve target the resolve writes whole, no
+  smaller than the minimum scalable dimension, is made the scale's
+  (`scale_texture`: an image of the same format, its old one gone with the
+  submission), 64-bit ones and depth textures too (the latter take the
+  float made from the bits in the scaled pass, as at the console's size).
+  With resolved memory at the scale off, a resolve no texture is over yet
+  keeps its scaled texels in an image of its own (`ScaledResolve`, dropped
+  when anything else writes there or two swaps on), which the texture a
+  later draw makes over the destination copies in. Either way a texture is
+  the scale's from its first use, so a one-frame trace and a game's first
+  frame show the scaled picture too. The
   shaders' texture coordinates are scale-free: sizes and offsets come from
   the fetch constants (shader_translator.cpp), so a scaled image needs no
   shader change (Xenia scales unnormalized coordinates for its scaled
@@ -4517,56 +4583,137 @@ holds the frames whose 100% picture is Xenia's within a mean difference of 4
 against our 100% frame, box filtered (`render_scale.h`'s `resample_box`),
 which is no bound: a scaled picture is not the console's (blurs made of
 bilinear taps between texels blur less over finer texels, in Xenia's
-scaled pictures as in ours). Results (2026-11-08, interlock path):
-- 23 of the 29 frames within 0.7 of Xenia's at both scales, 0-1% of pixels
-  (game B's 1800-3601: 0.67-0.69 at 200%, 0.29-0.30 at 300%; game A's
-  title and menu 0.02-0.17; games C, D, H and F's 600-2400 0.00-0.04).
-- Game E's 1200-3600: 2.8-2.9 at 200% (no pixel off by 16), 1.2-1.4 at 300%
-  (3-4% of pixels): its blurred background is drawn through textures over
-  resolved memory that no resolve feeds whole, which Xenia scales and we
-  keep at the console's size.
-- Game F's 3600: 1.65 at 200% (0.5%). With 64-bit resolve targets scaled
-  as well its bloom showed magenta strips Xenia's does not have (9.4), so
-  64-bit textures stay at the console's size (open: the 64-bit texels'
-  scaled feed; the same resolves at 100% go through guest memory).
-- Game A's park and race (frames whose 100% picture is off Xenia's by 1.8
-  and 3.1 already, from what the trace does not hold): 4.0-4.4 at 200%,
-  1.6-1.7 at 300%.
-Against our own 100% frames, box filtered: game B 0.8 (200%) and 0.4
-(300%), game A's title 0.15-0.45.
+scaled pictures as in ours). Results on the interlock path, before (master
+of 2026-11-13, 6c1a8ce) and after resolved memory at the scale, the half
+pixel offset's fill and 64-bit targets scaled; the mean difference of 255
+and the share of pixels off by more than 16:
 
-**Cost against Xenia** (game B's 3D title scene, `bench_vs_xenia.ps1 -Scale`,
-GPU ms a frame by the counter, median and spread; ours on its default
-interlock path, Xenia's Direct3D 12 on its default host render targets;
-both hold 60 fps at every scale):
+| frame | 200% before | 200% after | 300% before | 300% after |
+| --- | --- | --- | --- | --- |
+| game B 1800, 1801 | 0.673 (0.9%) | 0.000 | 0.289 (0.18%) | 0.000 |
+| game B 3600, 3601 | 0.687 (0.96%) | 0.000 | 0.296 (0.21%) | 0.000 |
+| game B 600, 601 | 0.000 | 0.000 | 0.000 | 0.000 |
+| game A 300, 301, 900, 1800, 2400 | 0.03-0.16 (0.11%) | 0.000 | 0.02-0.11 (0.07%) | 0.000 |
+| game A's menu | 0.046 (0.07%) | 0.003 | 0.033 (0.05%) | 0.003 |
+| game A's park | 4.784 (7.6%) | 1.118 (2.9%) | 1.818 (3.8%) | 0.937 (2.5%) |
+| game A's race | 4.384 (5.8%) | 0.881 (2.0%) | 1.666 (2.8%) | 0.864 (1.8%) |
+| game E 1200, 2400, 3600 | 3.12-3.22 (0.04-0.13%) | 0.024-0.025 | 1.21-1.39 (3.0-3.7%) | 0.019-0.021 |
+| game E 600 | 0.019 | 0.000 | 0.012 | 0.000 |
+| game F 3600 | 1.647 (0.47%) | 0.784 (0.08%) | 1.324 (0.70%) | 0.998 (0.25%) |
+| game F 600-2400 | 0.000-0.006 | 0.000 | 0.000-0.004 | 0.000 |
+| game C 600-3600 | 0.000 | 0.000 | 0.000 | 0.000 |
+| game D's intro | 0.032 | 0.016 | 0.026 | 0.015 |
+| game H's title | 0.099 (0.15%) | 0.001 | 0.078 (0.10%) | 0.001 |
 
-| scale | ours | Xenia D3D12 |
+Every frame Xenia has a scaled picture of is now within 0.03 of it, but for
+game A's park and race (whose 100% pictures are off Xenia's by 1.8 and 3.1
+already, from what the traces do not hold) and game F's 3600 (0.8-1.0).
+By switch, at 200% (`xfreplay --scale 200`):
+
+| frame | all on | fill off | scaled memory off | 64-bit off |
+| --- | --- | --- | --- | --- |
+| game B 1800 | 0.000 | 0.000 | 0.673 | 0.000 |
+| game E 1200 | 0.025 | 0.418 | 2.802 | 0.025 |
+| game F 3600 | 0.784 | 9.227 | 0.911 | 0.784 |
+| game A's park | 1.118 | 1.127 | 4.442 | 1.118 |
+
+Resolved memory at the scale gives most of it: game B's and game E's
+pictures read resolves through textures of other sizes and layouts (game E
+reads a 16x512 resolve as a 16x16 texture of 16 layers, and a 16_16_16_16
+surface through a 16_16 view). The fill is what lets 64-bit targets be scaled (game F's bloom:
+9.2 without it once they are); with resolved memory at the scale, 64-bit
+textures load scaled whether or not their targets are made so.
+
+**Cost** (2026-11-13, replays: `xfreplay --scale <percent> --gpu-time
+--repeat 10`, the GPU time of the fastest play after the first; the median of
+three runs, base and ours interleaved, the spread in brackets; the machine
+quiet, an editor's language server alone; ms a play). Base is master before
+this work (6c1a8ce); ours has resolved memory at the scale, 64-bit and depth
+targets scaled, and the two cuts below. Exact is the interlock path, fast the
+host render target path (the player's default):
+
+| trace | path | scale | base | ours |
+| --- | --- | --- | --- | --- |
+| game G's 1485 | exact | 100% | 13.66 (13.64-13.73) | 13.67 (13.62-13.72) |
+| | exact | 200% | 26.23 (26.08-26.25) | 27.73 (26.53-27.78) |
+| | exact | 300% | 46.50 (46.46-46.55) | 47.26 (47.18-47.34) |
+| | fast | 100% | 9.93 (9.91-9.98) | 9.95 (9.92-9.97) |
+| | fast | 200% | 15.98 (15.98-16.07) | 16.85 (16.38-17.21); 16.05-16.12 run again alone |
+| | fast | 300% | 26.02 (25.95-26.07) | 28.75 (26.28-28.80); 28.02 (27.97-28.89) run again |
+| game B's 1800 (the 3D title scene) | exact | 100% | 1.368 (1.363-1.370) | 1.378 (1.372-1.379) |
+| | exact | 200% | 6.147 (6.075-6.168) | 6.174 (6.088-6.200) |
+| | exact | 300% | 13.07 (12.94-13.09) | 13.00 (12.85-13.12) |
+| | fast | 100% | 0.933 (0.931-0.934) | 0.935 (0.929-0.935) |
+| | fast | 200% | 3.438 (3.434-3.445) | 3.449 (3.447-3.453) |
+| | fast | 300% | 7.484 (7.477-7.489) | 7.522 (7.520-7.529) |
+
+Game B costs the same. Game G's runs of ours are two-valued at 200% and
+300%: some match base (16.05-16.12 ms at 200%, 26.23 at 300%, where the
+kinds of work add up to base's but for 0.2 ms), others are 1-2.7 ms slower
+with no kind of work to show for it in the fastest play. Base's runs are
+not; resolved memory's heap (178 MB at 200%, 400 MB at 300%, beside 156 and
+250 MB of textures) is the suspect, not measured further (open). The replays include the trace's own
+read-back of the front buffer, which grows with the pixels (game G's: 0.50 ms
+at 100%, 2.05 ms at 200%), and which the player does not do.
+
+**What the scale adds beyond the pixels** (game G's 1485 at 200%, fast path,
+by `--gpu-time`'s kinds): the resolves' pass at the scale, 0.58 ms for 29
+resolves (the textures they feed written over their scaled texels); every
+other kind grows with the pixels (draws, the EDRAM transfers between targets:
+2.4 ms) or is the replay's (the read-back above). The host path's EDRAM
+stores before a resolve are gone already (a resolve reads the source's image
+itself, "Direct ownership transfers"). Resolved memory at the scale first
+added 1.8 ms there (every resolve's destination written twice over, game G's
+3200x3200 shadow atlas among them) and its first loads; two cuts, each kept
+only beyond the spread (game G's 1485 at 200%, three interleaved runs each):
+
+| | fast | exact |
 | --- | --- | --- |
-| 100% | 1.39 (1.38-1.39) | 0.83 (0.83-0.85) |
-| 200% | 5.18 (5.11-5.21), 3 runs | 2.92 (2.92-2.99), 2 runs |
-| 300% | 11.81 (11.81-12.03), 2 runs | 6.22 (6.22-6.28), 2 runs |
+| both cuts | 16.30 (16.09-17.17) | 27.32 (26.66-27.66) |
+| `XF_SCALED_COVER=0` | 17.71 (17.03-18.10) | 28.33 (27.46-29.27) |
+| `XF_SCALED_MEMORY_UNREAD=1` | 17.37 (17.36-17.39) | 28.16 (27.93-28.30) |
+| `XF_SCALED_MEMORY=0` (none of it kept) | 16.56 (16.48-16.92) | 26.94 (26.86-27.04) |
 
-The 100% row is the standing benchmark's above; ours at 200% and 300% ran
-before the direct ownership transfers above were merged. Not interleaved (ours'
-runs, then Xenia's, minutes apart); another agent's player and a Xenia ran
-on the machine during parts of both. Both grow about as the pixels do
-(ours 3.7x and 8.5x of its 100%, Xenia's 3.5x and 7.5x): we lose by the
-same factor as at 100%, the interlock path's draws costing about twice
-Xenia's host render targets' (the standing benchmark's analysis), which the
-interlock work aims at. What the scale adds besides the pixels (the
-resolves' second pass over scaled texels, the host path's EDRAM stores
-before every resolve) is not measured apart.
+- *Stale scaled targets covered in parts* (`XF_SCALED_COVER=0` off): a
+  scaled resolve target that went stale was refused the resolves that write
+  a part of it ("The loads after resolves in game G's town"), so game G's
+  shadow atlas, scaled now from resolved memory at the scale, was loaded
+  again every frame (0.83 ms at 200%). The scaled pass writes those parts at
+  the scale as the pass at the console's size does at 1x.
+- *Destinations nothing reads left out* (`XF_SCALED_MEMORY_UNREAD=1` off): a
+  resolve leaves its destination out of resolved memory at the scale (its
+  pages' tags cleared) where no texture load looked there since resolves of
+  two frames wrote it (one frame's resolves count once, so a one-frame trace
+  writes them all): the textures it feeds take what it wrote, and most of a
+  frame's resolves feed the textures that read them. A texture loaded there
+  next is the console's size that once, and those pages are written by every
+  resolve from then on. Pictures over six plays the same as with it off on
+  games B, D, E, F, G and A's park. In game G's later plays 5 of the 61
+  resolves at the scale still write it.
 
-**Where it differs from Xenia:** Xenia keeps a scaled copy of guest memory
-for resolves (its scaled resolve buffer, in 2 GB ranges on tiled resources)
-and loads textures from it with scaled addressing; here a resolve writes
-guest memory at the console's size and its scaled texels into the textures
-it feeds (or keeps them for the next texture), so no scaled memory exists
-and the CPU's view needs no downscale pass. A texture made over resolved
-memory that no resolve fed whole (a part of a resolve, another format's
-view of it, a 3D or cube texture) is the console's size where Xenia's would
-be scaled. Not done: a pixel shader's memory export runs once a host pixel
-(as Xenia's), counted.
+Against Xenia (its Direct3D 12 on its default host render targets, game B's
+title scene live, measured 2026-11-08 by `bench_vs_xenia.ps1 -Scale`: 0.83,
+2.92 and 6.22 ms at 100%, 200% and 300%): the fast path's replay is 1.13x, 1.18x and 1.21x of it, the exact path
+1.66x, 2.11x and 2.09x; the replay's own read-back is in ours, and Xenia's
+were frames of the running game, so the ratios are rough. Xenia's own trace
+dump has no GPU timing, and a live comparison is left to a quiet window.
+
+**Where it differs from Xenia:** Xenia keeps only its scaled copy of what
+resolves write (in 2 GB ranges on tiled resources, pages committed as they
+are touched) and downscales into guest memory where a read-back asks; here a
+resolve writes guest memory at the console's size as well as resolved memory
+at the scale (one heap of regions, no sparse binding, which Vulkan 1.3 does
+not require), so the CPU's view needs no downscale pass, and the textures it
+feeds directly. The layout is tiles rather than Xenia's 128-byte groups, so
+every quarter scales; a partly written unit is first made from memory where
+Xenia leaves what its buffer held. A texture smaller than the minimum
+scalable dimension loads at the console's size (Xenia scales every tiled
+texture whose base or mips are over scaled resolves); 3D and mipmapped
+textures over resolved memory load at the console's size, counted (open:
+their levels' sizes at a quarter scale are not the scaled levels' sizes, so
+they need a level-by-level load, and game G's mip chains made a level at a
+time are 14 of its 21 textures left at the console's size at 300%). Not done: a pixel shader's memory export
+runs once a host pixel (as Xenia's), counted.
 
 ## The software reference renderer (2026-11-09)
 

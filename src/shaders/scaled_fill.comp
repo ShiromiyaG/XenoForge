@@ -1,0 +1,42 @@
+// Resolved memory at a resolution scale (renderer.cpp's scaled memory;
+// docs/renderer.md, "Resolution scale"): a unit of it made from guest
+// memory's bytes in the mirror before a resolve writes a part of it, each
+// host block the guest block it lies in, so what the resolve leaves of the
+// unit holds what memory holds there. A unit is a 32x32 tile of 32-bit or
+// wider blocks, or the 4 KB page holding two tiles of 16-bit blocks or four
+// of 8-bit ones (whose bytes interleave there). An invocation writes a word.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer Memory { uint words[]; } memory;
+layout(set = 0, binding = 1) buffer Scaled { uint words[]; } scaled;
+
+layout(push_constant) uniform Fill {
+    uint guest;      // the unit's first byte in guest memory
+    uint at;         // its first byte in the scaled copy
+    uint log2_bytes; // per block
+    uint q;          // the scale in quarters
+    uint tiles;      // the tiles in the unit, side by side (1, 2 or 4)
+    uint words;      // the unit's scaled words
+} p;
+
+#include "tiling.glsl"
+
+void main() {
+    uint w = gl_GlobalInvocationID.x;
+    if (w >= p.words) return;
+    uint side = 8u * p.q, tile_bytes = (side * side) << p.log2_bytes;
+    uint offset = w * 4u, j = offset / tile_bytes, rest = offset - j * tile_bytes;
+    uint value = 0u;
+    for (uint k = 0u; k < 4u; k++) {
+        uint byte_ = rest + k, block = byte_ >> p.log2_bytes;
+        uint y = block / side, x = block - y * side;
+        uint address = p.guest + tiled_offset_2d(j * 32u + x * 4u / p.q, y * 4u / p.q, 32u * p.tiles, p.log2_bytes) +
+                       (byte_ & ((1u << p.log2_bytes) - 1u));
+        address &= PHYSICAL_MASK;
+        value |= ((memory.words[address >> 2u] >> ((address & 3u) * 8u)) & 0xFFu) << (8u * k);
+    }
+    scaled.words[(p.at >> 2u) + w] = value;
+}

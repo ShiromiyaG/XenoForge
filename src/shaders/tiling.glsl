@@ -18,6 +18,21 @@ uint tiled_offset_2d(uint x, uint y, uint pitch, uint log2_bytes) {
     return tiled_combine(bytes, bank, pipe, y & 1u);
 }
 
+// Resolved memory at a resolution scale of q quarters (renderer.cpp's scaled
+// memory; docs/renderer.md, "Resolution scale"): a 2D surface's 32x32 tile
+// whose guest bytes start at byte a of a region is kept at (a / 16) * q * q
+// of the region's scaled copy, as the tile's 8q x 8q host blocks row by row
+// (whole at every quarter; the guest's tiles follow one another along a row
+// of macro tiles, so its tile t lies t * 1024 * bytes past the surface's
+// base). The byte offset there of host block (x, y) of a surface whose base
+// lies rel bytes into the region (a multiple of 16), pitch in guest blocks.
+uint scaled_offset_2d(uint rel, uint x, uint y, uint pitch, uint log2_bytes, uint q) {
+    uint side = 8u * q;
+    uint tx = x / side, ty = y / side;
+    uint tile = rel + ((tx + ty * (pitch >> 5u)) << (log2_bytes + 10u));
+    return (tile >> 4u) * q * q + (((y - ty * side) * side + (x - tx * side)) << log2_bytes);
+}
+
 // the byte offset of block (x, y, z) of a 3D surface, pitch and height in blocks
 uint tiled_offset_3d(uint x, uint y, uint z, uint pitch, uint height, uint log2_bytes) {
     uint outer = ((((z >> 2u) * (height >> 4u) + (y >> 4u)) * (pitch >> 5u)) + (x >> 5u)) << 7u;

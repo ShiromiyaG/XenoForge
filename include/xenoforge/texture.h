@@ -286,6 +286,7 @@ uint64_t level_bytes(const Plan &plan, uint32_t level);
 struct GpuLevel {
     uint32_t base, slice_stride, slices, layered, pitch_blocks, z_rows, ox, oy, oz, tiled, is_3d, log2_bytes, endian;
     uint32_t blocks_x, blocks_y, out_word, words, load, half, row_words, out_width, out_height;
+    uint32_t scale_q4 = 0; // 0; else read from resolved memory at this scale (texture_load.comp)
 };
 // Every level of the plan, each starting at a 16-byte aligned offset of the
 // output (as the renderer copies them into the image), and the bytes of all.
