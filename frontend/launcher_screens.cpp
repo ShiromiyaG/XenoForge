@@ -66,7 +66,8 @@ void LauncherView::open_row_menu(bool first_hot) {
     Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str());
     if (!row || !selected_game()) return;
     const Rml::Vector2f at = row->GetAbsoluteOffset(Rml::BoxArea::Border);
-    open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
+    if (grid_) open_context_menu(at.x + row->GetBox().GetSize(Rml::BoxArea::Border).x * 0.5f, at.y + 60 * dp()); // over the tile's picture
+    else open_context_menu(at.x + 180 * dp(), at.y + 20 * dp());
     if (first_hot) menu_move(1);
 }
 
@@ -426,6 +427,7 @@ void LauncherView::update() {
     }
     poll_listing();
     rebuild_rows();
+    update_grid();
     update_backdrop();
 
     // the checks' and pictures' requests, once there is something to show

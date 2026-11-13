@@ -210,6 +210,30 @@ std::string table_row_html(const RowInfo &r, bool selected) {
     return s + "</div></div>";
 }
 
+// A game as a tile of the grid: a cell (its width is the share of the row the grid's column count gives, so the
+// tiles fill the width evenly) holding the tile itself, which wears the row's id and attributes so the selection,
+// the clicks and the menus find it as they find a row.
+std::string table_tile_html(const RowInfo &r, bool selected) {
+    std::string s = "<div class=\"cell\"><div class=\"tile f";
+    if (selected) s += " sel";
+    if (r.unreadable) s += " broken";
+    s += "\" data-index=\"" + std::to_string(r.index) + "\" id=\"row-" + std::to_string(r.index) + "\">";
+    if (selected) s += "<div class=\"glow\"></div>";
+    if (r.unreadable) {
+        s += "<div class=\"tile-art broken\">" + icon_html("triangle-alert") + "</div><div class=\"tile-title\">" + e(r.title) +
+             "</div><div class=\"tile-status\"><div class=\"dot bad\"></div><div class=\"nowrap\">Cannot be read</div></div>";
+    } else {
+        s += "<div class=\"opt-btn tile-opt\" data-row-options=\"1\" title=\"Options\">" + icon_html("settings", "ic cog") + "</div>";
+        s += "<div class=\"tile-art\" style=\"" + art_style(r.icon, r.title_id) + "\">" + art_letter(r.icon, r.title) + "</div>";
+        s += "<div class=\"tile-title\">" + e(r.title) + "</div>";
+        s += "<div class=\"tile-status\">";
+        s += r.running ? std::string("<div class=\"dot run\"></div><div class=\"nowrap\">Running</div>")
+                       : std::string("<div class=\"dot ") + status_class(r.status) + "\"></div><div class=\"nowrap\">" + status_text(r.status) + "</div>";
+        s += "</div>";
+    }
+    return s + "</div></div>";
+}
+
 std::string empty_html(bool no_folder, bool filtered, bool loading, const std::string &folder) {
     std::string s = "<div class=\"empty\">";
     if (loading) {

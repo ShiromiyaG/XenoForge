@@ -43,6 +43,7 @@ LauncherView::LauncherView(LauncherCore &core, ui::Renderer &renderer, SDL_Windo
     context_pending_ = opt_.context_menu;
     screen_pending_ = opt_.screen != Screen::Library;
     parse_sort(core_.launcher().sort, sort_, ascending_);
+    grid_ = core_.launcher().view == "grid";
     last_update_ = Clock::now();
     settings_ = std::make_unique<SettingsView>(core_, *this);
     if (!opt_.offscreen) { // a picture of the window needs no sound
@@ -122,6 +123,7 @@ bool LauncherView::build_document(std::string &error) {
     if (Rml::Element *e = by_id("nav-games")) e->SetClass("on", !in_settings);
     if (Rml::Element *e = by_id("nav-settings")) e->SetClass("on", in_settings);
     rows_sig_.clear(), status_sig_.clear();
+    grid_cols_ = 0; // the new body has no column class yet
     menu_.clear(), menu_items_.clear();
     if (Rml::Element *search = by_id("search")) search->SetAttribute("value", filter_);
     if (Rml::Element *clear = by_id("search-clear")) clear->SetClass("on", !filter_.empty());
@@ -303,7 +305,22 @@ void LauncherView::move_selection(int delta, bool to_end) {
     long at = -1;
     for (size_t i = 0; i < order_.size(); i++)
         if (long(order_[i]) == selected_) at = long(i);
-    long next = to_end ? (delta < 0 ? 0 : long(order_.size()) - 1) : at < 0 ? 0 : std::clamp(at + delta, 0L, long(order_.size()) - 1);
+    const long last = long(order_.size()) - 1;
+    const int cols = grid_ ? grid_columns() : 1;
+    long next;
+    if (to_end) {
+        next = delta < 0 ? 0 : last;
+    } else if (at < 0) {
+        next = 0;
+    } else if (cols > 1 && std::abs(delta) >= cols) {
+        // a row or more of tiles: the row that is not there is the last tile (the first, going up), and none from the row it is in
+        const long target = at + delta;
+        if (target > last) next = at / cols == last / cols ? at : last;
+        else if (target < 0) next = at / cols == 0 ? at : 0;
+        else next = target;
+    } else {
+        next = std::clamp(at + delta, 0L, last);
+    }
     select_game(long(order_[size_t(next)]), true);
     if (Rml::Element *row = by_id(("row-" + std::to_string(selected_)).c_str())) row->Focus(pad_mode_);
 }
@@ -311,12 +328,14 @@ void LauncherView::move_selection(int delta, bool to_end) {
 int LauncherView::visible_rows() const {
     Rml::Element *body = by_id("tbody");
     if (!body) return 10;
+    if (grid_) return std::max(1, int(body->GetClientHeight() / (232 * dp()))); // a row of tiles' cells
     return std::max(1, int(body->GetClientHeight() / (74 * dp())) - 1); // a row and its gap
 }
 
 void LauncherView::save_layout() {
     Settings::Launcher l = core_.launcher();
     l.sort = sort_text(sort_, ascending_);
+    l.view = grid_ ? "grid" : "list";
     std::string error;
     if (!core_.set_launcher(l, error)) std::fprintf(stderr, "launcher: %s\n", error.c_str());
 }
@@ -346,7 +365,7 @@ void LauncherView::rebuild_rows(bool force) {
         k.title = g.title, k.id_text = g.title_id_text(), k.version = g.version;
         k.status = int(status_of(g));
     }
-    std::string sig = core_.games_folder() + "|" + std::to_string(listing_.total) + (listing_.busy ? "b" : "i") + "|" + filter_ + "|" +
+    std::string sig = core_.games_folder() + "|" + std::to_string(listing_.total) + (listing_.busy ? "b" : "i") + (grid_ ? "g" : "l") + "|" + filter_ + "|" +
                       sort_text(sort_, ascending_) + "|" + (run.running ? run.title : "") + "|";
     for (const RowKey &k : keys) sig += k.title + "/" + std::to_string(k.status) + ";";
     if (!force && sig == rows_sig_) return;
@@ -371,9 +390,10 @@ void LauncherView::rebuild_rows(bool force) {
             r.icon = icon_name(g), r.status = GameStatus(keys[i].status);
             r.running = run.running && run.title == g.title;
         }
-        html += table_row_html(r, long(i) == selected_);
+        html += grid_ ? table_tile_html(r, long(i) == selected_) : table_row_html(r, long(i) == selected_);
     }
     body->SetInnerRML(html);
+    update_grid();
     if (animate_rows_ && !listing_.busy && !order_.empty()) { // the whole list is in: it comes in
         animate_rows_ = false;
         animate_rows_in();
@@ -385,6 +405,7 @@ void LauncherView::rebuild_rows(bool force) {
     if (Rml::Element *table = by_id("table")) {
         table->SetClass("no-rows", show_empty);
         table->SetClass("has-games", !listing_.games.empty()); // the search box is for a list that has games
+        table->SetClass("grid", grid_);
     }
     if (Rml::Element *empty = by_id("tempty")) {
         empty->SetClass("on", show_empty);
@@ -393,6 +414,41 @@ void LauncherView::rebuild_rows(bool force) {
     update_toolbar();
     update_status();
 }
+
+// The games as rows or as tiles. The table is built again (the rows come in as for a new list) and the selected
+// game is scrolled to, where the other layout has it.
+void LauncherView::set_view(bool grid) {
+    if (grid == grid_) return;
+    grid_ = grid;
+    save_layout();
+    animate_rows_ = true;
+    rebuild_head();
+    rebuild_rows(true);
+    update_toolbar();
+    defer([this] {
+        if (selected_ >= 0) select_game(selected_, true);
+    });
+}
+
+// The grid's columns: as many tiles as the body's width holds at their least width, as a class of the body
+// (cols-N: the cells' share of the width, in the stylesheet). Looked at once a frame; the class is set only when
+// the count changes, since a property set every frame lays the whole document out again.
+void LauncherView::update_grid() {
+    if (!grid_) return;
+    Rml::Element *body = by_id("tbody");
+    if (!body) return;
+    const Rml::Box &box = body->GetBox();
+    const float width = body->GetClientWidth() - box.GetEdge(Rml::BoxArea::Padding, Rml::BoxEdge::Left) - box.GetEdge(Rml::BoxArea::Padding, Rml::BoxEdge::Right);
+    if (width <= 0) return; // not laid out yet
+    const int cols = std::clamp(int(width / (186 * dp())), 1, 10);
+    if (cols == grid_cols_) return;
+    if (grid_cols_ > 0) body->SetClass("cols-" + std::to_string(grid_cols_), false);
+    grid_cols_ = cols;
+    body->SetClass("cols-" + std::to_string(cols), true);
+    settle_until_ = std::max(settle_until_, now_ + 0.3);
+}
+
+int LauncherView::grid_columns() const { return grid_ ? std::max(1, grid_cols_) : 1; }
 
 // The rows slide in from the left and fade in, one after another (the first ten; the rest with the tenth),
 // as the console's list does when a page opens. A hold at nothing for the row's turn comes first: an
@@ -434,6 +490,8 @@ void LauncherView::update_toolbar() {
     }
     if (Rml::Element *interpreted = by_id("tb-play-interpreted")) interpreted->SetClass("off", running || !g || !player_of(*g));
     if (Rml::Element *demo = by_id("tb-demo")) demo->SetClass("on", core_.demo_games());
+    if (Rml::Element *list = by_id("tb-view-list")) list->SetClass("on", !grid_);
+    if (Rml::Element *grid = by_id("tb-view-grid")) grid->SetClass("on", grid_);
     // the scan under way: the Rescan button's arrows and the status bar's icon turn
     if (Rml::Element *rescan = by_id("tb-rescan"))
         if (Rml::Element *icon = rescan->GetFirstChild()) icon->SetClass("spin", listing_.busy);

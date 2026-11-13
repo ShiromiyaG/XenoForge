@@ -57,6 +57,8 @@ struct RowInfo {
 // name, its status, title ID and version, and the Options button
 std::string table_head_html(Column sort, bool ascending);
 std::string table_row_html(const RowInfo &row, bool selected);
+// the same game as a tile of the grid view (its picture over its name and status)
+std::string table_tile_html(const RowInfo &row, bool selected);
 // what the table area says with nothing to list: no folder chosen, a folder
 // without games, or a filter that hides them all
 std::string empty_html(bool no_folder, bool filtered, bool loading, const std::string &folder);

@@ -588,6 +588,7 @@ int main() {
         frontend::Settings a, b;
         a.launcher.games = "D:/games", a.launcher.accent = "#9b7bff", a.launcher.theme = "light";
         a.launcher.sort = "-status";
+        a.launcher.view = "grid";
         a.launcher.backdrop = "still";
         a.launcher.sounds = false;
         a.launcher.smooth_edges = false;
@@ -596,6 +597,7 @@ int main() {
         CHECK(frontend::save(file, a, err) && frontend::load(file, b, err));
         CHECK(b.launcher.games == "D:/games" && b.launcher.accent == "#9b7bff" && b.launcher.theme == "light");
         CHECK(b.launcher.sort == "-status");
+        CHECK(b.launcher.view == "grid" && frontend::Settings().launcher.view == "list"); // the rows unless the file says grid
         CHECK(b.launcher.backdrop == "still");
         CHECK(frontend::Settings().launcher.backdrop == "animated");
         CHECK(!b.launcher.sounds && frontend::Settings().launcher.sounds); // on unless the file says off

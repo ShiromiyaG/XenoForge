@@ -10,7 +10,8 @@
 // a colour is launcher_model.cpp's; this file connects them to the document.
 //
 // Input: the mouse and keys as a desktop program takes them (the arrows,
-// Page Up and Down, Home and End move the selection, Enter plays, F2 the
+// Page Up and Down, Home and End move the selection (in the grid, Left and
+// Right too, and Up and Down a row of tiles), Enter plays, F2 the
 // game's settings, F5 rescans, Ctrl+O opens a folder, Ctrl+F searches, Alt or
 // F10 the menus); a pad moves the selection with the d-pad or the stick, A or
 // Start plays, X opens the game's settings, Y rescans, B closes, Back opens
@@ -119,6 +120,12 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     void move_selection(int delta, bool to_end = false);
     int visible_rows() const;
     void save_layout();
+    // the grid view (tiles instead of rows): its toggle, the column count the width allows (set as a class of the
+    // body, once a frame), the columns the tiles are actually laid out in, and what a page of the list is
+    void set_view(bool grid);
+    void update_grid();
+    int grid_columns() const;
+    int page_step() const { return visible_rows() * (grid_ ? grid_columns() : 1); }
 
     // menus
     std::vector<MenuItem> menu_items(const std::string &name);
@@ -190,6 +197,8 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     std::string filter_;
     Column sort_ = Column::Title;
     bool ascending_ = true;
+    bool grid_ = false;    // the games as tiles ([launcher] view = "grid")
+    int grid_cols_ = 0;    // the class the body wears (cols-N); 0 until the first measure
     // whether a library is cached for a disc, by its digest: asked of the
     // cache folder once, again after a rescan or a build
     mutable std::map<uint64_t, bool> cached_;
@@ -248,6 +257,7 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
         double next = 0;
     };
     Repeat pad_repeat_, stick_repeat_;
+    int stick_x_ = 0, stick_y_ = 0;          // the left stick's last positions (the grid moves along both)
     int menu_stick_dir_ = 0;                // the left stick's push in a menu: one step a push
     bool lt_held_ = false, rt_held_ = false; // the triggers, which switch between the pages once a press
     bool quit_ = false;
