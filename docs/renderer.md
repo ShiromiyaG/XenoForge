@@ -4522,13 +4522,68 @@ and a console pixel to the host pixel at its center (render_scale.h's
     (`scaled_fill.comp`), unless its pages already hold this layout. The
     CPU's writes (when `request` takes them into the mirror), exports and
     3D-array resolves clear the tags. A texture loads at the scale when it
-    is one level of tiled 2D slices of single-texel blocks, no smaller than
-    the minimum scalable dimension, and every page of it is in one region
-    with this layout's tag (its pages made current first); else at the
+    is tiled 2D slices of single-texel blocks, no smaller than the minimum
+    scalable dimension, each level's slices in one region, and every page of
+    it has this layout's tag (its pages made current first); else at the
     console's size, counted by why ("textures over resolved memory at the
-    console's size: ...": 3D, mipmapped, not tiled 2D slices,
-    block-compressed, smaller than the minimum scalable dimension, not all
-    of it kept at the scale).
+    console's size: ...": 3D, not tiled 2D slices, block-compressed, smaller
+    than the minimum scalable dimension, mipmapped with its levels' sizes not
+    the scale's, not all of it kept at the scale).
+  - *A part of it kept* (2026-11-13; `XF_SCALED_FILL_LOAD=0` off). A texture
+    some of whose pages hold this layout's scaled bytes and others not loads
+    at the scale too, the units that do not (as a resolve's: a tile of 32-bit
+    or wider blocks, else the 4 KB page) made from guest memory first by
+    `scaled_fill.comp` and tagged, as a resolve makes the units it writes a
+    part of; its regions are made first where they are not yet. Xenia scales
+    a texture any of whose base or mip pages a scaled resolve wrote
+    (texture_cache.cc's FindOrCreateTexture, `IsRangeScaledResolved`), and
+    reads what its scaled buffer holds for the rest; here the rest is the
+    console's bytes, each host texel the guest texel it lies in. Counted:
+    "textures over resolved memory at the scale: a part made from memory
+    first".
+  - *Mipmapped textures* (2026-11-13; `XF_SCALED_MIPS=0` off), level by
+    level as Xenia's (d3d12_texture_cache.cc's load, each level
+    `(width * scale) >> level`): each level from its own place in the heap,
+    a packed tail's offsets at the scale. Where a level's size at the scale
+    is not the image's level (a quarter scale of a size that does not halve
+    evenly: 125% of 100 is 125, whose half 62 is not 125% of 50) the texture
+    loads at the console's size, counted; at whole scales of power-of-two
+    sizes, never.
+  - *Game G's town at 200%* (traces 1294 and 1485, the host render target
+    path, Xenia's Direct3D 12 dump at `--draw_resolution_scale_x/y=2`). The
+    game draws its 1280x720 HDR scene with 2x MSAA in two parts, resolving
+    the top 1280x512 into a 16_16_16_16 surface and then the bottom
+    1280x208 into the same surface 512 rows down, and reads the whole
+    surface between the two (and its 8_8_8_8 and 24_8 twins likewise). Then
+    the bottom part's pages held the last frame's (in a one-frame trace,
+    nothing at the scale), so the texture loaded at the console's size, the
+    bottom resolve fed it at that size as its resolve target, and the
+    tonemap read a 1280x720 scene into the 2560x1440 picture: 2x2 stair
+    steps on every edge. The "texture loads after a resolve: 16_16_16_16_
+    EXPAND 1280x720, a target with no place in the resolves' table" in the
+    report was this load (made before as no target, from memory no resolve
+    had written yet); the table had room. Its sky and impostor mip chains
+    (4_4_4_4 64-192 square, 8_8_8_8 128x64, resolved a level at a time) were
+    the 20 "mipmapped". The 12 "a resolve target refused: another pitch"
+    are post-process surfaces resolved over the shadow atlas's memory, which
+    loads at the scale from resolved memory anyway: none feeds the picture
+    at the console's size. Mean difference of 255 and pixels off by more
+    than 16 against Xenia's 200%:
+
+    | | 1294 | 1485 |
+    | --- | --- | --- |
+    | our 100% against Xenia's 100% | 1.096 (1.75%) | 1.080 (1.99%) |
+    | 200%, both off | 4.463 (8.68%) | 3.859 (6.15%) |
+    | 200%, mips only | 4.443 (8.61%) | 3.857 (6.14%) |
+    | 200%, a part kept only | 1.103 (1.88%) | 0.909 (1.66%) |
+    | 200%, both on | 1.069 (1.78%) | 0.905 (1.65%) |
+    | 200%, both on, interlock path | 1.130 (1.78%) | 0.952 (1.68%) |
+
+    At 200% ours is now as near Xenia's as at 100%, and the crops show the
+    same edges. Left at the console's size there: a 1x1 and two 4x4
+    32_FLOAT (the exposure's reduction), below the minimum scalable
+    dimension. The other frames Xenia has scaled pictures of are unchanged
+    (`replay_test` at 200% and 300%, the table below).
 - Textures a resolve feeds: a resolve target the resolve writes whole, no
   smaller than the minimum scalable dimension, is made the scale's
   (`scale_texture`: an image of the same format, its old one gone with the
@@ -4708,12 +4763,13 @@ feeds directly. The layout is tiles rather than Xenia's 128-byte groups, so
 every quarter scales; a partly written unit is first made from memory where
 Xenia leaves what its buffer held. A texture smaller than the minimum
 scalable dimension loads at the console's size (Xenia scales every tiled
-texture whose base or mips are over scaled resolves); 3D and mipmapped
-textures over resolved memory load at the console's size, counted (open:
-their levels' sizes at a quarter scale are not the scaled levels' sizes, so
-they need a level-by-level load, and game G's mip chains made a level at a
-time are 14 of its 21 textures left at the console's size at 300%). Not done: a pixel shader's memory export
-runs once a host pixel (as Xenia's), counted.
+texture whose base or mips are over scaled resolves); 3D textures over
+resolved memory load at the console's size, and mipmapped ones at quarter
+scales whose levels' sizes do not halve as the image's, counted (Xenia has
+only whole scales). A texture partly kept at the scale has the rest made
+from guest memory, where Xenia reads whatever its scaled buffer held. Not
+done: a pixel shader's memory export runs once a host pixel (as Xenia's),
+counted.
 
 ## The software reference renderer (2026-11-09)
 

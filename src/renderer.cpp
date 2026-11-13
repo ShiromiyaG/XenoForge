@@ -1891,6 +1891,27 @@ private:
         const char *v = std::getenv("XF_SCALED_MEMORY_UNREAD");
         return !(v && v[0] == '1');
     }();
+    // A texture over resolved memory a part of which is kept at the scale
+    // loads at the scale, the rest of it made from guest memory first (as a
+    // resolve makes the units it writes a part of: scaled_fill.comp), as
+    // Xenia scales a texture any of whose pages a scaled resolve wrote. A
+    // screen resolved in two parts and read between them (the second part's
+    // memory then holds the last frame's) was otherwise loaded, and fed by
+    // the second resolve, at the console's size. XF_SCALED_FILL_LOAD=0: such
+    // a texture loads at the console's size.
+    bool scaled_fill_load_ = [] {
+        const char *v = std::getenv("XF_SCALED_FILL_LOAD");
+        return !(v && v[0] == '0');
+    }();
+    // Mipmapped textures over resolved memory loaded at the scale level by
+    // level, each level from its own scaled tiles (a mip chain resolved a
+    // level at a time), where every level's size at the scale is the image's
+    // level size (always at whole scales of power-of-two sizes).
+    // XF_SCALED_MIPS=0: those load at the console's size.
+    bool scaled_mips_ = [] {
+        const char *v = std::getenv("XF_SCALED_MIPS");
+        return !(v && v[0] == '0');
+    }();
     // a page's resolved memory at the scale (0: never written): bits 0-4 the
     // frames whose resolves wrote it since a texture load last looked there,
     // bit 5 left out since, bit 6 looked at since the last write, bit 7
@@ -2156,7 +2177,7 @@ private:
     std::vector<uint32_t> free_indices_[3]; // each table's places given back
     uint64_t limits_applied_at_ = 0;        // done_serial_ when the limits were last applied
     bool gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload,
-                  const std::pair<const uint32_t, ScaledRegion> *scaled_from = nullptr);
+                  const std::vector<uint32_t> *scaled_bases = nullptr);
     bool cpu_upload(const vk::Image &target, const texture::Image &image, bool fresh);
     texture::Support support_; // what the device samples (texture_support)
     uint32_t sampler(const uint32_t fetch[6], const std::array<uint32_t, 4> &overrides);
@@ -7203,40 +7224,142 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     // dimension, every page of it in one region and holding this layout's
     // scaled bytes (made current first: what the CPU wrote since clears that).
     // What is not is counted by why ("uses" in the report).
-    const std::pair<const uint32_t, ScaledRegion> *scaled_from = nullptr;
+    //
+    // Mipmapped ones level by level (scaled_mips_), each level's slices in
+    // one region, where every level's size at the scale is the image's level
+    // size. One part of which is kept at the scale, the rest made from memory
+    // first (scaled_fill_load_).
+    std::vector<uint32_t> scaled_bases; // each level's first slice, in the heap (scaled_rel); empty: not scaled
+    const char *scaled_why = nullptr;   // (for the verbose line)
     if (scaled_memory_ && mirror && !kept && !ranges.empty()) {
         const texture::SliceLoad *first = plan.slices.empty() ? nullptr : &plan.slices[0];
-        bool layout = first != nullptr;
-        for (const texture::SliceLoad &s : plan.slices)
-            layout &= s.level == 0 && s.tiled && !s.is_3d && !s.ox && !s.oy && s.pitch_blocks == first->pitch_blocks;
+        bool layout = first != nullptr, levels_kept = true;
+        for (size_t i = 0; i < plan.slices.size(); i++) {
+            const texture::SliceLoad &s = plan.slices[i];
+            layout &= s.tiled && !s.is_3d && s.log2_bytes_per_block == first->log2_bytes_per_block;
+            // (a level's slices of one pitch; the first level's from its corner)
+            if (i && s.level == plan.slices[i - 1].level) layout &= s.pitch_blocks == plan.slices[i - 1].pitch_blocks;
+            if (s.level == 0) layout &= !s.ox && !s.oy;
+            const uint32_t w = std::max(plan.width >> s.level, 1u), h = std::max(plan.height >> s.level, 1u);
+            levels_kept &= std::max(scale_.up(plan.width) >> s.level, 1u) == scale_.up(w) &&
+                           std::max(scale_.up(plan.height) >> s.level, 1u) == scale_.up(h) &&
+                           scale_.up(s.ox) * 4 == s.ox * scale_.q4 && scale_.up(s.oy) * 4 == s.oy * scale_.q4;
+        }
         const bool small = !scalable(plan.width, plan.height, min_scalable_);
         const char *reason = three                                             ? "3D"
-                             : level_count != 1                                ? "mipmapped"
+                             : level_count != 1 && !scaled_mips_               ? "mipmapped"
                              : !layout                                         ? "not tiled 2D slices"
                              : plan.block_width != 1 || plan.block_height != 1 ? "block-compressed"
-                             : small ? "smaller than the minimum scalable dimension"
-                                     : nullptr;
+                             : small                            ? "smaller than the minimum scalable dimension"
+                             : level_count != 1 && !levels_kept ? "mipmapped, its levels' sizes not the scale's"
+                                                                : nullptr;
         if (!reason) {
             request(ranges);
-            uint32_t low = UINT32_MAX, high = 0;
-            for (auto [start, end] : ranges) low = std::min(low, start), high = std::max(high, end);
-            scaled_from = scaled_region(low & ~4095u, (high + 4095) & ~4095u);
-            const uint32_t base = first->base & 0x1FFFFFFF;
-            bool all = scaled_from != nullptr;
-            for (auto [start, end] : ranges)
-                for (uint32_t page = start & ~4095u; page < end; page += 4096) {
-                    all &= scaled_tags_[page >> 12] == scaled_tag(page, base, first->log2_bytes_per_block);
+            // each slice's pages, with the base its tiles count from (for
+            // 64- and 128-bit blocks, whose tiles span pages)
+            const uint32_t log2_bytes = first->log2_bytes_per_block;
+            auto slice_pages = [&](const texture::SliceLoad &s, auto &&f) {
+                const uint32_t base = s.base & 0x1FFFFFFF;
+                for (uint64_t page = (base + s.low) & ~uint64_t(4095); page < base + s.high; page += 4096)
+                    f(uint32_t(page), base);
+            };
+            bool all = true, any = false;
+            for (const texture::SliceLoad &s : plan.slices)
+                slice_pages(s, [&](uint32_t page, uint32_t base) {
+                    const bool kept_here = scaled_tags_[page >> 12] == scaled_tag(page, base, log2_bytes);
+                    all &= kept_here, any |= kept_here;
                     // (looked at: scaled_skip_unread_; always written if left out)
                     uint8_t &reads = scaled_reads_[page >> 12];
                     if (reads) reads |= (reads & 0x20) ? 0xC0 : 0x40;
+                });
+            // each level's span of guest memory, page aligned (a level's
+            // slices follow one another: texture::gpu_levels makes a load of
+            // each run of them)
+            std::vector<std::pair<uint32_t, uint32_t>> spans;
+            std::vector<uint32_t> span_of(plan.slices.size());
+            for (size_t i = 0; i < plan.slices.size(); i++) {
+                const texture::SliceLoad &s = plan.slices[i];
+                const uint32_t base = s.base & 0x1FFFFFFF;
+                const uint32_t lo = uint32_t((base + s.low) & ~uint64_t(4095)),
+                               hi =
+                                   uint32_t(std::min<uint64_t>((base + s.high + 4095) & ~uint64_t(4095), GUEST_MEMORY));
+                if (!i || s.level != plan.slices[i - 1].level) spans.push_back({lo, hi});
+                span_of[i] = uint32_t(spans.size() - 1);
+                spans.back().first = std::min(spans.back().first, lo);
+                spans.back().second = std::max(spans.back().second, hi);
+            }
+            if (!all && any && scaled_fill_load_) {
+                // the regions first (one may merge and move another), then
+                // the units not holding this layout made from memory
+                bool regions = true;
+                for (auto [lo, hi] : spans) regions &= make_scaled_region(lo, hi) != nullptr;
+                if (regions) {
+                    struct Fill {
+                        uint32_t guest, at, log2_bytes, q, tiles, words;
+                    };
+                    std::vector<Fill> fills;
+                    const uint32_t tile_bytes = 1024u << log2_bytes, unit_bytes = std::max(tile_bytes, 4096u),
+                                   q = scale_.q4;
+                    for (const texture::SliceLoad &s : plan.slices) {
+                        const uint32_t base = s.base & 0x1FFFFFFF;
+                        const uint64_t from = tile_bytes < 4096 ? (base + s.low) & ~uint64_t(4095)
+                                                                : base + s.low / tile_bytes * tile_bytes;
+                        for (uint64_t unit = from; unit < base + s.high && unit + unit_bytes <= GUEST_MEMORY;
+                             unit += unit_bytes) {
+                            bool current = true;
+                            for (uint64_t page = unit; page < unit + unit_bytes; page += 4096)
+                                current &= scaled_tags_[page >> 12] == scaled_tag(uint32_t(page), base, log2_bytes);
+                            if (current) continue;
+                            const auto *region = scaled_region(uint32_t(unit), uint32_t(unit + unit_bytes));
+                            if (!region) continue;
+                            fills.push_back({uint32_t(unit),
+                                             uint32_t(region->second.heap +
+                                                      VkDeviceSize((uint32_t(unit) - region->first) >> 4) * q * q),
+                                             log2_bytes, q, unit_bytes / tile_bytes,
+                                             uint32_t(((unit_bytes >> 4) * q * q) >> 2)});
+                            for (uint64_t page = unit; page < unit + unit_bytes; page += 4096)
+                                scaled_tags_[page >> 12] = scaled_tag(uint32_t(page), base, log2_bytes);
+                        }
+                    }
+                    if (!fills.empty()) {
+                        VkCommandBuffer c = outside();
+                        if (options_.gpu_timing) gpu_mark("textures: scaled memory made from memory for a load");
+                        full_barrier(c);
+                        vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, scaled_fill_pipeline_);
+                        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1,
+                                                &scaled_fill_set_, 0, nullptr);
+                        for (const Fill &f : fills) {
+                            vkCmdPushConstants(c, load_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(f), &f);
+                            vkCmdDispatch(c, (f.words + 63) / 64, 1, 1);
+                        }
+                        full_barrier(c);
+                        report_.scaled_fills += fills.size();
+                        use("textures over resolved memory at the scale: a part made from memory first");
+                    }
+                    all = true;
+                    for (const texture::SliceLoad &s : plan.slices)
+                        slice_pages(s, [&](uint32_t page, uint32_t base) {
+                            all &= scaled_tags_[page >> 12] == scaled_tag(page, base, log2_bytes);
+                        });
                 }
-            if (!all) scaled_from = nullptr;
-            if (!scaled_from) reason = "not all of it kept at the scale";
+            }
+            if (all) {
+                for (size_t i = 0; i < plan.slices.size(); i++) {
+                    if (scaled_bases.size() > span_of[i]) continue;
+                    const auto [lo, hi] = spans[span_of[i]];
+                    const auto *region = scaled_region(lo, hi);
+                    if (!region) break;
+                    scaled_bases.push_back(scaled_rel(*region, plan.slices[i].base & 0x1FFFFFFF));
+                }
+                if (scaled_bases.size() != spans.size()) scaled_bases.clear();
+            }
+            if (scaled_bases.empty()) reason = "not all of it kept at the scale";
         }
-        if (scaled_from)
+        if (!scaled_bases.empty())
             extent = {scale_.up(plan.width), scale_.up(plan.height), 1};
         else
             use(std::string("textures over resolved memory at the console's size: ") + reason);
+        scaled_why = reason;
     }
     bool fresh = !t || t->image.format != format || t->image.extent.width != extent.width ||
                  t->image.extent.height != extent.height || t->image.extent.depth != extent.depth ||
@@ -7355,7 +7478,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     t->low = UINT32_MAX, t->high = 0;
     for (auto [start, end] : t->ranges) t->low = std::min(t->low, start), t->high = std::max(t->high, end);
     index_texture(*t);
-    t->scaled = kept != nullptr || scaled_from != nullptr;
+    t->scaled = kept != nullptr || !scaled_bases.empty();
     if (kept) {
         // the scaled resolve's texels, of the same size (the texture's format
         // holds the guest's bits as they are, as the resolve wrote them)
@@ -7370,11 +7493,14 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         std::vector<Range> its{{kept->low, kept->high}};
         drop_scaled_resolves(its);
         report_.textures_scaled++;
-        if (options_.verbose) std::fprintf(stderr, "  texture %08X: a scaled resolve's texels copied in\n", info.base_address);
+        if (options_.verbose)
+            std::fprintf(stderr, "  texture %08X: a scaled resolve's texels copied in\n", info.base_address);
     } else if (gpu) {
-        if (!gpu_load(*t, t->image, plan, fresh, true, scaled_from)) return nullptr;
-        if (separate && !gpu_load(*t, t->signed_image, signed_plan, fresh, false, scaled_from)) return nullptr;
-        if (scaled_from) report_.textures_scaled++, report_.textures_scaled_loads++;
+        if (!gpu_load(*t, t->image, plan, fresh, true, scaled_bases.empty() ? nullptr : &scaled_bases)) return nullptr;
+        if (separate &&
+            !gpu_load(*t, t->signed_image, signed_plan, fresh, false, scaled_bases.empty() ? nullptr : &scaled_bases))
+            return nullptr;
+        if (!scaled_bases.empty()) report_.textures_scaled++, report_.textures_scaled_loads++;
     } else {
         if (!cpu_upload(t->image, image, fresh)) return nullptr;
         if (separate && !cpu_upload(t->signed_image, signed_image, fresh)) return nullptr;
@@ -7390,11 +7516,18 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     if (t->load_why == LoadWhy::GpuWritten && t->exported) report_.texture_loads_exported++;
     t->load_why = LoadWhy::CpuWritten; // the next one, unless a resolve or an export marks it
     if (options_.verbose)
-        std::fprintf(stderr, "  texture %08X: format %s %ux%u, signs %u%u%u%u, exponent %d, from %s as %s%s\n",
-                     info.base_address, format_name(info.format), plan.width, plan.height, info.signs[0],
-                     info.signs[1], info.signs[2], info.signs[3], info.exp_adjust,
-                     mirror ? "the mirror" : gpu ? "guest memory on the GPU" : "guest memory",
-                     texture::host_format_name(plan.format), separate ? " and a signed image" : "");
+        std::fprintf(stderr, "  texture %08X: format %s %ux%u%s, signs %u%u%u%u, exponent %d, from %s as %s%s%s%s\n",
+                     info.base_address, format_name(info.format), plan.width, plan.height,
+                     level_count > 1 ? " mipmapped" : "", info.signs[0], info.signs[1], info.signs[2], info.signs[3],
+                     info.exp_adjust,
+                     mirror ? "the mirror"
+                     : gpu  ? "guest memory on the GPU"
+                            : "guest memory",
+                     texture::host_format_name(plan.format), separate ? " and a signed image" : "",
+                     t->scaled    ? ", at the scale"
+                     : scaled_why ? ", at the console's size: "
+                                  : "",
+                     !t->scaled && scaled_why ? scaled_why : "");
     return t;
 }
 
@@ -7495,22 +7628,29 @@ bool Impl::cpu_upload(const vk::Image &target, const texture::Image &image, bool
 // cpu_upload copies: what of its memory guest memory holds the newest of goes
 // into the mirror first (upload: once for its versions).
 bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &plan, bool fresh, bool upload,
-                    const std::pair<const uint32_t, ScaledRegion> *scaled_from) {
+                    const std::vector<uint32_t> *scaled_bases) {
     std::vector<texture::GpuLevel> loads;
     uint64_t total = 0;
     texture::gpu_levels(plan, loads, total);
-    if (scaled_from) {
-        // from resolved memory at the scale (texture() checked the layout:
-        // one level), the image's texels at the scale
-        texture::GpuLevel &g = loads[0];
-        g.base = scaled_rel(*scaled_from, g.base & 0x1FFFFFFF);
-        g.blocks_x = g.out_width = scale_.up(plan.width), g.blocks_y = g.out_height = scale_.up(plan.height);
-        const uint64_t bytes = uint64_t(g.blocks_x) * g.blocks_y * texture::bytes_per_block(plan.format) * g.slices;
-        g.words = uint32_t((bytes + 3) / 4);
-        const uint32_t groups = (g.words + 63) / 64, across = std::max(std::min(groups, 32768u), 1u);
-        g.row_words = across * 64;
-        g.scale_q4 = scale_.q4;
-        total = (bytes + 15) & ~uint64_t(15);
+    if (scaled_bases && scaled_bases->size() == loads.size()) {
+        // from resolved memory at the scale (texture() checked the layout and
+        // that each level's size at the scale is the image's), the image's
+        // texels at the scale, level by level from each level's place in the
+        // heap (a packed tail's offsets at the scale too)
+        total = 0;
+        for (size_t i = 0; i < loads.size(); i++) {
+            texture::GpuLevel &g = loads[i];
+            g.base = (*scaled_bases)[i];
+            g.blocks_x = g.out_width = scale_.up(g.out_width), g.blocks_y = g.out_height = scale_.up(g.out_height);
+            g.ox = scale_.up(g.ox), g.oy = scale_.up(g.oy);
+            const uint64_t bytes = uint64_t(g.blocks_x) * g.blocks_y * texture::bytes_per_block(plan.format) * g.slices;
+            g.out_word = uint32_t(total / 4);
+            g.words = uint32_t((bytes + 3) / 4);
+            const uint32_t groups = (g.words + 63) / 64, across = std::max(std::min(groups, 32768u), 1u);
+            g.row_words = across * 64;
+            g.scale_q4 = scale_.q4;
+            total += (bytes + 15) & ~uint64_t(15);
+        }
     }
     std::vector<uint32_t> level_of; // each load's level
     for (size_t i = 0; i < plan.slices.size(); i++)
@@ -7540,7 +7680,7 @@ bool Impl::gpu_load(Texture &t, const vk::Image &image, const texture::Plan &pla
     if (fresh) begin_image(c, image.image, VK_IMAGE_ASPECT_COLOR_BIT, image.levels, image.layers);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_pipeline_);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, load_layout_, 0, 1,
-                            scaled_from ? &scaled_load_set_ : &load_set_, 0, nullptr);
+                            scaled_bases ? &scaled_load_set_ : &load_set_, 0, nullptr);
     std::vector<VkBufferImageCopy> copies;
     for (size_t i = 0; i < loads.size(); i++) {
         const LoadConstants &p = loads[i];
