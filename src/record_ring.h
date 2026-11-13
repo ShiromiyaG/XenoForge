@@ -1,4 +1,4 @@
-// The renderer's recording thread (XF_RECORD_RING=1; docs/renderer.md,
+// The renderer's recording thread (on by default, XF_RECORD_RING=0 off; docs/renderer.md,
 // "The recording on a thread of its own").
 //
 // The renderer records through command buffer handles of its own (Fake) in

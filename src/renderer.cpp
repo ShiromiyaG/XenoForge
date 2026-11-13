@@ -3155,10 +3155,10 @@ private:
     static constexpr uint32_t RECORDED_MOST = 32; // words of a command, with its number
     uint32_t recorded_direct_[RECORDED_MOST] = {};
     VkCommandBuffer record_direct_cmd_ = VK_NULL_HANDLE;
-    std::unique_ptr<rec::Ring> ring_; // the recording thread's ring (XF_RECORD_RING=1)
+    std::unique_ptr<rec::Ring> ring_; // the recording thread's ring (XF_RECORD_RING=0 off)
     bool ring_on_ = [] {
         const char *v = std::getenv("XF_RECORD_RING");
-        return v && v[0] == '1';
+        return !(v && v[0] == '0');
     }();
     // the serial of the last submission the recording thread made, and its error
     std::atomic<uint64_t> ring_submitted_{0};
@@ -4422,9 +4422,9 @@ bool Impl::init(std::string &error) {
         if (own[k]) module_names_[own[k]] = {2, own[k] == fsi_depth_fs_ ? fsi_ : 0u, k + 1};
     if (!init_generic(error)) return false;
     open_storage();
-    // XF_GPU_BACK_END=1: the work of the processor's calls on a thread of its own, the command
-    // processor's thread left with the packets (gpu/deferred_sink.h; off by default until timed live)
-    if (const char *v = std::getenv("XF_GPU_BACK_END"); v && v[0] == '1')
+    // The work of the processor's calls on a thread of its own, the command processor's thread
+    // left with the packets (gpu/deferred_sink.h; XF_GPU_BACK_END=0 off)
+    if (const char *v = std::getenv("XF_GPU_BACK_END"); !(v && v[0] == '0'))
         deferred_ = std::make_unique<gpu::DeferredSink>(*this, processor_.registers(), mem_);
     return true;
 }

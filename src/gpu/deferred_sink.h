@@ -1,4 +1,4 @@
-// The GPU's work split in two threads (XF_GPU_BACK_END=1; docs/renderer.md,
+// The GPU's work split in two threads (on by default, XF_GPU_BACK_END=0 off; docs/renderer.md,
 // "The command thread split in two"): the command processor's thread (the
 // front end) parses the packets, keeps the register file and does everything
 // the guest can observe at once (its register and memory writes, fences,

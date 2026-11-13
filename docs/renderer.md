@@ -2071,8 +2071,8 @@ machine. Game G's in-play frame, a draw by section in time stamp ticks
   copies a draw; what it costs is the copy itself (about 450 ticks a draw)
   and the bookkeeping around it, no single thing to cut.
 
-**The recording thread** (`XF_RECORD_RING=1`, off by default until timed
-live; `src/record_ring.h`). The slots' command buffers are named, in the
+**The recording thread** (`src/record_ring.h`; on by default since
+2026-11-13, with the split below, `XF_RECORD_RING=0` off). The slots' command buffers are named, in the
 renderer, by handles of the ring's (`rec::Fake`: an entry of a process-wide
 table, told from a driver's handle by its address). Every `vkCmd*` the
 renderer calls is, in `renderer.cpp` alone, a function of the same
@@ -2205,8 +2205,10 @@ thread's.
 
 ## The command thread split in two (2026-11-13)
 
-`XF_GPU_BACK_END=1` (off by default until timed live; `src/gpu/deferred_sink.h`).
-Game G's vblank wait is a WAIT_REG_MEM in its own command stream, so its
+`src/gpu/deferred_sink.h`; on by default since 2026-11-13, `XF_GPU_BACK_END=0`
+off. **Live** (the player, game G's town in front of the saloon, the place the
+owner plays it): 20 fps before, with neither the split nor the recording
+thread; 30 fps with both, 29 at moments, no picture error seen. Game G's vblank wait is a WAIT_REG_MEM in its own command stream, so its
 frame is the command thread's work rounded up to a vblank: under about 32 ms
 two vblanks, over it three. The thread parsed the packets and also did all
 of the renderer's work for every draw. Now, as Dolphin's dual-core mode and
