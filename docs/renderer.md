@@ -5032,7 +5032,8 @@ table is printed and only crashes and failed replays fail; with no traces at
 all it is skipped (77). `XF_REFERENCE_PATHS=exact,host` picks the paths,
 `XF_REFERENCE_OUT=<dir>` writes the reference's frame (`<stem>.png`) and ours
 (`<stem>_<path>.png`). A full run takes about 15 minutes (the reference's
-share 4 minutes for 42 frames; ours twice).
+share 5 minutes for 42 frames; ours twice). Of the 84 frame-paths: 56 in
+class a, 26 in b, 2 in e.
 
 The owner's new captures of games G and E were dumped by Xenia's Direct3D
 12 trace dump (default and `--render_target_path_d3d12=rov`) into
@@ -5063,7 +5064,7 @@ path, the host path's class the same in every frame):
 | Game G 850 | 0.652, 0.86% | 0.724, 0.97% | 0.168, 0.03% | b |
 | Game G 950 | 0.565, 0.53% | 0.638, 0.64% | 0.169, 0.03% | b |
 | Game G bar 1260, 1485, 1596 | 0.684-0.716, 0.26-0.29% | 0.867-0.883, 0.36-0.38% | 0.358-0.376, 0.02% | b |
-| Game G checker 1294 | see the baseline | | | |
+| Game G checker 1294 | 0.811, 0.32% | 0.955, 0.40% | 0.364, 0.01% | b |
 | Game H title | 0.022, 0.00% | 0.022, 0.00% | 0.000, 0.00% | a |
 
 No frame is in class c or d: where ours differs from Xenia, the reference
@@ -5091,7 +5092,15 @@ traces at the first one that parts.
   positions behind the eye left alone, where the hardware snaps after
   clipping). The menu with it: ours against the reference 0.320, 0.21% to
   0.268, 0.115%, against Xenia 0.000 to 0.097, 0.099% (inside the bound); the
-  strip gone. The rest of the menu is the next item.
+  strip gone. The rest of the menu is the next item. Elsewhere, on the
+  exact path, it brings ours closer to the reference and away from Xenia:
+  game G 850 0.724, 0.97% to 0.613, 0.78% from the reference, 0.168, 0.03%
+  to 0.347, 0.28% from Xenia; game D 6400 1.655, 1.68% to 1.637, 1.62% and
+  0.113, 0.00% to 0.308, 0.13%; with it `replay_test` fails five frames
+  against Xenia (game A's park and race, game D 6400, game G 850 and 950),
+  which is why it stays off until hardware says the console interpolates
+  from the snapped positions. The gate shows such a change as it should:
+  each of those frames "WORSE than the baseline" in ours : Xenia.
 - *Game A menu: the character's ink outlines (hardware).* An outline pass
   reads the character's depth (D24FS8, resolved as 24_8_FLOAT). A flat
   backdrop at z/w = 1632.6/1633.6 under reverse Z (depth 1 - z/w) comes out
