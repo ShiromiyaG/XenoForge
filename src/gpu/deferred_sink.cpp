@@ -185,10 +185,7 @@ void DeferredSink::wait_done(uint64_t position, uint64_t *counter, size_t why) {
             pause();
             continue;
         }
-        waiters_.fetch_add(1, std::memory_order_seq_cst);
-        done = done_.load(std::memory_order_seq_cst);
-        if (done < position) done_.wait(done, std::memory_order_seq_cst);
-        waiters_.fetch_sub(1, std::memory_order_relaxed);
+        sleep_until(position);
     }
     const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
     stats_.wait_seconds += waited;
@@ -208,10 +205,26 @@ void DeferredSink::finish() {
             pause();
             continue;
         }
-        waiters_.fetch_add(1, std::memory_order_seq_cst);
-        done = done_.load(std::memory_order_seq_cst);
-        if (done < position) done_.wait(done, std::memory_order_seq_cst);
-        waiters_.fetch_sub(1, std::memory_order_relaxed);
+        sleep_until(position);
+    }
+}
+
+// Asleep until the back end has done everything before position. The sleeper puts the position
+// it waits for in wanted_ (the lowest of any two sleepers' stays), and the back end wakes the
+// sleepers once it gets there: woken at every record it did, a front end waiting 9 ms of a frame
+// for the back end made a system call and a wake-up a record, and as much processor time as the
+// wait itself (game G's town, the player). A sleeper woken short of its position (another's was
+// reached) puts its own back and sleeps again.
+void DeferredSink::sleep_until(uint64_t position) {
+    for (;;) {
+        uint64_t want = wanted_.load(std::memory_order_seq_cst);
+        while (position < want && !wanted_.compare_exchange_weak(want, position, std::memory_order_seq_cst)) {
+        }
+        // (after the position is put: the back end's done_ then wanted_, this one's wanted_ then done_)
+        const uint64_t done = done_.load(std::memory_order_seq_cst);
+        if (done >= position) return;
+        done_.wait(done, std::memory_order_seq_cst);
+        if (done_.load(std::memory_order_seq_cst) >= position) return;
     }
 }
 
@@ -475,7 +488,10 @@ void DeferredSink::run() {
             }
             at += aligned(sizeof(Header) + h.bytes);
             done_.store(at, std::memory_order_seq_cst);
-            if (waiters_.load(std::memory_order_seq_cst)) done_.notify_all();
+            // the sleepers woken once the position the lowest of them waits for is done
+            if (at >= wanted_.load(std::memory_order_seq_cst) &&
+                wanted_.exchange(UINT64_MAX, std::memory_order_seq_cst) != UINT64_MAX)
+                done_.notify_all();
             const uint64_t now = FastClock::now();
             back_busy_.store(back_busy_.load(std::memory_order_relaxed) + (now - busy_from), std::memory_order_relaxed);
             busy_from = now;

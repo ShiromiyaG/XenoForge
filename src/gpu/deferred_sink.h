@@ -157,7 +157,10 @@ class DeferredSink final : public Sink {
     std::atomic<uint64_t> written_{0}, done_{0};
     uint64_t reserved_ = 0, record_at_ = 0; // the front end's: the record being made
     std::atomic<bool> back_asleep_{false}, stop_{false};
-    std::atomic<uint32_t> waiters_{0}; // threads asleep in a wait for done_
+    // the lowest position a thread asleep in sleep_until waits for (UINT64_MAX: none); the back end
+    // wakes the sleepers once done_ reaches it, not at every record
+    std::atomic<uint64_t> wanted_{UINT64_MAX};
+    void sleep_until(uint64_t position);
     std::thread thread_;
     ThreadCpu back_cpu_;
     std::atomic<uint64_t> back_busy_{0}; // the back end's wall time with records to do (FastClock's ticks)
