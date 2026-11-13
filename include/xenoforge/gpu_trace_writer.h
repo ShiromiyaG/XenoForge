@@ -122,6 +122,23 @@ public:
     void zpd_poll(std::vector<std::pair<uint64_t, uint64_t>> &resolved) override {
         if (next_) next_->zpd_poll(resolved);
     }
+    // Screen extents and VIZ queries: the backend's (measures_extents false without one). The player
+    // keeps a writer standing by for F4; without these the processor wrote every extent report as the
+    // whole screen there, so a game's predicated tiling never skipped a bin, as it does in a replay.
+    bool measures_extents() override { return next_ && next_->measures_extents(); }
+    void extent_init() override {
+        if (next_) next_->extent_init();
+    }
+    uint64_t extent_report() override { return next_ ? next_->extent_report() : 0; }
+    void extent_wait() override {
+        if (next_) next_->extent_wait();
+    }
+    void extent_poll(std::vector<Extent> &resolved) override {
+        if (next_) next_->extent_poll(resolved);
+    }
+    void viz_query(uint32_t id, bool end) override {
+        if (next_) next_->viz_query(id, end);
+    }
 
     // MemoryTrace: what the backend read and what the GPU wrote
     void read(uint32_t address, uint32_t bytes) override;
