@@ -84,6 +84,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
 // (last: its macros stand for the driver's vkCmd* functions in what follows)
 #include "gpu/deferred_sink.h"
 #include "record_ring.h"
@@ -1852,6 +1856,8 @@ private:
         put("EVENT_WRITE_EXT packets (screen extent reports)", n.opcodes[pm4::EVENT_WRITE_EXT].load());
         put("VIZ_QUERY packets", n.opcodes[pm4::VIZ_QUERY].load());
         put("draws with no valid index source (not drawn)", n.failed_draws.load());
+        if (deferred_) r.back_end_cpu_ticks = deferred_->back_cpu_ticks();
+        if (ring_) r.record_cpu_ticks = ring_->cpu_ticks();
         return r;
     }
 
@@ -2568,8 +2574,38 @@ private:
     VkDeviceSize draw_data_take(VkDeviceSize bytes, VkDeviceSize align);
     // bytes into the draw data or the arena: a copy the compiler cannot fold
     // with one around it (the destination may be write-combined device
-    // memory, hundreds of times slower to read than to write)
-    [[gnu::noinline]] static void upload(void *to, const void *from, size_t bytes) { std::memcpy(to, from, bytes); }
+    // memory, hundreds of times slower to read than to write). In 16-byte
+    // stores, in order, the rest by words (XF_UPLOAD_STORES=0: memcpy's): the
+    // C runtime's memcpy took half again as long into the write-combined draw
+    // data (game G's frame by sections: the constants' upload 1,230 to 870
+    // ticks a draw, the system constants' 510 to 360), by its wider or string
+    // stores, which that memory takes worse than plain ones filling each line
+    // in order.
+    [[gnu::noinline]] static void upload(void *to, const void *from, size_t bytes) {
+#if defined(__SSE2__)
+        static const bool stores = [] {
+            const char *v = std::getenv("XF_UPLOAD_STORES");
+            return !(v && v[0] == '0');
+        }();
+        if (stores) {
+            uint8_t *d = static_cast<uint8_t *>(to);
+            const uint8_t *f = static_cast<const uint8_t *>(from);
+            size_t k = 0;
+            for (; k + 16 <= bytes; k += 16) {
+                const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(f + k));
+                _mm_storeu_si128(reinterpret_cast<__m128i *>(d + k), v);
+            }
+            for (; k + 4 <= bytes; k += 4) {
+                uint32_t w;
+                std::memcpy(&w, f + k, 4);
+                std::memcpy(d + k, &w, 4);
+            }
+            if (k < bytes) std::memcpy(d + k, f + k, bytes - k);
+            return;
+        }
+#endif
+        std::memcpy(to, from, bytes);
+    }
     uint8_t *draw_data(VkDeviceSize at) {
         return static_cast<uint8_t *>((draw_data_.buffer ? draw_data_ : arena_).mapped) + at;
     }
@@ -9847,7 +9883,7 @@ void Impl::draw(const gpu::Draw &d) {
             index_cache_words_ -= e.words.size() * 4;
             e.words = indices;
             if (index_cache_place(indices.size() * 4, e.buffer, e.at))
-                std::memcpy(static_cast<uint8_t *>(index_chunks_.back().buffer.mapped) + e.at, indices.data(),
+                upload(static_cast<uint8_t *>(index_chunks_.back().buffer.mapped) + e.at, indices.data(),
                             indices.size() * 4);
             else
                 e.buffer = VK_NULL_HANDLE;
@@ -10962,12 +10998,12 @@ void Impl::draw(const gpu::Draw &d) {
                 fatal_ = "could not make an index or vertex buffer";
                 return false;
             }
-            std::memcpy(own.mapped, data, bytes);
+            upload(own.mapped, data, bytes);
             slots_[current_].after.push_back([this, own]() mutable { d_.destroy(own); });
             buffer = own.buffer, at = 0;
         } else {
             at = arena_take(bytes, 4);
-            std::memcpy(arena_data(at), data, bytes);
+            upload(arena_data(at), data, bytes);
             buffer = arena_.buffer;
         }
         return true;

@@ -388,6 +388,14 @@ void TraceWriter::shader(uint32_t type, uint32_t address, std::span<const uint32
     if (next_) next_->shader(type, address, code);
 }
 
+bool TraceWriter::shader_again(uint32_t type, uint32_t address, uint32_t dwords) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (file_) return false;
+    }
+    return next_ && next_->shader_again(type, address, dwords);
+}
+
 void TraceWriter::draw(const RegisterFile &registers, const Draw &d) {
     if (next_) next_->draw(registers, d);
 }

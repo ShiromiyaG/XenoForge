@@ -58,6 +58,12 @@ struct Report {
     std::vector<double> command_cpu_plays, play_seconds;
     // the time each play waited for the GPU (in the commands' time: Report::wait_seconds's share)
     std::vector<double> command_wait_seconds;
+    // replay only, with repeat: each play's processor time on the GPU back end's thread
+    // (XF_GPU_BACK_END) and on the recording thread (XF_RECORD_RING), empty without them, and of
+    // all of the process's threads (the trace's walk included)
+    std::vector<double> back_end_cpu_plays, record_cpu_plays, process_cpu_plays;
+    // the back end's and the recording thread's processor time so far (thread_cpu.h's ticks)
+    uint64_t back_end_cpu_ticks = 0, record_cpu_ticks = 0;
     uint64_t draws = 0, drawn = 0;    // outside copy mode; of them, done
     uint64_t resolves = 0, swaps = 0; // draws in copy mode; XE_SWAP packets
     uint64_t frames = 0;              // front buffers read back (the swaps asked for)

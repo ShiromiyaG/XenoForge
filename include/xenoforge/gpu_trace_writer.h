@@ -108,6 +108,12 @@ public:
     // (a backend writing a fence later does so only while no trace records: it then does its work
     // at once, and the fence is written by the processor and recorded here)
     bool write_later(const LateWrite &write) override { return next_ && next_->write_later(write); }
+    // What the backend has done, for XF_SLOW_FRAMES (the player keeps a writer standing by for F4:
+    // without this its lines counted no texture loads, submissions or pipelines).
+    Work work() override { return next_ ? next_->work() : Work{}; }
+    // An IM_LOAD of a shader the backend has from unwritten memory, not copied: the backend's
+    // answer while no trace is being written (one being written gets every shader's words).
+    bool shader_again(uint32_t type, uint32_t address, uint32_t dwords) override;
     // occlusion queries: the backend's (counts_samples false without one)
     bool counts_samples() override { return next_ && next_->counts_samples(); }
     void zpd_report(uint64_t ended, uint64_t next) override {

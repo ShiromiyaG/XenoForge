@@ -85,6 +85,7 @@ add_library(xenoforge STATIC
     src/guest_memory.cpp
     src/gpu/command_processor.cpp
     src/gpu/deferred_sink.cpp
+    src/thread_cpu.cpp
     src/gpu_trace_writer.cpp
     src/xma_decoder.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/generated/game_interface.stamp
@@ -344,6 +345,7 @@ if(NOT TARGET stb)
 endif()
 add_executable(xfreplay tools/xfreplay.cpp tools/sampler.cpp)
 target_link_libraries(xfreplay PRIVATE xenoforge_vk stb)
+target_include_directories(xfreplay PRIVATE src)
 # the software reference renderer on a trace (docs/renderer.md, "The software reference renderer")
 add_executable(xfref tools/xfref.cpp)
 target_link_libraries(xfref PRIVATE xenoforge stb)

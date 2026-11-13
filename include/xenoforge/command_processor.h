@@ -31,12 +31,17 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <span>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 namespace xf::gpu {
 
@@ -154,6 +159,7 @@ public:
         return false;
     }
     uint64_t foreign_writes() const { return foreign_writes_.load(std::memory_order_relaxed); }
+
     // all of them, for whoever runs on the command processor's thread (a
     // Sink's callbacks): constants copied in bulk
     const uint32_t *data() const { return values_.data(); }
@@ -163,36 +169,95 @@ private:
     template <bool BigEndian> void write_run(uint32_t first, const uint8_t *words, uint32_t count) {
         while (count) {
             const uint32_t n = std::min(count, BLOCK - (first & (BLOCK - 1)));
-            // The block's words in host order, compared with those held in
-            // one pass (both loops without a branch, for the compiler's
-            // vectors: a scene's constants are most of what a frame's
-            // commands write), and stored only where they differ.
-            uint32_t host[BLOCK];
-            std::memcpy(host, words, 4 * n);
-            uint32_t differs = 0;
-            for (uint32_t k = 0; k < n; k++) {
-                if constexpr (BigEndian) host[k] = __builtin_bswap32(host[k]);
-                differs |= values_[first + k] ^ host[k];
+            // The block's words in host order (a host-order run's own: they come as whole words)
+            uint32_t swapped[BLOCK];
+            const uint32_t *host = reinterpret_cast<const uint32_t *>(words);
+            if constexpr (BigEndian) {
+                std::memcpy(swapped, words, 4 * n);
+                for (uint32_t k = 0; k < n; k++) swapped[k] = __builtin_bswap32(swapped[k]);
+                host = swapped;
             }
-            if (differs) {
-                // (the shader constants' blocks hold no register of the draws' state)
-                bool state = false;
-                const bool constants = first >= 0x4000 && first + n <= 0x4910;
-                for (uint32_t k = 0; k < n; k++) {
-                    if (values_[first + k] == host[k]) continue;
-                    if (!constants && draw_state(first + k)) state = true;
-                    std::atomic_ref<uint32_t>(values_[first + k]).store(host[k], std::memory_order_relaxed);
+            uint32_t *const held = values_.data() + first;
+            if (run_masks()) {
+                // Which registers changed, a bit each, by vector compares; then those alone
+                // stored, by their bits, with a plain relaxed store. A register at a time, with a
+                // branch each (taken at random in a block of constants) and std::atomic_ref's
+                // constructor and store as calls (not inlined), was most of what a block cost the
+                // GPU back end, which writes every block the processor changed into its own copy.
+                // XF_REGISTER_RUN_MASKS=0: a register at a time, as before.
+                const uint32_t changed = changed_mask(held, host, n);
+                if (changed) {
+                    ++serial_;
+                    for (uint32_t m = changed; m; m &= m - 1) {
+                        const uint32_t k = uint32_t(__builtin_ctz(m));
+                        __atomic_store_n(&held[k], host[k], __ATOMIC_RELAXED);
+                    }
+                    stamped(first, ((changed << (first & (BLOCK - 1))) & state_mask(first & ~(BLOCK - 1))) != 0);
                 }
-                stamps_[first >> BLOCK_SHIFT] = ++serial_;
-                if (tracking_) mark(first >> BLOCK_SHIFT);
-                if (state) state_serial_ = serial_;
-                if (first >= 0x4000 && first < 0x4800) float_serial_[(first - 0x4000) >> 10] = serial_;
+            } else {
+                // compared with those held in one pass, and stored only where they differ
+                uint32_t differs = 0;
+                for (uint32_t k = 0; k < n; k++) differs |= held[k] ^ host[k];
+                if (differs) {
+                    // (the shader constants' blocks hold no register of the draws' state)
+                    bool state = false;
+                    ++serial_;
+                    const bool constants = first >= 0x4000 && first + n <= 0x4910;
+                    for (uint32_t k = 0; k < n; k++) {
+                        if (held[k] == host[k]) continue;
+                        if (!constants && draw_state(first + k)) state = true;
+                        std::atomic_ref<uint32_t>(held[k]).store(host[k], std::memory_order_relaxed);
+                    }
+                    stamped(first, state);
+                }
             }
             first += n, words += 4 * n, count -= n;
         }
     }
+    // a block changed at serial_ (whether a register of the draws' state did)
+    void stamped(uint32_t first, bool state) {
+        stamps_[first >> BLOCK_SHIFT] = serial_;
+        if (tracking_) mark(first >> BLOCK_SHIFT);
+        if (state) state_serial_ = serial_;
+        if (first >= 0x4000 && first < 0x4800) float_serial_[(first - 0x4000) >> 10] = serial_;
+    }
+    // bit k: held[k] differs from host[k] (n within a block)
+    static uint32_t changed_mask(const uint32_t *held, const uint32_t *host, uint32_t n) {
+#if defined(__SSE2__)
+        if (n == BLOCK) {
+            uint32_t same = 0;
+            for (uint32_t k = 0; k < BLOCK; k += 4) {
+                const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(held + k));
+                const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(host + k));
+                same |= uint32_t(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(a, b)))) << k;
+            }
+            return ~same;
+        }
+#endif
+        uint32_t changed = 0;
+        for (uint32_t k = 0; k < n; k++) changed |= uint32_t(held[k] != host[k]) << k;
+        return changed;
+    }
     void mark(uint32_t block) {
         if (!dirty_mark_[block]) dirty_mark_[block] = 1, dirty_.push_back(block);
+    }
+    static bool run_masks() {
+        static const bool on = [] {
+            const char *v = std::getenv("XF_REGISTER_RUN_MASKS");
+            return !(v && v[0] == '0');
+        }();
+        return on;
+    }
+    // the registers of the draws' state (draw_state) in the block from base, a bit each
+    static uint32_t state_mask(uint32_t base) {
+        if (base < 0x2000 || (base >= 0x4000 && base + BLOCK <= 0x4910)) return 0;
+        // (the blocks the exceptions lie in)
+        if (base == 0x2100 || base == 0x21E0 || base == 0x4900) {
+            uint32_t mask = 0;
+            for (uint32_t k = 0; k < BLOCK; k++) mask |= uint32_t(draw_state(base + k)) << k;
+            return mask;
+        }
+        return ~0u;
     }
 
     std::vector<uint32_t> values_;

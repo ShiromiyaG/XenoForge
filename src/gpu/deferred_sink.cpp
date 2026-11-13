@@ -4,6 +4,8 @@
 #include "xenoforge/bytes.h"
 #include "xenoforge/resolve.h"
 
+#include "draw_sections.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -416,6 +418,8 @@ void DeferredSink::viz_query(uint32_t id, bool end) {
 
 void DeferredSink::run() {
     passing_depth = 1;
+    back_cpu_.bind_current();
+    gpu_back_end_os_thread.store(back_cpu_.os_id());
     uint64_t at = 0;
     for (;;) {
         uint64_t written = written_.load(std::memory_order_acquire);
@@ -438,7 +442,21 @@ void DeferredSink::run() {
         while (at < written) {
             Header h;
             std::memcpy(&h, &ring_[at & (RING - 1)], sizeof(h));
-            if (h.kind != Kind::Wrap) handle(h.kind, &ring_[(at & (RING - 1)) + sizeof(Header)], h.bytes);
+            if (h.kind != Kind::Wrap) {
+                // (XF_DRAW_SECTIONS=1: the time by the kind of record, beside the draws' sections)
+                const uint64_t t0 = DrawSections::on() ? FastClock::now() : 0;
+                handle(h.kind, &ring_[(at & (RING - 1)) + sizeof(Header)], h.bytes);
+                if (t0) {
+                    using S = DrawSections;
+                    const S::BackKind k = h.kind == Kind::Blocks    ? S::BackBlocks
+                                          : h.kind == Kind::Draw    ? S::BackDraw
+                                          : h.kind == Kind::Resolve ? S::BackResolve
+                                          : h.kind == Kind::Swap    ? S::BackSwap
+                                          : h.kind == Kind::Shader || h.kind == Kind::ImLoad ? S::BackShader
+                                                                                              : S::BackOther;
+                    DrawSections::get().back(k, FastClock::now() - t0);
+                }
+            }
             at += aligned(sizeof(Header) + h.bytes);
             done_.store(at, std::memory_order_seq_cst);
             if (waiters_.load(std::memory_order_seq_cst)) done_.notify_all();
@@ -453,13 +471,14 @@ void DeferredSink::handle(Kind kind, const uint8_t *p, uint32_t bytes) {
         uint64_t foreign;
         std::memcpy(&foreign, p, 8);
         const uint32_t each = 4 + RegisterFile::BLOCK * 4;
-        alignas(16) uint32_t values[RegisterFile::BLOCK];
         for (const uint8_t *q = p + 8, *end = p + bytes; q < end; q += each) {
             uint32_t b;
             std::memcpy(&b, q, 4);
-            std::memcpy(values, q + 4, sizeof(values));
             const uint32_t first = b * RegisterFile::BLOCK;
-            copy_.write_host(first, values, std::min(RegisterFile::BLOCK, RegisterFile::COUNT - first));
+            // (the words read where the ring holds them: a record's payload, and so each block's
+            // words, lies on a word's boundary)
+            copy_.write_host(first, reinterpret_cast<const uint32_t *>(q + 4),
+                             std::min(RegisterFile::BLOCK, RegisterFile::COUNT - first));
         }
         copy_.set_foreign_writes(foreign);
         break;

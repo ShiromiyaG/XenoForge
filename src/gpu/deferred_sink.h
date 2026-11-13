@@ -30,8 +30,11 @@
 #include "xenoforge/command_processor.h"
 #include "xenoforge/guest_memory.h"
 
+#include "thread_cpu.h"
+
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -70,6 +73,8 @@ class DeferredSink final : public Sink {
         double wait_seconds = 0;                      // the front end's time waiting for the back end
     };
     Stats stats() const;
+    // the back end's processor time so far (thread_cpu.h's ticks), from any thread
+    uint64_t back_cpu_ticks() const { return back_cpu_.ticks(); }
 
     // ---- the Sink ----
     void sync(SyncFor why, uint32_t address, uint32_t bytes) override;
@@ -148,6 +153,7 @@ class DeferredSink final : public Sink {
     std::atomic<bool> back_asleep_{false}, stop_{false};
     std::atomic<uint32_t> waiters_{0}; // threads asleep in a wait for done_
     std::thread thread_;
+    ThreadCpu back_cpu_;
 
     // Where the back end's work yet to be done writes guest memory, physical [start, end), and the
     // position its record ends at: the resolves' destinations and the fences written later. A

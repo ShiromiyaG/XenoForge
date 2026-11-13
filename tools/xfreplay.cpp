@@ -31,6 +31,7 @@
 #include "xenoforge/renderer.h"
 
 #include "sampler.h"
+#include "thread_cpu.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -165,10 +166,14 @@ int main(int argc, char **argv) {
     bool profiling = false;
     if (profile_top) {
         unsigned long thread = xf::sampler::current_thread();
+        // XF_PROFILE_BACK_END=1: the GPU back end's thread sampled instead (the thread the frames
+        // runs on, with XF_GPU_BACK_END on), all of it
+        const char *back = std::getenv("XF_PROFILE_BACK_END");
+        const bool back_end = back && back[0] == '1';
         // the command processor's work alone, not the trace's walk
-        xf::sampler::scope("CommandProcessor::execute_packets");
-        options.on_frame = [&profiling, thread](uint64_t, const xf::render::Image &) {
-            if (!profiling) profiling = xf::sampler::start(1000, thread);
+        if (!back_end) xf::sampler::scope("CommandProcessor::execute_packets");
+        options.on_frame = [&profiling, thread, back_end](uint64_t, const xf::render::Image &) {
+            if (!profiling) profiling = xf::sampler::start(1000, back_end ? xf::gpu_back_end_os_thread.load() : thread);
         };
     }
     double cpu_before = xf::sampler::process_cpu_seconds();
@@ -286,6 +291,35 @@ int main(int argc, char **argv) {
                     "the walk outside the commands %.2f ms\n",
                     cpu.empty() ? 0.0 : cpu[cpu.size() / 2] * 1000, cpu.empty() ? 0.0 : cpu.front() * 1000,
                     report.command_cpu_seconds * 1000, walk.empty() ? 0.0 : walk[walk.size() / 2] * 1000);
+    }
+    {
+        // The GPU's other threads, a play (the plays after the first, each drained): the back end's
+        // processor time (XF_GPU_BACK_END), the recording thread's (XF_RECORD_RING), and all of the
+        // process's threads (the trace's walk included). With the back end on, its time is what
+        // sets a game's frame, not the front end's above.
+        auto median = [](std::vector<double> v, double &fastest) {
+            std::sort(v.begin(), v.end());
+            fastest = v.front();
+            return v[v.size() / 2];
+        };
+        double fastest = 0;
+        if (!report.back_end_cpu_plays.empty()) {
+            const double m = median(report.back_end_cpu_plays, fastest);
+            std::printf("  the back end's processor time a play: %.3f ms median, %.3f ms fastest\n", m * 1000,
+                        fastest * 1000);
+        }
+        if (!report.record_cpu_plays.empty()) {
+            const double m = median(report.record_cpu_plays, fastest);
+            std::printf("  the recording thread's processor time a play: %.3f ms median, %.3f ms fastest\n", m * 1000,
+                        fastest * 1000);
+        }
+        if (!report.process_cpu_plays.empty()) {
+            // (the mean: the system counts a process's time in steps of 15.6 ms on Windows)
+            double sum = 0;
+            for (double s : report.process_cpu_plays) sum += s;
+            std::printf("  all threads' processor time a play, the walk included: %.2f ms mean of %zu plays\n",
+                        sum * 1000 / double(report.process_cpu_plays.size()), report.process_cpu_plays.size());
+        }
     }
     for (const auto &[why, n] : report.skipped) std::printf("  skipped %6llu  %s\n", (unsigned long long)n, why.c_str());
     for (const auto &[what, n] : report.approximate)

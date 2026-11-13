@@ -31,6 +31,7 @@
 #include "xenoforge/memory.h"
 
 #include "fast_clock.h"
+#include "thread_cpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -185,6 +186,7 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     std::vector<double> command_seconds;
     double command_cpu_seconds = 0;
     std::vector<double> command_cpu_plays, play_seconds, command_waits;
+    std::vector<double> back_end_plays, record_plays, process_plays;
     if (walked && repeat > 1) {
         renderer->drain();
         Report before = renderer->report();
@@ -195,6 +197,7 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
             // once a play: it is a system call), and the wall time of the play and of its commands
             player.command_clock_ = 0;
             const uint64_t cpu_start = thread_cpu_ticks(), play_start = FastClock::now();
+            const double process_start = process_cpu_seconds();
             walked = walk_gpu_trace(trace, player, error);
             const uint64_t play_ticks = thread_cpu_ticks() - cpu_start;
             play_seconds.push_back(FastClock::seconds(FastClock::now() - play_start));
@@ -205,6 +208,13 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
             renderer->drain();
             Report after = renderer->report();
             command_waits.push_back(after.wait_seconds - before.wait_seconds);
+            // (the other threads' processor time once the play is drained: everything it handed them done)
+            process_plays.push_back(process_cpu_seconds() - process_start);
+            if (after.back_end_cpu_ticks)
+                back_end_plays.push_back(double(after.back_end_cpu_ticks - before.back_end_cpu_ticks) /
+                                         cpu_ticks_a_second());
+            if (after.record_cpu_ticks)
+                record_plays.push_back(double(after.record_cpu_ticks - before.record_cpu_ticks) / cpu_ticks_a_second());
             double seconds = after.gpu_seconds - before.gpu_seconds;
             if (fastest_gpu_seconds < 0 || seconds < fastest_gpu_seconds) {
                 fastest_gpu_seconds = seconds;
@@ -232,6 +242,9 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     report.command_cpu_plays = std::move(command_cpu_plays);
     report.play_seconds = std::move(play_seconds);
     report.command_wait_seconds = std::move(command_waits);
+    report.back_end_cpu_plays = std::move(back_end_plays);
+    report.record_cpu_plays = std::move(record_plays);
+    report.process_cpu_plays = std::move(process_plays);
     // XF_REPLAY_DUMP_MEMORY=<hex address>:<hex size>:<file>: that physical
     // memory after the trace, to set beside Xenia's and the reference's
     // (XF_REF_DUMP_MEMORY). What resolves wrote is in it with

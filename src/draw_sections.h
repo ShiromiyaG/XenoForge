@@ -55,6 +55,7 @@ class DrawSections {
     void reset() {
         for (uint32_t i = 0; i < COUNT; i++) cycles_[i] = counts_[i] = 0;
         for (uint32_t i = 0; i < TALLIES; i++) tallies_[i] = 0;
+        for (uint32_t i = 0; i < BACK_KINDS; i++) back_[i] = back_counts_[i] = 0;
         draws_ = 0;
     }
     void draw() { draws_++; }
@@ -80,8 +81,23 @@ class DrawSections {
         TALLIES
     };
     void tally(Tally t, uint64_t n = 1) { tallies_[t] += n; }
+    // the GPU back end's time by the kind of record it handles (gpu/deferred_sink.h), beside
+    // the draws' sections: what the back end does outside the draws
+    enum BackKind : uint32_t { BackBlocks, BackDraw, BackResolve, BackSwap, BackShader, BackOther, BACK_KINDS };
+    void back(BackKind k, uint64_t ticks) { back_[k] += ticks, back_counts_[k]++; }
     ~DrawSections() {
         if (!on() || !draws_) return;
+        uint64_t back_total = 0;
+        for (uint32_t i = 0; i < BACK_KINDS; i++) back_total += back_[i];
+        if (back_total) {
+            static const char *const kinds[BACK_KINDS] = {"blocks", "draws", "resolves", "swaps", "shaders", "other"};
+            std::fprintf(stderr, "back end by record: %.0f ticks a draw in all\n",
+                         double(back_total) / double(draws_));
+            for (uint32_t i = 0; i < BACK_KINDS; i++)
+                std::fprintf(stderr, "  %-10s %7.0f ticks a draw %5.1f%% (%llu records)\n", kinds[i],
+                             double(back_[i]) / double(draws_), 100.0 * double(back_[i]) / double(back_total),
+                             (unsigned long long)back_counts_[i]);
+        }
         static const char *const names[COUNT] = {"front",    "indices", "constants", "targets", "textures",
                                                  "pipeline", "vertex",  "fit",       "constup", "systemup",
                                                  "words",    "pass",    "state",     "draw"};
@@ -107,6 +123,7 @@ class DrawSections {
   private:
     uint64_t last_ = 0, draws_ = 0;
     uint64_t cycles_[COUNT] = {}, counts_[COUNT] = {}, tallies_[TALLIES] = {};
+    uint64_t back_[BACK_KINDS] = {}, back_counts_[BACK_KINDS] = {};
 };
 
 #define XF_DRAW_TALLY(t)                                                                                               \

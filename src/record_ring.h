@@ -20,6 +20,7 @@
 #pragma once
 
 #include "fast_clock.h"
+#include "thread_cpu.h"
 
 #include <volk.h>
 
@@ -167,6 +168,8 @@ class Ring {
     void publish_some() {
         if (head_ - published_ >= batch_) publish();
     }
+    // the recording thread's processor time so far (thread_cpu.h's ticks; 0 before it starts)
+    uint64_t cpu_ticks() const { return cpu_.ticks(); }
     // the entries put so far handed to the thread (started at the first)
     void publish() {
         if (head_ == published_) return;
@@ -241,6 +244,7 @@ class Ring {
         wait_ticks_[Full] += FastClock::now() - t0;
     }
     void loop() {
+        cpu_.bind_current();
         size_t tail = 0;
         for (;;) {
             size_t head = head_shared_.load(std::memory_order_acquire);
@@ -283,6 +287,7 @@ class Ring {
     uint32_t pending_ = 0;
     uint64_t entries_ = 0, publishes_ = 0, waits_[WHYS] = {}, wait_ticks_[WHYS] = {};
     std::thread thread_;
+    ThreadCpu cpu_; // the recording thread's processor time (cpu_ticks)
     // shared, each on its own line
     alignas(64) std::atomic<size_t> head_shared_{0};
     alignas(64) std::atomic<size_t> tail_shared_{0};

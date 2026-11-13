@@ -2313,6 +2313,111 @@ timed with the machine quiet: with the back end the `commands:` line of
 `--rates` counts the front end's waits for it, so it no longer gives the
 front end's own work.
 
+## The back end's cost, and Xenia's write-time model tried (2026-11-13)
+
+With the split, game G's frame is set by the back end: live in its town
+about 27.9 ms of work a frame (p99 33.3), against Xenia's whole GPU thread at
+about 24 ms (D3D12). Xenia keeps a draw whose state did not change almost
+free by doing the work where a register is written: a float constant write
+marks its stage's buffer out of date only where the current shader reads it,
+fetch constant writes mark their bindings, `RequestTextures` looks only at
+the slots not in sync. That model was tried here against the renderer's
+memos, each part behind its switch.
+
+**The measure.** `xfreplay --repeat` now prints the back end's processor
+time a play and the recording thread's (`src/thread_cpu.h`: each thread's
+cycles read from another, `QueryThreadCycleTime` or the thread's CPU clock),
+and all threads' processor time a play (the mean: Windows counts a process's
+time in steps of 15.6 ms; the trace's walk included). `XF_DRAW_SECTIONS=1`
+adds the back end's time by the kind of record (`back end by record`), and
+`XF_PROFILE_BACK_END=1` makes `--profile` sample the back end's thread. Game
+G's frame 1485, quiet machine: the back end 24 ms a play, 9,445 ticks a draw
+in all, of which the draws 69%, the register blocks 19% (1,800 ticks a draw:
+5.2 blocks of 32 registers), the resolves 4%, the shaders 2%, the rest 5%.
+
+**Kept** (A B interleaved, three rounds of `--repeat 15`, the back end's
+processor time a play, the rounds' medians; the machine in a slower state
+than above, the owner's monitoring tools running, about 20% busy):
+
+| frame | both off | both on |
+| --- | --- | --- |
+| game G 1485, back end | 31.6 / 32.7 / 31.4 ms | 29.0 / 28.5 / 28.9 ms (-9%) |
+| game G 1485, front end's commands | 15.0 / 14.9 / 14.6 ms | 13.9 / 13.1 / 13.6 ms |
+| game D's drive, back end | 9.42 / 9.04 / 9.31 ms | 9.32 / 8.30 / 8.64 ms (-7%) |
+| game D's drive, front end's commands | 3.96 / 3.29 / 3.57 ms | 3.59 / 3.10 / 3.30 ms |
+
+- **Register runs by masks** (`XF_REGISTER_RUN_MASKS=0` off;
+  `RegisterFile::write_run`). A block's changed registers are found as a
+  bit mask by vector compares and only those stored, with a plain relaxed
+  store; before, each register had a branch (taken at random in a block of
+  constants) and `std::atomic_ref`'s constructor and store, which clang did
+  not inline under the C runtime's library: two calls a register. The back
+  end's copy of a record's blocks is read where the ring holds them, not
+  copied out first. A block in a loop by itself: 590 to 170 ticks; the
+  back end's blocks 1,760 to 1,370 ticks a draw. The front end's own file
+  writes the same way, so its commands gain too.
+- **Uploads in 16-byte stores** (`XF_UPLOAD_STORES=0` off; `upload`). The C
+  runtime's `memcpy` into the write-combined draw data cost half again as
+  much as plain 16-byte stores filling each line in order: the constants'
+  upload 1,230 to 870 ticks a draw, the system constants' 510 to 360. The
+  arena's index and attribute words and the index cache's go the same way.
+
+Pictures byte for byte the same with both on and both off on game G's 1260,
+1485, 1596 and 3700 (exact path) and 1485 and 3700 (host path).
+
+**Tried and dropped**, each measured by sections:
+
+- **Constants by write-time marks** (Xenia's `current_float_constant_map_`):
+  the back end's register file marked, at each write that changed a
+  constant, a bit per float4 a stage and a serial per fetch constant; a
+  draw copied only those and uploaded a stage again only where a constant
+  its shader reads (a bit per float4, by texture fetch constant) changed
+  since the stage's last upload. Uploads 1.497 to 1.423 a draw (-5%): the
+  constants a shader reads do change at nearly every draw that uploads,
+  real changes. The copy by marks cost more than the block stamps' (the
+  section 595 to 669 ticks a draw), and the back end lost 0.6 ms a play.
+- **Texture slots in sync** (Xenia's `texture_bindings_in_sync_`): a slot
+  whose fetch constant was unwritten since it was bound (the write-time
+  serial) took what it gave then without hashing the constant or looking
+  into the memo's table. 1.58 of the 2.24 slots a draw were in sync, but
+  the textures' section stayed at 576-579 ticks a draw: the slot memo,
+  prefetched, already cost little more than the texture's own checks
+  (`unwritten`, `use`) that both keep.
+- **Vertex ranges in sync**: the ranges kept while the shaders and their
+  vertex fetch constants were unchanged and nothing was written. Only 23% of
+  draws were in sync (a draw's vertex buffers change at most draws), and the
+  section rose from 588 to 691 ticks a draw.
+- **Packed constant uploads**: the constants laid out with the fetch,
+  boolean and loop constants first and the float constants from 1 KB, each
+  upload placed right after the last one's bytes rather than a whole 5 KB
+  window a stage, so a frame's uploads write a few pages together. No
+  change (constup 974-1,061 against 987-1,038 ticks a draw), so the layout
+  stayed as it was. Uploading to the same address every time (a wrong
+  picture, as a probe) halved the upload: what costs is the write-combined
+  memory's lines going to the bus, not the pages.
+- **Prefetching** the ring's records ahead and the register copy's blocks
+  before a record is written: no change.
+- **System constants by fields**: not built. A draw can skip building and
+  comparing them only where its front part, pipeline and every texture slot
+  are the draw before's, at most a third of the draws, about 150 ticks
+  each.
+
+What is left is what changes at every draw (the constants' uploads, 1.4 a
+draw, each a real change) and each draw's fixed bookkeeping, which the memos
+already keep small: Xenia's write-time model and the memos arrive at the
+same work by different roads here.
+
+**The player's slow frames counted nothing** (`XF_SLOW_FRAMES`): the player
+keeps a trace writer standing by for F4 (`gpu::TraceWriter`), the
+processor's sink in front of the renderer, and it did not hand `work()` on,
+so every frame showed 0 texture loads, submissions and pipelines. It does
+now, and it hands on `shader_again` while no trace is written (the front end
+copied every IM_LOAD's words and the back end hashed them again). It still
+does not hand on the screen extents (`measures_extents` and the reports) or
+the VIZ queries, so in the player the extents are never measured and VIZ
+queries never reach the renderer, unlike in a replay: left as found, to be
+decided with a live run.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches
