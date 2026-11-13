@@ -183,6 +183,7 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     std::vector<size_t> order_; // the listing's indices as the table shows them (sorted, filtered)
     std::string rows_sig_;
     bool animate_rows_ = true; // the next full list of rows comes in animated (the start, a new folder, a new sort)
+    bool rows_shown_reading_ = false; // rows shown while the folder was read: the whole list is not brought in again
     UiSound sound_;
     std::set<uint32_t> icons_;  // title IDs whose image the renderer has
     std::set<uint32_t> failed_; // games whose preparing failed here

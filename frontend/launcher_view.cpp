@@ -374,10 +374,15 @@ void LauncherView::rebuild_rows(bool force) {
         html += table_row_html(r, long(i) == selected_);
     }
     body->SetInnerRML(html);
+    // The rows shown one by one as the folder is read stay as they are once it is read: brought in again
+    // whole, from nothing, they would vanish and come back. A list that appears whole (read before it was
+    // first drawn, sorted again) comes in.
+    if (listing_.busy && !order_.empty()) rows_shown_reading_ = true;
     if (animate_rows_ && !listing_.busy && !order_.empty()) { // the whole list is in: it comes in
         animate_rows_ = false;
-        animate_rows_in();
+        if (!rows_shown_reading_) animate_rows_in();
     }
+    if (!listing_.busy) rows_shown_reading_ = false; // (a new sort after the reading comes in)
 
     const bool filtered = !filter_.empty() && order_.empty() && !listing_.games.empty();
     const bool show_empty = no_folder || filtered || (listing_.games.empty() && !listing_.busy);
