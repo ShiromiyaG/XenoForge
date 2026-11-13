@@ -232,11 +232,11 @@ int main(int argc, char **argv) {
                 double(report.texture_bytes) / (1 << 20),
                 double(report.texture_bytes_peak) / (1 << 20), (unsigned long long)report.textures_evicted,
                 (unsigned long long)report.textures_evicted_for_room, (unsigned long long)report.textures_refused);
-    std::printf("  texture loads: %llu new, %llu after the CPU wrote their memory, %llu after a resolve or an export; "
-                "%llu resolves wrote the texture they feed\n",
+    std::printf("  texture loads: %llu new, %llu after the CPU wrote their memory, %llu after a resolve or an export "
+                "(%llu an export); %llu resolves wrote the texture they feed, %llu made a stale target current\n",
                 (unsigned long long)report.texture_loads_new, (unsigned long long)report.texture_loads_cpu_written,
-                (unsigned long long)report.texture_loads_gpu_written,
-                (unsigned long long)report.resolve_targets_written);
+                (unsigned long long)report.texture_loads_gpu_written, (unsigned long long)report.texture_loads_exported,
+                (unsigned long long)report.resolve_targets_written, (unsigned long long)report.resolve_targets_covered);
     if (report.textures_scaled)
         std::printf("  %llu textures made the resolution scale's\n", (unsigned long long)report.textures_scaled);
     if (report.zpd_reports)

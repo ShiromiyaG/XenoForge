@@ -403,6 +403,9 @@ public:
     struct Work {
         double gpu_wait_seconds = 0;
         uint64_t texture_loads = 0, submissions = 0, pipelines = 0;
+        // the texture loads by why: a texture not held, its memory written
+        // by the CPU, by a resolve, by a memory export
+        uint64_t texture_loads_new = 0, texture_loads_cpu = 0, texture_loads_resolved = 0, texture_loads_exported = 0;
         // the front end's waits for the back end, by why: SyncFor's reasons,
         // then the extents' wait (extent_wait), the ring full
         static constexpr size_t BACK_END_WAITS = size_t(SyncFor::COUNT) + 2;

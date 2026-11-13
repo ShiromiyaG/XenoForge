@@ -98,10 +98,12 @@ void print_renderer_report(const render::Report &r) {
                 (unsigned long long)r.render_targets, (unsigned long long)r.textures, (unsigned long long)r.pipelines,
                 (unsigned long long)r.shaders, (unsigned long long)r.shader_loads_again);
     std::printf("renderer: texture loads: %llu new, %llu again after the CPU wrote their memory, %llu after a resolve "
-                "or a memory export did; %llu resolves wrote the texture they feed (%llu table places taken back)\n",
+                "or a memory export did (%llu an export); %llu resolves wrote the texture they feed (%llu table "
+                "places taken back, %llu stale targets made current)\n",
                 (unsigned long long)r.texture_loads_new, (unsigned long long)r.texture_loads_cpu_written,
-                (unsigned long long)r.texture_loads_gpu_written, (unsigned long long)r.resolve_targets_written,
-                (unsigned long long)r.resolve_targets_reclaimed);
+                (unsigned long long)r.texture_loads_gpu_written, (unsigned long long)r.texture_loads_exported,
+                (unsigned long long)r.resolve_targets_written, (unsigned long long)r.resolve_targets_reclaimed,
+                (unsigned long long)r.resolve_targets_covered);
     std::printf(
         "renderer: texture cache: %llu textures (%llu views) held in %.1f MB (at most %.1f MB), %llu destroyed by the "
         "memory limits, %llu to make room in a bindless table, %llu loads refused for want of it\n",

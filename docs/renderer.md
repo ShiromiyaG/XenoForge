@@ -2538,6 +2538,96 @@ processor waits there for its GPU too. A live run with the new line tells
 how much of a slow frame is that, the back end's own work, or a thread
 preempted (busy time well above processor time).
 
+## The loads after resolves in game G's town (2026-11-13)
+
+Live, in the first town, the player counted 60-70 texture loads a
+frame (about 99 arriving there) for 66 resolves. The replays of the scene's
+three traces (1260, 1485, 1596) and of 3700 load the same set every play:
+about 20 textures after resolves, none after the CPU's writes, none new
+after the first play. So what the live frames load beyond those 20 is
+something a replay does not reproduce (new textures as the camera moves,
+or memory the CPU writes, faults and their widening); the frame's line now
+tells which.
+
+**Measured** (1485; `--gpu-time`, the loads now marked by why, format and
+size; `XF_DRAW_SECTIONS=1` with kept plays):
+
+| a play | loads | GPU |
+| --- | --- | --- |
+| a 24_8 1600x1600 shadow atlas | 1 | 0.231 ms |
+| mip chains made a level at a time (4_4_4_4 64, 128 and 192 square, three levels each; 8_8_8_8 128x64) | 14 | 0.13 ms |
+| the same chains' 4_4_4_4 first level (a converting load) | 3 | 0.026 ms |
+| an 8 128x128 | 2 | 0.014 ms |
+
+Of 13.9 ms of GPU a play, the loads were 0.38 ms (2.8%). On the back end
+the slot misses that make them cost about 17,000 cycles each (about 5 us),
+0.13 ms of a 14 ms play (1%): the reloads are not what keeps the back end
+busy. Game D's drive frame: 3 loads a play, 0.22 ms of 9.1 ms, two of them
+24_8 1024x1024 shadow maps a 1280x720 color resolve over the same memory
+overwrites outside the 520x520 their depth resolves write.
+
+**The atlas.** The game resolves its shadow atlas a quarter at a time
+(four 800x800 depth resolves into a 1600x1600 24_8 texture), and between
+two frames resolves a 640x360 16_16_16_16_FLOAT surface over the same
+memory. Two things kept the atlas from being fed:
+- *The right-hand quarters start 25 tiles across*, not a whole number of
+  tile rows down. **Fed at a tile offset across** (`XF_RESOLVE_TARGET_TILES=0`
+  off): within a row of macro tiles the 32x32 tiles follow one another, so
+  Xenia's `GetTiledOffset2D` of (x + 32k, y + 32m) is that of (x, y) plus
+  m * pitch / 32 + k tiles (the bits below 32 it mixes are the same); a
+  destination a whole number of tiles past a target's base is fed k * 32
+  columns across and m * 32 rows down (the corner in the push constants),
+  as long as it ends within the pitch (past it, memory wraps into the next
+  tile row, which the texel's bounds check would leave out).
+- *A stale target was fed only by a resolve writing all of it.* **Stale
+  targets covered in parts** (`XF_RESOLVE_TARGET_COVER=0` off): a stale target
+  is fed by a resolve writing a part of it too, and its 32x32 tiles written
+  since it went stale are counted (`Texture::covered`, a bit a tile, those at
+  its edge counting where the write reaches the edge); once all are, its image
+  is what memory holds and it is current again without a load. Another
+  write over it (a resolve not feeding it, an export) forgets them, and a
+  load or the CPU's writes (its watches, checked at every use as before)
+  too. The current targets over a destination take its two places first,
+  the stale ones fed in part after them.
+
+Neither gains alone here; together the atlas is never loaded again.
+Interleaved, three rounds each (`--gpu-time --repeat 10`, the fastest play;
+the machine quiet, 8% busy, only an editor's language server):
+
+| | off | on |
+| --- | --- | --- |
+| 1485, GPU a play | 13.896 / 13.920 / 13.865 ms | 13.706 / 13.660 / 13.629 ms (-1.7%) |
+| game D's drive, GPU a play | 9.157 / 9.149 / 9.162 ms | 9.158 / 9.132 / 9.172 ms |
+| 1485, back end's processor time a play (kept plays, `--repeat 15`, median) | 13.25 / 14.79 / 13.42 ms | 14.24 / 13.25 / 13.13 ms |
+| 1485, all threads a play | 48.0 / 50.2 / 43.5 ms | 50.2 / 48.0 / 46.9 ms |
+
+The back end's time does not move beyond its spread (one load fewer, about
+5 us). Pictures byte for byte the same with both on and both off on 1260,
+1485, 1596, 3700 and the drive; `replay_test` matches on both paths.
+
+**Counted.** The loads by why on the frame's line (`XF_SLOW_FRAMES`: new,
+after the CPU's writes, after resolves, after exports; `Sink::Work`), the
+loads after an export apart in the report (`texture_loads_exported`), the
+stale targets made current by their resolves (`resolve_targets_covered`),
+and `--gpu-time` marks each load with why, the format and size.
+
+**Left, measured but not built:**
+- *Mip chains made a level at a time*: the game resolves level 0, draws
+  level 1 from a fetch constant reading level 0 only, resolves it, and so
+  on, each step's constant a texture of its own key (one more level each),
+  four textures over the same memory. Feeding them needs targets with
+  levels (a storage view and a place a level), 16-bit texels with the
+  4_4_4_4 load's nibble order, and more than two places a resolve: 17 loads
+  a play, 0.16 ms of GPU and about 0.09 ms of the back end.
+- *8-bit targets* (the 8 128x128): 2 loads, 0.014 ms.
+- *Partial loads* of a texture whose memory a resolve of another pitch
+  overwrote in part (the drive's shadow maps: the color resolve reaches 3
+  of the first map's 32 tile rows): would need the rows a write touched
+  kept by texture; 0.17 ms a play at most.
+- *Fed across pitches* (a resolve of one pitch into a texture of another:
+  each written address's texel found by inverting the tiling): the 640x360
+  surface over the atlas, the drive's color resolve over its shadow maps.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches
@@ -3093,7 +3183,9 @@ resolves wrote the texture they feed), the loads 5.6 -> 1.5 s of the run's
 GPU time (14.5% -> 4.6%). Its two recorded frames replay identically with
 resolve targets on and off (0.000 of 255); replay_test 29/29 on both paths
 and at 200%. Left: mipmapped and stacked textures, aliases over memory
-another surface wrote since (needed), 24_8 1024x1024 half fed.
+another surface wrote since (needed), 24_8 1024x1024 half fed. (A stale
+target fed in parts, and at a tile offset across, since: "The loads after
+resolves in game G's town".)
 
 **Vertex data and the CPU's decodes.** Two costs of the renderer's thread:
 - *Every texture loaded on the GPU* (`XF_TEXTURE_LOADS=cpu` for the CPU's

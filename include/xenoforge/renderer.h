@@ -79,7 +79,11 @@ struct Report {
     // CPU wrote (its watches), one whose memory a resolve or a memory export
     // wrote (render to texture, loaded again from the mirror on the GPU)
     uint64_t texture_loads_new = 0, texture_loads_cpu_written = 0, texture_loads_gpu_written = 0;
+    uint64_t texture_loads_exported = 0; // of texture_loads_gpu_written, those after a memory export
     uint64_t resolve_targets_written = 0; // resolves that wrote the texture they feed too (not loaded again)
+    // stale targets made current by the resolves feeding them: one writing
+    // all of it, or several each a part (Texture::covered in renderer.cpp)
+    uint64_t resolve_targets_covered = 0;
     uint64_t resolve_targets_reclaimed = 0; // places in the resolves' table taken from a texture unused since
     uint64_t textures_scaled = 0;         // textures made the resolution scale's (Options::resolution_scale)
     uint64_t textures_evicted = 0, textures_evicted_for_room = 0, textures_refused = 0;

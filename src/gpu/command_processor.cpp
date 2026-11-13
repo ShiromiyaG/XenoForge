@@ -990,13 +990,18 @@ bool CommandProcessor::xe_swap(uint32_t count) {
             }();
             if (slow_swaps_ && (ms > limit || all))
                 std::printf("%s frame: swap %llu, %.1f ms (%.1f ms in waits, %.1f ms waiting for the GPU), %llu draws, "
-                            "%llu resolves, %llu extent reports, %llu texture loads, %llu submissions, %llu pipelines%s\n",
+                            "%llu resolves, %llu extent reports, %llu texture loads (%llu new, %llu after the CPU's "
+                            "writes, %llu after resolves, %llu after exports), %llu submissions, %llu pipelines%s\n",
                             ms > limit ? "slow" : "a", (unsigned long long)counts_.swaps.load(), ms,
                             double(waited - slow_waited_) / 1e6,
                             (work.gpu_wait_seconds - slow_work_.gpu_wait_seconds) * 1000.0,
                             (unsigned long long)(draws - slow_draws_), (unsigned long long)(resolves - slow_resolves_),
                             (unsigned long long)(reports - slow_reports_),
                             (unsigned long long)(work.texture_loads - slow_work_.texture_loads),
+                            (unsigned long long)(work.texture_loads_new - slow_work_.texture_loads_new),
+                            (unsigned long long)(work.texture_loads_cpu - slow_work_.texture_loads_cpu),
+                            (unsigned long long)(work.texture_loads_resolved - slow_work_.texture_loads_resolved),
+                            (unsigned long long)(work.texture_loads_exported - slow_work_.texture_loads_exported),
                             (unsigned long long)(work.submissions - slow_work_.submissions),
                             (unsigned long long)(work.pipelines - slow_work_.pipelines),
                             extents_ == ScreenExtents::Measured ? ", extents measured" : "");
