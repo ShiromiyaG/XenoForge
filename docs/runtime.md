@@ -1986,6 +1986,12 @@ offsets, and for one thread its callers and inclusive shares.
   frame taken wrongly, and the fault ended the run as a crash: a handler
   put before the process's own takes the walking thread back to where the
   walk began.
+- **Far addresses.** A game library has no symbols: its code is named from
+  the modules' function tables, the nearest function at or below. An
+  address more than 64 KB past it (a long function's code: one game's
+  video decoder has a function of 234 KB) is named after it with
+  `(far)` and its RVA in the module, for a disassembly of the library; it
+  was "module+?" before (docs/recompiler.md, "Video decoding").
 - **`XF_PROFILE_CHAINS=<name>[,<name>...]`** (with one thread): for each
   function whose name holds one of them, the chains of six callers above
   it by their samples. A flat profile's small system costs (a page's

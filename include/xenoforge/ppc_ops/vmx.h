@@ -44,9 +44,30 @@ template <typename T, typename F> XF_INLINE Vec128 map(const Vec128 &a, const Ve
 }
 
 // a[k] + b[k] (Sub: a[k] - b[k]) saturated to T; VSCR[SAT] if any lane did,
-// which is where the saturated result differs from the wrapped one. Three
-// separate loops: the compiler makes the first a saturating add (paddsb...)
-// and the others narrow lanes, where one loop would widen every lane.
+// which is where the saturated result differs from the wrapped one.
+//
+// With clang's vector types and saturating builtins: one saturating add
+// (paddsw, sqadd...), one wrapping add, a compare. The loops below, written
+// for the vectorizer, came out right alone, but inside a long function of
+// such operations the vectorizer took the wrapped sum and the compare back
+// to 16 lane extracts and scalar adds an instruction (a video decoder's
+// hottest functions are little else).
+#if defined(__clang__)
+template <typename T, bool Sub> XF_INLINE Vec128 add_sat(Context &c, const Vec128 &a, const Vec128 &b) {
+    using U = lib::make_unsigned_t<T>;
+    typedef T VT __attribute__((vector_size(16)));
+    typedef U VU __attribute__((vector_size(16)));
+    VT x, y;
+    lib::memcpy(&x, &a, 16);
+    lib::memcpy(&y, &b, 16);
+    const VT r = Sub ? __builtin_elementwise_sub_sat(x, y) : __builtin_elementwise_add_sat(x, y);
+    const VU w = Sub ? VU(x) - VU(y) : VU(x) + VU(y);
+    c.vscr_sat |= __builtin_reduce_or(VU(r) ^ w) != 0;
+    Vec128 v;
+    lib::memcpy(&v, &r, 16);
+    return v;
+}
+#else
 template <typename T, bool Sub> XF_INLINE Vec128 add_sat(Context &c, const Vec128 &a, const Vec128 &b) {
     using U = lib::make_unsigned_t<T>;
     constexpr int N = 16 / sizeof(T);
@@ -66,6 +87,7 @@ template <typename T, bool Sub> XF_INLINE Vec128 add_sat(Context &c, const Vec12
     lib::memcpy(&v, r, 16);
     return v;
 }
+#endif
 
 // all ones where f(a[k], b[k]); CR6 for the dot forms
 template <typename T, typename F> XF_INLINE void compare(Context &c, uint32_t d, uint32_t a, uint32_t b, bool rc, F f) {
@@ -156,15 +178,77 @@ inline Vec128 shr_bits(const Vec128 &a, const Vec128 &b) {
 
 // PERMUTE by bytes: guest byte n is byte (control n & 31) of a || b. Byte k of
 // a || b is at tab[k ^ 3] (bit 4 picks b, and ^ 3 keeps it).
+//
+// Where the host has a byte shuffle (SSSE3's pshufb, every x86-64 level the
+// game library is built at), host byte j of the result is host byte
+// (control.u8[j] & 31) ^ 3 of a || b: each of a and b shuffled by its low 4
+// bits and bit 4 choosing between them, as Xenia's backend does. Done byte by
+// byte, the 16 loads and 16 byte stores were a video decoder's hottest code,
+// and the vector read of the result right after its byte stores stalls (the
+// stores cannot be forwarded to it).
 inline Vec128 perm(const Vec128 &a, const Vec128 &b, const Vec128 &control) {
+#if defined(__SSSE3__) && (defined(__clang__) || defined(__GNUC__))
+    typedef char B16 __attribute__((vector_size(16)));
+    B16 x, y, k;
+    lib::memcpy(&x, &a, 16);
+    lib::memcpy(&y, &b, 16);
+    lib::memcpy(&k, &control, 16);
+    k = (k & 0x1F) ^ 3;
+    const B16 lo = __builtin_ia32_pshufb128(x, k), hi = __builtin_ia32_pshufb128(y, k);
+    const B16 from_b = k > 15;
+    const B16 r = (hi & from_b) | (lo & ~from_b);
+    Vec128 v;
+    lib::memcpy(&v, &r, 16);
+    return v;
+#else
     uint8_t tab[32];
     lib::memcpy(tab, &a, 16);
     lib::memcpy(tab + 16, &b, 16);
     Vec128 r;
     for (uint32_t j = 0; j < 16; j++) r.u8[j] = tab[(control.u8[j] & 0x1F) ^ 3];
     return r;
+#endif
 }
 // (a || b) << (sh * 8), the high 16 bytes
+#if defined(__clang__)
+// host byte p of the result is host byte ((p ^ 3) + S) ^ 3 of a || b: one
+// fixed shuffle for each shift, where the loop below left some shifts a
+// byte at a time (sh is the instruction's, a constant in generated code)
+template <uint32_t S> XF_INLINE Vec128 sldoi_by(const Vec128 &a, const Vec128 &b) {
+    typedef uint8_t U16 __attribute__((vector_size(16)));
+    U16 x, y;
+    lib::memcpy(&x, &a, 16);
+    lib::memcpy(&y, &b, 16);
+#define XF_AT(p) ((((p) ^ 3) + S) ^ 3)
+    const U16 r = __builtin_shufflevector(x, y, XF_AT(0), XF_AT(1), XF_AT(2), XF_AT(3), XF_AT(4), XF_AT(5), XF_AT(6),
+                                          XF_AT(7), XF_AT(8), XF_AT(9), XF_AT(10), XF_AT(11), XF_AT(12), XF_AT(13),
+                                          XF_AT(14), XF_AT(15));
+#undef XF_AT
+    Vec128 v;
+    lib::memcpy(&v, &r, 16);
+    return v;
+}
+XF_INLINE Vec128 sldoi(const Vec128 &a, const Vec128 &b, uint32_t sh) {
+    switch (sh & 15) {
+    case 0: return sldoi_by<0>(a, b);
+    case 1: return sldoi_by<1>(a, b);
+    case 2: return sldoi_by<2>(a, b);
+    case 3: return sldoi_by<3>(a, b);
+    case 4: return sldoi_by<4>(a, b);
+    case 5: return sldoi_by<5>(a, b);
+    case 6: return sldoi_by<6>(a, b);
+    case 7: return sldoi_by<7>(a, b);
+    case 8: return sldoi_by<8>(a, b);
+    case 9: return sldoi_by<9>(a, b);
+    case 10: return sldoi_by<10>(a, b);
+    case 11: return sldoi_by<11>(a, b);
+    case 12: return sldoi_by<12>(a, b);
+    case 13: return sldoi_by<13>(a, b);
+    case 14: return sldoi_by<14>(a, b);
+    default: return sldoi_by<15>(a, b);
+    }
+}
+#else
 inline Vec128 sldoi(const Vec128 &a, const Vec128 &b, uint32_t sh) {
     uint8_t tab[32];
     lib::memcpy(tab, &a, 16);
@@ -173,7 +257,50 @@ inline Vec128 sldoi(const Vec128 &a, const Vec128 &b, uint32_t sh) {
     for (uint32_t n = 0; n < 16; n++) r.u8[n ^ 3] = tab[(n + sh) ^ 3];
     return r;
 }
+#endif
 
+#if defined(__clang__)
+// Merges, packs and unpacks as fixed shuffles of clang's vector types: the
+// lane loops below came out as shuffles alone, but inside a long function of
+// vector code the vectorizer left some of them as a store and an extract a
+// lane (and the vector read of the result after its narrow stores stalls).
+// Host lane p of the result and the source lane each takes, from the guest
+// order (byte n at n ^ 3, halfword n at n ^ 1); 16 + i or 8 + i is lane i of b.
+typedef uint8_t U8x16 __attribute__((vector_size(16)));
+typedef uint16_t U16x8 __attribute__((vector_size(16)));
+#define XF_SHUF8(x, y, F) __builtin_shufflevector(x, y, F(0), F(1), F(2), F(3), F(4), F(5), F(6), F(7))
+#define XF_SHUF16(x, y, F)                                                                                             \
+    __builtin_shufflevector(x, y, F(0), F(1), F(2), F(3), F(4), F(5), F(6), F(7), F(8), F(9), F(10), F(11), F(12),     \
+                            F(13), F(14), F(15))
+template <typename V> XF_INLINE V as(const Vec128 &a) {
+    V v;
+    lib::memcpy(&v, &a, 16);
+    return v;
+}
+template <typename V> XF_INLINE Vec128 vec_of(const V &v) {
+    Vec128 r;
+    lib::memcpy(&r, &v, 16);
+    return r;
+}
+// merges: elements off..off+count/2-1 of a and b interleaved
+template <uint32_t Off> XF_INLINE Vec128 merge8_at(const Vec128 &a, const Vec128 &b) {
+    // guest byte n = p ^ 3 is element n / 2 + Off of a (n even) or of b
+#define XF_AT(p) ((((p) ^ 3) & 1 ? 16 : 0) + (((((p) ^ 3) >> 1) + Off) ^ 3))
+    return vec_of(XF_SHUF16(as<U8x16>(a), as<U8x16>(b), XF_AT));
+#undef XF_AT
+}
+template <uint32_t Off> XF_INLINE Vec128 merge16_at(const Vec128 &a, const Vec128 &b) {
+#define XF_AT(p) ((((p) ^ 1) & 1 ? 8 : 0) + (((((p) ^ 1) >> 1) + Off) ^ 1))
+    return vec_of(XF_SHUF8(as<U16x8>(a), as<U16x8>(b), XF_AT));
+#undef XF_AT
+}
+XF_INLINE Vec128 merge8(const Vec128 &a, const Vec128 &b, uint32_t off) {
+    return off ? merge8_at<8>(a, b) : merge8_at<0>(a, b);
+}
+XF_INLINE Vec128 merge16(const Vec128 &a, const Vec128 &b, uint32_t off) {
+    return off ? merge16_at<4>(a, b) : merge16_at<0>(a, b);
+}
+#else
 // merges: elements off..off+count/2-1 of a and b interleaved
 XF_INLINE Vec128 merge8(const Vec128 &a, const Vec128 &b, uint32_t off) {
     Vec128 r;
@@ -187,6 +314,7 @@ XF_INLINE Vec128 merge16(const Vec128 &a, const Vec128 &b, uint32_t off) {
         r.u16[(2 * k) ^ 1] = a.u16[(k + off) ^ 1], r.u16[(2 * k + 1) ^ 1] = b.u16[(k + off) ^ 1];
     return r;
 }
+#endif
 XF_INLINE Vec128 merge32(const Vec128 &a, const Vec128 &b, uint32_t off) {
     Vec128 r;
     r.u32[0] = a.u32[off], r.u32[1] = b.u32[off], r.u32[2] = a.u32[off + 1], r.u32[3] = b.u32[off + 1];
@@ -206,6 +334,43 @@ XF_INLINE int32_t simm5(uint32_t v) { return int32_t(v << 27) >> 27; }
 // halfwords and x[n] for words; the narrowing and the saturation test are
 // separate loops over the host lanes (Out's range fits In, so the clamp is
 // done in In), then a fixed shuffle.
+#if defined(__clang__)
+// (clang's vector types: x is a's lanes then b's, clamped, narrowed, and
+// result byte p ^ 3 (halfword p ^ 1) is y[p ^ 3 ^ 1] (y[p ^ 1]))
+template <typename In, typename Out, bool Sat, int N> XF_INLINE Vec128 pack(Context &c, const Vec128 &a, const Vec128 &b) {
+    typedef In VIn __attribute__((vector_size(16)));
+    typedef In VX __attribute__((vector_size(32)));
+    typedef Out VOut __attribute__((vector_size(16)));
+    const VIn xa = as<VIn>(a), xb = as<VIn>(b);
+    VX x;
+    if constexpr (N == 16)
+        x = __builtin_shufflevector(xa, xb, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    else
+        x = __builtin_shufflevector(xa, xb, 0, 1, 2, 3, 4, 5, 6, 7);
+    VX y = x;
+    if constexpr (Sat) {
+        constexpr In lo = In(lib::numeric_limits<Out>::min()), hi = In(lib::numeric_limits<Out>::max());
+        y = __builtin_elementwise_min(__builtin_elementwise_max(x, VX{} + lo), VX{} + hi);
+        c.vscr_sat |= __builtin_reduce_or(y != x) != 0;
+    }
+    const VOut z = __builtin_convertvector(y, VOut);
+    if constexpr (N == 16) {
+#define XF_AT(p) ((p) ^ 2)
+        return vec_of(XF_SHUF16(z, z, XF_AT));
+#undef XF_AT
+    } else {
+#define XF_AT(p) ((p) ^ 1)
+        return vec_of(XF_SHUF8(z, z, XF_AT));
+#undef XF_AT
+    }
+}
+template <typename In, typename Out, bool Sat> XF_INLINE Vec128 pack16(Context &c, const Vec128 &a, const Vec128 &b) {
+    return pack<In, Out, Sat, 16>(c, a, b);
+}
+template <typename In, typename Out, bool Sat> XF_INLINE Vec128 pack32(Context &c, const Vec128 &a, const Vec128 &b) {
+    return pack<In, Out, Sat, 8>(c, a, b);
+}
+#else
 template <typename In, typename Out, bool Sat, int N, typename F>
 XF_INLINE void narrow(Context &c, const Vec128 &a, const Vec128 &b, F store) {
     constexpr In lo = In(lib::numeric_limits<Out>::min()), hi = In(lib::numeric_limits<Out>::max());
@@ -235,6 +400,7 @@ template <typename In, typename Out, bool Sat> XF_INLINE Vec128 pack32(Context &
     });
     return r;
 }
+#endif
 // vpkpx: 8:8:8:8 to 1:5:5:5
 XF_INLINE Vec128 pack_pixel(const Vec128 &a, const Vec128 &b) {
     uint32_t x[8];
@@ -247,6 +413,30 @@ XF_INLINE Vec128 pack_pixel(const Vec128 &a, const Vec128 &b) {
     return r;
 }
 // UNPACK, sign-extended: elements off.. of b
+#if defined(__clang__)
+// (result lane p is guest element p ^ 1 (halfwords) or p (words), from
+// guest element that + off of b)
+template <uint32_t Off> XF_INLINE Vec128 unpack8_at(const Vec128 &b) {
+    typedef int8_t I8x16 __attribute__((vector_size(16)));
+    typedef int8_t I8x8 __attribute__((vector_size(8)));
+    typedef int16_t I16x8 __attribute__((vector_size(16)));
+    const I8x16 x = as<I8x16>(b);
+#define XF_AT(p) ((((p) ^ 1) + Off) ^ 3)
+    const I8x8 s = XF_SHUF8(x, x, XF_AT);
+#undef XF_AT
+    return vec_of(__builtin_convertvector(s, I16x8));
+}
+template <uint32_t Off> XF_INLINE Vec128 unpack16_at(const Vec128 &b) {
+    typedef int16_t I16x8 __attribute__((vector_size(16)));
+    typedef int16_t I16x4 __attribute__((vector_size(8)));
+    typedef int32_t I32x4 __attribute__((vector_size(16)));
+    const I16x8 x = as<I16x8>(b);
+    const I16x4 s = __builtin_shufflevector(x, x, Off ^ 1, (1 + Off) ^ 1, (2 + Off) ^ 1, (3 + Off) ^ 1);
+    return vec_of(__builtin_convertvector(s, I32x4));
+}
+XF_INLINE Vec128 unpack8(const Vec128 &b, uint32_t off) { return off ? unpack8_at<8>(b) : unpack8_at<0>(b); }
+XF_INLINE Vec128 unpack16(const Vec128 &b, uint32_t off) { return off ? unpack16_at<4>(b) : unpack16_at<0>(b); }
+#else
 XF_INLINE Vec128 unpack8(const Vec128 &b, uint32_t off) {
     Vec128 r;
     for (uint32_t n = 0; n < 8; n++) r.i16[n ^ 1] = int8_t(b.u8[(n + off) ^ 3]);
@@ -257,6 +447,7 @@ XF_INLINE Vec128 unpack16(const Vec128 &b, uint32_t off) {
     for (uint32_t n = 0; n < 4; n++) r.i32[n] = int16_t(b.u16[(n + off) ^ 1]);
     return r;
 }
+#endif
 // vupkhpx/vupklpx: 1:5:5:5 to 8:8:8:8, the 1 sign-extended
 inline Vec128 unpack_pixel(const Vec128 &b, uint32_t off) {
     Vec128 r;

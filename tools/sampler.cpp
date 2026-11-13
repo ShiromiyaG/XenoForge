@@ -86,6 +86,19 @@ bool generated_at(uint64_t address, std::string &name, uint64_t &displacement) {
     name = b, displacement = address - it->first;
     return true;
 }
+// Past 64 KB of the nearest generated function and within 16 MB: named after it, marked far (a long
+// function's code, or an op's helper the compiler kept out of line next to it), so that a game
+// library's long functions are not one nameless "module+?".
+bool generated_far(uint64_t address, std::string &name, uint64_t &displacement) {
+    auto it = std::upper_bound(generated.begin(), generated.end(), std::make_pair(address, UINT32_MAX));
+    if (it == generated.begin()) return false;
+    --it;
+    if (address - it->first >= 0x1000000) return false;
+    char b[40];
+    std::snprintf(b, sizeof(b), "xf_%08X (far)", it->second);
+    name = b, displacement = address - it->first;
+    return true;
+}
 
 // The suspended thread's stack by x64 unwind data (RtlVirtualUnwind), at
 // most 48 frames; a frame without unwind data is a leaf (its return address
@@ -229,6 +242,7 @@ void sample_loop(unsigned interval_us, DWORD only) {
 bool generated_name(std::string n) {
     // a module's functions sit in its namespace (xfm_default_xex::xf_822D5D18)
     if (size_t colons = n.rfind("::"); colons != std::string::npos) n = n.substr(colons + 2);
+    if (n.ends_with(" (far)")) n.resize(n.size() - 6);
     // <prefix>_<8 hex digits>: a generated function (xf_822D5D18, xfo_..., a DLL's prefix)
     if (n.size() < 10) return false;
     size_t u = n.size() - 9;
@@ -361,8 +375,15 @@ void stop_and_report(size_t top) {
         std::string name = "?", module = "?";
         IMAGEHLP_MODULE64 mod{sizeof(mod)};
         if (SymGetModuleInfo64(process, rip, &mod)) module = mod.ModuleName;
-        if (SymFromAddr(process, rip, &displacement, sym)) name = sym->Name;
-        else if (!generated_at(rip, name, displacement)) name = module + "+?";
+        if (SymFromAddr(process, rip, &displacement, sym)) {
+            name = sym->Name;
+        } else if (!generated_at(rip, name, displacement)) {
+            // else the offsets are from the module's base (its RVAs)
+            if (!generated_far(rip, name, displacement)) {
+                name = module + "+?";
+                if (mod.BaseOfImage && rip >= mod.BaseOfImage) displacement = rip - mod.BaseOfImage;
+            }
+        }
         Fn &f = fns[name];
         if (f.cat.empty()) f.cat = category(name, module);
         if (!f.base) f.base = rip - displacement;
@@ -437,6 +458,13 @@ void stop_and_report(size_t top) {
             }
             hot += b;
         }
+        // a far function's hottest address as its module's RVA, for a disassembly of the module
+        if (IMAGEHLP_MODULE64 mod{sizeof(mod)};
+            !offs.empty() && by_fn[k].second.ends_with(" (far)") && SymGetModuleInfo64(process, f.base, &mod)) {
+            char b[48];
+            std::snprintf(b, sizeof(b), " rva 0x%llx", (unsigned long long)(f.base + offs[0].second - mod.BaseOfImage));
+            hot += b;
+        }
         std::printf("  %5.2f%%  %-48s %s [%s ]\n", 100.0 * double(f.weight) / double(total), by_fn[k].second.c_str(),
                     f.cat.c_str(), hot.c_str());
     }
@@ -456,7 +484,7 @@ void stop_and_report(size_t top) {
         // (a return address is the instruction after the call: look one byte back)
         if (SymFromAddr(process, address - 1, &displacement, sym)) {
             name = sym->Name;
-        } else if (generated_at(address - 1, name, displacement)) {
+        } else if (generated_at(address - 1, name, displacement) || generated_far(address - 1, name, displacement)) {
         } else {
             IMAGEHLP_MODULE64 mod{sizeof(mod)};
             name = SymGetModuleInfo64(process, address, &mod) ? std::string(mod.ModuleName) + "+?" : "?";

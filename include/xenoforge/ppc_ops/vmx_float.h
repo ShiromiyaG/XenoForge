@@ -67,6 +67,18 @@ template <typename F> inline Vec128 lanes(const Vec128 &a, const Vec128 &b, cons
     for (int k = 0; k < 4; k++) r.u32[k] = f(a.u32[k], b.u32[k], c.u32[k]);
     return r;
 }
+// The same out of line: the whole-vector forms' way for a NaN operand, which
+// inline made each instruction of a long function of vector arithmetic a
+// dozen times its size (the lanes' NaN rules, unrolled), for a path the
+// common case never takes.
+template <typename F> [[gnu::cold, gnu::noinline]] Vec128 lanes_cold(const Vec128 &a, F f) { return lanes(a, f); }
+template <typename F> [[gnu::cold, gnu::noinline]] Vec128 lanes_cold(const Vec128 &a, const Vec128 &b, F f) {
+    return lanes(a, b, f);
+}
+template <typename F>
+[[gnu::cold, gnu::noinline]] Vec128 lanes_cold(const Vec128 &a, const Vec128 &b, const Vec128 &c, F f) {
+    return lanes(a, b, c, f);
+}
 
 // ---- arithmetic ----
 
@@ -151,21 +163,21 @@ template <bool J = false> inline Vec128 add4(const Vec128 &a, const Vec128 &b) {
     if constexpr (J) return lanes(a, b, add<true>);
     const U4 x = flush4(load4(a)), y = flush4(load4(b));
     if (any_nan4(x) || any_nan4(y)) [[unlikely]]
-        return lanes(a, b, add<false>);
+        return lanes_cold(a, b, add<false>);
     return store4(result4(F4(x) + F4(y)));
 }
 template <bool J = false> inline Vec128 sub4(const Vec128 &a, const Vec128 &b) {
     if constexpr (J) return lanes(a, b, sub<true>);
     const U4 x = flush4(load4(a)), y = flush4(load4(b));
     if (any_nan4(x) || any_nan4(y)) [[unlikely]]
-        return lanes(a, b, sub<false>);
+        return lanes_cold(a, b, sub<false>);
     return store4(result4(F4(x) - F4(y)));
 }
 template <bool J = false> inline Vec128 mul4(const Vec128 &a, const Vec128 &b) {
     if constexpr (J) return lanes(a, b, mul<true>);
     const U4 x = flush4(load4(a)), y = flush4(load4(b));
     if (any_nan4(x) || any_nan4(y)) [[unlikely]]
-        return lanes(a, b, mul<false>);
+        return lanes_cold(a, b, mul<false>);
     return store4(result4(F4(x) * F4(y)));
 }
 // a * c + b in each lane, rounded once: one instruction where the build has
@@ -184,7 +196,7 @@ template <bool J = false> inline Vec128 madd4(const Vec128 &a, const Vec128 &b, 
     if constexpr (J) return lanes(a, b, c, madd<true>);
     const U4 x = flush4(load4(a)), y = flush4(load4(b)), z = flush4(load4(c));
     if (any_nan4(x) || any_nan4(y) || any_nan4(z)) [[unlikely]]
-        return lanes(a, b, c, madd<false>);
+        return lanes_cold(a, b, c, madd<false>);
     return store4(result4(fma4(F4(x), F4(z), F4(y))));
 }
 // -(a * c - b), rounded once (nmsub above: the sign of a zero result is the negation's)
@@ -192,7 +204,7 @@ template <bool J = false> inline Vec128 nmsub4(const Vec128 &a, const Vec128 &b,
     if constexpr (J) return lanes(a, b, c, nmsub<true>);
     const U4 x = flush4(load4(a)), y = flush4(load4(b)), z = flush4(load4(c));
     if (any_nan4(x) || any_nan4(y) || any_nan4(z)) [[unlikely]]
-        return lanes(a, b, c, nmsub<false>);
+        return lanes_cold(a, b, c, nmsub<false>);
     return store4(result4(-lib::unfused(fma4(F4(x), F4(z), -F4(y)))));
 }
 
@@ -201,7 +213,7 @@ template <bool J = false> inline Vec128 max4(const Vec128 &a, const Vec128 &b) {
     if constexpr (J) return lanes(a, b, max<true>);
     const U4 x = flush4(load4(a)), y = flush4(load4(b));
     if (any_nan4(x) || any_nan4(y)) [[unlikely]]
-        return lanes(a, b, max<false>);
+        return lanes_cold(a, b, max<false>);
     const U4 greater = U4(F4(x) > F4(y)), less = U4(F4(y) > F4(x));
     return store4((x & greater) | (y & less) | (x & y & ~(greater | less)));
 }
@@ -209,7 +221,7 @@ template <bool J = false> inline Vec128 min4(const Vec128 &a, const Vec128 &b) {
     if constexpr (J) return lanes(a, b, min<true>);
     const U4 x = flush4(load4(a)), y = flush4(load4(b));
     if (any_nan4(x) || any_nan4(y)) [[unlikely]]
-        return lanes(a, b, min<false>);
+        return lanes_cold(a, b, min<false>);
     const U4 less = U4(F4(x) < F4(y)), greater = U4(F4(y) < F4(x));
     return store4((x & less) | (y & greater) | ((x | y) & ~(greater | less)));
 }
@@ -310,6 +322,39 @@ template <Round mode, bool J = false> inline uint32_t round(uint32_t v) {
     }
     return up ? t + fraction + 1 : t;
 }
+// The same bits from the whole vector in non-Java mode (a video decoder's
+// sound runs vrfin on every sample). A magnitude of 2^23 or more is integral
+// already and stays; below it, to nearest is (m + 2^23) - 2^23, rounded once
+// to an integer as the host rounds (to nearest even: the host's mode outside
+// the scalar unit's slow path, which puts it back), and the others start from
+// the exact conversion to an integer and back (truncation), a floor one less
+// where that is above the operand and a ceiling one more where below. The
+// sign is the operand's, as the bits' way keeps it (a negative fraction to
+// -0 or -1). A NaN goes lane by lane.
+template <Round mode> inline Vec128 round4(const Vec128 &a) {
+    const U4 v = flush4(load4(a));
+    if (any_nan4(v)) [[unlikely]]
+        return lanes_cold(a, round<mode, false>);
+    const U4 mag = v & 0x7FFFFFFFu, sign = v & 0x80000000u;
+    const U4 small = U4(mag < 0x4B000000u); // |v| < 2^23
+    F4 r;
+    if constexpr (mode == NEAREST) {
+        const F4 big = F4(U4{0x4B000000u, 0x4B000000u, 0x4B000000u, 0x4B000000u});
+        r = (F4(mag) + big) - big;
+    } else {
+        // the large lanes zeroed: the conversion is defined only in range
+        const F4 x = F4(v & small);
+        r = __builtin_convertvector(__builtin_convertvector(x, I4), F4);
+        const U4 one = U4{0x3F800000u, 0x3F800000u, 0x3F800000u, 0x3F800000u};
+        if constexpr (mode == FLOOR) r -= F4(U4(r > x) & one);
+        if constexpr (mode == CEIL) r += F4(U4(r < x) & one);
+    }
+    return store4((small & (sign | (U4(r) & 0x7FFFFFFFu))) | (~small & v));
+}
+template <Round mode, bool J> inline Vec128 round_vec(const Vec128 &a) {
+    if constexpr (J) return lanes(a, round<mode, true>);
+    else return round4<mode>(a);
+}
 
 // ---- conversions ----
 
@@ -342,6 +387,21 @@ template <bool J = false> inline uint32_t to_unsigned(uint32_t v, uint32_t uimm,
     return x < 1.0 ? 0u : uint32_t(x);
 }
 template <bool J = false> inline Vec128 to_signed(const Vec128 &a, uint32_t uimm, uint8_t &vscr_sat) {
+    if constexpr (!J) {
+        // The whole vector in non-Java mode, the same bits: the operand
+        // flushed, scaled by 2^uimm in single (exact: a power of two of 2^31
+        // at most, and a product past single's range is past 2^31 too), the
+        // lanes at 2^31 or more and below -2^31 saturated, a NaN's 0, and the
+        // rest truncated by the conversion, given only the lanes in range.
+        const F4 scale = F4(U4{0, 0, 0, 0} + ((127 + (uimm & 31)) << 23));
+        const F4 x = F4(flush4(load4(a))) * scale;
+        const F4 two31 = F4(U4{0x4F000000u, 0x4F000000u, 0x4F000000u, 0x4F000000u});
+        const U4 high = U4(x >= two31), low = U4(x < -two31), nan = U4(x != x);
+        const U4 out = high | low | nan;
+        const I4 t = __builtin_convertvector(F4(U4(x) & ~out), I4);
+        if (__builtin_reduce_or(high | low)) vscr_sat = 1;
+        return store4((U4(t) & ~out) | (high & 0x7FFFFFFFu) | (low & 0x80000000u));
+    }
     bool sat = false;
     Vec128 r = lanes(a, [&](uint32_t v) { return to_signed<J>(v, uimm, sat); });
     if (sat) vscr_sat = 1;
@@ -641,14 +701,14 @@ XF_OP(vlogefp128) { XF_VFP(c.v[VX128_3_VD128] = vfp::lanes(c.v[VX128_3_VB128], v
 
 // ---- rounding ----
 
-XF_OP(vrfim) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VB], vfp::round<vfp::FLOOR, J>)); }
-XF_OP(vrfim128) { XF_VFP(c.v[VX128_3_VD128] = vfp::lanes(c.v[VX128_3_VB128], vfp::round<vfp::FLOOR, J>)); }
-XF_OP(vrfin) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VB], vfp::round<vfp::NEAREST, J>)); }
-XF_OP(vrfin128) { XF_VFP(c.v[VX128_3_VD128] = vfp::lanes(c.v[VX128_3_VB128], vfp::round<vfp::NEAREST, J>)); }
-XF_OP(vrfip) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VB], vfp::round<vfp::CEIL, J>)); }
-XF_OP(vrfip128) { XF_VFP(c.v[VX128_3_VD128] = vfp::lanes(c.v[VX128_3_VB128], vfp::round<vfp::CEIL, J>)); }
-XF_OP(vrfiz) { XF_VFP(c.v[i.VX.VD] = vfp::lanes(c.v[i.VX.VB], vfp::round<vfp::TRUNC, J>)); }
-XF_OP(vrfiz128) { XF_VFP(c.v[VX128_3_VD128] = vfp::lanes(c.v[VX128_3_VB128], vfp::round<vfp::TRUNC, J>)); }
+XF_OP(vrfim) { XF_VFP(c.v[i.VX.VD] = vfp::round_vec<vfp::FLOOR, J>(c.v[i.VX.VB])); }
+XF_OP(vrfim128) { XF_VFP(c.v[VX128_3_VD128] = vfp::round_vec<vfp::FLOOR, J>(c.v[VX128_3_VB128])); }
+XF_OP(vrfin) { XF_VFP(c.v[i.VX.VD] = vfp::round_vec<vfp::NEAREST, J>(c.v[i.VX.VB])); }
+XF_OP(vrfin128) { XF_VFP(c.v[VX128_3_VD128] = vfp::round_vec<vfp::NEAREST, J>(c.v[VX128_3_VB128])); }
+XF_OP(vrfip) { XF_VFP(c.v[i.VX.VD] = vfp::round_vec<vfp::CEIL, J>(c.v[i.VX.VB])); }
+XF_OP(vrfip128) { XF_VFP(c.v[VX128_3_VD128] = vfp::round_vec<vfp::CEIL, J>(c.v[VX128_3_VB128])); }
+XF_OP(vrfiz) { XF_VFP(c.v[i.VX.VD] = vfp::round_vec<vfp::TRUNC, J>(c.v[i.VX.VB])); }
+XF_OP(vrfiz128) { XF_VFP(c.v[VX128_3_VD128] = vfp::round_vec<vfp::TRUNC, J>(c.v[VX128_3_VB128])); }
 
 // ---- conversions (the immediate in VA, or VX128_3's IMM) ----
 

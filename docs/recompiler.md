@@ -1221,6 +1221,64 @@ mapping of that view without its offset, which Windows' 64 KB mapping
 granularity does not give. Neither's gain was measured: the checks cannot
 be removed to time what they cost.
 
+## Video decoding: permutes, packs and saturation on whole vectors (2026-11-13)
+
+A game's startup videos (a common video codec's decoder, VMX integer code)
+ran at 7 to 15 frames a second with the GPU idle: the decoder's thread was
+a whole host core. Its hottest function (1,980 instructions: `lvx128`,
+`stvx128`, `vperm128`, `vaddshs`, `vsubshs`, `vsrah`, merges, `vsldoi128`,
+`vpkshus128`) was 61% of that thread, and its host code 234 KB.
+
+`boot --profile` named it only after a change to the sampler: a game
+library has no symbols, and an address more than 64 KB past the nearest
+generated function was "module+?" (two thirds of the thread). Such an
+address is now named after that function, marked `(far)`, with its RVA in
+the module (`tools/sampler.cpp`, `generated_far`), which a disassembly of the
+library (`llvm-objdump -d --start-address`) places; the function's bounds come
+from the unwind table (`llvm-readobj --unwind`).
+
+What it was made of, compiled alone and inside that function:
+- `vperm` byte by byte: 16 extracts, 16 loads and 16 byte stores (80 host
+  instructions), and the next instruction's vector read of the result,
+  right after its byte stores, cannot have them forwarded and stalls. Now
+  SSSE3's `pshufb` on each source and a select by bit 4, as Xenia's backend
+  does (11 instructions), where the host has it (every x86-64 level a game
+  library is built at); elsewhere the loop.
+- The saturating adds' VSCR[SAT] test, the merges and the packs' final
+  shuffles, written as loops over lanes for the vectorizer: alone each came
+  out as a few vector instructions, but inside the long function the
+  vectorizer gave some of them back as an extract and a scalar add a lane
+  (1,496 `vpextrw` in that one function). Now clang's vector types:
+  `__builtin_elementwise_add_sat`/`sub_sat` and a compare with the wrapped
+  sum, fixed `__builtin_shufflevector`s for the merges, unpacks and
+  `vsldoi` (one shuffle for each of the 16 shifts; the loop left some
+  shifts a byte at a time), and the packs clamped with
+  `__builtin_elementwise_min`/`max` and narrowed with
+  `__builtin_convertvector`. Portable: SSE or NEON as the host has, no
+  intrinsics; other compilers keep the loops.
+- The sound's `vrfin128` and `vcfpsxws128` lane by lane on the bits: now on
+  the whole vector in non-Java mode (`round4`: to nearest by adding and
+  subtracting 2^23, the host rounding to nearest as everywhere outside the
+  scalar unit's slow path; floor, ceiling and truncation from the exact
+  conversion to an integer and back; `to_signed`: the scale in single,
+  exact, and the conversion given only the lanes in range). Checked against
+  the lanes' form on 16 million lanes of random and edge values at each
+  CPU level.
+- The whole-vector float operations' way for a NaN operand (the lanes'
+  rules, unrolled) was inlined into every instruction: a 190-instruction
+  function of vector float code was 14,500 host instructions. It is out of
+  line now (`lanes_cold`): 5,450.
+
+The hot function's host code went from 44,700 lines of disassembly to
+12,100. The instruction tests pass as before, interpreted and recompiled.
+The game's start, `boot --render --rates`, 40 s, the two libraries
+interleaved three times each on a quiet machine (a Zen 3 processor,
+nothing else building or running): the second video 13.4 to 14.3 swaps a
+second (7 to 25 s from the start) before, 29.1 to 29.3 after (the game's
+cap of 30, held but for a few seconds at 24 to 27); the decoder's thread
+21.5 to 21.7 s of host CPU in the 40 s before, 7.9 to 8.7 after; swaps by
+40 s, 866 to 903 before, 1,169 to 1,172 after.
+
 ## The calls' cost, measured before a new emitter (2026-11-11)
 
 Asked: whether to emit LLVM IR instead of C++, for a calling convention of
