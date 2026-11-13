@@ -62,6 +62,8 @@ A game's generated code is built with `-DXF_GAMES="<name>;..."` from what
 - [docs/runtime.md](docs/runtime.md): the kernel, sound, player and launcher.
 - [docs/renderer.md](docs/renderer.md): the GPU.
 - [docs/input.md](docs/input.md): input.
+- [CONTRIBUTING.md](CONTRIBUTING.md): the rules for a change, building,
+  testing, and reporting problems.
 
 ## References
 
