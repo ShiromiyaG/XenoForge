@@ -29,7 +29,8 @@
 // controls) and --start N starts the Nth game as Play does, --player-arg
 // <arg> (repeatable) adds an argument to the player's command line
 // (--quit-after 20, say), --build-jobs N the compilers a Prepare runs at once
-// (4 unless told; each takes a gigabyte or two). For the pictures of the
+// (unless told, as many as the memory free and the cores allow:
+// game_build.h's JobPolicy). For the pictures of the
 // windows: --demo-games lists six titles instead of a folder's discs,
 // --demo-progress shows a fake build under way (--demo-fail: one
 // that fails, --demo-speed X: times real time, --show-log: its log open),

@@ -863,6 +863,33 @@ guest's registers in locals synced with the context around calls, does
 not meet this: its longest function in a game we built (21,742 lines of C)
 compiles in 12 s, GVN 0.5 s.
 
+**Regions in parts too** (2026-11-12, `place_regions`): a long function
+with branches throughout has no plain stretch of 256, and stayed whole: a
+12,000-instruction function of game B and one of game D's DLLs took 48 s
+of clang each alone, the build's longest jobs. What the plain stretches
+leave of a long function now goes into parts by
+regions: consecutive instructions with one entry (the first) and one exit
+(the instruction after the last), every branch inside going to an
+instruction inside or to the exit, every branch from outside to the
+first, and nothing a part cannot do for its function (a return, a tail
+call, a dispatch that returns, a table switch, a stack switch; calls are
+fine). The part has its own labels, its first instruction's (a loop back
+to its start) and its exit's. Not in a function whose returns are checked,
+with resume sites or a port's hooks. Those two functions: 96 s of clang to
+15 s, their objects 3% smaller. See "The recompile step's memory" below
+for a whole disc.
+
+**Parts from 2,048 instructions** (4,096 before, 2026-11-12): a function of
+game A of 3,516 instructions, mostly loads, stores and floating point with
+180 branches, took 12.7 s of clang and 0.62 GB alone (the largest peak of
+the disc), in parts 4.1 s and 0.10 GB. On game A the threshold changes 34
+functions; with the regions above, the 24 files they changed went from
+333 s of clang to 246 s and from 0.61 GB at most to 0.33. From 1,024
+instructions (178 more functions in game A) another 10% of the files it
+changes (329 s to 296 s, a third of them measured), at the cost of a part's
+call in many more functions of ordinary length; not taken without a
+measure of the game's speed.
+
 **Registers in locals, weighed and not done** (2026-11-09). With the long
 functions in parts, clang's time on an ordinary file has no one cost that
 locals would remove (`-ftime-report`, game A, two files of 34,000 lines:
@@ -1352,3 +1379,90 @@ commonest instructions (each inlined helper is compiled once a use), and
 starting the game on the interpreter while the library is built (the
 runtime falls back to it for code without a function already), which is
 the owner's to decide: it is slow while it lasts.
+
+## The recompile step's memory (2026-11-12)
+
+A build at `-j 8` once ran a 16 GB machine out of memory, and the recompile
+step ran a fixed four compilers. Measured first: each clang's peak working
+set (its commit charge is the same within a few percent), from the build
+itself (`BuildReport::compiled`, `xfbuild --compile-stats <file.tsv>`: the
+CPU time and peak of each file; Windows from the process's counters, Linux
+from `wait4`'s `rusage`).
+
+- Game D, all 284 files, three at once: most functions files 0.13 to
+  0.26 GB; the one with the 27,500-instruction function (in 29 parts) 0.56
+  GB, of which the function alone 0.47; a module's `table.cpp` 0.33 GB.
+- Games A and G, their largest files (1.3 to 1.8 MB of source, functions up
+  to 9,600 instructions): 0.20 to 0.23 GB. The longest functions of games
+  B, C and H (8,000 to 12,000 instructions): 0.18 to 0.32 GB.
+- The link (lld, about 300 objects into a 186 MB library): 0.44 GB for
+  game A, 0.16 for game B.
+
+So no job of the step needed more than 0.65 GB (game A's largest, a
+function of 3,516 instructions: see "Parts from 2,048 instructions"; 0.35
+GB since), and eight of them about 2
+GB: the out-of-memory was the step beside other builds, not the step
+alone. Against the source's size, a functions file peaked at 128 MB plus
+26 MB a megabyte of source (the median), 152 MB at most.
+
+**The jobs** (`game_build.h`'s `JobPolicy`, `BuildOptions::jobs` 0, the
+default for `xfbuild` and the launcher): a compiler is expected to need
+160 MB plus 192 bytes a byte of its source (`job_memory`: every file
+measured fits, with room); the limit is the cores and what the memory free
+at the start allows, less a reserve for the rest of the machine (an eighth
+of it, a gigabyte at least), at the largest ordinary file's need (2 MB of
+source: 544 MB); past the first compiler, another starts only while the
+memory free now, less what the running ones are still expected to grow
+by (their expected need less what they hold), leaves the reserve and the
+next one's need, checked as each ends and every tenth of a second. One
+always runs. The memory free is `GlobalMemoryStatusEx` on Windows and
+`/proc/meminfo`'s `MemAvailable` on Linux and Android; where it cannot be
+read the cores alone, four at most. A given count (`--jobs`,
+`--build-jobs`) wins and is not checked against the memory. The build says
+what it chose and why, as the first line of its compiling stage: "up to 5
+compilers at once: 5.1 GB of 15.8 GB free, 2.0 GB kept for the rest, up to
+0.5 GB a compiler (5), 12 cores; another starts only while the memory
+allows".
+
+**What a guest instruction becomes**, counted in the emitted code (the
+instructions of the semantics, `I(...)`, and what the emitter writes
+itself):
+
+| | game A | game B | game D |
+| --- | --- | --- | --- |
+| instructions of the semantics | 3,858,983 | 1,396,088 | 3,669,822 |
+| memory accesses | 1,515,858 | 481,062 | 1,276,785 |
+| of them with an MMIO check | 771,752 | 259,319 | 611,861 |
+| CR field updates | 345,330 | 140,286 | 303,604 |
+| conditional branches | 434,875 | 160,049 | 378,017 |
+| calls (and tail calls) | 309,990 (44,487) | 90,082 (13,059) | 384,098 (38,278) |
+| floating point with a slow path | 162,805 | 30,700 | 73,846 |
+| VMX | 63,124 | 79,619 | 142,033 |
+| yield points (back edges, indirect calls) | 67,286, 55,500 | 34,504, 8,300 | 74,917, 52,417 |
+
+What each kind costs the compiler, bounded by leaving it out (the
+headers edited, results wrong; four ordinary files of games A, B, D and G,
+about 95,000 instructions, compiled one at a time; the objects' size is
+exact, the CPU time within about 5% under the machine's load): the
+physical view's offset in every access (`host`: `ea >= 0xE0000000`) 19% of
+the objects and about 10% of the time; the MMIO check 9.5% of the objects
+and no time measurable; the floating point slow paths, condition and
+call, 4.5% and none measurable; the yield points 2.7% and none
+measurable. The slow paths are already out of line (`mmio_read`,
+`fp_arith_value`, `yield_hook`: cold, never inlined); moving the rest of
+the rare paths out (the single-precision tie's correction, the denormal
+operands' test) and writing a CR field as one 32-bit store instead of four
+bytes made the objects no smaller and the time no shorter, so they were
+not kept. The two large ones are the semantics of every access: the
+physical view's offset could go only by mapping the 0xE0000000 view 4 KB
+apart, which the hosts' 64 KB (Windows) and 16 KB (some ARM64) mapping
+granularity does not allow, and the MMIO check only by catching the
+accesses with a fault, as Xenia does.
+
+So what shortened the build was the long functions (above, "Regions in
+parts too" and "Parts from 2,048 instructions"). The regions alone (parts
+still from 4,096): on game B, the 11 files they changed went from 204 and
+198 s of clang to 106 and 102 s; on game D, its 9 files from 155 s to 76
+s, the longest single file from 97 s to 25 s. Both, on game A: its 24
+files from 333 s to 246 s. (Each set compiled one file at a time, old and
+new interleaved, under other agents' builds.)

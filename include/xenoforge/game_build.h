@@ -92,6 +92,18 @@ struct BuildReport {
     // the project file the library was emitted with (BuildOptions::project):
     // a digest of what it says, empty without one ("project <digest>")
     std::string project;
+    // What this build's compilers took (not kept in the report file): each
+    // file compiled, with clang's CPU time and the most memory it held (its
+    // peak working set, resident set on Linux); the files compiled before
+    // and kept are not in it.
+    struct Compiled {
+        std::string file; // relative to the work directory's src
+        double cpu_seconds = 0;
+        uint64_t peak_bytes = 0;
+    };
+    std::vector<Compiled> compiled;
+    Compiled linked;  // the linker's, the same way
+    std::string jobs; // the jobs policy's choice and why, as the build said it
 };
 
 // the build report of the library cached for this digest at this interface
@@ -163,7 +175,9 @@ struct ShaderStep {
 };
 
 struct BuildOptions {
-    unsigned jobs = 4;               // compilers at once (more ran out of memory on 16 GB)
+    // compilers at once; 0: chosen from the memory free and the cores
+    // (JobPolicy below), a new one started only while enough stays free
+    unsigned jobs = 0;
     std::filesystem::path toolchain; // where clang and lld are; empty: find_toolchain's search
     bool keep_work = false;          // keep the emitted code and objects (they are hundreds of MB)
     // keep the objects (<cache>/work/<digest>/obj, about 0.7 MB a file of
@@ -213,6 +227,31 @@ bool prepare_game(const std::filesystem::path &disc, const std::filesystem::path
 bool build_library(const std::filesystem::path &src_root, const std::vector<std::string> &sources,
                    const std::filesystem::path &work, const std::filesystem::path &library, Progress &progress,
                    std::string &error, const BuildOptions &options = {});
+
+// How many compilers the recompile step runs at once (BuildOptions::jobs 0).
+// A clang on a file of generated code holds up to about a gigabyte; more
+// than the memory free makes the machine page or the system end processes.
+// So the limit is the cores and what the memory free at the start allows,
+// less a reserve for the rest of the machine, and each compiler past the
+// first starts only while the memory free, less what the running ones are
+// expected to grow by, still leaves the next one's room.
+struct JobPolicy {
+    unsigned cores = 1;
+    uint64_t total_bytes = 0, available_bytes = 0; // 0: unknown
+    uint64_t reserve_bytes = 0;                    // left to the rest of the machine
+    uint64_t job_bytes = 0;                        // what a compiler is expected to need, at most
+    unsigned limit = 1;
+    std::string why; // one line: the choice and its reasons
+};
+// the host's memory (Windows: GlobalMemoryStatusEx; Linux and Android:
+// /proc/meminfo's MemAvailable and MemTotal); 0 when unknown
+uint64_t available_memory();
+uint64_t total_memory();
+// the policy for these numbers (`explicit_jobs` nonzero wins), and for the host's
+JobPolicy job_policy(unsigned explicit_jobs, unsigned cores, uint64_t total_bytes, uint64_t available_bytes);
+JobPolicy job_policy(unsigned explicit_jobs = 0);
+// what a compiler on a source of this many bytes is expected to need at most
+uint64_t job_memory(uint64_t source_bytes);
 
 // The directory holding clang and lld: `hint` (or its bin/), XF_TOOLCHAIN
 // (or its bin/), toolchain/bin beside the executable (what the launcher

@@ -47,10 +47,13 @@
 
 #ifdef _WIN32
 #include <windows.h>
+// (after windows.h) K32GetProcessMemoryInfo, in kernel32
+#include <psapi.h>
 #else
 #include <csignal>
 #include <fcntl.h>
 #include <spawn.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern char **environ;
@@ -294,6 +297,18 @@ std::string digest_of(const recomp::Project &p) {
 // code's header to be precompiled for them (Build::compile)
 constexpr size_t PCH_MINIMUM_FILES = 4;
 
+// The jobs policy's numbers (job_memory, job_policy): a compiler's memory
+// by its source's size, the size of the largest ordinary functions file
+// (64 KB of the image), and the compilers at once where the memory free
+// cannot be read. Measured on three discs (docs/recompiler.md, "The
+// recompile step's memory"): a functions file peaked at 128 MB plus 26 MB
+// a megabyte of source (the median), 152 at most, so 160 MB and 192 bound
+// every one with room.
+constexpr uint64_t JOB_FIXED_BYTES = 160ull << 20;
+constexpr uint64_t JOB_BYTES_PER_SOURCE_BYTE = 192;
+constexpr uint64_t JOB_LARGEST_SOURCE_BYTES = 2ull << 20;
+constexpr unsigned UNKNOWN_MEMORY_JOBS = 4;
+
 bool is_functions_file(const fs::path &source) { return utf8(source.filename()).starts_with("functions_"); }
 
 // clang's first error in its log, else its exit code
@@ -407,7 +422,31 @@ struct Process {
     pid_t pid = -1;
 #endif
     size_t job = 0;
+    uint64_t expected = 0; // the memory it is expected to need at most (job_memory)
 };
+
+// what an ended process took: its CPU time and its peak working set
+// (resident set)
+struct ProcessStats {
+    double cpu_seconds = 0;
+    uint64_t peak_bytes = 0;
+};
+
+// the memory a running process holds now (its working set, resident set)
+uint64_t memory_of(const Process &p) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (!p.handle || !K32GetProcessMemoryInfo(p.handle, &counters, sizeof(counters))) return 0;
+    return counters.WorkingSetSize;
+#else
+    if (p.pid < 0) return 0;
+    std::ifstream f("/proc/" + std::to_string(p.pid) + "/statm");
+    uint64_t size = 0, resident = 0;
+    if (!(f >> size >> resident)) return 0;
+    const long page = sysconf(_SC_PAGESIZE);
+    return page > 0 ? resident * uint64_t(page) : 0;
+#endif
+}
 
 bool start(const fs::path &program, const std::vector<std::string> &args, const fs::path &log, Process &p,
            std::string &error) {
@@ -481,9 +520,9 @@ void end(Process &p) {
 #endif
 }
 
-// Waits up to `ms` for one of the processes to end: its index and exit code,
-// or -1 when none did.
-int wait_any(std::vector<Process> &running, int ms, int &exit_code) {
+// Waits up to `ms` for one of the processes to end: its index, exit code and
+// what it took, or -1 when none did.
+int wait_any(std::vector<Process> &running, int ms, int &exit_code, ProcessStats *stats = nullptr) {
 #ifdef _WIN32
     std::vector<HANDLE> handles;
     for (const Process &p : running) handles.push_back(p.handle);
@@ -492,6 +531,15 @@ int wait_any(std::vector<Process> &running, int ms, int &exit_code) {
     int k = int(r - WAIT_OBJECT_0);
     DWORD code = 1;
     GetExitCodeProcess(running[size_t(k)].handle, &code);
+    if (stats) {
+        FILETIME created, exited, kernel, user;
+        auto ticks = [](const FILETIME &t) { return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+        if (GetProcessTimes(running[size_t(k)].handle, &created, &exited, &kernel, &user))
+            stats->cpu_seconds = double(ticks(kernel) + ticks(user)) * 1e-7;
+        PROCESS_MEMORY_COUNTERS counters{};
+        if (K32GetProcessMemoryInfo(running[size_t(k)].handle, &counters, sizeof(counters)))
+            stats->peak_bytes = counters.PeakWorkingSetSize;
+    }
     CloseHandle(running[size_t(k)].handle);
     running[size_t(k)].handle = nullptr;
     exit_code = int(code);
@@ -500,9 +548,15 @@ int wait_any(std::vector<Process> &running, int ms, int &exit_code) {
     for (int waited = 0;; waited += 20) {
         for (size_t k = 0; k < running.size(); k++) {
             int status = 0;
-            if (waitpid(running[k].pid, &status, WNOHANG) == running[k].pid) {
+            struct rusage usage{};
+            if (wait4(running[k].pid, &status, WNOHANG, &usage) == running[k].pid) {
                 running[k].pid = -1;
                 exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+                if (stats) {
+                    stats->cpu_seconds = double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+                                         double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) * 1e-6;
+                    stats->peak_bytes = uint64_t(usage.ru_maxrss) * 1024; // kilobytes on Linux
+                }
                 return int(k);
             }
         }
@@ -736,6 +790,10 @@ class Build {
 
     // what the build left out (the emission's and clang's), in order
     std::vector<LeftOutFunction> left_;
+    // what each compiler took, and the jobs policy's line (BuildReport)
+    std::vector<BuildReport::Compiled> compiled_;
+    BuildReport::Compiled linked_; // the linker's (its file the library)
+    JobPolicy policy_;
 
   private:
     // the jobs of `batch` compiled (what a stopped build compiled already
@@ -757,6 +815,24 @@ class Build {
     }
     // (BuildOptions::fail_compile) a line clang rejects put in those functions
     void force_failures(const std::vector<Job> &jobs);
+    // whether another compiler, on `next`, starts beside the running ones
+    // (JobPolicy): one always runs; past it the policy's limit, and unless
+    // the jobs were given, the memory free now less what the running ones
+    // are still expected to grow by (re-checked as they end and every tenth
+    // of a second while one waits)
+    bool has_room(const std::vector<Process> &running, const Job &next) const {
+        if (running.empty()) return true;
+        if (running.size() >= policy_.limit) return false;
+        if (options_.jobs) return true;
+        const uint64_t available = available_memory();
+        if (!available) return true; // unknown: the limit alone
+        uint64_t growth = 0;
+        for (const Process &p : running) {
+            const uint64_t now = memory_of(p);
+            growth += p.expected > now ? p.expected - now : 0;
+        }
+        return available > growth + policy_.reserve_bytes + job_memory(next.size);
+    }
 
     Progress &progress_;
     const BuildOptions &options_;
@@ -827,6 +903,7 @@ bool Build::compile_and_link(const fs::path &src_root, const std::vector<std::st
     add(entry, "xf_library_entry.cpp");
     if (!options_.fail_compile.empty()) force_failures(jobs);
     const fs::path clang = *bin / (std::string("clang") + EXE);
+    policy_ = job_policy(options_.jobs);
     std::vector<size_t> all(jobs.size()), failed;
     std::iota(all.begin(), all.end(), size_t(0));
     if (!compile(clang, work, jobs, all, failed, error)) return false;
@@ -966,6 +1043,9 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     fs::rename(built, library, ec);
     if (ec) return fail(error, "cannot move the library into " + utf8(library) + ": " + ec.message());
     result.left_out = left_;
+    result.compiled = compiled_;
+    result.linked = linked_;
+    result.jobs = policy_.why;
     if (options_.shader_step) shaders(disc, cache, xex, digest, result);
     if (!write_report(report_path(cache, digest, level_), library, result))
         return fail(error, "cannot write " + utf8(report_path(cache, digest, level_)));
@@ -1039,7 +1119,9 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
         }
     }
     const uint64_t total = batch.size();
-    report(Stage::Compiling, done, total, done ? std::to_string(done) + " compiled before" : "");
+    // (the first report says what the jobs policy chose, and why)
+    report(Stage::Compiling, done, total,
+           (done ? std::to_string(done) + " compiled before; " : std::string()) + policy_.why);
     const std::vector<std::string> flags = compile_flags(level_);
     const std::string include = "-I" + utf8(work / "include");
     // The generated code's header precompiled once for the functions files
@@ -1081,7 +1163,7 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
             running.clear();
             break;
         }
-        while (next < todo.size() && running.size() < std::max(1u, options_.jobs)) {
+        while (next < todo.size() && has_room(running, jobs[todo[next]])) {
             const Job &j = jobs[todo[next]];
             fs::create_directories(j.object.parent_path(), ec);
             fs::remove(j.object, ec); // (one clang rejects leaves none behind)
@@ -1098,18 +1180,21 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
             args.push_back(utf8(j.object));
             Process p;
             p.job = todo[next++];
+            p.expected = job_memory(j.size);
             if (!start(clang, args, j.log, p, failure)) break;
             running.push_back(p);
         }
         if (running.empty()) continue;
         int code = 0;
-        int k = wait_any(running, 100, code);
+        ProcessStats stats;
+        int k = wait_any(running, 100, code, &stats);
         if (k < 0) continue;
         const size_t index = running[size_t(k)].job;
         Job &j = jobs[index];
         running.erase(running.begin() + k);
         j.code = code;
         const std::string name = utf8(fs::relative(j.object, work / "obj", ec).replace_extension(".cpp"));
+        compiled_.push_back({name, stats.cpu_seconds, stats.peak_bytes});
         if (code != 0) {
             failed.push_back(index);
             fs::remove(j.object, ec);
@@ -1316,7 +1401,8 @@ bool Build::link(const fs::path &bin, const fs::path &work, const std::vector<Jo
     std::string why;
     if (!start(lld, args, log, running[0], why)) return fail(error, why);
     int code = 0;
-    while (wait_any(running, 100, code) < 0) {
+    ProcessStats stats;
+    while (wait_any(running, 100, code, &stats) < 0) {
         if (cancelled()) {
             end(running[0]);
             return fail(error, "cancelled");
@@ -1324,6 +1410,7 @@ bool Build::link(const fs::path &bin, const fs::path &work, const std::vector<Jo
     }
     if (code != 0 || !fs::exists(out, ec))
         return fail(error, "lld failed (" + std::to_string(code) + "):\n" + read_head(log, 30));
+    linked_ = {utf8(out.filename()), stats.cpu_seconds, stats.peak_bytes};
     report(Stage::Linking, 1, 1, utf8(out.filename()));
     return true;
 }
@@ -1465,7 +1552,12 @@ bool build_library(const fs::path &src_root, const std::vector<std::string> &sou
     Build build(progress, options);
     try {
         if (!build.compile_and_link(src_root, sources, work, library, error)) return false;
-        if (options.report) *options.report = BuildReport{build.left_, 0, 0};
+        if (options.report) {
+            *options.report = BuildReport{build.left_, 0, 0};
+            options.report->compiled = build.compiled_;
+            options.report->linked = build.linked_;
+            options.report->jobs = build.policy_.why;
+        }
         build.report(Stage::Done, 1, 1, utf8(library));
         return true;
     } catch (const std::exception &e) {
@@ -1485,6 +1577,87 @@ bool prepare_game(const fs::path &disc, const fs::path &cache_dir, Progress &pro
     } catch (const std::exception &e) {
         return build.fail(error, std::string("the build failed: ") + e.what());
     }
+}
+
+namespace {
+// /proc/meminfo's line for `key` ("MemAvailable"), in bytes; 0 without it
+[[maybe_unused]] uint64_t meminfo(std::string_view key) {
+    std::ifstream f("/proc/meminfo");
+    std::string name, unit;
+    uint64_t kilobytes = 0;
+    while (f >> name >> kilobytes) {
+        std::getline(f, unit);
+        if (name.size() == key.size() + 1 && name.starts_with(key) && name.back() == ':') return kilobytes * 1024;
+    }
+    return 0;
+}
+
+std::string gigabytes(uint64_t bytes) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.1f GB", double(bytes) / double(1ull << 30));
+    return text;
+}
+} // namespace
+
+uint64_t available_memory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
+#else
+    return meminfo("MemAvailable"); // Linux since 3.14, and Android
+#endif
+}
+
+uint64_t total_memory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
+#else
+    return meminfo("MemTotal");
+#endif
+}
+
+uint64_t job_memory(uint64_t source_bytes) {
+    // measured (docs/recompiler.md, "The recompile step's memory"): clang's
+    // peak on a functions file is about a fixed part (the process, the
+    // precompiled header) and a part growing with the file
+    return JOB_FIXED_BYTES + source_bytes * JOB_BYTES_PER_SOURCE_BYTE;
+}
+
+JobPolicy job_policy(unsigned explicit_jobs, unsigned cores, uint64_t total_bytes, uint64_t available_bytes) {
+    JobPolicy p;
+    p.cores = std::max(1u, cores);
+    p.total_bytes = total_bytes;
+    p.available_bytes = available_bytes;
+    // the rest of the machine keeps an eighth of it, at least a gigabyte
+    p.reserve_bytes = std::max<uint64_t>(1ull << 30, total_bytes / 8);
+    p.job_bytes = job_memory(JOB_LARGEST_SOURCE_BYTES);
+    if (explicit_jobs) {
+        p.limit = explicit_jobs;
+        p.why = std::to_string(p.limit) + " compilers at once (given)";
+        return p;
+    }
+    if (!available_bytes) {
+        p.limit = std::min(p.cores, UNKNOWN_MEMORY_JOBS);
+        p.why = std::to_string(p.limit) + " compilers at once: the memory free is unknown, " +
+                std::to_string(p.cores) + " cores";
+        return p;
+    }
+    const uint64_t room = available_bytes > p.reserve_bytes ? available_bytes - p.reserve_bytes : 0;
+    const unsigned by_memory = unsigned(std::max<uint64_t>(1, room / p.job_bytes));
+    p.limit = std::min(p.cores, by_memory);
+    p.why = "up to " + std::to_string(p.limit) + " compilers at once: " + gigabytes(available_bytes) + " of " +
+            gigabytes(total_bytes) + " free, " + gigabytes(p.reserve_bytes) + " kept for the rest, up to " +
+            gigabytes(p.job_bytes) + " a compiler (" + std::to_string(by_memory) + "), " + std::to_string(p.cores) +
+            " cores; another starts only while the memory allows";
+    return p;
+}
+
+JobPolicy job_policy(unsigned explicit_jobs) {
+    unsigned cores = std::thread::hardware_concurrency();
+    return job_policy(explicit_jobs, cores ? cores : UNKNOWN_MEMORY_JOBS, total_memory(), available_memory());
 }
 
 std::optional<fs::path> find_toolchain(const fs::path &hint) {

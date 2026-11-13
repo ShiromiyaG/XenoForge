@@ -2680,8 +2680,9 @@ title, version, digest, the player each starts in), without a window;
 `--select N` selects a game, `--controls` opens its controls' tab,
 `--start N` presses
 its Play (a disc not yet built is prepared first, then `--keys a` plays it),
-`--build-jobs N` the compilers a Prepare runs at once (4 by default; each
-takes a gigabyte or two), `--player-arg` adds to the player's command line (e.g.
+`--build-jobs N` the compilers a Prepare runs at once (by default as many
+as the memory free and the cores allow: docs/recompiler.md, "The recompile
+step's memory"), `--player-arg` adds to the player's command line (e.g.
 `--quit-after 20`), `--quit-after S` closes the launcher after S seconds
 once a game it started has ended, printing how it ended, and `--screenshot`
 saves its window's last picture.
@@ -2868,8 +2869,9 @@ headers and the library's entry (`xf_library_entry.cpp`) beside them; each
 file compiled by its own clang process (`-std=c++20 -O2 -g0 -w
 -fno-math-errno -nostdinc -nostdinc++ -DXF_GAME_LIBRARY` and the CPU
 level's `-march`, the statically linked games' flags; never `-ffast-math`; on Linux also
-`-fPIC -fvisibility=hidden -fno-stack-protector`), 4 at once by default
-(`BuildOptions::jobs`: more ran out of memory on 16 GB), the largest files
+`-fPIC -fvisibility=hidden -fno-stack-protector`), as many at once as the
+memory free and the cores allow unless `BuildOptions::jobs` says (the jobs
+policy: docs/recompiler.md, "The recompile step's memory"), the largest files
 first, at below-normal priority with only its log inherited; then
 `lld-link /dll /noentry /nodefaultlib /opt:ref /Brepro` through a response
 file (`ld.lld -shared --eh-frame-hdr --gc-sections` on Linux).

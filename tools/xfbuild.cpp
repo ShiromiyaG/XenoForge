@@ -1,13 +1,14 @@
 // xfbuild: the recompile step from the command line (plan D2; game_build.h),
 // what the launcher runs on a worker thread: the disc's executables
-// discovered and emitted, compiled by clang (4 at once unless --jobs says)
-// and linked by lld into the game library, kept in the cache by the
+// discovered and emitted, compiled by clang (as many at once as the memory
+// free and the cores allow, game_build.h's JobPolicy, unless --jobs says) and
+// linked by lld into the game library, kept in the cache by the
 // executable's digest and the interface version. Prints each stage as it
 // goes and how long it took.
 //
 //   xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
 //           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only]
-//           [--project <file.toml>] [--cpu-level v2|v3|arm64]
+//           [--project <file.toml>] [--cpu-level v2|v3|arm64] [--compile-stats <file.tsv>]
 //
 // The cache is game_build.h's default_cache_dir() unless named. --keep keeps
 // the work directory (the emitted code and the objects), --force builds even
@@ -26,7 +27,9 @@
 // --cpu-level builds for that CPU level (xenoforge/cpu_level.h) instead of the
 // best this CPU has (or XF_GAME_CPU_LEVEL's): for tests; the runtime finds
 // the library in the cache only at its own level (XF_GAME_CPU_LEVEL set the
-// same, or --game-library naming it).
+// same, or --game-library naming it). After a build it prints clang's CPU
+// time summed over the files it compiled and the most memory one held;
+// --compile-stats writes each file's (file, CPU seconds, peak bytes).
 
 #include "xenoforge/game_build.h"
 #include "xenoforge/shader_step.h"
@@ -36,6 +39,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 #include <thread>
 
@@ -64,7 +68,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "usage: xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] "
                              "[--keep] [--force] [--cancel-after S] [--quiet] [--entry <hex>]... "
                              "[--no-entry-log] [--no-shaders] [--no-disc-shaders] [--disc-variants N] [--shaders-only] "
-                             "[--project <file.toml>] [--cpu-level v2|v3|arm64]\n");
+                             "[--project <file.toml>] [--cpu-level v2|v3|arm64] [--compile-stats <file.tsv>]\n");
         return 2;
     }
     std::filesystem::path disc = argv[1], cache = build::default_cache_dir();
@@ -74,6 +78,7 @@ int main(int argc, char **argv) {
     options.shader_step = &render::run_shader_step;
     double cancel_after = 0;
     bool quiet = false;
+    std::string stats_file;
     for (int k = 2; k < argc; k++) {
         std::string a = argv[k];
         if (a == "--jobs" && k + 1 < argc)
@@ -98,6 +103,8 @@ int main(int argc, char **argv) {
             options.disc_shaders = false;
         else if (a == "--disc-variants" && k + 1 < argc)
             options.disc_variants = uint32_t(std::max(0, std::atoi(argv[++k])));
+        else if (a == "--compile-stats" && k + 1 < argc)
+            stats_file = argv[++k];
         else if (a == "--project" && k + 1 < argc)
             options.project = argv[++k];
         else if (a == "--cpu-level" && k + 1 < argc) {
@@ -113,8 +120,11 @@ int main(int argc, char **argv) {
     }
     auto toolchain = build::find_toolchain(options.toolchain);
     const CpuLevel level = options.cpu_level != CpuLevel::None ? options.cpu_level : game_cpu_level();
-    std::printf("disc %s\ncache %s\ntoolchain %s, %u jobs\nCPU level %s (this CPU: %s)\n", disc.string().c_str(),
-                cache.string().c_str(), toolchain ? toolchain->string().c_str() : "(none found)", options.jobs,
+    // (the compiling stage's first line says what the jobs policy chose then)
+    const std::string jobs =
+        options.jobs ? std::to_string(options.jobs) + " (given)" : "from the memory free and the cores";
+    std::printf("disc %s\ncache %s\ntoolchain %s\njobs %s\nCPU level %s (this CPU: %s)\n", disc.string().c_str(),
+                cache.string().c_str(), toolchain ? toolchain->string().c_str() : "(none found)", jobs.c_str(),
                 cpu_level_name(level), cpu_level_name(host_cpu_level()));
 
     std::atomic<bool> cancel{false};
@@ -169,5 +179,25 @@ int main(int argc, char **argv) {
     for (const build::LeftOutFunction &f : result.left_out)
         std::printf("  %s 0x%08X  %s\n", f.module.c_str(), f.address, f.reason.c_str());
     for (const std::string &line : result.shaders) std::printf("shaders: %s\n", line.c_str());
+    if (!result.compiled.empty()) {
+        // clang's CPU time over the files and the largest peak, for the
+        // compile time and memory measures (docs/recompiler.md)
+        double cpu = 0;
+        const build::BuildReport::Compiled *peak = &result.compiled[0];
+        for (const build::BuildReport::Compiled &c : result.compiled) {
+            cpu += c.cpu_seconds;
+            if (c.peak_bytes > peak->peak_bytes) peak = &c;
+        }
+        std::printf("compiled %zu files: clang %.1f CPU s; the most memory %.2f GB (%s)\n", result.compiled.size(), cpu,
+                    double(peak->peak_bytes) / double(1ull << 30), peak->file.c_str());
+        std::printf("linked: lld %.1f CPU s, %.2f GB at most\n", result.linked.cpu_seconds,
+                    double(result.linked.peak_bytes) / double(1ull << 30));
+        if (!stats_file.empty()) {
+            std::ofstream f(stats_file, std::ios::trunc);
+            f << "file\tcpu_seconds\tpeak_bytes\n";
+            for (const build::BuildReport::Compiled &c : result.compiled)
+                f << c.file << '\t' << c.cpu_seconds << '\t' << c.peak_bytes << '\n';
+        }
+    }
     return 0;
 }

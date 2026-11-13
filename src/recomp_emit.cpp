@@ -49,8 +49,11 @@ std::string hex8(uint32_t v) {
 // before fpu.h's slow paths stopped taking the context) and 38 s in parts.
 // Functions that long are a handful in a game (game D: 11 over 4,096 of
 // 85,859); a part costs a call and the registers it holds in the context
-// read again, once every thousand instructions.
-constexpr size_t PART_FUNCTION = 4096, PART_LENGTH = 1024, PART_MINIMUM = 256;
+// read again, once every thousand instructions. From 2,048 instructions
+// (4,096 before): a function of game A of 3,516, mostly loads, stores and
+// floating point, took 12.7 s and 0.62 GB of clang alone, 4.1 s and 0.10 GB
+// in parts (docs/recompiler.md, "The recompile step's memory").
+constexpr size_t PART_FUNCTION = 2048, PART_LENGTH = 1024, PART_MINIMUM = 256;
 
 class Emitter {
 public:
@@ -88,7 +91,16 @@ public:
             out_ = &parts, base_ = 2;
             line("XF_PART(" + name + ") {", 0);
             base_ = 3;
-            for (size_t k = 0; k < part->second; k++, ++it) instruction(*it, false);
+            // a region (place_regions) has its own labels, its first
+            // instruction's too (a loop back to its start), and its exit's,
+            // the instruction after it, which its branches out reach
+            const bool region = regions_.count(pc) != 0;
+            uint32_t last = pc;
+            for (size_t k = 0; k < part->second; k++, ++it) {
+                if (region && referenced_.count(*it)) line("L_" + hex8(*it) + ":", -1);
+                instruction(last = *it, false);
+            }
+            if (region && referenced_.count(last + 4)) line("L_" + hex8(last + 4) + ":;", -1);
             --it;
             base_ = 2;
             line("}");
@@ -210,6 +222,84 @@ private:
             if (p) run.push_back(pc);
         }
         flush();
+        place_regions();
+    }
+
+    // What the plain stretches leave of a long function, in regions: code
+    // with branches inside, one entry (its first instruction) and one exit
+    // (the instruction after its last), PART_LENGTH instructions at most and
+    // PART_MINIMUM at least, which go into parts the same way. A region's
+    // instructions are consecutive and each one either an instruction of
+    // the semantics, a branch to a label in the function, or a call; no
+    // return, tail call, dispatch that returns or table switch (none of
+    // which a part can do for its function), and no stack switch. Every
+    // branch inside goes to an instruction inside or to the exit, and every
+    // branch from outside to the first instruction. A function 12,000
+    // instructions long with branches throughout (no plain stretch long
+    // enough) took clang 48 s alone in one function (docs/recompiler.md,
+    // "The recompile step's memory"). Not in a function whose returns are
+    // checked, with resume sites or a port's hooks: their bodies return in
+    // ways a part cannot.
+    bool region_kind(uint32_t pc) const {
+        const Instr i{image_.word(pc)};
+        const Opcode op = ppc::decode(i.code);
+        auto callee = [&](uint32_t t) { return !d_.stack_thunks.count(t); };
+        switch (op) {
+        case Opcode::bx: {
+            const uint32_t t = uint32_t(exts26(i.I.LI << 2)) + (i.I.AA ? 0 : pc);
+            return i.I.LK ? callee(t) : internal(t);
+        }
+        case Opcode::bcx: {
+            const uint32_t t = uint32_t(exts16(i.B.BD << 2)) + (i.B.AA ? 0 : pc);
+            return i.B.LK ? callee(t) : internal(t);
+        }
+        case Opcode::bclrx:
+        case Opcode::bcctrx: return i.XL.LK != 0; // an indirect call
+        default: return true;
+        }
+    }
+    // the branch target of a branch inside a region (0: none)
+    uint32_t region_target(uint32_t pc) const {
+        const Instr i{image_.word(pc)};
+        const Opcode op = ppc::decode(i.code);
+        if (op == Opcode::bx && !i.I.LK) return uint32_t(exts26(i.I.LI << 2)) + (i.I.AA ? 0 : pc);
+        if (op == Opcode::bcx && !i.B.LK) return uint32_t(exts16(i.B.BD << 2)) + (i.B.AA ? 0 : pc);
+        return 0;
+    }
+    void place_regions() {
+        if (checked_ || !resumes_.empty() || hooks_) return;
+        const std::vector<uint32_t> pcs(code_.begin(), code_.end());
+        std::set<uint32_t> covered;
+        for (const auto &[start, n] : parts_)
+            for (size_t k = 0; k < n; k++) covered.insert(start + uint32_t(4 * k));
+        for (size_t i = 0; i < pcs.size();) {
+            const uint32_t first = pcs[i];
+            // the lowest target or label source seen, the highest target, the highest label source
+            uint32_t low = UINT32_MAX, target_high = 0, source_high = 0;
+            size_t best = 0;
+            for (size_t j = i; j < pcs.size() && j - i < PART_LENGTH; j++) {
+                const uint32_t pc = pcs[j];
+                if ((j > i && pc != pcs[j - 1] + 4) || covered.count(pc) || !region_kind(pc)) break;
+                if (const uint32_t t = region_target(pc))
+                    low = std::min(low, t), target_high = std::max(target_high, t);
+                // a label after the first: every branch to it from inside
+                if (auto s = sources_.find(pc); j > i && s != sources_.end())
+                    low = std::min(low, s->second.first), source_high = std::max(source_high, s->second.second);
+                if (low < first) break; // a branch back before it, or into it from before: none further
+                // an end: the next instruction emitted, the targets inside or
+                // the exit, the labels' branches from inside
+                if (j + 1 - i >= PART_MINIMUM && code_.count(pc + 4) && low >= first && target_high <= pc + 4 &&
+                    source_high <= pc)
+                    best = j + 1 - i;
+            }
+            if (best) {
+                parts_[first] = best;
+                regions_.insert(first);
+                i += best;
+            } else {
+                i++;
+            }
+        }
     }
 
     // a line of the body, indent levels past the body's own
@@ -222,7 +312,12 @@ private:
 
     std::string go(uint32_t target, bool first) {
         if (internal(target)) {
-            if (first) referenced_.insert(target);
+            if (first) {
+                referenced_.insert(target);
+                // the branches to it, the lowest and the highest (place_regions)
+                auto [s, added] = sources_.try_emplace(target, at_, at_);
+                s->second.first = std::min(s->second.first, at_), s->second.second = std::max(s->second.second, at_);
+            }
             return "goto L_" + hex8(target) + ";";
         }
         // the stack switch: this frame goes on, when switched back to, where
@@ -286,6 +381,7 @@ private:
     }
 
     void instruction(uint32_t pc, bool first) {
+        at_ = pc;
         Instr i{image_.word(pc)};
         Opcode op = ppc::decode(i.code);
         mid_hook(pc, first);
@@ -391,6 +487,10 @@ private:
     uint32_t end_;
     std::set<uint32_t> code_, referenced_;
     std::map<uint32_t, size_t> parts_; // a part's first instruction: its length
+    std::set<uint32_t> regions_;       // the parts that are regions (place_regions)
+    // each label's branches, by the lowest and the highest address they are at
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> sources_;
+    uint32_t at_ = 0; // the instruction being emitted
     size_t parts_emitted_ = 0;
     std::string *out_ = nullptr;
     std::set<uint32_t> *calls_;  // the functions it calls by name, when asked

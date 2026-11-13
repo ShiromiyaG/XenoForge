@@ -172,7 +172,24 @@ void invalid(Context &, uint32_t) {}
 void switch_stack(Context &, uint32_t, uint32_t) {}
 } // namespace xf::ppc
 
+// The jobs policy (game_build.h's JobPolicy): the cores and the memory free
+// less the reserve, a given count winning, the cores alone where the memory
+// is unknown, and at least one compiler.
+void job_policy() {
+    const uint64_t GB = 1ull << 30;
+    const uint64_t job = build::job_memory(2ull << 20);
+    CHECK(job > 256ull << 20 && job < GB);
+    build::JobPolicy p = build::job_policy(0, 16, 16 * GB, 2 * GB + 5 * job + job / 2);
+    CHECK(p.reserve_bytes == 2 * GB && p.limit == 5 && !p.why.empty());
+    CHECK(build::job_policy(0, 4, 16 * GB, 14 * GB).limit == 4); // the cores
+    CHECK(build::job_policy(0, 8, 8 * GB, GB / 2).limit == 1);   // too little: still one
+    CHECK(build::job_policy(3, 16, 16 * GB, GB / 2).limit == 3); // given
+    CHECK(build::job_policy(0, 16, 0, 0).limit == 4);            // unknown memory
+    CHECK(build::available_memory() <= build::total_memory());
+}
+
 int main() {
+    job_policy();
     if (!build::find_toolchain()) {
         std::printf("game_build: no clang and lld, skipped\n");
         return finish("game_build");
