@@ -102,6 +102,12 @@ struct VertexOptions {
     // bottom ones plus one (zero: nothing yet). A position not in front of
     // the eye (w not above 0, or not a number) takes the whole viewport.
     bool extents = false;
+    // With extents: the four maxima taken over the subgroup first and stored
+    // by one invocation of it, where the subgroup's invocations all bound the
+    // same report (each its own atomics where not). Needs subgroup votes,
+    // arithmetic and election in vertex shaders. One setting for the whole
+    // run (the renderer's), so not part of the key.
+    bool extents_subgroup = false;
     // Xenia's texture_point_snap (off by default there too): point-sampled
     // 2D fetches with normalized coordinates, where the fetch constant
     // filters by point too (texture::integer_scale_bits' bit 26), sample at

@@ -2418,6 +2418,126 @@ the VIZ queries, so in the player the extents are never measured and VIZ
 queries never reach the renderer, unlike in a replay: left as found, to be
 decided with a live run.
 
+## Where a frame's threads wait, and the extents' round trip (2026-11-13)
+
+Once the player passed the extents on, game G's town frame drew about 6,200
+draws where it drew 8,600, but its work fell only from 27.9 to 26.5 ms, its
+submissions rose from 4.5 to 9 a frame, and 5-6% of the frames took three
+vblanks.
+
+**The frame's line.** With the work split in two, `XF_SLOW_FRAMES` prints a
+second line under each frame (`Sink::Work`, filled by the renderer and
+`DeferredSink::work`):
+
+    threads: front end waited W ms for the back end (fence, interrupt, wait, gamma, memory read,
+    extents, ring full); extents' GPU wait E ms (fence F, recording R), other GPU waits O ms
+    (B on the back end), recording-thread waits ms; back end busy ms (CPU ms); front end CPU ms
+
+- the front end's waits for the back end by why (`Sink::sync`'s reasons,
+  `extent_wait`'s own, the ring full);
+- the renderer's waits where the guest may read the extents
+  (`extent_wait`: the submission holding them recorded, submitted and done;
+  of them the fence, the rest the recording thread's submission), the other
+  fences (of them, those on the back end's thread: a submission's slot free
+  again), and every wait for the recording thread to submit;
+- the back end's wall time with records to do and its processor time, and
+  the front end's processor time. A thread whose processor time falls short
+  of its busy time was preempted or waited inside (the back end's GPU waits
+  are inside its busy time). Its processor time counts its wake-ups too,
+  which on a replay walked from the trace (a wake at nearly every record)
+  make it larger than its busy time.
+
+**A replay at the live pace** (`XF_REPLAY_KEPT_PLAY=1` with `xfreplay
+--repeat`). A repeated play spent 200 ms walking the trace (decoding and
+comparing every memory block) for 10 ms of commands, so the back end was
+always caught up: the front end waited 0.1 ms a frame and the extents'
+round trip 0.6 ms, nothing like live. Now the first repeated play is kept
+(its packets, the memory it found changed, its registers and gamma) and the
+plays after it do the same from memory, 1.6 ms a play outside the commands,
+without draining the GPU between them or reading the front buffer back, as
+a game's frames come. The plays are the same play, so the pictures are
+byte for byte the first one's. Game G's frame 1485 then takes about 20 ms
+a play, about 27 live, where game G's own threads and the guest's interrupt
+callbacks share the machine.
+
+**The frame, from the trace.** A first pass of 1,574 draws; an interrupt;
+the extents pass, 3,410 draws and 2,999 extent events; an interrupt, where
+the guest reads the extents (the frame's only wait for them) and patches the
+second pass's bins; the second pass, 3,542 draws; an interrupt and the swap.
+Before each interrupt the stream waits (`WAIT_REG_MEM`) on a word that an
+`EVENT_WRITE_SHD` just before it writes: the GPU waiting for its own pipeline
+to drain, which here is the front end waiting for the back end to write that
+fence (the `memory read` syncs). All of the front end's 9 ms of waits a
+frame are there. The extents' wait then stops the front end and the back end
+until the GPU has drawn the extents pass: 2.3 ms a frame, the GPU's backlog,
+and the GPU then idles while the second pass is recorded.
+
+Measured (frame 1485, kept plays, 25 a run, the frames 4-24: the median
+and the range; the machine quiet, under 15% busy, only an editor's language
+server running):
+
+| | frame | extents' wait | back end's GPU waits | back end busy (processor) | submissions |
+| --- | --- | --- | --- | --- | --- |
+| as before | 20.1 [19.7-21.5] | 2.3 | 2.9 | 16.3 (13.4) | 10 |
+| the whole screen (`--whole-extents`; no draw skipped in a replay) | 15.3 [13.8-16.7] | 0 | 2.2 | 15.0 (12.9) | 5 |
+| `XF_EXTENT_FLUSH_DRAWS=0` | 21.7 | 6.2 | 0.0 | 13.9 | 5 |
+| `XF_EXTENT_FLUSH_DRAWS=128` | 21.7 | 0.5 | 5.6 | 19.6 | 28 |
+| `XF_EXTENT_FLUSH_DRAWS=256` | 20.5 | 1.5 | 3.8 | 17.5 | 16 |
+| `XF_EXTENT_FLUSH_DRAWS=1024` | 20.1 | 4.5 | 0.4 | 14.1 | 7 |
+| six submission slots, not three (a probe) | 23.5 | 7.5 | 1.6 | 14.4 | 9 |
+| `XF_RECORD_RING=0` | 22.4 | 2.2 | 1.3 | 18.8 (17.7) | 10 |
+
+The extents' wait and the back end's waits for a slot trade one for the
+other: what the CPU's side waits for is the GPU drawing the extents pass,
+whether at the slots or at the interrupt. Measuring costs a replay 5 ms a
+frame over the whole screen with every draw drawn; live, the bins it gives
+spare 28% of the draws, about 3.7 ms of the back end's, which is why live
+gained 1.4 ms rather than 6.
+
+**Kept: the extents' maxima a subgroup at a time** (`XF_EXTENTS_SUBGROUP=0`
+off; on where the device has subgroup votes, arithmetic and election in
+vertex shaders, Vulkan 1.1's subgroup properties; beyond Xenia, which
+measures no extents). Every vertex of a draw in a report did four atomic
+maxima on the same four words; now the subgroup takes the four maxima first
+(`OpGroupNonUniformUMax`) and one of its invocations stores them, where all
+of the subgroup's invocations bound the same report (each its own atomics
+where not). The GPU's time a play (drained plays, the fastest): 14.79 /
+14.75 ms to 13.82 / 13.86 (the whole screen 13.49), the extents' own GPU
+cost from 1.3 to 0.35 ms. Kept plays, A B interleaved, three rounds: the
+frame 20.1 / 20.0 / 20.2 ms to 19.3 / 19.1 / 19.2 (ranges 19.8-22.0 and
+18.8-20.6), the back end's slot waits 2.8 to 2.2 ms. The answers are the
+same (a hash of every report's bounds over three plays of 1485 and one of
+1596 equal with it on and off) and so are the pictures (1260, 1485, 1596,
+both paths).
+
+**Tried and dropped:**
+
+- **The GPU fed sooner after the extents' wait** (submissions of 16 or 64
+  draws, doubled up to `XF_EXTENT_FLUSH_DRAWS`, at any draw, after the
+  wait): the second pass, without reports, was submitted only 1,830 draws
+  after the wait (4 ms of an idle GPU); with it 64 draws (1.6 ms), and the
+  frame did not move (20.0-20.2 against 20.1-20.2): the GPU is not what the
+  second pass waits for.
+- **The flush at another count** (table above): the extents' wait and the
+  slot waits trade; 512 stays.
+- **More slots in flight** (six): the backlog goes to the extents' wait,
+  and the frame lost 3.4 ms.
+- **Judging measuring by time saved** rather than by draws skipped: not
+  built. Live, game G's frame is cheaper measured (26.5 against 27.9 ms), so
+  it would choose the same; the replays cannot judge it (no guest patches
+  the bins).
+- **The front end's wait only for the reports read**: the guest reads them
+  in its interrupt, where the front end waits for everything anyway (the
+  interrupt and the fence before it); what the round trip costs is the GPU's
+  backlog, not the front end's wait.
+
+What is left is the round trip itself: the extents pass drawn by the GPU
+before the guest's interrupt can patch the second one, about 2 ms a frame
+with nothing on the CPU's side to do, as on the console, whose command
+processor waits there for its GPU too. A live run with the new line tells
+how much of a slow frame is that, the back end's own work, or a thread
+preempted (busy time well above processor time).
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches

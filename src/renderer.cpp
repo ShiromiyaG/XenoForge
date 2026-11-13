@@ -1536,8 +1536,15 @@ public:
     // screen extents (gpu::ScreenExtents::Measured; "screen extents" below)
     bool measures_extents() override { return extents_.buffer != VK_NULL_HANDLE; }
     Work work() override {
+        if (deferring()) return deferred_->work(); // (with the threads' figures, then back here)
         std::lock_guard<CallLock> lock(mutex_);
-        return {report_.wait_seconds, report_.textures, report_.submissions, report_.pipelines};
+        Work w;
+        w.gpu_wait_seconds = report_.wait_seconds;
+        w.texture_loads = report_.textures, w.submissions = report_.submissions, w.pipelines = report_.pipelines;
+        w.extent_wait_seconds = extent_wait_seconds_, w.extent_fence_seconds = extent_fence_seconds_;
+        w.back_end_gpu_wait_seconds = back_end_gpu_wait_seconds_;
+        if (ring_) w.record_wait_seconds = FastClock::seconds(ring_->wait_ticks(rec::Ring::Fence));
+        return w;
     }
     void extent_init() override {
         if (deferring()) return deferred_->extent_init();
@@ -1566,7 +1573,13 @@ public:
         for (const Slot &s : slots_)
             for (const Slot::ExtentReport &e : s.extent_reports)
                 if (e.handle && s.serial) serial = std::max(serial, s.serial);
-        if (serial) wait_serial(serial);
+        if (!serial) return;
+        // (timed for XF_SLOW_FRAMES: the whole wait, and of it the fence's)
+        const uint64_t t0 = FastClock::now();
+        const double fence0 = report_.wait_seconds;
+        wait_serial(serial);
+        extent_wait_seconds_ += FastClock::seconds(FastClock::now() - t0);
+        extent_fence_seconds_ += report_.wait_seconds - fence0;
     }
     void extent_poll(std::vector<gpu::Extent> &resolved) override {
         if (deferring()) return deferred_->extent_poll(resolved);
@@ -2420,6 +2433,8 @@ private:
         return v ? uint64_t(std::strtoull(v, nullptr, 10)) : uint64_t(512);
     }();
     uint64_t drawn_at_submission_ = 0;
+    double extent_wait_seconds_ = 0, extent_fence_seconds_ = 0; // extent_wait's, all and the fences'
+    double back_end_gpu_wait_seconds_ = 0;                      // the fences waited for on the back end's thread
     // the draw being made bounds the open report (the index of its words in
     // extents_), or UINT32_MAX: it cannot, and the report is the whole screen
     uint32_t extent_draw_words() {
@@ -3303,6 +3318,12 @@ private:
     bool point_snap_ = [] {
         const char *v = std::getenv("XF_TEXTURE_POINT_SNAP");
         return v && v[0] == '1';
+    }();
+    // the screen extents' maxima a subgroup at a time (shader::VertexOptions::extents_subgroup)
+    // where the device has subgroup arithmetic in vertex shaders; XF_EXTENTS_SUBGROUP=0 off
+    bool extents_subgroup_ = [] {
+        const char *v = std::getenv("XF_EXTENTS_SUBGROUP");
+        return !(v && v[0] == '0');
     }();
     VkDescriptorPool compute_pool_ = VK_NULL_HANDLE;
     VkDescriptorSet resolve_set_ = VK_NULL_HANDLE, load_set_ = VK_NULL_HANDLE, resolve_edram_set_ = VK_NULL_HANDLE;
@@ -4908,7 +4929,9 @@ bool Impl::finish_oldest(bool wait) {
         if (!wait) return false;
         Timer submit(report_.submit_seconds), waiting(report_.wait_seconds);
         report_.waits++;
+        const uint64_t t0 = gpu::DeferredSink::on_back_end() ? FastClock::now() : 0;
         status = vkWaitForFences(dev_, 1, &oldest->fence, VK_TRUE, 20'000'000'000ull);
+        if (t0) back_end_gpu_wait_seconds_ += FastClock::seconds(FastClock::now() - t0);
     }
     if (status != VK_SUCCESS) {
         fatal_ = "waiting for the GPU failed (" + std::to_string(status) + ")" + lost_device_report(status);
@@ -5569,6 +5592,7 @@ VkShaderModule Impl::form_module(Shader &s, uint32_t key, const shader::VertexOp
     shader::VertexOptions v = vertex;
     shader::PixelOptions p = pixel;
     v.texture_point_snap = p.texture_point_snap = point_snap_;
+    v.extents_subgroup = v.extents && extents_subgroup_ && d_.vertex_subgroup_arithmetic();
     if (pending && translate_later(s, key)) {
         if (s.translating.insert(key).second)
             translation_workers_->queue({&s, key, is_pixel, v, p});

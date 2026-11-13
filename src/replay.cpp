@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifdef _WIN32
 extern "C" __declspec(dllimport) void *__stdcall GetCurrentThread();
@@ -97,6 +98,7 @@ public:
     void packet(uint32_t address, std::span<const uint8_t> words) override {
         uint32_t count = uint32_t(words.size() / 4);
         if (!count) return;
+        if (keeping_) keep(Kept::Packet, address, words.data(), words.size());
         write(address, words);
         if (!repeating_) {
             processor_.execute_packets(address, count);
@@ -112,10 +114,12 @@ public:
         // a repeated play: what memory holds already is not written again
         // (a game's frame drawn again finds its memory as it left it)
         if (repeating_ && unchanged(address, bytes)) return;
+        if (keeping_) keep(Kept::Memory, address, bytes.data(), bytes.size());
         write(address, bytes);
         renderer_.memory_written(address & 0x1FFFFFFF, uint32_t(bytes.size()));
     }
     void registers(uint32_t first, std::span<const uint32_t> values) override {
+        if (keeping_) keep(Kept::Registers, first, values.data(), values.size_bytes());
         processor_.restore_registers(first, values);
     }
     void edram_snapshot(std::span<const uint8_t> bytes) override {
@@ -124,13 +128,73 @@ public:
         if (restore_edram_ && !repeating_) renderer_.restore_edram(bytes);
     }
     void gamma_ramp(std::span<const uint32_t> table, std::span<const uint32_t> pwl) override {
+        if (keeping_) {
+            keep(Kept::Gamma, uint32_t(table.size()), table.data(), table.size_bytes());
+            bytes_.insert(bytes_.end(), reinterpret_cast<const uint8_t *>(pwl.data()),
+                          reinterpret_cast<const uint8_t *>(pwl.data()) + pwl.size_bytes());
+            kept_.back().size += uint32_t(pwl.size_bytes());
+        }
         processor_.restore_gamma_ramp(table, pwl);
     }
 
+    // A repeated play kept (XF_REPLAY_KEPT_PLAY=1): what it did, for the
+    // plays after it to do again without walking the trace, which decodes
+    // every memory block and compares it with memory (200 ms a play of a
+    // frame of 8,500 draws, where the commands are 10). The plays after it
+    // are the same play (each repeated play finds memory as the one before
+    // left it), so only the memory it found changed is written again. The
+    // command processor then runs at about the pace it has live, so a play's
+    // wall time shows how its threads wait for each other at the frame's
+    // syncs.
+    void play_kept() {
+        for (const Kept &k : kept_) {
+            const uint8_t *p = bytes_.data() + k.at;
+            switch (k.kind) {
+            case Kept::Packet: {
+                write(k.address, {p, k.size});
+                const uint64_t start = FastClock::now();
+                processor_.execute_packets(k.address, k.size / 4);
+                command_clock_ += FastClock::now() - start;
+                break;
+            }
+            case Kept::Memory:
+                write(k.address, {p, k.size});
+                renderer_.memory_written(k.address & 0x1FFFFFFF, k.size);
+                break;
+            case Kept::Registers:
+                processor_.restore_registers(
+                    k.address, {reinterpret_cast<const uint32_t *>(p), k.size / 4});
+                break;
+            case Kept::Gamma: {
+                const auto *w = reinterpret_cast<const uint32_t *>(p);
+                processor_.restore_gamma_ramp({w, k.address}, {w + k.address, k.size / 4 - k.address});
+                break;
+            }
+            }
+        }
+    }
+
     bool repeating_ = false;
+    bool keeping_ = false; // this play kept for play_kept
     uint64_t command_clock_ = 0; // in the processor, over the repeated plays (FastClock)
 
 private:
+    struct Kept {
+        enum Kind : uint32_t { Packet, Memory, Registers, Gamma } kind;
+        uint32_t address; // (Gamma: the table's words)
+        uint32_t size;    // bytes
+        size_t at;        // in bytes_
+    };
+    std::vector<Kept> kept_;
+    std::vector<uint8_t> bytes_;
+    void keep(Kept::Kind kind, uint32_t address, const void *data, size_t size) {
+        kept_.push_back({kind, address, uint32_t(size), bytes_.size()});
+        // (word-aligned: registers and gamma words are read in place)
+        const uint8_t *b = static_cast<const uint8_t *>(data);
+        bytes_.insert(bytes_.end(), b, b + size);
+        bytes_.resize((bytes_.size() + 3) & ~size_t(3));
+    }
+
     bool unchanged(uint32_t address, std::span<const uint8_t> bytes) const {
         for (size_t i = 0; i < bytes.size();) {
             uint32_t at = (address + uint32_t(i)) & 0x1FFFFFFF;
@@ -167,7 +231,17 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     TraceHost host;
     gpu::CommandProcessor processor(*memory, host);
     Options o = options;
-    if (!o.frame_wanted) o.frame_wanted = [](uint64_t) { return true; };
+    // XF_REPLAY_KEPT_PLAY=1 (Player::play_kept): the plays between the first kept and the last
+    // read no front buffer back (its conversion, on whichever thread finds the submission done,
+    // is no part of a game's frame)
+    static const bool kept_play = [] {
+        const char *v = std::getenv("XF_REPLAY_KEPT_PLAY");
+        return v && v[0] == '1';
+    }();
+    bool frames_wanted = true;
+    o.frame_wanted = [&frames_wanted, wanted = options.frame_wanted](uint64_t swap) {
+        return frames_wanted && (!wanted || wanted(swap));
+    };
     o.on_frame = [&, user = options.on_frame](uint64_t swap, const Image &image) {
         frame = image;
         if (user) user(swap, image);
@@ -198,14 +272,23 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
             player.command_clock_ = 0;
             const uint64_t cpu_start = thread_cpu_ticks(), play_start = FastClock::now();
             const double process_start = process_cpu_seconds();
-            walked = walk_gpu_trace(trace, player, error);
+            frames_wanted = !kept_play || k == 1 || k + 1 == repeat;
+            if (kept_play && k >= 2) {
+                player.play_kept();
+            } else {
+                player.keeping_ = kept_play && k == 1;
+                walked = walk_gpu_trace(trace, player, error);
+                player.keeping_ = false;
+            }
             const uint64_t play_ticks = thread_cpu_ticks() - cpu_start;
             play_seconds.push_back(FastClock::seconds(FastClock::now() - play_start));
             command_seconds.push_back(FastClock::seconds(player.command_clock_));
             command_cpu_plays.push_back(double(play_ticks) / cpu_ticks_a_second());
             ticks += play_ticks;
             command_cpu_seconds = double(ticks) / cpu_ticks_a_second() / double(k);
-            renderer->drain();
+            // (the kept plays one after the other as a game's frames come, the GPU never drained
+            // between them: the threads' figures a play are then those to its swap)
+            if (!kept_play || k == 1 || k + 1 == repeat) renderer->drain();
             Report after = renderer->report();
             command_waits.push_back(after.wait_seconds - before.wait_seconds);
             // (the other threads' processor time once the play is drained: everything it handed them done)

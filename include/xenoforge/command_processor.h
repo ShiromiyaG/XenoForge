@@ -398,9 +398,26 @@ public:
     // What the sink has done so far, for XF_SLOW_FRAMES: the seconds it
     // waited for the GPU, its texture loads, its submissions, the pipelines
     // it has made. Called on the processor's thread.
+    // With the work split in two threads (gpu/deferred_sink.h), also where
+    // each thread's time went, every figure a running total in seconds:
     struct Work {
         double gpu_wait_seconds = 0;
         uint64_t texture_loads = 0, submissions = 0, pipelines = 0;
+        // the front end's waits for the back end, by why: SyncFor's reasons,
+        // then the extents' wait (extent_wait), the ring full
+        static constexpr size_t BACK_END_WAITS = size_t(SyncFor::COUNT) + 2;
+        double back_end_wait_seconds[BACK_END_WAITS] = {};
+        // the sink's waits where the guest may read the extents (extent_wait:
+        // the submission holding them recorded, submitted and done), and of
+        // them, the GPU's fence (the rest: the recording thread's submission)
+        double extent_wait_seconds = 0, extent_fence_seconds = 0;
+        // every wait for the recording thread to submit (the extents' among them)
+        double record_wait_seconds = 0;
+        // of the GPU waits (gpu_wait_seconds), those on the back end's thread: a submission's
+        // slot free again (the rest are the front end's: the extents', a drain)
+        double back_end_gpu_wait_seconds = 0;
+        // the back end's wall time with records to do, and its processor time
+        double back_end_busy_seconds = 0, back_end_cpu_seconds = 0;
     };
     virtual Work work() { return {}; }
     virtual void extent_poll(std::vector<Extent> & /*resolved*/) {}
@@ -669,6 +686,7 @@ private:
     std::chrono::steady_clock::time_point slow_at_{};
     uint64_t slow_swaps_ = 0, slow_waited_ = 0, slow_draws_ = 0, slow_resolves_ = 0, slow_reports_ = 0;
     Sink::Work slow_work_{};
+    uint64_t slow_cpu_ = 0; // the processor's thread's processor time (thread_cpu.h's ticks)
     std::vector<std::pair<uint64_t, uint32_t>> extent_pending_; // handle (0: answered) and address, in order
     size_t extent_first_ = 0;                                   // the first of them still waiting
     // The latest report at each address, by address: its handle (0: none).

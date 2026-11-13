@@ -34,5 +34,8 @@ uint64_t current_thread_cpu_ticks();
 extern std::atomic<unsigned long> gpu_back_end_os_thread;
 // the whole process's processor time so far, all of its threads, in seconds
 double process_cpu_seconds();
+// how many ticks make a second (Windows: the cycle counter's rate, measured over a busy 20 ms the
+// first time it is asked for; elsewhere 1e9)
+double cpu_ticks_a_second();
 
 } // namespace xf

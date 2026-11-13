@@ -339,9 +339,17 @@ std::unique_ptr<Device> Device::open(std::string &error, const Window *window) {
         vkGetPhysicalDeviceFeatures2(d->physical_, &query);
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gpl_props{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+        VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        gpl_props.pNext = &subgroup;
         VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         props.pNext = &gpl_props;
         vkGetPhysicalDeviceProperties2(d->physical_, &props);
+        {
+            const VkSubgroupFeatureFlags needed =
+                VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+            d->vertex_subgroup_arithmetic_ = (subgroup.supportedStages & VK_SHADER_STAGE_VERTEX_BIT) &&
+                                             (subgroup.supportedOperations & needed) == needed;
+        }
         void **tail = &v13.pNext;
         if (has_eds3 && has_eds3_features.extendedDynamicState3ColorBlendEnable &&
             has_eds3_features.extendedDynamicState3ColorBlendEquation &&

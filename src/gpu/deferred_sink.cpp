@@ -22,6 +22,7 @@ namespace {
 
 // set for good on the back end's thread, and around a call passed to the sink on another
 thread_local int passing_depth = 0;
+thread_local bool back_end_thread = false;
 
 struct Passing {
     Passing() { passing_depth++; }
@@ -56,6 +57,7 @@ uint32_t back_spins() {
 } // namespace
 
 bool DeferredSink::passing() { return passing_depth > 0; }
+bool DeferredSink::on_back_end() { return back_end_thread; }
 
 DeferredSink::DeferredSink(Sink &back, RegisterFile &front, Memory &memory)
     : back_(back), front_(front), memory_(memory), view_(memory.translate_physical(0)), ring_(new uint8_t[RING]) {
@@ -90,7 +92,7 @@ uint8_t *DeferredSink::reserve(Kind kind, uint32_t bytes) {
     if (offset + size > RING) need += RING - offset;
     if (at + need - done_.load(std::memory_order_acquire) > RING) {
         stats_.full++;
-        wait_done(at + need - RING, nullptr);
+        wait_done(at + need - RING, nullptr, WAIT_FULL);
     }
     if (offset + size > RING) {
         Header wrap{Kind::Wrap, uint32_t(RING - offset - sizeof(Header))};
@@ -172,7 +174,7 @@ void DeferredSink::push_draw(Kind kind, const Draw &d) {
     commit();
 }
 
-void DeferredSink::wait_done(uint64_t position, uint64_t *counter) {
+void DeferredSink::wait_done(uint64_t position, uint64_t *counter, size_t why) {
     if (done_.load(std::memory_order_acquire) >= position) return;
     if (counter) ++*counter;
     const auto began = std::chrono::steady_clock::now();
@@ -188,7 +190,9 @@ void DeferredSink::wait_done(uint64_t position, uint64_t *counter) {
         if (done < position) done_.wait(done, std::memory_order_seq_cst);
         waiters_.fetch_sub(1, std::memory_order_relaxed);
     }
-    stats_.wait_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    stats_.wait_seconds += waited;
+    stats_.wait_by[why] += waited;
 }
 
 void DeferredSink::finish() {
@@ -214,7 +218,7 @@ void DeferredSink::finish() {
 void DeferredSink::set_synchronous(bool on) {
     if (on == synchronous_) return;
     if (on) {
-        wait_done(written_.load(std::memory_order_relaxed), nullptr);
+        wait_done(written_.load(std::memory_order_relaxed), nullptr, WAIT_FULL);
     } else {
         resync_ = true; // the back end's copy of the registers brought up to date in full
     }
@@ -225,7 +229,7 @@ void DeferredSink::sync(SyncFor why, uint32_t address, uint32_t bytes) {
     const size_t w = size_t(why);
     stats_.syncs[w]++;
     if (synchronous_) return;
-    if (why != SyncFor::MemoryRead) return wait_done(written_.load(std::memory_order_relaxed), &stats_.waited[w]);
+    if (why != SyncFor::MemoryRead) return wait_done(written_.load(std::memory_order_relaxed), &stats_.waited[w], w);
     // A memory read waits only for the work yet to be done that writes where it reads: a
     // resolve's destination, a fence written later. What else that work may write (memexport)
     // the console's command processor would not wait for either without a fence or a wait
@@ -240,7 +244,7 @@ void DeferredSink::sync(SyncFor why, uint32_t address, uint32_t bytes) {
         pending_[kept++] = p;
     }
     pending_.resize(kept);
-    if (until) wait_done(until, &stats_.waited[w]);
+    if (until) wait_done(until, &stats_.waited[w], w);
 }
 
 void DeferredSink::add_pending(uint32_t start, uint32_t end) {
@@ -374,7 +378,7 @@ uint64_t DeferredSink::extent_report() {
 }
 
 void DeferredSink::extent_wait() {
-    if (!synchronous_) wait_done(written_.load(std::memory_order_relaxed), nullptr);
+    if (!synchronous_) wait_done(written_.load(std::memory_order_relaxed), nullptr, WAIT_EXTENTS);
     Passing p;
     back_.extent_wait();
 }
@@ -400,9 +404,18 @@ void DeferredSink::extent_poll(std::vector<Extent> &resolved) {
     extent_whole_.clear();
 }
 
+// The sink's, with the front end's waits for the back end and the back end's own time (on the
+// processor's thread: the front end's figures are its own)
 Sink::Work DeferredSink::work() {
-    Passing p;
-    return back_.work();
+    Work w;
+    {
+        Passing p;
+        w = back_.work();
+    }
+    for (size_t i = 0; i < Work::BACK_END_WAITS; i++) w.back_end_wait_seconds[i] = stats_.wait_by[i];
+    w.back_end_busy_seconds = FastClock::seconds(back_busy_.load(std::memory_order_relaxed));
+    w.back_end_cpu_seconds = double(back_cpu_.ticks()) / cpu_ticks_a_second();
+    return w;
 }
 
 void DeferredSink::viz_query(uint32_t id, bool end) {
@@ -418,6 +431,7 @@ void DeferredSink::viz_query(uint32_t id, bool end) {
 
 void DeferredSink::run() {
     passing_depth = 1;
+    back_end_thread = true;
     back_cpu_.bind_current();
     gpu_back_end_os_thread.store(back_cpu_.os_id());
     uint64_t at = 0;
@@ -439,6 +453,8 @@ void DeferredSink::run() {
                 continue;
             }
         }
+        // (the busy time added at each record, not at the batch's end: a batch can last a frame)
+        uint64_t busy_from = FastClock::now();
         while (at < written) {
             Header h;
             std::memcpy(&h, &ring_[at & (RING - 1)], sizeof(h));
@@ -460,6 +476,9 @@ void DeferredSink::run() {
             at += aligned(sizeof(Header) + h.bytes);
             done_.store(at, std::memory_order_seq_cst);
             if (waiters_.load(std::memory_order_seq_cst)) done_.notify_all();
+            const uint64_t now = FastClock::now();
+            back_busy_.store(back_busy_.load(std::memory_order_relaxed) + (now - busy_from), std::memory_order_relaxed);
+            busy_from = now;
         }
     }
 }

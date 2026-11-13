@@ -41,6 +41,8 @@
 
 #include "xenoforge/command_processor.h"
 
+#include "thread_cpu.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <chrono>
@@ -998,6 +1000,37 @@ bool CommandProcessor::xe_swap(uint32_t count) {
                             (unsigned long long)(work.submissions - slow_work_.submissions),
                             (unsigned long long)(work.pipelines - slow_work_.pipelines),
                             extents_ == ScreenExtents::Measured ? ", extents measured" : "");
+            // Where the threads' time went (the work split in two, gpu/deferred_sink.h): the
+            // front end's waits for the back end by why, the GPU waits where the guest may read
+            // the extents (of them the fence's; the rest the recording thread's submission) and
+            // the others, the waits for the recording thread to submit, the back end's wall time
+            // with work and its processor time, and the front end's processor time. A thread
+            // whose processor time falls short of its busy time was preempted or waited inside.
+            const uint64_t cpu = current_thread_cpu_ticks();
+            if (slow_swaps_ && (ms > limit || all) && work.back_end_busy_seconds > 0) {
+                static_assert(Sink::Work::BACK_END_WAITS == 7, "the line names seven reasons");
+                const Sink::Work &a = slow_work_;
+                auto d = [](double now, double then) { return (now - then) * 1000.0; };
+                const double *bw = work.back_end_wait_seconds, *aw = a.back_end_wait_seconds;
+                double front_waits = 0;
+                for (size_t i = 0; i < Sink::Work::BACK_END_WAITS; i++) front_waits += d(bw[i], aw[i]);
+                const double extent_all = d(work.extent_wait_seconds, a.extent_wait_seconds);
+                const double extent_fence = d(work.extent_fence_seconds, a.extent_fence_seconds);
+                std::printf("  threads: front end waited %.1f ms for the back end (fence %.1f, interrupt %.1f, "
+                            "wait %.1f, gamma %.1f, memory read %.1f, extents %.1f, ring full %.1f); extents' GPU "
+                            "wait %.1f ms (fence %.1f, recording %.1f), other GPU waits %.1f ms (%.1f on the back "
+                            "end), recording-thread waits %.1f ms; back end busy %.1f ms (CPU %.1f ms); front end CPU %.1f ms\n",
+                            front_waits, d(bw[0], aw[0]), d(bw[1], aw[1]), d(bw[2], aw[2]), d(bw[3], aw[3]),
+                            d(bw[4], aw[4]), d(bw[5], aw[5]), d(bw[6], aw[6]), extent_all, extent_fence,
+                            extent_all - extent_fence,
+                            d(work.gpu_wait_seconds, a.gpu_wait_seconds) - extent_fence,
+                            d(work.back_end_gpu_wait_seconds, a.back_end_gpu_wait_seconds),
+                            d(work.record_wait_seconds, a.record_wait_seconds),
+                            d(work.back_end_busy_seconds, a.back_end_busy_seconds),
+                            d(work.back_end_cpu_seconds, a.back_end_cpu_seconds),
+                            double(cpu - slow_cpu_) / cpu_ticks_a_second() * 1000.0);
+            }
+            slow_cpu_ = cpu;
             slow_work_ = work;
             slow_at_ = now, slow_waited_ = waited, slow_draws_ = draws, slow_resolves_ = resolves, slow_reports_ = reports;
             slow_swaps_++;

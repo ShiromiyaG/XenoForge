@@ -2267,10 +2267,33 @@ void Translator::main_vertex() {
                               m_.op(Op::OpISub, uint_, {u(8192), m_.op(Op::OpCompositeExtract, uint_, {low_u, 1})}),
                               m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpCompositeExtract, uint_, {high_u, 0}), u(1)}),
                               m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpCompositeExtract, uint_, {high_u, 1}), u(1)})};
-        for (uint32_t k = 0; k < 4; k++) {
-            Id at = m_.op(Op::OpAccessChain, ptr, {extents, u(0), m_.op(Op::OpIAdd, uint_, {first, u(k)})});
-            m_.op(Op::OpAtomicUMax, uint_, {at, device, relaxed, values[k]});
-        }
+        auto store = [&](const Id (&v)[4]) {
+            for (uint32_t k = 0; k < 4; k++) {
+                Id at = m_.op(Op::OpAccessChain, ptr, {extents, u(0), m_.op(Op::OpIAdd, uint_, {first, u(k)})});
+                m_.op(Op::OpAtomicUMax, uint_, {at, device, relaxed, v[k]});
+            }
+        };
+        if (!vertex_.extents_subgroup) return store(values);
+        // (VertexOptions::extents_subgroup: every vertex of a draw bounds the same report, so the
+        // atomics on its four words are one subgroup's at a time rather than each invocation's)
+        m_.capability(spv::Capability::GroupNonUniform);
+        m_.capability(spv::Capability::GroupNonUniformVote);
+        m_.capability(spv::Capability::GroupNonUniformArithmetic);
+        const Id subgroup = u(uint32_t(spv::Scope::Subgroup));
+        const Id reduce = uint32_t(spv::GroupOperation::Reduce);
+        Id reduced[4];
+        for (uint32_t k = 0; k < 4; k++)
+            reduced[k] = m_.op(Op::OpGroupNonUniformUMax, uint_, {subgroup, reduce, values[k]});
+        Id same = m_.op(Op::OpGroupNonUniformAllEqual, bool_, {subgroup, first});
+        Id elected = m_.op(Op::OpGroupNonUniformElect, bool_, {subgroup});
+        when(m_.op(Op::OpLogicalAnd, bool_, {same, elected}), [&] {
+            store(reduced);
+            return false;
+        });
+        when(m_.op(Op::OpLogicalNot, bool_, {same}), [&] {
+            store(values);
+            return false;
+        });
     };
     // oPts.x clamped to PA_SU_POINT_MINMAX (system values' y and z) as Xenia
     // does, like signed integers (-NaN and negatives to the minimum, NaN to

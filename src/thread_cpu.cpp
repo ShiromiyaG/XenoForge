@@ -9,6 +9,8 @@
 #include <time.h>
 #endif
 
+#include <chrono>
+
 namespace xf {
 
 std::atomic<unsigned long> gpu_back_end_os_thread{0};
@@ -67,6 +69,21 @@ double process_cpu_seconds() {
     timespec t{};
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
     return double(t.tv_sec) + double(t.tv_nsec) * 1e-9;
+#endif
+}
+
+double cpu_ticks_a_second() {
+#ifdef _WIN32
+    static const double rate = [] {
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint64_t c0 = current_thread_cpu_ticks();
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(20)) {}
+        const uint64_t c1 = current_thread_cpu_ticks();
+        return double(c1 - c0) / std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }();
+    return rate;
+#else
+    return 1e9;
 #endif
 }
 

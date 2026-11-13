@@ -125,6 +125,9 @@ public:
     // draws run only where a buffer's word is not zero
     // (VK_EXT_conditional_rendering): the VIZ queries' predicated draws
     bool conditional_rendering() const { return conditional_rendering_; }
+    // subgroup votes, arithmetic and election in vertex shaders (Vulkan 1.1's subgroup
+    // properties: the screen extents' maxima reduced a subgroup at a time)
+    bool vertex_subgroup_arithmetic() const { return vertex_subgroup_arithmetic_; }
     // storage image descriptors updated after binding (the resolve targets)
     bool storage_image_update_after_bind() const { return storage_image_update_after_bind_; }
     // VK_EXT_extended_dynamic_state3's blend enables, blend equations and
@@ -223,6 +226,7 @@ private:
     bool clip_distance_ = false, cull_distance_ = false, wide_lines_ = false, fill_mode_non_solid_ = false;
     bool maintenance8_ = false;
     bool conditional_rendering_ = false;
+    bool vertex_subgroup_arithmetic_ = false;
     bool device_fault_ = false, device_fault_vendor_binary_ = false, memory_budget_ = false;
     bool custom_border_color_ = false, storage_image_update_after_bind_ = false;
     bool depth_bias_control_ = false;

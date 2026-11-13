@@ -54,6 +54,8 @@ class DeferredSink final : public Sink {
     // the sink on another: a sink that sends its own entry points here (the
     // renderer) does its work then.
     static bool passing();
+    // True on the back end's own thread only.
+    static bool on_back_end();
     // Everything handed over so far done; from any thread (at once on the
     // back end's own).
     void finish();
@@ -71,6 +73,8 @@ class DeferredSink final : public Sink {
         uint64_t finishes = 0, full = 0;              // other waits: finish() from outside, the ring full
         uint64_t late_writes = 0;                     // fences written by the back end
         double wait_seconds = 0;                      // the front end's time waiting for the back end
+        // of it, by why (Work::back_end_wait_seconds's order: SyncFor's, the extents', the ring full)
+        double wait_by[Work::BACK_END_WAITS] = {};
     };
     Stats stats() const;
     // the back end's processor time so far (thread_cpu.h's ticks), from any thread
@@ -130,7 +134,9 @@ class DeferredSink final : public Sink {
     // the register blocks written since the last record, as one (before any other record)
     void push_registers();
     void push_draw(Kind kind, const Draw &d);
-    void wait_done(uint64_t position, uint64_t *counter);
+    // (why: the index in Stats::wait_by)
+    void wait_done(uint64_t position, uint64_t *counter, size_t why);
+    static constexpr size_t WAIT_EXTENTS = size_t(SyncFor::COUNT), WAIT_FULL = size_t(SyncFor::COUNT) + 1;
 
     // ---- the back end ----
     void run();
@@ -154,6 +160,7 @@ class DeferredSink final : public Sink {
     std::atomic<uint32_t> waiters_{0}; // threads asleep in a wait for done_
     std::thread thread_;
     ThreadCpu back_cpu_;
+    std::atomic<uint64_t> back_busy_{0}; // the back end's wall time with records to do (FastClock's ticks)
 
     // Where the back end's work yet to be done writes guest memory, physical [start, end), and the
     // position its record ends at: the resolves' destinations and the fences written later. A
