@@ -21,12 +21,12 @@ These are not negotiable. A change that breaks one is not merged.
    shader dumps, saves, or recordings. Test data lives outside the
    repository (for example `../traces/`), and the tests find it through
    environment variables.
-2. **No game names or title IDs in the repository.** That covers code,
-   comments, tests, CMake, scripts, examples and docs, and commit messages
-   too.
+2. **No game names or title IDs in the repository's files.** That covers
+   code, comments, tests, CMake, scripts, examples and docs.
    - Write "a game" or `<game>`, and use made-up addresses in examples.
-   - Measurements name games as "game A", "game B" and so on.
-   - Names and IDs are fine in an issue or a chat, never in a commit.
+   - Measurements in the docs name games as "game A", "game B" and so on.
+   - Commit messages, pull requests and issues may name the game a change
+     fixes or was measured on, with its title ID, as Xenia's history does.
 3. **No confidential material.** Never use leaked or non-public Microsoft
    material: XDK leaks, internal documents, leaked source. Never commit
    console keys, key vaults, NAND images or firmware. Public documentation,

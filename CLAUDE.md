@@ -79,10 +79,12 @@ aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-k
   `xfrecomp tests`; ~1 min de build). Descoberta: `build/xfrecomp analyze <iso> --compare <*_init.cpp do rexglue>`.
 - O fork do rexglue (`../rexglue-sdk`) fica como está: continua rodando os ports dos jogos A e B até o XenoForge rodá-los.
   Não mexer nele por causa do XenoForge.
-- **Nenhum nome de jogo no repositório** (dono, 2026-11-08): nem em código, comentários, testes, CMake, scripts,
-  exemplos, READMEs, docs ou mensagens de commit. Escrever "um jogo", "<jogo>", endereços inventados nos
-  exemplos; medições por jogo usam "jogo A".."jogo H", com a chave (nomes, title IDs, caminhos dos discos) só
-  no `docs/plan.md` local, seção "Test discs". Testar com discos reais à mão pode.
+- **Nenhum nome de jogo nos arquivos do repositório** (dono, 2026-11-08): nem em código, comentários, testes,
+  CMake, scripts, exemplos, READMEs ou docs. Escrever "um jogo", "<jogo>", endereços inventados nos exemplos;
+  medições por jogo nos docs usam "jogo A".."jogo H", com a chave (nomes, title IDs, caminhos dos discos) só no
+  `docs/plan.md` local, seção "Test discs". **Mensagens de commit podem nomear o jogo** (e o title ID) que a
+  mudança corrige ou em que foi medida (dono, 2026-11-13, como o histórico do Xenia faz). Testar com discos
+  reais à mão pode.
 - Nada derivado dos jogos entra aqui (ISOs, XEX, imagens, traces de GPU, dumps). Listas de nomes de funções do
   sistema e versões do XDK são fatos e podem ir para os docs.
 - O renderizador é geral (implementa o hardware, nunca casos de jogo); o que um jogo pede e não existe é
