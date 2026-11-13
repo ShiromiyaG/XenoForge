@@ -114,6 +114,16 @@ struct VertexOptions {
     // their texel's center instead of adding the rounding epsilon. One
     // setting for the whole run (the renderer's), so not part of the key.
     bool texture_point_snap = false;
+    // The console's vertex snapping (PA_SU_VTX_CNTL's quant_mode and
+    // round_mode: 1/16 to 1 pixel, truncated or rounded, R6xx register
+    // reference) done in the vertex shader on the final position, where hosts
+    // snap to their own subpixel grid (1/256 here) and Xenia does not snap:
+    // the position over w mapped to console pixels by the system constants'
+    // member 10, snapped there by the mode in flags.y bits 24-25 (round) and
+    // 26-28 (quant), and mapped back; positions not in front of the eye are
+    // left as they are (the hardware snaps after clipping). One setting for
+    // the whole run (the renderer's Options::vertex_snap), so not part of the key.
+    bool vertex_snap = false;
     // a word naming the variant (the renderer's key for the module)
     uint32_t key() const {
         return uint32_t(host) | (equal_spacing ? 1u << 8 : 0u) | uint32_t(clip_planes) << 9 |

@@ -839,13 +839,17 @@ add_test(NAME shader_compare COMMAND shader_compare_test)
 add_executable(replay_test tests/replay_test.cpp)
 target_link_libraries(replay_test PRIVATE xenoforge_vk stb)
 add_test(NAME replay COMMAND replay_test)
-# the software reference renderer against Xenia's pictures and the Vulkan
-# renderer's (three ways), where XF_TRACES and XF_DUMPS say; its pieces
-# against the documents' values
+# the three-way check: the software reference renderer, the Vulkan renderer
+# on both render target paths and Xenia's pictures, classed per frame and
+# gated against the baseline XF_REFERENCE_BASELINE names (outside the
+# repository: it names traces; it also says where the traces and dumps are,
+# XF_TRACES and XF_DUMPS win). Skipped (77) with no traces; no gate without
+# the file. docs/renderer.md, "The three-way check". Its pieces against the
+# documents' values below.
 add_executable(reference_test tests/reference_test.cpp)
 target_link_libraries(reference_test PRIVATE xenoforge_vk stb)
 add_test(NAME reference COMMAND reference_test)
-set_tests_properties(reference PROPERTIES TIMEOUT 1800)
+set_tests_properties(reference PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 RUN_SERIAL ON)
 add_executable(reference_units_test tests/reference_units_test.cpp)
 target_link_libraries(reference_units_test PRIVATE xenoforge)
 add_test(NAME reference_units COMMAND reference_units_test)

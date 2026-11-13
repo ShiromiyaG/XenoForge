@@ -3482,6 +3482,11 @@ private:
         const char *v = std::getenv("XF_TEXTURE_POINT_SNAP");
         return v && v[0] == '1';
     }();
+    // the console's vertex snapping in the vertex shaders (Options::vertex_snap, or XF_VERTEX_SNAP=1)
+    bool vertex_snap_ = [this] {
+        const char *v = std::getenv("XF_VERTEX_SNAP");
+        return options_.vertex_snap || (v && v[0] == '1');
+    }();
     // the screen extents' maxima a subgroup at a time (shader::VertexOptions::extents_subgroup)
     // where the device has subgroup arithmetic in vertex shaders; XF_EXTENTS_SUBGROUP=0 off
     bool extents_subgroup_ = [] {
@@ -5793,6 +5798,7 @@ VkShaderModule Impl::form_module(Shader &s, uint32_t key, const shader::VertexOp
     shader::PixelOptions p = pixel;
     v.texture_point_snap = p.texture_point_snap = point_snap_;
     p.console_centers = console_centers_ && !scale_.one();
+    v.vertex_snap = vertex_snap_;
     v.extents_subgroup = v.extents && extents_subgroup_ && d_.vertex_subgroup_arithmetic();
     if (pending && translate_later(s, key)) {
         if (s.translating.insert(key).second)
@@ -10492,12 +10498,12 @@ void Impl::draw(const gpu::Draw &d) {
     System sys{};
     for (int i = 0; i < 3; i++) sys.ndc_scale[i] = viewport.ndc_scale[i], sys.ndc_offset[i] = viewport.ndc_offset[i];
     sys.ndc_scale[3] = 1.0f;
-    if (host_vertex.extents) {
-        // the host's NDC to the viewport's console pixels
+    if (host_vertex.extents || vertex_snap_) {
+        // the host's NDC to the viewport's console pixels (for the extents and the vertex snapping)
         const VkViewport &v = viewport.viewport;
         sys.extent_map[0] = v.width * 0.5f, sys.extent_map[1] = v.x + v.width * 0.5f;
         sys.extent_map[2] = v.height * 0.5f, sys.extent_map[3] = v.y + v.height * 0.5f;
-        sys.extent_report[0] = extent_words;
+        if (host_vertex.extents) sys.extent_report[0] = extent_words;
     }
     uint32_t color_control = regs_[r::RB_COLORCONTROL];
     if (color_control & 8) sys.flags[0] = 8 | (color_control & 7);
@@ -10521,6 +10527,9 @@ void Impl::draw(const gpu::Draw &d) {
                              (unsigned long long)report_.draws, pitch, width, height);
         }
     }
+    // the vertex snapping's mode (shader::VertexOptions::vertex_snap): PA_SU_VTX_CNTL's round_mode, quant_mode
+    if (vertex_snap_)
+        sys.flags[1] |= ((regs_[r::PA_SU_VTX_CNTL] >> 1) & 3) << 24 | ((regs_[r::PA_SU_VTX_CNTL] >> 3) & 7) << 26;
     // the pixel parameters (SQ_PROGRAM_CNTL's param_gen) into the
     // interpolator SQ_CONTEXT_MISC's param_gen_pos names, as Xenia's
     // GetInterpolatorInputMask allows them (within the 16 interpolators),

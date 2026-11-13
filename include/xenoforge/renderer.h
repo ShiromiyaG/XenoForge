@@ -407,6 +407,12 @@ struct Options {
     // each linearly), 2 nearest everywhere
     uint32_t anisotropy = 0;
     uint32_t texture_filter = 0;
+    // The console's vertex snapping (PA_SU_VTX_CNTL's quant_mode and round_mode, 1/16 pixel in the games seen)
+    // done in the vertex shaders (shader::VertexOptions::vertex_snap), as the software reference renderer does;
+    // off by default, as Xenia, which leaves positions to the host's own subpixel grid (1/256). A full-screen pass
+    // whose texture coordinates fall near texel edges then reads the texels the console reads (docs/renderer.md,
+    // "The three-way check"). XF_VERTEX_SNAP=1 turns it on too.
+    bool vertex_snap = false;
 };
 
 // The render target path a renderer takes with these options on the device

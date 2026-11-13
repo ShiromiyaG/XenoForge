@@ -2208,7 +2208,56 @@ void Translator::main_vertex() {
         Id w = comp(xyzw, 3);
         Id moved = exact(Op::OpFAdd, vec4_,
                          {exact(Op::OpFMul, vec4_, {xyzw, scale}), exact(Op::OpVectorTimesScalar, vec4_, {offset, w})});
-        return vec4_of(comp(moved, 0), comp(moved, 1), comp(moved, 2), w);
+        Id x = comp(moved, 0), y = comp(moved, 1);
+        if (vertex_.vertex_snap) {
+            // VertexOptions::vertex_snap: x and y over w to console pixels
+            // (system member 10: x scale, x offset, y scale, y offset), to
+            // PA_SU_VTX_CNTL's grid by its rounding (as the reference's
+            // draw.cpp snap), and back
+            Id map = load(vec4_, m_.op(Op::OpAccessChain, ptr_u_vec4, {system_, u(10)}));
+            Id flags = m_.op(Op::OpCompositeExtract, uint_,
+                             {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                                 {system_, u(3)})),
+                              1});
+            Id round = m_.op(Op::OpBitwiseAnd, uint_, {m_.op(Op::OpShiftRightLogical, uint_, {flags, u(24)}), u(3)});
+            Id quant = m_.op(Op::OpBitwiseAnd, uint_, {m_.op(Op::OpShiftRightLogical, uint_, {flags, u(26)}), u(7)});
+            // steps a pixel: 16 >> quant, one pixel from quant 4 up
+            Id steps =
+                m_.op(Op::OpConvertUToF, float_,
+                      {m_.op(Op::OpShiftRightLogical, uint_, {u(16), glsl(GLSLstd450UMin, uint_, {quant, u(4)})})});
+            Id in_front = m_.op(Op::OpFOrdGreaterThan, bool_, {w, f(0)});
+            auto snap = [&](Id v, uint32_t c) {
+                Id map_scale = comp(map, 2 * c), map_offset = comp(map, 2 * c + 1);
+                Id pixels =
+                    exact(Op::OpFAdd, float_,
+                          {exact(Op::OpFMul, float_, {exact(Op::OpFDiv, float_, {v, w}), map_scale}), map_offset});
+                Id s = exact(Op::OpFMul, float_, {pixels, steps});
+                Id floor = glsl(GLSLstd450Floor, float_, {s});
+                Id nearest = glsl(GLSLstd450Floor, float_, {exact(Op::OpFAdd, float_, {s, f(0.5f)})});
+                // to odd: a half way between goes to the odd one of the two
+                Id half = m_.op(Op::OpFOrdEqual, bool_, {exact(Op::OpFSub, float_, {s, floor}), f(0.5f)});
+                Id floor_odd =
+                    m_.op(Op::OpFOrdNotEqual, bool_,
+                          {glsl(GLSLstd450FAbs, float_, {m_.op(Op::OpFRem, float_, {floor, f(2.0f)})}), f(0)});
+                Id odd = select(float_, half,
+                                select(float_, floor_odd, floor, exact(Op::OpFAdd, float_, {floor, f(1.0f)})), nearest);
+                Id r = select(float_, m_.op(Op::OpIEqual, bool_, {round, u(0)}), glsl(GLSLstd450Trunc, float_, {s}),
+                              select(float_, m_.op(Op::OpIEqual, bool_, {round, u(1)}), nearest,
+                                     select(float_, m_.op(Op::OpIEqual, bool_, {round, u(2)}),
+                                            glsl(GLSLstd450RoundEven, float_, {s}), odd)));
+                Id snapped = exact(Op::OpFDiv, float_, {r, steps});
+                Id back = exact(
+                    Op::OpFMul, float_,
+                    {exact(Op::OpFDiv, float_, {exact(Op::OpFSub, float_, {snapped, map_offset}), map_scale}), w});
+                // only where the mapping is a number both ways (w in front, a viewport of some size)
+                Id finite = m_.op(Op::OpLogicalNot, bool_,
+                                  {m_.op(Op::OpLogicalOr, bool_,
+                                         {m_.op(Op::OpIsNan, bool_, {back}), m_.op(Op::OpIsInf, bool_, {back})})});
+                return select(float_, m_.op(Op::OpLogicalAnd, bool_, {in_front, finite}), back, v);
+            };
+            x = snap(x, 0), y = snap(y, 1);
+        }
+        return vec4_of(x, y, comp(moved, 2), w);
     };
     // The guest position's distance to each enabled user clip plane (system
     // member 9), as Xenia's dp4, into a clip or cull distance array.

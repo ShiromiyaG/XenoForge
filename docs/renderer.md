@@ -4823,10 +4823,12 @@ shaders (disassembled), texture fetch constants, nonzero float constants,
 indices and clip-space vertices; `XF_REF_DUMP_MEMORY=<hex address>:<hex
 size>:<file>` writes that physical memory after the trace (resolves
 included), to compare with Xenia's (a local `--trace_dump_memory` in its
-trace dump, with `--readback_resolve=full`). The three-way regression:
-`XF_TRACES=../traces XF_DUMPS=../traces/dumps build/reference_test`
-(`XF_REFERENCE_FILTER=<name>`, `XF_REFERENCE_OUT=<dir>` for its frames); it
-fails on crashes and failed replays, not yet on differences.
+trace dump, with `--readback_resolve=full`); `XF_REF_DUMP_RESOLVES=<dir>`
+writes what each resolve wrote, a file each, named and laid out as the
+Vulkan renderer's `XF_DUMP_RESOLVES` (with `xfreplay --readback-resolve
+full`), so the first resolve where the two part is found by comparing the
+two directories. The three-way check, classed and gated against a baseline:
+`build/reference_test` ("The three-way check" below).
 `reference_units_test` checks the pieces against the documents' values.
 
 **Design.** `reference::Renderer` is a `gpu::Sink` played by the same trace
@@ -4989,6 +4991,152 @@ halfway (as to the edge); signed versions of the widened formats
 extents (the processor's fake reports); getBCF (0, as Xenia). Performance:
 one interpreter invocation per vertex and per pixel lane, heap-allocated;
 the 29 frames take a minute, the work is bound by the interpreter.
+
+## The three-way check (2026-11-13)
+
+`reference_test` sets each frame beside three pictures and puts it in a
+class: the reference's, ours (the Vulkan renderer, on each render target
+path: exact through fragment shader interlock, and host render targets) and
+Xenia's. Two pictures agree within `replay_test`'s bound (mean difference 1
+of 255, at most 0.1% of pixels off by more than 16). The classes:
+
+- **a**: all three agree (two pairs of the three within the bound count too:
+  the third is then just past it);
+- **b**: ours and Xenia agree, the reference differs: the reference is
+  suspect, or the two emulators share an error;
+- **c**: ours and the reference agree, Xenia differs: ours is likely right;
+- **d**: ours alone differs: our bug;
+- **e**: all three differ.
+
+Xenia's picture for the exact path is its Direct3D 12 ROV dump
+(`<dumps>/rov/d3d12`), then its Vulkan FSI one (`<dumps>/rov`); for the host
+path its Direct3D 12 default dump (`<dumps>/d3d12`), then its Vulkan one, then
+the ROV one: the first there, or a later one where ours agrees with that one
+alone, as `replay_test` accepts it (the line names the picture taken).
+
+**The gate.** `XF_REFERENCE_BASELINE` names a TOML file kept outside the
+repository (it names traces, and so title IDs), as the deterministic check
+keeps its expected values: here `F:/RECOMPs/external/reference/baseline.toml`.
+It says where the traces and dumps are (`traces = "<dir>"`, `dumps = ["<dir>",
+...]`; `XF_TRACES` and `XF_DUMPS`, directories split by semicolons, win) and
+holds one `[[frame]]` per frame and path: `name` (the trace relative to the
+traces, without `.xtr`), `path` (`exact` or `host`), `class`, `xenia` (the
+picture compared) and the three pairs `ref_xenia`, `ref_ours`, `ours_xenia`
+as `[mean, share]`. A frame fails when its class gets worse (in the order a,
+c, b, d, e: how far ours is from being right) or a pair's mean grows by more
+than 0.05 or its share by more than 0.05 points; a better class is printed.
+`reference_test --update` writes the run into the file (the frames a
+`XF_REFERENCE_FILTER` left out are kept). ctest's `reference` runs it: with
+the baseline's variable alone it needs nothing else; without the file the
+table is printed and only crashes and failed replays fail; with no traces at
+all it is skipped (77). `XF_REFERENCE_PATHS=exact,host` picks the paths,
+`XF_REFERENCE_OUT=<dir>` writes the reference's frame (`<stem>.png`) and ours
+(`<stem>_<path>.png`). A full run takes about 15 minutes (the reference's
+share 4 minutes for 42 frames; ours twice).
+
+The owner's new captures of games G and E were dumped by Xenia's Direct3D
+12 trace dump (default and `--render_target_path_d3d12=rov`) into
+`../traces/dumps_threeway`, beside the regression's `../traces/dumps`, so
+`replay_test`'s set stays as it is (they match Xenia on our exact path: game
+G's bar 0.36-0.38 of 255 and 0.02%, the checker 0.36, 0.01%).
+
+**Results** (2026-11-13; mean of 255, share off by more than 16; the exact
+path, the host path's class the same in every frame):
+
+| frame | ref : Xenia | ref : ours | ours : Xenia | class |
+| --- | --- | --- | --- | --- |
+| Game B 1800-3601, 600, 601 (6) | 0.001-0.100, 0.00% | the same | 0.000, 0.00% | a |
+| Game A 300, 301, 900, 1800, 2400, loading | 0.004-0.197, 0.00-0.04% | the same | 0.000, 0.00% | a |
+| Game A menu | 0.320, 0.21% | 0.320, 0.21% | 0.000, 0.00% | b |
+| Game A park | 5.588, 9.93% | 5.588, 9.93% | 0.000, 0.00% (FSI picture) | b |
+| Game A race | 4.886, 7.99% | 4.886, 8.00% | 0.002, 0.00% (FSI picture) | b |
+| Game C 600-3600 (4) | 0.000, 0.00% | the same | 0.000, 0.00% | a |
+| Game D intro, 4300 | 0.056-0.113, 0.00-0.09% | 0.045-0.090 | 0.011-0.023, 0.00% | a |
+| Game D cockpit 3347 | 0.455, 0.41% | 0.405, 0.41% | 0.135, 0.00% | b |
+| Game D drive 5000 | 0.614, 0.46% | 0.607, 0.46% | 0.080, 0.00% | b |
+| Game D 5600 | 1.142, 0.35% | 1.131, 0.35% | 0.168, 0.01% | b |
+| Game D 6400 | 1.649, 1.68% | 1.655, 1.68% | 0.113, 0.00% | b |
+| Game E 600-3600 (4) | 0.001-0.279, 0.00% | the same | 0.000, 0.00% | a |
+| Game E horde | 1.720, 1.50% | 2.231, 2.71% | 0.783, 0.58% | e |
+| Game F 600-3600 (4) | 0.000-0.195, 0.00-0.02% | the same | 0.000, 0.00% | a |
+| Game G 600 | 0.000, 0.00% | 0.000, 0.00% | 0.000, 0.00% | a |
+| Game G 850 | 0.652, 0.86% | 0.724, 0.97% | 0.168, 0.03% | b |
+| Game G 950 | 0.565, 0.53% | 0.638, 0.64% | 0.169, 0.03% | b |
+| Game G bar 1260, 1485, 1596 | 0.684-0.716, 0.26-0.29% | 0.867-0.883, 0.36-0.38% | 0.358-0.376, 0.02% | b |
+| Game G checker 1294 | see the baseline | | | |
+| Game H title | 0.022, 0.00% | 0.022, 0.00% | 0.000, 0.00% | a |
+
+No frame is in class c or d: where ours differs from Xenia, the reference
+does not side with ours. Nothing is skipped by the reference in any frame.
+
+**Triage, frame by frame.** The tools: the resolves compared one by one
+(`XF_REF_DUMP_RESOLVES` beside `XF_DUMP_RESOLVES`), then the pixel and draw
+traces at the first one that parts.
+
+- *Game A menu: vertex snapping (reference right by the documents; a
+  renderer switch).* A full-screen pass draws a 1280x720 DXT1 background with
+  texture coordinates 0.016 of a texel past each texel's left edge; in a
+  strip of the screen (x 640-680) Xenia's picture and ours read the texel to
+  the left, the reference the one the coordinate names. The quad's vertices
+  lie 0.04 pixels outside the screen: the console snaps them to
+  PA_SU_VTX_CNTL's grid, 1/16 of a pixel (quant_mode 0: R6xx register
+  reference, "QUANT_MODE"; Xenia's xenos.h: "on the Xbox 360, games normally
+  use 1/16th"), and the attributes are interpolated from the snapped
+  positions; the hosts snap to their own 1/256 and Xenia does not snap. With
+  the reference snapping to 1/256 instead (a throwaway knob) the strip
+  matches Xenia exactly, so this is the whole cause. `Options::vertex_snap`
+  (`XF_VERTEX_SNAP=1`; off by default, as Xenia) snaps the final positions
+  in the vertex shader (shader::VertexOptions::vertex_snap: x and y over w to
+  console pixels by the viewport, to the grid by round_mode, and back;
+  positions behind the eye left alone, where the hardware snaps after
+  clipping). The menu with it: ours against the reference 0.320, 0.21% to
+  0.268, 0.115%, against Xenia 0.000 to 0.097, 0.099% (inside the bound); the
+  strip gone. The rest of the menu is the next item.
+- *Game A menu: the character's ink outlines (hardware).* An outline pass
+  reads the character's depth (D24FS8, resolved as 24_8_FLOAT). A flat
+  backdrop at z/w = 1632.6/1633.6 under reverse Z (depth 1 - z/w) comes out
+  0x440D00 in the reference and 0x440C80 in ours: 128 units of the 20e4
+  mantissa at that exponent, one float32 ulp of z/w. The reference divides
+  correctly rounded; the hosts' division is not (NVIDIA's is within 2 ulps).
+  The outlines' edge test then picks other pixels. Which divider the Xenos
+  has is a hardware question (with the multiply's rounding, category C1).
+- *Game A park and race:* the traces' mips were never written (above,
+  "Both settled"); to be recorded again.
+- *Game D (cockpit, drive, 5600, 6400) and game G (850, 950, the bar):
+  alpha-tested foliage and distant vegetation (hardware).* No offset between
+  the pictures (the best shift is 0,0); the leaves are denser or thinner.
+  Resolve by resolve (game D 6400): the shadow maps part first (24-bit depth
+  off by tens of units at the car's silhouette edges, 9% of words past 16
+  units: interpolation and slope offsets), then the scene's float depth. The
+  foliage's DXT1 mips under 4x MSAA with alpha to coverage pass different
+  samples at each LOD: the reference's LOD is exact (Vulkan's reference
+  footprint), the hosts' is the driver's. The documents give no precision
+  for the LOD, the attribute interpolation or the depth plane: the
+  hardware's would settle it.
+- *Game E horde (class e; open).* The three place a wind-animated ivy
+  differently (its vertex shader takes sin of frc'd world positions plus a
+  per-object phase; draws 539 and 692 of the trace, a depth pass and the
+  color pass), several pixels apart; ours is 0.58% off Xenia there, past the
+  bound, and Xenia's own two backends were not compared on it. Not settled:
+  the inputs are small (sin of -pi..pi), so the spread needs a larger cause
+  in the chain (to find: the vertex positions of draw 692 from the
+  reference's draw trace against ours). **The green**: all three draw the
+  tall green pillar in the middle of the frame, so it is in the trace's data
+  (what the guest wrote), not a renderer's doing; the green shadows on the
+  shelves in the owner's live screenshot are in none of the three (the
+  shelves' green tint is the same in all: 8.9-9.0 against 9.5 in the
+  screenshot), so they are not in this trace's frame at 100%: they come
+  from a resolution scale (the color-grading LUT drawn into a 16x512 target
+  whose row index crosses a boundary at the host's sub-pixel positions,
+  fixed separately by reading small targets' interpolators at the console
+  pixel's center, `XF_CONSOLE_CENTERS`).
+
+**What only hardware answers** (to add to docs/xenia-todos-gpu.md's category
+C): the divider's and the reciprocal's rounding (z/w above; with C1); the
+texture LOD's precision and the anisotropic footprint (the foliage); the
+attribute and depth interpolation's precision. The vertex snapping itself is
+documented (R6xx) and needs no test, but whether the Xenos interpolates from
+the snapped positions (as R6xx does) would confirm `vertex_snap`.
 
 ## Motion blur near the car: fetches in Q16 (2026-11-09)
 

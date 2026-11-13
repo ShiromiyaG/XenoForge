@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 
 namespace xf::reference {
 
@@ -276,6 +277,20 @@ void Renderer::Impl::resolve(const uint32_t *regs) {
                 for (auto [s, e] : written) textures.invalidate(s, e - s);
             else
                 textures.clear();
+            // XF_REF_DUMP_RESOLVES=<directory>: what each resolve wrote, a file each, named and laid out as the
+            // Vulkan renderer's XF_DUMP_RESOLVES (<resolve's number>_<address>.bin, the ranges one after the
+            // other), so the first resolve where the two differ is found by comparing the two directories
+            static const char *const dump = std::getenv("XF_REF_DUMP_RESOLVES");
+            if (dump && *dump && !written.empty()) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "%05llu_%08X.bin", (unsigned long long)report.resolves,
+                              written.front().first);
+                if (std::FILE *f = std::fopen((std::filesystem::path(dump) / name).string().c_str(), "wb")) {
+                    for (auto [s, e] : written)
+                        std::fwrite(guest.data() + (s & GuestMemory::PHYSICAL_MASK), 1, e - s, f);
+                    std::fclose(f);
+                }
+            }
         }
     }
     // the clears, after the copy, over the same rectangle (RB_DEPTH_CLEAR,
