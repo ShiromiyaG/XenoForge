@@ -15,6 +15,8 @@
 //   module.
 // - DEPTH_ONLY (with SAMPLE_INTERLOCK or not): a whole fragment shader for the
 //   draws without a pixel shader that test or write depth or stencil.
+// - DEPTH_ONLY with UNORDERED: the same without the interlock, for the
+//   renderer's unordered depth passes (xf_fsi_depth_unordered).
 //
 // The render targets' state is the draw's uniform block (binding 4), or, with
 // the specialization constants set (SPECIALIZED), the formats, write masks,
@@ -23,13 +25,20 @@
 // because all of it is dynamic).
 
 #version 460
-#ifdef DEPTH_ONLY
+#if defined(DEPTH_ONLY) && !defined(UNORDERED)
 #extension GL_ARB_fragment_shader_interlock : require
 #endif
 
 #include "edram_fsi.glsl"
 
-#ifdef DEPTH_ONLY
+#if defined(DEPTH_ONLY) && defined(UNORDERED)
+// no interlock: the renderer's unordered depth passes (xf_fsi_depth_unordered)
+void main() {
+    vec2 dxy = vec2(dFdxCoarse(gl_FragCoord.z), dFdyCoarse(gl_FragCoord.z));
+    if (gl_HelperInvocation) return;
+    xf_fsi_depth_unordered(gl_FragCoord, dxy, uint(gl_SampleMaskIn[0]), gl_FrontFacing);
+}
+#elif defined(DEPTH_ONLY)
 #ifdef SAMPLE_INTERLOCK
 layout(sample_interlock_ordered) in;
 #else
@@ -38,14 +47,17 @@ layout(pixel_interlock_ordered) in;
 void main() {
     vec2 dxy = vec2(dFdxCoarse(gl_FragCoord.z), dFdyCoarse(gl_FragCoord.z));
     bool alive = !gl_HelperInvocation;
+    // (the early rejection: a fragment that fails leaves the interlock at once)
+    alive = alive && !xf_fsi_rejects(gl_FragCoord, dxy, uint(gl_SampleMaskIn[0]), gl_FrontFacing, alive);
     beginInvocationInterlockARB();
     xf_fsi(vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), 0u, 0.0, false, gl_FragCoord, dxy, uint(gl_SampleMaskIn[0]),
            gl_FrontFacing, 0xFu, alive);
     endInvocationInterlockARB();
 }
 #else
-// keeps xf_fsi in the module; never run
+// keeps xf_fsi and xf_fsi_rejects in the module; never run
 void main() {
+    if (xf_fsi_rejects(vec4(0.0), vec2(0.0), 0u, false, false)) return;
     xf_fsi(vec4(0.0), vec4(0.0), vec4(0.0), vec4(0.0), 0u, 0.0, false, vec4(0.0), vec2(0.0), 0u, false, 0u, false);
 }
 #endif

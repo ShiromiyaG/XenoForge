@@ -268,6 +268,9 @@ const uint32_t EDRAM_FSI_DEPTH_PIXEL[] = {
 const uint32_t EDRAM_FSI_DEPTH_SAMPLE[] = {
 #include "edram_fsi_depth_sample.frag.inc"
 };
+const uint32_t EDRAM_FSI_DEPTH_UNORDERED[] = {
+#include "edram_fsi_depth_unordered.frag.inc"
+};
 const uint32_t EDRAM_CLEAR[] = {
 #include "edram_clear.comp.inc"
 };
@@ -1053,6 +1056,9 @@ struct Pass {
     // the interlock path's passes have no attachments: their draws' samples
     // apart (all pipelines in such a pass rasterize at one count)
     uint32_t samples = 0;
+    // an unordered depth pass of the interlock path (1 minimum, 2 maximum;
+    // Impl::fsi_depth_run_), a pass apart from the interlock's draws
+    uint32_t unordered = 0;
     bool operator==(const Pass &) const = default;
 };
 
@@ -3247,6 +3253,7 @@ private:
         VkPipeline pipe = VK_NULL_HANDLE;
         bool premultiplied = false;
         uint32_t premultiply[4] = {};
+        uint32_t fsi_unordered = 0;
     } pipeline_memo_;
     std::vector<std::pair<const char *, bool>> pipeline_counts_;
     bool pipeline_recording_ = false, pipeline_keepable_ = false;
@@ -3744,7 +3751,72 @@ private:
     // 6, a slot's share each, read back at its end).
     uint32_t fsi_ = 0;
     bool fsi_2x_as_4x_ = false;         // the guest's 2x rasterized as 4x (no 2x without attachments)
+    // The early rejection's knowledge of the render pass under way
+    // (edram_fsi.glsl's xf_fsi_rejects; reset as a pass begins, after its
+    // barrier made every earlier write seen): whether a draw in it may have
+    // raised or lowered depth in EDRAM, and the tiles color targets wrote.
+    // XF_FSI_EARLY_REJECT=0 turns the rejection off.
+    // A set of EDRAM's tiles, a bit each, filled a run of tiles at a time.
+    struct TileSet {
+        std::array<uint64_t, EDRAM_TILES / 64> words{};
+        void set_run(uint32_t first, uint32_t count) { // (wrapping at EDRAM's end)
+            first %= EDRAM_TILES;
+            while (count) {
+                const uint32_t bit = first & 63, n = std::min(count, 64 - bit);
+                words[first >> 6] |= (n == 64 ? ~0ull : ((1ull << n) - 1)) << bit;
+                count -= n, first = (first + n) % EDRAM_TILES;
+            }
+        }
+        void set_all() { words.fill(~0ull); }
+        void add(const TileSet &o) {
+            for (size_t i = 0; i < words.size(); i++) words[i] |= o.words[i];
+        }
+        bool meets(const TileSet &o) const {
+            for (size_t i = 0; i < words.size(); i++)
+                if (words[i] & o.words[i]) return true;
+            return false;
+        }
+    };
+    struct FsiPassDepth {
+        bool raised = false, lowered = false;
+        TileSet color;
+    } fsi_pass_;
+    bool fsi_early_reject_ = [] {
+        const char *v = std::getenv("XF_FSI_EARLY_REJECT");
+        return !(v && v[0] == '0');
+    }();
+    // the EDRAM tiles of a target (its base and a row's tiles) under the
+    // draw's reach (reach_), at tile_width x tile_height console pixels each
+    void fsi_reach_tiles(TileSet &tiles, uint32_t base, uint32_t pitch_tiles, uint32_t tile_width,
+                         uint32_t tile_height) const {
+        for (const Reach &r : reach_) {
+            if (r.x1 <= r.x0 || r.y1 <= r.y0) continue;
+            const uint32_t c0 = r.x0 / tile_width, c1 = std::min((r.x1 + tile_width - 1) / tile_width, pitch_tiles);
+            const uint32_t r0 = r.y0 / tile_height, r1 = (r.y1 + tile_height - 1) / tile_height;
+            if (uint64_t(r1 - r0) * pitch_tiles >= EDRAM_TILES) return tiles.set_all();
+            if (c1 <= c0) continue;
+            for (uint32_t row = r0; row < r1; row++) tiles.set_run(base + row * pitch_tiles + c0, c1 - c0);
+        }
+    }
+    // the tiles a draw's color targets write (FsiConstants' rt: written, a
+    // write mask) and those its depth test reads
+    void fsi_color_tiles(const FsiConstants &f, TileSet &tiles) const;
+    void fsi_depth_tiles(const FsiConstants &f, TileSet &tiles) const;
     VkShaderModule fsi_depth_fs_ = VK_NULL_HANDLE; // depth and stencil alone (no pixel shader)
+    // Beyond Xenia: depth alone without the interlock (edram_fsi.glsl's
+    // xf_fsi_depth_unordered), for runs of draws without a pixel shader that
+    // write depth one way only, without the stencil or an occlusion query: a
+    // render pass of their own (Pass::unordered; its barriers order them
+    // against the interlock's draws) once a run is fsi_depth_run_min_ long.
+    // XF_FSI_UNORDERED_DEPTH=0 turns it off, =<n> sets the run's length.
+    VkShaderModule fsi_depth_unordered_fs_ = VK_NULL_HANDLE;
+    struct {
+        uint32_t direction = 0, count = 0; // the run of such draws so far
+    } fsi_depth_run_;
+    uint32_t fsi_depth_run_min_ = [] {
+        const char *v = std::getenv("XF_FSI_UNORDERED_DEPTH");
+        return v && *v ? uint32_t(std::atoi(v)) : 3u;
+    }();
     VkPipeline clear_pipeline_ = VK_NULL_HANDLE;
     // EDRAM between the console's size and scale_'s (edram_rescale.comp), for
     // traces' snapshots: through edram_1x_, EDRAM at the console's size; the
@@ -3845,7 +3917,7 @@ Impl::~Impl() {
                          scaled_fill_pipeline_})
         if (p) vkDestroyPipeline(dev_, p, nullptr);
     for (VkShaderModule m : {fullscreen_vs_, load_fs_[0], load_fs_[1], load_fs_[2], load_uint_fs_, depth_float24_fs_[0],
-                             depth_float24_fs_[1], placeholder_fs_, fsi_depth_fs_})
+                             depth_float24_fs_[1], placeholder_fs_, fsi_depth_fs_, fsi_depth_unordered_fs_})
         if (m) vkDestroyShaderModule(dev_, m, nullptr);
     for (VkDescriptorPool p : edram_pools_) vkDestroyDescriptorPool(dev_, p, nullptr);
     for (VkDescriptorPool p : {pool0_, bindless_pool_, compute_pool_, target_pool_})
@@ -4334,6 +4406,8 @@ bool Impl::init(std::string &error) {
         fsi_depth_fs_ = fsi_ == 2 ? module(EDRAM_FSI_DEPTH_SAMPLE, sizeof(EDRAM_FSI_DEPTH_SAMPLE))
                                   : module(EDRAM_FSI_DEPTH_PIXEL, sizeof(EDRAM_FSI_DEPTH_PIXEL));
         if (!fsi_depth_fs_) return error = "could not make the interlock path's depth shader", false;
+        fsi_depth_unordered_fs_ = module(EDRAM_FSI_DEPTH_UNORDERED, sizeof(EDRAM_FSI_DEPTH_UNORDERED));
+        if (!fsi_depth_unordered_fs_) return error = "could not make the interlock path's depth shader", false;
     }
     {
         constexpr VkShaderStageFlags store_stages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -4669,7 +4743,8 @@ bool Impl::init(std::string &error) {
     // a new one goes last)
     const VkShaderModule own[] = {rectangle_gs_,       point_gs_,           tessellation_vs_,    tessellation_hs_[0],
                                   tessellation_hs_[1], tessellation_hs_[2], tessellation_hs_[3], tessellation_hs_[4],
-                                  fsi_depth_fs_,       depth_float24_fs_[0], depth_float24_fs_[1], placeholder_fs_};
+                                  fsi_depth_fs_,       depth_float24_fs_[0], depth_float24_fs_[1], placeholder_fs_,
+                                  fsi_depth_unordered_fs_};
     for (uint32_t k = 0; k < std::size(own); k++)
         if (own[k]) module_names_[own[k]] = {2, own[k] == fsi_depth_fs_ ? fsi_ : 0u, k + 1};
     if (!init_generic(error)) return false;
@@ -5162,6 +5237,7 @@ void Impl::wait_serial(uint64_t serial) {
 VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4], RenderTarget *depth) {
     // (the pass under way: the draw's commands go to the recording thread, nothing waited for)
     if (in_pass_ && pass_ == pass) return slots_[current_].cmd;
+    fsi_pass_ = {};
     VkCommandBuffer c = cmd();
     end_pass();
     // a target's kept clears (pending_clears) beyond this pass's area drawn
@@ -6222,6 +6298,21 @@ RenderTarget Impl::edram_view(bool depth, uint32_t base, uint32_t pitch, uint32_
     t.height = std::clamp(rows * t.tile_height, 1u, 8192u);
     t.host_width = scale_.up(t.width), t.host_height = scale_.up(t.height);
     return t;
+}
+
+void Impl::fsi_color_tiles(const FsiConstants &f, TileSet &tiles) const {
+    const uint32_t msaa = f.flags & 3, pitch_tiles = f.pitch / tile_dwords_;
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!(f.rt[i] & 0x100) || !((f.rt[i] >> 4) & 0xF)) continue;
+        const uint32_t format = f.rt[i] & 0xF;
+        const bool wide = format == 5 || format == 7 || format == 15;
+        fsi_reach_tiles(tiles, f.rt_base[i] / tile_dwords_, pitch_tiles * (wide ? 2 : 1),
+                        (msaa >= 2 ? 40 : 80) / (wide ? 2 : 1), msaa ? 8 : 16);
+    }
+}
+void Impl::fsi_depth_tiles(const FsiConstants &f, TileSet &tiles) const {
+    const uint32_t msaa = f.flags & 3;
+    fsi_reach_tiles(tiles, f.depth_base / tile_dwords_, f.pitch / tile_dwords_, msaa >= 2 ? 40 : 80, msaa ? 8 : 16);
 }
 
 // A resolve's clear into EDRAM on the interlock path (edram_clear.comp): the
@@ -10758,8 +10849,30 @@ void Impl::draw(const gpu::Draw &d) {
     // draw state, shaders and kind of primitive), so everything the key, the
     // description and the lookup are worked out from is as it was then
     // (XF_PIPELINE_MEMO=0: worked out at every draw).
+    // The interlock path's draws without a pixel shader that write depth one
+    // way alone, without the stencil and outside occlusion queries, in a run:
+    // unordered, in a pass of their own (fsi_depth_unordered_fs_) once the
+    // run is long enough, or where the pass under way is such a one already.
+    uint32_t fsi_unordered = 0;
+    if (fsi_ && !export_only) {
+        const uint32_t flags = fsi_constants.flags, fn = (flags / FSI_DEPTH_LESS) & 7;
+        uint32_t direction = 0;
+        if (!ps && (flags & FSI_DEPTH_STENCIL) && (flags & FSI_DEPTH_WRITE) && !(flags & FSI_STENCIL) &&
+            !zpd_current_ && viz_survey_ == UINT32_MAX)
+            direction = fn == 1 || fn == 3 ? 1 : fn == 4 || fn == 6 ? 2 : 0;
+        if (direction && direction == fsi_depth_run_.direction)
+            fsi_depth_run_.count++;
+        else
+            fsi_depth_run_ = {direction, direction ? 1u : 0u};
+        if (direction && fsi_depth_run_min_ &&
+            (fsi_depth_run_.count >= fsi_depth_run_min_ || (in_pass_ && pass_.unordered == direction))) {
+            fsi_unordered = direction;
+            use("interlock path's depth draws without the interlock");
+        }
+    }
     PipelineMemo &pm = pipeline_memo_;
-    if (pipeline_memo_on_ && front_hit && pm.valid && pm.front_generation == front_generation_) {
+    if (pipeline_memo_on_ && front_hit && pm.valid && pm.front_generation == front_generation_ &&
+        pm.fsi_unordered == fsi_unordered) {
         for (const auto &[what, approximation] : pm.counts) approximation ? approximate(what) : use(what);
         std::copy(pm.blends, pm.blends + 4, blends);
         raster = pm.raster, depth_state = pm.depth_state;
@@ -10922,7 +11035,9 @@ void Impl::draw(const gpu::Draw &d) {
                 if (!fragment && translating) fragment = generic_fs_[0][0];
                 if (!fragment) return skip("pixel shader: " + why);
             } else {
-                fragment = fsi_constants.flags & FSI_DEPTH_STENCIL ? fsi_depth_fs_ : VK_NULL_HANDLE;
+                fragment = fsi_constants.flags & FSI_DEPTH_STENCIL
+                               ? (fsi_unordered ? fsi_depth_unordered_fs_ : fsi_depth_fs_)
+                               : VK_NULL_HANDLE;
             }
             if (!fragment) {
                 if (options_.verbose)
@@ -10949,7 +11064,7 @@ void Impl::draw(const gpu::Draw &d) {
         VkSpecializationMapEntry spec_entries[10];
         VkSpecializationInfo spec{};
         if (fsi_ && fragment) {
-            key.push_back(0xF5000000u | fsi_ | (options_.fsi_specialized ? 0x100u : 0u));
+            key.push_back(0xF5000000u | fsi_ | (options_.fsi_specialized ? 0x100u : 0u) | fsi_unordered << 9);
             if (options_.fsi_specialized) {
                 spec_data[0] = 1, spec_data[1] = fsi_constants.flags;
                 for (uint32_t i = 0; i < 4; i++)
@@ -11182,7 +11297,7 @@ void Impl::draw(const gpu::Draw &d) {
             pm.raster = raster, pm.depth_state = depth_state;
             pm.raster.pNext = nullptr, pm.depth_state.pNext = nullptr;
             pm.samples = multisample.rasterizationSamples;
-            pm.fragment = fragment, pm.pipe = pipe;
+            pm.fragment = fragment, pm.pipe = pipe, pm.fsi_unordered = fsi_unordered;
             pm.premultiplied = premultiplied;
             std::copy(premultiply, premultiply + 4, pm.premultiply);
         }
@@ -11310,8 +11425,45 @@ void Impl::draw(const gpu::Draw &d) {
 
     // the interlock path's constants, with the occlusion counter the draw
     // counts in (the slot's, so once the flush above is past)
+    // (the render pass the draw goes in, begun below)
+    Pass pass;
+    for (uint32_t i = 0; i < 4; i++) pass.colors[i] = colors[i] ? colors[i]->view : VK_NULL_HANDLE;
+    pass.depth = depth ? depth->view : VK_NULL_HANDLE;
+    pass.width = export_only ? 1 : host_width, pass.height = export_only ? 1 : host_height;
+    if (fsi_ && !export_only)
+        pass.width = pass.height = std::min(scale_.up(8192), max_image_),
+        pass.samples = uint32_t(multisample.rasterizationSamples), pass.unordered = fsi_unordered;
     if (fsi_ && fragment) {
         fsi_constants.zpd_index = viz_survey_ != UINT32_MAX ? viz_fsi_index() : fsi_zpd_index();
+        // The early rejection (edram_fsi.glsl's xf_fsi_rejects): on where the
+        // depth EDRAM holds under the draw can only have gone one way in its
+        // render pass so far (the pass's draws' tests and color targets, this
+        // one's own included; a new pass starts from what its barrier made
+        // seen), the draw's test passes nothing that way, a fragment that
+        // fails it changes nothing (the stencil's fail and depth fail
+        // operations keep) and the shader neither writes oDepth nor exports.
+        fsi_constants.scale[2] = 0;
+        const uint32_t fn = (fsi_constants.flags / FSI_DEPTH_LESS) & 7;
+        if (fsi_early_reject_ && (fsi_constants.flags & FSI_DEPTH_STENCIL) && fn != 7 &&
+            (!ps || (!ps->writes_depth && !ps->exports))) {
+            bool keeps = true;
+            if (fsi_constants.flags & FSI_STENCIL)
+                for (uint32_t face : {fsi_constants.stencil[1], fsi_constants.stencil[3]})
+                    keeps &= ((face >> 3) & 7) == 0 && ((face >> 9) & 7) == 0;
+            const bool same_pass = in_pass_ && !exports && pass_ == pass;
+            const bool raised = same_pass && fsi_pass_.raised, lowered = same_pass && fsi_pass_.lowered;
+            const uint32_t mode = !(fn & 4) && !raised ? 1 : !(fn & 1) && !lowered ? 2 : 0;
+            if (keeps && mode) {
+                TileSet color, read;
+                if (same_pass) color = fsi_pass_.color;
+                fsi_color_tiles(fsi_constants, color);
+                fsi_depth_tiles(fsi_constants, read);
+                if (!color.meets(read)) {
+                    fsi_constants.scale[2] = mode;
+                    use("interlock draws rejecting before the shader");
+                }
+            }
+        }
         if (last_fsi_at_ == NONE || std::memcmp(&last_fsi_, &fsi_constants, sizeof(FsiConstants)) != 0) {
             last_fsi_at_ = draw_data_take(sizeof(FsiConstants), ubo_align_);
             // (the kept copy first, the upload from it: the draw data is in
@@ -11465,14 +11617,15 @@ void Impl::draw(const gpu::Draw &d) {
     // a draw that exports begins its own, after a barrier, as what came
     // before in the pass may read the mirror where it writes
     if (exports) end_pass();
-    Pass pass;
-    for (uint32_t i = 0; i < 4; i++) pass.colors[i] = colors[i] ? colors[i]->view : VK_NULL_HANDLE;
-    pass.depth = depth ? depth->view : VK_NULL_HANDLE;
-    pass.width = export_only ? 1 : host_width, pass.height = export_only ? 1 : host_height;
-    if (fsi_ && !export_only)
-        pass.width = pass.height = std::min(scale_.up(8192), max_image_),
-        pass.samples = uint32_t(multisample.rasterizationSamples);
     VkCommandBuffer c = begin_pass(pass, colors, depth);
+    if (fsi_ && fragment && !export_only) {
+        // what the draw may do to depth and colors in EDRAM, for the early
+        // rejection of the pass's later draws
+        const uint32_t fn = (fsi_constants.flags / FSI_DEPTH_LESS) & 7;
+        if ((fsi_constants.flags & FSI_DEPTH_STENCIL) && (fsi_constants.flags & FSI_DEPTH_WRITE))
+            fsi_pass_.raised |= (fn & 4) != 0, fsi_pass_.lowered |= (fn & 1) != 0;
+        fsi_color_tiles(fsi_constants, fsi_pass_.color);
+    }
     XF_DRAW_SECTION(Pass);
     if (pipe != bound_pipeline_) {
         // (after another pipeline of the renderer's own, a transfer's or a

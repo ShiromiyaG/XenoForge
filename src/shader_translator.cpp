@@ -306,6 +306,28 @@ private:
     // the shader's path (a bit each), the library's xf_fsi and its parameters
     Id colors_written_ = 0, fsi_function_ = 0;
     std::vector<Id> fsi_parameters_;
+    // and its early rejection before the shader (xf_fsi_rejects)
+    Id fsi_rejects_function_ = 0;
+    std::vector<Id> fsi_rejects_parameters_;
+    // a call of one of the library's functions: glslang's take their
+    // parameters as pointers to function variables
+    Id call_library(Id function, const std::vector<Id> &parameters, Id result_type,
+                    std::initializer_list<std::pair<Id, Id>> arguments) {
+        std::vector<uint32_t> call{function};
+        size_t k = 0;
+        for (auto [value, type] : arguments) {
+            Id pointer_type = m_.type_pointer(spv::StorageClass::Function, type);
+            if (k < parameters.size() && parameters[k] == pointer_type) {
+                Id variable = m_.local_variable(pointer_type);
+                store(variable, value);
+                call.push_back(variable);
+            } else {
+                call.push_back(value);
+            }
+            k++;
+        }
+        return m_.op(Op::OpFunctionCall, result_type, std::span<const uint32_t>(call));
+    }
 };
 
 void Translator::declare() {
@@ -2644,6 +2666,38 @@ void Translator::main_pixel() {
 
     Id main = m_.begin_function(void_, m_.type_function(void_, {}));
     m_.label();
+    // The interlock path's early rejection (Beyond Xenia; edram_fsi.glsl's
+    // xf_fsi_rejects, which the renderer turns on per draw): a quad whose
+    // every fragment would fail the depth test against what EDRAM holds,
+    // read without the interlock, ends here, before the guest's shader runs;
+    // a fragment of a quad that goes on is still tested in the interlock.
+    // Xenia's interlock path tests early inside the interlock, holding it
+    // through the shader. Not for a shader that writes oDepth or exports.
+    Id rejected = 0, rejected_quad_kept = 0;
+    if (fsi && !writes_depth && !em_written_) {
+        m_.capability(spv::Capability::DerivativeControl);
+        Id position = load(vec4_, frag_coord);
+        Id z = comp(position, 2);
+        Id dxy = m_.op(Op::OpCompositeConstruct, vec2_,
+                       {m_.op(Op::OpDPdxCoarse, float_, {z}), m_.op(Op::OpDPdyCoarse, float_, {z})});
+        Id ptr_in_int = m_.type_pointer(spv::StorageClass::Input, int_);
+        Id mask_in = m_.op(Op::OpBitcast, uint_, {load(int_, m_.op(Op::OpAccessChain, ptr_in_int, {sample_mask_in, i(0)}))});
+        Id alive = m_.op(Op::OpLogicalNot, bool_, {load(bool_, helper)});
+        rejected = call_library(fsi_rejects_function_, fsi_rejects_parameters_, bool_,
+                                {{position, vec4_}, {dxy, vec2_}, {mask_in, uint_}, {load(bool_, front_facing), bool_},
+                                 {alive, bool_}});
+        // the whole quad (the guest's derivatives need it whole): kept where
+        // a neighbor across or down (then the other row's pair) is kept, as
+        // Xenia's early quad test asks
+        Id kept = select(float_, rejected, f(0), f(1));
+        Id quad_kept = m_.op(Op::OpLogicalOr, bool_,
+                             {m_.op(Op::OpLogicalNot, bool_, {rejected}),
+                              m_.op(Op::OpFOrdNotEqual, bool_, {m_.op(Op::OpDPdxFine, float_, {kept}), f(0)})});
+        Id row_kept = select(float_, quad_kept, f(1), f(0));
+        quad_kept = m_.op(Op::OpLogicalOr, bool_,
+                          {quad_kept, m_.op(Op::OpFOrdNotEqual, bool_, {m_.op(Op::OpDPdyCoarse, float_, {row_kept}), f(0)})});
+        rejected_quad_kept = quad_kept;
+    }
     Id ptr_in_vec4 = m_.type_pointer(spv::StorageClass::Input, vec4_);
     for (uint32_t k = 0; k < harness::REGISTERS; k++) {
         Id value = zero4_;
@@ -2765,7 +2819,13 @@ void Translator::main_pixel() {
         });
     }
     reset_state();
-    m_.op(Op::OpFunctionCall, void_, {body_});
+    if (rejected_quad_kept)
+        when(rejected_quad_kept, [&] {
+            m_.op(Op::OpFunctionCall, void_, {body_});
+            return false;
+        });
+    else
+        m_.op(Op::OpFunctionCall, void_, {body_});
     export_to_memory(em_before_end_); // the export under way at the end
     if (frag_depth && float24) {
         // As Xenia's CompletePixelShader_DSV_DepthTo24Bit: oDepth clamped to
@@ -2983,6 +3043,8 @@ void Translator::main_pixel() {
         Id ptr_in_int = m_.type_pointer(spv::StorageClass::Input, int_);
         Id mask_in = m_.op(Op::OpBitcast, uint_, {load(int_, m_.op(Op::OpAccessChain, ptr_in_int, {sample_mask_in, i(0)}))});
         Id alive = m_.op(Op::OpLogicalNot, bool_, {load(bool_, helper)});
+        // (a fragment rejected early in a quad that went on writes nothing)
+        if (rejected) alive = m_.op(Op::OpLogicalAnd, bool_, {alive, m_.op(Op::OpLogicalNot, bool_, {rejected})});
         Id facing = load(bool_, front_facing);
         const std::pair<Id, Id> arguments[13] = {
             {load(vec4_, m_.op(Op::OpAccessChain, ptr_private_vec4_, {colors_, i(0)})), vec4_},
@@ -3175,10 +3237,13 @@ Translation Translator::run() {
         if (m_.import(pixel_.edram_library, imported)) {
             for (const auto &[name, function] : imported.functions)
                 if (name.starts_with("xf_fsi(")) fsi_function_ = function;
+                else if (name.starts_with("xf_fsi_rejects(")) fsi_rejects_function_ = function;
             if (fsi_function_) fsi_parameters_ = imported.parameters[fsi_function_];
+            if (fsi_rejects_function_) fsi_rejects_parameters_ = imported.parameters[fsi_rejects_function_];
             interface_.insert(interface_.end(), imported.globals.begin(), imported.globals.end());
         }
-        if (!fsi_function_ || fsi_parameters_.size() != 13)
+        if (!fsi_function_ || fsi_parameters_.size() != 13 || !fsi_rejects_function_ ||
+            fsi_rejects_parameters_.size() != 5)
             return {{}, {"the interlock path without its output merger (edram_fsi.frag's library)"}};
     }
     declare();

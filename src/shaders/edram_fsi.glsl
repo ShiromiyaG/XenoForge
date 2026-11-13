@@ -115,32 +115,38 @@ vec2 sample_location(uint i, uint msaa) {
 // the nearest even) or 20e4 (rounded to the nearest even), tested and
 // written with the stencil as RB_DEPTHCONTROL says; the samples that fail
 // leave the coverage.
+// the center's depth with the polygon offset, unless the shader wrote it
+float fsi_depth_center(float center, vec2 dz, bool writes_depth, bool front) {
+    if (writes_depth) return center;
+    vec2 offset = front ? fsi.poly_offset.xy : fsi.poly_offset.zw;
+    precise float slope = max(abs(dz.x), abs(dz.y));
+    precise float bias = offset.x * slope + offset.y;
+    precise float biased = center + bias;
+    return biased;
+}
+// a guest sample's depth in EDRAM's 24 bits: the center's extrapolated to its
+// position, saturated, then 24-bit unorm or 20e4
+uint fsi_sample_depth(uint i, uint flags, float z_center, vec2 dz) {
+    vec2 location = sample_location(i, flags & 3u);
+    precise float dx = location.x * dz.x;
+    precise float dy = location.y * dz.y;
+    precise float z_unclamped = z_center + (dx + dy);
+    // saturated, NaN to 0 (NClamp)
+    float z = z_unclamped > 0.0 ? min(z_unclamped, 1.0) : 0.0;
+    precise float z_scaled = z * 16777215.0;
+    return (flags & F_FLOAT24) != 0u ? float32_to_20e4(z, true) : uint(roundEven(z_scaled));
+}
 uint fsi_depth_stencil(uint mask, uint flags, uint address, float center, vec2 dz, bool writes_depth, bool front) {
     if ((flags & F_DEPTH_STENCIL) == 0u) return mask;
-    float z_center = center;
-    if (!writes_depth) {
-        vec2 offset = front ? fsi.poly_offset.xy : fsi.poly_offset.zw;
-        precise float slope = max(abs(dz.x), abs(dz.y));
-        precise float bias = offset.x * slope + offset.y;
-        precise float biased = center + bias;
-        z_center = biased;
-    }
+    float z_center = fsi_depth_center(center, dz, writes_depth, front);
     uvec2 st = front ? fsi.stencil.xy : fsi.stencil.zw;
     uint reference = st.x & 0xFFu, read_mask = (st.x >> 8u) & 0xFFu, write_mask = (st.x >> 16u) & 0xFFu;
     uint reference_masked = reference & read_mask;
-    uint msaa = flags & 3u;
     for (uint i = 0u; i < 4u; i++) {
         if ((mask & (1u << i)) == 0u) continue;
         uint at = address + sample_offset(i, false);
         uint old = edram.words[at];
-        vec2 location = sample_location(i, msaa);
-        precise float dx = location.x * dz.x;
-        precise float dy = location.y * dz.y;
-        precise float z_unclamped = z_center + (dx + dy);
-        // saturated, NaN to 0 (NClamp)
-        float z = z_unclamped > 0.0 ? min(z_unclamped, 1.0) : 0.0;
-        precise float z_scaled = z * 16777215.0;
-        uint z24 = (flags & F_FLOAT24) != 0u ? float32_to_20e4(z, true) : uint(roundEven(z_scaled));
+        uint z24 = fsi_sample_depth(i, flags, z_center, dz);
         uint old_z = old >> 8u;
         bool z_pass = ((flags & F_DEPTH_LESS) != 0u && z24 < old_z) || ((flags & F_DEPTH_EQUAL) != 0u && z24 == old_z) ||
                       ((flags & F_DEPTH_GREATER) != 0u && z24 > old_z);
@@ -456,4 +462,66 @@ void xf_fsi(vec4 c0, vec4 c1, vec4 c2, vec4 c3, uint written, float shader_depth
     if ((written & 2u) != 0u) fsi_color(1u, c1, p_rt(1u), p_blend(1u), mask, o);
     if ((written & 4u) != 0u) fsi_color(2u, c2, p_rt(2u), p_blend(2u), mask, o);
     if ((written & 8u) != 0u) fsi_color(3u, c3, p_rt(3u), p_blend(3u), mask, o);
+}
+
+// Beyond Xenia: the early rejection, before the shader and outside the
+// interlock (docs/renderer.md, "The exact path's cost"). fsi.scale.z is what
+// the renderer knows of the draw's render pass so far: 0, nothing (never
+// rejects); 1, the depth EDRAM holds under the draw only went down (no draw
+// in the pass wrote it with a test that passes greater, nor a color target
+// over it), and the draw's test passes nothing greater; 2, the same upward.
+// A word read here without the interlock is then one the fragments before
+// this one in primitive order may still lower (raise), never raise (lower):
+// where every covered sample fails against it, it fails against the word the
+// interlock would give it, and (the renderer's other conditions: no oDepth,
+// no memory export, the stencil's fail and depth fail operations keeping)
+// the fragment would change nothing. True also for no coverage.
+bool xf_fsi_rejects(vec4 frag_coord, vec2 depth_dxy, uint sample_mask_in, bool front_facing, bool alive) {
+    uint mode = fsi.scale.z;
+    if (mode == 0u) return false;
+    uint flags = p_flags();
+    uint mask = alive ? guest_coverage(sample_mask_in, flags) : 0u;
+    if (mask == 0u) return true;
+    Offsets o = fsi_offsets(uvec2(frag_coord.xy), flags & 3u);
+    float z_center = fsi_depth_center(frag_coord.z, depth_dxy, false, front_facing);
+    bool equal_passes = (flags & F_DEPTH_EQUAL) != 0u;
+    for (uint i = 0u; i < 4u; i++) {
+        if ((mask & (1u << i)) == 0u) continue;
+        uint z24 = fsi_sample_depth(i, flags, z_center, depth_dxy);
+        uint old_z = edram.words[o.depth + sample_offset(i, false)] >> 8u;
+        bool fails = mode == 1u ? z24 > old_z : z24 < old_z;
+        if (!fails && !(z24 == old_z && !equal_passes)) return false;
+    }
+    return true;
+}
+
+// Beyond Xenia: depth alone, without the interlock (the renderer's unordered
+// depth passes, docs/renderer.md "The exact path's cost"). The renderer
+// gives a render pass of its own to a run of draws without a pixel shader
+// that write depth with a test passing less (or greater) and never equal
+// and greater (less), without the stencil and outside any occlusion query:
+// over such a run EDRAM's depth is the minimum (maximum) of what it held and
+// every covered sample's whatever their order, and nothing in the pass
+// changes the stencil's bits, so each sample is an atomic minimum (maximum)
+// of its word with its depth over the stencil's bits as they are.
+void xf_fsi_depth_unordered(vec4 frag_coord, vec2 dz, uint sample_mask_in, bool front_facing) {
+    uint flags = p_flags();
+    uint mask = guest_coverage(sample_mask_in, flags);
+    if (mask == 0u) return;
+    Offsets o = fsi_offsets(uvec2(frag_coord.xy), flags & 3u);
+    float z_center = fsi_depth_center(frag_coord.z, dz, false, front_facing);
+    bool down = (flags & F_DEPTH_GREATER) == 0u;
+    for (uint i = 0u; i < 4u; i++) {
+        if ((mask & (1u << i)) == 0u) continue;
+        uint at = o.depth + sample_offset(i, false);
+        uint z24 = fsi_sample_depth(i, flags, z_center, dz);
+        uint old = edram.words[at];
+        uint old_z = old >> 8u;
+        if (down ? z24 >= old_z : z24 <= old_z) continue;
+        uint word = (z24 << 8u) | (old & 0xFFu);
+        if (down)
+            atomicMin(edram.words[at], word);
+        else
+            atomicMax(edram.words[at], word);
+    }
 }

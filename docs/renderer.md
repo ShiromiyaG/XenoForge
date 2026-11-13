@@ -5370,6 +5370,90 @@ its default is kept in `dumps/d3d12_standard_positions`); the other 30
 host frames compare as before. `XF_XENOS_SAMPLE_POSITIONS=0` and
 `xfreplay --no-xenos-sample-positions` give the host's standard positions.
 
+## The exact path's cost (2026-11-13)
+
+Why the interlock path costs more than host render targets, and two cuts.
+Replays (`xfreplay --gpu-time --repeat 10`, `XF_REPLAY_KEPT_PLAY=1`, the
+fastest play's GPU time; three runs of each configuration interleaved, the
+median and the spread; other agents' GPU tests ran on the machine at times).
+
+**Where the time goes** (game G's town, 1485, at 100%, knocking parts out
+of the output merger; pictures not kept): exact 11.3 ms, fast 7.5. Without
+any of the output merger (the shaders run, nothing written) 9.2; without
+the colors (depth alone) 11.2; without the depth test (colors alone) 10.7;
+without the interlock (wrong, unordered) 11.0. Draw by draw
+(`--gpu-time-draws`) against the host path, the gap is in draws the host
+culls before shading: occlusion surveys (quads tested and mostly hidden:
+0.44 ms against 0.001), the shadow maps' depth-only draws (0.47 against
+0.15), shading over a depth pre-pass. The host's hierarchical depth and
+early tests skip a hidden fragment before the shader starts; the interlock
+path ran every fragment's shader, then read EDRAM's depth in order. The
+colors' loads and stores, the format conversions and the interlock's
+ordering are each a few percent. Host render targets with their early hint
+off (`XF_EARLY_DEPTH_STENCIL=0`) lose about 2% (the hardware's hierarchical
+depth does the culling there).
+
+**The early rejection** (beyond Xenia; `XF_FSI_EARLY_REJECT=0` off). Before
+the guest's shader, outside the interlock, edram_fsi.glsl's
+`xf_fsi_rejects` reads the depth of each covered sample and the quad skips
+the shader (a quad-uniform branch around it, as Xenia's early test does)
+where every fragment in it fails. Reading without the interlock is exact
+where the depth under the draw can only have moved one way since the render
+pass began (each pass begins after a full barrier): the renderer keeps, per
+pass, whether any draw wrote depth with a test that passes greater (raised)
+or less (lowered), and the EDRAM tiles color targets wrote
+(`Impl::fsi_pass_`, by the draws' reach). A draw whose test passes nothing
+greater, in a pass that never raised depth and wrote no color over the
+tiles its depth test reads, gets mode 1 (`FsiConstants::scale[2]`): a word
+read early is one later fragments in primitive order can only lower, so a
+sample that fails against it fails against the word the interlock gives
+it. The same upward (mode 2). Not for shaders that write oDepth or export,
+nor where the stencil's fail or depth-fail operation changes anything. A
+rejected fragment in a quad that goes on writes nothing. Xenia's interlock
+paths test depth early inside the interlock instead, holding it through the
+shader.
+
+**Unordered depth passes** (beyond Xenia; `XF_FSI_UNORDERED_DEPTH=0` off,
+`=<n>` the run's length, 3 by default). A run of draws without a pixel
+shader that write depth with a test passing less (or greater) and never the
+other way, without the stencil and outside occlusion queries, ends with the
+same depth whatever their order: the minimum (maximum) of what EDRAM held
+and every covered sample's. From the run's third draw on they go into a
+render pass of their own (`Pass::unordered`, whose barriers order it against
+the interlock's draws) with `edram_fsi_depth_unordered.frag`: no interlock,
+each sample an atomic minimum (maximum) of its word with its depth over the
+stencil's bits as they are (nothing in such a pass writes them). Game G's
+shadow cascades (runs of 72 to 554 such draws) and game D's.
+
+| trace | scale | exact before | exact now | fast | now : fast |
+| --- | --- | --- | --- | --- | --- |
+| game G's town (1485) | 100% | 11.52 (11.47-11.88) | 11.41 (11.36-12.64) | 6.32 (6.24-7.68) | 1.81 |
+| | 200% | 20.28 (20.20-21.32) | 17.01 (16.93-17.04) | 9.91 (9.85-9.92) | 1.72 |
+| game D's drive (5000) | 100% | 4.60 (4.59-4.60) | 4.36 (4.35-4.49) | 3.18 (3.17-3.18) | 1.37 |
+| | 200% | 14.72 (14.71-14.77) | 13.87 (13.84-13.89) | 7.83 (7.81-7.87) | 1.77 |
+| game B's title (1800) | 100% | 0.398 (0.397-0.399) | 0.431 (0.425-0.432) | 0.199 (0.196-0.201) | 2.17 |
+| | 200% | 2.19 (2.10-2.41) | 2.19 (2.14-2.20) | 0.669 | 3.28 |
+
+By switch (the same runs): game G at 200%, the early rejection alone
+18.96, the unordered passes alone 18.66, both 17.0-18.1; game D at 200%
+14.05 and 14.55, both 13.87. Game B's title, with little overdraw, pays for
+the early reads at 100% (0.401 without the rejection, 0.431 with it: 0.03
+ms). Game G at 100% moved between runs on the same build (11.0 to 12.4 ms
+for one configuration over the session, the fast path 6.3 to 7.5): the
+replay is CPU-bound there, the GPU idles between submissions and its clock
+with it, so its numbers at 100% are the least sure. A first form of the
+rejection's bookkeeping (a bit set filled a tile at a time) cost 3 ms of
+CPU a play in game D, and its GPU time rose with it (6.0 ms against 4.5,
+the GPU clocked down); runs of tiles at a time made it free.
+
+Pictures are the same bytes on all three traces with each switch, and
+validation is clean. The exact path stays well above 1.3 times the fast
+one, so the player's default stays `fast`. What is left is the culling
+itself: the host's rasterizer drops hidden tiles before any shader runs,
+while the early rejection still launches the shader for each quad and
+reads EDRAM; closing that needs a host depth attachment kept as a
+conservative bound of EDRAM's depth (open).
+
 ## Played frames of four more games (2026-11-11)
 
 Games C, E, F and H, built by the recompile step and driven by `boot`

@@ -172,6 +172,7 @@ xf_shader(edram_transfer_ms_stencil_copy.frag edram_transfer.frag -DMS -DDEPTH -
 xf_shader(edram_fsi_library.frag edram_fsi.frag -DLIBRARY)
 xf_shader(edram_fsi_depth_pixel.frag edram_fsi.frag -DDEPTH_ONLY)
 xf_shader(edram_fsi_depth_sample.frag edram_fsi.frag -DDEPTH_ONLY -DSAMPLE_INTERLOCK)
+xf_shader(edram_fsi_depth_unordered.frag edram_fsi.frag -DDEPTH_ONLY -DUNORDERED)
 xf_shader(edram_clear.comp edram_clear.comp)
 xf_shader(edram_rescale.comp edram_rescale.comp)
 xf_shader(scaled_fill.comp scaled_fill.comp)
