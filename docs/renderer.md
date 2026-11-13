@@ -2133,6 +2133,76 @@ Live, the presenter adds one wait a swap (the frame's last submission made
 before `on_swap`), what the ring holds then: at most a batch and the frame's
 end. To be timed live with the machine quiet.
 
+**A draw's own cost: the pipeline kept, the memo tables prefetched
+(2026-11-13).** Game G's frame where the owner sees 20 fps in its town,
+`../traces/xf_<G>_bar` swap 1485 (8,601 draws, 71 resolves), is the main
+frame now, the in-play swap 3700 kept beside it. Two changes, each behind
+its switch, both on:
+
+- **The pipeline kept** (`XF_PIPELINE_MEMO=0` off; `PipelineMemo`). A draw
+  whose front part is the draw before's (`DrawFront`: the same draw state,
+  shaders and primitive) takes the pipeline and what it reads of the
+  pipeline's description afterwards (the blends, the rasterization and
+  depth-stencil states, the samples, the fragment module, the
+  premultiplied blend factors) from the last draw that worked them out
+  under that front part, with what that draw counted (`use`, `approximate`)
+  counted again. Kept only from a draw whose pipeline was found made and
+  final in the lookup's front table (not pending, not a stand-in, not a
+  generic one, no shader's form being translated) and that counted
+  nothing by a made string. 60% of game G's draws take it (all the front
+  part's hits but a few). The pipeline's section 733-791 ticks a draw to
+  459-471. Tried before (2026-11-11, with the dynamic state's block, live:
+  no gain); measured now by sections it is a steady 280 ticks a draw.
+- **The memo tables prefetched** (`XF_DRAW_PREFETCH=0` off;
+  `prefetch_draw`). A draw looks up its own entries in tables too large for
+  the nearer caches (the slot memos, 16,384 of them; the index cache's
+  front table and entry; the vertex range memos), one after another, each
+  a miss. As the draw begins, the entries are worked out from the
+  registers and prefetched: each texture slot's two memo ways (the hash
+  kept for the textures' section where the filters are the same: a shader
+  analyzed only within the draw has none yet), the index cache's entry (its
+  key as the indices' section makes it), each vertex fetch's range memo;
+  after the indices' section, the textures and samplers the slot memos
+  name. By sections (game G 1485, ring on): front part 500 to 700 ticks (the
+  prefetch itself), indices 660 to 530, textures 760 to 510, vertex
+  request 490 to 370; a draw 5,680-5,790 to 5,395-5,490 (one round of
+  three 5,950, the machine busy).
+
+Measured as before (xfreplay `--repeat 15`, the commands' processor time a
+play, three rounds A B interleaved, A both off, B both on; another agent's
+build running, clang at 3 processes):
+
+| frame | ring | both off (rounds' medians) | both on | median of medians |
+| --- | --- | --- | --- | --- |
+| game G 1485 | on | 19.19 / 20.44 / 19.15 ms | 16.41 / 15.69 / 16.88 ms | 19.19 to 16.41 (-14%) |
+| game G 3700 | on | 18.51 / 19.35 / 17.68 / 16.90 / 17.02 | 18.46 / 17.54 / 24.30 / 15.67 / 16.14 | 17.68 to 17.54 (B lower in 4 rounds of 5) |
+| game D drive | on | 10.10 / 8.85 / 7.74 | 8.56 / 6.79 / 6.76 | 8.85 to 6.79 (-23%) |
+| game G 1485 | off | 21.43 / 22.73 / 22.00 | 20.63 / 20.39 / 20.81 | 22.00 to 20.63 (-6%) |
+| game G 3700 | off | 22.01 / 21.76 / 23.03 | 20.35 / 21.20 / 20.76 | 22.01 to 20.76 (-6%) |
+| game D drive | off | 8.73 / 9.43 / 8.75 | 8.46 / 8.54 / 8.32 | 8.75 to 8.46 (-3%) |
+
+B was lower in every round but one (game G 3700, ring on: a round of 24.3
+ms, a game's boot running beside it). The pictures are identical with both
+on and both off, ring on and off, on the three frames.
+
+Tried and left out, the constants' upload (1.5 uploads and 1,000 ticks a
+draw, 16% of it): counted by blocks (`XF_DRAW_SECTIONS`' new tallies), an
+upload carries 6.3 blocks of 128 bytes of which 1.7 were written since the
+stage's last, and 46% of the uploads have no float constant written (only
+fetch, boolean or loop constants). But the bytes are not what costs: one
+copy of the whole 5 KB in place of the four runs (six times the bytes)
+took the same time a draw, and so did one copy from the first block read
+to the last; copying nowhere saved 900 ticks a draw, into a small cached
+buffer (hot) saved 450, and into the draw data in cached host memory cost
+more everywhere (the lines read for ownership: 1,400 ticks a draw more).
+So the write-combined draw data costs by the upload, not by the byte (most
+likely the drain of the write-combining buffers to the bus, which a locked
+instruction waits for: an inference, not measured), and splitting the
+fetch constants into a binding of their own (fewer bytes, as many uploads)
+would not pay; only fewer uploads would. Push descriptors were not tried: with
+the record ring the binds are the recording thread's, not the command
+thread's.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches

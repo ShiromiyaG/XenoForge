@@ -1763,11 +1763,11 @@ private:
     }
     void approximate(const std::string &what) {
         report_.approximate[what]++, approximations_++;
-        front_keepable_ = false; // (a count by a made string is not kept: draw_front)
+        front_keepable_ = pipeline_keepable_ = false; // (a count by a made string is not kept: draw_front)
     }
     void use(const std::string &what) {
         report_.used[what]++;
-        front_keepable_ = false;
+        front_keepable_ = pipeline_keepable_ = false;
     }
     // A literal's counts by its address: no string made and no map of
     // strings searched at each draw (1.8% of the command thread and the
@@ -1790,10 +1790,12 @@ private:
     void approximate(const char *what) {
         approximate_by_literal_[what]++, approximations_++;
         if (front_recording_) front_counts_.push_back({what, true});
+        if (pipeline_recording_) pipeline_counts_.push_back({what, true});
     }
     void use(const char *what) {
         used_by_literal_[what]++;
         if (front_recording_) front_counts_.push_back({what, false});
+        if (pipeline_recording_) pipeline_counts_.push_back({what, false});
     }
     // the report with what the processor counted of the packets the renderer
     // does not see (Report::used)
@@ -2754,7 +2756,9 @@ private:
     // the entry of a slot's constant and filters: the way that holds them, else the one to
     // replace (one kept by an older epoch, else the one found less lately)
     SlotMemo *fetch_memo(const uint32_t *fetch, const std::array<uint32_t, 4> &overrides) {
-        const uint32_t index = fetch_memo_index(fetch, overrides);
+        return fetch_memo(fetch, overrides, fetch_memo_index(fetch, overrides));
+    }
+    SlotMemo *fetch_memo(const uint32_t *fetch, const std::array<uint32_t, 4> &overrides, uint32_t index) {
         SlotMemo *a = &fetch_memos_[index];
         if (!slot_memo_two_ways_) return a;
         SlotMemo *b = &fetch_memos_[index ^ 1];
@@ -2768,6 +2772,71 @@ private:
         if (b->epoch != texture_epoch_) return b;
         return a->used <= b->used ? a : b;
     }
+    // The entries a draw's slot memos and vertex range memos will be looked up in, prefetched as
+    // the draw begins (XF_DRAW_PREFETCH=0 off): each is in a table of its own too large for the
+    // processor's nearer caches, and a draw found them one after another, each a miss.
+    void prefetch_draw(const gpu::Draw &d, const Shader *vs, const Shader *ps) {
+        if (index_cache_on_ && d.indexed && d.immediate.empty()) {
+            // the index cache's entry, by the key the indices' section makes (a strip's reset
+            // index as for any draw that is not tessellated: a mismatch only a prefetch lost)
+            const uint32_t primitive = d.primitive;
+            const bool strip = primitive == 3 || primitive == 5 || primitive == 6 || primitive == 12 ||
+                               primitive == 14 || primitive == 15 || primitive == 0x15 || primitive == 0x16;
+            const bool restart = strip && (regs_[r::PA_SU_SC_MODE_CNTL] >> 21) & 1;
+            IndexKey key;
+            key.base = d.index_base & GuestMemory::PHYSICAL_MASK, key.count = d.count;
+            const uint32_t converted = primitive >= 12 && primitive <= 15 ? primitive : 0;
+            key.form = uint32_t(d.index32) | uint32_t(d.index_endian) << 1 | uint32_t(restart) << 4 | converted << 8;
+            key.reset = restart ? regs_[r::VGT_MULTI_PRIM_IB_RESET_INDX] : 0;
+            key.offset = regs_[r::VGT_INDX_OFFSET];
+            key.min = regs_[r::VGT_MIN_VTX_INDX] & 0xFFFFFF, key.max = regs_[r::VGT_MAX_VTX_INDX] & 0xFFFFFF;
+            if (const IndexEntry *e = index_front_[IndexKeyHash()(key) & (INDEX_FRONT - 1)]) __builtin_prefetch(e);
+        }
+        if (slot_memos_on_ && !trace_) {
+            const uint64_t slots = vs->texture_mask | (ps ? ps->texture_mask : 0);
+            for (uint64_t left = slots; left; left &= left - 1) {
+                const uint32_t slot = uint32_t(std::countr_zero(left));
+                const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS + slot * 6];
+                std::array<uint32_t, 4> overrides = {3, 3, 3, 7};
+                for (const Shader *s : {vs, ps})
+                    if (s && slot < 32 && (s->filter_mask & (1u << slot))) {
+                        overrides = s->slot_filters[slot];
+                        break;
+                    }
+                const uint32_t index = fetch_memo_index(fetch, overrides);
+                __builtin_prefetch(&fetch_memos_[index]);
+                __builtin_prefetch(&fetch_memos_[index ^ 1]);
+                prefetched_slots_[slot] = {overrides, index};
+            }
+            prefetched_mask_ = slots, prefetched_vs_ = vs, prefetched_ps_ = ps;
+        }
+        if (range_memos_on_ && !trace_) {
+            const uint64_t fetch_slots[2] = {vs->vertex_mask[0] | (ps ? ps->vertex_mask[0] : 0),
+                                             vs->vertex_mask[1] | (ps ? ps->vertex_mask[1] : 0)};
+            for (uint32_t half = 0; half < 2; half++)
+                for (uint64_t left = fetch_slots[half]; left; left &= left - 1) {
+                    const uint32_t slot = half * 64 + uint32_t(std::countr_zero(left));
+                    const uint32_t *f = &regs_[reg::FETCH_CONSTANTS + slot * 2];
+                    const uint32_t start = f[0] & 0x1FFFFFFC, words = (f[1] >> 2) & 0xFFFFFF;
+                    const uint32_t end =
+                        uint32_t(std::min<uint64_t>(uint64_t(start) + uint64_t(words) * 4, GuestMemory::SIZE));
+                    if (end > start) __builtin_prefetch(&range_memos_[range_memo_index({start, end})]);
+                }
+        }
+    }
+    // the slots' filters and memo entries the prefetch found, for the textures' section (the
+    // registers do not change within a draw)
+    struct PrefetchedSlot {
+        std::array<uint32_t, 4> overrides;
+        uint32_t index;
+    };
+    PrefetchedSlot prefetched_slots_[64] = {};
+    uint64_t prefetched_mask_ = 0;
+    const Shader *prefetched_vs_ = nullptr, *prefetched_ps_ = nullptr; // (the shaders the filters are of)
+    bool draw_prefetch_ = [] {
+        const char *v = std::getenv("XF_DRAW_PREFETCH");
+        return !(v && v[0] == '0');
+    }();
     uint64_t texture_epoch_ = 1;
     uint64_t approximations_ = 0; // approximate()'s calls
     bool slot_memos_on_ = [] {
@@ -2817,6 +2886,7 @@ private:
     }();
     System last_system_{};
     VkDeviceSize last_constants_at_[2] = {NONE, NONE}, last_system_at_ = NONE;
+    uint64_t constants_dirty_[2] = {}; // (XF_DRAW_SECTIONS: the blocks written since a stage's last upload)
     // the blocks uploaded there: the float constants' in bits 0-31 (Shader::float_blocks), the
     // fetch constants' in bits 32-37 (Shader::fetch_blocks)
     uint64_t last_constants_blocks_[2] = {};
@@ -2902,6 +2972,33 @@ private:
     }();
     // false: the draw ends there (skipped, or it writes nothing)
     bool draw_front(const gpu::Draw &d, DrawFront &f);
+    // the front part worked out again (each a new one: what was kept with the last stands no more)
+    uint64_t front_generation_ = 0;
+    // The pipeline and what the draw takes of its description, kept for the
+    // next draw whose front part is the same one (the key, the description
+    // and the lookup worked out from the registers the front part's draw
+    // state covers, its shaders and its primitive); XF_PIPELINE_MEMO=0 off.
+    struct PipelineMemo {
+        bool valid = false;
+        uint64_t front_generation = 0;
+        std::vector<std::pair<const char *, bool>> counts; // (use, approximate), counted again
+        VkPipelineColorBlendAttachmentState blends[4] = {};
+        VkPipelineRasterizationStateCreateInfo raster{};
+        VkPipelineDepthStencilStateCreateInfo depth_state{};
+        VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+        VkShaderModule fragment = VK_NULL_HANDLE;
+        VkPipeline pipe = VK_NULL_HANDLE;
+        bool premultiplied = false;
+        uint32_t premultiply[4] = {};
+    } pipeline_memo_;
+    std::vector<std::pair<const char *, bool>> pipeline_counts_;
+    bool pipeline_recording_ = false, pipeline_keepable_ = false;
+    // the last pipeline() found its pipeline made and final (its front table's entry)
+    bool pipeline_final_ = false;
+    bool pipeline_memo_on_ = [] {
+        const char *v = std::getenv("XF_PIPELINE_MEMO");
+        return !(v && v[0] == '0');
+    }();
 
     // ---- the index cache ----
     // A draw's converted indices kept by where the guest's are and how they
@@ -7156,8 +7253,10 @@ VkPipeline Impl::pipeline(const std::vector<uint32_t> &key, const VkGraphicsPipe
     PipelineFront &front = pipeline_front_[size_t(hash >> 32) & (PIPELINE_FRONT - 1)];
     if (front.entry && front.entry->pipeline && !front.entry->stand_in && !front.entry->generic && key == front.key &&
         front.entry->asked == std::chrono::steady_clock::time_point{} &&
-        front.entry->state.load(std::memory_order_acquire))
+        front.entry->state.load(std::memory_order_acquire)) {
+        pipeline_final_ = true;
         return front.entry->pipeline;
+    }
     PipelineEntry *e = nullptr;
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) {
@@ -9408,10 +9507,15 @@ void Impl::draw(const gpu::Draw &d) {
             }
         }
     }
+    // what the textures' and vertex data's sections look up first, asked of the memory now
+    prefetched_mask_ = 0;
+    if (draw_prefetch_ && have_vertex_ && vertex_shader_)
+        prefetch_draw(d, vertex_shader_, have_pixel_ ? pixel_shader_ : nullptr);
     // the front part: the draw before's where this one comes with the same
     // state, shaders and kind of primitive, else worked out
     collect_translations();
     DrawFront &f = front_;
+    bool front_hit = false; // (the front part the draw before's: the pipeline's memo may stand)
     {
         DrawFrontKey key;
         key.state_serial = file_ ? file_->state_serial() : 0, key.foreign_writes = file_ ? file_->foreign_writes() : 0;
@@ -9426,13 +9530,16 @@ void Impl::draw(const gpu::Draw &d) {
             f.extent_words = (!f.points && !f.rectangles) || f.expanded ? extent_draw_words() : UINT32_MAX;
             if ((f.extent_words != UINT32_MAX) != was_bounded) hit = false;
         }
+        front_hit = hit;
         if (hit) {
+            XF_DRAW_TALLY(FrontHits);
             for (const auto &[what, approximation] : front_counts_) approximation ? approximate(what) : use(what);
             for (const Shader *s : {front_key_.vertex, f.color ? front_key_.pixel : nullptr})
                 if (s)
                     for (const std::string &a : s->approximate) report_.approximate[a]++, approximations_++;
         } else {
             front_valid_ = false;
+            front_generation_++;
             front_counts_.clear();
             front_recording_ = front_keepable_ = true;
             f.primitive = primitive, f.count = count, f.index32 = index32, f.color = color;
@@ -9740,6 +9847,13 @@ void Impl::draw(const gpu::Draw &d) {
     }
 
     XF_DRAW_SECTION(Indices);
+    // the textures and samplers the prefetched slot memos name (in the caches by now), prefetched
+    // in turn
+    for (uint64_t left = prefetched_mask_; left; left &= left - 1) {
+        const uint32_t index = prefetched_slots_[std::countr_zero(left)].index;
+        for (const SlotMemo *m : {&fetch_memos_[index], &fetch_memos_[index ^ 1]})
+            if (m->texture) __builtin_prefetch(m->texture), __builtin_prefetch(m->sampler);
+    }
     // constants
     for (int stage = 0; stage < 2; stage++) {
         harness::Constants &c = last_constants_[stage];
@@ -9771,11 +9885,13 @@ void Impl::draw(const gpu::Draw &d) {
             if (!kept || file.changed_since(alu + first, File::BLOCK, since)) {
                 std::memcpy(&c.float_constants[first / 4], &regs_[alu + first], File::BLOCK * 4);
                 changed = true;
+                constants_dirty_[stage] |= 1ull << (first / File::BLOCK);
             }
         if (!kept || file.changed_since(reg::BOOL_CONSTANTS, 8 + 32, since)) {
             std::memcpy(c.bool_constants, &regs_[reg::BOOL_CONSTANTS], sizeof(c.bool_constants));
             std::memcpy(c.loop_constants, &regs_[reg::LOOP_CONSTANTS], sizeof(c.loop_constants));
             changed = true;
+            constants_dirty_[stage] |= 1ull << 63;
         }
         // the fetch constants: the blocks the stage's shader reads brought up to date; the others
         // are no longer current once written
@@ -9790,6 +9906,7 @@ void Impl::draw(const gpu::Draw &d) {
                 std::memcpy(&c.fetch_constants[first], &regs_[reg::FETCH_CONSTANTS + first], File::BLOCK * 4);
                 current |= 1u << b;
                 changed = true;
+                constants_dirty_[stage] |= 1ull << (32 + b);
             }
         }
         if (changed) last_constants_at_[stage] = NONE;
@@ -9931,6 +10048,7 @@ void Impl::draw(const gpu::Draw &d) {
     // its dimension and a sampler's
     // (a mask of the 32 texture fetch constants, in order)
     uint64_t texture_slots = vs->texture_mask | (ps ? ps->texture_mask : 0);
+    if (prefetched_vs_ != vs || prefetched_ps_ != ps) prefetched_mask_ = 0;
     for (uint64_t left = texture_slots; left; left &= left - 1) {
         const uint32_t slot = uint32_t(std::countr_zero(left));
         const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS + slot * 6];
@@ -9946,13 +10064,18 @@ void Impl::draw(const gpu::Draw &d) {
                 overrides = s->slot_filters[slot];
                 break;
             }
+        // (the prefetch's entry where it hashed the same filters: a shader's are known once it
+        // is analyzed, which a new shader is only within the draw)
+        const bool prefetched = ((prefetched_mask_ >> slot) & 1) && prefetched_slots_[slot].overrides == overrides;
         // What the slot gave the last draw that read it, again: the same constant's words and
         // filters, no texture, view or sampler destroyed or loaded since (texture_epoch_), and
         // the texture's memory unwritten. The constant is not parsed, nor the texture, its view
         // and its sampler looked up (three maps, 7% of the command thread).
         const uint32_t forced_filter = texture_filter_.load(std::memory_order_relaxed);
         const uint32_t forced_aniso = anisotropy_.load(std::memory_order_relaxed);
-        SlotMemo *memo = slot_memos_on_ && !trace_ ? fetch_memo(fetch, overrides) : nullptr;
+        SlotMemo *memo = !slot_memos_on_ || trace_ ? nullptr
+                         : prefetched              ? fetch_memo(fetch, overrides, prefetched_slots_[slot].index)
+                                                   : fetch_memo(fetch, overrides);
         if (memo) {
             if (done_serial_ != limits_applied_at_) apply_texture_limits(); // (as texture() begins)
             SlotMemo &m = *memo;
@@ -10076,8 +10199,6 @@ void Impl::draw(const gpu::Draw &d) {
     }
 
     // the pipeline
-    VkFormat color_formats[4] = {};
-    VkPipelineColorBlendAttachmentState blends[4] = {};
     // The key: what the pipeline cannot take at the draw. Vulkan 1.3's
     // extended dynamic state (1 and 2, core) gives the draw the topology
     // within its class (points, lines, triangles), primitive restart,
@@ -10089,400 +10210,449 @@ void Impl::draw(const gpu::Draw &d) {
                               : topology <= VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ? 1
                               : topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST ? 3
                                                                              : 2;
-    // the vertex shader's host form, with a tessellated draw's hull shader
-    // and patch size
-    uint32_t host_key = host_vertex.key() | hull << 16 | patch_points << 20;
-    // The polygon modes (PA_SU_SC_MODE_CNTL's poly_mode bits 3-4, dual mode
-    // 1; the front's and back's types in bits 5-7 and 8-10: 0 points, 1
-    // lines, 2 triangles), as Xenia's Vulkan pipeline cache takes them:
-    // Vulkan has one mode for both faces, so the lowest type of the faces
-    // not culled (the most deliberate one: points, then lines, then fill).
-    VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
-    if (primitive >= 4 && !rectangles) {
-        const uint32_t sc_mode = regs_[r::PA_SU_SC_MODE_CNTL];
-        if (((sc_mode >> 3) & 3) == 1) {
-            uint32_t type = 2;
-            if (!(sc_mode & 1)) type = std::min(type, (sc_mode >> 5) & 7);
-            if (!(sc_mode & 2)) type = std::min(type, (sc_mode >> 8) & 7);
-            if (type < 2) {
-                if (d_.fill_mode_non_solid())
-                    polygon_mode = type == 0 ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_LINE;
-                else
-                    approximate("polygon modes other than fill (the device has no fillModeNonSolid)");
+    VkFormat color_formats[4] = {};
+    VkPipelineColorBlendAttachmentState blends[4] = {};
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineDepthStencilStateCreateInfo depth_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkShaderModule fragment = VK_NULL_HANDLE;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    bool generic = false;
+    uint32_t centroid = 0;
+    const uint32_t sc_mode = regs_[r::PA_SU_SC_MODE_CNTL];
+    // The draw before's pipeline and what the draw takes of its description,
+    // again: its front part was the one this draw found (DrawFront: the same
+    // draw state, shaders and kind of primitive), so everything the key, the
+    // description and the lookup are worked out from is as it was then
+    // (XF_PIPELINE_MEMO=0: worked out at every draw).
+    PipelineMemo &pm = pipeline_memo_;
+    if (pipeline_memo_on_ && front_hit && pm.valid && pm.front_generation == front_generation_) {
+        for (const auto &[what, approximation] : pm.counts) approximation ? approximate(what) : use(what);
+        std::copy(pm.blends, pm.blends + 4, blends);
+        raster = pm.raster, depth_state = pm.depth_state;
+        multisample.rasterizationSamples = pm.samples;
+        fragment = pm.fragment, pipe = pm.pipe;
+        if (pm.premultiplied) {
+            std::copy(pm.premultiply, pm.premultiply + 4, sys.blend_premultiply);
+            std::memcpy(sys.blend_constant, &regs_[r::RB_BLEND_RED], 16);
+        }
+        XF_DRAW_TALLY(PipelineMemoHits);
+    } else {
+        pm.valid = false;
+        pipeline_counts_.clear();
+        pipeline_recording_ = pipeline_keepable_ = true;
+        pipeline_final_ = false;
+        struct RecordingEnd {
+            bool &recording;
+            ~RecordingEnd() { recording = false; }
+        } recording_end{pipeline_recording_};
+        // the vertex shader's host form, with a tessellated draw's hull shader
+        // and patch size
+        uint32_t host_key = host_vertex.key() | hull << 16 | patch_points << 20;
+        // The polygon modes (PA_SU_SC_MODE_CNTL's poly_mode bits 3-4, dual mode
+        // 1; the front's and back's types in bits 5-7 and 8-10: 0 points, 1
+        // lines, 2 triangles), as Xenia's Vulkan pipeline cache takes them:
+        // Vulkan has one mode for both faces, so the lowest type of the faces
+        // not culled (the most deliberate one: points, then lines, then fill).
+        VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
+        if (primitive >= 4 && !rectangles) {
+            const uint32_t sc_mode = regs_[r::PA_SU_SC_MODE_CNTL];
+            if (((sc_mode >> 3) & 3) == 1) {
+                uint32_t type = 2;
+                if (!(sc_mode & 1)) type = std::min(type, (sc_mode >> 5) & 7);
+                if (!(sc_mode & 2)) type = std::min(type, (sc_mode >> 8) & 7);
+                if (type < 2) {
+                    if (d_.fill_mode_non_solid())
+                        polygon_mode = type == 0 ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_LINE;
+                    else
+                        approximate("polygon modes other than fill (the device has no fillModeNonSolid)");
+                }
             }
         }
-    }
-    host_key |= uint32_t(polygon_mode) << 24;
-    std::vector<uint32_t> &key = draw_lists_.key;
-    key.assign({uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), ps ? uint32_t(pixel_hash_) : 0,
-                ps ? uint32_t(pixel_hash_ >> 32) : 0, topology_class, uint32_t(rectangles), uint32_t(msaa),
-                depth ? uint32_t(depth->image.format) : 0u, regs_[r::PA_CL_CLIP_CNTL] & (1u << 16), host_key});
-    std::vector<uint32_t> &color_key = draw_lists_.color_key; // the targets' part of the key
-    color_key.clear();
-    // (the factors of a minimum or maximum the pixel shader multiplies in: host_blend_control)
-    uint32_t premultiply[4] = {};
-    bool premultiplied = false;
-    for (uint32_t i = 0; i < 4; i++) {
-        if (!colors[i]) continue;
-        color_formats[i] = colors[i]->image.format;
-        // (the factors of a minimum or maximum, where the host can: host_blend_control)
-        bool factors_ignored = false;
-        uint32_t blend = host_blend_control(regs_[r::RB_BLENDCONTROL[i]], colors[i]->format,
-                                            ps && !fsi_ && !export_only, premultiply[i], factors_ignored);
-        if (factors_ignored) approximate("minimum and maximum blending with factors (the host ignores them)");
-        if (premultiply[i]) {
-            premultiplied = true;
-            use("minimum and maximum blending with factors multiplied in by the pixel shader");
+        host_key |= uint32_t(polygon_mode) << 24;
+        std::vector<uint32_t> &key = draw_lists_.key;
+        key.assign({uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), ps ? uint32_t(pixel_hash_) : 0,
+                    ps ? uint32_t(pixel_hash_ >> 32) : 0, topology_class, uint32_t(rectangles), uint32_t(msaa),
+                    depth ? uint32_t(depth->image.format) : 0u, regs_[r::PA_CL_CLIP_CNTL] & (1u << 16), host_key});
+        std::vector<uint32_t> &color_key = draw_lists_.color_key; // the targets' part of the key
+        color_key.clear();
+        // (the factors of a minimum or maximum the pixel shader multiplies in: host_blend_control)
+        uint32_t premultiply[4] = {};
+        bool premultiplied = false;
+        for (uint32_t i = 0; i < 4; i++) {
+            if (!colors[i]) continue;
+            color_formats[i] = colors[i]->image.format;
+            // (the factors of a minimum or maximum, where the host can: host_blend_control)
+            bool factors_ignored = false;
+            uint32_t blend = host_blend_control(regs_[r::RB_BLENDCONTROL[i]], colors[i]->format,
+                                                ps && !fsi_ && !export_only, premultiply[i], factors_ignored);
+            if (factors_ignored) approximate("minimum and maximum blending with factors (the host ignores them)");
+            if (premultiply[i]) {
+                premultiplied = true;
+                use("minimum and maximum blending with factors multiplied in by the pixel shader");
+            }
+            VkPipelineColorBlendAttachmentState &b = blends[i];
+            b.colorWriteMask = color_masks[i];
+            b.srcColorBlendFactor = blend_factor(blend & 0x1F);
+            b.colorBlendOp = blend_op((blend >> 5) & 7);
+            b.dstColorBlendFactor = blend_factor((blend >> 8) & 0x1F);
+            b.srcAlphaBlendFactor = blend_factor((blend >> 16) & 0x1F);
+            b.alphaBlendOp = blend_op((blend >> 21) & 7);
+            b.dstAlphaBlendFactor = blend_factor((blend >> 24) & 0x1F);
+            b.blendEnable = (blend & 0x1FFF1FFF) != 0x00010001; // not ONE, ADD, ZERO for both
+            // with extended dynamic state 3 the blend and the write mask are set
+            // at the draw too, so the targets' formats alone make pipelines
+            if (d_.dynamic_blend())
+                color_key.insert(color_key.end(), {i, uint32_t(color_formats[i])});
+            else
+                color_key.insert(color_key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
         }
-        VkPipelineColorBlendAttachmentState &b = blends[i];
-        b.colorWriteMask = color_masks[i];
-        b.srcColorBlendFactor = blend_factor(blend & 0x1F);
-        b.colorBlendOp = blend_op((blend >> 5) & 7);
-        b.dstColorBlendFactor = blend_factor((blend >> 8) & 0x1F);
-        b.srcAlphaBlendFactor = blend_factor((blend >> 16) & 0x1F);
-        b.alphaBlendOp = blend_op((blend >> 21) & 7);
-        b.dstAlphaBlendFactor = blend_factor((blend >> 24) & 0x1F);
-        b.blendEnable = (blend & 0x1FFF1FFF) != 0x00010001; // not ONE, ADD, ZERO for both
-        // with extended dynamic state 3 the blend and the write mask are set
-        // at the draw too, so the targets' formats alone make pipelines
-        if (d_.dynamic_blend())
-            color_key.insert(color_key.end(), {i, uint32_t(color_formats[i])});
-        else
-            color_key.insert(color_key.end(), {i, uint32_t(color_formats[i]), color_masks[i], blend});
-    }
-    // A 16_16_16_16 target blended by the source's alpha ("A 16_16 target's
-    // alpha", renderer.md): its alpha is stored, so it is scaled by the fixed
-    // range, and so is the blend's factor, which should not be: counted (a
-    // second source for the blend would carry the alpha unscaled)
-    for (uint32_t i = 0; i < 4; i++) {
-        if (!colors[i] || colors[i]->format != 5 || !blends[i].blendEnable) continue;
-        auto by_alpha = [](VkBlendFactor f) {
-            return f == VK_BLEND_FACTOR_SRC_ALPHA || f == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        };
-        const VkPipelineColorBlendAttachmentState &b = blends[i];
-        if (by_alpha(b.srcColorBlendFactor) || by_alpha(b.dstColorBlendFactor) || by_alpha(b.srcAlphaBlendFactor) ||
-            by_alpha(b.dstAlphaBlendFactor))
-            approximate("a 16_16_16_16 target blended by the source's alpha (scaled with the target's range)");
-    }
-    key.insert(key.end(), color_key.begin(), color_key.end());
-    if (premultiplied) {
-        std::copy(premultiply, premultiply + 4, sys.blend_premultiply);
-        std::memcpy(sys.blend_constant, &regs_[r::RB_BLEND_RED], 16);
-    }
-    // (a form being translated on the workers stands as the generic shader's
-    // module until the pipeline, which the generic shaders' then is)
-    VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why, &translating);
-    if (!guest_vs && translating) guest_vs = generic_vs_[0][0];
-    if (!guest_vs) return skip("vertex shader: " + why);
-    // The pixel shader: the guest's, its float24 depth conversion form with
-    // float24_convert; a depth-only draw that tests or writes depth then gets
-    // one that converts the rasterized depth (Xenia's float24_truncate and
-    // _round fragment shaders). The conversion runs per sample under MSAA, as
-    // Xenia's (unless the shader writes oDepth, which is per pixel).
-    VkShaderModule fragment = ps ? (ps->translated ? ps->module : generic_fs_[0][0]) : VK_NULL_HANDLE;
-    bool fragment_pending = ps && !ps->translated; // its first form, unless another is taken below
-    uint32_t pixel_form = 0; // its form's key (shader::PixelOptions), for the generic shaders
-    uint32_t float24_mode = float24_convert ? (options_.depth_float24_round ? 2u : 1u) : 0u;
-    // The interpolators read at the centroid under MSAA, as xenos.h's
-    // GetInterpolatorSamplingPattern takes SQ_CONTEXT_MISC's sc_sample_cntl (bits 2-3:
-    // 0 centroids only, 1 centers only, 2 both, by SQ_INTERPOLATOR_CNTL's
-    // sampling_pattern: a bit each, 1 the center). Xenia keeps only the
-    // interpolators the pixel shader reads; here all 16, as the shader
-    // loads them all.
-    uint32_t centroid = 0;
-    if (ps && msaa) {
-        uint32_t sample_control = (regs_[r::SQ_CONTEXT_MISC] >> 2) & 3;
-        if (sample_control == 0)
-            centroid = 0xFFFF;
-        else if (sample_control == 2)
-            centroid = ~(regs_[r::SQ_INTERPOLATOR_CNTL] >> 16) & 0xFFFF;
-    }
-    // a point list's pixel parameters take the sprite's coordinates from the
-    // point expansion (Xenia's param_gen_point)
-    const bool point_coordinates =
-        ps && points && ((regs_[reg::SQ_PROGRAM_CNTL] >> 18) & 1) && ((regs_[r::SQ_CONTEXT_MISC] >> 8) & 0xFF) < 16;
-    // Xenia's DepthStencilMode::kEarlyHint (pipeline_cache.cc): on the host
-    // path, without a float24 conversion, a shader that may write depth early
-    // (Shader::implicit_early_z_write_allowed: no kill, no oDepth, no memory
-    // export) is given its early form (PixelOptions::early_depth_stencil)
-    // where the coverage does not depend on its alpha (draw_util's
-    // DoesCoverageDependOnAlpha: an alpha test other than always, or alpha to
-    // coverage), or it does not write oC0. XF_EARLY_DEPTH_STENCIL=0: never.
-    static const bool early_allowed = [] {
-        const char *v = std::getenv("XF_EARLY_DEPTH_STENCIL");
-        return !(v && v[0] == '0');
-    }();
-    const uint32_t color_control_now = regs_[r::RB_COLORCONTROL];
-    const bool early =
-        early_allowed && ps && !fsi_ && !export_only && !float24_convert && !ps->summary.kills && !ps->writes_depth &&
-        !ps->exports &&
-        (!(ps->colors_written & 1) ||
-         !(((color_control_now & 8) && (color_control_now & 7) != 7) || (color_control_now & 16)));
-    bool sample_shading = false;
-    if (fsi_ && !export_only) {
-        // the interlock path: the guest's shader with the output merger taken
-        // in, or for depth and stencil alone edram_fsi.frag's own
-        if (ps) {
+        // A 16_16_16_16 target blended by the source's alpha ("A 16_16 target's
+        // alpha", renderer.md): its alpha is stored, so it is scaled by the fixed
+        // range, and so is the blend's factor, which should not be: counted (a
+        // second source for the blend would carry the alpha unscaled)
+        for (uint32_t i = 0; i < 4; i++) {
+            if (!colors[i] || colors[i]->format != 5 || !blends[i].blendEnable) continue;
+            auto by_alpha = [](VkBlendFactor f) {
+                return f == VK_BLEND_FACTOR_SRC_ALPHA || f == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            };
+            const VkPipelineColorBlendAttachmentState &b = blends[i];
+            if (by_alpha(b.srcColorBlendFactor) || by_alpha(b.dstColorBlendFactor) || by_alpha(b.srcAlphaBlendFactor) ||
+                by_alpha(b.dstAlphaBlendFactor))
+                approximate("a 16_16_16_16 target blended by the source's alpha (scaled with the target's range)");
+        }
+        key.insert(key.end(), color_key.begin(), color_key.end());
+        if (premultiplied) {
+            std::copy(premultiply, premultiply + 4, sys.blend_premultiply);
+            std::memcpy(sys.blend_constant, &regs_[r::RB_BLEND_RED], 16);
+        }
+        // (a form being translated on the workers stands as the generic shader's
+        // module until the pipeline, which the generic shaders' then is)
+        VkShaderModule guest_vs = vertex_module(*vs, host_vertex, why, &translating);
+        if (!guest_vs && translating) guest_vs = generic_vs_[0][0];
+        if (!guest_vs) return skip("vertex shader: " + why);
+        // The pixel shader: the guest's, its float24 depth conversion form with
+        // float24_convert; a depth-only draw that tests or writes depth then gets
+        // one that converts the rasterized depth (Xenia's float24_truncate and
+        // _round fragment shaders). The conversion runs per sample under MSAA, as
+        // Xenia's (unless the shader writes oDepth, which is per pixel).
+        fragment = ps ? (ps->translated ? ps->module : generic_fs_[0][0]) : VK_NULL_HANDLE;
+        bool fragment_pending = ps && !ps->translated; // its first form, unless another is taken below
+        uint32_t pixel_form = 0;                       // its form's key (shader::PixelOptions), for the generic shaders
+        uint32_t float24_mode = float24_convert ? (options_.depth_float24_round ? 2u : 1u) : 0u;
+        // The interpolators read at the centroid under MSAA, as xenos.h's
+        // GetInterpolatorSamplingPattern takes SQ_CONTEXT_MISC's sc_sample_cntl (bits 2-3:
+        // 0 centroids only, 1 centers only, 2 both, by SQ_INTERPOLATOR_CNTL's
+        // sampling_pattern: a bit each, 1 the center). Xenia keeps only the
+        // interpolators the pixel shader reads; here all 16, as the shader
+        // loads them all.
+        if (ps && msaa) {
+            uint32_t sample_control = (regs_[r::SQ_CONTEXT_MISC] >> 2) & 3;
+            if (sample_control == 0)
+                centroid = 0xFFFF;
+            else if (sample_control == 2)
+                centroid = ~(regs_[r::SQ_INTERPOLATOR_CNTL] >> 16) & 0xFFFF;
+        }
+        // a point list's pixel parameters take the sprite's coordinates from the
+        // point expansion (Xenia's param_gen_point)
+        const bool point_coordinates =
+            ps && points && ((regs_[reg::SQ_PROGRAM_CNTL] >> 18) & 1) && ((regs_[r::SQ_CONTEXT_MISC] >> 8) & 0xFF) < 16;
+        // Xenia's DepthStencilMode::kEarlyHint (pipeline_cache.cc): on the host
+        // path, without a float24 conversion, a shader that may write depth early
+        // (Shader::implicit_early_z_write_allowed: no kill, no oDepth, no memory
+        // export) is given its early form (PixelOptions::early_depth_stencil)
+        // where the coverage does not depend on its alpha (draw_util's
+        // DoesCoverageDependOnAlpha: an alpha test other than always, or alpha to
+        // coverage), or it does not write oC0. XF_EARLY_DEPTH_STENCIL=0: never.
+        static const bool early_allowed = [] {
+            const char *v = std::getenv("XF_EARLY_DEPTH_STENCIL");
+            return !(v && v[0] == '0');
+        }();
+        const uint32_t color_control_now = regs_[r::RB_COLORCONTROL];
+        const bool early = early_allowed && ps && !fsi_ && !export_only && !float24_convert && !ps->summary.kills &&
+                           !ps->writes_depth && !ps->exports &&
+                           (!(ps->colors_written & 1) ||
+                            !(((color_control_now & 8) && (color_control_now & 7) != 7) || (color_control_now & 16)));
+        bool sample_shading = false;
+        if (fsi_ && !export_only) {
+            // the interlock path: the guest's shader with the output merger taken
+            // in, or for depth and stencil alone edram_fsi.frag's own
+            if (ps) {
+                shader::PixelOptions options;
+                options.centroid = uint16_t(centroid);
+                options.fsi = uint8_t(fsi_);
+                options.point_coordinates = point_coordinates;
+                options.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
+                pixel_form = options.key();
+                fragment_pending = false;
+                fragment = pixel_module(*ps, options, why, &translating);
+                if (!fragment && translating) fragment = generic_fs_[0][0];
+                if (!fragment) return skip("pixel shader: " + why);
+            } else {
+                fragment = fsi_constants.flags & FSI_DEPTH_STENCIL ? fsi_depth_fs_ : VK_NULL_HANDLE;
+            }
+            if (!fragment) {
+                if (options_.verbose)
+                    std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
+                return;
+            }
+        } else if (ps && (float24_convert || centroid || point_coordinates || early || premultiplied)) {
             shader::PixelOptions options;
+            options.depth_float24 = uint8_t(float24_mode);
+            options.early_depth_stencil = early;
+            options.blend_premultiply = premultiplied;
             options.centroid = uint16_t(centroid);
-            options.fsi = uint8_t(fsi_);
             options.point_coordinates = point_coordinates;
-            options.edram_library = std::span<const uint32_t>(EDRAM_FSI_LIBRARY);
             pixel_form = options.key();
             fragment_pending = false;
             fragment = pixel_module(*ps, options, why, &translating);
             if (!fragment && translating) fragment = generic_fs_[0][0];
             if (!fragment) return skip("pixel shader: " + why);
-        } else {
-            fragment = fsi_constants.flags & FSI_DEPTH_STENCIL ? fsi_depth_fs_ : VK_NULL_HANDLE;
         }
-        if (!fragment) {
-            if (options_.verbose)
-                std::fprintf(stderr, "  draw %llu: writes nothing\n", (unsigned long long)report_.draws);
-            return;
-        }
-    } else if (ps && (float24_convert || centroid || point_coordinates || early || premultiplied)) {
-        shader::PixelOptions options;
-        options.depth_float24 = uint8_t(float24_mode);
-        options.early_depth_stencil = early;
-        options.blend_premultiply = premultiplied;
-        options.centroid = uint16_t(centroid);
-        options.point_coordinates = point_coordinates;
-        pixel_form = options.key();
-        fragment_pending = false;
-        fragment = pixel_module(*ps, options, why, &translating);
-        if (!fragment && translating) fragment = generic_fs_[0][0];
-        if (!fragment) return skip("pixel shader: " + why);
-    }
-    if (fragment_pending) translating = true;
-    // the interlock path's state as the pipeline's specialization
-    // (Options::fsi_specialized; edram_fsi.frag's constant_id 0-9)
-    uint32_t spec_data[10] = {};
-    VkSpecializationMapEntry spec_entries[10];
-    VkSpecializationInfo spec{};
-    if (fsi_ && fragment) {
-        key.push_back(0xF5000000u | fsi_ | (options_.fsi_specialized ? 0x100u : 0u));
-        if (options_.fsi_specialized) {
-            spec_data[0] = 1, spec_data[1] = fsi_constants.flags;
-            for (uint32_t i = 0; i < 4; i++) spec_data[2 + i] = fsi_constants.rt[i], spec_data[6 + i] = fsi_constants.blend[i];
-            for (uint32_t k = 0; k < 10; k++) spec_entries[k] = {k, k * 4, 4};
-            spec = {10, spec_entries, sizeof(spec_data), spec_data};
-            key.insert(key.end(), spec_data + 1, spec_data + 10);
-        }
-    }
-    if (float24_convert) {
-        if (!ps && ((depth_control & 4) || ((depth_control >> 4) & 7) != 7))
-            fragment = depth_float24_fs_[float24_mode == 2 ? 1 : 0];
-        // (the guest's shader runs per sample by its sample-decorated
-        // position; the depth-only one by the pipeline's sample shading)
-        sample_shading = msaa && fragment && !ps;
-    }
-    key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) |
-                  (point_coordinates ? 16u : 0u) | (early ? 32u : 0u) | (premultiplied ? 64u : 0u) | centroid << 16);
-    VkPipelineShaderStageCreateInfo stages[4] = {};
-    uint32_t stage_count = 0;
-    auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
-        stages[stage_count++] = {
-            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, bit, m, "main", nullptr};
-    };
-    if (tessellated) {
-        stage(VK_SHADER_STAGE_VERTEX_BIT, tessellation_vs_);
-        stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tessellation_hs_[hull]);
-        stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, guest_vs);
-    } else {
-        stage(VK_SHADER_STAGE_VERTEX_BIT, guest_vs);
-        if ((rectangles || points) && !expanded)
-            stage(VK_SHADER_STAGE_GEOMETRY_BIT, points ? point_gs_ : rectangle_gs_);
-    }
-    if (fragment) {
-        stage(VK_SHADER_STAGE_FRAGMENT_BIT, fragment);
-        if (spec.mapEntryCount) stages[stage_count - 1].pSpecializationInfo = &spec;
-    }
-    // the vertex attributes: a tessellated draw's control points (two
-    // floats), an expanded rectangle's guest indices (three)
-    VkVertexInputBindingDescription vertex_binding{0, tessellated ? 8u : 12u, VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription vertex_attribute{
-        0, 0, tessellated ? VK_FORMAT_R32G32_SFLOAT : VK_FORMAT_R32G32B32_UINT, 0};
-    VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    if (tessellated || host_vertex.host == shader::HostVertex::RectangleListAsTriangleStrip) {
-        vertex_input.vertexBindingDescriptionCount = vertex_input.vertexAttributeDescriptionCount = 1;
-        vertex_input.pVertexBindingDescriptions = &vertex_binding;
-        vertex_input.pVertexAttributeDescriptions = &vertex_attribute;
-    }
-    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-    assembly.topology = topology;
-    assembly.primitiveRestartEnable = restart;
-    VkPipelineTessellationStateCreateInfo tessellation{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
-    tessellation.patchControlPoints = patch_points;
-    VkPipelineViewportStateCreateInfo viewport_state{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    viewport_state.viewportCount = viewport_state.scissorCount = 1;
-    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.lineWidth = 1.0f;
-    uint32_t sc_mode = regs_[r::PA_SU_SC_MODE_CNTL];
-    bool triangles = primitive >= 4 && !rectangles;
-    if (triangles) {
-        raster.cullMode = (sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0);
-        raster.frontFace = sc_mode & 4 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    }
-    raster.polygonMode = polygon_mode; // (above, with the key)
-    raster.depthClampEnable = (regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1;
-    raster.depthBiasEnable = depth ? VK_TRUE : VK_FALSE; // the polygon offset, set at the draw
-    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    multisample.rasterizationSamples = msaa == 0   ? VK_SAMPLE_COUNT_1_BIT
-                                       : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT
-                                                   : VK_SAMPLE_COUNT_4_BIT;
-    // (the interlock path's guest 2x as 4x where passes without attachments
-    // take no 2x: edram_fsi.frag's F_2X_AS_4X)
-    if (fsi_ && msaa == 1 && fsi_2x_as_4x_) multisample.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
-    // The interlock path rasterizes at the Xenos's sample positions where the
-    // device places samples (VK_EXT_sample_locations), as Xenia's interlock
-    // paths always do; host render targets do with
-    // Options::xenos_sample_positions (Xenia's option of that name, off by
-    // default there, on here): xenos_sample_locations.
-    VkSampleLocationEXT sample_positions[4];
-    VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
-        VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
-    if (msaa && (fsi_ ? (d_.sample_locations() & multisample.rasterizationSamples) != 0 : xenos_at(msaa))) {
-        xenos_sample_locations(msaa, multisample.rasterizationSamples, fsi_, sample_positions, sample_locations);
-        multisample.pNext = &sample_locations;
-    }
-    if (sample_shading) multisample.sampleShadingEnable = VK_TRUE, multisample.minSampleShading = 1.0f;
-    VkPipelineDepthStencilStateCreateInfo depth_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    if (depth) {
-        depth_state.depthTestEnable = (depth_control >> 1) & 1;
-        depth_state.depthWriteEnable = (depth_control >> 2) & 1;
-        depth_state.depthCompareOp = compare_op(depth_control >> 4);
-        depth_state.stencilTestEnable = depth_control & 1;
-        auto face = [&](uint32_t shift) {
-            VkStencilOpState s{};
-            s.compareOp = compare_op(depth_control >> shift);
-            s.failOp = stencil_op(depth_control >> (shift + 3));
-            s.passOp = stencil_op(depth_control >> (shift + 6));
-            s.depthFailOp = stencil_op(depth_control >> (shift + 9));
-            return s;
-        };
-        depth_state.front = face(8);
-        // (the back face's own only for polygons, as Xenia's: a point, line or rectangle has no
-        // facing on the console and takes the front's, whichever way the host's triangles of it
-        // face: a rectangle list clearing depth where the stencil says so otherwise passed
-        // everywhere by the back face's test)
-        depth_state.back = polygonal && ((depth_control >> 7) & 1) ? face(20) : depth_state.front;
-    }
-    VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend_state.attachmentCount = 4;
-    blend_state.pAttachments = blends;
-    const VkDynamicState dynamic_states[] = {
-        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-        VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-        VK_DYNAMIC_STATE_DEPTH_BIAS,
-        // extended dynamic state 1 and 2 (Vulkan 1.3), set at each draw
-        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_CULL_MODE,
-        VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
-        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
-        // (core) the lines' width, PA_SU_LINE_CNTL's
-        VK_DYNAMIC_STATE_LINE_WIDTH,
-        // extended dynamic state 3 where the device has it (the last three)
-        VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
-        VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
-    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states)) - (d_.dynamic_blend() && !fsi_ ? 0u : 3u);
-    dynamic.pDynamicStates = dynamic_states;
-    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.colorAttachmentCount = 4;
-    rendering.pColorAttachmentFormats = color_formats;
-    // the interlock path's passes have no attachments
-    if (fsi_) rendering.colorAttachmentCount = blend_state.attachmentCount = 0;
-    rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat =
-        depth ? depth->image.format : VK_FORMAT_UNDEFINED;
-    VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    info.pNext = &rendering;
-    info.stageCount = stage_count;
-    info.pStages = stages;
-    info.pVertexInputState = &vertex_input;
-    info.pInputAssemblyState = &assembly;
-    if (tessellated) info.pTessellationState = &tessellation;
-    info.pViewportState = &viewport_state;
-    info.pRasterizationState = &raster;
-    info.pMultisampleState = &multisample;
-    info.pDepthStencilState = &depth_state;
-    info.pColorBlendState = &blend_state;
-    info.pDynamicState = &dynamic;
-    info.layout = layout_;
-    if (export_only) {
-        // the vertex shader alone, rasterization discarded: no viewport,
-        // multisample, depth, blend or dynamic state; a render pass without
-        // attachments
-        key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), 0xE0u, topology_class, host_key};
-        raster = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-        raster.rasterizerDiscardEnable = VK_TRUE;
-        raster.lineWidth = 1.0f;
-        info.stageCount = 1;
-        info.pViewportState = nullptr;
-        info.pMultisampleState = nullptr;
-        info.pDepthStencilState = nullptr;
-        info.pColorBlendState = nullptr;
-        info.pDynamicState = nullptr;
-        rendering.colorAttachmentCount = 0;
-    }
-    // made on a worker while the draw goes without it, or with a stand-in,
-    // when there is a pixel shader (Xenia's D3D12 pipeline cache: draws
-    // without one get theirs at once)
-    bool pending = false, stand_in = false, generic = false;
-    GenericStages generic_stages;
-    std::string generic_why;
-    VkPipeline pipe = VK_NULL_HANDLE;
-    const bool generic_wanted = options_.generic_only && ps; // (draws without a pixel shader are made at once anyway)
-    if (generic_wanted &&
-        !generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages, generic_why))
-        report_.generic_refused[generic_why]++;
-    if (generic_wanted && generic_why.empty()) {
-        // (Options::generic_only: whole pipelines of the generic shaders, made at once)
-        key.push_back(0x6E0E0000u);
-        pipe = pipeline(key, generic_stages.info, false, pending, stand_in);
-        generic = true;
-    } else if (translating) {
-        // a shader's form on the translation workers: the generic shaders'
-        // pipeline alone, linked once their libraries are made
-        if (generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages, generic_why)) {
-            std::unique_ptr<PipelineEntry> &slot = translating_pipelines_[key];
-            if (!slot) slot = std::make_unique<PipelineEntry>();
-            pipe = generic_stand_in(*slot, generic_stages.info, true);
-            generic = pipe != VK_NULL_HANDLE;
-        } else {
-            report_.generic_refused[generic_why]++;
-        }
-        if (!pipe) return skip("pipeline not ready (shaders being translated)");
-    } else {
-        // the generic pipeline drawn while its shaders were translated
-        if (!translating_pipelines_.empty()) {
-            auto it = translating_pipelines_.find(key);
-            if (it != translating_pipelines_.end()) {
-                retire_generic(*it->second);
-                translating_pipelines_.erase(it);
+        if (fragment_pending) translating = true;
+        // the interlock path's state as the pipeline's specialization
+        // (Options::fsi_specialized; edram_fsi.frag's constant_id 0-9)
+        uint32_t spec_data[10] = {};
+        VkSpecializationMapEntry spec_entries[10];
+        VkSpecializationInfo spec{};
+        if (fsi_ && fragment) {
+            key.push_back(0xF5000000u | fsi_ | (options_.fsi_specialized ? 0x100u : 0u));
+            if (options_.fsi_specialized) {
+                spec_data[0] = 1, spec_data[1] = fsi_constants.flags;
+                for (uint32_t i = 0; i < 4; i++)
+                    spec_data[2 + i] = fsi_constants.rt[i], spec_data[6 + i] = fsi_constants.blend[i];
+                for (uint32_t k = 0; k < 10; k++) spec_entries[k] = {k, k * 4, 4};
+                spec = {10, spec_entries, sizeof(spec_data), spec_data};
+                key.insert(key.end(), spec_data + 1, spec_data + 10);
             }
         }
-        pipe = pipeline(key, info, options_.async_pipelines && ps, pending, stand_in);
-        // waiting for the pipeline and its exact stand-in: the generic one
-        if (pending && generic_on_ && !options_.generic_only) {
+        if (float24_convert) {
+            if (!ps && ((depth_control & 4) || ((depth_control >> 4) & 7) != 7))
+                fragment = depth_float24_fs_[float24_mode == 2 ? 1 : 0];
+            // (the guest's shader runs per sample by its sample-decorated
+            // position; the depth-only one by the pipeline's sample shading)
+            sample_shading = msaa && fragment && !ps;
+        }
+        key.push_back(float24_mode | (sample_shading ? 4u : 0u) | (fragment && !ps ? 8u : 0u) |
+                      (point_coordinates ? 16u : 0u) | (early ? 32u : 0u) | (premultiplied ? 64u : 0u) |
+                      centroid << 16);
+        VkPipelineShaderStageCreateInfo stages[4] = {};
+        uint32_t stage_count = 0;
+        auto stage = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
+            stages[stage_count++] = {
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, bit, m, "main", nullptr};
+        };
+        if (tessellated) {
+            stage(VK_SHADER_STAGE_VERTEX_BIT, tessellation_vs_);
+            stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, tessellation_hs_[hull]);
+            stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, guest_vs);
+        } else {
+            stage(VK_SHADER_STAGE_VERTEX_BIT, guest_vs);
+            if ((rectangles || points) && !expanded)
+                stage(VK_SHADER_STAGE_GEOMETRY_BIT, points ? point_gs_ : rectangle_gs_);
+        }
+        if (fragment) {
+            stage(VK_SHADER_STAGE_FRAGMENT_BIT, fragment);
+            if (spec.mapEntryCount) stages[stage_count - 1].pSpecializationInfo = &spec;
+        }
+        // the vertex attributes: a tessellated draw's control points (two
+        // floats), an expanded rectangle's guest indices (three)
+        VkVertexInputBindingDescription vertex_binding{0, tessellated ? 8u : 12u, VK_VERTEX_INPUT_RATE_VERTEX};
+        VkVertexInputAttributeDescription vertex_attribute{
+            0, 0, tessellated ? VK_FORMAT_R32G32_SFLOAT : VK_FORMAT_R32G32B32_UINT, 0};
+        VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        if (tessellated || host_vertex.host == shader::HostVertex::RectangleListAsTriangleStrip) {
+            vertex_input.vertexBindingDescriptionCount = vertex_input.vertexAttributeDescriptionCount = 1;
+            vertex_input.pVertexBindingDescriptions = &vertex_binding;
+            vertex_input.pVertexAttributeDescriptions = &vertex_attribute;
+        }
+        VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        assembly.topology = topology;
+        assembly.primitiveRestartEnable = restart;
+        VkPipelineTessellationStateCreateInfo tessellation{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
+        tessellation.patchControlPoints = patch_points;
+        VkPipelineViewportStateCreateInfo viewport_state{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        viewport_state.viewportCount = viewport_state.scissorCount = 1;
+        raster.polygonMode = VK_POLYGON_MODE_FILL;
+        raster.lineWidth = 1.0f;
+        bool triangles = primitive >= 4 && !rectangles;
+        if (triangles) {
+            raster.cullMode = (sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0);
+            raster.frontFace = sc_mode & 4 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        }
+        raster.polygonMode = polygon_mode; // (above, with the key)
+        raster.depthClampEnable = (regs_[r::PA_CL_CLIP_CNTL] >> 16) & 1;
+        raster.depthBiasEnable = depth ? VK_TRUE : VK_FALSE; // the polygon offset, set at the draw
+        multisample.rasterizationSamples = msaa == 0   ? VK_SAMPLE_COUNT_1_BIT
+                                           : msaa == 1 ? VK_SAMPLE_COUNT_2_BIT
+                                                       : VK_SAMPLE_COUNT_4_BIT;
+        // (the interlock path's guest 2x as 4x where passes without attachments
+        // take no 2x: edram_fsi.frag's F_2X_AS_4X)
+        if (fsi_ && msaa == 1 && fsi_2x_as_4x_) multisample.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+        // The interlock path rasterizes at the Xenos's sample positions where the
+        // device places samples (VK_EXT_sample_locations), as Xenia's interlock
+        // paths always do; host render targets do with
+        // Options::xenos_sample_positions (Xenia's option of that name, off by
+        // default there, on here): xenos_sample_locations.
+        VkSampleLocationEXT sample_positions[4];
+        VkPipelineSampleLocationsStateCreateInfoEXT sample_locations{
+            VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT};
+        if (msaa && (fsi_ ? (d_.sample_locations() & multisample.rasterizationSamples) != 0 : xenos_at(msaa))) {
+            xenos_sample_locations(msaa, multisample.rasterizationSamples, fsi_, sample_positions, sample_locations);
+            multisample.pNext = &sample_locations;
+        }
+        if (sample_shading) multisample.sampleShadingEnable = VK_TRUE, multisample.minSampleShading = 1.0f;
+        if (depth) {
+            depth_state.depthTestEnable = (depth_control >> 1) & 1;
+            depth_state.depthWriteEnable = (depth_control >> 2) & 1;
+            depth_state.depthCompareOp = compare_op(depth_control >> 4);
+            depth_state.stencilTestEnable = depth_control & 1;
+            auto face = [&](uint32_t shift) {
+                VkStencilOpState s{};
+                s.compareOp = compare_op(depth_control >> shift);
+                s.failOp = stencil_op(depth_control >> (shift + 3));
+                s.passOp = stencil_op(depth_control >> (shift + 6));
+                s.depthFailOp = stencil_op(depth_control >> (shift + 9));
+                return s;
+            };
+            depth_state.front = face(8);
+            // (the back face's own only for polygons, as Xenia's: a point, line or rectangle has no
+            // facing on the console and takes the front's, whichever way the host's triangles of it
+            // face: a rectangle list clearing depth where the stencil says so otherwise passed
+            // everywhere by the back face's test)
+            depth_state.back = polygonal && ((depth_control >> 7) & 1) ? face(20) : depth_state.front;
+        }
+        VkPipelineColorBlendStateCreateInfo blend_state{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        blend_state.attachmentCount = 4;
+        blend_state.pAttachments = blends;
+        const VkDynamicState dynamic_states[] = {
+            VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_DEPTH_BIAS,
+            // extended dynamic state 1 and 2 (Vulkan 1.3), set at each draw
+            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_CULL_MODE,
+            VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+            VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
+            VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+            // (core) the lines' width, PA_SU_LINE_CNTL's
+            VK_DYNAMIC_STATE_LINE_WIDTH,
+            // extended dynamic state 3 where the device has it (the last three)
+            VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+            VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
+        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        dynamic.dynamicStateCount = uint32_t(std::size(dynamic_states)) - (d_.dynamic_blend() && !fsi_ ? 0u : 3u);
+        dynamic.pDynamicStates = dynamic_states;
+        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rendering.colorAttachmentCount = 4;
+        rendering.pColorAttachmentFormats = color_formats;
+        // the interlock path's passes have no attachments
+        if (fsi_) rendering.colorAttachmentCount = blend_state.attachmentCount = 0;
+        rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat =
+            depth ? depth->image.format : VK_FORMAT_UNDEFINED;
+        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        info.pNext = &rendering;
+        info.stageCount = stage_count;
+        info.pStages = stages;
+        info.pVertexInputState = &vertex_input;
+        info.pInputAssemblyState = &assembly;
+        if (tessellated) info.pTessellationState = &tessellation;
+        info.pViewportState = &viewport_state;
+        info.pRasterizationState = &raster;
+        info.pMultisampleState = &multisample;
+        info.pDepthStencilState = &depth_state;
+        info.pColorBlendState = &blend_state;
+        info.pDynamicState = &dynamic;
+        info.layout = layout_;
+        if (export_only) {
+            // the vertex shader alone, rasterization discarded: no viewport,
+            // multisample, depth, blend or dynamic state; a render pass without
+            // attachments
+            key = {uint32_t(vertex_hash_), uint32_t(vertex_hash_ >> 32), 0xE0u, topology_class, host_key};
+            raster = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+            raster.rasterizerDiscardEnable = VK_TRUE;
+            raster.lineWidth = 1.0f;
+            info.stageCount = 1;
+            info.pViewportState = nullptr;
+            info.pMultisampleState = nullptr;
+            info.pDepthStencilState = nullptr;
+            info.pColorBlendState = nullptr;
+            info.pDynamicState = nullptr;
+            rendering.colorAttachmentCount = 0;
+        }
+        // made on a worker while the draw goes without it, or with a stand-in,
+        // when there is a pixel shader (Xenia's D3D12 pipeline cache: draws
+        // without one get theirs at once)
+        bool pending = false, stand_in = false;
+        GenericStages generic_stages;
+        std::string generic_why;
+        const bool generic_wanted =
+            options_.generic_only && ps; // (draws without a pixel shader are made at once anyway)
+        if (generic_wanted &&
+            !generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages, generic_why))
+            report_.generic_refused[generic_why]++;
+        if (generic_wanted && generic_why.empty()) {
+            // (Options::generic_only: whole pipelines of the generic shaders, made at once)
+            key.push_back(0x6E0E0000u);
+            pipe = pipeline(key, generic_stages.info, false, pending, stand_in);
+            generic = true;
+        } else if (translating) {
+            // a shader's form on the translation workers: the generic shaders'
+            // pipeline alone, linked once their libraries are made
             if (generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages,
                              generic_why)) {
-                auto entry = pipelines_.find(key);
-                if (entry != pipelines_.end()) pipe = generic_stand_in(*entry->second, generic_stages.info, true);
-                if (pipe) pending = false, generic = true;
+                std::unique_ptr<PipelineEntry> &slot = translating_pipelines_[key];
+                if (!slot) slot = std::make_unique<PipelineEntry>();
+                pipe = generic_stand_in(*slot, generic_stages.info, true);
+                generic = pipe != VK_NULL_HANDLE;
             } else {
                 report_.generic_refused[generic_why]++;
             }
+            if (!pipe) return skip("pipeline not ready (shaders being translated)");
+        } else {
+            // the generic pipeline drawn while its shaders were translated
+            if (!translating_pipelines_.empty()) {
+                auto it = translating_pipelines_.find(key);
+                if (it != translating_pipelines_.end()) {
+                    retire_generic(*it->second);
+                    translating_pipelines_.erase(it);
+                }
+            }
+            pipe = pipeline(key, info, options_.async_pipelines && ps, pending, stand_in);
+            // waiting for the pipeline and its exact stand-in: the generic one
+            if (pending && generic_on_ && !options_.generic_only) {
+                if (generic_info(info, *vs, ps, point_coordinates, host_vertex.key(), pixel_form, generic_stages,
+                                 generic_why)) {
+                    auto entry = pipelines_.find(key);
+                    if (entry != pipelines_.end()) pipe = generic_stand_in(*entry->second, generic_stages.info, true);
+                    if (pipe) pending = false, generic = true;
+                } else {
+                    report_.generic_refused[generic_why]++;
+                }
+            }
         }
-    }
-    if (pending) return skip("pipeline not ready (being made)");
-    if (!pipe) return skip("vkCreateGraphicsPipelines failed");
-    if (stand_in) report_.stand_in_draws++;
-    if (generic) {
-        report_.generic_draws++;
-        sys.generic[0] = vs->program;
-        sys.generic[1] = ps ? ps->program : 0;
+        if (pending) return skip("pipeline not ready (being made)");
+        if (!pipe) return skip("vkCreateGraphicsPipelines failed");
+        if (stand_in) report_.stand_in_draws++;
+        if (generic) {
+            report_.generic_draws++;
+            sys.generic[0] = vs->program;
+            sys.generic[1] = ps ? ps->program : 0;
+        }
+        // kept for the next draw that finds this one's front part: a pipeline
+        // found made, the shaders' own forms, nothing counted by a made string
+        if (pipeline_memo_on_ && front_valid_ && pipeline_final_ && pipeline_keepable_ && !generic && !translating &&
+            !stand_in && !pending) {
+            pm.valid = true;
+            pm.front_generation = front_generation_;
+            pm.counts = pipeline_counts_;
+            std::copy(blends, blends + 4, pm.blends);
+            pm.raster = raster, pm.depth_state = depth_state;
+            pm.raster.pNext = nullptr, pm.depth_state.pNext = nullptr;
+            pm.samples = multisample.rasterizationSamples;
+            pm.fragment = fragment, pm.pipe = pipe;
+            pm.premultiplied = premultiplied;
+            std::copy(premultiply, premultiply + 4, pm.premultiply);
+        }
     }
 
     XF_DRAW_SECTION(Pipeline);
@@ -10634,6 +10804,15 @@ void Impl::draw(const gpu::Draw &d) {
         // blocks there are not all this draw's)
         if (last_constants_at_[stage] == NONE || (blocks & ~last_constants_blocks_[stage])) {
             XF_DRAW_TALLY(ConstantUploadCount);
+            if (DrawSections::on()) {
+                const uint64_t dirty = constants_dirty_[stage];
+                const uint64_t read = blocks | 1ull << 63;
+                DrawSections::get().tally(DrawSections::UploadBlocks, std::popcount(read));
+                DrawSections::get().tally(DrawSections::UploadDirtyBlocks, std::popcount(read & dirty));
+                if (!(dirty & read & 0xFFFFFFFFull)) DrawSections::get().tally(DrawSections::UploadNoFloats);
+                if (stage == 1) DrawSections::get().tally(DrawSections::UploadPixel);
+            }
+            constants_dirty_[stage] = 0;
             last_constants_at_[stage] = draw_data_take(sizeof(harness::Constants), ubo_align_);
             uint8_t *to = draw_data(last_constants_at_[stage]);
             const uint8_t *from = reinterpret_cast<const uint8_t *>(&last_constants_[stage]);

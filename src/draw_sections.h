@@ -71,6 +71,12 @@ class DrawSections {
         MissLoads,
         MissStale,
         MissWritten,
+        PipelineMemoHits,
+        FrontHits,
+        UploadBlocks,
+        UploadDirtyBlocks,
+        UploadNoFloats,
+        UploadPixel,
         TALLIES
     };
     void tally(Tally t, uint64_t n = 1) { tallies_[t] += n; }
@@ -87,10 +93,12 @@ class DrawSections {
             std::fprintf(stderr, "  %-10s %7.0f ticks a draw %5.1f%% (%llu reached)\n", names[i],
                          double(cycles_[i]) / double(draws_), total ? 100.0 * double(cycles_[i]) / double(total) : 0.0,
                          (unsigned long long)counts_[i]);
-        static const char *const tallies[TALLIES] = {"slot memo hits",   "slot memo misses", "unwritten scans",
-                                                     "constant uploads", "system uploads",   "ticks in slot misses",
-                                                     "miss: epoch",      "miss: fetch",      "miss: loads",
-                                                     "miss: stale",      "miss: written"};
+        static const char *const tallies[TALLIES] = {
+            "slot memo hits",  "slot memo misses",     "unwritten scans",       "constant uploads",
+            "system uploads",  "ticks in slot misses", "miss: epoch",           "miss: fetch",
+            "miss: loads",     "miss: stale",          "miss: written",         "pipeline memo hits",
+            "front part hits", "upload blocks",        "upload blocks written", "uploads without a float written",
+            "pixel uploads"};
         for (uint32_t i = 0; i < TALLIES; i++)
             std::fprintf(stderr, "  %s: %.4f a draw (%llu)\n", tallies[i], double(tallies_[i]) / double(draws_),
                          (unsigned long long)tallies_[i]);
