@@ -17,6 +17,7 @@
 #pragma once
 
 #include "stacks.h"
+#include "thread_priority.h"
 #include "xenoforge/kernel.h"
 
 #include <atomic>
@@ -131,7 +132,7 @@ constexpr uint32_t STACK_BASE = 0x5C, STACK_LIMIT = 0x60, STACK_KERNEL = 0x64, T
 constexpr uint32_t STATE = 0x6C, ALERTABLE = 0x6F, PRIORITY = 0x70, FPU_EXCEPTIONS = 0x71;
 constexpr uint32_t PROCESS_TYPE_DUP = 0x72, PROCESS_TYPE = 0x73, APC_LISTS = 0x74, PROCESS = 0x84;
 constexpr uint32_t MAY_QUEUE_APCS = 0x8B, MSR_MASK = 0x9C, WAIT_RESULT = 0xA0, APC_DISABLE_COUNT = 0xB0;
-constexpr uint32_t QUANTUM = 0xB4, BASE_PRIORITY = 0xB9, BOOST_DISABLED = 0xBB, SUSPEND_COUNT = 0xBC, TERMINATED = 0xBE;
+constexpr uint32_t QUANTUM = 0xB4, BASE_PRIORITY = 0xB9, PRIORITY_DECREMENT = 0xBA, BOOST_DISABLED = 0xBB, SUSPEND_COUNT = 0xBC, TERMINATED = 0xBE;
 constexpr uint32_t CURRENT_CPU = 0xBF, A_PRCB = 0xC0, ANOTHER_PRCB = 0xC4, PROCESS_PRIORITY_CLASS = 0xC8;
 constexpr uint32_t BASE_PRIORITY_COPY = 0xC9, MAX_DYNAMIC_PRIORITY = 0xCA, STACK_ALLOC_BASE = 0xD0;
 constexpr uint32_t PROCESS_THREADS = 0x110, CREATE_TIME = 0x130, EXIT_TIME = 0x138, EXIT_STATUS = 0x140;
@@ -446,6 +447,17 @@ public:
     uint32_t wait_status = X_STATUS_PENDING;
     std::vector<Mutant *> mutants; // owned, abandoned at exit
     int32_t base_priority_increment = 0;
+    // The priority given to the host thread (thread_priority.h): its state,
+    // the increment of the signal that woke it, and the host thread's handle
+    // to set it with (a Windows handle, or a pthread_t; none until body()).
+    priority::State prio;
+    uint32_t wake_increment = 0;
+    uintptr_t host_priority_handle = 0;
+    int host_tid = 0; // POSIX: the kernel's thread id, for the nice value
+    // the host thread gets the level its state asks for (lock held; nothing
+    // unless the scheduler gives priorities to the host), and the KTHREAD
+    // the effective priority
+    void apply_host_priority();
 
     // the scheduler's
     bool woken = false;
@@ -520,6 +532,10 @@ public:
     virtual void preempt_point() {}
     // t's processor (KPCR CURRENT_CPU) changed (KeSetAffinityThread; lock held)
     virtual void affinity_changed(Thread &t) { (void)t; }
+    // Whether guest priorities go to the host's threads (the host scheduler,
+    // unless XF_IGNORE_THREAD_PRIORITIES=1). The other schedulers schedule by
+    // the KTHREAD's priority themselves.
+    virtual bool applies_priorities() const { return false; }
 };
 
 std::unique_ptr<Scheduler> make_host_scheduler(Objects &objects);
@@ -623,8 +639,10 @@ public:
     // wait's status (WAIT_0 + n, ABANDONED_WAIT_0 + n, TIMEOUT, USER_APC).
     // The caller delivers user APCs on USER_APC.
     uint32_t wait(Thread &self, std::span<Dispatcher *const> objects, bool all, bool alertable, uint64_t deadline);
-    // d's state became signaled: the waits it satisfies (lock held)
-    void signaled(Dispatcher &d);
+    // d's state became signaled: the waits it satisfies (lock held). The
+    // increment is the signal's (KeSetEvent's, KeReleaseSemaphore's...), by
+    // which the threads it wakes are boosted.
+    void signaled(Dispatcher &d, uint32_t increment = 0);
     // ends t's wait with a status, waking it (lock held)
     void unwait(Thread &t, uint32_t status);
 
@@ -641,6 +659,12 @@ public:
     uint64_t next_due(); // Scheduler::NEVER: none armed
     // the clock ticked (lock held): due timers fire, KeTimeStampBundle moves
     void on_clock();
+    // every 20 ms (the host scheduler's clock; lock held): the running
+    // threads' quanta end (Xenia's CheckQuantumAndDecay)
+    void decay_priorities();
+    // a thread woke from a wait that blocked it (lock held): the signaler's
+    // increment boosts it (Xenia's BoostOnWake)
+    void boost_on_wake(Thread &t);
     // where a timer with a DPC (KeSetTimerEx) sends it when it comes due
     // (lock held; the system time then): the family that runs DPCs sets it
     std::function<void(Timer &timer, uint64_t system_time)> on_timer_dpc;

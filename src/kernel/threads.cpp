@@ -34,6 +34,12 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace xf::kernel {
@@ -62,6 +68,50 @@ void fine_host_timer() {
     query(&minimum, &maximum, &current);
     set(maximum, TRUE, &current);
 #endif
+}
+
+// XF_IGNORE_THREAD_PRIORITIES=1: guest priorities stay in the KTHREADs, as
+// they did before (Xenia's ignore_thread_priorities cvar, which since
+// b3d8a21b7 defaults to false: the priorities are applied)
+bool ignore_thread_priorities() {
+    static const bool ignore = [] {
+        const char *v = std::getenv("XF_IGNORE_THREAD_PRIORITIES");
+        return v && v[0] && v[0] != '0';
+    }();
+    return ignore;
+}
+
+// The host thread of a guest thread gets a level (priority::Host). Windows:
+// SetThreadPriority, whose five levels these are (Xenia's threading_win.cc).
+// POSIX, as Xenia's threading_posix.cc does since 763b160c7: SCHED_FIFO at
+// priority 1, 8, 16, 24 or 32 where the process may, else nice values
+// (16 - that priority) with setpriority on the thread's id. Both fail quietly
+// without the privileges (a nice below the thread's current one needs them
+// too). TODO: macOS has no thread ids for setpriority; nothing is set there.
+void set_host_thread_priority(Thread &t, int level) {
+#ifdef _WIN32
+    SetThreadPriority(reinterpret_cast<HANDLE>(t.host_priority_handle), level);
+#else
+    static constexpr int fifo[] = {1, 8, 16, 24, 32}; // by level + 2
+    int rt = fifo[std::clamp(level, int(priority::LOWEST), int(priority::HIGHEST)) + 2];
+    static std::atomic<bool> fifo_failed{false};
+    if (!fifo_failed.load(std::memory_order_relaxed)) {
+        sched_param param{};
+        param.sched_priority = rt;
+        if (pthread_setschedparam(static_cast<pthread_t>(t.host_priority_handle), SCHED_FIFO, &param) == 0) return;
+        fifo_failed.store(true, std::memory_order_relaxed);
+    }
+#if defined(__linux__) || defined(__ANDROID__)
+    if (t.host_tid > 0) setpriority(PRIO_PROCESS, id_t(t.host_tid), std::clamp(16 - rt, -20, 19));
+#endif
+#endif
+}
+
+// the thread's level, to the host thread if it has one yet and not already
+void push_host_priority(Thread &t) {
+    if (!t.host_priority_handle || t.prio.applied == t.prio.host) return;
+    t.prio.applied = t.prio.host;
+    set_host_thread_priority(t, t.prio.host);
 }
 
 // The host's shortest sleep: Xenia's NanoSleep(100) (NtDelayExecution for one
@@ -215,6 +265,8 @@ public:
 
     void timers_changed() override { clock_cv_.notify_one(); }
 
+    bool applies_priorities() const override { return !ignore_thread_priorities(); }
+
 private:
     // a deadline on now()'s clock as one on steady_clock's, which the host's
     // waits take: by the time left, so that the two clocks' rates may differ
@@ -232,6 +284,11 @@ private:
         std::unique_lock<std::mutex> l(o_.lock);
         while (!stopping_) {
             o_.on_clock();
+            // the quanta end every 20 ms (Xenia piggybacks on the same timer)
+            if (uint64_t t = now(); t - last_decay_ >= priority::QUANTUM_PERIOD) {
+                last_decay_ = t;
+                o_.decay_priorities();
+            }
             uint64_t next = std::min(o_.next_due(), now() + 10'000);
             clock_cv_.wait_until(l, time_point(next));
         }
@@ -243,6 +300,7 @@ private:
 
     Objects &o_;
     uint64_t epoch_; // host_clock::now() when the scheduler was made
+    uint64_t last_decay_ = 0; // the clock thread's
     std::atomic<uint64_t> naps_{0};
     std::mutex spin_lock_; // spin_wait's sleepers
     std::condition_variable spin_cv_;
@@ -379,6 +437,13 @@ uint32_t Thread::create(const Params &p) {
     g[kthread::PROCESS_PRIORITY_CLASS] = k.host(process)[kprocess::PRIORITY_CLASS];
     uint8_t priority = k.host(process)[kprocess::DEFAULT_PRIORITY];
     g[kthread::BASE_PRIORITY_COPY] = g[kthread::BASE_PRIORITY] = g[kthread::PRIORITY] = priority;
+    // the host-side copy (Xenia's priority_ and base_priority_), and the
+    // level the host thread starts at, from the creation flags (0x20 above
+    // normal, 0x40 normal; Xenia's, which gives those two values as the
+    // host's levels)
+    prio.priority = prio.base = priority;
+    prio.quantum_start = owner.now();
+    if (int level = priority::creation_level(p.flags); level != priority::NO_LEVEL) prio.host = level;
     g[kthread::MAX_DYNAMIC_PRIORITY] = k.host(process)[kprocess::MAX_DYNAMIC_PRIORITY];
     k.store32(t + kthread::QUANTUM, k.load32(process + kprocess::QUANTUM));
     k.store32(t + kthread::A_PRCB, pcr + kpcr::PRCB_DATA);
@@ -419,6 +484,14 @@ void Thread::refresh_ready() {
     owner.ready_threads.fetch_add(now ? 1 : -1, std::memory_order_relaxed);
 }
 
+void Thread::apply_host_priority() {
+    if (!owner.scheduler->applies_priorities()) return;
+    owner.k.host(guest)[kthread::PRIORITY] = uint8_t(prio.priority);
+    prio.host = priority::wanted(prio);
+    // (a finished thread's host thread may be gone)
+    if (!finished) push_host_priority(*this);
+}
+
 double Thread::host_cpu_seconds() const {
 #ifdef _WIN32
     FILETIME created, exited, kernel_time, user_time;
@@ -446,7 +519,8 @@ void Thread::body() {
                       params.name ? params.name : "");
 #ifdef _WIN32
         host_thread_id = GetCurrentThreadId();
-        host_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, host_thread_id);
+        host_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | THREAD_SET_LIMITED_INFORMATION, FALSE,
+                                 host_thread_id);
         wchar_t wide[48];
         for (size_t i = 0; i < sizeof(name); i++)
             if (!(wide[i] = wchar_t(static_cast<unsigned char>(name[i])))) break;
@@ -457,11 +531,22 @@ void Thread::body() {
 #if defined(__linux__) || defined(__ANDROID__)
         name[15] = 0; // the 16 bytes Linux keeps
         pthread_setname_np(pthread_self(), name);
+        host_tid = int(syscall(SYS_gettid));
 #endif
 #endif
     }
     {
         std::unique_lock<std::mutex> l(o.lock);
+        // the host thread's own level, from the priority asked before it ran
+        // too (a fiber has no host thread of its own: nothing is given)
+        if (!scheduled && o.scheduler->applies_priorities()) {
+#ifdef _WIN32
+            host_priority_handle = reinterpret_cast<uintptr_t>(host_thread);
+#else
+            host_priority_handle = static_cast<uintptr_t>(pthread_self());
+#endif
+            push_host_priority(*this);
+        }
         started = true;
         refresh_ready();
         while (suspend_count > 0) {
@@ -994,10 +1079,13 @@ XF_EXPORT(xboxkrnl, KeSetAffinityThread) {
     result(c, X_STATUS_SUCCESS);
 }
 
-// Priorities are recorded, not given to the host (Xenia ignores them by
-// default too). The base priority's increment over the process's, as NT's
-// KeSetBasePriorityThread takes and returns it (Xenia returns the host
-// thread's priority, 0 when ignored).
+// Priorities are recorded in the KTHREAD and given to the host's thread, as
+// Xenia does since b3d8a21b7 (thread_priority.h; not by the console and the
+// deterministic schedulers, which schedule by the KTHREAD themselves, nor
+// with XF_IGNORE_THREAD_PRIORITIES=1). The base priority's increment over the
+// process's, as NT's KeSetBasePriorityThread takes and returns it (Xenia
+// returns the host thread's priority, and takes the increment as the
+// priority).
 XF_EXPORT(xboxkrnl, KeQueryBasePriorityThread) {
     Ref<Thread> t = thread_at(k, arg(k, c, 0));
     std::lock_guard<std::mutex> l(objects(k).lock);
@@ -1015,6 +1103,8 @@ XF_EXPORT(xboxkrnl, KeSetBasePriorityThread) {
     int32_t priority = std::clamp(int32_t(k.host(process)[kprocess::DEFAULT_PRIORITY]) + increment, 0, 31);
     k.host(t->kthread())[kthread::BASE_PRIORITY] = uint8_t(priority);
     k.host(t->kthread())[kthread::PRIORITY] = uint8_t(priority);
+    priority::set_priority(t->prio, priority, objects(k).now());
+    t->apply_host_priority();
     result(c, uint32_t(previous));
 }
 
@@ -1040,9 +1130,8 @@ XF_EXPORT(xboxkrnl, KeSuspendThread) {
     result(c, previous);
 }
 
-// (thread, priority): the previous priority; the new one in the KTHREAD,
-// not given to the host (as KeSetBasePriorityThread here; Xenia ignores
-// priorities by default)
+// (thread, priority): the previous priority; the new one in the KTHREAD and
+// given to the host (as KeSetBasePriorityThread here)
 XF_EXPORT(xboxkrnl, KeSetPriorityThread) {
     uint32_t thread = arg(k, c, 0);
     int32_t priority = int32_t(arg(k, c, 1));
@@ -1050,7 +1139,11 @@ XF_EXPORT(xboxkrnl, KeSetPriorityThread) {
     Ref<Thread> t = thread_at(k, thread);
     std::lock_guard<std::mutex> l(objects(k).lock);
     uint8_t previous = k.host(thread)[kthread::PRIORITY];
-    if (t) k.host(thread)[kthread::PRIORITY] = uint8_t(std::max(priority, 0));
+    if (t) {
+        k.host(thread)[kthread::PRIORITY] = uint8_t(std::max(priority, 0));
+        priority::set_priority(t->prio, priority, objects(k).now());
+        t->apply_host_priority();
+    }
     result(c, previous);
 }
 

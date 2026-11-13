@@ -41,10 +41,10 @@ namespace {
 // ---- the objects' operations (lock held) ----
 
 // NT's KeSetEvent returns the previous state (Xenia: 1)
-int32_t set_event(Objects &o, Event &e) {
+int32_t set_event(Objects &o, Event &e, uint32_t increment = 0) {
     int32_t previous = e.signal_state();
     e.set_signal_state(1);
-    o.signaled(e);
+    o.signaled(e, increment);
     return previous;
 }
 
@@ -55,11 +55,11 @@ int32_t reset_event(Event &e) {
 }
 
 // waiters that can go now go, and the event ends reset
-int32_t pulse_event(Objects &o, Event &e) {
+int32_t pulse_event(Objects &o, Event &e, uint32_t increment = 0) {
     int32_t previous = e.signal_state();
     if (!previous) {
         e.set_signal_state(1);
-        o.signaled(e);
+        o.signaled(e, increment);
     }
     e.set_signal_state(0);
     return previous;
@@ -157,7 +157,7 @@ XF_EXPORT(xboxkrnl, KeSetEvent) {
     Ref<Event> e = as<Event>(o.native(arg(k, c, 0)));
     if (!e) return result(c, 0);
     std::lock_guard<std::mutex> l(o.lock);
-    result(c, uint32_t(set_event(o, *e)));
+    result(c, uint32_t(set_event(o, *e, arg(k, c, 1))));
 }
 
 XF_EXPORT(xboxkrnl, KeResetEvent) {
@@ -226,7 +226,7 @@ XF_EXPORT(xboxkrnl, KePulseEvent) {
     Ref<Event> e = as<Event>(o.native(arg(k, c, 0)));
     if (!e) return result(c, 0);
     std::lock_guard<std::mutex> l(o.lock);
-    result(c, uint32_t(pulse_event(o, *e)));
+    result(c, uint32_t(pulse_event(o, *e, arg(k, c, 1))));
 }
 
 // (handle, EVENT_BASIC_INFORMATION *): the type (0 notification, 1
@@ -336,7 +336,7 @@ XF_EXPORT(xboxkrnl, KeReleaseSemaphore) {
     int32_t previous = s->signal_state();
     if (adjustment > 0 && int64_t(previous) + adjustment <= s->limit()) {
         s->set_signal_state(previous + adjustment);
-        o.signaled(*s);
+        o.signaled(*s, arg(k, c, 1));
     }
     result(c, uint32_t(previous));
 }
@@ -377,7 +377,7 @@ XF_EXPORT(xboxkrnl, KeReleaseMutant) {
     }
     if (m->signal_state() > 0) {
         m->set_owner(nullptr);
-        o.signaled(*m);
+        o.signaled(*m, arg(k, c, 1));
     }
     result(c, uint32_t(previous));
 }
@@ -864,7 +864,7 @@ XF_EXPORT(xboxkrnl, RtlLeaveCriticalSection) {
         Objects &o = objects(k);
         if (Ref<Event> e = as<Event>(o.native(cs))) {
             std::lock_guard<std::mutex> l(o.lock);
-            set_event(o, *e);
+            set_event(o, *e, 1);
         }
     }
 }
@@ -999,7 +999,7 @@ XF_EXPORT(xboxkrnl, ExReleaseReadWriteLock) {
                 int32_t previous = s->signal_state();
                 if (int64_t(previous) + waiting <= s->limit()) {
                     s->set_signal_state(previous + int32_t(waiting));
-                    o.signaled(*s);
+                    o.signaled(*s, 1);
                 }
             }
             return;
@@ -1012,7 +1012,7 @@ XF_EXPORT(xboxkrnl, ExReleaseReadWriteLock) {
     release_spin(k, c, lock + RW_SPIN_LOCK, irql);
     if (Ref<Event> e = as<Event>(o.native(lock + RW_WRITER_EVENT))) {
         std::lock_guard<std::mutex> l(o.lock);
-        set_event(o, *e);
+        set_event(o, *e, 1);
     }
 }
 

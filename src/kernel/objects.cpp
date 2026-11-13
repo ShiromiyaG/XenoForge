@@ -389,7 +389,7 @@ void Objects::unwait(Thread &t, uint32_t status) {
     scheduler->wake(t);
 }
 
-void Objects::signaled(Dispatcher &d) {
+void Objects::signaled(Dispatcher &d, uint32_t increment) {
     // the oldest waits first, each satisfied while the object stays signaled
     // for it (NT's KiWaitTest)
     for (size_t i = 0; i < d.waiters.size();) {
@@ -408,6 +408,7 @@ void Objects::signaled(Dispatcher &d) {
         } else {
             status = d.acquire(t) + w.index;
         }
+        t.wake_increment = increment;
         unwait(t, status); // removes w from d.waiters
         if (d.signal_state() <= 0 && d.type() != Object::Type::Mutant) break;
     }
@@ -432,6 +433,7 @@ uint32_t Objects::wait(Thread &self, std::span<Dispatcher *const> objects, bool 
         self.waiting_on.assign(objects.begin(), objects.end());
         self.wait_all = all, self.alertable = alertable;
         self.wait_status = X_STATUS_PENDING;
+        self.wake_increment = 0;
         for (uint32_t i = 0; i < objects.size(); i++) objects[i]->waiters.push_back({&self, i});
         self.set_blocked(Thread::Blocked::Wait);
         k.host(self.kthread())[kthread::STATE] = kthread::WAITING;
@@ -444,8 +446,30 @@ uint32_t Objects::wait(Thread &self, std::span<Dispatcher *const> objects, bool 
             continue;
         }
         if (status == WAKE_FOR_KERNEL_APC) continue;
+        // a wait a signal satisfied after it blocked (WAIT_0 + index: not a
+        // timeout, an APC or an abandoned mutant)
+        if (status < 0x40) boost_on_wake(self);
         return status;
     }
+}
+
+// ---- priorities (thread_priority.h; Xenia's xthread.cc) ----
+
+void Objects::decay_priorities() {
+    if (!scheduler->applies_priorities()) return;
+    uint64_t t = now();
+    for (Thread *thread : threads) {
+        if (!thread->started || thread->finished) continue;
+        if (priority::decay(thread->prio, t)) thread->apply_host_priority();
+    }
+}
+
+void Objects::boost_on_wake(Thread &t) {
+    if (!scheduler->applies_priorities()) return;
+    uint8_t *g = k.host(t.kthread());
+    if (priority::boost_on_wake(t.prio, int32_t(t.wake_increment), g[kthread::BOOST_DISABLED] != 0,
+                                g[kthread::PRIORITY_DECREMENT] != 0, g[kthread::MAX_DYNAMIC_PRIORITY], now()))
+        t.apply_host_priority();
 }
 
 uint64_t Objects::deadline(uint32_t timeout_ptr) {

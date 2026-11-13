@@ -536,6 +536,32 @@ As built (`src/kernel/objects.h`; objects.cpp, threads.cpp, sync.cpp):
   all, frame time p5-p95 no wider; KeDelayExecutionThread 39.0 M -> 0.59 M
   calls in 30 s. Game D's spin is in guest code (two threads of its media
   DLL, no kernel calls), which this does not reach: 1,711 naps in 30 s.
+- **Priorities go to the host's threads** (`src/kernel/thread_priority.h`,
+  threads.cpp), as Xenia has done since b3d8a21b7 (`ignore_thread_priorities`
+  false by default), 65b74819a and 763b160c7. The Xenon's 0-31 map to the
+  host's five levels (24+ highest, 17+ above normal, 10+ normal, 5+ below
+  normal, else lowest); ExCreateThread's flag 0x20 starts the host thread
+  above normal, 0x40 normal; KeSetBasePriorityThread and KeSetPriorityThread
+  set the thread's priority and its base. A clock thread tick every 20 ms ends
+  the quantum of the running threads below priority 18: each loses the boost
+  it had and one level more per quantum, down to its base. A thread woken from
+  a blocked wait is boosted by the increment of the signal that woke it
+  (KeSetEvent, KePulseEvent, KeReleaseSemaphore, KeReleaseMutant; the Nt forms
+  and timers give 0) above its base, to the KTHREAD's max dynamic priority
+  (17 if none), unless the boost is disabled (KeSetDisableBoostThread) or it
+  is at 18 or more. The KTHREAD's priority follows. On Windows the level is
+  SetThreadPriority; on POSIX SCHED_FIFO at 1, 8, 16, 24, 32 where the process
+  may, else a nice value of 16 minus that, failing quietly without the
+  privileges. Differences from Xenia: the clock is the kernel's (Xenia's host
+  uptime); KeSetBasePriorityThread's priority is the process's default plus
+  the increment (Xenia takes the increment as the priority); the boost is for
+  waits that blocked (Xenia also boosts on an immediate success, with the
+  increment of the object's last signal); creation flags map to the host's
+  levels on POSIX too (Xenia passes 0 and 1, which SCHED_FIFO rejects); a
+  level the host thread has is not set again. The console and the
+  deterministic schedulers schedule by the KTHREAD themselves and give nothing
+  to the host (the deterministic mode is unchanged). `XF_IGNORE_THREAD_PRIORITIES=1`
+  records the priorities only, as before.
 - **Safe points**: a thread suspended by another, or with kernel APCs
   queued, stops at its next kernel call (Xenia suspends the host thread
   wherever it is). User APCs run in alertable waits; DPCs run on the
