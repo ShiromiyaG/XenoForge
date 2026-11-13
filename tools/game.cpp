@@ -86,10 +86,10 @@ void print_renderer_report(const render::Report &r) {
                     (unsigned long long)n.resolves_kept, (unsigned long long)n.memexport_kept,
                     (unsigned long long)n.occlusion_faked);
     std::printf("renderer: %.1f s spent: %.1f s in submissions (%.1f s waiting for the GPU), %.1f s in resolves, "
-                "%.1f s checking textures, %.1f s decoding them, %.1f s on vertex data (%.1f MB uploaded), %.1f s "
-                "copying %.1f MB that resolves wrote into memory\n",
+                "%.1f s checking textures, %.1f s decoding them (%.1f s loading them in all), %.1f s on vertex "
+                "data (%.1f MB uploaded), %.1f s copying %.1f MB that resolves wrote into memory\n",
                 r.seconds, r.submit_seconds, r.wait_seconds, r.resolve_seconds, r.check_seconds, r.decode_seconds,
-                r.vertex_seconds, double(r.vertex_bytes) / (1 << 20), r.writeback_seconds,
+                r.texture_load_seconds, r.vertex_seconds, double(r.vertex_bytes) / (1 << 20), r.writeback_seconds,
                 double(r.writeback_bytes) / (1 << 20));
     std::printf("renderer: %llu submissions, %llu waits for the GPU\n", (unsigned long long)r.submissions,
                 (unsigned long long)r.waits);
@@ -129,6 +129,10 @@ void print_renderer_report(const render::Report &r) {
                 (unsigned long long)r.shaders_stored, (unsigned long long)r.pipelines_stored,
                 (unsigned long long)r.pipelines_prebuilt, (unsigned long long)r.pipeline_libraries_prebuilt,
                 (unsigned long long)r.pipelines_prebuilt_missed, (unsigned long long)r.pipeline_libraries_prebuilt_missed);
+    std::printf("renderer: shaders' libraries found in the pipeline cache at once: %llu (%llu not there, left to the "
+                "workers); shader forms translated on its thread within its time a frame: %llu\n",
+                (unsigned long long)r.pipeline_libraries_cached, (unsigned long long)r.pipeline_libraries_cache_missed,
+                (unsigned long long)r.translations_in_budget);
     std::printf(
         "renderer: %llu pipeline libraries, %llu pipelines linked, %llu placeholders, %llu draws by a stand-in; "
         "hitches: %llu frames with more than 4 ms making pipelines (at most %.1f ms), %llu swaps more than 50 ms "

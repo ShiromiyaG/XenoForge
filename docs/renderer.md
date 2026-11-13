@@ -2628,6 +2628,97 @@ and `--gpu-time` marks each load with why, the format and size.
   each written address's texel found by inverting the tiling): the 640x360
   surface over the atlas, the drive's color resolve over its shadow maps.
 
+## Long hitches in a game's play: the generic shaders' GPU time and the pipeline cache's file (2026-11-13)
+
+Game E's play (the player, host render targets, 200%, `XF_SLOW_FRAMES=34,all`)
+ran at 33 ms a frame but for a few long ones. Read from the run's log:
+
+- **A wave's new shaders, 190-230 ms a frame for three frames** (and one of
+  1,015 ms when the play began): the back end waited 196, 350 and 125 ms for
+  submission slots while its processor time was 9-30 ms. The GPU was busy with
+  the generic shaders' draws (the interpreter, "The generic shaders" above),
+  which drew the new shaders' draws while their forms were translated on the
+  workers and their libraries looked up. Measured on the play's trace replayed
+  with a warm pipeline cache (as the run had: its cache grew 0.2 MB in the
+  run, so the driver compiled nothing), the first play's GPU time was 346 ms,
+  320 of it 1,143 generic draws (92%), at most 25 ms for one; the translated
+  shaders draw the frame in 15 ms. The textures were not it: the frame's 339
+  new textures cost 8.2 ms of the GPU and 9 ms of the back end's.
+- **The pipeline cache's file, 156 and 205 ms** (swaps 1176 and 303, each
+  exactly 300 swaps after the last new pipelines): the back end wrote the
+  game's 126 MB cache at a swap, its busy time twice its processor time.
+- **The player's last frame, 167 ms**: `drain()` held the renderer's lock
+  through the pipeline workers' last whole pipelines and the cache's write,
+  and the back end waited for the lock (its processor time 8 ms).
+- A load of 1.5 s (280 new textures) was the guest's: the back end was busy
+  48 ms of it, the front end 10.
+
+**The changes**, each with a switch:
+- *The new shaders' libraries asked of the pipeline cache first*
+  (`Options::pipeline_cache_first`, `XF_PIPELINE_CACHE_FIRST=0` off): as the
+  build step's recorded libraries were (`from_cache`, a lookup that fails
+  rather than compiles), now any library of a guest shader, where the device
+  has the cache control. A run of a build that met the shader before links the
+  exact pipeline at once; a miss costs a hash and a search (a cold replay spent
+  the same time making pipelines with and without it) and goes to the workers.
+  So a run no longer depends on the build step's record matching its build.
+- *New forms translated on the renderer's thread within a frame's time*
+  (`Options::translate_here_ms`, 24 ms by default, about 50 forms;
+  `XF_TRANSLATE_HERE_MS=0` as before): with the cache lookup, those draws are
+  exact in their first frame.
+- *A GPU budget for the generic shaders' draws* (`Options::generic_gpu_ms_a_frame`,
+  8 ms; `generic_unknown_a_frame`, 8; `XF_GENERIC_GPU_MS=0` for no budget,
+  `XF_GENERIC_UNKNOWN_A_FRAME`): each generic draw is timed with a pair of
+  timestamps and its pixel shader's cost kept; a frame's generic draws are
+  drawn while their known costs fit the budget, and 8 a frame whose cost is not
+  known yet, to learn it. The rest are skipped as Xenia skips draws whose
+  pipeline is not made (counted "the generic shaders' GPU time for the frame
+  spent"); they are drawn exactly a frame or so later.
+- *The pipeline cache written on a thread of its own* while playing
+  (`XF_PIPELINE_CACHE_SAVE_THREAD=0`: on the renderer's thread). The driver
+  synchronizes a `VkPipelineCache` itself, so pipelines go on being made with
+  it meanwhile; one write at a time, a later one at the next swap.
+- *`drain()` waits for the workers and the file outside the lock.*
+
+Measured on the trace (`xfreplay --async-pipelines --stand-in library
+--gpu-time --scale 200`, host render targets, a warm pipeline cache, the
+first play; the machine shared with other agents):
+
+| | before | after |
+| --- | --- | --- |
+| GPU time of the play | 346 ms | 26 ms |
+| of it the generic shaders' draws | 320 ms (1,143) | 1.3 ms (8) |
+| the renderer's time | 0.51 s | 0.20 s |
+| forms translated on its thread | 0 | 50 (0.49 ms each) |
+| draws skipped (generic budget spent / translating) | 0 / 227 | 1,075 / 0 |
+
+From empty caches (pipeline cache and the driver's) the later plays, drawn
+by linked stand-ins while the whole pipelines are made, took 404 ms of the
+GPU's in generic draws before and 2.7 ms after. Pictures are unchanged:
+`replay_test` makes pipelines at once (37 frames exact, 35 host).
+
+**What the frame's lines now say.** Under `threads:`, `XF_SLOW_FRAMES` prints
+where the back end was held up besides its records' work (`Sink::Work`):
+
+    back end held up: the renderer's lock L ms (held by the front end F, another thread O),
+    pipelines made there P ms, shaders translated there T ms, texture loads X ms,
+    GPU drains D ms (n), the pipeline cache written S ms; draws by a linked stand-in N,
+    by the generic shaders G, skipped K; the generic shaders' draws Y ms of the GPU's
+
+- the lock: `CallLock` times the back end's waits for it, by who held it
+  (a call the front end passed, such as `work()`, or another thread: a report's
+  reader, a drain), a word written only by the threads that are not the back
+  end, so the back end's own taking stays one compare-and-swap;
+- pipelines: `Report::pipeline_seconds`, the driver's work on the renderer's
+  thread (draws without a pixel shader made at once, lookups, links);
+- texture loads: `Report::texture_load_seconds`, all of a load (images made,
+  data staged, the load recorded);
+- GPU drains: `sync()` (a buffer grown, the scaled heap made again), of the
+  GPU waits on the line above;
+- the generic draws' GPU time from their timestamps (always), or from the
+  GPU timing's kind "draws: by the generic shaders" with `XF_GPU_TIME=1`,
+  which then also gives the GPU's whole time in the submissions finished.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches

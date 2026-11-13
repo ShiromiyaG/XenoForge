@@ -1035,6 +1035,35 @@ bool CommandProcessor::xe_swap(uint32_t count) {
                             d(work.back_end_cpu_seconds, a.back_end_cpu_seconds),
                             double(cpu - slow_cpu_) / cpu_ticks_a_second() * 1000.0);
             }
+            // What held the sink's thread up besides its records' plain work (Sink::Work's
+            // causes), and the draws drawn while their pipelines were made: a frame whose back
+            // end was busy far longer than its processor time, or whose GPU ran long, says why.
+            if (slow_swaps_ && (ms > limit || all) && sink_) {
+                const Sink::Work &a = slow_work_;
+                auto d = [](double now, double then) { return (now - then) * 1000.0; };
+                const double lock_front = d(work.lock_front_seconds, a.lock_front_seconds),
+                             lock_other = d(work.lock_other_seconds, a.lock_other_seconds);
+                char gpu[128] = "";
+                if (work.gpu_seconds > 0)
+                    std::snprintf(gpu, sizeof(gpu), "; GPU %.1f ms in the submissions finished, %.1f of it the generic "
+                                  "shaders' draws", d(work.gpu_seconds, a.gpu_seconds),
+                                  d(work.gpu_generic_seconds, a.gpu_generic_seconds));
+                else if (work.gpu_generic_seconds > a.gpu_generic_seconds)
+                    std::snprintf(gpu, sizeof(gpu), "; the generic shaders' draws %.1f ms of the GPU's (finished)",
+                                  d(work.gpu_generic_seconds, a.gpu_generic_seconds));
+                std::printf("  back end held up: the renderer's lock %.1f ms (held by the front end %.1f, another "
+                            "thread %.1f), pipelines made there %.1f ms, shaders translated there %.1f ms, texture "
+                            "loads %.1f ms, GPU drains %.1f ms (%llu), the pipeline cache written %.1f ms; draws by "
+                            "a linked stand-in %llu, by the generic shaders %llu, skipped %llu%s\n",
+                            lock_front + lock_other, lock_front, lock_other,
+                            d(work.pipeline_seconds, a.pipeline_seconds),
+                            d(work.translate_seconds, a.translate_seconds), d(work.texture_seconds, a.texture_seconds),
+                            d(work.drain_seconds, a.drain_seconds), (unsigned long long)(work.drains - a.drains),
+                            d(work.cache_save_seconds, a.cache_save_seconds),
+                            (unsigned long long)(work.stand_in_draws - a.stand_in_draws),
+                            (unsigned long long)(work.generic_draws - a.generic_draws),
+                            (unsigned long long)(work.skipped_draws - a.skipped_draws), gpu);
+            }
             slow_cpu_ = cpu;
             slow_work_ = work;
             slow_at_ = now, slow_waited_ = waited, slow_draws_ = draws, slow_resolves_ = resolves, slow_reports_ = reports;

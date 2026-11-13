@@ -319,6 +319,8 @@ constexpr VkDeviceSize DRAW_DATA_SLOT = 16u << 20;
 constexpr VkDeviceSize READBACK_CHUNK = 32u << 20;
 // GPU timestamps a submission holds at most (Options::gpu_timing)
 constexpr uint32_t TIMESTAMPS = 8192;
+// generic shaders' draws timed a submission at most (a pair of timestamps each; Impl::generic_allowed)
+constexpr uint32_t GENERIC_TIMED = 512;
 constexpr uint32_t GPU_END = UINT32_MAX; // the kind of a submission's last timestamp
 constexpr VkDeviceSize NONE = ~VkDeviceSize(0);
 // the bindless tables: images by kind (2D arrays, 3D, cube; the slot word
@@ -996,6 +998,11 @@ struct Slot {
     // each one begins
     VkQueryPool queries = VK_NULL_HANDLE;
     std::vector<uint32_t> marks;
+    // the generic shaders' draws timed (Impl::generic_allowed): a pair of timestamps each, and
+    // each one's pixel shader; the pool reset as the slot begins recording
+    VkQueryPool generic_timed = VK_NULL_HANDLE;
+    std::vector<uint64_t> generic_shaders;
+    bool generic_reset = false; // its queries to reset before the next use
     // occlusion queries (Impl's "occlusion queries"): the pool, reset as the
     // slot begins recording, and the report each query counts for
     VkQueryPool occlusion = VK_NULL_HANDLE;
@@ -1411,24 +1418,66 @@ private:
 // XF_RENDERER_STD_MUTEX=1: std::mutex, as before.
 class CallLock {
 public:
+    // Who holds it, as the back end's waits for it are counted (XF_SLOW_FRAMES's back end line):
+    // the back end itself, a call the front end passed (DeferredSink::passing on its thread), or
+    // another thread (the player's report, a drain). Only the threads other than the back end
+    // write it, so the back end's own taking stays one compare-and-swap.
+    enum Holder : uint32_t { BACK_END, FRONT_END, OTHER, HOLDERS };
     void lock() {
-        if (std_) return std_mutex_.lock();
+        if (std_) {
+            if (!gpu::DeferredSink::on_back_end()) {
+                std_mutex_.lock();
+                return mark_holder();
+            }
+            if (std_mutex_.try_lock()) return;
+            const uint64_t t0 = FastClock::now();
+            const uint32_t by = holder_.load(std::memory_order_relaxed);
+            std_mutex_.lock();
+            waited_[by].fetch_add(FastClock::now() - t0, std::memory_order_relaxed);
+            return;
+        }
         uint32_t free = 0;
-        if (word_.compare_exchange_strong(free, 1, std::memory_order_acquire, std::memory_order_relaxed)) return;
+        if (word_.compare_exchange_strong(free, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+            // (the holder named where it is not the back end, whose fast path this is)
+            if (!gpu::DeferredSink::on_back_end()) mark_holder();
+            return;
+        }
+        // (the back end's waits timed, by who held it as it began to wait)
+        const bool back_end = gpu::DeferredSink::on_back_end();
+        const uint64_t t0 = back_end ? FastClock::now() : 0;
+        const uint32_t by = holder_.load(std::memory_order_relaxed);
         while (word_.exchange(2, std::memory_order_acquire) != 0) word_.wait(2, std::memory_order_relaxed);
+        if (back_end) {
+            waited_[by].fetch_add(FastClock::now() - t0, std::memory_order_relaxed);
+        } else {
+            mark_holder();
+        }
     }
     bool try_lock() {
-        if (std_) return std_mutex_.try_lock();
+        if (std_) {
+            if (!std_mutex_.try_lock()) return false;
+            if (!gpu::DeferredSink::on_back_end()) mark_holder();
+            return true;
+        }
         uint32_t free = 0;
-        return word_.compare_exchange_strong(free, 1, std::memory_order_acquire, std::memory_order_relaxed);
+        if (!word_.compare_exchange_strong(free, 1, std::memory_order_acquire, std::memory_order_relaxed)) return false;
+        if (!gpu::DeferredSink::on_back_end()) mark_holder();
+        return true;
     }
+    // the back end's time waiting for it so far, in FastClock's ticks, by holder
+    uint64_t waited(Holder by) const { return waited_[by].load(std::memory_order_relaxed); }
     void unlock() {
         if (std_) return std_mutex_.unlock();
         if (word_.exchange(0, std::memory_order_release) == 2) word_.notify_one();
     }
 
 private:
+    void mark_holder() {
+        holder_.store(gpu::DeferredSink::passing() ? FRONT_END : OTHER, std::memory_order_relaxed);
+    }
     std::atomic<uint32_t> word_{0};
+    std::atomic<uint32_t> holder_{OTHER};
+    std::atomic<uint64_t> waited_[HOLDERS]{};
     std::mutex std_mutex_;
     const bool std_ = [] {
         const char *v = std::getenv("XF_RENDERER_STD_MUTEX");
@@ -1455,7 +1504,12 @@ public:
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     uint64_t pipelines_saved_ = 0, last_pipeline_swap_ = 0;
     void open_pipeline_cache();
-    void save_pipeline_cache();
+    // (background: on its own thread, while playing; else here, a write under way waited for)
+    void save_pipeline_cache(bool background = false);
+    uint64_t write_pipeline_cache() const;
+    std::thread cache_saver_;
+    std::atomic<bool> cache_saver_done_{false};
+    std::atomic<uint64_t> cache_saver_bytes_{0};
 
     // ---- the Sink: the processor's calls, on its thread ----
     void shader(uint32_t type, uint32_t address, std::span<const uint32_t> code) override {
@@ -1562,6 +1616,14 @@ public:
         w.extent_wait_seconds = extent_wait_seconds_, w.extent_fence_seconds = extent_fence_seconds_;
         w.back_end_gpu_wait_seconds = back_end_gpu_wait_seconds_;
         if (ring_) w.record_wait_seconds = FastClock::seconds(ring_->wait_ticks(rec::Ring::Fence));
+        w.lock_front_seconds = FastClock::seconds(mutex_.waited(CallLock::FRONT_END));
+        w.lock_other_seconds = FastClock::seconds(mutex_.waited(CallLock::OTHER));
+        w.pipeline_seconds = report_.pipeline_seconds, w.translate_seconds = report_.translate_seconds;
+        w.texture_seconds = report_.texture_load_seconds;
+        w.drain_seconds = drain_seconds_, w.drains = drains_, w.cache_save_seconds = cache_save_seconds_;
+        w.stand_in_draws = report_.stand_in_draws, w.generic_draws = report_.generic_draws;
+        for (const auto &[why, n] : report_.skipped) w.skipped_draws += n;
+        w.gpu_seconds = report_.gpu_seconds, w.gpu_generic_seconds = gpu_generic_seconds_;
         return w;
     }
     void extent_init() override {
@@ -1655,10 +1717,25 @@ public:
     }
     void drain() override {
         if (deferred_) deferred_->finish();
-        Call call(*this, nullptr);
-        if (call) sync();
+        {
+            Call call(*this, nullptr);
+            if (call) sync();
+        }
+        // The workers' last pipelines and the cache's file waited for outside the renderer's
+        // lock: they take a while (the whole pipelines queued last, a file of 100 MB and more),
+        // and the back end's thread, which may go on with the processor's calls meanwhile,
+        // waited for the lock all that time (a player's last frame, 160 ms).
         if (pipeline_workers_) pipeline_workers_->wait_all();
-        save_pipeline_cache();
+        bool writing;
+        {
+            std::lock_guard<CallLock> lock(mutex_);
+            save_pipeline_cache(true);
+            writing = cache_saver_.joinable();
+        }
+        while (writing && !cache_saver_done_.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::lock_guard<CallLock> lock(mutex_);
+        save_pipeline_cache(); // (the write's thread joined, its size counted)
     }
 
     // ---- TraceSource: what a trace writer asks ----
@@ -2007,6 +2084,18 @@ private:
     // XF_GENERIC_SHADERS=0), the program buffer and what of it is written
     // (16-byte units), the modules ([point coordinates][writes depth])
     bool generic_on_ = false;
+    // (Options::pipeline_cache_first and translate_here_ms, as init_generic takes them)
+    bool cache_first_ = false;
+    double translate_here_seconds_ = 0;
+    // (Options::generic_gpu_ms_a_frame) the budget, the GPU's time a generic draw of each pixel
+    // shader took the last time one was timed, what the frame's generic draws are counted to
+    // take so far, and the frame's draws of a shader not timed yet
+    double generic_budget_seconds_ = 0, generic_spent_frame_ = 0;
+    uint32_t generic_unknown_a_frame_ = 0, generic_unknown_frame_ = 0;
+    std::unordered_map<uint64_t, double> generic_cost_;
+    bool generic_allowed();
+    void generic_collect(Slot &s);
+    bool generic_timing_ = false; // (timestamps on the queue)
     vk::Buffer programs_;
     uint32_t programs_used_ = 0;
     // (the vertex shader's: [screen extents][none, clip, cull distances])
@@ -2382,8 +2471,11 @@ private:
     }
     void wait_serial(uint64_t serial);
     void sync() {
+        const uint64_t t0 = FastClock::now();
         flush();
         while (fatal_.empty() && finish_oldest(true)) {}
+        drain_seconds_ += FastClock::seconds(FastClock::now() - t0);
+        drains_++;
     }
     // the render pass ended, if one is under way
     void end_pass() {
@@ -2577,6 +2669,12 @@ private:
     uint64_t drawn_at_submission_ = 0;
     double extent_wait_seconds_ = 0, extent_fence_seconds_ = 0; // extent_wait's, all and the fences'
     double back_end_gpu_wait_seconds_ = 0;                      // the fences waited for on the back end's thread
+    // (XF_SLOW_FRAMES's back end line, Sink::Work) the GPU drained by sync() (its time and count),
+    // the time the renderer's thread spent writing the pipeline cache's file (or handing it to
+    // its thread), the GPU's time in the generic shaders' draws (with the GPU timed)
+    double drain_seconds_ = 0, cache_save_seconds_ = 0, gpu_generic_seconds_ = 0;
+    uint64_t drains_ = 0;
+    uint32_t gpu_generic_kind_ = UINT32_MAX, gpu_pass_kind_ = UINT32_MAX;
     // the draw being made bounds the open report (the index of its words in
     // extents_), or UINT32_MAX: it cannot, and the report is the whole screen
     uint32_t extent_draw_words() {
@@ -3864,6 +3962,7 @@ Impl::~Impl() {
         if (s.fence) vkDestroyFence(dev_, s.fence, nullptr);
         if (s.queries) vkDestroyQueryPool(dev_, s.queries, nullptr);
         if (s.occlusion) vkDestroyQueryPool(dev_, s.occlusion, nullptr);
+        if (s.generic_timed) vkDestroyQueryPool(dev_, s.generic_timed, nullptr);
     }
     if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
     for (auto &[k, s] : shaders_) {
@@ -3993,25 +4092,65 @@ void Impl::open_pipeline_cache() {
 // The cache written to its file (through a temporary file renamed over it,
 // so a run cut short leaves the last whole one) when pipelines were made
 // since the last time
-void Impl::save_pipeline_cache() {
-    if (!pipeline_cache_ || options_.pipeline_cache.empty() || pipelines_saved_ == report_.pipelines) return;
+//
+// While playing (background), on a thread of its own: a game's cache grows past 100 MB, and
+// reading it out of the driver and writing it took the renderer's thread 70-120 ms at a swap,
+// a frame missed every time new pipelines had settled. VkPipelineCache is synchronized by the
+// driver (no VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT here), so the workers and the
+// renderer's thread go on making pipelines with it meanwhile. XF_PIPELINE_CACHE_SAVE_THREAD=0
+// writes it on the renderer's thread, as before.
+void Impl::save_pipeline_cache(bool background) {
+    if (!pipeline_cache_ || options_.pipeline_cache.empty()) return;
+    Timer timer(cache_save_seconds_);
+    if (cache_saver_.joinable()) {
+        // one write at a time: a write under way is left to finish (the next swap asks again)
+        if (!cache_saver_done_.load(std::memory_order_acquire) && background) return;
+        cache_saver_.join();
+        const uint64_t bytes = cache_saver_bytes_.load(std::memory_order_relaxed);
+        if (bytes)
+            report_.pipeline_cache_written = bytes;
+        else
+            pipelines_saved_ = 0; // failed: written again later
+    }
+    if (pipelines_saved_ == report_.pipelines) return;
+    static const bool thread = [] {
+        const char *v = std::getenv("XF_PIPELINE_CACHE_SAVE_THREAD");
+        return !(v && v[0] == '0');
+    }();
+    pipelines_saved_ = report_.pipelines;
+    if (background && thread) {
+        cache_saver_done_.store(false, std::memory_order_relaxed);
+        cache_saver_ = std::thread([this] {
+            cache_saver_bytes_.store(write_pipeline_cache(), std::memory_order_relaxed);
+            cache_saver_done_.store(true, std::memory_order_release);
+        });
+        return;
+    }
+    const uint64_t bytes = write_pipeline_cache();
+    if (bytes)
+        report_.pipeline_cache_written = bytes;
+    else
+        pipelines_saved_ = 0;
+}
+
+// The cache's data written to its file through a temporary one renamed over it: its bytes, 0
+// when it could not be. (Reads nothing of the renderer's but the cache and its path.)
+uint64_t Impl::write_pipeline_cache() const {
     size_t size = 0;
-    if (vkGetPipelineCacheData(dev_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) return;
+    if (vkGetPipelineCacheData(dev_, pipeline_cache_, &size, nullptr) != VK_SUCCESS || !size) return 0;
     std::vector<char> data(size);
-    if (vkGetPipelineCacheData(dev_, pipeline_cache_, &size, data.data()) != VK_SUCCESS) return;
+    if (vkGetPipelineCacheData(dev_, pipeline_cache_, &size, data.data()) != VK_SUCCESS) return 0;
     std::error_code ec;
     std::filesystem::create_directories(options_.pipeline_cache.parent_path(), ec);
     std::filesystem::path temporary = options_.pipeline_cache;
     temporary += ".new";
     FILE *f = std::fopen(temporary.string().c_str(), "wb");
-    if (!f) return;
+    if (!f) return 0;
     const bool written = std::fwrite(data.data(), 1, size, f) == size;
     std::fclose(f);
-    if (!written) return;
+    if (!written) return 0;
     std::filesystem::rename(temporary, options_.pipeline_cache, ec);
-    if (ec) return;
-    pipelines_saved_ = report_.pipelines;
-    report_.pipeline_cache_written = size;
+    return ec ? 0 : size;
 }
 
 bool Impl::init(std::string &error) {
@@ -4170,15 +4309,17 @@ bool Impl::init(std::string &error) {
             if (!s.cmd || !s.pre) return error = "no room for the recording ring's handles", false;
         }
     }
+    // timestamps where the queue has them (none: no timing): the GPU timing's, and the generic
+    // shaders' draws' (generic_allowed)
+    uint32_t families = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(d_.physical(), &families, nullptr);
+    std::vector<VkQueueFamilyProperties> family(families);
+    vkGetPhysicalDeviceQueueFamilyProperties(d_.physical(), &families, family.data());
+    const uint32_t bits = d_.queue_family() < families ? family[d_.queue_family()].timestampValidBits : 0;
+    timestamp_period_ = limits.timestampPeriod;
+    timestamp_mask_ = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    generic_timing_ = bits != 0;
     if (options_.gpu_timing) {
-        // timestamps where the queue has them (none: no timing)
-        uint32_t families = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(d_.physical(), &families, nullptr);
-        std::vector<VkQueueFamilyProperties> family(families);
-        vkGetPhysicalDeviceQueueFamilyProperties(d_.physical(), &families, family.data());
-        uint32_t bits = d_.queue_family() < families ? family[d_.queue_family()].timestampValidBits : 0;
-        timestamp_period_ = limits.timestampPeriod;
-        timestamp_mask_ = bits >= 64 ? ~0ull : (1ull << bits) - 1;
         for (Slot &s : slots_) {
             VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             q.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -4767,6 +4908,23 @@ bool Impl::init_generic(std::string &error) {
         return v && v[0] == '0';
     }();
     generic_on_ = (options_.generic_shaders || options_.generic_only) && !off;
+    // the new shaders' libraries asked of the pipeline cache first (a lookup: only with the
+    // device's cache control), and the new forms translated here within a frame's time
+    // (Options::pipeline_cache_first, translate_here_ms; XF_PIPELINE_CACHE_FIRST=0,
+    // XF_TRANSLATE_HERE_MS=<ms>)
+    {
+        const char *first = std::getenv("XF_PIPELINE_CACHE_FIRST");
+        cache_first_ = options_.pipeline_cache_first && !(first && first[0] == '0') && d_.cache_control();
+        const char *here = std::getenv("XF_TRANSLATE_HERE_MS");
+        translate_here_seconds_ =
+            std::max(0.0, here ? std::strtod(here, nullptr) : options_.translate_here_ms) / 1000.0;
+        const char *budget = std::getenv("XF_GENERIC_GPU_MS");
+        generic_budget_seconds_ =
+            std::max(0.0, budget ? std::strtod(budget, nullptr) : options_.generic_gpu_ms_a_frame) / 1000.0;
+        const char *unknown = std::getenv("XF_GENERIC_UNKNOWN_A_FRAME");
+        generic_unknown_a_frame_ =
+            unknown ? uint32_t(std::strtoul(unknown, nullptr, 10)) : options_.generic_unknown_a_frame;
+    }
     // (in video memory where the host can write it, as the interpreter reads
     // it at every instruction; else host memory)
     programs_ = d_.create_device_local_mapped_buffer(PROGRAM_BUFFER_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -5012,6 +5170,19 @@ void Impl::begin_recording() {
             s.occlusion_used = OCCLUSION_QUERIES;
         }
         if (s.occlusion && s.occlusion_used) vkCmdResetQueryPool(s.cmd, s.occlusion, 0, s.occlusion_used);
+        // the generic draws' timestamps, where the last submission used them (made the first
+        // time a recording begins with the generic shaders on)
+        if (!s.generic_timed && generic_timing_ && generic_on_ && generic_budget_seconds_ > 0) {
+            VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            info.queryCount = 2 * GENERIC_TIMED;
+            if (vkCreateQueryPool(dev_, &info, nullptr, &s.generic_timed) != VK_SUCCESS)
+                s.generic_timed = VK_NULL_HANDLE;
+            s.generic_reset = true;
+        }
+        if (s.generic_timed && s.generic_reset) vkCmdResetQueryPool(s.cmd, s.generic_timed, 0, 2 * GENERIC_TIMED);
+        s.generic_reset = false;
+        s.generic_shaders.clear();
         // the interlock path's counters, the slot's share zeroed
         if (fsi_ && s.occlusion_used) {
             vkCmdFillBuffer(s.cmd, zpd_counters_.buffer, VkDeviceSize(current_) * OCCLUSION_QUERIES * 4,
@@ -5054,6 +5225,7 @@ void Impl::gpu_collect(Slot &s) {
         Report::GpuTime &t = report_.gpu_time[gpu_kinds_[s.marks[i]]];
         t.seconds += seconds, t.intervals++;
         report_.gpu_seconds += seconds;
+        if (s.marks[i] == gpu_generic_kind_) gpu_generic_seconds_ += seconds;
     }
     s.marks.clear();
 }
@@ -5215,6 +5387,7 @@ bool Impl::finish_oldest(bool wait) {
 // (images and buffers no longer used).
 void Impl::finish(Slot &s) {
     gpu_collect(s);
+    generic_collect(s);
     zpd_collect(s);
     extent_collect(s, uint32_t(&s - slots_));
     for (auto &f : s.after) f();
@@ -5281,6 +5454,7 @@ VkCommandBuffer Impl::begin_pass(const Pass &pass, RenderTarget *const colors[4]
             if (colors[i]) kind += " " + target_name(*colors[i]) + ";";
         if (depth) kind += " " + target_name(*depth);
         gpu_mark(kind);
+        gpu_pass_kind_ = gpu_kind_ids_[kind]; // (the pass's again after a generic draw)
     }
     // a kept clear over the whole render area as the attachment's load
     // operation (the driver's fast clear, as Xenia's ClearRenderTargetView
@@ -5876,7 +6050,17 @@ VkShaderModule Impl::form_module(Shader &s, uint32_t key, const shader::VertexOp
     p.console_centers = console_centers_ && !scale_.one();
     v.vertex_snap = vertex_snap_;
     v.extents_subgroup = v.extents && extents_subgroup_ && d_.vertex_subgroup_arithmetic();
-    if (pending && translate_later(s, key)) {
+    // (Options::translate_here_ms) translated here while the frame's time for it lasts and no
+    // worker has it already: the draw may then have its exact pipeline at once (from the
+    // pipeline cache), where the generic shaders drawing it meanwhile cost the GPU many times
+    // the translated shader's time
+    bool later = pending && translate_later(s, key);
+    if (later && !s.translating.count(key) &&
+        report_.translate_seconds - translate_seconds_at_swap_ < translate_here_seconds_) {
+        later = false;
+        report_.translations_in_budget++;
+    }
+    if (later) {
         if (s.translating.insert(key).second)
             translation_workers_->queue({&s, key, is_pixel, v, p});
         *pending = true;
@@ -7224,6 +7408,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         t->load_why = LoadWhy::CpuWritten;
     }
     if (t) t->stale = true, uncover(*t); // until it is loaded again
+    Timer loading(report_.texture_load_seconds);
     // a load: what the draws kept of this texture's slots goes (SlotMemo), not
     // of every texture's (a scene reloading fifty textures a frame after its
     // resolves otherwise took every slot of every draw the long way again)
@@ -8064,6 +8249,20 @@ PipelineEntry *Impl::library(uint32_t part, const std::vector<uint32_t> &key, co
                 return slot.get();
             }
             report_.pipeline_libraries_prebuilt_missed++;
+        } else if (cache_first_ && pipeline_cache_) {
+            // (Options::pipeline_cache_first) the pipeline cache asked alone, whatever the build
+            // step recorded: an earlier run of this build met the shader, and its library is a
+            // lookup there, so the draw links its exact pipeline now rather than being drawn by
+            // the generic shaders until a worker has looked it up. Not there: a miss costs a
+            // hash and a search, and the workers compile it.
+            VkPipeline p = VK_NULL_HANDLE;
+            if (from_cache(desc.info, p)) {
+                report_.pipeline_libraries_cached++;
+                slot->pipeline = p;
+                slot->state.store(1, std::memory_order_release);
+                return slot.get();
+            }
+            report_.pipeline_libraries_cache_missed++;
         }
         pipeline_workers_->queue(slot.get(), std::make_unique<PipelineDesc>(desc.info), PipelinePriority::first);
         return slot.get();
@@ -8234,6 +8433,43 @@ VkPipeline Impl::generic_stand_in(PipelineEntry &e, const VkGraphicsPipelineCrea
         e.generic_failed = true;
     }
     return e.generic;
+}
+
+// Whether a draw the generic shaders would draw is drawn (Options::generic_gpu_ms_a_frame): its
+// pixel shader's cost on the GPU the last time one of its generic draws was timed counted
+// against the frame's budget; a shader not timed yet drawn while the frame's share of those is
+// left, to learn its cost. The rest are skipped as without the generic shaders: the GPU's time
+// for a frame of their draws ran to hundreds of milliseconds, a frame's draws held up three
+// frames behind them (a wave of new shaders in a game's play).
+bool Impl::generic_allowed() {
+    if (generic_budget_seconds_ <= 0) return true;
+    auto it = generic_cost_.find(pixel_hash_);
+    if (it == generic_cost_.end()) {
+        if (generic_unknown_frame_ >= generic_unknown_a_frame_) return false;
+        generic_unknown_frame_++;
+        return true;
+    }
+    if (generic_spent_frame_ + it->second > generic_budget_seconds_) return false;
+    generic_spent_frame_ += it->second;
+    return true;
+}
+
+// The finished submission's generic draws' times, kept by pixel shader
+void Impl::generic_collect(Slot &s) {
+    if (!s.generic_timed || s.generic_shaders.empty()) return;
+    const size_t n = s.generic_shaders.size();
+    std::vector<uint64_t> ticks(2 * n);
+    if (vkGetQueryPoolResults(dev_, s.generic_timed, 0, uint32_t(2 * n), ticks.size() * 8, ticks.data(), 8,
+                              VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        const double scale = timestamp_period_ * 1e-9;
+        for (size_t i = 0; i < n; i++) {
+            const double seconds = double((ticks[2 * i + 1] - ticks[2 * i]) & timestamp_mask_) * scale;
+            generic_cost_[s.generic_shaders[i]] = seconds;
+            // (the GPU timing's kind counts them where it is on)
+            if (!options_.gpu_timing) gpu_generic_seconds_ += seconds;
+        }
+    }
+    s.generic_shaders.clear();
 }
 
 void Impl::retire_generic(PipelineEntry &e) {
@@ -11280,6 +11516,12 @@ void Impl::draw(const gpu::Draw &d) {
         }
         if (pending) return skip("pipeline not ready (being made)");
         if (!pipe) return skip("vkCreateGraphicsPipelines failed");
+        // (Options::generic_draws_a_frame) past the frame's share of the generic shaders' draws,
+        // skipped as without them: their interpreter costs the GPU many times the translated
+        // shaders' time (a frame of a scene's new shaders drawn by it alone, 300 ms of the GPU's
+        // against 30 ms), and a wave of new shaders drawn by it held the GPU up for frames
+        if (generic && !options_.generic_only && !generic_allowed())
+            return skip("pipeline not ready (the generic shaders' GPU time for the frame spent)");
         if (stand_in) report_.stand_in_draws++;
         if (generic) {
             report_.generic_draws++;
@@ -11856,6 +12098,23 @@ void Impl::draw(const gpu::Draw &d) {
         std::snprintf(kind, sizeof(kind), "draw: %s, shaders %016llX %016llX", draw_name.c_str(),
                       (unsigned long long)vertex_hash_, ps ? (unsigned long long)pixel_hash_ : 0ull);
         gpu_mark(kind);
+    } else if (options_.gpu_timing && generic) {
+        // the generic shaders' draws timed apart from their pass (the GPU's cost of a stand-in)
+        if (gpu_generic_kind_ == UINT32_MAX) {
+            gpu_mark("draws: by the generic shaders");
+            gpu_generic_kind_ = gpu_kind_ids_["draws: by the generic shaders"];
+        } else {
+            gpu_mark(gpu_generic_kind_);
+        }
+    }
+    // a generic draw timed on the GPU, its cost kept by its pixel shader (generic_allowed)
+    uint32_t generic_timed = UINT32_MAX;
+    if (generic && slots_[current_].generic_timed && slots_[current_].generic_shaders.size() < GENERIC_TIMED) {
+        Slot &s = slots_[current_];
+        generic_timed = uint32_t(s.generic_shaders.size());
+        s.generic_shaders.push_back(pixel_hash_);
+        s.generic_reset = true;
+        vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s.generic_timed, 2 * generic_timed);
     }
     if (viz_survey_ == UINT32_MAX)
         zpd_draw(c);
@@ -11879,8 +12138,14 @@ void Impl::draw(const gpu::Draw &d) {
     else
         record_words(c, Recorded::DrawIndexed, uint32_t(indices.size()), first_index);
     if (viz_predicate_ != UINT32_MAX) record_words(c, Recorded::EndConditional);
+    if (generic_timed != UINT32_MAX)
+        vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slots_[current_].generic_timed,
+                             2 * generic_timed + 1);
     record_publish();
-    if (options_.gpu_timing_draws) gpu_mark("draws: between draws");
+    if (options_.gpu_timing_draws)
+        gpu_mark("draws: between draws");
+    else if (options_.gpu_timing && generic && gpu_pass_kind_ != UINT32_MAX)
+        gpu_mark(gpu_pass_kind_);
     report_.drawn++;
     end_export(exported);
     if (options_.verbose) {
@@ -13273,6 +13538,7 @@ void Impl::swap() {
         report_.translate_frame_max =
             std::max(report_.translate_frame_max, report_.translate_seconds - translate_seconds_at_swap_);
         translate_seconds_at_swap_ = report_.translate_seconds;
+        generic_spent_frame_ = 0, generic_unknown_frame_ = 0;
         auto now = std::chrono::steady_clock::now();
         if (number) {
             double gap = std::chrono::duration<double>(now - last_swap_time_).count();
@@ -13359,7 +13625,8 @@ void Impl::swap() {
     poll();
     next_readback_frame();
     // the pipeline cache written once new pipelines have settled
-    if (pipelines_saved_ != report_.pipelines && report_.swaps - last_pipeline_swap_ >= 300) save_pipeline_cache();
+    if (pipelines_saved_ != report_.pipelines && report_.swaps - last_pipeline_swap_ >= 300)
+        save_pipeline_cache(true);
 }
 
 // The texture of fetch constant 0 that a swap shows, its loads recorded;

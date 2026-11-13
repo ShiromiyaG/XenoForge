@@ -219,10 +219,11 @@ int main(int argc, char **argv) {
                     report.pipeline_wait_seconds * 1000.0 / double(report.pipeline_waits),
                     report.pipeline_wait_max * 1000.0);
     std::printf("  %.3f s in the renderer: %.3f s in submissions (%.3f s waiting for the GPU), %.3f s in resolves, "
-                "%.3f s checking textures, %.3f s decoding them, %.3f s on vertex data (%.1f KB uploaded), "
-                "%.3f s copying %.1f KB that resolves wrote into memory\n",
+                "%.3f s checking textures, %.3f s decoding them (%.3f s loading them in all), %.3f s on vertex "
+                "data (%.1f KB uploaded), %.3f s copying %.1f KB that resolves wrote into memory\n",
                 report.seconds, report.submit_seconds, report.wait_seconds, report.resolve_seconds,
-                report.check_seconds, report.decode_seconds, report.vertex_seconds, double(report.vertex_bytes) / 1024,
+                report.check_seconds, report.decode_seconds, report.texture_load_seconds, report.vertex_seconds,
+                double(report.vertex_bytes) / 1024,
                 report.writeback_seconds, double(report.writeback_bytes) / 1024);
     std::printf("  %llu submissions, %llu waits for the GPU\n", (unsigned long long)report.submissions,
                 (unsigned long long)report.waits);

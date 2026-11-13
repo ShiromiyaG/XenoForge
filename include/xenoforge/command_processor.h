@@ -421,6 +421,23 @@ public:
         double back_end_gpu_wait_seconds = 0;
         // the back end's wall time with records to do, and its processor time
         double back_end_busy_seconds = 0, back_end_cpu_seconds = 0;
+        // Where the sink's thread (the back end's, with the work split) was held up outside its
+        // records' plain work: waiting for the sink's own lock, by who held it (the front end's
+        // passed calls, another thread such as a report's reader); making pipelines and
+        // libraries itself (the driver's lookups and links among them); translating shaders
+        // itself; loading textures (their images made, their data staged and their loads
+        // recorded); draining the GPU (a buffer grown, a heap made again: of the GPU waits
+        // above); writing the pipeline cache's file
+        double lock_front_seconds = 0, lock_other_seconds = 0;
+        double pipeline_seconds = 0, translate_seconds = 0, texture_seconds = 0;
+        double drain_seconds = 0, cache_save_seconds = 0;
+        uint64_t drains = 0;
+        // the draws drawn by a stand-in while their pipeline is made: a linked pipeline, the
+        // generic shaders (an interpreter, many times the GPU's time); and those skipped
+        uint64_t stand_in_draws = 0, generic_draws = 0, skipped_draws = 0;
+        // with the GPU timed (XF_GPU_TIME): its time in the submissions finished so far, and of
+        // it the generic shaders' draws
+        double gpu_seconds = 0, gpu_generic_seconds = 0;
     };
     virtual Work work() { return {}; }
     virtual void extent_poll(std::vector<Extent> & /*resolved*/) {}

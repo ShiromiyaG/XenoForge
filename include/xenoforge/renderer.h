@@ -105,6 +105,7 @@ struct Report {
     double wait_seconds = 0;                     //     waiting for the GPU to finish work
     double check_seconds = 0;                    //   checking textures against the memory under them
     double decode_seconds = 0;                   //   decoding textures on the CPU and recording their uploads
+    double texture_load_seconds = 0;             //   loading textures, all of it (images made, data staged)
     double vertex_seconds = 0;                   //   comparing vertex data with the mirror's, uploading what differs
     double resolve_seconds = 0;                  //   recording resolves (their waits counted in submit_seconds too)
     double writeback_seconds = 0;                //   copying what resolves wrote into guest memory, once done
@@ -146,6 +147,12 @@ struct Report {
     // driver would have compiled them: a cache another build of the driver
     // or of the translator wrote), left to the workers instead
     uint64_t pipelines_prebuilt_missed = 0, pipeline_libraries_prebuilt_missed = 0;
+    // The shaders' libraries no build step recorded, asked of the pipeline cache alone first
+    // (Options::pipeline_cache_first): found there and made at once, or left to the workers
+    uint64_t pipeline_libraries_cached = 0, pipeline_libraries_cache_missed = 0;
+    // The shader forms the generic shaders could have drawn meanwhile, translated on the
+    // renderer's thread instead within its time a frame (Options::translate_here_ms)
+    uint64_t translations_in_budget = 0;
     // The pipelines made on the workers, and how long their draws went
     // without one (from the first draw asking to the first drawn, by the
     // pipeline or its stand-in): in all and at most
@@ -303,6 +310,29 @@ struct Options {
     // on the workers and kept in the pipeline cache. XF_GENERIC_SHADERS=0
     // turns it off.
     bool generic_shaders = true;
+    // A new shader's library (with library stand-ins) asked of the pipeline cache first, on
+    // the renderer's thread, where the device has the cache control
+    // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT: a lookup, never a compile):
+    // found, the draw links its exact pipeline at once rather than being drawn by the generic
+    // shaders, whose interpreter costs the GPU many times the translated shaders' time; not
+    // found, made on the workers as before. XF_PIPELINE_CACHE_FIRST=0 turns it off.
+    bool pipeline_cache_first = true;
+    // The milliseconds a frame the renderer's thread may spend translating the new shader forms
+    // that would otherwise go to the translation workers with the generic shaders drawing
+    // meanwhile (about a millisecond a form): translated at once, the draw can have its exact
+    // pipeline (with the one above). 0: always on the workers, as before. XF_TRANSLATE_HERE_MS.
+    double translate_here_ms = 24.0;
+    // The GPU's time a frame the generic shaders' draws may take, the rest skipped while their
+    // pipelines are made: their interpreter costs the GPU many times the translated shaders'
+    // time (a scene's new shaders drawn by it, 300 ms of the GPU's against 30 ms at twice the
+    // console's resolution, single draws up to 25 ms), and a wave of new shaders drawn by it
+    // held the GPU up for frames. Each generic draw is timed on the GPU and its pixel shader's
+    // cost kept; a draw whose shader's cost is known counts it against the budget, and
+    // generic_unknown_a_frame draws a frame whose cost is not known yet are drawn to learn it.
+    // 0 ms: no budget (every such draw drawn). XF_GENERIC_GPU_MS=<ms>,
+    // XF_GENERIC_UNKNOWN_A_FRAME=<n>.
+    double generic_gpu_ms_a_frame = 8.0;
+    uint32_t generic_unknown_a_frame = 8;
     // Every draw the generic shaders can draw drawn by them, as whole
     // pipelines made at once (xfreplay --generic): to check what they draw
     // against the translated shaders' pictures
