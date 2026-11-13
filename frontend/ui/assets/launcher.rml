@@ -74,6 +74,7 @@
             </div>
         </div>
         <div id="statusbar">
+            <div class="st" id="st-busy">{i:loader-circle}</div>
             <div class="st" id="st-count"></div>
             <div class="st-sep"></div>
             <div class="st" id="st-folder" data-action="browse"></div>

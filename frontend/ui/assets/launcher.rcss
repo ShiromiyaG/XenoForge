@@ -211,6 +211,7 @@ body { background-color: transparent; }
 .empty .big-ic { font-family: Lucide; font-size: 46dp; line-height: 1; color: #d6d5da; margin-bottom: 14dp; }
 .empty-title { font-size: 20dp; font-weight: 300; color: #ffffff; margin-bottom: 6dp; }
 .empty-text { color: #ecebef; text-align: center; }
+.empty .loading-ic { font-family: Lucide; font-size: 46dp; line-height: 1; color: {ac-shine}; margin-bottom: 14dp; }
 .empty-buttons { display: flex; flex-direction: row; margin-top: 16dp; }
 /* the buttons wear the game rows' look: the primary one the selected row's green glow, the others the plain row */
 .empty-buttons .btn {
@@ -289,6 +290,10 @@ body { background-color: transparent; }
 .st-link:hover { text-decoration: underline; }
 #st-progress { display: none; flex-direction: row; align-items: center; cursor: pointer; }
 #st-progress.on { display: flex; }
+/* the scan under way: a turning icon before the count */
+#st-busy { display: none; padding-right: 0; }
+#st-busy.on { display: flex; align-items: center; }
+#st-busy .ic { font-size: 12dp; color: {ac-shine}; }
 .minibar { width: 110dp; height: 6dp; margin-left: 8dp; border-radius: 3dp; background-color: {sb-sep}; }
 .minibar-fill { height: 6dp; border-radius: 3dp; background-color: {accent}; }
 #st-message .st-ic { font-size: 12dp; margin-right: 6dp; color: {dot-ready}; }

@@ -385,14 +385,15 @@ void LauncherView::rebuild_rows(bool force) {
     if (!listing_.busy) rows_shown_reading_ = false; // (a new sort after the reading comes in)
 
     const bool filtered = !filter_.empty() && order_.empty() && !listing_.games.empty();
-    const bool show_empty = no_folder || filtered || (listing_.games.empty() && !listing_.busy);
+    const bool loading = listing_.busy && listing_.games.empty() && !no_folder; // nothing in yet: a spinner, not a blank list
+    const bool show_empty = no_folder || filtered || loading || (listing_.games.empty() && !listing_.busy);
     if (Rml::Element *table = by_id("table")) {
         table->SetClass("no-rows", show_empty);
         table->SetClass("has-games", !listing_.games.empty()); // the search box is for a list that has games
     }
     if (Rml::Element *empty = by_id("tempty")) {
         empty->SetClass("on", show_empty);
-        empty->SetInnerRML(show_empty ? empty_html(no_folder, filtered, core_.games_folder()) : std::string());
+        empty->SetInnerRML(show_empty ? empty_html(no_folder, filtered, loading, core_.games_folder()) : std::string());
     }
     update_toolbar();
     update_status();
@@ -438,6 +439,13 @@ void LauncherView::update_toolbar() {
     }
     if (Rml::Element *interpreted = by_id("tb-play-interpreted")) interpreted->SetClass("off", running || !g || !player_of(*g));
     if (Rml::Element *demo = by_id("tb-demo")) demo->SetClass("on", core_.demo_games());
+    // the scan under way: the Rescan button's arrows and the status bar's icon turn
+    if (Rml::Element *rescan = by_id("tb-rescan"))
+        if (Rml::Element *icon = rescan->GetFirstChild()) icon->SetClass("spin", listing_.busy);
+    if (Rml::Element *busy = by_id("st-busy")) {
+        busy->SetClass("on", listing_.busy);
+        if (Rml::Element *icon = busy->GetFirstChild()) icon->SetClass("spin", listing_.busy);
+    }
     // B only clears the search. (Set only when it changes: a property set every frame, the same or not, dirties the
     // layout and the whole document is laid out again each frame.)
     if (Rml::Element *back = by_id("hint-b")) {
