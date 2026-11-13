@@ -49,31 +49,6 @@ const uint32_t FRONT_BUFFER[] = {
 #include "front_buffer.comp.inc"
 };
 
-// present_effects.comp's variants, in Presenter::Effect's order
-const uint32_t EFFECT_EASU[] = {
-#include "present_EASU.comp.inc"
-};
-const uint32_t EFFECT_RCAS[] = {
-#include "present_RCAS.comp.inc"
-};
-const uint32_t EFFECT_CAS[] = {
-#include "present_CAS.comp.inc"
-};
-const uint32_t EFFECT_FXAA[] = {
-#include "present_FXAA.comp.inc"
-};
-const uint32_t EFFECT_FXAA_EXTREME[] = {
-#include "present_FXAA_EXTREME.comp.inc"
-};
-
-// present_effects.comp's push constants
-struct EffectPush {
-    uint32_t dest_width, dest_height;
-    float source_width, source_height, dest_width_f, dest_height_f;
-    float sharpness;
-    uint32_t scaling;
-};
-
 // front_buffer.comp's push constants
 struct Push {
     uint32_t width, height, swizzle, components, bits, luta;
@@ -294,15 +269,6 @@ Presenter::~Presenter() {
         device_->destroy(p.ramp);
         device_->destroy(p.copy);
     }
-    for (EffectImage &e : effect_images_) {
-        if (e.view) vkDestroyImageView(dev_, e.view, nullptr);
-        device_->destroy(e.image);
-    }
-    for (VkPipeline p : effect_pipelines_) vkDestroyPipeline(dev_, p, nullptr);
-    vkDestroyPipelineLayout(dev_, effect_layout_, nullptr);
-    vkDestroyDescriptorSetLayout(dev_, effect_set_layout_, nullptr);
-    vkDestroyDescriptorPool(dev_, effect_pool_, nullptr);
-    vkDestroySampler(dev_, linear_, nullptr);
     vkDestroySemaphore(dev_, converted_, nullptr);
     vkDestroySemaphore(dev_, shown_, nullptr);
     vkDestroySampler(dev_, sampler_, nullptr);
@@ -475,147 +441,6 @@ bool Presenter::window_captured(render::Image &out) {
 
 // ---- the window's thread ----
 
-bool Presenter::make_effects() {
-    if (effects_tried_) return effects_ok_;
-    effects_tried_ = true;
-    VkDescriptorSetLayoutBinding bindings[2] = {};
-    bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    sli.bindingCount = 2;
-    sli.pBindings = bindings;
-    if (vkCreateDescriptorSetLayout(dev_, &sli, nullptr, &effect_set_layout_) != VK_SUCCESS) return false;
-    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(EffectPush)};
-    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    pli.setLayoutCount = 1;
-    pli.pSetLayouts = &effect_set_layout_;
-    pli.pushConstantRangeCount = 1;
-    pli.pPushConstantRanges = &push;
-    if (vkCreatePipelineLayout(dev_, &pli, nullptr, &effect_layout_) != VK_SUCCESS) return false;
-    const std::pair<const uint32_t *, size_t> code[EFFECTS] = {
-        {EFFECT_EASU, sizeof(EFFECT_EASU)}, {EFFECT_RCAS, sizeof(EFFECT_RCAS)}, {EFFECT_CAS, sizeof(EFFECT_CAS)},
-        {EFFECT_FXAA, sizeof(EFFECT_FXAA)}, {EFFECT_FXAA_EXTREME, sizeof(EFFECT_FXAA_EXTREME)}};
-    for (uint32_t e = 0; e < EFFECTS; e++) {
-        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        smi.codeSize = code[e].second;
-        smi.pCode = code[e].first;
-        VkShaderModule module = VK_NULL_HANDLE;
-        if (vkCreateShaderModule(dev_, &smi, nullptr, &module) != VK_SUCCESS) return false;
-        VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpi.stage.module = module;
-        cpi.stage.pName = "main";
-        cpi.layout = effect_layout_;
-        VkResult made = vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &cpi, nullptr, &effect_pipelines_[e]);
-        vkDestroyShaderModule(dev_, module, nullptr);
-        if (made != VK_SUCCESS) return false;
-    }
-    VkSamplerCreateInfo smp{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    smp.magFilter = smp.minFilter = VK_FILTER_LINEAR;
-    smp.addressModeU = smp.addressModeV = smp.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    if (vkCreateSampler(dev_, &smp, nullptr, &linear_) != VK_SUCCESS) return false;
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * EFFECT_PASSES},
-                                     {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * EFFECT_PASSES}};
-    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    dpi.maxSets = 2 * EFFECT_PASSES;
-    dpi.poolSizeCount = 2;
-    dpi.pPoolSizes = sizes;
-    if (vkCreateDescriptorPool(dev_, &dpi, nullptr, &effect_pool_) != VK_SUCCESS) return false;
-    for (auto &sets : effect_sets_)
-        for (VkDescriptorSet &set : sets) {
-            VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-            dai.descriptorPool = effect_pool_;
-            dai.descriptorSetCount = 1;
-            dai.pSetLayouts = &effect_set_layout_;
-            if (vkAllocateDescriptorSets(dev_, &dai, &set) != VK_SUCCESS) return false;
-        }
-    return effects_ok_ = true;
-}
-
-// A pass's output image, made again when its size changes (after the
-// window's queue is idle: an earlier frame may still read the old one)
-Presenter::EffectImage *Presenter::effect_image(uint32_t slot, uint32_t width, uint32_t height) {
-    EffectImage &e = effect_images_[slot];
-    if (e.image.image && e.image.extent.width == width && e.image.extent.height == height) return &e;
-    if (e.image.image) {
-        idle();
-        vkDestroyImageView(dev_, e.view, nullptr);
-        device_->destroy(e.image);
-        e = {};
-    }
-    e.image = device_->create_image(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {width, height, 1}, 1, 1,
-                                    VK_SAMPLE_COUNT_1_BIT,
-                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-    if (!e.image.image) return nullptr;
-    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    vi.image = e.image.image;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = VK_FORMAT_R8G8B8A8_UNORM;
-    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    if (vkCreateImageView(dev_, &vi, nullptr, &e.view) != VK_SUCCESS) return nullptr;
-    return &e;
-}
-
-// Xenia's presenter's chain (presenter.cc's PaintAndPresentImpl): FXAA at the
-// picture's size; then FSR 1 when upscaling (EASU in passes of at most 2x,
-// RCAS with the sharpness reduction in stops at the end) or CAS (sharpening,
-// resampling when the sizes differ; FSR asked for without an upscale takes
-// CAS too, with no additional sharpness, as Xenia's does).
-Presenter::EffectImage *Presenter::run_effects(VkCommandBuffer cmd, const View &view, VkImageView picture_view,
-                                               uint32_t width, uint32_t height, uint32_t dest_width,
-                                               uint32_t dest_height, uint32_t &out_width, uint32_t &out_height) {
-    if (!picture_view || !make_effects()) return nullptr;
-    VkImageView source = picture_view;
-    uint32_t sw = width, sh = height, slot = 0;
-    EffectImage *last = nullptr;
-    auto pass = [&](Effect effect, uint32_t w, uint32_t h, float sharpness, uint32_t scaling) {
-        if (slot >= EFFECT_PASSES) return false;
-        EffectImage *image = effect_image(slot, w, h);
-        if (!image) return false;
-        VkDescriptorSet set = effect_sets_[at_][slot++];
-        VkDescriptorImageInfo in{linear_, source, VK_IMAGE_LAYOUT_GENERAL};
-        VkDescriptorImageInfo out{VK_NULL_HANDLE, image->view, VK_IMAGE_LAYOUT_GENERAL};
-        VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-        writes[0].dstSet = writes[1].dstSet = set;
-        writes[0].dstBinding = 0, writes[1].dstBinding = 1;
-        writes[0].descriptorCount = writes[1].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, writes[0].pImageInfo = &in;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, writes[1].pImageInfo = &out;
-        vkUpdateDescriptorSets(dev_, 2, writes, 0, nullptr);
-        // what came before (the picture's conversion, the pass before, an
-        // earlier frame reading this image) done first
-        full_barrier(cmd);
-        barrier(cmd, image->image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, effect_pipelines_[effect]);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, effect_layout_, 0, 1, &set, 0, nullptr);
-        EffectPush p{w, h, float(sw), float(sh), float(w), float(h), sharpness, scaling};
-        vkCmdPushConstants(cmd, effect_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
-        vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
-        source = image->view, sw = w, sh = h, last = image;
-        return true;
-    };
-    bool ok = true;
-    if (view.antialiasing) ok = pass(view.antialiasing == 2 ? FXAA_EXTREME : FXAA, sw, sh, 0.0f, 0);
-    if (ok && view.upscaler == 1) {
-        const auto steps = easu_passes(sw, sh, dest_width, dest_height);
-        if (!steps.empty()) {
-            for (auto [w, h] : steps) ok = ok && pass(EASU, w, h, 0.0f, 0);
-            ok = ok && pass(RCAS, dest_width, dest_height, std::exp2(-view.fsr_sharpness_reduction), 0);
-        } else {
-            ok = pass(CAS, dest_width, dest_height, cas_sharpness_constant(0.0f), sw != dest_width || sh != dest_height);
-        }
-    } else if (ok && view.upscaler == 2) {
-        ok = pass(CAS, dest_width, dest_height, cas_sharpness_constant(view.cas_sharpness),
-                  sw != dest_width || sh != dest_height);
-    }
-    if (!ok || !last) return nullptr;
-    full_barrier(cmd); // the last pass's writes before the blit
-    out_width = sw, out_height = sh;
-    return last;
-}
-
 void Presenter::drop_swapchain() {
     for (VkImageView v : views_) vkDestroyImageView(dev_, v, nullptr);
     for (VkSemaphore s : finished_) vkDestroySemaphore(dev_, s, nullptr);
@@ -750,14 +575,20 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
         // picture's, antialiased alone), then blitted
         uint32_t from_w = width, from_h = height;
         VkImage from = picture;
-        if (place.width && place.height && (view.upscaler || view.antialiasing)) {
-            EffectImage *out = run_effects(cmd, view, picture_view, width, height, place.width, place.height, from_w, from_h);
-            if (out) from = out->image.image;
+        if (place.width && place.height && effects_apply(view.effects, width, height, place.width, place.height)) {
+            if (!effects_tried_) {
+                effects_tried_ = true;
+                effects_ok_ = effects_.open(*device_, [this] { idle(); }, effects_error_);
+            }
+            PictureEffects::Output out;
+            const bool ran = effects_ok_ && effects_.record(cmd, at_, view.effects, picture_view, width, height,
+                                                            place.width, place.height, out);
+            if (ran) from = out.image, from_w = out.width, from_h = out.height;
             // once, why the chosen effects are not on the screen
-            if (!out && !effects_failure_told_) {
+            if (!ran && !effects_failure_told_) {
                 effects_failure_told_ = true;
                 std::fprintf(stderr, "presenter: the picture effects could not run (%s)\n",
-                             effects_tried_ && !effects_ok_ ? "their pipelines could not be made" : "no picture view");
+                             !effects_ok_ ? effects_error_.c_str() : "no picture view, or an image not made");
             }
         }
         VkImageBlit blit{};
@@ -767,7 +598,7 @@ bool Presenter::present(const View &view, const std::function<void(VkCommandBuff
         blit.dstOffsets[1] = {place.x + int32_t(place.width), place.y + int32_t(place.height), 1};
         const bool same = from_w == place.width && from_h == place.height;
         vkCmdBlitImage(cmd, from, VK_IMAGE_LAYOUT_GENERAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
-                       view.smooth && !same ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+                       view.effects.smooth && !same ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     barrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};

@@ -441,8 +441,10 @@ if(XF_PLAYER AND TARGET boot)
     # the window's front buffer conversion, a compute shader (src/shaders/spirv)
     set(XF_FRONTEND_SHADERS)
     xf_spirv(XF_FRONTEND_SHADERS front_buffer.comp frontend/front_buffer.comp)
-    # the window's picture effects (FSR 1's EASU and RCAS, CAS, FXAA), one compute shader each
-    foreach(effect EASU RCAS CAS FXAA FXAA_EXTREME)
+    # the window's picture effects (FSR 1's EASU and RCAS, CAS, FXAA, the output resampling, SMAA's three passes),
+    # one compute shader each
+    foreach(effect EASU RCAS CAS FXAA FXAA_EXTREME AREA BICUBIC SHARP_BILINEAR SMAA_EDGES SMAA_WEIGHTS_MEDIUM
+                   SMAA_WEIGHTS_HIGH SMAA_WEIGHTS_ULTRA SMAA_BLEND)
         xf_spirv(XF_FRONTEND_SHADERS present_${effect}.comp frontend/present_effects.comp -fshader-stage=comp -w
                  -D${effect})
     endforeach()
@@ -452,7 +454,8 @@ if(XF_PLAYER AND TARGET boot)
                 -DOUT=${XF_SHADER_OUT}/xenoforge_icon.inc -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bytes.cmake
         DEPENDS assets/branding/xenoforge-256.png cmake/embed_bytes.cmake
         COMMENT "the windows' icon")
-    add_library(xf_frontend STATIC frontend/settings.cpp frontend/presenter.cpp frontend/sdl_input.cpp
+    add_library(xf_frontend STATIC frontend/settings.cpp frontend/presenter.cpp frontend/present_effects.cpp
+                                   frontend/sdl_input.cpp
                                    frontend/profiles.cpp frontend/console_options.cpp frontend/system_ui.cpp
                                    frontend/sdl_audio.cpp frontend/library.cpp frontend/launcher_core.cpp
                                    frontend/window_icon.cpp
@@ -517,6 +520,13 @@ if(XF_PLAYER AND TARGET boot)
     add_executable(frontend_test tests/frontend_test.cpp tools/game.cpp)
     target_link_libraries(frontend_test PRIVATE xf_ui xf_frontend xenoforge_kernel xenoforge_vk)
     add_test(NAME frontend COMMAND frontend_test)
+    # the window's picture effects on synthetic images (area, bicubic, SMAA), on the GPU without a window
+    add_executable(picture_effects_test tests/picture_effects_test.cpp)
+    target_link_libraries(picture_effects_test PRIVATE xf_frontend xenoforge_vk)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(picture_effects_test PRIVATE -Wno-missing-field-initializers)
+    endif()
+    add_test(NAME picture_effects COMMAND picture_effects_test)
     # the player's system UI without a window: the dialogs' model, the profiles, the kernel's exports through the handler
     add_executable(system_ui_test tests/system_ui_test.cpp tools/game.cpp)
     target_include_directories(system_ui_test PRIVATE src/kernel)

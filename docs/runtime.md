@@ -2192,11 +2192,48 @@ from one table of choices (`settings.h`'s `video_choices`):
   guest_output_ffx_* shaders, ported to compute in
   `frontend/present_effects.comp`; AMD's FidelityFX headers, MIT, in
   `third_party/FidelityFX-*`). FSR asked for where the window is no larger
-  than the picture takes CAS, as Xenia's does. **Antialiasing**
+  than the picture takes CAS, as Xenia's does. **Resampling**
+  (`resampling`, Dolphin's "output resampling" choices, standard filters
+  written anew): where neither FSR nor CAS is asked for and `smooth` is on,
+  `area` (each pixel the exact box average of the texels its footprint
+  covers, at any ratio along each axis), the Mitchell-Netravali cubics
+  (`bspline` B=1 C=0, `mitchell` 1/3 1/3, `catmull_rom` 0 1/2; 4x4 texels
+  enlarging, the kernel widened by the ratio up to 4x when reducing,
+  weights normalized) or `sharp_bilinear` (nearest to the largest whole
+  multiple, then linear), else `bilinear`, the blit. The default `auto` is
+  area where the picture is larger than the window's rectangle along
+  either axis and the blit otherwise: with the resolution scale up to 800%
+  the picture is often larger than the window, and there a linear blit
+  reads 2x2 texels a pixel, a box filter only at exactly 2x; above it
+  skips texels (shimmer, detail lost), where area keeps every texel's
+  share, which makes the resolution scale supersampling. Enlarging, the
+  blit stays the default (what players know; the cubics are a choice).
+  Nearest (`smooth` off) and integer scaling are the blit as before. All in
+  the picture's gamma encoding, as the blit. **Antialiasing**
   (`antialiasing`): FXAA 3.11 at Xenia's two presets (NVIDIA's header,
   BSD, `third_party/fxaa`), with green as luma (Xenia puts luma in the
-  alpha in its gamma pass). The effects run on the window's thread into
-  images of the destination rectangle's size, then a 1:1 blit; live.
+  alpha in its gamma pass), or SMAA 1x (Jimenez et al., MIT,
+  `third_party/smaa`: `SMAA.hlsl` unchanged, given to glslang as
+  `SMAA_CUSTOM_SL` with level-0 sampling, its precomputed area and search
+  textures uploaded once) at its medium, high and ultra presets, with luma
+  edge detection (the reference's recommendation; it wants the
+  gamma-encoded picture this is). Its three passes (edges, blending
+  weights, neighbourhood blending) are compute shaders writing every pixel,
+  so nothing needs clearing; where the reference discards, the edge pass
+  writes no edge. Both run at the internal resolution, before the output
+  scaling. The effects (`frontend/present_effects.{h,cpp,comp}`) run on the
+  window's thread into images of the destination rectangle's size, then a
+  1:1 blit; live. `picture_effects_test` runs them on synthetic images:
+  area equals the box average (whole and fractional ratios), the cubics
+  and sharp bilinear keep a flat picture flat, SMAA softens an aliased
+  diagonal and keeps a flat picture, a horizontal line and a straight edge
+  exactly; with `XF_EFFECTS_TIMING=1` it prints each pass's GPU time. Once
+  on an RTX 5060 (shared with another agent's work, so indicative): SMAA
+  high at 1080p 0.04 + 0.08 + 0.04 ms (edges, weights, blending), at 4K
+  0.16 + 0.26 + 0.18 ms; ultra at 4K 0.19 + 0.29 + 0.19 ms; FXAA at 4K
+  0.19 ms; area 4K to 1080p 0.08 ms, 4800x2700 to 1080p 0.13 ms; Mitchell
+  4K to 1080p 0.47 ms, 1080p to 4K 0.56 ms; sharp bilinear 1080p to 4K
+  0.11 ms.
 - **Picture shape** (`aspect`): fitted, whole multiples (integer scaling;
   fitted where not even 1x fits), or stretched; live.
 - **Render targets** (`edram`, as the game starts): `fast`, the default,

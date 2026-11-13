@@ -117,6 +117,20 @@ int main() {
         CHECK(!frontend::set_video_value(bad, "video.resolution_scale", "130"));
         CHECK(frontend::video_value(bad, "video.upscaler") == "none" && frontend::video_needs_restart("video.min_scalable"));
         CHECK(!frontend::video_needs_restart("video.upscaler"));
+        // the output resampling and SMAA's presets: listed, kept, an unknown one back to the default
+        CHECK(frontend::Settings().video.resampling == "auto");
+        CHECK(frontend::video_choices("video.resampling").size() == 7);
+        CHECK(frontend::set_video_value(bad, "video.resampling", "catmull_rom") &&
+              frontend::video_value(bad, "video.resampling") == "catmull_rom");
+        CHECK(frontend::set_video_value(bad, "video.antialiasing", "smaa_ultra") && bad.video.antialiasing == "smaa_ultra");
+        CHECK(!frontend::set_video_value(bad, "video.resampling", "lanczos"));
+        CHECK(frontend::save(dir / "resample.toml", bad, error));
+        frontend::Settings rs;
+        CHECK(frontend::load(dir / "resample.toml", rs, error) && rs.video.resampling == "catmull_rom" &&
+              rs.video.antialiasing == "smaa_ultra");
+        rs.video.resampling = "x";
+        frontend::clamp_video(rs);
+        CHECK(rs.video.resampling == "auto");
     }
     // no lost updates: two processes (the launcher and a player) load the file, each changes a few fields and
     // saves; the other's fields survive, whichever saves first

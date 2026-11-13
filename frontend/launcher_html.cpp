@@ -396,7 +396,9 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
         rows += slider_row("video.fsr_sharpness", "FSR sharpness reduction", "0 is the sharpest (Xenia's default 0.2).", st.video.fsr_sharpness / 2.0, sharp);
         std::snprintf(sharp, sizeof(sharp), "%.0f%%", st.video.cas_sharpness * 100);
         rows += slider_row("video.cas_sharpness", "CAS additional sharpness", "", st.video.cas_sharpness, sharp);
-        rows += select_row("video.antialiasing", "Antialiasing", "FXAA over the game's picture, before it is scaled: smooths jagged edges, a subtle change on a smooth picture. Changes at once.",
+        rows += select_row("video.resampling", "Resampling", "How the picture is scaled to the window without FSR or CAS. Area averages every pixel when the picture is larger than the window (a high resolution scale): no shimmer, no detail lost. The bicubic filters and sharp bilinear suit enlarging. Changes at once.",
+                           label_of(video_choice_list("video.resampling"), st.video.resampling));
+        rows += select_row("video.antialiasing", "Antialiasing", "FXAA or SMAA over the game's picture, before it is scaled: smooths jagged edges. SMAA keeps the picture sharper; a subtle change on a smooth picture. Changes at once.",
                            label_of(video_choice_list("video.antialiasing"), st.video.antialiasing));
         s += group("Display", rows);
         std::string inner = select_row("video.resolution_scale", "Resolution scale",

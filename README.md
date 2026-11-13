@@ -119,9 +119,11 @@ The rest is under its own license:
   built as a separate library (`ffmpeg-xma`) that the programs load at run
   time. Without it, they run with XMA silent.
 - **AMD FidelityFX FSR 1 and CAS (MIT, `third_party/FidelityFX-FSR`,
-  `third_party/FidelityFX-CAS`) and NVIDIA FXAA 3.11 (BSD 3-clause,
-  `third_party/fxaa`):** their headers, unchanged, compiled into the
-  player's output scaling shaders; each folder holds its license.
+  `third_party/FidelityFX-CAS`), NVIDIA FXAA 3.11 (BSD 3-clause,
+  `third_party/fxaa`) and SMAA (Jimenez et al., MIT, `third_party/smaa`:
+  `SMAA.hlsl` and its precomputed `AreaTex.h` and `SearchTex.h`):** their
+  headers, unchanged, compiled into the player's picture effects; each
+  folder holds its license.
 - **volk (MIT) and Khronos's Vulkan-Headers (Apache 2.0) and SPIRV-Headers
   (MIT):** fetched at configure time, unchanged; volk is compiled in.
 - **The player's package:** `cmake --install build --prefix <folder>` makes

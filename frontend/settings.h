@@ -56,7 +56,13 @@ struct Settings {
         std::string upscaler = "none";
         double fsr_sharpness = 0.2; // RCAS's sharpness reduction in stops, 0-2 (Xenia's default)
         double cas_sharpness = 0.0; // CAS's additional sharpness, 0-1 (Xenia's default)
-        std::string antialiasing = "none"; // "none", "fxaa" or "fxaa_extreme", on the picture before scaling; live
+        // "none", "fxaa", "fxaa_extreme" (Xenia's two FXAA presets) or "smaa_medium", "smaa_high", "smaa_ultra" (SMAA
+        // 1x at its presets), on the picture before scaling; live
+        std::string antialiasing = "none";
+        // The output resampling where neither FSR nor CAS is asked for and `smooth` is on (Dolphin's choices):
+        // "auto" (area where the picture is larger than the window's rectangle along either axis, else the bilinear
+        // blit), "bilinear", "area", "bspline", "mitchell", "catmull_rom" or "sharp_bilinear"; live
+        std::string resampling = "auto";
         // Texture filtering, live: anisotropic filtering forced (0 the game's, else 1, 2, 4, 8 or 16) on mipmapped
         // textures the game filters linearly (Xenia's anisotropic_override rule), and "game", "trilinear" (linear
         // between mips where the game filters each one linearly) or "nearest" (everything point sampled)
@@ -149,7 +155,8 @@ int clamp_resolution_scale(int percent);
 void clamp_video(Settings &settings);
 
 // The video section's choices, shared by the launcher's Video tab and the player's overlay and guide: for a key
-// ("video.resolution_scale", "video.min_scalable", "video.upscaler", "video.antialiasing", "video.anisotropy",
+// ("video.resolution_scale", "video.min_scalable", "video.upscaler", "video.antialiasing", "video.resampling",
+// "video.anisotropy",
 // "video.texture_filter", "video.aspect") its values (as text) and their labels, the current value as text, and a
 // value set (false for a key or value not known). Empty for other keys.
 struct VideoChoice {

@@ -64,7 +64,9 @@ void clamp_video(Settings &s) {
     s.video.min_scalable = std::clamp(s.video.min_scalable, 0, 256);
     one_of(s.video.aspect, {"auto", "integer", "stretch"});
     one_of(s.video.upscaler, {"none", "fsr", "cas"});
-    one_of(s.video.antialiasing, {"none", "fxaa", "fxaa_extreme"});
+    one_of(s.video.antialiasing, {"none", "fxaa", "fxaa_extreme", "smaa_medium", "smaa_high", "smaa_ultra"});
+    one_of(s.video.resampling,
+           {"auto", "bilinear", "area", "bspline", "mitchell", "catmull_rom", "sharp_bilinear"});
     one_of(s.video.texture_filter, {"game", "trilinear", "nearest"});
     one_of(s.video.edram, {"fast", "exact"});
     s.video.fsr_sharpness = std::isfinite(s.video.fsr_sharpness) ? std::clamp(s.video.fsr_sharpness, 0.0, 2.0) : 0.2;
@@ -90,7 +92,20 @@ std::vector<VideoChoice> video_choices(const std::string &key) {
         out = {{"none", "None (bilinear or nearest)"}, {"fsr", "AMD FSR 1 (upscale and sharpen)"},
                {"cas", "AMD CAS (sharpen and resample)"}};
     } else if (key == "video.antialiasing") {
-        out = {{"none", "None"}, {"fxaa", "FXAA"}, {"fxaa_extreme", "FXAA (extreme)"}};
+        out = {{"none", "None"},
+               {"fxaa", "FXAA"},
+               {"fxaa_extreme", "FXAA (extreme)"},
+               {"smaa_medium", "SMAA (medium)"},
+               {"smaa_high", "SMAA (high)"},
+               {"smaa_ultra", "SMAA (ultra)"}};
+    } else if (key == "video.resampling") {
+        out = {{"auto", "Automatic (area when reducing, else bilinear)"},
+               {"bilinear", "Bilinear"},
+               {"area", "Area (box average)"},
+               {"bspline", "Bicubic: B-spline (soft)"},
+               {"mitchell", "Bicubic: Mitchell-Netravali"},
+               {"catmull_rom", "Bicubic: Catmull-Rom (sharp)"},
+               {"sharp_bilinear", "Sharp bilinear"}};
     } else if (key == "video.anisotropy") {
         out = {{"0", "The game's"}, {"1", "Off (1x)"}, {"2", "2x"}, {"4", "4x"}, {"8", "8x"}, {"16", "16x"}};
     } else if (key == "video.texture_filter") {
@@ -110,6 +125,7 @@ std::string video_value(const Settings &s, const std::string &key) {
     if (key == "video.min_scalable") return std::to_string(s.video.min_scalable);
     if (key == "video.upscaler") return s.video.upscaler;
     if (key == "video.antialiasing") return s.video.antialiasing;
+    if (key == "video.resampling") return s.video.resampling;
     if (key == "video.anisotropy") return std::to_string(s.video.anisotropy);
     if (key == "video.texture_filter") return s.video.texture_filter;
     if (key == "video.edram") return s.video.edram;
@@ -126,6 +142,7 @@ bool set_video_value(Settings &s, const std::string &key, const std::string &val
     else if (key == "video.min_scalable") s.video.min_scalable = number;
     else if (key == "video.upscaler") s.video.upscaler = value;
     else if (key == "video.antialiasing") s.video.antialiasing = value;
+    else if (key == "video.resampling") s.video.resampling = value;
     else if (key == "video.anisotropy") s.video.anisotropy = number;
     else if (key == "video.texture_filter") s.video.texture_filter = value;
     else if (key == "video.edram") s.video.edram = value;
@@ -176,6 +193,7 @@ void read_sections(const toml::table &t, Settings &s) {
     get(t, "video", "fsr_sharpness", s.video.fsr_sharpness);
     get(t, "video", "cas_sharpness", s.video.cas_sharpness);
     get(t, "video", "antialiasing", s.video.antialiasing);
+    get(t, "video", "resampling", s.video.resampling);
     get(t, "video", "texture_filter", s.video.texture_filter);
     get(t, "video", "edram", s.video.edram);
     get(t, "video", "frame_graph", s.video.frame_graph);
@@ -250,6 +268,7 @@ void write_sections(toml::table &t, const Settings &s) {
                                             {"fsr_sharpness", s.video.fsr_sharpness},
                                             {"cas_sharpness", s.video.cas_sharpness},
                                             {"antialiasing", s.video.antialiasing},
+                                            {"resampling", s.video.resampling},
                                             {"anisotropy", s.video.anisotropy},
                                             {"texture_filter", s.video.texture_filter},
                                             {"edram", s.video.edram},

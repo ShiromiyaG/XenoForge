@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "present_effects.h"
 #include "xenoforge/renderer.h"
 #include "xenoforge/vk_device.h"
 
@@ -54,12 +55,10 @@ class Presenter {
   public:
     struct View {
         uint32_t width = 0, height = 0; // the window's, in pixels
-        bool vsync = true, smooth = true;
+        bool vsync = true;
         Fit fit = Fit::aspect;
-        // the output scaling (settings.h's upscaler): 0 a blit, 1 FSR 1, 2 CAS; and their sharpness
-        uint32_t upscaler = 0;
-        float fsr_sharpness_reduction = 0.2f, cas_sharpness = 0.0f;
-        uint32_t antialiasing = 0; // 0 none, 1 FXAA, 2 FXAA extreme
+        // the antialiasing, the output scaling and the resampling, and smooth (linear, or nearest)
+        EffectOptions effects;
     };
 
     // The pictures and the window's swapchain on the device, which was opened
@@ -133,15 +132,6 @@ class Presenter {
     };
 
     bool make_swapchain(const View &view);
-    // the effects (present_effects.comp): their pipelines, made on the first present that asks
-    bool make_effects();
-    struct EffectImage;
-    // the picture through the view's effects (the antialiasing at its size, then the output scaling to the
-    // destination's): the last pass's image, in VK_IMAGE_LAYOUT_GENERAL, and its size; null when none applies (a
-    // blit does it all) or they could not be made
-    EffectImage *run_effects(VkCommandBuffer cmd, const View &view, VkImageView picture_view, uint32_t width,
-                             uint32_t height, uint32_t dest_width, uint32_t dest_height, uint32_t &out_width,
-                             uint32_t &out_height);
     void drop_swapchain();
     bool make_pipeline(std::string &error);
     uint64_t counter(VkSemaphore semaphore) const;
@@ -168,23 +158,10 @@ class Presenter {
     bool window_ready_ = false;
     uint32_t window_w_ = 0, window_h_ = 0;
 
-    // the effects (the window's thread): a pipeline each (EASU, RCAS, CAS, FXAA, FXAA extreme), the images between
-    // passes (kept while their sizes hold), a descriptor set per pass and frame in flight
-    enum Effect { EASU, RCAS, CAS, FXAA, FXAA_EXTREME, EFFECTS };
-    static constexpr uint32_t EFFECT_PASSES = 8;
-    struct EffectImage {
-        vk::Image image;
-        VkImageView view = VK_NULL_HANDLE;
-    };
+    // the effects (the window's thread; present_effects.h), made on the first present that asks
     bool effects_tried_ = false, effects_ok_ = false, effects_failure_told_ = false;
-    VkDescriptorSetLayout effect_set_layout_ = VK_NULL_HANDLE;
-    VkPipelineLayout effect_layout_ = VK_NULL_HANDLE;
-    VkPipeline effect_pipelines_[EFFECTS] = {};
-    VkSampler linear_ = VK_NULL_HANDLE;
-    VkDescriptorPool effect_pool_ = VK_NULL_HANDLE;
-    VkDescriptorSet effect_sets_[2][EFFECT_PASSES] = {};
-    EffectImage effect_images_[EFFECT_PASSES]; // the passes' outputs, by the pass's place in the chain
-    EffectImage *effect_image(uint32_t slot, uint32_t width, uint32_t height);
+    std::string effects_error_;
+    PictureEffects effects_;
 
     // the window (its thread)
     VkCommandPool commands_ = VK_NULL_HANDLE;

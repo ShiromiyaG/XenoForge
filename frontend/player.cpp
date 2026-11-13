@@ -573,9 +573,9 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         std::printf("drawing at %u%% of the console's resolution%s%s\n", g.renderer->resolution_scale() * 25,
                     scale_notice.empty() ? "" : ": ", scale_notice.c_str());
     // what the settings asked of the picture, so a log shows what reached the player
-    std::printf("picture: resolution scale %d%%, output scaling %s, antialiasing %s, shape %s\n",
-                settings.video.resolution_scale, settings.video.upscaler.c_str(), settings.video.antialiasing.c_str(),
-                settings.video.aspect.c_str());
+    std::printf("picture: resolution scale %d%%, output scaling %s, resampling %s, antialiasing %s, shape %s\n",
+                settings.video.resolution_scale, settings.video.upscaler.c_str(), settings.video.resampling.c_str(),
+                settings.video.antialiasing.c_str(), settings.video.aspect.c_str());
     std::printf("rendering on %s, the window on the same device (%s)\n", g.device->name().c_str(),
                 presenter.own_queue() ? "a queue of its own" : "the renderer's queue");
     stbi_write_png_compression_level = 1;
@@ -1006,16 +1006,15 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         frontend::Presenter::View view;
         view.width = uint32_t(pw), view.height = uint32_t(ph);
         view.vsync = settings.video.vsync;
-        view.smooth = settings.video.smooth;
         view.fit = settings.video.aspect == "stretch"   ? frontend::Fit::stretch
                    : settings.video.aspect == "integer" ? frontend::Fit::integer
                                                         : frontend::Fit::aspect;
-        view.upscaler = settings.video.upscaler == "fsr" ? 1u : settings.video.upscaler == "cas" ? 2u : 0u;
-        view.fsr_sharpness_reduction = float(settings.video.fsr_sharpness);
-        view.cas_sharpness = float(settings.video.cas_sharpness);
-        view.antialiasing = settings.video.antialiasing == "fxaa"           ? 1u
-                            : settings.video.antialiasing == "fxaa_extreme" ? 2u
-                                                                            : 0u;
+        view.effects.smooth = settings.video.smooth;
+        view.effects.upscaler = settings.video.upscaler == "fsr" ? 1u : settings.video.upscaler == "cas" ? 2u : 0u;
+        view.effects.fsr_sharpness_reduction = float(settings.video.fsr_sharpness);
+        view.effects.cas_sharpness = float(settings.video.cas_sharpness);
+        view.effects.antialiasing = frontend::antialiasing_from(settings.video.antialiasing);
+        view.effects.resampling = frontend::resampling_from(settings.video.resampling);
         if (!window_shots.empty() && seconds >= next_window_shot) {
             presenter.capture_window_next();
             next_window_shot = seconds + window_shot_every;

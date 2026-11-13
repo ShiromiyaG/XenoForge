@@ -121,6 +121,8 @@ bool ConsolePages::picture_page(Host &h) {
         float v = float(s.video.cas_sharpness);
         if (ImGui::SliderFloat(labelled("CAS sharpness").c_str(), &v, 0.0f, 1.0f, "%.2f"))
             s.video.cas_sharpness = v, changed = live = true;
+    } else {
+        combo("Resampling", "video.resampling");
     }
     combo("Antialiasing", "video.antialiasing");
     combo("Picture shape", "video.aspect");
