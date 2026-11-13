@@ -4617,6 +4617,40 @@ is where a small buffer is read back. (Open: per-target scales with tiles
 tagged by scale and converted by `edram_rescale.comp` where they change
 hands.)
 
+**Small targets at the console's pixel centers** (`XF_CONSOLE_CENTERS`,
+16 console pixels by default, 0 off; beyond Xenia, which shows the fault).
+A draw into a target at most that many pixels across or down (the
+surface's pitch, the window scissor) reads its interpolators at the center
+of the console pixel each host pixel lies in: the translator moves each
+along its fine screen derivatives by the offset to that center, worked out
+in integers from the scale's quarters (the pixel `RenderScale::map` gives a
+resolve), under bit 16 of the system flags' y, a uniform branch. The
+code is emitted only in a run at a scale (`PixelOptions::console_centers`,
+not part of the key: the scale is the run's), so at 100% every shader's
+SPIR-V is what it was before. Such
+targets are tables and reductions whose shaders turn the position into an
+index, made exact at the console's centers. Found in a UE3 game's color
+grading table, a 16x512 target read as sixteen 16x16 slices: its pixel
+shader takes `frac(16 v - 1/64)` of the interpolated coordinate, exactly 0
+at a slice's first row on the console. At 200% the host's sub-pixels sit a
+quarter pixel either side, the first row's upper half wraps to the slice's
+end (and the quad's huge derivatives make the anisotropic fetch smear it),
+the resolve's pixel (+0.75) reads every row a quarter texel late, so the
+table's darkest entry came out green (0x30522C for black) and every dark
+pixel of the frame took a green tint (3.3% of pixels at 200%, Xenia's 200%
+dump the same; 0.05% at 100%). With the centers every host pixel of a
+console pixel computes the console's value: the table at 200% is the 100%
+table word for word. The derivatives are exact for the screen-affine
+values such draws pass; implicit texture derivatives inside a console
+pixel become 0 (the base level), which only matters to a mipmapped texture
+read by such a draw. A texture is also loaded at the scale only when wider
+and taller than the threshold (`texture_scalable`): at a scale that is not a
+power of two (300%) the host pixels off the console's center hold the table
+only to the interpolators' rounding, which can still step an index, so a
+table is read from the pixels the resolve took. Measured on that frame
+(dark pixels tinted green, of all): 3.3% before, 0.05-0.06% after at 150,
+200, 250, 300 and 400%, both render target paths, as at 100%.
+
 **The interlock path takes multiples of 50%.** It addresses a pixel's MSAA
 samples from its first sample's dword (Xenia's ROV layout), which keeps
 them in one half of a tile only where the half (10 samples a quarter) is a

@@ -2871,6 +2871,27 @@ private:
     // smaller than min_scalable_ leaves EDRAM at the console's size.
     Scale scale_{};
     uint32_t min_scalable_ = 16;
+    // At a resolution scale, a draw whose target is at most this many console
+    // pixels across or down (the surface's pitch, the window scissor) reads
+    // its interpolators at the console pixel's center (shader_translator.cpp,
+    // bit 16 of the system flags' y): small targets are tables and
+    // reductions, whose shaders index them by position and expect the
+    // console's centers. XF_CONSOLE_CENTERS=<pixels> sets it, 0 turns it off.
+    uint32_t console_centers_ = [] {
+        const char *v = std::getenv("XF_CONSOLE_CENTERS");
+        return v && *v ? uint32_t(std::atoi(v)) : 16u;
+    }();
+    // A texture loaded at the scale (from a scaled resolve target or scaled
+    // memory): no smaller than the minimum scalable dimension, and, with
+    // console_centers_, wider and taller than it: a table such draws made is
+    // read at the console's size, from the pixels a resolve takes (the
+    // console pixels' centers). Its other host pixels hold the same values
+    // only to the interpolators' rounding, which at a scale that is not a
+    // power of two can step a position-indexed table across an index.
+    bool texture_scalable(uint32_t width, uint32_t height) const {
+        return scalable(width, height, min_scalable_) &&
+               !(console_centers_ && (width <= console_centers_ || height <= console_centers_));
+    }
     // 64-bit resolve targets made the scale's too (XF_SCALE_WIDE=0: those stay
     // the console's size)
     bool scale_wide_ = [] {
@@ -5771,6 +5792,7 @@ VkShaderModule Impl::form_module(Shader &s, uint32_t key, const shader::VertexOp
     shader::VertexOptions v = vertex;
     shader::PixelOptions p = pixel;
     v.texture_point_snap = p.texture_point_snap = point_snap_;
+    p.console_centers = console_centers_ && !scale_.one();
     v.extents_subgroup = v.extents && extents_subgroup_ && d_.vertex_subgroup_arithmetic();
     if (pending && translate_later(s, key)) {
         if (s.translating.insert(key).second)
@@ -7207,7 +7229,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
         use(std::string(line));
     }
     ScaledResolve *kept = nullptr;
-    if (target && !convert && !scale_.one() && scalable(plan.width, plan.height, min_scalable_) &&
+    if (target && !convert && !scale_.one() && texture_scalable(plan.width, plan.height) &&
         (texel_bytes == 4 || scale_wide_)) {
         auto found = scaled_resolves_.find(plan.slices[0].base & 0x1FFFFFFF);
         if (found != scaled_resolves_.end() && found->second.pitch == plan.slices[0].pitch_blocks &&
@@ -7245,7 +7267,7 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
                            std::max(scale_.up(plan.height) >> s.level, 1u) == scale_.up(h) &&
                            scale_.up(s.ox) * 4 == s.ox * scale_.q4 && scale_.up(s.oy) * 4 == s.oy * scale_.q4;
         }
-        const bool small = !scalable(plan.width, plan.height, min_scalable_);
+        const bool small = !texture_scalable(plan.width, plan.height);
         const char *reason = three                                             ? "3D"
                              : level_count != 1 && !scaled_mips_               ? "mipmapped"
                              : !layout                                         ? "not tiled 2D slices"
@@ -10485,6 +10507,20 @@ void Impl::draw(const gpu::Draw &d) {
     sys.values[3] = 1.0f / scale_.factor();
     uint32_t vte = regs_[r::PA_CL_VTE_CNTL];
     sys.flags[1] = ((vte >> 10) & 1) | ((vte >> 8) & 1) << 1 | ((vte >> 9) & 1) << 2;
+    // a small target at a resolution scale: the interpolators at the console
+    // pixel's center (console_centers_)
+    if (console_centers_ && !scale_.one() && ps) {
+        const uint32_t pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
+        const uint32_t tl = regs_[r::PA_SC_WINDOW_SCISSOR_TL], br = regs_[r::PA_SC_WINDOW_SCISSOR_BR];
+        const uint32_t width = (br & 0x7FFF) - std::min(br & 0x7FFF, tl & 0x7FFF);
+        const uint32_t height = ((br >> 16) & 0x7FFF) - std::min((br >> 16) & 0x7FFF, (tl >> 16) & 0x7FFF);
+        if ((pitch && pitch <= console_centers_) || width <= console_centers_ || height <= console_centers_) {
+            sys.flags[1] |= 1u << 16;
+            if (options_.verbose)
+                std::fprintf(stderr, "  draw %llu: interpolators at the console's centers (pitch %u, scissor %ux%u)\n",
+                             (unsigned long long)report_.draws, pitch, width, height);
+        }
+    }
     // the pixel parameters (SQ_PROGRAM_CNTL's param_gen) into the
     // interpolator SQ_CONTEXT_MISC's param_gen_pos names, as Xenia's
     // GetInterpolatorInputMask allows them (within the 16 interpolators),

@@ -169,6 +169,11 @@ struct PixelOptions {
     // host_blend_control). Not on the interlock path, which blends itself.
     bool blend_premultiply = false;
     bool texture_point_snap = false; // VertexOptions::texture_point_snap's; not part of the key
+    // A run at a resolution scale: the interpolators can be read at the
+    // console pixel's center, where the system flags' y bit 16 says (a draw
+    // into a small target). The run's, not part of the key; at 100% the code
+    // is left out.
+    bool console_centers = false;
     std::span<const uint32_t> edram_library; // with fsi; not part of the key
     uint32_t key() const {
         // (depth_float24 is 0-2; bits 4-7 are free)

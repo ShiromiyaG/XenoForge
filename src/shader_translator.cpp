@@ -2603,6 +2603,64 @@ void Translator::main_pixel() {
                 load(vec4_, inputs ? m_.op(Op::OpAccessChain, ptr_in_vec4, {inputs, i(int32_t(k))}) : interpolators[k]);
         store(m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))}), value);
     }
+    // At a resolution scale, a draw into a small target (a look-up table, a
+    // 1x1 reduction: the renderer sets bit 16 of the system flags' y) reads
+    // its interpolators at the center of the console pixel the host pixel
+    // lies in, so every host pixel of a console pixel computes what the
+    // console's pixel does. A shader that turns its position into a table's
+    // index (frac, floor of a coordinate made exact at the console's centers)
+    // otherwise steps across the index's boundary at the host's off-center
+    // positions. Each interpolator moved along its fine screen derivatives
+    // (exact for the screen-affine values such draws pass); the branch is on
+    // a uniform, so the derivatives are taken in uniform control flow. Only
+    // in a run at a scale (PixelOptions::console_centers).
+    if (pixel_.console_centers) {
+        Id flags = m_.op(Op::OpCompositeExtract, uint_,
+                         {load(uvec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, uvec4_),
+                                             {system_, u(3)})),
+                          1});
+        Id snap = m_.op(Op::OpINotEqual, bool_, {m_.op(Op::OpBitwiseAnd, uint_, {flags, u(1u << 16)}), u(0)});
+        when(snap, [&] {
+            m_.capability(spv::Capability::DerivativeControl);
+            Id position = load(vec4_, frag_coord);
+            Id per_pixel = comp(load(vec4_, m_.op(Op::OpAccessChain, m_.type_pointer(spv::StorageClass::Uniform, vec4_),
+                                                  {system_, u(4)})),
+                                3);
+            per_pixel = select(float_, m_.op(Op::OpFOrdEqual, bool_, {per_pixel, f(0)}), f(1), per_pixel);
+            // the scale in quarters, as the renderer takes it, and the rest in
+            // integers so the offsets come out exact (1 / 3 is not a float):
+            // host pixel h lies in console pixel c = floor((h + 1/2) * 4 / q4)
+            // (RenderScale::map, the pixel a resolve takes), whose center is
+            // ((2c + 1) * q4 - 4 * (2h + 1)) / 8 host pixels from h's
+            Id q4 = m_.op(Op::OpConvertFToU, uint_,
+                          {glsl(GLSLstd450RoundEven, float_, {exact(Op::OpFDiv, float_, {f(4.0f), per_pixel})})});
+            auto offset = [&](uint32_t component) {
+                Id host = m_.op(Op::OpConvertFToU, uint_, {glsl(GLSLstd450Floor, float_, {comp(position, component)})});
+                Id twice = m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpShiftLeftLogical, uint_, {host, u(1)}), u(1)});
+                Id console = m_.op(Op::OpUDiv, uint_, {m_.op(Op::OpShiftLeftLogical, uint_, {twice, u(1)}), q4});
+                Id center = m_.op(Op::OpIMul, uint_,
+                                  {m_.op(Op::OpIAdd, uint_, {m_.op(Op::OpShiftLeftLogical, uint_, {console, u(1)}), u(1)}),
+                                   q4});
+                Id eighths = m_.op(Op::OpISub, int_,
+                                   {m_.op(Op::OpBitcast, int_, {center}),
+                                    m_.op(Op::OpBitcast, int_, {m_.op(Op::OpShiftLeftLogical, uint_, {twice, u(2)})})});
+                return exact(Op::OpFMul, float_, {m_.op(Op::OpConvertSToF, float_, {eighths}), f(0.125f)});
+            };
+            Id ox = offset(0), oy = offset(1);
+            for (uint32_t k = 0; k < 16; k++) {
+                if (!inputs && ((pixel_.centroid >> k) & 1)) continue;
+                Id pointer = m_.op(Op::OpAccessChain, ptr_private_vec4_, {registers_, i(int32_t(k))});
+                Id value = load(vec4_, pointer);
+                Id dx = m_.op(Op::OpDPdxFine, vec4_, {value}), dy = m_.op(Op::OpDPdyFine, vec4_, {value});
+                Id moved = exact(Op::OpFAdd, vec4_,
+                                 {value, exact(Op::OpFAdd, vec4_,
+                                               {exact(Op::OpVectorTimesScalar, vec4_, {dx, ox}),
+                                                exact(Op::OpVectorTimesScalar, vec4_, {dy, oy})})});
+                store(pointer, moved);
+            }
+            return false;
+        });
+    }
     // The pixel parameters (SQ_PROGRAM_CNTL's param_gen), as Xenia's
     // StartFragmentShaderInMain writes them into the interpolator
     // SQ_CONTEXT_MISC names, by the system flags' y (bit 8 on, bits 9-12
