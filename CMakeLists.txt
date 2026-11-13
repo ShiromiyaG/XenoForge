@@ -84,6 +84,7 @@ add_library(xenoforge STATIC
     src/memory.cpp
     src/guest_memory.cpp
     src/gpu/command_processor.cpp
+    src/gpu/deferred_sink.cpp
     src/gpu_trace_writer.cpp
     src/xma_decoder.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/generated/game_interface.stamp
@@ -586,6 +587,8 @@ foreach(name aes disc xex lzx sha1 snappy ucode ucode_parse trace shader_interpr
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+# the command processor test reaches the deferred sink (src/gpu/deferred_sink.h)
+target_include_directories(command_processor_test PRIVATE src)
 # xfcompat's rows, files and the parser of boot's output, on canned output
 add_executable(compat_test tests/compat_test.cpp tools/compat.cpp)
 target_include_directories(compat_test PRIVATE tools)

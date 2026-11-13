@@ -9,6 +9,7 @@
 
 #include "check.h"
 
+#include "gpu/deferred_sink.h"
 #include "xenoforge/command_processor.h"
 #include "xenoforge/memory.h"
 
@@ -533,6 +534,64 @@ void register_stamps() {
     CHECK(r.foreign_writes() == foreign + 1);
 }
 
+// The sink's work on a thread of its own (gpu/deferred_sink.h): the same calls in the same order,
+// each with the registers as they stood at it; IM_LOAD's words read by the back end; a fence
+// written by the back end once the work before it is done; a time synchronous.
+void deferred_sink() {
+    Host host;
+    Recorder recorder;
+    CommandProcessor cp{*M, host};
+    uint32_t ring = physical_alloc(0x1000), m = physical_alloc(0x1000), code = physical_alloc(0x1000);
+    cp.initialize_ring_buffer(ring, 9);
+    DeferredSink deferred(recorder, cp.registers(), *M);
+    cp.set_sink(&deferred);
+    Words{code}({0xC0DE0001, 0xC0DE0002});
+    Words w(ring);
+    w({type3(pm4::IM_LOAD, 2), code | 1, 2});
+    w({type3(pm4::IM_LOAD_IMMEDIATE, 4), 0, 2, 0xAAAA, 0xBBBB});
+    w({type0(reg::RB_MODECONTROL, 1), 4});
+    w({type3(pm4::DRAW_INDX_2, 1), 6u << 16 | 2u << 6 | 8});
+    w({type0(reg::RB_MODECONTROL, 1), 5});
+    w({type3(pm4::DRAW_INDX_2, 3), 3u << 16 | 1u << 6 | 4, 0x00050004, 0x0006});
+    w({type3(pm4::EVENT_WRITE_SHD, 3), 0x15, (m + 0x20) | 2, 0xFE11CE});
+    w({type0(reg::SCRATCH_UMSK, 2), 1, m + 0x40}); // SCRATCH_UMSK, SCRATCH_ADDR
+    w({type0(reg::SCRATCH_REG0, 1), 0x5C});        // written back later
+    w({type0(reg::RB_MODECONTROL, 1), 6});
+    w({type3(pm4::DRAW_INDX, 2), 0, 3u << 16 | 2u << 6 | 8});
+    w({type3(pm4::XE_SWAP, 4), pm4::SWAP_SIGNATURE, 0x1E000000, 1280, 720});
+    cp.run(w.n);
+    deferred.finish();
+    CHECK(recorder.shaders.size() == 2);
+    if (recorder.shaders.size() == 2) {
+        CHECK(recorder.shaders[0].first == 1 &&
+              recorder.shaders[0].second == (std::vector<uint32_t>{0xC0DE0001, 0xC0DE0002}));
+        CHECK(recorder.shaders[1].second == (std::vector<uint32_t>{0xAAAA, 0xBBBB}));
+    }
+    CHECK(recorder.draws.size() == 2 && recorder.draw_modes == (std::vector<uint32_t>{4, 5}));
+    if (recorder.draws.size() == 2)
+        CHECK(recorder.draws[1].immediate == (std::vector<uint32_t>{0x00050004, 0x0006}) &&
+              recorder.draws[1].count == 3 && recorder.draws[1].indexed);
+    CHECK(recorder.resolves.size() == 1 && recorder.swaps.size() == 1);
+    CHECK(be32(m + 0x20) == 0xFE11CE && be32(m + 0x40) == 0x5C);
+    CHECK(deferred.stats().late_writes == 2);
+    // synchronous: passed on at once, with the processor's registers
+    deferred.set_synchronous(true);
+    Words s(ring + 4 * w.n);
+    s({type0(reg::RB_MODECONTROL, 1), 4});
+    s({type3(pm4::DRAW_INDX_2, 1), 6u << 16 | 2u << 6 | 8});
+    cp.run(w.n + s.n);
+    CHECK(recorder.draws.size() == 3 && recorder.draw_modes.size() == 3 && recorder.draw_modes.back() == 4);
+    // and deferred again, the back end's registers brought up to date in full
+    deferred.set_synchronous(false);
+    Words t(ring + 4 * (w.n + s.n));
+    t({type0(reg::RB_MODECONTROL, 1), 5});
+    t({type3(pm4::DRAW_INDX_2, 1), 6u << 16 | 2u << 6 | 8});
+    cp.run(w.n + s.n + t.n);
+    deferred.finish();
+    CHECK(recorder.draws.size() == 4 && recorder.draw_modes.size() == 4 && recorder.draw_modes.back() == 5);
+    cp.set_sink(nullptr);
+}
+
 int main() {
     std::string error;
     auto memory = Memory::create(error);
@@ -549,5 +608,6 @@ int main() {
     trace_player();
     register_stamps();
     occlusion_queries();
+    deferred_sink();
     return finish("command_processor");
 }

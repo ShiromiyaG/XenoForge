@@ -326,6 +326,7 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     case pm4::NOP: reader_.skip(count * 4); return true;
     case pm4::INTERRUPT: {
         uint32_t cpu_mask = reader_.next();
+        sync(SyncFor::Interrupt);
         // the CPU may read the screen extents in its interrupt
         poll_extents(true);
         for (uint32_t n = 0; n < 6; n++)
@@ -354,11 +355,13 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
     }
     case pm4::REG_TO_MEM: {
         uint32_t reg_index = reader_.next(), address = reader_.next();
+        sync(SyncFor::Fence);
         store_swapped(address & ~3u, regs_[reg_index], Endian(address & 3));
         return true;
     }
     case pm4::MEM_WRITE: {
         uint32_t address = reader_.next();
+        sync(SyncFor::Fence);
         for (uint32_t i = 0; i + 1 < count; i++, address += 4)
             store_swapped(address & ~3u, reader_.next(), Endian(address & 3));
         return true;
@@ -485,6 +488,7 @@ void CommandProcessor::write_registers_from_ring(uint32_t base, uint32_t count) 
 }
 
 void CommandProcessor::write_registers_from_memory(uint32_t base, uint32_t address, uint32_t count) {
+    sync(SyncFor::MemoryRead, address, count * 4);
     if (sink_) sink_->memory_read(address & PHYSICAL_MASK, count * 4);
     // (in a row in physical memory, short of its end)
     if (uint64_t(address & PHYSICAL_MASK) + uint64_t(count) * 4 <= PHYSICAL_SIZE) {
@@ -499,7 +503,12 @@ void CommandProcessor::special_register_write(uint32_t index, uint32_t value) {
     if (index - reg::SCRATCH_REG0 < 8) {
         // the scratch registers the mask enables are written back to memory
         uint32_t n = index - reg::SCRATCH_REG0;
-        if ((1u << n) & regs_.get(reg::SCRATCH_UMSK)) store_be32(regs_.get(reg::SCRATCH_ADDR) + n * 4, value);
+        if ((1u << n) & regs_.get(reg::SCRATCH_UMSK)) {
+            const uint32_t address = regs_.get(reg::SCRATCH_ADDR) + n * 4;
+            uint32_t word;
+            put_be32(reinterpret_cast<uint8_t *>(&word), value);
+            fence_write(physical(address), word, address);
+        }
         return;
     }
     // the gamma ramp's write enable mask is blue, green, red; its sequential
@@ -512,6 +521,7 @@ void CommandProcessor::special_register_write(uint32_t index, uint32_t value) {
         break;
     case reg::DC_LUT_RW_INDEX: gamma_component_ = 0; break;
     case reg::DC_LUT_SEQ_COLOR: {
+        sync(SyncFor::Gamma);
         uint32_t rw_index = regs_.get(reg::DC_LUT_RW_INDEX);
         bool write = component_enabled();
         if (write) {
@@ -529,6 +539,7 @@ void CommandProcessor::special_register_write(uint32_t index, uint32_t value) {
         break;
     }
     case reg::DC_LUT_PWL_DATA: {
+        sync(SyncFor::Gamma);
         uint32_t rw_index = regs_.get(reg::DC_LUT_RW_INDEX), pwl_index = rw_index & 0x7F; // bit 7 ignored
         bool write = component_enabled();
         if (write) {
@@ -543,6 +554,7 @@ void CommandProcessor::special_register_write(uint32_t index, uint32_t value) {
         break;
     }
     case reg::DC_LUT_30_COLOR: {
+        sync(SyncFor::Gamma);
         uint32_t rw_index = regs_.get(reg::DC_LUT_RW_INDEX), mask = regs_.get(reg::DC_LUT_WRITE_EN_MASK) & 7;
         if (mask) {
             uint32_t color = regs_.get(reg::DC_LUT_30_COLOR), &entry = gamma_table_[rw_index & 0xFF];
@@ -572,9 +584,13 @@ bool CommandProcessor::wait_reg_mem() {
     for (bool first = true;; first = false) {
         uint32_t value;
         if (is_memory) {
+            if (first) sync(SyncFor::MemoryRead, poll & ~3u, 4);
             if (sink_) sink_->memory_read(poll & ~3u & PHYSICAL_MASK, 4);
             value = load_swapped(poll & ~3u, Endian(poll & 3));
         } else {
+            // (no sync for memory made coherent, D3D's wait after a resolve and before a texture's
+            // use: a sink doing its work later does it in order, and what the CPU reads it reads
+            // after a fence, which syncs)
             if (poll == reg::COHER_STATUS_HOST) make_coherent();
             value = regs_[poll];
         }
@@ -584,6 +600,8 @@ bool CommandProcessor::wait_reg_mem() {
         if (is_memory) bump(counts_.waits_on_memory);
         if (wait >= 0x100) bump(counts_.waits_asleep);
         if (first) {
+            // (what the wait is for may be the sink's work, or the CPU's after it has seen that work)
+            sync(SyncFor::Wait);
             bump(counts_.waiting_packets);
             counts_.last_wait_poll.store((poll & 0x7FFFFFFF) | (is_memory ? 0x80000000u : 0u), std::memory_order_relaxed);
             counts_.last_wait_ref.store(ref, std::memory_order_relaxed);
@@ -601,6 +619,7 @@ bool CommandProcessor::cond_write() {
     uint32_t write_address = reader_.next(), write_data = reader_.next();
     uint32_t value;
     if (wait_info & 0x10) {
+        sync(SyncFor::MemoryRead, poll & ~3u, 4);
         if (sink_) sink_->memory_read(poll & ~3u & PHYSICAL_MASK, 4);
         value = load_swapped(poll & ~3u, Endian(poll & 3));
     } else {
@@ -608,7 +627,7 @@ bool CommandProcessor::cond_write() {
     }
     if (!match(value & mask, ref, wait_info)) return true;
     if (wait_info & 0x100)
-        store_swapped(write_address & ~3u, write_data, Endian(write_address & 3));
+        sync(SyncFor::Fence), store_swapped(write_address & ~3u, write_data, Endian(write_address & 3));
     else
         write_register(write_address, write_data);
     return true;
@@ -628,10 +647,25 @@ bool CommandProcessor::event_write_shd() {
         uint32_t base = regs_.get(reg::WRITEBACK_START), size = regs_.get(reg::WRITEBACK_SIZE);
         if (base && address - base < size) destination = memory_.translate(0x7F000000 + (address - base));
     }
-    put_le32(destination, data);
+    uint32_t word;
+    put_le32(reinterpret_cast<uint8_t *>(&word), data);
+    fence_write(destination, word, address);
+    return true;
+}
+
+// A fence's word (four bytes as stored at where): handed to the sink to write once the work told
+// before it is done, or written now, after the sink has caught up.
+void CommandProcessor::fence_write(uint8_t *where, uint32_t word, uint32_t address) {
+    if (sink_) {
+        Sink::LateWrite w;
+        w.where = where, w.word = word, w.address = address & PHYSICAL_MASK;
+        w.written = &CommandProcessor::wrote_back, w.context = this;
+        if (sink_->write_later(w)) return;
+    }
+    sync(SyncFor::Fence);
+    std::memcpy(where, &word, 4);
     if (sink_) sink_->memory_written(address & PHYSICAL_MASK, 4);
     host_.wrote_back();
-    return true;
 }
 
 // A screen extent event (SCREEN_EXT_RPT): the area the draws since the last

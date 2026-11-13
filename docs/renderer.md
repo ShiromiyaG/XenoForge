@@ -2203,6 +2203,114 @@ would not pay; only fewer uploads would. Push descriptors were not tried: with
 the record ring the binds are the recording thread's, not the command
 thread's.
 
+## The command thread split in two (2026-11-13)
+
+`XF_GPU_BACK_END=1` (off by default until timed live; `src/gpu/deferred_sink.h`).
+Game G's vblank wait is a WAIT_REG_MEM in its own command stream, so its
+frame is the command thread's work rounded up to a vblank: under about 32 ms
+two vblanks, over it three. The thread parsed the packets and also did all
+of the renderer's work for every draw. Now, as Dolphin's dual-core mode and
+RPCS3's RSX thread do (read, never copied), it is two:
+
+- **The front end**, the command processor's thread as before: the packets,
+  the register file, and everything the guest can observe at once: its
+  register and memory writes, MEM_WRITE, REG_TO_MEM, COND_WRITE, interrupts,
+  WAIT_REG_MEM, the read pointer and its write-back, the occlusion and extent
+  reports' first answers.
+- **The back end**, a thread of its own: the renderer's calls (draws,
+  resolves, swaps, shader loads, VIZ queries, the reports' counting, the
+  memory the processor wrote), in the same order, from a ring of 32 MB of
+  records. The renderer's Sink entry points send themselves there
+  (`DeferredSink::passing` tells the back end's calls apart); nothing else in
+  the renderer changed.
+
+**The registers.** The register file lists the blocks of 32 registers its
+writes changed (`RegisterFile::track_blocks`; the CPU's MMIO writes, from
+other threads, mark theirs in a bitmap). Before each record the front end
+puts in the blocks changed since the record before, and the back end writes
+them into a register file of its own, which stamps them as the processor's
+did, so the renderer's memos keyed on `serial`, `state_serial` and
+`foreign_writes` work unchanged. Game G's in-play frame: about 41,800 blocks,
+5.4 MB, for 3,300 draws, 6.4 MB of records in all.
+
+**Shaders.** IM_LOAD's question (`Sink::shader_again`) goes into the ring:
+the front end answers yes at once and copies nothing, and the back end asks
+the renderer, and reads the words from memory itself where the renderer
+does not have them. IM_LOAD_IMMEDIATE's words are in the packet, copied into
+the record.
+
+**Where the front end waits** (`Sink::sync`, called by the processor; the
+reasons are counted, and the line `gpu back end: ...` at the end gives
+them):
+
+- INTERRUPT: the guest's callback may look at anything the GPU did.
+- A WAIT_REG_MEM that does not match at once (what it waits for may be the
+  back end's work, or the CPU's after it has seen that work).
+- MEM_WRITE, REG_TO_MEM and COND_WRITE's write: fences the CPU reads.
+- The gamma ramp about to change (the renderer reads it at its swaps).
+- A memory read by the processor (LOAD_ALU_CONSTANT from memory, a wait's or
+  COND_WRITE's poll): only for the work yet to be done that writes there.
+  The front end works out each resolve's destination from the registers
+  (`resolve::get_info` and `destination_ranges`, as the back end will) and
+  waits only where the read overlaps one, or a fence written later. What a
+  draw's memexport writes is not waited for: the console's command processor
+  does not wait for it either without a fence or a wait before the read.
+- Outside the processor: `drain`, `restore_edram`, the trace writer's
+  snapshots; and while a trace records what the renderer reads
+  (`set_memory_trace`), the calls are passed on at once, in order with the
+  packets.
+
+**Fences written by the back end.** EVENT_WRITE_SHD's word and a scratch
+register's write-back (`Sink::write_later`) are written by the back end
+once everything before them is done, then the processor's `wrote_back` wakes
+what polls them: the console's GPU writes such an event at the end of its
+pipeline, after the draws before it. A wait on one by the processor polls
+until the back end has written it. These were the frame's syncs that cost:
+game G's frame has 8 EVENT_WRITE_SHD and 17 scratch write-backs, and the
+front end waiting at each (and at the 84 waits on COHER_STATUS_HOST, which no
+longer sync: D3D's wait after a resolve, before a texture's use, which the
+back end's order already keeps) left it 15 ms a play of its 22.
+
+**What the back end defers** is what the console's GPU defers: it reads
+vertices, indices, textures and shaders after the command processor has
+moved on. A game reuses that memory after a fence or a wait, where the front
+end waits or the fence is written after the reads. The read pointer is
+written back by the front end as before: it says what the processor has
+read, not what the GPU has drawn, on the console as here.
+
+**With the recording thread** (`XF_RECORD_RING=1`): the two chain, three
+threads: the front end, the back end making the commands, the recording
+thread calling the driver. Neither makes the other unneeded: the back end
+still calls the driver for every draw without the ring, and the ring alone
+leaves the packets and the renderer's work on the command thread. Pictures
+the same either way.
+
+The back end with nothing to do sleeps at once and is woken by the next
+record (`XF_GPU_BACK_END_SPINS=<n>` spins first): spinning 4,096 pauses cost
+all threads a sixth more processor time on a replay for nothing measurable.
+
+Measured, coarsely (xfreplay `--repeat 15` of game G's frame in its town,
+1,485, two rounds; other agents' builds on the machine, 50% busy; the
+command thread's processor time a play, median):
+
+| | the command thread | all threads, a play (the walk and the first play included) |
+| --- | --- | --- |
+| off | 21.8 / 23.5 ms | 332 / 333 ms |
+| `XF_GPU_BACK_END=1` | 9.7 / 9.8 ms (the spinning back end: 345 ms with it sleeping) | 401 / 415 ms |
+| `XF_RECORD_RING=1` | 19.5 / 18.4 ms | 348 / 348 ms |
+| both | 7.9 / 7.9 ms | 401 / 372 ms |
+
+The back end's own work is what the command thread no longer does: a frame
+now takes the longer of the two (the front end catches up at the frame's
+interrupt), not their sum. Pictures byte for byte the same as without it on
+both paths (game G's three town frames and its in-play frame), with the
+recording thread too and with the pipeline memo and the prefetch off; the
+regression passes with it on, both paths; game G ran live with it for 600
+seconds (14,656 swaps, into play) without an error. Its live rate is to be
+timed with the machine quiet: with the back end the `commands:` line of
+`--rates` counts the front end's waits for it, so it no longer gives the
+front end's own work.
+
 ## Texture formats (2026-11-06)
 
 Completed by inventory against Xenia's texture caches

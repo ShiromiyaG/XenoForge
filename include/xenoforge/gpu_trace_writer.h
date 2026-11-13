@@ -102,6 +102,12 @@ public:
     void draw(const RegisterFile &registers, const Draw &draw) override;
     void resolve(const RegisterFile &registers, const Draw &draw) override;
     void swap(const RegisterFile &registers, const Swap &swap) override;
+    void sync(SyncFor why, uint32_t address, uint32_t bytes) override {
+        if (next_) next_->sync(why, address, bytes);
+    }
+    // (a backend writing a fence later does so only while no trace records: it then does its work
+    // at once, and the fence is written by the processor and recorded here)
+    bool write_later(const LateWrite &write) override { return next_ && next_->write_later(write); }
     // occlusion queries: the backend's (counts_samples false without one)
     bool counts_samples() override { return next_ && next_->counts_samples(); }
     void zpd_report(uint64_t ended, uint64_t next) override {

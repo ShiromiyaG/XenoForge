@@ -85,6 +85,7 @@
 #include <unordered_set>
 
 // (last: its macros stand for the driver's vkCmd* functions in what follows)
+#include "gpu/deferred_sink.h"
 #include "record_ring.h"
 
 namespace xf::render {
@@ -1439,6 +1440,7 @@ public:
 
     // ---- the Sink: the processor's calls, on its thread ----
     void shader(uint32_t type, uint32_t address, std::span<const uint32_t> code) override {
+        if (deferring()) return deferred_->shader(type, address, code);
         Call call(*this, nullptr);
         if (!call) return;
         load_shader(type, code);
@@ -1455,6 +1457,7 @@ public:
     // unwritten (memory.h's watches: watched, the count taken, then the
     // copy). Never while a trace is recorded (it wants each load's words).
     bool shader_again(uint32_t type, uint32_t address, uint32_t dwords) override {
+        if (deferring()) return deferred_->shader_again(type, address, dwords);
         Call call(*this, nullptr, true);
         shader_at_open_ = false;
         if (!call || trace_ || type > 1 || !dwords || address + uint64_t(dwords) * 4 > GuestMemory::SIZE) return false;
@@ -1482,6 +1485,7 @@ public:
         return false;
     }
     void draw(const gpu::RegisterFile &registers, const gpu::Draw &d) override {
+        if (deferring()) return deferred_->draw(registers, d);
         Call call(*this, &registers);
         extent_drawn_ = false;
         uint32_t survey = viz_survey_begin();
@@ -1493,21 +1497,30 @@ public:
         viz_survey_ = viz_predicate_ = UINT32_MAX;
     }
     void viz_query(uint32_t id, bool end) override {
+        if (deferring()) return deferred_->viz_query(id, end);
         Call call(*this, nullptr);
         if (call) viz_query_event(id & 63, end);
     }
-    void resolve(const gpu::RegisterFile &registers, const gpu::Draw &) override {
+    void resolve(const gpu::RegisterFile &registers, const gpu::Draw &d) override {
+        if (deferring()) return deferred_->resolve(registers, d);
         Call call(*this, &registers);
         Timer timer(report_.resolve_seconds);
         if (call) resolve();
     }
-    void swap(const gpu::RegisterFile &registers, const gpu::Swap &) override {
+    void swap(const gpu::RegisterFile &registers, const gpu::Swap &s) override {
+        if (deferring()) return deferred_->swap(registers, s);
         Call call(*this, &registers);
         if (call) swap();
     }
+    // the back end's (XF_GPU_BACK_END=1): the processor caught up with where the guest may look
+    void sync(gpu::SyncFor why, uint32_t address, uint32_t bytes) override {
+        if (deferring()) deferred_->sync(why, address, bytes);
+    }
+    bool write_later(const LateWrite &write) override { return deferring() && deferred_->write_later(write); }
     // occlusion queries (gpu::OcclusionQueries::Fast; "occlusion queries" below)
     bool counts_samples() override { return true; }
     void zpd_report(uint64_t ended, uint64_t next) override {
+        if (deferring()) return deferred_->zpd_report(ended, next);
         Call call(*this, nullptr);
         if (call) zpd_report_ended(ended, next);
     }
@@ -1523,6 +1536,7 @@ public:
         return {report_.wait_seconds, report_.textures, report_.submissions, report_.pipelines};
     }
     void extent_init() override {
+        if (deferring()) return deferred_->extent_init();
         Call call(*this, nullptr, true);
         // Between two reports, the draws recorded so far handed to the GPU
         // once there are enough of them: the processor waits for the GPU
@@ -1536,10 +1550,12 @@ public:
         extent_open_ = true, extent_whole_ = false, extent_index_ = UINT32_MAX, extent_margin_ = 0;
     }
     uint64_t extent_report() override {
+        if (deferring()) return deferred_->extent_report();
         Call call(*this, nullptr, true);
         return extent_reported();
     }
     void extent_wait() override {
+        if (deferring()) return deferred_->extent_wait();
         Call call(*this, nullptr);
         if (!call) return;
         uint64_t serial = 0;
@@ -1549,6 +1565,7 @@ public:
         if (serial) wait_serial(serial);
     }
     void extent_poll(std::vector<gpu::Extent> &resolved) override {
+        if (deferring()) return deferred_->extent_poll(resolved);
         std::lock_guard<CallLock> lock(mutex_);
         resolved.insert(resolved.end(), extent_resolved_.begin(), extent_resolved_.end());
         extent_resolved_.clear();
@@ -1558,6 +1575,7 @@ public:
     // which no watch sees, so the watches are told; the mirror's pages and
     // the textures there are loaded again at their next use
     void memory_written(uint32_t address, uint32_t bytes) override {
+        if (deferring()) return deferred_->memory_written(address, bytes);
         Call call(*this, nullptr, true);
         std::vector<Range> &written = draw_lists_.written; // (kept for its room)
         written.clear();
@@ -1567,6 +1585,7 @@ public:
 
     // EDRAM as a trace began, in Xenia's layout (edram.glsl's)
     void restore_edram(std::span<const uint8_t> bytes) override {
+        if (deferring()) deferred_->finish(); // (in order with the draws handed over)
         Call call(*this, nullptr);
         if (bytes.size() != EDRAM_BYTES || !call) return;
         std::fill(owners_.begin(), owners_.end(), nullptr);
@@ -1600,6 +1619,7 @@ public:
         return true;
     }
     void drain() override {
+        if (deferred_) deferred_->finish();
         Call call(*this, nullptr);
         if (call) sync();
         if (pipeline_workers_) pipeline_workers_->wait_all();
@@ -1608,6 +1628,8 @@ public:
 
     // ---- TraceSource: what a trace writer asks ----
     void set_memory_trace(gpu::MemoryTrace *trace) override {
+        // (what the renderer reads recorded in order with the packets: no back end while it is)
+        if (deferred_) deferred_->set_synchronous(trace != nullptr);
         std::lock_guard<CallLock> lock(mutex_);
         trace_ = trace;
     }
@@ -1677,6 +1699,27 @@ private:
     // One of the processor's calls: the renderer's state is its alone while
     // it runs (report() waits), the registers are the processor's as they
     // stand, and its time is counted. False once the device has failed.
+    // XF_GPU_BACK_END=1: the processor's calls handed to the back end's thread, which makes them
+    // again here (DeferredSink::passing on it)
+    std::unique_ptr<gpu::DeferredSink> deferred_;
+    bool deferring() const { return deferred_ && !gpu::DeferredSink::passing(); }
+    static void print_back_end(const gpu::DeferredSink::Stats &s) {
+        static const char *const why[] = {"fence", "interrupt", "wait", "gamma", "memory read"};
+        std::string line;
+        char part[96];
+        for (size_t i = 0; i < size_t(gpu::SyncFor::COUNT); i++) {
+            std::snprintf(part, sizeof(part), "%s%s %llu (%llu waited)", i ? ", " : "", why[i],
+                          (unsigned long long)s.syncs[i], (unsigned long long)s.waited[i]);
+            line += part;
+        }
+        std::fprintf(stderr,
+                     "gpu back end: %llu records, %.1f MB, %llu register blocks, %llu fences written by it; syncs: "
+                     "%s; %llu finishes, %llu waits for room; the front end waited %.1f ms\n",
+                     (unsigned long long)s.records, double(s.bytes) / 1048576.0, (unsigned long long)s.blocks,
+                     (unsigned long long)s.late_writes, line.c_str(), (unsigned long long)s.finishes,
+                     (unsigned long long)s.full, s.wait_seconds * 1e3);
+    }
+
     class Call {
     public:
         // (small: one of the many short calls, timed only with cpu_times_)
@@ -3498,6 +3541,13 @@ private:
 };
 
 Impl::~Impl() {
+    if (deferred_) {
+        // (what the back end has yet to do done, its thread stopped, before anything it uses goes)
+        deferred_->finish();
+        const gpu::DeferredSink::Stats s = deferred_->stats();
+        deferred_.reset();
+        print_back_end(s);
+    }
     if (ring_) {
         // (what the thread has yet to record recorded, the thread stopped)
         ring_->stop();
@@ -4372,6 +4422,10 @@ bool Impl::init(std::string &error) {
         if (own[k]) module_names_[own[k]] = {2, own[k] == fsi_depth_fs_ ? fsi_ : 0u, k + 1};
     if (!init_generic(error)) return false;
     open_storage();
+    // XF_GPU_BACK_END=1: the work of the processor's calls on a thread of its own, the command
+    // processor's thread left with the packets (gpu/deferred_sink.h; off by default until timed live)
+    if (const char *v = std::getenv("XF_GPU_BACK_END"); v && v[0] == '1')
+        deferred_ = std::make_unique<gpu::DeferredSink>(*this, processor_.registers(), mem_);
     return true;
 }
 
@@ -5987,6 +6041,7 @@ uint32_t Impl::fsi_zpd_index() {
 // stored into EDRAM by its holder (which keeps holding it), then the whole
 // buffer read back, waited for.
 bool Impl::snapshot_edram(std::vector<uint8_t> &out) {
+    if (deferred_) deferred_->finish();
     Call call(*this, nullptr);
     if (!call) return false;
     std::map<RenderTarget *, std::vector<uint32_t>> held;
@@ -6013,6 +6068,7 @@ bool Impl::snapshot_edram(std::vector<uint8_t> &out) {
 // together: what a trace records as it begins (Xenia's trace downloads the
 // ranges its GPU wrote, PrepareForTraceDownload)
 void Impl::gpu_memory(std::vector<std::pair<uint32_t, std::vector<uint8_t>>> &out) {
+    if (deferred_) deferred_->finish();
     out.clear();
     Call call(*this, nullptr);
     if (!call) return;

@@ -69,6 +69,8 @@ public:
     static constexpr uint32_t COUNT = xenos::REGISTER_COUNT;
     static constexpr uint32_t BLOCK_SHIFT = 5, BLOCK = 1u << BLOCK_SHIFT;
     RegisterFile() : values_(COUNT, 0), stamps_((COUNT + BLOCK - 1) >> BLOCK_SHIFT, 0) {}
+    RegisterFile(const RegisterFile &) = delete;
+    RegisterFile &operator=(const RegisterFile &) = delete;
     uint32_t operator[](uint32_t index) const { return index < COUNT ? get(index) : 0; }
     uint32_t get(uint32_t index) const {
         return std::atomic_ref<uint32_t>(const_cast<uint32_t &>(values_[index])).load(std::memory_order_relaxed);
@@ -76,6 +78,8 @@ public:
     // from any thread
     void set(uint32_t index, uint32_t value) {
         std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
+        // (marked after the store: whoever takes the mark then reads this value or a later one)
+        if (tracking_) foreign_dirty_[index >> (BLOCK_SHIFT + 6)].fetch_or(1ull << ((index >> BLOCK_SHIFT) & 63));
         foreign_writes_.fetch_add(1, std::memory_order_relaxed);
     }
     // on the command processor's thread
@@ -83,41 +87,46 @@ public:
         if (get(index) == value) return;
         std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
         stamps_[index >> BLOCK_SHIFT] = ++serial_;
+        if (tracking_) mark(index >> BLOCK_SHIFT);
         if (draw_state(index)) state_serial_ = serial_;
         if (index >= 0x4000 && index < 0x4800) float_serial_[(index - 0x4000) >> 10] = serial_;
     }
     // count registers from first, from big-endian words (a packet's, guest
     // memory's); first + count within COUNT. On the command processor's thread.
     void write_big_endian(uint32_t first, const uint8_t *words, uint32_t count) {
-        while (count) {
-            const uint32_t n = std::min(count, BLOCK - (first & (BLOCK - 1)));
-            // The block's words in host order, compared with those held in
-            // one pass (both loops without a branch, for the compiler's
-            // vectors: a scene's constants are most of what a frame's
-            // commands write), and stored only where they differ.
-            uint32_t host[BLOCK];
-            std::memcpy(host, words, 4 * n);
-            uint32_t differs = 0;
-            for (uint32_t k = 0; k < n; k++) {
-                host[k] = __builtin_bswap32(host[k]);
-                differs |= values_[first + k] ^ host[k];
-            }
-            if (differs) {
-                // (the shader constants' blocks hold no register of the draws' state)
-                bool state = false;
-                const bool constants = first >= 0x4000 && first + n <= 0x4910;
-                for (uint32_t k = 0; k < n; k++) {
-                    if (values_[first + k] == host[k]) continue;
-                    if (!constants && draw_state(first + k)) state = true;
-                    std::atomic_ref<uint32_t>(values_[first + k]).store(host[k], std::memory_order_relaxed);
-                }
-                stamps_[first >> BLOCK_SHIFT] = ++serial_;
-                if (state) state_serial_ = serial_;
-                if (first >= 0x4000 && first < 0x4800) float_serial_[(first - 0x4000) >> 10] = serial_;
-            }
-            first += n, words += 4 * n, count -= n;
+        write_run<true>(first, words, count);
+    }
+    // the same from words in host order (a copy of another file's blocks)
+    void write_host(uint32_t first, const uint32_t *words, uint32_t count) {
+        write_run<false>(first, reinterpret_cast<const uint8_t *>(words), count);
+    }
+
+    // The blocks written since they were last taken, for a copy of the file
+    // kept on another thread (gpu/deferred_sink.h): with tracking on, the
+    // processor's writes that changed a value list their block, and the
+    // writes from other threads (set) mark theirs. Set before the processor
+    // runs.
+    void track_blocks(bool on) {
+        tracking_ = on;
+        dirty_.clear();
+        std::fill(dirty_mark_.begin(), dirty_mark_.end(), uint8_t(0));
+        for (auto &w : foreign_dirty_) w.store(0, std::memory_order_relaxed);
+    }
+    bool tracking_blocks() const { return tracking_; }
+    // each block listed since the last take, once (and any marked by other
+    // threads, perhaps again), the lists emptied; on the processor's thread
+    template <class F> void take_blocks(F &&block) {
+        for (uint32_t b : dirty_) dirty_mark_[b] = 0, block(b);
+        dirty_.clear();
+        for (uint32_t w = 0; w < FOREIGN_WORDS; w++) {
+            if (!foreign_dirty_[w].load(std::memory_order_relaxed)) continue;
+            for (uint64_t bits = foreign_dirty_[w].exchange(0, std::memory_order_acquire); bits; bits &= bits - 1)
+                block(w * 64 + uint32_t(__builtin_ctzll(bits)));
         }
     }
+    // the copy's count of the writes from other threads, as the original's
+    // stood (what a sink compares, see foreign_writes)
+    void set_foreign_writes(uint64_t n) { foreign_writes_.store(n, std::memory_order_relaxed); }
     // The serial of the processor's last write that changed a value; whether
     // any of count registers from first changed after a serial (by blocks: a
     // neighbour in the same block counts); the writes from other threads.
@@ -150,10 +159,52 @@ public:
     const uint32_t *data() const { return values_.data(); }
 
 private:
+    static constexpr uint32_t BLOCKS = (COUNT + BLOCK - 1) >> BLOCK_SHIFT, FOREIGN_WORDS = (BLOCKS + 63) / 64;
+    template <bool BigEndian> void write_run(uint32_t first, const uint8_t *words, uint32_t count) {
+        while (count) {
+            const uint32_t n = std::min(count, BLOCK - (first & (BLOCK - 1)));
+            // The block's words in host order, compared with those held in
+            // one pass (both loops without a branch, for the compiler's
+            // vectors: a scene's constants are most of what a frame's
+            // commands write), and stored only where they differ.
+            uint32_t host[BLOCK];
+            std::memcpy(host, words, 4 * n);
+            uint32_t differs = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                if constexpr (BigEndian) host[k] = __builtin_bswap32(host[k]);
+                differs |= values_[first + k] ^ host[k];
+            }
+            if (differs) {
+                // (the shader constants' blocks hold no register of the draws' state)
+                bool state = false;
+                const bool constants = first >= 0x4000 && first + n <= 0x4910;
+                for (uint32_t k = 0; k < n; k++) {
+                    if (values_[first + k] == host[k]) continue;
+                    if (!constants && draw_state(first + k)) state = true;
+                    std::atomic_ref<uint32_t>(values_[first + k]).store(host[k], std::memory_order_relaxed);
+                }
+                stamps_[first >> BLOCK_SHIFT] = ++serial_;
+                if (tracking_) mark(first >> BLOCK_SHIFT);
+                if (state) state_serial_ = serial_;
+                if (first >= 0x4000 && first < 0x4800) float_serial_[(first - 0x4000) >> 10] = serial_;
+            }
+            first += n, words += 4 * n, count -= n;
+        }
+    }
+    void mark(uint32_t block) {
+        if (!dirty_mark_[block]) dirty_mark_[block] = 1, dirty_.push_back(block);
+    }
+
     std::vector<uint32_t> values_;
     std::vector<uint64_t> stamps_; // per block, the serial of the last write that changed a value there
     uint64_t serial_ = 0, state_serial_ = 0, float_serial_[2] = {};
     std::atomic<uint64_t> foreign_writes_{0};
+    // track_blocks: the processor's blocks changed since the last take (listed once each), and the
+    // blocks other threads wrote (a bit each)
+    bool tracking_ = false;
+    std::vector<uint32_t> dirty_;
+    std::vector<uint8_t> dirty_mark_ = std::vector<uint8_t>(BLOCKS, 0);
+    std::array<std::atomic<uint64_t>, FOREIGN_WORDS> foreign_dirty_{};
 };
 
 // A draw as DRAW_INDX and DRAW_INDX_2 give it (VGT_DRAW_INITIATOR's fields);
@@ -195,9 +246,39 @@ struct Extent {
     uint32_t left = 0, top = 0, right = 0, bottom = 0;
 };
 
+// Why the processor asks a sink to have caught up (Sink::sync).
+enum class SyncFor : uint32_t {
+    Fence,      // a write the CPU learns the GPU's progress by: MEM_WRITE, REG_TO_MEM, COND_WRITE's, and
+                // EVENT_WRITE_SHD's and a scratch register's write-back where the sink does not write them later
+    Interrupt,  // INTERRUPT, the guest's callback run next
+    Wait,       // a WAIT_REG_MEM that did not match at once
+    Gamma,      // the display's gamma ramp about to change (the sink reads it at its swaps)
+    MemoryRead, // the processor about to read guest memory the sink's work may write (constants, polls)
+    COUNT
+};
+
 class Sink {
 public:
     virtual ~Sink() = default;
+    // The processor is about to do something after which the guest can see
+    // how far the GPU has come, or to read guest memory (MemoryRead: bytes at
+    // a physical address) the sink's work may write: a sink that does its
+    // work later than it is told (gpu/deferred_sink.h) finishes what it was
+    // told so far first (for a read, what writes there). Others do nothing.
+    virtual void sync(SyncFor /*why*/, uint32_t /*address*/, uint32_t /*bytes*/) {}
+    // A fence's word for guest memory (EVENT_WRITE_SHD's, a scratch
+    // register's write-back), the GPU's progress as the CPU learns it: a sink
+    // doing its work later writes it once everything told before it is done,
+    // as the console's GPU writes such an event at the end of its pipeline,
+    // and returns true; false (the default), the processor writes it now.
+    struct LateWrite {
+        uint8_t *where = nullptr;                 // in guest memory
+        uint32_t word = 0;                        // its four bytes as they are stored
+        uint32_t address = 0;                     // physical, for memory_written
+        void (*written)(void *context) = nullptr; // called after the write: what polls the write-backs woken
+        void *context = nullptr;
+    };
+    virtual bool write_later(const LateWrite & /*write*/) { return false; }
     // a primary (indirect false) or indirect buffer begins or ends
     virtual void buffer_start(bool /*indirect*/, uint32_t /*address*/, uint32_t /*dwords*/) {}
     virtual void buffer_end(bool /*indirect*/) {}
@@ -452,6 +533,12 @@ private:
     void write_registers_from_ring(uint32_t base, uint32_t count);
     void write_registers_from_memory(uint32_t base, uint32_t physical, uint32_t count);
     void make_coherent();
+    void sync(SyncFor why, uint32_t address = 0, uint32_t bytes = 0) {
+        if (sink_) sink_->sync(why, address & 0x1FFFFFFF, bytes); // (physical)
+    }
+    // a fence's word: the sink's to write later, or written now (after a sync)
+    void fence_write(uint8_t *where, uint32_t word, uint32_t address);
+    static void wrote_back(void *self) { static_cast<CommandProcessor *>(self)->host_.wrote_back(); }
     bool wait_reg_mem();
     bool cond_write();
     bool event_write_shd();
