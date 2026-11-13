@@ -542,13 +542,21 @@ void stop_and_report(size_t top) {
 
 #else
 
+#include <sys/resource.h>
+
 namespace xf::sampler {
-// TODO: POSIX (a profiling timer's signal reading the interrupted context)
+// TODO: POSIX sampling (a profiling timer's signal reading the interrupted context). Until then the
+// sampler does not start, and only the process's processor time is reported.
 void scope(const char *) {}
 bool start(unsigned, unsigned long) { return false; }
 unsigned long current_thread() { return 0; }
 void name_generated(const void *const *, const unsigned *, size_t) {}
-double process_cpu_seconds() { return -1; } // TODO: getrusage
+double process_cpu_seconds() {
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) return -1;
+    auto value = [](timeval t) { return double(t.tv_sec) + double(t.tv_usec) * 1e-6; };
+    return value(usage.ru_utime) + value(usage.ru_stime);
+}
 void stop_and_report(size_t) {}
 } // namespace xf::sampler
 

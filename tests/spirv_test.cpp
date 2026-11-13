@@ -25,8 +25,13 @@ bool validates(const std::vector<uint32_t> &words, const char *name, bool expect
     auto path = std::filesystem::temp_directory_path() / name;
     std::ofstream(path, std::ios::binary)
         .write(reinterpret_cast<const char *>(words.data()), std::streamsize(words.size() * 4));
-    std::string command = std::string("\"\"") + XF_SPIRV_VAL + "\" --target-env vulkan1.3 \"" + path.string() + "\"" +
-                          (expected ? "" : " 2>nul") + "\"";
+    std::string command = std::string("\"") + XF_SPIRV_VAL + "\" --target-env vulkan1.3 \"" + path.string() + "\"";
+#ifdef _WIN32
+    // cmd.exe takes the line's first and last quotes away
+    command = "\"" + command + (expected ? "" : " 2>nul") + "\"";
+#else
+    if (!expected) command += " 2>/dev/null";
+#endif
     bool valid = std::system(command.c_str()) == 0;
     if (valid == expected) std::filesystem::remove(path);
     else std::printf("  spirv-val %s %s (kept)\n", valid ? "accepted" : "refused", path.string().c_str());

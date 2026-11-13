@@ -33,8 +33,11 @@ system's exports; linked whole, as they register by static initializers),
 the player), and the executables `::xfrecomp` and `::xfinspect`; plus the
 variable `XENOFORGE_RUNTIME_FILES` (what `xenoforge_add_port` copies beside the
 executables). SDL3, Dear ImGui and toml++ are inside `::player`: a port does
-not fetch them. The package is Windows now; nothing in it blocks Linux (static
-libraries, SDL3's system libraries read from the build that made them).
+not fetch them. The package is built and tested on Windows and, without the
+player, on Linux (2026-11-12: the `sdk` test passes there; the kernel's
+archive names core and the renderer as its dependencies, so a linker that
+reads archives once and in order sees them after it). SDL3's system
+libraries are read from the build that made them.
 
 ## `xenoforge_add_port`
 

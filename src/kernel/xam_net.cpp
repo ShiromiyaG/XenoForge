@@ -438,7 +438,7 @@ uint32_t receive(Kernel &k, Socket &s, const std::vector<Buffer> &buffers, uint3
 
 // ---- fd_set (x_fd_set: a count, 64 handles) ----
 
-constexpr uint32_t FD_SETSIZE = 64;
+constexpr uint32_t GUEST_FD_SETSIZE = 64;
 
 struct SocketSet {
     uint32_t address = 0;
@@ -449,7 +449,7 @@ struct SocketSet {
 bool load_set(Kernel &k, uint32_t address, SocketSet &set) {
     set.address = address;
     if (!address) return true;
-    uint32_t count = std::min(k.load32(address), FD_SETSIZE);
+    uint32_t count = std::min(k.load32(address), GUEST_FD_SETSIZE);
     for (uint32_t i = 0; i < count; i++) {
         Ref<Socket> s = socket_by_handle(k, k.load32(address + 4 + 4 * i));
         if (!s) return false;
@@ -1103,7 +1103,7 @@ XF_EXPORT(xam, NetDll_select) {
 // (socket, x_fd_set *): whether the set names the socket
 XF_EXPORT(xam, NetDll___WSAFDIsSet) {
     uint32_t handle = arg(k, c, 0), set = arg(k, c, 1);
-    uint32_t count = std::min(k.load32(set), FD_SETSIZE);
+    uint32_t count = std::min(k.load32(set), GUEST_FD_SETSIZE);
     for (uint32_t i = 0; i < count; i++)
         if (k.load32(set + 4 + 4 * i) == handle) return result(c, 1);
     result(c, 0);

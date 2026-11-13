@@ -29,8 +29,10 @@ bool validates(const std::vector<uint32_t> &words, const std::string &name) {
     auto path = std::filesystem::temp_directory_path() / ("xenoforge_" + name + ".spv");
     std::ofstream(path, std::ios::binary)
         .write(reinterpret_cast<const char *>(words.data()), std::streamsize(words.size() * 4));
-    std::string command =
-        std::string("\"\"") + XF_SPIRV_VAL + "\" --target-env vulkan1.3 \"" + path.string() + "\"\"";
+    std::string command = std::string("\"") + XF_SPIRV_VAL + "\" --target-env vulkan1.3 \"" + path.string() + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\""; // cmd.exe takes the line's first and last quotes away
+#endif
     bool valid = std::system(command.c_str()) == 0;
     if (valid) std::filesystem::remove(path);
     else std::printf("  spirv-val refused %s (kept)\n", path.string().c_str());

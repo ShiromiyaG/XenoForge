@@ -55,6 +55,9 @@ _xf_static(XenoForge::vk xenoforge_vk)
 set_target_properties(XenoForge::vk PROPERTIES INTERFACE_LINK_LIBRARIES "XenoForge::core;XenoForge::volk")
 
 _xf_static(XenoForge::kernel_archive xenoforge_kernel)
+# the archive's own dependencies, so the link puts it before them: a linker that
+# reads archives once, in order (GNU ld, lld on ELF), finds core's symbols then
+set_target_properties(XenoForge::kernel_archive PROPERTIES INTERFACE_LINK_LIBRARIES "XenoForge::vk;XenoForge::core")
 add_library(XenoForge::kernel INTERFACE IMPORTED)
 set_target_properties(XenoForge::kernel PROPERTIES
     INTERFACE_LINK_LIBRARIES "$<LINK_LIBRARY:WHOLE_ARCHIVE,XenoForge::kernel_archive>;XenoForge::vk;XenoForge::core")

@@ -31,6 +31,7 @@
 #else
 #include <csignal>
 #include <dlfcn.h>
+#include <ucontext.h>
 #endif
 
 namespace xf::kernel {
@@ -429,13 +430,51 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS *e) {
     }
 }
 #else
-void on_signal(int signal, siginfo_t *info, void *) {
-    // TODO: the faulting host pc from the ucontext (REG_RIP, ARM64's pc), to name a generated function
-    const char *kind = signal == SIGSEGV   ? "memory fault at"
+// the faulting host pc, from the interrupted context, to name the generated function it was in
+const void *signal_pc([[maybe_unused]] void *context) {
+#if defined(__linux__) && defined(__x86_64__)
+    return reinterpret_cast<const void *>(static_cast<ucontext_t *>(context)->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__linux__) && defined(__aarch64__)
+    return reinterpret_cast<const void *>(static_cast<ucontext_t *>(context)->uc_mcontext.pc);
+#else
+    return nullptr; // TODO: other POSIX hosts' contexts
+#endif
+}
+
+// What a memory fault was doing, as the Windows handler names it, from the
+// hardware's own report (Xenia's exception_handler_posix.cc reads the same):
+// x86-64's page fault error code (bit 1 a write, bit 4 an instruction fetch),
+// ARM64's ESR (exception class in bits 26-31: 0x20-0x21 an instruction abort,
+// 0x24-0x25 a data abort, whose bit 6 is set for a write). nullptr when the
+// context does not say.
+const char *signal_access([[maybe_unused]] void *context) {
+#if defined(__linux__) && defined(__x86_64__)
+    const uint64_t error = uint64_t(static_cast<ucontext_t *>(context)->uc_mcontext.gregs[REG_ERR]);
+    return error & 0x10 ? "executing" : error & 0x2 ? "writing" : "reading";
+#elif defined(__linux__) && defined(__aarch64__) && defined(ESR_MAGIC)
+    const auto &m = static_cast<ucontext_t *>(context)->uc_mcontext;
+    for (auto *x = reinterpret_cast<const _aarch64_ctx *>(m.__reserved); x->magic && x->size;
+         x = reinterpret_cast<const _aarch64_ctx *>(reinterpret_cast<const uint8_t *>(x) + x->size)) {
+        if (x->magic != ESR_MAGIC) continue;
+        const uint64_t esr = reinterpret_cast<const esr_context *>(x)->esr, kind = esr >> 26 & 0x3E;
+        if (kind == 0x20) return "executing";
+        if (kind == 0x24) return esr & (1u << 6) ? "writing" : "reading";
+        return nullptr;
+    }
+    return nullptr;
+#else
+    return nullptr;
+#endif
+}
+
+void on_signal(int signal, siginfo_t *info, void *context) {
+    const char *access = signal == SIGSEGV ? signal_access(context) : nullptr;
+    const char *kind = access              ? access
+                       : signal == SIGSEGV ? "memory fault at"
                        : signal == SIGBUS  ? "bus error at"
                        : signal == SIGILL  ? "illegal host instruction at"
                                            : "host arithmetic fault at";
-    crash(access_text(kind, uint64_t(uintptr_t(info->si_addr))), nullptr);
+    crash(access_text(kind, uint64_t(uintptr_t(info->si_addr))), signal_pc(context));
 }
 #endif
 

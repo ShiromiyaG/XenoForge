@@ -161,9 +161,40 @@ template <class T> XF_INLINE constexpr T rotl(T x, int s) {
     else
         return __builtin_rotateleft8(x, uint8_t(s));
 }
+#if __has_builtin(__builtin_clzg)
 template <class T> XF_INLINE constexpr int countl_zero(T x) { return __builtin_clzg(x, int(sizeof(T) * 8)); }
 template <class T> XF_INLINE constexpr int countr_zero(T x) { return __builtin_ctzg(x, int(sizeof(T) * 8)); }
 template <class T> XF_INLINE constexpr int popcount(T x) { return __builtin_popcountg(x); }
+#else
+// clang before 19 (a Linux distribution's) has only the sized builtins; the value is taken as
+// unsigned of its own width, so a narrow signed one is not sign-extended
+template <class T> XF_INLINE constexpr int countl_zero(T x) {
+    constexpr int bits = int(sizeof(T) * 8);
+    if constexpr (sizeof(T) == 8) {
+        uint64_t v = uint64_t(x);
+        return v ? __builtin_clzll(v) : 64;
+    } else {
+        uint32_t v = uint32_t(x) & (~0u >> (32 - bits));
+        return v ? __builtin_clz(v) - (32 - bits) : bits;
+    }
+}
+template <class T> XF_INLINE constexpr int countr_zero(T x) {
+    constexpr int bits = int(sizeof(T) * 8);
+    if constexpr (sizeof(T) == 8) {
+        uint64_t v = uint64_t(x);
+        return v ? __builtin_ctzll(v) : 64;
+    } else {
+        uint32_t v = uint32_t(x) & (~0u >> (32 - bits));
+        return v ? __builtin_ctz(v) : bits;
+    }
+}
+template <class T> XF_INLINE constexpr int popcount(T x) {
+    if constexpr (sizeof(T) == 8)
+        return __builtin_popcountll(uint64_t(x));
+    else
+        return __builtin_popcount(uint32_t(x) & (~0u >> (32 - int(sizeof(T) * 8))));
+}
+#endif
 
 XF_INLINE void *memcpy(void *to, const void *from, size_t n) { return __builtin_memcpy(to, from, n); }
 XF_INLINE void *memset(void *to, int value, size_t n) { return __builtin_memset(to, value, n); }
@@ -245,6 +276,20 @@ XF_INLINE double fma(double a, double b, double c) { return runtime.fma(a, b, c)
 XF_INLINE float fma(float a, float b, float c) { return runtime.fmaf(a, b, c); }
 #endif
 XF_INLINE double trunc(double v) { return __builtin_trunc(v); }
+// A fused multiply-add's result, kept from being folded into a negation that
+// follows. On ARM64 clang (18 and 23 alike) turns -fma(a, b, c) into one
+// fnmadd, which negates the operands before the fused add, (-a)b + (-c): an
+// exact zero sum then comes out +0, where the PPC's fnmadd, fnmsub and
+// vnmsubfp negate the rounded result and give -0 (Xenia's tests; found under
+// qemu). An empty asm that keeps the value in its register stops the fold, at
+// the cost of the separate fneg; nothing on x86-64, where clang leaves the
+// negation alone.
+template <class T> XF_INLINE T unfused(T v) {
+#if defined(__aarch64__) && (defined(__clang__) || defined(__GNUC__))
+    __asm__("" : "+w"(v));
+#endif
+    return v;
+}
 
 // what the C library does: the host's own, through the runtime's table in a
 // game library

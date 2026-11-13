@@ -160,7 +160,13 @@ added to its base; loads and stores swap bytes.
   result moves one double ulp toward it before the rounding to single (an
   exact tie stays: ties to even). Checked against the slow path on 8.5
   million ties (4 million exact) at v3 and v2, all equal; a game's start
-  sent 9 million fmadds a run to the slow path on ties before. Rc forms keep FPSCR's exception and status
+  sent 9 million fmadds a run to the slow path on ties before. The negated
+  forms (`fnmadd`, `fnmsub`, `vnmsubfp`) negate the rounded result, so an
+  exact zero sum comes out -0; on ARM64 clang folds `-fma(a, b, c)` into
+  `fnmadd`, which negates the operands before the add and gives +0, so the
+  result passes through `lib::unfused` (an empty asm on ARM64, nothing on
+  x86-64) before its negation (found by the first run under qemu,
+  2026-11-12: 80 of Xenia's cases). Rc forms keep FPSCR's exception and status
   bits and copy them to CR1; compares set FPCC. The console wins over Xenia:
   the default NaN 0x7FF8000000000000, NaNs in A, B, C order, quieted, not
   negated by `fnm*`; fused single forms round once; `fctiw` of a NaN gives

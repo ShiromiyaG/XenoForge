@@ -97,7 +97,7 @@ template <bool J = false> inline uint32_t madd(uint32_t a, uint32_t b, uint32_t 
 template <bool J = false> inline uint32_t nmsub(uint32_t a, uint32_t b, uint32_t c) {
     a = flush_j<J>(a), b = flush_j<J>(b), c = flush_j<J>(c);
     if (is_nan(a) || is_nan(b) || is_nan(c)) return quiet(is_nan(a) ? a : is_nan(b) ? b : c);
-    return result<J>(-lib::fma(flt(a), flt(c), -flt(b)));
+    return result<J>(-lib::unfused(lib::fma(flt(a), flt(c), -flt(b))));
 }
 // vmaxfp/vminfp: +0 above -0; a NaN operand comes out quieted, vA's first
 // (Xenia passes a signaling NaN through unchanged; the console tests quiet it)
@@ -193,7 +193,7 @@ template <bool J = false> inline Vec128 nmsub4(const Vec128 &a, const Vec128 &b,
     const U4 x = flush4(load4(a)), y = flush4(load4(b)), z = flush4(load4(c));
     if (any_nan4(x) || any_nan4(y) || any_nan4(z)) [[unlikely]]
         return lanes(a, b, c, nmsub<false>);
-    return store4(result4(-fma4(F4(x), F4(z), -F4(y))));
+    return store4(result4(-lib::unfused(fma4(F4(x), F4(z), -F4(y)))));
 }
 
 // the greater, +0 above -0 (max above); the lesser, -0 below +0 (min above)

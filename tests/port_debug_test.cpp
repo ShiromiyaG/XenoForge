@@ -146,7 +146,7 @@ void owners() {
 
 // ---- the guest paused ----
 
-void pause() {
+void paused() {
     KernelHarness h;
     CHECK(h.init());
     kernel::Kernel &k = *h.k;
@@ -230,7 +230,7 @@ int main() {
     frames();
     stats();
     owners();
-    pause();
+    paused();
     module();
     return finish("port_debug");
 }

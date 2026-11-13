@@ -56,6 +56,9 @@
 #include <thread>
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__linux__)
+#include <sys/uio.h>
+#include <unistd.h>
 #endif
 
 namespace xf::kernel {
@@ -694,8 +697,18 @@ bool readable(const uint8_t *p, size_t size) {
             return false;
         p = static_cast<const uint8_t *>(info.BaseAddress) + info.RegionSize;
     }
+#elif defined(__linux__)
+    // the kernel reads the range for us and answers EFAULT where a page is not
+    // there or not readable, without a fault in this process
+    static thread_local uint8_t scratch[65536];
+    for (size_t done = 0; done < size;) {
+        const size_t n = std::min(size - done, sizeof(scratch));
+        iovec local{scratch, n}, remote{const_cast<uint8_t *>(p + done), n};
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != ssize_t(n)) return false;
+        done += n;
+    }
 #else
-    (void)p, (void)size;
+    (void)p, (void)size; // TODO: other POSIX hosts (the guest's mappings are read-write there)
 #endif
     return true;
 }

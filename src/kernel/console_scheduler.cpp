@@ -101,6 +101,10 @@ struct Processor {
     std::atomic<uint64_t> running_since{0};
     std::atomic<bool> preempt{false};
     void *host_handle = nullptr; // for its CPU time in the report (Windows)
+#ifndef _WIN32
+    clockid_t host_clock{}; // the same on POSIX: its thread's CPU clock
+    bool host_clock_set = false;
+#endif
 };
 
 thread_local Processor *on_processor = nullptr;
@@ -361,6 +365,10 @@ public:
                 auto value = [](FILETIME f) { return double(uint64_t(f.dwHighDateTime) << 32 | f.dwLowDateTime) * 1e-7; };
                 cpu = value(kernel) + value(user);
             }
+#else
+            timespec t{};
+            if (p.host_clock_set && clock_gettime(p.host_clock, &t) == 0)
+                cpu = double(t.tv_sec) + double(t.tv_nsec) * 1e-9;
 #endif
             std::snprintf(line, sizeof(line), " %u: %zu threads, %.1f s;", p.index, p.entries.size(), cpu);
             out += line;
@@ -470,6 +478,7 @@ private:
 #if defined(__linux__) || defined(__ANDROID__)
             pthread_setname_np(pthread_self(), name);
 #endif
+            p.host_clock_set = pthread_getcpuclockid(pthread_self(), &p.host_clock) == 0;
         }
 #endif
         std::unique_lock<std::mutex> l(o_.lock);

@@ -395,7 +395,8 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     std::printf("settings: %s%s\n", config_file.string().c_str(),
                 settings.game.empty() ? "" : (std::string(" (the game's own, ") + title_id + ")").c_str());
     std::filesystem::path key_shots =
-        settings.screenshots.empty() ? config_file.parent_path() / "screenshots" : settings.screenshots;
+        settings.screenshots.empty() ? config_file.parent_path() / "screenshots"
+                                     : std::filesystem::path(settings.screenshots);
 
     // the window: the game's name and image (its executable's XDBF), else the port's name or the title ID and
     // XenoForge's mark

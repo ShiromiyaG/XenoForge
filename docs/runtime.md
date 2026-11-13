@@ -3071,8 +3071,76 @@ static run between them did not; not seen again in eight runs under a
 build's load since. The cache belongs on the system drive, as its default
 (`%LOCALAPPDATA%`) has it.
 
-Left: the Linux side (`.so`, `posix_spawn`, `ld.lld`) is written but not built
-or run; title updates (D3).
+Left: title updates (D3). The Linux side (`.so`, `posix_spawn`, `ld.lld`)
+was first built and run on 2026-11-12 ("Other hosts").
+
+## Other hosts (2026-11-12)
+
+The tree was built and its tests run on Linux for the first time (Ubuntu
+24.04 under WSL2, x86-64, its own clang 18 and lld), and the CPU's part on
+ARM64 (cross-compiled, run under qemu-user).
+
+**Linux x86-64.** Everything builds with
+`cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++`
+(`-DXF_PLAYER=ON` too: SDL3 finds X11 and Wayland; the player and the
+launcher build and the frontend tests pass; neither was run with a window),
+and ctest passes but for `shader_compare`, which runs on Mesa's software
+Vulkan there (lavapipe, the only device under WSL2): it differs from the
+CPU on denormal results and does not finish in 300 s; a driver's
+difference, not the port's. What it took:
+- clang before 19 lacks `__builtin_clzg`, `__builtin_ctzg` and
+  `__builtin_popcountg`: `ppc_runtime.h` falls back to the sized builtins
+  (the same instructions);
+- names the C library defines (`FD_SETSIZE` as a macro, `pause()`), a
+  missing `<utility>`, a conditional between a path and a string (both
+  convert to each other where a path is narrow), and `port_gen`'s output
+  directory, which had the program's own path without an `.exe`;
+- the SDK's imported kernel archive lists core and the renderer as its own
+  dependencies, so a linker that reads archives once, in order (GNU ld,
+  lld on ELF), sees them after it;
+- the tests' `spirv-val` command lines were cmd.exe's quoting;
+- the crash report names the faulting host pc (the ucontext's RIP, ARM64's
+  pc) and the access (x86-64's page fault error code, ARM64's ESR), as on
+  Windows;
+- XMA's recorder checks that a buffer is readable with `process_vm_readv`;
+  the console scheduler reports each processor's time from its thread's CPU
+  clock; the sampler's process time comes from `getrusage`.
+
+**What stays Windows only**, and why:
+- the deterministic scheduler's forced hand-over (`Deterministic::force_after_ms`):
+  it stops a spinning guest thread with `SuspendThread`, moves it to a
+  handover with `SetThreadContext`, and puts every register back later
+  with `RtlRestoreContext`. On POSIX it needs a signal whose handler
+  saves the whole context (the vector registers' upper halves included)
+  and a second signal to restore it; not straightforward, so a run there
+  that spins without a kernel call does not hand over;
+- the sampling profiler (`--profile`, `tools/sampler.cpp`): it walks
+  suspended threads' stacks with dbghelp; POSIX needs a profiling timer's
+  signal and its own unwinder;
+- `xfbench` and its hook (Xenia's own benchmark is Windows only);
+- XAM's oracle (`xfxam`, Xenia's Windows build).
+
+**The recompile step on Linux.** `xfbuild` built game B's disc into an ELF
+`.so` (`--jobs 2`, 108 files, 70.3 MB, 18 minutes beside other work) with
+the distribution's clang and `ld.lld`. The generic `boot` loads it and runs
+the game headless on generated code alone (30 s: 1,110 swaps, no
+interpreted entries, the sound decoded through the FFmpeg built from
+source), and the deterministic run to swap 1,200 leaves the guest memory
+hash it leaves on Windows (`5a14b74fff15d4a9`, 87,444 runs, no hand-over
+forced): the same guest work on another OS, C library and compiler.
+
+**ARM64.** `cmake/toolchains/aarch64-linux-gnu.cmake` cross-compiles with
+clang and the distribution's cross libstdc++ (`g++-aarch64-linux-gnu`), and
+runs what the build itself runs (`xfrecomp`, `xffuzz`) and the tests under
+`qemu-aarch64`. The first run of `lib::FpEnv`'s FPCR and FPSR path and of
+the ARM64 level: `ppc_test` (interpreted) and `ppc_recompiled_test` pass
+what they pass on x86-64 (141,705 cases, none failed) and `ppc_fuzz_test`
+finds no difference between the two (5,303 cases). It took one fix: clang
+folds `-fma(a, b, c)` into ARM64's `fnmadd`, which negates the operands
+before the fused add, so an exact zero result came out +0 where the PPC's
+`fnmadd`/`fnmsub` give -0 (80 of Xenia's cases); `lib::unfused` keeps the
+negation apart (docs/recompiler.md, "Floating point").
+Not tried on ARM64 yet: the kernel, the game library, the renderer.
 
 ## Order
 

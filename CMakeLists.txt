@@ -299,15 +299,17 @@ set_tests_properties(kernel_exceptions PROPERTIES TIMEOUT 120)
 # with its project file, run generated and interpreted
 add_executable(port_gen tests/port_gen.cpp)
 target_link_libraries(port_gen PRIVATE xenoforge)
+# (its output directory is not named port_gen: without an .exe suffix that is the program's own path)
 add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp
-    COMMAND port_gen ${CMAKE_CURRENT_BINARY_DIR}/port_gen
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/port_gen_out/m/functions_0.cpp
+           ${CMAKE_CURRENT_BINARY_DIR}/port_gen_out/m/table.cpp
+    COMMAND port_gen ${CMAKE_CURRENT_BINARY_DIR}/port_gen_out
     DEPENDS port_gen
     COMMENT "port_gen")
-set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp
-                            ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp PROPERTIES COMPILE_OPTIONS "-O1;-g0;-w")
-add_executable(port_test tests/port_test.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/functions_0.cpp
-                         ${CMAKE_CURRENT_BINARY_DIR}/port_gen/m/table.cpp)
+set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/port_gen_out/m/functions_0.cpp
+                            ${CMAKE_CURRENT_BINARY_DIR}/port_gen_out/m/table.cpp PROPERTIES COMPILE_OPTIONS "-O1;-g0;-w")
+add_executable(port_test tests/port_test.cpp ${CMAKE_CURRENT_BINARY_DIR}/port_gen_out/m/functions_0.cpp
+                         ${CMAKE_CURRENT_BINARY_DIR}/port_gen_out/m/table.cpp)
 target_include_directories(port_test PRIVATE tests)
 target_link_libraries(port_test PRIVATE xenoforge_kernel xenoforge)
 add_test(NAME port COMMAND port_test)

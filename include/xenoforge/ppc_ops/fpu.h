@@ -269,7 +269,7 @@ inline double fp_arith_core(uint32_t fpscr, uint32_t op, bool rc, double a, doub
         if (rc) env.round(lib::ROUND_ZERO), rz = double(float(d));
     }
     env.end();
-    if (kind == FP_NMADD || kind == FP_NMSUB) r = -r, rz = -rz;
+    if (kind == FP_NMADD || kind == FP_NMSUB) r = -lib::unfused(r), rz = -lib::unfused(rz);
     if ((fpscr & FPSCR_NI) && r != 0 && lib::fabs(r) < (single ? 0x1p-126 : 0x1p-1022)) {
         r = rz = lib::copysign(0.0, r);
         flags |= lib::EXCEPT_UNDERFLOW | lib::EXCEPT_INEXACT;
@@ -366,7 +366,7 @@ XF_FP_BINARY(fdivsx, FP_DIV | FP_SINGLE, double(float(a / b)), FRB)
 // frD <- +-((frA x frC) +- frB), one rounding
 #define XF_FP_FUSED(name, kind, sign, addend)                                                                          \
     XF_OP(name) {                                                                                                      \
-        double a = c.f[i.A.FRA], b = c.f[i.A.FRB], cc = c.f[i.A.FRC], d = lib::fma(a, cc, addend);                     \
+        double a = c.f[i.A.FRA], b = c.f[i.A.FRB], cc = c.f[i.A.FRC], d = lib::unfused(lib::fma(a, cc, addend));       \
         bool tie = (kind) & FP_SINGLE && fp_single_tie(d);                                                             \
         if (tie) [[unlikely]]                                                                                          \
             tie = !fp_single_untie(a, cc, addend, d);                                                                  \
