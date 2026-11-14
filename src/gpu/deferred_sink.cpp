@@ -90,7 +90,9 @@ uint8_t *DeferredSink::reserve(Kind kind, uint32_t bytes) {
     const size_t offset = at & (RING - 1);
     uint64_t need = size;
     if (offset + size > RING) need += RING - offset;
-    if (at + need - done_.load(std::memory_order_acquire) > RING) {
+    // (done_ read again only where the last value read leaves no room: its line stays the back
+    // end's, which stores it at every record)
+    if (at + need - done_seen_ > RING && at + need - (done_seen_ = done_.load(std::memory_order_acquire)) > RING) {
         stats_.full++;
         wait_done(at + need - RING, nullptr, WAIT_FULL);
     }
@@ -123,31 +125,44 @@ void DeferredSink::push(Kind kind, const void *payload, uint32_t bytes) {
 void DeferredSink::push_registers() {
     // the blocks written since the last record (all of them after a time synchronous); a block's
     // registers as they stand now, which is what the processor's calls would have seen
-    std::vector<uint32_t> &blocks = blocks_;
+    // A block goes as its number, a mask of the registers in it sent (bit k: its register k) and
+    // their values in order: the registers the processor changed since the last record, all of
+    // them for a block another thread wrote (or after a time synchronous). Game G's town changes
+    // about 4 of a block's 32 registers a record: whole blocks were six times the bytes, copied
+    // by the front end and compared again by the back end. XF_SPARSE_BLOCKS=0: whole blocks.
+    std::vector<BlockBits> &blocks = blocks_;
     blocks.clear();
+    uint32_t words = 0;
     if (resync_) {
-        front_.take_blocks([](uint32_t) {});
+        front_.take_blocks([](uint32_t, uint32_t) {});
         for (uint32_t b = 0; b < (RegisterFile::COUNT + RegisterFile::BLOCK - 1) / RegisterFile::BLOCK; b++)
-            blocks.push_back(b);
+            blocks.push_back({b, RegisterFile::block_bits(b)});
         resync_ = false;
     } else {
-        front_.take_blocks([&](uint32_t b) { blocks.push_back(b); });
+        front_.take_blocks([&](uint32_t b, uint32_t bits) { blocks.push_back({b, sparse_blocks_ ? bits : ~0u}); });
     }
+    for (BlockBits &b : blocks) words += uint32_t(__builtin_popcount(b.bits &= RegisterFile::block_bits(b.block)));
     const uint64_t foreign = front_.foreign_writes();
     if (blocks.empty() && foreign == foreign_sent_) return;
     foreign_sent_ = foreign;
-    const uint32_t each = 4 + RegisterFile::BLOCK * 4;
-    uint8_t *p = reserve(Kind::Blocks, 8 + uint32_t(blocks.size()) * each);
+    uint8_t *p = reserve(Kind::Blocks, 8 + uint32_t(blocks.size()) * 8 + words * 4);
     std::memcpy(p, &foreign, 8);
     p += 8;
     const uint32_t *values = front_.data();
-    for (uint32_t b : blocks) {
-        const uint32_t first = b * RegisterFile::BLOCK;
-        const uint32_t n = std::min(RegisterFile::BLOCK, RegisterFile::COUNT - first);
-        std::memcpy(p, &b, 4);
+    for (const BlockBits &b : blocks) {
+        const uint32_t *from = values + b.block * RegisterFile::BLOCK;
+        std::memcpy(p, &b, 8);
+        p += 8;
         // (relaxed loads in effect: the CPU's MMIO may write one meanwhile, and its mark brings it again)
-        std::memcpy(p + 4, values + first, n * 4);
-        p += each;
+        if (b.bits == ~0u) {
+            std::memcpy(p, from, RegisterFile::BLOCK * 4);
+            p += RegisterFile::BLOCK * 4;
+        } else {
+            for (uint32_t m = b.bits; m; m &= m - 1, p += 4) {
+                const uint32_t v = __atomic_load_n(from + __builtin_ctz(m), __ATOMIC_RELAXED);
+                std::memcpy(p, &v, 4);
+            }
+        }
     }
     stats_.blocks += blocks.size();
     commit();
@@ -448,9 +463,17 @@ void DeferredSink::run() {
     back_cpu_.bind_current();
     gpu_back_end_os_thread.store(back_cpu_.os_id());
     uint64_t at = 0;
+    uint32_t fenced = 0;
     for (;;) {
         uint64_t written = written_.load(std::memory_order_acquire);
         if (at == written) {
+            // (relaxed: a sleeper the records' looks missed is woken before the back end waits)
+            if (ring_relaxed_) {
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (at >= wanted_.load(std::memory_order_seq_cst) &&
+                    wanted_.exchange(UINT64_MAX, std::memory_order_seq_cst) != UINT64_MAX)
+                    done_.notify_all();
+            }
             // nothing to do: a spin, then a sleep until the front end hands more over
             for (uint32_t spins = 0; spins < back_spins() && at == written; spins++) {
                 pause();
@@ -487,11 +510,24 @@ void DeferredSink::run() {
                 }
             }
             at += aligned(sizeof(Header) + h.bytes);
-            done_.store(at, std::memory_order_seq_cst);
-            // the sleepers woken once the position the lowest of them waits for is done
-            if (at >= wanted_.load(std::memory_order_seq_cst) &&
-                wanted_.exchange(UINT64_MAX, std::memory_order_seq_cst) != UINT64_MAX)
-                done_.notify_all();
+            // the sleepers woken once the position the lowest of them waits for is done. A full
+            // fence between done_'s store and wanted_'s load (a sleeper puts wanted_, then reads
+            // done_) at every record cost the back end a twelfth of its time: the fence waits for
+            // the draw's write-combined uploads to leave. Relaxed, a sleeper that put wanted_ as
+            // done_ was stored is seen at a later record's look, at the latest at the fenced one
+            // every 16 records or before the back end sleeps.
+            if (ring_relaxed_) {
+                done_.store(at, std::memory_order_release);
+                if ((++fenced & 15) == 0) std::atomic_thread_fence(std::memory_order_seq_cst);
+                if (at >= wanted_.load(std::memory_order_relaxed) &&
+                    wanted_.exchange(UINT64_MAX, std::memory_order_seq_cst) != UINT64_MAX)
+                    done_.notify_all();
+            } else {
+                done_.store(at, std::memory_order_seq_cst);
+                if (at >= wanted_.load(std::memory_order_seq_cst) &&
+                    wanted_.exchange(UINT64_MAX, std::memory_order_seq_cst) != UINT64_MAX)
+                    done_.notify_all();
+            }
             const uint64_t now = FastClock::now();
             back_busy_.store(back_busy_.load(std::memory_order_relaxed) + (now - busy_from), std::memory_order_relaxed);
             busy_from = now;
@@ -505,15 +541,18 @@ void DeferredSink::handle(Kind kind, const uint8_t *p, uint32_t bytes) {
     case Kind::Blocks: {
         uint64_t foreign;
         std::memcpy(&foreign, p, 8);
-        const uint32_t each = 4 + RegisterFile::BLOCK * 4;
-        for (const uint8_t *q = p + 8, *end = p + bytes; q < end; q += each) {
-            uint32_t b;
-            std::memcpy(&b, q, 4);
-            const uint32_t first = b * RegisterFile::BLOCK;
+        for (const uint8_t *q = p + 8, *end = p + bytes; q < end;) {
+            BlockBits b;
+            std::memcpy(&b, q, 8);
+            q += 8;
             // (the words read where the ring holds them: a record's payload, and so each block's
             // words, lies on a word's boundary)
-            copy_.write_host(first, reinterpret_cast<const uint32_t *>(q + 4),
-                             std::min(RegisterFile::BLOCK, RegisterFile::COUNT - first));
+            const uint32_t *values = reinterpret_cast<const uint32_t *>(q);
+            if (b.bits == ~0u)
+                copy_.write_host(b.block * RegisterFile::BLOCK, values, RegisterFile::BLOCK);
+            else
+                copy_.write_sparse(b.block, b.bits, values);
+            q += 4 * __builtin_popcount(b.bits);
         }
         copy_.set_foreign_writes(foreign);
         break;

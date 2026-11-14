@@ -14,6 +14,7 @@
 namespace xf {
 
 std::atomic<unsigned long> gpu_back_end_os_thread{0};
+std::atomic<unsigned long> gpu_recording_os_thread{0};
 
 ThreadCpu::~ThreadCpu() {
 #ifdef _WIN32

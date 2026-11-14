@@ -3900,6 +3900,38 @@ private:
     // write mask) and those its depth test reads
     void fsi_color_tiles(const FsiConstants &f, TileSet &tiles) const;
     void fsi_depth_tiles(const FsiConstants &f, TileSet &tiles) const;
+    // A draw's own tiles, its color targets' and its depth test's, kept for
+    // the next draw with the same reach and targets (most of a pass's draws:
+    // each walk of the tiles' rows was an eighth of the back end's time on
+    // game G's town). XF_FSI_TILES_MEMO=0 walks them at every draw.
+    struct FsiTiles {
+        bool valid = false;
+        std::vector<Reach> reach;
+        uint32_t msaa = 0, pitch = 0, depth_base = 0, tile_dwords = 0, rt[4] = {}, rt_base[4] = {};
+        TileSet drawn, read;
+    } fsi_tiles_;
+    bool fsi_tiles_memo_ = [] {
+        const char *v = std::getenv("XF_FSI_TILES_MEMO");
+        return !(v && v[0] == '0');
+    }();
+    const FsiTiles &fsi_draw_tiles(const FsiConstants &f) {
+        FsiTiles &m = fsi_tiles_;
+        uint32_t rt[4];
+        for (uint32_t i = 0; i < 4; i++) rt[i] = f.rt[i] & 0x1FF; // written, write mask, format
+        if (fsi_tiles_memo_ && m.valid && m.msaa == (f.flags & 3) && m.pitch == f.pitch &&
+            m.depth_base == f.depth_base && m.tile_dwords == tile_dwords_ && !std::memcmp(m.rt, rt, sizeof(rt)) &&
+            !std::memcmp(m.rt_base, f.rt_base, sizeof(m.rt_base)) && m.reach.size() == reach_.size() &&
+            (reach_.empty() || !std::memcmp(m.reach.data(), reach_.data(), reach_.size() * sizeof(Reach))))
+            return m;
+        m.valid = true, m.msaa = f.flags & 3, m.pitch = f.pitch, m.depth_base = f.depth_base;
+        m.tile_dwords = tile_dwords_;
+        std::memcpy(m.rt, rt, sizeof(rt)), std::memcpy(m.rt_base, f.rt_base, sizeof(m.rt_base));
+        m.reach.assign(reach_.begin(), reach_.end());
+        m.drawn = {}, m.read = {};
+        fsi_color_tiles(f, m.drawn);
+        fsi_depth_tiles(f, m.read);
+        return m;
+    }
     VkShaderModule fsi_depth_fs_ = VK_NULL_HANDLE; // depth and stencil alone (no pixel shader)
     // Beyond Xenia: depth alone without the interlock (edram_fsi.glsl's
     // xf_fsi_depth_unordered), for runs of draws without a pixel shader that
@@ -11696,11 +11728,8 @@ void Impl::draw(const gpu::Draw &d) {
             const bool raised = same_pass && fsi_pass_.raised, lowered = same_pass && fsi_pass_.lowered;
             const uint32_t mode = !(fn & 4) && !raised ? 1 : !(fn & 1) && !lowered ? 2 : 0;
             if (keeps && mode) {
-                TileSet color, read;
-                if (same_pass) color = fsi_pass_.color;
-                fsi_color_tiles(fsi_constants, color);
-                fsi_depth_tiles(fsi_constants, read);
-                if (!color.meets(read)) {
+                const FsiTiles &tiles = fsi_draw_tiles(fsi_constants);
+                if (!tiles.read.meets(tiles.drawn) && !(same_pass && tiles.read.meets(fsi_pass_.color))) {
                     fsi_constants.scale[2] = mode;
                     use("interlock draws rejecting before the shader");
                 }
@@ -11866,7 +11895,7 @@ void Impl::draw(const gpu::Draw &d) {
         const uint32_t fn = (fsi_constants.flags / FSI_DEPTH_LESS) & 7;
         if ((fsi_constants.flags & FSI_DEPTH_STENCIL) && (fsi_constants.flags & FSI_DEPTH_WRITE))
             fsi_pass_.raised |= (fn & 4) != 0, fsi_pass_.lowered |= (fn & 1) != 0;
-        fsi_color_tiles(fsi_constants, fsi_pass_.color);
+        fsi_pass_.color.add(fsi_draw_tiles(fsi_constants).drawn);
     }
     XF_DRAW_SECTION(Pass);
     if (pipe != bound_pipeline_) {

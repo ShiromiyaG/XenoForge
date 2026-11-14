@@ -149,17 +149,36 @@ class DeferredSink final : public Sink {
     RegisterFile copy_; // the back end's
     bool synchronous_ = false, resync_ = true;
     uint64_t foreign_sent_ = UINT64_MAX;
-    std::vector<uint32_t> blocks_; // push_registers's
+    // a register block in a Blocks record: its number and the registers in it sent, a bit each
+    struct BlockBits {
+        uint32_t block, bits;
+    };
+    std::vector<BlockBits> blocks_; // push_registers's
+    const bool sparse_blocks_ = [] {
+        const char *v = std::getenv("XF_SPARSE_BLOCKS");
+        return !(v && v[0] == '0');
+    }();
 
     static constexpr size_t RING = size_t(32) << 20; // bytes, a power of two
     std::unique_ptr<uint8_t[]> ring_;
     // byte positions, never wrapped: what the front end has handed over, what the back end has done
-    std::atomic<uint64_t> written_{0}, done_{0};
-    uint64_t reserved_ = 0, record_at_ = 0; // the front end's: the record being made
+    // (each on a line of its own: written by one thread at every record, read by the other)
+    alignas(64) std::atomic<uint64_t> written_{0};
+    alignas(64) std::atomic<uint64_t> done_{0};
+    alignas(64) uint64_t reserved_ = 0, record_at_ = 0; // the front end's: the record being made
+    uint64_t done_seen_ = 0; // the front end's: done_ as last read, for the ring's room
     std::atomic<bool> back_asleep_{false}, stop_{false};
     // the lowest position a thread asleep in sleep_until waits for (UINT64_MAX: none); the back end
     // wakes the sleepers once done_ reaches it, not at every record
-    std::atomic<uint64_t> wanted_{UINT64_MAX};
+    alignas(64) std::atomic<uint64_t> wanted_{UINT64_MAX};
+    // The back end's done_ stored plainly at each record (a release store), and the sleepers'
+    // wanted_ looked at with a full fence only every few records and before the back end sleeps;
+    // XF_GPU_RING_RELAXED=0: a full fence at every record, as before (docs/renderer.md, "The GPU
+    // side's cost a draw").
+    const bool ring_relaxed_ = [] {
+        const char *v = std::getenv("XF_GPU_RING_RELAXED");
+        return !(v && v[0] == '0');
+    }();
     void sleep_until(uint64_t position);
     std::thread thread_;
     ThreadCpu back_cpu_;

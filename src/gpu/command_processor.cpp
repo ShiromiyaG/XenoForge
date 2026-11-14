@@ -727,10 +727,20 @@ void CommandProcessor::poll_extents(bool wait) {
         run_start = run_end = 0;
     };
     for (const Extent &e : extent_resolved_) {
-        // (the answers come in the reports' order: found at the first one waiting, or near it)
-        size_t at = extent_first_;
-        while (at < extent_pending_.size() && extent_pending_[at].first != e.handle) at++;
-        if (at == extent_pending_.size()) continue;
+        // (the answers come in the reports' order, mostly: looked for from the one after the last
+        // found, then from the first still waiting. Searched from the first waiting alone, a report
+        // left unanswered at the front made each search walk thousands: a quarter of game G's front
+        // end. XF_EXTENT_CURSOR=0: from the first waiting alone)
+        const size_t pending = extent_pending_.size();
+        size_t at = extent_cursor_on_ ? std::max(extent_cursor_, extent_first_) : extent_first_;
+        while (at < pending && extent_pending_[at].first != e.handle) at++;
+        if (at == pending && extent_cursor_on_) {
+            const size_t to = std::min(std::max(extent_cursor_, extent_first_), pending);
+            for (at = extent_first_; at < to && extent_pending_[at].first != e.handle;) at++;
+            if (at == to) at = pending;
+        }
+        if (at == pending) continue;
+        extent_cursor_ = at + 1;
         const uint32_t address = extent_pending_[at].second;
         extent_pending_[at].first = 0;
         while (extent_first_ < extent_pending_.size() && !extent_pending_[extent_first_].first) extent_first_++;
@@ -753,7 +763,7 @@ void CommandProcessor::poll_extents(bool wait) {
         written = true;
     }
     tell();
-    if (extent_first_ == extent_pending_.size()) extent_pending_.clear(), extent_first_ = 0;
+    if (extent_first_ == extent_pending_.size()) extent_pending_.clear(), extent_first_ = 0, extent_cursor_ = 0;
     // (what polls the write-backs woken once for all of them)
     if (written) host_.wrote_back();
 }

@@ -32,6 +32,8 @@ class ThreadCpu {
 uint64_t current_thread_cpu_ticks();
 // the GPU back end's thread's system id, once it runs (for a profiler to sample it), else 0
 extern std::atomic<unsigned long> gpu_back_end_os_thread;
+// the renderer's recording thread's system id, once it runs (for a profiler), else 0
+extern std::atomic<unsigned long> gpu_recording_os_thread;
 // the whole process's processor time so far, all of its threads, in seconds
 double process_cpu_seconds();
 // how many ticks make a second (Windows: the cycle counter's rate, measured over a busy 20 ms the

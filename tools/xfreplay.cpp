@@ -167,13 +167,17 @@ int main(int argc, char **argv) {
     if (profile_top) {
         unsigned long thread = xf::sampler::current_thread();
         // XF_PROFILE_BACK_END=1: the GPU back end's thread sampled instead (the thread the frames
-        // runs on, with XF_GPU_BACK_END on), all of it
+        // runs on, with XF_GPU_BACK_END on), all of it; XF_PROFILE_BACK_END=2: the recording thread's
         const char *back = std::getenv("XF_PROFILE_BACK_END");
-        const bool back_end = back && back[0] == '1';
+        const bool back_end = back && (back[0] == '1' || back[0] == '2');
+        const bool recording = back && back[0] == '2';
         // the command processor's work alone, not the trace's walk
         if (!back_end) xf::sampler::scope("CommandProcessor::execute_packets");
-        options.on_frame = [&profiling, thread, back_end](uint64_t, const xf::render::Image &) {
-            if (!profiling) profiling = xf::sampler::start(1000, back_end ? xf::gpu_back_end_os_thread.load() : thread);
+        options.on_frame = [&profiling, thread, back_end, recording](uint64_t, const xf::render::Image &) {
+            if (!profiling)
+                profiling = xf::sampler::start(1000, recording  ? xf::gpu_recording_os_thread.load()
+                                                     : back_end ? xf::gpu_back_end_os_thread.load()
+                                                                : thread);
         };
     }
     double cpu_before = xf::sampler::process_cpu_seconds();

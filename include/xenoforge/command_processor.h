@@ -92,7 +92,7 @@ public:
         if (get(index) == value) return;
         std::atomic_ref<uint32_t>(values_[index]).store(value, std::memory_order_relaxed);
         stamps_[index >> BLOCK_SHIFT] = ++serial_;
-        if (tracking_) mark(index >> BLOCK_SHIFT);
+        if (tracking_) mark(index >> BLOCK_SHIFT, 1u << (index & (BLOCK - 1)));
         if (draw_state(index)) state_serial_ = serial_;
         if (index >= 0x4000 && index < 0x4800) float_serial_[(index - 0x4000) >> 10] = serial_;
     }
@@ -114,20 +114,43 @@ public:
     void track_blocks(bool on) {
         tracking_ = on;
         dirty_.clear();
-        std::fill(dirty_mark_.begin(), dirty_mark_.end(), uint8_t(0));
+        std::fill(dirty_bits_.begin(), dirty_bits_.end(), 0u);
         for (auto &w : foreign_dirty_) w.store(0, std::memory_order_relaxed);
     }
     bool tracking_blocks() const { return tracking_; }
-    // each block listed since the last take, once (and any marked by other
-    // threads, perhaps again), the lists emptied; on the processor's thread
+    // each block listed since the last take, once, with the registers in it the processor changed
+    // since (a bit each), and any marked by other threads, perhaps again, with all of its
+    // registers; the lists emptied. On the processor's thread.
     template <class F> void take_blocks(F &&block) {
-        for (uint32_t b : dirty_) dirty_mark_[b] = 0, block(b);
+        for (uint32_t b : dirty_) block(b, dirty_bits_[b]), dirty_bits_[b] = 0;
         dirty_.clear();
         for (uint32_t w = 0; w < FOREIGN_WORDS; w++) {
             if (!foreign_dirty_[w].load(std::memory_order_relaxed)) continue;
             for (uint64_t bits = foreign_dirty_[w].exchange(0, std::memory_order_acquire); bits; bits &= bits - 1)
-                block(w * 64 + uint32_t(__builtin_ctzll(bits)));
+                block(w * 64 + uint32_t(__builtin_ctzll(bits)), ~0u);
         }
+    }
+    // the registers of a block by bits (bit k: the block's register k), their values in order:
+    // those that differ stored and stamped as write_host's (a copy's blocks as another file's
+    // take_blocks gave them)
+    void write_sparse(uint32_t block, uint32_t bits, const uint32_t *values) {
+        const uint32_t first = block << BLOCK_SHIFT;
+        uint32_t *const held = values_.data() + first;
+        uint32_t changed = 0;
+        for (uint32_t m = bits; m; m &= m - 1) {
+            const uint32_t k = uint32_t(__builtin_ctz(m)), v = *values++;
+            if (held[k] == v) continue;
+            __atomic_store_n(&held[k], v, __ATOMIC_RELAXED);
+            changed |= 1u << k;
+        }
+        if (!changed) return;
+        ++serial_;
+        stamped(first, (changed & state_mask(first)) != 0, changed);
+    }
+    // a block's registers within the file, a bit each
+    static uint32_t block_bits(uint32_t block) {
+        const uint32_t n = std::min(BLOCK, COUNT - (block << BLOCK_SHIFT));
+        return n == BLOCK ? ~0u : (1u << n) - 1;
     }
     // the copy's count of the writes from other threads, as the original's
     // stood (what a sink compares, see foreign_writes)
@@ -192,7 +215,8 @@ private:
                         const uint32_t k = uint32_t(__builtin_ctz(m));
                         __atomic_store_n(&held[k], host[k], __ATOMIC_RELAXED);
                     }
-                    stamped(first, ((changed << (first & (BLOCK - 1))) & state_mask(first & ~(BLOCK - 1))) != 0);
+                    const uint32_t bits = changed << (first & (BLOCK - 1));
+                    stamped(first, (bits & state_mask(first & ~(BLOCK - 1))) != 0, bits);
                 }
             } else {
                 // compared with those held in one pass, and stored only where they differ
@@ -208,16 +232,17 @@ private:
                         if (!constants && draw_state(first + k)) state = true;
                         std::atomic_ref<uint32_t>(held[k]).store(host[k], std::memory_order_relaxed);
                     }
-                    stamped(first, state);
+                    stamped(first, state, (n == BLOCK ? ~0u : (1u << n) - 1) << (first & (BLOCK - 1)));
                 }
             }
             first += n, words += 4 * n, count -= n;
         }
     }
-    // a block changed at serial_ (whether a register of the draws' state did)
-    void stamped(uint32_t first, bool state) {
+    // a block changed at serial_ (whether a register of the draws' state did; bits: the block's
+    // registers that changed, a bit each)
+    void stamped(uint32_t first, bool state, uint32_t bits) {
         stamps_[first >> BLOCK_SHIFT] = serial_;
-        if (tracking_) mark(first >> BLOCK_SHIFT);
+        if (tracking_) mark(first >> BLOCK_SHIFT, bits);
         if (state) state_serial_ = serial_;
         if (first >= 0x4000 && first < 0x4800) float_serial_[(first - 0x4000) >> 10] = serial_;
     }
@@ -238,8 +263,9 @@ private:
         for (uint32_t k = 0; k < n; k++) changed |= uint32_t(held[k] != host[k]) << k;
         return changed;
     }
-    void mark(uint32_t block) {
-        if (!dirty_mark_[block]) dirty_mark_[block] = 1, dirty_.push_back(block);
+    void mark(uint32_t block, uint32_t bits) {
+        if (!dirty_bits_[block]) dirty_.push_back(block);
+        dirty_bits_[block] |= bits;
     }
     static bool run_masks() {
         static const bool on = [] {
@@ -268,7 +294,7 @@ private:
     // blocks other threads wrote (a bit each)
     bool tracking_ = false;
     std::vector<uint32_t> dirty_;
-    std::vector<uint8_t> dirty_mark_ = std::vector<uint8_t>(BLOCKS, 0);
+    std::vector<uint32_t> dirty_bits_ = std::vector<uint32_t>(BLOCKS, 0); // a listed block's changed registers
     std::array<std::atomic<uint64_t>, FOREIGN_WORDS> foreign_dirty_{};
 };
 
@@ -709,6 +735,11 @@ private:
     uint64_t slow_cpu_ = 0; // the processor's thread's processor time (thread_cpu.h's ticks)
     std::vector<std::pair<uint64_t, uint32_t>> extent_pending_; // handle (0: answered) and address, in order
     size_t extent_first_ = 0;                                   // the first of them still waiting
+    size_t extent_cursor_ = 0;                                  // the one after the last answered
+    const bool extent_cursor_on_ = [] {
+        const char *v = std::getenv("XF_EXTENT_CURSOR");
+        return !(v && v[0] == '0');
+    }();
     // The latest report at each address, by address: its handle (0: none).
     // Thousands of reports a frame at the addresses of the frame before's,
     // none ever taken out: an open table (a multiplicative hash, the next

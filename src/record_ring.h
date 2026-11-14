@@ -245,11 +245,12 @@ class Ring {
     }
     void loop() {
         cpu_.bind_current();
+        gpu_recording_os_thread.store(cpu_.os_id());
         size_t tail = 0;
         for (;;) {
             size_t head = head_shared_.load(std::memory_order_acquire);
             if (head == tail) {
-                for (uint32_t spins = 0; spins < 2000 && head == tail; spins++) {
+                for (uint32_t spins = 0; spins < spins_ && head == tail; spins++) {
                     spin_pause();
                     head = head_shared_.load(std::memory_order_acquire);
                 }
@@ -281,6 +282,16 @@ class Ring {
     const size_t batch_ = [] {
         const char *v = std::getenv("XF_RECORD_RING_BATCH");
         return v ? size_t(std::strtoull(v, nullptr, 10)) : size_t(16) << 10;
+    }();
+    // The pauses the thread spins for with the ring empty before it sleeps
+    // (XF_RECORD_RING_SPINS=<n>; 2,000 before 2026-11-14). Handed work 16 KB
+    // at a time, the thread found the ring empty about a hundred times a
+    // frame, and its 2,000 pauses each were half of its processor time
+    // (game G's town: 6.3 ms a play, 3.6 with 200 or none); the producer's
+    // wakes cost it nothing that shows.
+    const uint32_t spins_ = [] {
+        const char *v = std::getenv("XF_RECORD_RING_SPINS");
+        return v ? uint32_t(std::strtoul(v, nullptr, 10)) : 200u;
     }();
     // the producer's
     size_t head_ = 0, published_ = 0, tail_seen_ = 0;
