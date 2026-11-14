@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <optional>
 
 namespace xf::kernel {
 namespace {
@@ -114,12 +115,17 @@ struct Kernel::Code {
 // A guest thread running guest code (running) or in the kernel (not), for
 // Kernel::pause: set for the scope, put back after; a thread that goes back
 // to guest code while a pause is asked parks first.
+// Out of guest code, the host stack's frames below this one are the kernel's
+// (HostStackMark, marked before the thread says it runs none, so a pause's
+// scan of the stacks sees every frame of the guest's: stacks.h).
 struct GuestCodeScope {
     Kernel &k;
     Thread *t;
     bool was = false;
+    std::optional<HostStackMark> mark;
     GuestCodeScope(Kernel &kernel, bool running) : k(kernel), t(current_thread()) {
         if (!t) return;
+        if (!running) mark.emplace();
         was = t->guest_running.exchange(running, std::memory_order_seq_cst);
         if (running && k.pause_requested_.load(std::memory_order_seq_cst)) [[unlikely]]
             k.park();
@@ -679,6 +685,7 @@ void Kernel::attach(ppc::Context &c) {
 void Kernel::park() {
     Thread *t = current_thread();
     if (!t) return;
+    HostStackMark mark; // (the guest's frames are above it: stacks.h)
     std::unique_lock l(pause_mutex_);
     const bool was = t->guest_running.load(std::memory_order_seq_cst);
     for (;;) {
@@ -717,6 +724,16 @@ bool Kernel::pause(uint32_t timeout_ms) {
         std::unique_lock l(pause_mutex_);
         pause_cv_.wait_for(l, std::chrono::milliseconds(2));
     }
+}
+
+bool Kernel::scan_host_stacks(uintptr_t low, uintptr_t high, std::vector<uintptr_t> &found) {
+    // guest code on a host thread of its own: its frames are not scanned
+    if (host_guest_calls_.load(std::memory_order_seq_cst)) return false;
+    kernel::scan_host_stacks([&](const uint64_t *begin, const uint64_t *end) {
+        for (const uint64_t *p = begin; p < end; p++)
+            if (*p >= low && *p < high) found.push_back(uintptr_t(*p));
+    });
+    return host_guest_calls_.load(std::memory_order_seq_cst) == 0;
 }
 
 void Kernel::resume() {
@@ -962,6 +979,15 @@ void Kernel::interpret_from(ppc::Context &c, uint32_t pc, uint32_t until, uint32
 void Kernel::call(ppc::Context &c, uint32_t address) {
     // guest code from here (a thread's start, a callback the kernel makes)
     GuestCodeScope running(*this, true);
+    // guest code on a host thread with no guest thread of its own: its stack
+    // is not among those a pause scans (scan_host_stacks says so meanwhile)
+    struct HostCall {
+        std::atomic<int> *n;
+        ~HostCall() {
+            if (n) n->fetch_sub(1, std::memory_order_seq_cst);
+        }
+    } host_call{current_thread() ? nullptr : &host_guest_calls_};
+    if (host_call.n) host_call.n->fetch_add(1, std::memory_order_seq_cst);
     c.lr = SENTINEL;
     // an entry the kernel makes moves the deterministic mode's clock and may hand over
     if (deterministic_entry_cost_) objects_->scheduler->advance(deterministic_entry_cost_);

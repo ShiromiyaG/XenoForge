@@ -12,6 +12,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <string>
 
 namespace xf::sampler {
 
@@ -26,6 +29,10 @@ bool start(unsigned interval_us = 1000, unsigned long only_thread = 0);
 // symbols): an address there is named after the nearest function at or
 // below it, xf_<guest address>
 void name_generated(const void *const *hosts, const unsigned *guests, size_t count);
+// Names for addresses of code made at run time (the first tier's: its
+// stencils, stencil.h's Module::describe), tried before the generated
+// functions' table for an address with no symbol.
+void name_with(std::function<bool(uint64_t address, std::string &name, uint64_t &displacement)> namer);
 // With one thread sampled: only the samples taken under a function whose name has `function` in it
 // count in the report (a tool's other work on the thread left out); null or empty for all of them.
 void scope(const char *function);

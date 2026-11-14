@@ -73,6 +73,8 @@ std::vector<std::pair<std::vector<uint64_t>, uint64_t>> stacks;
 std::vector<std::pair<uint64_t, uint32_t>> generated;
 // scope's function name's part: with stacks, only the samples under such a function count
 std::string scope_name;
+// name_with's
+std::function<bool(uint64_t, std::string &, uint64_t &)> namer;
 
 // a generated function's name for a host address with no symbol, and how far in
 bool generated_at(uint64_t address, std::string &name, uint64_t &displacement) {
@@ -268,6 +270,7 @@ bool waiting_name(const std::string &n) {
 
 std::string category(const std::string &name, const std::string &module) {
     if (generated_name(name)) return "generated code";
+    if (name.starts_with("tier ")) return "first tier (copy-and-patch)";
     if (waiting_name(name)) return WAITING;
     if (name.find("ppc::ops::") != std::string::npos) return "instructions' cold paths";
     if (name.find("ppc::interpret") != std::string::npos || name.find("ppc_interp") != std::string::npos ||
@@ -295,6 +298,11 @@ double process_cpu_seconds() {
     if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return -1;
     auto value = [](FILETIME t) { return double(uint64_t(t.dwHighDateTime) << 32 | t.dwLowDateTime) * 1e-7; };
     return value(kernel) + value(user);
+}
+
+void name_with(std::function<bool(uint64_t, std::string &, uint64_t &)> f) {
+    std::lock_guard lock(mutex);
+    namer = std::move(f);
 }
 
 void name_generated(const void *const *hosts, const unsigned *guests, size_t count) {
@@ -377,6 +385,8 @@ void stop_and_report(size_t top) {
         if (SymGetModuleInfo64(process, rip, &mod)) module = mod.ModuleName;
         if (SymFromAddr(process, rip, &displacement, sym)) {
             name = sym->Name;
+        } else if (namer && namer(rip, name, displacement)) {
+            // (code made at run time: the first tier's)
         } else if (!generated_at(rip, name, displacement)) {
             // else the offsets are from the module's base (its RVAs)
             if (!generated_far(rip, name, displacement)) {
@@ -484,7 +494,8 @@ void stop_and_report(size_t top) {
         // (a return address is the instruction after the call: look one byte back)
         if (SymFromAddr(process, address - 1, &displacement, sym)) {
             name = sym->Name;
-        } else if (generated_at(address - 1, name, displacement) || generated_far(address - 1, name, displacement)) {
+        } else if ((namer && namer(address - 1, name, displacement)) || generated_at(address - 1, name, displacement) ||
+                   generated_far(address - 1, name, displacement)) {
         } else {
             IMAGEHLP_MODULE64 mod{sizeof(mod)};
             name = SymGetModuleInfo64(process, address, &mod) ? std::string(mod.ModuleName) + "+?" : "?";
@@ -579,6 +590,7 @@ void scope(const char *) {}
 bool start(unsigned, unsigned long) { return false; }
 unsigned long current_thread() { return 0; }
 void name_generated(const void *const *, const unsigned *, size_t) {}
+void name_with(std::function<bool(uint64_t, std::string &, uint64_t &)>) {}
 double process_cpu_seconds() {
     rusage usage{};
     if (getrusage(RUSAGE_SELF, &usage) != 0) return -1;

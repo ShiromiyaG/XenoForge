@@ -56,12 +56,12 @@ void *convert_thread(bool &converted) {
     return converted ? ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH) : GetCurrentFiber();
 }
 void revert_thread() { ConvertFiberToThread(); }
-void *create_fiber(void (*entry)(void *), void *arg) {
+static void *create_fiber_raw(void (*entry)(void *), void *arg) {
     return CreateFiberEx(64 * 1024, HOST_STACK, FIBER_FLAG_FLOAT_SWITCH, reinterpret_cast<LPFIBER_START_ROUTINE>(entry),
                          arg);
 }
-void switch_fiber(void *fiber) { SwitchToFiber(fiber); }
-void delete_fiber(void *fiber) { DeleteFiber(fiber); }
+static void switch_fiber_raw(void *fiber) { SwitchToFiber(fiber); }
+static void delete_fiber_raw(void *fiber) { DeleteFiber(fiber); }
 void *current_fiber() { return IsThreadAFiber() ? GetCurrentFiber() : nullptr; }
 #else
 namespace {
@@ -85,7 +85,7 @@ void revert_thread() {
     delete running;
     running = nullptr;
 }
-void *create_fiber(void (*entry)(void *), void *arg) {
+static void *create_fiber_raw(void (*entry)(void *), void *arg) {
     void *stack = mmap(nullptr, HOST_STACK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (stack == MAP_FAILED) return nullptr;
     auto *f = new PosixFiber();
@@ -97,18 +97,137 @@ void *create_fiber(void (*entry)(void *), void *arg) {
     makecontext(&f->context, trampoline, 0);
     return f;
 }
-void switch_fiber(void *fiber) {
+static void switch_fiber_raw(void *fiber) {
     PosixFiber *from = running;
     running = static_cast<PosixFiber *>(fiber);
     swapcontext(&from->context, &running->context);
 }
-void delete_fiber(void *fiber) {
+static void delete_fiber_raw(void *fiber) {
     auto *f = static_cast<PosixFiber *>(fiber);
     munmap(f->stack, HOST_STACK);
     delete f;
 }
 void *current_fiber() { return running; }
 #endif
+
+// ---- the host stacks guest code runs on (stacks.h) ----
+
+namespace {
+
+struct StackRegistry {
+    std::mutex mutex;
+    std::vector<HostStackRecord *> stacks;
+    struct FiberStart {
+        void (*entry)(void *);
+        void *arg;
+        HostStackRecord record;
+    };
+    std::map<void *, FiberStart *> fibers;
+};
+StackRegistry &stack_registry() {
+    static StackRegistry *r = new StackRegistry(); // (never destroyed: threads may outlive statics)
+    return *r;
+}
+thread_local HostStackRecord *current_stack = nullptr;
+
+// an address on the calling thread's stack, below its caller's frames
+[[gnu::noinline]] uintptr_t stack_here() {
+    volatile char probe = 0;
+    return uintptr_t(&probe);
+}
+
+void register_stack(HostStackRecord *r) {
+    StackRegistry &g = stack_registry();
+    std::lock_guard l(g.mutex);
+    g.stacks.push_back(r);
+}
+void unregister_stack(HostStackRecord *r) {
+    StackRegistry &g = stack_registry();
+    std::lock_guard l(g.mutex);
+    g.stacks.erase(std::remove(g.stacks.begin(), g.stacks.end(), r), g.stacks.end());
+}
+
+// a fiber's start: its stack's base noted, then its routine
+#ifdef _WIN32
+void WINAPI fiber_start(void *p)
+#else
+void fiber_start(void *p)
+#endif
+{
+    auto *s = static_cast<StackRegistry::FiberStart *>(p);
+    volatile char base = 0;
+    s->record.base = uintptr_t(&base);
+    current_stack = &s->record;
+    s->entry(s->arg);
+}
+
+} // namespace
+
+void *create_fiber(void (*entry)(void *), void *arg) {
+    auto *s = new StackRegistry::FiberStart{entry, arg, {}};
+    void *fiber = create_fiber_raw(reinterpret_cast<void (*)(void *)>(&fiber_start), s);
+    if (!fiber) {
+        delete s;
+        return nullptr;
+    }
+    StackRegistry &g = stack_registry();
+    std::lock_guard l(g.mutex);
+    g.fibers[fiber] = s;
+    g.stacks.push_back(&s->record);
+    return fiber;
+}
+void switch_fiber(void *fiber) {
+    // this stack's frames wait here (its lowest: below them)
+    HostStackRecord *self = current_stack;
+    uintptr_t outer = 0;
+    if (self) outer = self->sp.exchange(stack_here(), std::memory_order_seq_cst);
+    switch_fiber_raw(fiber);
+    current_stack = self;
+    if (self) self->sp.store(outer, std::memory_order_seq_cst);
+}
+void delete_fiber(void *fiber) {
+    StackRegistry &g = stack_registry();
+    StackRegistry::FiberStart *s = nullptr;
+    {
+        std::lock_guard l(g.mutex);
+        auto it = g.fibers.find(fiber);
+        if (it != g.fibers.end()) {
+            s = it->second;
+            g.fibers.erase(it);
+            g.stacks.erase(std::remove(g.stacks.begin(), g.stacks.end(), &s->record), g.stacks.end());
+        }
+    }
+    delete_fiber_raw(fiber);
+    delete s;
+}
+
+HostStackScope::HostStackScope() : outer_(current_stack) {
+    record_.base = stack_here();
+    register_stack(&record_);
+    current_stack = &record_;
+}
+HostStackScope::~HostStackScope() {
+    current_stack = outer_;
+    unregister_stack(&record_);
+}
+
+HostStackMark::HostStackMark() : record_(current_stack) {
+    if (record_) outer_ = record_->sp.exchange(stack_here(), std::memory_order_seq_cst);
+}
+HostStackMark::~HostStackMark() {
+    if (record_) record_->sp.store(outer_, std::memory_order_seq_cst);
+}
+
+void scan_host_stacks(const std::function<void(const uint64_t *, const uint64_t *)> &fn) {
+    StackRegistry &g = stack_registry();
+    std::lock_guard l(g.mutex);
+    for (const HostStackRecord *r : g.stacks) {
+        const uintptr_t sp = r->sp.load(std::memory_order_seq_cst), base = r->base;
+        if (!sp || !base || sp >= base) continue;
+        fn(reinterpret_cast<const uint64_t *>((sp + 7) & ~uintptr_t(7)),
+           reinterpret_cast<const uint64_t *>(base & ~uintptr_t(7)));
+    }
+}
 
 namespace {
 

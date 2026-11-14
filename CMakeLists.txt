@@ -132,7 +132,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD
         OUTPUT ${XF_STENCIL_OUT}/stencils.inc
         COMMAND xfstencil ${XF_STENCIL_CLANG} ${CMAKE_CURRENT_SOURCE_DIR}/src/stencil/stencils.cpp
                 ${CMAKE_CURRENT_SOURCE_DIR}/include ${XF_STENCIL_OUT} ${XF_STENCIL_TARGET}
-        DEPENDS xfstencil src/stencil/stencils.cpp src/stencil_format.h ${XF_GAME_INTERFACE_INPUTS}
+        DEPENDS xfstencil src/stencil/stencils.cpp src/stencil/stencil_fields.h src/stencil_format.h ${XF_GAME_INTERFACE_INPUTS}
         COMMENT "the copy-and-patch tier's stencils")
     target_sources(xenoforge PRIVATE ${XF_STENCIL_OUT}/stencils.inc)
     target_include_directories(xenoforge PRIVATE ${XF_STENCIL_OUT})

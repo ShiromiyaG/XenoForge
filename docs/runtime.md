@@ -3280,6 +3280,76 @@ movies (Bink, on a thread of its own) play at 6 to 10 swaps a second, then
 the game reaches 30 a second past them (530 and 896 swaps), with no address
 interpreted.
 
+### Hot functions first (2026-11-14)
+
+The whole library takes the background build five to eight minutes; the
+code a game runs most is a few hundred functions of tens of thousands. So:
+
+- **The heat.** The tier counts each function's entries and its loops' back
+  edges taken (docs/recompiler.md, "Hot functions first and the tier
+  released"). From 10 s on the tier, every 20 s until a library comes,
+  `poll_tier_up` writes the executable's to `<cache>/<digest>.hot.txt`
+  (`build::write_hot_list`: address, entries, back edges, instructions; the
+  whole list each time, moved over the old one).
+- **The partial library.** A build with `BuildOptions::hot_first` (the
+  launcher's background build; `xfbuild --hot-first`, or `--hot-only` for the
+  partial library alone) reads the list once the code is emitted (waiting
+  up to 20 s for it when the game has not written it yet), takes the
+  hottest functions (`build::choose_hot`: 99% of the heat, at most 2,000
+  functions and 200,000 instructions), builds them first into
+  `<cache>/<digest>-<interface>-<level>.hot.dll` (`.so`) under
+  `work/<digest>/hot`, then the whole library as ever, whose end removes the
+  partial one from the cache (unless a player still has it loaded, which
+  only a later build's end then removes). A partial library that fails leaves only the
+  whole one (its failure is not the build's). The executable only: a DLL's
+  functions wait for the whole library. Not with a port's project file.
+- **Adopting it.** `poll_tier_up` finds it (`build::find_partial`), loads it,
+  pauses the guest and has the tier's executable module adopt its functions
+  (`stencil::Module::adopt`); the kernel keeps the tier's tables, so every
+  entry still goes through the tier's entries, the hot ones now jumping to
+  the partial library. The log says `tier-up: the partial library ... runs N
+  of the tier's functions now`; at the tier-up and in boot's report, the
+  share of the function entries since then that went to library code.
+- **Then the whole library**, as before; the functions the partial library
+  had are pointed at the whole one's. A library that does not load is tried
+  twice more, 2 s apart (a file still being written), before the run stays
+  on the tier.
+
+Game E (its logos, no presses): the partial library from a 40 s run's heat
+holds 969 functions, built in 45 s (19 s of it compiling, four compilers);
+adopted 2 s into a run, it took 93.8% of the function entries until the
+whole library came at 25 s.
+
+### Releasing the first tier (2026-11-14)
+
+After the tier-up, the tier's code the library took is released where no
+frame is in it (`stencil::Module::release`, docs/recompiler.md): a pause,
+then each guest thread's host stack read for values inside the tier's code
+(`Kernel::scan_host_stacks`). It is safe because every host stack that runs
+guest code is known and so is the lowest of its guest frames while they
+wait (`src/kernel/stacks.h`):
+
+- a guest thread's own stack is registered in `Thread::body`
+  (`HostStackScope`), every host fiber (a guest stack's, the deterministic
+  and the console schedulers' threads) from `create_fiber` to
+  `delete_fiber`, each with its base;
+- `HostStackMark` notes the stack pointer before a thread says it runs no
+  guest code (`GuestCodeScope` around a kernel call or a park, `park()`
+  itself), and `switch_fiber` notes it for the stack it leaves, so at a
+  pause each stack's frames above that point are the guest's, waiting, and
+  hold a return address into every function of the tier's code they are in;
+- guest code on a host thread with no guest thread of its own
+  (`Kernel::call` from such a thread) is counted, and while any runs no scan
+  is made.
+
+A value in the scan that is not a return address only keeps a function's
+code longer. `poll_tier_up` tries three times, 2 s apart, then every 30 s,
+ten times in all; the log says `tier release: N functions' code released
+(... MB), M kept with a frame in them, ...; the tier holds ... MB now`, and
+boot's report the total. Game E: 247.0 MB released, 25.0 MB held after, the
+threads paused 43 ms once; game B: 114.9 MB, 13.1 MB held, 20 ms; game A:
+325.6 MB, 26.4 MB held, 59 ms.
+
 ## Discord Rich Presence (2026-11-13)
 
 While a game runs, the player shows "Playing <title>" with the time since it started on the user's Discord profile

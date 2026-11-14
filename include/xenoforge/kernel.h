@@ -599,8 +599,14 @@ public:
     bool pause_requested() const { return pause_requested_.load(std::memory_order_relaxed); }
     // the guest threads that ran guest code when pause() returned
     uint32_t pause_unparked() const { return pause_unparked_; }
+    // At a pause: every value in [low, high) on the guest threads' host stacks
+    // below their frames waiting (stacks.h's scan_host_stacks): what no frame
+    // of the first tier's code can be in unless it is among them (docs/runtime.md,
+    // "Releasing the first tier"). False when a host thread with no guest
+    // thread of its own runs guest code, whose stack is not scanned.
+    bool scan_host_stacks(uintptr_t low, uintptr_t high, std::vector<uintptr_t> &found);
 
-private:
+  private:
     friend class Lockstep;
     // (try_call's) generated code run, or checked by the lockstep check
     void run_generated(ppc::Context &c, uint32_t target, void (*fn)(ppc::Context &));
@@ -681,6 +687,7 @@ private:
     std::mutex pause_mutex_;
     std::condition_variable pause_cv_;
     uint32_t pause_unparked_ = 0;
+    std::atomic<int> host_guest_calls_{0}; // Kernel::call on a host thread with no guest thread
     // a guest thread at a safe point: parked until resume() (pause_requested_ set)
     void park();
     friend struct GuestCodeScope;

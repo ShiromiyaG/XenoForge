@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <thread>
 
 #ifdef _WIN32
@@ -509,6 +510,10 @@ void Thread::body() {
     Objects &o = owner;
     Kernel &k = o.k;
     current_ = this;
+    // its own host stack registered for a pause's scan (stacks.h; a fiber of
+    // the deterministic or the console scheduler is, as every fiber)
+    std::optional<HostStackScope> host_stack;
+    if (!scheduled) host_stack.emplace();
     if (!scheduled) {
         // the host thread named after the guest's (for debuggers and
         // profilers), and kept for its CPU time in the thread report (a

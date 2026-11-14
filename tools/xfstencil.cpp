@@ -397,8 +397,10 @@ void read_elf(const std::vector<uint8_t> &f, Object &o) {
 // ---- the table ----
 
 int hole_index(const std::string &name) {
-    static const char *const names[] = {"xf_hole_word", "xf_hole_a",      "xf_hole_b",   "xf_hole_data",
-                                        "xf_hole_next", "xf_hole_target", "xf_hole_call"};
+    static const char *const names[] = {"xf_hole_word", "xf_hole_a",      "xf_hole_b",    "xf_hole_data",
+                                        "xf_hole_next", "xf_hole_target", "xf_hole_call", "xf_hole_f0",
+                                        "xf_hole_f1",   "xf_hole_f2",     "xf_hole_f3",   "xf_hole_f4"};
+    static_assert(sizeof(names) / sizeof(names[0]) == size_t(Hole::Count));
     for (int k = 0; k < int(Hole::Count); k++)
         if (name == names[k]) return k;
     return -1;
@@ -482,7 +484,15 @@ std::string write_table(const Object &o, const std::string &source) {
                       std::to_string(addend) + "},\n";
             nrelocs++;
         }
+        // (a helper by the symbol at its start, which says more than its section's name)
         std::string name = stencil ? stencils.at(order[k]) : sec.name;
+        if (!stencil)
+            for (const Symbol &s : o.symbols)
+                if (s.section == order[k] && s.value == 0 && !s.name.empty() && s.name[0] != '.' &&
+                    s.name.find('$') == std::string::npos) {
+                    name = s.name;
+                    break;
+                }
         uint32_t flags = (stencil ? PIECE_STENCIL : 0) | (sec.code ? PIECE_CODE : 0) | (tail ? PIECE_TAIL_JUMP : 0);
         pieces += "    {\"" + name + "\", " + std::to_string(nbytes) + ", " + std::to_string(sec.bytes.size()) + ", " +
                   std::to_string(sec.align) + ", " + std::to_string(flags) + ", " + std::to_string(first) + ", " +

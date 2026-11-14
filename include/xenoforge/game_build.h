@@ -150,6 +150,34 @@ class EntryLog {
     std::unique_ptr<State> state_;
 };
 
+// ---- hot functions first (docs/runtime.md, "Hot functions first") ----
+//
+// A game running on the first tier writes, every 20 s, how hot each of the
+// executable's functions ran there (its entries and loops' back edges taken)
+// to <cache>/<digest>.hot.txt. A build with BuildOptions::hot_first (the
+// launcher's background build) reads it once the code is emitted and
+// compiles the hottest functions first into a partial library,
+// <cache>/<digest>-<interface version>-<CPU level>.hot.dll (.so), which the
+// running game adopts as soon as it is there (find_partial); then it builds
+// the whole library as ever, which replaces it.
+
+struct HotFunction {
+    uint32_t address = 0;
+    uint64_t entries = 0, back_edges = 0;
+    uint32_t instructions = 0;
+};
+std::filesystem::path hot_list_path(const std::filesystem::path &cache_dir, std::string_view digest);
+// one line a function: address, entries, back edges, instructions (written whole each time)
+bool write_hot_list(const std::filesystem::path &file, const std::vector<HotFunction> &functions);
+std::vector<HotFunction> read_hot_list(const std::filesystem::path &file);
+// The functions the partial library takes: by entries and back edges taken,
+// the hottest first, until they hold 99% of them or the limits (as many
+// functions, as many instructions) are reached.
+std::vector<uint32_t> choose_hot(std::vector<HotFunction> functions, size_t max_functions = 2000,
+                                 uint64_t max_instructions = 200000);
+// the partial library cached for this digest at this interface version and CPU level
+std::optional<std::filesystem::path> find_partial(const std::filesystem::path &cache_dir, std::string_view digest);
+
 // ---- extensions (the launcher may leave them alone) ----
 
 // The shader step (docs/renderer.md, "Shaders and pipelines at the
@@ -185,6 +213,12 @@ struct BuildOptions {
     // build): half the compilers the policy (or `jobs`) allows, at least one,
     // started at the lowest priority, so the game keeps its processor
     bool background = false;
+    // Hot functions first: with the runtime's hot list (hot_list_path), the
+    // hottest functions built into a partial library before the whole one
+    // (the launcher's background build). hot_only: that partial library
+    // alone (for tests and measurements), the build stopping there.
+    bool hot_first = false;
+    bool hot_only = false;
     std::filesystem::path toolchain; // where clang and lld are; empty: find_toolchain's search
     bool keep_work = false;          // keep the emitted code and objects (they are hundreds of MB)
     // keep the objects (<cache>/work/<digest>/obj, about 0.7 MB a file of

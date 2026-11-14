@@ -340,6 +340,14 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                     guests.push_back(g.installed_modules[m]->functions[f].address);
                 }
             sampler::name_generated(hosts.data(), guests.data(), hosts.size());
+            // the first tier's code: by stencil with XF_STENCIL_MAP=1, else by function
+            if (g.stencil)
+                sampler::name_with([&g](uint64_t address, std::string &name, uint64_t &displacement) {
+                    if (g.stencil->describe(address, name, displacement)) return true;
+                    for (auto &d : g.stencil_dlls)
+                        if (d->describe(address, name, displacement)) return true;
+                    return false;
+                });
             if (!sampler::start(1000, only)) std::fprintf(stderr, "boot: --profile is not supported on this host\n");
         }
         if (stall_report > 0) {

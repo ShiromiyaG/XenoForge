@@ -110,6 +110,20 @@ struct Game {
     bool tier_up = false;
     double tier_up_polled = -1e9; // when the cache was last looked at (seconds, steady clock)
     const ppc::GameLibrary *tier_up_library = nullptr; // loaded, waiting for a pause
+    // Hot functions first (docs/runtime.md): the tier's heat written for the
+    // background build (the hot list), the partial library adopted once the
+    // cache has it, and the entries counted from then
+    double started = 0;                                // the tier's start (seconds, steady clock)
+    double hot_list_written = -1e9;                    // the hot list's last writing
+    const ppc::GameLibrary *partial_library = nullptr; // adopted (nullptr: none yet)
+    uint64_t partial_tier_entries = 0;                 // the tier's entries when it was adopted
+    bool partial_failed = false;                       // it did not load: not tried again
+    int tier_up_failures = 0;                          // the library's loads that failed
+    // Releasing the first tier (docs/runtime.md): after the tier-up, the code
+    // no frame is in released at pauses, a few times
+    int release_tries = 0;
+    double release_polled = -1e9;
+    size_t released_bytes = 0;
     Xex xex;
     // the executable's image digest before any patch, and the game library's cache key: the digest
     // alone, or with the enabled code patches' key (patches::cache_key)

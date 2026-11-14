@@ -7,8 +7,11 @@
 // goes and how long it took.
 //
 //   xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
-//           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only]
-//           [--project <file.toml>] [--patches <dir> [--patch <name>[=off]]...] [--cpu-level v2|v3|arm64] [--compile-stats <file.tsv>]
+//           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log] [--no-shaders] [--no-disc-shaders]
+//           [--shaders-only]
+//           [--project <file.toml>] [--patches <dir> [--patch <name>[=off]]...] [--cpu-level v2|v3|arm64]
+//           [--compile-stats <file.tsv>]
+//           [--hot-first | --hot-only]
 //
 // The cache is game_build.h's default_cache_dir() unless named. --keep keeps
 // the work directory (the emitted code and the objects), --force builds even
@@ -30,6 +33,8 @@
 // same, or --game-library naming it). After a build it prints clang's CPU
 // time summed over the files it compiled and the most memory one held;
 // --compile-stats writes each file's (file, CPU seconds, peak bytes).
+// --hot-first builds the hot list's functions into a partial library first
+// (game_build.h, "hot functions first"); --hot-only builds that alone.
 
 #include "xenoforge/game_build.h"
 #include "xenoforge/shader_step.h"
@@ -68,7 +73,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "usage: xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] "
                              "[--keep] [--force] [--cancel-after S] [--quiet] [--entry <hex>]... "
                              "[--no-entry-log] [--no-shaders] [--no-disc-shaders] [--disc-variants N] [--shaders-only] "
-                             "[--project <file.toml>] [--cpu-level v2|v3|arm64] [--compile-stats <file.tsv>]\n");
+                             "[--project <file.toml>] [--cpu-level v2|v3|arm64] [--compile-stats <file.tsv>] "
+                             "[--hot-first | --hot-only]\n");
         return 2;
     }
     std::filesystem::path disc = argv[1], cache = build::default_cache_dir();
@@ -97,6 +103,10 @@ int main(int argc, char **argv) {
             options.use_entry_log = false;
         else if (a == "--no-shaders")
             options.shader_step = {};
+        else if (a == "--hot-first")
+            options.hot_first = true;
+        else if (a == "--hot-only")
+            options.hot_only = true;
         else if (a == "--shaders-only")
             options.shaders_only = true;
         else if (a == "--no-disc-shaders")

@@ -133,6 +133,7 @@ struct Program {
     xf::recomp::Image image;
     xf::recomp::Discovery d;
     std::unique_ptr<xf::stencil::Module> module;
+    xf::stencil::Stats stats;
     std::string error;
     Program(std::initializer_list<uint32_t> words) {
         image.base = image.entry = BASE;
@@ -153,7 +154,7 @@ struct Program {
         runtime.unwind = &unwind;
         runtime.hooked = &hooked;
         runtime.mid_hook = &mid_hook;
-        xf::stencil::Stats stats;
+        stats = {};
         xf::stencil::Options options;
         options.project = project;
         module = xf::stencil::compile(image, d, runtime, "control", 0, options, stats, error);
@@ -312,6 +313,110 @@ int run_checks(uint8_t *base) {
             ok = ok && c.r[3] == 1000;
         }
         check(ok, "the tier-up's jump to the library");
+    }
+    {
+        // hot functions first: the entries counted, a partial library adopted
+        // (its function's calls counted), then the whole one (the adopted
+        // function pointed at it), then the tier's code released, all but a
+        // function with a frame in it
+        Program p({0x48000009,   // 80000000 bl 80000008
+                   0x4E800020,   // 80000004 blr
+                   0x38630001,   // 80000008 addi r3, r3, 1
+                   0x4E800020,   // 8000000C blr
+                   0x38630002,   // 80000010 addi r3, r3, 2
+                   0x4E800020}); // 80000014 blr
+        p.function(BASE, 8);
+        p.function(BASE + 8, 8);
+        p.function(BASE + 16, 8);
+        bool ok = p.compile();
+        auto heat = [&](uint32_t address) {
+            for (const xf::stencil::FunctionHeat &h : p.module->heat())
+                if (h.address == address) return h;
+            return xf::stencil::FunctionHeat{};
+        };
+        if (ok) {
+            fresh();
+            p.fn(BASE)(c);
+            p.fn(BASE)(c);
+            ok = c.r[3] == 2 && heat(BASE).entries == 2 && heat(BASE + 8).entries == 2 && heat(BASE + 16).entries == 0;
+            static const GeneratedFunction partial_functions[] = {{BASE + 8, [](Context &c) { c.r[3] += 1000; }}};
+            GeneratedModule partial = *p.module->table();
+            partial.functions = partial_functions, partial.count = 1;
+            std::string error;
+            ok = ok && p.module->adopt(partial, error) == 1;
+            fresh();
+            p.fn(BASE)(c);
+            ok = ok && c.r[3] == 1000 && heat(BASE + 8).adopted && heat(BASE + 8).library_calls == 1;
+            static const GeneratedFunction whole_functions[] = {{BASE, [](Context &c) { c.r[3] += 5; }},
+                                                                {BASE + 8, [](Context &c) { c.r[3] += 2000; }}};
+            GeneratedModule whole = *p.module->table();
+            whole.functions = whole_functions, whole.count = 2;
+            ok = ok && p.module->adopt(whole, error) == 2;
+            fresh();
+            p.fn(BASE)(c);
+            ok = ok && c.r[3] == 5;
+            // BASE's code has a frame (an address inside it among the live
+            // ones), BASE + 16's library has none: both kept; BASE + 8's released
+            const auto [begin, end] = p.module->code_range();
+            std::vector<uintptr_t> live;
+            for (uintptr_t a = begin; a < end; a += 4) {
+                std::string name;
+                uint64_t displacement = 0;
+                if (p.module->describe(a, name, displacement) && name == "tier 0x80000000") {
+                    live.push_back(a);
+                    break;
+                }
+            }
+            xf::stencil::ReleaseStats released;
+            p.module->release(live, released, error);
+            ok = ok && live.size() == 1 && released.released == 1 && released.live == 1 && released.not_adopted == 1 &&
+                 heat(BASE + 8).released && !heat(BASE).released;
+            // the released function's entry still goes to the library, and the
+            // function the library lacks still runs here
+            fresh();
+            p.fn(BASE + 8)(c);
+            p.fn(BASE + 16)(c);
+            ok = ok && c.r[3] == 2002;
+        }
+        check(ok, "hot functions first and the tier released");
+    }
+    {
+        // the compare-and-branch superinstructions: a loop's cmpwi and blt (a
+        // back edge), a cmplwi and bgt on cr6, a cmpw and bne on cr1; a bc
+        // something branches to is left alone
+        Program p({0x38800000,   // 80000000 li r4, 0
+                   0x38840001,   // 80000004 addi r4, r4, 1
+                   0x2C04000A,   // 80000008 cmpwi r4, 10
+                   0x4180FFF8,   // 8000000C blt 80000004
+                   0x2B040005,   // 80000010 cmplwi cr6, r4, 5
+                   0x4199000C,   // 80000014 bgt cr6, 80000020
+                   0x38600001,   // 80000018 li r3, 1
+                   0x4E800020,   // 8000001C blr
+                   0x38600002,   // 80000020 li r3, 2
+                   0x7C832000,   // 80000024 cmpw cr1, r3, r4
+                   0x40860008,   // 80000028 bne cr1, 80000030
+                   0x38600003,   // 8000002C li r3, 3
+                   0x4E800020,   // 80000030 blr
+                   0x2C030002,   // 80000034 cmpwi r3, 2
+                   0x4BFFFFF8,   // 80000038 b 80000030 (not reached)
+                   0x2C030002,   // 8000003C cmpwi r3, 2 (its bc a branch's target)
+                   0x41820008,   // 80000040 beq 80000048
+                   0x4BFFFFFC,   // 80000044 b 80000040
+                   0x38600007,   // 80000048 li r3, 7
+                   0x4E800020}); // 8000004C blr
+        p.function(BASE, 0x38);
+        p.function(BASE + 0x3C, 0x14);
+        bool ok = p.compile() && p.stats.fused == 3;
+        if (ok) {
+            fresh();
+            p.fn(BASE)(c);
+            ok = c.r[3] == 2 && c.r[4] == 10 && c.cr[4 * 1 + 2] == 0 && c.cr[4 * 6 + 1] == 1;
+            fresh();
+            c.r[3] = 2;
+            p.fn(BASE + 0x3C)(c);
+            ok = ok && c.r[3] == 7;
+        }
+        check(ok, "compare and branch");
     }
     return failed;
 }

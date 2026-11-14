@@ -38,6 +38,7 @@
 // relocation is a field the tier can write (xf::ppc::runtime's too).
 #pragma GCC visibility push(hidden)
 
+#include "stencil_fields.h"
 #include "xenoforge/ppc_module.h"
 #include "xenoforge/ppc_ops.h"
 
@@ -48,6 +49,7 @@ using namespace xf::ppc;
 
 extern "C" {
 extern char xf_hole_word[], xf_hole_a[], xf_hole_b[], xf_hole_data[];
+extern char xf_hole_f0[], xf_hole_f1[], xf_hole_f2[], xf_hole_f3[], xf_hole_f4[];
 XF_CC uint32_t xf_hole_next(Context *c);
 XF_CC uint32_t xf_hole_target(Context *c);
 XF_CC uint32_t xf_hole_call(Context *c);
@@ -106,15 +108,175 @@ struct MidData {
 
 } // namespace
 
-// ---- every instruction of the semantics: ops::run with the word as a hole ----
+// ---- every instruction of the semantics: ops::run with the word as holes ----
 
-#define XF_PPC_OP(name, opcode, form, group, description)                                                              \
-    XF_STENCIL xf_st_op_##name(Context *c) {                                                                           \
-        ops::run<Opcode::name>(*c, Instr{WORD});                                                                       \
+namespace {
+
+using xf::stencil::Ra;
+using xf::stencil::Regs;
+
+// The value of field hole K, said to fit its field (an unreachable branch past
+// it, which the optimizer keeps as what it knows of the value's bits).
+template <Form F, int K> XF_INLINE uint32_t field_hole() {
+    uint32_t v;
+    if constexpr (K == 0)
+        v = hole32(xf_hole_f0);
+    else if constexpr (K == 1)
+        v = hole32(xf_hole_f1);
+    else if constexpr (K == 2)
+        v = hole32(xf_hole_f2);
+    else if constexpr (K == 3)
+        v = hole32(xf_hole_f3);
+    else
+        v = hole32(xf_hole_f4);
+    if (v >= (1u << xf::stencil::field_width(F, K))) __builtin_unreachable();
+    return v;
+}
+
+// Field K of the word written from its hole (FIELDS), or kept as the word's
+// hole has it; then what the variant knows of it: RA's value or what it is
+// not, RB a copy of RS.
+template <Form F, int K, int32_t RA, Regs REGS, bool FIELDS> XF_INLINE void put_field(Instr &i) {
+    if constexpr (K < xf::stencil::field_count(F)) {
+        if constexpr (K == 1 && RA >= 0) {
+            xf::stencil::set_field(F, K, i, uint32_t(RA));
+        } else if constexpr (K == 2 && REGS == Regs::Move) {
+            xf::stencil::set_field(F, K, i, xf::stencil::get_field(F, 0, i));
+        } else {
+            const uint32_t v = FIELDS ? field_hole<F, K>() : xf::stencil::get_field(F, K, i);
+            if constexpr (K == 1 && RA == int32_t(Ra::Other))
+                if (v == 0 || v == 1 || v == 13) __builtin_unreachable();
+            if constexpr (K == 1 && RA == int32_t(Ra::NonZero))
+                if (v == 0) __builtin_unreachable();
+            if constexpr (FIELDS) xf::stencil::set_field(F, K, i, v);
+        }
+    }
+}
+
+// The word as the semantics read it (stencil_fields.h): the word's hole with
+// its form's register fields taken from their own holes (FIELDS) or from it;
+// then what the variant knows: RA's value or what it is not, the registers'
+// sameness, and the bits it has constant.
+template <Form F, bool FIELDS, uint32_t MASK = 0, uint32_t BITS = 0, int32_t RA = int32_t(Ra::Any),
+          Regs REGS = Regs::Any>
+XF_INLINE Instr operands() {
+    Instr i{WORD};
+    put_field<F, 0, RA, REGS, FIELDS>(i);
+    put_field<F, 1, RA, REGS, FIELDS>(i);
+    put_field<F, 2, RA, REGS, FIELDS>(i);
+    put_field<F, 3, RA, REGS, FIELDS>(i);
+    put_field<F, 4, RA, REGS, FIELDS>(i);
+    if constexpr (REGS == Regs::Move)
+        if (i.X.RA == i.X.RT) __builtin_unreachable();
+    if constexpr (REGS == Regs::Distinct)
+        if (i.X.RT == i.X.RA && i.X.RA == i.X.RB) __builtin_unreachable();
+    i.code = (i.code & ~MASK) | BITS;
+    return i;
+}
+
+// An instruction's semantics.
+template <Opcode OP> XF_INLINE void run_op(Context *c, Instr i) { ops::run<OP>(*c, i); }
+
+} // namespace
+
+// Each stencil twice: its register fields from holes (`name`), and read from
+// the word as the semantics do (`name_w`). Where the semantics pass the word
+// on (to an out-of-line slow path), the first has to put it back together and
+// comes out longer; the tier copies whichever is shorter (stencil_jit.cpp).
+#define XF_OP_STENCILS(stencil, name, form, ...)                                                                       \
+    XF_STENCIL stencil(Context *c) {                                                                                   \
+        run_op<Opcode::name>(c, operands<Form::form, true, ##__VA_ARGS__>());                                          \
+        NEXT;                                                                                                          \
+    }                                                                                                                  \
+    XF_STENCIL stencil##_w(Context *c) {                                                                               \
+        run_op<Opcode::name>(c, operands<Form::form, false, ##__VA_ARGS__>());                                         \
         NEXT;                                                                                                          \
     }
+
+#define XF_PPC_OP(name, opcode, form, group, description)                                                              \
+    XF_OP_STENCILS(xf_st_op_##name, name, form)                                                                        \
+    XF_RC0_##form(name, form)
+
+// the variant with Rc (and XO's OE) 0, for the forms that have it (stencil_fields.h's rc_mask)
+#define XF_RC0(name, form) XF_OP_STENCILS(xf_st_op_##name##_rc0, name, form, xf::stencil::rc_mask(Form::form), 0)
+#define XF_RC0_NONE(name, form)
+#define XF_RC0_X XF_RC0
+#define XF_RC0_XO XF_RC0
+#define XF_RC0_A XF_RC0
+#define XF_RC0_M XF_RC0
+#define XF_RC0_MD XF_RC0
+#define XF_RC0_MDS XF_RC0
+#define XF_RC0_XS XF_RC0
+#define XF_RC0_VC XF_RC0
+#define XF_RC0_VX128_R XF_RC0
+#define XF_RC0_SC XF_RC0_NONE
+#define XF_RC0_D XF_RC0_NONE
+#define XF_RC0_DS XF_RC0_NONE
+#define XF_RC0_B XF_RC0_NONE
+#define XF_RC0_I XF_RC0_NONE
+#define XF_RC0_XL XF_RC0_NONE
+#define XF_RC0_XFX XF_RC0_NONE
+#define XF_RC0_XFL XF_RC0_NONE
+#define XF_RC0_DCBZ XF_RC0_NONE
+#define XF_RC0_VX XF_RC0_NONE
+#define XF_RC0_VA XF_RC0_NONE
+#define XF_RC0_VX128 XF_RC0_NONE
+#define XF_RC0_VX128_1 XF_RC0_NONE
+#define XF_RC0_VX128_2 XF_RC0_NONE
+#define XF_RC0_VX128_3 XF_RC0_NONE
+#define XF_RC0_VX128_4 XF_RC0_NONE
+#define XF_RC0_VX128_5 XF_RC0_NONE
+#define XF_RC0_VX128_P XF_RC0_NONE
 #include "xenoforge/ppc_opcodes.inc"
 #undef XF_PPC_OP
+
+// RA known (stencil_fields.h's XF_STENCIL_RA4 and XF_STENCIL_RA2)
+#define XF_RA_VARIANT(name, form, suffix, ra) XF_OP_STENCILS(xf_st_op_##name##_##suffix, name, form, 0, 0, int32_t(ra))
+#define XF_RA4(name, form)                                                                                             \
+    XF_RA_VARIANT(name, form, ra0, 0)                                                                                  \
+    XF_RA_VARIANT(name, form, ra1, 1)                                                                                  \
+    XF_RA_VARIANT(name, form, ra13, 13)                                                                                \
+    XF_RA_VARIANT(name, form, ran, Ra::Other)
+#define XF_RA2(name, form)                                                                                             \
+    XF_RA_VARIANT(name, form, ra0, 0)                                                                                  \
+    XF_RA_VARIANT(name, form, ran, Ra::NonZero)
+XF_STENCIL_RA4(XF_RA4)
+XF_STENCIL_RA2(XF_RA2)
+
+// a vsldoi's shift known (XF_STENCIL_SH16)
+#define XF_SH_VARIANT(name, form, sh) XF_OP_STENCILS(xf_st_op_##name##_sh##sh, name, form, 0xFu << 6, uint32_t(sh) << 6)
+#define XF_SH16(name, form)                                                                                            \
+    XF_SH_VARIANT(name, form, 0)                                                                                       \
+    XF_SH_VARIANT(name, form, 1)                                                                                       \
+    XF_SH_VARIANT(name, form, 2)                                                                                       \
+    XF_SH_VARIANT(name, form, 3)                                                                                       \
+    XF_SH_VARIANT(name, form, 4)                                                                                       \
+    XF_SH_VARIANT(name, form, 5)                                                                                       \
+    XF_SH_VARIANT(name, form, 6)                                                                                       \
+    XF_SH_VARIANT(name, form, 7)                                                                                       \
+    XF_SH_VARIANT(name, form, 8)                                                                                       \
+    XF_SH_VARIANT(name, form, 9)                                                                                       \
+    XF_SH_VARIANT(name, form, 10)                                                                                      \
+    XF_SH_VARIANT(name, form, 11)                                                                                      \
+    XF_SH_VARIANT(name, form, 12)                                                                                      \
+    XF_SH_VARIANT(name, form, 13)                                                                                      \
+    XF_SH_VARIANT(name, form, 14)                                                                                      \
+    XF_SH_VARIANT(name, form, 15)
+XF_STENCIL_SH16(XF_SH16)
+
+// an SPR known (XF_STENCIL_SPR)
+#define XF_SPR_VARIANT(name, form, spr)                                                                                \
+    XF_OP_STENCILS(xf_st_op_##name##_spr##spr, name, form, 0x3FFu << 11, xf::stencil::spr_bits(spr))
+#define XF_SPR_OF(name, form) XF_STENCIL_SPRS(XF_SPR_##name)
+#define XF_SPR_mfspr(spr) XF_SPR_VARIANT(mfspr, XFX, spr)
+#define XF_SPR_mtspr(spr) XF_SPR_VARIANT(mtspr, XFX, spr)
+XF_STENCIL_SPR(XF_SPR_OF)
+
+// orx as mr, and as no priority hint (XF_STENCIL_OR)
+#define XF_OR(name, form)                                                                                              \
+    XF_OP_STENCILS(xf_st_op_##name##_mr, name, form, 1, 0, int32_t(Ra::Any), Regs::Move)                               \
+    XF_OP_STENCILS(xf_st_op_##name##_or, name, form, 1, 0, int32_t(Ra::Any), Regs::Distinct)
+XF_STENCIL_OR(XF_OR)
 
 // ---- the control flow, as recomp_emit.cpp writes it in C++ ----
 
@@ -260,9 +422,12 @@ XF_STENCIL xf_st_mid(Context *c) {
 
 // What a function's entry jumps to once the game library has it (the
 // tier-up, stencil.h's Module::adopt): the library's function (data: a
-// pointer to it), called with the C++ convention, then the return.
+// pointer to it, then its calls, counted), called with the C++ convention,
+// then the return.
 XF_STENCIL xf_st_adopted(Context *c) {
-    (*reinterpret_cast<void (*const *)(Context &)>(xf_hole_data))(*c);
+    uint64_t *data = reinterpret_cast<uint64_t *>(xf_hole_data);
+    data[1]++;
+    (*reinterpret_cast<void (*)(Context &)>(__atomic_load_n(&data[0], __ATOMIC_RELAXED)))(*c);
     return EXIT_RETURN;
 }
 
@@ -320,3 +485,26 @@ XF_STENCIL xf_st_adopted(Context *c) {
         NEXT;                                                                                                          \
     }
 XF_BO_ALL(XF_BO_STENCILS)
+
+// The compare-and-branch superinstructions (stencil_fields.h's XF_STENCIL_CMP):
+// the compare, then the bc on its CR field's bit `bit`, taken when the bit is
+// set (sense 1, BO 12) or clear (sense 0, BO 4). The compiler sees the bit
+// stored and read at the same place, so the branch tests the compare's result.
+#define XF_CMPBC_ONE(name, form, sense, bit)                                                                           \
+    XF_STENCIL xf_st_cmpbc_##name##_##sense##_##bit(Context *c) {                                                      \
+        const Instr i = operands<Form::form, true>();                                                                  \
+        ops::run<Opcode::name>(*c, i);                                                                                 \
+        const uint32_t bi = (xf::stencil::get_field(Form::form, 0, i) >> 2) * 4 + (bit);                               \
+        if (ops::branch_condition(*c, (sense) ? 12 : 4, bi)) TARGET;                                                   \
+        NEXT;                                                                                                          \
+    }
+#define XF_CMPBC(name, form)                                                                                           \
+    XF_CMPBC_ONE(name, form, 0, 0)                                                                                     \
+    XF_CMPBC_ONE(name, form, 0, 1)                                                                                     \
+    XF_CMPBC_ONE(name, form, 0, 2)                                                                                     \
+    XF_CMPBC_ONE(name, form, 0, 3)                                                                                     \
+    XF_CMPBC_ONE(name, form, 1, 0)                                                                                     \
+    XF_CMPBC_ONE(name, form, 1, 1)                                                                                     \
+    XF_CMPBC_ONE(name, form, 1, 2)                                                                                     \
+    XF_CMPBC_ONE(name, form, 1, 3)
+XF_STENCIL_CMP(XF_CMPBC)

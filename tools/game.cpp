@@ -238,6 +238,9 @@ std::unique_ptr<stencil::Module> make_stencil_module(const Xex &xex, const std::
     static const ppc::Runtime runtime = ppc::host_runtime();
     stencil::Options o;
     o.count = count;
+    // XF_STENCIL_MAP=1: each stencil's copies kept, so a profile names them
+    const char *map = std::getenv("XF_STENCIL_MAP");
+    o.map = map && *map && *map != '0';
     if (project) o.project = &hooks;
     return stencil::compile(image, d, runtime, name, image_digest(xex.image), o, s, error);
 }
@@ -281,6 +284,7 @@ bool load_stencil_tier(const Options &options, Game &g) {
     }
     const uint64_t peak = process_bytes();
     g.stencil_counting = count;
+    g.started = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
     g.stencil_table[0] = g.stencil->table();
     g.kernel->set_generated_modules(g.stencil_table, 1);
     g.generated_modules = 1, g.generated_functions = s.compiled, g.installed_modules = g.stencil_table;
@@ -459,26 +463,171 @@ const char *tier_name(const Game &g) {
     return "the interpreter";
 }
 
+namespace {
+
+double steady_seconds() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// The tier's modules (the executable's, then the DLLs').
+std::vector<stencil::Module *> tier_modules(Game &g) {
+    std::vector<stencil::Module *> out;
+    if (g.stencil) out.push_back(g.stencil.get());
+    for (auto &d : g.stencil_dlls) out.push_back(d.get());
+    return out;
+}
+
+// The entries the tier's code took (not the library's), and the calls its
+// entries passed to library code (Module::heat).
+std::pair<uint64_t, uint64_t> tier_entries(const stencil::Module &m) {
+    uint64_t tier = 0, library = 0;
+    for (const stencil::FunctionHeat &h : m.heat()) tier += h.entries, library += h.library_calls;
+    return {tier, library};
+}
+
+// The share of the entries since the partial library was adopted that its
+// code served: its calls against the entries the tier's own code took since.
+std::string partial_share(Game &g) {
+    if (!g.partial_library || !g.stencil) return "";
+    const auto [tier, library] = tier_entries(*g.stencil);
+    const uint64_t since = tier - std::min(tier, g.partial_tier_entries);
+    char line[200];
+    std::snprintf(line, sizeof(line),
+                  "%.1f%% of the function entries since the partial library came went to its code (%llu of %llu)",
+                  library + since ? 100.0 * double(library) / double(library + since) : 0.0,
+                  (unsigned long long)library, (unsigned long long)(library + since));
+    return line;
+}
+
+// The executable's heat written where the background build reads it.
+void write_hot_list(Game &g) {
+    if (!g.stencil || g.cache_key.empty()) return;
+    std::vector<build::HotFunction> hot;
+    for (const stencil::FunctionHeat &h : g.stencil->heat())
+        if (h.entries + h.back_edges && !h.adopted) hot.push_back({h.address, h.entries, h.back_edges, h.instructions});
+    if (!hot.empty()) build::write_hot_list(build::hot_list_path(g.cache, g.cache_key), hot);
+}
+
+// A partial library (the hot functions, built first) adopted by the tier's
+// executable code alone: the kernel keeps the tier's tables, whose entries
+// now jump to the partial library's functions. True once adopted.
+bool adopt_partial(Game &g) {
+    auto partial = build::find_partial(g.cache, g.cache_key);
+    if (!partial) return false;
+    static const ppc::Runtime runtime = ppc::host_runtime();
+    std::string error;
+    const ppc::GameLibrary *lib = ppc::load_game_library(*partial, runtime, error);
+    if (!lib) {
+        std::printf("tier-up: the partial library %s did not load (%s)\n", partial->string().c_str(), error.c_str());
+        g.partial_failed = true;
+        return false;
+    }
+    kernel::Kernel &k = *g.kernel;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!k.pause(500)) {
+        k.resume();
+        std::printf("tier-up: %u guest threads did not park in 0.5 s; trying again\n", k.pause_unparked());
+        return false;
+    }
+    size_t moved = 0;
+    for (size_t i = 0; i < lib->count; i++) {
+        const ppc::GeneratedModule &m = *lib->modules[i];
+        const ppc::GeneratedModule &t = *g.stencil->table();
+        if (m.base != t.base || m.digest != t.digest) continue;
+        moved += g.stencil->adopt(m, error);
+    }
+    g.partial_tier_entries = tier_entries(*g.stencil).first;
+    k.resume();
+    g.partial_library = lib;
+    std::printf("tier-up: the partial library %s (the hot functions) runs %zu of the tier's functions now; the "
+                "threads paused %.1f ms\n",
+                partial->string().c_str(), moved,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1000.0);
+    std::fflush(stdout);
+    return true;
+}
+
+// After the tier-up: the tier's code no frame is in released (Module::release),
+// at a pause, from the guest threads' host stacks as they wait.
+void release_tier(Game &g) {
+    kernel::Kernel &k = *g.kernel;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!k.pause(500)) {
+        k.resume();
+        return;
+    }
+    size_t bytes = 0, held = 0;
+    stencil::ReleaseStats all;
+    bool scanned = true;
+    std::string error;
+    for (stencil::Module *m : tier_modules(g)) {
+        const auto [low, high] = m->code_range();
+        std::vector<uintptr_t> live;
+        if (!k.scan_host_stacks(low, high, live)) {
+            scanned = false;
+            break;
+        }
+        stencil::ReleaseStats s;
+        bytes += m->release(live, s, error);
+        all.released += s.released, all.live += s.live, all.not_adopted += s.not_adopted;
+        all.unwind_dropped += s.unwind_dropped;
+        held += m->committed_bytes();
+    }
+    k.resume();
+    g.released_bytes += bytes;
+    if (!scanned) {
+        std::printf("tier release: a host thread runs guest code (its stack is not scanned); later\n");
+        return;
+    }
+    std::printf("tier release: %zu functions' code released (%.1f MB; %.1f MB in all), %zu kept with a frame in them, "
+                "%zu the library lacks, %zu unwind entries dropped; the tier holds %.1f MB now; the threads paused "
+                "%.1f ms%s%s\n",
+                all.released, bytes / 1048576.0, g.released_bytes / 1048576.0, all.live, all.not_adopted,
+                all.unwind_dropped, held / 1048576.0,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * 1000.0,
+                error.empty() ? "" : "; ", error.c_str());
+    std::fflush(stdout);
+}
+
+} // namespace
+
 bool poll_tier_up(Game &g) {
-    if (g.tier != Game::Tier::Stencil || !g.tier_up) return false;
-    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const double now = steady_seconds();
     if (now - g.tier_up_polled < 2.0) return false;
     g.tier_up_polled = now;
     kernel::Kernel &k = *g.kernel;
+    if (g.tier == Game::Tier::Library && g.stencil && g.release_tries < 10 && now - g.release_polled >= 0) {
+        // the tier's code released: three times 2 s apart, then every 30 s
+        release_tier(g);
+        g.release_polled = now + (++g.release_tries < 3 ? 0.0 : 28.0);
+        return false;
+    }
+    if (g.tier != Game::Tier::Stencil || !g.tier_up) return false;
+    // the hot list: after 10 s on the tier, then every 20 s
+    if (!g.partial_library && now - g.started >= 10.0 && now - g.hot_list_written >= 20.0) {
+        write_hot_list(g);
+        g.hot_list_written = now;
+    }
     if (!g.tier_up_library) {
         auto cached = build::find_cached(g.cache, g.cache_key);
-        if (!cached) return false;
+        if (!cached) {
+            if (!g.partial_library && !g.partial_failed) adopt_partial(g);
+            return false;
+        }
         static const ppc::Runtime runtime = ppc::host_runtime();
         std::string error;
         g.tier_up_library = ppc::load_game_library(cached->library, runtime, error);
         if (!g.tier_up_library) {
-            std::printf("tier-up: the game library %s did not load (%s); staying on the first tier\n",
-                        cached->library.string().c_str(), error.c_str());
-            g.tier_up = false;
+            // (tried again twice: a file still being written or scanned is not there for good)
+            const bool last = ++g.tier_up_failures >= 3;
+            std::printf("tier-up: the game library %s did not load (%s)%s\n", cached->library.string().c_str(),
+                        error.c_str(), last ? "; staying on the first tier" : "; trying again");
+            if (last) g.tier_up = false;
             return false;
         }
         std::printf("tier-up: the game library %s is ready\n", cached->library.string().c_str());
     }
+    const std::string share = partial_share(g);
     // every guest thread parked at a safe point while the entries change
     const auto t0 = std::chrono::steady_clock::now();
     if (!k.pause(500)) {
@@ -506,9 +655,10 @@ bool poll_tier_up(Game &g) {
     g.generated_modules = lib.count, g.generated_functions = functions, g.installed_modules = lib.modules;
     g.tier = Game::Tier::Library;
     g.tier_up = false;
+    g.release_polled = now + 2.0;
     std::printf("tier-up: the game library runs the guest now: %zu of its modules in place of the first tier's, "
-                "%zu of the tier's function entries jump to it; the threads paused %.1f ms\n",
-                moved.size(), entries, paused * 1000.0);
+                "%zu of the tier's function entries jump to it; the threads paused %.1f ms%s%s\n",
+                moved.size(), entries, paused * 1000.0, share.empty() ? "" : "; before it, ", share.c_str());
     std::fflush(stdout);
     return true;
 }
@@ -694,6 +844,27 @@ void print_report(Game &g, bool waiting) {
             std::printf(" %s %.2f%%", ppc::info(ppc::Opcode(by_op[k].second)).name,
                         100.0 * double(by_op[k].first) / double(run ? run : 1));
         std::printf("\n");
+        // the stencils' bytes a guest instruction and the slow paths taken
+        // (XF_STENCIL_PIECES=<file>: every stencil's runs written there)
+        const char *pieces = std::getenv("XF_STENCIL_PIECES");
+        std::printf("%s", g.stencil->count_report(15, pieces ? pieces : "").c_str());
+    }
+    if (g.stencil) {
+        // the hot functions (the heat the background build orders by), and
+        // after a tier-up what the library took and what was released
+        std::vector<stencil::FunctionHeat> heat = g.stencil->heat();
+        uint64_t entries = 0, back = 0, library = 0;
+        size_t adopted = 0, released = 0;
+        for (const stencil::FunctionHeat &h : heat) {
+            entries += h.entries, back += h.back_edges, library += h.library_calls;
+            adopted += h.adopted, released += h.released;
+        }
+        std::printf("first tier: %llu function entries and %llu back edges in its code, %llu calls to library code "
+                    "from its entries; %zu of %zu functions adopted, %zu released (%.1f MB)\n",
+                    (unsigned long long)entries, (unsigned long long)back, (unsigned long long)library, adopted,
+                    heat.size(), released, g.released_bytes / 1048576.0);
+        if (const std::string share = partial_share(g); !share.empty())
+            std::printf("  hot functions first: %s\n", share.c_str());
     }
     if (g.entry_log.size())
         std::printf("entry log: %zu addresses, %zu new this run\n", g.entry_log.size(), g.entry_log.added());

@@ -55,6 +55,7 @@ PrepareJob::Runner PrepareJob::build_runner(std::filesystem::path disc, std::fil
         if (jobs) options.jobs = jobs;
         options.force = force;
         options.background = background;
+        options.hot_first = background; // the game plays on the first tier meanwhile: its hot functions first
         // the shaders runs met, made into the title's pipeline cache
         options.shader_step = &render::run_shader_step;
         return build::prepare_game(disc, cache_dir, progress, error, options);

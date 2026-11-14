@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -61,6 +63,47 @@ void *create_fiber(void (*entry)(void *), void *arg);
 void switch_fiber(void *fiber);
 void delete_fiber(void *fiber);
 void *current_fiber();
+
+// ---- the host stacks guest code runs on, for a scan at a pause ----
+//
+// Every host stack that runs guest code is registered while it lives: a guest
+// thread's own (HostStackScope, in Thread::body) and every host fiber
+// (create_fiber's, until delete_fiber). Each keeps its base (the high end
+// where it started) and, while the guest's frames on it are suspended, the
+// lowest of them: the frame of the kernel call, park or fiber switch they
+// wait in (HostStackMark, set before the thread says it runs no guest code).
+// At a pause (Kernel::pause: no guest thread runs guest code), [sp, base) of
+// each holds every return address into generated code its frames have:
+// scan_host_stacks reads them (docs/runtime.md, "Releasing the first tier").
+struct HostStackRecord {
+    std::atomic<uintptr_t> sp{0}; // 0: no guest frame on it now
+    uintptr_t base = 0;           // 0: not started
+};
+class HostStackScope {
+  public:
+    HostStackScope();
+    ~HostStackScope();
+    HostStackScope(const HostStackScope &) = delete;
+    HostStackScope &operator=(const HostStackScope &) = delete;
+
+  private:
+    HostStackRecord record_;
+    HostStackRecord *outer_;
+};
+class HostStackMark {
+  public:
+    HostStackMark();
+    ~HostStackMark();
+    HostStackMark(const HostStackMark &) = delete;
+    HostStackMark &operator=(const HostStackMark &) = delete;
+
+  private:
+    HostStackRecord *record_;
+    uintptr_t outer_ = 0;
+};
+// Every registered stack's suspended frames, [sp, base), given to `fn` as
+// 8-byte words, under the registry's lock. Only at a pause.
+void scan_host_stacks(const std::function<void(const uint64_t *begin, const uint64_t *end)> &fn);
 
 // KeSetCurrentStackPointers on the calling thread's context, r1 already set
 // to the new stack (from_sp: where the old one was): when the new stack is

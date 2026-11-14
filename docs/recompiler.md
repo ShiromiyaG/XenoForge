@@ -1672,7 +1672,8 @@ emitter has: checked returns and resume sites, branches to a stack switch,
 the port's hooks, and the DLLs. Linux and ARM64 came after ("Linux and
 ARM64" below).
 
-Faster code is the larger question. What would pay, in order: stencils that
+Faster code is the larger question (the first two below are done since:
+"Stencils that know their operands"). What would pay, in order: stencils that
 know more of their word (variants for the D forms with `rA` not 0, and with
 the base register r1 or r13, which drop the `rA|0` branch and the MMIO check:
 the variant's condition given to the compiler with `__builtin_assume`, the
@@ -1761,7 +1762,9 @@ at each exit, without the stencils between carrying them.
 5-byte and a 3-byte `nop`, 8-byte aligned) before what runs (the body, or the
 hook's check, the checking frame or the resumable entry); every call and tail
 branch from another function, and the table's C++ entry, go there; a branch
-inside the function to its own start goes past it.
+inside the function to its own start goes past it. (Since 2026-11-14 the
+fronts are a table of their own, apart from the code: "Hot functions first
+and the tier released" below.)
 
 **Tier-up.** When the library is in the cache (poll_tier_up, every 2 s on
 the first tier), it is loaded and every guest thread parked
@@ -1777,9 +1780,9 @@ function's front, the eight bytes stored at once while the code is made
 writable without ceasing to be executable. So new calls, from dispatch and
 from the tier's own code, run the library's; frames already in the tier
 finish there (a return address is never inside a front, which holds no
-call). The tier's memory stays mapped for the process's life. The entry
-counts that would order the build (hot files first) are not done: the
-whole library is built and taken at once.
+call). (Since 2026-11-14 the hot functions come first, in a partial library,
+and the tier's code no frame is in is released: "Hot functions first and the
+tier released" below.)
 
 **Checks.** `ppc_stencil_test` runs, besides the 141,705 instruction cases,
 a program for each construct: checked returns (a return with r1 moved is
@@ -1854,3 +1857,162 @@ crossing the tier's frames, which on ELF goes through the registered
 `.eh_frame`. Game B on Linux x86-64 leaves the same guest memory hash at swap
 1,500 on the tier, interpreted and on Windows' tier (docs/runtime.md, "Other
 hosts").
+
+### Stencils that know their operands (2026-11-14)
+
+A game's startup videos (game E's logos, a VMX video decoder on a thread of
+its own) played at 6 to 10 swaps a second on the tier against 30 on the
+library: a factor of three to five where the tier's usual is three. Why,
+and what changed:
+
+- **The CPU level was not it.** The stencils are compiled with the game
+  library's flags at x86-64-v3 (`xfstencil`; `stencil::available()` refuses
+  a CPU without v3), so the SSSE3 `pshufb` permutes and the whole-vector
+  saturating adds, merges and packs of "Video decoding" above are what the
+  tier copies: `vperm`'s stencil is the two `vpshufb`, the compare and the
+  `vpblendvb`. (A CPU with v2 alone gets no tier: a second stencil set
+  built at v2 and picked by the host's level, as the library's is, would
+  give it one; not done.)
+- **What the decoder's thread runs** (`boot --profile --profile-thread`
+  with `XF_STENCIL_MAP=1`, which names the stencil each sample is in; 30 s
+  of the logos): 99% of its time in the tier's code, spread over the vector
+  stencils: `lvx128` 10%, `vaddshs` 7%, `vsubfp128` 7%, `stvx128` 6%,
+  `vaddfp128` 5%, `vsrah` 5%, `lvlx128` and `lvrx128` 5%, `vsubshs` 4%,
+  `vperm128` 3%, `vmulfp128` 3%, `vor128` 3%. Slow paths are not it: the
+  shared helpers the stencils call out of line (counted with
+  `XF_STENCIL_COUNT=1`) ran about once per 25,000 guest instructions.
+- **It is the overhead per instruction, which the library has none of.** A
+  VMX instruction is one or two host instructions in the library, which keeps
+  the vector registers in host registers across a function; a stencil loads
+  its two or three operands from the context, stores its result back, and
+  before this change decoded its register numbers from the word at run time,
+  which for VMX128's 7-bit numbers (put together from three places in the
+  word) was most of it (`vperm128`: 25 of its 39 host instructions).
+  Straight-line VMX code is nothing but such instructions; branchy integer
+  code pays the same overhead per instruction but the library pays there
+  too, for calls, memory and branches, so the gap is smaller. Two costs
+  stay: a vector result goes through the context to the next instruction
+  (a store, then a load: the forwarding latency on every dependency), and
+  the saturating ops OR VSCR[SAT] into the context (`vscr_sat |= saturated`),
+  a read-modify-write of one byte that a run of them chains on. The second
+  would go with a conditional store in the semantics
+  (`if (saturated) c.vscr_sat = 1;`), which changes the game library's
+  interface: proposed, not done.
+
+**Register fields as holes** (`src/stencil/stencil_fields.h`, shared by the
+stencils and the tier). Each form's register numbers (RT, RA, RB, FRT..FRC,
+VD..VC, VMX128's 7-bit VD128, VA128 and VB128, M's SH, MB and ME, XFX's spr)
+are holes of their own (`xf_hole_f0`..`f4`), written back into the word with
+the bitfields the semantics read them with and said to fit (an unreachable
+branch past a value out of range): the compiler reads each number as the
+hole's value, and a register's address is a scaled index of it. The tier
+fills the holes with the real word's fields, so the semantics see the real
+word. Where the semantics pass the word on to an out-of-line slow path, it
+has to be put back together from the holes and comes out longer; so every
+stencil is compiled twice, with the fields from holes and from the word
+(`_w`), and the tier copies whichever is shorter (`vperm128` 22 host
+instructions instead of 39, `lvx128` 20 to 24 instead of 30; the vector
+float ops keep the word).
+
+**Variants** (exact by construction: a variant is compiled with some of the
+word's bits constant, or a field's value known or known not to be some
+values, and the tier copies it only for a word that has them):
+- D and DS loads and stores, `addi` and `addis`: RA 0, 1, 13 or another (no
+  `(RA|0)` branch; for r1 and r13, the stack and the thread's block, no MMIO
+  check either: `lwz` off r1 is 14 instructions, 31 before);
+- X and VX128_1 loads and stores: RA 0 or not;
+- Rc 0 (and XO's OE 0) for every form with the bit: no CR0 update;
+- `vsldoi` and `vsldoi128` by shift: one shuffle instead of a binary search
+  of 16 (12 instructions, 121 before);
+- `mfspr` and `mtspr` for XER, LR, CTR and VRSAVE: no switch on the SPR;
+- `or` as `mr` (RB is RS, RA another) and as an or that is no priority hint.
+
+**Compare and branch** (`xf_st_cmpbc_*`): `cmp`, `cmpi`, `cmpl` or `cmpli`
+followed by a `bc` on a bit of the field it set, taken on the bit alone (BO
+4-7 or 12-15), with nothing branching to the `bc` (`branch_targets()`: the
+blocks discovery found, every branch's target, jump tables' cases, the
+returns after calls, resume sites, mid-function hooks): one stencil that
+compares, stores the field and branches on the bit it just computed.
+
+**Measured by counts** (`XF_STENCIL_COUNT=1` now counts each guest
+instruction and keeps the stencils made for it; `XF_STENCIL_PIECES=<file>`
+writes every stencil's runs and bytes and the opcodes' counts): game E's
+first 40 s (the logos and the decoder), 27.8 billion guest instructions. The
+host instructions of the stencils that run each guest instruction (its main
+path: the stencils made for it, its branches not taken), weighted by those
+runs: 28.6 with the stencils before this change (each opcode's, counted in
+their disassembly; a fused pair as its compare's and its `bc`'s) against
+17.8 now, 38% fewer; 83 bytes of stencils a guest instruction. The code:
+game B's 21,720 functions 115.1 MB (188 MB before), game E's 56,302 247.3
+MB, game A's 73,293 326.0 MB; 2,007 stencils, 258 KB. The instruction tests
+(141,705 cases) and game B's deterministic hash at swaps 100, 1,500 and 3,000
+(the tier, the library and the interpreter alike) are unchanged.
+
+What would still pay, in order: the memory base in a register beside the
+context (one load less an access, but `ops::host` reads it from the context:
+the semantics would take it as a parameter, an interface change); the
+conditional VSCR[SAT] store above (an interface change too); keeping vector
+registers in host registers across the stencils of a block (a stencil per
+register allocation: the paper's answer, which multiplies the stencils).
+
+### Hot functions first and the tier released (2026-11-14)
+
+**The entries table.** A function's front (the eight bytes the tier-up makes
+a jump to the library) is no longer the start of its code: the fronts are a
+table of their own after the shared pieces, each a jump to its function's
+code (x86-64: a `jmp rel32` and a 3-byte `nop`; ARM64: an 8-byte literal,
+then a `b` and a `nop`, or `ldr x16` and `br x16` when farther), and the
+table's C++ entries (`GeneratedFunction::fn`) are an array after it. Calls and
+tail branches between functions go to the fronts as before (a jump more on
+the tier), so a function's code can be released while the code that calls it
+stays.
+
+**Heat.** Each function's entries (a counter stencil first in its code) and
+its loops' back edges taken (one before each back edge's yield point) are
+counted on a writable page after the code, and so are the calls each tier-up
+adapter makes to the library (`xf_st_adopted`'s data is the library's
+function and its calls, on writable pages, so a later tier-up only points it
+elsewhere). `stencil::Module::heat()` gives them by function.
+
+**Hot functions first** (docs/runtime.md, "Hot functions first"): a game on
+the first tier writes its heat every 20 s (`<digest>.hot.txt` in the cache);
+the launcher's background build reads it once the code is emitted and builds
+the functions holding 99% of the entries and back edges (at most 2,000
+functions and 200,000 instructions; a bigger one is left to the whole
+library) into a partial library, `<digest>-<interface>-<level>.hot.dll`, from
+the emitted files: each functions file with only its hot functions, a stub
+(a dispatch to its own address) for every function they call and it lacks,
+the table with their lines alone, one module. The running game adopts it
+with `Module::adopt` alone: the kernel keeps the tier's tables, so dispatch
+still goes through the tier's entries, which now jump to the partial
+library, and the partial library's calls to what it lacks dispatch back into
+the tier. When the whole library is built it replaces it as before, and the
+adopted functions' adapters are pointed at it. Game E (the logos): 969
+functions (99% of the heat) built in 19 s of four compilers (45 s with the
+discovery and the emission); from their adoption to the whole library,
+93.8% of the function entries (120.7 of 128.7 million) went to library code,
+and the back edges taken in the tier's code fell from 741 million in 40 s to
+9 million.
+
+**The tier released.** After the tier-up, at three pauses 2 s apart (then
+every 30 s, ten in all), each guest thread's host stack is scanned for
+values inside the tier's code (`Kernel::scan_host_stacks`; docs/runtime.md,
+"Releasing the first tier"), and `Module::release` decommits the whole pages
+of the functions the library took that hold none of them (a frame in a
+function always leaves a return address into it on its stack), and drops
+their unwind entries (the Windows table registered again without them; on
+ELF the `.eh_frame` made again and registered in place). What stays: the
+shared pieces, the entries table and the C++ entries, the adapters, the
+functions with a frame in them (a thread's outermost loop never returns) and
+those the library lacks. Game E: 247.0 of 247.3 MB released (56,266
+functions; 36 kept), the tier then holding 25.0 MB, the threads paused 43 ms
+once; game B: 114.9 MB (21,702 functions; 18 kept), 13.1 MB held, 20 ms;
+game A: 325.6 MB (73,244 functions; 49 kept), 26.4 MB held, 59 ms. Each run
+went on to its end on the library, nothing interpreted.
+
+**Checks.** `ppc_stencil_test`'s programs add the compare-and-branch forms
+(three fused, one not: its `bc` a branch's target), and the heat, a partial
+library then a whole one (the adopted function pointed at the second), and a
+release with one function holding a frame (kept), one adopted (released, its
+entry still reaching the library) and one the library lacks (kept, still
+running on the tier).

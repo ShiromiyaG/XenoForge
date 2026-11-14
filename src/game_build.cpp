@@ -784,7 +784,7 @@ class Build {
     }
     bool fail(std::string &error, const std::string &why) {
         error = cancelled() ? "cancelled" : why;
-        report(Stage::Failed, 0, 0, error);
+        if (!partial_) report(Stage::Failed, 0, 0, error);
         return false;
     }
 
@@ -796,7 +796,15 @@ class Build {
     // to src_root) compiled and linked into out
     bool compile_and_link(const fs::path &src_root, const std::vector<std::string> &sources, const fs::path &work,
                           const fs::path &out, std::string &error);
+    // Hot functions first: the executable's hot functions (`hot`) out of the
+    // emitted code (src) into a partial library at `out`, its sources and
+    // objects under work/hot. What this build reports (left out, compiled)
+    // stays the whole library's.
+    bool partial(const fs::path &src, const fs::path &work, const recomp::EmittedModule &m,
+                 const std::vector<uint32_t> &hot, const fs::path &out, std::string &error);
 
+    // building the partial library: its failures are not the build's (no Failed reported)
+    bool partial_ = false;
     // what the build left out (the emission's and clang's), in order
     std::vector<LeftOutFunction> left_;
     // what each compiler took, and the jobs policy's line (BuildReport)
@@ -925,6 +933,94 @@ bool Build::compile_and_link(const fs::path &src_root, const std::vector<std::st
     return link(*bin, work, jobs, out, error);
 }
 
+bool Build::partial(const fs::path &src, const fs::path &work, const recomp::EmittedModule &m,
+                    const std::vector<uint32_t> &hot, const fs::path &out, std::string &error) {
+    partial_ = true;
+    struct Reset {
+        bool &partial;
+        ~Reset() { partial = false; }
+    } reset{partial_};
+    const std::unordered_set<uint32_t> wanted(hot.begin(), hot.end());
+    const fs::path root = work / "hot" / "src";
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    fs::create_directories(root / m.directory, ec);
+    if (ec) return fail(error, "cannot make " + utf8(root) + ": " + ec.message());
+    // each functions file's hot functions, with its declarations; then a stub
+    // (a dispatch to its own address) for each function they declare and the
+    // partial library lacks, so their calls to it reach the tier's code
+    std::vector<std::string> sources;
+    std::set<uint32_t> defined, declared;
+    std::string head, tail;
+    for (const std::string &s : m.sources) {
+        const fs::path file = src / s;
+        if (!is_functions_file(file)) continue;
+        SplitFile split;
+        if (!split_source(read_file(file), split)) continue;
+        std::string text;
+        for (const Chunk &c : split.chunks)
+            if (!c.hooked && wanted.count(c.address)) text += c.text + "\n", defined.insert(c.address);
+        if (text.empty()) continue;
+        if (head.empty()) head = split.head, tail = split.tail;
+        for (size_t at = split.head.find("XF_FN(xf_"); at != std::string::npos;
+             at = split.head.find("XF_FN(xf_", at + 1))
+            declared.insert(uint32_t(std::strtoul(split.head.c_str() + at + 9, nullptr, 16)));
+        if (!write_if_changed(root / s, split.head + text + split.tail)) return fail(error, "cannot write " + s);
+        sources.push_back(s);
+    }
+    if (defined.empty()) return fail(error, "none of the hot functions has emitted code");
+    std::string stubs = head;
+    for (uint32_t a : declared)
+        if (!defined.count(a)) stubs += recomp::left_out_stub("xf_", a, "not among the hot functions") + "\n";
+    stubs += tail;
+    const std::string stubs_file = m.directory + "/hot_stubs.cpp";
+    if (!write_if_changed(root / stubs_file, stubs)) return fail(error, "cannot write " + stubs_file);
+    sources.push_back(stubs_file);
+    // the module's table with only them (their lines, and its count)
+    const std::string table_file = m.directory + "/table.cpp";
+    std::string table, original = read_file(src / table_file);
+    size_t kept = 0;
+    for (size_t at = 0; at < original.size();) {
+        size_t end = original.find('\n', at);
+        end = end == std::string::npos ? original.size() : end + 1;
+        const std::string line = original.substr(at, end - at);
+        at = end;
+        if (line.starts_with("    {0x") && line.find("u, xf_") != std::string::npos) {
+            if (!defined.count(uint32_t(std::strtoul(line.c_str() + 7, nullptr, 16)))) continue;
+            kept++;
+        }
+        table += line;
+    }
+    const size_t count = table.find(" functions, ");
+    if (count == std::string::npos) return fail(error, "the table of " + m.directory + " is not as emitted");
+    const size_t digits = count + 12, end = table.find_first_not_of("0123456789", digits);
+    table.replace(digits, end - digits, std::to_string(kept));
+    if (!write_if_changed(root / table_file, table)) return fail(error, "cannot write " + table_file);
+    sources.push_back(table_file);
+    const std::string modules = "// Written by the recompile step: the partial library's one module.\n"
+                                "#include \"xenoforge/ppc_module.h\"\n\nnamespace " +
+                                m.ns +
+                                " {\nextern const ::xf::ppc::GeneratedModule module;\n}\n\nextern \"C\" const "
+                                "::xf::ppc::GeneratedModule *const xf_modules[] = {\n    &" +
+                                m.ns + "::module,\n};\nextern \"C\" const size_t xf_module_count = 1;\n";
+    if (!write_if_changed(root / "modules.cpp", modules)) return fail(error, "cannot write modules.cpp");
+    sources.push_back("modules.cpp");
+    report(Stage::Compiling, 0, 0,
+           "the " + std::to_string(defined.size()) + " hottest functions first (" + std::to_string(sources.size()) +
+               " files)");
+    // (what the whole library's report says stays its own)
+    const auto left = left_;
+    const auto compiled = compiled_;
+    const auto linked = linked_;
+    const fs::path built = work / "hot" / (std::string("game") + LIBRARY_EXTENSION);
+    const bool ok = compile_and_link(root, sources, work / "hot", built, error);
+    left_ = left, compiled_ = compiled, linked_ = linked;
+    if (!ok) return false;
+    fs::rename(built, out, ec);
+    if (ec) return fail(error, "cannot move the partial library into " + utf8(out) + ": " + ec.message());
+    return true;
+}
+
 void Build::force_failures(const std::vector<Job> &jobs) {
     for (const Job &j : jobs) {
         if (!is_functions_file(j.source)) continue;
@@ -991,7 +1087,7 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
         return true;
     }
     const bool same_project = read_report(report_path(cache, digest, level_)).value_or(BuildReport{}).project == project_digest;
-    if ((options_.shaders_only || (!options_.force && same_project)) && fs::exists(library, ec)) {
+    if ((options_.shaders_only || (!options_.force && !options_.hot_only && same_project)) && fs::exists(library, ec)) {
         BuildReport found = read_report(report_path(cache, digest, level_)).value_or(BuildReport{});
         if (options_.shader_step) {
             shaders(disc, cache, xex, digest, found);
@@ -1066,6 +1162,37 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
         if (!m.directory.empty()) module_paths_[m.directory] = m.path;
     }
     if (!left_.empty()) report(Stage::Emitting, 1, 1, std::to_string(left_.size()) + " functions left out");
+    if ((options_.hot_first || options_.hot_only) && options_.project.empty()) {
+        // hot functions first: the partial library, as the hot list a game on
+        // the first tier writes names them (a failure leaves only the whole
+        // one). The game writes it 10 s in: a build that got here sooner (a
+        // small executable) waits for it up to 20 s.
+        const fs::path list = hot_list_path(cache, digest);
+        for (int waited = 0; options_.hot_first && waited < 200 && !fs::exists(list, ec) && !cancelled(); waited++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const std::vector<uint32_t> hot = choose_hot(read_hot_list(list));
+        const recomp::EmittedModule *exe = nullptr;
+        for (const recomp::EmittedModule &m : emitted)
+            if (m.path == executable_path) exe = &m;
+        const fs::path out = cache / (library_stem(digest, level_) + ".hot" + LIBRARY_EXTENSION);
+        std::string why_not;
+        if (hot.empty())
+            why_not = "no hot list";
+        else if (!exe)
+            why_not = "the executable was not emitted";
+        else if (!partial(src, work, *exe, hot, out, why_not))
+            why_not = "it did not build: " + why_not;
+        if (cancelled()) return fail(error, "cancelled");
+        report(Stage::Compiling, 0, 0,
+               why_not.empty()
+                   ? "the partial library of the " + std::to_string(hot.size()) + " hottest functions: " + utf8(out)
+                   : "no partial library: " + why_not);
+        if (options_.hot_only) {
+            if (!why_not.empty()) return fail(error, "no partial library: " + why_not);
+            report(Stage::Done, 1, 1, utf8(out));
+            return true;
+        }
+    }
     sources.push_back("modules.cpp");
     const fs::path built = work / (std::string("game") + LIBRARY_EXTENSION);
     if (!compile_and_link(src, sources, work, built, error)) return false;
@@ -1466,6 +1593,73 @@ std::optional<CachedGame> find_cached(const fs::path &cache_dir, std::string_vie
     std::error_code ec;
     if (!fs::is_regular_file(library, ec)) return std::nullopt;
     return CachedGame{library, normal, XF_GAME_INTERFACE_VERSION, level};
+}
+
+std::optional<fs::path> find_partial(const fs::path &cache_dir, std::string_view digest) {
+    const std::string normal = normal_digest(digest);
+    if (normal.empty()) return std::nullopt;
+    const fs::path partial = cache_dir / (library_stem(normal, game_cpu_level()) + ".hot" + LIBRARY_EXTENSION);
+    std::error_code ec;
+    if (!fs::is_regular_file(partial, ec)) return std::nullopt;
+    return partial;
+}
+
+fs::path hot_list_path(const fs::path &cache_dir, std::string_view digest) {
+    std::string normal = normal_digest(digest);
+    return cache_dir / ((normal.empty() ? std::string(digest) : normal) + ".hot.txt");
+}
+
+bool write_hot_list(const fs::path &file, const std::vector<HotFunction> &functions) {
+    // written beside, then moved over: a build reading it sees a whole list
+    std::string text = "# address entries back_edges instructions (the first tier's heat)\n";
+    char line[96];
+    for (const HotFunction &f : functions) {
+        std::snprintf(line, sizeof(line), "%08X %llu %llu %u\n", f.address, (unsigned long long)f.entries,
+                      (unsigned long long)f.back_edges, f.instructions);
+        text += line;
+    }
+    fs::path part = file;
+    part += ".part";
+    {
+        std::ofstream out(part, std::ios::binary | std::ios::trunc);
+        if (!(out << text)) return false;
+    }
+    std::error_code ec;
+    fs::rename(part, file, ec);
+    return !ec;
+}
+
+std::vector<HotFunction> read_hot_list(const fs::path &file) {
+    std::vector<HotFunction> out;
+    std::ifstream f(file, std::ios::binary);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        HotFunction h;
+        unsigned long long entries = 0, back = 0;
+        unsigned address = 0, instructions = 0;
+        if (std::sscanf(line.c_str(), "%x %llu %llu %u", &address, &entries, &back, &instructions) != 4) continue;
+        h.address = address, h.entries = entries, h.back_edges = back, h.instructions = instructions;
+        out.push_back(h);
+    }
+    return out;
+}
+
+std::vector<uint32_t> choose_hot(std::vector<HotFunction> functions, size_t max_functions, uint64_t max_instructions) {
+    auto heat = [](const HotFunction &f) { return f.entries + f.back_edges; };
+    std::sort(functions.begin(), functions.end(),
+              [&](const HotFunction &a, const HotFunction &b) { return heat(a) > heat(b); });
+    uint64_t total = 0;
+    for (const HotFunction &f : functions) total += heat(f);
+    std::vector<uint32_t> out;
+    uint64_t taken = 0, instructions = 0;
+    for (const HotFunction &f : functions) {
+        if (!heat(f) || out.size() >= max_functions || taken >= total - total / 100) break;
+        if (instructions + f.instructions > max_instructions) continue; // a big one left for the whole library
+        out.push_back(f.address);
+        taken += heat(f), instructions += f.instructions;
+    }
+    return out;
 }
 
 std::optional<BuildReport> read_build_report(const fs::path &cache_dir, std::string_view digest) {

@@ -48,6 +48,13 @@ enum class Hole : uint16_t {
     Next,   // xf_hole_next: the next stencil
     Target, // xf_hole_target: a branch's target
     Call,   // xf_hole_call: a body called
+    // xf_hole_f0..f4: 32-bit values, an instruction's register fields
+    // (src/stencil/stencil_fields.h), F0 + k the k-th
+    F0,
+    F1,
+    F2,
+    F3,
+    F4,
     Count,
 };
 
