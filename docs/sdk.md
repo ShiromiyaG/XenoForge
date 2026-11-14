@@ -32,7 +32,7 @@ cmake -DNAME=mygame "-DTITLE=My Game" -DDIR=<new repository> -DISO=<disc image> 
 cd <new repository>
 cmake --preset local
 cmake --build --preset local
-build/boot_mygame <disc image> --seconds 20
+build/windows/boot_mygame <disc image> --seconds 20     (build/linux/ on Linux)
 ```
 
 `new_port.cmake` writes the repository from `sdk/template` (`NAME`: the
@@ -42,12 +42,54 @@ targets' name, letters, digits and `_`; `TITLE`: the window's title; `DIR`:
 | file | what |
 |---|---|
 | `CMakeLists.txt` | `find_package(XenoForge <the SDK's version>)` from `XENOFORGE_SDK` (cache or environment) or `CMAKE_PREFIX_PATH`, then `xenoforge_add_port` on `GAME_ISO` with `project.toml` (or on `GAME_GENERATED_DIR`, code emitted earlier) |
-| `CMakePresets.json` | `default`: Ninja, clang, RelWithDebInfo, `build/` |
-| `CMakeUserPresets.json` | `local`: `default` with this machine's SDK prefix and disc; not versioned |
+| `CMakePresets.json` | `windows`, `linux`, `linux-arm64`, `android-arm64` (A port on every host, below): Ninja, RelWithDebInfo, `build/<preset>/` |
+| `CMakeUserPresets.json` | `local`: this host's preset (`windows` or `linux`) with this machine's SDK prefix and disc; not versioned |
 | `src/main.cpp` | the port's main: its name, an option, `on_init` and `on_shutdown` |
-| `src/hooks.cpp` | the hooks, a module reloaded while the game runs (`PORT_HOT_RELOAD`, on by default) |
+| `src/hooks.cpp` | the hooks, a module reloaded while the game runs (`PORT_HOT_RELOAD`, on by default but on Android) |
 | `project.toml` | the recompiler's project file, empty |
-| `README.md`, `.gitignore` | the build and run lines; discs, executables and `build/` kept out |
+| `README.md`, `.gitignore` | the platforms, build and run lines; build trees, Android's packaging files, editors' files, discs and executables kept out |
+
+## A port on every host
+
+A port is made for Windows, Linux and Android at once: its code is the same
+everywhere (no host API in it; XenoForge's runtime has a branch for each
+host), and the host is the preset's and the SDK's:
+
+| preset | the port's host | built on | the SDK it takes |
+|---|---|---|---|
+| `windows` | Windows x86-64 | Windows | one built there |
+| `linux` | Linux, the build machine's CPU | Linux | one built there |
+| `linux-arm64` | Linux ARM64 | Linux x86-64 | one built with `cmake/toolchains/aarch64-linux-gnu.cmake` (installed in `share/xenoforge/toolchains`) |
+| `android-arm64` | Android arm64-v8a, API 29+ | any host with the NDK (`ANDROID_NDK_HOME`) | one built with the NDK's toolchain |
+
+- **Cross-compiling.** The recompiler runs during the build, on the build
+  machine, so a cross build names an `xfrecomp` built for the build machine:
+  `XENOFORGE_HOST_XFRECOMP` (cache or environment; XenoForgeConfig.cmake
+  defines it). Without it, a port built from an ISO stops at configure and
+  says so; one on `GENERATED_DIR` needs none. `xenoforge_add_port` passes
+  the toolchain (`CMAKE_TOOLCHAIN_FILE`, `CMAKE_SYSROOT`, `ANDROID_ABI`,
+  `ANDROID_PLATFORM`, `ANDROID_STL`) to the project that compiles the
+  generated code, and on ARM64 compiles it with no x86 flags (the CPU level
+  is `arm64`). The template finds the package through `XenoForge_DIR`
+  (`<XENOFORGE_SDK>/lib/cmake/XenoForge`), which a toolchain's find root
+  (the target's sysroot) does not hide.
+- **Android.** `player_<name>` is a shared library, `libplayer_<name>.so`:
+  SDL's Java activity (SDLActivity) loads it from the APK and calls the
+  `SDL_main` it exports, which is the port's `main` (`xenoforge_add_port`
+  force-includes a header declaring `extern "C" SDL_main` and defining
+  `main` as it). `boot_<name>` stays an executable (run with `adb shell`).
+  The hooks are linked in (no reloading inside an APK). The APK itself
+  (Gradle, SDLActivity's Java sources, the manifest) waits for XenoForge's
+  own Android build (docs/plan.md, "Hosts"): until there is an SDK built for
+  Android, the `android-arm64` preset has nothing to link.
+- **Checked** (2026-11-14): the template's port built and run on Windows
+  and on Linux x86-64 (WSL, `ctest -R sdk`), and the whole port of game A
+  on Windows. Android: the template's port configured with the NDK 30's
+  toolchain and its main compiled for arm64-v8a (`SDL_main` a global C
+  symbol), the toolchain passed to the generated code's project, the x86
+  flags gone, and a build from an ISO without `XENOFORGE_HOST_XFRECOMP`
+  stopping with its message; nothing linked (no Android package yet). ARM64
+  Linux: written, not built.
 
 ## What a port links
 
@@ -126,8 +168,9 @@ It makes:
 | `boot_mygame` | the same linked to boot: headless, for tests, traces and `--render` |
 
 The generated code's files are not known until `xfrecomp emit` has written
-them, so emission and compilation are one build step: `xfrecomp emit <iso>
-<build>/xenoforge/mygame/code [--project <toml>]`, then a small project
+them, so emission and compilation are one build step (`sdk/build_game.cmake`,
+run by `cmake -P`): `xfrecomp emit <iso> <build>/xenoforge/mygame/code
+[--project <toml>]`, then a small project
 (`game_library/CMakeLists.txt`) is configured over what was written and built
 with `-O2 -g0` and the CPU level's `-march` (`-DXF_GAME_CPU_LEVEL=v3`, the
 default, or `v2`: docs/runtime.md, "The CPU level"; both executables check
@@ -136,7 +179,17 @@ has that level, and say so and exit when it lacks it). The step runs only
 when the ISO, the project file, `xfrecomp` or the generated code's headers
 changed; `xfrecomp` writes only the files whose text changed, so after a
 change to the project file or a recompiler fix only those files recompile.
-The inner build uses the generator's default parallelism.
+The inner build runs as many compilers at once as `xfrecomp jobs` says:
+the recompile step's own policy (game_build.h's `job_policy`), the cores and
+the memory free when the step starts, an eighth of the machine (at least
+1 GB) kept for the rest and about 0.5 GB a compiler. The cores alone would
+run a 16 GB machine with an editor and a browser open out of memory (a
+first build of game A's 291 files at 12 compilers); limited by hand to 4 it
+took about 40 minutes. `-DXF_GAME_JOBS=<n>` forces the count. The step runs
+in the console pool (`USES_TERMINAL`): alone, its progress shown as it goes.
+The flags travel as space-separated strings (`-DXF_GAME_CPU_FLAGS=-march=x86-64-v3
+-mprefer-vector-width=128`), so no step on the way splits v3's two flags (a
+list once did, and a port from an ISO failed to configure its code).
 
 Other arguments: `DEFINITIONS`, `INCLUDES`, `LIBRARIES` for the port's
 sources; `XEX <path>` for an executable other than `default.xex`; `NO_PLAYER`,
@@ -366,6 +419,11 @@ and the CMake above (`-DMINIMAL_ISO=<iso>`). The project file's schema is in
   runtime files, a port's own shaders), not a game's recompile. Then a port
   made by the installed `new_port.cmake` is configured and built the same way
   (its hooks module included), and the package is checked to hold no header
-  outside the API's (`renderer.h`, `recomp.h`, `stencil.h`).
+  outside the API's (`renderer.h`, `recomp.h`, `stencil.h`). Last, that port
+  is built from an executable as from a disc (`tests/sdk/make_xex.cpp` makes
+  a title of four functions; the ISO form's emission and compile, with the
+  job count) and run: boot reports the code linked in, and the title's exit
+  code is the sum its functions compute. Passes on Windows and on Linux
+  x86-64 (WSL).
 - By hand, a real port end to end: the example with `-DMINIMAL_ISO=<a disc>`,
   then `boot_minimal <disc> --seconds 20`.

@@ -9,7 +9,9 @@
 # empty or not exist). Writes CMakeLists.txt, CMakePresets.json, project.toml,
 # src/main.cpp, src/hooks.cpp, README.md, .gitignore, and CMakeUserPresets.json
 # with this machine's SDK prefix (and ISO, when given): `cmake --preset local`
-# then builds it. Run from XenoForge's source tree (sdk/new_port.cmake) the SDK
+# then builds it, with this host's preset (windows or linux). The port is
+# made for Windows, Linux (x86-64, ARM64) and Android (arm64-v8a): its
+# CMakePresets.json has a preset for each. Run from XenoForge's source tree (sdk/new_port.cmake) the SDK
 # prefix is left for the user to fill in.
 
 if(NOT NAME)
@@ -46,6 +48,12 @@ if(EXISTS ${prefix}/lib/cmake/XenoForge/XenoForgeConfigVersion.cmake)
     set(PORT_SDK ${prefix})
     file(STRINGS ${prefix}/lib/cmake/XenoForge/XenoForgeConfigVersion.cmake line REGEX "^set\\(PACKAGE_VERSION \"")
     string(REGEX REPLACE "^set\\(PACKAGE_VERSION \"([^\"]*)\".*$" "\\1" XENOFORGE_VERSION "${line}")
+endif()
+# the presets this machine builds with (CMakePresets.json's windows or linux)
+if(CMAKE_HOST_WIN32)
+    set(PORT_HOST_PRESET windows)
+else()
+    set(PORT_HOST_PRESET linux)
 endif()
 set(PORT_NAME ${NAME})
 set(PORT_TITLE ${TITLE})

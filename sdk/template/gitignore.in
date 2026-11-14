@@ -1,8 +1,27 @@
-build/
+# build trees (build/<preset>/), CMake's per-machine presets, logs
+/build*/
+/out/
 CMakeUserPresets.json
-# nothing of the game goes in: discs, executables, extracted files, dumps
+compile_commands.json
+*.log
+# Android packaging (Gradle, the NDK's per-build files)
+.gradle/
+.cxx/
+local.properties
+*.apk
+*.aab
+# editors and language servers
+.cache/
+.vs/
+.vscode/
+.idea/
+.zed/
+*.swp
+# nothing of the game goes in: discs, executables, extracted files, dumps, traces
 *.iso
 *.xex
 *.xexp
+*.bin
+*.xtr
 assets/
 re/

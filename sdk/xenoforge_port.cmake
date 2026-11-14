@@ -3,7 +3,8 @@
 # installed XenoForge (XenoForgeConfig.cmake includes it), so a port and the
 # repository's own games take the same path. It expects the targets
 # XenoForge::core, ::kernel, ::vk and ::boot, ::player when the player is built,
-# XenoForge::xfrecomp, and XENOFORGE_INCLUDE_DIR and XENOFORGE_RUNTIME_FILES
+# XenoForge::xfrecomp (or, cross-compiling, XENOFORGE_HOST_XFRECOMP: the
+# build machine's), and XENOFORGE_INCLUDE_DIR and XENOFORGE_RUNTIME_FILES
 # (what is copied next to each executable: ffmpeg-xma).
 #
 #   xenoforge_add_port(<name>
@@ -21,7 +22,9 @@
 #                   files whose text changed, so a rebuild recompiles only those);
 #                   with GENERATED_DIR, the code already emitted there compiled in
 #                   this build (CMake globs it); with PREBUILT, that library
-#   player_<name>   SOURCES + the player + game_<name> (the window, input, sound)
+#   player_<name>   SOURCES + the player + game_<name> (the window, input, sound); on
+#                   Android a shared library, libplayer_<name>.so, whose SDL_main is the
+#                   port's main (SDL's activity loads it from the APK)
 #   boot_<name>     the same linked to boot (headless: tests, traces, --render)
 # SOURCES holds the port's main (xenoforge/run.h's xf::run); it is compiled for
 # each executable, boot's with XF_PORT_BOOT defined. The runtime files are copied
@@ -52,6 +55,10 @@ elseif(XF_GAME_CPU_LEVEL STREQUAL "v2")
 else()
     message(FATAL_ERROR "XF_GAME_CPU_LEVEL=${XF_GAME_CPU_LEVEL}: v3 or v2")
 endif()
+# How many compilers build a port's generated code at once (its ISO form):
+# 0, as many as the cores and the memory free allow (xfrecomp jobs, the
+# recompile step's policy), else this many.
+set(XF_GAME_JOBS 0 CACHE STRING "compilers at once for the generated code (0: by the cores and the memory free)")
 if(NOT _XF_GAME_CPU_LEVEL_NAME)
     set(_XF_GAME_CPU_LEVEL_NAME ${XF_GAME_CPU_LEVEL})
 endif()
@@ -111,41 +118,62 @@ function(xenoforge_add_port name)
         target_compile_options(game_${name} PRIVATE ${opt} -g0 -w ${XF_GAME_CPU_FLAGS})
     elseif(P_ISO)
         # The generated files are not known until xfrecomp has run, so the
-        # emission and the compile are one step: a small project (game_library/)
-        # configured over what was written (its glob sees it) and built; ninja
-        # inside recompiles only the files whose text changed.
+        # emission and the compile are one step (build_game.cmake): xfrecomp
+        # emit, a small project (game_library/) configured over what was
+        # written (its glob sees it), and built with as many compilers as the
+        # memory free allows (XF_GAME_JOBS); ninja inside recompiles only the
+        # files whose text changed.
         get_filename_component(iso ${P_ISO} ABSOLUTE)
+        if(XENOFORGE_HOST_XFRECOMP)
+            set(xfrecomp ${XENOFORGE_HOST_XFRECOMP})
+        elseif(CMAKE_CROSSCOMPILING AND NOT TARGET xfrecomp)
+            message(FATAL_ERROR "xenoforge_add_port(${name}): cross-compiling (${CMAKE_SYSTEM_NAME} "
+                                "${CMAKE_SYSTEM_PROCESSOR}), xfrecomp has to run on this machine: set "
+                                "XENOFORGE_HOST_XFRECOMP to the xfrecomp of an SDK built for it")
+        else()
+            set(xfrecomp $<TARGET_FILE:XenoForge::xfrecomp>)
+        endif()
         set(gen ${CMAKE_CURRENT_BINARY_DIR}/xenoforge/${name})
         set(lib ${gen}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}game_${name}${CMAKE_STATIC_LIBRARY_SUFFIX})
-        set(emit_args emit ${iso} ${gen}/code)
         set(depends ${iso})
+        set(step_args)
         if(P_XEX)
-            list(APPEND emit_args --xex ${P_XEX})
+            list(APPEND step_args -DXEX=${P_XEX})
         endif()
         if(P_PROJECT)
             get_filename_component(project ${P_PROJECT} ABSOLUTE)
-            list(APPEND emit_args --project ${project})
+            list(APPEND step_args -DPROJECT=${project})
             list(APPEND depends ${project})
         endif()
+        # the port's target (ARM64 Linux, Android: a toolchain file) for the generated code too
+        foreach(v TOOLCHAIN_FILE SYSROOT)
+            if(CMAKE_${v})
+                list(APPEND step_args -D${v}=${CMAKE_${v}})
+            endif()
+        endforeach()
+        foreach(v ANDROID_ABI ANDROID_PLATFORM ANDROID_STL)
+            if(${v})
+                list(APPEND step_args -D${v}=${${v}})
+            endif()
+        endforeach()
         file(GLOB interface_headers CONFIGURE_DEPENDS ${XENOFORGE_INCLUDE_DIR}/xenoforge/ppc*.h
              ${XENOFORGE_INCLUDE_DIR}/xenoforge/ppc_ops/*.h ${XENOFORGE_INCLUDE_DIR}/xenoforge/ppc_opcodes.inc
              ${XENOFORGE_INCLUDE_DIR}/xenoforge/game_library.h ${XENOFORGE_INCLUDE_DIR}/xenoforge/recomp.h)
-        # lists (v3's two flags) kept one argument each: VERBATIM splits a list at its semicolons
-        string(REPLACE ";" "$<SEMICOLON>" opt_arg "${opt}")
-        string(REPLACE ";" "$<SEMICOLON>" cpu_flags_arg "${XF_GAME_CPU_FLAGS}")
-        set(configure_args -S ${_XF_PORT_DIR}/game_library -B ${gen}/build -G ${CMAKE_GENERATOR}
-            -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
-            -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM} -DXF_GAME_NAME=${name}
-            -DXF_GAME_CODE=${gen}/code -DXF_GAME_OUT=${gen}/lib -DXF_INCLUDE_DIR=${XENOFORGE_INCLUDE_DIR}
-            "-DXF_GAME_OPT=${opt_arg}" "-DXF_GAME_CPU_FLAGS=${cpu_flags_arg}")
+        # the flags as space-separated strings: one argument each, whatever splits lists on the way
+        list(JOIN opt " " opt_text)
+        list(JOIN XF_GAME_CPU_FLAGS " " cpu_flags_text)
         add_custom_command(
             OUTPUT ${lib}
-            COMMAND $<TARGET_FILE:XenoForge::xfrecomp> ${emit_args}
-            COMMAND ${CMAKE_COMMAND} ${configure_args}
-            COMMAND ${CMAKE_COMMAND} --build ${gen}/build
+            COMMAND ${CMAKE_COMMAND} -DXFRECOMP=${xfrecomp} -DISO=${iso} -DGEN=${gen} -DNAME=${name}
+                    -DGAME_LIBRARY_DIR=${_XF_PORT_DIR}/game_library -DGENERATOR=${CMAKE_GENERATOR}
+                    -DMAKE_PROGRAM=${CMAKE_MAKE_PROGRAM} -DC_COMPILER=${CMAKE_C_COMPILER}
+                    -DCXX_COMPILER=${CMAKE_CXX_COMPILER} -DINCLUDE_DIR=${XENOFORGE_INCLUDE_DIR} "-DOPT=${opt_text}"
+                    "-DCPU_FLAGS=${cpu_flags_text}" -DJOBS=${XF_GAME_JOBS} ${step_args}
+                    -P ${_XF_PORT_DIR}/build_game.cmake
             DEPENDS ${depends} ${interface_headers} ${_XF_PORT_DIR}/game_library/CMakeLists.txt
-                    $<TARGET_FILE:XenoForge::xfrecomp>
+                    ${_XF_PORT_DIR}/build_game.cmake ${xfrecomp}
             COMMENT "${name}: xfrecomp emit, then the generated code"
+            USES_TERMINAL
             VERBATIM)
         add_custom_target(game_${name}_build DEPENDS ${lib})
         add_library(game_${name} INTERFACE)
@@ -188,7 +216,20 @@ function(xenoforge_add_port name)
         if(NOT P_HOT_RELOAD)
             list(APPEND sources ${P_HOOK_SOURCES})
         endif()
-        add_executable(${kind}_${name} ${sources})
+        if(ANDROID AND kind STREQUAL player)
+            # Android starts a game through SDL's Java activity (SDLActivity), which loads
+            # lib<name>.so from the APK and calls the SDL_main it exports: the port's main
+            # becomes that function (a C symbol), the player a shared library
+            set(android_main ${CMAKE_CURRENT_BINARY_DIR}/xenoforge/${name}/android_main.h)
+            file(WRITE ${android_main}.tmp "// written by xenoforge_add_port: the port's main as SDL_main on Android\n"
+                                           "extern \"C\" __attribute__((visibility(\"default\"))) int SDL_main(int argc, char **argv);\n"
+                                           "#define main SDL_main\n")
+            file(COPY_FILE ${android_main}.tmp ${android_main} ONLY_IF_DIFFERENT)
+            add_library(${kind}_${name} SHARED ${sources})
+            target_compile_options(${kind}_${name} PRIVATE -include ${android_main})
+        else()
+            add_executable(${kind}_${name} ${sources})
+        endif()
         xenoforge_cpu_level_check(${kind}_${name})
         target_compile_definitions(${kind}_${name} PRIVATE XF_PORT_LINKED ${P_DEFINITIONS})
         if(P_HOT_RELOAD)

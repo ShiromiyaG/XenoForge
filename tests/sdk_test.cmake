@@ -106,4 +106,25 @@ file(GLOB hooks_module ${WORK}/template_port/build/template_port_hooks*)
 if(NOT hooks_module)
     message(FATAL_ERROR "sdk_test: the template's port built no hooks module")
 endif()
+
+# the same port from an executable, as from a disc (xenoforge_add_port's ISO form: build_game.cmake's xfrecomp emit,
+# the generated code configured and compiled), then run: the boot report has the code linked in
+if(MAKE_XEX)
+    step("make an executable" ${MAKE_XEX} ${WORK}/default.xex)
+    step("configure the template's port from the executable" ${CMAKE_COMMAND} -S ${WORK}/template_port -B
+         ${WORK}/template_port/build_iso -G ${GENERATOR} -DCMAKE_MAKE_PROGRAM=${MAKE} -DCMAKE_C_COMPILER=${CC}
+         -DCMAKE_CXX_COMPILER=${CXX} -DXENOFORGE_SDK=${prefix} -DGAME_ISO=${WORK}/default.xex)
+    step("build the template's port from the executable" ${CMAKE_COMMAND} --build ${WORK}/template_port/build_iso)
+    if(NOT step_output MATCHES "xfrecomp emit" OR NOT step_output MATCHES "compilers at once")
+        message(FATAL_ERROR "sdk_test: the build from the executable did not emit and compile:\n${step_output}")
+    endif()
+    file(GLOB booted ${WORK}/template_port/build_iso/boot_template_port*)
+    list(FILTER booted EXCLUDE REGEX "\\.(pdb|ilk|exp|lib)$")
+    list(GET booted 0 boot_exe)
+    execute_process(COMMAND ${boot_exe} ${WORK}/default.xex --seconds 2 RESULT_VARIABLE rc OUTPUT_VARIABLE out
+                    ERROR_VARIABLE out TIMEOUT 120)
+    if(NOT out MATCHES "generated code: 1 modules, 4 functions" OR NOT out MATCHES "cpu: linked generated code")
+        message(FATAL_ERROR "sdk_test: boot_template_port on the executable: ${rc}\n${out}")
+    endif()
+endif()
 message(STATUS "sdk_test: ok")

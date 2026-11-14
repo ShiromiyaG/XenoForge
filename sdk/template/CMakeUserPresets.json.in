@@ -3,8 +3,9 @@
     "configurePresets": [
         {
             "name": "local",
-            "displayName": "this machine's SDK and disc",
-            "inherits": "default",
+            "displayName": "this machine's SDK and disc (@PORT_HOST_PRESET@)",
+            "inherits": "@PORT_HOST_PRESET@",
+            "binaryDir": "${sourceDir}/build/@PORT_HOST_PRESET@",
             "cacheVariables": {
                 "XENOFORGE_SDK": "@PORT_SDK@",
                 "GAME_ISO": "@PORT_ISO@"

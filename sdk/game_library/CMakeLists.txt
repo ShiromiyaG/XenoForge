@@ -2,7 +2,8 @@
 # by the port's build over what `xfrecomp emit` wrote, so the glob sees every
 # file. Parameters: XF_GAME_NAME, XF_GAME_CODE (the emission's directory),
 # XF_GAME_OUT (where the archive goes), XF_INCLUDE_DIR (XenoForge's headers),
-# XF_GAME_OPT, XF_GAME_CPU_FLAGS (the CPU level's flags: xenoforge_port.cmake).
+# XF_GAME_OPT, XF_GAME_CPU_FLAGS (the CPU level's flags: xenoforge_port.cmake),
+# each a list or a space-separated string (build_game.cmake passes strings).
 cmake_minimum_required(VERSION 3.25)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
@@ -17,5 +18,10 @@ endif()
 add_library(game STATIC ${sources})
 target_include_directories(game PRIVATE ${XF_INCLUDE_DIR})
 # optimized, without debug information (it is large) or warnings; never -ffast-math
+foreach(v XF_GAME_OPT XF_GAME_CPU_FLAGS)
+    if(NOT "${${v}}" MATCHES ";")
+        separate_arguments(${v} UNIX_COMMAND "${${v}}")
+    endif()
+endforeach()
 target_compile_options(game PRIVATE ${XF_GAME_OPT} -g0 -w ${XF_GAME_CPU_FLAGS})
 set_target_properties(game PROPERTIES OUTPUT_NAME game_${XF_GAME_NAME} ARCHIVE_OUTPUT_DIRECTORY ${XF_GAME_OUT})

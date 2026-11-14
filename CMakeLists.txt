@@ -914,7 +914,10 @@ add_test(NAME blend_minmax COMMAND blend_minmax_test)
 
 # the SDK package without a game: installed to a temporary prefix, the example port configured and built against it
 # (tests/sdk_test.cmake)
+# (and a port built from a made-up executable as from a disc: tests/sdk/make_xex.cpp)
+add_executable(sdk_make_xex tests/sdk/make_xex.cpp)
 add_test(NAME sdk COMMAND ${CMAKE_COMMAND} -DBUILD=${CMAKE_BINARY_DIR} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}
+         -DMAKE_XEX=$<TARGET_FILE:sdk_make_xex>
          -DWORK=${CMAKE_BINARY_DIR}/sdk_test -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
          -DGENERATOR=${CMAKE_GENERATOR} -DMAKE=${CMAKE_MAKE_PROGRAM} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/sdk_test.cmake)
 set_tests_properties(sdk PROPERTIES TIMEOUT 600)

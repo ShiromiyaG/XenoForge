@@ -1,6 +1,9 @@
 // @PORT_TITLE@ on XenoForge: the port's main (XenoForge's docs/sdk.md, "A
 // port's main"). xenoforge_add_port builds it twice: player_@PORT_NAME@ (a
-// window, input, sound) and, with XF_PORT_BOOT, boot_@PORT_NAME@ (headless).
+// window, input, sound; on Android a shared library whose SDL_main this
+// becomes) and, with XF_PORT_BOOT, boot_@PORT_NAME@ (headless). The same
+// code on every host: no host API here (XenoForge's own covers Windows,
+// Linux and Android), paths through std::filesystem.
 
 #include <xenoforge/run.h>
 

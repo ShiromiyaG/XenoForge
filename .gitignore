@@ -1,4 +1,17 @@
-build/
+# build trees (build/, build-exp/, an agent's build-x64/...), CMake's per-machine files, logs
+/build*/
+/out/
+/cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+*.log
+# editors and language servers
+.cache/
+.vs/
+.idea/
+.zed/
+.vscode/settings.json
+*.swp
 
 # nothing of a game goes in: discs, executables, their images and dumps
 *.iso
@@ -12,7 +25,6 @@ re/
 
 # the plan is the owner's working document, kept on this machine only
 docs/plan.md
-.vscode/settings.json
 xbox.jpg
 # left by Xenia's tools (the oracle) when one is run from this folder
 xconfig.settings

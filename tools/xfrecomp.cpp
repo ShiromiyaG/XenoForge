@@ -48,6 +48,7 @@
 
 #include "calling_convention.h"
 #include "xenoforge/disc.h"
+#include "xenoforge/game_build.h"
 #include "xenoforge/ppc.h"
 #include "xenoforge/recomp.h"
 #include "xenoforge/xex.h"
@@ -80,7 +81,8 @@ int usage() {
                  "                [--project <file.toml>] [--check-functions <file.toml>] [--calls [<counts>]]\n"
                  "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n"
                  "       xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] "
-                 "[--no-pointers] [--listing] [--project <file.toml>]\n");
+                 "[--no-pointers] [--listing] [--project <file.toml>]\n"
+                 "       xfrecomp jobs [N]\n");
     return 2;
 }
 
@@ -425,6 +427,15 @@ void report_calls(const recomp::Image &image, const recomp::Discovery &d, const 
 }
 
 int main(int argc, char **argv) {
+    // how many compilers the generated code's build runs at once (xenoforge_add_port's): the
+    // recompile step's policy (game_build.h's job_policy: the cores and the memory free now), or N;
+    // the number on stdout, why on stderr
+    if (argc >= 2 && std::string(argv[1]) == "jobs") {
+        const build::JobPolicy p = build::job_policy(argc >= 3 ? unsigned(std::max(0, std::atoi(argv[2]))) : 0u);
+        std::printf("%u\n", p.limit);
+        std::fprintf(stderr, "%s\n", p.why.c_str());
+        return 0;
+    }
     if (argc >= 4 && std::string(argv[1]) == "emit") {
         std::vector<std::string> only;
         int files = 0; // by each module's size

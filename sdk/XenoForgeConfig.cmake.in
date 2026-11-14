@@ -93,6 +93,10 @@ if(XENOFORGE_PLAYER)
         INTERFACE_LINK_LIBRARIES "XenoForge::_frontend;XenoForge::_imgui;XenoForge::_sdl3;XenoForge::vk;XenoForge::core")
 endif()
 
+# xfrecomp runs at build time, on the build machine: a package built for
+# another host (ARM64 Linux, Android) is used with an SDK built for the build
+# machine beside it, whose xfrecomp xenoforge_add_port takes from here
+set(XENOFORGE_HOST_XFRECOMP "" CACHE FILEPATH "cross-compiling: the xfrecomp of an SDK built for the build machine")
 add_executable(XenoForge::xfrecomp IMPORTED)
 set_target_properties(XenoForge::xfrecomp PROPERTIES IMPORTED_LOCATION
                       "${PACKAGE_PREFIX_DIR}/bin/xfrecomp${CMAKE_EXECUTABLE_SUFFIX}")

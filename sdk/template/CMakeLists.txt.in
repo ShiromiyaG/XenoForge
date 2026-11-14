@@ -1,17 +1,20 @@
-# @PORT_TITLE@ on XenoForge: the port's build (XenoForge's docs/sdk.md).
+# @PORT_TITLE@ on XenoForge: the port's build (XenoForge's docs/sdk.md), for
+# Windows, Linux (x86-64, ARM64) and Android (arm64-v8a).
 #
-#   cmake --preset default -DXENOFORGE_SDK=<the SDK's prefix> -DGAME_ISO=<the game's disc image>
-#   cmake --build --preset default
-#   build/boot_@PORT_NAME@ <disc> --seconds 20       headless: the report and the xf-summary line
-#   build/player_@PORT_NAME@ <disc>                  a window, input, sound
+#   cmake --preset <windows|linux> -DXENOFORGE_SDK=<the SDK's prefix> -DGAME_ISO=<the game's disc image>
+#   cmake --build --preset <windows|linux>
+#   build/<preset>/boot_@PORT_NAME@ <disc> --seconds 20     headless: the report and the xf-summary line
+#   build/<preset>/player_@PORT_NAME@ <disc>                a window, input, sound
 #
 # XenoForge comes from its installed SDK (cmake --install <XenoForge's build>
-# --component sdk --prefix <dir>): XENOFORGE_SDK names the prefix (cache or
-# environment), or CMAKE_PREFIX_PATH holds it. CMakeUserPresets.json (not
-# versioned: `cmake --preset local`) keeps this machine's SDK and disc. The
-# first build recompiles the disc (xfrecomp emit, then clang over the
-# generated code: minutes); after that only what the disc, project.toml or
-# XenoForge changed.
+# --component sdk --prefix <dir>), built for the host the port is for:
+# XENOFORGE_SDK names its prefix (cache or environment). Cross-compiling
+# (linux-arm64, android-arm64) the recompiler still runs on this machine:
+# XENOFORGE_HOST_XFRECOMP names an SDK's xfrecomp built for it (cache or
+# environment). CMakeUserPresets.json (not versioned: `cmake --preset local`)
+# keeps this machine's SDK and disc. The first build recompiles the disc
+# (xfrecomp emit, then clang over the generated code: minutes); after that
+# only what the disc, project.toml or XenoForge changed.
 cmake_minimum_required(VERSION 3.25)
 # optimized unless asked otherwise: XenoForge's libraries are built for the release runtime
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -19,9 +22,13 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 project(@PORT_NAME@ LANGUAGES C CXX)
 
-set(XENOFORGE_SDK "$ENV{XENOFORGE_SDK}" CACHE PATH "XenoForge's installed SDK (its prefix)")
+set(XENOFORGE_SDK "$ENV{XENOFORGE_SDK}" CACHE PATH "XenoForge's installed SDK (its prefix), built for the port's host")
+if(NOT XENOFORGE_HOST_XFRECOMP AND DEFINED ENV{XENOFORGE_HOST_XFRECOMP})
+    set(XENOFORGE_HOST_XFRECOMP "$ENV{XENOFORGE_HOST_XFRECOMP}" CACHE FILEPATH "")
+endif()
 if(XENOFORGE_SDK)
-    list(PREPEND CMAKE_PREFIX_PATH ${XENOFORGE_SDK})
+    # the package by its own directory: a cross toolchain's find root (the target's sysroot) would not see it
+    set(XenoForge_DIR "${XENOFORGE_SDK}/lib/cmake/XenoForge" CACHE PATH "" FORCE)
 endif()
 find_package(XenoForge @XENOFORGE_VERSION@ REQUIRED)
 
@@ -29,8 +36,14 @@ set(GAME_ISO "" CACHE FILEPATH "the game's disc image (never in the repository)"
 # code emitted earlier (xfrecomp emit <disc> <dir> --project project.toml), compiled as it is
 set(GAME_GENERATED_DIR "" CACHE PATH "a directory xfrecomp emit wrote, instead of emitting from GAME_ISO")
 # the hooks as a module of their own, rebuilt and reloaded while the game runs
-# (cmake --build build --target @PORT_NAME@_hooks; docs/sdk.md, "Reloading the hooks")
-option(PORT_HOT_RELOAD "build src/hooks.cpp as a module reloaded while the game runs" ON)
+# (cmake --build build/<preset> --target @PORT_NAME@_hooks; docs/sdk.md, "Reloading the hooks");
+# on Android they are linked in (an APK's libraries are not rebuilt in place)
+if(ANDROID)
+    set(hot_reload_default OFF)
+else()
+    set(hot_reload_default ON)
+endif()
+option(PORT_HOT_RELOAD "build src/hooks.cpp as a module reloaded while the game runs" ${hot_reload_default})
 
 if(GAME_GENERATED_DIR)
     set(game_code GENERATED_DIR ${GAME_GENERATED_DIR})
@@ -44,6 +57,8 @@ if(PORT_HOT_RELOAD)
     list(APPEND hooks HOT_RELOAD)
 endif()
 
+# player_@PORT_NAME@ (on Android libplayer_@PORT_NAME@.so, whose SDL_main is src/main.cpp's main) and
+# boot_@PORT_NAME@
 xenoforge_add_port(@PORT_NAME@ ${game_code}
     SOURCES src/main.cpp
     ${hooks})

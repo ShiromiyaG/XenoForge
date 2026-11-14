@@ -1,7 +1,8 @@
 // @PORT_TITLE@: the port's hooks on guest functions (xenoforge/port.h;
 // XenoForge's docs/recompiler.md, "Replacing and hooking"). With
-// PORT_HOT_RELOAD (the default) they are a module of their own: edit, then
-//   cmake --build build --target @PORT_NAME@_hooks
+// PORT_HOT_RELOAD (the default but on Android) they are a module of their own:
+// edit, then
+//   cmake --build build/<preset> --target @PORT_NAME@_hooks
 // and the running player takes them (F9 reloads at once). The module sees
 // port.h alone; state kept across reloads goes in xf::port::persistent<T>(key).
 //

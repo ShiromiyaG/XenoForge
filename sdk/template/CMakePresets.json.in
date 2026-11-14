@@ -2,21 +2,58 @@
     "version": 6,
     "configurePresets": [
         {
-            "name": "default",
-            "displayName": "clang, Ninja, RelWithDebInfo",
+            "name": "base",
+            "hidden": true,
             "generator": "Ninja",
-            "binaryDir": "${sourceDir}/build",
+            "binaryDir": "${sourceDir}/build/${presetName}",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
+        },
+        {
+            "name": "windows",
+            "displayName": "Windows x86-64 (clang)",
+            "inherits": "base",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+            "cacheVariables": {
                 "CMAKE_C_COMPILER": "clang",
                 "CMAKE_CXX_COMPILER": "clang++"
+            }
+        },
+        {
+            "name": "linux",
+            "displayName": "Linux, this machine's CPU (clang)",
+            "inherits": "base",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++"
+            }
+        },
+        {
+            "name": "linux-arm64",
+            "displayName": "Linux ARM64, cross-compiled on Linux x86-64",
+            "description": "XENOFORGE_SDK: an SDK built for ARM64 Linux; XENOFORGE_HOST_XFRECOMP: the build machine's xfrecomp",
+            "inherits": "base",
+            "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+            "toolchainFile": "$env{XENOFORGE_SDK}/share/xenoforge/toolchains/aarch64-linux-gnu.cmake"
+        },
+        {
+            "name": "android-arm64",
+            "displayName": "Android arm64-v8a (the NDK's clang)",
+            "description": "ANDROID_NDK_HOME: the NDK; XENOFORGE_SDK: an SDK built for Android; XENOFORGE_HOST_XFRECOMP: the build machine's xfrecomp",
+            "inherits": "base",
+            "toolchainFile": "$env{ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake",
+            "cacheVariables": {
+                "ANDROID_ABI": "arm64-v8a",
+                "ANDROID_PLATFORM": "android-29"
             }
         }
     ],
     "buildPresets": [
-        {
-            "name": "default",
-            "configurePreset": "default"
-        }
+        { "name": "windows", "configurePreset": "windows" },
+        { "name": "linux", "configurePreset": "linux" },
+        { "name": "linux-arm64", "configurePreset": "linux-arm64" },
+        { "name": "android-arm64", "configurePreset": "android-arm64" }
     ]
 }

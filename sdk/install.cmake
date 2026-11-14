@@ -9,7 +9,7 @@
 #                             (Vulkan, with volk), boot, and with the player: the player, its frontend, Dear ImGui, SDL3
 #   lib/cmake/XenoForge/      XenoForgeConfig.cmake and its version file, xenoforge_port.cmake (xenoforge_add_port)
 #                             and game_library/ (the project that compiles a port's generated code)
-#   share/xenoforge/          the licenses, new_port.cmake and template/ (a new port's repository)
+#   share/xenoforge/          the licenses, new_port.cmake and template/ (a new port's repository), toolchains/
 #
 # The imported targets (XenoForge::core, ::kernel, ::vk, ::boot, ::player and
 # the executable ::xfrecomp) are written by hand in XenoForgeConfig.cmake.in:
@@ -47,6 +47,8 @@ install(FILES ${CMAKE_SOURCE_DIR}/LICENSE ${CMAKE_SOURCE_DIR}/LICENSE-xenia ${CM
 # a new port's repository from the template: cmake -DNAME=<name> -P <prefix>/share/xenoforge/new_port.cmake
 install(FILES ${CMAKE_SOURCE_DIR}/sdk/new_port.cmake DESTINATION ${CMAKE_INSTALL_DATADIR}/xenoforge COMPONENT sdk)
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/sdk/template DESTINATION ${CMAKE_INSTALL_DATADIR}/xenoforge COMPONENT sdk)
+# the toolchain files a port cross-compiles with (ARM64 Linux; Android's is the NDK's)
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/cmake/toolchains DESTINATION ${CMAKE_INSTALL_DATADIR}/xenoforge COMPONENT sdk)
 
 # The headers a port sees: its API (what a port's code includes, and what its
 # generated code includes) and every header they include, followed here
@@ -104,7 +106,8 @@ configure_package_config_file(${CMAKE_SOURCE_DIR}/sdk/XenoForgeConfig.cmake.in
 write_basic_package_version_file(${CMAKE_BINARY_DIR}/XenoForgeConfigVersion.cmake VERSION ${PROJECT_VERSION}
                                  COMPATIBILITY SameMinorVersion)
 install(FILES ${CMAKE_BINARY_DIR}/XenoForgeConfig.cmake ${CMAKE_BINARY_DIR}/XenoForgeConfigVersion.cmake
-              ${CMAKE_SOURCE_DIR}/sdk/xenoforge_port.cmake DESTINATION ${XF_SDK_CMAKE_DIR} COMPONENT sdk)
+              ${CMAKE_SOURCE_DIR}/sdk/xenoforge_port.cmake ${CMAKE_SOURCE_DIR}/sdk/build_game.cmake
+        DESTINATION ${XF_SDK_CMAKE_DIR} COMPONENT sdk)
 install(FILES ${CMAKE_SOURCE_DIR}/sdk/game_library/CMakeLists.txt DESTINATION ${XF_SDK_CMAKE_DIR}/game_library
         COMPONENT sdk)
 if(TARGET xenoforge_player)

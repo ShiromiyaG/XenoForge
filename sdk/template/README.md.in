@@ -1,9 +1,23 @@
 # @PORT_TITLE@
 
 A port of @PORT_TITLE@ on XenoForge's SDK: the game's code recompiled ahead of
-time from your own disc and linked with XenoForge's runtime (kernel, GPU,
-sound, input), with this repository's own code on top. No part of the game is
-in the repository: the build reads your disc image.
+time from your own disc and linked with XenoForge's runtime (kernel, GPU on
+Vulkan, sound, input), with this repository's own code on top. No part of the
+game is in the repository: the build reads your disc image.
+
+## Platforms
+
+| preset | host | builds on |
+|---|---|---|
+| `windows` | Windows x86-64 | Windows |
+| `linux` | Linux x86-64 (or ARM64, built natively there) | Linux |
+| `linux-arm64` | Linux ARM64, cross-compiled | Linux x86-64 |
+| `android-arm64` | Android arm64-v8a (`libplayer_@PORT_NAME@.so`, SDL's activity starts it) | any, with the NDK |
+
+Each takes an SDK built for its host (`XENOFORGE_SDK`). The cross presets
+also take the build machine's `xfrecomp` (`XENOFORGE_HOST_XFRECOMP`: the
+recompiler runs during the build), and Android takes the NDK
+(`ANDROID_NDK_HOME`).
 
 ## Building
 
@@ -11,19 +25,20 @@ You need XenoForge's SDK installed (`cmake --install <XenoForge's build>
 --component sdk --prefix <dir>`), clang, CMake 3.25+ and Ninja.
 
 ```
-cmake --preset default -DXENOFORGE_SDK=<the SDK's prefix> -DGAME_ISO=<your disc image>
-cmake --build --preset default
+cmake --preset windows -DXENOFORGE_SDK=<the SDK's prefix> -DGAME_ISO=<your disc image>
+cmake --build --preset windows
 ```
 
-(or `cmake --preset local` and `cmake --build --preset local`, with the paths
-in `CMakeUserPresets.json`, which is not versioned). The first build
-recompiles the disc: several minutes.
+(`linux` on Linux; or `cmake --preset local` and `cmake --build --preset
+local`, with this machine's paths in `CMakeUserPresets.json`, which is not
+versioned). The first build recompiles the disc: several minutes. Each
+preset builds in `build/<preset>/`.
 
 ## Running
 
 ```
-build/player_@PORT_NAME@ <disc image>                 # the game in a window
-build/boot_@PORT_NAME@ <disc image> --seconds 20      # headless, with a report
+build/<preset>/player_@PORT_NAME@ <disc image>                 # the game in a window
+build/<preset>/boot_@PORT_NAME@ <disc image> --seconds 20      # headless, with a report
 ```
 
 Both take XenoForge's usual command line (its `docs/runtime.md`) and
@@ -34,5 +49,5 @@ Both take XenoForge's usual command line (its `docs/runtime.md`) and
 | path | what |
 |---|---|
 | `src/main.cpp` | the port's main: its name, options, `on_init` |
-| `src/hooks.cpp` | hooks on the game's functions, reloaded while it runs |
+| `src/hooks.cpp` | hooks on the game's functions, reloaded while it runs (linked in on Android) |
 | `project.toml` | the recompiler's project file: names, hooked functions, fixes to discovery |
