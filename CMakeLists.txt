@@ -63,6 +63,7 @@ add_library(xenoforge STATIC
     src/xenos.cpp
     src/spirv.cpp
     src/shader_translator.cpp
+    src/native_shaders.cpp
     src/shader_program.cpp
     src/shader_interpreter.cpp
     src/shader_container.cpp
@@ -94,6 +95,20 @@ add_library(xenoforge STATIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated/game_interface.stamp
 )
 target_include_directories(xenoforge PUBLIC include PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/generated)
+# the shader translator's version for a port's shader cache (native_shaders.h's translator_version): a digest of
+# the translator's sources, taken again when one changes
+file(GLOB XF_TRANSLATOR_SOURCES CONFIGURE_DEPENDS src/shader_translator.cpp src/ucode_parse.cpp src/ucode.cpp
+     src/spirv.cpp src/shader_program.cpp include/xenoforge/shader_translator.h include/xenoforge/ucode*.h
+     include/xenoforge/spirv.h include/xenoforge/shader_program.h include/xenoforge/shader_harness.h)
+set(XF_TRANSLATOR_TEXT "")
+foreach(f ${XF_TRANSLATOR_SOURCES})
+    file(SHA256 ${f} h)
+    string(APPEND XF_TRANSLATOR_TEXT "${h}")
+endforeach()
+string(SHA256 XF_TRANSLATOR_VERSION "${XF_TRANSLATOR_TEXT}")
+string(SUBSTRING ${XF_TRANSLATOR_VERSION} 0 16 XF_TRANSLATOR_VERSION)
+set_source_files_properties(src/native_shaders.cpp PROPERTIES COMPILE_DEFINITIONS
+                            "XF_TRANSLATOR_VERSION=\"${XF_TRANSLATOR_VERSION}\"")
 # The game library's interface (game_library.h; docs/runtime.md, "The game
 # library"): its version, a digest of what makes a library (the generated
 # code's headers, the recompiler's sources, the recompile step's flags in
@@ -589,6 +604,7 @@ add_library(XenoForge::vk ALIAS xenoforge_vk)
 add_library(XenoForge::kernel ALIAS xenoforge_kernel)
 add_library(XenoForge::boot ALIAS xenoforge_boot)
 add_executable(XenoForge::xfrecomp ALIAS xfrecomp)
+add_executable(XenoForge::xfshader ALIAS xfshader)
 set(XENOFORGE_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set(XENOFORGE_RUNTIME_FILES)
 if(XF_XMA)
@@ -640,7 +656,7 @@ target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
 foreach(name aes disc xex lzx sha1 snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor
-             recomp_discover gpu_trace_writer shader_storage patches)
+             recomp_discover gpu_trace_writer shader_storage patches native_shaders)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
@@ -916,6 +932,7 @@ add_test(NAME blend_minmax COMMAND blend_minmax_test)
 # (tests/sdk_test.cmake)
 # (and a port built from a made-up executable as from a disc: tests/sdk/make_xex.cpp)
 add_executable(sdk_make_xex tests/sdk/make_xex.cpp)
+target_link_libraries(sdk_make_xex PRIVATE xenoforge)
 add_test(NAME sdk COMMAND ${CMAKE_COMMAND} -DBUILD=${CMAKE_BINARY_DIR} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}
          -DMAKE_XEX=$<TARGET_FILE:sdk_make_xex>
          -DWORK=${CMAKE_BINARY_DIR}/sdk_test -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}

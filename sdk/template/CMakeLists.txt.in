@@ -52,6 +52,17 @@ elseif(GAME_ISO)
 else()
     message(FATAL_ERROR "set GAME_ISO to the game's disc image (or GAME_GENERATED_DIR)")
 endif()
+# the game's shaders translated before it runs (XenoForge's xfshader bake): what its runs recorded
+# (GAME_TITLE_ID's storage in XenoForge's cache, or GAME_SHADER_STORAGE) baked into build/<preset>/shaders
+set(GAME_TITLE_ID "@PORT_TITLE_ID@" CACHE STRING "the game's title ID (8 hex digits), for its recorded shaders")
+set(GAME_SHADER_STORAGE "" CACHE FILEPATH "the shaders a run recorded (<cache>/<title id>.xfshaders)")
+set(shaders)
+if(NOT GAME_SHADER_STORAGE AND GAME_TITLE_ID)
+    xenoforge_shader_storage(storage ${GAME_TITLE_ID})
+    set(shaders SHADER_STORAGE ${storage})
+elseif(GAME_SHADER_STORAGE)
+    set(shaders SHADER_STORAGE ${GAME_SHADER_STORAGE})
+endif()
 set(hooks HOOK_SOURCES src/hooks.cpp)
 if(PORT_HOT_RELOAD)
     list(APPEND hooks HOT_RELOAD)
@@ -61,4 +72,5 @@ endif()
 # boot_@PORT_NAME@
 xenoforge_add_port(@PORT_NAME@ ${game_code}
     SOURCES src/main.cpp
-    ${hooks})
+    ${hooks}
+    ${shaders})

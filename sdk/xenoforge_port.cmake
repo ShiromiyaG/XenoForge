@@ -11,7 +11,7 @@
 #       [ISO <disc image>] [XEX <path on the disc>] [PROJECT <project.toml>]
 #       [SOURCES <port sources>...] [HOOK_SOURCES <hook sources>... [HOT_RELOAD]]
 #       [DEFINITIONS ...] [INCLUDES ...] [LIBRARIES ...]
-#       [OPT <-O2>] [NO_PLAYER] [NO_BOOT]
+#       [OPT <-O2>] [NO_PLAYER] [NO_BOOT] [SHADER_STORAGE <title's .xfshaders>]
 #       [GENERATED_DIR <dir> | PREBUILT <game library file>])
 #
 # Makes
@@ -77,8 +77,28 @@ function(xenoforge_cpu_level_check target)
     target_sources(${target} PRIVATE ${file})
 endfunction()
 
+# xenoforge_shader_storage(<var> <title id>): where XenoForge keeps the
+# shaders a title's runs recorded on this machine (game_build.h's
+# default_cache_dir: %LOCALAPPDATA%/xenoforge/cache, $XDG_CACHE_HOME/xenoforge,
+# ~/.cache/xenoforge), <cache>/<title id, 8 hex digits>.xfshaders, for
+# xenoforge_add_port's SHADER_STORAGE.
+function(xenoforge_shader_storage var title_id)
+    string(TOUPPER "${title_id}" id)
+    if(WIN32 AND DEFINED ENV{LOCALAPPDATA})
+        file(TO_CMAKE_PATH "$ENV{LOCALAPPDATA}/xenoforge/cache" cache)
+    elseif(DEFINED ENV{XDG_CACHE_HOME})
+        set(cache "$ENV{XDG_CACHE_HOME}/xenoforge")
+    elseif(DEFINED ENV{HOME})
+        set(cache "$ENV{HOME}/.cache/xenoforge")
+    else()
+        set(${var} "" PARENT_SCOPE)
+        return()
+    endif()
+    set(${var} "${cache}/${id}.xfshaders" PARENT_SCOPE)
+endfunction()
+
 function(xenoforge_add_port name)
-    cmake_parse_arguments(P "NO_PLAYER;NO_BOOT;HOT_RELOAD" "ISO;XEX;PROJECT;OPT;GENERATED_DIR;PREBUILT"
+    cmake_parse_arguments(P "NO_PLAYER;NO_BOOT;HOT_RELOAD" "ISO;XEX;PROJECT;OPT;GENERATED_DIR;PREBUILT;SHADER_STORAGE"
                           "SOURCES;HOOK_SOURCES;DEFINITIONS;INCLUDES;LIBRARIES" ${ARGN})
     if(P_HOT_RELOAD AND NOT P_HOOK_SOURCES)
         message(FATAL_ERROR "xenoforge_add_port(${name}): HOT_RELOAD reloads HOOK_SOURCES, and there are none")
@@ -181,6 +201,34 @@ function(xenoforge_add_port name)
         add_dependencies(game_${name} game_${name}_build)
     else()
         message(FATAL_ERROR "xenoforge_add_port(${name}): one of ISO, GENERATED_DIR or PREBUILT is needed")
+    endif()
+
+    # the shader bake (native_shaders.h): what a run of the game recorded (XenoForge's shader storage,
+    # <cache>/<title id>.xfshaders) translated into shaders/ beside the executables, where a port's
+    # ShaderCache reads it, again whenever the storage grew
+    if(P_SHADER_STORAGE)
+        get_filename_component(storage ${P_SHADER_STORAGE} ABSOLUTE)
+        set(xfshader)
+        if(XENOFORGE_HOST_XFRECOMP)
+            get_filename_component(host_bin ${XENOFORGE_HOST_XFRECOMP} DIRECTORY)
+            set(xfshader ${host_bin}/xfshader${CMAKE_HOST_EXECUTABLE_SUFFIX})
+        elseif(NOT CMAKE_CROSSCOMPILING OR TARGET xfshader)
+            set(xfshader $<TARGET_FILE:XenoForge::xfshader>)
+        endif()
+        if(NOT EXISTS ${storage})
+            message(STATUS "xenoforge_add_port(${name}): no ${storage} yet (a run of the game records it): no bake")
+        elseif(NOT xfshader)
+            message(STATUS "xenoforge_add_port(${name}): cross-compiling without XENOFORGE_HOST_XFRECOMP: no bake")
+        else()
+            set(baked ${CMAKE_CURRENT_BINARY_DIR}/xenoforge/${name}/shaders.baked)
+            add_custom_command(OUTPUT ${baked}
+                               COMMAND ${xfshader} bake ${storage} ${CMAKE_CURRENT_BINARY_DIR}/shaders
+                               COMMAND ${CMAKE_COMMAND} -E touch ${baked}
+                               DEPENDS ${storage} ${xfshader}
+                               COMMENT "${name}: the shaders a run recorded, baked into shaders/"
+                               VERBATIM)
+            add_custom_target(${name}_shaders ALL DEPENDS ${baked})
+        endif()
     endif()
 
     # the hooks as a module of their own, reloaded while the game runs

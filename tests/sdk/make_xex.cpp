@@ -4,9 +4,14 @@
 // as from a disc (xenoforge_add_port's ISO form: xfrecomp emit, the generated
 // code compiled), so the step a real disc takes is checked without one.
 //
-//   make_xex <out.xex>
+//   make_xex <out.xex> [<out.xfshaders>]
 //
+// With a second path, a shader storage (shader_storage.h) holding one pixel
+// shader, for the bake a port's build runs (xenoforge_add_port's
+// SHADER_STORAGE).
 // The code: the entry calls three leaves (each adds to r3) and returns.
+
+#include "xenoforge/shader_storage.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -87,7 +92,14 @@ std::vector<uint8_t> make_xex() {
 } // namespace
 
 int main(int argc, char **argv) {
-    if (argc != 2) return std::fprintf(stderr, "usage: make_xex <out.xex>\n"), 2;
+    if (argc != 2 && argc != 3) return std::fprintf(stderr, "usage: make_xex <out.xex> [<out.xfshaders>]\n"), 2;
+    if (argc == 3) {
+        const std::vector<uint32_t> shader = {0x00000000u, 0x00001000u, 0x00000000u, 0, 0, 0};
+        std::remove(argv[2]);
+        xf::ShaderStorage storage;
+        if (!storage.open(argv[2], true) || !storage.add_shader(1, xf::ShaderStorage::hash(1, shader), shader))
+            return std::fprintf(stderr, "make_xex: cannot write %s\n", argv[2]), 1;
+    }
     const std::vector<uint8_t> file = make_xex();
     std::ofstream out(argv[1], std::ios::binary);
     out.write(reinterpret_cast<const char *>(file.data()), std::streamsize(file.size()));

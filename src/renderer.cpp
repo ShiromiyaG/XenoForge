@@ -51,6 +51,7 @@
 
 #include "xenoforge/guest_memory.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/native_shaders.h"
 #include "xenoforge/render_scale.h"
 #include "xenoforge/resolve.h"
 #include "xenoforge/shader_harness.h"
@@ -72,6 +73,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -950,6 +952,18 @@ struct System {
     uint32_t generic[4];
 };
 static_assert(sizeof(System) == 784);
+// a port's view of the block (native_shaders.h) is this one
+static_assert(sizeof(System) == sizeof(native::SystemConstants));
+static_assert(offsetof(System, slots) == offsetof(native::SystemConstants, slots));
+static_assert(offsetof(System, flags) == offsetof(native::SystemConstants, flags));
+static_assert(offsetof(System, values) == offsetof(native::SystemConstants, values));
+static_assert(offsetof(System, signs) == offsetof(native::SystemConstants, signs));
+static_assert(offsetof(System, signed_slots) == offsetof(native::SystemConstants, signed_slots));
+static_assert(offsetof(System, clip_planes) == offsetof(native::SystemConstants, clip_planes));
+static_assert(offsetof(System, extent_map) == offsetof(native::SystemConstants, extent_map));
+static_assert(offsetof(System, integer_scale) == offsetof(native::SystemConstants, integer_scale));
+static_assert(offsetof(System, blend_premultiply) == offsetof(native::SystemConstants, blend_premultiply));
+static_assert(offsetof(System, generic) == offsetof(native::SystemConstants, generic));
 
 // The snorm format of a unorm one's bits, where the host has one (a signed
 // view of the same image); undefined for the rest.
@@ -13450,6 +13464,15 @@ public:
         std::memcpy(r_.arena_data(at), data, bytes);
         buffer = r_.arena_.buffer, offset = at;
         return true;
+    }
+    VkDeviceSize guest_memory(uint32_t address, uint32_t bytes, VkBuffer &buffer, VkDeviceSize &offset) override {
+        buffer = r_.mirror_.buffer, offset = address & GuestMemory::PHYSICAL_MASK;
+        if (!bytes || !r_.fatal_.empty()) return 0;
+        std::vector<Range> ranges;
+        add_span(ranges, address, bytes);
+        const VkDeviceSize given = r_.request(ranges);
+        r_.report_.vertex_bytes += given;
+        return given;
     }
 
 private:

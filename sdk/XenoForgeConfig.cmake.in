@@ -100,6 +100,9 @@ set(XENOFORGE_HOST_XFRECOMP "" CACHE FILEPATH "cross-compiling: the xfrecomp of 
 add_executable(XenoForge::xfrecomp IMPORTED)
 set_target_properties(XenoForge::xfrecomp PROPERTIES IMPORTED_LOCATION
                       "${PACKAGE_PREFIX_DIR}/bin/xfrecomp${CMAKE_EXECUTABLE_SUFFIX}")
+add_executable(XenoForge::xfshader IMPORTED)
+set_target_properties(XenoForge::xfshader PROPERTIES IMPORTED_LOCATION
+                      "${PACKAGE_PREFIX_DIR}/bin/xfshader${CMAKE_EXECUTABLE_SUFFIX}")
 add_executable(XenoForge::xfinspect IMPORTED)
 set_target_properties(XenoForge::xfinspect PROPERTIES IMPORTED_LOCATION
                       "${PACKAGE_PREFIX_DIR}/bin/xfinspect${CMAKE_EXECUTABLE_SUFFIX}")

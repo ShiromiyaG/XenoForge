@@ -37,7 +37,8 @@ build/windows/boot_mygame <disc image> --seconds 20     (build/linux/ on Linux)
 
 `new_port.cmake` writes the repository from `sdk/template` (`NAME`: the
 targets' name, letters, digits and `_`; `TITLE`: the window's title; `DIR`:
-`./<NAME>` by default, empty or new; `ISO`: optional):
+`./<NAME>` by default, empty or new; `ISO`: optional; `TITLE_ID`: optional,
+the game's title ID, so the build bakes the shaders its runs recorded):
 
 | file | what |
 |---|---|
@@ -112,13 +113,14 @@ is the player's flat folder, `docs/runtime.md`, "Shipping the player"; a plain
 `cmake --install` makes both). Layout:
 
 ```
-bin/                         xfrecomp, xfinspect, ffmpeg-xma.dll (+ LICENSE-ffmpeg)
+bin/                         xfrecomp, xfinspect, xfshader (the shader bake), ffmpeg-xma.dll (+ LICENSE-ffmpeg)
 include/xenoforge/           the port's API (run.h, port.h, native_render.h,
-                             port_module.h), the generated code's (ppc_generated.h,
+                             native_shaders.h, port_module.h), the generated code's (ppc_generated.h,
                              ppc_module.h, game_library.h, ppc_runtime.h, and the
                              interface version, game_interface.h) and what those
                              include (kernel.h, memory.h, ppc_context.h, xex.h,
-                             vk_device.h, ...): 25 headers, not XenoForge's other 47
+                             vk_device.h, ...): 26 headers (25 of the tree's 79, and the
+                             generated game_interface.h), not XenoForge's other 54
 lib/                         xenoforge, xenoforge_kernel (an archive of the kernel's
                              objects), xenoforge_vk, xenoforge_boot and, with the
                              player, xenoforge_player, xf_frontend, xf_imgui, SDL3-static
@@ -190,6 +192,13 @@ in the console pool (`USES_TERMINAL`): alone, its progress shown as it goes.
 The flags travel as space-separated strings (`-DXF_GAME_CPU_FLAGS=-march=x86-64-v3
 -mprefer-vector-width=128`), so no step on the way splits v3's two flags (a
 list once did, and a port from an ISO failed to configure its code).
+
+`SHADER_STORAGE <file>`: the shaders a run of the game recorded
+(`<cache>/<title id>.xfshaders`; `xenoforge_shader_storage(<var> <title id>)`
+gives that path on this machine) baked into `shaders/` beside the
+executables by `xfshader bake`, again whenever the storage grew (none yet:
+said, and no bake); a port's `ShaderCache` reads them there
+(native_shaders.h).
 
 Other arguments: `DEFINITIONS`, `INCLUDES`, `LIBRARIES` for the port's
 sources; `XEX <path>` for an executable other than `default.xex`; `NO_PLAYER`,
@@ -396,33 +405,59 @@ with `xf::port::before` and yields every frame it was not called in. Options
 `background`. Inside XenoForge's build, `-DXF_NATIVE_PORT_GAME=<one of
 XF_GAMES>` builds it as `build/sdk/examples/native_port/{player,boot}_native`.
 
-## Next: a port that replaces the guest's Direct3D
+## A port that replaces the guest's Direct3D
 
-(Planned 2026-11-14, from the first port's design.) `native_render.h` lets a
-port draw while the guest's Direct3D still builds PM4 command buffers and the
-command processor still reads them, its draws skipped. A port can go
-further: replace the D3D library the game links statically (its draws,
-clears, resolves, swap, the ring buffer's commit and kick) with its own
-Vulkan, reading each draw's state from the `D3DDevice`'s shadow of the GPU
-registers, so no command buffer is built and the emulated GPU does no work.
-What the SDK lacks for that, all as port API (headers in
-`XF_SDK_API_HEADERS`, so a port stays off XenoForge's internals):
+`native_render.h` alone lets a port draw while the guest's Direct3D still
+builds PM4 command buffers and the command processor still reads them, its
+draws skipped. A port can go further: replace the D3D library the game links
+statically, so the emulated GPU does no work. The pattern (2026-11-14, from
+the first port's design):
 
-- **The GPU taken over**: a call that leaves the command processor idle for
-  the run (no ring buffer read, no EDRAM), hands the port the Vulkan device,
-  its queue and the presentation (the player's swapchain and overlay still
-  on top), and leaves the guest's fences and the occlusion queries to the
-  port, while the kernel keeps the vblank interrupts.
-- **Shaders**: the translator (Xenos microcode to SPIR-V, the one the
-  emulated path uses, the same options) behind a small public interface, and
-  a bake tool (`xfshader bake <disc> <out>`) a port's build runs, like
-  `xfrecomp emit`, so a port's shaders are translated before it runs.
-- **Resources**: guest memory as a Vulkan buffer (`VK_EXT_external_memory_host`
-  where there is one, else a mirror kept by the writes the next item reports),
-  and texture untiling and format conversion on the GPU from a fetch
-  constant, outside a `Frame`.
-- **Writes**: notification of CPU writes to guest memory ranges a port
-  registers (the page watch the renderer uses), for what a port cannot hook.
+- **What is replaced**: the D3D's draws (`DrawIndexedVertices`,
+  `DrawVertices`, the "UP" draws' `Begin`/`End`), `ClearF` and `Resolve`,
+  with `XF_REPLACE` hooks that never call the original. The `Set*` functions
+  stay: they only write the `D3DDevice`'s shadow of the GPU registers, which
+  the replacements read whole at each draw (the fetch constants, the float
+  constants, the render state, the bound shaders).
+- **What is kept**: `Swap` and the fences run as the guest has them, so the
+  ring buffer still carries the swap packet and the fence writes and nothing
+  else. The command processor then has almost nothing to read; the swaps,
+  their pacing by the vblank and the guest's fence waits stay right without
+  the port doing any of it; and the output renderer (`set_output_renderer`)
+  is still called at each swap, where the port records the frame it captured
+  (the replacements run on the guest's render thread; they capture, the
+  output renderer records).
+- **The toggle**: with `enabled()` off, the replacements call the originals,
+  and the emulated path draws the frame (the oracle, F6).
+
+What the SDK gives such a port:
+
+- **The game's own shaders** (`xenoforge/native_shaders.h`):
+  `translate_shader` turns Xenos microcode into SPIR-V with the translator
+  the emulated path uses, `shader_hash` is the emulated path's hash (the one
+  `PassInfo` and the shader storage carry), `ShaderConstants` and
+  `SystemConstants` are the blocks the shaders read (their layouts checked
+  against the renderer's at XenoForge's build), and the header documents the
+  bindings. `ShaderCache` keeps the SPIR-V by hash in memory and in a
+  directory, under a folder of `translator_version()` (a digest of the
+  translator's sources, so a new translator never reads an old one's
+  SPIR-V). **The bake**: `xfshader bake <cache>/<title id>.xfshaders <dir>`
+  (in the package's `bin/`) translates every shader a run recorded (the
+  generic player and the emulated frames record them) into that directory
+  before the port runs; game A's 240 recorded shaders bake in 0.8 s, all
+  translated, all valid SPIR-V for Vulkan 1.3 (`spirv-val`), and a second
+  bake has nothing to do.
+- **Guest memory on the GPU** (`Frame::guest_memory`): the renderer's mirror
+  of physical memory, one storage buffer, with the pages under a range made
+  current; the translated vertex shaders fetch their vertices from it at the
+  fetch constants' addresses and swap the words themselves, so a port copies
+  and converts no vertex data.
+- **Textures** (`Frame::texture`): a fetch constant's texture, detiled and
+  converted by the renderer's texture cache.
+
+Still to come: resolves into host images a port owns (render targets as
+images, not EDRAM), a pipeline helper for the translated shaders' layout,
+and notification of CPU writes to guest memory ranges a port registers.
 
 ## Building and running a port
 

@@ -1,6 +1,7 @@
 # A new port's repository from the SDK's template (docs/sdk.md, "Starting a port"):
 #
-#   cmake -DNAME=<name> [-DTITLE=<the game's title>] [-DDIR=<directory>] [-DISO=<disc image>]
+#   cmake -DNAME=<name> [-DTITLE=<the game's title>] [-DTITLE_ID=<8 hex digits>] [-DDIR=<directory>]
+#         [-DISO=<disc image>]
 #         -P <the SDK's prefix>/share/xenoforge/new_port.cmake
 #
 # NAME is the port's identifier (letters, digits, _; the targets are
@@ -57,6 +58,10 @@ else()
 endif()
 set(PORT_NAME ${NAME})
 set(PORT_TITLE ${TITLE})
+set(PORT_TITLE_ID "")
+if(TITLE_ID)
+    string(TOUPPER ${TITLE_ID} PORT_TITLE_ID)
+endif()
 set(PORT_ISO "")
 if(ISO)
     get_filename_component(PORT_ISO "${ISO}" ABSOLUTE)

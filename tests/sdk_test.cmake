@@ -110,13 +110,19 @@ endif()
 # the same port from an executable, as from a disc (xenoforge_add_port's ISO form: build_game.cmake's xfrecomp emit,
 # the generated code configured and compiled), then run: the boot report has the code linked in
 if(MAKE_XEX)
-    step("make an executable" ${MAKE_XEX} ${WORK}/default.xex)
+    step("make an executable and a shader storage" ${MAKE_XEX} ${WORK}/default.xex ${WORK}/58460002.xfshaders)
     step("configure the template's port from the executable" ${CMAKE_COMMAND} -S ${WORK}/template_port -B
          ${WORK}/template_port/build_iso -G ${GENERATOR} -DCMAKE_MAKE_PROGRAM=${MAKE} -DCMAKE_C_COMPILER=${CC}
-         -DCMAKE_CXX_COMPILER=${CXX} -DXENOFORGE_SDK=${prefix} -DGAME_ISO=${WORK}/default.xex)
+         -DCMAKE_CXX_COMPILER=${CXX} -DXENOFORGE_SDK=${prefix} -DGAME_ISO=${WORK}/default.xex
+         -DGAME_SHADER_STORAGE=${WORK}/58460002.xfshaders)
     step("build the template's port from the executable" ${CMAKE_COMMAND} --build ${WORK}/template_port/build_iso)
     if(NOT step_output MATCHES "xfrecomp emit" OR NOT step_output MATCHES "compilers at once")
         message(FATAL_ERROR "sdk_test: the build from the executable did not emit and compile:\n${step_output}")
+    endif()
+    # the recorded shader baked beside the executables (SHADER_STORAGE), translated or with its why
+    file(GLOB_RECURSE baked ${WORK}/template_port/build_iso/shaders/*.ps.*)
+    if(NOT baked)
+        message(FATAL_ERROR "sdk_test: no shader baked into shaders/:\n${step_output}")
     endif()
     file(GLOB booted ${WORK}/template_port/build_iso/boot_template_port*)
     list(FILTER booted EXCLUDE REGEX "\\.(pdb|ilk|exp|lib)$")

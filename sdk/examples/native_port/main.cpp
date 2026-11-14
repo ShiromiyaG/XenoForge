@@ -19,6 +19,7 @@
 // the overlay (F1) shows both and what was skipped.
 
 #include <xenoforge/native_render.h>
+#include <xenoforge/native_shaders.h>
 #include <xenoforge/port.h>
 #include <xenoforge/run.h>
 
@@ -49,6 +50,7 @@ const uint32_t background_frag[] = {
 // the port's options (config.toml's [port], the overlay, --option)
 bool g_suppress = true;   // skip the emulated draws and resolves while drawing (else only draw over them)
 bool g_background = true; // the guest's front buffer behind the triangle
+uint64_t g_guest_bytes = 0; // guest memory given to the GPU through Frame::guest_memory (the report's)
 int g_yield_every = 0;    // yield runs of this many swaps every other run (0: never), to see the switch both ways
 
 // what the hook captures, on the guest's threads
@@ -181,6 +183,14 @@ bool draw_frame(const xf::native::OutputContext &ctx) {
     xf::native::TextureImage front;
     std::string why;
     const bool background = g_background && ctx.guest.address && frame.texture(ctx.guest.fetch, front, why);
+    // guest memory as the GPU sees it (the renderer's mirror, made current where the CPU wrote): a
+    // port that replaces the guest's Direct3D binds it for the game's own vertex shaders
+    // (native_shaders.h, binding 1); here the front buffer's first row, counted
+    if (ctx.guest.address) {
+        VkBuffer memory;
+        VkDeviceSize at;
+        g_guest_bytes += frame.guest_memory(ctx.guest.address, ctx.guest.pitch * 4, memory, at);
+    }
     // the triangle: spinning with the swaps, its color from the captured calls
     const float angle = float(ctx.swap) * 0.03f;
     const float hue = g_capture ? float(new_calls % 16) / 16.0f : 0.5f + 0.5f * std::sin(angle * 0.5f);
@@ -260,6 +270,9 @@ int main(int argc, char **argv) {
                 "native_port_capture");
             std::printf("native port: capturing the calls to 0x%08X\n", g_capture);
         }
+        // the game's own shaders would come through native_shaders.h (a ShaderCache by hash, filled
+        // by xfshader bake); this example brings its own, and only says which translator it has
+        std::printf("native port: shader translator %s\n", xf::native::translator_version());
         xf::native::set_output_renderer(draw_frame);
         // every draw and resolve skipped while the port draws (no filter), or
         // none of them with suppress off (the cost of drawing on top)
@@ -275,6 +288,8 @@ int main(int argc, char **argv) {
                     (unsigned long long)n.resolves_skipped, (unsigned long long)n.draws_kept,
                     (unsigned long long)n.resolves_kept, (unsigned long long)n.memexport_kept,
                     (unsigned long long)n.occlusion_faked, (unsigned long long)g_calls.load(), g_last_argument.load());
+        std::printf("native port: %llu bytes of guest memory given to the GPU for it\n",
+                    (unsigned long long)g_guest_bytes);
         xf::native::set_output_renderer({});
     };
     return xf::run(int(args.size()), args.data(), port);

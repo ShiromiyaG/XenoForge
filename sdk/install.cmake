@@ -37,7 +37,7 @@ if(TARGET xenoforge_player)
          CONTENT "$<TARGET_PROPERTY:SDL3-static,INTERFACE_LINK_LIBRARIES>\n")
 endif()
 install(TARGETS ${_sdk_libs} ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT sdk)
-install(TARGETS xfrecomp xfinspect RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT sdk)
+install(TARGETS xfrecomp xfinspect xfshader RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT sdk)
 if(XF_XMA)
     install(FILES $<TARGET_FILE:ffmpeg_xma> DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT sdk)
     install(FILES ${CMAKE_SOURCE_DIR}/LICENSE-ffmpeg DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT sdk)
@@ -56,7 +56,8 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/cmake/toolchains DESTINATION ${CMAKE_INSTA
 # headers. The rest of include/xenoforge (the renderer's, the recompiler's,
 # the disc's, the tools') is XenoForge's own and is not installed.
 set(XF_SDK_API_HEADERS
-    run.h port.h native_render.h port_module.h cpu_level_check.h # a port's code (cpu_level_check.h: xenoforge_add_port's)
+    run.h port.h native_render.h native_shaders.h port_module.h cpu_level_check.h # a port's code (cpu_level_check.h:
+                                                                                  # xenoforge_add_port's)
     ppc_generated.h ppc_module.h game_library.h ppc_runtime.h)   # its generated code
 set(_xf_todo ${XF_SDK_API_HEADERS})
 set(XF_SDK_HEADERS)

@@ -3,6 +3,7 @@
 // shader_<hash>.ucode.bin.vert|frag, words in host order) or a guest's
 // big-endian words with --big-endian.
 
+#include "xenoforge/native_shaders.h"
 #include "xenoforge/shader_translator.h"
 #include "xenoforge/ucode_parse.h"
 
@@ -15,6 +16,20 @@
 using namespace xf;
 
 int main(int argc, char **argv) {
+    // the bake (native_shaders.h): every shader a run recorded, translated into a port's shader cache
+    if (argc >= 2 && std::string(argv[1]) == "bake") {
+        if (argc != 4) {
+            std::fprintf(stderr,
+                         "usage: xfshader bake <storage: <cache>/<title id>.xfshaders> <shader cache directory>\n");
+            return 2;
+        }
+        std::string why;
+        const long n = native::bake_shaders(argv[2], argv[3], why);
+        if (n < 0) return std::fprintf(stderr, "xfshader bake: %s\n", why.c_str()), 1;
+        std::printf("xfshader bake: %ld shaders translated into %s (translator %s)\n", n, argv[3],
+                    native::translator_version());
+        return 0;
+    }
     std::filesystem::path input;
     int type = -1; // 0 vertex, 1 pixel
     bool big_endian = false;

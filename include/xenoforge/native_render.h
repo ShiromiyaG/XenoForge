@@ -101,6 +101,16 @@ class Frame {
     // device's uniform alignment at least). False when it does not fit (a
     // few MB at most).
     virtual bool upload(const void *data, size_t bytes, size_t alignment, VkBuffer &buffer, VkDeviceSize &offset) = 0;
+    // Guest memory where it lies, for the GPU, without a copy of the port's:
+    // the renderer's mirror of physical memory (one storage buffer of all of
+    // it, the emulated path's shared memory), its pages under [address,
+    // address + bytes) made current (what the CPU wrote since given to it, as
+    // a draw's vertex data is) before what the port records next. buffer is
+    // the whole mirror; offset the physical address (address & 0x1FFFFFFF),
+    // so a shader indexes it by guest address (native_shaders.h's binding
+    // 1). The bytes are as the guest stores them: big-endian. Returns the
+    // bytes given to the GPU for it (0 when it was current already).
+    virtual VkDeviceSize guest_memory(uint32_t address, uint32_t bytes, VkBuffer &buffer, VkDeviceSize &offset) = 0;
 };
 
 struct OutputContext {
