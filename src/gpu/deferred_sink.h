@@ -75,10 +75,13 @@ class DeferredSink final : public Sink {
         double wait_seconds = 0;                      // the front end's time waiting for the back end
         // of it, by why (Work::back_end_wait_seconds's order: SyncFor's, the extents', the ring full)
         double wait_by[Work::BACK_END_WAITS] = {};
+        uint64_t waits = 0, sleeps = 0; // the front end's waits for the back end, and of them those that slept
     };
     Stats stats() const;
     // the back end's processor time so far (thread_cpu.h's ticks), from any thread
     uint64_t back_cpu_ticks() const { return back_cpu_.ticks(); }
+    // its wall time with records to do so far, from any thread
+    double back_busy_seconds() const;
 
     // ---- the Sink ----
     void sync(SyncFor why, uint32_t address, uint32_t bytes) override;

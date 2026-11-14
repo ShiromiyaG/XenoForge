@@ -84,6 +84,24 @@ class DrawSections {
     // the draws' sections: what the back end does outside the draws
     enum BackKind : uint32_t { BackBlocks, BackDraw, BackResolve, BackSwap, BackShader, BackOther, BACK_KINDS };
     void back(BackKind k, uint64_t ticks) { back_[k] += ticks, back_counts_[k]++; }
+    // the running totals, read from another thread for XF_SLOW_FRAMES' lines (a frame's share is
+    // the difference of two; a total read while it is added to is off by one record at most)
+    struct Totals {
+        uint64_t back[BACK_KINDS] = {};
+        uint64_t cycles[COUNT] = {};
+        uint64_t draws = 0;
+    };
+    Totals totals() const {
+        Totals t;
+        for (uint32_t i = 0; i < BACK_KINDS; i++) t.back[i] = back_[i];
+        for (uint32_t i = 0; i < COUNT; i++) t.cycles[i] = cycles_[i];
+        t.draws = draws_;
+        return t;
+    }
+    static constexpr const char *back_names[BACK_KINDS] = {"blocks", "draws", "resolves", "swaps", "shaders", "other"};
+    static constexpr const char *section_names[COUNT] = {"front",    "indices", "constants", "targets", "textures",
+                                                         "pipeline", "vertex",  "fit",       "constup", "systemup",
+                                                         "words",    "pass",    "state",     "draw"};
     ~DrawSections() {
         if (!on() || !draws_) return;
         uint64_t back_total = 0;

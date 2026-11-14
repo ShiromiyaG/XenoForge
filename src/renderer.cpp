@@ -46,6 +46,7 @@
 
 #include "draw_sections.h"
 #include "fast_clock.h"
+#include "thread_cpu.h"
 #include "native_internal.h"
 
 #include "xenoforge/guest_memory.h"
@@ -1615,6 +1616,7 @@ public:
         w.texture_loads_exported = report_.texture_loads_exported;
         w.extent_wait_seconds = extent_wait_seconds_, w.extent_fence_seconds = extent_fence_seconds_;
         w.back_end_gpu_wait_seconds = back_end_gpu_wait_seconds_;
+        w.gpu_wait_cpu_seconds = double(gpu_wait_cpu_ticks_.load(std::memory_order_relaxed)) / cpu_ticks_a_second();
         if (ring_) w.record_wait_seconds = FastClock::seconds(ring_->wait_ticks(rec::Ring::Fence));
         w.lock_front_seconds = FastClock::seconds(mutex_.waited(CallLock::FRONT_END));
         w.lock_other_seconds = FastClock::seconds(mutex_.waited(CallLock::OTHER));
@@ -1832,9 +1834,11 @@ private:
 
     class Call {
     public:
-        // (small: one of the many short calls, timed only with cpu_times_)
+        // (small: one of the many short calls, timed only with cpu_times_. With the work split in
+        // two none is timed but with cpu_times_: the back end's busy time is Report::seconds
+        // then, and two clock reads a call were 4% of its time)
         Call(Impl &r, const gpu::RegisterFile *registers, bool small = false)
-            : r_(r), lock_(r.mutex_), timer_(r.report_.seconds, !small || r.cpu_times_) {
+            : r_(r), lock_(r.mutex_), timer_(r.report_.seconds, r.cpu_times_ || (!small && !r.deferred_)) {
             if (registers) r.regs_ = registers->data(), r.file_ = registers;
         }
         explicit operator bool() const { return r_.fatal_.empty(); }
@@ -2033,6 +2037,8 @@ private:
         put("VIZ_QUERY packets", n.opcodes[pm4::VIZ_QUERY].load());
         put("draws with no valid index source (not drawn)", n.failed_draws.load());
         if (deferred_) r.back_end_cpu_ticks = deferred_->back_cpu_ticks();
+        // (the calls are untimed with the work split: the back end's busy time is the renderer's)
+        if (deferred_ && !cpu_times_) r.seconds = deferred_->back_busy_seconds();
         if (ring_) r.record_cpu_ticks = ring_->cpu_ticks();
         return r;
     }
@@ -2229,6 +2235,8 @@ private:
     VkDeviceSize scaled_heap_used_ = 0;
     std::map<uint32_t, ScaledRegion> scaled_regions_;
     std::vector<uint8_t> scaled_tags_;
+    // gpu_resolve's units of the destination at a scale (an address, its tiles written whole), kept
+    std::vector<std::pair<uint32_t, uint32_t>> resolve_units_;
     VkDescriptorSet scaled_resolve_set_ = VK_NULL_HANDLE, scaled_load_set_ = VK_NULL_HANDLE,
                     scaled_fill_set_ = VK_NULL_HANDLE;
     VkPipeline scaled_fill_pipeline_ = VK_NULL_HANDLE;
@@ -2677,6 +2685,10 @@ private:
     uint64_t drawn_at_submission_ = 0;
     double extent_wait_seconds_ = 0, extent_fence_seconds_ = 0; // extent_wait's, all and the fences'
     double back_end_gpu_wait_seconds_ = 0;                      // the fences waited for on the back end's thread
+    // the processor time spent inside vkWaitForFences, every thread's (a driver may spin there);
+    // timed only with XF_SLOW_FRAMES set
+    std::atomic<uint64_t> gpu_wait_cpu_ticks_{0};
+    const bool time_gpu_wait_cpu_ = std::getenv("XF_SLOW_FRAMES") != nullptr;
     // (XF_SLOW_FRAMES's back end line, Sink::Work) the GPU drained by sync() (its time and count),
     // the time the renderer's thread spent writing the pipeline cache's file (or handing it to
     // its thread), the GPU's time in the generic shaders' draws (with the GPU timed)
@@ -5412,7 +5424,9 @@ bool Impl::finish_oldest(bool wait) {
         Timer submit(report_.submit_seconds), waiting(report_.wait_seconds);
         report_.waits++;
         const uint64_t t0 = gpu::DeferredSink::on_back_end() ? FastClock::now() : 0;
+        const uint64_t c0 = time_gpu_wait_cpu_ ? current_thread_cpu_ticks() : 0;
         status = vkWaitForFences(dev_, 1, &oldest->fence, VK_TRUE, 20'000'000'000ull);
+        if (time_gpu_wait_cpu_) gpu_wait_cpu_ticks_.fetch_add(current_thread_cpu_ticks() - c0, std::memory_order_relaxed);
         if (t0) back_end_gpu_wait_seconds_ += FastClock::seconds(FastClock::now() - t0);
     }
     if (status != VK_SUCCESS) {
@@ -13017,16 +13031,35 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
         // the unit's first byte, and its tiles the rectangle writes whole (a
         // 64- or 128-bit tile is its own unit, wherever it starts; smaller
         // ones share the 4 KB page they lie in)
-        std::map<uint32_t, uint32_t> units;
+        // (by address, in a kept vector: the tiles come in address order but where a rectangle is
+        // wider than its pitch, merged where they share a unit; a map's node a tile was a
+        // tenth of a resolve's time at a scale)
+        std::vector<std::pair<uint32_t, uint32_t>> &units = resolve_units_;
+        units.clear();
         uint64_t high = 0;
         for (uint32_t ty = y0 / 32; ty <= (y1 - 1) / 32; ty++)
             for (uint32_t tx = x0 / 32; tx <= (x1 - 1) / 32; tx++) {
                 uint64_t a = uint64_t(dest_base) + uint64_t(tx + ty * (info.dest_pitch >> 5)) * tile_bytes;
                 if (tile_bytes < 4096) a &= ~uint64_t(4095);
                 const bool whole = x0 <= tx * 32 && x1 >= tx * 32 + 32 && y0 <= ty * 32 && y1 >= ty * 32 + 32;
-                units[uint32_t(a)] += whole ? 1 : 0;
+                if (!units.empty() && units.back().first == uint32_t(a))
+                    units.back().second += whole ? 1 : 0;
+                else
+                    units.push_back({uint32_t(a), whole ? 1 : 0});
                 high = std::max(high, a + unit_bytes);
             }
+        auto by_address = [](const auto &a, const auto &b) { return a.first < b.first; };
+        if (!std::is_sorted(units.begin(), units.end(), by_address)) {
+            std::stable_sort(units.begin(), units.end(), by_address);
+            size_t kept = 0;
+            for (size_t i = 0; i < units.size(); i++) {
+                if (kept && units[kept - 1].first == units[i].first)
+                    units[kept - 1].second += units[i].second;
+                else
+                    units[kept++] = units[i];
+            }
+            units.resize(kept);
+        }
         if (high <= GUEST_MEMORY) region = make_scaled_region(units.begin()->first, uint32_t(high));
         if (region) {
             const uint32_t tiles_per_unit = unit_bytes / tile_bytes, q = scale_.q4;

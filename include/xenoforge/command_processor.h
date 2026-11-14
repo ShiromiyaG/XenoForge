@@ -435,6 +435,7 @@ public:
         // then the extents' wait (extent_wait), the ring full
         static constexpr size_t BACK_END_WAITS = size_t(SyncFor::COUNT) + 2;
         double back_end_wait_seconds[BACK_END_WAITS] = {};
+        uint64_t back_end_waits = 0, back_end_sleeps = 0; // how many, and of them those that slept
         // the sink's waits where the guest may read the extents (extent_wait:
         // the submission holding them recorded, submitted and done), and of
         // them, the GPU's fence (the rest: the recording thread's submission)
@@ -444,6 +445,8 @@ public:
         // of the GPU waits (gpu_wait_seconds), those on the back end's thread: a submission's
         // slot free again (the rest are the front end's: the extents', a drain)
         double back_end_gpu_wait_seconds = 0;
+        // the processor time spent inside the GPU waits (a driver may spin before it sleeps)
+        double gpu_wait_cpu_seconds = 0;
         // the back end's wall time with records to do, and its processor time
         double back_end_busy_seconds = 0, back_end_cpu_seconds = 0;
         // Where the sink's thread (the back end's, with the work split) was held up outside its
@@ -543,6 +546,10 @@ public:
         sink_ = sink;
         packets_wanted_ = sink && sink->wants_packets();
     }
+    // The sink's packets wanted from here, or no longer (on the processor's thread, from the
+    // sink's own calls): a trace writer standing by asks for them only while it records, as
+    // copying every packet's words and two calls a packet cost the front end a third of its time.
+    void set_packets_wanted(bool on) { packets_wanted_ = sink_ && on; }
     Memory &memory() const { return memory_; }
     RegisterFile &registers() { return regs_; }
     const Counts &counts() const { return counts_; }
@@ -732,6 +739,9 @@ private:
     uint64_t slow_swaps_ = 0, slow_waited_ = 0, slow_draws_ = 0, slow_resolves_ = 0, slow_reports_ = 0;
     Sink::Work slow_work_{};
     uint64_t slow_cpu_ = 0; // the processor's thread's processor time (thread_cpu.h's ticks)
+    // of it, in the guest's interrupt callbacks (timed only with XF_SLOW_FRAMES set)
+    uint64_t interrupt_cpu_ = 0, slow_interrupt_cpu_ = 0;
+    static inline const bool slow_on_ = std::getenv("XF_SLOW_FRAMES") != nullptr;
     std::vector<std::pair<uint64_t, uint32_t>> extent_pending_; // handle (0: answered) and address, in order
     size_t extent_first_ = 0;                                   // the first of them still waiting
     size_t extent_cursor_ = 0;                                  // the one after the last answered

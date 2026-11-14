@@ -28,6 +28,7 @@
 
 #include "xenoforge/renderer.h"
 
+#include "xenoforge/gpu_trace_writer.h"
 #include "xenoforge/memory.h"
 
 #include "fast_clock.h"
@@ -249,6 +250,13 @@ bool replay(const GpuTrace &trace, vk::Device &device, const Options &options, I
     std::unique_ptr<Renderer> renderer = Renderer::create(device, processor, o, error);
     if (!renderer) return false;
     processor.set_sink(renderer.get());
+    // XF_REPLAY_TRACE_WRITER=1: a trace writer standing by in front of the renderer, recording
+    // nothing, as the player keeps one for F4 (its cost on the front end measured as live)
+    std::unique_ptr<gpu::TraceWriter> writer;
+    if (const char *v = std::getenv("XF_REPLAY_TRACE_WRITER"); v && v[0] == '1') {
+        writer = std::make_unique<gpu::TraceWriter>(processor, renderer.get(), renderer.get(), gpu::TraceOptions{});
+        processor.set_sink(writer.get());
+    }
     processor.set_occlusion_queries(options.occlusion_queries);
     processor.set_screen_extents(options.screen_extents);
     Player player(*memory, processor, *renderer, restore_edram);

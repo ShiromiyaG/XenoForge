@@ -67,7 +67,7 @@ void set_u32(uint8_t *p, uint32_t v) { std::memcpy(p, &v, 4); }
 
 TraceWriter::TraceWriter(CommandProcessor &processor, Sink *next, TraceSource *source, TraceOptions options)
     : processor_(processor), next_(next), source_(source), options_(std::move(options)),
-      memory_(processor.memory().translate_physical(0)) {
+      memory_(processor.memory().translate_physical(0)), packets_(options_.frames.count(0) != 0) {
     // (the backend is told of the writer only while a frame is traced: open
     // and packet_end. With a writer standing by for the player's F4 it
     // otherwise reported every read of every frame, and kept none of what it
@@ -287,8 +287,11 @@ void TraceWriter::buffer_start(bool indirect, uint32_t address, uint32_t dwords)
     if (!indirect && !started_) {
         started_ = true;
         if (options_.frames.count(0)) open(0);
+        if (!file_) set_packets(false);
     }
-    {
+    // (file_ is set and cleared on the processor's thread, where these calls come: read there
+    // without the lock, which only the backend's calls from other threads need)
+    if (file_) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_) {
             // Primary and IndirectBufferStartCommand: type, base_ptr, count
@@ -301,7 +304,7 @@ void TraceWriter::buffer_start(bool indirect, uint32_t address, uint32_t dwords)
 }
 
 void TraceWriter::buffer_end(bool indirect) {
-    {
+    if (file_) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_) put_u32(indirect ? INDIRECT_BUFFER_END : PRIMARY_BUFFER_END);
     }
@@ -309,7 +312,7 @@ void TraceWriter::buffer_end(bool indirect) {
 }
 
 void TraceWriter::packet(uint32_t address, std::span<const uint32_t> words) {
-    {
+    if (file_) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_ && !words.empty()) {
             // an indirect buffer's packet as its header and address alone: a
@@ -332,6 +335,7 @@ void TraceWriter::packet_end() {
     if (next_) next_->packet_end();
     bool wanted = false, closed = false;
     uint64_t frame = 0;
+    if (!file_ && !swapped_) return;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_) put_u32(PACKET_END);
@@ -350,14 +354,21 @@ void TraceWriter::packet_end() {
     // the next frame, from here, when asked for; else the backend reports
     // its reads no longer (told without the writer's lock: it takes its own,
     // which it holds when it calls read)
-    if (wanted)
-        open(frame);
-    else if (closed && source_)
-        source_->set_memory_trace(nullptr);
+    if (wanted) open(frame);
+    if (!file_) {
+        if (closed && source_) source_->set_memory_trace(nullptr);
+        set_packets(false);
+    }
+}
+
+void TraceWriter::set_packets(bool on) {
+    if (packets_ == on) return;
+    packets_ = on;
+    processor_.set_packets_wanted(on);
 }
 
 void TraceWriter::memory_read(uint32_t address, uint32_t bytes) {
-    {
+    if (file_) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_ && bytes) {
             // the processor's reads are recorded every time, as Xenia's
@@ -371,7 +382,7 @@ void TraceWriter::memory_read(uint32_t address, uint32_t bytes) {
 }
 
 void TraceWriter::memory_written(uint32_t address, uint32_t bytes) {
-    {
+    if (file_) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_ && bytes) {
             // a player skips these: its processor writes the same
@@ -389,10 +400,7 @@ void TraceWriter::shader(uint32_t type, uint32_t address, std::span<const uint32
 }
 
 bool TraceWriter::shader_again(uint32_t type, uint32_t address, uint32_t dwords) {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (file_) return false;
-    }
+    if (file_) return false;
     return next_ && next_->shader_again(type, address, dwords);
 }
 
@@ -413,6 +421,15 @@ void TraceWriter::swap(const RegisterFile &registers, const Swap &s) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         swapped_ = true;
+        if (!packets_) {
+            // No packet_end comes for the swap's packet while the processor reports none: the
+            // frame is counted here, unless the next one is to be recorded, where the packets
+            // are asked for again and packet_end opens it at the swap packet's end.
+            if (options_.frames.count(swaps_ + 1))
+                set_packets(true);
+            else
+                swaps_++, swapped_ = false;
+        }
     }
     if (next_) next_->swap(registers, s);
 }

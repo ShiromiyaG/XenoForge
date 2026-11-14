@@ -95,7 +95,8 @@ public:
     void buffer_end(bool indirect) override;
     void packet(uint32_t address, std::span<const uint32_t> words) override;
     void packet_end() override;
-    bool wants_packets() override { return true; }
+    // (only while a frame is recorded or about to be: set_packets)
+    bool wants_packets() override { return packets_; }
     void memory_read(uint32_t address, uint32_t bytes) override;
     void memory_written(uint32_t address, uint32_t bytes) override;
     void shader(uint32_t type, uint32_t address, std::span<const uint32_t> code) override;
@@ -166,6 +167,8 @@ private:
     void learn(uint32_t address, uint32_t bytes, const uint8_t *data = nullptr);
     // the parts of the range that differ from what the trace gave, recorded
     void read_locked(uint32_t address, uint32_t bytes);
+    // the processor's packets asked for, or no longer (its thread)
+    void set_packets(bool on);
 
     CommandProcessor &processor_;
     Sink *next_;
@@ -180,6 +183,7 @@ private:
     uint64_t swaps_ = 0;       // swaps executed, the number of the frame after them
     bool started_ = false;     // the first packet seen (frame 0 opens there)
     bool swapped_ = false;     // the packet under way swapped
+    bool packets_ = false;     // the processor reports its packets (a frame recorded or about to be)
     std::unordered_map<uint32_t, std::unique_ptr<Page>> pages_;
 };
 

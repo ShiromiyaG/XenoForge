@@ -41,6 +41,7 @@
 
 #include "xenoforge/command_processor.h"
 
+#include "draw_sections.h"
 #include "thread_cpu.h"
 
 #include <algorithm>
@@ -331,11 +332,15 @@ bool CommandProcessor::type3_opcode(uint32_t opcode, uint32_t count) {
         sync(SyncFor::Interrupt);
         // the CPU may read the screen extents in its interrupt
         poll_extents(true);
+        // (the guest's callbacks run on this thread: their processor time is told apart in
+        // XF_SLOW_FRAMES' line, the front end's own being the rest)
+        const uint64_t before = slow_on_ ? current_thread_cpu_ticks() : 0;
         for (uint32_t n = 0; n < 6; n++)
             if (cpu_mask & (1u << n)) {
                 bump(counts_.interrupts);
                 host_.interrupt(n);
             }
+        if (slow_on_) interrupt_cpu_ += current_thread_cpu_ticks() - before;
         return true;
     }
     case pm4::XE_SWAP: return xe_swap(count);
@@ -1032,19 +1037,48 @@ bool CommandProcessor::xe_swap(uint32_t count) {
                 for (size_t i = 0; i < Sink::Work::BACK_END_WAITS; i++) front_waits += d(bw[i], aw[i]);
                 const double extent_all = d(work.extent_wait_seconds, a.extent_wait_seconds);
                 const double extent_fence = d(work.extent_fence_seconds, a.extent_fence_seconds);
-                std::printf("  threads: front end waited %.1f ms for the back end (fence %.1f, interrupt %.1f, "
+                std::printf("  threads: front end waited %.1f ms for the back end (%llu times, %llu asleep; fence %.1f, "
+                            "interrupt %.1f, "
                             "wait %.1f, gamma %.1f, memory read %.1f, extents %.1f, ring full %.1f); extents' GPU "
                             "wait %.1f ms (fence %.1f, recording %.1f), other GPU waits %.1f ms (%.1f on the back "
-                            "end), recording-thread waits %.1f ms; back end busy %.1f ms (CPU %.1f ms); front end CPU %.1f ms\n",
-                            front_waits, d(bw[0], aw[0]), d(bw[1], aw[1]), d(bw[2], aw[2]), d(bw[3], aw[3]),
+                            "end; CPU in the GPU waits %.1f ms), recording-thread waits %.1f ms; back end busy %.1f ms (CPU %.1f ms); front end CPU %.1f ms "
+                            "(%.1f in the guest's interrupt callbacks)\n",
+                            front_waits, (unsigned long long)(work.back_end_waits - a.back_end_waits),
+                            (unsigned long long)(work.back_end_sleeps - a.back_end_sleeps), d(bw[0], aw[0]), d(bw[1], aw[1]), d(bw[2], aw[2]), d(bw[3], aw[3]),
                             d(bw[4], aw[4]), d(bw[5], aw[5]), d(bw[6], aw[6]), extent_all, extent_fence,
                             extent_all - extent_fence,
                             d(work.gpu_wait_seconds, a.gpu_wait_seconds) - extent_fence,
                             d(work.back_end_gpu_wait_seconds, a.back_end_gpu_wait_seconds),
+                            d(work.gpu_wait_cpu_seconds, a.gpu_wait_cpu_seconds),
                             d(work.record_wait_seconds, a.record_wait_seconds),
                             d(work.back_end_busy_seconds, a.back_end_busy_seconds),
                             d(work.back_end_cpu_seconds, a.back_end_cpu_seconds),
-                            double(cpu - slow_cpu_) / cpu_ticks_a_second() * 1000.0);
+                            double(cpu - slow_cpu_) / cpu_ticks_a_second() * 1000.0,
+                            double(interrupt_cpu_ - slow_interrupt_cpu_) / cpu_ticks_a_second() * 1000.0);
+            }
+            // XF_DRAW_SECTIONS=1 too: the back end's time by the kind of record and its draws' by
+            // section, this frame's (draw_sections.h), to set a live frame beside a replay's
+            if (slow_swaps_ && (ms > limit || all) && DrawSections::on()) {
+                static DrawSections::Totals last;
+                const DrawSections::Totals t = DrawSections::get().totals();
+                auto ms_of = [](uint64_t ticks) { return FastClock::seconds(ticks) * 1000.0; };
+                std::string line = "  back end by record (ms):";
+                char part[64];
+                for (uint32_t i = 0; i < DrawSections::BACK_KINDS; i++) {
+                    std::snprintf(part, sizeof(part), " %s %.2f", DrawSections::back_names[i],
+                                  ms_of(t.back[i] - last.back[i]));
+                    line += part;
+                }
+                std::snprintf(part, sizeof(part), "; %llu draws' sections (ms):",
+                              (unsigned long long)(t.draws - last.draws));
+                line += part;
+                for (uint32_t i = 0; i < DrawSections::COUNT; i++) {
+                    std::snprintf(part, sizeof(part), " %s %.2f", DrawSections::section_names[i],
+                                  ms_of(t.cycles[i] - last.cycles[i]));
+                    line += part;
+                }
+                std::printf("%s\n", line.c_str());
+                last = t;
             }
             // What held the sink's thread up besides its records' plain work (Sink::Work's
             // causes), and the draws drawn while their pipelines were made: a frame whose back
@@ -1076,6 +1110,7 @@ bool CommandProcessor::xe_swap(uint32_t count) {
                             (unsigned long long)(work.skipped_draws - a.skipped_draws), gpu);
             }
             slow_cpu_ = cpu;
+            slow_interrupt_cpu_ = interrupt_cpu_;
             slow_work_ = work;
             slow_at_ = now, slow_waited_ = waited, slow_draws_ = draws, slow_resolves_ = resolves, slow_reports_ = reports;
             slow_swaps_++;

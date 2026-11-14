@@ -2638,6 +2638,100 @@ copy (10%, memory latency on the copy's lines); on the front end the
 register file's writes (27%, the packets' words) and the blocks' gather
 (10%); on the recording thread the driver.
 
+## Live against the replay: the trace writer standing by (2026-11-14)
+
+The owner's live run of game G's saloon after the work above (the player at
+200%, SMAA, host render targets; 357 frames of 4,500-5,800 draws) still
+spent 10.5 ms of the front end's processor time a frame and 16.3 of the
+back end's (medians), 0.80 of a core at 33.3 ms a frame, where the replays
+said about 0.70.
+
+**The front end: the writer the player keeps for F4.** The player puts a
+`gpu::TraceWriter` in front of the renderer to record a frame when F4 asks.
+It answered `wants_packets()` true always, so the processor copied every
+packet's words and called `packet()` and `packet_end()` for each, and the
+writer took its mutex in both (and in `buffer_start`, `memory_read`,
+`memory_written`, `shader_again`) even with no trace open. The replays put
+no writer there, so they never saw it. `XF_REPLAY_TRACE_WRITER=1` now puts
+one in a replay, standing by as the player's: on frame 1485 (139,000
+packets a play) the front end's processor time went from 10.0 to 16.2 ms a
+play with it.
+
+Now the writer asks for the packets only while a frame is recorded or about
+to be (`CommandProcessor::set_packets_wanted`, called from the writer on
+the processor's thread): with none wanted, its `swap()` counts the frame,
+and where the next frame is to be recorded it asks for the packets there,
+so the swap packet's end opens the trace as before. The calls that come on
+the processor's thread look at the open file without the lock (the file is
+opened and closed on that thread; the lock stays for the backend's calls
+from its own threads).
+
+**The frame's line says more** (`XF_SLOW_FRAMES`):
+
+- the front end's waits for the back end counted, and those that slept
+  (`front end waited W ms for the back end (N times, M asleep; ...)`);
+- the processor time inside `vkWaitForFences`, every thread's (`CPU in the
+  GPU waits`): a driver that spins there would show it. On the RTX 5060's
+  driver it is 0.0 ms: the fence waits sleep;
+- the front end's processor time in the guest's interrupt callbacks, which
+  run on the processor's thread (`front end CPU F ms (I in the guest's
+  interrupt callbacks)`), so the processor's own work is the rest;
+- with `XF_DRAW_SECTIONS=1` too, a third line: the back end's time this
+  frame by the kind of record and its draws' by section, to set a live
+  frame beside a replay's (`back end by record (ms): ...`). The sections
+  read the clock at each of a draw's 14 boundaries, so a run with them
+  costs a little more than one without.
+
+A replay prints the same lines (the processor's swap prints them), so a
+kept play at the live settings can be read line for line against the live
+log: `XF_SLOW_FRAMES=34,all XF_REPLAY_TRACE_WRITER=1
+XF_RENDER_TARGET_PATH=host XF_REPLAY_KEPT_PLAY=1 xfreplay <xtr> --scale 200
+--repeat 25`.
+
+**The back end.** A kept play of 1485 at the live settings draws 8,526
+draws (no guest patches the bins: every draw is drawn) for 16.9 ms of the
+back end's processor time; live draws 5,400 for 16.3 ms. A draw costs live
+about half again what it costs in the replay, flat across the frame (the
+log's back end time follows its texture loads, submissions and extent
+reports, not one kind of work). The replay at 200% against 100% and on the
+host path against the interlock one costs the same, and the fences sleep, so
+the difference is not the settings or the waits. The same replays on this
+machine while another session built a game library ran half again slower
+too (the back end 24.8 ms a play against 16.9): the live frame's threads
+share the processor's cores with the game's own (six cores of two
+threads), which is the leading explanation. The live line with
+`XF_DRAW_SECTIONS=1` tells whether one section grows live or all of them.
+Cut meanwhile on the back end:
+
+- **No clock read a call with the work split in two.** Each draw, resolve,
+  swap, VIZ query and extent init read the clock twice for
+  `Report::seconds` (the renderer's busy time): about 4% of the back end's
+  samples in `FastClock::now` and `Timer` under the calls. With the work split, the back
+  end's busy time is `Report::seconds` and the calls are timed only with
+  `Options::cpu_times` (`XF_RENDERER_CPU_TIMES=1`).
+- **A resolve's units at a scale in a kept vector.** `gpu_resolve` put each
+  32x32 tile of the destination into a `std::map` (a node a tile, 2.2% of
+  the back end's samples at 200%); the tiles come in address order, so a
+  kept vector merges them as they come, sorted only where they do not.
+
+Measured (frame 1485, kept plays, 25 a run, the live settings above and a
+writer standing by; each thread's processor time a play, the median of the
+run; base `df8684f` and the change interleaved, six rounds; another
+session's tests ran a texture test at about one core throughout, the
+machine 30-70% busy):
+
+| | front end | back end | recording thread |
+| --- | --- | --- | --- |
+| before | 13.5 / 15.0 / 13.7 / 13.6 / 14.2 / 12.2 (median 13.6) | 16.7 / 20.2 / 18.0 / 17.0 / 18.6 / 15.3 (17.5) | 5.8 |
+| now | 9.6 / 8.0 / 12.0 / 9.0 / 8.5 / 7.8 (median 8.8) | 17.7 / 15.8 / 22.6 / 17.7 / 15.9 / 14.6 (16.8) | 5.8 |
+
+The front end 4.9 ms a play less (-36%); the back end within the noise.
+Live, where a saloon frame runs about 100,000 packets, the writer's share
+of the front end's 10.5 ms is about 4 ms; with it gone the GPU side's two
+threads come to about 0.66 of a core, under Xenia's 0.71. The pictures are
+byte for byte the same (1485 at 200% on the host path, kept plays), and
+`replay_test` matches on both paths.
+
 ## The loads after resolves in game G's town (2026-11-13)
 
 Live, in the first town, the player counted 60-70 texture loads a

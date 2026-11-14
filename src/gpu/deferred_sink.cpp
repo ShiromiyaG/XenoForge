@@ -192,6 +192,7 @@ void DeferredSink::push_draw(Kind kind, const Draw &d) {
 void DeferredSink::wait_done(uint64_t position, uint64_t *counter, size_t why) {
     if (done_.load(std::memory_order_acquire) >= position) return;
     if (counter) ++*counter;
+    stats_.waits++;
     const auto began = std::chrono::steady_clock::now();
     for (uint32_t spins = 0;; spins++) {
         uint64_t done = done_.load(std::memory_order_seq_cst);
@@ -200,6 +201,7 @@ void DeferredSink::wait_done(uint64_t position, uint64_t *counter, size_t why) {
             pause();
             continue;
         }
+        stats_.sleeps++;
         sleep_until(position);
     }
     const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
@@ -444,6 +446,10 @@ void DeferredSink::extent_poll(std::vector<Extent> &resolved) {
     extent_whole_.clear();
 }
 
+double DeferredSink::back_busy_seconds() const {
+    return FastClock::seconds(back_busy_.load(std::memory_order_relaxed));
+}
+
 // The sink's, with the front end's waits for the back end and the back end's own time (on the
 // processor's thread: the front end's figures are its own)
 Sink::Work DeferredSink::work() {
@@ -453,6 +459,7 @@ Sink::Work DeferredSink::work() {
         w = back_.work();
     }
     for (size_t i = 0; i < Work::BACK_END_WAITS; i++) w.back_end_wait_seconds[i] = stats_.wait_by[i];
+    w.back_end_waits = stats_.waits, w.back_end_sleeps = stats_.sleeps;
     w.back_end_busy_seconds = FastClock::seconds(back_busy_.load(std::memory_order_relaxed));
     w.back_end_cpu_seconds = double(back_cpu_.ticks()) / cpu_ticks_a_second();
     return w;
