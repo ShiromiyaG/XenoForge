@@ -1531,7 +1531,7 @@ s, the longest single file from 97 s to 25 s. Both, on game A: its 24
 files from 333 s to 246 s. (Each set compiled one file at a time, old and
 new interleaved, under other agents' builds.)
 
-## A copy-and-patch first tier (2026-11-13, a prototype)
+## A copy-and-patch first tier (2026-11-13; the default since "Full coverage and the tier-up" below)
 
 Asked: whether a game can run at once from code made in milliseconds out of
 the same semantics, between the interpreter and the game library the
@@ -1541,8 +1541,9 @@ optimization level" above). Copy-and-patch (Xu and Kjolstad, OOPSLA 2021;
 CPython 3.13's JIT does it the same way) makes code with no compiler at run
 time: clang compiles a template per instruction once, when XenoForge is
 built, and the run time copies the templates' machine code and writes their
-holes. Behind `XF_TIER=stencil` (boot and the player, in place of the game
-library; off by default).
+holes. First behind `XF_TIER=stencil`; now what the generic boot and player
+run when the cache has no game library for the disc (docs/runtime.md, "The
+first tier").
 
 **The stencils** (`src/stencil/stencils.cpp`). One per instruction of the
 semantics, all 456, each `ops::run<op>(*c, Instr{word})` with the word a
@@ -1607,8 +1608,9 @@ shared pieces and their unwind information, then each function: its entry,
 its body, its out-of-line sequences, its jump tables. Written, then made
 read-only and executable. The result is a module's table (`ppc_module.h`)
 that the kernel is given as a game library's, so whatever the tier leaves out
-(a function with resume sites, one whose returns are checked or that branches
-to a stack switch) is interpreted from dispatch as code no library holds.
+is interpreted from dispatch as code no library holds. (This paragraph is the
+prototype's; "Full coverage and the tier-up" below has what changed since:
+the entry log, the stack switches, resume sites, hooks, DLLs and the front.)
 
 **Checks.** `ppc_stencil_test` (with `XF_PPC_TESTS_DIR`, as
 `ppc_recompiled_test`): every case of the instruction tests made into code
@@ -1663,20 +1665,13 @@ its mask from MB and ME at run time, about 35. Stencils with a slow path adjust 
 fast path too, and the code is three times the library's size, so it misses
 the instruction cache more.
 
-**What full coverage would take.** The semantics are all there (one stencil
-each); what is left is the control flow the emitter has and the tier does not
-yet, a day or two each:
-
-- checked returns (`XF_CHECKED_RETURN`) and resume sites (`resumable()`): an
-  entry that keeps LR and r1 for the body, and a body entered at a resume site
-  through a table, as the jump tables are;
-- the port's hooks (`XF_HOOKED`, mid-function hooks), for ports;
-- the DLLs a game loads (each module made into code as `XexLoadImage` loads
-  it; only the executable now);
-- ARM64 and Linux: the patcher for ARM64's kinds, and the unwind information
-  registered from `.eh_frame` (`__register_frame`); until then
-  `stencil::available()` says no outside Windows on x86-64, as a run
-  could not unwind through the copies.
+**What full coverage took** (done since: "Full coverage and the tier-up"
+below). The semantics were all there; what was left was the control flow the
+emitter has: checked returns and resume sites, branches to a stack switch,
+the port's hooks, and the DLLs. Still left: ARM64 and Linux, the patcher for
+ARM64's kinds and the unwind information registered from `.eh_frame`
+(`__register_frame`); until then `stencil::available()` says no outside
+Windows on x86-64, as a run could not unwind through the copies.
 
 Faster code is the larger question. What would pay, in order: stencils that
 know more of their word (variants for the D forms with `rA` not 0, and with
@@ -1691,18 +1686,15 @@ across instructions, which is most of the library's lead; the paper's and
 Deegen's answer, a stencil per register allocation, multiplies the stencils
 by the cases.
 
-**Tier-up to the library.** The guest's state lives in the context between
-any two functions, in the tier and in the library alike, so changing tiers at
-a function's entry is always correct. The tier would count each function's
-entries (a counter in its entry, as the instruction counter is) and the
-launcher would build the hot functions' files first (the recompile step
-already compiles a module as files of 64 KB of the image), into a library
-holding only them (dispatch covers the rest). As each is loaded, at a safe
-point (the deterministic scheduler between slices; otherwise `Kernel::pause`),
-the kernel's table takes the library's functions and each one's body in the
-tier gets a jump to an adapter that calls the library's function (C++
-convention) and returns, so the direct calls already linked go there too.
-The tier's memory is freed once the library holds the whole module.
+**Tier-up to the library** (the proposal; what was built is in "Tier-up"
+below). The guest's state lives in the context between any two functions, in
+the tier and in the library alike, so changing tiers at a function's entry is
+always correct. The tier would count each function's entries and the
+launcher would build the hot functions' files first, into a library holding
+only them; as each is loaded, at a safe point, the kernel's table takes the
+library's functions and each one's entry in the tier gets a jump to an
+adapter that calls the library's function, so the direct calls already
+linked go there too.
 
 **Go or no-go.** Go as the first tier: ready in under two seconds, five
 times the interpreter's speed, bit for bit the same run, from the same
@@ -1712,3 +1704,96 @@ a replacement for the library: closing the factor of three needs registers
 kept across instructions, which is a compiler. Full coverage of what the
 emitter does is about a week (the list above); the specializations, another
 week for perhaps a third of the gap.
+
+### Full coverage and the tier-up (2026-11-13)
+
+The tier now does all the control flow `recomp_emit.cpp` does, line for line,
+and is what the generic boot and player run when the cache has no library for
+the disc (docs/runtime.md, "The first tier").
+
+**Every stencil returns how the body ends** (a 32-bit value in the return
+register, which the callers of an ordinary body ignore): `EXIT_RETURN` from a
+return, a tail dispatch, a jump table's default; `EXIT_PLAIN` after an invalid
+instruction (the emitter's plain `return` after `invalid()`, never checked);
+or a stack switch's thunk address. That is what lets a frame that holds the
+entry's LR and r1 (the emitter's `xf_lr`, `xf_sp`) do what the emitter does
+at each exit, without the stencils between carrying them.
+
+- **Checked returns** (`switches_stack`): `xf_st_checked` reads LR and r1,
+  calls the body, and does `XF_CHECKED_RETURN` on what it returns: a return
+  with LR and r1 changed is thrown (`unwind`); a thunk is first
+  `switch_stack(c, thunk, xf_lr)`. Inside such a function, as in the
+  emitter, a tail branch to another function is a call and a return (a jump
+  table's case too, through an out-of-line sequence).
+- **Stack switches**: a call to `KeSetCurrentStackPointers`' thunk is
+  `xf_st_switch_call` (`switch_stack(c, thunk, next)`); a branch to it is
+  `xf_st_switch_tail` (`switch_stack(c, thunk, LR & ~3)`, then the return), or
+  in a checked function `xf_st_switch_tail_checked`, which returns the thunk
+  to the checking frame. Conditional branches and jump tables reach them out
+  of line.
+- **Resume sites**: the walk takes the sites in (as the emitter's does), the
+  function's entry is `xf_st_resumable`, which calls the runtime's
+  `resumable()` with a C++-convention body runner copied after the function
+  (`xf_st_resume_body`, or `_checked`, which checks with the `lr` and `sp`
+  `resumable()` passes, as `XF_RESUMABLE_BODY` does): from 0 it calls the
+  body, from a site it looks the site up in the function's data (the sites,
+  then their copies' addresses) and calls there. The module's table carries
+  the sites (`GeneratedModule::resumes`), so dispatch knows them.
+- **The port's hooks** (`stencil::Project`, from a project file as
+  `recomp_module.cpp`'s `plan` and `apply_project` make it, with the
+  project's starts, tables and skips; boot's `--project`): a hooked
+  function's entry is `xf_st_hooked` (the slot's hooks when it holds any,
+  else on into the body), with a second C++ entry past it as the slot's
+  `original`; a mid-function hook is `xf_st_mid` before its instruction (the
+  slot, then the labels it may jump to and their copies' addresses: 0 goes
+  on, 1 returns, a label jumps, anything else is dispatched). The slots live
+  on the heap and the module's table lists them (`GeneratedModule::hooks`),
+  so `hooks::bind` fills them as it does a library's.
+- **DLLs**: `Kernel::set_code_provider` gives the kernel a function it calls
+  for an image no table matches as it loads (`add_module_code`, the code's
+  lock left meanwhile); the player's makes the DLL's code then (a fraction of
+  a second) and keeps it for the kernel's life. The project file applies to
+  the executable only.
+- **Discovery** takes the entry log's addresses in, as the library's build
+  does (`DiscoverOptions::entries`), and the interpreter's entries go to the
+  same log.
+
+**The front.** Each function's code starts with eight bytes of no-ops (a
+5-byte and a 3-byte `nop`, 8-byte aligned) before what runs (the body, or the
+hook's check, the checking frame or the resumable entry); every call and tail
+branch from another function, and the table's C++ entry, go there; a branch
+inside the function to its own start goes past it.
+
+**Tier-up.** When the library is in the cache (poll_tier_up, every 2 s on
+the first tier), it is loaded and every guest thread parked
+(`Kernel::pause`, which counts a thread in a kernel call as parked and keeps
+it there until resume). Then `Kernel::adopt_generated_modules` makes the
+library's tables what the loaded images run (the code map is published
+anew, the hook slots unbound from the tier's tables and bound to the
+library's), and `stencil::Module::adopt` gives each function the library has
+an adapter (`xf_st_adopted`: a call to the library's function through a
+pointer beside it, on pages past the sealed code, its unwind information
+registered) and writes a `jmp rel32` to it over the first five bytes of the
+function's front, the eight bytes stored at once while the code is made
+writable without ceasing to be executable. So new calls, from dispatch and
+from the tier's own code, run the library's; frames already in the tier
+finish there (a return address is never inside a front, which holds no
+call). The tier's memory stays mapped for the process's life. The entry
+counts that would order the build (hot files first) are not done: the
+whole library is built and taken at once.
+
+**Checks.** `ppc_stencil_test` runs, besides the 141,705 instruction cases,
+a program for each construct: checked returns (a return with r1 moved is
+thrown to LR), the three stack switches (the resume address the checked and
+the unchecked branch give, and a call's), a resume site an Unwind comes back
+to, a hooked function's slot and a mid-function hook's four answers, and a
+call that goes to a library's function once adopted. Game B, deterministic
+(`--deterministic --spin-idle`, `XF_DETERMINISTIC_FORCE_MS=10000`): the
+same guest-memory hash from the interpreter (`--interpret --steps 10^15`),
+the tier (`XF_TIER=stencil`) and the library at swaps 100, 1,500 and 3,000;
+the tier now gives code to all 21,720 functions (the 2 with checked returns
+and the 43 with resume sites too) and no address is interpreted; the
+scheduler's thread took 19.2 s to swap 3,000 on the tier, 6.5 s on the
+library and 112.4 s interpreted (one run each, the machine otherwise idle).
+A live run moved to the library 15 s in: 21,720 entries patched, the guest
+threads parked 18.9 ms.

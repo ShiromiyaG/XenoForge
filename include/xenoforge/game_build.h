@@ -181,6 +181,10 @@ struct BuildOptions {
     // compilers at once; 0: chosen from the memory free and the cores
     // (JobPolicy below), a new one started only while enough stays free
     unsigned jobs = 0;
+    // built while the game plays on the first tier (the launcher's background
+    // build): half the compilers the policy (or `jobs`) allows, at least one,
+    // started at the lowest priority, so the game keeps its processor
+    bool background = false;
     std::filesystem::path toolchain; // where clang and lld are; empty: find_toolchain's search
     bool keep_work = false;          // keep the emitted code and objects (they are hundreds of MB)
     // keep the objects (<cache>/work/<digest>/obj, about 0.7 MB a file of

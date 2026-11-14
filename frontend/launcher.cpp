@@ -214,7 +214,7 @@ int main(int argc, char **argv) {
         const frontend::LauncherCore::Listing l = core.listing();
         for (const auto &p : l.players)
             std::printf("player %s: %zu modules%s\n", utf8(p.path.filename()).c_str(), p.modules.size(),
-                        p.generic ? " (generic, interprets)" : "");
+                        p.generic ? " (generic: a cached library, else the first tier)" : "");
         std::printf("games in %s: %zu\n", core.games_folder().c_str(), l.games.size());
         for (const frontend::GameEntry &g : l.games) {
             if (!g.error.empty()) {

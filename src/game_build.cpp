@@ -457,7 +457,7 @@ uint64_t memory_of(const Process &p) {
 }
 
 bool start(const fs::path &program, const std::vector<std::string> &args, const fs::path &log, Process &p,
-           std::string &error) {
+           std::string &error, bool lowest = false) {
 #ifdef _WIN32
     std::string line = quote(utf8(program));
     for (const std::string &a : args) line += " " + quote(a);
@@ -484,7 +484,7 @@ bool start(const fs::path &program, const std::vector<std::string> &args, const 
     si.lpAttributeList = list;
     PROCESS_INFORMATION pi{};
     ok = ok && CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE,
-                              CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS | EXTENDED_STARTUPINFO_PRESENT, nullptr,
+                              CREATE_NO_WINDOW | (lowest ? IDLE_PRIORITY_CLASS : BELOW_NORMAL_PRIORITY_CLASS) | EXTENDED_STARTUPINFO_PRESENT, nullptr,
                               nullptr, &si.StartupInfo, &pi);
     DWORD why = GetLastError();
     if (size) DeleteProcThreadAttributeList(list);
@@ -508,6 +508,7 @@ bool start(const fs::path &program, const std::vector<std::string> &args, const 
     int r = posix_spawn(&p.pid, program_path.c_str(), &actions, nullptr, argv.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
     if (r != 0) return error = "cannot run " + program_path + ": " + std::strerror(r), false;
+    if (lowest) setpriority(PRIO_PROCESS, id_t(p.pid), 19); // the lowest: a game plays meanwhile
     return true;
 #endif
 }
@@ -912,6 +913,11 @@ bool Build::compile_and_link(const fs::path &src_root, const std::vector<std::st
     if (!options_.fail_compile.empty()) force_failures(jobs);
     const fs::path clang = *bin / (std::string("clang") + EXE);
     policy_ = job_policy(options_.jobs);
+    if (options_.background) {
+        // a game plays meanwhile on the first tier: half the compilers, at the lowest priority
+        policy_.limit = std::max(1u, policy_.limit / 2);
+        policy_.why += "; halved to " + std::to_string(policy_.limit) + " while a game plays (at the lowest priority)";
+    }
     std::vector<size_t> all(jobs.size()), failed;
     std::iota(all.begin(), all.end(), size_t(0));
     if (!compile(clang, work, jobs, all, failed, error)) return false;
@@ -1171,7 +1177,7 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
         std::string ignored;
         fs::path log = file;
         log.replace_extension(".pch.log");
-        if (start(clang, args, log, one[0], ignored)) {
+        if (start(clang, args, log, one[0], ignored, options_.background)) {
             int code = 1;
             while (!one.empty() && !cancelled())
                 if (wait_any(one, 100, code) == 0) one.clear();
@@ -1206,7 +1212,7 @@ bool Build::compile(const fs::path &clang, const fs::path &work, std::vector<Job
             Process p;
             p.job = todo[next++];
             p.expected = job_memory(j.size);
-            if (!start(clang, args, j.log, p, failure)) break;
+            if (!start(clang, args, j.log, p, failure, options_.background)) break;
             running.push_back(p);
         }
         if (running.empty()) continue;
@@ -1424,7 +1430,7 @@ bool Build::link(const fs::path &bin, const fs::path &work, const std::vector<Jo
     const fs::path log = work / "link.log";
     std::vector<Process> running(1);
     std::string why;
-    if (!start(lld, args, log, running[0], why)) return fail(error, why);
+    if (!start(lld, args, log, running[0], why, options_.background)) return fail(error, why);
     int code = 0;
     ProcessStats stats;
     while (wait_any(running, 100, code, &stats) < 0) {

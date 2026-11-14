@@ -229,6 +229,10 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     // preparing a game
     PrepareJob job_;
     bool prepare_hidden_ = false; // running behind the status bar
+    // the build started for a game that plays on the first tier meanwhile
+    // (Settings::Launcher::background_build): no dialog, a line in the status bar
+    bool prepare_background_ = false;
+    bool first_tier_ = false; // the generic player runs the first tier on this host (stencil::available)
     bool prepare_listed_ = false;
     bool log_open_ = false;
     long prepare_game_ = -1;

@@ -581,6 +581,10 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
                              "<div class=\"folder-row\"><input type=\"text\" id=\"folder-input\" class=\"text f\" value=\"" + e(page.folder) +
                              "\" placeholder=\"No folder chosen\"/>" + button_html("browse", "Browse...", false, {}, "folder-open") +
                              button_html("rescan", "Rescan", false, {}, "refresh-cw") + "</div>";
+        folder += check_row("ui.background_build", "Build game libraries while playing",
+                            "A game with no library yet starts at once on the first tier; its library is built meanwhile, at a low priority with "
+                            "half the compilers a Prepare runs, and the game moves to it when it is done.",
+                            page.background_build);
         s += group("Library", folder);
         s += group("Integrations",
                    check_row("discord.enabled", "Discord Rich Presence",

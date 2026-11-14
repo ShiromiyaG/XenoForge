@@ -34,8 +34,9 @@ class PrepareJob {
     // (0: the build's default).
     // `force` builds although the cache has the library (a rebuild).
     // `patches`: the game patches (patches.h) the library is built with; the default builds without any.
+    // `background`: while the game plays (BuildOptions::background: half the compilers, the lowest priority).
     static Runner build_runner(std::filesystem::path disc, std::filesystem::path cache_dir, unsigned jobs = 0,
-                               bool force = false, patches::Config patches = {.off = true});
+                               bool force = false, patches::Config patches = {.off = true}, bool background = false);
     // A build that is not one, for --demo-progress: a few minutes of stages
     // at `speed` times real time, ending in a failure when `fail`.
     static Runner demo_runner(double speed, bool fail);

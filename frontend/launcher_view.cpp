@@ -5,6 +5,7 @@
 
 #include "stale_library.h"
 #include "xenoforge/game_build.h"
+#include "xenoforge/stencil.h"
 
 #include <algorithm>
 #include <cctype>
@@ -36,6 +37,7 @@ std::string digest_text(uint64_t digest) {
 LauncherView::LauncherView(LauncherCore &core, ui::Renderer &renderer, SDL_Window *window, ViewOptions options)
     : core_(core), renderer_(renderer), window_(window), opt_(std::move(options)) {
     select_pending_ = opt_.select;
+    first_tier_ = stencil::available();
     start_pending_ = opt_.start_index;
     demo_pending_ = opt_.demo_progress;
     capture_pending_ = opt_.capture;
@@ -218,7 +220,8 @@ bool LauncherView::stale_of(const GameEntry &game) const {
 GameStatus LauncherView::status_of(const GameEntry &game) const {
     const bool cached = cached_of(game);
     const PlayerBinary *player = player_for(listing_.players, game, cached);
-    return game_status(cached, player && !player->generic, failed_.count(game.title_id) > 0, stale_of(game));
+    return game_status(cached, player && !player->generic, failed_.count(game.title_id) > 0, stale_of(game),
+                       first_tier_ && player && player->generic);
 }
 
 std::string LauncherView::icon_name(const GameEntry &game) {
@@ -483,7 +486,7 @@ void LauncherView::update_toolbar() {
         }
     }
     if (Rml::Element *prepare = by_id("tb-prepare")) {
-        const char *label = !g || status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild (new code)" : "Rebuild";
+        const char *label = !g || status == GameStatus::NeedsPreparing || status == GameStatus::FirstTier ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild (new code)" : "Rebuild";
         if (Rml::Element *text = by_id("tb-prepare-label"))
             if (text->GetInnerRML() != label) text->SetInnerRML(label);
         prepare->SetClass("off", !g || running || job_.active());
@@ -522,7 +525,8 @@ void LauncherView::update_status() {
         std::snprintf(percent, sizeof(percent), "%d%%", int(s.fraction * 100 + 0.5));
         char width[24];
         std::snprintf(width, sizeof(width), "%.1f%%", std::clamp(s.fraction, 0.0, 1.0) * 100);
-        bar = "<div>Preparing " + html_escape(prepare_title_) + "</div><div class=\"minibar\"><div class=\"minibar-fill\" style=\"width: " +
+        bar = std::string("<div>") + (prepare_background_ ? "Building the library of " : "Preparing ") + html_escape(prepare_title_) +
+              (prepare_background_ ? " (it plays on the first tier meanwhile)" : "") + "</div><div class=\"minibar\"><div class=\"minibar-fill\" style=\"width: " +
               std::string(width) + ";\"></div></div><div style=\"margin-left: 6dp;\">" + percent + "</div>";
     }
     const std::string sig = count + "|" + folder + "|" + message + message_class + "|" + bar;

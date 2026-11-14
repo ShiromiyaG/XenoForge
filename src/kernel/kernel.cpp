@@ -106,6 +106,7 @@ struct Kernel::Code {
     std::map<const ppc::GeneratedModule *, CodeMap::Range> ranges;
     std::vector<std::unique_ptr<CodeMap::Fn[]>> tables;
     std::map<uint32_t, const ppc::GeneratedModule *> loaded; // by base
+    CodeProvider provider; // makes the tables of images none matches (set_code_provider)
     // every map published: a thread may still read one replaced
     std::vector<std::unique_ptr<CodeMap>> maps;
 };
@@ -551,9 +552,14 @@ std::pair<uintptr_t, uintptr_t> Kernel::generated_code_span() {
     return low < high ? std::pair{low, high} : std::pair<uintptr_t, uintptr_t>{0, 0};
 }
 
-std::string Kernel::add_module_code(const Xex &xex) {
+void Kernel::set_code_provider(CodeProvider provider) {
     std::lock_guard lock(code_->mutex);
-    if (code_->available.empty()) return {};
+    code_->provider = std::move(provider);
+}
+
+std::string Kernel::add_module_code(const Xex &xex) {
+    std::unique_lock lock(code_->mutex);
+    if (code_->available.empty() && !code_->provider) return {};
     // the base and size first: the digest is computed only for a candidate
     uint32_t base = xex.base_address, size = uint32_t(xex.image.size());
     const ppc::GeneratedModule *match = nullptr, *other = nullptr;
@@ -568,10 +574,24 @@ std::string Kernel::add_module_code(const Xex &xex) {
         }
         other = m;
     }
-    if (!match)
-        return other ? std::string("interpreted: its image is not the one ") + other->name +
-                           "'s generated code was made from"
-                     : "interpreted: no generated code for it";
+    std::string made_why;
+    if (!match && code_->provider) {
+        // code made for it now (the copy-and-patch tier), the lock left meanwhile
+        CodeProvider provider = code_->provider;
+        lock.unlock();
+        const ppc::GeneratedModule *made = provider(xex, made_why);
+        lock.lock();
+        if (made) {
+            match = made;
+            code_->available.push_back(made);
+        }
+    }
+    if (!match) {
+        if (other)
+            return std::string("interpreted: its image is not the one ") + other->name +
+                   "'s generated code was made from";
+        return made_why.empty() ? "interpreted: no generated code for it" : "interpreted: " + made_why;
+    }
     auto [it, made] = code_->ranges.try_emplace(match);
     CodeMap::Range &r = it->second;
     if (made && match->count) {
@@ -589,6 +609,42 @@ std::string Kernel::add_module_code(const Xex &xex) {
     // its hook slots bound to the port's hooks, its names taken in
     hooks::bind(*match);
     return "generated code, " + std::to_string(match->count) + " functions";
+}
+
+std::vector<std::pair<const ppc::GeneratedModule *, const ppc::GeneratedModule *>>
+Kernel::adopt_generated_modules(const ppc::GeneratedModule *const *modules, size_t count) {
+    std::vector<std::pair<const ppc::GeneratedModule *, const ppc::GeneratedModule *>> moved;
+    std::lock_guard lock(code_->mutex);
+    std::vector<const ppc::GeneratedModule *> keep; // the loaded ones the library lacks keep their code
+    for (auto &[base, current] : code_->loaded) {
+        const ppc::GeneratedModule *to = nullptr;
+        for (size_t i = 0; i < count && !to; i++)
+            if (modules[i] != current && modules[i]->base == current->base && modules[i]->size == current->size &&
+                modules[i]->digest == current->digest)
+                to = modules[i];
+        if (!to) {
+            keep.push_back(current);
+            continue;
+        }
+        auto [it, made] = code_->ranges.try_emplace(to);
+        if (made && to->count) {
+            uint32_t begin = UINT32_MAX, end = 0;
+            for (size_t i = 0; i < to->count; i++)
+                begin = std::min(begin, to->functions[i].address), end = std::max(end, to->functions[i].address + 4);
+            auto table = std::make_unique<CodeMap::Fn[]>((end - begin) / 4);
+            for (size_t i = 0; i < to->count; i++) table[(to->functions[i].address - begin) / 4] = to->functions[i].fn;
+            it->second = {begin, end - begin, table.get(), to};
+            code_->tables.push_back(std::move(table));
+        }
+        hooks::unbind(*current);
+        moved.push_back({current, to});
+        current = to;
+        hooks::bind(*to);
+    }
+    code_->available.assign(modules, modules + count);
+    code_->available.insert(code_->available.end(), keep.begin(), keep.end());
+    publish_code();
+    return moved;
 }
 
 void Kernel::remove_module_code(uint32_t base) {

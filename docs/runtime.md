@@ -857,8 +857,10 @@ and the expected values (game data: never in the repository):
   stop the guest's thread past the watchdog's 100 ms: game B to swap 6,000
   beside a `-j 4` build had 9 forced hand-overs and another hash), or, not
   interpreted, ran no generated code
-  (boot quietly interprets when the cache has no library for the disc at
-  this interface version and CPU level: rebuild the cache with `xfbuild
+  (with `XF_TIER=library`, which the check sets unless the environment
+  names a tier, boot quietly interprets when the cache has no library for
+  the disc at this interface version and CPU level, where it would otherwise
+  run the first tier and give the same hash: rebuild the cache with `xfbuild
   <iso> <cache>`, which the check does not do, as it takes minutes a disc).
 - A run with `interpret = true` runs again with `--interpret`; hash, runs,
   clock and counts must be equal. That is the shorter agreement check of the
@@ -2779,9 +2781,11 @@ Pieces, each apart from the others:
   digest of every module whose generated code it carries. A game whose
   disc has a library in the cache (`find_cached` on its digest, in the
   default cache) starts in the generic `player`, which loads it; without
-  one, in the `player_<game>` that carries its `default.xex`, else Play
-  prepares it first (the recompile step) and, if that fails, the generic
-  player interprets (the list says which: "Runs in"). `player_for` in
+  one, in the `player_<game>` that carries its `default.xex`, else in the
+  generic player on the first tier at once while its library is built in
+  the background ("The first tier"; where the tier is not available, Play
+  prepares it first and, if that fails, the generic player interprets: the
+  list says which, "Runs in"). `player_for` in
   `library.h` is that choice.
 - **Settings and controls**: the selected game's settings, edited in the
   player's own config.toml and saved as they change: the video (fullscreen,
@@ -3202,6 +3206,69 @@ build's load since. The cache belongs on the system drive, as its default
 
 Left: title updates (D3). The Linux side (`.so`, `posix_spawn`, `ld.lld`)
 was first built and run on 2026-11-12 ("Other hosts").
+
+### The first tier (2026-11-13)
+
+A disc with no library in the cache (or only one for another interface or
+another set of code patches, which `find_cached` does not find) no longer
+waits for Prepare nor runs interpreted: the generic `boot` and player make
+its code at once with the copy-and-patch tier (`stencil.h`;
+docs/recompiler.md, "A copy-and-patch first tier"), about 1.5 s for a
+21,720-function executable and 3.3 s for one of 56,302, and run it; each DLL
+the game loads is made the same way as `XexLoadImage` loads it
+(`Kernel::set_code_provider`). The tier runs the guest at about a third of
+the library's speed and five to seven times the interpreter's.
+
+What runs, in order (`game::open`):
+
+- code linked in (a port, `boot_<game>`): that;
+- `--interpret` or `XF_TIER=interpret`: the interpreter;
+- `XF_TIER=stencil`: the tier, even with a library cached, and no tier-up
+  (for tests and measurements);
+- `XF_TIER=library`: the library, else the interpreter (the behavior before);
+- otherwise the library, else (none cached, and no `--game-library` named)
+  the tier, else (the tier not available here: another CPU, another host,
+  `stencil::available()`) the interpreter.
+
+The log's `cpu:` line says which ("the game library", "the first tier
+(copy-and-patch)", "the interpreter", "linked generated code"), and so does
+the first line of the F1 overlay's Debug page. `boot --project <file>` gives
+the tier a port's project file (its hook slots, mid-function hooks, starts,
+tables and skips in the executable).
+
+**Tier-up.** On the first tier, `game::poll_tier_up` (boot's and the
+player's loops) looks in the cache every two seconds; once the library is
+there it loads it, parks every guest thread (`Kernel::pause`), moves the
+loaded images to the library's tables (`Kernel::adopt_generated_modules`)
+and makes each function's entry in the tier's code jump to the library's
+function (`stencil::Module::adopt`), then lets the threads go: from the next
+call on the library runs, and frames already in the tier finish there. On
+game B the threads stood still 19 ms; the log says `tier-up: ...`. A library
+that does not load leaves the run on the tier.
+
+**The launcher.** A game with no library shows "Ready (first tier)" (a
+green dot) where the generic player can run the tier, and Play starts it at
+once; Prepare is still offered (and still builds with the whole machine).
+When a game starts on the first tier, the launcher builds its library in the
+background (Settings, Interface, Library: "Build game libraries while
+playing", `[launcher] background_build`, on by default): `prepare_game` with
+`BuildOptions::background`, which halves the jobs policy's compilers (at
+least one) and starts clang and lld at the lowest priority
+(`IDLE_PRIORITY_CLASS`, `nice 19`). The status bar shows "Building the
+library of <title> (it plays on the first tier meanwhile)" with its
+progress, and when it is done the running player moves to the library by
+itself. A build that fails marks the game as before; it keeps playing on
+the tier.
+
+Numbers (one machine, otherwise idle; `--rates`, three rounds interleaved):
+game B's first swaps come in the second ending at 1.0 s on the library, 3.0 s
+on the tier (all three rounds) and 15 s interpreted; by 12 s the tier had
+shown 459-460 swaps against the library's 532-534 and the interpreter's 0.
+Game E (logos, no presses, 45 s, two rounds each): the library holds 30
+swaps a second throughout (1,326 and 1,333 swaps); on the tier the logo
+movies (Bink, on a thread of its own) play at 6 to 10 swaps a second, then
+the game reaches 30 a second past them (530 and 896 swaps), with no address
+interpreted.
 
 ## Discord Rich Presence (2026-11-13)
 

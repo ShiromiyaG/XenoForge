@@ -100,6 +100,222 @@ bool unwind_check(uint8_t *base) {
     }
     return after == 1 && c.lr == start + 0x18;
 }
+
+// The control flow the emitter has beside the instructions, in the tier's
+// code: checked returns, stack switches, resume sites, the port's hooks, and
+// the tier-up's jump to a library's function. Each program is a few words at
+// 0x80000000 with its functions given; the runtime's calls are the test's.
+namespace control {
+constexpr uint32_t BASE = 0x80000000, THUNK = 0x80003000, THROW_TO = 0x80002000;
+uint32_t switch_thunk = 0, switch_resume = 0, hooked_calls = 0, mid_answer = 0;
+uint32_t throw_target = 0, throw_sp = 0;
+void dispatch(Context &c, uint32_t target) {
+    if (target == THROW_TO) {
+        // an Unwind to a resume site, with r1 inside the frame that takes it
+        c.r[1] = throw_sp;
+        throw Unwind{throw_target};
+    }
+    xf::ppc::dispatch(c, target);
+}
+void switch_stack(Context &c, uint32_t thunk, uint32_t resume) {
+    // as if the stack came back where it was left: LR is the resume address
+    switch_thunk = thunk, switch_resume = resume;
+    c.lr = resume;
+}
+[[noreturn]] void unwind(Context &c) { throw Unwind{uint32_t(c.lr) & ~3u}; }
+void hooked(Context &c, HookSlot &slot) {
+    hooked_calls++;
+    slot.original(c);
+}
+uint32_t mid_hook(Context &, HookSlot &) { return mid_answer; }
+
+struct Program {
+    xf::recomp::Image image;
+    xf::recomp::Discovery d;
+    std::unique_ptr<xf::stencil::Module> module;
+    std::string error;
+    Program(std::initializer_list<uint32_t> words) {
+        image.base = image.entry = BASE;
+        for (uint32_t w : words)
+            for (int k = 3; k >= 0; k--) image.bytes.push_back(uint8_t(w >> (8 * k)));
+        image.sections.push_back({".text", BASE, uint32_t(image.bytes.size()), true, false});
+    }
+    xf::recomp::Function &function(uint32_t address, uint32_t size) {
+        xf::recomp::Function &f = d.functions[address];
+        f.address = address, f.size = size, f.source = xf::recomp::Source::Pdata;
+        return f;
+    }
+    bool compile(const xf::stencil::Project *project = nullptr) {
+        Runtime runtime = core_runtime();
+        runtime.dispatch = &dispatch;
+        runtime.invalid = &xf::ppc::invalid;
+        runtime.switch_stack = &switch_stack;
+        runtime.unwind = &unwind;
+        runtime.hooked = &hooked;
+        runtime.mid_hook = &mid_hook;
+        xf::stencil::Stats stats;
+        xf::stencil::Options options;
+        options.project = project;
+        module = xf::stencil::compile(image, d, runtime, "control", 0, options, stats, error);
+        return module != nullptr;
+    }
+    void (*fn(uint32_t address) const)(Context &) {
+        const GeneratedModule &m = *module->table();
+        for (size_t k = 0; k < m.count; k++)
+            if (m.functions[k].address == address) return m.functions[k].fn;
+        return nullptr;
+    }
+};
+
+int run_checks(uint8_t *base) {
+    int failed = 0;
+    auto check = [&](bool ok, const char *what) {
+        std::printf("copy-and-patch: %s: %s\n", what, ok ? "ok" : "FAILED");
+        failed += !ok;
+    };
+    static Context c;
+    auto fresh = [&] {
+        std::memset(&c, 0, sizeof(c));
+        c.base = base;
+        c.lr = 0x12345678, c.r[1] = 0x70000000;
+    };
+    {
+        // a function that switches the stack: a return with LR and r1 as at its
+        // entry goes back to its caller; one with r1 moved is thrown to LR
+        Program p({0x38630001,   // 80000000 addi r3, r3, 1
+                   0x4E800020,   // 80000004 blr
+                   0x38210010,   // 80000008 addi r1, r1, 16
+                   0x4E800020}); // 8000000C blr
+        p.function(BASE, 8).switches_stack = true;
+        p.function(BASE + 8, 8).switches_stack = true;
+        bool ok = p.compile() && p.fn(BASE) && p.fn(BASE + 8);
+        if (ok) {
+            fresh();
+            p.fn(BASE)(c);
+            ok = c.r[3] == 1;
+            fresh();
+            uint32_t to = 0;
+            try {
+                p.fn(BASE + 8)(c);
+            } catch (const Unwind &u) {
+                to = u.target;
+            }
+            ok = ok && to == 0x12345678;
+        }
+        check(ok, "checked returns");
+    }
+    {
+        // a branch to the stack switch's thunk goes on, when switched back to,
+        // where the entry's LR says when the returns are checked, where LR
+        // says when not; a call to it, after the call
+        Program p({0x3C001111,   // 80000000 lis r0, 0x1111
+                   0x7C0803A6,   // 80000004 mtlr r0
+                   0x48002FF8,   // 80000008 b 80003000 (the thunk)
+                   0x60000000,   // 8000000C
+                   0x3C001111,   // 80000010 lis r0, 0x1111
+                   0x7C0803A6,   // 80000014 mtlr r0
+                   0x48002FE8,   // 80000018 b 80003000
+                   0x60000000,   // 8000001C
+                   0x48002FE1,   // 80000020 bl 80003000
+                   0x38630001,   // 80000024 addi r3, r3, 1
+                   0x4E800020}); // 80000028 blr
+        p.function(BASE, 12).switches_stack = true;
+        p.function(BASE + 0x10, 12);
+        p.function(BASE + 0x20, 12);
+        p.d.stack_thunks.insert(THUNK);
+        bool ok = p.compile();
+        if (ok) {
+            fresh();
+            p.fn(BASE)(c);
+            ok = switch_thunk == THUNK && switch_resume == 0x12345678;
+            fresh();
+            p.fn(BASE + 0x10)(c);
+            ok = ok && switch_resume == 0x11110000;
+            fresh();
+            p.fn(BASE + 0x20)(c);
+            ok = ok && switch_resume == BASE + 0x24 && c.r[3] == 1;
+        }
+        check(ok, "stack switches");
+    }
+    {
+        // an Unwind to a resume site, with r1 inside the frame, goes on there
+        Program p({0x38630001,   // 80000000 addi r3, r3, 1
+                   0x48001FFD,   // 80000004 bl 80002000 (throws to 80000008)
+                   0x38630064,   // 80000008 addi r3, r3, 100
+                   0x4E800020}); // 8000000C blr
+        p.function(BASE, 16).resumes = {BASE + 8};
+        bool ok = p.compile() && p.module->table()->resume_count == 1 && p.module->table()->resumes[0] == BASE + 8;
+        if (ok) {
+            fresh();
+            throw_target = BASE + 8, throw_sp = 0x70000000 - 0x20;
+            try {
+                p.fn(BASE)(c);
+            } catch (const Unwind &) {
+                ok = false;
+            }
+            ok = ok && c.r[3] == 101;
+        }
+        check(ok, "resume sites");
+    }
+    {
+        // a hooked function's slot, and a mid-function hook's answers
+        Program p({0x38630001,   // 80000000 addi r3, r3, 1
+                   0x3863000A,   // 80000004 addi r3, r3, 10 (the mid hook, may go on at 80000008)
+                   0x38630064,   // 80000008 addi r3, r3, 100
+                   0x4E800020}); // 8000000C blr
+        p.function(BASE, 16);
+        xf::stencil::Project project;
+        project.hooks[BASE].slot = true;
+        project.hooks[BASE].mid[BASE + 4] = {BASE + 8};
+        bool ok = p.compile(&project) && p.module->table()->hook_count == 2;
+        HookSlot *function = nullptr, *mid = nullptr;
+        for (size_t k = 0; ok && k < p.module->table()->hook_count; k++)
+            (p.module->table()->hooks[k]->original ? function : mid) = p.module->table()->hooks[k];
+        ok = ok && function && mid && function->address == BASE && mid->address == BASE + 4;
+        static int anything;
+        auto run = [&](uint32_t answer) {
+            fresh();
+            mid_answer = answer;
+            p.fn(BASE)(c);
+            return uint32_t(c.r[3]);
+        };
+        if (ok) {
+            ok = run(0) == 111 && hooked_calls == 0; // nothing hooked: past both
+            mid->hooks = &anything;
+            ok = ok && run(0) == 111 && run(BASE + 8) == 101 && run(1) == 1;
+            function->hooks = &anything;
+            ok = ok && run(0) == 111 && hooked_calls == 1;
+        }
+        check(ok, "the port's hooks");
+    }
+    {
+        // the tier-up: a call from the tier's code to a function the library
+        // has goes to the library's code once adopted
+        Program p({0x48000009,   // 80000000 bl 80000008
+                   0x4E800020,   // 80000004 blr
+                   0x38630001,   // 80000008 addi r3, r3, 1
+                   0x4E800020}); // 8000000C blr
+        p.function(BASE, 8);
+        p.function(BASE + 8, 8);
+        bool ok = p.compile();
+        if (ok) {
+            fresh();
+            p.fn(BASE)(c);
+            ok = c.r[3] == 1;
+            static const GeneratedFunction library_functions[] = {{BASE + 8, [](Context &c) { c.r[3] += 1000; }}};
+            GeneratedModule library = *p.module->table();
+            library.functions = library_functions, library.count = 1;
+            std::string error;
+            ok = ok && p.module->adopt(library, error) == 1;
+            fresh();
+            p.fn(BASE)(c);
+            ok = ok && c.r[3] == 1000;
+        }
+        check(ok, "the tier-up's jump to the library");
+    }
+    return failed;
+}
+} // namespace control
 } // namespace
 #endif
 
@@ -295,6 +511,7 @@ int main(int argc, char **argv) {
     if (!unwind_check(space.base()))
         return std::printf("copy-and-patch: an exception did not cross the tier's code\n"), 1;
     std::printf("copy-and-patch: an exception crossed the tier's code\n");
+    if (control::run_checks(space.base())) return 1;
 #endif
     Totals totals;
     [[maybe_unused]] uint64_t stencil_cases = 0, differ = 0;

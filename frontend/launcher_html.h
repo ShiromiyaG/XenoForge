@@ -96,6 +96,7 @@ struct SettingsPage {
     std::string backdrop;   // the ribbons: "animated", "still", "off"
     bool sounds = true;     // the window's own sounds
     bool smooth_edges = true; // multisampling for the window's drawing
+    bool background_build = true; // the library built while a game runs on the first tier
     bool discord = true;      // Discord Rich Presence
     bool discord_has_id = false; // an application ID is set (else presence is off whatever the toggle says)
     std::vector<std::string> gamepads;

@@ -382,6 +382,11 @@ int main() {
     CHECK(frontend::game_status(true, false, false, true) == frontend::GameStatus::Stale);
     CHECK(frontend::game_status(false, false, false, true) == frontend::GameStatus::NeedsPreparing);
     CHECK(std::string(frontend::status_class(frontend::GameStatus::Stale)) == "stale");
+    // no library, but the generic player runs the first tier: ready at once, even after a failed Prepare
+    CHECK(frontend::game_status(false, false, false, false, true) == frontend::GameStatus::FirstTier);
+    CHECK(frontend::game_status(false, false, true, false, true) == frontend::GameStatus::FirstTier);
+    CHECK(frontend::game_status(true, false, false, false, true) == frontend::GameStatus::Ready);
+    CHECK(std::string(frontend::status_text(frontend::GameStatus::FirstTier)) == "Ready (first tier)");
     {
         // which player: a cached library means the generic one, else the player carrying the code, else the generic
         frontend::PlayerBinary generic, carrying, other;

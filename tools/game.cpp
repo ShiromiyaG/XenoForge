@@ -175,18 +175,18 @@ void print_renderer_report(const render::Report &r) {
     for (const auto &[what, n] : r.used) std::printf("  uses    %8llu  %s\n", (unsigned long long)n, what.c_str());
 }
 
-// The game library the recompile step cached for this executable (or the one
-// named), its modules given to the kernel as a linked game's are; with none,
-// or one that does not load, the game is interpreted.
-void load_game_library(const Options &options, Game &g) {
+// The game library the recompile step cached for this executable (or the
+// one named), its modules given to the kernel as a linked game's are. False
+// when there is none or it does not load (said why).
+bool load_game_library(const Options &options, Game &g) {
     std::filesystem::path library = options.game_library;
     const char *digest = g.cache_key.c_str();
     if (library.empty()) {
         const std::filesystem::path cache = options.cache.empty() ? build::default_cache_dir() : options.cache;
         if (auto cached = build::find_cached(cache, digest)) library = cached->library;
         if (library.empty()) {
-            std::printf("generated code: none (no game library for %s in %s)\n", digest, cache.string().c_str());
-            return;
+            std::printf("generated code: no game library for %s in %s\n", digest, cache.string().c_str());
+            return false;
         }
     }
     // the runtime's table, kept for the process's life with the library
@@ -194,13 +194,14 @@ void load_game_library(const Options &options, Game &g) {
     std::string error;
     const ppc::GameLibrary *loaded = ppc::load_game_library(library, runtime, error);
     if (!loaded) {
-        std::printf("generated code: none (%s)\n", error.c_str());
-        return;
+        std::printf("generated code: the game library did not load (%s)\n", error.c_str());
+        return false;
     }
     size_t functions = 0;
     for (size_t i = 0; i < loaded->count; i++) functions += loaded->modules[i]->count;
     g.kernel->set_generated_modules(loaded->modules, loaded->count);
     g.generated_modules = loaded->count, g.generated_functions = functions, g.installed_modules = loaded->modules;
+    g.tier = Game::Tier::Library;
     std::printf("generated code: %zu modules, %zu functions (the game library %s)\n", loaded->count, functions,
                 library.string().c_str());
     // what discovery missed, logged beside the library for its next build
@@ -210,54 +211,112 @@ void load_game_library(const Options &options, Game &g) {
         g.kernel->set_entry_hook(&build::EntryLog::hook, &g.entry_log);
         std::printf("entry log: %s (%zu addresses)\n", log.string().c_str(), g.entry_log.size());
     }
+    return true;
 }
 
 uint64_t process_bytes();
 
-// The copy-and-patch tier (XF_TIER=stencil; stencil.h): the executable's
-// functions discovered and made into code now, its table given to the kernel
-// as a game library's is. XF_STENCIL_COUNT=1 counts the instructions its code
-// runs (the report compares them with the interpreter's).
-void load_stencil_tier(const Options &options, Game &g) {
+// A module's code made by the copy-and-patch tier: its image read, discovered
+// (with the entry log's addresses, as the library's build takes them, and the
+// project file's starts, tables and hooks) and copied. nullptr, and why.
+std::unique_ptr<stencil::Module> make_stencil_module(const Xex &xex, const std::string &name,
+                                                     const std::vector<uint32_t> &entries,
+                                                     const recomp::ProjectModule *project, bool count,
+                                                     stencil::Stats &s, double &discovered, uint64_t &peak_discovery,
+                                                     std::string &error) {
+    const auto t0 = std::chrono::steady_clock::now();
+    recomp::Image image;
+    if (!recomp::read_image(xex, image, error)) return nullptr;
+    recomp::DiscoverOptions options;
+    options.entries = entries;
+    if (project) stencil::project_discovery(*project, options);
+    const recomp::Discovery d = recomp::discover(image, options);
+    stencil::Project hooks;
+    if (project) hooks = stencil::project_hooks(*project, d);
+    discovered = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    peak_discovery = process_bytes();
+    static const ppc::Runtime runtime = ppc::host_runtime();
+    stencil::Options o;
+    o.count = count;
+    if (project) o.project = &hooks;
+    return stencil::compile(image, d, runtime, name, image_digest(xex.image), o, s, error);
+}
+
+// The copy-and-patch tier (stencil.h): the executable's functions discovered
+// and made into code now, its table given to the kernel as a game library's
+// is, and each DLL's made as it loads. XF_STENCIL_COUNT=1 counts the
+// instructions its code runs (the report compares them with the
+// interpreter's). False when the tier is not available here.
+bool load_stencil_tier(const Options &options, Game &g) {
     std::string error;
     std::string why;
     if (!stencil::available(&why)) {
-        std::printf("copy-and-patch tier: not available (%s)\n", why.c_str());
-        return;
+        std::printf("first tier (copy-and-patch): not available (%s)\n", why.c_str());
+        return false;
     }
     const uint64_t before = process_bytes();
-    const auto t0 = std::chrono::steady_clock::now();
-    recomp::Image image;
-    if (!recomp::read_image(g.xex, image, error)) {
-        std::printf("copy-and-patch tier: %s\n", error.c_str());
-        return;
+    // the addresses earlier runs entered the interpreter at, as the library's build reads them
+    const std::filesystem::path log = build::entry_log_path(g.cache, g.cache_key);
+    const std::vector<uint32_t> entries = build::read_entry_log(log);
+    static recomp::Project project;
+    const recomp::ProjectModule *pm = nullptr;
+    if (!options.project.empty()) {
+        if (!recomp::load_project(options.project, project, error)) {
+            std::printf("first tier (copy-and-patch): the project file: %s\n", error.c_str());
+            return false;
+        }
+        pm = project.find(options.xex_path);
     }
-    const recomp::Discovery d = recomp::discover(image);
-    const double discovered = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    const uint64_t peak_discovery = process_bytes();
-    static const ppc::Runtime runtime = ppc::host_runtime();
-    stencil::Options o;
-    if (const char *count = std::getenv("XF_STENCIL_COUNT"); count && *count && *count != '0') o.count = true;
+    const bool count = [] {
+        const char *c = std::getenv("XF_STENCIL_COUNT");
+        return c && *c && *c != '0';
+    }();
     stencil::Stats s;
-    g.stencil = stencil::compile(image, d, runtime, options.xex_path, image_digest(g.xex.image), o, s, error);
+    double discovered = 0;
+    uint64_t peak_discovery = 0;
+    g.stencil = make_stencil_module(g.xex, options.xex_path, entries, pm, count, s, discovered, peak_discovery, error);
     if (!g.stencil) {
-        std::printf("copy-and-patch tier: %s\n", error.c_str());
-        return;
+        std::printf("first tier (copy-and-patch): %s\n", error.c_str());
+        return false;
     }
     const uint64_t peak = process_bytes();
-    g.stencil_counting = o.count;
+    g.stencil_counting = count;
     g.stencil_table[0] = g.stencil->table();
     g.kernel->set_generated_modules(g.stencil_table, 1);
     g.generated_modules = 1, g.generated_functions = s.compiled, g.installed_modules = g.stencil_table;
-    std::printf("copy-and-patch tier: %zu of %zu functions (%llu of %llu instructions), %llu stencils copied, "
-                "%.1f MB of code (%.1f MB in all, %zu unwind entries); discovery %.3f s, the copies %.3f s; the "
-                "process's memory %+.1f MB after discovery, %+.1f MB after the copies%s\n",
+    g.tier = Game::Tier::Stencil;
+    std::printf("first tier (copy-and-patch): %zu of %zu functions (%llu of %llu instructions; %zu with checked "
+                "returns, %zu with resume sites, %zu hooked, %zu mid-function hooks), %llu stencils copied, %.1f MB of "
+                "code (%.1f MB in all, %zu unwind entries); discovery %.3f s (%zu logged entries), the copies %.3f s; "
+                "the process's memory %+.1f MB after discovery, %+.1f MB after the copies%s\n",
                 s.compiled, s.functions, (unsigned long long)s.compiled_instructions,
-                (unsigned long long)s.instructions, (unsigned long long)s.copies, s.code_bytes / 1048576.0,
-                s.region_bytes / 1048576.0, s.unwind_entries, discovered, s.seconds,
-                (double(peak_discovery) - double(before)) / 1048576.0, (double(peak) - double(before)) / 1048576.0,
-                o.count ? " (counting instructions)" : "");
+                (unsigned long long)s.instructions, s.checked, s.resumable, s.hooked, s.mid_hooks,
+                (unsigned long long)s.copies, s.code_bytes / 1048576.0, s.region_bytes / 1048576.0, s.unwind_entries,
+                discovered, entries.size(), s.seconds, (double(peak_discovery) - double(before)) / 1048576.0,
+                (double(peak) - double(before)) / 1048576.0, count ? " (counting instructions)" : "");
     for (const auto &[reason, n] : s.left_out) std::printf("  left to the interpreter: %zu %s\n", n, reason.c_str());
+    // the DLLs it loads, made into code as they load (a library would carry them)
+    Game *gp = &g;
+    g.kernel->set_code_provider([gp](const Xex &xex, std::string &why) -> const ppc::GeneratedModule * {
+        stencil::Stats ds;
+        double seconds = 0;
+        uint64_t peak = 0;
+        const std::string name = xex.original_pe_name.empty() ? "a DLL" : xex.original_pe_name;
+        auto m = make_stencil_module(xex, name, {}, nullptr, false, ds, seconds, peak, why);
+        if (!m) return nullptr;
+        std::printf("first tier (copy-and-patch): %s at 0x%08X: %zu of %zu functions, discovery %.3f s, the copies "
+                    "%.3f s\n",
+                    name.c_str(), xex.base_address, ds.compiled, ds.functions, seconds, ds.seconds);
+        std::fflush(stdout);
+        gp->stencil_dlls.push_back(std::move(m));
+        return gp->stencil_dlls.back()->table();
+    });
+    // what discovery missed, logged where the library's build reads it
+    if (g.entry_log.open(log)) {
+        g.kernel->set_entry_hook(&build::EntryLog::hook, &g.entry_log);
+        std::printf("entry log: %s (%zu addresses)\n", log.string().c_str(), g.entry_log.size());
+    }
+    return true;
 }
 
 } // namespace
@@ -339,11 +398,21 @@ bool open(const Options &options, Game &g, std::string &error) {
             g.installed_modules = options.modules;
         std::printf("generated code: %zu modules, %zu functions%s\n", options.module_count, functions,
                     options.interpret ? " (left out: --interpret)" : "");
-    } else if (!options.interpret && stencil::requested()) {
-        load_stencil_tier(options, g);
+        if (!options.interpret) g.tier = Game::Tier::Linked;
     } else if (!options.interpret) {
-        load_game_library(options, g);
+        // no code linked in: the cached game library, else the first tier
+        // (moving to the library when the cache gets it), else the interpreter
+        const stencil::Choice choice = stencil::choice();
+        if (choice == stencil::Choice::Stencil) {
+            load_stencil_tier(options, g);
+        } else if (choice == stencil::Choice::Interpret) {
+            std::printf("generated code: none (XF_TIER=interpret)\n");
+        } else if (!load_game_library(options, g) && choice == stencil::Choice::Default &&
+                   options.game_library.empty()) {
+            g.tier_up = load_stencil_tier(options, g);
+        }
     }
+    std::printf("cpu: %s\n", tier_name(g));
     if (!k.load(g.xex, error)) return error = "load: " + error, false;
     for (const std::string &line : patches::apply_data(g.patch_plan, *g.memory)) std::printf("%s\n", line.c_str());
     k.step_limit = options.steps;
@@ -377,6 +446,70 @@ bool open(const Options &options, Game &g, std::string &error) {
                     g.xex.tls.raw_data_size, g.xex.tls.raw_data_address);
     else
         std::printf("none\n");
+    return true;
+}
+
+const char *tier_name(const Game &g) {
+    switch (g.tier) {
+    case Game::Tier::Linked: return "linked generated code";
+    case Game::Tier::Library: return "the game library";
+    case Game::Tier::Stencil: return "the first tier (copy-and-patch)";
+    case Game::Tier::Interpreter: break;
+    }
+    return "the interpreter";
+}
+
+bool poll_tier_up(Game &g) {
+    if (g.tier != Game::Tier::Stencil || !g.tier_up) return false;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now - g.tier_up_polled < 2.0) return false;
+    g.tier_up_polled = now;
+    kernel::Kernel &k = *g.kernel;
+    if (!g.tier_up_library) {
+        auto cached = build::find_cached(g.cache, g.cache_key);
+        if (!cached) return false;
+        static const ppc::Runtime runtime = ppc::host_runtime();
+        std::string error;
+        g.tier_up_library = ppc::load_game_library(cached->library, runtime, error);
+        if (!g.tier_up_library) {
+            std::printf("tier-up: the game library %s did not load (%s); staying on the first tier\n",
+                        cached->library.string().c_str(), error.c_str());
+            g.tier_up = false;
+            return false;
+        }
+        std::printf("tier-up: the game library %s is ready\n", cached->library.string().c_str());
+    }
+    // every guest thread parked at a safe point while the entries change
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!k.pause(500)) {
+        k.resume();
+        std::printf("tier-up: %u guest threads did not park in 0.5 s; trying again\n", k.pause_unparked());
+        return false;
+    }
+    const ppc::GameLibrary &lib = *g.tier_up_library;
+    auto moved = k.adopt_generated_modules(lib.modules, lib.count);
+    size_t entries = 0;
+    std::string error;
+    for (const auto &[from, to] : moved) {
+        stencil::Module *m = g.stencil && g.stencil->table() == from ? g.stencil.get() : nullptr;
+        for (auto &d : g.stencil_dlls)
+            if (d->table() == from) m = d.get();
+        if (!m) continue;
+        const size_t n = m->adopt(*to, error);
+        if (!n && !error.empty()) std::printf("tier-up: %s: %s\n", from->name, error.c_str());
+        entries += n;
+    }
+    k.resume();
+    const double paused = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    size_t functions = 0;
+    for (size_t i = 0; i < lib.count; i++) functions += lib.modules[i]->count;
+    g.generated_modules = lib.count, g.generated_functions = functions, g.installed_modules = lib.modules;
+    g.tier = Game::Tier::Library;
+    g.tier_up = false;
+    std::printf("tier-up: the game library runs the guest now: %zu of its modules in place of the first tier's, "
+                "%zu of the tier's function entries jump to it; the threads paused %.1f ms\n",
+                moved.size(), entries, paused * 1000.0);
+    std::fflush(stdout);
     return true;
 }
 
@@ -544,7 +677,7 @@ void print_report(Game &g, bool waiting) {
     std::sort(entered.rbegin(), entered.rend());
     std::printf("interpreted entries: %llu, at %zu addresses\n", (unsigned long long)k.interpreted_entries(),
                 entered.size());
-    if (g.stencil_counting) {
+    if (g.stencil_counting && g.stencil) {
         // the copy-and-patch tier's coverage: the share of the guest's instructions its code ran
         const uint64_t run = g.stencil->executed(), interpreted = k.interpreted_instructions();
         std::printf("copy-and-patch tier: %llu instructions run in its code, %llu in the interpreter (%.2f%% "

@@ -26,8 +26,9 @@
 // Every run gets `--steps 18446744073709551615 --seconds 100000` before its own
 // arguments (it must end at its halt, not at boot's default limits). A run
 // without --interpret must have run generated code (the summary's modules), so
-// a game library missing from the cache, which boot would quietly interpret,
-// is a failure that says so; a forced hand-over makes the run inexact and fails.
+// a game library missing from the cache, which boot would quietly interpret
+// (the check sets XF_TIER=library, so not the first tier), is a failure that
+// says so; a forced hand-over makes the run inexact and fails.
 // The watchdog that forces them waits 10 s of the host's time here, not 100 ms
 // (XF_DETERMINISTIC_FORCE_MS, unless the environment sets it): on a loaded
 // machine the host can stop a guest thread for longer than 100 ms, and a run
@@ -269,6 +270,16 @@ int main(int argc, char **argv) {
         _putenv_s("XF_DETERMINISTIC_FORCE_MS", "10000");
 #else
         setenv("XF_DETERMINISTIC_FORCE_MS", "10000", 1);
+#endif
+    }
+    // the cached library or the interpreter, never the first tier a missing
+    // library would get (its runs give the same hash, so a stale cache would
+    // pass unseen), unless the environment asks for a tier
+    if (const char *tier = std::getenv("XF_TIER"); !tier || !*tier) {
+#ifdef _WIN32
+        _putenv_s("XF_TIER", "library");
+#else
+        setenv("XF_TIER", "library", 1);
 #endif
     }
     std::error_code ec;

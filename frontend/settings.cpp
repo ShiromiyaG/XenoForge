@@ -329,6 +329,7 @@ void read_launcher(const toml::table &t, Settings::Launcher &l) {
     get(t, "launcher", "backdrop", l.backdrop);
     get(t, "launcher", "sounds", l.sounds);
     get(t, "launcher", "smooth_edges", l.smooth_edges);
+    get(t, "launcher", "background_build", l.background_build);
     int64_t x = l.x, y = l.y, width = l.width, height = l.height;
     get(t, "launcher", "x", x);
     get(t, "launcher", "y", y);
@@ -341,7 +342,8 @@ void read_launcher(const toml::table &t, Settings::Launcher &l) {
 
 toml::table launcher_table(const Settings::Launcher &l) {
     toml::table t{{"games", l.games}, {"accent", l.accent}, {"theme", l.theme}, {"sort", l.sort},
-                    {"backdrop", l.backdrop}, {"sounds", l.sounds}, {"smooth_edges", l.smooth_edges}};
+                    {"backdrop", l.backdrop}, {"sounds", l.sounds}, {"smooth_edges", l.smooth_edges},
+                    {"background_build", l.background_build}};
     if (l.width > 0) {
         t.insert("x", l.x), t.insert("y", l.y), t.insert("width", l.width), t.insert("height", l.height);
         t.insert("maximized", l.maximized);

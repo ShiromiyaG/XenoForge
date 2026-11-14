@@ -397,6 +397,20 @@ public:
     void set_generated_modules(const ppc::GeneratedModule *const *modules, size_t count);
     std::string add_module_code(const Xex &xex);
     void remove_module_code(uint32_t base);
+    // What makes code for an image no table matches, as it loads (the
+    // copy-and-patch tier's compile, docs/runtime.md "The first tier"): the
+    // table made, which the provider keeps for the kernel's life, or nullptr
+    // and why (the image is interpreted). Called without the code's lock held.
+    using CodeProvider = std::function<const ppc::GeneratedModule *(const Xex &xex, std::string &why)>;
+    void set_code_provider(CodeProvider provider);
+    // The tier-up (docs/recompiler.md, "Tier-up"): `modules` (a game
+    // library's tables) become what images loaded from now on are matched
+    // against, and each image loaded now whose code a table of theirs was made
+    // from (base, size and digest) runs that code instead from the next
+    // lookup on (dispatch, the interpreter's calls), its hook slots bound. The
+    // tables replaced, each with the one replacing it.
+    std::vector<std::pair<const ppc::GeneratedModule *, const ppc::GeneratedModule *>>
+    adopt_generated_modules(const ppc::GeneratedModule *const *modules, size_t count);
     // Functions at any address, looked up before the modules' (sorted by
     // address; the tests' host functions), and their resume sites (sorted;
     // GeneratedModule::resumes).

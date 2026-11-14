@@ -10,9 +10,10 @@
 
 namespace xf::frontend {
 
-GameStatus game_status(bool cached_library, bool generated_player, bool prepare_failed, bool stale) {
+GameStatus game_status(bool cached_library, bool generated_player, bool prepare_failed, bool stale, bool first_tier) {
     if (cached_library && stale) return GameStatus::Stale;
     if (cached_library || generated_player) return GameStatus::Ready;
+    if (first_tier) return GameStatus::FirstTier;
     return prepare_failed ? GameStatus::Interpreted : GameStatus::NeedsPreparing;
 }
 
@@ -22,6 +23,7 @@ const char *status_class(GameStatus status) {
     case GameStatus::NeedsPreparing: return "prep";
     case GameStatus::Interpreted: return "interp";
     case GameStatus::Stale: return "stale";
+    case GameStatus::FirstTier: return "ready";
     }
     return "";
 }
@@ -32,6 +34,7 @@ const char *status_text(GameStatus status) {
     case GameStatus::NeedsPreparing: return "Needs preparing";
     case GameStatus::Interpreted: return "Interpreted";
     case GameStatus::Stale: return "Update available";
+    case GameStatus::FirstTier: return "Ready (first tier)";
     }
     return "";
 }
@@ -42,6 +45,9 @@ const char *status_detail(GameStatus status) {
     case GameStatus::NeedsPreparing: return "Built once here from your disc, in a few minutes.";
     case GameStatus::Interpreted: return "No library could be built: it runs interpreted.";
     case GameStatus::Stale: return "The game ran code its library lacks: rebuilding takes it in.";
+    case GameStatus::FirstTier:
+        return "Plays at once on the first tier; Prepare builds its game library, which runs it about three times as "
+               "fast (also built while it plays, when the setting says so).";
     }
     return "";
 }

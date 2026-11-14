@@ -46,7 +46,7 @@ std::vector<MenuItem> LauncherView::menu_items(const std::string &name) {
     const bool building = job_.active();
     const GameStatus status = g ? status_of(*g) : GameStatus::Ready;
     const bool playable = g && player_of(*g) && !running;
-    const char *prepare = status == GameStatus::NeedsPreparing ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild the library with the new code" : "Rebuild the library";
+    const char *prepare = status == GameStatus::NeedsPreparing || status == GameStatus::FirstTier ? "Prepare" : status == GameStatus::Interpreted ? "Try preparing again" : status == GameStatus::Stale ? "Rebuild the library with the new code" : "Rebuild the library";
     if (name == "help")
         return {item("about", "About XenoForge", "", "info"), menu_separator(),
                 item("open-cache", "Open the game libraries' folder", "", "hard-drive"),
@@ -208,6 +208,7 @@ void LauncherView::begin_prepare(const GameEntry &game, bool demo) {
     prepare_title_ = game.title;
     prepare_title_id_ = game.title_id;
     prepare_listed_ = false;
+    prepare_background_ = false;
     prepare_game_ = demo && !selected_game() ? -1 : selected_;
     job_.start(game.title, std::move(runner));
     prepare_stage_ = 0;
@@ -271,6 +272,8 @@ void LauncherView::update_prepare() {
         if (dialog_ != Dialog::Prepare || s.cancelled) {
             if (s.cancelled) set_message("Preparing " + prepare_title_ + " was cancelled", 0, 8);
             else if (failed) set_message("Preparing " + prepare_title_ + " failed: " + s.error, 2, 0);
+            else if (prepare_background_)
+                set_message(prepare_title_ + "'s game library is built: a game running on the first tier moves to it", 1, 12);
             else set_message(prepare_title_ + " is prepared and ready to play", 1, 12);
         }
         if (s.cancelled && dialog_ == Dialog::Prepare) {

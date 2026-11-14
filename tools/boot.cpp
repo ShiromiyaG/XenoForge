@@ -15,7 +15,12 @@
 // module's once the module is loaded; --interpret leaves it out. Plain boot
 // loads the game library the recompile step cached for the executable
 // (xfbuild, game_build.h): from --cache <dir> (the launcher's cache by
-// default), or the one --game-library names; with none it interprets.
+// default), or the one --game-library names; with none (or one for another
+// interface or set of patches) it runs the copy-and-patch first tier
+// (stencil.h) and moves to the library when the cache gets one (the
+// tier-up), else interprets. XF_TIER=stencil forces the tier, =library the
+// library or the interpreter, =interpret the interpreter (as --interpret).
+// --project <file> gives the tier a port's project file (its hooks' slots).
 // --render draws what the GPU is sent (the renderer as the command
 // processor's Sink, on a Vulkan device without a window); off by default,
 // so the GPU stays headless. --shots <dir> writes the front buffer of chosen
@@ -65,7 +70,7 @@
 // and adds each function's inclusive share.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
-//        [--cache <dir>] [--game-library <file>] [--patches <dir> [--patch <name>[=off]]...]
+//        [--cache <dir>] [--game-library <file>] [--project <file>] [--patches <dir> [--patch <name>[=off]]...]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 //        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
@@ -102,7 +107,7 @@ using namespace xf;
 
 int xf::run_boot(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
-                        "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
+                        "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] [--project <file>] "
                         "[--patches <dir> [--patch <name>[=off]]...] [--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
                         "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
@@ -151,6 +156,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             o.cache = argv[++k];
         else if (a == "--game-library" && k + 1 < argc)
             o.game_library = argv[++k];
+        else if (a == "--project" && k + 1 < argc)
+            o.project = argv[++k];
         else if (a == "--patches" && k + 1 < argc)
             o.patches.directory = argv[++k], o.patches.off = false;
         else if (a == "--patch" && k + 1 < argc) {
@@ -311,6 +318,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         const bool due = reload_every > 0 && elapsed >= next_reload;
         if (due) next_reload += reload_every;
         game::poll_port_module(g, due);
+        game::poll_tier_up(g); // the game library, once the cache has it
         if (rates && elapsed >= next_rates) game::print_rates(g, rate_log, elapsed), next_rates += 1;
         if (profile_top && !profiling && elapsed >= profile_from) {
             profiling = true, profile_swaps = swaps(), profile_started = elapsed;

@@ -47,13 +47,14 @@ void PrepareJob::join() {
 }
 
 PrepareJob::Runner PrepareJob::build_runner(std::filesystem::path disc, std::filesystem::path cache_dir,
-                                            unsigned jobs, bool force, patches::Config patches) {
-    return [disc = std::move(disc), cache_dir = std::move(cache_dir), jobs, force,
-            patches = std::move(patches)](build::Progress &progress, std::string &error) {
+                                            unsigned jobs, bool force, patches::Config patches, bool background) {
+    return [disc = std::move(disc), cache_dir = std::move(cache_dir), jobs, force, patches = std::move(patches),
+            background](build::Progress &progress, std::string &error) {
         build::BuildOptions options;
         options.patches = patches;
         if (jobs) options.jobs = jobs;
         options.force = force;
+        options.background = background;
         // the shaders runs met, made into the title's pipeline cache
         options.shader_step = &render::run_shader_step;
         return build::prepare_game(disc, cache_dir, progress, error, options);

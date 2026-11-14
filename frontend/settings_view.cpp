@@ -169,6 +169,7 @@ SettingsPage SettingsView::page() {
     p.backdrop = core_.launcher().backdrop;
     p.sounds = core_.launcher().sounds;
     p.smooth_edges = core_.launcher().smooth_edges;
+    p.background_build = core_.launcher().background_build;
     p.discord = core_.discord().enabled;
     p.discord_has_id = !core_.discord().client_id.empty();
     if (tab_ == SettingsTab::Controllers) p.gamepads = LauncherCore::gamepads();
@@ -402,6 +403,15 @@ void SettingsView::toggle_setting(Rml::Element *row) {
         std::string error;
         core_.set_discord(d, error);
         if (Rml::Element *box = row->QuerySelector(".check")) box->SetClass("on", d.enabled);
+        return;
+    }
+    if (key == "ui.background_build") {
+        // the launcher's own: whether a game started on the first tier has its library built meanwhile
+        Settings::Launcher l = core_.launcher();
+        l.background_build = !l.background_build;
+        std::string error;
+        core_.set_launcher(l, error);
+        if (Rml::Element *box = row->QuerySelector(".check")) box->SetClass("on", l.background_build);
         return;
     }
     if (key == "ui.smooth_edges") {
@@ -798,6 +808,10 @@ void SettingsView::navigate(NavDir dir) {
         }
         if (kind == "toggle" && key == "ui.smooth_edges") {
             if (core_.launcher().smooth_edges != (dir == NavDir::Right)) host_.play_sound(Cue::Toggle), toggle_setting(row);
+            return;
+        }
+        if (kind == "toggle" && key == "ui.background_build") {
+            if (core_.launcher().background_build != (dir == NavDir::Right)) host_.play_sound(Cue::Toggle), toggle_setting(row);
             return;
         }
         if (kind == "toggle" && key != "own") {

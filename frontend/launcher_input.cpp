@@ -247,8 +247,24 @@ void LauncherView::start_game(const GameEntry &game, bool interpreted) {
     }
     std::string message;
     if (!core_.start(game, plan, message)) return message_box("The game did not start", message);
+    const bool first_tier = !interpreted && plan.generic && !plan.from_library && first_tier_;
     std::printf("launcher: started %s on %s%s, its output in %s\n", utf8(plan.program.filename()).c_str(), utf8(game.path).c_str(),
-                plan.from_library ? " from its cached library" : "", utf8(core_.run().log).c_str());
+                plan.from_library ? " from its cached library" : first_tier ? " on the first tier" : "", utf8(core_.run().log).c_str());
+    // the game plays on the first tier: its library built meanwhile, behind
+    // the status bar, at a low priority with half the compilers (the player
+    // moves to it once it is in the cache)
+    if (first_tier && core_.launcher().background_build && !job_.active() && !failed_.count(game.title_id)) {
+        prepare_title_ = game.title;
+        prepare_title_id_ = game.title_id;
+        prepare_listed_ = false;
+        prepare_game_ = -1;
+        for (size_t i = 0; i < listing_.games.size(); i++)
+            if (listing_.games[i].path == game.path) prepare_game_ = long(i);
+        prepare_hidden_ = true, prepare_background_ = true;
+        job_.start(game.title, PrepareJob::build_runner(game.path, build::default_cache_dir(), opt_.build_jobs, false,
+                                                        patch_config_of(game), true));
+        std::printf("launcher: building the library of %s in the background\n", utf8(game.path).c_str());
+    }
     message_.clear();
     rows_sig_.clear();
     update_toolbar();

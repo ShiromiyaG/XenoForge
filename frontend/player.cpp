@@ -31,7 +31,10 @@
 // prints the modules whose generated code the player carries (the launcher
 // asks it, frontend/library.h). The generic player runs the game library the
 // recompile step cached for the disc (game_build.h; --cache names the cache,
-// --game-library a library), else interprets.
+// --game-library a library), else the copy-and-patch first tier until the
+// library is in the cache (the launcher builds it meanwhile), then the
+// library (game.h's poll_tier_up); the log's "cpu:" line and F1's Debug page
+// say which runs.
 //
 //   player[_<game>] <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] [--steps N]
 //        [--interpret] [--cache <dir>] [--game-library <file>] [--quit-after S] [--screenshots <dir>]
@@ -785,6 +788,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         uint32_t exit_code = 0;
         if (k.wait_main(0, &exit_code)) quit = true, ended = "the main thread ended";
         game::poll_port_module(g, false); // the port's hooks, loaded again when their module changed
+        game::poll_tier_up(g);            // the game library, once the cache has it (the launcher builds it)
 
         // the screenshots asked for
         std::deque<Shot> shots;
@@ -926,6 +930,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             }});
             host.extra_pages.push_back({"Debug", [&] {
                 fe::guide_caption("Run");
+                ImGui::TextWrapped("CPU: %s", game::tier_name(g));
                 ImGui::TextWrapped("guest swaps %.1f/s (%llu), frames presented %.1f/s (%llu)", rates.swaps,
                                    (unsigned long long)swapped, rates.presented, (unsigned long long)presented);
                 ImGui::TextWrapped("window refreshes %.1f/s, run %.0f s; front buffers not shown (no picture free) %llu",

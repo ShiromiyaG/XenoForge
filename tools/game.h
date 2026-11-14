@@ -31,6 +31,10 @@
 #include <string>
 #include <vector>
 
+namespace xf::ppc {
+struct GameLibrary;
+}
+
 namespace xf::game {
 
 struct Options {
@@ -48,9 +52,17 @@ struct Options {
     // Built without generated code (the generic boot and player): the game
     // library the recompile step cached for the executable (game_build.h),
     // from this cache (game_build.h's default_cache_dir() when empty), or the
-    // one named; with none, the game is interpreted.
+    // one named; with none (or one for another interface or set of patches),
+    // the copy-and-patch tier (stencil.h; docs/runtime.md, "The first tier"),
+    // moving to the library when one appears (poll_tier_up), and the
+    // interpreter where the tier is not available. XF_TIER says otherwise
+    // (stencil.h's Choice).
     std::filesystem::path cache;
     std::filesystem::path game_library;
+    // A port's project file (recomp.h, "The project file"), for the tier: its
+    // starts, tables, hook slots and mid-function hooks in the executable's
+    // code, as a library emitted with it has them (boot --project).
+    std::filesystem::path project;
     // The lockstep check (xenoforge/lockstep.h): the interpreter checks the
     // generated code of the calls to these functions and of one call in
     // lockstep_sample to any; XF_LOCKSTEP and XF_LOCKSTEP_SAMPLE when neither
@@ -85,11 +97,19 @@ struct Game {
     // where the kernel logs the addresses it enters the interpreter at, with
     // a cached game library loaded (D3; first, so it outlives the kernel)
     build::EntryLog entry_log;
-    // the copy-and-patch tier's code (XF_TIER=stencil; stencil.h), and its
-    // table as the kernel is given it: kept until the kernel is gone
+    // the copy-and-patch tier's code (stencil.h): the executable's, its table
+    // as the kernel is given it, and the DLLs' made as they load; kept until
+    // the kernel is gone, also after the tier-up (frames may still run there)
     std::unique_ptr<stencil::Module> stencil;
     const ppc::GeneratedModule *stencil_table[1] = {};
+    std::vector<std::unique_ptr<stencil::Module>> stencil_dlls;
     bool stencil_counting = false;
+    // which code runs the guest (tier_name), and whether the run moves to the
+    // game library when the cache gets one (poll_tier_up)
+    enum class Tier { Interpreter, Linked, Library, Stencil } tier = Tier::Interpreter;
+    bool tier_up = false;
+    double tier_up_polled = -1e9; // when the cache was last looked at (seconds, steady clock)
+    const ppc::GameLibrary *tier_up_library = nullptr; // loaded, waiting for a pause
     Xex xex;
     // the executable's image digest before any patch, and the game library's cache key: the digest
     // alone, or with the enabled code patches' key (patches::cache_key)
@@ -142,6 +162,17 @@ bool load_port_module(Game &game, const std::filesystem::path &path, std::string
 // settled), or when `force`: the line saying so printed. False when it was
 // not (unchanged, none, or the new file unusable: said on stderr).
 bool poll_port_module(Game &game, bool force);
+
+// Which code runs the guest: "the game library", "the first tier
+// (copy-and-patch)", "linked generated code", "the interpreter".
+const char *tier_name(const Game &game);
+// The tier-up (docs/runtime.md, "The first tier"): on the first tier, every
+// few seconds, whether the cache has the game's library now (the launcher
+// builds it in the background); when it has, the library is loaded and, with
+// every guest thread parked for a moment, the kernel's tables and the tier's
+// function entries are moved to it. True when it happened (the line saying
+// so printed). Call it from the loop that waits for the game.
+bool poll_tier_up(Game &game);
 
 // The modules, the interpreter's entries, the kernel calls, what the GPU,
 // the sound and the input did, the port's hook calls (--hook-stats), and the
