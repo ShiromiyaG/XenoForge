@@ -11,9 +11,10 @@ onde o Xenia não tem resposta, o XNA Game Studio 4.0 (`tools/xna/`) é a segund
 então agentes o leem em `F:\RECOMPs\XenoForge\docs\plan.md`, não o editam e trazem as mudanças no relatório, que eu
 aplico); renderizador: `docs/renderer.md`; o que os jogos importam: `docs/lean-kernel.md`.
 
-- Remoto: `origin` = https://github.com/Tsukimi-Labs/XenoForge (**privado**; criado em 2026-11-06 como
-  `ShiromiyaG/XenoForge`, transferido para a organização Tsukimi Labs em 2026-11-12, branch
-  `master`). Commits locais de rotina permitidos; **push só quando o dono pedir**. Só o `master` vai para o
+- Remoto: `origin` = https://github.com/ShiromiyaG/XenoForge (**público**, na conta do dono; criado em
+  2026-11-06 como `ShiromiyaG/XenoForge`, transferido para a organização Tsukimi Labs em 2026-11-12 e de volta para
+  a conta do dono em 2026-11-14, branch `master`; colaborador com escrita: `yanm1103`). Público: tudo que vai
+  para o GitHub fica visível a qualquer um. Commits locais de rotina permitidos; **push só quando o dono pedir**. Só o `master` vai para o
   GitHub (nunca os branches `worktree-agent-*`). Docs, comentários, logs e commits em inglês; só este arquivo
   em português.
 - **No máximo 4 agentes rodando ao mesmo tempo** (pedido do dono, 2026-11-06: oito em paralelo estouraram o
