@@ -3162,8 +3162,8 @@ invalid UTF-8) and cut at 128 bytes.
 account; a game with no name shows as "A game".
 
 **Settings.** `[discord]` in config.toml, shared (not per game): `enabled` (default true) and `client_id`, the
-Application ID of a Discord application. The default of `client_id` is empty, or the build's `-DXF_DISCORD_CLIENT_ID=`;
-with none, presence is off and the launcher's Settings > Interface page ("Integrations") says why. The page's toggle
+Application ID of a Discord application. The default of `client_id` is the build's `-DXF_DISCORD_CLIENT_ID=`, which
+is the project's own "XenoForge" application (1570958722610634802) unless a build sets another; with none, presence is off and the launcher's Settings > Interface page ("Integrations") says why. The page's toggle
 writes `enabled`. The launcher itself shows no presence; the player does. The application needs a "xenoforge" art
 asset (Rich Presence > Art Assets in the developer portal) for the large image.
 

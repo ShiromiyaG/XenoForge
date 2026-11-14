@@ -441,7 +441,7 @@ if(XF_PLAYER AND TARGET boot)
     target_compile_options(xf_imgui PRIVATE -w)
     # Discord Rich Presence's application ID, an empty default: presence is off until config.toml's [discord] client_id
     # (or this) names a Discord application (docs/runtime.md, "Discord Rich Presence")
-    set(XF_DISCORD_CLIENT_ID "" CACHE STRING "default Discord application ID for Rich Presence")
+    set(XF_DISCORD_CLIENT_ID "1570958722610634802" CACHE STRING "default Discord application ID for Rich Presence (the XenoForge application)")
     # the window, input, sound and settings, apart from the kernel they feed;
     # the window's front buffer conversion, a compute shader (src/shaders/spirv)
     set(XF_FRONTEND_SHADERS)
