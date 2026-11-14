@@ -1,0 +1,20 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "local",
+            "displayName": "this machine's SDK and disc",
+            "inherits": "default",
+            "cacheVariables": {
+                "XENOFORGE_SDK": "@PORT_SDK@",
+                "GAME_ISO": "@PORT_ISO@"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "local",
+            "configurePreset": "local"
+        }
+    ]
+}

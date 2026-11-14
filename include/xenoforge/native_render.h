@@ -37,7 +37,7 @@
 //   });
 //
 // A port's shaders are SPIR-V it brings itself (compiled by its own CMake,
-// glslc from the Vulkan SDK; examples/native_port).
+// glslc from the Vulkan SDK; sdk/examples/native_port).
 
 #pragma once
 

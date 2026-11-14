@@ -52,6 +52,7 @@ add_library(xenoforge STATIC
     src/snappy.cpp
     src/gpu_trace.cpp
     src/game_build.cpp
+    src/cache_dir.cpp
     src/game_library.cpp
     src/cpu_level.cpp
     src/shader_storage.cpp
@@ -408,7 +409,9 @@ endif()
 # boot as a library (a port's boot_<name> links it: tools/boot.cpp's run_boot, the shared tools/game.cpp) and the
 # generic boot: the game library cached for the disc, else the interpreter. --render draws what the GPU is sent (the
 # renderer as the command processor's Sink) and writes shots
-add_library(xenoforge_boot STATIC tools/boot.cpp tools/game.cpp tools/sampler.cpp)
+# (tools/game_tiers.cpp, the game library and the first tier, is linked only by the generic boot, whose main turns it
+# on: a port's boot_<name> leaves it and the recompiler out)
+add_library(xenoforge_boot STATIC tools/boot.cpp tools/game.cpp tools/game_tiers.cpp tools/sampler.cpp)
 target_link_libraries(xenoforge_boot PUBLIC xenoforge_vk xenoforge PRIVATE stb)
 add_executable(boot tools/stub_main.cpp)
 target_compile_definitions(boot PRIVATE XF_PORT_BOOT)
@@ -507,7 +510,7 @@ if(XF_PLAYER AND TARGET boot)
     # the player as a library (frontend/player.cpp's run_player; a port's player_<name> links it) and the
     # generic player, which carries no game code
     add_library(xenoforge_player STATIC frontend/player.cpp frontend/system_ui_view.cpp frontend/guide_theme.cpp frontend/overlay_system.cpp
-                                        tools/game.cpp)
+                                        tools/game.cpp tools/game_tiers.cpp)
     target_link_libraries(xenoforge_player PUBLIC xf_frontend xf_imgui xenoforge_vk xenoforge PRIVATE stb)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(xenoforge_player PRIVATE -Wno-missing-field-initializers)
@@ -579,7 +582,7 @@ if(XF_PLAYER AND TARGET boot)
     add_dependencies(xfcompat boot)
 endif()
 
-# The games of XF_GAMES through the same function a port uses (cmake/xenoforge_port.cmake): game_<name>,
+# The games of XF_GAMES through the same function a port uses (sdk/xenoforge_port.cmake): game_<name>,
 # boot_<name> and, with the player, player_<name>
 add_library(XenoForge::core ALIAS xenoforge)
 add_library(XenoForge::vk ALIAS xenoforge_vk)
@@ -591,7 +594,7 @@ set(XENOFORGE_RUNTIME_FILES)
 if(XF_XMA)
     set(XENOFORGE_RUNTIME_FILES $<TARGET_FILE:ffmpeg_xma>)
 endif()
-include(cmake/xenoforge_port.cmake)
+include(sdk/xenoforge_port.cmake)
 set(XF_PLAYERS)
 if(TARGET player)
     set(XF_PLAYERS player)
@@ -613,16 +616,16 @@ foreach(game ${XF_GAMES})
         list(APPEND XF_PLAYERS player_${game})
     endif()
 endforeach()
-# examples/native_port (a port drawing its own frames, docs/sdk.md "Native rendering") built here on one of XF_GAMES'
-# generated code: player_native and boot_native in build/examples/native_port
-set(XF_NATIVE_PORT_GAME "" CACHE STRING "a game of XF_GAMES to build examples/native_port on")
+# sdk/examples/native_port (a port drawing its own frames, docs/sdk.md "Native rendering") built here on one of XF_GAMES'
+# generated code: player_native and boot_native in build/sdk/examples/native_port
+set(XF_NATIVE_PORT_GAME "" CACHE STRING "a game of XF_GAMES to build sdk/examples/native_port on")
 if(XF_NATIVE_PORT_GAME)
     if(XF_GAME_LIBS)
         set(NATIVE_PREBUILT ${XF_GAME_LIBS}/game_${XF_NATIVE_PORT_GAME}${CMAKE_STATIC_LIBRARY_SUFFIX})
     else()
         set(NATIVE_GENERATED_DIR ${XF_GEN_DIR}/${XF_NATIVE_PORT_GAME})
     endif()
-    add_subdirectory(examples/native_port)
+    add_subdirectory(sdk/examples/native_port)
 endif()
 if(TARGET player)
     # the player as it is shipped: cmake --install, or the player_package target
@@ -630,7 +633,7 @@ if(TARGET player)
 endif()
 # the SDK: find_package(XenoForge) in a port's own repository (docs/sdk.md)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    include(cmake/install_sdk.cmake)
+    include(sdk/install.cmake)
 endif()
 add_executable(xftexture tools/xftexture.cpp)
 target_link_libraries(xftexture PRIVATE xenoforge stb)

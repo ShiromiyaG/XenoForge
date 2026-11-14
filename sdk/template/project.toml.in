@@ -1,0 +1,15 @@
+# @PORT_TITLE@: the recompiler's project file (XenoForge's docs/recompiler.md,
+# "The project file"). Empty, the recompiler's own discovery stands. What goes
+# here as the port grows: the functions the hooks replace or hook (`hooks`,
+# so the generated code's direct calls reach them), names, starts discovery
+# missed, jump tables, mid-function hooks.
+
+hooks = []
+
+[project]
+name = "@PORT_NAME@"
+module = "default.xex"
+
+[functions]
+
+[names]

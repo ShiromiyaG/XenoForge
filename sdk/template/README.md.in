@@ -1,0 +1,38 @@
+# @PORT_TITLE@
+
+A port of @PORT_TITLE@ on XenoForge's SDK: the game's code recompiled ahead of
+time from your own disc and linked with XenoForge's runtime (kernel, GPU,
+sound, input), with this repository's own code on top. No part of the game is
+in the repository: the build reads your disc image.
+
+## Building
+
+You need XenoForge's SDK installed (`cmake --install <XenoForge's build>
+--component sdk --prefix <dir>`), clang, CMake 3.25+ and Ninja.
+
+```
+cmake --preset default -DXENOFORGE_SDK=<the SDK's prefix> -DGAME_ISO=<your disc image>
+cmake --build --preset default
+```
+
+(or `cmake --preset local` and `cmake --build --preset local`, with the paths
+in `CMakeUserPresets.json`, which is not versioned). The first build
+recompiles the disc: several minutes.
+
+## Running
+
+```
+build/player_@PORT_NAME@ <disc image>                 # the game in a window
+build/boot_@PORT_NAME@ <disc image> --seconds 20      # headless, with a report
+```
+
+Both take XenoForge's usual command line (its `docs/runtime.md`) and
+`--option <key>=<value>` for this port's options.
+
+## Layout
+
+| path | what |
+|---|---|
+| `src/main.cpp` | the port's main: its name, options, `on_init` |
+| `src/hooks.cpp` | hooks on the game's functions, reloaded while it runs |
+| `project.toml` | the recompiler's project file: names, hooked functions, fixes to discovery |

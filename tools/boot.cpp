@@ -166,8 +166,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             bool on = true;
             if (choice.size() > 4 && choice.ends_with("=off")) on = false, choice.resize(choice.size() - 4);
             o.patches.enabled[choice] = on;
-        }
-        else if (a == "--render")
+        } else if (a == "--render")
             rendering = true;
         else if (a == "--shots" && k + 1 < argc)
             shots = argv[++k];
@@ -326,9 +325,11 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             uint32_t only = 0;
             if (!profile_thread.empty()) {
                 only = k.host_thread_id(profile_thread);
-                if (only) std::printf("profile: guest thread \"%s\" alone (host thread %u)\n", profile_thread.c_str(), only);
-                else std::fprintf(stderr, "boot: --profile-thread: no running thread named \"%s\"; all of them\n",
-                                  profile_thread.c_str());
+                if (only)
+                    std::printf("profile: guest thread \"%s\" alone (host thread %u)\n", profile_thread.c_str(), only);
+                else
+                    std::fprintf(stderr, "boot: --profile-thread: no running thread named \"%s\"; all of them\n",
+                                 profile_thread.c_str());
             }
             // the generated functions named for the samples a game library's
             // missing symbols leave unnamed
@@ -341,12 +342,9 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                 }
             sampler::name_generated(hosts.data(), guests.data(), hosts.size());
             // the first tier's code: by stencil with XF_STENCIL_MAP=1, else by function
-            if (g.stencil)
+            if (game::has_tier_code(g))
                 sampler::name_with([&g](uint64_t address, std::string &name, uint64_t &displacement) {
-                    if (g.stencil->describe(address, name, displacement)) return true;
-                    for (auto &d : g.stencil_dlls)
-                        if (d->describe(address, name, displacement)) return true;
-                    return false;
+                    return game::describe_tier_code(g, address, name, displacement);
                 });
             if (!sampler::start(1000, only)) std::fprintf(stderr, "boot: --profile is not supported on this host\n");
         }
@@ -364,7 +362,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     }
 
     if (profiling) {
-        double span = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() - profile_started;
+        double span =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() - profile_started;
         uint64_t swapped = swaps() - profile_swaps;
         double cpu = sampler::process_cpu_seconds() - profile_cpu;
         std::printf("profile: %.1f s, %.2f swaps a second, %.1f ms of CPU (all threads) a swap\n", span,
@@ -410,8 +409,10 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             std::vector<std::string> args;
             for (int i = 0; i < argc; i++) {
                 std::string a = argv[i];
-                if ((a == "--xex" || a == "--seconds" || a == "--launch-data") && i + 1 < argc) i++;
-                else args.push_back(a);
+                if ((a == "--xex" || a == "--seconds" || a == "--launch-data") && i + 1 < argc)
+                    i++;
+                else
+                    args.push_back(a);
             }
             double used = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             args.insert(args.end(),

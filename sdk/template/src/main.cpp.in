@@ -1,0 +1,27 @@
+// @PORT_TITLE@ on XenoForge: the port's main (XenoForge's docs/sdk.md, "A
+// port's main"). xenoforge_add_port builds it twice: player_@PORT_NAME@ (a
+// window, input, sound) and, with XF_PORT_BOOT, boot_@PORT_NAME@ (headless).
+
+#include <xenoforge/run.h>
+
+#include <cstdio>
+
+namespace {
+// The port's options: --option <key>=<value>, [port] in the player's
+// config.toml, or the overlay (F1).
+bool g_log_start = false;
+} // namespace
+
+int main(int argc, char **argv) {
+    xf::PortInfo port;
+    port.name = "@PORT_TITLE@";
+    port.options.push_back(xf::PortOption::boolean("log_start", "Log when the game starts", g_log_start));
+    // the game opened (executable loaded, kernel made, options read), its main
+    // thread not started: run-time hooks (xenoforge/port.h) and a native
+    // renderer (xenoforge/native_render.h) are set up here
+    port.on_init = [](xf::kernel::Kernel &) {
+        if (g_log_start) std::printf("@PORT_TITLE@: starting\n");
+    };
+    port.on_shutdown = [](xf::kernel::Kernel &) {};
+    return xf::run(argc, argv, port);
+}

@@ -1575,16 +1575,6 @@ bool Build::link(const fs::path &bin, const fs::path &work, const std::vector<Jo
 
 } // namespace
 
-fs::path default_cache_dir() {
-#ifdef _WIN32
-    if (const char *local = std::getenv("LOCALAPPDATA")) return fs::path(local) / "xenoforge" / "cache";
-#else
-    if (const char *xdg = std::getenv("XDG_CACHE_HOME")) return fs::path(xdg) / "xenoforge";
-    if (const char *home = std::getenv("HOME")) return fs::path(home) / ".cache" / "xenoforge";
-#endif
-    return fs::temp_directory_path() / "xenoforge-cache";
-}
-
 std::optional<CachedGame> find_cached(const fs::path &cache_dir, std::string_view digest) {
     const std::string normal = normal_digest(digest);
     if (normal.empty()) return std::nullopt;

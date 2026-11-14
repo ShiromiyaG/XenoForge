@@ -1,0 +1,8 @@
+build/
+CMakeUserPresets.json
+# nothing of the game goes in: discs, executables, extracted files, dumps
+*.iso
+*.xex
+*.xexp
+assets/
+re/

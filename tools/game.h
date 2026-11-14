@@ -12,14 +12,12 @@
 
 #pragma once
 
-#include "xenoforge/game_build.h"
 #include "xenoforge/input.h"
 #include "xenoforge/kernel.h"
 #include "xenoforge/memory.h"
 #include "xenoforge/patches.h"
 #include "xenoforge/port_module.h"
 #include "xenoforge/renderer.h"
-#include "xenoforge/stencil.h"
 #include "xenoforge/vk_device.h"
 #include "xenoforge/xex.h"
 
@@ -43,8 +41,8 @@ struct Options {
     std::filesystem::path storage;        // the storage root (content/, cache*/)
     kernel::SystemSettings system;        // the console's language, country and video the player chose
     kernel::ContentFormat content_format = kernel::ContentFormat::Stfs; // how new saves are kept
-    uint64_t steps = 2'000'000'000ull;    // the interpreter's instructions per entry
-    bool interpret = false;               // the generated code left out (linked, or a game library)
+    uint64_t steps = 2'000'000'000ull;                                  // the interpreter's instructions per entry
+    bool interpret = false; // the generated code left out (linked, or a game library)
     // Generated code linked into the executable (xfrecomp emit's modules.cpp: a
     // table per module), when there is any; else the game library below.
     const ppc::GeneratedModule *const *modules = nullptr;
@@ -93,37 +91,17 @@ struct Options {
     std::function<std::map<std::string, bool>(uint32_t title_id)> patch_choices;
 };
 
+// The game library and the first tier's state (game_tiers.cpp): the
+// copy-and-patch code, the tier-up, the entry log. Opaque here, so a port's
+// executables, which link their generated code, link none of it.
+struct Tiers;
+
 struct Game {
-    // where the kernel logs the addresses it enters the interpreter at, with
-    // a cached game library loaded (D3; first, so it outlives the kernel)
-    build::EntryLog entry_log;
-    // the copy-and-patch tier's code (stencil.h): the executable's, its table
-    // as the kernel is given it, and the DLLs' made as they load; kept until
-    // the kernel is gone, also after the tier-up (frames may still run there)
-    std::unique_ptr<stencil::Module> stencil;
-    const ppc::GeneratedModule *stencil_table[1] = {};
-    std::vector<std::unique_ptr<stencil::Module>> stencil_dlls;
-    bool stencil_counting = false;
-    // which code runs the guest (tier_name), and whether the run moves to the
-    // game library when the cache gets one (poll_tier_up)
+    // the tiers' state (first, so it outlives the kernel: the kernel holds its
+    // entry log and the tier's code until it is gone, also after the tier-up)
+    std::shared_ptr<Tiers> tiers;
+    // which code runs the guest (tier_name)
     enum class Tier { Interpreter, Linked, Library, Stencil } tier = Tier::Interpreter;
-    bool tier_up = false;
-    double tier_up_polled = -1e9; // when the cache was last looked at (seconds, steady clock)
-    const ppc::GameLibrary *tier_up_library = nullptr; // loaded, waiting for a pause
-    // Hot functions first (docs/runtime.md): the tier's heat written for the
-    // background build (the hot list), the partial library adopted once the
-    // cache has it, and the entries counted from then
-    double started = 0;                                // the tier's start (seconds, steady clock)
-    double hot_list_written = -1e9;                    // the hot list's last writing
-    const ppc::GameLibrary *partial_library = nullptr; // adopted (nullptr: none yet)
-    uint64_t partial_tier_entries = 0;                 // the tier's entries when it was adopted
-    bool partial_failed = false;                       // it did not load: not tried again
-    int tier_up_failures = 0;                          // the library's loads that failed
-    // Releasing the first tier (docs/runtime.md): after the tier-up, the code
-    // no frame is in released at pauses, a few times
-    int release_tries = 0;
-    double release_polled = -1e9;
-    size_t released_bytes = 0;
     Xex xex;
     // the executable's image digest before any patch, and the game library's cache key: the digest
     // alone, or with the enabled code patches' key (patches::cache_key)
@@ -134,8 +112,8 @@ struct Game {
     std::unique_ptr<kernel::Kernel> kernel;
     std::unique_ptr<vk::Device> device;
     std::unique_ptr<render::Renderer> renderer;
-    std::unique_ptr<gpu::TraceWriter> trace; // in front of the renderer, when frames are traced
-    size_t generated_modules = 0, generated_functions = 0; // the generated code installed (none: interpreted)
+    std::unique_ptr<gpu::TraceWriter> trace;                        // in front of the renderer, when frames are traced
+    size_t generated_modules = 0, generated_functions = 0;          // the generated code installed (none: interpreted)
     const ppc::GeneratedModule *const *installed_modules = nullptr; // its tables (linked, or the game library's)
     // the cache (Options::cache, else default_cache_dir()): the title's
     // pipeline cache and shader storage are kept there by default
@@ -187,6 +165,32 @@ const char *tier_name(const Game &game);
 // function entries are moved to it. True when it happened (the line saying
 // so printed). Call it from the loop that waits for the game.
 bool poll_tier_up(Game &game);
+// The first tier's code at a host address, by function (or by stencil with
+// XF_STENCIL_MAP=1), for boot's --profile; has_tier_code: whether there is any.
+bool has_tier_code(const Game &game);
+bool describe_tier_code(Game &game, uint64_t address, std::string &name, uint64_t &displacement);
+
+// The game library and the first tier for a game with no code linked in
+// (game_tiers.cpp), given to open, poll_tier_up and print_report through this
+// table. Only the generic boot and player turn them on (enable_tiers, from
+// their main: tools/stub_main.cpp); a port's executables never do, so they
+// link nothing of the recompiler, the copy-and-patch tier or the recompile
+// step (docs/sdk.md, "What a port links").
+struct TierSupport {
+    void (*open)(const Options &options, Game &game); // the cached library, else the first tier
+    bool (*poll)(Game &game);                         // poll_tier_up
+    void (*report)(Game &game);                       // print_report's lines on them
+    bool (*has_code)(const Game &game);
+    bool (*describe)(Game &game, uint64_t address, std::string &name, uint64_t &displacement);
+};
+void set_tier_support(const TierSupport *support);
+void enable_tiers(); // game_tiers.cpp
+
+// The process's resident memory (its working set on Windows) and its private
+// memory (its commit charge on Windows, else what is resident), in bytes; 0
+// where not known.
+uint64_t resident_bytes();
+uint64_t process_bytes();
 
 // The modules, the interpreter's entries, the kernel calls, what the GPU,
 // the sound and the input did, the port's hook calls (--hook-stats), and the
@@ -202,8 +206,8 @@ void print_report(Game &game, bool waiting);
 // stall, stopped, ended, crash) with `detail` (the stop reason, the fault),
 // `stack` (the guest stack of a crash or stop, one line, as functions) and
 // `report` (the crash report's file).
-void print_summary(Game &game, const std::string &state, const std::string &detail = {},
-                   const std::string &stack = {}, const std::string &report_file = {});
+void print_summary(Game &game, const std::string &state, const std::string &detail = {}, const std::string &stack = {},
+                   const std::string &report_file = {});
 
 // Where crash and stop reports are written (crash-<time>.txt; the current
 // directory by default, XF_CRASH_DIR, or boot's --crash-dir).
@@ -218,7 +222,7 @@ std::string write_stop_report(Game &game);
 struct Rates {
     double last_wall = 0, last_busy = 0, last_busy_wall = 0;
     uint64_t last_swaps = 0, last_draws = 0, last_resolves = 0;
-    uint64_t last_texture_loads = 0; // the renderer's, at its last report
+    uint64_t last_texture_loads = 0;            // the renderer's, at its last report
     uint64_t last_run_ns = 0, last_wait_ns = 0; // the command processor's thread
 };
 void print_rates(Game &game, Rates &rates, double wall_seconds, const std::string &extra = {});
@@ -228,8 +232,8 @@ void print_rates(Game &game, Rates &rates, double wall_seconds, const std::strin
 std::string disc_path(std::string path);
 // The command line of the process that runs the title this one launched (boot --follow-launches, the player's
 // follow_launches): `args` as this process got them (argv[0] first) without the options named in `replace` (each
-// with its value), then those with a value appended with it (an empty value only drops the option). What decides which title follows is
-// disc_path; how it is started (a process here, in the launcher's process on Android) is the caller's.
+// with its value), then those with a value appended with it (an empty value only drops the option). What decides which
+// title follows is disc_path; how it is started (a process here, in the launcher's process on Android) is the caller's.
 std::vector<std::string> relaunch_args(const std::vector<std::string> &args,
                                        const std::vector<std::pair<std::string, std::string>> &replace);
 

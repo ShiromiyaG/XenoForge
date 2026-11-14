@@ -1,5 +1,5 @@
 # A port that draws its own frames (docs/sdk.md, "Native rendering"), built on
-# an installed XenoForge as examples/minimal_port is:
+# an installed XenoForge as sdk/examples/minimal_port is:
 #
 #   cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH=<XenoForge's prefix> -DNATIVE_ISO=<disc image>
 #   cmake --build build

@@ -5,6 +5,63 @@ XenoForge, as a port builds against the rexglue fork today. The port
 holds its own code (hooks, replacements, native rendering, options), a project
 file for the recompiler and a few lines of CMake; XenoForge holds the system.
 The disc is never in the repository: the port builds from the player's own ISO.
+The port's repository carries none of XenoForge's code: it sees XenoForge's
+port API (a handful of headers) and links its libraries, and its executables
+take from them only what a game with its code linked in uses.
+
+## Where the SDK is in this repository
+
+Everything a port is made from is under `sdk/`; the runtime it links is the
+rest of the tree.
+
+```
+sdk/install.cmake            the package: what `cmake --install --component sdk` puts in the prefix
+sdk/XenoForgeConfig.cmake.in find_package(XenoForge): the imported targets, by hand
+sdk/xenoforge_port.cmake     xenoforge_add_port (also the repository's own XF_GAMES)
+sdk/game_library/            the project that compiles a port's generated code
+sdk/new_port.cmake           a new port's repository from sdk/template/
+sdk/template/                that repository: CMake, presets, main, hooks, project file
+sdk/examples/                minimal_port, native_port (tests/sdk_test.cmake builds them)
+```
+
+## Starting a port
+
+```
+cmake --install <XenoForge's build> --component sdk --prefix <sdk>
+cmake -DNAME=mygame "-DTITLE=My Game" -DDIR=<new repository> -DISO=<disc image> -P <sdk>/share/xenoforge/new_port.cmake
+cd <new repository>
+cmake --preset local
+cmake --build --preset local
+build/boot_mygame <disc image> --seconds 20
+```
+
+`new_port.cmake` writes the repository from `sdk/template` (`NAME`: the
+targets' name, letters, digits and `_`; `TITLE`: the window's title; `DIR`:
+`./<NAME>` by default, empty or new; `ISO`: optional):
+
+| file | what |
+|---|---|
+| `CMakeLists.txt` | `find_package(XenoForge <the SDK's version>)` from `XENOFORGE_SDK` (cache or environment) or `CMAKE_PREFIX_PATH`, then `xenoforge_add_port` on `GAME_ISO` with `project.toml` (or on `GAME_GENERATED_DIR`, code emitted earlier) |
+| `CMakePresets.json` | `default`: Ninja, clang, RelWithDebInfo, `build/` |
+| `CMakeUserPresets.json` | `local`: `default` with this machine's SDK prefix and disc; not versioned |
+| `src/main.cpp` | the port's main: its name, an option, `on_init` and `on_shutdown` |
+| `src/hooks.cpp` | the hooks, a module reloaded while the game runs (`PORT_HOT_RELOAD`, on by default) |
+| `project.toml` | the recompiler's project file, empty |
+| `README.md`, `.gitignore` | the build and run lines; discs, executables and `build/` kept out |
+
+## What a port links
+
+Its executables link the port's code, its generated code and the runtime:
+the kernel, the renderer, the player or boot. Not the recompiler: the
+generic boot and player load a game's code from the cache (the game library)
+or make it at start (the copy-and-patch tier), and that part of them
+(`tools/game_tiers.cpp`: the library loader and tier-up, the tier, the
+recompiler's discovery and the recompile step's cache code it calls) is
+reached only through a table their main turns on (`game::enable_tiers`,
+`tools/stub_main.cpp`). A port's main (`xf::run`) never does, so the linker
+leaves all of it out: on the SDK's examples, 11.5 to 9.6 MB for boot and
+16.8 to 14.9 MB for the player (2026-11-14). The recompiler runs at build
+time, as `xfrecomp` from the package's `bin/`.
 
 ## The package
 
@@ -14,16 +71,26 @@ is the player's flat folder, `docs/runtime.md`, "Shipping the player"; a plain
 
 ```
 bin/                         xfrecomp, xfinspect, ffmpeg-xma.dll (+ LICENSE-ffmpeg)
-include/xenoforge/           every public header, with the generated code's
-                             (game_library.h, ppc_runtime.h, ppc_context.h, ...)
-                             and run.h; whatever lands in include/xenoforge ships
+include/xenoforge/           the port's API (run.h, port.h, native_render.h,
+                             port_module.h), the generated code's (ppc_generated.h,
+                             ppc_module.h, game_library.h, ppc_runtime.h, and the
+                             interface version, game_interface.h) and what those
+                             include (kernel.h, memory.h, ppc_context.h, xex.h,
+                             vk_device.h, ...): 25 headers, not XenoForge's other 47
 lib/                         xenoforge, xenoforge_kernel (an archive of the kernel's
                              objects), xenoforge_vk, xenoforge_boot and, with the
                              player, xenoforge_player, xf_frontend, xf_imgui, SDL3-static
 lib/cmake/XenoForge/         XenoForgeConfig.cmake, its version file,
                              xenoforge_port.cmake, game_library/, sdl3_system_libs.txt
-share/xenoforge/             LICENSE, LICENSE-xenia, LICENSE-rexglue
+share/xenoforge/             LICENSE, LICENSE-xenia, LICENSE-rexglue,
+                             new_port.cmake and template/ (Starting a port)
 ```
+
+The headers are found at configure time from the API's list
+(`XF_SDK_API_HEADERS` in `sdk/install.cmake`) through their `#include
+"xenoforge/..."` lines, so a header the API comes to include ships with it;
+a header a port needs that is not reached so belongs in that list (and is
+then part of the API).
 
 `find_package(XenoForge REQUIRED)` (with `CMAKE_PREFIX_PATH` set to the prefix)
 gives these imported targets: `XenoForge::core` (the recompiled code's
@@ -259,7 +326,7 @@ port.options.push_back(xf::PortOption::boolean("native_render", "Native renderer
   registers; `read_words`, `read_floats`, `read_indices` read guest memory
   swapped as the GPU swaps it. On the CPU side, a hook reads the engine's
   structures with `xenoforge/port.h` (`be<T>`, `load<T>`).
-- **Shaders.** SPIR-V the port compiles itself: `examples/native_port`'s
+- **Shaders.** SPIR-V the port compiles itself: `sdk/examples/native_port`'s
   CMakeLists runs glslc (the Vulkan SDK's) and includes the words with
   `-mfmt=num`. XenoForge itself needs no Vulkan SDK (its package carries
   Vulkan's headers and volk, `XenoForge::volk`: Vulkan's functions are
@@ -268,13 +335,13 @@ port.options.push_back(xf::PortOption::boolean("native_render", "Native renderer
   shaders of its own needs no SDK either, and one with them can commit the
   words as XenoForge does (`cmake/vulkan.cmake`, `xf_spirv`).
 
-`examples/native_port` is the test port: the guest's last front buffer
+`sdk/examples/native_port` is the test port: the guest's last front buffer
 (through `Frame::texture`), tinted, with a spinning triangle (through
 `Frame::upload`) over it; `--capture <hex address>` hooks a guest function
 with `xf::port::before` and yields every frame it was not called in. Options
 `native_render`, `suppress` (skip the emulated work, else draw over it) and
 `background`. Inside XenoForge's build, `-DXF_NATIVE_PORT_GAME=<one of
-XF_GAMES>` builds it as `build/examples/native_port/{player,boot}_native`.
+XF_GAMES>` builds it as `build/sdk/examples/native_port/{player,boot}_native`.
 
 ## Building and running a port
 
@@ -285,17 +352,20 @@ build/boot_mygame <iso> --seconds 20          # headless: the report and the xf-
 build/player_mygame <iso> [--quit-after 20]   # a window
 ```
 
-`examples/minimal_port` is the smallest port: a main, an empty project file
+`sdk/examples/minimal_port` is the smallest port: a main, an empty project file
 and the CMake above (`-DMINIMAL_ISO=<iso>`). The project file's schema is in
 `docs/recompiler.md`, "The project file".
 
 ## Checks
 
 - `ctest -R sdk` (tests/sdk_test.cmake): installs the `sdk` component to a
-  temporary prefix, configures and builds `examples/minimal_port` against it on
+  temporary prefix, configures and builds `sdk/examples/minimal_port` against it on
   an empty generated-code table (`tests/sdk/modules.cpp`), and runs what it
-  built; then `examples/native_port` the same way when glslc is found. It
+  built; then `sdk/examples/native_port` the same way when glslc is found. It
   checks the package (headers, libraries, imported targets, the function, the
-  runtime files, a port's own shaders), not a game's recompile.
+  runtime files, a port's own shaders), not a game's recompile. Then a port
+  made by the installed `new_port.cmake` is configured and built the same way
+  (its hooks module included), and the package is checked to hold no header
+  outside the API's (`renderer.h`, `recomp.h`, `stencil.h`).
 - By hand, a real port end to end: the example with `-DMINIMAL_ISO=<a disc>`,
   then `boot_minimal <disc> --seconds 20`.

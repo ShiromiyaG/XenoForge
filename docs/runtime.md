@@ -3071,7 +3071,7 @@ results are the same at every level: without FMA, `lib::fma` (the PPC's
 fused forms, the slow path's, and VMX's vmaddfp and vnmsubfp a lane at a
 time) is the C library's through the runtime's table: exact, slow. The
 statically linked games and the tests take `-DXF_GAME_CPU_LEVEL=v3|v2`
-(CMake cache, v3 by default; `cmake/xenoforge_port.cmake`).
+(CMake cache, v3 by default; `sdk/xenoforge_port.cmake`).
 
 Such an executable (boot_<game>, player_<game>, an SDK port, the tests with
 generated code) checks the level before any of that code runs

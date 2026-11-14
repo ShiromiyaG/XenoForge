@@ -5852,7 +5852,7 @@ port's filter selects; nothing in it knows a game.
   swap, one branch a draw and a resolve; replay_test is unchanged.
 - **Measured** (game B's first 30 s, its intros and logos: about 5 draws and
   3 resolves a swap, guest-paced at 60 then 32 swaps a second;
-  `examples/native_port`, `XF_GPU_TIME=1`). Boot with `--render`: emulated,
+  `sdk/examples/native_port`, `XF_GPU_TIME=1`). Boot with `--render`: emulated,
   1102 swaps, 1.87 s of GPU time and 0.8 s in the renderer's calls; the
   port's frames with everything skipped, 1116 swaps, 0.02 s of GPU time (the
   port's frame 17 µs a swap) and 0.2 s, 5389 draws and 3347 resolves skipped;

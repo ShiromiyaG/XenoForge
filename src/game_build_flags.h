@@ -12,7 +12,7 @@ namespace xf::build {
 
 // The instruction set a CPU level allows (cpu_level.h). The statically
 // linked games and the tests take the same from XF_GAME_CPU_LEVEL
-// (cmake/xenoforge_port.cmake's xenoforge_cpu_level_flags).
+// (sdk/xenoforge_port.cmake's xenoforge_cpu_level_flags).
 //
 // At v3 the vectorizer is told to prefer 128-bit vectors: the guest's own
 // are 128-bit (VMX128), and widening its loops to 256 bits made the code
