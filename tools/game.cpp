@@ -11,10 +11,12 @@
 #include "xenoforge/hooks.h"
 #include "xenoforge/lockstep.h"
 #include "xenoforge/native_render.h"
+#include "xenoforge/recomp.h"
 #include "xenoforge/shader_storage.h"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -211,6 +213,54 @@ void load_game_library(const Options &options, Game &g) {
     }
 }
 
+uint64_t process_bytes();
+
+// The copy-and-patch tier (XF_TIER=stencil; stencil.h): the executable's
+// functions discovered and made into code now, its table given to the kernel
+// as a game library's is. XF_STENCIL_COUNT=1 counts the instructions its code
+// runs (the report compares them with the interpreter's).
+void load_stencil_tier(const Options &options, Game &g) {
+    std::string error;
+    std::string why;
+    if (!stencil::available(&why)) {
+        std::printf("copy-and-patch tier: not available (%s)\n", why.c_str());
+        return;
+    }
+    const uint64_t before = process_bytes();
+    const auto t0 = std::chrono::steady_clock::now();
+    recomp::Image image;
+    if (!recomp::read_image(g.xex, image, error)) {
+        std::printf("copy-and-patch tier: %s\n", error.c_str());
+        return;
+    }
+    const recomp::Discovery d = recomp::discover(image);
+    const double discovered = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const uint64_t peak_discovery = process_bytes();
+    static const ppc::Runtime runtime = ppc::host_runtime();
+    stencil::Options o;
+    if (const char *count = std::getenv("XF_STENCIL_COUNT"); count && *count && *count != '0') o.count = true;
+    stencil::Stats s;
+    g.stencil = stencil::compile(image, d, runtime, options.xex_path, image_digest(g.xex.image), o, s, error);
+    if (!g.stencil) {
+        std::printf("copy-and-patch tier: %s\n", error.c_str());
+        return;
+    }
+    const uint64_t peak = process_bytes();
+    g.stencil_counting = o.count;
+    g.stencil_table[0] = g.stencil->table();
+    g.kernel->set_generated_modules(g.stencil_table, 1);
+    g.generated_modules = 1, g.generated_functions = s.compiled, g.installed_modules = g.stencil_table;
+    std::printf("copy-and-patch tier: %zu of %zu functions (%llu of %llu instructions), %llu stencils copied, "
+                "%.1f MB of code (%.1f MB in all, %zu unwind entries); discovery %.3f s, the copies %.3f s; the "
+                "process's memory %+.1f MB after discovery, %+.1f MB after the copies%s\n",
+                s.compiled, s.functions, (unsigned long long)s.compiled_instructions,
+                (unsigned long long)s.instructions, (unsigned long long)s.copies, s.code_bytes / 1048576.0,
+                s.region_bytes / 1048576.0, s.unwind_entries, discovered, s.seconds,
+                (double(peak_discovery) - double(before)) / 1048576.0, (double(peak) - double(before)) / 1048576.0,
+                o.count ? " (counting instructions)" : "");
+    for (const auto &[reason, n] : s.left_out) std::printf("  left to the interpreter: %zu %s\n", n, reason.c_str());
+}
+
 } // namespace
 
 bool open(const Options &options, Game &g, std::string &error) {
@@ -276,6 +326,8 @@ bool open(const Options &options, Game &g, std::string &error) {
             g.installed_modules = options.modules;
         std::printf("generated code: %zu modules, %zu functions%s\n", options.module_count, functions,
                     options.interpret ? " (left out: --interpret)" : "");
+    } else if (!options.interpret && stencil::requested()) {
+        load_stencil_tier(options, g);
     } else if (!options.interpret) {
         load_game_library(options, g);
     }
@@ -478,6 +530,24 @@ void print_report(Game &g, bool waiting) {
     std::sort(entered.rbegin(), entered.rend());
     std::printf("interpreted entries: %llu, at %zu addresses\n", (unsigned long long)k.interpreted_entries(),
                 entered.size());
+    if (g.stencil_counting) {
+        // the copy-and-patch tier's coverage: the share of the guest's instructions its code ran
+        const uint64_t run = g.stencil->executed(), interpreted = k.interpreted_instructions();
+        std::printf("copy-and-patch tier: %llu instructions run in its code, %llu in the interpreter (%.2f%% "
+                    "covered)\n",
+                    (unsigned long long)run, (unsigned long long)interpreted,
+                    run + interpreted ? 100.0 * double(run) / double(run + interpreted) : 0.0);
+        // the commonest instructions in its code
+        std::vector<std::pair<uint64_t, uint32_t>> by_op;
+        for (uint32_t op = 0; op < ppc::OPCODE_COUNT; op++)
+            if (g.stencil->executed_by_opcode()[op]) by_op.push_back({g.stencil->executed_by_opcode()[op], op});
+        std::sort(by_op.rbegin(), by_op.rend());
+        std::printf("  the commonest:");
+        for (size_t k = 0; k < by_op.size() && k < 40; k++)
+            std::printf(" %s %.2f%%", ppc::info(ppc::Opcode(by_op[k].second)).name,
+                        100.0 * double(by_op[k].first) / double(run ? run : 1));
+        std::printf("\n");
+    }
     if (g.entry_log.size())
         std::printf("entry log: %zu addresses, %zu new this run\n", g.entry_log.size(), g.entry_log.added());
     for (size_t i = 0; i < entered.size() && i < 20; i++)
@@ -553,6 +623,18 @@ uint64_t resident_bytes() {
 }
 
 namespace {
+
+// The process's private memory in bytes (its commit charge on Windows, else
+// what is resident), for the copy-and-patch tier's report.
+uint64_t process_bytes() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) return counters.PagefileUsage;
+    return 0;
+#else
+    return resident_bytes();
+#endif
+}
 // a JSON string's body
 std::string json_escape(const std::string &text) {
     std::string out;

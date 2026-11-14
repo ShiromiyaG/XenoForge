@@ -108,6 +108,28 @@ add_custom_command(
     DEPENDS cmake/game_interface.cmake ${XF_GAME_INTERFACE_INPUTS}
     COMMENT "the game library's interface version")
 
+# The copy-and-patch tier's stencils (docs/recompiler.md, "A copy-and-patch
+# first tier"): src/stencil/stencils.cpp compiled by clang with the game
+# library's flags, its machine code and holes taken out of the object by
+# xfstencil into stencils.inc, which src/stencil_jit.cpp includes. With
+# another compiler or host the tier is left out (stencil.h's available()).
+target_sources(xenoforge PRIVATE src/stencil_jit.cpp)
+add_executable(xfstencil tools/xfstencil.cpp)
+target_include_directories(xfstencil PRIVATE include)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64")
+    set(XF_STENCIL_OUT ${CMAKE_CURRENT_BINARY_DIR}/stencil)
+    add_custom_command(
+        OUTPUT ${XF_STENCIL_OUT}/stencils.inc
+        COMMAND xfstencil ${CMAKE_CXX_COMPILER} ${CMAKE_CURRENT_SOURCE_DIR}/src/stencil/stencils.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/include ${XF_STENCIL_OUT}
+        DEPENDS xfstencil src/stencil/stencils.cpp src/stencil_format.h ${XF_GAME_INTERFACE_INPUTS}
+        COMMENT "the copy-and-patch tier's stencils")
+    target_sources(xenoforge PRIVATE ${XF_STENCIL_OUT}/stencils.inc)
+    target_include_directories(xenoforge PRIVATE ${XF_STENCIL_OUT})
+    set_source_files_properties(src/stencil_jit.cpp PROPERTIES COMPILE_DEFINITIONS XF_STENCIL_TIER=1
+                                OBJECT_DEPENDS ${XF_STENCIL_OUT}/stencils.inc)
+endif()
+
 # XMA decoded by FFmpeg's xmaframes decoder, as Xenia does (plan A6;
 # third_party/ffmpeg/ffmpeg.cmake): a shared library of its own (LGPL), fetched
 # unless XF_FFMPEG_DIR or xenia-canary's checkout has it, and loaded at run time
@@ -809,6 +831,16 @@ if(XF_PPC_TESTS_DIR)
     xenoforge_cpu_level_check(ppc_recompiled_test)
     add_test(NAME ppc_recompiled COMMAND ppc_recompiled_test)
     set_tests_properties(ppc_recompiled PROPERTIES ENVIRONMENT "XF_PPC_TESTS=${XF_PPC_TESTS_DIR}")
+    # and made into code by the copy-and-patch tier at run time, each case
+    # checked against the interpreter's run of it (docs/recompiler.md, "A
+    # copy-and-patch first tier")
+    if(XF_STENCIL_OUT)
+        add_executable(ppc_stencil_test tests/ppc_test.cpp)
+        target_compile_definitions(ppc_stencil_test PRIVATE XF_PPC_STENCIL)
+        target_link_libraries(ppc_stencil_test PRIVATE xenoforge)
+        add_test(NAME ppc_stencil COMMAND ppc_stencil_test)
+        set_tests_properties(ppc_stencil PROPERTIES ENVIRONMENT "XF_PPC_TESTS=${XF_PPC_TESTS_DIR}")
+    endif()
 endif()
 # The differential fuzzer (docs/recompiler.md, "The differential fuzzer"):
 # xffuzz makes the cases (a fixed seed) and recompiles them; ppc_fuzz_test runs

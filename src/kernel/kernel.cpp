@@ -888,6 +888,7 @@ void Kernel::run_from(ppc::Context &c, uint32_t pc) {
 
 void Kernel::interpret_from(ppc::Context &c, uint32_t pc, uint32_t until, uint32_t stack_top) {
     ppc::Stopped s = ppc::interpret(c, pc, until, step_limit, stack_top);
+    interpreted_steps_.fetch_add(s.steps, std::memory_order_relaxed);
     if (s.reason == ppc::Stopped::Unwound) {
         unwinds_thrown++;
         throw ppc::Unwind{s.pc};

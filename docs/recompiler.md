@@ -1530,3 +1530,185 @@ still from 4,096): on game B, the 11 files they changed went from 204 and
 s, the longest single file from 97 s to 25 s. Both, on game A: its 24
 files from 333 s to 246 s. (Each set compiled one file at a time, old and
 new interleaved, under other agents' builds.)
+
+## A copy-and-patch first tier (2026-11-13, a prototype)
+
+Asked: whether a game can run at once from code made in milliseconds out of
+the same semantics, between the interpreter and the game library the
+launcher's Prepare step builds with clang (4 to 6 minutes a game; LLVM IR
+would only save the front end, about 15% of it: "The compile time by
+optimization level" above). Copy-and-patch (Xu and Kjolstad, OOPSLA 2021;
+CPython 3.13's JIT does it the same way) makes code with no compiler at run
+time: clang compiles a template per instruction once, when XenoForge is
+built, and the run time copies the templates' machine code and writes their
+holes. Behind `XF_TIER=stencil` (boot and the player, in place of the game
+library; off by default).
+
+**The stencils** (`src/stencil/stencils.cpp`). One per instruction of the
+semantics, all 456, each `ops::run<op>(*c, Instr{word})` with the word a
+hole, then a tail call to the next stencil; and one per piece of the control
+flow `recomp_emit.cpp` writes in C++ (a return, a goto, a yield point, LR
+set, a call to another function's body, a call or a tail branch through
+dispatch, an invalid instruction, a jump table), the conditional ones once
+per BO value with BI a hole, so the compiler folds what BO decides as it does
+with the word a constant. They are compiled with the game library's flags
+(`game_build_flags.h`: `XF_GAME_LIBRARY`, freestanding, `-O2`, x86-64-v3),
+so they run the code the library would and reach the runtime through the
+same table (`ppc_runtime.h`'s `Runtime`, copied beside the code), plus
+`-ffunction-sections -fdata-sections -fno-jump-tables` (a jump table is data
+naming its function's code, which a copy per use cannot share). The holes
+are extern symbols:
+
+- three 32-bit values (`xf_hole_word`, `_a`, `_b`): only the low half of the
+  symbol's address is used (an empty asm keeps it in a register, so the
+  compiler neither folds it into an address nor assumes it is not null), so
+  the pc-relative field the compiler makes (x86-64: `lea rax, [rip+hole]`)
+  is written with whatever displacement gives those 32 bits, wherever the
+  code is (ARM64 the same with `adrp`/`add`: its pages reach 4 GB either way);
+- an address of data beside the code (`xf_hole_data`: a jump table's host
+  addresses, the instruction counter);
+- three code addresses (`xf_hole_next`, `_target`, `_call`).
+
+They chain with clang's `preserve_none` convention and `musttail` calls, as
+CPython's do: the context stays in one register (r12 on x86-64), a tail call
+is a jump, and no stencil saves a register for the next. A function's body is
+entered by a call and left by `ret`; `xf_st_entry`, a plain C++ function
+around it, is what the kernel's table holds (it saves the host's callee-saved
+registers, which `preserve_none` does not, once per entry from outside).
+Calls between functions given code call each other's bodies directly.
+
+**The extraction** (`tools/xfstencil.cpp`, a build step: clang, then
+`stencils.inc` in the build tree). It reads the object (COFF, or ELF with
+`-fPIC` and every symbol hidden, so a hole is a pc-relative field and never a
+GOT entry), takes each `xf_st_*` function's bytes and relocations and every
+helper and constant they reach (the slow paths kept out of line, the vector
+constants: copied once), and writes them as `stencil_format.h`'s kinds
+(`PcRel32`, `Abs64`; ARM64's `Branch26`, `AdrPage21`, the `Lo12` and `Movw`
+kinds are read from both formats but not patched yet). A last instruction
+that jumps to the next stencil is marked and left out of a copy that the next
+one follows. Windows' `.pdata` and `.xdata` give each stencil's unwind
+information, which the run time registers for every copy
+(`RtlAddFunctionTable`): an Unwind (a longjmp, a catch's continuation,
+"Stack switches") thrown through the tier's frames needs it (the test below
+checks that it crosses them; without it the process dies). 660 stencils,
+87 KB, and 251 helpers and constants; the step takes about two seconds.
+
+**At run time** (`src/stencil_jit.cpp`, `stencil.h`): discovery as the
+recompile step runs it (no entry log), then, per function, the emitter's
+walk and control flow stencil for line (the same yield points, so the
+deterministic clock is the same), each instruction's stencils copied and
+their holes written, branches inside the function linked to their targets'
+copies, calls and tail branches to functions given code linked to their
+bodies, everything else through the runtime's dispatch. A conditional branch
+whose taken path does more than jump (a back edge's yield point, a dispatch)
+takes it out of line, after the function. One reservation of a gigabyte
+holds the runtime's table, stubs to the C library's `memcpy` family, the
+shared pieces and their unwind information, then each function: its entry,
+its body, its out-of-line sequences, its jump tables. Written, then made
+read-only and executable. The result is a module's table (`ppc_module.h`)
+that the kernel is given as a game library's, so whatever the tier leaves out
+(a function with resume sites, one whose returns are checked or that branches
+to a stack switch) is interpreted from dispatch as code no library holds.
+
+**Checks.** `ppc_stencil_test` (with `XF_PPC_TESTS_DIR`, as
+`ppc_recompiled_test`): every case of the instruction tests made into code
+by the tier and run there, then compared with the interpreter's run of the
+same case, the whole context but `pc` and the memory the tests use, besides
+the expected values: 141,705 cases, all passing, none differing. And an
+exception thrown by a dispatch two calls deep in the tier's code is caught
+outside it.
+
+**Game B, the deterministic benchmark** (`boot <disc> --deterministic
+--spin-idle --seconds 7200 --until-swap 3000`, `XF_DETERMINISTIC_FORCE_MS=10000`;
+without it a run slower than the library is handed over by the host's
+clock, docs/runtime.md, and its hash is another), the scheduler's thread's
+processor time to the halt, the three in turn, three rounds (other agents'
+boots and builds beside them: the machine 5 to 50% busy):
+
+| | median | runs | ready after |
+| --- | --- | --- | --- |
+| the interpreter (`--interpret --steps 10^15`) | 103.3 s | 100.5, 111.8, 103.3 | at once |
+| the copy-and-patch tier | 20.2 s | 26.4, 20.2, 19.6 | 1.6 s (discovery 1.2-1.4 s, the copies 0.28-0.35 s) |
+| the game library (the cache's) | 6.7 s | 8.3, 6.7, 6.7 | 4 to 6 minutes of clang, once |
+
+So the tier runs the guest 5.1 times as fast as the interpreter and takes 3.0
+times the library's processor time (four earlier runs, unloaded: 19.4 to
+19.8 s against 6.7 to 7.0 s).
+
+The guest memory's hash is the same for the three (also at swaps 100 and
+1,500, and without `--spin-idle` at swap 100).
+
+- **Compile time and memory, the whole executable**: discovery 1.35 s, the
+  copies 0.31 s (21,675 of 21,720 functions, 1,855,008 stencils copied:
+  about six million instructions a second). The code takes 188 MB (the
+  library 61 MB), 110 bytes a guest instruction, with 716,511 unwind entries
+  (the copies of stencils that have a frame: every one with a slow path that
+  calls out); the process's commit charge rises by 65 MB during discovery
+  and 272 MB in all.
+- **Coverage** (`XF_STENCIL_COUNT=1`: a counter before each instruction,
+  by opcode): to swap 1,500, 9,275,863,954 guest instructions in the tier's
+  code and 386,726 in the interpreter, 99.996%; 2,580 interpreter entries at
+  18 addresses (the 45 functions left out are 43 with resume sites and 2
+  that switch stacks). The commonest instructions: addi 8.8%, bc 8.5%,
+  rlwinm 6.9%, lwz 6.8%, add 3.9%, ld 3.6%, std 3.6%, or 3.0%, vslh 2.9%,
+  stw 2.9%, cmpli 2.3%, vaddshs 2.2%.
+
+**Where the time goes.** A stencil reads its registers from the context and
+writes them back, and decodes its register fields from the word at run time
+(a shift and a mask each, and the `rA|0` test of the D forms is a branch); the
+library keeps a function's registers in host registers and folds the
+fields away. So addi is 15 host instructions in its stencil (a load from the
+context, a store, a branch on rA) and one or two in the library; rlwinm builds
+its mask from MB and ME at run time, about 35. Stencils with a slow path adjust the stack around it on the
+fast path too, and the code is three times the library's size, so it misses
+the instruction cache more.
+
+**What full coverage would take.** The semantics are all there (one stencil
+each); what is left is the control flow the emitter has and the tier does not
+yet, a day or two each:
+
+- checked returns (`XF_CHECKED_RETURN`) and resume sites (`resumable()`): an
+  entry that keeps LR and r1 for the body, and a body entered at a resume site
+  through a table, as the jump tables are;
+- the port's hooks (`XF_HOOKED`, mid-function hooks), for ports;
+- the DLLs a game loads (each module made into code as `XexLoadImage` loads
+  it; only the executable now);
+- ARM64 and Linux: the patcher for ARM64's kinds, and the unwind information
+  registered from `.eh_frame` (`__register_frame`); until then
+  `stencil::available()` says no outside Windows on x86-64, as a run
+  could not unwind through the copies.
+
+Faster code is the larger question. What would pay, in order: stencils that
+know more of their word (variants for the D forms with `rA` not 0, and with
+the base register r1 or r13, which drop the `rA|0` branch and the MMIO check:
+the variant's condition given to the compiler with `__builtin_assume`, the
+semantics unchanged); superinstructions for the commonest pairs (a compare
+and its branch: `cmpli`/`cmpi` then `bc` are about a sixth of the run); and
+the guest memory's base in a register beside the context (one load less an
+access, but `ops::host` reads it from the context: the semantics would have
+to take it as a parameter). None of these keeps registers in host registers
+across instructions, which is most of the library's lead; the paper's and
+Deegen's answer, a stencil per register allocation, multiplies the stencils
+by the cases.
+
+**Tier-up to the library.** The guest's state lives in the context between
+any two functions, in the tier and in the library alike, so changing tiers at
+a function's entry is always correct. The tier would count each function's
+entries (a counter in its entry, as the instruction counter is) and the
+launcher would build the hot functions' files first (the recompile step
+already compiles a module as files of 64 KB of the image), into a library
+holding only them (dispatch covers the rest). As each is loaded, at a safe
+point (the deterministic scheduler between slices; otherwise `Kernel::pause`),
+the kernel's table takes the library's functions and each one's body in the
+tier gets a jump to an adapter that calls the library's function (C++
+convention) and returns, so the direct calls already linked go there too.
+The tier's memory is freed once the library holds the whole module.
+
+**Go or no-go.** Go as the first tier: ready in under two seconds, five
+times the interpreter's speed, bit for bit the same run, from the same
+semantics with nothing described twice; it shortens the wait for the library
+to nothing, at the cost of a third of the library's speed while it lasts. Not
+a replacement for the library: closing the factor of three needs registers
+kept across instructions, which is a compiler. Full coverage of what the
+emitter does is about a week (the list above); the specializations, another
+week for perhaps a third of the gap.

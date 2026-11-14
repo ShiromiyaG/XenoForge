@@ -18,6 +18,7 @@
 #include "xenoforge/memory.h"
 #include "xenoforge/port_module.h"
 #include "xenoforge/renderer.h"
+#include "xenoforge/stencil.h"
 #include "xenoforge/vk_device.h"
 #include "xenoforge/xex.h"
 
@@ -76,6 +77,11 @@ struct Game {
     // where the kernel logs the addresses it enters the interpreter at, with
     // a cached game library loaded (D3; first, so it outlives the kernel)
     build::EntryLog entry_log;
+    // the copy-and-patch tier's code (XF_TIER=stencil; stencil.h), and its
+    // table as the kernel is given it: kept until the kernel is gone
+    std::unique_ptr<stencil::Module> stencil;
+    const ppc::GeneratedModule *stencil_table[1] = {};
+    bool stencil_counting = false;
     Xex xex;
     std::unique_ptr<Memory> memory;
     std::unique_ptr<kernel::Kernel> kernel;

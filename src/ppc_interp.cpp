@@ -41,15 +41,21 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
     auto entered = [&](uint32_t target, uint32_t from) {
         return hooked_page(target) && c.system->enter_hooked && c.system->enter_hooked(c, target, from);
     };
-    for (uint64_t step = 0; step < max_steps; step++) {
-        if (pc == until && uint32_t(c.r[1]) >= stack_top) return {Stopped::Returned, pc};
+    uint64_t step = 0;
+    auto stopped = [&](Stopped s) {
+        s.steps = step;
+        return s;
+    };
+    for (; step < max_steps; step++) {
+        if (pc == until && uint32_t(c.r[1]) >= stack_top) return stopped({Stopped::Returned, pc});
         if (hooked_page(pc) && c.system->mid_hook) [[unlikely]] {
             c.pc = pc;
             const uint32_t to = c.system->mid_hook(c, pc);
             if (to == 1) {
                 // a return, as blr
                 const uint32_t target = uint32_t(c.lr) & ~3u;
-                if (stack_top && target != until && uint32_t(c.r[1]) > stack_top) return {Stopped::Unwound, target};
+                if (stack_top && target != until && uint32_t(c.r[1]) > stack_top)
+                    return stopped({Stopped::Unwound, target});
                 pc = target;
                 continue;
             }
@@ -104,7 +110,7 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
                 if (taken && c.system && c.system->call && c.system->call(c, target)) break;
             } else if (taken && stack_top && target != until && uint32_t(c.r[1]) > stack_top) {
                 c.pc = pc;
-                return {Stopped::Unwound, target};
+                return stopped({Stopped::Unwound, target});
             }
             if (taken) next = target;
             break;
@@ -123,16 +129,16 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
             if (taken) next = target;
             break;
         }
-        case Opcode::Invalid: return {Stopped::Invalid, pc, op};
+        case Opcode::Invalid: return stopped({Stopped::Invalid, pc, op});
         default:
-            if (!IMPLEMENTED[size_t(op)]) return {Stopped::Unimplemented, pc, op};
+            if (!IMPLEMENTED[size_t(op)]) return stopped({Stopped::Unimplemented, pc, op});
             TABLE[size_t(op)](c, i);
             break;
         }
         if constexpr (watched) watch->after(c, pc, op);
         pc = next;
     }
-    return {Stopped::Steps, pc};
+    return stopped({Stopped::Steps, pc});
 }
 
 } // namespace

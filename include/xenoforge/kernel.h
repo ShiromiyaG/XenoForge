@@ -458,6 +458,8 @@ public:
     std::map<std::string, uint64_t> calls() const;
     std::map<std::string, uint64_t> unimplemented() const;
     uint64_t interpreted_entries() const { return interpreted_; }
+    // the guest instructions the interpreter ran (each run's steps)
+    uint64_t interpreted_instructions() const { return interpreted_steps_.load(std::memory_order_relaxed); }
     // the addresses the interpreter was entered at, and how often: with
     // generated code linked, what discovery missed
     std::unordered_map<uint32_t, uint64_t> interpreted_targets() const;
@@ -639,7 +641,7 @@ private:
     std::map<std::string, uint64_t> calls_, unimplemented_;
     std::set<std::string> unimplemented_logged_; // under counts_mutex_
     void each_import(const std::function<void(const Import &)> &visit) const;
-    std::atomic<uint64_t> interpreted_{0};
+    std::atomic<uint64_t> interpreted_{0}, interpreted_steps_{0};
     std::unordered_map<uint32_t, uint64_t> interpreted_targets_; // under counts_mutex_
     EntryHook entry_hook_ = nullptr;
     void *entry_hook_user_ = nullptr;

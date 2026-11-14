@@ -11,7 +11,11 @@
 // Without XF_PPC_TESTS there is nothing to run. Built with
 // XF_PPC_RECOMPILED (ppc_recompiled_test), each case calls the function
 // xfrecomp wrote for it instead of interpreting it, and dispatch() runs a
-// function of the same suite or the interpreter.
+// function of the same suite or the interpreter. Built with XF_PPC_STENCIL
+// (ppc_stencil_test), each suite's cases are made into code by the
+// copy-and-patch tier (stencil.h) and run there, and each case is run through
+// the interpreter too: the context and the memory they leave must be the
+// same, besides the expected values.
 
 #include "xenoforge/guest_space.h"
 #include "xenoforge/ppc_interp.h"
@@ -30,6 +34,74 @@
 
 namespace fs = std::filesystem;
 using namespace xf::ppc;
+
+#ifdef XF_PPC_STENCIL
+#include "xenoforge/game_library.h"
+#include "xenoforge/recomp.h"
+#include "xenoforge/stencil.h"
+namespace {
+std::map<uint32_t, void (*)(Context &)> functions; // the suite's, by address
+bool missing = false;
+Opcode missing_op = Opcode::Invalid;
+} // namespace
+namespace xf::ppc {
+constexpr uint32_t THROWS = 0x80001000; // a call there throws (unwind_check)
+void dispatch(Context &c, uint32_t target) {
+    if (target == THROWS) throw Unwind{target};
+    auto it = functions.find(target);
+    if (it != functions.end()) return it->second(c);
+    Stopped s = interpret(c, target, uint32_t(c.lr), 1'000'000);
+    if (s.reason != Stopped::Returned) missing = true, missing_op = s.op;
+}
+void invalid(Context &, uint32_t) { missing = true, missing_op = Opcode::Invalid; }
+} // namespace xf::ppc
+namespace {
+// A C++ exception thrown from a dispatch the tier's code made, two calls
+// deep in it (a stencil with a frame, then the call's), caught outside: as an
+// Unwind (ppc_module.h) crosses it, through the unwind information the tier
+// registers for its copies.
+bool unwind_check(uint8_t *base) {
+    const uint32_t start = 0x80000000;
+    const uint32_t words[] = {
+        0x48000011, // 80000000 bl 80000010
+        0x4E800020, // 80000004 blr
+        0x60000000, 0x60000000,
+        0x80640000, // 80000010 lwz r3, 0(r4)
+        0x48000FED, // 80000014 bl 80001000 (no function: dispatch, which throws)
+        0x4E800020, // 80000018 blr
+    };
+    xf::recomp::Image image;
+    image.base = image.entry = start;
+    for (uint32_t w : words)
+        for (int k = 3; k >= 0; k--) image.bytes.push_back(uint8_t(w >> (8 * k)));
+    image.sections.push_back({".text", start, uint32_t(image.bytes.size()), true, false});
+    xf::recomp::Discovery d;
+    for (auto [a, size] : {std::pair<uint32_t, uint32_t>{start, 8}, {start + 0x10, 12}}) {
+        xf::recomp::Function f;
+        f.address = a, f.size = size, f.source = xf::recomp::Source::Pdata;
+        d.functions[a] = f;
+    }
+    Runtime runtime = core_runtime();
+    runtime.dispatch = &dispatch;
+    runtime.invalid = &invalid;
+    xf::stencil::Stats stats;
+    std::string error;
+    auto module = xf::stencil::compile(image, d, runtime, "unwind", 0, {}, stats, error);
+    if (!module || module->table()->count != 2) return false;
+    static Context c;
+    std::memset(&c, 0, sizeof(c));
+    c.base = base;
+    c.r[4] = 0x100;
+    volatile int after = 0;
+    try {
+        module->table()->functions[0].fn(c);
+    } catch (const Unwind &u) {
+        after = u.target == THROWS ? 1 : 2;
+    }
+    return after == 1 && c.lr == start + 0x18;
+}
+} // namespace
+#endif
 
 #ifdef XF_PPC_RECOMPILED
 #include "xenoforge/ppc_generated.h"
@@ -206,6 +278,11 @@ int main(int argc, char **argv) {
     static uint64_t ticks = 0;
     System system;
     system.time_base = [](Context &) { return ++ticks; };
+#ifdef XF_PPC_STENCIL
+    system.unimplemented = [](Context &, Opcode op, uint32_t) {
+        if (!missing) missing = true, missing_op = op;
+    };
+#endif
 #ifdef XF_PPC_RECOMPILED
     for (size_t k = 0; k < xf_test_function_count; k++)
         functions[{xf_test_functions[k].suite, xf_test_functions[k].address}] = xf_test_functions[k].fn;
@@ -214,7 +291,13 @@ int main(int argc, char **argv) {
     };
 #endif
 
+#ifdef XF_PPC_STENCIL
+    if (!unwind_check(space.base()))
+        return std::printf("copy-and-patch: an exception did not cross the tier's code\n"), 1;
+    std::printf("copy-and-patch: an exception crossed the tier's code\n");
+#endif
     Totals totals;
+    [[maybe_unused]] uint64_t stencil_cases = 0, differ = 0;
     for (const fs::path &source : sources) {
         std::string suite = source.stem().string();
         if (!filters.empty() && std::none_of(filters.begin(), filters.end(),
@@ -225,38 +308,117 @@ int main(int argc, char **argv) {
         std::ifstream b(fs::path(source).replace_extension(".bin"), std::ios::binary);
         std::vector<uint8_t> code((std::istreambuf_iterator<char>(b)), std::istreambuf_iterator<char>());
         uint64_t suite_failed = 0, suite_missing = 0;
+#ifdef XF_PPC_STENCIL
+        // the suite's cases as functions (each up to the next), made into code
+        std::unique_ptr<xf::stencil::Module> module;
+        functions.clear();
+        {
+            xf::recomp::Image image;
+            image.base = image.entry = START;
+            image.bytes = code;
+            image.sections.push_back({".text", START, uint32_t(code.size()), true, false});
+            std::vector<uint32_t> starts;
+            for (const TestCase &t : cases) starts.push_back(t.address);
+            std::sort(starts.begin(), starts.end());
+            starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+            xf::recomp::Discovery d;
+            for (size_t k = 0; k < starts.size(); k++) {
+                xf::recomp::Function f;
+                f.address = starts[k];
+                f.size = (k + 1 < starts.size() ? starts[k + 1] : START + uint32_t(code.size())) - starts[k];
+                f.source = xf::recomp::Source::Pdata;
+                d.functions[f.address] = f;
+            }
+            Runtime runtime = core_runtime();
+            runtime.dispatch = &dispatch;
+            runtime.invalid = &invalid;
+            runtime.unwind = [](Context &) { std::abort(); };
+            runtime.switch_stack = [](Context &, uint32_t, uint32_t) { std::abort(); };
+            xf::stencil::Stats stats;
+            std::string error;
+            module = xf::stencil::compile(image, d, runtime, suite, 0, {}, stats, error);
+            if (!module) return std::printf("the copy-and-patch tier: %s\n", error.c_str()), 1;
+            const GeneratedModule *table = module->table();
+            for (size_t k = 0; k < table->count; k++) functions[table->functions[k].address] = table->functions[k].fn;
+        }
+#endif
         for (TestCase &t : cases) {
             if (!all && skip.count(t.name)) {
                 totals.skipped++;
                 continue;
             }
-            // fresh memory and registers, as Xenia's Setup per test
-            // (the tests touch the first 64 KB, 0x100000 on, and Xenia's heap)
-            std::memset(space.base(), 0, 0x10000);
-            std::memset(space.base() + 0x100000, 0, 0x10000);
-            std::memset(space.base() + 0x10000000, 0, 0x10000);
-            std::memcpy(space.base() + START, code.data(), code.size());
             static Context c;
-            std::memset(&c, 0, sizeof(c));
-            c.base = space.base();
-            c.lr = SENTINEL;
-            c.msr = 0x9030; // Xenia's ThreadState, "dumped from a real 360"
-            c.system = &system;
-            for (auto &[key, value] : t.annotations) {
-                size_t space_at = value.find(' ');
-                std::string reg = value.substr(0, space_at), v = space_at == std::string::npos ? "" : value.substr(space_at + 1);
-                int n;
-                if (key == "REGISTER_IN") {
-                    if (std::sscanf(reg.c_str(), "r%d", &n) == 1) c.r[n] = parse_u64(v);
-                    else if (std::sscanf(reg.c_str(), "f%d", &n) == 1) c.f[n] = parse_double(v);
-                    else if (std::sscanf(reg.c_str(), "v%d", &n) == 1) c.v[n] = parse_vec(v);
-                    else if (reg == "cr") c.set_cr_word(uint32_t(parse_u64(v)));
-                } else if (key == "MEMORY_IN") {
-                    uint32_t address = uint32_t(std::strtoul(reg.c_str(), nullptr, 16));
-                    std::vector<uint8_t> bytes = parse_bytes(v);
-                    std::memcpy(space.base() + address, bytes.data(), bytes.size());
+            auto setup = [&] {
+                // fresh memory and registers, as Xenia's Setup per test
+                // (the tests touch the first 64 KB, 0x100000 on, and Xenia's heap)
+                std::memset(space.base(), 0, 0x10000);
+                std::memset(space.base() + 0x100000, 0, 0x10000);
+                std::memset(space.base() + 0x10000000, 0, 0x10000);
+                std::memcpy(space.base() + START, code.data(), code.size());
+                std::memset(&c, 0, sizeof(c));
+                c.base = space.base();
+                c.lr = SENTINEL;
+                c.msr = 0x9030; // Xenia's ThreadState, "dumped from a real 360"
+                c.system = &system;
+                for (auto &[key, value] : t.annotations) {
+                    size_t space_at = value.find(' ');
+                    std::string reg = value.substr(0, space_at),
+                                v = space_at == std::string::npos ? "" : value.substr(space_at + 1);
+                    int n;
+                    if (key == "REGISTER_IN") {
+                        if (std::sscanf(reg.c_str(), "r%d", &n) == 1) c.r[n] = parse_u64(v);
+                        else if (std::sscanf(reg.c_str(), "f%d", &n) == 1) c.f[n] = parse_double(v);
+                        else if (std::sscanf(reg.c_str(), "v%d", &n) == 1) c.v[n] = parse_vec(v);
+                        else if (reg == "cr") c.set_cr_word(uint32_t(parse_u64(v)));
+                    } else if (key == "MEMORY_IN") {
+                        uint32_t address = uint32_t(std::strtoul(reg.c_str(), nullptr, 16));
+                        std::vector<uint8_t> bytes = parse_bytes(v);
+                        std::memcpy(space.base() + address, bytes.data(), bytes.size());
+                    }
+                }
+            };
+            setup();
+#ifdef XF_PPC_STENCIL
+            // the interpreter's run first, what it leaves kept to compare
+            const uint64_t ticks_before = ticks; // mftb's, the same for both runs
+            const Stopped expected = interpret(c, t.address, SENTINEL, 1'000'000);
+            static Context interpreted;
+            std::memcpy(&interpreted, &c, sizeof(c));
+            // the memory the tests use (setup's), the code's included
+            const std::pair<uint32_t, uint32_t> used[] = {{0, 0x10000},
+                                                          {0x100000, 0x110000},
+                                                          {0x10000000, 0x10010000},
+                                                          {START, START + uint32_t(code.size())}};
+            static std::vector<uint8_t> memory_after;
+            memory_after.clear();
+            for (auto [a, b] : used) memory_after.insert(memory_after.end(), space.base() + a, space.base() + b);
+            setup();
+            ticks = ticks_before;
+            missing = false;
+            Stopped stop;
+            if (auto fn = functions.find(t.address); fn != functions.end()) {
+                fn->second(c);
+                if (missing) stop = {Stopped::Unimplemented, t.address, missing_op};
+                stencil_cases++;
+            } else {
+                stop = interpret(c, t.address, SENTINEL, 1'000'000);
+            }
+            if (expected.reason == Stopped::Returned && stop.reason == Stopped::Returned) {
+                // the same context (but pc, which the interpreter sets at every
+                // instruction) and the same memory
+                interpreted.pc = c.pc;
+                bool same = std::memcmp(&interpreted, &c, sizeof(c)) == 0;
+                size_t at = 0;
+                for (auto [a, b] : used) {
+                    same = same && std::memcmp(space.base() + a, memory_after.data() + at, b - a) == 0;
+                    at += b - a;
+                }
+                if (!same) {
+                    differ++;
+                    std::printf("  %s: differs from the interpreter\n", t.name.c_str());
                 }
             }
+#endif
 #ifdef XF_PPC_RECOMPILED
             current_suite = suite, missing = false;
             Stopped stop;
@@ -267,7 +429,7 @@ int main(int argc, char **argv) {
             } else {
                 stop = interpret(c, t.address, SENTINEL, 1'000'000);
             }
-#else
+#elif !defined(XF_PPC_STENCIL)
             Stopped stop = interpret(c, t.address, SENTINEL, 1'000'000);
 #endif
             if (stop.reason == Stopped::Unimplemented || stop.reason == Stopped::Invalid) {
@@ -326,6 +488,11 @@ int main(int argc, char **argv) {
     std::printf("passed %llu, failed %llu, not run %llu (instructions missing), skipped %llu\n",
                 (unsigned long long)totals.passed, (unsigned long long)totals.failed,
                 (unsigned long long)totals.unimplemented, (unsigned long long)totals.skipped);
+#ifdef XF_PPC_STENCIL
+    std::printf("copy-and-patch: %llu cases run in its code, %llu differ from the interpreter\n",
+                (unsigned long long)stencil_cases, (unsigned long long)differ);
+    if (differ || (!stencil_cases && totals.passed)) return 1;
+#endif
     if (!totals.missing.empty()) {
         std::vector<std::pair<uint64_t, std::string>> missing;
         for (auto &[name, n] : totals.missing) missing.push_back({n, name});

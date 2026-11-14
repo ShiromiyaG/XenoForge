@@ -20,6 +20,7 @@ struct Stopped {
     enum Reason { Returned, Unimplemented, Invalid, Steps, Unwound } reason = Returned;
     uint32_t pc = 0;
     Opcode op = Opcode::Invalid; // what it could not run
+    uint64_t steps = 0;          // the instructions it ran (not those of the calls the system ran)
 };
 
 // Runs from pc until a branch goes to `until` (a return address no code is
