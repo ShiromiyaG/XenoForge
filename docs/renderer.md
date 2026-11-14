@@ -2538,6 +2538,106 @@ processor waits there for its GPU too. A live run with the new line tells
 how much of a slow frame is that, the back end's own work, or a thread
 preempted (busy time well above processor time).
 
+## The GPU side's cost a draw (2026-11-14)
+
+Game G's saloon (traces 1485 and 1260, about 5,600 draws a frame live,
+8,350 in a replay, which measures every extent), each of the three threads
+profiled alone (`xfreplay --profile`; `XF_PROFILE_BACK_END=1` the back end,
+`=2` now the recording thread) over kept plays (`XF_REPLAY_KEPT_PLAY=1`).
+What each found, and what paid:
+
+- **The extents' answers searched from the front** (the front end, a
+  quarter of its time). `poll_extents` matched each of the frame's ~3,000
+  answers to its report by walking the pending list from the first still
+  waiting; one report left unanswered at the front made every search walk
+  thousands. Now from the one after the last found, then from the front
+  (`XF_EXTENT_CURSOR=0` off). The back end's own list of the sink's handles
+  (`DeferredSink::extent_handles_`, a hash map: a node made and freed a
+  report) is a list searched the same way.
+- **The interlock path's tiles walked twice a draw** (the back end, an
+  eighth). The early rejection's sets of EDRAM tiles (the draw's color
+  targets' and its depth's, 2,048 bits each, a run of tiles a row) were made
+  at every draw, the color ones twice. A draw's own sets are now kept for
+  the next draw with the same reach and targets, and met against the pass's
+  set as they stand (`XF_FSI_TILES_MEMO=0` off).
+- **The recording thread spinning** (half of its time). It spun 2,000
+  pauses each time it found its ring empty, about a hundred times a frame
+  (work comes 16 KB at a time). 200 now (`XF_RECORD_RING_SPINS=<n>`); 0
+  measured the same.
+- **A full fence a record on the back end** (8% of its samples on
+  `done_`'s store). The seq_cst store waited for the draw's write-combined
+  uploads to leave, and `done_` shared a cache line with `written_`, which
+  the front end stores at every record (and read `done_` at every
+  reservation). Each is on a line of its own now, the front end reads
+  `done_` again only when the ring looks full, and the back end stores it
+  with a release store, a full fence only every 16 records and before it
+  sleeps, so a sleeper missed at one record's look is woken at a later one
+  (`XF_GPU_RING_RELAXED=0`: a fence a record).
+- **Register blocks sent sparse** (`XF_SPARSE_BLOCKS=0` off). A record's
+  blocks went whole (128 bytes) where 3.8 of a block's 32 registers had
+  changed on average; the register file now keeps which registers of a
+  listed block changed (`take_blocks` gives a mask), and a block goes as its
+  number, the mask and those values (`RegisterFile::write_sparse` on the
+  back end). The ring's bytes 154 to 46 MB over 100 plays; the back end
+  0.7 ms a play less, the front end 0.3 more (the gather), so small.
+- **Guarded statics on the hot paths.** A function's `static const bool`
+  is checked against a thread-local count at every call under Windows' ABI:
+  `FastClock::now` (its rate), `DrawSections::on`, the register runs'
+  switches, the upload's. Read from plain words now. The back end reads its
+  clock every 8 records rather than at each, and `use()` finds a literal's
+  count in 8 kept slots before its hash map. Together about 0.7 ms of the
+  back end; the pictures the same, so no switch.
+- **A resolve's bounds walked texel by texel** (both threads). For texels
+  under 4 bytes or an array, `resolve::destination_ranges` called
+  `tiled_offset` for every texel, twice a resolve (the front end for its
+  waits, the back end). The last 64 bounds are kept per thread by the
+  rectangle, pitch and texel size (`XF_RESOLVE_RANGE_MEMO=0` off): the front
+  end 0.2 ms a play.
+
+Measured (kept plays, 25 a run, each thread's processor time a play, the
+median of the run; A B interleaved, three rounds; the machine quiet, under
+10% busy, only other sessions' editors running; "before" is every switch
+above off and 2,000 spins, which leaves the changes without a switch in):
+
+| frame | front end | back end | recording thread | the front end's wall time a play |
+| --- | --- | --- | --- | --- |
+| 1485 before | 8.81 / 8.93 / 10.60 | 16.06 / 16.58 / 20.41 | 6.20 / 6.36 / 7.84 | 17.4 / 18.3 / 20.4 |
+| 1485 now | 6.60 / 6.53 / 6.61 | 13.04 / 12.61 / 12.87 | 3.73 / 3.61 / 3.71 | 11.8 / 11.0 / 11.7 |
+| 1260 before | 8.19 / 8.69 / 8.31 | 14.98 / 16.33 / 15.66 | 6.02 / 6.32 / 6.24 | 15.7 / 17.1 / 16.5 |
+| 1260 now | 6.55 / 6.18 / 6.30 | 12.45 / 11.89 / 12.70 | 3.69 / 3.50 / 3.73 | 11.5 / 10.9 / 11.5 |
+
+The GPU side's processor time a play on 1485: 31.9 to 23.2 ms (-27%); at
+the base commit, one run, 8.66 + 16.96 + 6.67 = 32.3. Each switch off
+alone, three rounds (1485): the cursor 9.2 against 6.6 ms of the front end,
+the tiles' memo 15.1 against 12.9 of the back end, the relaxed ring 13.4
+against 13.0.
+
+**Tried and dropped:**
+
+- **Fewer Vulkan calls a draw.** The draws record 2.3 calls each on
+  average (the descriptor sets' bind with the constants' new dynamic
+  offsets at nearly every draw, the draw, a pipeline at three draws in ten;
+  dynamic state is set only where it changed already). Leaving every bind
+  that only moves offsets out (a wrong picture, as a probe) took 0.2 ms a
+  play off the recording thread: push descriptors or descriptor buffers
+  would gain less than that, so not built. The driver is three quarters of
+  the recording thread's 3.7 ms.
+- **The draws' constants in system memory** (`XF_VK_NO_DEVICE_LOCAL_DRAW_DATA=1`,
+  as Xenia's upload buffers): the back end 0.9 ms a play less (writes to
+  host memory, not across the bus), the GPU 2.5 ms a play more (12.8 to
+  15.3 ms, its reads across the bus). Video memory stays.
+- **No register blocks before the records that read no register** (IM_LOAD's
+  question, the extent reports, memory written): records 935,000 to
+  706,000 over 100 plays, the back end no faster and the front end's wall
+  time 0.5 ms a play longer. Dropped.
+
+What is left, by the profiles: on the back end `Impl::draw`'s own work,
+flat over its sections (the constants' upload 16%, the front part 13%,
+the pipeline's key 10%, textures 9%; no line above 2%), the register blocks'
+copy (10%, memory latency on the copy's lines); on the front end the
+register file's writes (27%, the packets' words) and the blocks' gather
+(10%); on the recording thread the driver.
+
 ## The loads after resolves in game G's town (2026-11-13)
 
 Live, in the first town, the player counted 60-70 texture loads a
