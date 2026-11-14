@@ -465,9 +465,27 @@ What the SDK gives such a port:
   microcode descriptors equal to the emulated path's). Boot calls it only
   with `--render` (without it no renderer is made).
 
+- **What a shader reads** (`shader_uses`, `used_float_constants`): its
+  float constants, texture fetch slots and vertex fetch constants, so a
+  port uploads and binds only those (a shader reading relative to a0 or
+  aL reads all its constants).
+- **The fixed function** (`native_render.h`): the renderer's own
+  conversions of the registers, `vk_compare_op`, `vk_stencil_op`,
+  `vk_blend_factor`, `vk_blend_op`, `host_viewport` (the viewport and the
+  NDC scale and offset the translated vertex shaders take) and
+  `host_scissor`, so a port building pipelines for the translated shaders
+  does not write them again.
+- **Seeing it**: boot's `--shots` read a frame the port drew from its
+  output image (what the window shows), so a run with the port's frames and
+  one without compare frame by frame (`xfcompare`).
+
+The first port drew its opening's frames this way (the game's Bink shaders,
+its own pipelines and descriptor sets on this layout): every emulated draw
+and resolve of those frames skipped, the pictures as the emulated ones.
+
 Still to come: resolves into host images a port owns (render targets as
-images, not EDRAM), a pipeline helper for the translated shaders' layout,
-and notification of CPU writes to guest memory ranges a port registers.
+images, not EDRAM), and notification of CPU writes to guest memory ranges a
+port registers.
 
 ## Building and running a port
 

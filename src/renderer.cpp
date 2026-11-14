@@ -1921,6 +1921,7 @@ private:
     void gpu_resolve(const resolve::Info &info, RenderTarget &source);
     void swap();
     Texture *front_texture(texture::Info &info);
+    void read_native_output(uint64_t number);
     void read_front_buffer(uint64_t number, Texture &t, const texture::Info &info);
     void deliver(const FrontRead &read);
     void skip(const std::string &reason) {
@@ -13691,8 +13692,10 @@ void Impl::swap() {
     bool held = false;
     const bool native = native_frame(number, held);
     texture::Info info;
-    Texture *t = read || (options_.on_swap && !native && !held) ? front_texture(info) : nullptr;
-    if (read && t) read_front_buffer(number, *t, info);
+    // (a frame the port drew is read from its output image: what the window shows)
+    Texture *t = (read && !native) || (options_.on_swap && !native && !held) ? front_texture(info) : nullptr;
+    if (read && native && native_output_.image) read_native_output(number);
+    else if (read && t) read_front_buffer(number, *t, info);
     FrontBuffer front;
     if (native && options_.on_swap && fatal_.empty()) {
         // shown as it is: an identity table for the display's gamma
@@ -13756,6 +13759,36 @@ Texture *Impl::front_texture(texture::Info &info) {
 
 // The front buffer's level 0 copied into a read-back buffer on the GPU,
 // handed to on_frame once the GPU is done (deliver), without waiting for it.
+// The port's output image read back for a frame it drew (native_render.h):
+// R8G8B8A8_UNORM shown as it is, an identity table for the display's gamma.
+void Impl::read_native_output(uint64_t number) {
+    FrontRead read;
+    read.number = number;
+    read.host = texture::HostFormat::RGBA8;
+    read.width = native_output_.extent.width, read.height = native_output_.extent.height;
+    read.swizzle = texture::SWIZZLE_RGBA, read.format = 6; // k_8_8_8_8
+    for (uint32_t i = 0; i < 256; i++) {
+        const uint32_t ten = i << 2 | i >> 6;
+        read.gamma[i] = ten << 20 | ten << 10 | ten;
+    }
+    read.luta_control = 0;
+    read.bytes = VkDeviceSize(read.width) * read.height * 4;
+    VkBuffer back;
+    VkDeviceSize at;
+    uint8_t *data = readback(read.bytes, back, at);
+    if (!data) return;
+    read.data = data;
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = at;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {read.width, read.height, 1};
+    VkCommandBuffer c = outside();
+    gpu_mark("swap: the port's output read back");
+    vkCmdCopyImageToBuffer(c, native_output_.image, VK_IMAGE_LAYOUT_GENERAL, back, 1, &copy);
+    read.serial = slots_[current_].serial;
+    front_reads_.push_back(std::move(read));
+}
+
 void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &info) {
     FrontRead read;
     read.number = number;
@@ -13912,3 +13945,25 @@ bool precompile(vk::Device &device, const Options &options, const PrecompileOpti
 }
 
 } // namespace xf::render
+
+// ---- the GPU's state as Vulkan's, for a port (native_render.h) ----
+
+namespace xf::native {
+
+VkCompareOp vk_compare_op(uint32_t function) { return render::compare_op(function); }
+VkStencilOp vk_stencil_op(uint32_t op) { return render::stencil_op(op); }
+VkBlendFactor vk_blend_factor(uint32_t factor) { return render::blend_factor(factor); }
+VkBlendOp vk_blend_op(uint32_t op) { return render::blend_op(op); }
+
+HostViewport host_viewport(const uint32_t *registers, float max_x, float max_y) {
+    const render::Viewport v = render::host_viewport(registers, max_x, max_y, false, false, false);
+    HostViewport out;
+    out.viewport = v.viewport;
+    for (int i = 0; i < 3; i++) out.ndc_scale[i] = v.ndc_scale[i], out.ndc_offset[i] = v.ndc_offset[i];
+    out.empty = v.empty;
+    return out;
+}
+
+VkRect2D host_scissor(const uint32_t *registers, uint32_t pitch) { return render::host_scissor(registers, pitch); }
+
+} // namespace xf::native

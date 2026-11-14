@@ -59,6 +59,9 @@ void cache_round_trip(const std::vector<uint32_t> &code, native::ShaderStage sta
     uint64_t used[4];
     CHECK(native::used_float_constants(code.data(), code.size(), stage, used));
     for (int k = 0; k < 4; k++) CHECK(used[k] == t.float_constants[k] && used[k] == r.float_constants[k]);
+    native::ShaderUses uses;
+    CHECK(native::shader_uses(code.data(), code.size(), stage, uses));
+    for (int k = 0; k < 4; k++) CHECK(uses.float_constants[k] == used[k]);
     // kept under the translator's version only
     CHECK(fs::is_directory(dir / native::translator_version()));
 }

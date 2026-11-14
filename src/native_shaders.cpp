@@ -55,12 +55,34 @@ void mark_constants(const ucode::ParsedShader &parsed, uint64_t out[4]) {
 }
 } // namespace
 
+bool shader_uses(const uint32_t *microcode, size_t words, ShaderStage stage, ShaderUses &out) {
+    out = {};
+    if (!microcode || !words) return false;
+    const ucode::ParsedShader parsed =
+        ucode::parse_shader(stage == ShaderStage::Vertex ? ucode::ShaderType::Vertex : ucode::ShaderType::Pixel,
+                            std::span<const uint32_t>(microcode, words));
+    mark_constants(parsed, out.float_constants);
+    for (const ucode::ControlFlow &cf : parsed.control_flow) {
+        const auto *exec = std::get_if<ucode::Exec>(&cf.instruction);
+        if (!exec) continue;
+        for (const ucode::ExecSlot &slot : exec->slots) {
+            if (const auto *t = std::get_if<ucode::TextureFetchInstruction>(&slot.instruction)) {
+                if (t->operand_count > 1) out.texture_slots |= 1u << (t->operands[1].index & 31);
+            } else if (const auto *v = std::get_if<ucode::VertexFetchInstruction>(&slot.instruction)) {
+                const uint32_t f = v->operands[1].index;
+                if (f < 96) out.vertex_fetches[f / 32] |= 1u << (f % 32);
+            }
+        }
+    }
+    return true;
+}
+
 bool used_float_constants(const uint32_t *microcode, size_t words, ShaderStage stage, uint64_t out[4]) {
     out[0] = out[1] = out[2] = out[3] = 0;
     if (!microcode || !words) return false;
-    const ucode::ParsedShader parsed = ucode::parse_shader(
-        stage == ShaderStage::Vertex ? ucode::ShaderType::Vertex : ucode::ShaderType::Pixel,
-        std::span<const uint32_t>(microcode, words));
+    const ucode::ParsedShader parsed =
+        ucode::parse_shader(stage == ShaderStage::Vertex ? ucode::ShaderType::Vertex : ucode::ShaderType::Pixel,
+                            std::span<const uint32_t>(microcode, words));
     mark_constants(parsed, out);
     return true;
 }

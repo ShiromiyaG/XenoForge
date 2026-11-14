@@ -177,6 +177,34 @@ struct PassInfo {
 using PassFilter = std::function<bool(const PassInfo &pass)>;
 void set_pass_filter(PassFilter filter);
 
+// ---- the GPU's state as Vulkan's: the renderer's own conversions ----
+//
+// For a port that draws a game's draws itself from their register state
+// (native_shaders.h's translated shaders), what the emulated path does with
+// the same registers, so a port does not write it again. `registers` is a
+// register file indexed by the GPU's register number (xenos.h), covering at
+// least 0x2000-0x23FF.
+
+VkCompareOp vk_compare_op(uint32_t function); // RB_DEPTHCONTROL's depth and stencil functions (3 bits)
+VkStencilOp vk_stencil_op(uint32_t op);       // its stencil operations (3 bits)
+VkBlendFactor vk_blend_factor(uint32_t factor); // RB_BLENDCONTROL's factors (5 bits)
+VkBlendOp vk_blend_op(uint32_t op);             // its operations (3 bits)
+
+// The draw's viewport on a host target of max_x by max_y pixels (Xenia's
+// draw_util GetHostViewportInfo at resolution scale 1: PA_CL_CLIP_CNTL,
+// PA_CL_VTE_CNTL, PA_SU_SC_MODE_CNTL, PA_SU_VTX_CNTL, PA_CL_VPORT_*,
+// PA_SC_WINDOW_OFFSET), and the NDC scale and offset the translated vertex
+// shaders take (SystemConstants' ndc_scale, ndc_offset). Empty: nothing drawn.
+struct HostViewport {
+    VkViewport viewport{};
+    float ndc_scale[3] = {1, 1, 1}, ndc_offset[3] = {};
+    bool empty = false;
+};
+HostViewport host_viewport(const uint32_t *registers, float max_x, float max_y);
+// The draw's scissor (PA_SC_WINDOW_SCISSOR_*, PA_SC_SCREEN_SCISSOR_*, the
+// window offset), clamped to a target `pitch` pixels wide.
+VkRect2D host_scissor(const uint32_t *registers, uint32_t pitch);
+
 // ---- every draw, watched: a port's check against the emulated path ----
 
 // Called for every draw and resolve the command processor issues, whether

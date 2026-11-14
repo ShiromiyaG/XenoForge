@@ -76,6 +76,18 @@ uint64_t shader_hash(const uint32_t *microcode, size_t words, ShaderStage stage)
 // earlier shader left there). False when the microcode does not parse.
 bool used_float_constants(const uint32_t *microcode, size_t words, ShaderStage stage, uint64_t out[4]);
 
+// What else a shader reads of a draw's state: the texture fetch constants
+// (slots 0-31, a bit each) its texture fetches and texture queries name, and
+// the vertex fetch constants (0-95, a bit each in vertex_fetches[0..2]) its
+// vertex fetches name, with its float constants (used_float_constants'). A
+// native renderer binds only these textures and streams.
+struct ShaderUses {
+    uint64_t float_constants[4] = {};
+    uint32_t texture_slots = 0;
+    uint32_t vertex_fetches[3] = {};
+};
+bool shader_uses(const uint32_t *microcode, size_t words, ShaderStage stage, ShaderUses &out);
+
 // The translator's version: a digest of its sources (the parser, the
 // translator, the shader headers), so SPIR-V kept on disk is never used by
 // a translator that would make other SPIR-V.
