@@ -1,7 +1,7 @@
 // What each instruction does, once, for both the generated code and the
 // interpreter (docs/recompiler.md, "One description per instruction"):
 //
-//   ops::run<Opcode::addx>(c, Instr{code});
+//   ops::run<Opcode::addx>(c, base, Instr{code});
 //
 // The generated code passes the word as a constant and the compiler folds
 // the fields away; the interpreter passes the word it fetched. Translated
@@ -13,8 +13,10 @@
 // Groups, a header each under ppc_ops/: integer, control (branch
 // conditions, CR, SPRs, traps, sync), memory (every load and store,
 // reservations, cache lines), fpu, vmx (integer and permutes), vmx_float.
-// An instruction is defined with XF_OP(name) { ... }, with `c` the context
-// and `i` the word (i.XO.RT, as Xenia's InstrData); one not defined runs
+// An instruction is defined with XF_OP(name) { ... }, with `c` the context,
+// `base` the guest memory's base (c.base, passed beside the context so that
+// no access reads it from there) and `i` the word (i.XO.RT, as Xenia's
+// InstrData); one not defined runs
 // the primary template, which reports it.
 
 #pragma once
@@ -28,13 +30,15 @@ namespace xf::ppc::ops {
 
 template <Opcode> inline constexpr bool implemented = false;
 
-template <Opcode op> XF_INLINE void run(Context &c, Instr i) {
+template <Opcode op> XF_INLINE void run(Context &c, [[maybe_unused]] uint8_t *base, Instr i) {
     if (c.system && c.system->unimplemented) c.system->unimplemented(c, op, i.code);
 }
 
 #define XF_OP(name)                                                                                                    \
     template <> inline constexpr bool implemented<Opcode::name> = true;                                                \
-    template <> XF_INLINE void run<Opcode::name>([[maybe_unused]] Context & c, [[maybe_unused]] Instr i)
+    template <>                                                                                                        \
+    XF_INLINE void run<Opcode::name>([[maybe_unused]] Context & c, [[maybe_unused]] uint8_t *base,                     \
+                                     [[maybe_unused]] Instr i)
 
 // ---- the instruction word (ppc_decode_data.h's helpers) ----
 
@@ -77,41 +81,47 @@ constexpr uint64_t mask(uint32_t mstart, uint32_t mstop) {
 // the compiler, a guest store no longer makes it reload the registers it
 // holds from the context, nor the base (game B: about 12% less CPU time
 // running deterministically; docs/recompiler.md, "Where the time goes").
-XF_INLINE uint8_t *host(Context &c, uint32_t ea) {
-    uint8_t *p = c.base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u);
+// The base itself comes as a parameter (every instruction's `base`, beside
+// the context): a generated function reads it from the context once, at its
+// entry, the first tier's stencils pass it along in a register of their
+// convention, and the interpreter reads it once a run; never a load of the
+// context's field per access (docs/recompiler.md, "The memory base in a
+// register").
+XF_INLINE uint8_t *host(Context &c, uint8_t *base, uint32_t ea) {
+    uint8_t *p = base + ea + (ea >= 0xE0000000u ? 0x1000u : 0u);
 #if __has_builtin(__builtin_assume_separate_storage)
     __builtin_assume_separate_storage(p, &c);
 #endif
     return p;
 }
-XF_INLINE uint8_t load8(Context &c, uint32_t ea) { return *host(c, ea); }
-XF_INLINE uint16_t load16(Context &c, uint32_t ea) {
+XF_INLINE uint8_t load8(Context &c, uint8_t *base, uint32_t ea) { return *host(c, base, ea); }
+XF_INLINE uint16_t load16(Context &c, uint8_t *base, uint32_t ea) {
     uint16_t v;
-    lib::memcpy(&v, host(c, ea), 2);
+    lib::memcpy(&v, host(c, base, ea), 2);
     return __builtin_bswap16(v);
 }
-XF_INLINE uint32_t load32(Context &c, uint32_t ea) {
+XF_INLINE uint32_t load32(Context &c, uint8_t *base, uint32_t ea) {
     uint32_t v;
-    lib::memcpy(&v, host(c, ea), 4);
+    lib::memcpy(&v, host(c, base, ea), 4);
     return __builtin_bswap32(v);
 }
-XF_INLINE uint64_t load64(Context &c, uint32_t ea) {
+XF_INLINE uint64_t load64(Context &c, uint8_t *base, uint32_t ea) {
     uint64_t v;
-    lib::memcpy(&v, host(c, ea), 8);
+    lib::memcpy(&v, host(c, base, ea), 8);
     return __builtin_bswap64(v);
 }
-XF_INLINE void store8(Context &c, uint32_t ea, uint8_t v) { *host(c, ea) = v; }
-XF_INLINE void store16(Context &c, uint32_t ea, uint16_t v) {
+XF_INLINE void store8(Context &c, uint8_t *base, uint32_t ea, uint8_t v) { *host(c, base, ea) = v; }
+XF_INLINE void store16(Context &c, uint8_t *base, uint32_t ea, uint16_t v) {
     v = __builtin_bswap16(v);
-    lib::memcpy(host(c, ea), &v, 2);
+    lib::memcpy(host(c, base, ea), &v, 2);
 }
-XF_INLINE void store32(Context &c, uint32_t ea, uint32_t v) {
+XF_INLINE void store32(Context &c, uint8_t *base, uint32_t ea, uint32_t v) {
     v = __builtin_bswap32(v);
-    lib::memcpy(host(c, ea), &v, 4);
+    lib::memcpy(host(c, base, ea), &v, 4);
 }
-XF_INLINE void store64(Context &c, uint32_t ea, uint64_t v) {
+XF_INLINE void store64(Context &c, uint8_t *base, uint32_t ea, uint64_t v) {
     v = __builtin_bswap64(v);
-    lib::memcpy(host(c, ea), &v, 8);
+    lib::memcpy(host(c, base, ea), &v, 8);
 }
 
 // ---- MMIO: the devices' registers (the GPU's at 0x7FC80000) ----
@@ -131,15 +141,15 @@ XF_INLINE bool mmio(uint32_t ra, uint32_t ea) { return ra != 1 && ra != 13 && ea
     if (c.system && c.system->mmio_write) c.system->mmio_write(c, ea, v);
 }
 // a 32-bit load or store through base register ra
-XF_INLINE uint32_t load32_io(Context &c, uint32_t ra, uint32_t ea) {
+XF_INLINE uint32_t load32_io(Context &c, uint8_t *base, uint32_t ra, uint32_t ea) {
     if (mmio(ra, ea)) [[unlikely]]
         return mmio_read(c, ea);
-    return load32(c, ea);
+    return load32(c, base, ea);
 }
-XF_INLINE void store32_io(Context &c, uint32_t ra, uint32_t ea, uint32_t v) {
+XF_INLINE void store32_io(Context &c, uint8_t *base, uint32_t ra, uint32_t ea, uint32_t v) {
     if (mmio(ra, ea)) [[unlikely]]
         return mmio_write(c, ea, v);
-    store32(c, ea, v);
+    store32(c, base, ea, v);
 }
 
 // ---- the flags (ppc_hir_builder.cc) ----

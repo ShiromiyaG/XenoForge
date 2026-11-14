@@ -23,7 +23,11 @@ inline std::vector<const char *> cpu_level_flags(CpuLevel level) {
     switch (level) {
     case CpuLevel::X86_64_V2: return {"-march=x86-64-v2"};
     case CpuLevel::X86_64_V3: return {"-march=x86-64-v3", "-mprefer-vector-width=128"};
-    default: return {}; // ARM64: its baseline
+    // ARM64: its baseline, with the atomics inline: clang's default on Linux
+    // calls libgcc's __aarch64_cas* and the like, which a library that imports
+    // nothing does not have (the first tier's stencils are built the same way)
+    case CpuLevel::Arm64: return {"-mno-outline-atomics"};
+    default: return {};
     }
 }
 

@@ -302,10 +302,11 @@ int main() {
             const std::string text = emit_function(big, bd, bd.functions.at(T), "xf_");
             CHECK(contains(text, "    struct xf_parts {\n        XF_PART(p0) {\n"));
             CHECK(contains(text, "XF_PART(p4) {") && !contains(text, "XF_PART(p5)"));
-            CHECK(contains(text, "    xf_parts::p0(c);\n    xf_parts::p1(c);\n    xf_parts::p2(c);\n"));
-            CHECK(contains(text, "L_82002EE0:\n    xf_parts::p3(c);\n")); // LOOP
+            CHECK(contains(text, "    xf_parts::p0(c, xf_base);\n    xf_parts::p1(c, xf_base);\n"
+                                 "    xf_parts::p2(c, xf_base);\n"));
+            CHECK(contains(text, "L_82002EE0:\n    xf_parts::p3(c, xf_base);\n")); // LOOP
             CHECK(contains(text, "if (BC(4, 0)) { XF_YIELD(); goto L_82002EE0; }\n"));
-            CHECK(contains(text, "    xf_parts::p4(c);\n    // 82004E20 ") && contains(text, "    return;\n}\n"));
+            CHECK(contains(text, "    xf_parts::p4(c, xf_base);\n    // 82004E20 ") && contains(text, "    return;\n}\n"));
         }
     }
     return finish("recomp_discover");

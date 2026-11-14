@@ -1681,7 +1681,7 @@ semantics unchanged); superinstructions for the commonest pairs (a compare
 and its branch: `cmpli`/`cmpi` then `bc` are about a sixth of the run); and
 the guest memory's base in a register beside the context (one load less an
 access, but `ops::host` reads it from the context: the semantics would have
-to take it as a parameter). None of these keeps registers in host registers
+to take it as a parameter; done since: "The memory base in a register"). None of these keeps registers in host registers
 across instructions, which is most of the library's lead; the paper's and
 Deegen's answer, a stencil per register allocation, multiplies the stencils
 by the cases.
@@ -1848,7 +1848,7 @@ there (`XF_STENCIL_CLANG` names it when the build's clang is older; clang 18
 ignores the attribute and the stencils would still run, saving registers),
 and `-mno-outline-atomics` (clang's default on Linux calls libgcc's
 `__aarch64_cas*`, which the tier does not provide; a game library built for
-ARM64 will need the same flag).
+ARM64 takes the same flag: game_build_flags.h's ARM64 level).
 
 **Checks.** `ppc_stencil_test` passes on Linux x86-64 and on ARM64 under
 `qemu-aarch64` (also with `XF_STENCIL_FAR=1`): the 141,705 cases, none
@@ -1897,7 +1897,7 @@ and what changed:
   a read-modify-write of one byte that a run of them chains on. The second
   would go with a conditional store in the semantics
   (`if (saturated) c.vscr_sat = 1;`), which changes the game library's
-  interface: proposed, not done.
+  interface: done since ("The memory base in a register").
 
 **Register fields as holes** (`src/stencil/stencil_fields.h`, shared by the
 stencils and the tier). Each form's register numbers (RT, RA, RB, FRT..FRC,
@@ -1949,9 +1949,8 @@ MB, game A's 73,293 326.0 MB; 2,007 stencils, 258 KB. The instruction tests
 (the tier, the library and the interpreter alike) are unchanged.
 
 What would still pay, in order: the memory base in a register beside the
-context (one load less an access, but `ops::host` reads it from the context:
-the semantics would take it as a parameter, an interface change); the
-conditional VSCR[SAT] store above (an interface change too); keeping vector
+context and the conditional VSCR[SAT] store above (both interface changes,
+done since: "The memory base in a register"); keeping vector
 registers in host registers across the stencils of a block (a stencil per
 register allocation: the paper's answer, which multiplies the stencils).
 
@@ -2016,3 +2015,47 @@ library then a whole one (the adopted function pointed at the second), and a
 release with one function holding a frame (kept), one adopted (released, its
 entry still reaching the library) and one the library lacks (kept, still
 running on the tier).
+
+### The memory base in a register (2026-11-14)
+
+One change of the game library's interface (version `b34445fb` to
+`a1792871`), bundling what waited for one, so every cached library is built
+again once:
+
+- **The guest memory's base beside the context.** Every instruction's
+  semantics take it as a parameter (`ops::run<op>(c, base, i)`, XF_OP's
+  `base`), and `ops::host`, the loads and the stores add the guest address
+  to it instead of reading `c.base` at each access. Where it comes from:
+  - a generated function reads it from the context once, at its entry
+    (`XF_BASE;`, `ppc_generated.h`: a local the instructions take, which the
+    compiler keeps in a callee-saved register across the function's calls,
+    where `c.base` had to be loaded again after each); a part gets it from
+    its caller (`xf_parts::p0(c, xf_base)`), a body with resume sites reads
+    it at its own start (the lambda captures nothing). A function's
+    signature is unchanged (`void name(Context &c)`): the kernel's table,
+    dispatch, the hooks and the ports' replacements call it as before.
+  - the first tier's stencils pass it along in a register of their
+    convention: every stencil is `uint32_t (Context *c, uint8_t *base)`
+    with `preserve_none`, so it stays in r13 on x86-64 and x21 on ARM64
+    beside the context's r12 and x20 from the entry (`xf_st_entry` reads it
+    once) to the return, never stored.
+  - the interpreter reads it once a run (`interpret`).
+- **VSCR[SAT] stored when set.** The saturating integer VMX ops (adds and
+  subtracts, packs, `vmsum*`, `vsum*`, `vmhaddshs`) store 1 when an element
+  saturated (`set_sat`, vmx.h) instead of OR-ing the flag into the byte, so a
+  run of them no longer chains on a read-modify-write of it; the vector
+  float conversions already stored. The value read is the same (`mfvscr`
+  and the exceptions' frames take its low bit; the flag is only ever 0 or 1).
+- **ARM64's atomics inline.** A game library built for ARM64 is compiled
+  with `-mno-outline-atomics` (game_build_flags.h's level flags; clang's
+  default on Linux calls libgcc's `__aarch64_cas*`, which a library that
+  imports nothing does not have). The stencils take the flag from the same
+  place now.
+
+**Checks.** The instruction tests pass as before: interpreted, recompiled,
+and the tier's 141,705 cases, none differing from the interpreter, on
+Windows x86-64 and on ARM64 under `qemu-aarch64` (also with
+`XF_STENCIL_FAR=1`). A load stencil's disassembly (`lwz` off r1) adds the
+address to r13 (x21 on ARM64) where it loaded the base from the context. Game B, deterministic to swap
+3,000 (`--spin-idle`), leaves the guest memory hash it left before
+(`ca91d1b719deff1d`) on the tier, on the library and interpreted.

@@ -18,6 +18,7 @@ XF_FN(xf_00002100);
 // VMX ops that reach the C library: fctiw (llrint), fadd. (the rounding mode
 // and exception flags: fenv), vexptefp and vlogefp (exp2f, log2f)
 XF_FN(xf_00001000) {
+    XF_BASE;
     I(addi, 0x38630001);    // addi r3, r3, 1
     I(addx, 0x7C632214);    // add r3, r3, r4
     I(lwz, 0x80A60000);     // lwz r5, 0(r6)

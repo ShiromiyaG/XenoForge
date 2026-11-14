@@ -72,10 +72,10 @@ uint64_t now() { return objects(*K).now(); }
 
 // the XMA registers as the games reach them: lwbrx and stwbrx (base r3)
 uint32_t xma_read(ppc::Context &c, uint32_t index) {
-    return __builtin_bswap32(ppc::ops::load32_io(c, 3, 0x7FEA0000 + index * 4));
+    return __builtin_bswap32(ppc::ops::load32_io(c, c.base, 3, 0x7FEA0000 + index * 4));
 }
 void xma_write(ppc::Context &c, uint32_t index, uint32_t value) {
-    ppc::ops::store32_io(c, 3, 0x7FEA0000 + index * 4, __builtin_bswap32(value));
+    ppc::ops::store32_io(c, c.base, 3, 0x7FEA0000 + index * 4, __builtin_bswap32(value));
 }
 
 // ---- the render driver's clients ----

@@ -15,6 +15,13 @@
 
 namespace xf::ppc::ops {
 
+// VSCR[SAT] set when an instruction saturated: a store only then (no
+// read-modify-write of the byte that a run of saturating instructions would
+// chain on), the same value for any reader (mfvscr takes its low bit)
+XF_INLINE void set_sat(Context &c, bool saturated) {
+    if (saturated) c.vscr_sat = 1;
+}
+
 // Lane helpers. Element-wise ops work on the host lanes as they are: element n
 // of every operand sits in the same host lane. Only the ops that move elements
 // between positions need the guest order (byte n at u8[n ^ 3], halfword n at
@@ -62,7 +69,7 @@ template <typename T, bool Sub> XF_INLINE Vec128 add_sat(Context &c, const Vec12
     lib::memcpy(&y, &b, 16);
     const VT r = Sub ? __builtin_elementwise_sub_sat(x, y) : __builtin_elementwise_add_sat(x, y);
     const VU w = Sub ? VU(x) - VU(y) : VU(x) + VU(y);
-    c.vscr_sat |= __builtin_reduce_or(VU(r) ^ w) != 0;
+    set_sat(c, __builtin_reduce_or(VU(r) ^ w) != 0);
     Vec128 v;
     lib::memcpy(&v, &r, 16);
     return v;
@@ -82,7 +89,7 @@ template <typename T, bool Sub> XF_INLINE Vec128 add_sat(Context &c, const Vec12
     for (int k = 0; k < N; k++) w[k] = T(Sub ? U(U(x[k]) - U(y[k])) : U(U(x[k]) + U(y[k])));
     U any = 0;
     for (int k = 0; k < N; k++) any |= U(r[k] ^ w[k]);
-    c.vscr_sat |= any != 0;
+    set_sat(c, any != 0);
     Vec128 v;
     lib::memcpy(&v, r, 16);
     return v;
@@ -351,7 +358,7 @@ template <typename In, typename Out, bool Sat, int N> XF_INLINE Vec128 pack(Cont
     if constexpr (Sat) {
         constexpr In lo = In(lib::numeric_limits<Out>::min()), hi = In(lib::numeric_limits<Out>::max());
         y = __builtin_elementwise_min(__builtin_elementwise_max(x, VX{} + lo), VX{} + hi);
-        c.vscr_sat |= __builtin_reduce_or(y != x) != 0;
+        set_sat(c, __builtin_reduce_or(y != x) != 0);
     }
     const VOut z = __builtin_convertvector(y, VOut);
     if constexpr (N == 16) {
@@ -382,7 +389,7 @@ XF_INLINE void narrow(Context &c, const Vec128 &a, const Vec128 &b, F store) {
     if constexpr (Sat) {
         In any = 0;
         for (int k = 0; k < N; k++) any |= In(In(y[k]) ^ x[k]);
-        c.vscr_sat |= any != 0;
+        set_sat(c, any != 0);
     }
     store(y);
 }
@@ -500,7 +507,7 @@ inline Vec128 msum(Context &ctx, const Vec128 &a, const Vec128 &b, const Vec128 
         int64_t t = sum[w] + int64_t(T(c.u32[w]));
         r.u32[w] = uint32_t(Sat ? clamp<T>(t, sat) : T(t));
     }
-    if (Sat) ctx.vscr_sat |= uint8_t(sat);
+    if (Sat) set_sat(ctx, sat != 0);
     return r;
 }
 // vsum4*: for each word, the elements of a in it plus the word of b, saturated
@@ -515,7 +522,7 @@ template <typename TA, typename T> inline Vec128 sum4(Context &c, const Vec128 &
         for (int k = 0; k < N; k++) t += x[w * N + k];
         r.u32[w] = uint32_t(clamp<T>(t, sat));
     }
-    c.vscr_sat |= uint8_t(sat);
+    set_sat(c, sat != 0);
     return r;
 }
 // vsum2sws (2 words to each of words 1 and 3) and vsumsws (4 to word 3)
@@ -527,7 +534,7 @@ template <int Words> inline Vec128 sum_across(Context &c, const Vec128 &a, const
         for (int k = 0; k < Words; k++) t += a.i32[g + k];
         r.i32[g + Words - 1] = clamp<int32_t>(t, sat);
     }
-    c.vscr_sat |= uint8_t(sat);
+    set_sat(c, sat != 0);
     return r;
 }
 // vmhaddshs/vmhraddshs: ((a * b + round) >> 15) + c, saturated
@@ -536,7 +543,7 @@ inline Vec128 mhadd(Context &ctx, const Vec128 &a, const Vec128 &b, const Vec128
     uint32_t sat = 0;
     for (int k = 0; k < 8; k++)
         r.i16[k] = clamp<int16_t>(((int32_t(a.i16[k]) * b.i16[k] + round) >> 15) + c.i16[k], sat);
-    ctx.vscr_sat |= uint8_t(sat);
+    set_sat(ctx, sat != 0);
     return r;
 }
 

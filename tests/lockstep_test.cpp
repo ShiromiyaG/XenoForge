@@ -24,6 +24,7 @@ uint32_t bl(uint32_t from, uint32_t to) { return 0x48000001u | ((to - from) & 0x
 
 // A: r3 += 1; *(r4) = r3; the wrong one adds 2
 XF_FN(gen_a) {
+    XF_BASE;
     I(addi, 0x38630001);
     if (wrong) I(addi, 0x38630001);
     I(stw, 0x90640000);
@@ -31,6 +32,7 @@ XF_FN(gen_a) {
 
 // B: a frame, KeQueryPerformanceFrequency, r3 += 5, A, mftb into r5
 XF_FN(gen_b) {
+    XF_BASE;
     I(mfspr, 0x7D8802A6);
     I(stw, 0x9181FFF8);
     I(stwu, 0x9421FFA0);

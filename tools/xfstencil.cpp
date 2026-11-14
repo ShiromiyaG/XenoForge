@@ -576,10 +576,8 @@ int main(int argc, char **argv) {
     // and no jump tables: one is data that names its function's code, which
     // a copy per use cannot share
     command += " -ffunction-sections -fdata-sections -fno-jump-tables";
-    // ARM64 on Linux: atomics inline (LDXR/STXR at the baseline), not calls
-    // to libgcc's __aarch64_cas* helpers, which clang chooses there by
-    // default and the tier does not provide
-    if (arm64) command += " -mno-outline-atomics";
+    // (ARM64's level flags keep the atomics inline, -mno-outline-atomics: the
+    // tier does not provide libgcc's __aarch64_cas* helpers either)
     // ELF: position independent (an absolute 32-bit field would need the code
     // in the low 2 GB); stencils.cpp declares every symbol hidden, so a hole
     // is a pc-relative field, never reached through the GOT

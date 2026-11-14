@@ -59,9 +59,11 @@ void stack_args(ppc::Context &c, std::initializer_list<uint32_t> args) {
 }
 
 // the GPU's registers, through lwz and stw on 0x7FC80000 (base register r3)
-uint32_t mmio_read(ppc::Context &c, uint32_t index) { return ppc::ops::load32_io(c, 3, 0x7FC80000 + index * 4); }
+uint32_t mmio_read(ppc::Context &c, uint32_t index) {
+    return ppc::ops::load32_io(c, c.base, 3, 0x7FC80000 + index * 4);
+}
 void mmio_write(ppc::Context &c, uint32_t index, uint32_t value) {
-    ppc::ops::store32_io(c, 3, 0x7FC80000 + index * 4, value);
+    ppc::ops::store32_io(c, c.base, 3, 0x7FC80000 + index * 4, value);
 }
 
 uint32_t scratch = 0; // guest memory for the main thread

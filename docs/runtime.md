@@ -2965,6 +2965,11 @@ another XenoForge never runs against these headers. The same script embeds
 those headers in the core, and the recompile step writes them beside the
 code it compiles, so the code is always built against the headers of the
 XenoForge that loads it and nothing but the toolchain ships for the build.
+Since 2026-11-14 the version is `a1792871` (from `b34445fb`): the instructions
+take the guest memory's base beside the context, the saturating VMX ops
+store VSCR[SAT] only when set, and an ARM64 library keeps its atomics
+inline (docs/recompiler.md, "The memory base in a register"); the
+generated functions' signature and the runtime's table are unchanged.
 
 **The Unwind across the boundary.** An `Unwind` (a longjmp, a catch's
 continuation, a stack switched back elsewhere) is a C++ exception. It is

@@ -13,7 +13,7 @@
 namespace xf::ppc {
 namespace {
 
-using Fn = void (*)(Context &, Instr);
+using Fn = void (*)(Context &, uint8_t *, Instr);
 
 constexpr Fn TABLE[] = {
 #define XF_PPC_OP(name, opcode, form, group, description) &ops::run<Opcode::name>,
@@ -31,6 +31,8 @@ constexpr bool IMPLEMENTED[] = {
 template <class Watch>
 Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_t stack_top, Watch *watch) {
     constexpr bool watched = !std::is_same_v<Watch, std::nullptr_t>;
+    // the guest memory's base, read once (ppc_ops.h's host)
+    uint8_t *const base = c.base;
     // the port's hooks (System::hook_pages): a page holding one is looked at
     // further, for mid-function hooks here and hooked functions entered by a
     // branch (calls reach them through System::call)
@@ -64,7 +66,7 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
                 continue;
             }
         }
-        Instr i{ops::load32(c, pc)};
+        Instr i{ops::load32(c, base, pc)};
         Opcode op = decode(i.code);
         c.pc = pc;
         if constexpr (watched) watch->before(c, pc, op, i);
@@ -132,7 +134,7 @@ Stopped run(Context &c, uint32_t pc, uint32_t until, uint64_t max_steps, uint32_
         case Opcode::Invalid: return stopped({Stopped::Invalid, pc, op});
         default:
             if (!IMPLEMENTED[size_t(op)]) return stopped({Stopped::Unimplemented, pc, op});
-            TABLE[size_t(op)](c, i);
+            TABLE[size_t(op)](c, base, i);
             break;
         }
         if constexpr (watched) watch->after(c, pc, op);

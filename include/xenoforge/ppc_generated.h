@@ -2,10 +2,13 @@
 // branch conditions, and the runtime's calls (ppc_runtime.h: dispatch,
 // invalid, unwind, switch_stack, resumable; direct calls when the code is
 // linked statically, through the runtime's table in a game library).
-// A generated function is `void name(xf::ppc::Context &c)`; each
-// instruction is one line:
+// A generated function is `void name(xf::ppc::Context &c)`; its body starts
+// with XF_BASE, the guest memory's base read from the context once into a
+// local the instructions take beside the context (ppc_ops.h's host), and
+// each instruction is one line:
 //
-//   I(lwz, 0x81430008);        // ops::run<Opcode::lwz>(c, Instr{...})
+//   XF_BASE;
+//   I(lwz, 0x81430008);        // ops::run<Opcode::lwz>(c, xf_base, Instr{...})
 //   if (BC(12, 26)) goto L_822D28E4;
 //   XF_TAIL(xf_822D2910);      // a tail call, no frame left behind
 //   if (BC(4, 2)) { XF_YIELD(); goto L_822D28C0; } // a backward branch
@@ -17,7 +20,9 @@
 #include "xenoforge/ppc_runtime.h"
 
 #define XF_FN(name) void name([[maybe_unused]] ::xf::ppc::Context &c)
-#define I(op, code) ::xf::ppc::ops::run<::xf::ppc::Opcode::op>(c, ::xf::ppc::Instr{code})
+// the guest memory's base, once a body (a part gets it from its caller)
+#define XF_BASE [[maybe_unused]] uint8_t *const xf_base = c.base
+#define I(op, code) ::xf::ppc::ops::run<::xf::ppc::Opcode::op>(c, xf_base, ::xf::ppc::Instr{code})
 #define BC(bo, bi) ::xf::ppc::ops::branch_condition(c, bo, bi)
 #define BCCTR(bo, bi) ::xf::ppc::ops::branch_condition_ctr(c, bo, bi)
 // a taken branch backward (to its own address or before it, no LK): a yield
@@ -33,11 +38,14 @@
 // A part of a very long function (recomp_emit.cpp, "parts"): a stretch of
 // its straight-line code in a function of its own, a static member of a
 // class local to the function, never inlined back (the optimizer's time on
-// one function grows faster than its length)
+// one function grows faster than its length), called with the context and
+// the memory's base: `xf_parts::p0(c, xf_base);`
 #if defined(__clang__) || defined(__GNUC__)
-#define XF_PART(name) [[gnu::noinline]] static void name([[maybe_unused]] ::xf::ppc::Context &c)
+#define XF_PART(name)                                                                                                  \
+    [[gnu::noinline]] static void name([[maybe_unused]] ::xf::ppc::Context &c, [[maybe_unused]] uint8_t *xf_base)
 #else
-#define XF_PART(name) __declspec(noinline) static void name([[maybe_unused]] ::xf::ppc::Context &c)
+#define XF_PART(name)                                                                                                  \
+    __declspec(noinline) static void name([[maybe_unused]] ::xf::ppc::Context &c, [[maybe_unused]] uint8_t *xf_base)
 #endif
 // A return from a function that switches the stack: to its caller when LR
 // and r1 are its entry's (xf_lr, xf_sp), else thrown to the frame it goes to.
@@ -53,6 +61,7 @@
 //   XF_FN(xf_82000B20) {
 //       static constexpr uint32_t xf_sites[] = {0x82000B4Cu, 0x82000B54u};
 //       ::xf::ppc::resumable(c, XF_RESUMABLE_BODY {
+//           XF_BASE;
 //           switch (xf_at) { case 0x82000B4C: goto L_82000B4C; ... }
 //           ...
 //       }, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, 2);

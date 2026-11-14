@@ -86,7 +86,7 @@ public:
             }
             // the stretch into its part, the call here
             const std::string name = "p" + std::to_string(parts_emitted_++);
-            line("xf_parts::" + name + "(c);");
+            line("xf_parts::" + name + "(c, xf_base);");
             const int base = base_;
             out_ = &parts, base_ = 2;
             line("XF_PART(" + name + ") {", 0);
@@ -119,6 +119,8 @@ public:
                                          : std::string();
         head += parts;
         if (resumes_.empty()) {
+            // the memory's base, read once (ppc_generated.h's XF_BASE)
+            head += "    XF_BASE;\n";
             // where its returns are checked against (XF_CHECKED_RETURN)
             if (checked_) head += "    const uint32_t xf_lr = uint32_t(c.lr), xf_sp = uint32_t(c.r[1]);\n";
             return head + body + "}\n" + wrapper;
@@ -135,9 +137,10 @@ public:
             cases += "        case 0x" + hex8(a) + ": goto L_" + hex8(a) + ";\n";
         }
         return head + "    static constexpr uint32_t xf_sites[] = {" + sites + "};\n" +
-               "    ::xf::ppc::resumable(c, XF_RESUMABLE_BODY {\n" + "        switch (xf_at) {\n" + cases +
-               "        }\n" + body + "    }, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, " +
-               std::to_string(resumes_.size()) + ");\n" + "}\n" + wrapper;
+               "    ::xf::ppc::resumable(c, XF_RESUMABLE_BODY {\n" + "        XF_BASE;\n" +
+               "        switch (xf_at) {\n" + cases + "        }\n" + body +
+               "    }, uint32_t(c.lr), uint32_t(c.r[1]), xf_sites, " + std::to_string(resumes_.size()) + ");\n" +
+               "}\n" + wrapper;
     }
 
     std::string name(uint32_t address) const { return prefix_ + hex8(address); }
