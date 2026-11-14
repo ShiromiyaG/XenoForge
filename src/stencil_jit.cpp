@@ -14,6 +14,15 @@
 // body, the branches' out-of-line sequences, its jump tables' data. Written,
 // then made read-only and executable; the instruction counter
 // (Options::count) sits on a page of its own that stays writable.
+//
+// Hosts: x86-64 (Windows, Linux) and ARM64 (Linux, Android). ARM64's direct
+// branches reach 128 MB, less than the reservation: a call or jump farther
+// goes through a veneer (an indirect jump through x16, which the procedure
+// call standard leaves to such veneers), to the shared pieces from islands
+// of veneers laid out every 64 MB, to other functions from veneers after the
+// caller's code. The unwind information is Windows' function tables
+// (RtlAddFunctionTable) there, and elsewhere a .eh_frame of the copies' own
+// given to the C++ runtime's unwinder (__register_frame).
 
 #include "xenoforge/stencil.h"
 
@@ -23,6 +32,7 @@
 #include "xenoforge/recomp.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -68,7 +78,7 @@ bool requested() { return choice() == Choice::Stencil; }
 #if !XF_STENCIL_TIER
 
 bool available(std::string *why) {
-    if (why) *why = "this build has no stencils (clang on x86-64 makes them)";
+    if (why) *why = "this build has no stencils (clang on x86-64 or ARM64 makes them)";
     return false;
 }
 std::unique_ptr<Module> compile(const recomp::Image &, const recomp::Discovery &, const ppc::Runtime &,
@@ -87,6 +97,15 @@ using recomp::Discovery;
 using recomp::Function;
 using recomp::Image;
 using recomp::Source;
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+constexpr bool ARM64 = true;
+#else
+constexpr bool ARM64 = false;
+#endif
+// what fills the gaps between pieces: int3, or ARM64's udf #0
+constexpr uint8_t FILL = ARM64 ? 0x00 : 0xCC;
+constexpr size_t TAIL_JUMP = tail_jump_size(ARM64);
 
 int64_t exts16(uint32_t v) { return int64_t(int16_t(v)); }
 int64_t exts26(uint32_t v) { return int64_t(v & 0x02000000 ? int32_t(v) | int32_t(0xFC000000) : int32_t(v)); }
@@ -191,7 +210,7 @@ class Region {
 #endif
             committed_ = to;
         }
-        if (at > used_) std::memset(base_ + used_, 0xCC, at - used_); // int3 between pieces
+        if (at > used_) std::memset(base_ + used_, FILL, at - used_);
         used_ = at + n;
         return base_ + at;
     }
@@ -224,6 +243,181 @@ class Region {
     uint8_t *base_ = nullptr;
     size_t size_ = 0, used_ = 0, committed_ = 0, page_ = 4096;
 };
+
+// ---- writing a hole ----
+
+// Writes a relocation of `kind` at `field` for the value S + A (stencil_format.h),
+// false when it does not reach. wrap: S is a 32-bit hole (xf_hole_word, _a,
+// _b), of whose address the stencil uses the low 32 bits only, so any address
+// with those bits will do: the one nearest the field, which a pc-relative
+// field always reaches.
+bool write_reloc(uint8_t *field, RelocKind kind, int64_t s, int64_t addend, bool wrap) {
+    const int64_t p = int64_t(uintptr_t(field));
+    int64_t v = s + addend;
+    if (wrap) {
+        const uint64_t low = uint64_t(v) & 0xFFFFFFFFu;
+        int64_t best = int64_t((uint64_t(p) & ~uint64_t(0xFFFFFFFF)) | low);
+        for (int64_t c : {best - (int64_t(1) << 32), best + (int64_t(1) << 32)})
+            if (std::llabs(c - p) < std::llabs(best - p)) best = c;
+        v = best;
+    }
+    auto insn = [&](uint32_t mask, uint32_t bits) {
+        uint32_t w;
+        std::memcpy(&w, field, 4);
+        w = (w & ~mask) | (bits & mask);
+        std::memcpy(field, &w, 4);
+    };
+    switch (kind) {
+    case RelocKind::PcRel32: {
+        const int64_t d = v - p;
+        if (!wrap && d != int64_t(int32_t(d))) return false;
+        const uint32_t w = uint32_t(uint64_t(d));
+        std::memcpy(field, &w, 4);
+        return true;
+    }
+    case RelocKind::Abs64: {
+        const uint64_t w = uint64_t(v);
+        std::memcpy(field, &w, 8);
+        return true;
+    }
+    case RelocKind::Branch26: {
+        const int64_t d = v - p;
+        if (d & 3 || d < -(int64_t(1) << 27) || d >= (int64_t(1) << 27)) return false;
+        insn(0x03FFFFFFu, uint32_t(d >> 2));
+        return true;
+    }
+    case RelocKind::AdrPage21: {
+        const int64_t pages = (v >> 12) - (p >> 12);
+        if (pages < -(int64_t(1) << 20) || pages >= (int64_t(1) << 20)) return false;
+        const uint32_t imm = uint32_t(pages) & 0x1FFFFF;
+        insn(0x60FFFFE0u, (imm & 3) << 29 | (imm >> 2) << 5);
+        return true;
+    }
+    case RelocKind::AddLo12: insn(0x003FFC00u, uint32_t(v & 0xFFF) << 10); return true;
+    case RelocKind::LdSt8Lo12:
+    case RelocKind::LdSt16Lo12:
+    case RelocKind::LdSt32Lo12:
+    case RelocKind::LdSt64Lo12:
+    case RelocKind::LdSt128Lo12: {
+        const int scale = int(kind) - int(RelocKind::LdSt8Lo12);
+        if (v & ((int64_t(1) << scale) - 1)) return false; // misaligned for the access
+        insn(0x003FFC00u, uint32_t((v & 0xFFF) >> scale) << 10);
+        return true;
+    }
+    case RelocKind::MovwG0:
+    case RelocKind::MovwG1:
+    case RelocKind::MovwG2:
+    case RelocKind::MovwG3: {
+        const int shift = 16 * (int(kind) - int(RelocKind::MovwG0));
+        insn(0x001FFFE0u, uint32_t((uint64_t(v) >> shift) & 0xFFFF) << 5);
+        return true;
+    }
+    }
+    return false;
+}
+
+// An ARM64 veneer (16 bytes): ldr x16, #8; br x16; the target's address.
+void write_veneer(uint8_t *at, uint64_t target) {
+    const uint32_t code[2] = {0x58000050u, 0xD61F0200u};
+    std::memcpy(at, code, 8);
+    std::memcpy(at + 8, &target, 8);
+}
+constexpr size_t VENEER_SIZE = 16;
+
+// XF_STENCIL_FAR=1 (ARM64, for tests): every branch to another function or a
+// shared piece goes through its veneer, and the tier-up's jumps through the
+// literal, as they do past 128 MB, so a small program checks those paths.
+bool force_far() {
+    static const bool far_ = ARM64 && std::getenv("XF_STENCIL_FAR") && *std::getenv("XF_STENCIL_FAR") == '1';
+    return far_;
+}
+
+#if !defined(_WIN32)
+} // namespace
+} // namespace xf::stencil
+// libgcc's and LLVM's libunwind's: both take a whole .eh_frame (from a CIE to
+// a zero length; libunwind since LLVM 13, the version Android's NDK has had
+// since r23)
+extern "C" void __register_frame(void *);
+extern "C" void __deregister_frame(void *);
+namespace xf::stencil {
+namespace {
+
+// The copies' unwind information on ELF hosts: a .eh_frame of their own, with
+// each CIE the stencils use once and an FDE for each copy of a piece that has
+// rules (stencil_format.h's Piece), its addresses absolute (8 bytes), so the
+// table may lie anywhere. Registered once it is whole; kept, unchanged, until
+// it is deregistered.
+class EhFrame {
+  public:
+    EhFrame() = default;
+    EhFrame(const EhFrame &) = delete;
+    EhFrame &operator=(const EhFrame &) = delete;
+    ~EhFrame() {
+        if (registered_) __deregister_frame(bytes_.data());
+    }
+    void add(const Piece &p, const uint8_t *at, size_t size) {
+        if (!p.unwind_size) return;
+        const uint8_t *u = gen::unwind + p.unwind_offset;
+        const size_t cie_size = size_t(u[0]) | size_t(u[1]) << 8;
+        const uint8_t *cie = u + 2, *tail = cie + cie_size;
+        const size_t tail_size = p.unwind_size - 2 - cie_size;
+        size_t cie_at = SIZE_MAX;
+        for (const auto &[offset, size_, bytes] : cies_)
+            if (size_ == cie_size && std::memcmp(bytes, cie, cie_size) == 0) cie_at = offset;
+        if (cie_at == SIZE_MAX) {
+            cie_at = bytes_.size();
+            cies_.push_back({cie_at, cie_size, cie});
+            const size_t start = begin();
+            u32(0); // a CIE's id
+            bytes_.insert(bytes_.end(), cie, cie + cie_size);
+            end(start);
+        }
+        const size_t start = begin();
+        u32(uint32_t(bytes_.size() - cie_at)); // back to its CIE
+        u64(uint64_t(uintptr_t(at)));
+        u64(size);
+        bytes_.insert(bytes_.end(), tail, tail + tail_size);
+        end(start);
+        fdes_++;
+    }
+    size_t fdes() const { return fdes_; }
+    bool install() {
+        if (!fdes_) return true;
+        u32(0); // the end
+        __register_frame(bytes_.data());
+        registered_ = true;
+        return true;
+    }
+
+  private:
+    size_t begin() {
+        const size_t start = bytes_.size();
+        u32(0);
+        return start;
+    }
+    // the record's length written, padded with DW_CFA_nop to 8 bytes
+    void end(size_t start) {
+        while ((bytes_.size() - start) % 8) bytes_.push_back(0);
+        const uint32_t length = uint32_t(bytes_.size() - start - 4);
+        std::memcpy(bytes_.data() + start, &length, 4);
+    }
+    void u32(uint32_t v) {
+        bytes_.insert(bytes_.end(), reinterpret_cast<uint8_t *>(&v), reinterpret_cast<uint8_t *>(&v) + 4);
+    }
+    void u64(uint64_t v) {
+        bytes_.insert(bytes_.end(), reinterpret_cast<uint8_t *>(&v), reinterpret_cast<uint8_t *>(&v) + 8);
+    }
+    struct Cie {
+        size_t offset, size;
+        const uint8_t *bytes;
+    };
+    std::vector<Cie> cies_;
+    std::vector<uint8_t> bytes_;
+    size_t fdes_ = 0;
+    bool registered_ = false;
+};
+#endif
 
 // ---- a function as stencils ----
 
@@ -267,9 +461,13 @@ struct Block {
 // no-ops before what runs (its body, or the frame around it), which the
 // tier-up turns into a jump to the game library's code (Module::adopt).
 // Calls and tail branches between functions given code all go there; a
-// branch inside the function to its own start does not.
-constexpr uint8_t FRONT[8] = {0x0F, 0x1F, 0x44, 0x00, 0x00, 0x0F, 0x1F, 0x00}; // nop dword [rax+rax]; nop dword [rax]
-constexpr size_t FRONT_SIZE = sizeof(FRONT);
+// branch inside the function to its own start does not. ARM64: two nops, and
+// before them an 8-byte literal the tier-up fills when its jump is indirect.
+constexpr std::array<uint8_t, 8> FRONT = ARM64 ? std::array<uint8_t, 8>{0x1F, 0x20, 0x03, 0xD5, 0x1F, 0x20, 0x03, 0xD5}
+                                               // nop dword [rax+rax]; nop dword [rax]
+                                               : std::array<uint8_t, 8>{0x0F, 0x1F, 0x44, 0x00, 0x00, 0x0F, 0x1F, 0x00};
+constexpr size_t FRONT_SIZE = FRONT.size();
+constexpr size_t FRONT_LITERAL = ARM64 ? 8 : 0;
 
 class Compiler;
 
@@ -308,6 +506,8 @@ class StencilModule final : public Module {
 #if defined(_WIN32)
     // the unwind tables registered (the code's, then each adopt()'s)
     std::vector<std::vector<RUNTIME_FUNCTION>> unwind_tables_;
+#else
+    std::deque<EhFrame> eh_frames_; // the same
 #endif
 };
 
@@ -321,18 +521,15 @@ class Compiler {
         // a gigabyte: games' code makes a few hundred megabytes at most (about
         // a hundred bytes an instruction), and every pc-relative field reaches across it
         if (!m_.region_.reserve(size_t(1) << 30)) return error = "could not reserve the code's memory", false;
+#if !defined(_WIN32)
+        m_.eh_frames_.emplace_back();
+#endif
         if (!header(runtime)) return error = "out of the code's memory", false;
         for (size_t k = 0; k < plans_.size(); k++)
             if (!function(k)) return error = "out of the code's memory", false;
-        for (const Pending &p : pending_) {
-            const uint64_t target = bodies_[p.function];
-            if (p.abs) {
-                const uint64_t v = target;
-                std::memcpy(p.field, &v, 8);
-            } else if (!rel32(p.field, int64_t(target) + p.addend - int64_t(uintptr_t(p.field)))) {
+        for (const Pending &p : pending_)
+            if (!place(p.field, p.kind, int64_t(bodies_[p.function]), p.addend, p.veneer))
                 return error = "a call out of the code's reach", false;
-            }
-        }
         const size_t code_end = m_.region_.used();
         m_.code_end_ = code_end;
         if (options_.count) {
@@ -342,9 +539,9 @@ class Compiler {
             std::memset(page, 0, m_.region_.page());
             m_.counter_ = reinterpret_cast<uint64_t *>(page);
             // the count stencils' data holes, written now that it exists
-            for (size_t k = 0; k < counter_fields_.size(); k++)
-                rel32(counter_fields_[k], int64_t(uintptr_t(page)) + 8 * int64_t(counter_index_[k]) +
-                                              counter_addends_[k] - int64_t(uintptr_t(counter_fields_[k])));
+            for (const Pending &p : counter_fields_)
+                if (!write_reloc(p.field, p.kind, int64_t(uintptr_t(page)) + 8 * int64_t(p.function), p.addend, false))
+                    return error = "the counter out of the code's reach", false;
         }
         if (!m_.region_.seal(0, code_end)) return error = "could not make the code executable", false;
 #if defined(_WIN32)
@@ -355,6 +552,9 @@ class Compiler {
                 return error = "could not register the code's unwind information", false;
             stats_.unwind_entries = table.size();
         }
+#else
+        stats_.unwind_entries = m_.eh_frames_.front().fdes();
+        if (!m_.eh_frames_.front().install()) return error = "could not register the code's unwind information", false;
 #endif
         stats_.region_bytes = m_.region_.used();
         m_.adopted_piece_ = ids_.adopted;
@@ -386,11 +586,14 @@ class Compiler {
     }
 
   private:
+    // A field written once its target is placed: a function's front not made
+    // yet (function: its index), or the counter (function: the opcode).
     struct Pending {
         uint8_t *field;
         uint32_t function;
         int64_t addend;
-        bool abs;
+        RelocKind kind;
+        uint8_t *veneer; // ARM64: a veneer kept for a branch that may not reach
     };
 
     // ---- which functions get code ----
@@ -480,10 +683,38 @@ class Compiler {
 
     // ---- writing ----
 
-    static bool rel32(uint8_t *field, int64_t v) {
-        if (v != int64_t(int32_t(v))) return false;
-        const int32_t w = int32_t(v);
-        std::memcpy(field, &w, 4);
+    // A field to S + A; an ARM64 branch that does not reach goes through the
+    // veneer given (written here), or none
+    static bool place(uint8_t *field, RelocKind kind, int64_t s, int64_t addend, uint8_t *veneer) {
+        if (!(force_far() && veneer) && write_reloc(field, kind, s, addend, false)) return true;
+        if (kind != RelocKind::Branch26 || !veneer) return false;
+        write_veneer(veneer, uint64_t(s + addend));
+        return write_reloc(field, kind, int64_t(uintptr_t(veneer)), 0, false);
+    }
+
+    // ARM64: an island of veneers to the shared code pieces and the C
+    // library's stubs, for the branches to them from code more than 128 MB
+    // away; one is laid out each time the code has grown 64 MB since the last
+    // (the header counts as the first, its pieces reached directly)
+    static constexpr size_t ISLAND_EVERY = size_t(64) << 20;
+    bool island() {
+        Region &r = m_.region_;
+        if (!ARM64 || (r.used() - island_at_ < ISLAND_EVERY && !(force_far() && island_at_ == 0))) return true;
+        for (size_t k = 0; k < gen::piece_count; k++) {
+            if (!shared_[k] || !(gen::pieces[k].flags & PIECE_CODE)) continue;
+            uint8_t *v = r.take(VENEER_SIZE, 16);
+            if (!v) return false;
+            write_veneer(v, uint64_t(uintptr_t(shared_[k])));
+            far_piece_[k] = v;
+        }
+        for (size_t k = 0; k < size_t(Extern::Count); k++) {
+            if (k == size_t(Extern::Runtime)) continue; // data
+            uint8_t *v = r.take(VENEER_SIZE, 16);
+            if (!v) return false;
+            write_veneer(v, uint64_t(uintptr_t(externs_[k])));
+            far_extern_[k] = v;
+        }
+        island_at_ = r.used();
         return true;
     }
 
@@ -495,29 +726,37 @@ class Compiler {
         if (!rt) return false;
         std::memcpy(rt, &runtime, sizeof(runtime));
         externs_[size_t(Extern::Runtime)] = rt;
-        // jmp [rip+0]; the address
+        // x86-64: jmp [rip+0]; the address. ARM64: a veneer.
         const void *const c_library[] = {reinterpret_cast<const void *>(&std::memcpy),
                                          reinterpret_cast<const void *>(&std::memmove),
                                          reinterpret_cast<const void *>(&std::memset)};
         for (size_t k = 0; k < 3; k++) {
-            uint8_t *stub = r.take(14, 16);
-            if (!stub) return false;
-            static const uint8_t jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};
-            std::memcpy(stub, jmp, 6);
             const uint64_t a = uint64_t(uintptr_t(c_library[k]));
-            std::memcpy(stub + 6, &a, 8);
+            uint8_t *stub = r.take(ARM64 ? VENEER_SIZE : 14, 16);
+            if (!stub) return false;
+            if (ARM64) {
+                write_veneer(stub, a);
+            } else {
+                static const uint8_t jmp[6] = {0xFF, 0x25, 0, 0, 0, 0};
+                std::memcpy(stub, jmp, 6);
+                std::memcpy(stub + 6, &a, 8);
+            }
             externs_[size_t(Extern::Memcpy) + k] = stub;
         }
         shared_.assign(gen::piece_count, nullptr);
+        far_piece_.assign(gen::piece_count, nullptr);
         unwind_rva_.assign(gen::piece_count, 0);
         for (size_t k = 0; k < gen::piece_count; k++) {
             const Piece &p = gen::pieces[k];
+#if defined(_WIN32)
+            // Windows: the UNWIND_INFO in the region, which its tables name by offset
             if (p.unwind_size) {
                 uint8_t *u = r.take(p.unwind_size, 4);
                 if (!u) return false;
                 std::memcpy(u, gen::unwind + p.unwind_offset, p.unwind_size);
                 unwind_rva_[k] = uint32_t(u - r.base());
             }
+#endif
             if (p.flags & PIECE_STENCIL) continue;
             uint8_t *at = r.take(p.size, std::max<uint32_t>(p.align, 1));
             if (!at) return false;
@@ -531,6 +770,7 @@ class Compiler {
             }
         // the tier-up's adapters are copied later: their unwind information now
         m_.adopted_unwind_rva_ = unwind_rva_[ids_.adopted];
+        island_at_ = 0;
         return true;
     }
 
@@ -542,7 +782,24 @@ class Compiler {
         f.EndAddress = DWORD(at - m_.region_.base() + size);
         f.UnwindData = unwind_rva_[piece];
         unwind_.push_back(f);
+#elif !defined(_WIN32)
+        m_.eh_frames_.front().add(gen::pieces[piece], at, size);
 #endif
+    }
+
+    // Whether a relocation of a copy is an ARM64 branch to another function,
+    // which may need a veneer (function() keeps one for each).
+    static bool far_call(const Reloc &rel, const Inst &inst) {
+        if (rel.kind != RelocKind::Branch26 || rel.target != TargetKind::Hole) return false;
+        if (Hole(rel.index) == Hole::Target) return inst.target.kind == Ref::Function;
+        if (Hole(rel.index) == Hole::Call) return inst.call.kind == Ref::Function;
+        return false;
+    }
+
+    [[noreturn]] static void unreachable(const Piece &p, uint32_t k, const Reloc &rel) {
+        std::fprintf(stderr, "stencil: %s reloc %u (kind %d) target %d/%u out of reach\n", p.name, k, int(rel.kind),
+                     int(rel.target), rel.index);
+        std::abort(); // inside one reservation of a gigabyte, with veneers where it is larger than a branch: never
     }
 
     // Writes a copy's holes. inst: what the per-copy holes stand for (nullptr
@@ -556,9 +813,16 @@ class Compiler {
             uint8_t *field = at + rel.offset;
             bool wrap = false;
             int64_t s = 0;
+            uint8_t *island_veneer = nullptr; // a veneer to the same target, for a branch that does not reach
             switch (rel.target) {
-            case TargetKind::Piece: s = int64_t(uintptr_t(shared_[rel.index])); break;
-            case TargetKind::Extern: s = int64_t(uintptr_t(externs_[rel.index])); break;
+            case TargetKind::Piece:
+                s = int64_t(uintptr_t(shared_[rel.index]));
+                island_veneer = far_piece_[rel.index];
+                break;
+            case TargetKind::Extern:
+                s = int64_t(uintptr_t(externs_[rel.index]));
+                island_veneer = far_extern_[rel.index];
+                break;
             case TargetKind::Hole:
                 switch (Hole(rel.index)) {
                 case Hole::Word: s = inst->word, wrap = true; break;
@@ -567,9 +831,7 @@ class Compiler {
                 case Hole::Data:
                     if (inst->counter) {
                         // the counter's page is placed at the end: written then
-                        counter_fields_.push_back(field);
-                        counter_index_.push_back(inst->word);
-                        counter_addends_.push_back(rel.addend);
+                        counter_fields_.push_back({field, inst->word, rel.addend, rel.kind, nullptr});
                         continue;
                     }
                     s = int64_t(uintptr_t(data));
@@ -578,37 +840,25 @@ class Compiler {
                 case Hole::Target:
                 case Hole::Call: {
                     const Ref &ref = Hole(rel.index) == Hole::Target ? inst->target : inst->call;
+                    uint8_t *veneer = far_call(rel, *inst) ? veneers_[next_veneer_++] : nullptr;
                     if (ref.kind == Ref::Function && !bodies_[ref.value]) {
-                        pending_.push_back({field, ref.value, rel.addend, rel.kind == RelocKind::Abs64});
+                        pending_.push_back({field, ref.value, rel.addend, rel.kind, veneer});
                         continue;
                     }
                     s = int64_t(uintptr_t(resolve(ref)));
-                    break;
+                    if (!place(field, rel.kind, s, rel.addend, veneer)) unreachable(p, k, rel);
+                    continue;
                 }
                 default: break;
                 }
                 break;
             }
-            switch (rel.kind) {
-            case RelocKind::PcRel32: {
-                const int64_t v = s + rel.addend - int64_t(uintptr_t(field));
-                if (wrap) {
-                    const uint32_t w = uint32_t(uint64_t(v));
-                    std::memcpy(field, &w, 4);
-                } else if (!rel32(field, v)) {
-                    std::fprintf(stderr, "stencil: %s reloc %u target %d/%u out of reach\n", p.name, k, int(rel.target),
-                                 rel.index);
-                    std::abort(); // inside one reservation of a gigabyte: never
-                }
-                break;
-            }
-            case RelocKind::Abs64: {
-                const uint64_t v = uint64_t(s + rel.addend);
-                std::memcpy(field, &v, 8);
-                break;
-            }
-            default: std::abort(); // ARM64's kinds: not built yet
-            }
+            if (!(force_far() && island_veneer && rel.kind == RelocKind::Branch26) &&
+                write_reloc(field, rel.kind, s, rel.addend, wrap))
+                continue;
+            if (rel.kind != RelocKind::Branch26 || !island_veneer || rel.addend != 0 ||
+                !write_reloc(field, rel.kind, int64_t(uintptr_t(island_veneer)), 0, false))
+                unreachable(p, k, rel);
         }
     }
 
@@ -908,24 +1158,50 @@ class Compiler {
         };
         auto copied = [&](size_t j) {
             const Piece &p = gen::pieces[inst(j).piece];
-            return (p.flags & PIECE_TAIL_JUMP) ? p.size - 5 : p.size;
+            return (p.flags & PIECE_TAIL_JUMP) ? p.size - TAIL_JUMP : p.size;
         };
+        // the entries (the table's, whose call to the body may need a veneer
+        // as any call to a function's front, and a hooked function's original)
         const size_t entry_size = gen::pieces[ids_.entry].size;
         const size_t entries = slot ? 2 : 1;
-        const size_t front_at = (entries * entry_size + 7) & ~size_t(7);
+        Inst entry_inst[2] = {Inst{ids_.entry}, Inst{ids_.entry}};
+        entry_inst[0].call = {Ref::Function, uint32_t(k)};
+        entry_inst[1].call = {Ref::Pre, 1};
+        // ARM64: a veneer kept after the code for each branch to another
+        // function, used if it does not reach
+        size_t far_calls = 0;
+        if (ARM64) {
+            auto count = [&](const Inst &i) {
+                const Piece &p = gen::pieces[i.piece];
+                for (uint32_t q = 0; q < p.reloc_count; q++) far_calls += far_call(gen::relocs[p.reloc_first + q], i);
+            };
+            for (size_t e = 0; e < entries; e++) count(entry_inst[e]);
+            for (size_t j = 0; j < n; j++) count(inst(j));
+        }
+        const size_t front_at = ((entries * entry_size + 7) & ~size_t(7)) + FRONT_LITERAL;
         size_t total = front_at + FRONT_SIZE;
         for (size_t j = 0; j < n; j++) total += copied(j);
+        if (far_calls) total = ((total + 7) & ~size_t(7)) + far_calls * VENEER_SIZE;
+        if (!island()) return false;
         const size_t start = r.used();
         uint8_t *entry = r.take(total, 16);
         if (!entry) return false;
         if (front_at > entries * entry_size)
-            std::memset(entry + entries * entry_size, 0xCC, front_at - entries * entry_size);
+            std::memset(entry + entries * entry_size, FILL, front_at - entries * entry_size);
         uint8_t *front = entry + front_at;
-        std::memcpy(front, FRONT, FRONT_SIZE);
+        std::memcpy(front, FRONT.data(), FRONT_SIZE);
         addr_.resize(n + 1);
         uint8_t *at = front + FRONT_SIZE;
         for (size_t j = 0; j < n; j++) addr_[j] = at, at += copied(j);
         addr_[n] = at;
+        veneers_.clear();
+        next_veneer_ = 0;
+        if (far_calls) {
+            uint8_t *v = entry + (((at - entry) + 7) & ~size_t(7));
+            std::memset(at, FILL, size_t(v - at));
+            for (size_t j = 0; j < far_calls; j++) veneers_.push_back(v + j * VENEER_SIZE);
+            std::memset(v, FILL, far_calls * VENEER_SIZE); // what is not used stays a trap
+        }
         bodies_[k] = uint64_t(uintptr_t(front));
         m_.fronts_.push_back({f_->address, front});
         // the data
@@ -936,7 +1212,7 @@ class Compiler {
             std::memcpy(data[b], blocks_[b].bytes.data(), blocks_[b].bytes.size());
             for (const auto &[offset, ref] : blocks_[b].refs) {
                 if (ref.kind == Ref::Function && !bodies_[ref.value]) {
-                    pending_.push_back({data[b] + offset, ref.value, 0, true});
+                    pending_.push_back({data[b] + offset, ref.value, 0, RelocKind::Abs64, nullptr});
                     continue;
                 }
                 const uint64_t v = uint64_t(uintptr_t(resolve(ref)));
@@ -947,13 +1223,8 @@ class Compiler {
         for (size_t e = 0; e < entries; e++) {
             uint8_t *copy = entry + e * entry_size;
             std::memcpy(copy, gen::bytes + gen::pieces[ids_.entry].offset, entry_size);
-            Inst c{ids_.entry};
             // the table's entry: the front; a hooked function's original: past the slot's check
-            if (e == 0)
-                c.call = {Ref::Function, uint32_t(k)};
-            else
-                c.call = {Ref::Pre, 1};
-            patch(copy, ids_.entry, entry_size, &c, nullptr, nullptr);
+            patch(copy, ids_.entry, entry_size, &entry_inst[e], nullptr, nullptr);
             add_unwind(ids_.entry, copy, entry_size);
         }
         for (size_t j = 0; j < n; j++) {
@@ -990,9 +1261,14 @@ class Compiler {
     std::vector<uint8_t *> shared_;
     std::vector<uint32_t> unwind_rva_;
     uint8_t *externs_[size_t(Extern::Count)] = {};
-    std::vector<uint8_t *> counter_fields_;
-    std::vector<int64_t> counter_addends_;
-    std::vector<uint32_t> counter_index_; // the opcode each counts
+    std::vector<Pending> counter_fields_; // function: the opcode each counts
+    // ARM64: the latest island's veneers (none: the piece itself is near),
+    // where it was laid out, and the function being made's own veneers
+    std::vector<uint8_t *> far_piece_;
+    uint8_t *far_extern_[size_t(Extern::Count)] = {};
+    size_t island_at_ = 0;
+    std::vector<uint8_t *> veneers_;
+    size_t next_veneer_ = 0;
 #if defined(_WIN32)
     std::vector<RUNTIME_FUNCTION> unwind_;
 #endif
@@ -1029,6 +1305,8 @@ size_t StencilModule::adopt(const ppc::GeneratedModule &library, std::string &er
     std::vector<Move> moves;
 #if defined(_WIN32)
     std::vector<RUNTIME_FUNCTION> unwind;
+#else
+    EhFrame &eh = eh_frames_.emplace_back();
 #endif
     for (size_t k = 0; k < fronts_.size(); k++) {
         if (adopted_[k]) continue;
@@ -1046,7 +1324,6 @@ size_t StencilModule::adopt(const ppc::GeneratedModule &library, std::string &er
         std::memcpy(adapter, gen::bytes + p.offset, p.size);
         for (uint32_t r = 0; r < p.reloc_count; r++) {
             const Reloc &rel = gen::relocs[p.reloc_first + r];
-            uint8_t *field = adapter + rel.offset;
             int64_t s = 0;
             if (rel.target == TargetKind::Hole && Hole(rel.index) == Hole::Data)
                 s = int64_t(uintptr_t(slot));
@@ -1054,11 +1331,8 @@ size_t StencilModule::adopt(const ppc::GeneratedModule &library, std::string &er
                 s = int64_t(uintptr_t(region_.base()));
             else
                 return error = "the adapter stencil refers to what the tier-up does not provide", 0;
-            if (rel.kind != RelocKind::PcRel32) return error = "the adapter stencil's relocation is not pc-relative", 0;
-            const int64_t v = s + rel.addend - int64_t(uintptr_t(field));
-            if (v != int64_t(int32_t(v))) return error = "an adapter out of the code's reach", 0;
-            const int32_t w = int32_t(v);
-            std::memcpy(field, &w, 4);
+            if (!write_reloc(adapter + rel.offset, rel.kind, s, rel.addend, false))
+                return error = "an adapter out of the code's reach", 0;
         }
 #if defined(_WIN32)
         if (p.unwind_size) {
@@ -1068,6 +1342,8 @@ size_t StencilModule::adopt(const ppc::GeneratedModule &library, std::string &er
             f.UnwindData = adopted_unwind_rva_;
             unwind.push_back(f);
         }
+#else
+        eh.add(p, adapter, p.size);
 #endif
         moves.push_back({k, adapter});
     }
@@ -1082,19 +1358,36 @@ size_t StencilModule::adopt(const ppc::GeneratedModule &library, std::string &er
             return error = "could not register the adapters' unwind information", 0;
         }
     }
+#else
+    if (!eh.install()) return error = "could not register the adapters' unwind information", 0;
 #endif
-    // the fronts: each one's eight bytes stored at once, a jmp rel32 to the
-    // adapter and the rest of the no-ops (the threads are parked; the code
-    // stays executable while it is written)
+    // the fronts: each one's eight bytes stored at once (the threads are
+    // parked; the code stays executable while it is written). x86-64: a jmp
+    // rel32 to the adapter and the rest of the no-ops. ARM64: a b to it and a
+    // nop, or, farther than a b reaches, ldr x16 from the literal before the
+    // front (written first) and br x16.
     if (!region_.writable_code(0, code_end_, true)) return error = "could not write the code", 0;
     for (const Move &m : moves) {
         uint8_t *front = fronts_[m.front].second;
         uint8_t bytes[8];
-        std::memcpy(bytes, FRONT, 8);
-        bytes[0] = 0xE9;
-        const int64_t v = int64_t(uintptr_t(m.adapter)) - int64_t(uintptr_t(front + 5));
-        const int32_t w = int32_t(v);
-        std::memcpy(bytes + 1, &w, 4);
+        std::memcpy(bytes, FRONT.data(), 8);
+        if (ARM64) {
+            const int64_t d = int64_t(uintptr_t(m.adapter)) - int64_t(uintptr_t(front));
+            if (d >= -(int64_t(1) << 27) && d < (int64_t(1) << 27) && !force_far()) {
+                const uint32_t b = 0x14000000u | (uint32_t(d >> 2) & 0x03FFFFFFu);
+                std::memcpy(bytes, &b, 4);
+            } else {
+                const uint64_t a = uint64_t(uintptr_t(m.adapter));
+                __atomic_store_n(reinterpret_cast<uint64_t *>(front - 8), a, __ATOMIC_SEQ_CST);
+                const uint32_t code[2] = {0x58FFFFD0u, 0xD61F0200u}; // ldr x16, #-8; br x16
+                std::memcpy(bytes, code, 8);
+            }
+        } else {
+            bytes[0] = 0xE9;
+            const int64_t v = int64_t(uintptr_t(m.adapter)) - int64_t(uintptr_t(front + 5));
+            const int32_t w = int32_t(v);
+            std::memcpy(bytes + 1, &w, 4);
+        }
         uint64_t word;
         std::memcpy(&word, bytes, 8);
         __atomic_store_n(reinterpret_cast<uint64_t *>(front), word, __ATOMIC_SEQ_CST);
@@ -1115,16 +1408,13 @@ bool available(std::string *why) {
         if (why) *why = "the stencils are built for x86-64-v3, which this processor lacks";
         return false;
     }
-#if !defined(_WIN32)
-    // An Unwind thrown through the copies needs their unwind information
-    // registered, which is done for Windows' .pdata only (TODO: .eh_frame's
-    // FDEs through __register_frame).
-    if (why) *why = "the copies' unwind information is only registered on Windows yet";
-    return false;
-#endif
+    return true;
+#elif defined(__aarch64__) && !defined(_WIN32)
+    // ARM64's baseline (ELF: Linux, Android), its unwind information from .eh_frame
     return true;
 #else
-    if (why) *why = "the stencils' relocations are only written for x86-64 yet";
+    // Windows on ARM64: its .pdata (packed unwind entries) is not read yet
+    if (why) *why = "the stencils' unwind information is only read for x86-64 and ELF on ARM64 yet";
     return false;
 #endif
 }

@@ -1585,13 +1585,14 @@ GOT entry), takes each `xf_st_*` function's bytes and relocations and every
 helper and constant they reach (the slow paths kept out of line, the vector
 constants: copied once), and writes them as `stencil_format.h`'s kinds
 (`PcRel32`, `Abs64`; ARM64's `Branch26`, `AdrPage21`, the `Lo12` and `Movw`
-kinds are read from both formats but not patched yet). A last instruction
+kinds: "Linux and ARM64" below). A last instruction
 that jumps to the next stencil is marked and left out of a copy that the next
 one follows. Windows' `.pdata` and `.xdata` give each stencil's unwind
 information, which the run time registers for every copy
 (`RtlAddFunctionTable`): an Unwind (a longjmp, a catch's continuation,
 "Stack switches") thrown through the tier's frames needs it (the test below
-checks that it crosses them; without it the process dies). 660 stencils,
+checks that it crosses them; without it the process dies); on ELF it comes
+from `.eh_frame` (below). 660 stencils,
 87 KB, and 251 helpers and constants; the step takes about two seconds.
 
 **At run time** (`src/stencil_jit.cpp`, `stencil.h`): discovery as the
@@ -1668,10 +1669,8 @@ the instruction cache more.
 **What full coverage took** (done since: "Full coverage and the tier-up"
 below). The semantics were all there; what was left was the control flow the
 emitter has: checked returns and resume sites, branches to a stack switch,
-the port's hooks, and the DLLs. Still left: ARM64 and Linux, the patcher for
-ARM64's kinds and the unwind information registered from `.eh_frame`
-(`__register_frame`); until then `stencil::available()` says no outside
-Windows on x86-64, as a run could not unwind through the copies.
+the port's hooks, and the DLLs. Linux and ARM64 came after ("Linux and
+ARM64" below).
 
 Faster code is the larger question. What would pay, in order: stencils that
 know more of their word (variants for the D forms with `rA` not 0, and with
@@ -1797,3 +1796,61 @@ scheduler's thread took 19.2 s to swap 3,000 on the tier, 6.5 s on the
 library and 112.4 s interpreted (one run each, the machine otherwise idle).
 A live run moved to the library 15 s in: 21,720 entries patched, the guest
 threads parked 18.9 ms.
+
+### Linux and ARM64 (2026-11-13)
+
+The tier is available on Linux x86-64 and on ARM64 Linux and Android
+(`stencil::available()`); Windows on ARM64 still says no (its `.pdata` holds
+packed unwind entries, not read yet).
+
+**Unwind information on ELF.** `xfstencil` reads each stencil's and helper's
+FDE in the object's `.eh_frame` with its CIE (clang writes one, `"zR"`: no
+personality, no LSDA, as nothing in the stencils catches) and keeps the CIE's
+body and the FDE's rules; an FDE with no rules past the CIE's is a leaf's,
+which never holds a return address, and is dropped, as Windows has no
+`.pdata` entry for one (an ARM64 function that calls and has none would be
+an error). The run time writes a `.eh_frame` of its own beside the code:
+each CIE once, then an FDE per copy of a piece that has rules, and registers
+it whole with `__register_frame` (libgcc's on glibc, LLVM's libunwind on
+Android: both take a table that starts at a CIE and ends with a zero
+length), once the code is placed, and again for each tier-up's adapters;
+the module deregisters them when it is destroyed. The CIE's pointer encoding is
+rewritten from pc-relative 4-byte to absolute 8-byte addresses, so the table
+can sit on the heap, gigabytes from the code.
+
+**ARM64's relocations**, all patched (`write_reloc`): `CALL26` and `JUMP26`
+(`Branch26`), `ADR_PREL_PG_HI21` (`AdrPage21`), `ADD_ABS_LO12_NC` and the
+`LDST8..128_ABS_LO12_NC` (the low 12 bits, scaled by the access, checked
+aligned), `ABS64`, and the `MOVW_UABS_G0..G3` (none in the stencils today).
+A 32-bit hole is reached by `adrp`/`add` as x86-64's by `lea`: of the
+address the stencil makes, only the low half is used, so the page is chosen
+nearest the field among those with the right low 32 bits (always within
+`adrp`'s 4 GB). A last `b` to the next stencil is dropped as x86-64's
+`jmp`. A direct branch reaches 128 MB, less than the gigabyte reserved, so:
+- calls and tail branches to other functions each keep a 16-byte veneer
+  after the caller's code (`ldr x16, #8; br x16; the address`, x16 being the
+  register the procedure call standard leaves to veneers), used when the
+  target is farther; the entry's call to its body counts among them;
+- calls to the shared helpers and the C library's stubs go through an island
+  of veneers to every shared piece laid out each time the code has grown
+  64 MB, the latest one being always within reach;
+- the front is two `nop`s with an 8-byte literal before it: the tier-up
+  writes a `b` to the adapter, or, farther, the literal and `ldr x16, #-8;
+  br x16`.
+`XF_STENCIL_FAR=1` takes the far way everywhere it exists (veneers, an
+island at once, the literal), for a test program to run it.
+
+The stencils need clang 19 or later on ARM64, the first with `preserve_none`
+there (`XF_STENCIL_CLANG` names it when the build's clang is older; clang 18
+ignores the attribute and the stencils would still run, saving registers),
+and `-mno-outline-atomics` (clang's default on Linux calls libgcc's
+`__aarch64_cas*`, which the tier does not provide; a game library built for
+ARM64 will need the same flag).
+
+**Checks.** `ppc_stencil_test` passes on Linux x86-64 and on ARM64 under
+`qemu-aarch64` (also with `XF_STENCIL_FAR=1`): the 141,705 cases, none
+differing from the interpreter, the construct programs, and the exception
+crossing the tier's frames, which on ELF goes through the registered
+`.eh_frame`. Game B on Linux x86-64 leaves the same guest memory hash at swap
+1,500 on the tier, interpreted and on Windows' tier (docs/runtime.md, "Other
+hosts").

@@ -30,7 +30,7 @@
 #include "xenoforge/command_processor.h"
 #include "xenoforge/guest_memory.h"
 
-#include "thread_cpu.h"
+#include "../thread_cpu.h"
 
 #include <atomic>
 #include <cstdint>

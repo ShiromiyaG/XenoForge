@@ -50,7 +50,8 @@ struct Section {
     uint32_t align = 1;
     bool code = false, writable = false, bss = false;
     std::vector<Rel> rels;
-    // Windows x64: its function's UNWIND_INFO (from .pdata and .xdata)
+    // its function's unwind information (stencil_format.h's Piece): Windows
+    // x64's UNWIND_INFO (from .pdata and .xdata), or ELF's CIE and FDE rules
     std::vector<uint8_t> unwind;
 };
 struct Symbol {
@@ -61,6 +62,7 @@ struct Symbol {
 struct Object {
     std::vector<Section> sections;
     std::vector<Symbol> symbols;
+    bool arm64 = false;
 };
 
 template <class T> T rd(const std::vector<uint8_t> &b, size_t at) {
@@ -76,6 +78,7 @@ void read_coff(const std::vector<uint8_t> &f, Object &o) {
     const uint16_t machine = rd<uint16_t>(f, 0);
     const bool x64 = machine == 0x8664, arm64 = machine == 0xAA64;
     if (!x64 && !arm64) fail("COFF machine not x86-64 or ARM64");
+    o.arm64 = arm64;
     const uint16_t nsections = rd<uint16_t>(f, 2);
     const uint32_t symtab = rd<uint32_t>(f, 8), nsymbols = rd<uint32_t>(f, 12);
     const uint16_t optional = rd<uint16_t>(f, 16);
@@ -183,12 +186,100 @@ void read_coff(const std::vector<uint8_t> &f, Object &o) {
     }
 }
 
+uint64_t uleb(const std::vector<uint8_t> &b, size_t &at) {
+    uint64_t v = 0;
+    for (int shift = 0;; shift += 7) {
+        const uint8_t byte = b.at(at++);
+        v |= uint64_t(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) return v;
+    }
+}
+void skip_sleb(const std::vector<uint8_t> &b, size_t &at) {
+    while (b.at(at++) & 0x80) {
+    }
+}
+
+// ELF's unwind information: each stencil's and helper's FDE in .eh_frame, with
+// its CIE, kept as stencil_format.h's Piece describes, for the run time to
+// write an FDE for every copy. The CIEs clang writes are "zR" (no personality,
+// no LSDA: nothing in the stencils catches) with pc-relative 4-byte addresses,
+// which the run time cannot use where its table lies more than 2 GB from the
+// code, so the encoding becomes 8-byte absolute addresses.
+void read_eh_frame(Object &o, size_t index, const std::map<uint64_t, std::pair<uint32_t, int64_t>> &relocs) {
+    const std::vector<uint8_t> &b = o.sections[index].bytes;
+    std::map<size_t, std::vector<uint8_t>> cies; // by offset: the body, rewritten
+    for (size_t at = 0; at + 4 <= b.size();) {
+        const uint32_t length = rd<uint32_t>(b, at);
+        if (length == 0) break;
+        if (length == 0xFFFFFFFFu) fail(".eh_frame: a 64-bit entry");
+        const size_t end = at + 4 + length;
+        if (end > b.size()) fail(".eh_frame: an entry past its end");
+        const uint32_t id = rd<uint32_t>(b, at + 4);
+        if (id == 0) {
+            std::vector<uint8_t> body(b.begin() + at + 8, b.begin() + end);
+            size_t p = 1; // past the version
+            std::string augmentation;
+            while (body.at(p)) augmentation += char(body[p++]);
+            p++;
+            if (augmentation != "zR") fail(".eh_frame: a CIE with augmentation \"" + augmentation + "\"");
+            uleb(body, p);      // code alignment
+            skip_sleb(body, p); // data alignment
+            if (body[0] == 1)
+                p++; // the return address register: a byte in version 1
+            else
+                uleb(body, p);
+            if (uleb(body, p) != 1) fail(".eh_frame: a CIE's augmentation data is not one byte");
+            if (body.at(p) != 0x1B) fail(".eh_frame: a CIE's addresses are not pc-relative 4-byte ones");
+            body[p] = 0x00; // DW_EH_PE_absptr
+            cies[at] = std::move(body);
+        } else {
+            auto cie = cies.find(at + 4 - id);
+            if (cie == cies.end()) fail(".eh_frame: an FDE before its CIE");
+            auto r = relocs.find(at + 8);
+            if (r == relocs.end()) fail(".eh_frame: an FDE without its start's relocation");
+            const Symbol &sym = o.symbols.at(r->second.first);
+            if (sym.section < 0) fail(".eh_frame: an FDE for an undefined symbol");
+            if (int64_t(sym.value) + r->second.second != 0) fail(".eh_frame: an FDE not at its section's start");
+            // after the start and the range (4 bytes each): the augmentation
+            // data's length (none for "zR") and the instructions
+            std::vector<uint8_t> tail(b.begin() + at + 16, b.begin() + end);
+            size_t q = 0;
+            if (uleb(tail, q) != 0) fail(".eh_frame: an FDE with augmentation data");
+            bool rules = false;
+            for (size_t k = q; k < tail.size(); k++) rules |= tail[k] != 0; // 0: DW_CFA_nop
+            Section &fn = o.sections[size_t(sym.section)];
+            if (!fn.unwind.empty()) fail(".eh_frame: two FDEs for " + fn.name);
+            // a leaf, which never holds a return address, has nothing past
+            // the CIE's rules: no FDE for its copies (as Windows has no .pdata entry)
+            if (rules) {
+                const std::vector<uint8_t> &body = cie->second;
+                fn.unwind = {uint8_t(body.size()), uint8_t(body.size() >> 8)};
+                fn.unwind.insert(fn.unwind.end(), body.begin(), body.end());
+                fn.unwind.insert(fn.unwind.end(), tail.begin(), tail.end());
+            }
+        }
+        at = end;
+    }
+    // ARM64: a function that calls (bl, blr) keeps LR in its frame, so it has
+    // rules; one without would unwind to garbage
+    if (o.arm64)
+        for (Section &s : o.sections) {
+            if (!s.code || !s.unwind.empty()) continue;
+            for (size_t k = 0; k + 4 <= s.bytes.size(); k += 4) {
+                const uint32_t w = rd<uint32_t>(s.bytes, k);
+                if ((w & 0xFC000000u) == 0x94000000u || (w & 0xFFFFFC1Fu) == 0xD63F0000u)
+                    fail(s.name + " calls but has no unwind rules");
+            }
+        }
+}
+
 // ELF64 (Linux, Android): relocations with explicit addends
 void read_elf(const std::vector<uint8_t> &f, Object &o) {
     if (f.size() < 64 || f[4] != 2 || f[5] != 1) fail("ELF: not 64-bit little-endian");
     const uint16_t machine = rd<uint16_t>(f, 18);
     const bool x64 = machine == 62, arm64 = machine == 183;
     if (!x64 && !arm64) fail("ELF machine not x86-64 or AArch64");
+    o.arm64 = arm64;
     const uint64_t shoff = rd<uint64_t>(f, 40);
     const uint16_t shentsize = rd<uint16_t>(f, 58), shnum = rd<uint16_t>(f, 60), shstrndx = rd<uint16_t>(f, 62);
     struct Sh {
@@ -237,11 +328,24 @@ void read_elf(const std::vector<uint8_t> &f, Object &o) {
         if (sym.name.empty() && (f[at + 4] & 0xF) == 3) sym.name = o.sections[shndx].name; // a section's symbol
         o.symbols.push_back(sym);
     }
+    // .eh_frame's relocations: the FDEs' starts (offset: symbol, addend)
+    std::map<uint64_t, std::pair<uint32_t, int64_t>> eh_relocs;
+    int eh_frame = -1;
     for (uint16_t s = 0; s < shnum; s++) {
         if (sh[s].type != 4) continue; // SHT_RELA
         Section &sec = o.sections[sh[s].info];
-        // the unwind tables' own (read with them, once registered: see below)
-        if (sec.name == ".eh_frame" || !(sh[sh[s].info].flags & 2)) continue;
+        if (sec.name == ".eh_frame") {
+            eh_frame = int(sh[s].info);
+            for (uint64_t at = sh[s].offset; at + 24 <= sh[s].offset + sh[s].size; at += 24) {
+                const uint32_t type = uint32_t(rd<uint64_t>(f, at + 8));
+                // x86-64 PC32, AArch64 PREL32: the FDE's start, pc-relative (encoding 0x1B)
+                if ((x64 && type != 2) || (arm64 && type != 261))
+                    fail("ELF .eh_frame relocation type " + std::to_string(type));
+                eh_relocs[rd<uint64_t>(f, at)] = {uint32_t(rd<uint64_t>(f, at + 8) >> 32), rd<int64_t>(f, at + 16)};
+            }
+            continue;
+        }
+        if (!(sh[sh[s].info].flags & 2)) continue;
         for (uint64_t at = sh[s].offset; at + 24 <= sh[s].offset + sh[s].size; at += 24) {
             const uint64_t info = rd<uint64_t>(f, at + 8);
             const uint32_t type = uint32_t(info);
@@ -287,8 +391,7 @@ void read_elf(const std::vector<uint8_t> &f, Object &o) {
             sec.rels.push_back(rel);
         }
     }
-    // TODO: .eh_frame's FDEs for the stencils, so an Unwind can cross them on
-    // Linux as .pdata lets it on Windows (stencil_jit.cpp registers neither yet there)
+    if (eh_frame >= 0) read_eh_frame(o, size_t(eh_frame), eh_relocs);
 }
 
 // ---- the table ----
@@ -360,9 +463,15 @@ std::string write_table(const Object &o, const std::string &source) {
             } else if (int h = hole_index(sym.name); h >= 0) {
                 if (!stencil) fail("a hole outside a stencil: " + sec.name);
                 target = "TargetKind::Hole, " + std::to_string(h);
-                // the last five bytes a jmp rel32 to the next stencil (x86-64)
-                if (h == int(Hole::Next) && r.kind == RelocKind::PcRel32 && r.offset + 4 == sec.bytes.size() &&
-                    r.offset >= 1 && sec.bytes[r.offset - 1] == 0xE9 && r.addend == -4)
+                // the last five bytes a jmp rel32 to the next stencil (x86-64),
+                // or the last four a b (ARM64)
+                if (h == int(Hole::Next) && !o.arm64 && r.kind == RelocKind::PcRel32 &&
+                    r.offset + 4 == sec.bytes.size() && r.offset >= 1 && sec.bytes[r.offset - 1] == 0xE9 &&
+                    r.addend == -4)
+                    tail = true;
+                if (h == int(Hole::Next) && o.arm64 && r.kind == RelocKind::Branch26 &&
+                    r.offset + 4 == sec.bytes.size() && r.addend == 0 &&
+                    (rd<uint32_t>(sec.bytes, r.offset) & 0xFC000000u) == 0x14000000u)
                     tail = true;
             } else if (int e = extern_index(sym.name); e >= 0) {
                 target = "TargetKind::Extern, " + std::to_string(e);
@@ -457,6 +566,10 @@ int main(int argc, char **argv) {
     // and no jump tables: one is data that names its function's code, which
     // a copy per use cannot share
     command += " -ffunction-sections -fdata-sections -fno-jump-tables";
+    // ARM64 on Linux: atomics inline (LDXR/STXR at the baseline), not calls
+    // to libgcc's __aarch64_cas* helpers, which clang chooses there by
+    // default and the tier does not provide
+    if (arm64) command += " -mno-outline-atomics";
     // ELF: position independent (an absolute 32-bit field would need the code
     // in the low 2 GB); stencils.cpp declares every symbol hidden, so a hole
     // is a pc-relative field, never reached through the GOT

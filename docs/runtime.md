@@ -3369,6 +3369,25 @@ before the fused add, so an exact zero result came out +0 where the PPC's
 negation apart (docs/recompiler.md, "Floating point").
 Not tried on ARM64 yet: the kernel, the game library, the renderer.
 
+**The first tier on Linux and ARM64** (2026-11-13; docs/recompiler.md,
+"Linux and ARM64"). The copy-and-patch tier is available on Linux x86-64 and
+on ARM64 Linux and Android: the copies' unwind information is a `.eh_frame`
+registered with `__register_frame`, and ARM64's relocations are patched, with
+veneers past a branch's 128 MB. On ARM64 the stencils need clang 19 or later
+(`-DXF_STENCIL_CLANG=/usr/bin/clang++-19` where the build's clang is 18, as
+Ubuntu 24.04's; the cross build passes its `--target` on). Checked:
+`ppc_stencil_test` on Linux x86-64 (clang 18) and on ARM64 under
+`qemu-aarch64` (stencils by clang 19, the rest by clang 18): 141,705 cases
+run in the tier's code, none differing from the interpreter, every construct
+program passing and the exception crossing the tier's frames; on ARM64 also
+with `XF_STENCIL_FAR=1` (every far path taken). Game B on Linux x86-64,
+deterministic to swap 1,500 (`--deterministic --spin-idle`): the tier
+(`XF_TIER=stencil`: all 21,720 functions, 189.7 MB of code, 697,178 FDEs
+registered, ready in 1.8 s) and the interpreter leave the guest memory hash
+the tier leaves on Windows (`2aec43aac0cf9ecc`), the tier in 20.7 s of host
+time against the interpreter's 99.7 s (WSL2, one run each). Not tried there
+yet: the tier-up to a library built on Linux, and a game on ARM64.
+
 ## Order
 
 1. Memory (an agent, from Xenia's memory.cc).

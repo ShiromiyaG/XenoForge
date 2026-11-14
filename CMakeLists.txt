@@ -115,15 +115,23 @@ add_custom_command(
 # library's flags, its machine code and holes taken out of the object by
 # xfstencil into stencils.inc, which src/stencil_jit.cpp includes. With
 # another compiler or host the tier is left out (stencil.h's available()).
+# XF_STENCIL_CLANG: the clang that compiles the stencils (the build's by
+# default); ARM64 needs clang 19 or later, the first with preserve_none there
+# (an older one ignores it: the stencils still run, slower).
 target_sources(xenoforge PRIVATE src/stencil_jit.cpp)
 add_executable(xfstencil tools/xfstencil.cpp)
 target_include_directories(xfstencil PRIVATE include)
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64")
+set(XF_STENCIL_CLANG "${CMAKE_CXX_COMPILER}" CACHE FILEPATH "the clang++ that compiles the copy-and-patch stencils")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64|aarch64|arm64|ARM64")
     set(XF_STENCIL_OUT ${CMAKE_CURRENT_BINARY_DIR}/stencil)
+    set(XF_STENCIL_TARGET)
+    if(CMAKE_CXX_COMPILER_TARGET)
+        set(XF_STENCIL_TARGET --target ${CMAKE_CXX_COMPILER_TARGET})
+    endif()
     add_custom_command(
         OUTPUT ${XF_STENCIL_OUT}/stencils.inc
-        COMMAND xfstencil ${CMAKE_CXX_COMPILER} ${CMAKE_CURRENT_SOURCE_DIR}/src/stencil/stencils.cpp
-                ${CMAKE_CURRENT_SOURCE_DIR}/include ${XF_STENCIL_OUT}
+        COMMAND xfstencil ${XF_STENCIL_CLANG} ${CMAKE_CURRENT_SOURCE_DIR}/src/stencil/stencils.cpp
+                ${CMAKE_CURRENT_SOURCE_DIR}/include ${XF_STENCIL_OUT} ${XF_STENCIL_TARGET}
         DEPENDS xfstencil src/stencil/stencils.cpp src/stencil_format.h ${XF_GAME_INTERFACE_INPUTS}
         COMMENT "the copy-and-patch tier's stencils")
     target_sources(xenoforge PRIVATE ${XF_STENCIL_OUT}/stencils.inc)
