@@ -130,11 +130,14 @@ function(xenoforge_add_port name)
         file(GLOB interface_headers CONFIGURE_DEPENDS ${XENOFORGE_INCLUDE_DIR}/xenoforge/ppc*.h
              ${XENOFORGE_INCLUDE_DIR}/xenoforge/ppc_ops/*.h ${XENOFORGE_INCLUDE_DIR}/xenoforge/ppc_opcodes.inc
              ${XENOFORGE_INCLUDE_DIR}/xenoforge/game_library.h ${XENOFORGE_INCLUDE_DIR}/xenoforge/recomp.h)
+        # lists (v3's two flags) kept one argument each: VERBATIM splits a list at its semicolons
+        string(REPLACE ";" "$<SEMICOLON>" opt_arg "${opt}")
+        string(REPLACE ";" "$<SEMICOLON>" cpu_flags_arg "${XF_GAME_CPU_FLAGS}")
         set(configure_args -S ${_XF_PORT_DIR}/game_library -B ${gen}/build -G ${CMAKE_GENERATOR}
             -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
             -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM} -DXF_GAME_NAME=${name}
             -DXF_GAME_CODE=${gen}/code -DXF_GAME_OUT=${gen}/lib -DXF_INCLUDE_DIR=${XENOFORGE_INCLUDE_DIR}
-            "-DXF_GAME_OPT=${opt}" "-DXF_GAME_CPU_FLAGS=${XF_GAME_CPU_FLAGS}")
+            "-DXF_GAME_OPT=${opt_arg}" "-DXF_GAME_CPU_FLAGS=${cpu_flags_arg}")
         add_custom_command(
             OUTPUT ${lib}
             COMMAND $<TARGET_FILE:XenoForge::xfrecomp> ${emit_args}
