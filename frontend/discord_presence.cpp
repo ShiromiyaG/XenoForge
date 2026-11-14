@@ -295,39 +295,47 @@ struct Presence::Impl {
         link.close();
         ready = false;
     }
-    // sleeps up to 15 s, less when asked to stop
-    void pause() {
+    // sleeps up to `seconds`, less when asked to stop
+    void pause(int seconds = 15) {
         std::unique_lock lock(mutex);
-        wake.wait_for(lock, std::chrono::seconds(15), [this] { return stopping; });
+        wake.wait_for(lock, std::chrono::seconds(seconds), [this] { return stopping; });
     }
 
-    // connect, handshake and set the activity; false when Discord is not there or does not answer
-    bool connect() {
+    // connect, handshake and set the activity; false when Discord is not there or does not answer. A Discord that
+    // is there but slow (it answers late while it takes in another client's activity: titles opened and closed in a
+    // row, the launcher stepping aside) is tried again soon, 2, 4 then 8 s later, before the 15 s of one not running.
+    int unanswered = 0;
+    int connect() {
         if (!link.open()) {
             say(2, "Discord is not running (tried again every 15 s)");
-            return false;
+            return 15;
         }
         uint32_t op = 0;
         std::string body;
         unsigned char head[8];
-        if (!link.write(encode_frame(OP_HANDSHAKE, handshake_json(client_id))) || link.read((char *)head, 1, 3000) <= 0 ||
+        if (!link.write(encode_frame(OP_HANDSHAKE, handshake_json(client_id))) || link.read((char *)head, 1, 8000) <= 0 ||
             !read_frame_after_first(head, op, body) || op != OP_FRAME ||
             !link.write(encode_frame(OP_FRAME, activity_json(process_id(), title, state, started, next_nonce(), image,
                                                              image_text, name)))) {
             link.close();
-            say(3, "Discord did not answer the handshake (tried again every 15 s)");
-            return false;
+            say(3, "Discord did not answer the handshake (tried again shortly)");
+            const int wait = unanswered < 3 ? 2 << unanswered : 15;
+            unanswered++;
+            return wait;
         }
         say(1, "the activity is set");
+        unanswered = 0;
         ready = true;
-        return true;
+        return 0;
     }
 
     void run() {
         while (!stop_requested()) {
-            if (!link.is_open() && !connect()) {
-                pause(); // not running (or not answering): try again later, quietly
-                continue;
+            if (!link.is_open()) {
+                if (const int wait = connect()) {
+                    pause(wait); // not running (or not answering): try again later, quietly
+                    continue;
+                }
             }
             // connected: answer what Discord sends (its replies, PING, CLOSE) while waiting
             unsigned char head[8];
