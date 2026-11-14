@@ -3158,13 +3158,21 @@ cleared and CLOSE (2) sent. All of it is on a thread of its own: the game never 
 not running the thread retries every 15 s without a word. Titles are escaped as JSON (quotes, control characters,
 invalid UTF-8) and cut at 128 bytes.
 
-**Privacy.** Only the title and the start time are sent. Never the title ID, the gamertag, a path or anything of the
-account; a game with no name shows as "A game".
+**What it shows.** In the launcher, while no game runs: "In the launcher", with XenoForge's own art asset
+("xenoforge"). While a game runs, the player's: the game's title, the time since it started and, as the large
+image, the game's box art on the Xbox 360 Marketplace's own catalog of title images
+(`http://download.xbox.com/content/images/66acd000-77fe-1000-9115-d802<title id>/1033/boxartlg.jpg`, by the title
+ID; Discord fetches it through its media proxy; http only, as its https certificate does not match). A title
+the catalog has no art for shows an empty image. The launcher steps aside while a game runs, and each says one
+line in its log a change ("discord: the activity is set", "Discord is not running", "did not answer").
+
+**Privacy.** Sent to Discord: the game's title, the start time and the box art's address, which carries the
+title ID. Never the gamertag, a path or anything of the account; a game with no name shows as "A game".
 
 **Settings.** `[discord]` in config.toml, shared (not per game): `enabled` (default true) and `client_id`, the
 Application ID of a Discord application. The default of `client_id` is the build's `-DXF_DISCORD_CLIENT_ID=`, which
 is the project's own "XenoForge" application (1570958722610634802) unless a build sets another; with none, presence is off and the launcher's Settings > Interface page ("Integrations") says why. The page's toggle
-writes `enabled`. The launcher itself shows no presence; the player does. The application needs a "xenoforge" art
+writes `enabled`. The application needs a "xenoforge" art
 asset (Rich Presence > Art Assets in the developer portal) for the large image.
 
 ## Other hosts (2026-11-12)

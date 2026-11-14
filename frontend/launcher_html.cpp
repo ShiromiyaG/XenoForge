@@ -564,7 +564,7 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
         s += group("Integrations",
                    check_row("discord.enabled", "Discord Rich Presence",
                              page.discord_has_id
-                                 ? "Shows \"Playing <game>\" and the time since it started on your Discord profile while a game runs. Only the game's title and the start time are sent."
+                                 ? "Shows XenoForge on your Discord profile: \"In the launcher\", or the game being played, its box art and the time since it started. Sent: the game's title, the start time, and the address of its box art on Xbox's catalog (which carries the title ID)."
                                  : "Off for now: this build has no Discord application ID. Set client_id under [discord] in config.toml (or build with XF_DISCORD_CLIENT_ID) to turn it on. Only the game's title and the start time would be sent.",
                              page.discord));
         break;

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -89,13 +90,26 @@ std::string handshake_json(const std::string &client_id) {
 }
 
 std::string activity_json(int pid, const std::string &title, const std::string &state, int64_t start_seconds,
-                          const std::string &nonce) {
+                          const std::string &nonce, const std::string &image, const std::string &image_text) {
     // details and state are 2 to 128 characters for Discord; a shorter text is padded by a space
     auto field = [](const std::string &s) { return json_string(s.size() < 2 ? s + " " : s, 128); };
+    // the image: an art asset's key, or a picture's address (Discord fetches it through its media proxy)
     return "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + std::to_string(pid) + ",\"activity\":{\"details\":" +
            field(title) + ",\"state\":" + field(state) + ",\"timestamps\":{\"start\":" + std::to_string(start_seconds) +
-           "},\"assets\":{\"large_image\":\"xenoforge\",\"large_text\":\"XenoForge\"}}},\"nonce\":" +
-           json_string(nonce) + "}";
+           "},\"assets\":{\"large_image\":" + json_string(image, 256) + ",\"large_text\":" + field(image_text) +
+           "}}},\"nonce\":" + json_string(nonce) + "}";
+}
+
+std::string title_art_url(const std::string &title_id) {
+    if (title_id.size() != 8) return "";
+    std::string id;
+    for (char c : title_id) {
+        if (!std::isxdigit(static_cast<unsigned char>(c))) return "";
+        id += char(std::tolower(static_cast<unsigned char>(c)));
+    }
+    // the Xbox 360 Marketplace's box art, by the title's ID in the last 8 digits of its product ID; served over
+    // http only (its https certificate does not match), which Discord's media proxy takes
+    return "http://download.xbox.com/content/images/66acd000-77fe-1000-9115-d802" + id + "/1033/boxartlg.jpg";
 }
 
 std::string clear_json(int pid, const std::string &nonce) {
@@ -231,8 +245,17 @@ int process_id() {
 } // namespace
 
 struct Presence::Impl {
-    std::string client_id, title;
+    std::string client_id, title, state, image, image_text;
     int64_t started = 0;
+    // what was last said in the log (one line a change, not one a retry): 0 nothing, 1 set, 2 not running,
+    // 3 no answer
+    int said = 0;
+    void say(int what, const char *text) {
+        if (said == what) return;
+        said = what;
+        std::printf("discord: %s\n", text);
+        std::fflush(stdout);
+    }
     std::thread thread;
     std::mutex mutex;
     std::condition_variable wake;
@@ -276,16 +299,22 @@ struct Presence::Impl {
 
     // connect, handshake and set the activity; false when Discord is not there or does not answer
     bool connect() {
-        if (!link.open()) return false;
+        if (!link.open()) {
+            say(2, "Discord is not running (tried again every 15 s)");
+            return false;
+        }
         uint32_t op = 0;
         std::string body;
         unsigned char head[8];
         if (!link.write(encode_frame(OP_HANDSHAKE, handshake_json(client_id))) || link.read((char *)head, 1, 3000) <= 0 ||
             !read_frame_after_first(head, op, body) || op != OP_FRAME ||
-            !link.write(encode_frame(OP_FRAME, activity_json(process_id(), title, "XenoForge", started, next_nonce())))) {
+            !link.write(encode_frame(OP_FRAME, activity_json(process_id(), title, state, started, next_nonce(), image,
+                                                             image_text)))) {
             link.close();
+            say(3, "Discord did not answer the handshake (tried again every 15 s)");
             return false;
         }
+        say(1, "the activity is set");
         ready = true;
         return true;
     }
@@ -330,15 +359,19 @@ struct Presence::Impl {
 Presence::Presence() = default;
 Presence::~Presence() { stop(); }
 
-bool Presence::start(const std::string &client_id, const std::string &title) {
+bool Presence::start(const std::string &client_id, const std::string &title, const std::string &state,
+                     const std::string &image, const std::string &image_text) {
 #if defined(__ANDROID__)
-    (void)client_id, (void)title;
+    (void)client_id, (void)title, (void)state, (void)image, (void)image_text;
     return false;
 #else
     if (client_id.empty() || impl_) return false;
     impl_ = std::make_unique<Impl>();
     impl_->client_id = client_id;
     impl_->title = title;
+    impl_->state = state;
+    impl_->image = image;
+    impl_->image_text = image_text;
     impl_->started =
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     impl_->thread = std::thread([p = impl_.get()] { p->run(); });

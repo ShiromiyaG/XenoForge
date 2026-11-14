@@ -51,6 +51,10 @@ int main() {
                      "\"The \\\"Test\\\" \\\\ Game\\n \xC3\xA9\xE2\x84\xA2\",\"state\":\"XenoForge\","
                      "\"timestamps\":{\"start\":1700000000},\"assets\":{\"large_image\":\"xenoforge\","
                      "\"large_text\":\"XenoForge\"}}},\"nonce\":\"7\"}");
+        // a picture by its address as the large image, and the box art's address by a made-up title ID
+        CHECK(d::activity_json(1, "ab", "s", 2, "3", "http://x/y.jpg", "ab").find("\"large_image\":\"http://x/y.jpg\",\"large_text\":\"ab\"") != std::string::npos);
+        CHECK(d::title_art_url("58460001") == "http://download.xbox.com/content/images/66acd000-77fe-1000-9115-d80258460001/1033/boxartlg.jpg");
+        CHECK(d::title_art_url("5846000") == "" && d::title_art_url("5846000G") == "");
         CHECK(d::clear_json(1234, "8") == "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":1234},\"nonce\":\"8\"}");
         CHECK(d::json_string("a\x01" "b") == "\"a\\u0001b\"");
         CHECK(d::json_string("bad\xFF" "x") == "\"bad\xEF\xBF\xBD" "x\"");     // invalid UTF-8 replaced
@@ -642,7 +646,9 @@ int main() {
         CHECK(!b.launcher.smooth_edges && frontend::Settings().launcher.smooth_edges); // on unless the file says off
         CHECK(frontend::backdrop_choices().size() == 3);
         CHECK(!b.discord.enabled && b.discord.client_id == "123456789012345678");
-        CHECK(frontend::Settings().discord.enabled && frontend::Settings().discord.client_id.empty()); // on, but no ID
+        // on by default; the ID is the build's default (XF_DISCORD_CLIENT_ID): empty, or digits
+        CHECK(frontend::Settings().discord.enabled &&
+              frontend::Settings().discord.client_id.find_first_not_of("0123456789") == std::string::npos);
         CHECK(b.launcher.x == -1200 && b.launcher.y == 40 && b.launcher.width == 1500 && b.launcher.height == 900 && b.launcher.maximized);
         std::filesystem::remove(file);
     }

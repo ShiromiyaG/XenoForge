@@ -408,11 +408,15 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     SDL_Window *window = SDL_CreateWindow((window_title + " - XenoForge").c_str(), 1280, 720,
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!window) return fail(std::string("SDL: ") + SDL_GetError());
-    // Discord Rich Presence: the title and the start time, on a thread of its own (nothing without a client ID)
+    // Discord Rich Presence: the title, the start time and the game's art, on a thread of its own (nothing without a
+    // client ID). The art is the Marketplace's box art by the title ID (Discord fetches it); XenoForge's own image is
+    // the launcher's.
     frontend::discord::Presence presence;
     if (settings.discord.enabled && !settings.discord.client_id.empty()) {
-        // never the title ID: a game without a name is "A game"
-        presence.start(settings.discord.client_id, window_title == title_id ? "A game" : window_title);
+        const std::string name = window_title == title_id ? "A game" : window_title;
+        const std::string art = frontend::discord::title_art_url(title_id);
+        presence.start(settings.discord.client_id, name, "XenoForge", art.empty() ? "xenoforge" : art, name);
+        std::printf("discord: presence for %s%s\n", name.c_str(), art.empty() ? "" : " with its box art");
     }
     if (!frontend::set_window_icon(window, frontend::title_icon(g.xex)))
         frontend::set_window_icon(window, frontend::xenoforge_icon_png());

@@ -50,6 +50,7 @@
 //            [--demo-speed X] [--show-log] [--capture-binding <name>] [--menu <name>] [--context-menu] [--tab <name>]
 //            [--render-size WxH] [--scale F] [--assets <dir>]
 
+#include "discord_presence.h"
 #include "launcher_core.h"
 #include "window_icon.h"
 #include "xenoforge/game_build.h"
@@ -369,7 +370,18 @@ int main(int argc, char **argv) {
     bool quit = false;
     uint64_t frames = 0;
     bool window_shown = false;
+    // Discord Rich Presence while no game runs, with XenoForge's own image; a game's player shows its own (the
+    // game's art) and this one steps aside while it runs
+    frontend::discord::Presence presence;
+    bool presence_on = false;
     while (!quit) {
+        {
+            const frontend::Settings::Discord &d = core.discord();
+            const bool want = d.enabled && !d.client_id.empty() && !core.run().running;
+            if (want && !presence_on) presence.start(d.client_id, "In the launcher");
+            if (!want && presence_on) presence.stop();
+            presence_on = want;
+        }
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_EVENT_QUIT) quit = true;
