@@ -110,6 +110,10 @@ body { background-color: transparent; }
 .tb.off:hover { border-color: {btn-border}; decorator: linear-gradient(180deg, {btn-0} 0%, {btn-1} 40%, {btn-2} 62%, {btn-3} 100%); }
 .tb.stop .ic { color: {bad-ic}; }
 #tb-space { flex: 1 1 0; }
+/* the views, at the toolbar's right: icon only, the chosen one lit like a pressed toggle */
+.tb.icon { width: 30dp; padding: 0; justify-content: center; margin-right: 4dp; }
+.tb.icon .ic { margin-right: 0; font-size: 18dp; }
+#tb-view-grid { margin-right: 0; }
 
 /* ------------------------------------------------------------------- table */
 
@@ -203,6 +207,80 @@ body { background-color: transparent; }
 .opt-btn .cog { font-size: 19dp; line-height: 27dp; }
 .opt-btn:hover { border-color: {opt-h-border}; decorator: linear-gradient(180deg, {opt-h0} 0%, {opt-h1} 38%, {opt-h2} 58%, {opt-h3} 100%); }
 .opt-btn:active { decorator: linear-gradient(180deg, {opt-p0} 0%, {opt-p1} 60%, {opt-p2} 100%); box-shadow: 0 0 0 1dp {opt-p-ring}, inset 0 1dp 3dp 0 {btn-p-inset}; }
+
+/* ---------------------------------------------------------------- grid view
+   the games as tiles, in as many columns as fit (LauncherView::update_grid sets cols-N on the body from its
+   width); each tile sits in a cell of a share of the width and a fixed height, so the selected one, which
+   grows past its cell, moves nothing. No column heads: the sort stays as the list left it. */
+
+#table.grid #thead { display: none; }
+#table.grid #tbody { margin-top: 0; padding-top: 14dp; display: flex; flex-direction: row; flex-wrap: wrap; align-content: flex-start; }
+#table.grid.has-games #tempty { top: 52dp; }
+.cell { position: relative; flex: 0 0 auto; width: 20%; height: 232dp; padding: 0 9dp; }
+#tbody.cols-1 .cell { width: 100%; }
+#tbody.cols-2 .cell { width: 50%; }
+#tbody.cols-3 .cell { width: 33.3333%; }
+#tbody.cols-4 .cell { width: 25%; }
+#tbody.cols-5 .cell { width: 20%; }
+#tbody.cols-6 .cell { width: 16.6666%; }
+#tbody.cols-7 .cell { width: 14.2857%; }
+#tbody.cols-8 .cell { width: 12.5%; }
+#tbody.cols-9 .cell { width: 11.1111%; }
+#tbody.cols-10 .cell { width: 10%; }
+.tile {
+    position: relative; display: flex; flex-direction: column; align-items: center; width: 100%; height: 214dp; padding: 16dp 8dp 0 8dp; cursor: pointer;
+    border: 2dp {row-border}; border-radius: 9dp;
+    decorator: radial-gradient(ellipse 40% 60% at 25.7% 0%, {row-shine}, #ffffff00),
+               radial-gradient(ellipse 40% 60% at 75.4% 0%, {row-shine}, #ffffff00),
+               linear-gradient(180deg, {row-0} 0%, {row-1} 55%, {row-2} 95%, {row-3} 100%);
+    box-shadow: 0 0 0 1dp {row-ring}, 0 3dp 6dp 1dp {row-drop}, inset 0 1dp 0 0 {row-inset};
+    transition: decorator 0.2s cubic-out, border-color 0.2s cubic-out, border-width 0.2s cubic-out, margin 0.2s cubic-out;
+}
+.tile:hover {
+    border-color: {row-border-h};
+    decorator: radial-gradient(ellipse 40% 60% at 25.7% 0%, {row-shine-h}, #ffffff00),
+               radial-gradient(ellipse 40% 60% at 75.4% 0%, {row-shine-h}, #ffffff00),
+               linear-gradient(180deg, {row-h0} 0%, {row-h1} 55%, {row-h2} 95%, {row-h3} 100%);
+}
+.tile.sel, .tile.sel:hover {
+    border: 3dp {ac-edge}; border-radius: 10dp; margin: -2dp; border-color: {ac-edge};
+    decorator: radial-gradient(ellipse 40% 60% at 25.7% 0%, #ffffff4a, #ffffff00),
+               radial-gradient(ellipse 40% 60% at 75.4% 0%, #ffffff4a, #ffffff00),
+               linear-gradient(180deg, {ac-top}e0 0%, {ac-mid}e0 55%, {ac-low}e0 95%, {ac-end}e0 100%);
+    box-shadow: none;
+}
+.tile .glow {
+    position: absolute; left: -3dp; top: -3dp; right: -3dp; bottom: -3dp; border-radius: 10dp; opacity: 0; pointer-events: none;
+    box-shadow: 0 0 0 1dp {ac-ring}, 0 0 24dp 6dp {ac-glow}e0, 0 0 8dp 2dp {ac-shine}, inset 0 0 14dp 0 {ac-edge}90;
+}
+.tile.sel .glow { opacity: 1; }
+/* the game's image (the console's 64 pixels, scaled to the tile) or a coloured tile with its initial */
+.tile-art { flex: 0 0 104dp; width: 104dp; height: 104dp; border-radius: 6dp; overflow: hidden; }
+.tile-art .letter { width: 104dp; height: 104dp; line-height: 104dp; text-align: center; font-family: Inter; font-size: 48dp; font-weight: 700; color: #ffffffe0; }
+.tile-art.broken { text-align: center; line-height: 104dp; background-color: #4a2f31; color: #ff8a80; }
+.tile-art.broken .ic { font-size: 40dp; line-height: 104dp; }
+/* two lines of the name, the second cut at the tile's edge */
+.tile-title {
+    flex: 0 0 auto; width: 100%; height: 46dp; margin-top: 10dp; overflow: hidden; text-align: center;
+    font-family: Condensed; font-weight: 400; font-size: 21dp; line-height: 23dp; color: {g-text};
+}
+.tile-status {
+    flex: 0 0 auto; display: flex; flex-direction: row; align-items: center; justify-content: center; max-width: 100%; margin-top: 6dp; overflow: hidden;
+    font-family: Condensed; font-weight: 400; font-size: 16dp; line-height: 1; color: {g-text-2}; white-space: nowrap;
+}
+.tile-status .dot { flex: 0 0 10dp; width: 10dp; height: 10dp; border-radius: 5dp; margin-right: 8dp; }
+.tile-status .dot.prep { background-color: {dot-prep}; }
+.tile-status .dot.ready { background-color: {dot-ready}; }
+.tile-status .dot.interp, .tile-status .dot.bad { background-color: {dot-bad}; }
+.tile-status .dot.run { background-color: {dot-run}; }
+.tile.broken .tile-title { color: {g-text-2}; }
+.tile.sel .tile-title { color: {sel-text}; }
+.tile.sel .tile-status { color: {sel-sub}; }
+.tile.sel .tile-status .dot.prep { background-color: {sel-dot-prep}; }
+.tile.sel .tile-status .dot.ready { background-color: {sel-dot-ready}; }
+.tile.sel .tile-status .dot.interp, .tile.sel .tile-status .dot.bad { background-color: {sel-dot-bad}; }
+.tile.sel .tile-status .dot.run { background-color: {sel-dot-run}; }
+.tile-opt { position: absolute; right: 7dp; top: 7dp; }
 
 #tempty { position: absolute; left: 0; top: 38dp; width: 100%; bottom: 0; display: none; padding: 0 8.8%; }
 #table.has-games #tempty { top: 90dp; }

@@ -25,6 +25,9 @@
                         <div class="tb f" id="tb-rescan" data-action="rescan">{i:refresh-cw}<div>Rescan</div></div>
                         <div class="tb f" id="tb-controls" data-action="controls">{i:gamepad-2}<div>Controls</div></div>
                         <div class="tb f" id="tb-demo" data-action="demo-games">{i:layers}<div>Demo games</div></div>
+                        <div id="tb-space"></div>
+                        <div class="tb icon f on" id="tb-view-list" data-action="view" data-arg="list">{i:list}</div>
+                        <div class="tb icon f" id="tb-view-grid" data-action="view" data-arg="grid">{i:grid-3x3}</div>
                     </div>
                     <div id="table">
                         <div id="searchbar"><div id="search-box">{i:search}<input type="text" class="text f" id="search" placeholder="Search games"/><div id="search-clear" data-action="clear-search">{i:x}</div></div></div>

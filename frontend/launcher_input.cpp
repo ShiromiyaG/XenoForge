@@ -151,6 +151,8 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
         show_about();
     } else if (name == "exit") {
         quit_ = true;
+    } else if (name == "view") {
+        set_view(arg == "grid");
     } else if (name == "sort") {
         Column column = Column::Title;
         bool ascending = true;
@@ -376,7 +378,7 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         }
         return false;
     }
-    if (repeat && key != SDLK_UP && key != SDLK_DOWN && key != SDLK_PAGEUP && key != SDLK_PAGEDOWN) return false;
+    if (repeat && key != SDLK_UP && key != SDLK_DOWN && key != SDLK_LEFT && key != SDLK_RIGHT && key != SDLK_PAGEUP && key != SDLK_PAGEDOWN) return false;
     if (ctrl && key == SDLK_O) return do_action("browse", ""), true;
     if (ctrl && key == SDLK_F) {
         if (section_ != Section::Library) return false;
@@ -398,10 +400,15 @@ bool LauncherView::on_key(SDL_Keycode key, SDL_Scancode scancode, bool repeat) {
         else open_menu("help", true);
         return true;
     case SDLK_APPLICATION: open_row_menu(false); return true;
-    case SDLK_UP: move_selection(-1); return true;
-    case SDLK_DOWN: move_selection(1); return true;
-    case SDLK_PAGEUP: move_selection(-visible_rows()); return true;
-    case SDLK_PAGEDOWN: move_selection(visible_rows()); return true;
+    case SDLK_UP: move_selection(-(grid_ ? grid_columns() : 1)); return true; // a row of tiles in the grid
+    case SDLK_DOWN: move_selection(grid_ ? grid_columns() : 1); return true;
+    case SDLK_LEFT: // the list has no sideways: only the grid takes them
+    case SDLK_RIGHT:
+        if (!grid_ || section_ != Section::Library) return false;
+        move_selection(key == SDLK_LEFT ? -1 : 1);
+        return true;
+    case SDLK_PAGEUP: move_selection(-page_step()); return true;
+    case SDLK_PAGEDOWN: move_selection(page_step()); return true;
     case SDLK_HOME: move_selection(-1, true); return true;
     case SDLK_END: move_selection(1, true); return true;
     case SDLK_RETURN:
@@ -473,13 +480,19 @@ bool LauncherView::on_pad_button(SDL_GamepadButton button, bool down) {
         return true;
     }
     switch (button) {
-    case SDL_GAMEPAD_BUTTON_DPAD_UP: repeat(-1); break;
-    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: repeat(1); break;
+    case SDL_GAMEPAD_BUTTON_DPAD_UP: repeat(-(grid_ ? grid_columns() : 1)); break;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: repeat(grid_ ? grid_columns() : 1); break;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+        if (grid_) repeat(-1);
+        break;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+        if (grid_) repeat(1);
+        break;
     case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
-        if (down) move_selection(-visible_rows());
+        if (down) move_selection(-page_step());
         break;
     case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
-        if (down) move_selection(visible_rows());
+        if (down) move_selection(page_step());
         break;
     case SDL_GAMEPAD_BUTTON_SOUTH:
         if (down) do_action("play", "");
@@ -517,7 +530,10 @@ void LauncherView::on_pad_axis(SDL_GamepadAxis axis, int value) {
         }
         return;
     }
-    if (axis != SDL_GAMEPAD_AXIS_LEFTY) return;
+    if (axis != SDL_GAMEPAD_AXIS_LEFTY && axis != SDL_GAMEPAD_AXIS_LEFTX) return;
+    (axis == SDL_GAMEPAD_AXIS_LEFTY ? stick_y_ : stick_x_) = value;
+    // the sideways push means something only to the grid's tiles
+    if (axis == SDL_GAMEPAD_AXIS_LEFTX && (!grid_ || section_ != Section::Library || !menu_.empty() || dialog_ != Dialog::None)) return;
     // in a menu the stick steps once a push
     if (!menu_.empty()) {
         const int dir = std::abs(value) > STICK_THRESHOLD ? (value > 0 ? 1 : -1) : 0;
@@ -533,13 +549,15 @@ void LauncherView::on_pad_axis(SDL_GamepadAxis axis, int value) {
         settings_->on_pad_axis(axis, value);
         return;
     }
-    if (std::abs(value) > STICK_THRESHOLD) {
+    // the stick's step: a tile along the grid's row or a row of tiles (the list: a row), by the push that is greater
+    int delta = 0;
+    if (grid_ && std::abs(stick_x_) > STICK_THRESHOLD && std::abs(stick_x_) >= std::abs(stick_y_)) delta = stick_x_ > 0 ? 1 : -1;
+    else if (std::abs(stick_y_) > STICK_THRESHOLD) delta = (stick_y_ > 0 ? 1 : -1) * (grid_ ? grid_columns() : 1);
+    if (delta != 0) {
         pad_mode_ = true;
-        const int delta = value > 0 ? 1 : -1;
         if (!stick_repeat_.active || stick_repeat_.delta != delta) {
-            if (!menu_.empty()) menu_move(delta);
-            else if (dialog_ == Dialog::None) move_selection(delta);
-            stick_repeat_ = {menu_.empty() && dialog_ == Dialog::None, delta, now_ + 0.36};
+            if (dialog_ == Dialog::None) move_selection(delta);
+            stick_repeat_ = {dialog_ == Dialog::None, delta, now_ + 0.36};
         }
     } else {
         stick_repeat_.active = false;

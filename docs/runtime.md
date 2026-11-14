@@ -2550,8 +2550,8 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   filtering on every word of the title, title ID and file name; a
   toolbar (Play, which becomes Stop while a game runs; Play interpreted; Prepare, Rebuild or Try
   preparing again by the selected game's status; Open Folder, Rescan,
-  Settings, Controls; at its right the views: the list, the grid, which is not
-  there yet, and the keyboard's and the pad's settings); the games as glossy
+  Settings, Controls; at its right the two views, the list and the grid, the chosen
+  one lit; see "The grid" below); the games as glossy
   rows (cover, name, status, title ID, version and an Options button that
   opens the row's menu: Play, Play interpreted, Prepare, Game settings, Open
   the disc's folder, Copy the title ID or path; the same menu on a right
@@ -2563,6 +2563,16 @@ desktop-tool one after it), drawn for a window 1240dp wide:
   list, the table says why (no folder, no games, a search that hides them
   all) with the button that helps. What the mockup shows and is not here yet:
   its own window buttons (the system's frame is used).
+- **The grid** (2026-11-13, `[launcher] view = "list"|"grid"`, the toggle at the toolbar's right, kept in
+  config.toml with the sort): the same games as tiles, the game's picture over its name (two lines) and
+  status, the Options button in the corner (`table_tile_html`). The tiles fill the width in as many columns as
+  hold 186dp each (`LauncherView::update_grid` puts `cols-N` on the body, once a frame and only when the count
+  changes; the stylesheet gives a cell its 100/N percent), each in a cell of fixed height, so the selected tile,
+  which grows past its cell, moves nothing. A tile wears a row's id and `data-index`, so selection, clicks,
+  double click, menus and the glow are the rows' own. Keys: Left and Right move a tile, Up and Down a row of
+  tiles (a row that is not there is the last tile, and none from the last row), Page Up and Down and the
+  bumpers a screenful of rows, the pad's d-pad and left stick likewise (the stick along the greater push).
+  The column heads are not shown in the grid; the sort chosen in the list stays.
 - **The backdrop**: the window's background is not an element's: the renderer
   draws it under the interface at the start of every frame
   (`Renderer::set_backdrop`, `ui.frag` `MODE_BACKDROP`; `#app` and `body` are

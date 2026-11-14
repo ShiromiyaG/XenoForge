@@ -326,6 +326,8 @@ void read_launcher(const toml::table &t, Settings::Launcher &l) {
     get(t, "launcher", "accent", l.accent);
     get(t, "launcher", "theme", l.theme);
     get(t, "launcher", "sort", l.sort);
+    get(t, "launcher", "view", l.view);
+    if (l.view != "grid") l.view = "list";
     get(t, "launcher", "backdrop", l.backdrop);
     get(t, "launcher", "sounds", l.sounds);
     get(t, "launcher", "smooth_edges", l.smooth_edges);
@@ -341,7 +343,7 @@ void read_launcher(const toml::table &t, Settings::Launcher &l) {
 }
 
 toml::table launcher_table(const Settings::Launcher &l) {
-    toml::table t{{"games", l.games}, {"accent", l.accent}, {"theme", l.theme}, {"sort", l.sort},
+    toml::table t{{"games", l.games}, {"accent", l.accent}, {"theme", l.theme}, {"sort", l.sort}, {"view", l.view},
                     {"backdrop", l.backdrop}, {"sounds", l.sounds}, {"smooth_edges", l.smooth_edges},
                     {"background_build", l.background_build}};
     if (l.width > 0) {
