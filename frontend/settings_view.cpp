@@ -169,6 +169,8 @@ SettingsPage SettingsView::page() {
     p.backdrop = core_.launcher().backdrop;
     p.sounds = core_.launcher().sounds;
     p.smooth_edges = core_.launcher().smooth_edges;
+    p.discord = core_.discord().enabled;
+    p.discord_has_id = !core_.discord().client_id.empty();
     if (tab_ == SettingsTab::Controllers) p.gamepads = LauncherCore::gamepads();
     if (tab_ == SettingsTab::Profile) {
         const std::filesystem::path storage = storage_root(edit_, core_.config_file());
@@ -373,6 +375,14 @@ void SettingsView::toggle_setting(Rml::Element *row) {
         core_.set_launcher(l, error);
         if (Rml::Element *box = row->QuerySelector(".check")) box->SetClass("on", l.sounds);
         if (l.sounds) host_.play_sound(Cue::Toggle); // turned on: this is the first one heard
+        return;
+    }
+    if (key == "discord.enabled") {
+        Settings::Discord d = core_.discord();
+        d.enabled = !d.enabled;
+        std::string error;
+        core_.set_discord(d, error);
+        if (Rml::Element *box = row->QuerySelector(".check")) box->SetClass("on", d.enabled);
         return;
     }
     if (key == "ui.smooth_edges") {
@@ -743,6 +753,10 @@ void SettingsView::navigate(NavDir dir) {
         }
         if (kind == "toggle" && key == "ui.sounds") {
             if (core_.launcher().sounds != (dir == NavDir::Right)) toggle_setting(row);
+            return;
+        }
+        if (kind == "toggle" && key == "discord.enabled") {
+            if (core_.discord().enabled != (dir == NavDir::Right)) host_.play_sound(Cue::Toggle), toggle_setting(row);
             return;
         }
         if (kind == "toggle" && key == "ui.smooth_edges") {

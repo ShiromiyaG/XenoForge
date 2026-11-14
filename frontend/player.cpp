@@ -38,6 +38,8 @@
 //        [--screenshot-every N] [--press <b@s>]... [--no-sound] [--overlay] [--rates] [--hook-stats]
 //   player[_<game>] --identify
 
+#include "discord_presence.h"
+#include "discord_presence.h"
 #include "presenter.h"
 #include "sdl_audio.h"
 #include "sdl_input.h"
@@ -406,6 +408,12 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     SDL_Window *window = SDL_CreateWindow((window_title + " - XenoForge").c_str(), 1280, 720,
                                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
     if (!window) return fail(std::string("SDL: ") + SDL_GetError());
+    // Discord Rich Presence: the title and the start time, on a thread of its own (nothing without a client ID)
+    frontend::discord::Presence presence;
+    if (settings.discord.enabled && !settings.discord.client_id.empty()) {
+        // never the title ID: a game without a name is "A game"
+        presence.start(settings.discord.client_id, window_title == title_id ? "A game" : window_title);
+    }
     if (!frontend::set_window_icon(window, frontend::title_icon(g.xex)))
         frontend::set_window_icon(window, frontend::xenoforge_icon_png());
     // one Vulkan device for the renderer and the window: the front buffers
@@ -1071,6 +1079,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     std::printf("player: system dialogs taken %llu, answered %llu (the rest cancelled as the player closed)\n",
                 (unsigned long long)sysui.taken(), (unsigned long long)sysui.answered());
     sysui.cancel_all();
+    presence.stop(); // the activity cleared before the next title (or the exit)
     // the title that follows: the one this launched (XamLoaderLaunchTitle) when its executable is on the same disc,
     // or this one again when the overlay asked for a restart. It is a process of its own, as a console's titles are:
     // the next player starts on the same disc with the launch data the title left it, and this one waits for it.

@@ -53,6 +53,8 @@ class LauncherCore {
     // The launcher's own section as a whole (its look, its window, its
     // table), saved in config.toml with the rest of the file kept.
     const Settings::Launcher &launcher() const { return shared_.launcher; }
+    const Settings::Discord &discord() const { return shared_.discord; }
+    bool set_discord(const Settings::Discord &discord, std::string &error);
     bool set_launcher(const Settings::Launcher &launcher, std::string &error);
 
     // The list as the scan has it so far.

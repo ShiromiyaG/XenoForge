@@ -70,6 +70,15 @@ bool LauncherCore::set_launcher(const Settings::Launcher &launcher, std::string 
     return frontend::save(config_file_, s, error);
 }
 
+bool LauncherCore::set_discord(const Settings::Discord &discord, std::string &error) {
+    shared_.discord = discord;
+    Settings s;
+    std::string ignored;
+    load(config_file_, s, ignored);
+    s.discord = discord;
+    return frontend::save(config_file_, s, error);
+}
+
 void LauncherCore::rescan() { start_scan(); }
 
 void LauncherCore::use_demo_games(std::vector<GameEntry> games) {

@@ -561,6 +561,12 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
                              "\" placeholder=\"No folder chosen\"/>" + button_html("browse", "Browse...", false, {}, "folder-open") +
                              button_html("rescan", "Rescan", false, {}, "refresh-cw") + "</div>";
         s += group("Library", folder);
+        s += group("Integrations",
+                   check_row("discord.enabled", "Discord Rich Presence",
+                             page.discord_has_id
+                                 ? "Shows \"Playing <game>\" and the time since it started on your Discord profile while a game runs. Only the game's title and the start time are sent."
+                                 : "Off for now: this build has no Discord application ID. Set client_id under [discord] in config.toml (or build with XF_DISCORD_CLIENT_ID) to turn it on. Only the game's title and the start time would be sent.",
+                             page.discord));
         break;
     }
     }

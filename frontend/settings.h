@@ -138,6 +138,12 @@ struct Settings {
         int x = 0, y = 0, width = 0, height = 0;
         bool maximized = false;
     } launcher;
+    // Discord Rich Presence ([discord], shared only; docs/runtime.md): "Playing <title>" while a game runs. It needs the
+    // client ID of a Discord application, from the build's default (empty) or config.toml; without one it is off.
+    struct Discord {
+        bool enabled = true;
+        std::string client_id;
+    } discord;
     // the title ID ("5846000A") whose own settings these are, or "" for the
     // shared ones: where save() writes them
     std::string game;

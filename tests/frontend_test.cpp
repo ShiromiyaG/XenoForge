@@ -6,6 +6,7 @@
 
 #include "check.h"
 
+#include "../frontend/discord_presence.h"
 #include "../frontend/launcher_core.h"
 #include "../frontend/launcher_html.h"
 #include "../frontend/launcher_model.h"
@@ -34,6 +35,30 @@
 using namespace xf;
 
 int main() {
+    {
+        // Discord Rich Presence: the frames and the JSON
+        namespace d = frontend::discord;
+        const std::string hs = d::encode_frame(d::OP_HANDSHAKE, d::handshake_json("42"));
+        CHECK(hs == std::string("\0\0\0\0\x18\0\0\0{\"v\":1,\"client_id\":\"42\"}", 8 + 24));
+        const std::string close = d::encode_frame(d::OP_CLOSE, "{}");
+        CHECK(close.size() == 10 && close[0] == 2 && close[4] == 2 && close[1] == 0 && close[5] == 0);
+        const std::string big = d::encode_frame(d::OP_FRAME, std::string(300, 'x'));
+        CHECK(big[0] == 1 && big[4] == char(300 & 255) && big[5] == 1 && big.size() == 308);
+        // a made-up title with quotes, a backslash, a control character and non-ASCII
+        const std::string title = "The \"Test\" \\ Game\n \xC3\xA9\xE2\x84\xA2";
+        const std::string act = d::activity_json(1234, title, "XenoForge", 1700000000, "7");
+        CHECK(act == "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":1234,\"activity\":{\"details\":"
+                     "\"The \\\"Test\\\" \\\\ Game\\n \xC3\xA9\xE2\x84\xA2\",\"state\":\"XenoForge\","
+                     "\"timestamps\":{\"start\":1700000000},\"assets\":{\"large_image\":\"xenoforge\","
+                     "\"large_text\":\"XenoForge\"}}},\"nonce\":\"7\"}");
+        CHECK(d::clear_json(1234, "8") == "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":1234},\"nonce\":\"8\"}");
+        CHECK(d::json_string("a\x01" "b") == "\"a\\u0001b\"");
+        CHECK(d::json_string("bad\xFF" "x") == "\"bad\xEF\xBF\xBD" "x\"");     // invalid UTF-8 replaced
+        CHECK(d::json_string("\xC3\xA9\xC3\xA9", 3) == "\"\xC3\xA9\"");      // cut on a character boundary
+        // no client ID: nothing starts
+        d::Presence off;
+        CHECK(!off.start("", "x") && !off.connected());
+    }
     // the pointer over the game's picture: gone after 2 s at rest (windowed), at once in fullscreen, back on a move, and
     // always there for the overlay, the guide and the dialogs
     {
@@ -605,6 +630,7 @@ int main() {
         a.launcher.backdrop = "still";
         a.launcher.sounds = false;
         a.launcher.smooth_edges = false;
+        a.discord.enabled = false, a.discord.client_id = "123456789012345678";
         a.launcher.x = -1200, a.launcher.y = 40, a.launcher.width = 1500, a.launcher.height = 900, a.launcher.maximized = true;
         std::string err;
         CHECK(frontend::save(file, a, err) && frontend::load(file, b, err));
@@ -615,6 +641,8 @@ int main() {
         CHECK(!b.launcher.sounds && frontend::Settings().launcher.sounds); // on unless the file says off
         CHECK(!b.launcher.smooth_edges && frontend::Settings().launcher.smooth_edges); // on unless the file says off
         CHECK(frontend::backdrop_choices().size() == 3);
+        CHECK(!b.discord.enabled && b.discord.client_id == "123456789012345678");
+        CHECK(frontend::Settings().discord.enabled && frontend::Settings().discord.client_id.empty()); // on, but no ID
         CHECK(b.launcher.x == -1200 && b.launcher.y == 40 && b.launcher.width == 1500 && b.launcher.height == 900 && b.launcher.maximized);
         std::filesystem::remove(file);
     }

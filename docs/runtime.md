@@ -2170,6 +2170,7 @@ code. As built (`frontend/`):
   [keyboard] # each pad control's keys (input.md)
   [player]   # screenshots: the folder F12 writes to
   [launcher] # games: the folder the launcher lists
+  [discord]  # enabled (true), client_id (the Discord application's ID; "" turns presence off)
   [games.5846000A.video] # a game's own settings (the launcher's), any of the four sections above
   ```
 
@@ -3142,6 +3143,29 @@ build's load since. The cache belongs on the system drive, as its default
 
 Left: title updates (D3). The Linux side (`.so`, `posix_spawn`, `ld.lld`)
 was first built and run on 2026-11-12 ("Other hosts").
+
+## Discord Rich Presence (2026-11-13)
+
+While a game runs, the player shows "Playing <title>" with the time since it started on the user's Discord profile
+(`frontend/discord_presence.*`). There is no Discord SDK: it speaks Discord's local IPC protocol directly, after the
+MIT-licensed discord-rpc library's design. The transport is a named pipe `\\.\pipe\discord-ipc-0`..`9` on Windows and
+a Unix socket `discord-ipc-N` in `$XDG_RUNTIME_DIR`, `$TMPDIR`, `$TMP`, `$TEMP` or `/tmp` elsewhere; Android has no
+local Discord IPC, so it compiles to nothing there. A frame is the opcode and the JSON's length (little-endian 32-bit
+words) and the JSON: HANDSHAKE (0) `{"v":1,"client_id":...}`, the READY reply, then FRAME (1) `SET_ACTIVITY` with
+`args.pid` and `args.activity` (`details` = the game's title, `state` = "XenoForge", `timestamps.start`, the large
+image key `xenoforge` with the text "XenoForge"); PING (3) is answered with PONG (4); at the end the activity is
+cleared and CLOSE (2) sent. All of it is on a thread of its own: the game never waits for Discord, and with Discord
+not running the thread retries every 15 s without a word. Titles are escaped as JSON (quotes, control characters,
+invalid UTF-8) and cut at 128 bytes.
+
+**Privacy.** Only the title and the start time are sent. Never the title ID, the gamertag, a path or anything of the
+account; a game with no name shows as "A game".
+
+**Settings.** `[discord]` in config.toml, shared (not per game): `enabled` (default true) and `client_id`, the
+Application ID of a Discord application. The default of `client_id` is empty, or the build's `-DXF_DISCORD_CLIENT_ID=`;
+with none, presence is off and the launcher's Settings > Interface page ("Integrations") says why. The page's toggle
+writes `enabled`. The launcher itself shows no presence; the player does. The application needs a "xenoforge" art
+asset (Rich Presence > Art Assets in the developer portal) for the large image.
 
 ## Other hosts (2026-11-12)
 

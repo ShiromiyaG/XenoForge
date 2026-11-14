@@ -439,6 +439,9 @@ if(XF_PLAYER AND TARGET boot)
     target_link_libraries(xf_imgui PUBLIC SDL3::SDL3-static xf_volk)
     target_compile_definitions(xf_imgui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK)
     target_compile_options(xf_imgui PRIVATE -w)
+    # Discord Rich Presence's application ID, an empty default: presence is off until config.toml's [discord] client_id
+    # (or this) names a Discord application (docs/runtime.md, "Discord Rich Presence")
+    set(XF_DISCORD_CLIENT_ID "" CACHE STRING "default Discord application ID for Rich Presence")
     # the window, input, sound and settings, apart from the kernel they feed;
     # the window's front buffer conversion, a compute shader (src/shaders/spirv)
     set(XF_FRONTEND_SHADERS)
@@ -460,8 +463,9 @@ if(XF_PLAYER AND TARGET boot)
                                    frontend/sdl_input.cpp
                                    frontend/profiles.cpp frontend/console_options.cpp frontend/system_ui.cpp
                                    frontend/sdl_audio.cpp frontend/library.cpp frontend/launcher_core.cpp
-                                   frontend/window_icon.cpp
+                                   frontend/window_icon.cpp frontend/discord_presence.cpp
                                    ${XF_SHADER_OUT}/xenoforge_icon.inc ${XF_FRONTEND_SHADERS})
+    target_compile_definitions(xf_frontend PRIVATE XF_DISCORD_CLIENT_ID="${XF_DISCORD_CLIENT_ID}")
     target_include_directories(xf_frontend PRIVATE ${XF_SHADER_OUT} ${XF_SPIRV_DIR})
     target_link_libraries(xf_frontend PUBLIC xenoforge xenoforge_vk SDL3::SDL3-static xf_volk
                                              tomlplusplus::tomlplusplus)

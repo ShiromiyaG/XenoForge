@@ -157,6 +157,9 @@ bool video_needs_restart(const std::string &key) {
 
 Settings::Settings() {
     for (const Binding &b : BINDINGS) keys[b.name] = b.keys;
+#ifdef XF_DISCORD_CLIENT_ID
+    discord.client_id = XF_DISCORD_CLIENT_ID;
+#endif
 }
 
 std::filesystem::path default_path() {
@@ -336,6 +339,16 @@ toml::table launcher_table(const Settings::Launcher &l) {
     return t;
 }
 
+// the Discord section, shared only
+void read_discord(const toml::table &t, Settings::Discord &d) {
+    get(t, "discord", "enabled", d.enabled);
+    get(t, "discord", "client_id", d.client_id);
+}
+
+toml::table discord_table(const Settings::Discord &d) {
+    return toml::table{{"enabled", d.enabled}, {"client_id", d.client_id}};
+}
+
 bool write_file(const std::filesystem::path &path, const toml::table &t, std::string &error) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -373,6 +386,7 @@ bool load(const std::filesystem::path &path, Settings &s, std::string &error, co
     get(t, "player", "screenshots", s.screenshots);
     get(t, "player", "follow_launches", s.follow_launches);
     read_launcher(t, s.launcher);
+    read_discord(t, s.discord);
     if (!title.empty())
         if (const toml::table *own = t["games"][title].as_table()) {
             read_sections(*own, s);
@@ -418,6 +432,7 @@ toml::table written_tables(const Settings &s) {
     if (s.game.empty()) {
         t.insert_or_assign("player", player_table(s));
         t.insert_or_assign("launcher", launcher_table(s.launcher));
+        t.insert_or_assign("discord", discord_table(s.discord));
     }
     return t;
 }
@@ -444,6 +459,7 @@ bool save(const std::filesystem::path &path, const Settings &s, std::string &err
             write_sections(t, shared);
             t.insert_or_assign("player", player_table(s));
             t.insert_or_assign("launcher", launcher_table(s.launcher));
+            t.insert_or_assign("discord", discord_table(s.discord));
         }
         if (!t["games"].as_table()) t.insert_or_assign("games", toml::table{});
         // a game's table not there yet is written whole
