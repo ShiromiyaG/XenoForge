@@ -43,6 +43,8 @@ add_library(xenoforge STATIC
     src/profile_gpd.cpp
     src/exports.cpp
     src/xex.cpp
+    src/xxh3.cpp
+    src/patches.cpp
     src/lzx.cpp
     src/sha1.cpp
     src/sha2.cpp
@@ -627,7 +629,7 @@ target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
 foreach(name aes disc xex lzx sha1 snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor
-             recomp_discover gpu_trace_writer shader_storage)
+             recomp_discover gpu_trace_writer shader_storage patches)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)

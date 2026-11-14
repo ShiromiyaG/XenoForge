@@ -206,6 +206,7 @@ GameEntry read_game(const std::filesystem::path &path) {
     game.version = xex.execution.version;
     game.media_id = xex.execution.media_id;
     game.digest = image_digest(xex.image);
+    game.patch_module = patches::module_info(xex);
     game.title = title_name(xex);
     game.icon = title_icon(xex);
     if (game.title.empty()) game.title = path.stem().string();

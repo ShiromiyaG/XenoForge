@@ -46,6 +46,8 @@ class SettingsHost {
     virtual bool pad_mode() const = 0;
     // a cue of the window's own sounds (nothing when they are off)
     virtual void play_sound(Cue cue) = 0;
+    // a game's patches were turned on or off: its library's name in the cache may be another
+    virtual void patches_changed() {}
 };
 
 class SettingsView final : public Rml::EventListener {

@@ -16,6 +16,7 @@
 
 #include "xenoforge/game_build.h"
 #include "xenoforge/game_library.h"
+#include "xenoforge/patches.h"
 #include "xenoforge/ppc_context.h"
 #include "xenoforge/xex.h"
 
@@ -93,7 +94,10 @@ std::vector<uint8_t> make_xex() {
     put32(f, 0x08, 0x1000);
     put32(f, 0x10, 0x400);
     const std::pair<uint32_t, uint32_t> headers[] = {
-        {xex_key::ENTRY_POINT, E}, {xex_key::IMAGE_BASE_ADDRESS, BASE}, {xex_key::FILE_FORMAT_INFO, 0x600}};
+        {xex_key::ENTRY_POINT, E},
+        {xex_key::IMAGE_BASE_ADDRESS, BASE},
+        {xex_key::FILE_FORMAT_INFO, 0x600},
+        {xex_key::EXECUTION_INFO, 0x700}};
     put32(f, 0x14, uint32_t(std::size(headers)));
     for (size_t i = 0; i < std::size(headers); i++) {
         put32(f, 0x18 + 8 * i, headers[i].first);
@@ -102,6 +106,10 @@ std::vector<uint8_t> make_xex() {
     put32(f, 0x400 + 0x004, IMAGE_SIZE);
     put32(f, 0x400 + 0x110, BASE);
     put32(f, 0x600, 8); // no encryption, no compression
+    put32(f, 0x700 + 0xC, 0x58460001);   // the execution info: a made-up title ID
+    put32(f, 0x400 + 0x10C, 0x10000000); // 4 KB pages...
+    put32(f, 0x400 + 0x180, 1);          // ...in one run of three, all code
+    put32(f, 0x400 + 0x184, (3u << 4) | uint32_t(XexSection::Code));
     std::vector<uint8_t> image = make_image();
     f.insert(f.end(), image.begin(), image.end());
     return f;
@@ -376,6 +384,50 @@ int main() {
         CHECK(build_once() && reused == 0 && total > 0);
         kept.keep_work = false, kept.keep_objects = false;
         CHECK(build_once() && !std::filesystem::exists(work));
+    }
+
+    // game patches (patches.h): a code patch enabled for a made-up title (leaf 0 adds 5 instead of 1) is
+    // written into the image before discovery, and the library is kept under the digest and the patches'
+    // key; the plain name has no library there
+    {
+        const std::filesystem::path folder = root / "patches", patched = root / "cache_patched";
+        std::filesystem::create_directories(folder, ec);
+        const patches::ModuleInfo module = patches::module_info(xex);
+        CHECK(module.title_id == 0x58460001 && module.code.size() == 1 && module.hash != 0);
+        char text[512];
+        std::snprintf(text, sizeof(text),
+                      "title_name = \"made up\"\ntitle_id = \"58460001\"\nhash = \"0x%016llX\"\n"
+                      "[[patch]]\nname = \"Leaf\"\n[[patch.be32]]\naddress = 0x%08X\nvalue = 0x38630005\n",
+                      (unsigned long long)module.hash, LEAVES);
+        std::ofstream(folder / "58460001 - made up.patch.toml") << text;
+        build::Progress quiet2;
+        build::BuildOptions options;
+        options.patches.directory = folder;
+        options.patches.off = false;
+        options.patches.enabled = {{"Leaf", true}};
+        CHECK(build::prepare_game(xex_path, patched, quiet2, error, options));
+        const patches::Plan plan = patches::make_plan(module, options.patches);
+        CHECK(plan.any_code());
+        const std::string key = patches::cache_key(digest, plan);
+        auto cached_patched = build::find_cached(patched, key);
+        CHECK(cached_patched && !build::find_cached(patched, digest));
+        CHECK(!build::find_cached(patched, digest + std::string("+nothex")));
+        if (cached_patched) {
+            CHECK(cached_patched->library.filename().string().starts_with(key + "-"));
+            static const ppc::Runtime runtime = ppc::host_runtime();
+            const ppc::GameLibrary *lib = ppc::load_game_library(cached_patched->library, runtime, error);
+            CHECK(lib && lib->count == 1);
+            if (lib) {
+                auto c = std::make_unique<ppc::Context>();
+                std::memset(c.get(), 0, sizeof(ppc::Context));
+                current = lib->modules[0];
+                ppc::dispatch(*c, LEAVES);
+                CHECK(c->r[3] == 5); // the plain library's leaf 0 gives 1
+            }
+        }
+        // the same patch turned off: no code patches, no key
+        options.patches.enabled = {{"Leaf", false}};
+        CHECK(!patches::make_plan(module, options.patches).any_code());
     }
 
     // the libraries stay loaded: the directory is left for the next run's

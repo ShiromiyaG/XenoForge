@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "xenoforge/patches.h"
 #include "xenoforge/xex.h"
 
 #include <cstdint>
@@ -23,6 +24,7 @@ struct GameEntry {
     uint32_t version = 0, media_id = 0; // the execution info's
     uint64_t digest = 0;                // default.xex's image (xf::image_digest), what generated code is tied to
     uint64_t size = 0;                  // the file's
+    patches::ModuleInfo patch_module;   // what game patches match the executable by (patches.h)
     std::vector<uint8_t> icon;          // the title's image from its XDBF (a PNG; empty when it has none), read at run time
     std::string error;                  // why it could not be read (then only path is set)
     std::string title_id_text() const;  // "5846000A"

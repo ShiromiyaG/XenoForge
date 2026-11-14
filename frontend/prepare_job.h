@@ -9,6 +9,8 @@
 
 #include "xenoforge/game_build.h"
 
+#include "xenoforge/patches.h"
+
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -31,8 +33,9 @@ class PrepareJob {
     // The real build of a disc into the cache, with `jobs` compilers at once
     // (0: the build's default).
     // `force` builds although the cache has the library (a rebuild).
+    // `patches`: the game patches (patches.h) the library is built with; the default builds without any.
     static Runner build_runner(std::filesystem::path disc, std::filesystem::path cache_dir, unsigned jobs = 0,
-                               bool force = false);
+                               bool force = false, patches::Config patches = {.off = true});
     // A build that is not one, for --demo-progress: a few minutes of stages
     // at `speed` times real time, ending in a failure when `fail`.
     static Runner demo_runner(double speed, bool fail);

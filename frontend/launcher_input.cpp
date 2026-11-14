@@ -143,7 +143,7 @@ void LauncherView::do_action(const std::string &name, const std::string &arg) {
         selected_ = -1;
         rows_sig_.clear();
         animate_rows_ = true;
-        cached_.clear();
+        cached_.clear(), keys_.clear(), patch_files_.reset();
         last_listing_ = Clock::time_point();
         settings_->set_game(nullptr);
         set_message(core_.demo_games() ? "Listing the demo games" : "Listing the games folder", 0, 4);

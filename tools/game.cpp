@@ -180,8 +180,7 @@ void print_renderer_report(const render::Report &r) {
 // or one that does not load, the game is interpreted.
 void load_game_library(const Options &options, Game &g) {
     std::filesystem::path library = options.game_library;
-    char digest[24];
-    std::snprintf(digest, sizeof(digest), "%016llx", (unsigned long long)image_digest(g.xex.image));
+    const char *digest = g.cache_key.c_str();
     if (library.empty()) {
         const std::filesystem::path cache = options.cache.empty() ? build::default_cache_dir() : options.cache;
         if (auto cached = build::find_cached(cache, digest)) library = cached->library;
@@ -266,6 +265,20 @@ void load_stencil_tier(const Options &options, Game &g) {
 bool open(const Options &options, Game &g, std::string &error) {
     const std::string &input = options.input;
     if (!load(input, options.xex_path, g.xex, error)) return false;
+    // the patches, before anything reads the image: its digest is taken first, the cache's name for the
+    // library built from the unpatched code
+    {
+        g.base_digest = image_digest(g.xex.image);
+        char digest[24];
+        std::snprintf(digest, sizeof(digest), "%016llx", (unsigned long long)g.base_digest);
+        patches::Config config = options.patches;
+        if (options.patch_choices) config.enabled = options.patch_choices(g.xex.execution.title_id);
+        g.patch_plan = patches::make_plan(patches::module_info(g.xex), config);
+        for (const std::string &line : g.patch_plan.log) std::printf("%s\n", line.c_str());
+        const size_t changed = patches::apply_code(g.patch_plan, g.xex.image, g.xex.base_address);
+        if (changed) std::printf("patches: %zu bytes of code patched in the image\n", changed);
+        g.cache_key = patches::cache_key(digest, g.patch_plan);
+    }
     g.cache = options.cache.empty() ? build::default_cache_dir() : options.cache;
     g.memory = Memory::create(error);
     if (!g.memory) return error = "memory: " + error, false;
@@ -332,6 +345,7 @@ bool open(const Options &options, Game &g, std::string &error) {
         load_game_library(options, g);
     }
     if (!k.load(g.xex, error)) return error = "load: " + error, false;
+    for (const std::string &line : patches::apply_data(g.patch_plan, *g.memory)) std::printf("%s\n", line.c_str());
     k.step_limit = options.steps;
     {
         kernel::LockstepOptions lockstep;
@@ -672,7 +686,7 @@ void print_summary(Game &g, const std::string &state, const std::string &detail,
     char text[256];
     std::string out = "xf-summary {";
     std::snprintf(text, sizeof(text), "\"title_id\":\"%08X\",\"digest\":\"%016llx\",", g.xex.execution.title_id,
-                  (unsigned long long)image_digest(g.xex.image));
+                  (unsigned long long)g.base_digest);
     out += text;
     out += "\"state\":\"" + json_escape(state) + "\",\"detail\":\"" + json_escape(detail) + "\",";
     out += "\"stack\":\"" + json_escape(stack) + "\",\"report\":\"" + json_escape(report_file) + "\",";

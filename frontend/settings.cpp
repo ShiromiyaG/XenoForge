@@ -246,6 +246,10 @@ void read_sections(const toml::table &t, Settings &s) {
             else if (auto d = value.value<double>())
                 s.port[std::string(key.str())] = *d;
         }
+    s.patches.clear();
+    if (auto *table = t["patches"].as_table())
+        for (auto &[key, value] : *table)
+            if (auto b = value.value<bool>()) s.patches[std::string(key.str())] = *b;
 }
 
 toml::table player_table(const Settings &s) {
@@ -295,6 +299,12 @@ void write_sections(toml::table &t, const Settings &s) {
         for (const auto &[key, value] : s.port)
             std::visit([&](auto v) { port.insert_or_assign(key, v); }, value);
         t.insert_or_assign("port", std::move(port));
+    }
+    // a game's patches turned on or off (patches.h): [games.<id>.patches] "<name>" = true
+    if (!s.patches.empty()) {
+        toml::table choices;
+        for (const auto &[name, on] : s.patches) choices.insert_or_assign(name, on);
+        t.insert_or_assign("patches", std::move(choices));
     }
 }
 

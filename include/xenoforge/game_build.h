@@ -13,6 +13,7 @@
 #pragma once
 
 #include "xenoforge/cpu_level.h"
+#include "xenoforge/patches.h"
 
 #include <atomic>
 #include <cstdint>
@@ -52,7 +53,9 @@ struct CachedGame {
 std::filesystem::path default_cache_dir();
 
 // the cached library for an executable's digest (16 hex digits, either
-// case), if one was built for this XenoForge's interface version
+// case, then "+" and the 16 digits of the code patches' key when the library
+// was built with game patches: patches::cache_key), if one was built for this
+// XenoForge's interface version
 std::optional<CachedGame> find_cached(const std::filesystem::path &cache_dir, std::string_view digest);
 
 // builds the disc's game library into the cache; blocks, so it runs on a
@@ -214,6 +217,11 @@ struct BuildOptions {
     // fails the build. The library is kept under its level's name, which
     // find_cached looks for at game_cpu_level() alone.
     CpuLevel cpu_level = CpuLevel::None;
+    // Game patches (patches.h): the enabled code patches are written into the executable's image
+    // before discovery, and the library is kept under the unpatched image's digest with their key
+    // (patches::cache_key: <digest>+<key>), so each set of them has a library of its own. Off by
+    // default here: a caller that wants patches gives the folder and the choices.
+    patches::Config patches = {.off = true};
 };
 bool prepare_game(const std::filesystem::path &disc, const std::filesystem::path &cache_dir, Progress &progress,
                   std::string &error, const BuildOptions &options);

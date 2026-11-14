@@ -65,7 +65,7 @@
 // and adds each function's inclusive share.
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
-//        [--cache <dir>] [--game-library <file>]
+//        [--cache <dir>] [--game-library <file>] [--patches <dir> [--patch <name>[=off]]...]
 //        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 //        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
@@ -103,7 +103,7 @@ using namespace xf;
 int xf::run_boot(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] "
-                        "[--render [--shots <dir> [--shot-swaps <list>] "
+                        "[--patches <dir> [--patch <name>[=off]]...] [--render [--shots <dir> [--shot-swaps <list>] "
                         "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
                         "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
                         "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
@@ -114,6 +114,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                         "[--profile N [--profile-from S] [--profile-thread <name>]]\n";
     if (argc < 2) return std::fprintf(stderr, "%s", usage), 2;
     game::Options o;
+    o.patches.off = true; // read only when --patches names a folder: boot's runs are the same on every machine
     o.input = argv[1];
     o.modules = port.modules, o.module_count = port.module_count;
     std::error_code ec;
@@ -150,6 +151,15 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             o.cache = argv[++k];
         else if (a == "--game-library" && k + 1 < argc)
             o.game_library = argv[++k];
+        else if (a == "--patches" && k + 1 < argc)
+            o.patches.directory = argv[++k], o.patches.off = false;
+        else if (a == "--patch" && k + 1 < argc) {
+            // a patch's name, on (the default) or off with "=off"
+            std::string choice = argv[++k];
+            bool on = true;
+            if (choice.size() > 4 && choice.ends_with("=off")) on = false, choice.resize(choice.size() - 4);
+            o.patches.enabled[choice] = on;
+        }
         else if (a == "--render")
             rendering = true;
         else if (a == "--shots" && k + 1 < argc)

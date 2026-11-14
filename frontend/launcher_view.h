@@ -20,6 +20,7 @@
 
 #include "launcher_core.h"
 #include "launcher_html.h"
+#include "xenoforge/patches.h"
 #include "prepare_job.h"
 #include "settings_view.h"
 #include "ui/ui_renderer.h"
@@ -31,6 +32,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -90,6 +92,7 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     void leave_settings() override;
     bool pad_mode() const override { return pad_mode_; }
     void play_sound(Cue cue) override;
+    void patches_changed() override;
 
   private:
     enum class Dialog { None, Prepare, About, Message };
@@ -196,6 +199,13 @@ class LauncherView final : public Rml::EventListener, public SettingsHost {
     mutable std::map<uint64_t, bool> cached_;
     mutable std::map<uint64_t, bool> stale_; // by digest: the cached library lacks entries the runtime logged
     bool stale_of(const GameEntry &game) const;
+    // The game library's name in the cache for a game: its image digest, and the key of the code patches
+    // its settings enable (patches.h), asked of the files and the settings once per game.
+    mutable std::map<uint64_t, std::string> keys_;
+    mutable std::optional<std::vector<patches::File>> patch_files_; // the patches folder, read when first needed
+    std::string cache_key_of(const GameEntry &game) const;
+    // what a prepare of the game builds with: the folder and the game's own choices
+    patches::Config patch_config_of(const GameEntry &game) const;
 
     // the backdrop's ribbons: their clock (it stops with the window out of sight)
     double backdrop_clock_ = 7.0, backdrop_seen_ = 0;

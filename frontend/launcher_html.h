@@ -73,10 +73,18 @@ const char *prepare_stage_label(int stage); // 0 to 4
 
 // ----------------------------------------------------------------- the settings window
 
-enum class SettingsTab { Video = 0, Sound, Controllers, Keyboard, System, Profile, Interface };
-constexpr int SETTINGS_TABS = 7;
+enum class SettingsTab { Video = 0, Sound, Controllers, Keyboard, System, Profile, Interface, Patches };
+constexpr int SETTINGS_TABS = 8;
 const char *settings_tab_label(SettingsTab tab);
 const char *settings_tab_name(SettingsTab tab); // "video", "sound"...
+
+// a game patch (patches.h) as the Patches tab lists it
+struct PatchRow {
+    std::string name, description, author, file;
+    bool enabled = false; // the file's is_enabled, or the game's own choice over it
+    bool applies = true;  // the file's hashes include this executable's
+    bool code = false;    // changes the game's code: its library is built for it
+};
 
 struct SettingsPage {
     const Settings *settings = nullptr;
@@ -98,6 +106,9 @@ struct SettingsPage {
     std::string profile_message, confirm_delete;
     std::vector<kernel::ProfileAchievement> achievements;
     bool achievements_read = false;
+    // the Patches tab: the selected game's patch files' patches, and the folder they are read from
+    std::vector<PatchRow> patches;
+    std::string patches_folder;
 };
 std::string settings_tabs_html(SettingsTab current);
 // the strip above the tabs: whose settings these are, and the switch that

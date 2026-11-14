@@ -120,6 +120,10 @@ struct Settings {
     bool follow_launches = true;
     // the port's options (run.h's PortOption) by key, in config.toml's [port]
     std::map<std::string, std::variant<bool, int64_t, double>> port;
+    // the game's patches the user turned on or off, by the patch's name (patches.h), in
+    // [games.<id>.patches]; a patch not named here is as its file's is_enabled says. A game's own
+    // settings only.
+    std::map<std::string, bool> patches;
     // each binding's keys, space-separated (BINDINGS' names)
     std::map<std::string, std::string> keys;
     // where F12 and the overlay's button put screenshots ("" for the
@@ -176,6 +180,10 @@ bool video_needs_restart(const std::string &key);
 
 // SDL's preference folder's xenoforge\config.toml
 std::filesystem::path default_path();
+// the game patches' folder beside a config file: xenoforge\patches (patches.h)
+inline std::filesystem::path patches_directory(const std::filesystem::path &config_file) {
+    return config_file.parent_path() / "patches";
+}
 // A missing file gives the defaults; false and why for one that does not
 // parse. With a title ID, that game's own settings over the shared ones
 // (settings.game is the title ID when the game has a table, else "").

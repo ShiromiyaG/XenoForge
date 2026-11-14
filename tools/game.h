@@ -16,6 +16,7 @@
 #include "xenoforge/input.h"
 #include "xenoforge/kernel.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/patches.h"
 #include "xenoforge/port_module.h"
 #include "xenoforge/renderer.h"
 #include "xenoforge/stencil.h"
@@ -71,6 +72,13 @@ struct Options {
     // to record_input, or given from replay_input; XF_INPUT_RECORD and
     // XF_INPUT_REPLAY when empty.
     std::filesystem::path record_input, replay_input;
+    // Game patches (patches.h): the folder read and what the user turned on or off; code patches
+    // are written into the executable's image before anything else reads it, data patches into
+    // the guest's memory once it is loaded.
+    patches::Config patches;
+    // the choices for the executable's title, asked once its title ID is known (the player reads the
+    // game's own settings here); they replace patches.enabled when given
+    std::function<std::map<std::string, bool>(uint32_t title_id)> patch_choices;
 };
 
 struct Game {
@@ -83,6 +91,11 @@ struct Game {
     const ppc::GeneratedModule *stencil_table[1] = {};
     bool stencil_counting = false;
     Xex xex;
+    // the executable's image digest before any patch, and the game library's cache key: the digest
+    // alone, or with the enabled code patches' key (patches::cache_key)
+    uint64_t base_digest = 0;
+    std::string cache_key;
+    patches::Plan patch_plan; // the enabled patches that apply to the executable
     std::unique_ptr<Memory> memory;
     std::unique_ptr<kernel::Kernel> kernel;
     std::unique_ptr<vk::Device> device;

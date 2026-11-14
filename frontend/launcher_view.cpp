@@ -173,10 +173,35 @@ const GameEntry *LauncherView::selected_game() const {
     return g.error.empty() ? &g : nullptr;
 }
 
+patches::Config LauncherView::patch_config_of(const GameEntry &game) const {
+    patches::Config config;
+    config.directory = patches_directory(core_.config_file());
+    Settings own;
+    std::string error;
+    if (core_.load_settings(game, own, error)) config.enabled = own.patches;
+    return config;
+}
+
+std::string LauncherView::cache_key_of(const GameEntry &game) const {
+    auto it = keys_.find(game.digest);
+    if (it != keys_.end()) return it->second;
+    std::string key = digest_text(game.digest);
+    if (game.patch_module.valid() && !game.title_id_text().empty()) {
+        const patches::Config config = patch_config_of(game);
+        if (!patch_files_) patch_files_ = patches::load_directory(config.directory);
+        key = patches::cache_key(key, patches::make_plan(game.patch_module, *patch_files_, config.enabled));
+    }
+    return keys_.emplace(game.digest, key).first->second;
+}
+
+void LauncherView::patches_changed() {
+    cached_.clear(), keys_.clear(), patch_files_.reset(), stale_.clear(), rows_sig_.clear();
+}
+
 bool LauncherView::cached_of(const GameEntry &game) const {
     auto it = cached_.find(game.digest);
     if (it == cached_.end())
-        it = cached_.emplace(game.digest, build::find_cached(build::default_cache_dir(), digest_text(game.digest)).has_value()).first;
+        it = cached_.emplace(game.digest, build::find_cached(build::default_cache_dir(), cache_key_of(game)).has_value()).first;
     return it->second;
 }
 
@@ -186,7 +211,7 @@ bool LauncherView::stale_of(const GameEntry &game) const {
     if (!cached_of(game)) return false;
     auto it = stale_.find(game.digest);
     if (it == stale_.end())
-        it = stale_.emplace(game.digest, library_has_new_entries(build::default_cache_dir(), digest_text(game.digest))).first;
+        it = stale_.emplace(game.digest, library_has_new_entries(build::default_cache_dir(), cache_key_of(game))).first;
     return it->second;
 }
 
@@ -597,7 +622,7 @@ void LauncherView::set_folder(const std::string &folder) {
     selected_ = -1;
     rows_sig_.clear();
     animate_rows_ = true;
-    cached_.clear(), stale_.clear();
+    cached_.clear(), keys_.clear(), patch_files_.reset(), stale_.clear();
     last_listing_ = Clock::time_point();
     settings_->set_game(nullptr), settings_->folder_changed();
 }
@@ -607,7 +632,7 @@ void LauncherView::rescan() {
     selected_ = -1;
     rows_sig_.clear();
     animate_rows_ = true;
-    cached_.clear(), stale_.clear();
+    cached_.clear(), keys_.clear(), patch_files_.reset(), stale_.clear();
     last_listing_ = Clock::time_point();
     settings_->set_game(nullptr);
 }

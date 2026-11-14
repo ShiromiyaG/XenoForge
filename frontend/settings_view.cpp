@@ -183,6 +183,25 @@ SettingsPage SettingsView::page() {
                 if (pr.selected)
                     p.achievements_read = read_gpd_achievements(profile_gpd_path(storage, pr.xuid, game_.title_id), p.achievements);
     }
+    if (tab_ == SettingsTab::Patches && has_game_) {
+        const std::filesystem::path folder = patches_directory(core_.config_file());
+        p.patches_folder = folder.string();
+        for (const patches::File &file : patches::load_directory(folder)) {
+            if (file.title_id != game_.title_id) continue;
+            const bool applies =
+                std::find(file.hashes.begin(), file.hashes.end(), game_.patch_module.hash) != file.hashes.end();
+            for (const patches::Patch &patch : file.patches) {
+                PatchRow row{patch.name, patch.description, patch.author, file.path};
+                auto choice = edit_.patches.find(patch.name);
+                row.enabled = choice != edit_.patches.end() ? choice->second : patch.enabled;
+                row.applies = applies;
+                for (const patches::Entry &entry : patch.entries)
+                    for (size_t i = 0; i < entry.bytes.size() && !row.code; i++)
+                        row.code = game_.patch_module.is_code(entry.address + uint32_t(i));
+                p.patches.push_back(std::move(row));
+            }
+        }
+    }
     p.capturing = capturing_;
     return p;
 }
@@ -392,6 +411,24 @@ void SettingsView::toggle_setting(Rml::Element *row) {
         std::string error;
         core_.set_launcher(l, error);
         if (Rml::Element *box = row->QuerySelector(".check")) box->SetClass("on", l.smooth_edges);
+        return;
+    }
+    if (key.rfind("patch:", 0) == 0) {
+        // a game's patch on or off: the game gets settings of its own to keep the choice in
+        if (!has_game_) return;
+        if (edit_.game.empty()) {
+            std::string error;
+            core_.set_own_settings(game_, true, edit_, error);
+            edit_valid_ = true;
+            if (!error.empty()) std::fprintf(stderr, "launcher: settings: %s\n", error.c_str());
+            defer([this] { rebuild(); });
+        }
+        Rml::Element *box = row->QuerySelector(".check");
+        const bool now = !(box && box->IsClassSet("on"));
+        edit_.patches[key.substr(6)] = now;
+        if (box) box->SetClass("on", now);
+        save_edit();
+        host_.patches_changed();
         return;
     }
     bool *field = bool_field(key);

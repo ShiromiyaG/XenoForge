@@ -323,17 +323,17 @@ std::string prepare_body_html(const std::string &title, const std::string &icon,
 // the settings window
 
 const char *settings_tab_label(SettingsTab tab) {
-    static const char *labels[] = {"Video", "Sound", "Controllers", "Keyboard", "System", "Profile", "Interface"};
+    static const char *labels[] = {"Video", "Sound", "Controllers", "Keyboard", "System", "Profile", "Interface", "Patches"};
     return labels[int(tab)];
 }
 
 const char *settings_tab_name(SettingsTab tab) {
-    static const char *names[] = {"video", "sound", "controllers", "keyboard", "system", "profile", "interface"};
+    static const char *names[] = {"video", "sound", "controllers", "keyboard", "system", "profile", "interface", "patches"};
     return names[int(tab)];
 }
 
 std::string settings_tabs_html(SettingsTab current) {
-    static const char *icons[] = {"monitor", "volume-2", "gamepad-2", "keyboard", "cpu", "hard-drive", "sliders-horizontal"};
+    static const char *icons[] = {"monitor", "volume-2", "gamepad-2", "keyboard", "cpu", "hard-drive", "sliders-horizontal", "layers"};
     std::string s;
     for (int i = 0; i < SETTINGS_TABS; i++)
         s += std::string("<div class=\"tab f") + (i == int(current) ? " active" : "") + "\" data-action=\"tab\" data-arg=\"" +
@@ -536,6 +536,27 @@ std::string settings_page_html(SettingsTab tab, const SettingsPage &page) {
         }
         s += group("Achievements" + (page.game_title.empty() ? std::string() : " - " + page.game_title), ach,
                    "Read from the selected profile's record; the game writes it as the player earns them.");
+        break;
+    }
+    case SettingsTab::Patches: {
+        if (page.game_title.empty()) {
+            s += group("Patches", "<div class=\"setting\"><div class=\"label\"><div class=\"hint\">Select a game in the list: patches belong to one game.</div></div></div>");
+            break;
+        }
+        std::string rows;
+        for (const PatchRow &p : page.patches) {
+            std::string hint = p.description;
+            if (!p.author.empty()) hint += (hint.empty() ? "" : " ") + std::string("By ") + p.author + ".";
+            if (p.code) hint += std::string(hint.empty() ? "" : " ") + "Changes the game's code: Prepare builds a library for it.";
+            if (!p.applies) hint += std::string(hint.empty() ? "" : " ") + "Made for another version of the game: it will not apply.";
+            const std::string key = e("patch:" + p.name);
+            rows += check_row(key.c_str(), p.name.c_str(), hint, p.enabled);
+        }
+        if (rows.empty())
+            rows = "<div class=\"setting\"><div class=\"label\"><div class=\"hint\">No patch files for " + e(page.title_id) + " in " + e(page.patches_folder) +
+                   ". Put Xenia-format files there, named like \"" + e(page.title_id) + " - name.patch.toml\".</div></div></div>";
+        s += group("Patches for " + page.game_title, rows,
+                   "Written in config.toml under this game's settings. A change to the game's code needs the game prepared again.");
         break;
     }
     case SettingsTab::Interface: {

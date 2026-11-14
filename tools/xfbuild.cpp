@@ -8,7 +8,7 @@
 //
 //   xfbuild <game.iso | default.xex> [cache dir] [--jobs N] [--toolchain <dir>] [--keep] [--force]
 //           [--cancel-after S] [--quiet] [--entry <hex>]... [--no-entry-log] [--no-shaders] [--no-disc-shaders] [--shaders-only]
-//           [--project <file.toml>] [--cpu-level v2|v3|arm64] [--compile-stats <file.tsv>]
+//           [--project <file.toml>] [--patches <dir> [--patch <name>[=off]]...] [--cpu-level v2|v3|arm64] [--compile-stats <file.tsv>]
 //
 // The cache is game_build.h's default_cache_dir() unless named. --keep keeps
 // the work directory (the emitted code and the objects), --force builds even
@@ -107,6 +107,15 @@ int main(int argc, char **argv) {
             stats_file = argv[++k];
         else if (a == "--project" && k + 1 < argc)
             options.project = argv[++k];
+        else if (a == "--patches" && k + 1 < argc)
+            options.patches.directory = argv[++k], options.patches.off = false;
+        else if (a == "--patch" && k + 1 < argc) {
+            // a game patch's name, on (the default) or off with "=off" (patches.h)
+            std::string choice = argv[++k];
+            bool on = true;
+            if (choice.size() > 4 && choice.ends_with("=off")) on = false, choice.resize(choice.size() - 4);
+            options.patches.enabled[choice] = on;
+        }
         else if (a == "--cpu-level" && k + 1 < argc) {
             std::optional<CpuLevel> level = parse_cpu_level(argv[++k]);
             if (!level) return std::fprintf(stderr, "xfbuild: %s: not a CPU level (v2, v3, arm64)\n", argv[k]), 2;

@@ -99,12 +99,14 @@ int main() {
     frontend::Settings own;
     CHECK(frontend::load(dir / "config.toml", own, error, "5846000A") && own.game.empty());
     own.game = "5846000A", own.audio.volume = 70, own.keys["start"] = "Space";
+    own.patches["Made up 60 FPS"] = true, own.patches["A fix. With a dot"] = false;
     CHECK(frontend::save(dir / "config.toml", own, error));
     CHECK(frontend::load(dir / "config.toml", back, error, "5846000A") && back.game == "5846000A");
+    CHECK(back.patches.size() == 2 && back.patches.at("Made up 60 FPS") && !back.patches.at("A fix. With a dot"));
     CHECK(back.audio.volume == 70 && back.keys.at("start") == "Space" && back.video.aspect == "stretch");
     CHECK(frontend::load(dir / "config.toml", back, error) && back.game.empty());
     CHECK(back.audio.volume == 40 && back.keys.at("start") == "Return" && back.launcher.games == "D:/games");
-    CHECK(frontend::load(dir / "config.toml", back, error, "41560817") && back.game.empty() && back.audio.volume == 40);
+    CHECK(frontend::load(dir / "config.toml", back, error, "41560817") && back.game.empty() && back.audio.volume == 40 && back.patches.empty());
     s.audio.volume = 30; // the shared ones saved again keep the game's table
     CHECK(frontend::save(dir / "config.toml", s, error));
     CHECK(frontend::load(dir / "config.toml", back, error, "5846000A") && back.audio.volume == 70);
@@ -459,6 +461,21 @@ int main() {
         size_t binds = 0;
         for (size_t at = settings.find("data-action=\"capture\""); at != std::string::npos; at = settings.find("data-action=\"capture\"", at + 1)) binds++;
         CHECK(binds == 25);
+        // the Patches tab: a row a patch, its key escaped, the code and other-version notes
+        {
+            frontend::SettingsPage with = page;
+            with.game_title = "A <game>", with.title_id = "5846000A", with.patches_folder = "D:/patches";
+            frontend::PatchRow a, b;
+            a.name = "60 \"FPS\"", a.description = "Unlocks it.", a.author = "me", a.enabled = true, a.code = true;
+            b.name = "Fix", b.applies = false;
+            with.patches = {a, b};
+            const std::string html = frontend::settings_page_html(frontend::SettingsTab::Patches, with);
+            CHECK(html.find("data-key=\"patch:60 &quot;FPS&quot;\"") != std::string::npos);
+            CHECK(html.find("check on") != std::string::npos && html.find("Prepare builds a library") != std::string::npos);
+            CHECK(html.find("another version of the game") != std::string::npos && html.find("By me.") != std::string::npos);
+            with.patches.clear();
+            CHECK(frontend::settings_page_html(frontend::SettingsTab::Patches, with).find("No patch files for 5846000A") != std::string::npos);
+        }
         CHECK(frontend::settings_tabs_html(frontend::SettingsTab::Keyboard).find("tab f active\" data-action=\"tab\" data-arg=\"keyboard\"") != std::string::npos);
         CHECK(frontend::about_body_html().find("FFmpeg") != std::string::npos && frontend::about_body_html().find("Lucide") != std::string::npos);
         // menus: an item's action, a greyed one without, a check mark

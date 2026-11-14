@@ -209,7 +209,7 @@ int fail(const std::string &message) {
 
 int xf::run_player(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: player <game.iso | default.xex> [--xex <path>] [--content <dir>] [--config <file>] "
-                        "[--steps N] [--interpret] [--cache <dir>] [--game-library <file>] [--quit-after S] "
+                        "[--steps N] [--interpret] [--no-patches] [--cache <dir>] [--game-library <file>] [--quit-after S] "
                         "[--screenshots <dir>] [--screenshot-every N] "
                         "[--press <buttons@seconds[:hold]>]... [--no-sound] [--overlay] [--rates] [--hook-stats] "
                         "[--option <key>=<value>]...\n";
@@ -233,7 +233,7 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     double quit_after = 0;
     uint64_t screenshot_every = 300;
     bool sound_wanted = true, overlay = false, print_rates = false;
-    bool storage_given = false, directory_saves = false, system_ui = true;
+    bool storage_given = false, directory_saves = false, system_ui = true, no_patches = false;
     std::filesystem::path window_shots; // --window-shots: the window itself (the overlay and dialogs on it) saved here
     double window_shot_every = 2.0, next_window_shot = 1.0;
     uint64_t window_shots_written = 0;
@@ -264,6 +264,8 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
             o.steps = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--interpret")
             o.interpret = true;
+        else if (a == "--no-patches")
+            no_patches = true;
         else if (a == "--cache" && i + 1 < argc)
             o.cache = argv[++i];
         else if (a == "--game-library" && i + 1 < argc)
@@ -309,6 +311,20 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         }
     }
     if (directory_saves) o.content_format = kernel::ContentFormat::Directory;
+    // the game's patches (patches.h): the folder beside the config file, and the game's own choices
+    // in [games.<id>.patches], read once the game's title ID is known
+    if (!no_patches) {
+        o.patches.directory = frontend::patches_directory(config_file);
+        o.patch_choices = [&](uint32_t id) {
+            char text[16];
+            std::snprintf(text, sizeof(text), "%08X", id);
+            frontend::Settings own;
+            std::string why;
+            return frontend::load(config_file, own, why, text) ? own.patches : std::map<std::string, bool>{};
+        };
+    } else {
+        o.patches.off = true;
+    }
     // the game, opened as boot opens it
     game::Game g;
     if (!game::open(o, g, error)) return fail(error);

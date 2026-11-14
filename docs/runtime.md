@@ -2443,6 +2443,65 @@ kernel's own result shapes. The logic is apart from the view:
   mid-game takes the pad without a stray press reaching the game on the frame it opens; the launcher's System and
   Profile tabs with the mouse and the pad; the title restart the overlay offers.
 
+## Game patches
+
+Per-title patches in the format of Xenia Canary's patcher (`patcher/patch_db.*`, `patcher.*`, BSD; `src/patches.cpp`,
+`include/xenoforge/patches.h`): 60 fps unlocks, resolution changes, fixes. Users drop Xenia's files in the patches
+folder, the config folder's `patches` (`%APPDATA%\xenoforge\patches`; `$XDG_DATA_HOME/xenoforge/patches` or
+`~/.local/share/...` on POSIX), named as Xenia names them: `<TITLE ID> - <name>.patch.toml` (eight hex digits first).
+
+**The format.** `title_name`, `title_id` (hex text) and `hash` (one string or an array: hex, `0x` optional) at the top,
+then `[[patch]]` tables with `name`, `desc`, `author`, `is_enabled` and the writes as arrays of `{address, value}`
+tables: `be8`, `be16`, `be32`, `be64` (integers), `f32`, `f64` (float or integer, stored big-endian), `string` (bytes,
+no terminator), `u16string` (UTF-16, stored big-endian) and `array` (a hex string, read in pairs of digits from the
+left, a last odd digit alone, as Xenia's `hex_string_to_array`). A file without the three header fields is refused; a
+patch with a field of the wrong type is left out whole with a warning (Xenia dereferences the missing field or keeps the
+entries read before).
+
+**Matching.** The hash is Xenia's `UserModule::CalculateHash`: XXH3-64 (`src/xxh3.cpp`, written from the algorithm, checked
+against the reference library) of the executable's image from its first code page to the end of its last, in the pages of
+the module's heap (64 KB below 0x90000000, else 4 KB), taken on the image as `load_xex_image` gives it (title update
+included, patches not). A file applies when its title ID is the executable's and its hash list holds the module's; a file
+for the title with another hash is refused and the log says so.
+
+**Enabling.** Each patch's `is_enabled` is the default. The game's own settings override it by name:
+`[games."<TITLE ID>".patches]` with `"<patch name>" = true` or `false`. `boot` reads no patches unless given
+`--patches <dir>` (and `--patch <name>[=off]`), so its runs and the deterministic check do not depend on the machine;
+`xfbuild` takes the same two options; the player reads the folder and the game's table (`--no-patches` ignores them).
+
+**Code and data.** XenoForge builds the game's code ahead of time, so a patch is applied by what it writes over, decided by
+the module's section table (`ModuleInfo::is_code`: pages of type code) and cut where one entry passes from one to the
+other:
+- *Data* (everything not in a code page, also read-only data and the heaps): written into guest memory once the executable
+  is loaded, with the page protection lifted and put back, as Xenia's `ApplyPatch`; an address in no committed memory is
+  left out and logged.
+- *Code*: written into the executable's image before anything reads it, both for the build (discovery and emission see the
+  patched instructions: `recomp::EmitOptions::patch_image`) and for the run (the kernel maps the patched image, so the
+  interpreter and anything reading code see it, and a library's module digest is checked against the patched image).
+  A library carries the code patches it was built with in its name: `<digest>+<key>-<interface>-<level>`, where `digest`
+  is the unpatched image's and `key` is the XXH3-64 of the enabled code entries (address and bytes, in file order) as 16
+  hex digits (`patches::cache_key`); with no code patch enabled the name is the plain `<digest>-...`, so every library
+  built before stays valid, and each set of code patches has a library of its own (toggling one selects or builds the
+  matching library; the entry log and shader storage are per name too).
+- *No library for the set*: the player runs the game in the interpreter until the game is prepared with the patches on
+  (the launcher shows "Needs preparing" for it, since its name differs). It never runs a library built from other code.
+  Data-only sets need no rebuild. A game linked into a port's own player (generated code built in) interprets the
+  executable when a code patch changes its image, since the linked code is tied to the unpatched digest.
+
+**The log.** Boot and the player print one line a patch (`patches: <file>: "<name>" enabled: N bytes of code, M of data`),
+the refusals, the bytes of code patched in the image and each data write (`... bytes of data at 0x... applied`); the build
+reports the same lines in its Reading stage.
+
+**The launcher.** A Patches tab in a game's settings (after Interface), laid out as the Video tab: a group of toggle rows
+with the patch's description and author, a note when it changes code ("Prepare builds a library for it") and when its file
+is for another version of the game. Toggling gives the game settings of its own (as the Custom settings switch does) and
+writes `[games.<id>.patches]`; the library's status follows the set.
+
+Differences from Xenia: the code/data split above; `u16string` is written big-endian (Xenia copies the host's
+little-endian code units into the big-endian guest); a bad patch is dropped whole; files are read once at start (no
+reload); the folder is the config folder's `patches` (Xenia's `<storage>/patches`); TOML is read with the project's reader
+(`xf::toml`) or toml++ in the launcher's settings.
+
 ## The launcher
 
 Plan track C2 (2026-11-05, a first one), after the 3DS runtime's

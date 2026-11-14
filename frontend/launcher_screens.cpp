@@ -203,7 +203,8 @@ void LauncherView::show_about() {
 
 void LauncherView::begin_prepare(const GameEntry &game, bool demo) {
     PrepareJob::Runner runner = demo ? PrepareJob::demo_runner(opt_.demo_speed, opt_.demo_fail)
-                                     : PrepareJob::build_runner(game.path, build::default_cache_dir(), opt_.build_jobs, cached_of(game));
+                                     : PrepareJob::build_runner(game.path, build::default_cache_dir(), opt_.build_jobs, cached_of(game),
+                                                              patch_config_of(game));
     prepare_title_ = game.title;
     prepare_title_id_ = game.title_id;
     prepare_listed_ = false;
@@ -262,7 +263,7 @@ void LauncherView::update_prepare() {
     // its dialog is not showing
     if (s.finished && !prepare_listed_) {
         prepare_listed_ = true;
-        cached_.clear(), stale_.clear(), rows_sig_.clear();
+        cached_.clear(), keys_.clear(), patch_files_.reset(), stale_.clear(), rows_sig_.clear();
         if (failed) failed_.insert(prepare_title_id_);
         if (done) failed_.erase(prepare_title_id_);
         if (done) play_sound(Cue::Done);

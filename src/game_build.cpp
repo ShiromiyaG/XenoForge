@@ -162,8 +162,16 @@ constexpr const char *REPORT_EXTENSION = ".build.txt";
 // names it; empty when it is not one
 std::string normal_digest(std::string_view digest) {
     std::string text(digest);
-    if (text.size() != 16 || text.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return {};
-    return hex_digest(std::strtoull(text.c_str(), nullptr, 16));
+    // the image's digest, and after a "+" the key of the code patches the library was built with
+    std::string key;
+    if (const size_t plus = text.find('+'); plus != std::string::npos) key = text.substr(plus + 1), text.resize(plus);
+    auto valid = [](const std::string &s) {
+        return s.size() == 16 && s.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+    };
+    if (!valid(text) || (!key.empty() && !valid(key))) return {};
+    std::string normal = hex_digest(std::strtoull(text.c_str(), nullptr, 16));
+    if (!key.empty()) normal += "+" + hex_digest(std::strtoull(key.c_str(), nullptr, 16));
+    return normal;
 }
 
 std::string read_file(const fs::path &path) {
@@ -953,7 +961,11 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
     Xex xex;
     if (!parse_xex(executable->file, xex, why) || !load_xex_image(executable->file, xex, why))
         return fail(error, executable->path + ": " + why);
-    const std::string digest = hex_digest(image_digest(xex.image));
+    // the enabled code patches: the library is cached by the unpatched image's digest and their
+    // key, and they are written into each executable's file (patches::patched_file) before discovery
+    const patches::Plan plan = patches::make_plan(patches::module_info(xex), options_.patches);
+    for (const std::string &line : plan.log) report(Stage::Reading, 0, 0, line);
+    const std::string digest = patches::cache_key(hex_digest(image_digest(xex.image)), plan);
     const fs::path library = library_path(cache, digest, level_);
     std::error_code ec;
     // the port's project file, read first: what it says is part of what the
@@ -1020,6 +1032,19 @@ bool Build::run(const fs::path &disc, const fs::path &cache, std::string &error)
                        : std::string();
         };
     std::vector<recomp::EmittedModule> emitted;
+    // the executables the enabled code patches change are emitted from a copy of the file with the
+    // patched image (the recompiler knows nothing of patches)
+    for (recomp::ModuleFile &m : modules) {
+        Xex x;
+        if (!parse_xex(m.file, x, why) || !load_xex_image(m.file, x, why)) continue;
+        const patches::Plan p = patches::make_plan(patches::module_info(x), options_.patches);
+        if (!p.any_code()) continue;
+        patches::apply_code(p, x.image, x.base_address);
+        std::vector<uint8_t> patched;
+        if (!patches::patched_file(m.file, x, patched))
+            return fail(error, m.path + ": cannot apply the code patches to this executable's file");
+        m.file = std::move(patched);
+    }
     if (!recomp::emit_modules(modules, src, emit, emitted, why)) return fail(error, why);
     modules.clear(); // the files' bytes, no longer needed
 
