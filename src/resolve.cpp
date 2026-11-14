@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace xf::resolve {
@@ -728,6 +729,32 @@ bool destination_ranges(const Info &info, std::vector<std::pair<uint32_t, uint32
         }
         return true;
     }
+    // Texels under 4 bytes, or an array: every texel's place walked for the lowest and highest,
+    // a million calls for a 720p resolve to 8-bit texels, done again by both GPU threads at each
+    // resolve. A frame resolves the same rectangles to the same places as the frame before, so
+    // the bounds are kept, the last 64 on each thread, by what they are worked out from
+    // (XF_RESOLVE_RANGE_MEMO=0: walked every time).
+    struct Bounds {
+        uint32_t key[9];
+        uint64_t low, high;
+    };
+    static const bool memo_on = [] {
+        const char *v = std::getenv("XF_RESOLVE_RANGE_MEMO");
+        return !(v && v[0] == '0');
+    }();
+    thread_local Bounds kept[64] = {};
+    thread_local uint32_t kept_next = 0;
+    const uint32_t key[9] = {info.width,       info.height,     info.dest_x,
+                             info.dest_y,      info.dest_pitch, info.dest_height,
+                             info.dest_slice,  uint32_t(info.dest_array), log2 + 1};
+    if (memo_on)
+        for (const Bounds &b : kept)
+            if (!std::memcmp(b.key, key, sizeof(key))) {
+                if (b.high - b.low > (256u << 20)) return false;
+                add(written, b.low, b.high + dest_bytes);
+                partial = written;
+                return true;
+            }
     uint64_t low = UINT64_MAX, high = 0;
     for (uint32_t j = 0; j < info.height; j++)
         for (uint32_t i = 0; i < info.width; i++) {
@@ -737,6 +764,11 @@ bool destination_ranges(const Info &info, std::vector<std::pair<uint32_t, uint32
                              : texture::tiled_offset_2d(x, y, info.dest_pitch, log2);
             low = std::min(low, o), high = std::max(high, o);
         }
+    if (memo_on) {
+        Bounds &b = kept[kept_next++ & 63];
+        std::memcpy(b.key, key, sizeof(key));
+        b.low = low, b.high = high;
+    }
     if (high - low > (256u << 20)) return false;
     add(written, low, high + dest_bytes);
     partial = written;
