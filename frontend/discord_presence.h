@@ -32,7 +32,7 @@ std::string handshake_json(const std::string &client_id);
 // image (an art asset's key, or a picture's http(s) address) with its hover text; `nonce` pairs the reply with it
 std::string activity_json(int pid, const std::string &title, const std::string &state, int64_t start_seconds,
                           const std::string &nonce, const std::string &image = "xenoforge",
-                          const std::string &image_text = "XenoForge");
+                          const std::string &image_text = "XenoForge", const std::string &name = "");
 
 // The game's art on Xbox's own catalog of title images, by its title ID ("4D5300AB" style, 8 hex digits), for the
 // large image while a game runs; "" for an ID that is not one
@@ -48,8 +48,10 @@ public:
     Presence();
     ~Presence();
     // false: nothing started. `state` is the second line; `image` the large image (a key or an address)
+    // `name` shows in place of the application's ("Playing <name>"; "" keeps "XenoForge")
     bool start(const std::string &client_id, const std::string &title, const std::string &state = "XenoForge",
-               const std::string &image = "xenoforge", const std::string &image_text = "XenoForge");
+               const std::string &image = "xenoforge", const std::string &image_text = "XenoForge",
+               const std::string &name = "");
     void stop();
     // for a check: whether the thread has its activity sent to a running Discord
     bool connected() const;

@@ -90,12 +90,16 @@ std::string handshake_json(const std::string &client_id) {
 }
 
 std::string activity_json(int pid, const std::string &title, const std::string &state, int64_t start_seconds,
-                          const std::string &nonce, const std::string &image, const std::string &image_text) {
+                          const std::string &nonce, const std::string &image, const std::string &image_text,
+                          const std::string &name) {
     // details and state are 2 to 128 characters for Discord; a shorter text is padded by a space
     auto field = [](const std::string &s) { return json_string(s.size() < 2 ? s + " " : s, 128); };
+    // the activity's name in place of the application's ("Playing <name>"), where one is given
+    const std::string named = name.empty() ? std::string() : "\"name\":" + field(name) + ",";
     // the image: an art asset's key, or a picture's address (Discord fetches it through its media proxy)
-    return "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + std::to_string(pid) + ",\"activity\":{\"details\":" +
-           field(title) + ",\"state\":" + field(state) + ",\"timestamps\":{\"start\":" + std::to_string(start_seconds) +
+    return "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" + std::to_string(pid) + ",\"activity\":{" + named +
+           "\"details\":" + field(title) + (state.empty() ? std::string() : ",\"state\":" + field(state)) +
+           ",\"timestamps\":{\"start\":" + std::to_string(start_seconds) +
            "},\"assets\":{\"large_image\":" + json_string(image, 256) + ",\"large_text\":" + field(image_text) +
            "}}},\"nonce\":" + json_string(nonce) + "}";
 }
@@ -245,7 +249,7 @@ int process_id() {
 } // namespace
 
 struct Presence::Impl {
-    std::string client_id, title, state, image, image_text;
+    std::string client_id, title, state, image, image_text, name;
     int64_t started = 0;
     // what was last said in the log (one line a change, not one a retry): 0 nothing, 1 set, 2 not running,
     // 3 no answer
@@ -309,7 +313,7 @@ struct Presence::Impl {
         if (!link.write(encode_frame(OP_HANDSHAKE, handshake_json(client_id))) || link.read((char *)head, 1, 3000) <= 0 ||
             !read_frame_after_first(head, op, body) || op != OP_FRAME ||
             !link.write(encode_frame(OP_FRAME, activity_json(process_id(), title, state, started, next_nonce(), image,
-                                                             image_text)))) {
+                                                             image_text, name)))) {
             link.close();
             say(3, "Discord did not answer the handshake (tried again every 15 s)");
             return false;
@@ -360,9 +364,9 @@ Presence::Presence() = default;
 Presence::~Presence() { stop(); }
 
 bool Presence::start(const std::string &client_id, const std::string &title, const std::string &state,
-                     const std::string &image, const std::string &image_text) {
+                     const std::string &image, const std::string &image_text, const std::string &name) {
 #if defined(__ANDROID__)
-    (void)client_id, (void)title, (void)state, (void)image, (void)image_text;
+    (void)client_id, (void)title, (void)state, (void)image, (void)image_text, (void)name;
     return false;
 #else
     if (client_id.empty() || impl_) return false;
@@ -372,6 +376,7 @@ bool Presence::start(const std::string &client_id, const std::string &title, con
     impl_->state = state;
     impl_->image = image;
     impl_->image_text = image_text;
+    impl_->name = name;
     impl_->started =
         std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     impl_->thread = std::thread([p = impl_.get()] { p->run(); });

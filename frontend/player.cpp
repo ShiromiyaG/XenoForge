@@ -415,7 +415,8 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     if (settings.discord.enabled && !settings.discord.client_id.empty()) {
         const std::string name = window_title == title_id ? "A game" : window_title;
         const std::string art = frontend::discord::title_art_url(title_id);
-        presence.start(settings.discord.client_id, name, "XenoForge", art.empty() ? "xenoforge" : art, name);
+        // "Playing <the game>", "XenoForge" beneath, the game's art
+        presence.start(settings.discord.client_id, "XenoForge", "", art.empty() ? "xenoforge" : art, name, name);
         std::printf("discord: presence for %s%s\n", name.c_str(), art.empty() ? "" : " with its box art");
     }
     if (!frontend::set_window_icon(window, frontend::title_icon(g.xex)))

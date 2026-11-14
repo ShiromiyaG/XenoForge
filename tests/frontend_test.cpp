@@ -53,6 +53,7 @@ int main() {
                      "\"large_text\":\"XenoForge\"}}},\"nonce\":\"7\"}");
         // a picture by its address as the large image, and the box art's address by a made-up title ID
         CHECK(d::activity_json(1, "ab", "s", 2, "3", "http://x/y.jpg", "ab").find("\"large_image\":\"http://x/y.jpg\",\"large_text\":\"ab\"") != std::string::npos);
+        CHECK(d::activity_json(1, "XenoForge", "", 2, "3", "k", "Some Game", "Some Game").find("{\"name\":\"Some Game\",\"details\":\"XenoForge\",\"timestamps\"") != std::string::npos);
         CHECK(d::title_art_url("58460001") == "http://download.xbox.com/content/images/66acd000-77fe-1000-9115-d80258460001/1033/boxartlg.jpg");
         CHECK(d::title_art_url("5846000") == "" && d::title_art_url("5846000G") == "");
         CHECK(d::clear_json(1234, "8") == "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":1234},\"nonce\":\"8\"}");

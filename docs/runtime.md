@@ -3159,8 +3159,8 @@ not running the thread retries every 15 s without a word. Titles are escaped as 
 invalid UTF-8) and cut at 128 bytes.
 
 **What it shows.** In the launcher, while no game runs: "In the launcher", with XenoForge's own art asset
-("xenoforge"). While a game runs, the player's: the game's title, the time since it started and, as the large
-image, the game's box art on the Xbox 360 Marketplace's own catalog of title images
+("xenoforge"). While a game runs, the player's: "Playing <the game's title>" (the activity's `name` in place of
+the application's), "XenoForge" beneath, the time since it started and, as the large image, the game's box art on the Xbox 360 Marketplace's own catalog of title images
 (`http://download.xbox.com/content/images/66acd000-77fe-1000-9115-d802<title id>/1033/boxartlg.jpg`, by the title
 ID; Discord fetches it through its media proxy; http only, as its https certificate does not match). A title
 the catalog has no art for shows an empty image. The launcher steps aside while a game runs, and each says one
