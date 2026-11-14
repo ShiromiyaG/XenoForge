@@ -413,19 +413,31 @@ void DeferredSink::extent_wait() {
 
 void DeferredSink::extent_poll(std::vector<Extent> &resolved) {
     Passing p;
-    if (synchronous_ && extent_handles_.empty() && extent_whole_.empty()) return back_.extent_poll(resolved);
+    if (synchronous_ && extent_first_ == extent_handles_.size() && extent_whole_.empty())
+        return back_.extent_poll(resolved);
     std::lock_guard<std::mutex> lock(extents_mutex_);
     extent_scratch_.clear();
     back_.extent_poll(extent_scratch_);
     for (Extent e : extent_scratch_) {
-        auto it = extent_handles_.find(e.handle);
-        if (it == extent_handles_.end()) {
+        // (the sink's answers in its reports' order, mostly: looked for from the one after the
+        // last found, then from the first still open)
+        const size_t n = extent_handles_.size(), from = std::max(extent_cursor_, extent_first_);
+        size_t at = from;
+        while (at < n && extent_handles_[at].first != e.handle) at++;
+        if (at == n) {
+            for (at = extent_first_; at < from && extent_handles_[at].first != e.handle;) at++;
+            if (at == from) at = n;
+        }
+        if (at == n) {
             // (one reported while synchronous, under the sink's own handle)
             if (synchronous_) resolved.push_back(e);
             continue;
         }
-        e.handle = it->second;
-        extent_handles_.erase(it);
+        e.handle = extent_handles_[at].second;
+        extent_handles_[at].first = 0;
+        extent_cursor_ = at + 1;
+        while (extent_first_ < n && !extent_handles_[extent_first_].first) extent_first_++;
+        if (extent_first_ == n) extent_handles_.clear(), extent_first_ = extent_cursor_ = 0;
         resolved.push_back(e);
     }
     resolved.insert(resolved.end(), extent_whole_.begin(), extent_whole_.end());
@@ -463,7 +475,7 @@ void DeferredSink::run() {
     back_cpu_.bind_current();
     gpu_back_end_os_thread.store(back_cpu_.os_id());
     uint64_t at = 0;
-    uint32_t fenced = 0;
+    uint32_t fenced = 0, records = 0;
     for (;;) {
         uint64_t written = written_.load(std::memory_order_acquire);
         if (at == written) {
@@ -528,9 +540,13 @@ void DeferredSink::run() {
                     wanted_.exchange(UINT64_MAX, std::memory_order_seq_cst) != UINT64_MAX)
                     done_.notify_all();
             }
-            const uint64_t now = FastClock::now();
-            back_busy_.store(back_busy_.load(std::memory_order_relaxed) + (now - busy_from), std::memory_order_relaxed);
-            busy_from = now;
+            // (the clock read every 8 records and at the batch's end, not at each)
+            if ((++records & 7) == 0 || at == written) {
+                const uint64_t now = FastClock::now();
+                back_busy_.store(back_busy_.load(std::memory_order_relaxed) + (now - busy_from),
+                                 std::memory_order_relaxed);
+                busy_from = now;
+            }
         }
     }
 }
@@ -623,7 +639,7 @@ void DeferredSink::handle(Kind kind, const uint8_t *p, uint32_t bytes) {
         std::lock_guard<std::mutex> lock(extents_mutex_);
         const uint64_t theirs = back_.extent_report();
         if (theirs)
-            extent_handles_[theirs] = ours;
+            extent_handles_.push_back({theirs, ours});
         else
             extent_whole_.push_back(Extent{ours, true, 0, 0, 0, 0});
         break;

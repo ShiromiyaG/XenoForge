@@ -1770,13 +1770,11 @@ private:
     private:
         // the cheap clock (fast_clock.h), or steady_clock with XF_RENDERER_STEADY_CLOCK=1 (as
         // before; the replay's own timing keeps the cheap one)
-        static bool steady() {
-            static const bool on = [] {
-                const char *v = std::getenv("XF_RENDERER_STEADY_CLOCK");
-                return v && v[0] == '1';
-            }();
-            return on;
-        }
+        static bool steady() { return steady_; }
+        static inline const bool steady_ = [] {
+            const char *v = std::getenv("XF_RENDERER_STEADY_CLOCK");
+            return v && v[0] == '1';
+        }();
         static constexpr double STEADY_TICK =
             double(std::chrono::steady_clock::period::num) / std::chrono::steady_clock::period::den;
         static uint64_t now() {
@@ -1929,6 +1927,11 @@ private:
     // allocations with it in a heavy scene), folded into the report's maps
     // as it is taken (with_processor_counts).
     std::unordered_map<const char *, uint64_t> used_by_literal_, approximate_by_literal_;
+    struct UseSlot {
+        const char *what = nullptr;
+        uint64_t *count = nullptr;
+    };
+    UseSlot use_slots_[8]; // use()'s, never emptied (used_by_literal_ never is)
     // XF_RESOLVE_TARGET_DETAIL=1: each refused resolve target counted with
     // its format, size and pitch beside the resolve's (resolve_targets)
     bool refusal_detail_ = [] {
@@ -2008,7 +2011,12 @@ private:
         if (pipeline_recording_) pipeline_counts_.push_back({what, true});
     }
     void use(const char *what) {
-        used_by_literal_[what]++;
+        // (a literal's count found again by its address in a few kept slots, before the map: a
+        // draw counts the same few things, and the map's lookup was a seventieth of the back end;
+        // the map's values stay where they are as it grows)
+        UseSlot &slot = use_slots_[(reinterpret_cast<uintptr_t>(what) >> 3) & 7];
+        if (slot.what != what) slot.what = what, slot.count = &used_by_literal_[what];
+        ++*slot.count;
         if (front_recording_) front_counts_.push_back({what, false});
         if (pipeline_recording_) pipeline_counts_.push_back({what, false});
     }
@@ -2836,13 +2844,13 @@ private:
     // ticks a draw, the system constants' 510 to 360), by its wider or string
     // stores, which that memory takes worse than plain ones filling each line
     // in order.
+    static inline const bool upload_stores_ = [] {
+        const char *v = std::getenv("XF_UPLOAD_STORES");
+        return !(v && v[0] == '0');
+    }();
     [[gnu::noinline]] static void upload(void *to, const void *from, size_t bytes) {
 #if defined(__SSE2__)
-        static const bool stores = [] {
-            const char *v = std::getenv("XF_UPLOAD_STORES");
-            return !(v && v[0] == '0');
-        }();
-        if (stores) {
+        if (upload_stores_) {
             uint8_t *d = static_cast<uint8_t *>(to);
             const uint8_t *f = static_cast<const uint8_t *>(from);
             size_t k = 0;

@@ -267,13 +267,12 @@ private:
         if (!dirty_bits_[block]) dirty_.push_back(block);
         dirty_bits_[block] |= bits;
     }
-    static bool run_masks() {
-        static const bool on = [] {
-            const char *v = std::getenv("XF_REGISTER_RUN_MASKS");
-            return !(v && v[0] == '0');
-        }();
-        return on;
-    }
+    // (a plain word read, not a function's guarded static: asked at every run of registers)
+    static bool run_masks() { return run_masks_; }
+    static inline const bool run_masks_ = [] {
+        const char *v = std::getenv("XF_REGISTER_RUN_MASKS");
+        return !(v && v[0] == '0');
+    }();
     // the registers of the draws' state (draw_state) in the block from base, a bit each
     static uint32_t state_mask(uint32_t base) {
         if (base < 0x2000 || (base >= 0x4000 && base + BLOCK <= 0x4910)) return 0;

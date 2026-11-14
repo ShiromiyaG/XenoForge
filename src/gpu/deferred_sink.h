@@ -198,7 +198,11 @@ class DeferredSink final : public Sink {
     // screen extent reports: the handles made here, the sink's matched to them as it reports
     std::mutex extents_mutex_;
     uint64_t extent_next_ = 1;                              // the front end's
-    std::unordered_map<uint64_t, uint64_t> extent_handles_; // the sink's handle to ours
+    // the sink's handle (0: answered) and ours, in the reports' order, from the first still open
+    // (a list searched by a cursor, not a hash map: a node made and freed at each of a frame's
+    // thousands of reports)
+    std::vector<std::pair<uint64_t, uint64_t>> extent_handles_;
+    size_t extent_first_ = 0, extent_cursor_ = 0;
     std::vector<Extent> extent_whole_;                      // ours the sink did not bound (whole)
     std::vector<Extent> extent_scratch_;
 

@@ -33,13 +33,12 @@ class DrawSections {
         Record,          // the draw itself, and what follows it
         COUNT,
     };
-    static bool on() {
-        static const bool v = [] {
-            const char *e = std::getenv("XF_DRAW_SECTIONS");
-            return e && e[0] == '1';
-        }();
-        return v;
-    }
+    // (a plain word read, not a function's guarded static: asked many times a draw)
+    static bool on() { return on_; }
+    static inline const bool on_ = [] {
+        const char *e = std::getenv("XF_DRAW_SECTIONS");
+        return e && e[0] == '1';
+    }();
     static DrawSections &get() {
         static DrawSections s;
         return s;

@@ -468,12 +468,13 @@ void CommandProcessor::write_register(uint32_t index, uint32_t value) {
 // and LOAD_ALU_CONSTANT's constants: a seventh of the command thread went to
 // writing them one by one through write_register, each with its checks);
 // XF_GPU_REGISTER_RUNS=0 writes them one by one again.
+// (a plain word, not a function's guarded static: read at every run)
+static const bool g_register_runs = [] {
+    const char *v = std::getenv("XF_GPU_REGISTER_RUNS");
+    return !(v && v[0] == '0');
+}();
 void CommandProcessor::write_register_run(uint32_t base, const uint8_t *words, uint32_t count) {
-    static const bool runs = [] {
-        const char *v = std::getenv("XF_GPU_REGISTER_RUNS");
-        return !(v && v[0] == '0');
-    }();
-    if (runs && base >= PLAIN_REGISTERS && uint64_t(base) + count <= RegisterFile::COUNT) {
+    if (g_register_runs &&base >= PLAIN_REGISTERS && uint64_t(base) + count <= RegisterFile::COUNT) {
         regs_.write_big_endian(base, words, count);
         return;
     }

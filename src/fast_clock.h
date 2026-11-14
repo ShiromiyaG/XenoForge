@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -27,7 +28,11 @@ class FastClock {
 public:
     static uint64_t now() {
 #if defined(__x86_64__) || defined(_M_X64)
-        if (rate().tsc) return __rdtsc();
+        // (the choice read from a plain word once made: a function's static is a guarded one,
+        // checked against a thread-local count at every call on Windows)
+        int tsc = tsc_.load(std::memory_order_relaxed);
+        if (tsc < 0) tsc_.store(tsc = rate().tsc ? 1 : 0, std::memory_order_relaxed);
+        if (tsc) return __rdtsc();
 #endif
         return uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
     }
@@ -39,6 +44,7 @@ private:
         bool tsc = false;
         double seconds_a_tick = double(std::chrono::steady_clock::period::num) / std::chrono::steady_clock::period::den;
     };
+    static inline std::atomic<int> tsc_{-1}; // -1 not chosen yet, 0 steady_clock, 1 the time stamp counter
     static const Rate &rate() {
         static const Rate r = [] {
             Rate out;
