@@ -54,6 +54,9 @@ struct TranslatedShader {
     // the microcode's hash: the one the emulated path keys the shader by,
     // PassInfo's vertex_shader and pixel_shader, and shader dumps' names
     uint64_t hash = 0;
+    // the stage's float constants (c0-c255) the shader reads, a bit each
+    // (used_float_constants): the ones a draw needs uploaded
+    uint64_t float_constants[4] = {};
     bool ok() const { return why.empty() && !spirv.empty(); }
 };
 
@@ -64,6 +67,14 @@ TranslatedShader translate_shader(const uint32_t *microcode, size_t words, Shade
 // The hash alone (translate_shader's): a shader known already is not
 // translated again.
 uint64_t shader_hash(const uint32_t *microcode, size_t words, ShaderStage stage);
+
+// The stage's float constants the shader reads (its ALU operands), a bit per
+// constant c0-c255 in out[0..3] (c0 = bit 0 of out[0]); a constant read
+// relative to a0 or aL sets them all. What a draw needs of the constants: a
+// native renderer uploads only these, and a port comparing its draws with
+// the GPU's compares only these (the GPU's other constants hold whatever an
+// earlier shader left there). False when the microcode does not parse.
+bool used_float_constants(const uint32_t *microcode, size_t words, ShaderStage stage, uint64_t out[4]);
 
 // The translator's version: a digest of its sources (the parser, the
 // translator, the shader headers), so SPIR-V kept on disk is never used by

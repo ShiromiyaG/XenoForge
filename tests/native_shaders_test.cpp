@@ -55,6 +55,10 @@ void cache_round_trip(const std::vector<uint32_t> &code, native::ShaderStage sta
     const native::TranslatedShader &r = second.get(code.data(), code.size(), stage);
     CHECK(second.stats().read == 1 && second.stats().translated == 0);
     CHECK(same(t, r));
+    // the constants it reads: the same from the translation, the parse alone and the cache's read
+    uint64_t used[4];
+    CHECK(native::used_float_constants(code.data(), code.size(), stage, used));
+    for (int k = 0; k < 4; k++) CHECK(used[k] == t.float_constants[k] && used[k] == r.float_constants[k]);
     // kept under the translator's version only
     CHECK(fs::is_directory(dir / native::translator_version()));
 }
@@ -92,7 +96,7 @@ int main() {
     // a corpus of real shaders, when given
     if (const char *corpus = std::getenv("XF_SHADERS"); corpus && *corpus) {
         const fs::path dir = scratch("xf_native_shaders_corpus");
-        size_t n = 0;
+        size_t n = 0, with_constants = 0;
         for (const auto &e : fs::directory_iterator(corpus)) {
             const std::string name = e.path().filename().string();
             const bool vert = name.ends_with(".ucode.bin.vert"), frag = name.ends_with(".ucode.bin.frag");
@@ -103,9 +107,14 @@ int main() {
             std::memcpy(code.data(), bytes.data(), code.size() * 4);
             const native::ShaderStage stage = vert ? native::ShaderStage::Vertex : native::ShaderStage::Pixel;
             cache_round_trip(code, stage, dir, true); // (the dumps' names are Xenia's hashes, not ours)
+            uint64_t used[4];
+            native::used_float_constants(code.data(), code.size(), stage, used);
+            if (used[0] | used[1] | used[2] | used[3]) with_constants++;
             n++;
         }
-        std::printf("native_shaders: %zu shaders of %s through the cache\n", n, corpus);
+        std::printf("native_shaders: %zu shaders of %s through the cache, %zu reading float constants\n", n, corpus,
+                    with_constants);
+        CHECK(with_constants > 0);
     }
     return finish("native_shaders");
 }
