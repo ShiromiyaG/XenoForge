@@ -14,6 +14,7 @@ namespace xf::native::detail {
 struct Settings {
     OutputRenderer renderer;
     PassFilter filter;
+    DrawObserver observer;
     uint32_t width = 0, height = 0;
     uint32_t occlusion_samples = 1000;
 };

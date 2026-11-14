@@ -50,6 +50,9 @@ void set_output_size(uint32_t width, uint32_t height) {
 void set_pass_filter(PassFilter filter) {
     change([&](detail::Settings &s) { s.filter = std::move(filter); });
 }
+void set_draw_observer(DrawObserver observer) {
+    change([&](detail::Settings &s) { s.observer = std::move(observer); });
+}
 void set_occlusion_samples(uint32_t samples) {
     change([&](detail::Settings &s) { s.occlusion_samples = samples; });
 }

@@ -177,6 +177,20 @@ struct PassInfo {
 using PassFilter = std::function<bool(const PassInfo &pass)>;
 void set_pass_filter(PassFilter filter);
 
+// ---- every draw, watched: a port's check against the emulated path ----
+
+// Called for every draw and resolve the command processor issues, whether
+// the port draws the frame or not (on the renderer's thread, in the order the
+// GPU gets them), with the PassInfo the pass filter would get: a port that
+// captures the guest's draws itself (replacing its Direct3D) compares what it
+// captured with what the GPU got, draw by draw. registers is the GPU's
+// register file at that draw (xenos.h's indices: fetch constants from
+// 0x4800, float constants from 0x4000, the render state from 0x2000), swap
+// the swaps before it. Unset (the default), a draw pays one branch. From any
+// thread; taken at the next swap. Keep it cheap: it runs on every draw.
+using DrawObserver = std::function<void(const PassInfo &pass)>;
+void set_draw_observer(DrawObserver observer);
+
 // What an occlusion query report holds when a skipped draw counted for it
 // (default 1000, Xenia's query_occlusion_fake_sample_count).
 void set_occlusion_samples(uint32_t samples);

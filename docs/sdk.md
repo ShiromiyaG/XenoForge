@@ -454,6 +454,16 @@ What the SDK gives such a port:
   and converts no vertex data.
 - **Textures** (`Frame::texture`): a fetch constant's texture, detiled and
   converted by the renderer's texture cache.
+- **Checking a capture** (`set_draw_observer`): every draw and resolve the
+  command processor issues, with its `PassInfo` (the register file, the
+  shaders' hashes, the primitive and count, the swaps before it), whether the
+  port draws the frame or not, on the renderer's thread; unset, a draw pays
+  one branch. A port that reads each draw's state from the `D3DDevice`'s
+  shadow compares it with what the GPU got, draw by draw, before replacing
+  anything (the first port's step 2: every draw of game A's opening frames
+  matched, its shaders' hashes read through the D3D shader objects'
+  microcode descriptors equal to the emulated path's). Boot calls it only
+  with `--render` (without it no renderer is made).
 
 Still to come: resolves into host images a port owns (render targets as
 images, not EDRAM), a pipeline helper for the translated shaders' layout,

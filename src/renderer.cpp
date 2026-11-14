@@ -2412,6 +2412,7 @@ private:
     bool native_output(uint32_t width, uint32_t height);
     // a draw or a resolve while suppressing: false when it is skipped
     bool native_keep(native::PassInfo &pass);
+    void native_pass(native::PassInfo &pass);
     VkImageView make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
                           VkComponentMapping components = {}, uint32_t levels = 1, uint32_t layers = 1,
                           bool keep = true);
@@ -10401,17 +10402,20 @@ void Impl::draw(const gpu::Draw &d) {
             }
             if (q.ended && q.armed) viz_predicate_ = d.viz_query & 63;
         }
-        // the port draws this frame (native_render.h): the draws its filter
-        // selects skipped, never one exporting memory (the CPU may read it)
-        if (native_suppress_) {
-            if (exports) {
-                native::detail::bump(native::detail::atomic_counters().memexport_kept);
-            } else {
-                native::PassInfo pass;
-                pass.color = color, pass.has_pixel_shader = p != nullptr;
-                pass.primitive = primitive, pass.count = count;
-                pass.vertex_shader = have_vertex_ ? vertex_hash_ : 0, pass.pixel_shader = have_pixel_ ? pixel_hash_ : 0;
-                if (!native_keep(pass)) {
+        // the port's observer sees every draw; the port draws this frame
+        // (native_render.h): the draws its filter selects skipped, never one
+        // exporting memory (the CPU may read it)
+        if (native_suppress_ || native_settings_.observer) {
+            native::PassInfo pass;
+            pass.color = color, pass.has_pixel_shader = p != nullptr;
+            pass.primitive = primitive, pass.count = count;
+            pass.vertex_shader = have_vertex_ ? vertex_hash_ : 0, pass.pixel_shader = have_pixel_ ? pixel_hash_ : 0;
+            native_pass(pass);
+            if (native_settings_.observer) native_settings_.observer(pass);
+            if (native_suppress_) {
+                if (exports) {
+                    native::detail::bump(native::detail::atomic_counters().memexport_kept);
+                } else if (!native_keep(pass)) {
                     if (zpd_current_) zpd_counts_[zpd_current_].suppressed = true;
                     return;
                 }
@@ -12234,11 +12238,13 @@ void Impl::draw(const gpu::Draw &d) {
 
 void Impl::resolve() {
     report_.resolves++;
-    if (native_suppress_) {
+    if (native_suppress_ || native_settings_.observer) {
         native::PassInfo pass;
         pass.resolve = true;
         pass.copy_dest = regs_[reg::RB_COPY_DEST_BASE];
-        if (!native_keep(pass)) return;
+        native_pass(pass);
+        if (native_settings_.observer) native_settings_.observer(pass);
+        if (native_suppress_ && !native_keep(pass)) return;
     }
     poll();
     resolve::Info info;
@@ -13582,16 +13588,18 @@ bool Impl::native_frame(uint64_t number, bool &held) {
 
 // A draw or resolve while the port's frame is shown: the filter's answer
 // (none: skip everything), counted.
+// what the register file says of a draw or resolve, for the filter and the observer
+void Impl::native_pass(native::PassInfo &pass) {
+    pass.surface_pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
+    pass.color_base = regs_[reg::RB_COLOR_INFO] & 0xFFF;
+    pass.color_format = (regs_[reg::RB_COLOR_INFO] >> 16) & 0xF;
+    pass.registers = regs_, pass.swap = report_.swaps;
+}
+
 bool Impl::native_keep(native::PassInfo &pass) {
     native::detail::AtomicCounters &counts = native::detail::atomic_counters();
     bool skip = true;
-    if (native_settings_.filter) {
-        pass.surface_pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
-        pass.color_base = regs_[reg::RB_COLOR_INFO] & 0xFFF;
-        pass.color_format = (regs_[reg::RB_COLOR_INFO] >> 16) & 0xF;
-        pass.registers = regs_, pass.swap = report_.swaps;
-        skip = native_settings_.filter(pass);
-    }
+    if (native_settings_.filter) skip = native_settings_.filter(pass);
     native::detail::bump(skip ? (pass.resolve ? counts.resolves_skipped : counts.draws_skipped)
                               : (pass.resolve ? counts.resolves_kept : counts.draws_kept));
     return !skip;
