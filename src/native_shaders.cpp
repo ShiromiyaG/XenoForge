@@ -70,7 +70,9 @@ bool shader_uses(const uint32_t *microcode, size_t words, ShaderStage stage, Sha
                 if (t->operand_count > 1) out.texture_slots |= 1u << (t->operands[1].index & 31);
             } else if (const auto *v = std::get_if<ucode::VertexFetchInstruction>(&slot.instruction)) {
                 const uint32_t f = v->operands[1].index;
-                if (f < 96) out.vertex_fetches[f / 32] |= 1u << (f % 32);
+                if (f >= 96) continue;
+                out.vertex_fetches[f / 32] |= 1u << (f % 32);
+                if (!v->is_mini_fetch && v->stride > out.vertex_strides[f]) out.vertex_strides[f] = uint8_t(v->stride);
             }
         }
     }

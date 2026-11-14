@@ -62,6 +62,9 @@ void cache_round_trip(const std::vector<uint32_t> &code, native::ShaderStage sta
     native::ShaderUses uses;
     CHECK(native::shader_uses(code.data(), code.size(), stage, uses));
     for (int k = 0; k < 4; k++) CHECK(uses.float_constants[k] == used[k]);
+    // a stride only for a vertex fetch constant it names
+    for (int f = 0; f < 96; f++)
+        if (uses.vertex_strides[f]) CHECK(uses.vertex_fetches[f / 32] & (1u << (f % 32)));
     // kept under the translator's version only
     CHECK(fs::is_directory(dir / native::translator_version()));
 }

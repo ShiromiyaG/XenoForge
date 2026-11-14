@@ -466,9 +466,10 @@ What the SDK gives such a port:
   with `--render` (without it no renderer is made).
 
 - **What a shader reads** (`shader_uses`, `used_float_constants`): its
-  float constants, texture fetch slots and vertex fetch constants, so a
-  port uploads and binds only those (a shader reading relative to a0 or
-  aL reads all its constants).
+  float constants, texture fetch slots and vertex fetch constants with
+  each one's stride, so a port uploads and binds only those (a shader
+  reading relative to a0 or aL reads all its constants) and copies a
+  draw's vertices from a vertex buffer by its indices' range.
 - **The fixed function** (`native_render.h`): the renderer's own
   conversions of the registers, `vk_compare_op`, `vk_stencil_op`,
   `vk_blend_factor`, `vk_blend_op`, `host_viewport` (the viewport and the

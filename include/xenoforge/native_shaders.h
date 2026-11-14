@@ -80,11 +80,15 @@ bool used_float_constants(const uint32_t *microcode, size_t words, ShaderStage s
 // (slots 0-31, a bit each) its texture fetches and texture queries name, and
 // the vertex fetch constants (0-95, a bit each in vertex_fetches[0..2]) its
 // vertex fetches name, with its float constants (used_float_constants'). A
-// native renderer binds only these textures and streams.
+// native renderer binds only these textures and streams. vertex_strides: each
+// vertex fetch constant's stride in dwords (its full fetches' largest; 0 for
+// one it does not name), so a port copying a draw's vertices copies indices
+// first to last + 1 times it.
 struct ShaderUses {
     uint64_t float_constants[4] = {};
     uint32_t texture_slots = 0;
     uint32_t vertex_fetches[3] = {};
+    uint8_t vertex_strides[96] = {};
 };
 bool shader_uses(const uint32_t *microcode, size_t words, ShaderStage stage, ShaderUses &out);
 
