@@ -126,5 +126,13 @@ if(MAKE_XEX)
     if(NOT out MATCHES "generated code: 1 modules, 4 functions" OR NOT out MATCHES "cpu: linked generated code")
         message(FATAL_ERROR "sdk_test: boot_template_port on the executable: ${rc}\n${out}")
     endif()
+    # the project file changed: emitted again, the generated code's project configured a second time (its cache
+    # once turned it to the debug runtime there, which the link refused), built and linked again
+    file(APPEND ${WORK}/template_port/project.toml "\"0x82001000\" = \"Entry\"\n")
+    step("build the template's port again after a project file change" ${CMAKE_COMMAND} --build
+         ${WORK}/template_port/build_iso)
+    if(NOT step_output MATCHES "1 names")
+        message(FATAL_ERROR "sdk_test: the project file's change was not emitted:\n${step_output}")
+    endif()
 endif()
 message(STATUS "sdk_test: ok")

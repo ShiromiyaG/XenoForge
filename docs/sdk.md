@@ -396,6 +396,34 @@ with `xf::port::before` and yields every frame it was not called in. Options
 `background`. Inside XenoForge's build, `-DXF_NATIVE_PORT_GAME=<one of
 XF_GAMES>` builds it as `build/sdk/examples/native_port/{player,boot}_native`.
 
+## Next: a port that replaces the guest's Direct3D
+
+(Planned 2026-11-14, from the first port's design.) `native_render.h` lets a
+port draw while the guest's Direct3D still builds PM4 command buffers and the
+command processor still reads them, its draws skipped. A port can go
+further: replace the D3D library the game links statically (its draws,
+clears, resolves, swap, the ring buffer's commit and kick) with its own
+Vulkan, reading each draw's state from the `D3DDevice`'s shadow of the GPU
+registers, so no command buffer is built and the emulated GPU does no work.
+What the SDK lacks for that, all as port API (headers in
+`XF_SDK_API_HEADERS`, so a port stays off XenoForge's internals):
+
+- **The GPU taken over**: a call that leaves the command processor idle for
+  the run (no ring buffer read, no EDRAM), hands the port the Vulkan device,
+  its queue and the presentation (the player's swapchain and overlay still
+  on top), and leaves the guest's fences and the occlusion queries to the
+  port, while the kernel keeps the vblank interrupts.
+- **Shaders**: the translator (Xenos microcode to SPIR-V, the one the
+  emulated path uses, the same options) behind a small public interface, and
+  a bake tool (`xfshader bake <disc> <out>`) a port's build runs, like
+  `xfrecomp emit`, so a port's shaders are translated before it runs.
+- **Resources**: guest memory as a Vulkan buffer (`VK_EXT_external_memory_host`
+  where there is one, else a mirror kept by the writes the next item reports),
+  and texture untiling and format conversion on the GPU from a fetch
+  constant, outside a `Frame`.
+- **Writes**: notification of CPU writes to guest memory ranges a port
+  registers (the page watch the renderer uses), for what a port cannot hook.
+
 ## Building and running a port
 
 ```
