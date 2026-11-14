@@ -27,6 +27,10 @@
 //   o0-o15 (locations 0-15) and writes oC0-oC3 (color locations 0-3)
 //   one invocation per guest vertex, its index (gl_VertexIndex) in r0.x: index buffers are the
 //   port's (the guest's, swapped), vertex input bindings none
+//   VertexForm::RectangleList: a rectangle list's vertex shader (primitive type 8), drawn as a
+//   triangle strip of four vertices a rectangle (the corner in gl_VertexIndex's bits 0-1), the
+//   indices of its three guest vertices a uvec3 at input location 0 (VK_FORMAT_R32G32B32_UINT, the
+//   same for the four); the guest shader runs for the three and the fourth corner is made from them
 //
 // The two blocks below are the layouts the shaders read, checked against the
 // renderer's at XenoForge's build (a change to either is a change to this
@@ -44,6 +48,9 @@
 namespace xf::native {
 
 enum class ShaderStage { Vertex, Pixel };
+// how a vertex shader runs on the host (shader_translator.h's HostVertex): a
+// guest vertex an invocation, or a rectangle list's rectangle four
+enum class VertexForm { Vertices, RectangleList };
 
 struct TranslatedShader {
     std::vector<uint32_t> spirv; // empty when not translated (why)
@@ -62,7 +69,8 @@ struct TranslatedShader {
 
 // The microcode's words in host order (a guest shader object stores them
 // big-endian: swap each). Thread-safe; a port caches the result by hash.
-TranslatedShader translate_shader(const uint32_t *microcode, size_t words, ShaderStage stage);
+TranslatedShader translate_shader(const uint32_t *microcode, size_t words, ShaderStage stage,
+                                  VertexForm form = VertexForm::Vertices);
 
 // The hash alone (translate_shader's): a shader known already is not
 // translated again.
@@ -110,7 +118,10 @@ class ShaderCache {
     ShaderCache &operator=(const ShaderCache &) = delete;
     // the shader for this microcode (host order), translated or read when not
     // met yet; the reference stays valid as long as the cache
-    const TranslatedShader &get(const uint32_t *microcode, size_t words, ShaderStage stage);
+    // (form: a vertex shader's; the rectangle list form is kept apart, and
+    // not baked: translated when first met)
+    const TranslatedShader &get(const uint32_t *microcode, size_t words, ShaderStage stage,
+                                VertexForm form = VertexForm::Vertices);
     struct Stats {
         uint64_t read = 0;       // from the directory (the bake's, or an earlier run's)
         uint64_t translated = 0; // translated now (what a bake would have saved)

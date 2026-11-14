@@ -50,6 +50,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace xf::native {
 
@@ -72,11 +73,60 @@ struct GuestFrontBuffer {
 // of it as a 2D array (one layer for a 2D texture) with the fetch constant's
 // swizzle applied. Valid until the frame's work is done on the GPU: ask for
 // it again each frame.
+//
+// What a translated shader's sampling of it takes besides (native_shaders.h's
+// SystemConstants, per slot): its components' modes after the swizzle (signs:
+// two bits each, 0 unsigned, 1 signed, 2 unsigned biased to -1..1, 3 gamma),
+// the integer number format's scales (integer_scale), and, with a signed
+// component the format has a signed version for, a view of it in that
+// version (signed_view, else null), which the slot's signed_slots names.
 struct TextureImage {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE; // VK_IMAGE_VIEW_TYPE_2D_ARRAY
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0, levels = 1, layers = 1;
+    uint32_t signs = 0, integer_scale = 0;
+    VkImageView signed_view = VK_NULL_HANDLE;
+};
+
+// A resolve as the renderer reads it from the GPU's registers at the copy
+// (resolve.h's Info, xenos.h's numbering): PassInfo::resolve_info gives it, so
+// a port drawing into render targets of its own does each resolve itself
+// (Frame::resolve) where the GPU would have.
+struct ResolveInfo {
+    // the source, in EDRAM
+    bool depth = false;         // the depth buffer, else color target color_target
+    uint32_t color_target = 0;  // 0-3
+    uint32_t edram_base = 0;    // in tiles, of the source surface
+    uint32_t surface_pitch = 0; // in pixels
+    uint32_t msaa = 0;          // 0 1x, 1 2x, 2 4x
+    uint32_t sample_select = 0;
+    uint32_t source_format = 0;                   // a color target format, or the depth format
+    uint32_t x = 0, y = 0, width = 0, height = 0; // the rectangle, in surface pixels
+    // the destination, in guest memory (as a texture's fetch constant names it)
+    uint32_t dest_base = 0, dest_pitch = 0, dest_height = 0;
+    uint32_t dest_format = 0, dest_endian = 0;
+    int32_t dest_exp_bias = 0;
+    bool dest_swap = false;
+    uint32_t dest_x = 0, dest_y = 0, dest_slice = 0, dest_number = 0;
+    bool dest_array = false;
+    uint32_t texture_base = 0, texel_x0 = 0, texel_y0 = 0;
+    bool copy = true; // false: a clear alone
+    // the clears after the copy, over the same rectangle of the targets
+    // RB_DEPTH_INFO and the color target's RB_COLOR_INFO name: the guest's
+    // words (RB_COLOR_CLEAR, RB_COLOR_CLEAR_LO; RB_DEPTH_CLEAR)
+    bool clear_color = false, clear_depth = false;
+    uint32_t clear_color_value[2] = {};
+    uint32_t clear_depth_value = 0;
+};
+
+// A render target of the port's own as a resolve's source (Frame::resolve):
+// single-sampled, at the console's pixels, made in Frame::target_format's
+// format for its guest format with VK_IMAGE_USAGE_TRANSFER_SRC_BIT, in
+// VK_IMAGE_LAYOUT_GENERAL.
+struct TargetImage {
+    VkImage image = VK_NULL_HANDLE;
+    uint32_t width = 0, height = 0;
 };
 
 // The frame's work, while the output renderer runs (and only then).
@@ -111,6 +161,31 @@ class Frame {
     // 1). The bytes are as the guest stores them: big-endian. Returns the
     // bytes given to the GPU for it (0 when it was current already).
     virtual VkDeviceSize guest_memory(uint32_t address, uint32_t bytes, VkBuffer &buffer, VkDeviceSize &offset) = 0;
+    // The host format the renderer keeps a render target of this guest
+    // format in (RB_COLOR_INFO's or RB_DEPTH_INFO's format), and so the one a
+    // port's own targets take for the translated shaders and Frame::resolve
+    // to read them as the emulated path's: 2_10_10_10_FLOAT (7e3) as 16-bit
+    // floats, 16_16 and 16_16_16_16 (-32..32) as snorm holding the guest's
+    // bits (target_constants' scales), 8_8_8_8_GAMMA as RGBA8 holding the
+    // gamma-encoded bits; D24S8 as the device's 24-bit unorm depth (else a
+    // 32-bit float), D24FS8 as a 32-bit float holding half the depth (0 to 2
+    // halved: its clears too). VK_FORMAT_UNDEFINED when the renderer has none.
+    virtual VkFormat target_format(bool depth, uint32_t format) = 0;
+    // A resolve the port does from a target of its own: the rectangle of
+    // `source` copied into guest memory as the destination says, as the
+    // emulated path's resolve writes it (format conversion, exponent bias,
+    // endianness, tiling), so the textures the guest makes there next
+    // (Frame::texture) are the resolve's. The clears after the copy are the
+    // port's own. Recorded after what the port recorded so far (outside a
+    // render pass: ask for commands() again after it). False, and why, when
+    // it cannot (a resolution scale on, a format the resolves do not write).
+    virtual bool resolve(const ResolveInfo &info, const TargetImage &source, std::string &why) = 0;
+    // The microcode (host order) of a shader the GPU was given, by its hash
+    // (PassInfo's vertex_shader, pixel_shader): what a draw ran, where the
+    // guest's Direct3D loads another program than its shader object's (a
+    // vertex shader whose fetches it fills in from the vertex declaration,
+    // or patches for the pixel shader bound). False when none was met.
+    virtual bool shader_words(uint64_t hash, std::vector<uint32_t> &words) = 0;
 };
 
 struct OutputContext {
@@ -168,6 +243,9 @@ struct PassInfo {
     uint32_t primitive = 0, count = 0;            // a draw's
     uint64_t vertex_shader = 0, pixel_shader = 0; // the shaders' hashes (as verbose draws print them)
     uint32_t copy_dest = 0;                       // a resolve's RB_COPY_DEST_BASE (physical)
+    // a resolve's, as the renderer reads its registers (null when it cannot:
+    // a resolve the emulated path skips too); valid during the call
+    const ResolveInfo *resolve_info = nullptr;
     const uint32_t *registers = nullptr;
     uint64_t swap = 0;
 };
@@ -185,8 +263,8 @@ void set_pass_filter(PassFilter filter);
 // register file indexed by the GPU's register number (xenos.h), covering at
 // least 0x2000-0x23FF.
 
-VkCompareOp vk_compare_op(uint32_t function); // RB_DEPTHCONTROL's depth and stencil functions (3 bits)
-VkStencilOp vk_stencil_op(uint32_t op);       // its stencil operations (3 bits)
+VkCompareOp vk_compare_op(uint32_t function);   // RB_DEPTHCONTROL's depth and stencil functions (3 bits)
+VkStencilOp vk_stencil_op(uint32_t op);         // its stencil operations (3 bits)
 VkBlendFactor vk_blend_factor(uint32_t factor); // RB_BLENDCONTROL's factors (5 bits)
 VkBlendOp vk_blend_op(uint32_t op);             // its operations (3 bits)
 
@@ -201,9 +279,25 @@ struct HostViewport {
     bool empty = false;
 };
 HostViewport host_viewport(const uint32_t *registers, float max_x, float max_y);
+// The same into a port's own targets (Frame::target_format's): with the
+// pixel shader writing depth (oDepth), and with a D24FS8 depth target (kept
+// halved).
+HostViewport host_viewport(const uint32_t *registers, float max_x, float max_y, bool pixel_writes_depth,
+                           bool depth_float24);
 // The draw's scissor (PA_SC_WINDOW_SCISSOR_*, PA_SC_SCREEN_SCISSOR_*, the
 // window offset), clamped to a target `pitch` pixels wide.
 VkRect2D host_scissor(const uint32_t *registers, uint32_t pitch);
+
+// What a draw's targets ask of the translated pixel shader, into its system
+// constants (native_shaders.h), as the emulated path's host render targets
+// take them: each color target's scale (2 to RB_COLOR_INFO's exponent bias,
+// times 1024/32767 for the 16-bit fixed formats kept as snorm, negative for
+// 16_16, whose alpha is left out) for the targets `colors_written` names (a
+// bit each, the shader's), the gamma targets and the 7e3 ones whose alpha is
+// clamped (flags[2]), and a D24FS8 depth target the draw tests or writes
+// (flags[3] bit 0: its depth written halved).
+struct SystemConstants;
+void target_constants(const uint32_t *registers, uint32_t colors_written, SystemConstants &sys);
 
 // ---- every draw, watched: a port's check against the emulated path ----
 

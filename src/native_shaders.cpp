@@ -89,7 +89,7 @@ bool used_float_constants(const uint32_t *microcode, size_t words, ShaderStage s
     return true;
 }
 
-TranslatedShader translate_shader(const uint32_t *microcode, size_t words, ShaderStage stage) {
+TranslatedShader translate_shader(const uint32_t *microcode, size_t words, ShaderStage stage, VertexForm form) {
     TranslatedShader out;
     out.hash = shader_hash(microcode, words, stage);
     if (!microcode || !words) {
@@ -100,8 +100,11 @@ TranslatedShader translate_shader(const uint32_t *microcode, size_t words, Shade
         ucode::parse_shader(stage == ShaderStage::Vertex ? ucode::ShaderType::Vertex : ucode::ShaderType::Pixel,
                             std::span<const uint32_t>(microcode, words));
     mark_constants(parsed, out.float_constants);
+    shader::VertexOptions vertex;
+    if (stage == ShaderStage::Vertex && form == VertexForm::RectangleList)
+        vertex.host = shader::HostVertex::RectangleListAsTriangleStrip;
     shader::Translation t =
-        shader::translate(parsed, stage == ShaderStage::Vertex ? shader::Stage::Vertex : shader::Stage::Pixel);
+        shader::translate(parsed, stage == ShaderStage::Vertex ? shader::Stage::Vertex : shader::Stage::Pixel, vertex);
     out.approximate = std::move(t.approximate);
     if (!t.unsupported.empty()) {
         for (size_t i = 0; i < t.unsupported.size(); i++) out.why += (i ? "; " : "") + t.unsupported[i];
@@ -117,18 +120,23 @@ TranslatedShader translate_shader(const uint32_t *microcode, size_t words, Shade
 
 namespace {
 
-std::filesystem::path file_of(const std::filesystem::path &base, uint64_t hash, ShaderStage stage, const char *ext) {
+std::filesystem::path file_of(const std::filesystem::path &base, uint64_t hash, ShaderStage stage, const char *ext,
+                              VertexForm form = VertexForm::Vertices) {
     const std::filesystem::path dir = base / translator_version();
     char name[48];
     std::snprintf(name, sizeof(name), "%016llx.%s.%s", (unsigned long long)hash,
-                  stage == ShaderStage::Vertex ? "vs" : "ps", ext);
+                  stage == ShaderStage::Pixel         ? "ps"
+                  : form == VertexForm::RectangleList ? "rects.vs"
+                                                      : "vs",
+                  ext);
     return dir / name;
 }
 
 // the SPIR-V (or the why) written beside the others: a temporary file renamed, so a reader never sees half
-void write_entry(const std::filesystem::path &dir, const TranslatedShader &t, ShaderStage stage) {
+void write_entry(const std::filesystem::path &dir, const TranslatedShader &t, ShaderStage stage,
+                 VertexForm form = VertexForm::Vertices) {
     std::error_code ec;
-    const std::filesystem::path final = file_of(dir, t.hash, stage, t.ok() ? "spv" : "txt");
+    const std::filesystem::path final = file_of(dir, t.hash, stage, t.ok() ? "spv" : "txt", form);
     std::filesystem::create_directories(final.parent_path(), ec);
     const std::filesystem::path temp = final.string() + ".tmp";
     {
@@ -145,16 +153,17 @@ void write_entry(const std::filesystem::path &dir, const TranslatedShader &t, Sh
 }
 
 // what the directory holds for the shader: true when it has it (translated or not)
-bool read_entry(const std::filesystem::path &dir, uint64_t hash, ShaderStage stage, TranslatedShader &out) {
+bool read_entry(const std::filesystem::path &dir, uint64_t hash, ShaderStage stage, TranslatedShader &out,
+                VertexForm form = VertexForm::Vertices) {
     out.hash = hash;
-    if (std::ifstream f(file_of(dir, hash, stage, "spv"), std::ios::binary); f) {
+    if (std::ifstream f(file_of(dir, hash, stage, "spv", form), std::ios::binary); f) {
         std::vector<char> bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         if (bytes.empty() || bytes.size() % 4) return false;
         out.spirv.resize(bytes.size() / 4);
         std::memcpy(out.spirv.data(), bytes.data(), bytes.size());
         return true;
     }
-    if (std::ifstream f(file_of(dir, hash, stage, "txt")); f) {
+    if (std::ifstream f(file_of(dir, hash, stage, "txt", form)); f) {
         out.why.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         if (out.why.empty()) out.why = "did not translate";
         return true;
@@ -167,8 +176,8 @@ bool read_entry(const std::filesystem::path &dir, uint64_t hash, ShaderStage sta
 struct ShaderCache::State {
     std::filesystem::path directory;
     mutable std::mutex mutex;
-    // by hash and stage; node-based, so references stay valid
-    std::unordered_map<uint64_t, TranslatedShader> shaders[2];
+    // by hash and stage (vertex, pixel, the rectangle list form); node-based, so references stay valid
+    std::unordered_map<uint64_t, TranslatedShader> shaders[3];
     Stats stats;
 };
 
@@ -177,9 +186,10 @@ ShaderCache::ShaderCache(std::filesystem::path directory) : state_(std::make_uni
 }
 ShaderCache::~ShaderCache() = default;
 
-const TranslatedShader &ShaderCache::get(const uint32_t *microcode, size_t words, ShaderStage stage) {
+const TranslatedShader &ShaderCache::get(const uint32_t *microcode, size_t words, ShaderStage stage, VertexForm form) {
     const uint64_t hash = shader_hash(microcode, words, stage);
-    auto &map = state_->shaders[stage == ShaderStage::Vertex ? 0 : 1];
+    if (stage == ShaderStage::Pixel) form = VertexForm::Vertices;
+    auto &map = state_->shaders[stage == ShaderStage::Pixel ? 1 : form == VertexForm::RectangleList ? 2 : 0];
     {
         std::lock_guard<std::mutex> lock(state_->mutex);
         if (auto it = map.find(hash); it != map.end()) return it->second;
@@ -188,11 +198,11 @@ const TranslatedShader &ShaderCache::get(const uint32_t *microcode, size_t words
     // second thread on the same shader does the same work, and the first one
     // in keeps its result
     TranslatedShader t;
-    bool read = !state_->directory.empty() && read_entry(state_->directory, hash, stage, t);
+    bool read = !state_->directory.empty() && read_entry(state_->directory, hash, stage, t, form);
     if (read) used_float_constants(microcode, words, stage, t.float_constants); // (not kept on disk)
     if (!read) {
-        t = translate_shader(microcode, words, stage);
-        if (!state_->directory.empty()) write_entry(state_->directory, t, stage);
+        t = translate_shader(microcode, words, stage, form);
+        if (!state_->directory.empty()) write_entry(state_->directory, t, stage, form);
     }
     std::lock_guard<std::mutex> lock(state_->mutex);
     auto [it, made] = map.emplace(hash, std::move(t));

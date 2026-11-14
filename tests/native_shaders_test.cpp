@@ -65,6 +65,13 @@ void cache_round_trip(const std::vector<uint32_t> &code, native::ShaderStage sta
     // a stride only for a vertex fetch constant it names
     for (int f = 0; f < 96; f++)
         if (uses.vertex_strides[f]) CHECK(uses.vertex_fetches[f / 32] & (1u << (f % 32)));
+    // a vertex shader's rectangle list form: kept apart from its plain one
+    if (stage == native::ShaderStage::Vertex) {
+        const native::TranslatedShader &r =
+            first.get(code.data(), code.size(), stage, native::VertexForm::RectangleList);
+        CHECK(&r != &t && r.hash == t.hash);
+        CHECK(&first.get(code.data(), code.size(), stage, native::VertexForm::RectangleList) == &r);
+    }
     // kept under the translator's version only
     CHECK(fs::is_directory(dir / native::translator_version()));
 }
@@ -77,6 +84,7 @@ int main() {
     {
         const fs::path dir = scratch("xf_native_shaders_cache");
         cache_round_trip(made_up, native::ShaderStage::Pixel, dir, false);
+        cache_round_trip(made_up, native::ShaderStage::Vertex, scratch("xf_native_shaders_cache_vs"), false);
         // the stage is part of the key
         CHECK(native::shader_hash(made_up.data(), made_up.size(), native::ShaderStage::Vertex) !=
               native::shader_hash(made_up.data(), made_up.size(), native::ShaderStage::Pixel));

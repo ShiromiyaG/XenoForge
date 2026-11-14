@@ -1918,7 +1918,9 @@ private:
         return v;
     }
     void resolve();
-    void gpu_resolve(const resolve::Info &info, RenderTarget &source);
+    // port_image: the source is a port's own target (NativeFrame::resolve),
+    // read through a copy of its image whatever the renderer's path
+    void gpu_resolve(const resolve::Info &info, RenderTarget &source, bool port_image = false);
     void swap();
     Texture *front_texture(texture::Info &info);
     void read_native_output(uint64_t number);
@@ -12237,22 +12239,30 @@ void Impl::draw(const gpu::Draw &d) {
 
 // ---- resolves ----
 
+native::ResolveInfo native_resolve_info(const resolve::Info &i);
+
 void Impl::resolve() {
     report_.resolves++;
+    resolve::Info info;
+    std::string why;
+    // the rectangle's three vertices, in vertex fetch constant 0
+    traced(regs_[reg::FETCH_CONSTANTS] & 0x1FFFFFFC, 24);
+    const bool read = resolve::get_info({regs_, REGISTER_COUNT}, memory_, info, why);
     if (native_suppress_ || native_settings_.observer) {
         native::PassInfo pass;
         pass.resolve = true;
         pass.copy_dest = regs_[reg::RB_COPY_DEST_BASE];
+        native::ResolveInfo described;
+        if (read) {
+            described = native_resolve_info(info);
+            pass.resolve_info = &described;
+        }
         native_pass(pass);
         if (native_settings_.observer) native_settings_.observer(pass);
         if (native_suppress_ && !native_keep(pass)) return;
     }
     poll();
-    resolve::Info info;
-    std::string why;
-    // the rectangle's three vertices, in vertex fetch constant 0
-    traced(regs_[reg::FETCH_CONSTANTS] & 0x1FFFFFFC, 24);
-    if (!resolve::get_info({regs_, REGISTER_COUNT}, memory_, info, why)) return skip("resolve: " + why);
+    if (!read) return skip("resolve: " + why);
     if (!info.copy && !why.empty()) approximate("resolve not copied: " + why);
     uint32_t pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
     // (the interlock path reads EDRAM itself: the target's place there)
@@ -12972,7 +12982,7 @@ void Impl::scale_texture(Texture &t, uint32_t width, uint32_t height) {
 // (made current in the mirror first, Xenia's RequestRange of the extent).
 // Its pages are then the GPU's (gpu_written); textures over it are loaded
 // again; guest memory gets the bytes as readback_resolve says.
-void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
+void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source, bool port_image) {
     flush_clears(&source);
     std::vector<Range> written, partial;
     if (!resolve::destination_ranges(info, written, partial)) {
@@ -13025,7 +13035,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     // (and at a resolution scale, always: the resolve reads EDRAM's scaled
     // samples)
     const bool from_edram =
-        !from_image || fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear) || !scale_.one();
+        !port_image && (!from_image || fsi_ || info.msaa != 0 || (!info.depth && source.gamma_linear) || !scale_.one());
     const VkBufferUsageFlags usage =
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     if (!from_edram && !grow(scratch_, pixel_bytes + stencil_bytes, usage, resolve_set_, 0)) return;
@@ -13125,6 +13135,7 @@ void Impl::gpu_resolve(const resolve::Info &info, RenderTarget &source) {
     } else {
         c = outside();
         if (options_.gpu_timing) gpu_mark("resolves: copies from the image: " + target_name(source));
+        if (port_image) full_barrier(c); // (the port's drawing into it, done)
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VkImageAspectFlags(info.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
                                  0, 0, 1};
@@ -13427,6 +13438,38 @@ void Impl::next_readback_frame() {
 // ---- the port's frames (native_render.h; docs/renderer.md, "A port's own
 // renderer") ----
 
+// A resolve's description for a port (native_render.h's ResolveInfo), and back
+native::ResolveInfo native_resolve_info(const resolve::Info &i) {
+    native::ResolveInfo o;
+    o.depth = i.depth, o.color_target = i.color_target, o.edram_base = i.edram_base;
+    o.surface_pitch = i.surface_pitch, o.msaa = i.msaa, o.sample_select = i.sample_select;
+    o.source_format = i.source_format, o.x = i.x, o.y = i.y, o.width = i.width, o.height = i.height;
+    o.dest_base = i.dest_base, o.dest_pitch = i.dest_pitch, o.dest_height = i.dest_height;
+    o.dest_format = i.dest_format, o.dest_endian = i.dest_endian, o.dest_exp_bias = i.dest_exp_bias;
+    o.dest_swap = i.dest_swap, o.dest_x = i.dest_x, o.dest_y = i.dest_y, o.dest_slice = i.dest_slice;
+    o.dest_number = i.dest_number, o.dest_array = i.dest_array;
+    o.texture_base = i.texture_base, o.texel_x0 = i.texel_x0, o.texel_y0 = i.texel_y0;
+    o.copy = i.copy, o.clear_color = i.clear_color, o.clear_depth = i.clear_depth;
+    o.clear_color_value[0] = i.clear_color_value[0], o.clear_color_value[1] = i.clear_color_value[1];
+    o.clear_depth_value = i.clear_depth_value;
+    return o;
+}
+resolve::Info from_native(const native::ResolveInfo &o) {
+    resolve::Info i;
+    i.depth = o.depth, i.color_target = o.color_target, i.edram_base = o.edram_base;
+    i.surface_pitch = o.surface_pitch, i.msaa = o.msaa, i.sample_select = o.sample_select;
+    i.source_format = o.source_format, i.x = o.x, i.y = o.y, i.width = o.width, i.height = o.height;
+    i.dest_base = o.dest_base, i.dest_pitch = o.dest_pitch, i.dest_height = o.dest_height;
+    i.dest_format = o.dest_format, i.dest_endian = o.dest_endian, i.dest_exp_bias = o.dest_exp_bias;
+    i.dest_swap = o.dest_swap, i.dest_x = o.dest_x, i.dest_y = o.dest_y, i.dest_slice = o.dest_slice;
+    i.dest_number = o.dest_number, i.dest_array = o.dest_array;
+    i.texture_base = o.texture_base, i.texel_x0 = o.texel_x0, i.texel_y0 = o.texel_y0;
+    i.copy = o.copy, i.clear_color = o.clear_color, i.clear_depth = o.clear_depth;
+    i.clear_color_value[0] = o.clear_color_value[0], i.clear_color_value[1] = o.clear_color_value[1];
+    i.clear_depth_value = o.clear_depth_value;
+    return i;
+}
+
 // What the port's output renderer records through, while it runs: the
 // renderer's command buffer, its texture cache and its arena.
 class Impl::NativeFrame final : public native::Frame {
@@ -13454,14 +13497,25 @@ public:
         const uint32_t index = r_.texture_view(*t, info.swizzle, false, why);
         if (!index && !why.empty()) return false;
         const uint32_t key = texture::compose_swizzle(info.swizzle, t->host_swizzle);
+        out.view = VK_NULL_HANDLE;
         for (const TextureView &v : t->views)
-            if (v.key == key) {
-                out.image = t->image.image, out.view = v.view, out.format = t->image.format;
-                out.width = t->image.extent.width, out.height = t->image.extent.height;
-                out.levels = t->image.levels, out.layers = t->image.layers;
-                return true;
-            }
-        return why = "no view of the texture", false;
+            if (v.key == key) out.view = v.view;
+        if (!out.view) return why = "no view of the texture", false;
+        out.image = t->image.image, out.format = t->image.format;
+        out.width = t->image.extent.width, out.height = t->image.extent.height;
+        out.levels = t->image.levels, out.layers = t->image.layers;
+        // (Impl::draw's: the components' modes, the integer scales, the signed view)
+        out.signs = texture::swizzled_signs(info);
+        out.integer_scale = texture::integer_scale_bits(info, out.signs);
+        out.signed_view = VK_NULL_HANDLE;
+        if ((info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1) &&
+            t->signed_read != texture::Signed::None && t->signed_format != VK_FORMAT_UNDEFINED) {
+            std::string signed_why;
+            if (r_.texture_view(*t, info.swizzle, true, signed_why) && r_.fatal_.empty())
+                for (const TextureView &v : t->views)
+                    if (v.key == (key | 1u << 12)) out.signed_view = v.view;
+        }
+        return true;
     }
     bool upload(const void *data, size_t bytes, size_t alignment, VkBuffer &buffer, VkDeviceSize &offset) override {
         const VkDeviceSize align = std::max<VkDeviceSize>({VkDeviceSize(alignment), r_.ubo_align_, 16});
@@ -13471,6 +13525,48 @@ public:
         std::memcpy(r_.arena_data(at), data, bytes);
         buffer = r_.arena_.buffer, offset = at;
         return true;
+    }
+    VkFormat target_format(bool depth, uint32_t format) override {
+        if (depth) return r_.depth_vk_format(format & 1);
+        if (format == 10) format = 2;
+        if (format == 12) format = 3;
+        const texture::HostFormat host = resolve::host_format_of_color_target(format);
+        return host == texture::HostFormat::RG16     ? VK_FORMAT_R16G16_SNORM
+               : host == texture::HostFormat::RGBA16 ? VK_FORMAT_R16G16B16A16_SNORM
+                                                     : vk_format_of(host);
+    }
+    bool resolve(const native::ResolveInfo &described, const native::TargetImage &source, std::string &why) override {
+        if (!r_.scale_.one()) return why = "a resolution scale is on", false;
+        if (!source.image || !source.width || !source.height) return why = "no source image", false;
+        const resolve::Info info = from_native(described);
+        if (!info.copy) return true; // (a clear alone: the port's)
+        if (info.msaa) return why = "a multisampled source", false;
+        RenderTarget t;
+        t.depth = info.depth;
+        t.format = info.depth ? (info.source_format & 1) : info.source_format == 10 ? 2
+                                                         : info.source_format == 12 ? 3
+                                                                                    : info.source_format;
+        if (!t.depth) t.host = resolve::host_format_of_color_target(t.format);
+        t.image.image = source.image;
+        t.image.format = target_format(t.depth, t.format);
+        if (t.image.format == VK_FORMAT_UNDEFINED) return why = "a source format the renderer keeps no target in", false;
+        t.image.extent = {source.width, source.height, 1};
+        t.base = info.edram_base, t.pitch = info.surface_pitch;
+        t.width = t.host_width = source.width, t.height = t.host_height = source.height;
+        resolve::Info clipped = info;
+        clipped.x = std::min(info.x, source.width), clipped.y = std::min(info.y, source.height);
+        clipped.width = std::min(info.width, source.width - clipped.x);
+        clipped.height = std::min(info.height, source.height - clipped.y);
+        if (!clipped.width || !clipped.height) return true;
+        r_.gpu_resolve(clipped, t, true);
+        if (!r_.fatal_.empty()) return why = r_.fatal_, false;
+        return true;
+    }
+    bool shader_words(uint64_t hash, std::vector<uint32_t> &words) override {
+        const Shader *s = r_.shader(hash);
+        if (!s) return false;
+        words = s->parsed.dwords;
+        return !words.empty();
     }
     VkDeviceSize guest_memory(uint32_t address, uint32_t bytes, VkBuffer &buffer, VkDeviceSize &offset) override {
         buffer = r_.mirror_.buffer, offset = address & GuestMemory::PHYSICAL_MASK;
@@ -13964,6 +14060,35 @@ HostViewport host_viewport(const uint32_t *registers, float max_x, float max_y) 
     return out;
 }
 
+HostViewport host_viewport(const uint32_t *registers, float max_x, float max_y, bool pixel_writes_depth,
+                           bool depth_float24) {
+    const render::Viewport v = render::host_viewport(registers, max_x, max_y, pixel_writes_depth, depth_float24, false);
+    HostViewport out;
+    out.viewport = v.viewport;
+    for (int i = 0; i < 3; i++) out.ndc_scale[i] = v.ndc_scale[i], out.ndc_offset[i] = v.ndc_offset[i];
+    out.empty = v.empty;
+    return out;
+}
+
 VkRect2D host_scissor(const uint32_t *registers, uint32_t pitch) { return render::host_scissor(registers, pitch); }
+
+// (Impl::draw's, on the host render target path)
+void target_constants(const uint32_t *registers, uint32_t colors_written, SystemConstants &sys) {
+    const uint32_t mask = registers[xenos::reg::RB_COLOR_MASK];
+    sys.flags[2] = 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        sys.color_scales[i] = 1.0f;
+        if (!((mask >> (4 * i)) & 0xF) || !(colors_written & (1u << i))) continue;
+        const uint32_t info = registers[render::r::COLOR_INFO[i]], format = (info >> 16) & 0xF;
+        sys.color_scales[i] = std::ldexp(1.0f, render::sign_extend((info >> 20) & 0x3F, 6));
+        if (format == 4 || format == 5) sys.color_scales[i] *= 1024.0f / 32767.0f;
+        if (format == 4) sys.color_scales[i] = -sys.color_scales[i];
+        if (format == 1) sys.flags[2] |= 1u << i;
+        if (format == 3 || format == 12) sys.flags[2] |= 16u << i;
+    }
+    const uint32_t depth_control = registers[xenos::reg::RB_DEPTHCONTROL];
+    const bool depth_float24 = (depth_control & 3) && ((registers[xenos::reg::RB_DEPTH_INFO] >> 16) & 1);
+    sys.flags[3] = (sys.flags[3] & ~1u) | (depth_float24 ? 1u : 0u);
+}
 
 } // namespace xf::native

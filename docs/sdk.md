@@ -484,9 +484,29 @@ The first port drew its opening's frames this way (the game's Bink shaders,
 its own pipelines and descriptor sets on this layout): every emulated draw
 and resolve of those frames skipped, the pictures as the emulated ones.
 
-Still to come: resolves into host images a port owns (render targets as
-images, not EDRAM), and notification of CPU writes to guest memory ranges a
-port registers.
+- **Render targets of the port's own** (`native_render.h`):
+  `Frame::target_format` (the host format the renderer keeps a guest target
+  format in, so the translated shaders and the resolves read the port's
+  targets as the emulated path's), `PassInfo::resolve_info` (each resolve
+  as the renderer reads the GPU's registers, for the port's own resolves),
+  `Frame::resolve` (a resolve from the port's image into guest memory as the
+  emulated path writes it: the textures made there next are the port's
+  picture), `target_constants` and `host_viewport`'s depth flags (what the
+  targets ask of the pixel shaders: exponent bias, gamma, D24FS8 halved).
+- **Textures as the shaders read them**: `Frame::texture` also gives a
+  texture's component modes, integer scales and signed view for the system
+  constants.
+- **Shaders the GPU ran**: `Frame::shader_words` (the microcode of a shader
+  by the hash the GPU met it under: what the guest's Direct3D loaded instead
+  of a shader object's own) and `VertexForm::RectangleList` (a vertex shader
+  run as a rectangle list: four vertices a rectangle).
+
+The first port drew whole frames this way (its menus' and races' 3D, the
+post-processing, the 2D), the emulated path skipping every draw and resolve.
+
+Still to come: notification of CPU writes to guest memory ranges a port
+registers, and a port's resolves kept as images (not through guest memory)
+where nothing on the CPU reads them.
 
 ## Building and running a port
 
