@@ -333,4 +333,45 @@ std::string left_out_original_stub(const std::string &prefix, uint32_t address, 
 // symbols do (xf, XF, __) or is in `used` already gets the address after it.
 std::string alias_identifier(const std::string &name, uint32_t address, std::set<std::string> &used);
 
+// ---- Library functions by signature (recomp_signatures.cpp; docs/recompiler.md, "The XDK by signature") ----
+//
+// A named function of one executable (a reference: the XDK's Direct3D of
+// one build, named once) found in another without its names. A signature is
+// the function's instructions with what the linker places masked (calls and
+// jumps out of it, the halves of addresses lis builds and what is addressed
+// through them), hashed, and the features a recompile of the same source by
+// another XDK build keeps: how often each kind of instruction occurs, the
+// small constants it loads (register numbers, packet headers), its length and
+// its calls. The same build links the same words: the hash finds it; another
+// build is matched on the features, inside the library's place the exact
+// matches show, each reference name given to one function at most.
+
+struct Signature {
+    std::string name;
+    uint32_t length = 0; // instructions
+    uint32_t calls = 0;  // calls out of it
+    uint64_t hash = 0;   // the masked words
+    std::map<uint32_t, uint32_t> kinds; // instruction kind (primary opcode, extended << 6 where it has one): count
+    std::set<uint32_t> constants;       // (kind << 16) | immediate, of li, lis and ori
+};
+
+Signature signature_of(const Image &image, uint32_t address, uint32_t size);
+// one per line: name, length, calls, hash, kinds, constants (docs/recompiler.md)
+std::string write_signatures(const std::vector<Signature> &signatures);
+bool read_signatures(std::string_view text, std::vector<Signature> &out, std::string &error);
+
+// How alike two signatures are, 0..1 (1: the same masked words).
+double signature_similarity(const Signature &a, const Signature &b);
+
+struct SignatureMatch {
+    std::string name;
+    uint32_t address = 0;   // 0: not found
+    double score = 0;       // 1: the same masked words
+    double runner_up = 0;   // the best other function's score
+    bool exact = false;
+    bool sure = false;      // exact, or well above the runner-up
+};
+// The reference's names in `d`'s functions, in the reference's order.
+std::vector<SignatureMatch> identify(const Image &image, const Discovery &d, const std::vector<Signature> &reference);
+
 } // namespace xf::recomp

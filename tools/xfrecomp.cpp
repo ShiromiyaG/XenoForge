@@ -82,7 +82,11 @@ int usage() {
                  "       xfrecomp tests <assembled tests dir> <out dir> [--files N]\n"
                  "       xfrecomp emit <game.iso | file.xex> <out dir> [--xex <path>]... [--files N] "
                  "[--no-pointers] [--listing] [--project <file.toml>]\n"
-                 "       xfrecomp jobs [N]\n");
+                 "       xfrecomp jobs [N]\n"
+                 "       xfrecomp signatures <reference game> --project <file.toml> --out <file> [--xex <path>] "
+                 "[--prefix P]...\n"
+                 "       xfrecomp identify <game> --signatures <file>... [--xex <path>] [--names-out <file.toml>] "
+                 "[--check <file.toml>]\n");
     return 2;
 }
 
@@ -285,6 +289,110 @@ std::unique_ptr<recomp::Project> load_project(const char *path) {
     return p;
 }
 
+// signatures: a reference game's named functions (its project file's names, those starting with a --prefix:
+// all without one) written as signatures. identify: a game's functions named from signature files, written
+// as a project file's [names] (docs/recompiler.md, "The XDK by signature"); --check scores them against a
+// project file's names.
+int signatures_command(int argc, char **argv) {
+    const bool make = std::string(argv[1]) == "signatures";
+    const std::string input = argv[2];
+    std::string xex_path = "default.xex", out, names_out;
+    std::vector<std::string> prefixes, signature_files;
+    std::unique_ptr<recomp::Project> project, checked;
+    for (int k = 3; k < argc; k++) {
+        const std::string a = argv[k];
+        if (a == "--xex" && k + 1 < argc) xex_path = argv[++k];
+        else if (a == "--project" && k + 1 < argc) {
+            if (!(project = load_project(argv[++k]))) return 1;
+        } else if (a == "--out" && k + 1 < argc) out = argv[++k];
+        else if (a == "--prefix" && k + 1 < argc) prefixes.push_back(argv[++k]);
+        else if (a == "--signatures" && k + 1 < argc) signature_files.push_back(argv[++k]);
+        else if (a == "--names-out" && k + 1 < argc) names_out = argv[++k];
+        else if (a == "--check" && k + 1 < argc) {
+            if (!(checked = load_project(argv[++k]))) return 1;
+        } else
+            return usage();
+    }
+    if (make ? (!project || out.empty()) : signature_files.empty()) return usage();
+    std::string error;
+    Xex xex;
+    recomp::Image image;
+    if (!load(input, xex_path, xex, error) || !recomp::read_image(xex, image, error)) {
+        std::fprintf(stderr, "%s\n", error.c_str());
+        return 1;
+    }
+    recomp::DiscoverOptions options;
+    if (const recomp::ProjectModule *pm = project ? project->find(xex_path) : nullptr)
+        for (const auto &[a, end] : pm->starts) options.functions.emplace(a, end);
+    const recomp::Discovery d = recomp::discover(image, options);
+    if (make) {
+        const recomp::ProjectModule *pm = project->find(xex_path);
+        std::vector<recomp::Signature> signatures;
+        for (const auto &[a, name] : pm ? pm->names : std::map<uint32_t, std::string>{}) {
+            bool wanted = prefixes.empty();
+            for (const std::string &p : prefixes) wanted |= name.rfind(p, 0) == 0;
+            if (!wanted) continue;
+            auto it = d.functions.find(a);
+            if (it == d.functions.end()) {
+                std::fprintf(stderr, "%s at %08X: no function starts there\n", name.c_str(), a);
+                continue;
+            }
+            recomp::Signature s = recomp::signature_of(image, a, it->second.size);
+            s.name = name;
+            signatures.push_back(std::move(s));
+        }
+        std::ofstream f(out, std::ios::binary);
+        f << recomp::write_signatures(signatures);
+        std::printf("%zu signatures written to %s\n", signatures.size(), out.c_str());
+        return f ? 0 : 1;
+    }
+    std::vector<recomp::Signature> reference;
+    for (const std::string &file : signature_files) {
+        std::ifstream f(file, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (!f && text.empty()) return std::fprintf(stderr, "cannot read %s\n", file.c_str()), 1;
+        if (!recomp::read_signatures(text, reference, error))
+            return std::fprintf(stderr, "%s: %s\n", file.c_str(), error.c_str()), 1;
+    }
+    const std::vector<recomp::SignatureMatch> found = recomp::identify(image, d, reference);
+    std::map<std::string, uint32_t> truth;
+    if (const recomp::ProjectModule *pm = checked ? checked->find(xex_path) : nullptr)
+        for (const auto &[a, name] : pm->names) truth[name] = a;
+    uint64_t sure = 0, unsure = 0, missing = 0, right = 0, wrong = 0;
+    std::string toml = "# found by xfrecomp identify (docs/recompiler.md, \"The XDK by signature\")\n[names]\n";
+    for (const recomp::SignatureMatch &m : found) {
+        const char *verdict = "";
+        if (auto t = truth.find(m.name); t != truth.end()) {
+            const bool ok = t->second == m.address;
+            (ok ? right : wrong)++;
+            verdict = ok ? "  right" : "  WRONG";
+        }
+        if (!m.address) {
+            missing++;
+            std::printf("  %-40s not found%s\n", m.name.c_str(), verdict);
+            continue;
+        }
+        (m.sure ? sure : unsure)++;
+        std::printf("  %-40s %08X  %s %.3f (next %.3f)%s\n", m.name.c_str(), m.address,
+                    m.exact ? "exact" : m.sure ? "sure " : "maybe", m.score, m.runner_up, verdict);
+        char line[160];
+        std::snprintf(line, sizeof(line), "%s\"0x%08X\" = \"%s\"%s\n", m.sure ? "" : "# ", m.address, m.name.c_str(),
+                      m.sure ? "" : "  # not sure");
+        toml += line;
+    }
+    std::printf("%zu names: %llu sure, %llu not sure, %llu not found", found.size(), (unsigned long long)sure,
+                (unsigned long long)unsure, (unsigned long long)missing);
+    if (right + wrong) std::printf("; against the project file: %llu right, %llu wrong", (unsigned long long)right,
+                                   (unsigned long long)wrong);
+    std::printf("\n");
+    if (!names_out.empty()) {
+        std::ofstream f(names_out, std::ios::binary);
+        f << toml;
+        if (!f) return std::fprintf(stderr, "cannot write %s\n", names_out.c_str()), 1;
+    }
+    return 0;
+}
+
 // --calls: the functions by how they keep the calling convention, and what
 // trusting it could save at their calls (docs/recompiler.md, "Trusting the
 // calling convention, weighed"). With a file of counted calls (lines "site target
@@ -460,6 +568,8 @@ int main(int argc, char **argv) {
             if (std::string(argv[k]) == "--files") files = std::max(1, std::atoi(argv[k + 1]));
         return tests(argv[2], argv[3], files);
     }
+    if (argc >= 3 && (std::string(argv[1]) == "signatures" || std::string(argv[1]) == "identify"))
+        return signatures_command(argc, argv);
     if (argc < 3 || std::string(argv[1]) != "analyze") return usage();
     std::string input = argv[2], xex_path = "default.xex", compare, functions_out, tables_out, unresolved_out;
     std::string call_counts;

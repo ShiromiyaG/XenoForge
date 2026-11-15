@@ -1056,6 +1056,52 @@ The reader is the core's own (`xenoforge/toml.h`: the TOML a project file
 uses, without multi-line strings or dates), so xfrecomp needs no TOML
 library.
 
+## The XDK by signature
+
+A game's executable carries the XDK's libraries (Direct3D, XAPI, XAudio, the
+C runtime) linked in, without names. Named once in one game (its project
+file's names), they are found in others by signature
+(`src/recomp_signatures.cpp`, `recomp.h`):
+
+    xfrecomp signatures <reference game> --project <its project.toml> --prefix D3D --out d3d_<build>.sig
+    xfrecomp identify <game> --signatures d3d_<build>.sig [--names-out names.toml] [--check <project.toml>]
+
+- **The signature** of a function: its instructions with what the linker
+  places masked (a `b` or `bl` leaving the function: its target; a `lis` of
+  an address's upper half, 0x8000-0x8FFF, and the lower half added or
+  addressed through that register), hashed (FNV-1a); and the features a
+  recompile of the same source keeps: each kind of instruction's count
+  (primary opcode, the extended one beside it where there is one), the small
+  constants it loads with `li`, `lis` and `ori` (register numbers, packet
+  headers), its length and its calls. The file holds one per line: name,
+  length, calls, hash, kinds (`kind:count`), constants (`kind << 16 |
+  immediate`, kinds 1 `lis`, 2 `li`, 3 `ori`).
+- **The same XDK build** links the same words: one function with the
+  reference's hash and length is it ("exact").
+- **Another build** schedules instructions differently and moves the device's
+  fields, so no hash matches: the functions are matched on their features
+  (0.45 the kinds' cosine, 0.35 the constants' Jaccard, 0.2 the lengths'
+  ratio, less 0.1 when the calls differ by more than a third), inside the
+  library's place: the largest run of clear best matches (0.97 or more, 0.05
+  over the next) less than 256 KB apart, with 256 KB of margin each side.
+  Each function takes one name at most, the best pairs first.
+- **Sure**: exact, or 0.95 or more and 0.03 over the runner-up. The rest is
+  written to `--names-out` commented, for the porter to confirm: two
+  functions alike but for a field's offset (the vertex and pixel shader
+  constant setters) score the same.
+
+Measured (2026-11-15): game A's 18 named Direct3D functions (XDK 2.0.21250,
+built with LTCG) found in game A itself: 18 exact. In game H (XDK 2.0.7776,
+three years older, no LTCG): 13 sure, all inside its Direct3D's place, 4
+not sure (`SetViewport`, 31 instructions in A; the shader constant setters'
+pair; `Swap`; `Resolve`), the one A-only helper not found. Comparing matched
+functions' instructions also gives the device's field offsets of the other
+build (A's 0x32E0 is H's 0x3168 in `SetScissorRect`), which `xdk_d3d.h`'s
+`D3DLayout` needs per build. Left: a runtime check of the names that are
+not sure (the device in their first argument, their calls against the GPU's
+draws), XAPI, XAudio and the C runtime, the layout derived from matched
+functions.
+
 ## Replacing and hooking
 
 (Plan E3, 2026-11-08.) A port puts native code on guest functions by their

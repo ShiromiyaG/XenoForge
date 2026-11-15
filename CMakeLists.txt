@@ -84,6 +84,7 @@ add_library(xenoforge STATIC
     src/recomp_emit.cpp
     src/recomp_module.cpp
     src/recomp_project.cpp
+    src/recomp_signatures.cpp
     src/toml.cpp
     src/hooks.cpp
     src/memory.cpp
@@ -661,7 +662,7 @@ target_link_libraries(xftexture PRIVATE xenoforge stb)
 
 enable_testing()
 foreach(name aes disc xex lzx sha1 snappy ucode ucode_parse trace shader_interpreter texture ppc memory command_processor
-             recomp_discover gpu_trace_writer shader_storage patches native_shaders)
+             recomp_discover recomp_signatures gpu_trace_writer shader_storage patches native_shaders)
     add_executable(${name}_test tests/${name}_test.cpp)
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
