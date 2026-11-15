@@ -1929,6 +1929,7 @@ private:
     std::map<RenderTarget *, TileRect> native_touched_; // (each target's tiles' bounds)
     bool native_owned_ = false; // the port's targets hold tiles the interlock path's EDRAM may not
     uint64_t native_kept_at_ = 0; // the draws and resolves the emulated path did while the port's frames are shown
+    TextureKey texture_key_of(const texture::Info &info, const uint32_t fetch[6]) const;
     bool native_resolving_ = false;
     void native_store_back();
     void native_release();
@@ -2435,6 +2436,11 @@ private:
     // a draw or a resolve while suppressing: false when it is skipped
     bool native_keep(native::PassInfo &pass);
     void native_pass(native::PassInfo &pass);
+    // a draw the filter skipped (the port draws it at the swap): the textures the CPU wrote since their load
+    // loaded now, and held as they are for the port's frame (native_frozen_)
+    void native_freeze_textures();
+    std::set<std::array<uint32_t, 6>> native_frozen_; // (TextureKey) held for the port's frame
+    bool native_frozen_reads_ = false;                // the port's frame is drawn: those held are what it reads
     VkImageView make_view(VkImage image, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect,
                           VkComponentMapping components = {}, uint32_t levels = 1, uint32_t layers = 1,
                           bool keep = true);
@@ -7464,18 +7470,24 @@ uint32_t Impl::take_index(uint32_t kind) {
 // resolves and memory exports over it mark it at once): from guest memory on
 // the CPU, or from the mirror on the GPU when the GPU holds some of it.
 // Loaded again, it keeps its image and its views.
+// signed components: read through a snorm view of the same bits (Xenia's
+// signed host format; float formats are signed either way), or an image
+// of their own where the signed bits differ (10_11_11 and 11_11_10, 16-bit
+// snorm as floats), a texture of its own as Xenia's signed_separate keys
+// it; biased and gamma components, and the exponent adjust, are the
+// shader's (texture_signs)
+TextureKey Impl::texture_key_of(const texture::Info &info, const uint32_t fetch[6]) const {
+    const bool any_signed = info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1;
+    return texture_key(info, fetch,
+                       any_signed && texture::signed_read(info.format, support_) == texture::Signed::Separate);
+}
+
 Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     if (done_serial_ != limits_applied_at_) apply_texture_limits();
     const texture::Info info = texture::parse_fetch_constant(fetch);
-    // signed components: read through a snorm view of the same bits (Xenia's
-    // signed host format; float formats are signed either way), or an image
-    // of their own where the signed bits differ (10_11_11 and 11_11_10, 16-bit
-    // snorm as floats), a texture of its own as Xenia's signed_separate keys
-    // it; biased and gamma components, and the exponent adjust, are the
-    // shader's (texture_signs)
     const bool any_signed = info.signs[0] == 1 || info.signs[1] == 1 || info.signs[2] == 1 || info.signs[3] == 1;
     const bool separate = any_signed && texture::signed_read(info.format, support_) == texture::Signed::Separate;
-    const TextureKey key = texture_key(info, fetch, separate);
+    const TextureKey key = texture_key_of(info, fetch);
     auto it = textures_.find(key);
     Texture *t = it == textures_.end() ? nullptr : it->second.get();
     // used by the submission being recorded, counted as the next one's: the
@@ -7483,6 +7495,8 @@ Texture *Impl::texture(const uint32_t fetch[6], std::string &why) {
     // and a swap's presenter reads the front buffer after it is submitted
     const uint64_t serial = submission_serial() + 1;
     if (t) use(*t, serial);
+    // the port's frame: a texture held as its skipped draw read it, whatever the CPU wrote since
+    if (t && !t->stale && native_frozen_reads_ && native_frozen_.count(key)) return t;
     if (t && !t->stale) {
         bool same;
         {
@@ -10440,6 +10454,7 @@ void Impl::draw(const gpu::Draw &d) {
                     native::detail::bump(native::detail::atomic_counters().memexport_kept);
                 } else if (!native_keep(pass)) {
                     if (zpd_current_) zpd_counts_[zpd_current_].suppressed = true;
+                    native_freeze_textures();
                     return;
                 }
             }
@@ -13692,6 +13707,12 @@ public:
         if (!r_.fatal_.empty()) return why = r_.fatal_, false;
         return true;
     }
+    bool gpu_wrote(uint32_t address, uint32_t bytes) override {
+        if (!bytes) return false;
+        std::vector<Range> ranges;
+        add_span(ranges, address, bytes);
+        return r_.gpu_held(ranges);
+    }
     bool shader_words(uint64_t hash, std::vector<uint32_t> &words) override {
         const Shader *s = r_.shader(hash);
         if (!s) return false;
@@ -13831,7 +13852,9 @@ bool Impl::native_frame(uint64_t number, bool &held) {
             NativeFrame frame(*this);
             ctx.frame = &frame;
             gpu_mark("the port's frame (native rendering)");
+            native_frozen_reads_ = true;
             drew = native_settings_.renderer(ctx);
+            native_frozen_reads_ = false;
             outside();
             native_store_back(); // (the interlock path's EDRAM holds the port's targets' tiles again)
             // whatever the port bound is not the draws'
@@ -13842,6 +13865,7 @@ bool Impl::native_frame(uint64_t number, bool &held) {
             approximate("the port's output image could not be made");
         }
     }
+    native_frozen_.clear();
     if (drew) {
         native::detail::bump(counts.frames_native);
     } else {
@@ -13865,6 +13889,27 @@ void Impl::native_pass(native::PassInfo &pass) {
     pass.color_base = regs_[reg::RB_COLOR_INFO] & 0xFFF;
     pass.color_format = (regs_[reg::RB_COLOR_INFO] >> 16) & 0xF;
     pass.registers = regs_, pass.swap = report_.swaps;
+}
+
+// A texture the CPU writes again before the swap (a video's frame, the next one decoded into it) is read by
+// the GPU's draw as it was at the draw: loaded at the skipped draw, as the emulated path would, and held so
+// for the port's frame. Not one over the GPU's pages (a resolve's, which the port's resolves make at the
+// swap) nor one never loaded (loaded at the swap, as the port asks).
+void Impl::native_freeze_textures() {
+    const Shader *vs = have_vertex_ ? vertex_shader_ : nullptr, *ps = have_pixel_ ? pixel_shader_ : nullptr;
+    const uint64_t slots = (vs ? vs->texture_mask : 0) | (ps ? ps->texture_mask : 0);
+    for (uint64_t left = slots; left; left &= left - 1) {
+        const uint32_t *fetch = &regs_[reg::FETCH_CONSTANTS + uint32_t(std::countr_zero(left)) * 6];
+        if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture) continue;
+        const texture::Info info = texture::parse_fetch_constant(fetch);
+        const TextureKey key = texture_key_of(info, fetch);
+        auto it = textures_.find(key);
+        if (it == textures_.end()) continue;
+        Texture &t = *it->second;
+        if (t.stale || unwritten(t) || gpu_held(t.ranges)) continue;
+        std::string why;
+        if (texture(fetch, why) && fatal_.empty()) native_frozen_.insert(key);
+    }
 }
 
 bool Impl::native_keep(native::PassInfo &pass) {

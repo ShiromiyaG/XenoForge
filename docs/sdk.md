@@ -495,7 +495,17 @@ and resolve of those frames skipped, the pictures as the emulated ones.
   targets ask of the pixel shaders: exponent bias, gamma, D24FS8 halved).
 - **Textures as the shaders read them**: `Frame::texture` also gives a
   texture's component modes, integer scales and signed view for the system
-  constants.
+  constants. A texture the CPU writes again between a skipped draw and the
+  swap (a video's frame, the next one decoded into it) is the one the GPU's
+  draw read: at a draw the filter skips, the renderer loads the textures it
+  reads that the CPU wrote since their load, and `Frame::texture` gives
+  those as they were for the port's frame. Not textures over the GPU's
+  pages (a resolve's: the port's resolves make them at the swap) nor ones
+  never loaded before (loaded at the swap).
+- **Memory the GPU wrote**: `Frame::gpu_wrote(address, bytes)` says whether
+  a resolve or a memory export wrote any of those bytes since the CPU last
+  did, so a copy the port made from guest memory at a Direct3D call is not
+  what the GPU reads there (`Frame::guest_memory` gives the GPU's).
 - **Shaders the GPU ran**: `Frame::shader_words` (the microcode of a shader
   by the hash the GPU met it under: what the guest's Direct3D loaded instead
   of a shader object's own) and `VertexForm::RectangleList` (a vertex shader
@@ -595,17 +605,22 @@ What a port capturing the guest's Direct3D still takes from the GPU's draw
 command buffers: the bool and loop constants (Direct3D writes them into the
 command buffer as they are set; its device keeps no copy), the literal
 constants a program Direct3D patched or filled in loads (c250-c255), and the
-render target registers it writes at the draw (RB_MODECONTROL among them).
-Without them a loop runs no iteration, a vertex shader's sine reads zero,
-and a depth-only pass is drawn as a color one.
+render state registers (0x2000-0x23FF), some of which it writes at the draw
+and its device then holds stale: RB_MODECONTROL, the shader pair's
+SQ_PROGRAM_CNTL, SQ_CONTEXT_MISC and SQ_INTERPOLATOR_CNTL, VGT_INDX_OFFSET.
+Without them a loop runs no iteration, a vertex shader's sine reads zero, a
+depth-only pass is drawn as a color one, and a pixel shader reads another
+interpolator than the vertex shader wrote (a lit surface several times too
+dark).
 
 Measured on the first port's recorded race (2,640 frames, headless,
 deterministic): the renderer's thread 34.7 s with the port's own renderer,
-about 11 s with the Drawer (the emulated path alone: 5.1 s); the whole run
+11-13 s with the Drawer (the emulated path alone: 3.4-5.1 s); the whole run
 126.4 s, 88.4 s with the Drawer and the device read in blocks
-(`xdk_d3d.h`), against 75.9 s emulated. Against the emulated path at the
-same swap (exact runs, docs/runtime.md "Rendered runs"): the menus
-identical, race frames within 0.35-0.4 of 255 (0.01-0.3% of pixels off by
+(`xdk_d3d.h`), against 75.9 s emulated (another day, the same builds: 99-100
+s against 78.4 s). Against the emulated path at the same swap (exact runs,
+docs/runtime.md "Rendered runs"): the menus and the opening's movie
+identical, race frames within 0.33-0.42 of 255 (0.01-0.5% of pixels off by
 more than 16: the host targets against the interlock path's exact EDRAM),
 where the port's own renderer was 16 of 255 off with a third of the pixels.
 

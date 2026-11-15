@@ -242,6 +242,11 @@ class Frame {
     // (those target() gave the port): the copy, then its clears. Recorded
     // after what the port recorded so far (outside a render pass).
     virtual bool resolve_target(const ResolveInfo &info, std::string &why) = 0;
+    // Whether the GPU holds any of these bytes newer than guest memory (a
+    // resolve or a memory export wrote them since the CPU last did): a copy a
+    // port made of them from guest memory is not what the GPU reads there
+    // (Frame::guest_memory gives the GPU's).
+    virtual bool gpu_wrote(uint32_t address, uint32_t bytes) = 0;
 };
 
 struct OutputContext {
