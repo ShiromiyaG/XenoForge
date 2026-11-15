@@ -15,7 +15,8 @@ constexpr D3DLayout XDK_21250 = [] {
     D3DLayout l;
     l.xdk_build = 21250;
     l.pixel_shader = 0x330C, l.vertex_shader = 0x3310;
-    l.fetch_constants = 0x480, l.vs_constants = 0x780, l.ps_constants = 0x1780;
+    l.fetch_constants = 0x480, l.vs_constants = 0x780, l.ps_constants = 0x1780, l.bool_constants = 0x2780;
+    l.dirty_constants = 0;
     l.index_buffer = 0x320C, l.viewport = 0x32E0, l.scissor_enabled = 0x3000, l.scissor = 0x32FC;
     l.blocks[0] = {0x2000, 0x10, 10368}, l.blocks[1] = {0x2080, 3, 10432}, l.blocks[2] = {0x2100, 0x15, 10444};
     l.blocks[3] = {0x2180, 5, 10528}, l.blocks[4] = {0x2200, 0x21, 10548}, l.blocks[5] = {0x2280, 0x15, 10596};
@@ -65,7 +66,7 @@ std::shared_ptr<const ShaderObject> D3DReader::shader(const port::Context &c, ui
 }
 
 void D3DReader::literals(const port::Context &c, uint32_t object, bool vertex, uint32_t vs[1024],
-                         uint32_t ps[1024]) const {
+                         uint32_t ps[1024], LiteralCarry *carry, const uint32_t *shadow) const {
     if (!object) return;
     const uint32_t header = object + (vertex ? l_.vs_header : l_.ps_header);
     const uint32_t block = header + port::load<uint32_t>(c, header + 0x14);
@@ -80,16 +81,38 @@ void D3DReader::literals(const port::Context &c, uint32_t object, bool vertex, u
         if (type != 0) continue; // fetch, bool and loop constants
         for (uint32_t k = 0; k < dwords && first + k < 2048; k++) {
             const uint32_t at = first + k;
-            (at < 1024 ? vs[at] : ps[at - 1024]) = port::load<uint32_t>(c, data + offset + 4 * k);
+            uint32_t &word = at < 1024 ? vs[at] : ps[at - 1024];
+            word = port::load<uint32_t>(c, data + offset + 4 * k);
+            if (carry) carry->value[at] = word, carry->shadow[at] = shadow[at], carry->held[at] = true;
         }
     }
 }
 
-void D3DReader::constants(const port::Context &c, uint32_t dev, uint32_t vs[1024], uint32_t ps[1024]) const {
+void D3DReader::constants(const port::Context &c, uint32_t dev, uint32_t vs[1024], uint32_t ps[1024],
+                          LiteralCarry *carry) const {
     read_words(c, dev + l_.vs_constants, vs, 1024);
     read_words(c, dev + l_.ps_constants, ps, 1024);
-    literals(c, vertex_shader(c, dev), true, vs, ps);
-    literals(c, pixel_shader(c, dev), false, vs, ps);
+    thread_local uint32_t shadow[2048]; // (the shadow's words, before any literal is laid over)
+    if (carry) std::memcpy(shadow, vs, 4096), std::memcpy(shadow + 1024, ps, 4096);
+    const bool masks = carry && l_.dirty_constants != UINT32_MAX;
+    uint64_t dirty[2] = {};
+    if (masks)
+        dirty[0] = port::load<uint64_t>(c, dev + l_.dirty_constants),
+        dirty[1] = port::load<uint64_t>(c, dev + l_.dirty_constants + 8);
+    if (carry)
+        for (uint32_t at = 0; at < 2048; at++) {
+            if (!carry->held[at]) continue;
+            uint32_t &word = at < 1024 ? vs[at] : ps[at - 1024];
+            const bool written = masks ? (dirty[at / 1024] >> (63 - (at % 1024) / 16)) & 1 : word != carry->shadow[at];
+            if (written) carry->held[at] = false; // (the game set it since: the shadow's goes)
+            else word = carry->value[at];
+        }
+    const uint32_t objects[2] = {vertex_shader(c, dev), pixel_shader(c, dev)};
+    for (int stage = 0; stage < 2; stage++) {
+        if (masks && objects[stage] == carry->last[stage]) continue; // (the same shader: its literals stand)
+        literals(c, objects[stage], stage == 0, vs, ps, carry, shadow);
+        if (carry) carry->last[stage] = objects[stage];
+    }
 }
 
 void D3DReader::fetch_constants(const port::Context &c, uint32_t dev, uint32_t out[192]) const {
@@ -103,6 +126,36 @@ void D3DReader::registers(const port::Context &c, uint32_t dev, uint32_t out[0x4
     std::memset(out, 0, 0x400 * 4);
     for (const D3DLayout::Block &b : l_.blocks)
         if (b.count) read_words(c, dev + b.offset, out + (b.first - 0x2000), b.count);
+}
+
+void D3DReader::draw_registers(const port::Context &c, uint32_t dev, uint32_t out[0x400]) const {
+    registers(c, dev, out);
+    const uint32_t vs = vertex_shader(c, dev), ps = pixel_shader(c, dev);
+    auto header = [&](uint32_t object, bool vertex) -> uint32_t {
+        if (!object) return 0;
+        if (!vertex) return object + l_.ps_header + port::load<uint32_t>(c, object + l_.ps_descriptor);
+        const bool variant = !ps && (port::load<uint32_t>(c, object + l_.vs_header) & l_.vs_depth_only_flag);
+        return object + l_.vs_header + port::load<uint32_t>(c, object + (variant ? l_.vs_depth_only : l_.vs_descriptor));
+    };
+    const uint32_t vh = header(vs, true), ph = header(ps, false);
+    constexpr uint32_t SQ_PROGRAM_CNTL = 0x180, SQ_CONTEXT_MISC = 0x181, SQ_INTERPOLATOR_CNTL = 0x182;
+    constexpr uint32_t RB_MODECONTROL = 0x208;
+    if (vh || ph)
+        out[SQ_PROGRAM_CNTL] = (vh ? port::load<uint32_t>(c, vh + 8) : 0) | (ph ? port::load<uint32_t>(c, ph + 8) : 0);
+    if (ph) {
+        out[SQ_CONTEXT_MISC] = port::load<uint32_t>(c, ph + 12);
+        out[SQ_INTERPOLATOR_CNTL] = port::load<uint32_t>(c, ph + 24);
+    } else {
+        out[SQ_CONTEXT_MISC] = 0;
+    }
+    // (only between the two draw modes: another, as a copy's, is left as set)
+    const uint32_t mode = out[RB_MODECONTROL] & 7;
+    if (mode == 4 || mode == 5) out[RB_MODECONTROL] = (out[RB_MODECONTROL] & ~7u) | (ps ? 4u : 5u);
+}
+
+void D3DReader::bool_loop_constants(const port::Context &c, uint32_t dev, uint32_t bools[8], uint32_t loops[32]) const {
+    read_words(c, dev + l_.bool_constants, bools, 8);
+    read_words(c, dev + l_.bool_constants + 32, loops, 32);
 }
 
 D3DReader::IndexBuffer D3DReader::index_buffer(const port::Context &c, uint32_t dev) const {

@@ -52,6 +52,10 @@ struct D3DLayout {
     uint32_t pixel_shader = 0, vertex_shader = 0; // the bound shader objects
     uint32_t fetch_constants = 0;                 // 32 fetch constants of 6 words (GPU 0x4800)
     uint32_t vs_constants = 0, ps_constants = 0;  // 256 float4 each (GPU 0x4000 and 0x4400)
+    uint32_t bool_constants = 0; // 8 words of bool constants, then 32 loop constants (GPU 0x4900-0x4927)
+    // the float constants' dirty masks (64 bits each, vertex then pixel shader: a bit a group of four
+    // constants, group 0 the top bit), which a draw sends and clears; UINT32_MAX: not known
+    uint32_t dirty_constants = UINT32_MAX;
     uint32_t index_buffer = 0;   // the bound index buffer object: bit 31 of its first word 32-bit indices, the data at +0x18
     uint32_t viewport = 0;       // x, y, width, height (floats)
     uint32_t scissor_enabled = 0, scissor = 0; // a word; x1, y1, x2, y2
@@ -107,13 +111,44 @@ class D3DReader {
     // order): the shadow's, with the bound shaders' literal constants laid
     // over (the D3D has the GPU load them from the shader's own data as it
     // loads the shader, never through the shadow).
-    void constants(const port::Context &c, uint32_t dev, uint32_t vs[1024], uint32_t ps[1024]) const;
+    //
+    // The GPU keeps its float constants between draws, and the D3D sends them
+    // at a draw in this order: the groups the game wrote since the last draw
+    // (the dirty masks) from the shadow, then a shader's literals when the
+    // shader is not the one the last draw had. So a shader reads, at a
+    // literal place its own data does not fill (c250-c255, where the compiler
+    // puts them), what the last shader to load one there left, and keeps its
+    // own literals over the game's writes until it is set again. `carry`,
+    // kept by the caller across the draws in their order (before the D3D's
+    // draw clears the masks), follows that. (Without the layout's dirty masks:
+    // a carried word stands until the shadow's word differs from the one it
+    // had, and the literals are laid over at every draw.)
+    struct LiteralCarry {
+        uint32_t value[2048] = {};  // vs c0-c255 then ps, a word each component
+        uint32_t shadow[2048] = {}; // the shadow's word when the literal was loaded
+        bool held[2048] = {};
+        uint32_t last[2] = {};      // the shader objects the last draw had
+    };
+    void constants(const port::Context &c, uint32_t dev, uint32_t vs[1024], uint32_t ps[1024],
+                   LiteralCarry *carry = nullptr) const;
     // The 32 fetch constants (192 words, host order) as the GPU gets them: a
     // slot whose type is 0 has the texture type set (the shadow keeps it 0).
     void fetch_constants(const port::Context &c, uint32_t dev, uint32_t out[192]) const;
     // The render state 0x2000-0x23FF (out[register - 0x2000]): the blocks the
     // shadow holds as the GPU gets them, the rest 0.
     void registers(const port::Context &c, uint32_t dev, uint32_t out[0x400]) const;
+    // The same as the GPU gets them at a draw: the shadow's, with what the
+    // D3D works out at the draw from the bound shaders over it. Each shader's
+    // header (its microcode's descriptor, as the XDK's compiler wrote it)
+    // holds its part: SQ_PROGRAM_CNTL is the vertex shader's word 2 | the
+    // pixel shader's word 2, SQ_CONTEXT_MISC the pixel shader's word 3,
+    // SQ_INTERPOLATOR_CNTL its word 6; RB_MODECONTROL's EDRAM mode 4 (color
+    // and depth) with a pixel shader, 5 (depth only) without one. (The
+    // shadow holds these as they were set last, often not this draw's.)
+    void draw_registers(const port::Context &c, uint32_t dev, uint32_t out[0x400]) const;
+    // The bool constants (8 words, 256 bits: vertex shader's b0-b127 then the pixel shader's) and the loop
+    // constants (i0-i31 of both stages) as the GPU gets them at a draw (the D3D sends the device's copy).
+    void bool_loop_constants(const port::Context &c, uint32_t dev, uint32_t bools[8], uint32_t loops[32]) const;
     // The bound index buffer: its data's address (0: none) and width.
     struct IndexBuffer {
         uint32_t address = 0;
@@ -125,7 +160,8 @@ class D3DReader {
     void clear_area(const port::Context &c, uint32_t dev, uint32_t rect, int32_t out[4]) const;
 
   private:
-    void literals(const port::Context &c, uint32_t object, bool vertex, uint32_t vs[1024], uint32_t ps[1024]) const;
+    void literals(const port::Context &c, uint32_t object, bool vertex, uint32_t vs[1024], uint32_t ps[1024],
+                  LiteralCarry *carry, const uint32_t *shadow) const;
     D3DLayout l_;
 };
 

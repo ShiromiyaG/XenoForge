@@ -729,7 +729,38 @@ with the shader, never through the shadow), the fetch constants as the GPU
 gets them, the render state blocks the shadow holds, the bound index buffer
 and a clear's area, each block in one copy. The header lists the arguments
 of the D3D calls a port hooks (draws, the UP draws' `Begin`s, `ClearF`).
-The functions' addresses are each title's: the port's.
+The functions' addresses are each title's: the port's (`xfrecomp identify`
+finds them from another title's names: docs/recompiler.md, "The XDK by
+signature").
+
+What the D3D works out at the draw, read without the GPU (plan E8, step 1),
+each checked against the GPU's draw on every draw of a recorded race
+(1,037,047 draws, none differing):
+
+- **`draw_registers`**: the render state as the GPU gets it. Each shader's
+  header (its microcode's descriptor, as the XDK's compiler wrote it) holds
+  its part of what links the pair: SQ_PROGRAM_CNTL is the vertex shader's
+  word 2 | the pixel shader's word 2, SQ_CONTEXT_MISC (where the pixel
+  parameters go, the sampling) the pixel shader's word 3,
+  SQ_INTERPOLATOR_CNTL its word 6; RB_MODECONTROL's EDRAM mode is 4 with a
+  pixel shader and 5 (depth only) without. The shadow holds these as last
+  set, often not this draw's.
+- **`bool_loop_constants`**: the bool and loop constants, which the device
+  keeps beside the float constants and sends at a draw.
+- **`constants(..., &carry)`**: the float constants as the GPU has them.
+  The GPU keeps its constants between draws, and the D3D sends at a draw the
+  groups of four the game wrote since (the device's dirty masks, from the
+  shadow), then a shader's literals when the shader is not the last draw's.
+  So a shader reading a literal place its own data leaves empty (c250-c255,
+  the compiler's) reads what the last shader to load one there left, and a
+  shader keeps its literals over the game's writes until it is set again;
+  the `LiteralCarry` the caller keeps across draws (read before the D3D's
+  draw clears the masks) follows that.
+
+Left of step 1: the vertex shaders the D3D patches at the draw (it fills
+their vertex fetches' format, offset and stride from the vertex declaration
+and the streams, and the fetch constant's slot: 4,125 of those draws in the
+race), which a capturing port still takes from the GPU.
 
 Still to come: notification of CPU writes to guest memory ranges a port
 registers, and a port's resolves kept as images (not through guest memory)

@@ -13,6 +13,7 @@
 #include "xenoforge/lockstep.h"
 #include "xenoforge/port.h"
 #include "xenoforge/run.h"
+#include "xenoforge/xdk_d3d.h"
 #include "xenoforge/toml.h"
 
 #include <cmath>
@@ -443,6 +444,85 @@ void port_options() {
     CHECK(std::isnan(port::option("aspect")));
 }
 
+// xdk_d3d.h on a device and shader objects made here in the 21250 layout: the registers the D3D works out at
+// a draw from the shaders' headers, the bool and loop constants, and the literals the GPU keeps between draws
+// (laid when the shader changes, the game's dirty groups from the shadow first)
+void xdk_d3d_reader() {
+    KernelHarness h;
+    CHECK(h.init());
+    Context &c = *h.c;
+    const xf::xdk::D3DLayout *layout = xf::xdk::d3d_layout(21250);
+    CHECK(layout != nullptr);
+    if (!layout) return;
+    const xf::xdk::D3DLayout &l = *layout;
+    const xf::xdk::D3DReader reader(l);
+    const uint32_t dev = h.alloc(0x4000), data = h.alloc(0x200);
+    auto zero = [&](uint32_t at, uint32_t bytes) { std::memset(port::host(c, at), 0, bytes); };
+    zero(dev, 0x4000), zero(data, 0x200);
+    constexpr uint32_t TWO_PI = 0x40C90FDB;
+    // a vertex shader with a literal for c250.xyzw (2 pi, 1, 2, 3), one with none, a pixel shader
+    auto vertex_shader = [&](bool literal, uint32_t program) {
+        const uint32_t o = h.alloc(0x600);
+        zero(o, 0x600);
+        port::store<uint32_t>(c, o + l.vs_data, data);
+        port::store<uint32_t>(c, o + l.vs_descriptor, 0x80); // the descriptor at header + 0x80
+        port::store<uint32_t>(c, o + l.vs_header + 0x80 + 8, program);
+        port::store<uint32_t>(c, o + l.vs_header + 0x14, 0x100); // the literal block at header + 0x100
+        const uint32_t block = o + l.vs_header + 0x100;
+        port::store<uint32_t>(c, block + 0x10, literal ? 8 : 0);
+        port::store<uint16_t>(c, block + 0x14, 250), port::store<uint16_t>(c, block + 0x16, 4);
+        port::store<uint32_t>(c, block + 0x18, 0x40);
+        return o;
+    };
+    for (uint32_t k = 0; k < 4; k++) port::store<uint32_t>(c, data + 0x40 + 4 * k, k ? k : TWO_PI);
+    const uint32_t vs_a = vertex_shader(true, 0x00110001), vs_b = vertex_shader(false, 0x00010002);
+    const uint32_t ps = h.alloc(0x200);
+    zero(ps, 0x200);
+    port::store<uint32_t>(c, ps + l.ps_descriptor, 0x40);
+    port::store<uint32_t>(c, ps + l.ps_header + 0x40 + 8, 0x10000200);
+    port::store<uint32_t>(c, ps + l.ps_header + 0x40 + 12, 0x4);
+    port::store<uint32_t>(c, ps + l.ps_header + 0x40 + 24, 0x00030003);
+    // RB_MODECONTROL as the shadow last had it: depth only (stale)
+    port::store<uint32_t>(c, dev + l.blocks[4].offset + 8 * 4, 5);
+    port::store<uint32_t>(c, dev + l.vertex_shader, vs_a), port::store<uint32_t>(c, dev + l.pixel_shader, ps);
+
+    uint32_t regs[0x400];
+    reader.draw_registers(c, dev, regs);
+    CHECK(regs[0x180] == 0x10110201 && regs[0x181] == 4 && regs[0x182] == 0x00030003 && regs[0x208] == 4);
+    port::store<uint32_t>(c, dev + l.pixel_shader, 0);
+    reader.draw_registers(c, dev, regs);
+    CHECK(regs[0x180] == 0x00110001 && regs[0x181] == 0 && regs[0x208] == 5);
+    port::store<uint32_t>(c, dev + l.pixel_shader, ps);
+
+    uint32_t bools[8], loops[32];
+    port::store<uint32_t>(c, dev + l.bool_constants + 4, 0x80000001);
+    port::store<uint32_t>(c, dev + l.bool_constants + 32 + 4 * 31, 0x00010203);
+    reader.bool_loop_constants(c, dev, bools, loops);
+    CHECK(bools[1] == 0x80000001 && bools[0] == 0 && loops[31] == 0x00010203);
+
+    static uint32_t vs[1024], psc[1024];
+    xf::xdk::D3DReader::LiteralCarry carry;
+    auto draw = [&](uint32_t vertex, uint64_t dirty) {
+        port::store<uint32_t>(c, dev + l.vertex_shader, vertex);
+        port::store<uint64_t>(c, dev + l.dirty_constants, dirty);
+        reader.constants(c, dev, vs, psc, &carry);
+        port::store<uint64_t>(c, dev + l.dirty_constants, 0); // (the D3D's draw sends and clears them)
+        return vs[250 * 4];
+    };
+    const uint64_t c250_group = 1ull << (63 - 250 / 4); // c248-c251
+    CHECK(draw(vs_a, 0) == TWO_PI && vs[250 * 4 + 3] == 3);
+    CHECK(draw(vs_b, 0) == TWO_PI);          // no literal of its own: what the last one left
+    CHECK(draw(vs_b, c250_group) == 0);      // the game wrote the group: the shadow's
+    CHECK(draw(vs_b, 0) == 0);
+    CHECK(draw(vs_a, 0) == TWO_PI);          // set again: its literals
+    CHECK(draw(vs_a, c250_group) == 0);      // the same shader: the game's write stands
+    CHECK(draw(vs_b, 0) == 0 && draw(vs_a, 0) == TWO_PI);
+    // without a carry: the literals laid over at every draw, the shadow elsewhere
+    port::store<uint32_t>(c, dev + l.vertex_shader, vs_b);
+    reader.constants(c, dev, vs, psc);
+    CHECK(vs[250 * 4] == 0);
+}
+
 // invoke and GuestStack (docs/sdk.md, "Calling the game") on code placed in guest memory, interpreted:
 // arguments in r3-r10 and f1-f13 counted apart, results from r3 and f1, every register back as it was,
 // temporaries that a callee's own frame and saves leave alone
@@ -498,6 +578,7 @@ int main() {
     memory_helpers();
     typed_calls();
     port_options();
+    xdk_d3d_reader();
     hooks_run(false);
     hooks_run(true);
     return finish("port");
