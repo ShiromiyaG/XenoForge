@@ -36,7 +36,7 @@ namespace xf {
 // player's overlay (F1) by category with its description, read by hooks in a
 // reloaded module (port::option, port.h), and the list an in-game options
 // menu is made from (docs/sdk.md, "The port's options"); after the 3DS
-// runtime's PORT_OPTION and UnleashedRecomp's config_def.h. The port owns the
+// runtime's PORT_OPTION and hedge-dev's recompilations' config_def.h. The port owns the
 // variable; the player writes it when the file is read, when the overlay
 // changes it and when --option sets it, always before the game starts or from
 // the overlay's thread while it runs (a port reads it where a torn read does

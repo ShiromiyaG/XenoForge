@@ -352,7 +352,7 @@ report. Hooks and replacements themselves are `xenoforge/port.h` (plan E3).
 ### The port's options
 
 Declared once, with the variable the port owns (the 3DS runtime's
-`PORT_OPTION`, UnleashedRecomp's `config_def.h`): boolean, integer or real in
+`PORT_OPTION`, hedge-dev's recompilations' `config_def.h`): boolean, integer or real in
 a range, or a choice among named values (its index in an `int`).
 
 ```cpp
