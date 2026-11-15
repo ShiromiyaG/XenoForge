@@ -56,6 +56,8 @@ struct D3DLayout {
     // the float constants' dirty masks (64 bits each, vertex then pixel shader: a bit a group of four
     // constants, group 0 the top bit), which a draw sends and clears; UINT32_MAX: not known
     uint32_t dirty_constants = UINT32_MAX;
+    // the bound vertex declaration object; the streams' strides (a byte each, in words)
+    uint32_t vertex_declaration = 0, stream_strides = 0;
     uint32_t index_buffer = 0;   // the bound index buffer object: bit 31 of its first word 32-bit indices, the data at +0x18
     uint32_t viewport = 0;       // x, y, width, height (floats)
     uint32_t scissor_enabled = 0, scissor = 0; // a word; x1, y1, x2, y2
@@ -149,6 +151,22 @@ class D3DReader {
     // The bool constants (8 words, 256 bits: vertex shader's b0-b127 then the pixel shader's) and the loop
     // constants (i0-i31 of both stages) as the GPU gets them at a draw (the D3D sends the device's copy).
     void bool_loop_constants(const port::Context &c, uint32_t dev, uint32_t bools[8], uint32_t loops[32]) const;
+    // The vertex shader's microcode as the D3D runs it with the bound vertex
+    // declaration and streams: each vertex fetch the shader's header names
+    // (its instruction, the usage and index it reads) given the declaration's
+    // element of that usage: its stream's fetch constant (95 - stream), the
+    // element's format, signedness and integer reading (the low bytes of the
+    // XDK's D3DDECLTYPE), its offset and the stream's stride, the destination
+    // components' sources swapped in pairs for 16-bit components (the
+    // stream's 8-in-32 swap reverses each pair) and red and blue for
+    // D3DCOLOR. The D3D also makes the fetches after a stream's first "mini"
+    // fetches and sets the first one's prefetch, which reads the same data:
+    // left as full fetches here. A UP draw (BeginVertices) gives stream 0's
+    // stride itself (`up_stride`, bytes; 0: the streams' as set). False when
+    // there is nothing to patch (no declaration, no element the shader
+    // reads), `words` then untouched.
+    bool patch_vertex_fetches(const port::Context &c, uint32_t dev, uint32_t object, bool no_pixel_shader,
+                              std::vector<uint32_t> &words, uint32_t up_stride = 0) const;
     // The bound index buffer: its data's address (0: none) and width.
     struct IndexBuffer {
         uint32_t address = 0;

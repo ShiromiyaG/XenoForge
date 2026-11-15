@@ -521,6 +521,33 @@ void xdk_d3d_reader() {
     port::store<uint32_t>(c, dev + l.vertex_shader, vs_b);
     reader.constants(c, dev, vs, psc);
     CHECK(vs[250 * 4] == 0);
+
+    // the vertex fetches the D3D fills in from the declaration: vs_a's header names two (texcoord 0 at
+    // instruction 1, position 0 at 2); the declaration gives them a SHORT4 at offset 8 of stream 1 and a FLOAT4
+    // at offset 0 of stream 0
+    const uint32_t header = vs_a + l.vs_header + 0x80;
+    port::store<uint32_t>(c, header + 24, 1), port::store<uint32_t>(c, header + 28, 2); // one word before, two elements
+    port::store<uint32_t>(c, header + 36 + 4, 0x00005001); // address 1, usage 5 (texcoord), index 0
+    port::store<uint32_t>(c, header + 36 + 8, 0x00000002); // address 2, usage 0 (position), index 0
+    const uint32_t decl = h.alloc(0x100);
+    zero(decl, 0x100);
+    port::store<uint32_t>(c, decl + 24, 2);
+    port::store<uint32_t>(c, decl + 0x34, 0x00010008), port::store<uint32_t>(c, decl + 0x38, 0x001A235A); // SHORT4
+    port::store<uint32_t>(c, decl + 0x3C, 0x00050000);                                                  // texcoord 0
+    port::store<uint32_t>(c, decl + 0x40, 0x00000000), port::store<uint32_t>(c, decl + 0x44, 0x001A23A6); // FLOAT4
+    port::store<uint32_t>(c, decl + 0x48, 0x00000000);                                                  // position 0
+    port::store<uint32_t>(c, dev + l.vertex_declaration, decl);
+    port::store<uint8_t>(c, dev + l.stream_strides, 4), port::store<uint8_t>(c, dev + l.stream_strides + 1, 6);
+    std::vector<uint32_t> words(9, 0);
+    words[3] = 0x05F80000, words[4] = 0x688; // full fetches as compiled: fetch constant 95, xyzw
+    words[6] = 0x05F81000, words[7] = 0x688;
+    CHECK(reader.patch_vertex_fetches(c, dev, vs_a, false, words));
+    CHECK(words[3] == ((0x05F80000u & ~(0x1Fu << 20 | 3u << 25)) | 31u << 20 | 1u << 25)); // stream 1: constant 94
+    CHECK(words[4] == (0x4C1u | 1u << 12 | 1u << 13 | 0x1Au << 16)); // pairs swapped, signed, integer, 16_16_16_16
+    CHECK(words[5] == (6u | 2u << 8));                                // stride 6 words, offset 2 words
+    CHECK(words[6] == 0x05F81000 && words[7] == (0x688u | 1u << 12 | 1u << 13 | 0x26u << 16) && words[8] == 4u);
+    words.assign(9, 0), words[6] = 0x05F81000, words[7] = 0x688;
+    CHECK(reader.patch_vertex_fetches(c, dev, vs_a, false, words, 32) && words[8] == 8u); // a UP draw's stride
 }
 
 // invoke and GuestStack (docs/sdk.md, "Calling the game") on code placed in guest memory, interpreted:

@@ -757,10 +757,22 @@ each checked against the GPU's draw on every draw of a recorded race
   the `LiteralCarry` the caller keeps across draws (read before the D3D's
   draw clears the masks) follows that.
 
-Left of step 1: the vertex shaders the D3D patches at the draw (it fills
-their vertex fetches' format, offset and stride from the vertex declaration
-and the streams, and the fetch constant's slot: 4,125 of those draws in the
-race), which a capturing port still takes from the GPU.
+- **`patch_vertex_fetches`**: the vertex shader as the D3D runs it with
+  the bound vertex declaration. The shader's header lists its vertex
+  fetches (the instruction, the usage and index each reads); the
+  declaration's element of that usage gives the stream (fetch constant 95 -
+  stream), the offset and the type, whose low bytes are the GPU's format,
+  signedness and integer reading; the stride is the stream's (a UP draw's
+  own for stream 0); 16-bit components have their sources swapped in pairs
+  (the stream's 8-in-32 swap reverses each pair), D3DCOLOR red and blue.
+  The D3D also turns a stream's later fetches into "mini" ones and sets the
+  first one's prefetch, which reads the same data: left as full fetches.
+  Checked on the race: every patched program the GPU ran (3,706 draws to
+  swap 2,400) alike but for those two fields.
+
+So a port capturing the D3D draws without anything from the GPU's draws:
+what it still takes from the GPU is the resolves' description, which goes
+with step 2 (the D3D's Resolve replaced).
 
 Still to come: notification of CPU writes to guest memory ranges a port
 registers, and a port's resolves kept as images (not through guest memory)

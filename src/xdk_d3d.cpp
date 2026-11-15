@@ -16,7 +16,7 @@ constexpr D3DLayout XDK_21250 = [] {
     l.xdk_build = 21250;
     l.pixel_shader = 0x330C, l.vertex_shader = 0x3310;
     l.fetch_constants = 0x480, l.vs_constants = 0x780, l.ps_constants = 0x1780, l.bool_constants = 0x2780;
-    l.dirty_constants = 0;
+    l.dirty_constants = 0, l.vertex_declaration = 0x2FD0, l.stream_strides = 0x3268;
     l.index_buffer = 0x320C, l.viewport = 0x32E0, l.scissor_enabled = 0x3000, l.scissor = 0x32FC;
     l.blocks[0] = {0x2000, 0x10, 10368}, l.blocks[1] = {0x2080, 3, 10432}, l.blocks[2] = {0x2100, 0x15, 10444};
     l.blocks[3] = {0x2180, 5, 10528}, l.blocks[4] = {0x2200, 0x21, 10548}, l.blocks[5] = {0x2280, 0x15, 10596};
@@ -156,6 +156,57 @@ void D3DReader::draw_registers(const port::Context &c, uint32_t dev, uint32_t ou
 void D3DReader::bool_loop_constants(const port::Context &c, uint32_t dev, uint32_t bools[8], uint32_t loops[32]) const {
     read_words(c, dev + l_.bool_constants, bools, 8);
     read_words(c, dev + l_.bool_constants + 32, loops, 32);
+}
+
+bool D3DReader::patch_vertex_fetches(const port::Context &c, uint32_t dev, uint32_t object, bool no_pixel_shader,
+                                     std::vector<uint32_t> &words, uint32_t up_stride) const {
+    if (!object || !l_.vertex_declaration) return false;
+    const uint32_t decl = port::load<uint32_t>(c, dev + l_.vertex_declaration);
+    if (!decl) return false;
+    const bool variant = no_pixel_shader && (port::load<uint32_t>(c, object + l_.vs_header) & l_.vs_depth_only_flag);
+    const uint32_t header =
+        object + l_.vs_header + port::load<uint32_t>(c, object + (variant ? l_.vs_depth_only : l_.vs_descriptor));
+    // the header: ... [6] words before the elements, [7] the elements, then {address:12, usage:4, index:4}
+    const uint32_t before = port::load<uint32_t>(c, header + 24), count = port::load<uint32_t>(c, header + 28);
+    if (count > 32 || before > 32) return false;
+    // the declaration: [6] its element count, its elements from +0x34: {stream << 16 | offset, type,
+    // method << 24 | usage << 16 | index << 8}
+    const uint32_t elements = port::load<uint32_t>(c, decl + 24);
+    if (elements > 64) return false;
+    bool patched = false;
+    for (uint32_t e = 0; e < count; e++) {
+        const uint32_t ve = port::load<uint32_t>(c, header + 36 + 4 * (before + e));
+        const uint32_t address = ve & 0xFFF, usage = (ve >> 12) & 0xF, index = (ve >> 16) & 0xF;
+        if (size_t(address) * 3 + 3 > words.size()) continue;
+        for (uint32_t k = 0; k < elements; k++) {
+            const uint32_t at = decl + 0x34 + 12 * k;
+            const uint32_t w2 = port::load<uint32_t>(c, at + 8);
+            if (((w2 >> 16) & 0xFF) != usage || ((w2 >> 8) & 0xFF) != index) continue;
+            const uint32_t w0 = port::load<uint32_t>(c, at), type = port::load<uint32_t>(c, at + 4);
+            const uint32_t stream = w0 >> 16, offset = w0 & 0xFFFF;
+            if (stream >= 16 || type == 0xFFFFFFFF) break;
+            const uint32_t stride =
+                up_stride && stream == 0 ? up_stride / 4 : port::load<uint8_t>(c, dev + l_.stream_strides + stream);
+            const uint32_t slot = 95 - stream, format = type & 0x3F, flags = (type >> 8) & 0xFF;
+            uint32_t *fetch = words.data() + size_t(address) * 3;
+            // the destination's sources: 3 bits a component, 0-3 a source component
+            uint32_t swizzle = fetch[1] & 0xFFF;
+            const bool pairs = format == 25 || format == 26 || format == 31 || format == 32; // 16-bit components
+            const bool red_blue = (flags & 0x08) != 0;                                          // D3DCOLOR
+            for (uint32_t comp = 0; comp < 4; comp++) {
+                uint32_t v = (swizzle >> (3 * comp)) & 7;
+                if (v < 4 && pairs) v ^= 1;
+                if (v < 4 && red_blue && (v == 0 || v == 2)) v ^= 2;
+                swizzle = (swizzle & ~(7u << (3 * comp))) | v << (3 * comp);
+            }
+            fetch[0] = (fetch[0] & ~(0x1Fu << 20 | 3u << 25)) | (slot / 3) << 20 | (slot % 3) << 25;
+            fetch[1] = swizzle | (flags & 1) << 12 | ((flags >> 1) & 1) << 13 | format << 16;
+            fetch[2] = (fetch[2] & 0x80000000u) | (stride & 0xFF) | ((offset / 4) & 0x7FFFFF) << 8;
+            patched = true;
+            break;
+        }
+    }
+    return patched;
 }
 
 D3DReader::IndexBuffer D3DReader::index_buffer(const port::Context &c, uint32_t dev) const {
