@@ -78,6 +78,7 @@ struct DrawSetup {
     uint32_t pitch = 0, msaa = 0; // pixels; 0 1x, 1 2x, 2 4x
     DrawTarget color[4], depth;
     bool pixel_shader = true; // the draw runs its pixel shader (else depth alone)
+    bool pixel_writes_depth = false; // its pixel shader writes oDepth (the viewport's depth range then 0-1)
 
     // the primitive
     uint32_t primitive = 0;

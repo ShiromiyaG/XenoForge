@@ -256,6 +256,16 @@ struct Options {
     // picture of each frame frame_wanted asks for, read at the swap before
     // the port draws the same frame (on_frame gets the port's).
     std::function<void(uint64_t swap, const Image &frame)> on_emulated_frame;
+    // Each resolve of the swaps resolve_dump_wanted names, read back as the
+    // texture its destination is (no display gamma): index counts the
+    // frame's resolves from 0, port says a port's own (native_render.h's
+    // Frame::resolve; the shadow mode has both for the same frame). raw: the
+    // texels as the texture cache holds them (host_format: texture.h's
+    // HostFormat), for comparing values a picture hides (depth).
+    std::function<bool(uint64_t swap)> resolve_dump_wanted;
+    std::function<void(uint64_t swap, uint32_t index, bool port, const Image &image, const std::vector<uint8_t> &raw,
+                       uint32_t host_format)>
+        on_resolve_dump;
     // Each swap's front buffer on the GPU, with no read-back: called on the
     // renderer's thread right after the swap's work is submitted on the
     // device's queue. The synchronization is the queue's order: what the hook
@@ -288,6 +298,12 @@ struct Options {
     // logical cores (Xenia's d3d12_pipeline_creation_threads default).
     bool async_pipelines = false;
     int pipeline_threads = -1;
+    // The processor's calls done on a thread of their own (gpu/deferred_sink.h),
+    // the fences they owe written once the work before them is done. Off:
+    // done on the processor's thread as they come (the deterministic mode's
+    // default: then nothing the GPU does reaches the guest at a time of the
+    // host's). XF_GPU_BACK_END=0 or =1 overrides it.
+    bool back_end = true;
     // What a draw is drawn with while its pipeline is made on the workers
     // (async_pipelines; docs/renderer.md, "Pipelines while they are made"):
     enum class PipelineStandIn {

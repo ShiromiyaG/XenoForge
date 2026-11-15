@@ -359,10 +359,17 @@ bool start_renderer(Game &g, const render::Options &options, std::string &error)
         o.gpu_timing_draws = std::string(timing) == "draws";
     }
     // occlusion queries: the GPU's counts, as Xenia's default "fast" mode;
-    // XF_OCCLUSION_QUERIES=fake keeps the processor's made-up ones
+    // XF_OCCLUSION_QUERIES=fake keeps the processor's made-up ones. The
+    // deterministic mode takes the made-up ones and no back end thread: the
+    // GPU's counts and fences reach the guest when the host's GPU is done, so
+    // a rendered run would differ from the next (with both, a rendered run
+    // leaves the guest as the headless one; XF_OCCLUSION_QUERIES=fast and
+    // XF_GPU_BACK_END=1 for the GPU's own)
     const char *queries = std::getenv("XF_OCCLUSION_QUERIES");
-    processor.set_occlusion_queries(queries && std::string(queries) == "fake" ? gpu::OcclusionQueries::Fake
-                                                                              : gpu::OcclusionQueries::Fast);
+    const bool exact = g.kernel->deterministic();
+    const bool fake = queries ? std::string(queries) == "fake" : exact;
+    processor.set_occlusion_queries(fake ? gpu::OcclusionQueries::Fake : gpu::OcclusionQueries::Fast);
+    if (exact) o.back_end = false;
     // screen extents: the bounds of what the draws rasterized (beyond Xenia)
     // where measuring them gains, the whole screen, as Xenia answers,
     // where it does not (the default: CommandProcessor::set_screen_extents_by_gain);

@@ -52,6 +52,9 @@ const uint32_t PACK7E3_FRAG[] = {
 const uint32_t DOWNSAMPLE_FRAG[] = {
 #include "native_downsample.frag.inc"
 };
+const uint32_t SHOW_FRAG[] = {
+#include "native_show.frag.inc"
+};
 
 constexpr uint32_t SLOTS = 32;
 // each image table (set 1's bindings 0-2: 2D arrays, 3D, cubes): a stand-in at 0 (the translated shaders read
@@ -171,13 +174,23 @@ struct Drawer::Impl {
     std::vector<uint32_t> index_words, attribute_words, fetch_words;
     Stats stats;
     mutable std::mutex stats_mutex;
+    // XF_DRAWER_SHOW=<swap>:<base hex>:<pitch>[:<scale>]: that frame's output is the target written last at
+    // that EDRAM place (depth or color), its first component times scale (default 1), as grey
     // XF_DRAWER_LOG=<swap>: that frame's draws listed, numbered from 0 in the order the port gave them;
     // XF_DRAWER_SKIP=<swap>:<first>-<last>: those draws of that frame left out (finding the one a wrong
     // picture comes from, beside the shadow mode's emulated picture of the same frame)
     struct Debug {
-        uint64_t log_swap = UINT64_MAX, skip_swap = UINT64_MAX;
-        uint32_t skip_first = 0, skip_last = 0;
+        uint64_t log_swap = UINT64_MAX, skip_swap = UINT64_MAX, show_swap = UINT64_MAX;
+        uint32_t skip_first = 0, skip_last = 0, show_base = 0, show_pitch = 0;
+        float show_scale = 1.0f;
         Debug() {
+            if (const char *v = std::getenv("XF_DRAWER_SHOW"); v && *v) {
+                unsigned long long swap = 0;
+                unsigned base = 0, pitch = 0;
+                float scale = 1.0f;
+                if (std::sscanf(v, "%llu:%x:%u:%f", &swap, &base, &pitch, &scale) >= 3)
+                    show_swap = swap, show_base = base, show_pitch = pitch, show_scale = scale;
+            }
             if (const char *v = std::getenv("XF_DRAWER_LOG"); v && *v) log_swap = std::strtoull(v, nullptr, 10);
             if (const char *v = std::getenv("XF_DRAWER_SKIP"); v && *v) {
                 unsigned long long swap = 0;
@@ -187,7 +200,7 @@ struct Drawer::Impl {
             }
         }
     } debug;
-    uint32_t frame_draws = 0;
+    uint32_t frame_draws = 0, frame_resolves = 0;
 
     void log_draw(uint32_t index, const DrawCall &call, const Op &op) {
         const uint32_t *r = call.registers;
@@ -202,9 +215,20 @@ struct Drawer::Impl {
         if (const Target *t = op.attachments.depth)
             std::printf(", depth at %X format %u control %08X stencil %08X/%08X", t->base, t->format, r[0x2200],
                         r[0x210D], r[0x210C]);
-        std::printf(", color control %08X, mode %08X, scissor %d,%d %ux%u, bias %g %g\n", r[0x2202], r[0x2205],
-                    op.scissor.offset.x, op.scissor.offset.y, op.scissor.extent.width, op.scissor.extent.height,
-                    op.bias_constant, op.bias_slope);
+        std::printf(", edram mode %u color mask %04X info %08X written by the shader %X", r[0x2208] & 7, r[0x2104] & 0xFFFF,
+                    r[0x2001], call.ps_uses ? call.ps_uses->colors_written : 0u);
+        // the textures the shaders read: slot, address, format, dimension, size
+        const uint32_t slots = call.vs_uses->texture_slots | (call.ps_uses ? call.ps_uses->texture_slots : 0);
+        for (uint32_t slot = 0; slot < 32; slot++) {
+            if (!((slots >> slot) & 1)) continue;
+            const uint32_t *f = &call.fetch[slot * 6];
+            std::printf(", t%u %08X fmt %u dim %u %ux%u", slot, f[1] & 0xFFFFF000u, f[1] & 0x3F, (f[5] >> 9) & 3,
+                        (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1);
+        }
+        std::printf(", color control %08X, mode %08X, scissor %d,%d %ux%u, viewport z %g-%g%s, bias %g %g\n",
+                    r[0x2202], r[0x2205], op.scissor.offset.x, op.scissor.offset.y, op.scissor.extent.width,
+                    op.scissor.extent.height, op.viewport.minDepth, op.viewport.maxDepth,
+                    call.ps_uses && call.ps_uses->writes_depth ? " (oDepth)" : "", op.bias_constant, op.bias_slope);
     }
 
     void approximate(const char *what) {
@@ -403,12 +427,14 @@ struct Drawer::Impl {
         t.image = device->create_image(
             VK_IMAGE_TYPE_2D, vk_format, {t.width, t.height, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
                        : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT));
         if (!t.image.image) return why = "a target image not made", nullptr;
         t.view = make_view(t.image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format,
                            depth ? DEPTH_STENCIL : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT));
-        if (!depth) {
+        if (depth) {
+            t.sampled = make_view(t.image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, VK_IMAGE_ASPECT_DEPTH_BIT);
+        } else {
             t.sampled = t.view;
             t.array = make_view(t.image.image, VK_IMAGE_VIEW_TYPE_2D_ARRAY, vk_format, VK_IMAGE_ASPECT_COLOR_BIT);
         }
@@ -421,6 +447,7 @@ struct Drawer::Impl {
         // (an image the GPU may still use: destroyed after the device is idle, at the Drawer's end, or
         // now when made again taller, which a draw of this frame cannot have used yet)
         if (t.array) vkDestroyImageView(dev, t.array, nullptr);
+        if (t.depth && t.sampled) vkDestroyImageView(dev, t.sampled, nullptr);
         if (t.view) vkDestroyImageView(dev, t.view, nullptr);
         if (t.image.image) device->destroy(t.image);
         t = {};
@@ -1079,6 +1106,14 @@ struct Drawer::Impl {
                     (!source || t.written > source->written))
                     source = &t;
             if (!source) return fail("a resolve from a target the port has not drawn");
+            if (debug.log_swap == ctx->swap)
+                std::printf("drawer: swap %llu resolve %u: %s base %X pitch %u msaa %u format %u (%u,%u %ux%u) from the "
+                            "target at %X format %u (%ux%u) -> %08X format %u%s%s\n",
+                            (unsigned long long)ctx->swap, frame_resolves, info.depth ? "depth" : "color",
+                            info.edram_base, info.surface_pitch, info.msaa, info.source_format, info.x, info.y,
+                            info.width, info.height, source->base, source->format, source->width, source->height,
+                            info.dest_base, info.dest_format, info.clear_color ? ", clear color" : "",
+                            info.clear_depth ? ", clear depth" : "");
             if (info.depth && info.msaa) return fail("a depth resolve of a multisampled view");
             VkImageView view = source->sampled;
             VkFormat vk_format = source->image.format;
@@ -1209,7 +1244,7 @@ bool Drawer::begin(const OutputContext &ctx, std::string &why) {
     d.last_at[0] = d.last_at[1] = {}, d.last_system_at = {};
     d.textures_set = VK_NULL_HANDLE, d.textures_key.clear();
     d.textures_met.clear();
-    d.frame_draws = 0;
+    d.frame_draws = 0, d.frame_resolves = 0;
     return true;
 }
 
@@ -1231,6 +1266,14 @@ bool Drawer::draw(const DrawCall &call, std::string &why) {
 bool Drawer::clear(const ClearCall &call, std::string &why) {
     Impl &d = *impl_;
     const uint32_t pitch = call.surface_info & 0x3FFF;
+    if (d.debug.log_swap == d.ctx->swap)
+        std::printf("drawer: swap %llu clear after draw %u: targets %X (color 0 at %X format %u)%s%s depth at %X format "
+                    "%u, color %g %g %g %g z %g stencil %u, area %d,%d-%d,%d pitch %u\n",
+                    (unsigned long long)d.ctx->swap, d.frame_draws, call.targets, call.color_info[0] & 0xFFF,
+                    (call.color_info[0] >> 16) & 0xF, call.depth ? " depth" : "", call.stencil ? " stencil" : "",
+                    call.depth_info & 0xFFF, (call.depth_info >> 16) & 1, call.color[0], call.color[1], call.color[2],
+                    call.color[3], call.z, call.stencil_value, call.area[0], call.area[1], call.area[2], call.area[3],
+                    pitch);
     if ((call.surface_info >> 16) & 3) return why = "a clear of a multisampled target", false;
     const uint32_t bottom = uint32_t(std::max(call.area[3], 0));
     Op op;
@@ -1268,11 +1311,29 @@ bool Drawer::clear(const ClearCall &call, std::string &why) {
     return true;
 }
 
-bool Drawer::resolve(const ResolveInfo &info, std::string &why) { return impl_->do_resolve(info, why); }
+bool Drawer::resolve(const ResolveInfo &info, std::string &why) {
+    const bool ok = impl_->do_resolve(info, why);
+    impl_->frame_resolves++;
+    return ok;
+}
 
 bool Drawer::present(const uint32_t fetch[6], std::string &why) {
     Impl &d = *impl_;
     d.flush();
+    if (d.debug.show_swap == d.ctx->swap) {
+        const Target *best = nullptr;
+        for (const auto &[k, t] : d.targets)
+            if (t.base == d.debug.show_base && t.pitch == d.debug.show_pitch && t.sampled &&
+                (!best || t.written > best->written))
+                best = &t;
+        VkPipeline p = d.helper(SHOW_FRAG, sizeof(SHOW_FRAG), d.ctx->output_format);
+        int32_t push[4] = {};
+        std::memcpy(&push[0], &d.debug.show_scale, 4);
+        if (best && p && d.helper_pass(p, best->sampled, d.nearest, d.ctx->output_view, d.ctx->width, d.ctx->height, push))
+            return true;
+        std::printf("drawer: swap %llu: no target at %X pitch %u to show\n", (unsigned long long)d.ctx->swap,
+                    d.debug.show_base, d.debug.show_pitch);
+    }
     if (!fetch) return why = "no front buffer", false;
     TextureImage front;
     if (!d.ctx->frame->texture(fetch, front, why)) return why = "the front buffer: " + why, false;

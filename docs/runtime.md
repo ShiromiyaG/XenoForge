@@ -726,6 +726,16 @@ stack's generated frames wait where they are:
   (`VirtualClockOutput`; the player's device still gets the frames).
   Unpaced (boot), it runs as fast as the host goes; paced (the player), it
   never runs ahead of the host's clock.
+- **Rendered runs (2026-11-15).** With the renderer (`--render`, the player)
+  two things reached the guest at a time of the host's: occlusion query
+  reports with the GPU's counts (written when the host's GPU is done) and
+  the fences the GPU's back end thread writes once its work is done. The
+  deterministic mode now takes the processor's made-up query reports and no
+  back end thread (renderer `Options::back_end`; `XF_OCCLUSION_QUERIES=fast`
+  and `XF_GPU_BACK_END=1` bring them back): a rendered run leaves the guest
+  exactly as the headless one, and a port's native frames and the shadow mode
+  too (game A's recorded race to swap 1,501: one memory hash for all four),
+  so the same swap is the same frame in every run.
 - **What else would differ run to run**: XeCryptRandom and XNetRandom take a
   fixed seed; the loader lock's owner is the guest thread, not the host
   thread (all are one). Not covered: the storage root's contents (saves left

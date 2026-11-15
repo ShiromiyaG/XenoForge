@@ -32,6 +32,8 @@
 // into --trace-dir (./traces by default); it renders. --native-shadow: a
 // port draws every frame beside the emulated path (native_render.h's
 // set_shadow), the shots adding <title>_<swap>_emulated.png, the same frame.
+// --dump-resolves <list> writes each resolve of those swaps (its destination as
+// a texture) as <title>_<swap>_r<n>_emulated.png, and _port.png for a port's.
 //
 // XAM's input answers from an idle pad for user 0 (a controller plugged in,
 // nothing pressed), so a game that waits for one goes on; --no-controller
@@ -75,7 +77,7 @@
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>] [--project <file>] [--patches <dir> [--patch <name>[=off]]...]
-//        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]] [--native-shadow]]
+//        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]] [--native-shadow] [--dump-resolves <list>]]
 //        [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 //        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
@@ -115,7 +117,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] [--project <file>] "
                         "[--patches <dir> [--patch <name>[=off]]...] [--render [--shots <dir> [--shot-swaps <list>] "
-                        "[--shot-every N]] [--native-shadow]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
+                        "[--shot-every N]] [--native-shadow] [--dump-resolves <list>]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
                         "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
                         "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
                         "[--deterministic [--paced] [--spin-idle] [--until-swap N] [--until S]] "
@@ -136,7 +138,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     bool rendering = false, controller = true, rates = false;
     std::vector<game::Press> presses;
     std::filesystem::path shots;
-    std::set<uint64_t> shot_swaps, trace_frames;
+    std::set<uint64_t> shot_swaps, trace_frames, dump_resolves;
     uint64_t shot_every = 0;
     std::filesystem::path trace_dir = "traces";
     double reload_every = 0;
@@ -238,7 +240,10 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             follow_launches = true;
         else if (a == "--launch-data" && k + 1 < argc)
             launch_data_file = argv[++k];
-        else if (a == "--native-shadow")
+        else if (a == "--dump-resolves" && k + 1 < argc) {
+            if (!game::parse_numbers(argv[++k], dump_resolves))
+                return std::fprintf(stderr, "bad --dump-resolves\n%s", usage), 2;
+        } else if (a == "--native-shadow")
             xf::native::set_shadow(true);
         else if (a == "--hook-stats")
             hooks::set_stats(true);
@@ -287,6 +292,30 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
                                     int(frame.width) * 4))
                     std::fprintf(stderr, "could not write %s\n", path.string().c_str());
             };
+            // each resolve of --dump-resolves' swaps, both paths' in the shadow mode
+            if (!dump_resolves.empty()) {
+                options.resolve_dump_wanted = [&dump_resolves](uint64_t swap) { return dump_resolves.count(swap) != 0; };
+                options.on_resolve_dump = [dir = shots, prefix = std::string(title)](
+                                              uint64_t swap, uint32_t index, bool port, const render::Image &image,
+                                              const std::vector<uint8_t> &raw, uint32_t host) {
+                    char name[96];
+                    std::snprintf(name, sizeof(name), "%s_%llu_r%03u_%s.png", prefix.c_str(), (unsigned long long)swap,
+                                  index, port ? "port" : "emulated");
+                    const std::filesystem::path path = dir / name;
+                    if (!stbi_write_png(path.string().c_str(), int(image.width), int(image.height), 4, image.rgba.data(),
+                                        int(image.width) * 4))
+                        std::fprintf(stderr, "could not write %s\n", path.string().c_str());
+                    // the texels as they are: a header of width, height and host format (32-bit words), then the bytes
+                    std::filesystem::path raw_path = path;
+                    raw_path.replace_extension(".raw");
+                    if (std::FILE *f = std::fopen(raw_path.string().c_str(), "wb")) {
+                        const uint32_t header[3] = {image.width, image.height, host};
+                        std::fwrite(header, 4, 3, f);
+                        std::fwrite(raw.data(), 1, raw.size(), f);
+                        std::fclose(f);
+                    }
+                };
+            }
             // (the shadow mode's emulated picture of the same frame)
             options.on_emulated_frame = [dir = shots, prefix = std::string(title)](uint64_t swap,
                                                                                    const render::Image &frame) {

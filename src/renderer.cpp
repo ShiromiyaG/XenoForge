@@ -1048,6 +1048,8 @@ struct FrontRead {
     std::array<uint32_t, 128 * 3> pwl{};
     uint32_t luta_control = 0; // DC_LUTA_CONTROL at the swap
     bool emulated = false;     // a shadow mode's emulated picture (Options::on_emulated_frame)
+    int32_t dump_index = -1;   // a resolve's destination (Options::on_resolve_dump), the frame's resolve number
+    bool dump_port = false;
 };
 
 // The attachments of the render pass under way.
@@ -1927,6 +1929,10 @@ private:
     Texture *front_texture(texture::Info &info);
     void read_native_output(uint64_t number);
     void read_front_buffer(uint64_t number, Texture &t, const texture::Info &info, bool emulated = false);
+    // a resolve's destination read back for Options::on_resolve_dump (the frame's resolves numbered per path)
+    void dump_resolve(const resolve::Info &info, uint64_t swap, bool port);
+    uint32_t dumped_resolves_[2] = {};
+    uint64_t native_number_ = 0; // the swap the port's frame is being drawn for
     void deliver(const FrontRead &read);
     void skip(const std::string &reason) {
         report_.skipped[reason]++;
@@ -4964,8 +4970,9 @@ bool Impl::init(std::string &error) {
     open_storage();
     // The work of the processor's calls on a thread of its own, the command processor's thread
     // left with the packets (gpu/deferred_sink.h; XF_GPU_BACK_END=0 off)
-    if (const char *v = std::getenv("XF_GPU_BACK_END"); !(v && v[0] == '0'))
-        deferred_ = std::make_unique<gpu::DeferredSink>(*this, processor_.registers(), mem_);
+    bool back_end = options_.back_end;
+    if (const char *v = std::getenv("XF_GPU_BACK_END"); v && *v) back_end = v[0] != '0';
+    if (back_end) deferred_ = std::make_unique<gpu::DeferredSink>(*this, processor_.registers(), mem_);
     return true;
 }
 
@@ -12334,6 +12341,8 @@ void Impl::resolve() {
         clipped.x = x, clipped.y = y, clipped.width = w, clipped.height = h;
         gpu_resolve(clipped, *source);
         if (!fatal_.empty()) return;
+        if (options_.resolve_dump_wanted && options_.resolve_dump_wanted(report_.swaps))
+            dump_resolve(clipped, report_.swaps, false);
     }
 
     // the clears, after the copy, over the same rectangle; on the interlock
@@ -13574,6 +13583,8 @@ public:
         if (!clipped.width || !clipped.height) return true;
         r_.gpu_resolve(clipped, t, true);
         if (!r_.fatal_.empty()) return why = r_.fatal_, false;
+        if (r_.options_.resolve_dump_wanted && r_.options_.resolve_dump_wanted(r_.native_number_))
+            r_.dump_resolve(clipped, r_.native_number_, true);
         return true;
     }
     VkSampler sampler(const uint32_t fetch[6], const uint8_t filters[4]) override {
@@ -13678,6 +13689,7 @@ bool Impl::native_frame(uint64_t number, bool &held) {
             height = ctx.guest.width ? ctx.guest.height : 720;
         }
         if (native_output(width, height) && fatal_.empty()) {
+            native_number_ = number;
             ctx.output = native_output_.image, ctx.output_view = native_output_view_;
             ctx.width = width, ctx.height = height;
             NativeFrame frame(*this);
@@ -13744,6 +13756,7 @@ void Impl::swap() {
     end_query();
     zpd_current_ = 0;
     uint64_t number = report_.swaps++;
+    dumped_resolves_[0] = dumped_resolves_[1] = 0;
     if (number == 0 && DrawSections::on()) DrawSections::get().reset(); // (the first play left out)
     // the scaled resolves no texture took within two swaps go
     std::vector<Range> unused;
@@ -13914,6 +13927,34 @@ void Impl::read_native_output(uint64_t number) {
     front_reads_.push_back(std::move(read));
 }
 
+// A resolve's destination as a 2D texture over it (tiled, at texture_base with the destination's pitch, as
+// far as the rectangle reaches), read back as the front buffer is
+void Impl::dump_resolve(const resolve::Info &info, uint64_t swap, bool port) {
+    if (info.dest_array || !info.texture_base || !info.dest_pitch) return;
+    const uint32_t width = info.texel_x0 + info.dest_x + info.width, height = info.texel_y0 + info.dest_y + info.height;
+    if (width > 8192 || height > 8192) return;
+    uint32_t fetch[6] = {};
+    fetch[0] = 2u | (info.dest_pitch >> 5) << 22 | 1u << 31;
+    fetch[1] = (info.dest_format & 0x3F) | (info.dest_endian & 3) << 6 | (info.texture_base & 0xFFFFF000u);
+    fetch[2] = (width - 1) | (height - 1) << 13;
+    fetch[3] = (0u | 1u << 3 | 2u << 6 | 3u << 9) << 1; // x y z w
+    fetch[5] = 1u << 9;                                  // 2D
+    std::string why;
+    Texture *t = texture(fetch, why);
+    if (!t || !fatal_.empty()) return;
+    const texture::Info parsed = texture::parse_fetch_constant(fetch);
+    const size_t before = front_reads_.size();
+    read_front_buffer(swap, *t, parsed);
+    if (front_reads_.size() == before) return;
+    FrontRead &read = front_reads_.back();
+    read.dump_index = int32_t(dumped_resolves_[port ? 1 : 0]++), read.dump_port = port;
+    read.luta_control = 0;
+    for (uint32_t i = 0; i < 256; i++) {
+        const uint32_t ten = i << 2 | i >> 6;
+        read.gamma[i] = ten << 20 | ten << 10 | ten;
+    }
+}
+
 void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &info, bool emulated) {
     FrontRead read;
     read.number = number, read.emulated = emulated;
@@ -13999,6 +14040,12 @@ void Impl::deliver(const FrontRead &read) {
                     ten_bits ? uint8_t(float(ten) * (255.0f / 1023.0f) + 0.5f) : uint8_t((ten * 255 + 511) / 1023);
             }
         }
+    }
+    if (read.dump_index >= 0) {
+        if (options_.on_resolve_dump)
+            options_.on_resolve_dump(read.number, uint32_t(read.dump_index), read.dump_port, frame,
+                                     std::vector<uint8_t>(read.data, read.data + read.bytes), uint32_t(read.host));
+        return;
     }
     if (read.emulated) {
         if (options_.on_emulated_frame) options_.on_emulated_frame(read.number, frame);
@@ -14207,6 +14254,7 @@ DrawSetup draw_setup(const uint32_t *regs, uint32_t primitive, const ShaderUses 
         if (s.depth.format == 1) add(s, "D24FS8 depth as 32-bit float");
     }
     s.pixel_shader = ps != nullptr;
+    s.pixel_writes_depth = ps && ps->writes_depth;
     if (!colors_written && !s.depth.used) {
         s.empty = true; // (nothing it could change; a memory export alone is not done here)
         if (vs.exports || (ps && ps->exports)) add(s, "memory export in a draw that writes no target (not done)");
@@ -14395,8 +14443,10 @@ DrawSetup draw_setup(const uint32_t *regs, uint32_t primitive, const ShaderUses 
 
 void place_draw(DrawSetup &s, const uint32_t *regs, uint32_t width, uint32_t height, VkFormat depth_format,
                 const vk::Device *device) {
-    const bool float24 = s.depth.used && s.depth.format == 1 && (s.depth_test || s.depth_write || s.stencil_test);
-    const render::Viewport v = render::host_viewport(regs, float(width), float(height), false, float24, false);
+    // (Impl::draw's: the pixel shader's oDepth, a D24FS8 target kept halved)
+    const bool float24 = s.depth.used && s.depth.format == 1;
+    const render::Viewport v =
+        render::host_viewport(regs, float(width), float(height), s.pixel_writes_depth, float24, false);
     s.viewport = v.viewport;
     for (int i = 0; i < 3; i++) s.system.ndc_scale[i] = v.ndc_scale[i], s.system.ndc_offset[i] = v.ndc_offset[i];
     s.system.ndc_scale[3] = 1.0f;

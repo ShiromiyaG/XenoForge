@@ -597,12 +597,22 @@ write guest memory after the emulated path's, so where a frame reads the
 frame before's resolves (temporal effects) the emulated picture reads the
 port's.
 
-Finding the draw a difference comes from: `XF_DRAWER_LOG=<swap>` lists that
-frame's draws as the Drawer got them, numbered from 0 (shaders, primitive,
-targets with their formats, blend, depth and stencil control, scissor,
-polygon offset); `XF_DRAWER_SKIP=<swap>:<first>-<last>` leaves those draws
-out; `Drawer::present_target` shows one of the port's targets instead of the
-front buffer.
+Finding the draw a difference comes from: `boot --dump-resolves <swaps>`
+writes each resolve of those swaps, both paths' in the shadow mode, numbered
+in the frame's order (`<title>_<swap>_r<n>_emulated.png` and `_port.png`,
+and `.raw` beside each: width, height and host format as three words, then
+the texels as the texture cache holds them, for comparing values a picture
+hides, as depth); the first resolve that differs names the pass.
+`XF_DRAWER_LOG=<swap>` lists that frame's draws, clears and resolves as the
+Drawer got them, numbered from 0 (shaders, primitive, targets with their
+formats, EDRAM mode, color mask and what the shader writes, blend, depth and
+stencil control, the textures read, scissor, viewport depth range, polygon
+offset; a resolve's source target); `XF_DRAWER_SKIP=<swap>:<first>-<last>`
+leaves those draws out; `XF_DRAWER_SHOW=<swap>:<base hex>:<pitch>[:<scale>]`
+draws one of the port's targets (depth too, its first component times
+scale, as grey) in that frame's place; `Drawer::present_target` does it from
+code. The deterministic mode makes the same swap the same frame in every run
+(docs/runtime.md, "Rendered runs").
 
 ### The XDK's Direct3D (`xdk_d3d.h`)
 
