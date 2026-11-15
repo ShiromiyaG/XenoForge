@@ -27,7 +27,7 @@ void settings(Settings &out);
 struct AtomicCounters {
     std::atomic<uint64_t> frames_native{0}, frames_yielded{0}, frames_held{0};
     std::atomic<uint64_t> draws_skipped{0}, resolves_skipped{0}, draws_kept{0}, resolves_kept{0};
-    std::atomic<uint64_t> memexport_kept{0}, occlusion_faked{0};
+    std::atomic<uint64_t> memexport_kept{0}, occlusion_faked{0}, frames_shadowed{0};
 };
 AtomicCounters &atomic_counters();
 inline void bump(std::atomic<uint64_t> &n) { n.fetch_add(1, std::memory_order_relaxed); }

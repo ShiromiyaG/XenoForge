@@ -29,7 +29,9 @@
 // the first N shows): --shot-swaps 300,301,890-910, or --shot-every N. The
 // report adds the renderer's counts. --trace-frames 300,301 records those
 // frames as Xenia's GPU traces (gpu_trace_writer.h), numbered as the shots,
-// into --trace-dir (./traces by default); it renders.
+// into --trace-dir (./traces by default); it renders. --native-shadow: a
+// port draws every frame beside the emulated path (native_render.h's
+// set_shadow), the shots adding <title>_<swap>_emulated.png, the same frame.
 //
 // XAM's input answers from an idle pad for user 0 (a controller plugged in,
 // nothing pressed), so a game that waits for one goes on; --no-controller
@@ -44,7 +46,9 @@
 // fixed order on a virtual clock (docs/runtime.md, "The deterministic mode";
 // --paced keeps that clock behind the host's): the same disc and input give
 // the same run. --until-swap N or --until S (seconds of its clock) halts it
-// there, every thread parked, and the report adds a hash of guest memory.
+// there, every thread parked, and the report adds a hash of guest memory;
+// with either, the host's limit is an hour unless --seconds gives one (else
+// 30 s), and a run the host's limit ends first says so.
 // --spin-idle takes a long spin with nothing else ready for an idle wait (the
 // clock jumps to the next deadline): the generated code's benchmark, whose
 // report gives the scheduler's thread's processor time to the halt.
@@ -71,7 +75,8 @@
 //
 //   boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] [--content <dir>] [--interpret]
 //        [--cache <dir>] [--game-library <file>] [--project <file>] [--patches <dir> [--patch <name>[=off]]...]
-//        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]]
+//        [--render [--shots <dir> [--shot-swaps <list>] [--shot-every N]] [--native-shadow]]
+//        [--trace-frames <list> [--trace-dir <dir>]]
 //        [--no-controller] [--press <b@s>]... [--rates] [--stall-report S] [--crash-dir <dir>]
 //        [--deterministic [--paced] [--until-swap N] [--until S]] [--record-input <file>] [--replay-input <file>]
 //        [--hook-stats] [--reload-hooks-every S] [--profile N [--profile-from S] [--profile-thread <name>]]
@@ -80,6 +85,7 @@
 #include "sampler.h"
 #include "xenoforge/hooks.h"
 #include "xenoforge/lockstep.h"
+#include "xenoforge/native_render.h"
 #include "xenoforge/run.h"
 
 #include <algorithm>
@@ -109,7 +115,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     const char *usage = "usage: boot <game.iso | default.xex> [--xex <path>] [--steps N] [--seconds N] "
                         "[--content <dir>] [--interpret] [--cache <dir>] [--game-library <file>] [--project <file>] "
                         "[--patches <dir> [--patch <name>[=off]]...] [--render [--shots <dir> [--shot-swaps <list>] "
-                        "[--shot-every N]]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
+                        "[--shot-every N]] [--native-shadow]] [--trace-frames <list> [--trace-dir <dir>]] [--no-controller] "
                         "[--press <buttons@seconds[:hold]>]... [--rates] [--stall-report <seconds>] "
                         "[--crash-dir <dir>] [--lockstep <address,...>] [--lockstep-sample N] "
                         "[--deterministic [--paced] [--spin-idle] [--until-swap N] [--until S]] "
@@ -125,6 +131,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
     std::error_code ec;
     o.storage = std::filesystem::temp_directory_path(ec) / "xenoforge";
     uint32_t seconds = 30;
+    bool seconds_given = false;
     double stall_report = 0;
     bool rendering = false, controller = true, rates = false;
     std::vector<game::Press> presses;
@@ -145,7 +152,7 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         else if (a == "--steps" && k + 1 < argc)
             o.steps = std::strtoull(argv[++k], nullptr, 10);
         else if (a == "--seconds" && k + 1 < argc)
-            seconds = uint32_t(std::strtoul(argv[++k], nullptr, 10));
+            seconds = uint32_t(std::strtoul(argv[++k], nullptr, 10)), seconds_given = true;
         else if (a == "--content" && k + 1 < argc)
             o.storage = argv[++k];
         else if (a == "--directory-saves")
@@ -231,6 +238,8 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             follow_launches = true;
         else if (a == "--launch-data" && k + 1 < argc)
             launch_data_file = argv[++k];
+        else if (a == "--native-shadow")
+            xf::native::set_shadow(true);
         else if (a == "--hook-stats")
             hooks::set_stats(true);
         else if (a == "--reload-hooks-every" && k + 1 < argc)
@@ -246,6 +255,10 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             std::fprintf(stderr, "boot: %s ignored\n", a.c_str());
     }
     if (!shots.empty() && !rendering) return std::fprintf(stderr, "--shots needs --render\n"), 2;
+    // a halt asked for (--until-swap, --until) is where the run ends: the host's limit lifted to an hour
+    // unless --seconds sets one
+    const bool halt_asked = o.halt_swap || o.halt_seconds > 0;
+    if (halt_asked && !seconds_given) seconds = 3600;
 
     std::string error;
     game::Game g;
@@ -270,6 +283,14 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
             };
             options.on_frame = [dir = shots, prefix = std::string(title)](uint64_t swap, const render::Image &frame) {
                 std::filesystem::path path = dir / (prefix + "_" + std::to_string(swap) + ".png");
+                if (!stbi_write_png(path.string().c_str(), int(frame.width), int(frame.height), 4, frame.rgba.data(),
+                                    int(frame.width) * 4))
+                    std::fprintf(stderr, "could not write %s\n", path.string().c_str());
+            };
+            // (the shadow mode's emulated picture of the same frame)
+            options.on_emulated_frame = [dir = shots, prefix = std::string(title)](uint64_t swap,
+                                                                                   const render::Image &frame) {
+                std::filesystem::path path = dir / (prefix + "_" + std::to_string(swap) + "_emulated.png");
                 if (!stbi_write_png(path.string().c_str(), int(frame.width), int(frame.height), 4, frame.rgba.data(),
                                     int(frame.width) * 4))
                     std::fprintf(stderr, "could not write %s\n", path.string().c_str());
@@ -376,6 +397,10 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         std::printf("the main thread ended (exit code 0x%08X)\n", exit_code);
     else if (halted)
         std::printf("halted (the deterministic mode's --until-swap or --until)\n");
+    else if (halt_asked)
+        std::printf("still running after %u s of the host, before the --until-swap or --until halt (--seconds "
+                    "sets the host's limit)\n",
+                    seconds);
     else
         std::printf("still running after %u s\n", seconds);
     // a stop's report (the guest stack, the last kernel calls), written to a file

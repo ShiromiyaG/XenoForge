@@ -70,9 +70,11 @@ struct GuestFrontBuffer {
 
 // A guest texture as the renderer's texture cache holds it (Frame::texture):
 // its image in VK_IMAGE_LAYOUT_GENERAL, usable as a sampled image, and a view
-// of it as a 2D array (one layer for a 2D texture) with the fetch constant's
-// swizzle applied. Valid until the frame's work is done on the GPU: ask for
-// it again each frame.
+// of it with the fetch constant's swizzle applied: a 2D array (one layer for a
+// 2D texture; 1D and stacked textures too), a 3D view or a cube view, as
+// `kind` says (the translated shaders' image table: set 1's binding 0, 1 or
+// 2). Valid until the frame's work is done on the GPU: ask for it again each
+// frame.
 //
 // What a translated shader's sampling of it takes besides (native_shaders.h's
 // SystemConstants, per slot): its components' modes after the swizzle (signs:
@@ -82,7 +84,8 @@ struct GuestFrontBuffer {
 // version (signed_view, else null), which the slot's signed_slots names.
 struct TextureImage {
     VkImage image = VK_NULL_HANDLE;
-    VkImageView view = VK_NULL_HANDLE; // VK_IMAGE_VIEW_TYPE_2D_ARRAY
+    VkImageView view = VK_NULL_HANDLE; // VK_IMAGE_VIEW_TYPE_2D_ARRAY, _3D or _CUBE (kind)
+    uint32_t kind = 0;                 // 0 2D array, 1 3D, 2 cube
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0, levels = 1, layers = 1;
     uint32_t signs = 0, integer_scale = 0;
@@ -118,6 +121,10 @@ struct ResolveInfo {
     bool clear_color = false, clear_depth = false;
     uint32_t clear_color_value[2] = {};
     uint32_t clear_depth_value = 0;
+    // the targets those clears hit: RB_COLOR_INFO's of color_target and
+    // RB_DEPTH_INFO's EDRAM base (tiles) and format, at surface_pitch
+    uint32_t clear_color_base = 0, clear_color_format = 0;
+    uint32_t clear_depth_base = 0, clear_depth_format = 0;
 };
 
 // A render target of the port's own as a resolve's source (Frame::resolve):
@@ -151,6 +158,10 @@ class Frame {
     // device's uniform alignment at least). False when it does not fit (a
     // few MB at most).
     virtual bool upload(const void *data, size_t bytes, size_t alignment, VkBuffer &buffer, VkDeviceSize &offset) = 0;
+    // The same room, not copied into: the bytes to write (host-visible, the
+    // GPU reads them as upload's), null when it does not fit. For a block the
+    // port fills in part (a stage's constants: the ones its shader reads).
+    virtual void *allocate(size_t bytes, size_t alignment, VkBuffer &buffer, VkDeviceSize &offset) = 0;
     // Guest memory where it lies, for the GPU, without a copy of the port's:
     // the renderer's mirror of physical memory (one storage buffer of all of
     // it, the emulated path's shared memory), its pages under [address,
@@ -186,6 +197,13 @@ class Frame {
     // vertex shader whose fetches it fills in from the vertex declaration,
     // or patches for the pixel shader bound). False when none was met.
     virtual bool shader_words(uint64_t hash, std::vector<uint32_t> &words) = 0;
+    // The sampler the emulated path samples a texture with: the fetch
+    // constant's addressing, border and filters, with a shader's first
+    // fetch's filters over them (filters: mag, min, mip, 3 the constant's;
+    // anisotropy, 7 the constant's; null: the constant's own;
+    // ShaderUses::slot_filters), and the player's filtering settings. Valid
+    // until the frame's work is done on the GPU.
+    virtual VkSampler sampler(const uint32_t fetch[6], const uint8_t filters[4]) = 0;
 };
 
 struct OutputContext {
@@ -327,6 +345,18 @@ inline bool enabled() { return std::atomic_ref<bool>(enabled_flag()).load(std::m
 inline void set_enabled(bool on) { std::atomic_ref<bool>(enabled_flag()).store(on, std::memory_order_relaxed); }
 inline void toggle() { set_enabled(!enabled()); }
 
+// The shadow mode: the port draws every frame beside the emulated path,
+// for the same frame's two pictures. Nothing is skipped (the pass filter is
+// not asked); at each swap the emulated picture is read first (boot --shots:
+// <title>_<swap>_emulated.png, renderer Options::on_emulated_frame), then the
+// output renderer runs and its picture is the frame's (<title>_<swap>.png,
+// what the window shows). The port's resolves write guest memory after the
+// emulated path's: the next frame's emulated draws read the port's pictures
+// where a frame reads the one before's (temporal effects). Off by default;
+// boot --native-shadow turns it on.
+void set_shadow(bool on);
+bool shadow();
+
 // What it did so far, from any thread.
 struct Counters {
     uint64_t frames_native = 0;  // swaps the port drew
@@ -338,6 +368,7 @@ struct Counters {
     uint64_t draws_kept = 0, resolves_kept = 0; // the filter kept them while suppressing
     uint64_t memexport_kept = 0;                // draws exporting memory, never skipped
     uint64_t occlusion_faked = 0;               // reports answered with the fake count
+    uint64_t frames_shadowed = 0;               // swaps the port drew in the shadow mode (nothing skipped)
 };
 Counters counters();
 // whether the last swap showed the port's frame

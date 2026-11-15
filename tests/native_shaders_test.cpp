@@ -72,6 +72,20 @@ void cache_round_trip(const std::vector<uint32_t> &code, native::ShaderStage sta
         CHECK(&r != &t && r.hash == t.hash);
         CHECK(&first.get(code.data(), code.size(), stage, native::VertexForm::RectangleList) == &r);
     }
+    // a draw's other forms (ShaderVariant): each kept apart, the plain variant the plain form, and read back
+    // from the directory by a second cache under their own names
+    {
+        native::ShaderVariant v;
+        CHECK(&first.get(code.data(), code.size(), stage, v) == &t);
+        if (stage == native::ShaderStage::Vertex)
+            v.form = native::VertexForm::PointList, v.clip_planes = 2;
+        else
+            v.blend_premultiply = true, v.centroid = 0xFFFF;
+        const native::TranslatedShader &f = first.get(code.data(), code.size(), stage, v);
+        CHECK(&f != &t && f.hash == t.hash);
+        native::ShaderCache third(dir);
+        CHECK(same(third.get(code.data(), code.size(), stage, v), f) && third.stats().read == 1);
+    }
     // kept under the translator's version only
     CHECK(fs::is_directory(dir / native::translator_version()));
 }
@@ -110,7 +124,7 @@ int main() {
     // a corpus of real shaders, when given
     if (const char *corpus = std::getenv("XF_SHADERS"); corpus && *corpus) {
         const fs::path dir = scratch("xf_native_shaders_corpus");
-        size_t n = 0, with_constants = 0;
+        size_t n = 0, with_constants = 0, pixel_colors = 0;
         for (const auto &e : fs::directory_iterator(corpus)) {
             const std::string name = e.path().filename().string();
             const bool vert = name.ends_with(".ucode.bin.vert"), frag = name.ends_with(".ucode.bin.frag");
@@ -121,6 +135,9 @@ int main() {
             std::memcpy(code.data(), bytes.data(), code.size() * 4);
             const native::ShaderStage stage = vert ? native::ShaderStage::Vertex : native::ShaderStage::Pixel;
             cache_round_trip(code, stage, dir, true); // (the dumps' names are Xenia's hashes, not ours)
+            native::ShaderUses uses;
+            native::shader_uses(code.data(), code.size(), stage, uses);
+            if (frag) pixel_colors += uses.colors_written != 0;
             uint64_t used[4];
             native::used_float_constants(code.data(), code.size(), stage, used);
             if (used[0] | used[1] | used[2] | used[3]) with_constants++;
@@ -129,6 +146,7 @@ int main() {
         std::printf("native_shaders: %zu shaders of %s through the cache, %zu reading float constants\n", n, corpus,
                     with_constants);
         CHECK(with_constants > 0);
+        std::printf("native_shaders: %zu pixel shaders writing a color\n", pixel_colors);
     }
     return finish("native_shaders");
 }

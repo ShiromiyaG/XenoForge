@@ -504,6 +504,121 @@ and resolve of those frames skipped, the pictures as the emulated ones.
 The first port drew whole frames this way (its menus' and races' 3D, the
 post-processing, the 2D), the emulated path skipping every draw and resolve.
 
+### Drawing the guest's draws (`native_draw.h`)
+
+Everything between a captured draw and Vulkan that does not depend on the
+game, so a port writes only its capture. Written from the first port's own
+renderer (about 950 lines it no longer has), whose bugs all came from this
+part: an unbound image table (device lost), a texture's component modes, a
+format sharing an EDRAM place.
+
+- **`draw_setup(registers, primitive, vs_uses, ps_uses, device)`**: a draw's
+  registers (0x2000-0x23FF by register number) as the emulated path takes
+  them on its host render targets: the targets the pixel shader writes with
+  a channel on (RB_COLOR_MASK and the shader's oC#), the depth target it
+  tests or writes; the topology and how its indices become the host's
+  (`IndexForm`: quads as two triangles, line loops closed, quad strips and
+  polygons, rectangle and point lists expanded in the vertex shader, the
+  reset index where multi_prim_ib_ena cuts); the shaders' forms
+  (`ShaderVariant`: rectangle and point lists, user clip planes, centroids,
+  a point list's sprite coordinates, early depth and stencil, a minimum or
+  maximum blend's factors multiplied in by the pixel shader); culling,
+  polygon modes, depth clamp, depth and stencil (the back face's own only for
+  polygons), blending per target, stencil masks and references, blend
+  constants, line widths; the system constants (alpha test, alpha to
+  coverage, the position's formats, the pixel parameters, point sizes, the
+  clip planes packed); the texture slots and the filters each slot's first
+  fetch gives over its fetch constant's; a 64-bit pipeline key. `why` says
+  what it cannot draw; `approximate` what it does as Xenia does rather than
+  as the console. No GPU work: `tests/native_draw_test.cpp` checks it.
+- **`place_draw(setup, registers, width, height, depth_format)`**: the rest
+  once the targets are known: viewport, scissor, NDC, the targets' scales,
+  and the polygon offset in the depth format's own units (D24S8 in 2^-24
+  steps rounded up, D24FS8 kept halved in a float target, exact with
+  VK_EXT_depth_bias_control: `depth_bias_representation`).
+- **`convert_indices`**, **`clear_value`** (a clear's value in the host
+  format a port's target of a guest format holds: 7e3 as floats, 16-bit
+  fixed as snorm, D24FS8 halved).
+- **`ShaderUses`** says more: the colors a pixel shader writes, oDepth,
+  kill, memexport, and per texture slot the first fetch's filters.
+  **`ShaderCache::get(..., ShaderVariant)`** keeps each form apart
+  (`<hash>.vs.<key>.spv`); the bake makes the plain forms.
+- **`Frame::sampler(fetch, filters)`**: the emulated path's sampler for a
+  fetch constant with a shader's filter overrides (and the player's
+  filtering settings). **`Frame::texture`** takes 3D and cube textures too
+  (`TextureImage::kind` names the image table). **`ResolveInfo`** names the
+  targets its clears hit.
+- **The `Drawer`**: `begin(ctx)`, then `draw(DrawCall)`, `clear(ClearCall)`,
+  `resolve(ResolveInfo)` in the guest's order, `present(front buffer's
+  fetch)` and `end()` (or `cancel()` to leave the frame to the emulated
+  path). It keeps render targets by EDRAM place (base, pitch, format) in
+  `Frame::target_format`'s formats, made as tall as the scissors reach; a
+  resolve reads the one written last at its place, a 7e3 target read as
+  2_10_10_10 packed first, a 2x or 4x view of single-sampled tiles taken as
+  the console's downsample, then `Frame::resolve` and the resolve's own
+  clears; a clear of any of the four color targets and depth or stencil.
+  Set 1's image tables have the stand-ins at 0 (the translated shaders read
+  each table's 0 for the kinds a slot is not; unbound, the device is lost).
+  `present_target(base, pitch, format)` shows one of its targets instead (a
+  target viewer); `targets()` lists them.
+
+The Drawer's per-draw cost: set 0 is written once a frame and bound with
+dynamic offsets (copied vertices are addressed by their place in the frame's
+arena, so binding 1 is the arena or guest memory's mirror, whole); each
+stage's constants are uploaded only when the floats it reads, its bools,
+loops or fetch constants differ from its last upload; the system constants
+likewise; set 1 is reused while a draw's textures and samplers are the last
+draw's; pipelines are found by a 64-bit key and made through a
+VkPipelineCache kept beside the shaders (`pipelines.bin`); bindings and
+dynamic state are set only when they change; one dynamic rendering covers
+each run of draws and clears with the same attachments.
+
+Not done by it (counted in `stats().approximate`, or refused with a why):
+multisampled targets (refused), memory export from a port's draws, a
+resolution scale, pipelines made off the renderer's thread.
+
+Measured on the first port's recorded race (2,640 frames, headless,
+deterministic): the renderer's thread 34.7 s with the port's own renderer,
+10.5 s with the Drawer (the emulated path alone: 5.1 s); the whole run
+126.4 s, 88.8 s with the Drawer and the device read in blocks
+(`xdk_d3d.h`), against 75.9 s emulated. Its frames are the old renderer's
+(the opening's identical, the menus within 0.4 of 255).
+
+### The same frame, both ways: the shadow mode
+
+A replay of a recorded run drifts from one run to the next (the GPU is not
+on the deterministic scheduler), so a port's picture and the emulated one of
+the "same" swap from two runs are not the same frame. `native::set_shadow`
+(boot `--native-shadow`) draws every frame both ways in one run: nothing is
+skipped, the emulated picture is read at the swap before the port draws the
+frame, and boot's `--shots` write both, `<title>_<swap>.png` (the port's)
+and `<title>_<swap>_emulated.png`, for `xfcompare`. The port's resolves
+write guest memory after the emulated path's, so where a frame reads the
+frame before's resolves (temporal effects) the emulated picture reads the
+port's.
+
+Finding the draw a difference comes from: `XF_DRAWER_LOG=<swap>` lists that
+frame's draws as the Drawer got them, numbered from 0 (shaders, primitive,
+targets with their formats, blend, depth and stencil control, scissor,
+polygon offset); `XF_DRAWER_SKIP=<swap>:<first>-<last>` leaves those draws
+out; `Drawer::present_target` shows one of the port's targets instead of the
+front buffer.
+
+### The XDK's Direct3D (`xdk_d3d.h`)
+
+What a port capturing a game's D3D reads at a draw is the same for every
+title built with one XDK: `d3d_layout(build)` gives the `D3DDevice`'s
+layout for the D3D library's build (`xfinspect` lists it among the XDK
+libraries; known: 2.0.21250.0), and a `D3DReader` reads the bound shader
+objects (the microcode, its hash and uses, the depth-only variant a vertex
+shader runs with no pixel shader bound; kept per object), the float
+constants with the shaders' literal constants laid over (the D3D loads those
+with the shader, never through the shadow), the fetch constants as the GPU
+gets them, the render state blocks the shadow holds, the bound index buffer
+and a clear's area, each block in one copy. The header lists the arguments
+of the D3D calls a port hooks (draws, the UP draws' `Begin`s, `ClearF`).
+The functions' addresses are each title's: the port's.
+
 Still to come: notification of CPU writes to guest memory ranges a port
 registers, and a port's resolves kept as images (not through guest memory)
 where nothing on the CPU reads them.

@@ -64,6 +64,7 @@ add_library(xenoforge STATIC
     src/spirv.cpp
     src/shader_translator.cpp
     src/native_shaders.cpp
+    src/xdk_d3d.cpp
     src/shader_program.cpp
     src/shader_interpreter.cpp
     src/shader_container.cpp
@@ -252,7 +253,12 @@ xf_shader(generic_fsi_sample_depth.frag generic.frag -DFSI=2 -DWRITES_DEPTH)
 xf_shader(generic_fsi_sample_points.frag generic.frag -DFSI=2 -DPOINT_COORDINATES)
 xf_shader(generic_fsi_sample_points_depth.frag generic.frag -DFSI=2 -DPOINT_COORDINATES -DWRITES_DEPTH)
 xf_shader(generic.comp generic.comp) # shader_compare_test's
-add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/index_convert.cpp src/native_render.cpp src/replay.cpp src/shader_step.cpp ${XF_SHADER_WORDS})
+# the Drawer's passes (native_draw.h): present, 7e3 packing, a multisampled view's downsample
+xf_shader(native_fullscreen.vert native_fullscreen.vert)
+xf_shader(native_present.frag native_present.frag)
+xf_shader(native_pack7e3.frag native_pack7e3.frag)
+xf_shader(native_downsample.frag native_downsample.frag)
+add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/index_convert.cpp src/native_render.cpp src/native_draw.cpp src/replay.cpp src/shader_step.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SPIRV_DIR})
 target_link_libraries(xenoforge_vk PUBLIC xenoforge xf_volk)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -661,6 +667,10 @@ foreach(name aes disc xex lzx sha1 snappy ucode ucode_parse trace shader_interpr
     target_link_libraries(${name}_test PRIVATE xenoforge)
     add_test(NAME ${name} COMMAND ${name}_test)
 endforeach()
+# a port's draw setup from registers (native_draw.h): no GPU, the renderer's conversions
+add_executable(native_draw_test tests/native_draw_test.cpp)
+target_link_libraries(native_draw_test PRIVATE xenoforge_vk xenoforge)
+add_test(NAME native_draw COMMAND native_draw_test)
 # the command processor test reaches the deferred sink (src/gpu/deferred_sink.h)
 target_include_directories(command_processor_test PRIVATE src)
 # xfcompat's rows, files and the parser of boot's output, on canned output

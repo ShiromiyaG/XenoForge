@@ -51,6 +51,7 @@
 
 #include "xenoforge/guest_memory.h"
 #include "xenoforge/memory.h"
+#include "xenoforge/native_draw.h"
 #include "xenoforge/native_shaders.h"
 #include "xenoforge/render_scale.h"
 #include "xenoforge/resolve.h"
@@ -1046,6 +1047,7 @@ struct FrontRead {
     std::array<uint32_t, 256> gamma{};
     std::array<uint32_t, 128 * 3> pwl{};
     uint32_t luta_control = 0; // DC_LUTA_CONTROL at the swap
+    bool emulated = false;     // a shadow mode's emulated picture (Options::on_emulated_frame)
 };
 
 // The attachments of the render pass under way.
@@ -1924,7 +1926,7 @@ private:
     void swap();
     Texture *front_texture(texture::Info &info);
     void read_native_output(uint64_t number);
-    void read_front_buffer(uint64_t number, Texture &t, const texture::Info &info);
+    void read_front_buffer(uint64_t number, Texture &t, const texture::Info &info, bool emulated = false);
     void deliver(const FrontRead &read);
     void skip(const std::string &reason) {
         report_.skipped[reason]++;
@@ -12239,7 +12241,7 @@ void Impl::draw(const gpu::Draw &d) {
 
 // ---- resolves ----
 
-native::ResolveInfo native_resolve_info(const resolve::Info &i);
+native::ResolveInfo native_resolve_info(const resolve::Info &i, const uint32_t *regs);
 
 void Impl::resolve() {
     report_.resolves++;
@@ -12254,7 +12256,7 @@ void Impl::resolve() {
         pass.copy_dest = regs_[reg::RB_COPY_DEST_BASE];
         native::ResolveInfo described;
         if (read) {
-            described = native_resolve_info(info);
+            described = native_resolve_info(info, regs_);
             pass.resolve_info = &described;
         }
         native_pass(pass);
@@ -13439,8 +13441,12 @@ void Impl::next_readback_frame() {
 // renderer") ----
 
 // A resolve's description for a port (native_render.h's ResolveInfo), and back
-native::ResolveInfo native_resolve_info(const resolve::Info &i) {
+native::ResolveInfo native_resolve_info(const resolve::Info &i, const uint32_t *regs) {
     native::ResolveInfo o;
+    // (the targets Impl::resolve's clears hit)
+    const uint32_t color_info = regs[r::COLOR_INFO[i.color_target & 3]], depth_info = regs[reg::RB_DEPTH_INFO];
+    o.clear_color_base = color_info & 0xFFF, o.clear_color_format = (color_info >> 16) & 0xF;
+    o.clear_depth_base = depth_info & 0xFFF, o.clear_depth_format = (depth_info >> 16) & 1;
     o.depth = i.depth, o.color_target = i.color_target, o.edram_base = i.edram_base;
     o.surface_pitch = i.surface_pitch, o.msaa = i.msaa, o.sample_select = i.sample_select;
     o.source_format = i.source_format, o.x = i.x, o.y = i.y, o.width = i.width, o.height = i.height;
@@ -13490,8 +13496,8 @@ public:
     }
     bool texture(const uint32_t fetch[6], native::TextureImage &out, std::string &why) override {
         const texture::Info info = texture::parse_fetch_constant(fetch);
-        if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture || info.dimension != 1 || !info.base_address)
-            return why = "not a 2D texture's fetch constant", false;
+        if (FetchConstantType(fetch[0] & 3) != FetchConstantType::Texture || !info.base_address)
+            return why = "not a texture's fetch constant", false;
         Texture *t = r_.texture(fetch, why);
         if (!t || !r_.fatal_.empty()) return false;
         const uint32_t index = r_.texture_view(*t, info.swizzle, false, why);
@@ -13501,7 +13507,7 @@ public:
         for (const TextureView &v : t->views)
             if (v.key == key) out.view = v.view;
         if (!out.view) return why = "no view of the texture", false;
-        out.image = t->image.image, out.format = t->image.format;
+        out.image = t->image.image, out.format = t->image.format, out.kind = t->kind;
         out.width = t->image.extent.width, out.height = t->image.extent.height;
         out.levels = t->image.levels, out.layers = t->image.layers;
         // (Impl::draw's: the components' modes, the integer scales, the signed view)
@@ -13525,6 +13531,14 @@ public:
         std::memcpy(r_.arena_data(at), data, bytes);
         buffer = r_.arena_.buffer, offset = at;
         return true;
+    }
+    void *allocate(size_t bytes, size_t alignment, VkBuffer &buffer, VkDeviceSize &offset) override {
+        const VkDeviceSize align = std::max<VkDeviceSize>({VkDeviceSize(alignment), r_.ubo_align_, 16});
+        if (bytes == 0 || bytes + align > ARENA_SLOT || !r_.fatal_.empty()) return nullptr;
+        const VkDeviceSize at = r_.arena(bytes, align);
+        if (at == NONE) return nullptr;
+        buffer = r_.arena_.buffer, offset = at;
+        return r_.arena_data(at);
     }
     VkFormat target_format(bool depth, uint32_t format) override {
         if (depth) return r_.depth_vk_format(format & 1);
@@ -13561,6 +13575,13 @@ public:
         r_.gpu_resolve(clipped, t, true);
         if (!r_.fatal_.empty()) return why = r_.fatal_, false;
         return true;
+    }
+    VkSampler sampler(const uint32_t fetch[6], const uint8_t filters[4]) override {
+        std::array<uint32_t, 4> overrides = {3, 3, 3, 7};
+        if (filters)
+            for (int k = 0; k < 4; k++) overrides[k] = filters[k];
+        r_.sampler(fetch, overrides);
+        return r_.last_sampler_ ? r_.last_sampler_->sampler : r_.dummy_sampler_;
     }
     bool shader_words(uint64_t hash, std::vector<uint32_t> &words) override {
         const Shader *s = r_.shader(hash);
@@ -13678,7 +13699,10 @@ bool Impl::native_frame(uint64_t number, bool &held) {
         held = was_suppressed;
         if (held) native::detail::bump(counts.frames_held);
     }
-    native_suppress_ = drew;
+    // (the shadow mode skips nothing: the emulated path draws every frame too)
+    const bool shadowing = drew && native::shadow();
+    if (shadowing) native::detail::bump(counts.frames_shadowed);
+    native_suppress_ = drew && !shadowing;
     native::detail::set_active(drew);
     return drew;
 }
@@ -13786,6 +13810,11 @@ void Impl::swap() {
     // the port's frame (native_render.h), shown in the emulated one's place;
     // held: neither is shown (the port's last stays in the window)
     bool held = false;
+    // (the shadow mode: the emulated picture read before the port draws the same frame)
+    if (read && native::shadow() && native::enabled() && native::has_output_renderer()) {
+        texture::Info emulated_info;
+        if (Texture *e = front_texture(emulated_info)) read_front_buffer(number, *e, emulated_info, true);
+    }
     const bool native = native_frame(number, held);
     texture::Info info;
     // (a frame the port drew is read from its output image: what the window shows)
@@ -13885,9 +13914,9 @@ void Impl::read_native_output(uint64_t number) {
     front_reads_.push_back(std::move(read));
 }
 
-void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &info) {
+void Impl::read_front_buffer(uint64_t number, Texture &t, const texture::Info &info, bool emulated) {
     FrontRead read;
-    read.number = number;
+    read.number = number, read.emulated = emulated;
     read.host = t.host;
     read.width = t.image.extent.width, read.height = t.image.extent.height;
     read.swizzle = texture::compose_swizzle(info.swizzle, t.host_swizzle), read.format = info.format;
@@ -13970,6 +13999,10 @@ void Impl::deliver(const FrontRead &read) {
                     ten_bits ? uint8_t(float(ten) * (255.0f / 1023.0f) + 0.5f) : uint8_t((ten * 255 + 511) / 1023);
             }
         }
+    }
+    if (read.emulated) {
+        if (options_.on_emulated_frame) options_.on_emulated_frame(read.number, frame);
+        return;
     }
     report_.frames++;
     if (options_.on_frame) options_.on_frame(read.number, frame);
@@ -14089,6 +14122,419 @@ void target_constants(const uint32_t *registers, uint32_t colors_written, System
     const uint32_t depth_control = registers[xenos::reg::RB_DEPTHCONTROL];
     const bool depth_float24 = (depth_control & 3) && ((registers[xenos::reg::RB_DEPTH_INFO] >> 16) & 1);
     sys.flags[3] = (sys.flags[3] & ~1u) | (depth_float24 ? 1u : 0u);
+}
+
+} // namespace xf::native
+
+// ---- a draw's registers as Vulkan's state, for a port (native_draw.h) ----
+//
+// Impl::draw's choices on the host render target path, taken from the
+// registers alone: what the emulated path does with the same draw state, so
+// a port drawing the guest's draws itself gets the same picture.
+
+namespace xf::native {
+
+namespace {
+using render::r::COLOR_INFO;
+namespace rr = render::r;
+
+void add(DrawSetup &s, const char *what) {
+    for (const char *a : s.approximate)
+        if (a == what) return;
+    s.approximate.push_back(what);
+}
+
+uint64_t mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001B3ull + (v >> 29); }
+} // namespace
+
+DrawSetup draw_setup(const uint32_t *regs, uint32_t primitive, const ShaderUses &vs, const ShaderUses *ps,
+                     const vk::Device *device) {
+    DrawSetup s;
+    s.primitive = primitive;
+    const uint32_t mode = regs[xenos::reg::RB_MODECONTROL] & 7;
+    if (mode != 4 && mode != 5) return s.why = "EDRAM mode " + std::to_string(mode), s;
+    const bool color = mode == 4; // (5: depth only)
+    if (!color) ps = nullptr;
+    const uint32_t surface = regs[xenos::reg::RB_SURFACE_INFO];
+    s.pitch = surface & 0x3FFF, s.msaa = (surface >> 16) & 3;
+    if (!s.pitch) return s.why = "surface pitch 0", s;
+    if (s.msaa == 3) return s.why = "MSAA mode 3", s;
+    s.samples = s.msaa == 0 ? VK_SAMPLE_COUNT_1_BIT : s.msaa == 1 ? VK_SAMPLE_COUNT_2_BIT : VK_SAMPLE_COUNT_4_BIT;
+
+    // the primitive (Impl::draw's topology switch)
+    const bool rectangles = primitive == 8, points = primitive == 1;
+    const bool polygonal = (primitive >= 4 && primitive <= 7) || (primitive >= 13 && primitive <= 15);
+    switch (primitive) {
+    case 1: s.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, s.indices = IndexForm::Points; break;
+    case 2: s.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+    case 3: s.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
+    case 4: s.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+    case 5: s.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+    case 6: s.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+    case 8: s.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, s.indices = IndexForm::Rectangles; break;
+    case 12: s.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, s.indices = IndexForm::Primitives; break;
+    case 13: s.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, s.indices = IndexForm::Quads; break;
+    case 14: s.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, s.indices = IndexForm::Primitives; break;
+    case 15: s.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN, s.indices = IndexForm::Primitives; break;
+    default: return s.why = "primitive type " + std::to_string(primitive), s;
+    }
+    // the types the reset index cuts (Impl::draw's strip), and the expanded forms' own restarts
+    const bool strip = primitive == 3 || primitive == 5 || primitive == 6 || primitive == 12 || primitive == 14 ||
+                       primitive == 15;
+    s.reset = strip && ((regs[rr::PA_SU_SC_MODE_CNTL] >> 21) & 1);
+    s.restart = s.reset || points || rectangles || s.indices == IndexForm::Primitives;
+    s.reset_index = regs[rr::VGT_MULTI_PRIM_IB_RESET_INDX];
+    if (rectangles) s.vertex.form = VertexForm::RectangleList;
+    if (points) s.vertex.form = VertexForm::PointList;
+
+    // the targets: the colors the pixel shader writes with a channel enabled, the depth tested or written
+    const uint32_t mask = regs[xenos::reg::RB_COLOR_MASK];
+    uint32_t colors_written = 0;
+    if (ps)
+        for (uint32_t i = 0; i < 4; i++) {
+            const uint32_t m = (mask >> (4 * i)) & 0xF;
+            if (!m || !(ps->colors_written & (1u << i))) continue;
+            const uint32_t info = regs[COLOR_INFO[i]];
+            s.color[i] = {true, info & 0xFFF, (info >> 16) & 0xF};
+            s.blend[i].colorWriteMask = m;
+            colors_written |= 1u << i;
+            if (s.color[i].format == 1) add(s, "8_8_8_8_GAMMA color targets blended in gamma (no RGBA16 unorm attachments)");
+        }
+    const uint32_t dc = regs[xenos::reg::RB_DEPTHCONTROL];
+    if (dc & 3) {
+        const uint32_t info = regs[xenos::reg::RB_DEPTH_INFO];
+        s.depth = {true, info & 0xFFF, (info >> 16) & 1};
+        if (s.depth.format == 1) add(s, "D24FS8 depth as 32-bit float");
+    }
+    s.pixel_shader = ps != nullptr;
+    if (!colors_written && !s.depth.used) {
+        s.empty = true; // (nothing it could change; a memory export alone is not done here)
+        if (vs.exports || (ps && ps->exports)) add(s, "memory export in a draw that writes no target (not done)");
+        return s;
+    }
+    if (vs.exports || (ps && ps->exports)) add(s, "memory export (not done by the port's draws)");
+
+    // the rasterizer (polygon modes, culling, the front face, depth clamp)
+    const uint32_t sc_mode = regs[rr::PA_SU_SC_MODE_CNTL];
+    if (primitive >= 4 && !rectangles && ((sc_mode >> 3) & 3) == 1) {
+        uint32_t type = 2;
+        if (!(sc_mode & 1)) type = std::min(type, (sc_mode >> 5) & 7);
+        if (!(sc_mode & 2)) type = std::min(type, (sc_mode >> 8) & 7);
+        if (type < 2) {
+            if (!device || device->fill_mode_non_solid())
+                s.polygon_mode = type == 0 ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_LINE;
+            else
+                add(s, "polygon modes other than fill (the device has no fillModeNonSolid)");
+        }
+    }
+    if (primitive >= 4 && !rectangles) {
+        s.cull = (sc_mode & 1 ? VK_CULL_MODE_FRONT_BIT : 0) | (sc_mode & 2 ? VK_CULL_MODE_BACK_BIT : 0);
+        s.front_face = sc_mode & 4 ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    }
+    s.depth_clamp = (regs[rr::PA_CL_CLIP_CNTL] >> 16) & 1;
+    // the user clip planes (while clipping is on), packed
+    const uint32_t clip_cntl = regs[rr::PA_CL_CLIP_CNTL];
+    const uint32_t ucp = (clip_cntl >> 16) & 1 ? 0u : clip_cntl & 0x3F;
+    if (ucp) {
+        s.vertex.clip_planes = uint8_t(std::popcount(ucp));
+        s.vertex.clip_planes_cull = (clip_cntl >> 17) & 1;
+        if (points) s.vertex.point_ucp_mode = uint8_t((clip_cntl >> 14) & 3);
+        const bool cull = s.vertex.clip_planes_cull || (points && s.vertex.point_ucp_mode == 2);
+        const bool clip = !s.vertex.clip_planes_cull;
+        if (device && ((cull && !device->cull_distance()) || (clip && !device->clip_distance())))
+            return s.why = "user clip planes without clip or cull distances on the device", s;
+        for (uint32_t plane = 0, k = 0; plane < 6; plane++)
+            if (ucp & (1u << plane)) std::memcpy(s.system.clip_planes[k++], &regs[rr::PA_CL_UCP_0_X + plane * 4], 16);
+    }
+
+    // depth and stencil (Impl::draw's, the back face's own only for polygons)
+    if (s.depth.used) {
+        s.depth_test = (dc >> 1) & 1, s.depth_write = (dc >> 2) & 1;
+        s.depth_compare = render::compare_op(dc >> 4);
+        s.stencil_test = dc & 1;
+        auto face = [&](uint32_t shift) {
+            VkStencilOpState f{};
+            f.compareOp = render::compare_op(dc >> shift);
+            f.failOp = render::stencil_op(dc >> (shift + 3));
+            f.passOp = render::stencil_op(dc >> (shift + 6));
+            f.depthFailOp = render::stencil_op(dc >> (shift + 9));
+            return f;
+        };
+        s.stencil_front = face(8);
+        const bool back = polygonal && ((dc >> 7) & 1);
+        s.stencil_back = back ? face(20) : s.stencil_front;
+        const uint32_t ref = regs[rr::RB_STENCILREFMASK], ref_bf = back ? regs[rr::RB_STENCILREFMASK_BF] : ref;
+        for (int f = 0; f < 2; f++) {
+            const uint32_t w = f ? ref_bf : ref;
+            s.stencil_reference[f] = w & 0xFF, s.stencil_compare_mask[f] = (w >> 8) & 0xFF;
+            s.stencil_write_mask[f] = (w >> 16) & 0xFF;
+        }
+    }
+
+    // blending, with the console's factors on a minimum or maximum multiplied in by the pixel shader
+    // where the host can (render::host_blend_control)
+    bool premultiplied = false;
+    for (uint32_t i = 0; i < 4; i++) {
+        if (!s.color[i].used) continue;
+        bool ignored = false;
+        uint32_t premultiply = 0;
+        const uint32_t blend =
+            render::host_blend_control(regs[rr::RB_BLENDCONTROL[i]], s.color[i].format, ps != nullptr, premultiply, ignored);
+        if (ignored) add(s, "minimum and maximum blending with factors (the host ignores them)");
+        if (premultiply) premultiplied = true, s.system.blend_premultiply[i] = premultiply;
+        VkPipelineColorBlendAttachmentState &b = s.blend[i];
+        b.srcColorBlendFactor = render::blend_factor(blend & 0x1F);
+        b.colorBlendOp = render::blend_op((blend >> 5) & 7);
+        b.dstColorBlendFactor = render::blend_factor((blend >> 8) & 0x1F);
+        b.srcAlphaBlendFactor = render::blend_factor((blend >> 16) & 0x1F);
+        b.alphaBlendOp = render::blend_op((blend >> 21) & 7);
+        b.dstAlphaBlendFactor = render::blend_factor((blend >> 24) & 0x1F);
+        b.blendEnable = (blend & 0x1FFF1FFF) != 0x00010001; // not ONE, ADD, ZERO for both
+        auto by_alpha = [](VkBlendFactor f) {
+            return f == VK_BLEND_FACTOR_SRC_ALPHA || f == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        };
+        if (s.color[i].format == 5 && b.blendEnable &&
+            (by_alpha(b.srcColorBlendFactor) || by_alpha(b.dstColorBlendFactor) || by_alpha(b.srcAlphaBlendFactor) ||
+             by_alpha(b.dstAlphaBlendFactor)))
+            add(s, "a 16_16_16_16 target blended by the source's alpha (scaled with the target's range)");
+    }
+    std::memcpy(s.blend_constants, &regs[rr::RB_BLEND_RED], 16);
+    if (premultiplied) {
+        s.pixel.blend_premultiply = true;
+        std::memcpy(s.system.blend_constant, &regs[rr::RB_BLEND_RED], 16);
+    }
+
+    // the pixel shader's other forms: centroids under MSAA, a point list's sprite coordinates, early depth
+    if (ps && s.msaa) {
+        const uint32_t sample_control = (regs[rr::SQ_CONTEXT_MISC] >> 2) & 3;
+        if (sample_control == 0)
+            s.pixel.centroid = 0xFFFF;
+        else if (sample_control == 2)
+            s.pixel.centroid = uint16_t(~(regs[rr::SQ_INTERPOLATOR_CNTL] >> 16) & 0xFFFF);
+    }
+    const uint32_t param_position = (regs[rr::SQ_CONTEXT_MISC] >> 8) & 0xFF;
+    const bool param_gen = ps && ((regs[xenos::reg::SQ_PROGRAM_CNTL] >> 18) & 1) && param_position < 16;
+    s.pixel.point_coordinates = param_gen && points;
+    const uint32_t color_control = regs[rr::RB_COLORCONTROL];
+    s.pixel.early_depth_stencil = ps && !ps->kills && !ps->writes_depth && !ps->exports &&
+                                  (!(ps->colors_written & 1) ||
+                                   !(((color_control & 8) && (color_control & 7) != 7) || (color_control & 16)));
+
+    // the system constants the registers give (Impl::draw's)
+    SystemConstants &sys = s.system;
+    if (color_control & 8) sys.flags[0] = 8 | (color_control & 7);
+    if (color_control & 16) sys.flags[0] |= (color_control >> 24) << 8 | 1u << 16; // alpha to coverage
+    std::memcpy(&sys.values[0], &regs[rr::RB_ALPHA_REF], 4);
+    sys.values[3] = 1.0f; // the host pixel's size in console pixels (no resolution scale)
+    const uint32_t vte = regs[rr::PA_CL_VTE_CNTL];
+    sys.flags[1] = ((vte >> 10) & 1) | ((vte >> 8) & 1) << 1 | ((vte >> 9) & 1) << 2;
+    if (param_gen) {
+        sys.flags[1] |= 1u << 8 | param_position << 9;
+        if (points)
+            sys.flags[1] |= 1u << 13;
+        else if (polygonal)
+            sys.flags[1] |= 1u << 15;
+        else if (primitive == 2 || primitive == 3 || primitive == 12)
+            sys.flags[1] |= 1u << 14;
+    }
+    sys.flags[3] = uint32_t(s.msaa) << 1; // (bit 0, D24FS8 halved: place_draw)
+    if (points) {
+        const uint32_t minmax = regs[rr::PA_SU_POINT_MINMAX], point_size = regs[rr::PA_SU_POINT_SIZE];
+        sys.values[1] = float(minmax & 0xFFFF) * (2.0f / 16.0f);
+        sys.values[2] = float(minmax >> 16) * (2.0f / 16.0f);
+        sys.point[0] = float(point_size >> 16) * (2.0f / 16.0f);
+        sys.point[1] = float(point_size & 0xFFFF) * (2.0f / 16.0f);
+    }
+
+    // lines' width (PA_SU_LINE_CNTL: half the width in 12.4), within the device's range
+    if (s.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || s.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) {
+        const float guest = float(regs[rr::PA_SU_LINE_CNTL] & 0xFFFF) * (1.0f / 8.0f);
+        s.line_width = !device ? guest : device->wide_lines() ? std::clamp(guest, device->min_line_width(), device->max_line_width()) : 1.0f;
+        if (s.line_width != guest) add(s, "line widths the device does not draw");
+    }
+    // the polygon offset the draw takes (Impl::draw's: the front's for polygons unless culled, else the back's)
+    const float *offsets = reinterpret_cast<const float *>(&regs[rr::PA_SU_POLY_OFFSET_FRONT_SCALE]);
+    if (polygonal) {
+        if ((sc_mode >> 11) & 1 && !(sc_mode & 1)) s.poly_offset[0] = offsets[0], s.poly_offset[1] = offsets[1];
+        if ((sc_mode >> 12) & 1 && !(sc_mode & 2) && s.poly_offset[0] == 0.0f && s.poly_offset[1] == 0.0f)
+            s.poly_offset[0] = offsets[2], s.poly_offset[1] = offsets[3];
+    } else if ((sc_mode >> 13) & 1) {
+        s.poly_offset[0] = offsets[0], s.poly_offset[1] = offsets[1];
+    }
+
+    // the textures, with the first fetch's filters (the vertex shader's first)
+    s.texture_slots = vs.texture_slots | (ps ? ps->texture_slots : 0);
+    for (uint32_t slot = 0; slot < 32; slot++) {
+        s.slot_filters[slot][0] = s.slot_filters[slot][1] = s.slot_filters[slot][2] = 3;
+        s.slot_filters[slot][3] = 7;
+        for (const ShaderUses *u : {&vs, ps})
+            if (u && ((u->filter_slots >> slot) & 1)) {
+                std::memcpy(s.slot_filters[slot], u->slot_filters[slot], 4);
+                break;
+            }
+    }
+
+    // the pipeline's key: the state above a pipeline is made from
+    uint64_t h = 0xCBF29CE484222325ull;
+    h = mix(h, uint64_t(s.topology) | uint64_t(s.vertex.vertex_key()) << 8 | uint64_t(s.pixel.pixel_key()) << 32);
+    h = mix(h, uint64_t(s.polygon_mode) | uint64_t(s.cull) << 4 | uint64_t(s.front_face) << 8 |
+                   uint64_t(s.depth_clamp) << 12 | uint64_t(s.samples) << 16 | uint64_t(s.pixel_shader) << 24 |
+                   uint64_t(s.depth.used) << 25);
+    h = mix(h, uint64_t(s.depth_test) | uint64_t(s.depth_write) << 1 | uint64_t(s.stencil_test) << 2 |
+                   uint64_t(s.depth_compare) << 4 | uint64_t(dc & 0xFFFFFF00u) << 8);
+    for (uint32_t i = 0; i < 4; i++) {
+        const VkPipelineColorBlendAttachmentState &b = s.blend[i];
+        h = mix(h, uint64_t(s.color[i].used) | uint64_t(b.colorWriteMask) << 1 | uint64_t(b.blendEnable) << 5 |
+                       uint64_t(b.srcColorBlendFactor) << 8 | uint64_t(b.dstColorBlendFactor) << 16 |
+                       uint64_t(b.colorBlendOp) << 24 | uint64_t(b.srcAlphaBlendFactor) << 32 |
+                       uint64_t(b.dstAlphaBlendFactor) << 40 | uint64_t(b.alphaBlendOp) << 48);
+    }
+    s.pipeline_key = h;
+    return s;
+}
+
+void place_draw(DrawSetup &s, const uint32_t *regs, uint32_t width, uint32_t height, VkFormat depth_format,
+                const vk::Device *device) {
+    const bool float24 = s.depth.used && s.depth.format == 1 && (s.depth_test || s.depth_write || s.stencil_test);
+    const render::Viewport v = render::host_viewport(regs, float(width), float(height), false, float24, false);
+    s.viewport = v.viewport;
+    for (int i = 0; i < 3; i++) s.system.ndc_scale[i] = v.ndc_scale[i], s.system.ndc_offset[i] = v.ndc_offset[i];
+    s.system.ndc_scale[3] = 1.0f;
+    s.scissor = render::host_scissor(regs, s.pitch);
+    s.scissor.extent.width = std::min(s.scissor.extent.width, width - std::min(width, uint32_t(s.scissor.offset.x)));
+    s.scissor.extent.height =
+        std::min(s.scissor.extent.height, height - std::min(height, uint32_t(s.scissor.offset.y)));
+    if (v.empty || !s.scissor.extent.width || !s.scissor.extent.height) s.empty = true;
+    if (s.vertex.form == VertexForm::PointList) {
+        s.system.point[2] = 1.0f / float(std::max(uint32_t(v.viewport.width), 1u));
+        s.system.point[3] = 1.0f / float(std::max(uint32_t(v.viewport.height), 1u));
+    }
+    uint32_t colors_written = 0;
+    for (uint32_t i = 0; i < 4; i++) colors_written |= s.color[i].used ? 1u << i : 0u;
+    target_constants(regs, colors_written, s.system); // (the scales, gamma and 7e3 flags, D24FS8)
+    // the polygon offset in the depth format's units (Impl::draw's, at scale 1)
+    const float scale = s.poly_offset[0], offset = s.poly_offset[1];
+    const bool f24 = s.depth.used && s.depth.format == 1;
+    const bool host_float = depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT || depth_format == VK_FORMAT_D32_SFLOAT;
+    const bool exact = !device || device->depth_bias_control();
+    float constant = 0.0f;
+    if (offset != 0.0f) {
+        if (host_float && exact)
+            constant = offset * (f24 ? float(1u << 24) * 0.5f : float((1u << 24) - 1));
+        else if (f24)
+            constant = std::copysign(std::ceil(std::fabs(offset) * float(1u << 21)) * 8.0f, offset);
+        else
+            constant = std::copysign(std::ceil(std::fabs(offset) * float((1u << 24) - 1)), offset);
+        if (!exact) add(s, "polygon offsets in the device's depth units (no VK_EXT_depth_bias_control)");
+    }
+    s.depth_bias_constant = constant, s.depth_bias_slope = scale / 16.0f;
+    s.depth_bias_representation = !exact ? 0 : host_float ? 2 : 1;
+}
+
+void convert_indices(const DrawSetup &s, const uint32_t *guest, uint32_t count, uint32_t first,
+                     std::vector<uint32_t> &out) {
+    out.clear();
+    auto at = [&](uint32_t k) -> uint32_t {
+        if (!guest) return first + k;
+        const uint32_t v = guest[k];
+        return s.reset && v == s.reset_index ? UINT32_MAX : v;
+    };
+    switch (s.indices) {
+    case IndexForm::AsGiven:
+        out.resize(count);
+        for (uint32_t k = 0; k < count; k++) out[k] = at(k);
+        break;
+    case IndexForm::Quads:
+        out.reserve(count / 4 * 6);
+        for (uint32_t q = 0; q + 3 < count; q += 4) {
+            const uint32_t a = at(q), b = at(q + 1), c = at(q + 2), d = at(q + 3);
+            out.insert(out.end(), {a, b, d, b, c, d});
+        }
+        break;
+    case IndexForm::Primitives:
+        for (uint32_t begin = 0; begin < count;) {
+            uint32_t end = begin;
+            while (end < count && at(end) != UINT32_MAX) end++;
+            uint32_t n = end - begin;
+            if (s.primitive == 14) n = n >= 4 ? n & ~1u : 0;
+            if (s.primitive == 15 && n < 3) n = 0;
+            if (s.primitive == 12 && n < 2) n = 0;
+            if (n) {
+                if (!out.empty()) out.push_back(UINT32_MAX);
+                for (uint32_t k = 0; k < n; k++) out.push_back(at(begin + k));
+                if (s.primitive == 12) out.push_back(at(begin));
+            }
+            begin = end + 1;
+        }
+        break;
+    case IndexForm::Rectangles:
+        out.reserve(count / 3 * 12);
+        for (uint32_t r = 0; r + 2 < count; r += 3) {
+            const uint32_t v[3] = {at(r), at(r + 1), at(r + 2)};
+            for (int corner = 0; corner < 4; corner++) out.insert(out.end(), v, v + 3);
+        }
+        break;
+    case IndexForm::Points:
+        out.reserve(size_t(count) * 5);
+        for (uint32_t p = 0; p < count; p++) {
+            const uint32_t v = at(p);
+            if (v == UINT32_MAX) continue;
+            if (!out.empty()) out.push_back(UINT32_MAX);
+            for (uint32_t corner = 0; corner < 4; corner++) out.push_back(v << 2 | corner);
+        }
+        break;
+    }
+}
+
+VkClearValue clear_value(bool depth, uint32_t format, const uint32_t words[2]) {
+    VkClearValue v{};
+    if (depth) {
+        const uint32_t word = words[0], d24 = word >> 8;
+        v.depthStencil.depth = (format & 1) == 0 ? float(d24 + (d24 >> 23)) * (1.0f / 16777216.0f)
+                                                 : render::float24_to_float(d24) * 0.5f;
+        v.depthStencil.stencil = word & 0xFF;
+        return v;
+    }
+    // (Impl::resolve's clears, by the host format a port's target takes: Frame::target_format)
+    if (format == 10) format = 2;
+    if (format == 12) format = 3;
+    const bool wide = format == 5 || format == 7 || format == 15; // 16_16_16_16, its float, 32_32_FLOAT
+    const uint64_t value = wide ? uint64_t(words[0]) << 32 | words[1] : words[0];
+    auto &cv = v.color;
+    switch (format) {
+    case 0: case 1: // 8_8_8_8 and its gamma (the gamma-encoded bits)
+        for (int j = 0; j < 4; j++) cv.float32[j] = float((value >> (8 * j)) & 0xFF) / 255.0f;
+        break;
+    case 2: // 2_10_10_10
+        for (int j = 0; j < 3; j++) cv.float32[j] = float((value >> (10 * j)) & 0x3FF) / 1023.0f;
+        cv.float32[3] = float((value >> 30) & 3) / 3.0f;
+        break;
+    case 3: // 7e3 as 16-bit floats
+        for (int j = 0; j < 3; j++) cv.float32[j] = render::float7e3_to_float(uint32_t(value >> (10 * j)));
+        cv.float32[3] = float((value >> 30) & 3) / 3.0f;
+        break;
+    case 4: case 5: // 16-bit fixed as snorm holding the bits
+        for (int j = 0; j < 4; j++) cv.float32[j] = std::max(-1.0f, float(int16_t(value >> (16 * j))) / 32767.0f);
+        break;
+    case 6: case 7: // 16-bit floats
+        for (int j = 0; j < 4; j++) cv.float32[j] = render::half_to_float(uint16_t(value >> (16 * j)));
+        break;
+    default: // 32-bit floats: the bits
+        cv.uint32[0] = uint32_t(value >> (wide ? 32 : 0)), cv.uint32[1] = uint32_t(value);
+        break;
+    }
+    return v;
+}
+
+VkClearValue clear_value(bool depth, uint32_t format, const float color[4], float z, uint32_t stencil) {
+    VkClearValue v{};
+    if (depth) {
+        v.depthStencil = {(format & 1) ? z * 0.5f : z, stencil & 0xFF}; // (D24FS8 kept halved)
+        return v;
+    }
+    const float scale = format == 4 || format == 5 ? 1024.0f / 32767.0f : 1.0f; // (16-bit fixed: -32..32 as snorm)
+    for (int i = 0; i < 4; i++) v.color.float32[i] = color[i] * scale;
+    return v;
 }
 
 } // namespace xf::native

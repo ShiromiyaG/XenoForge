@@ -252,6 +252,10 @@ struct Options {
     // frame and returns at once (frame_wanted says no while the window has
     // not shown the last one), so the guest never waits for a display.
     std::function<void(uint64_t swap, const Image &frame)> on_frame;
+    // In a port's shadow mode (native_render.h's set_shadow): the emulated
+    // picture of each frame frame_wanted asks for, read at the swap before
+    // the port draws the same frame (on_frame gets the port's).
+    std::function<void(uint64_t swap, const Image &frame)> on_emulated_frame;
     // Each swap's front buffer on the GPU, with no read-back: called on the
     // renderer's thread right after the swap's work is submitted on the
     // device's queue. The synchronization is the queue's order: what the hook

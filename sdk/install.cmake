@@ -56,8 +56,8 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/cmake/toolchains DESTINATION ${CMAKE_INSTA
 # headers. The rest of include/xenoforge (the renderer's, the recompiler's,
 # the disc's, the tools') is XenoForge's own and is not installed.
 set(XF_SDK_API_HEADERS
-    run.h port.h native_render.h native_shaders.h port_module.h cpu_level_check.h # a port's code (cpu_level_check.h:
-                                                                                  # xenoforge_add_port's)
+    run.h port.h native_render.h native_shaders.h native_draw.h xdk_d3d.h port_module.h cpu_level_check.h # a port's code
+                                                                         # (cpu_level_check.h: xenoforge_add_port's)
     ppc_generated.h ppc_module.h game_library.h ppc_runtime.h)   # its generated code
 set(_xf_todo ${XF_SDK_API_HEADERS})
 set(XF_SDK_HEADERS)

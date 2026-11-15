@@ -57,6 +57,11 @@ void set_occlusion_samples(uint32_t samples) {
     change([&](detail::Settings &s) { s.occlusion_samples = samples; });
 }
 bool &enabled_flag() { return enabled_value; }
+namespace {
+std::atomic<bool> shadow_value{false};
+}
+void set_shadow(bool on) { shadow_value.store(on, std::memory_order_relaxed); }
+bool shadow() { return shadow_value.load(std::memory_order_relaxed); }
 bool active() { return active_value.load(std::memory_order_relaxed); }
 
 Counters counters() {
@@ -71,6 +76,7 @@ Counters counters() {
     c.resolves_kept = a.resolves_kept.load(std::memory_order_relaxed);
     c.memexport_kept = a.memexport_kept.load(std::memory_order_relaxed);
     c.occlusion_faked = a.occlusion_faked.load(std::memory_order_relaxed);
+    c.frames_shadowed = a.frames_shadowed.load(std::memory_order_relaxed);
     return c;
 }
 
