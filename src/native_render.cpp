@@ -47,6 +47,9 @@ bool has_output_renderer() {
 void set_output_size(uint32_t width, uint32_t height) {
     change([&](detail::Settings &s) { s.width = width, s.height = height; });
 }
+void set_output_display_gamma(bool on) {
+    change([&](detail::Settings &s) { s.display_gamma = on; });
+}
 void set_pass_filter(PassFilter filter) {
     change([&](detail::Settings &s) { s.filter = std::move(filter); });
 }

@@ -17,6 +17,7 @@ struct Settings {
     DrawObserver observer;
     uint32_t width = 0, height = 0;
     uint32_t occlusion_samples = 1000;
+    bool display_gamma = true;
 };
 
 // Changes with every set_* call: the renderer copies the settings again only

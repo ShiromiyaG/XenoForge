@@ -551,16 +551,29 @@ format sharing an EDRAM place.
 - **The `Drawer`**: `begin(ctx)`, then `draw(DrawCall)`, `clear(ClearCall)`,
   `resolve(ResolveInfo)` in the guest's order, `present(front buffer's
   fetch)` and `end()` (or `cancel()` to leave the frame to the emulated
-  path). It keeps render targets by EDRAM place (base, pitch, format) in
-  `Frame::target_format`'s formats, made as tall as the scissors reach; a
-  resolve reads the one written last at its place, a 7e3 target read as
-  2_10_10_10 packed first, a 2x or 4x view of single-sampled tiles taken as
-  the console's downsample, then `Frame::resolve` and the resolve's own
-  clears; a clear of any of the four color targets and depth or stencil.
-  Set 1's image tables have the stand-ins at 0 (the translated shaders read
-  each table's 0 for the kinds a slot is not; unbound, the device is lost).
-  `present_target(base, pitch, format)` shows one of its targets instead (a
-  target viewer); `targets()` lists them.
+  path). It draws into **the renderer's own render targets**
+  (`Frame::target`: its cache by EDRAM place, pitch, samples and format, the
+  tiles under a draw's scissor made current first), so the console's EDRAM
+  rules are the emulated path's: a format or pitch reading the bits another
+  wrote at the same tiles (a pass writing one channel of a target keeps the
+  others' bits), clears, a 7e3 target read as 2_10_10_10, a 2x or 4x view of
+  single-sampled tiles. Its resolves are the emulated path's too
+  (`Frame::resolve_target`: the copy and its clears from those targets). On
+  the interlock path, which reads EDRAM itself, the tiles the port drew are
+  stored back into EDRAM before each resolve and after the frame; the
+  targets keep them until the interlock path draws into EDRAM again (an
+  emulated frame, kept passes, a resolve's clears). A clear of any of the
+  four color targets and depth or stencil. A draw exporting memory is left
+  to the emulated path, which never skips one and runs it when the GPU meets
+  it (drawn again at the swap, its export would land over memory the guest
+  has since given to something else). Set 1's image tables have the
+  stand-ins at 0 (the translated shaders read each table's 0 for the kinds
+  a slot is not; unbound, the device is lost). `present_target(base, pitch,
+  format)` shows one of its targets instead (a target viewer); `targets()`
+  lists them.
+- **The output's gamma**: the output image goes through the display's
+  gamma ramp the guest set, as its front buffer does (window and shots);
+  `set_output_display_gamma(false)` for a port making its own final picture.
 
 The Drawer's per-draw cost: set 0 is written once a frame and bound with
 dynamic offsets (copied vertices are addressed by their place in the frame's
@@ -574,15 +587,27 @@ dynamic state are set only when they change; one dynamic rendering covers
 each run of draws and clears with the same attachments.
 
 Not done by it (counted in `stats().approximate`, or refused with a why):
-multisampled targets (refused), memory export from a port's draws, a
-resolution scale, pipelines made off the renderer's thread.
+multisampled targets (refused), a resolution scale, pipelines made off the
+renderer's thread.
+
+What a port capturing the guest's Direct3D still takes from the GPU's draw
+(the draw observer, matched in order) while the guest's Direct3D builds its
+command buffers: the bool and loop constants (Direct3D writes them into the
+command buffer as they are set; its device keeps no copy), the literal
+constants a program Direct3D patched or filled in loads (c250-c255), and the
+render target registers it writes at the draw (RB_MODECONTROL among them).
+Without them a loop runs no iteration, a vertex shader's sine reads zero,
+and a depth-only pass is drawn as a color one.
 
 Measured on the first port's recorded race (2,640 frames, headless,
 deterministic): the renderer's thread 34.7 s with the port's own renderer,
-10.5 s with the Drawer (the emulated path alone: 5.1 s); the whole run
-126.4 s, 88.8 s with the Drawer and the device read in blocks
-(`xdk_d3d.h`), against 75.9 s emulated. Its frames are the old renderer's
-(the opening's identical, the menus within 0.4 of 255).
+about 11 s with the Drawer (the emulated path alone: 5.1 s); the whole run
+126.4 s, 88.4 s with the Drawer and the device read in blocks
+(`xdk_d3d.h`), against 75.9 s emulated. Against the emulated path at the
+same swap (exact runs, docs/runtime.md "Rendered runs"): the menus
+identical, race frames within 0.35-0.4 of 255 (0.01-0.3% of pixels off by
+more than 16: the host targets against the interlock path's exact EDRAM),
+where the port's own renderer was 16 of 255 off with a third of the pixels.
 
 ### The same frame, both ways: the shadow mode
 
@@ -610,7 +635,9 @@ stencil control, the textures read, scissor, viewport depth range, polygon
 offset; a resolve's source target); `XF_DRAWER_SKIP=<swap>:<first>-<last>`
 leaves those draws out; `XF_DRAWER_SHOW=<swap>:<base hex>:<pitch>[:<scale>]`
 draws one of the port's targets (depth too, its first component times
-scale, as grey) in that frame's place; `Drawer::present_target` does it from
+scale, as grey) in that frame's place; `XF_DRAWER_SHOW_TEXTURE=<swap>:<draw>:<slot>`
+the texture a draw samples; `XF_DRAWER_SHADERS=<dir>` writes the logged
+draws' microcode (`xfshader` disassembles it); `Drawer::present_target` does it from
 code. The deterministic mode makes the same swap the same frame in every run
 (docs/runtime.md, "Rendered runs").
 

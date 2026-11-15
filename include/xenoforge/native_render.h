@@ -125,6 +125,11 @@ struct ResolveInfo {
     // RB_DEPTH_INFO's EDRAM base (tiles) and format, at surface_pitch
     uint32_t clear_color_base = 0, clear_color_format = 0;
     uint32_t clear_depth_base = 0, clear_depth_format = 0;
+    // When the GPU met it (a count of the guest's memory writes the renderer
+    // watches; 0 unknown): a port's resolve done later (Frame::resolve_target)
+    // leaves the destination to the CPU where the CPU wrote it since, as the
+    // emulated resolve, done first, would have been overwritten.
+    uint32_t cpu_epoch = 0;
 };
 
 // A render target of the port's own as a resolve's source (Frame::resolve):
@@ -134,6 +139,28 @@ struct ResolveInfo {
 struct TargetImage {
     VkImage image = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0;
+};
+
+// One of the renderer's own render targets for a port's draws
+// (Frame::target): its cache by EDRAM place, pitch, samples and format, which
+// keeps the console's rules (the formats and pitches sharing EDRAM's tiles
+// see one another's bits, clears, the resolves read what was written last).
+struct TargetRequest {
+    bool depth = false;
+    uint32_t edram_base = 0, pitch = 0, msaa = 0, format = 0; // RB_SURFACE_INFO's pitch and samples, the info's base and format
+    uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;                  // the pixels the draws may write (the scissor)
+};
+struct RendererTarget {
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE; // the attachment's (depth: both aspects)
+    VkImageView sampled = VK_NULL_HANDLE; // the color, or depth alone
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    uint32_t width = 0, height = 0; // the image's
+    // an 8_8_8_8_GAMMA target kept linear (as RGBA16 unorm): the pixel shader
+    // writes linear into it, so SystemConstants::flags[2]'s gamma bit is off
+    bool gamma_linear = false;
+    uint64_t id = 0; // the same target, frame after frame
 };
 
 // The frame's work, while the output renderer runs (and only then).
@@ -204,6 +231,17 @@ class Frame {
     // ShaderUses::slot_filters), and the player's filtering settings. Valid
     // until the frame's work is done on the GPU.
     virtual VkSampler sampler(const uint32_t fetch[6], const uint8_t filters[4]) = 0;
+    // The renderer's render target for a request, its tiles under the
+    // rectangle made current (another format's or pitch's bits moved into
+    // it, the clears it was owed drawn), recorded before what the port
+    // records next (outside a render pass: ask for commands() again after).
+    // In VK_IMAGE_LAYOUT_GENERAL; the port draws into it and the renderer
+    // knows those tiles as its. False and why when it has none.
+    virtual bool target(const TargetRequest &request, RendererTarget &out, std::string &why) = 0;
+    // A resolve as the emulated path does it, from the renderer's own targets
+    // (those target() gave the port): the copy, then its clears. Recorded
+    // after what the port recorded so far (outside a render pass).
+    virtual bool resolve_target(const ResolveInfo &info, std::string &why) = 0;
 };
 
 struct OutputContext {
@@ -246,6 +284,13 @@ bool has_output_renderer();
 // The output image's size; 0 by 0 (the default): the guest's front buffer's,
 // else 1280 by 720.
 void set_output_size(uint32_t width, uint32_t height);
+
+// Whether the output image goes through the display's gamma ramp the guest
+// set (DC_LUTA_CONTROL's table or piecewise linear ramp), as the guest's front
+// buffer does when the window shows it and shots read it: on by default, for
+// a port that draws the guest's frame (its front buffer into the output);
+// off for one that makes its own final picture.
+void set_output_display_gamma(bool on);
 
 // ---- what is skipped ----
 

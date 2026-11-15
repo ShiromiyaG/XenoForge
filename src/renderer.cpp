@@ -1922,6 +1922,17 @@ private:
         return v;
     }
     void resolve();
+    void resolve_from(const resolve::Info &info);
+    // a port's draws into the renderer's targets (NativeFrame::target): the
+    // tiles it took, stored back into EDRAM on the interlock path (which
+    // reads EDRAM, not the targets) before a resolve and after the port's frame
+    std::map<RenderTarget *, TileRect> native_touched_; // (each target's tiles' bounds)
+    bool native_owned_ = false; // the port's targets hold tiles the interlock path's EDRAM may not
+    uint64_t native_kept_at_ = 0; // the draws and resolves the emulated path did while the port's frames are shown
+    bool native_resolving_ = false;
+    void native_store_back();
+    void native_release();
+    std::vector<uint32_t> native_registers_;
     // port_image: the source is a port's own target (NativeFrame::resolve),
     // read through a copy of its image whatever the renderer's path
     void gpu_resolve(const resolve::Info &info, RenderTarget &source, bool port_image = false);
@@ -12264,6 +12275,16 @@ void Impl::resolve() {
         native::ResolveInfo described;
         if (read) {
             described = native_resolve_info(info, regs_);
+            // (the destination watched from here: a port's resolve of it later sees what the CPU wrote since)
+            if (native_suppress_ && info.copy) {
+                std::vector<Range> written, partial;
+                if (resolve::destination_ranges(info, written, partial)) {
+                    for (const Range &r : partial) written.push_back(r);
+                    for (const Range &r : written)
+                        if (r.second > r.first) mem_.watch(r.first, uint32_t(r.second - r.first));
+                    described.cpu_epoch = std::max(1u, mem_.write_count());
+                }
+            }
             pass.resolve_info = &described;
         }
         native_pass(pass);
@@ -12273,6 +12294,13 @@ void Impl::resolve() {
     poll();
     if (!read) return skip("resolve: " + why);
     if (!info.copy && !why.empty()) approximate("resolve not copied: " + why);
+    resolve_from(info);
+}
+
+// A resolve's work once its registers are read (Impl::resolve, and a port's
+// resolve from the renderer's targets: NativeFrame::resolve_target, with
+// regs_ a register file made of its description)
+void Impl::resolve_from(const resolve::Info &info) {
     uint32_t pitch = regs_[reg::RB_SURFACE_INFO] & 0x3FFF;
     // (the interlock path reads EDRAM itself: the target's place there)
     RenderTarget view;
@@ -12341,8 +12369,9 @@ void Impl::resolve() {
         clipped.x = x, clipped.y = y, clipped.width = w, clipped.height = h;
         gpu_resolve(clipped, *source);
         if (!fatal_.empty()) return;
-        if (options_.resolve_dump_wanted && options_.resolve_dump_wanted(report_.swaps))
-            dump_resolve(clipped, report_.swaps, false);
+        const uint64_t dump_swap = native_resolving_ ? native_number_ : report_.swaps;
+        if (options_.resolve_dump_wanted && options_.resolve_dump_wanted(dump_swap))
+            dump_resolve(clipped, dump_swap, native_resolving_);
     }
 
     // the clears, after the copy, over the same rectangle; on the interlock
@@ -13594,6 +13623,75 @@ public:
         r_.sampler(fetch, overrides);
         return r_.last_sampler_ ? r_.last_sampler_->sampler : r_.dummy_sampler_;
     }
+    bool target(const native::TargetRequest &q, native::RendererTarget &out, std::string &why) override {
+        if (!r_.scale_.one()) return why = "a resolution scale is on", false;
+        if (!r_.fatal_.empty()) return why = r_.fatal_, false;
+        RenderTarget *t = r_.render_target(q.depth, q.edram_base, q.pitch, q.msaa, q.format);
+        if (!t) return why = r_.fatal_.empty() ? "a target format the renderer keeps none of" : r_.fatal_, false;
+        const TileRect tiles = tiles_of(*t, q.x0, q.y0, std::max(q.x1, q.x0 + 1), std::max(q.y1, q.y0 + 1));
+        r_.outside();
+        r_.acquire(t, std::span<const TileRect>(&tiles, 1));
+        r_.tiles_drawn(*t, tiles);
+        r_.flush_clears(t);
+        if (!r_.fatal_.empty()) return why = r_.fatal_, false;
+        if (r_.fsi_) {
+            auto [it, made] = r_.native_touched_.try_emplace(t, tiles);
+            if (!made) {
+                TileRect &u = it->second;
+                u.c0 = std::min(u.c0, tiles.c0), u.r0 = std::min(u.r0, tiles.r0);
+                u.c1 = std::max(u.c1, tiles.c1), u.r1 = std::max(u.r1, tiles.r1);
+            }
+            r_.native_owned_ = true;
+        }
+        out.image = t->image.image, out.view = t->view, out.sampled = t->sampled ? t->sampled : t->view;
+        out.format = t->image.format, out.samples = t->image.samples;
+        out.width = t->host_width, out.height = t->host_height;
+        out.gamma_linear = t->gamma_linear;
+        out.id = reinterpret_cast<uintptr_t>(t);
+        return true;
+    }
+    bool resolve_target(const native::ResolveInfo &described, std::string &why) override {
+        if (!r_.scale_.one()) return why = "a resolution scale is on", false;
+        if (!r_.fatal_.empty()) return why = r_.fatal_, false;
+        native::ResolveInfo info = described;
+        if (info.copy && info.cpu_epoch) {
+            // the CPU wrote the destination since the GPU met the resolve: its data is the newer
+            std::vector<Range> written, partial;
+            if (resolve::destination_ranges(from_native(info), written, partial)) {
+                for (const Range &r : partial) written.push_back(r);
+                for (const Range &r : written)
+                    if (r.second > r.first &&
+                        !r_.pages_unwritten(r_.first_page(r), r_.last_page(r), info.cpu_epoch)) {
+                        info.copy = false;
+                        r_.approximate("a port's resolve over memory the CPU wrote since the GPU's (left the CPU's)");
+                        break;
+                    }
+            }
+        }
+        r_.outside();
+        r_.native_store_back();
+        // the registers the resolve's work reads, as its description gives them
+        std::vector<uint32_t> &regs = r_.native_registers_;
+        regs.assign(r_.regs_, r_.regs_ + REGISTER_COUNT);
+        regs[reg::RB_SURFACE_INFO] = described.surface_pitch | described.msaa << 16;
+        regs[reg::RB_DEPTH_INFO] = described.clear_depth_base | described.clear_depth_format << 16;
+        regs[r::COLOR_INFO[described.color_target & 3]] =
+            (regs[r::COLOR_INFO[described.color_target & 3]] & 0xFFF0F000u) | described.clear_color_base |
+            described.clear_color_format << 16;
+        regs[r::RB_COLOR_CLEAR] = described.clear_color_value[0];
+        regs[r::RB_COLOR_CLEAR_LO] = described.clear_color_value[1];
+        regs[r::RB_DEPTH_CLEAR] = described.clear_depth_value;
+        const uint32_t *saved = r_.regs_;
+        r_.regs_ = regs.data();
+        r_.native_resolving_ = true;
+        r_.resolve_from(from_native(info));
+        r_.native_resolving_ = false;
+        r_.regs_ = saved;
+        // (the interlock path's clears go into EDRAM: the port's targets take those tiles from there again)
+        if (r_.fsi_ && (info.clear_color || info.clear_depth)) r_.native_release();
+        if (!r_.fatal_.empty()) return why = r_.fatal_, false;
+        return true;
+    }
     bool shader_words(uint64_t hash, std::vector<uint32_t> &words) override {
         const Shader *s = r_.shader(hash);
         if (!s) return false;
@@ -13655,6 +13753,36 @@ bool Impl::native_output(uint32_t width, uint32_t height) {
     return true;
 }
 
+// The interlock path reads and writes EDRAM itself, not the render targets:
+// the tiles a port drew into the renderer's targets since the last time
+// (NativeFrame::target) stored back there, before a resolve reads EDRAM and
+// after the port's frame. The targets keep them (the next draws find them
+// held), until the interlock path may have drawn into EDRAM since
+// (native_release).
+void Impl::native_store_back() {
+    if (native_touched_.empty()) return;
+    std::map<RenderTarget *, std::vector<uint32_t>> tiles;
+    for (const auto &[t, rect] : native_touched_)
+        for (uint32_t row = rect.r0; row < rect.r1; row++)
+            for (uint32_t column = rect.c0; column < rect.c1; column++) {
+                const uint32_t tile = (t->base + row * t->pitch_tiles + column) % EDRAM_TILES;
+                if (owners_[tile] == t) tiles[t].push_back(tile);
+            }
+    native_touched_.clear();
+    for (auto &[t, list] : tiles)
+        if (!edram_store(t, list)) return;
+}
+
+// The port's targets give up their tiles: the interlock path drew into EDRAM
+// since they took them (an emulated frame, draws or resolves the pass filter
+// kept), so the next take loads them from EDRAM again.
+void Impl::native_release() {
+    if (!native_owned_) return;
+    native_owned_ = false;
+    for (uint32_t tile = 0; tile < EDRAM_TILES; tile++) owners_[tile] = nullptr;
+    owners_epoch_++;
+}
+
 // At a swap, before its front buffer is taken: the port's output renderer
 // called when there is one and the toggle is on. What it returns decides the
 // next frame's passes: skipped after a frame the port drew. A frame whose
@@ -13665,6 +13793,14 @@ bool Impl::native_frame(uint64_t number, bool &held) {
     if (version != native_version_) native::detail::settings(native_settings_), native_version_ = version;
     const bool on = native_settings_.renderer && native::enabled();
     const bool was_suppressed = native_suppress_;
+    {
+        // the interlock path drew into EDRAM since the port's last frame (it was emulated, or the filter kept
+        // draws or resolves of it): the port's targets take their tiles from EDRAM again
+        const native::Counters c = native::counters();
+        const uint64_t kept = c.draws_kept + c.resolves_kept + c.memexport_kept;
+        if (fsi_ && (!was_suppressed || kept != native_kept_at_)) native_release();
+        native_kept_at_ = kept;
+    }
     if (!on && !was_suppressed) return false;
     native::detail::AtomicCounters &counts = native::detail::atomic_counters();
     bool drew = false;
@@ -13696,6 +13832,8 @@ bool Impl::native_frame(uint64_t number, bool &held) {
             ctx.frame = &frame;
             gpu_mark("the port's frame (native rendering)");
             drew = native_settings_.renderer(ctx);
+            outside();
+            native_store_back(); // (the interlock path's EDRAM holds the port's targets' tiles again)
             // whatever the port bound is not the draws'
             bound_pipeline_ = VK_NULL_HANDLE;
             // (the recording thread's ring again, where the port recorded itself: NativeFrame::commands)
@@ -13836,14 +13974,21 @@ void Impl::swap() {
     else if (read && t) read_front_buffer(number, *t, info);
     FrontBuffer front;
     if (native && options_.on_swap && fatal_.empty()) {
-        // shown as it is: an identity table for the display's gamma
+        // through the display's gamma as the guest's front buffer (native::set_output_display_gamma), else
+        // shown as it is: an identity table
         front.swap = number;
         front.image = native_output_.image, front.format = native_output_.format;
         front.width = native_output_.extent.width, front.height = native_output_.extent.height;
         front.swizzle = texture::SWIZZLE_RGBA, front.components = 4, front.bits = 8, front.luta_control = 0;
-        for (uint32_t i = 0; i < 256; i++) {
-            const uint32_t ten = i << 2 | i >> 6;
-            front.gamma[i] = ten << 20 | ten << 10 | ten;
+        if (native_settings_.display_gamma) {
+            front.luta_control = regs_[r::DC_LUTA_CONTROL];
+            front.gamma = processor_.gamma_ramp_table();
+            front.pwl = processor_.gamma_ramp_pwl();
+        } else {
+            for (uint32_t i = 0; i < 256; i++) {
+                const uint32_t ten = i << 2 | i >> 6;
+                front.gamma[i] = ten << 20 | ten << 10 | ten;
+            }
         }
     } else if (t && options_.on_swap && !held) {
         front.swap = number;
@@ -13905,11 +14050,18 @@ void Impl::read_native_output(uint64_t number) {
     read.host = texture::HostFormat::RGBA8;
     read.width = native_output_.extent.width, read.height = native_output_.extent.height;
     read.swizzle = texture::SWIZZLE_RGBA, read.format = 6; // k_8_8_8_8
-    for (uint32_t i = 0; i < 256; i++) {
-        const uint32_t ten = i << 2 | i >> 6;
-        read.gamma[i] = ten << 20 | ten << 10 | ten;
-    }
     read.luta_control = 0;
+    if (native_settings_.display_gamma) {
+        // (as the window shows it: the display's gamma, native::set_output_display_gamma)
+        read.gamma = processor_.gamma_ramp_table();
+        read.pwl = processor_.gamma_ramp_pwl();
+        read.luta_control = regs_[r::DC_LUTA_CONTROL];
+    } else {
+        for (uint32_t i = 0; i < 256; i++) {
+            const uint32_t ten = i << 2 | i >> 6;
+            read.gamma[i] = ten << 20 | ten << 10 | ten;
+        }
+    }
     read.bytes = VkDeviceSize(read.width) * read.height * 4;
     VkBuffer back;
     VkDeviceSize at;
@@ -14260,7 +14412,7 @@ DrawSetup draw_setup(const uint32_t *regs, uint32_t primitive, const ShaderUses 
         if (vs.exports || (ps && ps->exports)) add(s, "memory export in a draw that writes no target (not done)");
         return s;
     }
-    if (vs.exports || (ps && ps->exports)) add(s, "memory export (not done by the port's draws)");
+
 
     // the rasterizer (polygon modes, culling, the front face, depth clamp)
     const uint32_t sc_mode = regs[rr::PA_SU_SC_MODE_CNTL];

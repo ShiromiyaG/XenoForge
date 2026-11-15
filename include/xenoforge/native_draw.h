@@ -16,13 +16,15 @@
 //   alpha test, alpha to coverage, the position's formats, the pixel
 //   parameters, point sizes, user clip planes, the targets' scales). No GPU
 //   work: a test or a tool can call them.
-// - Drawer: draws a frame's draws, clears and resolves with them into render
-//   targets of its own kept by EDRAM place (the console's rules: formats
-//   sharing a place, 7e3 read back as 2_10_10_10, a 2x/4x view of
-//   single-sampled tiles, clear values per format), pipelines, samplers with
-//   the shaders' filter overrides, descriptor sets with the stand-in images
-//   the translated shaders need at each image table's 0, and the guest's
-//   front buffer presented, all in the output renderer (native_render.h).
+// - Drawer: draws a frame's draws, clears and resolves with them into the
+//   renderer's own render targets (Frame::target: the console's EDRAM rules
+//   as the emulated path keeps them, formats and pitches sharing tiles see
+//   one another's bits) and resolves them as the emulated path does
+//   (Frame::resolve_target); pipelines, samplers with the shaders' filter
+//   overrides, descriptor sets with the stand-in images the translated
+//   shaders need at each image table's 0, and the guest's front buffer
+//   presented, all in the output renderer (native_render.h). Draws exporting
+//   memory are left to the emulated path.
 //
 //   xf::native::Drawer drawer(shader_directory);           // the port's, one for the run
 //   xf::native::set_output_renderer([&](const xf::native::OutputContext &ctx) {

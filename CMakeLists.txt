@@ -253,11 +253,9 @@ xf_shader(generic_fsi_sample_depth.frag generic.frag -DFSI=2 -DWRITES_DEPTH)
 xf_shader(generic_fsi_sample_points.frag generic.frag -DFSI=2 -DPOINT_COORDINATES)
 xf_shader(generic_fsi_sample_points_depth.frag generic.frag -DFSI=2 -DPOINT_COORDINATES -DWRITES_DEPTH)
 xf_shader(generic.comp generic.comp) # shader_compare_test's
-# the Drawer's passes (native_draw.h): present, 7e3 packing, a multisampled view's downsample
+# the Drawer's passes (native_draw.h): the present and the target viewer
 xf_shader(native_fullscreen.vert native_fullscreen.vert)
 xf_shader(native_present.frag native_present.frag)
-xf_shader(native_pack7e3.frag native_pack7e3.frag)
-xf_shader(native_downsample.frag native_downsample.frag)
 xf_shader(native_show.frag native_show.frag)
 add_library(xenoforge_vk STATIC src/vk_compute.cpp src/vk_device.cpp src/renderer.cpp src/index_convert.cpp src/native_render.cpp src/native_draw.cpp src/replay.cpp src/shader_step.cpp ${XF_SHADER_WORDS})
 target_include_directories(xenoforge_vk PRIVATE ${XF_SPIRV_DIR})

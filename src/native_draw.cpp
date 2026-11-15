@@ -46,12 +46,6 @@ const uint32_t FULLSCREEN_UV_VERT[] = {
 const uint32_t PRESENT_FRAG[] = {
 #include "native_present.frag.inc"
 };
-const uint32_t PACK7E3_FRAG[] = {
-#include "native_pack7e3.frag.inc"
-};
-const uint32_t DOWNSAMPLE_FRAG[] = {
-#include "native_downsample.frag.inc"
-};
 const uint32_t SHOW_FRAG[] = {
 #include "native_show.frag.inc"
 };
@@ -68,14 +62,16 @@ constexpr VkImageAspectFlags DEPTH_STENCIL = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAG
 
 uint64_t mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001B3ull + (v >> 29); }
 
+// one of the renderer's render targets (Frame::target), as the port's draws attach it
 struct Target {
     bool depth = false;
     uint32_t base = 0, pitch = 0, format = 0;
-    vk::Image image;
-    VkImageView view = VK_NULL_HANDLE;   // the attachment's (depth: both aspects)
-    VkImageView sampled = VK_NULL_HANDLE; // color: 2D
-    VkImageView array = VK_NULL_HANDLE;   // color: a 2D array (present_target)
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;    // the attachment's (depth: both aspects)
+    VkImageView sampled = VK_NULL_HANDLE; // the color, or depth alone
+    VkFormat vk_format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
+    bool gamma_linear = false;
     uint64_t written = 0;
 };
 
@@ -150,8 +146,6 @@ struct Drawer::Impl {
     std::unordered_map<uint64_t, VkPipeline> pipelines;    // by the draw's key
     std::map<std::tuple<const uint32_t *, int>, VkPipeline> helpers;
     std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t>, Target> targets; // (depth, base, pitch, format)
-    std::map<std::tuple<int, uint32_t, uint32_t>, Target> scratch;              // (format, width, height)
-    std::vector<std::pair<uint64_t, Target>> retired; // targets made again taller: destroyed POOLS frames later
     uint64_t written = 0;
     // the frame's
     const OutputContext *ctx = nullptr;
@@ -180,10 +174,18 @@ struct Drawer::Impl {
     // XF_DRAWER_SKIP=<swap>:<first>-<last>: those draws of that frame left out (finding the one a wrong
     // picture comes from, beside the shadow mode's emulated picture of the same frame)
     struct Debug {
-        uint64_t log_swap = UINT64_MAX, skip_swap = UINT64_MAX, show_swap = UINT64_MAX;
+        uint64_t log_swap = UINT64_MAX, skip_swap = UINT64_MAX, show_swap = UINT64_MAX, texture_swap = UINT64_MAX;
+        uint32_t texture_draw = 0, texture_slot = 0;
         uint32_t skip_first = 0, skip_last = 0, show_base = 0, show_pitch = 0;
         float show_scale = 1.0f;
         Debug() {
+            // XF_DRAWER_SHOW_TEXTURE=<swap>:<draw>:<slot>: that draw's texture in the frame's place
+            if (const char *v = std::getenv("XF_DRAWER_SHOW_TEXTURE"); v && *v) {
+                unsigned long long swap = 0;
+                unsigned draw = 0, slot = 0;
+                if (std::sscanf(v, "%llu:%u:%u", &swap, &draw, &slot) == 3)
+                    texture_swap = swap, texture_draw = draw, texture_slot = slot;
+            }
             if (const char *v = std::getenv("XF_DRAWER_SHOW"); v && *v) {
                 unsigned long long swap = 0;
                 unsigned base = 0, pitch = 0;
@@ -201,6 +203,7 @@ struct Drawer::Impl {
         }
     } debug;
     uint32_t frame_draws = 0, frame_resolves = 0;
+    VkImageView shown_texture = VK_NULL_HANDLE; // (XF_DRAWER_SHOW_TEXTURE's)
 
     void log_draw(uint32_t index, const DrawCall &call, const Op &op) {
         const uint32_t *r = call.registers;
@@ -217,6 +220,24 @@ struct Drawer::Impl {
                         r[0x210D], r[0x210C]);
         std::printf(", edram mode %u color mask %04X info %08X written by the shader %X", r[0x2208] & 7, r[0x2104] & 0xFFFF,
                     r[0x2001], call.ps_uses ? call.ps_uses->colors_written : 0u);
+        std::printf(", vertices %s %zu, indices %u from %u base %d", call.vertex_data ? "copied" : "in place",
+                    call.vertex_data ? call.vertex_bytes : call.range_count, call.count, call.first, call.base);
+        std::printf(", index offset %X min %X max %X", r[0x2102], r[0x2101], r[0x2100]);
+        // XF_DRAWER_SHADERS=<dir>: the logged draws' microcode written there (<hash>.vs, <hash>.ps, host order;
+        // xfshader disassembles them)
+        if (const char *dir = std::getenv("XF_DRAWER_SHADERS"); dir && *dir) {
+            auto write = [&](uint64_t hash, const uint32_t *words, size_t count, const char *ext) {
+                if (!words) return;
+                char name[32];
+                std::snprintf(name, sizeof(name), "%016llX.%s", (unsigned long long)hash, ext);
+                if (std::FILE *f = std::fopen((std::filesystem::path(dir) / name).string().c_str(), "wb")) {
+                    std::fwrite(words, 4, count, f);
+                    std::fclose(f);
+                }
+            };
+            write(call.vs_hash, call.vs, call.vs_words, "vs");
+            write(call.ps_hash, call.ps, call.ps_words, "ps");
+        }
         // the textures the shaders read: slot, address, format, dimension, size
         const uint32_t slots = call.vs_uses->texture_slots | (call.ps_uses ? call.ps_uses->texture_slots : 0);
         for (uint32_t slot = 0; slot < 32; slot++) {
@@ -224,6 +245,25 @@ struct Drawer::Impl {
             const uint32_t *f = &call.fetch[slot * 6];
             std::printf(", t%u %08X fmt %u dim %u %ux%u", slot, f[1] & 0xFFFFF000u, f[1] & 0x3F, (f[5] >> 9) & 3,
                         (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1);
+            TextureKey key;
+            std::memcpy(key.words, f, 24);
+            const uint8_t filters[4] = {3, 3, 3, 7};
+            std::memcpy(&key.words[6], call.vs_uses->filter_slots >> slot & 1   ? call.vs_uses->slot_filters[slot]
+                                       : call.ps_uses && call.ps_uses->filter_slots >> slot & 1 ? call.ps_uses->slot_filters[slot]
+                                                                                              : filters,
+                        4);
+            {
+                uint64_t h = 1469598103934665603ull;
+                const uint8_t *m = ctx->physical_memory + ((f[1] & 0xFFFFF000u) & 0x1FFFFFFFu);
+                for (uint32_t i = 0; i < 0x20000; i++) h = (h ^ m[i]) * 1099511628211ull;
+                std::printf(" (memory hash %016llX)", (unsigned long long)h);
+            }
+            if (auto it = textures_met.find(key); it != textures_met.end())
+                std::printf(" [%s vk %d %ux%u kind %u signs %X int %X signed view %d, words %08X %08X %08X %08X %08X %08X]",
+                            it->second.ok ? "ok" : it->second.why.c_str(), int(it->second.image.format),
+                            it->second.image.width, it->second.image.height, it->second.image.kind, it->second.image.signs,
+                            it->second.image.integer_scale, it->second.image.signed_view != VK_NULL_HANDLE, f[0], f[1], f[2],
+                            f[3], f[4], f[5]);
         }
         std::printf(", color control %08X, mode %08X, scissor %d,%d %ux%u, viewport z %g-%g%s, bias %g %g\n",
                     r[0x2202], r[0x2205], op.scissor.offset.x, op.scissor.offset.y, op.scissor.extent.width,
@@ -399,72 +439,40 @@ struct Drawer::Impl {
         pipelines_unsaved = 0;
     }
 
-    // ---- targets ----
+    // ---- targets: the renderer's own (Frame::target) ----
 
-    // The port's target for an EDRAM place and format: made the first time at the pitch, as tall as asked
-    // (a multiple of 16, at most 2048), again when taller is asked (the old contents lost, counted).
-    Target *target(bool depth, uint32_t base, uint32_t pitch, uint32_t format, uint32_t height_wanted,
-                   std::string &why) {
+    // A target's key, for the run of ops with the same attachments
+    static uint64_t key_of(bool depth, uint32_t base, uint32_t pitch, uint32_t format) {
         if (!depth && format == 10) format = 2; // (2_10_10_10_AS_10_10_10_10, 2_10_10_10_FLOAT_AS_16_16_16_16)
         if (!depth && format == 12) format = 3;
         if (depth) format &= 1;
-        height_wanted = std::clamp(height_wanted, 16u, 2048u);
-        const auto key = std::make_tuple(depth, base, pitch, format);
-        auto it = targets.find(key);
-        if (it != targets.end() && it->second.height >= height_wanted) return &it->second;
+        return uint64_t(depth) << 63 | uint64_t(base) << 40 | uint64_t(pitch) << 16 | format;
+    }
+    // The ops waiting to be recorded all have these attachments' keys: a request for others records them
+    // first, since the request may move EDRAM's tiles between targets now (Frame::target records it).
+    std::array<uint64_t, 5> group_keys{};
+    void group(const std::array<uint64_t, 5> &keys) {
+        if (!ops.empty() && keys != group_keys) flush();
+        group_keys = keys;
+    }
+
+    // The renderer's target for an EDRAM place, pitch and format, its tiles under the rectangle made current.
+    Target *target(bool depth, uint32_t base, uint32_t pitch, uint32_t format, int32_t x0, int32_t y0, int32_t x1,
+                   int32_t y1, std::string &why) {
+        if (!depth && format == 10) format = 2;
+        if (!depth && format == 12) format = 3;
+        if (depth) format &= 1;
         if (!pitch) return why = "a target of pitch 0", nullptr;
-        const VkFormat vk_format = ctx->frame->target_format(depth, format);
-        if (vk_format == VK_FORMAT_UNDEFINED) return why = "a target format the renderer keeps none of", nullptr;
-        if (it != targets.end()) {
-            approximate("a target made taller (its contents lost)");
-            flush(); // (the frame's draws into it recorded first)
-            retired.emplace_back(stats.frames, it->second);
-            targets.erase(it);
-        }
-        Target t;
+        TargetRequest q;
+        q.depth = depth, q.edram_base = base, q.pitch = pitch, q.msaa = 0, q.format = format;
+        q.x0 = uint32_t(std::max(x0, 0)), q.y0 = uint32_t(std::max(y0, 0));
+        q.x1 = uint32_t(std::max(x1, 0)), q.y1 = uint32_t(std::max(y1, 0));
+        RendererTarget rt;
+        if (!ctx->frame->target(q, rt, why)) return nullptr;
+        Target &t = targets[std::make_tuple(depth, base, pitch, format)];
         t.depth = depth, t.base = base, t.pitch = pitch, t.format = format;
-        t.width = pitch, t.height = (height_wanted + 15) & ~15u;
-        t.image = device->create_image(
-            VK_IMAGE_TYPE_2D, vk_format, {t.width, t.height, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-                       : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT));
-        if (!t.image.image) return why = "a target image not made", nullptr;
-        t.view = make_view(t.image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format,
-                           depth ? DEPTH_STENCIL : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT));
-        if (depth) {
-            t.sampled = make_view(t.image.image, VK_IMAGE_VIEW_TYPE_2D, vk_format, VK_IMAGE_ASPECT_DEPTH_BIT);
-        } else {
-            t.sampled = t.view;
-            t.array = make_view(t.image.image, VK_IMAGE_VIEW_TYPE_2D_ARRAY, vk_format, VK_IMAGE_ASPECT_COLOR_BIT);
-        }
-        if (!t.view || (!depth && !t.array)) return destroy(t), why = "a target view not made", nullptr;
-        initialize(t.image.image, depth);
-        return &(targets[key] = t);
-    }
-
-    void destroy(Target &t) {
-        // (an image the GPU may still use: destroyed after the device is idle, at the Drawer's end, or
-        // now when made again taller, which a draw of this frame cannot have used yet)
-        if (t.array) vkDestroyImageView(dev, t.array, nullptr);
-        if (t.depth && t.sampled) vkDestroyImageView(dev, t.sampled, nullptr);
-        if (t.view) vkDestroyImageView(dev, t.view, nullptr);
-        if (t.image.image) device->destroy(t.image);
-        t = {};
-    }
-
-    // a scratch image of this format and size (sampled, a color attachment, general layout)
-    Target *scratch_image(VkFormat format, uint32_t width, uint32_t height) {
-        Target &t = scratch[{int(format), width, height}];
-        if (t.image.image) return &t;
-        t.width = width, t.height = height;
-        t.image = device->create_image(VK_IMAGE_TYPE_2D, format, {width, height, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
-                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-        if (!t.image.image) return nullptr;
-        t.view = t.sampled = make_view(t.image.image, VK_IMAGE_VIEW_TYPE_2D, format, VK_IMAGE_ASPECT_COLOR_BIT);
-        if (!t.view) return nullptr;
-        initialize(t.image.image, false);
+        t.image = rt.image, t.view = rt.view, t.sampled = rt.sampled, t.vk_format = rt.format;
+        t.width = rt.width, t.height = rt.height, t.gamma_linear = rt.gamma_linear;
         return &t;
     }
 
@@ -528,7 +536,7 @@ struct Drawer::Impl {
         VkFormat formats[4];
         for (int i = 0; i < 4; i++) {
             blends[i] = a.color[i] ? s.blend[i] : VkPipelineColorBlendAttachmentState{};
-            formats[i] = a.color[i] ? a.color[i]->image.format : VK_FORMAT_UNDEFINED;
+            formats[i] = a.color[i] ? a.color[i]->vk_format : VK_FORMAT_UNDEFINED;
         }
         VkPipelineColorBlendStateCreateInfo colors{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         colors.attachmentCount = 4, colors.pAttachments = blends;
@@ -545,7 +553,7 @@ struct Drawer::Impl {
         VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
         rendering.colorAttachmentCount = 4, rendering.pColorAttachmentFormats = formats;
         rendering.depthAttachmentFormat = rendering.stencilAttachmentFormat =
-            a.depth ? a.depth->image.format : VK_FORMAT_UNDEFINED;
+            a.depth ? a.depth->vk_format : VK_FORMAT_UNDEFINED;
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         info.pNext = &rendering;
         info.stageCount = ps ? 2 : 1, info.pStages = stages;
@@ -762,22 +770,36 @@ struct Drawer::Impl {
         if (!call.registers || !call.vs || !call.vs_words || !call.vs_uses || !call.vs_floats || !call.fetch)
             return why = "a draw without its registers, vertex shader or constants", false;
         const bool has_ps = call.ps && call.ps_words && call.ps_uses && call.ps_floats;
+        // A draw exporting memory is the emulated path's: the renderer never skips one, and does it when the
+        // GPU meets it; the translated shaders would export again, later, over memory the guest has since
+        // given to something else.
+        if (call.vs_uses->exports || (has_ps && call.ps_uses->exports)) {
+            approximate("draws exporting memory (drawn by the emulated path, when the GPU met them)");
+            return true;
+        }
         DrawSetup s = draw_setup(call.registers, call.primitive, *call.vs_uses, has_ps ? call.ps_uses : nullptr,
                                  device);
         if (!s.why.empty()) return why = s.why, false;
         for (const char *a : s.approximate) approximate(a);
         if (s.empty) return true;
         if (s.msaa) return why = "a multisampled target", false;
-        // the targets, as tall as the scissor reaches
+        // the targets: the renderer's, their tiles under the scissor made current
         const VkRect2D reach = render_scissor(call.registers, s.pitch);
-        const uint32_t bottom = uint32_t(reach.offset.y) + reach.extent.height;
+        const int32_t rx0 = reach.offset.x, ry0 = reach.offset.y;
+        const int32_t rx1 = rx0 + int32_t(reach.extent.width), ry1 = ry0 + int32_t(reach.extent.height);
+        std::array<uint64_t, 5> keys{};
+        for (uint32_t i = 0; i < 4; i++)
+            if (s.color[i].used) keys[i] = key_of(false, s.color[i].edram_base, s.pitch, s.color[i].format) | 1;
+        if (s.depth.used) keys[4] = key_of(true, s.depth.edram_base, s.pitch, s.depth.format) | 1;
+        group(keys);
         for (uint32_t i = 0; i < 4; i++)
             if (s.color[i].used) {
-                op.attachments.color[i] = target(false, s.color[i].edram_base, s.pitch, s.color[i].format, bottom, why);
+                op.attachments.color[i] =
+                    target(false, s.color[i].edram_base, s.pitch, s.color[i].format, rx0, ry0, rx1, ry1, why);
                 if (!op.attachments.color[i]) return false;
             }
         if (s.depth.used) {
-            op.attachments.depth = target(true, s.depth.edram_base, s.pitch, s.depth.format, bottom, why);
+            op.attachments.depth = target(true, s.depth.edram_base, s.pitch, s.depth.format, rx0, ry0, rx1, ry1, why);
             if (!op.attachments.depth) return false;
         }
         uint32_t width = UINT32_MAX, height = UINT32_MAX;
@@ -785,9 +807,12 @@ struct Drawer::Impl {
             if (t) width = std::min(width, t->width), height = std::min(height, t->height);
         if (Target *t = op.attachments.depth) width = std::min(width, t->width), height = std::min(height, t->height);
         place_draw(s, call.registers, width, height,
-                   op.attachments.depth ? op.attachments.depth->image.format : VK_FORMAT_UNDEFINED, device);
+                   op.attachments.depth ? op.attachments.depth->vk_format : VK_FORMAT_UNDEFINED, device);
         for (const char *a : s.approximate) approximate(a);
         if (s.empty) return op.pipeline = VK_NULL_HANDLE, true;
+        // (an 8_8_8_8_GAMMA target the renderer keeps linear: the shader writes linear, EDRAM's bits get the gamma)
+        for (uint32_t i = 0; i < 4; i++)
+            if (op.attachments.color[i] && op.attachments.color[i]->gamma_linear) s.system.flags[2] &= ~(1u << i);
         // the shaders and the pipeline
         VkShaderModule vs = module_of(call.vs, call.vs_words, call.vs_hash, true, s.vertex, why);
         if (!vs) return false;
@@ -797,8 +822,8 @@ struct Drawer::Impl {
             if (!ps) return false;
         }
         uint64_t key = mix(mix(s.pipeline_key, call.vs_hash), ps ? call.ps_hash : 0);
-        for (Target *t : op.attachments.color) key = mix(key, t ? uint64_t(t->image.format) : 0);
-        key = mix(key, op.attachments.depth ? uint64_t(op.attachments.depth->image.format) : 0);
+        for (Target *t : op.attachments.color) key = mix(key, t ? uint64_t(t->vk_format) : 0);
+        key = mix(key, op.attachments.depth ? uint64_t(op.attachments.depth->vk_format) : 0);
         op.pipeline = pipeline_of(s, vs, ps, op.attachments, key, why);
         if (!op.pipeline) return false;
 
@@ -837,6 +862,8 @@ struct Drawer::Impl {
             }
             const TextureMet &met = texture_of(f, s.slot_filters[slot]);
             if (!met.ok) return why = "a texture: " + met.why, false;
+            if (debug.texture_swap == ctx->swap && debug.texture_draw == frame_draws - 1 && debug.texture_slot == slot)
+                shown_texture = met.image.view;
             const TextureImage &t = met.image;
             const VkSampler sampler = met.sampler;
             const uint32_t kind = std::min(t.kind, 2u);
@@ -1083,107 +1110,21 @@ struct Drawer::Impl {
     bool do_resolve(const ResolveInfo &info, std::string &why) {
         flush();
         textures_met.clear(); // (the resolve may write a texture's memory: loaded again after it)
-        auto fail = [&](const char *what) {
-            char place[112];
-            std::snprintf(place, sizeof(place), " (%s base %X pitch %u msaa %u format %u)",
-                          info.depth ? "depth" : "color", info.edram_base, info.surface_pitch, info.msaa,
-                          info.source_format);
-            why = std::string(what) + place;
-            return false;
-        };
-        // the view's samples on the single-sampled tiles: 2x two rows a row, 4x a 2x2 block a pixel
-        const uint32_t sx = info.msaa == 2 ? 2 : 1, sy = info.msaa >= 1 ? 2 : 1;
-        const uint32_t pitch = info.surface_pitch * sx;
-        if (info.copy) {
-            uint32_t format = info.source_format;
-            if (!info.depth && format == 10) format = 2;
-            if (!info.depth && format == 12) format = 3;
-            if (info.depth) format &= 1;
-            // the target written last at the place (the formats there share its bits)
-            const Target *source = nullptr;
-            for (const auto &[key, t] : targets)
-                if (t.depth == info.depth && t.base == info.edram_base && t.pitch == pitch && t.written &&
-                    (!source || t.written > source->written))
-                    source = &t;
-            if (!source) return fail("a resolve from a target the port has not drawn");
-            if (debug.log_swap == ctx->swap)
-                std::printf("drawer: swap %llu resolve %u: %s base %X pitch %u msaa %u format %u (%u,%u %ux%u) from the "
-                            "target at %X format %u (%ux%u) -> %08X format %u%s%s\n",
-                            (unsigned long long)ctx->swap, frame_resolves, info.depth ? "depth" : "color",
-                            info.edram_base, info.surface_pitch, info.msaa, info.source_format, info.x, info.y,
-                            info.width, info.height, source->base, source->format, source->width, source->height,
-                            info.dest_base, info.dest_format, info.clear_color ? ", clear color" : "",
-                            info.clear_depth ? ", clear depth" : "");
-            if (info.depth && info.msaa) return fail("a depth resolve of a multisampled view");
-            VkImageView view = source->sampled;
-            VkFormat vk_format = source->image.format;
-            uint32_t source_format = format;
-            if (source->format != format) {
-                if (!info.depth && format == 2 && source->format == 3) {
-                    // a 7e3 target's bits read as 2_10_10_10
-                    Target *packed = scratch_image(VK_FORMAT_A2B10G10R10_UNORM_PACK32, source->width, source->height);
-                    VkPipeline pack = helper(PACK7E3_FRAG, sizeof(PACK7E3_FRAG), VK_FORMAT_A2B10G10R10_UNORM_PACK32);
-                    if (!packed || !pack) return fail("the packing pass not made");
-                    helper_pass(pack, view, nearest, packed->view, source->width, source->height);
-                    source = packed, view = packed->sampled, vk_format = packed->image.format, source_format = 2;
-                } else {
-                    approximate("resolves of a place another format wrote last");
-                    auto it = targets.find(std::make_tuple(info.depth, info.edram_base, pitch, format));
-                    if (it == targets.end()) return fail("a resolve of a place another format wrote");
-                    source = &it->second, view = source->sampled, vk_format = source->image.format;
-                }
-            }
-            ResolveInfo described = info;
-            if (!info.depth) described.source_format = source_format;
-            if (info.msaa) {
-                // the view's samples as the resolve selects them (resolve.h's sample selections), averaged
-                const uint32_t select = info.sample_select;
-                const int32_t push[4] = {int32_t(sx), int32_t(sy),
-                                         int32_t(select <= 3 ? select : select == 5 ? 2 : 0),
-                                         int32_t(select <= 3 ? 1 : select == 6 ? 4 : 2)};
-                const uint32_t w = source->width / sx, h = source->height / sy;
-                Target *samples = scratch_image(vk_format, w, h);
-                VkPipeline down = helper(DOWNSAMPLE_FRAG, sizeof(DOWNSAMPLE_FRAG), vk_format);
-                if (!samples || !down) return fail("the downsampling pass not made");
-                helper_pass(down, view, nearest, samples->view, w, h, push);
-                source = samples;
-                described.msaa = 0, described.sample_select = 0;
-            }
-            TargetImage image;
-            image.image = source->image.image, image.width = source->width, image.height = source->height;
-            if (!ctx->frame->resolve(described, image, why)) return false;
-        }
-        // its clears, over the rectangle of the targets they hit (the view's pixels on the single-sampled tiles)
-        if ((info.clear_color || info.clear_depth) && info.width && info.height) {
-            Attachments a;
-            Op op;
-            op.clear = true;
-            const uint32_t bottom = (info.y + info.height) * sy;
-            if (info.clear_color) {
-                a.color[0] = target(false, info.clear_color_base, pitch, info.clear_color_format, bottom, why);
-                if (!a.color[0]) return false;
-                VkClearAttachment &v = op.values[op.value_count++];
-                v.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, v.colorAttachment = 0;
-                v.clearValue = clear_value(false, a.color[0]->format, info.clear_color_value);
-            }
-            if (info.clear_depth) {
-                a.depth = target(true, info.clear_depth_base, pitch, info.clear_depth_format, bottom, why);
-                if (!a.depth) return false;
-                VkClearAttachment &v = op.values[op.value_count++];
-                v.aspectMask = DEPTH_STENCIL;
-                const uint32_t words[2] = {info.clear_depth_value, 0};
-                v.clearValue = clear_value(true, a.depth->format, words);
-            }
-            const Target *any = a.color[0] ? a.color[0] : a.depth;
-            const uint32_t x = std::min(info.x * sx, any->width), y = std::min(info.y * sy, any->height);
-            const uint32_t w = std::min(info.width * sx, any->width - x), h = std::min(info.height * sy, any->height - y);
-            if (w && h) {
-                op.rect = {{{int32_t(x), int32_t(y)}, {w, h}}, 0, 1};
-                op.attachments = a;
-                ops.push_back(op);
-                flush();
-            }
-        }
+        if (debug.log_swap == ctx->swap)
+            std::printf("drawer: swap %llu resolve %u: %s base %X pitch %u msaa %u format %u (%u,%u %ux%u) -> %08X "
+                        "format %u%s%s\n",
+                        (unsigned long long)ctx->swap, frame_resolves, info.depth ? "depth" : "color", info.edram_base,
+                        info.surface_pitch, info.msaa, info.source_format, info.x, info.y, info.width, info.height,
+                        info.dest_base, info.dest_format, info.clear_color ? ", clear color" : "",
+                        info.clear_depth ? ", clear depth" : "");
+        // the emulated path's resolve, from the renderer's targets the draws went into (EDRAM's rules: a
+        // format or pitch reading another's bits, a multisampled view of single-sampled tiles, the clears)
+        if (!ctx->frame->resolve_target(info, why)) return false;
+        // (the targets the resolve's clears hit wrote last there)
+        for (auto &[k, t] : targets)
+            if ((info.clear_color && !t.depth && t.base == info.clear_color_base) ||
+                (info.clear_depth && t.depth && t.base == info.clear_depth_base))
+                t.written = ++written;
         std::lock_guard<std::mutex> lock(stats_mutex);
         stats.resolves++;
         return true;
@@ -1201,9 +1142,6 @@ Drawer::~Drawer() {
     d.save_pipelines();
     // (the device: idle by now when the run ends, as the renderer's own objects go)
     vkDeviceWaitIdle(d.dev);
-    for (auto &[k, t] : d.targets) d.destroy(t);
-    for (auto &[k, t] : d.scratch) d.destroy(t);
-    for (auto &[k, t] : d.retired) d.destroy(t);
     for (auto &[k, p] : d.pipelines)
         if (p) vkDestroyPipeline(d.dev, p, nullptr);
     for (auto &[k, p] : d.helpers)
@@ -1236,8 +1174,6 @@ bool Drawer::begin(const OutputContext &ctx, std::string &why) {
     }
     if (d.failed) return why = "the Drawer's Vulkan objects were not made: " + d.failed_why, false;
     d.pool = d.pools[d.stats.frames % POOLS];
-    while (!d.retired.empty() && d.retired.front().first + POOLS <= d.stats.frames)
-        d.destroy(d.retired.front().second), d.retired.erase(d.retired.begin());
     vkResetDescriptorPool(d.dev, d.pool, 0);
     d.ops.clear();
     d.set0.clear();
@@ -1275,21 +1211,30 @@ bool Drawer::clear(const ClearCall &call, std::string &why) {
                     call.color[3], call.z, call.stencil_value, call.area[0], call.area[1], call.area[2], call.area[3],
                     pitch);
     if ((call.surface_info >> 16) & 3) return why = "a clear of a multisampled target", false;
-    const uint32_t bottom = uint32_t(std::max(call.area[3], 0));
     Op op;
     op.clear = true;
+    std::array<uint64_t, 5> keys{};
+    for (uint32_t i = 0; i < 4; i++)
+        if ((call.targets >> i) & 1)
+            keys[i] = Impl::key_of(false, call.color_info[i] & 0xFFF, pitch, (call.color_info[i] >> 16) & 0xF) | 1;
+    if (call.depth || call.stencil)
+        keys[4] = Impl::key_of(true, call.depth_info & 0xFFF, pitch, (call.depth_info >> 16) & 1) | 1;
+    d.group(keys);
     for (uint32_t i = 0; i < 4; i++) {
         if (!((call.targets >> i) & 1)) continue;
         const uint32_t info = call.color_info[i];
-        Target *t = d.target(false, info & 0xFFF, pitch, (info >> 16) & 0xF, bottom, why);
+        Target *t = d.target(false, info & 0xFFF, pitch, (info >> 16) & 0xF, call.area[0], call.area[1], call.area[2],
+                             call.area[3], why);
         if (!t) return false;
         op.attachments.color[i] = t;
         VkClearAttachment &v = op.values[op.value_count++];
         v.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, v.colorAttachment = i;
         v.clearValue = clear_value(false, t->format, call.color, 0.0f, 0);
+        if (t->gamma_linear) d.approximate("clears of 8_8_8_8_GAMMA targets kept linear (the color as given)");
     }
     if (call.depth || call.stencil) {
-        Target *t = d.target(true, call.depth_info & 0xFFF, pitch, (call.depth_info >> 16) & 1, bottom, why);
+        Target *t = d.target(true, call.depth_info & 0xFFF, pitch, (call.depth_info >> 16) & 1, call.area[0],
+                             call.area[1], call.area[2], call.area[3], why);
         if (!t) return false;
         op.attachments.depth = t;
         VkClearAttachment &v = op.values[op.value_count++];
@@ -1320,6 +1265,11 @@ bool Drawer::resolve(const ResolveInfo &info, std::string &why) {
 bool Drawer::present(const uint32_t fetch[6], std::string &why) {
     Impl &d = *impl_;
     d.flush();
+    if (d.debug.texture_swap == d.ctx->swap && d.shown_texture) {
+        VkPipeline p = d.helper(PRESENT_FRAG, sizeof(PRESENT_FRAG), d.ctx->output_format);
+        if (p && d.helper_pass(p, d.shown_texture, d.linear, d.ctx->output_view, d.ctx->width, d.ctx->height))
+            return d.shown_texture = VK_NULL_HANDLE, true;
+    }
     if (d.debug.show_swap == d.ctx->swap) {
         const Target *best = nullptr;
         for (const auto &[k, t] : d.targets)
@@ -1329,6 +1279,7 @@ bool Drawer::present(const uint32_t fetch[6], std::string &why) {
         VkPipeline p = d.helper(SHOW_FRAG, sizeof(SHOW_FRAG), d.ctx->output_format);
         int32_t push[4] = {};
         std::memcpy(&push[0], &d.debug.show_scale, 4);
+        push[1] = 1; // (its first component as grey)
         if (best && p && d.helper_pass(p, best->sampled, d.nearest, d.ctx->output_view, d.ctx->width, d.ctx->height, push))
             return true;
         std::printf("drawer: swap %llu: no target at %X pitch %u to show\n", (unsigned long long)d.ctx->swap,
@@ -1353,9 +1304,12 @@ bool Drawer::present_target(uint32_t edram_base, uint32_t pitch, uint32_t format
             (!best || t.written > best->written))
             best = &t;
     if (!best) return why = "no such target", false;
-    VkPipeline p = d.helper(PRESENT_FRAG, sizeof(PRESENT_FRAG), d.ctx->output_format);
+    VkPipeline p = d.helper(SHOW_FRAG, sizeof(SHOW_FRAG), d.ctx->output_format);
     if (!p) return why = "the present pass was not made", false;
-    return d.helper_pass(p, best->array, d.linear, d.ctx->output_view, d.ctx->width, d.ctx->height) ||
+    const float one = 1.0f;
+    int32_t push[4] = {};
+    std::memcpy(&push[0], &one, 4);
+    return d.helper_pass(p, best->sampled, d.nearest, d.ctx->output_view, d.ctx->width, d.ctx->height, push) ||
            (why = "out of descriptor sets this frame", false);
 }
 
@@ -1383,7 +1337,7 @@ void Drawer::cancel() {
 std::vector<Drawer::TargetInfo> Drawer::targets() const {
     std::vector<TargetInfo> out;
     for (const auto &[k, t] : impl_->targets)
-        out.push_back({t.depth, t.base, t.pitch, t.format, t.width, t.height, t.image.format, t.written});
+        out.push_back({t.depth, t.base, t.pitch, t.format, t.width, t.height, t.vk_format, t.written});
     return out;
 }
 
