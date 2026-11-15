@@ -1085,6 +1085,9 @@ file's names), they are found in others by signature
   library's place: the largest run of clear best matches (0.97 or more, 0.05
   over the next) less than 256 KB apart, with 256 KB of margin each side.
   Each function takes one name at most, the best pairs first.
+- **The files are the porter's**: made from a game they own, kept with
+  their other game data, never in this repository nor in a port's (they are
+  taken from a game's code).
 - **Sure**: exact, or 0.95 or more and 0.03 over the runner-up. The rest is
   written to `--names-out` commented, for the porter to confirm: two
   functions alike but for a field's offset (the vertex and pixel shader
