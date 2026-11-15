@@ -119,7 +119,7 @@ struct Settings {
     // launched, from the same disc, as boot's --follow-launches does
     bool follow_launches = true;
     // the port's options (run.h's PortOption) by key, in config.toml's [port]
-    std::map<std::string, std::variant<bool, int64_t, double>> port;
+    std::map<std::string, std::variant<bool, int64_t, double, std::string>> port; // (a choice by its name)
     // the game's patches the user turned on or off, by the patch's name (patches.h), in
     // [games.<id>.patches]; a patch not named here is as its file's is_enabled says. A game's own
     // settings only.

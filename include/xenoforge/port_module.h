@@ -55,6 +55,8 @@ struct ModuleApi {
     void (*original)(Context &c, uint32_t address, void (*fn)(Context &));
     void (*call)(Context &c, uint32_t address);
     void *(*persistent)(const char *key, size_t size, bool *made);
+    // (added after version 1's first table: a module checks `size` before using it)
+    double (*option)(const char *key);
 };
 
 } // namespace xf::port
@@ -173,6 +175,11 @@ std::string name_of(uint32_t address) {
 void Original::operator()(Context &c) const { module_api->original(c, address_, fn_); }
 void call(Context &c, uint32_t address) { module_api->call(c, address); }
 void *persistent(const char *key, size_t size, bool *made) { return module_api->persistent(key, size, made); }
+double option(const char *key) {
+    return module_api->size >= offsetof(ModuleApi, option) + sizeof(module_api->option) && module_api->option
+               ? module_api->option(key)
+               : __builtin_nan("");
+}
 
 } // namespace xf::port
 

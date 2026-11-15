@@ -93,6 +93,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -337,6 +338,12 @@ int xf::run_boot(int argc, char **argv, PortInfo &port) {
         std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
         kernel::set_launch_data(k, data);
     }
+    // port::option (hooks in a reloaded module read the port's options through it)
+    port::set_option_reader([&port](const char *key) {
+        for (const PortOption &o : port.options)
+            if (o.key == key) return o.value();
+        return std::nan("");
+    });
     if (port.on_init) port.on_init(k);
     if (!port.hook_module.empty() && !game::load_port_module(g, port.hook_module, error))
         return std::fprintf(stderr, "%s\n", error.c_str()), 1;

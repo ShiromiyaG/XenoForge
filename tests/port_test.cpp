@@ -12,6 +12,7 @@
 #include "xenoforge/hooks.h"
 #include "xenoforge/lockstep.h"
 #include "xenoforge/port.h"
+#include "xenoforge/run.h"
 #include "xenoforge/toml.h"
 
 #include <cmath>
@@ -411,6 +412,37 @@ void memory_helpers() {
     CHECK(port::arg(c, 1) == 9);
 }
 
+// The port's options declared once (run.h): a choice by name or index, a range clamped, the default kept,
+// the builder's fields, and port::option reading them as numbers
+void port_options() {
+    bool wide = true;
+    int aspect = 0, fps = 30;
+    std::vector<PortOption> options;
+    options.push_back(PortOption::choice("aspect", "Aspect", aspect, {"auto", "16:9", "21:9"}, {"Auto", "", "Ultrawide"})
+                          .describe("The picture's shape.")
+                          .in("Video"));
+    options.push_back(PortOption::integer_range("fps", "Frame rate", fps, 30, 120).in("Video").needs_restart());
+    options.push_back(PortOption::boolean("wide", "Wide", wide));
+    CHECK(options[0].kind == PortOption::Kind::Choice && options[0].max == 2 && options[0].category == "Video");
+    CHECK(options[0].description == "The picture's shape." && options[1].restart && !options[0].restart);
+    CHECK(options[0].set_text("21:9") && aspect == 2 && options[0].set_text("1") && aspect == 1);
+    CHECK(!options[0].set_text("4:3") && aspect == 1);
+    CHECK(options[0].choice_label(0) == "Auto" && options[0].choice_label(1) == "16:9");
+    CHECK(options[1].set_text("500") && fps == 120 && options[1].default_value == 30);
+    CHECK(options[2].set_text("off") && !wide && options[2].default_value == 1);
+    options[1].set_value(options[1].default_value);
+    CHECK(fps == 30);
+    port::set_option_reader([&](const char *key) {
+        for (const PortOption &o : options)
+            if (o.key == key) return o.value();
+        return std::nan("");
+    });
+    CHECK(port::option("aspect") == 1.0 && port::option("fps") == 30.0 && port::option("wide") == 0.0);
+    CHECK(std::isnan(port::option("missing")));
+    port::set_option_reader({});
+    CHECK(std::isnan(port::option("aspect")));
+}
+
 // invoke and GuestStack (docs/sdk.md, "Calling the game") on code placed in guest memory, interpreted:
 // arguments in r3-r10 and f1-f13 counted apart, results from r3 and f1, every register back as it was,
 // temporaries that a callee's own frame and saves leave alone
@@ -465,6 +497,7 @@ int main() {
     emission();
     memory_helpers();
     typed_calls();
+    port_options();
     hooks_run(false);
     hooks_run(true);
     return finish("port");

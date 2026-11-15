@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <functional>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -505,6 +507,19 @@ std::string name_of(uint32_t address) {
     std::shared_lock lock(r.mutex);
     auto it = r.names.find(address);
     return it == r.names.end() ? std::string() : it->second;
+}
+
+namespace {
+std::function<double(const char *)> &option_reader() {
+    static std::function<double(const char *)> reader;
+    return reader;
+}
+} // namespace
+
+void set_option_reader(std::function<double(const char *)> reader) { option_reader() = std::move(reader); }
+double option(const char *key) {
+    const auto &reader = option_reader();
+    return reader ? reader(key) : std::nan("");
 }
 
 void *persistent(const char *key, size_t size, bool *made) {

@@ -73,6 +73,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -206,6 +207,60 @@ bool demo_request(const std::string &name, kernel::UiRequest &r) {
 int fail(const std::string &message) {
     std::fprintf(stderr, "%s\n", message.c_str());
     return 1;
+}
+
+// a port option's value into config.toml's [port]: a choice by its name
+void store_port_option(frontend::Settings &settings, const PortOption &op) {
+    switch (op.kind) {
+    case PortOption::Kind::Boolean: settings.port[op.key] = *op.flag; break;
+    case PortOption::Kind::Integer: settings.port[op.key] = int64_t(*op.integer); break;
+    case PortOption::Kind::Real: settings.port[op.key] = *op.real; break;
+    case PortOption::Kind::Choice:
+        if (*op.integer >= 0 && size_t(*op.integer) < op.choices.size())
+            settings.port[op.key] = op.choices[size_t(*op.integer)];
+        break;
+    }
+}
+
+// One port option in the overlay: a checkbox, a slider, a list of choices; its description as a tooltip, a
+// button back to its default when it is elsewhere. True when it changed (on_change called).
+bool port_option_widget(const PortOption &op) {
+    const char *label = op.label.empty() ? op.key.c_str() : op.label.c_str();
+    bool changed = false;
+    ImGui::PushID(op.key.c_str());
+    switch (op.kind) {
+    case PortOption::Kind::Boolean: changed = ImGui::Checkbox(frontend::guide_label(label).c_str(), op.flag); break;
+    case PortOption::Kind::Integer:
+        changed = ImGui::SliderInt(frontend::guide_label(label).c_str(), op.integer, int(op.min), int(op.max));
+        break;
+    case PortOption::Kind::Real:
+        changed = ImGui::SliderScalar(frontend::guide_label(label).c_str(), ImGuiDataType_Double, op.real, &op.min, &op.max,
+                                      "%.3f");
+        break;
+    case PortOption::Kind::Choice: {
+        const int count = int(op.choices.size());
+        const std::string shown = *op.integer >= 0 && *op.integer < count ? op.choice_label(size_t(*op.integer)) : "";
+        if (ImGui::BeginCombo(frontend::guide_label(label).c_str(), shown.c_str())) {
+            for (int k = 0; k < count; k++)
+                if (ImGui::Selectable(op.choice_label(size_t(k)).c_str(), k == *op.integer))
+                    changed = k != *op.integer, *op.integer = k;
+            ImGui::EndCombo();
+        }
+        break;
+    }
+    }
+    if (!op.description.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", op.description.c_str());
+    if (op.value() != op.default_value) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Default")) op.set_value(op.default_value), changed = true;
+    }
+    if (op.restart) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(at the next start)");
+    }
+    ImGui::PopID();
+    if (changed && op.on_change) op.on_change();
+    return changed;
 }
 
 } // namespace
@@ -349,24 +404,14 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
         auto at = settings.port.find(op.key);
         if (at == settings.port.end()) {
             port_new = true;
-            if (op.kind == PortOption::Kind::Boolean)
-                settings.port[op.key] = *op.flag;
-            else if (op.kind == PortOption::Kind::Integer)
-                settings.port[op.key] = int64_t(*op.integer);
-            else
-                settings.port[op.key] = *op.real;
+            store_port_option(settings, op);
             continue;
         }
         const auto &v = at->second;
-        if (op.kind == PortOption::Kind::Boolean) {
-            if (auto *b = std::get_if<bool>(&v)) *op.flag = *b;
-        } else if (op.kind == PortOption::Kind::Integer) {
-            if (auto *i = std::get_if<int64_t>(&v)) *op.integer = int(std::clamp<double>(double(*i), op.min, op.max));
-        } else if (auto *d = std::get_if<double>(&v)) {
-            *op.real = std::clamp(*d, op.min, op.max);
-        } else if (auto *i = std::get_if<int64_t>(&v)) {
-            *op.real = std::clamp(double(*i), op.min, op.max);
-        }
+        if (auto *b = std::get_if<bool>(&v)) op.set_value(*b ? 1 : 0);
+        else if (auto *i = std::get_if<int64_t>(&v)) op.set_value(double(*i));
+        else if (auto *d = std::get_if<double>(&v)) op.set_value(*d);
+        else if (auto *text = std::get_if<std::string>(&v)) op.set_text(*text);
     }
     if (config_read && (!std::filesystem::exists(config_file, ec) || port_new))
         if (!frontend::save(config_file, settings, error)) std::fprintf(stderr, "%s\n", error.c_str());
@@ -611,6 +656,12 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
     std::printf("rendering on %s, the window on the same device (%s)\n", g.device->name().c_str(),
                 presenter.own_queue() ? "a queue of its own" : "the renderer's queue");
     stbi_write_png_compression_level = 1;
+    // port::option (hooks in a reloaded module read the port's options through it)
+    port::set_option_reader([&port](const char *key) {
+        for (const PortOption &o : port.options)
+            if (o.key == key) return o.value();
+        return std::nan("");
+    });
     if (port.on_init) port.on_init(k);
     if (!port.hook_module.empty() && !game::load_port_module(g, port.hook_module, error)) return fail(error);
     if (!game::launch(g, error)) return fail("launch: " + error);
@@ -908,22 +959,19 @@ int xf::run_player(int argc, char **argv, PortInfo &port) {
                 pages.restart_notice(host);
                 bool port_moved = false;
                 if (!port.options.empty()) {
-                    fe::guide_caption(port.name.empty() ? "Port" : port.name.c_str());
-                    for (const PortOption &op : port.options) {
-                        const char *label = op.label.empty() ? op.key.c_str() : op.label.c_str();
-                        bool one = false;
-                        if (op.kind == PortOption::Kind::Boolean) {
-                            one = ImGui::Checkbox(fe::guide_label(label).c_str(), op.flag);
-                            if (one) settings.port[op.key] = *op.flag;
-                        } else if (op.kind == PortOption::Kind::Integer) {
-                            one = ImGui::SliderInt(fe::guide_label(label).c_str(), op.integer, int(op.min), int(op.max));
-                            if (one) settings.port[op.key] = int64_t(*op.integer);
-                        } else {
-                            one = ImGui::SliderScalar(fe::guide_label(label).c_str(), ImGuiDataType_Double, op.real,
-                                                      &op.min, &op.max, "%.3f");
-                            if (one) settings.port[op.key] = *op.real;
-                        }
-                        port_moved |= one;
+                    // by category, in the order they first appear; the port's own (no category) under its name
+                    std::vector<std::string> groups;
+                    for (const PortOption &op : port.options)
+                        if (std::find(groups.begin(), groups.end(), op.category) == groups.end())
+                            groups.push_back(op.category);
+                    for (const std::string &group : groups) {
+                        fe::guide_caption(!group.empty() ? group.c_str()
+                                          : port.name.empty() ? "Port" : port.name.c_str());
+                        for (const PortOption &op : port.options)
+                            if (op.category == group && port_option_widget(op)) {
+                                store_port_option(settings, op);
+                                port_moved = true;
+                            }
                     }
                 }
                 return moved || picture || port_moved;

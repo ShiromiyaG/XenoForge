@@ -31,41 +31,89 @@
 
 namespace xf {
 
-// One setting of the port, shown in the player's overlay (F1) and kept in
-// config.toml under [port] (the game's own table when it has one), after the
-// 3DS runtime's PORT_OPTION. The port owns the variable; the player writes it
-// when the file is read, when the overlay changes it and when --option sets
-// it, always before the game starts or from the overlay's thread while it
-// runs (a port reads it where a torn read does not matter, or keeps an atomic).
+// One setting of the port, declared once: kept in config.toml under [port]
+// (the game's own table when it has one), set by --option, shown in the
+// player's overlay (F1) by category with its description, read by hooks in a
+// reloaded module (port::option, port.h), and the list an in-game options
+// menu is made from (docs/sdk.md, "The port's options"); after the 3DS
+// runtime's PORT_OPTION and UnleashedRecomp's config_def.h. The port owns the
+// variable; the player writes it when the file is read, when the overlay
+// changes it and when --option sets it, always before the game starts or from
+// the overlay's thread while it runs (a port reads it where a torn read does
+// not matter, or keeps an atomic).
+//
+//   static int aspect = 0;
+//   port.options.push_back(xf::PortOption::choice("aspect", "Aspect ratio", aspect, {"auto", "16:9", "21:9"})
+//                              .describe("The picture's shape; auto follows the window.")
+//                              .in("Video")
+//                              .changed([] { apply_aspect(); }));
 struct PortOption {
-    enum class Kind { Boolean, Integer, Real };
-    std::string key;   // the name in config.toml and --option
-    std::string label; // what the overlay shows
+    enum class Kind { Boolean, Integer, Real, Choice };
+    std::string key;         // the name in config.toml and --option
+    std::string label;       // what the overlay and a menu show
+    std::string description; // what it does, a sentence or two (the overlay's tooltip, a menu's text)
+    std::string category;    // the group it is shown in ("Video", "Gameplay"); empty: the port's own
     Kind kind = Kind::Boolean;
     bool *flag = nullptr;
-    int *integer = nullptr;
+    int *integer = nullptr; // an Integer, or a Choice's index
     double *real = nullptr;
-    double min = 0, max = 0; // the range of an Integer or Real
+    double min = 0, max = 0;                 // the range of an Integer or Real (a Choice: 0, count - 1)
+    std::vector<std::string> choices;        // a Choice's values as config.toml and --option name them
+    std::vector<std::string> choice_labels;  // and as they are shown (empty: the names)
+    double default_value = 0;                // the value when declared (a menu's reset)
+    bool restart = false;                    // it takes effect at the next start
+    std::function<void()> on_change;         // after the overlay or a menu changed it (the overlay's thread)
 
     static PortOption boolean(std::string key, std::string label, bool &value) {
         PortOption o;
         o.key = std::move(key), o.label = std::move(label), o.kind = Kind::Boolean, o.flag = &value;
+        o.min = 0, o.max = 1, o.default_value = value ? 1 : 0;
         return o;
     }
     static PortOption integer_range(std::string key, std::string label, int &value, int min, int max) {
         PortOption o;
         o.key = std::move(key), o.label = std::move(label), o.kind = Kind::Integer, o.integer = &value;
-        o.min = min, o.max = max;
+        o.min = min, o.max = max, o.default_value = value;
         return o;
     }
     static PortOption real_range(std::string key, std::string label, double &value, double min, double max) {
         PortOption o;
         o.key = std::move(key), o.label = std::move(label), o.kind = Kind::Real, o.real = &value;
-        o.min = min, o.max = max;
+        o.min = min, o.max = max, o.default_value = value;
         return o;
     }
+    // one of named values, its index in `index`; `labels` as they are shown (empty: the names)
+    static PortOption choice(std::string key, std::string label, int &index, std::vector<std::string> names,
+                             std::vector<std::string> labels = {}) {
+        PortOption o;
+        o.key = std::move(key), o.label = std::move(label), o.kind = Kind::Choice, o.integer = &index;
+        o.choices = std::move(names), o.choice_labels = std::move(labels);
+        o.min = 0, o.max = o.choices.empty() ? 0 : double(o.choices.size() - 1), o.default_value = index;
+        return o;
+    }
+    PortOption &describe(std::string text) { return description = std::move(text), *this; }
+    PortOption &in(std::string group) { return category = std::move(group), *this; }
+    PortOption &needs_restart(bool yes = true) { return restart = yes, *this; }
+    PortOption &changed(std::function<void()> fn) { return on_change = std::move(fn), *this; }
 
-    // The value set from text ("true", "0", "1.5"), clamped to the range; false
+    // The value as a number: a boolean 0 or 1, an integer, a real, a choice's index.
+    double value() const {
+        return kind == Kind::Boolean ? (*flag ? 1.0 : 0.0) : kind == Kind::Real ? *real : double(*integer);
+    }
+    // Set from a number, clamped to the range (no on_change: the caller's to call).
+    void set_value(double v) const {
+        if (v < min) v = min;
+        if (v > max) v = max;
+        if (kind == Kind::Boolean) *flag = v != 0;
+        else if (kind == Kind::Real) *real = v;
+        else *integer = int(v);
+    }
+    // a Choice's label for its index (the name where it has no label)
+    const std::string &choice_label(size_t k) const {
+        return k < choice_labels.size() && !choice_labels[k].empty() ? choice_labels[k] : choices[k];
+    }
+
+    // The value set from text ("true", "0", "1.5", a choice's name or index), clamped to the range; false
     // when the text is not one.
     bool set_text(const std::string &text) const {
         if (kind == Kind::Boolean) {
@@ -73,15 +121,13 @@ struct PortOption {
             if (text == "0" || text == "false" || text == "off") return *flag = false, true;
             return false;
         }
+        if (kind == Kind::Choice)
+            for (size_t k = 0; k < choices.size(); k++)
+                if (choices[k] == text) return *integer = int(k), true;
         char *end = nullptr;
         double v = std::strtod(text.c_str(), &end);
         if (text.empty() || *end) return false;
-        if (v < min) v = min;
-        if (v > max) v = max;
-        if (kind == Kind::Integer)
-            *integer = int(v);
-        else
-            *real = v;
+        set_value(v);
         return true;
     }
 };

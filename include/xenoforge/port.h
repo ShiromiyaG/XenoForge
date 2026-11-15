@@ -297,6 +297,11 @@ std::string name_of(uint32_t address); // empty: none
 // (its statics, its heap, its threads) is gone with it. In an executable it
 // is a block that lives as long as the process.
 void *persistent(const char *key, size_t size, bool *made = nullptr);
+// One of the port's options (PortInfo::options, run.h) by its key, as it is
+// now: a boolean 0 or 1, an integer, a real, a choice's index; NaN when the
+// port declares none so named. For hooks in a reloaded module, which cannot
+// see the executable's variables (in the executable, read the variable).
+double option(const char *key);
 // A T (trivially copyable, so a reloaded module may read what the last one
 // wrote) kept as persistent() keeps it, value-initialized the first time.
 // A T whose size changed between two loads is a new block (a warning).

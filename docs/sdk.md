@@ -349,12 +349,38 @@ int main(int argc, char **argv) {
 options read) and before its main thread starts; `on_shutdown` after the run's
 report. Hooks and replacements themselves are `xenoforge/port.h` (plan E3).
 
-Options (the 3DS runtime's `PORT_OPTION`): boolean, integer or real, bound to
-the port's variable. In the player they are read from `config.toml` (`[port]`,
-or the game's own table `[games."<title id>".port]`), written with their
-defaults the first time, shown in the overlay (F1) under the port's name,
-saved when the overlay closes, and overridden for a run by `--option`. In
-boot only `--option` sets them.
+### The port's options
+
+Declared once, with the variable the port owns (the 3DS runtime's
+`PORT_OPTION`, UnleashedRecomp's `config_def.h`): boolean, integer or real in
+a range, or a choice among named values (its index in an `int`).
+
+```cpp
+static int aspect = 0;
+port.options.push_back(xf::PortOption::choice("aspect", "Aspect ratio", aspect, {"auto", "16:9", "21:9"},
+                                              {"Automatic", "16:9", "Ultrawide"})
+                           .describe("The picture's shape; automatic follows the window.")
+                           .in("Video")                // the group it is shown in
+                           .changed([] { apply(); })); // after the overlay or a menu changed it
+port.options.push_back(xf::PortOption::integer_range("fps", "Frame rate", fps, 30, 120).needs_restart());
+```
+
+- **config.toml**: `[port]`, or the game's own table
+  `[games."<title id>".port]`; written with the defaults the first time, a
+  choice by its name (`aspect = "21:9"`). `--option key=value` overrides it
+  for a run (a choice by name or index); in boot only `--option` sets them.
+- **The overlay (F1)**: one group per category in the order they first
+  appear (those without one under the port's name), a checkbox, a slider or
+  a list of choices each, the description as its tooltip, a "Default" button
+  when it is elsewhere than when declared, "(at the next start)" for one
+  that `needs_restart`; `on_change` runs when it changes there; saved when
+  the overlay closes.
+- **Hooks in a reloaded module** read them by key with `port::option("fps")`
+  (a number: a boolean 0 or 1, a choice's index; NaN for no such key). In the
+  executable, read the variable.
+- **The same list makes an in-game menu**: a menu drawn in the game's style
+  (plan E14) shows the declared options, their labels, descriptions and
+  choices; nothing is declared twice.
 
 ## Native rendering
 

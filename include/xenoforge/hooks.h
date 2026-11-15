@@ -25,6 +25,7 @@
 #include "xenoforge/ppc_module.h"
 
 #include <atomic>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -157,3 +158,8 @@ void remove_owner(Owner *owner);
 bool drained(Owner *owner, int wait_ms);
 
 } // namespace xf::hooks
+
+namespace xf::port {
+// What port::option reads (the player and boot set it from the port's options; unset: NaN for every key).
+void set_option_reader(std::function<double(const char *key)> reader);
+} // namespace xf::port

@@ -97,6 +97,7 @@ size_t api_name_of(uint32_t address, char *out, size_t size) {
 void api_original(ppc::Context &c, uint32_t address, void (*fn)(ppc::Context &)) { port::Original(address, fn)(c); }
 void api_call(ppc::Context &c, uint32_t address) { port::call(c, address); }
 void *api_persistent(const char *key, size_t size, bool *made) { return port::persistent(key, size, made); }
+double api_option(const char *key) { return port::option(key); }
 
 // One copy loaded: its library, its table, its owner in the registry.
 struct Copy {
@@ -162,7 +163,8 @@ struct PortModule::State {
                      api_name_of,
                      api_original,
                      api_call,
-                     api_persistent};
+                     api_persistent,
+                     api_option};
         return copy;
     }
     // its hooks registered (its static registrations, then what its entry does)

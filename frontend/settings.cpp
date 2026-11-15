@@ -245,6 +245,8 @@ void read_sections(const toml::table &t, Settings &s) {
                 s.port[std::string(key.str())] = *i;
             else if (auto d = value.value<double>())
                 s.port[std::string(key.str())] = *d;
+            else if (auto text = value.value<std::string>())
+                s.port[std::string(key.str())] = *text;
         }
     s.patches.clear();
     if (auto *table = t["patches"].as_table())
