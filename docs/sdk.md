@@ -269,6 +269,40 @@ and the player takes the new ones without restarting the game:
 - **What is not reloaded**: the executable's own SOURCES (the main,
   `on_init`, options, a native renderer); only HOOK_SOURCES.
 
+## Calling the game
+
+A hook often calls the game's own functions: to add an item to one of its
+menus (its own function that adds items, with a menu name and an item name),
+to look an object up, to play its sound. `port.h`:
+
+```cpp
+XF_AFTER(0x824A0000, pause_menu_built) {
+    port::GuestStack stack(c);                       // temporaries on the guest's stack
+    const uint32_t menu = stack.string("TopMenu"), item = stack.string("option");
+    port::invoke(c, 0x824AE690, this_menu, menu, item);   // the game's AddItem(menu, name)
+    const float scale = port::invoke<float>(c, 0x82310000, 2u, 0.5f);
+}
+```
+
+- **`invoke<R>(c, address, args...)`**: integers, enums and guest addresses
+  (`uint32_t`) in r3-r10 in order, `float` and `double` in f1-f13 in order
+  (the PowerPC ABI counts the two kinds apart), at most eight and thirteen;
+  host pointers are refused at compile time. The result as `R` from r3 (an
+  integer, an enum, `bool`) or f1 (`float`, `double`), or none. Every
+  register comes back as it was, r1 included: a hook calling the game leaves
+  the call it hooks as it found it. Generated code where there is some, the
+  interpreter where not, the hooks there too. `call(c, address)` is the
+  untyped form: the registers as they are, and as the callee left them.
+- **`GuestStack`**: strings (`string`, `wstring` as the guest's big-endian
+  UTF-16), values (`value(T)`, a structure of `be<>` fields), zeroed room
+  (`reserve`), each aligned to 16, below the stack pointer the hook found:
+  past a red zone (0x120 bytes: a leaf function's saves below its stack
+  pointer, at a mid-function hook), then a linkage area (0x60: a callee's
+  saved LR at -8, the parameter words above its stack pointer) and the back
+  chain at the bottom. While it lives r1 is that bottom; it puts r1 back.
+  They live as long as it does: a call that keeps a pointer to one needs
+  memory of its own (the game's allocator, called with `invoke`).
+
 ## Debugging a port
 
 - **The hooks in the reports** (docs/runtime.md, "Crash and stop

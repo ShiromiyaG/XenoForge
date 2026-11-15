@@ -411,6 +411,51 @@ void memory_helpers() {
     CHECK(port::arg(c, 1) == 9);
 }
 
+// invoke and GuestStack (docs/sdk.md, "Calling the game") on code placed in guest memory, interpreted:
+// arguments in r3-r10 and f1-f13 counted apart, results from r3 and f1, every register back as it was,
+// temporaries that a callee's own frame and saves leave alone
+void typed_calls() {
+    KernelHarness h;
+    CHECK(h.init());
+    Context &c = *h.c;
+    const uint32_t code = h.alloc(256);
+    auto put = [&](uint32_t at, std::initializer_list<uint32_t> words) {
+        for (uint32_t w : words) port::store<uint32_t>(c, at, w), at += 4;
+    };
+    const uint32_t mix = code, first = code + 0x40, framed = code + 0x80;
+    // mix: r3 += r4 + r4; f1 *= f2
+    put(mix, {0x7C632214, 0x7C632214, 0xFC2100B2, 0x4E800020});
+    // first: r3 = the byte at r3
+    put(first, {0x88630000, 0x4E800020});
+    // framed: a frame of its own and a save below r1 (as compiled code does), then the byte at r3
+    put(framed, {0x7D8802A6, 0x9181FFF8, 0x9421FFA0, 0x38000000, 0x9001FFF0, 0x88630000, 0x38210060,
+                 0x8181FFF8, 0x7D8803A6, 0x4E800020});
+    c.r[3] = 77, c.r[4] = 88, c.f[1] = 9.5, c.cr[2] = 1, c.ctr = 5;
+    const uint64_t sp = c.r[1];
+    CHECK((port::invoke<uint32_t>(c, mix, 3u, 4u, 1.5, 2.0)) == 11u);
+    CHECK((port::invoke<double>(c, mix, 3u, 4u, 1.5, 2.0)) == 3.0);
+    CHECK((port::invoke<float>(c, mix, 0u, 0u, 2.0f, 4.0f)) == 8.0f);
+    port::invoke(c, mix, 1u, 1u); // void
+    CHECK(c.r[3] == 77 && c.r[4] == 88 && c.f[1] == 9.5 && c.cr[2] == 1 && c.ctr == 5 && c.r[1] == sp);
+    {
+        port::GuestStack stack(c);
+        const uint32_t hi = stack.string("Hi");
+        const uint32_t wide = stack.wstring(u"Ok");
+        struct Pair {
+            port::be<uint32_t> a, b;
+        };
+        const uint32_t pair = stack.value(Pair{{0x01020304}, {0x05060708}});
+        CHECK(hi < sp && wide < sp && pair < sp && c.r[1] < pair && (c.r[1] & 15) == 0);
+        CHECK(port::load<uint32_t>(c, uint32_t(c.r[1])) == uint32_t(sp)); // the back chain
+        CHECK((port::invoke<uint32_t>(c, first, hi)) == 'H');
+        CHECK((port::invoke<uint32_t>(c, framed, hi + 1)) == 'i');
+        CHECK((port::invoke<uint32_t>(c, framed, wide + 1)) == 'O');
+        CHECK(port::load<uint16_t>(c, wide + 2) == u'k' && port::load<uint32_t>(c, pair + 4) == 0x05060708u);
+        CHECK(std::string(reinterpret_cast<const char *>(port::host(c, hi))) == "Hi"); // left alone by the callee
+    }
+    CHECK(c.r[1] == sp);
+}
+
 } // namespace
 
 int main() {
@@ -419,6 +464,7 @@ int main() {
     name_files();
     emission();
     memory_helpers();
+    typed_calls();
     hooks_run(false);
     hooks_run(true);
     return finish("port");

@@ -49,6 +49,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <string_view>
 #include <type_traits>
 
 namespace xf::port {
@@ -140,6 +141,114 @@ inline void fresult(Context &c, double v) { c.f[1] = v; }
 // The crash and stop reports show the call as the hook that made it.
 constexpr uint32_t CALL_RETURN = 0xBCBCBCBC; // the return address it runs with: no code is there
 void call(Context &c, uint32_t address);
+
+// ---- typed calls into guest code (docs/sdk.md, "Calling the game") ----
+//
+// Temporaries on the guest's stack for the calls a hook makes: strings, a
+// structure, an out value. Below the stack pointer as the hook found it,
+// past a red zone (a leaf function's saves below its stack pointer, at a
+// mid-function hook), then the linkage area a callee writes into (its saved
+// LR at -8, the parameter words above its stack pointer), with the back chain
+// at the bottom. While it lives, r1 is that bottom; it puts r1 back.
+//
+//   GuestStack stack(c);
+//   const uint32_t menu = stack.string("TopMenu");
+//   invoke(c, 0x824AE690, this_, menu);
+class GuestStack {
+  public:
+    static constexpr uint32_t RED_ZONE = 0x120, LINKAGE = 0x60;
+    explicit GuestStack(Context &c) : c_(c), saved_(c.r[1]), cursor_(uint32_t(c.r[1]) - RED_ZONE) { place(); }
+    ~GuestStack() { c_.r[1] = saved_; }
+    GuestStack(const GuestStack &) = delete;
+    GuestStack &operator=(const GuestStack &) = delete;
+    // `size` bytes, aligned to 16 (zeroed): their guest address
+    uint32_t reserve(uint32_t size) {
+        cursor_ = (cursor_ - size) & ~15u;
+        std::memset(host(c_, cursor_), 0, size);
+        place();
+        return cursor_;
+    }
+    // bytes copied in as they are
+    uint32_t bytes(const void *data, uint32_t size) {
+        const uint32_t at = reserve(size);
+        std::memcpy(host(c_, at), data, size);
+        return at;
+    }
+    // a value as it is in memory (a structure of be<> fields, a be<T>)
+    template <class T> uint32_t value(const T &v) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        return bytes(&v, uint32_t(sizeof(T)));
+    }
+    // an 8-bit string, NUL-terminated
+    uint32_t string(std::string_view s) {
+        const uint32_t at = reserve(uint32_t(s.size()) + 1);
+        std::memcpy(host(c_, at), s.data(), s.size());
+        return at;
+    }
+    // a UTF-16 string as the guest keeps it (big-endian), NUL-terminated
+    uint32_t wstring(std::u16string_view s) {
+        const uint32_t at = reserve(uint32_t(s.size() + 1) * 2);
+        for (size_t k = 0; k < s.size(); k++) store<uint16_t>(c_, at + 2 * uint32_t(k), uint16_t(s[k]));
+        return at;
+    }
+
+  private:
+    // r1 below the temporaries and the linkage area, its back chain to the hook's frame
+    void place() {
+        const uint32_t sp = (cursor_ - LINKAGE) & ~15u;
+        store<uint32_t>(c_, sp, uint32_t(saved_));
+        c_.r[1] = sp;
+    }
+    Context &c_;
+    uint64_t saved_;
+    uint32_t cursor_;
+};
+
+namespace detail {
+template <class T> constexpr bool float_arg = std::is_floating_point_v<T>;
+template <class T> void put_arg(Context &c, int &gpr, int &fpr, T v) {
+    if constexpr (float_arg<T>) {
+        if (fpr <= 13) c.f[fpr++] = double(v);
+    } else if constexpr (std::is_pointer_v<T>) {
+        static_assert(!std::is_pointer_v<T>, "pass guest addresses (uint32_t), not host pointers");
+    } else {
+        static_assert(std::is_integral_v<T> || std::is_enum_v<T>, "an argument is an integer, an enum or a float");
+        if (gpr <= 10) c.r[gpr++] = uint64_t(int64_t(v)) & (sizeof(T) == 8 ? ~0ull : 0xFFFFFFFFull);
+    }
+}
+} // namespace detail
+
+// The guest function at `address` called with C++ arguments: integers, enums
+// and guest addresses (uint32_t) in r3-r10 in order, float and double in
+// f1-f13 in order (the PowerPC ABI counts them apart), at most eight and
+// thirteen. Its result as R: r3 (an integer, an enum, bool), f1 (float,
+// double), nothing for void. Every register comes back as it was, r1
+// included, so a hook calling the game's functions leaves the call it hooks
+// as it found it; what the callee wrote into memory stays.
+template <class R = void, class... A> R invoke(Context &c, uint32_t address, A... args) {
+    static_assert(std::is_void_v<R> || std::is_integral_v<R> || std::is_enum_v<R> || std::is_floating_point_v<R>,
+                  "a result is void, an integer, an enum or a float");
+    uint64_t r[32];
+    double f[32];
+    std::remove_reference_t<decltype(c.v[0])> v[128];
+    uint8_t cr[32];
+    std::memcpy(r, c.r, sizeof(r)), std::memcpy(f, c.f, sizeof(f)), std::memcpy(v, c.v, sizeof(v));
+    std::memcpy(cr, c.cr, sizeof(cr));
+    const uint64_t ctr = c.ctr;
+    const uint8_t ca = c.xer_ca, ov = c.xer_ov, so = c.xer_so, bc = c.xer_bc, sat = c.vscr_sat;
+    const uint32_t fpscr = c.fpscr;
+    int gpr = 3, fpr = 1;
+    (detail::put_arg(c, gpr, fpr, args), ...);
+    call(c, address);
+    const uint64_t r3 = c.r[3];
+    const double f1 = c.f[1];
+    std::memcpy(c.r, r, sizeof(r)), std::memcpy(c.f, f, sizeof(f)), std::memcpy(c.v, v, sizeof(v));
+    std::memcpy(c.cr, cr, sizeof(cr));
+    c.ctr = ctr, c.xer_ca = ca, c.xer_ov = ov, c.xer_so = so, c.xer_bc = bc, c.vscr_sat = sat, c.fpscr = fpscr;
+    if constexpr (std::is_floating_point_v<R>) return R(f1);
+    else if constexpr (std::is_same_v<R, bool>) return (r3 & 0xFFFFFFFF) != 0;
+    else if constexpr (!std::is_void_v<R>) return R(r3);
+}
 
 // ---- hooks ----
 
